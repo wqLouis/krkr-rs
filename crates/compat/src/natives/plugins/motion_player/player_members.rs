@@ -1136,7 +1136,12 @@ mp_method_variant!(
     player_get_layer_names,
     PlayerInst,
     |p: &mut PlayerInst, _args: &[Value], ctx: &CompatCtx| {
-        let names: Vec<String> = p.nodes.iter().map(|node| node.label.clone()).collect();
+        let names: Vec<String> = p
+            .nodes
+            .iter()
+            .filter(|node| node.own)
+            .map(|node| node.label.clone())
+            .collect();
         string_list(ctx, &names)
     }
 );
@@ -1181,7 +1186,7 @@ mp_method_variant!(
         // (`reference/cpp/plugins/motionplayer/Player.h:335`).
         super::helpers::require_args(args, 1, "getLayerMotion")?;
         let name = value_as_string(&args[0]);
-        let node = p.nodes.iter().find(|node| node.label == name);
+        let node = p.nodes.iter().find(|node| node.own && node.label == name);
         Ok(match node {
             Some(node) => RetainedValue::Value(TjsValue::Integer(i64::from(node.node_type))),
             None => RetainedValue::Value(TjsValue::Void),
@@ -1197,7 +1202,7 @@ mp_method_variant!(
         // (`reference/cpp/plugins/motionplayer/Player.h:336`).
         super::helpers::require_args(args, 1, "getLayerGetter")?;
         let name = value_as_string(&args[0]);
-        let Some(node) = p.nodes.iter().find(|node| node.label == name) else {
+        let Some(node) = p.nodes.iter().find(|node| node.own && node.label == name) else {
             return Ok(RetainedValue::Value(TjsValue::Void));
         };
         let node = node.clone();
@@ -1212,7 +1217,7 @@ mp_method_variant!(
         let array = eval_object(ctx, "[]")?;
         // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for this callback.
         let engine = unsafe { ctx.engine() };
-        for (index, node) in p.nodes.iter().enumerate() {
+        for (index, node) in p.nodes.iter().filter(|node| node.own).enumerate() {
             let getter = p.layer_getter_object(ctx, node)?;
             let id = getter.raw_id() as usize as u64;
             engine

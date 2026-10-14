@@ -357,8 +357,7 @@ impl PlayerInst {
         let time = self.current_frame;
         // Evaluate each node's local state.
         for index in 0..self.nodes.len() {
-            let frames = self.nodes[index].frames.clone();
-            let state = evaluate_frames(&frames, time);
+            let state = evaluate_frames(&self.nodes[index].frames, time);
             let node = &mut self.nodes[index];
             node.local = state;
             node.draw_flag = true;
@@ -744,7 +743,10 @@ impl PlayerInst {
         let nodes: Vec<MotionNode> = self
             .nodes
             .iter()
-            .filter(|node| node.draw_flag && node.shape > 0)
+            .filter(|node| {
+                node.draw_flag
+                    && (node.shape > 0 || (node.node_type == 0 && !node.local.src.is_empty()))
+            })
             .cloned()
             .collect();
         let (width, height) = scene
@@ -762,13 +764,33 @@ impl PlayerInst {
                     node.accumulated.scale_x.abs().max(0.01),
                     node.accumulated.scale_y.abs().max(0.01),
                 );
-                let points = vec![
-                    (cx - 32.0 * sx, cy - 32.0 * sy),
-                    (cx + 32.0 * sx, cy - 32.0 * sy),
-                    (cx + 32.0 * sx, cy + 32.0 * sy),
-                    (cx - 32.0 * sx, cy + 32.0 * sy),
-                ];
-                engine::raster::fill_polygon(&mut bitmap, &points, color);
+                // An object layer draws the `source` icon it names; a shape
+                // layer keeps the fixed-size quad approximation.
+                let points = match self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.icons.get(&node.local.src))
+                {
+                    Some(icon) => {
+                        let x0 = cx - icon.origin_x * sx;
+                        let y0 = cy - icon.origin_y * sy;
+                        vec![
+                            (x0, y0),
+                            (x0 + icon.width * sx, y0),
+                            (x0 + icon.width * sx, y0 + icon.height * sy),
+                            (x0, y0 + icon.height * sy),
+                        ]
+                    }
+                    None => vec![
+                        (cx - 32.0 * sx, cy - 32.0 * sy),
+                        (cx + 32.0 * sx, cy - 32.0 * sy),
+                        (cx + 32.0 * sx, cy + 32.0 * sy),
+                        (cx - 32.0 * sx, cy + 32.0 * sy),
+                    ],
+                };
+                let alpha = (f64::from(color[3]) * node.accumulated.opacity.clamp(0.0, 1.0)) as u8;
+                let node_color = [color[0], color[1], color[2], alpha];
+                engine::raster::fill_polygon(&mut bitmap, &points, node_color);
             }
             bitmap.rgba
         });

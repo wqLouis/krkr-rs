@@ -105,8 +105,10 @@ pub(crate) struct Frame {
     pub(crate) time: f64,
     /// `0` invisible, `2` static, `3` interpolate.
     pub(crate) frame_type: i32,
-    /// The source reference (icon / child motion).
+    /// The icon source reference (`src/<chara>/<icon>`).
     pub(crate) src: String,
+    /// The child motion clip label a `motion/<chara>/<clip>` source names.
+    pub(crate) child_motion: Option<String>,
     /// The blend mode (`bm`).
     pub(crate) blend_mode: i32,
     /// Offset x (`ox`).
@@ -145,6 +147,7 @@ impl Default for Frame {
             time: 0.0,
             frame_type: 0,
             src: String::new(),
+            child_motion: None,
             blend_mode: 16,
             ox: 0.0,
             oy: 0.0,
@@ -230,6 +233,12 @@ pub(crate) struct MotionNode {
     pub(crate) children: Vec<usize>,
     /// The layer label.
     pub(crate) label: String,
+    /// Whether the node belongs to this player rather than an expanded child
+    /// motion. Only own nodes answer the layer queries; the renderer draws
+    /// both.
+    pub(crate) own: bool,
+    /// The child motion clip label the layer's frames reference.
+    pub(crate) child_motion: Option<String>,
     /// The node type (`Motion::LayerType*`).
     pub(crate) node_type: i32,
     /// The coordinate mode.
@@ -278,6 +287,8 @@ impl MotionNode {
             parent,
             children: Vec::new(),
             label,
+            own: true,
+            child_motion: None,
             node_type: 0,
             coordinate: 0,
             shape: 0,
@@ -300,6 +311,19 @@ impl MotionNode {
             particle_count: 0,
         }
     }
+}
+
+/// The canvas geometry of a `source.<chara>.icon.<name>` entry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct IconInfo {
+    /// The icon width in pixels.
+    pub(crate) width: f64,
+    /// The icon height in pixels.
+    pub(crate) height: f64,
+    /// The horizontal anchor origin.
+    pub(crate) origin_x: f64,
+    /// The vertical anchor origin.
+    pub(crate) origin_y: f64,
 }
 
 /// One motion clip (`MotionClip`).
@@ -352,6 +376,8 @@ pub(crate) struct MotionSnapshot {
     pub(crate) clips: Vec<MotionClip>,
     /// Label → clip index.
     pub(crate) clip_index: HashMap<String, usize>,
+    /// `source.<chara>.icon.<name>` geometry keyed by `src/<chara>/<name>`.
+    pub(crate) icons: HashMap<String, IconInfo>,
     /// The active root layer list.
     pub(crate) layers: Vec<PsbValue>,
     /// The raw metadata dictionary (for `Player::initPhysics` / `metadata`).
@@ -397,6 +423,8 @@ impl MotionSnapshot {
             })
             .or_else(|| number_of(root.get("height")))
             .unwrap_or(0.0);
+        let mut icons = HashMap::new();
+        collect_icons(&root, &mut icons);
 
         let mut snapshot = Self {
             width,
@@ -416,6 +444,7 @@ impl MotionSnapshot {
             timeline_controls: HashMap::new(),
             clips: Vec::new(),
             clip_index: HashMap::new(),
+            icons,
             layers: Vec::new(),
             metadata: PsbValue::Null,
             root,
@@ -958,16 +987,28 @@ pub(crate) fn build_node_tree(
         .map(|clip| clip.layers.as_slice())
         .filter(|layers| !layers.is_empty())
         .unwrap_or(snapshot.layers.as_slice());
+    let mut stack: Vec<String> = Vec::new();
+    if let Some(clip) = clip {
+        stack.push(clip.label.clone());
+    }
     for layer in layers {
-        append_node(&mut nodes, 0, layer);
+        append_node(&mut nodes, 0, layer, snapshot, &mut stack, false);
     }
     nodes
 }
 
-fn append_node(nodes: &mut Vec<MotionNode>, parent: usize, layer: &PsbValue) -> usize {
+fn append_node(
+    nodes: &mut Vec<MotionNode>,
+    parent: usize,
+    layer: &PsbValue,
+    snapshot: &MotionSnapshot,
+    stack: &mut Vec<String>,
+    child: bool,
+) -> usize {
     let index = nodes.len();
     let label = label_of(layer).unwrap_or_default();
     let mut node = MotionNode::new(parent, label);
+    node.own = !child;
     node.node_type = number_of(layer.get("type")).unwrap_or(0.0) as i32;
     node.coordinate = number_of(layer.get("coordinate")).unwrap_or(0.0) as i32;
     node.shape = number_of(layer.get("shape")).unwrap_or(0.0) as i32;
@@ -989,11 +1030,27 @@ fn append_node(nodes: &mut Vec<MotionNode>, parent: usize, layer: &PsbValue) -> 
         }
     }
     node.frames = parse_frames(layer.get("frameList"));
+    node.child_motion = node
+        .frames
+        .iter()
+        .find_map(|frame| frame.child_motion.clone());
     nodes.push(node);
     nodes[parent].children.push(index);
+    if let Some(label) = nodes[index].child_motion.clone()
+        && !label.is_empty()
+        && !stack.iter().any(|item| item == &label)
+        && let Some(clip) = snapshot.clip(&label)
+    {
+        let layers = clip.layers.clone();
+        stack.push(label);
+        for layer in &layers {
+            append_node(nodes, index, layer, snapshot, stack, true);
+        }
+        stack.pop();
+    }
     if let Some(children) = list_of(layer.get("children")) {
-        for child in children {
-            append_node(nodes, index, child);
+        for child_layer in children {
+            append_node(nodes, index, child_layer, snapshot, stack, child);
         }
     }
     index
@@ -1011,9 +1068,19 @@ fn parse_frames(value: Option<&PsbValue>) -> Vec<Frame> {
             ..Frame::default()
         };
         if let Some(content) = item.get("content") {
-            frame.src = string_of(content.get("src"))
+            let raw_src = string_of(content.get("src"))
                 .or_else(|| string_of(content.get("icon")))
                 .unwrap_or_default();
+            // A `motion/<chara>/<clip>` source names a child motion clip; the
+            // remaining sources name an icon in `source.<chara>.icon.<name>`.
+            if let Some(rest) = raw_src.strip_prefix("motion/") {
+                frame.child_motion = rest
+                    .rsplit('/')
+                    .find(|segment| !segment.is_empty())
+                    .map(str::to_string);
+            } else {
+                frame.src = raw_src;
+            }
             frame.blend_mode = number_of(content.get("bm")).unwrap_or(16.0) as i32;
             frame.ox = number_of(content.get("ox")).unwrap_or(0.0);
             frame.oy = number_of(content.get("oy")).unwrap_or(0.0);
@@ -1055,14 +1122,15 @@ pub(crate) fn evaluate_frames(frames: &[Frame], time: f64) -> FrameState {
     if frames.is_empty() {
         return FrameState::default();
     }
-    let mut active = frames[0].clone();
-    for frame in frames {
+    let mut active_index = 0usize;
+    for (index, frame) in frames.iter().enumerate() {
         if frame.time <= time {
-            active = frame.clone();
+            active_index = index;
         } else {
             break;
         }
     }
+    let active = &frames[active_index];
     if active.frame_type == 3
         && let Some(next) = frames.iter().find(|frame| frame.time > time)
     {
@@ -1073,7 +1141,7 @@ pub(crate) fn evaluate_frames(frames: &[Frame], time: f64) -> FrameState {
         } else {
             0.0
         };
-        return interpolate(&active, next, t);
+        return interpolate(active, next, t);
     }
     if active.frame_type == 0 {
         return FrameState {
@@ -1133,6 +1201,36 @@ fn navigate<'a>(mut value: &'a PsbValue, path: &[&str]) -> Option<&'a PsbValue> 
     Some(value)
 }
 
+/// Collect the `source.<chara>.icon.<name>` canvas geometry keyed by the
+/// `src/<chara>/<name>` path a frame's `content.src` carries. Reference
+/// `collectRootResources` / `MotionSnapshot::iconList`.
+fn collect_icons(root: &PsbValue, icons: &mut HashMap<String, IconInfo>) {
+    let Some(source) = root.get("source").and_then(PsbValue::as_dict) else {
+        return;
+    };
+    for (chara, node) in source {
+        let Some(icon) = node.get("icon").and_then(PsbValue::as_dict) else {
+            continue;
+        };
+        for (name, info) in icon {
+            let width = number_of(info.get("width")).unwrap_or(0.0);
+            let height = number_of(info.get("height")).unwrap_or(0.0);
+            if width <= 0.0 || height <= 0.0 {
+                continue;
+            }
+            icons.insert(
+                format!("src/{chara}/{name}"),
+                IconInfo {
+                    width,
+                    height,
+                    origin_x: number_of(info.get("originX")).unwrap_or(0.0),
+                    origin_y: number_of(info.get("originY")).unwrap_or(0.0),
+                },
+            );
+        }
+    }
+}
+
 fn list_of(value: Option<&PsbValue>) -> Option<&[PsbValue]> {
     value.and_then(PsbValue::as_list)
 }
@@ -1171,5 +1269,176 @@ fn timeline_ease_weight(easing: f64) -> f32 {
         (1.0 / (1.0 - easing)) as f32
     } else {
         1.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dict(entries: Vec<(&str, PsbValue)>) -> PsbValue {
+        PsbValue::Dict(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+        )
+    }
+
+    fn text(value: &str) -> PsbValue {
+        PsbValue::String(value.to_string())
+    }
+
+    fn num(value: i64) -> PsbValue {
+        PsbValue::Int(value)
+    }
+
+    fn frame(time: i64, frame_type: i64, src: PsbValue) -> PsbValue {
+        dict(vec![
+            ("time", num(time)),
+            ("type", num(frame_type)),
+            ("content", dict(vec![("src", src)])),
+        ])
+    }
+
+    /// A `title` clip whose `main` motion layer names the `char` child clip,
+    /// and a `char` clip whose `logo` object layer names the `src/title/logo`
+    /// icon. This mirrors the structure `title_bg.mtn` uses
+    /// (`motion/title_bg/char_move` -> `char_move`; `src/title/logo`).
+    fn snapshot() -> MotionSnapshot {
+        let main = dict(vec![
+            ("label", text("main")),
+            ("type", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![frame(0, 3, text("motion/title_bg/char_move"))]),
+            ),
+        ]);
+        let logo = dict(vec![
+            ("label", text("logo")),
+            ("type", num(0)),
+            (
+                "frameList",
+                PsbValue::List(vec![frame(0, 2, text("src/title/logo"))]),
+            ),
+        ]);
+        let title = dict(vec![
+            ("lastTime", num(120)),
+            ("layer", PsbValue::List(vec![main])),
+        ]);
+        let char_move = dict(vec![
+            ("lastTime", num(120)),
+            ("layer", PsbValue::List(vec![logo])),
+        ]);
+        let motions = dict(vec![("title", title), ("char_move", char_move)]);
+        let owner = dict(vec![("motion", motions)]);
+        let object = dict(vec![("title_bg", owner)]);
+        let icon = dict(vec![(
+            "logo",
+            dict(vec![
+                ("width", num(437)),
+                ("height", num(184)),
+                ("originX", num(219)),
+                ("originY", num(92)),
+            ]),
+        )]);
+        let source = dict(vec![("title", dict(vec![("icon", icon)]))]);
+        let root = dict(vec![("object", object), ("source", source)]);
+        MotionSnapshot::from_psb(Psb { root })
+    }
+
+    #[test]
+    fn source_icons_carry_their_canvas_geometry() {
+        let snapshot = snapshot();
+        let icon = snapshot
+            .icons
+            .get("src/title/logo")
+            .expect("the source icon is indexed by its frame path");
+        // `source/<group>/icon/<name>` carries width/height/originX/originY
+        // (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1514`,
+        // `reference/cpp/plugins/motionplayer/PlayerInternal.h:1620`).
+        assert_eq!(icon.width, 437.0);
+        assert_eq!(icon.height, 184.0);
+        assert_eq!(icon.origin_x, 219.0);
+        assert_eq!(icon.origin_y, 92.0);
+    }
+
+    #[test]
+    fn a_motion_layer_expands_the_clip_it_names() {
+        let snapshot = snapshot();
+        let clip = snapshot.clip("title").expect("the title clip parses");
+        let nodes = build_node_tree(&snapshot, Some(clip));
+        // The clip's layer references resolve to the layer dictionaries, and
+        // a `motion/<chara>/<clip>` source plays the named child clip
+        // (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1070`,
+        // `reference/cpp/plugins/motionplayer/PlayerUpdateChildMotion.cpp:59`).
+        // Root, the `main` motion layer, and the `char_move` `logo` object
+        // layer it references. Before child-motion expansion the tree stopped
+        // at `main`, so the title had no object layer to draw.
+        assert_eq!(nodes.len(), 3, "labels: {:?}", node_labels(&nodes));
+        assert_eq!(nodes[1].label, "main");
+        assert_eq!(nodes[1].child_motion.as_deref(), Some("char_move"));
+        assert!(nodes[1].own, "the title clip's own layer stays queryable");
+        assert_eq!(nodes[2].label, "logo");
+        assert_eq!(nodes[2].node_type, 0);
+        assert!(
+            !nodes[2].own,
+            "the child clip's layers render but do not answer layer queries"
+        );
+    }
+
+    /// A child reference that points back at an ancestor must not recurse
+    /// forever; the clip label stack blocks the cycle like the reference's
+    /// active-player set (`reference/cpp/plugins/motionplayer/PlayerRenderItems.cpp:15`).
+    #[test]
+    fn a_child_motion_cycle_is_bounded() {
+        let main = dict(vec![
+            ("label", text("main")),
+            ("type", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![frame(0, 3, text("motion/self/self"))]),
+            ),
+        ]);
+        let clip = dict(vec![
+            ("lastTime", num(1)),
+            ("layer", PsbValue::List(vec![main])),
+        ]);
+        let object = dict(vec![(
+            "self",
+            dict(vec![("motion", dict(vec![("self", clip)]))]),
+        )]);
+        let snapshot = MotionSnapshot::from_psb(Psb {
+            root: dict(vec![("object", object)]),
+        });
+        let clip = snapshot.clip("self").expect("the self clip parses");
+        let nodes = build_node_tree(&snapshot, Some(clip));
+        assert_eq!(nodes.len(), 2);
+    }
+
+    #[test]
+    fn animation_frames_evaluate_by_time() {
+        // Static frames select by the last keyframe at or before the time
+        // (`reference/cpp/plugins/motionplayer/PlayerUpdateLayerEval.cpp:1`).
+        let frames = vec![
+            Frame {
+                time: 0.0,
+                frame_type: 2,
+                ..Frame::default()
+            },
+            Frame {
+                time: 10.0,
+                frame_type: 2,
+                x: 5.0,
+                ..Frame::default()
+            },
+        ];
+        assert_eq!(evaluate_frames(&frames, 0.0).x, 0.0);
+        assert_eq!(evaluate_frames(&frames, 10.0).x, 5.0);
+        assert_eq!(evaluate_frames(&frames, 9.0).x, 0.0);
+    }
+
+    fn node_labels(nodes: &[MotionNode]) -> Vec<&str> {
+        nodes.iter().map(|node| node.label.as_str()).collect()
     }
 }
