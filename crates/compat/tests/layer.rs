@@ -955,3 +955,75 @@ fn unchanged_set_image_pos_and_size_writes_do_not_invalidate() {
     );
     assert!(!env.scene.layer(id).unwrap().cache_recalc);
 }
+
+/// A script subclass may touch a native `Layer` member from its class prelude
+/// or from its constructor before it calls `super.Layer(...)`. The reference's
+/// `CreateNativeInstance` already returns a layer carrying its default rect
+/// and main image, so member access needs no owner
+/// (`reference/cpp/core/visual/LayerIntf.cpp:304-410`, `:2203`, `:3683`);
+/// only `font` refuses until the constructor has run (`:6182-6188`). The port
+/// used to reject every member until `super.Layer(...)` set the payload id,
+/// which broke `MessageLayer.tjs`'s `left` property setter.
+#[test]
+fn subclass_member_writes_before_the_base_constructor_land() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        r#"
+        var w = new Window();
+        class BeforeSuper extends Layer {
+            function BeforeSuper(win, parent) {
+                left = 11;
+                top = 13;
+                focusable = true;
+                super.Layer(win, parent);
+            }
+        }
+        var early = new BeforeSuper(w, null);
+        early.name = 'before-super';
+
+        class InPrelude extends Layer {
+            visible = true;
+            focusable = true;
+            function InPrelude(win, parent) { super.Layer(win, parent); }
+        }
+        var prelude = new InPrelude(w, null);
+        prelude.name = 'in-prelude';
+        "#,
+    );
+
+    // reference/cpp/core/visual/LayerIntf.cpp:2203 (SetPosition stores the
+    // rect without a manager), :3683 (SetFocusable).
+    let early = env
+        .scene
+        .layers
+        .iter()
+        .find(|layer| layer.name == "before-super")
+        .expect("the before-super layer");
+    assert_eq!(
+        (early.rect.x, early.rect.y),
+        (11, 13),
+        "a member write before super.Layer must reach the joined layer"
+    );
+    assert!(
+        early.focusable,
+        "a member write before super.Layer must reach the joined layer"
+    );
+
+    // reference/cpp/core/visual/LayerIntf.cpp:1183 (SetVisible stores the
+    // flag before any manager exists).
+    let prelude = env
+        .scene
+        .layers
+        .iter()
+        .find(|layer| layer.name == "in-prelude")
+        .expect("the in-prelude layer");
+    assert!(
+        prelude.visible,
+        "a class-body member write before super.Layer must reach the joined layer"
+    );
+    assert!(
+        prelude.focusable,
+        "a class-body member write before super.Layer must reach the joined layer"
+    );
+}

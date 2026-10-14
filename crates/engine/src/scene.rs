@@ -620,29 +620,40 @@ impl Scene {
 
     /// Add a layer. `parent == None` attaches to the window directly.
     pub fn add_layer(&mut self, window: u32, parent: Option<u32>) -> u32 {
-        // A parent belongs to the same window; invalid/cross-window ids fall
-        // back to a window-attached layer rather than creating an unreachable
-        // subtree.
-        let parent = parent.filter(|parent_id| {
-            self.layer(*parent_id)
-                .is_some_and(|layer| layer.window == window)
-        });
+        let id = self.add_detached_layer();
+        self.attach_layer(id, window, parent);
+        id
+    }
+
+    /// Allocate a layer with the reference `CreateNativeInstance` defaults
+    /// (default rect, no owner, manager or parent) but leave it detached from
+    /// every window, parent and focus domain. [`Scene::attach_layer`] is the
+    /// later `Construct` join.
+    ///
+    /// A detached layer is reachable through [`Scene::layer`] and
+    /// [`Scene::layers`], so its properties can be read and written, but it
+    /// is not in any `window.layers` list or child list, so it is not
+    /// rendered, hit-tested or focus-searched until it is attached.
+    pub fn add_detached_layer(&mut self) -> u32 {
         let id = self.next_layer;
         self.next_layer += 1;
-        let primary = self.window(window).and_then(|w| w.primary_layer).is_none();
-        // A parentless layer founds its own focus domain (the reference
-        // creates one manager per parentless layer and attaches it as the
-        // primary, `reference/cpp/core/visual/LayerIntf.cpp:461-473`); a
-        // child inherits its parent's (`:449-455`). The domain id is the
-        // founding root's own layer id, so `id == domain` identifies it.
-        let domain = parent
-            .and_then(|parent| self.layer(parent).map(|layer| layer.domain))
-            .unwrap_or(id);
-        self.layers.push(LayerState {
+        self.layer_index.insert(id, self.layers.len());
+        self.layers.push(Self::detached_layer_state(id));
+        self.touch();
+        id
+    }
+
+    /// The field initializers a freshly allocated layer is born with. The
+    /// rect and main image are completed by the caller.
+    fn detached_layer_state(id: u32) -> LayerState {
+        LayerState {
             id,
-            window,
-            parent,
-            domain,
+            // No window yet; [`Scene::attach_layer`] assigns the real one.
+            // `u32::MAX` cannot be a window id (`next_window` counts up from
+            // 0), so window-scoped lookups never match a detached layer.
+            window: u32::MAX,
+            parent: None,
+            domain: id,
             children: Vec::new(),
             bitmap: None,
             rect: Rect::default(),
@@ -691,8 +702,35 @@ impl Scene {
             is_primary: false,
             pending_paint: false,
             shutdown: false,
+        }
+    }
+
+    /// Attach a layer allocated by [`Scene::add_detached_layer`] to `window`
+    /// and `parent`, assigning its focus domain and primary slot — the
+    /// reference `Construct` join. An unknown id is ignored.
+    pub fn attach_layer(&mut self, id: u32, window: u32, parent: Option<u32>) {
+        if self.layer(id).is_none() {
+            return;
+        }
+        // A parent belongs to the same window; invalid/cross-window ids fall
+        // back to a window-attached layer rather than creating an unreachable
+        // subtree.
+        let parent = parent.filter(|parent_id| {
+            self.layer(*parent_id)
+                .is_some_and(|layer| layer.window == window)
         });
-        self.layer_index.insert(id, self.layers.len() - 1);
+        let primary = self.window(window).and_then(|w| w.primary_layer).is_none();
+        // A parentless layer founds its own focus domain; a child inherits its
+        // parent's. The domain id is the founding root's own layer id, so
+        // `id == domain` identifies it.
+        let domain = parent
+            .and_then(|parent| self.layer(parent).map(|layer| layer.domain))
+            .unwrap_or(id);
+        if let Some(layer) = self.layer_mut(id) {
+            layer.window = window;
+            layer.parent = parent;
+            layer.domain = domain;
+        }
         // First layer of a window becomes its primary layer, which the
         // reference `tTVPLayerManager::AttachPrimary` forces visible (a new
         // layer otherwise defaults to hidden).
@@ -714,16 +752,13 @@ impl Scene {
             None => {
                 if let Some(w) = self.window_mut(window) {
                     w.layers.push(id);
-                    // Register the new manager at the end of the window's
-                    // list (`RegisterLayerManager`,
-                    // `reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:93-98`).
+                    // Register the new manager at the end of the window's list.
                     w.focus_domains.push(domain);
                     w.sync_focused_layer();
                 }
             }
         }
         self.touch();
-        id
     }
 
     /// Look up a layer by id. Uses the id→index map, falling back to a
@@ -2259,6 +2294,27 @@ impl Scene {
         });
         self.touch();
         id
+    }
+
+    /// Reset a scene font in place to the default style with the given face,
+    /// height and color. The reference `tTJSNI_Font::Construct` with no layer
+    /// argument replaces the native font with the default font, so the style
+    /// fields reset rather than preserving a pre-constructor write. Returns
+    /// `false` when the font is gone.
+    pub fn reset_font(&mut self, id: u32, face: String, height: i32, color: [u8; 4]) -> bool {
+        let Some(font) = self.fonts.iter_mut().find(|font| font.id == id) else {
+            return false;
+        };
+        font.face = face;
+        font.height = height;
+        font.color = color;
+        font.bold = false;
+        font.italic = false;
+        font.strikeout = false;
+        font.underline = false;
+        font.angle = 0.0;
+        self.touch();
+        true
     }
 
     /// Look up a font by id. Uses the id→index map, falling back to a

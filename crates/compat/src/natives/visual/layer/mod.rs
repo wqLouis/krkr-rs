@@ -68,6 +68,11 @@ struct LayerTransition {
 #[derive(Default)]
 struct LayerInst {
     id: Option<u32>,
+    /// Set by the native constructor (`super.Layer(...)`). Before it runs the
+    /// layer exists but is detached from its window and parent; `id` is
+    /// already allocated so the reference's pre-`Construct` member writes
+    /// land.
+    attached: bool,
     font_object: Option<DetachedValue>,
     /// Reference `tTJSNI_BaseLayer::CursorX_Work` (`LayerIntf.cpp:347`): the
     /// pending X `SetCursorX` stores for the next `SetCursorY`.
@@ -150,8 +155,27 @@ fn layer_array(
 // Layer
 // ---------------------------------------------------------------------------
 
-extern "C" fn layer_create(_engine: *mut c_void) -> *mut c_void {
-    Box::into_raw(Box::new(LayerInst::default())) as *mut c_void
+extern "C" fn layer_create(engine: *mut c_void) -> *mut c_void {
+    // The reference's `CreateNativeInstance` returns a layer that already
+    // carries its default rect and main image; only the window/parent join is
+    // deferred to `Construct`. A script subclass touches members from its
+    // class prelude or before `super.Layer(...)`, so the scene record must
+    // exist from creation, detached until the join.
+    let mut inst = LayerInst::default();
+    if let Ok((_resolved, ctx)) = bound(engine)
+        && let Ok(scene) = scene_mut(&ctx)
+    {
+        let id = scene.add_detached_layer();
+        if let Some(layer) = scene.layer_mut(id) {
+            layer.rect = Rect::new(0, 0, 32, 32);
+        }
+        if scene.ensure_layer_image(id, 32, 32) {
+            inst.id = Some(id);
+        } else {
+            scene.remove_layer(id);
+        }
+    }
+    Box::into_raw(Box::new(inst)) as *mut c_void
 }
 
 extern "C" fn layer_invalidate(engine: *mut c_void, instance: *mut c_void) {
@@ -228,7 +252,7 @@ extern "C" fn layer_ctor(
     let a = unsafe { args(argv, argc) };
     // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; `layer_ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut LayerInst) };
-    if inst.id.is_some() {
+    if inst.attached {
         return report_error(out_error, "Layer: this layer is already constructed");
     }
     // Window: explicit object/id, else the scene's first window.
@@ -274,14 +298,29 @@ extern "C" fn layer_ctor(
             }
         },
     };
-    let id = scene.add_layer(window, parent);
-    if let Some(layer) = scene.layer_mut(id) {
-        layer.rect = Rect::new(0, 0, 32, 32);
-    }
-    if !scene.ensure_layer_image(id, 32, 32) {
-        return report_error(out_error, "Layer: could not allocate the default image");
-    }
-    inst.id = Some(id);
+    let id = match inst.id {
+        // `layer_create` already allocated the detached scene record; join it
+        // to `window`/`parent` (the reference `Construct`).
+        Some(id) => {
+            scene.attach_layer(id, window, parent);
+            id
+        }
+        // No scene was available at creation time (e.g. before any window);
+        // allocate and join now.
+        None => {
+            let id = scene.add_layer(window, parent);
+            if let Some(layer) = scene.layer_mut(id) {
+                layer.rect = Rect::new(0, 0, 32, 32);
+            }
+            if !scene.ensure_layer_image(id, 32, 32) {
+                scene.remove_layer(id);
+                return report_error(out_error, "Layer: could not allocate the default image");
+            }
+            inst.id = Some(id);
+            id
+        }
+    };
+    inst.attached = true;
     log::trace!("Layer created: id={id} parent={parent:?}");
     register_layer(&ctx, resolved.engine(), id, objthis);
     set_int(out, i64::from(id));
@@ -2983,6 +3022,12 @@ extern "C" fn layer_font_get(
     let host = resolved.engine();
     // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; `layer_font_get` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut LayerInst) };
+    // Reference `tTJSNI_BaseLayer::GetFontObjectNoAddRef` raises until the
+    // native constructor has joined the layer; the id alone is no longer
+    // enough once it is allocated at creation.
+    if !inst.attached {
+        return report_error(out_error, "Layer.font: this layer is not constructed");
+    }
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.font: this layer is not constructed");
     };

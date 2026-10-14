@@ -27,7 +27,8 @@ uv run --project scripts krkr-gate gate
 ```
 
 `krkr-gate gate` runs, in order: `cargo fmt --all -- --check`; the
-`stateless`, `error-handling`, `house-style`, `layering`, `storage-boundary`
+`stateless`, `error-handling`, `house-style`, `layering`, `storage-boundary`,
+`native-construction`
 checks;
 `cargo clippy --workspace --all-targets -- -D warnings`;
 `cargo test --workspace --no-fail-fast`;
@@ -46,6 +47,7 @@ uv run --project scripts krkr-gate error-handling
 uv run --project scripts krkr-gate house-style
 uv run --project scripts krkr-gate layering
 uv run --project scripts krkr-gate storage-boundary
+uv run --project scripts krkr-gate native-construction
 uv run --project scripts krkr-gate host-facts
 uv run --project scripts krkr-gate android-target
 uv run --project scripts krkr-gate surface-lock --no-regen

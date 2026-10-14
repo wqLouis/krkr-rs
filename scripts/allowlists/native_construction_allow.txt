@@ -1,0 +1,22 @@
+# Native-instance construction allowlist (AGENTS §4/D11).  Enforced by
+# krkr-gate native-construction.
+#
+# One entry per line:  path:line:pattern — reason
+#
+#   path     repo-relative path of the file.
+#   line     the line at the time the entry was written (advisory when
+#            `pattern` is a code anchor).
+#   pattern  the create callback name (e.g. `menu_item_create`) — matched as a
+#            substring of the finding, so it survives line churn and fails
+#            closed when the create callback changes; or the rule name
+#            `native-preconstruct` for an exact-line entry.
+#   reason   why the lazy payload is legitimate, citing `reference/cpp/**`
+#            where the behaviour comes from (D30). A site is not evidence
+#            without one.
+#
+# Intentionally empty: every native-instance create callback that a member
+# helper can reject as "not constructed" now builds the usable payload state
+# at creation (the reference's `CreateNativeInstance` contract) and defers only
+# the owner/manager join to `Construct`. An entry may only be added for a
+# create callback the reference genuinely leaves unusable until `Construct`,
+# with the exact reference lines quoted.

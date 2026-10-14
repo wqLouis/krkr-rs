@@ -25,6 +25,7 @@ from .checks import (
     host_facts,
     house_style,
     layering,
+    native_construction,
     native_parity,
     plugin_parity,
     stateless,
@@ -41,6 +42,7 @@ CHECKS: dict[str, Callable[[list[str]], int]] = {
     "house-style": house_style.run,
     "layering": layering.run,
     "storage-boundary": storage_boundary.run,
+    "native-construction": native_construction.run,
     "host-facts": host_facts.run,
     "android-target": android_target.run,
     "surface-lock": surface_lock.run,
@@ -57,6 +59,7 @@ GATE_SEQUENCE: list[tuple[str, str, str, list[str]]] = [
     ("house-style", "check", "house-style", []),
     ("layering", "check", "layering", []),
     ("storage-boundary", "check", "storage-boundary", []),
+    ("native-construction", "check", "native-construction", []),
     (
         "cargo clippy",
         "cargo",
@@ -114,6 +117,7 @@ Checks:
   house-style      bean accessors, parameter shapes, comments (AGENTS §5/§6)
   layering         layer vocabulary and unsafe placement (AGENTS §2/§5)
   storage-boundary script storage names that reach L2 or the host unstripped
+  native-construction native instances left unconstructed at create time
   host-facts       host seams with no production installer
   android-target   per-target backend-feature resolution
   surface-lock     VM dispatch surface vs the committed baseline

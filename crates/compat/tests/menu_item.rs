@@ -436,3 +436,35 @@ fn popup_coerces_its_arguments_before_returning_success() {
     // The success value is still `1` for coercible arguments.
     assert_eq!(env.eval_int("m.popup(0, 10, 20)"), 1);
 }
+
+/// A script subclass may touch a native `MenuItem` member before it calls
+/// `super.MenuItem(...)`. The reference's `CreateNativeInstance` returns a
+/// menu item whose flags are already initialized
+/// (`reference/cpp/core/visual/impl/MenuItemImpl.cpp:95-102`), and `Construct`
+/// only sets the action owner, window and caption
+/// (`reference/cpp/core/visual/MenuItemIntf.cpp:41-73`), so a pre-constructor
+/// flag write lands. The port used to reject it with
+/// `MenuItem.add: this item is not constructed`.
+#[test]
+fn subclass_member_writes_before_the_base_constructor_land() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        r#"
+        class EarlyItem extends MenuItem {
+            function EarlyItem() {
+                checked = true;
+                enabled = false;
+                visible = false;
+                super.MenuItem(null);
+            }
+        }
+        var m = new EarlyItem();
+        "#,
+    );
+    // reference/cpp/core/visual/impl/MenuItemImpl.cpp:95-102 — the native
+    // constructor initializes the flags and `Construct` does not touch them.
+    assert_eq!(env.eval_int("m.checked"), 1);
+    assert_eq!(env.eval_int("m.enabled"), 0);
+    assert_eq!(env.eval_int("m.visible"), 0);
+}

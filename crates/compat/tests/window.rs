@@ -500,3 +500,39 @@ fn obsolete_window_members_are_registered() {
     // (`reference/cpp/core/visual/WindowIntf.cpp:872-882`).
     assert!(env.eval("w.setLayerPos(1)").is_err());
 }
+
+/// A script subclass may touch a native `Window` member before it calls
+/// `super.Window(...)`. The reference's `CreateNativeInstance` already returns
+/// a window whose fields are usable, and only `Construct` joins it to the
+/// manager (`reference/cpp/core/visual/WindowIntf.cpp:143-156`), so the
+/// pre-constructor member call succeeds. The port used to reject every such
+/// member, which made `new KAGWindow()` throw and left the script global
+/// `kag` unset; a dependent script then failed with `Member "kag" does not
+/// exist`. The reference's KAG scripts only *guard* that global
+/// (`reference/cpp/core/base/impl/SystemImpl.cpp:520-535`), so it is the
+/// script that must have set it.
+#[test]
+fn subclass_member_calls_before_the_base_constructor_leave_global_kag_set() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        r#"
+        class KAGWindow extends Window {
+            function KAGWindow() {
+                setSize(320, 240);
+                super.Window();
+            }
+        }
+        global.kag = new KAGWindow() if typeof global.kag == "undefined";
+        "#,
+    );
+
+    // A second script reads the bare global; an unset `kag` raises.
+    assert_eq!(
+        env.eval_ok("typeof kag"),
+        TjsValue::String("Object".to_string()),
+        "the subclass constructor must run to completion and set global.kag"
+    );
+    // The member call before `super.Window(...)` must have reached the window.
+    assert_eq!(env.eval_int("kag.width"), 1280);
+}

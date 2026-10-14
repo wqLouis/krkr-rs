@@ -757,3 +757,37 @@ fn font_metrics_fall_back_to_a_system_face() {
         Err(message) => panic!("unexpected error: {message}"),
     }
 }
+
+/// A script subclass may touch a native `Font` member before it calls
+/// `super.Font(...)`. The reference's `CreateNativeInstance` returns a font
+/// whose fields are usable (`reference/cpp/core/visual/LayerIntf.cpp:11500-11532`),
+/// and `Construct` then replaces the native font with the default font or the
+/// layer's font, so the constructor arguments win over a pre-constructor
+/// write. The port used to reject such a write with
+/// `Font: this font is not constructed`.
+#[test]
+fn subclass_member_writes_before_the_base_constructor_do_not_raise() {
+    let _lock = vm_lock();
+    let env = Env::new(None);
+    env.run(
+        r#"
+        class EarlyFont extends Font {
+            function EarlyFont() {
+                face = 'pre-constructor';
+                height = 99;
+                bold = true;
+                super.Font('constructor-face', 24, 0xffffffff);
+            }
+        }
+        var f = new EarlyFont();
+        "#,
+    );
+    // reference/cpp/core/visual/LayerIntf.cpp:11506-11530 — `Construct`
+    // resets the native font, so the constructor's face/height/style win.
+    assert_eq!(
+        env.eval_ok("f.face"),
+        TjsValue::String("constructor-face".into())
+    );
+    assert_eq!(env.eval_int("f.height"), 24);
+    assert_eq!(env.eval_int("f.bold"), 0);
+}

@@ -141,6 +141,10 @@ struct MenuState {
 #[derive(Default)]
 struct MenuItemInst {
     id: Option<u64>,
+    /// Set by the native constructor (`super.MenuItem(...)`). `menu_item_create`
+    /// already registered a default node, so the id alone cannot tell whether
+    /// the constructor ran.
+    attached: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -365,8 +369,22 @@ fn index_of(state: &MenuState, id: u64) -> usize {
 // Instance lifecycle
 // ---------------------------------------------------------------------------
 
-extern "C" fn menu_item_create(_engine: *mut c_void) -> *mut c_void {
-    Box::into_raw(Box::<MenuItemInst>::default()) as *mut c_void
+extern "C" fn menu_item_create(engine: *mut c_void) -> *mut c_void {
+    // The reference's `CreateNativeInstance` returns a menu item whose fields
+    // are usable; `Construct` only sets the action owner, the window/caption
+    // and the parent link. A script subclass may touch a member before
+    // `super.MenuItem(...)`, so the node exists from creation.
+    let mut inst = MenuItemInst::default();
+    if let Ok((_resolved, ctx)) = bound(engine) {
+        // SAFETY: `bound` only succeeds for the installed, live binding.
+        let services = unsafe { ctx.services() };
+        let mut state = services.state::<MenuState>();
+        let id = state.next_id.max(1);
+        state.next_id = id + 1;
+        state.nodes.insert(id, MenuNode::default());
+        inst.id = Some(id);
+    }
+    Box::into_raw(Box::new(inst)) as *mut c_void
 }
 
 extern "C" fn menu_item_destroy(engine: *mut c_void, instance: *mut c_void) {
@@ -520,7 +538,7 @@ extern "C" fn menu_item_ctor(
     let host = resolved.engine();
     // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; `menu_item_ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut MenuItemInst) };
-    if inst.id.is_some() {
+    if inst.attached {
         return report_error(out_error, "MenuItem: this item is already constructed");
     }
     // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
@@ -561,9 +579,9 @@ extern "C" fn menu_item_ctor(
                 }
             };
             // The reference requires a native `Window` instance here and
-            // throws `TVPSpecifyWindow` otherwise (`MenuItemIntf.cpp:61-70`).
+            // throws `TVPSpecifyWindow` otherwise.
             match host.native_instance_payload(object.raw_id(), "Window") {
-                Ok(Some(_)) => (Some(object), String::new()),
+                Ok(Some(_)) => (Some(object), None),
                 Ok(None) => {
                     return report_error(
                         out_error,
@@ -575,10 +593,10 @@ extern "C" fn menu_item_ctor(
                 }
             }
         }
-        // `if(!Window && numparams >= 2) Caption = *param[1]`
-        // (`impl/MenuItemImpl.cpp:121-126`).
-        Some(second) => (None, value_as_string(second)),
-        None => (None, String::new()),
+        // The reference sets the caption only when a second argument is
+        // present, so a pre-constructor caption survives `super.MenuItem(owner)`.
+        Some(second) => (None, Some(value_as_string(second))),
+        None => (None, None),
     };
     let object = host.retain_object_detached(objthis).ok();
 
@@ -586,25 +604,46 @@ extern "C" fn menu_item_ctor(
     let services = unsafe { ctx.services() };
     let id = {
         let mut state = services.state::<MenuState>();
-        let id = state.next_id.max(1);
-        state.next_id = id + 1;
-        state.nodes.insert(
-            id,
-            MenuNode {
-                caption,
-                action_owner,
-                window,
-                object,
-                self_handle: objthis as usize,
-                ..MenuNode::default()
-            },
-        );
+        let id = match inst.id {
+            // `menu_item_create` already registered a default node; the
+            // constructor fills in the action owner, window, caption and self
+            // handle while preserving the pre-constructor member writes.
+            Some(id) => {
+                if let Some(node) = state.nodes.get_mut(&id) {
+                    if let Some(caption) = caption {
+                        node.caption = caption;
+                    }
+                    node.action_owner = action_owner;
+                    node.window = window;
+                    node.object = object;
+                    node.self_handle = objthis as usize;
+                }
+                id
+            }
+            None => {
+                let id = state.next_id.max(1);
+                state.next_id = id + 1;
+                state.nodes.insert(
+                    id,
+                    MenuNode {
+                        caption: caption.unwrap_or_default(),
+                        action_owner,
+                        window,
+                        object,
+                        self_handle: objthis as usize,
+                        ..MenuNode::default()
+                    },
+                );
+                id
+            }
+        };
         if !objthis.is_null() {
             state.instances.insert(objthis as usize, id);
         }
         id
     };
     inst.id = Some(id);
+    inst.attached = true;
     set_void(out);
     0
 }

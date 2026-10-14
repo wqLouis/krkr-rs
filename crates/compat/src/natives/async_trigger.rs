@@ -105,9 +105,6 @@ struct AsyncTriggerState {
 /// Typed `AsyncTrigger` failures.
 #[derive(Debug, thiserror::Error)]
 enum AsyncTriggerError {
-    /// The native instance was not constructed (no registry entry).
-    #[error("AsyncTrigger is not constructed")]
-    NotConstructed,
     /// No registry entry for the given handle.
     #[error("unknown AsyncTrigger {0:?}")]
     UnknownTrigger(AsyncTriggerId),
@@ -234,12 +231,6 @@ fn bound(engine: *mut c_void) -> Result<(&'static Tjs2Engine, CompatCtx), String
         resolve(engine).ok_or_else(|| "async_trigger: compat context is not bound".to_string())?;
     let ctx = resolved.ctx();
     Ok((resolved.engine(), ctx))
-}
-
-/// The registry handle of a constructed instance (instead of a silent
-/// default).
-fn instance_id(inst: &AsyncTriggerInst) -> Result<AsyncTriggerId, AsyncTriggerError> {
-    inst.id.ok_or(AsyncTriggerError::NotConstructed)
 }
 
 /// Invoke the action retained for `id` (the reference `onFire` body,
@@ -430,9 +421,11 @@ extern "C" fn async_trigger_trigger(
     };
     // SAFETY: `instance` is the live `AsyncTriggerInst` payload the VM allocated for this script object; no `&mut` to it is live in `async_trigger_trigger`.
     let inst = unsafe { &*(instance as *const AsyncTriggerInst) };
-    let id = match instance_id(inst) {
-        Ok(id) => id,
-        Err(error) => return report_error(out_error, &format!("AsyncTrigger.trigger: {error}")),
+    // The registry entry is this port's owner: an unconstructed (or
+    // invalidated) object is a silent no-op, not an error.
+    let Some(id) = inst.id else {
+        set_void(out);
+        return 0;
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
@@ -467,9 +460,10 @@ extern "C" fn async_trigger_cancel(
     };
     // SAFETY: `instance` is the live `AsyncTriggerInst` payload the VM allocated for this script object; no `&mut` to it is live in `async_trigger_cancel`.
     let inst = unsafe { &*(instance as *const AsyncTriggerInst) };
-    let id = match instance_id(inst) {
-        Ok(id) => id,
-        Err(error) => return report_error(out_error, &format!("AsyncTrigger.cancel: {error}")),
+    // See `async_trigger_trigger`: no registry entry is a silent no-op.
+    let Some(id) = inst.id else {
+        set_void(out);
+        return 0;
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
@@ -502,9 +496,11 @@ extern "C" fn async_trigger_on_fire(
     };
     // SAFETY: `instance` is the live `AsyncTriggerInst` payload the VM allocated for this script object; no `&mut` to it is live in `async_trigger_on_fire`.
     let inst = unsafe { &*(instance as *const AsyncTriggerInst) };
-    let id = match instance_id(inst) {
-        Ok(id) => id,
-        Err(error) => return report_error(out_error, &format!("AsyncTrigger.onFire: {error}")),
+    // See `async_trigger_trigger`: no registry entry (and therefore no
+    // retained action) makes `onFire` a no-op.
+    let Some(id) = inst.id else {
+        set_void(out);
+        return 0;
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
@@ -560,14 +556,11 @@ extern "C" fn async_trigger_cached_set(
     let cached = value_as_bool(unsafe { &*value });
     // SAFETY: `instance` is the live `AsyncTriggerInst` payload the VM allocated for this script object; `async_trigger_cached_set` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut AsyncTriggerInst) };
-    let id = match instance_id(inst) {
-        Ok(id) => id,
-        Err(error) => return report_error(out_error, &format!("AsyncTrigger.cached: {error}")),
-    };
-    // Reference `SetCached`: only a change cancels (`EventIntf.cpp:1072-1079`).
+    // Only a change cancels, and cancelling without a registered owner is a
+    // no-op, so the flag is written even before the constructor runs.
     let changed = inst.cached != cached;
     inst.cached = cached;
-    if changed {
+    if changed && let Some(id) = inst.id {
         // SAFETY: the caller resolved `ctx` from the installed binding.
         unsafe { ctx.services() }
             .state::<AsyncTriggerState>()
@@ -608,14 +601,11 @@ extern "C" fn async_trigger_mode_set(
     let mode = value_as_i64(unsafe { &*value });
     // SAFETY: `instance` is the live `AsyncTriggerInst` payload the VM allocated for this script object; `async_trigger_mode_set` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut AsyncTriggerInst) };
-    let id = match instance_id(inst) {
-        Ok(id) => id,
-        Err(error) => return report_error(out_error, &format!("AsyncTrigger.mode: {error}")),
-    };
-    // Reference `SetMode`: only a change cancels (`EventIntf.cpp:1082-1089`).
+    // See `async_trigger_cached_set`: the mode is stored unconditionally and
+    // only a change cancels, which is a no-op before the join.
     let changed = inst.mode != mode;
     inst.mode = mode;
-    if changed {
+    if changed && let Some(id) = inst.id {
         // SAFETY: the caller resolved `ctx` from the installed binding.
         unsafe { ctx.services() }
             .state::<AsyncTriggerState>()

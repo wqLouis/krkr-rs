@@ -24,6 +24,11 @@ use tjs::VAL_OBJECT;
 /// [`engine::WindowState`] does not model (there is no OS chrome).
 struct WindowInst {
     id: Option<u32>,
+    /// Set by the native constructor (`super.Window(...)`). Before it runs the
+    /// window exists but is not yet registered with the manager; `id` is
+    /// already allocated so the reference's pre-`Construct` member writes
+    /// land.
+    attached: bool,
     left: i32,
     top: i32,
     min_width: i32,
@@ -66,6 +71,7 @@ impl Default for WindowInst {
     fn default() -> Self {
         Self {
             id: None,
+            attached: false,
             left: 0,
             top: 0,
             min_width: 0,
@@ -149,8 +155,19 @@ fn register_window(ctx: &CompatCtx, host: &Tjs2Engine, id: u32, objthis: *mut c_
 // Window
 // ---------------------------------------------------------------------------
 
-extern "C" fn window_create(_engine: *mut c_void) -> *mut c_void {
-    Box::into_raw(Box::new(WindowInst::default())) as *mut c_void
+extern "C" fn window_create(engine: *mut c_void) -> *mut c_void {
+    // The reference's `CreateNativeInstance` returns a window whose fields are
+    // already usable; only the manager registration and the default draw
+    // device wait for `Construct`. A script subclass may touch a `Window`
+    // member before it calls `super.Window(...)`, so the scene window exists
+    // from creation.
+    let mut inst = WindowInst::default();
+    if let Ok((_resolved, ctx)) = bound(engine)
+        && let Ok(scene) = scene_mut(&ctx)
+    {
+        inst.id = Some(scene.add_window(String::new(), (1280, 720)));
+    }
+    Box::into_raw(Box::new(inst)) as *mut c_void
 }
 
 extern "C" fn window_destroy(engine: *mut c_void, instance: *mut c_void) {
@@ -196,7 +213,7 @@ extern "C" fn window_ctor(
         return report_error(out_error, "Window: compat context is not bound");
     };
     // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
-    if unsafe { &*(instance as *const WindowInst) }.id.is_some() {
+    if unsafe { &*(instance as *const WindowInst) }.attached {
         return report_error(out_error, "Window: this window is already constructed");
     }
     let scene = match scene_mut(&ctx) {
@@ -206,12 +223,24 @@ extern "C" fn window_ctor(
     // The game immediately sizes the window; a non-zero default keeps
     // `win.width`/`win.height` sane before `setInnerSize` (the reference
     // opens with a default size).
-    let id = scene.add_window(String::new(), (1280, 720));
-    // This borrow is released before `eval_retained` below: that call runs
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM
+    // owns it and keeps it alive and unaliased for the duration of this
+    // callback.
+    let id = match unsafe { &*(instance as *const WindowInst) }.id {
+        // `window_create` already allocated the scene window; only the
+        // manager join and the draw device wait for the constructor.
+        Some(id) => id,
+        // No scene was available at creation time; allocate it now.
+        None => {
+            let id = scene.add_window(String::new(), (1280, 720));
+            // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
+            unsafe { &mut *(instance as *mut WindowInst) }.id = Some(id);
+            id
+        }
+    };
+    // The scene borrow ends here, before `eval_retained` below: that call runs
     // script, which could otherwise re-enter a `Window` member and mint a
     // second `&mut` to the same payload.
-    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
-    unsafe { &mut *(instance as *mut WindowInst) }.id = Some(id);
     register_window(&ctx, resolved.engine(), id, objthis);
     // Install the default draw device: the reference constructs a
     // `BasicDrawDevice` for every window and throws `TVPInternalError` when
@@ -234,6 +263,9 @@ extern "C" fn window_ctor(
             return report_error(out_error, "Internal error");
         }
     }
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; this
+    // write runs after `eval_retained` returned, so no borrow spans the call.
+    unsafe { &mut *(instance as *mut WindowInst) }.attached = true;
     set_int(out, i64::from(id));
     0
 }
@@ -452,6 +484,13 @@ extern "C" fn window_set_size(
     let height = value_as_i64(&a[1]).max(0) as u32;
     // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
+    // The reference stores the size on the form, and the form does not exist
+    // until the native constructor runs, so a pre-`super.Window(...)` write is
+    // a no-op.
+    if !inst.attached {
+        set_void(out);
+        return 0;
+    }
     let Some(id) = inst.id else {
         return report_error(out_error, "Window.setSize: this window is not constructed");
     };

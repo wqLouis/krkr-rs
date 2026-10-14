@@ -244,3 +244,40 @@ fn constructor_requires_an_action_callback() {
     let env = Env::new();
     assert!(env.engine.eval("new AsyncTrigger()", "t").is_err());
 }
+
+/// A script subclass may write `cached`/`mode` and call `trigger`/`cancel`
+/// before it calls `super.AsyncTrigger(...)`. The reference initializes the
+/// flags in the native constructor (`reference/cpp/core/base/EventIntf.cpp:1003-1011`)
+/// and guards the queue on `Owner` (`:1043`, `:1064`), which `Construct` sets
+/// (`:1015-1036`), so a pre-constructor write lands and a pre-constructor
+/// `trigger` is a no-op rather than an error.
+#[test]
+fn subclass_members_before_the_base_constructor_follow_the_owner_guard() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        r#"
+        var fired = 0;
+        class Early extends AsyncTrigger {
+            function Early() {
+                cached = false;
+                mode = 2;
+                trigger();
+                cancel();
+                super.AsyncTrigger(function(){ fired = fired + 1; }, "");
+            }
+        }
+        var t = new Early();
+        "#,
+    );
+    // The pre-constructor writes reached the instance.
+    assert_eq!(env.eval_int("t.cached"), 0);
+    assert_eq!(env.eval_int("t.mode"), 2);
+    // The pre-constructor `trigger` scheduled nothing: no owner existed yet.
+    env.poll();
+    assert_eq!(env.eval_int("fired"), 0);
+    // After the constructor the trigger works normally.
+    env.run("t.trigger();");
+    env.poll();
+    assert_eq!(env.eval_int("fired"), 1);
+}

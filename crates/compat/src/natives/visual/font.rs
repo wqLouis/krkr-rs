@@ -40,6 +40,10 @@ use crate::{CompatCtx, CompatError};
 #[derive(Default)]
 struct FontInst {
     id: Option<u32>,
+    /// Set by the native constructor (`super.Font(...)`). `font_create`
+    /// already registered a default scene font, so the id alone cannot tell
+    /// whether the constructor ran.
+    attached: bool,
     owns_state: bool,
 }
 
@@ -207,8 +211,24 @@ fn register_font(ctx: &CompatCtx, host: &Tjs2Engine, id: u32, objthis: *mut c_vo
 // Font
 // ---------------------------------------------------------------------------
 
-extern "C" fn font_create(_engine: *mut c_void) -> *mut c_void {
-    Box::into_raw(Box::new(FontInst::default())) as *mut c_void
+extern "C" fn font_create(engine: *mut c_void) -> *mut c_void {
+    // The reference's `CreateNativeInstance` returns a font whose fields are
+    // usable; `Construct` only binds it to a layer or resets it to the default
+    // font. A script subclass may touch a member before `super.Font(...)`, so
+    // the scene font exists from creation.
+    let mut inst = FontInst::default();
+    if let Ok((_resolved, ctx)) = bound(engine)
+        && let Ok(scene) = scene_mut(&ctx)
+    {
+        let id = scene.add_font(
+            DEFAULT_FONT_FACE.to_string(),
+            DEFAULT_FONT_HEIGHT,
+            argb_to_rgba(DEFAULT_FONT_COLOR),
+        );
+        inst.id = Some(id);
+        inst.owns_state = true;
+    }
+    Box::into_raw(Box::new(inst)) as *mut c_void
 }
 
 extern "C" fn font_destroy(engine: *mut c_void, instance: *mut c_void) {
@@ -270,16 +290,30 @@ extern "C" fn font_ctor(
     let color = a.get(2).map(value_as_i64).unwrap_or(DEFAULT_FONT_COLOR);
     // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; `font_ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut FontInst) };
-    if inst.id.is_some() {
+    if inst.attached {
         return report_error(out_error, "Font: this font is already constructed");
     }
     let scene = match scene_mut(&ctx) {
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    let id = scene.add_font(face, height, argb_to_rgba(color));
-    inst.id = Some(id);
-    inst.owns_state = true;
+    // `font_create` already registered a default font; the constructor
+    // resets it to the default style with the constructor's face/height/color,
+    // matching the reference `Construct`, which replaces the native font
+    // rather than preserving a pre-constructor write.
+    let id = match inst.id {
+        Some(id) if scene.font(id).is_some() => {
+            scene.reset_font(id, face, height, argb_to_rgba(color));
+            id
+        }
+        _ => {
+            let id = scene.add_font(face, height, argb_to_rgba(color));
+            inst.id = Some(id);
+            inst.owns_state = true;
+            id
+        }
+    };
+    inst.attached = true;
     register_font(&ctx, resolved.engine(), id, objthis);
     set_int(out, i64::from(id));
     0
