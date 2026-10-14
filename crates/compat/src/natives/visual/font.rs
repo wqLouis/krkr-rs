@@ -26,8 +26,8 @@ use tjs::{
 };
 
 use super::common::{
-    DEFAULT_FONT_COLOR, DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, VisualState, argb_to_rgba, bound,
-    scene_mut, scene_ref, set_real, set_visual_string_out,
+    DEFAULT_FONT_COLOR, DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, argb_to_rgba, bound, scene_mut,
+    scene_ref, set_real, set_visual_string_out,
 };
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
 use crate::natives::system::{value_as_bool, value_as_i64};
@@ -189,24 +189,6 @@ fn angle_radians(angle_tenths: f64) -> f64 {
     angle_tenths * std::f64::consts::PI / 1800.0
 }
 
-/// See `register_window`.
-fn register_font(ctx: &CompatCtx, host: &Tjs2Engine, id: u32, objthis: *mut c_void) {
-    if objthis.is_null() {
-        return;
-    }
-    match host.retain_object_detached(objthis) {
-        // SAFETY: the caller resolved `ctx` from the installed binding.
-        Ok(object) => {
-            unsafe { ctx.services() }
-                .state::<VisualState>()
-                .objects
-                .fonts
-                .insert(id, object);
-        }
-        Err(error) => log::warn!("Font: could not retain the script object: {error}"),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Font
 // ---------------------------------------------------------------------------
@@ -240,7 +222,6 @@ extern "C" fn font_destroy(engine: *mut c_void, instance: *mut c_void) {
     if let (Some(id), Ok((_resolved, ctx))) = (inst.id, bound(engine)) {
         // SAFETY: the caller resolved `ctx` from the installed binding.
         let services = unsafe { ctx.services() };
-        services.state::<VisualState>().objects.fonts.remove(&id);
         services
             .state::<FontMetricsState>()
             .face_is_file_name
@@ -267,9 +248,9 @@ extern "C" fn font_ctor(
     argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    objthis: *mut c_void,
+    _objthis: *mut c_void,
 ) -> c_int {
-    let Ok((resolved, ctx)) = bound(engine) else {
+    let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Font: compat context is not bound");
     };
     // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
@@ -314,7 +295,6 @@ extern "C" fn font_ctor(
         }
     };
     inst.attached = true;
-    register_font(&ctx, resolved.engine(), id, objthis);
     set_int(out, i64::from(id));
     0
 }
@@ -342,24 +322,11 @@ pub(super) fn bind_font_object(
     if owned
         && let Some(previous) = previous
         && previous != font_id
+        && let Some(scene) = services.scene()
     {
-        services
-            .state::<VisualState>()
-            .objects
-            .fonts
-            .remove(&previous);
-        if let Some(scene) = services.scene() {
-            // SAFETY: the scene is live for the binding's lifetime.
-            let scene = unsafe { &mut *scene };
-            scene.fonts.retain(|font| font.id != previous);
-        }
-    }
-    if let Ok(retained) = host.duplicate_retained(object) {
-        services
-            .state::<VisualState>()
-            .objects
-            .fonts
-            .insert(font_id, retained);
+        // SAFETY: the scene is live for the binding's lifetime.
+        let scene = unsafe { &mut *scene };
+        scene.fonts.retain(|font| font.id != previous);
     }
     Ok(())
 }

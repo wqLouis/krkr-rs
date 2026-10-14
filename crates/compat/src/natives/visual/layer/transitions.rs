@@ -642,27 +642,48 @@ fn options_text(host: &tjs::Tjs2Engine, options: Option<&Value>, name: &str) -> 
 /// both the event and the peer teardown in `InternalStopTransition`
 /// (`:7997-8004`).
 fn object_alive(ctx: &crate::CompatCtx, kind: ObjectKind, id: u32) -> bool {
-    let (raw, class) = {
-        // SAFETY: the caller resolved `ctx` from the installed binding.
-        let state = unsafe { ctx.services() }.state::<VisualState>();
-        let object = match kind {
-            ObjectKind::Layer => state.objects.layers.get(&id),
-            ObjectKind::Window => state.objects.windows.get(&id),
-        };
-        let class = match kind {
-            ObjectKind::Layer => "Layer",
-            ObjectKind::Window => "Window",
-        };
-        match object {
-            Some(object) => (object.raw_id(), class),
-            None => return false,
-        }
+    let class = match kind {
+        ObjectKind::Layer => "Layer",
+        ObjectKind::Window => "Window",
     };
-    // SAFETY: `ctx` was resolved from the installed binding, so the engine is
-    // live; `raw` is a retained id the registry keeps alive across this call.
-    unsafe { ctx.engine() }
-        .native_instance_payload(raw, class)
-        .is_ok_and(|payload| payload.is_some())
+    match kind {
+        ObjectKind::Window => {
+            let held = {
+                // SAFETY: the caller resolved `ctx` from the installed binding.
+                let state = unsafe { ctx.services() }.state::<VisualState>();
+                state.objects.windows.get(&id).map(|object| object.raw_id())
+            };
+            let Some(raw) = held else {
+                return false;
+            };
+            // SAFETY: `ctx` was resolved from the installed binding, so the
+            // engine is live; `raw` is a retained id the registry keeps alive
+            // across this call.
+            unsafe { ctx.engine() }
+                .native_instance_payload(raw, class)
+                .is_ok_and(|payload| payload.is_some())
+        }
+        ObjectKind::Layer => {
+            let raw = {
+                // SAFETY: the caller resolved `ctx` from the installed binding.
+                let state = unsafe { ctx.services() }.state::<VisualState>();
+                state.objects.layers.get(&id).map(|object| object.as_ptr())
+            };
+            let Some(raw) = raw else {
+                return false;
+            };
+            // SAFETY: `ctx` was resolved from the installed binding, so the
+            // engine is live; the raw object is alive while its registry entry
+            // is present. Retain it for the lookup, then release it.
+            let Ok(retained) = (unsafe { ctx.engine() }).retain_object_detached(raw) else {
+                return false;
+            };
+            // SAFETY: see above.
+            unsafe { ctx.engine() }
+                .native_instance_payload(retained.raw_id(), class)
+                .is_ok_and(|payload| payload.is_some())
+        }
+    }
 }
 
 /// Advance every active transition by `dt_ms` and tear down the finished or

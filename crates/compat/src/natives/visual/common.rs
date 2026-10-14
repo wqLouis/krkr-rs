@@ -30,10 +30,12 @@ pub(crate) const DEFAULT_FONT_COLOR: i64 = 0xffff_ffff;
 // Per-family dispatch state (never a process global)
 // ---------------------------------------------------------------------------
 
-/// Scene id → the retained script object (`objthis`) that wraps it. This is
-/// the one cross-object mapping the visual natives need: it lets
+/// Scene id → the script object (`objthis`) that wraps it. This is the one
+/// cross-object mapping the visual natives need: it lets
 /// `Window.primaryLayer`, `Layer.parent`, `Layer.window`, `Layer.children`
-/// and `Layer.getLayerAt` hand back the *real* object a script created.
+/// and `Layer.getLayerAt` hand back the *real* object a script created. The
+/// window entry owns its object; a layer entry is a non-owning
+/// [`ObjectHandle`].
 #[derive(Default)]
 pub(crate) struct ObjectRegistry {
     pub(crate) windows: HashMap<u32, DetachedValue>,
@@ -65,7 +67,7 @@ impl ObjectHandle {
     }
 
     /// The raw script object pointer.
-    pub(crate) fn as_ptr(self) -> *mut c_void {
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
         self.raw as *mut c_void
     }
 }

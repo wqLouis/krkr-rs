@@ -109,6 +109,10 @@ struct SystemState {
     /// Epoch of the first `getTickCount` call (the reference's
     /// `TVPStartTickCount`).
     tick_epoch: Option<Instant>,
+    /// Rough tick of the last automatic compact, or `None` before the first
+    /// check (the reference `LastCompactedTick`,
+    /// `reference/cpp/core/environ/impl/SystemControl.cpp:52`).
+    last_compacted_ms: Option<i64>,
     /// Counter mixed into `createUUID` seeds (keeps the UUID generator
     /// stateless without a process global).
     uuid_counter: u64,
@@ -139,6 +143,7 @@ impl Default for SystemState {
             exit_on_no_window_startup: true,
             draw_thread_num: 0,
             tick_epoch: None,
+            last_compacted_ms: None,
             uuid_counter: 0,
             continuous: Vec::new(),
             current_continuous: None,
@@ -222,6 +227,58 @@ pub fn continuous_handler_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError>
     let mut state = services.state::<SystemState>();
     state.continuous.retain(|slot| slot.is_some());
     Ok(!state.continuous.is_empty())
+}
+
+/// The idle interval after which the frame body runs the TJS collector.
+///
+/// The reference `SystemWatchTimerTimer` delivers `TVP_COMPACT_LEVEL_IDLE`
+/// once the rough tick is more than 4000 ms past the last compact
+/// (`reference/cpp/core/environ/impl/SystemControl.cpp:174-179`), and that
+/// callback runs `tTJS::DoGarbageCollection`
+/// (`reference/cpp/core/base/ScriptMgnIntf.cpp:377-386`).
+const COMPACT_INTERVAL_MS: i64 = 4000;
+
+/// Run the TJS collector when the idle interval has elapsed.
+///
+/// This is the automatic half of `System.doCompact`: the reference's idle
+/// check (`SystemControl.cpp:174-179`) is not driven from a script, and
+/// without it a long run never compacts the VM at all. Returns whether the
+/// collector ran this frame. On the first call the interval starts, matching
+/// the reference's `LastCompactedTick = 0` initial state, so the first pass is
+/// one interval after the rough clock's epoch.
+///
+/// The collector compacts the variant stack and the string heap. The
+/// vendored VM leaves `TJSVariantArrayStackCompactNow` empty, so
+/// `tTJS::DoGarbageCollection` is paired with an explicit stack compact on
+/// the FFI side (see `tjs2_do_gc`).
+pub fn compact_poll(ctx: &mut CompatCtx) -> bool {
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let engine = unsafe { ctx.engine() };
+    // SAFETY: see above.
+    let services = unsafe { ctx.services() };
+    let due = {
+        let mut state = services.state::<SystemState>();
+        let epoch = *state.tick_epoch.get_or_insert_with(Instant::now);
+        let tick = epoch.elapsed().as_millis() as i64;
+        match state.last_compacted_ms {
+            Some(last) if tick - last <= COMPACT_INTERVAL_MS => false,
+            Some(_) => {
+                state.last_compacted_ms = Some(tick);
+                true
+            }
+            None => {
+                state.last_compacted_ms = Some(tick);
+                false
+            }
+        }
+    };
+    if !due {
+        return false;
+    }
+    if let Err(error) = engine.do_gc() {
+        log::warn!("idle compact: TJS garbage collection failed: {error}");
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------

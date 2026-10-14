@@ -1027,3 +1027,61 @@ fn subclass_member_writes_before_the_base_constructor_land() {
         "a class-body member write before super.Layer must reach the joined layer"
     );
 }
+
+/// Repeated open/close cycles of a config-page-style layer tree must release
+/// every layer, bitmap and font the page created. The reference native
+/// instance keeps only a non-owning owner pointer (`iTJSDispatch2 *Owner`,
+/// `reference/cpp/core/visual/LayerIntf.h:173`) and `Invalidate` releases the
+/// page's resources (`reference/cpp/core/visual/LayerIntf.cpp:515-566`), so a
+/// page whose script reference is dropped reaches reference count zero and
+/// its native teardown runs. A strong L3 registry entry prevented that: the
+/// page stayed rooted, the destroy callback never ran, and `scene.layers`
+/// grew with every cycle.
+#[test]
+fn repeated_page_cycles_release_layers_bitmaps_and_fonts() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window();");
+    let baseline_layers = env.scene.layers.len();
+    let baseline_bitmaps = env.scene.bitmaps.len();
+    let baseline_fonts = env.scene.fonts.len();
+
+    env.run(
+        "var page, row, face; \
+         for (var cycle = 0; cycle < 10; cycle++) { \
+             page = new Layer(w, null); \
+             for (var i = 0; i < 8; i++) { \
+                 row = new Layer(w, page); \
+                 row.setImageSize(8, 8); \
+                 face = row.font; \
+             } \
+             invalidate page; \
+         } \
+         page = null; row = null; face = null;",
+    );
+    // The collector must run outside the creating frame: an in-frame
+    // `System.doCompact()` leaves that frame's stale variant-array
+    // register slot live, so the page's last object survives it. The
+    // frame body's automatic idle compact is the out-of-frame pass the
+    // app uses (`reference/cpp/core/environ/impl/SystemControl.cpp:174-179`);
+    // a separate execution exercises the script path and the direct
+    // `do_gc` reproduces that pass.
+    env.run("System.doCompact();");
+    env.engine.do_gc().expect("idle compact");
+
+    assert_eq!(
+        env.scene.layers.len(),
+        baseline_layers,
+        "a closed config page must not leave its layer tree in the scene"
+    );
+    assert_eq!(
+        env.scene.bitmaps.len(),
+        baseline_bitmaps,
+        "a closed config page must not leave its bitmaps in the scene"
+    );
+    assert_eq!(
+        env.scene.fonts.len(),
+        baseline_fonts,
+        "a closed config page must not leave its fonts in the scene"
+    );
+}

@@ -122,6 +122,13 @@ pub fn run_frame_body(body: &mut dyn FrameBody, ctx: &mut CompatCtx) -> Result<(
     body.continuous_handler_poll(ctx)?;
     body.continuous_handler_completed(started.elapsed());
 
+    // Idle compaction: the reference `tTVPSystemControl::SystemWatchTimerTimer`
+    // delivers `TVP_COMPACT_LEVEL_IDLE` from its per-loop idle check
+    // (`reference/cpp/core/environ/impl/SystemControl.cpp:174-179`). It runs
+    // after the events and before the frame's draw, so the collector never
+    // runs inside a native callback.
+    crate::natives::system::compact_poll(ctx);
+
     let started = Instant::now();
     body.project_and_render(ctx)?;
     body.project_and_render_completed(started.elapsed());
