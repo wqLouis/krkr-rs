@@ -283,6 +283,57 @@ fn foreach_walks_arrays_and_dictionaries() {
     assert_eq!(env.string("visitedKeys"), "x");
 }
 
+/// `ScriptsAdd::foreach` chooses the callback's receiver: the callback's own
+/// `ObjThis` when it has one, otherwise the helper's calling context
+/// (`reference/cpp/plugins/scriptsEx.cpp:690-693`).
+/// `tTJSVariantClosure::FuncCall` prefers an explicit receiver over the
+/// function object (`reference/cpp/core/tjs2/tjsVariant.h:219-228`).
+///
+/// This is the shape the KAG environment relies on: `entryUpdateAll` iterates
+/// its `objects` dictionary with an anonymous callback that reads
+/// `entryUpdate` through `this`, so a lost receiver surfaces as
+/// `Member "entryUpdate" does not exist`. The callback is retained and
+/// re-invoked by the native, so the port must also keep the *absence* of an
+/// `ObjThis` rather than substitute the function object when it detaches the
+/// argument (`crates/tjs/cpp/tjs2_abi.cpp` `resolve_value_variant`).
+#[test]
+fn foreach_anonymous_callback_receives_the_callers_this() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "class KAGEnvironment { \
+             var objects; \
+             var seen; \
+             function KAGEnvironment() { \
+                 objects = %[bgm: 1]; \
+                 seen = -1; \
+             } \
+             function entryUpdate() { return 7; } \
+             function entryUpdateAll() { \
+                 Scripts.foreach(objects, function(key, value) { \
+                     seen = this.entryUpdate(); \
+                 }); \
+             } \
+         } \
+         var kag = new KAGEnvironment(); \
+         kag.entryUpdateAll();",
+    );
+    assert_eq!(env.int("kag.seen"), 7);
+
+    // A callback that carries its own receiver keeps it: the explicit
+    // fallback only fills in a missing `ObjThis`.
+    env.run(
+        "class Binder { \
+             var bound; \
+             function Binder() { bound = 0; } \
+             function record() { bound = 11; } \
+         } \
+         var binder = new Binder(); \
+         Scripts.foreach(%[a: 1], binder.record);",
+    );
+    assert_eq!(env.int("binder.bound"), 11);
+}
+
 // ---------------------------------------------------------------------------
 // clone
 // ---------------------------------------------------------------------------

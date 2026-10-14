@@ -37,9 +37,9 @@ use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 
 use tjs::{
-    DetachedValue, Engine, NativeMethodDef, NativeStaticMembers, RetainedValue, Tjs2Engine,
-    TjsValue, VAL_INTEGER, VAL_NULL, VAL_OBJECT, VAL_OCTET, VAL_REAL, VAL_RETAINED, VAL_STRING,
-    VAL_VOID, Value,
+    DetachedValue, Engine, NativeMethodDef, NativeObjThisMethodDef, NativeStaticMembers,
+    RetainedValue, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_NULL, VAL_OBJECT, VAL_OCTET, VAL_REAL,
+    VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
 };
 
 use crate::binding;
@@ -631,26 +631,45 @@ fn equal_dicts(
 /// Call `func(key, value, extra...)` for every member (reference
 /// `ScriptsAdd::foreach`). A non-`void` return stops the walk and is
 /// returned; otherwise the result is `void`.
+///
+/// `objthis` is the receiver the helper was invoked on; it becomes the
+/// callback's `this` when the callback is an anonymous function
+/// (`funcClosure.ObjThis == 0`, reference `scriptsEx.cpp:690-693`).
 fn foreach(
     engine: &Tjs2Engine,
     _services: &CompatServices,
     target: &DetachedValue,
     function: DetachedValue,
     extra: Vec<Owned>,
+    objthis: *mut c_void,
 ) -> Result<Owned, String> {
     if is_instance_of(engine, target, "Array")? {
         let count = object_count(engine, target)?;
         for index in 0..count {
             let value = engine.member(target.raw_id(), &index.to_string())?;
             let owned = owned_from_tjs(engine, value)?;
-            let result = call_callback(engine, &function, Owned::Integer(index), owned, &extra)?;
+            let result = call_callback(
+                engine,
+                &function,
+                Owned::Integer(index),
+                owned,
+                &extra,
+                objthis,
+            )?;
             if let Some(result) = result {
                 return Ok(result);
             }
         }
     } else {
         for (key, value) in enumerate_entries(engine, target)? {
-            let result = call_callback(engine, &function, Owned::String(key), value, &extra)?;
+            let result = call_callback(
+                engine,
+                &function,
+                Owned::String(key),
+                value,
+                &extra,
+                objthis,
+            )?;
             if let Some(result) = result {
                 return Ok(result);
             }
@@ -667,6 +686,7 @@ fn call_callback(
     key: Owned,
     value: Owned,
     extra: &[Owned],
+    objthis: *mut c_void,
 ) -> Result<Option<Owned>, String> {
     let mut arguments = Vec::with_capacity(2 + extra.len());
     arguments.push(key.to_tjs_for_call(engine)?);
@@ -674,7 +694,7 @@ fn call_callback(
     for argument in extra {
         arguments.push(argument.to_tjs_for_call(engine)?);
     }
-    match engine.call_detached(function, &arguments)? {
+    match engine.call_detached_with_objthis(function, &arguments, objthis)? {
         TjsValue::Void => Ok(None),
         other => Ok(Some(owned_from_tjs(engine, other)?)),
     }
@@ -920,8 +940,9 @@ fn run_foreach(
     target: &DetachedValue,
     function: DetachedValue,
     extra: Vec<Owned>,
+    objthis: *mut c_void,
 ) -> Result<Owned, String> {
-    foreach(engine, services, target, function, extra)
+    foreach(engine, services, target, function, extra, objthis)
 }
 
 /// Whether `target` has the member `key`, via `typeof target[key]`.
@@ -1224,6 +1245,7 @@ extern "C" fn scripts_equal_struct_numeric_loose(
 
 extern "C" fn scripts_foreach(
     engine: *mut c_void,
+    objthis: *mut c_void,
     argc: c_int,
     argv: *const Value,
     out: *mut Value,
@@ -1246,7 +1268,7 @@ extern "C" fn scripts_foreach(
                 .iter()
                 .map(|value| owned_from_arg(engine, value))
                 .collect::<Result<Vec<_>, _>>()?;
-            run_foreach(engine, services, &target, function, extra)
+            run_foreach(engine, services, &target, function, extra, objthis)
         },
     )
 }
@@ -1416,10 +1438,6 @@ fn static_methods() -> Vec<NativeMethodDef> {
             f: scripts_equal_struct_numeric_loose,
         },
         NativeMethodDef {
-            name: "foreach",
-            f: scripts_foreach,
-        },
-        NativeMethodDef {
             name: "getMD5HashString",
             f: scripts_get_md5_hash_string,
         },
@@ -1453,6 +1471,23 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         methods: static_methods(),
         properties: vec![],
     })?;
+
+    // `Scripts.foreach` runs an anonymous callback with the helper's calling
+    // context as its `this` when the callback carries no receiver of its own
+    // (reference `ScriptsAdd::foreach`, `scriptsEx.cpp:690-693`). The plain
+    // static dispatch drops that receiver, so the member is attached through
+    // the objthis dispatch while staying `TJS_STATICMEMBER`.
+    crate::native_util::register_builtin_static_members(
+        // SAFETY: `ctx` is only created for a bound, live engine.
+        unsafe { ctx.engine() },
+        "Scripts",
+        &[NativeObjThisMethodDef {
+            name: "foreach",
+            f: scripts_foreach,
+        }],
+        &[],
+    )
+    .map_err(CompatError::Register)?;
 
     // The `pf*` flags are plain class data members rather than accessor
     // properties, so a script assignment overwrites the value. Write them

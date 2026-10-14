@@ -376,6 +376,18 @@ int tjs2_call_value(void *engine, tjs2_value_id id, int argc,
                     char **out_error);
 
 /*
+ * Like tjs2_call_value, but supplies a fallback receiver. The retained
+ * value's own ObjThis wins when it is set; otherwise `objthis` is used, and
+ * only when both are null does it fall back to the function object itself
+ * (tTJSVariantClosure::FuncCall's preference). Script callbacks that pass an
+ * anonymous function to a helper use the helper's calling context as the
+ * fallback (reference `ScriptsAdd::foreach`, scriptsEx.cpp:690-693).
+ */
+int tjs2_call_value_with_objthis(void *engine, tjs2_value_id id, int argc,
+                                 const tjs2_value *argv, void *objthis,
+                                 tjs2_value *out, char **out_error);
+
+/*
  * Read a named property from a retained object value (PropGet through the
  * object's class chain). Same conventions as tjs2_call_value: returns 0 on
  * success and fills out; on failure returns non-zero with a malloc'd UTF-8

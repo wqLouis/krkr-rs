@@ -1665,13 +1665,18 @@ static bool resolve_value_variant(tjs2_engine *e, const tjs2_value *v,
         if(v->retained) {
             TJS::iTJSDispatch2 *obj =
                 reinterpret_cast<TJS::iTJSDispatch2 *>(v->retained);
-            // `array` carries the closure's ObjThis for a native argument
-            // (null for a plain object); fall back to `obj` otherwise, which
-            // matches tTJSVariantClosure's Object-as-receiver default.
+            // `array` carries the callable's own ObjThis (its receiver),
+            // null for an anonymous function or a plain object. Preserve
+            // the absence instead of substituting `obj`: an anonymous
+            // function with no receiver and a function bound to itself are
+            // different values, and a caller that supplies an explicit
+            // receiver (`tjs2_call_value_with_objthis`) must see the
+            // absent one (`tTJSVariantClosure::FuncCall` still falls back
+            // to `Object` when no receiver is supplied).
             TJS::iTJSDispatch2 *objthis =
                 v->array ? reinterpret_cast<TJS::iTJSDispatch2 *>(
                                const_cast<char **>(v->array))
-                         : obj;
+                         : nullptr;
             var = TJS::tTJSVariant(obj, objthis);
             return true;
         }
@@ -3121,13 +3126,14 @@ int tjs2_invalidate_retained(void *engine, tjs2_value_id id) {
 
 // Invoke the retained value's default member with the given arguments.
 // Follows the VM's own calling convention for a plain function call
-// (tjsInterCodeExec.cpp CallFunction, VM_CALL): FuncCall with no membername
-// and no objthis — tTJSVariantClosure::FuncCall resolves objthis as
-// ObjThis ? ObjThis : Object (tjsVariant.h). Returns 0 on success and fills
-// `out`; non-zero on failure with a malloc'd message in *out_error.
-int tjs2_call_value(void *engine, tjs2_value_id id, int argc,
-                    const tjs2_value *argv, tjs2_value *out,
-                    char **out_error) {
+// (tjsInterCodeExec.cpp CallFunction, VM_CALL): FuncCall with no membername.
+// The value's own ObjThis wins; `objthis` is the fallback receiver, and
+// only when both are null does it become the function object itself
+// (tTJSVariantClosure::FuncCall, tjsVariant.h). Returns 0 on success and
+// fills `out`; non-zero on failure with a malloc'd message in *out_error.
+static int tjs2_call_value_impl(void *engine, tjs2_value_id id, int argc,
+                                const tjs2_value *argv, void *objthis,
+                                tjs2_value *out, char **out_error) {
     tjs2_engine *e = (tjs2_engine *)engine;
     if(!e || !id || argc < 0 || (argc > 0 && !argv)) {
         if(out_error)
@@ -3175,7 +3181,7 @@ int tjs2_call_value(void *engine, tjs2_value_id id, int argc,
             it->second.AsObjectClosureNoAddRef(); // throws if not an object
         tjs_error hr = clo.FuncCall(0, nullptr, nullptr, &result, argc,
                                     params.empty() ? nullptr : params.data(),
-                                    nullptr);
+                                    (TJS::iTJSDispatch2 *)objthis);
         if(TJS_FAILED(hr))
             TJSThrowFrom_tjs_error(hr, nullptr); // -> catch(eTJS) below
 
@@ -3205,6 +3211,20 @@ int tjs2_call_value(void *engine, tjs2_value_id id, int argc,
         }
         return 1;
     }
+}
+
+int tjs2_call_value(void *engine, tjs2_value_id id, int argc,
+                    const tjs2_value *argv, tjs2_value *out,
+                    char **out_error) {
+    return tjs2_call_value_impl(engine, id, argc, argv, nullptr, out,
+                                out_error);
+}
+
+int tjs2_call_value_with_objthis(void *engine, tjs2_value_id id, int argc,
+                                 const tjs2_value *argv, void *objthis,
+                                 tjs2_value *out, char **out_error) {
+    return tjs2_call_value_impl(engine, id, argc, argv, objthis, out,
+                                out_error);
 }
 
 // Invoke a named member on a retained object value (e.g. the timer

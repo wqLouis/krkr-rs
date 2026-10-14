@@ -487,6 +487,18 @@ unsafe extern "C" {
         out: *mut Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
+    /// Like [`Self::tjs2_call_value`], but supplies a fallback receiver for
+    /// the value: the value's own `ObjThis` wins, then `objthis`, then the
+    /// function object itself.
+    fn tjs2_call_value_with_objthis(
+        engine: *mut Engine,
+        id: Tjs2ValueId,
+        argc: c_int,
+        argv: *const Value,
+        objthis: *mut c_void,
+        out: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
     /// Read a named property from a retained object value through its class
     /// chain (`PropGet`).
     fn tjs2_prop_get(
@@ -2347,6 +2359,20 @@ name), and none was available"
 
     /// Invoke a retained detached value (see [`Self::retain_value_detached`]).
     pub fn call_detached(&self, dv: &DetachedValue, args: &[TjsValue]) -> Result<TjsValue, String> {
+        self.call_detached_with_objthis(dv, args, ptr::null_mut())
+    }
+
+    /// Like [`Self::call_detached`], but supplies a fallback receiver: the
+    /// callable value's own `ObjThis` wins, then `objthis`, then the function
+    /// object itself (`tTJSVariantClosure::FuncCall`). A helper that invokes
+    /// an anonymous callback passes the helper's calling context as `objthis`
+    /// (reference `ScriptsAdd::foreach`, `scriptsEx.cpp:690-693`).
+    pub fn call_detached_with_objthis(
+        &self,
+        dv: &DetachedValue,
+        args: &[TjsValue],
+        objthis: *mut c_void,
+    ) -> Result<TjsValue, String> {
         if !std::ptr::eq(dv.engine, self.inner) {
             return Err("detached value belongs to a different engine".into());
         }
@@ -2367,7 +2393,7 @@ name), and none was available"
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: self.inner is a live engine and dv.id is a live retained id.
         let rc = unsafe {
-            tjs2_call_value(
+            tjs2_call_value_with_objthis(
                 self.inner,
                 dv.id,
                 ffi_args.len() as c_int,
@@ -2376,6 +2402,7 @@ name), and none was available"
                 } else {
                     ffi_args.as_ptr()
                 },
+                objthis,
                 &mut out,
                 &mut error,
             )
