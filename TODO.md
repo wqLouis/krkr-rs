@@ -866,3 +866,46 @@ yet.
   with no production installer; `storage-boundary` fails a script-supplied
   name that reaches L2 or a host seam without `strip_file_media` in
   `crates/compat/src/**`.
+
+## 20. Open: GPU descriptor-pool exhaustion / memory growth
+
+**Status: open — deliberately not fixed yet; do a full audit first.**
+
+Symptom (windowed Vulkan, a real title, after a while of play):
+
+```
+WARN app] failed to upload N bitmap(s): out of GPU memory: failed to allocate a
+          texture descriptor set: A device memory allocation has failed
+```
+
+repeating every frame, alongside `audio: … frame exceeds the 250 ms playback
+cap`. It appeared on the branch after `android-v2.0.9-alpha` and persists after
+the two self-cycle leak fixes below.
+
+What is known:
+* `create_descriptor_pool` is `COMBINED_IMAGE_SAMPLER × 1024`, `max_sets(1024)`,
+  with `FREE_DESCRIPTOR_SET`, and `texture.destroy` frees the set. So the pool
+  only exhausts when more than 1024 textures are live, or a texture handle is
+  dropped without `destroy` (or re-created under a key without destroying the
+  old one).
+* The failure means `scene.bitmaps` is not dropping, so `prune_stale_textures`
+  never frees the textures. Which object still roots those bitmaps is not yet
+  identified.
+* Fixed so far (do not re-open): the layer registry no longer roots every layer
+  (`ObjectRegistry.layers` is a non-owning handle); MenuItem / Timer /
+  WaveSoundBuffer / AsyncTrigger no longer store their own `objthis`; the
+  motion snapshot store evicts on `unload`/`clearCache`; the `psb://` media is
+  the reference's **session-global** cache, not per-file.
+
+What the audit must do:
+1. Add live counters to the debug overlay — `scene.bitmaps`, `Host::textures`,
+   the Vulkan texture/descriptor-set count, and the `ObjectRegistry` map sizes —
+   then drive a real page/motion/config cycle on a title and watch which
+   counter grows (and whether it ever falls).
+2. Separate "a genuine retainer" from "the reference's own graphic cache
+   limit". The reference bounds live graphics through `System.graphicCacheLimit`;
+   the port uploads one texture per live scene bitmap with **no** such bound, so
+   a scene with >1024 live bitmaps exhausts the pool even with no leak at all.
+3. Only then decide: fix the retainer, or bound the live texture set the way the
+   reference bounds its graphic cache (its own mechanism — not an arbitrary
+   cap).
