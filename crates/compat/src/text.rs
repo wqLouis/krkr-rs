@@ -236,9 +236,20 @@ fn detect_and_decode(bytes: &[u8]) -> (Result<Decoded, String>, DecodePath<'stat
     let mut detector = EncodingDetector::new(Iso2022JpDetection::Allow);
     detector.feed(bytes, true);
     let detected = detector.guess(None, Utf8Detection::Allow);
-    // The reference maps `WINDOWS-1252` to `ASCII`; its ASCII branch assigns
-    // each byte to a UTF-16 code unit (Latin-1), not CP1252.
+    // `WINDOWS-1252` is the detector's single-byte fallback. A BOM-less KAG
+    // scenario is mostly ASCII with a few CP932 double-byte characters, so the
+    // fallback would decode it as Latin-1 and mangle every non-ASCII storage
+    // name. The reference decodes a reported `SHIFT_JIS` as `cp932`
+    // (`reference/cpp/core/base/TextStream.cpp:53`); use CP932 when the bytes
+    // are valid CP932 carrying Japanese text, and keep the Latin-1 mapping the
+    // reference gives `WINDOWS-1252` (`:47-57`) otherwise.
     if detected.name() == encoding_rs::WINDOWS_1252.name() {
+        if let Some(text) = cp932_japanese_text(bytes) {
+            return (
+                Ok(Decoded::Utf8(text)),
+                DecodePath::Detected(Some(encoding_rs::SHIFT_JIS.name())),
+            );
+        }
         return (
             Ok(Decoded::Utf8(
                 encoding_rs::mem::decode_latin1(bytes).into_owned(),
@@ -252,6 +263,43 @@ fn detect_and_decode(bytes: &[u8]) -> (Result<Decoded, String>, DecodePath<'stat
     (
         decode_from_encoding(bytes, detected).map(Decoded::Utf8),
         DecodePath::Detected(Some(detected.name())),
+    )
+}
+
+/// Decode `bytes` as CP932 when they are valid CP932 containing Japanese
+/// text, returning `None` otherwise.
+///
+/// The decode is strict: any malformed sequence rejects the bytes, so a
+/// genuine Latin-1 payload keeps the Latin-1 mapping. The result is accepted
+/// only when it contains a kana or ideograph, which only a CP932 double-byte
+/// sequence produces; the single-byte half-width katakana a Latin-1 payload
+/// can produce are deliberately not a signal.
+fn cp932_japanese_text(bytes: &[u8]) -> Option<String> {
+    let mut decoder = encoding_rs::SHIFT_JIS.new_decoder_without_bom_handling();
+    let capacity = decoder.max_utf8_buffer_length_without_replacement(bytes.len())?;
+    let mut text = String::with_capacity(capacity);
+    let mut consumed = 0usize;
+    loop {
+        let (result, read) =
+            decoder.decode_to_string_without_replacement(&bytes[consumed..], &mut text, true);
+        consumed += read;
+        match result {
+            DecoderResult::InputEmpty => break,
+            DecoderResult::OutputFull => text.reserve(bytes.len().max(64)),
+            DecoderResult::Malformed(_, _) => return None,
+        }
+    }
+    text.chars().any(is_japanese_char).then_some(text)
+}
+
+/// Whether `ch` is a kana or a CJK ideograph, the characters a CP932
+/// double-byte sequence produces.
+fn is_japanese_char(ch: char) -> bool {
+    matches!(ch,
+        '\u{3040}'..='\u{30ff}'
+            | '\u{3400}'..='\u{4dbf}'
+            | '\u{4e00}'..='\u{9fff}'
+            | '\u{f900}'..='\u{faff}'
     )
 }
 
@@ -656,6 +704,21 @@ mod tests {
         assert_eq!(
             decode_text(&bytes, TextEncoding::Detect).expect("Shift_JIS decodes"),
             SHIFT_JIS_TEXT
+        );
+    }
+
+    // reference/cpp/core/base/TextStream.cpp:47-57 — BOM-less text is decoded
+    // from the charset reported by detection; :53 remaps `SHIFT_JIS` to
+    // `cp932`. A short KAG scenario is mostly ASCII with a few double-byte
+    // characters, so the detector's single-byte fallback would otherwise
+    // decode the non-ASCII storage name as Latin-1.
+    #[test]
+    fn short_cp932_ams_scenario_is_detected_and_decoded() {
+        let text = "@loadimage imgid=MARK file=image/EM怒り01_01\r\n";
+        let bytes = encoded(SHIFT_JIS, text);
+        assert_eq!(
+            decode_text(&bytes, TextEncoding::Detect).expect("short CP932 decodes"),
+            text
         );
     }
 

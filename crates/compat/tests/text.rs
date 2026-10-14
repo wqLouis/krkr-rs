@@ -106,6 +106,12 @@ impl Env {
             .unwrap_or_else(|error| panic!("eval {expression:?} failed: {error}"))
     }
 
+    fn run(&self, script: &str) {
+        self.engine
+            .exec_script(script, "test")
+            .unwrap_or_else(|error| panic!("exec {script:?} failed: {error}"));
+    }
+
     fn error(&self, expression: &str) -> String {
         self.eval(expression)
             .expect_err(&format!("{expression:?} should have raised"))
@@ -181,6 +187,35 @@ fn cp932_script_is_decoded() {
     assert_eq!(
         env.eval_ok("Scripts.execStorage('cp932.tjs')"),
         TjsValue::String("日本語のテストに成功しました".into())
+    );
+}
+
+/// The real emotion scenario (`emotion/怒り01.ams`) is BOM-less CP932: a
+/// mostly-ASCII KAG tag carrying a non-ASCII `file=` name. The detector's
+/// single-byte fallback decoded the name as Latin-1 (`EM\u{93}{\u{82}è01_01`)
+/// before the reference's `SHIFT_JIS` -> `cp932` remap
+/// (`reference/cpp/core/base/TextStream.cpp:47-57`, `:53`).
+#[test]
+fn cp932_ams_scenario_attribute_is_decoded() {
+    let _lock = vm_lock();
+    let dir = GameDir::new();
+    dir.write(
+        "emotion.ams",
+        &cp932("@loadimage imgid=MARK file=image/EM怒り01_01\r\n"),
+    );
+    let env = Env::new(dir);
+    env.run(
+        "var parser = new KAGParser(); \
+         parser.loadScenario('emotion.ams'); \
+         var tag = parser.getNextTag();",
+    );
+    assert_eq!(
+        env.eval_ok("tag.tagname"),
+        TjsValue::String("loadimage".into())
+    );
+    assert_eq!(
+        env.eval_ok("tag.file"),
+        TjsValue::String("image/EM怒り01_01".into())
     );
 }
 
