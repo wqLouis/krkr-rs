@@ -334,18 +334,19 @@ Open:
    `PresentationScaling`/`--scaling`/`ViewTransform`/`native_size` removal)
    has landed.
 
-3. **The GPU-resident frame** (`D41`–`D43`, **next**) — **design landed in
-   `docs/migration/13`.** L2 embeds the translation and drives L1 to execute
-   draw/readback operations directly on the GPU: no persistent VM-resolution
-   layer copy, text rasterized at `Font.size · raster_scale`, images sampled
-   at native resolution, and a device-res GPU target only for layers whose
-   compositing needs an offscreen. L3 stays VM-only. Migration order: text →
-   images/fills → layer targets → pixel-copy/mask/transition ops → delete the
-   CPU display path (keep the null oracle). `07` Phase 11.
+3. **The render-resolution frame** (`D41`–`D44`, **next**) — **design landed
+   in `docs/migration/13`.** The CPU rasterizer stays authoritative but runs
+   at an explicit, fixed render resolution, independent of the VM size and the
+   window. L2 embeds the VM→render translation; L3 stays VM-only. A layer has
+   one storage: a native texture for image-only layers, or one render-res CPU
+   surface once a raster op touches it; no persistent VM-res mirror. Text is
+   rasterized at `Font.size · render_scale`; the GPU only composes/presents.
+   Render ops: text/fills → image-only layers → remaining raster ops →
+   raw-buffer/plugin carve-out → remove the VM-res path (`07` Phase 11).
 
-Open sub-items are tracked in those docs, not duplicated here: the GPU text
-atlas/readback path (`13`, `10`) and the remaining mixer/video/transition
-pumps above.
+Open sub-items are tracked in those docs, not duplicated here: the raw-buffer
+compatibility policy, the default render resolution, readback reduction and
+the remaining mixer/video/transition pumps above.
 
 ## 12. Deferred design work
 

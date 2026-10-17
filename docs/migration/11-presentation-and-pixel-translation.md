@@ -1,10 +1,11 @@
 # 11 — Presentation and the pixel-translation layer
 
 Status: **implemented for the mapping.** Stage 0 (removal), the Stage 1 frame
-slice and Stage 2 (`PixelTranslation`, device-space projection, input inverse
-mapping) have landed. Open: the remaining Stage 1 mixer/video pumps and the GPU-resident frame
-(D41–D43, [`13`](13-gpu-resident-frame.md)): no persistent VM-resolution layer
-copy, device-scale text, and readback of the GPU storage.
+slice and Stage 2 (`PixelTranslation`, projection/input mapping) have landed.
+Open: the remaining Stage 1 mixer/video pumps and the render-resolution frame
+(D41–D44, [`13`](13-render-resolution.md)): the CPU rasterizes at a fixed
+render resolution, L2 embeds the translation, no persistent VM-res layer copy,
+and readback samples the render-res storage.
 This document decides how the engine maps the scene a script thinks it is
 drawing onto the framebuffer it actually draws into. It supersedes
 [`04-renderer-vulkan.md`](04-renderer-vulkan.md) §6.1 (the `ScalingMode`
@@ -307,7 +308,7 @@ no position and pass through unchanged.
   mapping internally; L3 natives keep their VM-coordinate contract and do not
   call `to_device_*`/`to_vm_point`/`raster_scale` or name a device pixel. The
   composition root only maps platform input through an L2 method. This is
-  D41 and is the subject of [`13`](13-gpu-resident-frame.md).
+  D41 and is the subject of [`13`](13-render-resolution.md).
 * **No `ViewTransform` in `render`.** The pipeline keeps the generic root
   transform (`Affine2`) and nothing about a "presentation"; that vocabulary is
   L2/L3.

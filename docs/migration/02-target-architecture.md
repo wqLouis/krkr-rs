@@ -245,15 +245,18 @@ Implemented: `engine::translate::PixelTranslation` owns the Fit mapping,
 `Engine` refits it on a VM/framebuffer size change, and the composition root
 inverse-maps pointer/touch coordinates before the VM tick.
 
-The target refines this into the **GPU-resident frame** (D41–D43,
-[`13`](13-gpu-resident-frame.md)): the translation is private to L2 and applied
-inside every render/pixel method; L3 keeps calling L2 in VM coordinates. There
-is no persistent VM-resolution layer copy — L2 drives L1 to execute the draw
-operations at device resolution, text is rasterized at `size · raster_scale`,
-readback samples the GPU region, and a layer gets a device-res GPU target only
-when its compositing semantics need an offscreen. Open: migrating the
-remaining CPU pixel operations (blit/affine/mask/transitions) and the null/CPU
-oracle path.
+The target is the **hybrid render-resolution frame** (D41–D44,
+[`13`](13-render-resolution.md)): the translation is private to L2 and applied
+inside every render/pixel/readback method; L3 keeps calling L2 in VM
+coordinates. The CPU rasterizer runs at an explicit, fixed render resolution
+(`render_size`, independent of the VM size and the window), so text is
+rasterized at `Font.size · render_scale` and raster ops produce native
+render-res pixels. A layer has one storage: a native texture for image-only
+layers, or one render-res CPU surface once a raster op touches it; there is no
+persistent VM-resolution layer bitmap. The GPU only composes layer textures
+and presents the Fit-scaled frame — no GPU text and no GPU pixel mutation.
+Readback samples the render region; the raw-buffer/plugin path is the
+documented per-bitmap compatibility exception.
 
 ### Implementation status
 
