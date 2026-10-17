@@ -46,6 +46,9 @@ ash = "0.38"
 raw-window-handle = "0.6"
 winit = "0.30"
 flate2 = "1"
+# Fast, non-cryptographic hashing for the storage/engine lookup maps. Used with
+# fixed seeds so iteration order stays stable across runs.
+ahash = "0.8"
 # Script text decoding: `chardetng` detects the charset of BOM-less
 # legacy-encoded scripts (the maintained successor of the reference's uchardet
 # detector) and `encoding_rs` performs the bulk decode from the reported

@@ -9,6 +9,7 @@ license.workspace = true
 api = { workspace = true }
 thiserror = { workspace = true }
 flate2 = { workspace = true }
+ahash = { workspace = true }
 
 [dev-dependencies]
 testkit = { workspace = true }

@@ -12,6 +12,7 @@ render = { workspace = true }
 cosmic-text = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+ahash = { workspace = true }
 
 [dev-dependencies]
 testkit = { workspace = true }

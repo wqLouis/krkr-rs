@@ -422,10 +422,10 @@ impl DecodedImageKey {
 /// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1305-1310`); the cache is
 /// enabled only while the limit is nonzero, matching the reference's default
 /// (`:1433-1434`).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DecodedImageCache {
     /// Cached images by key.
-    entries: HashMap<DecodedImageKey, DecodedImage>,
+    entries: crate::hasher::Map<DecodedImageKey, DecodedImage>,
     /// Recency order: index 0 is the least recently used, the back is the
     /// most recently used (the reference's additional order, whose `NFirst`
     /// is most recent: `reference/cpp/core/tjs2/tjsHashSearch.h:513-527`).
@@ -434,6 +434,17 @@ struct DecodedImageCache {
     total_bytes: u64,
     /// Byte limit; `0` disables the cache.
     limit: u64,
+}
+
+impl Default for DecodedImageCache {
+    fn default() -> Self {
+        Self {
+            entries: crate::hasher::map(),
+            order: Vec::new(),
+            total_bytes: 0,
+            limit: 0,
+        }
+    }
 }
 
 impl DecodedImageCache {
@@ -483,7 +494,7 @@ impl DecodedImageCache {
 }
 
 /// The whole logical scene.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub struct Scene {
     /// All windows, in creation order. Callers may edit this directly (the
@@ -504,18 +515,39 @@ pub struct Scene {
     /// verified defensively: callers can still mutate the public `windows`
     /// vec directly, in which case the lookup falls back to a linear scan
     /// (and still returns the correct result).
-    window_index: HashMap<u32, usize>,
+    window_index: crate::hasher::Map<u32, usize>,
     /// `layer.id` → index into `layers`. Rebuilt whenever a layer is
     /// removed; verified defensively like [`Scene::window_index`].
-    layer_index: HashMap<u32, usize>,
+    layer_index: crate::hasher::Map<u32, usize>,
     /// `bitmap.id` → index into `bitmaps`.
-    bitmap_index: HashMap<u32, usize>,
+    bitmap_index: crate::hasher::Map<u32, usize>,
     /// `font.id` → index into `fonts`.
-    font_index: HashMap<u32, usize>,
+    font_index: crate::hasher::Map<u32, usize>,
     /// Decoded-image cache (the reference graphic cache).
     image_cache: DecodedImageCache,
     /// Monotonic mutation counter (see [`Scene::revision`]).
     revision: u64,
+}
+
+impl Default for Scene {
+    fn default() -> Self {
+        Self {
+            windows: Vec::new(),
+            layers: Vec::new(),
+            bitmaps: Vec::new(),
+            fonts: Vec::new(),
+            next_window: 0,
+            next_layer: 0,
+            next_bitmap: 0,
+            next_font: 0,
+            window_index: crate::hasher::map(),
+            layer_index: crate::hasher::map(),
+            bitmap_index: crate::hasher::map(),
+            font_index: crate::hasher::map(),
+            image_cache: DecodedImageCache::default(),
+            revision: 0,
+        }
+    }
 }
 
 impl Scene {

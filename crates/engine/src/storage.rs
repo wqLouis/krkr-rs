@@ -34,7 +34,7 @@
 //! 4. the auto search-path list.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -123,7 +123,7 @@ pub struct Storage {
     /// by the full storage name (e.g. `psb://quickmenu.pimg/11632.tlg`).
     /// [`Self::read`]/[`Self::read_prefix`]/[`Self::exists`] serve these
     /// before disk and archive resolution; L2 only stores the bytes.
-    media: RefCell<HashMap<String, Vec<u8>>>,
+    media: RefCell<crate::hasher::Map<String, Vec<u8>>>,
     /// Lazily built resolver tables, invalidated when the auto-path list or
     /// the mounted archives change.
     resolution_cache: RefCell<ResolutionCache>,
@@ -155,7 +155,7 @@ pub struct ProbeCounts {
 
 /// The direct children of an archive auto-path prefix: the archive path and a
 /// map from lower-cased base name to normalized in-archive name.
-type ArchiveChildren = (PathBuf, HashMap<String, String>);
+type ArchiveChildren = (PathBuf, crate::hasher::Map<String, String>);
 
 /// A cached auto-path candidate table, keyed by the auto-path entry.
 enum AutoPathTable {
@@ -164,16 +164,16 @@ enum AutoPathTable {
         /// Absolute directory that was listed.
         root: PathBuf,
         /// Real child name -> `is_dir`, for the exact lower-cased probe.
-        exact: HashMap<String, bool>,
+        exact: crate::hasher::Map<String, bool>,
         /// Lower-cased child name -> the first **file** child with that name.
-        first_file: HashMap<String, String>,
+        first_file: crate::hasher::Map<String, String>,
     },
     /// An archive auto path with an in-archive prefix.
     Archive {
         /// Absolute path of the archive.
         archive: PathBuf,
         /// Lower-cased direct-child base name -> normalized in-archive name.
-        entries: HashMap<String, String>,
+        entries: crate::hasher::Map<String, String>,
     },
 }
 
@@ -216,17 +216,27 @@ impl AutoPathTable {
 }
 
 /// The per-storage resolver cache.
-#[derive(Default)]
 struct ResolutionCache {
     /// Candidate tables keyed by the auto-path entry string.
-    auto_paths: HashMap<String, Rc<AutoPathTable>>,
+    auto_paths: crate::hasher::Map<String, Rc<AutoPathTable>>,
     /// Resolved hits keyed by the requested storage name (the reference's
     /// `TVPAutoPathCache`: a hit is cached, a miss is not).
-    placed: HashMap<String, Location>,
+    placed: crate::hasher::Map<String, Location>,
     /// Bottom file-system probes issued while resolving.
     probes: ProbeCounts,
     /// Entry bytes decoded and returned by `read`/`read_prefix`.
     read_bytes: u64,
+}
+
+impl Default for ResolutionCache {
+    fn default() -> Self {
+        Self {
+            auto_paths: crate::hasher::map(),
+            placed: crate::hasher::map(),
+            probes: ProbeCounts::default(),
+            read_bytes: 0,
+        }
+    }
 }
 
 /// The number of leading characters kept in the bounded `debug` storage-miss
@@ -637,7 +647,7 @@ impl Storage {
             preload_archives,
             project: None,
             xp3_extraction_filter: None,
-            media: RefCell::new(HashMap::new()),
+            media: RefCell::new(crate::hasher::map()),
             resolution_cache: RefCell::new(ResolutionCache::default()),
         })
     }
@@ -1039,8 +1049,8 @@ impl Storage {
             self.game_dir.join(dir)
         };
         let listing = self.directory_listing(&root)?;
-        let mut exact = HashMap::new();
-        let mut first_file = HashMap::new();
+        let mut exact = crate::hasher::map();
+        let mut first_file = crate::hasher::map();
         for (name, is_dir) in listing.iter() {
             let key = name.to_ascii_lowercase();
             // The lower-cased spelling wins when both a lower-cased and a
@@ -1072,7 +1082,7 @@ impl Storage {
             // a miss, exactly like the on-demand open returning `NotFound`.
             return Ok(AutoPathTable::Archive {
                 archive: PathBuf::new(),
-                entries: HashMap::new(),
+                entries: crate::hasher::map(),
             });
         };
         Ok(AutoPathTable::Archive { archive, entries })
@@ -1092,7 +1102,7 @@ impl Storage {
             .unwrap_or_default();
         for mounted in self.archives.iter().rev() {
             if mounted.file_name.eq_ignore_ascii_case(&arc_name) {
-                let mut entries = HashMap::new();
+                let mut entries = crate::hasher::map();
                 collect_archive_children(mounted.archive.entries(), prefix, &mut entries);
                 return Ok(Some((mounted.path.clone(), entries)));
             }
@@ -1108,7 +1118,7 @@ impl Storage {
             Err(error) => return Err(StorageReadError::Fs(error)),
         };
         let archive = Xp3Archive::open(&self.fs, &file)?;
-        let mut entries = HashMap::new();
+        let mut entries = crate::hasher::map();
         collect_archive_children(archive.entries(), prefix, &mut entries);
         Ok(Some((path, entries)))
     }
@@ -1696,7 +1706,8 @@ impl Storage {
     /// Lists the immediate children of storage directory `dir`, merging disk
     /// entries with archive entries. Names are normalized (`/` separators,
     /// lowercase); directory children carry a trailing `/`. Results are sorted
-    /// and deduplicated.
+    /// and deduplicated. This is an internal enumeration helper; no reference
+    /// member is bound to it.
     ///
     /// A missing or non-directory `dir` lists nothing (it does not error);
     /// only a bottom file-system failure propagates.
@@ -1748,18 +1759,18 @@ impl Storage {
         Ok(found.into_iter().collect())
     }
 
-    /// `Storages.getFileList(mask, attr)`: storage names matching a wildcard
-    /// mask, merged across the disk root and every mounted archive.
+    /// Lists storage names matching a wildcard mask, merged across the disk
+    /// root and every mounted archive. This is an internal enumeration helper;
+    /// no reference member is bound to it.
     ///
     /// * The mask is normalized (lowercased, `\` → `/`).
     /// * If it contains `>` it addresses archives: `arcmask>inarcmask`, where
     ///   `arcmask` wildcard-matches the archive file name.
     /// * The part before the last `/` is a required literal directory prefix;
     ///   the part after is a `*`/`?` wildcard matched case-insensitively
-    ///   against the base name. Matching is **recursive under the prefix**
-    ///   (matching the reference `Storages.getFileList`): a mask with no
-    ///   `>` matches base names at any depth below the prefix, and a mask
-    ///   with no `/` matches at any depth in the whole tree.
+    ///   against the base name. Matching is **recursive under the prefix**: a
+    ///   mask with no `>` matches base names at any depth below the prefix, and
+    ///   a mask with no `/` matches at any depth in the whole tree.
     /// * Disk entries are emitted as normalized relative names; archive
     ///   entries as `arc.xp3>path`.
     /// * `attr` filters results: `0` or [`ATTR_NORMAL`] → regular files,
@@ -2029,7 +2040,7 @@ fn normalize_in_archive_path(name: &str) -> Option<String> {
 fn collect_archive_children<'a>(
     entries: impl Iterator<Item = &'a xp3::Entry>,
     prefix: &str,
-    out: &mut HashMap<String, String>,
+    out: &mut crate::hasher::Map<String, String>,
 ) {
     for entry in entries {
         let Some(rest) = entry.name.strip_prefix(prefix) else {

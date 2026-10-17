@@ -13,6 +13,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod hasher;
+
 pub mod input;
 pub mod layer_ops;
 pub mod projection;

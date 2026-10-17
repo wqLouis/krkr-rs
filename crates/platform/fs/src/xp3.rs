@@ -29,7 +29,7 @@
 //! * Reading a file concatenates its segments; zlib segments are inflated to
 //!   `org_size`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::io::{self, Read, Seek, SeekFrom};
 
 use api::error::FsError;
@@ -209,6 +209,24 @@ pub struct NearMisses {
     pub total: usize,
 }
 
+/// The archive index hasher. Fixed seeds keep iteration order stable across
+/// runs; `ahash`'s default `RandomState` is randomized per process.
+fn entry_hasher() -> ahash::RandomState {
+    ahash::RandomState::with_seeds(
+        0x2f5a_1c3d_9e7b_0481,
+        0x8c4d_6e2f_1a90_7531,
+        0x0b7e_3a5c_9d18_6240,
+        0xf31c_9042_6d7b_e825,
+    )
+}
+
+/// Archive entries keyed by normalized name.
+type EntryMap = std::collections::HashMap<String, Entry, ahash::RandomState>;
+
+fn entry_map() -> EntryMap {
+    EntryMap::with_hasher(entry_hasher())
+}
+
 /// An opened XP3 archive index.
 ///
 /// The value stores the archive base offset and the parsed entry map; it does
@@ -219,7 +237,7 @@ pub struct Xp3Archive {
     /// EXE-embedded archives).
     base: u64,
     /// Entries keyed by normalized name.
-    entries: BTreeMap<String, Entry>,
+    entries: EntryMap,
     /// Index blocks read while parsing, in read order.
     sections: Vec<IndexSection>,
 }
@@ -264,7 +282,7 @@ impl Xp3Archive {
 
         let mut archive = Xp3Archive {
             base,
-            entries: BTreeMap::new(),
+            entries: entry_map(),
             sections: Vec::new(),
         };
         archive.read_index(reader)?;
@@ -286,7 +304,7 @@ impl Xp3Archive {
         self.entries.is_empty()
     }
 
-    /// Iterate over all entries in normalized-name order.
+    /// Iterate over every entry.
     pub fn entries(&self) -> impl Iterator<Item = &Entry> {
         self.entries.values()
     }
@@ -329,6 +347,8 @@ impl Xp3Archive {
                 weak.push(entry.name.clone());
             }
         }
+        strong.sort();
+        weak.sort();
         let names = strong.into_iter().chain(weak).take(cap).collect();
         NearMisses { names, total }
     }
@@ -1032,8 +1052,6 @@ fn alloc_zeroed(len: usize, what: &'static str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
 
     /// A field slice shorter than `N` is a typed corrupt-index error, not a
@@ -1051,7 +1069,7 @@ mod tests {
     fn chunk_overrunning_the_index_is_rejected() {
         let mut archive = Xp3Archive {
             base: 0,
-            entries: BTreeMap::new(),
+            entries: entry_map(),
             sections: Vec::new(),
         };
         let mut index = Vec::new();
@@ -1116,7 +1134,7 @@ mod tests {
 
         let archive = Xp3Archive {
             base: 0,
-            entries: BTreeMap::new(),
+            entries: entry_map(),
             sections: Vec::new(),
         };
         let mut reader = io::Cursor::new(image.as_slice());
@@ -1234,7 +1252,7 @@ mod tests {
         let entry = single_segment_entry("big.bin", SEGM_ENCODE_ZLIB, 0, &stored, payload.len());
         let archive = Xp3Archive {
             base: 0,
-            entries: BTreeMap::new(),
+            entries: entry_map(),
             sections: Vec::new(),
         };
 
@@ -1301,7 +1319,7 @@ mod tests {
         let entry = single_segment_entry("raw.bin", SEGM_ENCODE_RAW, 0, &stored, stored.len());
         let archive = Xp3Archive {
             base: 0,
-            entries: BTreeMap::new(),
+            entries: entry_map(),
             sections: Vec::new(),
         };
 
