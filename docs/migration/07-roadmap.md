@@ -269,6 +269,35 @@ unchanged; the game then renders at device resolution with `getPixel`,
 `piledCopy` and `saveLayerImage` addressed through the translation and every
 script-observable value still VM and reference-exact.
 
+### Phase 11 — GPU-resident frame (D41–D43)
+
+**Status: design; the next architecture slice.**
+
+L2 owns the frame, so it can hold a layer's VM-space state and draw/readback
+operations and drive L1 to execute them on the GPU. The translation is
+embedded in L2; L3 keeps calling L2 in VM coordinates and never sees a device
+pixel. There is no persistent VM-resolution layer copy: the GPU frame (or a
+device-res layer target only when the layer needs an offscreen) is the storage,
+and readback samples it over `vm_pixel_region`. Contract and migration table:
+[`13`](13-gpu-resident-frame.md).
+
+Stages (each leaves the game runnable and the gate green):
+
+1. **Text** — L2 owns the font engine/glyph atlas, rasterizes at
+   `Font.size · raster_scale`, and draws glyph quads; the VM-res text bake
+   stops being the display source.
+2. **Images and fills** — native texture upload + textured/solid quads via L2;
+   no VM-res copy for those operations.
+3. **Layer targets** — opacity/transform/mask/cache/transition layers get one
+   device-res GPU target; direct layers stay direct.
+4. **Pixel-copy operations** — blit/copyRect/affineCopy/province/masks on the
+   GPU; region readback.
+5. **Delete the CPU display path**, retain the null/CPU oracle and the guards.
+
+Exit criteria: no persistent VM-res layer mirror; L3 contains no
+`PixelTranslation`/device-coordinate use; at `s == 1` output and readback match
+the CPU oracle; a real game renders text/images at device resolution.
+
 ## 3. Suggested commit/branch discipline
 
 * One phase per feature branch off `migration/middle-layer-ash`, merged

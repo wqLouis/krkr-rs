@@ -523,6 +523,17 @@ device drain. Moving them into L2 is the rest of Phase 9 and does not change
 the frame entry point or the order. `Engine::run(clock, hooks)` waits for the
 platform-loop slice; the platform loop currently drives `Engine::step`.
 
+**The GPU-resident frame (D41–D43).** The translation is internal to L2: every
+L2 render/pixel method takes VM coordinates and applies `PixelTranslation`
+itself, so L3 keeps its VM-only contract. A layer is VM-space state plus an
+ordered set of draw/readback operations; L1 executes those operations on the
+GPU at device resolution. There is no persistent VM-resolution layer bitmap —
+the GPU frame or a device-res layer target is the storage, and readback samples
+it over `vm_pixel_region`. The font engine and glyph atlas are L2 state; L3
+passes face/size/style/text only. Contract:
+[`13-gpu-resident-frame.md`](13-gpu-resident-frame.md). The current CPU bitmap
+source is transitional and remains only as the null/test oracle.
+
 Tests construct `Engine` with a null `RenderPipeline`, a headless
 `Surface`/`RenderState`, and a virtual clock.
 

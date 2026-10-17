@@ -154,8 +154,9 @@ Crate roles:
 These are recorded in `docs/migration/README.md` §3. The **code must not cite
 them by number** (§6); this section is for you to know them. The live target
 for the current work is docs [`11`](docs/migration/11-presentation-and-pixel-translation.md)
-(presentation + pixel translation) and [`12`](docs/migration/12-layer-tree-and-frame.md)
-(the layer tree → frame contract).
+(presentation + pixel translation), [`12`](docs/migration/12-layer-tree-and-frame.md)
+(the layer tree → frame contract) and [`13`](docs/migration/13-gpu-resident-frame.md)
+(the GPU-resident frame).
 
 - **D9 — L1 is stateless.** L1 objects are facades over platform capabilities;
   methods are `&self` and take evolving state as an explicit `&mut` value
@@ -252,6 +253,26 @@ for the current work is docs [`11`](docs/migration/11-presentation-and-pixel-tra
   pixel read samples its device region. At `s == 1` the mapping is the
   identity; script-observable values stay VM and reference-exact (D34).
   Contract: docs [`11`](docs/migration/11-presentation-and-pixel-translation.md) §6.
+- **D41 — the VM↔device translation is embedded in L2; L3 never sees it.**
+  Every L2 render/pixel method takes VM coordinates and applies the current
+  `PixelTranslation` internally. L3 natives keep their VM-coordinate contract:
+  they must not call `to_device_*`/`to_vm_point`/`raster_scale`, name a device
+  pixel, or import `PixelTranslation`. The composition root passes platform
+  input through an L2 mapping method; L3 receives only VM events.
+- **D42 — the frame is GPU-resident; there is no persistent VM-resolution
+  layer copy.** A layer is VM-space state plus an ordered set of draw/readback
+  operations. L2 translates each operation and L1 executes it on the GPU at
+  device resolution. Text is rasterized at `Font.size · raster_scale` into a
+  device-size glyph atlas; images are uploaded once at native resolution and
+  sampled at device resolution. Readback samples the GPU storage over
+  `vm_pixel_region`; CPU bytes exist only transiently for decode, upload and a
+  requested region read. The CPU rasterizer remains the null/test oracle.
+- **D43 — a GPU target exists only where the semantics need an offscreen.**
+  Direct layers draw into the frame in call order and allocate no per-layer
+  surface; opacity/transform/mask/cache/transition/readback layers get one
+  device-resolution target; reading a direct layer materializes a transient
+  target. “Device-res copy of every layer” is forbidden; the `s²` cost is paid
+  only by layers that actually need their pixels kept.
 
 ---
 
@@ -392,6 +413,7 @@ Two-sided tests:
 12. Loading is explicit (`--archive`, repeatable; later wins). There is **no** folder scan in the reference (D15), but D35 adds one opt-in exception: a directory-only launch (`--base-dir`/positional dir, no `--archive`) mounts every `*.xp3` found recursively (`engine::storage::discover_archives`).
 13. The frame is L2's: `GameHost::step` must not accumulate a `now_ms` or call the subsystem pumps itself. Pass events through `Engine::step(dt, hooks)`; the hook is `VmHook` (VM tick + audio drain). `compat::run_frame_body` starts by draining the timer posts the engine already produced; it must not call `TimerState::advance`.
 14. VM pixels are not device pixels. Scripts, layer rects, bitmap dimensions, `Font.size` and `getPixel` coordinates are VM space; the framebuffer is device space. Only `engine::translate::PixelTranslation` names both. An OS resize changes the framebuffer only — never write it back into the scene window; a script size change goes the other way through `Engine::take_window_resize`.
+15. L3 never sees device pixels or the translation: no `PixelTranslation`/`to_device_*`/`to_vm_point`/`raster_scale` in `crates/compat/src/**`. L2 applies the mapping inside its draw/readback methods; the frame is GPU-resident (`docs/migration/13`), and a layer keeps no persistent VM-resolution mirror.
 
 ---
 
@@ -426,6 +448,7 @@ Two-sided tests:
 | Android AAudio/MediaCodec, `AHardwareBuffer` readback | `docs/migration/10-android-backends.md`, `docs/android.md` |
 | Presentation (Fit only) and the VM↔device pixel translation | `docs/migration/11-presentation-and-pixel-translation.md` |
 | Layer tree → projection → draw tree → frame | `docs/migration/12-layer-tree-and-frame.md` |
+| GPU-resident frame, L2-embedded translation | `docs/migration/13-gpu-resident-frame.md` |
 | Per-crate review findings | `docs/migration/reviews/*.md` |
 | Surface lock / parity | `docs/native_parity.md`, `docs/plugin_parity.md` |
 | Win32/plugin-host and Wine studies (non-goals) | `docs/plugin_host_exe.md`, `docs/wine_box64.md` |

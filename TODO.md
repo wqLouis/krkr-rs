@@ -334,10 +334,18 @@ Open:
    `PresentationScaling`/`--scaling`/`ViewTransform`/`native_size` removal)
    has landed.
 
-Open sub-items are tracked in those docs, not duplicated here: device-pixel
-readback over `AHardwareBuffer`/staging (`10` "Device-pixel readback"; today's
-CPU layer bitmaps are already VM-exact) and glyph rasterization at
-`raster_scale` (the GPU currently scales VM-resolution text).
+3. **The GPU-resident frame** (`D41`–`D43`, **next**) — **design landed in
+   `docs/migration/13`.** L2 embeds the translation and drives L1 to execute
+   draw/readback operations directly on the GPU: no persistent VM-resolution
+   layer copy, text rasterized at `Font.size · raster_scale`, images sampled
+   at native resolution, and a device-res GPU target only for layers whose
+   compositing needs an offscreen. L3 stays VM-only. Migration order: text →
+   images/fills → layer targets → pixel-copy/mask/transition ops → delete the
+   CPU display path (keep the null oracle). `07` Phase 11.
+
+Open sub-items are tracked in those docs, not duplicated here: the GPU text
+atlas/readback path (`13`, `10`) and the remaining mixer/video/transition
+pumps above.
 
 ## 12. Deferred design work
 

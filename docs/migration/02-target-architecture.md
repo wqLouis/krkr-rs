@@ -242,12 +242,18 @@ translation feeds is mapped end to end in
 [`12-layer-tree-and-frame.md`](12-layer-tree-and-frame.md).
 
 Implemented: `engine::translate::PixelTranslation` owns the Fit mapping,
-`Engine` refits it on a VM/framebuffer size change and rewrites the projected
-tree into device space, and the composition root inverse-maps pointer/touch
-coordinates before the VM tick. The framebuffer is the single backing. Open:
-device-pixel readback for a GPU-composed backing (`vm_pixel_region` is the
-seam; the current CPU layer bitmap is already VM-exact) and glyph
-rasterization at `raster_scale` (the layer bitmap is currently VM-resolution).
+`Engine` refits it on a VM/framebuffer size change, and the composition root
+inverse-maps pointer/touch coordinates before the VM tick.
+
+The target refines this into the **GPU-resident frame** (D41–D43,
+[`13`](13-gpu-resident-frame.md)): the translation is private to L2 and applied
+inside every render/pixel method; L3 keeps calling L2 in VM coordinates. There
+is no persistent VM-resolution layer copy — L2 drives L1 to execute the draw
+operations at device resolution, text is rasterized at `size · raster_scale`,
+readback samples the GPU region, and a layer gets a device-res GPU target only
+when its compositing semantics need an offscreen. Open: migrating the
+remaining CPU pixel operations (blit/affine/mask/transitions) and the null/CPU
+oracle path.
 
 ### Implementation status
 

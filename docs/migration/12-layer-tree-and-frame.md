@@ -1,8 +1,9 @@
 # 12 — The layer tree, the projection and the frame
 
 Status: **the render path, the L2 frame and the VM↔device mapping are
-implemented; device-pixel readback and device-resolution glyph rasterization
-are open.** This document is the end-to-end
+implemented; the GPU-resident frame (D41–D43, [`13`](13-gpu-resident-frame.md))
+— no persistent VM-res layer copy, device-scale text and GPU pixel operations —
+is the next slice.** This document is the end-to-end
 contract for *how a layer tree becomes a frame*. It consolidates the ownership
 rules that [02 §2.1/§3](02-target-architecture.md) and
 [03 §2](03-middle-layer-api.md#2-render-pipeline) already state, adds the code
@@ -215,6 +216,12 @@ The timer contract is D27's: L2 waits and calls; L3 decides whether to arm and
 turns the fire into an `onTimer` post. `TimerState::advance` is called only by
 `Engine::frame` (it stays public until the timer surface collapses).
 
+**Target superseding the CPU-composite layer path.** The current tree still
+uses each layer's VM-resolution CPU bitmap as the display source. The target
+is [`13`](13-gpu-resident-frame.md): L2 applies the translation inside every
+draw/readback method and drives L1 to execute the operation on the GPU, with
+no persistent VM-res layer copy; the CPU rasterizer remains the test oracle.
+
 ## 7. Where the pixel translation fits (D39/D40)
 
 The projection emits the layer tree in **VM pixels**; `engine::translate`
@@ -229,7 +236,9 @@ centred offset. The engine refits it whenever the VM window size or the
 framebuffer size changes (twice per frame: before the hook so input uses the
 current mapping, after it so a script size change is projected the same
 frame). At `s == 1` the mapping is the identity and the reference is matched
-exactly.
+exactly. The translation is **internal to L2** (D41): L3 keeps calling L2 in
+VM coordinates. The GPU-resident frame that consumes it for text, images and
+pixel operations is [`13`](13-gpu-resident-frame.md).
 
 Input travels the other way: the composition root maps pointer/touch
 coordinates with `to_vm_point` before the VM tick, so L3 hit-tests in VM
