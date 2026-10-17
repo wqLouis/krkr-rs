@@ -157,6 +157,11 @@ preload_archives)` returning `RuntimeConfig`
 exists. Cosmetic but exactly the kind of doc the audit protocol says wins over
 code — here the code is right and the doc is behind.
 
+> **Update.** The `runtime-config.md` snippet has been corrected since
+> (`crates/android` now drives `host::AndroidHost::new` + `host::run_loop`).
+> The `scaling` argument itself is being removed with the presentation feature
+> (`docs/migration/11`, D39), so `resolve_runtime_config` loses it too.
+
 ### F10 (hygiene) — duplicated option vocabulary between Kotlin and Rust with no drift guard
 
 `RuntimeOptions` mirrors `api::config` as hand-copied constants
@@ -262,6 +267,11 @@ the documented contract. The launcher reads but never writes `krkr.log`
 | scaling | `["game","fit","fill","expand"]`, `DEFAULT_SCALING "fit"` (`:49-58`) | `parse`: exactly those four (`config.rs:152-163`) | `Fit` when unset (`config.rs:53-55`, `64-67`) |
 | preload | `["true","false"]`, default `"false"` (`:61-64`) | `parse_bool`: exactly `true`/`false` (`config.rs:240-249`) | `false` when unset (`config.rs:70-73`) |
 
+> **Note (removed option).** The `scaling` row above recorded the state when the
+> audit was written. Presentation scaling has since been removed (always Fit —
+> `docs/migration/11`, D39): the `scaling` key, its parse and its `Fit` default
+> no longer exist, and the Kotlin side drops them with the feature.
+
 Error-text ranges agree too: the engine error contains `1..=1000`
 (`config.rs:36`, asserted by `crates/android/src/config.rs` tests) and
 `game, fit, fill, expand`; the UI validates with the same constants
@@ -280,6 +290,11 @@ desktop path is unaffected: `crates/app/src/main.rs:298-306` resolves
 gesture modules are `#[cfg(any(target_os = "android", test))]`
 (`crates/android/src/lib.rs:31-45`) so they never link into the desktop
 binary. Verified on both sides; matches `docs/android.md` §2.2 and §3.2.
+
+> **Note (removed option).** This recorded the `fit`-vs-`game` split when the
+> audit was written; both are gone with the presentation feature
+> (`docs/migration/11`, D39), so there is no Android-vs-desktop default to
+> reconcile. **Superseded by D39/D40.**
 
 **Missing knobs / the doc's claim.** `RuntimeConfig` has exactly three fields
 (`api/src/config.rs:185-201`) and the UI exposes all three. The claim in

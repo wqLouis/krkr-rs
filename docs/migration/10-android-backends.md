@@ -1,4 +1,4 @@
-# Android backends (AAudio + MediaCodec) — design & references
+# Android backends (AAudio + MediaCodec + AHardwareBuffer) — design & references
 
 Status: **implemented inside the Android composition root; unverified on a
 device.** **Android
@@ -24,6 +24,18 @@ must be validated on a device.
 - Java `MediaCodec`: <https://developer.android.com/reference/android/media/MediaCodec>
 - Headers/libs: `<media/NdkMediaCodec.h>`, `<media/NdkMediaExtractor.h>`,
   `<media/NdkMediaFormat.h>`, `libmediandk.so`
+
+**Render readback (AHardwareBuffer / dmabuf)**
+- NDK `AHardwareBuffer` reference:
+  <https://developer.android.com/ndk/reference/group/a-hardware-buffer>
+- Header: `<android/hardware_buffer.h>` (API 26+), `libnativewindow`
+- Vulkan extension `VK_ANDROID_external_memory_android_hardware_buffer`
+  (device extension 130, API 27+):
+  <https://docs.vulkan.org/refpages/latest/refpages/source/VK_ANDROID_external_memory_android_hardware_buffer.html>
+- `VK_EXT_external_memory_dma_buf` + `VK_EXT_image_drm_format_modifier` (the
+  raw-dmabuf and DRM-modifier route; Linux-oriented)
+- `ndk::hardware_buffer` (safe `AHardwareBuffer` bindings, `rust-mobile/ndk`):
+  <https://docs.rs/ndk/latest/ndk/hardware_buffer/index.html>
 
 ## AAudio → `platform::AudioDevice`
 
@@ -83,6 +95,107 @@ return the rotated landscape size; that the back and volume keys arrive as
 expected; and that the touch coordinates are in the same physical space as
 `size()`.
 
+## Device-pixel readback → `render` (AHardwareBuffer interop)
+
+This is the Android transport for the L2 pixel-translation readback
+(`11-presentation-and-pixel-translation.md` §7): the single backing is a
+**device-resolution** image, and a script's VM-coordinate read is served by
+locking the device region `[x·s,(x+1)·s)×[y·s,(y+1)·s)` and copying it out —
+the buffer is never downscaled. The scope is any device-resolution surface the
+engine must read on the CPU: the frame backing now, and later a GPU-composed
+layer buffer whose CPU copy has been discarded.
+
+### The load-bearing constraint: only one direction works
+
+`AHardwareBuffer` is the Android handle for gralloc/dmabuf memory; it is
+imported into and exported from Vulkan. But the two directions are **not**
+symmetric, and the extension's own issue 4 is explicit:
+
+> Implementations are not required to support host-visible memory types for
+> imported Android hardware buffers … Implementations are not required to
+> support linear-tiled images backed by Android hardware buffers, even if the
+> `AHardwareBuffer` has CPU usage. There is no reliable way to allocate memory
+> in Vulkan that can be exported to a `AHardwareBuffer` with CPU usage.
+
+and `vkMapMemory` is **not** `AHardwareBuffer_lock` (the former is a persistent
+raw view with no ownership; the latter is temporary, exclusive, and does the
+cache/reformat work). So the design does **not** allocate a Vulkan image and
+try to export/map it. It does the opposite:
+
+**allocate the `AHardwareBuffer` first, import it into Vulkan, render into it,
+then `AHardwareBuffer_lock` to read.**
+
+### Our API → Android
+
+| our API | Android |
+|---|---|
+| allocate the device-resolution backing | `AHardwareBuffer_allocate` (`ndk::hardware_buffer::HardwareBuffer::allocate`) with usage `GPU_COLOR_OUTPUT \| GPU_SAMPLED_IMAGE \| CPU_READ_OFTEN`, format `R8G8B8A8_UNORM`, one layer. Validate with `is_supported` (API 29) and fail with a typed error on unsupported (D11) — never a silent downgrade |
+| import into Vulkan | `vkGetAndroidHardwareBufferPropertiesANDROID` → `vkAllocateMemory` (dedicated, `VkImportAndroidHardwareBufferInfoANDROID` chained) → bind to a `VkImage` created with `VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID` and usage `COLOR_ATTACHMENT \| SAMPLED \| TRANSFER_SRC` |
+| draw the frame | render the device-space `RenderScene` into the imported image (the D40 projection); the image is the persistent backing |
+| present | blit the backing image to the acquired swapchain image. Readback never comes from a swapchain image: its contents are undefined after present and the set is rotated |
+| read a VM-pixel region | fence the submit that wrote the region, then `HardwareBuffer::lock_and_get_info(CPU_READ_OFTEN, fence, rect)` (API 29) for the address **and** the row stride, copy the strided rows, then `unlock` |
+
+### Lock semantics that constrain the code
+
+* **`lock`, not `mmap`.** `lock` may block until the GPU finishes and performs
+  the cache maintenance and any tiling reformat (gralloc may hand back an
+  AFBC/UBWC-tiled buffer); a raw map would read garbage. That is why the
+  exported-image route above is rejected.
+* **Stride is required and only the newer calls give it.** `lock` returns a
+  bare address; `lock_and_get_info` (API 29) returns bytes-per-pixel and
+  bytes-per-stride, and `lock_planes` returns the same per plane. A missing
+  stride is a typed error, never an assumed width (D11).
+* **One layer only**; a multi-layer buffer fails `lock`.
+* **`rect` is the `PixelTranslation::vm_pixel_region` box**, so the lock is
+  scoped to the region the script read, not the whole frame.
+* Read locks are shareable across threads; a concurrent write lock is
+  undefined, so the engine serializes its own writes (`unlock` before the next
+  submit touching the buffer). `unlock` blocks; `unlock_async` returns a fence.
+
+### Where the dmabuf fd fits (and where it does not)
+
+The dmabuf is reached **through** `AHardwareBuffer`, not through
+`VK_EXT_external_memory_dma_buf`. `AHardwareBuffer_getNativeHandle` (the VNDK
+header `vndk/hardware_buffer.h`, whose `native_handle_t.data[0]` is the fd) is
+not part of the safe `ndk` crate and is vendor-dependent, and it is only needed
+to hand the memory to a **non-Vulkan** consumer. Our readback is a CPU read, so
+`lock` is the transport; the fd stays an interop escape hatch. Cross-process
+sharing, if ever needed, uses the sanctioned channel —
+`send_handle_to_unix_socket`/`recv_handle_from_unix_socket`, both exposed by
+`ndk`.
+
+On the **Linux** host the analogue is `VK_EXT_external_memory_dma_buf` plus
+`VK_EXT_image_drm_format_modifier` (a dmabuf fd negotiated with a DRM format
+modifier, `DRM_FORMAT_MOD_LINEAR` for a linear view), but the simplest desktop
+transport is the host-visible **staging copy** below.
+
+### Capability and fallback
+
+The zero-copy path needs `VK_ANDROID_external_memory_android_hardware_buffer`
+(API 27+) and API 29 for the stride-returning locks. When the extension, the
+format, or the required lock entry point is unavailable, the fallback is the
+existing **staging-copy** readback: `vkCmdCopyImageToBuffer` the region into a
+`HOST_VISIBLE | HOST_COHERENT` `VkBuffer`, wait, map, copy. It returns the same
+bytes through a different transport, so this is a capability choice (like
+FFmpeg vs MediaCodec, D5), **not** a silent semantic fallback — and it is
+probed explicitly, not guessed.
+
+Host builds compile a stub for all of the above, as AAudio and MediaCodec do.
+The unlock/lock path returns a raw pointer, so the module uses
+`#![deny(unsafe_code)]` with a scoped `#[allow(unsafe_code)]` (the same pattern
+as the audio buffer conversion).
+
+### Cost, and when the staging copy is the better transport
+
+The AHB path keeps one persistent, lockable backing, so a script read is a
+region lock instead of a full-image copy — but that backing is presented by a
+blit to the swapchain every frame, and `lock` may stall on the GPU. When
+readback is rare (a one-off `captureCanvas`, not a per-frame `getPixel` loop),
+the staging copy is cheaper and is the default. Whether the *frame* backing must
+be device-resolution and lockable at all, or only the offscreen canvases and the
+GPU-composed bitmaps do, is left to Stage 3
+(`11-presentation-and-pixel-translation.md` §9).
+
 ## MediaCodec → `media` video backend
 
 | Our API | NDK |
@@ -115,14 +228,23 @@ downloads), which ships *safe* Rust bindings for exactly what we need:
   data/error callbacks, `AudioFormat`, performance/sharing modes;
 - `ndk::media::media_codec` + `ndk::media::media_format` (feature `media`) —
   MediaCodec + `AMediaFormat` (`AMediaExtractor` is **not** covered; use a small
-  raw `extern "C"` shim for the extractor only).
+  raw `extern "C"` shim for the extractor only);
+- `ndk::hardware_buffer` — `HardwareBuffer`, `HardwareBufferDesc`,
+  `HardwareBufferUsage`, `lock`/`lock_planes`/`unlock`. The module is gated by
+  the **`api-level-26`** feature and the stride-returning
+  `lock_and_get_info`/`lock_planes`/`is_supported` by **`api-level-29`**. It
+  exposes **no** `AHardwareBuffer_getNativeHandle`, so the raw-dmabuf-fd path
+  would need a shim; readback deliberately goes through `lock` instead.
 
 `ndk` only compiles for an Android target, so add it **target-gated** to keep
 host checks working:
 
 ```toml
 [target.'cfg(target_os = "android")'.dependencies]
-ndk = { version = "0.9", features = ["audio"] }   # or ["media"]
+ndk = { version = "0.9", features = ["audio"] }   # or ["media"], or
+                                                  # ["api-level-29"] for the
+                                                  # hardware buffer (26 for the
+                                                  # module, 29 for the locks)
 ```
 
 and implement the real path under `#[cfg(target_os = "android")]` with a
@@ -154,3 +276,10 @@ under a crate-wide `forbid`, which is why the Android path uses `deny`.
   `flush`, colour-format negotiation (`COLOR_FormatYUV420Flexible` and the
   documented planar fallback), stride/slice-height/crop geometry, format-change
   timing, PCM encoding, and EOS/drain termination.
+- AHardwareBuffer readback (device-only): that `AHardwareBuffer_isSupported`
+  returns true for the chosen desc on the target GPU, that the driver accepts
+  the imported `VkImage`, which tiling/compression modifier gralloc picks, that
+  `CPU_READ_OFTEN` is honoured, that `lock`/`lock_and_get_info` return the stride
+  and the region is correct, how much `lock` stalls the GPU, and that the blit
+  to the swapchain matches the old direct-to-swapchain output. Until then the
+  staging-copy transport is the default and the AHB path is unverified.

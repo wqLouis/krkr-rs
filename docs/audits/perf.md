@@ -34,6 +34,10 @@ A windowed run of the release binary on `/mnt/DATA/Games/Others/test/`
 (Yuzusoft, `data.xp3` + `patch.xp3`) with `--backend vulkan --scaling fit`, at
 the 60 fps steady state, 347 clean frames:
 
+> **Note (removed option).** The command above is the one the measurement was
+> taken with; `--scaling` no longer exists (presentation is always Fit —
+> `docs/migration/11`, D39). The numbers stand as the record of that run.
+
 | phase | p50 | p90 | max |
 |---|---|---|---|
 | total | 1.20 ms | 1.90 | 4.90 |

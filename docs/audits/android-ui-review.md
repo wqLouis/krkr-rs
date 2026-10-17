@@ -128,6 +128,10 @@ change recreates the Activity and the whole composition. All UI state is
 | `permissionGranted`, `startupIssue` | `MainActivity.kt:100-101` | Activity fields, recreated | **re-derived**: `onCreate` re-reads the grant (`:108`), `onResume` re-runs `reconcilePendingLaunch` (`:131-136`) |
 | scroll positions | `rememberScrollState` / `LazyColumn` state | no | `rememberSaveable`-backed internally — survives |
 
+> **Note (removed option).** The settings draft will shrink to
+> (`frameRate`, `preloadArchives`, …) when presentation scaling is removed
+> (`docs/migration/11`, D39); the recreation-loss finding is unaffected.
+
 The documented intent makes this reachable: the app is declared
 "**Landscape-locked**" (`android/README.md:32`) / "Locked to landscape"
 (`docs/android.md:28`), but only `KrkrGameActivity` carries
@@ -194,6 +198,8 @@ literals. Surfaces, by file:
   `GameCard` remove label (`:1012`), share/copy subject (`:614, 645`).
 - **RuntimeSettings.kt** — `FRAME_RATE_RANGE` (`:46`), all four scaling
   descriptions (`:74-84`), the preload description (`:90-98`).
+  (`:74-84` and the scaling constants go with the presentation feature —
+  `docs/migration/11` §4.)
 - **GamePreflight.kt** — all four issue titles/messages (`:36, 43, 52, 64-70`).
 
 **Is it a gap?** Yes, given the documented audience: the repo ships

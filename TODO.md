@@ -1,6 +1,6 @@
 # TODO — open work
 
-**Branch:** `migration/middle-layer-ash` · **repo:** `/mnt/DATA/Document/code/krkr-rs`
+**Branch:** `main` · **repo:** `/mnt/DATA/Document/code/krkr-rs`
 **Real game:** `/mnt/DATA/Games/Others/test` (`data.xp3`, `patch.xp3`, loose `patch.tjs`).
 
 This file lists **only what is still open**, verified against the tree by four
@@ -28,19 +28,23 @@ re-opened. History is read with `git log`.
 uv run --project scripts krkr-gate gate
 ```
 
-`krkr-gate gate` runs the sequence in order: `cargo fmt --all -- --check`; the
-`stateless`, `error-handling`, `house-style`, `layering` checks;
-`cargo clippy --workspace --all-targets -- -D warnings`;
-`cargo test --workspace --no-fail-fast`;
-`cargo test -p platform --features platform-linux`;
-`cargo clippy -p platform --features platform-android --all-targets -- -D warnings`;
-`cargo test -p platform --features platform-android`; `android-target`;
-`surface-lock --update`; `surface-lock`; `native-parity`;
+`krkr-gate gate` runs the ordered **static** sequence: `cargo fmt --all --
+--check`; the `stateless`, `error-handling`, `house-style`, `layering`,
+`storage-boundary`, `native-construction`, `storage-media`, `callback-objthis`
+checks; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo clippy
+-p platform --features platform-android --all-targets -- -D warnings`;
+`android-target`; `surface-lock --update`; `surface-lock`; `native-parity`;
 `plugin-parity --no-doc`; `host-facts`.
+
+The test suites are separate: `uv run --project scripts krkr-gate test` runs
+`cargo test --workspace --no-fail-fast`, then the `platform` suites for
+`platform-linux` and `platform-android`. A change is done only when both the
+static gate and the test suites are green.
 
 The compiler-free checks also run individually with no build (`android-target`
 shells out to `cargo tree` only): `uv run --project scripts krkr-gate <check>`
 for `<check>` in `stateless`, `error-handling`, `house-style`, `layering`,
+`storage-boundary`, `native-construction`, `storage-media`, `callback-objthis`,
 `host-facts`, `android-target`, `native-parity`, `plugin-parity`, or
 `surface-lock --no-regen`; `gate --no-cargo` runs the compiler-free subset in
 the same order.
@@ -86,11 +90,16 @@ layer, the window bound to the first, a cross-domain re-parent raising
    `tjsDictionary.cpp:642`; cycle guard only, identical to the reference), and
    the decisive backtrace was never taken. Close it by reproducing once and
    reading the backtrace, not by guessing.
-2. **The game cannot change resolution — open, needs a repro.** No audit
-   defines the trigger and the game data is packed. The likely-needed path has
-   landed (`dbc1e9b` resize propagation, `2b021c6` scaling). Tell us what the
-   game does when it fails (a settings screen? a title option? a window resize?)
-   to turn this into a concrete repro.
+2. **The game cannot change resolution — reworked into automatic Fit.** The
+   first attempt (`2b021c6` scaling, `dbc1e9b` resize propagation) scaled the
+   composited tree and is being removed (`docs/migration/11` §4). The
+   replacement presents every game uniformly scaled and letterboxed to the
+   device size (D39), so the game no longer needs to change the framebuffer
+   resolution; the script's own declared size (`System.screenWidth`,
+   `Window.setSize`) is unchanged and still what the script sees. Still owed:
+   the ground truth from the game — what it does when a resolution change is
+   requested (a settings screen? a title option? a window resize?) — to confirm
+   the Fit path covers it.
 3. **Startup is slow on `/mnt/DATA`** — environmental: `fuseblk` (NTFS-3G), not
    CPU and not a code defect (`docs/audits/perf-hotspots.md` #6).
 
@@ -114,10 +123,6 @@ layer, the window bound to the first, a cross-domain re-parent raising
   `"path must end with '/', '\\' or '>'; got …"`; the reference raises
   `TVPMissingPathDelimiterAtLast` = `"Use path delimiter '>' or '/'"` —
   script-observable, so it matters.
-* **Stale review doc** `docs/migration/reviews/fs_engine.md` §1.10 still records
-  the `exists`-reports-directories finding as open; the code and
-  `crates/engine/tests/storage.rs:353-365` now agree with `TVPIsExistentStorage`.
-  Annotate it as resolved.
 
 ## 5. Dialogs and popups
 
@@ -164,20 +169,20 @@ touching L3 — but no native backend is built now:
 
 ## 6. Core natives
 
-Three members still raise (or ignore an argument) where the reference returns a
-value. Same class as the landed C-batch: a member behaves like the reference or
-raises because the reference raises.
+Two members still differ from the reference; a member behaves like the
+reference or raises because the reference raises.
 
-* **C5** `Font.doUserSelect` raises (`crates/compat/src/natives/visual/font.rs`);
-  the reference returns `0` (`LayerIntf.cpp:11931-11956`).
 * **C6** `Font.rasterizer = n` raises for `n != 0`; the reference ignores an
   out-of-range value (`LayerBitmapImpl.cpp:94-101`).
-* **C11** `Font.getList(flags)` ignores `flags`; the reference passes it to
-  `GetFontList` (`LayerIntf.cpp:11977`).
+* **C11** `Font.getList(flags)` accepts `flags` but ignores it; the reference
+  passes it to `GetFontList` (`LayerIntf.cpp:11977`).
 * **C14 (coverage)** `scripts/native_parity.py:59` still checks only
   `reference/cpp/core/**`; the plugin surface is machine-checked by
   `scripts/plugin_parity.py`, but plugin *behaviour* rests on the audits alone.
   `Mouse`/`Key` are in neither parity map (see §7).
+
+`Font.doUserSelect` now returns `0` after checking its four arguments, matching
+`LayerIntf.cpp:11931-11956`; it was the C5 finding.
 
 ## 7. Input / audio / video
 
@@ -313,18 +318,35 @@ Open:
 * The launcher's whole UI is hardcoded English; `strings.xml` holds only
   `app_name`, and no `values-zh` exists (`docs/audits/android-ui-review.md` F5).
 
+## 1.1 Current priority
+
+Two pieces of architecture work are in flight; they are the first two phases
+of [`docs/migration/07-roadmap.md`](docs/migration/07-roadmap.md) Phase 9/10 and
+the contract is [`docs/migration/11`](docs/migration/11-presentation-and-pixel-translation.md)
+and [`12`](docs/migration/12-layer-tree-and-frame.md).
+
+1. **L2 owns the frame** (`D26`/`D27`). `Engine::frame(now_ms, hooks)` /
+   `Engine::step(dt_ms, hooks)` own the frame clock, timers, projection and
+   render; `GameFrame::before_render` is the single L4/L3 hook. Nothing above L2
+   owns a `dt`.
+2. **The pixel-translation layer** (`D39`/`D40`). A pure L2 `PixelTranslation`
+   maps VM pixels (what scripts see) to device pixels (what the framebuffer
+   uses), applies the Fit-with-letterbox rule during projection, and maps input
+   back. The obsolete `ScalingMode`/`PresentationScaling`/`--scaling`/
+   `ViewTransform`/`native_size` line is deleted first (Phase 9a).
+
+Open sub-items are tracked in those docs, not duplicated here: device-pixel
+readback over `AHardwareBuffer`/staging (`10` "Device-pixel readback"),
+glyph rasterization at `raster_scale`, and the remaining per-subsystem pumps
+that still run inside the L3 hook (mixer/video/transitions) before they move
+to L2.
+
 ## 12. Deferred design work
 
-* **L2 owns the frame** — `Engine::frame`/`Engine::run`/`GameFrame` designed, not
-  built (`docs/migration/02 §3`, `07 Phase 9`). Until then `platform::Clock` is a
-  wall clock, which is why headless frame counts reach real time only by accident.
 * **TJS VM Rust port** — deferred (`08 §10.7`).
 * **`streams.cpp`: thin C++ adapter over a Rust implementation** — deferred. It
   is the only port-authored C++ besides the ABI boundary (794 lines), and every
   memory-safety defect in the save path was in it.
-* **L2 API snapshot + CI** — `cargo public-api` is decided but unwired. There is
-  no CI gate: the only workflow builds the Android app on tags and does not run
-  the Rust gate, so §1 is run locally.
 * **Windowed audio on a real device** — the cpal backend is real and wired
   (`crates/platform/platform/src/linux.rs`, `crates/app/src/audio.rs`); owed is
   the device validation.
@@ -380,8 +402,8 @@ these needs new evidence, not a re-read.
 * `VideoOverlay` frames are composited into `layer1`/`layer2` and the mixing
   layer; `vomOverlay` is deliberately not emulated.
 * Plugin/native parity is 100% with empty allowlists: `native_parity` reports
-  0 missing and **2 intentional extras** (`KAGParser.multiLineTagEnabled`,
-  `paramMacros`; `docs/native_parity.md`).
+  0 missing and **3 intentional extras** (`KAGParser.multiLineTagEnabled`,
+  `paramMacros`, `PhaseVocoder.__TvpPhaseVocoder`; `docs/native_parity.md`).
 
 ## 14. Error handling
 
@@ -669,35 +691,26 @@ directory. Host check available: `/mnt/DATA/Games/Others/test2/data.xp3` is
    it needs behaviour** (18.4, Tier 2).
 2. **Other linked but unported plugins**: `krglhwebp.dll`, `clipboardEx.dll`
    (seen in a device log), plus the inventory's 35 unemulated names.
-3. **The hasher swap** — measured, not guesswork: `scripts/perf/hashmap_vs_btreemap.rs`
-   shows `FxHash` 2–9× faster than the default SipHash on the id/name keys this
-   tree uses, while `BTreeMap` is *worse* (and reorders observable
-   dictionaries). Swap the hasher on internal maps only; leave insertion-ordered
-   structures alone.
-4. **Delete `unsafe impl Send + Sync for Tjs2Engine`** — unsound as a public API
+3. **Delete `unsafe impl Send + Sync for Tjs2Engine`** — unsound as a public API
    (two engines race process-global VM state) and nothing in the tree was found
    to require the bounds, so remove them and let the compiler name any caller.
    `docs/vm-defects.md` GLO-1 / LIFE-2.
-5. **Image decode scheduling** — the measured 6.77 s frame and ~1.9 s transition
+4. **Image decode scheduling** — the measured 6.77 s frame and ~1.9 s transition
    are sums of synchronous decodes. The plan is prefetch, cache consultation and
    a bounded worker pool; `fork_union`/`rayon`/std threads are the candidates,
    to be chosen on a measurement. This is where the remaining seconds are.
-6. **`unsafe` SAFETY-note debt** — 89 findings across 19 files, baselined per
+5. **`unsafe` SAFETY-note debt** — 89 findings across 19 files, baselined per
    file by `scripts/check-layering.sh` so new debt fails the gate (§16).
-7. **Parity blind spots left** — `global.X = …` in script strings, member names
+6. **Parity blind spots left** — `global.X = …` in script strings, member names
    built at runtime, and two *false* reference members
    (`BasicDrawDevice.name`/`PassThroughDrawDevice.name`) that the extractor
    invents from a `#define` body. `docs/audits/propset-parity.md` §6.
-8. **`BLK-3`'s open question** — whether the shipped engine shares the reference
+7. **`BLK-3`'s open question** — whether the shipped engine shares the reference
    snapshot's incomplete bytecode export table. Settle with a game that uses
    `Scripts.compileStorage` on a `+=`/`++` statement, or a reference build whose
    translation table differs (`docs/vm-defects.md`).
-9. **`docs/migration/reviews/fs_engine.md` §1.10** — claims
-   `TVPIsExistentStorage` reports directories as existing, contradicted by
-   `StorageImpl.cpp:532-546`. Settle from the reference or mark as needing
-   device evidence; two docs must not disagree silently.
-10. **Deferred by decision**: C++ `-O2 -flto` (needs a device A/B, §12), the GPU
-    text path and render-target readback (§12), and the L2-owns-the-frame work.
+8. **Deferred by decision**: C++ `-O2 -flto` (needs a device A/B, §12), and the
+   GPU text path and render-target readback (§12).
 
 ### 18.4 Plugin coverage plan (the next major version)
 
@@ -797,23 +810,7 @@ yet.
    (present only in the device's XP3 archives) or a TJS-level trace of the
    expression that builds `saveDataLocation`. Do not add a title-specific patch
    (D28).
-2. **Directory case-correction — resolved.** `Storage::local_name` now
-   case-corrects every component (`GetLocallyAccessibleName`,
-   `StorageImpl.cpp:339-407`), so `isExistentDirectory('<root>/ASSETS/')` is
-   `true` when `<root>/Assets/` exists. The directory-listing cache was the
-   blocker and is gone: the case walk and `GetLocallyAccessibleName` read the
-   directory live (`opendir`/`readdir` on every call), so a directory created
-   after mount is seen.
-3. **`innerSunken` storage vs constant — resolved.** The concrete
-   `TVPWindowLayer` does not override `Set/GetInnerSunken`, so the shipped form
-   is constant `false`/no-op (`TVPWindow.h:135-184`); the port now matches and
-   the test pins it.
-4. **`typeof <undeclared global>` — resolved (reference behaviour).** A bare
-   `typeof <name>` is an ordinary must-exist read and raises; only the property
-   form reports `"undefined"` (`docs/vm-defects.md` SEM-2). The device
-   `Motion`/`Player`/... names are published unconditionally by the port, so a
-   build that still logs them predates those registrations.
-5. **Device verification of all of the above (D36)** is still owed: a fresh run
+2. **Device verification of all of the above (D36)** is still owed: a fresh run
    of the four titles with the log exported, and the §18.3 priority list after
    that.
 

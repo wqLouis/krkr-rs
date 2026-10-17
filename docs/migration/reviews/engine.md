@@ -274,7 +274,7 @@ reused from `bitmap.rgba`'s capacity or a row-sized buffer.
 
 ### 3.7 `wildcard_match` allocates two `Vec<char>` per call — Medium
 
-`storage.rs:690-692`. `get_file_list` calls it for every disk and archive
+`storage.rs:690-692`. `file_list` calls it for every disk and archive
 entry. Iterating `pattern.chars()`/`text.chars()` (or comparing with
 `eq_ignore_ascii_case` on `u8` after ASCII folding) avoids the per-call
 allocations.

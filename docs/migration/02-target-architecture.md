@@ -169,7 +169,7 @@ L2 Engine::frame(now_ms)
   ├─ advance mixer, video from the frame clock
   ├─ GameFrame::before_render()  ← L4 vm.tick + L3 KiriKiri event dispatch
   │                                (async triggers, continuous handlers)
-  ├─ project `scene` into L1 `RenderScene`
+  ├─ translate + project `scene` into L1 `RenderScene` (device space; D40)
   └─ call L1 RenderPipeline::render
 ```
 
@@ -219,6 +219,21 @@ leaves nobody responsible for `advance → project → render` — it degrades i
 convention shared between two files, which is exactly how the drift below
 happened — and it keeps a second clock above L2, competing with the frame clock
 L2 already needs.
+
+### Device pixels and the pixel-translation layer (D40)
+
+L3 and scripts describe the scene in **VM pixels** — the size the game
+declared; L1 draws in **device pixels** — the framebuffer. L2 owns the mapping
+between them (Fit with letterbox, D39) and applies it when it projects and when
+it reads back. It is the only layer that names both spaces: L3 never sees a
+device coordinate and L1 never sees a VM coordinate. The full contract — the
+`PixelTranslation` API, the font-rasterization split, input, and device-pixel
+readback over dmabuf — is
+[`11-presentation-and-pixel-translation.md`](11-presentation-and-pixel-translation.md)
+§6–§7. The translation is recomputed per size change inside `frame`, which is
+why it depends on D26 above. The layer tree → projection → draw path the
+translation feeds is mapped end to end in
+[`12-layer-tree-and-frame.md`](12-layer-tree-and-frame.md).
 
 ### Implementation status: not built yet
 
@@ -443,7 +458,7 @@ optimisations this freeze is meant to protect.
 | `scene` | `Scene` + its methods; `WindowState`, `LayerState`, `BitmapState`, `FontState`, `Rect` | The layer system. State fields are `pub` by house style; the types carry `#[non_exhaustive]` so growth is additive. |
 | `projection` | `project_window`, `project_scene`, `ComposedLayer`, `compose_layer`, `resolve_blend` | The native `lt*` blend numbering lives in L3 (`natives/visual/layer/blend.rs`). |
 | `layer_ops` / `raster` | the pixel operations (`blit_*`, `fill_*`, `blur_*`, `affine_blit`, `fill_polygon`, …) | Pure transforms over `BitmapState`. `GammaAdjust` fields are public-by-design (a plain parameter block). |
-| `storage` | `Storage` + `mount_archives`/`mount_archive`/`find`/`read`/`stat`/`exists`/`get_file_list`/`add_auto_path`/`extract…`; `discover_startup` | The VFS namespace + TVP addressing. |
+| `storage` | `Storage` + `mount_archives`/`mount_archive`/`find`/`read`/`stat`/`exists`/`list`/`file_list`/`add_auto_path`/`extract…`; `discover_startup` | The VFS namespace + TVP addressing. |
 | `startup` | `discover_startup` | |
 | `sound` | `Mixer`, `SoundSource`, `SoundChannel`, `SoundBuffer`, `LoopInfo`, `LoopFlags`, `SoundLabel`, `LoopLink`, `mix`/`mix_source` | Pure PCM state; L1 device consumes. The `.sli` parser and the TVP `0..100000` scale live in L3. |
 | `text` | `TextEngine`, `GlyphAtlas`, `TextLayout`, `PositionedGlyph`, `TextStyle`, `project_text`, `compose_text_cpu`, `TextError` | L1 raster/atlas swap must not change this. |

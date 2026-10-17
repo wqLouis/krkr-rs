@@ -42,7 +42,7 @@ behaviour needs TVP vocabulary (`>`, `media://`, `startup.tjs`, `addAutoPath`,
 
 | Item | Class | Why |
 |---|---|---|
-| `ATTR_DIRECTORY`, `ATTR_NORMAL` | (b) | Win32 `FILE_ATTRIBUTE_*` bits (D18). They are only consumed by the script member `Storages.getFileList(mask, attr)`. Generic VFS has `is_dir`, not an `i64` bitmask. |
+| `ATTR_DIRECTORY`, `ATTR_NORMAL` | (b) | Win32 `FILE_ATTRIBUTE_*` bits (D18). They are only consumed by `Storage::file_list`, an internal enumeration helper with no registered script member (the reference has no `Storages.getFileList`). Generic VFS has `is_dir`, not an `i64` bitmask. |
 | `STARTUP_SCRIPT`, `INITIALIZE_SCRIPT`, `PATCH_SCRIPT`, `AFTER_STARTUP_SCRIPT` | (b) | Literal names from `TVPExecuteStartupScript` (`reference/cpp/core/base/ScriptMgnIntf.cpp:898-975`; `TVPStartupScriptName` at `:371`). TVP startup policy, not a VFS concept. |
 
 ### 1.2 Public types / enums / errors
@@ -83,7 +83,7 @@ behaviour needs TVP vocabulary (`>`, `media://`, `startup.tjs`, `addAutoPath`,
 | `exists` | (b) | `TVPIsExistentStorage`, which reports directories and goes through `TVPGetPlacedPath` (`reference/cpp/core/base/StorageIntf.cpp:1120-1123`). |
 | `startup_plan`, `app_path_file` | (b) | `TVPExecuteStartupScript` policy; `patch.tjs`/`AfterStartup.tjs` are app-path-only. |
 | `list` | (c) | Merges disk + archive children and lowercases names. The merge is generic; the lowering and `arc.xp3>path` framing are TVP. Not called by any native today. |
-| `file_list` | (b) | `Storages.getFileList` semantics: Windows `attr` bits, `arcmask>inarcmask` addressing, recursive wildcard walk. Not registered on the L3 surface today (see §2). |
+| `file_list` | (b) | No reference member: an internal enumeration helper with Windows `attr` bits, `arcmask>inarcmask` addressing, recursive wildcard walk. The reference has no `Storages.getFileList`; it lists through the disk-only `getDirList`/`dirlist`/`dirlistEx`. Not registered on the L3 surface today (see §2). |
 
 ### 1.4 Public free functions
 
@@ -161,7 +161,7 @@ app is wiring/diagnostics; the vm is absent. This is exactly the shape the targe
 boundary wants: the TVP resolution has one owner (L3) and L2 is the namespace.
 
 Also note: `Storage::list` and `Storage::file_list` are **not called by any
-native** today (`getFileList` is not registered; `dirlist` uses L1 `fs::list`).
+native** today (no `getFileList` member exists; `dirlist` uses L1 `fs::list`).
 They are exercised only by `crates/engine/tests/storage.rs` and
 `crates/app/tests/real_game.rs`. That makes them cheap to move or delete.
 
@@ -439,7 +439,7 @@ resolver entry point. `crates/app` calls the resolver.
 * `scripts/surface_lock.py` — the registered `Storages` member set must not
   change (`Storages` methods are unchanged; only their implementation moves).
 * `scripts/native_parity.py` / `plugin_parity.py --no-doc` — the plugin surface
-  (`Storages.fstat`, `getFileList`, …) is unchanged.
+  (`Storages.fstat`, `Storages.dirlist`, …) is unchanged.
 * Every `reference/cpp/...` citation currently in `crates/engine/tests/storage.rs`
   and `startup.rs` moves with its test, not deleted.
 
@@ -562,7 +562,7 @@ resolver entry point. `crates/app` calls the resolver.
    read/list; TVP resolution is L3)"*, and the L3 row to name the resolver.
 
 5. **§12.3 `storage` row.** Replace
-   *"`Storage` + `mount_archives`/`mount_archive`/`find`/`read`/`stat`/`exists`/`get_file_list`/`add_auto_path`/`extract…`; `discover_startup` | The VFS namespace + TVP addressing."*
+   *"`Storage` + `mount_archives`/`mount_archive`/`find`/`read`/`stat`/`exists`/`list`/`file_list`/`add_auto_path`/`extract…`; `discover_startup` | The VFS namespace + TVP addressing."*
    with *"`Vfs` + `MountId`/`Location`/`mount_archive`/`mount_directory`/`unmount`/`read`/`stat`/`list_dir`/`stat_path`/archive index; `discover_archives` | The generic mount namespace; TVP storage resolution is L3 (`compat::storage`)."*
 
 6. **§12.4.** Change *"XP3 decompress cache / mmap → `fs` + `engine::storage`

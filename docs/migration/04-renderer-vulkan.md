@@ -126,46 +126,26 @@ transitions.
 * `winit` reports `Resized`/`ScaleFactorChanged`; the platform layer forwards
   the new surface size, and the render pipeline recreates the swapchain
   (including `OUT_OF_DATE`/`SUBOPTIMAL`/minimized handling).
-* The letterboxed game projection is L2's job (`engine::projection::ScalingMode`):
-  the middle layer computes the `dst` rects in framebuffer pixels from the
-  logical window size.
+* The letterboxed game projection is L2's job: the middle layer computes the
+  device-space `dst` rects from the logical window size and hands the pipeline
+  a device-space `RenderScene`. The pipeline has no presentation policy of its
+  own.
 * `Window.setSize`/`setZoom`/`changeScreenMode`: L2 writes the declared
   size; the host applies it through the platform window.
 
 ### 6.1 Presentation scaling
 
-This is a deliberate departure from the Win32 reference, at the user's
-request: a modern display should show the game scaled rather than pinned to
-its declared size.
+**Superseded and removed — see
+[`11-presentation-and-pixel-translation.md`](11-presentation-and-pixel-translation.md).**
 
-The behaviour to copy is not the Win32 environment's but the **cocos2d**
-one's, which is what the reference's own non-Windows builds use. It sets a
-design resolution and a `ResolutionPolicy`
-(`reference/cpp/core/environ/cocos2d/AppDelegate.cpp:63-75` — `SHOW_ALL` on
-desktop, `EXACT_FIT` on Android/iOS) and sizes its scene from the frame
-aspect (`MainScene.cpp:436-441`).
-
-`ScalingMode` selects how the engine presents the game:
-
-| mode | logical size | transform | reference |
-|---|---|---|---|
-| `Game` (default) | the game's declared size | none | the Win32 environment |
-| `Fit` | the game's declared size | uniform scale, letterboxed | cocos2d `SHOW_ALL` (`AppDelegate.cpp:73-75`) |
-| `Fill` | the game's declared size | non-uniform scale to the window | cocos2d `EXACT_FIT` (`AppDelegate.cpp:70`) |
-| `Expand` | the design height at the window's aspect | uniform scale, no letterbox | cocos2d `MainScene::initialize` (`MainScene.cpp:436-441`) |
-
-`Game` is the default, so an unconfigured run matches the reference exactly
-and every parity test keeps its meaning.
-
-The scale and offset are L2 state: the middle layer owns the projection and
-L1 applies it while compositing, per D10. Input is inverse-mapped from
-framebuffer to logical coordinates before dispatch, so a script's own
-hit-testing keeps working unchanged.
-
-`System.screenWidth`/`screenHeight` and `Window.innerWidth`/`innerHeight`
-report the **logical** size — the declared size for `Game`/`Fit`/`Fill`, the
-grown size for `Expand` — and never the framebuffer size, preserving the
-reference's design-versus-frame split (`MainScene.cpp:436-441`).
+The `ScalingMode` enum (`Game`/`Fit`/`Fill`/`Expand`), its configuration key
+and the whole-tree `ViewTransform` it drove have been deleted. Presentation is
+now a single rule — Fit with letterbox (D39) — and the VM-pixel/device-pixel
+split it needs lives in an L2 pixel-translation layer, not in the pipeline
+(D40). The renderer receives device-space rectangles and has no notion of a
+"presentation mode"; the cocos2d `SHOW_ALL`/`EXACT_FIT`/frame-aspect
+comparison below is kept only as the historical reference for the one rule
+that survives.
 
 ## 7. Window, input and UI
 

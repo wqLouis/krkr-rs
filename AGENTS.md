@@ -5,7 +5,7 @@ It distills `docs/migration/**` (the design decisions are the source of truth
 there) into the rules you must follow without re-reading them. If code and docs
 disagree, the design docs win; fix the code, then update the doc.
 
-Repo: `/mnt/DATA/Document/code/krkr-rs` · Branch: `migration/middle-layer-ash`
+Repo: `/mnt/DATA/Document/code/krkr-rs` · Branch: `main`
 Real game for manual checks: `/mnt/DATA/Games/Others/test`.
 
 ---
@@ -19,8 +19,7 @@ and corrupted the tree before. Subagents *may* run `cargo fmt` / `rustfmt`
 (formatting is not a build) and may run already-built binaries under
 `target/debug/`.
 
-The gate runs in one command (main-agent only; it includes the cargo
-fmt/clippy/test steps) and must end green:
+The gate runs in one command (main-agent only) and must end green:
 
 ```bash
 uv run --project scripts krkr-gate gate
@@ -38,10 +37,11 @@ checks;
 `surface-lock --update`; `surface-lock`; `native-parity`;
 `plugin-parity --no-doc`; `host-facts`.
 
-The test suites are **not** bundled into the guard script — run them with
+The static gate does **not** run the test suites. Run them separately with
 `uv run --project scripts krkr-gate test` (`cargo test --workspace
 --no-fail-fast`, then the `platform` suites for `platform-linux` and
-`platform-android`), or invoke `cargo test` directly.
+`platform-android`), or invoke `cargo test` directly. A change is not done
+until both the static gate and the test suites are green.
 
 The compiler-free checks run individually with no build (subagents may use
 these; `android-target` shells out to `cargo tree` only):
@@ -152,7 +152,10 @@ Crate roles:
 ## 3. The non-negotiable decisions (D-rules)
 
 These are recorded in `docs/migration/README.md` §3. The **code must not cite
-them by number** (§6); this section is for you to know them.
+them by number** (§6); this section is for you to know them. The live target
+for the current work is docs [`11`](docs/migration/11-presentation-and-pixel-translation.md)
+(presentation + pixel translation) and [`12`](docs/migration/12-layer-tree-and-frame.md)
+(the layer tree → frame contract).
 
 - **D9 — L1 is stateless.** L1 objects are facades over platform capabilities;
   methods are `&self` and take evolving state as an explicit `&mut` value
@@ -218,6 +221,32 @@ them by number** (§6); this section is for you to know them.
   — member getters/setters, return values, raised errors, `typeof`, string and
   number conversions — must match `reference/cpp/**` exactly. This is the
   boundary of D32's ban.
+- **D35 — a directory input mounts every `*.xp3` under it.** Only when no
+  explicit `--archive` is given: recursive discovery, ordered by file name
+  (case-insensitive) then shallower-first, later mounts win. Symbolic-link
+  directories are not followed. The explicit list stays authoritative.
+- **D36 — a compatibility claim names its evidence and scope.** A test is
+  evidence for what it asserts and nothing else; a knowingly-left divergence
+  is recorded as an **approximation** with its reference gap, never as
+  "unobservable". An engine release needs a real title run on a real device
+  with the log captured (`docs/android.md` §7).
+- **D38 — where the reference is a binary, the DLL is the oracle and is cited
+  by hash.** An unported plugin's behaviour test cites the shipped DLL build
+  (`plugins/<n>/plugin/<Name>.dll <sha256[:12]> @ <function/address>`) and
+  gates on a committed derived fixture, never on the DLL at run time.
+  See `plugins/analysis/README.md`.
+- **D39 — presentation is one rule: Fit with letterbox.** Scale uniformly by
+  `min(device/vm)`, centre, clear the margin. There is no mode enum and no
+  `scaling` configuration key on any launcher; the old scaling feature is
+  deleted rather than adapted. Contract: docs
+  [`11`](docs/migration/11-presentation-and-pixel-translation.md) §2.
+- **D40 — a pixel-translation layer in L2 separates VM pixels from device
+  pixels.** L3 and scripts speak VM pixels; L1 speaks device pixels; L2 owns
+  the Fit mapping at the L2↔L3 boundary and applies it when projecting and
+  reading back. The framebuffer is the single device-resolution backing; a VM
+  pixel read samples its device region. At `s == 1` the mapping is the
+  identity; script-observable values stay VM and reference-exact (D34).
+  Contract: docs [`11`](docs/migration/11-presentation-and-pixel-translation.md) §6.
 
 ---
 
@@ -387,7 +416,9 @@ Two-sided tests:
 | Roadmap + phase 9 (L2 owns the frame) | `docs/migration/07-roadmap.md` |
 | L3/L4, plugins, null plugin, ABI | `docs/migration/08-tjs-vm-and-native-plugins.md` |
 | Game loading, precedence, startup order | `docs/migration/09-game-loading.md` |
-| Android AAudio/MediaCodec | `docs/migration/10-android-backends.md`, `docs/android.md` |
+| Android AAudio/MediaCodec, `AHardwareBuffer` readback | `docs/migration/10-android-backends.md`, `docs/android.md` |
+| Presentation (Fit only) and the VM↔device pixel translation | `docs/migration/11-presentation-and-pixel-translation.md` |
+| Layer tree → projection → draw tree → frame | `docs/migration/12-layer-tree-and-frame.md` |
 | Per-crate review findings | `docs/migration/reviews/*.md` |
 | Surface lock / parity | `docs/native_parity.md`, `docs/plugin_parity.md` |
 | Win32/plugin-host and Wine studies (non-goals) | `docs/plugin_host_exe.md`, `docs/wine_box64.md` |

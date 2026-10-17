@@ -123,37 +123,27 @@ android-activity = { version = "0.6", default-features = false, features = ["gam
 so an Android target check needs the NDK `cc`/`cxx` that the `platform` check
 above does not.)
 
-### 2.2 Scaling: Android must always use automatic scaling
+### 2.2 Presentation: the game is always scaled to fit (Fit with letterbox)
 
-On a phone the game must never be presented at its raw logical size. The
-reference's Android build fills the frame by stretching: it sets the design
-resolution to the full frame size with cocos2d's `EXACT_FIT`
+On a phone the game must never be presented at its raw logical size, and the
+same is now true on the desktop: the engine presents every game uniformly
+scaled to the largest size that fits the display, centred, with the remainder
+letterboxed (`docs/migration/11`, D39). There is no per-platform default and no
+mode to choose — Fit is the single rule, on every backend.
+
+The reference's Android build stretches instead: it sets the design resolution
+to the full frame size with cocos2d's `EXACT_FIT`
 (`reference/cpp/core/environ/cocos2d/AppDelegate.cpp:60-70`) and derives the
 design size from the screen aspect
-(`reference/cpp/core/environ/cocos2d/MainScene.cpp:436-438`). The Android
-build defaults to `ScalingMode::Fit` instead — a uniform scale to the largest
-size that fits, with the remainder letterboxed — so the picture keeps its
-aspect rather than being stretched on an unusual screen. That is a deliberate
-divergence from the reference's Android environment, chosen for phones; the
-desktop launcher also defaults to `fit`, because it opens the window at the
-display's native size, so `game` would crop the declared logical screen. The
-shared `RuntimeConfig` default is still `game`, the reference's one-to-one
-Win32 presentation.
+(`reference/cpp/core/environ/cocos2d/MainScene.cpp:436-438`). Keeping the
+aspect (no distortion) is a deliberate divergence, chosen for phones; it is a
+presentation-internal choice, so nothing a script observes changes — a script
+still sees its own declared logical size.
 
-The platform side of this is already done: `PlatformWindow::size()` reports the
-physical surface size and `PlatformWindow::scale_factor()` the display density.
-The default itself belongs to the **launcher**, not L1 (L1 must not know
-TVP/scaling semantics) and not the engine (which receives an already-resolved
-value and does no configuration I/O of its own):
-
-* the Android composition root `crates/android` builds its `RuntimeConfig` with
-  `scaling: PresentationScaling::Fit` and drives the shared
-  `app::Host`/`app::GameHost` from the `android-activity` event loop; the
-  desktop CLI drives the same host through `app::run`. The desktop default
-  stays `Game`, and `--scaling` still overrides either. Loading the
-  configuration is deliberately the launcher's business, so each platform can
-  implement it its own way (`docs/runtime-config.md`). On Android the player's
-  saved choice overrides `Fit` through the settings screen (§3.2).
+The platform side reports the physical surface size (`PlatformWindow::size()`)
+and the display density (`PlatformWindow::scale_factor()`). The mapping between
+the declared logical size and the surface is L2's pixel-translation layer
+(`docs/migration/11` §6), never L1 and never the launcher.
 
 ---
 
@@ -166,8 +156,8 @@ android/                          Kotlin + Compose M3 app (Gradle)
     KrkrGameActivity.kt           hosts the engine surface; publishes the game
                                   dir + runtime settings over JNI
     GameLibrary.kt                persisted picked-folder URIs + metadata
-    RuntimeSettings.kt            persisted runtime options (frame rate, scaling,
-                                  archive preload, debug overlay)
+    RuntimeSettings.kt            persisted runtime options (frame rate,
+                                  archive preload, debug overlay, log level)
     ui/                           Compose screens, M3 theme
   app/src/main/jniLibs/arm64-v8a/
     libkrkr_android.so            ← the Rust engine (cargo-ndk output)
@@ -250,20 +240,18 @@ than starting the engine against a path that will not resolve.
 The launcher also persists the player's runtime options and carries them into
 the engine. A **Settings** screen reachable from the launcher's top bar exposes
 the options `api::config::RuntimeConfig` carries today, with the same accepted
-values as the desktop `--fps`/`--scaling`/`--preload-archives`/`--debug-overlay`.
+values as the desktop `--fps`/`--preload-archives`/`--debug-overlay`.
 Nothing is offered for a feature the engine has no knob for
 — a control that silently did nothing is the bug class this project forbids.
+Presentation is not among the options: Fit-with-letterbox is the engine's single
+rule (`docs/migration/11`, D39), so there is no scaling control to show.
 
 | option | values / range | default | basis |
 |---|---|---|---|
 | Frame-rate limit | decimal integer `1..=1000` fps | `60` | reference `fps_limit` default 60 (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`); the same range `--fps` accepts |
-| Presentation scaling | `game`, `fit`, `fill`, `expand` | `fit` | `game` is the reference's one-to-one Win32 presentation; `fit` is the Android default (§2.2), because a phone must not present the raw logical size |
 | Archive preload | `true`, `false` | `false` | whether every mounted archive is read into memory when it mounts; the cost is that archive's size in resident memory, the gain is that entry reads stop touching the backing filesystem |
 | Debug overlay | `true`, `false` | `false` | draw the frame rate and the process's resident memory in the top-left corner; a render-only panel, never a script-visible layer or bitmap |
 | Engine log level | `off`, `error`, `warn`, `info`, `debug`, `trace` | `info` | how much the engine writes to `krkr.log`; `debug`/`trace` are diagnostic and produce large logs (see §7) |
-
-`fill` and `expand` are exposed because the engine honours them; the desktop
-launcher and Android both default to `fit`.
 
 The debug overlay is off by default and persisted under the `debug_overlay`
 key; `KrkrGameActivity` publishes it as `pendingDebugOverlay` and
@@ -282,7 +270,7 @@ The choices are stored as JSON in the app's private files directory —
 inspectable, atomically-written convention (§3.1):
 
 ```json
-{ "version": 1, "frame_rate": "60", "scaling": "fit",
+{ "version": 1, "frame_rate": "60",
   "preload_archives": "false", "debug_overlay": "false", "log_level": "info" }
 ```
 
@@ -293,29 +281,27 @@ as it does for the desktop `key=value` file.
 The configuration path mirrors the desktop launcher's, with the settings file
 playing the role of the `KRKR_CONFIG` file:
 
-1. **The settings UI** validates the frame rate (`1..=1000`), the scaling (one
-   of the four), the archive preload (`true`/`false`) and the debug overlay
-   (`true`/`false`) and writes
+1. **The settings UI** validates the frame rate (`1..=1000`), the archive
+   preload (`true`/`false`) and the debug overlay (`true`/`false`) and writes
    `settings.json` atomically. A value loaded from a hand-edited file that is
    not one of the accepted values is shown and must be corrected before it can
    be saved; the hand-edited value is preserved, not rewritten.
 2. **`KrkrGameActivity`** reads `settings.json` in `onCreate`/`onNewIntent`
-   *before* `super.onCreate` and copies the five values onto the static fields
-   `pendingFrameRate`, `pendingScaling`, `pendingPreloadArchives`,
+   *before* `super.onCreate` and copies the four values onto the static fields
+   `pendingFrameRate`, `pendingPreloadArchives`,
    `pendingDebugOverlay` and `pendingLogLevel` — the same JNI channel
    `pendingGameDir`/`pendingGameName`/`pendingStateDir` already use.
 3. **`crates/android`** reads those fields (`jni_fields.rs`) and resolves them
-   (`config.rs`) into a `RuntimeConfig`, applying `fit` as the presentation
-   default and `false` as the preload and debug-overlay defaults. The log level
-   is resolved first,
+   (`config.rs`) into a `RuntimeConfig`, applying `false` as the preload and
+   debug-overlay defaults. The log level is resolved first,
    before the logger is installed, because it selects the filter; its default
    is `info`. An unparseable or out-of-range value is a typed `ConfigError`
    naming the option and the accepted values; it is written to `krkr_state.json`
    as a failure and the loop is never started — it is never replaced by the
    default.
 4. **The shared emulator host** receives the finished value: the
-   `crates/android` loop passes the scaling into the render host, the
-   archive-preload choice into `app::GameHost::open_with_preload`, the
+   `crates/android` loop passes the archive-preload choice into
+   `app::GameHost::open_with_preload`, the
    debug-overlay choice into `app::HostConfig::with_debug_overlay`, and the
    frame period into its ticker, exactly as the desktop `app::run` does; the
    log level becomes the process logger's filter. The emulator core performs no
@@ -641,14 +627,16 @@ The storage, orientation and game-discovery questions are now **decided**
 (§1): sideloaded storage via option A, landscape lock, and explicit folders
 only — no auto-indexing of a default location.
 
-1. **Resolution/scaling policy** on phones — **decided: default `Fit`, and the
-   player can override it.** The game is scaled uniformly to fit the screen by
-   default, with the remainder letterboxed, so it keeps its aspect. The
-   reference's Android build stretches instead (`EXACT_FIT`,
+1. **Resolution/scaling policy** on phones — **decided: always Fit with
+   letterbox, no override.** The target is to scale the game uniformly to fit
+   the screen and letterbox the remainder, so it keeps its aspect; this is the
+   engine's single presentation rule (`docs/migration/11`, D39), not an Android
+   default, and the settings screen (§3.2) no longer offers a mode. Until the
+   L2 pixel-translation layer lands (`07` Phase 10) the scene is presented
+   one-to-one at its declared size. The reference's Android build stretches
+   instead (`EXACT_FIT`,
    `reference/cpp/core/environ/cocos2d/AppDelegate.cpp:60-70`,
-   `MainScene.cpp:436-438`); we choose no distortion. The Android composition
-   root selects `Fit` as the default and the settings screen (§3.2) can override
-   it with any of the engine's four modes.
+   `MainScene.cpp:436-438`); we choose no distortion.
 2. **Audio focus/interruption** (phone call, notification) and lifecycle
    (backgrounding must pause the VM + mixer) — not yet scoped.
 3. **Emulator support**: arm64-only means no x86_64 emulator; verification will

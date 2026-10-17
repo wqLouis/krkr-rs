@@ -16,10 +16,12 @@ after each one.
 > The original list of remaining work (move the host into `platform`, move
 > XP3 into L1, explicit archive loading, introduce `compat`/`vm`, media video
 > + startup, Android host, delete `tvp-*`) is **done**. What remains is
-> tracked in `TODO.md`: the frame-owning `Engine` (Phase 9 below), native
-> plugin coverage (`TODO.md` §17), the unmodelled parts of the timer event
-> queue, Android on-device validation, and the deferred performance work
-> (§9, D22).
+> tracked in `TODO.md`: remove the presentation-scaling feature (Phase 9a
+> below, [`11`](11-presentation-and-pixel-translation.md) §4), the
+> frame-owning `Engine` (Phase 9 below, the prerequisite for the
+> pixel-translation layer in Phase 10), native plugin coverage (`TODO.md`
+> §17), the unmodelled parts of the timer event queue, Android on-device
+> validation, and the deferred performance work (§9, D22).
 >
 > The per-phase list below is kept as the record of how the rework was
 > sequenced.
@@ -172,7 +174,35 @@ Deliverables:
 
 Exit criteria: `02-target-architecture.md §9` acceptance criteria all hold.
 
+### Phase 9a — Remove the presentation-scaling feature
+
+**Status: landed.**
+
+The first attempt at scaling (the `feat(scaling)` line) is removed rather than
+adapted: it scaled the composited tree through a whole-tree `ViewTransform`
+and is built the wrong way round for the target design. Contract, deletion
+inventory and the keep-list: [`11`](11-presentation-and-pixel-translation.md)
+§4.
+
+Deliverables:
+* delete `ScalingMode`/`Presentation` (engine), `PresentationScaling` + the
+  `scaling` config key (api/config/CLI/Android), `ViewTransform` +
+  `RenderScene.view` (render), the `app`/`android` logical-size plumbing and
+  `platform::native_size`;
+* keep `render::scene::{node_spaces, place_rect}` and the nearest-texel
+  sampling (independent fixes);
+* update the docs that described the feature (this list, `04 §6.1`,
+  `runtime-config.md`, `android.md`, `audits/perf.md`).
+
+Exit criteria: gate green; a headless and a windowed run present one-to-one at
+the game's declared size; `git grep -n 'ScalingMode\|PresentationScaling\|
+native_size' crates` is empty (the GDI+ `Layer.*ViewTransform` surface stays);
+surface lock and both parity reports unchanged.
+
 ### Phase 9 — L2 owns the frame (D26 / D27)
+
+This is the prerequisite for Phase 10: the pixel translation is recomputed per
+size change *inside the frame*, and the frame is where projection happens.
 
 Deliverables:
 * `Engine::frame(now_ms, hooks)` + `Engine::run(clock, hooks)` + the
@@ -193,6 +223,35 @@ Exit criteria: no code above L2 holds a clock or calls `advance`; the
 timer's public surface is the four methods; `cargo test -p engine -p
 compat -p app` green with tests driving `frame(now)` virtually; doc 02 §3
 “Implementation status: not built yet” section removed.
+
+### Phase 10 — Pixel-translation layer (device resolution + readback)
+
+The device-resolution presentation and the VM↔device boundary. Contract:
+[`11`](11-presentation-and-pixel-translation.md) §6–§7.
+
+Deliverables:
+* `engine::translate::PixelTranslation` — Fit (D39) mapping with
+  `to_device_*`/`to_vm_point`/`raster_scale`/`vm_pixel_region`, owned and
+  recomputed by `Engine` on a size change (D40);
+* the projection applies the mapping so the pipeline receives device-space
+  rectangles (the generic `Affine2` root transform already exists);
+* device resolution is switched on: the window opens at the device size and
+  the scene is presented through the translation, not 1:1 (this replaces the
+  removed `native_size`);
+* glyph rasterization at `size_px · raster_scale()`, with **layout metrics
+  still VM** so every script-visible measurement is unchanged;
+* input mapped device→VM in L2 before hit-testing (the removed
+  `map_input_to_logical`, hoisted to the owner of the translation);
+* readback through `vm_pixel_region`: the desktop and fallback path is a
+  host-visible staging copy; on Android the backing is allocated as an
+  `AHardwareBuffer` and read with `AHardwareBuffer_lock`
+  ([`10-android-backends.md`](10-android-backends.md) "Device-pixel readback").
+
+Exit criteria: with `vm_size == device_size` the output is identical to Phase
+9a (the mapping is the identity), so surface lock, parity and golden tests are
+unchanged; the game then renders at device resolution with `getPixel`,
+`piledCopy` and `saveLayerImage` addressed through the translation and every
+script-observable value still VM and reference-exact.
 
 ## 3. Suggested commit/branch discipline
 

@@ -52,8 +52,17 @@ name belongs to. It never keeps a table of open files; L2 stores each
 * the parsed archive index returned by L1, plus the `FileState`s that own
   each archive's bytes — the namespace state. L2 never reads or parses the
   XP3 container itself; that is L1 (see the D6 note below);
-* `Storages` native semantics: `stat`, `getFileList`, `open`, `fstat`,
-  `deleteFile`, `copyFile`, save-data writes.
+* `Storages` native semantics: `getPlacedPath`, `isExistentStorage`,
+  `getLocalName`, `getFullPath`, `addAutoPath`/`removeAutoPath`, the
+  `extractStorage*`/`chopStorageExt` string helpers, and the fstat-plugin file
+  operations (`stat`, `deleteFile`, `copyFile`, …); save-data writes.
+  Directory listing is **not** a `Storages` core member in the reference: it
+  lists through the `dirlist.dll` global `getDirList` and the fstat plugin's
+  `Storages.dirlist`/`dirlistEx`/`dirtree`, all of which are **disk-only**
+  (`reference/cpp/plugins/fstat/main.cpp:486-539`). There is no
+  `Storages.getFileList` in `reference/cpp`. The L2 `list`/`file_list` that
+  merge disk and archive entries are a non-reference enumeration helper used
+  by tests, not a registered script member.
 
 > **D6 note.** The XP3 container is read and parsed in L1
 > (`fs::xp3`), because parsing is a stateless transform over bytes.
@@ -67,6 +76,96 @@ name belongs to. It never keeps a table of open files; L2 stores each
 The exact same method surface and error strings; its implementation calls the
 middle layer (and, where it needs file IO, the L1 `fs` abstraction) instead of
 touching `std::fs`.
+
+### The seam in code
+
+| Layer | Type / function | Role |
+|---|---|---|
+| L1 | `fs::FileSystem` (`Backend::Host { base }` \| `Backend::Memory { store }`); `FileSystem::{host,memory,from_config}`, `base()/is_host()/is_memory()` | the stateless service object — configuration only, no mutable field, no open-file registry |
+| L1 | `fs::open(fs, path, mode) -> Result<FileState, FsError>` | creates the state value |
+| L1 | `fs::FileState` (open handle + cursor); `read_at`/`write_at`/`file_size`/`flush`/`seek`/`read_seq` | positional IO; the cursor is the only evolving thing and it lives in the value, not the object |
+| L1 | `fs` ops: `stat`/`exists`/`list`/`create_dir_all`/`remove_file`/`remove_dir`/`copy`/`rename`/`metadata`/`set_times` | namespace-free filesystem actions |
+| L1 | `fs::xp3::Xp3Archive`, `read_entry_from_bytes` | stateless XP3 parse (index) + segment read over the bytes |
+| L2 | `engine::storage::Storage` | owns the namespace: game dir + mounted archives, precedence, auto-path list, resolution cache, the parsed index and each archive's `FileState`/backing image |
+| L2 | `mount_archives`/`mount_archive`/`mount_discovered_archives` (+ `_with(MountOptions)`), `unmount_archive`, `discover_archives` | mounting (D35 scan) and the `preload_archives` choice (`ArchiveBacking::Streaming \| Image`) |
+| L2 | `find(name) -> Result<Option<Location>, StorageReadError>`, `read`/`read_prefix`, `stat -> Result<Option<StorageMetadata>>`, `exists -> Result<bool>`, `list`/`file_list` | resolution and reads; `NotFound` and a real error stay distinguishable (D11) |
+| L2 | `add_auto_path`, `register_media`, `startup_plan`/`discover_startup`, `clear_resolution_cache`, `probe_counts` | TVP auto-path search, in-memory registered media, startup discovery |
+| L3 | `compat::natives::storages` | parses the TVP storage name / `arc.xp3>path` grammar and maps it onto `Storage`; it owns no bytes |
+
+The rule of thumb: **L1 turns bytes into bytes; L2 turns names into sources.**
+`Storage` never parses an XP3 container, and `fs` never resolves a name.
+
+### How the entries are held
+
+L2 does **not** build one merged name→source table. It holds **one parsed index
+per mounted archive** and probes them in order:
+
+* `Storage::archives: Vec<MountedArchive>`, in mount order. `find` walks it
+  `.rev()`, so a later mount wins; `find_in_archive` (`arc.xp3>path`) matches
+  by `MountedArchive::file_name` case-insensitively.
+* `MountedArchive { path, file_name, backing: ArchiveBacking, archive: Xp3Archive }`.
+* `Xp3Archive` — the **type is L1's, the value is L2's** (parsing is stateless,
+  so it lives in `fs::xp3`; the owned index is `Storage` state) — holds
+  `entries: BTreeMap<String, Entry>` keyed by the **normalized** in-archive
+  name, plus `base` (the offset, non-zero for EXE-embedded) and `sections`.
+  `Xp3Archive::entry(name)` normalizes and does a `BTreeMap` lookup;
+  `read`/`read_entry` decode the entry's segments over the backing.
+* An `Entry` is **metadata + segment descriptors, not bytes**: `raw_name`,
+  `name`, `flags`, `org_size`, `arc_size`, `file_hash`, and
+  `segments: Vec<Segment>` where `Segment { flags, start, org_size, arc_size }`.
+  The bytes stay in the archive file (or the preload image); a read is
+  positional over `Segment::start`/`arc_size`.
+* `ArchiveBacking` is `Stream(FileState)` (the archive's `FileState` is
+  L2-owned) or `Memory(Vec<u8>)` under `preload_archives`. Either way L1 holds
+  no handle: L2 owns every `FileState` and the preloaded image, and hands L1 a
+  borrow on each read.
+
+**Disk entries are not held.** A disk name is probed live (`stat`/`list`) each
+time resolution reaches it, and only a **hit** is cached — in
+`ResolutionCache::placed: HashMap<String, Location>`, keyed by the requested
+name, never a miss, matching `TVPAutoPathCache`
+(`reference/cpp/core/base/StorageIntf.cpp:1101`). The auto-path candidate
+tables are cached separately
+(`ResolutionCache::auto_paths: HashMap<String, Rc<AutoPathTable>>`; a
+`Folder` table of real children, or an `Archive` prefix table of base name →
+in-archive name). Both are dropped by `clear_resolution_cache` on any
+mount/unmount/auto-path change.
+
+`find` returns `Location::Archive(path, normalized_name)` — a lightweight
+reference *into* the held index, not an entry copy — so the read goes back
+through the archive. An archive that was not mounted but exists on disk is
+opened and parsed **on demand** inside `find_in_archive`; that parse is
+transient and dropped after the call. L3-registered virtual entries live in a
+third place, `media: RefCell<HashMap<String, Vec<u8>>>`, keyed by the full
+storage name (e.g. `psb://…`), holding bytes only.
+
+### Looking up entries
+
+Everything the index holds is reachable through the `Storage` surface — the
+archive list (`archives`) and each archive's file map (`Xp3Archive::entries`)
+are resident, so a lookup is in-memory, not a scan of the container bytes.
+
+| Want | Call | Notes |
+|---|---|---|
+| one name | `find(name) -> Result<Option<Location>, StorageReadError>` | full resolution; `Location::Disk(PathBuf)` or `Location::Archive(PathBuf, normalized)` |
+| one name in a named archive | `find("arc.xp3>path")` | bypasses the mount scan; matches `file_name` case-insensitively |
+| the bytes | `read(name)` / `read_prefix(name, max_len)` | re-resolves through `find` |
+| existence (file or directory) | `exists(name) -> Result<bool>` | `TVPIsExistentStorage` semantics, so directories report true (`reference/cpp/core/base/StorageIntf.cpp:1120-1123`) |
+| metadata | `stat(name) -> Result<Option<StorageMetadata>>` | archive: `size = entry.org_size`, all times `None` (XP3 has no timestamps); disk: `size` + modification time, `accessed`/`created` `None` |
+| a directory's children | `list(dir) -> Result<Vec<String>>` | merges the disk dir and every mounted archive's children under the prefix; directories carry a trailing `/` |
+| a wildcard | `file_list(mask, attr)` | disk + archive names; `arcmask>inarcmask` addressing; recursive under the literal prefix |
+| the raw index | `for_each_archive(\|path, archive\| …)` | then `archive.entries()` / `archive.entry(name)` / `archive.len()`; `archive.near_misses(request, cap)` for a miss diagnostic |
+
+`find`/`read`/`stat`/`exists` and the `getLocalName`/`getPlacedPath`/auto-path
+family are reference members. `list`/`file_list` are L2 enumeration helpers with
+**no** registered script member — there is no `Storages.getFileList` in
+`reference/cpp`; the reference lists directories through the disk-only
+`getDirList` (dirlist plugin) and `Storages.dirlist`/`dirlistEx`/`dirtree`
+(fstat plugin), see §2.
+
+The only per-entry fields the surface exposes are `name` and `size` (+ disk
+times). The stored/compressed size, the protected flag, the hash and the
+segment layout live in the L1 `Entry` and have no route to a script.
 
 ## 3. Object + state, not streams
 

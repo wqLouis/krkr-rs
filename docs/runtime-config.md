@@ -30,20 +30,18 @@ app::run(Launch {
 
 ```rust
 // crates/android — the Android launcher, the same entry point
-// The player's stored choices (frame rate, scaling, archive preload) are read
-// from the launcher's own settings file, resolved over the Android defaults,
-// and the finished value is handed to the shared host. An unparseable or
+// The player's stored choices (frame rate, archive preload) are read from the
+// launcher's own settings file, resolved over the Android defaults, and the
+// finished value is handed to the shared host. An unparseable or
 // out-of-range value is a ConfigError naming the option and its range; it is
 // never defaulted away.
 let log_level = config::resolve_log_level(stored_log_level)?; // selects the logger filter
 let runtime = config::resolve_runtime_config(
     stored_frame_rate,
-    stored_scaling,
     stored_preload_archives,
 )?;
 let handler = host::AndroidHost::new(
     BackendKind::Vulkan,
-    map_scaling(runtime.scaling),
     game_dir,
     runtime.preload_archives,
 );
@@ -57,7 +55,7 @@ Keeping that choice in each launcher means the core contains no
 `#[cfg(target_os = ...)]`, no configuration path and no loading trait — it
 only acts on the value it is handed. A launcher still needs the shared value
 types and the `key=value` parser, so `api::config` provides `RuntimeConfig`,
-`FrameRateLimit`, `PresentationScaling`, `parse_overrides`, the partial
+`FrameRateLimit`, `parse_overrides`, the partial
 `RuntimeConfigOverrides` shape and the typed `ConfigError`.
 
 Every field is validated. An unparseable or out-of-range value is a typed
@@ -75,15 +73,14 @@ to read files (only the compatibility layer is barred from `std::fs`).
 
 A file that is named but unreadable is a typed error, and so is an unknown key
 or a bad value; nothing is skipped and nothing is applied until the whole file
-parses. The recognized keys are `frame_rate`, `scaling`,
-`preload_archives` and `debug_overlay`, matching the argument names.
+parses. The recognized keys are `frame_rate`, `preload_archives` and
+`debug_overlay`, matching the argument names.
 
 ## 2. Implemented options
 
 | option | unit / range | default | basis |
 |---|---|---|---|
 | `--fps N` (`frame_rate`) | frames per second, `1..=1000` | `60` | reference `fps_limit` default `60` (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`), applied as the animation interval `1/fps` (`reference/cpp/core/environ/cocos2d/MainScene.cpp:684-685`); the main loop sleeps the remaining interval (`reference/cpp/core/environ/RenderUtils.h`, `TVPDrawSceneOnce`) |
-| `--scaling MODE` (`scaling`) | `game`, `fit`, `fill`, `expand` | `fit` (the shared `RuntimeConfig` default is `game`; the desktop launcher and Android default to `fit`) | `game` is the reference Win32 one-to-one presentation; the other three are the existing engine projection modes. `fit` is the launcher default because the window opens at the display's native size, so `game` would crop the declared logical screen |
 | `--preload-archives` (`preload_archives`) | `true`, `false` | `false` | read every mounted archive into memory when it mounts; the cost is that archive's size in resident memory, the gain is that entry reads stop touching the backing filesystem |
 | `--debug-overlay` (`debug_overlay`) | `true`, `false` | `false` | draw the frame rate and the process's resident memory in the top-left corner; a render-only node, never a script-visible layer or bitmap, so it cannot change what a script observes. RSS comes from `platform::memory_usage()`, which reads `VmRSS` from `/proc/self/status` (Linux and Android); an unreadable value is omitted rather than fabricated |
 
@@ -97,6 +94,14 @@ Preloading is a memory-for-filesystem trade and is worth setting when the game
 lives on a slow mount. It is not a special mode: it reads the archive into the
 same storage as before, so every entry returns the same bytes, and the only
 difference is that the bytes no longer come from the backing filesystem.
+
+Presentation is **not** configurable. There is no `--scaling` option or
+`scaling` key: the target is the single Fit rule (`docs/migration/11` D39),
+uniformly scaled and letterboxed to the display, and the script's own declared
+size is what `System.screenWidth`/`Window.innerWidth` report unchanged. Until
+the L2 pixel-translation layer lands (`07` Phase 10) the scene is presented
+one-to-one at that declared size; the setting does not come back in either
+state.
 
 ## 3. Not implemented meaningfully
 

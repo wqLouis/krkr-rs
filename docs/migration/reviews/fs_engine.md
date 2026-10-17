@@ -240,7 +240,7 @@ run the rest through the existing `Xp3Error::from(io::Error)` conversion so
 
 ### 1.9 `collect_disk_entries` silently swallows all list errors — Medium
 
-`crates/engine/src/storage.rs:630-641` (via `get_file_list`)
+`crates/engine/src/storage.rs:630-641` (via `file_list`)
 
 ```rust
 let Ok(entries) = fs::list(&self.fs, &FsPath::host(dir)) else {
@@ -250,12 +250,12 @@ let Ok(entries) = fs::list(&self.fs, &FsPath::host(dir)) else {
 
 `Storage::list` is careful to ignore only `NotFound`/`NotADirectory`
 (`:526`) and to propagate anything else, but the recursive walk used by
-`get_file_list` discards every failure, so a permission or I/O error yields a
+`file_list` discards every failure, so a permission or I/O error yields a
 silently truncated file list. That is a D11 fallback and a wrong result
 presented as a complete one.
 
 Fix: make `collect_disk_entries` return `Result<_, StorageReadError>` and let
-`get_file_list` propagate it (only `NotFound`/`NotADirectory` may be treated as
+`file_list` propagate it (only `NotFound`/`NotADirectory` may be treated as
 an empty subtree); or document the truncation explicitly and return it as an
 error.
 

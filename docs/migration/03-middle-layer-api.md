@@ -9,7 +9,9 @@ The bottom layer creates the **abstraction objects**; the middle layer stores
 every **state value** and performs actions on those objects. For rendering,
 L2 only maintains the **scene/layer object tree** and hands it to the L1
 **render pipeline**, which does all traversal, composition and drawing. See
-[`02-target-architecture.md`](02-target-architecture.md) §2.1 and §3.
+[`02-target-architecture.md`](02-target-architecture.md) §2.1 and §3, and
+[`12-layer-tree-and-frame.md`](12-layer-tree-and-frame.md) for the end-to-end
+path from the L2 `Scene` through the projection to a drawn frame.
 
 ---
 

@@ -341,8 +341,10 @@ variant-by-variant exists.**
   **constructs** the engine enums (`TransKind::Wave` etc. in
   `visual/layer/transitions.rs`, `LoopCondition` in `sound.rs`) and never
   `match`es them — verified by grep for `match` on `TransKind`, `LoopCondition`,
-  `ScalingMode`, `StartupScript`, `ScrollFrom`, `ScrollStay`, `PlayStatus`,
-  `PeriodReason` (zero hits).
+  `StartupScript`, `ScrollFrom`, `ScrollStay`, `PlayStatus`,
+  `PeriodReason` (zero hits). (`ScalingMode` was in this list when the audit
+  was written; it has since been removed with the presentation-scaling feature —
+  `docs/migration/11` §4.)
 
 `_ =>` arms in compat number **224**. They are overwhelmingly on non-enum
 scrutinees and are fine:
