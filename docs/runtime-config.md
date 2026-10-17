@@ -96,12 +96,11 @@ same storage as before, so every entry returns the same bytes, and the only
 difference is that the bytes no longer come from the backing filesystem.
 
 Presentation is **not** configurable. There is no `--scaling` option or
-`scaling` key: the target is the single Fit rule (`docs/migration/11` D39),
-uniformly scaled and letterboxed to the display, and the script's own declared
-size is what `System.screenWidth`/`Window.innerWidth` report unchanged. Until
-the L2 pixel-translation layer lands (`07` Phase 10) the scene is presented
-one-to-one at that declared size; the setting does not come back in either
-state.
+`scaling` key: the engine always fits the scene into the framebuffer with the
+single Fit rule (`docs/migration/11` D39), uniformly scaled and letterboxed,
+and the script's own declared size is what `System.screenWidth`/
+`Window.innerWidth` report unchanged. The mapping lives in L2 and is invisible
+to scripts; there is no setting to expose.
 
 ## 3. Not implemented meaningfully
 

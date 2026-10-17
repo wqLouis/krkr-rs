@@ -1,7 +1,8 @@
 # 12 — The layer tree, the projection and the frame
 
-Status: **the render path and the L2 frame are implemented; the
-pixel-translation layer (D40) is not.** This document is the end-to-end
+Status: **the render path, the L2 frame and the VM↔device mapping are
+implemented; device-pixel readback and device-resolution glyph rasterization
+are open.** This document is the end-to-end
 contract for *how a layer tree becomes a frame*. It consolidates the ownership
 rules that [02 §2.1/§3](02-target-architecture.md) and
 [03 §2](03-middle-layer-api.md#2-render-pipeline) already state, adds the code
@@ -215,32 +216,28 @@ turns the fire into an `onTimer` post. `TimerState::advance` is called only by
 `Engine::frame` (it stays public until the timer surface collapses).
 
 ## 7. Where the pixel translation fits (D39/D40)
-## 7. Where the pixel translation fits (D39/D40)
 
-Today the projection takes a **whole-tree `ViewTransform`** and the pipeline
-applies it around the scene root (`RenderScene.view`). D39/D40 replace that
-with a device-space projection:
+The projection emits the layer tree in **VM pixels**; `engine::translate`
+then maps every node's `dst` and every rectangle clip into **device pixels**
+before the overlay is attached. The pipeline receives device-space rectangles
+and has no presentation policy of its own. This replaced the removed
+`ViewTransform`/`RenderScene.view` pair, so presentation is one rule — Fit
+with letterbox — and there is no `ScalingMode` or `--scaling`.
 
-* presentation is one rule — **Fit with letterbox** — so there is no
-  `ScalingMode` and no `--scaling`;
-* the **L2 pixel-translation layer** (`PixelTranslation`, D40) converts a
-  VM-space layer rect into a device-space `dst` *before* the node is built, and
-  converts a device read region back into a VM value on readback;
-* `RenderScene.view` and `ViewTransform` disappear, because the rectangles the
-  pipeline receives are already in device space and the pipeline has no
-  presentation policy of its own ([04 §6](04-renderer-vulkan.md)).
+`PixelTranslation` is a pure value: a uniform `min(device/vm)` scale plus a
+centred offset. The engine refits it whenever the VM window size or the
+framebuffer size changes (twice per frame: before the hook so input uses the
+current mapping, after it so a script size change is projected the same
+frame). At `s == 1` the mapping is the identity and the reference is matched
+exactly.
 
-At scale `s == 1` this is the identity and the reference is matched exactly.
-The translation is recomputed per size change **inside `frame`**, which is why
-D40 depends on D26. Readback (`getPixel`/`piledCopy`/`saveLayerImage`) scales
-the *access*, not the buffer: a VM read of `(x, y)` samples the device region
-`[x·s,(x+1)·s)×[y·s,(y+1)·s)`.
-[11](11-presentation-and-pixel-translation.md) §6–§7 is the API contract;
-[10](10-android-backends.md) "Device-pixel readback" is the Android transport.
-
-The offscreen targets that already exist (`render_to_target` /
-`read_render_target`) are the primitive the readback path builds on, and the
-CPU rasterizer is the baseline the translation's readback is checked against.
+Input travels the other way: the composition root maps pointer/touch
+coordinates with `to_vm_point` before the VM tick, so L3 hit-tests in VM
+pixels. Readback (`getPixel`/`piledCopy`/`saveLayerImage`) is still served by
+the CPU bitmap the script can already read, which is VM-exact; the
+device-pixel readback path for a GPU-composed backing uses
+`vm_pixel_region` and is not wired yet ([11](11-presentation-and-pixel-translation.md)
+§7, [10](10-android-backends.md) "Device-pixel readback").
 
 ## 8. Boundaries and invariants
 
@@ -268,8 +265,10 @@ CPU rasterizer is the baseline the translation's readback is checked against.
 * **L2 frame (D26)** — the frame entry point, clock, timer pump and
   projection/render ownership have landed (§6). The mixer, video and
   transition pumps still run inside the hook, and `Engine::run` is not built.
-* **Pixel translation (D40)** — device-space projection and scaled readback;
-  the Fit mapping, input inverse-map and readback are open (§7, `11`).
+* **Pixel translation (D40)** — the Fit mapping, device-space projection and
+  input inverse-map have landed (§7). Device-pixel readback (the
+  `vm_pixel_region` consumer) and device-resolution glyph rasterization are
+  open; the CPU bitmap the script reads is already VM-exact.
 * **Masks and province images** — `Clip::Mask` and the main-vs-province
   composition are emitted by neither the projection nor the backends;
   `hold_alpha` travels but is not interpreted.

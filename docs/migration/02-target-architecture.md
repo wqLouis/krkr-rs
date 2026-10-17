@@ -241,6 +241,14 @@ why it depends on D26 above. The layer tree → projection → draw path the
 translation feeds is mapped end to end in
 [`12-layer-tree-and-frame.md`](12-layer-tree-and-frame.md).
 
+Implemented: `engine::translate::PixelTranslation` owns the Fit mapping,
+`Engine` refits it on a VM/framebuffer size change and rewrites the projected
+tree into device space, and the composition root inverse-maps pointer/touch
+coordinates before the VM tick. The framebuffer is the single backing. Open:
+device-pixel readback for a GPU-composed backing (`vm_pixel_region` is the
+seam; the current CPU layer bitmap is already VM-exact) and glyph
+rasterization at `raster_scale` (the layer bitmap is currently VM-resolution).
+
 ### Implementation status
 
 `engine::Engine` now owns the frame. It holds the scene, the projected

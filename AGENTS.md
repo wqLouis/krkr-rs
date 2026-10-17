@@ -391,6 +391,7 @@ Two-sided tests:
     design; identify through real members or the L2 `Scene`.
 12. Loading is explicit (`--archive`, repeatable; later wins). There is **no** folder scan in the reference (D15), but D35 adds one opt-in exception: a directory-only launch (`--base-dir`/positional dir, no `--archive`) mounts every `*.xp3` found recursively (`engine::storage::discover_archives`).
 13. The frame is L2's: `GameHost::step` must not accumulate a `now_ms` or call the subsystem pumps itself. Pass events through `Engine::step(dt, hooks)`; the hook is `VmHook` (VM tick + audio drain). `compat::run_frame_body` starts by draining the timer posts the engine already produced; it must not call `TimerState::advance`.
+14. VM pixels are not device pixels. Scripts, layer rects, bitmap dimensions, `Font.size` and `getPixel` coordinates are VM space; the framebuffer is device space. Only `engine::translate::PixelTranslation` names both. An OS resize changes the framebuffer only — never write it back into the scene window; a script size change goes the other way through `Engine::take_window_resize`.
 
 ---
 

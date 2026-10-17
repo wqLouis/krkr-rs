@@ -1,7 +1,9 @@
 # 11 — Presentation and the pixel-translation layer
 
-Status: **design.** Stage 0 (the removal) and the Stage 1 frame slice have
-landed; the remaining Stage 1 pumps and Stages 2–3 are open.
+Status: **implemented for the mapping.** Stage 0 (removal), the Stage 1 frame
+slice and Stage 2 (`PixelTranslation`, device-space projection, input inverse
+mapping) have landed. Open: the remaining Stage 1 mixer/video pumps and the
+Stage 3 device-pixel readback + device-resolution glyph rasterization.
 This document decides how the engine maps the scene a script thinks it is
 drawing onto the framebuffer it actually draws into. It supersedes
 [`04-renderer-vulkan.md`](04-renderer-vulkan.md) §6.1 (the `ScalingMode`
@@ -213,6 +215,11 @@ Stage-0 removal as Phase 9a.
 
 ## 6. Stage 2 — the pixel-translation layer
 
+**Landed.** `engine::translate::PixelTranslation` is the pure mapping;
+`Engine` refits it on a VM or framebuffer size change and rewrites the
+projected nodes into device space, and the composition root maps pointer/
+touch input back with `to_vm_point`.
+
 A new L2 value (module name provisional: `engine::translate`) that owns the
 VM↔device mapping. It is pure, `Copy`, and holds no clock and no cache:
 `Engine` recomputes it whenever the VM size or the device size changes.
@@ -264,6 +271,10 @@ own `transform` in VM space; the root transform composes last.
 
 ### 6.2 Font rasterization (the decoupling the user asked for)
 
+**Open.** Today text is rasterized into the VM-resolution layer bitmap and the
+GPU scales that bitmap; the visible difference at `s > 1` is softness, which
+D34 permits. Layout metrics are already VM and unchanged.
+
 Scripts think text is composed on the CPU at `Font.size` VM pixels. In the
 target it is rasterized at `size_px * raster_scale()` device pixels (crisp on
 a HiDPI screen) and placed through the device transform:
@@ -280,11 +291,13 @@ a HiDPI screen) and placed through the device transform:
 
 ### 6.3 Input
 
-The event adapter maps each pointer/touch position device→VM with
-`to_vm_point` **before** L2/L3 hit-testing. The mapping lives in L2 (called by
-whatever pumps events into the frame), not in `app`/`android` — that is the
-`map_input_to_logical` shape being removed, hoisted to the owner of the
-translation.
+**Landed.** The composition root (`app::GameHost`, the same `VmHook` that runs
+the VM tick) maps each pointer/touch position device→VM with
+`PixelTranslation::to_vm_point` **before** `vm.tick`, so L2 input state and the
+L3 hit-test only ever see VM coordinates. The mapping itself is the L2 value;
+the composition root only applies it. `map_input_to_logical`'s old
+`ViewTransform` plumbing is gone. Keyboard, wheel, text and focus events carry
+no position and pass through unchanged.
 
 ### 6.4 Boundaries the translation must respect
 
@@ -298,7 +311,13 @@ translation.
 * **No new config.** Fit is not selectable; there is no `scaling` key on any
   launcher, desktop or Android (see §4).
 
-## 7. Stage 3 — device-pixel readback
+## 7. Stage 3 — device scaling and readback
+
+**Device scaling and input mapping landed; readback and glyph rasterization
+are open.** The projection is device-space, so the scene is already drawn at
+the framebuffer resolution. The rest of this section is the unbuilt readback
+path; today `getPixel`/`piledCopy`/`saveLayerImage` read the CPU layer bitmap,
+which is VM-exact.
 
 The single backing is the **device-resolution** framebuffer. The engine does
 **not** keep a VM-resolution copy and does **not** downscale the frame back to
@@ -346,24 +365,28 @@ GPU-composed layer buffer whose CPU copy has been discarded.
 |---|---|---|
 | 0 | remove the scaling feature (§4) | gate green; one-to-one presentation; `git grep` clean |
 | 1 | L2 owns the frame (D26, §5) | `07` Phase 9 exit criteria |
-| 2 | `PixelTranslation` in L2 (§6) | behaviour-neutral at `s == 1`: identical output to Stage 0 on every existing test |
-| 3 | device scale + device-pixel readback (§7) | game renders at the device resolution; `getPixel` addressed through the translation |
+| 2 | `PixelTranslation` in L2 (§6) | behaviour-neutral at `s == 1`: identical output to Stage 0 on every existing test — **landed** |
+| 3 | device scale + input inverse map (§6.2–6.3) | the scene draws at the device resolution and hit-tests in VM pixels — **landed** |
+| 3 | device-pixel readback + device-resolution glyph rasterization (§7) | `getPixel` addressed through `vm_pixel_region` on a GPU-composed backing; glyphs rasterized at `raster_scale` — **open** |
 
 Stage 2 is deliberately **behaviour-neutral at scale 1**: with `vm_size ==
 device_size`, `scale == 1` and `offset == (0,0)`, so the projection and input
 paths reduce to what Stage 0 does and the surface lock, parity reports and
-golden tests are unchanged. The device scale is switched on only in Stage 3.
+golden tests are unchanged. The device scale switches on by itself when the
+window and the script's declared size differ (the Android surface, or a
+desktop window the player resized).
 
 ## 9. Open items
 
-1. **`getPixel` reduction at `s > 1`.** Point-read the region origin, or
-   average the box? The origin is exact at `s == 1` and cheapest; averaging
-   needs a defined rounding. Decide with a reference question: what does the
-   reference `getPixel` return for a half-covered edge? (`PaintEngine`/
-   `BitmapIntf` read-back.)
-2. **Window sizing.** Which size does the OS window open at — the monitor's
-   physical size, or a multiple of the VM size? Decide with the launcher; the
-   translation only needs *a* device size.
+1. **`getPixel` reduction at `s > 1`** (only for a GPU-composed backing).
+   Point-read the region origin, or average the box? The origin is exact at
+   `s == 1` and cheapest; averaging needs a defined rounding. Today readback
+   comes from the VM-resolution CPU layer bitmap, so the question waits for
+   the GPU readback path.
+2. **Window sizing — resolved.** The OS window keeps its platform-chosen
+   size; the game's first declared VM size is surfaced once and applied to the
+   desktop window, and a later script size change does the same. Android keeps
+   the display-sized surface and refits.
 3. **Readback transport.** Android reads over `AHardwareBuffer_lock`
    (region-scoped, stride from `lock_and_get_info`); the desktop and the
    fallback use a host-visible staging copy. Open: the device behaviour of
@@ -374,8 +397,8 @@ golden tests are unchanged. The device scale is switched on only in Stage 3.
    than the VM's letterboxes vertically. Confirm the reference's own
    letterbox colour and whether the game ever sets a non-black background
    (`RenderScene.background` is the current answer).
-5. **Naming.** `PixelTranslation`, `DeviceTransform`, `vm_size`/`device_size`
-   — settle once, before Stage 2 lands, so the L2 API is stable (02 §12).
+5. **Naming — settled.** `PixelTranslation` with `scale`/`offset`/
+   `vm_size`/`device_size`; the module is `engine::translate`.
 6. **What must be device-resolution and lockable.** Only the frame backing needs
    the swapchain blit; offscreen canvases and GPU-composed bitmaps may not. If
    most readback targets are bitmaps whose CPU copy we keep (`D8`), the

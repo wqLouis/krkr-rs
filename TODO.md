@@ -327,15 +327,17 @@ Open:
    hook, and the timer tests drive virtual time. Remaining: move the mixer,
    video and transition pumps out of the hook, add `Engine::run`, and collapse
    the timer surface to D27's four methods (`07` Phase 9).
-2. **The pixel-translation layer** (`D39`/`D40`) — **next.** A pure L2
-   `PixelTranslation` maps VM pixels (what scripts see) to device pixels (what
-   the framebuffer uses), applies Fit-with-letterbox during projection, and
-   maps input back. Phase 9a (the `ScalingMode`/`PresentationScaling`/
-   `--scaling`/`ViewTransform`/`native_size` removal) has landed.
+2. **The pixel-translation layer** (`D39`/`D40`) — **mapping landed.** A pure
+   L2 `PixelTranslation` maps VM pixels (what scripts see) to device pixels
+   (what the framebuffer uses), applies Fit-with-letterbox during projection,
+   and input is inverse-mapped before the VM tick. Phase 9a (the `ScalingMode`/
+   `PresentationScaling`/`--scaling`/`ViewTransform`/`native_size` removal)
+   has landed.
 
 Open sub-items are tracked in those docs, not duplicated here: device-pixel
-readback over `AHardwareBuffer`/staging (`10` "Device-pixel readback") and
-glyph rasterization at `raster_scale`.
+readback over `AHardwareBuffer`/staging (`10` "Device-pixel readback"; today's
+CPU layer bitmaps are already VM-exact) and glyph rasterization at
+`raster_scale` (the GPU currently scales VM-resolution text).
 
 ## 12. Deferred design work
 

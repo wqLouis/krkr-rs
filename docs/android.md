@@ -631,9 +631,9 @@ only — no auto-indexing of a default location.
    letterbox, no override.** The target is to scale the game uniformly to fit
    the screen and letterbox the remainder, so it keeps its aspect; this is the
    engine's single presentation rule (`docs/migration/11`, D39), not an Android
-   default, and the settings screen (§3.2) no longer offers a mode. Until the
-   L2 pixel-translation layer lands (`07` Phase 10) the scene is presented
-   one-to-one at its declared size. The reference's Android build stretches
+   default, and the settings screen (§3.2) no longer offers a mode. The engine
+   fits the script's declared size into the display-sized surface; the script
+   still sees its declared size. The reference's Android build stretches
    instead (`EXACT_FIT`,
    `reference/cpp/core/environ/cocos2d/AppDelegate.cpp:60-70`,
    `MainScene.cpp:436-438`); we choose no distortion.

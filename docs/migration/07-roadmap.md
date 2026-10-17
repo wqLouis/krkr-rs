@@ -232,26 +232,36 @@ still tracks the remaining list.
 
 ### Phase 10 — Pixel-translation layer (device resolution + readback)
 
+**Status: the mapping landed; readback and device-resolution glyph
+rasterization are open.**
+
 The device-resolution presentation and the VM↔device boundary. Contract:
 [`11`](11-presentation-and-pixel-translation.md) §6–§7.
 
-Deliverables:
+Landed:
 * `engine::translate::PixelTranslation` — Fit (D39) mapping with
   `to_device_*`/`to_vm_point`/`raster_scale`/`vm_pixel_region`, owned and
-  recomputed by `Engine` on a size change (D40);
+  recomputed by `Engine` on a VM or framebuffer size change (D40);
 * the projection applies the mapping so the pipeline receives device-space
-  rectangles (the generic `Affine2` root transform already exists);
-* device resolution is switched on: the window opens at the device size and
-  the scene is presented through the translation, not 1:1 (this replaces the
-  removed `native_size`);
+  rectangles; the overlay stays in device coordinates;
+* input mapped device→VM (in the composition root, using the L2 mapping)
+  before the VM tick and hit-testing;
+* the OS window no longer rewrites the script's VM window size; a script
+  window-size change is surfaced once and applied to the desktop window, while
+  Android keeps the display surface and refits the declared size into it.
+
+Open:
 * glyph rasterization at `size_px · raster_scale()`, with **layout metrics
-  still VM** so every script-visible measurement is unchanged;
-* input mapped device→VM in L2 before hit-testing (the removed
-  `map_input_to_logical`, hoisted to the owner of the translation);
+  still VM** so every script-visible measurement is unchanged (today glyphs
+  are rasterized into the VM-resolution layer bitmap and the GPU scales the
+  result; that is a D34 rasterization approximation, not a script-observable
+  difference);
 * readback through `vm_pixel_region`: the desktop and fallback path is a
   host-visible staging copy; on Android the backing is allocated as an
   `AHardwareBuffer` and read with `AHardwareBuffer_lock`
   ([`10-android-backends.md`](10-android-backends.md) "Device-pixel readback").
+  Today `getPixel`/`piledCopy`/`saveLayerImage` read the CPU layer bitmap,
+  which is already VM-exact.
 
 Exit criteria: with `vm_size == device_size` the output is identical to Phase
 9a (the mapping is the identity), so surface lock, parity and golden tests are
