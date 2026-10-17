@@ -9,14 +9,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use api::config::{PresentationScaling, RuntimeConfig};
-use engine::projection::ScalingMode;
+use api::config::RuntimeConfig;
 use platform::{EventHandler, Flow, FramePacing, PlatformConfig, PlatformEvent, PlatformWindow};
-use render::ViewTransform;
 
-use crate::{
-    BackendKind, FrameStats, GameHost, Host, HostConfig, StepReport, map_input_to_logical,
-};
+use crate::{BackendKind, FrameStats, GameHost, Host, HostConfig, StepReport};
 
 /// The game a launcher asks the emulator to open.
 ///
@@ -86,16 +82,6 @@ pub fn run(launch: Launch) -> Result<RunReport, String> {
     match launch.mode {
         RunMode::Headless { frames } => run_headless(&launch, frames),
         RunMode::Windowed => run_windowed(&launch).map(|()| RunReport::default()),
-    }
-}
-
-/// Maps a resolved presentation scaling to the engine's projection mode.
-fn map_scaling(scaling: PresentationScaling) -> ScalingMode {
-    match scaling {
-        PresentationScaling::Game => ScalingMode::Game,
-        PresentationScaling::Fit => ScalingMode::Fit,
-        PresentationScaling::Fill => ScalingMode::Fill,
-        PresentationScaling::Expand => ScalingMode::Expand,
     }
 }
 
@@ -208,15 +194,11 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, String> {
 fn run_windowed(launch: &Launch) -> Result<(), String> {
     let mut config = PlatformConfig::default();
     config.title = "krkr-rs".to_owned();
-    // Render at the display's physical resolution; the presentation scales the
-    // game's declared logical size to it (see `DesktopApp::resumed`).
-    config.native_size = true;
     config.frame_interval = Duration::from_secs_f64(launch.runtime.frame_rate_limit.period_secs());
     platform::run(
         config,
         DesktopApp::new(
             launch.backend,
-            map_scaling(launch.runtime.scaling),
             launch.game.clone(),
             launch.runtime.preload_archives,
             launch.runtime.debug_overlay,
@@ -234,8 +216,6 @@ fn run_windowed(launch: &Launch) -> Result<(), String> {
 struct DesktopApp {
     /// Backend requested on the command line.
     backend: BackendKind,
-    /// Presentation scaling mode requested on the command line.
-    scaling: ScalingMode,
     /// The game to load, or `None` for the empty scene.
     game: Option<GameInput>,
     /// Whether every mounted archive is read into memory at mount.
@@ -261,7 +241,7 @@ enum Running {
 }
 
 impl Running {
-    /// Resizes the presentation surface.
+    /// Resizes the render surface.
     fn resize(&mut self, size: (u32, u32)) -> Result<(), String> {
         match self {
             Running::Empty(host) => host.resize(size).map(|_| ()).map_err(|e| e.to_string()),
@@ -282,20 +262,11 @@ impl Running {
         }
     }
 
-    /// The logical size the host currently reports, or `None` when the host
-    /// owns no scene window.
-    fn logical_size(&self) -> Option<(u32, u32)> {
+    /// The framebuffer size the running host presents.
+    fn surface_size(&self) -> (u32, u32) {
         match self {
-            Running::Empty(_) => None,
-            Running::Game(game) => Some(game.host().logical_size()),
-        }
-    }
-
-    /// The framebuffer transform of the current presentation.
-    fn view(&self) -> Option<ViewTransform> {
-        match self {
-            Running::Empty(host) => Some(host.view()),
-            Running::Game(game) => Some(game.host().view()),
+            Running::Empty(host) => host.surface_size(),
+            Running::Game(game) => game.host().surface_size(),
         }
     }
 
@@ -321,14 +292,12 @@ impl DesktopApp {
     /// Creates a handler that has not yet received `resumed`.
     fn new(
         backend: BackendKind,
-        scaling: ScalingMode,
         game: Option<GameInput>,
         preload_archives: bool,
         debug_overlay: bool,
     ) -> Self {
         Self {
             backend,
-            scaling,
             game,
             preload_archives,
             debug_overlay,
@@ -341,19 +310,22 @@ impl DesktopApp {
     /// Requests a new platform-window inner size when a script changed the
     /// main window's declared client size.
     ///
-    /// The host rewrites the scene window's `inner_size` to the logical size
-    /// of the current presentation, so the raw `inner_size` equals the
-    /// host's logical size unless a script declared a new size. A window
-    /// whose `inner_size` differs is a declaration and is applied to the OS
-    /// window; a user resize changes the framebuffer instead and is left
-    /// alone. When the backend applies the request synchronously (and
-    /// therefore emits no `Resized`), the surface is resized here.
+    /// The host keeps the scene window's client size equal to the framebuffer,
+    /// so the raw `inner_size` equals the host's surface size unless a script
+    /// declared a new size. A window whose `inner_size` differs is a
+    /// declaration and is applied to the OS window; a user resize changes the
+    /// framebuffer instead and is left alone. When the backend applies the
+    /// request synchronously (and therefore emits no `Resized`), the surface is
+    /// resized here.
     fn apply_window_size(&mut self, window: &PlatformWindow) -> Result<(), String> {
-        let Some(size) = self.running.as_ref().and_then(Running::inner_size) else {
+        let Some(running) = self.running.as_ref() else {
             return Ok(());
         };
-        let logical = self.running.as_ref().and_then(Running::logical_size);
-        if logical == Some(size) {
+        let Some(size) = running.inner_size() else {
+            return Ok(());
+        };
+        // A window already showing the declared size has no pending declaration.
+        if running.surface_size() == size {
             return Ok(());
         }
         if size.0 == 0 || size.1 == 0 {
@@ -404,13 +376,12 @@ impl EventHandler for DesktopApp {
             surface_size: window.size(),
             window_handle: Some(window_handle),
             display_handle: Some(display_handle),
-            scaling: self.scaling,
             debug_overlay: self.debug_overlay,
             ..Default::default()
         };
         match Host::new(config) {
             Ok(host) => {
-                let mut running = match &self.game {
+                let running = match &self.game {
                     Some(input) => {
                         match GameHost::open_with_preload(
                             host,
@@ -427,18 +398,10 @@ impl EventHandler for DesktopApp {
                     }
                     None => Running::Empty(Box::new(host)),
                 };
-                // Capture the game's declared logical size as the presentation
-                // design before aligning the OS window. The presentation
-                // scales that design to the framebuffer, so `setInnerSize`
-                // defines the logical scene instead of shrinking the window.
-                if let Err(error) = running.resize(window.size()) {
-                    eprintln!("krkr: resize failed: {error}");
-                    return Flow::Exit;
-                }
-                self.running = Some(running);
                 // Align the platform window with the client size the game
                 // declared during startup (`Window.setInnerSize`); the
                 // resulting `Resized` sizes the surface.
+                self.running = Some(running);
                 if let Err(error) = self.apply_window_size(window) {
                     eprintln!("krkr: resize failed: {error}");
                     return Flow::Exit;
@@ -474,15 +437,9 @@ impl EventHandler for DesktopApp {
             // into the L2 input state and dispatches the TJS events
             // (`onFocus`/`onBlur`). `ScaleFactorChanged` is informational
             // (winit follows it with `Resized`) and the adapter ignores it.
+            // Input positions are surface pixels, the same space the scene is
+            // drawn in, so they are delivered unchanged.
             PlatformEvent::Input(input) => {
-                // The engine presents the logical scene scaled inside the
-                // framebuffer, so a pointer/touch position is inverse-mapped
-                // to logical coordinates before the layer manager hit-tests
-                // it.
-                let input = match self.running.as_ref().and_then(Running::view) {
-                    Some(view) => map_input_to_logical(view, input),
-                    None => input,
-                };
                 self.pending_events.push(PlatformEvent::Input(input));
                 Flow::Continue
             }
@@ -521,7 +478,6 @@ mod tests {
     fn run_honours_a_directly_passed_config() {
         let runtime = RuntimeConfig {
             frame_rate_limit: FrameRateLimit::new("test", 500).expect("valid"),
-            scaling: PresentationScaling::Fit,
             ..RuntimeConfig::default()
         };
         let report = run(Launch {

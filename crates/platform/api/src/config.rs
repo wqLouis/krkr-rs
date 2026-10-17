@@ -96,59 +96,6 @@ impl FrameRateLimit {
     }
 }
 
-/// How the engine presents the logical scene inside the framebuffer.
-///
-/// This mirrors the engine's `ScalingMode` at the configuration boundary: the
-/// configuration crate cannot name the engine type (the dependency runs the
-/// other way), so the composition root maps one to the other. It is a plain
-/// value with no behaviour.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum PresentationScaling {
-    /// One logical pixel per framebuffer pixel (the default).
-    #[default]
-    Game,
-    /// Uniform scale that fits the whole scene, letterboxed.
-    Fit,
-    /// Non-uniform scale that fills the window.
-    Fill,
-    /// Grow the logical size to the window's aspect, then scale uniformly.
-    Expand,
-}
-
-impl PresentationScaling {
-    /// The built-in default (`Game`).
-    pub const DEFAULT: Self = Self::Game;
-
-    /// Human-readable accepted values for error and help text.
-    pub const RANGE: &str = "one of: game, fit, fill, expand";
-
-    /// Parses a scaling name.
-    ///
-    /// # Errors
-    ///
-    /// [`ConfigError::InvalidValue`] when `value` is not one of the accepted
-    /// names.
-    pub fn parse(option: &'static str, value: &str) -> Result<Self, ConfigError> {
-        match value {
-            "game" => Ok(Self::Game),
-            "fit" => Ok(Self::Fit),
-            "fill" => Ok(Self::Fill),
-            "expand" => Ok(Self::Expand),
-            other => Err(ConfigError::invalid(option, other.to_owned(), Self::RANGE)),
-        }
-    }
-
-    /// The canonical name of this mode.
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Game => "game",
-            Self::Fit => "fit",
-            Self::Fill => "fill",
-            Self::Expand => "expand",
-        }
-    }
-}
-
 /// The fully resolved runtime configuration a launcher passes to the
 /// emulator.
 ///
@@ -162,10 +109,6 @@ pub struct RuntimeConfig {
     /// [`DEFAULT_FRAME_RATE`] (60). It paces the host loop and the headless
     /// step.
     pub frame_rate_limit: FrameRateLimit,
-    /// How the logical scene is presented inside the framebuffer; one of
-    /// [`PresentationScaling::Game`], `Fit`, `Fill` or `Expand`, default
-    /// [`PresentationScaling::Game`].
-    pub scaling: PresentationScaling,
     /// Whether a mounted archive is read into memory in full at mount, default
     /// `false`. It trades the archive's size in resident memory for removing
     /// the per-entry reads a mounted archive otherwise does, which is the cost
@@ -183,7 +126,6 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             frame_rate_limit: FrameRateLimit::DEFAULT,
-            scaling: PresentationScaling::DEFAULT,
             preload_archives: false,
             debug_overlay: false,
         }
@@ -199,8 +141,6 @@ impl Default for RuntimeConfig {
 pub struct RuntimeConfigOverrides {
     /// A source's frame-rate limit, if it holds one.
     pub frame_rate_limit: Option<FrameRateLimit>,
-    /// A source's presentation scaling, if it holds one.
-    pub scaling: Option<PresentationScaling>,
     /// A source's archive-preload choice, if it holds one.
     pub preload_archives: Option<bool>,
     /// A source's debug-overlay choice, if it holds one.
@@ -227,7 +167,7 @@ pub fn parse_bool(option: &'static str, value: &str) -> Result<bool, ConfigError
 
 /// The configuration keys [`parse_overrides`] accepts, in the order its
 /// unknown-key diagnostic lists them.
-const ACCEPTED_KEYS: [&str; 4] = ["frame_rate", "scaling", "preload_archives", "debug_overlay"];
+const ACCEPTED_KEYS: [&str; 3] = ["frame_rate", "preload_archives", "debug_overlay"];
 
 /// Parses `key=value` configuration text into overrides.
 ///
@@ -235,8 +175,7 @@ const ACCEPTED_KEYS: [&str; 4] = ["frame_rate", "scaling", "preload_archives", "
 /// launcher's business. Blank lines and lines whose first non-space character
 /// is `#` are ignored. A line without `=` or with an unknown key is an error,
 /// as is a value that fails validation; nothing is silently skipped. The
-/// recognized keys are `frame_rate`, `scaling`, `preload_archives` and
-/// `debug_overlay`.
+/// recognized keys are `frame_rate`, `preload_archives` and `debug_overlay`.
 ///
 /// # Errors
 ///
@@ -257,9 +196,6 @@ pub fn parse_overrides(text: &str) -> Result<RuntimeConfigOverrides, ConfigError
         match key {
             "frame_rate" => {
                 overrides.frame_rate_limit = Some(FrameRateLimit::parse("frame_rate", value)?);
-            }
-            "scaling" => {
-                overrides.scaling = Some(PresentationScaling::parse("scaling", value)?);
             }
             "preload_archives" => {
                 overrides.preload_archives = Some(parse_bool("preload_archives", value)?);
@@ -357,32 +293,15 @@ mod tests {
     }
 
     #[test]
-    fn scaling_parses_every_name() {
-        for (text, expected) in [
-            ("game", PresentationScaling::Game),
-            ("fit", PresentationScaling::Fit),
-            ("fill", PresentationScaling::Fill),
-            ("expand", PresentationScaling::Expand),
-        ] {
-            assert_eq!(
-                PresentationScaling::parse("--scaling", text).unwrap(),
-                expected
-            );
-        }
-        assert_eq!(PresentationScaling::Game.as_str(), "game");
-        assert!(PresentationScaling::parse("--scaling", "stretch").is_err());
-    }
-
-    #[test]
     fn overrides_parse_keys_comments_and_blanks() {
-        let overrides =
-            parse_overrides("# a comment\n\nframe_rate = 30\nscaling=fit\npreload_archives=true\ndebug_overlay=true\n")
-                .expect("parse");
+        let overrides = parse_overrides(
+            "# a comment\n\nframe_rate = 30\npreload_archives=true\ndebug_overlay=true\n",
+        )
+        .expect("parse");
         assert_eq!(
             overrides.frame_rate_limit,
             Some(FrameRateLimit::new("frame_rate", 30).unwrap())
         );
-        assert_eq!(overrides.scaling, Some(PresentationScaling::Fit));
         assert_eq!(overrides.preload_archives, Some(true));
         assert_eq!(overrides.debug_overlay, Some(true));
     }
@@ -411,7 +330,6 @@ mod tests {
     fn overrides_reject_a_bad_value() {
         let error = parse_overrides("frame_rate=0").expect_err("must reject");
         assert!(error.to_string().contains("frame_rate"));
-        assert!(parse_overrides("scaling=stretch").is_err());
         assert!(parse_overrides("debug_overlay=yes").is_err());
     }
 }

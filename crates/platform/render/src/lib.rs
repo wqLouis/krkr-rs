@@ -61,7 +61,6 @@ pub use crate::null::{
 pub use crate::render_target::{RenderTarget, RenderTargetDesc};
 pub use crate::scene::{
     Clip, GlyphPlacement, GlyphRun, RenderContent, RenderNode, RenderNodeId, RenderScene,
-    ViewTransform,
 };
 use crate::state::StateKind;
 pub use crate::state::{RenderState, Surface};

@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use api::error::RenderError;
 use api::geometry::PixelRegion;
 use api::host::{InputState, SurfaceEvent};
-use engine::projection::{Presentation, ScalingMode, project_scene};
+use engine::projection::project_scene;
 use engine::scene::{Rect, Scene};
 use fs::FileSystem;
 use media::Media;
@@ -46,9 +46,9 @@ use overlay::Overlay;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use render::{
     FrameTimings, PipelineConfig, RenderPipeline, RenderScene, RenderState, Surface, Texture,
-    TextureDesc, TextureFormat, TextureUpload, ViewTransform, begin_render_state,
-    begin_render_state_with_display, create_render_pipeline, create_texture, drop_texture,
-    last_frame_timings, render, resize as resize_render, upload_textures,
+    TextureDesc, TextureFormat, TextureUpload, begin_render_state, begin_render_state_with_display,
+    create_render_pipeline, create_texture, drop_texture, last_frame_timings, render,
+    resize as resize_render, upload_textures,
 };
 
 pub use audio::install_audio_decoder;
@@ -142,11 +142,6 @@ pub struct HostConfig {
     /// through `begin_render_state_with_display`; `None` uses the
     /// window-handle-only entry point (or the null backend).
     pub display_handle: Option<RawDisplayHandle>,
-    /// How the engine presents the logical scene inside the framebuffer.
-    ///
-    /// [`ScalingMode::Game`] is the untransformed Win32 presentation and the
-    /// default, so an unconfigured run matches the reference exactly.
-    pub scaling: ScalingMode,
     /// Whether the host draws the debug overlay (frame rate and resident
     /// memory) in the top-left corner.
     ///
@@ -165,7 +160,6 @@ impl Default for HostConfig {
             headless: false,
             window_handle: None,
             display_handle: None,
-            scaling: ScalingMode::Game,
             debug_overlay: false,
         }
     }
@@ -207,12 +201,6 @@ impl HostConfig {
         self
     }
 
-    /// Returns this configuration with a different presentation scaling mode.
-    pub fn with_scaling(mut self, scaling: ScalingMode) -> Self {
-        self.scaling = scaling;
-        self
-    }
-
     /// Returns this configuration with the debug overlay enabled or disabled.
     pub fn with_debug_overlay(mut self, debug_overlay: bool) -> Self {
         self.debug_overlay = debug_overlay;
@@ -222,9 +210,9 @@ impl HostConfig {
 
 /// Resizes a window's client area to `size`.
 ///
-/// The logical screen size and, when the window has one, its primary layer
-/// are resized; the layer stays at the origin because the reference forbids
-/// moving the primary layer.
+/// The window's client size and, when it has one, its primary layer are
+/// resized; the layer stays at the origin because the reference forbids moving
+/// the primary layer.
 fn resize_window_client(scene: &mut Scene, window: u32, size: (u32, u32)) {
     let primary = scene.window_mut(window).map(|window| {
         window.inner_size = size;
@@ -234,34 +222,6 @@ fn resize_window_client(scene: &mut Scene, window: u32, size: (u32, u32)) {
         && let Some(layer) = scene.layer_mut(primary)
     {
         layer.rect = Rect::new(0, 0, size.0, size.1);
-    }
-}
-
-/// Inverse-maps a platform input event from framebuffer to logical
-/// coordinates.
-///
-/// The engine presents the logical scene scaled inside the framebuffer, so a
-/// pointer or touch position must be divided by the presentation transform
-/// before the layer manager hit-tests it. Keyboard and text events carry no
-/// position and pass through unchanged.
-pub fn map_input_to_logical(
-    view: ViewTransform,
-    input: platform::InputEvent,
-) -> platform::InputEvent {
-    match input {
-        platform::InputEvent::PointerMoved { x, y } => {
-            let (x, y) = view.inverse_map((x, y));
-            platform::InputEvent::PointerMoved { x, y }
-        }
-        platform::InputEvent::Touch { id, phase, x, y } => {
-            let (x, y) = view.inverse_map((x, y));
-            platform::InputEvent::Touch { id, phase, x, y }
-        }
-        platform::InputEvent::PointerLeft
-        | platform::InputEvent::MouseButton { .. }
-        | platform::InputEvent::Wheel { .. }
-        | platform::InputEvent::Key { .. }
-        | platform::InputEvent::Text(_) => input,
     }
 }
 
@@ -288,7 +248,7 @@ pub struct Host {
     /// `None` until the first projection, so the first [`Host::step`] (and any
     /// forced redraw) always projects.
     render_scene_revision: Option<u64>,
-    /// Presentation surface for `render_state`.
+    /// Presented surface for `render_state`.
     surface: Surface,
     /// GPU/staging/texture bookkeeping owned by the host.
     render_state: RenderState,
@@ -309,15 +269,6 @@ pub struct Host {
     elapsed_ms: f64,
     /// Current surface size in pixels.
     surface_size: (u32, u32),
-    /// Presentation scaling mode (from [`HostConfig::scaling`]).
-    scaling: ScalingMode,
-    /// The game's declared design size, captured from the scene window when a
-    /// script changes it. `None` until the first resize.
-    design_size: Option<(u32, u32)>,
-    /// The logical size the host currently reports to scripts.
-    logical_size: (u32, u32),
-    /// Framebuffer transform for the current presentation.
-    view: ViewTransform,
     /// Debug overlay, or `None` when the host draws none.
     overlay: Option<Overlay>,
 }
@@ -369,7 +320,6 @@ impl Host {
         };
         let surface_size = (config.surface_size.0.max(1), config.surface_size.1.max(1));
         let _ = resize_render(&pipeline, &surface, &mut render_state, surface_size)?;
-        let view = Presentation::compute(config.scaling, surface_size, surface_size).view;
         let overlay = if config.debug_overlay {
             Some(Overlay::new(&pipeline).map_err(|error| HostError::Overlay(error.to_string()))?)
         } else {
@@ -391,10 +341,6 @@ impl Host {
             frame_index: 0,
             elapsed_ms: 0.0,
             surface_size,
-            scaling: config.scaling,
-            design_size: None,
-            logical_size: surface_size,
-            view,
             overlay,
         })
     }
@@ -459,26 +405,18 @@ impl Host {
     /// revision is `None` until the first projection, so the first frame (and
     /// any forced redraw) always projects.
     fn reproject_render_scene(&mut self) -> Result<(), HostError> {
-        // The framebuffer transform can change on a resize that does not
-        // change the logical layout, so it is refreshed even when the layer
-        // tree is rebuilt from the persistent arena below.
-        self.render_scene.view = self.view;
-
         let revision = self.scene.revision();
         if self.render_scene_revision == Some(revision) {
             return Ok(());
         }
 
         let textures = &self.textures;
-        let projected = project_scene(&self.scene, self.view, |bitmap| {
-            textures.get(&bitmap).cloned()
-        });
+        let projected = project_scene(&self.scene, |bitmap| textures.get(&bitmap).cloned());
 
         // Reuse the arena instead of replacing the whole `RenderScene`.
         self.render_scene.nodes.clear();
         self.render_scene.root = projected.root;
         self.render_scene.background = projected.background;
-        self.render_scene.view = projected.view;
         self.render_scene.nodes.extend(projected.nodes);
 
         self.attach_overlay();
@@ -496,7 +434,7 @@ impl Host {
             return;
         };
         let root = self.render_scene.root;
-        let mut node = overlay.node(self.view);
+        let mut node = overlay.node();
         node.parent = Some(root);
         let id = self.render_scene.push(node);
         if let Some(root_node) = self.render_scene.node_mut(root) {
@@ -529,21 +467,16 @@ impl Host {
 
     /// Reports a new surface size in physical pixels.
     ///
-    /// The physical size is the framebuffer. The logical size reported to
-    /// scripts is derived from it according to the configured
-    /// [`ScalingMode`]: the framebuffer size for [`ScalingMode::Game`], the
-    /// game's declared design size for `Fit`/`Fill`, and the design height at
-    /// the window's aspect for `Expand`.
+    /// The surface size is the framebuffer, and the host draws the scene into
+    /// it one-to-one. The main window's client size and its primary layer
+    /// follow the framebuffer; the layer stays at the origin because the
+    /// reference forbids moving the primary layer.
     ///
     /// # Errors
     ///
     /// Returns [`HostError::Render`] if the backend rejects the resize.
     pub fn resize(&mut self, size: (u32, u32)) -> Result<SurfaceEvent, HostError> {
         let size = (size.0.max(1), size.1.max(1));
-        // The framebuffer is already this size, so the pipeline needs no
-        // reconfiguration; the presentation can still change because the
-        // scene's declared size did (the windowed runner calls this after
-        // startup to capture the game's design).
         let event = if size == self.surface_size {
             SurfaceEvent::Resized(size.0, size.1)
         } else {
@@ -551,26 +484,8 @@ impl Host {
         };
         self.surface_size = size;
 
-        // A scene window whose `inner_size` differs from the logical size the
-        // host last wrote is a script declaration (`Window.setSize` /
-        // `setInnerSize`); capture it as the design size the presentation
-        // scales from.
-        let scripted = self.scene.windows.first().map(|window| window.inner_size);
-        if let Some(scripted) = scripted
-            && (self.design_size.is_none() || scripted != self.logical_size)
-        {
-            self.design_size = Some(scripted);
-        }
-        let design = self.design_size.unwrap_or(size);
-        let presentation = Presentation::compute(self.scaling, design, size);
-        self.view = presentation.view;
-        self.logical_size = presentation.logical_size;
-
-        // The logical screen size and, when the window has one, its primary
-        // layer follow the presentation; the layer stays at the origin
-        // because the reference forbids moving the primary layer.
         if let Some(window) = self.scene.windows.first().map(|window| window.id) {
-            resize_window_client(&mut self.scene, window, self.logical_size);
+            resize_window_client(&mut self.scene, window, size);
         }
         Ok(event)
     }
@@ -631,21 +546,6 @@ impl Host {
     /// Returns the current surface size in pixels.
     pub fn surface_size(&self) -> (u32, u32) {
         self.surface_size
-    }
-
-    /// Returns the presentation scaling mode.
-    pub fn scaling(&self) -> ScalingMode {
-        self.scaling
-    }
-
-    /// Returns the logical scene size the host reports to scripts.
-    pub fn logical_size(&self) -> (u32, u32) {
-        self.logical_size
-    }
-
-    /// Returns the framebuffer transform for the current presentation.
-    pub fn view(&self) -> ViewTransform {
-        self.view
     }
 
     /// Whether the host draws the debug overlay.
@@ -773,33 +673,5 @@ impl Host {
                 drop_texture(&self.pipeline, &mut self.render_state, texture);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A resize to the current framebuffer size still captures the scene
-    /// window's declared size as the presentation design, so the windowed
-    /// runner can keep a native-size window instead of shrinking it to the
-    /// game's `Window.setInnerSize`.
-    #[test]
-    fn same_size_resize_keeps_the_declared_design() {
-        let mut host = Host::new(
-            HostConfig::headless()
-                .with_surface_size((1920, 1080))
-                .with_scaling(ScalingMode::Fit),
-        )
-        .expect("headless host");
-        host.scene_mut().add_window("game", (1280, 720));
-
-        let event = host.resize((1920, 1080)).expect("resize");
-        assert_eq!(event, SurfaceEvent::Resized(1920, 1080));
-        assert_eq!(host.surface_size(), (1920, 1080));
-        // The declared 1280x720 stays the logical (script-visible) size; the
-        // presentation scales it to the 1920x1080 framebuffer instead of
-        // growing the logical screen with the window.
-        assert_eq!(host.logical_size(), (1280, 720));
     }
 }

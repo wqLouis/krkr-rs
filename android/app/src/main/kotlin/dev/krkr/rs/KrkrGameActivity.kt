@@ -85,16 +85,6 @@ class KrkrGameActivity : GameActivity() {
         var pendingFrameRate: String? = null
 
         /**
-         * The presentation scaling the user chose (`game`/`fit`/`fill`/
-         * `expand`), read through JNI like [pendingFrameRate].
-         *
-         * The launcher defaults this to `fit` on Android; the user's choice
-         * overrides it.
-         */
-        @JvmField
-        var pendingScaling: String? = null
-
-        /**
          * Whether every mounted archive is read into memory at mount (`true`
          * or `false`), read through JNI like [pendingFrameRate].
          *
@@ -140,7 +130,7 @@ class KrkrGameActivity : GameActivity() {
         pendingStateDir = filesDir.absolutePath
         publishRuntimeSettings()
         LauncherLog.i(
-            "KrkrGameActivity.onCreate: game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} stateDir=${pendingStateDir ?: "?"} fps=${pendingFrameRate ?: "?"} scaling=${pendingScaling ?: "?"} preload=${pendingPreloadArchives ?: "?"} overlay=${pendingDebugOverlay ?: "?"} log=${pendingLogLevel ?: "?"}",
+            "KrkrGameActivity.onCreate: game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} stateDir=${pendingStateDir ?: "?"} fps=${pendingFrameRate ?: "?"} preload=${pendingPreloadArchives ?: "?"} overlay=${pendingDebugOverlay ?: "?"} log=${pendingLogLevel ?: "?"}",
         )
         super.onCreate(savedInstanceState)
 
@@ -181,7 +171,7 @@ class KrkrGameActivity : GameActivity() {
         pendingStateDir = filesDir.absolutePath
         publishRuntimeSettings()
         LauncherLog.i(
-            "KrkrGameActivity.onNewIntent: engine already running; game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} fps=${pendingFrameRate ?: "?"} scaling=${pendingScaling ?: "?"} preload=${pendingPreloadArchives ?: "?"} overlay=${pendingDebugOverlay ?: "?"} log=${pendingLogLevel ?: "?"}",
+            "KrkrGameActivity.onNewIntent: engine already running; game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} fps=${pendingFrameRate ?: "?"} preload=${pendingPreloadArchives ?: "?"} overlay=${pendingDebugOverlay ?: "?"} log=${pendingLogLevel ?: "?"}",
         )
     }
 
@@ -192,7 +182,6 @@ class KrkrGameActivity : GameActivity() {
     private fun publishRuntimeSettings() {
         val settings = RuntimeSettingsStore(this).read()
         pendingFrameRate = settings.frameRate
-        pendingScaling = settings.scaling
         pendingPreloadArchives = settings.preloadArchives
         pendingDebugOverlay = settings.debugOverlay
         pendingLogLevel = settings.logLevel

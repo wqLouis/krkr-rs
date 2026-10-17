@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 
 use android_activity::{AndroidApp, MainEvent, PollEvent};
 use app::{BackendKind, GameHost, Host, HostConfig};
-use engine::projection::ScalingMode;
 use platform::{
     EventHandler, Flow, FramePacing, PlatformError, PlatformEvent, PlatformWindow, Ticker,
 };
@@ -30,8 +29,6 @@ use crate::state;
 pub(crate) struct AndroidHost {
     /// Render backend requested by the composition root.
     backend: BackendKind,
-    /// Presentation scaling mode (phones always fit).
-    scaling: ScalingMode,
     /// The folder the launcher selected; mounted when the window appears.
     game_dir: PathBuf,
     /// Whether every mounted archive is read into memory at mount, from the
@@ -58,14 +55,12 @@ impl AndroidHost {
     /// Creates a handler that has not yet received a window.
     pub(crate) fn new(
         backend: BackendKind,
-        scaling: ScalingMode,
         game_dir: PathBuf,
         preload_archives: bool,
         debug_overlay: bool,
     ) -> Self {
         Self {
             backend,
-            scaling,
             game_dir,
             preload_archives,
             debug_overlay,
@@ -129,29 +124,6 @@ impl AndroidHost {
             .saturating_mul(1_000)
             .saturating_add(u64::from(elapsed.subsec_millis()))
     }
-
-    /// Re-applies the presentation when a script declared a new client size.
-    ///
-    /// On Android the surface is the display, so a `Window.setInnerSize` cannot
-    /// resize the OS window; the host recomputes the fitted presentation over
-    /// the same framebuffer instead.
-    fn sync_script_size(&mut self) -> Result<(), String> {
-        let Some(game) = self.running.as_mut() else {
-            return Ok(());
-        };
-        let declared = game.scene().windows.first().map(|window| window.inner_size);
-        let Some(declared) = declared else {
-            return Ok(());
-        };
-        if declared == game.host().logical_size() {
-            return Ok(());
-        }
-        let surface = game.host().surface_size();
-        game.host_mut()
-            .resize(surface)
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    }
 }
 
 impl EventHandler for AndroidHost {
@@ -174,7 +146,6 @@ impl EventHandler for AndroidHost {
         config.surface_size = window.size();
         config.window_handle = Some(window_handle);
         config.display_handle = Some(display_handle);
-        config.scaling = self.scaling;
         let host = match Host::new(config) {
             Ok(host) => host,
             Err(error) => {
@@ -217,14 +188,9 @@ impl EventHandler for AndroidHost {
             // Input and sizes are physical, so the density value needs no host
             // action; the accompanying physical resize carries the new size.
             PlatformEvent::ScaleFactorChanged(_scale) => Flow::Continue,
+            // Input positions are surface pixels, the same space the scene is
+            // drawn in, so they are delivered unchanged.
             PlatformEvent::Input(input) => {
-                // The engine presents the logical scene scaled inside the
-                // framebuffer, so a pointer or touch position is inverse-mapped
-                // to logical coordinates before hit-testing.
-                let input = match self.running.as_ref() {
-                    Some(game) => app::map_input_to_logical(game.host().view(), input),
-                    None => input,
-                };
                 self.pending_events.push(PlatformEvent::Input(input));
                 Flow::Continue
             }
@@ -398,10 +364,6 @@ pub(crate) fn run_loop(
                 accumulated_poll = Duration::ZERO;
                 accumulated_input = Duration::ZERO;
                 if handler.frame(dt_ms, created, pacing) == Flow::Exit {
-                    exit = true;
-                }
-                if let Err(error) = handler.sync_script_size() {
-                    handler.fail(format!("cannot apply the script window size: {error}"));
                     exit = true;
                 }
             }

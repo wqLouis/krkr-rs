@@ -16,7 +16,6 @@ class RuntimeSettingsTest {
     fun settingsRoundTripThroughJson() {
         val settings = RuntimeSettings(
             frameRate = "120",
-            scaling = "fill",
             preloadArchives = "true",
             debugOverlay = "true",
             logLevel = "debug",
@@ -46,7 +45,6 @@ class RuntimeSettingsTest {
         val root = settingsToJson(RuntimeOptions.DEFAULTS).put("debug_overlay", "true")
         val decoded = settingsFromJson(root)
         assertEquals(RuntimeOptions.DEFAULTS.frameRate, decoded.frameRate)
-        assertEquals(RuntimeOptions.DEFAULTS.scaling, decoded.scaling)
         assertEquals(RuntimeOptions.DEFAULTS.preloadArchives, decoded.preloadArchives)
         assertEquals("true", decoded.debugOverlay)
         assertEquals(RuntimeOptions.DEFAULTS.logLevel, decoded.logLevel)

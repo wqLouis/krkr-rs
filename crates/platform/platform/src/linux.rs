@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalSize, Size};
+use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{
     ElementState, Ime, MouseButton as WinitMouseButton, MouseScrollDelta,
     TouchPhase as WinitTouchPhase, WindowEvent,
@@ -160,19 +160,6 @@ impl<H: EventHandler> AppLoop<H> {
     }
 }
 
-/// Picks the physical size a native-resolution window opens at.
-///
-/// `primary` is the event loop's primary monitor, which a Wayland event loop
-/// never reports; `available` are the outputs it knows about, in report
-/// order. `None` means the event loop reported no output at all, so the
-/// caller keeps the configured fallback size.
-fn native_monitor_size(
-    primary: Option<PhysicalSize<u32>>,
-    available: impl IntoIterator<Item = PhysicalSize<u32>>,
-) -> Option<PhysicalSize<u32>> {
-    primary.or_else(|| available.into_iter().next())
-}
-
 impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // On a re-resume (Android suspend/resume, desktop backends that emit
@@ -180,26 +167,8 @@ impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
         // notified so a higher layer can recreate its surface. Only the
         // window creation itself is guarded.
         if self.window.is_none() {
-            // The requested logical size is the fallback when the event loop
-            // reports no output (headless/offscreen): `native_size` prefers a
-            // monitor's physical resolution, and a Wayland event loop has no
-            // primary monitor, so its first reported output is the native one.
-            let configured =
+            let inner_size =
                 LogicalSize::new(f64::from(self.config.size.0), f64::from(self.config.size.1));
-            let monitor_size = if self.config.native_size {
-                native_monitor_size(
-                    event_loop.primary_monitor().map(|monitor| monitor.size()),
-                    event_loop
-                        .available_monitors()
-                        .map(|monitor| monitor.size()),
-                )
-            } else {
-                None
-            };
-            let inner_size: Size = match monitor_size {
-                Some(size) => size.into(),
-                None => configured.into(),
-            };
             let attributes = Window::default_attributes()
                 .with_title(self.config.title.as_str())
                 .with_inner_size(inner_size);
@@ -894,41 +863,5 @@ pub(crate) mod audio {
             assert_eq!(FALLBACK_SPEC.sample_rate, 44_100);
             assert_eq!(FALLBACK_SPEC.channels, 2);
         }
-    }
-}
-
-#[cfg(test)]
-mod window_size_tests {
-    use super::native_monitor_size;
-    use winit::dpi::PhysicalSize;
-
-    /// A Wayland event loop has no primary monitor, so the first output it
-    /// reports is the native size the window opens at.
-    #[test]
-    fn a_missing_primary_monitor_falls_back_to_the_first_output() {
-        let chosen = native_monitor_size(
-            None,
-            [PhysicalSize::new(3840, 2160), PhysicalSize::new(1920, 1080)],
-        );
-        assert_eq!(chosen, Some(PhysicalSize::new(3840, 2160)));
-    }
-
-    /// An event loop that reports no output keeps the configured size.
-    #[test]
-    fn no_output_selects_no_native_size() {
-        assert_eq!(
-            native_monitor_size(None, std::iter::empty::<PhysicalSize<u32>>()),
-            None
-        );
-    }
-
-    /// A primary monitor still wins over the first reported output.
-    #[test]
-    fn a_primary_monitor_wins_over_other_outputs() {
-        let chosen = native_monitor_size(
-            Some(PhysicalSize::new(2560, 1440)),
-            [PhysicalSize::new(3840, 2160)],
-        );
-        assert_eq!(chosen, Some(PhysicalSize::new(2560, 1440)));
     }
 }

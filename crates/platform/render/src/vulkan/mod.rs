@@ -57,7 +57,7 @@ use raw_window_handle::{
 };
 
 use api::error::RenderError;
-use api::geometry::PixelRegion;
+use api::geometry::{Affine2, PixelRegion};
 use api::host::{Presentation, SurfaceEvent};
 
 use crate::render_target::{RenderTarget, RenderTargetDesc};
@@ -804,7 +804,7 @@ impl VulkanPipeline {
                 scene,
                 extent,
                 srgb,
-                &scene.view.to_affine(),
+                &Affine2::IDENTITY,
             )?;
 
             // SAFETY: the render pass and command buffer are recording.

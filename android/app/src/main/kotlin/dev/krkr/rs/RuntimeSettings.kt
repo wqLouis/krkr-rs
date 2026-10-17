@@ -17,7 +17,6 @@ import java.io.File
  */
 data class RuntimeSettings(
     val frameRate: String,
-    val scaling: String,
     val preloadArchives: String,
     val debugOverlay: String,
     val logLevel: String,
@@ -26,12 +25,10 @@ data class RuntimeSettings(
 /**
  * The accepted runtime options, their ranges and their defaults.
  *
- * These mirror `api::config::{FrameRateLimit, PresentationScaling}` and the
- * boolean `preload_archives` and `debug_overlay` options: every default and
- * accepted value comes from there, while the Android default presentation is
- * [DEFAULT_SCALING] (`fit`) rather than the desktop `game`
- * (`docs/android.md` §2.2). Only options the engine can actually honour are
- * listed — there is no control for texture resolution or audio buffering,
+ * These mirror `api::config::FrameRateLimit` and the boolean
+ * `preload_archives` and `debug_overlay` options: every default and
+ * accepted value comes from there. Only options the engine can actually honour
+ * are listed — there is no control for texture resolution or audio buffering,
  * because the engine exposes no knob for either.
  *
  * [LOG_LEVELS] mirrors the engine's `pendingLogLevel` field: one of `off`,
@@ -50,18 +47,6 @@ object RuntimeOptions {
     /** Accepted frame-rate range as written in the UI and in errors. */
     const val FRAME_RATE_RANGE = "1..=1000"
 
-    /** The four presentation modes; mirrors `PresentationScaling`. */
-    val SCALING = listOf("game", "fit", "fill", "expand")
-
-    /**
-     * Android's presentation default.
-     *
-     * A phone must never present the game at its raw logical size, so the
-     * picture is scaled uniformly to fit the screen and the remainder is
-     * letterboxed. The user's saved choice overrides it.
-     */
-    const val DEFAULT_SCALING = "fit"
-
     /** The two accepted archive-preload values, as stored in the file. */
     val PRELOAD_VALUES = listOf("true", "false")
 
@@ -77,20 +62,10 @@ object RuntimeOptions {
     /** The stored defaults, used when the settings file is missing or empty. */
     val DEFAULTS = RuntimeSettings(
         frameRate = DEFAULT_FRAME_RATE.toString(),
-        scaling = DEFAULT_SCALING,
         preloadArchives = DEFAULT_PRELOAD_ARCHIVES,
         debugOverlay = DEFAULT_DEBUG_OVERLAY,
         logLevel = DEFAULT_LOG_LEVEL,
     )
-
-    /** A one-line description of [mode], shown under its radio button. */
-    fun scalingDescription(mode: String): String = when (mode) {
-        "game" -> "One logical pixel per screen pixel (the reference Win32 presentation)."
-        "fit" -> "Scale uniformly to fit the screen; letterbox the remainder. Recommended."
-        "fill" -> "Scale to fill the screen, which may distort the aspect."
-        "expand" -> "Grow the logical area to the screen aspect, then scale uniformly."
-        else -> "Unknown mode."
-    }
 
     /**
      * The archive-preload trade, shown under its switch.
@@ -157,7 +132,6 @@ object RuntimeOptions {
  */
 internal fun settingsFromJson(root: JSONObject): RuntimeSettings = RuntimeSettings(
     frameRate = stringField(root, FIELD_FRAME_RATE, RuntimeOptions.DEFAULTS.frameRate),
-    scaling = stringField(root, FIELD_SCALING, RuntimeOptions.DEFAULTS.scaling),
     preloadArchives = stringField(
         root,
         FIELD_PRELOAD_ARCHIVES,
@@ -171,7 +145,6 @@ internal fun settingsFromJson(root: JSONObject): RuntimeSettings = RuntimeSettin
 internal fun settingsToJson(settings: RuntimeSettings): JSONObject = JSONObject()
     .put(FIELD_VERSION, SCHEMA_VERSION)
     .put(FIELD_FRAME_RATE, settings.frameRate)
-    .put(FIELD_SCALING, settings.scaling)
     .put(FIELD_PRELOAD_ARCHIVES, settings.preloadArchives)
     .put(FIELD_DEBUG_OVERLAY, settings.debugOverlay)
     .put(FIELD_LOG_LEVEL, settings.logLevel)
@@ -192,7 +165,6 @@ private const val SCHEMA_VERSION = 1
 
 private const val FIELD_VERSION = "version"
 private const val FIELD_FRAME_RATE = "frame_rate"
-private const val FIELD_SCALING = "scaling"
 private const val FIELD_PRELOAD_ARCHIVES = "preload_archives"
 private const val FIELD_DEBUG_OVERLAY = "debug_overlay"
 private const val FIELD_LOG_LEVEL = "log_level"
@@ -213,7 +185,7 @@ private const val FIELD_LOG_LEVEL = "log_level"
  * File: `<app files dir>/settings.json`
  *
  * ```json
- * { "version": 1, "frame_rate": "60", "scaling": "fit",
+ * { "version": 1, "frame_rate": "60",
  *   "preload_archives": "false", "debug_overlay": "false", "log_level": "info" }
  * ```
  */

@@ -1047,11 +1047,11 @@ private fun launchGame(
  * The runtime-settings screen: the launcher's persisted copy of the engine
  * options the player can change.
  *
- * It exposes the five options the engine honours — the frame-rate limit, the
- * presentation scaling, the archive preload, the debug overlay and the engine
- * log level — with the same accepted values and range as the desktop CLI's
- * `--fps`, `--scaling`, `--preload-archives` and `--debug-overlay`
- * (`api::config`). Nothing is offered for a feature the engine has no knob for.
+ * It exposes the four options the engine honours — the frame-rate limit, the
+ * archive preload, the debug overlay and the engine log level — with the same
+ * accepted values and range as the desktop CLI's `--fps`,
+ * `--preload-archives` and `--debug-overlay` (`api::config`). Nothing is
+ * offered for a feature the engine has no knob for.
  *
  * Saving writes the settings file atomically; [KrkrGameActivity] reads it and
  * publishes it over JNI on the next launch, which is why the change is described
@@ -1068,7 +1068,6 @@ private fun SettingsScreen(
     // Saveable so an in-progress edit survives a configuration change rather
     // than silently reverting to the on-disk values.
     var frameRate by rememberSaveable { mutableStateOf(saved.frameRate) }
-    var scaling by rememberSaveable { mutableStateOf(saved.scaling) }
     var preloadArchives by rememberSaveable { mutableStateOf(saved.preloadArchives) }
     var debugOverlay by rememberSaveable { mutableStateOf(saved.debugOverlay) }
     var logLevel by rememberSaveable { mutableStateOf(saved.logLevel) }
@@ -1078,7 +1077,6 @@ private fun SettingsScreen(
     val frameRateValue = frameRate.trim().toIntOrNull()
     val frameRateValid = frameRateValue != null &&
         frameRateValue in RuntimeOptions.MIN_FRAME_RATE..RuntimeOptions.MAX_FRAME_RATE
-    val scalingKnown = scaling in RuntimeOptions.SCALING
     val preloadKnown = preloadArchives in RuntimeOptions.PRELOAD_VALUES
     val preloadChecked = preloadArchives.toBooleanStrictOrNull() ?: false
     val debugKnown = debugOverlay in RuntimeOptions.DEBUG_OVERLAY_VALUES
@@ -1120,53 +1118,6 @@ private fun SettingsScreen(
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             modifier = Modifier.fillMaxWidth(),
         )
-        Spacer(Modifier.height(24.dp))
-
-        Text("Presentation scaling", style = MaterialTheme.typography.titleSmall)
-        Spacer(Modifier.height(4.dp))
-        Text(
-            "How the game picture is fitted to the screen. " +
-                "Default: ${RuntimeOptions.DEFAULT_SCALING}.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Column(Modifier.selectableGroup()) {
-            RuntimeOptions.SCALING.forEach { mode ->
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .selectable(
-                            selected = scaling == mode,
-                            onClick = { scaling = mode },
-                            role = Role.RadioButton,
-                        )
-                        .padding(vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    RadioButton(selected = scaling == mode, onClick = null)
-                    Spacer(Modifier.width(8.dp))
-                    Column {
-                        Text(
-                            text = mode.replaceFirstChar { it.uppercase() },
-                            style = MaterialTheme.typography.bodyLarge,
-                        )
-                        Text(
-                            text = RuntimeOptions.scalingDescription(mode),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-            }
-        }
-        if (!scalingKnown) {
-            Text(
-                text = "This saved value (\"$scaling\") is not one of " +
-                    "${RuntimeOptions.SCALING.joinToString(", ")}; choose one before saving.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error,
-            )
-        }
         Spacer(Modifier.height(24.dp))
 
         Text("Archive preload", style = MaterialTheme.typography.titleSmall)
@@ -1296,7 +1247,6 @@ private fun SettingsScreen(
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextButton(onClick = {
                 frameRate = RuntimeOptions.DEFAULT_FRAME_RATE.toString()
-                scaling = RuntimeOptions.DEFAULT_SCALING
                 preloadArchives = RuntimeOptions.DEFAULT_PRELOAD_ARCHIVES
                 debugOverlay = RuntimeOptions.DEFAULT_DEBUG_OVERLAY
                 logLevel = RuntimeOptions.DEFAULT_LOG_LEVEL
@@ -1308,10 +1258,6 @@ private fun SettingsScreen(
                         "Frame rate must be an integer in " +
                             "${RuntimeOptions.FRAME_RATE_RANGE} frames per second.",
                     )
-                    return@Button
-                }
-                if (scaling !in RuntimeOptions.SCALING) {
-                    onNotify("Choose one of: ${RuntimeOptions.SCALING.joinToString(", ")}.")
                     return@Button
                 }
                 if (preloadArchives !in RuntimeOptions.PRELOAD_VALUES) {
@@ -1329,7 +1275,6 @@ private fun SettingsScreen(
                 if (store.write(
                         RuntimeSettings(
                             frameRate = fps.toString(),
-                            scaling = scaling,
                             preloadArchives = preloadArchives,
                             debugOverlay = debugOverlay,
                             logLevel = logLevel,

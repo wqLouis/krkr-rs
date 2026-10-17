@@ -14,8 +14,8 @@
 use api::error::RenderError;
 use api::geometry::{PixelRegion, RectF};
 use render::{
-    RenderContent, RenderNode, RenderPipeline, RenderState, Texture, TextureDesc, ViewTransform,
-    create_texture, upload_texture,
+    RenderContent, RenderNode, RenderPipeline, RenderState, Texture, TextureDesc, create_texture,
+    upload_texture,
 };
 
 /// Panel width in pixels.
@@ -154,33 +154,15 @@ impl Overlay {
         Ok(())
     }
 
-    /// Builds the overlay's render node for `view`.
+    /// Builds the overlay's render node.
     ///
-    /// The node is positioned at the top-left of the framebuffer: the
-    /// presentation transform is inverse-mapped at the origin, and the panel's
-    /// own extent is divided by the transform's scale so it stays the same
-    /// pixel size regardless of the presentation scaling. The caller sets the
-    /// node's parent and adds it to the scene.
-    pub(crate) fn node(&self, view: ViewTransform) -> RenderNode {
-        let (x, y) = view.inverse_map((0.0, 0.0));
-        let scale_x = if view.scale.0.abs() > f32::EPSILON {
-            view.scale.0
-        } else {
-            1.0
-        };
-        let scale_y = if view.scale.1.abs() > f32::EPSILON {
-            view.scale.1
-        } else {
-            1.0
-        };
+    /// The node is positioned at the top-left of the framebuffer at the
+    /// panel's own pixel size. The caller sets the node's parent and adds it
+    /// to the scene.
+    pub(crate) fn node(&self) -> RenderNode {
         RenderNode {
             content: RenderContent::Texture(self.texture.clone()),
-            dst: RectF::new(
-                x,
-                y,
-                PANEL_WIDTH as f32 / scale_x,
-                PANEL_HEIGHT as f32 / scale_y,
-            ),
+            dst: RectF::new(0.0, 0.0, PANEL_WIDTH as f32, PANEL_HEIGHT as f32),
             z: OVERLAY_Z,
             ..RenderNode::default()
         }

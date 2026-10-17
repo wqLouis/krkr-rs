@@ -35,8 +35,5 @@ app = { path = "../app" }
 # The L1 Android backend (real window + input translation). The desktop
 # composition root selects `platform-linux` instead.
 platform = { workspace = true, features = ["platform-android"] }
-# The composition root chooses the presentation mode and names the engine's
-# `ScalingMode` at the `HostConfig` boundary.
-engine = { workspace = true }
 # The composition root owns the process logger.
 env_logger = { workspace = true }

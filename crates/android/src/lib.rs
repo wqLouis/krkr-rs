@@ -8,19 +8,12 @@
 //! logic. The desktop binary (`krkr`) and this library drive the same
 //! `app::Host` and `app::GameHost` through the same `platform::EventHandler`.
 //!
-//! Two Android-specific rules live here rather than in the shared host:
+//! One Android-specific rule lives here rather than in the shared host:
 //!
 //! * **The loop.** `platform::run` is a desktop (winit) driver; the Android
 //!   driver is `android-activity`, whose lifecycle and input arrive on the
 //!   `android_main` thread. [`host::run_loop`] normalizes those callbacks into
 //!   the same `PlatformEvent`s the winit backend emits.
-//! * **The presentation default.** Phones always present the scene scaled
-//!   uniformly to fit the screen, with the remainder letterboxed
-//!   (`ScalingMode::Fit`), instead of showing the raw logical size. The
-//!   desktop launcher defaults to the same `fit` presentation so a
-//!   native-resolution window shows the whole scene; the shared
-//!   `RuntimeConfig` default is still `game`, and the user's saved scaling
-//!   setting overrides either. See `docs/android.md` §2.2 and §3.2.
 //!
 //! The state-file writer ([`state`]), the log-file sink ([`log_file`]) and the
 //! touch→mouse synthesizer ([`gesture`]) are plain `std` and name no Android
@@ -53,9 +46,7 @@ mod android_entry {
     use std::time::Duration;
 
     use android_activity::AndroidApp;
-    use api::config::PresentationScaling;
     use app::BackendKind;
-    use engine::projection::ScalingMode;
 
     use crate::log_file::{self, FileSink};
     use crate::{config, host, jni_fields, state};
@@ -71,11 +62,9 @@ mod android_entry {
     /// file and the loop is never started. The launcher's log level is read
     /// next and validated before the logger is installed, because it selects
     /// the filter. The remaining saved runtime settings (frame-rate limit,
-    /// presentation scaling, archive preload and debug overlay) are read over
-    /// the same JNI channel and resolved by [`crate::config`]: the presentation
-    /// default is
-    /// [`PresentationScaling::Fit`] and the user's stored choice overrides it,
-    /// and an out-of-range value is reported and the loop is never started.
+    /// archive preload and debug overlay) are read over the same JNI channel and
+    /// resolved by [`crate::config`], and an out-of-range value is reported and
+    /// the loop is never started.
     #[allow(unsafe_code)]
     #[unsafe(no_mangle)]
     pub fn android_main(app: AndroidApp) {
@@ -178,13 +167,6 @@ mod android_entry {
                 return;
             }
         };
-        let scaling = match read_settings_field(&app, jni_fields::FIELD_SCALING) {
-            Ok(value) => value,
-            Err(message) => {
-                report_startup_failure(&message);
-                return;
-            }
-        };
         let preload_archives = match read_settings_field(&app, jni_fields::FIELD_PRELOAD_ARCHIVES) {
             Ok(value) => value,
             Err(message) => {
@@ -201,7 +183,6 @@ mod android_entry {
         };
         let runtime = match config::resolve_runtime_config(
             frame_rate.as_deref(),
-            scaling.as_deref(),
             preload_archives.as_deref(),
             debug_overlay.as_deref(),
         ) {
@@ -214,16 +195,14 @@ mod android_entry {
             }
         };
         log::info!(
-            "krkr: frame rate {} fps, scaling {}, preload archives {}, debug overlay {}, log level {}",
+            "krkr: frame rate {} fps, preload archives {}, debug overlay {}, log level {}",
             runtime.frame_rate_limit.fps(),
-            runtime.scaling.as_str(),
             runtime.preload_archives,
             runtime.debug_overlay,
             log_level.as_filter()
         );
         let handler = host::AndroidHost::new(
             BackendKind::Vulkan,
-            map_scaling(runtime.scaling),
             game_dir,
             runtime.preload_archives,
             runtime.debug_overlay,
@@ -251,16 +230,6 @@ mod android_entry {
     fn report_startup_failure(message: &str) {
         log::error!("{message}");
         state::write_state(state::State::Failed, Some(message));
-    }
-
-    /// Maps a resolved presentation scaling to the engine's projection mode.
-    fn map_scaling(scaling: PresentationScaling) -> ScalingMode {
-        match scaling {
-            PresentationScaling::Game => ScalingMode::Game,
-            PresentationScaling::Fit => ScalingMode::Fit,
-            PresentationScaling::Fill => ScalingMode::Fill,
-            PresentationScaling::Expand => ScalingMode::Expand,
-        }
     }
 
     /// Installs the process logger.

@@ -11,7 +11,6 @@
 //! are written by `KrkrGameActivity.onCreate`; [`pendingStateDir`](FIELD_STATE_DIR)
 //! is its `filesDir.absolutePath`, where [`crate::state`] writes
 //! `krkr_state.json`. [`pendingFrameRate`](FIELD_FRAME_RATE),
-//! [`pendingScaling`](FIELD_SCALING),
 //! [`pendingPreloadArchives`](FIELD_PRELOAD_ARCHIVES),
 //! [`pendingDebugOverlay`](FIELD_DEBUG_OVERLAY) and
 //! [`pendingLogLevel`](FIELD_LOG_LEVEL) are the launcher's
@@ -33,9 +32,6 @@ pub(crate) const FIELD_STATE_DIR: &str = "pendingStateDir";
 /// Static field on the same class holding the frame-rate limit, as a decimal
 /// integer; unset means the launcher had no override.
 pub(crate) const FIELD_FRAME_RATE: &str = "pendingFrameRate";
-/// Static field on the same class holding the presentation scaling name
-/// (`game`/`fit`/`fill`/`expand`); unset means the launcher had no override.
-pub(crate) const FIELD_SCALING: &str = "pendingScaling";
 /// Static field on the same class holding the archive-preload choice (`true`
 /// or `false`); unset means the launcher had no override.
 pub(crate) const FIELD_PRELOAD_ARCHIVES: &str = "pendingPreloadArchives";
@@ -138,7 +134,6 @@ mod tests {
         assert_eq!(FIELD_GAME_NAME, "pendingGameName");
         assert_eq!(FIELD_STATE_DIR, "pendingStateDir");
         assert_eq!(FIELD_FRAME_RATE, "pendingFrameRate");
-        assert_eq!(FIELD_SCALING, "pendingScaling");
         assert_eq!(FIELD_PRELOAD_ARCHIVES, "pendingPreloadArchives");
         assert_eq!(FIELD_DEBUG_OVERLAY, "pendingDebugOverlay");
         assert_eq!(FIELD_LOG_LEVEL, "pendingLogLevel");

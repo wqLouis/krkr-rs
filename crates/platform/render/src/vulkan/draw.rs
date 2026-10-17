@@ -45,9 +45,8 @@ const _: () = assert!(std::mem::size_of::<PushConstants>() as u32 == super::PUSH
 /// Records all visible content of `scene` into `command`.
 ///
 /// The caller has already begun the render pass and set the viewport.
-/// `root` is the transform applied around the scene root; the presentation
-/// path passes the scene's [`ViewTransform`](crate::ViewTransform) and
-/// offscreen targets pass the identity.
+/// `root` is the transform applied around the scene root. The live frame path
+/// passes the identity and offscreen targets pass the identity as well.
 ///
 /// # Errors
 ///

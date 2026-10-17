@@ -1,7 +1,7 @@
 //! `krkr` CLI: headless frame runner and windowed desktop frontend.
 //!
 //! ```text
-//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--scaling game|fit|fill|expand] [--preload-archives] [--archive XP3 ...] [--base-dir DIR] [GAME]
+//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--preload-archives] [--archive XP3 ...] [--base-dir DIR] [GAME]
 //! ```
 //!
 //! * `--headless` runs an empty scene for `N` frames (default 120) through
@@ -34,8 +34,6 @@
 //!   window with a display connection (Wayland/X11/XCB); the windowed host
 //!   passes both the window and display handle so a surface can be created.
 //!   The headless path has no display and uses `--backend null`.
-//! * `--scaling` selects how the engine presents the logical scene inside
-//!   the framebuffer (`game` by default, plus `fit`, `fill` and `expand`).
 //! * Configuration is resolved **by this launcher** and handed to
 //!   [`app::run`] as an already-loaded value: the `key=value` file named by
 //!   the `KRKR_CONFIG` environment variable supplies overrides, the launch
@@ -51,8 +49,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use api::config::{
-    ConfigError, FrameRateLimit, PresentationScaling, RuntimeConfig, RuntimeConfigOverrides,
-    parse_overrides,
+    ConfigError, FrameRateLimit, RuntimeConfig, RuntimeConfigOverrides, parse_overrides,
 };
 use app::{BackendKind, GameInput, Launch, RunMode};
 
@@ -90,11 +87,6 @@ const OPTIONS: &[OptionDoc] = &[
         flag: "--backend",
         value: "null|vulkan",
         help: "Render backend (default: null).",
-    },
-    OptionDoc {
-        flag: "--scaling",
-        value: "MODE",
-        help: "Presentation scaling (default: fit, one of: game, fit, fill, expand).",
     },
     OptionDoc {
         flag: "--preload-archives",
@@ -155,8 +147,6 @@ struct Cli {
     backend: BackendKind,
     /// Frame-rate limit from `--fps`, or `None` when the argument was absent.
     frame_rate: Option<FrameRateLimit>,
-    /// Presentation scaling from `--scaling`, or `None` when absent.
-    scaling: Option<PresentationScaling>,
     /// Whether `--preload-archives` was given.
     preload_archives: Option<bool>,
     /// Whether `--debug-overlay` was given.
@@ -194,7 +184,6 @@ impl Cli {
             frames: DEFAULT_FRAMES,
             backend: BackendKind::Null,
             frame_rate: None,
-            scaling: None,
             preload_archives: None,
             debug_overlay: None,
             archives: Vec::new(),
@@ -225,12 +214,6 @@ impl Cli {
                         .next()
                         .ok_or_else(|| CliError::Usage("--backend requires a value".to_owned()))?;
                     cli.backend = parse_backend(&value).map_err(CliError::Usage)?;
-                }
-                "--scaling" => {
-                    let value = args
-                        .next()
-                        .ok_or_else(|| CliError::Usage("--scaling requires a value".to_owned()))?;
-                    cli.scaling = Some(PresentationScaling::parse("--scaling", &value)?);
                 }
                 "--preload-archives" => cli.preload_archives = Some(true),
                 "--debug-overlay" => cli.debug_overlay = Some(true),
@@ -307,20 +290,14 @@ fn load_config_file(path: &Path) -> Result<RuntimeConfigOverrides, ConfigError> 
 ///
 /// Both the argument and the file have already been validated, so the merge
 /// cannot fail; a field neither source holds falls back to
-/// [`RuntimeConfig::default`], except the presentation scaling, which
-/// defaults to [`PresentationScaling::Fit`] here so a native-resolution
-/// window shows the whole scaled scene instead of a one-to-one crop.
+/// [`RuntimeConfig::default`].
 fn resolve_runtime_config(cli: &Cli, file: RuntimeConfigOverrides) -> RuntimeConfig {
-    let defaults = RuntimeConfig {
-        scaling: PresentationScaling::Fit,
-        ..RuntimeConfig::default()
-    };
+    let defaults = RuntimeConfig::default();
     RuntimeConfig {
         frame_rate_limit: cli
             .frame_rate
             .or(file.frame_rate_limit)
             .unwrap_or(defaults.frame_rate_limit),
-        scaling: cli.scaling.or(file.scaling).unwrap_or(defaults.scaling),
         preload_archives: cli
             .preload_archives
             .or(file.preload_archives)
@@ -505,18 +482,16 @@ mod tests {
         assert!(cli.positional.is_none());
         assert_eq!(cli.frames, DEFAULT_FRAMES);
         assert_eq!(cli.frame_rate, None);
-        assert_eq!(cli.scaling, None);
         assert_eq!(cli.debug_overlay, None);
     }
 
     #[test]
-    fn parse_frame_rate_and_scaling() {
-        let cli = parse(&["--fps", "30", "--scaling", "fit"]).expect("parse");
+    fn parse_frame_rate() {
+        let cli = parse(&["--fps", "30"]).expect("parse");
         assert_eq!(
             cli.frame_rate,
             Some(FrameRateLimit::new("--fps", 30).expect("valid"))
         );
-        assert_eq!(cli.scaling, Some(PresentationScaling::Fit));
     }
 
     #[test]
@@ -537,8 +512,6 @@ mod tests {
             &["--fps", "0"],
             &["--fps", "1001"],
             &["--fps", "fast"],
-            &["--scaling"],
-            &["--scaling", "stretch"],
         ] {
             assert!(parse(args).is_err(), "accepted {args:?}");
         }
@@ -549,18 +522,13 @@ mod tests {
         let error = parse(&["--fps", "0"]).expect_err("must fail").to_string();
         assert!(error.contains("--fps"), "{error}");
         assert!(error.contains("1..=1000"), "{error}");
-        let error = parse(&["--scaling", "stretch"])
-            .expect_err("must fail")
-            .to_string();
-        assert!(error.contains("--scaling"), "{error}");
-        assert!(error.contains("game, fit, fill, expand"), "{error}");
     }
 
     #[test]
     fn resolution_prefers_argument_then_file_then_default() {
         let file = RuntimeConfigOverrides {
             frame_rate_limit: Some(FrameRateLimit::new("frame_rate", 30).expect("valid")),
-            scaling: Some(PresentationScaling::Fit),
+            debug_overlay: Some(true),
             ..RuntimeConfigOverrides::default()
         };
 
@@ -568,34 +536,22 @@ mod tests {
         let cli = parse(&["--headless"]).expect("parse");
         let config = resolve_runtime_config(&cli, file);
         assert_eq!(config.frame_rate_limit.fps(), 30);
-        assert_eq!(config.scaling, PresentationScaling::Fit);
+        assert!(config.debug_overlay);
 
         // The launch argument beats the file, field by field.
-        let cli = parse(&["--headless", "--fps", "120", "--scaling", "fill"]).expect("parse");
-        let config = resolve_runtime_config(&cli, file);
-        assert_eq!(config.frame_rate_limit.fps(), 120);
-        assert_eq!(config.scaling, PresentationScaling::Fill);
-
-        // An argument for one field leaves the file's other field in place.
         let cli = parse(&["--headless", "--fps", "120"]).expect("parse");
         let config = resolve_runtime_config(&cli, file);
         assert_eq!(config.frame_rate_limit.fps(), 120);
-        assert_eq!(config.scaling, PresentationScaling::Fit);
+        // The file's other field is still in place.
+        assert!(config.debug_overlay);
     }
 
     #[test]
-    fn scaling_falls_back_to_the_desktop_presentation_default() {
+    fn unresolved_fields_take_the_built_in_default() {
         let cli = parse(&["--headless"]).expect("parse");
         let config = resolve_runtime_config(&cli, RuntimeConfigOverrides::default());
-        assert_eq!(
-            config,
-            RuntimeConfig {
-                scaling: PresentationScaling::Fit,
-                ..RuntimeConfig::default()
-            }
-        );
+        assert_eq!(config, RuntimeConfig::default());
         assert_eq!(config.frame_rate_limit.fps(), 60);
-        assert_eq!(config.scaling, PresentationScaling::Fit);
         assert!(!config.debug_overlay);
     }
 
@@ -633,13 +589,12 @@ mod tests {
 
     #[test]
     fn config_file_parses_keys_and_rejects_bad_values() {
-        let path = temp_config("frame_rate = 30\nscaling=fit\ndebug_overlay=true\n# comment\n");
+        let path = temp_config("frame_rate = 30\ndebug_overlay=true\n# comment\n");
         let overrides = load_config_file(&path).expect("parse");
         assert_eq!(
             overrides.frame_rate_limit,
             Some(FrameRateLimit::new("frame_rate", 30).expect("valid"))
         );
-        assert_eq!(overrides.scaling, Some(PresentationScaling::Fit));
         assert_eq!(overrides.debug_overlay, Some(true));
         std::fs::remove_file(&path).ok();
 
@@ -677,8 +632,6 @@ mod tests {
         assert!(text.contains("GAME"), "{text}");
         assert!(text.contains("default: 60"), "{text}");
         assert!(text.contains("1..=1000"), "{text}");
-        assert!(text.contains("default: fit"), "{text}");
-        assert!(text.contains("game, fit, fill, expand"), "{text}");
         assert!(text.contains("default: 120"), "{text}");
     }
 
