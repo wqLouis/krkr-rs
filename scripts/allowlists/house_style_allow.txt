@@ -25,7 +25,6 @@
 #     public because a setter would break a state invariant (bound/paused/
 #     done/completed/playing) or the field mirrors an owned config value.
 #     The method is the read-only API, so it is not a bean accessor. -------
-crates/app/src/lib.rs:547:pub fn is_headless(&self) -> bool — read-only query; `headless` mirrors `HostConfig::headless`, which is the public knob
 crates/compat/src/host.rs:99:pub fn is_bound(&self) -> bool — read-only query; `bound` is private because it gates the unsafe engine/services dereferences
 crates/engine/src/sound.rs:1170:pub fn is_paused(&self) -> bool — read-only query; `paused` is private and mutated together with `playing`/`done`
 crates/engine/src/sound.rs:1175:pub fn is_done(&self) -> bool — read-only query; `done` is private and mutated together with `playing`/`paused`

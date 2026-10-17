@@ -41,6 +41,7 @@
 
 mod common;
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use common::vm_lock;
@@ -95,7 +96,9 @@ struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
     _scene: Box<Scene>,
-    _timer: Box<TimerState>,
+    /// The attached timer registry; tests move its injected time directly so a
+    /// poll never depends on the wall clock.
+    timer: RefCell<Box<TimerState>>,
     _input: Box<InputState>,
     _storage: Box<Storage>,
     _dir: GameDir,
@@ -134,7 +137,7 @@ impl Env {
             _host: host,
             engine,
             _scene: scene,
-            _timer: timer,
+            timer: RefCell::new(timer),
             _input: input,
             _storage: storage,
             _dir: dir,
@@ -177,15 +180,18 @@ impl Env {
             .expect_err(&format!("{expression:?} should have raised"))
     }
 
-    /// Run one frame-body `timer_poll` step.
+    /// Move the attached timer registry's injected time forward by `ms`.
+    fn advance_time(&self, ms: u64) {
+        let mut timer = self.timer.borrow_mut();
+        timer.now_ms = timer.now_ms.saturating_add(ms);
+    }
+
+    /// One frame-body `timer_poll` step at a virtual 16 ms frame step.
     fn poll_timer(&self) -> bool {
+        self.advance_time(16);
         let mut ctx = self._host.ctx().expect("bound host");
         compat::timer_poll(&mut ctx).expect("timer poll")
     }
-}
-
-fn sleep(ms: u64) {
-    std::thread::sleep(std::time::Duration::from_millis(ms));
 }
 
 // ---------------------------------------------------------------------------
@@ -363,7 +369,6 @@ fn rect_timer_callback_with_read_reaches_the_target() {
          timer.interval = 1; \
          timer.enabled = 1;",
     );
-    sleep(10);
     env.poll_timer();
 
     assert_eq!(

@@ -5,8 +5,8 @@
 //! (the vendored `crates/tjs/cpp/tjs2/**` is the reference source and is
 //! assumed correct) and drive them through the exact seams our glue owns:
 //! the ABI shim (`tjs2_abi.cpp`), the `tjs` engine bindings and the
-//! `compat` dispatch (e.g. `timer_poll` -> `call_member`, the frame body's
-//! `onTimer` path). The live bug that motivated this file: a game
+//! `compat` dispatch (e.g. `timer_posts_poll` -> `call_member`, the frame
+//! body's `onTimer` path). The live bug that motivated this file: a game
 //! `class OnceTimer extends Timer` whose native timer fired 77 times while
 //! every dispatch reached the *native* `Timer::onTimer` instead of the
 //! script override, and whose constructor assignments (`capacity = 1`)
@@ -46,8 +46,8 @@
 
 mod common;
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use common::vm_lock;
 use compat::CompatHost;
@@ -70,7 +70,9 @@ struct Env {
     host: CompatHost,
     engine: Box<Tjs2Engine>,
     _scene: Box<Scene>,
-    _timer: Box<TimerState>,
+    /// The attached timer registry; tests move its injected time directly so a
+    /// poll never depends on the wall clock.
+    timer: RefCell<Box<TimerState>>,
 }
 
 impl Env {
@@ -91,7 +93,7 @@ impl Env {
             host,
             engine,
             _scene: scene,
-            _timer: timer,
+            timer: RefCell::new(timer),
         }
     }
 
@@ -134,9 +136,16 @@ impl Env {
             .expect_err(&format!("{expression:?} should have raised"))
     }
 
-    /// One `FrameBody::timer_poll` step — the exact dispatch the frame
-    /// body uses for every due timer.
+    /// Move the attached timer registry's injected time forward by `ms`.
+    fn advance_time(&self, ms: u64) {
+        let mut timer = self.timer.borrow_mut();
+        timer.now_ms = timer.now_ms.saturating_add(ms);
+    }
+
+    /// One `timer_poll` step at a virtual 16 ms frame step: advance the
+    /// attached registry, then dispatch the due `onTimer` posts.
     fn poll_once(&self) {
+        self.advance_time(16);
         let mut ctx = self.host.ctx().expect("bound compat context");
         compat::timer_poll(&mut ctx).expect("timer poll");
     }
@@ -148,7 +157,6 @@ impl Env {
             if self.eval_int(cond) != 0 {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(2));
         }
         panic!("condition {cond:?} never became true after {tries} timer polls");
     }

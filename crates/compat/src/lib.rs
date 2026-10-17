@@ -49,9 +49,10 @@ pub use ctx::{CompatCtx, CompatServices};
 pub use event::{EventAdapter, EventValue, TjsEvent};
 pub use frame::{FrameBody, run_frame_body};
 pub use host::CompatHost;
-// The built-in `Timer` poll: an L4 [`FrameBody`] forwards its `timer_poll`
-// step here (the visual natives' registry lives in this crate).
-pub use natives::visual::timer_poll;
+// The built-in `Timer` delivery: the frame body drains the `onTimer` posts the
+// L2 registry produced. `timer_poll` remains for a host or test that advances
+// the attached registry itself.
+pub use natives::visual::{timer_poll, timer_posts_poll};
 // The built-in `VideoOverlay` advance: an L4 [`FrameBody`] forwards its
 // `video_poll` step to `video_advance` with its own per-frame `dt`;
 // `VideoSource`/`set_video_source` install the host-decoded source.
@@ -71,7 +72,7 @@ pub use natives::scripts::exec_storage;
 // The built-in `AsyncTrigger` poll: an L4 [`FrameBody`] forwards its
 // `async_trigger_poll` step here (deferred script callbacks).
 pub use natives::async_trigger::async_trigger_poll;
-// The tree-owner / frame-body hand-offs: the frame body's `project_and_render`
+// The tree-owner / frame-body hand-offs: the frame body's `frame_tail`
 // step advances layer transitions and drains the host's window/capture
 // requests.
 pub use natives::visual::{

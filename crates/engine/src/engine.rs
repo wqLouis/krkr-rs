@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use api::error::RenderError;
 use api::geometry::PixelRegion;
-use api::host::{InputState, SurfaceEvent};
+use api::host::SurfaceEvent;
 use render::{
     BackendKind, FrameStats, FrameTimings, RenderNode, RenderPipeline, RenderScene, RenderState,
     Surface, Texture, TextureDesc, TextureUpload, create_texture, drop_texture, last_frame_timings,
@@ -184,8 +184,8 @@ pub struct Engine {
     textures: Map<u32, Texture>,
     /// Timer registry advanced by the frame clock.
     timer: TimerState,
-    /// Latest raw input snapshot.
-    input: InputState,
+    /// Latest script-visible input state.
+    input: crate::input::InputState,
     /// Current surface size in pixels.
     surface_size: (u32, u32),
     /// The frame clock of the last frame, in milliseconds.
@@ -232,7 +232,7 @@ impl Engine {
             render_state,
             textures: map(),
             timer: TimerState::new(),
-            input: InputState::default(),
+            input: crate::input::InputState::default(),
             surface_size,
             now_ms: 0,
             last_now_ms: None,
@@ -422,11 +422,6 @@ impl Engine {
             .map_err(EngineError::Overlay)
     }
 
-    /// Replaces the stored raw input snapshot.
-    pub fn handle_input(&mut self, input: InputState) {
-        self.input = input;
-    }
-
     /// Returns the stateless render pipeline.
     pub fn pipeline(&self) -> &RenderPipeline {
         &self.pipeline
@@ -457,13 +452,13 @@ impl Engine {
         &self.textures
     }
 
-    /// Returns the latest raw input snapshot.
-    pub fn input(&self) -> &InputState {
+    /// Returns the script-visible input state.
+    pub fn input(&self) -> &crate::input::InputState {
         &self.input
     }
 
-    /// Returns the latest raw input snapshot for mutation.
-    pub fn input_mut(&mut self) -> &mut InputState {
+    /// Returns the script-visible input state for mutation.
+    pub fn input_mut(&mut self) -> &mut crate::input::InputState {
         &mut self.input
     }
 

@@ -22,6 +22,8 @@
 
 mod common;
 
+use std::cell::RefCell;
+
 use common::vm_lock;
 use compat::CompatHost;
 use engine::Scene;
@@ -40,7 +42,9 @@ struct Env {
     /// Read back by the layer test to confirm the subclass instance really
     /// landed in the L2 scene.
     scene: Box<Scene>,
-    _timer: Box<TimerState>,
+    /// The attached timer registry; tests move its injected time directly so a
+    /// poll never depends on the wall clock.
+    timer: RefCell<Box<TimerState>>,
     _input: Box<InputState>,
     /// Only [`Env::with_storage`] mounts a storage (the KAG scenario test);
     /// declared after `_host` so it outlives the binding's raw pointer.
@@ -111,7 +115,7 @@ impl Env {
             _host: host,
             engine,
             scene,
-            _timer: timer,
+            timer: RefCell::new(timer),
             _input: input,
             _storage: storage,
             _game_dir: game_dir,
@@ -143,9 +147,17 @@ impl Env {
             .map_err(|error| error.to_string())
     }
 
-    /// Run one frame-body `timer_poll` step; returns whether any timer is
-    /// still enabled afterwards (the poll's own convention).
+    /// Move the attached timer registry's injected time forward by `ms`.
+    fn advance_time(&self, ms: u64) {
+        let mut timer = self.timer.borrow_mut();
+        timer.now_ms = timer.now_ms.saturating_add(ms);
+    }
+
+    /// Run one frame-body `timer_poll` step at a virtual 16 ms frame step;
+    /// returns whether any timer is still enabled afterwards (the poll's own
+    /// convention).
     fn poll_timer(&self) -> bool {
+        self.advance_time(16);
         let mut ctx = self._host.ctx().expect("bound host");
         compat::timer_poll(&mut ctx).expect("timer poll")
     }
@@ -155,10 +167,6 @@ impl Env {
         let mut ctx = self._host.ctx().expect("bound host");
         compat::async_trigger_poll(&mut ctx).expect("async trigger poll");
     }
-}
-
-fn sleep(ms: u64) {
-    std::thread::sleep(std::time::Duration::from_millis(ms));
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +201,6 @@ fn timer_subclass_override_wins_over_the_native_on_timer() {
          var ot = new OnceTimer(function(){ cb++; }, 1, function(){ ends++; }); \
          ot.enabled = 1;",
     );
-    sleep(10);
     env.poll_timer();
 
     assert_eq!(
@@ -230,7 +237,6 @@ fn timer_subclass_without_an_override_reaches_the_native_ctor_callback() {
          var st = new SubTimer(function(){ n++; }, 1); \
          st.enabled = 1;",
     );
-    sleep(10);
     env.poll_timer();
     assert_eq!(
         env.eval_int("n"),
@@ -269,7 +275,6 @@ fn timer_capacity_one_keeps_repeating_until_cancelled() {
          o.enabled = 1;",
     );
     for _ in 0..10 {
-        sleep(3);
         env.poll_timer();
     }
     assert!(
@@ -289,7 +294,6 @@ fn timer_capacity_one_keeps_repeating_until_cancelled() {
     env.run("o.enabled = 0;");
     let hits = env.eval_int("hits");
     for _ in 0..5 {
-        sleep(3);
         env.poll_timer();
     }
     assert_eq!(
@@ -314,7 +318,6 @@ fn timer_capacity_negative_never_fires_while_enabled() {
          t.capacity = -5; t.interval = 1; t.enabled = 1;",
     );
     for _ in 0..10 {
-        sleep(3);
         env.poll_timer();
     }
     assert_eq!(
@@ -372,7 +375,6 @@ fn timer_untouched_capacity_keeps_repeating() {
          t.interval = 1; t.enabled = 1;",
     );
     for _ in 0..10 {
-        sleep(3);
         env.poll_timer();
     }
     assert!(
@@ -395,7 +397,6 @@ fn timer_capacity_zero_is_the_reference_no_limit_sentinel() {
          t.interval = 1; t.capacity = 0; t.enabled = 1;",
     );
     for _ in 0..10 {
-        sleep(3);
         env.poll_timer();
     }
     assert!(
@@ -426,7 +427,6 @@ fn timer_invalidate_stops_the_dispatch_and_reports_not_valid() {
          var it = new InvTimer(1); \
          it.enabled = 1;",
     );
-    sleep(10);
     env.poll_timer();
     assert_eq!(env.eval_int("hits"), 1);
 
@@ -437,7 +437,6 @@ fn timer_invalidate_stops_the_dispatch_and_reports_not_valid() {
         "an invalidated subclass instance reports not valid"
     );
 
-    sleep(10);
     env.poll_timer();
     assert_eq!(
         env.eval_int("hits"),
@@ -465,10 +464,8 @@ fn timer_callback_invalidate_stops_further_fires() {
     env.run(
         "var n = 0; \n         var t = new Timer(function(){ n++; invalidate t; }, ''); \n         t.interval = 1; t.enabled = 1;",
     );
-    sleep(10);
     env.poll_timer();
     assert_eq!(env.eval_int("n"), 1, "the first due poll fires");
-    sleep(10);
     let any_enabled = env.poll_timer();
     assert_eq!(
         env.eval_int("n"),
@@ -498,7 +495,6 @@ fn timer_peer_disabled_mid_dispatch_is_cancelled() {
     env.run(
         "var na = 0; var nb = 0; \n         var ta = new Timer(function(){ na++; tb.enabled = 0; }, ''); \n         ta.interval = 1; \n         var tb = new Timer(function(){ nb++; }, ''); \n         tb.interval = 1; \n         ta.enabled = 1; tb.enabled = 1;",
     );
-    sleep(10);
     env.poll_timer();
     assert_eq!(env.eval_int("na"), 1, "the first timer fired");
     assert_eq!(
@@ -506,7 +502,6 @@ fn timer_peer_disabled_mid_dispatch_is_cancelled() {
         0,
         "the peer-disabled timer must not fire in the same round"
     );
-    sleep(10);
     env.poll_timer();
     assert_eq!(env.eval_int("na"), 2, "the first timer keeps repeating");
     assert_eq!(env.eval_int("nb"), 0, "the disabled timer stays off");

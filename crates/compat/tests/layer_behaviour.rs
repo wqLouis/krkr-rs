@@ -33,6 +33,8 @@
 
 mod common;
 
+use std::cell::RefCell;
+
 use common::vm_lock;
 use compat::CompatHost;
 use engine::Scene;
@@ -52,8 +54,9 @@ struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
     scene: Box<Scene>,
-    /// Kept alive for the host's raw pointer; never read directly.
-    _timer: Box<TimerState>,
+    /// The attached timer registry; tests move its injected time directly so a
+    /// poll never depends on the wall clock.
+    timer: RefCell<Box<TimerState>>,
     /// Kept alive for the host's raw pointer; never read directly.
     input: Box<InputState>,
 }
@@ -80,7 +83,7 @@ impl Env {
             _host: host,
             engine,
             scene,
-            _timer: timer,
+            timer: RefCell::new(timer),
             input,
         }
     }
@@ -117,6 +120,20 @@ impl Env {
             TjsValue::Integer(value) => value,
             other => panic!("{expression:?} returned {other:?}, expected an integer"),
         }
+    }
+
+    /// Move the attached timer registry's injected time forward by `ms`.
+    fn advance_time(&self, ms: u64) {
+        let mut timer = self.timer.borrow_mut();
+        timer.now_ms = timer.now_ms.saturating_add(ms);
+    }
+
+    /// Move the attached timer registry's injected time forward by `ms` and
+    /// poll once, so a due timer fires without a wall-clock wait.
+    fn poll_timer_after(&self, ms: u64) {
+        self.advance_time(ms);
+        let mut ctx = self._host.ctx().expect("bound host");
+        compat::timer_poll(&mut ctx).expect("timer poll");
     }
 
     fn assert_script(&self, expression: &str) {
@@ -2077,7 +2094,7 @@ fn layer_update_dispatches_on_paint_before_drawing() {
         "update() only arms CallOnPaint; onPaint runs on the next pre-draw step"
     );
 
-    // The frame body's pre-draw step (`project_and_render` ->
+    // The frame body's pre-draw step (`frame_tail` ->
     // `compat::advance_transitions` / `compat::paint_poll`) runs the pending
     // `onPaint` before anything is rendered.
     let ctx = env._host.ctx().expect("bound host");
@@ -2176,11 +2193,11 @@ fn with_member_property_write_reaches_the_member_from_a_timer() {
          var ot = new OnceTimer(h.mark, 1); \
          ot.start();",
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-    while env.eval_int("fired") == 0 && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let mut ctx = env._host.ctx().expect("bound host");
-        compat::timer_poll(&mut ctx).expect("timer poll");
+    for _ in 0..100 {
+        env.poll_timer_after(5);
+        if env.eval_int("fired") != 0 {
+            break;
+        }
     }
     assert_eq!(env.eval_int("fired"), 1, "the timer action must run");
     assert_eq!(

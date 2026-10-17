@@ -1,26 +1,22 @@
-//! krkr-rs host assembly: owns the middle-layer state values and the
-//! per-frame step, wired to the L1 platform by the `krkr` binary.
+//! krkr-rs host assembly: the middle-layer engine plus the stateless services
+//! the composition root holds, wired to the L1 platform by the `krkr` binary.
 //!
-//! [`Host`] is the engine-driving frontend. It owns the stateless bottom
-//! objects ([`RenderPipeline`], [`FileSystem`], [`Media`]) together with all
-//! of the evolving middle-layer state:
-//!
-//! * the TVP layer system [`Scene`];
-//! * the projected [`RenderScene`] consumed by the pipeline;
-//! * the [`RenderState`]/[`Surface`] pair created by
-//!   [`begin_render_state`];
-//! * the bitmap-id → [`Texture`] table and the raw [`InputState`].
+//! [`Host`] wraps the middle-layer [`engine::Engine`] together with the two
+//! stateless bottom objects the composition root also keeps ([`FileSystem`]
+//! and [`Media`]). Every evolving value — the TVP layer system [`Scene`], the
+//! projected [`RenderScene`], the [`RenderState`]/[`Surface`] pair, the
+//! bitmap-id → [`Texture`] table, the timer registry and the script-visible
+//! input state — belongs to the engine, so the host holds no frame state of
+//! its own and drives one engine frame per [`Host::step`].
 //!
 //! There are no globals, statics or hidden caches: every value is a local
 //! field of [`Host`] and is passed to the bottom objects explicitly. Two
-//! hosts can therefore run in the same process. The per-frame work is one
-//! projection pass: sync dirty bitmaps, upload textures, project the tree and
-//! make one `render` call.
+//! hosts can therefore run in the same process.
 
-// The composition root installs the VM's raw-pointer binding to the L2 scene
-// and storage (`compat::CompatServices::attach_scene`/`attach_storage`), which
-// is inherently `unsafe`. That wiring is the crate's only `unsafe`, confined
-// to `game` and covered by SAFETY comments; every other module is safe.
+// The composition root installs the VM's raw-pointer binding to the L2 scene,
+// storage, timer and input (`compat::CompatServices::attach_*`), which is
+// inherently `unsafe`. That wiring is the crate's only `unsafe`, confined to
+// `game` and covered by SAFETY comments; every other module is safe.
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -33,22 +29,16 @@ mod startup;
 mod video;
 mod window_ex;
 
-use std::collections::HashMap;
-
 use api::error::RenderError;
-use api::geometry::PixelRegion;
-use api::host::{InputState, SurfaceEvent};
-use engine::projection::project_scene;
-use engine::scene::{Rect, Scene};
+use api::host::SurfaceEvent;
+use engine::Scene;
 use fs::FileSystem;
 use media::Media;
 use overlay::Overlay;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use render::{
     FrameTimings, PipelineConfig, RenderPipeline, RenderScene, RenderState, Surface, Texture,
-    TextureDesc, TextureFormat, TextureUpload, begin_render_state, begin_render_state_with_display,
-    create_render_pipeline, create_texture, drop_texture, last_frame_timings, render,
-    resize as resize_render, upload_textures,
+    TextureFormat, begin_render_state, begin_render_state_with_display, create_render_pipeline,
 };
 
 pub use audio::install_audio_decoder;
@@ -67,9 +57,8 @@ pub use window_ex::install_window_ex_facts;
 
 /// Errors surfaced by [`Host`].
 ///
-/// The only fallible host operations are the render actions, so the host
-/// error is currently a transparent render error. It exists as its own type
-/// so file-system/media errors can be added without changing signatures.
+/// The host reports the engine's own frame, configuration and overlay failures
+/// alongside its own configuration check.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum HostError {
@@ -83,28 +72,27 @@ pub enum HostError {
     /// The debug overlay could not be built or refreshed.
     #[error("debug overlay: {0}")]
     Overlay(String),
+    /// The frame hook failed; the frame was abandoned before drawing.
+    #[error("frame: {0}")]
+    Frame(String),
+}
+
+impl From<engine::EngineError> for HostError {
+    fn from(error: engine::EngineError) -> Self {
+        match error {
+            engine::EngineError::Render(error) => Self::Render(error),
+            engine::EngineError::Config(message) => Self::Config(message),
+            engine::EngineError::Overlay(message) => Self::Overlay(message),
+            engine::EngineError::Frame(message) => Self::Frame(message),
+            // `EngineError` is non-exhaustive, so a variant this build cannot
+            // classify keeps its message as a frame failure.
+            other => Self::Frame(other.to_string()),
+        }
+    }
 }
 
 /// Outcome of one [`Host::step`].
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct StepReport {
-    /// Number of frames rendered so far, counting this one.
-    pub frame_index: u64,
-    /// Total simulated time advanced through `step`, in milliseconds.
-    pub elapsed_ms: f64,
-    /// Per-frame counters from the null backend, or `None` on a GPU backend.
-    pub stats: Option<FrameStats>,
-    /// Milliseconds spent syncing dirty bitmaps to textures.
-    pub sync_ms: f64,
-    /// Milliseconds of `sync_ms` spent uploading dirty bitmaps.
-    pub upload_ms: f64,
-    /// Milliseconds of `sync_ms` spent dropping textures whose bitmap is gone.
-    pub prune_ms: f64,
-    /// Milliseconds spent projecting the scene tree.
-    pub project_ms: f64,
-    /// Milliseconds spent in the pipeline's render call.
-    pub render_ms: f64,
-}
+pub use engine::FrameReport as StepReport;
 
 /// Immutable configuration for [`Host::new`].
 ///
@@ -208,69 +196,29 @@ impl HostConfig {
     }
 }
 
-/// Resizes a window's client area to `size`.
+/// The assembled host: the middle-layer engine plus the stateless services
+/// the composition root also holds.
 ///
-/// The window's client size and, when it has one, its primary layer are
-/// resized; the layer stays at the origin because the reference forbids moving
-/// the primary layer.
-fn resize_window_client(scene: &mut Scene, window: u32, size: (u32, u32)) {
-    let primary = scene.window_mut(window).map(|window| {
-        window.inner_size = size;
-        window.primary_layer
-    });
-    if let Some(Some(primary)) = primary
-        && let Some(layer) = scene.layer_mut(primary)
-    {
-        layer.rect = Rect::new(0, 0, size.0, size.1);
-    }
-}
-
-/// The assembled host: bottom objects, middle-layer state and frame step.
-///
-/// See the crate documentation for the ownership model. The fields are
-/// deliberately private; callers reach the middle-layer state through
-/// [`Host::scene`] / [`Host::scene_mut`] and drive frames through
-/// [`Host::step`].
+/// See the crate documentation for the ownership model. Callers reach the
+/// layer system through [`Host::scene`] / [`Host::scene_mut`] and drive
+/// frames through [`Host::step`].
 pub struct Host {
-    /// Stateless render service.
-    pipeline: RenderPipeline,
+    /// The middle-layer engine: scene, projection, textures, timers, input
+    /// and the frame clock.
+    engine: engine::Engine,
     /// Stateless file-system service (constructed, not yet exercised).
     fs: FileSystem,
     /// Stateless media service (constructed, not yet exercised).
     media: Media,
-    /// TVP layer system owned by the host.
-    scene: Scene,
-    /// Projected render tree, rebuilt in place by [`Host::step`] only when the
-    /// [`Scene`] revision changes.
-    render_scene: RenderScene,
-    /// [`Scene::revision`] value that `render_scene` was projected from.
-    ///
-    /// `None` until the first projection, so the first [`Host::step`] (and any
-    /// forced redraw) always projects.
-    render_scene_revision: Option<u64>,
-    /// Presented surface for `render_state`.
-    surface: Surface,
-    /// GPU/staging/texture bookkeeping owned by the host.
-    render_state: RenderState,
-    /// Bitmap id → uploaded texture handle.
-    textures: HashMap<u32, Texture>,
-    /// Latest raw input snapshot.
-    input: InputState,
-    /// Whether the host runs offscreen with no window (from
-    /// [`HostConfig::headless`]).
-    ///
-    /// The game host reads this at open time to pick the L1 audio backend:
-    /// a headless host cannot assume an audio server exists and opens the
-    /// null device (see `audio` module docs).
-    headless: bool,
-    /// Frames rendered so far.
-    frame_index: u64,
-    /// Simulated time advanced through [`Host::step`].
-    elapsed_ms: f64,
-    /// Current surface size in pixels.
-    surface_size: (u32, u32),
-    /// Debug overlay, or `None` when the host draws none.
-    overlay: Option<Overlay>,
+}
+
+/// A frame hook that does nothing, for a host with no game above it.
+struct EmptyFrame;
+
+impl engine::GameFrame for EmptyFrame {
+    fn before_render(&mut self, _now_ms: u64, _dt_ms: f64) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 impl Host {
@@ -295,8 +243,6 @@ impl Host {
         })?;
         let fs = FileSystem::memory();
         let media = Media::new();
-        let scene = Scene::default();
-        let render_scene = RenderScene::with_root_node();
 
         let headless_handle;
         let handle: &RawWindowHandle = if config.headless {
@@ -314,190 +260,87 @@ impl Host {
                 )
             })?
         };
-        let (surface, mut render_state) = match &config.display_handle {
+        let (surface, render_state): (Surface, RenderState) = match &config.display_handle {
             Some(display) => begin_render_state_with_display(&pipeline, display, handle)?,
             None => begin_render_state(&pipeline, handle)?,
         };
-        let surface_size = (config.surface_size.0.max(1), config.surface_size.1.max(1));
-        let _ = resize_render(&pipeline, &surface, &mut render_state, surface_size)?;
         let overlay = if config.debug_overlay {
             Some(Overlay::new(&pipeline).map_err(|error| HostError::Overlay(error.to_string()))?)
         } else {
             None
         };
 
-        Ok(Self {
+        let engine = engine::Engine::new(engine::EngineParts {
             pipeline,
-            fs,
-            media,
-            scene,
-            render_scene,
-            render_scene_revision: None,
             surface,
             render_state,
-            textures: HashMap::new(),
-            input: InputState::default(),
+            surface_size: config.surface_size,
             headless: config.headless,
-            frame_index: 0,
-            elapsed_ms: 0.0,
-            surface_size,
-            overlay,
-        })
+            overlay: overlay.map(|overlay| Box::new(overlay) as Box<dyn engine::EngineOverlay>),
+        })?;
+
+        Ok(Self { engine, fs, media })
     }
 
     /// Advances the host by one frame and presents it.
     ///
-    /// This performs the projection seam in order: dirty bitmaps are synced
-    /// to textures, the layer tree is projected into the persistent
-    /// [`RenderScene`] (skipped while [`Scene::revision`] is unchanged), and
-    /// the pipeline renders it in a single call. `dt_ms` is accumulated into
-    /// [`Host::elapsed_ms`] for callers that animate.
+    /// The engine drives the whole frame: it advances its clock, fires due
+    /// timers, runs the (here empty) frame hook, refreshes the debug overlay,
+    /// uploads dirty bitmaps, projects the layer tree when it changed and
+    /// renders the result. `dt_ms` advances the engine's frame clock.
     ///
     /// # Errors
     ///
-    /// Returns [`HostError::Render`] when the render action fails.
+    /// Returns [`HostError`] when the frame hook, the overlay or a render
+    /// action fails.
     pub fn step(&mut self, dt_ms: f32) -> Result<StepReport, HostError> {
-        self.elapsed_ms += f64::from(dt_ms).max(0.0);
-
-        let sync_started = std::time::Instant::now();
-        let upload_started = std::time::Instant::now();
-        self.sync_dirty_bitmaps();
-        let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
-        let prune_started = std::time::Instant::now();
-        self.prune_stale_textures();
-        let prune_ms = prune_started.elapsed().as_secs_f64() * 1000.0;
-        let sync_ms = sync_started.elapsed().as_secs_f64() * 1000.0;
-
-        self.refresh_overlay()?;
-        let project_started = std::time::Instant::now();
-        self.reproject_render_scene()?;
-        let project_ms = project_started.elapsed().as_secs_f64() * 1000.0;
-
-        let render_started = std::time::Instant::now();
-        render(
-            &self.pipeline,
-            &self.surface,
-            &mut self.render_state,
-            &self.render_scene,
-        )?;
-        let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
-        self.frame_index = self.frame_index.saturating_add(1);
-
-        Ok(StepReport {
-            frame_index: self.frame_index,
-            elapsed_ms: self.elapsed_ms,
-            stats: self.last_frame(),
-            sync_ms,
-            upload_ms,
-            prune_ms,
-            project_ms,
-            render_ms,
-        })
+        self.step_with_frame(dt_ms, &mut EmptyFrame)
     }
 
-    /// Rebuilds [`Host::render_scene`] from the layer tree when it is stale.
+    /// Advances the host by one frame, running `hooks` before the projection.
     ///
-    /// The projection is skipped while [`Scene::revision`] is unchanged, so a
-    /// static scene does not reallocate the render tree every frame. A
-    /// rebuild reuses the existing arena: [`RenderScene::nodes`] is cleared
-    /// (retaining its capacity) and refilled, so the persistent allocation is
-    /// kept and only the projected nodes' own allocations are touched. The
-    /// revision is `None` until the first projection, so the first frame (and
-    /// any forced redraw) always projects.
-    fn reproject_render_scene(&mut self) -> Result<(), HostError> {
-        let revision = self.scene.revision();
-        if self.render_scene_revision == Some(revision) {
-            return Ok(());
-        }
-
-        let textures = &self.textures;
-        let projected = project_scene(&self.scene, |bitmap| textures.get(&bitmap).cloned());
-
-        // Reuse the arena instead of replacing the whole `RenderScene`.
-        self.render_scene.nodes.clear();
-        self.render_scene.root = projected.root;
-        self.render_scene.background = projected.background;
-        self.render_scene.nodes.extend(projected.nodes);
-
-        self.attach_overlay();
-        self.render_scene_revision = Some(revision);
-        Ok(())
+    /// This is the composition root's entry point: the game host passes its
+    /// VM/audio hook so its per-frame work runs between the timer advance and
+    /// the projection.
+    ///
+    /// # Errors
+    ///
+    /// As [`Host::step`], plus a hook failure reported as
+    /// [`HostError::Frame`].
+    pub(crate) fn step_with_frame(
+        &mut self,
+        dt_ms: f32,
+        hooks: &mut dyn engine::GameFrame,
+    ) -> Result<StepReport, HostError> {
+        Ok(self.engine.step(dt_ms, hooks)?)
     }
 
-    /// Appends the debug overlay as the last child of the scene root.
-    ///
-    /// The projection clears and refills the arena, so the overlay node is
-    /// re-added after every rebuild. The overlay's texture is stable across
-    /// refreshes, so an unchanged revision does not need to touch the node.
-    fn attach_overlay(&mut self) {
-        let Some(overlay) = self.overlay.as_ref() else {
-            return;
-        };
-        let root = self.render_scene.root;
-        let mut node = overlay.node();
-        node.parent = Some(root);
-        let id = self.render_scene.push(node);
-        if let Some(root_node) = self.render_scene.node_mut(root) {
-            root_node.children.push(id);
-        }
-    }
-
-    /// Advances the overlay and re-uploads its panel when the refresh interval
-    /// has elapsed.
-    ///
-    /// The resident set size is re-read here rather than on every frame, so
-    /// the overlay's cost is bounded by its refresh cadence.
-    fn refresh_overlay(&mut self) -> Result<(), HostError> {
-        let Some(overlay) = self.overlay.as_mut() else {
-            return Ok(());
-        };
-        let rss = platform::memory_usage();
-        overlay
-            .tick(&self.pipeline, &mut self.render_state, self.elapsed_ms, rss)
-            .map_err(|error| HostError::Overlay(error.to_string()))
-    }
-
-    /// Replaces the stored raw input snapshot.
-    ///
-    /// TVP hit-testing and gesture synthesis stay in the middle layer; the
-    /// host only captures the device state and hands it over.
-    pub fn handle_input(&mut self, input: InputState) {
-        self.input = input;
+    /// The middle-layer engine, for the composition root's attachments.
+    pub(crate) fn engine_mut(&mut self) -> &mut engine::Engine {
+        &mut self.engine
     }
 
     /// Reports a new surface size in physical pixels.
     ///
-    /// The surface size is the framebuffer, and the host draws the scene into
-    /// it one-to-one. The main window's client size and its primary layer
-    /// follow the framebuffer; the layer stays at the origin because the
-    /// reference forbids moving the primary layer.
+    /// The surface size is the framebuffer. The main window's client size and
+    /// its primary layer follow the framebuffer; the layer stays at the
+    /// origin because the reference forbids moving the primary layer.
     ///
     /// # Errors
     ///
     /// Returns [`HostError::Render`] if the backend rejects the resize.
     pub fn resize(&mut self, size: (u32, u32)) -> Result<SurfaceEvent, HostError> {
-        let size = (size.0.max(1), size.1.max(1));
-        let event = if size == self.surface_size {
-            SurfaceEvent::Resized(size.0, size.1)
-        } else {
-            resize_render(&self.pipeline, &self.surface, &mut self.render_state, size)?
-        };
-        self.surface_size = size;
-
-        if let Some(window) = self.scene.windows.first().map(|window| window.id) {
-            resize_window_client(&mut self.scene, window, size);
-        }
-        Ok(event)
+        Ok(self.engine.resize(size)?)
     }
 
     /// Returns the stateless render pipeline.
     pub fn pipeline(&self) -> &RenderPipeline {
-        &self.pipeline
+        self.engine.pipeline()
     }
 
     /// Returns the backend the pipeline was created with.
     pub fn backend(&self) -> BackendKind {
-        self.pipeline.backend()
+        self.engine.backend()
     }
 
     /// Returns the file-system service (constructed, not yet used).
@@ -512,27 +355,22 @@ impl Host {
 
     /// Returns the TVP layer system.
     pub fn scene(&self) -> &Scene {
-        &self.scene
+        self.engine.scene()
     }
 
     /// Returns the TVP layer system for script-driven mutation.
     pub fn scene_mut(&mut self) -> &mut Scene {
-        &mut self.scene
+        self.engine.scene_mut()
     }
 
     /// Returns the most recently projected render tree.
     pub fn render_scene(&self) -> &RenderScene {
-        &self.render_scene
+        self.engine.render_scene()
     }
 
     /// Returns the bitmap-id → texture table.
-    pub fn textures(&self) -> &HashMap<u32, Texture> {
-        &self.textures
-    }
-
-    /// Returns the latest raw input snapshot.
-    pub fn input(&self) -> &InputState {
-        &self.input
+    pub fn textures(&self) -> &engine::Map<u32, Texture> {
+        self.engine.textures()
     }
 
     /// Whether this host runs offscreen with no window.
@@ -540,32 +378,32 @@ impl Host {
     /// Mirrors [`HostConfig::headless`]: the game host uses it to select the
     /// L1 null audio backend instead of opening a real device.
     pub fn is_headless(&self) -> bool {
-        self.headless
+        self.engine.is_headless()
     }
 
     /// Returns the current surface size in pixels.
     pub fn surface_size(&self) -> (u32, u32) {
-        self.surface_size
+        self.engine.surface_size()
     }
 
     /// Whether the host draws the debug overlay.
     pub fn debug_overlay_enabled(&self) -> bool {
-        self.overlay.is_some()
+        self.engine.debug_overlay_enabled()
     }
 
     /// Returns the number of frames rendered so far.
     pub fn frame_index(&self) -> u64 {
-        self.frame_index
+        self.engine.frame_index()
     }
 
-    /// Returns the simulated time advanced through [`Host::step`].
+    /// Returns the frame clock of the most recent frame.
     pub fn elapsed_ms(&self) -> f64 {
-        self.elapsed_ms
+        self.engine.elapsed_ms()
     }
 
     /// Returns the null backend's counters for the last frame, if available.
     pub fn last_frame(&self) -> Option<FrameStats> {
-        render::NullRenderPipeline::last_frame(&self.render_state)
+        self.engine.last_frame()
     }
 
     /// Returns the presentation calls' costs for the last presented frame.
@@ -574,104 +412,6 @@ impl Host {
     /// measured; the null backend reports zeros. `None` means no frame has
     /// been presented through this state yet.
     pub fn last_frame_timings(&self) -> Option<FrameTimings> {
-        last_frame_timings(&self.render_state)
-    }
-
-    /// Uploads every bitmap whose dirty flag is set and clears the flag.
-    ///
-    /// A bitmap whose dimensions changed recreates its texture; one with an
-    /// inconsistent pixel length is skipped with a warning so one bad bitmap
-    /// cannot abort the frame. All dirty bitmaps are uploaded in one batch, so
-    /// the frame submits them once and the present path waits for that batch
-    /// instead of waiting once per bitmap.
-    fn sync_dirty_bitmaps(&mut self) {
-        let dirty: Vec<u32> = self
-            .scene
-            .bitmaps
-            .iter()
-            .filter(|bitmap| bitmap.dirty)
-            .map(|bitmap| bitmap.id)
-            .collect();
-
-        let mut ready: Vec<u32> = Vec::with_capacity(dirty.len());
-        for id in dirty {
-            let Some((width, height, len)) = self
-                .scene
-                .bitmap(id)
-                .map(|bitmap| (bitmap.width, bitmap.height, bitmap.rgba.len()))
-            else {
-                continue;
-            };
-            if width == 0 || height == 0 {
-                log::warn!("bitmap #{id} has a zero dimension; skipping upload");
-                self.scene.set_bitmap_clean(id);
-                continue;
-            }
-            let expected = width as usize * height as usize * 4;
-            if len != expected {
-                log::warn!(
-                    "bitmap #{id} has {len} pixel bytes, expected {expected}; skipping upload"
-                );
-                self.scene.set_bitmap_clean(id);
-                continue;
-            }
-
-            let recreate = self
-                .textures
-                .get(&id)
-                .is_none_or(|texture| texture.width() != width || texture.height() != height);
-            if recreate {
-                if let Some(old) = self.textures.remove(&id) {
-                    drop_texture(&self.pipeline, &mut self.render_state, old);
-                }
-                match create_texture(&self.pipeline, TextureDesc::new(width, height)) {
-                    Ok(texture) => {
-                        self.textures.insert(id, texture);
-                    }
-                    Err(error) => {
-                        log::warn!("failed to create a texture for bitmap #{id}: {error}");
-                        continue;
-                    }
-                }
-            }
-            ready.push(id);
-        }
-
-        if !ready.is_empty() {
-            let uploads: Vec<TextureUpload<'_>> = ready
-                .iter()
-                .filter_map(|id| {
-                    let bitmap = self.scene.bitmap(*id)?;
-                    let texture = self.textures.get(id)?;
-                    Some(TextureUpload {
-                        texture,
-                        region: PixelRegion::new(0, 0, bitmap.width, bitmap.height),
-                        pixels: &bitmap.rgba,
-                    })
-                })
-                .collect();
-            if let Err(error) = upload_textures(&self.pipeline, &mut self.render_state, &uploads) {
-                log::warn!("failed to upload {} bitmap(s): {error}", uploads.len());
-            }
-            drop(uploads);
-            for id in ready {
-                self.scene.set_bitmap_clean(id);
-            }
-        }
-    }
-
-    /// Drops textures whose bitmap no longer exists in the scene.
-    fn prune_stale_textures(&mut self) {
-        let stale: Vec<u32> = self
-            .textures
-            .keys()
-            .copied()
-            .filter(|id| self.scene.bitmap(*id).is_none())
-            .collect();
-        for id in stale {
-            if let Some(texture) = self.textures.remove(&id) {
-                drop_texture(&self.pipeline, &mut self.render_state, texture);
-            }
-        }
+        self.engine.last_frame_timings()
     }
 }

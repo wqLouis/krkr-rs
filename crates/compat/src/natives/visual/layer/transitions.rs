@@ -6,8 +6,9 @@
 //! the L2 [`engine::trans`] state machine they drive. The transition state
 //! is stored per layer in [`LayerExtras`](super::LayerExtras);
 //! [`advance_transitions`] is the frame step the frame body calls (it
-//! advances the machine with the L1 [`platform::Clock`], stops transitions
-//! the reference stops per tick, and fires `onTransitionCompleted`).
+//! advances the machine by the frame's elapsed milliseconds, stops
+//! transitions the reference stops per tick, and fires
+//! `onTransitionCompleted`).
 //!
 //! `onTransitionCompleted` itself is a no-op assignable handler (see
 //! [`super::events`]); [`advance_transitions`] / [`end_transition`]
@@ -702,7 +703,7 @@ fn object_alive(ctx: &crate::CompatCtx, kind: ObjectKind, id: u32) -> bool {
 /// (`:8056-8060`), and like its `Invalidate` (`:517-521`) a transition
 /// whose destination or source script object has died is torn down without
 /// the completion event (`:7997-8004`). The frame body calls this from its
-/// `project_and_render` step; the completion handler
+/// `frame_tail` step; the completion handler
 /// (`onTransitionCompleted`) is dispatched here through the object member
 /// so a script subclass override runs (reference `LayerIntf.cpp:8000-8015`
 /// fires the event synchronously on the layer with `(dest, src)`).

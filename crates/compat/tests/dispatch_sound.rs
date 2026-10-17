@@ -87,7 +87,7 @@
 
 mod common;
 
-use std::time::Duration;
+use std::cell::RefCell;
 
 use common::vm_lock;
 use compat::CompatHost;
@@ -102,12 +102,14 @@ const SCRIPT: &str = "dispatch-sound-test";
 /// No storage/decoder is needed: a fresh `WaveSoundBuffer` already owns its
 /// mixer channel (`sound_ctor` spawns one,
 /// `crates/compat/src/natives/sound.rs:1355-1375`), so `volume` reads/writes
-/// observe real L2 state. `_timer` drops after `_host` (declaration order),
+/// observe real L2 state. `timer` drops after `_host` (declaration order),
 /// so the host's raw pointer stays valid for its whole life.
 struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
-    _timer: Box<TimerState>,
+    /// The attached timer registry; tests move its injected time directly so a
+    /// poll never depends on the wall clock.
+    timer: RefCell<Box<TimerState>>,
 }
 
 impl Env {
@@ -116,7 +118,7 @@ impl Env {
         let mut timer = Box::new(TimerState::new());
         let mut host = CompatHost::new();
         // SAFETY: the boxed timer registry outlives the host binding; fields
-        // drop in declaration order, so `_timer` is released after `_host`.
+        // drop in declaration order, so `timer` is released after `_host`.
         unsafe {
             host.services_mut()
                 .attach_timer(timer.as_mut() as *mut TimerState);
@@ -125,7 +127,7 @@ impl Env {
         Env {
             _host: host,
             engine,
-            _timer: timer,
+            timer: RefCell::new(timer),
         }
     }
 
@@ -148,15 +150,18 @@ impl Env {
         }
     }
 
-    /// One frame-body `timer_poll` step (the timer-owned callback seam).
+    /// Move the attached timer registry's injected time forward by `ms`.
+    fn advance_time(&self, ms: u64) {
+        let mut timer = self.timer.borrow_mut();
+        timer.now_ms = timer.now_ms.saturating_add(ms);
+    }
+
+    /// One frame-body `timer_poll` step at a virtual 16 ms frame step.
     fn poll_timer(&self) -> bool {
+        self.advance_time(16);
         let mut ctx = self._host.ctx().expect("bound host");
         compat::timer_poll(&mut ctx).expect("timer poll")
     }
-}
-
-fn sleep(ms: u64) {
-    std::thread::sleep(Duration::from_millis(ms));
 }
 
 // ---------------------------------------------------------------------------
@@ -568,7 +573,6 @@ fn with_write_from_a_timer_callback_routes_to_the_target() {
          t.interval = 1; \
          t.enabled = 1;",
     );
-    sleep(10);
     assert!(
         env.poll_timer(),
         "the timer must still be enabled after one poll"

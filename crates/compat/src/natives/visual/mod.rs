@@ -53,9 +53,10 @@
 //!   `height`, `buffer`, `bufferForWrite`, `bufferPitch`, `loading`.
 //! * `Font`: constructor; properties `face`, `height`, `color`, `bold`,
 //!   `italic`, `strikeout`, `underline`, `angle`, `faceIsFileName`.
-//! * `Timer`: constructor, `onTimer`; properties `id`, `interval`, `enabled`,
-//!   `capacity`, `count`, `mode`; [`timer_poll`] fires due timers through the
-//!   object's `onTimer` member (so a script subclass override runs).
+//! * `Timer`: constructor, `onTimer`; properties `interval`, `enabled`,
+//!   `capacity`, `mode`; [`timer_posts_poll`] delivers the queued `onTimer`
+//!   events through the object's `onTimer` member (so a script subclass
+//!   override runs), and [`timer_poll`] advances the attached registry first.
 //!
 //! # Deliberately deferred
 //!
@@ -69,13 +70,15 @@
 //!
 //! # Timer polling
 //!
-//! [`timer_poll`] is the `timer_poll` step of the documented frame body
-//! (`compat::frame::FrameBody`); the host calls it once per frame. It is a
-//! `pub` free function (like `system::continuous_handler_poll`) so the host
-//! can wire it without the natives exposing anything else. It asks the L2
-//! [`engine::timer::TimerState`] registry for the due timers (the L1
-//! [`platform::Clock`] supplies `now_ms`) and dispatches `onTimer`; the
-//! dispatch itself stays in L3.
+//! The L2 [`engine::timer::TimerState`] registry is advanced by the L2 frame
+//! clock; its callbacks only queue `onTimer` events. [`timer_posts_poll`]
+//! delivers those queued events and is the first step of the frame body
+//! (`compat::frame::run_frame_body`). [`timer_poll`] stays for a host or test
+//! that drives the attached registry itself: it advances the registry at the
+//! registry's own injected `now_ms` and then drains. Both are `pub` free
+//! functions (like `system::continuous_handler_poll`) so the host can wire them
+//! without the natives exposing anything else; the dispatch itself stays in
+//! L3.
 #![allow(unsafe_code)]
 
 use crate::{CompatCtx, CompatError};
@@ -90,7 +93,7 @@ mod layer;
 mod timer;
 mod window;
 
-pub use timer::timer_poll;
+pub use timer::{timer_poll, timer_posts_poll};
 
 /// The number of live `Timer` bindings in the dispatch state.
 ///
@@ -100,7 +103,7 @@ pub(crate) fn timer_count(services: &crate::CompatServices) -> usize {
     timer::binding_count(services)
 }
 // The tree-owner / frame-body hand-offs: the L4 frame body drains the host
-// requests and advances transitions from its `project_and_render` step.
+// requests and advances transitions from its `frame_tail` step.
 pub use layer::{advance_transitions, paint_poll, take_capture_releases};
 pub use window::{take_bring_to_front_requests, take_update_requests};
 
@@ -119,6 +122,8 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::timer_poll;
     use crate::CompatHost;
     use engine::Scene;
@@ -135,8 +140,9 @@ mod tests {
         engine: Box<Tjs2Engine>,
         /// Kept alive for the host's raw pointer; never read directly.
         _scene: Box<Scene>,
-        /// Kept alive for the host's raw pointer; never read directly.
-        _timer: Box<TimerState>,
+        /// The attached registry; tests move its injected time directly so a
+        /// poll never depends on the wall clock.
+        timer: RefCell<Box<TimerState>>,
     }
 
     impl Env {
@@ -157,8 +163,14 @@ mod tests {
                 host,
                 engine,
                 _scene: scene,
-                _timer: timer,
+                timer: RefCell::new(timer),
             }
+        }
+
+        /// Move the attached registry's injected time forward by `ms`.
+        fn advance(&self, ms: u64) {
+            let mut timer = self.timer.borrow_mut();
+            timer.now_ms = timer.now_ms.saturating_add(ms);
         }
 
         fn eval_int(&self, expression: &str) -> i64 {
@@ -183,16 +195,15 @@ mod tests {
             )
             .expect("define timer");
 
-        // `timer_poll` is the frame body's timer step; poll until the 1 ms
-        // timer has fired (it is enabled on the first poll, then due after
-        // the interval).
+        // `timer_poll` advances the attached registry to its injected
+        // `now_ms`; a virtual frame step is enough for the 1 ms timer.
         for _ in 0..200 {
+            env.advance(16);
             let mut ctx = env.host.ctx().expect("bound host");
             timer_poll(&mut ctx).expect("timer poll");
             if env.eval_int("hits") >= 1 {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(env.eval_int("hits") >= 1, "the timer callback never ran");
     }

@@ -11,11 +11,6 @@ struct Recorder {
 }
 
 impl FrameBody for Recorder {
-    fn timer_poll(&mut self, _ctx: &mut CompatCtx) -> Result<(), CompatError> {
-        self.order.push("timer");
-        Ok(())
-    }
-
     fn sound_poll(&mut self, _ctx: &mut CompatCtx) -> Result<(), CompatError> {
         self.order.push("sound");
         Ok(())
@@ -36,7 +31,7 @@ impl FrameBody for Recorder {
         Ok(())
     }
 
-    fn project_and_render(&mut self, _ctx: &mut CompatCtx) -> Result<(), CompatError> {
+    fn frame_tail(&mut self, _ctx: &mut CompatCtx) -> Result<(), CompatError> {
         self.order.push("present");
         Ok(())
     }
@@ -64,6 +59,6 @@ fn exec_eval_and_tick() {
 
     assert_eq!(
         recorder.order,
-        ["timer", "sound", "video", "async", "continuous", "present"]
+        ["sound", "video", "async", "continuous", "present"]
     );
 }

@@ -8,9 +8,9 @@
 
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::Duration;
 
 use api::media::{DecodedImage, ImageInfo};
 use compat::CompatHost;
@@ -44,7 +44,9 @@ pub struct Env {
     engine: Box<Tjs2Engine>,
     /// Read back by tests that assert on the L2 state a native write reached.
     pub scene: Box<Scene>,
-    _timer: Box<TimerState>,
+    /// The attached timer registry; tests move its injected time directly so a
+    /// poll never depends on the wall clock.
+    timer: RefCell<Box<TimerState>>,
     _input: Box<InputState>,
     _storage: Option<Box<Storage>>,
     _game_dir: Option<PathBuf>,
@@ -110,7 +112,7 @@ impl Env {
             _host: host,
             engine,
             scene,
-            _timer: timer,
+            timer: RefCell::new(timer),
             _input: input,
             _storage: storage,
             _game_dir: game_dir,
@@ -203,9 +205,20 @@ impl Env {
         );
     }
 
-    /// One frame-body `timer_poll` step; returns whether any timer remains
-    /// armed afterwards.
+    /// Move the attached timer registry's injected time forward by `ms`
+    /// without polling.
+    pub fn advance_time(&self, ms: u64) {
+        let mut timer = self.timer.borrow_mut();
+        timer.now_ms = timer.now_ms.saturating_add(ms);
+    }
+
+    /// One frame-body `timer_poll` step: advance the attached timer registry by
+    /// a virtual frame step, then deliver the due timers. Returns whether any
+    /// timer remains armed afterwards.
     pub fn poll_timer(&self) -> bool {
+        // One virtual frame step at the reference's ~60 fps.
+        const FRAME_STEP_MS: u64 = 16;
+        self.advance_time(FRAME_STEP_MS);
         let mut ctx = self._host.ctx().expect("bound compat context");
         compat::timer_poll(&mut ctx).expect("timer poll")
     }
@@ -283,9 +296,4 @@ pub fn unique_dir(prefix: &str) -> PathBuf {
             .as_nanos()
     ));
     path
-}
-
-/// Sleep helper for tests that poll a real-time L2 timer.
-pub fn sleep_ms(ms: u64) {
-    std::thread::sleep(Duration::from_millis(ms));
 }

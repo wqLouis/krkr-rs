@@ -236,7 +236,7 @@ struct DesktopApp {
 enum Running {
     /// An empty scene (no game).
     Empty(Box<Host>),
-    /// A real game: the L4 VM host plus the L2 render host.
+    /// A real game: the L4 VM host plus the L2 engine host.
     Game(Box<GameHost>),
 }
 

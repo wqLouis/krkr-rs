@@ -1,5 +1,10 @@
 //! The VM host: engine lifecycle, logging, script execution and the frame
 //! body.
+//!
+//! The engine, its scene, its frame clock and its input and timer state are L2
+//! state. The host owns only the C++ engine and the L3 surface; the
+//! composition root attaches the L2 service handles through
+//! [`VmHost::with_default_services`] before the surface is installed.
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, c_char, c_int, c_void};
@@ -7,8 +12,6 @@ use std::ptr;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use compat::{CompatHost, EventAdapter, FrameBody, PluginRegistry, run_frame_body};
-use engine::input::InputState;
-use engine::timer::TimerState;
 use platform::PlatformEvent;
 use tjs::{LOG_DEBUG, LOG_ERROR, LOG_INFO, LOG_WARN, Tjs2Engine, TjsValue};
 
@@ -33,8 +36,6 @@ pub struct FrameCtx<'a> {
 /// are ordered so the engine is dropped last: the dispatch state retains
 /// values whose `Drop` releases an id on the engine.
 pub struct VmHost {
-    input: Box<InputState>,
-    timer: Box<TimerState>,
     /// The L3 dispatch state. Declared before `engine` so its retained values
     /// are released first (fields drop in declaration order).
     compat: CompatHost,
@@ -367,27 +368,10 @@ impl VmHost {
                 (&mut *log_dedup) as *mut LogDedup as *mut c_void,
             )
         };
-        // The L2 services the natives compose are boxed so their addresses
-        // stay stable for the binding; the engine is declared last so it
-        // outlives every retained value.
-        let mut input = Box::new(InputState::new());
-        let mut timer = Box::new(TimerState::new());
         let mut compat = CompatHost::with_registry(registry);
         attach(compat.services_mut());
         compat.install(&engine)?;
-        // SAFETY: `input`/`timer` live for the whole `VmHost` and no reference to
-        // them escapes past its drop; the binding is removed first.
-        unsafe {
-            compat
-                .services_mut()
-                .attach_input(input.as_mut() as *mut InputState);
-            compat
-                .services_mut()
-                .attach_timer(timer.as_mut() as *mut TimerState);
-        }
         Ok(Self {
-            input,
-            timer,
             compat,
             adapter: EventAdapter::new(),
             log_dedup,
@@ -408,26 +392,6 @@ impl VmHost {
     /// The L3 compatibility host, mutably.
     pub fn compat_mut(&mut self) -> &mut CompatHost {
         &mut self.compat
-    }
-
-    /// The L2 input state the input natives read.
-    pub fn input(&self) -> &InputState {
-        &self.input
-    }
-
-    /// The L2 input state, mutably (the host may drive it directly).
-    pub fn input_mut(&mut self) -> &mut InputState {
-        &mut self.input
-    }
-
-    /// The L2 timer registry the `Timer` native composes.
-    pub fn timer(&self) -> &TimerState {
-        &self.timer
-    }
-
-    /// The L2 timer registry, mutably.
-    pub fn timer_mut(&mut self) -> &mut TimerState {
-        &mut self.timer
     }
 
     /// Execute a TJS script.

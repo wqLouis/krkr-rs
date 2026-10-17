@@ -69,8 +69,9 @@ struct TimerInst {
 /// priority flag (`TimerIntf.cpp:86-98`) and the event loop delivers the
 /// queued events later, exclusive first, then normal, then idle
 /// (`EventIntf.cpp:426-519`). This is the L3 half of that model: the L2
-/// callback enqueues one entry per fire, and [`timer_poll`] drains the queue
-/// after `advance` returns, ordering by the mode captured at fire time.
+/// callback enqueues one entry per fire, and [`timer_posts_poll`] drains the
+/// queue after the L2 registry advanced, ordering by the mode captured at
+/// fire time.
 ///
 /// A schedule write while the queue is draining cancels the timer's pending
 /// entries the way the reference's `CancelEvents` does, tracked by the
@@ -80,8 +81,8 @@ struct TimerInst {
 /// skips a cancelled entry.
 #[derive(Default)]
 struct TimerPosts {
-    /// Posts in fire order; [`timer_poll`] sorts a copy by priority before
-    /// delivery.
+    /// Posts in fire order; [`timer_posts_poll`] sorts a copy by priority
+    /// before delivery.
     pending: Vec<TimerPost>,
     /// Cancellation generation per timer. An absent entry is generation 0.
     generation: HashMap<TimerId, u64>,
@@ -770,7 +771,14 @@ extern "C" fn timer_interval_set(
     // (x86 yields `i64::MIN`); every in-range value — including `-1`,
     // which stores `2^64 - 65535` — converts identically.
     let units = ((requested * SUBMILLI_SCALE) + 0.5) as i64 as u64;
-    let now = services.state::<VisualState>().clock.now_ms();
+    let now = {
+        let Some(timer_ptr) = services.timer() else {
+            return report_error(out_error, "Timer.interval: timer registry is not attached");
+        };
+        // SAFETY: `attach_timer` guarantees the pointer stays valid; the read
+        // ends before the schedule sync borrows the registry mutably.
+        unsafe { &*timer_ptr }.now_ms
+    };
     {
         let mut state = services.state::<VisualState>();
         let Some(binding) = state.timers.get_mut(&id) else {
@@ -853,7 +861,14 @@ extern "C" fn timer_enabled_set(
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
-    let now = services.state::<VisualState>().clock.now_ms();
+    let now = {
+        let Some(timer_ptr) = services.timer() else {
+            return report_error(out_error, "Timer.enabled: timer registry is not attached");
+        };
+        // SAFETY: `attach_timer` guarantees the pointer stays valid; the read
+        // ends before the schedule sync borrows the registry mutably.
+        unsafe { &*timer_ptr }.now_ms
+    };
     {
         let mut state = services.state::<VisualState>();
         let Some(binding) = state.timers.get_mut(&id) else {
@@ -933,7 +948,14 @@ extern "C" fn timer_capacity_set(
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
-    let now = services.state::<VisualState>().clock.now_ms();
+    let now = {
+        let Some(timer_ptr) = services.timer() else {
+            return report_error(out_error, "Timer.capacity: timer registry is not attached");
+        };
+        // SAFETY: `attach_timer` guarantees the pointer stays valid; the read
+        // ends before the schedule sync borrows the registry mutably.
+        unsafe { &*timer_ptr }.now_ms
+    };
     {
         let mut state = services.state::<VisualState>();
         let Some(binding) = state.timers.get_mut(&id) else {
@@ -1000,43 +1022,71 @@ extern "C" fn timer_mode_set(
     0
 }
 
-/// Fire every due timer (`FrameBody::timer_poll`): advance the L2 registry
-/// to the clock's `now_ms` — its callbacks dispatch `onTimer` themselves
-/// (see [`timer_callback`]) — and return whether any timer remains **armed**
-/// (the `system::continuous_handler_poll` convention): a timer the script
-/// disabled or that the reference would never post (negative capacity,
-/// non-positive interval) does not keep the frame loop polling.
+/// Fire every due timer: advance the attached L2 registry to its own injected
+/// `now_ms` — its callbacks post the `onTimer` events (see [`timer_callback`]) —
+/// then drain those posts, and return whether any timer remains **armed** (the
+/// `system::continuous_handler_poll` convention): a timer the script disabled
+/// or that the reference would never post (negative capacity, non-positive
+/// interval) does not keep the frame loop polling.
+///
+/// The frame body does not call this: the L2 engine advances the timer
+/// registry before it runs, so [`timer_posts_poll`] already finds the posts
+/// here. This entry point stays for a host or test that drives the registry
+/// itself by writing [`TimerState::now_ms`]. Advancing at the registry's own
+/// `now_ms` delivers whatever is due and re-arms from it, so calling it twice
+/// at one timestamp delivers nothing the second time.
 ///
 /// Delivery failures inside the callbacks are logged by
 /// [`dispatch_on_timer`] and never disable the timer — the reference has no
 /// disable-on-error path in `TimerIntf.cpp`/`TimerImpl.cpp`.
 pub fn timer_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let host = unsafe { ctx.engine() };
-    // SAFETY: see above.
-    let services = unsafe { ctx.services() };
-    // The clock borrow ends at this statement — before any callback can
-    // re-enter `state::<VisualState>()`.
-    let now = services.state::<VisualState>().clock.now_ms();
-    let Some(timer_ptr) = services.timer() else {
+    let timer_ptr = unsafe { ctx.services() }.timer();
+    let Some(timer_ptr) = timer_ptr else {
         return Err(CompatError::Engine("timer registry is not attached".into()));
     };
-    // SAFETY: `attach_timer` guarantees the pointer stays valid; the
-    // callbacks invoked inside `advance` re-enter through the same handle
-    // strictly sequentially (the single-threaded attach contract).
+    // SAFETY: `attach_timer` guarantees the pointer stays valid; the read ends
+    // before `advance` borrows the registry mutably.
+    let now = unsafe { &*timer_ptr }.now_ms;
+    // SAFETY: the callbacks invoked inside `advance` re-enter through the same
+    // handle strictly sequentially (the single-threaded attach contract).
     let fired = unsafe { &mut *timer_ptr }.advance(now);
     if fired > 0 {
         log::trace!("timer_poll: {fired} timer(s) fired at {now}");
     }
-    // Deliver the `onTimer` postings the callbacks queued, ordering them the
-    // way the reference event queue does: exclusive before normal before idle
-    // (`EventIntf.cpp:426-519`). The queue is taken out whole, so a handler
-    // that posts again lands in the next poll rather than re-entering the VM
-    // mid-drain.
+    timer_posts_poll(ctx)?;
+    // L3 mirrors what it pushed to L2 (`TimerBinding::armed`).
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let any_armed = unsafe { ctx.services() }
+        .state::<VisualState>()
+        .timers
+        .values()
+        .any(|binding| binding.armed);
+    Ok(any_armed)
+}
+
+/// Deliver the `onTimer` postings queued since the last drain and return
+/// whether the queue held any.
+///
+/// The L2 registry's callbacks only enqueue; this is the L3 delivery step. The
+/// frame body runs it first, after L2 advanced the registry, so the events the
+/// advance produced are delivered in the frame that produced them. Ordering is
+/// the reference event queue's: exclusive before normal before idle
+/// (`EventIntf.cpp:426-519`). The queue is taken out whole, so a handler that
+/// posts again lands in the next drain rather than re-entering the VM
+/// mid-drain.
+pub fn timer_posts_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let host = unsafe { ctx.engine() };
+    // SAFETY: see above.
+    let services = unsafe { ctx.services() };
     let mut posts = {
         let mut queue = services.state::<TimerPosts>();
         std::mem::take(&mut queue.pending)
     };
+    if posts.is_empty() {
+        return Ok(false);
+    }
     posts.sort_by_key(|post| mode_priority(post.mode));
     for post in posts {
         if !timer_post_is_live(services, post.id, post.generation) {
@@ -1044,13 +1094,7 @@ pub fn timer_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
         }
         dispatch_on_timer(host, services, post.id);
     }
-    // L3 mirrors what it pushed to L2 (`TimerBinding::armed`).
-    let any_armed = services
-        .state::<VisualState>()
-        .timers
-        .values()
-        .any(|binding| binding.armed);
-    Ok(any_armed)
+    Ok(true)
 }
 
 pub(super) fn register_timer_class(ctx: &mut CompatCtx) -> Result<(), CompatError> {

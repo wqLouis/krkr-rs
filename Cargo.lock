@@ -2789,7 +2789,6 @@ name = "vm"
 version = "1.0.0"
 dependencies = [
  "compat",
- "engine",
  "log",
  "platform",
  "testkit",

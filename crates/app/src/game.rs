@@ -1,12 +1,13 @@
 //! Real-game frontend: mount an explicit archive list, run the L2 startup
 //! sequence through the L4 VM host, and drive the VM frame body together with
-//! the L2 render host.
+//! the L2 engine frame.
 //!
 //! Loading is explicit: the caller
 //! supplies the `--archive` list and base directory; nothing scans a folder
 //! for `*.xp3` or `startup.tjs`. [`GameHost`] is the composition-root
 //! counterpart of the empty-scene [`Host`]: it adds the VM host, the mounted
-//! game [`Storage`] and the ordered frame body.
+//! game [`Storage`] and the ordered frame body, which it runs inside the
+//! engine's frame hook.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -14,8 +15,10 @@ use std::time::{Duration, Instant};
 use api::error::FsError;
 use api::fs::FsPath;
 use compat::{CompatCtx, CompatError, FrameBody};
-use engine::Storage;
+use engine::input::InputState;
 use engine::storage::{MountOptions, StartupPlan, StorageReadError};
+use engine::timer::TimerState;
+use engine::{GameFrame, Storage};
 use fs::{FileSystem, list};
 use platform::{FramePacing, PlatformError, PlatformEvent};
 use vm::{FrameCtx, VmHost};
@@ -73,16 +76,15 @@ pub enum GameError {
 /// Per-frame wall-clock costs, in milliseconds, recorded by the frame body.
 ///
 /// The fields are overwritten by each poll's completion hook, so one instance
-/// describes exactly one frame. [`FramePhases::body_ms`] is the sum of the six
-/// poll phases; the render host's own costs are not part of it.
+/// describes exactly one frame. [`FramePhases::body_ms`] is the sum of the five
+/// poll phases; the engine's own costs are not part of it.
 #[derive(Clone, Copy, Default)]
 struct FramePhases {
-    timer_ms: f64,
     sound_ms: f64,
     video_ms: f64,
     async_trigger_ms: f64,
     continuous_handler_ms: f64,
-    project_and_render_ms: f64,
+    frame_tail_ms: f64,
     body_ms: f64,
 }
 
@@ -128,10 +130,6 @@ struct Polls {
 }
 
 impl FrameBody for Polls {
-    fn timer_poll(&mut self, ctx: &mut CompatCtx) -> Result<(), CompatError> {
-        compat::timer_poll(ctx).map(|_fired| ())
-    }
-
     fn sound_poll(&mut self, ctx: &mut CompatCtx) -> Result<(), CompatError> {
         compat::sound_poll(ctx)
     }
@@ -149,24 +147,20 @@ impl FrameBody for Polls {
     }
 
     #[allow(unsafe_code)]
-    fn project_and_render(&mut self, ctx: &mut CompatCtx) -> Result<(), CompatError> {
+    fn frame_tail(&mut self, ctx: &mut CompatCtx) -> Result<(), CompatError> {
         // The movie frame body advances its overlays and copies the current
         // frame into the layer before the transition step composites it
         // (reference `layerExMovie::OnContinuousCallback`).
         compat::movie_poll(ctx, self.dt_ms)?;
         // The frame body owns the per-frame transition step; the remaining
-        // hand-offs are host drains that the render host consumes after this
-        // poll returns.
+        // hand-offs are host drains the engine frame consumes after this poll
+        // returns.
         compat::advance_transitions(ctx, self.dt_ms).map_err(CompatError::Engine)?;
         // SAFETY: `ctx` is bound to a live engine for the callback.
         let _ = compat::take_bring_to_front_requests(unsafe { ctx.services() });
         let _ = compat::take_update_requests(unsafe { ctx.services() });
         let _ = compat::take_capture_releases(ctx);
         Ok(())
-    }
-
-    fn timer_completed(&mut self, elapsed: Duration) {
-        FramePhases::record(&mut self.phases.timer_ms, &mut self.phases.body_ms, elapsed);
     }
 
     fn sound_completed(&mut self, elapsed: Duration) {
@@ -193,9 +187,9 @@ impl FrameBody for Polls {
         );
     }
 
-    fn project_and_render_completed(&mut self, elapsed: Duration) {
+    fn frame_tail_completed(&mut self, elapsed: Duration) {
         FramePhases::record(
-            &mut self.phases.project_and_render_ms,
+            &mut self.phases.frame_tail_ms,
             &mut self.phases.body_ms,
             elapsed,
         );
@@ -233,7 +227,7 @@ struct FrameAttribution {
     timings: Option<render::FrameTimings>,
     /// The previous frame's audio drain cost.
     audio_ms: f64,
-    /// The previous frame's whole `Host::step` cost.
+    /// The previous frame's engine frame cost, excluding the frame hook.
     host_ms: f64,
     /// The previous frame's whole wall-clock cost.
     total_ms: f64,
@@ -272,8 +266,8 @@ impl FrameAttribution {
     /// measurement; `unaccounted` is `gap - previous total - platform wait`,
     /// so a non-zero value is loop overhead or a stall outside both the
     /// frame and the event poll. `tick_residual` is the VM tick not covered
-    /// by the input segments and the six polls; `host_residual` is the
-    /// host step not covered by sync/project/render.
+    /// by the input segments and the five polls; `host_residual` is the
+    /// engine frame not covered by sync/project/render.
     fn slow_frame_line(&self, gap_ms: f64, pacing: FramePacing) -> Option<String> {
         if !self.valid || gap_ms < SLOW_FRAME_MS {
             return None;
@@ -288,8 +282,8 @@ impl FrameAttribution {
         Some(format!(
             "frame {} slow: gap={gap_ms:.1} ms since the previous frame; \
              the gap spans the previous frame, so these are its phases: \
-             timer={:.1} sound={:.1} video={:.1} async={:.1} continuous={:.1} \
-             project_and_render={:.1} body={:.1}; its vm: tick={:.1} \
+             sound={:.1} video={:.1} async={:.1} continuous={:.1} \
+             frame_tail={:.1} body={:.1}; its vm: tick={:.1} \
              input_begin={:.1} input_events={:.1} input_end={:.1} \
              tick_residual={tick_residual:.1}; its host: host_total={:.1} \
              audio={:.1} host_sync={:.1} sync_upload={:.1} sync_prune={:.1} \
@@ -298,12 +292,11 @@ impl FrameAttribution {
              present={:.1} recreate={:.1} fence_wait={:.1}; this wait: \
              platform_wait={:.1} input={:.1} unaccounted={unaccounted:.1} ms",
             report.frame_index,
-            phases.timer_ms,
             phases.sound_ms,
             phases.video_ms,
             phases.async_trigger_ms,
             phases.continuous_handler_ms,
-            phases.project_and_render_ms,
+            phases.frame_tail_ms,
             phases.body_ms,
             tick.tick_ms,
             tick.input_begin_ms,
@@ -328,29 +321,28 @@ impl FrameAttribution {
     }
 }
 
-/// A running game: the L4 VM host bound to the render host's scene and the
-/// mounted game storage.
+/// A running game: the L4 VM host bound to the engine's scene and timer, and
+/// the mounted game storage.
 ///
 /// Field order is load-bearing. `audio` is declared first so the L1 device is
 /// stopped (its state drop stops the stream) **before** the VM dies; the VM
 /// then holds raw pointers to the [`Storage`] and to the
-/// [`Scene`](engine::Scene) inside `host`, so `vm` is declared before its
-/// targets, and the [`Host`] is boxed so its address (and thus the scene
-/// pointer) is stable across the move into this struct.
+/// [`Scene`](engine::Scene), [`TimerState`] and [`InputState`] behind it, so
+/// `vm` is declared before its targets, and the [`Host`] is boxed so its
+/// address (and thus the engine's) is stable across the move into this
+/// struct.
 pub struct GameHost {
     /// The L1 audio device drained to the L3 mixer once per frame; dropped
     /// first, so the stream stops before the engine tears down.
     audio: AudioOutput,
-    /// The L4 VM host, bound to `storage` and `host.scene`.
+    /// The L4 VM host, bound to `storage` and the engine services.
     vm: VmHost,
     /// The mounted game archives, read by the `Storages` natives.
     storage: Box<Storage>,
-    /// The L2 render host, boxed for a stable scene address.
+    /// The L2 engine host, boxed for a stable scene/timer/input address.
     host: Box<Host>,
     /// The ordered frame body.
     polls: Polls,
-    /// Monotonic frame clock fed to the VM frame body.
-    now_ms: u64,
     /// Wall-clock instant the open sequence started.
     open_start: Instant,
     /// The previous frame's measured attribution, reported when the next gap
@@ -360,10 +352,54 @@ pub struct GameHost {
     first_frame_logged: bool,
 }
 
+/// The engine's frame hook for a running game: the VM tick, the audio drain it
+/// feeds, and the ordered polls.
+///
+/// [`Engine::step`](engine::Engine::step) calls it after firing the due timers
+/// and before projecting and drawing, so the scene the VM left behind is the
+/// one the frame presents.
+struct VmHook<'a> {
+    /// The VM host whose frame body runs.
+    vm: &'a mut VmHost,
+    /// The audio device drained from the mixer after the VM tick.
+    audio: &'a mut AudioOutput,
+    /// Platform events delivered to script this frame.
+    events: &'a [PlatformEvent],
+    /// The ordered frame body and its per-frame cost record.
+    polls: &'a mut Polls,
+    /// Wall-clock cost of the whole hook, in milliseconds.
+    hook_ms: f64,
+    /// Wall-clock cost of the audio drain, in milliseconds.
+    audio_ms: f64,
+}
+
+impl GameFrame for VmHook<'_> {
+    fn before_render(&mut self, now_ms: u64, dt_ms: f64) -> Result<(), String> {
+        let hook_started = Instant::now();
+        self.polls.dt_ms = dt_ms;
+        let frame = FrameCtx {
+            now_ms,
+            dt_ms: dt_ms as u32,
+            body: &mut *self.polls,
+            events: self.events,
+        };
+        let vm_started = Instant::now();
+        self.vm.tick(frame).map_err(|error| error.to_string())?;
+        self.polls.tick.tick_ms = vm_started.elapsed().as_secs_f64() * 1000.0;
+        let audio_started = Instant::now();
+        self.audio
+            .pump(self.vm, dt_ms)
+            .map_err(|error| error.to_string())?;
+        self.audio_ms = audio_started.elapsed().as_secs_f64() * 1000.0;
+        self.hook_ms = hook_started.elapsed().as_secs_f64() * 1000.0;
+        Ok(())
+    }
+}
+
 impl GameHost {
-    /// Mounts `archives` in order (later archives win), binds the VM to
-    /// `host`'s scene and the storage, installs the L1 codec seams, and runs
-    /// the L2 startup sequence.
+    /// Mounts `archives` in order (later archives win), binds the VM to the
+    /// engine's scene and timer, to the L2 input state and to the storage,
+    /// installs the L1 codec seams, and runs the L2 startup sequence.
     ///
     /// `base_dir` is the app path (loose files, `patch.tjs`,
     /// `AfterStartup.tjs`). Every mounted archive keeps its file open and is
@@ -441,15 +477,19 @@ impl GameHost {
         let mount_time = mount_started.elapsed();
         let scene_ptr = host.scene_mut() as *mut engine::Scene;
         let storage_ptr = storage.as_ref() as *const Storage as *mut Storage;
+        let timer_ptr = host.engine_mut().timer_mut() as *mut TimerState;
+        let input_ptr = host.engine_mut().input_mut() as *mut InputState;
         // SAFETY: `storage` and `host` are declared after `vm` in the returned
-        // struct and therefore outlive it; the boxed `host` keeps the scene
-        // address stable, and nothing else aliases either value while the
-        // binding is installed. Attaching before the compat surface is
-        // installed lets a registration-time service read (the `xp3filter`
-        // `xp3filter.tjs` read) see the mounted archives.
+        // struct and therefore outlive it; the boxed `host` keeps the engine's
+        // scene, timer and input addresses stable, and nothing else aliases
+        // any of them while the binding is installed. Attaching before the
+        // compat surface is installed lets a registration-time service read
+        // (the `xp3filter` `xp3filter.tjs` read) see the mounted archives.
         let vm = VmHost::with_default_services(|services| unsafe {
             services.attach_scene(scene_ptr);
             services.attach_storage(storage_ptr);
+            services.attach_timer(timer_ptr);
+            services.attach_input(input_ptr);
         })?;
 
         // Install the seams the compat natives compose: the L1 codecs and the
@@ -506,19 +546,18 @@ impl GameHost {
             storage,
             host,
             polls: Polls::default(),
-            now_ms: 0,
             open_start,
             last_frame: FrameAttribution::default(),
             first_frame_logged: false,
         })
     }
 
-    /// The L2 render host.
+    /// The L2 engine host.
     pub fn host(&self) -> &Host {
         &self.host
     }
 
-    /// The L2 render host, mutably (the platform loop resizes it).
+    /// The L2 engine host, mutably (the platform loop resizes it).
     pub fn host_mut(&mut self) -> &mut Host {
         &mut self.host
     }
@@ -539,21 +578,24 @@ impl GameHost {
         &self.vm
     }
 
-    /// Runs one frame: the VM frame body (events, polls, transitions), then
-    /// renders and presents.
+    /// Runs one frame: the engine frame with the VM frame body (events, polls,
+    /// transitions) as its upward hook, then the projection and the draw.
     ///
-    /// The L1 audio drain runs between the two: after `tick` a dt-derived
-    /// chunk of the mixer is rendered through `compat::sound_render` (which
-    /// advances the mixer by the frames it produces) and written to the
-    /// device (policy documented in the `audio` module).
+    /// The engine fires the due timers before the hook and projects and draws
+    /// after it, so the scene the VM left behind is the frame that presents.
+    /// The L1 audio drain runs inside the hook, right after `tick`: a
+    /// dt-derived chunk of the mixer is rendered through
+    /// `compat::sound_render` (which advances the mixer by the frames it
+    /// produces) and written to the device (policy documented in the `audio`
+    /// module).
     ///
     /// # Errors
     ///
     /// Returns [`GameError`] when the VM frame body fails, when the audio
     /// pump cannot reach the bound compat context or the device rejects a
-    /// write, or when the render action fails.
+    /// write, or when a render action fails.
     ///
-    /// Returns the L1 [`StepReport`] so a headless run can print the draw
+    /// Returns the engine [`StepReport`] so a headless run can print the draw
     /// counters (they exist on the null backend only, see [`StepReport::stats`]);
     /// the windowed loop ignores them.
     pub fn step(&mut self, dt_ms: f32, events: &[PlatformEvent]) -> Result<StepReport, GameError> {
@@ -584,27 +626,26 @@ impl GameHost {
         if let Some(line) = self.last_frame.slow_frame_line(dt, pacing) {
             log::warn!("{line}");
         }
-        self.polls.dt_ms = dt;
         self.polls.phases = FramePhases::default();
         self.polls.tick = TickPhases::default();
-        self.now_ms = self.now_ms.saturating_add(dt as u64);
-        let frame = FrameCtx {
-            now_ms: self.now_ms,
-            dt_ms: dt as u32,
-            body: &mut self.polls,
-            events,
-        };
+
         let step_started = Instant::now();
-        let vm_started = Instant::now();
-        self.vm.tick(frame)?;
-        self.polls.tick.tick_ms = vm_started.elapsed().as_secs_f64() * 1000.0;
-        let audio_started = Instant::now();
-        self.audio.pump(&self.vm, dt)?;
-        let audio_ms = audio_started.elapsed().as_secs_f64() * 1000.0;
-        let host_started = Instant::now();
-        let report = self.host.step(dt_ms)?;
-        let host_ms = host_started.elapsed().as_secs_f64() * 1000.0;
+        let (report, hook_ms, audio_ms) = {
+            let mut hook = VmHook {
+                vm: &mut self.vm,
+                audio: &mut self.audio,
+                events,
+                polls: &mut self.polls,
+                hook_ms: 0.0,
+                audio_ms: 0.0,
+            };
+            let report = self.host.step_with_frame(dt_ms, &mut hook)?;
+            (report, hook.hook_ms, hook.audio_ms)
+        };
         let total_ms = step_started.elapsed().as_secs_f64() * 1000.0;
+        // The engine frame's own cost: the whole step minus the upward hook it
+        // ran (the VM tick and the audio drain are attributed separately).
+        let host_ms = total_ms - hook_ms;
 
         self.last_frame.record(
             self.polls.phases,
@@ -874,12 +915,12 @@ mod tests {
     }
 
     /// Builds a valid attribution for `frame` whose body spent `body_ms` in
-    /// the `project_and_render` phase.
+    /// the `frame_tail` phase.
     fn attribution_for(frame: u64, body_ms: f64, host_render_ms: f64) -> FrameAttribution {
         let mut attribution = FrameAttribution::default();
         attribution.record(
             FramePhases {
-                project_and_render_ms: body_ms,
+                frame_tail_ms: body_ms,
                 body_ms,
                 ..FramePhases::default()
             },
@@ -952,10 +993,7 @@ mod tests {
             .expect("slow gap emits a line");
 
         assert!(line.contains("frame 7 slow"), "line was: {line}");
-        assert!(
-            line.contains("project_and_render=480.0"),
-            "line was: {line}"
-        );
+        assert!(line.contains("frame_tail=480.0"), "line was: {line}");
         assert!(line.contains("body=480.0"), "line was: {line}");
         assert!(line.contains("tick=487.5"), "line was: {line}");
         assert!(line.contains("input_begin=1.0"), "line was: {line}");
@@ -993,7 +1031,7 @@ mod tests {
 
         attribution.record(
             FramePhases {
-                timer_ms: 250.0,
+                frame_tail_ms: 250.0,
                 body_ms: 250.0,
                 ..FramePhases::default()
             },
@@ -1014,7 +1052,7 @@ mod tests {
             .slow_frame_line(320.0, FramePacing::default())
             .expect("second slow line");
         assert!(second.contains("frame 8 slow"), "line was: {second}");
-        assert!(second.contains("timer=250.0"), "line was: {second}");
+        assert!(second.contains("frame_tail=250.0"), "line was: {second}");
         assert!(!second.contains("frame 7"), "line was: {second}");
     }
 
@@ -1115,6 +1153,52 @@ mod tests {
             game.storage().xp3_extraction_filter.is_some(),
             "GameHost::open must leave the xp3 filter seam installed"
         );
+        drop(game);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// One `step` is one engine frame: the timer registry advances with the
+    /// frame clock, the game's hook (the VM frame body) delivers what fired,
+    /// and the scene is drawn afterwards. The script counter therefore advances
+    /// only because `Engine::step` ran the app's hook.
+    ///
+    /// The reference fires a timer whose deadline the frame tick passed
+    /// (`reference/cpp/core/utils/impl/TimerImpl.cpp:110-143`) and runs the
+    /// per-frame update hook before `drawScene`
+    /// (`reference/cpp/core/environ/RenderUtils.h:13-24`).
+    #[test]
+    fn step_runs_the_game_hook_inside_the_engine_frame() {
+        let _lock = vm_lock();
+        let base = unique_temp_dir("frame-hook");
+        std::fs::create_dir_all(&base).expect("game dir");
+        std::fs::write(
+            base.join("startup.tjs"),
+            "var fired = 0;\n\
+             var ticker = new Timer(function() { fired++; }, '');\n\
+             ticker.interval = 1;\n\
+             ticker.enabled = 1;\n",
+        )
+        .expect("startup script");
+        let host = crate::Host::new(crate::HostConfig::headless()).expect("headless host");
+        let mut game = GameHost::open(host, Vec::new(), base.clone()).expect("open game");
+
+        fn fired(game: &GameHost) -> i64 {
+            match game.vm().eval("fired", "t").expect("eval `fired`") {
+                tjs::TjsValue::Integer(value) => value,
+                other => panic!("expected Integer for `fired`, got {other:?}"),
+            }
+        }
+
+        assert_eq!(fired(&game), 0, "no frame has run yet");
+        for _ in 0..3 {
+            game.step(16.0, &[]).expect("step");
+        }
+        assert!(
+            fired(&game) >= 1,
+            "the engine frame must run the hook that delivers the fired timer"
+        );
+        assert_eq!(game.host().frame_index(), 3);
+
         drop(game);
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -12,10 +12,10 @@
 //!   taken as correct; divergences are attributed to
 //!   `crates/compat/src/natives/visual/timer.rs` (L3 glue) or
 //!   `crates/engine/src/timer.rs` (L2 registry).
-//! * Time is driven with short real intervals (10–50 ms) plus
-//!   [`std::thread::sleep`]; the registry is advanced by calling the
-//!   exported [`compat::timer_poll`] directly — no frame loop. Every test
-//!   stays well under a second.
+//! * Time is virtual: each test moves the attached registry's injected
+//!   `now_ms` forward by an explicit step and then calls the exported
+//!   [`compat::timer_poll`], which advances the registry at that timestamp
+//!   and drains the `onTimer` posts — no frame loop and no wall-clock wait.
 //! * One [`Env`] (engine + host + attached timer registry) per test,
 //!   serialized through [`common::vm_lock`].
 //!
@@ -27,7 +27,7 @@
 
 mod common;
 
-use std::time::{Duration, Instant};
+use std::cell::RefCell;
 
 use common::vm_lock;
 use compat::{CompatHost, timer_poll};
@@ -45,8 +45,9 @@ const SCRIPT: &str = "timer-behavior-test";
 struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
-    /// Kept alive for the host's raw pointer; never read directly.
-    _timer: Box<TimerState>,
+    /// The attached registry; tests move its injected time directly so a poll
+    /// never depends on the wall clock.
+    timer: RefCell<Box<TimerState>>,
 }
 
 impl Env {
@@ -64,7 +65,7 @@ impl Env {
         Env {
             _host: host,
             engine,
-            _timer: timer,
+            timer: RefCell::new(timer),
         }
     }
 
@@ -112,28 +113,30 @@ impl Env {
             .map_err(|error| error.to_string())
     }
 
-    /// One frame-body `timer_poll` step; returns the registry's
-    /// "any timer still enabled" reading.
+    /// One frame-body `timer_poll` step at the current injected time; returns
+    /// the registry's "any timer still enabled" reading.
     fn poll(&self) -> bool {
         let mut ctx = self._host.ctx().expect("bound host");
         timer_poll(&mut ctx).expect("timer poll")
     }
 
-    /// Poll every `step_ms` until `total_ms` of real time elapsed; returns
-    /// the last poll's reading.
+    /// Move the attached registry's injected time forward by `ms` without
+    /// polling, so a schedule write lands on this timestamp.
+    fn advance(&self, ms: u64) {
+        let mut timer = self.timer.borrow_mut();
+        timer.now_ms = timer.now_ms.saturating_add(ms);
+    }
+
+    /// Advance `total_ms` of virtual time in `step_ms` polls; returns the last
+    /// poll's reading.
     fn poll_for(&self, total_ms: u64, step_ms: u64) -> bool {
-        let deadline = Instant::now() + Duration::from_millis(total_ms);
         let mut last = false;
-        while Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(step_ms));
+        for _ in 0..(total_ms / step_ms) {
+            self.advance(step_ms);
             last = self.poll();
         }
         last
     }
-}
-
-fn sleep_ms(ms: u64) {
-    std::thread::sleep(Duration::from_millis(ms));
 }
 
 /// Record a mismatch of `observed` against the reference `expected`.
@@ -586,9 +589,9 @@ fn interval_change_rearms_an_enabled_timer_from_now() {
     );
     // Let the original deadline (now + 40) pass without polling, then move
     // the interval. If the old deadline were kept, the next poll would fire.
-    sleep_ms(65);
+    env.advance(65);
     env.run("rt.interval = 40;");
-    sleep_ms(15);
+    env.advance(15);
     env.poll();
     check(
         &mut problems,
@@ -596,7 +599,7 @@ fn interval_change_rearms_an_enabled_timer_from_now() {
         env.eval_int("rhits"),
         0,
     );
-    sleep_ms(40);
+    env.advance(40);
     env.poll();
     check(
         &mut problems,
@@ -637,7 +640,7 @@ fn enabled_arms_from_now_and_disabling_cancels_pending_fires() {
     );
 
     // Armed at now + 80: no fire halfway, fire after the deadline.
-    sleep_ms(30);
+    env.advance(30);
     env.poll();
     check(
         &mut problems,
@@ -645,7 +648,7 @@ fn enabled_arms_from_now_and_disabling_cancels_pending_fires() {
         env.eval_int("ehits"),
         0,
     );
-    sleep_ms(60);
+    env.advance(60);
     env.poll();
     check(
         &mut problems,
@@ -657,7 +660,7 @@ fn enabled_arms_from_now_and_disabling_cancels_pending_fires() {
     // Disabling cancels the (virtual) queued event: a passed deadline while
     // disabled must not deliver.
     env.run("et.enabled = false;");
-    sleep_ms(100);
+    env.advance(100);
     env.poll();
     check(
         &mut problems,
@@ -674,7 +677,7 @@ fn enabled_arms_from_now_and_disabling_cancels_pending_fires() {
 
     // Re-enabling re-arms from now, not from the stale deadline.
     env.run("et.enabled = true;");
-    sleep_ms(50);
+    env.advance(50);
     env.poll();
     check(
         &mut problems,
@@ -682,7 +685,7 @@ fn enabled_arms_from_now_and_disabling_cancels_pending_fires() {
         env.eval_int("ehits"),
         1,
     );
-    sleep_ms(40);
+    env.advance(40);
     env.poll();
     check(
         &mut problems,
@@ -978,14 +981,14 @@ fn a_plain_timer_invokes_its_constructor_callback_on_fire() {
          t.interval = 25; \
          t.enabled = true;",
     );
-    sleep_ms(60);
+    env.advance(60);
     env.poll();
     let hits = env.eval_int("hits");
     assert!(
         hits >= 1,
         "the constructor callback never ran (observed {hits} fires)"
     );
-    sleep_ms(50);
+    env.advance(50);
     env.poll();
     assert!(
         env.eval_int("hits") > hits,
@@ -1029,9 +1032,9 @@ fn subclass_on_timer_override_wins_and_replaces_the_ctor_callback() {
     );
 
     env.run("mt.interval = 25; mt.enabled = true;");
-    sleep_ms(60);
+    env.advance(60);
     env.poll();
-    sleep_ms(40);
+    env.advance(40);
     env.poll();
     check(
         &mut problems,
@@ -1083,9 +1086,11 @@ fn override_disabling_itself_stops_firing_and_cancel_does_not_exist() {
          t2.interval = 25; \
          t2.enabled = true;",
     );
-    let deadline = Instant::now() + Duration::from_millis(400);
-    while env.eval_int("ovHits") == 0 && Instant::now() < deadline {
-        sleep_ms(5);
+    for _ in 0..80 {
+        if env.eval_int("ovHits") != 0 {
+            break;
+        }
+        env.advance(5);
         env.poll();
     }
     check(
@@ -1196,7 +1201,7 @@ fn a_callback_that_invalidates_itself_stops_dispatching() {
          st.interval = 20; \
          st.enabled = true;",
     );
-    sleep_ms(40);
+    env.advance(40);
     env.poll();
     check(
         &mut problems,
@@ -1212,9 +1217,9 @@ fn a_callback_that_invalidates_itself_stops_dispatching() {
         false,
     );
 
-    sleep_ms(30);
+    env.advance(30);
     env.poll();
-    sleep_ms(30);
+    env.advance(30);
     env.poll();
     check(
         &mut problems,
@@ -1314,9 +1319,9 @@ fn invalidate_removes_the_timer_from_the_registry() {
     );
 
     // No late fire: the dispatch handles are gone in both implementations.
-    sleep_ms(70);
+    env.advance(70);
     env.poll();
-    sleep_ms(40);
+    env.advance(40);
     env.poll();
     check(
         &mut problems,
@@ -1368,7 +1373,7 @@ fn simultaneous_timers_fire_in_creation_order() {
          ta.interval = 30; tb.interval = 30; tc.interval = 30; \
          ta.enabled = true; tb.enabled = true; tc.enabled = true;",
     );
-    sleep_ms(45);
+    env.advance(45);
     env.poll();
 
     assert_eq!(
@@ -1403,7 +1408,7 @@ fn a_peer_disabled_from_a_callback_is_cancelled_before_it_fires() {
          pa.interval = 20; pb.interval = 20; \
          pa.enabled = true; pb.enabled = true;",
     );
-    sleep_ms(35);
+    env.advance(35);
     env.poll();
     check(
         &mut problems,
@@ -1419,7 +1424,7 @@ fn a_peer_disabled_from_a_callback_is_cancelled_before_it_fires() {
         0,
     );
 
-    sleep_ms(40);
+    env.advance(40);
     env.poll();
     check(
         &mut problems,
@@ -1588,7 +1593,7 @@ fn engine_driven_fire_delivers_type_target_and_this() {
          probeTimer.interval = 10; \
          probeTimer.enabled = true;",
     );
-    sleep_ms(30);
+    env.advance(30);
     env.poll();
 
     check(&mut problems, "action invocations", env.eval_int("hits"), 1);
@@ -1639,7 +1644,7 @@ fn engine_driven_fire_is_delivered_exclusive_before_idle() {
          idleTimer.enabled = true; \
          exclusiveTimer.enabled = true;",
     );
-    sleep_ms(30);
+    env.advance(30);
     env.poll();
 
     check(
@@ -1680,9 +1685,9 @@ fn self_disabling_action_is_invoked_once() {
          t.interval = 10; \
          t.enabled = true;",
     );
-    sleep_ms(30);
+    env.advance(30);
     env.poll();
-    sleep_ms(30);
+    env.advance(30);
     env.poll();
 
     assert_eq!(

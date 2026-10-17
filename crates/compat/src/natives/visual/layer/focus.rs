@@ -706,7 +706,7 @@ fn push_capture(ctx: &CompatCtx, id: u32, contact: Option<u64>) {
 }
 
 /// Drain the queued capture-release requests (the frame body's
-/// `project_and_render` step calls this). Returns `(mouse_releases,
+/// `frame_tail` step calls this). Returns `(mouse_releases,
 /// touch_releases)`.
 pub fn take_capture_releases(ctx: &CompatCtx) -> (Vec<u32>, Vec<(u32, Option<u64>)>) {
     // SAFETY: the caller resolved `ctx` from the installed binding.

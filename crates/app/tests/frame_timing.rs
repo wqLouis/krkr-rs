@@ -2,8 +2,8 @@
 //! consistent.
 //!
 //! The device cannot be measured here, so the test drives the real
-//! [`run_frame_body`] with a body whose timer poll sleeps a known amount and
-//! checks that the reported timer cost dominates, that every phase is
+//! [`run_frame_body`] with a body whose sound poll sleeps a known amount and
+//! checks that the reported sound cost dominates, that every phase is
 //! reported, and that the wall-clock total that contains all of them is at
 //! least their sum. It then drives a real [`VmHost::tick`] to prove the input
 //! segments report before the ordered polls. This is instrumentation
@@ -12,28 +12,26 @@
 use std::time::{Duration, Instant};
 
 use compat::{CompatCtx, CompatError, FrameBody, run_frame_body};
+use engine::input::InputState;
+use engine::timer::TimerState;
 use vm::{FrameCtx, VmHost};
 
-/// A frame body that records every phase completion and can make the timer
+/// A frame body that records every phase completion and can make the sound
 /// phase deliberately slow.
 #[derive(Default)]
 struct RecordingBody {
-    /// Whether `timer_poll` sleeps before returning.
-    slow_timer: bool,
+    /// Whether `sound_poll` sleeps before returning.
+    slow_sound: bool,
     /// `(phase name, reported duration)` in completion order.
     phases: Vec<(&'static str, Duration)>,
 }
 
 impl FrameBody for RecordingBody {
-    fn timer_poll(&mut self, _ctx: &mut CompatCtx) -> Result<(), CompatError> {
-        if self.slow_timer {
+    fn sound_poll(&mut self, _ctx: &mut CompatCtx) -> Result<(), CompatError> {
+        if self.slow_sound {
             std::thread::sleep(Duration::from_millis(25));
         }
         Ok(())
-    }
-
-    fn timer_completed(&mut self, elapsed: Duration) {
-        self.phases.push(("timer", elapsed));
     }
 
     fn sound_completed(&mut self, elapsed: Duration) {
@@ -52,8 +50,8 @@ impl FrameBody for RecordingBody {
         self.phases.push(("continuous_handler", elapsed));
     }
 
-    fn project_and_render_completed(&mut self, elapsed: Duration) {
-        self.phases.push(("project_and_render", elapsed));
+    fn frame_tail_completed(&mut self, elapsed: Duration) {
+        self.phases.push(("frame_tail", elapsed));
     }
 
     fn input_begin_completed(&mut self, elapsed: Duration) {
@@ -69,12 +67,29 @@ impl FrameBody for RecordingBody {
     }
 }
 
+/// Creates a VM host with the input and timer registries attached, as the
+/// running game attaches them.
+fn vm_host() -> (VmHost, Box<InputState>, Box<TimerState>) {
+    let mut input = Box::new(InputState::new());
+    let mut timer = Box::new(TimerState::new());
+    let host = VmHost::with_default_services(|services| {
+        // SAFETY: both boxes outlive the host in the caller's return value, and
+        // nothing else aliases them while the binding is installed.
+        unsafe {
+            services.attach_input(input.as_mut() as *mut InputState);
+            services.attach_timer(timer.as_mut() as *mut TimerState);
+        }
+    })
+    .expect("vm host");
+    (host, input, timer)
+}
+
 #[test]
 fn slow_phase_dominates_and_the_wall_total_contains_the_sum() {
-    let mut host = VmHost::with_default().expect("vm host");
+    let (mut host, _input, _timer) = vm_host();
     let mut ctx = host.compat().ctx().expect("bound compat context");
     let mut body = RecordingBody {
-        slow_timer: true,
+        slow_sound: true,
         phases: Vec::new(),
     };
 
@@ -86,26 +101,25 @@ fn slow_phase_dominates_and_the_wall_total_contains_the_sum() {
     assert_eq!(
         names,
         vec![
-            "timer",
             "sound",
             "video",
             "async_trigger",
             "continuous_handler",
-            "project_and_render",
+            "frame_tail",
         ],
         "every phase is reported, in the documented order"
     );
 
     let sum: Duration = body.phases.iter().map(|(_, elapsed)| *elapsed).sum();
-    let timer = body.phases[0].1;
+    let sound = body.phases[0].1;
     assert!(
-        timer >= Duration::from_millis(20),
-        "the slow timer phase must report its sleep, got {timer:?}"
+        sound >= Duration::from_millis(20),
+        "the slow sound phase must report its sleep, got {sound:?}"
     );
     for (name, elapsed) in &body.phases[1..] {
         assert!(
-            *elapsed < timer,
-            "the slow timer phase must dominate {name} ({elapsed:?})"
+            *elapsed < sound,
+            "the slow sound phase must dominate {name} ({elapsed:?})"
         );
     }
     assert!(
@@ -121,7 +135,7 @@ fn slow_phase_dominates_and_the_wall_total_contains_the_sum() {
     // polls, so a slow gap can be attributed to input dispatch or to the
     // frame body.
     body.phases.clear();
-    body.slow_timer = false;
+    body.slow_sound = false;
     let frame = FrameCtx {
         now_ms: 16,
         dt_ms: 16,
@@ -136,12 +150,11 @@ fn slow_phase_dominates_and_the_wall_total_contains_the_sum() {
             "input_begin",
             "input_events",
             "input_end",
-            "timer",
             "sound",
             "video",
             "async_trigger",
             "continuous_handler",
-            "project_and_render",
+            "frame_tail",
         ],
         "the tick reports the input segments before the ordered polls"
     );

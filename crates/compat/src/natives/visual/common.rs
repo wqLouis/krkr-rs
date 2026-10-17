@@ -8,7 +8,6 @@ use std::ffi::{c_char, c_void};
 use engine::Scene;
 use engine::input::InputState;
 use engine::timer::TimerId;
-use platform::Clock;
 use tjs::{
     DetachedValue, RetainedValue, Tjs2Engine, Tjs2ValueId, VAL_INTEGER, VAL_OBJECT, VAL_REAL,
     VAL_RETAINED, Value,
@@ -173,9 +172,6 @@ pub(crate) struct VisualState {
     pub(crate) window_objects: HashMap<u32, Vec<WindowObject>>,
     /// L3 payload per L2 timer id.
     pub(crate) timers: HashMap<TimerId, TimerBinding>,
-    /// The L1 monotonic clock that supplies `now_ms` to the L2 timer
-    /// registry.
-    pub(crate) clock: Clock,
     /// `Window.bringToFront` requests for the host to drain.
     pub(crate) bring_to_front: Vec<u32>,
     /// `Window.update` requests `(window_id, update_type)`.

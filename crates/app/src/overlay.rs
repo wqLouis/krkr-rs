@@ -2,17 +2,18 @@
 //!
 //! The overlay is **not** part of the engine [`Scene`](engine::scene::Scene) and
 //! owns no `Bitmap` a script can reach. It builds a small RGBA panel in memory,
-//! uploads it as a texture and appends one [`RenderNode`] to the projected
-//! [`RenderScene`]. Nothing above the render pipeline can observe it, so the
-//! overlay cannot change what a script sees.
+//! uploads it as a texture and contributes one [`RenderNode`] to the projected
+//! render tree. Nothing above the render pipeline can observe it, so the overlay
+//! cannot change what a script sees.
 //!
-//! The panel refreshes a few times a second through [`Overlay::tick`], never on
-//! every frame: it increments a frame counter, and once the refresh interval
-//! has elapsed it averages the frames over that interval into the displayed
-//! rate and re-uploads the panel.
+//! The engine refreshes it once per frame through its [`EngineOverlay`]
+//! implementation, which re-uploads the panel only a few times a second: it
+//! increments a frame counter, and once the refresh interval has elapsed it
+//! averages the frames over that interval into the displayed rate.
 
 use api::error::RenderError;
 use api::geometry::{PixelRegion, RectF};
+use engine::EngineOverlay;
 use render::{
     RenderContent, RenderNode, RenderPipeline, RenderState, Texture, TextureDesc, create_texture,
     upload_texture,
@@ -101,7 +102,7 @@ impl Overlay {
     /// Advances the overlay by one frame and re-uploads the panel when the
     /// refresh interval has elapsed.
     ///
-    /// `now_ms` is the host's elapsed time; `rss` is the resident set size in
+    /// `now_ms` is the engine's frame clock; `rss` is the resident set size in
     /// bytes, or `None` when the host does not expose one (the memory line is
     /// then omitted).
     ///
@@ -157,8 +158,8 @@ impl Overlay {
     /// Builds the overlay's render node.
     ///
     /// The node is positioned at the top-left of the framebuffer at the
-    /// panel's own pixel size. The caller sets the node's parent and adds it
-    /// to the scene.
+    /// panel's own pixel size. The engine sets the node's parent and adds it
+    /// to the render tree.
     pub(crate) fn node(&self) -> RenderNode {
         RenderNode {
             content: RenderContent::Texture(self.texture.clone()),
@@ -166,6 +167,23 @@ impl Overlay {
             z: OVERLAY_Z,
             ..RenderNode::default()
         }
+    }
+}
+
+impl EngineOverlay for Overlay {
+    /// Reads the resident set size and advances the panel by one frame.
+    fn refresh(
+        &mut self,
+        pipeline: &RenderPipeline,
+        state: &mut RenderState,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let rss = platform::memory_usage();
+        Overlay::tick(self, pipeline, state, now_ms as f64, rss).map_err(|error| error.to_string())
+    }
+
+    fn node(&self) -> RenderNode {
+        Overlay::node(self)
     }
 }
 

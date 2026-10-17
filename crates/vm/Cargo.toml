@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 compat = { workspace = true }
-engine = { workspace = true }
 tjs = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true, features = ["std"] }

@@ -36,7 +36,7 @@
 
 mod common;
 
-use common::{Env, sleep_ms, vm_lock};
+use common::{Env, vm_lock};
 use engine::LayerState;
 
 /// The L2 layer registered under `name` (the classes below set it explicitly).
@@ -83,7 +83,6 @@ fn layer_timer_callback_with_write_targets_the_member_object() {
         timer.enabled = true;
         "#,
     );
-    sleep_ms(10);
     env.poll_timer();
 
     // reference/cpp/core/visual/LayerIntf.cpp:10592 — `visible` is a native
