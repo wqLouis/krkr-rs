@@ -1,7 +1,7 @@
 # 12 — The layer tree, the projection and the frame
 
-Status: **the render path is implemented; the L2 frame (D26) and the
-pixel-translation layer (D40) are not.** This document is the end-to-end
+Status: **the render path and the L2 frame are implemented; the
+pixel-translation layer (D40) is not.** This document is the end-to-end
 contract for *how a layer tree becomes a frame*. It consolidates the ownership
 rules that [02 §2.1/§3](02-target-architecture.md) and
 [03 §2](03-middle-layer-api.md#2-render-pipeline) already state, adds the code
@@ -193,41 +193,28 @@ sub-rectangle (`PixelRegion`) into one staging pass and one GPU wait; the
 Vulkan backend records and submits the batch once. `drop_texture` is called when
 L2 drops a bitmap, so bitmap→texture lifetime is explicit L2 state.
 
-## 6. Per-frame orchestration — today, and the D26 target
+## 6. Per-frame orchestration
 
-**Today** the frame is split across three layers, which is legal by the
-dependency rule (`L3 → L2 → L1`) but is *not* D26:
+**The engine owns the frame.** `engine::Engine::step(dt_ms, hooks)` /
+`frame(now_ms, hooks)` set the frame clock, advance the L2 timer registry, run
+the single `GameFrame::before_render(now_ms, dt_ms)` hook, refresh the overlay,
+upload dirty bitmaps, project when `Scene::revision` changed (clearing and
+refilling the persistent arena, then re-attaching the overlay), and make one
+`render` call. The report is `FrameReport` (`frame_index`, `elapsed_ms`, the
+null counters and the upload/prune/project/render costs).
 
-* L1 `platform::Clock` supplies wall time; `app::GameHost::step(dt_ms)` owns the
-  `dt` and returns a `StepReport`;
-* `step` does: `sync_dirty_bitmaps` → `prune_stale_textures` →
-  `refresh_overlay` → `reproject_render_scene` → `render`;
-* `reproject_render_scene` refreshes `render_scene.view` always, and rebuilds
-  the arena only when `Scene::revision` changed (the persistent arena is
-  cleared and refilled to keep its capacity), then re-attaches the debug
-  overlay;
-* L3 `compat::run_frame_body` orchestrates `timer_poll → sound_poll →
-  video_poll → … → project → render`, and `app::GameHost::project_and_render`
-  drives the movie/transition polls (`movie_poll`, `advance_transitions`).
+`app::Host` is a wrapper around the engine. `app::GameHost` implements the
+hook: `vm.tick` (input begin → platform events → input end), then
+`compat::run_frame_body` (drain the timer posts the engine produced, sound,
+video, async triggers, continuous handlers, idle compaction, movie/transition
+tail), then the audio drain. The mixer, video and transition pumps are the
+remaining staged work; see [07 Phase 9](07-roadmap.md).
 
-**Target (D26).** L2 is the runtime and owns the frame entry point:
+The timer contract is D27's: L2 waits and calls; L3 decides whether to arm and
+turns the fire into an `onTimer` post. `TimerState::advance` is called only by
+`Engine::frame` (it stays public until the timer surface collapses).
 
-```rust
-impl Engine {
-    pub fn frame(&mut self, now_ms: u64, hooks: &mut dyn GameFrame);
-    pub fn run(&mut self, clock: impl Clock, hooks: &mut dyn GameFrame);
-}
-
-pub trait GameFrame { fn before_render(&mut self); }  // L4 vm.tick + L3 dispatch
-```
-
-`frame` advances timers (invoking their stored callbacks), the mixer and video
-from L2's own clock, runs the single injected `before_render` hook, then
-projects and renders. Nothing above L2 owns a `dt`; `TimerState::advance`
-becomes private (D27); the pump is internal. See
-[02 §3](02-target-architecture.md#3-who-owns-the-loop-and-the-event-flow) and
-[07 Phase 9](07-roadmap.md).
-
+## 7. Where the pixel translation fits (D39/D40)
 ## 7. Where the pixel translation fits (D39/D40)
 
 Today the projection takes a **whole-tree `ViewTransform`** and the pipeline
@@ -278,10 +265,11 @@ CPU rasterizer is the baseline the translation's readback is checked against.
 
 ## 9. What is not built yet
 
-* **L2 frame (D26)** — `Engine::frame`, `GameFrame`, private timer pump. Today
-  L3 orchestrates and `app::GameHost` owns `dt` (§6).
-* **Pixel translation (D40)** — device-space projection and scaled readback; the
-  `ScalingMode`/`ViewTransform` removal (§7).
+* **L2 frame (D26)** — the frame entry point, clock, timer pump and
+  projection/render ownership have landed (§6). The mixer, video and
+  transition pumps still run inside the hook, and `Engine::run` is not built.
+* **Pixel translation (D40)** — device-space projection and scaled readback;
+  the Fit mapping, input inverse-map and readback are open (§7, `11`).
 * **Masks and province images** — `Clip::Mask` and the main-vs-province
   composition are emitted by neither the projection nor the backends;
   `hold_alpha` travels but is not interpreted.

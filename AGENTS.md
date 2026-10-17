@@ -185,10 +185,15 @@ for the current work is docs [`11`](docs/migration/11-presentation-and-pixel-tra
   Win32 APIs. `HWND`, draw devices, message receivers, registry, shell,
   system metrics must return **emulated** values/handles (synthetic stable
   integers), never typed errors. A typed error there is a compatibility bug.
-- **D26 (in progress) — L2 owns the frame.** `Engine::frame(now_ms, hooks)`
-  advances timers/mixer/video, runs `GameFrame::before_render()`, projects and
-  renders. Nothing above L2 owns a `dt`. Until it lands, `compat` orchestrates
-  and `platform::Clock` supplies wall time; keep deterministic test clocks.
+- **D26 — L2 owns the frame.** `Engine::step(dt_ms, hooks)` /
+  `Engine::frame(now_ms, hooks)` own the frame clock and the frame entry point:
+  they advance the L2 timer registry, run the single
+  `GameFrame::before_render(now_ms, dt_ms)` hook, then project and render.
+  Nothing above L2 owns a `dt`; a deterministic test drives `frame(now)`.
+  Landed: the engine, timer pump, projection/render ownership and the hook.
+  Staged: the mixer, video and transition pumps still run inside the L3 hook,
+  and `Engine::run(clock, hooks)` waits for the platform-loop slice. Keep
+  deterministic test clocks for every staged pump.
 - **D27 — the L2 timer is `create_interval`/`set_interval`/`set_enabled`/`remove`.**
   No config struct, no mode enum, no fire list to hand upward.
 - **D28 — no game-specific code.** A behaviour change must implement what
@@ -385,6 +390,7 @@ Two-sided tests:
 11. `Layer.id`/`nativeId`, `Bitmap.id`, `Window.id`, `Font.id` do not exist by
     design; identify through real members or the L2 `Scene`.
 12. Loading is explicit (`--archive`, repeatable; later wins). There is **no** folder scan in the reference (D15), but D35 adds one opt-in exception: a directory-only launch (`--base-dir`/positional dir, no `--archive`) mounts every `*.xp3` found recursively (`engine::storage::discover_archives`).
+13. The frame is L2's: `GameHost::step` must not accumulate a `now_ms` or call the subsystem pumps itself. Pass events through `Engine::step(dt, hooks)`; the hook is `VmHook` (VM tick + audio drain). `compat::run_frame_body` starts by draining the timer posts the engine already produced; it must not call `TimerState::advance`.
 
 ---
 

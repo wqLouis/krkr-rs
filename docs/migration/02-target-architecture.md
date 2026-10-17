@@ -164,14 +164,20 @@ platform event   →  L1 (winit / android-activity backend)
 Per frame (D26 — **L2 owns it**):
 
 ```
-L2 Engine::frame(now_ms)
-  ├─ advance timers   → invoke their registered callbacks (script dispatch)
-  ├─ advance mixer, video from the frame clock
-  ├─ GameFrame::before_render()  ← L4 vm.tick + L3 KiriKiri event dispatch
-  │                                (async triggers, continuous handlers)
+L2 Engine::step(dt_ms) / frame(now_ms)
+  ├─ advance timers   → invoke their registered callbacks (L3 posts onTimer)
+  ├─ GameFrame::before_render(now_ms, dt_ms)
+  │      ← L4 vm.tick + L3 event dispatch + sound/video/async/continuous
+  │        polls + the audio drain (the staged pumps)
+  ├─ drain the posted onTimer events, then run the L3 polls
+  ├─ refresh the render-only overlay, upload dirty bitmaps
   ├─ translate + project `scene` into L1 `RenderScene` (device space; D40)
   └─ call L1 RenderPipeline::render
 ```
+
+The first line and the projection/render pair are L2's. The mixer, video and
+transition pumps are still inside the hook; moving them into L2 is the rest of
+Phase 9 and does not change the order above.
 
 The composition root (the `krkr` binary, the Android `cdylib`) is trivial:
 it selects the L1 platform, constructs L2/L3/L4 and starts the loop. It
@@ -235,21 +241,28 @@ why it depends on D26 above. The layer tree → projection → draw path the
 translation feeds is mapped end to end in
 [`12-layer-tree-and-frame.md`](12-layer-tree-and-frame.md).
 
-### Implementation status: not built yet
+### Implementation status
 
-The code has no `Engine` object. `crates/engine` is a set of independent state
-structs; the clock lives in `app::GameHost::step(dt_ms, events)` (which returns
-a `StepReport`); `compat::run_frame_body` orchestrates
-`timer_poll → sound_poll → video_poll → … → project → render` and hands time to
-each subsystem. That is legal by the dependency rule (L3 → L2 → L1) but it is
-not D26.
+`engine::Engine` now owns the frame. It holds the scene, the projected
+`RenderScene`, the `Surface`/`RenderState` pair, the bitmap texture table, the
+timer registry and the script-visible input state, and exposes
+`step(dt_ms, hooks)` / `frame(now_ms, hooks)`. A frame advances the L2 timer
+registry, runs the single `GameFrame::before_render(now_ms, dt_ms)` hook (the
+L4 VM tick plus the L3 polls and audio drain), refreshes the render-only
+overlay, uploads dirty bitmaps, projects when the scene revision changed, and
+performs one L1 render call. `app::Host` is a wrapper around it; `GameHost`
+implements the hook.
 
-It drifted because the strangler migration (`07-roadmap.md` §1) built the frame
-around the first real per-frame requirement — the script event loop; D10 split
-"who projects" from "who renders" without naming an owner for that seam;
-`--frames N` and headless runs needed a deterministic `StepReport`, putting `now`
-in L4; and no lint guards frame ownership (`check-stateless.sh` covers D9, the
-parity scripts cover surface, Cargo covers dependency direction).
+Landed with this: `TimerState::advance` is called only from the engine frame;
+`compat::run_frame_body` no longer fires timers, it drains the posts the
+engine produced; L3 timer schedule writes read the injected frame clock
+instead of a wall clock; and the timer tests drive virtual time.
+
+Remaining in Phase 9: the mixer, video and transition pumps still run inside
+the L3 hook (the audio device drain is part of the hook); `Engine::run(clock,
+hooks)` is not built yet because the platform loop still owns the event pump;
+and `TimerState::advance` stays public until the timer surface collapses to
+D27's four methods. Pixel translation (D39/D40) is Phase 10.
 
 **Schedule:** `07-roadmap.md` Phase 9.
 

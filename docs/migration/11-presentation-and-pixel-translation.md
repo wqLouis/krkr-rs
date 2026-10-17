@@ -1,6 +1,7 @@
 # 11 — Presentation and the pixel-translation layer
 
-Status: **design.** Stage 0 (the removal) has landed; Stages 1–3 are open.
+Status: **design.** Stage 0 (the removal) and the Stage 1 frame slice have
+landed; the remaining Stage 1 pumps and Stages 2–3 are open.
 This document decides how the engine maps the scene a script thinks it is
 drawing onto the framebuffer it actually draws into. It supersedes
 [`04-renderer-vulkan.md`](04-renderer-vulkan.md) §6.1 (the `ScalingMode`
@@ -161,36 +162,46 @@ unchanged, and a headless run draws the real game at its declared size.
 
 ## 5. Stage 1 (prerequisite) — L2 owns the frame
 
+**Landed: the frame entry point, clock, timer registry and projection/render
+ownership.** `Engine::step`/`frame` run the frame, `GameFrame::before_render`
+is the single upward hook, and `GameHost` no longer owns a `dt` or triggers
+the projection. The mixer, video and transition pumps still run inside the
+hook; moving them is the rest of Phase 9 (see `07`).
+
 The translation is computed per size change *inside the frame*, so the frame
 must be L2's first (D26). The contract is already written down —
 [`02` §3](02-target-architecture.md) and [`03` §8](03-middle-layer-api.md) —
 and is restated here only as the boundary the translation depends on:
 
 ```rust
-pub struct Engine { /* stateless L1 objects + ALL L2 state */ }
+pub struct Engine { /* L1 objects + ALL L2 state */ }
 
 impl Engine {
     /// The whole frame. Deterministic: tests drive it with a virtual clock.
-    pub fn frame(&mut self, now_ms: u64, hooks: &mut dyn GameFrame);
-    /// Sugar over `frame`: platform event pump + `SystemClock`.
-    pub fn run(&mut self, clock: impl Clock, hooks: &mut dyn GameFrame);
+    pub fn frame(&mut self, now_ms: u64, hooks: &mut dyn GameFrame)
+        -> Result<FrameReport, EngineError>;
+    /// Sugar: add `dt_ms` to the engine clock and run one frame.
+    pub fn step(&mut self, dt_ms: f32, hooks: &mut dyn GameFrame)
+        -> Result<FrameReport, EngineError>;
+    // Engine::run(clock, hooks) is the loop sugar, still open.
 }
 
-/// Declared in L2, implemented in L3/L4, wired by the composition root.
+/// Declared in L2, implemented by the composition root.
 pub trait GameFrame {
-    /// L4 `vm.tick` plus L3's event dispatch.
-    fn before_render(&mut self);
+    /// L4 `vm.tick` plus L3's event dispatch and polls.
+    fn before_render(&mut self, now_ms: u64, dt_ms: f64) -> Result<(), String>;
 }
 ```
 
 What this requires, and why the translation waits for it:
 
-* **one clock.** `TimerState::advance` becomes private to `frame`; the second
-  L3 clock (`VisualState.clock`) and `app::GameHost`'s `now_ms`/`dt` go. The
-  translation has no clock of its own — it changes only on a size change.
-* **one size owner.** Today `app::Host::resize` derives a presentation and
-  writes it back into the scene window; that is the drift D26 removes. In the
-  target, `Engine` learns the **device size** (from the L1 surface event) and
+* **one clock (landed).** `TimerState::advance` is called only by the frame;
+  the second L3 clock (`VisualState.clock`) and `app::GameHost`'s `now_ms`/`dt`
+  are gone. The translation has no clock of its own — it changes only on a
+  size change.
+* **one size owner.** Today `app::Host::resize` writes the surface size back
+  into the scene window; that is the drift D26 removes. In the target,
+  `Engine` learns the **device size** (from the L1 surface event) and
   the **VM size** (from the scene the script declared), computes the
   translation, and stores it. Nothing above L2 holds either size.
 * **the projection seam stays L2's.** `Engine` projects the scene into the

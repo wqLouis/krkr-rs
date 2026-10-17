@@ -320,26 +320,22 @@ Open:
 
 ## 1.1 Current priority
 
-Two pieces of architecture work are in flight; they are the first two phases
-of [`docs/migration/07-roadmap.md`](docs/migration/07-roadmap.md) Phase 9/10 and
-the contract is [`docs/migration/11`](docs/migration/11-presentation-and-pixel-translation.md)
-and [`12`](docs/migration/12-layer-tree-and-frame.md).
-
-1. **L2 owns the frame** (`D26`/`D27`). `Engine::frame(now_ms, hooks)` /
-   `Engine::step(dt_ms, hooks)` own the frame clock, timers, projection and
-   render; `GameFrame::before_render` is the single L4/L3 hook. Nothing above L2
-   owns a `dt`.
-2. **The pixel-translation layer** (`D39`/`D40`). A pure L2 `PixelTranslation`
-   maps VM pixels (what scripts see) to device pixels (what the framebuffer
-   uses), applies the Fit-with-letterbox rule during projection, and maps input
-   back. The obsolete `ScalingMode`/`PresentationScaling`/`--scaling`/
-   `ViewTransform`/`native_size` line is deleted first (Phase 9a).
+1. **L2 owns the frame** (`D26`/`D27`) — **landed (frame slice).**
+   `Engine::step(dt_ms, hooks)` / `Engine::frame(now_ms, hooks)` own the clock,
+   timers, projection and render; `GameFrame::before_render(now_ms, dt_ms)` is
+   the single upward hook. `app::Host` wraps the engine, `GameHost` is the
+   hook, and the timer tests drive virtual time. Remaining: move the mixer,
+   video and transition pumps out of the hook, add `Engine::run`, and collapse
+   the timer surface to D27's four methods (`07` Phase 9).
+2. **The pixel-translation layer** (`D39`/`D40`) — **next.** A pure L2
+   `PixelTranslation` maps VM pixels (what scripts see) to device pixels (what
+   the framebuffer uses), applies Fit-with-letterbox during projection, and
+   maps input back. Phase 9a (the `ScalingMode`/`PresentationScaling`/
+   `--scaling`/`ViewTransform`/`native_size` removal) has landed.
 
 Open sub-items are tracked in those docs, not duplicated here: device-pixel
-readback over `AHardwareBuffer`/staging (`10` "Device-pixel readback"),
-glyph rasterization at `raster_scale`, and the remaining per-subsystem pumps
-that still run inside the L3 hook (mixer/video/transitions) before they move
-to L2.
+readback over `AHardwareBuffer`/staging (`10` "Device-pixel readback") and
+glyph rasterization at `raster_scale`.
 
 ## 12. Deferred design work
 

@@ -459,49 +459,50 @@ pub struct ProcessEnv {
 
 ## 8. L2 is the state store and dispatcher
 
+`engine::Engine` is the frame-owning object. It holds the stateless L1 render
+objects the composition root hands it, and every L2 value:
+
 ```rust
 pub struct Engine {
-    // ---- L1 stateless objects (shared services) ----
+    // ---- L1 stateless objects ----
     pipeline: RenderPipeline,
-    media: Media,
-    fs: FileSystem,
-    fonts: FontSystem,
-    audio: Option<AudioDevice>,
-
-    // ---- L2 state (all of it) ----
-    scene: Scene,                // TVP layer system (all properties)
-    render_scene: RenderScene,   // L1 tree, projected from `scene`
-    render_state: RenderState,   // L1 GPU state, owned by L2
     surface: Surface,
-    mixer: Mixer,
-    glyph_atlas: GlyphAtlas,
-    decoders: HashMap<SoundId, AudioDecoderState>,
-    video: HashMap<VideoId, VideoDecoderState>,
-    open_files: HashMap<FileId, FileState>,
-    storage_index: StorageIndex, // namespace, arc.xp3>path
-    pool: WorkerPool,            // L2-owned threads + completions
+    render_state: RenderState,
+
+    // ---- L2 state ----
+    scene: Scene,                // the generic layer tree
+    render_scene: RenderScene,   // projected from `scene`
+    render_scene_revision: Option<u64>,
+    textures: Map<u32, Texture>, // bitmap id -> uploaded texture
+    timer: TimerState,
+    input: engine::input::InputState,
+    surface_size: (u32, u32),
+    now_ms: u64,
+    frame_index: u64,
+    overlay: Option<Box<dyn EngineOverlay>>,
 }
 
 impl Engine {
-    /// The whole frame (D26): advance timers — invoking their stored
-    /// callbacks — mixer and video from `now`, run `hooks.before_render()`,
-    /// project, render. Public and *deterministic*: tests and headless runs
-    /// drive it directly with a virtual clock, so nothing sleeps.
-    pub fn frame(&mut self, now_ms: u64, hooks: &mut dyn GameFrame);
-    /// Sugar over `frame`: platform event pump + `SystemClock`.
-    pub fn run(&mut self, clock: impl Clock, hooks: &mut dyn GameFrame);
-    pub fn render(&mut self);             // project tree, call pipeline.render
-    pub fn install_natives(&self, vm: &Tjs2Engine);
+    /// The whole frame at an explicit clock value. Deterministic: tests and
+    /// headless runs drive it directly, so nothing sleeps.
+    pub fn frame(&mut self, now_ms: u64, hooks: &mut dyn GameFrame)
+        -> Result<FrameReport, EngineError>;
+    /// Sugar: add `dt_ms` to the engine's clock and run one frame.
+    pub fn step(&mut self, dt_ms: f32, hooks: &mut dyn GameFrame)
+        -> Result<FrameReport, EngineError>;
+    pub fn resize(&mut self, size: (u32, u32)) -> Result<SurfaceEvent, EngineError>;
 }
 
-/// Declared in L2, implemented by L3/L4, wired by the composition root.
-/// This is L2's only upward edge: it never names L3 or L4.
+/// Declared in L2, implemented above it, wired by the composition root.
 pub trait GameFrame {
-    /// L4 `vm.tick` plus L3's KiriKiri event dispatch (async triggers,
-    /// continuous handlers).
-    fn before_render(&mut self);
+    fn before_render(&mut self, now_ms: u64, dt_ms: f64) -> Result<(), String>;
 }
 ```
+
+The frame order is: set the clock → `timer.advance(now)` → `hooks.before_render`
+→ refresh the overlay → upload dirty bitmaps → prune gone bitmaps → project if
+the scene revision changed → one `render` call. `Engine::render` is a private
+step of that sequence; L2 never builds a draw list.
 
 The timer is the template for what L2 keeps (D27): no config struct, no mode
 enum, no fire list to hand upward —
@@ -513,15 +514,17 @@ set_enabled(id, enabled)
 remove(id)
 ```
 
-all state stays private to `Engine`, and the pump (`advance(now)`) is internal
-to `frame`.
+`advance(now)` is called only by `Engine::frame`; it stays on the public type
+until the timer surface collapses to the four methods above.
 
-`Engine::render` is: sync dirty `scene` fields into `render_scene`, upload
-dirty bitmaps into `render_state`, then a single `render(pipeline, surface,
-render_state, render_scene)`. No draw-list construction in L2.
+**Staged.** The mixer, video and transition pumps still run inside the
+`GameFrame` hook (the composition root's `VmHook`), together with the audio
+device drain. Moving them into L2 is the rest of Phase 9 and does not change
+the frame entry point or the order. `Engine::run(clock, hooks)` waits for the
+platform-loop slice; the platform loop currently drives `Engine::step`.
 
-Tests construct `Engine` with a `NullRenderPipeline`, an in-memory
-`FileSystem`, a stub `Media`, `SystemClock` and no window/codec.
+Tests construct `Engine` with a null `RenderPipeline`, a headless
+`Surface`/`RenderState`, and a virtual clock.
 
 ## 9. Enforcing the model
 

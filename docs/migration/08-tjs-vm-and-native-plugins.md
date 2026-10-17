@@ -205,13 +205,23 @@ No `#[cfg]` above L1.
 
 ## 6. Frame body and poll order
 
-L1 drives the tick; L4 runs the body:
+L2 owns the frame (`engine::Engine::step`/`frame`). It advances the timer
+registry, runs the `GameFrame` hook, then projects and renders. The L4 VM tick
+and the L3 polls are the hook body:
 
 ```
-timer_poll → sound_poll → video poll
-           → async_trigger_poll → continuous_handler_poll
-           → L2 projects the scene → L1 RenderPipeline::render
+L2: advance timers → invoke their callbacks (L3 posts onTimer)
+L4/L3 hook: vm.tick (input begin → events → input end)
+            → drain the posted onTimer events
+            → sound_poll → video_poll → async_trigger_poll
+            → continuous_handler_poll → idle compaction
+            → frame_tail (movie poll + layer transitions)
+            → audio drain
+L2: overlay refresh → upload → project → L1 RenderPipeline::render
 ```
+
+The mixer, video and transition pumps still run in the hook; moving them into
+L2 is the rest of the frame phase (see `07-roadmap.md` Phase 9).
 
 ## 7. Implementation status
 

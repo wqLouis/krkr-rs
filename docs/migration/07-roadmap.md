@@ -201,28 +201,34 @@ surface lock and both parity reports unchanged.
 
 ### Phase 9 — L2 owns the frame (D26 / D27)
 
+**Status: the frame slice has landed; the remaining pumps are still staged.**
+
 This is the prerequisite for Phase 10: the pixel translation is recomputed per
 size change *inside the frame*, and the frame is where projection happens.
 
-Deliverables:
-* `Engine::frame(now_ms, hooks)` + `Engine::run(clock, hooks)` + the
-  `GameFrame` trait declared in L2 and implemented in L3/L4 (contract:
-  `02-target-architecture.md` §3 “Frame ownership”);
-* the frame clock moves into L2 — `GameHost::step(dt_ms, …)` stops owning
-  `dt` and shrinks to wiring + `StepReport` plumbing;
-* `compat::run_frame_body` collapses into a `GameFrame` implementation
-  (it stops orchestrating project/render);
-* `engine::timer` collapses to `create_interval` / `set_interval` /
-  `set_enabled` / `remove`, with `advance` private to `frame` —
-  `TimerConfig`, `TimerMode`, `TimerFire` and the introspection-only
-  accessors go (D27);
-* L2 advances mixer/video from its own frame clock, per
-  `03-middle-layer-api.md` §5.
+Landed:
+* `Engine::frame(now_ms, hooks)` + `Engine::step(dt_ms, hooks)` + the
+  `GameFrame::before_render(now_ms, dt_ms)` trait declared in L2 and
+  implemented by the composition root (`VmHook` runs the VM tick and the audio
+  drain);
+* the frame clock lives in L2 — `GameHost` no longer owns `now_ms` or a `dt`;
+* `compat::run_frame_body` no longer fires timers or projects/renders: it
+  drains the posts the engine produced, then runs sound/video/async/continuous
+  and the movie/transition tail;
+* L3 timer schedule writes read the injected frame clock, and the timer tests
+  drive virtual time instead of the wall clock.
 
-Exit criteria: no code above L2 holds a clock or calls `advance`; the
-timer's public surface is the four methods; `cargo test -p engine -p
-compat -p app` green with tests driving `frame(now)` virtually; doc 02 §3
-“Implementation status: not built yet” section removed.
+Remaining:
+* move the mixer, video and transition pumps from the hook into L2, then retire
+  `SoundState.clock` and pass an L2-owned delta to those pumps;
+* `Engine::run(clock, hooks)` (platform event pump) — blocked on the loop
+  slice;
+* collapse `engine::timer` to D27's four methods and make `advance` private.
+
+Exit criteria for the slice: no code above L2 accumulates a frame clock, and
+`cargo test -p engine -p compat -p app` is green with tests driving
+`frame(now)` virtually. Both hold. The full Phase 9 exit (all pumps in L2)
+still tracks the remaining list.
 
 ### Phase 10 — Pixel-translation layer (device resolution + readback)
 
