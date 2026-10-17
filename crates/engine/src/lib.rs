@@ -27,6 +27,7 @@ pub mod storage;
 pub mod text;
 pub mod timer;
 pub mod trans;
+pub mod translate;
 pub mod video;
 
 // Archive name normalization is a shared storage-naming rule; the parser
@@ -35,6 +36,7 @@ pub use fs::xp3::normalize_in_archive_name;
 // The fixed-seed lookup map the engine keys its per-bitmap tables with.
 pub use crate::engine::{Engine, EngineError, EngineOverlay, EngineParts, FrameReport, GameFrame};
 pub use crate::hasher::Map;
+pub use crate::translate::{PixelTranslation, TranslateError};
 // Curated crate root. The
 // pixel primitives, blend-type numbering and TVP constants stay reachable
 // through their own modules (`layer_ops`, `raster`, `projection`, `scene`,

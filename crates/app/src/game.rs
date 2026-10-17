@@ -14,11 +14,12 @@ use std::time::{Duration, Instant};
 
 use api::error::FsError;
 use api::fs::FsPath;
+use api::input::InputEvent;
 use compat::{CompatCtx, CompatError, FrameBody};
 use engine::input::InputState;
 use engine::storage::{MountOptions, StartupPlan, StorageReadError};
 use engine::timer::TimerState;
-use engine::{GameFrame, Storage};
+use engine::{GameFrame, PixelTranslation, Storage};
 use fs::{FileSystem, list};
 use platform::{FramePacing, PlatformError, PlatformEvent};
 use vm::{FrameCtx, VmHost};
@@ -365,6 +366,9 @@ struct VmHook<'a> {
     audio: &'a mut AudioOutput,
     /// Platform events delivered to script this frame.
     events: &'a [PlatformEvent],
+    /// The presentation the frame started with, used to map input positions
+    /// from device pixels into VM pixels.
+    translation: Option<PixelTranslation>,
     /// The ordered frame body and its per-frame cost record.
     polls: &'a mut Polls,
     /// Wall-clock cost of the whole hook, in milliseconds.
@@ -377,11 +381,26 @@ impl GameFrame for VmHook<'_> {
     fn before_render(&mut self, now_ms: u64, dt_ms: f64) -> Result<(), String> {
         let hook_started = Instant::now();
         self.polls.dt_ms = dt_ms;
+        // Pointer and touch positions arrive in device pixels while the scene's
+        // hit-testing is in VM pixels, so those events are mapped back before
+        // the VM sees them. Without a mapping, or at an identity mapping, the
+        // events pass through untouched.
+        let translation = self
+            .translation
+            .filter(|translation| !translation.is_identity());
+        let source = self.events;
+        let translated = translation.map(|translation| {
+            source
+                .iter()
+                .map(|event| translate_event(Some(translation), event))
+                .collect::<Vec<PlatformEvent>>()
+        });
+        let events: &[PlatformEvent] = translated.as_deref().unwrap_or(source);
         let frame = FrameCtx {
             now_ms,
             dt_ms: dt_ms as u32,
             body: &mut *self.polls,
-            events: self.events,
+            events,
         };
         let vm_started = Instant::now();
         self.vm.tick(frame).map_err(|error| error.to_string())?;
@@ -393,6 +412,34 @@ impl GameFrame for VmHook<'_> {
         self.audio_ms = audio_started.elapsed().as_secs_f64() * 1000.0;
         self.hook_ms = hook_started.elapsed().as_secs_f64() * 1000.0;
         Ok(())
+    }
+}
+
+/// Maps the position-carrying events of one frame from device pixels into VM
+/// pixels.
+///
+/// Only the pointer position and a touch contact carry a coordinate; button,
+/// wheel, key, text, focus and resize events mean the same in both spaces and
+/// are returned unchanged, as is every event without a mapping.
+fn translate_event(translation: Option<PixelTranslation>, event: &PlatformEvent) -> PlatformEvent {
+    let Some(translation) = translation else {
+        return event.clone();
+    };
+    match event {
+        PlatformEvent::Input(InputEvent::PointerMoved { x, y }) => {
+            let (x, y) = translation.to_vm_point((*x, *y));
+            PlatformEvent::Input(InputEvent::PointerMoved { x, y })
+        }
+        PlatformEvent::Input(InputEvent::Touch { id, phase, x, y }) => {
+            let (x, y) = translation.to_vm_point((*x, *y));
+            PlatformEvent::Input(InputEvent::Touch {
+                id: *id,
+                phase: *phase,
+                x,
+                y,
+            })
+        }
+        other => other.clone(),
     }
 }
 
@@ -628,6 +675,11 @@ impl GameHost {
         }
         self.polls.phases = FramePhases::default();
         self.polls.tick = TickPhases::default();
+        // Input is mapped with the presentation captured as the frame starts;
+        // the engine refits after the hook, so a window size the VM changes
+        // during the hook applies to this frame's drawing and to the next
+        // frame's input.
+        let translation = self.host.engine().translation();
 
         let step_started = Instant::now();
         let (report, hook_ms, audio_ms) = {
@@ -635,6 +687,7 @@ impl GameHost {
                 vm: &mut self.vm,
                 audio: &mut self.audio,
                 events,
+                translation,
                 polls: &mut self.polls,
                 hook_ms: 0.0,
                 audio_ms: 0.0,
@@ -1201,6 +1254,51 @@ mod tests {
 
         drop(game);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The composition root maps pointer and touch positions from device
+    /// pixels into VM pixels before the VM sees them, so hit-testing stays in
+    /// the scene's own space. Every other event carries no position and passes
+    /// through.
+    ///
+    /// The reference receives input in the window's own pixels
+    /// (`reference/cpp/core/visual/LayerManager.cpp:345-356` hit-tests in
+    /// primary-layer coordinates). Separating the framebuffer from the VM size
+    /// and mapping back into it is the D40 presentation extension, not
+    /// reference behaviour.
+    #[test]
+    fn pointer_and_touch_events_are_mapped_into_vm_pixels() {
+        // A 320x240 VM surface in a 640x480 framebuffer: scale 2, no letterbox.
+        let translation = PixelTranslation::fit((320, 240), (640, 480)).expect("fittable sizes");
+
+        let moved = PlatformEvent::Input(InputEvent::PointerMoved { x: 200.0, y: 100.0 });
+        assert_eq!(
+            translate_event(Some(translation), &moved),
+            PlatformEvent::Input(InputEvent::PointerMoved { x: 100.0, y: 50.0 })
+        );
+
+        let touch = PlatformEvent::Input(InputEvent::Touch {
+            id: 7,
+            phase: api::host::TouchPhase::Moved,
+            x: 200.0,
+            y: 100.0,
+        });
+        assert_eq!(
+            translate_event(Some(translation), &touch),
+            PlatformEvent::Input(InputEvent::Touch {
+                id: 7,
+                phase: api::host::TouchPhase::Moved,
+                x: 100.0,
+                y: 50.0,
+            })
+        );
+
+        let key = PlatformEvent::Input(InputEvent::Key {
+            code: api::input::PhysicalKey::Enter,
+            pressed: true,
+        });
+        assert_eq!(translate_event(Some(translation), &key), key);
+        assert_eq!(translate_event(None, &key), key);
     }
 
     /// A directory launch prefers the conventional boot archive `data.xp3`

@@ -227,9 +227,6 @@ struct DesktopApp {
     /// Input and focus events received since the last frame, delivered to
     /// the VM.
     pending_events: Vec<PlatformEvent>,
-    /// The window size a script most recently requested, so a request still
-    /// in flight is not repeated on every frame.
-    pending_size: Option<(u32, u32)>,
 }
 
 /// What the windowed loop is driving.
@@ -253,20 +250,13 @@ impl Running {
         }
     }
 
-    /// The main window's declared client size, or `None` when the host owns
-    /// no scene window (the empty-scene run).
-    fn inner_size(&self) -> Option<(u32, u32)> {
+    /// Takes the script-side window size the OS window still has to adopt.
+    ///
+    /// The empty-scene run has no scene window, so it never asks for one.
+    fn take_window_resize(&mut self) -> Option<(u32, u32)> {
         match self {
             Running::Empty(_) => None,
-            Running::Game(game) => game.scene().windows.first().map(|window| window.inner_size),
-        }
-    }
-
-    /// The framebuffer size the running host presents.
-    fn surface_size(&self) -> (u32, u32) {
-        match self {
-            Running::Empty(host) => host.surface_size(),
-            Running::Game(game) => game.host().surface_size(),
+            Running::Game(game) => game.host_mut().take_window_resize(),
         }
     }
 
@@ -303,52 +293,7 @@ impl DesktopApp {
             debug_overlay,
             running: None,
             pending_events: Vec::new(),
-            pending_size: None,
         }
-    }
-
-    /// Requests a new platform-window inner size when a script changed the
-    /// main window's declared client size.
-    ///
-    /// The host keeps the scene window's client size equal to the framebuffer,
-    /// so the raw `inner_size` equals the host's surface size unless a script
-    /// declared a new size. A window whose `inner_size` differs is a
-    /// declaration and is applied to the OS window; a user resize changes the
-    /// framebuffer instead and is left alone. When the backend applies the
-    /// request synchronously (and therefore emits no `Resized`), the surface is
-    /// resized here.
-    fn apply_window_size(&mut self, window: &PlatformWindow) -> Result<(), String> {
-        let Some(running) = self.running.as_ref() else {
-            return Ok(());
-        };
-        let Some(size) = running.inner_size() else {
-            return Ok(());
-        };
-        // A window already showing the declared size has no pending declaration.
-        if running.surface_size() == size {
-            return Ok(());
-        }
-        if size.0 == 0 || size.1 == 0 {
-            return Ok(());
-        }
-        if self.pending_size == Some(size) {
-            return Ok(());
-        }
-        if size == window.size() {
-            self.pending_size = None;
-            if let Some(running) = self.running.as_mut() {
-                running.resize(size)?;
-            }
-            return Ok(());
-        }
-        self.pending_size = Some(size);
-        if let Some(applied) = window.set_size(size) {
-            self.pending_size = None;
-            if let Some(running) = self.running.as_mut() {
-                running.resize(applied)?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -398,14 +343,10 @@ impl EventHandler for DesktopApp {
                     }
                     None => Running::Empty(Box::new(host)),
                 };
-                // Align the platform window with the client size the game
-                // declared during startup (`Window.setInnerSize`); the
-                // resulting `Resized` sizes the surface.
+                // A window size the startup scripts declared
+                // (`Window.setInnerSize`) is surfaced by the first frame and
+                // applied there; the resulting `Resized` sizes the surface.
                 self.running = Some(running);
-                if let Err(error) = self.apply_window_size(window) {
-                    eprintln!("krkr: resize failed: {error}");
-                    return Flow::Exit;
-                }
                 Flow::Continue
             }
             Err(error) => {
@@ -418,7 +359,6 @@ impl EventHandler for DesktopApp {
     fn event(&mut self, event: PlatformEvent) -> Flow {
         match event {
             PlatformEvent::Resized(width, height) => {
-                self.pending_size = None;
                 if let Some(running) = self.running.as_mut()
                     && let Err(error) = running.resize((width, height))
                 {
@@ -437,8 +377,8 @@ impl EventHandler for DesktopApp {
             // into the L2 input state and dispatches the TJS events
             // (`onFocus`/`onBlur`). `ScaleFactorChanged` is informational
             // (winit follows it with `Resized`) and the adapter ignores it.
-            // Input positions are surface pixels, the same space the scene is
-            // drawn in, so they are delivered unchanged.
+            // Positions arrive in device pixels; the game host maps them into
+            // VM pixels before the VM sees them.
             PlatformEvent::Input(input) => {
                 self.pending_events.push(PlatformEvent::Input(input));
                 Flow::Continue
@@ -452,14 +392,27 @@ impl EventHandler for DesktopApp {
     }
 
     fn frame(&mut self, dt_ms: f32, window: &PlatformWindow, pacing: FramePacing) -> Flow {
-        if let Some(running) = self.running.as_mut() {
-            let events = std::mem::take(&mut self.pending_events);
-            if let Err(error) = running.step(dt_ms, &events, pacing) {
-                eprintln!("krkr: frame failed: {error}");
-                return Flow::Exit;
-            }
+        let Some(running) = self.running.as_mut() else {
+            return Flow::Continue;
+        };
+        let events = std::mem::take(&mut self.pending_events);
+        if let Err(error) = running.step(dt_ms, &events, pacing) {
+            eprintln!("krkr: frame failed: {error}");
+            return Flow::Exit;
         }
-        if let Err(error) = self.apply_window_size(window) {
+        // A script `Window.setInnerSize` asks the OS window to adopt the new
+        // client size. The engine cleared the request when it was taken, so a
+        // size that does not change again is not applied twice, and a request
+        // the window already shows needs no action. A backend that applies it
+        // synchronously emits no `Resized`, so the surface is resized here from
+        // the size the backend reports.
+        if let Some(size) = running.take_window_resize()
+            && size.0 != 0
+            && size.1 != 0
+            && size != window.size()
+            && let Some(applied) = window.set_size(size)
+            && let Err(error) = running.resize(applied)
+        {
             eprintln!("krkr: frame resize failed: {error}");
             return Flow::Exit;
         }

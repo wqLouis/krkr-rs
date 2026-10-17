@@ -5,9 +5,12 @@
 //! pair, the bitmap-id → [`Texture`] table, the [`TimerState`] and the raw
 //! input snapshot — and advances them one frame at a time.
 //!
-//! One frame is: get the clock, fire due timers, run the upward hook, refresh
-//! the render-only overlay, upload dirty bitmaps, project the layer tree when
-//! it changed, and draw it with a single pipeline call.
+//! One frame is: get the clock, fit the VM→device presentation, fire due
+//! timers, run the upward hook, fit the presentation again (the hook may have
+//! changed a window's size), refresh the render-only overlay, upload dirty
+//! bitmaps, project the layer tree when it changed, translate it into device
+//! pixels, and draw it with a single pipeline call. A size pair that cannot be
+//! fitted skips everything that draws.
 //!
 //! Nothing here reads a wall clock. [`Engine::frame`] takes the time and
 //! [`Engine::step`] adds a delta to the clock the engine already holds, so a
@@ -31,8 +34,9 @@ use render::{
 
 use crate::hasher::{Map, map};
 use crate::projection::project_scene;
-use crate::scene::{Rect, Scene};
+use crate::scene::Scene;
 use crate::timer::TimerState;
+use crate::translate::{PixelTranslation, TranslateError, translate_render_scene};
 
 /// The bottom objects and initial state [`Engine::new`] assembles into an
 /// [`Engine`].
@@ -141,24 +145,8 @@ pub struct FrameReport {
     pub render_ms: f64,
 }
 
-/// Resizes a window's client area to `size`.
-///
-/// The window's client size and, when it has one, its primary layer are
-/// resized; the layer stays at the origin because the primary layer is
-/// anchored at the window client area's top-left.
-fn resize_window_client(scene: &mut Scene, window: u32, size: (u32, u32)) {
-    let primary = scene.window_mut(window).map(|window| {
-        window.inner_size = size;
-        window.primary_layer
-    });
-    if let Some(Some(primary)) = primary
-        && let Some(layer) = scene.layer_mut(primary)
-    {
-        layer.rect = Rect::new(0, 0, size.0, size.1);
-    }
-}
-
-/// The middle-layer engine: scene, projection, textures, timers and the frame.
+/// The middle-layer engine: scene, projection, textures, timers, presentation
+/// and the frame.
 ///
 /// Every value is a field of this object; there are no globals, statics or
 /// hidden caches, so two engines can run in one process. Callers reach the
@@ -200,6 +188,16 @@ pub struct Engine {
     headless: bool,
     /// Render-only overlay, or `None` when none is drawn.
     overlay: Option<Box<dyn EngineOverlay>>,
+    /// VM-pixel → device-pixel mapping for the current sizes, or `None` when
+    /// the two sizes cannot be fitted.
+    translation: Option<PixelTranslation>,
+    /// The VM size the most recent presentation sync observed.
+    last_vm_size: Option<(u32, u32)>,
+    /// A script-side window size the composition root has not applied yet.
+    pending_window_resize: Option<(u32, u32)>,
+    /// Whether the unfittable-size warning has been logged since the sizes
+    /// last fitted.
+    presentation_skipped_logged: bool,
 }
 
 impl Engine {
@@ -240,6 +238,10 @@ impl Engine {
             elapsed_ms: 0.0,
             headless,
             overlay,
+            translation: None,
+            last_vm_size: None,
+            pending_window_resize: None,
+            presentation_skipped_logged: false,
         };
         resize_render(
             &engine.pipeline,
@@ -247,6 +249,7 @@ impl Engine {
             &mut engine.render_state,
             surface_size,
         )?;
+        engine.sync_presentation();
         Ok(engine)
     }
 
@@ -291,8 +294,11 @@ impl Engine {
 
     /// Runs one frame at `now_ms` with `dt_ms` as the hook's delta.
     ///
-    /// The order is the frame contract: set the clock, fire due timers, run
-    /// the upward hook, refresh the overlay, then upload, project and draw.
+    /// The order is the frame contract: set the clock, fit the presentation,
+    /// fire due timers, run the upward hook, fit the presentation again (the
+    /// hook may have changed a window's size), then refresh the overlay,
+    /// upload, project, translate and draw. A size pair that cannot be fitted
+    /// skips everything that draws and reports no frame statistics.
     fn advance(
         &mut self,
         now_ms: u64,
@@ -302,10 +308,27 @@ impl Engine {
         self.now_ms = now_ms;
         self.last_now_ms = Some(now_ms);
         self.elapsed_ms = now_ms as f64;
+        self.sync_presentation();
         self.timer.advance(now_ms);
         hooks
             .before_render(now_ms, dt_ms)
             .map_err(EngineError::Frame)?;
+        self.sync_presentation();
+
+        if self.translation.is_none() {
+            self.frame_index = self.frame_index.saturating_add(1);
+            return Ok(FrameReport {
+                frame_index: self.frame_index,
+                elapsed_ms: self.elapsed_ms,
+                stats: None,
+                sync_ms: 0.0,
+                upload_ms: 0.0,
+                prune_ms: 0.0,
+                project_ms: 0.0,
+                render_ms: 0.0,
+            });
+        }
+
         self.refresh_overlay(now_ms)?;
 
         let sync_started = Instant::now();
@@ -346,9 +369,10 @@ impl Engine {
 
     /// Rebinds the surface to a new size in physical pixels.
     ///
-    /// The size is clamped to at least `1x1`. The main window's client size
-    /// and its primary layer follow the new size; the layer stays at the
-    /// origin. An unchanged size does not touch the backend.
+    /// The size is clamped to at least `1x1`, and an unchanged size does not
+    /// touch the backend. The framebuffer size is not the script-visible size:
+    /// the scene keeps its window sizes and the presentation refits them into
+    /// the new framebuffer, so an OS resize moves no value a script observes.
     ///
     /// # Errors
     ///
@@ -361,10 +385,7 @@ impl Engine {
             resize_render(&self.pipeline, &self.surface, &mut self.render_state, size)?
         };
         self.surface_size = size;
-
-        if let Some(window) = self.scene.windows.first().map(|window| window.id) {
-            resize_window_client(&mut self.scene, window, size);
-        }
+        self.sync_presentation();
         Ok(event)
     }
 
@@ -376,11 +397,20 @@ impl Engine {
     /// capacity) and refilled, so only the projected nodes' own allocations
     /// are touched. The revision is `None` until the first projection, so the
     /// first frame always projects.
+    ///
+    /// The tree is projected in VM pixels and then translated into device
+    /// pixels, which is why a changed presentation also invalidates it. The
+    /// overlay is attached after the translation because it is already in
+    /// device coordinates. Nothing is rebuilt while the two sizes cannot be
+    /// fitted; the frame path draws nothing in that case.
     fn reproject_render_scene(&mut self) {
         let revision = self.scene.revision();
         if self.render_scene_revision == Some(revision) {
             return;
         }
+        let Some(translation) = self.translation else {
+            return;
+        };
 
         let textures = &self.textures;
         let projected = project_scene(&self.scene, |bitmap| textures.get(&bitmap).cloned());
@@ -390,15 +420,60 @@ impl Engine {
         self.render_scene.background = projected.background;
         self.render_scene.nodes.extend(projected.nodes);
 
+        translate_render_scene(&mut self.render_scene, &translation);
         self.attach_overlay();
         self.render_scene_revision = Some(revision);
+    }
+
+    /// Refits the VM→device presentation for the current sizes and reports a
+    /// script-side window resize to the composition root.
+    ///
+    /// The VM size is the first window's client size, so a script that creates
+    /// or resizes a window moves it while an OS resize moves only the
+    /// framebuffer. A changed mapping invalidates the projected tree, which is
+    /// built in VM pixels. A size pair that cannot be fitted leaves the frame
+    /// without a mapping and warns once rather than substituting a scale.
+    fn sync_presentation(&mut self) {
+        let vm_size = self.vm_size();
+        let translation = match PixelTranslation::fit(vm_size, self.surface_size) {
+            Ok(translation) => {
+                self.presentation_skipped_logged = false;
+                Some(translation)
+            }
+            Err(TranslateError::EmptyDimension { vm, device }) => {
+                if !self.presentation_skipped_logged {
+                    log::warn!(
+                        "presentation skipped: a {vm:?} game surface cannot be fitted into a {device:?} framebuffer"
+                    );
+                    self.presentation_skipped_logged = true;
+                }
+                None
+            }
+        };
+        if translation != self.translation {
+            self.translation = translation;
+            self.render_scene_revision = None;
+        }
+
+        if self.last_vm_size != Some(vm_size) {
+            // The first observation asks for a window resize only when it
+            // already differs from the framebuffer; every later change of the
+            // VM size is a script resize and is surfaced to the composition
+            // root. An OS resize leaves the VM size alone, so it never asks.
+            if self.last_vm_size.is_some() || vm_size != self.surface_size {
+                self.pending_window_resize = Some(vm_size);
+            }
+            self.last_vm_size = Some(vm_size);
+        }
     }
 
     /// Appends the overlay as the last child of the render scene root.
     ///
     /// The projection clears and refills the arena, so the overlay node is
-    /// re-added after every rebuild and never on a skipped one. The overlay's
-    /// texture is stable across refreshes, so the node needs no refresh here.
+    /// re-added after every rebuild and never on a skipped one. The overlay is
+    /// attached after the tree has been translated, so its node stays in
+    /// device coordinates; its texture is stable across refreshes, so the node
+    /// needs no refresh here.
     fn attach_overlay(&mut self) {
         let Some(overlay) = self.overlay.as_ref() else {
             return;
@@ -480,6 +555,32 @@ impl Engine {
     /// Returns the current surface size in pixels.
     pub fn surface_size(&self) -> (u32, u32) {
         self.surface_size
+    }
+
+    /// Returns the script-visible surface size: the first window's client size,
+    /// or the framebuffer size when the scene has no window.
+    pub fn vm_size(&self) -> (u32, u32) {
+        self.scene
+            .windows
+            .first()
+            .map_or(self.surface_size, |window| window.inner_size)
+    }
+
+    /// Returns the current VM-pixel → device-pixel mapping, or `None` when the
+    /// VM and framebuffer sizes cannot be fitted.
+    pub fn translation(&self) -> Option<PixelTranslation> {
+        self.translation
+    }
+
+    /// Takes the script-side window size the composition root still has to
+    /// apply to the OS window, if any.
+    ///
+    /// A request is produced when the script creates a window whose client
+    /// size differs from the framebuffer and on every later change of that
+    /// size. Taking it clears it, so a size that does not change again is not
+    /// requested twice.
+    pub fn take_window_resize(&mut self) -> Option<(u32, u32)> {
+        self.pending_window_resize.take()
     }
 
     /// Returns the number of frames drawn so far.

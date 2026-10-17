@@ -284,10 +284,13 @@ impl Host {
 
     /// Advances the host by one frame and presents it.
     ///
-    /// The engine drives the whole frame: it advances its clock, fires due
-    /// timers, runs the (here empty) frame hook, refreshes the debug overlay,
-    /// uploads dirty bitmaps, projects the layer tree when it changed and
-    /// renders the result. `dt_ms` advances the engine's frame clock.
+    /// The engine drives the whole frame: it fits the script-visible size into
+    /// the framebuffer, advances its clock, fires due timers, runs the (here
+    /// empty) frame hook, fits the presentation again (the hook may have
+    /// changed a window size), refreshes the debug overlay, uploads dirty
+    /// bitmaps, projects the layer tree when it changed, translates it into
+    /// device pixels and renders the result. `dt_ms` advances the engine's
+    /// frame clock.
     ///
     /// # Errors
     ///
@@ -315,16 +318,24 @@ impl Host {
         Ok(self.engine.step(dt_ms, hooks)?)
     }
 
-    /// The middle-layer engine, for the composition root's attachments.
+    /// The middle-layer engine, for the composition root's attachments and
+    /// presentation reads.
     pub(crate) fn engine_mut(&mut self) -> &mut engine::Engine {
         &mut self.engine
     }
 
-    /// Reports a new surface size in physical pixels.
+    /// The middle-layer engine, for reading the presentation the frame uses.
+    pub(crate) fn engine(&self) -> &engine::Engine {
+        &self.engine
+    }
+
+    /// Reports a new framebuffer size in physical pixels.
     ///
-    /// The surface size is the framebuffer. The main window's client size and
-    /// its primary layer follow the framebuffer; the layer stays at the
-    /// origin because the reference forbids moving the primary layer.
+    /// The surface size is the device framebuffer, which is independent of the
+    /// script-visible size: the scene keeps its window and layer sizes and the
+    /// presentation refits them into the new framebuffer, so an OS resize moves
+    /// no value a script observes. A script `Window.setInnerSize` is the other
+    /// direction and is surfaced through [`Host::take_window_resize`].
     ///
     /// # Errors
     ///
@@ -384,6 +395,30 @@ impl Host {
     /// Returns the current surface size in pixels.
     pub fn surface_size(&self) -> (u32, u32) {
         self.engine.surface_size()
+    }
+
+    /// Returns the VM-pixel → device-pixel mapping of the presented frame, or
+    /// `None` when the script-visible size cannot be fitted into the
+    /// framebuffer.
+    pub fn translation(&self) -> Option<engine::PixelTranslation> {
+        self.engine.translation()
+    }
+
+    /// Returns the script-visible surface size: the first scene window's client
+    /// size, or the framebuffer size when the scene has no window.
+    pub fn vm_size(&self) -> (u32, u32) {
+        self.engine.vm_size()
+    }
+
+    /// Takes the script-side window size the platform window still has to
+    /// adopt, if any.
+    ///
+    /// The engine produces a request when the script creates a window whose
+    /// client size differs from the framebuffer and whenever that size changes
+    /// afterwards. Taking it clears it, so a size that does not change again is
+    /// applied once.
+    pub fn take_window_resize(&mut self) -> Option<(u32, u32)> {
+        self.engine.take_window_resize()
     }
 
     /// Whether the host draws the debug overlay.

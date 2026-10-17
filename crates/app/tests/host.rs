@@ -135,7 +135,7 @@ fn unchanged_revision_reuses_arena_and_mutation_reprojects() {
 }
 
 #[test]
-fn resize_propagates_to_the_primary_window() {
+fn resize_changes_only_the_framebuffer() {
     let mut host = headless_host();
     let window = build_solid_and_bitmap_scene(host.scene_mut());
     let primary = host
@@ -147,19 +147,57 @@ fn resize_propagates_to_the_primary_window() {
 
     host.resize((800, 600)).expect("resize");
 
-    // A window resize reaches the window's client size and the primary layer,
-    // which follows it off-origin at the new size
-    // (`reference/cpp/core/visual/LayerManager.cpp:334` ->
-    // `reference/cpp/core/visual/LayerIntf.cpp:2121`).
+    // The framebuffer follows the OS resize and nothing a script observes
+    // does: the only path from a window resize into the layer tree is the
+    // manager's resize notification, which the reference leaves unused
+    // (`reference/cpp/core/visual/LayerManager.cpp:334-343`).
+    assert_eq!(host.surface_size(), (800, 600));
     assert_eq!(
         host.scene().window(window).expect("window").inner_size,
-        (800, 600)
+        (320, 240)
     );
     let layer = host.scene().layer(primary).expect("primary layer");
     assert_eq!(
         (layer.rect.x, layer.rect.y, layer.rect.w, layer.rect.h),
-        (0, 0, 800, 600)
+        (0, 0, 320, 240)
     );
+
+    // The D40 presentation extension fits the VM size into the new
+    // framebuffer: 800x600 is exactly 2.5x of 320x240, so there is no margin.
+    let translation = host.translation().expect("fittable sizes");
+    assert_eq!(translation.vm_size, (320, 240));
+    assert_eq!(translation.device_size, (800, 600));
+    assert_eq!(translation.scale, 2.5);
+    assert_eq!(translation.offset, (0.0, 0.0));
+}
+
+#[test]
+fn a_script_window_resize_is_surfaced_once() {
+    let mut host = headless_host();
+    let window = build_solid_and_bitmap_scene(host.scene_mut());
+
+    // The window the scene created is surfaced on the first frame, because
+    // its client size differs from the framebuffer.
+    host.step(16.0).expect("step");
+    assert_eq!(host.take_window_resize(), Some((320, 240)));
+    assert_eq!(host.take_window_resize(), None, "a taken request is gone");
+
+    // A later script resize of the window's client size is a new request.
+    // The window's client area is what a script sees and moves
+    // (`reference/cpp/core/visual/LayerManager.cpp:341-342`).
+    if let Some(window_state) = host.scene_mut().window_mut(window) {
+        window_state.inner_size = (400, 300);
+    }
+    host.step(16.0).expect("step");
+    assert_eq!(host.take_window_resize(), Some((400, 300)));
+    assert_eq!(host.take_window_resize(), None, "a taken request is gone");
+
+    // The presentation follows the new VM size into the unchanged framebuffer
+    // (the D40 extension).
+    assert_eq!(host.vm_size(), (400, 300));
+    let translation = host.translation().expect("fittable sizes");
+    assert_eq!(translation.vm_size, (400, 300));
+    assert_eq!(translation.device_size, (1280, 720));
 }
 
 /// Boots the production composition root and confirms it installs the

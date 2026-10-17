@@ -120,6 +120,18 @@ fn drawable_layer(engine: &mut Engine, window: u32) -> u32 {
     layer
 }
 
+/// The projected `dst` rectangles of the drawn (textured) nodes, in arena
+/// order.
+fn drawn_dsts(engine: &Engine) -> Vec<RectF> {
+    engine
+        .render_scene()
+        .nodes
+        .iter()
+        .filter(|node| matches!(&node.content, RenderContent::Texture(_)))
+        .map(|node| node.dst)
+        .collect()
+}
+
 #[test]
 fn step_advances_the_frame_clock_and_frame_index() {
     let mut engine = headless_engine((64, 64));
@@ -198,20 +210,24 @@ fn timer_callback_fires_inside_step() {
 }
 
 #[test]
-fn resize_updates_the_surface_window_and_primary_layer() {
-    // reference/cpp/core/visual/LayerManager.cpp:342 — a window resize sets
-    // the primary layer's size; reference/cpp/core/visual/LayerManager.cpp:187
-    // derives the client size back from that primary layer.
+fn resize_changes_the_framebuffer_without_touching_the_scene_window() {
+    // reference/cpp/core/visual/LayerManager.cpp:342 — the script-visible
+    // window client size is what the primary layer follows. Here the VM window
+    // size is that client size and an OS resize moves only the framebuffer;
+    // presenting an unchanged VM surface at a different framebuffer size is
+    // the documented extension (D34/D39/D40), not reference behaviour.
     let mut engine = headless_engine((64, 48));
     let window = engine.scene_mut().add_window("game", (64, 48));
     let primary = engine.scene_mut().add_layer(window, None);
+    let layer_rect = engine.scene().layer(primary).expect("layer").rect;
 
     let event = engine.resize((128, 96)).expect("resize");
     assert_eq!(event, SurfaceEvent::Resized(128, 96));
     assert_eq!(engine.surface_size(), (128, 96));
+    assert_eq!(engine.vm_size(), (64, 48), "the OS size is not the VM size");
     assert_eq!(
         engine.scene().window(window).expect("window").inner_size,
-        (128, 96)
+        (64, 48)
     );
     assert_eq!(
         engine.scene().window(window).expect("window").primary_layer,
@@ -219,8 +235,16 @@ fn resize_updates_the_surface_window_and_primary_layer() {
     );
     assert_eq!(
         engine.scene().layer(primary).expect("layer").rect,
-        Rect::new(0, 0, 128, 96)
+        layer_rect
     );
+
+    // 64x48 into 128x96 doubles both axes with no margin.
+    let translation = engine.translation().expect("mapping");
+    assert_eq!(translation.scale, 2.0);
+    assert_eq!(translation.offset, (0.0, 0.0));
+
+    // An OS resize never asks the composition root for a window resize.
+    assert_eq!(engine.take_window_resize(), None);
 
     // A zero size clamps to one pixel per axis.
     assert_eq!(
@@ -228,16 +252,147 @@ fn resize_updates_the_surface_window_and_primary_layer() {
         SurfaceEvent::Resized(1, 1)
     );
     assert_eq!(engine.surface_size(), (1, 1));
+    assert_eq!(engine.vm_size(), (64, 48));
 
     // An unchanged size is reported without touching the backend.
     assert_eq!(
         engine.resize((1, 1)).expect("resize"),
         SurfaceEvent::Resized(1, 1)
     );
+    assert_eq!(engine.vm_size(), (64, 48));
+}
+
+#[test]
+fn a_scaled_presentation_maps_the_projected_tree_into_the_framebuffer() {
+    // The layer's VM placement (10,10,50,50) is reference-compatible; fitting
+    // it into a differently sized framebuffer is the documented extension
+    // (D34/D39/D40).
+    let mut engine = headless_engine((200, 200));
+    let window = engine.scene_mut().add_window("game", (100, 100));
+    let layer = engine.scene_mut().add_layer(window, None);
+    let bitmap = engine
+        .scene_mut()
+        .add_bitmap(50, 50, vec![0u8; 50 * 50 * 4]);
+    {
+        let state = engine.scene_mut().layer_mut(layer).expect("layer");
+        state.rect = Rect::new(10, 10, 50, 50);
+        state.visible = true;
+        state.bitmap = Some(bitmap);
+        state.image_width = 50;
+        state.image_height = 50;
+    }
+    let mut hooks = Recorder::default();
+
+    engine.step(1.0, &mut hooks).expect("frame");
+    let translation = engine.translation().expect("mapping");
+    assert_eq!(translation.scale, 2.0);
+    assert_eq!(translation.offset, (0.0, 0.0));
+    assert_eq!(translation.vm_size, (100, 100));
+    assert_eq!(translation.device_size, (200, 200));
+    assert_eq!(
+        drawn_dsts(&engine),
+        vec![RectF::new(20.0, 20.0, 100.0, 100.0)]
+    );
+
+    // A wider framebuffer letterboxes the VM surface: the scale stays 2 and
+    // the 200-device-pixel margin is split into 100 on each side.
+    engine.resize((400, 200)).expect("resize");
+    engine.step(1.0, &mut hooks).expect("frame");
+    let translation = engine.translation().expect("mapping");
+    assert_eq!(translation.scale, 2.0);
+    assert_eq!(translation.offset, (100.0, 0.0));
+    assert_eq!(
+        drawn_dsts(&engine),
+        vec![RectF::new(120.0, 20.0, 100.0, 100.0)]
+    );
     assert_eq!(
         engine.scene().window(window).expect("window").inner_size,
-        (1, 1)
+        (100, 100),
+        "an OS resize leaves the VM window alone"
     );
+}
+
+#[test]
+fn a_script_window_resize_is_surfaced_once() {
+    // reference/cpp/core/visual/LayerManager.cpp:342 — the window client size
+    // is the script-visible surface; a script that changes it is reported to
+    // the composition root, which owns the OS window.
+    let mut engine = headless_engine((200, 200));
+    let window = engine.scene_mut().add_window("game", (100, 100));
+    engine.scene_mut().add_layer(window, None);
+    let mut hooks = Recorder::default();
+
+    engine.step(1.0, &mut hooks).expect("frame");
+    assert_eq!(
+        engine.take_window_resize(),
+        Some((100, 100)),
+        "the declared size differs from the framebuffer, so it asks for a window resize"
+    );
+    assert_eq!(engine.take_window_resize(), None, "taking it clears it");
+
+    engine.step(1.0, &mut hooks).expect("frame");
+    assert_eq!(
+        engine.take_window_resize(),
+        None,
+        "a size that does not change asks for nothing"
+    );
+
+    engine
+        .scene_mut()
+        .window_mut(window)
+        .expect("window")
+        .inner_size = (150, 150);
+    engine.step(1.0, &mut hooks).expect("frame");
+    assert_eq!(engine.take_window_resize(), Some((150, 150)));
+
+    engine.step(1.0, &mut hooks).expect("frame");
+    assert_eq!(
+        engine.take_window_resize(),
+        None,
+        "later frames do not repeat the request"
+    );
+    assert_eq!(engine.vm_size(), (150, 150));
+}
+
+#[test]
+fn an_empty_vm_window_skips_the_draw_and_recovers() {
+    let mut engine = headless_engine((100, 100));
+    let window = engine.scene_mut().add_window("game", (0, 0));
+    engine.scene_mut().add_layer(window, None);
+    let mut hooks = Recorder::default();
+
+    let skipped = engine.step(1.0, &mut hooks).expect("frame");
+    assert!(
+        engine.translation().is_none(),
+        "a zero VM dimension has no fit"
+    );
+    assert!(skipped.stats.is_none(), "nothing was drawn");
+    assert_eq!(skipped.render_ms, 0.0);
+    assert_eq!(skipped.project_ms, 0.0);
+    assert_eq!(skipped.sync_ms, 0.0);
+    assert_eq!(skipped.frame_index, 1, "the frame is still counted");
+
+    // The script's size is reported even when it cannot be presented; the
+    // composition root owns making it a valid OS window size.
+    assert_eq!(engine.take_window_resize(), Some((0, 0)));
+
+    // The unfittable size keeps skipping on later frames.
+    let second = engine.step(1.0, &mut hooks).expect("frame");
+    assert!(second.stats.is_none());
+    assert_eq!(engine.take_window_resize(), None);
+
+    engine
+        .scene_mut()
+        .window_mut(window)
+        .expect("window")
+        .inner_size = (50, 50);
+    let recovered = engine.step(1.0, &mut hooks).expect("frame");
+    assert!(
+        recovered.stats.is_some(),
+        "the draw resumes once a size fits"
+    );
+    assert!(engine.translation().is_some());
+    assert_eq!(engine.frame_index(), 3);
 }
 
 #[test]
