@@ -11,7 +11,7 @@ fs = { workspace = true }
 render = { workspace = true }
 cosmic-text = { workspace = true }
 thiserror = { workspace = true }
-log = { workspace = true }
+log = { workspace = true, features = ["std"] }
 ahash = { workspace = true }
 
 [dev-dependencies]

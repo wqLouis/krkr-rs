@@ -31,3 +31,4 @@ crates/engine/src/sound.rs:1170:pub fn is_paused(&self) -> bool — read-only qu
 crates/engine/src/sound.rs:1175:pub fn is_done(&self) -> bool — read-only query; `done` is private and mutated together with `playing`/`paused`
 crates/engine/src/trans/mod.rs:498:pub fn is_complete(&self) -> bool — read-only query; `completed` is private playback state
 crates/engine/src/video.rs:364:pub fn is_playing(&self) -> bool — read-only query; `playing` is private and mutated together with the frame clock
+crates/engine/src/engine.rs:481:pub fn is_headless(&self) -> bool — read-only query; `headless` is fixed at construction and selects the audio backend, so it is not a writable field

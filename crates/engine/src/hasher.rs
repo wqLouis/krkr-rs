@@ -1,7 +1,7 @@
 //! Fixed-seed ahash maps for the engine's lookup tables.
 
 /// A `HashMap` keyed with the engine's fixed-seed hasher.
-pub(crate) type Map<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
+pub type Map<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 
 /// The engine's hasher. Fixed seeds keep hashing deterministic across runs;
 /// `ahash`'s default `RandomState` is randomized per process.
