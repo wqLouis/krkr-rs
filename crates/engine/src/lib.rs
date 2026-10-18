@@ -45,7 +45,8 @@ pub use crate::translate::{PixelTranslation, TranslateError};
 // `storage`, `startup`); they are not part of the stable flat surface.
 pub use projection::{ComposedLayer, compose_layer, project_scene, project_window, resolve_blend};
 pub use scene::{
-    BitmapState, DecodedImageKey, DecodedImageMode, FontState, LayerState, Rect, Scene, WindowState,
+    BitmapState, CacheLimit, DecodedImageKey, DecodedImageMode, FontState, LayerState, Rect, Scene,
+    WindowState,
 };
 pub use startup::{StartupError, discover_startup};
 pub use storage::{Location, MountError, Storage, StorageMetadata, StorageReadError};

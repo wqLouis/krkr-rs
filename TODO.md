@@ -869,7 +869,9 @@ yet.
 
 ## 20. Open: GPU descriptor-pool exhaustion / memory growth
 
-**Status: open — deliberately not fixed yet; do a full audit first.**
+**Status: open — cache growth in the config cycle is not the cause; the
+remaining limits are the fixed descriptor pool and the exit-time heap
+corruption.**
 
 Symptom (windowed Vulkan, a real title, after a while of play):
 
@@ -879,18 +881,36 @@ WARN app] failed to upload N bitmap(s): out of GPU memory: failed to allocate a
 ```
 
 repeating every frame, alongside `audio: … frame exceeds the 250 ms playback
-cap`. It appeared on the branch after `android-v2.0.9-alpha` and persists after
-the two self-cycle leak fixes below.
+cap`.
+
+**Measured (headless, 600 frames, current tree):**
+
+| run | layers | bitmaps | textures |
+|---|---:|---:|---:|
+| title, no config | 23 | 51 | 51 |
+| config opened, then closed | 23 | 51 | 51 |
+| config opened again | 342 | 263 | 263 |
+
+The config page returns exactly to the title baseline when it closes. The
+342/263 figure is the second `ConfigWindow`'s live scene tree, not a cache:
+every id is reachable from the window DFS, and `textures` tracks `bitmaps`
+one-for-one. The decoded-image cache is disabled by default (`0` in the
+reference), so it holds nothing during this run. RSS retention after a close
+is allocator high-water, not live objects.
 
 What is known:
 * `create_descriptor_pool` is `COMBINED_IMAGE_SAMPLER × 1024`, `max_sets(1024)`,
-  with `FREE_DESCRIPTOR_SET`, and `texture.destroy` frees the set. So the pool
+  with `FREE_DESCRIPTOR_SET`, and `texture.destroy` frees the set. The pool
   only exhausts when more than 1024 textures are live, or a texture handle is
   dropped without `destroy` (or re-created under a key without destroying the
-  old one).
-* The failure means `scene.bitmaps` is not dropping, so `prune_stale_textures`
-  never frees the textures. Which object still roots those bitmaps is not yet
-  identified.
+  old one). This is a real fixed cap, independent of the config cycle.
+* A cache limit does not bound live layers or their textures. The reference
+  bounds only its optional decoded-image cache through
+  `System.graphicCacheLimit`: `0` disables, `-1` selects the system cap, and a
+  positive value is a byte cap (512 MiB maximum). The port now represents that
+  bound as `CacheLimit::{Disabled, Unlimited, Bytes}` in `engine::Scene`; the
+  script adapter keeps the reference's integer contract (`0` is disabled, and
+  `Unlimited` is never selected by script).
 * Fixed so far (do not re-open): the layer registry no longer roots every layer
   (`ObjectRegistry.layers` is a non-owning handle); MenuItem / Timer /
   WaveSoundBuffer / AsyncTrigger no longer store their own `objthis`; the
@@ -905,17 +925,13 @@ What is known:
   layer is owned by its Window, so it is released when the window is; the
   descriptor-set/`ObjectRegistry` counters remain the next audit step.
 
-What the audit must do:
-1. Add live counters to the debug overlay — `scene.bitmaps`, `Host::textures`,
-   the Vulkan texture/descriptor-set count, and the `ObjectRegistry` map sizes —
-   then drive a real page/motion/config cycle on a title and watch which
-   counter grows (and whether it ever falls). **Partially done:** the overlay
-   now shows windows/layers/bitmaps/fonts/textures; descriptor-set and
-   `ObjectRegistry` counts are still missing.
-2. Separate "a genuine retainer" from "the reference's own graphic cache
-   limit". The reference bounds live graphics through `System.graphicCacheLimit`;
-   the port uploads one texture per live scene bitmap with **no** such bound, so
-   a scene with >1024 live bitmaps exhausts the pool even with no leak at all.
-3. Only then decide: fix the retainer, or bound the live texture set the way the
-   reference bounds its graphic cache (its own mechanism — not an arbitrary
-   cap).
+What remains:
+1. Grow or size the Vulkan descriptor pool from the live texture count instead
+   of the fixed 1024, or establish the reference's own bound. Do not call the
+   1024 a cache limit; it is a hard pool cap.
+2. Fix the exit-time `free(): chunks in smallbin corrupted` abort. It also
+   reproduces on the no-config title run, so it is independent of layer count
+   and caching; audit the compat-context/FFI release order at teardown.
+3. Keep the overlay counters (windows/layers/bitmaps/fonts/textures) as the
+   regression evidence; descriptor-set and `ObjectRegistry` counts are still
+   missing.

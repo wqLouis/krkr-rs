@@ -12,6 +12,7 @@
 //! `compat` native adapter calls into these operations.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 
 use api::blend::BlendMode;
 use api::media::DecodedImage;
@@ -258,6 +259,63 @@ pub struct LayerState {
     pub shutdown: bool,
 }
 
+/// The bound on a decoded-image cache.
+///
+/// [`Self::Disabled`] stores nothing. [`Self::Unlimited`] keeps every entry.
+/// [`Self::Bytes`] evicts least-recently-used entries until the cached bytes
+/// fit the bound. The byte count is the sum of the decoded RGBA buffers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CacheLimit {
+    /// Do not cache decoded images.
+    #[default]
+    Disabled,
+    /// Keep every decoded image.
+    Unlimited,
+    /// Keep at most this many decoded bytes.
+    Bytes(NonZeroU64),
+}
+
+impl CacheLimit {
+    /// A byte limit; zero means unlimited.
+    #[must_use]
+    pub fn bytes(limit: u64) -> Self {
+        NonZeroU64::new(limit).map_or(Self::Unlimited, Self::Bytes)
+    }
+
+    /// Whether the cache stores entries.
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// The byte bound, or `None` when caching is disabled. An unlimited cache
+    /// reports `Some(0)`.
+    #[must_use]
+    pub const fn option(self) -> Option<u64> {
+        match self {
+            Self::Disabled => None,
+            Self::Unlimited => Some(0),
+            Self::Bytes(bytes) => Some(bytes.get()),
+        }
+    }
+}
+
+impl From<Option<u64>> for CacheLimit {
+    fn from(limit: Option<u64>) -> Self {
+        match limit {
+            None => Self::Disabled,
+            Some(0) => Self::Unlimited,
+            Some(bytes) => Self::bytes(bytes),
+        }
+    }
+}
+
+impl From<CacheLimit> for Option<u64> {
+    fn from(limit: CacheLimit) -> Self {
+        limit.option()
+    }
+}
+
 /// One decoded bitmap (RGBA8, straight alpha).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -420,8 +478,8 @@ impl DecodedImageKey {
 /// least-recently-used order and the byte limit.
 ///
 /// The limit counts the decoded bytes (`Width * Height * PixelSize`,
-/// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1305-1310`); the cache is
-/// enabled only while the limit is nonzero, matching the reference's default
+/// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1305-1310`). The cache is
+/// disabled by default, matching the reference's default
 /// (`:1433-1434`).
 #[derive(Debug)]
 struct DecodedImageCache {
@@ -433,8 +491,8 @@ struct DecodedImageCache {
     order: Vec<DecodedImageKey>,
     /// Sum of the cached images' `rgba` byte counts.
     total_bytes: u64,
-    /// Byte limit; `0` disables the cache.
-    limit: u64,
+    /// Cache bound.
+    limit: CacheLimit,
 }
 
 impl Default for DecodedImageCache {
@@ -443,7 +501,7 @@ impl Default for DecodedImageCache {
             entries: crate::hasher::map(),
             order: Vec::new(),
             total_bytes: 0,
-            limit: 0,
+            limit: CacheLimit::Disabled,
         }
     }
 }
@@ -451,7 +509,7 @@ impl Default for DecodedImageCache {
 impl DecodedImageCache {
     /// Whether the cache stores entries.
     fn enabled(&self) -> bool {
-        self.limit != 0
+        self.limit.is_enabled()
     }
 
     /// Look `key` up, mark it most recently used and return an owned copy of
@@ -467,7 +525,13 @@ impl DecodedImageCache {
     /// (the reference `TVPCheckGraphicCacheLimit`,
     /// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1441-1454`).
     fn evict_to_limit(&mut self) {
-        while self.total_bytes > self.limit {
+        let Some(limit) = self.limit.option() else {
+            return;
+        };
+        if limit == 0 {
+            return;
+        }
+        while self.total_bytes > limit {
             let Some(key) = self.order.first().cloned() else {
                 break;
             };
@@ -2117,9 +2181,27 @@ impl Scene {
         freed
     }
 
-    /// The decoded-image cache byte limit (`0` when the cache is disabled).
+    /// The decoded-image cache byte limit (`0` when the cache is disabled or
+    /// unlimited). The script-visible property uses the reference's numeric
+    /// encoding; [`Self::decoded_image_cache_limit`] exposes the typed value.
     pub fn graphic_cache_limit(&self) -> u64 {
+        self.image_cache.limit.option().unwrap_or(0)
+    }
+
+    /// The typed decoded-image cache bound.
+    pub fn decoded_image_cache_limit(&self) -> CacheLimit {
         self.image_cache.limit
+    }
+
+    /// Set the decoded-image cache bound. `None` disables caching, `Some(0)`
+    /// keeps every entry, and `Some(n)` caps the cached bytes at `n`.
+    pub fn set_decoded_image_cache_limit(&mut self, limit: impl Into<CacheLimit>) {
+        self.image_cache.limit = limit.into();
+        if self.image_cache.enabled() {
+            self.image_cache.evict_to_limit();
+        } else {
+            self.clear_decoded_image_cache();
+        }
     }
 
     /// Set the decoded-image cache byte limit, mirroring
@@ -2136,14 +2218,11 @@ impl Scene {
     /// no memory probe, so the cap is the system limit.
     pub fn set_graphic_cache_limit(&mut self, limit: i64) {
         const SYSTEM_LIMIT: u64 = 512 * 1024 * 1024;
-        self.image_cache.limit = if limit == 0 {
-            0
-        } else if limit == -1 {
-            SYSTEM_LIMIT
-        } else {
-            (limit as u64).min(SYSTEM_LIMIT)
-        };
-        self.image_cache.evict_to_limit();
+        self.set_decoded_image_cache_limit(match limit {
+            0 => CacheLimit::Disabled,
+            -1 => CacheLimit::bytes(SYSTEM_LIMIT),
+            _ => CacheLimit::bytes((limit as u64).min(SYSTEM_LIMIT)),
+        });
     }
 
     /// Drop every decoded-image cache entry (the reference
@@ -2650,6 +2729,51 @@ mod tests {
 
         load_cached(&mut scene, &decodes, "huge", 1024);
         assert_eq!(decodes.get(), 3, "the oversized entry decodes again");
+    }
+
+    /// The typed limit distinguishes no cache, unlimited caching and a byte
+    /// cap. `Option` follows the same encoding: `None` disables, `Some(0)` is
+    /// unlimited, `Some(n)` is a byte cap.
+    #[test]
+    fn cache_limit_option_distinguishes_disabled_unlimited_and_bytes() {
+        assert_eq!(CacheLimit::from(None), CacheLimit::Disabled);
+        assert_eq!(CacheLimit::from(Some(0)), CacheLimit::Unlimited);
+        assert_eq!(CacheLimit::from(Some(256)), CacheLimit::bytes(256));
+        assert!(!CacheLimit::Disabled.is_enabled());
+        assert!(CacheLimit::Unlimited.is_enabled());
+        assert_eq!(CacheLimit::Unlimited.option(), Some(0));
+        assert_eq!(CacheLimit::bytes(256).option(), Some(256));
+        assert_eq!(CacheLimit::bytes(0), CacheLimit::Unlimited);
+    }
+
+    /// An unlimited cache keeps every entry until it is replaced by a finite
+    /// cap or disabled. Disabling clears the entries immediately.
+    #[test]
+    fn unlimited_cache_keeps_entries_until_disabled() {
+        let decodes = Cell::new(0);
+        let mut scene = Scene::default();
+        scene.set_decoded_image_cache_limit(CacheLimit::Unlimited);
+        assert_eq!(scene.decoded_image_cache_limit(), CacheLimit::Unlimited);
+
+        load_cached(&mut scene, &decodes, "a", 256);
+        load_cached(&mut scene, &decodes, "b", 256);
+        load_cached(&mut scene, &decodes, "c", 256);
+        assert_eq!(scene.image_cache.total_bytes, 768);
+        load_cached(&mut scene, &decodes, "a", 256);
+        assert_eq!(decodes.get(), 3, "the unlimited cache hits");
+
+        scene.set_decoded_image_cache_limit(Some(256));
+        assert_eq!(scene.decoded_image_cache_limit(), CacheLimit::bytes(256));
+        assert_eq!(scene.image_cache.total_bytes, 256);
+        assert!(cached(&scene, "a"), "the most recent entry survives");
+
+        scene.set_decoded_image_cache_limit(None);
+        assert_eq!(scene.decoded_image_cache_limit(), CacheLimit::Disabled);
+        assert!(scene.image_cache.entries.is_empty());
+        assert_eq!(scene.image_cache.total_bytes, 0);
+        load_cached(&mut scene, &decodes, "a", 256);
+        load_cached(&mut scene, &decodes, "a", 256);
+        assert_eq!(decodes.get(), 5, "the disabled cache never hits");
     }
 
     /// A limit of zero disables the cache: existing entries are evicted by
