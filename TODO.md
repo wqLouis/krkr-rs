@@ -334,13 +334,16 @@ Open:
    `PresentationScaling`/`--scaling`/`ViewTransform`/`native_size` removal)
    has landed.
 
-3. **Explicit VM resolution (next)** — the launcher can set the game's VM
-   size (`--vm-size WxH`, and the display/window size) so the game runs at
-   that resolution instead of its declared fixed size. The existing Fit
-   translation maps the forced VM surface to the window; scripts see the forced
-   size (`System.screenWidth`, window). This requires the scene window and
-   primary layer to follow the forced size and script window-size changes to be
-   held at it. Default remains the game's declared size.
+3. **Explicit VM resolution — landed.** `--vm-size WxH` forces the game's VM
+   surface; `--vm-size display` (aliases `window`/`native`) uses the primary
+   display's physical size. The scene window and primary layer are held at the
+   forced size, script window-size writes are ignored, and the existing Fit
+   translation maps the VM surface to the actual window. The default remains
+   the game's declared size. On a fixed-layout title (the test game hardcodes
+   `WINDOW_WIDTH=1280` and uses its in-game “1080p” option as a window zoom)
+   the forced VM size enlarges the screen but the game’s layers keep their
+   authored size; a native-resolution re-layout or a window-zoom presentation
+   is a separate game-compatibility question, not part of this flag.
 
 Open sub-items are tracked there and in `07`; the remaining mixer/video/
 transition pumps above still apply. Render-resolution decoupling (keep VM,
