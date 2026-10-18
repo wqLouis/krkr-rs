@@ -53,6 +53,9 @@ Rules:
   if a name needs a sentence, the function probably does too much. Do not
   encode parameter types or the return type in the name
   (`parse_string_to_u32_result` is noise).
+- Test names are descriptive sentences that state the behavior under test;
+  they are exempt from the word limit. Keep the reference citation next to the
+  assertion, not in the test name.
 - No `helper`, `util`, `manager`, `handler`, `processor`, `impl`, or `base`
   suffixes unless the thing really is that role. Prefer the concrete noun:
   `FontRegistry`, `Scene`, `Transition`, not `FontManager`.
