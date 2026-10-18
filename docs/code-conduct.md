@@ -10,6 +10,62 @@ write the cleanest Rust that expresses it.
 
 ---
 
+## 0. Agent baseline — what a worker writes and does
+
+A worker delivers one small, reviewable, behavior-preserving change in an
+explicit scope. The main agent owns the design, the integration and the gate;
+the worker owns the implementation of its slice.
+
+Before writing code, the worker states:
+
+- the one job of the change and the file(s) it belongs in;
+- the reference behaviour or design contract that makes it correct;
+- the state owner and the layer that must own it;
+- what must **not** move: script-visible values, member names, errors, ABI,
+  surface lock, public API;
+- the smallest verification that proves it.
+
+When writing code, prefer this shape:
+
+```rust
+// A value with an invariant.
+struct CacheLimit { /* ... */ }
+
+// One explicit action; the weakest useful borrows.
+fn trim_to(&mut self, limit: CacheLimit) -> usize { /* ... */ }
+
+// Composition and exhaustive state.
+enum CacheMode { Disabled, Unlimited, Bytes(u64) }
+```
+
+Use structs, enums, free functions and explicit state. Do not recreate a class
+hierarchy, a `Manager`, a vtable, an `*Impl`, or a C++ ownership pair. Use a
+trait or macro only when the same structure genuinely repeats at least three
+times; otherwise a helper function is clearer.
+
+The worker **does not**:
+
+- change behaviour, public/script-visible names or the surface baseline to make
+  a cleanup easier;
+- fix an unrelated bug found on the way — report it instead;
+- add a dependency, a global, a hidden cache or a fallback;
+- widen its own write scope or edit a file another worker owns;
+- run `cargo build`, `cargo check`, `cargo clippy`, `cargo test`, `cargo run`,
+  or `rustc`; the main agent runs those.
+
+The worker finishes by running `cargo fmt` and the compiler-free guards listed
+in §8, then reports:
+
+1. files changed and the exact scope;
+2. patterns fixed, with the behavior-preserving argument;
+3. behavior risk and anything deliberately left alone;
+4. blockers, or a bug that belongs to another scope.
+
+A worker result is a proposal. The main agent reads the diff, checks the layer
+boundary and the reference, and runs the full gate before committing.
+
+---
+
 ## 1. Non-negotiables
 
 - Preserve behavior. A refactor must not change a script-visible value, an

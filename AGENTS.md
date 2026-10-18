@@ -8,9 +8,86 @@ disagree, the design docs win; fix the code, then update the doc.
 Repo: `/mnt/DATA/Document/code/krkr-rs` · Branch: `main`
 Real game for manual checks: `/mnt/DATA/Games/Others/test`.
 
+Read order: this file, then `docs/code-conduct.md` for the Rust-level baseline,
+then only the design/reference pages a task actually needs. Do not load the
+whole repository or all of `docs/migration/**` into every agent.
+
 ---
 
-## 0. The gate — the main agent runs it, nobody else
+## 0. Agent roles — the main agent orchestrates, subagents implement
+
+The **main agent is the orchestrator and integrator**. It holds the full project
+picture: the layer model and dependency direction, the design decisions and
+their trade-offs, the current work graph, the user's intent, the surface lock,
+and the gate state. It decides *what* changes, *where* it belongs and *whether*
+it is correct. It does not spend its context typing every mechanical edit; it
+delegates bounded modules to workers and reviews their result against the
+whole.
+
+The main agent must always be able to answer:
+
+- Which layer owns this state/behaviour, and which layers may depend on it?
+- Which reference behaviour is the oracle, and what is script-observable?
+- Which files are in flight, who owns each one, and what is the next gate?
+- What is the current known risk or approximation, and where is it recorded?
+
+User-visible design, cross-layer changes, the surface baseline, commits, tags,
+and the final gate stay with the main agent. Routine module cleanup, a scoped
+bug fix, and a mechanical migration are delegated.
+
+### 0.1 Subagents are scoped workers
+
+A subagent is a worker with a **narrow, explicit scope**. It implements one
+coherent change, in the assigned files, against the reference and the layer
+contract. It does not redesign the surrounding system, fix unrelated bugs, or
+change behaviour it was not asked to change.
+
+Every task brief states:
+
+1. **Outcome** — the behaviour or cleanup required, and the evidence that will
+   prove it.
+2. **Scope** — exact files/directories it may edit; reads are unrestricted.
+3. **Contract** — reference citations for behaviour, invariants to preserve,
+   public/script surface that must not move, non-goals.
+4. **Verification** — `rustfmt` and compiler-free guards only; the main agent
+   runs build/clippy/test.
+5. **Report format** — files changed, patterns fixed, behavior risk, deliberate
+   leftovers, blockers.
+
+A task brief is deliberately short enough to paste into a worker:
+
+```text
+Goal:        one behavior or cleanup, with the evidence that proves it
+Write:       exact files/directories; no other writes
+Read:        the module, its callers, and the cited reference lines
+Must hold:   invariants, public/script surface, layer boundary
+Do not:      unrelated fixes, new deps, public renames, commits
+Verify:      rustfmt + compiler-free guards only; main runs the gate
+Report:      files, patterns, risk, left alone, blockers
+```
+
+Parallel workers only run on **disjoint write scopes**. Two workers never edit
+the same file in one wave. A worker that finds a bug outside its scope reports
+it; it does not fix it.
+
+Workers must not run `cargo build`, `cargo check`, `cargo clippy`, `cargo test`,
+`cargo run`, or `rustc`. Parallel builds have exhausted `/tmp` and corrupted the
+tree before. Workers *may* run `cargo fmt` / `rustfmt` and already-built
+binaries under `target/debug/`.
+
+### 0.2 What the main agent does with a worker result
+
+1. Read the diff, not only the report. Check the layer boundary, the reference
+   behaviour, the surface lock and the task's non-goals.
+2. Reject silent fallbacks, unrelated refactors, new dependencies and
+   unreviewed public/script changes.
+3. Integrate, then run the full static gate and the test suites.
+4. Commit only after both are green. Update the design doc when the code change
+   changes a recorded contract.
+
+The main agent owns the camera; workers own the pixels.
+
+### 0.3 The gate — the main agent runs it, nobody else
 
 Only the **main agent** runs the build/test gate. Subagents (any delegated
 worker) may **not** run `cargo build`, `cargo check`, `cargo clippy`,
