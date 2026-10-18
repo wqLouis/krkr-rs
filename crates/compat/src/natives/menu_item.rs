@@ -78,6 +78,11 @@ struct MenuNode {
     parent: Option<u64>,
     /// Child node ids, in menu order.
     children: Vec<u64>,
+    /// Strong references to the children's script objects (reference
+    /// `AddChild`'s `item->Owner->AddRef()`, `MenuItemIntf.cpp:127-132`), so a
+    /// child added by `root.add(new MenuItem(...))` stays alive until it is
+    /// removed.
+    retained_children: HashMap<u64, DetachedValue>,
     /// Retained action owner (`MenuItem` constructor argument 0); the default
     /// `onClick` handler dispatches to it.
     action_owner: Option<DetachedValue>,
@@ -110,6 +115,7 @@ impl Default for MenuNode {
             shortcut: String::new(),
             parent: None,
             children: Vec::new(),
+            retained_children: HashMap::new(),
             action_owner: None,
             window: None,
             self_handle: 0,
@@ -255,16 +261,34 @@ fn item_id_from_arg(state: &MenuState, value: &Value) -> Option<u64> {
 }
 
 /// Detach `child_id` from `parent_id`, if it is a child.
-fn detach_child(state: &mut MenuState, parent_id: u64, child_id: u64) {
-    if let Some(parent) = state.nodes.get_mut(&parent_id)
-        && let Some(index) = parent.children.iter().position(|&child| child == child_id)
-    {
-        parent.children.remove(index);
-        parent.children_dirty = true;
+fn detach_child(state: &mut MenuState, parent_id: u64, child_id: u64) -> Option<DetachedValue> {
+    let mut released = None;
+    if let Some(parent) = state.nodes.get_mut(&parent_id) {
+        if let Some(index) = parent.children.iter().position(|&child| child == child_id) {
+            parent.children.remove(index);
+            parent.children_dirty = true;
+        }
+        released = parent.retained_children.remove(&child_id);
     }
     if let Some(child) = state.nodes.get_mut(&child_id) {
         child.parent = None;
     }
+    released
+}
+
+/// Keep the child's script object alive for as long as it is a child
+/// (reference `MenuItemIntf.cpp:127-132`). Returns the retention the same
+/// parent previously held for this child, if any.
+fn retain_child(
+    engine: &Tjs2Engine,
+    state: &mut MenuState,
+    parent_id: u64,
+    child_id: u64,
+) -> Option<DetachedValue> {
+    let handle = state.nodes.get(&child_id).map(|node| node.self_handle)?;
+    let object = retain_handle(engine, handle)?;
+    let parent = state.nodes.get_mut(&parent_id)?;
+    parent.retained_children.insert(child_id, object)
 }
 
 /// Insert `child_id` into `parent_id` at `index`, detaching it from any old
@@ -274,7 +298,7 @@ fn insert_child(
     parent_id: u64,
     child_id: u64,
     index: usize,
-) -> Result<(), String> {
+) -> Result<Option<DetachedValue>, String> {
     if !state.nodes.contains_key(&parent_id) || !state.nodes.contains_key(&child_id) {
         return Err("MenuItem: the item no longer exists".into());
     }
@@ -286,9 +310,12 @@ fn insert_child(
         }
         cursor = state.nodes.get(&current).and_then(|node| node.parent);
     }
-    if let Some(old_parent) = state.nodes.get(&child_id).and_then(|node| node.parent) {
-        detach_child(state, old_parent, child_id);
-    }
+    let old_retention =
+        if let Some(old_parent) = state.nodes.get(&child_id).and_then(|node| node.parent) {
+            detach_child(state, old_parent, child_id)
+        } else {
+            None
+        };
     {
         let parent = state
             .nodes
@@ -301,7 +328,7 @@ fn insert_child(
     if let Some(child) = state.nodes.get_mut(&child_id) {
         child.parent = Some(parent_id);
     }
-    Ok(())
+    Ok(old_retention)
 }
 
 /// Whether an item and every one of its ancestors is enabled
@@ -489,6 +516,7 @@ extern "C" fn menu_item_invalidate(engine: *mut c_void, instance: *mut c_void) {
                 node.action_owner.take(),
                 node.window.take(),
                 node.children_array.take(),
+                std::mem::take(&mut node.retained_children),
             ),
             children,
         )
@@ -666,7 +694,7 @@ extern "C" fn menu_item_add(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let Ok((_resolved, ctx)) = bound(engine) else {
+    let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.add: compat context is not bound");
     };
     // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_item_add`.
@@ -681,18 +709,27 @@ extern "C" fn menu_item_add(
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
-    let mut state = services.state::<MenuState>();
-    let Some(child) = item_id_from_arg(&state, value) else {
-        return report_error(out_error, "MenuItem.add expects a MenuItem");
+    let (old_retention, previous_retention) = {
+        let mut state = services.state::<MenuState>();
+        let Some(child) = item_id_from_arg(&state, value) else {
+            return report_error(out_error, "MenuItem.add expects a MenuItem");
+        };
+        if state.nodes.get(&child).and_then(|node| node.parent) == Some(id) {
+            set_void(out);
+            return 0;
+        }
+        let index = state.nodes.get(&id).map_or(0, |node| node.children.len());
+        let old_retention = match insert_child(&mut state, id, child, index) {
+            Ok(previous) => previous,
+            Err(error) => return report_error(out_error, &error),
+        };
+        let previous_retention = retain_child(resolved.engine(), &mut state, id, child);
+        (old_retention, previous_retention)
     };
-    if state.nodes.get(&child).and_then(|node| node.parent) == Some(id) {
-        set_void(out);
-        return 0;
-    }
-    let index = state.nodes.get(&id).map_or(0, |node| node.children.len());
-    if let Err(error) = insert_child(&mut state, id, child, index) {
-        return report_error(out_error, &error);
-    }
+    // Releasing these can run script finalizers, so do it after the state
+    // borrow is gone.
+    drop(old_retention);
+    drop(previous_retention);
     set_void(out);
     0
 }
@@ -708,7 +745,7 @@ extern "C" fn menu_item_insert(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let Ok((_resolved, ctx)) = bound(engine) else {
+    let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.insert: compat context is not bound");
     };
     // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_item_insert`.
@@ -723,25 +760,33 @@ extern "C" fn menu_item_insert(
     }
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
-    let mut state = services.state::<MenuState>();
-    let Some(child) = item_id_from_arg(&state, &values[0]) else {
-        return report_error(out_error, "MenuItem.insert expects a MenuItem");
+    let (old_retention, previous_retention) = {
+        let mut state = services.state::<MenuState>();
+        let Some(child) = item_id_from_arg(&state, &values[0]) else {
+            return report_error(out_error, "MenuItem.insert expects a MenuItem");
+        };
+        // `tjs_int index = *param[1]` raises on objects (`operator tjs_int` →
+        // `AsInteger`, `tjsVariant.h:933-935`).
+        let index = match try_value_as_i64(&values[1]) {
+            Ok(index) => index.max(0) as usize,
+            Err(error) => return report_error(out_error, &error),
+        };
+        // Duplicates are rejected by `ObjectVector::Add`
+        // (`MenuItemIntf.h:32-39`): inserting an item that is already a child
+        // keeps its position.
+        if state.nodes.get(&child).and_then(|node| node.parent) == Some(id) {
+            set_void(out);
+            return 0;
+        }
+        let old_retention = match insert_child(&mut state, id, child, index) {
+            Ok(previous) => previous,
+            Err(error) => return report_error(out_error, &error),
+        };
+        let previous_retention = retain_child(resolved.engine(), &mut state, id, child);
+        (old_retention, previous_retention)
     };
-    // `tjs_int index = *param[1]` raises on objects (`operator tjs_int` →
-    // `AsInteger`, `tjsVariant.h:933-935`).
-    let index = match try_value_as_i64(&values[1]) {
-        Ok(index) => index.max(0) as usize,
-        Err(error) => return report_error(out_error, &error),
-    };
-    // Duplicates are rejected by `ObjectVector::Add` (`MenuItemIntf.h:32-39`):
-    // inserting an item that is already a child keeps its position.
-    if state.nodes.get(&child).and_then(|node| node.parent) == Some(id) {
-        set_void(out);
-        return 0;
-    }
-    if let Err(error) = insert_child(&mut state, id, child, index) {
-        return report_error(out_error, &error);
-    }
+    drop(old_retention);
+    drop(previous_retention);
     set_void(out);
     0
 }
@@ -771,11 +816,14 @@ extern "C" fn menu_item_remove(
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
-    let mut state = services.state::<MenuState>();
-    let Some(child) = item_id_from_arg(&state, value) else {
-        return report_error(out_error, "MenuItem.remove expects a MenuItem");
+    let released = {
+        let mut state = services.state::<MenuState>();
+        let Some(child) = item_id_from_arg(&state, value) else {
+            return report_error(out_error, "MenuItem.remove expects a MenuItem");
+        };
+        detach_child(&mut state, id, child)
     };
-    detach_child(&mut state, id, child);
+    drop(released);
     set_void(out);
     0
 }
