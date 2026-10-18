@@ -185,10 +185,15 @@ extern "C" fn layer_invalidate(engine: *mut c_void, instance: *mut c_void) {
     }
     // SAFETY: `layer_create` allocated the payload and the VM keeps it
     // alive for the duration of the callback.
-    let inst = unsafe { &*(instance as *const LayerInst) };
+    let inst = unsafe { &mut *(instance as *mut LayerInst) };
     let Some(id) = inst.id else {
         return;
     };
+    // An invalidated layer cannot hand out its cached `Font` object again.
+    // Release it now; a script object that outlives the scene record (for
+    // example a config page's input-notify cycle) would otherwise keep the
+    // font retained after every Scene resource is gone.
+    drop(inst.font_object.take());
     let Ok((_resolved, ctx)) = bound(engine) else {
         return;
     };
@@ -214,6 +219,56 @@ extern "C" fn layer_invalidate(engine: *mut c_void, instance: *mut c_void) {
     // reference frees it with the layer object
     // (`reference/cpp/plugins/layerExMovie.cpp:318-327`).
     crate::natives::plugins::layer_ex::forget_layer(&ctx, id);
+    release_orphaned_layer_state(&ctx, _resolved.engine());
+}
+
+/// Release the cached L3 state of layers whose Scene record is already gone.
+///
+/// A final `Layer.Invalidate` destroys the whole Scene subtree. The child
+/// script objects may still be held by script arrays (the config page does
+/// this), so their `LayerInst.font_object` would otherwise keep a retained
+/// `Font` forever. This clears the cached font and plugin state for every
+/// registered layer id with no Scene record; the script object itself is
+/// still finalized by its own lifetime.
+fn release_orphaned_layer_state(ctx: &CompatCtx, host: &Tjs2Engine) {
+    let Some(scene) = scene_ref(ctx).ok() else {
+        return;
+    };
+    let candidates: Vec<(u32, *mut c_void)> = {
+        // SAFETY: the caller resolved a live compat context.
+        let services = unsafe { ctx.services() };
+        let mut state = services.state::<VisualState>();
+        let candidates = state
+            .objects
+            .layers
+            .iter()
+            .filter(|(id, _)| scene.layer(**id).is_none())
+            .map(|(id, handle)| (*id, handle.as_ptr()))
+            .collect();
+        // The Scene record is gone, so the registry entry can never resolve a
+        // live layer again. Remove it before invalidating the script object;
+        // a re-entrant `layer_invalidate` then sees no stale candidates.
+        state
+            .objects
+            .layers
+            .retain(|id, _| scene.layer(*id).is_some());
+        candidates
+    };
+    for (id, raw) in candidates {
+        let Ok(object) = host.retain_object_detached(raw) else {
+            continue;
+        };
+        if let Ok(Some(payload)) = host.native_instance_payload(object.raw_id(), "Layer") {
+            // SAFETY: `native_instance_payload("Layer")` only returns Layer
+            // payloads, and `object` keeps the payload alive for this call.
+            let inst = unsafe { &mut *(payload.as_ptr() as *mut LayerInst) };
+            drop(inst.font_object.take());
+        }
+        crate::natives::plugins::layer_ex::forget_layer(ctx, id);
+        if let Err(error) = host.invalidate_retained(object.raw_id()) {
+            log::debug!("Layer: orphan invalidate failed for #{id}: {error}");
+        }
+    }
 }
 
 extern "C" fn layer_destroy(engine: *mut c_void, instance: *mut c_void) {

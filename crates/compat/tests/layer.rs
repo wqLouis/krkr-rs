@@ -1085,3 +1085,37 @@ fn repeated_page_cycles_release_layers_bitmaps_and_fonts() {
         "a closed config page must not leave its fonts in the scene"
     );
 }
+
+/// Invalidating a page layer destroys its child Scene records; the child
+/// script objects may still be referenced by script arrays, so their cached
+/// `Font` wrappers must be released rather than staying in the engine's
+/// retained map.
+#[test]
+fn invalidating_a_parent_page_releases_child_font_wrappers() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let baseline = env.engine.retained_count();
+    env.run(
+        "var w = new Window(); \
+         var page = new Layer(w, null); \
+         var row = new Layer(w, page); \
+         var a = page.font; \
+         var b = row.font;",
+    );
+    assert!(
+        env.engine.retained_count() > baseline,
+        "the font getters must retain their wrappers"
+    );
+
+    env.run("invalidate page; page = null; row = null; a = null; b = null;");
+    env.run("System.doCompact();");
+    env.engine.do_gc().expect("idle compact");
+
+    assert_eq!(env.scene.layers.len(), 0, "the page subtree is gone");
+    assert!(
+        env.engine.retained_count() <= baseline + 1,
+        "child font wrappers must not stay retained: {} > {}",
+        env.engine.retained_count(),
+        baseline + 1
+    );
+}

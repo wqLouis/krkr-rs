@@ -894,6 +894,15 @@ impl Tjs2Engine {
         self.exec_script_with_context(script, name, ptr::null_mut(), 0)
     }
 
+    /// Returns the number of live retained-value entries.
+    ///
+    /// This is a diagnostic for native state that keeps script objects alive;
+    /// the value is the engine's retained-id map size.
+    pub fn retained_count(&self) -> usize {
+        // SAFETY: self.inner is a live engine.
+        unsafe { tjs2_retained_count(self.inner) }
+    }
+
     /// Execute a TJS script and discard its result.
     ///
     /// The C ABI receives a null result slot, so the VM materialises no
