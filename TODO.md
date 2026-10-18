@@ -896,6 +896,14 @@ What is known:
   WaveSoundBuffer / AsyncTrigger no longer store their own `objthis`; the
   motion snapshot store evicts on `unload`/`clearCache`; the `psb://` media is
   the reference's **session-global** cache, not per-file.
+* Fixed in `4995b84`: the Window registry is non-owning and Window
+  invalidate/destroy now tear down the scene tree; LayerExMovie no longer
+  stores an owning layer object and drops its per-layer state on
+  invalidate/destroy; `Layer.independMainImage` releases the replaced bitmap;
+  ignored script results use `Tjs2Engine::exec_script_discard` instead of
+  pinning the result register. Regression tests cover each path. The primary
+  layer is owned by its Window, so it is released when the window is; the
+  descriptor-set/`ObjectRegistry` counters remain the next audit step.
 
 What the audit must do:
 1. Add live counters to the debug overlay — `scene.bitmaps`, `Host::textures`,
