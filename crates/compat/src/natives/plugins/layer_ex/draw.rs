@@ -187,6 +187,16 @@ fn draw_state(ctx: &CompatCtx) -> std::cell::RefMut<'_, DrawState> {
     unsafe { ctx.services() }.state::<DrawState>()
 }
 
+/// Drop the per-layer drawing state of `id`.
+///
+/// The reference keeps this state on the layer's own native instance
+/// (`layerExBase`, `reference/cpp/plugins/layerExPerspective.cpp:255-296`), so
+/// it is freed with the layer; the transform and the recorded operation list
+/// must not outlive it.
+pub(crate) fn forget_layer(ctx: &CompatCtx, id: u32) {
+    draw_state(ctx).layers.remove(&id);
+}
+
 // ---------------------------------------------------------------------------
 // Geometry helpers
 // ---------------------------------------------------------------------------

@@ -11,8 +11,9 @@ use tjs::{
 };
 
 use super::common::{
-    ObjectKind, VisualState, WindowObject, bound, duplicate_object, input_ref, resolve_object_id,
-    scene_mut, scene_ref, set_null_out, set_object_out, set_real, set_retained_out,
+    ObjectHandle, ObjectKind, VisualState, WindowObject, bound, duplicate_object, input_ref,
+    resolve_object_id, scene_mut, scene_ref, set_null_out, set_object_out, set_real,
+    set_retained_out,
 };
 use super::{clear_layer_focus, focus_layer_in_input_domain};
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
@@ -135,22 +136,47 @@ fn resolve_touch_id(input: &InputState, arg: i64) -> Option<u64> {
     ids.get(value as usize).copied()
 }
 
-/// Retain `objthis` under `id` so cross-object properties can return it.
-fn register_window(ctx: &CompatCtx, host: &Tjs2Engine, id: u32, objthis: *mut c_void) {
+/// Register `objthis` under `id` so cross-object properties can return it.
+///
+/// The entry is a non-owning [`ObjectHandle`], like the layer registry: the
+/// reference native instance keeps its owner as a raw `iTJSDispatch2 *Owner`
+/// without a reference, so a window the script drops reaches reference count
+/// zero and its `Invalidate`/destroy callbacks run.
+fn register_window(ctx: &CompatCtx, id: u32, objthis: *mut c_void) {
     if objthis.is_null() {
         return;
     }
-    match host.retain_object_detached(objthis) {
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    unsafe { ctx.services() }
+        .state::<VisualState>()
+        .objects
+        .windows
+        .insert(id, ObjectHandle::new(objthis));
+}
+
+/// Release the per-window L3 state: the `Window.add` `ObjectVector`, the
+/// scene-id → script-object handle and the mouse-velocity sample.
+///
+/// Every registered object is invalidated, which runs its script `finalize`
+/// before the native teardown (`reference/cpp/core/visual/WindowIntf.cpp:211-221`),
+/// and the retained values are released when the vector drops. The registry
+/// entry is non-owning, so removing it does not touch the window's own
+/// reference count.
+fn release_window_objects(ctx: &CompatCtx, host: &Tjs2Engine, id: u32) {
+    let registered = {
         // SAFETY: the caller resolved `ctx` from the installed binding.
-        Ok(object) => {
-            // SAFETY: the callback resolved this context from the installed binding, whose service set is live for the whole VM lifetime.
-            unsafe { ctx.services() }
-                .state::<VisualState>()
-                .objects
-                .windows
-                .insert(id, object);
+        let services = unsafe { ctx.services() };
+        services.state::<MouseVelocityState>().last.remove(&id);
+        let mut state = services.state::<VisualState>();
+        state.objects.windows.remove(&id);
+        state.window_objects.remove(&id)
+    };
+    if let Some(registered) = registered {
+        for entry in &registered {
+            if let Err(error) = host.invalidate_retained(entry.value.raw_id()) {
+                log::warn!("Window: invalidate failed: {error}");
+            }
         }
-        Err(error) => log::warn!("Window: could not retain the script object: {error}"),
     }
 }
 
@@ -177,29 +203,74 @@ extern "C" fn window_destroy(engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
     }
-    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
-    let inst = unsafe { &*(instance as *const WindowInst) };
-    if let (Some(id), Ok((resolved, ctx))) = (inst.id, bound(engine)) {
-        let registered = {
-            // SAFETY: the caller resolved `ctx` from the installed binding.
-            let mut state = unsafe { ctx.services() }.state::<VisualState>();
-            state.objects.windows.remove(&id);
-            state.window_objects.remove(&id)
-        };
-        // Invalidate every object registered through `Window.add` (reference
-        // `ObjectVector`); the retained values are released when `registered`
-        // drops, breaking the window→object references.
-        if let Some(registered) = registered {
-            for entry in &registered {
-                if let Err(error) = resolved.engine().invalidate_retained(entry.value.raw_id()) {
-                    log::warn!("Window: invalidate failed: {error}");
-                }
-            }
+    // The payload borrow ends before anything below can re-enter the VM
+    // (invalidating a registered object runs its script `finalize`).
+    let id = {
+        // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
+        unsafe { &*(instance as *const WindowInst) }.id
+    };
+    if let (Some(id), Ok((resolved, ctx))) = (id, bound(engine)) {
+        release_window_objects(&ctx, resolved.engine(), id);
+        // The window owns the whole layer subtree and its per-layer bitmaps
+        // and fonts; destroy them with it so a dropped window leaves no scene
+        // records behind.
+        if let Ok(scene) = scene_mut(&ctx) {
+            scene.remove_window(id);
         }
     }
     // SAFETY: instance came from `window_create`'s `Box::into_raw` and is
     // freed exactly once by the VM.
     drop(unsafe { Box::from_raw(instance as *mut WindowInst) });
+}
+
+/// Native `Invalidate` for a `Window` — the `invalidate win;` path and the
+/// teardown the VM runs before `window_destroy`.
+///
+/// Mirrors `tTJSNI_BaseWindow::Invalidate`
+/// (`reference/cpp/core/visual/WindowIntf.cpp:175-241`): it invalidates every
+/// object registered through `Window.add` (`ObjectVector`), severs the primary
+/// layer by invalidating the window's layer tree, releases the draw device and
+/// unregisters the window. The payload stays alive for the later destroy.
+extern "C" fn window_invalidate(engine: *mut c_void, instance: *mut c_void) {
+    if instance.is_null() {
+        return;
+    }
+    // The payload borrow ends before the invalidation can re-enter the VM.
+    let id = {
+        // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM keeps it alive and unaliased for the duration of this callback.
+        unsafe { &*(instance as *const WindowInst) }.id
+    };
+    let Ok((resolved, ctx)) = bound(engine) else {
+        return;
+    };
+    if let Some(id) = id {
+        release_window_objects(&ctx, resolved.engine(), id);
+    }
+    // Reference `SetDrawDeviceObject(tTJSVariant())`
+    // (`WindowIntf.cpp:233-234`): drop the window's reference to the device.
+    let draw_device = {
+        // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the
+        // VM keeps it alive and unaliased for the duration of this callback.
+        unsafe { &mut *(instance as *mut WindowInst) }
+            .draw_device
+            .take()
+    };
+    if let Some(draw_device) = draw_device
+        && let Err(error) = resolved.engine().invalidate_retained(draw_device.raw_id())
+    {
+        log::warn!("Window: draw device invalidate failed: {error}");
+    }
+    let Some(id) = id else {
+        return;
+    };
+    if let Ok(scene) = scene_mut(&ctx) {
+        // Invalidate the layer tree the window roots, then drop the window
+        // record: the reference unregisters the window from its list at
+        // `Invalidate` (`WindowIntf.cpp:177`), before the script object is
+        // destroyed.
+        scene.invalidate_window(id);
+        scene.remove_window(id);
+    }
 }
 
 /// `Window()` — add a window to the scene and return its id.
@@ -244,7 +315,7 @@ extern "C" fn window_ctor(
     // The scene borrow ends here, before `eval_retained` below: that call runs
     // script, which could otherwise re-enter a `Window` member and mint a
     // second `&mut` to the same payload.
-    register_window(&ctx, resolved.engine(), id, objthis);
+    register_window(&ctx, id, objthis);
     // Install the default draw device: the reference constructs a
     // `BasicDrawDevice` for every window and throws `TVPInternalError` when
     // `CreateNew` fails (`reference/cpp/core/visual/WindowIntf.cpp:150-156`).
@@ -283,26 +354,30 @@ extern "C" fn window_close(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let Ok((_resolved, ctx)) = bound(engine) else {
+    let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.close: compat context is not bound");
     };
-    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
-    let inst = unsafe { &mut *(instance as *mut WindowInst) };
-    let Some(id) = inst.id else {
-        return report_error(out_error, "Window.close: this window is not constructed");
+    let id = {
+        // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
+        let inst = unsafe { &mut *(instance as *mut WindowInst) };
+        let Some(id) = inst.id else {
+            return report_error(out_error, "Window.close: this window is not constructed");
+        };
+        // The reference drops the form before the native invalidation chain
+        // runs (`WindowImpl.cpp:1469-1472`), so a re-entrant `close()` sees no
+        // window.
+        inst.id = None;
+        id
     };
     let scene = match scene_mut(&ctx) {
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
     scene.remove_window(id);
-    inst.id = None;
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    unsafe { ctx.services() }
-        .state::<VisualState>()
-        .objects
-        .windows
-        .remove(&id);
+    // The window object survives `close()`, so its destroy callback cannot be
+    // relied on to release the `ObjectVector`: invalidate and release it here
+    // (`reference/cpp/core/visual/WindowIntf.cpp:211-221`).
+    release_window_objects(&ctx, resolved.engine(), id);
     set_void(out);
     0
 }
@@ -2272,7 +2347,7 @@ pub(super) fn register_window_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
         name: "Window",
         create: window_create,
         destroy: window_destroy,
-        invalidate: None,
+        invalidate: Some(window_invalidate),
         methods: vec![
             NativeInstanceMethodDef {
                 name: "Window",

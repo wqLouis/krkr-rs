@@ -32,25 +32,25 @@ pub(crate) const DEFAULT_FONT_COLOR: i64 = 0xffff_ffff;
 /// Scene id → the script object (`objthis`) that wraps it. This is the one
 /// cross-object mapping the visual natives need: it lets
 /// `Window.primaryLayer`, `Layer.parent`, `Layer.window`, `Layer.children`
-/// and `Layer.getLayerAt` hand back the *real* object a script created. The
-/// window entry owns its object; a layer entry is a non-owning
-/// [`ObjectHandle`].
+/// and `Layer.getLayerAt` hand back the *real* object a script created. Both
+/// entries are non-owning [`ObjectHandle`]s.
 #[derive(Default)]
 pub(crate) struct ObjectRegistry {
-    pub(crate) windows: HashMap<u32, DetachedValue>,
+    pub(crate) windows: HashMap<u32, ObjectHandle>,
     pub(crate) layers: HashMap<u32, ObjectHandle>,
 }
 
-/// A non-owning handle to a layer's script object, keyed by scene id.
+/// A non-owning handle to a script object, keyed by scene id.
 ///
 /// The reference native instance holds its owner as a raw
 /// `iTJSDispatch2 *Owner` without a reference (`LayerIntf.h:173`,
-/// `GetOwnerNoAddRef`), so the script object reaches reference count zero and
-/// its `Invalidate`/destructor run. Holding a strong reference here made that
-/// impossible: the registry rooted every layer forever, so the native destroy
-/// never ran and each create/close cycle leaked its objects. Every lookup
-/// retains the object for the returned handle, the reference
-/// `tTJSVariant(GetOwnerNoAddRef(), GetOwnerNoAddRef())` shape.
+/// `WindowIntf.h:168-172` `Owner`/`GetOwnerNoAddRef`), so the script object
+/// reaches reference count zero and its `Invalidate`/destructor run. Holding a
+/// strong reference here made that impossible: the registry rooted every
+/// object forever, so the native destroy never ran and each create/close
+/// cycle leaked its objects. Every lookup retains the object for the returned
+/// handle, the reference `tTJSVariant(GetOwnerNoAddRef(), GetOwnerNoAddRef())`
+/// shape.
 #[derive(Clone, Copy)]
 pub(crate) struct ObjectHandle {
     raw: usize,
@@ -350,10 +350,8 @@ pub(crate) enum ObjectKind {
 
 /// Return a handle to a registered object as an owned [`DetachedValue`].
 ///
-/// The window registry keeps its object alive (the game owns one long-lived
-/// window), so it duplicates the existing retention. A layer is registered
-/// only through a non-owning [`ObjectHandle`], so the object is retained for
-/// the returned handle here.
+/// Both registries hold only a non-owning [`ObjectHandle`], so the object is
+/// retained here for the returned handle.
 pub(crate) fn duplicate_object(
     ctx: &CompatCtx,
     host: &Tjs2Engine,
@@ -362,22 +360,15 @@ pub(crate) fn duplicate_object(
 ) -> Option<DetachedValue> {
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
-    match kind {
-        ObjectKind::Window => {
-            let held = {
-                let state = services.state::<VisualState>();
-                state.objects.windows.get(&id).map(|object| object.raw_id())
-            };
-            host.duplicate_retained(held?).ok()
-        }
-        ObjectKind::Layer => {
-            let raw = {
-                let state = services.state::<VisualState>();
-                state.objects.layers.get(&id).map(|object| object.as_ptr())
-            };
-            host.retain_object_detached(raw?).ok()
-        }
-    }
+    let raw = {
+        let state = services.state::<VisualState>();
+        let registry = match kind {
+            ObjectKind::Window => &state.objects.windows,
+            ObjectKind::Layer => &state.objects.layers,
+        };
+        registry.get(&id).map(ObjectHandle::as_ptr)
+    };
+    host.retain_object_detached(raw?).ok()
 }
 
 /// The scene id reader for one of the classes whose native-instance payload

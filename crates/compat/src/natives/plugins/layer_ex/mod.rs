@@ -51,6 +51,19 @@ use crate::{CompatCtx, CompatError};
 pub use crate::natives::video::VideoSource;
 pub use movie::{movie_poll, set_movie_source};
 
+/// Drop every piece of per-layer state this plugin keeps for `id`.
+///
+/// The reference attaches its per-layer state to the layer object itself
+/// (`layerExMovie`/`layerExPerspective` are native instances of the `Layer`,
+/// `reference/cpp/plugins/layerExMovie.cpp:318-327`,
+/// `reference/cpp/plugins/layerExPerspective.cpp:255-296`), so a layer's
+/// destruction frees it. The port keys that state by layer id in the dispatch
+/// services; the layer's invalidate and destroy hooks call this.
+pub(crate) fn forget_layer(ctx: &CompatCtx, id: u32) {
+    movie::forget_layer(ctx, id);
+    draw::forget_layer(ctx, id);
+}
+
 /// Resolve the installed engine → context binding for a native callback.
 pub(super) fn bound(
     engine: *mut c_void,

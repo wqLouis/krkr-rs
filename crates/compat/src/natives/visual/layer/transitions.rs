@@ -25,7 +25,8 @@ use tjs::{NativeInstanceMethodDef, TjsValue, VAL_OBJECT, VAL_VOID, Value};
 
 use super::super::bitmap::{decode_image, read_image_from_storage};
 use super::super::common::{
-    ObjectKind, VisualState, duplicate_object, resolve_object_id, scene_mut, scene_ref,
+    ObjectHandle, ObjectKind, VisualState, duplicate_object, resolve_object_id, scene_mut,
+    scene_ref,
 };
 use super::{LayerExtras, LayerInst, LayerTransition, bound};
 use crate::native_util::{args, report_error, set_void, value_as_string};
@@ -647,44 +648,28 @@ fn object_alive(ctx: &crate::CompatCtx, kind: ObjectKind, id: u32) -> bool {
         ObjectKind::Layer => "Layer",
         ObjectKind::Window => "Window",
     };
-    match kind {
-        ObjectKind::Window => {
-            let held = {
-                // SAFETY: the caller resolved `ctx` from the installed binding.
-                let state = unsafe { ctx.services() }.state::<VisualState>();
-                state.objects.windows.get(&id).map(|object| object.raw_id())
-            };
-            let Some(raw) = held else {
-                return false;
-            };
-            // SAFETY: `ctx` was resolved from the installed binding, so the
-            // engine is live; `raw` is a retained id the registry keeps alive
-            // across this call.
-            unsafe { ctx.engine() }
-                .native_instance_payload(raw, class)
-                .is_ok_and(|payload| payload.is_some())
-        }
-        ObjectKind::Layer => {
-            let raw = {
-                // SAFETY: the caller resolved `ctx` from the installed binding.
-                let state = unsafe { ctx.services() }.state::<VisualState>();
-                state.objects.layers.get(&id).map(|object| object.as_ptr())
-            };
-            let Some(raw) = raw else {
-                return false;
-            };
-            // SAFETY: `ctx` was resolved from the installed binding, so the
-            // engine is live; the raw object is alive while its registry entry
-            // is present. Retain it for the lookup, then release it.
-            let Ok(retained) = (unsafe { ctx.engine() }).retain_object_detached(raw) else {
-                return false;
-            };
-            // SAFETY: see above.
-            unsafe { ctx.engine() }
-                .native_instance_payload(retained.raw_id(), class)
-                .is_ok_and(|payload| payload.is_some())
-        }
-    }
+    let raw = {
+        // SAFETY: the caller resolved `ctx` from the installed binding.
+        let state = unsafe { ctx.services() }.state::<VisualState>();
+        let registry = match kind {
+            ObjectKind::Window => &state.objects.windows,
+            ObjectKind::Layer => &state.objects.layers,
+        };
+        registry.get(&id).map(ObjectHandle::as_ptr)
+    };
+    let Some(raw) = raw else {
+        return false;
+    };
+    // SAFETY: `ctx` was resolved from the installed binding, so the engine is
+    // live; the raw object is alive while its registry entry is present.
+    // Retain it for the lookup, then release it.
+    let Ok(retained) = (unsafe { ctx.engine() }).retain_object_detached(raw) else {
+        return false;
+    };
+    // SAFETY: see above.
+    unsafe { ctx.engine() }
+        .native_instance_payload(retained.raw_id(), class)
+        .is_ok_and(|payload| payload.is_some())
 }
 
 /// Advance every active transition by `dt_ms` and tear down the finished or

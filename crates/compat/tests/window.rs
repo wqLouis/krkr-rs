@@ -73,7 +73,7 @@ impl Env {
 
     fn run(&self, script: &str) {
         self.engine
-            .exec_script(script, "window-test")
+            .exec_script_discard(script, "window-test")
             .unwrap_or_else(|error| panic!("exec {script:?} failed: {error}"));
     }
 
@@ -101,6 +101,11 @@ impl Env {
             TjsValue::Integer(value) => value as f64,
             other => panic!("{expression:?} returned {other:?}, expected a real"),
         }
+    }
+
+    /// The attached L2 scene (kept alive for the host's raw pointer).
+    fn scene(&self) -> &Scene {
+        &self._scene
     }
 }
 
@@ -572,4 +577,184 @@ fn subclass_member_calls_before_the_base_constructor_leave_global_kag_set() {
     );
     // The member call before `super.Window(...)` must have reached the window.
     assert_eq!(env.eval_int("kag.width"), 1280);
+}
+
+/// Dropping the last script reference to a window must release the scene
+/// window and the whole layer subtree it roots.
+///
+/// The reference native instance keeps its owner without adding a reference
+/// (`tTJSNI_BaseWindow::Construct`: `Owner = tjs_obj; // no addref`,
+/// `reference/cpp/core/visual/WindowIntf.cpp:145`) and `Invalidate` tears the
+/// window down (`reference/cpp/core/visual/WindowIntf.cpp:175-241`); each
+/// layer's own teardown releases its image and font
+/// (`reference/cpp/core/visual/LayerIntf.cpp:515-561`). A strong L3 registry
+/// entry rooted every window forever, so the native destroy never ran and the
+/// window's layers, bitmaps and fonts stayed in the scene.
+#[test]
+fn dropping_the_last_window_reference_releases_its_scene_tree() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window();");
+    let baseline_layers = env.scene().layers.len();
+    let baseline_bitmaps = env.scene().bitmaps.len();
+    let baseline_fonts = env.scene().fonts.len();
+
+    env.run(
+        "var page = new Layer(w, null); page.setImageSize(16, 16); \
+         var row = new Layer(w, page); row.setImageSize(8, 8); \
+         var face = row.font;",
+    );
+    assert_eq!(env.scene().windows.len(), 1);
+    assert_eq!(env.scene().layers.len(), baseline_layers + 2);
+    assert!(env.scene().bitmaps.len() > baseline_bitmaps);
+    assert!(env.scene().fonts.len() > baseline_fonts);
+
+    // The collector must run outside the creating frame (`System.doCompact`
+    // then the idle compact); see the layer page-cycle test.
+    env.run("w = null; page = null; row = null; face = null;");
+    env.run("1;");
+    env.run("System.doCompact();");
+    env.engine.do_gc().expect("idle compact");
+
+    assert_eq!(
+        env.scene().windows.len(),
+        0,
+        "a dropped window must not stay registered in the scene"
+    );
+    assert_eq!(
+        env.scene().layers.len(),
+        baseline_layers,
+        "a dropped window must release its layer subtree"
+    );
+    assert_eq!(
+        env.scene().bitmaps.len(),
+        baseline_bitmaps,
+        "a dropped window must release its layers' bitmaps"
+    );
+    assert_eq!(
+        env.scene().fonts.len(),
+        baseline_fonts,
+        "a dropped window must release its layers' fonts"
+    );
+}
+
+/// `invalidate w;` runs the reference `tTJSNI_BaseWindow::Invalidate` path:
+/// every object registered with the window is invalidated, the layer tree is
+/// severed, and the window is unregistered
+/// (`reference/cpp/core/visual/WindowIntf.cpp:175-241`). The layers'
+/// resources go with them (`reference/cpp/core/visual/LayerIntf.cpp:515-561`).
+#[test]
+fn invalidating_a_window_releases_its_scene_tree_and_registered_objects() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window();");
+    let baseline_layers = env.scene().layers.len();
+    let baseline_bitmaps = env.scene().bitmaps.len();
+    let baseline_fonts = env.scene().fonts.len();
+
+    env.run(
+        "var page = new Layer(w, null); page.setImageSize(16, 16); \
+         var row = new Layer(w, page); row.setImageSize(8, 8); \
+         var face = row.font; \
+         var finals = 0; \
+         class Sink { function finalize() { finals = finals + 1; } } \
+         var reg = new Sink(); \
+         w.add(reg);",
+    );
+    assert_eq!(env.scene().windows.len(), 1);
+
+    env.run("invalidate w;");
+
+    // Reference `Invalidate` walks `ObjectVector` and invalidates (and so
+    // finalizes) each registered object before the native teardown
+    // (`reference/cpp/core/visual/WindowIntf.cpp:211-221`).
+    assert_eq!(env.eval_int("finals"), 1);
+    assert_eq!(
+        env.scene().layers.len(),
+        baseline_layers,
+        "Invalidate severs the window's layer tree"
+    );
+    assert_eq!(
+        env.scene().bitmaps.len(),
+        baseline_bitmaps,
+        "Invalidate releases the layers' bitmaps"
+    );
+    assert_eq!(
+        env.scene().fonts.len(),
+        baseline_fonts,
+        "Invalidate releases the layers' fonts"
+    );
+    // Reference `TVPUnregisterWindowToList` removes the window from the list
+    // at Invalidate (`reference/cpp/core/visual/WindowIntf.cpp:177`), so it is
+    // no longer the main window.
+    assert_eq!(
+        env.scene().windows.len(),
+        0,
+        "Invalidate unregisters the window"
+    );
+    assert_eq!(env.eval_int("global.Window.mainWindow === null"), 1);
+
+    // The invalidated object still exists while the script holds it; dropping
+    // it destroys the native instance without resurrecting the window.
+    env.run("w = null; page = null; row = null; face = null; reg = null;");
+    env.run("System.doCompact();");
+    env.engine.do_gc().expect("idle compact");
+    assert_eq!(env.scene().windows.len(), 0);
+    assert_eq!(env.scene().layers.len(), baseline_layers);
+    assert_eq!(env.scene().bitmaps.len(), baseline_bitmaps);
+    assert_eq!(env.scene().fonts.len(), baseline_fonts);
+}
+
+/// `Window.close()` tears the window down: the scene window and its layer
+/// subtree go, and the objects registered through `Window.add` are invalidated
+/// (running their `finalize`) and released. The window script object survives
+/// `close()`, so its destroy callback cannot be relied on for that release
+/// (`reference/cpp/core/visual/WindowIntf.cpp:175-241`,
+/// `reference/cpp/core/visual/LayerIntf.cpp:515-561`).
+#[test]
+fn close_invalidates_registered_objects_and_drops_the_scene_tree() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window();");
+    let baseline_layers = env.scene().layers.len();
+    let baseline_bitmaps = env.scene().bitmaps.len();
+    let baseline_fonts = env.scene().fonts.len();
+
+    env.run(
+        "var page = new Layer(w, null); page.setImageSize(16, 16); \
+         var row = new Layer(w, page); row.setImageSize(8, 8); \
+         var face = row.font; \
+         var finals = 0; \
+         class Sink { function finalize() { finals = finals + 1; } } \
+         var sink = new Sink(); \
+         w.add(sink);",
+    );
+    assert_eq!(env.scene().windows.len(), 1);
+    assert_eq!(env.scene().layers.len(), baseline_layers + 2);
+
+    env.run("w.close();");
+
+    assert_eq!(
+        env.eval_int("finals"),
+        1,
+        "close must run the registered objects' finalizers"
+    );
+    assert_eq!(env.scene().windows.len(), 0);
+    assert_eq!(
+        env.scene().layers.len(),
+        baseline_layers,
+        "close must release the window's layer subtree"
+    );
+    assert_eq!(env.scene().bitmaps.len(), baseline_bitmaps);
+    assert_eq!(env.scene().fonts.len(), baseline_fonts);
+
+    // The script object outlives `close()`; collecting it must not resurrect
+    // or leak anything.
+    env.run("w = null; page = null; row = null; face = null;");
+    env.run("System.doCompact();");
+    env.engine.do_gc().expect("idle compact");
+    assert_eq!(env.scene().windows.len(), 0);
+    assert_eq!(env.scene().layers.len(), baseline_layers);
+    assert_eq!(env.scene().bitmaps.len(), baseline_bitmaps);
+    assert_eq!(env.scene().fonts.len(), baseline_fonts);
 }

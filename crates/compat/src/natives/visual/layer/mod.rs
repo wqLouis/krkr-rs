@@ -210,6 +210,10 @@ extern "C" fn layer_invalidate(engine: *mut c_void, instance: *mut c_void) {
         // no longer resolve it once its script object is invalidated.
         scene.invalidate_layer(id);
     }
+    // The plugin families keep their per-layer state keyed by layer id; the
+    // reference frees it with the layer object
+    // (`reference/cpp/plugins/layerExMovie.cpp:318-327`).
+    crate::natives::plugins::layer_ex::forget_layer(&ctx, id);
 }
 
 extern "C" fn layer_destroy(engine: *mut c_void, instance: *mut c_void) {
@@ -225,6 +229,10 @@ extern "C" fn layer_destroy(engine: *mut c_void, instance: *mut c_void) {
             .objects
             .layers
             .remove(&id);
+        // Idempotent with the invalidate hook, which always runs first; a
+        // payload destroyed without it still drops its per-layer plugin
+        // state (`reference/cpp/plugins/layerExMovie.cpp:318-327`).
+        crate::natives::plugins::layer_ex::forget_layer(&ctx, id);
     }
     // Dropping the payload releases the cached `font` object.
     // SAFETY: instance came from `layer_create`'s `Box::into_raw` and is
@@ -926,12 +934,20 @@ extern "C" fn layer_independ_main_image(
         set_void(out);
         return 0;
     };
+    // Reference `IndependMainImage` (`LayerIntf.cpp:2679-2686`) severs the
+    // image's sharing in `tTVPNativeBaseBitmap::Independ`, which installs the
+    // fresh copy and then releases the layer's reference to the old image
+    // (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:652-661`).
+    let replaced = scene.layer_mut(id).and_then(|layer| layer.bitmap.take());
     let new_bitmap = scene.add_bitmap(width, height, rgba);
     if let Some(layer) = scene.layer_mut(id) {
         layer.bitmap = Some(new_bitmap);
         layer.image_width = width;
         layer.image_height = height;
         layer.image_modified = true;
+    }
+    if let Some(replaced) = replaced {
+        scene.release_bitmap(replaced);
     }
     set_void(out);
     0

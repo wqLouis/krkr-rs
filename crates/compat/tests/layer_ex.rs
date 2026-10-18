@@ -19,7 +19,7 @@ use std::rc::Rc;
 use api::error::MediaError;
 use api::media::{AudioSpec, DecodedAudio, RgbaFrame, VideoSpec};
 use common::vm_lock;
-use compat::CompatHost;
+use compat::{CompatHost, VideoSource, movie_poll, set_movie_source};
 use engine::Scene;
 use tjs::{Tjs2Engine, TjsValue};
 
@@ -200,6 +200,90 @@ fn movie_callbacks_are_layer_members() {
     assert_eq!(env.eval_int("dst.onStartMovie()"), 7);
     assert_eq!(env.eval_int("dst.onStopMovie()"), 8);
     assert_eq!(env.eval_int("dst.onUpdateMovie()"), 9);
+}
+
+/// A host video source for the movie tests: the same seam the app installs
+/// (`compat::set_movie_source`).
+struct MovieSource {
+    spec: VideoSpec,
+}
+
+impl VideoSource for MovieSource {
+    fn spec(&self, _path: &str) -> Option<VideoSpec> {
+        Some(self.spec)
+    }
+
+    fn frame_at(&mut self, _path: &str, _at_ms: i64) -> Option<RgbaFrame> {
+        Some(RgbaFrame::new(4, 4, 0, [0u8, 255, 0, 255].repeat(16)))
+    }
+}
+
+/// A layer that opened and started a movie is released when the script drops
+/// it.
+///
+/// The reference keeps a layer's movie state on the layer's own native
+/// instance (`reference/cpp/plugins/layerExMovie.cpp:318-327`, `new
+/// ClassT(objthis)` registered with `NCB_INSTANCE_GETTER` and destroyed with
+/// the object), so nothing outside the object roots it; dropping the last
+/// script reference runs `Layer.Invalidate`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:515-566`), which deallocates the
+/// MainImage. A slot that retains the layer object prevents exactly that.
+#[test]
+fn a_movie_layer_is_released_when_the_script_drops_it() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var mov = new Layer(w, null); \
+         mov.name = 'movie'; \
+         mov.setImageSize(4, 4); \
+         var started = 0; \
+         mov.onStartMovie = function() { started = 1; };",
+    );
+    let ctx = env._host.ctx().expect("bound context");
+    set_movie_source(
+        &ctx,
+        Box::new(MovieSource {
+            spec: VideoSpec {
+                width: 4,
+                height: 4,
+                fps: 10.0,
+                total_frames: Some(10),
+                sample_rate: 0,
+                channels: 0,
+                ..VideoSpec::default()
+            },
+        }),
+    );
+    env.run("mov.openMovie('movie.mpg', false); mov.startMovie(false);");
+    // The callback is dispatched through the layer object, so the non-owning
+    // handle must still resolve a live receiver.
+    assert_eq!(env.eval_int("started"), 1);
+    movie_poll(&ctx, 16.0).expect("movie step");
+    assert_eq!(env.eval_int("mov.isPlayingMovie()"), 1);
+    assert_eq!(env.scene.layers.len(), 1);
+    assert_eq!(env.scene.bitmaps.len(), 1);
+
+    // The movie layer is also the window's primary layer, so drop both script
+    // references while the movie is still playing, then let the idle collector
+    // run outside the creating frame (the frame body's automatic idle pass,
+    // `reference/cpp/core/environ/impl/SystemControl.cpp:174-179`). The slot
+    // must not keep the layer alive after the script references are gone.
+    env.run("mov = null; w = null;");
+    env.run("System.doCompact();");
+    env.engine.do_gc().expect("idle compact");
+
+    assert!(
+        env.scene.layers.is_empty(),
+        "the movie layer must not stay in the scene: {:?}",
+        env.scene.layers.iter().map(|l| l.id).collect::<Vec<_>>()
+    );
+    assert!(
+        env.scene.bitmaps.is_empty(),
+        "the layer's main image must be freed with it"
+    );
+    // The frame body keeps running after the layer is gone.
+    movie_poll(&ctx, 16.0).expect("movie step after teardown");
 }
 
 // ---------------------------------------------------------------------------

@@ -1827,15 +1827,29 @@ static int exec_script_decoded(tjs2_engine *e, std::u16string s,
     e->last_object.Clear();
     try {
         TJS::tTJSVariant result;
+        // A null result slot (the discard entry point) mirrors a reference
+        // native method called with a null `result` pointer: the compiled
+        // block does not require a result, so no object is copied into a
+        // caller-owned variant or recorded in `last_object`.
+        TJS::tTJSVariant *result_slot = out_result ? &result : nullptr;
         std::u16string n = name ? utf8_to_u16(name) : std::u16string();
         // The length-aware ttstr form keeps an interior NUL in the payload;
         // the VM's own text handling decides what that NUL means.
         TJS::ttstr script_text(s.c_str(), s.size());
         TJS::ttstr script_name(n.c_str(), n.size());
-        e->inner->ExecScript(script_text, &result,
+        e->inner->ExecScript(script_text, result_slot,
                              static_cast<TJS::iTJSDispatch2 *>(context),
                              name ? &script_name : nullptr, (tjs_int)lineofs);
-        variant_to_value(e, result, out_result);
+        if(out_result) {
+            variant_to_value(e, result, out_result);
+        } else if(e->inner->GetVariantArrayStack()) {
+            // ExecScript can still leave the last expression's value in a
+            // register slot of the variant-array stack, where it stays alive
+            // until something compacts the stack. Clear those slots now (the
+            // same `Compact()` `tjs2_do_gc` performs) so a discarded object
+            // result cannot stay rooted.
+            e->inner->GetVariantArrayStack()->Compact();
+        }
         if(out_error)
             *out_error = nullptr;
         return 0;

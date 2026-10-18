@@ -137,7 +137,7 @@ impl Env {
 
     pub fn run(&self, script: &str) {
         self.engine
-            .exec_script(script, "compat-test")
+            .exec_script_discard(script, "compat-test")
             .unwrap_or_else(|error| panic!("exec {script:?} failed: {error}"));
     }
 
@@ -262,7 +262,7 @@ pub fn eval_then(
     read: &str,
 ) -> Result<tjs::TjsValue, String> {
     engine
-        .exec_script(write, "compat-test")
+        .exec_script_discard(write, "compat-test")
         .map_err(|error| error.to_string())?;
     engine
         .eval(read, "compat-test")

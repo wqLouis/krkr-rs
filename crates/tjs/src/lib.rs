@@ -894,6 +894,39 @@ impl Tjs2Engine {
         self.exec_script_with_context(script, name, ptr::null_mut(), 0)
     }
 
+    /// Execute a TJS script and discard its result.
+    ///
+    /// The C ABI receives a null result slot, so the VM materialises no
+    /// result value: an object produced by the script's last expression is
+    /// neither left in the interpreter's result register nor recorded in the
+    /// engine's last-object slot. Use this for scripts whose value is
+    /// ignored; a result-returning [`Self::exec_script`] keeps that object
+    /// alive until the next engine call with an object result (or the idle
+    /// compact).
+    pub fn exec_script_discard(&self, script: &str, name: &str) -> Result<(), TjsError> {
+        let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: the script pointer/length and the name are valid for the
+        // call, `self.inner` is a live engine, and a null result slot is the
+        // documented "no result" form.
+        let rc = unsafe {
+            tjs2_exec_script(
+                self.inner,
+                script.as_ptr().cast::<c_char>(),
+                script.len(),
+                name.as_ptr(),
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                &mut error,
+            )
+        };
+        if rc != 0 {
+            return Err(take_error(error));
+        }
+        Ok(())
+    }
+
     /// Execute a TJS script with an explicit `this` (`context`) and a reported
     /// line-number offset (`lineofs`), matching the reference
     /// `TJS::tTJS::ExecScript(content, result, context, name, lineofs)`.
@@ -3646,6 +3679,43 @@ var ra = a.get(); var rb = b.get();",
             COUNTER_DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the receiver must be destroyed after its last reference is dropped"
+        );
+    }
+
+    /// `exec_script_discard` passes a null result slot, so the object produced
+    /// by the script's last expression is not kept alive by the interpreter's
+    /// result register. That retention pinned a script-created object across
+    /// `do_gc`: a boot script ending in `new Window()` (or appending to a
+    /// helper object) kept the object alive after its script reference was
+    /// gone. The observation is the native instance's `destroy` callback,
+    /// which runs in Rust, so no engine call is needed to read the result
+    /// (such a call would itself reset the result slot).
+    #[test]
+    fn exec_script_discard_does_not_pin_its_object_result() {
+        let _vm_lock = vm_lock();
+        COUNTER_CREATED.store(0, std::sync::atomic::Ordering::SeqCst);
+        COUNTER_DESTROYED.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class_instance(&counter_builder())
+            .unwrap();
+        e.exec_script_discard("global.discardedRan = 1; new Counter();", "discard")
+            .unwrap();
+        assert_eq!(
+            COUNTER_CREATED.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the discarded script must still run"
+        );
+        e.do_gc().unwrap();
+        assert_eq!(
+            COUNTER_DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a discarded object result must not stay rooted"
+        );
+        assert_eq!(
+            e.eval("global.discardedRan", "test").unwrap(),
+            TjsValue::Integer(1),
+            "the discarded script's side effects must run"
         );
     }
 
