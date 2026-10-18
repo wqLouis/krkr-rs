@@ -361,10 +361,7 @@ fn format_lines(stats: &OverlayStats) -> Vec<String> {
         .one_percent_low_fps
         .map_or_else(|| "?".to_owned(), |fps| format!("{fps:.1}"));
     let mut lines = vec![format!("FPS {:.1} 1% {one_percent}", stats.fps)];
-    lines.push(format!(
-        "CPU {}",
-        format_percent(stats.cpu_percent.map(|value| value as f32))
-    ));
+    lines.push(format!("CPU {}", format_percent(stats.cpu_percent)));
     lines.push(format!(
         "IO R {} W {}",
         format_rate(stats.io_read_per_s),
@@ -385,7 +382,7 @@ fn format_lines(stats: &OverlayStats) -> Vec<String> {
 }
 
 /// Formats an optional percentage.
-fn format_percent(value: Option<f32>) -> String {
+fn format_percent(value: Option<f64>) -> String {
     value.map_or_else(|| "?".to_owned(), |value| format!("{value:.0}%"))
 }
 

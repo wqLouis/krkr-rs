@@ -185,16 +185,15 @@ fn release_window_objects(ctx: &CompatCtx, host: &Tjs2Engine, id: u32) {
 /// property (`SelectItemBase.finalize` writes `cursor`); without this it would
 /// run against a removed Scene record.
 fn invalidate_window_layers(ctx: &CompatCtx, host: &Tjs2Engine, id: u32) {
-    let layer_ids: Vec<u32> = scene_ref(ctx)
-        .map(|scene| {
-            scene
-                .layers
-                .iter()
-                .filter(|layer| layer.window == id)
-                .map(|layer| layer.id)
-                .collect()
-        })
-        .unwrap_or_default();
+    let Ok(scene) = scene_ref(ctx) else {
+        return;
+    };
+    let layer_ids: Vec<u32> = scene
+        .layers
+        .iter()
+        .filter(|layer| layer.window == id)
+        .map(|layer| layer.id)
+        .collect();
     for layer_id in layer_ids {
         let raw = {
             // SAFETY: the caller resolved a live compat context.

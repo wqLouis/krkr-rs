@@ -1142,18 +1142,12 @@ impl Scene {
 
     /// Detach one layer — the reference `tTJSNI_BaseLayer::Part()`
     /// (`LayerIntf.cpp:624`). The layer is severed from its parent (or the
-    /// window root list) and removed from the scene. Children are **not**
-    /// destroyed: the layer's direct children are re-parented to the window
-    /// root list and stay alive (the reference `Invalidate` calls
-    /// `child->Part()` for each direct child, `LayerIntf.cpp:551`). The old
-    /// implementation removed the whole subtree, which silently deleted live
-    /// children (focus, button and transition layers all share a parent).
+    /// window root list) and removed from the scene. Direct children are
+    /// detached too, but their records stay alive until their own script
+    /// objects are finalized (`LayerIntf.cpp:535-549`).
     ///
-    /// This is *detachment*, not destruction. Destroying a layer's native
-    /// instance must use [`Scene::destroy_layer`], which removes the whole
-    /// subtree the way the reference's GC cascade does. Using this function
-    /// for destruction is what left a torn-down scene's layers alive as
-    /// window roots (the "old scene images stay on screen" bug).
+    /// This is *detachment*, not destruction: use [`Scene::destroy_layer`] to
+    /// remove a native instance and its whole subtree.
     pub fn remove_layer(&mut self, id: u32) {
         let Some(layer) = self.layer(id) else {
             return;
@@ -1185,12 +1179,8 @@ impl Scene {
         // draws precisely the tree reachable from the window's `Primary` layer
         // (`tTVPLayerManager::RecreateOverallOrderIndex`, `LayerManager.cpp:208`),
         // and `NotifyPart` invalidates that index — so a parted layer stops
-        // being drawn *and* hit-tested. Registering these children instead made
-        // them fresh top-level window layers, which is what left a settings page's controls stuck on screen after
-        // invalidating its page layers: they were drawn at full opacity,
-        // outside the faded parent, and their scripts then saw `parent ==
-        // null` and threw. A script that
-        // wants such a layer back re-parents it explicitly, which restores it.
+        // being drawn *and* hit-tested. A script that wants such a layer back
+        // re-parents it explicitly, which restores it.
         for child in &children {
             if let Some(cl) = self.layer_mut(*child) {
                 cl.parent = None;
@@ -1257,10 +1247,6 @@ impl Scene {
             l.shutdown = true;
             l.pending_paint = false;
         }
-        // `Part()` only detaches this layer and its direct children; the
-        // children keep their own records until their script objects are
-        // finalized, matching `tTJSNI_BaseLayer::Invalidate`
-        // (`LayerIntf.cpp:535-549`).
         self.remove_layer(id);
     }
 
@@ -2383,14 +2369,11 @@ impl Scene {
         }
 
         // Root list: only the layers the window actually owns. A layer whose
-        // parent was severed is deliberately **not** adopted here. The
-        // reference draws exactly the tree reachable from the window's
-        // `Primary` layer (`tTVPLayerManager::RecreateOverallOrderIndex`,
-        // `LayerManager.cpp:208`), and `NotifyPart` invalidates that index, so a
+        // parent was severed is deliberately **not** adopted here: the draw
+        // order is the tree reachable from the window's `Primary` layer, so a
         // `Part()`ed layer stops being drawn and hit-tested. Adopting every
-        // `parent == None` layer made detached, invalidated subtrees render
-        // again as top-level window layers — a settings page kept its
-        // controls on screen after leaving the page.
+        // `parent == None` layer would put detached, invalidated subtrees back
+        // into the draw order as top-level window layers.
         let mut roots: Vec<u32> = window_state
             .layers
             .iter()
@@ -2405,17 +2388,13 @@ impl Scene {
         for id in roots {
             self.append_layer_subtree(window, id, &all_children, &mut order, &mut visited);
         }
-        // No "leftovers" pass. It used to append every window layer that the
-        // root walk had not visited, on the theory that a malformed parent link
-        // should not hide a layer. But a layer is unvisited precisely when it is
-        // **not reachable from the window's roots** — which is the definition of
-        // a detached layer. Re-adding those made `Part()` a no-op for rendering:
-        // `invalidate` severed a layer's children and this pass put them back on
-        // screen (and back into hit-testing), which is why a settings page
-        // kept its sliders and buttons after `invalidate _base[i]`.
-        // A child that is genuinely missing from its parent's `children` list is
-        // still found: `all_children` is indexed by the layer's own `parent`
-        // field and `append_layer_subtree` merges it into the maintained list.
+        // Only layers reachable from the window's roots are emitted. A layer
+        // the root walk does not visit is detached — a `Part()`ed layer or one
+        // whose parent link is stale — so it stays out of both the draw order
+        // and hit-testing. A child genuinely missing from its parent's
+        // `children` list is still found: `all_children` is indexed by the
+        // layer's own `parent` field and `append_layer_subtree` merges it into
+        // the maintained list.
         order
     }
 

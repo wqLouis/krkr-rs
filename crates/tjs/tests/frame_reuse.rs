@@ -1,10 +1,9 @@
-//! Reusing a VM frame must release the previous frame's `this` reference.
+//! Reusing a VM frame releases the previous frame's `this` reference.
 //!
 //! `ExecuteAsFunction` stores `objthis` in the frame's dedicated slot
-//! (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:700`). The slot is reused by
-//! the next call, so assigning a new value must release the old one
-//! (`reference/cpp/core/tjs2/tjsVariant.cpp:534-545`). A raw `memset` over the
-//! frame would skip that release and root every `this` object forever.
+//! (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:700`); the next call reuses
+//! the slot and releases the value it held
+//! (`reference/cpp/core/tjs2/tjsVariant.cpp:534-545`).
 
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;

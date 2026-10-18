@@ -266,23 +266,19 @@ fn output_path(ctx: &CompatCtx, filename: &str) -> Result<PathBuf, String> {
     }
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let services = unsafe { ctx.services() };
-    if let Some(pointer) = services.storage() {
-        // SAFETY: the host keeps the attached storage alive for the binding.
-        let storage = unsafe { &*pointer };
-        match storage.local_name(lookup) {
-            Ok(Some(path)) => return Ok(path),
-            Ok(None) => {}
-            Err(error) => return Err(error.to_string()),
-        }
+    // SAFETY: the host keeps the attached storage alive for the binding.
+    let Some(storage) = services.storage().map(|pointer| unsafe { &*pointer }) else {
+        return Ok(path.to_path_buf());
+    };
+    match storage.local_name(lookup) {
+        Ok(Some(path)) => return Ok(path),
+        Ok(None) => {}
+        Err(error) => return Err(error.to_string()),
     }
     if path.is_absolute() {
         return Ok(path.to_path_buf());
     }
-    if let Some(pointer) = services.storage() {
-        // SAFETY: the host keeps the attached storage alive for the binding.
-        return Ok(unsafe { &*pointer }.game_dir().join(path));
-    }
-    Ok(path.to_path_buf())
+    Ok(storage.game_dir().join(path))
 }
 
 /// Write the serialized text as the raw `tjs_char` stream the reference's

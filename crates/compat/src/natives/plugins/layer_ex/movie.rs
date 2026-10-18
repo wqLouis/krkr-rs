@@ -263,17 +263,12 @@ fn is_playing(ctx: &CompatCtx, layer_id: u32) -> bool {
 
 /// Drop the movie state bound to `id`.
 ///
-/// Each layer's movie state belongs to that layer: the reference's
-/// `layerExMovie` is a native instance of the layer object itself
-/// (`reference/cpp/plugins/layerExMovie.cpp:318-327`), so it is destroyed
-/// with the object and never outlives it. The layer's invalidate/destroy
-/// hooks call this, which also releases the mixer voice and the overlay the
-/// slot owns.
+/// The layer's invalidate and destroy hooks call this. The slot owns the
+/// overlay and the mixer voice, so dropping it releases both.
 pub(crate) fn forget_layer(ctx: &CompatCtx, id: u32) {
     // SAFETY: the caller holds a live, bound context.
     let services = unsafe { ctx.services() };
-    let removed = services.state::<LayerExMovieState>().slots.remove(&id);
-    let Some(mut slot) = removed else {
+    let Some(mut slot) = services.state::<LayerExMovieState>().slots.remove(&id) else {
         return;
     };
     slot.release_audio(services);
@@ -285,21 +280,18 @@ pub(crate) fn forget_layer(ctx: &CompatCtx, id: u32) {
 /// methods, so the member always exists; a script override wins.
 ///
 /// The slot holds no script object, so the receiver is resolved through the
-/// layer registry and retained for the call only; the same
-/// `(Object, ObjThis)` pair the reference dispatches into
-/// (`reference/cpp/plugins/layerExMovie.cpp:205,222,274`).
+/// layer registry and retained for the call only.
 fn dispatch_callback(ctx: &CompatCtx, host: &Tjs2Engine, layer_id: u32, member: &str) {
     let Some(object) = duplicate_object(ctx, host, ObjectKind::Layer, layer_id) else {
-        // The layer registry has no receiver for this id: the layer was
-        // invalidated (the destroy hook drops its entry) or never ran its
-        // `Layer` constructor, so there is no object to dispatch into.
+        // No receiver is registered for this id: the layer was invalidated
+        // (the destroy hook drops its entry) or never ran its `Layer`
+        // constructor.
         log::debug!("LayerExMovie: layer #{layer_id} has no script object for {member}");
         return;
     };
     if let Err(error) = host.call_member(object.raw_id(), member, &[]) {
         log::warn!("LayerExMovie: {member}: {error}");
     }
-    drop(object);
 }
 
 /// Copy the overlay's current frame into the bound layer.

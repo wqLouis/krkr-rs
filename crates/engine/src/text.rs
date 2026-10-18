@@ -1,64 +1,24 @@
 //! L2 text layout, glyph-atlas composition and GPU projection.
 //!
-//! This module is the middle-layer (L2) text seam. It deliberately does the
-//! minimum itself and delegates the hard parts:
+//! The module delegates the hard parts:
 //!
-//! * **Layout/shaping/bidi/line-breaking/font-fallback** are delegated to
+//! * **Layout/shaping/bidi/line-breaking/font-fallback** go to
 //!   [`cosmic_text`], a pure-Rust text stack (harfrust shaping, `fontdb`
-//!   discovery/fallback, `unicode-bidi`, `unicode-linebreak`). We do **not**
-//!   reimplement a shaping engine.
+//!   discovery/fallback, `unicode-bidi`, `unicode-linebreak`).
 //! * **Rasterization** is the L1 [`render`] `FontSystem` /
 //!   [`render::rasterize_glyph`] / [`render::glyph_advance`] /
 //!   [`render::font_metrics`] contract. L1 owns the font and the coverage
 //!   bitmap; L2 owns the *atlas* that packs those bitmaps.
 //! * **GPU projection** is the L1 quad pipeline: [`project_text`] turns
 //!   positioned glyphs into per-glyph [`RenderContent::Texture`] quads against
-//!   an L2-owned [`GlyphAtlas`]. The production text draw does **not** use it
-//!   yet; the layer-bitmap composite below is the authoritative path.
-//!
-//! ## The CPU composite is the production text path
+//!   an L2-owned [`GlyphAtlas`].
 //!
 //! Script-visible text is drawn by compositing per-character coverage into the
 //! layer's [`BitmapState`] ([`rasterize_text_coverage`] +
 //! [`compose_text_into`]), so `getPixel` and every other readback observe the
-//! same pixels the reference produces. The [`GlyphAtlas`] path exists for a
-//! future accelerated display: it rasterizes the same coverage once, packs it
-//! into a texture, and [`project_text`] emits textured quads that the L1
-//! pipeline can draw. No backend is wired to that path today —
-//! `RenderContent::Glyphs` is unanswered by the CPU and Vulkan renderers, and
-//! [`GlyphAtlas`] requires a live [`RenderPipeline`] that the L3 natives do not
-//! have.
-//!
-//! ## Why `cosmic-text`
-//!
-//! `cosmic-text` is the only candidate that provides a *complete*,
-//! renderer-agnostic text front end in pure Rust while leaving rasterization
-//! to us:
-//!
-//! * `rustybuzz`/`harfrust` alone is a shaper: no bidi, no line breaking, no
-//!   font discovery/fallback, no line metrics — all of which this module would
-//!   have to rebuild.
-//! * `swash` bundles shaping *and* rasterization; using it would duplicate
-//!   (and bypass) the L1 rasterizer we already have and still leave bidi/line
-//!   breaking unimplemented.
-//! * `glyphon` is a `wgpu` text integration. It would pull `wgpu` into L2,
-//!   keeps the engine free of any render backend
-//!   invariant, while our backend is `ash`/Vulkan.
-//! * `vello` is a GPU 2D *renderer*, not a layout engine; it would replace the
-//!   quad pipeline rather than feed it.
-//!
-//! `cosmic-text` is used only for its layout half, so disabling its `swash`
-//! and `fontconfig` default features keeps its dependency surface small and
-//! free of system-library linkage; fonts are loaded explicitly by the caller.
-//!
-//! ## CPU and GPU coexistence (`getPixel`)
-//!
-//! The same rasterized coverage can feed two consumers: the authoritative
-//! layer-bitmap composite ([`rasterize_text_coverage`]/[`compose_text_into`])
-//! that `getPixel`/readback observe, and a future GPU presentation
-//! ([`GlyphAtlas`] + [`project_text`]) that reads the identical pixels. Only
-//! the former is wired into the emulator; the latter is the seam a GPU backend
-//! would fill.
+//! same pixels the reference produces. The [`GlyphAtlas`] path rasterizes the
+//! same coverage once, packs it into a texture, and [`project_text`] emits
+//! textured quads for the L1 pipeline; it needs a live [`RenderPipeline`].
 //!
 //! ## State
 //!
@@ -87,19 +47,15 @@ use cosmic_text::{Attrs, Buffer, Family, FontSystem as CosmicFontSystem, Metrics
 
 /// Maximum number of entries held by each L2 text memo.
 ///
-/// Reference: the `tTVPFontCache` character-cache limit `TVP_CH_MAX_CACHE_COUNT`
-/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:108`). It bounds the
-/// rasterized character masks ([`TextCoverageCache`]), the shaped-layout memo
-/// ([`TextEngine`]) and the glyph atlas' entry map ([`GlyphAtlas`]).
+/// It bounds the rasterized character masks ([`TextCoverageCache`]), the
+/// shaped-layout memo ([`TextEngine`]) and the glyph atlas' entry map
+/// ([`GlyphAtlas`]).
 pub const MAX_TEXT_CACHE_ENTRIES: usize = 1300;
 
 /// Japanese/Chinese/Korean-capable fallback families, tried in order when a
 /// requested family is not installed on the host.
 ///
-/// The reference ships a bundled `NotoSansCJK-Regular.ttc` as its default face
-/// (`reference/cpp/core/visual/FontImpl.cpp:220-243`); the shipped Android build
-/// bundles `DroidSansFallback.ttf` instead. Both are reached here by family
-/// name when the host's system fonts carry them.
+/// The families are reached by name when the host's system fonts carry them.
 const CJK_FALLBACK_FAMILIES: &[&str] = &[
     "Noto Sans CJK JP",
     "Noto Sans CJK SC",
@@ -608,9 +564,8 @@ impl TextEngine {
     /// Returns the first registered face, the fallback for a face that cannot
     /// be resolved, and notes that `family` used it.
     ///
-    /// The reference substitutes its default face silently
-    /// (`reference/cpp/core/visual/FontImpl.cpp:159-168`), so the first such
-    /// fallback is logged once per engine rather than once per name.
+    /// The first such fallback is logged once per engine rather than once per
+    /// name.
     pub fn default_font_for(&mut self, family: &str) -> Option<FontId> {
         if self.faces.is_empty() {
             return None;
@@ -654,9 +609,7 @@ impl TextEngine {
         style: &TextStyle,
         wrap_width: Option<f32>,
     ) -> Result<TextLayout, TextError> {
-        if !(style.size_px.is_finite() && style.size_px > 0.0) {
-            return Err(TextError::InvalidSize(style.size_px));
-        }
+        validate_size(style.size_px)?;
 
         let wrap = wrap_width.filter(|w| w.is_finite() && *w > 0.0);
         let key = LayoutKey {
@@ -760,9 +713,7 @@ impl TextEngine {
         codepoint: char,
         style: &TextStyle,
     ) -> Result<GlyphBitmap, TextError> {
-        if !(style.size_px.is_finite() && style.size_px > 0.0) {
-            return Err(TextError::InvalidSize(style.size_px));
-        }
+        validate_size(style.size_px)?;
         let face = self
             .faces
             .get(font.0)
@@ -778,9 +729,8 @@ impl TextEngine {
 
     /// Returns the rasterizer's pen advance for one character.
     ///
-    /// This is the per-character extent the pre-rendered-font width sums in
-    /// for a character the `.tft` does not carry
-    /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473`).
+    /// This is the per-character extent a pre-rendered-font width sums in for
+    /// a character the `.tft` does not carry.
     ///
     /// # Errors
     ///
@@ -1118,9 +1068,7 @@ impl GlyphAtlas {
         codepoint: char,
         style: &TextStyle,
     ) -> Result<AtlasGlyph, TextError> {
-        if !(style.size_px.is_finite() && style.size_px > 0.0) {
-            return Err(TextError::InvalidSize(style.size_px));
-        }
+        validate_size(style.size_px)?;
         let key = GlyphKey {
             font: font.0,
             codepoint,
@@ -1272,15 +1220,15 @@ impl GlyphAtlas {
 
     /// Copies a tightly packed RGBA rectangle into the CPU mirror.
     fn blit(&mut self, x: u32, y: u32, width: u32, height: u32, rgba: &[u8]) {
+        if width == 0 || height == 0 {
+            return;
+        }
         let stride = self.width as usize * 4;
         let row = width as usize * 4;
-        for r in 0..height as usize {
-            let source = r * row;
-            let destination = (y as usize + r) * stride + x as usize * 4;
-            if let (Some(src), Some(dst)) = (
-                rgba.get(source..source + row),
-                self.pixels.get_mut(destination..destination + row),
-            ) {
+        let start = y as usize * stride + x as usize * 4;
+        for (r, src) in rgba.chunks_exact(row).take(height as usize).enumerate() {
+            let destination = start + r * stride;
+            if let Some(dst) = self.pixels.get_mut(destination..destination + row) {
                 dst.copy_from_slice(src);
             }
         }
@@ -1427,14 +1375,12 @@ pub fn compose_text_cpu(
 
 /// Cache key for one rasterized character mask in [`TextCoverageCache`].
 ///
-/// Reference: `tTVPFontAndCharacterData`
-/// (`reference/cpp/core/visual/CharacterData.h:89-115`) keys `tTVPFontCache`
-/// by the face (`tTVPFont`: height, flags, angle, face), the character,
-/// `Antialiased`, `BlurLevel`, `BlurWidth`, `Blured` and `Hinting`. The sharp
-/// character and its blurred shadow are separate entries distinguished by
-/// `blur`. The rotation is absent because the rasterizer produces an
-/// unrotated bitmap and the draw only offsets it; colour is absent because it
-/// is a draw argument, not cached data.
+/// The key covers the face, the character, the size, the synthetic style,
+/// antialiasing and the blur parameters. The sharp character and its blurred
+/// shadow are separate entries distinguished by `blur`. Rotation is absent
+/// because the rasterizer produces an unrotated bitmap and the draw only
+/// offsets it; colour is absent because it is a draw argument, not cached
+/// data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct CoverageKey {
     /// Registered face index.
@@ -1486,12 +1432,8 @@ impl CoverageKey {
 
 /// A fixed-capacity least-recently-used map.
 ///
-/// Reference: `tTJSHashTable::FindAndTouchWithHash` moves a hit to the front
-/// of the recency order
-/// (`reference/cpp/core/tjs2/tjsHashSearch.h:358-364,516-528`) and
-/// `tTJSHashCache::ChopLast` removes entries from the back
-/// (`reference/cpp/core/tjs2/tjsHashSearch.h:424-433,593-599`), so an entry at
-/// the limit is evicted only when it is the least recently used.
+/// A hit moves to the front of the recency order; an insert at the limit
+/// evicts the entry at the back.
 struct LruCache<K, V> {
     /// Live and reusable slots; a live key owns exactly one slot.
     slots: Vec<Slot<K, V>>,
@@ -1646,16 +1588,11 @@ impl<K: Eq + std::hash::Hash + Clone, V> LruCache<K, V> {
 
 /// L2-owned cache of rasterized character masks and their blurred shadows.
 ///
-/// Reference: the `tTVPFontCache` character cache (`TVP_CH_MAX_CACHE_COUNT`;
-/// `reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:108,222-232`). Its
-/// `TVPGetCharacter` (`LayerBitmapImpl.cpp:244-320`) looks a character up by
-/// `CoverageKey` and, on a miss, rasterizes it and (when the font is blurred)
-/// applies `tTVPCharacterData::Blur`
-/// (`reference/cpp/core/visual/CharacterData.cpp:118-165`) before inserting,
-/// so both the sharp character and its shadow are reused by a later draw.
-/// Eviction is least-recently-used, matching the reference's
-/// `FindAndTouchWithHash`/`ChopLast` pair. The type is explicit caller-owned
-/// state; there is no global cache.
+/// A character is looked up by [`CoverageKey`] and, on a miss, rasterized and
+/// (when the font is blurred) its shadow derived from that coverage before
+/// inserting, so both the sharp character and its shadow are reused by a
+/// later draw. Eviction is least-recently-used. The type is explicit
+/// caller-owned state; there is no global cache.
 pub struct TextCoverageCache {
     /// Cached masks, evicted least-recently-used at the reference limit.
     entries: LruCache<CoverageKey, CoverageMask>,
@@ -1801,7 +1738,7 @@ pub fn rasterize_text_coverage(
     }
     // A run whose non-whitespace characters all rasterize to no ink means the
     // resolved face cannot render them; report a typed error instead of
-    // compositing nothing (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:185-194`).
+    // compositing nothing.
     if masks.is_empty()
         && let Some(glyph) = layout
             .glyphs
@@ -1815,17 +1752,11 @@ pub fn rasterize_text_coverage(
     Ok(masks)
 }
 
-/// Blurs every glyph of `layout` with the reference character-blur kernel,
-/// returning the cached shadow masks positioned in the text's local coordinate
-/// space.
+/// Blurs every glyph of `layout` with the character-blur kernel, returning the
+/// cached shadow masks positioned in the text's local coordinate space.
 ///
 /// The blurred mask is derived from the cached sharp coverage, so a shadow
-/// never rasterizes a glyph a second time. The reference caches the blurred
-/// character beside the sharp one: `TVPGetCharacter` applies
-/// `tTVPCharacterData::Blur` before inserting when `font.Blured` is set
-/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:244-320`) and
-/// `DrawTextSingle`/`DrawText` request it by setting `font.Blured = true`
-/// (`LayerBitmapImpl.cpp:1114-1200,1300-1400`).
+/// never rasterizes a glyph a second time.
 ///
 /// # Errors
 ///
@@ -2127,9 +2058,7 @@ pub fn compose_text_into(
     clip: RectI,
     opacity: u8,
 ) -> Result<Option<RectI>, TextError> {
-    if !(style.size_px.is_finite() && style.size_px > 0.0) {
-        return Err(TextError::InvalidSize(style.size_px));
-    }
+    validate_size(style.size_px)?;
     let (sin, cos) = angle.sin_cos();
     let mut ink: Option<RectI> = None;
     for mask in masks {
@@ -2169,17 +2098,26 @@ fn union_rect(a: RectI, b: RectI) -> RectI {
     (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
 }
 
+/// Returns [`TextError::InvalidSize`] unless `size_px` is finite and positive.
+fn validate_size(size_px: f32) -> Result<(), TextError> {
+    if size_px.is_finite() && size_px > 0.0 {
+        Ok(())
+    } else {
+        Err(TextError::InvalidSize(size_px))
+    }
+}
+
 /// Expands 8-bit coverage into straight-alpha white RGBA.
 ///
 /// The atlas keeps only coverage (`alpha = coverage`, RGB white) so one cached
 /// cell can be tinted with any text colour at draw time without re-rasterizing.
 fn coverage_rgba(bitmap: &GlyphBitmap) -> Vec<u8> {
     let mut out = vec![0u8; (bitmap.width as usize) * (bitmap.height as usize) * 4];
-    for (index, &coverage) in bitmap.coverage.iter().enumerate() {
-        out[index * 4] = 255;
-        out[index * 4 + 1] = 255;
-        out[index * 4 + 2] = 255;
-        out[index * 4 + 3] = coverage;
+    for (pixel, &coverage) in out.chunks_exact_mut(4).zip(bitmap.coverage.iter()) {
+        pixel[0] = 255;
+        pixel[1] = 255;
+        pixel[2] = 255;
+        pixel[3] = coverage;
     }
     out
 }

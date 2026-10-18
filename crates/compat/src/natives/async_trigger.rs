@@ -86,17 +86,12 @@ struct AsyncTriggerBinding {
     owner: usize,
 }
 
-/// One scheduled fire.
-///
-/// The reference `tTVPEvent` constructor AddRefs both its target and source
-/// (`reference/cpp/core/base/EventIntf.cpp:58-65`), so the source trigger
-/// object stays alive until the queued event is delivered, even when the
-/// script only held it in a local. `owner` is that retained source for this
-/// port.
+/// One scheduled fire: the object to dispatch and a strong reference that
+/// keeps it alive until the poll delivers the fire.
 struct PendingTrigger {
     /// The object whose `onFire` is dispatched.
     id: AsyncTriggerId,
-    /// A strong reference to the trigger object while the fire is queued.
+    /// A strong reference to the source object while the fire is queued.
     owner: Option<DetachedValue>,
 }
 
@@ -448,9 +443,8 @@ extern "C" fn async_trigger_trigger(
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
-    // The reference's posted event AddRefs the source object
-    // (`EventIntf.cpp:58-65`), so a trigger held only by the script local
-    // survives until the poll delivers the fire.
+    // Retain the source object so it survives until the poll delivers the
+    // fire, even when the script held the trigger only in a local.
     let source = services
         .state::<AsyncTriggerState>()
         .triggers

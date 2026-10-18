@@ -1987,22 +1987,20 @@ fn case_correct_path(
     relative: &str,
 ) -> Result<PathBuf, StorageReadError> {
     let mut host = game_dir.to_path_buf();
-    let parts: Vec<&str> = relative
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .collect();
-    for (index, part) in parts.iter().enumerate() {
-        if let Some(real) = case_correct_component(fs, &host, part)? {
-            host.push(real);
-        } else {
-            // The reference appends the requested spelling of this component
-            // and every remaining one, then stops correcting
-            // (`newname += ptr_cur`,
-            // `reference/cpp/core/base/impl/StorageImpl.cpp:373-377`).
-            for rest in &parts[index..] {
-                host.push(*rest);
+    let mut parts = relative.split('/').filter(|part| !part.is_empty());
+    while let Some(part) = parts.next() {
+        match case_correct_component(fs, &host, part)? {
+            Some(real) => host.push(real),
+            None => {
+                // The requested spelling of this component and every
+                // remaining one is appended, then correcting stops
+                // (`reference/cpp/core/base/impl/StorageImpl.cpp:373-377`).
+                host.push(part);
+                for rest in parts {
+                    host.push(rest);
+                }
+                break;
             }
-            break;
         }
     }
     Ok(host)

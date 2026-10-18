@@ -647,13 +647,10 @@ fn screen_size(ctx: &CompatCtx) -> (u32, u32) {
     let Some(window) = scene.windows.first() else {
         return (0, 0);
     };
-    match window
+    window
         .primary_layer
         .and_then(|primary| scene.layer(primary))
-    {
-        Some(layer) => (layer.rect.w, layer.rect.h),
-        None => window.inner_size,
-    }
+        .map_or(window.inner_size, |layer| (layer.rect.w, layer.rect.h))
 }
 
 // ---------------------------------------------------------------------------

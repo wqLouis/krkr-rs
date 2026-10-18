@@ -189,10 +189,8 @@ extern "C" fn layer_invalidate(engine: *mut c_void, instance: *mut c_void) {
     let Some(id) = inst.id else {
         return;
     };
-    // An invalidated layer cannot hand out its cached `Font` object again.
-    // Release it now; a script object that outlives the scene record (for
-    // example an input-notify cycle) would otherwise keep the font retained
-    // after every Scene resource is gone.
+    // An invalidated layer can no longer hand out its cached `Font` object,
+    // so release it now rather than when the script object drops.
     drop(inst.font_object.take());
     let Ok((_resolved, ctx)) = bound(engine) else {
         return;
@@ -211,10 +209,7 @@ extern "C" fn layer_invalidate(engine: *mut c_void, instance: *mut c_void) {
     }
     blur_tree(&ctx, id);
     // Finalize the direct child script objects while their Scene records
-    // still exist. A parent finalizer can invalidate its page layers before
-    // the layer holding its controls, so the pages would otherwise sever the
-    // controls and leave their script objects to finalize against a missing
-    // record (a layer finalizer writes `cursor`).
+    // still exist, since a child finalizer expects its own layer record.
     let children: Vec<u32> = scene_ref(&ctx)
         .ok()
         .and_then(|scene| scene.layer(id).map(|layer| layer.children.clone()))
@@ -254,13 +249,8 @@ extern "C" fn layer_invalidate(engine: *mut c_void, instance: *mut c_void) {
 
 /// Release the cached L3 state of layers whose Scene record is already gone.
 ///
-/// A final `Layer.Invalidate` removes the layer record and severs its
-/// children. Some child script objects may already have been removed from the
-/// Scene by a re-entrant invalidation while still being held by script arrays,
-/// so their `LayerInst.font_object` would otherwise keep a retained `Font`
-/// forever. This clears the cached font and plugin state for every
-/// registered layer id with no Scene record; the script object itself is
-/// still finalized by its own lifetime.
+/// Their `LayerInst.font_object` would otherwise keep a retained `Font`
+/// forever; the script object itself is finalized by its own lifetime.
 fn release_orphaned_layer_state(ctx: &CompatCtx, host: &Tjs2Engine) {
     let Some(scene) = scene_ref(ctx).ok() else {
         return;
@@ -276,9 +266,9 @@ fn release_orphaned_layer_state(ctx: &CompatCtx, host: &Tjs2Engine) {
             .filter(|(id, _)| scene.layer(**id).is_none())
             .map(|(id, handle)| (*id, handle.as_ptr()))
             .collect();
-        // The Scene record is gone, so the registry entry can never resolve a
-        // live layer again. Remove it before invalidating the script object;
-        // a re-entrant `layer_invalidate` then sees no stale candidates.
+        // The Scene record is gone, so drop the registry entry before
+        // touching the script objects; a re-entrant `layer_invalidate` then
+        // sees no stale candidates.
         state
             .objects
             .layers
@@ -296,9 +286,9 @@ fn release_orphaned_layer_state(ctx: &CompatCtx, host: &Tjs2Engine) {
             drop(inst.font_object.take());
         }
         crate::natives::plugins::layer_ex::forget_layer(ctx, id);
-        // The script object still owns its remaining members; invalidating it
-        // here could run a finalizer that expects the (already removed) scene
-        // record. It is finalized when its own references drop.
+        // The script object keeps its remaining members and is finalized when
+        // its own references drop; invalidating it here would run a finalizer
+        // against the already removed Scene record.
     }
 }
 
@@ -315,16 +305,14 @@ extern "C" fn layer_destroy(engine: *mut c_void, instance: *mut c_void) {
             .objects
             .layers
             .remove(&id);
-        // The invalidate hook normally removed the record already. A payload
-        // destroyed without it still owns a detached record; remove it now so
-        // a layer object that was never explicitly invalidated cannot leave a
-        // scene entry behind.
+        // A payload destroyed without the invalidate hook still owns a
+        // detached record; remove it so no scene entry is left behind.
         if let Ok(scene) = scene_mut(&ctx) {
             scene.remove_layer(id);
         }
         // Idempotent with the invalidate hook, which always runs first; a
         // payload destroyed without it still drops its per-layer plugin
-        // state (`reference/cpp/plugins/layerExMovie.cpp:318-327`).
+        // state.
         crate::natives::plugins::layer_ex::forget_layer(&ctx, id);
     }
     // Dropping the payload releases the cached `font` object.
@@ -1027,10 +1015,8 @@ extern "C" fn layer_independ_main_image(
         set_void(out);
         return 0;
     };
-    // Reference `IndependMainImage` (`LayerIntf.cpp:2679-2686`) severs the
-    // image's sharing in `tTVPNativeBaseBitmap::Independ`, which installs the
-    // fresh copy and then releases the layer's reference to the old image
-    // (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:652-661`).
+    // Install the fresh copy, then release the layer's reference to the
+    // replaced image.
     let replaced = scene.layer_mut(id).and_then(|layer| layer.bitmap.take());
     let new_bitmap = scene.add_bitmap(width, height, rgba);
     if let Some(layer) = scene.layer_mut(id) {

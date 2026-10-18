@@ -53,12 +53,8 @@ pub use movie::{movie_poll, set_movie_source};
 
 /// Drop every piece of per-layer state this plugin keeps for `id`.
 ///
-/// The reference attaches its per-layer state to the layer object itself
-/// (`layerExMovie`/`layerExPerspective` are native instances of the `Layer`,
-/// `reference/cpp/plugins/layerExMovie.cpp:318-327`,
-/// `reference/cpp/plugins/layerExPerspective.cpp:255-296`), so a layer's
-/// destruction frees it. The port keys that state by layer id in the dispatch
-/// services; the layer's invalidate and destroy hooks call this.
+/// The layer's invalidate and destroy hooks call this, so no transform,
+/// recording or movie playback state outlives the layer.
 pub(crate) fn forget_layer(ctx: &CompatCtx, id: u32) {
     movie::forget_layer(ctx, id);
     draw::forget_layer(ctx, id);

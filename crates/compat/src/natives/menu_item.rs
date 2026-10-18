@@ -78,10 +78,8 @@ struct MenuNode {
     parent: Option<u64>,
     /// Child node ids, in menu order.
     children: Vec<u64>,
-    /// Strong references to the children's script objects (reference
-    /// `AddChild`'s `item->Owner->AddRef()`, `MenuItemIntf.cpp:127-132`), so a
-    /// child added by `root.add(new MenuItem(...))` stays alive until it is
-    /// removed.
+    /// Strong references to the child script objects, held for as long as the
+    /// child stays attached so `root.add(new MenuItem(...))` keeps it alive.
     retained_children: HashMap<u64, DetachedValue>,
     /// Retained action owner (`MenuItem` constructor argument 0); the default
     /// `onClick` handler dispatches to it.
@@ -276,9 +274,8 @@ fn detach_child(state: &mut MenuState, parent_id: u64, child_id: u64) -> Option<
     released
 }
 
-/// Keep the child's script object alive for as long as it is a child
-/// (reference `MenuItemIntf.cpp:127-132`). Returns the retention the same
-/// parent previously held for this child, if any.
+/// Keep the child's script object alive for as long as it is a child, and
+/// return the retention the same parent previously held for this child.
 fn retain_child(
     engine: &Tjs2Engine,
     state: &mut MenuState,
@@ -329,6 +326,22 @@ fn insert_child(
         child.parent = Some(parent_id);
     }
     Ok(old_retention)
+}
+
+/// Attach `child_id` to `parent_id` at `index` and retain the child's script
+/// object, returning the retentions this call gave up: the one the old parent
+/// held and the one this parent held, if any. The caller drops them once the
+/// state borrow is gone.
+fn attach_child(
+    engine: &Tjs2Engine,
+    state: &mut MenuState,
+    parent_id: u64,
+    child_id: u64,
+    index: usize,
+) -> Result<(Option<DetachedValue>, Option<DetachedValue>), String> {
+    let old = insert_child(state, parent_id, child_id, index)?;
+    let previous = retain_child(engine, state, parent_id, child_id);
+    Ok((old, previous))
 }
 
 /// Whether an item and every one of its ancestors is enabled
@@ -479,12 +492,12 @@ extern "C" fn menu_item_destroy(engine: *mut c_void, instance: *mut c_void) {
 /// The VM runs this hook both for `invalidate obj` and right before object
 /// destruction (`tTJSCustomObject::Finalize` → `Invalidate`,
 /// `tjsObject.cpp:377-399`), so a destroyed parent cascades into its subtree
-/// exactly like an invalidated one. The retained `action_owner`, `window`
-/// and `children_array` are taken here and dropped *outside* the state
-/// borrow: releasing the last reference to a script object can run
-/// destructors (including this object's) that re-enter the state. The item's
-/// own `Owner` is a raw pointer (`MenuItemIntf.cpp:103`), never a strong
-/// self-reference, so nothing here roots the item itself.
+/// exactly like an invalidated one. The retained `action_owner`, `window`,
+/// `children_array` and `retained_children` are taken here and dropped
+/// *outside* the state borrow: releasing the last reference to a script
+/// object can run destructors (including this object's) that re-enter the
+/// state. The item's own `Owner` is a raw pointer (`MenuItemIntf.cpp:103`),
+/// never a strong self-reference, so nothing here roots the item itself.
 extern "C" fn menu_item_invalidate(engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
@@ -507,8 +520,7 @@ extern "C" fn menu_item_invalidate(engine: *mut c_void, instance: *mut c_void) {
         let Some(node) = state.nodes.get_mut(&id) else {
             return;
         };
-        let children = node.children.clone();
-        node.children.clear();
+        let children = std::mem::take(&mut node.children);
         node.children_dirty = true;
         node.parent = None;
         (
@@ -719,17 +731,14 @@ extern "C" fn menu_item_add(
             return 0;
         }
         let index = state.nodes.get(&id).map_or(0, |node| node.children.len());
-        let old_retention = match insert_child(&mut state, id, child, index) {
-            Ok(previous) => previous,
+        match attach_child(resolved.engine(), &mut state, id, child, index) {
+            Ok(retentions) => retentions,
             Err(error) => return report_error(out_error, &error),
-        };
-        let previous_retention = retain_child(resolved.engine(), &mut state, id, child);
-        (old_retention, previous_retention)
+        }
     };
     // Releasing these can run script finalizers, so do it after the state
     // borrow is gone.
-    drop(old_retention);
-    drop(previous_retention);
+    drop((old_retention, previous_retention));
     set_void(out);
     0
 }
@@ -778,15 +787,12 @@ extern "C" fn menu_item_insert(
             set_void(out);
             return 0;
         }
-        let old_retention = match insert_child(&mut state, id, child, index) {
-            Ok(previous) => previous,
+        match attach_child(resolved.engine(), &mut state, id, child, index) {
+            Ok(retentions) => retentions,
             Err(error) => return report_error(out_error, &error),
-        };
-        let previous_retention = retain_child(resolved.engine(), &mut state, id, child);
-        (old_retention, previous_retention)
+        }
     };
-    drop(old_retention);
-    drop(previous_retention);
+    drop((old_retention, previous_retention));
     set_void(out);
     0
 }

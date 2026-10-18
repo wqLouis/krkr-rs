@@ -526,15 +526,9 @@ impl Engine {
 
     /// Advances the overlay by one frame, letting it refresh its own texture.
     fn refresh_overlay(&mut self, now_ms: u64) -> Result<(), EngineError> {
+        let objects = self.object_counts();
         let Some(overlay) = self.overlay.as_mut() else {
             return Ok(());
-        };
-        let objects = ObjectCounts {
-            windows: self.scene.windows.len(),
-            layers: self.scene.layers.len(),
-            bitmaps: self.scene.bitmaps.len(),
-            fonts: self.scene.fonts.len(),
-            textures: self.textures.len(),
         };
         overlay
             .refresh(&self.pipeline, &mut self.render_state, now_ms, objects)

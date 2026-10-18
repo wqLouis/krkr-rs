@@ -42,15 +42,9 @@ pub(crate) struct ObjectRegistry {
 
 /// A non-owning handle to a script object, keyed by scene id.
 ///
-/// The reference native instance holds its owner as a raw
-/// `iTJSDispatch2 *Owner` without a reference (`LayerIntf.h:173`,
-/// `WindowIntf.h:168-172` `Owner`/`GetOwnerNoAddRef`), so the script object
-/// reaches reference count zero and its `Invalidate`/destructor run. Holding a
-/// strong reference here made that impossible: the registry rooted every
-/// object forever, so the native destroy never ran and each create/close
-/// cycle leaked its objects. Every lookup retains the object for the returned
-/// handle, the reference `tTJSVariant(GetOwnerNoAddRef(), GetOwnerNoAddRef())`
-/// shape.
+/// The registry must not retain the object, so the script object can reach
+/// reference count zero and run its invalidate/destructor when its script
+/// references drop. A lookup retains the object only for the returned handle.
 #[derive(Clone, Copy)]
 pub(crate) struct ObjectHandle {
     raw: usize,

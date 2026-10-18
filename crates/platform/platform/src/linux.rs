@@ -167,10 +167,12 @@ impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
         // notified so a higher layer can recreate its surface. Only the
         // window creation itself is guarded.
         if self.window.is_none() {
-            let attributes = Window::default_attributes().with_title(self.config.title.as_str());
-            let logical_size =
-                LogicalSize::new(f64::from(self.config.size.0), f64::from(self.config.size.1));
-            let attributes = attributes.with_inner_size(logical_size);
+            let attributes = Window::default_attributes()
+                .with_title(self.config.title.as_str())
+                .with_inner_size(LogicalSize::new(
+                    f64::from(self.config.size.0),
+                    f64::from(self.config.size.1),
+                ));
             let window = match event_loop.create_window(attributes) {
                 Ok(window) => window,
                 Err(error) => {

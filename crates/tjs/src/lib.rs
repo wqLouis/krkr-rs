@@ -909,9 +909,7 @@ impl Tjs2Engine {
     /// result value: an object produced by the script's last expression is
     /// neither left in the interpreter's result register nor recorded in the
     /// engine's last-object slot. Use this for scripts whose value is
-    /// ignored; a result-returning [`Self::exec_script`] keeps that object
-    /// alive until the next engine call with an object result (or the idle
-    /// compact).
+    /// ignored.
     pub fn exec_script_discard(&self, script: &str, name: &str) -> Result<(), TjsError> {
         let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
         let mut error: *mut c_char = ptr::null_mut();
@@ -3693,12 +3691,9 @@ var ra = a.get(); var rb = b.get();",
 
     /// `exec_script_discard` passes a null result slot, so the object produced
     /// by the script's last expression is not kept alive by the interpreter's
-    /// result register. That retention pinned a script-created object across
-    /// `do_gc`: a boot script ending in `new Window()` (or appending to a
-    /// helper object) kept the object alive after its script reference was
-    /// gone. The observation is the native instance's `destroy` callback,
-    /// which runs in Rust, so no engine call is needed to read the result
-    /// (such a call would itself reset the result slot).
+    /// result register. The native instance's `destroy` callback observes the
+    /// release directly, without an engine call that would itself reset the
+    /// result slot.
     #[test]
     fn exec_script_discard_does_not_pin_its_object_result() {
         let _vm_lock = vm_lock();

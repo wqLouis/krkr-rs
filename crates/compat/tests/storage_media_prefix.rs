@@ -212,16 +212,6 @@ fn save2_strips_the_file_media_prefix() {
     );
 }
 
-/// A `saveStruct` name that carries the `file:` media prefix and a doubled
-/// slash lands at the bare host path, not under a literal `file:/…` path.
-///
-/// `Array.saveStruct` is vendored TJS2 and opens the target through the
-/// `crates/tjs` stream factory, which resolves names itself; the reference
-/// resolves `TVPCreateStream` through `TVPGetLocallyAccessibleName`, which
-/// strips the local `file` media prefix
-/// (`reference/cpp/core/base/StorageIntf.cpp:240-430`), and the text write
-/// stream then opens the placed path
-/// (`reference/cpp/core/base/TextStream.cpp`).
 /// A fully lowercased absolute save name — the shape `System.dataPath`
 /// produces — must resolve to the real mixed-case on-disk directory rather
 /// than creating a lowercase tree or failing on a read-only parent.
@@ -254,6 +244,16 @@ fn save_struct_resolves_a_lowercased_absolute_name_to_the_real_path() {
     );
 }
 
+/// A `saveStruct` name that carries the `file:` media prefix and a doubled
+/// slash lands at the bare host path, not under a literal `file:/…` path.
+///
+/// `Array.saveStruct` is vendored TJS2 and opens the target through the
+/// `crates/tjs` stream factory, which resolves names itself; the reference
+/// resolves `TVPCreateStream` through `TVPGetLocallyAccessibleName`, which
+/// strips the local `file` media prefix
+/// (`reference/cpp/core/base/StorageIntf.cpp:240-430`), and the text write
+/// stream then opens the placed path
+/// (`reference/cpp/core/base/TextStream.cpp`).
 #[test]
 fn save_struct_strips_the_file_media_prefix_and_doubled_slash() {
     let _lock = vm_lock();
