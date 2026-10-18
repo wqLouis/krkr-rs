@@ -211,10 +211,11 @@ fn destroy_layer_removes_whole_subtree() {
     assert_eq!(order, vec![unrelated]);
 }
 
-/// A native `Invalidate` is final, so it destroys the whole subtree; an
-/// invalidated config page must not leave parentless child records behind.
+/// `Invalidate` severs the parent and each direct child, but it does not
+/// destroy the child records: their script objects still have to finalize.
+/// The detached children are no longer reachable from the window's draw order.
 #[test]
-fn invalidate_layer_destroys_whole_subtree() {
+fn invalidate_layer_severs_its_children() {
     let mut scene = Scene::default();
     let win = scene.add_window("t", (1, 1));
     let parent = scene.add_layer(win, None);
@@ -225,11 +226,8 @@ fn invalidate_layer_destroys_whole_subtree() {
     scene.invalidate_layer(parent);
 
     assert!(scene.layer(parent).is_none());
-    assert!(scene.layer(child).is_none(), "child destroyed with parent");
-    assert!(
-        scene.layer(grandchild).is_none(),
-        "grandchild destroyed with parent"
-    );
+    assert_eq!(scene.layer(child).and_then(|l| l.parent), None);
+    assert_eq!(scene.layer(grandchild).and_then(|l| l.parent), Some(child));
     assert!(scene.layer(unrelated).is_some(), "unrelated layer survives");
     assert_eq!(scene.window_layer_order(win), vec![unrelated]);
 }

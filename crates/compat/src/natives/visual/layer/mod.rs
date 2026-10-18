@@ -210,6 +210,36 @@ extern "C" fn layer_invalidate(engine: *mut c_void, instance: *mut c_void) {
         layer.shutdown = true;
     }
     blur_tree(&ctx, id);
+    // Finalize the direct child script objects while their Scene records
+    // still exist. `ConfigWindow.finalize` invalidates its page layers before
+    // the button dictionary, so the pages would otherwise sever the buttons
+    // and leave their script objects to finalize against a missing record
+    // (`SelectItemBase.finalize` writes `cursor`).
+    let children: Vec<u32> = scene_ref(&ctx)
+        .ok()
+        .and_then(|scene| scene.layer(id).map(|layer| layer.children.clone()))
+        .unwrap_or_default();
+    for child in children {
+        let raw = {
+            // SAFETY: the caller resolved a live compat context.
+            let services = unsafe { ctx.services() };
+            let state = services.state::<VisualState>();
+            state
+                .objects
+                .layers
+                .get(&child)
+                .map(crate::natives::visual::common::ObjectHandle::as_ptr)
+        };
+        let Some(raw) = raw else {
+            continue;
+        };
+        let Ok(object) = _resolved.engine().retain_object_detached(raw) else {
+            continue;
+        };
+        if let Err(error) = _resolved.engine().invalidate_retained(object.raw_id()) {
+            log::debug!("Layer: child invalidate failed for #{child}: {error}");
+        }
+    }
     if let Ok(scene) = scene_mut(&ctx) {
         // Detach the layer from the scene so hit-testing and event dispatch
         // no longer resolve it once its script object is invalidated.
@@ -265,9 +295,9 @@ fn release_orphaned_layer_state(ctx: &CompatCtx, host: &Tjs2Engine) {
             drop(inst.font_object.take());
         }
         crate::natives::plugins::layer_ex::forget_layer(ctx, id);
-        if let Err(error) = host.invalidate_retained(object.raw_id()) {
-            log::debug!("Layer: orphan invalidate failed for #{id}: {error}");
-        }
+        // The script object still owns its remaining members; invalidating it
+        // here could run a finalizer that expects the (already removed) scene
+        // record. It is finalized when its own references drop.
     }
 }
 
@@ -284,6 +314,13 @@ extern "C" fn layer_destroy(engine: *mut c_void, instance: *mut c_void) {
             .objects
             .layers
             .remove(&id);
+        // The invalidate hook normally removed the record already. A payload
+        // destroyed without it still owns a detached record; remove it now so
+        // a layer object that was never explicitly invalidated cannot leave a
+        // scene entry behind.
+        if let Ok(scene) = scene_mut(&ctx) {
+            scene.remove_layer(id);
+        }
         // Idempotent with the invalidate hook, which always runs first; a
         // payload destroyed without it still drops its per-layer plugin
         // state (`reference/cpp/plugins/layerExMovie.cpp:318-327`).

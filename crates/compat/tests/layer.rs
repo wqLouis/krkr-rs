@@ -1119,3 +1119,28 @@ fn invalidating_a_parent_page_releases_child_font_wrappers() {
         baseline + 1
     );
 }
+
+/// A parent invalidation finalizes its direct children while their Scene
+/// records still exist. `SelectItemBase.finalize` writes `cursor`; if the
+/// parent had already removed the child records that write raised
+/// `Layer: layer no longer exists` and aborted `ConfigDelete`.
+#[test]
+fn invalidating_a_parent_finalizes_children_before_removing_their_records() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var page = new Layer(w, null); \
+         var row = new Layer(w, page); \
+         row.finalize = function() { cursor = 0; };",
+    );
+    assert_eq!(env.scene.layers.len(), 2);
+
+    env.run("invalidate page; page = null; row = null;");
+
+    assert_eq!(
+        env.scene.layers.len(),
+        0,
+        "the finalized child must remove its own Scene record"
+    );
+}

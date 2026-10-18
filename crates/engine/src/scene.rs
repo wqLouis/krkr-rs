@@ -1245,28 +1245,24 @@ impl Scene {
 
     /// Reference `tTJSNI_BaseLayer::Invalidate` (`LayerIntf.cpp:515`): the
     /// explicit native teardown the script triggers with `invalidate layer`.
-    /// This is the **cycle breaker**: it destroys the layer and its whole
-    /// child subtree, releasing the MainImage, province plane, font, primary
-    /// slot and focus registration of every record in the subtree.
-    ///
-    /// A native `Invalidate` is final (`LayerIntf.cpp:515-566`): the
-    /// reference severs each child (`Part`) and releases the parent's
-    /// `Children` array, so the children are destroyed with the parent. The
-    /// port has no TJS child array to release, so it removes the subtree
-    /// directly; leaving detached children in `Scene::layers` is what made a
-    /// repeatedly opened config page grow without bound. Explicit `Part()`
-    /// remains [`Scene::remove_layer`], which keeps the children.
+    /// The invalidated layer is removed from the scene and its direct
+    /// children are severed (`Part`, `LayerIntf.cpp:535-549`), but each
+    /// child's record remains until that child's own script object is
+    /// finalized. The compat layer finalizes the children before calling this
+    /// so their finalizers still see a live layer.
     pub fn invalidate_layer(&mut self, id: u32) {
         if self.layer(id).is_none() {
             return;
         }
-        // Mark it inert first so a re-entrant query cannot touch it while the
-        // subtree is collected.
         if let Some(l) = self.layer_mut(id) {
             l.shutdown = true;
             l.pending_paint = false;
         }
-        self.destroy_layer(id);
+        // `Part()` only detaches this layer and its direct children; the
+        // children keep their own records until their script objects are
+        // finalized, matching `tTJSNI_BaseLayer::Invalidate`
+        // (`LayerIntf.cpp:535-549`).
+        self.remove_layer(id);
     }
 
     /// Drop a font record and rebuild the id→index map.
