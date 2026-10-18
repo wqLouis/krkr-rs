@@ -901,7 +901,9 @@ What the audit must do:
 1. Add live counters to the debug overlay — `scene.bitmaps`, `Host::textures`,
    the Vulkan texture/descriptor-set count, and the `ObjectRegistry` map sizes —
    then drive a real page/motion/config cycle on a title and watch which
-   counter grows (and whether it ever falls).
+   counter grows (and whether it ever falls). **Partially done:** the overlay
+   now shows windows/layers/bitmaps/fonts/textures; descriptor-set and
+   `ObjectRegistry` counts are still missing.
 2. Separate "a genuine retainer" from "the reference's own graphic cache
    limit". The reference bounds live graphics through `System.graphicCacheLimit`;
    the port uploads one texture per live scene bitmap with **no** such bound, so

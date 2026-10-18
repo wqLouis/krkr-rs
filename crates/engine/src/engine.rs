@@ -59,6 +59,24 @@ pub struct EngineParts {
     pub overlay: Option<Box<dyn EngineOverlay>>,
 }
 
+/// Live object counts the engine exposes to a render-only overlay.
+///
+/// These are the engine's own tables, not script handles: the counts follow
+/// the scene and texture lifetime and are refreshed with the overlay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObjectCounts {
+    /// Windows in the scene.
+    pub windows: usize,
+    /// Layers in the scene.
+    pub layers: usize,
+    /// Bitmaps in the scene.
+    pub bitmaps: usize,
+    /// Fonts in the scene.
+    pub fonts: usize,
+    /// Uploaded bitmap textures the engine currently holds.
+    pub textures: usize,
+}
+
 /// Behaviour the engine calls once per frame before the frame is projected.
 ///
 /// This is the single upward edge of the frame: the layer above runs its VM
@@ -98,6 +116,7 @@ pub trait EngineOverlay {
         pipeline: &RenderPipeline,
         state: &mut RenderState,
         now_ms: u64,
+        objects: ObjectCounts,
     ) -> Result<(), String>;
 
     /// Returns the overlay node, in device/framebuffer coordinates.
@@ -510,8 +529,15 @@ impl Engine {
         let Some(overlay) = self.overlay.as_mut() else {
             return Ok(());
         };
+        let objects = ObjectCounts {
+            windows: self.scene.windows.len(),
+            layers: self.scene.layers.len(),
+            bitmaps: self.scene.bitmaps.len(),
+            fonts: self.scene.fonts.len(),
+            textures: self.textures.len(),
+        };
         overlay
-            .refresh(&self.pipeline, &mut self.render_state, now_ms)
+            .refresh(&self.pipeline, &mut self.render_state, now_ms, objects)
             .map_err(EngineError::Overlay)
     }
 
@@ -588,6 +614,17 @@ impl Engine {
         {
             Some(layer) => (layer.rect.w, layer.rect.h),
             None => window.inner_size,
+        }
+    }
+
+    /// Returns the live scene and texture object counts.
+    pub fn object_counts(&self) -> ObjectCounts {
+        ObjectCounts {
+            windows: self.scene.windows.len(),
+            layers: self.scene.layers.len(),
+            bitmaps: self.scene.bitmaps.len(),
+            fonts: self.scene.fonts.len(),
+            textures: self.textures.len(),
         }
     }
 

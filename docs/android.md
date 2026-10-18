@@ -250,7 +250,7 @@ rule (`docs/migration/11`, D39), so there is no scaling control to show.
 |---|---|---|---|
 | Frame-rate limit | decimal integer `1..=1000` fps | `60` | reference `fps_limit` default 60 (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`); the same range `--fps` accepts |
 | Archive preload | `true`, `false` | `false` | whether every mounted archive is read into memory when it mounts; the cost is that archive's size in resident memory, the gain is that entry reads stop touching the backing filesystem |
-| Debug overlay | `true`, `false` | `false` | draw the frame rate and the process's resident memory in the top-left corner; a render-only panel, never a script-visible layer or bitmap |
+| Debug overlay | `true`, `false` | `false` | draw FPS, CPU, disk I/O, memory and object counts in the top-left corner; a render-only panel, never a script-visible layer or bitmap |
 | Engine log level | `off`, `error`, `warn`, `info`, `debug`, `trace` | `info` | how much the engine writes to `krkr.log`; `debug`/`trace` are diagnostic and produce large logs (see §7) |
 
 The debug overlay is off by default and persisted under the `debug_overlay`

@@ -82,7 +82,7 @@ parses. The recognized keys are `frame_rate`, `preload_archives` and
 |---|---|---|---|
 | `--fps N` (`frame_rate`) | frames per second, `1..=1000` | `60` | reference `fps_limit` default `60` (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`), applied as the animation interval `1/fps` (`reference/cpp/core/environ/cocos2d/MainScene.cpp:684-685`); the main loop sleeps the remaining interval (`reference/cpp/core/environ/RenderUtils.h`, `TVPDrawSceneOnce`) |
 | `--preload-archives` (`preload_archives`) | `true`, `false` | `false` | read every mounted archive into memory when it mounts; the cost is that archive's size in resident memory, the gain is that entry reads stop touching the backing filesystem |
-| `--debug-overlay` (`debug_overlay`) | `true`, `false` | `false` | draw the frame rate and the process's resident memory in the top-left corner; a render-only node, never a script-visible layer or bitmap, so it cannot change what a script observes. RSS comes from `platform::memory_usage()`, which reads `VmRSS` from `/proc/self/status` (Linux and Android); an unreadable value is omitted rather than fabricated |
+| `--debug-overlay` (`debug_overlay`) | `true`, `false` | `false` | draw FPS, process CPU, storage read/write rates, resident memory and live object counts in the top-left corner; a render-only node, never a script-visible layer or bitmap, so it cannot change what a script observes. CPU comes from `/proc/self/task/*/schedstat`, storage from `/proc/self/io`, RSS from `/proc/self/status`; an unavailable value is shown as `?`, never fabricated |
 
 The frame-rate limit paces both loops: the windowed loop through
 `PlatformConfig::frame_interval` and the headless step through

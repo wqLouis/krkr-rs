@@ -129,8 +129,8 @@ pub struct HostConfig {
     /// through `begin_render_state_with_display`; `None` uses the
     /// window-handle-only entry point (or the null backend).
     pub display_handle: Option<RawDisplayHandle>,
-    /// Whether the host draws the debug overlay (frame rate and resident
-    /// memory) in the top-left corner.
+    /// Whether the host draws the debug overlay (frame rate, host usage,
+    /// memory and live object counts) in the top-left corner.
     ///
     /// The overlay is a render-only node: it is never a script-visible layer
     /// or bitmap, so it cannot change the scene a script observes.

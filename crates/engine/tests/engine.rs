@@ -45,6 +45,7 @@ impl EngineOverlay for CountingOverlay {
         _pipeline: &RenderPipeline,
         _state: &mut RenderState,
         _now_ms: u64,
+        _objects: engine::ObjectCounts,
     ) -> Result<(), String> {
         self.refreshes.set(self.refreshes.get().saturating_add(1));
         Ok(())
@@ -566,4 +567,41 @@ fn a_hook_error_abandons_the_frame() {
         other => panic!("unexpected error: {other:?}"),
     }
     assert_eq!(engine.frame_index(), 0);
+}
+
+#[test]
+fn object_counts_follow_the_scene_and_uploaded_textures() {
+    // reference/cpp/core/visual/LayerIntf.cpp:304-410 — layers, bitmaps and
+    // fonts are the scene's own object tables; the texture table is the
+    // engine's upload cache and grows with the first dirty bitmap.
+    let mut engine = headless_engine((64, 64));
+    assert_eq!(engine.object_counts(), engine::ObjectCounts::default());
+
+    let window = engine.scene_mut().add_window("game", (64, 64));
+    let layer = engine.scene_mut().add_layer(window, None);
+    let bitmap = engine.scene_mut().add_bitmap(2, 2, vec![255; 2 * 2 * 4]);
+    if let Some(state) = engine.scene_mut().layer_mut(layer) {
+        state.rect = Rect::new(0, 0, 2, 2);
+        state.bitmap = Some(bitmap);
+        state.image_width = 2;
+        state.image_height = 2;
+    }
+    let font = engine
+        .scene_mut()
+        .add_font(String::new(), 12, [255, 255, 255, 255]);
+    let counts = engine.object_counts();
+    assert_eq!(counts.windows, 1);
+    assert_eq!(counts.layers, 1);
+    assert_eq!(counts.bitmaps, 1);
+    assert_eq!(counts.fonts, 1);
+    assert_eq!(counts.textures, 0, "the texture is uploaded by the frame");
+    assert_eq!(
+        engine.scene().fonts.len(),
+        1,
+        "font {font} stays in the scene"
+    );
+
+    let mut hooks = Recorder::default();
+    engine.step(1.0, &mut hooks).expect("frame");
+    assert_eq!(engine.object_counts().textures, 1);
 }
