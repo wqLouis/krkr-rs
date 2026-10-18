@@ -254,10 +254,11 @@ extern "C" fn layer_invalidate(engine: *mut c_void, instance: *mut c_void) {
 
 /// Release the cached L3 state of layers whose Scene record is already gone.
 ///
-/// A final `Layer.Invalidate` destroys the whole Scene subtree. The child
-/// script objects may still be held by script arrays (the config page does
-/// this), so their `LayerInst.font_object` would otherwise keep a retained
-/// `Font` forever. This clears the cached font and plugin state for every
+/// A final `Layer.Invalidate` removes the layer record and severs its
+/// children. Some child script objects may already have been removed from the
+/// Scene by a re-entrant invalidation while still being held by script arrays,
+/// so their `LayerInst.font_object` would otherwise keep a retained `Font`
+/// forever. This clears the cached font and plugin state for every
 /// registered layer id with no Scene record; the script object itself is
 /// still finalized by its own lifetime.
 fn release_orphaned_layer_state(ctx: &CompatCtx, host: &Tjs2Engine) {

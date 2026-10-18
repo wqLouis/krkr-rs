@@ -601,6 +601,7 @@ fn dropping_the_last_window_reference_releases_its_scene_tree() {
 
     env.run(
         "var page = new Layer(w, null); page.setImageSize(16, 16); \
+         page.finalize = function() { cursor = 0; }; \
          var row = new Layer(w, page); row.setImageSize(8, 8); \
          var face = row.font;",
     );
@@ -654,10 +655,11 @@ fn invalidating_a_window_releases_its_scene_tree_and_registered_objects() {
 
     env.run(
         "var page = new Layer(w, null); page.setImageSize(16, 16); \
+         page.finalize = function() { cursor = 0; }; \
          var row = new Layer(w, page); row.setImageSize(8, 8); \
          var face = row.font; \
          var finals = 0; \
-         class Sink { function finalize() { finals = finals + 1; } } \
+         class Sink { function finalize() { page.cursor = 0; finals = finals + 1; } } \
          var reg = new Sink(); \
          w.add(reg);",
     );
@@ -722,10 +724,11 @@ fn close_invalidates_registered_objects_and_drops_the_scene_tree() {
 
     env.run(
         "var page = new Layer(w, null); page.setImageSize(16, 16); \
+         page.finalize = function() { cursor = 0; }; \
          var row = new Layer(w, page); row.setImageSize(8, 8); \
          var face = row.font; \
          var finals = 0; \
-         class Sink { function finalize() { finals = finals + 1; } } \
+         class Sink { function finalize() { page.cursor = 0; finals = finals + 1; } } \
          var sink = new Sink(); \
          w.add(sink);",
     );
