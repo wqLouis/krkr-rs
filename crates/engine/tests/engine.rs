@@ -72,12 +72,22 @@ fn headless_parts(size: (u32, u32)) -> EngineParts {
         surface_size: size,
         headless: true,
         overlay: None,
+        vm_size: None,
     }
 }
 
 /// Builds a headless engine over the null backend.
 fn headless_engine(size: (u32, u32)) -> Engine {
     Engine::new(headless_parts(size)).expect("engine")
+}
+
+/// Builds a headless engine that forces `vm_size` as the game's logical size.
+fn forced_headless_engine(size: (u32, u32), vm_size: Option<(u32, u32)>) -> Engine {
+    Engine::new(EngineParts {
+        vm_size,
+        ..headless_parts(size)
+    })
+    .expect("engine")
 }
 
 /// Arena indices of the overlay's nodes in the projected scene.
@@ -269,6 +279,9 @@ fn a_scaled_presentation_maps_the_projected_tree_into_the_framebuffer() {
     // (D34/D39/D40).
     let mut engine = headless_engine((200, 200));
     let window = engine.scene_mut().add_window("game", (100, 100));
+    // The window's primary layer covers the client area; the layer under test
+    // is a later, freely placed layer.
+    engine.scene_mut().add_layer(window, None);
     let layer = engine.scene_mut().add_layer(window, None);
     let bitmap = engine
         .scene_mut()
@@ -352,6 +365,151 @@ fn a_script_window_resize_is_surfaced_once() {
         "later frames do not repeat the request"
     );
     assert_eq!(engine.vm_size(), (150, 150));
+}
+
+#[test]
+fn a_forced_vm_size_drives_the_window_primary_layer_and_translation() {
+    // reference/cpp/core/visual/LayerManager.cpp:334-343 — a window client-size
+    // change is a primary-layer size change, so the primary layer covers the
+    // client area. Forcing the client size itself is the launcher extension
+    // (D34): the script cannot observe a size other than the forced one.
+    let mut engine = forced_headless_engine((1280, 720), Some((1920, 1080)));
+    assert_eq!(engine.forced_size(), Some((1920, 1080)));
+    assert_eq!(
+        engine.vm_size(),
+        (1920, 1080),
+        "the forced size is the VM size before a window exists"
+    );
+    assert_eq!(
+        engine.scene().forced_window_size,
+        Some((1920, 1080)),
+        "the scene knows the size a new window starts with"
+    );
+
+    // A window and its primary layer arrive at the script's own size.
+    let window = engine.scene_mut().add_window("game", (1280, 720));
+    let primary = engine.scene_mut().add_layer(window, None);
+    assert!(engine.scene_mut().set_layer_image_size(primary, 1280, 720));
+    let mut hooks = Recorder::default();
+
+    engine.step(1.0, &mut hooks).expect("frame");
+
+    assert_eq!(engine.vm_size(), (1920, 1080));
+    assert_eq!(
+        engine.scene().window(window).expect("window").inner_size,
+        (1920, 1080),
+        "the engine forces the client size"
+    );
+    assert_eq!(
+        engine.scene().layer(primary).expect("layer").rect,
+        Rect::new(0, 0, 1920, 1080),
+        "the primary layer covers the forced client area"
+    );
+    let bitmap = engine
+        .scene()
+        .layer(primary)
+        .and_then(|layer| layer.bitmap)
+        .expect("primary image");
+    let bitmap = engine.scene().bitmap(bitmap).expect("bitmap");
+    assert_eq!((bitmap.width, bitmap.height), (1920, 1080));
+    assert_eq!(
+        engine.take_window_resize(),
+        None,
+        "a forced size is not a script resize request"
+    );
+
+    // The projection is VM space, so 1920x1080 presented on a 1280x720
+    // framebuffer scales by 2/3.
+    let translation = engine.translation().expect("mapping");
+    assert_eq!(translation.vm_size, (1920, 1080));
+    assert_eq!(translation.device_size, (1280, 720));
+    assert!((translation.scale - 2.0 / 3.0).abs() < 1e-9);
+    assert_eq!(translation.offset, (0.0, 0.0));
+
+    // An OS resize moves the framebuffer and the presentation only.
+    engine.resize((2560, 1440)).expect("resize");
+    assert_eq!(engine.surface_size(), (2560, 1440));
+    assert_eq!(engine.vm_size(), (1920, 1080));
+    assert_eq!(
+        engine.scene().window(window).expect("window").inner_size,
+        (1920, 1080)
+    );
+    assert_eq!(engine.take_window_resize(), None);
+    let translation = engine.translation().expect("mapping");
+    assert_eq!(translation.vm_size, (1920, 1080));
+    assert_eq!(translation.device_size, (2560, 1440));
+    assert!((translation.scale - 4.0 / 3.0).abs() < 1e-9);
+
+    // A script that writes the scene window size directly is forced back.
+    engine
+        .scene_mut()
+        .window_mut(window)
+        .expect("window")
+        .inner_size = (800, 600);
+    engine.step(1.0, &mut hooks).expect("frame");
+    assert_eq!(
+        engine.scene().window(window).expect("window").inner_size,
+        (1920, 1080),
+        "the forced size wins over a script resize"
+    );
+    assert_eq!(engine.vm_size(), (1920, 1080));
+    assert_eq!(engine.take_window_resize(), None);
+}
+
+#[test]
+fn without_a_forced_size_the_primary_layer_follows_a_script_window_resize() {
+    // reference/cpp/core/visual/LayerManager.cpp:334-343 — a changed window
+    // client size sizes the primary layer, which therefore covers the client
+    // area after a script resize.
+    let mut engine = headless_engine((1280, 720));
+    assert_eq!(engine.forced_size(), None);
+    let window = engine.scene_mut().add_window("game", (800, 600));
+    let primary = engine.scene_mut().add_layer(window, None);
+    assert!(engine.scene_mut().set_layer_image_size(primary, 800, 600));
+    let mut hooks = Recorder::default();
+
+    engine.step(1.0, &mut hooks).expect("frame");
+    assert_eq!(
+        engine.scene().layer(primary).expect("layer").rect,
+        Rect::new(0, 0, 800, 600)
+    );
+    assert_eq!(
+        engine.take_window_resize(),
+        Some((800, 600)),
+        "the script size is still surfaced to the composition root"
+    );
+
+    engine
+        .scene_mut()
+        .window_mut(window)
+        .expect("window")
+        .inner_size = (1024, 768);
+    engine.step(1.0, &mut hooks).expect("frame");
+    assert_eq!(engine.take_window_resize(), Some((1024, 768)));
+    assert_eq!(engine.vm_size(), (1024, 768));
+    assert_eq!(
+        engine.scene().layer(primary).expect("layer").rect,
+        Rect::new(0, 0, 1024, 768),
+        "the primary layer follows the client size"
+    );
+    let bitmap = engine
+        .scene()
+        .layer(primary)
+        .and_then(|layer| layer.bitmap)
+        .expect("primary image");
+    let bitmap = engine.scene().bitmap(bitmap).expect("bitmap");
+    assert_eq!((bitmap.width, bitmap.height), (1024, 768));
+}
+
+#[test]
+fn a_forced_size_with_a_zero_dimension_is_a_config_error() {
+    let Err(error) = Engine::new(EngineParts {
+        vm_size: Some((1920, 0)),
+        ..headless_parts((64, 64))
+    }) else {
+        panic!("a zero forced dimension must be rejected");
+    };
+    assert!(matches!(error, EngineError::Config(_)), "got {error}");
 }
 
 #[test]

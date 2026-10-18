@@ -20,6 +20,9 @@ use crate::natives::system::{set_string_out, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
 use tjs::VAL_OBJECT;
 
+/// The client size a window starts with when the scene does not force one.
+const DEFAULT_WINDOW_SIZE: (u32, u32) = (1280, 720);
+
 /// `Window` payload: the scene id plus the window properties the L2
 /// [`engine::WindowState`] does not model (there is no OS chrome).
 struct WindowInst {
@@ -160,12 +163,14 @@ extern "C" fn window_create(engine: *mut c_void) -> *mut c_void {
     // already usable; only the manager registration and the default draw
     // device wait for `Construct`. A script subclass may touch a `Window`
     // member before it calls `super.Window(...)`, so the scene window exists
-    // from creation.
+    // from creation. The client size is the scene's forced size when the
+    // composition root forces one, and the default client size otherwise.
     let mut inst = WindowInst::default();
     if let Ok((_resolved, ctx)) = bound(engine)
         && let Ok(scene) = scene_mut(&ctx)
     {
-        inst.id = Some(scene.add_window(String::new(), (1280, 720)));
+        let size = scene.forced_window_size.unwrap_or(DEFAULT_WINDOW_SIZE);
+        inst.id = Some(scene.add_window(String::new(), size));
     }
     Box::into_raw(Box::new(inst)) as *mut c_void
 }
@@ -232,7 +237,8 @@ extern "C" fn window_ctor(
         Some(id) => id,
         // No scene was available at creation time; allocate it now.
         None => {
-            let id = scene.add_window(String::new(), (1280, 720));
+            let size = scene.forced_window_size.unwrap_or(DEFAULT_WINDOW_SIZE);
+            let id = scene.add_window(String::new(), size);
             // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
             unsafe { &mut *(instance as *mut WindowInst) }.id = Some(id);
             id
@@ -498,7 +504,11 @@ extern "C" fn window_set_size(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    if let Some(window) = scene.window_mut(id) {
+    // A forced client size is the launcher's, so a script resize is accepted
+    // and ignored: the engine keeps the window at the forced size.
+    if scene.forced_window_size.is_none()
+        && let Some(window) = scene.window_mut(id)
+    {
         window.inner_size = (width, height);
     }
     set_void(out);
@@ -620,6 +630,9 @@ extern "C" fn window_set_max_size(
 }
 
 /// `Window.setZoom(numer, denom)`.
+///
+/// The ratio is stored for the script to read back: the window and its layers
+/// keep their sizes, whether or not the scene forces a client size.
 extern "C" fn window_set_zoom(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -1025,7 +1038,10 @@ extern "C" fn window_width_set(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    if let Some(window) = scene.window_mut(id) {
+    // A forced client size is the launcher's, so a script write is ignored.
+    if scene.forced_window_size.is_none()
+        && let Some(window) = scene.window_mut(id)
+    {
         window.inner_size.0 = width;
     }
     0
@@ -1076,7 +1092,10 @@ extern "C" fn window_height_set(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    if let Some(window) = scene.window_mut(id) {
+    // A forced client size is the launcher's, so a script write is ignored.
+    if scene.forced_window_size.is_none()
+        && let Some(window) = scene.window_mut(id)
+    {
         window.inner_size.1 = height;
     }
     0

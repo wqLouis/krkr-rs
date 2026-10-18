@@ -275,6 +275,7 @@ impl Host {
             surface,
             render_state,
             surface_size: config.surface_size,
+            vm_size: None,
             headless: config.headless,
             overlay: overlay.map(|overlay| Box::new(overlay) as Box<dyn engine::EngineOverlay>),
         })?;
