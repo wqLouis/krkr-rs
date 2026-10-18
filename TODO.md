@@ -334,22 +334,15 @@ Open:
    `PresentationScaling`/`--scaling`/`ViewTransform`/`native_size` removal)
    has landed.
 
-3. **Explicit VM resolution — landed.** `--vm-size WxH` forces the game's VM
-   surface; `--vm-size display` (aliases `window`/`native`) uses the primary
-   display's physical size. The scene window and primary layer are held at the
-   forced size, script window-size writes are ignored, and the existing Fit
-   translation maps the VM surface to the actual window. The default remains
-   the game's declared size. On a fixed-layout title (the test game hardcodes
-   `WINDOW_WIDTH=1280` and uses its in-game “1080p” option as a window zoom)
-   the forced VM size enlarges the screen but the game’s layers keep their
-   authored size; a native-resolution re-layout or a window-zoom presentation
-   is a separate game-compatibility question, not part of this flag.
+3. **Reference window/screen split — landed.** The VM/logical screen is the
+   primary layer; `Window.setInnerSize` moves the window client only, and Fit
+   scales the screen into the window. A game that applies `setZoom` and
+   `setInnerSize` now presents its 1280-wide screen at the zoomed window size.
 
 Open sub-items are tracked there and in `07`; the remaining mixer/video/
 transition pumps above still apply. Render-resolution decoupling (keep VM,
 CPU-raster at a higher fixed resolution) is documented as a deferred idea in
-`07`, not implemented; the earlier raw-buffer/plugin compatibility concern is
-why the VM-size override is the near-term path.
+`07`, not implemented.
 
 ## 12. Deferred design work
 

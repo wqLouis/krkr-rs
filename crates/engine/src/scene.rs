@@ -24,7 +24,8 @@ pub struct WindowState {
     pub id: u32,
     /// Human-readable window title (used for the host window title).
     pub title: String,
-    /// Game logical size in pixels.
+    /// Window client size in pixels (`Window.width`/`innerWidth`). It is not
+    /// the logical screen: that is the primary layer's rect.
     pub inner_size: (u32, u32),
     /// Whether the host shows the window.
     pub visible: bool,
@@ -506,11 +507,6 @@ pub struct Scene {
     pub bitmaps: Vec<BitmapState>,
     /// All fonts, in creation order. Callers may edit this directly.
     pub fonts: Vec<FontState>,
-    /// The VM/client size the composition root forces on the first window, or
-    /// `None` when the window's client size follows the script. While it is
-    /// set, the engine keeps that window's [`WindowState::inner_size`] at this
-    /// size, and a window created in this scene starts at it.
-    pub forced_window_size: Option<(u32, u32)>,
     next_window: u32,
     next_layer: u32,
     next_bitmap: u32,
@@ -541,7 +537,6 @@ impl Default for Scene {
             layers: Vec::new(),
             bitmaps: Vec::new(),
             fonts: Vec::new(),
-            forced_window_size: None,
             next_window: 0,
             next_layer: 0,
             next_bitmap: 0,
@@ -604,45 +599,6 @@ impl Scene {
             return Some(window);
         }
         self.windows.iter().find(|w| w.id == id)
-    }
-
-    /// Set a window's client size and make its primary layer cover it.
-    ///
-    /// The window's [`WindowState::inner_size`] becomes `size`, the primary
-    /// layer (the layer whose MainImage is the window's screen buffer) gets the
-    /// rect `(0, 0, size)`, and [`Scene::layer_size_changed`] grows that
-    /// layer's MainImage to the rect when it is smaller, preserving the
-    /// overlapping pixels. The primary layer stays at the origin: a primary
-    /// layer cannot be moved and a window client-size change is a primary-layer
-    /// size change.
-    ///
-    /// Returns whether the client size or the primary rect changed; a repeated
-    /// call with the same size mutates nothing.
-    pub fn set_window_client_size(&mut self, window: u32, size: (u32, u32)) -> bool {
-        let Some((inner_size, primary)) = self
-            .window(window)
-            .map(|state| (state.inner_size, state.primary_layer))
-        else {
-            return false;
-        };
-        let mut changed = inner_size != size;
-        if changed && let Some(state) = self.window_mut(window) {
-            state.inner_size = size;
-        }
-        if let Some(primary) = primary {
-            let rect = Rect::new(0, 0, size.0, size.1);
-            let rect_changed = self.layer(primary).is_some_and(|layer| layer.rect != rect);
-            if rect_changed {
-                if let Some(layer) = self.layer_mut(primary) {
-                    layer.rect = rect;
-                }
-                changed = true;
-            }
-            if changed {
-                self.layer_size_changed(primary);
-            }
-        }
-        changed
     }
 
     /// Mutably look up a window by id, bumping [`Scene::revision`]. A window

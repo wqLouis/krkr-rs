@@ -525,9 +525,10 @@ platform-loop slice; the platform loop currently drives `Engine::step`.
 
 **Translation inside L2 (D41).** L3 keeps calling L2 in VM coordinates; L2
 applies `PixelTranslation` in its projection, input and readback methods. The
-launcher can force the game's VM size; the translation maps that VM surface to
-the window. The render-resolution/supersampling idea is a deferred design note,
-not part of the current tree.
+logical screen is the primary layer; a script that changes the window client
+(`setInnerSize`/`setZoom`) makes the translation fit that unchanged screen into
+the new window. The render-resolution/supersampling idea is a deferred design
+note, not part of the current tree.
 
 Tests construct `Engine` with a null `RenderPipeline`, a headless
 `Surface`/`RenderState`, and a virtual clock.

@@ -20,7 +20,7 @@ use crate::natives::system::{set_string_out, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
 use tjs::VAL_OBJECT;
 
-/// The client size a window starts with when the scene does not force one.
+/// The client size a window starts with.
 const DEFAULT_WINDOW_SIZE: (u32, u32) = (1280, 720);
 
 /// `Window` payload: the scene id plus the window properties the L2
@@ -163,14 +163,12 @@ extern "C" fn window_create(engine: *mut c_void) -> *mut c_void {
     // already usable; only the manager registration and the default draw
     // device wait for `Construct`. A script subclass may touch a `Window`
     // member before it calls `super.Window(...)`, so the scene window exists
-    // from creation. The client size is the scene's forced size when the
-    // composition root forces one, and the default client size otherwise.
+    // from creation, at the default client size.
     let mut inst = WindowInst::default();
     if let Ok((_resolved, ctx)) = bound(engine)
         && let Ok(scene) = scene_mut(&ctx)
     {
-        let size = scene.forced_window_size.unwrap_or(DEFAULT_WINDOW_SIZE);
-        inst.id = Some(scene.add_window(String::new(), size));
+        inst.id = Some(scene.add_window(String::new(), DEFAULT_WINDOW_SIZE));
     }
     Box::into_raw(Box::new(inst)) as *mut c_void
 }
@@ -237,8 +235,7 @@ extern "C" fn window_ctor(
         Some(id) => id,
         // No scene was available at creation time; allocate it now.
         None => {
-            let size = scene.forced_window_size.unwrap_or(DEFAULT_WINDOW_SIZE);
-            let id = scene.add_window(String::new(), size);
+            let id = scene.add_window(String::new(), DEFAULT_WINDOW_SIZE);
             // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
             unsafe { &mut *(instance as *mut WindowInst) }.id = Some(id);
             id
@@ -504,11 +501,9 @@ extern "C" fn window_set_size(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    // A forced client size is the launcher's, so a script resize is accepted
-    // and ignored: the engine keeps the window at the forced size.
-    if scene.forced_window_size.is_none()
-        && let Some(window) = scene.window_mut(id)
-    {
+    // A script resize writes the window's client size; the logical screen is
+    // the primary layer's rect, which only a primary-layer resize changes.
+    if let Some(window) = scene.window_mut(id) {
         window.inner_size = (width, height);
     }
     set_void(out);
@@ -631,8 +626,8 @@ extern "C" fn window_set_max_size(
 
 /// `Window.setZoom(numer, denom)`.
 ///
-/// The ratio is stored for the script to read back: the window and its layers
-/// keep their sizes, whether or not the scene forces a client size.
+/// The ratio is stored for the script to read back; the window client size and
+/// the primary layer keep their sizes.
 extern "C" fn window_set_zoom(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -1038,10 +1033,9 @@ extern "C" fn window_width_set(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    // A forced client size is the launcher's, so a script write is ignored.
-    if scene.forced_window_size.is_none()
-        && let Some(window) = scene.window_mut(id)
-    {
+    // The width setters write the client size, which is not the logical
+    // screen: the primary layer's rect is.
+    if let Some(window) = scene.window_mut(id) {
         window.inner_size.0 = width;
     }
     0
@@ -1092,10 +1086,9 @@ extern "C" fn window_height_set(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    // A forced client size is the launcher's, so a script write is ignored.
-    if scene.forced_window_size.is_none()
-        && let Some(window) = scene.window_mut(id)
-    {
+    // The height setters write the client size, which is not the logical
+    // screen: the primary layer's rect is.
+    if let Some(window) = scene.window_mut(id) {
         window.inner_size.1 = height;
     }
     0

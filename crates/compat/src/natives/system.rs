@@ -634,8 +634,9 @@ fn normalized_app_path(path: &Path) -> String {
     }
 }
 
-/// The logical screen size: the first window of the attached L2 scene, or
-/// `(0, 0)` when no window exists yet (the reference's unset default).
+/// The logical screen size: the first window's primary-layer rect, or its
+/// client size while it has no primary layer, or `(0, 0)` when no window
+/// exists yet (the reference's unset default).
 fn screen_size(ctx: &CompatCtx) -> (u32, u32) {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine, and the
     // host keeps the attached scene alive for the binding's lifetime.
@@ -643,11 +644,16 @@ fn screen_size(ctx: &CompatCtx) -> (u32, u32) {
         return (0, 0);
     };
     let scene = unsafe { &*ptr };
-    scene
-        .windows
-        .first()
-        .map(|window| window.inner_size)
-        .unwrap_or((0, 0))
+    let Some(window) = scene.windows.first() else {
+        return (0, 0);
+    };
+    match window
+        .primary_layer
+        .and_then(|primary| scene.layer(primary))
+    {
+        Some(layer) => (layer.rect.w, layer.rect.h),
+        None => window.inner_size,
+    }
 }
 
 // ---------------------------------------------------------------------------

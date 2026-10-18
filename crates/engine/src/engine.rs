@@ -7,10 +7,10 @@
 //!
 //! One frame is: get the clock, fit the VM→device presentation, fire due
 //! timers, run the upward hook, fit the presentation again (the hook may have
-//! changed a window's size), refresh the render-only overlay, upload dirty
-//! bitmaps, project the layer tree when it changed, translate it into device
-//! pixels, and draw it with a single pipeline call. A size pair that cannot be
-//! fitted skips everything that draws.
+//! resized a window's primary layer), refresh the render-only overlay, upload
+//! dirty bitmaps, project the layer tree when it changed, translate it into
+//! device pixels, and draw it with a single pipeline call. A size pair that
+//! cannot be fitted skips everything that draws.
 //!
 //! Nothing here reads a wall clock. [`Engine::frame`] takes the time and
 //! [`Engine::step`] adds a delta to the clock the engine already holds, so a
@@ -57,9 +57,6 @@ pub struct EngineParts {
     pub headless: bool,
     /// Render-only overlay drawn above every layer, or `None` for none.
     pub overlay: Option<Box<dyn EngineOverlay>>,
-    /// The VM/client size to force on the game, or `None` to let the scene's
-    /// window size (which a script can change) be the VM size.
-    pub vm_size: Option<(u32, u32)>,
 }
 
 /// Behaviour the engine calls once per frame before the frame is projected.
@@ -116,9 +113,6 @@ pub enum EngineError {
     /// A bottom-layer render action failed.
     #[error(transparent)]
     Render(#[from] RenderError),
-    /// The engine was handed a state value it cannot run with.
-    #[error("engine config: {0}")]
-    Config(String),
     /// The overlay could not be refreshed.
     #[error("engine overlay: {0}")]
     Overlay(String),
@@ -194,11 +188,9 @@ pub struct Engine {
     /// The VM-pixel → device-pixel mapping for the current sizes, or `None` when
     /// the two sizes cannot be fitted.
     translation: Option<PixelTranslation>,
-    /// The VM/client size the engine forces on the scene, or `None` when the
-    /// VM size follows the script-visible window size.
-    forced_size: Option<(u32, u32)>,
-    /// The VM size the most recent presentation sync observed.
-    last_vm_size: Option<(u32, u32)>,
+    /// The first window's client size the most recent presentation sync
+    /// observed, or `None` when the scene had no window.
+    last_window_client_size: Option<(u32, u32)>,
     /// A script-side window size the composition root has not applied yet.
     pending_window_resize: Option<(u32, u32)>,
     /// Whether the unfittable-size warning has been logged since the sizes
@@ -211,15 +203,12 @@ impl Engine {
     ///
     /// The surface is sized to [`EngineParts::surface_size`] (clamped to at
     /// least `1x1`), which is the one surface action the engine performs
-    /// before its first frame. [`EngineParts::vm_size`] is written into the
-    /// scene's [`Scene::forced_window_size`] before the engine is returned, so
-    /// the scene already knows the size a newly created window starts with.
+    /// before its first frame.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::Config`] when the forced VM size has a zero
-    /// dimension, and [`EngineError::Render`] when the backend rejects the
-    /// initial surface size.
+    /// Returns [`EngineError::Render`] when the backend rejects the initial
+    /// surface size.
     pub fn new(parts: EngineParts) -> Result<Self, EngineError> {
         let EngineParts {
             pipeline,
@@ -228,18 +217,9 @@ impl Engine {
             surface_size,
             headless,
             overlay,
-            vm_size,
         } = parts;
-        if let Some((width, height)) = vm_size
-            && (width == 0 || height == 0)
-        {
-            return Err(EngineError::Config(format!(
-                "forced VM size {width}x{height} has a zero dimension"
-            )));
-        }
         let surface_size = (surface_size.0.max(1), surface_size.1.max(1));
-        let mut scene = Scene::default();
-        scene.forced_window_size = vm_size;
+        let scene = Scene::default();
         let mut engine = Self {
             pipeline,
             scene,
@@ -258,8 +238,7 @@ impl Engine {
             headless,
             overlay,
             translation: None,
-            forced_size: vm_size,
-            last_vm_size: None,
+            last_window_client_size: None,
             pending_window_resize: None,
             presentation_skipped_logged: false,
         };
@@ -316,9 +295,9 @@ impl Engine {
     ///
     /// The order is the frame contract: set the clock, fit the presentation,
     /// fire due timers, run the upward hook, fit the presentation again (the
-    /// hook may have changed a window's size), then refresh the overlay,
-    /// upload, project, translate and draw. A size pair that cannot be fitted
-    /// skips everything that draws and reports no frame statistics.
+    /// hook may have resized a window's primary layer), then refresh the
+    /// overlay, upload, project, translate and draw. A size pair that cannot be
+    /// fitted skips everything that draws and reports no frame statistics.
     fn advance(
         &mut self,
         now_ms: u64,
@@ -390,9 +369,10 @@ impl Engine {
     /// Rebinds the surface to a new size in physical pixels.
     ///
     /// The size is clamped to at least `1x1`, and an unchanged size does not
-    /// touch the backend. The framebuffer size is not the script-visible size:
-    /// the scene keeps its window sizes and the presentation refits them into
-    /// the new framebuffer, so an OS resize moves no value a script observes.
+    /// touch the backend. The framebuffer is not the logical screen: the scene
+    /// keeps its window client sizes and primary-layer rects, and the
+    /// presentation refits the screen into the new framebuffer, so an OS resize
+    /// moves no value a script observes.
     ///
     /// # Errors
     ///
@@ -448,21 +428,16 @@ impl Engine {
     /// Refits the VM→device presentation for the current sizes and reports a
     /// script-side window resize to the composition root.
     ///
-    /// The VM size is the forced size when the composition root forces one, and
-    /// otherwise the first window's client size; a script that resizes the
-    /// window moves it while an OS resize moves only the framebuffer. The first
-    /// window's client size and its primary layer follow the VM size in both
-    /// modes, so the primary layer is always the window's screen buffer. A
-    /// changed mapping invalidates the projected tree, which is built in VM
-    /// pixels. A size pair that cannot be fitted leaves the frame without a
-    /// mapping and warns once rather than substituting a scale.
+    /// The VM size is the first window's primary-layer rect: the layer whose
+    /// MainImage is the window's screen buffer. Before the window has a primary
+    /// layer the window's client size stands in, and with no window the
+    /// framebuffer size does. An OS resize moves only the framebuffer and a
+    /// script window-client write moves only the window size; only the latter
+    /// is surfaced to the composition root. A changed mapping invalidates the
+    /// projected tree, which is built in VM pixels. A size pair that cannot be
+    /// fitted leaves the frame without a mapping and warns once rather than
+    /// substituting a scale.
     fn sync_presentation(&mut self) {
-        let first_window = self.scene.windows.first().map(|window| window.id);
-        if let (Some(forced), Some(window)) = (self.forced_size, first_window) {
-            // The forced size overrides whatever the script last wrote to the
-            // window, so a script resize cannot change the VM size.
-            self.scene.set_window_client_size(window, forced);
-        }
         let vm_size = self.vm_size();
         let translation = match PixelTranslation::fit(vm_size, self.surface_size) {
             Ok(translation) => {
@@ -494,24 +469,19 @@ impl Engine {
             }
         }
 
-        if self.last_vm_size != Some(vm_size) {
-            if let Some(window) = first_window {
-                // The window's client size and its primary layer track the VM
-                // size the frame is presented at.
-                self.scene.set_window_client_size(window, vm_size);
+        let window_client_size = self.scene.windows.first().map(|window| window.inner_size);
+        if window_client_size != self.last_window_client_size {
+            // The first observation asks for a window resize only when the
+            // client size already differs from the framebuffer; every later
+            // change is a script resize and is surfaced to the composition
+            // root. An OS resize leaves the client size alone, so it never
+            // asks.
+            if let Some(size) = window_client_size
+                && (self.last_window_client_size.is_some() || size != self.surface_size)
+            {
+                self.pending_window_resize = Some(size);
             }
-            if self.forced_size.is_none() {
-                // The first observation asks for a window resize only when it
-                // already differs from the framebuffer; every later change of
-                // the VM size is a script resize and is surfaced to the
-                // composition root. An OS resize leaves the VM size alone, so
-                // it never asks. A forced size is the launcher's, not a script
-                // request, so it never asks either.
-                if self.last_vm_size.is_some() || vm_size != self.surface_size {
-                    self.pending_window_resize = Some(vm_size);
-                }
-            }
-            self.last_vm_size = Some(vm_size);
+            self.last_window_client_size = window_client_size;
         }
     }
 
@@ -605,19 +575,20 @@ impl Engine {
         self.surface_size
     }
 
-    /// Returns the script-visible surface size: the forced VM size when the
-    /// composition root forces one, the first window's client size when the
-    /// scene has a window, and the framebuffer size when it has none.
+    /// Returns the script-visible screen size: the first window's primary-layer
+    /// rect, the window's client size while it has no primary layer, or the
+    /// framebuffer size when the scene has no window.
     pub fn vm_size(&self) -> (u32, u32) {
-        self.forced_size
-            .or_else(|| self.scene.windows.first().map(|window| window.inner_size))
-            .unwrap_or(self.surface_size)
-    }
-
-    /// Returns the VM/client size the composition root forces on the game, or
-    /// `None` when the VM size follows the script-visible window size.
-    pub fn forced_size(&self) -> Option<(u32, u32)> {
-        self.forced_size
+        let Some(window) = self.scene.windows.first() else {
+            return self.surface_size;
+        };
+        match window
+            .primary_layer
+            .and_then(|primary| self.scene.layer(primary))
+        {
+            Some(layer) => (layer.rect.w, layer.rect.h),
+            None => window.inner_size,
+        }
     }
 
     /// Returns the current VM-pixel → device-pixel mapping, or `None` when the

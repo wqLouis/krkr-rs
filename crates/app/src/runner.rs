@@ -40,21 +40,6 @@ pub enum RunMode {
     Windowed,
 }
 
-/// The VM surface size the launcher asks the engine to present.
-///
-/// Scripts always work in VM pixels; the framebuffer is what the OS window
-/// gives. This choice only decides which size the VM surface has.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VmSize {
-    /// Force this VM size. The scene window and its primary layer are held at
-    /// it, so a script `Window.setInnerSize` cannot change it.
-    Size((u32, u32)),
-    /// Use the primary monitor's physical size, falling back to the first
-    /// available monitor. A headless run has no display and uses its
-    /// configured offscreen size.
-    Display,
-}
-
 /// A fully resolved launch request.
 ///
 /// The caller owns configuration loading: it builds this value from whatever
@@ -72,9 +57,6 @@ pub struct Launch {
     pub game: Option<GameInput>,
     /// Whether to run offscreen or in a window.
     pub mode: RunMode,
-    /// The VM surface size to present at, or `None` to let the scene window's
-    /// client size be the VM size.
-    pub vm_size: Option<VmSize>,
 }
 
 /// What a completed [`run`] produced.
@@ -120,24 +102,9 @@ fn format_stats(stats: &FrameStats) -> String {
 
 /// Runs offscreen and prints the final frame stats (or the game's scene size).
 fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, String> {
-    let mut config = HostConfig::headless()
+    let config = HostConfig::headless()
         .with_backend(launch.backend)
         .with_debug_overlay(launch.runtime.debug_overlay);
-    match launch.vm_size {
-        // A forced VM size presents one-to-one in the offscreen framebuffer, so
-        // the scene is rendered at exactly the requested resolution.
-        Some(VmSize::Size(size)) => {
-            config.vm_size = Some(size);
-            config.surface_size = size;
-        }
-        // A headless run has no display to ask, so `display` is the configured
-        // offscreen size.
-        Some(VmSize::Display) => {
-            let offscreen = config.surface_size;
-            config.vm_size = Some(offscreen);
-        }
-        None => {}
-    }
     let mut host = Host::new(config).map_err(|error| error.to_string())?;
     let dt_ms = launch.runtime.frame_rate_limit.period_ms();
 
@@ -228,14 +195,6 @@ fn run_windowed(launch: &Launch) -> Result<(), String> {
     let mut config = PlatformConfig::default();
     config.title = "krkr-rs".to_owned();
     config.frame_interval = Duration::from_secs_f64(launch.runtime.frame_rate_limit.period_secs());
-    match launch.vm_size {
-        // Open the OS window at the forced VM size, so the presentation is
-        // one-to-one on a monitor that can show it.
-        Some(VmSize::Size(size)) => config.size = size,
-        // Ask the backend to open the window at the display's physical size.
-        Some(VmSize::Display) => config.size_from_display = true,
-        None => {}
-    }
     platform::run(
         config,
         DesktopApp::new(
@@ -243,7 +202,6 @@ fn run_windowed(launch: &Launch) -> Result<(), String> {
             launch.game.clone(),
             launch.runtime.preload_archives,
             launch.runtime.debug_overlay,
-            launch.vm_size,
         ),
     )
     .map_err(|error| error.to_string())
@@ -264,9 +222,6 @@ struct DesktopApp {
     preload_archives: bool,
     /// Whether the debug overlay is drawn.
     debug_overlay: bool,
-    /// The VM surface size the launcher asked for, or `None` to follow the
-    /// scene window's client size.
-    vm_size: Option<VmSize>,
     /// The running host, created once the window handle exists.
     running: Option<Running>,
     /// Input and focus events received since the last frame, delivered to
@@ -330,14 +285,12 @@ impl DesktopApp {
         game: Option<GameInput>,
         preload_archives: bool,
         debug_overlay: bool,
-        vm_size: Option<VmSize>,
     ) -> Self {
         Self {
             backend,
             game,
             preload_archives,
             debug_overlay,
-            vm_size,
             running: None,
             pending_events: Vec::new(),
         }
@@ -363,17 +316,9 @@ impl EventHandler for DesktopApp {
         };
         // Create the host at the window's real physical size rather than at
         // the requested logical default, so the initial swapchain matches.
-        let vm_size = match self.vm_size {
-            Some(VmSize::Size(size)) => Some(size),
-            // The window was just created at the display's physical size, so
-            // that is the VM size the frame presents at.
-            Some(VmSize::Display) => window.display_size().or_else(|| Some(window.size())),
-            None => None,
-        };
         let config = HostConfig {
             backend: self.backend,
             surface_size: window.size(),
-            vm_size,
             window_handle: Some(window_handle),
             display_handle: Some(display_handle),
             debug_overlay: self.debug_overlay,
@@ -501,7 +446,6 @@ mod tests {
             backend: BackendKind::Null,
             game: None,
             mode: RunMode::Headless { frames: 2 },
-            vm_size: None,
         })
         .expect("headless run");
 

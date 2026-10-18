@@ -22,34 +22,6 @@ use crate::event::PlatformEvent;
 use crate::input::{InputEvent, MouseButton, PhysicalKey};
 use crate::{EventHandler, Flow, FramePacing, PlatformConfig, PlatformError};
 
-/// Returns the physical size to open a display-sized window at.
-///
-/// The primary monitor wins; a backend that reports no primary monitor
-/// (Wayland always returns `None`) falls back to the first available monitor.
-/// `None` means the backend reported no monitor at all.
-fn display_size(event_loop: &ActiveEventLoop) -> Option<(u32, u32)> {
-    let primary = event_loop
-        .primary_monitor()
-        .map(|monitor| monitor.size())
-        .map(|size| (size.width, size.height));
-    let available = event_loop
-        .available_monitors()
-        .map(|monitor| monitor.size())
-        .map(|size| (size.width, size.height));
-    select_display_size(primary, available)
-}
-
-/// Picks the display size from the monitor sizes.
-///
-/// The primary monitor's size wins, otherwise the first available monitor's,
-/// otherwise there is none.
-fn select_display_size(
-    primary: Option<(u32, u32)>,
-    available: impl IntoIterator<Item = (u32, u32)>,
-) -> Option<(u32, u32)> {
-    primary.or_else(|| available.into_iter().next())
-}
-
 /// The window created by [`run`].
 ///
 /// Higher layers use it to obtain the raw window/display handles the render
@@ -91,23 +63,6 @@ impl PlatformWindow {
     pub fn size(&self) -> (u32, u32) {
         let size = self.window.inner_size();
         (size.width.max(1), size.height.max(1))
-    }
-
-    /// Returns the physical size of the window's current (or primary/first)
-    /// monitor, or `None` when no monitor reports one.
-    ///
-    /// This is the display resolution a launcher uses for an explicit VM size;
-    /// it is not the window client size, which the compositor may tile or
-    /// scale independently.
-    pub fn display_size(&self) -> Option<(u32, u32)> {
-        self.window
-            .current_monitor()
-            .or_else(|| self.window.primary_monitor())
-            .or_else(|| self.window.available_monitors().next())
-            .map(|monitor| {
-                let size = monitor.size();
-                (size.width.max(1), size.height.max(1))
-            })
     }
 
     /// Requests an inner (client-area) size in physical pixels.
@@ -215,23 +170,7 @@ impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
             let attributes = Window::default_attributes().with_title(self.config.title.as_str());
             let logical_size =
                 LogicalSize::new(f64::from(self.config.size.0), f64::from(self.config.size.1));
-            let attributes = if self.config.size_from_display {
-                match display_size(event_loop) {
-                    Some(size) => attributes.with_inner_size(PhysicalSize::new(size.0, size.1)),
-                    None => {
-                        // No monitor reported a size: open at the configured
-                        // logical size instead of inventing one.
-                        log::warn!(
-                            "platform: the backend reports no monitor size; opening the window at the configured {}x{}",
-                            self.config.size.0,
-                            self.config.size.1
-                        );
-                        attributes.with_inner_size(logical_size)
-                    }
-                }
-            } else {
-                attributes.with_inner_size(logical_size)
-            };
+            let attributes = attributes.with_inner_size(logical_size);
             let window = match event_loop.create_window(attributes) {
                 Ok(window) => window,
                 Err(error) => {
@@ -923,32 +862,5 @@ pub(crate) mod audio {
             assert_eq!(FALLBACK_SPEC.sample_rate, 44_100);
             assert_eq!(FALLBACK_SPEC.channels, 2);
         }
-    }
-}
-
-#[cfg(test)]
-mod display_size_tests {
-    use super::select_display_size;
-
-    #[test]
-    fn the_primary_monitor_wins() {
-        assert_eq!(
-            select_display_size(Some((2560, 1440)), [(1920, 1080), (1280, 720)]),
-            Some((2560, 1440))
-        );
-    }
-
-    #[test]
-    fn the_first_available_monitor_is_the_fallback() {
-        // Wayland never reports a primary monitor.
-        assert_eq!(
-            select_display_size(None, [(1920, 1080), (1280, 720)]),
-            Some((1920, 1080))
-        );
-    }
-
-    #[test]
-    fn no_monitor_reports_no_size() {
-        assert_eq!(select_display_size(None, []), None);
     }
 }

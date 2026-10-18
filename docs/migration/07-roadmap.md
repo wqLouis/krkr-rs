@@ -189,8 +189,8 @@ Deliverables:
   `scaling` config key (api/config/CLI/Android), `ViewTransform` +
   `RenderScene.view` (render), the `app`/`android` logical-size plumbing and
   `platform::native_size`;
-* keep `render::scene::{node_spaces, place_rect}` and the nearest-texel
-  sampling (independent fixes);
+* keep `render::scene::{node_spaces, place_rect}` and the CPU nearest-texel
+  sampling (the Vulkan sampler may filter bilinearly at a scaled presentation);
 * update the docs that described the feature (this list, `04 §6.1`,
   `runtime-config.md`, `android.md`, `audits/perf.md`).
 
@@ -275,9 +275,7 @@ A future option is to keep the game's VM size and CPU-rasterize at a fixed
 higher render resolution (text at `Font.size · render_scale`), sampling that
 backing to the window. It is documented here as a possible direction only: the
 raw-buffer/plugin compatibility surface and the CPU-native reference path make
-it a larger project, and it is **not implemented**. The current way to raise
-the game's rendering resolution is the launcher's explicit **VM size**
-(`--vm-size`), which the existing translation maps to the window.
+it a larger project, and it is **not implemented**.
 
 ## 3. Suggested commit/branch discipline
 

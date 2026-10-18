@@ -8,7 +8,6 @@ mod common;
 use std::sync::{Mutex, MutexGuard};
 
 use api::host::SurfaceEvent;
-use app::{Host, HostConfig};
 use common::{build_solid_and_bitmap_scene, headless_host};
 use tjs::TjsValue;
 use vm::VmHost;
@@ -121,7 +120,7 @@ fn unchanged_revision_reuses_arena_and_mutation_reprojects() {
     // A direct field edit does not bump `Scene::revision`, so the projection
     // is deliberately skipped (the documented over-approximation contract):
     // an unchanged revision must not rebuild the render scene.
-    host.scene_mut().layers[0].rect.w = 123;
+    host.scene_mut().layers[1].rect.w = 123;
     host.step(16.0).expect("step");
     assert_eq!(host.render_scene(), &snapshot);
 
@@ -162,6 +161,9 @@ fn resize_changes_only_the_framebuffer() {
         (layer.rect.x, layer.rect.y, layer.rect.w, layer.rect.h),
         (0, 0, 320, 240)
     );
+    // The logical screen the presentation fits is the primary layer, so it is
+    // unchanged as well.
+    assert_eq!(host.vm_size(), (320, 240));
 
     // The D40 presentation extension fits the VM size into the new
     // framebuffer: 800x600 is exactly 2.5x of 320x240, so there is no margin.
@@ -184,7 +186,8 @@ fn a_script_window_resize_is_surfaced_once() {
     assert_eq!(host.take_window_resize(), None, "a taken request is gone");
 
     // A later script resize of the window's client size is a new request.
-    // The window's client area is what a script sees and moves
+    // It moves the window client only: the logical screen stays the primary
+    // layer's size, so the presentation does not change
     // (`reference/cpp/core/visual/LayerManager.cpp:341-342`).
     if let Some(window_state) = host.scene_mut().window_mut(window) {
         window_state.inner_size = (400, 300);
@@ -193,59 +196,13 @@ fn a_script_window_resize_is_surfaced_once() {
     assert_eq!(host.take_window_resize(), Some((400, 300)));
     assert_eq!(host.take_window_resize(), None, "a taken request is gone");
 
-    // The presentation follows the new VM size into the unchanged framebuffer
-    // (the D40 extension).
-    assert_eq!(host.vm_size(), (400, 300));
+    // The window client moved but the logical screen did not, so the
+    // presentation still fits the primary layer's size into the unchanged
+    // framebuffer.
+    assert_eq!(host.vm_size(), (320, 240));
     let translation = host.translation().expect("fittable sizes");
-    assert_eq!(translation.vm_size, (400, 300));
+    assert_eq!(translation.vm_size, (320, 240));
     assert_eq!(translation.device_size, (1280, 720));
-}
-
-/// A launcher-forced VM size is the size the scene presents at: the scene
-/// carries it, the game's window is held at it, and the presentation fits it
-/// into the framebuffer. A forced size never asks the OS window to change,
-/// because the launcher already chose it (the D40 extension).
-#[test]
-fn a_forced_vm_size_holds_the_scene_window() {
-    let config = HostConfig::headless().with_vm_size(Some((1920, 1080)));
-    let mut host = Host::new(config).expect("headless host");
-    assert_eq!(
-        host.scene().forced_window_size,
-        Some((1920, 1080)),
-        "the engine carries the forced size into the scene"
-    );
-
-    let window = build_solid_and_bitmap_scene(host.scene_mut());
-    host.step(16.0).expect("step");
-
-    // The window the game created at its own size is forced to the launcher's.
-    assert_eq!(
-        host.scene().window(window).expect("window").inner_size,
-        (1920, 1080)
-    );
-    assert_eq!(host.vm_size(), (1920, 1080));
-    assert_eq!(
-        host.take_window_resize(),
-        None,
-        "a forced size asks for nothing"
-    );
-
-    let translation = host.translation().expect("fittable sizes");
-    assert_eq!(translation.vm_size, (1920, 1080));
-    assert_eq!(translation.device_size, (1280, 720));
-}
-
-/// A zero VM dimension is a typed configuration error: an empty surface has no
-/// uniform fit, so no size is substituted for it.
-#[test]
-fn a_zero_vm_size_is_a_typed_error() {
-    for size in [(0, 720), (1280, 0), (0, 0)] {
-        let config = HostConfig::headless().with_vm_size(Some(size));
-        assert!(
-            matches!(Host::new(config), Err(app::HostError::Config(_))),
-            "accepted a zero VM dimension in {size:?}"
-        );
-    }
 }
 
 /// Boots the production composition root and confirms it installs the

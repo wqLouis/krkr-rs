@@ -3,8 +3,9 @@
 Status: **implemented for the mapping.** Stage 0 (removal), the Stage 1 frame
 slice and Stage 2 (`PixelTranslation`, projection/input mapping) have landed.
 Open: the remaining Stage 1 mixer/video pumps. The render-resolution/
-supersampling idea is documented only and is not implemented; the launcher can
-set the game's VM size explicitly, which the translation maps to the window.
+supersampling idea is documented only and is not implemented. The logical
+screen is the primary layer; a script that zooms the window changes the client
+size only, and the translation fits the screen into it.
 This document decides how the engine maps the scene a script thinks it is
 drawing onto the framebuffer it actually draws into. It supersedes
 [`04-renderer-vulkan.md`](04-renderer-vulkan.md) §6.1 (the `ScalingMode`
@@ -27,16 +28,21 @@ Two spaces must never be confused:
 
 | space | unit | who speaks it | examples |
 |---|---|---|---|
-| **VM pixel** (*logical pixel*) | one pixel of the size the game declared | scripts (L3/L4) | `System.screenWidth`, `Window.innerWidth`, `Layer` rects, `Bitmap` dimensions, `Font.size`, `getPixel` coordinates |
+| **VM pixel** (*logical pixel*) | one pixel of the logical screen (the primary layer) | scripts (L3/L4) | `System.screenWidth`, `Layer` rects, `Bitmap` dimensions, `Font.size`, `getPixel` coordinates |
+| **window pixel** | one pixel of the OS window's client area | scripts (L3/L4) | `Window.innerWidth`/`innerHeight` |
 | **device pixel** (*render pixel*) | one pixel of the framebuffer/swapchain | L1 | the swapchain extent, the Vulkan viewport, the CPU rasterizer's `pixels` buffer |
 
-The reference runs at **one** size: the game's declared size is the window
-client area is the framebuffer (`reference/cpp/core/base/impl/SystemImpl.cpp`,
-`WindowIntf.cpp`). It has no second space. Modern displays do, and the user's
-requirement is that the game be **scaled to fit** the screen. Introducing a
-second space is therefore an extension, and it must be *invisible to every
-script-observable value*: a script still sees, and still hands back, **VM
-pixels** only (D34).
+The reference already separates the logical screen from the window client:
+`System.screenWidth` is the primary-layer size, `Window.innerWidth` is the
+form's client size, and `setZoom`/`setInnerSize` change only the client
+(`reference/cpp/core/base/impl/SystemImpl.cpp:877-895`,
+`reference/cpp/core/visual/WindowIntf.cpp:885-903,1518-1534`,
+`reference/cpp/core/environ/impl/TVPWindow.h:389-406`). The framebuffer follows
+the window client. Our translation keeps the same split and additionally lets
+a desktop framebuffer differ from the window client (DPI, compositor tiling).
+A script still sees, and still hands back, **VM pixels** for the screen; a
+window-size value is the client. Both are script-observable and reference-exact
+(D34).
 
 ## 2. The presentation rule: Fit with letterbox, only
 
@@ -143,10 +149,12 @@ survive:
   `Affine2` (the root transform stays a generic pipeline capability —
   `record_scene(..., root: &Affine2)` — with the identity passed at the live
   path for now; §6 supplies a real root transform later).
-* **nearest-texel sampling**: the CPU `sample_texture` point read and the
-  Vulkan `NEAREST` mag/min filter (`reference/cpp/core/visual/
-  RenderManager.cpp:2902`). This is reference fidelity, not scaling.
-* Everything else on `main` (debug overlay, point sampling, storage/media
+* **CPU point sampling**: the null backend's `sample_texture` keeps the
+  reference's nearest-texel read (`reference/cpp/core/visual/
+  RenderManager.cpp:2902`), so the software correctness baseline is unchanged.
+  The Vulkan sampler filters bilinearly so a scaled presentation is smooth
+  rather than point-scaled (D34 rasterization).
+* Everything else on `main` (debug overlay, the sampling policy, storage/media
   fixes, the surface lock baseline). The removal is a **surgical subtraction**,
   never a `git revert` of a range.
 
@@ -202,11 +210,10 @@ What this requires, and why the translation waits for it:
   the second L3 clock (`VisualState.clock`) and `app::GameHost`'s `now_ms`/`dt`
   are gone. The translation has no clock of its own — it changes only on a
   size change.
-* **one size owner.** Today `app::Host::resize` writes the surface size back
-  into the scene window; that is the drift D26 removes. In the target,
-  `Engine` learns the **device size** (from the L1 surface event) and
-  the **VM size** (from the scene the script declared), computes the
-  translation, and stores it. Nothing above L2 holds either size.
+* **one size owner.** `Engine` learns the **device size** from the L1 surface
+  event and the **VM size** from the logical screen (the primary layer),
+  computes the translation, and stores it. Nothing above L2 holds either size;
+  `app::Host::resize` only forwards the surface size to `Engine::resize`.
 * **the projection seam stays L2's.** `Engine` projects the scene into the
   device-space `RenderScene` and calls `render`; it is the place the
   translation is applied.
@@ -376,8 +383,8 @@ Stage 2 is deliberately **behaviour-neutral at scale 1**: with `vm_size ==
 device_size`, `scale == 1` and `offset == (0,0)`, so the projection and input
 paths reduce to what Stage 0 does and the surface lock, parity reports and
 golden tests are unchanged. The device scale switches on by itself when the
-window and the script's declared size differ (the Android surface, or a
-desktop window the player resized).
+window client and the logical screen differ (the game's own window zoom, the
+Android surface, or a desktop window the player resized).
 
 ## 9. Open items
 
@@ -386,10 +393,12 @@ desktop window the player resized).
    `s == 1` and cheapest; averaging needs a defined rounding. Today readback
    comes from the VM-resolution CPU layer bitmap, so the question waits for
    the GPU readback path.
-2. **Window sizing — resolved.** The OS window keeps its platform-chosen
-   size; the game's first declared VM size is surfaced once and applied to the
-   desktop window, and a later script size change does the same. Android keeps
-   the display-sized surface and refits.
+2. **Window sizing — resolved.** The logical screen is the primary layer.
+   `Window.setSize`/`setInnerSize` change the window client only; the engine
+   surfaces that change once to the composition root, which resizes the OS
+   window. The translation then fits the unchanged screen into the new client,
+   which is the reference window-zoom path. Android keeps the display-sized
+   surface and refits the same way.
 3. **Readback transport.** Android reads over `AHardwareBuffer_lock`
    (region-scoped, stride from `lock_and_get_info`); the desktop and the
    fallback use a host-visible staging copy. Open: the device behaviour of

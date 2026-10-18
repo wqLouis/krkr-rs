@@ -83,7 +83,6 @@ parses. The recognized keys are `frame_rate`, `preload_archives` and
 | `--fps N` (`frame_rate`) | frames per second, `1..=1000` | `60` | reference `fps_limit` default `60` (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`), applied as the animation interval `1/fps` (`reference/cpp/core/environ/cocos2d/MainScene.cpp:684-685`); the main loop sleeps the remaining interval (`reference/cpp/core/environ/RenderUtils.h`, `TVPDrawSceneOnce`) |
 | `--preload-archives` (`preload_archives`) | `true`, `false` | `false` | read every mounted archive into memory when it mounts; the cost is that archive's size in resident memory, the gain is that entry reads stop touching the backing filesystem |
 | `--debug-overlay` (`debug_overlay`) | `true`, `false` | `false` | draw the frame rate and the process's resident memory in the top-left corner; a render-only node, never a script-visible layer or bitmap, so it cannot change what a script observes. RSS comes from `platform::memory_usage()`, which reads `VmRSS` from `/proc/self/status` (Linux and Android); an unreadable value is omitted rather than fabricated |
-| `--vm-size WxH` / `--vm-size display` | VM pixels, both axes non-zero | the game's declared size | force the game's logical/VM resolution. `display` uses the primary display's physical size (first available monitor when there is no primary). The game then runs and lays out at that VM size; the existing Fit translation maps it to the window. While set, script `Window.setSize`/`setInnerSize`/width/height writes are held at the forced size. A game with hard-coded layout constants may keep its authored layer sizes inside the larger VM surface rather than re-laying out; the flag changes the VM size, it does not rewrite the game’s layout. This is a launch-time `Launch` value, not a `RuntimeConfig` field |
 
 The frame-rate limit paces both loops: the windowed loop through
 `PlatformConfig::frame_interval` and the headless step through
@@ -98,11 +97,13 @@ difference is that the bytes no longer come from the backing filesystem.
 
 Presentation is **not** configurable. There is no `--scaling` option or
 `scaling` key: the engine always fits the scene into the framebuffer with the
-single Fit rule (`docs/migration/11` D39), uniformly scaled and letterboxed,
-and the script's own declared size is what `System.screenWidth`/
-`Window.innerWidth` report unchanged — unless the launcher forces a `--vm-size`,
-in which case that size is the game's VM surface. The mapping lives in L2 and is
-invisible to scripts; there is no scaling setting to expose.
+single Fit rule (`docs/migration/11` D39), uniformly scaled and letterboxed.
+
+The reference splits the two sizes. `Window.innerWidth`/`Window.innerHeight`
+are the window client, which an OS resize and `Window.setInnerSize` move;
+`System.screenWidth`/`System.screenHeight` are the logical screen, the primary
+layer, and presentation fits that screen into the window. The mapping lives in
+L2 and is invisible to scripts; there is no size setting to expose.
 
 ## 3. Not implemented meaningfully
 

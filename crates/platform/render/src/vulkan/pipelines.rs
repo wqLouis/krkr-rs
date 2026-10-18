@@ -376,18 +376,16 @@ fn create_descriptor_pool(device: &ash::Device) -> Result<vk::DescriptorPool, Re
     })
 }
 
-/// Creates a clamp-to-edge point sampler with no mip filtering.
+/// Creates a clamp-to-edge bilinear sampler with no mip filtering.
 ///
-/// The reference's default layer stretch samples the nearest source texel:
-/// the software renderer starts at `StretchType(stNearest)` and selects the
-/// point `TVPStretchCopy` for anything below `stFastLinear`
-/// (`reference/cpp/core/visual/RenderManager.cpp:2902,3191-3226`), so a
-/// magnified layer is point-scaled rather than interpolated.
+/// Magnification and minification interpolate between source texels; at a 1:1
+/// mapping the half-texel sample points still select the exact source texel,
+/// and scaled presentation is smooth rather than point-sampled.
 fn create_sampler(device: &ash::Device) -> Result<vk::Sampler, RenderError> {
     let create_info = vk::SamplerCreateInfo::default()
-        .mag_filter(vk::Filter::NEAREST)
-        .min_filter(vk::Filter::NEAREST)
-        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
+        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
         .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
         .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
         .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)

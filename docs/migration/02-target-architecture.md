@@ -246,10 +246,11 @@ Implemented: `engine::translate::PixelTranslation` owns the Fit mapping,
 inverse-maps pointer/touch coordinates before the VM tick.
 
 The translation is internal to L2 (D41): L3 keeps calling L2 in VM
-coordinates. The launcher can set the game's VM size explicitly (for example
-to the display size); the translation then maps that VM surface to the window.
-Readback samples the corresponding region. The render-resolution/supersampling
-idea is a deferred design note, not part of the current tree.
+coordinates. The logical screen is the primary layer; `Window.setInnerSize`
+changes the client area only, and the translation fits the unchanged screen
+into it (the reference window-zoom path). Readback samples the corresponding
+region. The render-resolution/supersampling idea is a deferred design note, not
+part of the current tree.
 
 ### Implementation status
 
