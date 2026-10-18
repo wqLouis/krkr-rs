@@ -269,41 +269,15 @@ unchanged; the game then renders at device resolution with `getPixel`,
 `piledCopy` and `saveLayerImage` addressed through the translation and every
 script-observable value still VM and reference-exact.
 
-### Phase 11 — Render-resolution frame (D41–D44)
+### Deferred idea — render-resolution decoupling
 
-**Status: design; the next architecture slice.**
-
-The CPU rasterizer stays authoritative, but it runs at an explicit **render
-resolution** independent of the VM size and the window. L2 embeds the
-translation (VM→render for drawing/readback, render→display for presentation);
-L3 keeps calling L2 in VM coordinates and never sees a render/device pixel. A
-layer has one storage: a native texture for an image-only layer, or one
-render-res CPU surface once a raster operation touches it. There is no
-persistent VM-resolution layer bitmap. The GPU only composes layer textures and
-presents the Fit-scaled frame. Contract and migration table:
-[`13`](13-render-resolution.md).
-
-Stages (each leaves the game runnable and the gate green):
-
-1. **Render-resolution plumbing** — add `render_size`/`render_scale`
-   (`HostConfig`/`RuntimeConfig`/launcher), the VM→render translation, and the
-   render→display presentation; default = VM size, output unchanged.
-2. **Text and fills at render resolution** — the L2 font engine (moved from the
-   L3 resolver) rasterizes at `Font.size · render_scale`; raster ops translate
-   into the layer’s render-res surface; readback samples
-   `vm_pixel_region`.
-3. **Image-only layers** — keep native textures and drop the CPU layer copy;
-   a raster op materializes the render-res surface once.
-4. **Remaining raster ops** — blit/copy/affine/mask/transition into the
-   render-res surface; raw-buffer/plugin compatibility carve-out.
-5. **Delete the VM-res raster path**; retain the CPU oracle for
-   `render_scale == 1` and the guards.
-
-Exit criteria: every layer has exactly one storage (native texture or
-render-res surface); no persistent VM-res mirror; L3 contains no translation/
-render-coordinate use; at `render_scale == 1` output and readback match the CPU
-oracle; at `render_scale > 1` text and raster content are native at the chosen
-render resolution; a real game runs and plugins stay compatible.
+A future option is to keep the game's VM size and CPU-rasterize at a fixed
+higher render resolution (text at `Font.size · render_scale`), sampling that
+backing to the window. It is documented here as a possible direction only: the
+raw-buffer/plugin compatibility surface and the CPU-native reference path make
+it a larger project, and it is **not implemented**. The current way to raise
+the game's rendering resolution is the launcher's explicit **VM size**
+(`--vm-size`), which the existing translation maps to the window.
 
 ## 3. Suggested commit/branch discipline
 

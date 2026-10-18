@@ -334,19 +334,19 @@ Open:
    `PresentationScaling`/`--scaling`/`ViewTransform`/`native_size` removal)
    has landed.
 
-3. **The render-resolution frame** (`D41`–`D44`, **next**) — **design landed
-   in `docs/migration/13`.** The CPU rasterizer stays authoritative but runs
-   at an explicit, fixed render resolution, independent of the VM size and the
-   window. L2 embeds the VM→render translation; L3 stays VM-only. A layer has
-   one storage: a native texture for image-only layers, or one render-res CPU
-   surface once a raster op touches it; no persistent VM-res mirror. Text is
-   rasterized at `Font.size · render_scale`; the GPU only composes/presents.
-   Render ops: text/fills → image-only layers → remaining raster ops →
-   raw-buffer/plugin carve-out → remove the VM-res path (`07` Phase 11).
+3. **Explicit VM resolution (next)** — the launcher can set the game's VM
+   size (`--vm-size WxH`, and the display/window size) so the game runs at
+   that resolution instead of its declared fixed size. The existing Fit
+   translation maps the forced VM surface to the window; scripts see the forced
+   size (`System.screenWidth`, window). This requires the scene window and
+   primary layer to follow the forced size and script window-size changes to be
+   held at it. Default remains the game's declared size.
 
-Open sub-items are tracked in those docs, not duplicated here: the raw-buffer
-compatibility policy, the default render resolution, readback reduction and
-the remaining mixer/video/transition pumps above.
+Open sub-items are tracked there and in `07`; the remaining mixer/video/
+transition pumps above still apply. Render-resolution decoupling (keep VM,
+CPU-raster at a higher fixed resolution) is documented as a deferred idea in
+`07`, not implemented; the earlier raw-buffer/plugin compatibility concern is
+why the VM-size override is the near-term path.
 
 ## 12. Deferred design work
 

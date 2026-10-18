@@ -523,17 +523,11 @@ device drain. Moving them into L2 is the rest of Phase 9 and does not change
 the frame entry point or the order. `Engine::run(clock, hooks)` waits for the
 platform-loop slice; the platform loop currently drives `Engine::step`.
 
-**The hybrid render-resolution frame (D41–D44).** The translation is internal
-to L2: every L2 render/pixel/readback method takes VM coordinates and applies
-`PixelTranslation` itself, so L3 keeps its VM-only contract. The CPU rasterizer
-runs at an explicit, fixed render resolution (`render_size`, independent of the
-VM size and the window). A layer has one pixel storage — a native texture for
-an image-only layer, or one render-res CPU surface once a raster operation
-touches it — and no persistent VM-resolution bitmap. Text is laid out in VM and
-rasterized at `Font.size · render_scale`; readback samples the render region
-over `vm_pixel_region`. The GPU only composes layer textures and presents the
-frame. Contract: [`13-render-resolution.md`](13-render-resolution.md). The
-current VM-res CPU bitmap source is transitional.
+**Translation inside L2 (D41).** L3 keeps calling L2 in VM coordinates; L2
+applies `PixelTranslation` in its projection, input and readback methods. The
+launcher can force the game's VM size; the translation maps that VM surface to
+the window. The render-resolution/supersampling idea is a deferred design note,
+not part of the current tree.
 
 Tests construct `Engine` with a null `RenderPipeline`, a headless
 `Surface`/`RenderState`, and a virtual clock.

@@ -245,18 +245,11 @@ Implemented: `engine::translate::PixelTranslation` owns the Fit mapping,
 `Engine` refits it on a VM/framebuffer size change, and the composition root
 inverse-maps pointer/touch coordinates before the VM tick.
 
-The target is the **hybrid render-resolution frame** (D41–D44,
-[`13`](13-render-resolution.md)): the translation is private to L2 and applied
-inside every render/pixel/readback method; L3 keeps calling L2 in VM
-coordinates. The CPU rasterizer runs at an explicit, fixed render resolution
-(`render_size`, independent of the VM size and the window), so text is
-rasterized at `Font.size · render_scale` and raster ops produce native
-render-res pixels. A layer has one storage: a native texture for image-only
-layers, or one render-res CPU surface once a raster op touches it; there is no
-persistent VM-resolution layer bitmap. The GPU only composes layer textures
-and presents the Fit-scaled frame — no GPU text and no GPU pixel mutation.
-Readback samples the render region; the raw-buffer/plugin path is the
-documented per-bitmap compatibility exception.
+The translation is internal to L2 (D41): L3 keeps calling L2 in VM
+coordinates. The launcher can set the game's VM size explicitly (for example
+to the display size); the translation then maps that VM surface to the window.
+Readback samples the corresponding region. The render-resolution/supersampling
+idea is a deferred design note, not part of the current tree.
 
 ### Implementation status
 

@@ -1,10 +1,7 @@
 # 12 — The layer tree, the projection and the frame
 
 Status: **the render path, the L2 frame and the VM↔device mapping are
-implemented; the render-resolution frame (D41–D44,
-[`13`](13-render-resolution.md)) — CPU raster at a fixed render resolution, L2-
-embedded translation, one storage per layer, no VM-res mirror — is the next
-slice.** This document is the end-to-end
+implemented.** This document is the end-to-end
 contract for *how a layer tree becomes a frame*. It consolidates the ownership
 rules that [02 §2.1/§3](02-target-architecture.md) and
 [03 §2](03-middle-layer-api.md#2-render-pipeline) already state, adds the code
@@ -217,14 +214,6 @@ The timer contract is D27's: L2 waits and calls; L3 decides whether to arm and
 turns the fire into an `onTimer` post. `TimerState::advance` is called only by
 `Engine::frame` (it stays public until the timer surface collapses).
 
-**Target superseding the CPU-composite layer path.** The current tree still
-uses each layer's VM-resolution CPU bitmap as the display source. The target
-is [`13`](13-render-resolution.md): the CPU rasterizes at a fixed render
-resolution, L2 applies the translation inside every draw/readback method, a
-layer has one storage (native texture or render-res surface), and the GPU only
-composes/presents. There is no persistent VM-res mirror; the CPU rasterizer
-remains the test oracle at `render_scale == 1`.
-
 ## 7. Where the pixel translation fits (D39/D40)
 
 The projection emits the layer tree in **VM pixels**; `engine::translate`
@@ -240,8 +229,7 @@ framebuffer size changes (twice per frame: before the hook so input uses the
 current mapping, after it so a script size change is projected the same
 frame). At `s == 1` the mapping is the identity and the reference is matched
 exactly. The translation is **internal to L2** (D41): L3 keeps calling L2 in
-VM coordinates. The render-resolution frame that consumes it for text, images
-and pixel operations is [`13`](13-render-resolution.md).
+VM coordinates.
 
 Input travels the other way: the composition root maps pointer/touch
 coordinates with `to_vm_point` before the VM tick, so L3 hit-tests in VM
