@@ -248,32 +248,47 @@ fn is_drive_path(name: &str) -> bool {
 
 /// Resolve a reference stream name to a filesystem path.
 ///
-/// Absolute names (POSIX or a drive letter) are used verbatim; a relative
-/// name is joined onto the attached L2 storage's game directory, matching the
-/// reference's data-dir-relative `TVPCreateStream`. With no storage attached
-/// the name is used as given.
-fn output_path(ctx: &CompatCtx, filename: &str) -> PathBuf {
+/// A storage-relative name, and an absolute name that is the fully lowercased
+/// form of a path below the game directory, resolve through the attached L2
+/// namespace so the real mixed-case spelling is written. An absolute path
+/// outside the game directory is used verbatim. With no storage attached the
+/// name is used as given.
+fn output_path(ctx: &CompatCtx, filename: &str) -> Result<PathBuf, String> {
     // The reference resolves the write target through `TVPCreateStream`
     // (`reference/cpp/plugins/saveStruct.cpp:233,276,336`), so the media
     // prefix is L3 syntax; the L2 namespace joins the bare name.
     let lookup = strip_file_media(filename);
     let path = Path::new(lookup);
-    if path.is_absolute() || is_drive_path(lookup) {
-        return path.to_path_buf();
+    // A drive-letter path is absolute to the reference even on hosts where
+    // `Path::is_absolute` does not treat it as such.
+    if is_drive_path(lookup) {
+        return Ok(path.to_path_buf());
     }
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let services = unsafe { ctx.services() };
     if let Some(pointer) = services.storage() {
         // SAFETY: the host keeps the attached storage alive for the binding.
-        return unsafe { &*pointer }.game_dir().join(path);
+        let storage = unsafe { &*pointer };
+        match storage.local_name(lookup) {
+            Ok(Some(path)) => return Ok(path),
+            Ok(None) => {}
+            Err(error) => return Err(error.to_string()),
+        }
     }
-    path.to_path_buf()
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    if let Some(pointer) = services.storage() {
+        // SAFETY: the host keeps the attached storage alive for the binding.
+        return Ok(unsafe { &*pointer }.game_dir().join(path));
+    }
+    Ok(path.to_path_buf())
 }
 
 /// Write the serialized text as the raw `tjs_char` stream the reference's
 /// `tTVPStringStream` emits: UTF-16LE with no BOM.
 fn write_struct_file(ctx: &CompatCtx, filename: &str, content: &str) -> Result<(), String> {
-    let path = output_path(ctx, filename);
+    let path = output_path(ctx, filename)?;
     let file_system = fs::FileSystem::host("");
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()

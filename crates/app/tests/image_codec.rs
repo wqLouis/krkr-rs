@@ -97,3 +97,65 @@ fn bitmap_save_writes_a_decodable_file_through_the_app_installed_codec() {
         "the saved PNG must round-trip the bitmap pixels"
     );
 }
+
+/// A save name may be the fully lowercased absolute form `System.dataPath`
+/// produces. The write must land on the real mixed-case on-disk path, not on a
+/// second lowercase tree; the reference resolves the name through
+/// `TVPGetLocallyAccessibleName` before opening it
+/// (`reference/cpp/core/base/StorageIntf.cpp:240-430`).
+#[test]
+fn bitmap_save_resolves_a_lowercased_absolute_name_to_the_real_path() {
+    let _lock = vm_lock();
+
+    let unique = format!(
+        "krkr-image-codec-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique).join("MixedCaseGame");
+    std::fs::create_dir_all(root.join("SaveData")).expect("create game dir");
+
+    let rgba = pattern(2, 2);
+    let source = encode_image(&Media::new(), 2, 2, &rgba, "png").expect("encode source");
+    std::fs::write(root.join("source.png"), source).expect("write source image");
+
+    let fs = FileSystem::host(&root);
+    let mut storage = Box::new(
+        Storage::mount_archives(fs, root.clone(), std::iter::empty::<&str>())
+            .expect("mount storage"),
+    );
+    let engine = Box::new(Tjs2Engine::new().expect("create engine"));
+    let mut scene = Box::new(Scene::default());
+    let mut host = CompatHost::new();
+    install_image_codec(&host, &Media::new(), &storage);
+    // SAFETY: the boxed scene/storage outlive `host` (they are declared after
+    // it and drop later), and `host.install` only stores their addresses.
+    unsafe {
+        host.services_mut()
+            .attach_scene(scene.as_mut() as *mut Scene);
+        host.services_mut()
+            .attach_storage(storage.as_mut() as *mut Storage);
+    }
+    host.install(&engine).expect("install compat surface");
+
+    let target = root.join("SaveData/shot.png");
+    let lower = format!("file://.{}", target.to_string_lossy().to_ascii_lowercase());
+    engine
+        .exec_script(
+            &format!("var b = new Bitmap(); b.load('source.png'); b.save({lower:?}, 'png');"),
+            "image-codec-test",
+        )
+        .expect("run the load/save script");
+
+    let saved = std::fs::read(&target).expect("the save must use the real mixed-case path");
+    decode_image(&Media::new(), &saved, Some("SaveData/shot.png")).expect("decode saved PNG");
+    assert!(
+        !root.join("savedata").exists(),
+        "the save created a second lowercase tree"
+    );
+
+    std::fs::remove_dir_all(root.parent().expect("temporary root")).expect("remove temp game");
+}

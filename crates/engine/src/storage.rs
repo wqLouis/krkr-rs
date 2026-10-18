@@ -1208,32 +1208,13 @@ impl Storage {
     /// The mount-relative part of `name` with `.`/`..` still present: `None`
     /// when the name is absolute and outside the mount.
     fn raw_relative_disk_name(&self, name: &str) -> Option<String> {
-        // Fold Windows separators so a `\`-separated storage name behaves like
-        // the reference on any host.
-        let separators = name.replace('\\', "/");
-        let path = Path::new(&separators);
-        let relative = if path.is_absolute() {
-            if self.game_dir.as_os_str().is_empty() {
-                path.to_path_buf()
-            } else {
-                strip_prefix_ignore_ascii_case(path, &self.game_dir)?
-            }
-        } else {
-            path.to_path_buf()
-        };
-        Some(relative.to_string_lossy().replace('\\', "/"))
+        raw_relative_disk_name(&self.game_dir, name)
     }
 
     /// [`Self::relative_disk_name`] with a `..` that escapes the mount
     /// reported as [`StorageReadError::InvalidPathName`] instead of `None`.
     fn relative_disk_name_checked(&self, name: &str) -> Result<Option<String>, StorageReadError> {
-        let Some(relative) = self.raw_relative_disk_name(name) else {
-            return Ok(None);
-        };
-        match fold_dot_components(&relative) {
-            Some(folded) => Ok(Some(folded)),
-            None => Err(StorageReadError::InvalidPathName(name.to_string())),
-        }
+        relative_disk_name_checked(&self.game_dir, name)
     }
 
     /// Resolves an existing disk file for a storage name, case-insensitively.
@@ -1265,56 +1246,7 @@ impl Storage {
     /// name); a `..` that escapes the mount is
     /// [`StorageReadError::InvalidPathName`].
     pub fn local_name(&self, name: &str) -> Result<Option<PathBuf>, StorageReadError> {
-        if name.contains('>') {
-            return Ok(None);
-        }
-        let Some(relative) = self.relative_disk_name_checked(name)? else {
-            return Ok(None);
-        };
-        Ok(Some(self.case_correct_path(&relative)))
-    }
-
-    /// Walks `relative` (already folded and `/`-separated) below the game
-    /// directory, replacing each existing component with its real on-disk
-    /// spelling. From the first component that does not exist, the requested
-    /// spelling of every remaining component is appended unchanged.
-    fn case_correct_path(&self, relative: &str) -> PathBuf {
-        let mut host = self.game_dir.clone();
-        let parts: Vec<&str> = relative
-            .split('/')
-            .filter(|part| !part.is_empty())
-            .collect();
-        for (index, part) in parts.iter().enumerate() {
-            if let Some(real) = self.case_correct_component(&host, part) {
-                host.push(real);
-            } else {
-                // The reference appends the requested spelling of this
-                // component and every remaining one, then stops correcting
-                // (`newname += ptr_cur`,
-                // `reference/cpp/core/base/impl/StorageImpl.cpp:373-377`).
-                for rest in &parts[index..] {
-                    host.push(*rest);
-                }
-                break;
-            }
-        }
-        host
-    }
-
-    /// The real on-disk spelling of the child of `dir` named `want`, or `None`
-    /// when no child matches or the directory cannot be listed.
-    fn case_correct_component(&self, dir: &Path, want: &str) -> Option<String> {
-        let listing = match self.directory_listing(dir) {
-            Ok(listing) => listing,
-            // The reference's `opendir` failure appends the requested spelling
-            // and stops the walk
-            // (`reference/cpp/core/base/impl/StorageImpl.cpp:373-377`).
-            Err(_) => return None,
-        };
-        listing
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(want))
-            .map(|(name, _)| name.clone())
+        local_name_in(&self.fs, &self.game_dir, name)
     }
 
     /// Disk branch of [`Self::find`], given an already-resolved relative name
@@ -1987,6 +1919,112 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
             }
         }
     }
+}
+
+/// The mount-relative part of a storage `name`, or `None` when it is an
+/// absolute path outside `game_dir`.
+fn raw_relative_disk_name(game_dir: &Path, name: &str) -> Option<String> {
+    // Fold Windows separators so a `\`-separated storage name behaves like
+    // the reference on any host.
+    let separators = name.replace('\\', "/");
+    let path = Path::new(&separators);
+    let relative = if path.is_absolute() {
+        if game_dir.as_os_str().is_empty() {
+            path.to_path_buf()
+        } else {
+            strip_prefix_ignore_ascii_case(path, game_dir)?
+        }
+    } else {
+        path.to_path_buf()
+    };
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+/// [`raw_relative_disk_name`] with a `..` that escapes the mount reported as
+/// [`StorageReadError::InvalidPathName`] instead of `None`.
+fn relative_disk_name_checked(
+    game_dir: &Path,
+    name: &str,
+) -> Result<Option<String>, StorageReadError> {
+    let Some(relative) = raw_relative_disk_name(game_dir, name) else {
+        return Ok(None);
+    };
+    match fold_dot_components(&relative) {
+        Some(folded) => Ok(Some(folded)),
+        None => Err(StorageReadError::InvalidPathName(name.to_string())),
+    }
+}
+
+/// The case-corrected host path for a storage `name` below `game_dir` — the
+/// same resolution as [`Storage::local_name`], usable where only the
+/// stateless file-system handle and the base directory are available.
+///
+/// This is the writer-facing form: a `name` that is an absolute, fully
+/// lowercased form of a mixed-case on-disk path (the shape
+/// `System.dataPath` produces) resolves to the real spelling instead of
+/// creating a second lowercase tree.
+pub fn local_name_in(
+    fs: &FileSystem,
+    game_dir: &Path,
+    name: &str,
+) -> Result<Option<PathBuf>, StorageReadError> {
+    if name.contains('>') {
+        return Ok(None);
+    }
+    let Some(relative) = relative_disk_name_checked(game_dir, name)? else {
+        return Ok(None);
+    };
+    Ok(Some(case_correct_path(fs, game_dir, &relative)?))
+}
+
+/// Walks `relative` (already folded and `/`-separated) below `game_dir`,
+/// replacing each existing component with its real on-disk spelling. From the
+/// first component that does not exist, the requested spelling of every
+/// remaining component is appended unchanged.
+fn case_correct_path(
+    fs: &FileSystem,
+    game_dir: &Path,
+    relative: &str,
+) -> Result<PathBuf, StorageReadError> {
+    let mut host = game_dir.to_path_buf();
+    let parts: Vec<&str> = relative
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    for (index, part) in parts.iter().enumerate() {
+        if let Some(real) = case_correct_component(fs, &host, part)? {
+            host.push(real);
+        } else {
+            // The reference appends the requested spelling of this component
+            // and every remaining one, then stops correcting
+            // (`newname += ptr_cur`,
+            // `reference/cpp/core/base/impl/StorageImpl.cpp:373-377`).
+            for rest in &parts[index..] {
+                host.push(*rest);
+            }
+            break;
+        }
+    }
+    Ok(host)
+}
+
+/// The real on-disk spelling of the child of `dir` named `want`, or `None`
+/// when no child matches. A directory-list failure other than a missing
+/// directory is reported, never treated as a miss.
+fn case_correct_component(
+    fs: &FileSystem,
+    dir: &Path,
+    want: &str,
+) -> Result<Option<String>, StorageReadError> {
+    let entries = match fs::list(fs, &FsPath::host(dir)) {
+        Ok(entries) => entries,
+        Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => return Ok(None),
+        Err(error) => return Err(StorageReadError::Fs(error)),
+    };
+    Ok(entries
+        .into_iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(want))
+        .map(|entry| entry.name))
 }
 
 /// Strips `prefix` from the leading components of `path`, comparing each

@@ -24,6 +24,7 @@ use std::time::Instant;
 use api::fs::{FsPath, OpenMode};
 use compat::CompatHost;
 use engine::Storage;
+use engine::storage::local_name_in;
 use fs::FileSystem;
 use media::{Media, decode_image, encode_image, probe_image};
 
@@ -104,13 +105,29 @@ fn install_image_codec_on_metered(
 }
 
 /// Writes `bytes` to `name` under `base` in `fs`, creating missing parents.
+///
+/// `name` may be the fully lowercased absolute form `System.dataPath`
+/// produces. Resolving it through the storage's case-correcting path helper
+/// keeps the write on the real mixed-case game path instead of creating a
+/// second lowercase tree (or failing on a read-only parent).
 fn write_storage_file(
     fs: &FileSystem,
     base: &Path,
     name: &str,
     bytes: &[u8],
 ) -> Result<(), String> {
-    let path = base.join(name);
+    let path = match local_name_in(fs, base, name) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            let requested = Path::new(name);
+            if requested.is_absolute() {
+                requested.to_path_buf()
+            } else {
+                base.join(requested)
+            }
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {

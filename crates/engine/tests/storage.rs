@@ -284,6 +284,12 @@ fn local_name_case_corrects_components() {
         storage.local_name("assets/CONFIG.TJS").unwrap(),
         Some(PathBuf::from("/Games/KR/Assets/config.tjs"))
     );
+    // The fully lowercased form of an absolute mixed-case path, the shape
+    // `System.dataPath` produces, resolves to the real spelling.
+    assert_eq!(
+        storage.local_name("/games/kr/assets/config.tjs").unwrap(),
+        Some(PathBuf::from("/Games/KR/Assets/config.tjs"))
+    );
     // A component that does not exist keeps the requested spelling, and the
     // remaining components are appended unchanged.
     assert_eq!(

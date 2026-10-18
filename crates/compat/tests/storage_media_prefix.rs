@@ -222,6 +222,38 @@ fn save2_strips_the_file_media_prefix() {
 /// (`reference/cpp/core/base/StorageIntf.cpp:240-430`), and the text write
 /// stream then opens the placed path
 /// (`reference/cpp/core/base/TextStream.cpp`).
+/// A fully lowercased absolute save name — the shape `System.dataPath`
+/// produces — must resolve to the real mixed-case on-disk directory rather
+/// than creating a lowercase tree or failing on a read-only parent.
+///
+/// Reference: the write target goes through `TVPCreateStream`, which resolves
+/// the normalized name through `TVPGetLocallyAccessibleName`
+/// (`reference/cpp/core/base/StorageIntf.cpp:240-430`).
+#[test]
+fn save_struct_resolves_a_lowercased_absolute_name_to_the_real_path() {
+    let _lock = vm_lock();
+    let dir = GameDir::new();
+    let save_dir = dir.path().join("SaveData");
+    std::fs::create_dir_all(&save_dir).expect("create savedata dir");
+    let target = save_dir.join("savecheck");
+    let leaked = dir.path().to_string_lossy().to_ascii_lowercase();
+    let lower = format!("file://.{}", target.to_string_lossy().to_ascii_lowercase());
+    let literal = format!("{lower:?}");
+    // `Env::new` takes ownership of `dir`, so every path derived from it is
+    // computed above.
+    let env = Env::new(dir);
+    env.run(&format!(
+        "var a = ['hello']; a.saveStruct({literal}, 'o0');"
+    ));
+    let written = std::fs::read(&target)
+        .unwrap_or_else(|error| panic!("saveStruct did not write {target:?}: {error}"));
+    assert!(!written.is_empty(), "saveStruct wrote an empty file");
+    assert!(
+        !Path::new(&leaked).exists(),
+        "saveStruct created a second lowercase tree"
+    );
+}
+
 #[test]
 fn save_struct_strips_the_file_media_prefix_and_doubled_slash() {
     let _lock = vm_lock();
