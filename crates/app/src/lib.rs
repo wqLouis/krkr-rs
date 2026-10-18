@@ -29,6 +29,7 @@ mod startup;
 mod video;
 mod window_ex;
 
+use api::config::CacheLimit;
 use api::error::RenderError;
 use api::host::SurfaceEvent;
 use engine::Scene;
@@ -135,6 +136,9 @@ pub struct HostConfig {
     /// The overlay is a render-only node: it is never a script-visible layer
     /// or bitmap, so it cannot change the scene a script observes.
     pub debug_overlay: bool,
+    /// The decoded-image cache policy, or `None` to keep the engine default
+    /// (disabled, as in the reference). See [`CacheLimit`].
+    pub graphic_cache_limit: Option<CacheLimit>,
 }
 
 impl Default for HostConfig {
@@ -148,6 +152,7 @@ impl Default for HostConfig {
             window_handle: None,
             display_handle: None,
             debug_overlay: false,
+            graphic_cache_limit: None,
         }
     }
 }
@@ -191,6 +196,12 @@ impl HostConfig {
     /// Returns this configuration with the debug overlay enabled or disabled.
     pub fn with_debug_overlay(mut self, debug_overlay: bool) -> Self {
         self.debug_overlay = debug_overlay;
+        self
+    }
+
+    /// Returns this configuration with a decoded-image cache policy.
+    pub fn with_graphic_cache_limit(mut self, limit: Option<CacheLimit>) -> Self {
+        self.graphic_cache_limit = limit;
         self
     }
 }
@@ -272,7 +283,7 @@ impl Host {
             None
         };
 
-        let engine = engine::Engine::new(engine::EngineParts {
+        let mut engine = engine::Engine::new(engine::EngineParts {
             pipeline,
             surface,
             render_state,
@@ -280,6 +291,9 @@ impl Host {
             headless: config.headless,
             overlay: overlay.map(|overlay| Box::new(overlay) as Box<dyn engine::EngineOverlay>),
         })?;
+        if let Some(limit) = config.graphic_cache_limit {
+            engine.scene_mut().set_decoded_image_cache_limit(limit);
+        }
 
         Ok(Self { engine, fs, media })
     }

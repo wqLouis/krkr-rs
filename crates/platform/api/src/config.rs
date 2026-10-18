@@ -13,7 +13,88 @@
 //! clamped or defaulted. [`RuntimeConfigOverrides`] is the partial shape a
 //! parser or launcher holds before the built-in defaults are filled in.
 
+use std::num::NonZeroU64;
+
 use thiserror::Error;
+
+/// The bound on a decoded-image cache.
+///
+/// [`Self::Disabled`] stores nothing. [`Self::Unlimited`] keeps every entry.
+/// [`Self::Bytes`] evicts least-recently-used entries until the cached bytes
+/// fit the bound. The byte count is the sum of the decoded RGBA buffers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CacheLimit {
+    /// Do not cache decoded images.
+    #[default]
+    Disabled,
+    /// Keep every decoded image.
+    Unlimited,
+    /// Keep at most this many decoded bytes.
+    Bytes(NonZeroU64),
+}
+
+impl CacheLimit {
+    /// A byte limit; zero means unlimited.
+    #[must_use]
+    pub fn bytes(limit: u64) -> Self {
+        NonZeroU64::new(limit).map_or(Self::Unlimited, Self::Bytes)
+    }
+
+    /// Whether the cache stores entries.
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// The byte bound, or `None` when caching is disabled. An unlimited cache
+    /// reports `Some(0)`.
+    #[must_use]
+    pub const fn option(self) -> Option<u64> {
+        match self {
+            Self::Disabled => None,
+            Self::Unlimited => Some(0),
+            Self::Bytes(bytes) => Some(bytes.get()),
+        }
+    }
+
+    /// Parses `none`/`off`/`disabled` as no cache, `unlimited` or `0` as an
+    /// unlimited cache, or a positive byte count.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::InvalidValue`] when the value is not one of those forms.
+    pub fn parse(option: &'static str, value: &str) -> Result<Self, ConfigError> {
+        let value = value.trim();
+        let normalized = value.to_ascii_lowercase();
+        match normalized.as_str() {
+            "none" | "off" | "disabled" => Ok(Self::Disabled),
+            "unlimited" => Ok(Self::Unlimited),
+            _ => value.parse::<u64>().map(Self::bytes).map_err(|_| {
+                ConfigError::invalid(
+                    option,
+                    value.to_owned(),
+                    "none, unlimited, 0, or a non-negative byte count",
+                )
+            }),
+        }
+    }
+}
+
+impl From<Option<u64>> for CacheLimit {
+    fn from(limit: Option<u64>) -> Self {
+        match limit {
+            None => Self::Disabled,
+            Some(0) => Self::Unlimited,
+            Some(bytes) => Self::bytes(bytes),
+        }
+    }
+}
+
+impl From<CacheLimit> for Option<u64> {
+    fn from(limit: CacheLimit) -> Self {
+        limit.option()
+    }
+}
 
 /// Lowest accepted frame-rate limit, in frames per second.
 ///
@@ -120,6 +201,12 @@ pub struct RuntimeConfig {
     /// The overlay is a render-only node: it is never a script-visible layer
     /// or bitmap, so enabling it cannot change what a script observes.
     pub debug_overlay: bool,
+    /// The decoded-image cache policy, or `None` to leave the engine's
+    /// reference default (disabled) in place. `Some(CacheLimit::Disabled)`
+    /// clears and disables the cache, `Some(CacheLimit::Unlimited)` keeps
+    /// every entry, and `Some(CacheLimit::Bytes(n))` caps the cached bytes.
+    /// A startup script can still change it through `System.graphicCacheLimit`.
+    pub graphic_cache_limit: Option<CacheLimit>,
 }
 
 impl Default for RuntimeConfig {
@@ -128,6 +215,7 @@ impl Default for RuntimeConfig {
             frame_rate_limit: FrameRateLimit::DEFAULT,
             preload_archives: false,
             debug_overlay: false,
+            graphic_cache_limit: None,
         }
     }
 }
@@ -145,6 +233,8 @@ pub struct RuntimeConfigOverrides {
     pub preload_archives: Option<bool>,
     /// A source's debug-overlay choice, if it holds one.
     pub debug_overlay: Option<bool>,
+    /// A source's decoded-image cache policy, if it holds one.
+    pub graphic_cache_limit: Option<CacheLimit>,
 }
 
 /// Parses a boolean configuration value, accepting `true` and `false`.
@@ -167,7 +257,12 @@ pub fn parse_bool(option: &'static str, value: &str) -> Result<bool, ConfigError
 
 /// The configuration keys [`parse_overrides`] accepts, in the order its
 /// unknown-key diagnostic lists them.
-const ACCEPTED_KEYS: [&str; 3] = ["frame_rate", "preload_archives", "debug_overlay"];
+const ACCEPTED_KEYS: [&str; 4] = [
+    "frame_rate",
+    "preload_archives",
+    "debug_overlay",
+    "graphic_cache_limit",
+];
 
 /// Parses `key=value` configuration text into overrides.
 ///
@@ -175,7 +270,8 @@ const ACCEPTED_KEYS: [&str; 3] = ["frame_rate", "preload_archives", "debug_overl
 /// launcher's business. Blank lines and lines whose first non-space character
 /// is `#` are ignored. A line without `=` or with an unknown key is an error,
 /// as is a value that fails validation; nothing is silently skipped. The
-/// recognized keys are `frame_rate`, `preload_archives` and `debug_overlay`.
+/// recognized keys are `frame_rate`, `preload_archives`, `debug_overlay` and
+/// `graphic_cache_limit`.
 ///
 /// # Errors
 ///
@@ -202,6 +298,10 @@ pub fn parse_overrides(text: &str) -> Result<RuntimeConfigOverrides, ConfigError
             }
             "debug_overlay" => {
                 overrides.debug_overlay = Some(parse_bool("debug_overlay", value)?);
+            }
+            "graphic_cache_limit" => {
+                overrides.graphic_cache_limit =
+                    Some(CacheLimit::parse("graphic_cache_limit", value)?);
             }
             other => {
                 let keys = ACCEPTED_KEYS
@@ -295,7 +395,7 @@ mod tests {
     #[test]
     fn overrides_parse_keys_comments_and_blanks() {
         let overrides = parse_overrides(
-            "# a comment\n\nframe_rate = 30\npreload_archives=true\ndebug_overlay=true\n",
+            "# a comment\n\nframe_rate = 30\npreload_archives=true\ndebug_overlay=true\ngraphic_cache_limit=1048576\n",
         )
         .expect("parse");
         assert_eq!(
@@ -304,6 +404,10 @@ mod tests {
         );
         assert_eq!(overrides.preload_archives, Some(true));
         assert_eq!(overrides.debug_overlay, Some(true));
+        assert_eq!(
+            overrides.graphic_cache_limit,
+            Some(CacheLimit::bytes(1_048_576))
+        );
     }
 
     #[test]
@@ -331,5 +435,34 @@ mod tests {
         let error = parse_overrides("frame_rate=0").expect_err("must reject");
         assert!(error.to_string().contains("frame_rate"));
         assert!(parse_overrides("debug_overlay=yes").is_err());
+        assert!(parse_overrides("graphic_cache_limit=-1").is_err());
+    }
+
+    #[test]
+    fn graphic_cache_limit_parses_disabled_unlimited_and_bytes() {
+        assert_eq!(
+            CacheLimit::parse("graphic_cache_limit", "none").unwrap(),
+            CacheLimit::Disabled
+        );
+        assert_eq!(
+            CacheLimit::parse("graphic_cache_limit", "off").unwrap(),
+            CacheLimit::Disabled
+        );
+        assert_eq!(
+            CacheLimit::parse("graphic_cache_limit", "None").unwrap(),
+            CacheLimit::Disabled
+        );
+        assert_eq!(
+            CacheLimit::parse("graphic_cache_limit", "0").unwrap(),
+            CacheLimit::Unlimited
+        );
+        assert_eq!(
+            CacheLimit::parse("graphic_cache_limit", "unlimited").unwrap(),
+            CacheLimit::Unlimited
+        );
+        assert_eq!(
+            CacheLimit::parse("graphic_cache_limit", "1048576").unwrap(),
+            CacheLimit::bytes(1_048_576)
+        );
     }
 }

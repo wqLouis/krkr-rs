@@ -7,10 +7,24 @@ mod common;
 
 use std::sync::{Mutex, MutexGuard};
 
+use api::config::CacheLimit;
 use api::host::SurfaceEvent;
 use common::{build_solid_and_bitmap_scene, headless_host};
 use tjs::TjsValue;
 use vm::VmHost;
+
+/// The host applies the launcher's decoded-image cache policy to its scene.
+#[test]
+fn host_applies_the_configured_graphic_cache_limit() {
+    let host = app::Host::new(
+        app::HostConfig::headless().with_graphic_cache_limit(Some(CacheLimit::bytes(1_048_576))),
+    )
+    .expect("headless host");
+    assert_eq!(
+        host.scene().decoded_image_cache_limit(),
+        CacheLimit::bytes(1_048_576)
+    );
+}
 
 /// Serializes the tests that bind the process-global VM.
 fn vm_lock() -> MutexGuard<'static, ()> {

@@ -239,8 +239,10 @@ than starting the engine against a path that will not resolve.
 
 The launcher also persists the player's runtime options and carries them into
 the engine. A **Settings** screen reachable from the launcher's top bar exposes
-the options `api::config::RuntimeConfig` carries today, with the same accepted
-values as the desktop `--fps`/`--preload-archives`/`--debug-overlay`.
+the options the desktop launcher calls `--fps`, `--preload-archives` and
+`--debug-overlay`, with the same accepted values. The decoded-image cache
+limit is currently a desktop CLI option only; Android leaves the engine's
+reference default (disabled).
 Nothing is offered for a feature the engine has no knob for
 — a control that silently did nothing is the bug class this project forbids.
 Presentation is not among the options: Fit-with-letterbox is the engine's single
@@ -251,6 +253,7 @@ rule (`docs/migration/11`, D39), so there is no scaling control to show.
 | Frame-rate limit | decimal integer `1..=1000` fps | `60` | reference `fps_limit` default 60 (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`); the same range `--fps` accepts |
 | Archive preload | `true`, `false` | `false` | whether every mounted archive is read into memory when it mounts; the cost is that archive's size in resident memory, the gain is that entry reads stop touching the backing filesystem |
 | Debug overlay | `true`, `false` | `false` | draw FPS and 1% low, CPU, disk I/O, memory and object counts in the top-left corner; a render-only panel, never a script-visible layer or bitmap |
+| Graphic cache limit | desktop CLI only | engine default (disabled) | `--graphic-cache-limit none\|0\|BYTES`; not exposed by the Android settings screen yet |
 | Engine log level | `off`, `error`, `warn`, `info`, `debug`, `trace` | `info` | how much the engine writes to `krkr.log`; `debug`/`trace` are diagnostic and produce large logs (see §7) |
 
 The debug overlay is off by default and persisted under the `debug_overlay`

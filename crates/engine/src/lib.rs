@@ -30,6 +30,8 @@ pub mod trans;
 pub mod translate;
 pub mod video;
 
+pub use api::config::CacheLimit;
+
 // Archive name normalization is a shared storage-naming rule; the parser
 // itself now lives in L1 `fs::xp3`.
 pub use fs::xp3::normalize_in_archive_name;
@@ -45,8 +47,7 @@ pub use crate::translate::{PixelTranslation, TranslateError};
 // `storage`, `startup`); they are not part of the stable flat surface.
 pub use projection::{ComposedLayer, compose_layer, project_scene, project_window, resolve_blend};
 pub use scene::{
-    BitmapState, CacheLimit, DecodedImageKey, DecodedImageMode, FontState, LayerState, Rect, Scene,
-    WindowState,
+    BitmapState, DecodedImageKey, DecodedImageMode, FontState, LayerState, Rect, Scene, WindowState,
 };
 pub use startup::{StartupError, discover_startup};
 pub use storage::{Location, MountError, Storage, StorageMetadata, StorageReadError};

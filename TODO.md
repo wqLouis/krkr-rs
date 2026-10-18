@@ -908,9 +908,10 @@ What is known:
   bounds only its optional decoded-image cache through
   `System.graphicCacheLimit`: `0` disables, `-1` selects the system cap, and a
   positive value is a byte cap (512 MiB maximum). The port now represents that
-  bound as `CacheLimit::{Disabled, Unlimited, Bytes}` in `engine::Scene`; the
-  script adapter keeps the reference's integer contract (`0` is disabled, and
-  `Unlimited` is never selected by script).
+  bound as `CacheLimit::{Disabled, Unlimited, Bytes}`; the desktop launcher
+  exposes it as `--graphic-cache-limit none|0|BYTES` (absent leaves the
+  reference default), and the script adapter keeps the reference's integer
+  contract (`0` is disabled, and `Unlimited` is never selected by script).
 * Fixed so far (do not re-open): the layer registry no longer roots every layer
   (`ObjectRegistry.layers` is a non-owning handle); MenuItem / Timer /
   WaveSoundBuffer / AsyncTrigger no longer store their own `objthis`; the

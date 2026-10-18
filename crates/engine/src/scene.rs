@@ -12,9 +12,9 @@
 //! `compat` native adapter calls into these operations.
 
 use std::collections::{HashMap, HashSet};
-use std::num::NonZeroU64;
 
 use api::blend::BlendMode;
+use api::config::CacheLimit;
 use api::media::DecodedImage;
 
 /// One logical window.
@@ -257,63 +257,6 @@ pub struct LayerState {
     /// marks directly, and every consumer — [`Scene::node_visible`],
     /// [`Scene::layer_at`], [`Scene::window_layer_order`] — skips it.
     pub shutdown: bool,
-}
-
-/// The bound on a decoded-image cache.
-///
-/// [`Self::Disabled`] stores nothing. [`Self::Unlimited`] keeps every entry.
-/// [`Self::Bytes`] evicts least-recently-used entries until the cached bytes
-/// fit the bound. The byte count is the sum of the decoded RGBA buffers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CacheLimit {
-    /// Do not cache decoded images.
-    #[default]
-    Disabled,
-    /// Keep every decoded image.
-    Unlimited,
-    /// Keep at most this many decoded bytes.
-    Bytes(NonZeroU64),
-}
-
-impl CacheLimit {
-    /// A byte limit; zero means unlimited.
-    #[must_use]
-    pub fn bytes(limit: u64) -> Self {
-        NonZeroU64::new(limit).map_or(Self::Unlimited, Self::Bytes)
-    }
-
-    /// Whether the cache stores entries.
-    #[must_use]
-    pub const fn is_enabled(self) -> bool {
-        !matches!(self, Self::Disabled)
-    }
-
-    /// The byte bound, or `None` when caching is disabled. An unlimited cache
-    /// reports `Some(0)`.
-    #[must_use]
-    pub const fn option(self) -> Option<u64> {
-        match self {
-            Self::Disabled => None,
-            Self::Unlimited => Some(0),
-            Self::Bytes(bytes) => Some(bytes.get()),
-        }
-    }
-}
-
-impl From<Option<u64>> for CacheLimit {
-    fn from(limit: Option<u64>) -> Self {
-        match limit {
-            None => Self::Disabled,
-            Some(0) => Self::Unlimited,
-            Some(bytes) => Self::bytes(bytes),
-        }
-    }
-}
-
-impl From<CacheLimit> for Option<u64> {
-    fn from(limit: CacheLimit) -> Self {
-        limit.option()
-    }
 }
 
 /// One decoded bitmap (RGBA8, straight alpha).

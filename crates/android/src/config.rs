@@ -148,6 +148,7 @@ pub(crate) fn resolve_runtime_config(
         frame_rate_limit,
         preload_archives,
         debug_overlay,
+        graphic_cache_limit: None,
     })
 }
 

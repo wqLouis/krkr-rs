@@ -1,7 +1,7 @@
 //! `krkr` CLI: headless frame runner and windowed desktop frontend.
 //!
 //! ```text
-//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--preload-archives] [--archive XP3 ...] [--base-dir DIR] [GAME]
+//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--preload-archives] [--graphic-cache-limit LIMIT] [--archive XP3 ...] [--base-dir DIR] [GAME]
 //! ```
 //!
 //! * `--headless` runs an empty scene for `N` frames (default 120) through
@@ -31,6 +31,11 @@
 //!   resident memory and live object counts in the top-left corner. It is a
 //!   render-only node (never a script-visible layer or bitmap) and off by
 //!   default.
+//! * `--graphic-cache-limit LIMIT` sets the decoded-image cache policy:
+//!   `none` disables it, `0`/`unlimited` keeps every decoded image, and a
+//!   positive integer is a byte cap. Without the option the reference default
+//!   (disabled) applies, and a startup script may still change it through
+//!   `System.graphicCacheLimit`.
 //! * `--backend vulkan` requests the Vulkan pipeline. It needs a real
 //!   window with a display connection (Wayland/X11/XCB); the windowed host
 //!   passes both the window and display handle so a surface can be created.
@@ -50,7 +55,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use api::config::{
-    ConfigError, FrameRateLimit, RuntimeConfig, RuntimeConfigOverrides, parse_overrides,
+    CacheLimit, ConfigError, FrameRateLimit, RuntimeConfig, RuntimeConfigOverrides, parse_overrides,
 };
 use app::{BackendKind, GameInput, Launch, RunMode};
 
@@ -100,6 +105,11 @@ const OPTIONS: &[OptionDoc] = &[
         help: "Draw FPS/1% low, CPU, disk I/O, memory and object counts in the top-left corner.",
     },
     OptionDoc {
+        flag: "--graphic-cache-limit",
+        value: "LIMIT",
+        help: "Decoded-image cache: none, 0/unlimited, or bytes (default: reference default).",
+    },
+    OptionDoc {
         flag: "--archive",
         value: "XP3",
         help: "Mount an XP3 archive (repeatable, later wins); with none, every *.xp3 under the base directory mounts.",
@@ -125,10 +135,10 @@ fn usage() -> String {
         } else {
             format!("{} {}", option.flag, option.value)
         };
-        out.push_str(&format!("    {left:<24}{}\n", option.help));
+        out.push_str(&format!("    {left:<30}{}\n", option.help));
     }
     out.push_str(&format!(
-        "    {:<24}{}\n",
+        "    {:<30}{}\n",
         "GAME", "Game directory (recursively scanned for *.xp3) or an XP3 file."
     ));
     out
@@ -152,6 +162,8 @@ struct Cli {
     preload_archives: Option<bool>,
     /// Whether `--debug-overlay` was given.
     debug_overlay: Option<bool>,
+    /// Decoded-image cache policy from `--graphic-cache-limit`, if given.
+    graphic_cache_limit: Option<CacheLimit>,
     /// Explicit `--archive` list, in mount order (later wins).
     archives: Vec<PathBuf>,
     /// App path override (`--base-dir`); defaults to the current directory.
@@ -187,6 +199,7 @@ impl Cli {
             frame_rate: None,
             preload_archives: None,
             debug_overlay: None,
+            graphic_cache_limit: None,
             archives: Vec::new(),
             base_dir: None,
             positional: None,
@@ -218,6 +231,13 @@ impl Cli {
                 }
                 "--preload-archives" => cli.preload_archives = Some(true),
                 "--debug-overlay" => cli.debug_overlay = Some(true),
+                "--graphic-cache-limit" => {
+                    let value = args.next().ok_or_else(|| {
+                        CliError::Usage("--graphic-cache-limit requires a value".to_owned())
+                    })?;
+                    cli.graphic_cache_limit =
+                        Some(CacheLimit::parse("--graphic-cache-limit", &value)?);
+                }
                 "--archive" => {
                     let value = args
                         .next()
@@ -307,6 +327,7 @@ fn resolve_runtime_config(cli: &Cli, file: RuntimeConfigOverrides) -> RuntimeCon
             .debug_overlay
             .or(file.debug_overlay)
             .unwrap_or(defaults.debug_overlay),
+        graphic_cache_limit: cli.graphic_cache_limit.or(file.graphic_cache_limit),
     }
 }
 
@@ -484,6 +505,7 @@ mod tests {
         assert_eq!(cli.frames, DEFAULT_FRAMES);
         assert_eq!(cli.frame_rate, None);
         assert_eq!(cli.debug_overlay, None);
+        assert_eq!(cli.graphic_cache_limit, None);
     }
 
     #[test]
@@ -507,12 +529,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_graphic_cache_limit() {
+        let cli = parse(&["--headless", "--graphic-cache-limit", "none"]).expect("parse");
+        assert_eq!(cli.graphic_cache_limit, Some(CacheLimit::Disabled));
+
+        let cli = parse(&["--headless", "--graphic-cache-limit", "0"]).expect("parse");
+        assert_eq!(cli.graphic_cache_limit, Some(CacheLimit::Unlimited));
+
+        let cli = parse(&["--headless", "--graphic-cache-limit", "1048576"]).expect("parse");
+        assert_eq!(cli.graphic_cache_limit, Some(CacheLimit::bytes(1_048_576)));
+    }
+
+    #[test]
     fn parse_rejects_every_invalid_configuration_value() {
         for args in [
             &["--fps"][..],
             &["--fps", "0"],
             &["--fps", "1001"],
             &["--fps", "fast"],
+            &["--graphic-cache-limit"],
+            &["--graphic-cache-limit", "-1"],
+            &["--graphic-cache-limit", "sometimes"],
         ] {
             assert!(parse(args).is_err(), "accepted {args:?}");
         }
@@ -530,6 +567,7 @@ mod tests {
         let file = RuntimeConfigOverrides {
             frame_rate_limit: Some(FrameRateLimit::new("frame_rate", 30).expect("valid")),
             debug_overlay: Some(true),
+            graphic_cache_limit: Some(CacheLimit::bytes(1_048_576)),
             ..RuntimeConfigOverrides::default()
         };
 
@@ -538,13 +576,19 @@ mod tests {
         let config = resolve_runtime_config(&cli, file);
         assert_eq!(config.frame_rate_limit.fps(), 30);
         assert!(config.debug_overlay);
+        assert_eq!(
+            config.graphic_cache_limit,
+            Some(CacheLimit::bytes(1_048_576))
+        );
 
         // The launch argument beats the file, field by field.
-        let cli = parse(&["--headless", "--fps", "120"]).expect("parse");
+        let cli =
+            parse(&["--headless", "--fps", "120", "--graphic-cache-limit", "0"]).expect("parse");
         let config = resolve_runtime_config(&cli, file);
         assert_eq!(config.frame_rate_limit.fps(), 120);
-        // The file's other field is still in place.
+        // The file's other fields are still in place.
         assert!(config.debug_overlay);
+        assert_eq!(config.graphic_cache_limit, Some(CacheLimit::Unlimited));
     }
 
     #[test]
@@ -554,6 +598,7 @@ mod tests {
         assert_eq!(config, RuntimeConfig::default());
         assert_eq!(config.frame_rate_limit.fps(), 60);
         assert!(!config.debug_overlay);
+        assert_eq!(config.graphic_cache_limit, None);
     }
 
     #[test]
@@ -590,13 +635,19 @@ mod tests {
 
     #[test]
     fn config_file_parses_keys_and_rejects_bad_values() {
-        let path = temp_config("frame_rate = 30\ndebug_overlay=true\n# comment\n");
+        let path = temp_config(
+            "frame_rate = 30\ndebug_overlay=true\ngraphic_cache_limit=1048576\n# comment\n",
+        );
         let overrides = load_config_file(&path).expect("parse");
         assert_eq!(
             overrides.frame_rate_limit,
             Some(FrameRateLimit::new("frame_rate", 30).expect("valid"))
         );
         assert_eq!(overrides.debug_overlay, Some(true));
+        assert_eq!(
+            overrides.graphic_cache_limit,
+            Some(CacheLimit::bytes(1_048_576))
+        );
         std::fs::remove_file(&path).ok();
 
         let bad = temp_config("frame_rate=0\n");

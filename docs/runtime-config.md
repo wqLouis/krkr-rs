@@ -73,8 +73,8 @@ to read files (only the compatibility layer is barred from `std::fs`).
 
 A file that is named but unreadable is a typed error, and so is an unknown key
 or a bad value; nothing is skipped and nothing is applied until the whole file
-parses. The recognized keys are `frame_rate`, `preload_archives` and
-`debug_overlay`, matching the argument names.
+parses. The recognized keys are `frame_rate`, `preload_archives`, `debug_overlay` and
+`graphic_cache_limit`, matching the argument names.
 
 ## 2. Implemented options
 
@@ -83,6 +83,7 @@ parses. The recognized keys are `frame_rate`, `preload_archives` and
 | `--fps N` (`frame_rate`) | frames per second, `1..=1000` | `60` | reference `fps_limit` default `60` (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`), applied as the animation interval `1/fps` (`reference/cpp/core/environ/cocos2d/MainScene.cpp:684-685`); the main loop sleeps the remaining interval (`reference/cpp/core/environ/RenderUtils.h`, `TVPDrawSceneOnce`) |
 | `--preload-archives` (`preload_archives`) | `true`, `false` | `false` | read every mounted archive into memory when it mounts; the cost is that archive's size in resident memory, the gain is that entry reads stop touching the backing filesystem |
 | `--debug-overlay` (`debug_overlay`) | `true`, `false` | `false` | draw FPS and its rolling 1% low, process CPU, storage read/write rates, resident memory and live object counts in the top-left corner; a render-only node, never a script-visible layer or bitmap, so it cannot change what a script observes. CPU comes from `/proc/self/task/*/schedstat` and is a fraction of one core, so a single saturated core reads `100%` and N saturated cores read `N*100%`; storage from `/proc/self/io`, RSS from `/proc/self/status`; an unavailable value is shown as `?`, never fabricated |
+| `--graphic-cache-limit LIMIT` (`graphic_cache_limit`) | `none`, `0`/`unlimited`, or a non-negative byte count | unset (reference default: disabled) | the decoded-image cache policy. `none` clears and disables it; `0` or `unlimited` keeps every decoded image; a positive integer is a byte cap with LRU eviction. Unset leaves the engine's reference default (disabled), so a startup script's `System.graphicCacheLimit` write still works and can override the launcher value. This is a launcher extension: it does **not** change the script property's reference encoding, where `0` means disabled and `-1` selects the 512 MiB system cap |
 
 The frame-rate limit paces both loops: the windowed loop through
 `PlatformConfig::frame_interval` and the headless step through

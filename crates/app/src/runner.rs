@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use api::config::RuntimeConfig;
+use api::config::{CacheLimit, RuntimeConfig};
 use platform::{EventHandler, Flow, FramePacing, PlatformConfig, PlatformEvent, PlatformWindow};
 
 use crate::{BackendKind, FrameStats, GameHost, Host, HostConfig, StepReport};
@@ -104,7 +104,8 @@ fn format_stats(stats: &FrameStats) -> String {
 fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, String> {
     let config = HostConfig::headless()
         .with_backend(launch.backend)
-        .with_debug_overlay(launch.runtime.debug_overlay);
+        .with_debug_overlay(launch.runtime.debug_overlay)
+        .with_graphic_cache_limit(launch.runtime.graphic_cache_limit);
     let mut host = Host::new(config).map_err(|error| error.to_string())?;
     let dt_ms = launch.runtime.frame_rate_limit.period_ms();
 
@@ -202,6 +203,7 @@ fn run_windowed(launch: &Launch) -> Result<(), String> {
             launch.game.clone(),
             launch.runtime.preload_archives,
             launch.runtime.debug_overlay,
+            launch.runtime.graphic_cache_limit,
         ),
     )
     .map_err(|error| error.to_string())
@@ -222,6 +224,8 @@ struct DesktopApp {
     preload_archives: bool,
     /// Whether the debug overlay is drawn.
     debug_overlay: bool,
+    /// Decoded-image cache policy, or `None` for the engine default.
+    graphic_cache_limit: Option<CacheLimit>,
     /// The running host, created once the window handle exists.
     running: Option<Running>,
     /// Input and focus events received since the last frame, delivered to
@@ -285,12 +289,14 @@ impl DesktopApp {
         game: Option<GameInput>,
         preload_archives: bool,
         debug_overlay: bool,
+        graphic_cache_limit: Option<CacheLimit>,
     ) -> Self {
         Self {
             backend,
             game,
             preload_archives,
             debug_overlay,
+            graphic_cache_limit,
             running: None,
             pending_events: Vec::new(),
         }
@@ -322,6 +328,7 @@ impl EventHandler for DesktopApp {
             window_handle: Some(window_handle),
             display_handle: Some(display_handle),
             debug_overlay: self.debug_overlay,
+            graphic_cache_limit: self.graphic_cache_limit,
             ..Default::default()
         };
         match Host::new(config) {
