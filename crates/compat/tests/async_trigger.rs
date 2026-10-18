@@ -282,6 +282,56 @@ fn subclass_members_before_the_base_constructor_follow_the_owner_guard() {
     assert_eq!(env.eval_int("fired"), 1);
 }
 
+/// A queued fire retains its source object, like the reference `tTVPEvent`
+/// constructor's `Target->AddRef()` / `Source->AddRef()`
+/// (`reference/cpp/core/base/EventIntf.cpp:58-65`). A script may create the
+/// trigger in a local and return before the next poll; the queued event must
+/// still keep it alive and deliver `onFire`.
+#[test]
+fn a_queued_fire_keeps_a_local_trigger_alive() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var fired = 0; \
+         function arm() { \
+             var trigger = new AsyncTrigger(function(){ fired += 1; }, ''); \
+             trigger.trigger(); \
+         } \
+         arm();",
+    );
+    assert_eq!(env.eval_int("fired"), 0);
+    env.poll();
+    // `arm()` returned before the poll, so only the posted event can retain
+    // the trigger.
+    assert_eq!(env.eval_int("fired"), 1);
+}
+
+/// The event's source reference is released when the fire is delivered:
+/// `~tTVPEvent` calls `Target->Release()` / `Source->Release()`
+/// (`reference/cpp/core/base/EventIntf.cpp:88-95`). A delivered local trigger
+/// must therefore reach reference count zero and remove its binding.
+#[test]
+fn a_delivered_fire_releases_its_local_trigger() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let baseline = env._host.async_trigger_count();
+    env.run(
+        "for (var cycle = 0; cycle < 5; cycle++) { \
+             var trigger = new AsyncTrigger(function(){}, ''); \
+             trigger.trigger(); \
+             trigger = null; \
+         }",
+    );
+    env.poll();
+    env.run("System.doCompact();");
+    env.engine.do_gc().expect("idle compact");
+    assert_eq!(
+        env._host.async_trigger_count(),
+        baseline,
+        "a delivered fire must release its source object and binding"
+    );
+}
+
 /// The reference native async trigger keeps only a raw `Owner` pointer
 /// (`reference/cpp/core/base/EventIntf.h:322`), so a script object reaches
 /// reference count zero and its native destroy runs, removing the

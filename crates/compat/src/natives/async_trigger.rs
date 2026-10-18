@@ -86,6 +86,20 @@ struct AsyncTriggerBinding {
     owner: usize,
 }
 
+/// One scheduled fire.
+///
+/// The reference `tTVPEvent` constructor AddRefs both its target and source
+/// (`reference/cpp/core/base/EventIntf.cpp:58-65`), so the source trigger
+/// object stays alive until the queued event is delivered, even when the
+/// script only held it in a local. `owner` is that retained source for this
+/// port.
+struct PendingTrigger {
+    /// The object whose `onFire` is dispatched.
+    id: AsyncTriggerId,
+    /// A strong reference to the trigger object while the fire is queued.
+    owner: Option<DetachedValue>,
+}
+
 /// The `AsyncTrigger` registry: one entry per live object plus the FIFO of
 /// scheduled fires. Lives in [`CompatServices::state`] keyed by type.
 ///
@@ -100,8 +114,9 @@ struct AsyncTriggerState {
     /// Per-object state keyed by [`AsyncTriggerId`].
     triggers: HashMap<AsyncTriggerId, AsyncTriggerBinding>,
     /// Scheduled fires in `trigger()` order. A `cached` object appears at
-    /// most once.
-    pending: Vec<AsyncTriggerId>,
+    /// most once. Each entry retains its source object until delivery, like
+    /// the reference event queue.
+    pending: Vec<PendingTrigger>,
 }
 
 /// Typed `AsyncTrigger` failures.
@@ -150,7 +165,7 @@ impl AsyncTriggerState {
     fn remove(&mut self, id: AsyncTriggerId) -> Result<(), AsyncTriggerError> {
         self.binding(id)?;
         self.triggers.remove(&id);
-        self.pending.retain(|pending| *pending != id);
+        self.pending.retain(|pending| pending.id != id);
         Ok(())
     }
 
@@ -162,14 +177,14 @@ impl AsyncTriggerState {
     /// re-queues, mirroring the reference `TVPCancelSourceEvents(Owner)` +
     /// `TVPPostEvent` pair (`EventIntf.cpp:1047-1058`): the re-triggered fire
     /// moves to the end of the queue. An uncached object queues each call.
-    fn trigger(&mut self, id: AsyncTriggerId, cached: bool) -> bool {
+    fn trigger(&mut self, id: AsyncTriggerId, cached: bool, owner: Option<DetachedValue>) -> bool {
         if !self.triggers.contains_key(&id) {
             return false;
         }
         if cached {
-            self.pending.retain(|pending| *pending != id);
+            self.pending.retain(|pending| pending.id != id);
         }
-        self.pending.push(id);
+        self.pending.push(PendingTrigger { id, owner });
         true
     }
 
@@ -178,7 +193,7 @@ impl AsyncTriggerState {
     /// reference also treats as a silent no-op (`if(Owner)` guard).
     fn cancel(&mut self, id: AsyncTriggerId) -> bool {
         let known = self.triggers.contains_key(&id);
-        self.pending.retain(|pending| *pending != id);
+        self.pending.retain(|pending| pending.id != id);
         known
     }
 
@@ -186,7 +201,7 @@ impl AsyncTriggerState {
     /// `SetCached`/`SetMode` (`EventIntf.cpp:1076`, `1086`), valid for any
     /// entry state (a gone entry has no pending fires anyway).
     fn cancel_pending(&mut self, id: AsyncTriggerId) {
-        self.pending.retain(|pending| *pending != id);
+        self.pending.retain(|pending| pending.id != id);
     }
 
     /// Take the fires scheduled for this poll, leaving the queue empty.
@@ -194,7 +209,7 @@ impl AsyncTriggerState {
     /// `trigger()` calls made while a handler runs land in the emptied queue
     /// and are therefore deferred to the next poll instead of re-entering the
     /// VM mid-dispatch.
-    fn take_pending(&mut self) -> Vec<AsyncTriggerId> {
+    fn take_pending(&mut self) -> Vec<PendingTrigger> {
         std::mem::take(&mut self.pending)
     }
 }
@@ -417,7 +432,7 @@ extern "C" fn async_trigger_trigger(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let Ok((_host, ctx)) = bound(engine) else {
+    let Ok((host, ctx)) = bound(engine) else {
         return report_error(
             out_error,
             "AsyncTrigger.trigger: compat context is not bound",
@@ -433,12 +448,30 @@ extern "C" fn async_trigger_trigger(
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
+    // The reference's posted event AddRefs the source object
+    // (`EventIntf.cpp:58-65`), so a trigger held only by the script local
+    // survives until the poll delivers the fire.
+    let source = services
+        .state::<AsyncTriggerState>()
+        .triggers
+        .get(&id)
+        .and_then(|binding| std::num::NonZeroUsize::new(binding.owner));
+    let owner =
+        source.and_then(
+            |source| match host.retain_object_detached(source.get() as *mut c_void) {
+                Ok(owner) => Some(owner),
+                Err(error) => {
+                    log::debug!("AsyncTrigger.trigger: cannot retain the source object: {error}");
+                    None
+                }
+            },
+        );
     // An invalidated object has no registry entry: the reference's
     // `Trigger()` guards on `Owner`, which `Invalidate` clears
     // (`EventIntf.cpp:1036-1037`, `1044`) — a silent no-op, not an error.
     if !services
         .state::<AsyncTriggerState>()
-        .trigger(id, inst.cached)
+        .trigger(id, inst.cached, owner)
     {
         log::debug!("AsyncTrigger.trigger: {id:?} was invalidated; no-op");
     }
@@ -630,23 +663,16 @@ pub fn async_trigger_poll(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let (host, services) = unsafe { (ctx.engine(), ctx.services()) };
     let ready = services.state::<AsyncTriggerState>().take_pending();
-    for id in ready {
-        // Read the raw owner handle without holding the state borrow across
-        // the call, then retain it for the dispatch.
-        let handle = services
-            .state::<AsyncTriggerState>()
-            .triggers
-            .get(&id)
-            .map(|binding| binding.owner)
-            .unwrap_or(0);
-        // A zero handle is the null pointer, which `retain_object_detached`
-        // rejects, yielding `None`.
-        let owner = host.retain_object_detached(handle as *mut c_void).ok();
-        let result: Result<(), String> = match &owner {
+    for event in ready {
+        let id = event.id;
+        // The queued event's source retention keeps the trigger alive across
+        // the call; the event entry is dropped after dispatch, releasing it.
+        let result: Result<(), String> = match &event.owner {
             Some(owner) => host.call_member(owner.raw_id(), "onFire", &[]).map(|_| ()),
-            // Reference-equivalent fallback for an owner that could not be
-            // retained: run the native `onFire` body, i.e. the action with
-            // its event dictionary (no `target`, the object is unavailable).
+            // Reference-equivalent fallback for an event whose source could
+            // not be retained: run the native `onFire` body, i.e. the action
+            // with its event dictionary (no `target`, the object is
+            // unavailable).
             None => invoke_action(host, services, id, std::ptr::null_mut())
                 .map_err(|error| error.to_string()),
         };
