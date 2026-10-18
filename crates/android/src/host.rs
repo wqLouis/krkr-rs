@@ -85,6 +85,25 @@ impl AndroidHost {
         Flow::Exit
     }
 
+    /// Resizes the running game's framebuffer and queues the script-visible
+    /// resize event.
+    ///
+    /// The engine resizes the surface only; the VM learns about the new size as
+    /// a script event, like the reference window posting `onResize`
+    /// (`reference/cpp/core/visual/WindowIntf.cpp:302-310`). A failed resize
+    /// queues nothing, so the VM never sees a size the surface does not have.
+    fn resize_window(&mut self, size: (u32, u32)) -> Result<(), String> {
+        let Some(game) = self.running.as_mut() else {
+            return Ok(());
+        };
+        game.host_mut()
+            .resize(size)
+            .map_err(|error| format!("resize failed: {error}"))?;
+        self.pending_events
+            .push(PlatformEvent::Resized(size.0, size.1));
+        Ok(())
+    }
+
     /// Delivers a translated input event through the normal event path.
     pub(crate) fn send_input(&mut self, input: platform::InputEvent) {
         let _ = self.event(PlatformEvent::Input(input));
@@ -171,20 +190,10 @@ impl EventHandler for AndroidHost {
 
     fn event(&mut self, event: PlatformEvent) -> Flow {
         match event {
-            PlatformEvent::Resized(width, height) => {
-                // The resize error borrows the running game; build the message
-                // first so the terminal failure can be recorded afterwards.
-                let failure = self.running.as_mut().and_then(|game| {
-                    game.host_mut()
-                        .resize((width, height))
-                        .err()
-                        .map(|error| format!("resize failed: {error}"))
-                });
-                match failure {
-                    Some(message) => self.fail(message),
-                    None => Flow::Continue,
-                }
-            }
+            PlatformEvent::Resized(width, height) => match self.resize_window((width, height)) {
+                Ok(()) => Flow::Continue,
+                Err(message) => self.fail(message),
+            },
             // Input and sizes are physical, so the density value needs no host
             // action; the accompanying physical resize carries the new size.
             PlatformEvent::ScaleFactorChanged(_scale) => Flow::Continue,

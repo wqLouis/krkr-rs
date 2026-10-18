@@ -131,8 +131,17 @@ pub struct PlatformConfig {
     /// Initial window size in logical pixels (DPI-scaled by the backend).
     ///
     /// The surface size actually created is reported physically through
-    /// [`PlatformEvent::Resized`] and `PlatformWindow::size`.
+    /// [`PlatformEvent::Resized`] and `PlatformWindow::size`. Ignored when
+    /// [`PlatformConfig::size_from_display`] is set.
     pub size: (u32, u32),
+    /// Open the window at the display's physical size instead of
+    /// [`PlatformConfig::size`].
+    ///
+    /// The primary monitor's physical size is used; a backend that reports no
+    /// primary monitor (Wayland always does) falls back to the first available
+    /// monitor, and a backend that reports no monitor at all falls back to the
+    /// configured logical size.
+    pub size_from_display: bool,
     /// Target interval between frames.
     ///
     /// A zero interval is normalized up by [`Ticker::new`] so the loop cannot
@@ -145,6 +154,7 @@ impl Default for PlatformConfig {
         Self {
             title: "krkr-rs".to_owned(),
             size: (1280, 720),
+            size_from_display: false,
             frame_interval: Duration::from_millis(16),
         }
     }

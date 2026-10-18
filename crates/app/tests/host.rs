@@ -8,6 +8,7 @@ mod common;
 use std::sync::{Mutex, MutexGuard};
 
 use api::host::SurfaceEvent;
+use app::{Host, HostConfig};
 use common::{build_solid_and_bitmap_scene, headless_host};
 use tjs::TjsValue;
 use vm::VmHost;
@@ -198,6 +199,53 @@ fn a_script_window_resize_is_surfaced_once() {
     let translation = host.translation().expect("fittable sizes");
     assert_eq!(translation.vm_size, (400, 300));
     assert_eq!(translation.device_size, (1280, 720));
+}
+
+/// A launcher-forced VM size is the size the scene presents at: the scene
+/// carries it, the game's window is held at it, and the presentation fits it
+/// into the framebuffer. A forced size never asks the OS window to change,
+/// because the launcher already chose it (the D40 extension).
+#[test]
+fn a_forced_vm_size_holds_the_scene_window() {
+    let config = HostConfig::headless().with_vm_size(Some((1920, 1080)));
+    let mut host = Host::new(config).expect("headless host");
+    assert_eq!(
+        host.scene().forced_window_size,
+        Some((1920, 1080)),
+        "the engine carries the forced size into the scene"
+    );
+
+    let window = build_solid_and_bitmap_scene(host.scene_mut());
+    host.step(16.0).expect("step");
+
+    // The window the game created at its own size is forced to the launcher's.
+    assert_eq!(
+        host.scene().window(window).expect("window").inner_size,
+        (1920, 1080)
+    );
+    assert_eq!(host.vm_size(), (1920, 1080));
+    assert_eq!(
+        host.take_window_resize(),
+        None,
+        "a forced size asks for nothing"
+    );
+
+    let translation = host.translation().expect("fittable sizes");
+    assert_eq!(translation.vm_size, (1920, 1080));
+    assert_eq!(translation.device_size, (1280, 720));
+}
+
+/// A zero VM dimension is a typed configuration error: an empty surface has no
+/// uniform fit, so no size is substituted for it.
+#[test]
+fn a_zero_vm_size_is_a_typed_error() {
+    for size in [(0, 720), (1280, 0), (0, 0)] {
+        let config = HostConfig::headless().with_vm_size(Some(size));
+        assert!(
+            matches!(Host::new(config), Err(app::HostError::Config(_))),
+            "accepted a zero VM dimension in {size:?}"
+        );
+    }
 }
 
 /// Boots the production composition root and confirms it installs the

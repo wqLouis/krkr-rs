@@ -1,7 +1,7 @@
 //! `krkr` CLI: headless frame runner and windowed desktop frontend.
 //!
 //! ```text
-//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--preload-archives] [--archive XP3 ...] [--base-dir DIR] [GAME]
+//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--vm-size WxH|display] [--preload-archives] [--archive XP3 ...] [--base-dir DIR] [GAME]
 //! ```
 //!
 //! * `--headless` runs an empty scene for `N` frames (default 120) through
@@ -30,6 +30,13 @@
 //! * `--debug-overlay` draws the frame rate and the process's resident memory
 //!   in the top-left corner. It is a render-only node (never a script-visible
 //!   layer or bitmap) and off by default.
+//! * `--vm-size WxH|display` chooses the VM (script-visible) surface size.
+//!   `WxH` forces it (both dimensions must be greater than zero): the scene
+//!   window and primary layer are held at that size and a script resize is
+//!   ignored, while the framebuffer still fits it. `display` (also `window`,
+//!   `native`) uses the primary monitor's physical size, falling back to the
+//!   first available monitor; a headless run uses its configured offscreen
+//!   size. Without the flag the VM size follows the game's own window size.
 //! * `--backend vulkan` requests the Vulkan pipeline. It needs a real
 //!   window with a display connection (Wayland/X11/XCB); the windowed host
 //!   passes both the window and display handle so a surface can be created.
@@ -51,7 +58,7 @@ use std::process::ExitCode;
 use api::config::{
     ConfigError, FrameRateLimit, RuntimeConfig, RuntimeConfigOverrides, parse_overrides,
 };
-use app::{BackendKind, GameInput, Launch, RunMode};
+use app::{BackendKind, GameInput, Launch, RunMode, VmSize};
 
 /// One documented launch option.
 struct OptionDoc {
@@ -92,6 +99,11 @@ const OPTIONS: &[OptionDoc] = &[
         flag: "--preload-archives",
         value: "",
         help: "Read every mounted archive into memory at mount, trading its size in resident memory for per-entry reads.",
+    },
+    OptionDoc {
+        flag: "--vm-size",
+        value: "WxH|display",
+        help: "VM (script-visible) surface size: force WxH, or use the display's physical size (default: the game's window size).",
     },
     OptionDoc {
         flag: "--debug-overlay",
@@ -151,6 +163,9 @@ struct Cli {
     preload_archives: Option<bool>,
     /// Whether `--debug-overlay` was given.
     debug_overlay: Option<bool>,
+    /// The VM surface size `--vm-size` asked for, or `None` to follow the
+    /// game's window size.
+    vm_size: Option<VmSize>,
     /// Explicit `--archive` list, in mount order (later wins).
     archives: Vec<PathBuf>,
     /// App path override (`--base-dir`); defaults to the current directory.
@@ -186,6 +201,7 @@ impl Cli {
             frame_rate: None,
             preload_archives: None,
             debug_overlay: None,
+            vm_size: None,
             archives: Vec::new(),
             base_dir: None,
             positional: None,
@@ -217,6 +233,12 @@ impl Cli {
                 }
                 "--preload-archives" => cli.preload_archives = Some(true),
                 "--debug-overlay" => cli.debug_overlay = Some(true),
+                "--vm-size" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| CliError::Usage("--vm-size requires a value".to_owned()))?;
+                    cli.vm_size = Some(parse_vm_size(&value)?);
+                }
                 "--archive" => {
                     let value = args
                         .next()
@@ -254,6 +276,45 @@ fn parse_backend(value: &str) -> Result<BackendKind, String> {
             "unknown backend '{other}' (expected 'null' or 'vulkan')"
         )),
     }
+}
+
+/// Maps a `--vm-size` value to [`VmSize`].
+///
+/// `WxH` forces the VM surface to that resolution; both dimensions must be
+/// greater than zero, because an empty surface has no uniform fit. `display`
+/// (and its `window`/`native` aliases) asks for the display's physical size.
+/// Any other spelling is a usage error, never a default.
+fn parse_vm_size(value: &str) -> Result<VmSize, CliError> {
+    if matches!(value, "display" | "window" | "native") {
+        return Ok(VmSize::Display);
+    }
+    let (width, height) = value
+        .split_once('x')
+        .or_else(|| value.split_once('X'))
+        .ok_or_else(|| {
+            CliError::Usage(format!(
+                "invalid --vm-size '{value}' (expected WIDTHxHEIGHT, or 'display')"
+            ))
+        })?;
+    Ok(VmSize::Size((
+        vm_dimension(value, width)?,
+        vm_dimension(value, height)?,
+    )))
+}
+
+/// Parses one axis of a `--vm-size` value, rejecting zero and non-numbers.
+fn vm_dimension(value: &str, axis: &str) -> Result<u32, CliError> {
+    let dimension: u32 = axis.parse().map_err(|_| {
+        CliError::Usage(format!(
+            "invalid --vm-size '{value}' (expected WIDTHxHEIGHT with positive integers)"
+        ))
+    })?;
+    if dimension == 0 {
+        return Err(CliError::Usage(format!(
+            "invalid --vm-size '{value}': WIDTH and HEIGHT must be greater than zero"
+        )));
+    }
+    Ok(dimension)
 }
 
 /// Environment variable naming the desktop configuration file.
@@ -358,6 +419,7 @@ fn main() -> ExitCode {
         runtime,
         backend: cli.backend,
         game,
+        vm_size: cli.vm_size,
         mode: if cli.headless {
             RunMode::Headless { frames: cli.frames }
         } else {
@@ -503,6 +565,45 @@ mod tests {
                 .debug_overlay,
             Some(true)
         );
+    }
+
+    #[test]
+    fn parse_vm_size_accepts_a_resolution_or_the_display() {
+        assert_eq!(parse(&["--headless"]).expect("parse").vm_size, None);
+        assert_eq!(
+            parse(&["--vm-size", "1920x1080"]).expect("parse").vm_size,
+            Some(VmSize::Size((1920, 1080)))
+        );
+        // Uppercase `X` is accepted as the separator.
+        assert_eq!(
+            parse(&["--vm-size", "640X480"]).expect("parse").vm_size,
+            Some(VmSize::Size((640, 480)))
+        );
+        for alias in ["display", "window", "native"] {
+            assert_eq!(
+                parse(&["--vm-size", alias]).expect("parse").vm_size,
+                Some(VmSize::Display),
+                "{alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_vm_size_rejects_zero_and_malformed_values() {
+        for args in [
+            &["--vm-size"][..],
+            &["--vm-size", "0x720"],
+            &["--vm-size", "1920x0"],
+            &["--vm-size", "0x0"],
+            &["--vm-size", "1920"],
+            &["--vm-size", "1920x"],
+            &["--vm-size", "abc"],
+            &["--vm-size", "axb"],
+            &["--vm-size", "-1x720"],
+            &["--vm-size", "1920x1080x2"],
+        ] {
+            assert!(parse(args).is_err(), "accepted {args:?}");
+        }
     }
 
     #[test]

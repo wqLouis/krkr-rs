@@ -482,6 +482,16 @@ impl Engine {
         if translation != self.translation {
             self.translation = translation;
             self.render_scene_revision = None;
+            if let Some(translation) = translation {
+                log::info!(
+                    "presentation: VM {}x{} -> framebuffer {}x{} (scale {:.3})",
+                    translation.vm_size.0,
+                    translation.vm_size.1,
+                    translation.device_size.0,
+                    translation.device_size.1,
+                    translation.scale
+                );
+            }
         }
 
         if self.last_vm_size != Some(vm_size) {

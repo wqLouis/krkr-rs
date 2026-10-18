@@ -50,7 +50,7 @@ pub use render::{BackendKind, FrameStats};
 // The emulator entry point. A launcher resolves `Launch` (including the
 // `RuntimeConfig` it loaded its own way) and calls `run`; see the `runner`
 // module for the entry point contract.
-pub use runner::{GameInput, Launch, RunMode, RunReport, run};
+pub use runner::{GameInput, Launch, RunMode, RunReport, VmSize, run};
 pub use video::install_video_source;
 pub(crate) use video::install_video_source_metered;
 pub use window_ex::install_window_ex_facts;
@@ -136,6 +136,14 @@ pub struct HostConfig {
     /// The overlay is a render-only node: it is never a script-visible layer
     /// or bitmap, so it cannot change the scene a script observes.
     pub debug_overlay: bool,
+    /// The VM (script-visible) surface size to force, or `None` to let the
+    /// scene window's client size be the VM size.
+    ///
+    /// A forced size is presented at that resolution whatever the framebuffer
+    /// is, and the scene window and its primary layer are held at it, so a
+    /// script resize cannot change it. Either dimension must be non-zero;
+    /// [`Host::new`] reports [`HostError::Config`] otherwise.
+    pub vm_size: Option<(u32, u32)>,
 }
 
 impl Default for HostConfig {
@@ -149,6 +157,7 @@ impl Default for HostConfig {
             window_handle: None,
             display_handle: None,
             debug_overlay: false,
+            vm_size: None,
         }
     }
 }
@@ -194,6 +203,12 @@ impl HostConfig {
         self.debug_overlay = debug_overlay;
         self
     }
+
+    /// Returns this configuration with a forced VM surface size.
+    pub fn with_vm_size(mut self, vm_size: Option<(u32, u32)>) -> Self {
+        self.vm_size = vm_size;
+        self
+    }
 }
 
 /// The assembled host: the middle-layer engine plus the stateless services
@@ -229,11 +244,14 @@ impl Host {
     ///
     /// # Errors
     ///
-    /// Returns [`HostError::Render`] when the requested backend cannot be
-    /// created or when surface creation fails. A `--backend vulkan` host
-    /// reports [`RenderError::Unsupported`] for a backend this build does not
-    /// implement, and [`RenderError::DeviceUnavailable`] when the Vulkan
-    /// loader, instance or device cannot be brought up.
+    /// Returns [`HostError::Config`] for a headless configuration with a real
+    /// backend, for a non-headless one with no window handle, and for a forced
+    /// VM size with a zero dimension. Returns [`HostError::Render`] when the
+    /// requested backend cannot be created or when surface creation fails. A
+    /// `--backend vulkan` host reports [`RenderError::Unsupported`] for a
+    /// backend this build does not implement, and
+    /// [`RenderError::DeviceUnavailable`] when the Vulkan loader, instance or
+    /// device cannot be brought up.
     pub fn new(config: HostConfig) -> Result<Self, HostError> {
         let pipeline = create_render_pipeline(PipelineConfig {
             backend: config.backend,
@@ -275,7 +293,7 @@ impl Host {
             surface,
             render_state,
             surface_size: config.surface_size,
-            vm_size: None,
+            vm_size: config.vm_size,
             headless: config.headless,
             overlay: overlay.map(|overlay| Box::new(overlay) as Box<dyn engine::EngineOverlay>),
         })?;
