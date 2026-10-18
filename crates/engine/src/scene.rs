@@ -1245,31 +1245,28 @@ impl Scene {
 
     /// Reference `tTJSNI_BaseLayer::Invalidate` (`LayerIntf.cpp:515`): the
     /// explicit native teardown the script triggers with `invalidate layer`.
-    /// This is the **cycle breaker**: it detaches the layer from its window
-    /// and parent, parts each direct child (the children become window roots
-    /// and stay alive — the script's reference counts decide their fate),
-    /// and releases the resources the layer owns (MainImage, province plane,
-    /// font, primary slot).
+    /// This is the **cycle breaker**: it destroys the layer and its whole
+    /// child subtree, releasing the MainImage, province plane, font, primary
+    /// slot and focus registration of every record in the subtree.
     ///
-    /// The layer is fully unregistered from the scene here — the reference's
-    /// `Manager->UnregisterSelfFromWindow()` / `Manager->Release()` leave it
-    /// detached and inert, and the script has already invalidated it. The
-    /// later [`Scene::destroy_layer`] (when the TJS reference count finally
-    /// drops) is then a no-op. This is [`Scene::remove_layer`]'s `Part()`
-    /// semantics — it must **not** recurse into the child subtree. Keeping
-    /// the inert record instead let invalidated scenes accumulate forever
-    /// (their TJS objects are retained by script state).
+    /// A native `Invalidate` is final (`LayerIntf.cpp:515-566`): the
+    /// reference severs each child (`Part`) and releases the parent's
+    /// `Children` array, so the children are destroyed with the parent. The
+    /// port has no TJS child array to release, so it removes the subtree
+    /// directly; leaving detached children in `Scene::layers` is what made a
+    /// repeatedly opened config page grow without bound. Explicit `Part()`
+    /// remains [`Scene::remove_layer`], which keeps the children.
     pub fn invalidate_layer(&mut self, id: u32) {
         if self.layer(id).is_none() {
             return;
         }
         // Mark it inert first so a re-entrant query cannot touch it while the
-        // tree is being parted.
+        // subtree is collected.
         if let Some(l) = self.layer_mut(id) {
             l.shutdown = true;
             l.pending_paint = false;
         }
-        self.remove_layer(id);
+        self.destroy_layer(id);
     }
 
     /// Drop a font record and rebuild the id→index map.

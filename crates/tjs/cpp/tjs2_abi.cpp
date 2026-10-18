@@ -1843,11 +1843,10 @@ static int exec_script_decoded(tjs2_engine *e, std::u16string s,
         if(out_result) {
             variant_to_value(e, result, out_result);
         } else if(e->inner->GetVariantArrayStack()) {
-            // ExecScript can still leave the last expression's value in a
-            // register slot of the variant-array stack, where it stays alive
-            // until something compacts the stack. Clear those slots now (the
-            // same `Compact()` `tjs2_do_gc` performs) so a discarded object
-            // result cannot stay rooted.
+            // A null result slot stops the VM materialising a result value,
+            // but ExecScript can still leave the last expression in a
+            // register slot of the variant-array stack. Clear those slots now
+            // so a discarded object cannot stay rooted.
             e->inner->GetVariantArrayStack()->Compact();
         }
         if(out_error)

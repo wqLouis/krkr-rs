@@ -53,7 +53,7 @@ impl Env {
 
     fn run(&self, script: &str) {
         self.engine
-            .exec_script(script, "layer-ex-test")
+            .exec_script_discard(script, "layer-ex-test")
             .unwrap_or_else(|error| panic!("exec {script:?} failed: {error}"));
     }
 
@@ -354,7 +354,7 @@ impl FontEnv {
 
     fn run(&self, script: &str) {
         self.engine
-            .exec_script(script, "layer-ex-test")
+            .exec_script_discard(script, "layer-ex-test")
             .unwrap_or_else(|error| panic!("exec {script:?} failed: {error}"));
     }
 
