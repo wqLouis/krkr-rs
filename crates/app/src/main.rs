@@ -27,9 +27,10 @@
 //!   mounts, trading the archive's size in resident memory for never reading it
 //!   back from storage. Off by default; entries return the same bytes either
 //!   way.
-//! * `--debug-overlay` draws frame rate, CPU usage, disk I/O, resident memory
-//!   and live object counts in the top-left corner. It is a render-only node
-//!   (never a script-visible layer or bitmap) and off by default.
+//! * `--debug-overlay` draws frame rate and its 1% low, CPU usage, disk I/O,
+//!   resident memory and live object counts in the top-left corner. It is a
+//!   render-only node (never a script-visible layer or bitmap) and off by
+//!   default.
 //! * `--backend vulkan` requests the Vulkan pipeline. It needs a real
 //!   window with a display connection (Wayland/X11/XCB); the windowed host
 //!   passes both the window and display handle so a surface can be created.
@@ -96,7 +97,7 @@ const OPTIONS: &[OptionDoc] = &[
     OptionDoc {
         flag: "--debug-overlay",
         value: "",
-        help: "Draw FPS, CPU, disk I/O, memory and object counts in the top-left corner.",
+        help: "Draw FPS/1% low, CPU, disk I/O, memory and object counts in the top-left corner.",
     },
     OptionDoc {
         flag: "--archive",

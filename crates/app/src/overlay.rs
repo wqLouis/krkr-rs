@@ -1,5 +1,5 @@
-//! Debug overlay: frame rate, host usage and live object counts drawn as a
-//! render-only node.
+//! Debug overlay: frame rate with its rolling 1% low, process CPU, storage I/O,
+//! resident memory and live object counts drawn as a render-only node.
 //!
 //! The overlay is **not** part of the engine [`Scene`](engine::scene::Scene) and
 //! owns no `Bitmap` a script can reach. It builds a small RGBA panel in memory,
@@ -22,11 +22,13 @@ use render::{
     upload_texture,
 };
 
+use std::collections::VecDeque;
+
 /// Panel width in pixels.
 ///
 /// It is wide enough for the longest line [`format_lines`] can produce: the
 /// five object counts plus the `OBJ W… L… B… F… T…` labels fit at the glyph
-/// scale, with room for a large frame rate and utilization figure.
+/// scale, with room for the frame rate and its 1% low.
 const PANEL_WIDTH: u32 = 400;
 
 /// Panel height in pixels: five text lines plus padding.
@@ -59,11 +61,8 @@ const TEXT_COLOR: [u8; 4] = [255, 255, 255, 255];
 /// Milliseconds between panel refreshes (four times a second).
 const REFRESH_INTERVAL_MS: f64 = 250.0;
 
-/// Frame rate below which the FPS line is marked and coloured as low.
-const LOW_FPS_THRESHOLD: f64 = 30.0;
-
-/// Low-frame-rate text.
-const LOW_COLOR: [u8; 4] = [255, 96, 96, 255];
+/// Frames kept for the rolling 1% low.
+const FRAME_HISTORY: usize = 10_000;
 
 /// Sibling sort key that keeps the overlay above every projected layer.
 const OVERLAY_Z: i32 = i32::MAX;
@@ -86,6 +85,10 @@ pub(crate) struct Overlay {
     texture: Texture,
     /// Frames stepped since the last panel refresh.
     frames: u32,
+    /// The frame clock at the previous tick, or `None` before the first one.
+    last_tick_ms: Option<f64>,
+    /// Recent frame times in milliseconds, oldest first.
+    frame_times: VecDeque<f64>,
     /// Host elapsed time of the last refresh, or `None` before the first one.
     last_refresh_ms: Option<f64>,
     /// Counters observed at the previous refresh, for rate calculation.
@@ -106,6 +109,8 @@ impl Overlay {
         Ok(Self {
             texture,
             frames: 0,
+            last_tick_ms: None,
+            frame_times: VecDeque::with_capacity(FRAME_HISTORY),
             last_refresh_ms: None,
             last_sample: None,
         })
@@ -131,6 +136,16 @@ impl Overlay {
         host: HostMetrics,
     ) -> Result<(), OverlayError> {
         self.frames = self.frames.saturating_add(1);
+        if let Some(last) = self.last_tick_ms {
+            let delta = now_ms - last;
+            if delta > 0.0 {
+                self.frame_times.push_back(delta);
+                if self.frame_times.len() > FRAME_HISTORY {
+                    self.frame_times.pop_front();
+                }
+            }
+        }
+        self.last_tick_ms = Some(now_ms);
         let due = match self.last_refresh_ms {
             Some(last) => now_ms - last >= REFRESH_INTERVAL_MS,
             None => true,
@@ -151,12 +166,11 @@ impl Overlay {
         };
 
         let previous = self.last_sample;
-        let cpu_percent = match (previous.and_then(|sample| sample.cpu_ns), host.cpu_ns) {
-            (Some(previous), Some(current)) if current >= previous && elapsed_s > 0.0 => {
-                Some((current - previous) as f64 / elapsed_s / 1_000_000.0 * 100.0)
-            }
-            _ => None,
-        };
+        let cpu_percent = cpu_percent(
+            previous.and_then(|sample| sample.cpu_ns),
+            host.cpu_ns,
+            elapsed_s,
+        );
         let (io_read_per_s, io_write_per_s) = match (previous.and_then(|sample| sample.io), host.io)
         {
             (Some(previous), Some(current))
@@ -174,22 +188,17 @@ impl Overlay {
 
         let stats = OverlayStats {
             fps,
+            one_percent_low_fps: one_percent_low_fps(&self.frame_times),
             cpu_percent,
             io_read_per_s,
             io_write_per_s,
             rss: host.rss,
             objects,
         };
-        let low_fps = fps < LOW_FPS_THRESHOLD;
         let mut panel = Panel::filled(PANEL_COLOR);
         let mut y = TEXT_TOP;
-        for (index, line) in format_lines(&stats).iter().enumerate() {
-            let color = if index == 0 && low_fps {
-                LOW_COLOR
-            } else {
-                TEXT_COLOR
-            };
-            draw_text_color(&mut panel, TEXT_LEFT, y, line, color)?;
+        for line in format_lines(&stats) {
+            draw_text_color(&mut panel, TEXT_LEFT, y, &line, TEXT_COLOR)?;
             y += (GLYPH_HEIGHT + LINE_GAP) * CELL_SCALE;
         }
         upload_texture(
@@ -283,6 +292,8 @@ impl Panel {
 struct OverlayStats {
     /// Frames per second over the refresh interval.
     fps: f64,
+    /// Average FPS of the slowest 1% of recent frame times.
+    one_percent_low_fps: Option<f64>,
     /// Process CPU usage in percent of one core; may exceed 100.
     cpu_percent: Option<f64>,
     /// Storage read rate in bytes per second.
@@ -315,13 +326,41 @@ struct HostMetrics {
     io: Option<ProcessIo>,
 }
 
+/// Returns process CPU usage as a percentage of one fully used core.
+///
+/// Both counters are cumulative runtimes in nanoseconds, so their difference
+/// divided by the `elapsed_s` seconds between the samples is the number of
+/// cores that were busy over the interval: one saturated core is `100`, two
+/// are `200`, half a core is `50`. A missing counter, a counter that went
+/// backwards (a reset), or a non-positive interval is `None`, which the panel
+/// shows as `?`.
+fn cpu_percent(previous_ns: Option<u64>, current_ns: Option<u64>, elapsed_s: f64) -> Option<f64> {
+    let delta_ns = current_ns?.checked_sub(previous_ns?)?;
+    if elapsed_s <= 0.0 || !elapsed_s.is_finite() {
+        return None;
+    }
+    Some(delta_ns as f64 / elapsed_s / 1_000_000_000.0 * 100.0)
+}
+
+/// Returns the average FPS of the slowest 1% of `frame_times`.
+fn one_percent_low_fps(frame_times: &VecDeque<f64>) -> Option<f64> {
+    if frame_times.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<f64> = frame_times.iter().copied().collect();
+    sorted.sort_by(|left, right| right.total_cmp(left));
+    let count = (sorted.len() / 100).max(1);
+    let slowest = sorted.get(..count)?;
+    let average_ms = slowest.iter().sum::<f64>() / count as f64;
+    (average_ms > 0.0).then_some(1000.0 / average_ms)
+}
+
 /// Formats the overlay's lines for one refresh.
 fn format_lines(stats: &OverlayStats) -> Vec<String> {
-    let mut lines = vec![if stats.fps < LOW_FPS_THRESHOLD {
-        format!("FPS {:.1} LOW", stats.fps)
-    } else {
-        format!("FPS {:.1}", stats.fps)
-    }];
+    let one_percent = stats
+        .one_percent_low_fps
+        .map_or_else(|| "?".to_owned(), |fps| format!("{fps:.1}"));
+    let mut lines = vec![format!("FPS {:.1} 1% {one_percent}", stats.fps)];
     lines.push(format!(
         "CPU {}",
         format_percent(stats.cpu_percent.map(|value| value as f32))
@@ -617,6 +656,7 @@ mod tests {
     fn stats() -> OverlayStats {
         OverlayStats {
             fps: 60.0,
+            one_percent_low_fps: Some(45.2),
             cpu_percent: Some(12.4),
             io_read_per_s: Some(1.5 * 1024.0 * 1024.0),
             io_write_per_s: Some(0.0),
@@ -636,7 +676,7 @@ mod tests {
         assert_eq!(
             format_lines(&stats()),
             vec![
-                "FPS 60.0",
+                "FPS 60.0 1% 45.2",
                 "CPU 12%",
                 "IO R 1.5M W 0",
                 "MEM 256M",
@@ -645,21 +685,63 @@ mod tests {
         );
     }
 
+    /// One saturated core for one second is 100%: the delta is nanoseconds, so
+    /// it converts through 1e9 ns per second.
     #[test]
-    fn marks_low_frame_rates() {
-        let mut stats = stats();
-        stats.fps = LOW_FPS_THRESHOLD - 1.0;
-        assert_eq!(format_lines(&stats)[0], "FPS 29.0 LOW");
+    fn cpu_percentage_is_a_fraction_of_one_core() {
+        assert_eq!(cpu_percent(Some(0), Some(1_000_000_000), 1.0), Some(100.0));
+        assert_eq!(cpu_percent(Some(0), Some(2_000_000_000), 1.0), Some(200.0));
+        assert_eq!(cpu_percent(Some(0), Some(500_000_000), 1.0), Some(50.0));
+        assert_eq!(
+            cpu_percent(Some(1_000_000_000), Some(1_500_000_000), 1.0),
+            Some(50.0)
+        );
+        assert_eq!(cpu_percent(Some(0), Some(1_000_000_000), 2.0), Some(50.0));
+    }
+
+    #[test]
+    fn cpu_percentage_is_unknown_without_a_valid_interval() {
+        assert_eq!(cpu_percent(None, Some(1_000_000_000), 1.0), None);
+        assert_eq!(cpu_percent(Some(0), None, 1.0), None);
+        assert_eq!(cpu_percent(Some(1_000), Some(999), 1.0), None);
+        assert_eq!(cpu_percent(Some(0), Some(1_000), 0.0), None);
+        assert_eq!(cpu_percent(Some(0), Some(1_000), -1.0), None);
+        assert_eq!(cpu_percent(Some(0), Some(1_000), f64::NAN), None);
+    }
+
+    #[test]
+    fn one_percent_low_averages_the_slowest_hundredth() {
+        let mut frame_times = VecDeque::new();
+        for _ in 0..99 {
+            frame_times.push_back(10.0);
+        }
+        frame_times.push_back(100.0);
+        // 100 frames, 1% is the single slowest frame.
+        let low = one_percent_low_fps(&frame_times).expect("low value");
+        assert!((low - 10.0).abs() < 1e-9, "got {low}");
+        assert_eq!(one_percent_low_fps(&VecDeque::new()), None);
+
+        let mut wide = VecDeque::new();
+        for _ in 0..198 {
+            wide.push_back(10.0);
+        }
+        wide.push_back(20.0);
+        wide.push_back(100.0);
+        // 200 frames, 1% is the two slowest frames: (100 + 20) / 2 ms.
+        let low = one_percent_low_fps(&wide).expect("low value");
+        assert!((low - 1000.0 / 60.0).abs() < 1e-9, "got {low}");
     }
 
     #[test]
     fn unavailable_metrics_are_question_marks() {
         let mut stats = stats();
         stats.cpu_percent = None;
+        stats.one_percent_low_fps = None;
         stats.io_read_per_s = None;
         stats.io_write_per_s = None;
         stats.rss = None;
         let lines = format_lines(&stats);
+        assert_eq!(lines[0], "FPS 60.0 1% ?");
         assert_eq!(lines[1], "CPU ?");
         assert_eq!(lines[2], "IO R ? W ?");
         assert!(!lines.iter().any(|line| line.starts_with("MEM")));
