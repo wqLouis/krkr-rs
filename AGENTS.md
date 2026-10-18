@@ -27,7 +27,7 @@ uv run --project scripts krkr-gate gate
 
 `krkr-gate gate` runs the ordered **static** gate: `cargo fmt --all -- --check`;
 the `stateless`, `error-handling`, `house-style`, `layering`, `storage-boundary`,
-`native-construction`,
+`native-construction`, `lifecycle-order`,
 `storage-media`,
 `callback-objthis`
 checks;
@@ -53,6 +53,7 @@ uv run --project scripts krkr-gate house-style
 uv run --project scripts krkr-gate layering
 uv run --project scripts krkr-gate storage-boundary
 uv run --project scripts krkr-gate native-construction
+uv run --project scripts krkr-gate lifecycle-order
 uv run --project scripts krkr-gate storage-media
 uv run --project scripts krkr-gate callback-objthis
 uv run --project scripts krkr-gate host-facts

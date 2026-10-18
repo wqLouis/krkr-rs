@@ -107,8 +107,7 @@ fn window_layer_order_finds_children_missing_from_parent_list() {
 /// the window, on the theory that a stale parent link should not hide a
 /// layer. In practice it silently defeated `Part()` and `invalidate`: a
 /// detached (invalidated) subtree was re-added to the draw order every
-/// frame, which is what kept KAG's config window on screen after leaving the
-/// settings page.
+/// frame, which is what kept a settings page on screen after leaving it.
 #[test]
 fn window_layer_order_skips_layers_the_window_does_not_own() {
     let mut scene = Scene::default();

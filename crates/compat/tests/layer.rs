@@ -1028,17 +1028,17 @@ fn subclass_member_writes_before_the_base_constructor_land() {
     );
 }
 
-/// Repeated open/close cycles of a config-page-style layer tree must release
-/// every layer, bitmap and font the page created. The reference native
+/// Repeated create/invalidate/drop cycles of a parent layer tree must release
+/// every layer, bitmap and font the tree created. The reference native
 /// instance keeps only a non-owning owner pointer (`iTJSDispatch2 *Owner`,
 /// `reference/cpp/core/visual/LayerIntf.h:173`) and `Invalidate` releases the
-/// page's resources (`reference/cpp/core/visual/LayerIntf.cpp:515-566`), so a
-/// page whose script reference is dropped reaches reference count zero and
-/// its native teardown runs. A strong L3 registry entry prevented that: the
-/// page stayed rooted, the destroy callback never ran, and `scene.layers`
-/// grew with every cycle.
+/// parent's resources (`reference/cpp/core/visual/LayerIntf.cpp:515-566`), so
+/// a parent whose script reference is dropped reaches reference count zero
+/// and its native teardown runs. A strong L3 registry entry prevented that:
+/// the parent stayed rooted, the destroy callback never ran, and
+/// `scene.layers` grew with every cycle.
 #[test]
-fn repeated_page_cycles_release_layers_bitmaps_and_fonts() {
+fn repeated_parent_layer_cycles_release_layers_bitmaps_and_fonts() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run("var w = new Window();");
@@ -1072,26 +1072,26 @@ fn repeated_page_cycles_release_layers_bitmaps_and_fonts() {
     assert_eq!(
         env.scene.layers.len(),
         baseline_layers,
-        "a closed config page must not leave its layer tree in the scene"
+        "an invalidated parent must not leave its layer tree in the scene"
     );
     assert_eq!(
         env.scene.bitmaps.len(),
         baseline_bitmaps,
-        "a closed config page must not leave its bitmaps in the scene"
+        "an invalidated parent must not leave its bitmaps in the scene"
     );
     assert_eq!(
         env.scene.fonts.len(),
         baseline_fonts,
-        "a closed config page must not leave its fonts in the scene"
+        "an invalidated parent must not leave its fonts in the scene"
     );
 }
 
-/// Invalidating a page layer destroys its child Scene records; the child
+/// Invalidating a parent layer removes its child Scene records; the child
 /// script objects may still be referenced by script arrays, so their cached
 /// `Font` wrappers must be released rather than staying in the engine's
 /// retained map.
 #[test]
-fn invalidating_a_parent_page_releases_child_font_wrappers() {
+fn invalidating_a_parent_layer_releases_child_font_wrappers() {
     let _lock = vm_lock();
     let env = Env::new();
     let baseline = env.engine.retained_count();
@@ -1111,7 +1111,7 @@ fn invalidating_a_parent_page_releases_child_font_wrappers() {
     env.run("System.doCompact();");
     env.engine.do_gc().expect("idle compact");
 
-    assert_eq!(env.scene.layers.len(), 0, "the page subtree is gone");
+    assert_eq!(env.scene.layers.len(), 0, "the parent subtree is gone");
     assert!(
         env.engine.retained_count() <= baseline + 1,
         "child font wrappers must not stay retained: {} > {}",
@@ -1121,9 +1121,9 @@ fn invalidating_a_parent_page_releases_child_font_wrappers() {
 }
 
 /// A parent invalidation finalizes its direct children while their Scene
-/// records still exist. `SelectItemBase.finalize` writes `cursor`; if the
+/// records still exist. A layer finalizer can write a native property; if the
 /// parent had already removed the child records that write raised
-/// `Layer: layer no longer exists` and aborted `ConfigDelete`.
+/// `Layer: layer no longer exists` and aborted the invalidation.
 #[test]
 fn invalidating_a_parent_finalizes_children_before_removing_their_records() {
     let _lock = vm_lock();

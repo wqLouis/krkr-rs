@@ -1186,11 +1186,10 @@ impl Scene {
         // (`tTVPLayerManager::RecreateOverallOrderIndex`, `LayerManager.cpp:208`),
         // and `NotifyPart` invalidates that index — so a parted layer stops
         // being drawn *and* hit-tested. Registering these children instead made
-        // them fresh top-level window layers, which is what left KAG's config
-        // window with its sliders and buttons stuck on screen after
-        // `invalidate _base[i]`: they were drawn at full opacity, outside the
-        // faded parent, and their scripts then saw `parent == null` and threw
-        // (`SelectItem.tjs` `onButtonLeave`/`onButtonEnter`). A script that
+        // them fresh top-level window layers, which is what left a settings page's controls stuck on screen after
+        // invalidating its page layers: they were drawn at full opacity,
+        // outside the faded parent, and their scripts then saw `parent ==
+        // null` and threw. A script that
         // wants such a layer back re-parents it explicitly, which restores it.
         for child in &children {
             if let Some(cl) = self.layer_mut(*child) {
@@ -2390,8 +2389,8 @@ impl Scene {
         // `LayerManager.cpp:208`), and `NotifyPart` invalidates that index, so a
         // `Part()`ed layer stops being drawn and hit-tested. Adopting every
         // `parent == None` layer made detached, invalidated subtrees render
-        // again as top-level window layers — KAG's config window kept its
-        // sliders and buttons on screen after leaving the page.
+        // again as top-level window layers — a settings page kept its
+        // controls on screen after leaving the page.
         let mut roots: Vec<u32> = window_state
             .layers
             .iter()
@@ -2412,7 +2411,7 @@ impl Scene {
         // **not reachable from the window's roots** — which is the definition of
         // a detached layer. Re-adding those made `Part()` a no-op for rendering:
         // `invalidate` severed a layer's children and this pass put them back on
-        // screen (and back into hit-testing), which is why KAG's config window
+        // screen (and back into hit-testing), which is why a settings page
         // kept its sliders and buttons after `invalidate _base[i]`.
         // A child that is genuinely missing from its parent's `children` list is
         // still found: `all_children` is indexed by the layer's own `parent`

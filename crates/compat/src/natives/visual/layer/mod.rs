@@ -191,8 +191,8 @@ extern "C" fn layer_invalidate(engine: *mut c_void, instance: *mut c_void) {
     };
     // An invalidated layer cannot hand out its cached `Font` object again.
     // Release it now; a script object that outlives the scene record (for
-    // example a config page's input-notify cycle) would otherwise keep the
-    // font retained after every Scene resource is gone.
+    // example an input-notify cycle) would otherwise keep the font retained
+    // after every Scene resource is gone.
     drop(inst.font_object.take());
     let Ok((_resolved, ctx)) = bound(engine) else {
         return;
@@ -211,10 +211,10 @@ extern "C" fn layer_invalidate(engine: *mut c_void, instance: *mut c_void) {
     }
     blur_tree(&ctx, id);
     // Finalize the direct child script objects while their Scene records
-    // still exist. `ConfigWindow.finalize` invalidates its page layers before
-    // the button dictionary, so the pages would otherwise sever the buttons
-    // and leave their script objects to finalize against a missing record
-    // (`SelectItemBase.finalize` writes `cursor`).
+    // still exist. A parent finalizer can invalidate its page layers before
+    // the layer holding its controls, so the pages would otherwise sever the
+    // controls and leave their script objects to finalize against a missing
+    // record (a layer finalizer writes `cursor`).
     let children: Vec<u32> = scene_ref(&ctx)
         .ok()
         .and_then(|scene| scene.layer(id).map(|layer| layer.children.clone()))
