@@ -298,6 +298,9 @@ by the crate that declares it. Errors are values; no panics on bad input.
 
 ## 5. Idiomatic Rust (this codebase's house style)
 
+The detailed review/rewrite checklist is [`docs/code-conduct.md`](docs/code-conduct.md).
+It elaborates this section; if they disagree, this file wins.
+
 - **No OOP bean accessors.** A setter whose body is only `self.field = arg`
   must be a public field. A getter for a public field is deleted. Accessors
   exist only to enforce an invariant or do real work, and are named for the
