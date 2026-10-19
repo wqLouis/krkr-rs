@@ -219,11 +219,15 @@ Landed:
   drive virtual time instead of the wall clock.
 
 Remaining:
-* move the mixer, video and transition pumps from the hook into L2, then retire
-  `SoundState.clock` and pass an L2-owned delta to those pumps;
+* move the mixer (audio pump), video and transition pumps from the hook into
+  L2, then retire `SoundState.clock` and pass an L2-owned delta to those
+  pumps;
 * `Engine::run(clock, hooks)` (platform event pump) — blocked on the loop
   slice;
-* collapse `engine::timer` to D27's four methods and make `advance` private.
+* privatize `TimerState::advance` (the four D27 methods — `create_interval`,
+  `set_interval`, `set_enabled`, `remove` — already exist with no config
+  struct or mode enum; `advance` is the only extra public method and runs
+  inside `Engine::frame`).
 
 Exit criteria for the slice: no code above L2 accumulates a frame clock, and
 `cargo test -p engine -p compat -p app` is green with tests driving

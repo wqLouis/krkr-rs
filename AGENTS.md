@@ -392,7 +392,10 @@ It elaborates this section; if they disagree, this file wins.
 - Prefer explicit values and `&self` actions; avoid hidden `&mut self` state on
   service objects.
 - Parameters: `&str`, `&[T]`, `&mut [T]`, `impl Into<…>`; never `&String`,
-  `&Vec<T>`, or `&Box<T>`.
+  `&Vec<T>`, or `&Box<T>`. A sequence that is only iterated is
+  `impl IntoIterator<Item = …>`, and a sequence result that is only iterated
+  is `impl Iterator<Item = …>`; `&[T]`/`Vec<T>` stay where the slice or buffer
+  itself is the contract (indexing, exact length, FFI).
 - Use `TryFrom`/`checked_*` for narrowing and size math; `From`/`into` for
   widening.
 - Derive what you can (`Default`, `Copy`, `Eq`) and only implement manually

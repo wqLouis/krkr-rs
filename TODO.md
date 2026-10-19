@@ -324,9 +324,15 @@ Open:
    `Engine::step(dt_ms, hooks)` / `Engine::frame(now_ms, hooks)` own the clock,
    timers, projection and render; `GameFrame::before_render(now_ms, dt_ms)` is
    the single upward hook. `app::Host` wraps the engine, `GameHost` is the
-   hook, and the timer tests drive virtual time. Remaining: move the mixer,
-   video and transition pumps out of the hook, add `Engine::run`, and collapse
-   the timer surface to D27's four methods (`07` Phase 9).
+   hook, and the timer tests drive virtual time. The timer surface is already
+   D27's four methods — `TimerState::create_interval` / `set_interval` /
+   `set_enabled` / `remove` exist with no config struct or mode enum
+   (`crates/engine/src/timer.rs`); only `TimerState::advance` is still
+   `pub` (it runs inside `Engine::frame`) and awaits privatization. Remaining:
+   move the mixer (audio pump), video and transition pumps out of the hook
+   into L2, then retire `SoundState.clock` and pass an L2-owned delta to those
+   pumps; add `Engine::run(clock, hooks)` (platform event pump) — blocked on
+   the loop slice; and privatize `TimerState::advance`. See `07` Phase 9.
 2. **The pixel-translation layer** (`D39`/`D40`) — **mapping landed.** A pure
    L2 `PixelTranslation` maps VM pixels (what scripts see) to device pixels
    (what the framebuffer uses), applies Fit-with-letterbox during projection,
@@ -565,19 +571,24 @@ Recorded so it is not re-opened without new evidence.
 ones. Both are tracked work, not accepted practice, and the allowlist entries
 carry a `debt:` marker so clearing one is visible:
 
-* **25 `std::fs` uses in compat source, across 6 files** (`l3-platform`).
-  AGENTS §2 keeps platform code in L1; these should route through the L1 `fs`
-abstraction. The guard excludes `crates/compat/tests/**`, where `std::fs` is
-legitimate for fixtures.
-* **90 `unsafe` blocks with no `// SAFETY:` note, across 19 files**
-  (`unsafe-no-safety-note`). AGENTS §5 requires a note per block; the sites are
-already inventoried in `docs/audits/unsafe-inventory.md` §2.6. Each note needs
-a real safety argument, so this is review work, not a bulk edit. Baselined
-per file, so a new file or a new rule fails the gate. The three FFI-heaviest
-files (105 blocks: `visual/window.rs`, `tjs/src/lib.rs`, the Vulkan files) are
-reviewed and cleared, and that review found two real defects — a `&mut` held
-across a script eval in `window_ctor`, and 22 call-site `unsafe` blocks the TJS
-value helpers forced.
+* **`std::fs` debt cleared (`l3-platform`).** The `l3-platform` allowlist no
+  longer carries a compat entry: non-test compat source routes through the L1
+  `fs` abstraction, and the remaining `std::fs` calls (e.g. in
+  `crates/compat/src/natives/plugins/fstat/mod.rs`) live in `#[cfg(test)]`
+  modules, where `std::fs` is legitimate for fixtures. AGENTS §2 keeps
+  platform code in L1.
+* **`unsafe` blocks with no `// SAFETY:` note, across 19 allowlisted files**
+  (`unsafe-no-safety-note`), 2 of which the layering guard now reports as
+  stale (`crates/compat/src/natives/visual/font.rs`,
+  `crates/compat/src/natives/visual/layer/mod.rs`), so 17 files still carry
+  the debt. AGENTS §5 requires a note per block; the sites are already
+  inventoried in `docs/audits/unsafe-inventory.md` §2.6. Each note needs a
+  real safety argument, so this is review work, not a bulk edit. Baselined
+  per file, so a new file or a new rule fails the gate. The three FFI-heaviest
+  files (105 blocks: `visual/window.rs`, `tjs/src/lib.rs`, the Vulkan files) are
+  reviewed and cleared, and that review found two real defects — a `&mut` held
+  across a script eval in `window_ctor`, and 22 call-site `unsafe` blocks the TJS
+  value helpers forced.
 
 ## 17. Next major version — native plugin coverage
 
@@ -702,8 +713,9 @@ directory. Host check available: `/mnt/DATA/Games/Others/test2/data.xp3` is
    are sums of synchronous decodes. The plan is prefetch, cache consultation and
    a bounded worker pool; `fork_union`/`rayon`/std threads are the candidates,
    to be chosen on a measurement. This is where the remaining seconds are.
-5. **`unsafe` SAFETY-note debt** — 89 findings across 19 files, baselined per
-   file by `scripts/check-layering.sh` so new debt fails the gate (§16).
+5. **`unsafe` SAFETY-note debt** — baselined per file by
+   `scripts/check-layering.sh` so new debt fails the gate (§16); 19 files are
+   allowlisted, 2 of which are now stale (see §16).
 6. **Parity blind spots left** — `global.X = …` in script strings, member names
    built at runtime, and two *false* reference members
    (`BasicDrawDevice.name`/`PassThroughDrawDevice.name`) that the extractor
@@ -956,28 +968,36 @@ only reviewed false positives (ordinary-English "reference" about our own
 code, and six read-only boolean queries). Every other existing
 `reference-citation` and `history-comment` finding is recorded in
 `scripts/allowlists/house_style_baseline.txt` — JSON Lines keyed to the
-normalized offending comment line, 4344 entries covering 4595 finding sites —
+normalized offending comment line, 4260 entries covering 4507 finding sites —
 so the gate no longer blocks on legacy comments. A stale baseline entry is a
 note, not a failure. The baseline is **debt**: burn it down in file batches and
 delete each entry as its comment is rewritten. It never holds a `clippy-allow`
 entry. Counts move as the cleanup lands.
 
-### 21.1 Clippy allowances (hard; never allowlisted)
+### 21.1 Clippy allowances (hard; never allowlisted) — landed
 
-This is the only rule the gate fails on today: `krkr-gate house-style` reports
-**64** clippy sites and zero unallowlisted reference/history findings. The bulk
-are two systemic lints:
-
-* `clippy::too_many_arguments` (~34) — mostly the wide `extern "C"` native
-  callbacks in `compat`. Group the ABI arguments into a struct at the Rust
-  boundary, or take an args slice; do not silence the lint.
-* `clippy::not_unsafe_ptr_arg_deref` (~24) — the `extern "C"` callbacks that
-  dereference raw pointers. Make the callback `unsafe extern "C"` or move the
-  dereference behind a safe helper.
-
-Remaining: `manual_unwrap_or` / `manual_unwrap_or_default`, `approx_constant`,
-`needless_range_loop`, `cast_precision_loss`. See
-`uv run --project scripts krkr-gate house-style --print-all`.
+Landed in `3b4e0f0` (`cleanup: remove every clippy allowance and tighten
+wide APIs`): `rg -n 'allow\(clippy|expect\(clippy' crates` is empty and
+`krkr-gate house-style` reports **0** clippy sites (4540 sites checked,
+33 reviewed, 4507 baselined). This is no longer the failing rule — the
+house-style gate is clean on clippy. The systemic lints that drove the 64
+sites were fixed rather than silenced: `Tjs2ValueId` became a
+`repr(transparent)` typed handle instead of a raw `*mut c_void` (FFI converts
+at the boundary), and wide native/VM/engine callbacks were regrouped into
+parameter structs (`CompileOptions`, `BlitSource`/`BlitOptions`/
+`AffineBlit`, `TextRasterServices`, `FrameCosts`, plus the compat native
+command shapes and the Vulkan/TLG context structs) for
+`clippy::too_many_arguments`. The raw-pointer dereferences that drove
+`clippy::not_unsafe_ptr_arg_deref` were addressed through the typed handle
+and the documented `inst_mut`/`inst_ref`/`ctx.services()`-style helpers rather
+than by making callbacks `unsafe extern "C"` (only `native_util.rs` and
+`plugins/scripts_ex/mod.rs` use `unsafe extern "C"`). The remaining one-off lints
+(`manual_unwrap_or` / `manual_unwrap_or_default`, `approx_constant`,
+`needless_range_loop`, `cast_precision_loss`) were fixed in the same
+commit. Do not re-introduce an allowance: the `clippy-allow` rule has no
+allowlist exemption by design, and `#[allow(clippy::…)]` /
+`#![allow(clippy::…)]` / `#[expect(clippy::…)]` in any Rust file (tests
+included) fails the gate.
 
 ### 21.2 Reference citations (batch by shape)
 

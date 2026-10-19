@@ -142,6 +142,10 @@ Rules:
   - `&[T]` / `&mut [T]`, not `&Vec<T>` / `&mut Vec<T>` unless capacity is used;
   - `&Path`, not `&PathBuf`;
   - `&T`, not `&Box<T>`.
+- A sequence parameter that is only iterated is `impl IntoIterator<Item = T>`
+  (owning) or `impl IntoIterator<Item = &T>` (borrowing), not `Vec<T>` or
+  `&[T]`; keep the slice when the slice itself is the contract (indexing,
+  exact length, FFI, or a hot path that must not monomorphise).
 - Accept owned or borrowed input generically where it removes caller noise:
   - `name: impl Into<String>` for an owned stored string;
   - `path: impl AsRef<Path>` when any path-like value is valid;
@@ -149,7 +153,8 @@ Rules:
   - `f: impl FnMut(..) -> R` rather than `&dyn Fn` unless type erasure is
     required.
 - Return owned data only when ownership is needed. Prefer:
-  - `impl Iterator<Item = Foo>` for a lazy traversal;
+  - `impl Iterator<Item = Foo>` for a lazy traversal — a `Vec` return only
+    when the caller needs ownership, indexing, a length or repeated passes;
   - `&[T]` / `&str` for a borrowed view;
   - `Result<impl Iterator<Item = Foo>, Error>` when construction can fail.
   Collect only at a boundary that needs a slice, a count, or sorted order.
