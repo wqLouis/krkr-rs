@@ -274,6 +274,29 @@ reference or raises because the reference raises.
   `ShortCutInitial*` have no parity coverage — 100% parity is not coverage.
 * **PN10 (P0, deferred)** the real `WIN32Dialog` surface — see §5.
 
+### Known KAG parser approximations
+
+* **`multiLineTagEnabled` continuation errors are raised at load.** A tag line
+  ending in whitespace + `\` whose next line is not `;`-prefixed (or is EOF)
+  fails `loadScenario`; KAGParserEx raises it when the walk reaches the tag.
+  The joining itself follows the readme's case rules (a lone `@ \` is the tag
+  named `\`, a `\` inside an unterminated quoted value is not a marker), but
+  the readme gives no error timing and
+  `reference/cpp/plugins/KAGParser/kagparserex.cpp` is a stub, so the shipped
+  DLL is the only oracle (not decompiled). Risk: a script that loads a
+  scenario whose bad continuation is never walked sees a load-time throw.
+* **`multiLineTagEnabled` does not ignore the rest of a multi-line `[tag …]`.**
+  The readme says everything after the closing `]` of a multi-line tag is
+  ignored (`reference/cpp/plugins/KAGParser/readme.txt:36-42`); the port still
+  parses it. Evidence: readme only. Risk: `[tag …][ignored]` emits the second
+  tag where the reference drops it.
+* **A `\` continuation inside a macro/emb expansion buffer is not applied.**
+  The `\`/`[p]` rule is implemented for main-stream events; an expansion
+  (`LineBufferUsing`) text run ending in `\` keeps it. Evidence: reference
+  source — `KAGParser.cpp:1415-1429` runs against `CurLineStr`, which points at
+  the buffer while an expansion is active. Risk: a macro body whose last line
+  ends in `\` differs.
+
 ## 10. L3 blockers
 
 * `Window.registerMessageReceiver` records the receiver but **nothing dispatches

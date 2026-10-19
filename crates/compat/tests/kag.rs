@@ -280,6 +280,22 @@ mod parser_tests {
     }
 
     #[test]
+    fn prefix_before_a_quote_opens_the_value() {
+        // `key=&"expr"`: the reference consumes the `&` before it checks for
+        // the quote, so the quote delimits the value and the prefix survives
+        // (`reference/cpp/core/base/KAGParser.cpp:2067-2078`).
+        assert_eq!(
+            events("[x a=&\"expr\" b=%'arg']"),
+            vec![tag(
+                "x",
+                &[("a", "&expr"), ("b", "%arg")],
+                Bracket::Square,
+                1
+            )]
+        );
+    }
+
+    #[test]
     fn macro_entity_marker_is_consumed() {
         assert_eq!(
             events("[x * a=1]"),
@@ -677,6 +693,41 @@ mod parser_tests {
     }
 
     #[test]
+    fn multiline_lone_backslash_is_a_tag_name() {
+        // `@ \` is the tag named `\`, not a continuation
+        // (`reference/cpp/plugins/KAGParser/readme.txt:31-34`).
+        let scenario = parse_with_options("@ \\\n; x=1\n", opts()).unwrap();
+        assert!(matches!(
+            &scenario.events[0],
+            Event::Tag { name, bracket: Bracket::At, .. } if name == "\\"
+        ));
+    }
+
+    #[test]
+    fn multiline_quoted_backslash_is_not_joined() {
+        // A `\` inside a quoted value is part of the value, not a
+        // continuation, so the tag is still unterminated
+        // (`reference/cpp/plugins/KAGParser/readme.txt:27-34`).
+        assert!(matches!(
+            parse_with_options("[tag a=\"foo \\\n; bar]\n", opts()),
+            Err(Error::Syntax { .. })
+        ));
+    }
+
+    #[test]
+    fn multiline_backslash_after_the_closing_bracket_is_not_joined() {
+        // A `\` after the tag's `]` is outside the attribute area, so it is
+        // left to the ordinary line continuation
+        // (`reference/cpp/plugins/KAGParser/readme.txt:27-38`).
+        let scenario = parse_with_options("[tag] \\\nnext\n", opts()).unwrap();
+        assert!(matches!(
+            &scenario.events[0],
+            Event::Tag { name, .. } if name == "tag"
+        ));
+        assert_eq!(scenario.events.len(), 3);
+    }
+
+    #[test]
     fn multiline_continuation_must_be_followed_by_a_semicolon_line() {
         let err = parse_with_options("@tag a=1 \\\nnext=2\n", opts()).unwrap_err();
         assert_eq!(
@@ -760,6 +811,49 @@ mod parser_tests {
             &scenario.events[1],
             Event::Label { name, .. } if name == "*foo:2"
         ));
+    }
+
+    #[test]
+    fn a_label_spelled_like_an_alias_bumps_that_alias() {
+        // The cache is keyed by the name that was *stored*, so a label that
+        // literally spells an earlier alias finds that entry and suffixes it
+        // again (`reference/cpp/core/base/KAGParser.cpp:224-232`).
+        let scenario = parse("*foo\n*foo\n*foo:2\n").unwrap();
+        assert_eq!(scenario.labels.get("*foo").copied(), Some(0));
+        assert_eq!(scenario.labels.get("*foo:2").copied(), Some(1));
+        assert_eq!(scenario.labels.get("*foo:2:2").copied(), Some(2));
+        assert!(matches!(
+            &scenario.events[2],
+            Event::Label { name, .. } if name == "*foo:2:2"
+        ));
+    }
+
+    #[test]
+    fn labels_at_end_of_file_are_indexed() {
+        // The final line needs no trailing newline (LoadScenario pass 1/2,
+        // `reference/cpp/core/base/KAGParser.cpp:131-192`).
+        let scenario = parse("*start\n*end").unwrap();
+        assert_eq!(scenario.labels.get("*start").copied(), Some(0));
+        assert_eq!(scenario.labels.get("*end").copied(), Some(1));
+
+        // A page-only label aliases the previous name even at EOF, and
+        // without a previous label it is still an error
+        // (`reference/cpp/core/base/KAGParser.cpp:215-219`).
+        let scenario = parse("*foo\n*|page").unwrap();
+        assert_eq!(scenario.labels.get("*foo:2").copied(), Some(1));
+        assert_eq!(parse("*|page"), Err(Error::CannotOmitFirstLabelName));
+    }
+
+    #[test]
+    fn star_is_ordinary_text_away_from_line_start() {
+        // Only a line whose first character is `*` is a label
+        // (`reference/cpp/core/base/KAGParser.cpp:1091`); elsewhere `*` is an
+        // ordinary character (`reference/cpp/core/base/KAGParser.cpp:1463`).
+        assert_eq!(events("a*b"), vec![text("a*b", 1)]);
+        assert_eq!(
+            events("text * [b]"),
+            vec![text("text * ", 1), tag("b", &[], Bracket::Square, 1)]
+        );
     }
 
     #[test]
@@ -869,11 +963,14 @@ fn eval_literal(exp: &str) -> Result<EvalResult, String> {
     Ok(EvalResult::Integer(exp.parse::<i64>().unwrap_or(0)))
 }
 
+/// The parsed tags returned by the test walkers: `(tag name, attributes)`.
+type ParsedTags = Vec<(String, Vec<(String, String)>)>;
+
 /// Drain `next_tag` into an ordered list.
 fn collect(
     state: &mut KagParserState,
     eval: &mut dyn FnMut(&str) -> Result<EvalResult, String>,
-) -> Vec<(String, Vec<(String, String)>)> {
+) -> ParsedTags {
     let mut load =
         |_name: &str| -> Result<String, String> { Err("unexpected storage load".to_string()) };
     let mut env = Environ {
@@ -1070,6 +1167,28 @@ fn param_macros_expand_into_a_tag() {
         vec![
             ("a".to_string(), "1".to_string()),
             ("b".to_string(), "2".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn duplicate_attributes_keep_the_last_value() {
+    // Attributes are stored in a TJS dictionary with `TJS_MEMBERENSURE`, so a
+    // repeated name overwrites the earlier value in place and the first
+    // occurrence keeps its position
+    // (`reference/cpp/core/base/KAGParser.cpp:2176-2180`).
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text("t.ks", "*start\n[x a=1 a=2 b=3]\n")
+        .unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let tags = collect(&mut state, &mut eval);
+    let (_, params) = tags.iter().find(|(name, _)| name == "x").expect("x tag");
+    assert_eq!(
+        params,
+        &[
+            ("a".to_string(), "2".to_string()),
+            ("b".to_string(), "3".to_string()),
         ]
     );
 }
@@ -2069,4 +2188,150 @@ fn eval_result_object_carries_truthiness_and_string_form() {
         truthy: false,
     };
     assert!(!null.truthy());
+}
+
+/// Walk `next_tag` to the end and return the tags plus the first error, if any.
+fn walk_all(
+    state: &mut KagParserState,
+    eval: &mut dyn FnMut(&str) -> Result<EvalResult, String>,
+) -> (ParsedTags, Option<String>) {
+    let mut load =
+        |_name: &str| -> Result<String, String> { Err("unexpected storage load".to_string()) };
+    let mut env = Environ {
+        eval,
+        load_storage: &mut load,
+        fire_label: None,
+        fire_script: None,
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
+    };
+    let mut tags = Vec::new();
+    loop {
+        match state.next_tag(&mut env) {
+            Ok(Some(tag)) => tags.push(tag),
+            Ok(None) => return (tags, None),
+            Err(e) => return (tags, Some(e)),
+        }
+    }
+}
+
+#[test]
+fn a_syntax_error_is_raised_when_the_walk_reaches_its_line() {
+    // `LoadScenario` only splits lines; the tag scan throws in `_GetNextTag`
+    // when it reaches the bad line
+    // (`reference/cpp/core/base/KAGParser.cpp:1367-1500`).
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text("t.ks", "ok\n[bad\nafter\n")
+        .expect("load does not scan tags");
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let (tags, error) = walk_all(&mut state, &mut eval);
+    assert_eq!(ch_text(&tags), "ok");
+    assert_eq!(
+        tag_names(&tags),
+        vec!["ch".to_string(), "ch".to_string(), "r".to_string()],
+        "the walk stops before the line after the bad one"
+    );
+    assert!(error.is_some(), "the syntax error surfaces at the walk");
+}
+
+#[test]
+fn an_empty_scenario_still_fails_at_load() {
+    // `TVPKAGNoLine` is thrown by `LoadScenario` itself
+    // (`reference/cpp/core/base/KAGParser.cpp:118-131`).
+    let mut state = KagParserState::default();
+    let error = state.load_scenario_text("t.ks", "").unwrap_err();
+    assert!(error.contains("empty"), "{error}");
+}
+
+#[test]
+fn a_first_label_error_surfaces_at_the_first_walk_step() {
+    // `EnsureLabelCache` runs from `SkipCommentOrLabel` on the first
+    // `_GetNextTag`, so `loadScenario` succeeds
+    // (`reference/cpp/core/base/KAGParser.cpp:194-238`, `:1076`).
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text("t.ks", "*|page\n")
+        .expect("load does not build the label cache");
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let (_, error) = walk_all(&mut state, &mut eval);
+    let error = error.expect("the first walk step raises");
+    assert!(error.contains("ommit"), "{error}");
+
+    // `GoToLabel` also builds the cache, but an empty name returns first
+    // (`KAGParser.cpp:1015-1019`).
+    assert!(state.go_to_label("").is_ok());
+    assert!(state.go_to_label("*x").is_err());
+}
+
+#[test]
+fn a_trailing_backslash_joins_the_next_line_without_a_line_end() {
+    // With `ignoreCR` off, a line whose last character is `\` continues on
+    // the next line and emits no `r`; the `\` itself is not a character tag
+    // (`reference/cpp/core/base/KAGParser.cpp:1415-1429`).
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text("t.ks", "Hello \\\nWorld\n")
+        .unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let (tags, error) = walk_all(&mut state, &mut eval);
+    assert!(error.is_none());
+    assert_eq!(ch_text(&tags), "Hello World");
+    assert_eq!(
+        tag_names(&tags).iter().filter(|n| *n == "r").count(),
+        1,
+        "only the second line ends"
+    );
+}
+
+#[test]
+fn a_line_ending_in_page_marker_suppresses_its_line_end() {
+    // A line ending in `[p]` emits the `p` tag but no `r`
+    // (`reference/cpp/core/base/KAGParser.cpp:1415-1429`).
+    let mut state = KagParserState::default();
+    state.load_scenario_text("t.ks", "abc[p]\ndef\n").unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let (tags, error) = walk_all(&mut state, &mut eval);
+    assert!(error.is_none());
+    assert_eq!(ch_text(&tags), "abcdef");
+    assert!(tag_names(&tags).iter().any(|n| n == "p"));
+    assert_eq!(tag_names(&tags).iter().filter(|n| *n == "r").count(), 1);
+}
+
+#[test]
+fn ignore_cr_keeps_a_trailing_backslash_as_text() {
+    // With `ignoreCR` on the reference skips the whole `!IgnoreCR` block, so
+    // the `\` stays a normal character (`KAGParser.cpp:1415-1429`).
+    let mut state = KagParserState::default();
+    state.ignore_cr = true;
+    state
+        .load_scenario_text("t.ks", "Hello \\\nWorld\n")
+        .unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let (tags, _) = walk_all(&mut state, &mut eval);
+    assert_eq!(ch_text(&tags), "Hello \\World");
+}
+
+#[test]
+fn a_prefix_before_a_quote_evaluates_the_unquoted_expression() {
+    // `key=&"expr"`: the reference consumes `&`, treats the quote as the
+    // value delimiter, and evaluates `expr` unquoted
+    // (`reference/cpp/core/base/KAGParser.cpp:2067-2078`).
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text("t.ks", "[x a=&\"expr\"]\n")
+        .unwrap();
+    let mut seen = String::new();
+    let mut eval = |e: &str| -> Result<EvalResult, String> {
+        seen = e.to_string();
+        Ok(EvalResult::Str(format!("eval:{e}")))
+    };
+    let (tags, error) = walk_all(&mut state, &mut eval);
+    assert!(error.is_none());
+    let (_, params) = tags.iter().find(|(n, _)| n == "x").expect("x tag");
+    assert_eq!(seen, "expr");
+    assert_eq!(params, &[("a".to_string(), "eval:expr".to_string())]);
 }

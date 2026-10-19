@@ -291,6 +291,12 @@ pub struct KagParserState {
     comment_or_label_lines: BTreeSet<usize>,
     storage_name: String,
     storage_short_name: String,
+    /// The reference raises `CannotOmitFirstLabelName` when it first builds
+    /// the label cache (`GoToLabel` or the first walk step), not at load.
+    label_error: bool,
+    /// Deferred syntax errors keyed by the event index at which the walk
+    /// raises them, with the source line for its line-end boundary.
+    pending_errors: BTreeMap<usize, (usize, String)>,
 
     // walk position
     event_index: usize,
@@ -362,6 +368,8 @@ impl Default for KagParserState {
             comment_or_label_lines: BTreeSet::new(),
             storage_name: String::new(),
             storage_short_name: String::new(),
+            label_error: false,
+            pending_errors: BTreeMap::new(),
             event_index: 0,
             char_index: 0,
             cur_line: 0,
@@ -408,23 +416,32 @@ fn line_of(e: &Event) -> usize {
 // ---------------------------------------------------------------------------
 
 impl KagParserState {
-    /// Load a scenario from already-decoded text. The reference throws on
-    /// an empty scenario and on syntax errors; we report the same.
+    /// Load a scenario from already-decoded text. Only an empty scenario
+    /// fails here (`TVPKAGNoLine`); syntax and first-label errors are raised
+    /// later by [`Self::next_tag`]/[`Self::go_to_label`], like the reference's
+    /// lazy `EnsureLabelCache`/`_GetNextTag`
+    /// (`reference/cpp/core/base/KAGParser.cpp:194-238`, `:1367-1500`).
     pub fn load_scenario_text(&mut self, name: &str, text: &str) -> Result<(), String> {
         let options = super::parser::ParseOptions {
             multiline_tags: self.multi_line_tag_enabled,
         };
-        let scenario = super::parser::parse_with_options(text, options).map_err(|e| match e {
-            super::parser::Error::EmptyScenario => MSG_NO_LINE.replace("%1", name),
-            super::parser::Error::CannotOmitFirstLabelName => {
-                MSG_CANNOT_OMIT_FIRST_LABEL.to_string()
+        let recovered = match super::parser::parse_recovering(text, options) {
+            Ok(recovered) => recovered,
+            Err(super::parser::Error::EmptyScenario) => {
+                return Err(MSG_NO_LINE.replace("%1", name));
             }
-            super::parser::Error::InlineScriptNotEnd => MSG_INLINE_SCRIPT_NOT_END.to_string(),
-            e => format!("{MSG_SYNTAX} ({e})"),
-        })?;
-        self.events = scenario.events;
-        self.labels = scenario.labels;
-        self.event_cols = scenario.cols;
+            Err(e) => return Err(deferred_error_message(&e)),
+        };
+        self.label_error = recovered.label_error;
+        self.pending_errors.clear();
+        for pending in &recovered.pending_errors {
+            self.pending_errors
+                .entry(pending.after_event)
+                .or_insert_with(|| (pending.line, deferred_error_message(&pending.error)));
+        }
+        self.events = recovered.events;
+        self.labels = recovered.labels;
+        self.event_cols = recovered.cols;
         self.raw_lines = split_lines(text);
         self.comment_or_label_lines = self
             .events
@@ -499,14 +516,23 @@ impl KagParserState {
         if self.ignore_cr {
             return 0;
         }
-        let first_line = self
+        let mut first_line = self
             .events
             .first()
             .map(line_of)
             .unwrap_or(self.raw_lines.len() + 1);
+        if let Some(error_line) = self.pending_error_line(0) {
+            first_line = first_line.min(error_line);
+        }
         (1..first_line)
             .filter(|l| !self.comment_or_label_lines.contains(l))
             .count()
+    }
+
+    /// The source line of the deferred syntax error the walk raises at
+    /// `after_event`, if any.
+    fn pending_error_line(&self, after_event: usize) -> Option<usize> {
+        self.pending_errors.get(&after_event).map(|(line, _)| *line)
     }
 
     /// Reset condition state and macro recording/args (reference
@@ -530,6 +556,8 @@ impl KagParserState {
         self.raw_lines.clear();
         self.event_cols.clear();
         self.comment_or_label_lines.clear();
+        self.label_error = false;
+        self.pending_errors.clear();
         self.storage_name.clear();
         self.storage_short_name.clear();
         self.rewind();
@@ -558,6 +586,11 @@ impl KagParserState {
     pub fn go_to_label(&mut self, name: &str) -> Result<(), String> {
         if name.is_empty() {
             return Ok(());
+        }
+        // `GoToLabel` builds the label cache before looking the label up
+        // (`KAGParser.cpp:1021`), so a bad first label surfaces here.
+        if self.label_error {
+            return Err(MSG_CANNOT_OMIT_FIRST_LABEL.to_string());
         }
         let idx = *self.labels.get(name).ok_or_else(|| {
             MSG_LABEL_NOT_FOUND
@@ -619,6 +652,11 @@ impl KagParserState {
                 self.interrupted = false;
                 return Ok(Some(("interrupt".to_string(), Vec::new())));
             }
+            // The reference builds the label cache at the first
+            // `SkipCommentOrLabel` (`KAGParser.cpp:1076`), before any tag.
+            if self.label_error {
+                return Err(MSG_CANNOT_OMIT_FIRST_LABEL.to_string());
+            }
             if self.pending_rs > 0 {
                 self.pending_rs -= 1;
                 // A line end advances the scan cursor to the next line
@@ -647,6 +685,14 @@ impl KagParserState {
                     "r".to_string(),
                     vec![("eol".to_string(), "true".to_string())],
                 )));
+            }
+
+            // A deferred syntax error is raised once the walk has emitted
+            // every event before it (`_GetNextTag` scans the line and throws).
+            if self.splice_stack.is_empty()
+                && let Some((_, message)) = self.pending_errors.get(&self.event_index)
+            {
+                return Err(message.clone());
             }
 
             let (ev, from_splice) = self.current_event_cloned();
@@ -695,6 +741,21 @@ impl KagParserState {
                         self.advance_current();
                         continue;
                     };
+                    // A trailing `\` at the end of a line is a line
+                    // continuation: it is dropped and no `r` fires
+                    // (`KAGParser.cpp:1415-1429`).
+                    if !from_splice
+                        && pos + 1 == text.chars().count()
+                        && c == '\\'
+                        && !self.ignore_cr
+                        && self
+                            .raw_lines
+                            .get(line_of(&ev).saturating_sub(1))
+                            .is_some_and(|raw| raw.ends_with('\\'))
+                    {
+                        self.advance_current();
+                        continue;
+                    }
                     self.bump_char_pos();
                     // `CurPos` is the column within the whole line (or
                     // expansion buffer), one past the emitted character.
@@ -845,27 +906,30 @@ impl KagParserState {
         };
         let line = line_of(&ev);
 
+        let mut next_line = self
+            .events
+            .get(self.event_index + 1)
+            .map(line_of)
+            .unwrap_or(self.raw_lines.len() + 1);
+        // A deferred syntax error is a boundary: no line end follows it.
+        if let Some(error_line) = self.pending_error_line(self.event_index + 1) {
+            next_line = next_line.min(error_line);
+        }
+
         let line_ends = match &ev {
             Event::Tag {
                 bracket: Bracket::At,
                 ..
             } => false,
-            Event::Tag { .. } | Event::Text { .. } | Event::Directive { .. } => self
-                .events
-                .get(self.event_index + 1)
-                .map(|n| line_of(n) != line)
-                .unwrap_or(true),
+            Event::Tag { .. } | Event::Text { .. } | Event::Directive { .. } => {
+                next_line != line && !self.line_continues(&ev, line)
+            }
             _ => false,
         };
         if line_ends {
             self.end_of_line_r();
         }
 
-        let next_line = self
-            .events
-            .get(self.event_index + 1)
-            .map(line_of)
-            .unwrap_or(self.raw_lines.len() + 1);
         for g in (line + 1)..next_line {
             if !self.comment_or_label_lines.contains(&g) {
                 self.end_of_line_r();
@@ -875,6 +939,27 @@ impl KagParserState {
         // The char cursor only applies to the text run being emitted; the
         // next event starts at its own position.
         self.char_index = 0;
+    }
+
+    /// Whether the source line has no end-of-line `r` because it continues
+    /// onto the next line: a trailing `\` that stayed a plain character, or a
+    /// line ending in `[p]` (`reference/cpp/core/base/KAGParser.cpp:1415-1429`).
+    fn line_continues(&self, ev: &Event, line: usize) -> bool {
+        if self.ignore_cr {
+            return false;
+        }
+        let Some(raw) = self.raw_lines.get(line.saturating_sub(1)) else {
+            return false;
+        };
+        if raw.ends_with("[p]") {
+            return true;
+        }
+        raw.ends_with('\\')
+            && matches!(
+                ev,
+                Event::Text { text, .. } | Event::Directive { raw: text, .. }
+                    if text.ends_with('\\')
+            )
     }
 
     /// One `r eol=true`: queued as output (the recording-vs-output decision
@@ -937,7 +1022,7 @@ impl KagParserState {
             {
                 for (k, v) in args {
                     if k != "tagname" {
-                        resolved.push((k.clone(), v.clone()));
+                        push_param(&mut resolved, k.clone(), v.clone());
                     }
                 }
             }
@@ -1234,7 +1319,7 @@ impl KagParserState {
             return Ok(false);
         }
         if let Some(value) = value_opt {
-            resolved.push((attribname.to_string(), value));
+            push_param(resolved, attribname.to_string(), value);
         }
         Ok(true)
     }
@@ -2020,6 +2105,17 @@ fn extract_storage_name(name: &str) -> String {
     name.rsplit(['/', '\\']).next().unwrap_or(name).to_string()
 }
 
+/// The message the walk raises for a deferred parser error
+/// (`reference/cpp/core/base/KAGParser.cpp`).
+fn deferred_error_message(error: &super::parser::Error) -> String {
+    match error {
+        super::parser::Error::EmptyScenario => MSG_NO_LINE.to_string(),
+        super::parser::Error::CannotOmitFirstLabelName => MSG_CANNOT_OMIT_FIRST_LABEL.to_string(),
+        super::parser::Error::InlineScriptNotEnd => MSG_INLINE_SCRIPT_NOT_END.to_string(),
+        e => format!("{MSG_SYNTAX} ({e})"),
+    }
+}
+
 /// Reconstruct `[name key=value ...]` from parsed events for macro
 /// recording; values that would not re-parse as-is are double-quoted with
 /// backtick escapes.
@@ -2074,19 +2170,59 @@ fn parse_macro_content(content: &str) -> Result<(Vec<Event>, Vec<usize>), String
 /// Split a leading `&` (entity) or `%` (macro argument) prefix from a
 /// value. A backtick marker kept by [`super::parser::parse`] suppresses the prefix so
 /// the value stays literal (`&foo` / `%foo`).
+///
+/// The reference consumes the first `&`/`%` while scanning the value and then
+/// checks the *remaining* first character once more during the unescape pass
+/// (`KAGParser.cpp:2067-2078`, `:2111-2117`). The two steps are order
+/// dependent: `%&expr` consumes `%` then `&` (entity wins) while `%%expr`
+/// keeps the second `%` in the value.
 fn split_value_prefix(s: &str) -> (bool, bool, &str) {
     if let Some(rest) = s.strip_prefix('`')
         && (rest.starts_with('&') || rest.starts_with('%'))
     {
         return (false, false, rest);
     }
-    if let Some(rest) = s.strip_prefix('&') {
-        return (true, false, rest);
+    let mut rest = s;
+    let mut entity = false;
+    let mut macroarg = false;
+    if let Some(r) = rest.strip_prefix('&') {
+        entity = true;
+        rest = r;
+    } else if let Some(r) = rest.strip_prefix('%') {
+        macroarg = true;
+        rest = r;
     }
-    if let Some(rest) = s.strip_prefix('%') {
-        return (false, true, rest);
+    if !entity && let Some(r) = rest.strip_prefix('&') {
+        entity = true;
+        rest = r;
     }
-    (false, false, s)
+    if !macroarg && let Some(r) = rest.strip_prefix('%') {
+        macroarg = true;
+        rest = r;
+    }
+    // A marker backtick that followed the prefix just consumed keeps an
+    // escaped `&`/`%` literal rather than treating it as a second prefix.
+    if let Some(r) = rest.strip_prefix('`')
+        && (r.starts_with('&') || r.starts_with('%'))
+    {
+        rest = r;
+    }
+    (entity, macroarg, rest)
+}
+
+/// Store one resolved attribute the way `DicObj->PropSetByVS(
+/// TJS_MEMBERENSURE, …)` does: a repeated name overwrites in place, so the
+/// first occurrence keeps its position and the last value wins
+/// (`reference/cpp/core/base/KAGParser.cpp:2176-2180`).
+fn push_param(resolved: &mut Vec<(String, String)>, key: String, value: String) {
+    if let Some(slot) = resolved
+        .iter_mut()
+        .find(|(k, _)| k.as_str() == key.as_str())
+    {
+        slot.1 = value;
+    } else {
+        resolved.push((key, value));
+    }
 }
 
 /// Convert an attribute value to a boolean the way `tTJSVariant::operator
@@ -2508,6 +2644,25 @@ fn read_field(chars: &[char], mut i: usize) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::{Environ, EvalResult, KagParserState, parse_tjs_bool};
+
+    /// The reference consumes the first `&`/`%` while scanning the value and
+    /// then checks the remaining first character again during unescaping
+    /// (`reference/cpp/core/base/KAGParser.cpp:2067-2078`, `:2111-2117`), so
+    /// the two steps are order dependent.
+    #[test]
+    fn value_prefixes_follow_the_reference_two_step_order() {
+        assert_eq!(super::split_value_prefix("&expr"), (true, false, "expr"));
+        assert_eq!(super::split_value_prefix("%expr"), (false, true, "expr"));
+        assert_eq!(super::split_value_prefix("&%expr"), (true, true, "expr"));
+        assert_eq!(super::split_value_prefix("%&expr"), (true, true, "expr"));
+        assert_eq!(super::split_value_prefix("&&expr"), (true, false, "&expr"));
+        assert_eq!(super::split_value_prefix("%%expr"), (false, true, "%expr"));
+        // A backtick-escaped prefix stays literal.
+        assert_eq!(
+            super::split_value_prefix("`&%expr"),
+            (false, false, "&%expr")
+        );
+    }
 
     /// `tTJSVariant::operator bool` on a string is `AsInteger() != 0`
     /// (`reference/cpp/core/tjs2/tjsVariant.h:913-925`,

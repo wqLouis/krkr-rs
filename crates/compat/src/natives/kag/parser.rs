@@ -62,9 +62,14 @@
 //! * `[iscript]`/`@iscript` … `[endscript]`/`@endscript` blocks are
 //!   collected into a single [`Event::Script`] (the walk fires the owner's
 //!   `onScript` as it passes it).
-//! * The trailing-`\` and trailing-`[p]` line-continuation rules only affect
-//!   `r`-tag emission in the reference; since this module has no `r` events,
-//!   a trailing `\` is kept in the text.
+//! * The trailing-`\` and trailing-`[p]` line-continuation rules apply when
+//!   `ignoreCR` is off: the state walk drops a trailing `\` and emits no `r`
+//!   for a line ending in `[p]`
+//!   (`reference/cpp/core/base/KAGParser.cpp:1415-1429`).
+//! * Parsing is eager, but the syntax and first-label errors the reference
+//!   raises during the walk are carried in [`Recovered`] and raised by the
+//!   state walk when it reaches them; [`parse`]/[`parse_with_options`] surface
+//!   the first one immediately for direct callers.
 //! * `cond`, `if`/`elsif`/`else`, `emb`, `macro`, `jump`/`call`/`return`
 //!   and `%`-directives are all *parsed* but not *executed*: no expression
 //!   evaluation, macro expansion or control flow happens here.
@@ -176,6 +181,35 @@ pub struct Scenario {
     pub cols: Vec<usize>,
 }
 
+/// A parse error the reference raises lazily during the walk instead of at
+/// load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingError {
+    /// Number of events the walk emits before raising this error.
+    pub after_event: usize,
+    /// 1-based source line the reference is scanning when it raises.
+    pub line: usize,
+    /// The error to raise.
+    pub error: Error,
+}
+
+/// Recovery-aware parse result: the events plus the errors the walk must
+/// raise when it reaches them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recovered {
+    /// Parsed events.
+    pub events: Vec<Event>,
+    /// Label name (`*start`) → first-event index.
+    pub labels: BTreeMap<String, usize>,
+    /// Per-event scan columns, aligned with [`Recovered::events`].
+    pub cols: Vec<usize>,
+    /// Syntax errors the walk raises, ordered by `after_event`.
+    pub pending_errors: Vec<PendingError>,
+    /// A `*|page` before any named label; the reference raises it when it
+    /// first builds the label cache.
+    pub label_error: bool,
+}
+
 /// Errors produced by [`parse`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -237,6 +271,26 @@ pub fn parse(source: &str) -> Result<Scenario> {
 /// See the [crate-level documentation](crate) for the exact syntax and for
 /// the deliberate divergences from the reference C++ parser.
 pub fn parse_with_options(source: &str, options: ParseOptions) -> Result<Scenario> {
+    let recovered = parse_recovering(source, options)?;
+    if recovered.label_error {
+        return Err(Error::CannotOmitFirstLabelName);
+    }
+    if let Some(pending) = recovered.pending_errors.first() {
+        return Err(pending.error.clone());
+    }
+    Ok(Scenario {
+        events: recovered.events,
+        labels: recovered.labels,
+        cols: recovered.cols,
+    })
+}
+
+/// Recovery-aware parse used by the walk. Only an empty scenario is a load-time
+/// error; syntax and label-cache errors are returned for the walk to raise when
+/// it reaches them, matching the reference's lazy `EnsureLabelCache` and
+/// `_GetNextTag` (`reference/cpp/core/base/KAGParser.cpp:194-238`,
+/// `:1071-1108`, `:1367-1500`).
+pub fn parse_recovering(source: &str, options: ParseOptions) -> Result<Recovered> {
     let raw_lines = split_lines(source);
     if raw_lines.is_empty() {
         return Err(Error::EmptyScenario);
@@ -256,6 +310,11 @@ pub fn parse_with_options(source: &str, options: ParseOptions) -> Result<Scenari
     let mut events = Vec::new();
     let mut labels = BTreeMap::new();
     let mut cols = Vec::new();
+    let mut pending_errors: Vec<PendingError> = Vec::new();
+    let mut label_error = false;
+    // Label name → how many times it has been stored in the cache. Keyed by
+    // the name actually stored (base name or `base:N` alias), like the
+    // reference `LabelCache` hash.
     let mut label_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut prev_label: Option<String> = None;
     let mut index = 0;
@@ -285,7 +344,12 @@ pub fn parse_with_options(source: &str, options: ParseOptions) -> Result<Scenari
                 end += 1;
             }
             if !found {
-                return Err(Error::InlineScriptNotEnd);
+                pending_errors.push(PendingError {
+                    after_event: events.len(),
+                    line: lineno,
+                    error: Error::InlineScriptNotEnd,
+                });
+                break;
             }
             // `script_start` is the 0-based line of the first script line
             // (`CurLine` after the reference's `CurLine++`).
@@ -325,25 +389,38 @@ pub fn parse_with_options(source: &str, options: ParseOptions) -> Result<Scenari
                     if name == "*" {
                         // A page-only label (`*|page`) has an empty name and
                         // aliases the previous one; without a previous label
-                        // it is an error (`KAGParser.cpp:209-219`).
+                        // the reference raises `CannotOmitFirstLabelName`
+                        // when it first builds the label cache
+                        // (`KAGParser.cpp:215-219`), so the walk raises it.
                         let Some(previous) = prev_label.clone() else {
-                            return Err(Error::CannotOmitFirstLabelName);
+                            label_error = true;
+                            events.push(Event::Label {
+                                name: String::new(),
+                                macro_name,
+                                line: lineno,
+                            });
+                            cols.push(0);
+                            index += 1;
+                            continue;
                         };
                         name = previous;
                     }
                     prev_label = Some(name.clone());
-                    // Duplicate labels suffix `:2`, `:3`, ... and the first
-                    // occurrence keeps the bare name (`KAGParser.cpp:193-238`).
-                    let count = label_counts.entry(name.clone()).or_insert(0);
-                    *count += 1;
-                    let alias = if *count > 1 {
-                        format!("{name}:{count}")
-                    } else {
-                        name
-                    };
-                    labels.insert(alias.clone(), events.len());
+                    // The reference keeps one cache entry per *stored* label
+                    // name (`LabelCache`). A repeated name bumps that entry's
+                    // count and stores the suffixed name `name:N`; a later
+                    // label that literally spells a previous alias finds that
+                    // alias as its own entry and bumps it again
+                    // (`EnsureLabelCache`, KAGParser.cpp:224-232).
+                    if let Some(count) = label_counts.get_mut(&name) {
+                        *count += 1;
+                        let suffix = *count;
+                        name = format!("{name}:{suffix}");
+                    }
+                    label_counts.insert(name.clone(), 1);
+                    labels.insert(name.clone(), events.len());
                     events.push(Event::Label {
-                        name: alias,
+                        name,
                         macro_name,
                         line: lineno,
                     });
@@ -360,14 +437,26 @@ pub fn parse_with_options(source: &str, options: ParseOptions) -> Result<Scenari
                 });
                 cols.push(0);
             }
-            _ => parse_line(content, lineno, &mut events, &mut cols)?,
+            _ => {
+                if let Err(error) = parse_line(content, lineno, &mut events, &mut cols) {
+                    // The reference throws while scanning the line, after any
+                    // text before the bad tag; record the error there.
+                    pending_errors.push(PendingError {
+                        after_event: events.len(),
+                        line: lineno,
+                        error,
+                    });
+                }
+            }
         }
         index += 1;
     }
-    Ok(Scenario {
+    Ok(Recovered {
         events,
         labels,
         cols,
+        pending_errors,
+        label_error,
     })
 }
 
@@ -418,16 +507,11 @@ fn join_multiline_lines(lines: &[&str]) -> Result<Vec<(usize, String)>> {
     while i < lines.len() {
         let lineno = i + 1;
         let mut current = lines[i].trim_start_matches('\t').to_string();
-        loop {
-            // A continuation marker is a trailing `\` that is preceded by
-            // at least one whitespace character (`@tag foo=1 \`).
-            let trimmed = current.trim_end_matches([' ', '\t']);
-            let is_continuation = trimmed.ends_with('\\')
-                && trimmed.len() >= 2
-                && trimmed[..trimmed.len() - 1].ends_with([' ', '\t']);
-            if !is_continuation {
-                break;
-            }
+        // A continuation marker is a trailing `\` preceded by whitespace
+        // inside a tag's attribute area (KAGParserEx `readme.txt:16-38`): a
+        // tag name must be present (`@ \` is the tag named `\`) and the `\`
+        // must be outside any quoted value.
+        while let Some(backslash) = tag_continuation_backslash(&current) {
             let Some(next_raw) = lines.get(i + 1) else {
                 return Err(Error::Syntax {
                     line: lineno,
@@ -444,7 +528,7 @@ fn join_multiline_lines(lines: &[&str]) -> Result<Vec<(usize, String)>> {
             // Drop only the trailing `\`, keeping the whitespace before it
             // as the separator, then append the continuation line without
             // its leading `;`.
-            let mut merged = trimmed[..trimmed.len() - 1].to_string();
+            let mut merged = current[..backslash].to_string();
             merged.push_str(rest);
             current = merged;
             i += 1;
@@ -453,6 +537,61 @@ fn join_multiline_lines(lines: &[&str]) -> Result<Vec<(usize, String)>> {
         i += 1;
     }
     Ok(out)
+}
+
+/// The byte index of a KAGParserEx continuation `\` at the end of a tag line,
+/// or `None`. A continuation needs whitespace before the `\`, a tag name
+/// before it (`@ \` is the tag named `\`, not a continuation), and the `\`
+/// outside any quoted value (`reference/cpp/plugins/KAGParser/readme.txt:16-38`).
+fn tag_continuation_backslash(line: &str) -> Option<usize> {
+    let trimmed = line.trim_end_matches([' ', '\t']);
+    let backslash = trimmed.len().checked_sub(1)?;
+    if trimmed.as_bytes().get(backslash) != Some(&b'\\') {
+        return None;
+    }
+    let before = trimmed.as_bytes().get(backslash.checked_sub(1)?)?;
+    if !matches!(*before, b' ' | b'\t') {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    let opener = *bytes.first()?;
+    if opener != b'@' && opener != b'[' {
+        return None;
+    }
+    let mut i = 1;
+    while i < backslash && matches!(bytes[i], b' ' | b'\t') {
+        i += 1;
+    }
+    let name_start = i;
+    while i < backslash {
+        match bytes[i] {
+            b' ' | b'\t' => break,
+            b']' if opener == b'[' => break,
+            _ => i += 1,
+        }
+    }
+    if i == name_start {
+        return None;
+    }
+    // Reject a `\` that is inside an unterminated quoted value, or that
+    // follows the tag's closing `]` (the attribute area has ended).
+    let mut quote: Option<u8> = None;
+    while i < backslash {
+        let c = bytes[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) if c == b'`' => i += 1,
+            Some(_) => {}
+            None if c == b']' && opener == b'[' => return None,
+            None if c == b'"' || c == b'\'' => quote = Some(c),
+            None => {}
+        }
+        i += 1;
+    }
+    if quote.is_some() {
+        return None;
+    }
+    Some(backslash)
 }
 
 /// Split a label line into `(name, macro_name)`. `name` is the part before
@@ -722,6 +861,23 @@ fn parse_attrib_value(
         });
     }
 
+    // A `&`/`%` prefix may immediately precede a quoted value
+    // (`key=&"expr"`). The reference consumes the prefix before it checks
+    // for the quote delimiter, so the quote opens the value rather than being
+    // part of it (`KAGParser.cpp:2067-2078`). Keep the prefix on the result:
+    // the state layer strips one prefix and evaluates the unquoted content.
+    let prefix = if matches!(chars[*pos], '&' | '%')
+        && chars
+            .get(*pos + 1)
+            .is_some_and(|c| matches!(*c, '"' | '\''))
+    {
+        let p = chars[*pos];
+        *pos += 1;
+        Some(p)
+    } else {
+        None
+    };
+
     let quoted = matches!(chars[*pos], '"' | '\'');
     if quoted {
         let quote = chars[*pos];
@@ -751,7 +907,11 @@ fn parse_attrib_value(
         }
         // The reference tolerates an unclosed quote in `@` line-command
         // mode: the value simply runs to the end of the line.
-        Ok(unescape(&chars[value_start..value_end]))
+        let mut value = unescape(&chars[value_start..value_end]);
+        if let Some(p) = prefix {
+            value.insert(0, p);
+        }
+        Ok(value)
     } else {
         let value_start = *pos;
         while *pos < chars.len() {
