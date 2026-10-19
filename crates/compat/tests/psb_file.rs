@@ -236,7 +236,7 @@ fn objects_v2(entries: &[(u32, Vec<u8>)]) -> Vec<u8> {
 fn build_fixture() -> Vec<u8> {
     let names = [
         "id", "num", "str", "arr", "res", "flag", "nothing", "spec", "a", "b", "sub", "realv",
-        "big",
+        "big", "nested",
     ];
     let (charset, names_data, name_indexes) = encode_names(&names);
     // The names-section `nameIndexes` table holds trie slot indices, but an
@@ -258,6 +258,12 @@ fn build_fixture() -> Vec<u8> {
     let chunk_lengths = vec![resource.len() as u32];
 
     let nested = objects_v2(&[(positions[8], num1(9)), (positions[9], vec![0x15, 1])]);
+    // A resource nested in a dictionary and one nested in a list, so the
+    // `psb://` registration walk is exercised below the root.
+    let resource_nest = objects_v2(&[
+        (positions[8], vec![0x19, 0]),
+        (positions[9], list_value(&[vec![0x19, 0]])),
+    ]);
     let entries: Vec<(u32, Vec<u8>)> = vec![
         (positions[0], vec![0x15, 2]),                         // id = "motion"
         (positions[1], num4(1234)),                            // num
@@ -268,6 +274,7 @@ fn build_fixture() -> Vec<u8> {
         (positions[6], vec![0x01]),                            // nothing = null
         (positions[7], vec![0x15, 3]),                         // spec = "krkr"
         (positions[10], nested),                               // sub
+        (positions[13], resource_nest),                        // nested
         (positions[11], {
             // A `Float` value: type byte `0x1E` + little-endian f32
             // (`reference/cpp/plugins/psbfile/PSBFile.cpp:244-247`).
@@ -460,6 +467,40 @@ fn load_registers_psb_resources_in_the_psb_media() {
         env.int("missing"),
         0,
         "an unregistered key must not resolve"
+    );
+}
+
+// `PSB::registerRootResources` walks the whole value tree, so a resource
+// nested below the root is registered under its `/`-joined member path and a
+// list entry contributes its index as a path segment
+// (`reference/cpp/plugins/psbfile/PSBMediaRegistry.cpp:16-77`).
+#[test]
+fn nested_psb_resources_are_registered_under_their_member_path() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.write_fixture("fixture.psb", &build_fixture());
+
+    env.run("var f = new PSBFile(); var ok = f.load('fixture.psb');");
+
+    assert_eq!(env.int("ok"), 1);
+    assert_eq!(
+        env._storage
+            .read("psb://fixture.psb/nested/a")
+            .expect("the dictionary-nested chunk resolves"),
+        b"FAKEIMAGE".to_vec()
+    );
+    assert_eq!(
+        env._storage
+            .read("psb://fixture.psb/nested/b/0")
+            .expect("the list-nested chunk resolves"),
+        b"FAKEIMAGE".to_vec()
+    );
+    // The top-level resource stays reachable too.
+    assert_eq!(
+        env._storage
+            .read("psb://fixture.psb/res")
+            .expect("the root chunk resolves"),
+        b"FAKEIMAGE".to_vec()
     );
 }
 

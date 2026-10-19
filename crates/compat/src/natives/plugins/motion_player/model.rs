@@ -6,7 +6,8 @@
 //! `NodeTree.cpp` and `MotionNode.h`. The reference parses the PSB tree into a
 //! `MotionSnapshot` and then walks the active clip's `layer` array into a
 //! persistent `MotionNode` deque; this module does the same over the compact
-//! [`PsbValue`] tree produced by [`super::psb`].
+//! [`PsbValue`] tree produced by the shared PSB container parser
+//! ([`psb_file::container`](crate::natives::plugins::psb_file::container)).
 //!
 //! Everything here is plain data owned by a [`Player`](super::player::Player)
 //! (or a [`ResourceManager`](super::resource::ResourceManager) cache entry);
@@ -15,7 +16,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::animator::Animator;
-use super::psb::{Psb, PsbValue};
+use crate::natives::plugins::psb_file::container::{PsbDocument, PsbValue};
 
 /// One variable keyframe (`VariableFrameInfo`).
 #[derive(Debug, Clone, PartialEq)]
@@ -314,16 +315,38 @@ impl MotionNode {
 }
 
 /// The canvas geometry of a `source.<chara>.icon.<name>` entry.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IconInfo {
+    /// The `source.<group>` the icon belongs to.
+    pub(crate) group: String,
+    /// The icon's name inside its group.
+    pub(crate) name: String,
     /// The icon width in pixels.
     pub(crate) width: f64,
     /// The icon height in pixels.
     pub(crate) height: f64,
+    /// The icon's horizontal offset inside its group texture atlas.
+    pub(crate) left: f64,
+    /// The icon's vertical offset inside its group texture atlas.
+    pub(crate) top: f64,
     /// The horizontal anchor origin.
     pub(crate) origin_x: f64,
     /// The vertical anchor origin.
     pub(crate) origin_y: f64,
+    /// Whether the icon's own pixel chunk is `RL` run-length compressed.
+    pub(crate) compressed: bool,
+}
+
+/// The pixel atlas a group's icons are cropped from
+/// (`source.<group>.texture`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TextureInfo {
+    /// The atlas width in pixels.
+    pub(crate) width: f64,
+    /// The atlas height in pixels.
+    pub(crate) height: f64,
+    /// Whether the atlas pixel chunk is `RL` run-length compressed.
+    pub(crate) compressed: bool,
 }
 
 /// One motion clip (`MotionClip`).
@@ -342,6 +365,8 @@ pub(crate) struct MotionClip {
 /// A parsed motion module (`MotionSnapshot`).
 #[derive(Debug, Clone)]
 pub(crate) struct MotionSnapshot {
+    /// The normalized `psb://` container name the module was loaded from.
+    pub(crate) container: String,
     /// The natural width.
     pub(crate) width: f64,
     /// The natural height.
@@ -378,6 +403,8 @@ pub(crate) struct MotionSnapshot {
     pub(crate) clip_index: HashMap<String, usize>,
     /// `source.<chara>.icon.<name>` geometry keyed by `src/<chara>/<name>`.
     pub(crate) icons: HashMap<String, IconInfo>,
+    /// `source.<chara>.texture` atlases keyed by `<chara>`.
+    pub(crate) textures: HashMap<String, TextureInfo>,
     /// The active root layer list.
     pub(crate) layers: Vec<PsbValue>,
     /// The raw metadata dictionary (for `Player::initPhysics` / `metadata`).
@@ -387,9 +414,9 @@ pub(crate) struct MotionSnapshot {
 }
 
 impl MotionSnapshot {
-    /// Parse a snapshot from a PSB document.
-    pub(crate) fn from_psb(psb: Psb) -> Self {
-        let Psb { root, .. } = psb;
+    /// Parse a snapshot from a parsed PSB container loaded from `container`.
+    pub(crate) fn from_psb(document: PsbDocument, container: &str) -> Self {
+        let PsbDocument { root, .. } = document;
         // `metadata.base` holds only the default character and action
         // (`chara`/`motion`); the variable, controller, selector and timeline
         // lists are direct children of `metadata`
@@ -425,8 +452,11 @@ impl MotionSnapshot {
             .unwrap_or(0.0);
         let mut icons = HashMap::new();
         collect_icons(&root, &mut icons);
+        let mut textures = HashMap::new();
+        collect_textures(&root, &mut textures);
 
         let mut snapshot = Self {
+            container: container.to_string(),
             width,
             height,
             main_timelines: Vec::new(),
@@ -445,6 +475,7 @@ impl MotionSnapshot {
             clips: Vec::new(),
             clip_index: HashMap::new(),
             icons,
+            textures,
             layers: Vec::new(),
             metadata: PsbValue::Null,
             root,
@@ -723,7 +754,7 @@ impl MotionSnapshot {
             self.layers = layers.clone();
             self.add_clip(
                 "default",
-                &PsbValue::Dict(vec![("layer".into(), PsbValue::List(layers))]),
+                &PsbValue::Dictionary(vec![("layer".into(), PsbValue::List(layers))]),
             );
         }
         // The first clip's layers are the default active set.
@@ -1202,33 +1233,78 @@ fn navigate<'a>(mut value: &'a PsbValue, path: &[&str]) -> Option<&'a PsbValue> 
 }
 
 /// Collect the `source.<chara>.icon.<name>` canvas geometry keyed by the
-/// `src/<chara>/<name>` path a frame's `content.src` carries. Reference
-/// `collectRootResources` / `MotionSnapshot::iconList`.
+/// `src/<chara>/<name>` path a frame's `content.src` carries.
+///
+/// `width`/`height` fall back to the icon's `truncated_width`/
+/// `truncated_height`, and an icon with no usable size is skipped.
 fn collect_icons(root: &PsbValue, icons: &mut HashMap<String, IconInfo>) {
     let Some(source) = root.get("source").and_then(PsbValue::as_dict) else {
         return;
     };
-    for (chara, node) in source {
+    for (group, node) in source {
         let Some(icon) = node.get("icon").and_then(PsbValue::as_dict) else {
             continue;
         };
         for (name, info) in icon {
-            let width = number_of(info.get("width")).unwrap_or(0.0);
-            let height = number_of(info.get("height")).unwrap_or(0.0);
+            let width = number_of(info.get("width"))
+                .or_else(|| number_of(info.get("truncated_width")))
+                .unwrap_or(0.0);
+            let height = number_of(info.get("height"))
+                .or_else(|| number_of(info.get("truncated_height")))
+                .unwrap_or(0.0);
             if width <= 0.0 || height <= 0.0 {
                 continue;
             }
             icons.insert(
-                format!("src/{chara}/{name}"),
+                format!("src/{group}/{name}"),
                 IconInfo {
+                    group: group.clone(),
+                    name: name.clone(),
                     width,
                     height,
+                    left: number_of(info.get("left")).unwrap_or(0.0),
+                    top: number_of(info.get("top")).unwrap_or(0.0),
                     origin_x: number_of(info.get("originX")).unwrap_or(0.0),
                     origin_y: number_of(info.get("originY")).unwrap_or(0.0),
+                    compressed: is_rl_compressed(info),
                 },
             );
         }
     }
+}
+
+/// Collect the `source.<chara>.texture` atlas sizes keyed by `<chara>`.
+fn collect_textures(root: &PsbValue, textures: &mut HashMap<String, TextureInfo>) {
+    let Some(source) = root.get("source").and_then(PsbValue::as_dict) else {
+        return;
+    };
+    for (group, node) in source {
+        let Some(texture) = node.get("texture") else {
+            continue;
+        };
+        let width = number_of(texture.get("width"))
+            .or_else(|| number_of(texture.get("truncated_width")))
+            .unwrap_or(0.0);
+        let height = number_of(texture.get("height"))
+            .or_else(|| number_of(texture.get("truncated_height")))
+            .unwrap_or(0.0);
+        if width <= 0.0 || height <= 0.0 {
+            continue;
+        }
+        textures.insert(
+            group.clone(),
+            TextureInfo {
+                width,
+                height,
+                compressed: is_rl_compressed(texture),
+            },
+        );
+    }
+}
+
+/// Whether a node's `compress` member names the `RL` pixel compression.
+fn is_rl_compressed(value: &PsbValue) -> bool {
+    matches!(value.get("compress"), Some(PsbValue::String(name)) if name == "RL")
 }
 
 fn list_of(value: Option<&PsbValue>) -> Option<&[PsbValue]> {
@@ -1277,7 +1353,7 @@ mod tests {
     use super::*;
 
     fn dict(entries: Vec<(&str, PsbValue)>) -> PsbValue {
-        PsbValue::Dict(
+        PsbValue::Dictionary(
             entries
                 .into_iter()
                 .map(|(key, value)| (key.to_string(), value))
@@ -1340,11 +1416,23 @@ mod tests {
                 ("height", num(184)),
                 ("originX", num(219)),
                 ("originY", num(92)),
+                ("left", num(12)),
+                ("top", num(7)),
             ]),
         )]);
-        let source = dict(vec![("title", dict(vec![("icon", icon)]))]);
+        let texture = dict(vec![("width", num(800)), ("height", num(1080))]);
+        let source = dict(vec![(
+            "title",
+            dict(vec![("icon", icon), ("texture", texture)]),
+        )]);
         let root = dict(vec![("object", object), ("source", source)]);
-        MotionSnapshot::from_psb(Psb { root })
+        MotionSnapshot::from_psb(
+            PsbDocument {
+                root,
+                resources: Vec::new(),
+            },
+            "title.psb",
+        )
     }
 
     #[test]
@@ -1356,11 +1444,27 @@ mod tests {
             .expect("the source icon is indexed by its frame path");
         // `source/<group>/icon/<name>` carries width/height/originX/originY
         // (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1514`,
-        // `reference/cpp/plugins/motionplayer/PlayerInternal.h:1620`).
+        // `reference/cpp/plugins/motionplayer/PlayerInternal.h:1620`), plus
+        // the atlas crop offsets the texture path uses
+        // (`reference/cpp/plugins/motionplayer/PlayerInternal.h:1693-1700`).
         assert_eq!(icon.width, 437.0);
         assert_eq!(icon.height, 184.0);
         assert_eq!(icon.origin_x, 219.0);
         assert_eq!(icon.origin_y, 92.0);
+        assert_eq!(icon.left, 12.0);
+        assert_eq!(icon.top, 7.0);
+        assert_eq!(icon.group, "title");
+        assert_eq!(icon.name, "logo");
+        let texture = snapshot
+            .textures
+            .get("title")
+            .expect("the group texture is indexed by its group");
+        // The atlas size lives on the sibling `texture` node
+        // (`reference/cpp/plugins/motionplayer/PlayerInternal.h:1683-1700`).
+        assert_eq!(texture.width, 800.0);
+        assert_eq!(texture.height, 1080.0);
+        assert!(!texture.compressed);
+        assert_eq!(snapshot.container, "title.psb");
     }
 
     #[test]
@@ -1408,9 +1512,13 @@ mod tests {
             "self",
             dict(vec![("motion", dict(vec![("self", clip)]))]),
         )]);
-        let snapshot = MotionSnapshot::from_psb(Psb {
-            root: dict(vec![("object", object)]),
-        });
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root: dict(vec![("object", object)]),
+                resources: Vec::new(),
+            },
+            "self.psb",
+        );
         let clip = snapshot.clip("self").expect("the self clip parses");
         let nodes = build_node_tree(&snapshot, Some(clip));
         assert_eq!(nodes.len(), 2);

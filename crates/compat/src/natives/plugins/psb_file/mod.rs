@@ -45,13 +45,15 @@
 //!
 //! # `psb://` media
 //!
-//! `load` registers every top-level resource into the `psb://` storage
+//! `load` registers every resource of the container in the `psb://` storage
 //! media (`PSBMedia`, `main.cpp:60-67` + `PSBMedia.h:6-45`) so scripts can
-//! open `psb://…` paths afterwards. The registration goes through the L2
-//! `engine_api::Storage::register_media` table, which serves those names before
-//! disk and archive resolution; the container name is lower-cased from its
-//! first `.` exactly as `PSBMedia::NormalizeDomainName` does
-//! (`PSBMedia.cpp:16-22`).
+//! open `psb://…` paths afterwards. The whole value tree is walked, so a
+//! resource nested in a dictionary or a list is registered under its
+//! `/`-joined member path with list indices as path segments. The registration
+//! goes through the L2 `engine_api::Storage::register_media` table, which
+//! serves those names before disk and archive resolution; the container name
+//! is lower-cased from its first `.`, so `.psb` and `.PSB` containers share
+//! one name.
 //!
 //! # Architecture
 //!
@@ -61,7 +63,7 @@
 //! game script sees the same shapes as the reference `toTJSVal` conversions.
 #![allow(unsafe_code)]
 
-mod container;
+pub(crate) mod container;
 mod decompress;
 mod error;
 
@@ -367,36 +369,35 @@ fn load_document(ctx: &CompatCtx, inst: &mut PsbFileInst, path: &str) -> Result<
     }
 }
 
-/// Registers every top-level resource of a loaded PSB under
-/// `psb://<normalized path>/<key>` in the L2 storage media table.
+/// Registers every resource of a loaded PSB under
+/// `psb://<normalized path>/<member path>` in the L2 storage media table.
 ///
-/// Reference `PSBFile.load` walks `getObjects()` and adds each `PSBResource`
-/// to the `psb://` media after `PSBMedia::NormalizeDomainName` lower-cases the
-/// container's extension (`reference/cpp/plugins/psbfile/main.cpp:60-68`,
-/// `PSBMedia.cpp:16-22`). `PSDInfo.loadPIMG` then opens those entries as
-/// `psb://<container>/<layer_id>.tlg` (`data.xp3:system/psdlayer.tjs`).
+/// A resource is reachable under the `/`-joined path of the dictionaries and
+/// lists that contain it, and the container's extension is lower-cased, so
+/// scripts open resources as `psb://<container>/<member path>`.
 fn register_media(storage: *mut Storage, path: &str, document: &PsbDocument) {
-    let PsbValue::Dictionary(entries) = &document.root else {
-        return;
-    };
     let container = normalize_psb_domain(path);
     // SAFETY: the caller holds the live storage pointer for the call and the
     // registration only touches its interior-mutable media table.
     let storage = unsafe { &*storage };
-    for (key, value) in entries {
-        let PsbValue::Resource(reference) = value else {
-            continue;
-        };
-        let Some(bytes) = document.resource_bytes(*reference) else {
-            continue;
-        };
-        storage.register_media(format!("psb://{container}/{key}"), bytes.to_vec());
-    }
+    document.visit_resources(&mut |member: &str, bytes| {
+        register_psb_resource(storage, &container, member, bytes);
+    });
+}
+
+/// Registers one resource of a container under its `psb://` name.
+pub(crate) fn register_psb_resource(
+    storage: &Storage,
+    container: &str,
+    member: &str,
+    bytes: &[u8],
+) {
+    storage.register_media(format!("psb://{container}/{member}"), bytes.to_vec());
 }
 
 /// Reference `PSBMedia::NormalizeDomainName` (`PSBMedia.cpp:16-22`):
 /// lower-case from the first `.` onward.
-fn normalize_psb_domain(path: &str) -> String {
+pub(crate) fn normalize_psb_domain(path: &str) -> String {
     match path.find('.') {
         Some(dot) => format!("{}{}", &path[..dot], path[dot..].to_lowercase()),
         None => path.to_string(),

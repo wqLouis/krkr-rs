@@ -17,8 +17,11 @@ use super::StoredValue;
 use super::emote::ModuleSettings;
 use super::helpers::{eval_object, inst_mut, set_retained};
 use super::model::MotionSnapshot;
-use super::psb::{PsbValue, parse_stream};
+use crate::engine_api::Storage;
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
+use crate::natives::plugins::psb_file::container::{PsbDocument, PsbValue, parse_stream};
+use crate::natives::plugins::psb_file::{normalize_psb_domain, register_psb_resource};
+use crate::natives::storages::extract_storage_name;
 use crate::natives::system::{resolve, value_as_i64};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
@@ -262,6 +265,22 @@ extern "C" fn resource_ctor(
     0
 }
 
+/// Register every resource of a loaded motion container in the `psb://`
+/// storage media, under the container's normalized name.
+///
+/// A motion container is registered under both the name it was loaded by and
+/// its final path component, so a game can resolve its icon textures either
+/// way.
+fn register_motion_media(storage: &Storage, document: &PsbDocument, container: &str) {
+    let alias = normalize_psb_domain(&extract_storage_name(container));
+    document.visit_resources(&mut |member, bytes| {
+        register_psb_resource(storage, container, member, bytes);
+        if alias != container {
+            register_psb_resource(storage, &alias, member, bytes);
+        }
+    });
+}
+
 /// Read and parse the PSB at `path`, register the snapshot and its module
 /// object in the engine store, and return both plus the module handle.
 ///
@@ -286,8 +305,10 @@ pub(crate) fn read_motion_module(
         Err(error) => return Err(error.to_string()),
     }
     let bytes = storage.read(name).map_err(|error| error.to_string())?;
-    let psb = parse_stream(&bytes, seed).map_err(|error| error.0)?;
-    let snapshot = MotionSnapshot::from_psb(psb);
+    let document = parse_stream(&bytes, seed).map_err(|error| error.to_string())?;
+    let container = normalize_psb_domain(path);
+    register_motion_media(storage, &document, &container);
+    let snapshot = MotionSnapshot::from_psb(document, &container);
     let id = services.state::<MotionStore>().insert(snapshot);
     let registered = {
         let store = services.state::<MotionStore>();
@@ -434,7 +455,7 @@ fn build_psb(ctx: &CompatCtx, value: &PsbValue) -> Result<Built, String> {
             }
             Ok(Built::Object(array))
         }
-        PsbValue::Dict(entries) => {
+        PsbValue::Dictionary(entries) => {
             let dictionary = eval_object(ctx, "%[]")?;
             for (key, item) in entries {
                 let built = build_psb(ctx, item)?;
@@ -442,10 +463,10 @@ fn build_psb(ctx: &CompatCtx, value: &PsbValue) -> Result<Built, String> {
             }
             Ok(Built::Object(dictionary))
         }
-        PsbValue::Resource(index, extra) => Ok(Built::Scalar(TjsValue::Integer(if *extra {
-            (*index as i64) | 0x4000_0000
+        PsbValue::Resource(reference) => Ok(Built::Scalar(TjsValue::Integer(if reference.extra {
+            i64::from(reference.index) | 0x4000_0000
         } else {
-            *index as i64
+            i64::from(reference.index)
         }))),
     }
 }

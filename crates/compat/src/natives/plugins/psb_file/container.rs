@@ -231,6 +231,155 @@ impl PsbDocument {
             .find(|(candidate, _)| *candidate == reference)
             .map(|(_, data)| data.as_slice())
     }
+
+    /// Call `visit` with the `/`-joined member path and bytes of every
+    /// resource in the tree. List entries contribute their index as a path
+    /// segment, and a resource is a leaf.
+    pub(crate) fn visit_resources(&self, visit: &mut impl FnMut(&str, &[u8])) {
+        visit_value(&self.root, self, &mut Vec::new(), visit);
+    }
+}
+
+fn visit_value(
+    value: &PsbValue,
+    document: &PsbDocument,
+    member: &mut Vec<String>,
+    visit: &mut impl FnMut(&str, &[u8]),
+) {
+    match value {
+        PsbValue::Resource(reference) => {
+            if member.is_empty() {
+                return;
+            }
+            match document.resource_bytes(*reference) {
+                Some(bytes) => visit(&member.join("/"), bytes),
+                None => log::warn!(
+                    "psb: resource chunk {}:{} carries no bytes",
+                    if reference.extra { "extra" } else { "normal" },
+                    reference.index
+                ),
+            }
+        }
+        PsbValue::List(items) => {
+            for (index, item) in items.iter().enumerate() {
+                member.push(index.to_string());
+                visit_value(item, document, member, visit);
+                member.pop();
+            }
+        }
+        PsbValue::Dictionary(entries) => {
+            for (key, item) in entries {
+                member.push(key.clone());
+                visit_value(item, document, member, visit);
+                member.pop();
+            }
+        }
+        PsbValue::Null
+        | PsbValue::Bool(_)
+        | PsbValue::Int(_)
+        | PsbValue::Float(_)
+        | PsbValue::Double(_)
+        | PsbValue::Array(_)
+        | PsbValue::String(_) => {}
+    }
+}
+
+impl PsbValue {
+    /// The entries of an integer-array value.
+    pub(crate) fn as_array(&self) -> Option<&[u32]> {
+        match self {
+            Self::Array(values) => Some(values),
+            Self::Null
+            | Self::Bool(_)
+            | Self::Int(_)
+            | Self::Float(_)
+            | Self::Double(_)
+            | Self::String(_)
+            | Self::Resource(_)
+            | Self::List(_)
+            | Self::Dictionary(_) => None,
+        }
+    }
+
+    /// The entry for `key` in a dictionary value.
+    pub(crate) fn get(&self, key: &str) -> Option<&PsbValue> {
+        match self {
+            Self::Dictionary(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            Self::Null
+            | Self::Bool(_)
+            | Self::Int(_)
+            | Self::Float(_)
+            | Self::Double(_)
+            | Self::Array(_)
+            | Self::String(_)
+            | Self::Resource(_)
+            | Self::List(_) => None,
+        }
+    }
+
+    /// A numeric value coerced to `f64`.
+    pub(crate) fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Int(value) => Some(*value as f64),
+            Self::Float(value) => Some(f64::from(*value)),
+            Self::Double(value) => Some(*value),
+            Self::Bool(value) => Some(if *value { 1.0 } else { 0.0 }),
+            Self::Null
+            | Self::Array(_)
+            | Self::String(_)
+            | Self::Resource(_)
+            | Self::List(_)
+            | Self::Dictionary(_) => None,
+        }
+    }
+
+    /// A boolean value (numbers coerce to `!= 0`).
+    pub(crate) fn as_bool(&self) -> bool {
+        match self {
+            Self::Bool(value) => *value,
+            Self::Int(value) => *value != 0,
+            Self::Float(value) => *value != 0.0,
+            Self::Double(value) => *value != 0.0,
+            Self::Null
+            | Self::Array(_)
+            | Self::String(_)
+            | Self::Resource(_)
+            | Self::List(_)
+            | Self::Dictionary(_) => false,
+        }
+    }
+
+    /// A list value.
+    pub(crate) fn as_list(&self) -> Option<&[PsbValue]> {
+        match self {
+            Self::List(items) => Some(items),
+            Self::Null
+            | Self::Bool(_)
+            | Self::Int(_)
+            | Self::Float(_)
+            | Self::Double(_)
+            | Self::Array(_)
+            | Self::String(_)
+            | Self::Resource(_)
+            | Self::Dictionary(_) => None,
+        }
+    }
+
+    /// A dictionary value.
+    pub(crate) fn as_dict(&self) -> Option<&[(String, PsbValue)]> {
+        match self {
+            Self::Dictionary(entries) => Some(entries),
+            Self::Null
+            | Self::Bool(_)
+            | Self::Int(_)
+            | Self::Float(_)
+            | Self::Double(_)
+            | Self::Array(_)
+            | Self::String(_)
+            | Self::Resource(_)
+            | Self::List(_) => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

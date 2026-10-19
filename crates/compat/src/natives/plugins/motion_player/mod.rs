@@ -11,8 +11,9 @@
 //! the complete script-visible surface and the playback model (timelines,
 //! variables, transitions, wind/outer force, layer queries, particles) and
 //! composes the L2 `engine_api::Scene` layer system for drawing instead of
-//! re-implementing the D3D rasterizer. PSB data is parsed by [`psb`] and
-//! mapped to the runtime model in [`model`].
+//! re-implementing the D3D rasterizer. PSB data is parsed by the shared
+//! `psb_file` container parser, mapped to the runtime model in [`model`], and
+//! its pixel chunks are decoded by [`texture`].
 //!
 //! # Coordination note
 //!
@@ -38,8 +39,8 @@ pub(crate) mod emote;
 pub(crate) mod helpers;
 pub(crate) mod model;
 pub(crate) mod player;
-pub(crate) mod psb;
 pub(crate) mod resource;
+pub(crate) mod texture;
 
 use std::ffi::c_void;
 

@@ -5,15 +5,16 @@
 //! `PlayerFrameProgress.cpp`, `PlayerUpdate*.cpp` and `PlayerLayerQuery.cpp`.
 //!
 //! The port keeps the whole script-visible surface and the playback model
-//! (timeline state, variable animators, coordinate/scale/rotate/colour
+//! (timeline state, variable animators, coordinate/scale/rotate/color
 //! transitions, wind / outer force, hit testing, layer queries). Node-tree
 //! evaluation and drawing compose the L2 `engine_api::Scene` layer system:
-//! [`PlayerInst::draw`] writes the root transform onto the target layer and
-//! rasterises the visible shape nodes with `engine_api::raster` rather than
-//! re-implementing the D3D renderer.
+//! [`PlayerInst::draw`] writes the root transform onto the target layer, then
+//! maps each node's icon pixels onto its transformed quad with
+//! `engine_api::layer_ops`, decoding the container's `RL`/palettized pixel
+//! chunks itself.
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use tjs::{DetachedValue, RetainedValue, TjsValue, VAL_OBJECT, Value};
@@ -23,10 +24,13 @@ use super::adaptors::SeparateInst;
 use super::animator::{Animator, ColorAnimator, ease_weight};
 use super::helpers::{eval_object, inst_mut, inst_ref, set_string, value_as_f64};
 use super::model::{
-    MotionEvent, MotionNode, MotionSnapshot, TimelineState, build_node_tree, evaluate_frames,
-    prime_timelines, step_timelines,
+    FrameState, IconInfo, MotionEvent, MotionNode, MotionSnapshot, TimelineState, build_node_tree,
+    evaluate_frames, prime_timelines, step_timelines,
 };
 use super::resource::{MotionStore, ResourceInst};
+use super::texture::{Pixels, decode_pixels};
+use crate::engine_api::layer_ops::{AffineBlit, BlitOptions, BlitSource, RectI, affine_blit};
+use crate::engine_api::{BitmapState, Storage, StorageReadError};
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
 use crate::natives::system::{resolve, value_as_bool, value_as_i64};
 use crate::storage::strip_file_media;
@@ -126,6 +130,12 @@ pub(crate) struct PlayerInst {
     pub(crate) nodes: Vec<MotionNode>,
     pub(crate) current_frame: f64,
     pub(crate) pending_events: Vec<MotionEvent>,
+    /// The decoded pixel chunks the active motion draws, keyed by their
+    /// `psb://` storage name.
+    pub(crate) textures: HashMap<String, Arc<Pixels>>,
+    /// The `src` keys already reported as having no readable texture, so a
+    /// missing icon is reported once instead of on every frame.
+    pub(crate) missing_textures: BTreeSet<String>,
 
     // Emote transform state.
     pub(crate) coord: CoordState,
@@ -228,6 +238,8 @@ impl Default for PlayerInst {
             nodes: Vec::new(),
             current_frame: 0.0,
             pending_events: Vec::new(),
+            textures: HashMap::new(),
+            missing_textures: BTreeSet::new(),
             coord: CoordState::default(),
             scale: Animator::at(1.0),
             rotate: Animator::at(0.0),
@@ -400,6 +412,8 @@ impl PlayerInst {
         self.variable_values.clear();
         self.variable_animators.clear();
         self.affine = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        self.textures.clear();
+        self.missing_textures.clear();
     }
 
     /// Activate a resolved motion and rebuild the timeline, node and variable
@@ -482,6 +496,8 @@ impl PlayerInst {
             self.snapshot = None;
             self.timelines.clear();
             self.playing_timelines.clear();
+            self.textures.clear();
+            self.missing_textures.clear();
         }
     }
 
@@ -497,6 +513,8 @@ impl PlayerInst {
         self.variable_values.clear();
         self.variable_animators.clear();
         self.affine = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        self.textures.clear();
+        self.missing_textures.clear();
         self.motion_key.clear();
         if let Some(manager) = self.resource_manager.object_id() {
             clear_manager_cache(ctx, manager);
@@ -1016,47 +1034,37 @@ impl PlayerInst {
         if width <= 0 || height <= 0 {
             return Ok(());
         }
+        let snapshot = self.snapshot.clone();
+        // SAFETY: the host keeps the attached storage alive for the binding.
+        let storage = unsafe { ctx.services() }.storage();
+        // SAFETY: the host keeps the attached storage alive for the binding.
+        let storage = storage.map(|storage| unsafe { &*storage });
+        let textures = &mut self.textures;
         let rendered = scene.with_main_image_pixels_mut(layer_id, |pixels| {
-            let mut bitmap =
-                crate::engine_api::BitmapState::new(width as u32, height as u32, pixels.to_vec());
+            let mut bitmap = BitmapState::new(width as u32, height as u32, pixels.to_vec());
+            let mut missing = Vec::new();
             for node in &nodes {
-                let (cx, cy) = (node.accumulated.x, node.accumulated.y);
-                let (sx, sy) = (
-                    node.accumulated.scale_x.abs().max(0.01),
-                    node.accumulated.scale_y.abs().max(0.01),
+                draw_node(
+                    &mut bitmap,
+                    node,
+                    snapshot.as_deref(),
+                    storage,
+                    color,
+                    textures,
+                    &mut missing,
                 );
-                // An object layer draws the `source` icon it names; a shape
-                // layer keeps the fixed-size quad approximation.
-                let points = match self
-                    .snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.icons.get(&node.local.src))
-                {
-                    Some(icon) => {
-                        let x0 = cx - icon.origin_x * sx;
-                        let y0 = cy - icon.origin_y * sy;
-                        vec![
-                            (x0, y0),
-                            (x0 + icon.width * sx, y0),
-                            (x0 + icon.width * sx, y0 + icon.height * sy),
-                            (x0, y0 + icon.height * sy),
-                        ]
-                    }
-                    None => vec![
-                        (cx - 32.0 * sx, cy - 32.0 * sy),
-                        (cx + 32.0 * sx, cy - 32.0 * sy),
-                        (cx + 32.0 * sx, cy + 32.0 * sy),
-                        (cx - 32.0 * sx, cy + 32.0 * sy),
-                    ],
-                };
-                let alpha = (f64::from(color[3]) * node.accumulated.opacity.clamp(0.0, 1.0)) as u8;
-                let node_color = [color[0], color[1], color[2], alpha];
-                crate::engine_api::raster::fill_polygon(&mut bitmap, &points, node_color);
             }
-            bitmap.rgba
+            (bitmap.rgba, missing)
         });
-        if let Some(rgba) = rendered
-            && let Some(bitmap_id) = scene.layer(layer_id).and_then(|layer| layer.bitmap)
+        let Some((rgba, missing)) = rendered else {
+            return Ok(());
+        };
+        for src in missing {
+            if self.missing_textures.insert(src.clone()) {
+                log::warn!("Motion.Player.draw: no texture for {src}");
+            }
+        }
+        if let Some(bitmap_id) = scene.layer(layer_id).and_then(|layer| layer.bitmap)
             && let Some(bitmap) = scene.bitmap_mut(bitmap_id)
         {
             bitmap.rgba = rgba;
@@ -1064,6 +1072,271 @@ impl PlayerInst {
         }
         Ok(())
     }
+}
+
+/// Draw one node: the icon texture it names, mapped onto the quad its
+/// accumulated transform describes.
+///
+/// A shape node draws the placeholder quad instead, and a node whose icon has
+/// no readable texture draws nothing and is reported through `missing`.
+fn draw_node(
+    bitmap: &mut BitmapState,
+    node: &MotionNode,
+    snapshot: Option<&MotionSnapshot>,
+    storage: Option<&Storage>,
+    color: [u8; 4],
+    textures: &mut HashMap<String, Arc<Pixels>>,
+    missing: &mut Vec<String>,
+) {
+    let icon = snapshot.and_then(|snapshot| snapshot.icons.get(&node.local.src));
+    let (Some(snapshot), Some(icon), Some(storage)) = (snapshot, icon, storage) else {
+        if node.shape > 0 {
+            fill_placeholder_quad(bitmap, node, color);
+        } else if node.local.src.starts_with("src/") {
+            // Only a `src/<group>/<name>` source names an icon; the layout and
+            // blank sources of container and mask nodes draw nothing.
+            missing.push(node.local.src.clone());
+        }
+        return;
+    };
+    let Some((pixels, crop)) = icon_pixels(snapshot, storage, icon, textures) else {
+        missing.push(node.local.src.clone());
+        return;
+    };
+    let width = (crop.2 - crop.0) as u32;
+    let height = (crop.3 - crop.1) as u32;
+    if width == 0 || height == 0 {
+        return;
+    }
+    // The quad's source is the cropped icon tinted by the player color, so
+    // the corners map that rectangle 1:1 onto the layer.
+    let mut source = BitmapState::new(
+        width,
+        height,
+        vec![0u8; width as usize * height as usize * 4],
+    );
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let from = ((crop.1 as usize + y) * pixels.width as usize + crop.0 as usize + x) * 4;
+            let to = (y * width as usize + x) * 4;
+            for (channel, value) in source.rgba[to..to + 4].iter_mut().enumerate() {
+                *value = (u32::from(pixels.rgba[from + channel]) * u32::from(color[channel]) / 255)
+                    as u8;
+            }
+        }
+    }
+    let matrix = local_matrix(&node.accumulated, &node.transform_order);
+    let (center_x, center_y) = (node.accumulated.x, node.accumulated.y);
+    let corner = |local_x: f64, local_y: f64| {
+        (
+            center_x + matrix[0] * local_x + matrix[1] * local_y,
+            center_y + matrix[2] * local_x + matrix[3] * local_y,
+        )
+    };
+    let (origin_x, origin_y) = (icon.origin_x, icon.origin_y);
+    affine_blit(
+        bitmap,
+        AffineBlit {
+            corners: [
+                corner(-origin_x, -origin_y),
+                corner(f64::from(width) - origin_x, -origin_y),
+                corner(-origin_x, f64::from(height) - origin_y),
+            ],
+            stretch_type: 2,
+            clear: false,
+            clear_color: [0, 0, 0, 0],
+        },
+        BlitSource {
+            bitmap: &source,
+            rect: (0, 0, width as i32, height as i32),
+        },
+        BlitOptions {
+            mode: 2,
+            opa: (node.accumulated.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
+            treat_as_opaque: false,
+            hold_alpha: false,
+        },
+    );
+}
+
+/// Draw the fixed-size solid quad a shape node approximates to.
+fn fill_placeholder_quad(bitmap: &mut BitmapState, node: &MotionNode, color: [u8; 4]) {
+    let (cx, cy) = (node.accumulated.x, node.accumulated.y);
+    let (sx, sy) = (
+        node.accumulated.scale_x.abs().max(0.01),
+        node.accumulated.scale_y.abs().max(0.01),
+    );
+    let points = [
+        (cx - 32.0 * sx, cy - 32.0 * sy),
+        (cx + 32.0 * sx, cy - 32.0 * sy),
+        (cx + 32.0 * sx, cy + 32.0 * sy),
+        (cx - 32.0 * sx, cy + 32.0 * sy),
+    ];
+    let alpha = (f64::from(color[3]) * node.accumulated.opacity.clamp(0.0, 1.0)) as u8;
+    crate::engine_api::raster::fill_polygon(bitmap, &points, [color[0], color[1], color[2], alpha]);
+}
+
+/// Read and decode the pixels `icon` draws from, and the sub-rectangle of them
+/// it occupies.
+///
+/// The icon is cropped from its group's `texture` atlas when the atlas and the
+/// crop are usable, and from its own `pixel` chunk otherwise.
+fn icon_pixels(
+    snapshot: &MotionSnapshot,
+    storage: &Storage,
+    icon: &IconInfo,
+    textures: &mut HashMap<String, Arc<Pixels>>,
+) -> Option<(Arc<Pixels>, RectI)> {
+    let width = pixel_size(icon.width)?;
+    let height = pixel_size(icon.height)?;
+    if let Some(texture) = snapshot.textures.get(&icon.group) {
+        let atlas_path = format!(
+            "psb://{}/source/{}/texture/pixel",
+            snapshot.container, icon.group
+        );
+        let palette_path = format!(
+            "psb://{}/source/{}/texture/pal",
+            snapshot.container, icon.group
+        );
+        if let (Some(atlas_width), Some(atlas_height)) =
+            (pixel_size(texture.width), pixel_size(texture.height))
+            && let Some(atlas) = cached_pixels(
+                storage,
+                &atlas_path,
+                &palette_path,
+                atlas_width,
+                atlas_height,
+                texture.compressed,
+                textures,
+            )
+            && let (Some(left), Some(top)) = (pixel_offset(icon.left), pixel_offset(icon.top))
+            && left + width <= atlas.width
+            && top + height <= atlas.height
+        {
+            let crop = (
+                left as i32,
+                top as i32,
+                (left + width) as i32,
+                (top + height) as i32,
+            );
+            return Some((atlas, crop));
+        }
+    }
+    let icon_path = format!(
+        "psb://{}/source/{}/icon/{}/pixel",
+        snapshot.container, icon.group, icon.name
+    );
+    let palette_path = format!(
+        "psb://{}/source/{}/icon/{}/pal",
+        snapshot.container, icon.group, icon.name
+    );
+    let pixels = cached_pixels(
+        storage,
+        &icon_path,
+        &palette_path,
+        width,
+        height,
+        icon.compressed,
+        textures,
+    )?;
+    Some((pixels, (0, 0, width as i32, height as i32)))
+}
+
+/// The decoded pixels at `path`, from the cache or freshly decoded.
+fn cached_pixels(
+    storage: &Storage,
+    path: &str,
+    palette_path: &str,
+    width: u32,
+    height: u32,
+    compressed: bool,
+    textures: &mut HashMap<String, Arc<Pixels>>,
+) -> Option<Arc<Pixels>> {
+    if let Some(pixels) = textures.get(path) {
+        return Some(pixels.clone());
+    }
+    let bytes = match storage.read(strip_file_media(path)) {
+        Ok(bytes) => bytes,
+        Err(StorageReadError::NotFound(_)) => return None,
+        Err(error) => {
+            log::warn!("Motion.Player.draw: cannot read {path}: {error}");
+            return None;
+        }
+    };
+    let palette = match storage.read(strip_file_media(palette_path)) {
+        Ok(palette) => Some(palette),
+        Err(StorageReadError::NotFound(_)) => None,
+        Err(error) => {
+            log::warn!("Motion.Player.draw: cannot read {palette_path}: {error}");
+            None
+        }
+    };
+    match decode_pixels(&bytes, palette.as_deref(), width, height, compressed) {
+        Ok(decoded) => {
+            let pixels = Arc::new(decoded);
+            textures.insert(path.to_string(), pixels.clone());
+            Some(pixels)
+        }
+        Err(error) => {
+            log::warn!("Motion.Player.draw: cannot decode {path}: {error}");
+            None
+        }
+    }
+}
+
+/// An image dimension rounded to whole pixels, or `None` when it carries no
+/// usable size.
+fn pixel_size(value: f64) -> Option<u32> {
+    let rounded = value.round();
+    if !rounded.is_finite() || rounded < 1.0 || rounded > f64::from(u32::MAX) {
+        return None;
+    }
+    Some(rounded as u32)
+}
+
+/// A whole-pixel offset into an atlas, or `None` when it is negative.
+fn pixel_offset(value: f64) -> Option<u32> {
+    let rounded = value.round();
+    if !rounded.is_finite() || rounded < 0.0 || rounded > f64::from(u32::MAX) {
+        return None;
+    }
+    Some(rounded as u32)
+}
+
+/// The node's local 2x2 transform as `[m11, m12, m21, m22]`, composed from the
+/// flip, angle, zoom and slant steps in the layer's `transformOrder`.
+///
+/// The stored angle is in degrees. A step id outside `0..=3` is skipped, and a
+/// flip is already folded into the sign of the node's scale.
+fn local_matrix(state: &FrameState, order: &[i32; 4]) -> [f64; 4] {
+    let (mut m11, mut m12, mut m21, mut m22) = (1.0f64, 0.0f64, 0.0f64, 1.0f64);
+    for &step in order {
+        match step {
+            0 => {}
+            1 => {
+                if state.angle != 0.0 {
+                    let (sin, cos) = state.angle.to_radians().sin_cos();
+                    let (t11, t12) = (cos * m11 - sin * m21, cos * m12 - sin * m22);
+                    let (t21, t22) = (sin * m11 + cos * m21, sin * m12 + cos * m22);
+                    (m11, m12, m21, m22) = (t11, t12, t21, t22);
+                }
+            }
+            2 => {
+                m11 *= state.scale_x;
+                m12 *= state.scale_x;
+                m21 *= state.scale_y;
+                m22 *= state.scale_y;
+            }
+            3 if state.slant_x != 0.0 || state.slant_y != 0.0 => {
+                let (t11, t12) = (m11 + state.slant_x * m21, m22 * state.slant_x + m12);
+                let (t21, t22) = (m11 * state.slant_y + m21, m22 + m12 * state.slant_y);
+                (m11, m12, m21, m22) = (t11, t12, t21, t22);
+            }
+            3 => {}
+            _ => {}
+        }
+    }
+    [m11, m12, m21, m22]
 }
 
 /// The byte channels a normalized color animator hands the rasterizer.
@@ -1868,7 +2141,9 @@ include!("player_members.rs");
 
 #[cfg(test)]
 mod tests {
+    use super::FrameState;
     use super::color_bytes;
+    use super::local_matrix;
 
     #[test]
     fn color_channels_are_scaled_from_the_normalized_animator() {
@@ -1878,5 +2153,24 @@ mod tests {
         assert_eq!(color_bytes([1.0, 1.0, 1.0, 1.0]), [255, 255, 255, 255]);
         assert_eq!(color_bytes([0.0, 0.5, 0.25, 0.0]), [0, 128, 64, 0]);
         assert_eq!(color_bytes([2.0, -1.0, 1.0, 1.0]), [255, 0, 255, 255]);
+    }
+
+    #[test]
+    fn the_node_matrix_applies_angle_then_zoom() {
+        // The default `transformOrder` is flip, angle, zoom, slant, each
+        // left-multiplied into the local 2x2, and the stored angle is in
+        // degrees (`reference/cpp/plugins/motionplayer/
+        // PlayerUpdateLayersInternal.h:267-336`).
+        let state = FrameState {
+            angle: 90.0,
+            scale_x: 2.0,
+            scale_y: 3.0,
+            ..FrameState::default()
+        };
+        let matrix = local_matrix(&state, &[0, 1, 2, 3]);
+        assert!(matrix[0].abs() < 1e-9, "m11 = cos*sx: {matrix:?}");
+        assert!((matrix[1] + 2.0).abs() < 1e-9, "m12 = -sin*sx: {matrix:?}");
+        assert!((matrix[2] - 3.0).abs() < 1e-9, "m21 = sin*sy: {matrix:?}");
+        assert!(matrix[3].abs() < 1e-9, "m22 = cos*sy: {matrix:?}");
     }
 }

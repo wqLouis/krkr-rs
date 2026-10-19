@@ -122,6 +122,22 @@ impl Env {
             other => panic!("{expression:?} returned {other:?}, expected a string"),
         }
     }
+
+    /// The pixels of the layer bitmap a `Player.draw` wrote, found in the
+    /// attached scene.
+    fn drawn_bitmap(&self) -> (u32, u32, Vec<u8>) {
+        let bitmap = self
+            ._scene
+            .bitmaps
+            .iter()
+            .find(|bitmap| bitmap.width == 800 && bitmap.height == 1080)
+            .expect("the draw target's bitmap");
+        assert!(
+            bitmap.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0),
+            "Player.draw must write pixels into the target layer"
+        );
+        (bitmap.width, bitmap.height, bitmap.rgba.clone())
+    }
 }
 
 #[test]
@@ -329,6 +345,84 @@ fn layer_getter_matches_reference_field_types_and_defaults() {
             "{name} must read back as void"
         );
     }
+}
+
+#[test]
+fn player_draw_samples_the_icon_texture() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    // The default clip's object layers name `src/body_parts/...` icons, whose
+    // pixel chunks live in `source/<group>/icon/<name>/pixel`.
+    // `reference/cpp/plugins/motionplayer/PlayerInternal.h:1600-1835`.
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var w = new Window(); \
+         var target = new Layer(w, null); \
+         target.setSize(800, 1080); \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\"; \
+         p.draw(new Motion.SeparateLayerAdaptor(target));"
+    ));
+    let (width, height, pixels) = env.drawn_bitmap();
+    assert_eq!((width, height), (800, 1080));
+    let texel = |x: usize, y: usize| {
+        let i = (y * width as usize + x) * 4;
+        [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+    };
+    // The sampled texel is fully opaque artwork: the draw blits the decoded
+    // icon pixels, so an opaque texel keeps alpha 255
+    // (`reference/cpp/plugins/motionplayer/PlayerInternal.h:1693-1745`).
+    assert_eq!(
+        texel(20, 300)[3],
+        255,
+        "an opaque texel of the body icon must stay opaque"
+    );
+    // A solid quad would paint every covered pixel with one value; the
+    // texture carries thousands of distinct colours.
+    let distinct: std::collections::HashSet<[u8; 4]> = pixels
+        .chunks_exact(4)
+        .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
+        .collect();
+    assert!(
+        distinct.len() > 1000,
+        "the draw must sample the texture, got {} distinct values",
+        distinct.len()
+    );
+    // The quad ends where the icon does, so the rest of the layer keeps the
+    // layer's transparent fill instead of being covered.
+    assert_eq!(texel(700, 1000)[3], 0);
+}
+
+#[test]
+fn motion_load_registers_nested_psb_resources() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    // Loading a motion registers its container's resources in the `psb://`
+    // media (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1425-1432`),
+    // walking the whole value tree so a nested chunk is reachable by its
+    // `/`-joined member path
+    // (`reference/cpp/plugins/psbfile/PSBMediaRegistry.cpp:16-77`).
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\";"
+    ));
+    let storage = env._storage.as_ref().expect("the fixture storage");
+    // `source/#custom/icon/7/pixel` is resource chunk 57 of the fixture,
+    // 35085 `RL`-compressed bytes.
+    let bytes = storage
+        .read("psb://e-mote3.0バニラパジャマa.psb/source/#custom/icon/7/pixel")
+        .expect("the nested icon chunk resolves through psb://");
+    assert_eq!(bytes.len(), 35085);
+    // A second nested chunk, reached through the group/icon member path.
+    let icon = storage
+        .read("psb://e-mote3.0バニラパジャマa.psb/source/body_parts/icon/腕r00/pixel")
+        .expect("the per-icon chunk resolves through psb://");
+    assert_eq!(icon.len(), 270_140);
 }
 
 #[test]
