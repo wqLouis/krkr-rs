@@ -42,6 +42,19 @@ impl Env {
         Env::build(Some(dir))
     }
 
+    /// A VM whose storage holds a copy of the reference motion fixture at
+    /// `motion/bare_motion.psb`, so a name without an extension exercises the
+    /// candidate list.
+    fn with_motion_alias() -> Env {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../reference/tests/test_files/emote/e-mote3.0バニラパジャマa.psb");
+        let dir = std::env::temp_dir().join("krkr-motion-player-alias");
+        let nested = dir.join("motion");
+        std::fs::create_dir_all(&nested).expect("create alias directory");
+        std::fs::copy(source, nested.join("bare_motion.psb")).expect("copy motion fixture");
+        Env::build(Some(dir))
+    }
+
     fn build(storage_dir: Option<std::path::PathBuf>) -> Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut scene = Box::new(Scene::default());
@@ -743,6 +756,188 @@ fn resource_manager_loads_and_unloads_a_psb_module() {
         env.eval_str(&format!("typeof rm.findSource(\"{path}\")")),
         "void"
     );
+}
+
+#[test]
+fn player_variable_keys_is_an_empty_array_before_a_motion_is_bound() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var p = new Motion.Player(null);");
+    // `Player::getVariableKeys` returns an empty array whenever `_variableKeys`
+    // is still unset, so the property is always an object
+    // (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:1248-1254`).
+    assert_eq!(env.eval_str("typeof p.variableKeys"), "Object");
+    assert_eq!(env.eval_int("p.variableKeys.count"), 0);
+    // A void value raises when a caller reads a member from it
+    // (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1421`), which is the
+    // failure this fallback prevents; a fresh player must stay readable.
+    assert!(env.eval("p.variableKeys.count").is_ok());
+}
+
+#[test]
+fn player_project_binding_syncs_variable_keys_from_the_motion_labels() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var m = rm.load(\"{path}\"); \
+         var p = new Motion.Player(rm); \
+         p.project = m;"
+    ));
+    // `ensureMotionLoaded` activates the object bound to `project` and
+    // `syncVariableKeysFromActiveMotion` copies the motion's
+    // `variableLabels` into `_variableKeys`
+    // (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:503-550`,
+    // `:1068-1076`).
+    assert_eq!(env.eval_str("typeof p.variableKeys"), "Object");
+    assert!(env.eval_int("p.variableKeys.count") >= 24);
+    assert_eq!(env.eval_str("p.variableKeys[0]"), "move_UD");
+}
+
+#[test]
+fn player_variable_keys_getter_does_not_replace_a_void_value_with_the_motion_labels() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\"; \
+         p.variableKeys = void; \
+         var first = p.variableKeys.count; \
+         var second = p.variableKeys.count;"
+    ));
+    // The getter returns a fresh empty array while the stored `_variableKeys`
+    // stays void, and it never replaces that value with the active motion's
+    // labels (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:1248-1254`).
+    assert_eq!(env.eval_str("typeof p.variableKeys"), "Object");
+    assert_eq!(env.eval_int("first"), 0);
+    assert_eq!(env.eval_int("second"), 0);
+}
+
+#[test]
+fn player_motion_key_resolves_a_storage_like_name_and_syncs_variable_keys() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    // A name carrying a path separator or an extension is looked up as it is
+    // (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1319-1349`),
+    // and binding it resets the runtime before the load
+    // (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:471-490`).
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\";"
+    ));
+    assert_eq!(env.eval_str("p.motionKey"), path);
+    assert!(env.eval_int("p.variableKeys.count") >= 24);
+    assert_eq!(env.eval_str("p.variableKeys[0]"), "move_UD");
+}
+
+#[test]
+fn player_motion_key_expands_a_bare_name_through_the_candidate_list() {
+    let _lock = vm_lock();
+    let env = Env::with_motion_alias();
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    // A bare name is looked up as `<name>.mtn`, `<name>.psb`,
+    // `motion/<name>.mtn` and `motion/<name>.psb` in that order
+    // (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1319-1349`).
+    env.run(
+        "var p = new Motion.Player(null); \
+         p.motionKey = \"bare_motion\";",
+    );
+    assert_eq!(env.eval_str("p.motionKey"), "bare_motion");
+    assert!(env.eval_int("p.variableKeys.count") >= 24);
+    assert_eq!(env.eval_str("p.variableKeys[0]"), "move_UD");
+}
+
+#[test]
+fn player_find_motion_returns_the_module_and_syncs_variable_keys() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var p = new Motion.Player(rm); \
+         var found = p.findMotion(\"{path}\");"
+    ));
+    // `findMotion` activates the resolved motion, binds its key, syncs the
+    // variable keys and returns the module object; only a miss returns void
+    // (`reference/cpp/plugins/motionplayer/PlayerResource.cpp:60-73`,
+    // `PlayerCore.cpp:1068-1076`).
+    assert_eq!(env.eval_str("typeof found"), "Object");
+    assert_eq!(env.eval_str("found.path"), path);
+    assert_eq!(env.eval_str("found.metadata.base.chara"), "all_parts");
+    assert_eq!(env.eval_str("p.motionKey"), path);
+    assert!(env.eval_int("p.variableKeys.count") >= 24);
+    assert_eq!(env.eval_str("p.variableKeys[0]"), "move_UD");
+}
+
+#[test]
+fn player_is_exist_motion_resolves_the_candidate_list() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var p = new Motion.Player(rm); \
+         var present = p.isExistMotion(\"{path}\"); \
+         var absent = p.isExistMotion(\"no-such-motion\");"
+    ));
+    // `isExistMotion` is true exactly when the name resolves through the
+    // player's motion lookup (`reference/cpp/plugins/motionplayer/
+    // PlayerResource.cpp:75-78`).
+    assert_eq!(env.eval_int("present ? 1 : 0"), 1);
+    assert_eq!(env.eval_int("absent ? 1 : 0"), 0);
+}
+
+#[test]
+fn player_unload_all_drops_the_bound_motion_and_its_variable_keys() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\"; \
+         var before = p.variableKeys.count; \
+         p.unloadAll(); \
+         var after = p.variableKeys.count;"
+    ));
+    // `unloadAll` clears the cache, the runtime motion state and `motionKey`
+    // (`reference/cpp/plugins/motionplayer/PlayerResource.cpp:35-56`), so the
+    // next variable query has no motion and reports an empty array
+    // (`PlayerCore.cpp:1248-1254`).
+    assert!(env.eval_int("before") >= 24);
+    assert_eq!(env.eval_str("p.motionKey"), "");
+    assert_eq!(env.eval_int("after"), 0);
+}
+
+#[test]
+fn emote_player_load_activates_the_registered_module_snapshot() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var m = rm.load(\"{path}\"); \
+         var e = new Motion.EmotePlayer(rm); \
+         e.load(m);"
+    ));
+    // `EmotePlayer::load` stores the module and activates its registered
+    // snapshot (`reference/cpp/plugins/motionplayer/EmotePlayer.cpp:189-196`),
+    // then `syncVariableKeysFromActiveMotion` fills the labels
+    // (`PlayerCore.cpp:1068-1076`).
+    assert!(env.eval_int("e.variableKeys.count") >= 24);
+    assert_eq!(env.eval_str("e.variableKeys[0]"), "move_UD");
 }
 
 /// Reference: the `PostRegistCallback` defines `global.ShortCutInitialPadKeyMap`

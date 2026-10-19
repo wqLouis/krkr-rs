@@ -86,13 +86,33 @@ mp_set_string!(
 mp_get_string!(player_get_motion_key, PlayerInst, |p: &PlayerInst| p
     .motion_key
     .clone());
-mp_set_string!(
-    player_set_motion_key,
-    PlayerInst,
-    |p: &mut PlayerInst, v: String| {
-        p.motion_key = v;
+extern "C" fn player_set_motion_key(
+    engine: *mut std::ffi::c_void,
+    instance: *mut std::ffi::c_void,
+    value: *const Value,
+    out_error: *mut *mut std::ffi::c_char,
+    _objthis: *mut std::ffi::c_void,
+) -> std::os::raw::c_int {
+    let Some(res) = resolve(engine) else {
+        return report_error(out_error, super::helpers::NO_BINDING);
+    };
+    // SAFETY: the VM guarantees the live payload.
+    let Some(inst) = (unsafe { inst_mut::<PlayerInst>(instance) }) else {
+        return report_error(out_error, "Player: null instance");
+    };
+    // SAFETY: the VM passes a valid value for the duration of the call.
+    let key = if value.is_null() {
+        String::new()
+    } else {
+        value_as_string(unsafe { &*value })
+    };
+    // The emote shell shares this setter and binds the key through the same
+    // resolver.
+    match inst.bind_motion_key(&key, &res.ctx()) {
+        Ok(()) => 0,
+        Err(error) => report_error(out_error, &error),
     }
-);
+}
 mp_get_string!(player_get_outline, PlayerInst, |p: &PlayerInst| p
     .outline
     .clone());
@@ -177,11 +197,47 @@ mp_set_bool!(
         p.selector_enabled = v;
     }
 );
-mp_get_variant!(
-    player_get_variable_keys,
-    PlayerInst,
-    |p: &PlayerInst, ctx: &CompatCtx| { p.variable_keys.to_retained(ctx) }
-);
+extern "C" fn player_get_variable_keys(
+    engine: *mut std::ffi::c_void,
+    instance: *mut std::ffi::c_void,
+    out: *mut Value,
+    out_error: *mut *mut std::ffi::c_char,
+    _objthis: *mut std::ffi::c_void,
+) -> std::os::raw::c_int {
+    let Some(res) = resolve(engine) else {
+        return report_error(out_error, super::helpers::NO_BINDING);
+    };
+    // SAFETY: the VM guarantees the live payload.
+    let Some(inst) = (unsafe { inst_mut::<PlayerInst>(instance) }) else {
+        return report_error(out_error, "Player: null instance");
+    };
+    let ctx = res.ctx();
+    if let Err(error) = inst.ensure_motion_loaded(&ctx) {
+        return report_error(out_error, &error);
+    }
+    if matches!(&inst.variable_keys, StoredValue::Void) {
+        // A void `variableKeys` reads back as a fresh empty array; the stored
+        // value is left as it is.
+        return match eval_object(&ctx, "[]") {
+            Ok(array) => {
+                super::helpers::set_retained(out, array);
+                0
+            }
+            Err(error) => report_error(out_error, &error),
+        };
+    }
+    match inst.variable_keys.to_retained(&ctx) {
+        Ok(RetainedValue::Object(value)) => {
+            super::helpers::set_retained(out, value);
+            0
+        }
+        Ok(RetainedValue::Value(value)) => {
+            super::helpers::set_scalar(&ctx, out, value);
+            0
+        }
+        Err(error) => report_error(out_error, &error),
+    }
+}
 mp_set_variant!(
     player_set_variable_keys,
     PlayerInst,
@@ -549,17 +605,12 @@ extern "C" fn player_set_motion(
             drop(dict);
         }
     }
-    // Reset the playback state and reload
-    // (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:474-489`).
-    inst.motion_key = motion_value;
-    inst.snapshot = None;
-    inst.timelines.clear();
-    inst.playing_timelines.clear();
-    inst.variable_values.clear();
-    inst.variable_keys = StoredValue::Void;
-    inst.affine = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-    inst.ensure_loaded(&ctx);
-    0
+    // Reset the playback state and reload. A same-key assignment after the
+    // callback rewrites the key is a no-op.
+    match inst.bind_motion_key(&motion_value, &ctx) {
+        Ok(()) => 0,
+        Err(error) => report_error(out_error, &error),
+    }
 }
 
 // -- methods ---------------------------------------------------------------
@@ -630,7 +681,7 @@ mp_method_void!(
         // (`reference/cpp/plugins/motionplayer/Player.h:258`).
         super::helpers::require_args(args, 1, "unserialize")?;
         let stored = StoredValue::from_value(&args[0], ctx);
-        p.unserialize(ctx, &stored);
+        p.unserialize(ctx, &stored)?;
         Ok(())
     }
 );
@@ -802,9 +853,11 @@ mp_method_void!(
     |p: &mut PlayerInst, args: &[Value], _ctx: &CompatCtx| {
         // `void unload(ttstr name)` — ncbind arity 1
         // (`reference/cpp/plugins/motionplayer/Player.h:298`).
+        // Every cached motion whose key or source path matches is dropped,
+        // and the active one is released too.
         super::helpers::require_args(args, 1, "unload")?;
         let name = value_as_string(&args[0]);
-        p.layer_ids.remove(&name);
+        p.unload_motion(&name);
         Ok(())
     }
 );
@@ -812,12 +865,10 @@ mp_method_void!(
 mp_method_void!(
     player_unload_all,
     PlayerInst,
-    |p: &mut PlayerInst, _args: &[Value], _ctx: &CompatCtx| {
-        p.layer_ids.clear();
-        p.layer_names.clear();
-        p.snapshot = None;
-        p.timelines.clear();
-        p.playing_timelines.clear();
+    |p: &mut PlayerInst, _args: &[Value], ctx: &CompatCtx| {
+        // `void unloadAll()` drops the player's cache, its runtime motion
+        // state and the bound manager's cache.
+        p.unload_all(ctx);
         Ok(())
     }
 );
@@ -825,14 +876,13 @@ mp_method_void!(
 mp_method_bool!(
     player_is_exist_motion,
     PlayerInst,
-    |p: &mut PlayerInst, args: &[Value], _ctx: &CompatCtx| {
+    |p: &mut PlayerInst, args: &[Value], ctx: &CompatCtx| {
         // `bool isExistMotion(ttstr name)` — ncbind arity 1
         // (`reference/cpp/plugins/motionplayer/Player.h:300`).
+        // The name resolves through the player's lookup candidates.
         super::helpers::require_args(args, 1, "isExistMotion")?;
         let name = value_as_string(&args[0]);
-        Ok(p.snapshot().is_some_and(|snapshot| {
-            snapshot.clip_index.contains_key(&name) || p.timelines.contains_key(&name)
-        }))
+        Ok(p.resolve_motion(&name, ctx).is_some())
     }
 );
 
@@ -842,8 +892,18 @@ mp_method_variant!(
     |p: &mut PlayerInst, args: &[Value], ctx: &CompatCtx| {
         // `tTJSVariant findMotion(ttstr name)` — ncbind arity 1
         // (`reference/cpp/plugins/motionplayer/Player.h:301`).
+        // A resolved motion is activated, its key bound, and its module object
+        // returned, while a miss returns void.
         super::helpers::require_args(args, 1, "findMotion")?;
-        p.project.to_retained(ctx)
+        let name = value_as_string(&args[0]);
+        match p.resolve_motion(&name, ctx) {
+            Some(resolved) => {
+                p.motion_key = name;
+                p.activate_motion(&resolved, ctx)?;
+                p.motion_module(&resolved, ctx)
+            }
+            None => Ok(RetainedValue::Value(TjsValue::Void)),
+        }
     }
 );
 
@@ -1263,7 +1323,7 @@ mp_method_void!(
     |p: &mut PlayerInst, _args: &[Value], ctx: &CompatCtx| {
         // `skipToSync` lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:12-13`).
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         skip_to_sync(p);
         Ok(())
     }
@@ -1290,7 +1350,7 @@ mp_method_real!(
         // resolves the active motion lazily before reading
         // (`reference/cpp/plugins/motionplayer/PlayerVariable.cpp:539-541`).
         super::helpers::require_args(args, 1, "getVariable")?;
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let label = value_as_string(&args[0]);
         Ok(p.get_variable_value(&label))
     }
@@ -1302,7 +1362,7 @@ mp_method_int!(
     |p: &mut PlayerInst, _args: &[Value], ctx: &CompatCtx| {
         // The reference lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerVariable.cpp:568-574`).
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         Ok(p.snapshot()
             .map(|snapshot| snapshot.variable_labels.len() as i64)
             .unwrap_or(0))
@@ -1318,7 +1378,7 @@ mp_method_string!(
         // lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerVariable.cpp:576-577`).
         super::helpers::require_args(args, 1, "getVariableLabelAt")?;
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let index = value_as_i64(&args[0]).max(0) as usize;
         Ok(p.snapshot()
             .and_then(|snapshot| snapshot.variable_labels.get(index).cloned())
@@ -1335,7 +1395,7 @@ mp_method_int!(
         // routes through `getVariableLabelAt`, which loads lazily
         // (`reference/cpp/plugins/motionplayer/PlayerVariable.cpp:577-580`).
         super::helpers::require_args(args, 1, "countVariableFrameAt")?;
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let index = value_as_i64(&args[0]).max(0) as usize;
         let label = p
             .snapshot()
@@ -1357,7 +1417,7 @@ mp_method_string!(
         // the reference routes through `getVariableLabelAt`, which loads
         // lazily (`reference/cpp/plugins/motionplayer/PlayerVariable.cpp:576-577`).
         super::helpers::require_args(args, 2, "getVariableFrameLabelAt")?;
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let index = value_as_i64(&args[0]).max(0) as usize;
         let frame = value_as_i64(&args[1]).max(0) as usize;
         let label = p
@@ -1381,7 +1441,7 @@ mp_method_real!(
         // the reference routes through `getVariableLabelAt`, which loads
         // lazily (`reference/cpp/plugins/motionplayer/PlayerVariable.cpp:576-577`).
         super::helpers::require_args(args, 2, "getVariableFrameValueAt")?;
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let index = value_as_i64(&args[0]).max(0) as usize;
         let frame = value_as_i64(&args[1]).max(0) as usize;
         let label = p
@@ -1405,7 +1465,7 @@ mp_method_bool!(
         // lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:64-66`).
         super::helpers::require_args(args, 1, "getTimelinePlaying")?;
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let label = value_as_string(&args[0]);
         Ok(p.timelines.get(&label).is_some_and(|state| state.playing))
     }
@@ -1420,7 +1480,7 @@ mp_method_variant!(
         // lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerVariable.cpp:632-633`).
         super::helpers::require_args(args, 1, "getVariableRange")?;
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let label = value_as_string(&args[0]);
         match p
             .snapshot()
@@ -1441,7 +1501,7 @@ mp_method_variant!(
         // lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerVariable.cpp:647-648`).
         super::helpers::require_args(args, 1, "getVariableFrameList")?;
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let label = value_as_string(&args[0]);
         let frames = p
             .snapshot()
@@ -1482,7 +1542,7 @@ mp_method_int!(
     |p: &mut PlayerInst, _args: &[Value], ctx: &CompatCtx| {
         // The reference lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:75-76`).
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         Ok(p.snapshot()
             .map(|snapshot| snapshot.main_timelines.len() as i64)
             .unwrap_or(0))
@@ -1498,7 +1558,7 @@ mp_method_string!(
         // lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:83-84`).
         super::helpers::require_args(args, 1, "getMainTimelineLabelAt")?;
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let index = value_as_i64(&args[0]).max(0) as usize;
         Ok(p.snapshot()
             .and_then(|snapshot| snapshot.main_timelines.get(index).cloned())
@@ -1512,7 +1572,7 @@ mp_method_variant!(
     |p: &mut PlayerInst, _args: &[Value], ctx: &CompatCtx| {
         // The reference lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:94-95`).
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let labels = p
             .snapshot()
             .map(|snapshot| snapshot.main_timelines.clone())
@@ -1527,7 +1587,7 @@ mp_method_int!(
     |p: &mut PlayerInst, _args: &[Value], ctx: &CompatCtx| {
         // The reference lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:103-104`).
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         Ok(p.snapshot()
             .map(|snapshot| snapshot.diff_timelines.len() as i64)
             .unwrap_or(0))
@@ -1543,7 +1603,7 @@ mp_method_string!(
         // lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:111-112`).
         super::helpers::require_args(args, 1, "getDiffTimelineLabelAt")?;
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let index = value_as_i64(&args[0]).max(0) as usize;
         Ok(p.snapshot()
             .and_then(|snapshot| snapshot.diff_timelines.get(index).cloned())
@@ -1557,7 +1617,7 @@ mp_method_variant!(
     |p: &mut PlayerInst, _args: &[Value], ctx: &CompatCtx| {
         // The reference lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:121-122`).
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let labels = p
             .snapshot()
             .map(|snapshot| snapshot.diff_timelines.clone())
@@ -1575,7 +1635,7 @@ mp_method_bool!(
         // lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:130-131`).
         super::helpers::require_args(args, 1, "getLoopTimeline")?;
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let label = value_as_string(&args[0]);
         Ok(p.snapshot()
             .and_then(|snapshot| snapshot.loop_timelines.get(&label).copied())
@@ -1589,7 +1649,7 @@ mp_method_int!(
     |p: &mut PlayerInst, _args: &[Value], ctx: &CompatCtx| {
         // The reference lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:150-151`).
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         Ok(p.playing_timelines.len() as i64)
     }
 );
@@ -1603,7 +1663,7 @@ mp_method_string!(
         // lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:164-165`).
         super::helpers::require_args(args, 1, "getPlayingTimelineLabelAt")?;
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let index = value_as_i64(&args[0]).max(0) as usize;
         Ok(p.playing_timelines.get(index).cloned().unwrap_or_default())
     }
@@ -1618,7 +1678,7 @@ mp_method_int!(
         // lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:177-178`).
         super::helpers::require_args(args, 1, "getPlayingTimelineFlagsAt")?;
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let index = value_as_i64(&args[0]).max(0) as usize;
         Ok(p.playing_timelines
             .get(index)
@@ -1637,7 +1697,7 @@ mp_method_int!(
         // lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:176-177`).
         super::helpers::require_args(args, 1, "getTimelineTotalFrameCount")?;
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let label = value_as_string(&args[0]);
         Ok(p.timelines
             .get(&label)
@@ -1658,7 +1718,7 @@ mp_method_void!(
         // `void playTimeline(ttstr label, tjs_int flags)` — ncbind arity 2
         // (`reference/cpp/plugins/motionplayer/Player.h:364`).
         super::helpers::require_args(args, 2, "playTimeline")?;
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let label = value_as_string(&args[0]);
         let flags = value_as_i64(&args[1]) as i32;
         // `EmotePlayer::playTimeline` always marks the shell dirty
@@ -1696,7 +1756,7 @@ mp_method_void!(
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:294-295`)
         // and creates the state through `timelines[key]`.
         super::helpers::require_args(args, 2, "setTimelineBlendRatio")?;
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let label = value_as_string(&args[0]);
         let ratio = value_as_f64(&args[1]);
         let state = p
@@ -1848,7 +1908,7 @@ mp_method_variant!(
     |p: &mut PlayerInst, _args: &[Value], ctx: &CompatCtx| {
         // The reference lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:337-338`).
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         p.build_info_list(ctx)
     }
 );
@@ -1930,10 +1990,8 @@ mp_method_void!(
         // through the project/manager store
         // (`reference/cpp/plugins/motionplayer/PlayerMotionLoad.cpp:47-79`).
         p.motion_key = name.clone();
-        p.snapshot = None;
-        p.timelines.clear();
-        p.playing_timelines.clear();
-        p.ensure_loaded(ctx);
+        p.reset_motion_state();
+        p.ensure_motion_loaded(ctx)?;
         // Prime and start: the requested label wins, otherwise every
         // primary timeline starts with the same flags
         // (`reference/cpp/plugins/motionplayer/PlayerMotionLoad.cpp:97-138`).
@@ -1972,6 +2030,7 @@ mp_method_variant!(
     player_motion_list,
     PlayerInst,
     |p: &mut PlayerInst, _args: &[Value], ctx: &CompatCtx| {
+        p.ensure_motion_loaded(ctx)?;
         let labels = p
             .snapshot()
             .map(|snapshot| {
@@ -2008,11 +2067,7 @@ mp_method_void!(
         // player's motion state but leaves the transform fields alone
         // (`reference/cpp/plugins/motionplayer/EmotePlayer.cpp:183-187`).
         p.module = StoredValue::Void;
-        p.snapshot = None;
-        p.timelines.clear();
-        p.playing_timelines.clear();
-        p.variable_values.clear();
-        p.variable_animators.clear();
+        p.reset_motion_state();
         p.modified = true;
         Ok(())
     }
@@ -2024,11 +2079,15 @@ mp_method_void!(
     |p: &mut PlayerInst, args: &[Value], ctx: &CompatCtx| {
         // `void load(tTJSVariant data)` — ncbind arity 1
         // (`reference/cpp/plugins/motionplayer/EmotePlayer.h:134`); the
-        // module is stored and bridged into the playback pipeline
+        // module is stored and its registered snapshot is activated
         // (`reference/cpp/plugins/motionplayer/EmotePlayer.cpp:189-196`).
         super::helpers::require_args(args, 1, "load")?;
         p.module = StoredValue::from_value(&args[0], ctx);
-        p.ensure_loaded(ctx);
+        if let Some(id) = module_snapshot_id(ctx, &p.module)
+            && let Some(resolved) = p.resolved_from_store(ctx, id)
+        {
+            p.load_from_snapshot(&resolved, ctx)?;
+        }
         p.modified = true;
         Ok(())
     }
@@ -2295,7 +2354,7 @@ mp_method_void!(
         // `skip()` delegates to `skipToSync()`, which loads the motion
         // lazily (`reference/cpp/plugins/motionplayer/EmotePlayer.cpp:800-812`,
         // `reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:12-13`).
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         skip_to_sync(p);
         p.modified = true;
         Ok(())
@@ -2381,7 +2440,7 @@ mp_method_void!(
         // timeline (`reference/cpp/plugins/motionplayer/EmotePlayer.h:217`,
         // `EmotePlayer.cpp:633-636`, `PlayerTimeline.cpp:207-210`).
         super::helpers::require_args(args, 2, "setTimeline")?;
-        p.ensure_loaded(ctx);
+        p.ensure_motion_loaded(ctx)?;
         let label = value_as_string(&args[0]);
         if p.snapshot.is_some() {
             p.play_timeline(&label, 0);

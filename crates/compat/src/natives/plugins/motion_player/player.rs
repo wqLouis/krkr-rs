@@ -26,9 +26,10 @@ use super::model::{
     MotionEvent, MotionNode, MotionSnapshot, TimelineState, build_node_tree, evaluate_frames,
     prime_timelines, step_timelines,
 };
-use super::resource::MotionStore;
+use super::resource::{MotionStore, ResourceInst};
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
 use crate::natives::system::{resolve, value_as_bool, value_as_i64};
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
 /// A pending coordinate transition (`EmoteCoordState`).
@@ -56,6 +57,15 @@ pub(crate) struct OuterForce {
     active: bool,
     x: f64,
     y: f64,
+}
+
+/// A motion resolved for one player: the parsed snapshot, its engine-store id
+/// and the storage path it was loaded from.
+#[derive(Clone)]
+pub(crate) struct ResolvedMotion {
+    pub(crate) snapshot: Arc<MotionSnapshot>,
+    pub(crate) id: u64,
+    pub(crate) path: String,
 }
 
 /// `Player` instance payload.
@@ -107,6 +117,8 @@ pub(crate) struct PlayerInst {
 
     // Runtime.
     pub(crate) snapshot: Option<Arc<MotionSnapshot>>,
+    /// Motions resolved by name or path, keyed by both.
+    pub(crate) motions_by_key: HashMap<String, ResolvedMotion>,
     pub(crate) timelines: HashMap<String, TimelineState>,
     pub(crate) playing_timelines: Vec<String>,
     pub(crate) variable_values: HashMap<String, f64>,
@@ -208,6 +220,7 @@ impl Default for PlayerInst {
             meshline: String::new(),
             busy: false,
             snapshot: None,
+            motions_by_key: HashMap::new(),
             timelines: HashMap::new(),
             playing_timelines: Vec::new(),
             variable_values: HashMap::new(),
@@ -266,46 +279,285 @@ impl PlayerInst {
         self.snapshot.as_deref()
     }
 
-    /// Load the snapshot referenced by `project` (or the manager's last
-    /// module) into the runtime.
-    pub(crate) fn ensure_loaded(&mut self, ctx: &CompatCtx) {
-        let id = self.project_snapshot_id(ctx);
-        // SAFETY: the caller resolved `ctx` from the installed binding.
-        let services = unsafe { ctx.services() };
-        let store = services.state::<MotionStore>();
-        let snapshot = id
-            .and_then(|value| store.get(value))
-            .or_else(|| store.last());
-        drop(store);
-        let Some(snapshot) = snapshot else {
-            return;
-        };
-        if self.snapshot.is_none() {
-            self.snapshot = Some(snapshot.clone());
-            prime_timelines(&snapshot, &mut self.timelines);
-            self.nodes = build_node_tree(&snapshot, None);
-            for label in &snapshot.variable_labels {
-                self.variable_values
-                    .entry(label.clone())
-                    .or_insert_with(|| default_variable(&snapshot, label));
+    /// Resolve `name` to a parsed motion, loading and caching it on first use.
+    pub(crate) fn resolve_motion(&mut self, name: &str, ctx: &CompatCtx) -> Option<ResolvedMotion> {
+        if name.is_empty() {
+            return None;
+        }
+        if let Some(cached) = self.motions_by_key.get(name) {
+            return Some(cached.clone());
+        }
+        let candidates = motion_lookup_candidates(name);
+        match placed_motion_path(ctx, &candidates) {
+            Ok(Some(path)) => {
+                if let Some(cached) = self.motions_by_key.get(&path) {
+                    let cached = cached.clone();
+                    self.motions_by_key.insert(name.to_string(), cached.clone());
+                    return Some(cached);
+                }
+                match super::resource::read_motion_module(ctx, &path) {
+                    Ok(Some((id, snapshot, module))) => {
+                        drop(module);
+                        let resolved = ResolvedMotion {
+                            snapshot,
+                            id,
+                            path: path.clone(),
+                        };
+                        self.motions_by_key
+                            .insert(name.to_string(), resolved.clone());
+                        self.motions_by_key.insert(path, resolved.clone());
+                        return Some(resolved);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        log::warn!("motion_player: could not load motion {path:?}: {error}");
+                    }
+                }
             }
-            self.loop_time = snapshot
-                .clips
-                .first()
-                .map(|clip| clip.loop_time)
-                .unwrap_or(-1.0);
+            Ok(None) => {}
+            Err(error) => {
+                log::warn!("motion_player: motion path lookup failed: {error}");
+            }
+        }
+        if let Some(manager) = self.resource_manager.object_id() {
+            for candidate in candidates {
+                match load_manager_module(ctx, manager, &candidate) {
+                    Ok(Some((id, snapshot))) => {
+                        let resolved = ResolvedMotion {
+                            snapshot,
+                            id,
+                            path: candidate.clone(),
+                        };
+                        self.motions_by_key
+                            .insert(name.to_string(), resolved.clone());
+                        self.motions_by_key.insert(candidate, resolved.clone());
+                        return Some(resolved);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        log::warn!("motion_player: could not load motion {candidate:?}: {error}");
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Load the motion named by `project`, the manager's last module or
+    /// `motionKey`, if none is active yet.
+    pub(crate) fn ensure_motion_loaded(&mut self, ctx: &CompatCtx) -> Result<bool, String> {
+        if self.snapshot.is_some() {
+            return Ok(true);
+        }
+        if let Some(id) = self.project_snapshot_id(ctx)
+            && let Some(resolved) = self.resolved_from_store(ctx, id)
+        {
+            self.activate_motion(&resolved, ctx)?;
+            return Ok(true);
+        }
+        if looks_like_storage(&self.motion_key) {
+            let key = self.motion_key.clone();
+            if let Some(resolved) = self.resolve_motion(&key, ctx) {
+                self.activate_motion(&resolved, ctx)?;
+                return Ok(true);
+            }
+        }
+        if let Some(id) = self.resource_manager_snapshot_id(ctx)
+            && let Some(resolved) = self.resolved_from_store(ctx, id)
+        {
+            self.activate_motion(&resolved, ctx)?;
+            return Ok(true);
+        }
+        if self.motion_key.is_empty() {
+            return Ok(false);
+        }
+        let key = self.motion_key.clone();
+        if let Some(resolved) = self.resolve_motion(&key, ctx) {
+            self.activate_motion(&resolved, ctx)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Bind a motion key and load it: the per-motion state is reset, then one
+    /// lazy load runs through [`Self::ensure_motion_loaded`].
+    pub(crate) fn bind_motion_key(&mut self, key: &str, ctx: &CompatCtx) -> Result<(), String> {
+        if self.motion_key == key {
+            return Ok(());
+        }
+        self.motion_key = key.to_string();
+        self.reset_motion_state();
+        self.ensure_motion_loaded(ctx)?;
+        Ok(())
+    }
+
+    /// Drop the per-motion runtime state before another motion is bound.
+    pub(crate) fn reset_motion_state(&mut self) {
+        self.snapshot = None;
+        self.timelines.clear();
+        self.playing_timelines.clear();
+        self.variable_keys = StoredValue::Void;
+        self.variable_values.clear();
+        self.variable_animators.clear();
+        self.affine = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    }
+
+    /// Activate a resolved motion and rebuild the timeline, node and variable
+    /// state it owns.
+    fn activate_motion(
+        &mut self,
+        resolved: &ResolvedMotion,
+        ctx: &CompatCtx,
+    ) -> Result<(), String> {
+        self.snapshot = Some(resolved.snapshot.clone());
+        self.timelines.clear();
+        self.playing_timelines.clear();
+        prime_timelines(&resolved.snapshot, &mut self.timelines);
+        self.nodes = build_node_tree(&resolved.snapshot, None);
+        for label in &resolved.snapshot.variable_labels {
+            self.variable_values
+                .entry(label.clone())
+                .or_insert_with(|| default_variable(&resolved.snapshot, label));
+        }
+        self.loop_time = resolved
+            .snapshot
+            .clips
+            .first()
+            .map(|clip| clip.loop_time)
+            .unwrap_or(-1.0);
+        self.sync_variable_keys(ctx)
+    }
+
+    /// Replace `variableKeys` with the active motion's labels, or an empty
+    /// array when no motion is active.
+    pub(crate) fn sync_variable_keys(&mut self, ctx: &CompatCtx) -> Result<(), String> {
+        let labels = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.variable_labels.clone())
+            .unwrap_or_default();
+        let array = eval_object(ctx, "[]")?;
+        // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `sync_variable_keys`.
+        let engine = unsafe { ctx.engine() };
+        for (index, label) in labels.iter().enumerate() {
+            engine
+                .set_member(
+                    array.raw_id(),
+                    &index.to_string(),
+                    &TjsValue::String(label.clone()),
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        self.variable_keys = StoredValue::Object(array);
+        Ok(())
+    }
+
+    /// Activate a snapshot directly, replacing the current motion.
+    pub(crate) fn load_from_snapshot(
+        &mut self,
+        resolved: &ResolvedMotion,
+        ctx: &CompatCtx,
+    ) -> Result<(), String> {
+        self.reset_motion_state();
+        self.activate_motion(resolved, ctx)
+    }
+
+    /// Drop the cached motions named by `name`, or loaded from that path.
+    pub(crate) fn unload_motion(&mut self, name: &str) {
+        if name.is_empty() {
+            return;
+        }
+        let active = self.snapshot.as_ref().map(Arc::as_ptr);
+        let mut removed_active = false;
+        self.motions_by_key.retain(|key, resolved| {
+            if key != name && resolved.path != name {
+                return true;
+            }
+            if active == Some(Arc::as_ptr(&resolved.snapshot)) {
+                removed_active = true;
+            }
+            false
+        });
+        if removed_active {
+            self.snapshot = None;
+            self.timelines.clear();
+            self.playing_timelines.clear();
         }
     }
 
-    pub(crate) fn project_snapshot_id(&self, ctx: &CompatCtx) -> Option<u64> {
-        let StoredValue::Object(project) = &self.project else {
-            return None;
-        };
-        // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-        match unsafe { ctx.engine() }.member(project.raw_id(), "__motionSnapshot") {
-            Ok(TjsValue::Integer(value)) => Some(value as u64),
-            _ => None,
+    /// Drop every cached motion and the bound manager's cache.
+    pub(crate) fn unload_all(&mut self, ctx: &CompatCtx) {
+        self.motions_by_key.clear();
+        self.snapshot = None;
+        self.timelines.clear();
+        self.playing_timelines.clear();
+        self.layer_ids.clear();
+        self.layer_names.clear();
+        self.variable_keys = StoredValue::Void;
+        self.variable_values.clear();
+        self.variable_animators.clear();
+        self.affine = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        self.motion_key.clear();
+        if let Some(manager) = self.resource_manager.object_id() {
+            clear_manager_cache(ctx, manager);
         }
+    }
+
+    /// The module object of a resolved motion, rebuilt when the engine
+    /// registry no longer holds it.
+    pub(crate) fn motion_module(
+        &self,
+        resolved: &ResolvedMotion,
+        ctx: &CompatCtx,
+    ) -> Result<RetainedValue, String> {
+        let registered = {
+            // SAFETY: the caller resolved `ctx` from the installed binding.
+            let services = unsafe { ctx.services() };
+            let store = services.state::<MotionStore>();
+            store.module(resolved.id).and_then(StoredValue::object_id)
+        };
+        if let Some(id) = registered {
+            // SAFETY: the engine store retains the registered module object.
+            let value = unsafe { ctx.engine() }
+                .duplicate_retained(tjs::Tjs2ValueId::from_raw(id as *mut std::ffi::c_void))
+                .map_err(|error| error.to_string())?;
+            return Ok(RetainedValue::Object(value));
+        }
+        super::resource::module_for_snapshot(ctx, resolved.id, &resolved.path, &resolved.snapshot)
+            .map(RetainedValue::Object)
+    }
+
+    fn resolved_from_store(&self, ctx: &CompatCtx, id: u64) -> Option<ResolvedMotion> {
+        // SAFETY: the caller resolved `ctx` from the installed binding.
+        let services = unsafe { ctx.services() };
+        let store = services.state::<MotionStore>();
+        let snapshot = store.get(id)?;
+        let path = store.path(id).unwrap_or_default().to_string();
+        Some(ResolvedMotion { snapshot, id, path })
+    }
+
+    fn resource_manager_snapshot_id(&self, ctx: &CompatCtx) -> Option<u64> {
+        let manager = self.resource_manager.object_id()?;
+        // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `resource_manager_snapshot_id`.
+        let engine = unsafe { ctx.engine() };
+        let payload = match engine.native_instance_payload(
+            tjs::Tjs2ValueId::from_raw(manager as *mut std::ffi::c_void),
+            "ResourceManager",
+        ) {
+            Ok(payload) => payload,
+            Err(error) => {
+                log::warn!("motion_player: resource manager lookup failed: {error}");
+                return None;
+            }
+        };
+        let payload = payload?;
+        // SAFETY: the manager object is alive for this call, so its native payload is too.
+        let instance = unsafe { inst_ref::<ResourceInst>(payload.as_ptr()) }?;
+        module_snapshot_id(ctx, instance.last_module()?)
+    }
+
+    pub(crate) fn project_snapshot_id(&self, ctx: &CompatCtx) -> Option<u64> {
+        module_snapshot_id(ctx, &self.project)
     }
 
     pub(crate) fn require_layer_id(&mut self, name: &str) -> i32 {
@@ -459,14 +711,26 @@ impl PlayerInst {
         self.allplaying = true;
     }
 
-    pub(crate) fn play(&mut self, label: &str, flags: i32, ctx: &CompatCtx) -> bool {
-        self.ensure_loaded(ctx);
-        let Some(snapshot) = self.snapshot.clone() else {
-            return false;
-        };
+    pub(crate) fn play(
+        &mut self,
+        label: &str,
+        flags: i32,
+        ctx: &CompatCtx,
+    ) -> Result<bool, String> {
+        self.ensure_motion_loaded(ctx)?;
         if !label.is_empty() {
-            self.motion_key = label.to_string();
+            if (flags & 16) != 0 {
+                self.stealth_motion = label.to_string();
+            } else if self.snapshot.is_some() {
+                self.motion_key = label.to_string();
+            }
         }
+        if self.snapshot.is_none() && !label.is_empty() {
+            self.bind_motion_key(label, ctx)?;
+        }
+        let Some(snapshot) = self.snapshot.clone() else {
+            return Ok(false);
+        };
         if (flags & 1) != 0 {
             self.stop_timeline("");
         }
@@ -493,7 +757,7 @@ impl PlayerInst {
             self.rebuild_tree(&snapshot, label);
         }
         self.allplaying = started;
-        started
+        Ok(started)
     }
 
     pub(crate) fn play_clip_layers(&mut self, snapshot: &MotionSnapshot, label: &str) {
@@ -590,7 +854,8 @@ impl PlayerInst {
         false
     }
 
-    pub(crate) fn serialize(&self, ctx: &CompatCtx) -> Result<RetainedValue, String> {
+    pub(crate) fn serialize(&mut self, ctx: &CompatCtx) -> Result<RetainedValue, String> {
+        self.ensure_motion_loaded(ctx)?;
         let object = eval_object(ctx, "%[]")?;
         // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `serialize`.
         let engine = unsafe { ctx.engine() };
@@ -630,9 +895,13 @@ impl PlayerInst {
         Ok(RetainedValue::Object(object))
     }
 
-    pub(crate) fn unserialize(&mut self, ctx: &CompatCtx, value: &StoredValue) {
+    pub(crate) fn unserialize(
+        &mut self,
+        ctx: &CompatCtx,
+        value: &StoredValue,
+    ) -> Result<(), String> {
         let StoredValue::Object(object) = value else {
-            return;
+            return Ok(());
         };
         // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `unserialize`.
         let engine = unsafe { ctx.engine() };
@@ -657,6 +926,8 @@ impl PlayerInst {
         if let Ok(TjsValue::Integer(color)) = engine.member(object.raw_id(), "color") {
             self.color = ColorAnimator::from_packed(color as u32);
         }
+        self.ensure_motion_loaded(ctx)?;
+        Ok(())
     }
 
     pub(crate) fn build_info_list(&self, ctx: &CompatCtx) -> Result<RetainedValue, String> {
@@ -865,6 +1136,104 @@ fn default_variable(snapshot: &MotionSnapshot, label: &str) -> f64 {
     0.0
 }
 
+/// The engine-store id a module object carries in `__motionSnapshot`.
+fn module_snapshot_id(ctx: &CompatCtx, module: &StoredValue) -> Option<u64> {
+    let id = module.object_id()?;
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `module_snapshot_id`.
+    match unsafe { ctx.engine() }.member(
+        tjs::Tjs2ValueId::from_raw(id as *mut std::ffi::c_void),
+        "__motionSnapshot",
+    ) {
+        Ok(TjsValue::Integer(value)) => u64::try_from(value).ok(),
+        _ => None,
+    }
+}
+
+/// Whether a motion name carries a path separator or an extension and
+/// therefore resolves to itself.
+fn looks_like_storage(name: &str) -> bool {
+    name.contains('/') || name.contains('\\') || name.contains('.')
+}
+
+/// Candidate paths a bare motion name resolves through.
+fn motion_lookup_candidates(name: &str) -> Vec<String> {
+    if looks_like_storage(name) {
+        return vec![name.to_string()];
+    }
+    vec![
+        format!("{name}.mtn"),
+        format!("{name}.psb"),
+        format!("motion/{name}.mtn"),
+        format!("motion/{name}.psb"),
+    ]
+}
+
+/// The first candidate mounted in storage.
+fn placed_motion_path(ctx: &CompatCtx, candidates: &[String]) -> Result<Option<String>, String> {
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    let services = unsafe { ctx.services() };
+    let Some(storage) = services.storage() else {
+        return Ok(None);
+    };
+    // SAFETY: the host keeps the attached storage alive for the binding.
+    let storage = unsafe { &*storage };
+    for candidate in candidates {
+        match storage.find(strip_file_media(candidate)) {
+            Ok(Some(_)) => return Ok(Some(candidate.clone())),
+            Ok(None) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(None)
+}
+
+/// Load `path` through a bound resource manager so its cache and last-module
+/// slot observe the load.
+fn load_manager_module(
+    ctx: &CompatCtx,
+    manager: usize,
+    path: &str,
+) -> Result<Option<(u64, Arc<MotionSnapshot>)>, String> {
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `load_manager_module`.
+    let engine = unsafe { ctx.engine() };
+    let payload = engine.native_instance_payload(
+        tjs::Tjs2ValueId::from_raw(manager as *mut std::ffi::c_void),
+        "ResourceManager",
+    )?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    // SAFETY: the manager object is alive for this call, so its native payload is too.
+    let Some(instance) = (unsafe { inst_mut::<ResourceInst>(payload.as_ptr()) }) else {
+        return Ok(None);
+    };
+    instance.load_module(ctx, path)
+}
+
+/// Drop a bound manager's cache and its engine snapshot registry entries.
+fn clear_manager_cache(ctx: &CompatCtx, manager: usize) {
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `clear_manager_cache`.
+    let engine = unsafe { ctx.engine() };
+    let payload = match engine.native_instance_payload(
+        tjs::Tjs2ValueId::from_raw(manager as *mut std::ffi::c_void),
+        "ResourceManager",
+    ) {
+        Ok(payload) => payload,
+        Err(error) => {
+            log::warn!("motion_player: resource manager lookup failed: {error}");
+            return;
+        }
+    };
+    let Some(payload) = payload else {
+        return;
+    };
+    // SAFETY: the manager object is alive for this call, so its native payload is too.
+    let Some(instance) = (unsafe { inst_mut::<ResourceInst>(payload.as_ptr()) }) else {
+        return;
+    };
+    instance.clear_cache(ctx);
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -960,9 +1329,13 @@ extern "C" fn player_play_raw(
     let arguments = unsafe { args(argv, argc) };
     let label = arguments.first().map(value_as_string).unwrap_or_default();
     let flags = arguments.get(1).map(value_as_i64).unwrap_or(0) as i32;
-    let started = inst.play(&label, flags, &res.ctx());
-    set_bool(out, started);
-    0
+    match inst.play(&label, flags, &res.ctx()) {
+        Ok(started) => {
+            set_bool(out, started);
+            0
+        }
+        Err(error) => report_error(out_error, &error),
+    }
 }
 
 extern "C" fn player_progress_raw(

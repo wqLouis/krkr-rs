@@ -28,7 +28,10 @@ use crate::{CompatCtx, CompatError};
 pub(crate) struct MotionStore {
     next: u64,
     snapshots: BTreeMap<u64, Arc<MotionSnapshot>>,
-    last: Option<u64>,
+    /// The TJS module object each registered snapshot was built from.
+    modules: BTreeMap<u64, StoredValue>,
+    /// The storage path each registered snapshot was loaded from.
+    paths: BTreeMap<u64, String>,
     pub(crate) decrypt_seed: i64,
     decrypt_func: Option<DetachedValue>,
     rng: u64,
@@ -44,7 +47,6 @@ impl MotionStore {
         self.next += 1;
         let id = self.next;
         self.snapshots.insert(id, Arc::new(snapshot));
-        self.last = Some(id);
         id
     }
 
@@ -53,26 +55,44 @@ impl MotionStore {
         self.snapshots.get(&id).cloned()
     }
 
-    /// The most recently inserted snapshot.
-    pub(crate) fn last(&self) -> Option<Arc<MotionSnapshot>> {
-        self.last.and_then(|id| self.get(id))
+    /// Attach the TJS module object and source path to a snapshot id.
+    pub(crate) fn register_module(&mut self, id: u64, path: &str, module: StoredValue) {
+        self.modules.insert(id, module);
+        self.paths.insert(id, path.to_string());
+    }
+
+    /// The module object registered for a snapshot id.
+    pub(crate) fn module(&self, id: u64) -> Option<&StoredValue> {
+        self.modules.get(&id)
+    }
+
+    /// The source path registered for a snapshot id.
+    pub(crate) fn path(&self, id: u64) -> Option<&str> {
+        self.paths.get(&id).map(String::as_str)
     }
 
     /// Remove a snapshot by id (reference `detail::unregisterModuleSnapshot`,
     /// `RuntimeSupport.cpp:1575-1582`). A player that already loaded the
     /// snapshot keeps its own `Arc`, so an in-flight motion is unaffected.
     pub(crate) fn remove(&mut self, id: u64) -> Option<Arc<MotionSnapshot>> {
-        if self.last == Some(id) {
-            self.last = None;
-        }
+        self.modules.remove(&id);
+        self.paths.remove(&id);
         self.snapshots.remove(&id)
+    }
+
+    /// Drop a snapshot whose module object could not be built.
+    pub(crate) fn discard(&mut self, id: u64) {
+        self.modules.remove(&id);
+        self.paths.remove(&id);
+        self.snapshots.remove(&id);
     }
 
     /// Drop every snapshot (reference `detail::clearModuleSnapshots`,
     /// `RuntimeSupport.cpp:1584-1587`).
     pub(crate) fn clear_snapshots(&mut self) {
         self.snapshots.clear();
-        self.last = None;
+        self.modules.clear();
+        self.paths.clear();
     }
 
     /// The next pseudo-random value in `[0, 1)`.
@@ -120,6 +140,49 @@ impl ResourceInst {
 
     fn find_key(&self, path: &str) -> Option<&StoredValue> {
         cache_keys(path).iter().find_map(|key| self.loaded.get(key))
+    }
+
+    /// The most recently loaded module object.
+    pub(crate) fn last_module(&self) -> Option<&StoredValue> {
+        self.last.as_ref()
+    }
+
+    /// Read, parse and cache the motion module at `path`.
+    ///
+    /// `Ok(None)` means nothing is mounted at `path`; a mounted file that
+    /// cannot be read or parsed is an error.
+    pub(crate) fn load_module(
+        &mut self,
+        ctx: &CompatCtx,
+        path: &str,
+    ) -> Result<Option<(u64, Arc<MotionSnapshot>)>, String> {
+        let Some((id, snapshot, module)) = read_motion_module(ctx, path)? else {
+            return Ok(None);
+        };
+        for key in cache_keys(path) {
+            // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `load_module`.
+            let duplicate = unsafe { ctx.engine() }
+                .duplicate_retained(module.raw_id())
+                .map_err(|error| error.to_string())?;
+            self.loaded.insert(key, StoredValue::Object(duplicate));
+        }
+        self.last = Some(StoredValue::Object(module));
+        Ok(Some((id, snapshot)))
+    }
+
+    /// Drop every cached module, the layer-id allocator state and the engine
+    /// snapshot registry.
+    pub(crate) fn clear_cache(&mut self, ctx: &CompatCtx) {
+        self.loaded.clear();
+        self.last = None;
+        self.layer_ids.clear();
+        self.layer_names.clear();
+        self.used.clear();
+        self.next = 0;
+        // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+        unsafe { ctx.services() }
+            .state::<MotionStore>()
+            .clear_snapshots();
     }
 }
 
@@ -199,38 +262,81 @@ extern "C" fn resource_ctor(
     0
 }
 
-/// Read and parse the PSB at `path`, then register it in the store.
-fn load_module(ctx: &CompatCtx, inst: &mut ResourceInst, path: &str) -> Result<u64, String> {
+/// Read and parse the PSB at `path`, register the snapshot and its module
+/// object in the engine store, and return both plus the module handle.
+///
+/// `Ok(None)` means nothing is mounted at `path`; a mounted file that cannot
+/// be read or parsed is an error.
+pub(crate) fn read_motion_module(
+    ctx: &CompatCtx,
+    path: &str,
+) -> Result<Option<(u64, Arc<MotionSnapshot>, DetachedValue)>, String> {
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
     let seed = services.state::<MotionStore>().decrypt_seed;
     let Some(storage) = services.storage() else {
         return Err("motionplayer: no storage is attached".into());
     };
+    let name = strip_file_media(path);
     // SAFETY: the host keeps the attached storage alive for the binding.
-    let bytes = unsafe { &*storage }
-        .read(strip_file_media(path))
-        .map_err(|error| error.to_string())?;
+    let storage = unsafe { &*storage };
+    match storage.find(name) {
+        Ok(Some(_)) => {}
+        Ok(None) => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    }
+    let bytes = storage.read(name).map_err(|error| error.to_string())?;
     let psb = parse_stream(&bytes, seed).map_err(|error| error.0)?;
     let snapshot = MotionSnapshot::from_psb(psb);
     let id = services.state::<MotionStore>().insert(snapshot);
-    let store = services.state::<MotionStore>();
-    let snapshot_id = store.get(id);
+    let registered = {
+        let store = services.state::<MotionStore>();
+        store.get(id)
+    };
+    let Some(snapshot) = registered else {
+        services.state::<MotionStore>().discard(id);
+        return Err("motionplayer: snapshot registration failed".into());
+    };
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `read_motion_module`.
+    let module = match module_object(ctx, id, path, Some(snapshot.as_ref())) {
+        Ok(module) => module,
+        Err(error) => {
+            services.state::<MotionStore>().discard(id);
+            return Err(error);
+        }
+    };
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `read_motion_module`.
+    let registered = match unsafe { ctx.engine() }.duplicate_retained(module.raw_id()) {
+        Ok(registered) => registered,
+        Err(error) => {
+            services.state::<MotionStore>().discard(id);
+            return Err(error.to_string());
+        }
+    };
+    services
+        .state::<MotionStore>()
+        .register_module(id, path, StoredValue::Object(registered));
+    Ok(Some((id, snapshot, module)))
+}
 
-    // Build the TJS module the scripts read (`data.metadata...`).
-    let module = module_object(ctx, id, path, snapshot_id.as_deref())?;
-    // The reference registers the module under every cache key of the path
-    // (`reference/cpp/plugins/motionplayer/ResourceManager.cpp:166-169`);
-    // each key holds its own handle to the same TJS object.
-    for key in cache_keys(path) {
-        // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `load_module`.
-        let duplicate = unsafe { ctx.engine() }
-            .duplicate_retained(module.raw_id())
-            .map_err(|error| error.to_string())?;
-        inst.loaded.insert(key, StoredValue::Object(duplicate));
-    }
-    inst.last = Some(StoredValue::Object(module));
-    Ok(id)
+/// The engine-registered module object for `id`, rebuilt from a cached
+/// snapshot when the registration was cleared.
+pub(crate) fn module_for_snapshot(
+    ctx: &CompatCtx,
+    id: u64,
+    path: &str,
+    snapshot: &MotionSnapshot,
+) -> Result<DetachedValue, String> {
+    let module = module_object(ctx, id, path, Some(snapshot))?;
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `module_for_snapshot`.
+    let registered = unsafe { ctx.engine() }
+        .duplicate_retained(module.raw_id())
+        .map_err(|error| error.to_string())?;
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    unsafe { ctx.services() }
+        .state::<MotionStore>()
+        .register_module(id, path, StoredValue::Object(registered));
+    Ok(module)
 }
 
 /// Build the TJS `%{path, metadata, object, __motionSnapshot}` module.
@@ -372,17 +478,27 @@ extern "C" fn resource_load(
         set_void(out);
         return 0;
     }
-    match load_module(&res.ctx(), inst, &path) {
-        Ok(_) => {
-            if let Some(StoredValue::Object(module)) = inst.last.as_ref() {
-                let ctx = res.ctx();
-                // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `resource_load`.
-                let engine = unsafe { ctx.engine() };
-                if let Ok(copy) = engine.duplicate_retained(module.raw_id()) {
+    match inst.load_module(&res.ctx(), &path) {
+        Ok(Some(_)) => {
+            let ctx = res.ctx();
+            match inst.last_module().map(|module| module.to_retained(&ctx)) {
+                Some(Ok(RetainedValue::Object(copy))) => {
                     set_retained(out, copy);
-                    return 0;
+                    0
+                }
+                Some(Ok(_)) => {
+                    set_void(out);
+                    0
+                }
+                Some(Err(error)) => report_error(out_error, &error),
+                None => {
+                    set_void(out);
+                    0
                 }
             }
+        }
+        Ok(None) => {
+            log::warn!("motion_player: no stored motion at {path:?}");
             set_void(out);
             0
         }
@@ -483,22 +599,7 @@ extern "C" fn resource_clear_cache(
     let Some(inst) = (unsafe { inst_mut::<ResourceInst>(instance) }) else {
         return report_error(out_error, "ResourceManager: null instance");
     };
-    inst.loaded.clear();
-    // The reference `clearCache` clears the module-snapshot registry too
-    // (`detail::clearModuleSnapshots`, `ResourceManager.cpp:220`), so the
-    // parsed documents do not outlive the cache that named them.
-    let ctx = res.ctx();
-    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    unsafe { ctx.services() }
-        .state::<MotionStore>()
-        .clear_snapshots();
-    // `clearCache` also resets the layer-id allocator in the reference
-    // (`reference/cpp/plugins/motionplayer/ResourceManager.cpp:207-224`):
-    // the next `requireLayerId` hands out 1 again.
-    inst.layer_ids.clear();
-    inst.layer_names.clear();
-    inst.used.clear();
-    inst.next = 0;
+    inst.clear_cache(&res.ctx());
     set_void(out);
     0
 }
