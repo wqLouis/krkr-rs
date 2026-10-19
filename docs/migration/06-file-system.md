@@ -266,7 +266,7 @@ stateless fs surface cannot reach. Options:
 
 The port currently keeps option C: `streams.cpp` is the only port-authored
 C++ besides the ABI shim, and it still uses `std::fopen`. Replacing it with a
-thin C++ adapter over a Rust implementation is deferred (`TODO.md` §12).
+thin C++ adapter over a Rust implementation is deferred (`TODO.md` §16).
 
 ## 7. Case-insensitivity and archives
 

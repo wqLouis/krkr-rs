@@ -275,7 +275,7 @@ Reject these shapes:
   `port of`) or narrates history (`used to`, `previously`, `before this`,
   `replaced by`) is a finding. Existing comments that predate the rule are
   baselined in `scripts/allowlists/house_style_baseline.txt` (burn-down in
-  `TODO.md` §21); a new one fails.
+  `TODO.md` §15); a new one fails.
 - Public items have doc comments. Module docs explain the module’s job, not its
   past.
 - A comment that repeats the code is deleted. A comment that explains a

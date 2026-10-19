@@ -55,7 +55,7 @@ except for trivially small probes.
   in L2/L3 and owns the completion table; L1 is the pure `decode_image` call
   plus, where needed, an L2-scheduled worker. Image decoding is currently
   synchronous on the VM thread; the async/decode-worker path is tracked in
-  `TODO.md` §16.
+  `TODO.md` §1.
 * Image **save** (TLG5/TLG6, PNG) lives in `media` too, because it is a
   format concern. `Bitmap.saveLayerImage`/`save` go through it.
 * Supported formats stay the current `image` 0.25 feature list (png, jpeg,
@@ -117,7 +117,7 @@ Keep the current `MovieDecoder` semantics as an L1-defined
   `drain_audio` (swresample→f32) are implemented.
 * **Known inefficiency:** the audio track is decoded fully at `open`
   (`decode_audio_track`); streaming the audio through the audio decode API is
-  open work (`TODO.md` §9 `M5`).
+  open work (`TODO.md` §7 `M5`).
 
 ### 5.3 MediaCodec backend (Android)
 

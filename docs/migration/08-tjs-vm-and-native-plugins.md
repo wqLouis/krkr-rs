@@ -183,7 +183,7 @@ address>`. The extraction pipeline and its measured fidelity live in
 matched, the two differences being real build differences). The DLLs are
 gitignored and never loaded by a test: the extracted surface is committed as
 a derived fixture and the test gates on that. Bringing the 36 unported plugin
-names to native coverage is the next major version (`TODO.md` §17).
+names to native coverage is the next major version (`TODO.md` §10).
 
 ### 4.5 WASM (future)
 

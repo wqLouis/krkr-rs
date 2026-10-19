@@ -7,7 +7,7 @@ non-test comments that cite the external reference/oracle or narrate history,
 and ``clippy`` allowances anywhere in Rust code.  Reviewed false positives are
 listed in ``scripts/allowlists/house_style_allow.txt``; legacy comments that
 predate the comment rules are listed separately in
-``scripts/allowlists/house_style_baseline.txt`` (tracked in ``TODO`` §21), so
+``scripts/allowlists/house_style_baseline.txt`` (tracked in ``TODO`` §15), so
 the gate catches new citations while the old ones burn down in batches.  The
 ``clippy-allow`` rule has no exemptions in either file.
 """

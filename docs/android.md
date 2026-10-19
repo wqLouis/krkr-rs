@@ -33,7 +33,7 @@ per-target backend features; §2 below is the Android-specific state.
 ## 2. What is already verified (measured, not assumed)
 
 > **The development host has no NDK or Android SDK, and the Android target is
-> never built or tested here** (AGENTS §0, `TODO.md` §11). The cross-compiles
+> never built or tested here** (AGENTS §0, `TODO.md` §14). The cross-compiles
 > and the packaged build below were run on a machine that has the toolchain;
 > Android-only code that has not been compiled is documented as unverified,
 > never as working. The host bar is `cargo check --workspace` staying
