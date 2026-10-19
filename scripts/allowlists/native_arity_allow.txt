@@ -1,0 +1,11 @@
+# Native zero-argument arity allowlist (AGENTS §0).  Enforced by
+# krkr-gate native-arity.
+#
+# One entry per line:  Class.member — reason
+#
+#   Class.member  the script-visible member (matched exactly, so it survives
+#                 line churn).
+#   reason        why the Rust callback legitimately rejects `argc == 0` even
+#                 though the reference defines a zero-argument path.  Cite
+#                 `reference/cpp/**` where the divergence comes from (D30).  A
+#                 site is not evidence without one.

@@ -106,7 +106,8 @@ uv run --project scripts krkr-gate gate
 the `stateless`, `error-handling`, `house-style`, `layering`, `storage-boundary`,
 `native-construction`, `lifecycle-order`,
 `storage-media`,
-`callback-objthis`
+`callback-objthis`,
+`native-arity`
 checks;
 `cargo clippy --workspace --all-targets -- -D warnings`;
 `cargo clippy -p platform --features platform-android --all-targets -- -D warnings`;
@@ -133,6 +134,7 @@ uv run --project scripts krkr-gate native-construction
 uv run --project scripts krkr-gate lifecycle-order
 uv run --project scripts krkr-gate storage-media
 uv run --project scripts krkr-gate callback-objthis
+uv run --project scripts krkr-gate native-arity
 uv run --project scripts krkr-gate host-facts
 uv run --project scripts krkr-gate android-target
 uv run --project scripts krkr-gate surface-lock --no-regen

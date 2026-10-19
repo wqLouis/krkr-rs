@@ -30,8 +30,8 @@ shells out to `cargo tree`, the rest read the tree.
 
 `stateless`, `error-handling`, `house-style`, `layering`,
 `native-construction`, `lifecycle-order`, `host-facts`, `android-target`,
-`surface-lock`, `native-parity`, `plugin-parity`, the `extract-xp3` helper,
-and `gate`.
+`surface-lock`, `native-parity`, `plugin-parity`, `native-arity`, the
+`extract-xp3` helper, and `gate`.
 
 ## Notes
 

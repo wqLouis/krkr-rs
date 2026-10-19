@@ -6,9 +6,9 @@ Usage::
 
 ``<check>`` is one of ``stateless``, ``error-handling``, ``house-style``,
 ``layering``, ``host-facts``, ``android-target``, ``surface-lock``,
-``native-parity``, ``plugin-parity``, ``callback-objthis``, or the
-``extract-xp3`` helper. ``gate`` runs the full ordered sequence; its ``cargo``
-steps are for the main agent.
+``native-parity``, ``plugin-parity``, ``callback-objthis``, ``native-arity``,
+or the ``extract-xp3`` helper. ``gate`` runs the full ordered sequence; its
+``cargo`` steps are for the main agent.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from .checks import (
     house_style,
     layering,
     lifecycle_order,
+    native_arity,
     native_construction,
     native_parity,
     plugin_parity,
@@ -50,6 +51,7 @@ CHECKS: dict[str, Callable[[list[str]], int]] = {
     "lifecycle-order": lifecycle_order.run,
     "storage-media": storage_media.run,
     "callback-objthis": callback_objthis.run,
+    "native-arity": native_arity.run,
     "host-facts": host_facts.run,
     "android-target": android_target.run,
     "surface-lock": surface_lock.run,
@@ -70,6 +72,7 @@ GATE_SEQUENCE: list[tuple[str, str, str, list[str]]] = [
     ("lifecycle-order", "check", "lifecycle-order", []),
     ("storage-media", "check", "storage-media", []),
     ("callback-objthis", "check", "callback-objthis", []),
+    ("native-arity", "check", "native-arity", []),
     (
         "cargo clippy",
         "cargo",
@@ -128,6 +131,7 @@ Checks:
   lifecycle-order  Scene removal without child-finalizer ordering
   storage-media    reference storage-media domains neither served nor documented
   callback-objthis  callback-invoking native members registered without objthis
+  native-arity     reference zero-argument native methods rejected by a Rust guard
   host-facts       host seams with no production installer
   android-target   per-target backend-feature resolution
   surface-lock     VM dispatch surface vs the committed baseline
