@@ -741,17 +741,13 @@ impl KagParserState {
                         self.advance_current();
                         continue;
                     };
-                    // A trailing `\` at the end of a line is a line
-                    // continuation: it is dropped and no `r` fires
-                    // (`KAGParser.cpp:1415-1429`).
-                    if !from_splice
-                        && pos + 1 == text.chars().count()
+                    // A trailing `\` at the end of a line or expansion
+                    // buffer is a continuation: it is dropped and no `r`
+                    // fires (`KAGParser.cpp:1415-1428`).
+                    if pos + 1 == text.chars().count()
                         && c == '\\'
                         && !self.ignore_cr
-                        && self
-                            .raw_lines
-                            .get(line_of(&ev).saturating_sub(1))
-                            .is_some_and(|raw| raw.ends_with('\\'))
+                        && self.continuation_backslash_at_end(from_splice, &ev)
                     {
                         self.advance_current();
                         continue;
@@ -971,13 +967,34 @@ impl KagParserState {
     }
 
     /// Pop the top splice; when the stack becomes empty, an `r eol=true`
-    /// queued by the expansion's tag fires.
+    /// queued by the expansion's tag fires, unless the buffer ended with a
+    /// continuation `\` or a `[p]` marker
+    /// (`reference/cpp/core/base/KAGParser.cpp:1415-1428`).
     fn pop_splice(&mut self) {
         if let Some(splice) = self.splice_stack.pop()
             && self.splice_stack.is_empty()
             && splice.line_r_after
+            && !splice.buffer.ends_with("[p]")
+            && !splice.buffer.ends_with('\\')
         {
             self.end_of_line_r();
+        }
+    }
+
+    /// Whether the current `\` is a continuation marker at the end of the
+    /// current main-source line or expansion buffer. A splice is at its end
+    /// when its last event's last character is reached and the expansion was
+    /// the last thing on its line (`line_r_after`)
+    /// (`reference/cpp/core/base/KAGParser.cpp:1415-1428`).
+    fn continuation_backslash_at_end(&self, from_splice: bool, ev: &Event) -> bool {
+        if from_splice {
+            self.splice_stack.last().is_some_and(|splice| {
+                splice.line_r_after && splice.event_pos + 1 == splice.events.len()
+            })
+        } else {
+            self.raw_lines
+                .get(line_of(ev).saturating_sub(1))
+                .is_some_and(|raw| raw.ends_with('\\'))
         }
     }
 

@@ -298,15 +298,19 @@ pub fn parse_recovering(source: &str, options: ParseOptions) -> Result<Recovered
     // The reference strips leading tabs from every line (LoadScenario
     // pass 2) before classifying it; multi-line joining operates on the
     // tab-stripped text.
-    let lines: Vec<(usize, String)> = if options.multiline_tags {
-        join_multiline_lines(&raw_lines)?
+    let (lines, join_errors) = if options.multiline_tags {
+        join_multiline_lines(&raw_lines)
     } else {
-        raw_lines
-            .iter()
-            .enumerate()
-            .map(|(idx, line)| (idx + 1, line.trim_start_matches('\t').to_string()))
-            .collect()
+        (
+            raw_lines
+                .iter()
+                .enumerate()
+                .map(|(idx, line)| (idx + 1, line.trim_start_matches('\t').to_string()))
+                .collect(),
+            Vec::new(),
+        )
     };
+    let mut join_errors: BTreeMap<usize, Error> = join_errors.into_iter().collect();
     let mut events = Vec::new();
     let mut labels = BTreeMap::new();
     let mut cols = Vec::new();
@@ -321,6 +325,17 @@ pub fn parse_recovering(source: &str, options: ParseOptions) -> Result<Recovered
     while index < lines.len() {
         let (lineno, content) = &lines[index];
         let lineno = *lineno;
+        if let Some(error) = join_errors.remove(&lineno) {
+            // A bad multi-line continuation is a tag syntax error: the walk
+            // raises it when it reaches the line (`_GetNextTag`).
+            pending_errors.push(PendingError {
+                after_event: events.len(),
+                line: lineno,
+                error,
+            });
+            index += 1;
+            continue;
+        }
         if content.is_empty() {
             // Empty line: the reference emits an "r" tag here; we emit
             // nothing.
@@ -494,6 +509,10 @@ fn split_lines(source: &str) -> Vec<&str> {
     lines
 }
 
+/// The joined `(line, content)` entries plus the deferred continuation
+/// errors, keyed by the line they belong to.
+type MultilineLines = (Vec<(usize, String)>, Vec<(usize, Error)>);
+
 /// Join KAGParserEx multi-line tag continuations (see
 /// [`ParseOptions::multiline_tags`]).
 ///
@@ -501,29 +520,39 @@ fn split_lines(source: &str) -> Vec<&str> {
 /// `line_number` is the 1-based source line of the **first** line of the
 /// logical tag. Continuation lines are folded into it, so the line count of
 /// the result is smaller than the source line count.
-fn join_multiline_lines(lines: &[&str]) -> Result<Vec<(usize, String)>> {
+fn join_multiline_lines(lines: &[&str]) -> MultilineLines {
     let mut out: Vec<(usize, String)> = Vec::with_capacity(lines.len());
+    let mut errors: Vec<(usize, Error)> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         let lineno = i + 1;
         let mut current = lines[i].trim_start_matches('\t').to_string();
+        let mut joined = false;
         // A continuation marker is a trailing `\` preceded by whitespace
         // inside a tag's attribute area (KAGParserEx `readme.txt:16-38`): a
         // tag name must be present (`@ \` is the tag named `\`) and the `\`
         // must be outside any quoted value.
         while let Some(backslash) = tag_continuation_backslash(&current) {
             let Some(next_raw) = lines.get(i + 1) else {
-                return Err(Error::Syntax {
-                    line: lineno,
-                    message: "line continuation at end of file",
-                });
+                errors.push((
+                    lineno,
+                    Error::Syntax {
+                        line: lineno,
+                        message: "line continuation at end of file",
+                    },
+                ));
+                break;
             };
             let next = next_raw.trim_start_matches('\t');
             let Some(rest) = next.strip_prefix(';') else {
-                return Err(Error::Syntax {
-                    line: lineno,
-                    message: "line continuation must be followed by a ';' line",
-                });
+                errors.push((
+                    lineno,
+                    Error::Syntax {
+                        line: lineno,
+                        message: "line continuation must be followed by a ';' line",
+                    },
+                ));
+                break;
             };
             // Drop only the trailing `\`, keeping the whitespace before it
             // as the separator, then append the continuation line without
@@ -532,11 +561,21 @@ fn join_multiline_lines(lines: &[&str]) -> Result<Vec<(usize, String)>> {
             merged.push_str(rest);
             current = merged;
             i += 1;
+            joined = true;
+        }
+        // Once a multi-line `[tag]` closes, everything after its `]` is
+        // ignored and no line end is inserted
+        // (`reference/cpp/plugins/KAGParser/readme.txt:36-42`).
+        if joined
+            && current.starts_with('[')
+            && let Some(end) = first_bracket_end(&current)
+        {
+            current.truncate(end);
         }
         out.push((lineno, current));
         i += 1;
     }
-    Ok(out)
+    (out, errors)
 }
 
 /// The byte index of a KAGParserEx continuation `\` at the end of a tag line,
@@ -592,6 +631,30 @@ fn tag_continuation_backslash(line: &str) -> Option<usize> {
         return None;
     }
     Some(backslash)
+}
+
+/// The byte index just past the first `]` of a joined KAGParserEx multi-line
+/// bracket tag, ignoring `]` inside quotes or after a backtick escape. `None`
+/// when the tag never closes
+/// (`reference/cpp/plugins/KAGParser/readme.txt:36-42`).
+fn first_bracket_end(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) if c == b'`' => i += 1,
+            Some(_) => {}
+            None if c == b'`' => i += 1,
+            None if c == b'"' || c == b'\'' => quote = Some(c),
+            None if c == b']' => return Some(i + 1),
+            None => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Split a label line into `(name, macro_name)`. `name` is the part before

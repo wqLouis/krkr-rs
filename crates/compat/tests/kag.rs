@@ -728,6 +728,23 @@ mod parser_tests {
     }
 
     #[test]
+    fn multiline_ignores_everything_after_the_closing_bracket() {
+        // KAGParserEx drops the rest of a joined `[tag …]` after its `]`
+        // (`reference/cpp/plugins/KAGParser/readme.txt:36-42`).
+        let scenario =
+            parse_with_options("[tag hoge=123 \\\n; fuga=test][ignored]\n", opts()).unwrap();
+        assert_eq!(
+            scenario.events,
+            vec![tag(
+                "tag",
+                &[("hoge", "123"), ("fuga", "test")],
+                Bracket::Square,
+                1
+            )]
+        );
+    }
+
+    #[test]
     fn multiline_continuation_must_be_followed_by_a_semicolon_line() {
         let err = parse_with_options("@tag a=1 \\\nnext=2\n", opts()).unwrap_err();
         assert_eq!(
@@ -2334,4 +2351,38 @@ fn a_prefix_before_a_quote_evaluates_the_unquoted_expression() {
     let (_, params) = tags.iter().find(|(n, _)| n == "x").expect("x tag");
     assert_eq!(seen, "expr");
     assert_eq!(params, &[("a".to_string(), "eval:expr".to_string())]);
+}
+
+#[test]
+fn a_multiline_continuation_error_is_raised_when_the_walk_reaches_its_line() {
+    // KAGParserEx throws when `_GetNextTag` scans the bad continuation, so a
+    // tag line ending in `\` whose next line is not `;`-prefixed is deferred
+    // (`reference/cpp/plugins/KAGParser/readme.txt:16-18`).
+    let mut state = KagParserState::default();
+    state.multi_line_tag_enabled = true;
+    state
+        .load_scenario_text("t.ks", "ok\n@tag a=1 \\\nnext\n")
+        .expect("load does not join-scan tags");
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let (tags, error) = walk_all(&mut state, &mut eval);
+    assert_eq!(ch_text(&tags), "ok");
+    assert!(
+        error.is_some(),
+        "the continuation error surfaces at the walk"
+    );
+}
+
+#[test]
+fn a_backslash_at_the_end_of_an_emb_buffer_is_a_continuation() {
+    // While an expansion is active the reference scans `LineBuffer`, so a
+    // trailing `\` there is dropped like a source-line continuation
+    // (`reference/cpp/core/base/KAGParser.cpp:1415-1428`).
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text("t.ks", "[emb exp=\"x\"]\nbar\n")
+        .unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Str("foo\\".to_string()));
+    let (tags, error) = walk_all(&mut state, &mut eval);
+    assert!(error.is_none());
+    assert_eq!(ch_text(&tags), "foobar");
 }
