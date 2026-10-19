@@ -66,15 +66,9 @@
 
 use std::sync::OnceLock;
 
-use super::{Trans, TransError, argb_to_rgba, blend_level, read_pixel, write_pixel};
+use super::{PI_TRUNCATED, Trans, TransError, argb_to_rgba, blend_level, read_pixel, write_pixel};
 use crate::layer_ops::{RectI, blit_copy, intersect, intersect_rect};
 use crate::scene::BitmapState;
-
-/// The table generator's π as the truncated literal `3.14159265358979`.
-///
-/// `f64::consts::PI` differs in the last digits; this truncated value keeps
-/// every table entry at its exact byte value.
-const PI_TRUNCATED: f64 = f64::from_bits(0x4009_21FB_5444_2D11);
 
 /// Tile edge in pixels; the reference hard-codes 64×64 blocks (`turn.cpp`).
 const TILE: i32 = 64;

@@ -448,7 +448,7 @@ pub(crate) fn draw_text_into_bitmap(
         return draw_prerendered_text(
             resolver,
             bitmap,
-            PrerenderedDraw {
+            PrerenderedRun {
                 font,
                 body: &body,
                 size_px,
@@ -555,35 +555,40 @@ struct PrerenderedGlyph {
     y: i32,
 }
 
-/// Draws a run whose font is mapped to a pre-rendered `.tft`.
-///
-/// Each character uses the `.tft` descriptor's coverage, origin and ink width;
-/// a character the file does not carry falls back to the rasterizer. The pen
-/// advances by the descriptor's `IncX`/`IncY`, and the glyph origin includes
-/// the reference's ascent offset
-/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:715-728,1275-1433`).
-struct PrerenderedDraw<'a> {
+/// Inputs for drawing one run through a pre-rendered `.tft` font.
+struct PrerenderedRun<'a> {
+    /// Resolved font id for the mapped font.
     font: FontId,
+    /// Parsed `.tft` body the glyphs are read from.
     body: &'a PrerenderedBody,
+    /// Font size in pixels.
     size_px: f32,
+    /// Text style (bold, italic, colour).
     style: &'a TextStyle,
+    /// Rotation in tenths of a degree.
     angle_tenths: f64,
 }
 
+/// Draw a run whose font is mapped to a pre-rendered `.tft`.
+///
+/// Each character uses the `.tft` descriptor's coverage, origin and ink
+/// width; a character the file does not carry falls back to the rasterizer.
+/// The pen advances by the descriptor's `IncX`/`IncY`, and the glyph origin
+/// includes the ascent offset.
 fn draw_prerendered_text(
     resolver: &ResourceResolver,
     bitmap: &mut BitmapState,
-    font: PrerenderedDraw<'_>,
+    run: PrerenderedRun<'_>,
     clip: RectI,
     params: &TextDrawParams<'_>,
 ) -> Result<Option<RectI>, String> {
-    let PrerenderedDraw {
+    let PrerenderedRun {
         font,
         body,
         size_px,
         style,
         angle_tenths,
-    } = font;
+    } = run;
     let ascent = f64::from(
         resolver
             .engine
@@ -593,8 +598,7 @@ fn draw_prerendered_text(
     );
     let angle = angle_tenths * std::f64::consts::PI / 1800.0;
     let angle90 = angle + std::f64::consts::FRAC_PI_2;
-    // The reference truncates the ascent projection to an integer
-    // (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:722-728`).
+    // The ascent projection is truncated to an integer.
     let ascent_ofs_x = (-angle90.cos() * ascent) as i32;
     let ascent_ofs_y = (angle90.sin() * ascent) as i32;
     let opacity = params.opacity.clamp(0, 255) as u8;

@@ -73,15 +73,9 @@
 //! [`blend_level`], the shared `TVPConstAlphaBlend_SD` arithmetic of the
 //! parent module.
 
-use super::{Trans, TransError, argb_to_rgba, blend_level, read_pixel, write_pixel};
+use super::{PI_TRUNCATED, Trans, TransError, argb_to_rgba, blend_level, read_pixel, write_pixel};
 use crate::layer_ops::{RectI, intersect};
 use crate::scene::BitmapState;
-
-/// The wave's π as the truncated literal `3.14159265358979`.
-///
-/// `f64::consts::PI` differs in the last digits; this truncated value keeps
-/// the sine arguments and the boundary pixels at their exact values.
-const PI_TRUNCATED: f64 = f64::from_bits(0x4009_21FB_5444_2D11);
 
 /// The `wave` options of `wave.cpp`'s `StartTransition`, as the caller
 /// parsed them from the script.

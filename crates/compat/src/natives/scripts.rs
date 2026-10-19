@@ -569,9 +569,6 @@ struct StorageScript<'a> {
     storage: &'a Storage,
     name: &'a str,
     mode: &'a str,
-}
-
-struct ScriptExec<'a> {
     block_name: &'a str,
     context: *mut c_void,
     expression: bool,
@@ -582,20 +579,17 @@ struct ScriptExec<'a> {
 fn execute_storage(
     engine: &Tjs2Engine,
     script: StorageScript<'_>,
-    run: ScriptExec<'_>,
 ) -> Result<RetainedValue, String> {
     let StorageScript {
         storage,
         name,
         mode,
-    } = script;
-    let ScriptExec {
         block_name,
         context,
         expression,
         encoding,
         services,
-    } = run;
+    } = script;
     let _timer = ScriptExecTimer::start(services, block_name);
     let bytes = read_storage_bytes(storage, name, mode)?;
     // Bytecode first, text second. `Ok(None)` means the loader did not
@@ -651,8 +645,6 @@ pub fn exec_storage(engine: &Tjs2Engine, storage: &Storage, name: &str) -> Resul
             storage,
             name,
             mode: "",
-        },
-        ScriptExec {
             block_name: &extract_storage_name(name),
             context: std::ptr::null_mut(),
             expression: false,
@@ -744,8 +736,6 @@ extern "C" fn native_exec_storage(
             storage: unsafe { &*storage },
             name: &name,
             mode: &mode,
-        },
-        ScriptExec {
             block_name: &block_name,
             context,
             expression: false,
@@ -794,8 +784,6 @@ extern "C" fn native_eval_storage(
             storage: unsafe { &*storage },
             name: &name,
             mode: &mode,
-        },
-        ScriptExec {
             block_name: &block_name,
             context,
             expression: true,

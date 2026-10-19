@@ -56,6 +56,12 @@ mod extrans_wave;
 /// `tTVPCrossFadeTransHandler`).
 pub const PHASE_MAX: i32 = 255;
 
+/// Truncated π literal used by the `wave` and `turn` transition tables.
+///
+/// `f64::consts::PI` differs in the last digits; the truncated value keeps
+/// the sine arguments and table entries at their exact values.
+pub(crate) const PI_TRUNCATED: f64 = f64::from_bits(0x4009_21FB_5444_2D11);
+
 /// Direction a scroll/slide transition moves from (`tTVPScrollTransFrom`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
