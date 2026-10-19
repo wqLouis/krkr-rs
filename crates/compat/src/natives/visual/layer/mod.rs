@@ -1248,6 +1248,10 @@ pub fn paint_poll(ctx: &CompatCtx) -> Result<(), String> {
 }
 
 /// `Layer.setClip(left, top, width, height)`.
+///
+/// A call with no arguments resets the clip rectangle to the whole
+/// MainImage; otherwise the four edges are required (reference `setClip`,
+/// `reference/cpp/core/visual/LayerIntf.cpp:8635-8658`).
 extern "C" fn layer_set_clip(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -1257,15 +1261,9 @@ extern "C" fn layer_set_clip(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    if argc < 4 {
+    if argc != 0 && argc < 4 {
         return report_error(out_error, "Layer.setClip requires 4 arguments");
     }
-    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
-    let a = unsafe { args(argv, argc) };
-    let left = value_as_i64(&a[0]) as i32;
-    let top = value_as_i64(&a[1]) as i32;
-    let width = value_as_i64(&a[2]) as i32;
-    let height = value_as_i64(&a[3]) as i32;
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.setClip: compat context is not bound");
     };
@@ -1278,15 +1276,27 @@ extern "C" fn layer_set_clip(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    // A layer with no MainImage raises rather than storing the rectangle.
-    if let Err(error) = set_clip_rect(
-        scene,
-        id,
-        i64::from(left),
-        i64::from(top),
-        i64::from(width),
-        i64::from(height),
-    ) {
+    // A layer with no MainImage raises rather than storing or resetting the
+    // rectangle.
+    let result = if argc == 0 {
+        reset_clip(scene, id)
+    } else {
+        // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
+        let a = unsafe { args(argv, argc) };
+        let left = value_as_i64(&a[0]) as i32;
+        let top = value_as_i64(&a[1]) as i32;
+        let width = value_as_i64(&a[2]) as i32;
+        let height = value_as_i64(&a[3]) as i32;
+        set_clip_rect(
+            scene,
+            id,
+            i64::from(left),
+            i64::from(top),
+            i64::from(width),
+            i64::from(height),
+        )
+    };
+    if let Err(error) = result {
         return report_error(out_error, &format!("Layer.setClip: {error}"));
     }
     set_void(out);
@@ -1648,6 +1658,25 @@ fn set_clip_rect(
         (right - left_clamped) as u32,
         (bottom - top_clamped) as u32,
     ));
+    Ok(())
+}
+
+/// Reset the clip rectangle to the whole MainImage — the no-argument
+/// `setClip()` (reference `ResetClip`, `LayerIntf.cpp:4032-4039`). Without an
+/// image nothing is stored and `Not drawable layer type` is returned.
+fn reset_clip(scene: &mut Scene, id: u32) -> Result<(), String> {
+    if scene
+        .layer(id)
+        .and_then(|layer| layer.bitmap)
+        .and_then(|bitmap| scene.bitmap(bitmap))
+        .is_none()
+    {
+        return Err("Not drawable layer type".to_string());
+    }
+    let Some(layer) = scene.layer_mut(id) else {
+        return Err("layer no longer exists".to_string());
+    };
+    layer.clip = None;
     Ok(())
 }
 

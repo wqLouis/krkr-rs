@@ -1612,6 +1612,38 @@ fn set_clip_requires_an_image_and_intersects_it() {
     );
 }
 
+/// Reference: `setClip` with no arguments calls `ResetClip`, which requires a
+/// `MainImage` and otherwise restores the clip rectangle to the whole image
+/// (`reference/cpp/core/visual/LayerIntf.cpp:8635-8658`, `:4032-4039`); one
+/// to three arguments are a bad parameter count (`:8644-8648`).
+#[test]
+fn set_clip_with_no_arguments_resets_to_the_whole_image() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); l.setImageSize(4, 4); \
+         l.setClip(1, 1, 2, 2);",
+    );
+    assert_eq!(env.eval_int("l.clipWidth"), 2);
+    // The no-argument form restores the whole image.
+    env.run("l.setClip();");
+    assert_eq!(env.eval_int("l.clipLeft"), 0);
+    assert_eq!(env.eval_int("l.clipTop"), 0);
+    assert_eq!(env.eval_int("l.clipWidth"), 4);
+    assert_eq!(env.eval_int("l.clipHeight"), 4);
+    // A partial argument list is not the reset form and is rejected.
+    assert!(env.try_run("l.setClip(1, 2, 3);").is_err());
+    // A layer with no MainImage raises, like the four-argument form.
+    env.run("l.hasImage = false;");
+    let message = env
+        .try_run("l.setClip();")
+        .expect_err("no MainImage must raise");
+    assert!(
+        message.contains("Not drawable layer type"),
+        "unexpected message: {message}"
+    );
+}
+
 /// Reference: `SetPosition` and `InternalSetBounds` throw
 /// `TVPCannotMovePrimary` when the layer is the window's primary layer
 /// (`reference/cpp/core/visual/LayerIntf.cpp:2203-2207`, `:2144-2147`), and
