@@ -49,6 +49,8 @@ The worker **does not**:
   a cleanup easier;
 - fix an unrelated bug found on the way — report it instead;
 - add a dependency, a global, a hidden cache or a fallback;
+- keep the superseded code, test, allowlist entry or doc "for compatibility"
+  — deleting it is part of the change, not a follow-up;
 - widen its own write scope or edit a file another worker owns;
 - run `cargo build`, `cargo check`, `cargo clippy`, `cargo test`, `cargo run`,
   or `rustc`; the main agent runs those.
@@ -192,6 +194,13 @@ Rules:
   widening. Never let an unchecked `as` truncate a script-supplied value.
 - Prefer `Option<T>` for absence and `Result<T, E>` for failure. Do not use
   `bool` to mean “found or error”; `Result<Option<T>, E>` distinguishes the two.
+- A native property getter returns what the reference returns. A `StoredValue`
+  field whose constructor default is `StoredValue::Void` must be mapped to the
+  reference's non-void value (an empty array, a dictionary, the class's own
+  object) before it reaches the script: a raw passthrough makes
+  `obj.prop.member` raise on a fresh object. The `void-getter` gate enforces
+  this; a reference property that genuinely reads back void is recorded in
+  `scripts/allowlists/void_getter_allow.txt`.
 - No `static mut`, `thread_local!`, `LazyLock`, `OnceLock`, or hidden registries
   in L1. Per-engine state belongs in the explicit state object.
 
@@ -297,3 +306,7 @@ For each module, in order:
 
 Do not mix a behavioral fix with a style rewrite. If a rewrite exposes a bug,
 stop and report it; fix behavior in a separate change.
+
+A rewrite lands as a replacement, not an addition: the old implementation,
+its tests, its allowlist entries and the doc that described it are removed in
+the same change. Git keeps the history; the tree does not.
