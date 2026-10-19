@@ -190,7 +190,7 @@ from a VM-bound one.
 Two measurements per binary, both single-threaded:
 
 * **compile** — the 48 real-game `.tjs` files extracted from
-  `/mnt/DATA/Games/Others/test/data.xp3`, compiled 20 times in one process
+  `$KRKR_TEST_GAME/data.xp3`, compiled 20 times in one process
   (average per pass). The `.ks` files are KAG, not TJS, and the TJS2 compiler
   rejects them, so they are excluded.
 * **exec** — `scripts/perf/workload.tjs`, a class/object/array/dictionary/

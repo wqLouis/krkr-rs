@@ -5946,13 +5946,19 @@ var ra = a.get(); var rb = b.get();",
     #[test]
     fn reads_the_real_kag_save_fixture() {
         let _vm_lock = vm_lock();
-        const FIXTURE: &str = "/mnt/DATA/Games/Others/【KR】不可视之药与坎坷的命运/【KR】不可视之药与坎坷的命运/savedata/qsave01.bmp";
-        if !std::path::Path::new(FIXTURE).exists() {
-            eprintln!("skipping: real KAG fixture not present at {FIXTURE}");
+        // Set `KRKR_TEST_SAVE` to a real KAG save BMP (a thumbnail followed by
+        // the struct) to run this against shipped data.
+        let Ok(fixture) = std::env::var("KRKR_TEST_SAVE") else {
+            eprintln!("skipping: set KRKR_TEST_SAVE to a real KAG save BMP");
+            return;
+        };
+        let path = std::path::Path::new(&fixture);
+        if !path.exists() {
+            eprintln!("skipping: {fixture} does not exist");
             return;
         }
         // The BMP thumbnail is 83086 bytes; the save struct follows it.
-        let text = read_text_stream(std::path::Path::new(FIXTURE), "o83086");
+        let text = read_text_stream(path, "o83086");
         assert!(text.contains("(const)"), "fixture is not a TJS struct");
         assert!(
             text.contains("\"title\""),

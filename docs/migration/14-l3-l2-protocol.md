@@ -42,8 +42,9 @@ never in the seam file.
 
 `crates/compat/src/engine_api.rs` is the only file under `crates/compat/src`
 allowed to contain `engine::`. The `l3-engine-api` rule in
-`scripts/krkr_gates/checks/layering.py` reports any other file, and its
-self-test proves the rule fires on a bad fixture and leaves a near-miss clean.
+`scripts/krkr_gates/checks/layering.py` reports any other file whose production
+code names `engine::`, and its self-test proves the rule fires on a bad fixture
+and leaves a near-miss clean.
 
 Adding a protocol item:
 
@@ -285,8 +286,8 @@ and streams live in the native payloads and are dropped with the host.
 
 ### 6.7 `engine::video`
 
-**Items:** `VideoOverlay`, `VideoEvent`, `PlayStatus`, `PeriodReason`,
-`VideoBounds`, `blit_frame_to_layer`, `blit_frame_to_layer_opacity`.
+**Items:** `VideoOverlay`, `VideoEvent`, `PlayStatus`, `VideoBounds`,
+`blit_frame_to_layer`, `blit_frame_to_layer_opacity`.
 
 **Owns:** the overlay playback machine — status, clock, position, play rate,
 whole-stream/segment looping, period-event state, the current decoded frame,

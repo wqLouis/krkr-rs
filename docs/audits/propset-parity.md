@@ -1,6 +1,6 @@
 # `PropSet` parity audit — the registration mechanisms the extractors missed
 
-- Repo: `/mnt/DATA/Document/code/krkr-rs`
+- Repo: `$KRKR_REPO`
 - Date: 2026-10-11
 - Scope: the reference C++ registration mechanisms that make a name
   script-visible, and how the `native-parity` and `plugin-parity` checks

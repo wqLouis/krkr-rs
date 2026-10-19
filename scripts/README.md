@@ -64,6 +64,14 @@ A property whose reference getter genuinely reads back void is recorded in
 `allowlists/void_getter_allow.txt` as `path:field — reason`; a reason that
 starts with `debt:` tracks a known defect and does not silence the finding.
 
+## Environment
+
+- `KRKR_TEST_GAME` — a game directory for the `real_game`/`boot_game` tests
+  and `scripts/perf/bench-tjs-opt.sh` (the script also takes `--game`).
+- `KRKR_TEST_SAVE` — a real KAG save BMP for the save-fixture test.
+- `KRKR_REPO` — the checkout root; docs use it where a command starts outside
+  the repository.
+
 ## Notes
 
 - No third-party runtime dependencies; the build backend is hatchling.

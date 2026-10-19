@@ -30,7 +30,7 @@ proposals.
 
 ## Measured baseline (desktop, windowed Vulkan, real title)
 
-A windowed run of the release binary on `/mnt/DATA/Games/Others/test/`
+A windowed run of the release binary on `$KRKR_TEST_GAME/`
 (Yuzusoft, `data.xp3` + `patch.xp3`) with `--backend vulkan`, at the 60 fps
 steady state, 347 clean frames:
 

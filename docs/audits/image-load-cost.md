@@ -4,7 +4,7 @@ Audit only. **No source file was modified.** The reference (`reference/cpp/**`)
 is the only oracle. Measured on the tree at `649abc6`; the numbers are debug and
 release builds of that tree, not a benchmark in the repository.
 
-Game under test: `/mnt/DATA/Games/Others/test` (`data.xp3` + `patch.xp3`),
+Game under test: `$KRKR_TEST_GAME` (`data.xp3` + `patch.xp3`),
 run with archive preload ON (`--preload-archives`), so **file I/O is out**:
 reads come from the in-memory archive backing, not the FUSE mount.
 

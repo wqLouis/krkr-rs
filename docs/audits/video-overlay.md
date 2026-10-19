@@ -21,7 +21,7 @@ Actor map:
 | port decoder seam (app) | `crates/app/src/video.rs` |
 
 Scripts that drive it in the real game (extracted from
-`/mnt/DATA/Games/Others/test/data.xp3`):
+`$KRKR_TEST_GAME/data.xp3`):
 
 * `system/movie.tjs` — `MovieLayer extends VideoOverlay`, `mode = vomLayer`,
   `layer1 = <Layer>`, `open/play/pause/stop`, `numberOfAudioStream`,

@@ -1,7 +1,7 @@
 # TODO — open work
 
-**Branch:** `main` · **repo:** `/mnt/DATA/Document/code/krkr-rs` · **game:**
-`/mnt/DATA/Games/Others/test` (`data.xp3`, `patch.xp3`, loose `patch.tjs`).
+**Branch:** `main` · **repo:** `$KRKR_REPO` · **game:**
+`$KRKR_TEST_GAME` (`data.xp3`, `patch.xp3`, loose `patch.tjs`).
 
 This file lists **only what is still open**, in priority order; a landed change
 is deleted from it and history is read with `git log`. Decisions live in
@@ -345,4 +345,4 @@ new evidence.
 * **The error-handling scan over-reports by design** (it cannot tell a `Result`
   receiver from an `Option` one); a site with no
   `scripts/allowlists/error_handling_allow.txt` entry fails the gate. Startup
-  slowness on `/mnt/DATA` is environmental (`fuseblk`), not code.
+  slowness on the game mount is environmental (FUSE), not code.

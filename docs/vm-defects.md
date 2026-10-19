@@ -6,7 +6,7 @@ TJS2 VM (`crates/tjs/cpp/tjs2/**`) and the reference engine
 the script layer. This is a working document, not an audit: it lists the things
 a rewrite must not rediscover the hard way.
 
-- Repo: `/mnt/DATA/Document/code/krkr-rs` · HEAD `4f9f894`, branch `main`
+- Repo: `$KRKR_REPO` · HEAD `4f9f894`, branch `main`
 - **Line numbers are working-tree numbers** (other work was in flight while this
   document was written). Function/member/class names are the stable anchor;
   re-grep the name if a number has moved.

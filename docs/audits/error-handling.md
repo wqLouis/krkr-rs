@@ -1,6 +1,6 @@
 # Error / absence / panic handling audit
 
-- Repo: `/mnt/DATA/Document/code/krkr-rs`
+- Repo: `$KRKR_REPO`
 - Date: 2026-10-12
 - Scope: every non-test Rust site matching `.unwrap_or(`, `.unwrap_or_default()`,
   `.unwrap_or_else(`, `let _ = `, `.ok()`, `if let Ok(`, `.unwrap()`, `.expect(`,

@@ -1,6 +1,6 @@
 # `layerExDraw` plugin — hidden-handle, marshalling and lifetime audit
 
-- Repo: `/mnt/DATA/Document/code/krkr-rs`
+- Repo: `$KRKR_REPO`
 - Branch: `main`
 - Date: 2026-10-13
 - Scope: `crates/compat/src/natives/plugins/layer_ex/**` (`mod`, `draw`,

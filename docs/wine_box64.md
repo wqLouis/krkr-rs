@@ -5,8 +5,8 @@ plan. It asks whether Wine (plus box64 on ARM) can load the game's real Windows
 plugin DLLs into the process, or run the game's `.exe`, while the engine keeps the
 render surface.
 
-Repo: `/mnt/DATA/Document/code/krkr-rs`
-Game: `/mnt/DATA/Games/Others/test`
+Repo: `$KRKR_REPO`
+Game: `$KRKR_TEST_GAME`
 Reference engine in tree: `reference/` (the **KrKr2 Emulator**,
 `github.com/2468785842/krkr2`, per `reference/README.md:1`).
 
@@ -44,7 +44,7 @@ version's target (`AGENTS.md` §1). The engine's current render/window stack is
 $ uname -m
 x86_64
 $ uname -a
-Linux wqlouis-desktop 7.2.4-arch1-2 #1 SMP PREEMPT_DYNAMIC ... x86_64 GNU/Linux
+Linux 7.2.4-arch1-2 #1 SMP PREEMPT_DYNAMIC ... x86_64 GNU/Linux
 $ which wine wine64 wine32 box64 box86
 which: no wine in (...)
 which: no wine64 in (...)
@@ -72,7 +72,7 @@ Hangover GitHub pages. All non-obvious claims below cite a fetched source path.
 
 ---
 
-## 2. The game: what is actually in `/mnt/DATA/Games/Others/test`
+## 2. The game: what is actually in `$KRKR_TEST_GAME`
 
 It is **not** a Windows install. It is a **Kirikiroid2 Android package**:
 
@@ -112,7 +112,7 @@ There is **no `.exe`** anywhere (game dir or inside the archives), and no native
 
 ```
 $ uv run --project scripts krkr-gate extract-xp3 data.xp3 extrans.dll > extrans.dll
-$ file /tmp/dlls/*.dll
+$ file $TMPDIR/dlls/*.dll
 csvparser.dll:   PE32 executable for MS Windows 4.00 (DLL), Intel i386, 5 sections
 extrans.dll:     PE32 executable for MS Windows 4.00 (DLL), Intel i386, 5 sections
 fstat.dll:       PE32 executable for MS Windows 4.00 (DLL), Intel i386, 5 sections
@@ -831,14 +831,14 @@ bsdtar -tf Kirikiroid2_1.3.9.apk | grep '\.so$'
 file apk/lib/arm64-v8a/libgame.so
 
 # plugin binaries inside the archive
-uv run --project scripts krkr-gate extract-xp3 data.xp3 extrans.dll > /tmp/dlls/extrans.dll
-file /tmp/dlls/*.dll                        # PE32 ... Intel i386
+uv run --project scripts krkr-gate extract-xp3 data.xp3 extrans.dll > $TMPDIR/dlls/extrans.dll
+file $TMPDIR/dlls/*.dll                        # PE32 ... Intel i386
 
 # plugin references in UTF-16LE scripts
-python3 /tmp/grep_utf.py 'loadPlugin|Plugins\.link'   # initialize.tjs / sound.tjs / k2compat
+python3 $TMPDIR/grep_utf.py 'loadPlugin|Plugins\.link'   # initialize.tjs / sound.tjs / k2compat
 
 # exported entry points
-objdump -p /tmp/dlls/extrans.dll | grep -A2 'Export'
+objdump -p $TMPDIR/dlls/extrans.dll | grep -A2 'Export'
 # host entry points requested by the plugins (string extraction)
-strings -n4 /tmp/dlls/*.dll | grep -oE '::[A-Za-z_][A-Za-z0-9_]*\(' | sort -u | wc -l
+strings -n4 $TMPDIR/dlls/*.dll | grep -oE '::[A-Za-z_][A-Za-z0-9_]*\(' | sort -u | wc -l
 ```

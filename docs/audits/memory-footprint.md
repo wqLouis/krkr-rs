@@ -1,7 +1,7 @@
 # Runtime memory footprint audit
 
 Audit of the CPU memory footprint of the release/debug `krkr` host on the real
-game `/mnt/DATA/Games/Others/test` (`data.xp3` 23 572 entries + `patch.xp3`
+game `$KRKR_TEST_GAME` (`data.xp3` 23 572 entries + `patch.xp3`
 174 entries). This is an audit only: **no source was modified.**
 
 The reference engine (`reference/cpp/**`) is the oracle. Decision numbers in
@@ -28,7 +28,7 @@ release-vs-release comparison of the audio fix is not possible here.
 
 Method (no `cargo`/`rustc` was run, per the hard repo rule):
 
-* `--headless --frames N --base-dir /mnt/DATA/Games/Others/test`, RSS sampled
+* `--headless --frames N --base-dir $KRKR_TEST_GAME`, RSS sampled
   from `/proc/<pid>/status` (`VmRSS`/`VmHWM`) at ~20 Hz, plus
   `/proc/<pid>/smaps`;
 * a small `LD_PRELOAD` malloc interposer (`gcc`, not cargo) that snapshots

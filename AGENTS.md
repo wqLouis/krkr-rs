@@ -5,8 +5,12 @@ It distills `docs/migration/**` (the design decisions are the source of truth
 there) into the rules you must follow without re-reading them. If code and docs
 disagree, the design docs win; fix the code, then update the doc.
 
-Repo: `/mnt/DATA/Document/code/krkr-rs` · Branch: `main`
-Real game for manual checks: `/mnt/DATA/Games/Others/test`.
+Repo: `$KRKR_REPO` · Branch: `main`
+Real game for manual checks: `$KRKR_TEST_GAME`.
+
+Set `KRKR_REPO` to the checkout root and `KRKR_TEST_GAME` to a game directory
+before running a command that names them; `KRKR_TEST_SAVE` points at a real KAG
+save BMP for the save-fixture test.
 
 Read order: this file, then `docs/code-conduct.md` for the Rust-level baseline,
 then only the design/reference pages a task actually needs. Do not load the

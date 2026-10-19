@@ -11,7 +11,7 @@ Reference oracle: `reference/cpp/**`. The only port code that runs inside the
 
 ## 0. What actually runs on a save (facts)
 
-The game is `HULOTTE — 相见5分属于我` at `/mnt/DATA/Games/Others/test`.
+The game is `HULOTTE — 相见5分属于我` at `$KRKR_TEST_GAME`.
 `system/status.tjs:17` sets `__FILE_CRYPT__ = 1`, so:
 
 | step | caller | ported member |
@@ -49,7 +49,7 @@ the real `adv != null` `Savedata.save` path (or a specific value in `_param`).
 
 ### Leftover crash artifacts
 
-`/mnt/DATA/Games/Others/test/savedata/save01_001.bmp` and `qsave01.bmp`
+`$KRKR_TEST_GAME/savedata/save01_001.bmp` and `qsave01.bmp`
 (both 80699 bytes, written 21:08 / 21:14 while the user was testing) are exactly
 `BMP 192x105 (bfSize 80694)` **plus 5 bytes** `FE FE 02 FF FE` — the crypt
 signature + UTF-16 BOM that `TextWriteStream` writes first. There is no zlib
@@ -304,7 +304,7 @@ The decisive evidence is a backtrace. Please reproduce once and run:
 
 ```
 gdb -batch -ex run -ex 'thread apply all bt full' --args \
-  ./target/release/krkr --base-dir /mnt/DATA/Games/Others/test \
+  ./target/release/krkr --base-dir $KRKR_TEST_GAME \
   --archive data.xp3 --archive patch.xp3
 ```
 

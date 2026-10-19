@@ -1,6 +1,6 @@
 # `unsafe` inventory and C++ boundary audit
 
-- Repo: `/mnt/DATA/Document/code/krkr-rs`
+- Repo: `$KRKR_REPO`
 - Date: 2026-10-11
 - Scope: every `unsafe` construct in the Rust tree and the two hand-written C++
   files (`crates/tjs/cpp/tjs2_abi.cpp`, `crates/tjs/cpp/streams.cpp`) plus the
@@ -343,7 +343,7 @@ map). Many state structs hold live `DetachedValue`s that are not cleared by
 
 If any survives `tjs2_destroy`, its `Drop` dereferences a freed
 `tjs2_engine*`. A 2-frame headless run against
-`/mnt/DATA/Games/Others/test` exited cleanly (the `ObjectRegistry` entries
+`$KRKR_TEST_GAME` exited cleanly (the `ObjectRegistry` entries
 are released by native-destroy callbacks during `Shutdown`), but the
 MenuItem/windowEx/motion/xp3 caches are never explicitly drained, so this is
 reachable for games that touch them. Fix: in `VmHost::drop` (or a
@@ -651,7 +651,7 @@ grep -rn 'from_raw_parts\|copy_nonoverlapping\|Box::from_raw' crates --include=*
 grep -rn 'catch_unwind' crates --include=*.rs              # none
 python3 scripts/find_stubs.py
 uv run --project scripts krkr-gate stateless                # clean
-./target/debug/krkr --headless --frames 2 --backend null /mnt/DATA/Games/Others/test
+./target/debug/krkr --headless --frames 2 --backend null $KRKR_TEST_GAME
 ```
 
 Reference citations used: `reference/cpp/core/sound/win32/WaveImpl.cpp:3517`,

@@ -21,9 +21,9 @@
 #                                 [--iters N] [--configs "N|flags;N|flags"]
 #                                 [--work-dir DIR] [--keep]
 #
-# Defaults: game /mnt/DATA/Games/Others/test, runs 7, iters 20, and a config
-# set of -O2, -O3 and -O2 -flto. `WORK` and `ZIGOUT` are honoured from the
-# environment. Nothing here runs cargo.
+# Defaults: game `$KRKR_TEST_GAME`, runs 7, iters 20, and a config set of -O2,
+# -O3 and -O2 -flto. `GAME`, `WORK`, `ZIGOUT` and `KRKR_TEST_GAME` are honoured
+# from the environment. Nothing here runs cargo.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -32,7 +32,7 @@ ABI="$ROOT/crates/tjs/cpp"
 DRIVER="$ROOT/scripts/perf/tjs2_bench.cpp"
 WORKLOAD="$ROOT/scripts/perf/workload.tjs"
 
-GAME="${GAME:-/mnt/DATA/Games/Others/test}"
+GAME="${GAME:-${KRKR_TEST_GAME:-}}"
 CORPUS=""
 RUNS="${RUNS:-7}"
 ITERS="${ITERS:-20}"
@@ -52,6 +52,11 @@ while [[ $# -gt 0 ]]; do
         *) echo "bench-tjs-opt.sh: unknown argument '$1'" >&2; exit 2 ;;
     esac
 done
+
+if [[ -z "$GAME" ]]; then
+    echo "bench-tjs-opt.sh: set KRKR_TEST_GAME or pass --game DIR" >&2
+    exit 2
+fi
 
 mkdir -p "$WORK"
 GEN="$WORK/gen"

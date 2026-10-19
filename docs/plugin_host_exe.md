@@ -11,8 +11,8 @@ toolchains are installed by this study.** The one executable artefact below was
 *compiled* with the already-present `zig` (cross-compile only); it was **not run**
 because `wine` is absent on this machine.
 
-Repo: `/mnt/DATA/Document/code/krkr-rs`
-Game: `/mnt/DATA/Games/Others/test`
+Repo: `$KRKR_REPO`
+Game: `$KRKR_TEST_GAME`
 Reference engine in tree: `reference/` (the KrKr2 Emulator fork; see
 `docs/wine_box64.md` for the earlier Wine study, whose conclusion this study
 sharpens and partially revises).
@@ -65,7 +65,7 @@ plugins**, carried along by the platform-agnostic archive and never executed by
 the Android build.
 
 ```text
-$ file /tmp/dlls/*
+$ file $TMPDIR/dlls/*
 csvParser.dll:   PE32 executable for MS Windows 4.00 (DLL), Intel i386, 5 sections
 extrans.dll:     PE32 executable for MS Windows 4.00 (DLL), Intel i386, 5 sections
 fstat.dll:       PE32 executable for MS Windows 4.00 (DLL), Intel i386, 5 sections
@@ -355,7 +355,7 @@ built against.
 │  media / engine / tjs …                                                                         │
 │  PluginSidecar (Rust):                                                                           │
 │    DecoderClient ─── control: 127.0.0.1:PORT (TCP)  ───┐                                         │
-│                   └─ data:   /tmp/krkr-host-<pid>.pcm (mmap ring) ──┐                            │
+│                   └─ data:   $TMPDIR/krkr-host-<pid>.pcm (mmap ring) ──┐                            │
 └────────────────────────────────────────────────────────────────────┼────────────────────────────┘
                                                                      │ (Wine maps Z:\tmp\...)
 ┌──────────────────────────────── Wine process: host.exe (i386 PE) ──▼────────────────────────────┐
@@ -441,7 +441,7 @@ Ops:
 | 0xEE | `ERR` | UTF-8 message | — |
 
 Data plane: a file-backed shared-memory ring, mapped by the native side at
-`/tmp/krkr-host-<pid>.pcm` and by Wine at `Z:\tmp\krkr-host-<pid>.pcm`
+`$TMPDIR/krkr-host-<pid>.pcm` and by Wine at `Z:\tmp\krkr-host-<pid>.pcm`
 (`\\?\Z:\...` for long paths). Header:
 
 ```c
@@ -481,7 +481,7 @@ $ objdump -p host_demo.exe | grep 'DLL Name' | sort -u
 	DLL Name: KERNEL32.dll
 ```
 
-Source (`/tmp/host_demo.c` in the reproduction; abbreviated here):
+Source (`$TMPDIR/host_demo.c` in the reproduction; abbreviated here):
 
 ```c
 #include <windows.h>
@@ -747,7 +747,7 @@ equivalent to porting/running the whole engine under Wine.
 
 | Claim | Evidence |
 |---|---|
-| DLLs are i386 PE | `file /tmp/dlls/*.dll` output in §1 |
+| DLLs are i386 PE | `file $TMPDIR/dlls/*.dll` output in §1 |
 | 8/9 export only `V2Link`/`V2Unlink`; `wuvorbis` exports 40 | `objdump -p` export tables (§2.1) |
 | No TVP import library; runtime resolution by name | §2.2 import tables; `reference/cpp/core/plugin/PluginImpl.h:21-66` |
 | Exporter ABI | `reference/cpp/core/plugin/PluginImpl.h:28-52` |
@@ -767,11 +767,11 @@ equivalent to porting/running the whole engine under Wine.
 
 ```bash
 # 1. extract the nine DLLs (reuse extract_xp3's open_index/get_file)
-cd /mnt/DATA/Document/code/krkr-rs
+cd $KRKR_REPO
 python3 - <<'PY'
 import sys, os, struct
 sys.path.insert(0, 'scripts'); from krkr_gates.checks import extract_xp3 as E
-f, index = E.open_index('/mnt/DATA/Games/Others/test/data.xp3')
+f, index = E.open_index(os.environ['KRKR_TEST_GAME'] + '/data.xp3')
 names, pos = [], 0
 while pos + 12 <= len(index):
     tag = index[pos:pos+4]; size = struct.unpack('<Q', index[pos+4:pos+12])[0]
@@ -785,14 +785,14 @@ while pos + 12 <= len(index):
                 names.append(info[22:22+nlen*2].decode('utf-16-le', 'replace'))
             p2 += 12 + ss
     pos += 12 + size
-os.makedirs('/tmp/dlls', exist_ok=True)
+os.makedirs('$TMPDIR/dlls', exist_ok=True)
 for n in [x for x in names if x.lower().endswith('.dll')]:
-    open('/tmp/dlls/'+os.path.basename(n.replace('\\','/')), 'wb').write(
+    open('$TMPDIR/dlls/'+os.path.basename(n.replace('\\','/')), 'wb').write(
         E.get_file(f, index, n.replace('\\','/').lower()))
 PY
 
 # 2. exports / imports
-cd /tmp/dlls
+cd $TMPDIR/dlls
 for d in *.dll; do echo "=== $d ==="; objdump -p "$d" | sed -n '/The Export Tables/,$p' | head -40; done
 for d in *.dll; do echo "=== $d imports ==="; objdump -p "$d" | awk '/Member-Name/{f=1;next} f&&/^\t[0-9a-f]{8} /{print $NF} f&&/^$/{f=0}' | sort -u; done
 
@@ -804,7 +804,7 @@ for d in *.dll; do n=$(strings -n3 "$d" | grep -oE ' ::[A-Za-z_][A-Za-z0-9_]*' |
 # 4. registered TJS class/method wide strings
 python3 - <<'PY'
 import glob, re
-for d in sorted(set(x.lower() for x in glob.glob('/tmp/dlls/*.dll'))):
+for d in sorted(set(x.lower() for x in glob.glob('$TMPDIR/dlls/*.dll'))):
     b = open(d,'rb').read(); res = set()
     for m in re.finditer(rb'(?:[\x20-\x7e]\x00){4,}', b):
         s = m.group().decode('utf-16-le','replace')
@@ -814,8 +814,8 @@ for d in sorted(set(x.lower() for x in glob.glob('/tmp/dlls/*.dll'))):
 PY
 
 # 5. build the sidecar (verified: produces PE32 i386; not run — no wine)
-zig cc -target x86-windows-gnu -O2 /tmp/host_demo.c -o /tmp/host_demo.exe
-file /tmp/host_demo.exe
+zig cc -target x86-windows-gnu -O2 $TMPDIR/host_demo.c -o $TMPDIR/host_demo.exe
+file $TMPDIR/host_demo.exe
 ```
 
 `x86-windows-gnu` (not `i686-windows-gnu`) is zig 0.16's 32-bit x86 Windows

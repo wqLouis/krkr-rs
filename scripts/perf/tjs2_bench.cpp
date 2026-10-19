@@ -52,7 +52,7 @@ static int cmd_compile(tjs2_engine *e, const std::string &dir, int iters,
             files.push_back(p.path().string());
     }
     std::sort(files.begin(), files.end());
-    std::string outdir = "/tmp/tjs-bench-bytecode";
+    const fs::path outdir = fs::temp_directory_path() / "tjs-bench-bytecode";
     fs::create_directories(outdir);
 
     double total = 0.0;
@@ -63,8 +63,8 @@ static int cmd_compile(tjs2_engine *e, const std::string &dir, int iters,
             std::string src;
             if (!read_file(f, src))
                 continue;
-            std::string out = outdir + "/" + fs::path(f).filename().string() +
-                              ".tjsb";
+            std::string out =
+                (outdir / (fs::path(f).filename().string() + ".tjsb")).string();
             char *err = nullptr;
             int rc = tjs2_compile_script(e, src.c_str(), out.c_str(), 0, 0, 0,
                                          f.c_str(), 0, &err);
