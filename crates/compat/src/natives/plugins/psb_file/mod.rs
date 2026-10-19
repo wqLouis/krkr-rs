@@ -48,7 +48,7 @@
 //! `load` registers every top-level resource into the `psb://` storage
 //! media (`PSBMedia`, `main.cpp:60-67` + `PSBMedia.h:6-45`) so scripts can
 //! open `psb://…` paths afterwards. The registration goes through the L2
-//! [`engine::Storage::register_media`] table, which serves those names before
+//! `engine_api::Storage::register_media` table, which serves those names before
 //! disk and archive resolution; the container name is lower-cased from its
 //! first `.` exactly as `PSBMedia::NormalizeDomainName` does
 //! (`PSBMedia.cpp:16-22`).
@@ -75,11 +75,11 @@ use tjs::{
 use container::{PsbDocument, PsbValue};
 use error::PsbError;
 
+use crate::engine_api::Storage;
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
 use crate::natives::system::resolve;
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
-use engine::Storage;
 
 // ---------------------------------------------------------------------------
 // Instance payload

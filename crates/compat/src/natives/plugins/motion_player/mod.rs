@@ -10,7 +10,7 @@
 //! The reference is a large PSB-driven mesh/physics renderer. This port keeps
 //! the complete script-visible surface and the playback model (timelines,
 //! variables, transitions, wind/outer force, layer queries, particles) and
-//! composes the L2 [`engine::Scene`] layer system for drawing instead of
+//! composes the L2 `engine_api::Scene` layer system for drawing instead of
 //! re-implementing the D3D rasterizer. PSB data is parsed by [`psb`] and
 //! mapped to the runtime model in [`model`].
 //!

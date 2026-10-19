@@ -3,7 +3,7 @@
 //! Reference: the native `beginTransition`/`stopTransition` members and
 //! `tTJSNI_BaseLayer::StartTransition` / `InternalStopTransition`
 //! (`reference/cpp/core/visual/LayerIntf.cpp:7770-8058`, `:9815-9858`) and
-//! the L2 [`engine::trans`] state machine they drive. The transition state
+//! the L2 transition state machine they drive. The transition state
 //! is stored per layer in [`LayerExtras`](super::LayerExtras);
 //! [`advance_transitions`] is the frame step the frame body calls (it
 //! advances the machine by the frame's elapsed milliseconds, stops
@@ -19,8 +19,8 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::Scene;
-use engine::trans::{RuleMask, ScrollFrom, ScrollStay, Trans, TransKind};
+use crate::engine_api::Scene;
+use crate::engine_api::{RuleMask, ScrollFrom, ScrollStay, Trans, TransKind};
 use tjs::{NativeInstanceMethodDef, TjsValue, VAL_OBJECT, VAL_VOID, Value};
 
 use super::super::bitmap::{decode_image, read_image_from_storage};
@@ -263,7 +263,7 @@ extern "C" fn layer_stop_transition(
 }
 
 /// A layer's main-image size in pixels, or `None` when it has no image.
-fn main_image_size(scene: &Scene, layer: &engine::LayerState) -> Option<(u32, u32)> {
+fn main_image_size(scene: &Scene, layer: &crate::engine_api::LayerState) -> Option<(u32, u32)> {
     layer
         .bitmap
         .and_then(|bitmap| scene.bitmap(bitmap))
@@ -1108,11 +1108,12 @@ fn composite_transition(
     if with_children {
         // `render_layer_subtree` returns the composited subtree content (the
         // reference `Complete`), reusing it while the subtree is unchanged.
-        let dst_content = engine::layer_ops::render_layer_subtree(scene, id).ok_or_else(|| {
-            "Layer.beginTransition: cannot render the destination subtree".to_string()
-        })?;
-        let src_content =
-            engine::layer_ops::render_layer_subtree(scene, source).ok_or_else(|| {
+        let dst_content = crate::engine_api::layer_ops::render_layer_subtree(scene, id)
+            .ok_or_else(|| {
+                "Layer.beginTransition: cannot render the destination subtree".to_string()
+            })?;
+        let src_content = crate::engine_api::layer_ops::render_layer_subtree(scene, source)
+            .ok_or_else(|| {
                 "Layer.beginTransition: cannot render the transition source subtree".to_string()
             })?;
         // The source layer draws its rendered content.
@@ -1148,8 +1149,8 @@ fn composite_transition(
             })?;
             (bitmap.width, bitmap.height)
         };
-        let display =
-            engine::layer_ops::ensure_transition_display(scene, id, w, h).ok_or_else(|| {
+        let display = crate::engine_api::layer_ops::ensure_transition_display(scene, id, w, h)
+            .ok_or_else(|| {
                 "Layer.beginTransition: cannot allocate the transition frame".to_string()
             })?;
         let applied = scene

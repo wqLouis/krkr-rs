@@ -37,8 +37,8 @@
 //! interleaved `f32`, so every sample is scaled by `1 / 32768`.
 #![allow(unsafe_code)]
 
+use crate::engine_api::{LoopInfo, SoundSource};
 use api::media::{AudioSpec, DecodedAudio};
-use engine::sound::{LoopInfo, SoundSource};
 use std::sync::Arc;
 
 use crate::natives::sound::add_audio_decoder;

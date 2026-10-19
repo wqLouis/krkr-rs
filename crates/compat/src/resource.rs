@@ -14,13 +14,13 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use api::media::{DecodedImage, ImageInfo};
-use engine::layer_ops::RectI;
-use engine::text::{
+use crate::engine_api::layer_ops::RectI;
+use crate::engine_api::{BitmapState, Location, Storage, StorageReadError};
+use crate::engine_api::{
     CoverageMask, FontId, TextCoverageCache, TextEngine, TextStyle, blit_coverage_into,
     blur_coverage, blurred_text_coverage, compose_text_into, rasterize_text_coverage,
 };
-use engine::{BitmapState, Location, Storage, StorageReadError};
+use api::media::{DecodedImage, ImageInfo};
 use tjs::{Tjs2Engine, TjsValue, Value};
 
 use crate::CompatCtx;

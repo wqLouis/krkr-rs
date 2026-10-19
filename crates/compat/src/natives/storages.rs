@@ -1,10 +1,10 @@
-//! `Storages` native class (L3) over the L2 [`engine::Storage`] namespace.
+//! `Storages` native class (L3) over the L2 `engine_api::Storage` namespace.
 //!
 //! This is a reimplementation on the middle-layer API. The mounted namespace
 //! is the one the
 //! host attached through [`CompatServices::storage`]; all archive/namespace
 //! policy (`arc.xp3>path`, case folding, the auto search paths) lives in
-//! [`engine::Storage`] and is never duplicated here.
+//! `engine_api::Storage` and is never duplicated here.
 //!
 //! Script-visible members (reference `tTJSNC_Storages`):
 //!
@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 
-use engine::{Location, Storage, StorageReadError, normalize_in_archive_name};
+use crate::engine_api::{Location, Storage, StorageReadError, normalize_in_archive_name};
 use tjs::{Engine, NativeClassBuilder, NativeMethodDef, VAL_OBJECT, VAL_STRING, Value};
 
 use crate::binding;

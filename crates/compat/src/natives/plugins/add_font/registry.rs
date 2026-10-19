@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use engine::text::{FontId, TextEngine};
+use crate::engine_api::{FontId, TextEngine};
 
 use crate::CompatServices;
 

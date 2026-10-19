@@ -8,9 +8,9 @@
 //! replayed with the current transform and serialized without a Windows
 //! metafile dependency.
 
-use engine::BitmapState;
-use engine::layer_ops::RectI;
-use engine::raster;
+use crate::engine_api::BitmapState;
+use crate::engine_api::layer_ops::RectI;
+use crate::engine_api::raster;
 
 use super::appearance::{AppearanceData, DrawInfo, Paint};
 use super::draw::{ImagePlacement, Mat, blit_parallelogram, render_path};
@@ -59,7 +59,7 @@ pub(super) fn replay_record(bitmap: &mut BitmapState, ops: &[RecordOp], ctm: Mat
                 blit_parallelogram(
                     bitmap,
                     ImagePlacement {
-                        source: engine::layer_ops::BlitSource {
+                        source: crate::engine_api::layer_ops::BlitSource {
                             bitmap: &source,
                             rect: *src_rect,
                         },

@@ -4,7 +4,7 @@
 //! (`Player::VariableAnimatorState`) and steps it with a frame delta,
 //! applying an ease weight in `[0, 1]`. Timelines reuse the same shape for
 //! their blend animators. This module provides the shared state machine and
-//! the easing helpers; it composes with [`engine::timer`] by taking an
+//! the easing helpers; it composes with the engine timer registry by taking an
 //! explicit elapsed-time delta rather than reading a clock.
 
 /// One queued keyframe.

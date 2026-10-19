@@ -7,8 +7,8 @@ Usage::
 ``<check>`` is one of ``stateless``, ``error-handling``, ``house-style``,
 ``layering``, ``host-facts``, ``android-target``, ``surface-lock``,
 ``native-parity``, ``plugin-parity``, ``callback-objthis``, ``native-arity``,
-or the ``extract-xp3`` helper. ``gate`` runs the full ordered sequence; its
-``cargo`` steps are for the main agent.
+``void-getter``, or the ``extract-xp3`` helper. ``gate`` runs the full ordered
+sequence; its ``cargo`` steps are for the main agent.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from .checks import (
     storage_boundary,
     storage_media,
     surface_lock,
+    void_getter,
 )
 from .common import REPO_ROOT
 
@@ -52,6 +53,7 @@ CHECKS: dict[str, Callable[[list[str]], int]] = {
     "storage-media": storage_media.main,
     "callback-objthis": callback_objthis.main,
     "native-arity": native_arity.main,
+    "void-getter": void_getter.main,
     "host-facts": host_facts.main,
     "android-target": android_target.main,
     "surface-lock": surface_lock.main,
@@ -73,6 +75,7 @@ GATE_SEQUENCE: list[tuple[str, str, str, list[str]]] = [
     ("storage-media", "check", "storage-media", []),
     ("callback-objthis", "check", "callback-objthis", []),
     ("native-arity", "check", "native-arity", []),
+    ("void-getter", "check", "void-getter", []),
     (
         "cargo clippy",
         "cargo",
@@ -132,6 +135,7 @@ Checks:
   storage-media    reference storage-media domains neither served nor documented
   callback-objthis  callback-invoking native members registered without objthis
   native-arity     reference zero-argument native methods rejected by a Rust guard
+  void-getter      native getters returning a raw void where the reference returns an object
   host-facts       host seams with no production installer
   android-target   per-target backend-feature resolution
   surface-lock     VM dispatch surface vs the committed baseline

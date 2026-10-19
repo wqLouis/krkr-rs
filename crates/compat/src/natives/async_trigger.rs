@@ -12,7 +12,7 @@
 //!
 //! The registry of scheduled fires is explicit L3 dispatch state in
 //! [`CompatServices::state`], modelled like the L2
-//! [`engine::timer::TimerState`](engine::timer::TimerState) registry: one
+//! `engine_api::TimerState` registry: one
 //! entry per live object holds the retained action closure, the action name,
 //! the `cached`/`mode` flags and the object itself (for `onFire` dispatch),
 //! plus a FIFO of scheduled fires. No process global is used.

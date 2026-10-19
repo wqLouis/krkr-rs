@@ -5,9 +5,9 @@
 //! `performLinebreak`, `flush`, `clear`, `resetFont`, `resetStyle`). The only
 //! deliberate substitution is the metric source: the reference asks the active
 //! `FontRasterizer` for `GetTextExtent`/`GetAscentHeight`, while this port asks
-//! the L2 [`engine::text::TextEngine`] (see [`super::metrics`]).
+//! the L2 `engine_api::TextEngine` (see [`super::metrics`]).
 
-use engine::text::TextStyle;
+use crate::engine_api::TextStyle;
 
 use super::TextRenderInst;
 use super::metrics::{self, TextRenderEngine};

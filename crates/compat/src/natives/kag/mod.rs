@@ -26,7 +26,7 @@
 //! (created/destroyed by [`kagparser_create`]/[`kagparser_destroy`]); the
 //! only process-wide state touched is the documented engine binding
 //! (`crate::binding`) used to resolve the VM and its attached
-//! [`engine::Storage`]. The `out.string` scratch buffer is kept in
+//! `engine_api::Storage`. The `out.string` scratch buffer is kept in
 //! [`CompatServices`] state, not a thread-local.
 #![allow(unsafe_code)]
 
@@ -41,7 +41,7 @@ pub(crate) use crate::natives::tjsnum;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr;
 
-use engine::Storage;
+use crate::engine_api::Storage;
 use tjs::{
     DetachedValue, Engine, NativeInstanceBuilder, NativeInstanceMethodDef,
     NativeInstancePropertyDef, RetainedValue, Tjs2Engine, Tjs2ValueId, TjsValue, VAL_INTEGER,
@@ -149,7 +149,7 @@ fn shorten_scenario_loaded_closure<'a>(
 
 /// The injectable environment [`KagParserState`] walks in: TJS expression
 /// evaluation through the bound VM, scenario loading through the attached
-/// [`engine::Storage`], and the optional owner event callbacks.
+/// `engine_api::Storage`, and the optional owner event callbacks.
 struct KagEnv {
     eval: EvalFn,
     load: LoadFn,

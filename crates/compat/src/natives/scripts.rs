@@ -1,6 +1,6 @@
 //! `Scripts` native class (L3): storage-backed script execution helpers.
 //!
-//! Reimplemented over [`engine::Storage`] and the `tjs` engine handle exposed
+//! Reimplemented over `engine_api::Storage` and the `tjs` engine handle exposed
 //! by [`CompatCtx::engine`]. The reference is the `tvp-scripts` crate;
 //! this port keeps only the parts the ABI supports and owns no state
 //! outside [`CompatServices::state`].
@@ -38,7 +38,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr;
 use std::time::Instant;
 
-use engine::Storage;
+use crate::engine_api::Storage;
 use tjs::{
     Engine, NativeClassBuilder, NativeMethodDef, NativePropertyDef, RetainedValue, Tjs2Engine,
     TjsValue, VAL_NULL, VAL_OBJECT, VAL_REAL, VAL_RETAINED, VAL_STRING, VAL_VOID, Value,

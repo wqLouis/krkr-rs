@@ -11,7 +11,7 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::raster::hatch_foreground;
+use crate::engine_api::raster::hatch_foreground;
 use tjs::{NativeInstanceBuilder, NativeInstanceMethodDef, Tjs2Engine, TjsValue, Value};
 
 use super::{argb_to_rgba, bound, value_as_f64};

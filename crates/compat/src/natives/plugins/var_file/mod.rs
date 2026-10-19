@@ -9,7 +9,7 @@
 //!
 //! # Missing seam
 //!
-//! The L2 storage namespace (`engine::Storage`) has no storage-media
+//! The L2 storage namespace (`engine_api::Storage`) has no storage-media
 //! registration seam. A `Storage` is built from an immutable L1 `FileSystem`
 //! plus explicitly mounted XP3 archives, and its media are fixed to the
 //! disk/archive backends; there is no `TVPRegisterStorageMedia` equivalent
@@ -33,7 +33,7 @@ use crate::{CompatCtx, CompatError};
 /// No `var://` media registration seam exists in L2.
 ///
 /// The reference only registers a storage media (`PreRegistCallback` →
-/// `TVPRegisterStorageMedia(var)`); `engine::Storage` exposes no media hook,
+/// `TVPRegisterStorageMedia(var)`); `engine_api::Storage` exposes no media hook,
 /// so there is nothing to register. See the module documentation for the
 /// precise missing seam.
 pub fn register(_ctx: &mut CompatCtx) -> Result<(), CompatError> {

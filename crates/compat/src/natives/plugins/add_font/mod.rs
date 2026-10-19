@@ -16,7 +16,7 @@
 //! The reference stores the faces in the process-wide `TVPFontNames` map the
 //! renderer consults when a `Font.face` is set. Compat has no process global
 //! so the map is the per-engine [`registry::FontRegistry`] dispatch
-//! state. It keeps the L2 [`engine::text::TextEngine`] each file was parsed
+//! state. It keeps the L2 `engine_api::TextEngine` each file was parsed
 //! with, so any in-crate text consumer can resolve a face with
 //! [`registry::FontRegistry::lookup`] and load the returned bytes/collection
 //! index into its own engine.

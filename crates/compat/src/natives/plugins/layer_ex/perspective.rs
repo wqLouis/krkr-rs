@@ -6,7 +6,7 @@
 //! implements the same operation with the L2 CPU raster primitives: an
 //! inverse homography maps every destination pixel back into the source
 //! rectangle, the source is bilinearly sampled, and the result is composited
-//! with [`engine::raster::blend_pixel`] (the reference
+//! with `engine_api::raster::blend_pixel` (the reference
 //! `PerspectiveAlphaBlend_a`, opacity 255).
 //!
 //! Argument order (reference `PerspectiveCopy_GL`):
@@ -23,7 +23,7 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::{BitmapState, layer_ops};
+use crate::engine_api::{BitmapState, layer_ops};
 use tjs::{NativeObjThisMethodDef, Tjs2Engine, VAL_OBJECT, Value};
 
 use super::{bound, layer_from_objthis, scene_mut};
@@ -196,7 +196,7 @@ fn perspective_blit(
                 continue;
             }
             let color = sample_bilinear(src, u as f32 - 0.5, v as f32 - 0.5);
-            engine::raster::blend_pixel(dst, x, y, color, 255, 255);
+            crate::engine_api::raster::blend_pixel(dst, x, y, color, 255, 255);
         }
     }
     dst.mark_dirty();

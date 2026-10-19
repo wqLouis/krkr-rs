@@ -1,13 +1,13 @@
 //! The script-name → VFS-name boundary for storage-backed natives.
 //!
-//! L3 owns the TVP storage-name grammar; the L2 [`engine::Storage`] namespace
+//! L3 owns the TVP storage-name grammar; the L2 `engine_api::Storage` namespace
 //! takes a bare name within a mount. A script name may carry the local `file`
 //! media prefix (`file://.`, `file://` or `file:`) which the namespace does not
 //! understand, so every native that hands a script-supplied name to L2 routes
 //! it through [`strip_file_media`] first.
 
 /// Strips the local `file` media prefix from a storage name, returning the
-/// bare VFS name the L2 [`engine::Storage`] namespace accepts.
+/// bare VFS name the L2 `engine_api::Storage` namespace accepts.
 ///
 /// The prefixes are tried longest first so `file://.` wins over `file://` and
 /// `file:`. A name without a prefix is returned unchanged.

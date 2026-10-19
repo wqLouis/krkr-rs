@@ -5,9 +5,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 
-use engine::Scene;
-use engine::input::InputState;
-use engine::timer::TimerId;
+use crate::engine_api::InputState;
+use crate::engine_api::Scene;
+use crate::engine_api::TimerId;
 use tjs::{
     DetachedValue, RetainedValue, Tjs2Engine, Tjs2ValueId, VAL_INTEGER, VAL_OBJECT, VAL_REAL,
     VAL_RETAINED, Value,

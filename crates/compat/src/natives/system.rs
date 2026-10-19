@@ -3,7 +3,7 @@
 //! Behavioral reference: `crates/tvp-natives/src/system.rs` (itself a
 //! port of `reference/cpp/core/base/impl/SystemImpl.cpp`). This is a
 //! reimplementation on the layered API: the class composes the L2
-//! [`engine::Storage`] and [`engine::Scene`] services, the `tjs` VM and the
+//! `engine_api::Storage` and `engine_api::Scene` services, the `tjs` VM and the
 //! per-engine dispatch state kept in [`CompatServices::state`] — it owns no
 //! process global.
 //!
@@ -26,14 +26,14 @@
 //!
 //! # Composition
 //!
-//! `getKeyState` reads the attached L2 [`engine::input::InputState`]
+//! `getKeyState` reads the attached L2 `engine_api::InputState`
 //! (TVP virtual-key codes and pad/`VK_PADANY` semantics are the same as the
 //! `Key` class); `touchDevice` derives its touch-capability bits from the
 //! active contacts in the same L2 state; `clearGraphicCache` clears the
-//! attached L2 [`engine::Scene`]'s decoded-image cache and releases every
+//! attached L2 `engine_api::Scene`'s decoded-image cache and releases every
 //! bitmap it no longer references
-//! ([`engine::Scene::clear_decoded_image_cache`],
-//! [`engine::Scene::collect_unused_bitmaps`]) — the L2 counterpart of the
+//! (`engine_api::Scene::clear_decoded_image_cache`,
+//! `engine_api::Scene::collect_unused_bitmaps`) — the L2 counterpart of the
 //! reference's graphic cache.
 //!
 //! # Host-facts seam
@@ -1297,7 +1297,7 @@ fn clear_graphic_cache(services: &CompatServices) -> usize {
 
 /// `System.getKeyState(code [, getcurrent])` → int
 ///
-/// Reads the attached L2 [`engine::input::InputState`] through the same
+/// Reads the attached L2 `engine_api::InputState` through the same
 /// virtual-key mapping the `Key` class uses (mouse-button VKs and the
 /// `VK_PADANY` pseudo-code included). With `getcurrent` true (the default) it
 /// reports whether the key is currently held; with false it reports whether
@@ -1418,7 +1418,7 @@ extern "C" fn native_system(
 
 /// `System.clearGraphicCache()` → void
 ///
-/// Clears the attached L2 [`engine::Scene`]'s decoded-image cache and releases
+/// Clears the attached L2 `engine_api::Scene`'s decoded-image cache and releases
 /// every bitmap it no longer references — the L2 counterpart of the
 /// reference's `TVPClearGraphicCache`. With no scene attached there is no
 /// cache, so the call is a no-op.

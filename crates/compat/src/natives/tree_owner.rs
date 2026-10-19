@@ -10,8 +10,8 @@
 //! # The layered model
 //!
 //! There is no separate layer manager in the L2 scene: the state lives in
-//! [`engine::Scene`] and the generic input lives in
-//! [`engine::input::InputState`]. This adapter therefore:
+//! `engine_api::Scene` and the generic input lives in
+//! `engine_api::InputState`. This adapter therefore:
 //!
 //! * reads the tree bounds from the LTO's primary layer (falling back to the
 //!   scene window size) and the focused layer object from its own retained

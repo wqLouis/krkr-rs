@@ -5,9 +5,9 @@ use std::cell::{Cell, RefCell};
 use std::ffi::c_char;
 use std::marker::PhantomData;
 
-use engine::input::InputState;
-use engine::timer::TimerState;
-use engine::{Scene, Storage};
+use crate::engine_api::InputState;
+use crate::engine_api::TimerState;
+use crate::engine_api::{Scene, Storage};
 use tjs::{
     NativeClassBuilder, NativeInstanceBuilder, NativeInstanceMembers, NativeStaticMembers,
     RetainedValue, Tjs2Engine, Tjs2ValueId,

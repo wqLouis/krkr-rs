@@ -10,11 +10,11 @@
 //!
 //! The reference asks the process-wide [`FontRasterizer`] for per-character
 //! extents and the ascent. Compat has one rasterizer and no font enumeration,
-//! so the metrics come from the L2 [`engine::text::TextEngine`] (cosmic-text
-//! shaping) and a face is loaded from the attached [`engine::Storage`] on
+//! so the metrics come from the L2 `engine_api::TextEngine` (cosmic-text
+//! shaping) and a face is loaded from the attached `engine_api::Storage` on
 //! first use — the same seam the visual `Font` native uses. The reference's
 //! `"user"` face resolves to the newest font registered in the attached engine
-//! [`engine::Scene`], which is the compat equivalent of the rasterizer's
+//! `engine_api::Scene`, which is the compat equivalent of the rasterizer's
 //! currently applied face.
 //!
 //! Every piece of layout state lives in the per-instance payload; the shared
@@ -1186,8 +1186,8 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
 #[cfg(test)]
 mod tests {
     use super::register;
+    use crate::engine_api::Scene;
     use crate::{CompatCtx, CompatHost, CompatServices};
-    use engine::Scene;
     use tjs::{Tjs2Engine, TjsValue};
 
     /// Registration smoke test that installs the engine → context binding

@@ -139,6 +139,7 @@ it so the app path is never re-joined. | Mirrors `TVPCheckStartupArg`/`TVPCheckA
 | [`10-android-backends.md`](10-android-backends.md) | AAudio + NDK MediaCodec design and official references; the `ndk`-crate strategy; `AHardwareBuffer` interop for device-pixel readback (the dmabuf path). |
 | [`11-presentation-and-pixel-translation.md`](11-presentation-and-pixel-translation.md) | Presentation is Fit-with-letterbox only; the scaling-feature removal (constraints); the L2 pixel-translation layer (VM↔device API and boundaries); device-resolution readback. Supersedes `04 §6.1`. |
 | [`12-layer-tree-and-frame.md`](12-layer-tree-and-frame.md) | The layer tree → frame contract: the L2 logical tree, the projection seam, the L1 draw tree, traversal/draw on both backends, frame orchestration (today vs D26), and where the D39/D40 translation fits. Code map + boundaries. |
+| [`14-l3-l2-protocol.md`](14-l3-l2-protocol.md) | The L3 ↔ L2 protocol: the one seam module compat names the engine through, the exact engine surface by module, state ownership, VM coordinates, error types, attached-handle lifetimes, and what stays outside. |
 
 ## 5. Scope of this branch
 

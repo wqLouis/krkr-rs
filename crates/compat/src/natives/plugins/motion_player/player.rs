@@ -7,9 +7,9 @@
 //! The port keeps the whole script-visible surface and the playback model
 //! (timeline state, variable animators, coordinate/scale/rotate/colour
 //! transitions, wind / outer force, hit testing, layer queries). Node-tree
-//! evaluation and drawing compose the L2 [`engine::Scene`] layer system:
+//! evaluation and drawing compose the L2 `engine_api::Scene` layer system:
 //! [`PlayerInst::draw`] writes the root transform onto the target layer and
-//! rasterises the visible shape nodes with [`engine::raster`] rather than
+//! rasterises the visible shape nodes with `engine_api::raster` rather than
 //! re-implementing the D3D renderer.
 #![allow(unsafe_code)]
 
@@ -1022,7 +1022,8 @@ impl PlayerInst {
             return Ok(());
         }
         let rendered = scene.with_main_image_pixels_mut(layer_id, |pixels| {
-            let mut bitmap = engine::BitmapState::new(width as u32, height as u32, pixels.to_vec());
+            let mut bitmap =
+                crate::engine_api::BitmapState::new(width as u32, height as u32, pixels.to_vec());
             for node in &nodes {
                 let (cx, cy) = (node.accumulated.x, node.accumulated.y);
                 let (sx, sy) = (
@@ -1055,7 +1056,7 @@ impl PlayerInst {
                 };
                 let alpha = (f64::from(color[3]) * node.accumulated.opacity.clamp(0.0, 1.0)) as u8;
                 let node_color = [color[0], color[1], color[2], alpha];
-                engine::raster::fill_polygon(&mut bitmap, &points, node_color);
+                crate::engine_api::raster::fill_polygon(&mut bitmap, &points, node_color);
             }
             bitmap.rgba
         });
@@ -1268,11 +1269,28 @@ extern "C" fn player_ctor(
     };
     // SAFETY: the trampoline guarantees `argc` valid entries.
     let arguments = unsafe { args(argv, argc) };
-    if let Some(value) = arguments.first()
-        && value.ty == VAL_OBJECT
-    {
-        inst.resource_manager = StoredValue::from_value(value, &res.ctx());
+    let ctx = res.ctx();
+    let passed = arguments.first().filter(|value| value.ty == VAL_OBJECT);
+    let mut manager = None;
+    if let Some(value) = passed {
+        // SAFETY: the argument is a live object for the duration of the call.
+        match unsafe { ctx.engine() }.retain_object_arg(value) {
+            Ok(retained) => manager = Some(StoredValue::Object(retained)),
+            Err(error) => return report_error(out_error, &format!("Player: {error}")),
+        }
     }
+    inst.resource_manager = match manager {
+        Some(manager) => manager,
+        None => match eval_object(&ctx, "new Motion.ResourceManager(null, 1024)") {
+            Ok(manager) => StoredValue::Object(manager),
+            Err(error) => {
+                return report_error(
+                    out_error,
+                    &format!("Player: cannot create the default resource manager: {error}"),
+                );
+            }
+        },
+    };
     set_void(out);
     0
 }

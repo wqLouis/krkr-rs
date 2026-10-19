@@ -3,8 +3,8 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
+use crate::engine_api::{DecodedImageKey, DecodedImageMode, Scene, Storage, StorageReadError};
 use api::media::{DecodedImage, ImageInfo};
-use engine::{DecodedImageKey, DecodedImageMode, Scene, Storage, StorageReadError};
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
     NativeMethodDef, NativeStaticMembers, RetainedValue, Tjs2Engine, TjsValue, VAL_VOID, Value,

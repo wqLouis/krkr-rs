@@ -12,8 +12,8 @@
 use api::host::TouchPhase;
 use std::collections::HashMap;
 
-use engine::Scene;
-use engine::input::InputState;
+use crate::engine_api::InputState;
+use crate::engine_api::Scene;
 use platform::{InputEvent, MouseButton, PlatformEvent};
 use tjs::TjsValue;
 

@@ -11,13 +11,13 @@
 //! list of figures where the *open* last figure is the current one: an
 //! open-ended primitive extends it, a closed one replaces it. Every figure
 //! is flattened to a polyline as it is added, using the L2
-//! [`engine::raster`] flattening primitives, so `Layer.drawPath` can fill
+//! `engine_api::raster` flattening primitives, so `Layer.drawPath` can fill
 //! and stroke it with the existing CPU rasterizer.
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::raster::{flatten_arc, flatten_cubic};
+use crate::engine_api::raster::{flatten_arc, flatten_cubic};
 use tjs::{NativeInstanceBuilder, NativeInstanceMethodDef, Value};
 
 use crate::native_util::{args, report_error, set_void};

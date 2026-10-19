@@ -8,17 +8,17 @@
 //! state in [`CompatServices::state`](crate::CompatServices::state) keyed by
 //! the layer id (the reference keeps it in the attached instance).
 //!
-//! All pixel work goes through the L2 [`engine::layer_ops`] blits and the L1
-//! [`engine::raster`] compositor; there is no second GPU path.
+//! All pixel work goes through the L2 `engine_api::layer_ops` blits and the L1
+//! `engine_api::raster` compositor; there is no second GPU path.
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
+use crate::engine_api::BitmapState;
+use crate::engine_api::layer_ops::{self, RectI};
+use crate::engine_api::raster::{self, blend_pixel};
 use api::fs::FsPath;
-use engine::BitmapState;
-use engine::layer_ops::{self, RectI};
-use engine::raster::{self, blend_pixel};
 use tjs::{NativeObjThisMethodDef, NativeObjThisPropertyDef, TjsValue, Value};
 
 use super::appearance::{AppearanceData, AppearanceInst, Paint, paint_color_at};
@@ -259,7 +259,7 @@ fn transform_points(points: &[(f64, f64)], ctm: Mat) -> Vec<(f64, f64)> {
 // CPU paint rasterization (clipped)
 // ---------------------------------------------------------------------------
 
-/// 4×4 supersample grid per axis (matches [`engine::raster`]).
+/// 4×4 supersample grid per axis (matches `engine_api::raster`).
 const AA: i32 = 4;
 
 /// Dilate an 8-bit coverage mask by `radius` pixels (a cheap outline for

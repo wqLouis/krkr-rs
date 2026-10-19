@@ -1,0 +1,72 @@
+//! The L3-facing engine surface: every L2 item the compatibility layer names.
+//!
+//! This module is the single seam between `compat` and the `engine` crate.
+//! Source files under `crates/compat/src` name the engine through
+//! `crate::engine_api` and never through `engine` directly, so the re-exports
+//! below are the engine contract the compatibility layer codes against.
+//!
+//! The seam is grouped by engine module. Every item is L2 state or an L2
+//! action on it: L2 owns the layer tree, storage namespace, input/timer
+//! registries, text engine, mixer, video overlays and transitions. Coordinates
+//! are VM pixels — the engine applies the device mapping internally and L3
+//! never names a device pixel. Fallible operations report their own typed
+//! error (`StorageReadError`, `TextError`, `SoundError`, …).
+//!
+//! [`CompatServices`](crate::CompatServices) attaches raw pointers to the
+//! stateful handles ([`Scene`], [`Storage`], [`InputState`], [`TimerState`]);
+//! each pointer must stay valid for as long as the binding is installed.
+
+// The logical scene: layers, bitmaps, fonts, windows, and decoded-image keys.
+pub(crate) use engine::{
+    BitmapState, DecodedImageKey, DecodedImageMode, FontState, LayerState, Rect, Scene,
+};
+
+// The storage namespace: mounts, archive names, locations and typed read errors.
+pub(crate) use engine::{Location, Storage, StorageReadError, normalize_in_archive_name};
+
+// The generic input state the platform events are accumulated into.
+pub(crate) use engine::input::InputState;
+
+// The timer registry, its ids and the stored callback shape.
+pub(crate) use engine::timer::{TimerCallback, TimerId, TimerState};
+
+// Text shaping, coverage rasterization, the glyph cache and font identity.
+pub(crate) use engine::text::{
+    CoverageMask, FontId, TextCoverageCache, TextEngine, TextError, TextStyle, blit_coverage_into,
+    blur_coverage, blurred_text_coverage, compose_text_into, rasterize_text_coverage,
+};
+
+// The sound mixer, its stream/buffer/channel state and typed errors.
+pub(crate) use engine::sound::{
+    AudioStream, LOOP_FLAG_COUNT, LoopCondition, LoopInfo, LoopLink, Mixer, SoundBuffer,
+    SoundChannel, SoundError, SoundEvent, SoundLabel, SoundSource, Status,
+};
+
+// Video-overlay playback state, events, bounds and layer blits.
+pub(crate) use engine::video::{
+    PlayStatus, VideoBounds, VideoEvent, VideoOverlay, blit_frame_to_layer,
+    blit_frame_to_layer_opacity,
+};
+
+// The transition state machine and its rule/scroll vocabulary.
+pub(crate) use engine::trans::{RuleMask, ScrollFrom, ScrollStay, Trans, TransKind};
+
+/// Rasterization primitives compat composes directly.
+pub(crate) mod raster {
+    pub(crate) use engine::raster::{
+        blend_pixel, fill_polygon, fill_rect_replace, flatten_arc, flatten_cubic, hatch_foreground,
+    };
+}
+
+/// Layer composition and pixel-region operations compat composes directly.
+pub(crate) mod layer_ops {
+    pub(crate) use engine::layer_ops::{
+        AffineBlit, BlitOptions, BlitSource, COPY_MAIN, COPY_MASK, GammaAdjust, RectI,
+        adjust_gamma, affine_blit, blit_copy, blit_over, blit_plane, blur_bitmap_in_place,
+        clip_rect, convert_add_alpha_to_alpha, convert_alpha_to_add_alpha, copy_9patch,
+        do_gray_scale, ensure_transition_display, fill_color_hold_alpha, fill_color_on_add_alpha,
+        fill_color_on_alpha, fill_mask, flip_lr, flip_ud, gaussian_blur, intersect, intersect_rect,
+        light_contrast, operate_rect, remove_const_opacity, render_layer_subtree,
+        stretch_blit_mode, stretch_blit_plane,
+    };
+}

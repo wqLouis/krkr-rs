@@ -9,19 +9,19 @@
 //! class surface matches the reference one-for-one.
 //!
 //! Each method is a thin adapter over the L2 image primitives in
-//! [`engine::layer_ops`] and [`engine::raster`]. The two regions the L2
+//! `engine_api::layer_ops` and `engine_api::raster`. The two regions the L2
 //! surface does not expose directly are composed here from existing
 //! primitives:
 //!
-//! * an axis-aligned *region* flip, built on [`engine::layer_ops::flip_lr`] /
-//!   [`engine::layer_ops::flip_ud`] for the full-bitmap case and a small
+//! * an axis-aligned *region* flip, built on `engine_api::layer_ops::flip_lr` /
+//!   `engine_api::layer_ops::flip_ud` for the full-bitmap case and a small
 //!   in-place swap otherwise;
 //! * a *region* box blur, built by extracting the region into a scratch
-//!   [`engine::BitmapState`], running [`engine::layer_ops::blur_bitmap_in_place`]
+//!   `engine_api::BitmapState`, running `engine_api::layer_ops::blur_bitmap_in_place`
 //!   on it and blitting it back.
 //!
 //! The class owns no engine state and keeps nothing in globals: every
-//! persistent byte lives in the L2 [`engine::Scene`] the host attached, and
+//! persistent byte lives in the L2 `engine_api::Scene` the host attached, and
 //! the text faces and host image codec come from the shared
 //! [`crate::resource::ResourceResolver`].
 //!
@@ -43,8 +43,8 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::layer_ops::{self, GammaAdjust, RectI};
-use engine::{BitmapState, Scene, raster};
+use crate::engine_api::layer_ops::{self, GammaAdjust, RectI};
+use crate::engine_api::{BitmapState, Scene, raster};
 use tjs::{
     NativeInstanceBuilder, NativeInstanceMethodDef, NativeMethodDef, NativeStaticMembers,
     RetainedValue, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_NULL, VAL_OBJECT, VAL_REAL, VAL_STRING,
@@ -373,7 +373,7 @@ fn normalize_color_face(face: i64) -> i64 {
 }
 
 /// Map the reference `tTVPBlendOperationMode` + `tTVPDrawFace` to the
-/// operation mode [`engine::layer_ops`] takes, plus whether the destination
+/// operation mode `engine_api::layer_ops` takes, plus whether the destination
 /// alpha plane must be held.
 ///
 /// The reference maps through `GetBltMethodFromOperationMode`; for `omOpaque`

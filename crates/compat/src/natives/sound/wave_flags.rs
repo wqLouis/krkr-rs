@@ -26,7 +26,7 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::sound::LOOP_FLAG_COUNT;
+use crate::engine_api::LOOP_FLAG_COUNT;
 use tjs::{NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Value};
 
 use crate::native_util::{report_error, set_int, set_void};

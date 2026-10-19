@@ -4,7 +4,7 @@
 //! and the reference `Pad` class (`reference/cpp/core/utils/PadIntf.cpp`).
 //!
 //! The input state is the generic L2 state
-//! ([`engine::input::InputState`]) that the host attaches through
+//! (`engine_api::InputState`) that the host attaches through
 //! [`CompatServices::attach_input`](crate::CompatServices::attach_input) —
 //! the TVP-specific parts (the VK code table, the click-sequence constants
 //! and the `TVP_SS_*` flags) stay here.
@@ -20,9 +20,9 @@
 //! end_input_frame                         // commits held counters, frame += 1
 //! ```
 //!
-//! [`engine::input::InputState::begin_frame`] clears the per-frame release
+//! `engine_api::InputState::begin_frame` clears the per-frame release
 //! flags, the wheel accumulation, the released keys and `last_pressed`;
-//! [`engine::input::InputState::end_frame`] bumps the held-frame counters and
+//! `engine_api::InputState::end_frame` bumps the held-frame counters and
 //! advances the frame index. Both are driven by the host's per-frame body.
 //!
 //! # Host wiring
@@ -55,7 +55,7 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::input::InputState;
+use crate::engine_api::InputState;
 use platform::{MouseButton, PhysicalKey, PlatformEvent};
 use tjs::{
     NativeClassBuilder, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,

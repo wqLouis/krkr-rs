@@ -15,7 +15,7 @@
 //! # Layers
 //!
 //! All storage namespace policy (normalization, `arc.xp3>path`, case folding,
-//! auto paths) lives in the L2 [`engine::Storage`] attached to
+//! auto paths) lives in the L2 `engine_api::Storage` attached to
 //! [`CompatServices`]; this plugin never reimplements it. Names that resolve
 //! to a disk file use the real on-disk path; names that resolve inside an
 //! archive are reported by `fstat` with their uncompressed size only, exactly
@@ -58,9 +58,9 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::engine_api::{Location, Storage, normalize_in_archive_name};
 use api::error::FsError;
 use api::fs::{FsPath, OpenMode};
-use engine::{Location, Storage, normalize_in_archive_name};
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeMethodDef,
     NativePropertyDef, NativeStaticMembers, RetainedValue, Tjs2Engine, Tjs2ValueId, TjsValue,
@@ -2070,8 +2070,8 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
 #[cfg(test)]
 mod tests {
     use super::register;
+    use crate::engine_api::Storage;
     use crate::{CompatCtx, CompatHost, CompatServices};
-    use engine::Storage;
     use fs::FileSystem;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};

@@ -16,9 +16,9 @@
 //! `layerExBase` is an internal native-instance base and is not a TJS class
 //! (`reference/cpp/plugins/layerExPerspective.cpp:255-296`); `LayerExMovie`
 //! and `LayerExPerspective` are likewise not classes, only `Layer` member
-//! sets. The port composes the L2 [`engine::layer_ops`] /
-//! [`engine::raster`] primitives for the pixel work and the L2
-//! [`engine::Scene`] / [`engine::LayerState`] for layer state; the extension
+//! sets. The port composes the L2 `engine_api::layer_ops` /
+//! `engine_api::raster` primitives for the pixel work and the L2
+//! `engine_api::Scene` / `engine_api::LayerState` for layer state; the extension
 //! owns only the dispatch state that has no home in L2 (the movie playback
 //! slots and the per-layer draw transform/record state), kept in
 //! [`CompatServices::state`](crate::CompatServices::state) rather than in a
@@ -39,7 +39,7 @@ mod record;
 
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::Scene;
+use crate::engine_api::Scene;
 use tjs::{
     DetachedValue, NativeInstanceMembers, RetainedValue, Tjs2Engine, Tjs2ValueId, TjsValue,
     VAL_INTEGER, VAL_OBJECT, VAL_REAL, VAL_STRING, Value,
@@ -126,8 +126,8 @@ pub(super) fn mark_layer_paint(scene: &mut Scene, id: u32) {
 
 /// A layer's clip rectangle in the half-open pixel convention the L2
 /// operations use (`None` means the whole image).
-pub(super) fn layer_clip(scene: &Scene, id: u32) -> engine::layer_ops::RectI {
-    engine::layer_ops::clip_rect(scene.layer(id).and_then(|l| l.clip))
+pub(super) fn layer_clip(scene: &Scene, id: u32) -> crate::engine_api::layer_ops::RectI {
+    crate::engine_api::layer_ops::clip_rect(scene.layer(id).and_then(|l| l.clip))
 }
 
 /// Ensure `layer_id` owns a MainImage of at least `w` x `h`, preserving

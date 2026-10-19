@@ -1,0 +1,17 @@
+# Reviewed exceptions for the void-getter check.
+#
+# One `path:field — reason` line per exception, anchored on the field so line
+# churn does not break the entry. Use this file only when the reference
+# property genuinely reads back void; a property that always returns an
+# object/array in the reference is a bug, not an exception.
+#
+# A reason that starts with `debt:` records a known defect that is still owed.
+# A debt entry labels the finding; it does not silence it.
+
+crates/compat/src/natives/plugins/motion_player/player_members.rs:metadata — the reference `getMetadata` returns the unset `_metadata` variant, so the property reads back void until the script assigns it (`reference/cpp/plugins/motionplayer/Player.h:99-100`, `main.cpp:139`).
+crates/compat/src/natives/plugins/motion_player/player_members.rs:camera_target — the reference `getCameraTarget` returns the unset `_cameraTarget` variant (`reference/cpp/plugins/motionplayer/Player.h:201-202`).
+crates/compat/src/natives/plugins/motion_player/player_members.rs:camera_position — the reference `getCameraPosition` returns the unset `_cameraPosition` variant (`reference/cpp/plugins/motionplayer/Player.h:204-205`).
+crates/compat/src/natives/plugins/motion_player/player_members.rs:tags — the reference `getTags` returns the unset `_tags` variant (`reference/cpp/plugins/motionplayer/Player.h:237-238`).
+crates/compat/src/natives/plugins/motion_player/player_members.rs:project — the reference `getProject` returns the unset `_project` variant (`reference/cpp/plugins/motionplayer/Player.h:240-241`).
+crates/compat/src/natives/plugins/motion_player/player_members.rs:module — the reference `getModule` returns `_module`, unset until `load` assigns it (`reference/cpp/plugins/motionplayer/EmotePlayer.cpp:154`, `main.cpp:303`); `clone` copies the same value (`EmotePlayer.cpp:89-95`).
+crates/compat/src/natives/plugins/motion_player/player_members.rs:resource_manager — the constructor always installs a manager object (the passed manager or a default one), so the reference `getResourceManager` never reads back void (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:175-185`, `Player.h:228-229`).

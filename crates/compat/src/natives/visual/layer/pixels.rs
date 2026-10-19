@@ -1,6 +1,6 @@
 //! `Layer` image / pixel operations (group 1).
 //!
-//! Every method composes the L2 [`engine::layer_ops`] / [`engine::raster`]
+//! Every method composes the L2 `engine_api::layer_ops` / `engine_api::raster`
 //! primitives directly (the same ones `natives/image_function.rs` uses) — it
 //! never calls into `ImageFunction`. The destination is always the layer's
 //! own `MainImage`; the source is resolved from a script `Layer`/`Bitmap`
@@ -14,9 +14,9 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
+use crate::engine_api::layer_ops::{self, GammaAdjust, RectI};
+use crate::engine_api::{BitmapState, DecodedImageMode, Scene};
 use api::blend::{BlendMode, DstBlend};
-use engine::layer_ops::{self, GammaAdjust, RectI};
-use engine::{BitmapState, DecodedImageMode, Scene};
 use tjs::{NativeInstanceMethodDef, Tjs2Engine, Value};
 
 use super::super::bitmap::{COLOR_KEY_NONE, load_cached_storage_image, replace_bitmap_pixels};
@@ -998,8 +998,8 @@ fn clear_province_region(scene: &mut Scene, id: u32, args: (i32, i32, i32, i32, 
     let (dx, dy, _sx, _sy, sw, sh) = args;
     let clip = scene
         .layer(id)
-        .map_or(engine::layer_ops::clip_rect(None), |l| {
-            engine::layer_ops::clip_rect(l.clip)
+        .map_or(crate::engine_api::layer_ops::clip_rect(None), |l| {
+            crate::engine_api::layer_ops::clip_rect(l.clip)
         });
     let Some((dx, dy, src_rect)) = clip_dest_src(dx, dy, (0, 0, sw, sh), clip) else {
         return;

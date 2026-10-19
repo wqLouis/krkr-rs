@@ -775,6 +775,20 @@ fn player_variable_keys_is_an_empty_array_before_a_motion_is_bound() {
 }
 
 #[test]
+fn player_without_an_argument_installs_a_default_resource_manager() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // The constructor installs the TJS manager object it returns, whether the
+    // caller passes one or not, so a fresh player never exposes void
+    // (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:175-185`,
+    // `Player.h:228-229`).
+    env.run("var p = new Motion.Player(null);");
+    assert_eq!(env.eval_str("typeof p.resourceManager"), "Object");
+    // The same object is returned on every read.
+    assert!(env.eval_bool("p.resourceManager === p.resourceManager"));
+}
+
+#[test]
 fn player_project_binding_syncs_variable_keys_from_the_motion_labels() {
     let _lock = vm_lock();
     let env = Env::with_reference_storage();

@@ -5,7 +5,7 @@
 //! `uint16_t` or `uint32_t`/float) and merges by colour mode into a packed
 //! BGRA buffer. This port decodes into byte buffers with the same big-endian
 //! layout and merges into straight-alpha **RGBA**, which is what the L2
-//! [`engine::Scene`] bitmaps store.
+//! `engine_api::Scene` bitmaps store.
 
 use std::io::Read;
 

@@ -4,18 +4,18 @@
 //! `SetAttentionPoint` / `SetCursorPos` / `ReleaseCapture` /
 //! `ReleaseTouchCapture` in `reference/cpp/core/visual/LayerIntf.cpp`.
 //!
-//! Focus is per **domain** (`engine::LayerState::domain`): the reference
+//! Focus is per **domain** (`engine_api::LayerState::domain`): the reference
 //! keeps one `tTVPLayerManager` per parentless-root tree and every focus
 //! operation stays inside one manager
 //! (`reference/cpp/core/visual/LayerIntf.cpp:449-473`, `LayerManager.h:483-490`).
-//! The focus search runs over the L2 [`engine::Scene`] domain chain
+//! The focus search runs over the L2 `engine_api::Scene` domain chain
 //! ([`Scene::next_focusable`] / [`Scene::prev_focusable`]). Every focus
 //! transition goes through [`focus_layer`] / [`clear_layer_focus`], the port
 //! of `tTVPLayerManager::SetFocusTo`'s guard, state move and synchronous
 //! `onBlur`-then-`onFocus` pair; [`blur_tree`] is the port of
 //! `tTVPLayerManager::BlurTree` for the setters and teardown that make the
 //! focused subtree unusable. `setCursorPos` records a pointer warp on the
-//! attached L2 [`engine::input::InputState`]. The two capture-release
+//! attached L2 `engine_api::InputState`. The two capture-release
 //! methods have no L2 capture model yet, so they queue a request in
 //! [`LayerExtras`](super::LayerExtras) for the frame body to drain —
 //! explicit state, never a silent no-op.
@@ -23,7 +23,7 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::Scene;
+use crate::engine_api::Scene;
 use tjs::{NativeInstanceMethodDef, Tjs2Engine, TjsValue, Value};
 
 use super::super::common::{ObjectKind, duplicate_object, scene_mut, scene_ref, set_object_out};
@@ -302,7 +302,7 @@ fn deliver(ctx: &CompatCtx, host: &Tjs2Engine, layer: u32, name: &str, args: &[T
 /// (`reference/cpp/core/visual/LayerManager.cpp:690-711`): when the
 /// focused layer is `root` or below it in the parent chain, move focus to
 /// the next focusable layer of the chain after `root` (direction forward)
-/// or clear it. A [`engine::LayerState::shutdown`] `root` (reference
+/// or clear it. A `engine_api::LayerState::shutdown` `root` (reference
 /// `tTJSNI_BaseLayer::Shutdown`) always takes the clear: the reference's
 /// `GetNextFocusable` search walks `GetNeighborBelow`, which yields
 /// nothing once the layer's manager is gone

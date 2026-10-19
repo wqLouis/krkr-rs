@@ -33,6 +33,8 @@
 
 mod binding;
 mod ctx;
+// The single seam through which compat names the engine crate.
+mod engine_api;
 mod event;
 mod frame;
 mod host;

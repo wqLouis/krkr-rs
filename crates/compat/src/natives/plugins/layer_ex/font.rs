@@ -3,7 +3,7 @@
 //!
 //! Reference: `reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp`
 //! (`class FontInfo`, `drawString`, `measureString`) and the blend2d build.
-//! The port resolves the family through the L2 [`engine::text::TextEngine`]
+//! The port resolves the family through the L2 `engine_api::TextEngine`
 //! (the same shaping service the visual `Font` native uses) and rasterizes
 //! glyphs with the L1 glyph rasterizer exposed by the text engine. A face
 //! that cannot be loaded is a typed error, never a fabricated metric.
@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::text::{FontId, TextEngine, TextStyle};
-use engine::{BitmapState, StorageReadError};
+use crate::engine_api::{BitmapState, StorageReadError};
+use crate::engine_api::{FontId, TextEngine, TextStyle};
 use tjs::{
     NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, NativeMethodDef,
     Tjs2Engine, TjsValue, Value,

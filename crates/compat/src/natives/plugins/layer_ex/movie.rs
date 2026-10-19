@@ -5,8 +5,8 @@
 //! `NCB_ATTACH_CLASS_WITH_HOOK`; it opens a movie, drives it from the
 //! continuous-event hook and copies the decoded front buffer into the layer.
 //!
-//! The port uses the L2 [`engine::video::VideoOverlay`] playback machine for
-//! the clock/loop/event state and the L2 [`engine::layer_ops`] primitives for
+//! The port uses the L2 `engine_api::VideoOverlay` playback machine for
+//! the clock/loop/event state and the L2 `engine_api::layer_ops` primitives for
 //! the per-frame copy. L3 does not link a decoder (the same rule as the
 //! `VideoOverlay` native): decoded frames come from a host-installed
 //! [`VideoSource`], set with [`set_movie_source`]. The host drives
@@ -23,8 +23,8 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
+use crate::engine_api::{VideoEvent, VideoOverlay, blit_frame_to_layer};
 use api::blend::BlendMode;
-use engine::video::{VideoEvent, VideoOverlay, blit_frame_to_layer};
 use tjs::{NativeObjThisMethodDef, Tjs2Engine, Value};
 
 use super::{VideoSource, bound, layer_from_objthis, scene_mut};
@@ -539,8 +539,8 @@ pub(super) fn layer_method_defs() -> Vec<NativeObjThisMethodDef> {
 mod tests {
     use super::*;
     use crate::CompatHost;
+    use crate::engine_api::Scene;
     use api::media::VideoSpec;
-    use engine::Scene;
     use std::sync::MutexGuard;
     use tjs::TjsValue;
 

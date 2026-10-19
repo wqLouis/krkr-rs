@@ -3,12 +3,12 @@
 //! Behavioral reference: `main`'s `crates/tvp-visual/src/natives/*` (window.rs,
 //! layer.rs, bitmap.rs, font.rs, timer.rs) and the old `scene.rs`. This is a
 //! reimplementation on the layered API: every class composes the L2
-//! [`engine::Scene`] attached through [`CompatServices::scene`] and keeps no
+//! `engine_api::Scene` attached through [`CompatServices::scene`] and keeps no
 //! engine state of its own. The old code hid that state in process globals;
 //! here the per-family **dispatch** state (the id → script-object registries
 //! and the `Timer` callback bindings) lives in [`CompatServices::state`]
 //! (doc 08 §3.1); the generic input state and the timer schedule are L2 state
-//! ([`engine::input::InputState`], [`engine::timer::TimerState`]) attached to
+//! (`engine_api::InputState`, `engine_api::TimerState`) attached to
 //! the services, and the per-object state lives in the native instance
 //! payload.
 //!
@@ -64,13 +64,13 @@
 //! not found", never a silent stub):
 //!
 //! * `Layer.colorize` / `Layer.noise` and the remaining `operate*`/`blend*`
-//!   pile variants — L2 [`engine::layer_ops`] already implements the math
+//!   pile variants — L2 `engine_api::layer_ops` already implements the math
 //!   (`colorize`, `noise`, `operate_rect`, ...); wiring them here is a
 //!   mechanical follow-up rather than a missing primitive.
 //!
 //! # Timer polling
 //!
-//! The L2 [`engine::timer::TimerState`] registry is advanced by the L2 frame
+//! The L2 `engine_api::TimerState` registry is advanced by the L2 frame
 //! clock; its callbacks only queue `onTimer` events. [`timer_posts_poll`]
 //! delivers those queued events and is the first step of the frame body
 //! (`compat::frame::run_frame_body`). [`timer_poll`] stays for a host or test
@@ -126,8 +126,8 @@ mod tests {
 
     use super::timer_poll;
     use crate::CompatHost;
-    use engine::Scene;
-    use engine::timer::TimerState;
+    use crate::engine_api::Scene;
+    use crate::engine_api::TimerState;
     use tjs::{Tjs2Engine, TjsValue};
 
     /// A bound VM + host + attached scene and timer registry.

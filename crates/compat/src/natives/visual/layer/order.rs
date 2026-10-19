@@ -5,7 +5,7 @@
 //! `SetModeTo` / `RemoveModeFrom` (`LayerManager.cpp:834`).
 //!
 //! The sibling order is the maintained `children`/`layers` vector of the L2
-//! [`engine::Scene`]; reordering also renumbers `z_order` so the sort key
+//! `engine_api::Scene`; reordering also renumbers `z_order` so the sort key
 //! ([`Scene::window_layer_order`]) reflects the new order. The modal stack
 //! lives in [`LayerExtras`](super::LayerExtras) because the L2 node
 //! visibility/enabled predicates do not model modes yet.
@@ -13,7 +13,7 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::Scene;
+use crate::engine_api::Scene;
 use tjs::{NativeInstanceMethodDef, Value};
 
 use super::super::common::{resolve_object_id, scene_mut, scene_ref};

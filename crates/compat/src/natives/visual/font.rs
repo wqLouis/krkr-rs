@@ -3,11 +3,11 @@
 //! # Text metrics
 //!
 //! `getTextWidth`/`getTextHeight`, the `getEsc*` rotation variants and
-//! `getGlyphDrawRect` are backed by the L2 [`engine::text::TextEngine`]
+//! `getGlyphDrawRect` are backed by the L2 `engine_api::TextEngine`
 //! (cosmic-text shaping); a font mapped with `mapPrerenderedFont` reads the
 //! `.tft` per-character `Inc` metrics instead. A face is
 //! resolved through the shared [`crate::resource::ResourceResolver`]: the
-//! `System.addFont` registry, then the attached [`engine::Storage`] (the face
+//! `System.addFont` registry, then the attached `engine_api::Storage` (the face
 //! string read as a storage name), then the host's installed system fonts,
 //! with the reference's default-face fallback for an unresolved name.
 //! `defaultFaceName`/`getList` report the resolver's registered faces;
@@ -18,8 +18,8 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::FontState;
-use engine::text::{FontId, TextEngine, TextError, TextStyle};
+use crate::engine_api::FontState;
+use crate::engine_api::{FontId, TextEngine, TextError, TextStyle};
 use tjs::{
     NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, NativeMethodDef,
     NativePropertyDef, NativeStaticMembers, Tjs2Engine, Tjs2ValueId, Value,

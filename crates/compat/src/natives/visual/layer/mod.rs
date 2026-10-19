@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::input::InputState;
-use engine::{LayerState, Rect, Scene};
+use crate::engine_api::InputState;
+use crate::engine_api::{LayerState, Rect, Scene};
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
     RetainedValue, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_OBJECT, VAL_REAL, VAL_VOID, Value,
@@ -36,7 +36,7 @@ pub(crate) use focus::{
 };
 pub use transitions::advance_transitions;
 
-/// Per-layer L3 state that has no home in the L2 [`engine::Scene`] yet: the
+/// Per-layer L3 state that has no home in the L2 `engine_api::Scene` yet: the
 /// active transition, the modal-layer stack and the pending capture-release
 /// requests the frame body drains.
 ///
@@ -56,7 +56,7 @@ struct LayerExtras {
 
 /// One active layer transition (`beginTransition`).
 struct LayerTransition {
-    trans: engine::trans::Trans,
+    trans: crate::engine_api::Trans,
     /// The `transwith` layer the destination is being blended into (the
     /// reference's transition source).
     source: u32,
@@ -1457,9 +1457,10 @@ extern "C" fn layer_fill_rect(
         Err(error) => return report_error(out_error, &error),
     };
     let clip = util::layer_clip(scene, id);
-    let Some(dest) =
-        engine::layer_ops::intersect_rect((x, y, x.saturating_add(w), y.saturating_add(h)), clip)
-    else {
+    let Some(dest) = crate::engine_api::layer_ops::intersect_rect(
+        (x, y, x.saturating_add(w), y.saturating_add(h)),
+        clip,
+    ) else {
         set_void(out);
         return 0;
     };
@@ -1483,19 +1484,23 @@ extern "C" fn layer_fill_rect(
     let height = (dest.3 - dest.1) as u32;
     let modified = match face {
         pixels::DF_ALPHA | pixels::DF_ADD_ALPHA => {
-            engine::raster::fill_rect_replace(bitmap, dest.0, dest.1, width, height, color);
+            crate::engine_api::raster::fill_rect_replace(
+                bitmap, dest.0, dest.1, width, height, color,
+            );
             true
         }
         pixels::DF_OPAQUE if !hold_alpha => {
-            engine::raster::fill_rect_replace(bitmap, dest.0, dest.1, width, height, color);
+            crate::engine_api::raster::fill_rect_replace(
+                bitmap, dest.0, dest.1, width, height, color,
+            );
             true
         }
         pixels::DF_OPAQUE => {
-            engine::layer_ops::fill_color_hold_alpha(bitmap, dest, color, 255);
+            crate::engine_api::layer_ops::fill_color_hold_alpha(bitmap, dest, color, 255);
             true
         }
         pixels::DF_MASK => {
-            engine::layer_ops::fill_mask(bitmap, dest, color[2]);
+            crate::engine_api::layer_ops::fill_mask(bitmap, dest, color[2]);
             true
         }
         _ => false,

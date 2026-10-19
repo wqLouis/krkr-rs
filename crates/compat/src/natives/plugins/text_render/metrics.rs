@@ -3,8 +3,8 @@
 //! The reference asks the active [`FontRasterizer`] for each character's
 //! advance (`GetTextExtent`) and for the ascent (`GetAscentHeight`). Compat
 //! has exactly one rasterizer, so those metrics come from the L2
-//! [`engine::text::TextEngine`] (cosmic-text shaping); a face is resolved
-//! through the `System.addFont` registry, the attached [`engine::Storage`],
+//! `engine_api::TextEngine` (cosmic-text shaping); a face is resolved
+//! through the `System.addFont` registry, the attached `engine_api::Storage`,
 //! then the host's installed system fonts, exactly like the visual `Font`
 //! native.
 //!
@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use engine::text::{FontId, TextEngine, TextStyle};
+use crate::engine_api::{FontId, TextEngine, TextStyle};
 
 use crate::CompatCtx;
 
@@ -47,7 +47,7 @@ pub(super) fn ensure_face(
 }
 
 /// The face the reference's `"user"` placeholder resolves to: the newest font
-/// registered in the attached L2 [`engine::Scene`]. The reference's rasterizer
+/// registered in the attached L2 `engine_api::Scene`. The reference's rasterizer
 /// keeps the face last applied through a layer's `font`, and the scene's font
 /// list is the compat equivalent.
 fn scene_face(ctx: &CompatCtx) -> Option<String> {

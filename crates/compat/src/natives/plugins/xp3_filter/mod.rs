@@ -12,8 +12,8 @@
 //! * L1 (`fs::xp3`) owns the stateless per-segment hook
 //!   ([`fs::xp3::Xp3ExtractionFilter`]); the filter is passed in and never
 //!   stored there.
-//! * L2 (`engine::Storage`) owns the installed filter and hands it to L1 on
-//!   every archive read ([`engine::Storage::xp3_extraction_filter`]).
+//! * L2 (`engine_api::Storage`) owns the installed filter and hands it to L1 on
+//!   every archive read (`engine_api::Storage::xp3_extraction_filter`).
 //! * L3 (this module) registers the `Storages` members, retains the TJS
 //!   closures in [`CompatServices::state`], and installs an L2 filter that
 //!   marshals each decoded segment to the retained TJS closure. The content
@@ -77,7 +77,7 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::StorageReadError;
+use crate::engine_api::StorageReadError;
 use tjs::{
     DetachedValue, Engine, NativeMethodDef, NativeStaticMembers, RetainedValue, Tjs2Engine,
     TjsValue, VAL_OBJECT, Value,

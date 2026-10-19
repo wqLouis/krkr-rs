@@ -30,8 +30,8 @@ use std::f64::consts::PI;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::Arc;
 
+use crate::engine_api::{AudioStream, LoopInfo, LoopLink, SoundError, SoundLabel, SoundSource};
 use api::media::AudioSpec;
-use engine::sound::{AudioStream, LoopInfo, LoopLink, SoundError, SoundLabel, SoundSource};
 use tjs::{NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Value};
 
 use crate::native_util::{report_error, set_int, set_void, value_ref};

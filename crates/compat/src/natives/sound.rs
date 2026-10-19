@@ -4,7 +4,7 @@
 //! `natives.rs`) and the reference C++
 //! `reference/cpp/core/sound/WaveIntf.cpp` +
 //! `reference/cpp/core/sound/win32/WaveImpl.cpp`. This is a reimplementation
-//! on the layered API: the class composes the L2 [`engine::sound`] model and
+//! on the layered API: the class composes the L2 sound model and
 //! mixer and owns no process global — the one shared [`Mixer`] and the
 //! per-object [`SoundBuffer`]/[`SoundChannel`]/[`SoundSource`] handles live in
 //! [`CompatServices::state`].
@@ -35,7 +35,7 @@
 //! L3 has no codec backend (the L1 `media` crate is not a dependency of
 //! `compat`), so the host installs one with [`add_audio_decoder`]. `open`
 //! reads the audio entry and its `<name>.sli` side-car through the attached L2
-//! [`Storage`](engine::Storage), parses the side-car with the module's
+//! `engine_api::Storage`, parses the side-car with the module's
 //! [`parse_sli`], and hands both to the decoder — a typed error
 //! when no decoder or no storage is installed. The decoder returns a
 //! [`SoundSource`] (materialized or incremental), which is stored both on the
@@ -137,8 +137,8 @@ use std::sync::Arc;
 
 use api::media::AudioSpec;
 
-use engine::StorageReadError;
-use engine::sound::{
+use crate::engine_api::StorageReadError;
+use crate::engine_api::{
     LoopCondition, LoopInfo, LoopLink, Mixer, SoundBuffer, SoundChannel, SoundError, SoundEvent,
     SoundLabel, SoundSource, Status,
 };
@@ -3374,9 +3374,9 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
 mod tests {
     use super::*;
     use crate::CompatHost;
+    use crate::engine_api::Storage;
     use api::fs::{FsPath, OpenMode};
     use api::media::{AudioSpec, DecodedAudio};
-    use engine::Storage;
     use fs::FileSystem;
     use std::f64::consts::PI;
 
@@ -3913,7 +3913,7 @@ mod tests {
     /// buffer at once.
     #[test]
     fn streaming_chain_matches_whole_buffer_process() {
-        use engine::sound::AudioStream;
+        use crate::engine_api::AudioStream;
         use phase_vocoder::{FilterChainStream, PhaseVocoderDsp, VocoderConfig};
 
         let rate = 44_100u32;

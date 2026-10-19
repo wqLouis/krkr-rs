@@ -26,9 +26,9 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
+use crate::engine_api::{Scene, StorageReadError};
 use api::blend::BlendMode as SceneBlend;
 use api::fs::FsPath;
-use engine::{Scene, StorageReadError};
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
     NativeMethodDef, NativePropertyDef, NativeStaticMembers, RetainedValue, Tjs2Engine,

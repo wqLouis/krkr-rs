@@ -10,7 +10,7 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::{Storage, StorageReadError};
+use crate::engine_api::{Storage, StorageReadError};
 use tjs::{DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, Tjs2Engine, Value};
 
 use super::draw::Mat;

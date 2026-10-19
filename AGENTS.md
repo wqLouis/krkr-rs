@@ -70,6 +70,14 @@ Parallel workers only run on **disjoint write scopes**. Two workers never edit
 the same file in one wave. A worker that finds a bug outside its scope reports
 it; it does not fix it.
 
+**Deletion is part of the change.** When a patch replaces an implementation,
+test, allowlist entry or doc, the superseded one is deleted in the same patch.
+No compatibility shim, no stubbed old signature, no "kept for reference" copy,
+no appended "formerly" section. A patch that adds a parallel path without
+removing the one it replaces is rejected, and so is a doc that appends a
+superseded section instead of replacing it. Duplication on the way to a rewrite
+is never accepted as an intermediate state.
+
 Workers must not run `cargo build`, `cargo check`, `cargo clippy`, `cargo test`,
 `cargo run`, or `rustc`. Parallel builds have exhausted `/tmp` and corrupted the
 tree before. Workers *may* run `cargo fmt` / `rustfmt` and already-built
@@ -79,8 +87,10 @@ binaries under `target/debug/`.
 
 1. Read the diff, not only the report. Check the layer boundary, the reference
    behaviour, the surface lock and the task's non-goals.
-2. Reject silent fallbacks, unrelated refactors, new dependencies and
-   unreviewed public/script changes.
+2. Reject silent fallbacks, unrelated refactors, new dependencies,
+   unreviewed public/script changes, an added path that leaves the superseded
+   one in place, and a doc that appends a superseded section instead of
+   replacing it.
 3. Integrate, then run the full static gate and the test suites.
 4. Commit only after both are green. Update the design doc when the code change
    changes a recorded contract.
@@ -107,7 +117,8 @@ the `stateless`, `error-handling`, `house-style`, `layering`, `storage-boundary`
 `native-construction`, `lifecycle-order`,
 `storage-media`,
 `callback-objthis`,
-`native-arity`
+`native-arity`,
+`void-getter`
 checks;
 `cargo clippy --workspace --all-targets -- -D warnings`;
 `cargo clippy -p platform --features platform-android --all-targets -- -D warnings`;
@@ -135,6 +146,7 @@ uv run --project scripts krkr-gate lifecycle-order
 uv run --project scripts krkr-gate storage-media
 uv run --project scripts krkr-gate callback-objthis
 uv run --project scripts krkr-gate native-arity
+uv run --project scripts krkr-gate void-getter
 uv run --project scripts krkr-gate host-facts
 uv run --project scripts krkr-gate android-target
 uv run --project scripts krkr-gate surface-lock --no-regen
@@ -157,7 +169,7 @@ The `platform-android` steps build the **feature on the host**, not the Android
 target: the feature compiles the platform-independent helpers plus a typed stub,
 and everything that needs `ndk` stays gated to `target_os = "android"`. The
 Android target itself is **never** built or tested here — there is no NDK on the
-host and none may be installed (see §9 of `TODO.md`); it is compiled and run on a
+host and none may be installed (see §14 of `TODO.md`); it is compiled and run on a
 machine that has one, and Android-only code that has not been compiled is
 documented as unverified rather than described as working.
 
@@ -210,6 +222,11 @@ Hard rules:
   (`BlendMode`, normalized gain, opaque key codes).
 - **L3 must not contain platform code** (`#[cfg(target_os = …)]`, `winit`,
   `android-activity`, `std::fs`, JNI). It uses L1 abstractions.
+- **L3 names the engine only through `crates/compat/src/engine_api.rs`.** That
+  file is the L3↔L2 protocol surface; the `l3-engine-api` rule inside the
+  `layering` check rejects `engine::` anywhere else under `compat/src`. A new
+  engine item L3 needs is re-exported there and recorded in docs
+  [`14`](docs/migration/14-l3-l2-protocol.md).
 - **`#[cfg(target_os)]` and platform crates live only in L1 (`platform`, `media`).**
 
 Crate roles:
@@ -424,7 +441,7 @@ It elaborates this section; if they disagree, this file wins.
   this for non-test comments. Test comments keep the citation. Comments that
   predate the rule are baselined in
   `scripts/allowlists/house_style_baseline.txt` (burn-down tracked in
-  `TODO.md` §21); a new one fails.
+  `TODO.md` §15); a new one fails.
 - No internal jargon in **printed/logged** text (`L1`–`L4`, decision numbers).
   Use `platform`, `engine`, `compat`, `app`, `tjs`, `vm`, or plain English.
   Tests are exempt.
@@ -508,7 +525,10 @@ Two-sided tests:
 4. The surface lock and both parity reports are unchanged (or the baseline
    change is deliberate and reviewed).
 5. Comments/D31 clean; public items documented; `cargo fmt` clean.
-6. The main agent's full gate is green.
+6. Superseded code, tests, allowlist entries and docs are deleted in the same
+   change; nothing is left as a compatibility shim, a dead branch or a stale
+   section.
+7. The main agent's full gate is green.
 
 ---
 
@@ -528,6 +548,7 @@ Two-sided tests:
 | Android AAudio/MediaCodec, `AHardwareBuffer` readback | `docs/migration/10-android-backends.md`, `docs/android.md` |
 | Presentation (Fit only) and the VM↔device pixel translation | `docs/migration/11-presentation-and-pixel-translation.md` |
 | Layer tree → projection → draw tree → frame | `docs/migration/12-layer-tree-and-frame.md` |
+| L3 ↔ L2 protocol surface | `docs/migration/14-l3-l2-protocol.md` |
 | Per-crate review findings | `docs/migration/reviews/*.md` |
 | Surface lock / parity | `docs/native_parity.md`, `docs/plugin_parity.md` |
 | Win32/plugin-host and Wine studies (non-goals) | `docs/plugin_host_exe.md`, `docs/wine_box64.md` |

@@ -7,7 +7,7 @@
 //! action owner / action name, the script-visible `interval` (sub-ms fixed
 //! point), `capacity`, `mode` and `enabled` — all stored verbatim in the
 //! [`TimerBinding`] and never read back from L2 — plus the dispatch seam.
-//! Scheduling is L2 (`engine::timer::TimerState`): the constructor registers
+//! Scheduling is L2 (`engine_api::TimerState`): the constructor registers
 //! a callback that performs the `onTimer` dispatch on every fire, and L3
 //! decides whether the timer is armed *at all*. The reference's two "armed
 //! and enabled yet never fires" cases — a negative `Capacity` posting
@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::timer::{TimerCallback, TimerId, TimerState};
+use crate::engine_api::{TimerCallback, TimerId, TimerState};
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
     RetainedValue, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value,
@@ -179,7 +179,7 @@ fn timer_post_is_live(services: &CompatServices, id: TimerId, generation: u64) -
 }
 
 // ---------------------------------------------------------------------------
-// Timer (L3 adapter over the L2 `engine::timer::TimerState` registry)
+// Timer (L3 adapter over the L2 `engine_api::TimerState` registry)
 // ---------------------------------------------------------------------------
 
 /// The number of live `Timer` bindings in the dispatch state.

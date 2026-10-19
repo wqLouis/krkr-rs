@@ -30,8 +30,8 @@ shells out to `cargo tree`, the rest read the tree.
 
 `stateless`, `error-handling`, `house-style`, `layering`,
 `native-construction`, `lifecycle-order`, `host-facts`, `android-target`,
-`surface-lock`, `native-parity`, `plugin-parity`, `native-arity`, the
-`extract-xp3` helper, and `gate`.
+`surface-lock`, `native-parity`, `plugin-parity`, `native-arity`,
+`void-getter`, the `extract-xp3` helper, and `gate`.
 
 `house-style` also enforces the AGENTS §6 comment rules: a **non-test**
 comment may not cite the external engine (`reference/cpp`, a `*.cpp:line`, a
@@ -42,9 +42,25 @@ included — may carry `#[allow(clippy::…)]` / `#![allow(clippy::…)]` /
 `#[expect(clippy::…)]`; the `clippy-allow` rule has no allowlist exemption.
 Legacy comments that predate these rules are recorded in
 `allowlists/house_style_baseline.txt` (JSON Lines keyed to the normalized
-comment line, tracked in `TODO` §21); a stale baseline entry is a note, and
+comment line, tracked in `TODO` §15); a stale baseline entry is a note, and
 new citations outside the baseline still fail. `allowlists/house_style_allow.txt`
 holds only reviewed false positives.
+
+`layering` enforces the layer rules that a compiler cannot: L1 crates may not
+name TVP/TJS/KAG vocabulary, L2 may not carry TVP vocabulary or storage ids,
+L3 may not contain platform code, and L3 reaches the engine only through
+`crates/compat/src/engine_api.rs` (the `l3-engine-api` rule). It also checks
+that every `unsafe` block carries a `// SAFETY:` note and that the file-level
+`unsafe_code` allow appears only in reviewed FFI files.
+
+`void-getter` fails a native property getter that returns a `StoredValue`
+field whose constructor default is `StoredValue::Void` unchanged: the script
+receives a void value, and reading a member from it raises, where the
+reference returns an array, a dictionary or a native object. A getter that
+matches the void default and returns the reference's non-void value is clean.
+A property whose reference getter genuinely reads back void is recorded in
+`allowlists/void_getter_allow.txt` as `path:field — reason`; a reason that
+starts with `debt:` tracks a known defect and does not silence the finding.
 
 ## Notes
 

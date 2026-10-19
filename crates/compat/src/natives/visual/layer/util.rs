@@ -2,13 +2,13 @@
 //!
 //! These are the small marshalling / geometry / borrow routines every method
 //! group needs. They live here (rather than in a process global) so the
-//! `Layer` code stays a thin adapter over the L2 [`engine::Scene`].
+//! `Layer` code stays a thin adapter over the L2 `engine_api::Scene`.
 #![allow(unsafe_code)]
 
+use crate::engine_api::InputState;
+use crate::engine_api::layer_ops::RectI;
+use crate::engine_api::{BitmapState, Scene};
 use api::blend::BlendMode;
-use engine::input::InputState;
-use engine::layer_ops::RectI;
-use engine::{BitmapState, Scene};
 use tjs::{RetainedValue, Tjs2Engine, TjsValue, VAL_OBJECT, VAL_REAL, VAL_STRING, VAL_VOID, Value};
 
 use super::super::common::{VisualState, resolve_object_id, scene_ref};
@@ -154,8 +154,8 @@ pub(super) fn input_mut<'a>(ctx: &CompatCtx) -> Result<&'a mut InputState, Strin
 pub(super) fn layer_clip(scene: &Scene, layer_id: u32) -> RectI {
     scene
         .layer(layer_id)
-        .map_or(engine::layer_ops::clip_rect(None), |l| {
-            engine::layer_ops::clip_rect(l.clip)
+        .map_or(crate::engine_api::layer_ops::clip_rect(None), |l| {
+            crate::engine_api::layer_ops::clip_rect(l.clip)
         })
 }
 

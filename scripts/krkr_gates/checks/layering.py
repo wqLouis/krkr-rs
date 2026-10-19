@@ -1,9 +1,10 @@
 """Layer-vocabulary and unsafe-placement guard (AGENTS §2/§5).
 
 Checks that the bottom crates do not name TVP/TJS/KAG vocabulary, that the
-compat layer contains no platform code, and that ``unsafe`` carries a safety
-note and a file-level allow only in a reviewed FFI location. Accepted sites
-are listed in ``scripts/allowlists/layering_allow.txt``.
+compat layer contains no platform code, that compat reaches the engine only
+through its one seam module, and that ``unsafe`` carries a safety note and a
+file-level allow only in a reviewed FFI location. Accepted sites are listed in
+``scripts/allowlists/layering_allow.txt``.
 """
 
 import fnmatch
@@ -17,6 +18,7 @@ from ..framework import (
     FixtureRules,
     Finding,
     anchor_in,
+    blank_cfg_test,
     clean_fixture_problems,
     dedupe_findings,
     filter_findings,
@@ -92,12 +94,17 @@ UNSAFE_BLOCK = re.compile(r"\bunsafe\s*\{")
 UNSAFE_FN = re.compile(r"\bunsafe\s+(?:extern\s+\"[^\"]*\"\s+)?fn\b")
 UNSAFE_ALLOW = re.compile(r"#!\[allow\(unsafe_code\)\]")
 MISSING_DOCS = re.compile(r"#!\[warn\(missing_docs\)\]")
+# A path into the engine crate.  Compat names the engine through
+# `crate::engine_api` only; the seam module itself is the one exception.
+ENGINE_PATH = re.compile(r"\bengine\s*::")
+ENGINE_API_SEAM = "crates/compat/src/engine_api.rs"
 
 RULES = {
     "l1-vocabulary",
     "l2-vocabulary",
     "l2-storage-name",
     "l3-platform",
+    "l3-engine-api",
     "unsafe-no-safety-note",
     "unsafe-allow-outside-ffi",
     "missing-docs-lint",
@@ -202,6 +209,9 @@ def scan_text(rel, src):
                     add(line_number(offsets, a), "l2-storage-name")
         if log.startswith("crates/compat/src/"):
             tokens_scan(L3_TOKENS, "l3-platform")
+            if log != ENGINE_API_SEAM:
+                for m in ENGINE_PATH.finditer(blank_cfg_test(masked)):
+                    add(line_number(offsets, m.start()), "l3-engine-api")
 
         for rx, check in ((UNSAFE_BLOCK, has_safety_note), (UNSAFE_FN, has_fn_safety)):
             for m in rx.finditer(masked):
@@ -263,6 +273,7 @@ BAD_FIXTURES = {
     "crates/engine/src/bad_l2_vocabulary.rs": "l2-vocabulary",
     "crates/engine/src/bad_l2_storage_name.rs": "l2-storage-name",
     "crates/compat/src/bad_l3_platform.rs": "l3-platform",
+    "crates/compat/src/bad_l3_engine_path.rs": "l3-engine-api",
     "crates/compat/src/bad_unsafe_note.rs": "unsafe-no-safety-note",
     "crates/engine/src/bad_unsafe_allow.rs": "unsafe-allow-outside-ffi",
     "crates/bad_crate/src/lib.rs": "missing-docs-lint",
@@ -272,6 +283,7 @@ GOOD_FIXTURES = (
     "scripts/fixtures/layering/crates/engine/src/good_l2.rs",
     "scripts/fixtures/layering/crates/engine/src/good_l2_storage_name.rs",
     "scripts/fixtures/layering/crates/compat/src/good_l3.rs",
+    "scripts/fixtures/layering/crates/compat/src/good_l3_engine_path.rs",
     "scripts/fixtures/layering/crates/compat/src/good_unsafe_note.rs",
     "scripts/fixtures/layering/crates/compat/src/good_allow.rs",
     "scripts/fixtures/layering/crates/compat/tests/good_std_fs.rs",

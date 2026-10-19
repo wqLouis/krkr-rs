@@ -7,7 +7,7 @@
 //!
 //! # What this composes
 //!
-//! The class is a thin adapter over the L2 [`engine::video::VideoOverlay`]
+//! The class is a thin adapter over the L2 `engine_api::VideoOverlay`
 //! playback machine: playback commands, the position/frame clock, bounds,
 //! visibility, whole-stream/segment looping, the period event, the play rate
 //! and the event queue all live in the L2 value. L3 owns only the per-object
@@ -46,13 +46,13 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::Arc;
 
-use api::error::MediaError;
-use api::media::{DecodedAudio, RgbaFrame, VideoSpec};
-use engine::Scene;
-use engine::sound::{SoundError, SoundSource};
-use engine::video::{
+use crate::engine_api::Scene;
+use crate::engine_api::{
     PlayStatus, VideoBounds, VideoEvent, VideoOverlay, blit_frame_to_layer_opacity,
 };
+use crate::engine_api::{SoundError, SoundSource};
+use api::error::MediaError;
+use api::media::{DecodedAudio, RgbaFrame, VideoSpec};
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
     RetainedValue, Tjs2Engine, Tjs2ValueId, TjsValue, VAL_INTEGER, VAL_OBJECT, VAL_REAL,
@@ -255,7 +255,7 @@ impl VideoSlot {
 /// The decoded movie audio and the shared-mixer voice it plays on.
 ///
 /// This is the one implementation shared by every native that plays decoded
-/// movie audio. The sound family owns the one [`engine::sound::Mixer`], so the
+/// movie audio. The sound family owns the one `engine_api::Mixer`, so the
 /// value registers the decoded track through [`SoundState`] and keeps only the
 /// voice id; the owner composes it and drives [`Self::sync`] from its own
 /// transport. A caller with script volume/pan members passes their normalized
@@ -2933,7 +2933,7 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine::video::PlayStatus;
+    use crate::engine_api::PlayStatus;
     use std::cell::RefCell;
 
     struct FakeSink {

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::input::InputState;
+use crate::engine_api::InputState;
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
     NativePropertyDef, NativeStaticMembers, RetainedValue, Tjs2Engine, TjsValue, Value,
@@ -24,8 +24,8 @@ use tjs::VAL_OBJECT;
 /// The client size a window starts with.
 const DEFAULT_WINDOW_SIZE: (u32, u32) = (1280, 720);
 
-/// `Window` payload: the scene id plus the window properties the L2
-/// [`engine::WindowState`] does not model (there is no OS chrome).
+/// `Window` payload: the scene id plus the window properties the L2 window
+/// state does not model (there is no OS chrome).
 struct WindowInst {
     id: Option<u32>,
     /// Set by the native constructor (`super.Window(...)`). Before it runs the
