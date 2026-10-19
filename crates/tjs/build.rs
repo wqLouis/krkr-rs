@@ -574,6 +574,7 @@ fn main() {
             let obj_dir = obj_dir.clone();
             let failed = failed.clone();
             let lock = lock.clone();
+            let generated = src.starts_with(&gen_dir);
             std::thread::spawn(move || {
                 let obj = obj_dir.join(
                     src.file_name()
@@ -601,7 +602,9 @@ fn main() {
                     println!("cargo:warning=compile failed: {}", src.display());
                     return;
                 }
-                println!("cargo:rerun-if-changed={}", src.display());
+                if !generated {
+                    println!("cargo:rerun-if-changed={}", src.display());
+                }
             })
         })
         .collect();
