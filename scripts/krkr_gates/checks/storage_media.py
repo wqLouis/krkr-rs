@@ -50,11 +50,24 @@ import sys
 from pathlib import Path
 
 from ..common import ALLOWLISTS_DIR, FIXTURES_DIR, REPO_ROOT
-from .native_parity import _strip_cpp_comments
+from ..framework import (
+    find_block,
+    load_keyed_allowlist,
+    strip_cpp_comments,
+    write_keyed_allowlist,
+)
 
 ROOT = REPO_ROOT
 ALLOWLIST = ALLOWLISTS_DIR / "storage_media_allow.txt"
 FIXTURES = FIXTURES_DIR / "storage_media"
+ALLOWLIST_HEADER = (
+    "# Storage-media allowlist: reference domains the port does not serve\n"
+    "# and cannot document as a recoverable missing seam.\n"
+    "# One entry per line: <scheme> -- reason citing reference/cpp/**\n"
+    "# Regenerate after review with:\n"
+    "#   uv run --project scripts krkr-gate storage-media --update-allow\n"
+    "\n"
+)
 
 # A storage-media domain name; the reference spellings are plain lowercase
 # words, but the grammar allows the usual scheme characters.
@@ -106,15 +119,10 @@ _NOT_SERVED = re.compile(r"\bseam\b|\bnot ported\b|\bno-op\b", re.I)
 
 def _block(text: str, open_brace: int) -> str:
     """Return the text of the block whose ``{`` is at ``open_brace``."""
-    depth = 1
-    i = open_brace + 1
-    while i < len(text) and depth:
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-        i += 1
-    return text[open_brace + 1 : i - 1]
+    span = find_block(text, open_brace)
+    if span is not None:
+        return text[span[0] : span[1]]
+    return text[open_brace + 1 : len(text) - 1]
 
 
 def _reference_sources(root: Path):
@@ -145,7 +153,7 @@ def reference_domains(root: Path) -> dict[str, list[tuple[str, int]]]:
             match.group("name"): match.group("domain")
             for match in _DEFINE_BASENAME.finditer(raw)
         }
-        masked = _strip_cpp_comments(raw)
+        masked = strip_cpp_comments(raw)
         try:
             rel = path.relative_to(root).as_posix()
         except ValueError:
@@ -217,37 +225,6 @@ def scan(root: Path) -> list[dict[str, object]]:
     return findings
 
 
-def read_allowlist(path: Path) -> dict[str, str]:
-    entries: dict[str, str] = {}
-    if not path.is_file():
-        return entries
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        reason = ""
-        if "--" in line:
-            line, reason = line.split("--", 1)
-            reason = reason.strip()
-        entries[line.strip()] = reason
-    return entries
-
-
-def write_allowlist(path: Path, schemes: list[str], reasons: dict[str, str]) -> None:
-    lines = [
-        "# Storage-media allowlist: reference domains the port does not serve",
-        "# and cannot document as a recoverable missing seam.",
-        "# One entry per line: <scheme> -- reason citing reference/cpp/**",
-        "# Regenerate after review with:",
-        "#   uv run --project scripts krkr-gate storage-media --update-allow",
-        "",
-    ]
-    for scheme in sorted(schemes):
-        reason = reasons.get(scheme, "")
-        lines.append(f"{scheme} -- {reason}" if reason else scheme)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
 def self_test(verbose: bool = True) -> int:
     tree = FIXTURES / "tree"
     expected_path = FIXTURES / "expected.json"
@@ -309,11 +286,14 @@ def main(argv: list[str] | None = None) -> int:
     served = served_domains(ROOT)
     documented = documented_domains(ROOT)
     findings = scan(ROOT)
-    allowed = read_allowlist(ALLOWLIST)
+    allowed = load_keyed_allowlist(ALLOWLIST)
 
     if args.update_allow:
-        write_allowlist(
-            ALLOWLIST, sorted({f["scheme"] for f in findings}), allowed  # type: ignore[arg-type]
+        write_keyed_allowlist(
+            ALLOWLIST,
+            ALLOWLIST_HEADER,
+            sorted({f["scheme"] for f in findings}),  # type: ignore[arg-type]
+            allowed,
         )
         print(
             f"check-storage-media: allowlist updated — {len(findings)} finding(s) "
@@ -359,10 +339,5 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def run(argv=None):
-    """Run the check. ``argv`` carries the check-specific flags."""
-    return main(argv)
-
-
 if __name__ == "__main__":
-    sys.exit(run(sys.argv[1:]))
+    sys.exit(main(sys.argv[1:]))

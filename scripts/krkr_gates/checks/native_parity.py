@@ -83,6 +83,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..common import ALLOWLISTS_DIR, REPO_ROOT
+from ..framework import (
+    load_keyed_allowlist,
+    strip_cpp_comments,
+    write_keyed_allowlist,
+)
 
 REFERENCE_GLOB = "reference/cpp/core/**/*.cpp"
 ALLOWLIST_PATH = ALLOWLISTS_DIR / "native_parity_allow.txt"
@@ -390,30 +395,6 @@ def _preprocess_cpp(src: str) -> str:
     return "\n".join(out)
 
 
-def _strip_cpp_comments(src: str) -> str:
-    """Replace C/C++ comments with spaces, preserving offsets/newlines."""
-    out: list[str] = []
-    i = 0
-    n = len(src)
-    while i < n:
-        c = src[i]
-        if c == "/" and i + 1 < n and src[i + 1] == "/":
-            j = src.find("\n", i)
-            if j == -1:
-                j = n
-            out.append(" " * (j - i))
-            i = j
-        elif c == "/" and i + 1 < n and src[i + 1] == "*":
-            j = src.find("*/", i + 2)
-            j = n if j == -1 else j + 2
-            out.append(re.sub(r"[^\n]", " ", src[i:j]))
-            i = j
-        else:
-            out.append(c)
-            i += 1
-    return "".join(out)
-
-
 def _normalize_static_decl_comments(src: str) -> str:
     """Rewrite the ``..._DECL(name) /* static */`` comment form to a macro.
 
@@ -437,7 +418,7 @@ def _normalize_static_decl_comments(src: str) -> str:
 
 def _mask_cpp_source(raw: str) -> str:
     """Preprocess, normalize the static-comment form, then strip comments."""
-    return _strip_cpp_comments(_normalize_static_decl_comments(_preprocess_cpp(raw)))
+    return strip_cpp_comments(_normalize_static_decl_comments(_preprocess_cpp(raw)))
 
 
 def _cpp_end_is_static(src: str, m: re.Match) -> bool:
@@ -1396,7 +1377,7 @@ def parse_runtime_class_attachments() -> dict[str, dict[str, "bool | None"]]:
     for path in sorted(root.rglob("*.rs")):
         raw = path.read_text(encoding="utf-8", errors="replace")
         _code, strings = _lex_rust(raw)
-        code_no_comment = _strip_cpp_comments(raw)
+        code_no_comment = strip_cpp_comments(raw)
         for m in _RUNTIME_ATTACH_RE.finditer(code_no_comment):
             target, member = m.group(1), m.group(2)
             if target in tracked:
@@ -1618,22 +1599,9 @@ def read_allowlist_reasons(path: Path) -> "OrderedDict[str, str]":
     ``debt:`` marks a deliberately-baselined known gap (mirrors
     ``scripts/allowlists/layering_allow.txt``); a bare entry has an empty reason.
     """
-    entries: "OrderedDict[str, str]" = OrderedDict()
-    if not path.exists():
-        return entries
-    for line in path.read_text(encoding="utf-8").splitlines():
-        text = line.strip()
-        if not text or text.startswith("#"):
-            continue
-        reason = ""
-        for sep in ("\u2014", " -- ", " # "):
-            if sep in text:
-                key, _, reason = text.partition(sep)
-                entries[key.strip()] = reason.strip()
-                break
-        else:
-            entries[text] = ""
-    return entries
+    return OrderedDict(
+        load_keyed_allowlist(path, ("\u2014", " -- ", " # "))
+    )
 
 
 MEMBER_ALLOW_HEADER = (
@@ -1677,13 +1645,7 @@ def write_allowlist(
     reasons: "dict[str, str] | None" = None,
     header: str = MEMBER_ALLOW_HEADER,
 ) -> None:
-    reasons = reasons or {}
-    lines = []
-    for key in sorted(entries):
-        reason = (reasons.get(key) or "").strip()
-        lines.append(f"{key} \u2014 {reason}" if reason else key)
-    body = "\n".join(lines)
-    path.write_text(header + body + ("\n" if body else ""), encoding="utf-8")
+    write_keyed_allowlist(path, header, entries, reasons or {}, separator="\u2014")
 
 
 def build_report(
@@ -2511,10 +2473,5 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def run(argv=None):
-    """Run the check. ``argv`` carries the check-specific flags."""
-    return main(argv)
-
-
 if __name__ == "__main__":
-    raise SystemExit(run(sys.argv[1:]))
+    raise SystemExit(main(sys.argv[1:]))

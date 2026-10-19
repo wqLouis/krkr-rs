@@ -111,8 +111,3 @@ def main(argv: list[str] | None = None) -> int:
         "(no globals/caches, no stateful services in the bottom core)"
     )
     return 0
-
-
-def run(argv: list[str] | None = None) -> int:
-    """Run the check. ``argv`` carries the check-specific flags."""
-    return main(argv)

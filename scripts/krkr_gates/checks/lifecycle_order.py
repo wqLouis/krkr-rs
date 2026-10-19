@@ -24,7 +24,7 @@ import re
 import sys
 
 from ..common import FIXTURES_DIR, REPO_ROOT
-from .error_handling import mask
+from ..framework import Finding, find_block, mask
 
 ROOT = REPO_ROOT
 NATIVES = ROOT / "crates" / "compat" / "src" / "natives"
@@ -43,34 +43,24 @@ FN = re.compile(r"\bfn\s+(\w+)\s*\([^)]*\)[^{]*\{")
 SAFE_LAYER_FUNCTIONS = {"layer_create", "layer_ctor", "layer_destroy"}
 
 
-def _block(masked: str, open_brace: int) -> tuple[int, int]:
-    """Return the span (body_start, body_end) of the block at ``open_brace``."""
-    depth = 1
-    i = open_brace + 1
-    while i < len(masked) and depth:
-        if masked[i] == "{":
-            depth += 1
-        elif masked[i] == "}":
-            depth -= 1
-        i += 1
-    return open_brace + 1, i - 1
-
-
 def _enclosing_function(masked: str, offset: int) -> tuple[str, int, int] | None:
     """Find the innermost ``fn`` whose body contains ``offset``."""
     best: tuple[str, int, int] | None = None
     for match in FN.finditer(masked):
-        body_start, body_end = _block(masked, match.end() - 1)
+        span = find_block(masked, match.end() - 1)
+        if span is None:
+            continue
+        body_start, body_end = span
         if body_start <= offset < body_end:
             best = (match.group(1), body_start, body_end)
     return best
 
 
-def scan(roots=None):
-    """Return ``(rel_path, line, rule, detail)`` findings."""
+def scan(roots=None) -> list[Finding]:
+    """Return one finding per scene removal that precedes child finalization."""
     if roots is None:
         roots = [NATIVES]
-    findings = []
+    findings: list[Finding] = []
     for root in roots:
         paths = [root] if root.is_file() else sorted(root.rglob("*.rs"))
         for path in paths:
@@ -97,7 +87,7 @@ def scan(roots=None):
                     if required not in before:
                         line = masked[: call.start()].count("\n") + 1
                         findings.append(
-                            (rel, line, RULE, f"{name}: missing {required}")
+                            Finding(rel, line, RULE, message=f"{name}: missing {required}")
                         )
     return findings
 
@@ -107,9 +97,9 @@ def self_test() -> int:
         print(f"ERROR: lifecycle-order self-test fixtures missing at {FIXTURES}")
         return 1
     findings = scan([FIXTURES])
-    by_path = {}
+    by_path: dict[str, list[Finding]] = {}
     for finding in findings:
-        by_path.setdefault(finding[0], []).append(finding)
+        by_path.setdefault(finding.path, []).append(finding)
     missing = [
         path
         for path in (BAD_WINDOW, BAD_LAYER)
@@ -135,13 +125,17 @@ def self_test() -> int:
     return 0
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    del argv
     code = self_test()
     if code:
         return code
     findings = scan()
-    for rel, line, rule, detail in findings:
-        print(f"ERROR: scene lifecycle violation [{rule}] {rel}:{line}: {detail}")
+    for finding in findings:
+        print(
+            f"ERROR: scene lifecycle violation [{finding.rule}] "
+            f"{finding.path}:{finding.line}: {finding.message}"
+        )
     if findings:
         print("")
         print(
@@ -156,10 +150,5 @@ def main() -> int:
     return 0
 
 
-def run(argv=None) -> int:
-    del argv
-    return main()
-
-
 if __name__ == "__main__":
-    sys.exit(run(sys.argv[1:]))
+    sys.exit(main(sys.argv[1:]))

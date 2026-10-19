@@ -91,6 +91,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..common import ALLOWLISTS_DIR, REPO_ROOT
+from ..framework import (
+    load_keyed_allowlist,
+    strip_cpp_comments,
+    write_keyed_allowlist,
+)
 
 from . import native_parity as np
 
@@ -102,6 +107,17 @@ RUST_PLUGINS_DIR = REPO_ROOT / "crates" / "compat" / "src" / "natives" / "plugin
 RUST_NATIVES_DIR = REPO_ROOT / "crates" / "compat" / "src" / "natives"
 ALLOWLIST_PATH = ALLOWLISTS_DIR / "plugin_parity_allow.txt"
 DOC_PATH = REPO_ROOT / "docs" / "plugin_parity.md"
+PLUGIN_ALLOW_HEADER = (
+    "# Plugin parity allowlist: reference surface that is known-missing.\n"
+    "# One entry per line: Class.member, a class (`GdiPlus.Image`) or a\n"
+    "# namespace object (`GdiPlus`), optionally followed by '— reason'.\n"
+    "# A reason beginning with 'debt:' records a known gap that is accepted\n"
+    "# but still visible; see docs/audits/propset-parity.md.\n"
+    "# Regenerate after intentional additions with:\n"
+    "#   uv run --project scripts krkr-gate plugin-parity --update-allow\n"
+    "# The checker fails when a missing entry is not listed here.\n"
+    "\n"
+)
 FIXTURES_DIR = REPO_ROOT / "scripts" / "fixtures" / "parity"
 
 REFERENCE_GLOBS = ("**/*.cpp", "**/*.hpp", "**/*.h")
@@ -609,7 +625,7 @@ def parse_reference(sources: "list[Path] | None" = None) -> ReferenceModel:
     files: list[tuple[Path, str, list[tuple[int, int, str, "str | None", str]]]] = []
     for fp in (sources if sources is not None else _iter_reference_files()):
         raw = fp.read_text(encoding="utf-8", errors="replace")
-        src = _blank_directives(np._strip_cpp_comments(np._preprocess_cpp(raw)))
+        src = _blank_directives(strip_cpp_comments(np._preprocess_cpp(raw)))
         files.append((fp, src, _collect_class_spans(src)))
 
     # Namespace nesting first: a namespace may attach a nested class defined
@@ -1555,44 +1571,17 @@ def read_allowlist_reasons(path: Path) -> "OrderedDict[str, str]":
     reason starting with ``debt:`` marks a deliberately-baselined known gap
     (mirrors ``scripts/allowlists/layering_allow.txt``); a bare entry has an empty reason.
     """
-    entries: "OrderedDict[str, str]" = OrderedDict()
-    if not path.exists():
-        return entries
-    for line in path.read_text(encoding="utf-8").splitlines():
-        text = line.strip()
-        if not text or text.startswith("#"):
-            continue
-        for sep in ("\u2014", " -- ", " # "):
-            if sep in text:
-                key, _, reason = text.partition(sep)
-                entries[key.strip()] = reason.strip()
-                break
-        else:
-            entries[text] = ""
-    return entries
+    return OrderedDict(
+        load_keyed_allowlist(path, ("\u2014", " -- ", " # "))
+    )
 
 
 def write_allowlist(
     path: Path, entries: set[str], reasons: "dict[str, str] | None" = None
 ) -> None:
-    header = (
-        "# Plugin parity allowlist: reference surface that is known-missing.\n"
-        "# One entry per line: Class.member, a class (`GdiPlus.Image`) or a\n"
-        "# namespace object (`GdiPlus`), optionally followed by '— reason'.\n"
-        "# A reason beginning with 'debt:' records a known gap that is accepted\n"
-        "# but still visible; see docs/audits/propset-parity.md.\n"
-        "# Regenerate after intentional additions with:\n"
-        "#   uv run --project scripts krkr-gate plugin-parity --update-allow\n"
-        "# The checker fails when a missing entry is not listed here.\n"
-        "\n"
+    write_keyed_allowlist(
+        path, PLUGIN_ALLOW_HEADER, entries, reasons or {}, separator="\u2014"
     )
-    reasons = reasons or {}
-    lines = []
-    for key in sorted(entries):
-        reason = (reasons.get(key) or "").strip()
-        lines.append(f"{key} \u2014 {reason}" if reason else key)
-    body = "\n".join(lines)
-    path.write_text(header + body + ("\n" if body else ""), encoding="utf-8")
 
 
 def build_report(
@@ -2415,10 +2404,5 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def run(argv=None):
-    """Run the check. ``argv`` carries the check-specific flags."""
-    return main(argv)
-
-
 if __name__ == "__main__":
-    raise SystemExit(run(sys.argv[1:]))
+    raise SystemExit(main(sys.argv[1:]))

@@ -12,11 +12,31 @@ import sys
 import time
 
 from ..common import ALLOWLISTS_DIR, FIXTURES_DIR, REPO_ROOT
+from ..framework import (
+    AllowEntry,
+    FixtureRules,
+    Finding,
+    anchor_in,
+    clean_fixture_problems,
+    dedupe_findings,
+    filter_findings,
+    fixture_problems,
+    in_ranges,
+    line_number,
+    line_offsets,
+    literal_content,
+    load_path_line_allowlist,
+    mask,
+    print_all_findings,
+    print_stale,
+    report_self_test_failure,
+    scan_spans,
+    stale_keys,
+    test_ranges,
+)
 
 ROOT = REPO_ROOT
 ALLOW = ALLOWLISTS_DIR / "layering_allow.txt"
-ARGS: set[str] = set()
-PRINT_ALL = False
 
 CRATES = ROOT / "crates"
 FIXTURES = FIXTURES_DIR / "layering"
@@ -84,138 +104,6 @@ RULES = {
 }
 
 
-def scan_spans(src):
-    """Yield `(kind, start, end)` for every comment and string/char literal.
-
-    `kind` is `"comment"`, `"str"` or `"char"`; the spans are byte offsets
-    into `src` and keep their newlines, so positions stay valid.  `mask`
-    blanks the spans and the storage-name rule needs the string spans
-    themselves, so one tokenizer feeds both.
-    """
-    n = len(src)
-    i = 0
-    while i < n:
-        c = src[i]
-        if c == "/" and i + 1 < n and src[i + 1] == "/":
-            j = i + 2
-            while j < n and src[j] != "\n":
-                j += 1
-            yield ("comment", i, j)
-            i = j
-        elif c == "/" and i + 1 < n and src[i + 1] == "*":
-            depth = 1
-            j = i + 2
-            while j < n and depth:
-                if src[j] == "/" and j + 1 < n and src[j + 1] == "*":
-                    depth += 1
-                    j += 2
-                elif src[j] == "*" and j + 1 < n and src[j + 1] == "/":
-                    depth -= 1
-                    j += 2
-                else:
-                    j += 1
-            yield ("comment", i, j)
-            i = j
-        elif c == "r" and i + 1 < n and (src[i + 1] == '"' or src[i + 1] == "#"):
-            m = re.match(r'r(#*)"', src[i:])
-            if m:
-                hashes = m.group(1)
-                start = i + len(m.group(0))
-                end = src.find('"' + hashes, start)
-                if end == -1:
-                    yield ("str", i, n)
-                    i = n
-                else:
-                    yield ("str", i, end + len(hashes) + 1)
-                    i = end + len(hashes) + 1
-            else:
-                i += 1
-        elif c == '"':
-            j = i + 1
-            while j < n:
-                if src[j] == "\\":
-                    j += 2
-                elif src[j] == '"':
-                    j += 1
-                    break
-                else:
-                    j += 1
-            yield ("str", i, j)
-            i = j
-        elif c == "'":
-            m = re.match(
-                r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|.)|[^'\\])'", src[i:]
-            )
-            if m:
-                yield ("char", i, i + len(m.group(0)))
-                i += len(m.group(0))
-            else:
-                i += 1
-        else:
-            i += 1
-
-
-def mask(src):
-    """Blank comment and string/char literal contents, keeping newlines.
-
-    The result has the same length as `src`, so byte offsets and line numbers
-    stay valid.  Braces inside literals can no longer desynchronise the
-    `#[cfg(test)]` brace matcher.
-    """
-    out = list(src)
-    for _kind, a, b in scan_spans(src):
-        for k in range(a, b):
-            if out[k] != "\n":
-                out[k] = " "
-    return "".join(out)
-
-
-def literal_content(span):
-    """The content of a string-literal span, or `None` for another kind.
-
-    `span` is the literal including its `r`/`r#` prefix and its quotes; a byte
-    or C string's leading `b`/`c` sits outside the span.
-    """
-    m = re.match(r'^r(#*)"', span)
-    if m:
-        return span[m.end() :]
-    m = re.match(r'^"', span)
-    if m:
-        return span[m.end() :]
-    return None
-
-
-def test_ranges(masked):
-    """Character ranges of every `#[cfg(test)]` item."""
-    ranges = []
-    n = len(masked)
-    for m in re.finditer(r"#\[cfg\(test\)\]", masked):
-        j = m.end()
-        while j < n and masked[j] not in "{;":
-            j += 1
-        if j >= n:
-            continue
-        if masked[j] == ";":
-            ranges.append((m.start(), j))
-            continue
-        depth = 0
-        k = j
-        while k < n:
-            if masked[k] == "{":
-                depth += 1
-            elif masked[k] == "}":
-                depth -= 1
-                if depth == 0:
-                    break
-            k += 1
-        ranges.append((m.start(), k + 1))
-    return ranges
-
-
-def in_ranges(pos, ranges):
-    return any(a <= pos < b for a, b in ranges)
-
-
 def logical(rel):
     """The path from the crate root, so fixture trees reuse the real scopes.
 
@@ -225,18 +113,6 @@ def logical(rel):
     """
     i = rel.rfind("crates/")
     return rel[i:] if i >= 0 else rel
-
-
-def line_of(offsets, pos):
-    """1-based line number for a byte offset, from a per-line offset table."""
-    lo, hi = 0, len(offsets)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if offsets[mid] <= pos:
-            lo = mid + 1
-        else:
-            hi = mid
-    return max(1, lo)
 
 
 def has_safety_note(orig, ln):
@@ -296,22 +172,18 @@ def scan_text(rel, src):
     masked = mask(src)
     ranges = test_ranges(masked)
     lines = masked.splitlines()
-    offsets = []
-    acc = 0
-    for line in lines:
-        offsets.append(acc)
-        acc += len(line) + 1
+    offsets = line_offsets(masked)
 
     def add(line_no, rule):
         code = orig[line_no - 1].strip() if 0 <= line_no - 1 < len(orig) else ""
-        findings.append((rel, line_no, rule, code))
+        findings.append(Finding(rel, line_no, rule, code))
 
     def tokens_scan(tokens, rule):
         for rx in tokens:
             for m in rx.finditer(masked):
                 if in_ranges(m.start(), ranges):
                     continue
-                add(line_of(offsets, m.start()), rule)
+                add(line_number(offsets, m.start()), rule)
 
     is_test_path = "/tests/" in log
     if not is_test_path:
@@ -327,7 +199,7 @@ def scan_text(rel, src):
                     continue
                 body = literal_content(src[a:b])
                 if body is not None and L2_STORAGE_NAME.match(body):
-                    add(line_of(offsets, a), "l2-storage-name")
+                    add(line_number(offsets, a), "l2-storage-name")
         if log.startswith("crates/compat/src/"):
             tokens_scan(L3_TOKENS, "l3-platform")
 
@@ -335,7 +207,7 @@ def scan_text(rel, src):
             for m in rx.finditer(masked):
                 if in_ranges(m.start(), ranges):
                     continue
-                ln = line_of(offsets, m.start())
+                ln = line_number(offsets, m.start())
                 if not check(orig, ln):
                     add(ln, "unsafe-no-safety-note")
 
@@ -345,7 +217,7 @@ def scan_text(rel, src):
         if in_ranges(m.start(), ranges):
             continue
         if not is_ffi_unsafe_location(log):
-            add(line_of(offsets, m.start()), "unsafe-allow-outside-ffi")
+            add(line_number(offsets, m.start()), "unsafe-allow-outside-ffi")
 
     if log.endswith("/src/lib.rs") or log == "crates/lib.rs":
         if not MISSING_DOCS.search(masked):
@@ -354,8 +226,8 @@ def scan_text(rel, src):
     return findings
 
 
-def scan(roots=None):
-    findings = []
+def scan(roots=None) -> list[Finding]:
+    findings: list[Finding] = []
     root_dirs = [CRATES] if roots is None else list(roots)
     for root in root_dirs:
         if not root.is_dir():
@@ -370,56 +242,19 @@ def scan(roots=None):
                 continue
             findings.extend(scan_text(rel, src))
 
-    seen = set()
-    unique = []
-    for rel, line, rule, code in findings:
-        key = (rel, line, rule)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append((rel, line, rule, code))
-    return unique
+    return dedupe_findings(findings)
 
 
-def normalize(text):
-    return " ".join(text.split())
-
-
-def load_allowlist():
-    """Return a list of (path, line, pattern, reason) allowlist entries."""
-    entries = []
-    if not ALLOW.exists():
-        return entries
-    for raw in ALLOW.read_text(encoding="utf-8").splitlines():
-        text = raw.strip()
-        if not text or text.startswith("#"):
-            continue
-        key, sep, reason = text.partition("\u2014")  # em dash
-        if not sep:
-            key, sep, reason = text.partition(" -- ")
-        parts = key.split(":", 2)
-        if len(parts) != 3:
-            continue
-        path, line, pattern = parts[0].strip(), parts[1].strip(), parts[2].strip()
-        try:
-            line_no = int(line)
-        except ValueError:
-            line_no = 0
-        entries.append((path, line_no, pattern, reason.strip()))
-    return entries
-
-
-def entry_matches(entry, rel, line, rule, code):
-    path, line_no, pattern, _reason = entry
-    log = logical(rel)
-    if not (fnmatch.fnmatch(log, path) or fnmatch.fnmatch(rel, path)):
+def entry_matches(entry: AllowEntry, finding: Finding) -> bool:
+    log = logical(finding.path)
+    if not (fnmatch.fnmatch(log, entry.path) or fnmatch.fnmatch(finding.path, entry.path)):
         return False
-    if pattern in RULES:
-        if pattern != rule:
+    if entry.pattern in RULES:
+        if entry.pattern != finding.rule:
             return False
-        return line_no == 0 or line_no == line
+        return entry.line == 0 or entry.line == finding.line
     # Code anchor: survives line shifts, fails closed when the code changes.
-    return normalize(pattern) in normalize(code)
+    return anchor_in(entry.pattern, finding.anchor)
 
 
 FIXTURES_CRATES = FIXTURES / "crates"
@@ -455,24 +290,15 @@ def self_test():
         print(f"ERROR: layering guard self-test fixtures missing at {FIXTURES_CRATES}")
         return 1
     findings = scan([FIXTURES_CRATES])
-    by_file = {}
-    for rel, line, rule, code in findings:
-        by_file.setdefault(rel, []).append((line, rule, code))
-    problems = []
-    for fixture, rule in BAD_FIXTURES.items():
-        rel = str((FIXTURES / fixture).relative_to(ROOT))
-        rules = {r for _line, r, _code in by_file.get(rel, [])}
-        if rule not in rules:
-            problems.append(f"{rel}: expected a `{rule}` finding, matched none")
-    for rel in GOOD_FIXTURES:
-        for line, rule, code in by_file.get(rel, []):
-            problems.append(f"{rel}:{line}: unexpected `{rule}` finding: {code}")
+    expectations = tuple(
+        FixtureRules(str((FIXTURES / fixture).relative_to(ROOT)), (rule,))
+        for fixture, rule in BAD_FIXTURES.items()
+    )
+    problems = fixture_problems(findings, expectations)
+    problems += clean_fixture_problems(findings, GOOD_FIXTURES)
     elapsed = (time.perf_counter() - start) * 1000.0
     if problems:
-        print("ERROR: layering guard self-test failed:")
-        for problem in problems:
-            print(f"  {problem}")
-        print("  Fix the rule that stopped matching; do not silence the self-test.")
+        report_self_test_failure("ERROR: layering guard self-test failed", problems)
         return 1
     print(
         "layering guard: self-test ok "
@@ -482,48 +308,35 @@ def self_test():
     return 0
 
 
-def main():
+def main(argv=None):
+    args = set(argv or [])
     selftest = self_test()
     if selftest != 0:
         return selftest
-    if "--self-test" in ARGS:
+    if "--self-test" in args:
         return 0
 
     start = time.perf_counter()
     findings = scan()
     elapsed = time.perf_counter() - start
 
-    if PRINT_ALL:
-        for rel, line, rule, code in findings:
-            print(f"{rel}:{line}:{rule}: {code}")
-        print(f"\n{len(findings)} finding(s) total (allowlist not applied)")
+    if "--print-all" in args:
+        print_all_findings(findings)
         return 0
 
-    allow = load_allowlist()
-    unallowed = []
-    used = [False] * len(allow)
-    for rel, line, rule, code in findings:
-        hit = False
-        for i, entry in enumerate(allow):
-            if entry_matches(entry, rel, line, rule, code):
-                used[i] = True
-                hit = True
-        if not hit:
-            unallowed.append((rel, line, rule, code))
+    allow = load_path_line_allowlist(ALLOW, line_default=0)
+    unallowed, used = filter_findings(findings, allow, entry_matches)
 
-    for rel, line, rule, code in unallowed:
-        print(f"ERROR: layer/unsafe violation [{rule}] {rel}:{line}: {code}")
+    for finding in unallowed:
+        print(
+            f"ERROR: layer/unsafe violation [{finding.rule}] "
+            f"{finding.path}:{finding.line}: {finding.anchor}"
+        )
 
-    stale = [
-        f"{allow[i][0]}:{allow[i][1]}:{allow[i][2]}"
-        for i in range(len(allow))
-        if not used[i]
-    ]
-    if stale:
-        print("")
-        print(f"note: {len(stale)} allowlist entr(y/ies) no longer match (stale):")
-        for key in sorted(stale):
-            print(f"  {key}")
+    stale = stale_keys(
+        allow, used, lambda entry: f"{entry.path}:{entry.line}:{entry.pattern}"
+    )
+    print_stale(stale)
 
     if unallowed:
         print("")
@@ -545,13 +358,5 @@ def main():
     return 0
 
 
-def run(argv=None):
-    """Run the check. ``argv`` carries the check-specific flags."""
-    global ARGS, PRINT_ALL
-    ARGS = set(argv or [])
-    PRINT_ALL = "--print-all" in ARGS
-    return main()
-
-
 if __name__ == "__main__":
-    sys.exit(run(sys.argv[1:]))
+    sys.exit(main(sys.argv[1:]))

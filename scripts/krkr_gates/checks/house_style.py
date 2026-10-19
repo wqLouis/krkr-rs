@@ -12,154 +12,44 @@ the gate catches new citations while the old ones burn down in batches.  The
 ``clippy-allow`` rule has no exemptions in either file.
 """
 
-import bisect
 import json
 import re
 import sys
 from collections import Counter
 
 from ..common import ALLOWLISTS_DIR, FIXTURES_DIR, REPO_ROOT
+from ..framework import (
+    AllowEntry,
+    FixtureRules,
+    Finding,
+    IDENT_RE,
+    anchor_in,
+    dedupe_findings,
+    filter_findings,
+    fixture_problems,
+    group_findings,
+    in_ranges,
+    line_number,
+    line_offsets,
+    load_path_line_allowlist,
+    mask,
+    print_all_findings,
+    print_stale,
+    report_self_test_failure,
+    scan_spans,
+    stale_keys,
+    test_ranges,
+    tokenize,
+)
 
 ROOT = REPO_ROOT
 ALLOW = ALLOWLISTS_DIR / "house_style_allow.txt"
 BASELINE = ALLOWLISTS_DIR / "house_style_baseline.txt"
-ARGS: set[str] = set()
-PRINT_ALL = False
 
 CRATES = ROOT / "crates"
 FIXTURES = FIXTURES_DIR / "house_style"
 BAD_FIXTURE = "scripts/fixtures/house_style/bad_style.rs"
 GOOD_FIXTURE = "scripts/fixtures/house_style/good_style.rs"
-
-
-def scan_spans(src):
-    """Yield (kind, start, end) for comment and string/char literal spans.
-
-    `kind` is "comment", "str" or "char".  The spans are byte offsets into
-    `src`; a span keeps its newlines so positions stay valid.  A regex alone
-    would treat `// pub use …` or a `"&String"` string as code.
-    """
-    n = len(src)
-    i = 0
-    while i < n:
-        c = src[i]
-        if c == "/" and i + 1 < n and src[i + 1] == "/":
-            j = i + 2
-            while j < n and src[j] != "\n":
-                j += 1
-            yield ("comment", i, j)
-            i = j
-        elif c == "/" and i + 1 < n and src[i + 1] == "*":
-            depth = 1
-            j = i + 2
-            while j < n and depth:
-                if src[j] == "/" and j + 1 < n and src[j + 1] == "*":
-                    depth += 1
-                    j += 2
-                elif src[j] == "*" and j + 1 < n and src[j + 1] == "/":
-                    depth -= 1
-                    j += 2
-                else:
-                    j += 1
-            yield ("comment", i, j)
-            i = j
-        elif c == "r" and i + 1 < n and (src[i + 1] == '"' or src[i + 1] == "#"):
-            m = re.match(r'r(#*)"', src[i:])
-            if m:
-                hashes = m.group(1)
-                start = i + len(m.group(0))
-                end = src.find('"' + hashes, start)
-                if end == -1:
-                    yield ("str", i, n)
-                    i = n
-                else:
-                    yield ("str", i, end + len(hashes) + 1)
-                    i = end + len(hashes) + 1
-            else:
-                i += 1
-        elif c == '"':
-            j = i + 1
-            while j < n:
-                if src[j] == "\\":
-                    j += 2
-                elif src[j] == '"':
-                    j += 1
-                    break
-                else:
-                    j += 1
-            yield ("str", i, j)
-            i = j
-        elif c == "'":
-            m = re.match(
-                r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|.)|[^'\\])'", src[i:]
-            )
-            if m:
-                yield ("char", i, i + len(m.group(0)))
-                i += len(m.group(0))
-            else:
-                i += 1
-        else:
-            i += 1
-
-
-def mask(src):
-    """Blank comment and literal contents, keeping length and newlines.
-
-    The result has the same length as `src`, so byte offsets and line numbers
-    stay valid, and braces inside literals can no longer desynchronise the
-    `#[cfg(test)]` brace matcher.
-    """
-    out = list(src)
-    for _kind, a, b in scan_spans(src):
-        for k in range(a, b):
-            if out[k] != "\n":
-                out[k] = " "
-    return "".join(out)
-
-
-def test_ranges(masked):
-    """Character ranges of every `#[cfg(test)]` item."""
-    ranges = []
-    n = len(masked)
-    for m in re.finditer(r"#\[cfg\(test\)\]", masked):
-        j = m.end()
-        while j < n and masked[j] not in "{;":
-            j += 1
-        if j >= n:
-            continue
-        if masked[j] == ";":
-            ranges.append((m.start(), j))
-            continue
-        depth = 0
-        k = j
-        while k < n:
-            if masked[k] == "{":
-                depth += 1
-            elif masked[k] == "}":
-                depth -= 1
-                if depth == 0:
-                    break
-            k += 1
-        ranges.append((m.start(), k + 1))
-    return ranges
-
-
-def in_ranges(pos, ranges):
-    return any(a <= pos < b for a, b in ranges)
-
-
-TOKEN_RE = re.compile(
-    r"[A-Za-z_][A-Za-z0-9_]*"
-    r"|0[xX][0-9a-fA-F_]+"
-    r"|\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?"
-    r"|::|->|=>|\.\.=?|\|\||&&|==|!=|<=|>=|<<=|>>=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<|>>"
-    r"|[+\-*/%&|^!~<>=?.,;:()\[\]{}@#']"
-)
-IDENT_RE = re.compile(r"^[A-Za-z_]\w*$")
-
-
-def tokenize(text):
-    return [(m.group(0), m.start()) for m in TOKEN_RE.finditer(text)]
 
 
 def find_fns(tokens):
@@ -358,17 +248,12 @@ def scan_file(rel, src):
     ranges = test_ranges(masked)
     spans = list(scan_spans(src))
     lines = masked.splitlines()
-    offsets = []
-    acc = 0
-    for line in lines:
-        offsets.append(acc)
-        acc += len(line) + 1
+    offsets = line_offsets(masked)
 
     def add(pos, rule):
-        ln = bisect.bisect_right(offsets, pos)
-        ln = max(1, min(ln, len(orig)))
+        ln = min(line_number(offsets, pos), len(orig))
         code = orig[ln - 1].strip() if ln - 1 < len(orig) else ""
-        findings.append((rel, ln, rule, code))
+        findings.append(Finding(rel, ln, rule, code))
 
     # A clippy allowance is a finding in every Rust file, tests included, and
     # it is never allowlisted; run it before the test-code early return.
@@ -442,7 +327,7 @@ def scan_file(rel, src):
 
 
 def scan(roots=None):
-    findings = []
+    findings: list[Finding] = []
     root_dirs = [CRATES] if roots is None else list(roots)
     for root in root_dirs:
         if not root.is_dir():
@@ -457,15 +342,7 @@ def scan(roots=None):
                 continue
             findings.extend(scan_file(rel, src))
 
-    seen = set()
-    unique = []
-    for rel, line, rule, code in findings:
-        key = (rel, line, rule)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append((rel, line, rule, code))
-    return unique
+    return dedupe_findings(findings)
 
 
 RULES = {
@@ -481,42 +358,13 @@ RULES = {
 SELF_TEST_BAD_RULES = tuple(sorted(RULES))
 
 
-def normalize(text):
-    return " ".join(text.split())
-
-
-def load_allowlist():
-    """Return a list of (path, line, pattern, reason) allowlist entries."""
-    entries = []
-    if not ALLOW.exists():
-        return entries
-    for raw in ALLOW.read_text(encoding="utf-8").splitlines():
-        text = raw.strip()
-        if not text or text.startswith("#"):
-            continue
-        key, sep, reason = text.partition("\u2014")  # em dash
-        if not sep:
-            key, sep, reason = text.partition(" -- ")
-        parts = key.split(":", 2)
-        if len(parts) != 3:
-            continue
-        path, line, pattern = parts[0].strip(), parts[1].strip(), parts[2].strip()
-        try:
-            line_no = int(line)
-        except ValueError:
-            line_no = -1
-        entries.append((path, line_no, pattern, reason.strip()))
-    return entries
-
-
-def entry_matches_raw(entry, rel, line, rule, code):
-    path, line_no, pattern, _reason = entry
-    if path != rel:
+def entry_matches_raw(entry: AllowEntry, finding: Finding) -> bool:
+    if entry.path != finding.path:
         return False
-    if pattern in RULES:
-        return pattern == rule and line_no == line
+    if entry.pattern in RULES:
+        return entry.pattern == finding.rule and entry.line == finding.line
     # Code anchor: survives line shifts, fails closed when the code changes.
-    return normalize(pattern) in normalize(code)
+    return anchor_in(entry.pattern, finding.anchor)
 
 
 def load_baseline():
@@ -547,7 +395,7 @@ def load_baseline():
     return entries
 
 
-def baseline_matches(entry, rel, line, rule, code):
+def baseline_matches(entry, finding: Finding) -> bool:
     """Whether a legacy-comment baseline entry suppresses a finding.
 
     A baseline entry names one rule and one normalized comment line, so it can
@@ -555,20 +403,24 @@ def baseline_matches(entry, rel, line, rule, code):
     ``clippy-allow`` rule is never baselined.
     """
     path, entry_rule, anchor, _reason = entry
-    if rule == "clippy-allow":
+    if finding.rule == "clippy-allow":
         return False
-    return entry_rule == rule and path == rel and normalize(anchor) in normalize(code)
+    return (
+        entry_rule == finding.rule
+        and path == finding.path
+        and anchor_in(anchor, finding.anchor)
+    )
 
 
-def entry_matches(entry, rel, line, rule, code):
+def entry_matches(entry: AllowEntry, finding: Finding) -> bool:
     """Whether an allowlist entry suppresses a finding.
 
     The ``clippy-allow`` rule has no exemptions: a clippy lint is fixed or the
     code is written differently, never grandfathered.
     """
-    if rule == "clippy-allow":
+    if finding.rule == "clippy-allow":
         return False
-    return entry_matches_raw(entry, rel, line, rule, code)
+    return entry_matches_raw(entry, finding)
 
 
 def crate_of(rel):
@@ -583,11 +435,11 @@ def crate_of(rel):
 
 def print_summary(findings):
     """Print the per-rule and per-crate counts of a finding list."""
-    rules = Counter(rule for _rel, _line, rule, _code in findings)
-    crates = Counter(crate_of(rel) for rel, _line, _rule, _code in findings)
+    rules = Counter(finding.rule for finding in findings)
+    crates = Counter(crate_of(finding.path) for finding in findings)
     files = {}
-    for rel, _line, _rule, _code in findings:
-        files.setdefault(crate_of(rel), set()).add(rel)
+    for finding in findings:
+        files.setdefault(crate_of(finding.path), set()).add(finding.path)
     print("")
     print("summary by rule:")
     for rule, count in sorted(rules.items()):
@@ -607,57 +459,47 @@ def self_test():
         print(f"ERROR: guard self-test fixtures missing at {FIXTURES}")
         return 1
     findings = scan([FIXTURES])
-    by_file = {}
-    for rel, line, rule, code in findings:
-        by_file.setdefault(rel, []).append((line, rule, code))
-    bad_rules = {rule for _line, rule, _code in by_file.get(BAD_FIXTURE, [])}
-    good = by_file.get(GOOD_FIXTURE, [])
-    problems = []
-    for rule in SELF_TEST_BAD_RULES:
-        if rule not in bad_rules:
-            problems.append(f"{BAD_FIXTURE}: expected a `{rule}` finding, matched none")
-    for line, rule, code in good:
-        problems.append(f"{GOOD_FIXTURE}:{line}: unexpected `{rule}` finding: {code}")
+    by_path = group_findings(findings)
+    problems = fixture_problems(
+        findings,
+        (FixtureRules(BAD_FIXTURE, SELF_TEST_BAD_RULES, (GOOD_FIXTURE,)),),
+    )
     if problems:
-        print("ERROR: guard self-test failed:")
-        for problem in problems:
-            print(f"  {problem}")
-        print("  Fix the rule that stopped matching; do not silence the self-test.")
+        report_self_test_failure("ERROR: guard self-test failed", problems)
         return 1
     print(
         "house-style guard: self-test ok "
         f"({len(SELF_TEST_BAD_RULES)} rules flagged the bad fixture, "
-        f"{len(by_file.get(GOOD_FIXTURE, []))} finding(s) in the good fixture)"
+        f"{len(by_path.get(GOOD_FIXTURE, []))} finding(s) in the good fixture)"
     )
     return 0
 
 
-def main():
+def main(argv=None):
+    args = set(argv or [])
     selftest = self_test()
     if selftest != 0:
         return selftest
-    if "--self-test" in ARGS:
+    if "--self-test" in args:
         return 0
     findings = scan()
-    if PRINT_ALL:
-        for rel, line, rule, code in findings:
-            print(f"{rel}:{line}:{rule}: {code}")
-        print(f"\n{len(findings)} finding(s) total (allowlist not applied)")
+    if "--print-all" in args:
+        print_all_findings(findings)
         print_summary(findings)
         return 0
 
-    allow = load_allowlist()
+    allow = load_path_line_allowlist(ALLOW)
     baseline = load_baseline()
 
     # A clippy allowance is a hard finding: neither the reviewed allowlist nor
     # the legacy baseline may suppress it, whether an entry names the rule or
     # anchors the offending line.
-    clippy_sites = [f for f in findings if f[2] == "clippy-allow"]
+    clippy_sites = [f for f in findings if f.rule == "clippy-allow"]
     clippy_entries = [
-        f"{entry[0]}:{entry[1]}:{entry[2]}"
+        f"{entry.path}:{entry.line}:{entry.pattern}"
         for entry in allow
-        if entry[2] == "clippy-allow"
-        or any(entry_matches_raw(entry, *site) for site in clippy_sites)
+        if entry.pattern == "clippy-allow"
+        or any(entry_matches_raw(entry, site) for site in clippy_sites)
     ]
     clippy_baseline = [
         f"{entry[0]}:{entry[1]}:{entry[2]}"
@@ -673,65 +515,41 @@ def main():
         )
         return 1
 
-    unallowed = []
-    used = [False] * len(allow)
-    for rel, line, rule, code in findings:
-        hit = False
-        for i, entry in enumerate(allow):
-            if entry_matches(entry, rel, line, rule, code):
-                used[i] = True
-                hit = True
-        if not hit:
-            unallowed.append((rel, line, rule, code))
+    unallowed, used = filter_findings(findings, allow, entry_matches)
 
     # Legacy comments are baselined separately from the reviewed allowlist: a
     # baselined finding is not a failure, and a stale baseline entry is a note.
-    baselined = 0
-    used_baseline = [False] * len(baseline)
-    remaining = []
-    for rel, line, rule, code in unallowed:
-        hit = False
-        for i, entry in enumerate(baseline):
-            if baseline_matches(entry, rel, line, rule, code):
-                used_baseline[i] = True
-                hit = True
-        if hit:
-            baselined += 1
-        else:
-            remaining.append((rel, line, rule, code))
+    remaining, used_baseline = filter_findings(
+        unallowed, baseline, baseline_matches
+    )
+    baselined = len(unallowed) - len(remaining)
     unallowed = remaining
 
-    for rel, line, rule, code in unallowed:
-        print(f"ERROR: house-style violation [{rule}] {rel}:{line}: {code}")
+    for finding in unallowed:
+        print(
+            f"ERROR: house-style violation [{finding.rule}] "
+            f"{finding.path}:{finding.line}: {finding.anchor}"
+        )
 
     if unallowed:
         print_summary(unallowed)
 
-    stale = [
-        f"{allow[i][0]}:{allow[i][1]}:{allow[i][2]}"
-        for i in range(len(allow))
-        if not used[i]
-    ]
-    if stale:
-        print("")
-        print(f"note: {len(stale)} allowlist entr(y/ies) no longer match (stale):")
-        for key in sorted(stale):
-            print(f"  {key}")
+    stale = stale_keys(
+        allow, used, lambda entry: f"{entry.path}:{entry.line}:{entry.pattern}"
+    )
+    print_stale(stale)
 
-    stale_baseline = [
-        f"{baseline[i][0]}:{baseline[i][1]}"
-        for i in range(len(baseline))
-        if not used_baseline[i]
-    ]
-    if stale_baseline:
-        print("")
-        print(
+    stale_baseline = stale_keys(
+        baseline, used_baseline, lambda entry: f"{entry[0]}:{entry[1]}"
+    )
+    print_stale(
+        stale_baseline,
+        note=(
             f"note: {len(stale_baseline)} baseline entr(y/ies) no longer match "
             "(legacy comment rewritten; remove from "
             f"{BASELINE.relative_to(ROOT)}):"
-        )
-        for key in sorted(stale_baseline):
-            print(f"  {key}")
+        ),
+    )
 
     if unallowed:
         print("")
@@ -755,13 +573,5 @@ def main():
     return 0
 
 
-def run(argv=None):
-    """Run the check. ``argv`` carries the check-specific flags."""
-    global ARGS, PRINT_ALL
-    ARGS = set(argv or [])
-    PRINT_ALL = "--print-all" in ARGS
-    return main()
-
-
 if __name__ == "__main__":
-    sys.exit(run(sys.argv[1:]))
+    sys.exit(main(sys.argv[1:]))

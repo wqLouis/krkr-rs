@@ -50,7 +50,16 @@ import sys
 from pathlib import Path
 
 from ..common import ALLOWLISTS_DIR, FIXTURES_DIR, REPO_ROOT
-from .error_handling import mask
+from ..framework import (
+    filter_findings,
+    find_block,
+    mask,
+    match_delimiter,
+    print_all_findings,
+    print_stale,
+    read_allowlist_entries,
+    stale_keys,
+)
 
 ROOT = REPO_ROOT
 NATIVES = ROOT / "crates" / "compat" / "src" / "natives"
@@ -90,35 +99,15 @@ _IDENT_CALL = re.compile(r"\b([a-z_][A-Za-z0-9_]*)\s*\(")
 SAFE_KINDS = {"ObjThisMethodDef", "InstanceMethodDef"}
 
 
-def _find_block(text: str, open_brace: int) -> tuple[int, int]:
-    """Return the ``(start, end)`` body offsets for the block at ``open_brace``."""
-    depth = 1
-    i = open_brace + 1
-    while i < len(text) and depth:
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-        i += 1
-    return open_brace + 1, i - 1
-
-
 def _signature_end(text: str, fn_match: re.Match) -> int | None:
     """Return the offset of a function body's ``{``, or ``None``."""
     open_paren = text.find("(", fn_match.end() - 1)
     if open_paren == -1:
         return None
-    depth = 0
-    i = open_paren
-    while i < len(text):
-        if text[i] == "(":
-            depth += 1
-        elif text[i] == ")":
-            depth -= 1
-            if depth == 0:
-                break
-        i += 1
-    brace = text.find("{", i)
+    close = match_delimiter(text, open_paren, "(", ")")
+    if close < 0:
+        return None
+    brace = text.find("{", close)
     return brace if brace != -1 else None
 
 
@@ -127,18 +116,11 @@ def _parameter_names(text: str, fn_match: re.Match) -> set[str]:
     open_paren = text.find("(", fn_match.end() - 1)
     if open_paren == -1:
         return set()
-    depth = 0
-    i = open_paren
-    while i < len(text):
-        if text[i] == "(":
-            depth += 1
-        elif text[i] == ")":
-            depth -= 1
-            if depth == 0:
-                break
-        i += 1
+    close = match_delimiter(text, open_paren, "(", ")")
+    if close < 0:
+        return set()
     names: set[str] = set()
-    for part in text[open_paren + 1 : i].split(","):
+    for part in text[open_paren + 1 : close].split(","):
         part = re.sub(r"^\s*mut\s+", "", part.strip())
         name = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", part)
         if name:
@@ -153,7 +135,10 @@ def _definitions(masked: str):
         brace = _signature_end(masked, fn_match)
         if brace is None:
             continue
-        start, end = _find_block(masked, brace)
+        span = find_block(masked, brace)
+        if span is None:
+            continue
+        start, end = span
         definitions.setdefault(fn_match.group(1), []).append(
             (start, end, _parameter_names(masked, fn_match))
         )
@@ -219,7 +204,10 @@ def _scan_source(path: Path, rel: str, reach: set[str]) -> list[dict[str, object
     masked = mask(raw)
     findings: list[dict[str, object]] = []
     for def_match in _DEF.finditer(masked):
-        start, end = _find_block(masked, def_match.end() - 1)
+        span = find_block(masked, def_match.end() - 1)
+        if span is None:
+            continue
+        start, end = span
         member = re.search(r'\bname\s*:\s*"([^"]+)"', raw[start:end])
         function = re.search(r"\bf\s*:\s*(\w+)", masked[start:end])
         if member is None or function is None:
@@ -272,17 +260,9 @@ def scan(roots=None) -> list[dict[str, object]]:
 def load_allowlist() -> list[tuple[str, str, str]]:
     """Return ``(path, member, reason)`` allowlist entries."""
     entries: list[tuple[str, str, str]] = []
-    if not ALLOW.exists():
-        return entries
-    for raw in ALLOW.read_text(encoding="utf-8").splitlines():
-        text = raw.strip()
-        if not text or text.startswith("#"):
-            continue
-        key, sep, reason = text.partition("—")
-        if not sep:
-            key, sep, reason = text.partition(" -- ")
+    for key, reason in read_allowlist_entries(ALLOW):
         path, _, member = key.rpartition(":")
-        entries.append((path.strip(), member.strip(), reason.strip()))
+        entries.append((path.strip(), member.strip(), reason))
     return entries
 
 
@@ -337,26 +317,19 @@ def main(argv: list[str] | None = None) -> int:
 
     findings = scan()
     if args.print_all:
-        for finding in findings:
-            print(
+        print_all_findings(
+            findings,
+            lambda finding: (
                 f"{finding['file']}:{finding['line']}:{RULE}: "
                 f"{finding['kind']} {finding['member']} -> {finding['func']}"
-            )
-        print(f"\n{len(findings)} finding(s) total (allowlist not applied)")
+            ),
+        )
         return 0
 
     allow = load_allowlist()
-    used = [False] * len(allow)
-    unallowed: list[dict[str, object]] = []
-    for finding in findings:
-        matched = False
-        for i, entry in enumerate(allow):
-            if entry_matches(entry, finding):
-                used[i] = True
-                matched = True
-                break
-        if not matched:
-            unallowed.append(finding)
+    unallowed, used = filter_findings(
+        findings, allow, entry_matches, first_match=True
+    )
 
     for finding in unallowed:
         print(
@@ -364,16 +337,8 @@ def main(argv: list[str] | None = None) -> int:
             f"{finding['file']}:{finding['line']}: "
             f"{finding['kind']} {finding['member']} -> {finding['func']}"
         )
-    stale = [
-        f"{allow[i][0]}:{allow[i][1]}"
-        for i in range(len(allow))
-        if not used[i]
-    ]
-    if stale:
-        print("")
-        print(f"note: {len(stale)} allowlist entr(y/ies) no longer match (stale):")
-        for key in sorted(stale):
-            print(f"  {key}")
+    stale = stale_keys(allow, used, lambda entry: f"{entry[0]}:{entry[1]}")
+    print_stale(stale)
 
     if unallowed:
         print("")
@@ -394,10 +359,5 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def run(argv=None):
-    """Run the check. ``argv`` carries the check-specific flags."""
-    return main(argv)
-
-
 if __name__ == "__main__":
-    sys.exit(run(sys.argv[1:]))
+    sys.exit(main(sys.argv[1:]))

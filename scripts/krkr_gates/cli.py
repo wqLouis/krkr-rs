@@ -42,21 +42,21 @@ from .common import REPO_ROOT
 # Check subcommands that run without a compiler. ``android-target`` shells out
 # to ``cargo tree`` (not a build); the rest are pure file scans.
 CHECKS: dict[str, Callable[[list[str]], int]] = {
-    "stateless": stateless.run,
-    "error-handling": error_handling.run,
-    "house-style": house_style.run,
-    "layering": layering.run,
-    "storage-boundary": storage_boundary.run,
-    "native-construction": native_construction.run,
-    "lifecycle-order": lifecycle_order.run,
-    "storage-media": storage_media.run,
-    "callback-objthis": callback_objthis.run,
-    "native-arity": native_arity.run,
-    "host-facts": host_facts.run,
-    "android-target": android_target.run,
-    "surface-lock": surface_lock.run,
-    "native-parity": native_parity.run,
-    "plugin-parity": plugin_parity.run,
+    "stateless": stateless.main,
+    "error-handling": error_handling.main,
+    "house-style": house_style.main,
+    "layering": layering.main,
+    "storage-boundary": storage_boundary.main,
+    "native-construction": native_construction.main,
+    "lifecycle-order": lifecycle_order.main,
+    "storage-media": storage_media.main,
+    "callback-objthis": callback_objthis.main,
+    "native-arity": native_arity.main,
+    "host-facts": host_facts.main,
+    "android-target": android_target.main,
+    "surface-lock": surface_lock.main,
+    "native-parity": native_parity.main,
+    "plugin-parity": plugin_parity.main,
 }
 
 # The gate sequence in the AGENTS §0 order. Each step is
@@ -269,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
     if command == "test":
         return run_tests(quiet=quiet)
     if command == "extract-xp3":
-        return extract_xp3.run(rest)
+        return extract_xp3.main(rest)
     if command in CHECKS:
         return run_one(command, rest, quiet=quiet)
 

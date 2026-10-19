@@ -101,10 +101,5 @@ def main(args):
     return 0
 
 
-def run(argv=None):
-    """Run the extractor. ``argv`` is ``<archive> <name> [--lines A:B]``."""
-    return main(list(argv or []))
-
-
 if __name__ == "__main__":
-    sys.exit(run(sys.argv[1:]))
+    sys.exit(main(sys.argv[1:]))

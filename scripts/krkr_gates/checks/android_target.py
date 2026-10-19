@@ -226,10 +226,5 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def run(argv=None):
-    """Run the check. ``argv`` carries the check-specific flags."""
-    return main(argv)
-
-
 if __name__ == "__main__":
-    raise SystemExit(run(sys.argv[1:]))
+    raise SystemExit(main(sys.argv[1:]))

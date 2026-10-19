@@ -67,11 +67,26 @@ import re
 import sys
 
 from ..common import ALLOWLISTS_DIR, FIXTURES_DIR, REPO_ROOT
-from .host_facts import blank_cfg_test, strip_rust
+from ..framework import (
+    blank_cfg_test,
+    load_keyed_allowlist,
+    match_delimiter,
+    strip_rust,
+    write_keyed_allowlist,
+)
 
 ROOT = REPO_ROOT
 ALLOWLIST = ALLOWLISTS_DIR / "storage_boundary_allow.txt"
 FIXTURES = FIXTURES_DIR / "storage_boundary"
+ALLOWLIST_HEADER = (
+    "# Storage-boundary allowlist: script names that reach L2 or the host\n"
+    "# without a direct strip_file_media route, reviewed as safe.\n"
+    "# One entry per line: <file> :: <function> :: <call> -- reason\n"
+    "# Regenerate after review with:\n"
+    "#   uv run --project scripts krkr-gate storage-boundary --update-allow\n"
+    "# The checker fails when an unstripped call is not listed here.\n"
+    "\n"
+)
 
 # A call is a boundary site when this identifier is the receiver.
 _STORAGE_RECEIVERS = {"storage", "store", "pointer", "ptr"}
@@ -111,22 +126,6 @@ def _line_of(text: str, offset: int) -> int:
     return text.count("\n", 0, offset) + 1
 
 
-def _match_delimiter(text: str, open_idx: int, opener: str, closer: str) -> int:
-    depth = 0
-    i = open_idx
-    n = len(text)
-    while i < n:
-        c = text[i]
-        if c == opener:
-            depth += 1
-        elif c == closer:
-            depth -= 1
-            if depth == 0:
-                return i
-        i += 1
-    return -1
-
-
 def _split_top_level(text: str) -> list[str]:
     parts: list[str] = []
     start = 0
@@ -155,7 +154,7 @@ def _parse_functions(scrubbed: str):
         popen = scrubbed.find("(", match.end())
         if popen < 0:
             continue
-        pclose = _match_delimiter(scrubbed, popen, "(", ")")
+        pclose = match_delimiter(scrubbed, popen, "(", ")")
         if pclose < 0:
             continue
         j = pclose + 1
@@ -169,7 +168,7 @@ def _parse_functions(scrubbed: str):
             j += 1
         if brace < 0:
             continue
-        bclose = _match_delimiter(scrubbed, brace, "{", "}")
+        bclose = match_delimiter(scrubbed, brace, "{", "}")
         if bclose < 0:
             continue
         functions.append((name, scrubbed[popen + 1 : pclose], brace + 1, bclose))
@@ -371,7 +370,7 @@ def scan(root: pathlib.Path) -> list[dict[str, str]]:
             )
 
         def argument_at(open_idx: int, index: int = 0) -> str:
-            close = _match_delimiter(scrubbed, open_idx, "(", ")")
+            close = match_delimiter(scrubbed, open_idx, "(", ")")
             if close < 0:
                 return ""
             parts = _split_top_level(raw[open_idx + 1 : close])
@@ -430,38 +429,6 @@ def scan(root: pathlib.Path) -> list[dict[str, str]]:
     return findings
 
 
-def read_allowlist(path: pathlib.Path) -> dict[str, str]:
-    entries: dict[str, str] = {}
-    if not path.is_file():
-        return entries
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        reason = ""
-        if "--" in line:
-            line, reason = line.split("--", 1)
-            reason = reason.strip()
-        entries[line.strip()] = reason
-    return entries
-
-
-def write_allowlist(path: pathlib.Path, keys: list[str], reasons: dict[str, str]) -> None:
-    lines = [
-        "# Storage-boundary allowlist: script names that reach L2 or the host",
-        "# without a direct strip_file_media route, reviewed as safe.",
-        "# One entry per line: <file> :: <function> :: <call> -- reason",
-        "# Regenerate after review with:",
-        "#   uv run --project scripts krkr-gate storage-boundary --update-allow",
-        "# The checker fails when an unstripped call is not listed here.",
-        "",
-    ]
-    for key in sorted(keys):
-        reason = reasons.get(key, "")
-        lines.append(f"{key} -- {reason}" if reason else key)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
 def self_test(verbose: bool = True) -> int:
     tree = FIXTURES / "tree"
     expected_path = FIXTURES / "expected.json"
@@ -508,8 +475,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.update_allow:
         findings = scan(ROOT)
-        write_allowlist(
-            ALLOWLIST, [f["key"] for f in findings], read_allowlist(ALLOWLIST)
+        write_keyed_allowlist(
+            ALLOWLIST,
+            ALLOWLIST_HEADER,
+            [f["key"] for f in findings],
+            load_keyed_allowlist(ALLOWLIST, ("--",)),
         )
         print(
             f"check-storage-boundary: allowlist updated — {len(findings)} finding(s) "
@@ -518,7 +488,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     findings = scan(ROOT)
-    allowed = read_allowlist(ALLOWLIST)
+    allowed = load_keyed_allowlist(ALLOWLIST, ("--",))
     new = [f for f in findings if f["key"] not in allowed]
     stale = [key for key in allowed if key not in {f["key"] for f in findings}]
 
@@ -555,10 +525,5 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def run(argv=None):
-    """Run the check. ``argv`` carries the check-specific flags."""
-    return main(argv)
-
-
 if __name__ == "__main__":
-    sys.exit(run(sys.argv[1:]))
+    sys.exit(main(sys.argv[1:]))

@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..common import ALLOWLISTS_DIR, FIXTURES_DIR, REPO_ROOT
+from ..framework import match_delimiter, read_allowlist_entries
 from . import native_parity as parity
 
 ROOT = REPO_ROOT
@@ -112,19 +113,8 @@ class Finding:
 
 def _match_pair(src: str, open_pos: int, open_ch: str, close_ch: str) -> int:
     """Return the index just past the ``close_ch`` matching ``open_ch``."""
-    depth = 0
-    i = open_pos
-    n = len(src)
-    while i < n:
-        c = src[i]
-        if c == open_ch:
-            depth += 1
-        elif c == close_ch:
-            depth -= 1
-            if depth == 0:
-                return i + 1
-        i += 1
-    return n
+    close = match_delimiter(src, open_pos, open_ch, close_ch)
+    return len(src) if close < 0 else close + 1
 
 
 def _cpp_class_spans(src: str) -> list[tuple[int, int, str]]:
@@ -362,17 +352,9 @@ def evaluate() -> tuple[list[Finding], list[tuple[ReferenceMethod, str]]]:
 def load_allowlist() -> list[tuple[str, str, str]]:
     """Return ``(class, member, reason)`` allowlist entries."""
     entries: list[tuple[str, str, str]] = []
-    if not ALLOW.exists():
-        return entries
-    for raw in ALLOW.read_text(encoding="utf-8").splitlines():
-        text = raw.strip()
-        if not text or text.startswith("#"):
-            continue
-        key, sep, reason = text.partition("—")
-        if not sep:
-            key, sep, reason = text.partition(" -- ")
+    for key, reason in read_allowlist_entries(ALLOW):
         cls, _, member = key.rpartition(".")
-        entries.append((cls.strip(), member.strip(), reason.strip()))
+        entries.append((cls.strip(), member.strip(), reason))
     return entries
 
 
@@ -513,10 +495,5 @@ def main(argv: "list[str] | None" = None) -> int:
     return 0
 
 
-def run(argv=None):
-    """Run the check. ``argv`` carries the check-specific flags."""
-    return main(argv)
-
-
 if __name__ == "__main__":
-    sys.exit(run(sys.argv[1:]))
+    sys.exit(main(sys.argv[1:]))

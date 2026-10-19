@@ -12,12 +12,30 @@ import re
 import sys
 
 from ..common import ALLOWLISTS_DIR, FIXTURES_DIR, REPO_ROOT
+from ..framework import (
+    AllowEntry,
+    FixtureRules,
+    Finding,
+    anchor_in,
+    blank_ranges,
+    dedupe_findings,
+    filter_findings,
+    fixture_problems,
+    group_findings,
+    in_ranges,
+    line_number,
+    load_path_line_allowlist,
+    mask,
+    print_all_findings,
+    print_stale,
+    report_self_test_failure,
+    stale_keys,
+    test_ranges,
+    tokenize,
+)
 
 ROOT = REPO_ROOT
 ALLOW = ALLOWLISTS_DIR / "error_handling_allow.txt"
-ARGS: set[str] = set()
-PRINT_ALL = False
-
 CRATES = ROOT / "crates"
 # The one documented `#[allow(dead_code)]` exception (testing helper).
 DEAD_CODE_EXCEPTION = "crates/compat/tests/common/mod.rs"
@@ -83,13 +101,6 @@ HIDDEN_HANDLE = re.compile(r'\bname\s*:\s*"__handle"')
 #
 # The tokenizer splits the masked source; operators are single tokens so `==`
 # and `=` cannot be confused.
-TOKEN_RE = re.compile(
-    r"[A-Za-z_][A-Za-z0-9_]*"
-    r"|0[xX][0-9a-fA-F_]+"
-    r"|\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?"
-    r"|::|->|=>|\.\.=?|\|\||&&|==|!=|<=|>=|<<=|>>=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<|>>"
-    r"|[+\-*/%&|^!~<>=?.,;:()\[\]{}@#']"
-)
 # `x as *const T` / `x as *mut T`.
 PTR_CAST = re.compile(r"\bas\s*\*\s*(?:const|mut)\b")
 # Expressions that yield a pointer or a raw address.
@@ -127,115 +138,6 @@ LET_SKIP = {
 } | INTEGER_TYPES
 
 
-def mask(src):
-    """Blank comments and string/char literal *contents*, keeping newlines.
-
-    The result has the same length as `src`, so byte offsets and line numbers
-    stay valid.  Braces inside literals can no longer desynchronise the
-    `#[cfg(test)]` brace matcher.
-    """
-    out = list(src)
-    n = len(src)
-    i = 0
-
-    def blank(a, b):
-        for k in range(a, b):
-            if out[k] != "\n":
-                out[k] = " "
-
-    while i < n:
-        c = src[i]
-        if c == "/" and i + 1 < n and src[i + 1] == "/":
-            j = i + 2
-            while j < n and src[j] != "\n":
-                j += 1
-            blank(i, j)
-            i = j
-        elif c == "/" and i + 1 < n and src[i + 1] == "*":
-            depth = 1
-            j = i + 2
-            while j < n and depth:
-                if src[j] == "/" and j + 1 < n and src[j + 1] == "*":
-                    depth += 1
-                    j += 2
-                elif src[j] == "*" and j + 1 < n and src[j + 1] == "/":
-                    depth -= 1
-                    j += 2
-                else:
-                    j += 1
-            blank(i, j)
-            i = j
-        elif c == "r" and i + 1 < n and (src[i + 1] == '"' or src[i + 1] == "#"):
-            m = re.match(r'r(#*)"', src[i:])
-            if m:
-                hashes = m.group(1)
-                start = i + len(m.group(0))
-                end = src.find('"' + hashes, start)
-                if end == -1:
-                    blank(i, n)
-                    i = n
-                else:
-                    blank(i, end + len(hashes) + 1)
-                    i = end + len(hashes) + 1
-                continue
-            i += 1
-        elif c == '"':
-            j = i + 1
-            while j < n:
-                if src[j] == "\\":
-                    j += 2
-                elif src[j] == '"':
-                    j += 1
-                    break
-                else:
-                    j += 1
-            blank(i, j)
-            i = j
-        elif c == "'":
-            m = re.match(
-                r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|.)|[^'\\])'", src[i:]
-            )
-            if m:
-                blank(i, i + len(m.group(0)))
-                i += len(m.group(0))
-            else:
-                i += 1
-        else:
-            i += 1
-    return "".join(out)
-
-
-def test_ranges(masked):
-    """Character ranges of every `#[cfg(test)]` item."""
-    ranges = []
-    n = len(masked)
-    for m in re.finditer(r"#\[cfg\(test\)\]", masked):
-        j = m.end()
-        while j < n and masked[j] not in "{;":
-            j += 1
-        if j >= n:
-            continue
-        if masked[j] == ";":
-            ranges.append((m.start(), j))
-            continue
-        depth = 0
-        k = j
-        while k < n:
-            if masked[k] == "{":
-                depth += 1
-            elif masked[k] == "}":
-                depth -= 1
-                if depth == 0:
-                    break
-            k += 1
-        ranges.append((m.start(), k + 1))
-    return ranges
-
-
-def in_ranges(pos, ranges):
-    return any(a <= pos < b for a, b in ranges)
-
-
 def stmt_prefix(text, pos):
     """The expression text from the last statement boundary before `pos`.
 
@@ -250,20 +152,6 @@ def stmt_prefix(text, pos):
     return text[lo + 1 : pos]
 
 
-def _blank_ranges(masked, ranges):
-    """Blank `#[cfg(test)]` items but keep newlines, so braces stay balanced."""
-    chars = list(masked)
-    for a, b in ranges:
-        for k in range(a, min(b, len(chars))):
-            if chars[k] != "\n":
-                chars[k] = " "
-    return "".join(chars)
-
-
-def _tokenize(text):
-    return [(m.group(0), m.start()) for m in TOKEN_RE.finditer(text)]
-
-
 def collect_ptr_funcs(masked, ranges):
     """Names of functions whose return is pointer-derived.
 
@@ -272,8 +160,8 @@ def collect_ptr_funcs(masked, ranges):
     a `pixel_buffer` accessor, `instance as`, ...).  Over-reports by design;
     a missed pointer flow is worse than a reviewed exception.
     """
-    text = _blank_ranges(masked, ranges)
-    toks = _tokenize(text)
+    text = blank_ranges(masked, ranges)
+    toks = tokenize(text)
     funcs = set()
     n = len(toks)
     i = 0
@@ -586,18 +474,15 @@ def _generic_open(toks, i):
 
 def scan_pointer_flow(rel, masked, offsets, ranges, ptr_funcs, orig):
     """The flow-sensitive pointer rules; see the rule list in the header."""
-    import bisect
-
     findings = []
-    text = _blank_ranges(masked, ranges)
-    toks = _tokenize(text)
+    text = blank_ranges(masked, ranges)
+    toks = tokenize(text)
     n = len(toks)
     if not n:
         return findings
 
     def add(pos, rule):
-        ln = bisect.bisect_right(offsets, pos)
-        ln = max(1, min(ln, len(orig)))
+        ln = min(line_number(offsets, pos), len(orig))
         code = orig[ln - 1].strip() if ln - 1 < len(orig) else ""
         findings.append((rel, ln, rule, code))
 
@@ -854,10 +739,8 @@ def scan_error_swallow(rel, masked, offsets, ranges, orig):
     the §4 "drops the error variant" shape.  The arm body and an attached
     `reference/cpp/**` citation decide whether it is a reviewed mapping.
     """
-    import bisect
-
-    text = _blank_ranges(masked, ranges)
-    toks = _tokenize(text)
+    text = blank_ranges(masked, ranges)
+    toks = tokenize(text)
     findings = []
     n = len(toks)
     i = 0
@@ -905,13 +788,10 @@ def scan_error_swallow(rel, masked, offsets, ranges, orig):
             if m < n and toks[m][0] == "{":
                 body = _brace_body(toks, m)
         if body is not None and not _arm_raises(body):
-            ln = max(1, min(bisect.bisect_right(offsets, pos), len(orig)))
+            ln = min(line_number(offsets, pos), len(orig))
             end_ln = ln
             if body:
-                end_ln = max(
-                    1,
-                    min(bisect.bisect_right(offsets, body[-1][1]), len(orig)),
-                )
+                end_ln = min(line_number(offsets, body[-1][1]), len(orig))
             window = "\n".join(orig[max(0, ln - 1 - CITATION_WINDOW) : end_ln])
             if "reference/cpp/" not in window:
                 code = orig[ln - 1].strip() if ln - 1 < len(orig) else ""
@@ -953,7 +833,7 @@ def scan(roots=None):
         for idx, line in enumerate(masked.splitlines()):
             if DEAD_CODE.search(line) and rel != DEAD_CODE_EXCEPTION:
                 code = orig[idx].strip() if idx < len(orig) else ""
-                findings.append((rel, idx + 1, "allow-dead-code", code))
+                findings.append(Finding(rel, idx + 1, "allow-dead-code", code))
 
         if "/tests/" in rel or rel.endswith("build.rs"):
             continue
@@ -968,7 +848,7 @@ def scan(roots=None):
         def add(line_no, rule, _masked_code):
             # Report the real source line; detection used the masked copy.
             code = orig[line_no - 1].strip() if line_no - 1 < len(orig) else ""
-            findings.append((rel, line_no, rule, code))
+            findings.append(Finding(rel, line_no, rule, code))
 
         for idx, line in enumerate(lines):
             if not line.strip():
@@ -1017,22 +897,16 @@ def scan(roots=None):
             if NON_EXHAUSTIVE.search(line) and rel.startswith("crates/compat/"):
                 add(idx + 1, "non-exhaustive", stripped)
 
-        findings.extend(
-            scan_pointer_flow(rel, masked, offsets, ranges, ptr_funcs, orig)
-        )
-        findings.extend(
-            scan_error_swallow(rel, masked, offsets, ranges, orig)
-        )
+        for rel_path, ln, rule, code in scan_pointer_flow(
+            rel, masked, offsets, ranges, ptr_funcs, orig
+        ):
+            findings.append(Finding(rel_path, ln, rule, code))
+        for rel_path, ln, rule, code in scan_error_swallow(
+            rel, masked, offsets, ranges, orig
+        ):
+            findings.append(Finding(rel_path, ln, rule, code))
 
-    seen = set()
-    unique = []
-    for rel, line, rule, code in findings:
-        key = (rel, line, rule)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append((rel, line, rule, code))
-    return unique
+    return dedupe_findings(findings)
 
 
 RULES = {
@@ -1053,42 +927,13 @@ RULES = {
 }
 
 
-def normalize(text):
-    return " ".join(text.split())
-
-
-def load_allowlist():
-    """Return a list of (path, line, pattern, reason) allowlist entries."""
-    entries = []
-    if not ALLOW.exists():
-        return entries
-    for raw in ALLOW.read_text(encoding="utf-8").splitlines():
-        text = raw.strip()
-        if not text or text.startswith("#"):
-            continue
-        key, sep, reason = text.partition("\u2014")  # em dash
-        if not sep:
-            key, sep, reason = text.partition(" -- ")
-        parts = key.split(":", 2)
-        if len(parts) != 3:
-            continue
-        path, line, pattern = parts[0].strip(), parts[1].strip(), parts[2].strip()
-        try:
-            line_no = int(line)
-        except ValueError:
-            line_no = -1
-        entries.append((path, line_no, pattern, reason.strip()))
-    return entries
-
-
-def entry_matches(entry, rel, line, rule, code):
-    path, line_no, pattern, _reason = entry
-    if path != rel:
+def entry_matches(entry: AllowEntry, finding: Finding) -> bool:
+    if entry.path != finding.path:
         return False
-    if pattern in RULES:
-        return pattern == rule and line_no == line
+    if entry.pattern in RULES:
+        return entry.pattern == finding.rule and entry.line == finding.line
     # Code anchor: survives line shifts, fails closed when the code changes.
-    return normalize(pattern) in normalize(code)
+    return anchor_in(entry.pattern, finding.anchor)
 
 
 FIXTURES = FIXTURES_DIR / "guard"
@@ -1107,14 +952,14 @@ SELF_TEST_BAD_RULES = (
     "char-signedness",
     "addr-narrow",
 )
-# Each (bad, good, required) group: the bad fixture must trip every `required`
-# rule and the good fixture must trip nothing at all.
+# Each group: the bad fixture must trip every `rules` entry and the good
+# fixture must trip nothing at all.
 SELF_TEST_GROUPS = (
-    (BAD_FIXTURE, GOOD_FIXTURE, SELF_TEST_BAD_RULES),
-    (
+    FixtureRules(BAD_FIXTURE, SELF_TEST_BAD_RULES, (GOOD_FIXTURE,)),
+    FixtureRules(
         "scripts/fixtures/guard/bad_error_swallow.rs",
-        "scripts/fixtures/guard/good_error_swallow.rs",
         ("error-swallow",),
+        ("scripts/fixtures/guard/good_error_swallow.rs",),
     ),
 )
 
@@ -1130,31 +975,14 @@ def self_test():
         print(f"ERROR: guard self-test fixtures missing at {FIXTURES}")
         return 1
     findings = scan([FIXTURES])
-    by_file = {}
-    for rel, line, rule, code in findings:
-        by_file.setdefault(rel, []).append((line, rule, code))
-    problems = []
-    required_total = 0
-    good_total = 0
-    for bad_fixture, good_fixture, required in SELF_TEST_GROUPS:
-        bad_rules = {rule for _line, rule, _code in by_file.get(bad_fixture, [])}
-        for rule in required:
-            required_total += 1
-            if rule not in bad_rules:
-                problems.append(
-                    f"{bad_fixture}: expected a `{rule}` finding, matched none"
-                )
-        good = by_file.get(good_fixture, [])
-        good_total += len(good)
-        for line, rule, code in good:
-            problems.append(
-                f"{good_fixture}:{line}: unexpected `{rule}` finding: {code}"
-            )
+    problems = fixture_problems(findings, SELF_TEST_GROUPS)
+    by_path = group_findings(findings)
+    required_total = sum(len(group.rules) for group in SELF_TEST_GROUPS)
+    good_total = sum(
+        len(by_path.get(good, [])) for group in SELF_TEST_GROUPS for good in group.good
+    )
     if problems:
-        print("ERROR: guard self-test failed:")
-        for problem in problems:
-            print(f"  {problem}")
-        print("  Fix the rule that stopped matching; do not silence the self-test.")
+        report_self_test_failure("ERROR: guard self-test failed", problems)
         return 1
     print(
         "error-handling guard: self-test ok "
@@ -1164,44 +992,31 @@ def self_test():
     return 0
 
 
-def main():
+def main(argv=None):
+    args = set(argv or [])
     selftest = self_test()
     if selftest != 0:
         return selftest
-    if "--self-test" in ARGS:
+    if "--self-test" in args:
         return 0
     findings = scan()
-    if PRINT_ALL:
-        for rel, line, rule, code in findings:
-            print(f"{rel}:{line}:{rule}: {code}")
-        print(f"\n{len(findings)} finding(s) total (allowlist not applied)")
+    if "--print-all" in args:
+        print_all_findings(findings)
         return 0
 
-    allow = load_allowlist()
-    unallowed = []
-    used = [False] * len(allow)
-    for rel, line, rule, code in findings:
-        hit = False
-        for i, entry in enumerate(allow):
-            if entry_matches(entry, rel, line, rule, code):
-                used[i] = True
-                hit = True
-        if not hit:
-            unallowed.append((rel, line, rule, code))
+    allow = load_path_line_allowlist(ALLOW)
+    unallowed, used = filter_findings(findings, allow, entry_matches)
 
-    for rel, line, rule, code in unallowed:
-        print(f"ERROR: fallback/absence violation [{rule}] {rel}:{line}: {code}")
+    for finding in unallowed:
+        print(
+            f"ERROR: fallback/absence violation [{finding.rule}] "
+            f"{finding.path}:{finding.line}: {finding.anchor}"
+        )
 
-    stale = [
-        f"{allow[i][0]}:{allow[i][1]}:{allow[i][2]}"
-        for i in range(len(allow))
-        if not used[i]
-    ]
-    if stale:
-        print("")
-        print(f"note: {len(stale)} allowlist entr(y/ies) no longer match (stale):")
-        for key in sorted(stale):
-            print(f"  {key}")
+    stale = stale_keys(
+        allow, used, lambda entry: f"{entry.path}:{entry.line}:{entry.pattern}"
+    )
+    print_stale(stale)
 
     if unallowed:
         print("")
@@ -1223,13 +1038,5 @@ def main():
     return 0
 
 
-def run(argv=None):
-    """Run the check. ``argv`` carries the check-specific flags."""
-    global ARGS, PRINT_ALL
-    ARGS = set(argv or [])
-    PRINT_ALL = "--print-all" in ARGS
-    return main()
-
-
 if __name__ == "__main__":
-    sys.exit(run(sys.argv[1:]))
+    sys.exit(main(sys.argv[1:]))
