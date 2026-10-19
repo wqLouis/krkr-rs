@@ -1,31 +1,30 @@
 //! In-place CPU pixel operations on the layer system's [`BitmapState`]s (the
 //! `LayerExDraw` / `layerExImage` surface).
 //!
-//! The scene stores straight-alpha RGBA8 (`r, g, b, a` per pixel), which is
-//! the same pixel model [`crate::raster::blend_pixel`] uses. The reference's
-//! software bitmap is 32-bit ARGB in the opposite channel order; every
-//! function here is the reference math with the channels mapped into RGBA.
+//! The scene stores straight-alpha RGBA8 (`r, g, b, a` per pixel), the same
+//! pixel model [`crate::raster::blend_pixel`] uses; these operations run on
+//! those straight-alpha channels directly.
 //!
 //! This is L2 state: the caller owns the [`Scene`]/[`BitmapState`] and every
 //! function is a free function with no hidden state.
 //!
-//! | function | reference |
+//! | function | operation |
 //! |---|---|
-//! | [`fill_color_on_alpha`] | `iTVPBaseBitmap::FillColorOnAlpha` → `BlendColor` → `TVPConstColorAlphaBlend_d` |
-//! | [`fill_color_on_add_alpha`] | `iTVPBaseBitmap::FillColorOnAddAlpha` → `TVPConstColorAlphaBlend_a` |
-//! | [`fill_color_hold_alpha`] | `iTVPBaseBitmap::FillColor` (destination alpha held) |
-//! | [`fill_mask`] | `iTVPBaseBitmap::FillMask` |
-//! | [`remove_const_opacity`] | `iTVPBaseBitmap::RemoveConstOpacity` → `TVPRemoveConstOpacity` |
-//! | [`colorize`] | `layerExImage::colorize` (`reference/cpp/plugins/.../layerExImage`) |
-//! | [`noise`] | `layerExImage::noise` |
-//! | [`blit_copy`] | `iTVPBaseBitmap::CopyRect` |
-//! | [`tile_rect`] | SDK `Layer.tileRect` (a `copyRect` loop) |
-//! | [`do_drop_shadow`] / [`do_blur_light`] | SDK `Layer.doDropShadow` / `doBlurLight` |
-//! | [`fill_operate_rect`] | SDK `Layer.fillOperateRect` (a tiled `operateRect`) |
+//! | [`fill_color_on_alpha`] | source-over a constant color, considering the destination alpha |
+//! | [`fill_color_on_add_alpha`] | additive-alpha (premultiplied) fill |
+//! | [`fill_color_hold_alpha`] | set RGB to a constant color, holding the destination alpha |
+//! | [`fill_mask`] | replace the alpha channel with a constant |
+//! | [`remove_const_opacity`] | scale the alpha by `1 - level / 255` |
+//! | [`colorize`] | reblend hue and saturation, preserving lightness |
+//! | [`noise`] | add uniform per-channel noise, holding alpha |
+//! | [`blit_copy`] | copy a source region over the destination |
+//! | [`tile_rect`] | tile a source bitmap over a rectangle with a phase |
+//! | [`do_drop_shadow`] / [`do_blur_light`] | blur a copy, then composite it as a shadow / light pass |
+//! | [`fill_operate_rect`] | fill a rectangle with a solid color through a blend mode |
 //!
-//! `colorize` / `noise` operate on the layer's current `ClipRect` (the
-//! reference `layerExImage::reset` rebases its buffer on the clip), so the
-//! callers pass the already-clipped region.
+//! `colorize` / `noise` operate on the layer's current `ClipRect` (the effect
+//! rebases its buffer on the clip), so the callers pass the already-clipped
+//! region.
 
 use api::blend::{BlendMode, DstBlend};
 
@@ -47,7 +46,7 @@ pub struct BlitSource<'a> {
 /// The blend state shared by the blit operations.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BlitOptions {
-    /// `tTVPBlendOperationMode` value; ignored by [`blit_over`], which always
+    /// Numeric blend-operation mode; ignored by [`blit_over`], which always
     /// composites source-over.
     pub mode: i64,
     /// Source opacity, `0..=255`.
@@ -72,11 +71,11 @@ pub struct AffineBlit {
     pub clear_color: [u8; 4],
 }
 
-/// `TVP_BB_COPY_MAIN` (`LayerBitmapIntf.h:127`): copy the RGB plane only
-/// (the reference `CopyColor` render method; the destination alpha is held).
+/// `TVP_BB_COPY_MAIN`: copy the RGB plane only, holding the destination alpha
+/// (the `CopyColor` operation).
 pub const COPY_MAIN: u8 = 1;
-/// `TVP_BB_COPY_MASK` (`LayerBitmapIntf.h:128`): copy the alpha plane only
-/// (the reference `CopyMask` render method; the destination RGB is held).
+/// `TVP_BB_COPY_MASK`: copy the alpha plane only, holding the destination RGB
+/// (the `CopyMask` operation).
 pub const COPY_MASK: u8 = 2;
 
 /// Intersect `rect` with the bitmap's bounds, returning `None` when empty.
@@ -110,16 +109,15 @@ pub fn clip_rect(clip: Option<Rect>) -> RectI {
     }
 }
 
-/// `TVPOpacityOnOpacityTable` value. `dopa` is the destination alpha, `opa`
-/// the source opacity. Port of `TVPCreateTable` (`tvpgl.cpp`): the effective
-/// color-blend factor for a source-over composite. A fully transparent
+/// The effective color-blend factor for a source-over composite. `dopa` is the
+/// destination alpha, `opa` the source opacity. A fully transparent
 /// destination collapses to `255` (the source color is written unattenuated).
 fn opacity_on_opacity(dopa: u8, opa: u8) -> u8 {
     if dopa == 0 {
         return 255;
     }
-    // The reference computes this with `float` (see `TVPCreateTable`); the
-    // operation order is reproduced so the truncation matches.
+    // Computed with `f32` in this operation order so the final truncation is
+    // reproducible.
     let at = f32::from(dopa) / 255.0;
     let bt = f32::from(opa) / 255.0;
     let c = bt / at;
@@ -161,7 +159,7 @@ fn dim_i32(v: u32) -> i32 {
 }
 
 /// `FillColorOnAlpha`: source-over a constant color that **considers the
-/// destination alpha**, exactly like `TVPConstColorAlphaBlend_d`.
+/// destination alpha**.
 ///
 /// `color` is straight RGBA. `opa` semantics follow `ColorRect`:
 /// * `opa <= 0` does nothing,
@@ -202,16 +200,15 @@ pub fn fill_color_on_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 4]
     bitmap.mark_dirty();
 }
 
-/// Saturating per-channel addition of packed 8-bit values, a port of
-/// `TVPSaturatedAdd` (`tvpgl.h`).
+/// Saturating per-channel addition of packed 8-bit values (four lanes packed
+/// into `a`/`b`), without carry propagation between lanes.
 fn saturated_add(a: u32, b: u32) -> u32 {
     let tmp = ((a & b) + (((a ^ b) >> 1) & 0x7f7f_7f7f)) & 0x8080_8080;
     let tmp = (tmp << 1) - (tmp >> 7);
     (a + b - tmp) | tmp
 }
 
-/// `TVPConstColorAlphaBlend_a` (`FillColorOnAddAlpha`): additive-alpha
-/// (premultiplied) fill.
+/// `FillColorOnAddAlpha`: additive-alpha (premultiplied) fill.
 pub fn fill_color_on_add_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 4], opa: i32) {
     if opa <= 0 {
         return;
@@ -220,8 +217,7 @@ pub fn fill_color_on_add_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8
         return;
     };
     let opa = opa.min(255) as u32;
-    // `TVPMulColor(color & 0xffffff, opa)`: scale each RGB channel by
-    // `(channel * opa) >> 8`.
+    // Scale each RGB channel by `(channel * opa) >> 8`.
     let src = (((color[0] as u32 * opa) >> 8) << 16)
         | (((color[1] as u32 * opa) >> 8) << 8)
         | ((color[2] as u32 * opa) >> 8);
@@ -255,9 +251,9 @@ pub fn fill_color_on_add_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8
     bitmap.mark_dirty();
 }
 
-/// `iTVPBaseBitmap::FillColor`: set the RGB to `color` while **holding the
-/// destination alpha**. `opa` 0 does nothing; `255` replaces RGB; otherwise
-/// `TVPConstColorAlphaBlend_c` blends `(d * (255 - opa) + s * opa) >> 8`.
+/// `FillColor`: set the RGB to `color` while **holding the destination
+/// alpha**. `opa` 0 does nothing; `255` replaces RGB; otherwise the channels
+/// blend as `(d * (255 - opa) + s * opa) >> 8`.
 pub fn fill_color_hold_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 4], opa: i32) {
     if opa <= 0 {
         return;
@@ -286,8 +282,8 @@ pub fn fill_color_hold_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 
     bitmap.mark_dirty();
 }
 
-/// `iTVPBaseBitmap::FillMask`: replace the alpha channel with `value`,
-/// holding the RGB. In this engine the alpha channel *is* the mask plane.
+/// `FillMask`: replace the alpha channel with `value`, holding the RGB. In
+/// this engine the alpha channel *is* the mask plane.
 pub fn fill_mask(bitmap: &mut BitmapState, rect: RectI, value: u8) {
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
@@ -303,8 +299,8 @@ pub fn fill_mask(bitmap: &mut BitmapState, rect: RectI, value: u8) {
 }
 
 /// `RemoveConstOpacity`: multiply the alpha by `1 - level / 255`
-/// (`TVPRemoveConstOpacity` uses `(alpha * (255 - level)) >> 8`). `level <= 0`
-/// does nothing, `level >= 255` clears the alpha.
+/// (`(alpha * (255 - level)) >> 8`). `level <= 0` does nothing, `level >= 255`
+/// clears the alpha.
 pub fn remove_const_opacity(bitmap: &mut BitmapState, rect: RectI, level: i32) {
     if level <= 0 {
         return;
@@ -429,10 +425,9 @@ pub fn colorize(bitmap: &mut BitmapState, rect: RectI, hue: i32, sat: i32, blend
     bitmap.mark_dirty();
 }
 
-/// A tiny deterministic xorshift PRNG. The reference `noise` uses the C
-/// library `rand()`; this port takes an explicit seed from the caller (L2
-/// owns the state) so the function keeps no hidden state while a single call
-/// stays reproducible for a given seed.
+/// A tiny deterministic xorshift PRNG. The caller supplies the seed and owns
+/// the state, so a single call stays reproducible for a given seed and the
+/// function keeps no hidden state.
 struct NoiseRng(u32);
 impl NoiseRng {
     fn next_f32(&mut self) -> f32 {
@@ -458,9 +453,9 @@ fn mix64(mut x: u64) -> u32 {
 /// `layerExImage::noise(level)` — add `±level/2` uniform noise to each RGB
 /// channel, holding alpha. Operates in place on the clipped region.
 ///
-/// `seed` replaces the reference's process-wide `rand()` state (this port
-/// keeps no globals): the caller, which owns the state, passes a fresh value
-/// per call. The same `seed` reproduces the same noise.
+/// `seed` drives the generator instead of process-wide random state: the
+/// caller, which owns the state, passes a fresh value per call. The same
+/// `seed` reproduces the same noise.
 pub fn noise(bitmap: &mut BitmapState, rect: RectI, level: i32, seed: u64) {
     if level <= 0 {
         return;
@@ -536,11 +531,10 @@ pub fn blit_copy_clipped(
     dst.mark_dirty();
 }
 
-/// `tTVPBaseBitmap::Blt` source-over (`bmAlpha`/`bmAlphaOnAlpha`): composite
-/// `src[src_rect]` onto `dst` at `(dx, dy)`, clipping the destination both to
-/// the bitmap and to the layer's `clip` rect. Each pixel is blended with the
-/// straight-alpha source-over math ([`blend_pixel`]); `opa` scales the source
-/// alpha (the reference `Blt` opacity).
+/// `Blt` source-over: composite `src[src_rect]` onto `dst` at `(dx, dy)`,
+/// clipping the destination both to the bitmap and to the layer's `clip`
+/// rect. Each pixel is blended with the straight-alpha source-over math
+/// ([`blend_pixel`]); `opa` scales the source alpha.
 ///
 /// This is the pixel work behind `Layer.copyRect` and, with a different
 /// `mode`, `operateRect`.
@@ -587,9 +581,9 @@ pub fn blit_over(
                 // opaque image; the constant `opa` supplies the coverage.
                 color[3] = 255;
             }
-            // The reference `Blt(..., holdAlpha)` suppresses the write to the
-            // destination alpha channel entirely; capture it first so the
-            // composite math still sees the real destination alpha.
+            // `holdAlpha` suppresses the write to the destination alpha
+            // channel entirely; capture it first so the composite math still
+            // sees the real destination alpha.
             let old_alpha = read_pixel(dst, x, y)[3];
             blend_pixel(dst, x, y, color, 255, opa);
             if hold_alpha {
@@ -602,15 +596,15 @@ pub fn blit_over(
     dst.mark_dirty();
 }
 
-/// `iTVPBaseBitmap::CopyRect` with an explicit `plane` selection
-/// (`TVP_BB_COPY_MAIN` / `TVP_BB_COPY_MASK`), the primitive behind
-/// `tTJSNI_BaseLayer::CopyRect` (`LayerIntf.cpp:4574`).
+/// `CopyRect` with an explicit `plane` selection (`TVP_BB_COPY_MAIN` /
+/// `TVP_BB_COPY_MASK`), the primitive behind `Layer.copyRect`.
 ///
 /// * `COPY_MAIN` — `CopyColor`: destination RGB = source RGB, destination
 ///   alpha held.
 /// * `COPY_MASK` — `CopyMask`: destination alpha = source alpha, destination
 ///   RGB held.
-/// * `COPY_MAIN | COPY_MASK` — `Copy`: source-over alpha blend.
+/// * `COPY_MAIN | COPY_MASK` — `Copy`: straight copy of the source rect,
+///   including its alpha.
 pub fn blit_plane(
     dst: &mut BitmapState,
     dx: i32,
@@ -621,13 +615,12 @@ pub fn blit_plane(
     plane: u8,
 ) {
     if plane & (COPY_MAIN | COPY_MASK) == (COPY_MAIN | COPY_MASK) {
-        // Reference `Copy` is `tTVPRenderMethod_DirectCopy`
-        // (`RenderManager.cpp:1359`): a straight copy of the source rect over
-        // the dest (RGB *and* alpha), transparent source pixels included —
-        // NOT a source-over blend. Games rely on this to make old pixels
-        // vanish when they redraw over existing content (e.g.
-        // `system/album.tjs::drawCompleteNumber` redraws the percentage
-        // digits over the previous frame; a blend leaves the old strokes).
+        // `Copy` writes the source rect straight over the destination (RGB
+        // *and* alpha), transparent source pixels included — NOT a source-over
+        // blend. Games rely on this to make old pixels vanish when they redraw
+        // over existing content (e.g. `system/album.tjs::drawCompleteNumber`
+        // redraws the percentage digits over the previous frame; a blend
+        // leaves the old strokes).
         let sw = src_rect.2.saturating_sub(src_rect.0);
         let sh = src_rect.3.saturating_sub(src_rect.1);
         if sw <= 0 || sh <= 0 || src.width == 0 || src.height == 0 {
@@ -854,10 +847,10 @@ pub fn do_drop_shadow(
     }
     // `original` supplies the top layer and the shadow's alpha source;
     // `shadow` is the recoloured, blurred buffer. `bitmap` itself is the work
-    // buffer, so only two full-buffer copies are made (the old code made
-    // three).
+    // buffer, so only two full-buffer copies are made.
     let original = bitmap.clone();
-    // Shadow = original alpha, RGB replaced by the shadow color, then blurred.
+    // The shadow buffer starts from the alpha of `bitmap`, with RGB set to the
+    // shadow color, and is then blurred.
     let mut shadow = bitmap.clone();
     for chunk in shadow.rgba.chunks_exact_mut(4) {
         chunk[0] = shadow_color[0];
@@ -888,7 +881,7 @@ pub fn do_blur_light(
     let mut light = bitmap.clone();
     blur_bitmap_in_place(&mut light, blur, blur);
     composite_normal(bitmap, 0, 0, &light, blur_opacity);
-    // `ltPsHardLight = 19` (see `drawable.h` / tvp-natives constants).
+    // `ltPsHardLight = 19`.
     if light_type == 19 {
         composite_hard_light(bitmap, 0, 0, &light, light_opacity);
     } else {
@@ -898,7 +891,7 @@ pub fn do_blur_light(
 }
 
 /// Fill `[left, top, left+width, top+height)` with `color` using the
-/// blend/operation `mode` (a `tTVPBlendOperationMode` value). This is the
+/// blend/operation `mode`. This is the
 /// SDK's `Layer.fillOperateRect`, which tiles a solid-color layer through
 /// `operateRect`. The common modes are real; the Photoshop-specific modes
 /// (`ltPs*`) reduce to source-over until the PS blend pipeline lands.
@@ -1058,14 +1051,13 @@ fn horizontal_box_sum(rgba: &[u8], w: usize, y: usize, rx: usize, out: &mut [[u6
     }
 }
 
-/// A local **separable running-sum box blur** over the whole bitmap (the same
-/// clamped-window kernel the reference layer effect path uses).
+/// A local **separable running-sum box blur** over the whole bitmap with a
+/// window clamped to the image edges.
 ///
-/// This is `O(w · h)` rather than the old `O(w · h · (2rx+1) · (2ry+1))`
-/// recomputation, and it reads the source in place into one scratch output
+/// This is `O(w · h)` and reads the source in place into one scratch output
 /// buffer (no full `rgba.clone()`). The two passes keep *sums* rather than
-/// averages, so the final single integer division reproduces the old result
-/// exactly, including at the clamped edges where the window is smaller.
+/// averages, so the final single integer division yields the exact box mean,
+/// including at the clamped edges where the window is smaller.
 pub fn blur_bitmap_in_place(bitmap: &mut BitmapState, xradius: u32, yradius: u32) {
     if bitmap.width == 0 || bitmap.height == 0 || (xradius == 0 && yradius == 0) {
         return;
@@ -1133,9 +1125,9 @@ pub fn blur_bitmap_in_place(bitmap: &mut BitmapState, xradius: u32, yradius: u32
 // ---------------------------------------------------------------------------
 
 /// Clamp a sample coordinate to `rect` (a half-open source region) or, when
-/// `rect` is empty, to the whole bitmap. The `stRefNoClip` stretch flag makes
-/// the reference sample outside the given rectangle, so callers pass the
-/// whole image as `rect` in that case.
+/// `rect` is empty, to the whole bitmap. The `stRefNoClip` stretch flag allows
+/// sampling outside the given rectangle, so callers pass the whole image as
+/// `rect` in that case.
 fn read_pixel_rect(bitmap: &BitmapState, rect: RectI, x: i32, y: i32) -> [u8; 4] {
     if bitmap.width == 0 || bitmap.height == 0 {
         return [0, 0, 0, 0];
@@ -1173,8 +1165,8 @@ fn cubic_kernel(t: f32) -> f32 {
 }
 
 /// Gather samples around `(fx, fy)` with a separable kernel `k` of the given
-/// `radius` (samples to each side). Out-of-range samples clamp to `rect`
-/// (the reference edge policy).
+/// `radius` (samples to each side). Out-of-range samples clamp to the edge of
+/// `rect`.
 fn sample_kernel(
     bitmap: &BitmapState,
     rect: RectI,
@@ -1257,10 +1249,10 @@ fn sample_area(
 }
 
 /// Sample the source at dest-pixel center `(x, y)` using the mapping from the
-/// destination rect onto the source rect. `stretch_type` is a
-/// `tTVPBBStretchType`: the low 16 bits select the resampler, the
-/// `stRefNoClip` (0x10000) flag lets the kernel read outside `src`. Unknown
-/// resamplers fall back to bilinear rather than throwing.
+/// destination rect onto the source rect. `stretch_type` is a numeric stretch
+/// type: the low 16 bits select the resampler, the `stRefNoClip` (0x10000)
+/// flag lets the kernel read outside `src`. Unknown resamplers fall back to
+/// bilinear rather than throwing.
 fn stretch_sample(
     bitmap: &BitmapState,
     src: RectI,
@@ -1292,7 +1284,7 @@ fn stretch_sample(
     sample_kind(bitmap, rect, fx, fy, kind)
 }
 
-/// Apply a `tTVPBBStretchType` (low 16 bits) kernel at source position
+/// Apply a numeric stretch type (low 16 bits) kernel at source position
 /// `(fx, fy)`, clamping samples to `rect`. `stAreaAvg` is handled by the
 /// caller ([`sample_area`]) because it needs the destination footprint.
 fn sample_kind(bitmap: &BitmapState, rect: RectI, fx: f32, fy: f32, kind: i64) -> [u8; 4] {
@@ -1336,8 +1328,7 @@ fn sample_kind(bitmap: &BitmapState, rect: RectI, fx: f32, fy: f32, kind: i64) -
 
 /// `StretchBlt` copy: resample `src[src_rect]` into `dst[dest]`, replacing
 /// pixels. `dest`/`src_rect` are half-open; `dest` is clipped to the bitmap.
-/// This is the `bmCopy` path of `tTJSNI_BaseLayer::StretchCopy`
-/// (`LayerIntf.cpp:4672`) — the operation behind `saveLayerImage` thumbnails.
+/// The straight-copy path is the operation behind `saveLayerImage` thumbnails.
 pub fn stretch_blit(
     dst: &mut BitmapState,
     dest: RectI,
@@ -1355,9 +1346,8 @@ pub fn stretch_blit(
     );
 }
 
-/// [`stretch_blit`] with an explicit `plane` selection, mirroring
-/// `tTVPBaseBitmap::StretchBlt`'s `holdAlpha` argument (which the reference
-/// `StretchCopy` uses to pick `bmCopy` with or without the alpha plane).
+/// [`stretch_blit`] with an explicit `plane` selection, which picks whether
+/// the copy includes the alpha plane.
 pub fn stretch_blit_plane(
     dst: &mut BitmapState,
     dest: RectI,
@@ -1396,9 +1386,8 @@ pub fn stretch_blit_plane(
     dst.mark_dirty();
 }
 
-/// `TVPDoGrayScale`: luma `(54*R + 183*G + 19*B) >> 8` in all three channels,
-/// alpha held (`tvpgl.cpp:10350-10400`; the reference's packed color is
-/// `TVP_RGBA2COLOR`, `tvpgl.h:1102-1103`, so its lowest byte is blue).
+/// Luma `(54*R + 183*G + 19*B) >> 8` written to all three channels, alpha
+/// held.
 pub fn do_gray_scale(bitmap: &mut BitmapState, rect: RectI) {
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
@@ -1417,7 +1406,7 @@ pub fn do_gray_scale(bitmap: &mut BitmapState, rect: RectI) {
     bitmap.mark_dirty();
 }
 
-/// The reference `tTVPGLGammaAdjustData` (R/G/B gamma, floor, ceil).
+/// Per-channel gamma adjustment (R/G/B gamma, floor, ceil).
 #[derive(Clone, Copy, Debug)]
 pub struct GammaAdjust {
     /// Red gamma exponent.
@@ -1441,7 +1430,7 @@ pub struct GammaAdjust {
 }
 
 impl GammaAdjust {
-    /// `TVPIntactGammaAdjustData` (identity).
+    /// The identity adjustment.
     pub fn intact() -> Self {
         Self {
             r_gamma: 1.0,
@@ -1458,8 +1447,7 @@ impl GammaAdjust {
 }
 
 fn gamma_table(gamma: f64, floor: i32, ceil: i32) -> [u8; 256] {
-    // `TVPInitGammaAdjustTempData_c` (`tvpgl.cpp:10405`): the reference uses
-    // `exp(log(i/255) * (1/gamma))`, i.e. `pow(i/255, 1/gamma)`.
+    // The ramp is `exp(log(i/255) * (1/gamma))`, i.e. `pow(i/255, 1/gamma)`.
     let ramp = (ceil - floor) as f64;
     let g = if gamma == 0.0 { f64::MAX } else { 1.0 / gamma };
     let mut table = [0u8; 256];
@@ -1471,8 +1459,8 @@ fn gamma_table(gamma: f64, floor: i32, ceil: i32) -> [u8; 256] {
     table
 }
 
-/// `TVPAdjustGamma`: per-channel gamma/level remap, only on non-fully-
-/// transparent pixels (`tvpgl.cpp:10462`).
+/// Per-channel gamma/level remap applied only to non-fully-transparent
+/// pixels.
 pub fn adjust_gamma(bitmap: &mut BitmapState, rect: RectI, data: GammaAdjust) {
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
@@ -1499,9 +1487,9 @@ pub fn adjust_gamma(bitmap: &mut BitmapState, rect: RectI, data: GammaAdjust) {
 // Tone / geometry / composite operations (the rest of the LayerExDraw surface)
 // ---------------------------------------------------------------------------
 
-/// `tTJSNI_BaseLayer::ApplyLightContrast` (`LayerIntf.cpp:1006`): brightness
-/// offset followed by a `(259*(C+255))/(255*(259-C))` contrast factor, both
-/// clamped per channel; alpha held.
+/// `ApplyLightContrast`: brightness offset followed by a
+/// `(259*(C+255))/(255*(259-C))` contrast factor, both clamped per channel;
+/// alpha held.
 pub fn light_contrast(bitmap: &mut BitmapState, rect: RectI, brightness: i32, contrast: i32) {
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
@@ -1530,9 +1518,8 @@ pub fn light_contrast(bitmap: &mut BitmapState, rect: RectI, brightness: i32, co
     bitmap.mark_dirty();
 }
 
-/// `TVPConvertAlphaToAdditiveAlpha` (`tvpgl.cpp:1190`, via `TVPMulColor`):
-/// premultiply RGB by alpha (`(c * a) >> 8`), holding alpha. Reference
-/// `tTVPBaseBitmap::ConvertAlphaToAddAlpha` (`LayerBitmapIntf.cpp:4748`).
+/// `ConvertAlphaToAddAlpha`: premultiply RGB by alpha (`(c * a) >> 8`),
+/// holding alpha.
 pub fn convert_alpha_to_add_alpha(bitmap: &mut BitmapState, rect: RectI) {
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
@@ -1550,10 +1537,8 @@ pub fn convert_alpha_to_add_alpha(bitmap: &mut BitmapState, rect: RectI) {
     bitmap.mark_dirty();
 }
 
-/// `TVPConvertAdditiveAlphaToAlpha` (`tvpgl.cpp:1143`, `TVPDivTable`):
-/// unpremultiply RGB (`min(c * 255 / a, 255)`, alpha 0 → 0), holding alpha.
-/// Reference `tTVPBaseBitmap::ConvertAddAlphaToAlpha`
-/// (`LayerBitmapIntf.cpp:4721`).
+/// `ConvertAddAlphaToAlpha`: unpremultiply RGB (`c * 255 / a` clamped to
+/// `255`; alpha 0 leaves RGB zero), holding alpha.
 pub fn convert_add_alpha_to_alpha(bitmap: &mut BitmapState, rect: RectI) {
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
@@ -1580,11 +1565,10 @@ pub fn convert_add_alpha_to_alpha(bitmap: &mut BitmapState, rect: RectI) {
     bitmap.mark_dirty();
 }
 
-/// `Copy9Patch` (`LayerBitmapIntf.cpp:1150`): scale a source bitmap into the
-/// destination using the 9-slice `margin` (left, top, right, bottom). The
-/// corners are copied 1:1, the edges are stretched along one axis and the
-/// center on both. The reference reads the margins from a `tTVPRect`, where
-/// `right`/`bottom` are *offsets from the far edge*.
+/// `Copy9Patch`: scale a source bitmap into the destination using a 9-slice
+/// `margin` (left, top, right, bottom). The corners are copied 1:1, the edges
+/// are stretched along one axis and the center on both. `right`/`bottom` are
+/// *offsets from the far edge*.
 pub fn copy_9patch(dst: &mut BitmapState, src: &BitmapState) -> Option<RectI> {
     if dst.width == 0 || dst.height == 0 || src.width < 11 || src.height < 11 {
         return None;
@@ -1594,9 +1578,8 @@ pub fn copy_9patch(dst: &mut BitmapState, src: &BitmapState) -> Option<RectI> {
     }
     let w = src.width as i32;
     let h = src.height as i32;
-    // The reference derives the margins from the alpha runs on the source's
-    // bottom row (left/right margins) and right column (top/bottom margins)
-    // (`LayerBitmapIntf.cpp:1150`).
+    // The margins come from the alpha runs on the source's bottom row
+    // (left/right margins) and right column (top/bottom margins).
     let mut ml = -1;
     let mut mr = -1;
     for x in 1..w - 1 {
@@ -1652,8 +1635,7 @@ pub fn copy_9patch(dst: &mut BitmapState, src: &BitmapState) -> Option<RectI> {
     Some((ml, mt, mr, mb))
 }
 
-/// `tTJSNI_BaseLayer::LRFlip` (`LayerIntf.cpp:5910`): mirror the whole main
-/// image horizontally.
+/// `LRFlip`: mirror the whole main image horizontally.
 pub fn flip_lr(bitmap: &mut BitmapState) {
     if bitmap.width < 2 || bitmap.height == 0 {
         return;
@@ -1671,7 +1653,7 @@ pub fn flip_lr(bitmap: &mut BitmapState) {
     bitmap.mark_dirty();
 }
 
-/// `tTJSNI_BaseLayer::UDFlip` (`LayerIntf.cpp:5925`): mirror vertically.
+/// `UDFlip`: mirror the whole main image vertically.
 pub fn flip_ud(bitmap: &mut BitmapState) {
     if bitmap.height < 2 || bitmap.width == 0 {
         return;
@@ -1690,8 +1672,7 @@ pub fn flip_ud(bitmap: &mut BitmapState) {
     bitmap.mark_dirty();
 }
 
-/// The 1-D Gaussian kernel used by the reference `generate_1d_gaussian_kernel`
-/// (`LayerIntf.cpp:5729`).
+/// The normalized 1-D Gaussian kernel of `radius` taps for the given `sigma`.
 fn gaussian_kernel(radius: i32, sigma: f32) -> Vec<f32> {
     let size = (2 * radius + 1) as usize;
     let mut kernel = vec![0.0f32; size];
@@ -1710,9 +1691,8 @@ fn gaussian_kernel(radius: i32, sigma: f32) -> Vec<f32> {
     kernel
 }
 
-/// Separable Gaussian blur over the clip region (`Layer.gaussianBlur`;
-/// reference `ApplyGaussianBlur` `LayerIntf.cpp:5745`). Pixels outside the
-/// region clamp to the edge.
+/// Separable Gaussian blur over the clip region (`Layer.gaussianBlur`).
+/// Pixels outside the region clamp to the edge.
 pub fn gaussian_blur(bitmap: &mut BitmapState, rect: RectI, radius: i32, sigma: f32) {
     if radius <= 0 || sigma <= 0.0 {
         return;
@@ -1766,10 +1746,9 @@ pub fn gaussian_blur(bitmap: &mut BitmapState, rect: RectI, radius: i32, sigma: 
     bitmap.mark_dirty();
 }
 
-/// Blend one source pixel onto `dst` using a `tTVPBlendOperationMode`
-/// (`LayerIntf.h:76`). The Photoshop modes (`omPs*`) apply their per-channel
-/// blend function and then the source alpha; the modes with no dedicated
-/// kernel reduce to source-over.
+/// Blend one source pixel onto `dst` using a numeric operation mode. The
+/// Photoshop modes (`omPs*`) apply their per-channel blend function and then
+/// the source alpha; the modes with no dedicated kernel reduce to source-over.
 pub(crate) fn blend_pixel_mode(
     dst: &mut BitmapState,
     x: i32,
@@ -1849,8 +1828,7 @@ pub(crate) fn blend_pixel_mode(
             blend_pixel(dst, x, y, blended, 255, opa);
         }
         // The Photoshop modes apply their per-channel blend function and then
-        // the source alpha, matching `TVPPS_ALPHABLEND`
-        // (`reference/cpp/core/visual/tvpgl.cpp:12522-12537`).
+        // the source alpha.
         // omPsNormal / ltPsNormal: the same alpha blend as omAlpha.
         13 => blend_pixel(dst, x, y, src, 255, opa),
         // omPsAdditive / ltPsAdditive.
@@ -1936,8 +1914,8 @@ pub(crate) fn blend_pixel_mode(
     }
 }
 
-/// `tTJSNI_BaseLayer::OperateRect` (`LayerIntf.cpp:5224`): blend a source
-/// region onto `dst` at `(dx, dy)` with `mode` and `opa`.
+/// `OperateRect`: blend a source region onto `dst` at `(dx, dy)` with `mode`
+/// and `opa`.
 pub fn operate_rect(
     dst: &mut BitmapState,
     dx: i32,
@@ -2021,9 +1999,8 @@ pub fn stretch_blit_mode(
 }
 
 /// The forward affine map of the three destination corners `p0` (src LT),
-/// `p1` (src RT), `p2` (src LB) — see `AffineBlt` (`LayerBitmapIntf.cpp:3461`).
-/// Returns `(a, b, c, d, e, f)` such that `u,v ∈ [0,1]` maps to
-/// `x = a + b*u + c*v`, `y = d + e*u + f*v`.
+/// `p1` (src RT), `p2` (src LB). Returns `(a, b, c, d, e, f)` such that
+/// `u,v ∈ [0,1]` maps to `x = a + b*u + c*v`, `y = d + e*u + f*v`.
 fn affine_forward(p0: (f64, f64), p1: (f64, f64), p2: (f64, f64)) -> [f64; 6] {
     [
         p0.0,
@@ -2130,8 +2107,8 @@ pub fn affine_blit(
             }
             let fx = src_rect.0 as f32 + (u * sw) as f32 - 0.5;
             let fy = src_rect.1 as f32 + (v * sh) as f32 - 0.5;
-            // Affine sampling clamps to the whole source image (the reference
-            // may interpolate across the source-rect border), and supports the
+            // Affine sampling clamps to the whole source image (it may
+            // interpolate across the source-rect border), and supports the
             // same resampler set as `stretch*`.
             let rect = (0, 0, src.width as i32, src.height as i32);
             let color = sample_kind(src, rect, fx, fy, stretch_type & 0xffff);
@@ -2144,7 +2121,7 @@ pub fn affine_blit(
 /// The operation-mode number [`blend_pixel_mode`] uses for the generic
 /// [`BlendMode`] stored on a layer.
 ///
-/// A `tTVPBlendOperationMode` shares the native `tTVPLayerType` numbering
+/// The operation modes share the native layer-type numbering
 /// (`omOpaque == ltOpaque == 1`, …), so each generic mode maps to the type
 /// whose behaviour it names. The subtree composite starts from the typed L2
 /// blend; the `operate*` family receives an explicit native operation mode
@@ -2183,7 +2160,7 @@ const fn blend_operation_mode(blend: BlendMode) -> i64 {
 }
 
 /// Whether `id` is a (direct or indirect) child of `ancestor` in the layer
-/// tree. Used to restrict a subtree walk to its root's descendants; a
+/// tree, so a subtree walk can be restricted to the root's descendants; a
 /// sibling window root is a separate tree.
 fn is_descendant(scene: &Scene, id: u32, ancestor: u32) -> bool {
     let mut current = id;
@@ -2201,8 +2178,7 @@ fn is_descendant(scene: &Scene, id: u32, ancestor: u32) -> bool {
 }
 
 /// Whether `layer` has at least one direct child that is itself visible with
-/// nonzero opacity — the reference `GetVisibleChildrenCount`
-/// (`LayerIntf.h:265-268`).
+/// nonzero opacity.
 fn has_visible_child(scene: &Scene, layer: &crate::scene::LayerState) -> bool {
     layer.children.iter().any(|&child| {
         scene
@@ -2333,7 +2309,8 @@ fn subtree_source_generation(scene: &Scene, root: u32) -> u64 {
 }
 
 /// One resolved draw for the subtree cache, with the layer's own placement
-/// (the reference `ImageLeft/Top/Width/Height` transform) and draw face.
+/// (the `imageLeft`/`imageTop`/`imageWidth`/`imageHeight` transform) and draw
+/// face.
 struct SubtreeDraw {
     source: BitmapState,
     dx: i32,
@@ -2376,9 +2353,9 @@ fn grayscale_bitmap(
     Some(BitmapState::new(width, height, rgba))
 }
 
-/// The image a layer draws for its `face` (`LayerIntf.h:59-67`): the main
-/// image for the ordinary faces, the alpha plane for `dfMask` (`2`) and the
-/// 8-bit province plane for `dfProvince` (`3`).
+/// The image a layer draws for its `face`: the main image for the ordinary
+/// faces, the alpha plane for `dfMask` (`2`) and the 8-bit province plane for
+/// `dfProvince` (`3`).
 fn subtree_source_image(scene: &Scene, layer: &crate::scene::LayerState) -> Option<BitmapState> {
     match layer.face {
         2 => {
@@ -2405,9 +2382,9 @@ fn subtree_source_image(scene: &Scene, layer: &crate::scene::LayerState) -> Opti
 }
 
 /// Resolve a layer's drawn region in the cache: the source region in bitmap
-/// pixels and the destination rectangle. Honors `ImageLeft/Top/Width/Height`
-/// (the layout transform), the layer rect and `ClipRect`, like the reference
-/// `Draw`/`DrawSelf` placement. `dw`/`dh` differ from the source extent only
+/// pixels and the destination rectangle. Honors the
+/// `imageLeft`/`imageTop`/`imageWidth`/`imageHeight` layout transform, the
+/// layer rect and `ClipRect`. `dw`/`dh` differ from the source extent only
 /// when the layer scales its image.
 fn subtree_placement(
     layer: &crate::scene::LayerState,
@@ -2470,8 +2447,8 @@ fn subtree_placement(
 }
 
 /// Resolve the back-to-front draws for `root` and its subtree, relative to
-/// `root`'s origin, using the same `ImageLeft/Top/Width/Height` placement the
-/// render projection applies.
+/// `root`'s origin, using the same `imageLeft`/`imageTop`/`imageWidth`/
+/// `imageHeight` placement the render projection applies.
 fn collect_subtree_draws(scene: &Scene, root: u32, w: u32, h: u32) -> Vec<SubtreeDraw> {
     let Some(root_layer) = scene.layer(root) else {
         return Vec::new();
@@ -2488,11 +2465,9 @@ fn collect_subtree_draws(scene: &Scene, root: u32, w: u32, h: u32) -> Vec<Subtre
         let Some(layer) = scene.layer(id) else {
             continue;
         };
-        // The subtree root is rendered even when it is itself invisible: the
-        // reference `InternalComplete2` draws it with `visiblecheck = false`
-        // (`LayerIntf.cpp:7558-7565`). Every other layer is skipped when it
-        // is invisible or fully transparent (the reference `IsSeen`,
-        // `LayerIntf.h:306`).
+        // The subtree root is rendered even when it is itself invisible: it is
+        // drawn without a visibility check. Every other layer is skipped when
+        // it is invisible or fully transparent.
         if id != root && !(layer.visible && layer.opacity != 0.0) {
             continue;
         }
@@ -2531,21 +2506,18 @@ fn collect_subtree_draws(scene: &Scene, root: u32, w: u32, h: u32) -> Vec<Subtre
 }
 
 /// Render `root`'s own image and the visible layers of its subtree into the
-/// layer's composited content — the reference `tTJSNI_BaseLayer::Complete`
-/// (`LayerIntf.cpp:7673-7755`). Returns the bitmap to use as the layer's
-/// rendered content, reusing it while the subtree is unchanged (the
-/// `CacheRecalcRegion.GetCount() == 0` early return, `:7734-7737`):
+/// layer's composited content. Returns the bitmap to use as the layer's
+/// rendered content, reusing it while the subtree has no pending recalc:
 ///
-/// * the layer's MainImage when the subtree is trivial: no visible direct
+/// * the layer's main image when the subtree is trivial: no visible direct
 ///   child, the image at the origin, and the image size equal to the layer
-///   rect (`LayerIntf.cpp:7718-7725`);
+///   rect;
 /// * otherwise the composited content bitmap, rebuilt only when the subtree
 ///   changed.
 ///
-/// A layer with no MainImage is not a special case: the reference fill is
-/// transparent wherever no child drew (`LayerIntf.cpp:7217-7226`), which the
-/// transparent clear reproduces. Returns `None` for an unknown layer or a
-/// content bitmap that cannot be allocated.
+/// A layer with no main image is not a special case: the fill is transparent
+/// wherever no child drew, which the transparent clear reproduces. Returns
+/// `None` for an unknown layer or a content bitmap that cannot be allocated.
 ///
 /// The content is a plain `BitmapState` in the scene: there is no hidden
 /// registry, and the caller owns its lifetime through
@@ -2566,8 +2538,8 @@ pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
         (layer.bitmap, w, h, trivial)
     };
     if trivial {
-        // `Complete` returns `MainImage` here (`LayerIntf.cpp:7718-7725`), so
-        // any content composited for an earlier, non-trivial frame is stale.
+        // The trivial path returns the main image, so any content composited
+        // for an earlier, non-trivial frame is stale.
         release_subtree_caches(scene, root);
         return bitmap;
     }
