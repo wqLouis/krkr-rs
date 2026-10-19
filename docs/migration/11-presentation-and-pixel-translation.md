@@ -1,24 +1,19 @@
 # 11 — Presentation and the pixel-translation layer
 
-Status: **implemented for the mapping.** Stage 0 (removal), the Stage 1 frame
-slice and Stage 2 (`PixelTranslation`, projection/input mapping) have landed.
-Open: the remaining Stage 1 mixer/video pumps. The render-resolution/
-supersampling idea is documented only and is not implemented. The logical
-screen is the primary layer; a script that zooms the window changes the client
-size only, and the translation fits the screen into it.
+Status: **the Fit presentation and the pixel-translation mapping are
+implemented.** The presentation-scaling feature is removed, `Engine` owns the
+frame entry point, projection and input go through `PixelTranslation`, and the
+scene is drawn at the device resolution. Open: the remaining mixer/video pumps
+in the frame hook (Phase 9), device-pixel readback and device-resolution glyph
+rasterization (§7). The render-resolution/supersampling idea is documented only
+and is not implemented. The logical screen is the primary layer; a script that
+zooms the window changes the client size only, and the translation fits the
+screen into it.
+
 This document decides how the engine maps the scene a script thinks it is
 drawing onto the framebuffer it actually draws into. It supersedes
 [`04-renderer-vulkan.md`](04-renderer-vulkan.md) §6.1 (the `ScalingMode`
 presentation feature), which is removed.
-
-It is the contract for three pieces of work, in order:
-
-1. **remove** the presentation-scaling feature currently in the tree (§4);
-2. **finish** the prerequisite — L2 owns the frame (D26, §5);
-3. **build** the pixel-translation layer (§6) and device-pixel readback (§7).
-
-The first two are prerequisites so that the third lands on the frame
-ownership and the projection seam the rest of the design already assumes.
 
 ---
 
@@ -98,31 +93,17 @@ reads them back. The translation layer is that same split for a second
 coordinate space: the composite stays on the GPU at device resolution, and the
 CPU-side pixel access is a *view* onto it (D40, §7), not a second buffer.
 
-## 4. Stage 0 — remove the current presentation-scaling feature
+## 4. The scaling feature is removed
 
-The tree carries a first attempt at scaling (the `feat(scaling)` line and its
-follow-ups). It is built the wrong way round for this design — it scales the
-*composited scene* via a whole-tree `ViewTransform` and derives the logical
-size from the framebuffer — so it is removed, not adapted. **The removal must
-not revert the unrelated fixes that landed between and after those commits.**
+The tree once carried a first attempt at scaling (the `feat(scaling)` line and
+its follow-ups). It scaled the *composited scene* through a whole-tree
+`ViewTransform` and derived the logical size from the framebuffer; it is
+removed, not adapted. `ScalingMode`, `PresentationScaling`, the `scaling`
+configuration key, `RenderScene.view`, the `--scaling` flag and
+`platform::native_size` do not exist in the tree.
 
-### 4.1 Delete
-
-| where | symbol |
-|---|---|
-| `api::config` | `PresentationScaling`; `RuntimeConfig.scaling`; `RuntimeConfigOverrides.scaling`; the `scaling` key in `ACCEPTED_KEYS`/`parse_overrides`; its tests |
-| `engine::projection` | `ScalingMode`; `Presentation`; the `view` parameter of `project_window`/`project_scene` |
-| `render::scene` | `ViewTransform` and its re-export; `RenderScene.view` |
-| `app` | `HostConfig.scaling` + `with_scaling`; `Host::{scaling, logical_size, view, design_size}`; `app::map_input_to_logical`; the presentation derivation in `Host::resize` |
-| `app::main` | the `--scaling` flag, `Cli.scaling`, the desktop `fit` default |
-| `app::runner` | `map_scaling`; `DesktopApp.scaling`; `Running::{logical_size, view}`; the presentation coupling in `apply_window_size`; `config.native_size = true` |
-| `platform` | `PlatformConfig.native_size` and the Linux monitor-size selection it drives |
-| `android` | `FIELD_SCALING`; the `scaling` argument/`OPTION_SCALING` of `config::resolve_runtime_config`; `AndroidHost.scaling`; `AndroidHost::sync_script_size`; the `map_input_to_logical` call; the entry point's `map_scaling` |
-| `android/` Kotlin app | the scaling control and its four descriptions in the Settings screen; `RuntimeSettings.kt`'s scaling constants and descriptions; the `pendingScaling` field and the `scaling` key in `settings.json` |
-| docs | `04 §6.1`; the scaling row of `runtime-config.md`; the scaling rows/sections of `android.md`; the `--scaling fit` mention in `audits/perf.md`; the scaling rows in `audits/android-jni-review.md` (annotate the audit record — it is history) |
-
-Three look-alikes are **not** part of the removal, and an over-eager subtraction
-that deletes them would break unrelated contracts:
+Three look-alikes are **not** the removed feature, and deleting them would
+break unrelated contracts:
 
 * `api::host::Presentation` — the L1 `render` outcome (suboptimal / out-of-date
   status returned by `RenderPipeline::render`), unrelated to
@@ -132,46 +113,15 @@ that deletes them would break unrelated contracts:
 * `Layer.setViewTransform` / `translateViewTransform` / `resetTransform` — GDI+
   `Matrix` methods, unrelated to the removed `ViewTransform`.
 
-`native_size` goes with it: without a scaling step, opening at the monitor
-resolution would crop the scene. Device-size windowing returns with the
-translation (§6; the exact size is open item §9.2), expressed through the
-translation instead of a platform flag. (This also removes the Wayland
-first-output refinement, which is only reachable through `native_size`.)
+The fixes that landed around the scaling commits are independent and stay:
+`render::scene::{node_spaces, place_rect}` (the shared implementation both
+backends use, exercised through an explicit `Affine2` root transform) and the
+null backend's CPU nearest-texel sampling
+(`reference/cpp/core/visual/RenderManager.cpp:2902`), which keeps the software
+correctness baseline reference-exact while the Vulkan sampler filters
+bilinearly (D34 rasterization).
 
-### 4.2 Keep
-
-These landed around the scaling commits but are independent fixes and must
-survive:
-
-* **`render::scene::{node_spaces, place_rect}`** and the single shared
-  implementation the CPU and Vulkan backends now use. The one test that
-  builds a `ViewTransform` to exercise it is rewritten against an explicit
-  `Affine2` (the root transform stays a generic pipeline capability —
-  `record_scene(..., root: &Affine2)` — with the identity passed at the live
-  path for now; §6 supplies a real root transform later).
-* **CPU point sampling**: the null backend's `sample_texture` keeps the
-  reference's nearest-texel read (`reference/cpp/core/visual/
-  RenderManager.cpp:2902`), so the software correctness baseline is unchanged.
-  The Vulkan sampler filters bilinearly so a scaled presentation is smooth
-  rather than point-scaled (D34 rasterization).
-* Everything else on `main` (debug overlay, the sampling policy, storage/media
-  fixes, the surface lock baseline). The removal is a **surgical subtraction**,
-  never a `git revert` of a range.
-
-### 4.3 Definition of done for Stage 0
-
-**Landed.** The gate is green, the surface lock and both parity reports are
-unchanged, and a headless run draws the real game at its declared size.
-
-* the gate is green; the surface lock, native parity and plugin parity are
-  unchanged (none of them names a scaling symbol);
-* a headless run and a windowed run present the scene **one-to-one** at the
-  game's declared size — the reference's own operating point;
-* `git grep -n 'ScalingMode\|PresentationScaling\|native_size' crates` is
-  empty; the only `ViewTransform` left is the GDI+ `Layer.*ViewTransform`
-  surface, which §4.1 keeps.
-
-## 5. Stage 1 (prerequisite) — L2 owns the frame
+## 5. Frame ownership (D26)
 
 **Landed: the frame entry point, clock, timer registry and projection/render
 ownership.** `Engine::step`/`frame` run the frame, `GameFrame::before_render`
@@ -218,10 +168,9 @@ What this requires, and why the translation waits for it:
   device-space `RenderScene` and calls `render`; it is the place the
   translation is applied.
 
-Schedule: [`07` Phase 9](07-roadmap.md) (already the D26 phase), with the
-Stage-0 removal as Phase 9a.
+Schedule: [`07` Phase 9](07-roadmap.md).
 
-## 6. Stage 2 — the pixel-translation layer
+## 6. The pixel-translation layer
 
 **Landed.** `engine::translate::PixelTranslation` is the pure mapping;
 `Engine` refits it on a VM or framebuffer size change and rewrites the
@@ -321,7 +270,7 @@ no position and pass through unchanged.
 * **No new config.** Fit is not selectable; there is no `scaling` key on any
   launcher, desktop or Android (see §4).
 
-## 7. Stage 3 — device scaling and readback
+## 7. Device scaling and readback
 
 **Device scaling and input mapping landed; readback and glyph rasterization
 are open.** The projection is device-space, so the scene is already drawn at
@@ -369,19 +318,19 @@ and transition/`getPixel`-driven blends — every one of them a VM-space call at
 the L2↔L3 boundary, and each targeting either the frame backing or a
 GPU-composed layer buffer whose CPU copy has been discarded.
 
-## 8. Sequencing
+## 8. Status
 
-| stage | change | exit |
-|---|---|---|
-| 0 | remove the scaling feature (§4) | gate green; one-to-one presentation; `git grep` clean |
-| 1 | L2 owns the frame (D26, §5) | `07` Phase 9 exit criteria |
-| 2 | `PixelTranslation` in L2 (§6) | behaviour-neutral at `s == 1`: identical output to Stage 0 on every existing test — **landed** |
-| 3 | device scale + input inverse map (§6.2–6.3) | the scene draws at the device resolution and hit-tests in VM pixels — **landed** |
-| 3 | device-pixel readback + device-resolution glyph rasterization (§7) | `getPixel` addressed through `vm_pixel_region` on a GPU-composed backing; glyphs rasterized at `raster_scale` — **open** |
+| change | state |
+|---|---|
+| remove the scaling feature (§4) | landed; one-to-one presentation, no scaling symbol left |
+| L2 owns the frame (D26, §5) | frame entry point, clock and projection landed; mixer/video pumps still in the hook (Phase 9) |
+| `PixelTranslation` in L2 (§6) | landed; behaviour-neutral at `s == 1` — identical output on every existing test |
+| device scale + input inverse map (§6.2–6.3) | landed; the scene draws at the device resolution and hit-tests in VM pixels |
+| device-pixel readback + device-resolution glyph rasterization (§7) | open |
 
-Stage 2 is deliberately **behaviour-neutral at scale 1**: with `vm_size ==
-device_size`, `scale == 1` and `offset == (0,0)`, so the projection and input
-paths reduce to what Stage 0 does and the surface lock, parity reports and
+The mapping is deliberately **behaviour-neutral at scale 1**: with
+`vm_size == device_size`, `scale == 1` and `offset == (0,0)`, so projection and
+input reduce to the unscaled path and the surface lock, parity reports and
 golden tests are unchanged. The device scale switches on by itself when the
 window client and the logical screen differ (the game's own window zoom, the
 Android surface, or a desktop window the player resized).
@@ -393,25 +342,17 @@ Android surface, or a desktop window the player resized).
    `s == 1` and cheapest; averaging needs a defined rounding. Today readback
    comes from the VM-resolution CPU layer bitmap, so the question waits for
    the GPU readback path.
-2. **Window sizing — resolved.** The logical screen is the primary layer.
-   `Window.setSize`/`setInnerSize` change the window client only; the engine
-   surfaces that change once to the composition root, which resizes the OS
-   window. The translation then fits the unchanged screen into the new client,
-   which is the reference window-zoom path. Android keeps the display-sized
-   surface and refits the same way.
-3. **Readback transport.** Android reads over `AHardwareBuffer_lock`
+2. **Readback transport.** Android reads over `AHardwareBuffer_lock`
    (region-scoped, stride from `lock_and_get_info`); the desktop and the
    fallback use a host-visible staging copy. Open: the device behaviour of
    `CPU_READ_OFTEN`, which tiling modifier gralloc picks, and how much `lock`
    stalls the GPU — see [`10`](10-android-backends.md) "Device-pixel readback"
    and its device-validation list.
-4. **Aspect mismatch.** Fit letterboxes; a device whose aspect is *taller*
+3. **Aspect mismatch.** Fit letterboxes; a device whose aspect is *taller*
    than the VM's letterboxes vertically. Confirm the reference's own
    letterbox colour and whether the game ever sets a non-black background
    (`RenderScene.background` is the current answer).
-5. **Naming — settled.** `PixelTranslation` with `scale`/`offset`/
-   `vm_size`/`device_size`; the module is `engine::translate`.
-6. **What must be device-resolution and lockable.** Only the frame backing needs
+4. **What must be device-resolution and lockable.** Only the frame backing needs
    the swapchain blit; offscreen canvases and GPU-composed bitmaps may not. If
    most readback targets are bitmaps whose CPU copy we keep (`D8`), the
    AHB-backed frame may be unnecessary — decide with a readback-frequency

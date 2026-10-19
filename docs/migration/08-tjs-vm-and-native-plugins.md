@@ -3,6 +3,8 @@
 Status: implemented (the TJS2 Rust port in §10 remains deferred).
 Related: [`02-target-architecture.md`](02-target-architecture.md) (layers),
 [`09-game-loading.md`](09-game-loading.md) (loading).
+Defects: [`docs/vm-defects.md`](../vm-defects.md) — the VM and reference defects
+a rewrite must not rediscover.
 
 ---
 
@@ -69,8 +71,7 @@ screen-buffer primary layers, storage naming) on top of it.
 ### 3.1 The ABI constraint — the one allowed global
 
 The C++ ABI hands native callbacks only the raw `tjs2_engine*`; `tjs`
-exposes **no user-data slot**. The old `tvp-*` code worked around this with
-process-global `LazyLock<Mutex<…>>` contexts. We keep exactly **one**
+exposes **no user-data slot**. This tree keeps exactly **one**
 process-wide binding — an engine → context table in `compat` — because
 the ABI forces it. It is L3 (never L1), it holds *dispatch* state (a
 reference to the L2 session/engine), never game state, and it is documented
@@ -223,22 +224,22 @@ L2: overlay refresh → upload → project → L1 RenderPipeline::render
 The mixer, video and transition pumps still run in the hook; moving them into
 L2 is the rest of the frame phase (see `07-roadmap.md` Phase 9).
 
-## 7. Implementation status
+## 7. Implementation layout
 
-The move is complete: the `tvp-*` native families are folded into `compat`
-as `plugins/*`, the L2 scene/bitmap layer system is `engine`, the sound model
-is `engine::sound` over the L1 audio device, text raster is `render` with
+The native families are `compat::natives` (with `plugins/*` for the ported
+DLLs), the L2 scene/bitmap layer system is `engine`, the sound model is
+`engine::sound` over the L1 audio device, text raster is `render` with
 layout/composition in `engine`/`compat`, and the KAG parser is `compat/kag`.
-The VM host is `crates/vm` (`VmHost`, `FrameCtx`). There is no `tvp-*` crate
-left.
+The VM host is `crates/vm` (`VmHost`, `FrameCtx`).
 
 ## 8. Testing
 
 * Marshalling and the null-plugin object are unit-testable with no window.
 * The VM host is exercised with small script fixtures.
-* Native parity is tracked by `scripts/native_parity.py` against
-  `reference/cpp`; plugin parity by `scripts/plugin_parity.py`. Both are
-  reports of coverage, not correctness claims (D36).
+* Native parity is tracked by `uv run --project scripts krkr-gate
+  native-parity` against `reference/cpp`; plugin parity by `krkr-gate
+  plugin-parity`. Both are reports of coverage, not correctness claims
+  (D36).
 
 ## 9. Native class structure: share the implementation, register the real surface
 
@@ -523,8 +524,8 @@ dumps it to `target/runtime_surface.json`, locked against the committed
 baseline `docs/surface/runtime_surface.json`:
 
 ```bash
-python3 scripts/surface_lock.py            # regenerate + check; exit 1 on any diff
-python3 scripts/surface_lock.py --update   # accept a deliberate change
+uv run --project scripts krkr-gate surface-lock            # regenerate + check
+uv run --project scripts krkr-gate surface-lock --update   # accept a change
 ```
 
 What that buys:

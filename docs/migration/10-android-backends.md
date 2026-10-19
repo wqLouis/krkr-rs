@@ -265,8 +265,8 @@ under a crate-wide `forbid`, which is why the Android path uses `deny`.
 ## What we cannot verify here
 - No device/emulator in this environment, so the backends **cannot be run**. They
   *are* compile-checked by the host `platform-android` feature and by
-  `scripts/check-android-target.py` (which resolves the per-target dependency
-  graph without compiling); the real Android target is compiled on a machine
+  `uv run --project scripts krkr-gate android-target` (which resolves the
+  per-target dependency graph without compiling); the real Android target is compiled on a machine
   with an NDK, and everything Android-only is documented as unverified.
   Validate on a device before calling it done. Everything testable stays covered
   by the Linux/null backends.

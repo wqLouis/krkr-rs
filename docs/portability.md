@@ -1,7 +1,7 @@
 # Portability: per-target backend selection
 
 Scope: how the workspace builds for more than one target without linking the
-wrong platform code, and how `scripts/check-android-target.py` proves it.
+wrong platform code, and how the `android-target` gate check proves it.
 Related: [`android.md`](android.md) (the Android frontend),
 [`runtime-config.md`](runtime-config.md) (per-launcher configuration).
 
@@ -15,9 +15,10 @@ two mutually-exclusive backends are enabled together. Two things prevent that:
 
 1. Each backend crate has `default = []` or a default that the other target
    turns off, so no consumer gets a backend it did not ask for.
-2. `scripts/check-android-target.py` resolves the dependency graph of each
-   composition root for the host and for `aarch64-linux-android` and rejects a
-   leak. It compiles nothing and needs no NDK, so it runs in the host gate.
+2. `uv run --project scripts krkr-gate android-target` resolves the dependency
+   graph of each composition root for the host and for
+   `aarch64-linux-android` and rejects a leak. It compiles nothing and needs no
+   NDK, so it runs in the host gate.
 
 ---
 
@@ -83,9 +84,9 @@ TJS2, which has no browser toolchain in this tree.
 
 ---
 
-## 3. The guard — `scripts/check-android-target.py`
+## 3. The guard — `android-target`
 
-The script drives `cargo tree -p <root> --target <triple> -e normal,dev` for
+The check drives `cargo tree -p <root> --target <triple> -e normal,dev` for
 each root and asserts the resolved feature set. It uses `cargo tree` rather than
 `cargo metadata --filter-platform` deliberately: `cargo metadata` computes each
 package's features as a union over **all** workspace members and does not filter
@@ -111,7 +112,7 @@ For each root it enforces:
 Run it directly, or as part of the main gate (AGENTS §0):
 
 ```bash
-python3 scripts/check-android-target.py
+uv run --project scripts krkr-gate android-target
 ```
 
 ---
@@ -124,7 +125,7 @@ be installed (AGENTS §0, `TODO.md` §14). The Android target itself is therefor
 and is compiled and run on a machine that has an NDK; anything not compiled is
 documented as **unverified**, never described as working. The host bar is
 `cargo check --workspace` staying green, the `platform-android` host-feature
-steps in the gate, and `scripts/check-android-target.py`.
+steps in the gate, and the `android-target` check.
 
 The vendored C++ VM is target-aware: `crates/tjs/build.rs` reads the Cargo
 target (`CARGO_CFG_TARGET_OS`, `TARGET`) and only emits the desktop C++ runtime

@@ -549,6 +549,5 @@ Two-sided tests:
 | Presentation (Fit only) and the VM↔device pixel translation | `docs/migration/11-presentation-and-pixel-translation.md` |
 | Layer tree → projection → draw tree → frame | `docs/migration/12-layer-tree-and-frame.md` |
 | L3 ↔ L2 protocol surface | `docs/migration/14-l3-l2-protocol.md` |
-| Per-crate review findings | `docs/migration/reviews/*.md` |
 | Surface lock / parity | `docs/native_parity.md`, `docs/plugin_parity.md` |
 | Win32/plugin-host and Wine studies (non-goals) | `docs/plugin_host_exe.md`, `docs/wine_box64.md` |

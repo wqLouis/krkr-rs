@@ -1,7 +1,7 @@
 # Audit — SIGSEGV during an in-game save
 
 Status: read-only audit. No source was modified. HEAD at time of audit:
-`d840cce` (branch `migration/middle-layer-ash`).
+`d840cce`.
 
 Reference oracle: `reference/cpp/**`. The only port code that runs inside the
 `saveStruct` write path is the custom TJS2 stream layer in

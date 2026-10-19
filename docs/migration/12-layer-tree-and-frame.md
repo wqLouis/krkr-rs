@@ -67,11 +67,11 @@ single forward pass (§3).
 
 ## 3. The projection (L2 → L1)
 
-`engine::projection::project_scene(scene, view, texture)` (or `project_window`
-for one window) produces a fresh `RenderScene`:
+`engine::projection::project_scene(scene, texture)` (or `project_window` for
+one window) produces a fresh `RenderScene` in VM pixels:
 
 ```rust
-pub fn project_scene<F>(scene: &Scene, view: ViewTransform, texture: F) -> RenderScene
+pub fn project_scene<F>(scene: &Scene, texture: F) -> RenderScene
 where F: FnMut(u32) -> Option<Texture>;   // bitmap id → L1 texture handle
 ```
 
@@ -99,8 +99,8 @@ For every layer in `window_layer_order` it builds at most one `RenderNode`:
 * **Order**: `z` comes from a per-scene monotonic `next_z`, so siblings across
   all windows of a scene are globally ordered by insertion (layer order).
 * **Root/background**: one default root node; `background = BACKGROUND_CLEAR`
-  (`[0,0,0,1]`, opaque black, ported from the old Bevy camera clear);
-  `view` is the framebuffer transform the caller passes.
+  (`[0,0,0,1]`, opaque black). There is no view transform in the scene value:
+  the L2 translation rewrites the nodes into device space (§7).
 
 A layer is skipped (contributes no node) when it is hidden anywhere in its
 chain, has no texture, is fully clipped away, or sits under a layer whose cache
@@ -120,14 +120,14 @@ transforms and the `hold_alpha` main-vs-province rule are open work (see §9).
 `render::scene` (`crates/platform/render/src/scene.rs`) defines the tree L1
 consumes; L2 owns the value.
 
-* `RenderScene { root, nodes: Vec<RenderNode>, background, view }` — an arena.
+* `RenderScene { root, nodes: Vec<RenderNode>, background }` — an arena.
 * `RenderNode { parent, children, content, transform, dst, src, opacity,
   color, visible, z, blend, clip, hold_alpha }`.
 * `RenderContent` — `None` (container), `Solid([f32;4])`,
   `Texture(Texture)`, `Glyphs(GlyphRun)`.
 * `Clip` — `Rect(RectF)` (axis-aligned, scissor) or `Mask(Texture)` (alpha).
-* `Transform2D` — translate/scale/rotation/pivot; `ViewTransform` — the
-  whole-scene framebuffer scale+offset.
+* `Transform2D` — translate/scale/rotation/pivot. There is no view transform:
+  the L2 translation rewrites `dst` into device space (§7).
 
 Two free functions carry the space math, and both backends call them so they
 cannot drift:
@@ -136,8 +136,8 @@ cannot drift:
   `node_space` applies the node transform and then the inherited parent
   transform; `content_space` additionally places the unit quad on the node's
   `dst` rectangle *before* `node_space` moves it to the target. Because `dst`
-  is placed first, a presentation `ViewTransform` scales the rectangle's origin
-  and its extent together — the property a letterbox needs.
+  is placed first, a device-space `dst` scales the rectangle's origin and its
+  extent together — the property a letterbox needs.
 * `child_sort_key` / `children_are_sorted` keep sibling `z` ordering identical
   across backends; the common case (L2 appends children already in `z` order)
   iterates the borrowed slice without a clone and sort.
@@ -219,9 +219,8 @@ turns the fire into an `onTimer` post. `TimerState::advance` is called only by
 The projection emits the layer tree in **VM pixels**; `engine::translate`
 then maps every node's `dst` and every rectangle clip into **device pixels**
 before the overlay is attached. The pipeline receives device-space rectangles
-and has no presentation policy of its own. This replaced the removed
-`ViewTransform`/`RenderScene.view` pair, so presentation is one rule — Fit
-with letterbox — and there is no `ScalingMode` or `--scaling`.
+and has no presentation policy of its own, so presentation is one rule — Fit
+with letterbox.
 
 `PixelTranslation` is a pure value: a uniform `min(device/vm)` scale plus a
 centred offset. The engine refits it whenever the VM window size or the

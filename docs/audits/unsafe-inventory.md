@@ -1,7 +1,6 @@
 # `unsafe` inventory and C++ boundary audit
 
 - Repo: `/mnt/DATA/Document/code/krkr-rs`
-- Branch: `migration/middle-layer-ash`
 - Date: 2026-10-11
 - Scope: every `unsafe` construct in the Rust tree and the two hand-written C++
   files (`crates/tjs/cpp/tjs2_abi.cpp`, `crates/tjs/cpp/streams.cpp`) plus the
@@ -11,7 +10,7 @@
   D32 (no L3 stubs).
 
 Method used (all read-only): `grep -rn`, `python3`, `scripts/find_stubs.py`,
-`scripts/check-stateless.sh`, plus one already-built binary
+`uv run --project scripts krkr-gate stateless`, plus one already-built binary
 (`target/debug/krkr --headless`) for an observation. No `cargo
 build/check/clippy/test` was run.
 
@@ -148,7 +147,7 @@ where unsoundness was plausible rather than merely undocumented:
 `natives/visual/window.rs` (64 flagged), `tjs/src/lib.rs` (26) and
 `platform/render/src/vulkan/{device,mod,swapchain}.rs` (15). Every site now
 carries a note stating the argument that makes it sound, and the 105 findings
-are removed from `scripts/layering_allow.txt`.
+are removed from `scripts/allowlists/layering_allow.txt`.
 
 Defects fixed:
 
@@ -521,12 +520,12 @@ containing NUL silently becomes `""`. `Tjs2Engine::new` handles null.
 
 ---
 
-## 8. `scripts/find_stubs.py` and `scripts/check-stateless.sh`
+## 8. `scripts/find_stubs.py` and the `stateless` check
 
 - `find_stubs.py` reports only long functions (no `todo!`/`unimplemented!`);
   the D32 stub ban holds — the only `todo!`-class tokens are in vendored
   `tjs2/`.
-- `check-stateless.sh` reports **`D9 guard: clean`** (no globals/caches or
+- the `stateless` check reports **clean** (no globals/caches or
   stateful services in L1). The one deliberate process-global is the L3
   `binding.rs` `LazyLock<Mutex<Option<Binding>>>`, which is allowed.
 
@@ -651,7 +650,7 @@ grep -rn 'unsafe fn\|unsafe impl\|unsafe extern' crates --include=*.rs
 grep -rn 'from_raw_parts\|copy_nonoverlapping\|Box::from_raw' crates --include=*.rs
 grep -rn 'catch_unwind' crates --include=*.rs              # none
 python3 scripts/find_stubs.py
-bash scripts/check-stateless.sh                            # D9 guard: clean
+uv run --project scripts krkr-gate stateless                # clean
 ./target/debug/krkr --headless --frames 2 --backend null /mnt/DATA/Games/Others/test
 ```
 

@@ -135,17 +135,11 @@ transitions.
 
 ### 6.1 Presentation scaling
 
-**Superseded and removed — see
-[`11-presentation-and-pixel-translation.md`](11-presentation-and-pixel-translation.md).**
-
-The `ScalingMode` enum (`Game`/`Fit`/`Fill`/`Expand`), its configuration key
-and the whole-tree `ViewTransform` it drove have been deleted. Presentation is
-now a single rule — Fit with letterbox (D39) — and the VM-pixel/device-pixel
-split it needs lives in an L2 pixel-translation layer, not in the pipeline
-(D40). The renderer receives device-space rectangles and has no notion of a
-"presentation mode"; the cocos2d `SHOW_ALL`/`EXACT_FIT`/frame-aspect
-comparison below is kept only as the historical reference for the one rule
-that survives.
+Presentation is a single rule — Fit with letterbox (D39) — and it lives in L2,
+not in the pipeline. The renderer receives device-space rectangles and has no
+notion of a "presentation mode"; the VM-pixel/device-pixel split is the L2
+pixel-translation layer (D40). Contract:
+[`11-presentation-and-pixel-translation.md`](11-presentation-and-pixel-translation.md).
 
 ## 7. Window, input and UI
 
@@ -175,19 +169,13 @@ success value and `HMENU` is `0`. Drawing the reference's own engine-drawn
 popup form is open work (`TODO.md` §5); a native popup is a deliberate
 divergence in appearance, not a port.
 
-## 8. What was removed
+## 8. Where the scene path lives
 
-The Bevy renderer, its wgpu materials and WGSL shaders, `render/src/sync.rs`
-(`sync_scene`, `BitmapAssets`, `GpuPrimitives`), `render/src/runner.rs`,
-`render/src/input_bridge.rs`, `render/src/menu.rs`, and the `#[bevy_main]`
-Android entry point are gone; their functionality is the L2 projection +
-L1 `RenderPipeline` + the platform loop described above. Bevy is not in
-`Cargo.lock`.
-
-The pure helpers (`compose_layer`, `visible_image_region`,
-`window_to_game_transform`, `window_layer_order`, `sprite_z`, `bitmap_tint`,
-`fill_sprite_color`) live in `engine::projection`/`raster` and stay
-unit-tested without a GPU.
+The L2 projection builds the `RenderScene`, the L1 `RenderPipeline` draws it,
+and the platform loop drives the frame. The pure helpers (`compose_layer`,
+`visible_image_region`, `window_to_game_transform`, `window_layer_order`,
+`sprite_z`, `bitmap_tint`, `fill_sprite_color`) live in
+`engine::projection`/`raster` and stay unit-tested without a GPU.
 
 ## 9. Glyph rendering
 
@@ -222,5 +210,5 @@ read back. This is the compatibility baseline
 2. **Blend matrix tests**: one quad per fixed-function `BlendMode` over a
    known background, checked against the reference formulas.
 3. **Surface lifecycle tests**: resize, minimize, device-lost simulation.
-4. **No-Bevy build**: `cargo tree -p render` contains neither `bevy` nor
+4. **Dependency guard**: `cargo tree -p render` contains neither `bevy` nor
    `wgpu`.

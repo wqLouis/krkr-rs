@@ -85,8 +85,7 @@ fn decodes_real_images_and_probes_audio() {
         // the checks above. Requiring at least one image with pixels that
         // differ from the first proves the decode produced spatially varying
         // content; it does not prove the pixels are reference-exact, which
-        // needs a committed reference asset to compare against (see the
-        // test-fidelity audit, F9).
+        // needs a committed reference asset to compare against.
         let first = &image.rgba[..4];
         if image.rgba.chunks_exact(4).any(|pixel| pixel != first) {
             saw_non_uniform = true;

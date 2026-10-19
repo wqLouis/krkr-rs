@@ -23,10 +23,10 @@ per-target backend features; §2 below is the Android-specific state.
 | Video | **NDK MediaCodec** (`libmediandk`) on Android; FFmpeg on desktop | `ffmpeg-next` links via pkg-config and cannot be assumed on Android; MediaCodec is what Kirikiroid2 uses |
 | Folder picking | Android **SAF** (`ACTION_OPEN_DOCUMENT_TREE`) + persisted permission | User directive ("use android's system file picker") |
 | Storage access | **SAF for picking, a resolved filesystem path for reading, `MANAGE_EXTERNAL_STORAGE`** — option A in §4 | The app is **sideloaded**, so the Play-policy restriction is moot (user directive). The SAF-backed storage backend (option B) is **not** planned. |
-| Game selection | **Explicit folders only** — no auto-indexing of a default directory | User directive: mirror `krkr-rs run <game directory>` |
+| Game selection | **Explicit folders only** — no auto-indexing of a default directory | User directive: mirror `krkr <game directory>` |
 | Orientation | **Locked to landscape** | User directive. The games are 1280×720; portrait would letterbox badly. |
 | Launcher state | **JSON config file** (`games.json`) in the app's private files dir — **Android app only** | User directive: keep the library in a config file so folders never have to be found again. JSON is the project's configuration convention (`api::config` replaced the reference's `GlobalPreference.xml`/`Kirikiroid2Preference.xml` with a `key=value` store). |
-| Engine and CLI | **Unchanged on every platform.** No library, no config file, no game list in the Rust workspace | User directive: the Linux build is "pure simple cli" — `krkr-rs run <game directory>` and nothing more. The Android app is what adds convenience, not the engine. |
+| Engine and CLI | **Unchanged on every platform.** No library, no config file, no game list in the Rust workspace | User directive: the Linux build is "pure simple cli" — `krkr <game directory>` and nothing more. The Android app is what adds convenience, not the engine. |
 
 ---
 
@@ -38,7 +38,7 @@ per-target backend features; §2 below is the Android-specific state.
 > Android-only code that has not been compiled is documented as unverified,
 > never as working. The host bar is `cargo check --workspace` staying
 > green, the `platform-android` host-feature steps and
-> `scripts/check-android-target.py`.
+> `uv run --project scripts krkr-gate android-target`.
 
 - **The C++ TJS2 VM cross-compiles for Android.** Zig cannot do it (it refuses
   to provide Android libc: `unable to provide libc for target
@@ -200,9 +200,9 @@ point, storage access, video codec, input).
 
 **This is an app-level concern, not an engine one.** The engine accepts a game
 directory and nothing else, on every platform — the Android app is exactly
-`krkr-rs run <game directory>`, with a UI in front of it. No library, config
+`krkr <game directory>`, with a UI in front of it. No library, config
 file or game list is added to the Rust workspace: the desktop build stays a
-plain CLI (`krkr-rs run <dir>`), and `games.json` is never read by the engine or
+plain CLI (`krkr <dir>`), and `games.json` is never read by the engine or
 shared with it, so there is no schema coupling in either direction.
 
 The library is a plain JSON file in the app's private files directory

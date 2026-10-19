@@ -58,25 +58,6 @@ L1  →  OS / Vulkan / FFmpeg / MediaCodec only
 * **L3 may not contain platform code** (`#[cfg(target_os=…)]`, winit,
   `android-activity`, `std::fs`, JNI); it uses L1 abstractions.
 
-### 1.1 What changed from the earlier draft
-
-| Concern | Earlier draft | Now |
-|---|---|---|
-| Host / window / event loop | top layer (old L4 `app`) | **L1** platform core |
-| Platform-specific code | spread across top and backends | **confined to L1**, one abstraction |
-| TJS VM | old L3 (`krkr-tjs`) | **L4**, above the compat surface |
-| Compat surface (native classes + KAG) | old L3 | **L3**, composing L2 |
-| L2 role | TVP semantics + layer system + all state | **a generic game engine** with fundamental APIs **including the layer system (scene graph)**; owns engine state, but no TVP semantics |
-| Archive parsing | L2 (`engine::archive`) | **L1** (stateless read+parse); L2 sees a parsed FS |
-| Native plugins | static Rust families + `Plugins.link` no-op success | **statically built into L3**, with a null-plugin object for missing DLLs (D14) |
-| Backend selection | runtime flag during migration | **compile-time features/cfg** (D13) |
-
-> Decision **D2 is revised**: the **layer system (the generic scene graph)
-> lives in L2** — game engines hold scene graphs — while the *TVP semantics*
-> that scripts see (masks, province, exact property names, storage naming)
-> are L3, layered on top. The render pipeline remains L1 and consumes the
-> scene tree (D10 unchanged).
-
 ## 2. Responsibilities
 
 ### 2.1 L1 — platform core (mechanism + host)
@@ -334,9 +315,6 @@ crates/
 
   # L3 — KiriKiri compatibility --------------------------------------------
   compat     native classes + KAG + event adapter + static plugins
-                    (absorbed the former `tvp-natives`/`tvp-visual`/
-                     `tvp-storages`/`tvp-scripts`/`tvp-input`/`tvp-sound`/
-                     `tvp-text`/`tvp-kagparser` crates)
 
   # L4 — TJS VM -------------------------------------------------------------
   vm         TJS VM host over tjs
@@ -349,12 +327,8 @@ crates/
   testkit    dev-only shared test helpers
 ```
 
-The crate consolidation is complete. For reference, the machinery was:
-* keep `tjs` where it is unless in the way;
-* fold the `tvp-*` native families into `compat` as `plugins/*`;
-* the old `engine` loader split into mount/discover (L2) and execute
-  (L3/L4);
-* keep the game runnable at every step (roadmap).
+The crate layout is the one in the block above; `14` records the L3↔L2
+protocol. The loader is split into mount/discover (L2) and execute (L3/L4).
 
 ## 7. Component ownership
 
@@ -376,10 +350,11 @@ The crate consolidation is complete. For reference, the machinery was:
 * The VM is single-threaded (L4).
 * The loop is single-threaded and owns the frame (L1 drives, L4 executes
   the body).
-* L2 owns the worker pool; it schedules stateless L1 transforms and drains
-  completions on the loop thread.
-* No `VM_RUN_LOCK` workaround (it existed only for Bevy's parallel
-  scheduler).
+* Where L2 runs work off the loop thread it owns the worker (the streaming
+  sound decode-ahead worker) and drains completions on the loop thread. Image
+  decode is still synchronous on the VM thread (TODO §1.2).
+* There is no `VM_RUN_LOCK`: the loop is single-threaded and the VM is one
+  instance per process.
 
 ## 9. Acceptance criteria
 
@@ -389,14 +364,14 @@ The crate consolidation is complete. For reference, the machinery was:
    features and the trivial composition root.
 3. **D9:** L1 has no mutable statics, no `thread_local!`, no
    `LazyLock`/`OnceLock`/`OnceCell` caches, no id-keyed registries, no
-   `&mut self` on its service objects. Guarded by `scripts/check-stateless.sh`
-   in the gate.
+   `&mut self` on its service objects. Guarded by `uv run --project scripts
+   krkr-gate stateless` in the gate.
 4. **D10:** L2 contains no traversal, draw-list, batching or blend-state
    selection; its render path is "sync scene → call render".
 5. **D11:** no silent fallback and no hardcoded limit in L1/L2; the one
    documented exception is the null plugin object (D14).
-6. The game runs on Linux and Android with Vulkan and no Bevy in
-   `Cargo.lock`.
+6. The game runs on Linux and Android with Vulkan, and `Cargo.lock` carries
+   no Bevy or `tvp-*` dependency.
 7. Loading takes an explicit archive list; a directory scan runs only when no
    explicit list is given (§5, doc 09, D35).
 
@@ -406,9 +381,8 @@ The C++ engine already separates these concerns: `core/io/IFileBackend`
 (fs), `core/visual/RenderManager` + `visual/impl/DrawDevice` (pipeline),
 `core/visual/LayerManager`/`LayerImpl` (layer state), `core/movie/ffmpeg`
 (media), `core/sound` (sound), and the platform layer under
-`core/environ/*` (win32 / android / cocos2d). The Rust port collapsed the
-platform and host into Bevy; the target restores the separation with the
-host in L1 and the VM on top.
+`core/environ/*` (win32 / android / cocos2d). This tree keeps that
+separation, with the host in L1 and the VM on top.
 
 ## 11. Non-goals
 
@@ -418,7 +392,7 @@ host in L1 and the VM on top.
   first).
 * Rewriting the C++ TJS2 VM.
 
-## 12. L2 API stability (merged from `13-l2-api-stability.md`)
+## 12. L2 API stability
 
 Goal: **freeze the `engine` (L2) public API** so we can optimise everything
 below it (L1: Vulkan batching, GPU glyph runs, advanced blends, hw video decode,
@@ -493,11 +467,11 @@ optimisations this freeze is meant to protect.
 
 ### 12.4. What the freeze protects
 
-The optimisations in `07-roadmap.md` §9 are all *below* this
-surface:
+The optimisations in [`../optimization.md`](../optimization.md) are all
+*below* this surface:
 
-- GPU glyph runs / MSDF → implemented in `render` + the L2 `text` internals; the
-  `text` API is unchanged.
+- GPU glyph runs / MSDF → a deferred design item (TODO §16) in `render` + the
+  L2 `text` internals; the `text` API is unchanged.
 - `VK_EXT_blend_operation_advanced` → `render` blend selection; `BlendMode` and
   `resolve_blend` are unchanged.
 - hw video decode / streaming `video_audio` → `media` + the L2 `video` internals;

@@ -297,10 +297,11 @@ For each module, in order:
 3. Rewrite the smallest set of functions that removes the pattern without
    changing behavior. Prefer a trait/macro only when it removes repeated
    structure.
-4. Run `cargo fmt` (allowed for subagents). Run the compiler-free guards:
-   `stateless`, `error-handling`, `house-style`, `layering`, `storage-boundary`,
-   `native-construction`, `lifecycle-order`, `storage-media`,
-   `callback-objthis`, `host-facts`.
+4. Run `cargo fmt` (allowed for subagents). Run the compiler-free checks with
+   `uv run --project scripts krkr-gate <check>`: `stateless`, `error-handling`,
+   `house-style`, `layering`, `storage-boundary`, `native-construction`,
+   `lifecycle-order`, `storage-media`, `callback-objthis`, `native-arity`,
+   `void-getter`, `host-facts`.
 5. The main agent runs the build, clippy and test gate. A refactor is not done
    until both static and test gates are green.
 

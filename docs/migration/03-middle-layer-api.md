@@ -81,19 +81,19 @@ explicit `&mut` parameter. The state is a bottom-defined value
 
 ### 0.4 Why offload the render pipeline to L1
 
-* L2 no longer owns a `Scene → RenderScene` projection, blend mapping, sprite
-  positioning, clipping, batching or upload scheduling — those move to L1
-  and are shared by every backend.
-* The Bevy adapter and the Vulkan core both consume the same `RenderScene`
-  tree, so the two renderers cannot drift in composition semantics.
+* L1 owns blend mapping, sprite positioning, clipping, batching, upload
+  scheduling and drawing — mechanism shared by every backend.
+* L2 keeps the projection (`Scene` → `RenderScene`, `engine::projection`), so
+  the tree it hands L1 carries the composition semantics.
+* The null and Vulkan pipelines consume the same `RenderScene` tree, so the
+  two backends cannot drift in composition semantics.
 * L2 stays a **state store + dispatcher**: it mutates the layer tree from
   script calls and calls `render`.
 * "Could two engines run in one process?" stays **yes**: objects are
   immutable services, all state is local to the caller.
 
-The old tree did the opposite: it hid engine state in process-global statics
-(`history/01-investigation.md §9`) and re-derived the tree into entities every
-frame. The stateless split is enforced by `scripts/check-stateless.sh`.
+The stateless split is enforced by the `stateless` gate check
+(`uv run --project scripts krkr-gate stateless`).
 
 ---
 
@@ -535,12 +535,12 @@ Tests construct `Engine` with a null `RenderPipeline`, a headless
 
 ## 9. Enforcing the model
 
-* `scripts/check-stateless.sh` greps the L1 crates
+* `uv run --project scripts krkr-gate stateless` greps the L1 crates
   (`platform/{api,fs,media,render,platform}`) for forbidden constructs
   (`static mut`, `thread_local!`, `LazyLock`, `OnceLock`, `lazy_static!`,
   `OnceCell`) and for `&mut self` methods on the L1 service objects.
-  `scripts/check-layering.sh` enforces the layer vocabulary, `unsafe`
-  `SAFETY:` notes and the per-crate `missing_docs` lint.
+  `uv run --project scripts krkr-gate layering` enforces the layer vocabulary,
+  `unsafe` `SAFETY:` notes and the per-crate `missing_docs` lint.
 * An integration test constructs **two independent `RenderPipeline`/`Media`/
   `FileSystem` objects and two `Engine`s** in one process; if L1 had globals
   or object state, this would alias or fail.
@@ -553,7 +553,7 @@ Tests construct `Engine` with a null `RenderPipeline`, a headless
 ## 10. What the API intentionally leaves out
 
 * Storage namespaces / `.xp3` / auto-path search (L2).
-* TVP `Layer.type` numbering (L2 maps to `BlendMode`).
+* TVP `Layer.type` numbering (L3 maps it to the generic `BlendMode`).
 * TVP layer properties, masks, province, focus/hit-test, script callbacks
   (L2, on top of `RenderScene`).
 * `.sli` loop metadata, fade scheduling, 3D attenuation (L2 mixer).

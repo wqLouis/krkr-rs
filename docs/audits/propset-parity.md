@@ -1,11 +1,10 @@
 # `PropSet` parity audit — the registration mechanisms the extractors missed
 
 - Repo: `/mnt/DATA/Document/code/krkr-rs`
-- Branch: `migration/middle-layer-ash`
 - Date: 2026-10-11
 - Scope: the reference C++ registration mechanisms that make a name
-  script-visible, and how `scripts/native_parity.py` and
-  `scripts/plugin_parity.py` extract them. **No `cargo`/`rustc`/`clippy` was
+  script-visible, and how the `native-parity` and `plugin-parity` checks
+  extract them. **No `cargo`/`rustc`/`clippy` was
   run** (AGENTS §0); only `python3`, `grep`, and the guard scripts.
 - House rules referenced: AGENTS §4 (no silent fallbacks), D29 (surface lock),
   D30 (tests cite the reference), D36 (a compatibility claim names its
@@ -172,7 +171,7 @@ which is unrelated to this change.
 
 ### 4.1 Reference side
 
-`scripts/native_parity.py`:
+`scripts/krkr_gates/checks/native_parity.py`:
 
 - `MemberInfo` records `kind` (`method` / `property` / `constructor` /
   `unknown`), `static`, and `mechanism` (`native-macro` / `constructor` /
@@ -194,11 +193,11 @@ which is unrelated to this change.
   static, mechanism), a *Registration sites with a runtime-built name*
   section, and *Extraction notes and remaining blind spots*.
 - The allowlist reader accepts `Class.member — reason`; a reason starting
-  `debt:` is the marker used by `scripts/layering_allow.txt`. `--update-allow`
+  `debt:` is the marker used by `scripts/allowlists/layering_allow.txt`. `--update-allow`
   preserves existing reasons. Both scripts support the reasoned form and their
   allowlist headers document it.
 
-`scripts/plugin_parity.py`:
+`scripts/krkr_gates/checks/plugin_parity.py`:
 
 - `_plugin_namespace_bindings()` resolves `motion` from
   `global->PropGet(… TJS_W("Motion") …)` / `AsObjectNoAddRef()`. A scratch
@@ -235,23 +234,23 @@ and that a runtime-built name is reported as unrecoverable rather than
 counted:
 
 ```sh
-python3 scripts/native_parity.py --self-test
-python3 scripts/plugin_parity.py --self-test
+uv run --project scripts krkr-gate native-parity --self-test
+uv run --project scripts krkr-gate plugin-parity --self-test
 ```
 
 Fixtures:
 
-- `scripts/parity_fixtures/native_core.cpp` + `native_core.expected.json` —
+- `scripts/fixtures/parity/native_core.cpp` + `native_core.expected.json` —
   native macros, constructor, `registerObject`, class-level `PropSet` and
   `PropSetByNum`, and a runtime-built `PropSet` name.
-- `scripts/parity_fixtures/plugin_surface.cpp` +
+- `scripts/fixtures/parity/plugin_surface.cpp` +
   `plugin_surface.expected.json` — `NCB_REGISTER_CLASS`/`_SUBCLASS`/
   `NCB_SUBCLASS`, `NCB_METHOD`/`NCB_PROPERTY`, `NCB_ATTACH_FUNCTION`,
   `NCB_REGISTER_FUNCTION`, global/namespace `PropSet`, a script global, and an
   unresolved static member.
 
 A regex that stops matching flags its bad fixture, exactly as
-`scripts/check-layering.sh --self-test` does. The self-test runs
+the `layering --self-test` check does. The self-test runs
 **automatically on every invocation** (like the guard scripts), so a broken
 extractor fails the parity check itself rather than quietly shrinking the
 surface; `--quiet` suppresses the `ok` line, and `--self-test` runs only the
@@ -280,8 +279,8 @@ sides. Triaging each newly visible member:
 | `Player.useD3D` | Yes — already present via `NCB_PROPERTY` | Correct. |
 
 There is therefore **no genuinely missing member to baseline** from this
-change; `scripts/native_parity_allow.txt` and
-`scripts/plugin_parity_allow.txt` stay empty. The `debt:` machinery is in
+change; `scripts/allowlists/native_parity_allow.txt` and
+`scripts/allowlists/plugin_parity_allow.txt` stay empty. The `debt:` machinery is in
 place so the next genuinely-missing member is baselined visibly instead of
 disappearing.
 
@@ -306,13 +305,13 @@ The runtime comparison surfaces two things that were already true before the
 
 Both are recorded as remaining limitations in the regenerated reports.
 
-### 5.2 TODO §10 additions
+### 5.2 Recorded findings
 
 No new plugin/DLL coverage work is created by this change. The two
 pre-existing observations above are recorded in the audit and in the report
 blind-spot sections; the false `name` member is a script-side extractor fix,
 not a plugin port, and is left for the next extractor revision rather than
-inflating §10's plugin list.
+inflating the plugin list in `TODO.md` §10.
 
 ---
 
@@ -353,11 +352,11 @@ mistake a coverage figure for a completeness proof.
 
 ## 7. Files changed
 
-- `scripts/native_parity.py` — `MemberInfo`, class-level `PropSet` reader,
+- `scripts/krkr_gates/checks/native_parity.py` — `MemberInfo`, class-level `PropSet` reader,
   runtime attachments, self-test, report sections, reasoned allowlist.
-- `scripts/plugin_parity.py` — namespace/global `PropSet` reader, script
+- `scripts/krkr_gates/checks/plugin_parity.py` — namespace/global `PropSet` reader, script
   globals, static-member/global self-test, report sections.
-- `scripts/parity_fixtures/{native_core,plugin_surface}.cpp` and their
+- `scripts/fixtures/parity/{native_core,plugin_surface}.cpp` and their
   `.expected.json` — the self-test fixtures.
 - `docs/native_parity.md`, `docs/plugin_parity.md` — regenerated.
 - `docs/audits/propset-parity.md` — this audit.
@@ -365,6 +364,6 @@ mistake a coverage figure for a completeness proof.
 Regenerate with:
 
 ```sh
-python3 scripts/native_parity.py
-python3 scripts/plugin_parity.py
+uv run --project scripts krkr-gate native-parity
+uv run --project scripts krkr-gate plugin-parity
 ```

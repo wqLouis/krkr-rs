@@ -344,5 +344,5 @@ new evidence.
   measurable per script, native and phase (`docs/startup-attribution.md`).
 * **The error-handling scan over-reports by design** (it cannot tell a `Result`
   receiver from an `Option` one); a site with no
-  `scripts/error_handling_allow.txt` entry fails the gate. Startup slowness on
-  `/mnt/DATA` is environmental (`fuseblk`), not code.
+  `scripts/allowlists/error_handling_allow.txt` entry fails the gate. Startup
+  slowness on `/mnt/DATA` is environmental (`fuseblk`), not code.

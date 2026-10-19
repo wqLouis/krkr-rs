@@ -11,7 +11,7 @@ diagnostic — sitting on top of a small mount/index core. `02 §2.3` and D2 alr
 assign the TVP storage semantics to L3, and D6 says the *namespace* is L2 while
 the *addressing/naming* is L3, but `06-file-system.md` §1–§2 (the inventory row and the "Middle (`engine`)
 owns" bullets) explicitly hands `arc.xp3>path` and normalization to L2 and
-`scripts/check-layering.sh` deliberately
+the `layering` check deliberately
 exempts `arc.xp3>path` from the L2 vocabulary rule because of that sentence. The
 code and the guard both encode the contradiction. This audit classifies every
 item, describes the TVP-free L2 VFS the mount namespace actually needs, describes
@@ -386,7 +386,7 @@ runnable at every step (D7).
 ### Slice 0 — docs and guard (no code)
 
 1. Apply the doc edits in §6.
-2. Add `l2-storage-resolution` to `scripts/check-layering.sh` (and its own
+2. Add `l2-storage-resolution` to the `layering` check (and its own
    allowlist entries) forbidding in `crates/engine/**`:
    * `split_once('>')` / `split_once(">")` / `find('>')` / `contains('>')` /
      `TVPArchiveDelimiter`;
@@ -436,9 +436,9 @@ resolver entry point. `crates/app` calls the resolver.
 
 ### What must stay green
 
-* `scripts/surface_lock.py` — the registered `Storages` member set must not
+* `krkr-gate surface-lock` — the registered `Storages` member set must not
   change (`Storages` methods are unchanged; only their implementation moves).
-* `scripts/native_parity.py` / `plugin_parity.py --no-doc` — the plugin surface
+* `krkr-gate native-parity` / `plugin-parity --no-doc` — the plugin surface
   (`Storages.fstat`, `Storages.dirlist`, …) is unchanged.
 * Every `reference/cpp/...` citation currently in `crates/engine/tests/storage.rs`
   and `startup.rs` moves with its test, not deleted.

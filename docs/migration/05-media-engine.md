@@ -21,8 +21,8 @@ all script semantics are L2/L3.
 | Video overlay events | L2 `engine::video` + L3 `compat` |
 | YUV conversion | `media::yuv` |
 
-The split is complete: `media` is Bevy-free and links no graphics or windowing
-dependency, and the FFmpeg backend is behind the `video-ffmpeg` feature.
+`media` links no graphics or windowing dependency, and the FFmpeg backend is
+behind the `video-ffmpeg` feature.
 
 ## 2. Engine shape
 
@@ -195,6 +195,5 @@ instead (`crates/platform/media/Cargo.toml`, `crates/app/Cargo.toml`,
   is in `media::image_encode`.
 * The FFmpeg backend wraps the video demux/decode, and the MediaCodec backend
   covers Android; exactly one is selected by feature.
-* L2 owns the mixer, the decode-ahead worker pool and the completion table;
-  the video frame/PCM sinks feed the layer bitmap and the mixer.
-* The old `tvp-sound`/`tvp-natives` decode modules are gone.
+* L2 owns the mixer, the streaming decode-ahead worker and the completion
+  table; the video frame/PCM sinks feed the layer bitmap and the mixer.

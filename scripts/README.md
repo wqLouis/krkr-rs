@@ -13,8 +13,9 @@ uv run --project scripts krkr-gate <check>           # one check
 uv run --project scripts krkr-gate <check> --self-test
 ```
 
-`gate` runs the ordered sequence and includes the `cargo fmt`/`clippy`/`test`
-steps, so it is for the main agent. `gate --no-cargo` runs only the
+`gate` runs the ordered sequence and includes the `cargo fmt`/`clippy`
+steps, so it is for the main agent; the tests run separately with
+`krkr-gate test`. `gate --no-cargo` runs only the
 compiler-free checks. Every check also runs on its own; `android-target`
 shells out to `cargo tree`, the rest read the tree.
 
@@ -29,9 +30,10 @@ shells out to `cargo tree`, the rest read the tree.
 ## Checks
 
 `stateless`, `error-handling`, `house-style`, `layering`,
-`native-construction`, `lifecycle-order`, `host-facts`, `android-target`,
-`surface-lock`, `native-parity`, `plugin-parity`, `native-arity`,
-`void-getter`, the `extract-xp3` helper, and `gate`.
+`storage-boundary`, `native-construction`, `lifecycle-order`, `storage-media`,
+`callback-objthis`, `native-arity`, `void-getter`, `host-facts`,
+`android-target`, `surface-lock`, `native-parity`, `plugin-parity`, the
+`extract-xp3` helper, and `gate`.
 
 `house-style` also enforces the AGENTS §6 comment rules: a **non-test**
 comment may not cite the external engine (`reference/cpp`, a `*.cpp:line`, a

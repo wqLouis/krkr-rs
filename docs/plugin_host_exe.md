@@ -19,9 +19,8 @@ sharpens and partially revises).
 
 **Non-goal.** A Wine plugin-host `.exe` is rejected; the port continues the
 native Rust reimplementation, which is the next major version's target
-(`AGENTS.md` §1). The engine's current render stack is `render` (Vulkan), not
-Bevy/wgpu; the Bevy references below are the environment this study was written
-against.
+(`AGENTS.md` §1). The engine's current render stack is `render` (Vulkan) over `platform`
+(`winit` on the desktop).
 
 ---
 
@@ -294,20 +293,20 @@ The naive "input bytes → output bytes" test, applied rigorously:
   (`TVPConstAlphaBlend_SD*`, `TVPLinTransCopy`, `TVPStretchCopy`,
   `TVPFillARGB`). A host must therefore supply the provider registry + layer
   ABI, not just a byte buffer. (And krkr-rs already implements these transitions
-  natively — `crates/tvp-natives/src/extrans.rs`.)
+  natively — `crates/compat/src/natives/plugins/extrans/`.)
 * **`csvParser` — NO.** It returns TJS arrays via `TJSCreateArrayObject` and
   installs a `CSVParser` class through `TVPGetScriptDispatch` /
   `TVPExecuteExpression`. You cannot get its parsed rows without a TJS runtime.
-  (Already native: `crates/tvp-storages/src/csv_parser.rs`.)
+  (Already native: `crates/compat/src/natives/plugins/csv_parser/`.)
 * **`fstat` — NO.** Storage path normalization, streams, MD5, `Date` objects,
   Win32 file APIs, and `Storages` member attachment. (Already native:
-  `crates/tvp-storages/src/lib.rs`.)
+  `crates/compat/src/natives/plugins/fstat/`.)
 * **`KAGParserEx` — NO.** Builds TJS arrays/dicts, raises TJS exceptions, adds
   compact event hooks, reads text streams. 23 host functions, half in the TJS
-  bucket. (Already native: `crates/tvp-kagparser`.)
+  bucket. (Already native: `crates/compat/src/natives/kag/`.)
 * **`layerExDraw` — NO.** GDI+ draws into the engine's `Layer` buffers; methods
   are dispatched through TJS object handles. (Already native:
-  `crates/tvp-visual/src/natives/gdiplus.rs` and `window.rs`.)
+  `crates/compat/src/natives/plugins/layer_ex/`.)
 * **`menu`, `win32dialog`, `windowEx` — NO.** User32/GDI32/SHELL32 UI plus the
   TVP event/accelerator/window-handle graph. These are the *opposite* of
   self-contained: their whole job is engine/window state.
@@ -352,8 +351,8 @@ built against.
 ### 5.1 Architecture
 
 ```
-┌────────────────────────── Linux native krkr-rs (Rust/Bevy, x86_64 ELF) ─────────────────────────┐
-│  tvp-sound / tvp-visual / tjs …                                                             │
+┌────────────────────────── Linux native krkr-rs (Rust/Vk  , x86_64 ELF) ─────────────────────────┐
+│  media / engine / tjs …                                                                         │
 │  PluginSidecar (Rust):                                                                           │
 │    DecoderClient ─── control: 127.0.0.1:PORT (TCP)  ───┐                                         │
 │                   └─ data:   /tmp/krkr-host-<pid>.pcm (mmap ring) ──┐                            │
@@ -632,10 +631,10 @@ process; it does not make 32-bit code callable from a 64-bit address space. So:
   That is real work (L).
 * **Rust target** `i686-pc-windows-gnu` is not installed; it would be added with
   `rustup target add` plus a linker (zig can act as one, or mingw-w64).
-* **Bevy 0.19 / wgpu**: wgpu has DX12 and Vulkan backends that nominally support
-  32-bit Windows, but Bevy's dependency tree is overwhelmingly tested on 64-bit;
-  `usize`/pointer assumptions, large-asset address space, and 32-bit `wgpu`/`naga`
-  builds are all risk. This is the largest unknown (XL).
+* **32-bit Vulkan stack**: `ash` and the Vulkan loader nominally support 32-bit
+  Windows, but the stack is overwhelmingly tested on 64-bit; `usize`/pointer
+  assumptions and a large-asset address space are risk on i686. This is the
+  largest unknown (XL).
 * **Windowing**: `winit`'s Windows backend under Wine goes through `user32` →
   Wine's `winex11.drv` or `winewayland.drv`. The process is a Wine process; you
   lose the native Linux path (Wayland/X11 directly), gain Wine's input/IME/
@@ -648,11 +647,11 @@ process; it does not make 32-bit code callable from a 64-bit address space. So:
 | Address space | plugins stay in Wine; engine native | plugins and engine share one space |
 | Host API work | none (C API bypass) / 22 pure funcs | full 59 + real semantics |
 | TJS VM | native (already built) | rebuilt for i686 COFF |
-| Rendering | native Bevy | Bevy/wgpu on Wine (32-bit) |
+| Rendering | native Vulkan | Vulkan on Wine (32-bit) |
 | IPC | yes (but tiny, PCM only) | **none** |
 | Platforms | Linux (+Windows host if desired) | Linux/Wine; ARM needs box64/FEX |
 | Effort | S (one plugin) | XL |
-| Risk | low (bounded decoder) | high (32-bit Bevy, Wine graphics, build system) |
+| Risk | low (bounded decoder) | high (32-bit stack, Wine graphics, build system) |
 
 ### 7.4 ARM / Android
 
@@ -678,22 +677,23 @@ Scale: **S** < 1 day · **M** days · **L** 1-3 weeks · **XL** months.
 | Plugin | Host exe effort | Verdict | Reason |
 |---|---:|---|---|
 | `wuvorbis` | **S** | **Worth it (sidecar), if needed** | Exports full C decoder API; no TJS, no exporter. ~1 C file + a small Rust client. |
-| `extrans` | M | Not worth it here | Needs provider registry + layer ABI; krkr-rs already implements the transitions natively (`crates/tvp-natives/src/extrans.rs`). |
-| `csvParser` | L | Not worth it | Returns TJS objects; native impl exists (`crates/tvp-storages/src/csv_parser.rs`). |
-| `fstat` | L | Not worth it | Storage + TJS + Win32 file APIs; native impl exists (`crates/tvp-storages`). |
-| `KAGParserEx` | XL | Not worth it | Full TJS object graph + events; native impl exists (`crates/tvp-kagparser`). |
-| `layerExDraw` | L/XL | Not worth it | GDI+ into the `Layer` graph + TJS; native impl exists (`crates/tvp-visual`). |
+| `extrans` | M | Not worth it here | Needs provider registry + layer ABI; krkr-rs already implements the transitions natively
+(`crates/compat/src/natives/plugins/extrans/`). |
+| `csvParser` | L | Not worth it | Returns TJS objects; native impl exists (`crates/compat/src/natives/plugins/csv_parser/`). |
+| `fstat` | L | Not worth it | Storage + TJS + Win32 file APIs; native impl exists (`crates/compat/src/natives/plugins/fstat/`). |
+| `KAGParserEx` | XL | Not worth it | Full TJS object graph + events; native impl exists (`crates/compat/src/natives/kag/`). |
+| `layerExDraw` | L/XL | Not worth it | GDI+ into the `Layer` graph + TJS; native impl exists (`crates/compat/src/natives/plugins/layer_ex/`). |
 | `menu` | XL | Not worth it | Win32 menu + TVP events/accelerators; script fallbacks exist. |
-| `win32dialog` | XL | Not worth it | Win32 dialogs + `Win32GenericDialogEX`; script fallback exists (`crates/tvp-natives/src/plugin_stubs.rs`). |
-| `windowEx` | XL | Not worth it | Win32 window + engine `Window`; native impl exists (`crates/tvp-visual/src/natives/window.rs`). |
+| `win32dialog` | XL | Not worth it | Win32 dialogs + `Win32GenericDialogEX`; native impl exists (`crates/compat/src/natives/plugins/win32_dialog/`). |
+| `windowEx` | XL | Not worth it | Win32 window + engine `Window`; native impl exists (`crates/compat/src/natives/plugins/window_ex/`). |
 
 **Recommended scope: "self-contained C-API decoders only."** Implement the host
 exe as a *narrow decoder sidecar* pattern (load a codec DLL, call its C API,
 stream bytes back), and only for plugins that actually export a C API. For this
-game, `wuvorbis` is already covered by `tvp-sound` (symphonia + libopus) and the
-plugin set is emulated by built-in Rust natives
-(`crates/tvp-natives/src/plugins.rs:100-140`), so the sidecar is a
-future-proofing tool, not a task for this title.
+game, `wuvorbis` is already covered by the L1 `media` decoder (symphonia +
+libopus) and the plugin set is emulated by built-in Rust natives
+(`crates/compat/src/natives/plugins/`), so the sidecar is a future-proofing
+tool, not a task for this title.
 
 Do **not** attempt a generic "full TVP-in-a-box" host: it is option B1 and is
 equivalent to porting/running the whole engine under Wine.
@@ -713,10 +713,9 @@ equivalent to porting/running the whole engine under Wine.
   "true" interface lives only in the original SDK and the shipped DLL strings.
   A mock host factory that only approximates the ncbind classes will crash on
   registrations it mis-models — another reason to bypass `V2Link` when possible.
-* **`win32dialog` coverage gap.** `crates/tvp-natives/src/plugins.rs:118-133`'s
-  emulated-name list omits `win32dialog.dll` even though `system/initialize.tjs`
-  (indirectly, via `k2compat/win32dialog.tjs`) links it; that is handled today by
-  a script fallback, and is unrelated to the host-exe question but worth noting.
+* **`win32dialog` coverage.** `win32dialog.dll` is a built-in emulation
+  (`crates/compat/src/natives/plugins/win32_dialog/`); its member set is still
+  incomplete (TODO §5), unrelated to the host-exe question but worth noting.
 
 ---
 
@@ -736,7 +735,7 @@ equivalent to porting/running the whole engine under Wine.
   volume.
 * The bridge-free alternative (port krkr-rs to `i686-pc-windows-gnu` and run the
   whole thing under Wine) is coherent but XL, forced to 32-bit, and risky for
-  32-bit Bevy/wgpu.
+  32-bit Vulkan.
 * **Recommendation:** keep the native reimplementation; if a genuinely
   Windows-only codec appears, add a **narrow C-API decoder sidecar** (S effort),
   not a general plugin host. `zig` on this machine can build the sidecar; `wine`
@@ -757,9 +756,8 @@ equivalent to porting/running the whole engine under Wine.
 | TJS class/method registration | §2.4 wide-string scan; `reference/cpp/plugins/csvParser.cpp:432,439,445`; `reference/cpp/plugins/fstat/main.cpp:918-944`; `reference/cpp/plugins/layerex_draw/windows/main.cpp:607`; `reference/cpp/plugins/windowEx.cpp:1513-1527` |
 | ncbind registration macros | `reference/cpp/core/plugin/ncbind.hpp:2157,2248-2266` |
 | wuvorbis decoder call pattern | `reference/cpp/core/sound/VorbisWaveDecoder.cpp:32,217,221` |
-| krkr-rs current plugin handling | `crates/tvp-natives/src/plugins.rs:62-140`; `plugin_stubs.rs:1-25`; `crates/tvp-storages/src/csv_parser.rs`; `crates/tvp-kagparser/src/lib.rs`; `crates/tvp-visual/src/natives/gdiplus.rs`; `crates/tvp-visual/src/natives/window.rs` |
+| krkr-rs current plugin handling | `crates/compat/src/natives/plugins/mod.rs` (`BUILTIN_PLUGINS`); `crates/compat/src/null_plugin.rs`; `crates/compat/src/natives/plugins/{csv_parser,fstat,extrans,layer_ex,window_ex,win32_dialog}/`; `crates/compat/src/natives/kag/` |
 | TJS2 VM build | `crates/tjs/build.rs` |
-| Bevy 0.19 | `crates/platform/render/Cargo.toml` |
 | zig cross-compiles i386 PE | §1.1 and §5.5 command output |
 | wine/Rust-target absent | §1.1 environment |
 
@@ -772,7 +770,7 @@ equivalent to porting/running the whole engine under Wine.
 cd /mnt/DATA/Document/code/krkr-rs
 python3 - <<'PY'
 import sys, os, struct
-sys.path.insert(0, 'scripts'); import extract_xp3 as E
+sys.path.insert(0, 'scripts'); from krkr_gates.checks import extract_xp3 as E
 f, index = E.open_index('/mnt/DATA/Games/Others/test/data.xp3')
 names, pos = [], 0
 while pos + 12 <= len(index):

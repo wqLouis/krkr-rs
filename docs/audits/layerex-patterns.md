@@ -16,12 +16,6 @@
 - **This is an audit; the only file written is this one.** No `cargo`/`rustc`/
   `clippy` command was run (AGENTS §0). One already-built test binary was run
   for evidence (`target/debug/deps/layer_ex-9dd5492238b216ec`).
-- A peer agent is fixing `Layer.drawPolygon` in
-  `crates/compat/src/natives/plugins/layer_ex/**`. **At the time of reading,
-  no fix was present in the tree**: `git status` shows unrelated edits under
-  `crates/platform/**` and `crates/vm/src/host.rs` only, and every
-  `layer_ex/*.rs` file still has the checkout mtime with `read_handle`
-  unchanged (`mod.rs:500-516`). The findings below are against that state.
 
 House rules referenced: AGENTS §4 (no silent fallback), §5 (house style), §7
 (genericity), §9 (VM traps), D9, D11, D26, D29, D31, D32, D34.
@@ -43,8 +37,6 @@ Ranked by "would break a real game":
 
 | rank | finding | pattern | script-observable | evidence |
 |---|---|---|---|---|
-| 1 | **F1** `Appearance`/`Path` are recovered through a hidden `__handle` property instead of the object's native instance; a legitimately constructed object can fail the lookup | 1 | yes (throws) | device log; `mod.rs:500-516`, `appearance.rs:507-514`, `path.rs:834-841` |
-| 1 | **F2** `read_handle`'s fallback is a fixed `"not a LayerExDraw value type"` that hides the real `host.member` error and names the wrong type for both `Appearance` and `Path` | 2 | yes (message) | `mod.rs:511-513` |
 | 2 | **F3** `GdiPlus.addPrivateFont` never invalidates the shared `faces` cache, and `resolve_face` caches fallbacks under the requested name, so a later-added private face is unreachable | 6 | yes (metrics/drawing) | `font.rs:600-635`, `resource.rs:250-289` |
 | 3 | **F4** `read_font` reads public properties, so a plain dictionary is accepted as a `FontInfo` where the reference requires a native instance | 1/3 | yes (no throw) | `font.rs:80-104` |
 | 3 | **F5** Scalar `Layer.draw*` coordinates use `value_as_f64`, which maps objects/`null` to `0.0` where `AsReal` raises | 3 | yes | `draw.rs:793-923`, `mod.rs:538-552` |
@@ -53,7 +45,7 @@ Ranked by "would break a real game":
 | 3 | **F10** `Path.draw*` report a fixed `"invalid points"/"invalid rectangles"` and discard the underlying error | 2 | yes (message) | `path.rs:555,583,611,637,680-681` |
 | 3 | **F13** `Layer.setTransform`/`setViewTransform` cannot read a native `GdiPlus.Matrix` (`read_matrix` has no native-payload branch; `Matrix` exposes no `m11`/`dx`) | 3 | yes (throws) | `draw.rs:708-750`, `matrix.rs:139-163` |
 | 4 | **F8** Per-layer `DrawState` and `LayerExMovie` slots are never cleaned on layer destruction; movie slots retain the script `Layer` object | 4/6 | no (leak) | `draw.rs:179-183,596`, `movie.rs:97-110,261-279` |
-| 4 | **F9** `Appearance.__handle`/`Path.__handle` are port-only script members; `RectF.Union` is also registered as an instance method with different semantics | 5 | yes (member set) | `appearance.rs:507-514`, `path.rs:834-841`, `geom.rs:484-560,793` |
+| 4 | **F9** `RectF.Union` is registered as an instance method with different semantics from the reference's static | 5 | yes (member set) | `geom.rs:484-560,793` |
 | 4 | **F11** `appearance_ref`/`path_ref` return `&'a` with an unbounded lifetime; currently safe only because every caller uses the borrow synchronously | 4/6 | no (latent) | `draw.rs:640-658` |
 | 4 | **F12** `drawCurve3`'s `offset`/`numberOfSegments` use `value_as_usize`; a negative value becomes `0` instead of the reference's `AsInteger` + range guard | 3 | yes (edge) | `draw.rs:943-954`, `path.rs` `cardinal_spline` |
 
@@ -61,7 +53,7 @@ Nothing in `record.rs`, `image.rs`, `perspective.rs`, `gdiplus.rs`, `geom.rs`
 or `matrix.rs` rises to rank 1-2. `matrix.rs` is the **positive control**: it
 already resolves a `Matrix` argument through
 `native_instance_payload(..., "Matrix")` (`matrix.rs:154-163`), the exact
-class-chain mechanism the reference uses and the one F1 needs.
+class-chain mechanism the reference uses.
 
 ---
 
@@ -100,81 +92,11 @@ subclass of `Layer` with a legacy-style constructor** and (b) the call is
 unqualified inside that constructor. That is the coverage gap: **no test in
 `crates/compat/tests/layer_ex.rs` or `layer_ex_behaviour.rs` creates a
 `class X extends Layer { function X(win,par){ Layer(win,par); ... } }` and
-draws on it**, so `read_handle`'s failure mode for that shape is untested.
+draws on it**, so the legacy-constructor/subclass receiver path is untested.
 
 ---
 
-## 3. Pattern 1 — hidden-handle lookups that can fail for a valid object
-
-### F1 (rank 1) — `Appearance`/`Path` are read through `__handle`, not the native instance
-
-**What the code does.** `read_handle` (`mod.rs:500-516`) retains the argument,
-then reads a hidden `"__handle"` **property** and requires a positive integer:
-
-```rust
-match host.member(object.raw_id(), "__handle") {
-    Ok(TjsValue::Integer(handle)) if handle > 0 => Ok(handle as usize),
-    Ok(TjsValue::Real(handle))    if handle > 0.0 => Ok(handle as usize),
-    _ => Err(format!("{what}: the argument is not a LayerExDraw value type")),
-}
-```
-
-The property is a per-class getter that returns `instance as usize`:
-`appearance.rs:330-339` + `appearance.rs:507-514`, `path.rs:300-310` +
-`path.rs:834-841`. `read_handle` is called only from `appearance_ref`
-(`draw.rs:640-650`) and `path_ref` (`draw.rs:652-658`).
-
-**What the reference does.** The C++ method parameter is
-`const Appearance *app` / `const Path *path`, and ncbind obtains it from the
-object's **native instance on the class chain** —
-`AdaptorT::GetNativeInstance(src.AsObjectNoAddRef())`
-(`windows/main.cpp:104-131`, blend2d `LayerExDraw.cpp:2916-2943`). The engine's
-own dispatch does the same: `NativeInstanceSupport(TJS_NIS_GETINSTANCE,
-classid)` (`crates/tjs/cpp/tjs2_abi.cpp:1205-1231` for methods,
-`:1329-1360` for properties).
-
-**Why the difference bites.** A property getter resolves the payload from
-`objthis` via `NativeInstanceSupport` too, so the two agree for an ordinary
-`new GdiPlus.Appearance()`. They do **not** agree when the property is not
-reachable on the object as an own/class member the VM dispatches, or when it is
-present but resolves to a null payload: the getter then either throws ("property
-read on an object that is not an instance of this native class",
-`tjs2_abi.cpp:1347-1352`) or writes `0` (`handle_get` casts a null `instance` to
-`0`), and `read_handle` turns both into the same generic error. The device log
-is the proof that a real, legitimately constructed `new GdiPlus.Appearance()`
-reached that path; `app.addBrush(0x7ff00000, 0, 0, 0)` (4 args) succeeded, so
-the object existed and had its payload, yet the later `drawPolygon` could not
-recover it. The only untested structural variant in that call is the
-legacy-constructor/script-subclass receiver; the `__handle` own-property copy is
-class-construction-sensitive in a way the native-instance lookup is not.
-
-**Minimal reproduction shape** (not runnable here without a build):
-
-```tjs
-class ResizeButton extends Layer{
-    function ResizeButton(win, par){
-        Layer(win, par);
-        setSize(16, 16);
-        var app = new GdiPlus.Appearance();
-        app.addBrush(0x7ff00000, 0, 0, 0);
-        drawPolygon(app, [[8,0],[16,0],[16,16],[0,16],[0,8]]);
-    }
-}
-var b = new ResizeButton(win, null);
-```
-
-**Script-observable:** yes — the call throws and, in the game, the escaped
-exception left the scene slot void and produced 540 cascading timer failures
-(`krkr-rs-logs (2).txt:769` onward).
-
-**Proposed fix direction (do not implement).** Resolve `Appearance`/`Path` the
-way `matrix.rs:154-163` and `image.rs:156-164` already do:
-`host.native_instance_payload(object.raw_id(), "Appearance" | "Path")`, falling
-back to the payload pointer only for a missing native instance. Keep the
-`__handle` property only if a cross-class pointer is genuinely needed for the
-`GdiPlus.Path` → `Layer.drawPath` case (it is not; `Path` is registered as a
-native-instance class too). Add the legacy-constructor test above to
-`crates/compat/tests/layer_ex.rs`.
+## 3. Pattern 1 — class-chain lookups
 
 ### F4 (rank 3) — `read_font` bypasses the native instance entirely
 
@@ -190,34 +112,15 @@ divergence is the accepted dictionary. **Script-observable:** yes (D34).
 **Fix direction:** require `native_instance_payload(..., "FontInfo")` (the
 internal class name, `gdiplus.rs:325-326`) and read the payload fields.
 
-**Everything else in pattern 1 is already class-chain correct** and was
-checked: `layer_from_objthis` (`mod.rs:102-108`), `image_snapshot`
+**The rest of pattern 1 is already class-chain correct** and was checked:
+`layer_from_objthis` (`mod.rs:102-108`), `image_snapshot`
 (`draw.rs:1058-1078`) for `Layer`/`Bitmap`, `get_record_image`/`draw_image*`
 (`draw.rs:1058-1078,2060-2090`), `perspective.rs:230-247`, `matrix.rs:139-163`,
-`image.rs:150-164`. No other `__handle`/`read_handle` use exists in the plugin
-(`grep '"__handle"'` → `appearance.rs:511`, `path.rs:838`; `read_handle` →
-`draw.rs:645,653`).
+`image.rs:150-164`.
 
 ---
 
 ## 4. Pattern 2 — misleading fixed error messages
-
-### F2 (rank 1) — the fixed `"not a LayerExDraw value type"` fallback
-
-`mod.rs:511-513` is the message that made the device diagnosis slow:
-
-- it is emitted for a **`Path`** read too (`path_ref` passes the same helper),
-  so `dst.drawPath(app, notAPath)` reports `"Layer.drawPath: the argument is
-  not a LayerExDraw value type"` even though a Path was expected;
-- it discards the `Err` from `host.member` (`mod.rs:509`), so the real cause
-  (`"property read on an object that is not an instance of this native class"`,
-  `tjs2_abi.cpp:1347-1352`, or `"invalidated object"`, `:1353-1356`) is lost;
-- it is also used for the `value.ty != VAL_OBJECT` case (`mod.rs:503-505`
-  returns a different message) and for a `handle <= 0`.
-
-**Fix direction:** one message per expected type (`"Layer.drawPath: expected a
-GdiPlus.Path"`, `"expected a GdiPlus.Appearance"`) and propagate the
-`host.member` error instead of swallowing it.
 
 ### F10 (rank 3) — `Path.draw*` fixed `"invalid points"` / `"invalid rectangles"`
 
@@ -230,7 +133,7 @@ direction:** keep the method prefix but append the underlying error, as
 `read_number_member`/`read_point_object`/`read_rect_object`
 (`mod.rs:283-350`) do map the underlying member error to a contextual
 `"{what}: the object is not a point/rectangle"`, which is acceptable; the
-`read_handle` and `Path.draw*` sites above are the outliers.
+`Path.draw*` sites above are the outlier.
 
 ---
 
@@ -297,9 +200,9 @@ an object; otherwise they raise. The reference `getPoints`/`getRects`
 non-array object yields an empty list (no throw). So `dst.drawPolygon(app, [1,
 2, 3])` (a flat array of integers) or `dst.drawPolygon(app, %[a:1])` draws
 nothing in the reference and throws `"element 0 is not a point"` / `"the
-argument is not an array"` in the port. This is the opposite of the exemplar
-(F1 accepts nothing where the reference accepts something), but it is the same
-marshalling surface. **Script-observable:** yes. **Fix direction:** match
+argument is not an array"` in the port. This is the opposite of the
+exemplar case (the port accepts nothing where the reference accepts something),
+but it is the same marshalling surface. **Script-observable:** yes. **Fix direction:** match
 `GetArrayCount` semantics (absent/non-array ⇒ empty) and default a non-object
 element to `(0,0)` while still reading a native `PointF`/`RectF` via the
 class-chain (which `read_point_object`/`read_rect_object` already do by member
@@ -341,8 +244,8 @@ The game's idiom is `drawPolygon(app, ...); invalidate app;`
 - `draw_string`/`draw_path_string` (`draw.rs:1402-1580`) hold `app` only for the
   synchronous `with_layer` closure and clone the produced `BitmapState` into the
   record.
-- `read_handle`/`appearance_ref`/`path_ref` return raw payload borrows for the
-  duration of the call. **No pointer into the invalidated object survives the
+- `appearance_ref`/`path_ref` return raw payload borrows for the duration of the
+  call. **No pointer into the invalidated object survives the
   callback.** A script cannot invalidate mid-call (single-threaded VM, and the
   only re-entry points — `new_rectf`/`eval_object` in `set_rectf_result` — run
   after the borrow is no longer used).
@@ -377,31 +280,24 @@ the callback scope.
 | `RectF` ctor + `x/y/width/height` + `left/top/right/bottom/location/bounds` + `Clone/Equals/Inflate/InflatePoint/IntersectsWith/IsEmptyArea/Offset/Union` (`windows/main.cpp:181-210`) | `geom.rs:763-878` | match, plus one extra (below) |
 | `Image` ctor + `load/Clone/GetBounds/GetFlags/GetHeight/GetWidth/Get*/GetLastStatus/GetPixelFormat/GetType/RotateFlip` (`blend2d/LayerExDraw.cpp:3397-3403`) | `image.rs:520-580` | match |
 | `FontInfo` ctor + 4 read/write + 5 read-only (`blend2d:3418-3429`) | `font.rs:501-548` | match |
-| `Appearance` ctor + `clear/addBrush/addPen` (`blend2d:3431-3436`) | `appearance.rs:490-506` | match + `__handle` extra |
-| `Path` ctor + 17 methods (`blend2d:3438-3457`) | `path.rs:820-905` | match + `__handle` extra |
+| `Appearance` ctor + `clear/addBrush/addPen` (`blend2d:3431-3436`) | `appearance.rs:490-506` | match |
+| `Path` ctor + 17 methods (`blend2d:3438-3457`) | `path.rs:820-905` | match |
 | `NCB_ATTACH_CLASS_WITH_HOOK(LayerExDraw, Layer)` property/method set (`blend2d:3707-3755`) | `draw.rs:2305-2495` + `perspective.rs:341-347` + `movie.rs:505-530` | exact name-for-name match |
 | `GdiPlus` namespace + 7 nested classes + `addPrivateFont`/`getFontList` (`blend2d:3463-3651`) | `gdiplus.rs:257-330` | match (globals deleted) |
 
-**F9 (rank 4) — port-only surface.** `Appearance.__handle` and `Path.__handle`
-are script-visible read-only integer properties with no reference counterpart,
-and they appear in the live dump (`target/runtime_surface.json`,
-`docs/surface/runtime_surface.json:615,671`). `plugin_parity.py` classifies
-them as *plugin extras* and does **not** fail on extras (`plugin_parity.py:2032`
-counts them, the failure gates are `new_missing`/`wrong_level_failures`/
-`port_only_failures`/`stale` only), and the surface lock baseline already
-contains them, so the gate is green. They remain a D34 surface divergence (a
-script can observe `typeof app.__handle == 'Integer'`). `RectF.Union` is also
-registered as an **instance** method (`geom.rs:484-560`) in addition to the
-class-level static (`geom.rs:562-640`); the port's own comment calls the
-instance form a port extension. `r.Union(a,b)` returns a new `RectF` in the port
-while the reference exposes only the 3-argument `static Union(RectF&, const
-RectF&, const RectF&)` (`blend2d/LayerExDraw.hpp:389-397`,
-`windows/main.cpp:210`). **Fix direction:** drop `__handle` once F1 lands, and
-drop or align the instance `Union`.
+**F9 (rank 4) — port-only surface.** `RectF.Union` is registered as an
+**instance** method (`geom.rs:484-560`) in addition to the class-level static
+(`geom.rs:562-640`); the port's own comment calls the instance form a port
+extension. `r.Union(a,b)` returns a new `RectF` in the port while the reference
+exposes only the 3-argument `static Union(RectF&, const RectF&, const
+RectF&)` (`blend2d/LayerExDraw.hpp:389-397`, `windows/main.cpp:210`). The
+`plugin-parity` check classifies extras without failing on them, so the gate is
+green; it remains a D34 surface divergence. **Fix direction:** drop or align
+the instance `Union`.
 
 **Parity visibility.** The "plugin member registration invisible to the parity
 scripts" standing concern does **not** apply to `layer_ex`:
-`scripts/plugin_parity.py` parses `crates/compat/src/natives/plugins/**`
+The `plugin-parity` check parses `crates/compat/src/natives/plugins/**`
 (native_parity helpers) and recognises `register_instance(NativeInstanceBuilder)`,
 `register_static_members(NativeStaticMembers)`, and
 `register_instance_members(NativeInstanceMembers{class_name: "Layer"})`
@@ -489,13 +385,6 @@ bug. No change requested.
 
 ## 9. What this audit cannot decide without a build or a device
 
-- **The exact trigger of F1.** The device log proves `read_handle` failed for a
-  real `new GdiPlus.Appearance()`; it does not prove *which* of the two
-  hypotheses (the legacy-constructor/script-subclass object not carrying the
-  `__handle` own property, or the property resolving to a null payload) fired.
-  A host build with the legacy-constructor test in §3 F1 (and a
-  `GdiPlus.Appearance` subclass variant) would pin it. Neither was run here
-  (AGENTS §0).
 - **Whether a specific game calls the F5/F6/F7 shapes.** These are D34
   divergences confirmed against the reference; whether any shipped title passes
   an object where a `REAL` is expected, a short `drawCurve2`, or a flat point
@@ -506,8 +395,6 @@ bug. No change requested.
   confirm whether ncbind exposes it as an instance member, a static, or both.
   The port currently exposes both. The `windows/main.cpp` registration and the
   `ncbind.hpp` `NCB_METHOD` expansion are the tiebreaker.
-- **The `layer_ex` fix in flight.** At read time the peer's change was not in
-  the working tree (§header). Findings are against the unmodified checkout.
 
 ---
 
@@ -515,14 +402,14 @@ bug. No change requested.
 
 | file | lines read | findings |
 |---|---|---|
-| `mod.rs` | all 547 | F1 (`read_handle`), F2, F4 context, F7 (`read_points/rects`), F11 |
+| `mod.rs` | all 547 | F4 context, F7 (`read_points/rects`), F11 |
 | `draw.rs` | all 2495 | F5, F6, F12, F7 (`read_matrix`), F11, F8 (`DrawState`); pattern-4 clone check clean |
-| `appearance.rs` | all 532 | F1 (`__handle`, `handle_get`), F9 |
-| `path.rs` | all 859 | F1 (`__handle`), F10 |
+| `appearance.rs` | all 532 | none |
+| `path.rs` | all 859 | F10 |
 | `font.rs` | all 709 | F3, F4 |
 | `geom.rs` | all 898 | F9 (`RectF.Union` instance); PointF/RectF marshalling matches `PointFConvertor`/`RectFConvertor` |
 | `image.rs` | all 596 | none (correct `native_instance_payload` use) |
-| `matrix.rs` | all 812 | positive control for F1; `read_matrix_arg` correct |
+| `matrix.rs` | all 812 | positive control for the class-chain pattern; `read_matrix_arg` correct |
 | `movie.rs` | all 743 | F8 (`slots` never cleaned, retained layer object) |
 | `perspective.rs` | all 347 | none (`native_instance_id` correct) |
 | `record.rs` | all 368 | none (deep copies; length math checked with `checked_mul`) |

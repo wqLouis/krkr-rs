@@ -31,12 +31,8 @@ proposals.
 ## Measured baseline (desktop, windowed Vulkan, real title)
 
 A windowed run of the release binary on `/mnt/DATA/Games/Others/test/`
-(Yuzusoft, `data.xp3` + `patch.xp3`) with `--backend vulkan --scaling fit`, at
-the 60 fps steady state, 347 clean frames:
-
-> **Note (removed option).** The command above is the one the measurement was
-> taken with; `--scaling` no longer exists (presentation is always Fit —
-> `docs/migration/11`, D39). The numbers stand as the record of that run.
+(Yuzusoft, `data.xp3` + `patch.xp3`) with `--backend vulkan`, at the 60 fps
+steady state, 347 clean frames:
 
 | phase | p50 | p90 | max |
 |---|---|---|---|
@@ -212,8 +208,7 @@ scene already knows which bitmap was written; the host can maintain the
 `dirty` set when it marks a bitmap dirty) and a texture-presence generation, so
 a static frame does zero allocations and zero full scans. The full-region
 re-upload needs a region on `BitmapState`, which is a cross-cutting L2 change
-(every pixel-writing site) and is **needs-review**; the previous perf audit
-(`docs/audits/perf-hotspots.md` §3) reached the same conclusion.
+(every pixel-writing site) and is **needs-review**.
 
 **Upload ring.** `UPLOAD_SLOTS = 3`
 (`crates/platform/render/src/vulkan/texture.rs:164`); the render path calls

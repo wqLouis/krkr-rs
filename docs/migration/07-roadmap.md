@@ -1,203 +1,43 @@
-# 07 — Migration roadmap
+# 07 — Roadmap and phase contract
 
-Status: plan + status record. Phases are ordered so the game stayed runnable
-after each one.
+Status: the four-layer rework is implemented. The phases below are the ones
+that still own work: the frame-ownership finish (Phase 9), the pixel-translation
+readback (Phase 10), and the deferred design work that stays out until a real
+title runs end-to-end. Open items are tracked in [`TODO.md`](../../TODO.md);
+this document records the phase contract and the exit criteria, so a landed
+slice can be checked rather than remembered.
 
-> **Revision note (final layering, 2026).** This roadmap was written for the
-> original layering (host on top, Bevy strangler). Two things changed since:
-> the Bevy frontends were removed and the new crates
-> (`platform/{api,fs,media,render,platform}`, `engine`, `compat`, `vm`,
-> `app`, `android`) were implemented (waves 1–3), and
-> the layering was finalised in
-> [`02-target-architecture.md`](02-target-architecture.md) — host/platform
-> code and archive parsing in **L1**, **L2** a generic engine that holds the
-> layer system, **L3** the KiriKiri compat surface, **L4** the TJS VM.
->
-> The original list of remaining work (move the host into `platform`, move
-> XP3 into L1, explicit archive loading, introduce `compat`/`vm`, media video
-> + startup, Android host, delete `tvp-*`) is **done**. What remains is
-> tracked in `TODO.md`: remove the presentation-scaling feature (Phase 9a
-> below, [`11`](11-presentation-and-pixel-translation.md) §4), the
-> frame-owning `Engine` (Phase 9 below, the prerequisite for the
-> pixel-translation layer in Phase 10), native plugin coverage (`TODO.md`
-> §17), the unmodelled parts of the timer event queue, Android on-device
-> validation, and the deferred performance work (§9, D22).
->
-> The per-phase list below is kept as the record of how the rework was
-> sequenced.
+The layers, crate layout and acceptance criteria are in
+[`02-target-architecture.md`](02-target-architecture.md); the presentation and
+translation contract is in
+[`11-presentation-and-pixel-translation.md`](11-presentation-and-pixel-translation.md).
 
 ---
 
-## 1. Strategy: strangler, not big bang
+## 1. Phase discipline
 
-The new architecture is introduced **alongside** the current one:
+Every phase leaves a runnable game. A phase moves one boundary, lands as a
+replacement (the superseded code, tests, allowlists and docs are deleted in the
+same change), and ends with the gate green and the headless run producing the
+same scene dump. Nothing is kept behind a feature flag: a half-moved boundary
+is a change that is not finished yet, not a configuration.
 
-* the stateless middle-layer API is added first, with a **Bevy-backed
-  adapter** implementing its operations, so `engine` can be written
-  against the API while Bevy still renders;
-* media and FS operations get adapters that wrap today's code
-  (`decode.rs`, `tlg.rs`, `engine::Storage`, `xp3`) without moving it;
-* the Vulkan core is built behind the same API and selected by a runtime
-  flag (`--renderer vk` / `--renderer bevy`) during the overlap;
-* Bevy is deleted only after the Vulkan path reaches parity on the real
-  title and the Android build.
-
-Every phase must leave:
-* `cargo test` green,
-* the native-parity report green (the script was removed with the legacy crates; restore from `main` when the natives are ported),
-* `krkr-rs run <game> --headless` producing the same scene dump,
-* the windowed game playable.
+The old and new implementations never coexist in the tree; git is the history.
 
 ## 2. Phases
 
-### Phase 0 — Plan and branch (this branch)
+### Phase 9a — presentation scaling removed
 
-Deliverable: `docs/migration/*` (this directory).
+**Landed.** Presentation is Fit with letterbox only (D39). The
+`ScalingMode`/`PresentationScaling`/`--scaling`/`ViewTransform`/
+`RenderScene.view`/`platform::native_size` line is gone; the contract and the
+keep-list are [`11` §4](11-presentation-and-pixel-translation.md).
 
-Exit criteria: plan reviewed; open questions in §7 answered; no code change.
-
-### Phase 1 — Define the stateless middle-layer API; extract pure helpers
-
-Deliverables:
-* `api`: object/action signatures + state/DTO types from
-  `03-middle-layer-api.md` (stateless `RenderPipeline`/`Media`/`FileSystem`,
-  explicit `RenderScene`/`RenderState`/`DecoderState`/`FileState`,
-  `BlendMode`, `DecodedImage`, `AudioSpec`, `RgbaFrame`, …).
-* Move the pure, already-tested helpers out of `render`:
-  `compose_layer`, `visible_image_region`, `rect_center`,
-  `window_to_game_transform`, `window_logical_size`, `host_window_resize`,
-  `clamp_opacity`, `window_layer_order`, `sprite_z`, `bitmap_tint`,
-  `fill_sprite_color`, and the TVP→`BlendMode` mapping.
-* Add test doubles: an in-memory `FileSystem`, `NullRenderPipeline`, a stub media backend,
-  `MockClock`, so L2 can be constructed with no window/GPU/codec/fs.
-* Add the **D9 guard**: a CI grep/test that rejects mutable statics,
-  `thread_local!`, `LazyLock`/`OnceLock`/`OnceCell`/`lazy_static!` and
-  module-level `HashMap` caches in `krkr-core`/`api`.
-
-Exit criteria:
-* helpers live in a Bevy-free crate and their existing tests pass there;
-* no behavior change in the renderer;
-* the D9 guard is green and two `Engine`s with independent backends can be
-  constructed in one test process.
-
-### Phase 2 — Build the L2 layer system on the API
-
-Deliverables:
-* `engine`: the `Scene`/`LayerState`/`BitmapState` model moves here
-  (out of `tvp-visual`), plus the **`Scene → RenderScene` projection** (a
-  field-level sync, not a draw list).
-* `Engine` struct with injected stateless objects and stored state values
-  (`03-middle-layer-api.md §8`).
-* A Bevy-backed **platform adapter** implementing the stateless operations
-  by wrapping the current `sync_scene` on the L1 side, so the game still
-  runs through Bevy while L2 is written against the new API.
-* `tvp-visual` becomes the native adapter over `engine` (public
-  methods preserved as shims).
-
-Exit criteria: identical rendering through the adapter; no native behavior
-change; `tvp-visual` no longer owns `Scene`; L2 contains no draw-list or
-traversal code.
-
-### Phase 3 — File system (stateless)
-
-Deliverables:
-* `fs`: stateless `FileSystem` object + in-memory root, positional
-  `FileState`.
-* `xp3::Xp3Archive` reads positionally (no live `std::fs::File`).
-* `engine::Storage` moves onto the stateless fs functions (shimmed public
-  API); **L2 gains the namespace index and any buffering**.
-* logging/state/savedata/native IO routed through the fs functions.
-
-Exit criteria: `Storage` behaves identically against the in-memory root and
-the real game; no `std::fs` left outside `fs` except tests. Decide the
-`cpp/streams.cpp` hook (`06-file-system.md §6`).
-
-### Phase 4 — Media engine
-
-Deliverables:
-* `media`: `decode_image`/`probe_*` free functions (TLG + `image`),
-  `AudioDecoderState`/`VideoDecoderState` values, FFmpeg + unsupported
-  backends; MediaCodec after Linux parity.
-* `tvp-sound` decode calls the stateless API; mixer/model stay in L2.
-* **L2 gains the worker pool and completion table**; L1 stays stateless.
-* video frame + PCM sinks in the video overlay.
-
-Exit criteria: BGM/voice/image load through the stateless API; video is
-visible and audible (Linux); Android compiles with the MediaCodec backend.
-
-### Phase 5 — Vulkan render pipeline bring-up
-
-Deliverables:
-* `render` `RenderPipeline`: `ash` device/swapchain/pipelines, tree
-  traversal/composition, texture upload (sub-rect), `RenderScene`
-  submission, `SourceOver`/fixed-function blends.
-* Golden-image test harness (Bevy vs Vulkan framebuffer compare).
-* `--renderer vk` runtime selection while Bevy remains the default.
-
-Exit criteria: the demo scene and the real title render acceptably under
-Vulkan; fixed-function blend matrix passes; no Bevy in the Vulkan path.
-
-Phase 5b (can follow immediately): destination-dependent blends via the
-offscreen ping-pong path; then GPU transitions if wanted.
-
-### Phase 6 — Replace the Bevy host
-
-Deliverables:
-* `winit` event loop + `InputSource` + `HostWindow`; fixed-step VM drive.
-* `input_bridge`/`touch_gesture` split: raw events from the host, logic in
-  L2.
-* CPU-drawn menu replacing `render/src/menu.rs` Bevy UI.
-* Remove `VM_RUN_LOCK` (no parallel scheduler anymore).
-
-Exit criteria: the windowed game runs with no Bevy crate on the desktop
-path.
-
-### Phase 7 — Android host
-
-Deliverables:
-* `android-activity` host replacing `#[bevy_main]`; Vulkan surface from the
-  `ANativeWindow`; own swapchain lifecycle.
-* Preserve the JNI contract (`pendingGameDir`/`pendingGameName`/
-  `pendingStateDir`), state file, log rotation, touch/back handling.
-* MediaCodec video; `fs` Android roots.
-
-Exit criteria: APK builds and runs the game on device with Vulkan.
-
-### Phase 8 — Delete Bevy and rename crates
-
-Deliverables:
-* remove `bevy` from every manifest and from `Cargo.lock`;
-* final crate renames (`tvp-*` → `krkr-*`) if desired, in reviewable
-  commits;
-* update README, `docs/portability.md`, `docs/android.md`,
-  `docs/optimization.md` to the new architecture.
-
-Exit criteria: `02-target-architecture.md §9` acceptance criteria all hold.
-
-### Phase 9a — Remove the presentation-scaling feature
-
-**Status: landed.**
-
-The first attempt at scaling (the `feat(scaling)` line) is removed rather than
-adapted: it scaled the composited tree through a whole-tree `ViewTransform`
-and is built the wrong way round for the target design. Contract, deletion
-inventory and the keep-list: [`11`](11-presentation-and-pixel-translation.md)
-§4.
-
-Deliverables:
-* delete `ScalingMode`/`Presentation` (engine), `PresentationScaling` + the
-  `scaling` config key (api/config/CLI/Android), `ViewTransform` +
-  `RenderScene.view` (render), the `app`/`android` logical-size plumbing and
-  `platform::native_size`;
-* keep `render::scene::{node_spaces, place_rect}` and the CPU nearest-texel
-  sampling (the Vulkan sampler may filter bilinearly at a scaled presentation);
-* update the docs that described the feature (this list, `04 §6.1`,
-  `runtime-config.md`, `android.md`, `audits/perf.md`).
-
-Exit criteria: gate green; a headless and a windowed run present one-to-one at
-the game's declared size; `git grep -n 'ScalingMode\|PresentationScaling\|
-native_size' crates` is empty (the GDI+ `Layer.*ViewTransform` surface stays);
-surface lock and both parity reports unchanged.
+Exit criteria, met: gate green; a headless and a windowed run present
+one-to-one at the game's declared size; `git grep -n
+'ScalingMode\|PresentationScaling\|native_size' crates` is empty (the GDI+
+`Layer.*ViewTransform` surface stays); surface lock and both parity reports
+unchanged.
 
 ### Phase 9 — L2 owns the frame (D26 / D27)
 
@@ -207,6 +47,7 @@ This is the prerequisite for Phase 10: the pixel translation is recomputed per
 size change *inside the frame*, and the frame is where projection happens.
 
 Landed:
+
 * `Engine::frame(now_ms, hooks)` + `Engine::step(dt_ms, hooks)` + the
   `GameFrame::before_render(now_ms, dt_ms)` trait declared in L2 and
   implemented by the composition root (`VmHook` runs the VM tick and the audio
@@ -219,6 +60,7 @@ Landed:
   drive virtual time instead of the wall clock.
 
 Remaining:
+
 * move the mixer (audio pump), video and transition pumps from the hook into
   L2, then retire `SoundState.clock` and pass an L2-owned delta to those
   pumps;
@@ -243,6 +85,7 @@ The device-resolution presentation and the VM↔device boundary. Contract:
 [`11`](11-presentation-and-pixel-translation.md) §6–§7.
 
 Landed:
+
 * `engine::translate::PixelTranslation` — Fit (D39) mapping with
   `to_device_*`/`to_vm_point`/`raster_scale`/`vm_pixel_region`, owned and
   recomputed by `Engine` on a VM or framebuffer size change (D40);
@@ -255,6 +98,7 @@ Landed:
   Android keeps the display surface and refits the declared size into it.
 
 Open:
+
 * glyph rasterization at `size_px · raster_scale()`, with **layout metrics
   still VM** so every script-visible measurement is unchanged (today glyphs
   are rasterized into the VM-resolution layer bitmap and the GPU scales the
@@ -281,29 +125,20 @@ backing to the window. It is documented here as a possible direction only: the
 raw-buffer/plugin compatibility surface and the CPU-native reference path make
 it a larger project, and it is **not implemented**.
 
-## 3. Suggested commit/branch discipline
-
-* One phase per feature branch off `migration/middle-layer-ash`, merged
-  back only when the game is runnable.
-* Keep the old and new implementations behind a feature flag until the
-  phase's exit criteria pass, then delete the old one in a separate commit.
-* Never move more than one boundary per commit (e.g. do not combine FS and
-  media moves).
-
-## 4. Testing strategy
+## 3. Testing strategy
 
 | Level | What | Where |
 |-------|------|-------|
 | Unit | pure helpers, blend mapping, FS namespace, layout | L2/L1 crates |
-| **Statelessness (D9)** | `scripts/check-stateless.sh` + build two independent engines in one process | gate |
+| **Statelessness (D9)** | `uv run --project scripts krkr-gate stateless` + build two independent engines in one process | gate |
 | Backend parity | the null and Vulkan backends consume the same `RenderScene` contract; the null software rasterizer is the baseline | `render` |
 | Blend matrix | one quad per fixed-function `BlendMode` over a known background | `render` |
 | Integration | `krkr --headless` scene/phase log over the real title | `app` |
-| **Surface lock (D29)** | the live VM dispatch dump vs the committed baseline: `python3 scripts/surface_lock.py` — fails on any **added or removed** member | **gate, every commit** |
+| **Surface lock (D29)** | the live VM dispatch dump vs the committed baseline: `uv run --project scripts krkr-gate surface-lock` — fails on any **added or removed** member | **gate, every commit** |
 | Parity | reference-vs-Rust *report* of what is missing (coverage tracking — a presence metric, not a correctness claim) | report |
 | Media | host-testable pure parts (YUV, TLG, decode wrappers) | `media` |
 | FS | in-memory `FileSystem` fixtures, real-game mount | `fs`/`engine` |
-| Android | host-feature compile + `scripts/check-android-target.py`; device run manual | gate / manual |
+| Android | `uv run --project scripts krkr-gate android-target`; device run manual | gate / manual |
 
 Regression rule: the headless run, the **surface lock** and the native-parity
 report are the three coarse "nothing broke" signals and must be checked at
@@ -312,129 +147,41 @@ signal that fails when someone *invents* surface or silently drops a member.
 Behaviour is constrained separately — every semantic must be cited to
 `reference/cpp` (D28).
 
-## 5. Metrics to watch
-
-* startup decode time and BGM stall (baseline in `docs/optimization.md`:
-  645 ms image decode, 8.5 s BGM);
-* per-frame cost (Bevy sync baseline: 0.9 ms @23 layers, 4 ms @400);
-* binary size and dependency count (`cargo tree`), especially after Bevy is
-  removed;
-* idle-frame work (should be ~zero via `Scene::revision`).
-
-## 6. Risks and mitigations
+## 4. Risks
 
 | # | Risk | Likelihood | Impact | Mitigation |
 |---|------|:---------:|:------:|------------|
-| R1 | **Vulkan-only excludes devices/emulators** with no/old Vulkan, or flaky drivers. | Medium | High | Keep Bevy/GL as a fallback during migration; document min Vulkan; test on real devices; consider a GLES backend behind the same stateless ops later (the boundary makes it possible). |
-| R2 | Reimplementing windowing/input/IME is more work than estimated. | High | Medium | Reuse the already-pure hit-test/gesture logic; winit is already a dependency; keep `VM_RUN_LOCK` until the host loop is proven. |
-| R3 | Bevy UI menu loss causes visible regressions. | Medium | Medium | CPU-drawn menu early (Phase 6), golden-image it. |
-| R4 | sRGB/color mismatch between Bevy and Vulkan paths. | High | Medium | Pin one convention (`Rgba8UnormSrgb` + linear shader math) and add a color test to the blend matrix. |
-| R5 | CPU compositing/upload remains the bottleneck; Vulkan gains little. | Medium | Low | Sub-rect uploads, staging ring, revision fast path; GPU paths are an optimization behind the same API. |
-| R6 | API churn: `RenderScene`/media API need changes after L2 uses them. | Medium | Medium | Phase 1 mocks exercise the API before any backend; keep DTOs additive. |
-| R7 | Android MediaCodec is still runtime-untested. | High | Medium | Treat as compile-verified until on-device; keep FFmpeg out only on Android; test on hardware in Phase 7. |
-| R8 | `cpp/streams.cpp` `fopen` breaks Android savedata through the FS layer. | Medium | Medium | Decide the hook in Phase 3; option A (Rust callback) if savedata must route through FS. |
-| R9 | Schedule/scope creep (this is a whole-engine rewrite). | High | High | Phased exit criteria; each phase independently shippable; default branch stays Bevy until parity. |
-| R10 | TJS ABI limits (no object handles) surface as the layer system moves. | Medium | Medium | They already exist today; the move does not change the ABI. `docs/gdiplus.md §0` records the fix. |
+| R1 | **Vulkan-only excludes devices/emulators** with no/old Vulkan, or flaky drivers (D4). | Medium | High | Document the minimum Vulkan; test on real devices; a GLES backend behind the same stateless ops stays possible without changing L2. |
+| R2 | Windowing/input/IME is more work than estimated (TODO §7). | High | Medium | Keep the pure hit-test/gesture logic in L2; the platform loop stays in L1; the input imprecisions are listed in `TODO.md` §7. |
+| R3 | sRGB/colour mismatch across the CPU and Vulkan paths. | Medium | Medium | Pin one convention (`Rgba8UnormSrgb` + linear shader math) and keep the colour case in the blend matrix. |
+| R4 | CPU compositing/upload remains the bottleneck; Vulkan gains little. | Medium | Low | Sub-rect uploads, the staging ring, the revision fast path; GPU paths are an optimization behind the same API (D8). |
+| R5 | `BitmapState` carries no dirty region, so a full-frame upload cannot be narrowed without a cross-cutting L2 change. | Medium | Medium | Treat as open design work; measure before changing every pixel-writing site. |
+| R6 | Android MediaCodec is still runtime-untested. | High | Medium | Compile-verified until an on-device run; FFmpeg stays off only on Android. |
+| R7 | `crates/tjs/cpp/streams.cpp` `fopen` and the serializer break savedata on Android, and every save-path memory-safety defect so far was there. | Medium | Medium | The C++ adapter over a Rust implementation is deferred (TODO §16); reproduce against the reference before changing it. |
+| R8 | TJS ABI limits (no object handles) surface as the layer system moves. | Medium | Medium | They already exist today; the move does not change the ABI. `docs/gdiplus.md` §0 records the workaround. |
 
-## 7. Open questions for review
-
-1. **Glyph engine placement**: `render` vs a standalone `krkr-glyph`
-   crate vs `krkr-core`. The `FontSystem`/`Font` objects have no GPU
-   dependency. (Plan: `render` initially.)
-2. **`RenderScene` ownership**: does L2 keep a *parallel* `RenderScene`
-   projected from the TVP layer tree each frame (plan: simple field copy),
-   or do the L2 layer nodes embed a `RenderNode` so there is one tree and no
-   copy? The latter couples TVP state to the L1 type but avoids a sync pass.
-2. **GPU text ever?** If yes, does L2 keep CPU composition as the source of
-   truth (recommended) or switch `MainImage` to a GPU texture with
-   read-back? The latter breaks cheap pixel access.
-3. **`cpp/streams.cpp`**: Rust IO hook vs Rust reimplementation vs leave.
-4. **Crate renaming**: do the `tvp-*` crates become `krkr-*`, or do the
-   `tvp-*` names stay (they mirror the reference and the TJS class names)?
-5. **Vulkan fallback**: accept Vulkan-only (D4) or keep a GLES backend
-   behind the same stateless ops for old devices?
-6. **Destination-dependent blends & transitions**: implement via the GPU
-   ping-pong compositor (plan) or keep them CPU-side and only blit results?
-7. **`Engine` ownership**: one process-global engine (current) vs an
-   injected instance (plan). Tests want injection; the TJS VM is one-per-
-   process today.
-8. **Android default**: keep SAF→path (option A) or invest in a SAF/asset
-   FS root (option B) now that the stateless fs surface exists?
-
-## 8. Definition of done (architecture)
+## 5. Definition of done (architecture)
 
 The migration is complete when, on both Linux and Android:
 
-* the game runs on the Vulkan core with no Bevy dependency;
-* the layer system state, media, and file system sit in the layers defined
-  in `02-target-architecture.md`, and the render pipeline consumes the
+* the game runs on the Vulkan core, and the tree carries no ECS or `tvp-*`
+  dependency;
+* the layer system state, media and file system sit in the layers defined in
+  `02-target-architecture.md`, and the render pipeline consumes the
   `RenderScene` tree, verified by the dependency acceptance tests in
-  `02-target-architecture.md §9`;
-* `engine` contains no render traversal, draw-list or batching code;
-* the old Bevy renderer, wgpu materials, and the `VM_RUN_LOCK` workaround
-  are deleted;
-* documentation (`README`, `docs/portability.md`, `docs/android.md`,
-  `docs/optimization.md`) describes the new architecture, not the old one.
+  `02-target-architecture.md` §9;
+* `engine` contains no draw-list, batching or draw-call code (traversal and
+  drawing are L1);
+* `compat` reaches the engine only through `compat/src/engine_api.rs`
+  ([`14-l3-l2-protocol.md`](14-l3-l2-protocol.md)), and the `layering` check
+  is green without a new exception;
+* documentation describes the current tree, not a superseded one.
 
-## 9. Performance opportunities (merged from `10-performance-opportunities.md`)
+## 6. Performance
 
-Status: **forward-looking backlog.** **Deferred by D22** until a real game runs
-end-to-end — correctness first, then invest. This complements the historical audits
-[`../optimization.md`](../optimization.md) and [`../performance.md`](../performance.md),
-which measured the *old* Bevy/tvp-* tree and are kept only as a record. Numbers
-here are not measured yet; they are the places we know we can win, ordered by
-expected impact for real KiriKiri titles (text-heavy, many TLG layers, long BGM).
-
-The rule for every item below: **the CPU path is the correctness reference**
-(D8). An optimisation may change *how* pixels are produced, never *what* a
-script can read back through `getPixel`/readback.
-
-### L1 `render`
-
-| Opportunity | Why it matters | Notes |
-|---|---|---|
-| **GPU glyph runs** (`RenderContent::Glyphs`) | Today L2 emits **one `RenderContent::Texture` node per glyph**; a KAG screen with 2 000 characters = 2 000 nodes, transforms and draw submissions. This is the single biggest text cost. | Expand a run into **one instanced draw** sampling the L2 atlas. Vulkan backend currently returns `Unsupported` for `Glyphs` (`vulkan/mod.rs:30`); null counts it (`null.rs:546`). |
-| **Programmable/advanced blends** (`VK_EXT_blend_operation_advanced`) | Dest-dependent `DstBlend` modes (Multiply/Screen/Overlay/ColorDodge/…) are CPU-only today; GPU scenes fall back or return `Unsupported`. | Exposes most modes as hardware blend ops; keep the CPU path for `ColorDodge5`/`Difference5` and GPUs lacking the feature. |
-| **MSDF atlas** | Crisp text at arbitrary zoom/rotation without re-rasterising per size (KAG effects scale layers). | Generate once (CPU `msdfgen`/Rust port or compute pass); shader derives coverage. |
-| **Async readback** | `read_render_target` waits on a fence; a script that samples every frame stalls the CPU↔GPU sync. | Ring-buffer of readback targets + deferred map; return the previous frame's pixels. |
-| **Batching / pipeline cache** | Fewer pipeline switches and vertex uploads per frame. | Batch by `(texture, blend, clip)`; reuse the staging buffer; cache `VkPipeline` by state. |
-
-### L1 `media`
-
-| Opportunity | Why it matters | Notes |
-|---|---|---|
-| **Hardware video decode** | Software FFmpeg decode of 1080p is the dominant startup/scrub cost. | VAAPI/NVDEC on Linux, MediaCodec on Android; zero-copy frames into the render path. |
-| **Streaming `video_audio`** | The current `video_audio` decodes the **whole** track eagerly (the scaffold has no range parameter). | Add a range/streaming API and decode on demand. |
-| **SIMD image/TLG decode** | TLG is the most common KiriKiri image; startup decodes dozens. | SIMD predictor + colour conversion; parallel decode with a bounded pool. |
-| **Faster inflate** | XP3 entries and `FE FE` script containers use zlib. | `libdeflate`/`zlib-ng` instead of the default backend. |
-
-### L1 `fs`
-
-| Opportunity | Why it matters | Notes |
-|---|---|---|
-| **Index lookup** | `find`/`stat` run per storage open; a title can open thousands per boot. | Hash the XP3 index once; avoid repeated linear scans; cache decoded paths/offsets. |
-| **Decompress cache** | Re-opening the same entry re-inflates it. | Small LRU of decoded entries keyed by `(archive, offset)`; never mutate the mounted set. |
-| **Memory-map archives** | Large direct-from-disk reads. | mmap the container on desktop; `pread` on Android. |
-
-### L2 `engine`
-
-| Opportunity | Why it matters | Notes |
-|---|---|---|
-| **Glyph cache by coverage, not colour** | The atlas key includes the **colour** today, so every text-colour change re-rasterises and re-uploads. KAG text recolours constantly. | Cache straight-alpha coverage only and tint per node (the Vulkan shader already takes a push-constant tint — `vulkan/draw.rs:34`); the per-glyph tint becomes the text colour. **Highest text-cache win.** |
-| **Layout cache** | `cosmic-text` shaping runs every frame for unchanged labels. | Key by `(face, text, size, style, wrap-width)`, invalidate on change. |
-| **Multi-page atlas + eviction** | One fixed atlas hits `AtlasFull` and then fails. | Grow to several pages; LRU-evict cold glyphs. |
-| **Run batching** | Feed `RenderContent::Glyphs` once the L1 path exists. | Removes the per-glyph node overhead. |
-| **Scene projection dirty flags** | `project` rebuilds the whole `RenderScene` each frame. | Track per-layer dirty bits; reuse unchanged subtrees. |
-| **Mixer SIMD + quality** | Software mixing of several BGM/voice channels. | SIMD the gain/pan/resample inner loops; make resampler quality configurable. |
-
-### L3 `compat` / L4 `vm`
-
-| Opportunity | Why it matters | Notes |
-|---|---|---|
-| **Native dispatch** | Every property read/write is a TJS→C thunk. | Cache resolved members; avoid allocating dictionaries per call. |
-| **Script compile cache** | Re-parsing scripts on reload. | Cache compiled bytecode by storage path + mtime. |
-
-### How to measure
-Add `#[ignore]` perf probes next to the code (the old tree used this pattern) and
-a scene benchmark that rebuilds a title-like `Scene` (1 window, ~23 layers,
-~34 bitmaps) so the text/layer counts match the real test title.
+Performance work is deferred by D22 until a real game runs end-to-end.
+[`../optimization.md`](../optimization.md) records the current hot paths and
+the in-place optimizations; [`../performance.md`](../performance.md) holds the
+instruments and the measured C++ VM build flags. The deferred items (a GPU text
+path, an L3 render-target surface, zero-copy presentation, C++ LTO) are listed
+in `TODO.md` §16, not here.

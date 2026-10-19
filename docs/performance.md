@@ -147,24 +147,20 @@ gate only proves the instrument's shape.
 **Gate.** The standard gate (AGENTS §0), in order:
 
 ```bash
-cargo fmt --all -- --check
-bash scripts/check-stateless.sh
-bash scripts/check-error-handling.sh
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --no-fail-fast
-cargo test -p platform --features platform-linux
-cargo clippy -p platform --features platform-android --all-targets -- -D warnings
-cargo test -p platform --features platform-android
-python3 scripts/check-android-target.py
-python3 scripts/surface_lock.py --update
-python3 scripts/surface_lock.py
-python3 scripts/native_parity.py
-python3 scripts/plugin_parity.py --no-doc
+uv run --project scripts krkr-gate gate       # static gate (main agent)
+uv run --project scripts krkr-gate test       # both test suites
 ```
+
+`gate` runs `cargo fmt --check`, the compiler-free checks in order,
+`cargo clippy` for the workspace and for the `platform-android` host feature,
+`android-target`, `surface-lock --update` + `surface-lock`, `native-parity`,
+`plugin-parity --no-doc` and `host-facts`. `test` runs `cargo test
+--workspace --no-fail-fast` and the two `platform` suites. One check runs on
+its own with `krkr-gate <check>`.
 
 The Android-only loop (`crates/android/src/host.rs`) is target-gated and is
 **not** compiled by the host gate; its `FramePacing` plumbing is documented as
-unverified until an Android build compiles it (AGENTS §0/§9).
+unverified until an Android build compiles it (AGENTS §0.3, `TODO.md` §14).
 
 ---
 
@@ -293,7 +289,7 @@ the timer is deliberately changed to abort-on-panic.
 The Android build links with the NDK clang driver (`build-android.sh` sets
 `CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER`), so it is the one place the LTO
 candidate can actually be tried. There is no NDK and no device on this host,
-and the Android target is never built here (AGENTS §0/§11), so none of this is
+and the Android target is never built here (AGENTS §0.3), so none of this is
 verified:
 
 ```bash

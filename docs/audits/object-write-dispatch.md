@@ -1,27 +1,18 @@
 # Audit — object writes/calls and how the receiver is derived
 
-# Audit — object writes/calls and how the receiver is derived
-
-> **Status update — the motivating hypothesis was disproven by measurement.** gdb on the real
-> game established the layer identities: layer 2 = the `Logo` (the enclosing object), layer **21**
-> = `_logo` (the `Sprite` itself), layer 22 = `_logo._image` (the inner `AffineLayer` image).
-> `with(_logo){ .visible = true }` writes **layer 21 — the correct object**; `loadImages` reaches
-> layer 22 only because `AffineLayer.loadImages` forwards to its `_image`. The real white-screen
-> cause was unrelated: `CallOnPaint`/`pending_paint` was set and **never dispatched**, so
-> `AffineLayer.onPaint` never composited `_image` onto the visible layer (fixed in L3 as
-> `compat::paint_poll`, `LayerIntf.cpp:6401-6402`).
->
-> Consequences for this document: the mechanism in §1 is real (the VM's
-> `ObjThis ? ObjThis : ra[-1]` fallback exists), but it **did not fire** in the observed case, and a
-> closure whose `ObjThis` is the intended object behaves correctly. The "suspect" verdicts below
-> are therefore **hypotheses with no observed instance** — the `crates/compat/tests/dispatch_*.rs`
-> suites verify the receiver per family, and a family should be treated as affected only once one
-> of those tests fails.
+> **Status.** The motivating question is settled: the mechanism in §1 is real
+> (the VM's `ObjThis ? ObjThis : ra[-1]` fallback exists), but it does not fire
+> for the written-object case — a closure whose `ObjThis` is the intended object
+> behaves correctly, and `with(_logo){ .visible = true }` writes the enclosing
+> object. The "suspect" verdicts below are therefore **hypotheses with no
+> observed instance**: the `crates/compat/tests/dispatch_*.rs` suites verify the
+> receiver per family, and a family is affected only once one of those tests
+> fails. `AffineLayer.onPaint` is dispatched by `compat::paint_poll`
+> (`LayerIntf.cpp:6401-6402`).
 
 Scope: every script‑visible member **write** or **call** that reaches an object in L3, and
-how the *receiver* is derived. Read‑only audit; the motivating bug is being fixed in
-`crates/compat` separately. This document only *classifies* the pattern, it does not propose
-a patch.
+how the *receiver* is derived. This document only *classifies* the pattern; it does not
+propose a patch.
 
 Motivating measurement (from the task): `system/Title.tjs` does
 `_logo = new Sprite(win, this)` and then, in a timer‑invoked function,

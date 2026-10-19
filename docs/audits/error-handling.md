@@ -1,7 +1,6 @@
 # Error / absence / panic handling audit
 
 - Repo: `/mnt/DATA/Document/code/krkr-rs`
-- Branch: `migration/middle-layer-ash`
 - Date: 2026-10-12
 - Scope: every non-test Rust site matching `.unwrap_or(`, `.unwrap_or_default()`,
   `.unwrap_or_else(`, `let _ = `, `.ok()`, `if let Ok(`, `.unwrap()`, `.expect(`,
@@ -342,9 +341,7 @@ variant-by-variant exists.**
   `visual/layer/transitions.rs`, `LoopCondition` in `sound.rs`) and never
   `match`es them — verified by grep for `match` on `TransKind`, `LoopCondition`,
   `StartupScript`, `ScrollFrom`, `ScrollStay`, `PlayStatus`,
-  `PeriodReason` (zero hits). (`ScalingMode` was in this list when the audit
-  was written; it has since been removed with the presentation-scaling feature —
-  `docs/migration/11` §4.)
+  `PeriodReason` (zero hits).
 
 `_ =>` arms in compat number **224**. They are overwhelmingly on non-enum
 scrutinees and are fine:
@@ -422,34 +419,34 @@ build. Only the seam is dead.
 
 ---
 
-## 10. Enforcement recommendation
+## 10. Enforcement
 
-Mirror `scripts/check-stateless.sh`: a repo guard that fails without a
-compiler. The semantics split cleanly.
+`uv run --project scripts krkr-gate error-handling` (`scripts/krkr_gates/
+checks/error_handling.py`) fails without a compiler. Its rules:
 
-### 10.1 Mechanically checkable (grep + allowlist)
+1. **`result-fallback`** — `.unwrap_or(_default|_else)?(…)` whose receiver
+   chain contains a known-`Result` call: `parse`, `metadata`, `read`, `write`,
+   `read_dir`, `try_into`, `CString::new`, `status`, `send_eof`, `poll`,
+   `decode`, `inflate`, `lock`, `strip_prefix` (on `Path`), `absolute`, the
+   `MediaFormat` accessors, plus the crate's own
+   `Reader::{i32,u8,u16,u32,u64,unicode_string}`, `integer` and `key4`.
+2. **`parse-unwrap`** — `.parse().unwrap_or(` is always a coercion bug after
+   §3.4; use `string_to_real`.
+3. **`let-underscore`** — `let _ = <fallible call>`, except `let _ = X?;` and
+   the allowlisted cleanup calls (`stop`, `wait_idle`, `flush`, `remove_file`).
+4. **`ok-discard`** — `.ok()`/`.ok()?` that drops a real error; `try_from`/
+   `try_into` are exempt (out-of-range is `None` by contract).
+5. **`error-swallow`** — an `if let Err(_) = …` whose body neither raises nor
+   cites `reference/cpp`.
+6. **`pointer-sign`/`addr-narrow`/`char-signedness`/`pointer-compare`/
+   `pointer-flow`** — the D37 rules: no sign test, narrowing or `NonZero`
+   round-trip on a pointer or address-derived value (the `ADDR_NAMES` set plus
+   `as`/`max`/`abs`/`new` flows).
+7. **`allow-dead-code`** — no `#[allow(dead_code)]` outside
+   `crates/compat/tests/common/mod.rs`.
 
-A proposed `scripts/check-error-handling.sh`:
-
-1. **`Result`-receiver fallbacks.** Grep for
-   `\.unwrap_or(_default|_else)?\(` whose receiver chain contains a
-   known-`Result` method: `parse`, `metadata`, `read`, `write`, `read_dir`,
-   `try_into`, `CString::new`, `status`, `send_eof`, `poll`, `decode`,
-   `inflate`, `decode_entire`, `lock`, `strip_prefix` (on `Path`),
-   plus the crate's own `Reader::{i32,u8,u16,u32,u64,unicode_string}`, `integer`.
-   Fail unless the line carries a `// fallback: <reason>` marker or the
-   `file:line` is in an allowlist (like `native_parity_allow.txt`). This alone
-   catches the PSD parser and `.sli` families.
-2. **`.parse().unwrap_or(`** — an unconditional fail (always a coercion bug
-   after §3.4), suggesting `string_to_real`.
-3. **`let _ = <name>`** where `<name>` is in a fallible-call list — accept
-   `let _ = X?;` and an allowlist for cleanup (`stop`, `wait_idle`, `flush`,
-   `remove_file`).
-4. **`#[non_exhaustive]` in `crates/compat/**`** — allow only the two error
-   enums by name; fail on any new one.
-5. **`debug_assert` in `crates/**` decoders** — warn-only list.
-6. **`Result→Option` parsers**: fail when a `pub(crate) fn … -> Option<…>` in
-   `*decode*.rs`/`*parse*.rs` calls `.ok()?` on an inflate/decode.
+An accepted site is a `path:line` entry in
+`scripts/allowlists/error_handling_allow.txt`; a stale entry fails the check.
 
 ### 10.2 Needs a human (cannot be mechanised)
 
@@ -481,8 +478,8 @@ A proposed `scripts/check-error-handling.sh`:
 Recommendation: **do not** enable a broad clippy set. Enable at most
 `clippy::panic_in_result_fn` and `clippy::unwrap_in_result` **scoped** to the
 decoder/parser modules (`platform/fs/src/xp3.rs`, `platform/media/src/tlg.rs`,
-`compat/natives/plugins/**`), and rely on `check-error-handling.sh` +
-allowlist for the rest. The `surface_lock.py` model (snapshot + reviewed diff)
+`compat/natives/plugins/**`), and rely on the `error-handling` check and its
+allowlist for the rest. The `surface-lock` model (snapshot + reviewed diff)
 fits the allowlist.
 
 ---
@@ -518,9 +515,10 @@ fits the allowlist.
 
 ## 12. The guard, and what it found that this audit did not
 
-`scripts/check-error-handling.sh` enforces §4 mechanically (a bash wrapper over a
-python3 scanner; no compiler), with `scripts/error_handling_allow.txt` holding
-the sites this audit classified as legitimate. It over-reports by design — a
+`uv run --project scripts krkr-gate error-handling` enforces §4 mechanically (a
+python scanner; no compiler), with
+`scripts/allowlists/error_handling_allow.txt` holding the sites this audit
+classified as legitimate. It over-reports by design — a
 receiver that is an `Option` looks like one that is a `Result` to a scanner — and
 the allowlist is where that is resolved. Against the tree it found, beyond this
 audit's list:
@@ -536,5 +534,4 @@ set (`crates/android/src/host.rs`, `crates/android/src/log_file.rs`,
 `crates/app/src/window_ex.rs`, `crates/platform/fs/src/ops.rs`,
 `crates/platform/media/src/video/{ffmpeg,mediacodec}.rs`) and thirty sites this
 audit marked *needs a decision*, which are not allowlisted because "needs a
-decision" is not "legitimate". Both groups are tracked in `TODO.md` §14. The
-guard joins the gate only when its output is clean.
+decision" is not "legitimate". Both groups are tracked in `TODO.md` §17.

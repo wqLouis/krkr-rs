@@ -39,11 +39,13 @@ let log_level = config::resolve_log_level(stored_log_level)?; // selects the log
 let runtime = config::resolve_runtime_config(
     stored_frame_rate,
     stored_preload_archives,
+    stored_debug_overlay,
 )?;
 let handler = host::AndroidHost::new(
     BackendKind::Vulkan,
     game_dir,
     runtime.preload_archives,
+    runtime.debug_overlay,
 );
 host::run_loop(app, handler, Duration::from_secs_f64(runtime.frame_rate_limit.period_secs()));
 ```

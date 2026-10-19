@@ -19,7 +19,7 @@ errors, event order — must match exactly.
 | # | finding | severity for the port |
 |---|---|---|
 | E1 | `popup(flags,x,y)` **does** the reference work (`TVPShowPopMenu` → an engine-drawn form) and returns `1`; the port returns `1` and draws nothing (`crates/compat/src/natives/menu_item.rs:747-777`). This is the single missing behaviour. | high |
-| E2 | `Window.menu` — the reference's script entry point for a menu tree — is **not registered** in the port (`reference/cpp/core/base/ScriptMgnIntf.cpp:537-542` vs. `crates/compat/src/natives/visual/window.rs`, and the `Window` member list in `docs/surface/runtime_surface.json`). `scripts/native_parity.py` cannot see it: it only parses `TJS_BEGIN_NATIVE_*` macros, not `windowclass->PropSet(TJS_W("menu"), …)`. | high |
+| E2 | `Window.menu` is registered (`crates/compat/src/natives/visual/window.rs:2742`, `window_menu_get`), but as an **instance** property where the reference installs it on the class object (`reference/cpp/core/base/ScriptMgnIntf.cpp:537-542`). The `native-parity` dump is a union of class and instance members and cannot tell the two apart, so the class-level access path is unverified. | medium |
 | E3 | The port's logical tree (`MenuState`, `MenuNode`) and all non-popup members are already faithful and tested (`crates/compat/src/natives/menu_item.rs`, `crates/compat/tests/menu_item.rs`). The plan below only has to add the *presentation + activation* path. | — |
 | E4 | Reference row classification, dismissal and event order are **not** the obvious ones; they are the spec's real content (§1.5, §2). The three traps: `checked` is never toggled by the form, a disabled *constant* row still dismisses the menu, and `visible=false` does not hide a row. | high |
 | E5 | The reference is modal over the game for **keyboard** (the topmost UI form consumes every key; `reference/cpp/core/environ/cocos2d/MainScene.cpp:804-812`) and, by cocos scene ordering, for pointer/touch. A faithful port needs an input gate. | medium |
@@ -587,7 +587,7 @@ possible L3 adapter.
 | `crates/compat/src/event.rs` or `crates/vm/src/host.rs` | overlay input gate before map/dispatch |
 | `crates/app/src/game.rs` / `crates/app/src/lib.rs` | load a default overlay font; force a reprojection when the overlay changes |
 | `crates/compat/tests/menu_item.rs` | new tests: popup opens/closes, row classification, dismissal rules, no open/close event, `Window.menu` |
-| `scripts/native_parity_allow.txt` | not needed for `Window.menu` unless the extractor is taught to read `PropSet` registrations (see E2) |
+| `scripts/allowlists/native_parity_allow.txt` | not needed for `Window.menu` unless the extractor is taught to read `PropSet` registrations (see E2) |
 
 ### 3.4 Where the platform seam goes (no backend built)
 
@@ -757,4 +757,4 @@ Port:
 * `crates/compat/src/resource.rs:36-53,366-490` L3 text engine + bitmap text.
 * `docs/surface/runtime_surface.json` `MenuItem`/`Window` member lists.
 * `docs/audits/stub-inventory.md:35,62` `MenuItem.popup` classified as the
-  platform-dialog item; `TODO.md` §5 at `:115-141`.
+  platform-dialog item; `TODO.md` §5.

@@ -14,7 +14,6 @@ a rewrite must not rediscover the hard way.
   `docs/migration/08-tjs-vm-and-native-plugins.md`;
   `docs/audits/unsafe-inventory.md` §2.6/§5.3;
   `docs/audits/bytecode-scripts.md`; `docs/audits/save-crash.md`;
-  `docs/migration/reviews/compat_vm.md`; `docs/migration/reviews/fs_engine.md`;
   `docs/migration/README.md` D34–D38; the vendored C++ and the reference it
   was diffed against.
 - **Verification rule (D36).** Every entry below was checked against the
@@ -727,17 +726,12 @@ wrong and must not reintroduce.
    the `Exception` object's `trace` member is populated when the object is
    created (`tjsError.cpp:26-51`).
    Migration doc §3.2. A rewrite must keep the two distinct.
-3. **`Storages.isExistentStorage` / directory existence is unsettled.**
-   `docs/migration/reviews/fs_engine.md` §1.10 claims the reference
-   `TVPIsExistentStorage` reports directories as existing and that our
-   `Storage::find`/`exists` cannot resolve directories. The reference code path
-   visible in the tree is `TVPIsExistentStorage` → `TVPGetPlacedPath` →
+3. **`Storages.isExistentStorage` matches for a directory.** The reference
+   path is `TVPIsExistentStorage` → `TVPGetPlacedPath` →
    `TVPIsExistentStorageNoSearchNoNormalize` → `tTVPFileMedia::CheckExistentStorage`
    → `TVPCheckExistentLocalFile`, and that function returns
    `s.st_mode & S_IFREG` (`reference/cpp/core/base/impl/StorageImpl.cpp:532-546`)
-   — i.e. **false for a directory**. The claim is therefore **unverified and
-   contradicted by the reconstructed source** (see §9); it must be settled by a
-   device script probe before either the claim or the port is changed.
+   — **false for a directory**; the port matches (TODO §17 `F7`).
 4. **`TVPCheckExistentLocalFile`'s Windows body is `#if 0`-ed out.** The same
    function contains the original `GetFileAttributes` logic under `#if 0` and a
    Linux port based on `tTVP_stat`. Both return false for directories, but the
@@ -848,30 +842,25 @@ truncates.
 
 ### LIFE-2 — the single process-global binding and the null-plugin case are load-bearing and easy to misuse
 
-**Summary:** the C ABI forces exactly one process-wide engine→context binding;
-the null plugin's global name is normalized (lower-cased) and loses the case
-the script requested, and a per-call `thread_local` scratch is a second hidden
-global.
+**Summary:** the C ABI forces exactly one process-wide engine→context binding,
+and the ABI's `last_object` slot is a single-value scratch shared by every
+call. Both are load-bearing and easy to misuse.
 
 **Defect / trap.** The one documented global is `binding.rs`
-(`LazyLock<Mutex<Option<Binding>>>`, migration doc §3.1). Two related traps:
-1. `null_plugin::install` receives the **normalized** (lower-cased) key and
-   uses it for the script global and the recorded name, so
-   `Plugins.link("windowEx.dll")` exposes `global.windowex`, not
-   `global.windowEx`; the reference preserves the caller's case
-   (`docs/migration/reviews/compat_vm.md` §6).
-2. `plugins_native.rs:18-24` `thread_local! ARRAY_OUT` is an undocumented
-   second process-global scratch (`docs/migration/reviews/compat_vm.md` §4).
-Also relevant: `CompatServices` hands out `&Scene`/`&Storage` from raw pointers
-in safe fns (`compat/src/ctx.rs:20-64`, review §7), and the ABI's single
-`last_object` slot is cleared at each `eval`/`exec` entry
-(`tjs2_abi.cpp:535-537`), so a native callback that re-enters the VM can
-clobber it (review §2). None of these are reference defects; they are
-consequences of emulating a user-data-less C ABI.
+(`LazyLock<Mutex<Option<Binding>>>`, migration doc §3.1). It holds dispatch
+state only and is installed once, before any native callback can run. The ABI
+also keeps one `last_object` per engine (`tjs2_abi.cpp:80`), overwritten by
+every object argument (`:469`); a native that retains an argument must use the
+per-argument `retained` handle the marshaller records (`:462-476`), because the
+next conversion overwrites the slot. `CompatServices` exposes the scene and
+storage as raw pointers (`compat/src/ctx.rs` `scene`/`storage`), so every
+dereference needs the same single-VM-thread argument the binding has. None of
+these are reference defects; they are consequences of emulating a
+user-data-less C ABI.
 
-**Evidence.** `crates/compat/src/binding.rs`; `null_plugin.rs:200-208`;
-`plugins_native.rs:18-24`; `ctx.rs:20-64`; `tjs2_abi.cpp:535-537`;
-migration doc §3.1; reviews `compat_vm.md` §1,§2,§4,§6,§7.
+**Evidence.** `crates/compat/src/binding.rs`; `null_plugin.rs` (`install`
+keeps the requested stem); `compat/src/ctx.rs`; `tjs2_abi.cpp:80,462-476`;
+migration doc §3.1.
 
 **Whose bug:** ours.
 
@@ -880,7 +869,7 @@ are script-visible; the scratch and `last_object` are not directly visible but
 can produce wrong receiver/values.
 
 **Current workaround.** The binding is documented and
-`scripts/check-stateless.sh` guards L1's statelessness; `CompatCtx` is now
+The `stateless` check guards L1's statelessness; `CompatCtx` is now
 `!Send + !Sync`. The case/order issues are recorded in the review and not yet
 all fixed.
 
@@ -936,8 +925,8 @@ normalized lookup key, and own scratch state on the service rather than in a
   exists, and the reader-offset contract that keeps port-written files
   reference-readable (TS-1).
 
-The surface lock (`scripts/surface_lock.py`) and both parity reports
-(`native_parity.py`, `plugin_parity.py`) are the mechanical guard that the
+The surface lock (`krkr-gate surface-lock`) and both parity reports
+(`native-parity`, `plugin-parity`) are the mechanical guard that the
 rewrite does not drift the dispatch surface while changing internals.
 
 ---
@@ -979,24 +968,6 @@ finding (D36).
    or `++`/`--` statement would decide whether the snapshot's writer or reader
    is the lossy side (see BLK-3 for the exact evidence). Until then the port
    follows the snapshot and the divergence is recorded, not hidden.
-
----
-
-## 10. Cross-links for `docs/migration/08-tjs-vm-and-native-plugins.md`
-
-This document lives at `docs/vm-defects.md`. The following lines are suggested
-for the main agent to add to `08-tjs-vm-and-native-plugins.md` (that file is
-owned by another agent and was not edited here):
-
-- In the header, after the `Related:` line:
-  `Defects: [`docs/vm-defects.md`](../vm-defects.md) — the VM/reference defects a rewrite must not rediscover.`
-- In §10 (TJS2 Rust port audit), at the start of §10.4 "Hard parts / risks":
-  `The concrete defects behind these risks (null-block bytecode crash, interior-NUL truncation, the FE FE writer/reader split, the process-global VM state, the loader's short-blob OOB read, the unbounded serializer) are catalogued in [`docs/vm-defects.md`](../vm-defects.md).`
-- In §3.1 "The ABI constraint — the one allowed global", after the paragraph:
-  `The soundness status of that global and of `Tjs2Engine`'s unsafe `Send`/`Sync` impls is recorded in [`docs/vm-defects.md`](../vm-defects.md) GLO-1 / LIFE-2.`
-- In §11 "The dispatch surface is the contract (D29)", last paragraph, after
-  the `Timer` example:
-  `Known behaviour divergences that the surface lock cannot catch are listed in [`docs/vm-defects.md`](../vm-defects.md) (e.g. TIM-1 on `Timer.capacity`).`
 
 ---
 

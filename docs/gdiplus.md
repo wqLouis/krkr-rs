@@ -132,6 +132,7 @@ path is involved.
 
 Host tests drive the real VM surface: `crates/compat/tests/layer_ex.rs`,
 `layer_ex_behaviour.rs`, `menu_item.rs`, `menu_dll_surface.rs` and the parity
-scripts (`scripts/native_parity.py`, `scripts/plugin_parity.py`) compare the
-registered members against the reference tables. A device run is still owed
+checks (`uv run --project scripts krkr-gate native-parity`,
+`krkr-gate plugin-parity`) compare the registered members against the
+reference tables. A device run is still owed
 for the Android pixel path.

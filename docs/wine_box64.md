@@ -34,8 +34,7 @@ under Wine behind an in-app minimal Wayland compositor — is evaluated in §12.
 **Non-goal.** Loading the game's Windows plugin DLLs through Wine is rejected;
 the port continues the native Rust reimplementation, which is the next major
 version's target (`AGENTS.md` §1). The engine's current render/window stack is
-`render` (Vulkan) and `platform`; the Bevy/winit references below are the
-environment this study was written against.
+`render` (Vulkan) and `platform`, with `winit` for the desktop window.
 
 ---
 
@@ -112,7 +111,7 @@ There is **no `.exe`** anywhere (game dir or inside the archives), and no native
 **32-bit Windows PE**:
 
 ```
-$ python3 scripts/extract_xp3.py data.xp3 extrans.dll > extrans.dll   # etc.
+$ uv run --project scripts krkr-gate extract-xp3 data.xp3 extrans.dll > extrans.dll
 $ file /tmp/dlls/*.dll
 csvparser.dll:   PE32 executable for MS Windows 4.00 (DLL), Intel i386, 5 sections
 extrans.dll:     PE32 executable for MS Windows 4.00 (DLL), Intel i386, 5 sections
@@ -150,12 +149,14 @@ Cross-check with the DLLs actually present: `getSample.dll` and `KAGParser.dll`
 are **not shipped** (the game tolerates the failed load), the rest are.
 
 krkr-rs's current behavior is to accept-and-log every `Plugins.link`:
-`crates/tvp-natives/src/plugins.rs:62-84` (`native_link`) and the emulated-name
-list at `:100-140` (`is_emulated_plugin`: csvparser, extrans, fstat, kagparser,
-kagparserex, menu, wuvorbis, windowex, layerexdraw). Note `win32dialog` is *not*
-in that list, even though the game asks for it; `getSample`/`KAGParser` are also
-absent. That gap is currently handled by TJS fallbacks (`startup.tjs` defines a
-`WIN32Dialog` class; `k2compat/win32dialog.tjs` adds `WIN32DialogEX`).
+`crates/compat/src/plugin.rs` (`link`) resolves the name against
+`crates/compat/src/natives/plugins/mod.rs`'s `BUILTIN_PLUGINS` table (addFont,
+csvParser, dirlist, emoteplayer, extrans, fftgraph, fstat, getabout, getSample,
+json, KAGParserEx, layerExDraw, menu, motionplayer, psbfile, psd, saveStruct,
+ScriptsEx, krkrsteam, TextRender, varfile, win32dialog, windowEx, wutcwf); a
+name outside it gets the null plugin object. `getSample` is built in,
+`KAGParser.dll` is an alias of `KAGParserEx.dll`, and `win32dialog.dll` is
+emulated (its member set is still incomplete — TODO §5).
 
 ---
 
@@ -264,7 +265,7 @@ Fetched from `github.com/wine-mirror/wine` (master).
   Wine.
 
 There is no documented, supported way to bring that up inside an already-running
-non-Wine ELF process (e.g. a Rust/winit/Bevy binary). Wine would have to take
+non-Wine ELF process (e.g. the Rust/winit/Vulkan binary). Wine would have to take
 over signal handling, TLS, the heap, `ntdll`, the PE address space, and the
 thread-startup path. That is exactly the package `wine`/`winelib` provides, and it
 changes the identity of the process.
@@ -309,15 +310,15 @@ emulated (see §6).
 | Option | How | Feasibility / cost |
 |---|---|---|
 | **X11 reparenting / XEmbed** | `winit` creates an X11 window; find Wine's top-level X11 window and `XReparentWindow` it (or use an XEmbed client container). | **Best of the coexistence options, X11-only.** Fragile: the WM/managed-mode fights reparenting; Wine's own `embedded` flag is systray-only (`window.c:2984`); you must forward input and reconcile focus. No equivalent on Wayland. |
-| **Wine virtual desktop offscreen + readback** | Run Wine with a virtual desktop in one X window; capture with XComposite/XShmGetImage, upload into a Bevy `Image`. | Works but adds a full GPU→CPU→GPU round-trip per frame, plus tearing/latency. Good for a debug overlay, bad for a 60 fps VN. |
+| **Wine virtual desktop offscreen + readback** | Run Wine with a virtual desktop in one X window; capture with XComposite/XShmGetImage, upload into a renderer texture. | Works but adds a full GPU→CPU→GPU round-trip per frame, plus tearing/latency. Good for a debug overlay, bad for a 60 fps VN. |
 | **Wayland sub-surface** | Attach Wine's Wayland surface as a sub-surface of the winit surface. | **Not viable as-is.** Wine's Wayland driver creates top-level `xdg_toplevel` windows; Wayland has no reparent/embed protocol for foreign clients. |
-| **D3D/Vulkan external-memory interop** | Share a Vulkan image between Wine (winevulkan / DXVK / vkd3d) and Bevy via `VK_KHR_external_memory_fd`. | Theoretically possible on the same GPU, but the game's plugins here are GDI/GDI+/user32 (not D3D), so this buys nothing. High complexity. |
+| **D3D/Vulkan external-memory interop** | Share a Vulkan image between Wine (winevulkan / DXVK / vkd3d) and the engine via `VK_KHR_external_memory_fd`. | Theoretically possible on the same GPU, but the game's plugins here are GDI/GDI+/user32 (not D3D), so this buys nothing. High complexity. |
 | **Offscreen render → readback → present** | Make Wine render to an offscreen drawable. | Wine's `null` driver renders nothing; the X11 driver renders to an X11 surface. You are back to capture. |
 
 **Who owns input/focus:** Wine. Once Wine is running, its window (or embedded
-window) receives and dispatches input on the Wine side. To drive Wine from Bevy
+window) receives and dispatches input on the Wine side. To drive Wine from the engine
 you would feed synthetic events over X11, which loses the raw input path
-(`winit`/Bevy `ButtonInput`) and re-introduces latency.
+(`winit` input state) and re-introduces latency.
 
 ---
 
@@ -355,7 +356,7 @@ hot code — the worst case for emulation. A VN may tolerate it; a render-heavy
 plugin will not.
 
 **Bottom line on ARM:** Wine+box64/Hangover can *run a Windows KiriKiri app on
-ARM*, but it cannot *inject the DLLs into krkr-rs/Bevy*. That is a different
+ARM*, but it cannot *inject the DLLs into krkr-rs*. That is a different
 product (`krkr-rs` is not involved), and it still lacks a Windows engine binary in
 this package.
 
@@ -368,7 +369,7 @@ this package.
 ARM `libgame.so` (and it is Android-flavored). A generic `krkr2.exe` from
 elsewhere would be a different engine build and a distribution/legal problem.
 If you did supply one, this is just "play the Windows version under Wine": real
-DLLs are used, but krkr-rs and winit/Bevy play no part. **Verdict: not the
+DLLs are used, but krkr-rs and winit play no part. **Verdict: not the
 integration asked for.**
 
 **(b) Continue the native Rust reimplementation (current).**
@@ -378,7 +379,7 @@ Kirikiroid2 and the KrKr2 reference both do. **Verdict: viable.**
 **(c) Narrow out-of-process Wine worker for self-contained compute (e.g. a
 Windows-only codec) with shared-memory IPC.**
 Clean isolation, bounded API, no ABI bridge. For this game, however, audio
-decoding is already native (`tvp-sound`: symphonia + libopus), and the Windows
+decoding is already native (L1 `media`: symphonia + libopus), and the Windows
 plugins that *look* like compute (wuvorbis) are exactly the ones already covered.
 **Verdict: viable-with-caveats, low value here.**
 
@@ -388,8 +389,8 @@ This *is* the only way to use the DLLs unmodified. But: the plugin DLLs are
 **i386**, so the host must be i686 too; the TJS2 C++ VM must build for
 `i686-pc-windows-gnu`; the ~89-function TVP exporter must be reimplemented (the
 reference does not have it — it links plugins statically); and Wine owns the
-window. You can keep Bevy/wgpu via its Windows (DX12/Vulkan) backend and winit's
-Windows backend, but you are no longer on Linux/native. **Verdict:
+window. You can keep a Vulkan backend and winit's Windows backend, but you are no
+longer on Linux/native (Windows is not a host target, AGENTS §2). **Verdict:
 viable-with-caveats, large effort.**
 
 ---
@@ -399,15 +400,15 @@ viable-with-caveats, large effort.**
 ### Sketch A — window-level coexistence (X11): Wine plugin/engine as a sibling surface
 
 Use when you want **the real DLLs** but are willing to let Wine own a sub-surface,
-while Bevy keeps the rest of the app. X11 only.
+while the engine keeps the rest of the app. X11 only.
 
 ```
- ┌──────────────────────────── rust / winit / Bevy process (x86_64 ELF) ───────────────────────────┐
+ ┌───────────────────────── rust / winit / Vulkan process (x86_64 ELF) ───────────────────────────┐
  │                                                                                                  │
- │  Bevy App (DefaultPlugins, WindowPlugin)              Bevy 2D scene / UI / word-wrap / effects   │
+ │  krkr-rs app (platform loop, Vulkan)                 engine 2D scene / UI / word-wrap / effects  │
  │   └─ primary winit window (X11) ── XReparentWindow ──┐                                            │
  │        (frame / chrome / overlays)                   │                                            │
- │  tvp native plugins… (native reimpl)                 │                                            │
+ │  compat native plugins… (native reimpl)              │                                            │
  │                                                      ▼                                            │
  └──────────────────────────────────────────────────────────────────────────────────────────────┘
                                     X11 parent window
@@ -424,15 +425,15 @@ while Bevy keeps the rest of the app. X11 only.
 * **Address-space model:** the DLL lives entirely inside the Wine process and
   calls *that* process's engine. No ABI bridge. The Rust side never calls plugin
   functions in-process.
-* **Windowing ownership:** Wine owns the child X11 window and its input; Bevy
+* **Windowing ownership:** Wine owns the child X11 window and its input; the engine
   owns the frame. Focus is a genuine problem (two GUI toolkits, one seat).
 * **Readback variant:** if embedding is unreliable, capture the Wine window with
-  XComposite/XShm and present it as a Bevy texture (adds a frame of latency).
+  XComposite/XShm and present it as a renderer texture (adds a frame of latency).
 * **What you still need:** the real Windows KiriKiri engine + the DLLs, and a
   Wine prefix. Neither is in the repo/package today.
 * **Useful for:** `win32dialog` / `windowEx` / `menu` native dialogs and the
   `layerExDraw` render path, if you accept a Wine sibling window.
-* **Not useful for:** integrating plugin output into the Bevy render graph without
+* **Not useful for:** integrating plugin output into the engine render graph without
   a copy.
 
 ### Sketch B — process-level, same address space: 32-bit Windows PE plugin host under Wine
@@ -449,13 +450,13 @@ The only architecture in which `V2Link` works unmodified. Two sub-variants.
  │    │      (TVPAddLog, TVPGetScriptDispatch, TVPExecuteExpression, …)      │
  │    ├─ Plugins.link → LoadLibraryA("layerexDraw.dll") → V2Link(exporter)   │
  │    │      real DLL calls back into the host via raw function pointers     │
- │    ├─ Bevy/wgpu + winit (Windows backend: DX12/Vulkan + user32)           │
+ │    ├─ Vulkan + winit (Windows backend)                                    │
  │    └─ winex11.drv / winewayland.drv owns the window                       │
  └───────────────────────────────────────────────────────────────────────────┘
 
  (B2) Split: native Linux krkr-rs controller + i686 Wine "plugin service"
 
- ┌────────────── Linux host (Rust/Bevy/winit) ──────────────┐
+ ┌────────────── Linux host (Rust/Vulkan/winit) ────────────┐
  │  Scene, storage, TJS VM (native)                          │
  │  PluginClient ───── IPC (shared mem + control) ─────┐     │
  └─────────────────────────────────────────────────────┼─────┘
@@ -470,7 +471,7 @@ The only architecture in which `V2Link` works unmodified. Two sub-variants.
 * **B1** has no marshalling at all; it is "port krkr-rs to 32-bit Windows and run
   it on Wine". You get the real DLLs, but you inherit a second toolchain
   (mingw/i686 + Wine), and Wine is now your platform.
-* **B2** tries to keep the Linux/Bevy host but must proxy the entire shared object
+* **B2** tries to keep the Linux host but must proxy the entire shared object
   graph across a process boundary — the Distributed-`iTJSDispatch2` problem. This
   is where approach B in the verdict table becomes "research project", not
   engineering.
@@ -525,7 +526,7 @@ Scale: **S** < 1 day · **M** ~days · **L** ~1–3 weeks · **XL** months.
 |---|---|---|
 | Verify Wine/WoW64 runs an i386 KiriKiri engine on this box | M | Install Wine + multilib/new-WoW64; supply an engine we do not have |
 | X11 reparenting demo (Sketch A) with a dummy Wine window | M–L | Input forwarding + focus are the hard parts; X11-only |
-| X11 capture→Bevy texture (readback variant) | L | One frame latency; not for production |
+| X11 capture→renderer texture (readback variant) | L | One frame latency; not for production |
 | Implement TVP host exporter (~89 functions, real semantics) | XL | The core of any in-process DLL use; also needed by B1 |
 | Port TJS2 C++ VM + engine to i686-pc-windows-gnu / mingw | XL | Second toolchain; MSVC-isms in plugin headers |
 | Load the real DLLs in-process (Sketch B1) | XL on top of the above | `LoadLibraryA` + `V2Link` is the *easy* part once the host exists |
@@ -666,13 +667,13 @@ you would capture an X11 framebuffer on the CPU.
 The app owns the `ANativeWindow` (NativeActivity/GameActivity). Two decisions:
 
 **Which renderer composites?** Smithay core ships a **GLES** renderer and a
-**pixman** (CPU) renderer; it has **no wgpu renderer**. So:
+**pixman** (CPU) renderer; it has **no Vulkan renderer**. So:
 
 | Path | Mechanism | Cost / verdict |
 |---|---|---|
 | **GLES (recommended)** | Create an EGL context/surface on the `ANativeWindow`; Smithay `GlesRenderer`; import client shm and dmabufs (EGLImage) | Best performance; needs an Android EGL bridge (below) |
-| **CPU (baseline)** | Smithay `pixman` composites shm buffers; upload to wgpu/GLES texture | Trivial to prove, too slow for real games |
-| **wgpu** | Drive `ANativeWindow` with wgpu/Bevy; feed Smithay's client buffers in as wgpu textures | wgpu has no stable dmabuf-import API, so zero-copy is hard; a custom renderer is a sizeable project |
+| **CPU (baseline)** | Smithay `pixman` composites shm buffers; upload to a GLES texture | Trivial to prove, too slow for real games |
+| **Vulkan** | Drive `ANativeWindow` with Vulkan; feed Smithay's client buffers in as Vulkan images | Vulkan dmabuf import needs the right extensions and a custom renderer; a sizeable project |
 
 **Android EGL gap.** Smithay's `EGLNativeDisplay`/`EGLNativeSurface` are public
 traits (`backend/egl/native.rs:131`, `:284`) but the only impls are GBM, X11, and
@@ -755,7 +756,7 @@ same compositor can be validated on the desktop with zero emulation:
 | **0** | Take Smithay `examples/minimal.rs`; add `ViewporterState` + one `wl_output` + fullscreen `xdg_toplevel` mapping. Run it with its winit output on Linux x86_64. | Compositor usable by external clients | **S/M** |
 | **1** | `WINEPREFIX=$(mktemp -d) WAYLAND_DISPLAY=wayland-5 wine notepad.exe` (or a 2D GDI game). Confirm Wine binds our globals, maps an `xdg_toplevel`, and renders through `wl_shm`. | CPU/GDI render proven | **S** |
 | **2** | Add `zwp_linux_dmabuf_v1` (Smithay `DmabufState` + `import_dmabuf`) and `wl_seat` input injection. Run a D3D/Vulkan Windows game; verify GPU presentation. | Accelerated render + input proven | **M/L** |
-| **3** | Replace the winit output with "composite into a texture" (Bevy/wgpu or GLES-on-GL) and expose a library API; add touch→`wl_seat`. | The in-app integration shape proven on desktop | **M** |
+| **3** | Replace the winit output with "composite into a texture" (Vulkan or GLES-on-GL) and expose a library API; add touch→`wl_seat`. | The in-app integration shape proven on desktop | **M** |
 | **4** | Android: NativeActivity/GameActivity + `ANativeWindow`; implement `EGLNativeDisplay`/`EGLNativeSurface` for Android (or `EGLDisplay::from_raw`); socket in app-private dir. | Wine renders into the Android surface | **L/XL** |
 | **5** | Bundle box64 + Wine (+ Turnip/DXVK); bootstrap/repair the prefix; per-game config and a launcher UI. | Shippable game runner | **XL** |
 
@@ -770,7 +771,7 @@ Android stage will not rescue it.
 | 0 — minimal compositor (Linux) | **Viable** |
 | 1 — Wine GDI/`.exe` via `wl_shm` | **Viable** |
 | 2 — dmabuf GPU + input | **Viable-with-caveats** (modifier negotiation, seat mapping) |
-| 3 — composite into app texture | **Viable-with-caveats** (no wgpu renderer in Smithay; GLES or CPU) |
+| 3 — composite into app texture | **Viable-with-caveats** (no Vulkan renderer in Smithay; GLES or CPU) |
 | 4 — Android EGL + `ANativeWindow` | **Viable-with-caveats** (custom EGL platform; XL-ish) |
 | 5 — box64 + Wine packaging | **Viable-with-caveats** (per-game compat, drivers, maintenance) |
 
@@ -778,8 +779,8 @@ Biggest risks:
 
 1. **Android EGL is not a Smithay platform.** The single largest new subsystem;
    dmabuf modifier mismatches on mobile GPUs are a common failure mode.
-2. **wgpu is a poor fit for the compositor.** Smithay has no wgpu renderer, and
-   wgpu lacks stable dmabuf import, so the attractive "Bevy/wgpu owns everything"
+2. **Vulkan import is the hard part.** Smithay has no Vulkan renderer, and a
+   dmabuf import needs the right extensions, so the attractive "the engine owns everything"
    design needs a custom renderer or an extra GPU→CPU copy. GLES keeps zero-copy.
 3. **Compatibility is a long tail.** box64/WOW64 + Turnip + DXVK + per-game
    quirks is a support burden Winlator already carries; we would inherit it.
@@ -830,7 +831,7 @@ bsdtar -tf Kirikiroid2_1.3.9.apk | grep '\.so$'
 file apk/lib/arm64-v8a/libgame.so
 
 # plugin binaries inside the archive
-python3 scripts/extract_xp3.py data.xp3 extrans.dll > /tmp/dlls/extrans.dll
+uv run --project scripts krkr-gate extract-xp3 data.xp3 extrans.dll > /tmp/dlls/extrans.dll
 file /tmp/dlls/*.dll                        # PE32 ... Intel i386
 
 # plugin references in UTF-16LE scripts
