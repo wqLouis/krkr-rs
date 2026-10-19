@@ -936,3 +936,62 @@ What remains:
 3. Keep the overlay counters (windows/layers/bitmaps/fonts/textures) as the
    regression evidence; descriptor-set and `ObjectRegistry` counts are still
    missing.
+
+## 21. Comments-gate cleanup
+
+`house-style` now enforces the D31 comment rules mechanically
+(`scripts/krkr_gates/checks/house_style.py`):
+
+* a **non-test** comment may not cite the external engine — `reference/cpp`, a
+  `*.cpp:line` / `.h`/`.hpp` filename, `C++`, `TVP`, `KiriKiri`, `ported`,
+  `upstream`, `port of` — nor narrate history (`used to`, `previously`,
+  `before this`, `replaced by`). Test comments keep the citation: `/tests/`
+  files and `#[cfg(test)]` items are skipped;
+* **no** Rust file (tests included) may carry `#[allow(clippy::…)]`,
+  `#![allow(clippy::…)]` or `#[expect(clippy::…)]`. The `clippy-allow` rule
+  has **no** allowlist exemption by design.
+
+The tree predates the rule. `scripts/allowlists/house_style_allow.txt` carries
+only reviewed false positives (ordinary-English "reference" about our own
+code, and six read-only boolean queries). Every other existing
+`reference-citation` and `history-comment` finding is recorded in
+`scripts/allowlists/house_style_baseline.txt` — JSON Lines keyed to the
+normalized offending comment line, 4344 entries covering 4595 finding sites —
+so the gate no longer blocks on legacy comments. A stale baseline entry is a
+note, not a failure. The baseline is **debt**: burn it down in file batches and
+delete each entry as its comment is rewritten. It never holds a `clippy-allow`
+entry. Counts move as the cleanup lands.
+
+### 21.1 Clippy allowances (hard; never allowlisted)
+
+This is the only rule the gate fails on today: `krkr-gate house-style` reports
+**64** clippy sites and zero unallowlisted reference/history findings. The bulk
+are two systemic lints:
+
+* `clippy::too_many_arguments` (~34) — mostly the wide `extern "C"` native
+  callbacks in `compat`. Group the ABI arguments into a struct at the Rust
+  boundary, or take an args slice; do not silence the lint.
+* `clippy::not_unsafe_ptr_arg_deref` (~24) — the `extern "C"` callbacks that
+  dereference raw pointers. Make the callback `unsafe extern "C"` or move the
+  dereference behind a safe helper.
+
+Remaining: `manual_unwrap_or` / `manual_unwrap_or_default`, `approx_constant`,
+`needless_range_loop`, `cast_precision_loss`. See
+`uv run --project scripts krkr-gate house-style --print-all`.
+
+### 21.2 Reference citations (batch by shape)
+
+* `reference/cpp/...` paths and `*.cpp:line` citations — the majority; restate
+  the behaviour in the present tense without the oracle path, and keep the
+  citation in the behaviour test instead.
+* `C++ side` / `C++ trampoline` in `crates/tjs` and `crates/vm` — describe the
+  FFI boundary in our own terms (`the TJS VM`, `the callback trampoline`).
+* `TVP`/`KiriKiri` class, macro and file names in doc comments — rename to the
+  script-visible member or the Rust type.
+* Bare "the reference …" sentences (the `compat` bulk) — state the behaviour
+  directly.
+
+### 21.3 History comments
+
+Rewrite to the present tense: drop "used to", "previously", "before this",
+"replaced by". History is read from `git log`, never from the comment.

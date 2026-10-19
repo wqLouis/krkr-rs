@@ -36,3 +36,32 @@ pub fn d_in_string() -> &'static str {
 pub fn announce(count: u32) {
     log::info!("loaded {} items", count);
 }
+
+// --- near misses for the comment and clippy rules ---------------------------
+
+// A string is not a comment: the name below is just a name.
+pub fn log_storage_name() {
+    log::info!("{}", "reference/cpp/core/base/StorageIntf.cpp:1061");
+}
+
+// Documenting the ban is not an allowance: #[allow(clippy::too_many_arguments)]
+
+#[allow(dead_code)] // a non-clippy allowance is out of scope for this rule
+pub fn unreferenced_helper() {}
+
+// --- history-comment near misses --------------------------------------------
+
+// The pump reads the pending flag before running its update.
+pub fn pump_safely() {}
+
+pub fn history_in_string() -> &'static str {
+    "previously used to be the default"
+}
+
+#[cfg(test)]
+mod tests {
+    // Tests may cite the oracle: reference/cpp/core/base/StorageIntf.cpp:1061.
+    // A test comment may also narrate history: this was previously synchronous.
+    #[test]
+    fn citations_are_allowed_in_tests() {}
+}

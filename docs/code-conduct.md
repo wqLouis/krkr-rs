@@ -73,6 +73,9 @@ boundary and the reference, and runs the full gate before committing.
 - Keep the layer boundaries and dependency direction from `AGENTS.md` §2.
 - No silent fallback, no arbitrary cap, no discarded error (`AGENTS.md` §4).
 - No process-global state in L1; all engine state is owned by L2.
+- No `#[allow(clippy::…)]`, `#![allow(clippy::…)]` or `#[expect(clippy::…)]`,
+  in production or tests: fix the lint or restructure the code. The
+  `house-style` gate records one as a hard finding and never allowlists it.
 - L3 is VM-facing glue: marshal arguments, call one L2 operation, marshal the
   result. Do not grow L3 into a second engine.
 - Android-only stubs are the sole stub exception. L3 has no stubs.
@@ -252,6 +255,13 @@ Reject these shapes:
   invariant at that call site.
 - Keep reference citations in tests, formatted `reference/cpp/...:line`.
   Production code does not cite the reference.
+- The `house-style` gate enforces the paragraph above for non-test comments: a
+  comment that names the external engine (`reference/cpp`, a `*.cpp:line` or
+  `.h`/`.hpp` filename, `C++`, `TVP`, `KiriKiri`, `ported`, `upstream`,
+  `port of`) or narrates history (`used to`, `previously`, `before this`,
+  `replaced by`) is a finding. Existing comments that predate the rule are
+  baselined in `scripts/allowlists/house_style_baseline.txt` (burn-down in
+  `TODO.md` §21); a new one fails.
 - Public items have doc comments. Module docs explain the module’s job, not its
   past.
 - A comment that repeats the code is deleted. A comment that explains a

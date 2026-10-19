@@ -33,6 +33,19 @@ shells out to `cargo tree`, the rest read the tree.
 `surface-lock`, `native-parity`, `plugin-parity`, `native-arity`, the
 `extract-xp3` helper, and `gate`.
 
+`house-style` also enforces the AGENTS §6 comment rules: a **non-test**
+comment may not cite the external engine (`reference/cpp`, a `*.cpp:line`, a
+`.h`/`.hpp` filename, `C++`, `TVP`, `KiriKiri`, `ported`/`upstream`/`port of`)
+or narrate history (`used to`, `previously`, `before this`, `replaced by`);
+test comments keep those citations. In addition, no Rust file — tests
+included — may carry `#[allow(clippy::…)]` / `#![allow(clippy::…)]` /
+`#[expect(clippy::…)]`; the `clippy-allow` rule has no allowlist exemption.
+Legacy comments that predate these rules are recorded in
+`allowlists/house_style_baseline.txt` (JSON Lines keyed to the normalized
+comment line, tracked in `TODO` §21); a stale baseline entry is a note, and
+new citations outside the baseline still fail. `allowlists/house_style_allow.txt`
+holds only reviewed false positives.
+
 ## Notes
 
 - No third-party runtime dependencies; the build backend is hatchling.

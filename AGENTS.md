@@ -365,6 +365,9 @@ silent fallback?** Block and fix any of these:
 - A background thread that panics or a lock `expect` reachable from malformed
   input.
 - `#[allow(dead_code)]`, `#[allow(unused)]` (D32). If it is dead, delete it.
+- `#[allow(clippy::…)]` / `#![allow(clippy::…)]` / `#[expect(clippy::…)]`,
+  tests included. Fix the lint or write the code differently; the
+  `house-style` gate has no allowlist exemption for one.
 - A stub `todo!`/`unimplemented!`/approximation in L3 (D32). Android-only stubs
   are the sole exception.
 
@@ -412,6 +415,13 @@ It elaborates this section; if they disagree, this file wins.
 - **D31:** a comment says what the code does now. Delete "was", "used to",
   "previously", "replaced by", design rationale, and decision numbers. History
   is read with `git`.
+- A **production** comment must not cite the external engine (`reference/cpp`,
+  a `*.cpp:line` or `.h`/`.hpp` filename, `C++`, `TVP`, `KiriKiri`, `ported`,
+  `upstream`, `port of`) or narrate history; the `house-style` gate enforces
+  this for non-test comments. Test comments keep the citation. Comments that
+  predate the rule are baselined in
+  `scripts/allowlists/house_style_baseline.txt` (burn-down tracked in
+  `TODO.md` §21); a new one fails.
 - No internal jargon in **printed/logged** text (`L1`–`L4`, decision numbers).
   Use `platform`, `engine`, `compat`, `app`, `tjs`, `vm`, or plain English.
   Tests are exempt.

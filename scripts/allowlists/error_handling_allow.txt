@@ -94,7 +94,7 @@ crates/compat/src/natives/plugins/motion_player/resource.rs:174:let _ = engine_r
 crates/compat/src/natives/plugins/psb_file/mod.rs:202:let _ = host.set_member(global.raw_id(), PSB_BUF_GLOBAL, &TjsValue::Void); — clearing a temporary global after exec_script; the live global makes the write infallible
 crates/compat/src/natives/plugins/psb_file/mod.rs:203:let _ = host.set_member(global.raw_id(), PSB_KEY_GLOBAL, &TjsValue::Void); — clearing a temporary global after exec_script; the live global makes the write infallible
 crates/compat/src/null_plugin.rs:103:let _ = host.set_call_missing(object.raw_id()); — the retained null-plugin object is live, so the catch-all flag cannot fail to be set
-crates/compat/src/null_plugin.rs:177:let _ = host.set_default_member(prop.raw_id(), &TjsValue::Retained(noop.raw_id() as u64)); — both ids are live retentions; the access has already been logged
+crates/compat/src/null_plugin.rs:177:let _ = host.set_default_member( — both ids are live retentions; the access has already been logged
 
 # --- Option/`Vec` returns the guard's method-name heuristic flags ----------
 crates/compat/src/natives/sound.rs:1297:let _ = object.buffer.poll(channel); — SoundBuffer::poll returns Vec<SoundEvent>, not a Result; the transitional event is deliberately discarded

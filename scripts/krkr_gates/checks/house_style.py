@@ -2,18 +2,27 @@
 
 Scans ``crates/**`` for bean accessors that only move a field, ``&String`` /
 ``&Vec<T>`` / ``&Box<T>`` / ``&PathBuf`` parameters, decision numbers in
-comments, flat glob re-exports, and internal jargon in log/print literals.
-Accepted sites are listed in ``scripts/allowlists/house_style_allow.txt``.
+comments, flat glob re-exports, internal jargon in log/print literals,
+non-test comments that cite the external reference/oracle or narrate history,
+and ``clippy`` allowances anywhere in Rust code.  Reviewed false positives are
+listed in ``scripts/allowlists/house_style_allow.txt``; legacy comments that
+predate the comment rules are listed separately in
+``scripts/allowlists/house_style_baseline.txt`` (tracked in ``TODO`` §21), so
+the gate catches new citations while the old ones burn down in batches.  The
+``clippy-allow`` rule has no exemptions in either file.
 """
 
 import bisect
+import json
 import re
 import sys
+from collections import Counter
 
 from ..common import ALLOWLISTS_DIR, FIXTURES_DIR, REPO_ROOT
 
 ROOT = REPO_ROOT
 ALLOW = ALLOWLISTS_DIR / "house_style_allow.txt"
+BASELINE = ALLOWLISTS_DIR / "house_style_baseline.txt"
 ARGS: set[str] = set()
 PRINT_ALL = False
 
@@ -308,6 +317,39 @@ LOG_RE = re.compile(
 )
 JARGON_RE = re.compile(r"(?<!\+)\bL[1-4]\b|(?<!\+)\bD[0-9]{1,3}\b")
 
+# A production comment describes the code as it is: it does not cite the
+# external engine or the port history.  The term list is deliberately
+# overinclusive; the allowlist carries only reviewed false positives, never a
+# true citation.
+REFERENCE_TERMS_RE = re.compile(
+    r"reference/cpp"
+    r"|\breference\b"
+    r"|\boracle\b"
+    r"|\bC\+\+"
+    r"|\bported\b"
+    r"|\bport of\b"
+    r"|\bupstream\b"
+    r"|\boriginal implementation\b"
+    r"|\bTVP\b"
+    r"|kirikiri",
+    re.IGNORECASE,
+)
+# A C++ source file with a line (or line-range) suffix: `LayerIntf.cpp:42`.
+CPP_CITATION_RE = re.compile(
+    r"[\w./\\-]+\.(?:cpp|hpp|h|cc|cxx|inl):\d+(?:-\d+)?", re.IGNORECASE
+)
+# A citation-shaped parenthetical, with or without a line:
+# `(psbfile/main.cpp + PSBFile.cpp)`.
+CPP_PAREN_RE = re.compile(
+    r"\([^()\n]*[\w./\\-]+\.(?:cpp|hpp|h|cc|cxx|inl)\b[^()\n]*\)", re.IGNORECASE
+)
+# Comments that narrate history instead of describing the code.
+HISTORY_RE = re.compile(
+    r"\bused to\b|\bpreviously\b|\bbefore this\b|\breplaced by\b", re.IGNORECASE
+)
+# `#[allow(clippy::…)]`, `#![allow(clippy::…)]` or `#[expect(clippy::…)]`.
+CLIPPY_ALLOW_RE = re.compile(r"#!?\[\s*(?:allow|expect)\s*\([^)]*clippy\s*::")
+
 
 def scan_file(rel, src):
     findings = []
@@ -328,8 +370,14 @@ def scan_file(rel, src):
         code = orig[ln - 1].strip() if ln - 1 < len(orig) else ""
         findings.append((rel, ln, rule, code))
 
+    # A clippy allowance is a finding in every Rust file, tests included, and
+    # it is never allowlisted; run it before the test-code early return.
+    for m in CLIPPY_ALLOW_RE.finditer(masked):
+        add(m.start(), "clippy-allow")
+
     # Test code is exempt from the accessor, parameter, jargon and decision
-    # rules; a test-local glob is not part of any crate's contract either.
+    # rules; a test-local glob is not part of any crate's contract either, and
+    # a test comment is where a `reference/cpp/...:line` citation belongs.
     if "/tests/" in rel or rel.endswith("build.rs"):
         return findings
 
@@ -354,8 +402,17 @@ def scan_file(rel, src):
     for kind, a, b in spans:
         if kind != "comment" or in_ranges(a, ranges):
             continue
-        for m in DEC_RE.finditer(src[a:b]):
+        text = src[a:b]
+        for m in DEC_RE.finditer(text):
             add(a + m.start(), "decision-number")
+        for m in REFERENCE_TERMS_RE.finditer(text):
+            add(a + m.start(), "reference-citation")
+        for m in CPP_CITATION_RE.finditer(text):
+            add(a + m.start(), "reference-citation")
+        for m in CPP_PAREN_RE.finditer(text):
+            add(a + m.start(), "reference-citation")
+        for m in HISTORY_RE.finditer(text):
+            add(a + m.start(), "history-comment")
 
     for m in LOG_RE.finditer(masked):
         if in_ranges(m.start(), ranges):
@@ -417,6 +474,9 @@ RULES = {
     "decision-number",
     "glob-reexport",
     "jargon-in-log",
+    "reference-citation",
+    "history-comment",
+    "clippy-allow",
 }
 SELF_TEST_BAD_RULES = tuple(sorted(RULES))
 
@@ -449,7 +509,7 @@ def load_allowlist():
     return entries
 
 
-def entry_matches(entry, rel, line, rule, code):
+def entry_matches_raw(entry, rel, line, rule, code):
     path, line_no, pattern, _reason = entry
     if path != rel:
         return False
@@ -457,6 +517,84 @@ def entry_matches(entry, rel, line, rule, code):
         return pattern == rule and line_no == line
     # Code anchor: survives line shifts, fails closed when the code changes.
     return normalize(pattern) in normalize(code)
+
+
+def load_baseline():
+    """Return ``(path, rule, anchor, reason)`` legacy-comment baseline entries.
+
+    The baseline is JSON Lines: one object per line with ``path``, ``rule``,
+    ``anchor`` (the normalized offending comment line) and ``reason``.  It is
+    keyed to the comment text, not a line number, so a shift does not make it
+    stale; a rewritten comment does.
+    """
+    entries = []
+    if not BASELINE.exists():
+        return entries
+    for raw in BASELINE.read_text(encoding="utf-8").splitlines():
+        text = raw.strip()
+        if not text or text.startswith("#"):
+            continue
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        path = str(obj.get("path", ""))
+        rule = str(obj.get("rule", ""))
+        anchor = str(obj.get("anchor", ""))
+        reason = str(obj.get("reason", ""))
+        if path and rule and anchor:
+            entries.append((path, rule, anchor, reason))
+    return entries
+
+
+def baseline_matches(entry, rel, line, rule, code):
+    """Whether a legacy-comment baseline entry suppresses a finding.
+
+    A baseline entry names one rule and one normalized comment line, so it can
+    only suppress the legacy comment it was recorded for.  The
+    ``clippy-allow`` rule is never baselined.
+    """
+    path, entry_rule, anchor, _reason = entry
+    if rule == "clippy-allow":
+        return False
+    return entry_rule == rule and path == rel and normalize(anchor) in normalize(code)
+
+
+def entry_matches(entry, rel, line, rule, code):
+    """Whether an allowlist entry suppresses a finding.
+
+    The ``clippy-allow`` rule has no exemptions: a clippy lint is fixed or the
+    code is written differently, never grandfathered.
+    """
+    if rule == "clippy-allow":
+        return False
+    return entry_matches_raw(entry, rel, line, rule, code)
+
+
+def crate_of(rel):
+    """The crate a repo-relative path belongs to (``platform/fs``, ``compat``)."""
+    parts = rel.split("/")
+    if len(parts) > 1 and parts[0] == "crates":
+        if parts[1] == "platform" and len(parts) > 2:
+            return f"platform/{parts[2]}"
+        return parts[1]
+    return parts[0]
+
+
+def print_summary(findings):
+    """Print the per-rule and per-crate counts of a finding list."""
+    rules = Counter(rule for _rel, _line, rule, _code in findings)
+    crates = Counter(crate_of(rel) for rel, _line, _rule, _code in findings)
+    files = {}
+    for rel, _line, _rule, _code in findings:
+        files.setdefault(crate_of(rel), set()).add(rel)
+    print("")
+    print("summary by rule:")
+    for rule, count in sorted(rules.items()):
+        print(f"  {rule:22s} {count}")
+    print("summary by crate (findings in files):")
+    for crate, count in sorted(crates.items()):
+        print(f"  {crate:22s} {count} finding(s) in {len(files[crate])} file(s)")
 
 
 def self_test():
@@ -505,9 +643,36 @@ def main():
         for rel, line, rule, code in findings:
             print(f"{rel}:{line}:{rule}: {code}")
         print(f"\n{len(findings)} finding(s) total (allowlist not applied)")
+        print_summary(findings)
         return 0
 
     allow = load_allowlist()
+    baseline = load_baseline()
+
+    # A clippy allowance is a hard finding: neither the reviewed allowlist nor
+    # the legacy baseline may suppress it, whether an entry names the rule or
+    # anchors the offending line.
+    clippy_sites = [f for f in findings if f[2] == "clippy-allow"]
+    clippy_entries = [
+        f"{entry[0]}:{entry[1]}:{entry[2]}"
+        for entry in allow
+        if entry[2] == "clippy-allow"
+        or any(entry_matches_raw(entry, *site) for site in clippy_sites)
+    ]
+    clippy_baseline = [
+        f"{entry[0]}:{entry[1]}:{entry[2]}"
+        for entry in baseline
+        if entry[1] == "clippy-allow"
+    ]
+    if clippy_entries or clippy_baseline:
+        for key in sorted(clippy_entries + clippy_baseline):
+            print(f"ERROR: a clippy allowance cannot be allowlisted: {key}")
+        print(
+            f"ERROR: clippy-allow entries in {ALLOW.relative_to(ROOT)} and "
+            f"{BASELINE.relative_to(ROOT)} must be zero."
+        )
+        return 1
+
     unallowed = []
     used = [False] * len(allow)
     for rel, line, rule, code in findings:
@@ -519,8 +684,28 @@ def main():
         if not hit:
             unallowed.append((rel, line, rule, code))
 
+    # Legacy comments are baselined separately from the reviewed allowlist: a
+    # baselined finding is not a failure, and a stale baseline entry is a note.
+    baselined = 0
+    used_baseline = [False] * len(baseline)
+    remaining = []
+    for rel, line, rule, code in unallowed:
+        hit = False
+        for i, entry in enumerate(baseline):
+            if baseline_matches(entry, rel, line, rule, code):
+                used_baseline[i] = True
+                hit = True
+        if hit:
+            baselined += 1
+        else:
+            remaining.append((rel, line, rule, code))
+    unallowed = remaining
+
     for rel, line, rule, code in unallowed:
         print(f"ERROR: house-style violation [{rule}] {rel}:{line}: {code}")
+
+    if unallowed:
+        print_summary(unallowed)
 
     stale = [
         f"{allow[i][0]}:{allow[i][1]}:{allow[i][2]}"
@@ -533,12 +718,28 @@ def main():
         for key in sorted(stale):
             print(f"  {key}")
 
+    stale_baseline = [
+        f"{baseline[i][0]}:{baseline[i][1]}"
+        for i in range(len(baseline))
+        if not used_baseline[i]
+    ]
+    if stale_baseline:
+        print("")
+        print(
+            f"note: {len(stale_baseline)} baseline entr(y/ies) no longer match "
+            "(legacy comment rewritten; remove from "
+            f"{BASELINE.relative_to(ROOT)}):"
+        )
+        for key in sorted(stale_baseline):
+            print(f"  {key}")
+
     if unallowed:
         print("")
         print(
             f"ERROR: {len(unallowed)} unallowlisted house-style violation(s) "
-            f"(AGENTS §5/§6); {len(findings)} site(s) checked, {len(allow)} "
-            "allowlist entry/entries."
+            f"(AGENTS §5/§6); {len(findings)} site(s) checked, "
+            f"{len(allow)} reviewed entr(y/ies), {len(baseline)} baseline "
+            f"entr(y/ies) ({baselined} applied)."
         )
         print("  Either fix the site or add a reviewed entry to")
         print(f"  {ALLOW.relative_to(ROOT)}")
@@ -548,7 +749,8 @@ def main():
 
     print(
         f"house-style guard: clean ({len(findings)} site(s) checked, "
-        f"{len(allow)} allowlisted) — {ALLOW.relative_to(ROOT)}"
+        f"{len(allow)} reviewed, {baselined} baselined) — "
+        f"{ALLOW.relative_to(ROOT)}, {BASELINE.relative_to(ROOT)}"
     )
     return 0
 
