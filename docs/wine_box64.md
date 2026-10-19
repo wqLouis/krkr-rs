@@ -22,7 +22,7 @@ Reference engine in tree: `reference/` (the **KrKr2 Emulator**,
 | D | **X11 window embedding**: Wine renders into its own X11 window, reparented under the engine's frame | **Viable-with-caveats** (X11 only) | Technically possible; Wine still owns input/focus/geometry, the WM can interfere, and it does nothing on Wayland. Latency + fragility. |
 | E | Build krkr-rs / the plugin host as a **32-bit Windows PE** and run it under Wine, loading the DLLs in-process | **Viable-with-caveats** | The only way to load the DLLs without reimplementing them; but the process is a Wine process, it's i686, and the host exporter (~89 functions) must be rebuilt. |
 | F | Out-of-process Wine worker for one **self-contained compute** task (e.g. a Windows-only codec), shared-memory IPC | **Viable-with-caveats** | Clean isolation, bounded surface; but krkr-rs already decodes the game's audio natively, so the value is niche. |
-| G | Continue the **native Rust reimplementation** (current; the next major version's target, `TODO.md` §17) | **Viable** — recommended | Already working; matches what Kirikiroid2 and the KrKr2 reference do. |
+| G | Continue the **native Rust reimplementation** (current; the target, `AGENTS.md` §1) | **Viable** — recommended | Already working; matches what Kirikiroid2 and the KrKr2 reference do. |
 | H | **ARM/Android** Wine + box64/box86 + Winlator/Hangover | **Not viable for embedding; viable only as a full Windows app under Wine** | i386 PE needs WoW64 + Box64/FEX (Hangover) or Box86; extra 2–10×+ emulation; still Wine-owned process/window. |
 | I | **Minimal Wayland compositor as Wine's display backend** (Android + box64): run Windows `.exe`s, not the DLLs | **Viable-with-caveats** for running Windows games; **not** a way to call the game's DLLs in-process | Wine's `winewayland.drv` needs only a small strict set of globals that Smithay already provides; the hard parts are the Android EGL backend and the box64/Wine packaging. See §12. |
 
@@ -33,7 +33,7 @@ under Wine behind an in-app minimal Wayland compositor — is evaluated in §12.
 
 **Non-goal.** Loading the game's Windows plugin DLLs through Wine is rejected;
 the port continues the native Rust reimplementation, which is the next major
-version's target (`TODO.md` §17). The engine's current render/window stack is
+version's target (`AGENTS.md` §1). The engine's current render/window stack is
 `render` (Vulkan) and `platform`; the Bevy/winit references below are the
 environment this study was written against.
 

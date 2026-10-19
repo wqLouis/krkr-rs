@@ -119,7 +119,7 @@ python3 scripts/check-android-target.py
 ## 4. The Android target is not built on the development host
 
 No NDK and no Android SDK are installed on the development host, and none may
-be installed (AGENTS §0, `TODO.md` §11). The Android target itself is therefore
+be installed (AGENTS §0, `TODO.md` §14). The Android target itself is therefore
 **never built or tested here**. Android-only code is written and reviewed here
 and is compiled and run on a machine that has an NDK; anything not compiled is
 documented as **unverified**, never described as working. The host bar is

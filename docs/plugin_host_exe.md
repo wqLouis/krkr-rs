@@ -19,7 +19,7 @@ sharpens and partially revises).
 
 **Non-goal.** A Wine plugin-host `.exe` is rejected; the port continues the
 native Rust reimplementation, which is the next major version's target
-(`TODO.md` §17). The engine's current render stack is `render` (Vulkan), not
+(`AGENTS.md` §1). The engine's current render stack is `render` (Vulkan), not
 Bevy/wgpu; the Bevy references below are the environment this study was written
 against.
 

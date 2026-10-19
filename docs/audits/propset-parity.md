@@ -306,13 +306,13 @@ The runtime comparison surfaces two things that were already true before the
 
 Both are recorded as remaining limitations in the regenerated reports.
 
-### 5.2 TODO §17 additions
+### 5.2 TODO §10 additions
 
 No new plugin/DLL coverage work is created by this change. The two
 pre-existing observations above are recorded in the audit and in the report
 blind-spot sections; the false `name` member is a script-side extractor fix,
 not a plugin port, and is left for the next extractor revision rather than
-inflating §17's plugin list.
+inflating §10's plugin list.
 
 ---
 
