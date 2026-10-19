@@ -999,12 +999,7 @@ impl PlayerInst {
             layer.opacity = (root.accumulated.opacity.clamp(0.0, 1.0)) as f32;
             layer.visible = root.draw_flag && self.visible;
         }
-        let color = [
-            self.color.bytes[0].clamp(0.0, 1.0) as u8,
-            self.color.bytes[1].clamp(0.0, 1.0) as u8,
-            self.color.bytes[2].clamp(0.0, 1.0) as u8,
-            self.color.bytes[3].clamp(0.0, 1.0) as u8,
-        ];
+        let color = color_bytes(self.color.bytes);
         let nodes: Vec<MotionNode> = self
             .nodes
             .iter()
@@ -1069,6 +1064,11 @@ impl PlayerInst {
         }
         Ok(())
     }
+}
+
+/// The byte channels a normalized color animator hands the rasterizer.
+fn color_bytes(channels: [f32; 4]) -> [u8; 4] {
+    channels.map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
 /// The layer a `Player.draw` target draws into.
@@ -1865,3 +1865,18 @@ pub(crate) fn register_named(
 }
 
 include!("player_members.rs");
+
+#[cfg(test)]
+mod tests {
+    use super::color_bytes;
+
+    #[test]
+    fn color_channels_are_scaled_from_the_normalized_animator() {
+        // The animator stores normalized channels; the rasterizer takes bytes.
+        // The reference keeps 0..255 floats in `rgbaBytes`
+        // (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:1554-1565`).
+        assert_eq!(color_bytes([1.0, 1.0, 1.0, 1.0]), [255, 255, 255, 255]);
+        assert_eq!(color_bytes([0.0, 0.5, 0.25, 0.0]), [0, 128, 64, 0]);
+        assert_eq!(color_bytes([2.0, -1.0, 1.0, 1.0]), [255, 0, 255, 255]);
+    }
+}
