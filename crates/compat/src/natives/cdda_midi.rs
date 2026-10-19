@@ -234,7 +234,10 @@ fn disc_event_arg(host: &Tjs2Engine, value: &Value) -> (TjsValue, Option<Detache
         VAL_STRING => (TjsValue::String(value_as_string(value)), None),
         VAL_VOID => (TjsValue::Void, None),
         _ => match host.retain_object_arg(value) {
-            Ok(retained) => (TjsValue::Retained(retained.raw_id() as u64), Some(retained)),
+            Ok(retained) => (
+                TjsValue::Retained(retained.raw_id().as_ptr() as u64),
+                Some(retained),
+            ),
             Err(_) => (TjsValue::Void, None),
         },
     }
@@ -260,7 +263,7 @@ fn disc_action_event(
     if !objthis.is_null()
         && let Ok(target) = host.retain_object_detached(objthis)
     {
-        let target_id = target.raw_id() as u64;
+        let target_id = target.raw_id().as_ptr() as u64;
         let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id));
         drop(target);
     }
@@ -352,7 +355,7 @@ fn disc_forward_action(call: CallArgs, spec: DiscActionSpec) -> c_int {
                 return Err(format!("disc sound.{}: {error}", spec.what));
             }
         };
-        let event_id = event.raw_id() as u64;
+        let event_id = event.raw_id().as_ptr() as u64;
         if let Err(error) =
             host.call_member(owner.raw_id(), "action", &[TjsValue::Retained(event_id)])
         {

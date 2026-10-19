@@ -70,6 +70,12 @@ use super::{Trans, TransError, argb_to_rgba, blend_level, read_pixel, write_pixe
 use crate::layer_ops::{RectI, blit_copy, intersect, intersect_rect};
 use crate::scene::BitmapState;
 
+/// The table generator's π as the truncated literal `3.14159265358979`.
+///
+/// `f64::consts::PI` differs in the last digits; this truncated value keeps
+/// every table entry at its exact byte value.
+const PI_TRUNCATED: f64 = f64::from_bits(0x4009_21FB_5444_2D11);
+
 /// Tile edge in pixels; the reference hard-codes 64×64 blocks (`turn.cpp`).
 const TILE: i32 = 64;
 
@@ -137,10 +143,9 @@ fn perl_int(value: f64) -> i32 {
 /// (left edge) and `(0,0)–β`/`β–(63,63)` (right edge) and the source walk
 /// that spans the square between the two edges. `n = 0` and `n = 63` stay
 /// zero-filled dummies (never read: those phases copy a whole source).
-// The generator carries `mkturntranstable.pl`'s own truncated π literal;
+// The generator uses its own truncated π literal (`PI_TRUNCATED`);
 // `f64::consts::PI` differs in the last digits and would move table entries
-// off the reference's byte-exact values.
-#[allow(clippy::approx_constant)]
+// off their exact values.
 fn generate_table() -> Box<[[TurnTransParams; 64]; 64]> {
     let mut table = Box::new([[TurnTransParams::default(); 64]; 64]);
     for n in 1..=62 {
@@ -148,11 +153,11 @@ fn generate_table() -> Box<[[TurnTransParams; 64]; 64]> {
         // the tile (`int(sin(...) * 4)`).
         let (a_x, a_y) = if n < 32 {
             let p = perl_int(f64::from(n * n) / 31.0);
-            let d = perl_int((f64::from(p) * 3.14159265358979 / 64.0).sin() * 4.0);
+            let d = perl_int((f64::from(p) * PI_TRUNCATED / 64.0).sin() * 4.0);
             (p - d, 63 - p - d)
         } else {
             let p = 63 - perl_int(f64::from((63 - n) * (63 - n)) / 31.0);
-            let d = perl_int((f64::from(63 - p) * 3.14159265358979 / 64.0).sin() * 4.0);
+            let d = perl_int((f64::from(63 - p) * PI_TRUNCATED / 64.0).sin() * 4.0);
             (63 - p + d, p + d)
         };
         // β point, the point-symmetric counterpart of α.

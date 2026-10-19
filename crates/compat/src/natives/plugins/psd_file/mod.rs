@@ -221,7 +221,7 @@ fn set_obj_member(
     child: DetachedValue,
 ) -> Result<(), String> {
     let id = child.raw_id();
-    host.set_member(object, key, &TjsValue::Retained(id as u64))
+    host.set_member(object, key, &TjsValue::Retained(id.as_ptr() as u64))
         .map_err(|error| error.to_string())?;
     std::mem::forget(child);
     Ok(())
@@ -238,7 +238,7 @@ fn set_retained_out(out: *mut Value, object: DetachedValue) {
             (*out).string = std::ptr::null();
             (*out).array = std::ptr::null();
             (*out).array_count = 0;
-            (*out).retained = object.raw_id() as usize;
+            (*out).retained = object.raw_id().as_ptr() as usize;
         }
     }
     std::mem::forget(object);
@@ -734,7 +734,11 @@ extern "C" fn psd_get_layer_info(
 // ---------------------------------------------------------------------------
 
 /// The shared body of the three `getLayerData*` methods.
-#[allow(clippy::too_many_arguments)]
+struct LayerDatum<'a> {
+    mode: ImageMode,
+    method: &'a str,
+}
+
 fn get_layer_data_impl(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -742,9 +746,9 @@ fn get_layer_data_impl(
     argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    mode: ImageMode,
-    method: &str,
+    datum: LayerDatum<'_>,
 ) -> c_int {
+    let LayerDatum { mode, method } = datum;
     let Some(binding) = resolve(engine) else {
         return report_error(
             out_error,
@@ -813,8 +817,10 @@ extern "C" fn psd_get_layer_data(
         argv,
         out,
         out_error,
-        ImageMode::MaskedImage,
-        "getLayerData",
+        LayerDatum {
+            mode: ImageMode::MaskedImage,
+            method: "getLayerData",
+        },
     )
 }
 
@@ -835,8 +841,10 @@ extern "C" fn psd_get_layer_data_raw(
         argv,
         out,
         out_error,
-        ImageMode::Image,
-        "getLayerDataRaw",
+        LayerDatum {
+            mode: ImageMode::Image,
+            method: "getLayerDataRaw",
+        },
     )
 }
 
@@ -857,8 +865,10 @@ extern "C" fn psd_get_layer_data_mask(
         argv,
         out,
         out_error,
-        ImageMode::Mask,
-        "getLayerDataMask",
+        LayerDatum {
+            mode: ImageMode::Mask,
+            method: "getLayerDataMask",
+        },
     )
 }
 

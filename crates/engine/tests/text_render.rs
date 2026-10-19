@@ -71,11 +71,13 @@ fn cpu_and_gpu_runs_share_glyph_geometry() {
     let mut atlas = GlyphAtlas::new(&pipeline, 256).expect("atlas");
     let cpu = rasterize_run(
         GlyphBackend::Cpu,
-        &mut cache,
-        &mut atlas,
-        &pipeline,
-        &mut state,
-        &engine,
+        engine::text::TextRasterServices {
+            cache: &mut cache,
+            atlas: &mut atlas,
+            pipeline: &pipeline,
+            state: &mut state,
+            engine: &engine,
+        },
         &layout,
         &style,
         true,
@@ -84,11 +86,13 @@ fn cpu_and_gpu_runs_share_glyph_geometry() {
     .expect("cpu run");
     let gpu = rasterize_run(
         GlyphBackend::Gpu,
-        &mut cache,
-        &mut atlas,
-        &pipeline,
-        &mut state,
-        &engine,
+        engine::text::TextRasterServices {
+            cache: &mut cache,
+            atlas: &mut atlas,
+            pipeline: &pipeline,
+            state: &mut state,
+            engine: &engine,
+        },
         &layout,
         &style,
         true,
@@ -187,11 +191,13 @@ fn atlas_batches_a_run_into_one_flush() {
 
     let gpu = rasterize_run(
         GlyphBackend::Gpu,
-        &mut cache,
-        &mut atlas,
-        &pipeline,
-        &mut state,
-        &engine,
+        engine::text::TextRasterServices {
+            cache: &mut cache,
+            atlas: &mut atlas,
+            pipeline: &pipeline,
+            state: &mut state,
+            engine: &engine,
+        },
         &layout,
         &style,
         true,

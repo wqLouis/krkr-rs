@@ -140,16 +140,16 @@ pub fn compose_layer(scene: &Scene, layer_id: u32) -> Option<ComposedLayer> {
 /// same routine the old sync used (`setImagePos(-frame_w * n, 0)`).
 ///
 /// Ported from the old `sync::visible_image_region`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn visible_image_region(
     layer_rect: Rect,
-    image_left: i32,
-    image_top: i32,
-    image_width: u32,
-    image_height: u32,
-    bmp_w: u32,
-    bmp_h: u32,
+    image: Rect,
+    bmp: (u32, u32),
 ) -> Option<(PixelRegion, RectF)> {
+    let image_left = image.x;
+    let image_top = image.y;
+    let image_width = image.w;
+    let image_height = image.h;
+    let (bmp_w, bmp_h) = bmp;
     let img_x = layer_rect.x.saturating_add(image_left);
     let img_y = layer_rect.y.saturating_add(image_top);
     let layer_x1 = layer_rect.x.saturating_add(dim_i32(layer_rect.w));
@@ -351,15 +351,8 @@ fn append_window<F>(
                             },
                         ),
                     };
-                    match visible_image_region(
-                        node_composed.rect,
-                        image_left,
-                        image_top,
-                        img_w,
-                        img_h,
-                        bmp_w,
-                        bmp_h,
-                    ) {
+                    let image = Rect::new(image_left, image_top, img_w, img_h);
+                    match visible_image_region(node_composed.rect, image, (bmp_w, bmp_h)) {
                         Some((src, dst)) => (dst, src),
                         // Fully clipped away: the layer draws nothing.
                         None => {

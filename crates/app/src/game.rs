@@ -209,6 +209,18 @@ impl FrameBody for Polls {
     }
 }
 
+/// The per-frame costs [`FrameAttribution::record`] stores alongside the
+/// phases: audio drain, engine frame and total wall clock.
+#[derive(Clone, Copy, Default)]
+struct FrameCosts {
+    /// Audio drain cost.
+    audio_ms: f64,
+    /// Engine frame cost, excluding the frame hook.
+    host_ms: f64,
+    /// Whole wall-clock cost.
+    total_ms: f64,
+}
+
 /// The previous frame's measured attribution, kept so a slow gap names the
 /// frame it actually spans.
 ///
@@ -238,24 +250,21 @@ struct FrameAttribution {
 
 impl FrameAttribution {
     /// Records the frame that just completed.
-    #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         phases: FramePhases,
         tick: TickPhases,
         report: StepReport,
         timings: Option<render::FrameTimings>,
-        audio_ms: f64,
-        host_ms: f64,
-        total_ms: f64,
+        costs: FrameCosts,
     ) {
         self.phases = phases;
         self.tick = tick;
         self.report = report;
         self.timings = timings;
-        self.audio_ms = audio_ms;
-        self.host_ms = host_ms;
-        self.total_ms = total_ms;
+        self.audio_ms = costs.audio_ms;
+        self.host_ms = costs.host_ms;
+        self.total_ms = costs.total_ms;
         self.valid = true;
     }
 
@@ -705,9 +714,11 @@ impl GameHost {
             self.polls.tick,
             report,
             self.host.last_frame_timings(),
-            audio_ms,
-            host_ms,
-            total_ms,
+            FrameCosts {
+                audio_ms,
+                host_ms,
+                total_ms,
+            },
         );
 
         if !self.first_frame_logged {
@@ -999,9 +1010,11 @@ mod tests {
                 recreate_ms: 0.0,
                 fence_wait_ms: 0.5,
             }),
-            3.0,
-            host_render_ms + 1.0,
-            body_ms + 3.5 + 4.0 + host_render_ms + 1.0 + 3.0,
+            FrameCosts {
+                audio_ms: 3.0,
+                host_ms: host_render_ms + 1.0,
+                total_ms: body_ms + 3.5 + 4.0 + host_render_ms + 1.0 + 3.0,
+            },
         );
         attribution
     }
@@ -1097,9 +1110,11 @@ mod tests {
                 ..StepReport::default()
             },
             None,
-            0.0,
-            0.0,
-            300.0,
+            FrameCosts {
+                audio_ms: 0.0,
+                host_ms: 0.0,
+                total_ms: 300.0,
+            },
         );
         let second = attribution
             .slow_frame_line(320.0, FramePacing::default())

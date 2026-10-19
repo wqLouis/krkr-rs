@@ -440,7 +440,7 @@ fn action_event(host: &Tjs2Engine, objthis: *mut c_void) -> Result<DetachedValue
         // The retention is consumed while the variant copy is built; on
         // failure it is left to `DetachedValue`'s idempotent release.
         if let Ok(target) = host.retain_object_detached(objthis) {
-            let target_id = target.raw_id() as u64;
+            let target_id = target.raw_id().as_ptr() as u64;
             let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id));
             drop(target);
         }
@@ -508,7 +508,7 @@ fn invoke_action(
     // The event dictionary crosses the call as `TjsValue::Retained`; the
     // C++ side consumes that retention while copying the argument, so
     // dropping `event` afterwards is an idempotent no-op.
-    let event_id = event.raw_id() as u64;
+    let event_id = event.raw_id().as_ptr() as u64;
     let result = if action_name.is_empty() {
         // Empty action name: `FuncCall(0, nullptr, ...)` invokes the owner
         // itself — `owner(event)` (`TimerIntf.cpp:165`).

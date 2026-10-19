@@ -145,7 +145,7 @@ fn layer_array(
         host.set_member(
             array.raw_id(),
             &index.to_string(),
-            &TjsValue::Retained(object.raw_id() as u64),
+            &TjsValue::Retained(object.raw_id().as_ptr() as u64),
         )?;
         std::mem::forget(object);
     }

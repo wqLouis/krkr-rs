@@ -22,8 +22,6 @@
 //!
 //! [`InputState`] owns no global and no clock: all state is explicit.
 
-#![allow(clippy::cast_precision_loss)]
-
 use std::collections::HashMap;
 
 use api::host::{TouchPhase, TouchPoint};

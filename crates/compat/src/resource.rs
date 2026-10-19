@@ -403,23 +403,34 @@ pub(crate) struct TextDrawParams<'a> {
     pub(crate) shadow_offset: (i32, i32),
 }
 
+/// A resolved face and the style it is drawn with.
+pub(crate) struct FaceSpec<'a> {
+    pub(crate) face: &'a str,
+    pub(crate) size_px: f32,
+    pub(crate) bold: bool,
+    pub(crate) italic: bool,
+    pub(crate) angle_tenths: f64,
+}
+
 /// Draw `params` into `bitmap`, resolving `face` through `resolver`.
 ///
 /// `clip` is the layer/bitmap clip rectangle. Returns the union of the drawn
 /// glyph rectangles, or `None` when nothing had ink.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_text_into_bitmap(
     resolver: &mut ResourceResolver,
     ctx: &CompatCtx,
     bitmap: &mut BitmapState,
-    face: &str,
-    size_px: f32,
-    bold: bool,
-    italic: bool,
-    angle_tenths: f64,
+    face: FaceSpec<'_>,
     clip: RectI,
     params: &TextDrawParams<'_>,
 ) -> Result<Option<RectI>, String> {
+    let FaceSpec {
+        face,
+        size_px,
+        bold,
+        italic,
+        angle_tenths,
+    } = face;
     let font = resolver.resolve_face(ctx, face)?;
     let mut style = TextStyle::new(size_px);
     style.bold = bold;
@@ -437,11 +448,13 @@ pub(crate) fn draw_text_into_bitmap(
         return draw_prerendered_text(
             resolver,
             bitmap,
-            font,
-            &body,
-            size_px,
-            &style,
-            angle_tenths,
+            PrerenderedDraw {
+                font,
+                body: &body,
+                size_px,
+                style: &style,
+                angle_tenths,
+            },
             clip,
             params,
         );
@@ -549,18 +562,28 @@ struct PrerenderedGlyph {
 /// advances by the descriptor's `IncX`/`IncY`, and the glyph origin includes
 /// the reference's ascent offset
 /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:715-728,1275-1433`).
-#[allow(clippy::too_many_arguments)]
+struct PrerenderedDraw<'a> {
+    font: FontId,
+    body: &'a PrerenderedBody,
+    size_px: f32,
+    style: &'a TextStyle,
+    angle_tenths: f64,
+}
+
 fn draw_prerendered_text(
     resolver: &ResourceResolver,
     bitmap: &mut BitmapState,
-    font: FontId,
-    body: &PrerenderedBody,
-    size_px: f32,
-    style: &TextStyle,
-    angle_tenths: f64,
+    font: PrerenderedDraw<'_>,
     clip: RectI,
     params: &TextDrawParams<'_>,
 ) -> Result<Option<RectI>, String> {
+    let PrerenderedDraw {
+        font,
+        body,
+        size_px,
+        style,
+        angle_tenths,
+    } = font;
     let ascent = f64::from(
         resolver
             .engine

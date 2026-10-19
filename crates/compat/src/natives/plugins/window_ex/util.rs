@@ -82,7 +82,7 @@ pub(crate) fn set_retained_out(out: *mut Value, id: tjs::Tjs2ValueId) {
         (*out).string = ptr::null();
         (*out).array = ptr::null();
         (*out).array_count = 0;
-        (*out).retained = id as usize;
+        (*out).retained = id.as_ptr() as usize;
     }
 }
 

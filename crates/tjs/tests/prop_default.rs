@@ -8,7 +8,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use tjs::{DetachedValue, RetainedValue, Tjs2Engine, TjsValue};
+use tjs::{DetachedValue, RetainedValue, Tjs2Engine, Tjs2ValueId, TjsValue};
 
 /// The C++ TJS2 VM is single-threaded; serialize the tests.
 static VM_LOCK: Mutex<()> = Mutex::new(());
@@ -42,8 +42,10 @@ fn set_default_member_consumes_the_retained_value() {
     // The write may succeed or fail (a plain dictionary need not accept a
     // default member); either way the retained value is converted first and
     // therefore consumed.
-    let result =
-        engine.set_default_member(target.raw_id(), &TjsValue::Retained(value.raw_id() as u64));
+    let result = engine.set_default_member(
+        target.raw_id(),
+        &TjsValue::Retained(value.raw_id().as_ptr() as u64),
+    );
     let after = retained_count(&engine);
     assert_eq!(
         after,
@@ -60,8 +62,8 @@ fn set_default_member_with_invalid_target_keeps_the_value_retained() {
     let before = retained_count(&engine);
     let err = engine
         .set_default_member(
-            std::ptr::null_mut(),
-            &TjsValue::Retained(value.raw_id() as u64),
+            Tjs2ValueId::null(),
+            &TjsValue::Retained(value.raw_id().as_ptr() as u64),
         )
         .expect_err("a null target must fail");
     assert!(!err.is_empty(), "expected an error message: {err}");

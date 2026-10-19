@@ -243,7 +243,7 @@ fn attach_named(
     let Ok(RetainedValue::Object(class)) = engine.eval_retained(internal, "layer_ex") else {
         return Ok(false);
     };
-    let id = class.raw_id() as usize as u64;
+    let id = class.raw_id().as_ptr() as usize as u64;
     engine
         .set_member(gdiplus_id, public, &TjsValue::Retained(id))
         .map_err(|error| error.to_string())?;
@@ -293,11 +293,11 @@ pub(super) fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     let gdiplus_id = gdiplus_handle
         .as_ref()
         .map(DetachedValue::raw_id)
-        .unwrap_or(std::ptr::null_mut());
+        .unwrap_or(tjs::Tjs2ValueId::null());
     let global_id = global_handle
         .as_ref()
         .map(DetachedValue::raw_id)
-        .unwrap_or(std::ptr::null_mut());
+        .unwrap_or(tjs::Tjs2ValueId::null());
 
     // (public `GdiPlus.*` name, registration class name, keeps a global).
     // `Font` is registered as `FontInfo` because that is the C++ class name

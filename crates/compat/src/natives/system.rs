@@ -538,7 +538,7 @@ fn set_retained_value_out(ctx: &CompatCtx, out: *mut Value, value: RetainedValue
                     (*out).string = std::ptr::null();
                     (*out).array = std::ptr::null();
                     (*out).array_count = 0;
-                    (*out).retained = dv.raw_id() as usize;
+                    (*out).retained = dv.raw_id().as_ptr() as usize;
                 }
             }
             // The C++ side consumes the retention while copying the result.
@@ -2563,7 +2563,7 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         for name in ["exceptionHandler", "onActivate", "onDeactivate"] {
             match host.duplicate_retained(null.raw_id()) {
                 Ok(value) => {
-                    let id = value.raw_id() as u64;
+                    let id = value.raw_id().as_ptr() as u64;
                     if let Err(error) =
                         host.set_member(class.raw_id(), name, &TjsValue::Retained(id))
                     {

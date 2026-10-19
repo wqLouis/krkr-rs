@@ -189,7 +189,10 @@ fn object_to_string(engine: &Tjs2Engine, object: &DetachedValue) -> Result<Strin
         Err(error) => return Err(error.to_string()),
     };
     let argument = engine.duplicate_retained(object.raw_id())?;
-    match engine.call_detached(&helper, &[TjsValue::Retained(argument.raw_id() as u64)]) {
+    match engine.call_detached(
+        &helper,
+        &[TjsValue::Retained(argument.raw_id().as_ptr() as u64)],
+    ) {
         Ok(TjsValue::String(text)) => Ok(text),
         Ok(other) => Err(format!("KAGParser: object string form is {other:?}")),
         Err(error) => Err(error),
@@ -371,7 +374,7 @@ fn owner_tag_closure(
             match engine.call_member(
                 id.raw_id(),
                 member,
-                &[TjsValue::Retained(dict.raw_id() as u64)],
+                &[TjsValue::Retained(dict.raw_id().as_ptr() as u64)],
             ) {
                 Ok(value) => tjs_value_truthy(&value),
                 Err(_) => true,
@@ -477,7 +480,7 @@ fn set_retained_object(out: *mut Value, object: DetachedValue) {
             (*out).string = ptr::null();
             (*out).array = ptr::null();
             (*out).array_count = 0;
-            (*out).retained = object.raw_id() as usize;
+            (*out).retained = object.raw_id().as_ptr() as usize;
         }
     }
     // The C++ conversion consumes the id; forgetting the wrapper avoids a
@@ -565,7 +568,7 @@ fn build_tag_dict(
     engine.set_member(
         dict.raw_id(),
         "taglist",
-        &TjsValue::Retained(taglist.raw_id() as u64),
+        &TjsValue::Retained(taglist.raw_id().as_ptr() as u64),
     )?;
     Ok(dict)
 }
@@ -1028,7 +1031,11 @@ fn build_store_dict(host: &Tjs2Engine, state: &KagParserState) -> Result<Detache
     }
     // `macros` dictionary (`KAGParser.cpp:506-520`).
     let macros = retain_dict(host, &state.macros_entries())?;
-    host.set_member(raw, "macros", &TjsValue::Retained(macros.raw_id() as u64))?;
+    host.set_member(
+        raw,
+        "macros",
+        &TjsValue::Retained(macros.raw_id().as_ptr() as u64),
+    )?;
     drop(macros);
     // `macroArgs`: an array of dictionaries (`KAGParser.cpp:521-544`).
     let levels = retained_object(host, "[]")?;
@@ -1037,14 +1044,14 @@ fn build_store_dict(host: &Tjs2Engine, state: &KagParserState) -> Result<Detache
         host.set_member(
             levels.raw_id(),
             &index.to_string(),
-            &TjsValue::Retained(level_dict.raw_id() as u64),
+            &TjsValue::Retained(level_dict.raw_id().as_ptr() as u64),
         )?;
         drop(level_dict);
     }
     host.set_member(
         raw,
         "macroArgs",
-        &TjsValue::Retained(levels.raw_id() as u64),
+        &TjsValue::Retained(levels.raw_id().as_ptr() as u64),
     )?;
     drop(levels);
     // `callStack`: an array of dictionaries (`KAGParser.cpp:546-634`).
@@ -1090,11 +1097,15 @@ fn build_store_dict(host: &Tjs2Engine, state: &KagParserState) -> Result<Detache
         host.set_member(
             stack.raw_id(),
             &index.to_string(),
-            &TjsValue::Retained(entry_raw as u64),
+            &TjsValue::Retained(entry_raw.as_ptr() as u64),
         )?;
         drop(entry_dict);
     }
-    host.set_member(raw, "callStack", &TjsValue::Retained(stack.raw_id() as u64))?;
+    host.set_member(
+        raw,
+        "callStack",
+        &TjsValue::Retained(stack.raw_id().as_ptr() as u64),
+    )?;
     drop(stack);
     Ok(dict)
 }
@@ -1622,7 +1633,7 @@ fn retain_param_macros_dict(
         host.set_member(
             dict.raw_id(),
             name,
-            &TjsValue::Retained(array.raw_id() as u64),
+            &TjsValue::Retained(array.raw_id().as_ptr() as u64),
         )?;
     }
     Ok(dict)
@@ -1693,7 +1704,7 @@ fn call_param_macro_helper(
 ) -> Result<TjsValue, String> {
     let dict_arg = host.duplicate_retained(dict)?;
     let mut arguments = vec![
-        TjsValue::Retained(dict_arg.raw_id() as u64),
+        TjsValue::Retained(dict_arg.raw_id().as_ptr() as u64),
         TjsValue::String(name.to_string()),
     ];
     if let Some(index) = index {

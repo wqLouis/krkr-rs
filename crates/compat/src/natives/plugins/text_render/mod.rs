@@ -285,7 +285,7 @@ extern "C" fn text_render_get_characters(
                 Ok(dict) => dict,
                 Err(error) => return report_error(out_error, &error),
             };
-            let dict_id = dict.raw_id() as u64;
+            let dict_id = dict.raw_id().as_ptr() as u64;
             // The retention is consumed by `set_member`; forget the RAII
             // wrapper so it is not released a second time.
             std::mem::forget(dict);
@@ -923,7 +923,7 @@ fn set_retained_out(out: *mut Value, object: DetachedValue) {
             (*out).string = std::ptr::null();
             (*out).array = std::ptr::null();
             (*out).array_count = 0;
-            (*out).retained = object.raw_id() as usize;
+            (*out).retained = object.raw_id().as_ptr() as usize;
         }
     }
     // The C++ conversion consumes the id; forgetting the wrapper avoids a

@@ -13,7 +13,7 @@ use engine::layer_ops::RectI;
 use engine::raster;
 
 use super::appearance::{AppearanceData, DrawInfo, Paint};
-use super::draw::{Mat, blit_parallelogram, render_path};
+use super::draw::{ImagePlacement, Mat, blit_parallelogram, render_path};
 use super::path::{Figure, PathData};
 
 /// One recorded drawing operation, in local (pre-transform) coordinates.
@@ -56,7 +56,18 @@ pub(super) fn replay_record(bitmap: &mut BitmapState, ops: &[RecordOp], ctm: Mat
                 p2,
             } => {
                 let source = BitmapState::new(*sw, *sh, src.clone());
-                blit_parallelogram(bitmap, &source, *src_rect, *p0, *p1, *p2, ctm, clip);
+                blit_parallelogram(
+                    bitmap,
+                    ImagePlacement {
+                        source: engine::layer_ops::BlitSource {
+                            bitmap: &source,
+                            rect: *src_rect,
+                        },
+                        corners: [*p0, *p1, *p2],
+                    },
+                    ctm,
+                    clip,
+                );
             }
         }
     }

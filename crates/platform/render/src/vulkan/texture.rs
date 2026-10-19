@@ -561,15 +561,23 @@ pub(crate) fn create_texture(
     })
 }
 
+/// The device, memory and queue an upload batch is staged and submitted on.
+#[derive(Clone, Copy)]
+pub(crate) struct UploadContext<'a> {
+    /// Logical device that owns the images and staging buffers.
+    pub(crate) device: &'a ash::Device,
+    /// Memory properties that pick the staging buffer's memory type.
+    pub(crate) memory_properties: &'a vk::PhysicalDeviceMemoryProperties,
+    /// Queue the batch is submitted to.
+    pub(crate) queue: vk::Queue,
+}
+
 /// Copies a tightly packed sub-rectangle of `pixels` into `texture`.
 ///
 /// The batch is staged and submitted to a free slot of `ring` without waiting.
 /// `key` identifies `texture` so two uploads to the same image are serialised.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn upload(
-    device: &ash::Device,
-    memory_properties: &vk::PhysicalDeviceMemoryProperties,
-    queue: vk::Queue,
+    context: &UploadContext<'_>,
     ring: &mut UploadRing,
     texture: &mut VulkanTexture,
     key: u64,
@@ -588,29 +596,28 @@ pub(crate) fn upload(
         pixels,
     }];
     let offsets = [0usize];
+    let keys = [key];
     let first_upload = !texture.uploaded;
-    let result = submit_batch(
-        device,
-        memory_properties,
-        queue,
-        ring,
-        &[key],
-        &uploads,
-        &offsets,
+    let batch = StageBatch {
+        keys: &keys,
+        uploads: &uploads,
+        offsets: &offsets,
         total,
-        |command_buffer, staging_buffer| {
-            record_copy(
-                device,
+    };
+    let result = submit_batch(context, ring, batch, |command_buffer, staging_buffer| {
+        record_copy(
+            context,
+            CopyRecord {
                 command_buffer,
                 staging_buffer,
                 texture,
                 region,
-                0,
+                staging_offset: 0,
                 first_upload,
-            );
-            Ok(())
-        },
-    );
+            },
+        );
+        Ok(())
+    });
     if result.is_ok() {
         texture.uploaded = true;
     }
@@ -637,11 +644,8 @@ pub(crate) struct TextureUpload<'a> {
 /// have been validated against its texture. Waiting happens in [`UploadRing`]
 /// only when a slot is reused or when `wait_all` asks the present path for the
 /// pixels.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn upload_batch(
-    device: &ash::Device,
-    memory_properties: &vk::PhysicalDeviceMemoryProperties,
-    queue: vk::Queue,
+    context: &UploadContext<'_>,
     ring: &mut UploadRing,
     textures: &mut HashMap<u64, VulkanTexture>,
     uploads: &[TextureUpload<'_>],
@@ -656,36 +660,34 @@ pub(crate) fn upload_batch(
     // copy; every later copy starts from the sampled layout the previous
     // transition left behind.
     let mut seen: HashSet<u64> = HashSet::with_capacity(uploads.len());
-    let result = submit_batch(
-        device,
-        memory_properties,
-        queue,
-        ring,
-        &keys,
+    let batch = StageBatch {
+        keys: &keys,
         uploads,
-        &offsets,
+        offsets: &offsets,
         total,
-        |command_buffer, staging_buffer| {
-            for (upload, &offset) in uploads.iter().zip(&offsets) {
-                let gpu = textures
-                    .get_mut(&upload.key)
-                    .ok_or_else(|| RenderError::Upload {
-                        message: "texture state disappeared during upload".to_owned(),
-                    })?;
-                let first_upload = !gpu.uploaded && seen.insert(upload.key);
-                record_copy(
-                    device,
+    };
+    let result = submit_batch(context, ring, batch, |command_buffer, staging_buffer| {
+        for (upload, &offset) in uploads.iter().zip(&offsets) {
+            let gpu = textures
+                .get_mut(&upload.key)
+                .ok_or_else(|| RenderError::Upload {
+                    message: "texture state disappeared during upload".to_owned(),
+                })?;
+            let first_upload = !gpu.uploaded && seen.insert(upload.key);
+            record_copy(
+                context,
+                CopyRecord {
                     command_buffer,
                     staging_buffer,
-                    gpu,
-                    upload.region,
-                    offset as vk::DeviceSize,
+                    texture: gpu,
+                    region: upload.region,
+                    staging_offset: offset as vk::DeviceSize,
                     first_upload,
-                );
-            }
-            Ok(())
-        },
-    );
+                },
+            );
+        }
+        Ok(())
+    });
 
     // The images stay sampleable if the submit failed: nothing reached the
     // queue, so their recorded transitions never ran.
@@ -699,26 +701,45 @@ pub(crate) fn upload_batch(
     result
 }
 
-/// Stages `uploads` in a free ring slot and submits them without waiting.
+/// One upload batch's staging plan: the images to serialise on, the uploads,
+/// their staging offsets and the total staged byte count.
+struct StageBatch<'a> {
+    /// Destination texture keys, which keep an in-flight image from reusing a
+    /// slot.
+    keys: &'a [u64],
+    /// Updates staged into the slot.
+    uploads: &'a [TextureUpload<'a>],
+    /// Staging offset of every entry in `uploads`.
+    offsets: &'a [usize],
+    /// Total staged byte count.
+    total: usize,
+}
+
+/// Stages a batch in a free ring slot and submits it without waiting.
 ///
 /// `record` receives the recording command buffer and the staging buffer it
 /// must copy from. Nothing is submitted when `record` fails, so the slot's
 /// fence stays signalled and the slot is reusable.
-#[allow(clippy::too_many_arguments)]
 fn submit_batch<F>(
-    device: &ash::Device,
-    memory_properties: &vk::PhysicalDeviceMemoryProperties,
-    queue: vk::Queue,
+    context: &UploadContext<'_>,
     ring: &mut UploadRing,
-    keys: &[u64],
-    uploads: &[TextureUpload<'_>],
-    offsets: &[usize],
-    total: usize,
+    batch: StageBatch<'_>,
     record: F,
 ) -> Result<(), RenderError>
 where
     F: FnOnce(vk::CommandBuffer, vk::Buffer) -> Result<(), RenderError>,
 {
+    let UploadContext {
+        device,
+        memory_properties,
+        queue,
+    } = *context;
+    let StageBatch {
+        keys,
+        uploads,
+        offsets,
+        total,
+    } = batch;
     let slot = ring.acquire(device, keys)?;
     slot.staging.reserve(
         device,
@@ -795,17 +816,34 @@ fn staging_layout(uploads: &[TextureUpload<'_>]) -> Result<(Vec<usize>, usize), 
     Ok((offsets, total))
 }
 
-/// Records the layout transitions and buffer-to-image copy for one upload.
-#[allow(clippy::too_many_arguments)]
-fn record_copy(
-    device: &ash::Device,
+/// One staged copy: which command buffer and staging buffer it records into
+/// and the destination range it writes.
+struct CopyRecord<'a> {
+    /// Command buffer the copy is recorded into.
     command_buffer: vk::CommandBuffer,
+    /// Staging buffer the pixels are read from.
     staging_buffer: vk::Buffer,
-    texture: &VulkanTexture,
+    /// Destination texture image.
+    texture: &'a VulkanTexture,
+    /// Sub-rectangle of `texture` to write.
     region: PixelRegion,
+    /// Byte offset of this copy's pixels inside `staging_buffer`.
     staging_offset: vk::DeviceSize,
+    /// Whether the image is still in its initial `UNDEFINED` layout.
     first_upload: bool,
-) {
+}
+
+/// Records the layout transitions and buffer-to-image copy for one upload.
+fn record_copy(context: &UploadContext<'_>, copy: CopyRecord<'_>) {
+    let UploadContext { device, .. } = *context;
+    let CopyRecord {
+        command_buffer,
+        staging_buffer,
+        texture,
+        region,
+        staging_offset,
+        first_upload,
+    } = copy;
     let (old_layout, src_access, src_stage) = if first_upload {
         (
             vk::ImageLayout::UNDEFINED,
@@ -826,12 +864,14 @@ fn record_copy(
             device,
             command_buffer,
             texture,
-            old_layout,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            src_access,
-            vk::AccessFlags::TRANSFER_WRITE,
-            src_stage,
-            vk::PipelineStageFlags::TRANSFER,
+            ImageTransition {
+                old_layout,
+                new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                src_access,
+                dst_access: vk::AccessFlags::TRANSFER_WRITE,
+                src_stage,
+                dst_stage: vk::PipelineStageFlags::TRANSFER,
+            },
         );
 
         let subresource = vk::ImageSubresourceLayers::default()
@@ -865,12 +905,14 @@ fn record_copy(
             device,
             command_buffer,
             texture,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::AccessFlags::SHADER_READ,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            ImageTransition {
+                old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                src_access: vk::AccessFlags::TRANSFER_WRITE,
+                dst_access: vk::AccessFlags::SHADER_READ,
+                src_stage: vk::PipelineStageFlags::TRANSFER,
+                dst_stage: vk::PipelineStageFlags::FRAGMENT_SHADER,
+            },
         );
     }
 }
@@ -929,14 +971,12 @@ impl VulkanPipeline {
             textures,
             ..
         } = &mut **vstate;
-        upload_batch(
+        let context = UploadContext {
             device,
-            &self.memory_properties,
-            *graphics_queue,
-            upload,
-            textures,
-            &batch,
-        )
+            memory_properties: &self.memory_properties,
+            queue: *graphics_queue,
+        };
+        upload_batch(&context, upload, textures, &batch)
     }
 }
 
@@ -999,19 +1039,37 @@ fn create_staging_buffer(
     Ok((buffer, memory))
 }
 
+/// One image-memory barrier's layout, access and stage span.
+struct ImageTransition {
+    /// Layout the image is in before the barrier.
+    old_layout: vk::ImageLayout,
+    /// Layout the image is in after the barrier.
+    new_layout: vk::ImageLayout,
+    /// Accesses that must complete before the barrier.
+    src_access: vk::AccessFlags,
+    /// Accesses the barrier makes visible afterwards.
+    dst_access: vk::AccessFlags,
+    /// Pipeline stage the barrier waits on.
+    src_stage: vk::PipelineStageFlags,
+    /// Pipeline stage the barrier releases to.
+    dst_stage: vk::PipelineStageFlags,
+}
+
 /// Emits an image-memory barrier that transitions `texture` between layouts.
-#[allow(clippy::too_many_arguments)]
 fn transition_image(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     texture: &VulkanTexture,
-    old_layout: vk::ImageLayout,
-    new_layout: vk::ImageLayout,
-    src_access: vk::AccessFlags,
-    dst_access: vk::AccessFlags,
-    src_stage: vk::PipelineStageFlags,
-    dst_stage: vk::PipelineStageFlags,
+    transition: ImageTransition,
 ) {
+    let ImageTransition {
+        old_layout,
+        new_layout,
+        src_access,
+        dst_access,
+        src_stage,
+        dst_stage,
+    } = transition;
     let subresource_range = vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .base_mip_level(0)

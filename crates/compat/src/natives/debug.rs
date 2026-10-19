@@ -678,7 +678,7 @@ fn set_object_out(host: &Tjs2Engine, out: *mut Value, object: Option<&DetachedVa
                     (*out).string = std::ptr::null();
                     (*out).array = std::ptr::null();
                     (*out).array_count = 0;
-                    (*out).retained = duplicate.raw_id() as usize;
+                    (*out).retained = duplicate.raw_id().as_ptr() as usize;
                 }
             }
             // The C++ conversion consumed the retention.

@@ -188,7 +188,7 @@ extern "C" fn resource_ctor(
                     let Ok(dictionary) = eval_object(&ctx, "%[]") else {
                         continue;
                     };
-                    let id = dictionary.raw_id() as usize as u64;
+                    let id = dictionary.raw_id().as_ptr() as usize as u64;
                     let _ = engine_ref.set_member(window.raw_id(), name, &TjsValue::Retained(id));
                     drop(dictionary);
                 }
@@ -287,7 +287,7 @@ fn install(
             .set_member(parent, key, &value)
             .map_err(|error| error.to_string()),
         Built::Object(object) => {
-            let id = object.raw_id() as usize as u64;
+            let id = object.raw_id().as_ptr() as usize as u64;
             engine
                 .set_member(parent, key, &TjsValue::Retained(id))
                 .map_err(|error| error.to_string())?;
@@ -454,10 +454,10 @@ extern "C" fn resource_unload(
 /// at `ResourceManager.cpp:194`). The module carries its snapshot id in the
 /// `__motionSnapshot` member (`module_object`).
 fn unregister_snapshot(res: &crate::natives::system::EngineBinding, module_raw: usize) {
-    let Ok(TjsValue::Integer(snapshot_id)) = res
-        .engine()
-        .member(module_raw as *mut std::ffi::c_void, "__motionSnapshot")
-    else {
+    let Ok(TjsValue::Integer(snapshot_id)) = res.engine().member(
+        tjs::Tjs2ValueId::from_raw(module_raw as *mut std::ffi::c_void),
+        "__motionSnapshot",
+    ) else {
         return;
     };
     let ctx = res.ctx();

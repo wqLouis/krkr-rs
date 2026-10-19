@@ -118,7 +118,7 @@ fn set_retained_out(out: *mut Value, object: DetachedValue) {
             (*out).string = std::ptr::null();
             (*out).array = std::ptr::null();
             (*out).array_count = 0;
-            (*out).retained = object.raw_id() as usize;
+            (*out).retained = object.raw_id().as_ptr() as usize;
         }
     }
     std::mem::forget(object);
@@ -180,7 +180,7 @@ fn set_octet_member(
     host.set_member(
         global.raw_id(),
         PSB_BUF_GLOBAL,
-        &TjsValue::Retained(holder.raw_id() as u64),
+        &TjsValue::Retained(holder.raw_id().as_ptr() as u64),
     )?;
     drop(holder);
     host.set_member(
@@ -218,7 +218,7 @@ fn set_built(
     match built {
         Built::Scalar(value) => host.set_member(parent, key, &value),
         Built::Object(object) => {
-            let id = object.raw_id() as usize as u64;
+            let id = object.raw_id().as_ptr() as usize as u64;
             host.set_member(parent, key, &TjsValue::Retained(id))?;
             drop(object);
             Ok(())

@@ -225,7 +225,7 @@ fn serialize_object(
         namespace,
         SERIALIZER_NAME,
         &[
-            TjsValue::Retained(object.raw_id() as u64),
+            TjsValue::Retained(object.raw_id().as_ptr() as u64),
             TjsValue::Integer(newline),
         ],
     )?;

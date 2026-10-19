@@ -225,24 +225,36 @@ impl VulkanRenderTarget {
     }
 }
 
+/// The command resources one synchronous offscreen operation records into and
+/// submits on.
+#[derive(Clone, Copy)]
+pub(crate) struct OffscreenSubmit<'a> {
+    /// Logical device that owns every handle below.
+    pub(crate) device: &'a ash::Device,
+    /// Queue the command buffer is submitted to.
+    pub(crate) queue: vk::Queue,
+    /// Pool the command buffer is allocated from and reset with.
+    pub(crate) command_pool: vk::CommandPool,
+    /// Command buffer the operation is recorded into.
+    pub(crate) command_buffer: vk::CommandBuffer,
+    /// Fence waited on after the submit.
+    pub(crate) fence: vk::Fence,
+}
+
 /// Records `scene` into `target` and submits it synchronously.
 ///
 /// # Errors
 ///
 /// Propagates [`RenderError::Unsupported`] from the scene (mask clips, GPU
 /// glyph runs, destination-dependent blends) and any command/submit failure.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn render(
-    device: &ash::Device,
-    queue: vk::Queue,
-    command_pool: vk::CommandPool,
-    command_buffer: vk::CommandBuffer,
-    fence: vk::Fence,
+    submit: &OffscreenSubmit<'_>,
     target: &VulkanRenderTarget,
     pass: &OffscreenPass,
     textures: &HashMap<u64, VulkanTexture>,
     scene: &RenderScene,
 ) -> Result<(), RenderError> {
+    let OffscreenSubmit { device, .. } = *submit;
     let extent = vk::Extent2D {
         width: target.desc.width,
         height: target.desc.height,
@@ -263,45 +275,40 @@ pub(crate) fn render(
         .render_area(render_area)
         .clear_values(&clear_values);
 
-    record_and_submit(
-        device,
-        queue,
-        command_pool,
-        command_buffer,
-        fence,
-        |command_buffer| {
-            // SAFETY: the command buffer is recording and every handle is live.
-            unsafe {
-                device.cmd_begin_render_pass(
-                    command_buffer,
-                    &render_pass_begin,
-                    vk::SubpassContents::INLINE,
-                );
-                let viewport = vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: extent.width as f32,
-                    height: extent.height as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                };
-                device.cmd_set_viewport(command_buffer, 0, &[viewport]);
-            }
-            draw::record_scene(
-                device,
+    record_and_submit(submit, |command_buffer| {
+        // SAFETY: the command buffer is recording and every handle is live.
+        unsafe {
+            device.cmd_begin_render_pass(
                 command_buffer,
-                &pass.pipelines,
+                &render_pass_begin,
+                vk::SubpassContents::INLINE,
+            );
+            let viewport = vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: extent.width as f32,
+                height: extent.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            device.cmd_set_viewport(command_buffer, 0, &[viewport]);
+        }
+        draw::record_scene(
+            &draw::SceneDraw {
+                device,
+                command: command_buffer,
+                pipelines: &pass.pipelines,
                 textures,
-                scene,
                 extent,
                 srgb,
-                &Affine2::IDENTITY,
-            )?;
-            // SAFETY: the render pass and command buffer are recording.
-            unsafe { device.cmd_end_render_pass(command_buffer) };
-            Ok(())
-        },
-    )
+            },
+            scene,
+            &Affine2::IDENTITY,
+        )?;
+        // SAFETY: the render pass and command buffer are recording.
+        unsafe { device.cmd_end_render_pass(command_buffer) };
+        Ok(())
+    })
 }
 
 /// Copies `region` of `target` into `out` and waits for completion.
@@ -314,19 +321,15 @@ pub(crate) fn render(
 /// # Errors
 ///
 /// Returns [`RenderError::Framebuffer`] on allocation/copy/map failure.
-#[allow(clippy::too_many_arguments)] // a low-level Vulkan read-back needs its device handles
 pub(crate) fn read(
-    device: &ash::Device,
+    submit: &OffscreenSubmit<'_>,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
-    queue: vk::Queue,
-    command_pool: vk::CommandPool,
-    command_buffer: vk::CommandBuffer,
-    fence: vk::Fence,
     target: &VulkanRenderTarget,
     readback: &mut StagingBuffer,
     region: PixelRegion,
     out: &mut [u8],
 ) -> Result<(), RenderError> {
+    let OffscreenSubmit { device, .. } = *submit;
     let bytes_per_pixel = target.desc.format.bytes_per_pixel() as vk::DeviceSize;
     let size = (region.area() * bytes_per_pixel as u64).max(1);
 
@@ -339,48 +342,41 @@ pub(crate) fn read(
     let buffer = readback.buffer;
     let memory = readback.memory;
 
-    record_and_submit(
-        device,
-        queue,
-        command_pool,
-        command_buffer,
-        fence,
-        |command_buffer| {
-            barrier_to_transfer_src(device, command_buffer, target);
-            let subresource = vk::ImageSubresourceLayers::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .mip_level(0)
-                .base_array_layer(0)
-                .layer_count(1);
-            let copy = vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
-                .image_subresource(subresource)
-                .image_offset(vk::Offset3D {
-                    x: region.x as i32,
-                    y: region.y as i32,
-                    z: 0,
-                })
-                .image_extent(vk::Extent3D {
-                    width: region.width,
-                    height: region.height,
-                    depth: 1,
-                });
-            // SAFETY: the command buffer is recording and both handles are
-            // live.
-            unsafe {
-                device.cmd_copy_image_to_buffer(
-                    command_buffer,
-                    target.image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    buffer,
-                    &[copy],
-                );
-            }
-            Ok(())
-        },
-    )?;
+    record_and_submit(submit, |command_buffer| {
+        barrier_to_transfer_src(device, command_buffer, target);
+        let subresource = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .mip_level(0)
+            .base_array_layer(0)
+            .layer_count(1);
+        let copy = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(subresource)
+            .image_offset(vk::Offset3D {
+                x: region.x as i32,
+                y: region.y as i32,
+                z: 0,
+            })
+            .image_extent(vk::Extent3D {
+                width: region.width,
+                height: region.height,
+                depth: 1,
+            });
+        // SAFETY: the command buffer is recording and both handles are
+        // live.
+        unsafe {
+            device.cmd_copy_image_to_buffer(
+                command_buffer,
+                target.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buffer,
+                &[copy],
+            );
+        }
+        Ok(())
+    })?;
 
     // SAFETY: the fence has been waited on, so the mapped memory is no
     // longer written by the GPU and `size` bytes are valid.
@@ -502,17 +498,17 @@ fn barrier_to_transfer_src(
 }
 
 /// Records a fallible `record` closure and submits it synchronously.
-fn record_and_submit<F>(
-    device: &ash::Device,
-    queue: vk::Queue,
-    command_pool: vk::CommandPool,
-    command_buffer: vk::CommandBuffer,
-    fence: vk::Fence,
-    record: F,
-) -> Result<(), RenderError>
+fn record_and_submit<F>(submit: &OffscreenSubmit<'_>, record: F) -> Result<(), RenderError>
 where
     F: FnOnce(vk::CommandBuffer) -> Result<(), RenderError>,
 {
+    let OffscreenSubmit {
+        device,
+        queue,
+        command_pool,
+        command_buffer,
+        fence,
+    } = *submit;
     // SAFETY: the caller guarantees no command buffers from this pool are in
     // flight; the fence was created signalled so the first wait returns.
     unsafe {

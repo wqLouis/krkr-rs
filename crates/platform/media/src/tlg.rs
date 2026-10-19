@@ -405,50 +405,50 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
         for yy in y..ylim {
             let dir = (yy & 1) ^ 1;
             let oddskip = (ylim - yy - 1) as isize - (yy - y) as isize;
+            let mut row = BlockRow {
+                prevline: &prevline,
+                curline: &mut curline,
+                width,
+                filter_types: &filter_types,
+                ft_base,
+                skipbytes,
+                pixelbuf: &pixelbuf[..pixel_count],
+                initialp,
+            };
             if main_count > 0 {
                 let start = width.min(TLG6_W_BLOCK_SIZE) * (yy - y);
                 decode_line(
-                    &prevline,
-                    &mut curline,
-                    width,
-                    0,
-                    main_count,
-                    &filter_types,
-                    ft_base,
-                    skipbytes,
-                    &pixelbuf[..pixel_count],
-                    start,
-                    initialp,
-                    oddskip,
-                    dir,
+                    &mut row,
+                    LinePass {
+                        start_block: 0,
+                        block_limit: main_count,
+                        in_start: start,
+                        oddskip,
+                        dir,
+                    },
                 )?;
             }
             if main_count != x_block_count {
                 let ww = fraction.min(TLG6_W_BLOCK_SIZE);
                 let start = ww * (yy - y);
                 decode_line(
-                    &prevline,
-                    &mut curline,
-                    width,
-                    main_count,
-                    x_block_count,
-                    &filter_types,
-                    ft_base,
-                    skipbytes,
-                    &pixelbuf[..pixel_count],
-                    start,
-                    initialp,
-                    oddskip,
-                    dir,
+                    &mut row,
+                    LinePass {
+                        start_block: main_count,
+                        block_limit: x_block_count,
+                        in_start: start,
+                        oddskip,
+                        dir,
+                    },
                 )?;
             }
-            let row = &mut img[yy * width * 4..(yy + 1) * width * 4];
+            let row_pixels = &mut img[yy * width * 4..(yy + 1) * width * 4];
             for (x, &px) in curline.iter().enumerate() {
                 let b = px.to_le_bytes();
-                row[x * 4] = b[0];
-                row[x * 4 + 1] = b[1];
-                row[x * 4 + 2] = b[2];
-                row[x * 4 + 3] = b[3];
+                row_pixels[x * 4] = b[0];
+                row_pixels[x * 4 + 1] = b[1];
+                row_pixels[x * 4 + 2] = b[2];
+                row_pixels[x * 4 + 3] = b[3];
             }
             prevline.copy_from_slice(&curline);
         }
@@ -469,27 +469,71 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
         .ok_or("TLG6: invalid image dimensions".into())
 }
 
+/// Per-block-row decode state shared by every scanline of the row.
+struct BlockRow<'a> {
+    /// Scanline above the one being decoded, read by the predictor.
+    prevline: &'a [u32],
+    /// Scanline being written.
+    curline: &'a mut [u32],
+    /// Image width in pixels.
+    width: usize,
+    /// Per-block filter/method map for the whole image.
+    filter_types: &'a [u8],
+    /// Offset of this block row's filters inside `filter_types`.
+    ft_base: usize,
+    /// Residual lanes per block of this row.
+    skipbytes: usize,
+    /// Residual lanes of this block row, read in the encoder's zigzag order.
+    pixelbuf: &'a [u32],
+    /// Predictor seed used by the row's first block.
+    initialp: u32,
+}
+
+/// One scanline's block range and starting state.
+struct LinePass {
+    /// First block of the range.
+    start_block: usize,
+    /// One past the last block of the range.
+    block_limit: usize,
+    /// Residual-lane offset the range starts at.
+    in_start: usize,
+    /// How far the zigzag moves between block rows.
+    oddskip: isize,
+    /// `0` decodes the row left-to-right, `1` right-to-left.
+    dir: usize,
+}
+
 /// Decode one scanline's worth of 8-wide blocks (reference
 /// `TVPTLG6DecodeLineGeneric`): reads the residual lanes out of `pixelbuf`
 /// in the encoder's zigzag order and runs the color filter + MED/average
 /// predictor chain, writing RGBA pixels (in memory order R,G,B,A — byte 0
 /// of each `u32` is the red-related plane).
-#[allow(clippy::too_many_arguments)]
-fn decode_line(
-    prevline: &[u32],
-    curline: &mut [u32],
-    width: usize,
-    start_block: usize,
-    block_limit: usize,
-    filter_types: &[u8],
-    ft_base: usize,
-    skipbytes: usize,
-    pixelbuf: &[u32],
-    in_start: usize,
-    initialp: u32,
-    oddskip: isize,
-    dir: usize,
-) -> Result<(), String> {
+fn decode_line(row: &mut BlockRow<'_>, pass: LinePass) -> Result<(), String> {
+    let BlockRow {
+        prevline,
+        curline,
+        width,
+        filter_types,
+        ft_base,
+        skipbytes,
+        pixelbuf,
+        initialp,
+    } = row;
+    let prevline: &[u32] = prevline;
+    let curline: &mut [u32] = curline;
+    let filter_types: &[u8] = filter_types;
+    let pixelbuf: &[u32] = pixelbuf;
+    let width = *width;
+    let ft_base = *ft_base;
+    let skipbytes = *skipbytes;
+    let initialp = *initialp;
+    let LinePass {
+        start_block,
+        block_limit,
+        in_start,
+        oddskip,
+        dir,
+    } = pass;
     let step: isize = if dir & 1 == 1 { 1 } else { -1 };
     let (mut p, mut up);
     if start_block > 0 {

@@ -58,7 +58,7 @@ fn monitors_to_array(
         engine.set_member(
             array.raw_id(),
             &index.to_string(),
-            &TjsValue::Retained(dict_id as u64),
+            &TjsValue::Retained(dict_id.as_ptr() as u64),
         )?;
     }
     Ok(array)
@@ -98,7 +98,7 @@ fn metrics_lookup(engine: &Tjs2Engine, key: &str, what: &str) -> Result<Option<i
         engine.set_member(
             system.raw_id(),
             "metrics",
-            &TjsValue::Retained(dict_id as u64),
+            &TjsValue::Retained(dict_id.as_ptr() as u64),
         )?;
         return Ok(None);
     }
@@ -166,7 +166,7 @@ fn write_monitor(
         // The write consumes the retention; forget the guard first so an
         // error path cannot release it twice.
         std::mem::forget(sub);
-        engine.set_member(dict, key, &TjsValue::Retained(id as u64))?;
+        engine.set_member(dict, key, &TjsValue::Retained(id.as_ptr() as u64))?;
     }
     engine.set_member(dict, "primary", &TjsValue::Integer(i64::from(primary)))?;
     Ok(())

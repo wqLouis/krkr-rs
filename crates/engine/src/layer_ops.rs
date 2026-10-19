@@ -35,6 +35,43 @@ use crate::scene::{BitmapState, Rect, Scene};
 /// Half-open pixel rectangle `[x0, x1) x [y0, y1)`.
 pub type RectI = (i32, i32, i32, i32);
 
+/// A source bitmap and the sub-rectangle a blit reads from it.
+#[derive(Clone, Copy)]
+pub struct BlitSource<'a> {
+    /// Source bitmap.
+    pub bitmap: &'a BitmapState,
+    /// Sub-rectangle of the source to read.
+    pub rect: RectI,
+}
+
+/// The blend state shared by the blit operations.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlitOptions {
+    /// `tTVPBlendOperationMode` value; ignored by [`blit_over`], which always
+    /// composites source-over.
+    pub mode: i64,
+    /// Source opacity, `0..=255`.
+    pub opa: u8,
+    /// Treat the source as fully opaque and let `opa` supply the coverage;
+    /// [`blit_over`] only.
+    pub treat_as_opaque: bool,
+    /// Keep the destination alpha channel; unused by [`affine_blit`].
+    pub hold_alpha: bool,
+}
+
+/// The corner map, resampler and background of [`affine_blit`].
+#[derive(Clone, Copy, Debug)]
+pub struct AffineBlit {
+    /// Destination coordinates the source rect's LT/RT/LB corners map to.
+    pub corners: [(f64, f64); 3],
+    /// Resampler selector.
+    pub stretch_type: i64,
+    /// Whether to fill the destination bounding box first.
+    pub clear: bool,
+    /// Colour written when `clear` is set.
+    pub clear_color: [u8; 4],
+}
+
 /// `TVP_BB_COPY_MAIN` (`LayerBitmapIntf.h:127`): copy the RGB plane only
 /// (the reference `CopyColor` render method; the destination alpha is held).
 pub const COPY_MAIN: u8 = 1;
@@ -507,18 +544,24 @@ pub fn blit_copy_clipped(
 ///
 /// This is the pixel work behind `Layer.copyRect` and, with a different
 /// `mode`, `operateRect`.
-#[allow(clippy::too_many_arguments)]
 pub fn blit_over(
     dst: &mut BitmapState,
     dx: i32,
     dy: i32,
-    src: &BitmapState,
-    src_rect: RectI,
+    source: BlitSource<'_>,
     clip: RectI,
-    opa: u8,
-    treat_as_opaque: bool,
-    hold_alpha: bool,
+    options: BlitOptions,
 ) {
+    let BlitSource {
+        bitmap: src,
+        rect: src_rect,
+    } = source;
+    let BlitOptions {
+        opa,
+        treat_as_opaque,
+        hold_alpha,
+        ..
+    } = options;
     let sw = src_rect.2.saturating_sub(src_rect.0);
     let sh = src_rect.3.saturating_sub(src_rect.1);
     if sw <= 0 || sh <= 0 || opa == 0 || src.width == 0 || src.height == 0 {
@@ -651,18 +694,20 @@ pub fn blit_plane(
 ///
 /// Returns the phase-normalized `(x, y)` so a caller that wants the
 /// `fillOperateRect` composition can reuse it.
-#[allow(clippy::too_many_arguments)]
 pub fn tile_rect(
     dst: &mut BitmapState,
-    left: i32,
-    top: i32,
-    width: u32,
-    height: u32,
+    dest: Rect,
     tile: &BitmapState,
     tile_rect: RectI,
-    x: i32,
-    y: i32,
+    phase: (i32, i32),
 ) {
+    let Rect {
+        x: left,
+        y: top,
+        w: width,
+        h: height,
+    } = dest;
+    let (x, y) = phase;
     let tw = (tile_rect.2 - tile_rect.0).max(1);
     let th = (tile_rect.3 - tile_rect.1).max(1);
     let mut x = x % tw;
@@ -796,7 +841,6 @@ fn composite_hard_light(dst: &mut BitmapState, dx: i32, dy: i32, src: &BitmapSta
 /// the original image back on top (both source-over). Operates on the whole
 /// bitmap (the SDK version works on the image rect; callers assume
 /// `imageLeft`/`imageTop` offsets of 0, which is the engine's normal case).
-#[allow(clippy::too_many_arguments)]
 pub fn do_drop_shadow(
     bitmap: &mut BitmapState,
     dx: i32,
@@ -831,7 +875,6 @@ pub fn do_drop_shadow(
 /// `blur_opacity`, then composite it again with `light_type` at
 /// `light_opacity`. `ltPsHardLight` uses a hard-light blend (the SDK
 /// default); every other `light_type` falls back to source-over.
-#[allow(clippy::too_many_arguments)]
 pub fn do_blur_light(
     bitmap: &mut BitmapState,
     blur: u32,
@@ -859,17 +902,19 @@ pub fn do_blur_light(
 /// SDK's `Layer.fillOperateRect`, which tiles a solid-color layer through
 /// `operateRect`. The common modes are real; the Photoshop-specific modes
 /// (`ltPs*`) reduce to source-over until the PS blend pipeline lands.
-#[allow(clippy::too_many_arguments)]
 pub fn fill_operate_rect(
     bitmap: &mut BitmapState,
-    left: i32,
-    top: i32,
-    width: u32,
-    height: u32,
+    dest: Rect,
     color: [u8; 4],
     mode: i64,
     hold_alpha: bool,
 ) {
+    let Rect {
+        x: left,
+        y: top,
+        w: width,
+        h: height,
+    } = dest;
     let rect = (
         left,
         top,
@@ -1893,17 +1938,23 @@ pub(crate) fn blend_pixel_mode(
 
 /// `tTJSNI_BaseLayer::OperateRect` (`LayerIntf.cpp:5224`): blend a source
 /// region onto `dst` at `(dx, dy)` with `mode` and `opa`.
-#[allow(clippy::too_many_arguments)]
 pub fn operate_rect(
     dst: &mut BitmapState,
     dx: i32,
     dy: i32,
-    src: &BitmapState,
-    src_rect: RectI,
-    mode: i64,
-    opa: u8,
-    hold_alpha: bool,
+    source: BlitSource<'_>,
+    options: BlitOptions,
 ) {
+    let BlitSource {
+        bitmap: src,
+        rect: src_rect,
+    } = source;
+    let BlitOptions {
+        mode,
+        opa,
+        hold_alpha,
+        ..
+    } = options;
     let sw = src_rect.2.saturating_sub(src_rect.0);
     let sh = src_rect.3.saturating_sub(src_rect.1);
     if sw <= 0 || sh <= 0 {
@@ -1929,17 +1980,23 @@ pub fn operate_rect(
 
 /// `StretchPile`/`StretchBlend`/`OperateStretch`: resample `src[src_rect]`
 /// into `dst[dest]` and blend with `mode` (or copy when `mode == 1`).
-#[allow(clippy::too_many_arguments)]
 pub fn stretch_blit_mode(
     dst: &mut BitmapState,
     dest: RectI,
-    src: &BitmapState,
-    src_rect: RectI,
+    source: BlitSource<'_>,
     stretch_type: i64,
-    mode: i64,
-    opa: u8,
-    hold_alpha: bool,
+    options: BlitOptions,
 ) {
+    let BlitSource {
+        bitmap: src,
+        rect: src_rect,
+    } = source;
+    let BlitOptions {
+        mode,
+        opa,
+        hold_alpha,
+        ..
+    } = options;
     let dw = dest.2 - dest.0;
     let dh = dest.3 - dest.1;
     if dw <= 0 || dh <= 0 || src_rect.2 <= src_rect.0 || src_rect.3 <= src_rect.1 {
@@ -1982,20 +2039,24 @@ fn affine_forward(p0: (f64, f64), p1: (f64, f64), p2: (f64, f64)) -> [f64; 6] {
 /// rect's LT/RT/LB corners to `p0/p1/p2` and resample into `dst` with `mode`
 /// (`1` = copy) and `opa`. Inverse-maps each destination pixel and bilinearly
 /// samples the source.
-#[allow(clippy::too_many_arguments)]
 pub fn affine_blit(
     dst: &mut BitmapState,
-    p0: (f64, f64),
-    p1: (f64, f64),
-    p2: (f64, f64),
-    src: &BitmapState,
-    src_rect: RectI,
-    stretch_type: i64,
-    mode: i64,
-    opa: u8,
-    clear: bool,
-    clear_color: [u8; 4],
+    affine: AffineBlit,
+    source: BlitSource<'_>,
+    options: BlitOptions,
 ) {
+    let AffineBlit {
+        corners,
+        stretch_type,
+        clear,
+        clear_color,
+    } = affine;
+    let [p0, p1, p2] = corners;
+    let BlitSource {
+        bitmap: src,
+        rect: src_rect,
+    } = source;
+    let BlitOptions { mode, opa, .. } = options;
     let m = affine_forward(p0, p1, p2);
     let det = m[1] * m[5] - m[2] * m[4];
     if det.abs() < 1e-12 {
@@ -2533,22 +2594,32 @@ pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
                         target,
                         draw.dx,
                         draw.dy,
-                        src,
-                        draw.src,
+                        BlitSource {
+                            bitmap: src,
+                            rect: draw.src,
+                        },
                         full,
-                        draw.opa,
-                        false,
-                        draw.hold_alpha,
+                        BlitOptions {
+                            mode: 0,
+                            opa: draw.opa,
+                            treat_as_opaque: false,
+                            hold_alpha: draw.hold_alpha,
+                        },
                     ),
                     mode => operate_rect(
                         target,
                         draw.dx,
                         draw.dy,
-                        src,
-                        draw.src,
-                        mode,
-                        draw.opa,
-                        draw.hold_alpha,
+                        BlitSource {
+                            bitmap: src,
+                            rect: draw.src,
+                        },
+                        BlitOptions {
+                            mode,
+                            opa: draw.opa,
+                            treat_as_opaque: false,
+                            hold_alpha: draw.hold_alpha,
+                        },
                     ),
                 }
             } else {
@@ -2560,12 +2631,17 @@ pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
                         draw.dx.saturating_add(draw.dw),
                         draw.dy.saturating_add(draw.dh),
                     ),
-                    src,
-                    draw.src,
+                    BlitSource {
+                        bitmap: src,
+                        rect: draw.src,
+                    },
                     1, // stFastLinear
-                    draw.mode,
-                    draw.opa,
-                    draw.hold_alpha,
+                    BlitOptions {
+                        mode: draw.mode,
+                        opa: draw.opa,
+                        treat_as_opaque: false,
+                        hold_alpha: draw.hold_alpha,
+                    },
                 );
             }
         }

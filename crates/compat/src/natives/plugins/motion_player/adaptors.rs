@@ -411,7 +411,10 @@ extern "C" fn separate_ctor(
         if let Some(target_id) = inst.target.object_id() {
             let host = res.engine();
             if matches!(
-                host.member(target_id as tjs::Tjs2ValueId, "window"),
+                host.member(
+                    tjs::Tjs2ValueId::from_raw(target_id as *mut std::ffi::c_void),
+                    "window"
+                ),
                 Ok(TjsValue::Object)
             ) && let Ok(owner) = host.retain_value_detached(&TjsValue::Object)
             {

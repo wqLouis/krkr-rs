@@ -177,7 +177,7 @@ fn set_retained_out(out: *mut Value, id: Tjs2ValueId) {
         (*out).string = ptr::null();
         (*out).array = ptr::null();
         (*out).array_count = 0;
-        (*out).retained = id as usize;
+        (*out).retained = id.as_ptr() as usize;
     }
 }
 
@@ -1003,11 +1003,11 @@ fn dispatch_click_action(host: &Tjs2Engine, owner: &DetachedValue, objthis: *mut
     {
         // The retention is consumed when the variant copy is built; the drop
         // below is the idempotent release either way.
-        let target_id = target.raw_id() as u64;
+        let target_id = target.raw_id().as_ptr() as u64;
         let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id));
         drop(target);
     }
-    let event_id = event.raw_id() as u64;
+    let event_id = event.raw_id().as_ptr() as u64;
     if let Err(error) = host.call_member(owner.raw_id(), "action", &[TjsValue::Retained(event_id)])
     {
         // The reference ignores the `FuncCall` result of `TVP_ACTION_INVOKE_END`.
@@ -1572,8 +1572,12 @@ fn refresh_children_array(
             .duplicate_retained(object.raw_id())
             .map_err(|error| format!("MenuItem.children: {error}"))?;
         let duplicate_id = duplicate.raw_id();
-        host.call_member(array, "push", &[TjsValue::Retained(duplicate_id as u64)])
-            .map_err(|error| format!("MenuItem.children: push failed: {error}"))?;
+        host.call_member(
+            array,
+            "push",
+            &[TjsValue::Retained(duplicate_id.as_ptr() as u64)],
+        )
+        .map_err(|error| format!("MenuItem.children: push failed: {error}"))?;
         // The push consumed the retention.
         std::mem::forget(duplicate);
     }

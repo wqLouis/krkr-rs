@@ -190,7 +190,7 @@ fn finish_retained(
             0
         }
         Ok(RetainedValue::Object(object)) => {
-            set_retained_out(out, object.raw_id() as usize);
+            set_retained_out(out, object.raw_id().as_ptr() as usize);
             // The C++ trampoline consumes the retention when it converts the
             // native result, so the guard must not release it first.
             std::mem::forget(object);
@@ -565,18 +565,37 @@ fn load_storage_text(
 /// text when that reports they were not bytecode, which is the reference
 /// `TVPExecuteStorage` order
 /// (`reference/cpp/core/base/ScriptMgnIntf.cpp:691-699,713-760`).
-#[allow(clippy::too_many_arguments)]
-fn execute_storage(
-    engine: &Tjs2Engine,
-    storage: &Storage,
-    name: &str,
-    mode: &str,
-    block_name: &str,
+struct StorageScript<'a> {
+    storage: &'a Storage,
+    name: &'a str,
+    mode: &'a str,
+}
+
+struct ScriptExec<'a> {
+    block_name: &'a str,
     context: *mut c_void,
     expression: bool,
-    encoding: Option<&str>,
-    services: Option<&CompatServices>,
+    encoding: Option<&'a str>,
+    services: Option<&'a CompatServices>,
+}
+
+fn execute_storage(
+    engine: &Tjs2Engine,
+    script: StorageScript<'_>,
+    run: ScriptExec<'_>,
 ) -> Result<RetainedValue, String> {
+    let StorageScript {
+        storage,
+        name,
+        mode,
+    } = script;
+    let ScriptExec {
+        block_name,
+        context,
+        expression,
+        encoding,
+        services,
+    } = run;
     let _timer = ScriptExecTimer::start(services, block_name);
     let bytes = read_storage_bytes(storage, name, mode)?;
     // Bytecode first, text second. `Ok(None)` means the loader did not
@@ -628,14 +647,18 @@ pub fn exec_storage(engine: &Tjs2Engine, storage: &Storage, name: &str) -> Resul
     let services = ctx.as_ref().map(|ctx| unsafe { ctx.services() });
     execute_storage(
         engine,
-        storage,
-        name,
-        "",
-        &extract_storage_name(name),
-        std::ptr::null_mut(),
-        false,
-        None,
-        services,
+        StorageScript {
+            storage,
+            name,
+            mode: "",
+        },
+        ScriptExec {
+            block_name: &extract_storage_name(name),
+            context: std::ptr::null_mut(),
+            expression: false,
+            encoding: None,
+            services,
+        },
     )
     .map(|_| ())
 }
@@ -717,14 +740,18 @@ extern "C" fn native_exec_storage(
     // SAFETY: the host keeps the attached storage alive for the VM lifetime.
     let result = execute_storage(
         resolved.engine(),
-        unsafe { &*storage },
-        &name,
-        &mode,
-        &block_name,
-        context,
-        false,
-        encoding.as_deref(),
-        Some(services),
+        StorageScript {
+            storage: unsafe { &*storage },
+            name: &name,
+            mode: &mode,
+        },
+        ScriptExec {
+            block_name: &block_name,
+            context,
+            expression: false,
+            encoding: encoding.as_deref(),
+            services: Some(services),
+        },
     );
     finish_retained(out, out_error, services, result)
 }
@@ -763,14 +790,18 @@ extern "C" fn native_eval_storage(
     // SAFETY: the host keeps the attached storage alive for the VM lifetime.
     let result = execute_storage(
         resolved.engine(),
-        unsafe { &*storage },
-        &name,
-        &mode,
-        &block_name,
-        context,
-        true,
-        encoding.as_deref(),
-        Some(services),
+        StorageScript {
+            storage: unsafe { &*storage },
+            name: &name,
+            mode: &mode,
+        },
+        ScriptExec {
+            block_name: &block_name,
+            context,
+            expression: true,
+            encoding: encoding.as_deref(),
+            services: Some(services),
+        },
     );
     finish_retained(out, out_error, services, result)
 }
@@ -906,11 +937,13 @@ extern "C" fn native_compile_storage(
     match resolved.engine().compile_script(
         &text,
         &output,
-        isresult,
-        outputdebug,
-        isexpression,
-        &name,
-        0,
+        tjs::CompileOptions {
+            isresult,
+            outputdebug,
+            isexpression,
+            name: &name,
+            lineofs: 0,
+        },
     ) {
         Ok(()) => {
             set_void(out);
@@ -988,7 +1021,7 @@ extern "C" fn native_get_class_names(
     };
     match engine.class_names(object.raw_id()) {
         Ok(names) => {
-            set_retained_out(out, names.raw_id() as usize);
+            set_retained_out(out, names.raw_id().as_ptr() as usize);
             // The C++ trampoline consumes the retention.
             std::mem::forget(names);
             0

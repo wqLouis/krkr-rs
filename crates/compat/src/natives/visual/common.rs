@@ -236,7 +236,7 @@ pub(crate) fn set_retained_out(_host: &Tjs2Engine, out: *mut Value, id: tjs::Tjs
         (*out).string = std::ptr::null();
         (*out).array = std::ptr::null();
         (*out).array_count = 0;
-        (*out).retained = id as usize;
+        (*out).retained = id.as_ptr() as usize;
     }
 }
 

@@ -600,7 +600,52 @@ unsafe extern "C" {
 /// Opaque per-engine id of a retained script value (mirror of the C
 /// `tjs2_value_id` typedef: an opaque pointer that is never null for a live
 /// id).
-pub type Tjs2ValueId = *mut c_void;
+#[repr(transparent)]
+#[derive(Copy, Clone, Default, PartialEq, Eq, Hash)]
+pub struct Tjs2ValueId(*mut c_void);
+
+impl From<*mut c_void> for Tjs2ValueId {
+    fn from(raw: *mut c_void) -> Self {
+        Self(raw)
+    }
+}
+
+impl Tjs2ValueId {
+    /// The null id, which no retained value or object uses.
+    pub const fn null() -> Self {
+        Self(ptr::null_mut())
+    }
+
+    /// Wraps a raw C `tjs2_value_id` (or an object/`objthis` pointer).
+    pub const fn from_raw(raw: *mut c_void) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the raw C pointer for an FFI call.
+    pub const fn as_ptr(self) -> *mut c_void {
+        self.0
+    }
+
+    /// Whether the id is the null id.
+    pub const fn is_null(self) -> bool {
+        self.0.is_null()
+    }
+}
+
+/// Non-script inputs to [`Tjs2Engine::compile_script`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompileOptions<'a> {
+    /// Whether the compiled block keeps a result register.
+    pub isresult: bool,
+    /// Whether debug information is embedded in the output.
+    pub outputdebug: bool,
+    /// Whether the input is an expression rather than a statement script.
+    pub isexpression: bool,
+    /// Diagnostic label for the script block.
+    pub name: &'a str,
+    /// Reported line-number offset.
+    pub lineofs: i32,
+}
 
 // ---------------------------------------------------------------------------
 // Safe wrapper
@@ -891,7 +936,7 @@ impl Tjs2Engine {
 
     /// Execute a TJS script given as UTF-8 text.
     pub fn exec_script(&self, script: &str, name: &str) -> Result<TjsValue, TjsError> {
-        self.exec_script_with_context(script, name, ptr::null_mut(), 0)
+        self.exec_script_with_context(script, name, Tjs2ValueId::null(), 0)
     }
 
     /// Returns the number of live retained-value entries.
@@ -941,14 +986,14 @@ impl Tjs2Engine {
     /// `context` is a raw `iTJSDispatch2*` obtained from an object argument's
     /// [`Value::object_handle`]; it is only dereferenced on the C++ side while
     /// the argument is alive.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn exec_script_with_context(
         &self,
         script: &str,
         name: &str,
-        context: *mut c_void,
+        context: impl Into<Tjs2ValueId>,
         lineofs: i32,
     ) -> Result<TjsValue, TjsError> {
+        let context = context.into();
         // The script is handed over as a byte pointer and a length, so the
         // wrapper does not cut it at a NUL. `name` is a diagnostic label and
         // stays a NUL-terminated C string.
@@ -971,7 +1016,7 @@ impl Tjs2Engine {
                 script.as_ptr().cast::<c_char>(),
                 script.len(),
                 name.as_ptr(),
-                context,
+                context.as_ptr(),
                 lineofs,
                 &mut result,
                 &mut error,
@@ -985,20 +1030,20 @@ impl Tjs2Engine {
 
     /// Evaluate a TJS expression given as UTF-8 text.
     pub fn eval(&self, expression: &str, name: &str) -> Result<TjsValue, TjsError> {
-        self.eval_with_context(expression, name, ptr::null_mut(), 0)
+        self.eval_with_context(expression, name, Tjs2ValueId::null(), 0)
     }
 
     /// Evaluate a TJS expression with an explicit `this` (`context`) and a
     /// reported line-number offset (`lineofs`), matching the reference
     /// `TJS::tTJS::EvalExpression(content, result, context, name, lineofs)`.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn eval_with_context(
         &self,
         expression: &str,
         name: &str,
-        context: *mut c_void,
+        context: impl Into<Tjs2ValueId>,
         lineofs: i32,
     ) -> Result<TjsValue, TjsError> {
+        let context = context.into();
         self.eval_with_context_result(expression, name, context, lineofs, true)
     }
 
@@ -1009,15 +1054,15 @@ impl Tjs2Engine {
     /// `result` pointer: an expression that produces no value (a `swap`, for
     /// instance) then compiles, and the discarded value comes back as
     /// [`TjsValue::Void`].
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn eval_with_context_result(
         &self,
         expression: &str,
         name: &str,
-        context: *mut c_void,
+        context: impl Into<Tjs2ValueId>,
         lineofs: i32,
         need_result: bool,
     ) -> Result<TjsValue, TjsError> {
+        let context = context.into();
         // Length-aware hand-off, as in `exec_script_with_context`.
         let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
         let mut result = Value {
@@ -1043,7 +1088,7 @@ impl Tjs2Engine {
                 expression.as_ptr().cast::<c_char>(),
                 expression.len(),
                 name.as_ptr(),
-                context,
+                context.as_ptr(),
                 lineofs,
                 out_result,
                 &mut error,
@@ -1115,23 +1160,18 @@ impl Tjs2Engine {
     /// debug information, and `isexpression` compiles an expression rather
     /// than a statement script. `name` / `lineofs` label the script block
     /// for diagnostics.
-    #[allow(clippy::too_many_arguments)]
     pub fn compile_script(
         &self,
         script: &str,
         output_path: &str,
-        isresult: bool,
-        outputdebug: bool,
-        isexpression: bool,
-        name: &str,
-        lineofs: i32,
+        options: CompileOptions<'_>,
     ) -> Result<(), TjsError> {
         // The script bytes go over as a pointer and a length; the output
         // path and the diagnostic name stay NUL-terminated C strings (a path
         // is handed to the OS, and a name is a label).
         let output_path =
             CString::new(output_path).map_err(|_| TjsError("output path contains NUL".into()))?;
-        let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
+        let name = CString::new(options.name).map_err(|_| TjsError("name contains NUL".into()))?;
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: all pointers are valid for the call; the C++ side copies
         // the UTF-8 strings and writes the output file.
@@ -1141,11 +1181,11 @@ impl Tjs2Engine {
                 script.as_ptr().cast::<c_char>(),
                 script.len(),
                 output_path.as_ptr(),
-                isresult as c_int,
-                outputdebug as c_int,
-                isexpression as c_int,
+                options.isresult as c_int,
+                options.outputdebug as c_int,
+                options.isexpression as c_int,
                 name.as_ptr(),
-                lineofs,
+                options.lineofs,
                 &mut error,
             )
         };
@@ -1166,13 +1206,13 @@ impl Tjs2Engine {
     /// the same bytes as text), and `Err` when the loader recognized bytecode
     /// and rejected it. `context` is the script's `this` (a raw
     /// `iTJSDispatch2*`), or null for the global object.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn load_bytecode(
         &self,
         bytes: &[u8],
         name: &str,
-        context: *mut c_void,
+        context: impl Into<Tjs2ValueId>,
     ) -> Result<Option<RetainedValue>, TjsError> {
+        let context = context.into();
         // `bytes` is handed over as a pointer and a length; `name` is a
         // diagnostic label and stays a NUL-terminated C string.
         let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
@@ -1195,7 +1235,7 @@ impl Tjs2Engine {
                 bytes.as_ptr().cast::<c_char>(),
                 bytes.len(),
                 name.as_ptr(),
-                context,
+                context.as_ptr(),
                 &mut is_bytecode,
                 &mut result,
                 &mut error,
@@ -1249,19 +1289,19 @@ impl Tjs2Engine {
         script: &str,
         name: &str,
     ) -> Result<RetainedValue, TjsError> {
-        self.exec_script_retained_with_context(script, name, ptr::null_mut(), 0)
+        self.exec_script_retained_with_context(script, name, Tjs2ValueId::null(), 0)
     }
 
     /// [`Self::exec_script_retained`] with an explicit `this` and line offset;
     /// see [`Self::exec_script_with_context`].
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn exec_script_retained_with_context(
         &self,
         script: &str,
         name: &str,
-        context: *mut c_void,
+        context: impl Into<Tjs2ValueId>,
         lineofs: i32,
     ) -> Result<RetainedValue, TjsError> {
+        let context = context.into();
         let v = self.exec_script_with_context(script, name, context, lineofs)?;
         self.retain_object_result(v)
     }
@@ -1270,19 +1310,19 @@ impl Tjs2Engine {
     /// result instead of losing it across the ABI. See
     /// [`Self::exec_script_retained`].
     pub fn eval_retained(&self, expression: &str, name: &str) -> Result<RetainedValue, TjsError> {
-        self.eval_retained_with_context(expression, name, ptr::null_mut(), 0)
+        self.eval_retained_with_context(expression, name, Tjs2ValueId::null(), 0)
     }
 
     /// [`Self::eval_retained`] with an explicit `this` and line offset; see
     /// [`Self::eval_with_context`].
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn eval_retained_with_context(
         &self,
         expression: &str,
         name: &str,
-        context: *mut c_void,
+        context: impl Into<Tjs2ValueId>,
         lineofs: i32,
     ) -> Result<RetainedValue, TjsError> {
+        let context = context.into();
         self.eval_retained_with_context_result(expression, name, context, lineofs, true)
     }
 
@@ -1291,15 +1331,15 @@ impl Tjs2Engine {
     /// result slot (reference: a native method whose caller discarded the
     /// result) and the discarded value is returned as [`TjsValue::Void`];
     /// nothing is retained. See [`Self::eval_with_context_result`].
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn eval_retained_with_context_result(
         &self,
         expression: &str,
         name: &str,
-        context: *mut c_void,
+        context: impl Into<Tjs2ValueId>,
         lineofs: i32,
         need_result: bool,
     ) -> Result<RetainedValue, TjsError> {
+        let context = context.into();
         if !need_result {
             self.eval_with_context_result(expression, name, context, lineofs, false)?;
             return Ok(RetainedValue::Value(TjsValue::Void));
@@ -1314,14 +1354,14 @@ impl Tjs2Engine {
     /// This is the lossless counterpart of [`Self::exec_script_with_context`]:
     /// `script` is a code-unit slice, so an unpaired surrogate survives the
     /// boundary instead of being dropped by a UTF-8 round trip.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn exec_script_wide_with_context(
         &self,
         script: &[u16],
         name: &str,
-        context: *mut c_void,
+        context: impl Into<Tjs2ValueId>,
         lineofs: i32,
     ) -> Result<TjsValue, TjsError> {
+        let context = context.into();
         let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
         let mut result = Value {
             ty: VAL_VOID,
@@ -1341,7 +1381,7 @@ impl Tjs2Engine {
                 script.as_ptr(),
                 script.len(),
                 name.as_ptr(),
-                context,
+                context.as_ptr(),
                 lineofs,
                 &mut result,
                 &mut error,
@@ -1355,14 +1395,14 @@ impl Tjs2Engine {
 
     /// [`Self::exec_script_wide_with_context`] retaining an object result; see
     /// [`Self::exec_script_retained`].
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn exec_script_retained_wide_with_context(
         &self,
         script: &[u16],
         name: &str,
-        context: *mut c_void,
+        context: impl Into<Tjs2ValueId>,
         lineofs: i32,
     ) -> Result<RetainedValue, TjsError> {
+        let context = context.into();
         let v = self.exec_script_wide_with_context(script, name, context, lineofs)?;
         self.retain_object_result(v)
     }
@@ -1370,14 +1410,14 @@ impl Tjs2Engine {
     /// Evaluate a TJS expression given as UTF-16 code units.
     ///
     /// The lossless counterpart of [`Self::eval_with_context`].
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn eval_wide_with_context(
         &self,
         expression: &[u16],
         name: &str,
-        context: *mut c_void,
+        context: impl Into<Tjs2ValueId>,
         lineofs: i32,
     ) -> Result<TjsValue, TjsError> {
+        let context = context.into();
         let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
         let mut result = Value {
             ty: VAL_VOID,
@@ -1397,7 +1437,7 @@ impl Tjs2Engine {
                 expression.as_ptr(),
                 expression.len(),
                 name.as_ptr(),
-                context,
+                context.as_ptr(),
                 lineofs,
                 &mut result,
                 &mut error,
@@ -1411,14 +1451,14 @@ impl Tjs2Engine {
 
     /// [`Self::eval_wide_with_context`] retaining an object result; see
     /// [`Self::eval_retained`].
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn eval_retained_wide_with_context(
         &self,
         expression: &[u16],
         name: &str,
-        context: *mut c_void,
+        context: impl Into<Tjs2ValueId>,
         lineofs: i32,
     ) -> Result<RetainedValue, TjsError> {
+        let context = context.into();
         let v = self.eval_wide_with_context(expression, name, context, lineofs)?;
         self.retain_object_result(v)
     }
@@ -1944,13 +1984,16 @@ name), and none was available"
     /// object alive for the duration of the call (the native-callback
     /// trampoline guarantees validity; the retained reference keeps it alive
     /// afterward). Dereferencing happens only on the C++ side.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn retain_object_detached(&self, obj: *mut c_void) -> Result<DetachedValue, String> {
+    pub fn retain_object_detached(
+        &self,
+        obj: impl Into<Tjs2ValueId>,
+    ) -> Result<DetachedValue, String> {
+        let obj = obj.into();
         if obj.is_null() {
             return Err("cannot retain a null object".into());
         }
         // SAFETY: obj is a live TJS object for the duration of the call.
-        let id = unsafe { tjs2_retain_object(self.inner, obj) };
+        let id = unsafe { tjs2_retain_object(self.inner, obj.as_ptr()) };
         if id.is_null() {
             return Err("failed to retain object".into());
         }
@@ -1969,7 +2012,6 @@ name), and none was available"
     /// consuming call already consumed it, that release is a safe no-op.
     ///
     /// `id` must be a live retained id owned by a caller-held handle.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn duplicate_retained(&self, id: Tjs2ValueId) -> Result<DetachedValue, String> {
         if id.is_null() {
             return Err("cannot duplicate a null retained id".into());
@@ -1991,7 +2033,6 @@ name), and none was available"
     /// its script `finalize`. Returns an error string on an unknown id or a
     /// script exception. The retention is **not** released; the owning
     /// [`DetachedValue`] still releases it when dropped.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn invalidate_retained(&self, id: Tjs2ValueId) -> Result<(), String> {
         if id.is_null() {
             return Err("cannot invalidate a null retained id".into());
@@ -2040,7 +2081,6 @@ name), and none was available"
     /// `id` is a retained value whose validity is owned by the
     /// `DetachedValue`/`ValueId` handles (which keep the engine alive via
     /// the borrow checker); the C++ side dereferences it within the call.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn call_member(
         &self,
         id: Tjs2ValueId,
@@ -2095,7 +2135,6 @@ name), and none was available"
     /// chain (`PropGet`). Natives use this to resolve an object argument to
     /// one of its script-visible properties — e.g. `Layer.parent = <Layer>`
     /// reads the right-hand object's `id`.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn member(&self, id: Tjs2ValueId, membername: &str) -> Result<TjsValue, String> {
         let name = std::ffi::CString::new(membername)
             .map_err(|_| "member name contains a NUL byte".to_string())?;
@@ -2130,7 +2169,6 @@ name), and none was available"
     /// the conversion *before* `PropSet` runs, so it is gone even when this
     /// call returns `Err` (unless the target itself was invalid, in which
     /// case conversion never happens). Do not reuse the id after a call.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn set_member(
         &self,
         id: Tjs2ValueId,
@@ -2170,7 +2208,6 @@ name), and none was available"
     /// (`tjsInterCodeExec.cpp:1829-1833`). A [`Tjs2ValueId`] that is not a
     /// live object (null, released, or a non-object value such as TJS `null`)
     /// is likewise a typed error.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn delete_member(&self, id: Tjs2ValueId, membername: &str) -> Result<(), String> {
         let name = std::ffi::CString::new(membername)
             .map_err(|_| "member name contains a NUL byte".to_string())?;
@@ -2196,7 +2233,6 @@ name), and none was available"
     /// [`TjsValue::Retained`] id is consumed by the conversion before the
     /// `PropSet` runs, so it is gone even on error (unless the target was
     /// invalid and conversion never happened).
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn set_default_member(&self, id: Tjs2ValueId, value: &TjsValue) -> Result<(), String> {
         let mut strings = Vec::new();
         let ffi = value_to_ffi(value, &mut strings)?;
@@ -2245,7 +2281,6 @@ name), and none was available"
     /// [`DetachedValue`]; hand its [`DetachedValue::raw_id`] back as a
     /// `VAL_RETAINED` native result (the trampoline consumes it), or drop it
     /// to release the reference. `obj` must be a live retained object id.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn class_names(&self, obj: Tjs2ValueId) -> Result<DetachedValue, String> {
         let mut out = Value {
             ty: VAL_VOID,
@@ -2268,7 +2303,7 @@ name), and none was available"
         }
         Ok(DetachedValue {
             engine: self.inner,
-            id: out.retained as Tjs2ValueId,
+            id: Tjs2ValueId::from_raw(out.retained as *mut c_void),
         })
     }
 
@@ -2280,7 +2315,6 @@ name), and none was available"
     /// member surface: for a class object this includes its registered (static
     /// and instance) members, and for an instance its instance members. `obj`
     /// must be a live retained object id.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn enum_members(&self, obj: Tjs2ValueId) -> Result<Vec<String>, String> {
         let mut out = Value {
             ty: VAL_VOID,
@@ -2304,7 +2338,7 @@ name), and none was available"
         // reading an element fails; only the names escape.
         let array = DetachedValue {
             engine: self.inner,
-            id: out.retained as Tjs2ValueId,
+            id: Tjs2ValueId::from_raw(out.retained as *mut c_void),
         };
         let count = match self.member(array.raw_id(), "count")? {
             TjsValue::Integer(value) => value,
@@ -2336,7 +2370,6 @@ name), and none was available"
     /// Enable the `missing` member handler on a retained object (reference
     /// `Scripts.setCallMissing`): after this call an access to an absent
     /// member invokes the object's `missing` method.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn set_call_missing(&self, obj: Tjs2ValueId) -> Result<(), String> {
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: self.inner is a live engine and obj is a retained id; the
@@ -2378,7 +2411,6 @@ name), and none was available"
     /// the `GetNativePtr()` / `IsValid()` contract in `tjs2_abi.cpp`):
     /// discard it once the id is released or the object is invalidated,
     /// and never let it outlive the engine.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn native_instance_payload(
         &self,
         obj: Tjs2ValueId,
@@ -2738,11 +2770,13 @@ mod tests {
             .compile_script(
                 "var x = \0 1;",
                 &path_str,
-                false,
-                false,
-                false,
-                "nul-compile",
-                0,
+                CompileOptions {
+                    isresult: false,
+                    outputdebug: false,
+                    isexpression: false,
+                    name: "nul-compile",
+                    lineofs: 0,
+                },
             )
             .unwrap_err();
         assert!(
@@ -3951,7 +3985,7 @@ var ra = a.get(); var rb = b.get();",
         let rc = unsafe {
             tjs2_call_value(
                 e.inner,
-                ptr::null_mut(),
+                Tjs2ValueId::null(),
                 0,
                 ptr::null(),
                 &mut out,
@@ -4106,7 +4140,7 @@ var ra = a.get(); var rb = b.get();",
             (*out).string = ptr::null();
             (*out).array = ptr::null();
             (*out).array_count = 0;
-            (*out).retained = id as usize;
+            (*out).retained = id.as_ptr() as usize;
         }
         0
     }
@@ -4181,7 +4215,7 @@ var ra = a.get(); var rb = b.get();",
             (*out).string = ptr::null();
             (*out).array = ptr::null();
             (*out).array_count = 0;
-            (*out).retained = id as usize;
+            (*out).retained = id.as_ptr() as usize;
         }
         0
     }
@@ -4244,7 +4278,7 @@ var ra = a.get(); var rb = b.get();",
             (*out).string = ptr::null();
             (*out).array = ptr::null();
             (*out).array_count = 0;
-            (*out).retained = id as usize;
+            (*out).retained = id.as_ptr() as usize;
         }
         0
     }
@@ -4296,7 +4330,7 @@ var ra = a.get(); var rb = b.get();",
             (*out).string = ptr::null();
             (*out).array = ptr::null();
             (*out).array_count = 0;
-            (*out).retained = dv.raw_id() as usize;
+            (*out).retained = dv.raw_id().as_ptr() as usize;
         }
         std::mem::forget(dv);
         0
@@ -4480,7 +4514,7 @@ var ra = a.get(); var rb = b.get();",
             (*out).string = ptr::null();
             (*out).array = ptr::null();
             (*out).array_count = 0;
-            (*out).retained = id as usize;
+            (*out).retained = id.as_ptr() as usize;
         }
         0
     }
@@ -4668,8 +4702,13 @@ var ra = a.get(); var rb = b.get();",
         // second release of the same raw id (no longer registered):
         unsafe { tjs2_release_value(e.inner, raw) };
         // never-allocated / null ids:
-        unsafe { tjs2_release_value(e.inner, 0x1 as Tjs2ValueId) };
-        unsafe { tjs2_release_value(e.inner, ptr::null_mut()) };
+        unsafe {
+            tjs2_release_value(
+                e.inner,
+                Tjs2ValueId::from_raw(std::ptr::dangling_mut::<c_void>()),
+            )
+        };
+        unsafe { tjs2_release_value(e.inner, Tjs2ValueId::null()) };
         // engine still fully usable, and retains still work
         assert_eq!(e.eval("1 + 1", "test").unwrap(), TjsValue::Integer(2));
         e.exec_script("var g = function() { return 5; };", "test")
@@ -4699,7 +4738,7 @@ var ra = a.get(); var rb = b.get();",
             string: ptr::null(),
             array: ptr::null(),
             array_count: 0,
-            retained: id.id as usize,
+            retained: id.id.as_ptr() as usize,
         };
         let mut out = Value {
             ty: VAL_VOID,
@@ -4876,7 +4915,7 @@ var ra = a.get(); var rb = b.get();",
             (*out).string = ptr::null();
             (*out).array = ptr::null();
             (*out).array_count = 0;
-            (*out).retained = id as usize;
+            (*out).retained = id.as_ptr() as usize;
         }
         0
     }
@@ -5023,7 +5062,7 @@ var ra = a.get(); var rb = b.get();",
         e.set_member(
             pid.raw_id(),
             "child",
-            &TjsValue::Retained(cid.raw_id() as u64),
+            &TjsValue::Retained(cid.raw_id().as_ptr() as u64),
         )
         .unwrap();
         e.exec_script("var f = parent.child.flag;", "test").unwrap();
@@ -5038,7 +5077,7 @@ var ra = a.get(); var rb = b.get();",
             .unwrap();
         // Unknown/null retained id.
         let err = e
-            .set_member(std::ptr::null_mut(), "x", &TjsValue::Integer(1))
+            .set_member(Tjs2ValueId::null(), "x", &TjsValue::Integer(1))
             .unwrap_err();
         assert!(!err.is_empty(), "null id must error: {err}");
         // Invalidated object: finalize deletes its members, so PropSet returns
@@ -5341,11 +5380,13 @@ var ra = a.get(); var rb = b.get();",
         e.compile_script(
             "var compiledValue = 42;",
             &path_str,
-            false,
-            false,
-            false,
-            "compiled.tjs",
-            0,
+            CompileOptions {
+                isresult: false,
+                outputdebug: false,
+                isexpression: false,
+                name: "compiled.tjs",
+                lineofs: 0,
+            },
         )
         .expect("compile must succeed");
         let bytes = std::fs::read(&path).expect("compiled output file must exist");
@@ -5358,8 +5399,18 @@ var ra = a.get(); var rb = b.get();",
             nanos
         ));
         let expr_str = expr_path.to_string_lossy().into_owned();
-        e.compile_script("6 * 7", &expr_str, true, false, true, "expr.tjs", 0)
-            .expect("expression compile must succeed");
+        e.compile_script(
+            "6 * 7",
+            &expr_str,
+            CompileOptions {
+                isresult: true,
+                outputdebug: false,
+                isexpression: true,
+                name: "expr.tjs",
+                lineofs: 0,
+            },
+        )
+        .expect("expression compile must succeed");
         assert!(!std::fs::read(&expr_path).unwrap().is_empty());
 
         // A syntactically invalid script is reported as an error.
@@ -5367,11 +5418,13 @@ var ra = a.get(); var rb = b.get();",
             .compile_script(
                 "this is not valid tjs",
                 &path_str,
-                false,
-                false,
-                false,
-                "bad.tjs",
-                0,
+                CompileOptions {
+                    isresult: false,
+                    outputdebug: false,
+                    isexpression: false,
+                    name: "bad.tjs",
+                    lineofs: 0,
+                },
             )
             .unwrap_err();
         assert!(
@@ -5437,7 +5490,7 @@ var ra = a.get(); var rb = b.get();",
         e.set_member(
             holder.raw_id(),
             "names",
-            &TjsValue::Retained(names.raw_id() as u64),
+            &TjsValue::Retained(names.raw_id().as_ptr() as u64),
         )
         .unwrap();
         assert_eq!(

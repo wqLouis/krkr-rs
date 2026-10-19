@@ -519,7 +519,7 @@ extern "C" fn player_set_motion(
             // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `player_set_motion`.
             unsafe { ctx.engine() }.eval_retained(&expression, "onFindMotion")
         {
-            let id = dict.raw_id() as usize as u64;
+            let id = dict.raw_id().as_ptr() as usize as u64;
             // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `player_set_motion`.
             let called = unsafe { ctx.engine() }.call_member(
                 target.raw_id(),
@@ -1217,7 +1217,7 @@ mp_method_variant!(
         let engine = unsafe { ctx.engine() };
         for (index, node) in p.nodes.iter().filter(|node| node.own).enumerate() {
             let getter = p.layer_getter_object(ctx, node)?;
-            let id = getter.raw_id() as usize as u64;
+            let id = getter.raw_id().as_ptr() as usize as u64;
             engine
                 .set_member(array.raw_id(), &index.to_string(), &TjsValue::Retained(id))
                 .map_err(|error| error.to_string())?;
@@ -1466,7 +1466,7 @@ mp_method_variant!(
             engine
                 .set_member(entry.raw_id(), "value", &TjsValue::Real(frame.value))
                 .map_err(|error| error.to_string())?;
-            let id = entry.raw_id() as usize as u64;
+            let id = entry.raw_id().as_ptr() as usize as u64;
             engine
                 .set_member(array.raw_id(), &index.to_string(), &TjsValue::Retained(id))
                 .map_err(|error| error.to_string())?;
@@ -2049,7 +2049,7 @@ mp_method_variant!(
         let source = cloned.raw_id();
         // Identity/transform state travels through the serialize pair.
         if let RetainedValue::Object(state) = p.serialize(ctx)? {
-            let id = state.raw_id() as usize as u64;
+            let id = state.raw_id().as_ptr() as usize as u64;
             // Ownership of the retained id moves into the call argument.
             std::mem::forget(state);
             engine.call_member(source, "unserialize", &[TjsValue::Retained(id)])?;
@@ -2086,7 +2086,7 @@ mp_method_variant!(
         // (`reference/cpp/plugins/motionplayer/EmotePlayer.cpp:204`, `:245-249`).
         match p.module.to_retained(ctx)? {
             RetainedValue::Object(module) => {
-                let id = module.raw_id() as usize as u64;
+                let id = module.raw_id().as_ptr() as usize as u64;
                 std::mem::forget(module);
                 engine.call_member(source, "load", &[TjsValue::Retained(id)])?;
             }

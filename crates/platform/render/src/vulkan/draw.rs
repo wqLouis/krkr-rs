@@ -42,7 +42,24 @@ struct PushConstants {
 /// pipeline layout reserves.
 const _: () = assert!(std::mem::size_of::<PushConstants>() as u32 == super::PUSH_CONSTANT_SIZE);
 
-/// Records all visible content of `scene` into `command`.
+/// The frame-wide resources one scene traversal records with.
+#[derive(Clone, Copy)]
+pub(crate) struct SceneDraw<'a> {
+    /// Logical device the command buffer belongs to.
+    pub(crate) device: &'a ash::Device,
+    /// Command buffer the scene is recorded into.
+    pub(crate) command: vk::CommandBuffer,
+    /// Pipelines and the shared unit-quad vertex buffer.
+    pub(crate) pipelines: &'a PipelineSet,
+    /// Uploaded textures keyed by texture identity.
+    pub(crate) textures: &'a HashMap<u64, VulkanTexture>,
+    /// Target extent in device pixels.
+    pub(crate) extent: vk::Extent2D,
+    /// Whether the target format is an sRGB surface.
+    pub(crate) srgb: bool,
+}
+
+/// Records all visible content of `scene` into the draw's command buffer.
 ///
 /// The caller has already begun the render pass and set the viewport.
 /// `root` is the transform applied around the scene root. The live frame path
@@ -53,17 +70,19 @@ const _: () = assert!(std::mem::size_of::<PushConstants>() as u32 == super::PUSH
 /// Returns [`RenderError::Unsupported`] when the scene uses a feature the
 /// Vulkan backend does not implement (mask clips, GPU glyph runs or
 /// destination-dependent blend modes).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_scene(
-    device: &ash::Device,
-    command: vk::CommandBuffer,
-    pipelines: &PipelineSet,
-    textures: &HashMap<u64, VulkanTexture>,
+    draw: &SceneDraw<'_>,
     scene: &RenderScene,
-    extent: vk::Extent2D,
-    srgb: bool,
     root: &Affine2,
 ) -> Result<(), RenderError> {
+    let SceneDraw {
+        device,
+        command,
+        pipelines,
+        textures,
+        extent,
+        srgb,
+    } = *draw;
     let mut recorder = Recorder {
         device,
         command,
@@ -87,6 +106,25 @@ pub(crate) fn record_scene(
         extent,
     };
     recorder.visit(scene.root, root, 1.0, full_scissor, 0)
+}
+
+/// One unit-quad draw request: the pipeline it selects and the shader inputs
+/// plus scissor it carries.
+struct QuadDraw<'a> {
+    /// Vertex/fragment program to draw with.
+    program: Program,
+    /// Blend mode selecting the pipeline variant.
+    blend: api::blend::BlendMode,
+    /// Transform from the node's local space to device pixels.
+    world: &'a Affine2,
+    /// RGBA tint; alpha carries the composed opacity.
+    tint: [f32; 4],
+    /// `(u, v, width, height)` source rectangle inside the texture.
+    uv_rect: [f32; 4],
+    /// Descriptor set of the sampled texture, for a textured draw.
+    descriptor: Option<vk::DescriptorSet>,
+    /// Scissor rectangle the draw is clipped to.
+    scissor: vk::Rect2D,
 }
 
 /// Command-recording traversal state.
@@ -197,15 +235,15 @@ impl Recorder<'_> {
             RenderContent::None => Ok(()),
             RenderContent::Solid(color) => {
                 let tint = self.color_tint(*color, opacity);
-                self.draw_quad(
-                    Program::Solid,
-                    node.blend,
+                self.draw_quad(QuadDraw {
+                    program: Program::Solid,
+                    blend: node.blend,
                     world,
                     tint,
-                    [0.0, 0.0, 1.0, 1.0],
-                    None,
+                    uv_rect: [0.0, 0.0, 1.0, 1.0],
+                    descriptor: None,
                     scissor,
-                )
+                })
             }
             RenderContent::Texture(texture) => {
                 let Some(gpu) = self.textures.get(&texture.key()) else {
@@ -219,15 +257,15 @@ impl Recorder<'_> {
                 // sRGB target); the alpha is the composed opacity. Ordinary
                 // textures keep the default `[1, 1, 1, 1]`.
                 let tint = self.color_tint(node.color, opacity);
-                self.draw_quad(
-                    Program::Textured,
-                    node.blend,
+                self.draw_quad(QuadDraw {
+                    program: Program::Textured,
+                    blend: node.blend,
                     world,
                     tint,
-                    uv,
-                    Some(gpu.descriptor_set),
+                    uv_rect: uv,
+                    descriptor: Some(gpu.descriptor_set),
                     scissor,
-                )
+                })
             }
             RenderContent::Glyphs(_) => Err(RenderError::Unsupported {
                 message: "GPU glyph runs are not implemented by the Vulkan backend".to_owned(),
@@ -236,17 +274,16 @@ impl Recorder<'_> {
     }
 
     /// Emits one unit-quad draw.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_quad(
-        &mut self,
-        program: Program,
-        blend: api::blend::BlendMode,
-        world: &Affine2,
-        tint: [f32; 4],
-        uv_rect: [f32; 4],
-        descriptor: Option<vk::DescriptorSet>,
-        scissor: vk::Rect2D,
-    ) -> Result<(), RenderError> {
+    fn draw_quad(&mut self, quad: QuadDraw<'_>) -> Result<(), RenderError> {
+        let QuadDraw {
+            program,
+            blend,
+            world,
+            tint,
+            uv_rect,
+            descriptor,
+            scissor,
+        } = quad;
         let pipeline = self.pipelines.pipeline_for(program, blend)?;
         // SAFETY: the command buffer is recording and every handle is live.
         unsafe {

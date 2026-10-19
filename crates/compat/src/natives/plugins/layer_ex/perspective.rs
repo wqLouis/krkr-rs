@@ -36,7 +36,6 @@ use crate::native_util::{args, report_error, set_void};
 
 /// Solve the 8 unknowns of the projective map `dst -> src` from four
 /// correspondences. Returns `None` for a degenerate (collinear) quad.
-#[allow(clippy::needless_range_loop)]
 fn solve_homography(dst: [(f64, f64); 4], src: [(f64, f64); 4]) -> Option<[f64; 8]> {
     let mut m = [[0.0f64; 9]; 8];
     for i in 0..4 {
@@ -57,19 +56,20 @@ fn solve_homography(dst: [(f64, f64); 4], src: [(f64, f64); 4]) -> Option<[f64; 
         }
         m.swap(col, pivot);
         let d = m[col][col];
-        for k in col..9 {
-            m[col][k] /= d;
+        for value in &mut m[col][col..] {
+            *value /= d;
         }
-        for row in 0..8 {
+        let pivot = m[col];
+        for (row, values) in m.iter_mut().enumerate() {
             if row == col {
                 continue;
             }
-            let factor = m[row][col];
+            let factor = values[col];
             if factor == 0.0 {
                 continue;
             }
-            for k in col..9 {
-                m[row][k] -= factor * m[col][k];
+            for (value, pivot_value) in values[col..].iter_mut().zip(&pivot[col..]) {
+                *value -= factor * *pivot_value;
             }
         }
     }

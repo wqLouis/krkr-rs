@@ -254,7 +254,7 @@ fn layer_arg(ctx: &CompatCtx, host: &Tjs2Engine, layer: Option<u32>) -> Option<T
                 log::warn!("focus: layer {id} has no script object for the event argument");
                 return None;
             };
-            let raw = object.raw_id() as u64;
+            let raw = object.raw_id().as_ptr() as u64;
             // The C++ conversion consumes the retention; the
             // `DetachedValue` drop is a safe no-op.
             std::mem::forget(object);
@@ -262,7 +262,7 @@ fn layer_arg(ctx: &CompatCtx, host: &Tjs2Engine, layer: Option<u32>) -> Option<T
         }
         None => match host.eval_retained("null", "focus.null") {
             Ok(tjs::RetainedValue::Object(object)) => {
-                let raw = object.raw_id() as u64;
+                let raw = object.raw_id().as_ptr() as u64;
                 // The C++ conversion consumes the retention; the
                 // `DetachedValue` drop is a safe no-op.
                 std::mem::forget(object);

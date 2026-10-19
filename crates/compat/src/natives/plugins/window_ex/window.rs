@@ -816,7 +816,7 @@ pub(super) fn install_notifications(engine: &Tjs2Engine) -> Result<(), CompatErr
         .set_member(
             class.raw_id(),
             "_Notifications",
-            &TjsValue::Retained(dict_id as u64),
+            &TjsValue::Retained(dict_id.as_ptr() as u64),
         )
         .map_err(CompatError::Register)?;
     Ok(())

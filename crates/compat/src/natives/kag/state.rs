@@ -415,6 +415,14 @@ fn line_of(e: &Event) -> usize {
 // loading
 // ---------------------------------------------------------------------------
 
+/// Boolean switches for one attribute expansion.
+#[derive(Clone, Copy)]
+struct EntryParamFlags {
+    entity: bool,
+    macroarg: bool,
+    process_attrs: bool,
+}
+
 impl KagParserState {
     /// Load a scenario from already-decoded text. Only an empty scenario
     /// fails here (`TVPKAGNoLine`); syntax and first-label errors are raised
@@ -1051,9 +1059,11 @@ impl KagParserState {
             self.entry_param(
                 k,
                 rest,
-                entity,
-                macroarg,
-                process_attrs,
+                EntryParamFlags {
+                    entity,
+                    macroarg,
+                    process_attrs,
+                },
                 &mut condition,
                 &mut resolved,
                 env,
@@ -1300,22 +1310,35 @@ impl KagParserState {
     /// pair (resolving a leading `&`/`%` at run time); otherwise resolve the
     /// value and append it to `resolved` (skipping `cond`, which is
     /// consumed). Returns whether the attribute was stored.
-    #[allow(clippy::too_many_arguments)]
     fn entry_param(
         &self,
         attribname: &str,
         value: &str,
-        entity: bool,
-        macroarg: bool,
-        process_attrs: bool,
+        flags: EntryParamFlags,
         condition: &mut bool,
         resolved: &mut Vec<(String, String)>,
         env: &mut Environ<'_>,
     ) -> Result<bool, String> {
+        let EntryParamFlags {
+            entity,
+            macroarg,
+            process_attrs,
+        } = flags;
         if process_attrs && let Some(macro_list) = self.param_macros.get(attribname) {
             for (name, param) in macro_list {
                 let (entity, macroarg, rest) = split_value_prefix(param);
-                self.entry_param(name, rest, entity, macroarg, true, condition, resolved, env)?;
+                self.entry_param(
+                    name,
+                    rest,
+                    EntryParamFlags {
+                        entity,
+                        macroarg,
+                        process_attrs: true,
+                    },
+                    condition,
+                    resolved,
+                    env,
+                )?;
             }
             return Ok(false);
         }

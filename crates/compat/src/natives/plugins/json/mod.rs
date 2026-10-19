@@ -457,7 +457,7 @@ impl TjsOwned {
             TjsOwned::String(value) => TjsValue::String(value.clone()),
             TjsOwned::Object(object) => {
                 let duplicate = engine.duplicate_retained(object.raw_id())?;
-                let id = duplicate.raw_id() as u64;
+                let id = duplicate.raw_id().as_ptr() as u64;
                 std::mem::forget(duplicate);
                 TjsValue::Retained(id)
             }
@@ -590,8 +590,10 @@ fn is_null(
     .ok_or_else(|| JsonError::Engine("null helper is not installed".into()))?;
     let function = engine.duplicate_retained(helper)?;
     let argument = engine.duplicate_retained(value.raw_id())?;
-    let result =
-        engine.call_detached(&function, &[TjsValue::Retained(argument.raw_id() as u64)])?;
+    let result = engine.call_detached(
+        &function,
+        &[TjsValue::Retained(argument.raw_id().as_ptr() as u64)],
+    )?;
     match result {
         TjsValue::Integer(value) => Ok(value != 0),
         TjsValue::Void => Ok(false),
@@ -645,7 +647,7 @@ fn enumerate_members(
     let flat = new_object(engine, "[]")?;
     let argument = {
         let duplicate = engine.duplicate_retained(target.raw_id())?;
-        let id = duplicate.raw_id() as u64;
+        let id = duplicate.raw_id().as_ptr() as u64;
         std::mem::forget(duplicate);
         TjsValue::Retained(id)
     };
@@ -827,7 +829,7 @@ fn set_retained_out(out: *mut Value, object: DetachedValue) {
         (*out).string = ptr::null();
         (*out).array = ptr::null();
         (*out).array_count = 0;
-        (*out).retained = object.raw_id() as usize;
+        (*out).retained = object.raw_id().as_ptr() as usize;
     }
     std::mem::forget(object);
 }

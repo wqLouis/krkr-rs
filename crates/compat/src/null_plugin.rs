@@ -174,7 +174,10 @@ fn ignore_absent_member(engine: *mut c_void, prop: Option<&Value>) {
     };
     // `set_default_member` consumes the duplicate; the `DetachedValue` drop
     // is then a documented no-op.
-    let _ = host.set_default_member(prop.raw_id(), &TjsValue::Retained(noop.raw_id() as u64));
+    let _ = host.set_default_member(
+        prop.raw_id(),
+        &TjsValue::Retained(noop.raw_id().as_ptr() as u64),
+    );
 }
 
 /// Register the `NullPlugin` native instance class (idempotent per VM: the

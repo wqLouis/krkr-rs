@@ -507,12 +507,15 @@ pub(super) fn blit_with_transform(
             bitmap,
             dx + origin.0.round() as i32,
             dy + origin.1.round() as i32,
-            src,
-            src_rect,
+            layer_ops::BlitSource {
+                bitmap: src,
+                rect: src_rect,
+            },
             clip,
-            255,
-            false,
-            false,
+            layer_ops::BlitOptions {
+                opa: 255,
+                ..Default::default()
+            },
         );
         return;
     }
@@ -521,32 +524,44 @@ pub(super) fn blit_with_transform(
     let p2 = ctm.apply((origin.0, origin.1 + sh as f64));
     layer_ops::affine_blit(
         bitmap,
-        p0,
-        p1,
-        p2,
-        src,
-        src_rect,
-        0,
-        2,
-        255,
-        false,
-        [0, 0, 0, 0],
+        layer_ops::AffineBlit {
+            corners: [p0, p1, p2],
+            stretch_type: 0,
+            clear: false,
+            clear_color: [0, 0, 0, 0],
+        },
+        layer_ops::BlitSource {
+            bitmap: src,
+            rect: src_rect,
+        },
+        layer_ops::BlitOptions {
+            mode: 2,
+            opa: 255,
+            ..Default::default()
+        },
     );
 }
 
-/// Blit `src` so its source rectangle maps to the parallelogram `p0`/`p1`/`p2`
-/// (top-left, top-right, bottom-left), transformed by `ctm`.
-#[allow(clippy::too_many_arguments)]
+/// A source bitmap and the three destination corners it maps to.
+#[derive(Clone, Copy)]
+pub(super) struct ImagePlacement<'a> {
+    pub(super) source: layer_ops::BlitSource<'a>,
+    pub(super) corners: [(f64, f64); 3],
+}
+
+/// Blit `source` so its rectangle maps to `corners` (top-left, top-right,
+/// bottom-left), transformed by `ctm`.
 pub(super) fn blit_parallelogram(
     bitmap: &mut BitmapState,
-    src: &BitmapState,
-    src_rect: RectI,
-    p0: (f64, f64),
-    p1: (f64, f64),
-    p2: (f64, f64),
+    placement: ImagePlacement<'_>,
     ctm: Mat,
     clip: RectI,
 ) {
+    let layer_ops::BlitSource {
+        bitmap: src,
+        rect: src_rect,
+    } = placement.source;
+    let [p0, p1, p2] = placement.corners;
     let p0 = ctm.apply(p0);
     let p1 = ctm.apply(p1);
     let p2 = ctm.apply(p2);
@@ -564,22 +579,40 @@ pub(super) fn blit_parallelogram(
             && (p0.0 - dx as f64).abs() < 1e-6
             && (p0.1 - dy as f64).abs() < 1e-6
         {
-            layer_ops::blit_over(bitmap, dx, dy, src, src_rect, clip, 255, false, false);
+            layer_ops::blit_over(
+                bitmap,
+                dx,
+                dy,
+                layer_ops::BlitSource {
+                    bitmap: src,
+                    rect: src_rect,
+                },
+                clip,
+                layer_ops::BlitOptions {
+                    opa: 255,
+                    ..Default::default()
+                },
+            );
             return;
         }
     }
     layer_ops::affine_blit(
         bitmap,
-        p0,
-        p1,
-        p2,
-        src,
-        src_rect,
-        0,
-        2,
-        255,
-        false,
-        [0, 0, 0, 0],
+        layer_ops::AffineBlit {
+            corners: [p0, p1, p2],
+            stretch_type: 0,
+            clear: false,
+            clear_color: [0, 0, 0, 0],
+        },
+        layer_ops::BlitSource {
+            bitmap: src,
+            rect: src_rect,
+        },
+        layer_ops::BlitOptions {
+            mode: 2,
+            opa: 255,
+            ..Default::default()
+        },
     );
 }
 
@@ -1106,26 +1139,24 @@ fn image_snapshot(engine: *mut c_void, value: &Value, what: &str) -> Result<Bitm
         .ok_or_else(|| format!("{what}: the source image {bitmap_id} does not exist"))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn finish_image(
     engine: *mut c_void,
     objthis: *mut c_void,
     method: &str,
-    src: &BitmapState,
-    src_rect: RectI,
-    p0: (f64, f64),
-    p1: (f64, f64),
-    p2: (f64, f64),
+    placement: ImagePlacement<'_>,
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    let (p0, p1, p2) = placement.corners.into();
+    let src = placement.source.bitmap;
+    let src_rect = placement.source.rect;
     let result = with_layer(
         engine,
         objthis,
         method,
         (src_rect.2.max(1) as u32, src_rect.3.max(1) as u32),
         |bitmap, layer_draw, clip, ctm| {
-            blit_parallelogram(bitmap, src, src_rect, p0, p1, p2, ctm, clip);
+            blit_parallelogram(bitmap, placement, ctm, clip);
             let fourth = (p1.0 + p2.0 - p0.0, p1.1 + p2.1 - p0.1);
             let corners = [
                 ctm.apply(p0),
@@ -1181,11 +1212,13 @@ extern "C" fn draw_image(
         engine,
         objthis,
         "Layer.drawImage",
-        &src,
-        (0, 0, src.width as i32, src.height as i32),
-        (x, y),
-        (x + w, y),
-        (x, y + h),
+        ImagePlacement {
+            source: layer_ops::BlitSource {
+                bitmap: &src,
+                rect: (0, 0, src.width as i32, src.height as i32),
+            },
+            corners: [(x, y), (x + w, y), (x, y + h)],
+        },
         out,
         out_error,
     )
@@ -1228,11 +1261,17 @@ extern "C" fn draw_image_rect(
         engine,
         objthis,
         "Layer.drawImageRect",
-        &src,
-        src_rect,
-        (dleft, dtop),
-        (dleft + swidth, dtop),
-        (dleft, dtop + sheight),
+        ImagePlacement {
+            source: layer_ops::BlitSource {
+                bitmap: &src,
+                rect: src_rect,
+            },
+            corners: [
+                (dleft, dtop),
+                (dleft + swidth, dtop),
+                (dleft, dtop + sheight),
+            ],
+        },
         out,
         out_error,
     )
@@ -1280,11 +1319,17 @@ extern "C" fn draw_image_stretch(
         engine,
         objthis,
         "Layer.drawImageStretch",
-        &src,
-        src_rect,
-        (dleft, dtop),
-        (dleft + dwidth, dtop),
-        (dleft, dtop + dheight),
+        ImagePlacement {
+            source: layer_ops::BlitSource {
+                bitmap: &src,
+                rect: src_rect,
+            },
+            corners: [
+                (dleft, dtop),
+                (dleft + dwidth, dtop),
+                (dleft, dtop + dheight),
+            ],
+        },
         out,
         out_error,
     )
@@ -1347,11 +1392,13 @@ extern "C" fn draw_image_affine(
         engine,
         objthis,
         "Layer.drawImageAffine",
-        &src,
-        src_rect,
-        p0,
-        p1,
-        p2,
+        ImagePlacement {
+            source: layer_ops::BlitSource {
+                bitmap: &src,
+                rect: src_rect,
+            },
+            corners: [p0, p1, p2],
+        },
         out,
         out_error,
     )

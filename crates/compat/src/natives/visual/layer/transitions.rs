@@ -1067,13 +1067,13 @@ fn dispatch_transition_completed(ctx: &crate::CompatCtx, dest: u32, src: u32) {
     let Some(dest_arg) = duplicate_object(ctx, host, ObjectKind::Layer, dest) else {
         return;
     };
-    let src_value = TjsValue::Retained(src_object.raw_id() as usize as u64);
+    let src_value = TjsValue::Retained(src_object.raw_id().as_ptr() as usize as u64);
     // Consumed by the argument conversion below (see the menu click
     // dispatch: on an early error the forget leaks instead of risking a
     // double release).
     std::mem::forget(src_object);
     let args = [
-        TjsValue::Retained(dest_arg.raw_id() as usize as u64),
+        TjsValue::Retained(dest_arg.raw_id().as_ptr() as usize as u64),
         src_value,
     ];
     let result = host.call_member(target.raw_id(), "onTransitionCompleted", &args);

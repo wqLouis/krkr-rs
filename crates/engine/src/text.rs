@@ -1812,12 +1812,27 @@ pub enum RasterizedRun {
     Atlas(Vec<PositionedGlyph>),
 }
 
+/// The services and caches one [`rasterize_run`] pass draws from.
+pub struct TextRasterServices<'a> {
+    /// Coverage cache the CPU backend reuses.
+    pub cache: &'a mut TextCoverageCache,
+    /// Glyph atlas the GPU backend fills.
+    pub atlas: &'a mut GlyphAtlas,
+    /// Render pipeline that uploads the atlas texture.
+    pub pipeline: &'a RenderPipeline,
+    /// Render state the atlas upload updates.
+    pub state: &'a mut RenderState,
+    /// Shaping engine the glyphs are rasterized from.
+    pub engine: &'a TextEngine,
+}
+
 /// Rasterizes `layout` through the selected glyph `backend`.
 ///
 /// `Cpu` returns the coverage masks [`compose_text_into`] composites into a
-/// bitmap, reusing `cache`. `Gpu` fills `atlas` and returns pen-positioned
-/// glyphs for [`project_text`]; it needs a live `pipeline` to upload the atlas
-/// texture.
+/// bitmap, reusing [`TextRasterServices::cache`]. `Gpu` fills
+/// [`TextRasterServices::atlas`] and returns pen-positioned glyphs for
+/// [`project_text`]; it needs a live [`TextRasterServices::pipeline`] to
+/// upload the atlas texture.
 ///
 /// The shaped [`TextLayout`] is the single source of glyph positions and
 /// advances, so choosing `Gpu` changes only which raster coverage the draw
@@ -1831,19 +1846,21 @@ pub enum RasterizedRun {
 ///
 /// Propagates [`rasterize_text_coverage`] / [`GlyphAtlas::rasterize_layout`]'s
 /// errors.
-#[allow(clippy::too_many_arguments)]
 pub fn rasterize_run(
     backend: GlyphBackend,
-    cache: &mut TextCoverageCache,
-    atlas: &mut GlyphAtlas,
-    pipeline: &RenderPipeline,
-    state: &mut RenderState,
-    engine: &TextEngine,
+    services: TextRasterServices<'_>,
     layout: &TextLayout,
     style: &TextStyle,
     antialias: bool,
     opacity: f32,
 ) -> Result<RasterizedRun, TextError> {
+    let TextRasterServices {
+        cache,
+        atlas,
+        pipeline,
+        state,
+        engine,
+    } = services;
     match backend {
         GlyphBackend::Cpu => Ok(RasterizedRun::Coverage(rasterize_text_coverage(
             cache, engine, layout, style, antialias,
@@ -1982,7 +1999,6 @@ fn fast_int_hypot(lx: i32, ly: i32) -> u32 {
 ///
 /// Returns the clipped destination rectangle that received ink, or `None`
 /// when the mask falls entirely outside `clip` or `bitmap`.
-#[allow(clippy::too_many_arguments)]
 pub fn blit_coverage_into(
     bitmap: &mut BitmapState,
     clip: RectI,

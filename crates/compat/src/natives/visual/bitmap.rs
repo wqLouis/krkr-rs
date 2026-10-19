@@ -929,7 +929,7 @@ extern "C" fn bitmap_load_async(
             Some(object) => {
                 let raw = object.raw_id();
                 std::mem::forget(object);
-                TjsValue::Retained(raw as usize as u64)
+                TjsValue::Retained(raw.as_ptr() as usize as u64)
             }
             None => TjsValue::Void,
         };

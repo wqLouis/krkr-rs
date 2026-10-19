@@ -297,7 +297,7 @@ fn set_retained_out(out: *mut Value, object: DetachedValue) {
             (*out).string = ptr::null();
             (*out).array = ptr::null();
             (*out).array_count = 0;
-            (*out).retained = object.raw_id() as usize;
+            (*out).retained = object.raw_id().as_ptr() as usize;
         }
     }
     // The C++ conversion consumes the id; forgetting the wrapper avoids a
@@ -328,14 +328,13 @@ fn host_file_system() -> fs::FileSystem {
 // The explicit match is deliberate: the failure is mapped to the reference's
 // `false`, and the `unwrap_or_default` form the lint prefers is the shape the
 // error guard rejects because it hides the error.
-#[allow(clippy::manual_unwrap_or, clippy::manual_unwrap_or_default)]
 fn is_existing_dir(file_system: &fs::FileSystem, path: &Path) -> bool {
-    match fs::is_dir(file_system, &FsPath::host(path)) {
-        Ok(is_dir) => is_dir,
+    let Ok(is_dir) = fs::is_dir(file_system, &FsPath::host(path)) else {
         // A stat failure is `false`, never a script-visible error
         // (`reference/cpp/plugins/fstat/main.cpp:757-765`).
-        Err(_) => false,
-    }
+        return false;
+    };
+    is_dir
 }
 
 /// `fs::exists(p) && fs::is_regular_file(p)`, mapping a stat failure to
@@ -345,14 +344,13 @@ fn is_existing_dir(file_system: &fs::FileSystem, path: &Path) -> bool {
 // The explicit match is deliberate: the failure is mapped to the reference's
 // `false`, and the `unwrap_or_default` form the lint prefers is the shape the
 // error guard rejects because it hides the error.
-#[allow(clippy::manual_unwrap_or, clippy::manual_unwrap_or_default)]
 fn is_existing_file(file_system: &fs::FileSystem, path: &Path) -> bool {
-    match fs::is_file(file_system, &FsPath::host(path)) {
-        Ok(is_file) => is_file,
+    let Ok(is_file) = fs::is_file(file_system, &FsPath::host(path)) else {
         // A stat failure is `false`, never a script-visible error
         // (`reference/cpp/plugins/fstat/main.cpp:54-95,958-985`).
-        Err(_) => false,
-    }
+        return false;
+    };
+    is_file
 }
 
 /// Disk metadata used by `fstat` / `getTime`.
@@ -407,7 +405,7 @@ fn set_date_member(
     engine.set_member(
         dict,
         key,
-        &TjsValue::Retained(date.raw_id() as usize as u64),
+        &TjsValue::Retained(date.raw_id().as_ptr() as usize as u64),
     )?;
     // The write consumed the retained id.
     std::mem::forget(date);
@@ -1030,7 +1028,7 @@ extern "C" fn storages_dirlist_ex(
         if let Err(error) = host.set_member(
             array.raw_id(),
             &index.to_string(),
-            &TjsValue::Retained(dict.raw_id() as usize as u64),
+            &TjsValue::Retained(dict.raw_id().as_ptr() as usize as u64),
         ) {
             return report_error(out_error, &format!("Storages.dirlistEx: {error}"));
         }

@@ -106,7 +106,7 @@ impl StoredValue {
     /// The TJS object id, if this value is an object.
     pub(crate) fn object_id(&self) -> Option<usize> {
         match self {
-            Self::Object(module) => Some(module.raw_id() as usize),
+            Self::Object(module) => Some(module.raw_id().as_ptr() as usize),
             _ => None,
         }
     }
@@ -282,7 +282,7 @@ fn attach_named(
     let Ok(RetainedValue::Object(class)) = engine.eval_retained(internal, "motion_player") else {
         return Ok(false);
     };
-    let id = class.raw_id() as usize as u64;
+    let id = class.raw_id().as_ptr() as usize as u64;
     engine
         .set_member(motion_id, public, &TjsValue::Retained(id))
         .map_err(|error| error.to_string())?;
@@ -364,11 +364,11 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     let motion_id = motion_handle
         .as_ref()
         .map(DetachedValue::raw_id)
-        .unwrap_or(std::ptr::null_mut());
+        .unwrap_or(tjs::Tjs2ValueId::null());
     let global_id = global_handle
         .as_ref()
         .map(DetachedValue::raw_id)
-        .unwrap_or(std::ptr::null_mut());
+        .unwrap_or(tjs::Tjs2ValueId::null());
 
     if !motion_id.is_null() {
         // (public `Motion.*` name, registration class name, keeps a global).

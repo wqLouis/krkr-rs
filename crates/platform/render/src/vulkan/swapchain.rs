@@ -75,24 +75,42 @@ impl SwapchainState {
     }
 }
 
-/// Builds the swapchain for `surface`.
+/// The presentation surface a swapchain is built for, plus the device and
+/// loaders that query and create it.
+#[derive(Clone, Copy)]
+pub(crate) struct SurfaceContext<'a> {
+    /// Logical device the swapchain and its resources belong to.
+    pub(crate) device: &'a ash::Device,
+    /// Physical device the surface belongs to.
+    pub(crate) physical_device: vk::PhysicalDevice,
+    /// Instance-level surface function pointers.
+    pub(crate) surface_loader: &'a ash::khr::surface::Instance,
+    /// Device-level swapchain function pointers.
+    pub(crate) swapchain_loader: &'a ash::khr::swapchain::Device,
+    /// Surface the swapchain presents to.
+    pub(crate) surface: vk::SurfaceKHR,
+}
+
+/// Builds the swapchain for `context`'s surface.
 ///
 /// `requested` is the desired pixel size; it is only used when the surface
 /// reports a free extent (`current_extent == u32::MAX`). `preferred_format`
 /// biases the first format choice. When `old` is supplied its format, present
 /// mode and render pass are reused so the swapchain can be recreated without
 /// touching the graphics pipelines.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn create(
-    device: &ash::Device,
-    physical_device: vk::PhysicalDevice,
-    surface_loader: &ash::khr::surface::Instance,
-    swapchain_loader: &ash::khr::swapchain::Device,
-    surface: vk::SurfaceKHR,
+    context: &SurfaceContext<'_>,
     requested: (u32, u32),
     preferred_format: TextureFormat,
     old: Option<&SwapchainState>,
 ) -> Result<SwapchainState, RenderError> {
+    let SurfaceContext {
+        device,
+        physical_device,
+        surface_loader,
+        swapchain_loader,
+        surface,
+    } = *context;
     // A partially built state has a null render pass; treat it as "no old
     // swapchain" so a retry rebuilds everything from scratch.
     let old = old.filter(|state| state.render_pass != vk::RenderPass::null());

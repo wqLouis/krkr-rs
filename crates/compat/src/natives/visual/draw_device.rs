@@ -315,7 +315,7 @@ fn attach_class(ctx: &CompatCtx, target: &str, name: &str) -> Result<(), CompatE
     };
     let target_object = resolve(target)?;
     let class_object = resolve(name)?;
-    let class_id = class_object.raw_id() as usize as u64;
+    let class_id = class_object.raw_id().as_ptr() as usize as u64;
     let result = engine
         .set_member(target_object.raw_id(), name, &TjsValue::Retained(class_id))
         .map_err(|error| {

@@ -273,15 +273,11 @@ fn affine_points(
     }
 }
 
-/// Run an affine operation clipped to `clip`, emulating `HoldAlpha`.
-#[allow(clippy::too_many_arguments)]
-fn affine_run(
-    scene: &mut Scene,
+struct AffineRun<'a> {
+    scene: &'a mut Scene,
     dst_id: u32,
     src_id: u32,
-    p0: (f64, f64),
-    p1: (f64, f64),
-    p2: (f64, f64),
+    corners: [(f64, f64); 3],
     src_rect: RectI,
     stretch_type: i64,
     mode: i64,
@@ -290,21 +286,43 @@ fn affine_run(
     clear: bool,
     neutral: [u8; 4],
     clip: RectI,
-) -> Result<(), String> {
+}
+
+/// Run an affine operation clipped to `clip`, emulating `HoldAlpha`.
+fn affine_run(run: AffineRun<'_>) -> Result<(), String> {
+    let AffineRun {
+        scene,
+        dst_id,
+        src_id,
+        corners: [p0, p1, p2],
+        src_rect,
+        stretch_type,
+        mode,
+        opa,
+        hold_alpha,
+        clear,
+        neutral,
+        clip,
+    } = run;
     let before = scene.bitmap(dst_id).cloned();
     with_two_bitmaps(scene, dst_id, src_id, |dst, src| {
         layer_ops::affine_blit(
             dst,
-            p0,
-            p1,
-            p2,
-            src,
-            src_rect,
-            stretch_type,
-            mode,
-            opa,
-            clear,
-            neutral,
+            layer_ops::AffineBlit {
+                corners: [p0, p1, p2],
+                stretch_type,
+                clear,
+                clear_color: neutral,
+            },
+            layer_ops::BlitSource {
+                bitmap: src,
+                rect: src_rect,
+            },
+            layer_ops::BlitOptions {
+                mode,
+                opa,
+                ..Default::default()
+            },
         );
     })?;
     if let Some(before) = before
@@ -373,7 +391,21 @@ extern "C" fn layer_operate_rect(
         // mode/face validation (`LayerIntf.cpp:5235-5242`).
         check_operate_face(mode, face)?;
         with_two_bitmaps(scene, dst, src_id, |d, s| {
-            layer_ops::operate_rect(d, dx, dy, s, src_rect, mode, opa, hold_alpha);
+            layer_ops::operate_rect(
+                d,
+                dx,
+                dy,
+                layer_ops::BlitSource {
+                    bitmap: s,
+                    rect: src_rect,
+                },
+                layer_ops::BlitOptions {
+                    mode,
+                    opa,
+                    hold_alpha,
+                    ..Default::default()
+                },
+            );
         })?;
         mark_image_modified(scene, id);
         Ok(())
@@ -450,12 +482,17 @@ extern "C" fn layer_operate_stretch(
             layer_ops::stretch_blit_mode(
                 d,
                 dest,
-                s,
-                src_trimmed,
+                layer_ops::BlitSource {
+                    bitmap: s,
+                    rect: src_trimmed,
+                },
                 stretch_type,
-                mode,
-                opa,
-                hold_alpha,
+                layer_ops::BlitOptions {
+                    mode,
+                    opa,
+                    hold_alpha,
+                    ..Default::default()
+                },
             );
         })?;
         mark_image_modified(scene, id);
@@ -471,7 +508,6 @@ extern "C" fn layer_operate_stretch(
 }
 
 /// Shared body of the four affine methods.
-#[allow(clippy::too_many_arguments)]
 fn affine_op(
     argc: c_int,
     a: &[Value],
@@ -554,22 +590,20 @@ fn affine_op(
         argb_to_rgba(color)
     };
     let hold = hold_alpha && layer_hold_alpha;
-    affine_run(
+    affine_run(AffineRun {
         scene,
-        dst,
+        dst_id: dst,
         src_id,
-        p0,
-        p1,
-        p2,
+        corners: [p0, p1, p2],
         src_rect,
         stretch_type,
         mode,
         opa,
-        hold,
+        hold_alpha: hold,
         clear,
-        neutral_color,
+        neutral: neutral_color,
         clip,
-    )?;
+    })?;
     mark_image_modified(scene, id);
     Ok(())
 }
@@ -716,12 +750,17 @@ fn stretch_op(
                 layer_ops::stretch_blit_mode(
                     d,
                     dest,
-                    s,
-                    src_trimmed,
+                    layer_ops::BlitSource {
+                        bitmap: s,
+                        rect: src_trimmed,
+                    },
                     stretch_type,
-                    mode,
-                    opa,
-                    layer_hold_alpha,
+                    layer_ops::BlitOptions {
+                        mode,
+                        opa,
+                        hold_alpha: layer_hold_alpha,
+                        ..Default::default()
+                    },
                 );
             })?;
         }
@@ -897,12 +936,17 @@ fn rect_op(
                     d,
                     dx,
                     dy,
-                    s,
-                    src_rect,
+                    layer_ops::BlitSource {
+                        bitmap: s,
+                        rect: src_rect,
+                    },
                     clip,
-                    opa,
-                    treat_as_opaque,
-                    hold_alpha,
+                    layer_ops::BlitOptions {
+                        opa,
+                        treat_as_opaque,
+                        hold_alpha,
+                        ..Default::default()
+                    },
                 );
             })?;
         }
@@ -924,7 +968,22 @@ fn rect_op(
                 })?;
             } else {
                 with_two_bitmaps(scene, dst, src_id, |d, s| {
-                    layer_ops::blit_over(d, dx, dy, s, src_rect, clip, opa, true, hold_alpha);
+                    layer_ops::blit_over(
+                        d,
+                        dx,
+                        dy,
+                        layer_ops::BlitSource {
+                            bitmap: s,
+                            rect: src_rect,
+                        },
+                        clip,
+                        layer_ops::BlitOptions {
+                            opa,
+                            treat_as_opaque: true,
+                            hold_alpha,
+                            ..Default::default()
+                        },
+                    );
                 })?;
             }
         }
@@ -2278,7 +2337,16 @@ extern "C" fn layer_draw_text(
     _objthis: *mut c_void,
 ) -> c_int {
     layer_draw_text_common(
-        engine, instance, argc, argv, out, out_error, "drawText", false,
+        engine,
+        instance,
+        argc,
+        argv,
+        out,
+        out_error,
+        TextKind {
+            method: "drawText",
+            glyph: false,
+        },
     )
 }
 
@@ -2299,14 +2367,20 @@ extern "C" fn layer_draw_glyph(
         argv,
         out,
         out_error,
-        "drawGlyph",
-        true,
+        TextKind {
+            method: "drawGlyph",
+            glyph: true,
+        },
     )
+}
+
+struct TextKind<'a> {
+    method: &'a str,
+    glyph: bool,
 }
 
 /// Shared body of `drawText`/`drawGlyph` (the glyph argument only differs in
 /// how the text is extracted).
-#[allow(clippy::too_many_arguments)]
 fn layer_draw_text_common(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -2314,9 +2388,9 @@ fn layer_draw_text_common(
     argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    method: &str,
-    glyph: bool,
+    kind: TextKind<'_>,
 ) -> c_int {
+    let TextKind { method, glyph } = kind;
     if argc < 4 {
         return report_error(out_error, &format!("Layer.{method} requires 4 arguments"));
     }
@@ -2404,11 +2478,13 @@ fn layer_draw_text_common(
                 &mut resolver,
                 &ctx,
                 bitmap,
-                &face,
-                size_px,
-                bold,
-                italic,
-                angle,
+                crate::resource::FaceSpec {
+                    face: &face,
+                    size_px,
+                    bold,
+                    italic,
+                    angle_tenths: angle,
+                },
                 clip,
                 &params,
             )?

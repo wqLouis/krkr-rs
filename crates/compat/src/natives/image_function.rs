@@ -138,7 +138,7 @@ fn set_retained_out(out: *mut Value, id: tjs::Tjs2ValueId) {
         (*out).string = std::ptr::null();
         (*out).array = std::ptr::null();
         (*out).array_count = 0;
-        (*out).retained = id as usize;
+        (*out).retained = id.as_ptr() as usize;
     }
 }
 
@@ -636,7 +636,21 @@ extern "C" fn image_operate_rect(
         };
         let (mode, face_hold) = blit_method(mode, face);
         with_two_bitmaps(scene, dst_id, src_id, |dst, src| {
-            layer_ops::operate_rect(dst, dx, dy, src, src_rect, mode, opa, hda || face_hold);
+            layer_ops::operate_rect(
+                dst,
+                dx,
+                dy,
+                layer_ops::BlitSource {
+                    bitmap: src,
+                    rect: src_rect,
+                },
+                layer_ops::BlitOptions {
+                    mode,
+                    opa,
+                    hold_alpha: hda || face_hold,
+                    ..Default::default()
+                },
+            );
         })?;
         let result = (
             dx,
@@ -706,12 +720,17 @@ extern "C" fn image_operate_stretch(
             layer_ops::stretch_blit_mode(
                 dst,
                 dest,
-                src,
-                src_trimmed,
+                layer_ops::BlitSource {
+                    bitmap: src,
+                    rect: src_trimmed,
+                },
                 stretch_type,
-                mode,
-                opa,
-                hda || face_hold,
+                layer_ops::BlitOptions {
+                    mode,
+                    opa,
+                    hold_alpha: hda || face_hold,
+                    ..Default::default()
+                },
             );
         })?;
         Ok(Some(dest))
@@ -799,16 +818,21 @@ extern "C" fn image_operate_affine(
             let saved = hold_alpha.then(|| snapshot_alpha(dst, result));
             layer_ops::affine_blit(
                 dst,
-                p0,
-                p1,
-                p2,
-                src,
-                src_rect,
-                stretch_type,
-                mode,
-                opa,
-                false,
-                [0, 0, 0, 0],
+                layer_ops::AffineBlit {
+                    corners: [p0, p1, p2],
+                    stretch_type,
+                    clear: false,
+                    clear_color: [0, 0, 0, 0],
+                },
+                layer_ops::BlitSource {
+                    bitmap: src,
+                    rect: src_rect,
+                },
+                layer_ops::BlitOptions {
+                    mode,
+                    opa,
+                    ..Default::default()
+                },
             );
             if let Some(saved) = saved {
                 restore_alpha(dst, result, &saved);
@@ -1214,11 +1238,13 @@ extern "C" fn image_draw_text(
             &mut resolver,
             ctx,
             bitmap,
-            &face,
-            size_px,
-            bold,
-            italic,
-            angle,
+            crate::resource::FaceSpec {
+                face: &face,
+                size_px,
+                bold,
+                italic,
+                angle_tenths: angle,
+            },
             clip,
             &params,
         )
@@ -1291,11 +1317,13 @@ extern "C" fn image_draw_glyph(
             &mut resolver,
             ctx,
             bitmap,
-            &face,
-            16.0,
-            false,
-            false,
-            0.0,
+            crate::resource::FaceSpec {
+                face: &face,
+                size_px: 16.0,
+                bold: false,
+                italic: false,
+                angle_tenths: 0.0,
+            },
             clip,
             &params,
         )

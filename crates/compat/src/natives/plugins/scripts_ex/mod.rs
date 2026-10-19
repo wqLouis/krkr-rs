@@ -114,7 +114,7 @@ impl Owned {
             Owned::String(value) => Ok(TjsValue::String(value.clone())),
             Owned::Object(object) => {
                 let duplicate = engine.duplicate_retained(object.raw_id())?;
-                let id = duplicate.raw_id() as u64;
+                let id = duplicate.raw_id().as_ptr() as u64;
                 // The C++ `value_to_variant` consumes the retention.
                 std::mem::forget(duplicate);
                 Ok(TjsValue::Retained(id))
@@ -236,7 +236,7 @@ fn write_owned(services: &CompatServices, out: *mut Value, value: Owned) -> c_in
         Owned::Null => set_null(out),
         Owned::Octet(bytes) => set_octet_out(services, out, &bytes),
         Owned::Object(object) => {
-            set_retained_out(out, object.raw_id() as usize);
+            set_retained_out(out, object.raw_id().as_ptr() as usize);
             // The C++ trampoline consumes the retention.
             std::mem::forget(object);
         }
@@ -395,7 +395,7 @@ fn enumerate_flat(engine: &Tjs2Engine, target: &DetachedValue) -> Result<Detache
     engine.call_member(
         flat.raw_id(),
         "assign",
-        &[TjsValue::Retained(argument.raw_id() as u64)],
+        &[TjsValue::Retained(argument.raw_id().as_ptr() as u64)],
     )?;
     Ok(flat)
 }
@@ -543,8 +543,8 @@ fn objects_identical(
     let result = engine.call_detached(
         &function,
         &[
-            TjsValue::Retained(left.raw_id() as u64),
-            TjsValue::Retained(right.raw_id() as u64),
+            TjsValue::Retained(left.raw_id().as_ptr() as u64),
+            TjsValue::Retained(right.raw_id().as_ptr() as u64),
         ],
     )?;
     Ok(matches!(result, TjsValue::Integer(value) if value != 0))
@@ -970,7 +970,7 @@ fn member_exists(
     let result = engine.call_detached(
         &function,
         &[
-            TjsValue::Retained(object.raw_id() as u64),
+            TjsValue::Retained(object.raw_id().as_ptr() as u64),
             TjsValue::String(key.to_string()),
         ],
     )?;

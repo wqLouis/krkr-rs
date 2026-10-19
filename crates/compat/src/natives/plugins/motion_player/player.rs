@@ -688,7 +688,7 @@ impl PlayerInst {
             engine
                 .set_member(entry.raw_id(), "blendRatio", &TjsValue::Real(ratio))
                 .map_err(|error| error.to_string())?;
-            let id = entry.raw_id() as usize as u64;
+            let id = entry.raw_id().as_ptr() as usize as u64;
             engine
                 .set_member(array.raw_id(), &index.to_string(), &TjsValue::Retained(id))
                 .map_err(|error| error.to_string())?;
@@ -805,14 +805,15 @@ impl PlayerInst {
 /// any other object is resolved as a `Layer` directly. `None` means the target
 /// names no layer, which `draw` treats as a no-op.
 fn resolve_draw_target(engine: &tjs::Tjs2Engine, target_id: usize) -> Result<Option<u32>, String> {
-    let payload = match engine
-        .native_instance_payload(target_id as tjs::Tjs2ValueId, "SeparateLayerAdaptor")
-    {
+    let payload = match engine.native_instance_payload(
+        tjs::Tjs2ValueId::from_raw(target_id as *mut std::ffi::c_void),
+        "SeparateLayerAdaptor",
+    ) {
         Ok(Some(payload)) => payload,
         Ok(None) => {
             return crate::CompatCtx::native_instance_id(
                 engine,
-                target_id as tjs::Tjs2ValueId,
+                tjs::Tjs2ValueId::from_raw(target_id as *mut std::ffi::c_void),
                 &["Layer"],
             );
         }
@@ -826,7 +827,11 @@ fn resolve_draw_target(engine: &tjs::Tjs2Engine, target_id: usize) -> Result<Opt
     let Some(target) = adaptor.target_object_id() else {
         return Ok(None);
     };
-    crate::CompatCtx::native_instance_id(engine, target as tjs::Tjs2ValueId, &["Layer"])
+    crate::CompatCtx::native_instance_id(
+        engine,
+        tjs::Tjs2ValueId::from_raw(target as *mut std::ffi::c_void),
+        &["Layer"],
+    )
 }
 
 /// Install an object member by retaining it.
@@ -838,7 +843,7 @@ fn install_object(
 ) -> Result<(), String> {
     // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `install_object`.
     let engine = unsafe { ctx.engine() };
-    let id = object.raw_id() as usize as u64;
+    let id = object.raw_id().as_ptr() as usize as u64;
     engine
         .set_member(parent, key, &TjsValue::Retained(id))
         .map_err(|error| error.to_string())?;

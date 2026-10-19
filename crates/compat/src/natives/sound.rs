@@ -676,7 +676,7 @@ fn set_retained_out(out: *mut Value, id: Tjs2ValueId) {
         (*out).string = std::ptr::null();
         (*out).array = std::ptr::null();
         (*out).array_count = 0;
-        (*out).retained = id as usize;
+        (*out).retained = id.as_ptr() as usize;
     }
 }
 
@@ -1998,7 +1998,10 @@ fn event_arg(host: &Tjs2Engine, value: &Value) -> (TjsValue, Option<DetachedValu
         VAL_STRING => (TjsValue::String(value_as_string(value)), None),
         VAL_VOID => (TjsValue::Void, None),
         _ => match host.retain_object_arg(value) {
-            Ok(retained) => (TjsValue::Retained(retained.raw_id() as u64), Some(retained)),
+            Ok(retained) => (
+                TjsValue::Retained(retained.raw_id().as_ptr() as u64),
+                Some(retained),
+            ),
             Err(_) => (TjsValue::Void, None),
         },
     }
@@ -2028,7 +2031,7 @@ fn action_event(
     {
         // The retention is consumed while the variant copy is built; on
         // failure it is left to `DetachedValue`'s idempotent release.
-        let target_id = target.raw_id() as u64;
+        let target_id = target.raw_id().as_ptr() as u64;
         let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id));
         drop(target);
     }
@@ -2155,7 +2158,7 @@ fn forward_action(call: CallArgs, spec: ActionSpec) -> c_int {
     // The event dictionary crosses as `TjsValue::Retained`; the C++ side
     // consumes that retention while copying the argument, so dropping `event`
     // afterwards is an idempotent no-op.
-    let event_id = event.raw_id() as u64;
+    let event_id = event.raw_id().as_ptr() as u64;
     if let Err(error) = host.call_member(action.raw_id(), "action", &[TjsValue::Retained(event_id)])
     {
         // The reference never inspects this `FuncCall` result

@@ -326,7 +326,7 @@ impl CsvParserInst {
             let fields_id = fields.raw_id();
             std::mem::forget(fields);
             let arguments = [
-                TjsValue::Retained(fields_id as usize as u64),
+                TjsValue::Retained(fields_id.as_ptr() as usize as u64),
                 TjsValue::Integer(self.line_no),
             ];
             host.call_member(target, "doLine", &arguments)?;
@@ -383,7 +383,7 @@ fn set_retained_out(out: *mut Value, object: DetachedValue) {
             (*out).string = std::ptr::null();
             (*out).array = std::ptr::null();
             (*out).array_count = 0;
-            (*out).retained = object.raw_id() as usize;
+            (*out).retained = object.raw_id().as_ptr() as usize;
         }
     }
     // The C++ conversion consumes the id; forgetting the wrapper avoids a

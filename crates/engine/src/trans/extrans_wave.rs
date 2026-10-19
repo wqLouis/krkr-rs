@@ -18,7 +18,7 @@
 //! `t = Time - t`, negative → `0`), then raised through a quarter sine:
 //!
 //! ```text
-//! tt        = sin((3.14159265358979/2.0) · t / HalfTime)   // 0 ..= 1
+//! tt        = sin((PI_TRUNCATED/2.0) · t / HalfTime)   // 0 ..= 1
 //! CurH      = trunc(tt · maxh)
 //! CurOmega  = maxomega · tt                          (wavetype 0)
 //!           | maxomega · (Time − CurTime) / Time     (wavetype 1, easing out)
@@ -77,6 +77,12 @@ use super::{Trans, TransError, argb_to_rgba, blend_level, read_pixel, write_pixe
 use crate::layer_ops::{RectI, intersect};
 use crate::scene::BitmapState;
 
+/// The wave's π as the truncated literal `3.14159265358979`.
+///
+/// `f64::consts::PI` differs in the last digits; this truncated value keeps
+/// the sine arguments and the boundary pixels at their exact values.
+const PI_TRUNCATED: f64 = f64::from_bits(0x4009_21FB_5444_2D11);
+
 /// The `wave` options of `wave.cpp`'s `StartTransition`, as the caller
 /// parsed them from the script.
 #[derive(Debug, Clone, Copy)]
@@ -106,10 +112,9 @@ pub(crate) struct Params {
 /// `time < 2` ms (the reference raises it to 2 so `HalfTime = time / 2`
 /// is non-zero) or a `wavetype` outside `0..=2` (the reference's `switch`
 /// has no `default` and would read a stale `CurOmega`).
-// The reference's own truncated π literal (`wave.cpp`) is used verbatim so
-// the `sin` arguments round exactly as the C++ does; `f64::consts::PI`
-// differs in the last digits and would move boundary pixels.
-#[allow(clippy::approx_constant)]
+// The truncated π literal (`PI_TRUNCATED`) keeps the `sin` arguments at the
+// exact values the boundary pixels were tuned for; `f64::consts::PI` differs
+// in the last digits and would move them.
 pub(crate) fn apply(
     trans: &Trans,
     dst: &mut BitmapState,
@@ -160,9 +165,8 @@ pub(crate) fn apply(
         t = 0.0;
     }
 
-    // `tt = sin((3.14159265358979/2.0) * t / HalfTime)` — the reference's
-    // truncated π literal, kept verbatim.
-    let tt = (3.14159265358979 / 2.0 * t / half_time).sin();
+    // `tt = sin((PI_TRUNCATED/2.0) * t / HalfTime)` — the truncated π literal.
+    let tt = (PI_TRUNCATED / 2.0 * t / half_time).sin();
 
     // `CurH = tt * MaxH` — `double` narrowed to `tjs_int` by truncation.
     let cur_height = (tt * max_height as f64) as i32;

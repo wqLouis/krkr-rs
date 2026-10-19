@@ -272,7 +272,7 @@ fn invoke_action(
         return Ok(());
     };
     let event = action_event(host, objthis)?;
-    let event_id = event.raw_id() as u64;
+    let event_id = event.raw_id().as_ptr() as u64;
     let result = match action_name {
         Some(name) => host.call_member(action.raw_id(), &name, &[TjsValue::Retained(event_id)]),
         None => host.call_detached(&action, &[TjsValue::Retained(event_id)]),
@@ -313,7 +313,7 @@ fn action_event(
     {
         // The retention is consumed when the variant copy is built; a failure
         // leaves it to `DetachedValue`'s idempotent release.
-        let target_id = target.raw_id() as u64;
+        let target_id = target.raw_id().as_ptr() as u64;
         let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id));
         drop(target);
     }

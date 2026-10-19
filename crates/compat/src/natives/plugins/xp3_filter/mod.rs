@@ -619,7 +619,7 @@ fn apply_extraction_filter(
     engine.set_member(
         array.raw_id(),
         "xor",
-        &TjsValue::Retained(helper.raw_id() as u64),
+        &TjsValue::Retained(helper.raw_id().as_ptr() as u64),
     )?;
     // A retained `ctx` object is consumed by the call, so duplicate it into a
     // fresh retention for every segment; a scalar `ctx` passes by value.
@@ -628,7 +628,7 @@ fn apply_extraction_filter(
         None => None,
     };
     let ctx = match ctx_dup.as_ref() {
-        Some(dup) => TjsValue::Retained(dup.raw_id() as u64),
+        Some(dup) => TjsValue::Retained(dup.raw_id().as_ptr() as u64),
         None => entry.value.clone(),
     };
     // Pass a duplicate retention: the call consumes the argument's retained
@@ -637,7 +637,7 @@ fn apply_extraction_filter(
     let args = [
         TjsValue::Integer(i64::from(call.file_hash)),
         TjsValue::Integer(call.offset as i64),
-        TjsValue::Retained(pass.raw_id() as u64),
+        TjsValue::Retained(pass.raw_id().as_ptr() as u64),
         TjsValue::Integer(buffer.len() as i64),
         TjsValue::String(call.file_name.to_string()),
         ctx,

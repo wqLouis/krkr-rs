@@ -146,9 +146,12 @@ fn forward_arg(
         VAL_INTEGER => Ok((TjsValue::Integer(value.integer), None)),
         VAL_REAL => Ok((TjsValue::Real(value.real), None)),
         VAL_STRING => Ok((TjsValue::String(value_as_string(value)), None)),
-        VAL_OBJECT => host
-            .retain_object_arg(value)
-            .map(|retained| (TjsValue::Retained(retained.raw_id() as u64), Some(retained))),
+        VAL_OBJECT => host.retain_object_arg(value).map(|retained| {
+            (
+                TjsValue::Retained(retained.raw_id().as_ptr() as u64),
+                Some(retained),
+            )
+        }),
         // `null` and octets have no `TjsValue` form: `null` models as `void`
         // (both are false for `!`), and an octet is not valid dialog text.
         _ => Ok((TjsValue::Void, None)),

@@ -928,7 +928,7 @@ fn set_glyph_rect_out(host: &Tjs2Engine, out: *mut Value, rect: (i32, i32, i32, 
         (*out).string = std::ptr::null();
         (*out).array = std::ptr::null();
         (*out).array_count = 0;
-        (*out).retained = object.raw_id() as usize;
+        (*out).retained = object.raw_id().as_ptr() as usize;
     }
     std::mem::forget(object);
 }

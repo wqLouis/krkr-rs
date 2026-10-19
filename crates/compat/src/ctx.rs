@@ -174,7 +174,7 @@ impl CompatServices {
     /// engine owns the C++ retention and frees it at destruction, so this is
     /// safe to call during teardown even if the engine is already gone.
     pub(crate) fn clear_noop_closure(&self) {
-        self.noop_closure.set(std::ptr::null_mut());
+        self.noop_closure.set(tjs::Tjs2ValueId::null());
     }
 
     /// Borrow (creating if absent) the per-family dispatch state of type `T`.
@@ -358,7 +358,6 @@ impl CompatCtx {
     /// for the duration of the delay (reference
     /// `cpp/core/plugin/ncbind.hpp:1963-1970`). An absent member and a
     /// non-object id are reported as [`CompatError::Engine`].
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn delete_member(&self, id: Tjs2ValueId, membername: &str) -> Result<(), CompatError> {
         // SAFETY: a `CompatCtx` is only created for a bound, live engine.
         unsafe { self.engine() }

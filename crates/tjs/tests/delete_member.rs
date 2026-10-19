@@ -13,10 +13,9 @@
 //! ABI mirrors reports it as a failure, so `delete_member` returns a typed
 //! error for an absent member.
 
-use std::ptr;
 use std::sync::{Mutex, MutexGuard};
 
-use tjs::{DetachedValue, RetainedValue, Tjs2Engine, TjsValue};
+use tjs::{DetachedValue, RetainedValue, Tjs2Engine, Tjs2ValueId, TjsValue};
 
 /// The C++ TJS2 VM is single-threaded; serialize the tests.
 static VM_LOCK: Mutex<()> = Mutex::new(());
@@ -123,7 +122,7 @@ fn delete_member_rejects_dead_and_non_object_ids() {
 
     // A null id is a caller mistake, not a missing member.
     assert!(
-        engine.delete_member(ptr::null_mut(), "x").is_err(),
+        engine.delete_member(Tjs2ValueId::null(), "x").is_err(),
         "a null retained id must be rejected"
     );
 

@@ -233,11 +233,13 @@ impl VulkanPipeline {
             ash::khr::swapchain::Device::new(&self.instance_guard.instance, &device_bundle.device);
 
         let swapchain = match swapchain::create(
-            &device_bundle.device,
-            self.physical_device,
-            &surface_loader,
-            &swapchain_loader,
-            surface,
+            &swapchain::SurfaceContext {
+                device: &device_bundle.device,
+                physical_device: self.physical_device,
+                surface_loader: &surface_loader,
+                swapchain_loader: &swapchain_loader,
+                surface,
+            },
             (0, 0),
             self.preferred_format,
             None,
@@ -497,16 +499,12 @@ impl VulkanPipeline {
             .ok_or_else(|| RenderError::Upload {
                 message: "texture state disappeared during upload".to_owned(),
             })?;
-        texture::upload(
-            &vstate.device,
-            &self.memory_properties,
-            vstate.graphics_queue,
-            &mut vstate.upload,
-            gpu,
-            key,
-            region,
-            pixels,
-        )
+        let context = texture::UploadContext {
+            device: &vstate.device,
+            memory_properties: &self.memory_properties,
+            queue: vstate.graphics_queue,
+        };
+        texture::upload(&context, &mut vstate.upload, gpu, key, region, pixels)
     }
 
     /// Creates an offscreen render-target handle after validating its
@@ -600,17 +598,14 @@ impl VulkanPipeline {
                 message: "render-target state disappeared".to_owned(),
             })?;
         upload.wait_all(device)?;
-        target::render(
+        let submit = target::OffscreenSubmit {
             device,
-            *graphics_queue,
-            *offscreen_pool,
-            *offscreen_command,
-            *offscreen_fence,
-            gpu,
-            pass,
-            textures,
-            scene,
-        )
+            queue: *graphics_queue,
+            command_pool: *offscreen_pool,
+            command_buffer: *offscreen_command,
+            fence: *offscreen_fence,
+        };
+        target::render(&submit, gpu, pass, textures, scene)
     }
 
     /// Copies a sub-rectangle of an offscreen `target` into `out`.
@@ -641,13 +636,16 @@ impl VulkanPipeline {
                 })?;
         validate_readback(target.desc(), region, out.len())?;
         let mut readback = vstate.readback.borrow_mut();
+        let submit = target::OffscreenSubmit {
+            device: &vstate.device,
+            queue: vstate.graphics_queue,
+            command_pool: vstate.offscreen_pool,
+            command_buffer: vstate.offscreen_command,
+            fence: vstate.offscreen_fence,
+        };
         target::read(
-            &vstate.device,
+            &submit,
             &self.memory_properties,
-            vstate.graphics_queue,
-            vstate.offscreen_pool,
-            vstate.offscreen_command,
-            vstate.offscreen_fence,
             gpu,
             &mut readback,
             region,
@@ -831,13 +829,15 @@ impl VulkanPipeline {
             }
 
             draw::record_scene(
-                &device,
-                command_buffer,
-                &vstate.pipelines,
-                &vstate.textures,
+                &draw::SceneDraw {
+                    device: &device,
+                    command: command_buffer,
+                    pipelines: &vstate.pipelines,
+                    textures: &vstate.textures,
+                    extent,
+                    srgb,
+                },
                 scene,
-                extent,
-                srgb,
                 &Affine2::IDENTITY,
             )?;
 
@@ -1354,11 +1354,13 @@ fn recreate_swapchain(
 
     let requested = state.surface_size;
     let new_swapchain = swapchain::create(
-        device,
-        state.physical_device,
-        &state.surface_loader,
-        &state.swapchain_loader,
-        surface,
+        &swapchain::SurfaceContext {
+            device,
+            physical_device: state.physical_device,
+            surface_loader: &state.surface_loader,
+            swapchain_loader: &state.swapchain_loader,
+            surface,
+        },
         requested,
         state.preferred_format,
         Some(&state.swapchain),
@@ -1427,11 +1429,13 @@ fn recreate_surface(
     // pinned format and render pass, and a failure leaves the old swapchain
     // intact, so the new surface still has no user and is destroyed here.
     let new_swapchain = swapchain::create(
-        &state.device,
-        state.physical_device,
-        &state.surface_loader,
-        &state.swapchain_loader,
-        new_surface,
+        &swapchain::SurfaceContext {
+            device: &state.device,
+            physical_device: state.physical_device,
+            surface_loader: &state.surface_loader,
+            swapchain_loader: &state.swapchain_loader,
+            surface: new_surface,
+        },
         state.surface_size,
         state.preferred_format,
         Some(&state.swapchain),

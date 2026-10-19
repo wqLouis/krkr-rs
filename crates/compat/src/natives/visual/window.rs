@@ -1683,7 +1683,7 @@ fn set_event_member(
         tjs::VAL_STRING => host.set_member(event, name, &TjsValue::String(value_as_string(value))),
         _ => {
             let retained = host.retain_object_arg(value)?;
-            let id = retained.raw_id() as u64;
+            let id = retained.raw_id().as_ptr() as u64;
             let result = host.set_member(event, name, &TjsValue::Retained(id));
             drop(retained);
             result
@@ -1719,7 +1719,7 @@ fn dispatch_action_event(
     if !objthis.is_null()
         && let Ok(target) = host.retain_object_detached(objthis)
     {
-        let target_id = target.raw_id() as u64;
+        let target_id = target.raw_id().as_ptr() as u64;
         let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id));
         drop(target);
     }
@@ -1733,7 +1733,7 @@ fn dispatch_action_event(
             return Err(error);
         }
     }
-    let event_id = event.raw_id() as u64;
+    let event_id = event.raw_id().as_ptr() as u64;
     if let Err(error) = host.call_member(owner.raw_id(), "action", &[TjsValue::Retained(event_id)])
     {
         log::warn!("{event_type}: action dispatch failed: {error}");

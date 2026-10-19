@@ -147,7 +147,7 @@ pub(crate) fn set_retained(out: *mut Value, value: tjs::DetachedValue) {
             (*out).string = ptr::null();
             (*out).array = ptr::null();
             (*out).array_count = 0;
-            (*out).retained = value.raw_id() as usize;
+            (*out).retained = value.raw_id().as_ptr() as usize;
         }
     }
     std::mem::forget(value);

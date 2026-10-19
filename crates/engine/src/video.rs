@@ -42,7 +42,7 @@
 
 use api::media::{RgbaFrame, VideoSpec};
 
-use crate::layer_ops::{blit_copy_clipped, blit_over, clip_rect};
+use crate::layer_ops::{BlitOptions, BlitSource, blit_copy_clipped, blit_over, clip_rect};
 use crate::scene::{BitmapState, Scene};
 
 /// Playback status (`tTVPStatus` for the video overlay).
@@ -810,7 +810,22 @@ pub fn blit_frame_to_layer_opacity(
         return false;
     };
     if source_over {
-        blit_over(dst, dx, dy, &source, src_rect, clip, opacity, false, false);
+        blit_over(
+            dst,
+            dx,
+            dy,
+            BlitSource {
+                bitmap: &source,
+                rect: src_rect,
+            },
+            clip,
+            BlitOptions {
+                mode: 0,
+                opa: opacity,
+                treat_as_opaque: false,
+                hold_alpha: false,
+            },
+        );
     } else {
         blit_copy_clipped(dst, dx, dy, &source, src_rect, clip);
     }

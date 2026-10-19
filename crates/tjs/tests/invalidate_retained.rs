@@ -2,10 +2,9 @@
 //! an object's script `finalize` (the reference `invalidate obj;` statement,
 //! used by the `Window.add` object vector at window destruction).
 
-use std::ptr;
 use std::sync::{Mutex, MutexGuard};
 
-use tjs::{RetainedValue, Tjs2Engine, TjsValue};
+use tjs::{RetainedValue, Tjs2Engine, Tjs2ValueId, TjsValue};
 
 /// The C++ TJS2 VM is single-threaded; serialize the tests.
 static VM_LOCK: Mutex<()> = Mutex::new(());
@@ -95,5 +94,5 @@ fn self_referential_class_instance_finalizes_on_invalidate_only() {
 fn invalidate_retained_rejects_a_null_id() {
     let _lock = vm_lock();
     let engine = Tjs2Engine::new().unwrap();
-    assert!(engine.invalidate_retained(ptr::null_mut()).is_err());
+    assert!(engine.invalidate_retained(Tjs2ValueId::null()).is_err());
 }

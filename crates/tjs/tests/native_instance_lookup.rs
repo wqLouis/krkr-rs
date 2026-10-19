@@ -11,7 +11,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use tjs::{
     DetachedValue, NativeClassBuilder, NativeInstanceBuilder, NativeInstanceMethodDef,
-    RetainedValue, Tjs2Engine, VAL_VOID, Value,
+    RetainedValue, Tjs2Engine, Tjs2ValueId, VAL_VOID, Value,
 };
 
 /// The C++ TJS2 VM is single-threaded; serialize the tests.
@@ -312,7 +312,7 @@ fn null_id_and_nul_class_name_are_errors() {
 
     // A null id is a caller mistake, not an ordinary miss.
     assert!(
-        e.native_instance_payload(ptr::null_mut(), "Widget")
+        e.native_instance_payload(Tjs2ValueId::null(), "Widget")
             .is_err(),
         "a null retained id must be rejected"
     );
