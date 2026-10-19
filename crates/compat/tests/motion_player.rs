@@ -126,11 +126,15 @@ impl Env {
     /// The pixels of the layer bitmap a `Player.draw` wrote, found in the
     /// attached scene.
     fn drawn_bitmap(&self) -> (u32, u32, Vec<u8>) {
+        self.bitmap_of(800, 1080)
+    }
+
+    fn bitmap_of(&self, width: u32, height: u32) -> (u32, u32, Vec<u8>) {
         let bitmap = self
             ._scene
             .bitmaps
             .iter()
-            .find(|bitmap| bitmap.width == 800 && bitmap.height == 1080)
+            .find(|bitmap| bitmap.width == width && bitmap.height == height)
             .expect("the draw target's bitmap");
         assert!(
             bitmap.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0),
@@ -393,6 +397,38 @@ fn player_draw_samples_the_icon_texture() {
     // The quad ends where the icon does, so the rest of the layer keeps the
     // layer's transparent fill instead of being covered.
     assert_eq!(texel(700, 1000)[3], 0);
+}
+
+#[test]
+fn player_draw_applies_the_draw_affine_translate() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    // The title maps its 1920x1080 canvas into the 1920x1440 target with
+    // `setDrawAffineTranslateMatrix(1,0,0,1,960,540)`; the draw applies the
+    // matrix to every node quad (`reference/cpp/plugins/motionplayer/
+    // PlayerDrawDispatch.cpp:11-61`, `PlayerRenderItems.cpp:700-715`).
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var w = new Window(); \
+         var plain = new Layer(w, null); \
+         plain.setSize(1600, 1080); \
+         var moved = new Layer(w, null); \
+         moved.setSize(1600, 1081); \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\"; \
+         p.draw(new Motion.SeparateLayerAdaptor(plain)); \
+         p.setDrawAffineTranslateMatrix(1, 0, 0, 1, 800, 0); \
+         p.draw(new Motion.SeparateLayerAdaptor(moved));"
+    ));
+    let alpha = |pixels: &[u8], x: usize, y: usize| pixels[(y * 1600 + x) * 4 + 3];
+    let (_, _, plain) = env.bitmap_of(1600, 1080);
+    let (_, _, moved) = env.bitmap_of(1600, 1081);
+    // The body icon sits at x=20 without the affine and is moved by +800 px;
+    // nothing else covers x=820 in the untranslated frame.
+    assert_eq!(alpha(&plain, 820, 300), 0, "the untranslated spot is empty");
+    assert_eq!(alpha(&moved, 820, 300), 255, "the affine moves the icon");
 }
 
 #[test]

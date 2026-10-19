@@ -1039,22 +1039,20 @@ impl PlayerInst {
         let storage = unsafe { ctx.services() }.storage();
         // SAFETY: the host keeps the attached storage alive for the binding.
         let storage = storage.map(|storage| unsafe { &*storage });
-        let textures = &mut self.textures;
+        let mut frame = DrawFrame {
+            snapshot: snapshot.as_deref(),
+            storage,
+            color,
+            affine: self.affine,
+            textures: &mut self.textures,
+            missing: Vec::new(),
+        };
         let rendered = scene.with_main_image_pixels_mut(layer_id, |pixels| {
             let mut bitmap = BitmapState::new(width as u32, height as u32, pixels.to_vec());
-            let mut missing = Vec::new();
             for node in &nodes {
-                draw_node(
-                    &mut bitmap,
-                    node,
-                    snapshot.as_deref(),
-                    storage,
-                    color,
-                    textures,
-                    &mut missing,
-                );
+                draw_node(&mut bitmap, node, &mut frame);
             }
-            (bitmap.rgba, missing)
+            (bitmap.rgba, frame.missing)
         });
         let Some((rgba, missing)) = rendered else {
             return Ok(());
@@ -1079,28 +1077,31 @@ impl PlayerInst {
 ///
 /// A shape node draws the placeholder quad instead, and a node whose icon has
 /// no readable texture draws nothing and is reported through `missing`.
-fn draw_node(
-    bitmap: &mut BitmapState,
-    node: &MotionNode,
-    snapshot: Option<&MotionSnapshot>,
-    storage: Option<&Storage>,
+struct DrawFrame<'a> {
+    snapshot: Option<&'a MotionSnapshot>,
+    storage: Option<&'a Storage>,
     color: [u8; 4],
-    textures: &mut HashMap<String, Arc<Pixels>>,
-    missing: &mut Vec<String>,
-) {
-    let icon = snapshot.and_then(|snapshot| snapshot.icons.get(&node.local.src));
-    let (Some(snapshot), Some(icon), Some(storage)) = (snapshot, icon, storage) else {
+    affine: [f64; 6],
+    textures: &'a mut HashMap<String, Arc<Pixels>>,
+    missing: Vec<String>,
+}
+
+fn draw_node(bitmap: &mut BitmapState, node: &MotionNode, frame: &mut DrawFrame<'_>) {
+    let icon = frame
+        .snapshot
+        .and_then(|snapshot| snapshot.icons.get(&node.local.src));
+    let (Some(snapshot), Some(icon), Some(storage)) = (frame.snapshot, icon, frame.storage) else {
         if node.shape > 0 {
-            fill_placeholder_quad(bitmap, node, color);
+            fill_placeholder_quad(bitmap, node, frame.color, frame.affine);
         } else if node.local.src.starts_with("src/") {
             // Only a `src/<group>/<name>` source names an icon; the layout and
             // blank sources of container and mask nodes draw nothing.
-            missing.push(node.local.src.clone());
+            frame.missing.push(node.local.src.clone());
         }
         return;
     };
-    let Some((pixels, crop)) = icon_pixels(snapshot, storage, icon, textures) else {
-        missing.push(node.local.src.clone());
+    let Some((pixels, crop)) = icon_pixels(snapshot, storage, icon, frame.textures) else {
+        frame.missing.push(node.local.src.clone());
         return;
     };
     let width = (crop.2 - crop.0) as u32;
@@ -1120,18 +1121,17 @@ fn draw_node(
             let from = ((crop.1 as usize + y) * pixels.width as usize + crop.0 as usize + x) * 4;
             let to = (y * width as usize + x) * 4;
             for (channel, value) in source.rgba[to..to + 4].iter_mut().enumerate() {
-                *value = (u32::from(pixels.rgba[from + channel]) * u32::from(color[channel]) / 255)
-                    as u8;
+                *value = (u32::from(pixels.rgba[from + channel]) * u32::from(frame.color[channel])
+                    / 255) as u8;
             }
         }
     }
     let matrix = local_matrix(&node.accumulated, &node.transform_order);
     let (center_x, center_y) = (node.accumulated.x, node.accumulated.y);
     let corner = |local_x: f64, local_y: f64| {
-        (
-            center_x + matrix[0] * local_x + matrix[1] * local_y,
-            center_y + matrix[2] * local_x + matrix[3] * local_y,
-        )
+        let x = center_x + matrix[0] * local_x + matrix[1] * local_y;
+        let y = center_y + matrix[2] * local_x + matrix[3] * local_y;
+        draw_point(frame.affine, x, y)
     };
     let (origin_x, origin_y) = (icon.origin_x, icon.origin_y);
     affine_blit(
@@ -1159,18 +1159,31 @@ fn draw_node(
     );
 }
 
+/// Map a node point through the player's draw affine.
+fn draw_point(affine: [f64; 6], x: f64, y: f64) -> (f64, f64) {
+    (
+        affine[0] * x + affine[2] * y + affine[4],
+        affine[1] * x + affine[3] * y + affine[5],
+    )
+}
+
 /// Draw the fixed-size solid quad a shape node approximates to.
-fn fill_placeholder_quad(bitmap: &mut BitmapState, node: &MotionNode, color: [u8; 4]) {
+fn fill_placeholder_quad(
+    bitmap: &mut BitmapState,
+    node: &MotionNode,
+    color: [u8; 4],
+    affine: [f64; 6],
+) {
     let (cx, cy) = (node.accumulated.x, node.accumulated.y);
     let (sx, sy) = (
         node.accumulated.scale_x.abs().max(0.01),
         node.accumulated.scale_y.abs().max(0.01),
     );
     let points = [
-        (cx - 32.0 * sx, cy - 32.0 * sy),
-        (cx + 32.0 * sx, cy - 32.0 * sy),
-        (cx + 32.0 * sx, cy + 32.0 * sy),
-        (cx - 32.0 * sx, cy + 32.0 * sy),
+        draw_point(affine, cx - 32.0 * sx, cy - 32.0 * sy),
+        draw_point(affine, cx + 32.0 * sx, cy - 32.0 * sy),
+        draw_point(affine, cx + 32.0 * sx, cy + 32.0 * sy),
+        draw_point(affine, cx - 32.0 * sx, cy + 32.0 * sy),
     ];
     let alpha = (f64::from(color[3]) * node.accumulated.opacity.clamp(0.0, 1.0)) as u8;
     crate::engine_api::raster::fill_polygon(bitmap, &points, [color[0], color[1], color[2], alpha]);
@@ -2172,5 +2185,15 @@ mod tests {
         assert!((matrix[1] + 2.0).abs() < 1e-9, "m12 = -sin*sx: {matrix:?}");
         assert!((matrix[2] - 3.0).abs() < 1e-9, "m21 = sin*sy: {matrix:?}");
         assert!(matrix[3].abs() < 1e-9, "m22 = cos*sy: {matrix:?}");
+    }
+
+    #[test]
+    fn the_draw_affine_maps_the_node_canvas_into_the_layer() {
+        // The title sets `setDrawAffineTranslateMatrix(1,0,0,1,960,540)` to
+        // center the 1920x1080 canvas in the 1920x1440 layer
+        // (`reference/cpp/plugins/motionplayer/PlayerDrawDispatch.cpp:11-61`).
+        let affine = [1.0, 0.0, 0.0, 1.0, 960.0, 540.0];
+        assert_eq!(super::draw_point(affine, -960.0, -540.0), (0.0, 0.0));
+        assert_eq!(super::draw_point(affine, 960.0, 540.0), (1920.0, 1080.0));
     }
 }
