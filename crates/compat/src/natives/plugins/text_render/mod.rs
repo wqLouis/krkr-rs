@@ -36,7 +36,9 @@ use tjs::{
     TjsValue, Value,
 };
 
-use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::native_util::{
+    args, report_error, set_bool, set_int, set_void, value_as_string, value_ref,
+};
 use crate::natives::system::{resolve, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
 
@@ -469,7 +471,7 @@ macro_rules! int_prop {
             // SAFETY: `instance` is the live payload and `value` is the
             // setter argument, both valid for the call.
             let inst = unsafe { &mut *(instance as *mut TextRenderInst) };
-            $s(inst, value_as_i64(unsafe { &*value }));
+            $s(inst, value_as_i64(value_ref(value)));
             0
         }
     };
@@ -500,7 +502,7 @@ macro_rules! bool_prop {
             // SAFETY: `instance` is the live payload and `value` is the
             // setter argument, both valid for the call.
             let inst = unsafe { &mut *(instance as *mut TextRenderInst) };
-            $s(inst, value_as_bool(unsafe { &*value }));
+            $s(inst, value_as_bool(value_ref(value)));
             0
         }
     };
@@ -531,7 +533,7 @@ macro_rules! real_prop {
             // SAFETY: `instance` is the live payload and `value` is the
             // setter argument, both valid for the call.
             let inst = unsafe { &mut *(instance as *mut TextRenderInst) };
-            $s(inst, value_as_f64(unsafe { &*value }));
+            $s(inst, value_as_f64(value_ref(value)));
             0
         }
     };
@@ -566,7 +568,7 @@ macro_rules! string_prop {
             // SAFETY: `instance` is the live payload and `value` is the
             // setter argument, both valid for the call.
             let inst = unsafe { &mut *(instance as *mut TextRenderInst) };
-            $s(inst, value_as_string(unsafe { &*value }));
+            $s(inst, value_as_string(value_ref(value)));
             0
         }
     };
@@ -717,7 +719,7 @@ extern "C" fn prop_render_right_set(
     // SAFETY: `instance` is the live payload and `value` is the setter
     // argument, both valid for the call.
     let inst = unsafe { &mut *(instance as *mut TextRenderInst) };
-    let right = value_as_i64(unsafe { &*value }) as i32;
+    let right = value_as_i64(value_ref(value)) as i32;
     inst.box_width = right.wrapping_sub(inst.x);
     0
 }
@@ -747,7 +749,7 @@ extern "C" fn prop_render_bottom_set(
     // SAFETY: `instance` is the live payload and `value` is the setter
     // argument, both valid for the call.
     let inst = unsafe { &mut *(instance as *mut TextRenderInst) };
-    let bottom = value_as_i64(unsafe { &*value }) as i32;
+    let bottom = value_as_i64(value_ref(value)) as i32;
     inst.box_height = bottom.wrapping_sub(inst.y);
     0
 }

@@ -443,6 +443,7 @@ fn dispatch_extraction_filter(engine_ptr: usize, services_ptr: usize, request: F
     // services (which the host keeps alive for the VM lifetime) and the VM is
     // single-threaded, so no other reference is live here.
     let engine = unsafe { &*(engine_ptr as *const Tjs2Engine) };
+    // SAFETY: see above.
     let services = unsafe { &*(services_ptr as *const CompatServices) };
 
     ensure_script_loaded(engine, services);

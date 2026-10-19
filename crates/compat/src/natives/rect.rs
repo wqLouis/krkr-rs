@@ -275,6 +275,7 @@ extern "C" fn rect_ctor(
     // SAFETY: the trampoline guarantees `argc` valid `Value` entries and a
     // live payload for this constructor call.
     let arguments = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live payload for this constructor call.
     let data = unsafe { payload(instance) };
     match argc {
         // `new Rect()` leaves the all-zero default.

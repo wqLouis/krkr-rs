@@ -568,8 +568,8 @@ extern "C" fn bitmap_get(
         set_void(out);
         return 0;
     };
-    // SAFETY: `instance` is the live payload the VM passed to the callback.
     {
+        // SAFETY: `instance` is the live payload the VM passed to the callback.
         let inst = unsafe { &mut *(instance as *mut TreeOwnerInst) };
         if inst.bitmap.is_none() {
             inst.bitmap = Some(created);

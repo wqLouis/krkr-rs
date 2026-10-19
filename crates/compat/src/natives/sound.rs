@@ -149,7 +149,10 @@ use tjs::{
     Tjs2ValueId, TjsValue, VAL_INTEGER, VAL_REAL, VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
 };
 
-use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
+use crate::native_util::{
+    callback_args, host_ref, inst_mut, inst_ref, report_error, set_int, set_void, value_as_string,
+    value_ref,
+};
 use crate::natives::system::{resolve, set_string_out, value_as_bool, value_as_i64};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
@@ -1039,7 +1042,7 @@ macro_rules! with_sound {
                 concat!("WaveSoundBuffer.", $what, ": compat context is not bound"),
             );
         };
-        let Some(inst) = (unsafe { ($instance as *const SoundInst).as_ref() }) else {
+        let Some(inst) = inst_ref::<SoundInst>($instance) else {
             return report_error(
                 $out_error,
                 concat!("WaveSoundBuffer.", $what, ": missing instance"),
@@ -1223,7 +1226,9 @@ extern "C" fn sound_ctor(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "WaveSoundBuffer: compat context is not bound");
     };
-    let inst = unsafe { &mut *(instance as *mut SoundInst) };
+    let Some(inst) = inst_mut::<SoundInst>(instance) else {
+        return report_error(out_error, "WaveSoundBuffer: missing instance");
+    };
     if inst.id.is_some() {
         return report_error(out_error, "WaveSoundBuffer: already constructed");
     }
@@ -1240,7 +1245,7 @@ extern "C" fn sound_ctor(
     // `TJS_E_BADPARAMCOUNT` for a missing argument,
     // `SoundBufferBaseIntf.cpp:32-33`; the port tolerates `argc == 0`, see
     // the module docs — test suites outside this module construct that way.)
-    let raw_args = unsafe { args(argv, argc) };
+    let raw_args = callback_args(argv, argc);
     let action_owner = raw_args
         .first()
         .and_then(|value| host.retain_object_arg(value).ok());
@@ -1293,7 +1298,7 @@ extern "C" fn sound_open(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let raw_args = unsafe { args(argv, argc) };
+    let raw_args = callback_args(argv, argc);
     if raw_args.is_empty() {
         return report_error(
             out_error,
@@ -1367,7 +1372,7 @@ extern "C" fn sound_open(
         };
         // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
         let lookup = strip_file_media(&name);
-        let audio = match unsafe { &*storage }.read(lookup) {
+        let audio = match host_ref(storage).read(lookup) {
             Ok(bytes) => bytes,
             Err(error) => {
                 return report_error(
@@ -1382,7 +1387,7 @@ extern "C" fn sound_open(
         // is skipped, but a read failure after the existence check
         // propagates. The error is carried past the decode below so a
         // decoder failure still reports first, as in the reference.
-        let (sli_bytes, sli_read_error) = match unsafe { &*storage }.read(&sli_name) {
+        let (sli_bytes, sli_read_error) = match host_ref(storage).read(&sli_name) {
             Ok(bytes) => (Some(bytes), None),
             Err(StorageReadError::NotFound(_)) => (None, None),
             Err(error) => (None, Some(error)),
@@ -1653,7 +1658,7 @@ extern "C" fn sound_fade(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let raw_args = unsafe { args(argv, argc) };
+    let raw_args = callback_args(argv, argc);
     if raw_args.len() < 2 {
         // `if(numparams < 2) return TJS_E_BADPARAMCOUNT;`
         // (`WaveIntf.cpp:1144-1145`).
@@ -1760,7 +1765,7 @@ extern "C" fn sound_set_pos(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let raw_args = unsafe { args(argv, argc) };
+    let raw_args = callback_args(argv, argc);
     if raw_args.len() < 3 {
         return report_error(out_error, "WaveSoundBuffer.setPos(x, y, z)");
     }
@@ -1912,7 +1917,7 @@ extern "C" fn sound_get_vis_buffer(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let raw_args = unsafe { args(argv, argc) };
+    let raw_args = callback_args(argv, argc);
     if raw_args.len() < 3 {
         return report_error(
             out_error,
@@ -2132,7 +2137,7 @@ fn forward_action(call: CallArgs, spec: ActionSpec) -> c_int {
             object.action_owner = Some(action);
         });
     };
-    let raw_args = unsafe { args(argv, argc) };
+    let raw_args = callback_args(argv, argc);
     if raw_args.len() < required_args {
         restore(action);
         return report_error(
@@ -2650,7 +2655,7 @@ extern "C" fn sound_position_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let ms = value_as_i64(unsafe { &*value });
+    let ms = value_as_i64(value_ref(value));
     with_sound!(
         engine,
         instance,
@@ -2686,25 +2691,25 @@ extern "C" fn sound_position_set(
 }
 
 channel_setter!(sound_looping_set, "looping", value, out_error, |channel| {
-    channel.looping = value_as_bool(unsafe { &*value });
+    channel.looping = value_as_bool(value_ref(value));
 });
 
 channel_setter!(sound_volume_set, "volume", value, out_error, |channel| {
-    channel.set_volume(SoundState::script_volume_to_gain(value_as_i64(unsafe {
-        &*value
-    })));
+    channel.set_volume(SoundState::script_volume_to_gain(value_as_i64(value_ref(
+        value,
+    ))));
 });
 
 channel_setter!(sound_volume2_set, "volume2", value, out_error, |channel| {
-    channel.set_volume2(SoundState::script_volume_to_gain(value_as_i64(unsafe {
-        &*value
-    })));
+    channel.set_volume2(SoundState::script_volume_to_gain(value_as_i64(value_ref(
+        value,
+    ))));
 });
 
 channel_setter!(sound_pan_set, "pan", value, out_error, |channel| {
-    channel.set_pan(SoundState::script_pan_to_balance(value_as_i64(unsafe {
-        &*value
-    })));
+    channel.set_pan(SoundState::script_pan_to_balance(value_as_i64(value_ref(
+        value,
+    ))));
 });
 
 // The setters that also touch `SoundObject` are written out explicitly.
@@ -2716,7 +2721,7 @@ extern "C" fn sound_sample_position_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let samples = value_as_i64(unsafe { &*value });
+    let samples = value_as_i64(value_ref(value));
     with_sound!(
         engine,
         instance,
@@ -2754,7 +2759,7 @@ extern "C" fn sound_paused_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let paused = value_as_bool(unsafe { &*value });
+    let paused = value_as_bool(value_ref(value));
     with_sound!(
         engine,
         instance,
@@ -2787,7 +2792,7 @@ extern "C" fn sound_frequency_set(
     // no reset sentinel (`WaveImpl.cpp:3336-3342`); the member has no
     // playback effect because `SetFrequencyToBuffer` is a no-op
     // (`WaveImpl.cpp:3329-3334`).
-    let frequency = value_as_i64(unsafe { &*value });
+    let frequency = value_as_i64(value_ref(value));
     with_sound!(
         engine,
         instance,
@@ -2828,7 +2833,7 @@ extern "C" fn sound_use_vis_buffer_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let enabled = value_as_bool(unsafe { &*value });
+    let enabled = value_as_bool(value_ref(value));
     with_sound!(
         engine,
         instance,
@@ -2880,7 +2885,7 @@ fn sound_pos_component_set(
     out_error: *mut *mut c_char,
     axis: usize,
 ) -> c_int {
-    let component = value_as_f64(unsafe { &*value }) as f32;
+    let component = value_as_f64(value_ref(value)) as f32;
     with_sound!(engine, instance, "pos", out_error, |_ctx, services, id| {
         with_object(services, id, |object, mixer| {
             if let Some(channel) = mixer.channel(object.channel_id) {
@@ -2917,7 +2922,7 @@ extern "C" fn sound_global_volume_set(
     value: *const Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    let volume = SoundState::script_volume_to_gain(value_as_i64(unsafe { &*value }));
+    let volume = SoundState::script_volume_to_gain(value_as_i64(value_ref(value)));
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "WaveSoundBuffer.globalVolume: not bound");
     };
@@ -2954,7 +2959,7 @@ extern "C" fn sound_global_focus_mode_set(
 ) -> c_int {
     // Reference `SetGlobalFocusMode((tTVPSoundGlobalFocusMode)(tjs_int)*param)`
     // stores whatever integer the script wrote (`WaveIntf.cpp:1616-1618`).
-    let mode = value_as_i64(unsafe { &*value }) as i32;
+    let mode = value_as_i64(value_ref(value)) as i32;
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "WaveSoundBuffer.globalFocusMode: not bound");
     };

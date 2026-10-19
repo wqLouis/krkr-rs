@@ -14,6 +14,8 @@ use tjs::{
     Tjs2Engine, VAL_INTEGER, VAL_VOID, Value, tjs2_malloc,
 };
 
+use crate::{CompatCtx, CompatServices};
+
 /// View a native callback's `argc`/`argv` as a slice.
 ///
 /// Returns an empty slice for a null pointer or a non-positive count (the
@@ -30,6 +32,76 @@ pub(crate) unsafe fn args<'a>(argv: *const Value, argc: c_int) -> &'a [Value] {
     }
     // SAFETY: the caller upholds the validity contract above.
     unsafe { slice::from_raw_parts(argv, argc as usize) }
+}
+
+/// View a native callback's `argc`/`argv` for the duration of the call.
+///
+/// The slice is only valid while the callback runs; this safe form exists so
+/// a callback does not repeat the pointer contract, and callers must not let
+/// the slice escape the call.
+pub(crate) fn callback_args(argv: *const Value, argc: c_int) -> &'static [Value] {
+    // SAFETY: the callback trampoline passes `argc` valid `Value`s in `argv`
+    // that stay valid for the callback, and the slice is used only there.
+    unsafe { args(argv, argc) }
+}
+
+/// The single `Value` a native property setter received.
+///
+/// The property-setter trampoline passes one valid, non-null `Value` and
+/// keeps it alive for the call.
+pub(crate) fn value_ref(value: *const Value) -> &'static Value {
+    // SAFETY: every native property setter is invoked by the callback
+    // trampoline with a non-null `Value` valid for the callback, and the
+    // borrow is used only inside it.
+    unsafe { &*value }
+}
+
+/// Recover the mutable native payload a callback received.
+///
+/// Returns `None` for a null instance pointer, which the trampoline only
+/// passes when the object has no payload.
+pub(crate) fn inst_mut<T>(instance: *mut c_void) -> Option<&'static mut T> {
+    if instance.is_null() {
+        return None;
+    }
+    // SAFETY: the VM passes each callback the live native payload it allocated
+    // for the script object, valid for the call.
+    Some(unsafe { &mut *(instance as *mut T) })
+}
+
+/// Recover the shared native payload a callback received.
+///
+/// See [`inst_mut`] for the null case and the payload contract.
+pub(crate) fn inst_ref<T>(instance: *mut c_void) -> Option<&'static T> {
+    if instance.is_null() {
+        return None;
+    }
+    // SAFETY: the VM passes each callback the live native payload it allocated
+    // for the script object, valid for the call.
+    Some(unsafe { &*(instance as *const T) })
+}
+
+/// Borrow an L2 object the host attached for the binding's lifetime.
+///
+/// The host keeps the attached scene and storage alive while the binding is
+/// installed, and the single-threaded VM holds no `&mut` to them during a
+/// callback.
+pub(crate) fn host_ref<T>(ptr: *mut T) -> &'static T {
+    // SAFETY: the caller passes an attached host pointer that outlives the
+    // binding, and no `&mut` to it is live during the callback.
+    unsafe { &*ptr }
+}
+
+/// The L2 services bound to the current callback.
+///
+/// A [`CompatCtx`] exists only while the binding is installed and is used
+/// inside the callback that resolved it, so the attached services are alive
+/// for the returned borrow.
+pub(crate) fn services(ctx: &CompatCtx) -> &CompatServices {
+    // SAFETY: `ctx` is only built for the installed, live binding and is used
+    // inside the callback that resolved it; the host keeps the services alive
+    // for the binding's lifetime.
+    unsafe { ctx.services() }
 }
 
 /// Convert an argument to its string form (TJS `ttstr` coercion): strings

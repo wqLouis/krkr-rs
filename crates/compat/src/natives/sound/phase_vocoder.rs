@@ -34,7 +34,7 @@ use api::media::AudioSpec;
 use engine::sound::{AudioStream, LoopInfo, LoopLink, SoundError, SoundLabel, SoundSource};
 use tjs::{NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Value};
 
-use crate::native_util::{report_error, set_int, set_void};
+use crate::native_util::{report_error, set_int, set_void, value_ref};
 use crate::{CompatCtx, CompatError};
 
 /// A validated `PhaseVocoder` configuration, mirrored into
@@ -226,9 +226,8 @@ extern "C" fn pv_pitch_set(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     with_payload(instance, |payload| {
-        payload.config.pitch = super::value_as_f64(unsafe { &*value }) as f32;
+        payload.config.pitch = super::value_as_f64(value_ref(value)) as f32;
     });
     publish(engine, instance);
     0
@@ -255,9 +254,8 @@ extern "C" fn pv_time_set(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     with_payload(instance, |payload| {
-        payload.config.time = super::value_as_f64(unsafe { &*value }) as f32;
+        payload.config.time = super::value_as_f64(value_ref(value)) as f32;
     });
     publish(engine, instance);
     0

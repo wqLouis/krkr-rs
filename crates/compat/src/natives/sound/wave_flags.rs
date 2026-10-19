@@ -63,7 +63,7 @@ extern "C" fn wf_ctor(
     _objthis: *mut c_void,
 ) -> c_int {
     // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
-    let raw_args = unsafe { super::args(argv, argc) };
+    let raw_args = unsafe { crate::native_util::args(argv, argc) };
     let Some(id) = raw_args.first() else {
         return report_error(out_error, "WaveFlags: requires a buffer");
     };

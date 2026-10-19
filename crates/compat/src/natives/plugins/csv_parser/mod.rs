@@ -436,6 +436,7 @@ extern "C" fn csv_ctor(
     // SAFETY: the trampoline guarantees `argc` valid `Value` entries, and
     // `instance` is the live payload for the call.
     let argv = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live payload for the call.
     let inst = unsafe { &mut *(instance as *mut CsvParserInst) };
 
     if let Some(target) = argv.first() {

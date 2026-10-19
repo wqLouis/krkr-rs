@@ -667,20 +667,14 @@ extern "C" fn kagparser_destroy(_engine: *mut c_void, instance: *mut c_void) {
 }
 
 /// The parser state for the object a method was called on.
-///
-/// # Safety
-/// `instance` must be the live payload the VM passed to the callback.
-unsafe fn state_of(instance: *mut c_void) -> &'static mut KagParserState {
-    // SAFETY: the dispatcher verified the object is a KAGParser instance.
+fn state_of(instance: *mut c_void) -> &'static mut KagParserState {
+    // SAFETY: the dispatcher verified the object is a live KAGParser instance.
     &mut unsafe { &mut *(instance as *mut KagParserInstance) }.state
 }
 
 /// The full payload for the object a method was called on.
-///
-/// # Safety
-/// `instance` must be the live payload the VM passed to the callback.
-unsafe fn instance_of(instance: *mut c_void) -> &'static mut KagParserInstance {
-    // SAFETY: the dispatcher verified the object is a KAGParser instance.
+fn instance_of(instance: *mut c_void) -> &'static mut KagParserInstance {
+    // SAFETY: the dispatcher verified the object is a live KAGParser instance.
     unsafe { &mut *(instance as *mut KagParserInstance) }
 }
 
@@ -694,7 +688,7 @@ extern "C" fn kagparser_invalidate(_engine: *mut c_void, instance: *mut c_void) 
     if instance.is_null() {
         return;
     }
-    let instance = unsafe { instance_of(instance) };
+    let instance = instance_of(instance);
     instance.macros_dict = None;
     instance.macros_snapshot.clear();
     instance.macro_args_dict = None;
@@ -743,7 +737,7 @@ extern "C" fn native_load_scenario(
         Ok(env) => env,
         Err(e) => return report_error(out_error, &e),
     };
-    let state = unsafe { state_of(instance) };
+    let state = state_of(instance);
     log::info!("KAGParser: scenario loaded : {name}");
     match state.load_scenario(&name, &mut env.environ()) {
         Ok(()) => {
@@ -773,7 +767,7 @@ extern "C" fn native_get_next_tag(
         Ok(env) => env,
         Err(e) => return report_error(out_error, &e),
     };
-    let instance = unsafe { instance_of(instance) };
+    let instance = instance_of(instance);
     // Pick up script mutations of the live `macros` table before the walk.
     if let Err(e) = sync_macros(host, instance) {
         return report_error(out_error, &e);
@@ -809,7 +803,7 @@ extern "C" fn native_go_to_label(
         Ok(name) => name,
         Err(e) => return report_error(out_error, &e),
     };
-    match unsafe { state_of(instance) }.go_to_label(&name) {
+    match state_of(instance).go_to_label(&name) {
         Ok(()) => {
             set_void(out);
             0
@@ -840,7 +834,7 @@ extern "C" fn native_call_label(
         Ok(env) => env,
         Err(e) => return report_error(out_error, &e),
     };
-    match unsafe { state_of(instance) }.call_label(&name, &mut env.environ()) {
+    match state_of(instance).call_label(&name, &mut env.environ()) {
         Ok(()) => {
             set_void(out);
             0
@@ -928,7 +922,7 @@ extern "C" fn native_assign(
     // reads the source state before overwriting the destination, so it is
     // safe too.
     let source = unsafe { &*(payload.as_ptr() as *const KagParserInstance) };
-    unsafe { state_of(instance) }.assign_from(&source.state);
+    state_of(instance).assign_from(&source.state);
     set_void(out);
     0
 }
@@ -943,7 +937,7 @@ extern "C" fn native_clear(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    unsafe { state_of(instance) }.clear();
+    state_of(instance).clear();
     set_void(out);
     0
 }
@@ -967,7 +961,7 @@ extern "C" fn native_store(
         Ok(host) => host,
         Err(e) => return report_error(out_error, &e),
     };
-    let state = unsafe { state_of(instance) };
+    let state = state_of(instance);
     match build_store_dict(host, state) {
         Ok(dict) => {
             set_retained_object(out, dict);
@@ -1148,7 +1142,7 @@ extern "C" fn native_restore(
         Ok(env) => env,
         Err(e) => return report_error(out_error, &e),
     };
-    let state = unsafe { state_of(instance) };
+    let state = state_of(instance);
     match host.member(object.raw_id(), "data") {
         // The emulator's own snapshot: exact round-trip.
         Ok(TjsValue::String(snapshot)) => match state.restore(&snapshot, &mut env.environ()) {
@@ -1290,7 +1284,7 @@ extern "C" fn native_clear_call_stack(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    unsafe { state_of(instance) }.clear_call_stack();
+    state_of(instance).clear_call_stack();
     set_void(out);
     0
 }
@@ -1305,7 +1299,7 @@ extern "C" fn native_pop_macro_args(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    match unsafe { state_of(instance) }.pop_macro_args_public() {
+    match state_of(instance).pop_macro_args_public() {
         Ok(()) => {
             set_void(out);
             0
@@ -1324,7 +1318,7 @@ extern "C" fn native_interrupt(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    unsafe { state_of(instance) }.interrupt();
+    state_of(instance).interrupt();
     set_void(out);
     0
 }
@@ -1339,7 +1333,7 @@ extern "C" fn native_reset_interrupt(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    unsafe { state_of(instance) }.reset_interrupt();
+    state_of(instance).reset_interrupt();
     set_void(out);
     0
 }
@@ -1357,7 +1351,8 @@ macro_rules! prop_get_int {
             _out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
-            set_int(out, unsafe { state_of(instance) }.$method() as i64);
+            let state = state_of(instance);
+            set_int(out, state.$method() as i64);
             0
         }
     };
@@ -1372,7 +1367,8 @@ macro_rules! prop_get_int_field {
             _out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
-            set_int(out, unsafe { state_of(instance) }.$field as i64);
+            let state = state_of(instance);
+            set_int(out, state.$field as i64);
             0
         }
     };
@@ -1387,7 +1383,7 @@ macro_rules! prop_get_bool {
             _out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
-            set_int(out, i64::from(unsafe { state_of(instance) }.$field));
+            set_int(out, i64::from(state_of(instance).$field));
             0
         }
     };
@@ -1404,7 +1400,7 @@ macro_rules! prop_set_bool {
         ) -> c_int {
             // SAFETY: value follows the trampoline contract.
             let v = param_to_bool(unsafe { &*value });
-            unsafe { state_of(instance) }.$field = v;
+            state_of(instance).$field = v;
             0
         }
     };
@@ -1419,7 +1415,7 @@ macro_rules! prop_get_string {
             out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
-            let s = unsafe { state_of(instance) }.$method().to_string();
+            let s = state_of(instance).$method().to_string();
             match with_services(engine, |services| set_string_result(services, out, &s)) {
                 Ok(()) => 0,
                 Err(e) => report_error(out_error, &e),
@@ -1482,7 +1478,7 @@ extern "C" fn native_get_macro_params(
         Ok(host) => host,
         Err(e) => return report_error(out_error, &e),
     };
-    let instance = unsafe { instance_of(instance) };
+    let instance = instance_of(instance);
     let Some(entries) = instance.state.macro_params_entries() else {
         set_null_result(host, out);
         return 0;
@@ -1539,7 +1535,7 @@ extern "C" fn prop_debug_level_set(
         Ok(level) => level as i32,
         Err(e) => return report_error(out_error, &e),
     };
-    unsafe { state_of(instance) }.debug_level = level;
+    state_of(instance).debug_level = level;
     0
 }
 
@@ -1559,7 +1555,7 @@ extern "C" fn prop_cur_storage_set(
         Ok(env) => env,
         Err(e) => return report_error(out_error, &e),
     };
-    match unsafe { state_of(instance) }.load_scenario(&name, &mut env.environ()) {
+    match state_of(instance).load_scenario(&name, &mut env.environ()) {
         Ok(()) => 0,
         Err(e) => report_error(out_error, &e),
     }
@@ -1576,7 +1572,7 @@ extern "C" fn prop_macros_get(
         Ok(host) => host,
         Err(e) => return report_error(out_error, &e),
     };
-    let instance = unsafe { instance_of(instance) };
+    let instance = instance_of(instance);
     let entries = instance.state.macros_entries();
     if let Err(e) = publish_cached_dict(
         host,
@@ -1746,7 +1742,7 @@ extern "C" fn prop_param_macros_get(
         Ok(host) => host,
         Err(e) => return report_error(out_error, &e),
     };
-    let entries = unsafe { state_of(instance) }.param_macros_entries();
+    let entries = state_of(instance).param_macros_entries();
     match retain_param_macros_dict(host, &entries) {
         Ok(dict) => {
             set_retained_object(out, dict);
@@ -1783,7 +1779,7 @@ extern "C" fn prop_param_macros_set(
     };
     match read_param_macros_dict(host, object.raw_id()) {
         Ok(entries) => {
-            unsafe { state_of(instance) }.set_param_macros(entries);
+            state_of(instance).set_param_macros(entries);
             0
         }
         Err(e) => report_error(out_error, &e),

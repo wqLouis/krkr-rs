@@ -29,7 +29,7 @@ use super::super::common::{
     scene_ref,
 };
 use super::{LayerExtras, LayerInst, LayerTransition, bound};
-use crate::native_util::{args, report_error, set_void, value_as_string};
+use crate::native_util::{args, report_error, services, set_void, value_as_string};
 use crate::natives::system::value_as_bool;
 
 /// `beginTransition(name [, withchildren [, transwith [, options]]])`.
@@ -112,9 +112,8 @@ extern "C" fn layer_begin_transition(
         // `StartTransition` rejects a second transition on the same layer
         // up front (LayerIntf.cpp:7776-7778), then the mutual-source cycle
         // (LayerIntf.cpp:7779-7781).
-        // SAFETY: the caller resolved `ctx` from the installed binding.
         {
-            let extras = unsafe { ctx.services() }.state::<LayerExtras>();
+            let extras = services(&ctx).state::<LayerExtras>();
             if extras.transitions.contains_key(&id) {
                 return Err(
                     "Layer.beginTransition: a transition is already running on this layer \

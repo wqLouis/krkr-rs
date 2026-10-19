@@ -59,7 +59,9 @@ use tjs::{
     VAL_RETAINED, VAL_STRING, Value,
 };
 
-use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::native_util::{
+    args, report_error, services, set_bool, set_int, set_void, value_as_string, value_ref,
+};
 use crate::natives::sound::{SoundState, TVP_VOLUME_SCALE};
 use crate::natives::system::{resolve, value_as_bool, value_as_i64};
 use crate::storage::strip_file_media;
@@ -981,7 +983,7 @@ extern "C" fn vo_close(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "VideoOverlay.close: compat context is not bound");
     };
-    let services = unsafe { ctx.services() };
+    let services = services(&ctx);
     let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
         slot.overlay.close();
         slot.release_audio(services);
@@ -1014,7 +1016,7 @@ extern "C" fn vo_play(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "VideoOverlay.play: compat context is not bound");
     };
-    let services = unsafe { ctx.services() };
+    let services = services(&ctx);
     let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
         if slot.overlay.is_open() {
             slot.overlay
@@ -1044,7 +1046,7 @@ extern "C" fn vo_pause(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "VideoOverlay.pause: compat context is not bound");
     };
-    let services = unsafe { ctx.services() };
+    let services = services(&ctx);
     let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
         if slot.overlay.is_open() {
             slot.overlay
@@ -1074,7 +1076,7 @@ extern "C" fn vo_stop(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "VideoOverlay.stop: compat context is not bound");
     };
-    let services = unsafe { ctx.services() };
+    let services = services(&ctx);
     let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
         if slot.overlay.is_open() {
             slot.overlay
@@ -1107,7 +1109,7 @@ extern "C" fn vo_rewind(
             "VideoOverlay.rewind: compat context is not bound",
         );
     };
-    let services = unsafe { ctx.services() };
+    let services = services(&ctx);
     let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
         slot.overlay.rewind();
         slot.sync_audio(services);
@@ -1136,7 +1138,7 @@ extern "C" fn vo_prepare(
             "VideoOverlay.prepare: compat context is not bound",
         );
     };
-    let services = unsafe { ctx.services() };
+    let services = services(&ctx);
     let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
         if slot.overlay.is_open() && slot.mode == MODE_LAYER {
             slot.overlay
@@ -1625,9 +1627,8 @@ extern "C" fn vo_width_set(
     with_slot!(engine, instance, out_error, _ctx, slot, {
         if slot.mode != MODE_LAYER {
             let height = slot.overlay.bounds.height;
-            // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
             slot.overlay
-                .set_size(value_as_i64(unsafe { &*value }).max(0) as u32, height);
+                .set_size(value_as_i64(value_ref(value)).max(0) as u32, height);
         }
         0
     })
@@ -1656,9 +1657,8 @@ extern "C" fn vo_height_set(
     with_slot!(engine, instance, out_error, _ctx, slot, {
         if slot.mode != MODE_LAYER {
             let width = slot.overlay.bounds.width;
-            // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
             slot.overlay
-                .set_size(width, value_as_i64(unsafe { &*value }).max(0) as u32);
+                .set_size(width, value_as_i64(value_ref(value)).max(0) as u32);
         }
         0
     })

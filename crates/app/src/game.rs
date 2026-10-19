@@ -158,8 +158,9 @@ impl FrameBody for Polls {
         // returns.
         compat::advance_transitions(ctx, self.dt_ms).map_err(CompatError::Engine)?;
         // SAFETY: `ctx` is bound to a live engine for the callback.
-        let _ = compat::take_bring_to_front_requests(unsafe { ctx.services() });
-        let _ = compat::take_update_requests(unsafe { ctx.services() });
+        let services = unsafe { ctx.services() };
+        let _ = compat::take_bring_to_front_requests(services);
+        let _ = compat::take_update_requests(services);
         let _ = compat::take_capture_releases(ctx);
         Ok(())
     }

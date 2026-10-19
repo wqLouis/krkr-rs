@@ -72,7 +72,9 @@ use tjs::{
 
 use crate::binding;
 use crate::host::host_desktop_rect;
-use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::native_util::{
+    args, host_ref, report_error, services, set_bool, set_int, set_void, value_as_string,
+};
 use crate::natives::input::vk_pressed;
 use crate::{CompatCtx, CompatError, CompatServices};
 
@@ -181,7 +183,7 @@ pub fn take_exit_request(services: &CompatServices) -> Option<i32> {
 pub fn continuous_handler_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let engine = unsafe { ctx.engine() };
-    let services = unsafe { ctx.services() };
+    let services = services(ctx);
     let tick = tick_count_ms(services);
     let mut index = 0usize;
     loop {
@@ -601,7 +603,7 @@ fn project_dir(ctx: &CompatCtx) -> Option<std::path::PathBuf> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine, and the
     // host keeps the attached storage alive for the binding's lifetime.
     let ptr = unsafe { ctx.services() }.storage()?;
-    Some(unsafe { &*ptr }.game_dir().to_path_buf())
+    Some(host_ref(ptr).game_dir().to_path_buf())
 }
 
 /// The reference storage-name form of a native host path:
@@ -643,7 +645,7 @@ fn screen_size(ctx: &CompatCtx) -> (u32, u32) {
     let Some(ptr) = (unsafe { ctx.services() }).scene() else {
         return (0, 0);
     };
-    let scene = unsafe { &*ptr };
+    let scene = host_ref(ptr);
     let Some(window) = scene.windows.first() else {
         return (0, 0);
     };
@@ -988,7 +990,7 @@ extern "C" fn native_create_uuid(
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let uuid = {
-        let mut state = unsafe { ctx.services() }.state::<SystemState>();
+        let mut state = services(&ctx).state::<SystemState>();
         make_uuid(&mut state)
     };
     set_string_out(&ctx, out, &uuid);
@@ -2279,7 +2281,7 @@ fn read_register_value(ctx: &CompatCtx, key: &str) -> Result<Option<RetainedValu
         let Some(ptr) = (unsafe { ctx.services() }).storage() else {
             return Ok(None);
         };
-        match unsafe { &*ptr }.read("RegisterData.tjs") {
+        match host_ref(ptr).read("RegisterData.tjs") {
             Ok(bytes) => bytes,
             // Missing file / unreadable: the reference clears the result.
             Err(_) => return Ok(None),
