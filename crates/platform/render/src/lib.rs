@@ -475,7 +475,9 @@ pub fn read_render_target(
 ///
 /// This is the only drawing entry point. The pipeline owns traversal,
 /// composition, batching and presentation; the caller only keeps the tree
-/// current.
+/// current. A lost presentation surface is reported as
+/// [`SurfaceEvent::Lost`] in the returned [`Presentation`] instead of an
+/// error; the caller recovers it through [`recover_surface`].
 ///
 /// # Errors
 ///
@@ -491,6 +493,30 @@ pub fn render(
     match &p.kind {
         PipelineKind::Null(backend) => backend.render(surface, state, scene),
         PipelineKind::Vulkan(backend) => backend.render(surface, state, scene),
+    }
+}
+
+/// Recreates a presentation surface that a frame reported as
+/// [`SurfaceEvent::Lost`].
+///
+/// The backend builds a new surface from the window/display handles it was
+/// created with, rebuilds the swapchain on it and destroys the old surface
+/// exactly once. Everything else in `state` is untouched, so the caller keeps
+/// the game and VM alive across the recovery.
+///
+/// # Errors
+///
+/// Returns [`RenderError::InvalidArgument`] for a mismatched state/surface,
+/// the surface-creation error when the replacement cannot be built, and the
+/// swapchain error when the replacement cannot be presented to.
+pub fn recover_surface(
+    p: &RenderPipeline,
+    surface: &mut Surface,
+    state: &mut RenderState,
+) -> Result<SurfaceEvent, RenderError> {
+    match &p.kind {
+        PipelineKind::Null(backend) => backend.recover_surface(surface, state),
+        PipelineKind::Vulkan(backend) => backend.recover_surface(surface, state),
     }
 }
 

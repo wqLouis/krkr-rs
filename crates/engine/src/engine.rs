@@ -29,7 +29,7 @@ use api::host::SurfaceEvent;
 use render::{
     BackendKind, FrameStats, FrameTimings, RenderNode, RenderPipeline, RenderScene, RenderState,
     Surface, Texture, TextureDesc, TextureUpload, create_texture, drop_texture, last_frame_timings,
-    render, resize as resize_render, upload_textures,
+    recover_surface, render, resize as resize_render, upload_textures,
 };
 
 use crate::hasher::{Map, map};
@@ -261,12 +261,16 @@ impl Engine {
             pending_window_resize: None,
             presentation_skipped_logged: false,
         };
-        resize_render(
+        let event = resize_render(
             &engine.pipeline,
             &engine.surface,
             &mut engine.render_state,
             surface_size,
         )?;
+        // The surface can adopt an extent different from the requested one (a
+        // DPI or compositor clamp), so the presentation fits the extent the
+        // backend actually took rather than the size we asked for.
+        engine.surface_size = reported_surface_size(event, surface_size);
         engine.sync_presentation();
         Ok(engine)
     }
@@ -363,12 +367,18 @@ impl Engine {
         let project_ms = project_started.elapsed().as_secs_f64() * 1000.0;
 
         let render_started = Instant::now();
-        render(
+        let presentation = render(
             &self.pipeline,
             &self.surface,
             &mut self.render_state,
             &self.render_scene,
         )?;
+        // A lost surface is recoverable: rebuild the surface and swapchain in
+        // the bottom layer and keep the scene, textures and VM in place. The
+        // recovered frame is skipped and the next frame presents normally.
+        if presentation.surface_event == Some(SurfaceEvent::Lost) {
+            recover_surface(&self.pipeline, &mut self.surface, &mut self.render_state)?;
+        }
         let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
 
         self.frame_index = self.frame_index.saturating_add(1);
@@ -403,7 +413,7 @@ impl Engine {
         } else {
             resize_render(&self.pipeline, &self.surface, &mut self.render_state, size)?
         };
-        self.surface_size = size;
+        self.surface_size = reported_surface_size(event, size);
         self.sync_presentation();
         Ok(event)
     }
@@ -741,13 +751,19 @@ impl Engine {
                     })
                 })
                 .collect();
-            if let Err(error) = upload_textures(&self.pipeline, &mut self.render_state, &uploads) {
-                log::warn!("failed to upload {} bitmap(s): {error}", uploads.len());
-            }
+            let uploaded = match upload_textures(&self.pipeline, &mut self.render_state, &uploads) {
+                Ok(()) => true,
+                Err(error) => {
+                    log::warn!(
+                        "failed to upload {} bitmap(s): {error}; the bitmaps stay dirty and the \
+                         next frame retries them",
+                        uploads.len()
+                    );
+                    false
+                }
+            };
             drop(uploads);
-            for id in ready {
-                self.scene.set_bitmap_clean(id);
-            }
+            clear_uploaded_dirty(&mut self.scene, &ready, uploaded);
         }
     }
 
@@ -764,5 +780,66 @@ impl Engine {
                 drop_texture(&self.pipeline, &mut self.render_state, texture);
             }
         }
+    }
+}
+
+/// Returns the framebuffer size a backend resize event actually took.
+///
+/// A backend reports the extent the surface accepted; a driver or compositor
+/// clamp can make it differ from the requested size, and the presentation must
+/// fit the real framebuffer. A non-resize event leaves `requested` in place.
+fn reported_surface_size(event: SurfaceEvent, requested: (u32, u32)) -> (u32, u32) {
+    match event {
+        SurfaceEvent::Resized(width, height) => (width.max(1), height.max(1)),
+        SurfaceEvent::Lost | SurfaceEvent::Restored | SurfaceEvent::OutOfDate => requested,
+    }
+}
+
+/// Clears the dirty flag of every bitmap in `uploaded` after a batch upload.
+///
+/// A failed batch did not reach the backend, so the bitmaps stay dirty and the
+/// next frame retries them; clearing the flag anyway would present a frame
+/// that silently omits their textures.
+fn clear_uploaded_dirty(scene: &mut Scene, uploaded: &[u32], succeeded: bool) {
+    if !succeeded {
+        return;
+    }
+    for id in uploaded {
+        scene.set_bitmap_clean(*id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Scene, clear_uploaded_dirty, reported_surface_size};
+    use api::host::SurfaceEvent;
+
+    #[test]
+    fn a_failed_upload_leaves_every_bitmap_dirty_for_a_retry() {
+        let mut scene = Scene::default();
+        let id = scene.add_bitmap(1, 1, vec![0u8; 4]);
+        assert!(scene.bitmap(id).expect("bitmap").dirty);
+
+        clear_uploaded_dirty(&mut scene, &[id], false);
+        assert!(
+            scene.bitmap(id).expect("bitmap").dirty,
+            "a batch that did not reach the backend must be retried"
+        );
+
+        clear_uploaded_dirty(&mut scene, &[id], true);
+        assert!(!scene.bitmap(id).expect("bitmap").dirty);
+    }
+
+    #[test]
+    fn a_resize_event_reports_the_extent_the_surface_accepted() {
+        assert_eq!(
+            reported_surface_size(SurfaceEvent::Resized(640, 480), (1280, 720)),
+            (640, 480)
+        );
+        // A non-resize event leaves the requested size in place.
+        assert_eq!(
+            reported_surface_size(SurfaceEvent::OutOfDate, (1280, 720)),
+            (1280, 720)
+        );
     }
 }

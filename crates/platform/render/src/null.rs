@@ -107,6 +107,16 @@ impl NullRenderPipeline {
         Ok(SurfaceEvent::Resized(size.0, size.1))
     }
 
+    /// Recreates a lost surface; the null backend never loses one.
+    pub fn recover_surface(
+        &self,
+        surface: &Surface,
+        _state: &mut RenderState,
+    ) -> Result<SurfaceEvent, RenderError> {
+        check_surface(surface)?;
+        Ok(SurfaceEvent::Restored)
+    }
+
     /// Creates a texture handle after validating its descriptor.
     pub fn create_texture(&self, desc: TextureDesc) -> Result<Texture, RenderError> {
         validate_desc(&desc)?;

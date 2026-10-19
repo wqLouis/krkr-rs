@@ -24,10 +24,12 @@ pub(crate) enum StateKind {
     Vulkan(Box<VulkanState>),
 }
 
-/// Immutable presentation-surface handle.
+/// Presentation-surface handle.
 ///
 /// The current extent lives in [`RenderState`] because [`crate::resize`]
-/// only receives `&Surface`.
+/// only receives `&Surface`. The backend may replace the underlying
+/// `VkSurfaceKHR` when a lost surface is recovered, which is why
+/// [`crate::recover_surface`] takes it mutably.
 pub struct Surface {
     pub(crate) kind: SurfaceKind,
 }

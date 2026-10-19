@@ -341,6 +341,8 @@ impl VulkanPipeline {
             surface_loader,
             swapchain_loader,
             surface,
+            display_handle: *display,
+            window_handle: *window,
             preferred_format: self.preferred_format,
             swapchain,
             pipelines,
@@ -410,6 +412,32 @@ impl VulkanPipeline {
             vstate.swapchain.extent.width,
             vstate.swapchain.extent.height,
         ))
+    }
+
+    /// Recreates the presentation surface and its swapchain after a frame
+    /// reported the surface lost.
+    pub(crate) fn recover_surface(
+        &self,
+        surface: &mut Surface,
+        state: &mut RenderState,
+    ) -> Result<SurfaceEvent, RenderError> {
+        let SurfaceKind::Vulkan(vsurface) = &mut surface.kind else {
+            return Err(RenderError::InvalidArgument {
+                message: "the Vulkan backend received a null surface".to_owned(),
+            });
+        };
+        let StateKind::Vulkan(vstate) = &mut state.kind else {
+            return Err(RenderError::InvalidArgument {
+                message: "the Vulkan backend received a null render state".to_owned(),
+            });
+        };
+        if vsurface.surface != vstate.surface {
+            return Err(RenderError::InvalidArgument {
+                message: "the surface does not belong to this render state".to_owned(),
+            });
+        }
+        recreate_surface(self, vstate, vsurface)?;
+        Ok(SurfaceEvent::Restored)
     }
 
     /// Creates a texture handle after validating its descriptor.
@@ -718,6 +746,12 @@ impl VulkanPipeline {
                     surface_event: Some(SurfaceEvent::OutOfDate),
                 });
             }
+            Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
+                return Ok(Presentation {
+                    presented: false,
+                    surface_event: Some(SurfaceEvent::Lost),
+                });
+            }
             Err(error) => {
                 return Err(device::result_error(
                     "failed to acquire a swapchain image",
@@ -860,13 +894,16 @@ impl VulkanPipeline {
         vstate.frame_index = vstate.frame_index.wrapping_add(1);
 
         let mut needs_recreate = suboptimal;
-        match present_result {
-            Ok(false) => {}
-            Ok(true) => needs_recreate = true,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => needs_recreate = true,
-            Err(vk::Result::ERROR_SURFACE_LOST_KHR) => return Err(RenderError::SurfaceLost),
-            Err(error) => {
-                return Err(device::result_error("failed to present the frame", error));
+        match present_recovery(present_result)
+            .map_err(|error| device::result_error("failed to present the frame", error))?
+        {
+            SwapchainRecovery::None => {}
+            SwapchainRecovery::RebuildSwapchain => needs_recreate = true,
+            SwapchainRecovery::RecreateSurface => {
+                return Ok(Presentation {
+                    presented: false,
+                    surface_event: Some(SurfaceEvent::Lost),
+                });
             }
         }
 
@@ -939,6 +976,11 @@ pub(crate) struct VulkanState {
     pub(crate) swapchain_loader: ash::khr::swapchain::Device,
     /// The surface this state presents to (also owned by `Surface`).
     pub(crate) surface: vk::SurfaceKHR,
+    /// Display connection the surface was created from, kept so a lost surface
+    /// can be recreated against the same window.
+    pub(crate) display_handle: RawDisplayHandle,
+    /// Window the surface was created from, kept for the same reason.
+    pub(crate) window_handle: RawWindowHandle,
     /// Preferred swapchain format requested when the pipeline was created.
     pub(crate) preferred_format: TextureFormat,
     /// Swapchain, render pass and framebuffers.
@@ -1265,6 +1307,32 @@ fn create_offscreen_resources(
     Ok((pool, command_buffer, fence))
 }
 
+/// The recovery a swapchain operation needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwapchainRecovery {
+    /// The operation succeeded without a suboptimal result.
+    None,
+    /// The swapchain must be rebuilt; the surface is still valid.
+    RebuildSwapchain,
+    /// The surface is lost; recreate the surface and the swapchain.
+    RecreateSurface,
+}
+
+/// Classifies a present result into the recovery it needs.
+///
+/// `VK_SUBOPTIMAL_KHR` and `VK_ERROR_OUT_OF_DATE_KHR` rebuild the swapchain
+/// against the same surface; `VK_ERROR_SURFACE_LOST_KHR` is the only result
+/// that needs a new surface. Any other error is returned to the caller.
+fn present_recovery(result: Result<bool, vk::Result>) -> Result<SwapchainRecovery, vk::Result> {
+    match result {
+        Ok(false) => Ok(SwapchainRecovery::None),
+        Ok(true) => Ok(SwapchainRecovery::RebuildSwapchain),
+        Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(SwapchainRecovery::RebuildSwapchain),
+        Err(vk::Result::ERROR_SURFACE_LOST_KHR) => Ok(SwapchainRecovery::RecreateSurface),
+        Err(error) => Err(error),
+    }
+}
+
 /// Recreates the swapchain and its per-image synchronisation objects.
 ///
 /// The old swapchain is passed as a hint to the driver and destroyed only
@@ -1313,6 +1381,89 @@ fn recreate_swapchain(
             Err(error)
         }
     }
+}
+
+/// Recreates the presentation surface and the swapchain that presents to it.
+///
+/// The new swapchain references the new surface, so the surface is adopted
+/// before the swapchain is swapped in and the old surface is destroyed only
+/// after its last user, the old swapchain, is gone. Neither handle is
+/// destroyed twice: the new surface replaces `state.surface` and is destroyed
+/// by [`VulkanState`]'s `Drop` exactly as the surface it replaces would be.
+fn recreate_surface(
+    pipeline: &VulkanPipeline,
+    state: &mut VulkanState,
+    surface: &mut VulkanSurface,
+) -> Result<(), RenderError> {
+    // SAFETY: no GPU work may reference the old surface while it is replaced.
+    unsafe { state.device.device_wait_idle() }.map_err(|error| {
+        device::result_error(
+            "failed to idle the device before recreating the surface",
+            error,
+        )
+    })?;
+
+    // The stored window/display handles are the only inputs a replacement
+    // `VkSurfaceKHR` needs.
+    // SAFETY: the handles were live when the original surface was created and
+    // still describe the same window; `ash-window` dispatches on the variant.
+    let new_surface = unsafe {
+        ash_window::create_surface(
+            &pipeline.instance_guard.entry,
+            &pipeline.instance_guard.instance,
+            state.display_handle,
+            state.window_handle,
+            None,
+        )
+    }
+    .map_err(|error| RenderError::DeviceUnavailable {
+        message: format!(
+            "failed to recreate the Vulkan presentation surface: {}",
+            device::vk_result_message(error)
+        ),
+    })?;
+
+    // Build the replacement against the old swapchain first: it reuses the
+    // pinned format and render pass, and a failure leaves the old swapchain
+    // intact, so the new surface still has no user and is destroyed here.
+    let new_swapchain = swapchain::create(
+        &state.device,
+        state.physical_device,
+        &state.surface_loader,
+        &state.swapchain_loader,
+        new_surface,
+        state.surface_size,
+        state.preferred_format,
+        Some(&state.swapchain),
+    );
+    let new_swapchain = match new_swapchain {
+        Ok(new_swapchain) => new_swapchain,
+        Err(error) => {
+            // SAFETY: the surface was created above and no swapchain uses it.
+            unsafe { state.surface_loader.destroy_surface(new_surface, None) };
+            return Err(error);
+        }
+    };
+
+    // The new swapchain references the new surface from here on, so the swap
+    // is adopted before anything else can fail. The old swapchain is the old
+    // surface's last user and is destroyed before it.
+    let old_surface = std::mem::replace(&mut state.surface, new_surface);
+    surface.surface = new_surface;
+    let old_swapchain = std::mem::replace(&mut state.swapchain, new_swapchain);
+    old_swapchain.destroy(&state.device, &state.swapchain_loader);
+    // SAFETY: the old swapchain is gone and the device is idle.
+    unsafe { state.surface_loader.destroy_surface(old_surface, None) };
+
+    // A failure here leaves the surface valid but the swapchain unusable;
+    // `swapchain_ready` makes the next frame report out-of-date for a retry.
+    let device = state.device.clone();
+    if let Err(error) = rebuild_image_sync(state, &device) {
+        state.swapchain_ready = false;
+        return Err(error);
+    }
+    state.swapchain_ready = true;
+    Ok(())
 }
 
 /// Rebuilds the per-image fences and semaphores after a swapchain change.
@@ -1528,5 +1679,35 @@ pub fn upload_submit_count(state: &RenderState) -> Option<u64> {
     match &state.kind {
         StateKind::Vulkan(vstate) => Some(vstate.upload.submits()),
         StateKind::Null(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SwapchainRecovery, present_recovery};
+    use ash::vk;
+
+    /// `VK_ERROR_SURFACE_LOST_KHR` is the one present result that invalidates
+    /// the surface; out-of-date and suboptimal only need the swapchain
+    /// rebuilt, and every other error still reaches the caller.
+    #[test]
+    fn a_lost_surface_needs_a_new_surface_but_out_of_date_only_rebuilds_the_swapchain() {
+        assert_eq!(present_recovery(Ok(false)), Ok(SwapchainRecovery::None));
+        assert_eq!(
+            present_recovery(Ok(true)),
+            Ok(SwapchainRecovery::RebuildSwapchain)
+        );
+        assert_eq!(
+            present_recovery(Err(vk::Result::ERROR_OUT_OF_DATE_KHR)),
+            Ok(SwapchainRecovery::RebuildSwapchain)
+        );
+        assert_eq!(
+            present_recovery(Err(vk::Result::ERROR_SURFACE_LOST_KHR)),
+            Ok(SwapchainRecovery::RecreateSurface)
+        );
+        assert_eq!(
+            present_recovery(Err(vk::Result::ERROR_DEVICE_LOST)),
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        );
     }
 }

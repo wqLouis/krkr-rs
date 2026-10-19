@@ -169,11 +169,23 @@ pub(crate) fn create(
         })?;
 
     // SAFETY: `swapchain` was just created for this device.
-    let images = unsafe { swapchain_loader.get_swapchain_images(swapchain) }.map_err(|error| {
-        RenderError::Framebuffer {
-            message: format!("failed to query swapchain images: {error}"),
+    let images = match unsafe { swapchain_loader.get_swapchain_images(swapchain) } {
+        Ok(images) => images,
+        Err(error) => {
+            destroy_partial(
+                device,
+                swapchain_loader,
+                swapchain,
+                &[],
+                &[],
+                old,
+                vk::RenderPass::null(),
+            );
+            return Err(RenderError::Framebuffer {
+                message: format!("failed to query swapchain images: {error}"),
+            });
         }
-    })?;
+    };
 
     let render_pass = match old {
         Some(old) => old.render_pass,
