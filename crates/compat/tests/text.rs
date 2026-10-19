@@ -219,6 +219,36 @@ fn cp932_ams_scenario_attribute_is_decoded() {
     );
 }
 
+/// A BOM-less CP932 KAG scenario whose non-ASCII bytes make the detector
+/// report a Latin single-byte encoding other than `WINDOWS-1252`
+/// (`WINDOWS-1250`/ISO-8859-2 here): the CP932 bytes for `汗` (`8A BE`) decode
+/// as `Šľ` under those charsets. The reference remaps a reported `SHIFT_JIS`
+/// to `cp932` (`reference/cpp/core/base/TextStream.cpp:47-57`, `:53`), so the
+/// `file=` attribute must still carry the Japanese name.
+#[test]
+fn cp932_ams_scenario_attribute_survives_a_latin2_detection() {
+    let _lock = vm_lock();
+    let dir = GameDir::new();
+    dir.write(
+        "emotion.ams",
+        &cp932("@loadimage imgid=MARK1 file=image1/EM汗01_01\r\n"),
+    );
+    let env = Env::new(dir);
+    env.run(
+        "var parser = new KAGParser(); \
+         parser.loadScenario('emotion.ams'); \
+         var tag = parser.getNextTag();",
+    );
+    assert_eq!(
+        env.eval_ok("tag.tagname"),
+        TjsValue::String("loadimage".into())
+    );
+    assert_eq!(
+        env.eval_ok("tag.file"),
+        TjsValue::String("image1/EM汗01_01".into())
+    );
+}
+
 #[test]
 fn utf8_and_utf16_boms_are_decoded() {
     let _lock = vm_lock();

@@ -2,30 +2,24 @@
 //! legacy-encoded scripts, and the KiriKiri `FE FE` XOR/bit-swap container
 //! with an optional zlib payload.
 //!
-//! Behavioral references:
+//! Behavior:
 //!
-//! * `reference/cpp/core/base/TextStream.cpp` (`checkTextEncoding` and
-//!   `tTVPTextReadStream`): BOM recognition (`:24-45`), the uchardet
-//!   detection branch for BOM-less text (`:47-57`), conversion from the
-//!   reported charset (`:137-191`), and the `FE FE` crypt/compression
-//!   container (`:82-135`). Modes 0/1 and 2 share the five-byte header
-//!   `FE FE <mode> FF FE`: the reference reads the two bytes after the mode
-//!   as the mandatory UTF-16LE byte-order mark and starts the mode 0/1
-//!   payload at offset 5. The vendored reconstruction's offset-4 read
-//!   (`:87-88`) contradicts the shipped data and the upstream text stream, so
-//!   the offset-5 reader governs (see `decode_container`). Mode 2's header
-//!   (`FE FE 02 FF FE` + two little-endian `u64` sizes) matches the reference
-//!   (`:104-116`).
-//! * `crates/tjs/cpp/streams.cpp`: the same `FE FE` handling for the TJS
-//!   native text streams.
+//! * A byte-order mark selects UTF-32LE/BE, UTF-8, UTF-16LE or UTF-16BE before
+//!   charset detection runs. BOM-less text with no `Scripts.textEncoding`
+//!   override is decoded from the charset `chardetng` reports.
+//! * The `FE FE` container carries the XOR/bit-swap cipher (modes 0/1) or a
+//!   zlib payload (mode 2). Modes 0/1 and 2 share the five-byte header
+//!   `FE FE <mode> FF FE`: the two bytes after the mode are the mandatory
+//!   UTF-16LE byte-order mark and the mode 0/1 payload starts at offset 5.
+//!   Mode 2's header is `FE FE 02 FF FE` plus two little-endian `u64` sizes
+//!   (see `decode_container`).
+//! * `crates/tjs/cpp/streams.cpp` applies the same `FE FE` handling for the
+//!   TJS native text streams.
 //!
 //! Every conversion path -- a byte-order mark, `Scripts.textEncoding`, or
-//! charset detection -- drops byte sequences the charset cannot decode,
-//! matching the reference's Boost.Locale `skip` policy, and logs the drop once
-//! per decode. Only an unsupported `Scripts.textEncoding` name is a typed
-//! error. BOM-less text with no override is decoded from the charset reported
-//! by `chardetng`, the maintained successor of the reference's uchardet
-//! detector.
+//! charset detection -- drops byte sequences the charset cannot decode and
+//! logs the drop once per decode. Only an unsupported `Scripts.textEncoding`
+//! name is a typed error.
 
 use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
 use encoding_rs::DecoderResult;
@@ -38,11 +32,10 @@ const CONTAINER_ZLIB_HEADER: usize = 21;
 
 /// Selects the decoder for [`decode_text`].
 ///
-/// [`Detect`](Self::Detect) runs charset detection, the reference's
-/// text-stream behaviour. A caller that means the current code page or any
-/// other fixed encoding must say so with [`Named`](Self::Named): do not use a
-/// bare "no encoding" to mean detection in one place and the code page in
-/// another.
+/// [`Detect`](Self::Detect) runs charset detection. A caller that means the
+/// current code page or any other fixed encoding must say so with
+/// [`Named`](Self::Named): do not use a bare "no encoding" to mean detection
+/// in one place and the code page in another.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum TextEncoding<'a> {
     /// Detect the charset from the bytes.
@@ -61,9 +54,8 @@ pub(crate) enum TextEncoding<'a> {
 ///    plugin that names a fixed encoding);
 /// 4. charset detection.
 ///
-/// A payload the charset cannot decode is dropped and logged, matching the
-/// reference's Boost.Locale `skip` policy; an unsupported explicit `encoding`
-/// is a typed error.
+/// A payload the charset cannot decode is dropped and logged; an unsupported
+/// explicit `encoding` is a typed error.
 pub(crate) fn decode_text(bytes: &[u8], encoding: TextEncoding<'_>) -> Result<String, String> {
     let (decoded, path) = decode_text_inner(bytes, encoding);
     decoded.map(|decoded| decoded_into_string(decoded, path))
@@ -71,13 +63,11 @@ pub(crate) fn decode_text(bytes: &[u8], encoding: TextEncoding<'_>) -> Result<St
 
 /// Decode like [`decode_text`] but return UTF-16 code units.
 ///
-/// The reference's text stream decrypts an `FE FE` container into a
-/// `std::u16string` and keeps every code unit, including an unpaired
-/// surrogate (`reference/cpp/core/base/TextStream.cpp:82-135`). A Rust
-/// `String` cannot hold one, so the script loader decodes through this
-/// function and hands the VM the code units instead of a lossy UTF-8 string.
-/// A charset-decoded path is valid text and converts to code units without
-/// loss.
+/// An `FE FE` container decrypts to UTF-16 code units and keeps every code
+/// unit, including an unpaired surrogate. A Rust `String` cannot hold one, so
+/// the script loader decodes through this function and hands the VM the code
+/// units instead of a lossy UTF-8 string. A charset-decoded path is valid text
+/// and converts to code units without loss.
 pub(crate) fn decode_text_units(
     bytes: &[u8],
     encoding: TextEncoding<'_>,
@@ -126,7 +116,7 @@ enum DecodePath<'a> {
     Bom(&'static str),
     /// An explicit `Scripts.textEncoding` name.
     Explicit(&'a str),
-    /// The charset detector's decision; `None` is the reference's
+    /// The charset detector's decision; `None` marks the
     /// `WINDOWS-1252` -> latin1 special case.
     Detected(Option<&'static str>),
 }
@@ -222,44 +212,45 @@ fn decode_text_inner<'a>(
 
 /// Detect the charset of BOM-less, override-less text and decode it.
 ///
-/// The reference runs uchardet over the bytes and converts from the reported
-/// charset, mapping `SHIFT_JIS` to `cp932` and `WINDOWS-1252` to `ASCII`
-/// (`reference/cpp/core/base/TextStream.cpp:47-57`). Legacy East-Asian
-/// charsets overlap byte-for-byte, so the decision needs the statistical model
-/// `chardetng` provides; `encoding_rs` then does the bulk decode and owns the
-/// per-charset tables. Neither crate allocates per input byte: `chardetng`
-/// scores fixed-size buffers and `encoding_rs` decodes the whole slice in one
-/// pass, allocating only the output string.
+/// `chardetng` reports the charset; `SHIFT_JIS` maps to `cp932` and
+/// `WINDOWS-1252` to `ASCII`. Legacy East-Asian charsets overlap byte-for-byte,
+/// so the decision needs the statistical model `chardetng` provides;
+/// `encoding_rs` then does the bulk decode and owns the per-charset tables.
+/// Neither crate allocates per input byte: `chardetng` scores fixed-size
+/// buffers and `encoding_rs` decodes the whole slice in one pass, allocating
+/// only the output string.
 fn detect_and_decode(bytes: &[u8]) -> (Result<Decoded, String>, DecodePath<'static>) {
     // `Allow` keeps ISO-2022-JP in the candidate set, matching the charsets the
-    // reference's uchardet can report.
+    // detector can report.
     let mut detector = EncodingDetector::new(Iso2022JpDetection::Allow);
     detector.feed(bytes, true);
     let detected = detector.guess(None, Utf8Detection::Allow);
-    // `WINDOWS-1252` is the detector's single-byte fallback. A BOM-less KAG
-    // scenario is mostly ASCII with a few CP932 double-byte characters, so the
-    // fallback would decode it as Latin-1 and mangle every non-ASCII storage
-    // name. The reference decodes a reported `SHIFT_JIS` as `cp932`
-    // (`reference/cpp/core/base/TextStream.cpp:53`); use CP932 when the bytes
-    // are valid CP932 carrying Japanese text, and keep the Latin-1 mapping the
-    // reference gives `WINDOWS-1252` (`:47-57`) otherwise.
-    if detected.name() == encoding_rs::WINDOWS_1252.name() {
+    // A single-byte detection maps each byte to one character, so it decodes
+    // a BOM-less KAG scenario (mostly ASCII with a few CP932 double-byte
+    // characters) as Latin-x and mangles every non-ASCII storage name. The
+    // detector's fallback can report `WINDOWS-1252` or another Latin
+    // single-byte encoding, depending on the bytes. A reported `SHIFT_JIS`
+    // decodes as `cp932`, so try CP932 first whenever the decision is
+    // single-byte and keep the detected mapping otherwise. A genuine
+    // `WINDOWS-1252` payload keeps the Latin-1 mapping.
+    if detected.is_single_byte() {
         if let Some(text) = cp932_japanese_text(bytes) {
             return (
                 Ok(Decoded::Utf8(text)),
                 DecodePath::Detected(Some(encoding_rs::SHIFT_JIS.name())),
             );
         }
-        return (
-            Ok(Decoded::Utf8(
-                encoding_rs::mem::decode_latin1(bytes).into_owned(),
-            )),
-            DecodePath::Detected(None),
-        );
+        if detected.name() == encoding_rs::WINDOWS_1252.name() {
+            return (
+                Ok(Decoded::Utf8(
+                    encoding_rs::mem::decode_latin1(bytes).into_owned(),
+                )),
+                DecodePath::Detected(None),
+            );
+        }
     }
-    // The reference maps `SHIFT_JIS` to `cp932`; `encoding_rs`'s WHATWG
-    // Shift_JIS is already Windows-31J (cp932), so the reported encoding is
-    // used as-is.
+    // `SHIFT_JIS` maps to `cp932`; `encoding_rs`'s WHATWG Shift_JIS is already
+    // Windows-31J (cp932), so the reported encoding is used as-is.
     (
         decode_from_encoding(bytes, detected).map(Decoded::Utf8),
         DecodePath::Detected(Some(detected.name())),
@@ -306,15 +297,10 @@ fn is_japanese_char(ch: char) -> bool {
 /// Decode `bytes` from `encoding`, dropping byte sequences the charset cannot
 /// decode.
 ///
-/// Every reference conversion entry point defaults to the Boost.Locale `skip`
-/// policy -- `to_utf` for the detected and explicit charsets
-/// (`reference/cpp/core/base/TextStream.cpp:182-191`) and `utf_to_utf` for the
-/// BOM paths (`:148-180`) -- so illegal/unconvertible bytes are dropped and
-/// the surrounding text is kept. Boost.Locale's `encoding_errors.hpp` defines
-/// `default_method = skip`, and `encoding_utf.hpp` documents that invalid
-/// characters are skipped. The `encoding_rs` incremental decoder exposes
-/// malformed sequences the same way, so the drop stays a single pass over the
-/// input and is reported once per decode rather than silently. A payload whose
+/// Illegal or unconvertible bytes are dropped and the surrounding text is
+/// kept. The `encoding_rs` incremental decoder exposes malformed sequences
+/// without aborting the decode, so the drop stays a single pass over the input
+/// and is reported once per decode rather than silently. A payload whose
 /// worst-case UTF-8 length overflows `usize` is a typed error.
 fn decode_from_encoding(
     bytes: &[u8],
@@ -350,14 +336,9 @@ fn warn_dropped(label: &str, dropped: usize) {
 
 /// Decode a `FE FE` container, dispatching on its mode byte.
 ///
-/// The reference checks the two bytes after the mode for the mandatory
-/// UTF-16LE byte-order mark `FF FE` and raises `TVPUnsupportedCipherMode` when
-/// it is absent, then reads the payload from offset 5. The vendored
-/// reconstruction at `reference/cpp/core/base/TextStream.cpp:87-88` instead
-/// starts the mode 0/1 payload at offset 4 with no BOM check; that contradicts
-/// both the shipped data (mode 0/1 files have an odd length once the 5-byte
-/// header is present, and the offset-4 read drops code units) and the upstream
-/// text stream, so the offset-5 reader governs.
+/// Both modes check the two bytes after the mode for the mandatory UTF-16LE
+/// byte-order mark `FF FE` and raise when it is absent, then read the payload
+/// from offset 5.
 fn decode_container(bytes: &[u8]) -> Result<Decoded, String> {
     let mode = bytes[2];
     match mode {
@@ -387,11 +368,10 @@ fn require_container_bom(bytes: &[u8], mode: u8) -> Result<(), String> {
 /// Decrypt the UTF-16LE payload of an `FE FE 00` / `FE FE 01` container.
 ///
 /// The payload begins at offset 5 after `FE FE <mode> FF FE` and is read as
-/// little-endian code units (reference `reference/cpp/core/base/TextStream.cpp:82-105`);
-/// a trailing odd byte is reported. Mode 0 is the legacy per-code-unit XOR
-/// (only applied to units `>= 0x20`); mode 1 is the adjacent-bit swap. The
-/// units are kept raw, as the reference keeps them; the lossy string view is
-/// applied only by [`decode_text`].
+/// little-endian code units; a trailing odd byte is reported. Mode 0 is the
+/// legacy per-code-unit XOR (only applied to units `>= 0x20`); mode 1 is the
+/// adjacent-bit swap. The units are kept raw; the lossy string view is applied
+/// only by [`decode_text`].
 fn decode_container_cipher(bytes: &[u8], mode: u8) -> Result<Decoded, String> {
     let payload: &[u8] = bytes.get(5..).unwrap_or_default();
     let units = payload
@@ -464,8 +444,7 @@ fn decode_container_zlib(bytes: &[u8]) -> Result<Decoded, String> {
 ///
 /// A charset-decoded path is already valid UTF-8; `FE FE` code units are
 /// decoded as UTF-16, dropping an unpaired surrogate with one warning. The
-/// reference keeps the raw unit, so the script loader uses
-/// [`decode_text_units`] for the lossless path.
+/// script loader uses [`decode_text_units`] when it needs the raw code units.
 fn decoded_into_string(decoded: Decoded, path: DecodePath<'_>) -> String {
     match decoded {
         Decoded::Utf8(text) => text,
@@ -488,10 +467,7 @@ fn decoded_into_string(decoded: Decoded, path: DecodePath<'_>) -> String {
 /// Decode a UTF-32 byte payload, dropping values that are not Unicode scalar
 /// values.
 ///
-/// The reference has a UTF-32 branch, but it is unreachable (the UTF-16LE BOM
-/// test shadows `FF FE 00 00`) and its end pointer runs out of bounds, so this
-/// is our own behaviour rather than a copy of a reachable reference path. It
-/// decodes both byte orders and drops invalid scalar values with the same
+/// Decodes both byte orders and drops invalid scalar values with the same
 /// warning the charset decoder uses.
 fn decode_utf32(bytes: &[u8], label: &str, word: impl Fn([u8; 4]) -> u32) -> String {
     let mut dropped = bytes.len() % 4;
@@ -510,9 +486,8 @@ fn decode_utf32(bytes: &[u8], label: &str, word: impl Fn([u8; 4]) -> u32) -> Str
 /// Decode UTF-16 code units, returning the text and the number of unpaired
 /// surrogates dropped.
 ///
-/// The reference assigns the raw units into a `std::u16string` and keeps going;
-/// a Rust `String` is UTF-8 and cannot hold an unpaired surrogate, so the unit
-/// is dropped. This is a representation limit, not a reference behaviour.
+/// A Rust `String` is UTF-8 and cannot hold an unpaired surrogate, so an
+/// unpaired unit is dropped.
 fn from_utf16(units: impl Iterator<Item = u16>) -> (String, usize) {
     let mut text = String::new();
     let mut dropped = 0usize;
@@ -535,8 +510,7 @@ fn decode_named(bytes: &[u8], name: &str) -> Result<String, String> {
         "cp932" | "shiftjis" | "sjis" | "ms932" | "windows31j" | "csshiftjis" | "xsjis" => {
             decode_from_encoding(bytes, encoding_rs::SHIFT_JIS)
         }
-        // The reference's `ASCII` branch assigns each byte to a UTF-16 code
-        // unit (Latin-1), so every byte decodes and nothing is dropped.
+        // Latin-1 maps every byte to a code point, so nothing is dropped.
         "ascii" | "usascii" | "windows1252" | "iso88591" | "latin1" => {
             Ok(encoding_rs::mem::decode_latin1(bytes).into_owned())
         }
@@ -718,6 +692,37 @@ mod tests {
         let bytes = encoded(SHIFT_JIS, text);
         assert_eq!(
             decode_text(&bytes, TextEncoding::Detect).expect("short CP932 decodes"),
+            text
+        );
+    }
+
+    // reference/cpp/core/base/TextStream.cpp:47-57 — BOM-less text is decoded
+    // from the charset reported by detection; :53 remaps the reported
+    // `SHIFT_JIS` to `cp932`. Depending on the bytes, the single-byte fallback
+    // can report `WINDOWS-1250`/ISO-8859-2 instead of `WINDOWS-1252`: the CP932
+    // bytes for `汗` (`8A BE`) decode through those charsets as `Šľ`, so the
+    // CP932 reading must win for every single-byte decision, not only for
+    // `WINDOWS-1252`.
+    #[test]
+    fn short_cp932_ams_scenario_with_latin2_bytes_is_detected_and_decoded() {
+        let text = "@loadimage imgid=MARK1 file=image1/EM汗01_01\r\n";
+        let bytes = encoded(SHIFT_JIS, text);
+        assert_eq!(
+            decode_text(&bytes, TextEncoding::Detect).expect("short CP932 decodes"),
+            text
+        );
+    }
+
+    // reference/cpp/core/base/TextStream.cpp:47-57 — a reported `WINDOWS-1252`
+    // maps to `ASCII` (Latin-1). Text that is not valid CP932 must keep that
+    // mapping rather than be reinterpreted as Japanese.
+    #[test]
+    fn windows1252_payload_keeps_the_latin1_mapping() {
+        let text = "café résumé";
+        let (bytes, _, had_errors) = encoding_rs::WINDOWS_1252.encode(text);
+        assert!(!had_errors, "windows-1252 can encode {text:?}");
+        assert_eq!(
+            decode_text(&bytes, TextEncoding::Detect).expect("latin1 decodes"),
             text
         );
     }
