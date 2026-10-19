@@ -365,6 +365,13 @@ impl Default for SeparateInst {
     }
 }
 
+impl SeparateInst {
+    /// The object id of the live `targetLayer`, if one is set.
+    pub(crate) fn target_object_id(&self) -> Option<usize> {
+        self.target.object_id()
+    }
+}
+
 extern "C" fn separate_create(_engine: *mut c_void) -> *mut c_void {
     Box::into_raw(Box::new(SeparateInst::default())) as *mut c_void
 }

@@ -19,8 +19,9 @@ use std::sync::Arc;
 use tjs::{DetachedValue, RetainedValue, TjsValue, VAL_OBJECT, Value};
 
 use super::StoredValue;
+use super::adaptors::SeparateInst;
 use super::animator::{Animator, ColorAnimator, ease_weight};
-use super::helpers::{eval_object, inst_mut, set_string, value_as_f64};
+use super::helpers::{eval_object, inst_mut, inst_ref, set_string, value_as_f64};
 use super::model::{
     MotionEvent, MotionNode, MotionSnapshot, TimelineState, build_node_tree, evaluate_frames,
     prime_timelines, step_timelines,
@@ -704,20 +705,13 @@ impl PlayerInst {
         };
         // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `draw`.
         let engine = unsafe { ctx.engine() };
-        // The reference resolves the draw target only through
-        // `NativeInstanceSupport(TJS_NIS_GETINSTANCE, tTJSNC_Layer::ClassID)`
-        // (`reference/cpp/plugins/motionplayer/PlayerRenderInternal.cpp:334-345`,
-        // `PrivateMotionGLL.cpp:470-484`); a non-Layer object is a typed error,
-        // matching the `TVPSpecifyLayer` raise shape
-        // (`reference/cpp/core/visual/VideoOvlIntf.cpp:385-398`).
-        let layer_id = match crate::CompatCtx::native_instance_id(
-            engine,
-            target_id as tjs::Tjs2ValueId,
-            &["Layer"],
-        ) {
-            Ok(Some(id)) => id,
-            Ok(None) => return Err("Player.draw: expected a native Layer object".into()),
-            Err(error) => return Err(error),
+        // A draw target is a `SeparateLayerAdaptor`, which draws into the layer
+        // its live `targetLayer` names, or a `Layer` itself. A target that
+        // names no layer leaves nothing to draw into and is a no-op. The D3D
+        // adaptor route is not wired.
+        let layer_id = match resolve_draw_target(engine, target_id)? {
+            Some(id) => id,
+            None => return Ok(()),
         };
         // SAFETY: the host keeps the attached scene alive for the binding.
         let Some(scene) = unsafe { ctx.services() }.scene() else {
@@ -803,6 +797,36 @@ impl PlayerInst {
         }
         Ok(())
     }
+}
+
+/// The layer a `Player.draw` target draws into.
+///
+/// A `SeparateLayerAdaptor` draws into the layer its live `targetLayer` names;
+/// any other object is resolved as a `Layer` directly. `None` means the target
+/// names no layer, which `draw` treats as a no-op.
+fn resolve_draw_target(engine: &tjs::Tjs2Engine, target_id: usize) -> Result<Option<u32>, String> {
+    let payload = match engine
+        .native_instance_payload(target_id as tjs::Tjs2ValueId, "SeparateLayerAdaptor")
+    {
+        Ok(Some(payload)) => payload,
+        Ok(None) => {
+            return crate::CompatCtx::native_instance_id(
+                engine,
+                target_id as tjs::Tjs2ValueId,
+                &["Layer"],
+            );
+        }
+        Err(error) => return Err(error),
+    };
+    // SAFETY: `target_id` is a live object retained for the draw call, so the
+    // VM keeps the `SeparateLayerAdaptor` payload alive for this call.
+    let Some(adaptor) = (unsafe { inst_ref::<SeparateInst>(payload.as_ptr()) }) else {
+        return Ok(None);
+    };
+    let Some(target) = adaptor.target_object_id() else {
+        return Ok(None);
+    };
+    crate::CompatCtx::native_instance_id(engine, target as tjs::Tjs2ValueId, &["Layer"])
 }
 
 /// Install an object member by retaining it.

@@ -1044,12 +1044,10 @@ mp_method_void!(
     player_draw,
     PlayerInst,
     |p: &mut PlayerInst, args: &[Value], ctx: &CompatCtx| {
-        // The class registers `draw(tTJSVariant)` — one required argument
-        // (`reference/cpp/plugins/motionplayer/main.cpp:234`,
-        // `Player.h:322-323`); a scalar argument is a no-op, while an object
-        // that is not a native `Layer` is a typed error in `draw`
-        // (`reference/cpp/plugins/motionplayer/PlayerDrawDispatch.cpp:109-146`,
-        // `PlayerRenderInternal.cpp:334-345`).
+        // The class registers `draw(tTJSVariant)` — one required argument. A
+        // scalar argument is a no-op, and an object that names no layer (a
+        // `SeparateLayerAdaptor` with no valid `targetLayer`, or any other
+        // object) also does nothing rather than raising.
         super::helpers::require_args(args, 1, "draw")?;
         let target = StoredValue::from_value(&args[0], ctx);
         p.modified = true;

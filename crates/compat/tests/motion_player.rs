@@ -352,6 +352,43 @@ fn separate_layer_adaptor_absolute_is_an_integer_and_survives_clear() {
 }
 
 #[test]
+fn player_draw_routes_a_separate_layer_adaptor_to_its_target_layer() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var target = new Layer(w, null); \
+         var p = new Motion.Player(null);",
+    );
+    // The draw dispatch checks the `SeparateLayerAdaptor` native class before
+    // the ordinary render path (`reference/cpp/plugins/motionplayer/
+    // PlayerDrawDispatch.cpp:182-208`) and renders into the layer named by the
+    // adaptor's live `targetLayer` (`reference/cpp/plugins/motionplayer/
+    // PlayerRenderTargets.cpp:1228-1252`).
+    assert!(
+        env.eval("p.draw(new Motion.SeparateLayerAdaptor(target))")
+            .is_ok(),
+        "an SLA draw target must not raise"
+    );
+    // An SLA with an unset `targetLayer` has nothing to render into; the
+    // reference's failed SLA route returns void without raising
+    // (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:1228-1252`).
+    assert!(
+        matches!(
+            env.eval("p.draw(new Motion.SeparateLayerAdaptor())"),
+            Ok(TjsValue::Void)
+        ),
+        "an SLA with no targetLayer must return void"
+    );
+    // The same holds when `targetLayer` is set to a non-`Layer` object.
+    env.run("var odd = new Motion.SeparateLayerAdaptor(); odd.targetLayer = %[];");
+    assert!(
+        matches!(env.eval("p.draw(odd)"), Ok(TjsValue::Void)),
+        "an SLA whose targetLayer is not a Layer must return void"
+    );
+}
+
+#[test]
 fn resource_manager_allocates_and_releases_layer_ids() {
     let _lock = vm_lock();
     let env = Env::new();
@@ -597,13 +634,12 @@ fn player_methods_reject_missing_arguments() {
     ] {
         assert!(env.eval(call).is_err(), "{call} must fail");
     }
-    // A scalar `draw` argument is a no-op, but an object that is not a native
-    // `Layer` is a typed error — the reference resolves the target only
-    // through `NativeInstanceSupport(TJS_NIS_GETINSTANCE, Layer)`
-    // (`reference/cpp/plugins/motionplayer/PlayerRenderInternal.cpp:334-345`,
-    // `reference/cpp/core/visual/VideoOvlIntf.cpp:385-398`).
+    // A scalar `draw` argument is a no-op, and so is an object that names no
+    // layer — the reference's ordinary path returns without raising when the
+    // target does not resolve to a `Layer`
+    // (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:1081-1090`).
     env.run("p.draw(1);");
-    assert!(env.eval("p.draw(%[])").is_err());
+    assert!(env.eval("p.draw(%[])").is_ok());
 }
 
 #[test]
