@@ -763,24 +763,62 @@ mod parser_tests {
     }
 
     #[test]
-    fn empty_label_aliases_the_previous_one() {
-        // An empty `*` reuses the previous label name; because that name is
-        // already in the cache, the reference then suffixes the alias `:2`
+    fn page_only_label_aliases_the_previous_one() {
+        // An empty name before `|` (`*|page`) reuses the previous label name;
+        // because that name is already in the cache, the reference then
+        // suffixes the alias `:2`
         // (`reference/cpp/core/base/KAGParser.cpp:207-238`).
-        let scenario = parse("*foo\n*\n").unwrap();
+        let scenario = parse("*foo\n*|page\n").unwrap();
         assert_eq!(scenario.labels.get("*foo").copied(), Some(0));
         assert_eq!(scenario.labels.get("*foo:2").copied(), Some(1));
         assert!(matches!(
             &scenario.events[1],
-            Event::Label { name, .. } if name == "*foo:2"
+            Event::Label { name, macro_name, .. }
+                if name == "*foo:2" && macro_name.as_deref() == Some("page")
         ));
     }
 
     #[test]
-    fn empty_first_label_is_an_error() {
-        // Without a previous label an empty one cannot be aliased
-        // (`reference/cpp/core/base/KAGParser.cpp:213-216`).
-        assert_eq!(parse("*\n"), Err(Error::CannotOmitFirstLabelName));
+    fn page_only_first_label_is_an_error() {
+        // Without a previous label an empty name (`*|page`) cannot be
+        // aliased (`reference/cpp/core/base/KAGParser.cpp:209-219`).
+        assert_eq!(parse("*|page\n"), Err(Error::CannotOmitFirstLabelName));
+    }
+
+    #[test]
+    fn a_scenario_may_start_with_a_bare_star_line() {
+        // A line with fewer than two characters is not cached as a label
+        // (`reference/cpp/core/base/KAGParser.cpp:204`). A scenario may start
+        // with one, and it must not alias the previous label or raise the
+        // first-label error.
+        let scenario = parse("*\n[selopt]\n").expect("a bare `*` line is not a label");
+        assert_eq!(
+            scenario.events[0],
+            Event::Label {
+                name: String::new(),
+                macro_name: None,
+                line: 1,
+            }
+        );
+        assert!(matches!(
+            &scenario.events[1],
+            Event::Tag { name, .. } if name == "selopt"
+        ));
+        assert!(scenario.labels.is_empty(), "a bare `*` is not cached");
+
+        // It also does not consume the previous label's name: a following
+        // page-only label still aliases that earlier name.
+        let scenario = parse("*foo\n*\n*|page\n").expect("bare `*` between labels");
+        assert_eq!(scenario.labels.get("*foo").copied(), Some(0));
+        assert_eq!(
+            scenario.labels.get("*foo:2").copied(),
+            Some(2),
+            "the page-only label aliases `*foo`; the bare `*` did not"
+        );
+        assert!(
+            !scenario.labels.contains_key(""),
+            "a bare `*` is not cached under an empty name"
+        );
     }
 
     #[test]

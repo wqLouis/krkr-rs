@@ -307,33 +307,48 @@ pub fn parse_with_options(source: &str, options: ParseOptions) -> Result<Scenari
                 cols.push(0);
             }
             Some('*') => {
-                let (mut name, macro_name) = split_label(content);
-                if name == "*" {
-                    // An empty label aliases the previous one; without a
-                    // previous label it is an error
-                    // (`KAGParser.cpp:209-219`).
-                    let Some(previous) = prev_label.clone() else {
-                        return Err(Error::CannotOmitFirstLabelName);
-                    };
-                    name = previous;
-                }
-                prev_label = Some(name.clone());
-                // Duplicate labels suffix `:2`, `:3`, ... and the first
-                // occurrence keeps the bare name (`KAGParser.cpp:193-238`).
-                let count = label_counts.entry(name.clone()).or_insert(0);
-                *count += 1;
-                let alias = if *count > 1 {
-                    format!("{name}:{count}")
+                // The reference only caches a line as a label when it has at
+                // least two characters (`EnsureLabelCache`,
+                // `reference/cpp/core/base/KAGParser.cpp:204`). A bare `*`
+                // line is not a cacheable label: the walk only clears the
+                // current label, so it must neither alias the previous label
+                // nor raise the first-label error.
+                if content.chars().count() < 2 {
+                    events.push(Event::Label {
+                        name: String::new(),
+                        macro_name: None,
+                        line: lineno,
+                    });
+                    cols.push(0);
                 } else {
-                    name
-                };
-                labels.insert(alias.clone(), events.len());
-                events.push(Event::Label {
-                    name: alias,
-                    macro_name,
-                    line: lineno,
-                });
-                cols.push(0);
+                    let (mut name, macro_name) = split_label(content);
+                    if name == "*" {
+                        // A page-only label (`*|page`) has an empty name and
+                        // aliases the previous one; without a previous label
+                        // it is an error (`KAGParser.cpp:209-219`).
+                        let Some(previous) = prev_label.clone() else {
+                            return Err(Error::CannotOmitFirstLabelName);
+                        };
+                        name = previous;
+                    }
+                    prev_label = Some(name.clone());
+                    // Duplicate labels suffix `:2`, `:3`, ... and the first
+                    // occurrence keeps the bare name (`KAGParser.cpp:193-238`).
+                    let count = label_counts.entry(name.clone()).or_insert(0);
+                    *count += 1;
+                    let alias = if *count > 1 {
+                        format!("{name}:{count}")
+                    } else {
+                        name
+                    };
+                    labels.insert(alias.clone(), events.len());
+                    events.push(Event::Label {
+                        name: alias,
+                        macro_name,
+                        line: lineno,
+                    });
+                    cols.push(0);
+                }
             }
             Some('%') => {
                 let (name, args) = parse_directive(content);
