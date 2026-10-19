@@ -183,6 +183,15 @@ extern "C" fn layer_begin_transition(
             let scene = scene_mut(&ctx)?;
             scene.inc_cache_enabled_count(id);
             scene.inc_cache_enabled_count(source);
+        } else {
+            // Without children the frame blends the two MainImages beside the
+            // layer's live children, so the layer has no display bitmap to
+            // draw that blend from: the transition advances and tears down, but
+            // no frame is drawn.
+            log::warn!(
+                "Layer.beginTransition: a transition without children has no display bitmap; \
+                 both main images and the layer's children keep drawing unchanged"
+            );
         }
         // SAFETY: the caller resolved `ctx` from the installed binding.
         let mut extras = unsafe { ctx.services() }.state::<LayerExtras>();
@@ -674,12 +683,12 @@ fn object_alive(ctx: &crate::CompatCtx, kind: ObjectKind, id: u32) -> bool {
 /// Advance every active transition by `dt_ms` and tear down the finished or
 /// stopped ones.
 ///
-/// Each step renders one frame through [`Trans::apply`] — the reference's
-/// `iTVPDivisibleTransHandler::Process` writing into the destination layer —
-/// so a running transition is visible frame by frame, and the frame it
-/// completes on leaves the destination holding source 2 verbatim (the
-/// reference's `Phase == PhaseMax` short-circuit,
-/// `reference/cpp/core/visual/TransIntf.cpp:596-601`).
+/// Each step renders one frame through [`Trans::apply`] into the
+/// destination's transition frame, so a running whole-subtree transition is
+/// visible frame by frame; the frame it completes on is released with the
+/// caches, so the next projection draws the live subtree. A transition
+/// without children draws no frame of its own (see
+/// [`composite_transition`]).
 ///
 /// Like the reference's per-tick `InvokeTransition`
 /// (`LayerIntf.cpp:8047-8061`), a transition whose destination node is no
@@ -1083,20 +1092,19 @@ fn dispatch_transition_completed(ctx: &crate::CompatCtx, dest: u32, src: u32) {
     // `target` drops here, releasing its retention (never consumed).
 }
 
-/// Render one transition frame into the destination layer's image.
+/// Render one transition frame.
 ///
-/// Without children, `src1` is the destination's own MainImage and `src2`
-/// the `transwith` layer's, exactly as the reference captures them in
-/// `StartTransition`. With children, each endpoint is first rendered into
-/// its composited content — the reference `Complete`
-/// (`LayerIntf.cpp:7673-7755`), reused while the subtree is unchanged — and
-/// the blend is drawn into the destination's frame, which the projection
-/// draws in place of the subtree. The two cached contents are read in place:
-/// neither is copied per frame.
+/// A whole-subtree transition first renders each endpoint into its composited
+/// content, reused while the subtree is unchanged, and blends the two into the
+/// destination's own transition frame — the bitmap the projection draws in
+/// place of the subtree until the caches are released. A trivial layer's
+/// content is its MainImage: it is read as the blend source and never written,
+/// and the blend frame is allocated separately from the content it reads.
 ///
-/// A trivial destination (`Complete` returns its MainImage,
-/// `LayerIntf.cpp:7718-7725`) is blended into that MainImage, which the
-/// projection already draws.
+/// A transition without children blends the two MainImages, which the layer
+/// itself draws with its children live beside them, so there is no display
+/// bitmap the blend could be drawn from: this frame leaves both MainImages
+/// untouched and composes nothing.
 fn composite_transition(
     ctx: &crate::CompatCtx,
     id: u32,
@@ -1104,92 +1112,47 @@ fn composite_transition(
     trans: &Trans,
     with_children: bool,
 ) -> Result<(), String> {
-    let scene = scene_mut(ctx)?;
-    if with_children {
-        // `render_layer_subtree` returns the composited subtree content (the
-        // reference `Complete`), reusing it while the subtree is unchanged.
-        let dst_content = crate::engine_api::layer_ops::render_layer_subtree(scene, id)
-            .ok_or_else(|| {
-                "Layer.beginTransition: cannot render the destination subtree".to_string()
-            })?;
-        let src_content = crate::engine_api::layer_ops::render_layer_subtree(scene, source)
-            .ok_or_else(|| {
-                "Layer.beginTransition: cannot render the transition source subtree".to_string()
-            })?;
-        // The source layer draws its rendered content.
-        scene.set_cache_bitmap(source, Some(src_content));
-        // A trivial destination has no content bitmap: `Complete` returns the
-        // MainImage, which is the bitmap the transition draws into.
-        let dst_is_main = scene.layer(id).and_then(|layer| layer.bitmap) == Some(dst_content);
-        if dst_is_main {
-            let (Some(src1), Some(src2)) = (
-                scene.bitmap(dst_content).cloned(),
-                scene.bitmap(src_content).cloned(),
-            ) else {
-                return Err(
-                    "Layer.beginTransition: the transition cache bitmap is missing".to_string(),
-                );
-            };
-            let Some(dst) = scene.bitmap_mut(dst_content) else {
-                return Err(
-                    "Layer.beginTransition: the transition destination bitmap is missing"
-                        .to_string(),
-                );
-            };
-            let region = Trans::full_region(dst);
-            return trans
-                .apply(dst, &src1, &src2, region)
-                .map_err(|error| error.to_string());
-        }
-        // A non-trivial destination blends the two cached contents into the
-        // frame the projection draws, reading both sources in place.
-        let (w, h) = {
-            let bitmap = scene.bitmap(dst_content).ok_or_else(|| {
-                "Layer.beginTransition: the transition destination cache is missing".to_string()
-            })?;
-            (bitmap.width, bitmap.height)
-        };
-        let display = crate::engine_api::layer_ops::ensure_transition_display(scene, id, w, h)
-            .ok_or_else(|| {
-                "Layer.beginTransition: cannot allocate the transition frame".to_string()
-            })?;
-        let applied = scene
-            .bitmap_mut_with_refs(display, dst_content, src_content)
-            .map(|(dst, src1, src2)| {
-                let region = Trans::full_region(dst);
-                trans.apply(dst, src1, src2, region)
-            });
-        return match applied {
-            Some(Ok(())) => Ok(()),
-            Some(Err(error)) => Err(error.to_string()),
-            None => {
-                Err("Layer.beginTransition: the transition bitmaps are not distinct".to_string())
-            }
-        };
+    if !with_children {
+        // Both endpoints' images stay read-only: a MainImage is what script
+        // pixel reads, saves and piled copies observe.
+        return Ok(());
     }
-    let (Some(dst_layer), Some(src_layer)) = (scene.layer(id), scene.layer(source)) else {
-        return Err("Layer.beginTransition: the transition layer no longer exists".to_string());
-    };
-    let (Some(dst_id), Some(src2_id)) = (dst_layer.bitmap, src_layer.bitmap) else {
-        return Err(
-            "Layer.beginTransition: Transition source and destination must have image".to_string(),
-        );
-    };
-    let (Some(src1), Some(src2)) = (
-        scene.bitmap(dst_id).cloned(),
-        scene.bitmap(src2_id).cloned(),
-    ) else {
-        return Err("Layer.beginTransition: a transition main image is missing".to_string());
-    };
-    let Some(dst) = scene.bitmap_mut(dst_id) else {
-        return Err(
-            "Layer.beginTransition: the transition destination bitmap is missing".to_string(),
-        );
-    };
-    let region = Trans::full_region(dst);
-    trans
-        .apply(dst, &src1, &src2, region)
-        .map_err(|error| error.to_string())
+    let scene = scene_mut(ctx)?;
+    // `render_layer_subtree` returns the composited subtree content, reusing it
+    // while the subtree is unchanged; a trivial layer's content is its
+    // MainImage.
+    let dst_content =
+        crate::engine_api::layer_ops::render_layer_subtree(scene, id).ok_or_else(|| {
+            "Layer.beginTransition: cannot render the destination subtree".to_string()
+        })?;
+    let src_content = crate::engine_api::layer_ops::render_layer_subtree(scene, source)
+        .ok_or_else(|| {
+            "Layer.beginTransition: cannot render the transition source subtree".to_string()
+        })?;
+    // The source layer draws its rendered content. A layer that is its own
+    // transition source keeps the destination's slots instead.
+    if source != id {
+        scene.set_cache_bitmap(source, Some(src_content));
+    }
+    // The blend needs a frame of its own, distinct from the content it reads,
+    // whatever the destination's content happens to be.
+    let (w, h) = scene
+        .bitmap(dst_content)
+        .map(|bitmap| (bitmap.width, bitmap.height))
+        .ok_or_else(|| {
+            "Layer.beginTransition: the transition destination content is missing".to_string()
+        })?;
+    let display = crate::engine_api::layer_ops::ensure_transition_display(scene, id, w, h)
+        .ok_or_else(|| "Layer.beginTransition: cannot allocate the transition frame".to_string())?;
+    match scene.bitmap_mut_with_refs(display, dst_content, src_content) {
+        Some((dst, src1, src2)) => {
+            let region = Trans::full_region(dst);
+            trans
+                .apply(dst, src1, src2, region)
+                .map_err(|error| error.to_string())
+        }
+        None => Err("Layer.beginTransition: the transition bitmaps are not distinct".to_string()),
+    }
 }
 
 fn d(name: &'static str, f: tjs::NativeInstanceMethodFn) -> NativeInstanceMethodDef {

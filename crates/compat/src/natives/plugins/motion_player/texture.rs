@@ -66,14 +66,26 @@ pub(crate) fn decode_pixels(
     }
     let rgba = match palette.filter(|palette| !palette.is_empty()) {
         Some(palette) => expand_palette(bytes, palette, count, compressed)?,
-        None if compressed => rl_decode(bytes, count, 4),
-        None => raw(bytes, count),
+        None if compressed => swap_red_blue(rl_decode(bytes, count, 4)),
+        None => swap_red_blue(raw(bytes, count)),
     };
     Ok(Pixels {
         width,
         height,
         rgba,
     })
+}
+
+/// Swap the red and blue channels of straight-alpha RGBA pixels.
+///
+/// The PSB raw/RL pixel chunks store their colour channels in B,G,R,A order;
+/// the scene bitmap stores R,G,B,A, so the two channels are exchanged once
+/// after decoding. The palette path already writes the scene order.
+fn swap_red_blue(mut rgba: Vec<u8>) -> Vec<u8> {
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    rgba
 }
 
 /// Copy `count` RGBA pixels from a raw chunk, zero-filling what is short.
@@ -191,7 +203,7 @@ mod tests {
         let out = decode_pixels(&[1, 2, 3, 4, 5, 6, 7, 8], None, 2, 1, false)
             .expect("a raw chunk decodes");
         assert_eq!((out.width, out.height), (2, 1));
-        assert_eq!(out.rgba, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(out.rgba, vec![3, 2, 1, 4, 7, 6, 5, 8]);
     }
 
     #[test]
@@ -228,6 +240,6 @@ mod tests {
         let empty: &[u8] = &[];
         let raw = decode_pixels(&[1, 2, 3, 4], Some(empty), 1, 1, false)
             .expect("an empty palette falls back to the raw chunk");
-        assert_eq!(raw.rgba, vec![1, 2, 3, 4]);
+        assert_eq!(raw.rgba, vec![3, 2, 1, 4]);
     }
 }

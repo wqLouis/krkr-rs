@@ -142,6 +142,16 @@ impl Env {
         );
         (bitmap.width, bitmap.height, bitmap.rgba.clone())
     }
+
+    /// The raw RGBA pixels of the layer bitmap with the given dimensions.
+    fn pixels_of(&self, width: u32, height: u32) -> &[u8] {
+        self._scene
+            .bitmaps
+            .iter()
+            .find(|bitmap| bitmap.width == width && bitmap.height == height)
+            .map(|bitmap| bitmap.rgba.as_slice())
+            .expect("the target bitmap")
+    }
 }
 
 #[test]
@@ -379,9 +389,9 @@ fn player_draw_samples_the_icon_texture() {
     // icon pixels, so an opaque texel keeps alpha 255
     // (`reference/cpp/plugins/motionplayer/PlayerInternal.h:1693-1745`).
     assert_eq!(
-        texel(20, 300)[3],
-        255,
-        "an opaque texel of the body icon must stay opaque"
+        texel(20, 300),
+        [221, 255, 255, 255],
+        "the drawn texel keeps the scene RGBA channels"
     );
     // A solid quad would paint every covered pixel with one value; the
     // texture carries thousands of distinct colours.
@@ -429,6 +439,105 @@ fn player_draw_applies_the_draw_affine_translate() {
     // nothing else covers x=820 in the untranslated frame.
     assert_eq!(alpha(&plain, 820, 300), 0, "the untranslated spot is empty");
     assert_eq!(alpha(&moved, 820, 300), 255, "the affine moves the icon");
+}
+
+#[test]
+fn player_draw_clears_the_target_before_compositing() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    // A fully red target with a player that paints no node: the reference
+    // clears the render layer before compositing, so the old red pose must not
+    // survive (`reference/cpp/plugins/motionplayer/PlayerRenderInternal.cpp:369-387`,
+    // `PlayerRenderExecute.cpp:421-422`).
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var w = new Window(); \
+         var target = new Layer(w, null); \
+         target.setSize(800, 1080); \
+         target.fillRect(0, 0, 800, 1080, 0xFFFF0000); \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\"; \
+         p.setOpacity(0); \
+         p.draw(new Motion.SeparateLayerAdaptor(target));"
+    ));
+    let pixels = env.pixels_of(800, 1080);
+    for (x, y) in [(10usize, 10usize), (400, 540), (790, 1070)] {
+        let offset = (y * 800 + x) * 4;
+        assert_eq!(
+            &pixels[offset..offset + 4],
+            &[0, 0, 0, 0],
+            "pixel ({x},{y}) keeps the prefilled red pose"
+        );
+    }
+}
+
+#[test]
+fn player_draw_leaves_the_target_layer_geometry_and_visibility_alone() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    // The reference sizes and paints the target image; it does not move the
+    // target layer (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:1094-1135`,
+    // `PlayerDrawDispatch.cpp:236-285`).
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var w = new Window(); \
+         var target = new Layer(w, null); \
+         target.setSize(800, 1080); \
+         target.left = 7; \
+         target.top = 9; \
+         target.visible = false; \
+         target.opacity = 64; \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\"; \
+         p.draw(new Motion.SeparateLayerAdaptor(target));"
+    ));
+    assert_eq!(env.eval_int("target.left"), 7);
+    assert_eq!(env.eval_int("target.top"), 9);
+    assert_eq!(env.eval_int("target.width"), 800);
+    assert_eq!(env.eval_int("target.height"), 1080);
+    assert_eq!(env.eval_int("target.opacity"), 64);
+    assert_eq!(env.eval_int("target.visible ? 1 : 0"), 0);
+}
+
+#[test]
+fn player_draw_marks_the_target_image_modified() {
+    let _lock = vm_lock();
+    let mut env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var w = new Window(); \
+         var target = new Layer(w, null); \
+         target.setSize(800, 1080); \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\"; \
+         p.draw(new Motion.SeparateLayerAdaptor(target));"
+    ));
+    let layer_id = env._scene.layers.last().expect("the target layer").id;
+    let bitmap_id = env
+        ._scene
+        .layer(layer_id)
+        .and_then(|layer| layer.bitmap)
+        .expect("the target bitmap");
+    // Writes through `GetMainImagePixelBufferForWrite` set `ImageModified`
+    // (`reference/cpp/core/visual/LayerIntf.cpp:3012-3016`); the bitmap dirty
+    // flag makes the renderer re-upload it.
+    env._scene
+        .layer_mut(layer_id)
+        .expect("target")
+        .image_modified = false;
+    env._scene
+        .bitmap_mut(bitmap_id)
+        .expect("target bitmap")
+        .dirty = false;
+    env.run("p.draw(new Motion.SeparateLayerAdaptor(target));");
+    assert!(env._scene.layer(layer_id).expect("target").image_modified);
+    assert!(env._scene.bitmap(bitmap_id).expect("target bitmap").dirty);
 }
 
 #[test]

@@ -1124,8 +1124,7 @@ mp_method_void!(
         // (`reference/cpp/plugins/motionplayer/Player.h:324`).
         super::helpers::require_args(args, 1, "frameProgress")?;
         let dt = value_as_f64(&args[0]);
-        p.current_frame += dt;
-        p.update_layers();
+        p.frame_progress(dt);
         Ok(())
     }
 );
@@ -1309,12 +1308,9 @@ fn skip_to_sync(p: &mut PlayerInst) {
             state.playing = false;
         }
     }
-    p.current_frame = sync;
     p.sync_waiting = false;
     p.sync_active = false;
-    p.playing_timelines
-        .retain(|label| p.timelines.get(label).is_some_and(|state| state.playing));
-    p.allplaying = !p.playing_timelines.is_empty();
+    p.prune_playing_timelines();
 }
 
 mp_method_void!(
@@ -1650,6 +1646,7 @@ mp_method_int!(
         // The reference lazily resolves the active motion first
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:150-151`).
         p.ensure_motion_loaded(ctx)?;
+        p.prune_playing_timelines();
         Ok(p.playing_timelines.len() as i64)
     }
 );

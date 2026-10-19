@@ -106,6 +106,9 @@ pub(crate) struct Frame {
     pub(crate) time: f64,
     /// `0` invisible, `2` static, `3` interpolate.
     pub(crate) frame_type: i32,
+    /// Whether the frame carries a `content` dictionary. A frame without
+    /// content is a terminator, not a keyframe.
+    pub(crate) has_content: bool,
     /// The icon source reference (`src/<chara>/<icon>`).
     pub(crate) src: String,
     /// The child motion clip label a `motion/<chara>/<clip>` source names.
@@ -147,6 +150,7 @@ impl Default for Frame {
         Self {
             time: 0.0,
             frame_type: 0,
+            has_content: false,
             src: String::new(),
             child_motion: None,
             blend_mode: 16,
@@ -173,6 +177,10 @@ impl Default for Frame {
 pub(crate) struct FrameState {
     /// Whether the frame is visible.
     pub(crate) active: bool,
+    /// Clip origin x (`ox`).
+    pub(crate) ox: f64,
+    /// Clip origin y (`oy`).
+    pub(crate) oy: f64,
     /// Position.
     pub(crate) x: f64,
     /// Position.
@@ -207,6 +215,8 @@ impl Default for FrameState {
     fn default() -> Self {
         Self {
             active: true,
+            ox: 0.0,
+            oy: 0.0,
             x: 0.0,
             y: 0.0,
             z: 0.0,
@@ -940,18 +950,18 @@ pub(crate) fn step_timelines(
         state.current_time = wrapped;
         if !state.looping && !keep {
             state.playing = false;
+            events.push(MotionEvent {
+                kind: 1,
+                param1: label,
+                param2: String::new(),
+            });
         }
-        step_timeline_controls(state, &tracks, dt, &mut events);
+        step_timeline_controls(state, &tracks, dt);
     }
     events
 }
 
-fn step_timeline_controls(
-    state: &mut TimelineState,
-    tracks: &[TimelineTrack],
-    dt: f64,
-    events: &mut Vec<MotionEvent>,
-) {
+fn step_timeline_controls(state: &mut TimelineState, tracks: &[TimelineTrack], dt: f64) {
     if state.track_animators.len() < tracks.len() {
         state
             .track_animators
@@ -982,19 +992,43 @@ fn step_timeline_controls(
                 animator.set(frame.value);
             }
             animator.step(dt as f32);
-            if let Some(action) = frame_action(track, frame) {
-                events.push(MotionEvent {
-                    kind: 0,
-                    param1: action,
-                    param2: track.label.clone(),
-                });
-            }
         }
     }
 }
 
-fn frame_action(_track: &TimelineTrack, _frame: &TimelineFrame) -> Option<String> {
-    None
+/// Collect the action and sync events whose keyframe time is crossed when the
+/// evaluation clock advances from `previous` to `current`.
+pub(crate) fn scan_frame_events(
+    nodes: &[MotionNode],
+    previous: f64,
+    current: f64,
+) -> Vec<MotionEvent> {
+    let mut events = Vec::new();
+    if current <= previous {
+        return events;
+    }
+    for node in nodes {
+        for frame in &node.frames {
+            if frame.time <= previous || frame.time > current {
+                continue;
+            }
+            if !frame.action.is_empty() {
+                events.push(MotionEvent {
+                    kind: 0,
+                    param1: frame.action.clone(),
+                    param2: node.label.clone(),
+                });
+            }
+            if frame.has_sync {
+                events.push(MotionEvent {
+                    kind: 1,
+                    param1: node.label.clone(),
+                    param2: String::new(),
+                });
+            }
+        }
+    }
+    events
 }
 
 /// A pending action/sync event.
@@ -1096,6 +1130,9 @@ fn parse_frames(value: Option<&PsbValue>) -> Vec<Frame> {
         let mut frame = Frame {
             time: number_of(item.get("time")).unwrap_or(0.0),
             frame_type: number_of(item.get("type")).unwrap_or(0.0) as i32,
+            has_content: item
+                .get("content")
+                .is_some_and(|content| !matches!(content, PsbValue::Null)),
             ..Frame::default()
         };
         if let Some(content) = item.get("content") {
@@ -1149,6 +1186,11 @@ fn coord_number(coord: &PsbValue, index: usize) -> f64 {
 }
 
 /// Evaluate a node's frame state at `time` frames.
+///
+/// The last entry of a multi-frame list is a terminator: it is never selected
+/// as the active frame, so a trailing contentless frame leaves the last
+/// content frame held. Interpolation only runs toward a frame that carries
+/// content.
 pub(crate) fn evaluate_frames(frames: &[Frame], time: f64) -> FrameState {
     if frames.is_empty() {
         return FrameState::default();
@@ -1161,9 +1203,20 @@ pub(crate) fn evaluate_frames(frames: &[Frame], time: f64) -> FrameState {
             break;
         }
     }
+    if frames.len() > 1 {
+        active_index = active_index.min(frames.len() - 2);
+    }
     let active = &frames[active_index];
+    if !active.has_content {
+        return FrameState {
+            active: false,
+            src: active.src.clone(),
+            ..FrameState::default()
+        };
+    }
     if active.frame_type == 3
-        && let Some(next) = frames.iter().find(|frame| frame.time > time)
+        && let Some(next) = frames.get(active_index + 1)
+        && next.has_content
     {
         let start = active.time;
         let span = next.time - start;
@@ -1174,15 +1227,10 @@ pub(crate) fn evaluate_frames(frames: &[Frame], time: f64) -> FrameState {
         };
         return interpolate(active, next, t);
     }
-    if active.frame_type == 0 {
-        return FrameState {
-            active: false,
-            src: active.src.clone(),
-            ..FrameState::default()
-        };
-    }
     FrameState {
         active: true,
+        ox: active.ox,
+        oy: active.oy,
         x: active.x,
         y: active.y,
         z: active.z,
@@ -1204,6 +1252,8 @@ fn interpolate(a: &Frame, b: &Frame, t: f64) -> FrameState {
     let lerp = |from: f64, to: f64| from + (to - from) * t;
     FrameState {
         active: true,
+        ox: lerp(a.ox, b.ox),
+        oy: lerp(a.oy, b.oy),
         x: lerp(a.x, b.x),
         y: lerp(a.y, b.y),
         z: lerp(a.z, b.z),
@@ -1214,7 +1264,11 @@ fn interpolate(a: &Frame, b: &Frame, t: f64) -> FrameState {
         scale_y: lerp(a.scale_y, b.scale_y),
         opacity: lerp(a.opacity, b.opacity),
         blend_mode: a.blend_mode,
-        src: a.src.clone(),
+        src: if a.src.is_empty() {
+            b.src.clone()
+        } else {
+            a.src.clone()
+        },
         action: a.action.clone(),
         has_sync: a.has_sync,
         mask: a.mask,
@@ -1532,18 +1586,106 @@ mod tests {
             Frame {
                 time: 0.0,
                 frame_type: 2,
+                has_content: true,
                 ..Frame::default()
             },
             Frame {
                 time: 10.0,
                 frame_type: 2,
+                has_content: true,
                 x: 5.0,
+                ..Frame::default()
+            },
+            Frame {
+                time: 20.0,
+                frame_type: 0,
                 ..Frame::default()
             },
         ];
         assert_eq!(evaluate_frames(&frames, 0.0).x, 0.0);
-        assert_eq!(evaluate_frames(&frames, 10.0).x, 5.0);
         assert_eq!(evaluate_frames(&frames, 9.0).x, 0.0);
+        // The last entry is a terminator, never an active keyframe
+        // (`reference/cpp/plugins/motionplayer/PlayerUpdateLayerEval.cpp:282-311`).
+        assert_eq!(evaluate_frames(&frames, 10.0).x, 5.0);
+        assert_eq!(evaluate_frames(&frames, 1_000_000.0).x, 5.0);
+    }
+
+    #[test]
+    fn a_trailing_contentless_logo_frame_holds_the_last_content_pose() {
+        // `title_bg` `char_move`/`logo`: t=40 fades a 1.1x logo to opacity 0,
+        // t=75 restores it, and the trailing t=120 frame has no content. The
+        // reference holds the t=75 pose to the end of the clip
+        // (`reference/cpp/plugins/motionplayer/PlayerUpdateLayerEval.cpp:282-311`,
+        // `PlayerUpdateLayerEval.cpp:447-449`).
+        let frames = vec![
+            Frame {
+                time: 0.0,
+                frame_type: 0,
+                has_content: true,
+                ..Frame::default()
+            },
+            Frame {
+                time: 40.0,
+                frame_type: 3,
+                has_content: true,
+                x: -705.0,
+                y: -388.0,
+                scale_x: 1.1,
+                scale_y: 1.1,
+                opacity: 0.0,
+                ..Frame::default()
+            },
+            Frame {
+                time: 75.0,
+                frame_type: 3,
+                has_content: true,
+                x: -705.0,
+                y: -388.0,
+                ..Frame::default()
+            },
+            Frame {
+                time: 120.0,
+                frame_type: 0,
+                ..Frame::default()
+            },
+        ];
+        for time in [97.0, 119.9, 120.0, 1_000_000.0] {
+            let state = evaluate_frames(&frames, time);
+            assert!(state.active, "t={time} must hold a content frame");
+            assert_eq!(state.x, -705.0, "t={time}");
+            assert_eq!(state.y, -388.0, "t={time}");
+            assert_eq!(state.scale_x, 1.0, "t={time}");
+            assert_eq!(state.scale_y, 1.0, "t={time}");
+            assert_eq!(state.opacity, 1.0, "t={time}");
+        }
+    }
+
+    #[test]
+    fn content_presence_decides_visibility_for_a_one_frame_clip() {
+        // A frame with content is visible even when its type is 0; a frame
+        // without content is the terminator/invisible frame
+        // (`reference/cpp/plugins/motionplayer/PlayerInternal.h:1278`,
+        // `PlayerUpdateLayerEval.cpp:447-449`).
+        let visible = vec![Frame {
+            time: 0.0,
+            frame_type: 0,
+            has_content: true,
+            x: -705.0,
+            y: -388.0,
+            ..Frame::default()
+        }];
+        for time in [0.0, 100.0] {
+            let state = evaluate_frames(&visible, time);
+            assert!(state.active);
+            assert_eq!(state.x, -705.0);
+        }
+        let hidden = vec![Frame {
+            time: 0.0,
+            frame_type: 0,
+            has_content: false,
+            ..Frame::default()
+        }];
+        assert!(!evaluate_frames(&hidden, 0.0).active);
     }
 
     fn node_labels(nodes: &[MotionNode]) -> Vec<&str> {

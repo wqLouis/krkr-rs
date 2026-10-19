@@ -131,6 +131,24 @@ fn tlg5_rgba_roundtrip() {
 }
 
 #[test]
+fn tlg5_block_height_larger_than_the_image_roundtrip() {
+    // A small icon can be encoded with a block height above its own height.
+    // The reference decodes it as one clipped block; rejecting it makes valid
+    // game assets unloadable.
+    let (w, h) = (9usize, 7usize);
+    let img = test_image(w, h);
+    let encoded = encode_tlg5(&img, w, h, 4, 12);
+    let media = Media::new();
+    let decoded = decode_image(&media, &encoded, None)
+        .expect("a block height larger than the image is legal TLG5");
+    assert_eq!((decoded.width as usize, decoded.height as usize), (w, h));
+    assert_eq!(
+        decoded.rgba, img,
+        "clipped-block TLG5 round trip must be lossless"
+    );
+}
+
+#[test]
 fn tlg5_rgb_roundtrip() {
     let (w, h) = (21usize, 19usize);
     let mut img = test_image(w, h);
@@ -181,12 +199,12 @@ fn garbage_inputs_return_err() {
             v
         },
         {
-            // TLG5 with an out-of-range block height (larger than the image)
+            // TLG5 with a zero block height
             let mut v = b"TLG5.0\x00raw\x1a".to_vec();
             v.push(4); // 4 channels
             v.extend_from_slice(&8i32.to_le_bytes()); // width
             v.extend_from_slice(&8i32.to_le_bytes()); // height
-            v.extend_from_slice(&12i32.to_le_bytes()); // block height > height
+            v.extend_from_slice(&0i32.to_le_bytes()); // zero block height
             v.extend_from_slice(&0i32.to_le_bytes()); // empty block-size table
             v
         },

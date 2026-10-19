@@ -160,13 +160,6 @@ impl Env {
         }
     }
 
-    fn eval_str(&self, expression: &str) -> String {
-        match self.eval_ok(expression) {
-            TjsValue::String(value) => value,
-            other => panic!("{expression:?} returned {other:?}, expected a string"),
-        }
-    }
-
     fn error(&self, expression: &str) -> String {
         self.eval(expression)
             .expect_err(&format!("{expression:?} should have raised"))
@@ -195,8 +188,8 @@ fn two_layers(env: &Env, size: i64) {
 fn two_layers_with(env: &Env, size: i64, preamble: &str) {
     env.run(&format!(
         "var w = new Window(); {preamble} \
-         var a = new Layer(w, null); a.setSize({size}, {size}); a.setImageSize({size}, {size}); \
-         var b = new Layer(w, null); b.setSize({size}, {size}); b.setImageSize({size}, {size}); b.visible = true; \
+         var a = new Layer(w, null); a.setSize({size}, {size}); a.setImageSize({size}, {size}); a.name = 'src'; \
+         var b = new Layer(w, null); b.setSize({size}, {size}); b.setImageSize({size}, {size}); b.visible = true; b.name = 'dest'; \
          for (var i = 0; i < {size} * {size}; i++) {{ \
              b.setMainPixel(i % {size}, i / {size}, {RED}); \
              a.setMainPixel(i % {size}, i / {size}, {BLUE}); \
@@ -219,14 +212,6 @@ fn counter(env: &Env) {
     );
 }
 
-/// Every `getMainPixel` of `layer` as one comma-joined string.
-fn grid(env: &Env, layer: &str, size: i64) -> String {
-    env.eval_str(&format!(
-        "(function() {{ var s = ''; for (var y = 0; y < {size}; y++) \
-         for (var x = 0; x < {size}; x++) s += {layer}.getMainPixel(x, y) + ','; return s; }})()"
-    ))
-}
-
 /// The reference const-alpha blend per channel,
 /// `s1 + ((s2 - s1) * opa >> 8)` (`reference/cpp/plugins/common.h:17-29`,
 /// the `TVPConstAlphaBlend_SD` arithmetic of
@@ -241,11 +226,14 @@ fn blend_rgb(s1: i64, s2: i64, opa: i32) -> i64 {
     out
 }
 
-/// A scene layer by its script `name`.
+/// The most recently created scene layer carrying the script `name`: a test
+/// that builds several windows of `a`/`b` layers reuses those names, and the
+/// newest window's layers are appended after the earlier ones.
 fn named_layer<'a>(env: &'a Env, name: &str) -> &'a engine::LayerState {
     env._scene
         .layers
         .iter()
+        .rev()
         .find(|layer| layer.name == name)
         .unwrap_or_else(|| panic!("layer {name:?} not found"))
 }
@@ -254,6 +242,31 @@ fn named_layer<'a>(env: &'a Env, name: &str) -> &'a engine::LayerState {
 /// `None` before the first frame and after the teardown.
 fn cache_bitmap_of(env: &Env, name: &str) -> Option<u32> {
     named_layer(env, name).cache_bitmap
+}
+
+/// The bitmap a whole-subtree transition blends into: the destination's own
+/// frame, which the projection draws in place of the layer's subtree while the
+/// transition runs (`reference/cpp/core/visual/LayerIntf.cpp:7221-7226`).
+fn transition_frame(env: &Env, name: &str) -> u32 {
+    cache_bitmap_of(env, name).unwrap_or_else(|| panic!("{name} has no transition frame"))
+}
+
+/// The `0xRRGGBB` colour of `name`'s transition frame at `(x, y)`.
+fn frame_pixel(env: &Env, name: &str, x: u32, y: u32) -> i64 {
+    scene_pixel(env, transition_frame(env, name), x, y)
+}
+
+/// Every pixel of `name`'s transition frame as one comma-joined string.
+fn frame_grid(env: &Env, name: &str, size: i64) -> String {
+    let frame = transition_frame(env, name);
+    let size = u32::try_from(size).expect("grid size");
+    let mut out = String::new();
+    for y in 0..size {
+        for x in 0..size {
+            out.push_str(&format!("{},", scene_pixel(env, frame, x, y)));
+        }
+    }
+    out
 }
 
 /// The `0xRRGGBB` colour of a scene bitmap at `(x, y)`.
@@ -352,9 +365,10 @@ fn an_empty_method_name_is_the_reference_crossfade_default() {
         1,
         "the empty-method transition completed"
     );
-    // The crossfade endpoint is source 2 verbatim
-    // (`reference/cpp/core/visual/TransIntf.cpp:596-601`).
-    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), BLUE);
+    // Without children the frame blends the two main images into a temporary
+    // that is never stored on either layer (`LayerIntf.cpp:6721-6744`), so the
+    // destination's own image is untouched when the transition ends.
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
 }
 
 /// `StartTransition` refuses to begin while the layer is already in a
@@ -483,6 +497,55 @@ fn with_children_is_read_at_argument_one() {
     // the teardown releases the cache consumers.
     env.run("b.beginTransition('crossfade', void, a, %[time: 100]); b.stopTransition();");
     assert_eq!(named_layer(&env, "dest").cache_enabled_count, 0);
+}
+
+/// Without children both endpoints are required to have a main image
+/// (`LayerIntf.cpp:7860-7868`) and the blend reads them as `Src1`/`Src2` into a
+/// temporary that `DrawSelf` hands to the draw target (`:6750-6768`): neither
+/// layer's own image is ever the target, and the layer's children keep drawing
+/// live beside the result (`:7278-7309`). The `ttExchange` teardown uses `Swap`
+/// (`Exchange(target, true)`, `LayerIntf.h:260-263`), which moves the two
+/// layers' children to the other layer.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:6721-6773
+/// reference/cpp/core/visual/LayerIntf.cpp:7860-7868
+#[test]
+fn a_transition_without_children_leaves_both_main_images_live() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var a = new Layer(w, null); a.setSize(2, 2); a.setImageSize(2, 2); a.name = 'src'; \
+         var b = new Layer(w, null); b.setSize(2, 2); b.setImageSize(2, 2); b.visible = true; b.name = 'dest'; \
+         for (var i = 0; i < 4; i++) { b.setMainPixel(i % 2, i / 2, 0xff0000); a.setMainPixel(i % 2, i / 2, 0x0000ff); } \
+         var bc = new Layer(w, b); bc.setSize(2, 2); bc.setImageSize(2, 2); bc.name = 'ctl'; \
+         bc.fillRect(0, 0, 1, 1, 0xff00ff00); bc.visible = true; \
+         b.beginTransition('crossfade', false, a, %[time: 100]);",
+    );
+    counter(&env);
+    env.advance(50.0);
+    // The transition has been running for half its duration, but no frame is
+    // stored on either layer: both main images still hold their own pixels,
+    // and the visible child is untouched and still under the destination.
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
+    assert_eq!(env.eval_int("a.getMainPixel(0, 0)"), BLUE);
+    assert_eq!(env.eval_int("bc.getMainPixel(0, 0)"), 0x00ff00);
+    assert_eq!(
+        named_layer(&env, "ctl").parent,
+        Some(named_layer(&env, "dest").id)
+    );
+
+    env.advance(50.0);
+    assert_eq!(env.eval_int("hits"), 1, "the transition completed");
+    assert_eq!(
+        env.eval_int("b.getMainPixel(0, 0)"),
+        RED,
+        "the destination image survives the whole transition"
+    );
+    assert!(
+        cache_bitmap_of(&env, "dest").is_none(),
+        "a childless transition allocates no display frame"
+    );
 }
 
 /// With `withchildren = true` (the default) `StartTransition` transitions the
@@ -636,6 +699,76 @@ fn with_children_rebuilds_when_a_drawn_child_changes() {
     );
 }
 
+/// A destination that is trivial while its control layer is hidden and
+/// becomes a real subtree when the control appears: `Complete` returns the
+/// MainImage while no child is visible and the rebuilt `CacheBitmap` once one
+/// is (`LayerIntf.cpp:7725-7737`), and the blend always goes into the
+/// destination's own frame (`tTransDrawable::DrawCompleted`, `:8206-8249`).
+/// Showing the control mid-transition must neither drop it nor leave the
+/// half-blended frame behind: the frame is recomposited with the control, and
+/// the teardown hands the projection the live subtree with every control
+/// present and the original main image intact.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7673-7737
+/// reference/cpp/core/visual/LayerIntf.cpp:8154-8249
+#[test]
+fn a_destination_that_shows_a_hidden_control_mid_transition_ends_clean() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var a = new Layer(w, null); a.setSize(4, 4); a.setImageSize(4, 4); a.name = 'src'; \
+         a.fillRect(0, 0, 4, 4, 0xff0000ff); \
+         var b = new Layer(w, null); b.setSize(4, 4); b.setImageSize(4, 4); b.visible = true; b.name = 'dest'; \
+         b.fillRect(0, 0, 4, 4, 0xffff0000); \
+         var bc = new Layer(w, b); bc.setSize(2, 2); bc.setImageSize(2, 2); bc.name = 'ctl'; \
+         bc.fillRect(0, 0, 2, 2, 0xff00ff00); bc.visible = false; \
+         b.beginTransition('crossfade', true, a, %[time: 100]);",
+    );
+    // 25 ms into a 100 ms cross-fade is phase 64. No child is visible, so the
+    // destination content is its MainImage and the frame is the pure blend.
+    env.advance(25.0);
+    assert_eq!(frame_pixel(&env, "dest", 1, 1), blend_rgb(RED, BLUE, 64));
+    assert_eq!(
+        env.eval_int("b.getMainPixel(1, 1)"),
+        RED,
+        "the main image is never the blend target"
+    );
+
+    // The control appears: the next frame recomposites the subtree, so the
+    // control is part of the blend rather than missing from it.
+    env.run("bc.visible = true;");
+    env.advance(25.0);
+    assert_eq!(
+        frame_pixel(&env, "dest", 0, 0),
+        blend_rgb(0x00ff00, BLUE, 128),
+        "the control recomposited under the blend"
+    );
+    assert_eq!(
+        frame_pixel(&env, "dest", 3, 3),
+        blend_rgb(RED, BLUE, 128),
+        "the rest of the destination content"
+    );
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
+
+    // Completion releases the frame: the projection draws the live subtree,
+    // which still carries the control and the original image — no ghost of
+    // the last blended frame.
+    env.advance(50.0);
+    assert!(
+        cache_bitmap_of(&env, "dest").is_none(),
+        "no frame left behind"
+    );
+    assert_eq!(named_layer(&env, "dest").cache_enabled_count, 0);
+    assert_eq!(
+        env.eval_int("bc.getMainPixel(0, 0)"),
+        0x00ff00,
+        "the control is still there"
+    );
+    assert_eq!(env.eval_int("bc.visible"), 1, "and still visible");
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
+}
+
 /// The exact game path (`system/advscreen.tjs:216-217,3353,3719`: the source
 /// is the whole-screen container, whose content lives in child layers and
 /// which has no main image of its own). `withchildren = true` must accept it
@@ -702,36 +835,52 @@ fn exchange_reparents_non_sibling_layers() {
 // Endpoint short-circuits
 // ---------------------------------------------------------------------------
 
-/// `tTVPCrossFadeTransHandler::Process`: at `Phase == 0` the destination is
-/// source 1 verbatim — the advance at time 0 changes nothing.
+/// `tTVPCrossFadeTransHandler::Process` copies source 1 into the destination
+/// **frame** at `Phase == 0` (`TransIntf.cpp:578-594`) and source 2 verbatim
+/// at `Phase == PhaseMax` (`:596-601`). `Complete` returns a trivial layer's
+/// MainImage as an endpoint of the blend, never as its target
+/// (`LayerIntf.cpp:7725-7732`), and the blend is drawn into the parent drawable
+/// or a temporary (`tTransDrawable::DrawCompleted`, `:8206-8249`) — so the
+/// MainImage keeps its original pixels through the whole transition.
 ///
-/// reference/cpp/core/visual/TransIntf.cpp:578-594
+/// reference/cpp/core/visual/LayerIntf.cpp:7673-7732
+/// reference/cpp/core/visual/LayerIntf.cpp:8154-8249
+/// reference/cpp/core/visual/TransIntf.cpp:578-601
 #[test]
-fn phase_zero_copies_source_one_exactly() {
+fn a_trivial_destination_keeps_its_main_image() {
     let _lock = vm_lock();
     let env = Env::new();
     two_layers(&env, 2);
+    counter(&env);
     env.run("b.beginTransition('crossfade', true, a, %[time: 100]);");
+
+    // Phase 0: the frame holds source 1 verbatim; the MainImage is untouched.
     env.advance(0.0);
+    assert_eq!(frame_pixel(&env, "dest", 0, 0), RED);
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
+
+    // 50 ms into a 100 ms cross-fade is phase 128: the frame holds the blend,
+    // every pixel read of the MainImage still sees the original image.
+    env.advance(50.0);
+    let expected = blend_rgb(RED, BLUE, 128);
+    for (x, y) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
+        assert_eq!(frame_pixel(&env, "dest", x, y), expected, "frame ({x},{y})");
+        assert_eq!(
+            env.eval_int(&format!("b.getMainPixel({x}, {y})")),
+            RED,
+            "the main image at ({x},{y}) is not the blend"
+        );
+    }
+
+    // The completed transition releases its frame with the caches
+    // (`DecCacheEnabledCount`, `LayerIntf.cpp:7961-7964`), so the projection
+    // draws the live subtree — whose image is still the destination's own.
+    env.advance(50.0);
+    assert_eq!(env.eval_int("hits"), 1, "the transition completed");
+    assert!(cache_bitmap_of(&env, "dest").is_none(), "frame released");
+    assert_eq!(named_layer(&env, "dest").cache_enabled_count, 0);
     assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
     assert_eq!(env.eval_int("b.getMainPixel(1, 1)"), RED);
-}
-
-/// `Process` at `Phase == PhaseMax` copies source 2 **verbatim** (the
-/// transition ends with the new image exactly, not a 255-ratio blend: a
-/// blend at `opa = 255` would leave the blue channel at 254 —
-/// `blend_rgb(RED, BLUE, 255)`).
-///
-/// reference/cpp/core/visual/TransIntf.cpp:596-601
-#[test]
-fn phase_max_copies_source_two_exactly() {
-    let _lock = vm_lock();
-    let env = Env::new();
-    two_layers(&env, 2);
-    env.run("b.beginTransition('crossfade', true, a, %[time: 100]);");
-    env.advance(100.0);
-    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), BLUE);
-    assert_eq!(env.eval_int("b.getMainPixel(1, 1)"), BLUE);
 }
 
 // ---------------------------------------------------------------------------
@@ -759,15 +908,15 @@ fn scroll_reads_the_reference_numeric_enums() {
     two_layers(&env, 4);
     env.run("b.beginTransition('scroll', true, a, %[time: 100]);");
     env.advance(50.0);
-    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), BLUE);
-    assert_eq!(env.eval_int("b.getMainPixel(3, 0)"), RED);
+    assert_eq!(frame_pixel(&env, "dest", 0, 0), BLUE);
+    assert_eq!(frame_pixel(&env, "dest", 3, 0), RED);
 
     // `from: 2` (sttRight): mirrored — red on the left, blue on the right.
     two_layers(&env, 4);
     env.run("b.beginTransition('scroll', true, a, %[time: 100, from: 2]);");
     env.advance(50.0);
-    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
-    assert_eq!(env.eval_int("b.getMainPixel(3, 0)"), BLUE);
+    assert_eq!(frame_pixel(&env, "dest", 0, 0), RED);
+    assert_eq!(frame_pixel(&env, "dest", 3, 0), BLUE);
 
     // `stay: 2` (ststStaySrc): source 1 (the destination's own red image)
     // slides right and keeps priority, so the left half shows the blue
@@ -776,16 +925,16 @@ fn scroll_reads_the_reference_numeric_enums() {
     two_layers(&env, 4);
     env.run("b.beginTransition('scroll', true, a, %[time: 100, stay: 2]);");
     env.advance(50.0);
-    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), BLUE);
-    assert_eq!(env.eval_int("b.getMainPixel(3, 0)"), RED);
+    assert_eq!(frame_pixel(&env, "dest", 0, 0), BLUE);
+    assert_eq!(frame_pixel(&env, "dest", 3, 0), RED);
 
     // The port's string aliases are a compat extension; they must agree
     // with the numeric form they stand for.
     two_layers(&env, 4);
     env.run("b.beginTransition('scroll', true, a, %[time: 100, from: 'right']);");
     env.advance(50.0);
-    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
-    assert_eq!(env.eval_int("b.getMainPixel(3, 0)"), BLUE);
+    assert_eq!(frame_pixel(&env, "dest", 0, 0), RED);
+    assert_eq!(frame_pixel(&env, "dest", 3, 0), BLUE);
 
     for (option, value) in [("from", 9), ("stay", 9)] {
         two_layers(&env, 4);
@@ -880,31 +1029,25 @@ fn universal_rule_image_is_loaded_grayscale_and_tiled() {
     env.run("b.beginTransition('universal', true, a, %[time: 100, rule: 'rule.img']);");
     env.advance(50.0);
     // Rule (0,0) = grey 0 → opacity 255: the blue source at full blend.
-    assert_eq!(
-        env.eval_int("b.getMainPixel(0, 0)"),
-        blend_rgb(RED, BLUE, 255)
-    );
+    assert_eq!(frame_pixel(&env, "dest", 0, 0), blend_rgb(RED, BLUE, 255));
     // Rule (1,0) = grey 128 → opacity 128.
-    assert_eq!(
-        env.eval_int("b.getMainPixel(1, 0)"),
-        blend_rgb(RED, BLUE, 128)
-    );
+    assert_eq!(frame_pixel(&env, "dest", 1, 0), blend_rgb(RED, BLUE, 128));
     // Tiling: the 2x2 rule repeats over the 4x4 source, in both axes.
     assert_eq!(
-        env.eval_int("b.getMainPixel(2, 0)"),
-        env.eval_int("b.getMainPixel(0, 0)")
+        frame_pixel(&env, "dest", 2, 0),
+        frame_pixel(&env, "dest", 0, 0)
     );
     assert_eq!(
-        env.eval_int("b.getMainPixel(1, 2)"),
-        env.eval_int("b.getMainPixel(1, 0)")
+        frame_pixel(&env, "dest", 1, 2),
+        frame_pixel(&env, "dest", 1, 0)
     );
     assert_eq!(
-        env.eval_int("b.getMainPixel(3, 3)"),
-        env.eval_int("b.getMainPixel(1, 1)")
+        frame_pixel(&env, "dest", 3, 3),
+        frame_pixel(&env, "dest", 1, 1)
     );
     // A mid-grey rule value is not an endpoint of either source.
-    assert_ne!(env.eval_int("b.getMainPixel(1, 0)"), RED);
-    assert_ne!(env.eval_int("b.getMainPixel(1, 0)"), BLUE);
+    assert_ne!(frame_pixel(&env, "dest", 1, 0), RED);
+    assert_ne!(frame_pixel(&env, "dest", 1, 0), BLUE);
 
     // A missing `rule` option is `TVPSpecifyOption` (a typed error).
     two_layers(&env, 4);
@@ -944,7 +1087,7 @@ fn universal_vague_defaults_to_64_and_is_read() {
             "b.beginTransition('universal', true, a, %[time: 100, rule: 'rule.img'{options}]);"
         ));
         env.advance(50.0);
-        grid(&env, "b", 2)
+        frame_grid(&env, "dest", 2)
     };
 
     let default_grid = universal("");
@@ -961,7 +1104,7 @@ fn universal_vague_defaults_to_64_and_is_read() {
     two_layers(&env, 2);
     env.run("b.beginTransition('universal', true, a, %[time: 100, rule: 'rule.img', vague: 0]);");
     env.advance(50.0);
-    assert_eq!(env.eval_int("b.getMainPixel(1, 0)"), RED);
+    assert_eq!(frame_pixel(&env, "dest", 1, 0), RED);
 
     assert_ne!(
         universal(", vague: 255"),
@@ -984,12 +1127,12 @@ fn mask_alias_matches_universal_vague_zero() {
     two_layers(&env, 4);
     env.run("b.beginTransition('mask', true, a, %[time: 100, rule: 'rule.img']);");
     env.advance(50.0);
-    let mask_grid = grid(&env, "b", 4);
+    let mask_grid = frame_grid(&env, "dest", 4);
 
     two_layers(&env, 4);
     env.run("b.beginTransition('universal', true, a, %[time: 100, rule: 'rule.img', vague: 0]);");
     env.advance(50.0);
-    assert_eq!(mask_grid, grid(&env, "b", 4));
+    assert_eq!(mask_grid, frame_grid(&env, "dest", 4));
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,13 +1204,17 @@ fn stop_without_an_active_transition_is_a_noop() {
     assert_eq!(env.eval_int("hits"), 0, "no event without a transition");
 }
 
-/// Stopping midway keeps the last rendered frame (the teardown renders
-/// nothing) and runs the `ttExchange` exchange: the two layers trade
-/// position (`SetPosition`) and visibility.
+/// Stopping midway releases the transition frame with the caches
+/// (`DecCacheEnabledCount`, `LayerIntf.cpp:7961-7964`) and runs the
+/// `ttExchange` exchange: the two layers trade position (`SetPosition`) and
+/// visibility. Neither MainImage was ever the blend target (`:7673-7726`,
+/// `:8206-8249`), so the projection draws the live subtrees of the exchanged
+/// layers instead of a frozen frame.
 ///
-/// reference/cpp/core/visual/LayerIntf.cpp:7969-7991
+/// reference/cpp/core/visual/LayerIntf.cpp:7961-7991
+/// reference/cpp/core/visual/LayerIntf.cpp:7673-7732
 #[test]
-fn stopping_midway_keeps_the_frame_and_exchanges_layers() {
+fn stopping_midway_releases_the_frame_and_exchanges_layers() {
     let _lock = vm_lock();
     let env = Env::new();
     two_layers_with(&env, 2, "var base = new Layer(w, null); ");
@@ -1082,16 +1229,26 @@ fn stopping_midway_keeps_the_frame_and_exchanges_layers() {
          b.beginTransition('crossfade', true, a, %[time: 1000]);",
     );
     env.advance(50.0);
-    let before = env.eval_int("b.getMainPixel(0, 0)");
-    assert_ne!(before, RED, "mid-flight is not source 1");
-    assert_ne!(before, BLUE, "mid-flight is not source 2");
+    let frame = frame_pixel(&env, "dest", 0, 0);
+    assert_ne!(frame, RED, "mid-flight is not source 1");
+    assert_ne!(frame, BLUE, "mid-flight is not source 2");
+    assert_eq!(
+        env.eval_int("b.getMainPixel(0, 0)"),
+        RED,
+        "the main image is never the blend target"
+    );
 
     env.run("b.stopTransition();");
     assert_eq!(
         env.eval_int("b.getMainPixel(0, 0)"),
-        before,
-        "the teardown keeps the last rendered frame"
+        RED,
+        "the stopped transition leaves the main image intact"
     );
+    assert!(
+        cache_bitmap_of(&env, "dest").is_none(),
+        "the frame is released with the caches"
+    );
+    assert_eq!(named_layer(&env, "dest").cache_enabled_count, 0);
     assert_eq!(env.eval_int("b.left"), 10, "b took a's position");
     assert_eq!(env.eval_int("b.top"), 20);
     assert_eq!(env.eval_int("a.left"), 0, "a took b's position");
@@ -1101,14 +1258,16 @@ fn stopping_midway_keeps_the_frame_and_exchanges_layers() {
     assert_eq!(env.eval_int("hits"), 1, "and still fired the event");
 }
 
-/// A naturally completed transition ends through the same teardown: the
-/// final frame is source 2 verbatim (`TransIntf.cpp:596-601`) and the
-/// layers exchange position/visibility (`LayerIntf.cpp:7969-7991`).
+/// A naturally completed transition ends through the same teardown:
+/// the destination's MainImage keeps the destination's own image (`Complete`
+/// returns it as a blend source only, `LayerIntf.cpp:7673-7726`), the frame is
+/// released with the caches (`:7961-7964`) and the layers exchange
+/// position/visibility (`:7969-7991`).
 ///
-/// reference/cpp/core/visual/LayerIntf.cpp:7969-7991
-/// reference/cpp/core/visual/TransIntf.cpp:596-601
+/// reference/cpp/core/visual/LayerIntf.cpp:7673-7732
+/// reference/cpp/core/visual/LayerIntf.cpp:7961-7991
 #[test]
-fn completion_exchanges_layers_and_copies_source_two() {
+fn completion_exchanges_layers_and_leaves_the_main_image() {
     let _lock = vm_lock();
     let env = Env::new();
     two_layers_with(&env, 2, "var base = new Layer(w, null); ");
@@ -1123,8 +1282,9 @@ fn completion_exchanges_layers_and_copies_source_two() {
          b.beginTransition('crossfade', true, a, %[time: 100]);",
     );
     env.advance(100.0);
-    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), BLUE);
-    assert_eq!(env.eval_int("b.getMainPixel(1, 1)"), BLUE);
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
+    assert_eq!(env.eval_int("b.getMainPixel(1, 1)"), RED);
+    assert!(cache_bitmap_of(&env, "dest").is_none(), "frame released");
     assert_eq!(env.eval_int("b.left"), 10, "b took a's position");
     assert_eq!(env.eval_int("a.left"), 0, "a took b's position");
     assert_eq!(env.eval_int("b.visible"), 0, "b took a's visibility");
@@ -1195,7 +1355,7 @@ fn extrans_grid(env: &Env, name: &str, options: &str, size: i64) -> String {
         "b.beginTransition('{name}', true, a, %[time: 100{options}]);"
     ));
     env.advance(50.0);
-    grid(env, "b", size)
+    frame_grid(env, "dest", size)
 }
 
 /// Like [`extrans_grid`], but with two **spatially varying** layers, so a
@@ -1210,8 +1370,8 @@ fn extrans_grid(env: &Env, name: &str, options: &str, size: i64) -> String {
 fn extrans_patterned_grid(env: &Env, name: &str, options: &str, size: i64) -> String {
     env.run(&format!(
         "var w = new Window(); \
-         var a = new Layer(w, null); a.setSize({size}, {size}); a.setImageSize({size}, {size}); \
-         var b = new Layer(w, null); b.setSize({size}, {size}); b.setImageSize({size}, {size}); b.visible = true; \
+         var a = new Layer(w, null); a.setSize({size}, {size}); a.setImageSize({size}, {size}); a.name = 'src'; \
+         var b = new Layer(w, null); b.setSize({size}, {size}); b.setImageSize({size}, {size}); b.visible = true; b.name = 'dest'; \
          for (var y = 0; y < {size}; y++) for (var x = 0; x < {size}; x++) {{ \
              b.setMainPixel(x, y, ((x * 16) << 16) | ((y * 16) << 8) | ((x + y) * 8)); \
              a.setMainPixel(x, y, ((({size} - 1 - x) * 16) << 16) | \
@@ -1222,7 +1382,7 @@ fn extrans_patterned_grid(env: &Env, name: &str, options: &str, size: i64) -> St
         "b.beginTransition('{name}', true, a, %[time: 100{options}]);"
     ));
     env.advance(50.0);
-    grid(env, "b", size)
+    frame_grid(env, "dest", size)
 }
 
 /// Each provider's implicit options must equal the reference's declared

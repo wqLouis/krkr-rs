@@ -31,7 +31,15 @@ Every item was verified against the tree.
    captured is the release condition (D36).
 5. **Native plugin coverage** (§10) — 35 of 53 plugin names unemulated — and the
    **comments-gate debt** (§15): 4260 baseline entries, four unsafe-note files.
-6. **Deferred design work** (§16) stays deferred.
+6. **L3 behavioural audit** (§11) — the emulation lives in L3, and the current
+   motion/transition defects show that surface lock, arity/parity and the
+   static gates cannot see semantic loss (timeline evaluation, transition
+   cache ownership, silent draw no-ops, dropped events). Audit every L3 module
+   against `reference/cpp/**`, add a behavioural test with a reference
+   citation for each script-observable path, and turn every silent fallback
+   into the reference behaviour or a typed/logged error (D11, D36). The
+   current motion/transition wave is a first sample, not the audit.
+7. **Deferred design work** (§16) stays deferred.
 
 ## 2. Focus model
 
@@ -205,6 +213,25 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
 
 ## 11. L3 blockers
 
+* **L3 behavioural audit.** L1/L2 are small, stateless abstractions that the
+  static gates cover well; the compatibility emulation is L3, where a member
+  can exist with the right name/arity and still lose the reference semantics.
+  The current wave found this in the motion player (free-running evaluation
+  clock, interpolation into a contentless frame, silent draw no-ops, no target
+  clear), in layer transitions (blending into `MainImage` instead of a
+  transition display), and in the frame path (a healthy loop with silent
+  presentation skips). Audit L3 by subsystem against the reference oracle:
+  motion player (timeline/eval/child motion/events/draw), visual layer and
+  window, KAG, each native class and plugin port, audio/video/focus event
+  dispatch. For each module record the oracle path, the script-observable
+  paths, and the behavioural test that fails on the divergence; add real-game
+  traces or committed fixtures where a unit test cannot reach the state. A
+  divergence that must remain is recorded as an approximation with its
+  reference gap (D36), never as "unobservable". Exit when every L3 module has
+  a named oracle, a behaviour test and no silent script-observable fallback;
+  the surface lock and parity reports remain the contract but are not the
+  evidence of behaviour. Do not rewrite L1/L2 for this; change an L1/L2
+  signature only where the L3 behaviour cannot otherwise match.
 * `Window.registerMessageReceiver` records the receiver but **nothing dispatches
   messages** (`natives/visual/window.rs`; the registry is read only by its unit
   test, and `WindowImpl.cpp:2150-2163` forwards received messages to the

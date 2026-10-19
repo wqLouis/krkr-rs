@@ -193,9 +193,13 @@ fn decode_tlg5(raw: &[u8]) -> Result<RgbaImage, String> {
     let blockheight = read_i32(raw, 20)?;
     let blockheight =
         usize::try_from(blockheight).map_err(|_| "TLG5: negative block height".to_string())?;
-    if blockheight == 0 || blockheight > height {
-        return Err("TLG5: invalid block height".into());
+    if blockheight == 0 {
+        return Err("TLG5: zero block height".into());
     }
+    // A block height larger than the image is legal: the encoder then emits a
+    // single clipped block. Use the image height for the one block so a
+    // malformed huge value cannot drive an unbounded allocation.
+    let blockheight = blockheight.min(height);
     let blockcount = (height - 1) / blockheight + 1;
     let mut pos = 24usize
         .checked_add(

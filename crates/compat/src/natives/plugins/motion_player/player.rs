@@ -7,9 +7,9 @@
 //! The port keeps the whole script-visible surface and the playback model
 //! (timeline state, variable animators, coordinate/scale/rotate/color
 //! transitions, wind / outer force, hit testing, layer queries). Node-tree
-//! evaluation and drawing compose the L2 `engine_api::Scene` layer system:
-//! [`PlayerInst::draw`] writes the root transform onto the target layer, then
-//! maps each node's icon pixels onto its transformed quad with
+//! evaluation reads the selected clip's timeline time; drawing composes the
+//! L2 `engine_api::Scene` layer system: [`PlayerInst::draw`] clears the target
+//! image and maps each node's icon pixels onto its transformed quad with
 //! `engine_api::layer_ops`, decoding the container's `RL`/palettized pixel
 //! chunks itself.
 #![allow(unsafe_code)]
@@ -25,7 +25,7 @@ use super::animator::{Animator, ColorAnimator, ease_weight};
 use super::helpers::{eval_object, inst_mut, inst_ref, set_string, value_as_f64};
 use super::model::{
     FrameState, IconInfo, MotionEvent, MotionNode, MotionSnapshot, TimelineState, build_node_tree,
-    evaluate_frames, prime_timelines, step_timelines,
+    evaluate_frames, prime_timelines, scan_frame_events, step_timelines,
 };
 use super::resource::{MotionStore, ResourceInst};
 use super::texture::{Pixels, decode_pixels};
@@ -128,7 +128,6 @@ pub(crate) struct PlayerInst {
     pub(crate) variable_values: HashMap<String, f64>,
     pub(crate) variable_animators: HashMap<String, Animator>,
     pub(crate) nodes: Vec<MotionNode>,
-    pub(crate) current_frame: f64,
     pub(crate) pending_events: Vec<MotionEvent>,
     /// The decoded pixel chunks the active motion draws, keyed by their
     /// `psb://` storage name.
@@ -236,7 +235,6 @@ impl Default for PlayerInst {
             variable_values: HashMap::new(),
             variable_animators: HashMap::new(),
             nodes: Vec::new(),
-            current_frame: 0.0,
             pending_events: Vec::new(),
             textures: HashMap::new(),
             missing_textures: BTreeSet::new(),
@@ -285,6 +283,61 @@ impl Default for PlayerInst {
 impl PlayerInst {
     pub(crate) fn playing(&self) -> bool {
         self.allplaying
+    }
+
+    /// Recompute the playing timeline list and report whether any timeline is
+    /// still playing.
+    pub(crate) fn is_playing(&mut self) -> bool {
+        self.prune_playing_timelines();
+        self.allplaying
+    }
+
+    /// Drop timelines that stopped and recompute `allplaying`.
+    pub(crate) fn prune_playing_timelines(&mut self) {
+        let timelines = &self.timelines;
+        self.playing_timelines
+            .retain(|label| timelines.get(label).is_some_and(|state| state.playing));
+        self.allplaying = !self.playing_timelines.is_empty();
+    }
+
+    /// The clip whose timeline current time evaluates the node tree.
+    fn active_clip_label(&self) -> Option<&str> {
+        let snapshot = self.snapshot.as_ref()?;
+        if !self.motion_key.is_empty() && snapshot.clip_index.contains_key(&self.motion_key) {
+            return Some(&self.motion_key);
+        }
+        for label in &self.playing_timelines {
+            if snapshot.clip_index.contains_key(label) {
+                return Some(label);
+            }
+        }
+        let primary = if snapshot.main_timelines.is_empty() {
+            &snapshot.diff_timelines
+        } else {
+            &snapshot.main_timelines
+        };
+        for label in primary {
+            if snapshot.clip_index.contains_key(label) {
+                return Some(label);
+            }
+        }
+        snapshot.clips.first().map(|clip| clip.label.as_str())
+    }
+
+    /// The evaluation clock: the selected clip's timeline time, or the first
+    /// playing timeline time when the selected clip has no timeline.
+    pub(crate) fn eval_time(&self) -> f64 {
+        if let Some(label) = self.active_clip_label()
+            && let Some(state) = self.timelines.get(label)
+        {
+            return state.current_time;
+        }
+        for label in &self.playing_timelines {
+            if let Some(state) = self.timelines.get(label) {
+                return state.current_time;
+            }
+        }
+        0.0
     }
 
     pub(crate) fn snapshot(&self) -> Option<&MotionSnapshot> {
@@ -590,13 +643,13 @@ impl PlayerInst {
     }
 
     /// Advance everything by `dt_ms` milliseconds.
-    pub(crate) fn progress(&mut self, dt_ms: f64, ctx: &CompatCtx) {
+    pub(crate) fn progress(&mut self, dt_ms: f64, ctx: &CompatCtx, objthis: *mut std::ffi::c_void) {
         if !self.speed {
             return;
         }
         let frames = dt_ms * 60.0 / 1000.0;
         self.frame_tick_count += frames;
-        self.current_frame += frames;
+        self.frame_last_time = frames;
         self.coord.x.step(frames as f32);
         self.coord.y.step(frames as f32);
         self.scale.step(frames as f32);
@@ -605,16 +658,47 @@ impl PlayerInst {
             self.wind.phase += frames;
         }
         self.busy = false;
+        self.advance_timelines(frames);
         self.update_layers();
         self.step_animators(frames as f32);
-        let events = if let Some(snapshot) = &self.snapshot {
-            step_timelines(snapshot, &mut self.timelines, frames)
+        self.dispatch_events(ctx, objthis);
+    }
+
+    /// Advance everything by `frames` frame units without dispatching events.
+    pub(crate) fn frame_progress(&mut self, frames: f64) {
+        if !self.speed {
+            return;
+        }
+        self.frame_tick_count += frames;
+        self.frame_last_time = frames;
+        self.advance_timelines(frames);
+        self.update_layers();
+    }
+
+    fn advance_timelines(&mut self, frames: f64) {
+        let previous: Vec<(String, f64)> = self
+            .playing_timelines
+            .iter()
+            .filter_map(|label| {
+                self.timelines
+                    .get(label)
+                    .map(|state| (label.clone(), state.current_time))
+            })
+            .collect();
+        let events = if let Some(snapshot) = self.snapshot.clone() {
+            step_timelines(&snapshot, &mut self.timelines, frames)
         } else {
             Vec::new()
         };
-        self.allplaying = self.timelines.values().any(|state| state.playing);
         self.pending_events.extend(events);
-        self.dispatch_events(ctx);
+        for (label, previous) in previous {
+            let current = self.timelines.get(&label).map(|state| state.current_time);
+            if let Some(current) = current {
+                let events = scan_frame_events(&self.nodes, previous, current);
+                self.pending_events.extend(events);
+            }
+        }
+        self.prune_playing_timelines();
     }
 
     pub(crate) fn step_animators(&mut self, dt: f32) {
@@ -623,9 +707,12 @@ impl PlayerInst {
         }
     }
 
-    /// Evaluate the node tree at the current frame time.
+    /// Evaluate the node tree at the selected clip's timeline time.
     pub(crate) fn update_layers(&mut self) {
-        let time = self.current_frame;
+        if self.nodes.is_empty() {
+            return;
+        }
+        let time = self.eval_time();
         // Evaluate each node's local state.
         for index in 0..self.nodes.len() {
             let state = evaluate_frames(&self.nodes[index].frames, time);
@@ -633,6 +720,14 @@ impl PlayerInst {
             node.local = state;
             node.draw_flag = true;
         }
+        // The root viewport state is applied before the children inherit it,
+        // so a visibility or opacity change takes effect in the same frame.
+        let root = &mut self.nodes[0];
+        root.accumulated.x = root.local.x + self.root_x;
+        root.accumulated.y = root.local.y + self.root_y;
+        root.accumulated.active = self.visible;
+        root.accumulated.opacity = self.opacity;
+        root.draw_flag = self.visible;
         // Accumulate parent transforms into world coordinates.
         for index in 1..self.nodes.len() {
             let parent = self.nodes[index].parent;
@@ -650,26 +745,45 @@ impl PlayerInst {
             node.accumulated.scale_y = parent_state.scale_y * local.scale_y;
             node.draw_flag = parent_state.active && local.active && parent_state.opacity > 0.0;
         }
-        if self.nodes.is_empty() {
-            return;
-        }
-        let root = &mut self.nodes[0];
-        root.accumulated.x = root.local.x + self.root_x;
-        root.accumulated.y = root.local.y + self.root_y;
-        root.accumulated.active = self.visible;
-        root.accumulated.opacity = self.opacity;
-        root.draw_flag = self.visible;
         let vertices = self.nodes.iter().filter(|node| node.draw_flag).count();
         self.processed_mesh_vertices_num = vertices as i32;
     }
 
-    pub(crate) fn dispatch_events(&mut self, ctx: &CompatCtx) {
-        if self.pending_events.is_empty() {
+    pub(crate) fn dispatch_events(&mut self, ctx: &CompatCtx, objthis: *mut std::ffi::c_void) {
+        if self.pending_events.is_empty() || objthis.is_null() {
             return;
         }
+        // SAFETY: the VM passed a live `objthis` for this callback.
+        let Ok(target) = (unsafe { ctx.engine() }).retain_object_detached(objthis) else {
+            return;
+        };
         let events = std::mem::take(&mut self.pending_events);
         for event in events {
-            let _ = (event, ctx);
+            let (name, arguments) = if event.kind == 0 {
+                (
+                    "onAction",
+                    vec![
+                        TjsValue::String(event.param1),
+                        TjsValue::String(event.param2),
+                    ],
+                )
+            } else {
+                ("onSync", Vec::new())
+            };
+            // A class without the callback stays a no-op; a present callback
+            // that raises is reported.
+            // SAFETY: the binding is live and `objthis` was retained above.
+            if unsafe { ctx.engine() }
+                .member(target.raw_id(), name)
+                .is_err()
+            {
+                continue;
+            }
+            // SAFETY: the binding is live and `objthis` was retained above.
+            let called = unsafe { ctx.engine() }.call_member(target.raw_id(), name, &arguments);
+            if let Err(error) = called {
+                log::warn!("Motion.Player: {name} callback failed: {error}");
+            }
         }
     }
 
@@ -774,7 +888,7 @@ impl PlayerInst {
             self.play_clip_layers(&snapshot, label);
             self.rebuild_tree(&snapshot, label);
         }
-        self.allplaying = started;
+        self.prune_playing_timelines();
         Ok(started)
     }
 
@@ -1008,25 +1122,8 @@ impl PlayerInst {
         };
         // SAFETY: the host keeps the attached scene alive for the binding.
         let scene = unsafe { &mut *scene };
-        let root = self.nodes.first().cloned();
-        if let Some(layer) = scene.layer_mut(layer_id)
-            && let Some(root) = &root
-        {
-            layer.rect.x = root.accumulated.x.round() as i32;
-            layer.rect.y = root.accumulated.y.round() as i32;
-            layer.opacity = (root.accumulated.opacity.clamp(0.0, 1.0)) as f32;
-            layer.visible = root.draw_flag && self.visible;
-        }
         let color = color_bytes(self.color.bytes);
-        let nodes: Vec<MotionNode> = self
-            .nodes
-            .iter()
-            .filter(|node| {
-                node.draw_flag
-                    && (node.shape > 0 || (node.node_type == 0 && !node.local.src.is_empty()))
-            })
-            .cloned()
-            .collect();
+        let nodes = drawable_nodes(&self.nodes);
         let (width, height) = scene
             .layer(layer_id)
             .map(|layer| (layer.rect.w as i32, layer.rect.h as i32))
@@ -1035,24 +1132,28 @@ impl PlayerInst {
             return Ok(());
         }
         let snapshot = self.snapshot.clone();
+        let clear = clear_fill(self.clear_enabled, self.clear_color);
         // SAFETY: the host keeps the attached storage alive for the binding.
         let storage = unsafe { ctx.services() }.storage();
         // SAFETY: the host keeps the attached storage alive for the binding.
         let storage = storage.map(|storage| unsafe { &*storage });
-        let mut frame = DrawFrame {
-            snapshot: snapshot.as_deref(),
-            storage,
-            color,
-            affine: self.affine,
-            textures: &mut self.textures,
-            missing: Vec::new(),
-        };
+        let affine = self.affine;
+        let textures = &mut self.textures;
         let rendered = scene.with_main_image_pixels_mut(layer_id, |pixels| {
             let mut bitmap = BitmapState::new(width as u32, height as u32, pixels.to_vec());
-            for node in &nodes {
-                draw_node(&mut bitmap, node, &mut frame);
+            for pixel in bitmap.rgba.chunks_exact_mut(4) {
+                pixel.copy_from_slice(&clear);
             }
-            (bitmap.rgba, frame.missing)
+            let missing = composite_nodes(
+                &mut bitmap,
+                &nodes,
+                snapshot.as_deref(),
+                storage,
+                color,
+                affine,
+                textures,
+            );
+            (bitmap.rgba, missing)
         });
         let Some((rgba, missing)) = rendered else {
             return Ok(());
@@ -1062,11 +1163,15 @@ impl PlayerInst {
                 log::warn!("Motion.Player.draw: no texture for {src}");
             }
         }
-        if let Some(bitmap_id) = scene.layer(layer_id).and_then(|layer| layer.bitmap)
+        let bitmap_id = scene.layer(layer_id).and_then(|layer| layer.bitmap);
+        if let Some(bitmap_id) = bitmap_id
             && let Some(bitmap) = scene.bitmap_mut(bitmap_id)
         {
             bitmap.rgba = rgba;
             bitmap.mark_dirty();
+        }
+        if let Some(layer) = scene.layer_mut(layer_id) {
+            layer.image_modified = true;
         }
         Ok(())
     }
@@ -1084,6 +1189,59 @@ struct DrawFrame<'a> {
     affine: [f64; 6],
     textures: &'a mut HashMap<String, Arc<Pixels>>,
     missing: Vec<String>,
+}
+
+/// The node frame painted into the target: shape nodes plus object nodes that
+/// name an icon source.
+fn drawable_nodes(nodes: &[MotionNode]) -> Vec<MotionNode> {
+    nodes
+        .iter()
+        .filter(|node| {
+            node.draw_flag
+                && (node.shape > 0 || (node.node_type == 0 && !node.local.src.is_empty()))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Paint `nodes` over `bitmap` in order, returning the icon sources that had no
+/// readable texture.
+fn composite_nodes(
+    bitmap: &mut BitmapState,
+    nodes: &[MotionNode],
+    snapshot: Option<&MotionSnapshot>,
+    storage: Option<&Storage>,
+    color: [u8; 4],
+    affine: [f64; 6],
+    textures: &mut HashMap<String, Arc<Pixels>>,
+) -> Vec<String> {
+    let mut frame = DrawFrame {
+        snapshot,
+        storage,
+        color,
+        affine,
+        textures,
+        missing: Vec::new(),
+    };
+    for node in nodes {
+        draw_node(bitmap, node, &mut frame);
+    }
+    frame.missing
+}
+
+/// The target fill: transparent unless the player enables an explicit clear
+/// color, which is stored as `0xAARRGGBB`.
+fn clear_fill(clear_enabled: bool, color: i32) -> [u8; 4] {
+    if !clear_enabled {
+        return [0, 0, 0, 0];
+    }
+    let value = color as u32;
+    [
+        (value >> 16) as u8,
+        (value >> 8) as u8,
+        value as u8,
+        (value >> 24) as u8,
+    ]
 }
 
 fn draw_node(bitmap: &mut BitmapState, node: &MotionNode, frame: &mut DrawFrame<'_>) {
@@ -1133,7 +1291,10 @@ fn draw_node(bitmap: &mut BitmapState, node: &MotionNode, frame: &mut DrawFrame<
         let y = center_y + matrix[2] * local_x + matrix[3] * local_y;
         draw_point(frame.affine, x, y)
     };
-    let (origin_x, origin_y) = (icon.origin_x, icon.origin_y);
+    let (origin_x, origin_y) = (
+        icon.origin_x + node.accumulated.ox,
+        icon.origin_y + node.accumulated.oy,
+    );
     affine_blit(
         bitmap,
         AffineBlit {
@@ -1649,7 +1810,7 @@ extern "C" fn player_progress_raw(
     argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut std::ffi::c_char,
-    _objthis: *mut std::ffi::c_void,
+    objthis: *mut std::ffi::c_void,
 ) -> std::os::raw::c_int {
     let Some(res) = resolve(engine) else {
         return report_error(out_error, super::helpers::NO_BINDING);
@@ -1668,7 +1829,7 @@ extern "C" fn player_progress_raw(
             _ => value_as_i64(value) as f64,
         })
         .unwrap_or(0.0);
-    inst.progress(dt, &res.ctx());
+    inst.progress(dt, &res.ctx(), objthis);
     set_void(out);
     0
 }
@@ -1686,10 +1847,10 @@ extern "C" fn player_is_playing_raw(
         return report_error(out_error, super::helpers::NO_BINDING);
     };
     // SAFETY: the VM guarantees the live payload.
-    let Some(inst) = (unsafe { super::helpers::inst_ref::<PlayerInst>(instance) }) else {
+    let Some(inst) = (unsafe { super::helpers::inst_mut::<PlayerInst>(instance) }) else {
         return report_error(out_error, "Player: null instance");
     };
-    set_bool(out, inst.playing());
+    set_bool(out, inst.is_playing());
     0
 }
 
@@ -2157,6 +2318,245 @@ mod tests {
     use super::FrameState;
     use super::color_bytes;
     use super::local_matrix;
+    use super::{
+        BitmapState, MotionSnapshot, PlayerInst, build_node_tree, composite_nodes, draw_point,
+        drawable_nodes, evaluate_frames, prime_timelines,
+    };
+    use crate::natives::plugins::psb_file::container::{PsbDocument, PsbValue};
+    use crate::{CompatCtx, CompatServices};
+    use tjs::Tjs2Engine;
+
+    fn dict(entries: Vec<(&str, PsbValue)>) -> PsbValue {
+        PsbValue::Dictionary(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+        )
+    }
+
+    fn num(value: i64) -> PsbValue {
+        PsbValue::Int(value)
+    }
+
+    fn text(value: &str) -> PsbValue {
+        PsbValue::String(value.to_string())
+    }
+
+    fn content(x: i64, y: i64) -> PsbValue {
+        dict(vec![("coord", PsbValue::List(vec![num(x), num(y)]))])
+    }
+
+    fn frame(time: i64, frame_type: i64, content: Option<PsbValue>) -> PsbValue {
+        let mut entries = vec![("time", num(time)), ("type", num(frame_type))];
+        if let Some(content) = content {
+            entries.push(("content", content));
+        }
+        dict(entries)
+    }
+
+    /// Two clips: a 120-frame `intro` that moves its shape to (600,600), and a
+    /// one-frame `idle` whose shape rests at (300,300). Each clip's last entry
+    /// has no content and is only a terminator.
+    fn snapshot() -> MotionSnapshot {
+        let intro = dict(vec![
+            ("label", text("intro_shape")),
+            ("type", num(0)),
+            ("shape", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    frame(0, 3, Some(content(100, 100))),
+                    frame(60, 2, Some(content(600, 600))),
+                    frame(120, 0, None),
+                ]),
+            ),
+        ]);
+        let idle = dict(vec![
+            ("label", text("idle_shape")),
+            ("type", num(0)),
+            ("shape", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![frame(0, 0, Some(content(300, 300)))]),
+            ),
+        ]);
+        let intro_clip = dict(vec![
+            ("lastTime", num(120)),
+            ("layer", PsbValue::List(vec![intro])),
+        ]);
+        let idle_clip = dict(vec![
+            ("lastTime", num(1)),
+            ("layer", PsbValue::List(vec![idle])),
+        ]);
+        let motions = dict(vec![("intro", intro_clip), ("idle", idle_clip)]);
+        let object = dict(vec![("test", dict(vec![("motion", motions)]))]);
+        let root = dict(vec![("object", object)]);
+        MotionSnapshot::from_psb(
+            PsbDocument {
+                root,
+                resources: Vec::new(),
+            },
+            "test.psb",
+        )
+    }
+
+    fn player(snapshot: &MotionSnapshot) -> PlayerInst {
+        let mut player = PlayerInst::default();
+        player.snapshot = Some(std::sync::Arc::new(snapshot.clone()));
+        player.motion_key = "intro".to_string();
+        prime_timelines(snapshot, &mut player.timelines);
+        player.nodes = build_node_tree(snapshot, snapshot.clip("intro"));
+        player
+    }
+
+    fn context(engine: &Tjs2Engine, services: &mut CompatServices) -> CompatCtx {
+        // SAFETY: both values outlive the returned context.
+        unsafe {
+            CompatCtx::from_raw(
+                engine as *const Tjs2Engine as usize,
+                services as *mut CompatServices as usize,
+            )
+        }
+    }
+
+    fn composite(player: &mut PlayerInst) -> BitmapState {
+        let mut bitmap = BitmapState::new(800, 1080, vec![0u8; 800 * 1080 * 4]);
+        let nodes = drawable_nodes(&player.nodes);
+        let snapshot = player.snapshot.clone();
+        let color = color_bytes(player.color.bytes);
+        let affine = player.affine;
+        let missing = composite_nodes(
+            &mut bitmap,
+            &nodes,
+            snapshot.as_deref(),
+            None,
+            color,
+            affine,
+            &mut player.textures,
+        );
+        assert!(missing.is_empty(), "synthetic shapes need no texture");
+        bitmap
+    }
+
+    fn alpha(bitmap: &BitmapState, x: usize, y: usize) -> u8 {
+        bitmap.rgba[(y * 800 + x) * 4 + 3]
+    }
+
+    #[test]
+    fn a_short_clip_after_a_long_one_replays_from_its_first_frame() {
+        let snapshot = snapshot();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let ctx = context(&engine, &mut services);
+        let mut player = player(&snapshot);
+        player.play("intro", 0, &ctx).expect("start intro");
+        player.progress(2000.0, &ctx, std::ptr::null_mut());
+        assert!(!player.is_playing(), "the one-shot intro stopped");
+        assert!(player.playing_timelines.is_empty());
+        player.play("idle", 0, &ctx).expect("start idle");
+        player.progress(0.0, &ctx, std::ptr::null_mut());
+        assert!(player.is_playing(), "the idle timeline is playing");
+        // The idle clip is one frame long; the intro reached its 120-frame
+        // end. The evaluation clock is the idle timeline's own zero
+        // (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:869-871`).
+        let bitmap = composite(&mut player);
+        assert_eq!(alpha(&bitmap, 300, 300), 255, "idle t=0 shape is drawn");
+        assert_eq!(alpha(&bitmap, 600, 600), 0, "the intro shape is gone");
+    }
+
+    #[test]
+    fn replaying_a_clip_resets_its_evaluation_time() {
+        let snapshot = snapshot();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let ctx = context(&engine, &mut services);
+        let mut player = player(&snapshot);
+        player.play("intro", 0, &ctx).expect("start intro");
+        player.progress(50.0 * 1000.0 / 60.0, &ctx, std::ptr::null_mut());
+        assert!(
+            (player.nodes[1].local.x - 100.0).abs() > 100.0,
+            "50 frames move the shape"
+        );
+        player.play("intro", 0, &ctx).expect("replay intro");
+        player.progress(0.0, &ctx, std::ptr::null_mut());
+        // `playTimeline` resets `state.currentTime` before evaluation
+        // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:238`,
+        // `:396-403`).
+        assert!((player.nodes[1].local.x - 100.0).abs() < 1e-9);
+        let bitmap = composite(&mut player);
+        assert_eq!(alpha(&bitmap, 100, 100), 255);
+        assert_eq!(alpha(&bitmap, 600, 600), 0);
+    }
+
+    fn logo_frames() -> Vec<super::super::model::Frame> {
+        use super::super::model::Frame;
+        vec![
+            Frame {
+                time: 0.0,
+                frame_type: 0,
+                has_content: true,
+                ..Frame::default()
+            },
+            Frame {
+                time: 40.0,
+                frame_type: 3,
+                has_content: true,
+                x: -705.0,
+                y: -388.0,
+                scale_x: 1.1,
+                scale_y: 1.1,
+                opacity: 0.0,
+                ..Frame::default()
+            },
+            Frame {
+                time: 75.0,
+                frame_type: 3,
+                has_content: true,
+                x: -705.0,
+                y: -388.0,
+                ..Frame::default()
+            },
+            Frame {
+                time: 120.0,
+                frame_type: 0,
+                ..Frame::default()
+            },
+        ]
+    }
+
+    fn logo_corner(state: &FrameState) -> (f64, f64) {
+        let origin_x = 219.0 + state.ox;
+        let origin_y = 92.0 + state.oy;
+        draw_point(
+            [1.0, 0.0, 0.0, 1.0, 960.0, 540.0],
+            state.x - origin_x,
+            state.y - origin_y,
+        )
+    }
+
+    #[test]
+    fn the_logo_holds_its_last_content_corner_to_the_end() {
+        // 960 + (-705) - 219 = 36, 540 + (-388) - 92 = 60. The trailing
+        // contentless frame is not a keyframe
+        // (`reference/cpp/plugins/motionplayer/PlayerUpdateLayerEval.cpp:282-311`).
+        for time in [75.0, 97.0, 119.9, 1_000_000.0] {
+            let state = evaluate_frames(&logo_frames(), time);
+            assert_eq!(logo_corner(&state), (36.0, 60.0), "t={time}");
+        }
+        let normal = vec![super::super::model::Frame {
+            time: 0.0,
+            frame_type: 0,
+            has_content: true,
+            x: -705.0,
+            y: -388.0,
+            ..super::super::model::Frame::default()
+        }];
+        for time in [0.0, 100.0] {
+            let state = evaluate_frames(&normal, time);
+            assert_eq!(logo_corner(&state), (36.0, 60.0), "t={time}");
+        }
+    }
 
     #[test]
     fn color_channels_are_scaled_from_the_normalized_animator() {

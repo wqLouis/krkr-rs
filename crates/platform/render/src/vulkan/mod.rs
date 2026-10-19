@@ -363,6 +363,7 @@ impl VulkanPipeline {
             surface_size,
             frame_index: 0,
             swapchain_ready: true,
+            present_fault: None,
             last_timings: None,
         };
 
@@ -680,11 +681,32 @@ impl VulkanPipeline {
             });
         }
 
-        if !vstate.swapchain_ready || vstate.swapchain.images.is_empty() {
-            return Ok(Presentation {
-                presented: false,
-                surface_event: Some(SurfaceEvent::OutOfDate),
-            });
+        if let Some(fault) = swapchain_fault(vstate.swapchain_ready, vstate.swapchain.images.len())
+        {
+            // After a failed rebuild the fault stays `RebuildFailed` until a
+            // frame presents, so the retry loop logs each cause once.
+            if vstate.present_fault != Some(PresentFault::RebuildFailed) {
+                vstate.report_present_fault(fault);
+            }
+            let device = vstate.device.clone();
+            if let Err(error) = recreate_swapchain(&device, vstate, surface_handle) {
+                if vstate.present_fault != Some(PresentFault::RebuildFailed) {
+                    log::error!("vulkan: rebuilding the swapchain failed: {error}");
+                    vstate.present_fault = Some(PresentFault::RebuildFailed);
+                }
+                // The next frame retries the rebuild, and the precise failure
+                // was reported above once for this cause.
+                return Err(RenderError::SurfaceOutOfDate);
+            }
+            if let Some(fault) =
+                swapchain_fault(vstate.swapchain_ready, vstate.swapchain.images.len())
+            {
+                // A rebuild that leaves the swapchain unusable is reported as
+                // out of date so the caller retries instead of treating this
+                // frame as presented.
+                vstate.report_present_fault(fault);
+                return Err(RenderError::SurfaceOutOfDate);
+            }
         }
 
         let device = vstate.device.clone();
@@ -729,6 +751,7 @@ impl VulkanPipeline {
         let (image_index, suboptimal) = match acquire_result {
             Ok(value) => value,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                vstate.report_present_fault(PresentFault::AcquireOutOfDate);
                 let recreate_started = Instant::now();
                 recreate_swapchain(&device, vstate, surface_handle)?;
                 recreate_ms += recreate_started.elapsed().as_secs_f64() * 1000.0;
@@ -874,7 +897,18 @@ impl VulkanPipeline {
         submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
 
         if let Err(error) = record_result {
-            recreate_acquired_semaphore(&device, vstate, frame_index);
+            // The acquire signalled the semaphore, so the slot cannot be
+            // reused until it is replaced. A failure there leaves the
+            // swapchain unusable and is reported as out of date so the next
+            // frame rebuilds it instead of silently never presenting again.
+            if let Err(semaphore_error) = recreate_acquired_semaphore(&device, vstate, frame_index)
+            {
+                log::error!(
+                    "vulkan: the frame failed ({error}) and its image-available \
+                     semaphore could not be recreated: {semaphore_error}"
+                );
+                return Err(RenderError::SurfaceOutOfDate);
+            }
             return Err(error);
         }
 
@@ -918,6 +952,7 @@ impl VulkanPipeline {
                 recreate_ms,
                 fence_wait_ms,
             });
+            vstate.clear_present_fault();
             return Ok(Presentation {
                 presented: true,
                 surface_event: Some(SurfaceEvent::OutOfDate),
@@ -931,6 +966,7 @@ impl VulkanPipeline {
             recreate_ms,
             fence_wait_ms,
         });
+        vstate.clear_present_fault();
         Ok(Presentation {
             presented: true,
             surface_event: None,
@@ -1020,8 +1056,30 @@ pub(crate) struct VulkanState {
     pub(crate) frame_index: u64,
     /// Whether the swapchain is usable.
     pub(crate) swapchain_ready: bool,
+    /// Presentation fault already reported, so a persistent stall logs once
+    /// per cause instead of once per frame.
+    present_fault: Option<PresentFault>,
     /// Vulkan call timings from the most recent presented frame.
     pub(crate) last_timings: Option<FrameTimings>,
+}
+
+impl VulkanState {
+    /// Reports `fault` as a warning when it is not the fault already reported.
+    fn report_present_fault(&mut self, fault: PresentFault) {
+        if self.present_fault == Some(fault) {
+            return;
+        }
+        log::warn!("vulkan: presentation stalled: {}", fault.message());
+        self.present_fault = Some(fault);
+    }
+
+    /// Clears the reported fault after a presented frame, logging the recovery
+    /// once.
+    fn clear_present_fault(&mut self) {
+        if let Some(fault) = self.present_fault.take() {
+            log::info!("vulkan: presentation recovered: {}", fault.message());
+        }
+    }
 }
 
 impl Drop for VulkanState {
@@ -1318,6 +1376,43 @@ enum SwapchainRecovery {
     RecreateSurface,
 }
 
+/// Why the backend cannot present a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresentFault {
+    /// A previous swapchain rebuild left the swapchain unusable.
+    SwapchainNotReady,
+    /// The swapchain reports no images to acquire.
+    NoImages,
+    /// `acquire_next_image` reported the swapchain out of date.
+    AcquireOutOfDate,
+    /// Rebuilding the unusable swapchain failed.
+    RebuildFailed,
+}
+
+impl PresentFault {
+    /// One-line description used by the once-per-fault log lines.
+    fn message(self) -> &'static str {
+        match self {
+            Self::SwapchainNotReady => "the swapchain is not ready",
+            Self::NoImages => "the swapchain has no images",
+            Self::AcquireOutOfDate => "the swapchain was out of date at image acquire",
+            Self::RebuildFailed => "rebuilding the swapchain failed",
+        }
+    }
+}
+
+/// Returns the fault an unusable-swapchain state implies, or `None` when the
+/// swapchain can present.
+fn swapchain_fault(ready: bool, image_count: usize) -> Option<PresentFault> {
+    if !ready {
+        Some(PresentFault::SwapchainNotReady)
+    } else if image_count == 0 {
+        Some(PresentFault::NoImages)
+    } else {
+        None
+    }
+}
+
 /// Classifies a present result into the recovery it needs.
 ///
 /// `VK_SUBOPTIMAL_KHR` and `VK_ERROR_OUT_OF_DATE_KHR` rebuild the swapchain
@@ -1474,8 +1569,10 @@ fn recreate_surface(
 ///
 /// The presentation semaphores are always recreated: a `queue_present` on the
 /// previous generation may have signalled one, and a binary semaphore that is
-/// already signalled must not be signalled again. The device is idle here, so
-/// destroying and recreating them is safe.
+/// already signalled must not be signalled again. A frame whose image-available
+/// semaphore could not be recreated is also repaired here, because the rebuild
+/// only succeeds when every subsequent acquire has a valid semaphore. The
+/// device is idle here, so destroying and recreating them is safe.
 fn rebuild_image_sync(state: &mut VulkanState, device: &ash::Device) -> Result<(), RenderError> {
     let image_count = state.swapchain.images.len().max(1);
     for semaphore in state.render_finished.drain(..) {
@@ -1495,6 +1592,23 @@ fn rebuild_image_sync(state: &mut VulkanState, device: &ash::Device) -> Result<(
             )?;
         state.render_finished.push(semaphore);
     }
+    for frame in &mut state.frames {
+        if frame.image_available != vk::Semaphore::null() {
+            continue;
+        }
+        let semaphore =
+            // SAFETY: `device` is live and the GPU is idle after the swapchain
+            // change.
+            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }.map_err(
+                |error| RenderError::DeviceUnavailable {
+                    message: format!(
+                        "failed to recreate a frame's image-available semaphore: {}",
+                        device::vk_result_message(error)
+                    ),
+                },
+            )?;
+        frame.image_available = semaphore;
+    }
     state.images_in_flight = vec![vk::Fence::null(); image_count];
     Ok(())
 }
@@ -1503,31 +1617,42 @@ fn rebuild_image_sync(state: &mut VulkanState, device: &ash::Device) -> Result<(
 /// between `acquire_next_image` and a successful submit.
 ///
 /// The acquire signalled the old semaphore, so it can no longer be reused.
-/// Destroying it is safe because no queue operation is waiting on it. If the
-/// replacement cannot be created the swapchain is marked unusable so the slot
-/// is never touched again.
-fn recreate_acquired_semaphore(device: &ash::Device, state: &mut VulkanState, frame_index: usize) {
-    let recreated = {
-        let Some(frame) = state.frames.get_mut(frame_index) else {
-            return;
-        };
-        // SAFETY: the acquire signalled this semaphore and nothing waits on it.
-        unsafe {
-            device.destroy_semaphore(frame.image_available, None);
-            match device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) {
-                Ok(semaphore) => {
-                    frame.image_available = semaphore;
-                    true
-                }
-                Err(_) => {
-                    frame.image_available = vk::Semaphore::null();
-                    false
-                }
-            }
-        }
-    };
-    if !recreated {
+/// Destroying it is safe because no queue operation is waiting on it. When the
+/// replacement cannot be created the swapchain is marked unusable and the
+/// failure is returned, so the next frame rebuilds it instead of touching a
+/// null semaphore.
+fn recreate_acquired_semaphore(
+    device: &ash::Device,
+    state: &mut VulkanState,
+    frame_index: usize,
+) -> Result<(), RenderError> {
+    if frame_index >= state.frames.len() {
         state.swapchain_ready = false;
+        return Err(RenderError::Framebuffer {
+            message: format!("frame slot {frame_index} does not exist"),
+        });
+    }
+    let frame = &mut state.frames[frame_index];
+    // SAFETY: the acquire signalled this semaphore and nothing waits on it.
+    let recreated = unsafe {
+        device.destroy_semaphore(frame.image_available, None);
+        device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+    };
+    match recreated {
+        Ok(semaphore) => {
+            state.frames[frame_index].image_available = semaphore;
+            Ok(())
+        }
+        Err(error) => {
+            state.frames[frame_index].image_available = vk::Semaphore::null();
+            state.swapchain_ready = false;
+            Err(RenderError::DeviceUnavailable {
+                message: format!(
+                    "failed to recreate the image-available semaphore: {}",
+                    device::vk_result_message(error)
+                ),
+            })
+        }
     }
 }
 
@@ -1688,7 +1813,7 @@ pub fn upload_submit_count(state: &RenderState) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SwapchainRecovery, present_recovery};
+    use super::{PresentFault, SwapchainRecovery, present_recovery, swapchain_fault};
     use ash::vk;
 
     /// `VK_ERROR_SURFACE_LOST_KHR` is the one present result that invalidates
@@ -1713,5 +1838,17 @@ mod tests {
             present_recovery(Err(vk::Result::ERROR_DEVICE_LOST)),
             Err(vk::Result::ERROR_DEVICE_LOST)
         );
+    }
+
+    /// A swapchain that is not ready or has no images is a named fault, not a
+    /// frame that silently reports `presented: false`.
+    #[test]
+    fn an_unusable_swapchain_names_the_fault_that_blocks_presentation() {
+        assert_eq!(
+            swapchain_fault(false, 2),
+            Some(PresentFault::SwapchainNotReady)
+        );
+        assert_eq!(swapchain_fault(true, 0), Some(PresentFault::NoImages));
+        assert_eq!(swapchain_fault(true, 2), None);
     }
 }

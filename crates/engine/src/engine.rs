@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use api::error::RenderError;
 use api::geometry::PixelRegion;
-use api::host::SurfaceEvent;
+use api::host::{Presentation, SurfaceEvent};
 use render::{
     BackendKind, FrameStats, FrameTimings, RenderNode, RenderPipeline, RenderScene, RenderState,
     Surface, Texture, TextureDesc, TextureUpload, create_texture, drop_texture, last_frame_timings,
@@ -140,6 +140,53 @@ pub enum EngineError {
     Frame(String),
 }
 
+/// A frame the backend presented, or the reason it did not.
+///
+/// A backend that presents nothing but reports no error leaves the previous
+/// surface contents on screen, so the frame is counted as skipped and retried
+/// instead of being treated as an ordinary frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PresentOutcome {
+    /// Whether the backend presented this frame.
+    presented: bool,
+    /// The surface event the backend reported, if any.
+    surface_event: Option<SurfaceEvent>,
+    /// The fault to report when the frame was not presented.
+    fault: Option<PresentFault>,
+    /// Whether the engine should retry the presentation this frame.
+    retry: bool,
+}
+
+/// The reason a frame was not presented.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresentFault {
+    /// The backend presented nothing and named no surface event.
+    Unreported,
+    /// The backend named the surface event that stopped presentation.
+    Surface(SurfaceEvent),
+}
+
+/// Reduces a backend presentation to the outcome the frame reports.
+fn present_outcome(presentation: Presentation) -> PresentOutcome {
+    PresentOutcome {
+        presented: presentation.presented,
+        surface_event: presentation.surface_event,
+        fault: if presentation.presented {
+            None
+        } else {
+            Some(match presentation.surface_event {
+                Some(event) => PresentFault::Surface(event),
+                None => PresentFault::Unreported,
+            })
+        },
+        retry: !presentation.presented
+            && matches!(
+                presentation.surface_event,
+                None | Some(SurfaceEvent::OutOfDate)
+            ),
+    }
+}
+
 /// Outcome of one [`Engine::step`] or [`Engine::frame`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FrameReport {
@@ -147,6 +194,12 @@ pub struct FrameReport {
     pub frame_index: u64,
     /// The frame clock this frame ran at, in milliseconds.
     pub elapsed_ms: f64,
+    /// Whether the frame was presented to the surface.
+    ///
+    /// A frame with `presented == false` updated the scene but the backend
+    /// kept the previous surface contents; the engine reports and retries it
+    /// instead of treating it as an ordinary frame.
+    pub presented: bool,
     /// Per-frame counters from the null backend, or `None` on a GPU backend.
     pub stats: Option<FrameStats>,
     /// Milliseconds spent syncing dirty bitmaps to textures.
@@ -215,6 +268,14 @@ pub struct Engine {
     /// Whether the unfittable-size warning has been logged since the sizes
     /// last fitted.
     presentation_skipped_logged: bool,
+    /// Presentation fault the engine has already reported, or `None` while
+    /// frames present normally.
+    reported_present_fault: Option<PresentFault>,
+    /// Consecutive frames the backend did not present.
+    present_skips: u32,
+    /// Whether the most recent presentation retry failed, so a repeating
+    /// retry failure is logged once.
+    present_retry_failed: bool,
 }
 
 impl Engine {
@@ -260,6 +321,9 @@ impl Engine {
             last_window_client_size: None,
             pending_window_resize: None,
             presentation_skipped_logged: false,
+            reported_present_fault: None,
+            present_skips: 0,
+            present_retry_failed: false,
         };
         let event = resize_render(
             &engine.pipeline,
@@ -339,9 +403,11 @@ impl Engine {
 
         if self.translation.is_none() {
             self.frame_index = self.frame_index.saturating_add(1);
+            self.present_skips = self.present_skips.saturating_add(1);
             return Ok(FrameReport {
                 frame_index: self.frame_index,
                 elapsed_ms: self.elapsed_ms,
+                presented: false,
                 stats: None,
                 sync_ms: 0.0,
                 upload_ms: 0.0,
@@ -367,17 +433,57 @@ impl Engine {
         let project_ms = project_started.elapsed().as_secs_f64() * 1000.0;
 
         let render_started = Instant::now();
-        let presentation = render(
+        let outcome = match render(
             &self.pipeline,
             &self.surface,
             &mut self.render_state,
             &self.render_scene,
-        )?;
+        ) {
+            Ok(presentation) => present_outcome(presentation),
+            // A swapchain that could not be rebuilt is retried below and on
+            // the next frame; the backend logged the precise cause when it
+            // happened.
+            Err(RenderError::SurfaceOutOfDate) => present_outcome(Presentation {
+                presented: false,
+                surface_event: Some(SurfaceEvent::OutOfDate),
+            }),
+            Err(error) => return Err(error.into()),
+        };
         // A lost surface is recoverable: rebuild the surface and swapchain in
         // the bottom layer and keep the scene, textures and VM in place. The
         // recovered frame is skipped and the next frame presents normally.
-        if presentation.surface_event == Some(SurfaceEvent::Lost) {
+        if outcome.surface_event == Some(SurfaceEvent::Lost) {
             recover_surface(&self.pipeline, &mut self.surface, &mut self.render_state)?;
+            log::info!("engine: presentation surface recreated after it was lost");
+        }
+        if outcome.presented {
+            if self.reported_present_fault.take().is_some() {
+                log::info!(
+                    "engine: presentation resumed after {} skipped frame(s)",
+                    self.present_skips
+                );
+            }
+            self.present_skips = 0;
+            self.present_retry_failed = false;
+        } else {
+            self.present_skips = self.present_skips.saturating_add(1);
+            self.report_present_fault(outcome.fault);
+            if outcome.retry {
+                match resize_render(
+                    &self.pipeline,
+                    &self.surface,
+                    &mut self.render_state,
+                    self.surface_size,
+                ) {
+                    Ok(_) => self.present_retry_failed = false,
+                    Err(error) => {
+                        if !self.present_retry_failed {
+                            log::error!("engine: retrying the presentation failed: {error}");
+                            self.present_retry_failed = true;
+                        }
+                    }
+                }
+            }
         }
         let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -386,6 +492,7 @@ impl Engine {
         Ok(FrameReport {
             frame_index: self.frame_index,
             elapsed_ms: self.elapsed_ms,
+            presented: outcome.presented,
             stats: self.last_frame(),
             sync_ms,
             upload_ms,
@@ -393,6 +500,35 @@ impl Engine {
             project_ms,
             render_ms,
         })
+    }
+
+    /// Reports a presentation fault once for as long as it is the current
+    /// fault, so a persistent stall does not log on every frame.
+    fn report_present_fault(&mut self, fault: Option<PresentFault>) {
+        let Some(fault) = fault else {
+            return;
+        };
+        if self.reported_present_fault == Some(fault) {
+            return;
+        }
+        match fault {
+            PresentFault::Unreported => {
+                log::warn!("engine: the backend presented no frame and reported no surface event")
+            }
+            PresentFault::Surface(SurfaceEvent::Lost) => log::warn!(
+                "engine: the presentation surface was lost; this frame was not presented"
+            ),
+            PresentFault::Surface(SurfaceEvent::OutOfDate) => log::warn!(
+                "engine: the presentation surface is out of date; rebuilding the swapchain"
+            ),
+            PresentFault::Surface(SurfaceEvent::Restored) => {
+                log::warn!("engine: the surface was restored but this frame was not presented")
+            }
+            PresentFault::Surface(SurfaceEvent::Resized(width, height)) => log::warn!(
+                "engine: this frame was not presented after a resize to {width}x{height}"
+            ),
+        }
+        self.reported_present_fault = Some(fault);
     }
 
     /// Rebinds the surface to a new size in physical pixels.
@@ -811,8 +947,10 @@ fn clear_uploaded_dirty(scene: &mut Scene, uploaded: &[u32], succeeded: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Scene, clear_uploaded_dirty, reported_surface_size};
-    use api::host::SurfaceEvent;
+    use super::{
+        PresentFault, Scene, clear_uploaded_dirty, present_outcome, reported_surface_size,
+    };
+    use api::host::{Presentation, SurfaceEvent};
 
     #[test]
     fn a_failed_upload_leaves_every_bitmap_dirty_for_a_retry() {
@@ -841,5 +979,51 @@ mod tests {
             reported_surface_size(SurfaceEvent::OutOfDate, (1280, 720)),
             (1280, 720)
         );
+    }
+
+    #[test]
+    fn a_frame_the_backend_did_not_present_is_reported_and_retried() {
+        // reference/cpp/core/visual/impl/VSyncTimingThread.cpp:114,141-142
+        // The reference presents on every vsync wake; a wake that produced no
+        // frame is a skipped, reported frame rather than a normal one.
+        let outcome = present_outcome(Presentation {
+            presented: false,
+            surface_event: Some(SurfaceEvent::OutOfDate),
+        });
+        assert!(!outcome.presented);
+        assert!(outcome.retry);
+        assert_eq!(
+            outcome.fault,
+            Some(PresentFault::Surface(SurfaceEvent::OutOfDate))
+        );
+
+        let normal = present_outcome(Presentation {
+            presented: true,
+            surface_event: None,
+        });
+        assert!(normal.presented);
+        assert!(!normal.retry);
+        assert_eq!(normal.fault, None);
+    }
+
+    #[test]
+    fn a_lost_surface_is_recovered_without_a_second_swapchain_rebuild() {
+        let lost = present_outcome(Presentation {
+            presented: false,
+            surface_event: Some(SurfaceEvent::Lost),
+        });
+        assert!(!lost.presented);
+        assert!(
+            !lost.retry,
+            "recovering the surface already rebuilt the swapchain"
+        );
+        assert_eq!(lost.fault, Some(PresentFault::Surface(SurfaceEvent::Lost)));
+
+        let unreported = present_outcome(Presentation {
+            presented: false,
+            surface_event: None,
+        });
+        assert_eq!(unreported.fault, Some(PresentFault::Unreported));
+        assert!(unreported.retry);
     }
 }

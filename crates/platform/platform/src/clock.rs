@@ -110,3 +110,55 @@ impl Ticker {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{MAX_FRAME_INTERVAL, MIN_FRAME_INTERVAL, Ticker};
+
+    #[test]
+    fn poll_returns_true_only_on_and_after_the_deadline() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(16);
+        let mut ticker = Ticker::new(interval, start);
+
+        assert_eq!(ticker.deadline(), start);
+        assert!(ticker.poll(start));
+        assert_eq!(ticker.deadline(), start + interval);
+        assert!(!ticker.poll(start + Duration::from_millis(15)));
+        assert!(ticker.poll(start + interval));
+        assert_eq!(ticker.deadline(), start + 2 * interval);
+    }
+
+    #[test]
+    fn a_late_wake_up_re_bases_the_deadline_without_catch_up() {
+        // reference/cpp/core/visual/impl/VSyncTimingThread.cpp:114,141-142
+        // One wake presents one frame, so a wake that arrives a long way past
+        // the deadline must not produce a burst of frames.
+        let start = Instant::now();
+        let interval = Duration::from_millis(16);
+        let mut ticker = Ticker::new(interval, start);
+        let late = start + Duration::from_secs(10);
+
+        assert!(ticker.poll(late));
+        assert_eq!(ticker.deadline(), late + interval);
+        assert!(
+            !ticker.poll(late),
+            "the deadline is re-based on the late wake, not on the missed one"
+        );
+    }
+
+    #[test]
+    fn the_interval_is_clamped_to_the_documented_bounds() {
+        let start = Instant::now();
+
+        let mut zero = Ticker::new(Duration::ZERO, start);
+        assert!(zero.poll(start));
+        assert_eq!(zero.deadline(), start + MIN_FRAME_INTERVAL);
+
+        let mut huge = Ticker::new(Duration::MAX, start);
+        assert!(huge.poll(start));
+        assert_eq!(huge.deadline(), start + MAX_FRAME_INTERVAL);
+    }
+}

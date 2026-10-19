@@ -7,7 +7,7 @@
 //! same function so the core never learns where configuration comes from.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use api::config::{CacheLimit, RuntimeConfig};
 use platform::{EventHandler, Flow, FramePacing, PlatformConfig, PlatformEvent, PlatformWindow};
@@ -231,6 +231,10 @@ struct DesktopApp {
     /// Input and focus events received since the last frame, delivered to
     /// the VM.
     pending_events: Vec<PlatformEvent>,
+    /// Frames delivered since the last heartbeat line.
+    heartbeat_frames: u64,
+    /// Instant of the most recent heartbeat line.
+    heartbeat_at: Instant,
 }
 
 /// What the windowed loop is driving.
@@ -270,14 +274,12 @@ impl Running {
         dt_ms: f32,
         events: &[PlatformEvent],
         pacing: FramePacing,
-    ) -> Result<(), String> {
+    ) -> Result<StepReport, String> {
         match self {
-            Running::Empty(host) => host.step(dt_ms).map(|_| ()).map_err(|e| e.to_string()),
-            Running::Game(game) => {
-                game.step_with_pacing(dt_ms, events, pacing)
-                    .map_err(|e| e.to_string())?;
-                Ok(())
-            }
+            Running::Empty(host) => host.step(dt_ms).map_err(|e| e.to_string()),
+            Running::Game(game) => game
+                .step_with_pacing(dt_ms, events, pacing)
+                .map_err(|e| e.to_string()),
         }
     }
 }
@@ -299,7 +301,32 @@ impl DesktopApp {
             graphic_cache_limit,
             running: None,
             pending_events: Vec::new(),
+            heartbeat_frames: 0,
+            heartbeat_at: Instant::now(),
         }
+    }
+
+    /// Logs one heartbeat line per second of delivered frames.
+    ///
+    /// The line carries the frame index, the frame gap and whether the frame
+    /// reached the surface; the platform loop logs the ticker deadline for the
+    /// same second, so an alive loop that presents nothing is distinguishable
+    /// from one that stopped delivering frames.
+    fn log_heartbeat(&mut self, report: &StepReport, dt_ms: f32, now: Instant) {
+        self.heartbeat_frames = self.heartbeat_frames.saturating_add(1);
+        let elapsed = now.saturating_duration_since(self.heartbeat_at);
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        log::debug!(
+            "app: frame={} (+{} in {:.1} s), dt={dt_ms:.1} ms, presented={}",
+            report.frame_index,
+            self.heartbeat_frames,
+            elapsed.as_secs_f64(),
+            report.presented,
+        );
+        self.heartbeat_at = now;
+        self.heartbeat_frames = 0;
     }
 }
 
@@ -407,30 +434,37 @@ impl EventHandler for DesktopApp {
     }
 
     fn frame(&mut self, dt_ms: f32, window: &PlatformWindow, pacing: FramePacing) -> Flow {
-        let Some(running) = self.running.as_mut() else {
-            return Flow::Continue;
+        let report = {
+            let Some(running) = self.running.as_mut() else {
+                return Flow::Continue;
+            };
+            let events = std::mem::take(&mut self.pending_events);
+            let report = match running.step(dt_ms, &events, pacing) {
+                Ok(report) => report,
+                Err(error) => {
+                    eprintln!("krkr: frame failed: {error}");
+                    return Flow::Exit;
+                }
+            };
+            // A script `Window.setInnerSize` asks the OS window to adopt the
+            // new client size. The engine cleared the request when it was
+            // taken, so a size that does not change again is not applied
+            // twice, and a request the window already shows needs no action.
+            // A backend that applies it synchronously emits no `Resized`, so
+            // the surface is resized here from the size the backend reports.
+            if let Some(size) = running.take_window_resize()
+                && size.0 != 0
+                && size.1 != 0
+                && size != window.size()
+                && let Some(applied) = window.set_size(size)
+                && let Err(error) = running.resize(applied)
+            {
+                eprintln!("krkr: frame resize failed: {error}");
+                return Flow::Exit;
+            }
+            report
         };
-        let events = std::mem::take(&mut self.pending_events);
-        if let Err(error) = running.step(dt_ms, &events, pacing) {
-            eprintln!("krkr: frame failed: {error}");
-            return Flow::Exit;
-        }
-        // A script `Window.setInnerSize` asks the OS window to adopt the new
-        // client size. The engine cleared the request when it was taken, so a
-        // size that does not change again is not applied twice, and a request
-        // the window already shows needs no action. A backend that applies it
-        // synchronously emits no `Resized`, so the surface is resized here from
-        // the size the backend reports.
-        if let Some(size) = running.take_window_resize()
-            && size.0 != 0
-            && size.1 != 0
-            && size != window.size()
-            && let Some(applied) = window.set_size(size)
-            && let Err(error) = running.resize(applied)
-        {
-            eprintln!("krkr: frame resize failed: {error}");
-            return Flow::Exit;
-        }
+        self.log_heartbeat(&report, dt_ms, Instant::now());
         Flow::Continue
     }
 }

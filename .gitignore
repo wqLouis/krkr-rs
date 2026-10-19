@@ -40,3 +40,6 @@ krkr-rs-logs*.txt
 
 # Game plugin DLLs gathered for reverse engineering (binaries, not source).
 /plugins/
+
+# Local subagent evidence, probe workspaces and logs (not source)
+/.agent-tmp/

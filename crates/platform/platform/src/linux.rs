@@ -4,7 +4,8 @@
 //! native event loop into [`PlatformEvent`]/[`EventHandler`] and owns the
 //! window, the frame pacer and the dt computation.
 
-use std::time::Instant;
+use std::fmt;
+use std::time::{Duration, Instant};
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use winit::application::ApplicationHandler;
@@ -21,6 +22,117 @@ use crate::clock::Ticker;
 use crate::event::PlatformEvent;
 use crate::input::{InputEvent, MouseButton, PhysicalKey};
 use crate::{EventHandler, Flow, FramePacing, PlatformConfig, PlatformError};
+
+/// How long a requested redraw may wait for `RedrawRequested` before the
+/// watchdog reports a stall, i.e. the `N` frame intervals of the watchdog
+/// window.
+const REDRAW_STALL_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Wall-clock interval between loop heartbeat lines.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A due frame whose redraw request never came back as `RedrawRequested`.
+///
+/// The loop reports this once per stall episode so frames that keep being
+/// scheduled without drawing anything are visible in the log instead of
+/// showing up only as an absence of output.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RedrawStall {
+    /// Due frames recorded since the last delivered redraw.
+    due_ticks: u32,
+    /// Milliseconds the oldest outstanding request has waited.
+    waited_ms: f64,
+    /// Index of the last frame the handler delivered.
+    frame_index: u64,
+}
+
+impl fmt::Display for RedrawStall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "redraw stalled: {} due frame(s) with no frame delivered for {:.1} ms \
+             after the request (last frame {})",
+            self.due_ticks, self.waited_ms, self.frame_index
+        )
+    }
+}
+
+impl std::error::Error for RedrawStall {}
+
+/// Tracks due frames whose redraw request was never delivered.
+///
+/// The ticker requests one redraw per due frame and winit delivers it as a
+/// `RedrawRequested` on a following loop turn. When that callback does not
+/// arrive the loop keeps pacing frames that draw nothing, so the watchdog
+/// records the outstanding request, counts the due frames it spans and
+/// reports the stall once per episode.
+#[derive(Clone, Copy, Debug)]
+struct RedrawWatchdog {
+    /// Due frames recorded since the last delivered redraw.
+    due: u32,
+    /// Instant the oldest outstanding request was made, or `None` when no
+    /// request is outstanding.
+    requested_at: Option<Instant>,
+    /// Whether the current episode has been logged.
+    reported: bool,
+    /// Stall episodes reported so far.
+    episodes: u64,
+}
+
+impl RedrawWatchdog {
+    fn new() -> Self {
+        Self {
+            due: 0,
+            requested_at: None,
+            reported: false,
+            episodes: 0,
+        }
+    }
+
+    /// Records a due frame and the redraw request it made.
+    fn note_tick(&mut self, now: Instant) {
+        self.due = self.due.saturating_add(1);
+        if self.requested_at.is_none() {
+            self.requested_at = Some(now);
+        }
+    }
+
+    /// Records a delivered redraw and returns the due count of a stall it
+    /// ended, or `None` when the delivery was on time.
+    fn note_redraw(&mut self) -> Option<u32> {
+        let reported = self.reported;
+        let due = self.due;
+        self.reset();
+        if reported { Some(due) } else { None }
+    }
+
+    /// Returns the stall to report when the outstanding request has waited its
+    /// full timeout, or `None`.
+    fn check(&mut self, now: Instant, frame_index: u64) -> Option<RedrawStall> {
+        if self.reported {
+            return None;
+        }
+        let requested_at = self.requested_at?;
+        let waited = now.saturating_duration_since(requested_at);
+        if waited < REDRAW_STALL_TIMEOUT {
+            return None;
+        }
+        self.reported = true;
+        self.episodes = self.episodes.saturating_add(1);
+        Some(RedrawStall {
+            due_ticks: self.due,
+            waited_ms: waited.as_secs_f64() * 1000.0,
+            frame_index,
+        })
+    }
+
+    /// Clears the current episode, keeping the completed episode count.
+    fn reset(&mut self) {
+        self.due = 0;
+        self.requested_at = None;
+        self.reported = false;
+    }
+}
 
 /// The window created by [`run`].
 ///
@@ -133,6 +245,16 @@ struct AppLoop<H: EventHandler> {
     last_frame_end: Instant,
     /// Input dispatch time accumulated since the last frame.
     input_ms: f64,
+    /// Frames delivered to the handler.
+    frames: u64,
+    /// Frame gap of the most recent delivered frame, in milliseconds.
+    last_dt_ms: f32,
+    /// Due frames whose redraw request has not been delivered.
+    watchdog: RedrawWatchdog,
+    /// Frames delivered since the last heartbeat line.
+    heartbeat_frames: u64,
+    /// Instant of the most recent heartbeat line.
+    heartbeat_at: Instant,
     /// First fatal error seen inside the loop, returned by [`run`].
     failure: Option<PlatformError>,
 }
@@ -148,8 +270,44 @@ impl<H: EventHandler> AppLoop<H> {
             last_frame: now,
             last_frame_end: now,
             input_ms: 0.0,
+            frames: 0,
+            last_dt_ms: 0.0,
+            watchdog: RedrawWatchdog::new(),
+            heartbeat_frames: 0,
+            heartbeat_at: now,
             failure: None,
         }
+    }
+
+    /// Logs the loop's heartbeat once per interval.
+    ///
+    /// The line carries the delivered frame count, the last frame gap, the
+    /// next ticker deadline and the outstanding redraw requests, so a loop
+    /// that is alive but presenting nothing is distinguishable from one that
+    /// stopped.
+    fn heartbeat(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.heartbeat_at);
+        if elapsed < HEARTBEAT_INTERVAL {
+            return;
+        }
+        let deadline_in_ms = self
+            .ticker
+            .deadline()
+            .saturating_duration_since(now)
+            .as_secs_f64()
+            * 1000.0;
+        log::debug!(
+            "platform: frames={} (+{} in {:.1} s), due_without_frame={}, \
+             last_dt={:.1} ms, next_deadline={deadline_in_ms:.1} ms, stalls={}",
+            self.frames,
+            self.heartbeat_frames,
+            elapsed.as_secs_f64(),
+            self.watchdog.due,
+            self.last_dt_ms,
+            self.watchdog.episodes,
+        );
+        self.heartbeat_at = now;
+        self.heartbeat_frames = 0;
     }
 
     /// Records a fatal error and exits the loop.
@@ -185,6 +343,9 @@ impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
             self.last_frame = now;
             self.last_frame_end = now;
             self.ticker = Ticker::new(self.config.frame_interval, now);
+            self.watchdog.reset();
+            self.heartbeat_at = now;
+            self.heartbeat_frames = 0;
             self.window = Some(PlatformWindow { window });
         }
 
@@ -218,7 +379,16 @@ impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
             WindowEvent::Focused(focused) => self.handler.event(PlatformEvent::Focused(focused)),
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
+                if let Some(due) = self.watchdog.note_redraw() {
+                    log::info!(
+                        "platform: redraw delivery resumed after {due} due frame(s) \
+                         without a delivered frame"
+                    );
+                }
                 let dt_ms = now.saturating_duration_since(self.last_frame).as_secs_f32() * 1000.0;
+                self.frames = self.frames.saturating_add(1);
+                self.heartbeat_frames = self.heartbeat_frames.saturating_add(1);
+                self.last_dt_ms = dt_ms;
                 let poll_ms = now
                     .saturating_duration_since(self.last_frame_end)
                     .as_secs_f64()
@@ -256,8 +426,13 @@ impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
         if self.ticker.poll(now)
             && let Some(window) = &self.window
         {
+            self.watchdog.note_tick(now);
             window.request_redraw();
         }
+        if let Some(stall) = self.watchdog.check(now, self.frames) {
+            log::error!("platform: {stall}");
+        }
+        self.heartbeat(now);
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.ticker.deadline()));
         if self.handler.about_to_wait() == Flow::Exit {
             event_loop.exit();
@@ -864,5 +1039,90 @@ pub(crate) mod audio {
             assert_eq!(FALLBACK_SPEC.sample_rate, 44_100);
             assert_eq!(FALLBACK_SPEC.channels, 2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{REDRAW_STALL_TIMEOUT, RedrawWatchdog};
+
+    #[test]
+    fn a_stall_is_reported_once_after_the_timeout() {
+        // reference/cpp/core/visual/impl/VSyncTimingThread.cpp:114,141-142
+        // The reference presents on every vsync wake and flags the continuous
+        // handler there; a frame request that never reaches the handler has no
+        // equivalent, so the loop must report it.
+        let start = Instant::now();
+        let mut watchdog = RedrawWatchdog::new();
+
+        watchdog.note_tick(start);
+        assert!(
+            watchdog
+                .check(start + REDRAW_STALL_TIMEOUT / 2, 3)
+                .is_none(),
+            "a request that has not waited its timeout is not a stall"
+        );
+
+        let stall = watchdog
+            .check(start + REDRAW_STALL_TIMEOUT, 3)
+            .expect("the outstanding request is a stall");
+        assert_eq!(stall.due_ticks, 1);
+        assert_eq!(stall.frame_index, 3);
+        assert!(stall.waited_ms >= 1000.0);
+
+        // The same episode is not reported again on every later turn.
+        watchdog.note_tick(start + REDRAW_STALL_TIMEOUT);
+        assert!(
+            watchdog
+                .check(start + 2 * REDRAW_STALL_TIMEOUT, 3)
+                .is_none(),
+            "the episode has already been reported"
+        );
+        assert_eq!(watchdog.episodes, 1);
+    }
+
+    #[test]
+    fn a_delivered_redraw_ends_the_stall_and_a_new_one_can_be_reported() {
+        let start = Instant::now();
+        let mut watchdog = RedrawWatchdog::new();
+
+        watchdog.note_tick(start);
+        watchdog.note_tick(start + Duration::from_millis(16));
+        assert!(watchdog.check(start + REDRAW_STALL_TIMEOUT, 0).is_some());
+
+        assert_eq!(
+            watchdog.note_redraw(),
+            Some(2),
+            "the ended episode reports how many due frames it covered"
+        );
+        assert!(
+            watchdog
+                .check(start + 3 * REDRAW_STALL_TIMEOUT, 1)
+                .is_none()
+        );
+        assert_eq!(watchdog.due, 0);
+
+        // A later withheld redraw is a new episode.
+        watchdog.note_tick(start + 4 * REDRAW_STALL_TIMEOUT);
+        assert!(
+            watchdog
+                .check(start + 5 * REDRAW_STALL_TIMEOUT, 1)
+                .is_some(),
+            "a new episode is reported after the first one ended"
+        );
+        assert_eq!(watchdog.episodes, 2);
+    }
+
+    #[test]
+    fn an_on_time_delivery_reports_no_stall() {
+        let start = Instant::now();
+        let mut watchdog = RedrawWatchdog::new();
+
+        watchdog.note_tick(start);
+        assert_eq!(watchdog.note_redraw(), None);
+        assert!(watchdog.check(start + REDRAW_STALL_TIMEOUT, 0).is_none());
+        assert_eq!(watchdog.episodes, 0);
     }
 }
