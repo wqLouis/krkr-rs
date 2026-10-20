@@ -107,7 +107,7 @@ pub(crate) struct Frame {
     /// `0` invisible, `2` static, `3` interpolate.
     pub(crate) frame_type: i32,
     /// Whether the frame carries a `content` dictionary. A frame without
-    /// content is a terminator, not a keyframe.
+    /// content is invisible; the trailing one is only a terminator.
     pub(crate) has_content: bool,
     /// The icon source reference (`src/<chara>/<icon>`).
     pub(crate) src: String,
@@ -1203,6 +1203,8 @@ pub(crate) fn evaluate_frames(frames: &[Frame], time: f64) -> FrameState {
             break;
         }
     }
+    // The last entry of a multi-frame list is never the active keyframe, so a
+    // trailing contentless frame holds the frame before it.
     if frames.len() > 1 {
         active_index = active_index.min(frames.len() - 2);
     }
@@ -1621,13 +1623,13 @@ mod tests {
             Frame {
                 time: 0.0,
                 frame_type: 0,
-                has_content: true,
                 ..Frame::default()
             },
             Frame {
                 time: 40.0,
                 frame_type: 3,
                 has_content: true,
+                src: "src/title/logo".to_string(),
                 x: -705.0,
                 y: -388.0,
                 scale_x: 1.1,
@@ -1639,6 +1641,7 @@ mod tests {
                 time: 75.0,
                 frame_type: 3,
                 has_content: true,
+                src: "src/title/logo".to_string(),
                 x: -705.0,
                 y: -388.0,
                 ..Frame::default()
@@ -1649,6 +1652,10 @@ mod tests {
                 ..Frame::default()
             },
         ];
+        assert!(
+            !evaluate_frames(&frames, 0.0).active,
+            "the contentless first frame is invisible"
+        );
         for time in [97.0, 119.9, 120.0, 1_000_000.0] {
             let state = evaluate_frames(&frames, time);
             assert!(state.active, "t={time} must hold a content frame");
@@ -1657,6 +1664,7 @@ mod tests {
             assert_eq!(state.scale_x, 1.0, "t={time}");
             assert_eq!(state.scale_y, 1.0, "t={time}");
             assert_eq!(state.opacity, 1.0, "t={time}");
+            assert_eq!(state.src, "src/title/logo", "t={time}");
         }
     }
 
@@ -1686,6 +1694,109 @@ mod tests {
             ..Frame::default()
         }];
         assert!(!evaluate_frames(&hidden, 0.0).active);
+    }
+
+    #[test]
+    fn the_clip_origin_interpolates_between_content_frames() {
+        // `ox`/`oy` are interpolated with the other slot properties
+        // (`reference/cpp/plugins/motionplayer/PlayerInternal.h:1331-1332`).
+        let frames = vec![
+            Frame {
+                time: 0.0,
+                frame_type: 3,
+                has_content: true,
+                ox: 10.0,
+                oy: -4.0,
+                ..Frame::default()
+            },
+            Frame {
+                time: 10.0,
+                frame_type: 3,
+                has_content: true,
+                ox: 30.0,
+                oy: 4.0,
+                ..Frame::default()
+            },
+            Frame {
+                time: 20.0,
+                frame_type: 0,
+                ..Frame::default()
+            },
+        ];
+        let midway = evaluate_frames(&frames, 5.0);
+        assert_eq!(midway.ox, 20.0);
+        assert_eq!(midway.oy, 0.0);
+        let held = evaluate_frames(&frames, 20.0);
+        assert_eq!(held.ox, 30.0);
+        assert_eq!(held.oy, 4.0);
+    }
+
+    #[test]
+    fn keyframe_actions_and_syncs_fire_when_their_time_is_crossed() {
+        // A frame's `content.action` emits an action event carrying the layer
+        // label, and a nonzero `content.sync` emits a sync event
+        // (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1814-1920`,
+        // `PlayerFrameProgress.cpp:872-885`).
+        let layer = dict(vec![
+            ("label", text("layer")),
+            ("type", num(0)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    frame(0, 2, text("src/a/b")),
+                    dict(vec![
+                        ("time", num(10)),
+                        ("type", num(2)),
+                        (
+                            "content",
+                            dict(vec![
+                                ("src", text("src/a/b")),
+                                ("action", text("wave")),
+                                ("sync", num(1)),
+                            ]),
+                        ),
+                    ]),
+                    dict(vec![("time", num(20)), ("type", num(0))]),
+                ]),
+            ),
+        ]);
+        let clip = dict(vec![
+            ("lastTime", num(20)),
+            ("layer", PsbValue::List(vec![layer])),
+        ]);
+        let root = dict(vec![(
+            "object",
+            dict(vec![(
+                "test",
+                dict(vec![("motion", dict(vec![("clip", clip)]))]),
+            )]),
+        )]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root,
+                resources: Vec::new(),
+            },
+            "events.psb",
+        );
+        let nodes = build_node_tree(&snapshot, snapshot.clip("clip"));
+        assert_eq!(
+            scan_frame_events(&nodes, 0.0, 10.0),
+            vec![
+                MotionEvent {
+                    kind: 0,
+                    param1: "wave".to_string(),
+                    param2: "layer".to_string(),
+                },
+                MotionEvent {
+                    kind: 1,
+                    param1: "layer".to_string(),
+                    param2: String::new(),
+                },
+            ]
+        );
+        assert!(scan_frame_events(&nodes, 10.0, 20.0).is_empty());
+        // A loop restart moves the clock backwards; no crossing is reported.
+        assert!(scan_frame_events(&nodes, 20.0, 5.0).is_empty());
     }
 
     fn node_labels(nodes: &[MotionNode]) -> Vec<&str> {

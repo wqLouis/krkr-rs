@@ -287,7 +287,7 @@ impl PlayerInst {
 
     /// Recompute the playing timeline list and report whether any timeline is
     /// still playing.
-    pub(crate) fn is_playing(&mut self) -> bool {
+    pub(crate) fn playing_now(&mut self) -> bool {
         self.prune_playing_timelines();
         self.allplaying
     }
@@ -644,6 +644,7 @@ impl PlayerInst {
 
     /// Advance everything by `dt_ms` milliseconds.
     pub(crate) fn progress(&mut self, dt_ms: f64, ctx: &CompatCtx, objthis: *mut std::ffi::c_void) {
+        self.pending_events.clear();
         if !self.speed {
             return;
         }
@@ -699,6 +700,7 @@ impl PlayerInst {
             }
         }
         self.prune_playing_timelines();
+        self.sync_active = self.sync_waiting && self.allplaying;
     }
 
     pub(crate) fn step_animators(&mut self, dt: f32) {
@@ -725,6 +727,8 @@ impl PlayerInst {
         let root = &mut self.nodes[0];
         root.accumulated.x = root.local.x + self.root_x;
         root.accumulated.y = root.local.y + self.root_y;
+        root.accumulated.ox = root.local.ox;
+        root.accumulated.oy = root.local.oy;
         root.accumulated.active = self.visible;
         root.accumulated.opacity = self.opacity;
         root.draw_flag = self.visible;
@@ -1124,11 +1128,14 @@ impl PlayerInst {
         let scene = unsafe { &mut *scene };
         let color = color_bytes(self.color.bytes);
         let nodes = drawable_nodes(&self.nodes);
-        let (width, height) = scene
-            .layer(layer_id)
-            .map(|layer| (layer.rect.w as i32, layer.rect.h as i32))
-            .unwrap_or((0, 0));
-        if width <= 0 || height <= 0 {
+        let Some(bitmap_id) = scene.layer(layer_id).and_then(|layer| layer.bitmap) else {
+            return Ok(());
+        };
+        let (width, height) = match scene.bitmap(bitmap_id) {
+            Some(bitmap) => (bitmap.width, bitmap.height),
+            None => return Ok(()),
+        };
+        if width == 0 || height == 0 {
             return Ok(());
         }
         let snapshot = self.snapshot.clone();
@@ -1140,10 +1147,12 @@ impl PlayerInst {
         let affine = self.affine;
         let textures = &mut self.textures;
         let rendered = scene.with_main_image_pixels_mut(layer_id, |pixels| {
-            let mut bitmap = BitmapState::new(width as u32, height as u32, pixels.to_vec());
-            for pixel in bitmap.rgba.chunks_exact_mut(4) {
+            // Every draw starts from a clear target; the previous pose never
+            // survives into this frame.
+            for pixel in pixels.chunks_exact_mut(4) {
                 pixel.copy_from_slice(&clear);
             }
+            let mut bitmap = BitmapState::new(width, height, pixels.to_vec());
             let missing = composite_nodes(
                 &mut bitmap,
                 &nodes,
@@ -1163,10 +1172,7 @@ impl PlayerInst {
                 log::warn!("Motion.Player.draw: no texture for {src}");
             }
         }
-        let bitmap_id = scene.layer(layer_id).and_then(|layer| layer.bitmap);
-        if let Some(bitmap_id) = bitmap_id
-            && let Some(bitmap) = scene.bitmap_mut(bitmap_id)
-        {
+        if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
             bitmap.rgba = rgba;
             bitmap.mark_dirty();
         }
@@ -1850,7 +1856,7 @@ extern "C" fn player_is_playing_raw(
     let Some(inst) = (unsafe { super::helpers::inst_mut::<PlayerInst>(instance) }) else {
         return report_error(out_error, "Player: null instance");
     };
-    set_bool(out, inst.is_playing());
+    set_bool(out, inst.playing_now());
     0
 }
 
@@ -2402,9 +2408,11 @@ mod tests {
     }
 
     fn player(snapshot: &MotionSnapshot) -> PlayerInst {
-        let mut player = PlayerInst::default();
-        player.snapshot = Some(std::sync::Arc::new(snapshot.clone()));
-        player.motion_key = "intro".to_string();
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "intro".to_string(),
+            ..PlayerInst::default()
+        };
         prime_timelines(snapshot, &mut player.timelines);
         player.nodes = build_node_tree(snapshot, snapshot.clip("intro"));
         player
@@ -2452,11 +2460,11 @@ mod tests {
         let mut player = player(&snapshot);
         player.play("intro", 0, &ctx).expect("start intro");
         player.progress(2000.0, &ctx, std::ptr::null_mut());
-        assert!(!player.is_playing(), "the one-shot intro stopped");
+        assert!(!player.playing_now(), "the one-shot intro stopped");
         assert!(player.playing_timelines.is_empty());
         player.play("idle", 0, &ctx).expect("start idle");
         player.progress(0.0, &ctx, std::ptr::null_mut());
-        assert!(player.is_playing(), "the idle timeline is playing");
+        assert!(player.playing_now(), "the idle timeline is playing");
         // The idle clip is one frame long; the intro reached its 120-frame
         // end. The evaluation clock is the idle timeline's own zero
         // (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:869-871`).
@@ -2495,13 +2503,13 @@ mod tests {
             Frame {
                 time: 0.0,
                 frame_type: 0,
-                has_content: true,
                 ..Frame::default()
             },
             Frame {
                 time: 40.0,
                 frame_type: 3,
                 has_content: true,
+                src: "src/title/logo".to_string(),
                 x: -705.0,
                 y: -388.0,
                 scale_x: 1.1,
@@ -2513,6 +2521,7 @@ mod tests {
                 time: 75.0,
                 frame_type: 3,
                 has_content: true,
+                src: "src/title/logo".to_string(),
                 x: -705.0,
                 y: -388.0,
                 ..Frame::default()
@@ -2540,21 +2549,32 @@ mod tests {
         // 960 + (-705) - 219 = 36, 540 + (-388) - 92 = 60. The trailing
         // contentless frame is not a keyframe
         // (`reference/cpp/plugins/motionplayer/PlayerUpdateLayerEval.cpp:282-311`).
-        for time in [75.0, 97.0, 119.9, 1_000_000.0] {
+        for time in [75.0, 97.0, 119.9, 120.0, 1_000_000.0] {
             let state = evaluate_frames(&logo_frames(), time);
             assert_eq!(logo_corner(&state), (36.0, 60.0), "t={time}");
+            assert_eq!(state.src, "src/title/logo", "t={time}");
         }
-        let normal = vec![super::super::model::Frame {
-            time: 0.0,
-            frame_type: 0,
-            has_content: true,
-            x: -705.0,
-            y: -388.0,
-            ..super::super::model::Frame::default()
-        }];
+        let normal = vec![
+            super::super::model::Frame {
+                time: 0.0,
+                frame_type: 3,
+                has_content: true,
+                src: "src/title/logo".to_string(),
+                x: -705.0,
+                y: -388.0,
+                ..super::super::model::Frame::default()
+            },
+            super::super::model::Frame {
+                time: 1.0,
+                frame_type: 0,
+                ..super::super::model::Frame::default()
+            },
+        ];
         for time in [0.0, 100.0] {
             let state = evaluate_frames(&normal, time);
+            assert!(state.active, "t={time} holds the idle content frame");
             assert_eq!(logo_corner(&state), (36.0, 60.0), "t={time}");
+            assert_eq!(state.src, "src/title/logo", "t={time}");
         }
     }
 

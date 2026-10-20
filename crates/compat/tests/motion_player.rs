@@ -485,6 +485,7 @@ fn player_draw_leaves_the_target_layer_geometry_and_visibility_alone() {
     env.run(&format!(
         "var rm = new Motion.ResourceManager(null, 1024); \
          var w = new Window(); \
+         var base = new Layer(w, null); \
          var target = new Layer(w, null); \
          target.setSize(800, 1080); \
          target.left = 7; \
