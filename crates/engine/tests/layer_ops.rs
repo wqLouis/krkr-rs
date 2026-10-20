@@ -364,6 +364,141 @@ fn render_layer_subtree_ignores_hidden_child_changes() {
     );
 }
 
+/// An outer layer over an inner layer that consumes a cache over a visible
+/// grandchild. The inner layer composites its subtree and publishes the
+/// content as its cache. Returns the scene, the outer/inner layer ids, the
+/// inner cache content and the grandchild's main image.
+fn nested_cache_scene() -> (Scene, u32, u32, u32, u32) {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (2, 2));
+    let outer = scene.add_layer(win, None);
+    {
+        let l = scene.layer_mut(outer).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.visible = true;
+    }
+    let inner = scene.add_layer(win, Some(outer));
+    {
+        let l = scene.layer_mut(inner).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.visible = true;
+    }
+    let grandchild = scene.add_layer(win, Some(inner));
+    let live = solid_bitmap(&mut scene, 2, 2, [10, 20, 30, 255]);
+    {
+        let l = scene.layer_mut(grandchild).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.visible = true;
+        l.bitmap = Some(live);
+    }
+    scene.inc_cache_enabled_count(inner);
+    let content = render_layer_subtree(&mut scene, inner).expect("inner content");
+    scene.set_cache_bitmap(inner, Some(content));
+    (scene, outer, inner, content, live)
+}
+
+/// Fill a bitmap with one opaque colour.
+fn paint(scene: &mut Scene, id: u32, color: [u8; 4]) {
+    let bitmap = scene.bitmap_mut(id).expect("bitmap to paint");
+    for pixel in bitmap.rgba.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&color);
+    }
+}
+
+/// A descendant whose subtree cache is live draws that cache instead of its
+/// live subtree: the parent's `Draw` calls the child's `Draw`
+/// (`LayerIntf.cpp:7180-7198`), which hands its `CacheBitmap` to the parent
+/// through `DrawCompleted` (`:7223-7226`) and covers the grandchildren.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7180-7198
+/// reference/cpp/core/visual/LayerIntf.cpp:7223-7226
+#[test]
+fn render_layer_subtree_uses_a_live_nested_cache() {
+    let (mut scene, outer, _inner, content, _live) = nested_cache_scene();
+    // Paint the cached content a colour the live subtree never has, so the
+    // outer composite reveals which source it sampled.
+    paint(&mut scene, content, [200, 100, 50, 255]);
+
+    let outer_content = render_layer_subtree(&mut scene, outer).expect("outer content");
+    let bitmap = scene.bitmap(outer_content).unwrap();
+    assert_eq!(
+        &bitmap.rgba[..4],
+        &[200, 100, 50, 255],
+        "the outer cache holds the child's cached content"
+    );
+    assert_eq!(
+        &bitmap.rgba[4..8],
+        &[200, 100, 50, 255],
+        "the grandchild covered by the cache is not drawn on top of it"
+    );
+}
+
+/// A nested cache is sampled only while it is current. An edit behind the
+/// layer accessors advances the drawn source's generation, so the outer
+/// composite falls back to the child's live subtree; a layer change marks the
+/// child's cache for recomposite the same way (`Update` appends to the
+/// ancestor's `CacheRecalcRegion`). Once the child recomposites, the outer
+/// samples the refreshed cache again.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:6305-6335
+/// reference/cpp/core/visual/LayerIntf.cpp:7734-7737
+#[test]
+fn render_layer_subtree_falls_back_from_a_stale_nested_cache() {
+    let (mut scene, outer, inner, content, live) = nested_cache_scene();
+    paint(&mut scene, content, [200, 100, 50, 255]);
+    let outer_content = render_layer_subtree(&mut scene, outer).expect("outer content");
+    assert_eq!(
+        &scene.bitmap(outer_content).unwrap().rgba[..4],
+        &[200, 100, 50, 255]
+    );
+
+    // The grandchild's pixels change without a layer accessor: the inner
+    // cache's recorded source generation no longer matches.
+    scene.bitmap_mut(live).unwrap().rgba[..4].copy_from_slice(&[0, 255, 0, 255]);
+    let outer_content = render_layer_subtree(&mut scene, outer).expect("outer content");
+    assert_eq!(
+        &scene.bitmap(outer_content).unwrap().rgba[..4],
+        &[0, 255, 0, 255],
+        "a stale cache is not sampled"
+    );
+
+    // Recompositing the inner cache makes it live again.
+    let refreshed = render_layer_subtree(&mut scene, inner).expect("inner content");
+    assert_eq!(refreshed, content, "the cache bitmap is reused");
+    scene.set_cache_bitmap(inner, Some(refreshed));
+    paint(&mut scene, refreshed, [50, 100, 200, 255]);
+    scene.set_bitmap_clean(outer_content);
+    let outer_content = render_layer_subtree(&mut scene, outer).expect("outer content");
+    assert_eq!(
+        &scene.bitmap(outer_content).unwrap().rgba[..4],
+        &[50, 100, 200, 255],
+        "the refreshed cache is sampled"
+    );
+    assert!(
+        scene.bitmap(outer_content).unwrap().dirty,
+        "the outer cache is recomposited"
+    );
+
+    // A layer write marks the child's cache for recomposite; the outer falls
+    // back to the live subtree until the child rebuilds it.
+    scene.layer_mut(inner).unwrap().name = "inner".to_string();
+    let outer_content = render_layer_subtree(&mut scene, outer).expect("outer content");
+    assert_eq!(
+        &scene.bitmap(outer_content).unwrap().rgba[..4],
+        &[0, 255, 0, 255],
+        "a pending recomposite is not sampled"
+    );
+    let refreshed = render_layer_subtree(&mut scene, inner).expect("inner content");
+    scene.set_cache_bitmap(inner, Some(refreshed));
+    paint(&mut scene, refreshed, [5, 6, 7, 255]);
+    let outer_content = render_layer_subtree(&mut scene, outer).expect("outer content");
+    assert_eq!(
+        &scene.bitmap(outer_content).unwrap().rgba[..4],
+        &[5, 6, 7, 255],
+        "the rebuilt cache is sampled"
+    );
+}
+
 /// `Scene::update_layer` skips all invalidation when its closure reports no
 /// change: the layer's subtree cache and every caching ancestor's stay clean
 /// and `Scene::revision` does not advance. The reference guards a property

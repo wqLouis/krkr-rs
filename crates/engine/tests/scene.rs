@@ -508,6 +508,43 @@ fn revision_tracks_mutations_but_not_dirty_clear() {
     );
 }
 
+/// `bitmap_mut_with_source` borrows the write target and one read source at
+/// once, in either pool order, and refuses the bitmap it writes. It is a
+/// borrow accessor, not a content change: neither the revision nor the
+/// target's `content_generation` moves (the caller reports the write once).
+#[test]
+fn bitmap_mut_with_source_splits_without_touching_the_revision() {
+    let mut scene = Scene::default();
+    let first = scene.add_bitmap(1, 1, vec![1; 4]);
+    let second = scene.add_bitmap(1, 1, vec![2; 4]);
+    let revision = scene.revision();
+
+    // Source after the target in the pool.
+    {
+        let (target, source) = scene
+            .bitmap_mut_with_source(first, second)
+            .expect("distinct bitmaps");
+        target.rgba[0] = source.rgba[0];
+    }
+    assert_eq!(scene.bitmap(first).unwrap().rgba[0], 2);
+    // Source before the target in the pool.
+    {
+        let (target, source) = scene
+            .bitmap_mut_with_source(second, first)
+            .expect("distinct bitmaps");
+        target.rgba[1] = source.rgba[0];
+    }
+    assert_eq!(scene.bitmap(second).unwrap().rgba[1], 2);
+
+    assert!(
+        scene.bitmap_mut_with_source(first, first).is_none(),
+        "a composite never samples the bitmap it writes"
+    );
+    assert!(scene.bitmap_mut_with_source(first, 9999).is_none());
+    assert_eq!(scene.revision(), revision);
+    assert_eq!(scene.bitmap(first).unwrap().content_generation, 0);
+}
+
 /// `resize_province_image` uses checked arithmetic and a fallible allocation:
 /// a size that cannot be represented/allocated leaves the existing plane
 /// untouched, while a large-but-valid plane is allowed.

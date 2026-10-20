@@ -203,7 +203,12 @@ subtree content (or the MainImage for a trivial subtree) and allocates the
 cache content on demand; the frame body composites the script-cached layers
 with it after the transition step and before the upload and projection, and
 publishes the result as the layer's cache bitmap unless it is the layer's own
-MainImage. A layer owned by an active transition, or one whose subtree contains
+MainImage. A descendant whose own cache is current — a live consumer, no
+pending recomposite, source generations unchanged, and the cache bitmap is its
+composited content rather than a transition frame — is composited through that
+cache bitmap, and its descendants are covered by it; otherwise the descendant
+contributes its live image. The subtree root itself never sources its own
+cache. A layer owned by an active transition, or one whose subtree contains
 a whole-subtree transition, keeps drawing live instead.
 
 **Coordinates:** all rects and bitmap dimensions are VM pixels; bitmap buffers

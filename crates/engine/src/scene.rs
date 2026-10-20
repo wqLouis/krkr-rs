@@ -2265,16 +2265,21 @@ impl Scene {
         Ok(image)
     }
 
-    /// Look up a bitmap by id. Uses the id→index map, falling back to a
-    /// linear scan if callers edited [`Scene::bitmaps`] directly.
-    pub fn bitmap(&self, id: u32) -> Option<&BitmapState> {
+    /// The pool index of a bitmap id. Uses the id→index map, falling back to
+    /// a linear scan if callers edited [`Scene::bitmaps`] directly.
+    fn bitmap_position(&self, id: u32) -> Option<usize> {
         if let Some(index) = self.bitmap_index.get(&id).copied()
-            && let Some(bitmap) = self.bitmaps.get(index)
-            && bitmap.id == id
+            && self.bitmaps.get(index).is_some_and(|b| b.id == id)
         {
-            return Some(bitmap);
+            return Some(index);
         }
-        self.bitmaps.iter().find(|b| b.id == id)
+        self.bitmaps.iter().position(|b| b.id == id)
+    }
+
+    /// Look up a bitmap by id.
+    pub fn bitmap(&self, id: u32) -> Option<&BitmapState> {
+        self.bitmap_position(id)
+            .and_then(|index| self.bitmaps.get(index))
     }
 
     /// Mutably look up a bitmap by id, bumping [`Scene::revision`] and the
@@ -2282,19 +2287,45 @@ impl Scene {
     /// a possible content change).
     pub fn bitmap_mut(&mut self, id: u32) -> Option<&mut BitmapState> {
         self.touch();
-        let index = self
-            .bitmap_index
-            .get(&id)
-            .copied()
-            .filter(|&index| self.bitmaps.get(index).is_some_and(|b| b.id == id));
-        let mut bitmap = match index {
-            Some(index) => self.bitmaps.get_mut(index),
-            None => self.bitmaps.iter_mut().find(|b| b.id == id),
-        };
+        let mut bitmap = self.bitmap_mut_untracked(id);
         if let Some(state) = bitmap.as_mut() {
             state.content_generation = state.content_generation.wrapping_add(1);
         }
         bitmap
+    }
+
+    /// Mutably look up a bitmap by id without bumping the revision or the
+    /// content generation. Used by a pass that writes one bitmap many times
+    /// and reports the change once.
+    pub(crate) fn bitmap_mut_untracked(&mut self, id: u32) -> Option<&mut BitmapState> {
+        let index = self.bitmap_position(id)?;
+        self.bitmaps.get_mut(index)
+    }
+
+    /// Borrow the composite target `dst` mutably and one source `src`
+    /// immutably at the same time. Unlike [`Scene::bitmap_mut`] this bumps
+    /// neither the revision nor a content generation: a composite takes one
+    /// mutable borrow per pass and samples many sources. Returns `None` when
+    /// an id is missing or `dst` and `src` are the same bitmap, because a
+    /// composite never samples the bitmap it writes.
+    pub fn bitmap_mut_with_source(
+        &mut self,
+        dst: u32,
+        src: u32,
+    ) -> Option<(&mut BitmapState, &BitmapState)> {
+        let di = self.bitmap_position(dst)?;
+        let si = self.bitmap_position(src)?;
+        if di == si {
+            return None;
+        }
+        let (left, right) = self.bitmaps.split_at_mut(di);
+        let (dst_slice, right) = right.split_at_mut(1);
+        let source = if si < di {
+            &left[si]
+        } else {
+            &right[si - di - 1]
+        };
+        Some((&mut dst_slice[0], source))
     }
 
     /// Borrow `dst` mutably and `src1`/`src2` immutably at the same time. The
