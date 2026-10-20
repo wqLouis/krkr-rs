@@ -71,6 +71,14 @@ struct tjs2_engine {
     // value stays callable until the id is erased. Erasing (or destroying
     // the map with the engine) releases the reference. Ids are engine-local
     // and never 0 (0 is the null tjs2_value_id sentinel).
+    //
+    // Releasing an entry releases the TJS object it holds, and that
+    // object's destructor can release other entries (a native instance's
+    // payload owns the retained values it holds). The registry is therefore
+    // detached from the engine before its values are destroyed: the teardown
+    // moves the entries into a local map, leaves this map empty, and clears
+    // the local map, so a nested release cannot unlink a node the walk is
+    // following.
     std::unordered_map<uintptr_t, TJS::tTJSVariant> retained;
     uintptr_t next_retained_id = 1;
     // The most recent object-valued result this engine produced (from
@@ -1791,7 +1799,23 @@ void tjs2_destroy(tjs2_engine *e) {
         // classes while the VM is still alive: their releases/destructors
         // may touch global VM state that ~tTJS frees. (The global object's
         // refs were already dropped by Shutdown's Global->Clear().)
-        e->retained.clear();
+        //
+        // The retained values are released with the registry detached from
+        // the engine. Releasing a value releases the TJS object it holds,
+        // and destroying that object can run a native instance's `destroy`
+        // callback, which drops the Rust payload and releases the retained
+        // values that payload owns. Each of those releases erases an entry
+        // of the engine's retained map, so the entries are moved into a
+        // local map first: the engine's map stays empty, a nested release
+        // finds nothing to erase, and the local map releases every value
+        // exactly once while the VM is still alive. A teardown that
+        // retained a value put it back into the engine's map, so the swap
+        // repeats until the map is empty.
+        std::unordered_map<uintptr_t, TJS::tTJSVariant> retained;
+        while(!e->retained.empty()) {
+            retained.swap(e->retained);
+            retained.clear();
+        }
         e->last_object.Clear();
         for(TJS::iTJSDispatch2 *cls : e->native_classes)
             cls->Release();
