@@ -5,7 +5,7 @@
 //! parts of that data a host can assert are asserted here, per platform. What
 //! is left — a device's `/system/fonts` actually holding a face, an audio
 //! device opening, MediaCodec existing — is checked by the device run
-//! (`docs/migration/README.md` D36), not faked here.
+//! (`docs.old/migration/README.md` D36), not faked here.
 //!
 //! Deliberately **not** asserted: that a returned directory exists or holds a
 //! face. A missing directory is an absent source, not an error, so only the

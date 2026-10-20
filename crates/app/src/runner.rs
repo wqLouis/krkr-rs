@@ -193,9 +193,10 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, String> {
 
 /// Opens a window through the L1 platform and drives [`Host::step`].
 fn run_windowed(launch: &Launch) -> Result<(), String> {
+    let frame_interval = Duration::from_secs_f64(launch.runtime.frame_rate_limit.period_secs());
     let mut config = PlatformConfig::default();
     config.title = "krkr-rs".to_owned();
-    config.frame_interval = Duration::from_secs_f64(launch.runtime.frame_rate_limit.period_secs());
+    config.frame_interval = frame_interval;
     platform::run(
         config,
         DesktopApp::new(
@@ -204,6 +205,7 @@ fn run_windowed(launch: &Launch) -> Result<(), String> {
             launch.runtime.preload_archives,
             launch.runtime.debug_overlay,
             launch.runtime.graphic_cache_limit,
+            frame_interval,
         ),
     )
     .map_err(|error| error.to_string())
@@ -226,6 +228,8 @@ struct DesktopApp {
     debug_overlay: bool,
     /// Decoded-image cache policy, or `None` for the engine default.
     graphic_cache_limit: Option<CacheLimit>,
+    /// Frame period the loop paces at, which bounds the presentation wait.
+    frame_interval: Duration,
     /// The running host, created once the window handle exists.
     running: Option<Running>,
     /// Input and focus events received since the last frame, delivered to
@@ -292,6 +296,7 @@ impl DesktopApp {
         preload_archives: bool,
         debug_overlay: bool,
         graphic_cache_limit: Option<CacheLimit>,
+        frame_interval: Duration,
     ) -> Self {
         Self {
             backend,
@@ -299,6 +304,7 @@ impl DesktopApp {
             preload_archives,
             debug_overlay,
             graphic_cache_limit,
+            frame_interval,
             running: None,
             pending_events: Vec::new(),
             heartbeat_frames: 0,
@@ -356,6 +362,7 @@ impl EventHandler for DesktopApp {
             display_handle: Some(display_handle),
             debug_overlay: self.debug_overlay,
             graphic_cache_limit: self.graphic_cache_limit,
+            frame_interval: self.frame_interval,
             ..Default::default()
         };
         match Host::new(config) {

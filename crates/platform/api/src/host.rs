@@ -163,6 +163,19 @@ pub enum SurfaceEvent {
     OutOfDate,
 }
 
+/// Why a backend abandoned a frame without a surface fault.
+///
+/// A skip is not an error: the backend performed no work that could fail and
+/// the previous surface contents stay on screen. The caller counts the skip
+/// and reports it, so a display that stops releasing images is visible in the
+/// log instead of looking like a stall.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PresentSkip {
+    /// The display did not release a swapchain image within the frame's
+    /// presentation budget.
+    AcquireTimeout,
+}
+
 /// Result of a render/present action.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Presentation {
@@ -170,6 +183,9 @@ pub struct Presentation {
     pub presented: bool,
     /// A surface change the caller must react to, if any.
     pub surface_event: Option<SurfaceEvent>,
+    /// Why the backend skipped this frame, or `None` when it presented the
+    /// frame or reported a surface fault instead.
+    pub skip: Option<PresentSkip>,
 }
 
 /// A source of raw per-frame input snapshots.
