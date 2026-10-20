@@ -2092,15 +2092,77 @@ layer_int_prop_scene!(
         }
     }
 );
-layer_int_prop!(
-    layer_absolute_get,
-    layer_absolute_set,
-    |l: &LayerState| i64::from(l.z_order),
-    |l: &mut LayerState, v: &Value| {
-        l.z_order = value_as_i64(v) as i32;
-        true
+/// Read a layer property that needs its parent/sibling context.
+fn with_layer_scene_read<R>(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    f: impl FnOnce(&Scene, u32) -> R,
+) -> Result<R, String> {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `with_layer_scene_read`.
+    let inst = unsafe { &*(instance as *const LayerInst) };
+    let id = inst
+        .id
+        .ok_or_else(|| "Layer: this layer is not constructed".to_string())?;
+    let (_resolved, ctx) = bound(engine)?;
+    let scene = scene_ref(&ctx)?;
+    if scene.layer(id).is_none() {
+        return Err("Layer: layer no longer exists".to_string());
     }
-);
+    Ok(f(scene, id))
+}
+
+/// `Layer.absolute` getter: the stored absolute index while the parent is in
+/// absolute mode, otherwise the sibling position.
+extern "C" fn layer_absolute_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    match with_layer_scene_read(engine, instance, |scene, id| {
+        scene.absolute_order_index(id).unwrap_or(0)
+    }) {
+        Ok(value) => {
+            set_int(out, i64::from(value));
+            0
+        }
+        Err(error) => report_error(out_error, &error),
+    }
+}
+
+// `Layer.absolute` setter: a parent is required, the parent enters absolute
+// order mode, the sibling list is reordered, and the requested index is
+// stored.
+layer_scene_set!(layer_absolute_set, |scene, id, value| {
+    scene.set_absolute_order_index(id, value_as_i64(value) as i32)
+});
+
+/// `Layer.order` getter: the sibling position.
+extern "C" fn layer_order_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    match with_layer_scene_read(engine, instance, |scene, id| {
+        scene.order_index(id).unwrap_or(0)
+    }) {
+        Ok(value) => {
+            set_int(out, i64::from(value));
+            0
+        }
+        Err(error) => report_error(out_error, &error),
+    }
+}
+
+// `Layer.order` setter: a parent is required, the parent leaves absolute
+// order mode, the index is clamped to the sibling range and the layer is
+// moved there.
+layer_scene_set!(layer_order_set, |scene, id, value| {
+    scene.set_order_index(id, value_as_i64(value) as i32)
+});
 layer_int_prop!(
     layer_hit_threshold_get,
     layer_hit_threshold_set,
@@ -2581,19 +2643,15 @@ layer_int_prop!(
         true
     }
 );
-layer_int_prop!(
-    layer_absolute_order_mode_get,
-    layer_absolute_order_mode_set,
-    |l: &LayerState| i64::from(l.absolute_order_mode),
-    |l: &mut LayerState, v: &Value| {
-        let mode = value_as_bool(v);
-        if l.absolute_order_mode == mode {
-            return false;
-        }
-        l.absolute_order_mode = mode;
-        true
-    }
-);
+layer_int_get!(layer_absolute_order_mode_get, |l: &LayerState| i64::from(
+    l.absolute_order_mode
+));
+// `Layer.absoluteOrderMode` setter: enabling the mode seeds each child's
+// absolute index from its current sibling position.
+layer_scene_set!(layer_absolute_order_mode_set, |scene, id, value| {
+    scene.set_absolute_order_mode(id, value_as_bool(value));
+    Ok(())
+});
 layer_int_prop!(
     layer_call_on_paint_get,
     layer_call_on_paint_set,
@@ -3663,8 +3721,8 @@ pub(super) fn register_layer_class(ctx: &mut CompatCtx) -> Result<(), CompatErro
             },
             NativeInstancePropertyDef {
                 name: "order",
-                get: Some(layer_absolute_get),
-                set: Some(layer_absolute_set),
+                get: Some(layer_order_get),
+                set: Some(layer_order_set),
             },
             NativeInstancePropertyDef {
                 name: "hitThreshold",

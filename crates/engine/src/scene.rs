@@ -122,7 +122,8 @@ pub struct LayerState {
     /// projection does not lose `Layer.type` updates. L3 owns the native
     /// `tTVPLayerType` numbering and maps it onto these modes.
     pub blend: BlendMode,
-    /// Z order among sibling layers of the same window.
+    /// Sibling sort key: the sibling position in relative order mode, or the
+    /// stored absolute index while the parent is in absolute order mode.
     pub z_order: i32,
     /// Image placement inside the layer (reference `ImageLeft`/`ImageTop`,
     /// typically ≤ 0) and the drawn image size (`ImageWidth`/`ImageHeight`,
@@ -234,7 +235,8 @@ pub struct LayerState {
     pub ime_mode: i32,
     /// Reference `NeutralColor` (ARGB, stored).
     pub neutral_color: i64,
-    /// Reference `AbsoluteOrderMode`/`CallOnPaint` flags.
+    /// Whether this layer orders its children by their stored absolute index
+    /// (`absolute`) instead of their maintained sibling position.
     pub absolute_order_mode: bool,
     /// Reference `CallOnPaint`; see `pending_paint`.
     pub call_on_paint: bool,
@@ -821,6 +823,8 @@ impl Scene {
                 l.visible = true;
             }
         }
+        // A new child is appended at the front-most slot.
+        self.assign_front_order(id);
         match parent {
             Some(p) => {
                 if let Some(l) = self.layer_mut(p) {
@@ -834,6 +838,222 @@ impl Scene {
                     w.focus_domains.push(domain);
                     w.sync_focused_layer();
                 }
+            }
+        }
+        self.touch_structure();
+    }
+
+    /// Give `id` the sort key of the front-most slot among its current
+    /// siblings: one past the largest sibling key, or zero for the first
+    /// child. Call it after the layer's parent/window is set but before the
+    /// layer is pushed into the sibling list, so the layer itself does not
+    /// contribute a stale key.
+    pub fn assign_front_order(&mut self, id: u32) {
+        let Some(layer) = self.layer(id) else {
+            return;
+        };
+        let parent = layer.parent;
+        let window = layer.window;
+        let last = match parent {
+            Some(parent) => self.layer(parent).and_then(|parent| {
+                parent
+                    .children
+                    .iter()
+                    .filter_map(|child| self.layer(*child).map(|child| child.z_order))
+                    .max()
+            }),
+            None => self.window(window).and_then(|window| {
+                window
+                    .layers
+                    .iter()
+                    .filter_map(|child| self.layer(*child).map(|child| child.z_order))
+                    .max()
+            }),
+        };
+        if let Some(layer) = self.layer_mut(id) {
+            layer.z_order = last.map_or(0, |last| last.saturating_add(1));
+        }
+    }
+
+    /// The rectangle that clips `id`'s subtree.
+    ///
+    /// A primary layer is the screen-sized draw target. A first layer created
+    /// by script starts with the default 32x32 rect (or 0x0 for a direct scene
+    /// layer), but the window's primary layer must clip like the window
+    /// client; only an explicitly resized primary keeps its own size.
+    /// Every other layer clips to its own rect.
+    pub fn clipping_rect(&self, id: u32) -> Option<Rect> {
+        let layer = self.layer(id)?;
+        let rect = layer.rect;
+        if layer.is_primary && (rect.w == 0 || rect.h == 0 || (rect.w == 32 && rect.h == 32)) {
+            let (width, height) = self.window(layer.window)?.inner_size;
+            return Some(Rect::new(rect.x, rect.y, width, height));
+        }
+        Some(rect)
+    }
+
+    /// The sibling list that contains `id`: the parent's `children`, or the
+    /// window's root list for a parentless layer.
+    fn sibling_ids(&self, id: u32) -> Option<Vec<u32>> {
+        let layer = self.layer(id)?;
+        match layer.parent {
+            Some(parent) => self.layer(parent).map(|parent| parent.children.clone()),
+            None => self
+                .window(layer.window)
+                .map(|window| window.layers.clone()),
+        }
+    }
+
+    /// The position of `id` in its sibling list.
+    pub fn sibling_position(&self, id: u32) -> Option<usize> {
+        self.sibling_ids(id)?
+            .iter()
+            .position(|&sibling| sibling == id)
+    }
+
+    /// The sibling position, or `0` for a parentless layer.
+    pub fn order_index(&self, id: u32) -> Option<i32> {
+        let layer = self.layer(id)?;
+        if layer.parent.is_none() {
+            return Some(0);
+        }
+        self.sibling_position(id)
+            .map(|position| position.min(i32::MAX as usize) as i32)
+    }
+
+    /// The stored absolute index while the parent is in absolute order mode,
+    /// otherwise the sibling position. A parentless layer reports `0`.
+    pub fn absolute_order_index(&self, id: u32) -> Option<i32> {
+        let layer = self.layer(id)?;
+        let Some(parent) = layer.parent else {
+            return Some(0);
+        };
+        if self.layer(parent)?.absolute_order_mode {
+            Some(layer.z_order)
+        } else {
+            self.sibling_position(id)
+                .map(|position| position.min(i32::MAX as usize) as i32)
+        }
+    }
+
+    /// Switching the child list into absolute mode seeds every child's
+    /// absolute index from its current sibling position. Switching out
+    /// renumbers the children back to their positions so the relative order is
+    /// explicit. Returns `true` when the mode changed.
+    pub fn set_absolute_order_mode(&mut self, id: u32, enabled: bool) -> bool {
+        let Some(layer) = self.layer(id) else {
+            return false;
+        };
+        if layer.absolute_order_mode == enabled {
+            return false;
+        }
+        if let Some(layer) = self.layer_mut(id) {
+            layer.absolute_order_mode = enabled;
+        }
+        let children = self
+            .layer(id)
+            .map(|layer| layer.children.clone())
+            .unwrap_or_default();
+        for (position, child) in children.iter().enumerate() {
+            if let Some(child) = self.layer_mut(*child) {
+                child.z_order = position.min(i32::MAX as usize) as i32;
+            }
+        }
+        self.touch_structure();
+        true
+    }
+
+    /// Require a parent, turn the parent's absolute order mode on, insert the
+    /// layer at the position selected by the requested absolute index, then
+    /// store that index. The insertion point is the first sibling whose
+    /// absolute index is not less than the requested value, compensating for
+    /// the removed layer when it moves forward.
+    pub fn set_absolute_order_index(&mut self, id: u32, absolute: i32) -> Result<(), String> {
+        let Some(layer) = self.layer(id) else {
+            return Err("Layer: layer no longer exists".to_string());
+        };
+        let Some(parent) = layer.parent else {
+            return Err(
+                "Layer.absolute: cannot move the primary layer or a siblingless layer".to_string(),
+            );
+        };
+        if !self
+            .layer(parent)
+            .is_some_and(|parent| parent.absolute_order_mode)
+        {
+            self.set_absolute_order_mode(parent, true);
+        }
+        let from = self
+            .sibling_position(id)
+            .ok_or_else(|| "Layer.absolute: the sibling no longer exists".to_string())?;
+        let mut to = self
+            .layer(parent)
+            .map(|parent| {
+                parent
+                    .children
+                    .iter()
+                    .position(|&child| {
+                        self.layer(child).map_or(0, |child| child.z_order) >= absolute
+                    })
+                    .unwrap_or(parent.children.len())
+            })
+            .ok_or_else(|| "Layer.absolute: this layer has no parent".to_string())?;
+        if from < to {
+            to = to.saturating_sub(1);
+        }
+        let Some(parent_layer) = self.layer_mut(parent) else {
+            return Err("Layer.absolute: this layer has no parent".to_string());
+        };
+        parent_layer.children.retain(|&child| child != id);
+        let to = to.min(parent_layer.children.len());
+        parent_layer.children.insert(to, id);
+        if let Some(layer) = self.layer_mut(id) {
+            layer.z_order = absolute;
+        }
+        self.touch_structure();
+        Ok(())
+    }
+
+    /// Require a parent, leave absolute order mode, clamp the requested
+    /// position to the sibling range, move the layer there, and renumber the
+    /// siblings so the relative order index equals the draw position.
+    pub fn set_order_index(&mut self, id: u32, order: i32) -> Result<(), String> {
+        let Some(layer) = self.layer(id) else {
+            return Err("Layer: layer no longer exists".to_string());
+        };
+        let Some(parent) = layer.parent else {
+            return Err(
+                "Layer.order: cannot move the primary layer or a siblingless layer".to_string(),
+            );
+        };
+        self.set_absolute_order_mode(parent, false);
+        let count = self
+            .layer(parent)
+            .map(|parent| parent.children.len())
+            .unwrap_or(0);
+        let max = count.saturating_sub(1).min(i32::MAX as usize) as i32;
+        let index = order.clamp(0, max);
+        let index = index as usize;
+        let Some(parent_layer) = self.layer_mut(parent) else {
+            return Err("Layer.order: this layer has no parent".to_string());
+        };
+        parent_layer.children.retain(|&child| child != id);
+        let index = index.min(parent_layer.children.len());
+        parent_layer.children.insert(index, id);
+        self.renumber_siblings(id);
+        self.touch_structure();
+        Ok(())
+    }
+
+    /// Renumber the sibling list that contains `id` to its current positions,
+    /// so `z_order` is the relative draw order for every sibling.
+    pub fn renumber_siblings(&mut self, id: u32) {
+        let Some(ids) = self.sibling_ids(id) else {
+            return;
+        };
+        for (position, sibling) in ids.iter().enumerate() {
+            if let Some(layer) = self.layer_mut(*sibling) {
+                layer.z_order = position.min(i32::MAX as usize) as i32;
             }
         }
         self.touch_structure();
@@ -1703,12 +1923,18 @@ impl Scene {
             if !self.node_visible(id) {
                 continue;
             }
+            if !self.ancestor_rect_contains(id, px, py) {
+                continue;
+            }
             let Some((ax, ay)) = self.absolute_offset(id) else {
+                continue;
+            };
+            let Some(clip) = self.clipping_rect(id) else {
                 continue;
             };
             let lx = px - ax;
             let ly = py - ay;
-            if lx < 0 || ly < 0 || lx >= l.rect.w as i32 || ly >= l.rect.h as i32 {
+            if lx < 0 || ly < 0 || lx >= clip.w as i32 || ly >= clip.h as i32 {
                 continue;
             }
             if self.hit_test_layer(l, lx, ly) {
@@ -1721,6 +1947,37 @@ impl Scene {
             }
         }
         None
+    }
+
+    /// Whether `(x, y)`, in window coordinates, lies inside every ancestor
+    /// layer's `Rect` of `id`. The check walks parent to root and is bounded
+    /// like [`Self::node_visible`], so a descendant cannot be hit outside an
+    /// ancestor's rectangle.
+    fn ancestor_rect_contains(&self, id: u32, x: i32, y: i32) -> bool {
+        let mut current = self.layer(id).and_then(|layer| layer.parent);
+        let mut steps = 0usize;
+        while let Some(ancestor) = current {
+            let Some(layer) = self.layer(ancestor) else {
+                return false;
+            };
+            let Some((ax, ay)) = self.absolute_offset(ancestor) else {
+                return false;
+            };
+            let Some(clip) = self.clipping_rect(ancestor) else {
+                return false;
+            };
+            let lx = x.saturating_sub(ax);
+            let ly = y.saturating_sub(ay);
+            if lx < 0 || ly < 0 || lx >= clip.w as i32 || ly >= clip.h as i32 {
+                return false;
+            }
+            steps += 1;
+            if steps > self.layers.len() {
+                return false;
+            }
+            current = layer.parent;
+        }
+        true
     }
 
     /// Sum of this layer's and its ancestors' `rect` offsets (absolute
@@ -1788,14 +2045,17 @@ impl Scene {
         }
     }
 
-    /// Move the layer to the front among its siblings (`bringToFront`),
-    /// affecting only the insertion tie-break; `z_order` still dominates.
+    /// Move the layer to the front among its siblings (`bringToFront`): leave
+    /// absolute order mode and place it at the last sibling slot. A parentless
+    /// layer is a window root and moves to the end of the window's root list.
     pub fn layer_move_to_front(&mut self, id: u32) {
-        // Detach + re-attach as last (frontmost) among its siblings.
         let (window, parent) = match self.layer(id) {
             Some(l) => (l.window, l.parent),
             None => return,
         };
+        if let Some(p) = parent {
+            self.set_absolute_order_mode(p, false);
+        }
         match parent {
             Some(p) => {
                 if let Some(l) = self.layer_mut(p) {
@@ -1810,6 +2070,7 @@ impl Scene {
                 }
             }
         }
+        self.renumber_siblings(id);
         self.touch_structure();
     }
 

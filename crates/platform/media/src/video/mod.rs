@@ -67,6 +67,15 @@ mod backend;
 
 pub use backend::VideoDecoderState;
 
+/// Decodes a whole audio track with the platform's audio decoder.
+///
+/// The MediaCodec backend decodes an MP4/AAC track (including an HE-AAC
+/// track, whose SBR band the platform decoder reconstructs) with the
+/// platform's `audio/mp4a-latm` decoder. The FFmpeg backend has no
+/// counterpart: its track decoding belongs to the video backend.
+#[cfg(feature = "video-mediacodec")]
+pub use backend::decode_audio as decode_audio_mediacodec;
+
 /// How far a backwards request may lag the current frame before the decoder
 /// seeks instead of reusing it. Mirrors the reference `SEEK_TOLERANCE_MS`.
 pub(crate) const SEEK_TOLERANCE_MS: u64 = 500;

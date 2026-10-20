@@ -4,17 +4,18 @@
 //! private helpers used there are reimplemented here on top of the public
 //! `render` API.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use api::blend::{BlendMode, DstBlend};
 use api::geometry::{PixelRegion, RectF};
+use engine::translate::translate_render_scene;
 use engine::{
-    Engine, EngineOverlay, EngineParts, GameFrame, Rect, Scene, compose_layer, project_scene,
-    project_window, project_window_report, resolve_blend,
+    Engine, EngineOverlay, EngineParts, GameFrame, PixelTranslation, Rect, Scene, compose_layer,
+    project_scene, project_window, project_window_report, resolve_blend,
 };
 use render::{
-    PipelineConfig, RenderContent, RenderNode, RenderNodeId, RenderPipeline, RenderScene,
+    Clip, PipelineConfig, RenderContent, RenderNode, RenderNodeId, RenderPipeline, RenderScene,
     RenderState, Texture, TextureDesc, begin_render_state, create_render_pipeline, create_texture,
 };
 use testkit::headless_window;
@@ -809,5 +810,105 @@ fn a_new_resized_or_removed_bitmap_still_projects() {
     assert!(
         projected_layer_nodes(&engine).is_empty(),
         "the layer has no image to draw"
+    );
+}
+
+/// A texture-less container is still a clip: the reference intersects every
+/// child's draw rect with the parent's `Rect`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:7138-7140`, `:7184-7185`), so a
+/// child entirely outside the container emits nothing.
+#[test]
+fn textureless_parent_clips_a_child_outside_its_rect() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (320, 240));
+    let parent = scene.add_layer(win, None);
+    scene.layer_mut(parent).unwrap().rect = Rect::new(10, 10, 100, 100);
+    scene.layer_mut(parent).unwrap().visible = true;
+    let child = scene.add_layer(win, Some(parent));
+    scene.layer_mut(child).unwrap().rect = Rect::new(0, 150, 20, 20);
+    scene.layer_mut(child).unwrap().visible = true;
+    attach_image(&mut scene, child, 20, 20);
+
+    let textures: Rc<RefCell<Vec<(u32, Texture)>>> = Rc::new(RefCell::new(Vec::new()));
+    let projected = project_window(&scene, win, |bitmap| {
+        let texture = null_texture(20, 20);
+        textures.borrow_mut().push((bitmap, texture.clone()));
+        Some(texture)
+    });
+    assert!(
+        drawable_nodes(&projected).is_empty(),
+        "the child is outside the textureless parent's rect"
+    );
+}
+
+/// A child inside the container keeps the ancestor clip; the projection emits
+/// the clip in VM pixels so `translate_render_scene` can scale it.
+///
+/// Reference: `r ∩ Rect` (`reference/cpp/core/visual/LayerIntf.cpp:7138-7140`)
+/// and the child intersection (`:7184-7185`); the clip is the parent's absolute
+/// rect for a child that lies wholly inside it.
+#[test]
+fn textureless_parent_clip_is_emitted_and_translated() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (320, 240));
+    let parent = scene.add_layer(win, None);
+    scene.layer_mut(parent).unwrap().rect = Rect::new(10, 10, 100, 100);
+    scene.layer_mut(parent).unwrap().visible = true;
+    let child = scene.add_layer(win, Some(parent));
+    scene.layer_mut(child).unwrap().rect = Rect::new(0, 0, 20, 20);
+    scene.layer_mut(child).unwrap().visible = true;
+    attach_image(&mut scene, child, 20, 20);
+
+    let texture = null_texture(20, 20);
+    let mut projected = project_window(&scene, win, |_| Some(texture.clone()));
+    let node = drawable_nodes(&projected)
+        .into_iter()
+        .next()
+        .expect("the child draws");
+    assert_eq!(
+        node.clip,
+        Some(Clip::Rect(RectF::new(10.0, 10.0, 20.0, 20.0))),
+        "the parent rect bounds the child"
+    );
+
+    let translation = PixelTranslation::fit((100, 100), (200, 200)).expect("fit");
+    translate_render_scene(&mut projected, &translation);
+    let node = drawable_nodes(&projected)
+        .into_iter()
+        .next()
+        .expect("the child draws");
+    assert_eq!(
+        node.clip,
+        Some(Clip::Rect(RectF::new(20.0, 20.0, 40.0, 40.0))),
+        "a rectangle clip is in VM pixels and is scaled"
+    );
+}
+
+/// Reference `GetMostFrontChildAt` rejects a point outside the current
+/// layer's `Rect` before descending into its children
+/// (`reference/cpp/core/visual/LayerIntf.cpp:3322-3329`), so a child clipped
+/// by an ancestor is not hit-testable outside that ancestor.
+#[test]
+fn hit_test_rejects_a_point_outside_an_ancestor_rect() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (320, 240));
+    let parent = scene.add_layer(win, None);
+    scene.layer_mut(parent).unwrap().rect = Rect::new(0, 0, 50, 50);
+    scene.layer_mut(parent).unwrap().visible = true;
+    let child = scene.add_layer(win, Some(parent));
+    scene.layer_mut(child).unwrap().rect = Rect::new(0, 40, 20, 20);
+    scene.layer_mut(child).unwrap().visible = true;
+    attach_image(&mut scene, child, 20, 20);
+    scene.layer_mut(child).unwrap().hit_threshold = 0;
+
+    assert_eq!(
+        scene.layer_at(child, 5, 5, false, false),
+        Some(child),
+        "a point inside both rects hits"
+    );
+    assert_eq!(
+        scene.layer_at(child, 5, 45, false, false),
+        None,
+        "a point inside the child but outside the parent rect misses"
     );
 }

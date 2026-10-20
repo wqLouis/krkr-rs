@@ -33,19 +33,20 @@ fn siblings_mut(scene: &mut Scene, id: u32) -> Option<&mut Vec<u32>> {
 /// Reorder the sibling vector, then renumber every sibling's `z_order` to its
 /// new index so the stable sibling sort keeps the requested order.
 fn renumber_siblings(scene: &mut Scene, id: u32) {
-    let ids = match siblings_mut(scene, id) {
-        Some(list) => list.clone(),
-        None => return,
-    };
-    for (index, sibling) in ids.iter().enumerate() {
-        if let Some(layer) = scene.layer_mut(*sibling) {
-            layer.z_order = index as i32;
-        }
+    scene.renumber_siblings(id);
+}
+
+/// The relative-order operations all leave absolute order mode; a parentless
+/// window root has no mode to leave.
+fn leave_absolute_order(scene: &mut Scene, id: u32) {
+    if let Some(parent) = scene.layer(id).and_then(|layer| layer.parent) {
+        scene.set_absolute_order_mode(parent, false);
     }
 }
 
 /// Move `id` to the back of its sibling list.
 fn bring_to_back(scene: &mut Scene, id: u32) -> Result<(), String> {
+    leave_absolute_order(scene, id);
     {
         let list = siblings_mut(scene, id)
             .ok_or_else(|| "Layer.bringToBack: this layer has no parent".to_string())?;
@@ -88,6 +89,7 @@ fn move_relative(scene: &mut Scene, id: u32, target: u32, before: bool) -> Resul
             "Layer.{method}: cannot move a layer next to itself or a non-sibling"
         ));
     }
+    leave_absolute_order(scene, id);
     {
         let list = siblings_mut(scene, id)
             .ok_or_else(|| format!("Layer.{method}: this layer has no parent"))?;

@@ -136,10 +136,15 @@ trace-logged, so an almost-empty frame is diagnosable.
 
 **What the projection deliberately does not do.** It performs no batching, no
 sorting, no transform nesting, and no mask/province/face work. Every node gets
-`transform = IDENTITY` and `clip = None`; hierarchy exists for linking,
-`z`-order and the inherited opacity/visibility only. The `dst` is already in
-absolute window coordinates. Masks, province images, per-layer affine
-transforms and the `hold_alpha` main-vs-province rule are open work (see §9).
+`transform = IDENTITY`; hierarchy exists for linking, `z`-order, the inherited
+opacity/visibility and the ancestor clip. Each node's `clip` is the
+intersection of its own absolute rect and every ancestor rect, including
+texture-less container layers, matching `tTJSNI_BaseLayer::Draw`'s
+`r ∩ Rect` and its child intersection
+(`reference/cpp/core/visual/LayerIntf.cpp:7138-7140`, `:7184-7185`); a
+zero-sized intersection emits no node. The `dst` is already in absolute window
+coordinates. Masks, province images, per-layer affine transforms and the
+`hold_alpha` main-vs-province rule are open work (see §9).
 
 ## 4. The L1 draw tree
 

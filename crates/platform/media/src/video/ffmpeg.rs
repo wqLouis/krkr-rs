@@ -6,30 +6,24 @@
 //! audio track. `Media` stores nothing and there are no globals or caches.
 
 use std::fmt;
-use std::io::Cursor;
 use std::sync::Arc;
 
 use api::error::MediaError;
-use api::media::{AudioSpec, DecodedAudio, RgbaFrame, VideoSpec};
-use ffmpeg::ChannelLayout;
+use api::media::{DecodedAudio, RgbaFrame, VideoSpec};
 use ffmpeg::Error as FfmpegError;
 use ffmpeg::Packet;
 use ffmpeg::Rational;
 use ffmpeg::format::Pixel;
-use ffmpeg::format::Sample;
 use ffmpeg::format::context::Input;
-use ffmpeg::format::context::StreamIo;
-use ffmpeg::format::sample;
 use ffmpeg::media::Type as MediaType;
-use ffmpeg::software::resampling;
 use ffmpeg::software::scaling;
-use ffmpeg::util::frame::audio::Audio as AudioFrame;
 use ffmpeg::util::frame::video::Video as VideoFrame;
 use ffmpeg_next as ffmpeg;
 
 use super::SEEK_TOLERANCE_MS;
 use crate::Media;
-use crate::hint::extension_of;
+use crate::audio_ffmpeg::{decode_audio_track, open_input};
+use crate::hint::display_name;
 
 /// Number of bytes per RGBA8 pixel.
 const RGBA_BYTES_PER_PIXEL: usize = 4;
@@ -81,42 +75,12 @@ impl fmt::Debug for VideoDecoderState {
     }
 }
 
-/// Returns the hint used in error messages.
-fn display_name(hint: Option<&str>) -> &str {
-    hint.filter(|name| !name.is_empty()).unwrap_or("<video>")
-}
-
 /// Builds the typed decode error for this stream.
 fn decode_error(name: &str, error: FfmpegError) -> MediaError {
     MediaError::Decode {
         format: String::new(),
         message: format!("{name}: {error}"),
     }
-}
-
-/// Opens an in-memory FFmpeg demuxer over `bytes`.
-///
-/// The extension hint is passed to FFmpeg for format detection only; the
-/// bytes always decide the container. The `Arc<[u8]>` is shared into the
-/// `StreamIo`, so no whole-buffer copy is made.
-fn open_input(bytes: &Arc<[u8]>, hint: Option<&str>, name: &str) -> Result<Input, MediaError> {
-    ffmpeg::init().map_err(|error| MediaError::Io {
-        message: format!("{name}: ffmpeg init failed: {error}"),
-    })?;
-    let probe_name = hint
-        .and_then(extension_of)
-        .map(|ext| format!("input.{ext}"));
-    let io = StreamIo::from_read_seek(Cursor::new(Arc::clone(bytes))).map_err(|error| {
-        MediaError::Io {
-            message: format!("{name}: {error}"),
-        }
-    })?;
-    ffmpeg::format::input_from_stream(io, probe_name.as_deref(), None).map_err(|error| {
-        MediaError::Decode {
-            format: String::new(),
-            message: format!("{name}: open demuxer: {error}"),
-        }
-    })
 }
 
 /// Counts the container's streams of `kind`.
@@ -154,7 +118,7 @@ pub fn open(
     hint: Option<&str>,
 ) -> Result<(VideoSpec, VideoDecoderState), MediaError> {
     let _ = m;
-    let name = display_name(hint).to_string();
+    let name = display_name(hint, "<video>").to_string();
     let mut input = open_input(&bytes, hint, &name)?;
 
     let (video_stream_index, time_base, avg_frame_rate, total_frames_hint, duration_us) = {
@@ -267,230 +231,6 @@ pub fn open(
         eof: false,
     };
     Ok((spec, state))
-}
-
-/// Decodes every packet of the audio track `stream_index` into interleaved
-/// `f32`, resampling to the decoder's native rate/layout.
-fn decode_audio_track(
-    input: &mut Input,
-    stream_index: usize,
-    name: &str,
-) -> Result<DecodedAudio, MediaError> {
-    let parameters = input
-        .stream(stream_index)
-        .map(|stream| stream.parameters())
-        .ok_or_else(|| MediaError::InvalidState {
-            message: format!("{name}: audio stream vanished after probing"),
-        })?;
-    let context =
-        ffmpeg::codec::context::Context::from_parameters(parameters).map_err(|error| {
-            MediaError::Unsupported {
-                message: format!("{name}: {error}"),
-            }
-        })?;
-    let mut decoder = context
-        .decoder()
-        .audio()
-        .map_err(|error| MediaError::Unsupported {
-            message: format!("{name}: no audio decoder: {error}"),
-        })?;
-    // The decoder knows the stream's channel layout even when a decoded frame
-    // does not repeat it.
-    let decoder_layout = decoder.channel_layout();
-
-    let mut samples: Vec<f32> = Vec::new();
-    let mut spec = AudioSpec::default();
-    let mut resampler: Option<resampling::Context> = None;
-    // The layout the track is converted to, known once the first frame has
-    // been decoded.
-    let mut track_layout: Option<ChannelLayout> = None;
-    let mut demux_eof = false;
-
-    loop {
-        let mut frame = AudioFrame::empty();
-        match decoder.receive_frame(&mut frame) {
-            Ok(()) => {
-                if resampler.is_none() {
-                    let layout = resolve_layout(frame.channel_layout(), decoder_layout, name)?;
-                    let rate = frame.rate();
-                    // The L2 mixer renders mono and stereo only, so a
-                    // track with more channels is downmixed to stereo.
-                    let out_layout = if layout.channels() > 2 {
-                        ChannelLayout::STEREO
-                    } else {
-                        layout
-                    };
-                    let converter = resampling::Context::get(
-                        frame.format(),
-                        layout,
-                        rate,
-                        Sample::F32(sample::Type::Packed),
-                        out_layout,
-                        rate,
-                    )
-                    .map_err(|error| MediaError::Decode {
-                        format: String::new(),
-                        message: format!("{name}: audio resampler: {error}"),
-                    })?;
-                    spec.sample_rate = rate;
-                    spec.channels = channel_count(name, out_layout.channels())?;
-                    track_layout = Some(out_layout);
-                    resampler = Some(converter);
-                }
-
-                let converted = match resampler.as_mut() {
-                    Some(converter) => resample_frame(converter, &frame, name)?,
-                    None => {
-                        return Err(MediaError::Decode {
-                            format: String::new(),
-                            message: format!("{name}: the audio resampler is missing"),
-                        });
-                    }
-                };
-                samples.extend_from_slice(&converted);
-                continue;
-            }
-            Err(FfmpegError::Eof) => break,
-            Err(FfmpegError::Other { errno }) if errno == ffmpeg::error::EAGAIN => {}
-            Err(error) => {
-                return Err(MediaError::Decode {
-                    format: String::new(),
-                    message: format!("{name}: audio decode: {error}"),
-                });
-            }
-        }
-
-        if demux_eof {
-            break;
-        }
-
-        let mut packet = Packet::empty();
-        match packet.read(input) {
-            Ok(()) => {
-                if packet.stream() == stream_index {
-                    decoder
-                        .send_packet(&packet)
-                        .map_err(|error| MediaError::Decode {
-                            format: String::new(),
-                            message: format!("{name}: audio packet: {error}"),
-                        })?;
-                }
-            }
-            Err(FfmpegError::Eof) => {
-                decoder.send_eof().map_err(|error| MediaError::Decode {
-                    format: String::new(),
-                    message: format!("{name}: audio decoder flush: {error}"),
-                })?;
-                demux_eof = true;
-            }
-            Err(error) => {
-                return Err(MediaError::Io {
-                    message: format!("{name}: {error}"),
-                });
-            }
-        }
-    }
-
-    // The resampler may still hold samples of the track; flush them so the
-    // tail of the track is not dropped.
-    if let Some(converter) = resampler.as_mut()
-        && let Some(delay) = converter.delay()
-        && let Some(layout) = track_layout
-    {
-        let tail = usize::try_from(delay.output).map_err(|_| MediaError::Decode {
-            format: String::new(),
-            message: format!("{name}: the audio tail length is out of range"),
-        })?;
-        let mut output = AudioFrame::new(Sample::F32(sample::Type::Packed), tail, layout);
-        converter
-            .flush(&mut output)
-            .map_err(|error| MediaError::Decode {
-                format: String::new(),
-                message: format!("{name}: audio flush: {error}"),
-            })?;
-        samples.extend_from_slice(audio_packed_f32(&output, name)?);
-    }
-
-    if samples.is_empty() {
-        return Err(MediaError::Decode {
-            format: String::new(),
-            message: format!("{name}: no audio data decoded"),
-        });
-    }
-
-    spec.total_frames = if spec.channels > 0 {
-        Some(samples.len() as u64 / u64::from(spec.channels))
-    } else {
-        None
-    };
-    Ok(DecodedAudio::new(spec, samples))
-}
-
-/// The channel layout a decoded audio frame is converted from.
-///
-/// The frame's own layout is authoritative. A frame that carries none is
-/// converted with the decoder's layout: the decoder knows the stream's
-/// layout from the container even when the frame does not repeat it. A
-/// track whose frame and decoder both carry no layout has an unknown
-/// channel count, and the only sound layout that could be invented for it
-/// would either drop half of a stereo track or read a mono track as
-/// interleaved stereo, so it is reported instead.
-fn resolve_layout(
-    frame_layout: ChannelLayout,
-    decoder_layout: ChannelLayout,
-    name: &str,
-) -> Result<ChannelLayout, MediaError> {
-    if frame_layout.channels() > 0 {
-        return Ok(frame_layout);
-    }
-    if decoder_layout.channels() > 0 {
-        return Ok(decoder_layout);
-    }
-    Err(MediaError::InvalidData {
-        message: format!("{name}: the audio track carries no channel layout"),
-    })
-}
-
-/// Converts a decoder channel count to the `AudioSpec::channels` field.
-///
-/// The reference keeps the count in a 32-bit `tTVPWaveFormat::Channels`
-/// (`reference/cpp/core/sound/WaveIntf.h:47`); only a negative count cannot
-/// be represented and is reported rather than clamped.
-fn channel_count(name: &str, channels: i32) -> Result<u32, MediaError> {
-    u32::try_from(channels).map_err(|_| MediaError::InvalidData {
-        message: format!("{name}: audio channel count {channels} is negative"),
-    })
-}
-
-/// Runs the resampler over one decoded frame and copies the packed `f32`
-/// samples out.
-fn resample_frame(
-    converter: &mut resampling::Context,
-    frame: &AudioFrame,
-    name: &str,
-) -> Result<Vec<f32>, MediaError> {
-    let mut output = AudioFrame::empty();
-    converter
-        .run(frame, &mut output)
-        .map_err(|error| MediaError::Decode {
-            format: String::new(),
-            message: format!("{name}: audio resample: {error}"),
-        })?;
-    Ok(audio_packed_f32(&output, name)?.to_vec())
-}
-
-/// Borrows the single packed `f32` plane of an audio frame.
-///
-/// A frame with no plane carries no samples: that is a decode failure, not
-/// an empty frame.
-fn audio_packed_f32<'a>(frame: &'a AudioFrame, name: &str) -> Result<&'a [f32], MediaError> {
-    if frame.planes() == 0 {
-        return Err(MediaError::Decode {
-            format: String::new(),
-            message: format!("{name}: the converted audio frame carries no samples"),
-        });
-    }
-    Ok(frame.plane::<f32>(0))
 }
 
 /// Presents the frame at (or after) `at_ms`.
@@ -703,7 +443,8 @@ fn frame_pts_ms(time_base: Rational, frame: &VideoFrame, name: &str) -> Result<u
 mod tests {
     use ffmpeg_next::ChannelLayout;
 
-    use super::{Rational, VideoFrame, channel_count, frame_pts_ms, resolve_layout};
+    use super::{Rational, VideoFrame, frame_pts_ms};
+    use crate::audio_ffmpeg::{channel_count, resolve_layout};
 
     /// A non-negative channel count is stored as reported; the reference keeps
     /// it in a 32-bit `tTVPWaveFormat::Channels`

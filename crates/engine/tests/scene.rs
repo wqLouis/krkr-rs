@@ -74,7 +74,7 @@ fn window_layer_order_complex_hierarchy_matches_reference() {
     let c = scene.add_layer(win, None);
     scene.layer_mut(a).unwrap().z_order = 5;
     scene.layer_mut(b).unwrap().z_order = 1;
-    // c keeps z = 0.
+    scene.layer_mut(c).unwrap().z_order = 0;
     let b1 = scene.add_layer(win, Some(b));
     let b2 = scene.add_layer(win, Some(b));
     scene.layer_mut(b2).unwrap().z_order = -1;
@@ -663,4 +663,157 @@ fn set_focus_invalid_id_leaves_holder() {
     assert_eq!(scene.window(win).unwrap().focused_layer, Some(a));
     assert_eq!(scene.clear_focus(win), Some(a));
     assert_eq!(scene.window(win).unwrap().focused_layer, None);
+}
+
+/// Reference `AddChild` (`reference/cpp/core/visual/LayerIntf.cpp:635-654`)
+/// appends a new child at the front-most slot: the relative order index is the
+/// new sibling position, and in absolute order mode the child receives
+/// `last->GetAbsoluteOrderIndex() + 1`.
+#[test]
+fn attach_layer_appends_at_the_front_and_assigns_order() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (640, 480));
+    let parent = scene.add_layer(win, None);
+    let a = scene.add_layer(win, Some(parent));
+    let b = scene.add_layer(win, Some(parent));
+
+    assert_eq!(scene.layer(parent).unwrap().children, vec![a, b]);
+    assert_eq!(scene.layer(a).unwrap().z_order, 0);
+    assert_eq!(scene.layer(b).unwrap().z_order, 1);
+    assert_eq!(scene.order_index(b), Some(1));
+
+    assert!(scene.set_absolute_order_mode(parent, true));
+    assert!(scene.layer(parent).unwrap().absolute_order_mode);
+    let c = scene.add_layer(win, Some(parent));
+    assert_eq!(scene.layer(parent).unwrap().children, vec![a, b, c]);
+    assert_eq!(
+        scene.layer(c).unwrap().z_order,
+        2,
+        "the reference assigns last absolute index + 1"
+    );
+    assert_eq!(scene.absolute_order_index(c), Some(2));
+
+    // A parentless window root appends at the end of the root list.
+    let root_a = scene.add_layer(win, None);
+    let root_b = scene.add_layer(win, None);
+    assert_eq!(
+        scene.window(win).unwrap().layers,
+        vec![parent, root_a, root_b]
+    );
+    assert_eq!(scene.layer(root_b).unwrap().z_order, 2);
+}
+
+/// Reference `SetAbsoluteOrderIndex` (`reference/cpp/core/visual/LayerIntf.cpp:1445-1452`)
+/// requires a parent, turns the parent's absolute order mode on, inserts the
+/// layer at the index selected by `ChildChangeAbsoluteOrder`
+/// (`:1332-1354`) and stores the requested absolute index. The getter
+/// (`:1435-1443`) returns that index while the mode is on.
+#[test]
+fn absolute_order_reorders_siblings_and_keeps_the_index() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (640, 480));
+    let parent = scene.add_layer(win, None);
+    let a = scene.add_layer(win, Some(parent));
+    let b = scene.add_layer(win, Some(parent));
+    let c = scene.add_layer(win, Some(parent));
+
+    scene.set_absolute_order_index(c, 0).unwrap();
+    assert!(scene.layer(parent).unwrap().absolute_order_mode);
+    assert_eq!(scene.layer(parent).unwrap().children, vec![c, a, b]);
+    assert_eq!(scene.absolute_order_index(c), Some(0));
+    assert_eq!(scene.absolute_order_index(a), Some(0));
+    assert_eq!(scene.order_index(a), Some(1));
+
+    scene.set_absolute_order_index(c, 5).unwrap();
+    assert_eq!(scene.layer(parent).unwrap().children, vec![a, b, c]);
+    assert_eq!(scene.absolute_order_index(c), Some(5));
+    assert_eq!(scene.order_index(c), Some(2));
+
+    let error = scene
+        .set_absolute_order_index(parent, 1)
+        .expect_err("a parentless layer has no absolute order");
+    assert!(error.contains("siblingless"), "{error}");
+}
+
+/// Reference `SetOrderIndex` (`reference/cpp/core/visual/LayerIntf.cpp:1396-1410`)
+/// leaves absolute order mode, clamps the requested index to the sibling
+/// range, moves the layer and makes the relative order index its position.
+#[test]
+fn order_setter_clamps_and_leaves_absolute_mode() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (640, 480));
+    let parent = scene.add_layer(win, None);
+    let a = scene.add_layer(win, Some(parent));
+    let b = scene.add_layer(win, Some(parent));
+    let c = scene.add_layer(win, Some(parent));
+
+    scene.set_absolute_order_index(c, 9).unwrap();
+    assert!(scene.layer(parent).unwrap().absolute_order_mode);
+    scene.set_order_index(c, 0).unwrap();
+    assert!(!scene.layer(parent).unwrap().absolute_order_mode);
+    assert_eq!(scene.layer(parent).unwrap().children, vec![c, a, b]);
+    assert_eq!(scene.layer(c).unwrap().z_order, 0);
+    assert_eq!(scene.layer(a).unwrap().z_order, 1);
+    assert_eq!(scene.layer(b).unwrap().z_order, 2);
+    assert_eq!(scene.absolute_order_index(c), Some(0));
+
+    scene.set_order_index(c, 99).unwrap();
+    assert_eq!(scene.layer(parent).unwrap().children, vec![a, b, c]);
+    assert_eq!(scene.layer(c).unwrap().z_order, 2);
+    assert_eq!(scene.order_index(c), Some(2));
+}
+
+/// Reference `SetAbsoluteOrderMode` (`reference/cpp/core/visual/LayerIntf.cpp:1458-1470`)
+/// seeds each child's absolute index from its current sibling position when
+/// the mode is enabled, and the relative list is renumbered when it leaves.
+#[test]
+fn absolute_order_mode_seeds_child_indices() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (640, 480));
+    let parent = scene.add_layer(win, None);
+    let a = scene.add_layer(win, Some(parent));
+    let b = scene.add_layer(win, Some(parent));
+    let c = scene.add_layer(win, Some(parent));
+    scene.layer_mut(a).unwrap().z_order = 9;
+    scene.layer_mut(b).unwrap().z_order = 4;
+    scene.layer_mut(c).unwrap().z_order = 7;
+
+    assert!(scene.set_absolute_order_mode(parent, true));
+    assert_eq!(scene.layer(a).unwrap().z_order, 0);
+    assert_eq!(scene.layer(b).unwrap().z_order, 1);
+    assert_eq!(scene.layer(c).unwrap().z_order, 2);
+
+    assert!(scene.set_absolute_order_mode(parent, false));
+    assert_eq!(scene.layer(a).unwrap().z_order, 0);
+    assert_eq!(scene.layer(b).unwrap().z_order, 1);
+    assert_eq!(scene.layer(c).unwrap().z_order, 2);
+}
+
+/// The first layer of a window is its primary layer and the screen-sized draw
+/// target. A script-created first layer starts with the default empty rect,
+/// so the attach step must give it the window client size; otherwise ancestor
+/// hit-testing rejects every child of a normally-sized primary.
+#[test]
+fn first_layer_is_a_window_sized_primary() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (320, 240));
+    let primary = scene.add_layer(win, None);
+    assert_eq!(scene.window(win).unwrap().primary_layer, Some(primary));
+    assert_eq!(
+        scene.layer(primary).unwrap().rect,
+        engine::Rect::new(0, 0, 0, 0)
+    );
+    assert_eq!(
+        scene.clipping_rect(primary),
+        Some(engine::Rect::new(0, 0, 320, 240)),
+        "the primary layer clips like the window client"
+    );
+
+    let child = scene.add_layer(win, Some(primary));
+    scene.layer_mut(child).unwrap().rect = engine::Rect::new(1, 1, 4, 4);
+    scene.layer_mut(child).unwrap().visible = true;
+    let bitmap = scene.add_bitmap(4, 4, vec![255; 64]);
+    scene.layer_mut(child).unwrap().bitmap = Some(bitmap);
+    scene.layer_mut(child).unwrap().hit_threshold = 0;
+    assert_eq!(scene.layer_at(child, 1, 1, false, false), Some(child));
 }

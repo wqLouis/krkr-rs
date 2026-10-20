@@ -42,7 +42,7 @@ use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 
 use crate::Media;
-use crate::hint::extension_of;
+use crate::hint::{display_name, extension_of};
 
 /// Audio format/codec names advertised by [`crate::capabilities`].
 pub(crate) const AUDIO_FORMATS: [&str; 9] = [
@@ -111,11 +111,6 @@ struct OpenedAudio<'a> {
     spec: AudioSpec,
 }
 
-/// Returns the hint used in error messages.
-fn display_name(hint: Option<&str>) -> &str {
-    hint.filter(|name| !name.is_empty()).unwrap_or("<audio>")
-}
-
 /// Builds a fresh codec registry with the default codecs plus the Opus
 /// adapter.
 ///
@@ -141,7 +136,7 @@ where
     S: MediaSource + 'a,
     F: Fn() -> S,
 {
-    let name = display_name(hint);
+    let name = display_name(hint, "<audio>");
     // The hint only steers the probe. A name whose extension does not match
     // the content sends the probe down the wrong path, so a failed hinted
     // probe is retried without the hint: the bytes decide the format.
@@ -165,7 +160,7 @@ fn probe_source<'a, S>(source: S, hint: Option<&str>) -> Result<OpenedAudio<'a>,
 where
     S: MediaSource + 'a,
 {
-    let name = display_name(hint);
+    let name = display_name(hint, "<audio>");
     let mss = MediaSourceStream::new(Box::new(source), Default::default());
     let mut symphonia_hint = Hint::new();
     if let Some(ext) = hint.and_then(extension_of) {
@@ -271,7 +266,7 @@ fn decode_all(opened: OpenedAudio<'_>, hint: Option<&str>) -> Result<DecodedAudi
         decoder,
         track_id,
     };
-    let name = display_name(hint);
+    let name = display_name(hint, "<audio>");
     let mut samples: Vec<f32> = Vec::new();
     let mut pending: Vec<f32> = Vec::new();
     let mut pending_offset = 0usize;
@@ -315,6 +310,13 @@ fn decode_all(opened: OpenedAudio<'_>, hint: Option<&str>) -> Result<DecodedAudi
 /// by `Arc` so the caller can keep the compressed buffer alive (and so
 /// [`seek_audio`] can restart the reader without re-copying it).
 ///
+/// The first packet is decoded here, so the returned spec is the format the
+/// decoder really produces. A track whose decoder produces a different rate
+/// than the container declares (an AAC track with the SBR extension, whose
+/// decoder has no SBR synthesis) is reported at the open instead of playing
+/// at the wrong speed; the decoded packet is staged in the state, so nothing
+/// is lost.
+///
 /// A stream that cannot be opened returns a typed [`MediaError`].
 pub fn open_audio(
     m: &Media,
@@ -325,7 +327,7 @@ pub fn open_audio(
     let hint_owned = hint.map(str::to_string);
     let opened = open_setup(|| Cursor::new(Arc::clone(&bytes)), hint)?;
     let spec = opened.spec;
-    let state = AudioDecoderState {
+    let mut state = AudioDecoderState {
         spec,
         setup: Some(DecoderSetup {
             format: opened.format,
@@ -340,6 +342,14 @@ pub fn open_audio(
         position_frames: 0,
         eof: false,
     };
+    if !decode_next_packet(&mut state)? {
+        return Err(MediaError::Decode {
+            format: String::new(),
+            message: format!("{}: no audio data decoded", display_name(hint, "<audio>")),
+        });
+    }
+    // The decoder's own format, not the container's.
+    let spec = state.spec;
     Ok((spec, state))
 }
 
@@ -418,7 +428,7 @@ fn decode_next_packet(state: &mut AudioDecoderState) -> Result<bool, MediaError>
     let Some(setup) = setup.as_mut() else {
         return Ok(false);
     };
-    let name = display_name(hint.as_deref());
+    let name = display_name(hint.as_deref(), "<audio>");
     decode_packet_into(spec, setup, pending, pending_offset, skip_frames, name)
 }
 

@@ -9,6 +9,11 @@
 //! shim in [`extractor`] demuxes the container. Behind the same
 //! `open`/`present`/`audio` surface as the FFmpeg backend — no JNI, no FFmpeg.
 //!
+//! The same extractor, codec and audio state also back a **standalone audio
+//! path** ([`decode_audio`]): a track that is only audio — an MP4/AAC voice,
+//! including an HE-AAC track, whose SBR band the platform decoder
+//! reconstructs — is demuxed and decoded on its own, without a video track.
+//!
 //! # In-memory source
 //!
 //! The layer above hands us an [`Arc<[u8]>`]; the API-21 extractor only takes
@@ -25,8 +30,9 @@
 //! * **Compile-checked:** the whole module, including the Android path
 //!   (`cargo check --target aarch64-linux-android`, which never links).
 //! * **On-device validation still required:** the demux/decode loop, the
-//!   `memfd` trick, seeking, colour-format negotiation and the exact
-//!   stride/slice-height/crop a codec reports. None of this has run here.
+//!   `memfd` trick, seeking, colour-format negotiation, the exact
+//!   stride/slice-height/crop a codec reports and the platform AAC decoder
+//!   of the standalone audio path. None of this has run here.
 //!
 //! # State and errors
 //!
@@ -40,10 +46,10 @@
 //! that keeps `cargo check` green.
 
 #[cfg(not(target_os = "android"))]
-pub use stub::{VideoDecoderState, audio, open, present};
+pub use stub::{VideoDecoderState, audio, decode_audio, open, present};
 
 #[cfg(target_os = "android")]
-pub use android::{VideoDecoderState, audio, open, present};
+pub use android::{VideoDecoderState, audio, decode_audio, open, present};
 
 /// Non-Android placeholder backend.
 ///
@@ -92,6 +98,16 @@ mod stub {
     pub fn audio(m: &Media, state: &VideoDecoderState) -> Result<Arc<DecodedAudio>, MediaError> {
         let _ = (m, state);
         Err(host_stub_error("video audio (mediacodec)"))
+    }
+
+    /// Decodes a whole audio track. Host stub: always fails.
+    pub fn decode_audio(
+        m: &Media,
+        bytes: Arc<[u8]>,
+        hint: Option<&str>,
+    ) -> Result<Arc<DecodedAudio>, MediaError> {
+        let _ = (m, bytes, hint);
+        Err(host_stub_error("audio decode (mediacodec)"))
     }
 
     fn host_stub_error(feature: &str) -> MediaError {
@@ -304,6 +320,7 @@ mod android {
 
     use super::extractor::{self, AMEDIA_OK, AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC, Extractor};
     use crate::Media;
+    use crate::hint::display_name;
     use crate::video::SEEK_TOLERANCE_MS;
     use crate::yuv::{CropRect, Yuv420Layout, YuvSampling, micros_to_millis, yuv420_to_rgba};
 
@@ -323,6 +340,8 @@ mod android {
 
     /// `AudioFormat.ENCODING_PCM_16BIT`, the MediaCodec PCM default.
     const PCM_ENCODING_16BIT: i32 = 2;
+    /// The platform's AAC decoder, selected for an MP4/AAC audio track.
+    const AAC_MIME: &str = "audio/mp4a-latm";
     /// `AudioFormat.ENCODING_PCM_FLOAT`.
     const PCM_ENCODING_FLOAT: i32 = 4;
 
@@ -435,107 +454,126 @@ mod android {
             let Some(audio_index) = self.audio_index else {
                 return Ok(());
             };
-            select_only(&self.extractor, Some(audio_index), self.video_index);
-            let status = self
-                .extractor
-                .seek_to(0, AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC);
-            status_ok(status, &self.name, "AMediaExtractor_seekTo(audio)")?;
-
             let name = self.name.clone();
-            let extractor = &self.extractor;
             let Some(audio) = self.audio.as_mut() else {
                 return Ok(());
             };
-            audio
-                .codec
-                .flush()
-                .map_err(|error| decode_error(&name, format!("audio flush: {error}")))?;
-            audio.input_done = false;
-            audio.output_done = false;
+            let decoded =
+                decode_audio_track(&self.extractor, audio, audio_index, self.video_index, &name)?;
+            self.audio_pcm = Some(Arc::new(decoded));
+            Ok(())
+        }
+    }
 
-            let mut samples: Vec<f32> = Vec::new();
-            let mut out_rate = audio.out_rate;
-            let mut out_channels = audio.out_channels;
-            let mut encoding = audio.pcm_encoding;
+    /// Decode every sample of the selected audio track into interleaved `f32`.
+    ///
+    /// The track is demuxed with `AMediaExtractor` and decoded with the
+    /// platform's audio decoder. The decoder's own output format decides the
+    /// sample rate and the channel count, so a track the platform decoder
+    /// resamples (an AAC track with the SBR extension) is reported at the
+    /// rate it really has.
+    ///
+    /// `other_index` is a track that must not be selected (the video track of
+    /// a movie); the audio track alone is decoded.
+    fn decode_audio_track(
+        extractor: &Extractor,
+        audio: &mut AudioState,
+        audio_index: usize,
+        other_index: Option<usize>,
+        name: &str,
+    ) -> Result<DecodedAudio, MediaError> {
+        select_only(extractor, Some(audio_index), other_index);
+        let status = extractor.seek_to(0, AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC);
+        status_ok(status, name, "AMediaExtractor_seekTo(audio)")?;
 
-            let mut steps = 0u32;
-            loop {
-                steps += 1;
-                if steps > MAX_DECODE_STEPS {
-                    return Err(decode_error(&name, "audio decode did not terminate"));
-                }
-                if audio.output_done {
-                    break;
-                }
-                if !audio.input_done {
-                    match audio.codec.dequeue_input_buffer(Duration::ZERO) {
-                        Ok(DequeuedInputBufferResult::Buffer(input)) => {
-                            if feed_audio_sample(&audio.codec, input, extractor, &name)? {
-                                audio.input_done = true;
-                            }
-                            continue;
-                        }
-                        Ok(DequeuedInputBufferResult::TryAgainLater) => {}
-                        Err(error) => {
-                            return Err(decode_error(
-                                &name,
-                                format!("audio dequeueInputBuffer: {error}"),
-                            ));
-                        }
-                    }
-                }
+        audio
+            .codec
+            .flush()
+            .map_err(|error| decode_error(name, format!("audio flush: {error}")))?;
+        audio.input_done = false;
+        audio.output_done = false;
 
-                match audio.codec.dequeue_output_buffer(DECODE_TIMEOUT) {
-                    Ok(DequeuedOutputBufferInfoResult::Buffer(output)) => {
-                        let info = *output.info();
-                        if info.flags() & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM != 0 {
-                            release(&audio.codec, output, &name)?;
-                            audio.output_done = true;
-                            continue;
+        let mut samples: Vec<f32> = Vec::new();
+        let mut out_rate = audio.out_rate;
+        let mut out_channels = audio.out_channels;
+        let mut encoding = audio.pcm_encoding;
+
+        let mut steps = 0u32;
+        loop {
+            steps += 1;
+            if steps > MAX_DECODE_STEPS {
+                return Err(decode_error(name, "audio decode did not terminate"));
+            }
+            if audio.output_done {
+                break;
+            }
+            if !audio.input_done {
+                match audio.codec.dequeue_input_buffer(Duration::ZERO) {
+                    Ok(DequeuedInputBufferResult::Buffer(input)) => {
+                        if feed_audio_sample(&audio.codec, input, extractor, name)? {
+                            audio.input_done = true;
                         }
-                        if info.size() > 0 {
-                            append_pcm(output_slice(&output, &info), encoding, &mut samples);
-                        }
-                        release(&audio.codec, output, &name)?;
+                        continue;
                     }
-                    Ok(DequeuedOutputBufferInfoResult::OutputFormatChanged) => {
-                        let format = audio.codec.output_format();
-                        if let Some(rate) = format.i32("sample-rate") {
-                            out_rate = rate.max(0) as u32;
-                        }
-                        if let Some(channels) = format.i32("channel-count") {
-                            out_channels = channel_count(&name, channels)?;
-                        }
-                        if let Some(value) = format.i32("pcm-encoding") {
-                            encoding = value;
-                        }
-                    }
-                    Ok(DequeuedOutputBufferInfoResult::OutputBuffersChanged)
-                    | Ok(DequeuedOutputBufferInfoResult::TryAgainLater) => {}
+                    Ok(DequeuedInputBufferResult::TryAgainLater) => {}
                     Err(error) => {
                         return Err(decode_error(
-                            &name,
-                            format!("audio dequeueOutputBuffer: {error}"),
+                            name,
+                            format!("audio dequeueInputBuffer: {error}"),
                         ));
                     }
                 }
             }
 
-            audio.out_rate = out_rate;
-            audio.out_channels = out_channels;
-            audio.pcm_encoding = encoding;
-            let spec = AudioSpec {
-                sample_rate: out_rate,
-                channels: out_channels,
-                total_frames: if out_channels > 0 {
-                    Some(samples.len() as u64 / u64::from(out_channels))
-                } else {
-                    None
-                },
-            };
-            self.audio_pcm = Some(Arc::new(DecodedAudio::new(spec, samples)));
-            Ok(())
+            match audio.codec.dequeue_output_buffer(DECODE_TIMEOUT) {
+                Ok(DequeuedOutputBufferInfoResult::Buffer(output)) => {
+                    let info = *output.info();
+                    if info.flags() & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM != 0 {
+                        release(&audio.codec, output, name)?;
+                        audio.output_done = true;
+                        continue;
+                    }
+                    if info.size() > 0 {
+                        append_pcm(output_slice(&output, &info), encoding, &mut samples);
+                    }
+                    release(&audio.codec, output, name)?;
+                }
+                Ok(DequeuedOutputBufferInfoResult::OutputFormatChanged) => {
+                    let format = audio.codec.output_format();
+                    if let Some(rate) = format.i32("sample-rate") {
+                        out_rate = rate.max(0) as u32;
+                    }
+                    if let Some(channels) = format.i32("channel-count") {
+                        out_channels = channel_count(name, channels)?;
+                    }
+                    if let Some(value) = format.i32("pcm-encoding") {
+                        encoding = value;
+                    }
+                }
+                Ok(DequeuedOutputBufferInfoResult::OutputBuffersChanged)
+                | Ok(DequeuedOutputBufferInfoResult::TryAgainLater) => {}
+                Err(error) => {
+                    return Err(decode_error(
+                        name,
+                        format!("audio dequeueOutputBuffer: {error}"),
+                    ));
+                }
+            }
         }
+
+        audio.out_rate = out_rate;
+        audio.out_channels = out_channels;
+        audio.pcm_encoding = encoding;
+        let spec = AudioSpec {
+            sample_rate: out_rate,
+            channels: out_channels,
+            total_frames: if out_channels > 0 {
+                Some(samples.len() as u64 / u64::from(out_channels))
+            } else {
+                None
+            },
+        };
+        Ok(DecodedAudio::new(spec, samples))
     }
 
     /// Opens a video stream and probes its [`VideoSpec`].
@@ -551,7 +589,7 @@ mod android {
         hint: Option<&str>,
     ) -> Result<(VideoSpec, VideoDecoderState), MediaError> {
         let _ = m;
-        let name = display_name(hint).to_string();
+        let name = display_name(hint, "<video>").to_string();
         let source = extractor::memory_backed_file(&bytes).map_err(|error| MediaError::Io {
             message: format!("{name}: {error}"),
         })?;
@@ -1125,17 +1163,39 @@ mod android {
     }
 
     /// Create, configure and start the audio decoder.
+    ///
+    /// The platform's AAC decoder is selected with the container's mime
+    /// (`audio/mp4a-latm` for an MP4 AAC track). A decoder that cannot be
+    /// created, configured or started is logged with the mime and the reason
+    /// and reported as a typed error: the track is never replaced with
+    /// silence.
     fn create_audio_codec(track: &PickedTrack, name: &str) -> Result<Codec, MediaError> {
-        let codec =
-            MediaCodec::from_decoder_type(&track.mime).ok_or_else(|| MediaError::Unsupported {
-                message: format!("{name}: no MediaCodec decoder for {}", track.mime),
-            })?;
+        let codec = match MediaCodec::from_decoder_type(&track.mime) {
+            Some(codec) => codec,
+            None => {
+                let message = format!("{name}: no MediaCodec decoder for {}", track.mime);
+                log::error!("{message}");
+                return Err(MediaError::Unsupported { message });
+            }
+        };
         codec
             .configure(&track.format, None, MediaCodecDirection::Decoder)
-            .map_err(|error| decode_error(name, format!("configure(audio): {error}")))?;
-        codec
-            .start()
-            .map_err(|error| decode_error(name, format!("start(audio): {error}")))?;
+            .map_err(|error| {
+                let message = format!("{name}: configure(audio, {}): {error}", track.mime);
+                log::error!("{message}");
+                MediaError::Decode {
+                    format: String::new(),
+                    message,
+                }
+            })?;
+        codec.start().map_err(|error| {
+            let message = format!("{name}: start(audio, {}): {error}", track.mime);
+            log::error!("{message}");
+            MediaError::Decode {
+                format: String::new(),
+                message,
+            }
+        })?;
         Ok(Codec {
             codec,
             started: true,
@@ -1188,11 +1248,6 @@ mod android {
         }
     }
 
-    /// Returns the hint used in error messages.
-    fn display_name(hint: Option<&str>) -> &str {
-        hint.filter(|name| !name.is_empty()).unwrap_or("<video>")
-    }
-
     /// Interpreting `None` as zero.
     fn non_negative(value: Option<i32>) -> usize {
         value.unwrap_or(0).max(0) as usize
@@ -1215,6 +1270,20 @@ mod android {
     fn channel_count_opt(name: &str, channels: Option<i32>) -> Result<u32, MediaError> {
         match channels {
             Some(count) => channel_count(name, count),
+            None => Ok(0),
+        }
+    }
+
+    /// The sample rate a `MediaFormat` lookup reports.
+    ///
+    /// An absent key means the container states no rate: zero then, and the
+    /// decoder's own output format decides the real rate. A negative rate is
+    /// reported rather than clamped.
+    fn sample_rate_opt(name: &str, rate: Option<i32>) -> Result<u32, MediaError> {
+        match rate {
+            Some(rate) => u32::try_from(rate).map_err(|_| MediaError::InvalidData {
+                message: format!("{name}: the audio sample rate {rate} is negative"),
+            }),
             None => Ok(0),
         }
     }
@@ -1245,5 +1314,60 @@ mod android {
         u64::try_from(pts_ms).map_err(|_| MediaError::InvalidData {
             message: format!("{name}: presentation time {pts_ms} ms is out of range"),
         })
+    }
+
+    /// Decode a whole audio track with the platform's audio decoder.
+    ///
+    /// The track is demuxed with `AMediaExtractor` and decoded with the
+    /// platform's AAC decoder (`audio/mp4a-latm`), which reconstructs the SBR
+    /// band of an HE-AAC track, so the track decodes at the rate the
+    /// container declares. The decoder's own output format decides the sample
+    /// rate and the channel count, and the whole track is materialized.
+    ///
+    /// A track whose decoder cannot be created, configured or started is
+    /// logged with the mime and the reason and reported as a typed error: no
+    /// silence and no reduced-rate core is substituted.
+    ///
+    /// This path is compile-checked but has not run on a device.
+    pub fn decode_audio(
+        m: &Media,
+        bytes: Arc<[u8]>,
+        hint: Option<&str>,
+    ) -> Result<Arc<DecodedAudio>, MediaError> {
+        let _ = m;
+        let name = display_name(hint, "<audio>").to_string();
+        let source = extractor::memory_backed_file(&bytes).map_err(|error| MediaError::Io {
+            message: format!("{name}: {error}"),
+        })?;
+        let extractor = Extractor::new().ok_or_else(|| MediaError::Unsupported {
+            message: format!("{name}: AMediaExtractor_new returned null"),
+        })?;
+        let length = i64::try_from(bytes.len()).map_err(|_| MediaError::InvalidData {
+            message: format!("{name}: the track is too long for the extractor"),
+        })?;
+        let status = extractor.set_data_source_fd(source.as_raw_fd(), 0, length);
+        status_ok(status, &name, "AMediaExtractor_setDataSourceFd")?;
+
+        let (_video, audio) = collect_tracks(&extractor)?;
+        let Some(mut audio_track) = audio else {
+            return Err(MediaError::Unsupported {
+                message: format!("{name}: no audio stream"),
+            });
+        };
+        // The platform's AAC decoder is selected explicitly: an MP4/AAC track
+        // carries the same name, and the explicit choice keeps a track the
+        // container labels differently on the AAC decoder.
+        audio_track.mime = AAC_MIME.to_string();
+
+        let mut state = AudioState {
+            codec: create_audio_codec(&audio_track, &name)?,
+            out_rate: sample_rate_opt(&name, audio_track.format.i32("sample-rate"))?,
+            out_channels: channel_count_opt(&name, audio_track.format.i32("channel-count"))?,
+            pcm_encoding: PCM_ENCODING_16BIT,
+            input_done: false,
+            output_done: false,
+        };
+        let decoded = decode_audio_track(&extractor, &mut state, audio_track.index, None, &name)?;
+        Ok(Arc::new(decoded))
     }
 }

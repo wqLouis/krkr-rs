@@ -51,6 +51,9 @@ image = { version = "0.25", default-features = false, features = [
     "exr",
     "ff",
 ] }
+# The MediaCodec backend logs a decoder that cannot be created, configured or
+# started; the failure is also reported as a typed error.
+log = { workspace = true }
 
 # Android-only: safe NDK MediaCodec/MediaFormat bindings. `ndk` selects the
 # `ndk-sys` `media` feature and links `libmediandk`; it is not in the host

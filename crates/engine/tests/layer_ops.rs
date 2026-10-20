@@ -140,6 +140,41 @@ fn render_layer_subtree_composites_children_into_a_cache() {
     assert!(scene.layer(layer).unwrap().cache_bitmap.is_none());
 }
 
+/// A texture-less container clips its descendants inside a subtree cache as
+/// well as in the live projection. The reference draws children only inside
+/// the parent's `Rect` (`reference/cpp/core/visual/LayerIntf.cpp:7138-7140`,
+/// `:7184-7185`), so a grandchild outside a container contributes no pixels
+/// to the cache.
+#[test]
+fn cached_subtree_respects_a_textureless_container_clip() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (4, 4));
+    let root = scene.add_layer(win, None);
+    scene.layer_mut(root).unwrap().rect = Rect::new(0, 0, 4, 4);
+    let container = scene.add_layer(win, Some(root));
+    {
+        let l = scene.layer_mut(container).unwrap();
+        l.rect = Rect::new(0, 0, 2, 4);
+        l.visible = true;
+    }
+    let child = scene.add_layer(win, Some(container));
+    let child_bitmap = solid_bitmap(&mut scene, 2, 4, [255, 0, 0, 255]);
+    {
+        let l = scene.layer_mut(child).unwrap();
+        l.rect = Rect::new(2, 0, 2, 4);
+        l.visible = true;
+        l.bitmap = Some(child_bitmap);
+    }
+
+    let cache = render_layer_subtree(&mut scene, root).expect("cache bitmap");
+    let bitmap = scene.bitmap(cache).unwrap();
+    assert_eq!((bitmap.width, bitmap.height), (4, 4));
+    assert!(
+        bitmap.rgba.iter().all(|&byte| byte == 0),
+        "the grandchild is outside the texture-less container and must be clipped"
+    );
+}
+
 /// The subtree render applies each child's `ImageLeft/Top/Width/Height`
 /// placement — the reference `DrawSelf`/`CopySelf` transform
 /// (`LayerIntf.cpp:6744-6750`) — so a sprite-sheet frame selected with a

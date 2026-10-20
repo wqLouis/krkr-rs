@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 
 use api::blend::BlendMode;
 use api::geometry::{PixelRegion, RectF};
-use render::{RenderContent, RenderNode, RenderNodeId, RenderScene, Texture};
+use render::{Clip, RenderContent, RenderNode, RenderNodeId, RenderScene, Texture};
 
 use crate::scene::{Rect, Scene};
 
@@ -78,6 +78,11 @@ pub struct ComposedLayer {
     pub opacity: f32,
     /// `true` only when the layer and every ancestor is visible.
     pub visible: bool,
+    /// Intersection of the layer's own absolute rectangle and every ancestor
+    /// rectangle. A parent rectangle clips its whole subtree, so this is the
+    /// clip for the layer and its descendants. `None` only before a layer
+    /// rectangle has been composed.
+    pub clip: Option<Rect>,
 }
 
 /// Compose a layer's position, opacity and visibility through its ancestors.
@@ -113,16 +118,60 @@ pub fn compose_layer(scene: &Scene, layer_id: u32) -> Option<ComposedLayer> {
         rect: Rect::default(),
         opacity: 1.0,
         visible: true,
+        clip: None,
     };
     for layer in chain {
-        result.rect.x = result.rect.x.saturating_add(layer.rect.x);
-        result.rect.y = result.rect.y.saturating_add(layer.rect.y);
-        result.rect.w = layer.rect.w;
-        result.rect.h = layer.rect.h;
+        let rect = Rect::new(
+            result.rect.x.saturating_add(layer.rect.x),
+            result.rect.y.saturating_add(layer.rect.y),
+            layer.rect.w,
+            layer.rect.h,
+        );
+        let clip_rect = scene
+            .clipping_rect(layer.id)
+            .map(|clip| Rect::new(rect.x, rect.y, clip.w, clip.h))
+            .unwrap_or(rect);
+        result.clip = Some(match result.clip {
+            Some(clip) => intersect_rect(clip, clip_rect),
+            None => clip_rect,
+        });
+        result.rect = rect;
         result.opacity *= clamp_opacity(layer.opacity);
         result.visible &= layer.visible;
     }
     Some(result)
+}
+
+/// Intersect two layer rectangles. A non-overlapping pair yields a zero-sized
+/// rectangle at the shared origin, which the renderers turn into an empty
+/// scissor.
+fn intersect_rect(a: Rect, b: Rect) -> Rect {
+    let a_right = a.x.saturating_add(dim_i32(a.w));
+    let b_right = b.x.saturating_add(dim_i32(b.w));
+    let a_bottom = a.y.saturating_add(dim_i32(a.h));
+    let b_bottom = b.y.saturating_add(dim_i32(b.h));
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = a_right.min(b_right);
+    let bottom = a_bottom.min(b_bottom);
+    Rect::new(
+        left,
+        top,
+        right.saturating_sub(left).max(0) as u32,
+        bottom.saturating_sub(top).max(0) as u32,
+    )
+}
+
+/// Clip rectangle for a composed layer's render node.
+fn composed_clip(composed: &ComposedLayer) -> Option<Clip> {
+    composed.clip.map(|clip| {
+        Clip::Rect(RectF::new(
+            clip.x as f32,
+            clip.y as f32,
+            clip.w as f32,
+            clip.h as f32,
+        ))
+    })
 }
 
 /// Compute the visible part of a layer's image after clipping it to the
@@ -306,11 +355,20 @@ fn append_window<F>(
                 rect: Rect::default(),
                 opacity: 1.0,
                 visible: true,
+                clip: None,
             });
         node_composed.rect.x = node_composed.rect.x.saturating_add(layer.rect.x);
         node_composed.rect.y = node_composed.rect.y.saturating_add(layer.rect.y);
         node_composed.rect.w = layer.rect.w;
         node_composed.rect.h = layer.rect.h;
+        let clip_rect = scene
+            .clipping_rect(layer_id)
+            .map(|clip| Rect::new(node_composed.rect.x, node_composed.rect.y, clip.w, clip.h))
+            .unwrap_or(node_composed.rect);
+        node_composed.clip = Some(match node_composed.clip {
+            Some(clip) => intersect_rect(clip, clip_rect),
+            None => clip_rect,
+        });
         node_composed.opacity *= clamp_opacity(layer.opacity);
         node_composed.visible &= layer.visible;
         composed.insert(layer_id, node_composed);
@@ -327,6 +385,13 @@ fn append_window<F>(
         let node = 'layer: {
             if !node_composed.visible {
                 hidden += 1;
+                break 'layer None;
+            }
+            if node_composed
+                .clip
+                .is_some_and(|clip| clip.w == 0 || clip.h == 0)
+            {
+                clipped += 1;
                 break 'layer None;
             }
             let opacity = win_opacity * node_composed.opacity;
@@ -415,6 +480,7 @@ fn append_window<F>(
                 z: state.next_z,
                 blend,
                 hold_alpha: layer.hold_alpha,
+                clip: composed_clip(&node_composed),
                 ..RenderNode::default()
             })
         };

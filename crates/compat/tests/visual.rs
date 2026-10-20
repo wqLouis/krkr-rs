@@ -114,7 +114,7 @@ fn window_and_layer_round_trip_through_the_scene() {
          w.setPos(5, 6); \
          w.caption = 'hello'; \
          var base = new Layer(w, null); \
-         var l = new Layer(w, null); \
+         var l = new Layer(w, base); \
          l.setPos(10, 20); \
          l.setSize(100, 50); \
          l.visible = true; \

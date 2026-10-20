@@ -1402,6 +1402,7 @@ dependencies = [
  "api",
  "ffmpeg-next",
  "image",
+ "log",
  "ndk",
  "symphonia",
  "symphonia-adapter-libopus",

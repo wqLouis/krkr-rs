@@ -72,12 +72,18 @@ use std::sync::Arc;
 use api::error::{AudioError, MediaError};
 use api::media::AudioSpec;
 use compat::{
-    CompatHost, add_audio_decoder, set_output_latency, set_sound_render_driven, sound_render,
+    AudioDecoder, CompatHost, add_audio_decoder, set_output_latency, set_sound_render_driven,
+    sound_render,
 };
-use engine::sound::{AudioStream, SoundError, SoundSource};
+use engine::sound::{AudioStream, LoopInfo, SoundError, SoundSource};
 use media::{AudioDecoderState, Media, open_audio, read_audio, seek_audio};
 use platform::{AudioDevice, AudioOutputState, PlatformError};
 use vm::VmHost;
+
+#[cfg(target_os = "linux")]
+use media::decode_audio_ffmpeg;
+#[cfg(target_os = "android")]
+use media::decode_audio_mediacodec;
 
 use crate::GameError;
 use crate::startup::StartupStats;
@@ -205,6 +211,66 @@ impl AudioStream for MediaAudioStream {
     }
 }
 
+/// Decodes a track with the FFmpeg backend, after the built-in decoder
+/// failed.
+///
+/// The FFmpeg backend handles the tracks the built-in decoder cannot: an AAC
+/// track with the SBR extension declares the extension's rate while the
+/// built-in decoder produces the core's, and the track would play at the
+/// wrong speed. FFmpeg's AAC decoder reconstructs the SBR band, so such a
+/// track decodes at the rate the container declares.
+///
+/// The whole track is materialized: the source holds every decoded sample,
+/// so playback seeks by frame without decoding again.
+///
+/// When both attempts fail the error names both, so neither reason is lost.
+#[cfg(target_os = "linux")]
+fn decode_with_platform_backend(
+    media: &Media,
+    bytes: Arc<[u8]>,
+    hint: Option<&str>,
+    loops: Option<LoopInfo>,
+    builtin_error: &str,
+) -> Result<Arc<SoundSource>, String> {
+    match decode_audio_ffmpeg(media, bytes, hint) {
+        Ok(decoded) => SoundSource::with_loops(decoded, loops)
+            .map(Arc::new)
+            .map_err(|error| format!("{builtin_error}; the ffmpeg backend: {error}")),
+        Err(error) => {
+            log::error!("audio: the ffmpeg backend could not decode the track: {error}");
+            Err(format!("{builtin_error}; the ffmpeg backend: {error}"))
+        }
+    }
+}
+
+/// Decodes a track with the platform's AAC decoder, after the built-in
+/// decoder failed.
+///
+/// The platform decoder (`audio/mp4a-latm`) reconstructs the SBR band of an
+/// HE-AAC track, so such a track decodes at the rate the container declares.
+/// The whole track is materialized: the source holds every decoded sample, so
+/// playback seeks by frame without decoding again.
+///
+/// When both attempts fail the error names both, so neither reason is lost.
+#[cfg(target_os = "android")]
+fn decode_with_platform_backend(
+    media: &Media,
+    bytes: Arc<[u8]>,
+    hint: Option<&str>,
+    loops: Option<LoopInfo>,
+    builtin_error: &str,
+) -> Result<Arc<SoundSource>, String> {
+    match decode_audio_mediacodec(media, bytes, hint) {
+        Ok(decoded) => SoundSource::with_loops(decoded, loops)
+            .map(Arc::new)
+            .map_err(|error| format!("{builtin_error}; the mediacodec backend: {error}")),
+        Err(error) => {
+            log::error!("audio: the mediacodec backend could not decode the track: {error}");
+            Err(format!("{builtin_error}; the mediacodec backend: {error}"))
+        }
+    }
+}
+
 /// Install the `media` audio decoder on `host`.
 ///
 /// Call once, before any script runs. Opening a sound probes the container
@@ -212,6 +278,10 @@ impl AudioStream for MediaAudioStream {
 /// samples are decoded only as playback reads them. The decoder owns a clone
 /// of the stateless [`Media`] backend and its own explicit
 /// [`AudioDecoderState`].
+///
+/// A track the built-in decoder cannot handle is decoded with the platform's
+/// media backend instead (see [`decode_with_platform_backend`]); when both
+/// attempts fail the error names both.
 pub fn install_audio_decoder(host: &CompatHost, media: &Media) {
     let stats = StartupStats::new();
     install_audio_decoder_metered(host, media, &stats);
@@ -224,26 +294,44 @@ pub(crate) fn install_audio_decoder_metered(
     media: &Media,
     stats: &Rc<StartupStats>,
 ) {
-    let media = media.clone();
-    let stats = Rc::clone(stats);
     set_sound_render_driven(host.services(), true);
     add_audio_decoder(
         host.services(),
-        Box::new(move |bytes, loops, hint| {
-            let bytes: Arc<[u8]> = Arc::from(bytes);
-            let (spec, state) =
-                open_audio(&media, bytes, hint).map_err(|error| error.to_string())?;
-            stats.record_audio_decoder();
-            let stream = MediaAudioStream {
-                media: media.clone(),
-                state,
-                spec,
-            };
-            let source = SoundSource::streaming(spec, Box::new(stream), loops)
-                .map_err(|error| error.to_string())?;
-            Ok(Arc::new(source))
-        }),
+        make_decoder(media.clone(), Rc::clone(stats)),
     );
+}
+
+/// The decoder the host installs on the sound chain.
+///
+/// The built-in decoder streams: the container is probed at the open and the
+/// samples are decoded as playback reads them. A track it cannot handle is
+/// decoded with the platform's media backend instead (see
+/// [`decode_with_platform_backend`]); when both attempts fail the error names
+/// both.
+fn make_decoder(media: Media, stats: Rc<StartupStats>) -> AudioDecoder {
+    Box::new(move |bytes, loops, hint| {
+        let bytes: Arc<[u8]> = Arc::from(bytes);
+        match open_audio(&media, Arc::clone(&bytes), hint) {
+            Ok((spec, state)) => {
+                stats.record_audio_decoder();
+                let stream = MediaAudioStream {
+                    media: media.clone(),
+                    state,
+                    spec,
+                };
+                let source = SoundSource::streaming(spec, Box::new(stream), loops)
+                    .map_err(|error| error.to_string())?;
+                Ok(Arc::new(source))
+            }
+            Err(builtin_error) => {
+                let builtin_error = builtin_error.to_string();
+                let source =
+                    decode_with_platform_backend(&media, bytes, hint, loops, &builtin_error)?;
+                stats.record_audio_decoder();
+                Ok(source)
+            }
+        }
+    })
 }
 
 /// The L1 audio device plus the per-frame render buffer (see the module docs
@@ -386,12 +474,34 @@ impl AudioOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_MAX_CHUNK_MS, plan_chunk};
+    use media::Media;
+
+    use super::{DEFAULT_MAX_CHUNK_MS, make_decoder, plan_chunk};
+    use crate::startup::StartupStats;
 
     /// A 1 kHz stream, so one millisecond is exactly one frame.
     const RATE: f64 = 1_000.0;
     /// A 10 ms cap keeps the 0/1x/5x arithmetic exact.
     const CAP_MS: f64 = 10.0;
+
+    /// A Sun/NeXT AU file with 16-bit linear PCM.
+    ///
+    /// The AU header is big-endian. The built-in decoder has no reader for
+    /// this container, so only the FFmpeg backend can decode it.
+    fn au_tone(rate: u32, frames: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b".snd");
+        bytes.extend_from_slice(&24u32.to_be_bytes());
+        bytes.extend_from_slice(&(frames * 2).to_be_bytes());
+        bytes.extend_from_slice(&3u32.to_be_bytes());
+        bytes.extend_from_slice(&rate.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        for frame in 0..frames {
+            let sample = (i16::try_from(frame % 8).expect("the phase fits") - 4) * 1000;
+            bytes.extend_from_slice(&sample.to_be_bytes());
+        }
+        bytes
+    }
 
     #[test]
     fn the_default_cap_is_250_ms() {
@@ -464,5 +574,34 @@ mod tests {
         assert_eq!(plan.frames, 0);
         assert!((plan.carry_frames - 0.7).abs() < 1e-9);
         assert_eq!(plan.behind_ms, 0.0);
+    }
+
+    #[test]
+    fn a_track_the_builtin_decoder_cannot_read_is_decoded_by_the_ffmpeg_backend() {
+        let media = Media::new();
+        let decoder = make_decoder(media, StartupStats::new());
+        let source = decoder(&au_tone(8_000, 800), None, Some("tone.au"))
+            .expect("the ffmpeg backend decodes the track");
+        assert!(
+            !source.is_streaming(),
+            "the fallback materializes the whole track"
+        );
+        assert_eq!(source.sample_rate(), 8_000);
+        assert_eq!(source.channels(), 1);
+        assert_eq!(source.frames(), 800);
+    }
+
+    #[test]
+    fn a_track_neither_backend_can_decode_names_both_reasons() {
+        let media = Media::new();
+        let decoder = make_decoder(media, StartupStats::new());
+        let error = match decoder(b"not audio at all", None, Some("broken.wav")) {
+            Ok(_) => panic!("neither backend decodes this"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("the ffmpeg backend") || error.contains("the mediacodec backend"),
+            "the error names the second attempt: {error}"
+        );
     }
 }

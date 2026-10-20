@@ -2697,6 +2697,10 @@ struct SubtreePlacement {
     /// Layer `ClipRect` to intersect, or `None` for a cache, which covers the
     /// layer rect and carries no `ClipRect` of its own.
     clip: Option<Rect>,
+    /// Intersection of this layer's absolute rect and every ancestor rect, in
+    /// cache-root-relative coordinates. The subtree cache applies the same
+    /// ancestor clip as the live projection.
+    ancestor: Option<RectI>,
 }
 
 /// Resolve a layer's drawn region in the cache: the source region in bitmap
@@ -2713,6 +2717,7 @@ fn subtree_placement(
         image: (image_left, image_top, img_w, img_h),
         bmp: (bmp_w, bmp_h),
         clip,
+        ancestor,
     } = placement;
     let (w, h) = cache;
     if img_w == 0 || img_h == 0 {
@@ -2725,18 +2730,31 @@ fn subtree_placement(
     let rect_x1 = rel_x.saturating_add(layer.rect.w as i32);
     let rect_y1 = rel_y.saturating_add(layer.rect.h as i32);
     let (clx0, cly0, clx1, cly1) = clip_rect(clip);
-    let dx0 = img_x.saturating_add(clx0).max(img_x).max(rel_x).max(0);
-    let dy0 = img_y.saturating_add(cly0).max(img_y).max(rel_y).max(0);
+    let (ax0, ay0, ax1, ay1) = ancestor.unwrap_or((i32::MIN, i32::MIN, i32::MAX, i32::MAX));
+    let dx0 = img_x
+        .saturating_add(clx0)
+        .max(img_x)
+        .max(rel_x)
+        .max(0)
+        .max(ax0);
+    let dy0 = img_y
+        .saturating_add(cly0)
+        .max(img_y)
+        .max(rel_y)
+        .max(0)
+        .max(ay0);
     let dx1 = img_x
         .saturating_add(clx1)
         .min(img_x1)
         .min(rect_x1)
-        .min(w as i32);
+        .min(w as i32)
+        .min(ax1);
     let dy1 = img_y
         .saturating_add(cly1)
         .min(img_y1)
         .min(rect_y1)
-        .min(h as i32);
+        .min(h as i32)
+        .min(ay1);
     if dx1 <= dx0 || dy1 <= dy0 {
         return None;
     }
@@ -2756,6 +2774,30 @@ fn subtree_placement(
     Some(((sx0, sy0, sx1, sy1), (dx0, dy0, dx1, dy1)))
 }
 
+/// An `i32` bound for a pixel dimension.
+fn rect_i32(value: u32) -> i32 {
+    value.min(i32::MAX as u32) as i32
+}
+
+/// Intersect two absolute layer rectangles. A non-overlapping pair yields a
+/// zero-sized rectangle at the shared origin.
+fn intersect_layer_rects(a: Rect, b: Rect) -> Rect {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right =
+        a.x.saturating_add(rect_i32(a.w))
+            .min(b.x.saturating_add(rect_i32(b.w)));
+    let bottom =
+        a.y.saturating_add(rect_i32(a.h))
+            .min(b.y.saturating_add(rect_i32(b.h)));
+    Rect::new(
+        left,
+        top,
+        (right.saturating_sub(left).max(0)) as u32,
+        (bottom.saturating_sub(top).max(0)) as u32,
+    )
+}
+
 /// Resolve the back-to-front draws for `root` and its subtree, relative to
 /// `root`'s origin, using the same `imageLeft`/`imageTop`/`imageWidth`/
 /// `imageHeight` placement the render projection applies. A layer whose own
@@ -2771,6 +2813,9 @@ fn collect_subtree_draws(scene: &Scene, root: u32, w: u32, h: u32) -> Vec<Subtre
     let mut draws = Vec::new();
     // Layer id -> the live cache bitmap whose pixels already cover it.
     let mut covered: Map<u32, u32> = crate::hasher::map();
+    // Layer id -> the absolute intersection of its rect and every ancestor
+    // rect. A texture-less container still has to clip its descendants.
+    let mut subtree_clips: Map<u32, Option<Rect>> = crate::hasher::map();
     for id in scene.window_layer_order(window) {
         if id != root && !is_descendant(scene, id, root) {
             continue;
@@ -2787,6 +2832,31 @@ fn collect_subtree_draws(scene: &Scene, root: u32, w: u32, h: u32) -> Vec<Subtre
             covered.insert(id, owner);
             continue;
         }
+        let Some((ax, ay)) = scene.absolute_offset(id) else {
+            continue;
+        };
+        let clip = scene.clipping_rect(id).unwrap_or(layer.rect);
+        let own_rect = Rect::new(ax, ay, clip.w, clip.h);
+        let ancestor_clip = layer
+            .parent
+            .and_then(|parent| subtree_clips.get(&parent).copied().flatten());
+        let subtree_clip = match ancestor_clip {
+            Some(parent_clip) => intersect_layer_rects(parent_clip, own_rect),
+            None => own_rect,
+        };
+        subtree_clips.insert(id, Some(subtree_clip));
+        let ancestor_rel = Some((
+            subtree_clip.x.saturating_sub(root_ax),
+            subtree_clip.y.saturating_sub(root_ay),
+            subtree_clip
+                .x
+                .saturating_sub(root_ax)
+                .saturating_add(rect_i32(subtree_clip.w)),
+            subtree_clip
+                .y
+                .saturating_sub(root_ay)
+                .saturating_add(rect_i32(subtree_clip.h)),
+        ));
         // The subtree root is rendered even when it is itself invisible: it is
         // drawn without a visibility check. Every other layer is skipped when
         // it is invisible or fully transparent.
@@ -2810,7 +2880,6 @@ fn collect_subtree_draws(scene: &Scene, root: u32, w: u32, h: u32) -> Vec<Subtre
         if bmp_w == 0 || bmp_h == 0 {
             continue;
         }
-        let (ax, ay) = scene.absolute_offset(id).unwrap_or((0, 0));
         let rel_x = ax.saturating_sub(root_ax);
         let rel_y = ay.saturating_sub(root_ay);
         // The cache covers the layer rect; a drawn image is placed by the
@@ -2844,6 +2913,7 @@ fn collect_subtree_draws(scene: &Scene, root: u32, w: u32, h: u32) -> Vec<Subtre
                 image,
                 bmp: (bmp_w, bmp_h),
                 clip,
+                ancestor: ancestor_rel,
             },
             (w, h),
         ) else {
@@ -2953,8 +3023,9 @@ fn composite_subtree_draw(target: &mut BitmapState, draw: &SubtreeDraw, src: &Bi
 pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
     let (bitmap, w, h, trivial) = {
         let layer = scene.layer(root)?;
-        let w = layer.rect.w.max(1);
-        let h = layer.rect.h.max(1);
+        let clip = scene.clipping_rect(root).unwrap_or(layer.rect);
+        let w = clip.w.max(1);
+        let h = clip.h.max(1);
         let main_image_matches_rect = layer
             .bitmap
             .and_then(|id| scene.bitmap(id))

@@ -501,6 +501,7 @@ pub(crate) fn reparent_layer(scene: &mut Scene, layer_id: u32, new_parent: Optio
     if let Some(layer) = scene.layer_mut(layer_id) {
         layer.parent = new_parent;
     }
+    scene.assign_front_order(layer_id);
     match new_parent {
         Some(parent) => {
             if let Some(parent_layer) = scene.layer_mut(parent) {

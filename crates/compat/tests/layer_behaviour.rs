@@ -2326,3 +2326,174 @@ fn non_primary_layer_starts_hidden() {
     );
     assert!(!env.scene.is_primary_layer(layer));
 }
+
+/// Reference `SetAbsoluteOrderIndex` / `GetAbsoluteOrderIndex`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:1445-1452`, `:1435-1443`):
+/// writing `absolute` requires a parent, switches the parent into absolute
+/// order mode, reorders the sibling list and stores the requested index.
+#[test]
+fn absolute_property_reorders_and_switches_parent_mode() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); base.name = 'base'; \
+         var a = new Layer(w, base); a.name = 'a'; \
+         var b = new Layer(w, base); b.name = 'b'; \
+         var c = new Layer(w, base); c.name = 'c'; \
+         c.absolute = 5;",
+    );
+    env.assert_script("base.absoluteOrderMode == 1");
+    env.assert_script("c.absolute == 5");
+    env.assert_script("c.order == 2");
+    env.assert_script("a.absolute == 0");
+    env.assert_script("b.absolute == 1");
+
+    env.run("c.absolute = 0;");
+    env.assert_script("base.absoluteOrderMode == 1");
+    env.assert_script("c.absolute == 0");
+    env.assert_script("c.order == 0");
+    let base = env
+        .scene
+        .layers
+        .iter()
+        .find(|l| l.name == "base")
+        .unwrap()
+        .id;
+    let children: Vec<&str> = env
+        .scene
+        .layer(base)
+        .unwrap()
+        .children
+        .iter()
+        .map(|id| env.scene.layer(*id).unwrap().name.as_str())
+        .collect();
+    assert_eq!(children, vec!["c", "a", "b"]);
+}
+
+/// Reference `SetOrderIndex` (`reference/cpp/core/visual/LayerIntf.cpp:1396-1410`):
+/// `order` is the sibling position, it clamps to the sibling range, leaves
+/// absolute order mode and moves the layer there. `absolute` then falls back
+/// to the sibling index while the parent is in relative mode.
+#[test]
+fn order_property_clamps_and_leaves_absolute_mode() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); base.name = 'base'; \
+         var a = new Layer(w, base); a.name = 'a'; \
+         var b = new Layer(w, base); b.name = 'b'; \
+         var c = new Layer(w, base); c.name = 'c'; \
+         c.absolute = 9; \
+         c.order = 0;",
+    );
+    env.assert_script("base.absoluteOrderMode == 0");
+    env.assert_script("c.order == 0");
+    env.assert_script("c.absolute == 0");
+    env.assert_script("a.order == 1");
+    env.assert_script("b.order == 2");
+
+    env.run("c.order = 99;");
+    env.assert_script("c.order == 2");
+    env.assert_script("c.absolute == 2");
+
+    env.run(
+        "var noParent = 0; \
+         var a2 = new Layer(w, null); \
+         try { a2.absolute = 3; } catch (e) { noParent = 1; }",
+    );
+    env.assert_script("noParent == 1");
+}
+
+/// The UI copy gate `KAGLayer.assignImages` / `MessageLayer.assign` copies a
+/// source layer's `absolute` only when `src.parent.absoluteOrderMode` is
+/// true. The source's `.absolute` write is therefore what enables the copy;
+/// the destination then enters the same absolute order and reorders.
+///
+/// Reference: `SetAbsoluteOrderIndex` sets `Parent->SetAbsoluteOrderMode(true)`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:1445-1452`), and
+/// `GetAbsoluteOrderIndex` returns the stored index in that mode
+/// (`:1435-1443`).
+#[test]
+fn absolute_order_is_visible_to_the_ui_copy_gate() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); base.name = 'base'; \
+         var src = new Layer(w, base); src.name = 'src'; \
+         var dst = new Layer(w, base); dst.name = 'dst'; \
+         src.absolute = 42; \
+         if (src.parent.absoluteOrderMode) dst.absolute = src.absolute;",
+    );
+    env.assert_script("src.parent.absoluteOrderMode == 1");
+    env.assert_script("dst.absolute == 42");
+    env.assert_script("dst.order == 0");
+    env.assert_script("src.order == 1");
+}
+
+/// The flowchart/UI case: a return button whose authored absolute index is
+/// above the right sidebar must draw and hit in front of it. The reference
+/// PSD loader assigns `absolute = layer_count - index` over a front-to-back
+/// layer list (`system/psdlayer.tjs` `initLayers`), so the button leaf has a
+/// higher absolute than the sidebar leaf and `SetAbsoluteOrderIndex` puts it
+/// later in `Children` (`reference/cpp/core/visual/LayerIntf.cpp:1445-1452`,
+/// `:1335-1353`).
+#[test]
+fn higher_absolute_puts_the_return_button_above_the_sidebar() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); base.name = 'base'; \
+         base.setPos(0, 0, 100, 100); base.visible = true; \
+         var back = new Layer(w, base); back.name = 'back'; \
+         var sidebar = new Layer(w, base); sidebar.name = 'black'; \
+         back.setPos(0, 0, 10, 10); back.visible = true; back.hitThreshold = 0; \
+         sidebar.setPos(0, 0, 10, 10); sidebar.visible = true; \
+         back.absolute = 14; \
+         sidebar.absolute = 2;",
+    );
+    env.assert_script("back.absolute > sidebar.absolute");
+    let base = env
+        .scene
+        .layers
+        .iter()
+        .find(|l| l.name == "base")
+        .unwrap()
+        .id;
+    let children: Vec<&str> = env
+        .scene
+        .layer(base)
+        .unwrap()
+        .children
+        .iter()
+        .map(|id| env.scene.layer(*id).unwrap().name.as_str())
+        .collect();
+    assert_eq!(children, vec!["black", "back"]);
+    let back = env
+        .scene
+        .layers
+        .iter()
+        .find(|l| l.name == "back")
+        .unwrap()
+        .id;
+    let sidebar = env
+        .scene
+        .layers
+        .iter()
+        .find(|l| l.name == "black")
+        .unwrap()
+        .id;
+    let window = env.scene.windows.first().expect("one window").id;
+    let order = env.scene.window_layer_order(window);
+    let back_pos = order.iter().position(|id| *id == back).expect("back");
+    let sidebar_pos = order.iter().position(|id| *id == sidebar).expect("sidebar");
+    assert!(sidebar_pos < back_pos, "black draws behind back");
+    assert_eq!(
+        env.scene.layer_at(back, 5, 5, false, false),
+        Some(back),
+        "the overlap hit-tests to the front-most return button"
+    );
+}

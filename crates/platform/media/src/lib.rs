@@ -20,8 +20,13 @@
 //!   `tvp-visual/src/tlg.rs`) and `image`-crate formats, with header probing
 //!   and PNG/BMP/JPEG encoding.
 //! * **Audio** — symphonia whole-file/streaming decode (wav, pcm, ogg,
-//!   vorbis, flac, mp3) plus the Ogg Opus adapter, with header-only probing
-//!   and an explicit caller-owned [`AudioDecoderState`].
+//!   vorbis, flac, mp3, mp4/aac) plus the Ogg Opus adapter, with header-only
+//!   probing and an explicit caller-owned [`AudioDecoderState`]. The desktop
+//!   build links FFmpeg as well, and [`decode_audio_ffmpeg`] decodes a whole
+//!   track with it — the fallback for a track symphonia cannot handle (an
+//!   AAC track with the SBR extension, whose decoder has no SBR synthesis).
+//!   The Android build links no FFmpeg; there the platform's AAC decoder
+//!   does the same job (`decode_audio_mediacodec`).
 //! * **Video** — the `present_video`/`video_audio` surface over an explicit
 //!   [`VideoDecoderState`]. On Linux the FFmpeg backend (`video-ffmpeg`)
 //!   demuxes in memory, converts frames to tightly packed
@@ -44,6 +49,8 @@
 #![warn(missing_docs)]
 
 pub mod audio;
+#[cfg(feature = "video-ffmpeg")]
+mod audio_ffmpeg;
 mod hint;
 pub mod image_decode;
 pub mod image_encode;
@@ -52,8 +59,12 @@ pub mod video;
 pub mod yuv;
 
 pub use audio::{AudioDecoderState, decode_audio, open_audio, probe_audio, read_audio, seek_audio};
+#[cfg(feature = "video-ffmpeg")]
+pub use audio_ffmpeg::decode_audio_ffmpeg;
 pub use image_decode::{decode_image, probe_image};
 pub use image_encode::encode_image;
+#[cfg(feature = "video-mediacodec")]
+pub use video::decode_audio_mediacodec;
 pub use video::{VideoDecoderState, open_video, present_video, video_audio};
 pub use yuv::{CropRect, Yuv420Layout, YuvSampling, micros_to_millis, yuv420_to_rgba};
 

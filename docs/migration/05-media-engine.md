@@ -83,10 +83,15 @@ except for trivially small probes.
 
 ### 4.3 Backend split
 
-Audio decoding is symphonia on both targets (wav/pcm, ogg/vorbis, flac, mp3)
-plus the Opus adapter; there is no separate FFmpeg audio path. Video uses
-FFmpeg on Linux and MediaCodec on Android. The same free functions and decoder
-values are used either way, so the mixer never learns which backend ran.
+Audio decoding is symphonia on both targets (wav/pcm, ogg/vorbis, flac, mp3,
+mp4/aac) plus the Opus adapter. Video uses FFmpeg on Linux and MediaCodec on
+Android. The same free functions and decoder values are used either way, so
+the mixer never learns which backend ran.
+
+Each platform has a **second** audio backend for a track symphonia cannot
+handle: FFmpeg on the desktop (`media::decode_audio_ffmpeg`) and the
+platform's AAC decoder on Android (`media::decode_audio_mediacodec`, the
+MediaCodec backend). The host (L4) owns the choice (see 4.5).
 
 ### 4.4 Long tracks
 
@@ -94,6 +99,44 @@ The measured pain point is a whole-track decode (a 5.37 MB BGM → 8.5 s and
 ~125 MB, `docs/optimization.md`). The engine provides a streaming decoder
 and exposes the frame count; **L2 chooses** whole-file vs streaming. Seeking
 and loop-wrap should not require a full re-decode where the backend allows.
+
+### 4.5 The platform audio fallback
+
+The built-in decoder has no SBR synthesis: an AAC track with the SBR
+extension (HE-AAC) declares the extension's rate (48 kHz) while the decoder
+produces the core's (24 kHz). The built-in decoder **reports** that
+mismatch instead of playing the track at the wrong speed, and the
+`open_audio` call decodes the first packet so the report happens at the
+open.
+
+The platform's own audio decoder then decodes the track:
+
+* **Linux** — FFmpeg's AAC decoder reconstructs the SBR band and produces
+  the rate the container declares (`media::decode_audio_ffmpeg`).
+* **Android** — the platform's `audio/mp4a-latm` decoder does the same
+  (`media::decode_audio_mediacodec`). It reuses the MediaCodec backend's
+  extractor, codec and audio state, so there is one implementation of the
+  demux/decode loop; a decoder that cannot be created, configured or started
+  is logged with the mime and the reason and reported as a typed error.
+
+The host (L4) owns the choice:
+
+* the built-in decoder is tried first, so wav/ogg/opus/flac/mp3/aac-lc keep
+  their streaming decode and their behaviour;
+* when it fails, the track is decoded whole with the platform backend and
+  handed to the mixer as a materialized source (the spec, the loop
+  information and the frame seek are intact);
+* when both attempts fail, the error names both reasons. Silence is never
+  substituted (D11).
+
+The fallback materializes the whole track, so it costs the memory a
+whole-file decode costs; it is a fallback for tracks that cannot be played
+at all otherwise, not a general policy.
+
+**Verified vs unverified:** the desktop path is exercised by the committed
+MP4/AAC fixture. The Android path is compile-checked only — the
+`AMediaExtractor` shim, the `memfd` trick, the platform AAC decoder and the
+SBR handling have not run on a device here.
 
 ## 5. Video decode
 
@@ -182,6 +225,8 @@ the render list is built.
   scattered in `video/mod.rs`.
 * No silence fallback (D11): a failed Opus decode returns `MediaError`; it is
   never replaced by silence.
+* The desktop audio fallback reports both reasons when the built-in decoder
+  and FFmpeg both fail; the two errors are joined, not one of them dropped.
 
 ## 8. Feature/target matrix
 
@@ -190,6 +235,8 @@ the render list is built.
 | Images (TLG/png/…) | yes | yes |
 | Audio wav/ogg-vorbis/flac/mp3 | symphonia | symphonia |
 | Audio opus | libopus adapter | libopus adapter (or MediaCodec AAC only) |
+| Audio aac-lc | symphonia | symphonia |
+| Audio HE-AAC (SBR) | FFmpeg fallback | MediaCodec fallback |
 | Video H.264/AAC | FFmpeg | MediaCodec |
 | FFmpeg dependency | system pkg-config | **none** |
 | JNI for decode | n/a | none (libmediandk) |

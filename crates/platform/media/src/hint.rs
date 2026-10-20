@@ -23,3 +23,11 @@ pub(crate) fn extension_of(hint: &str) -> Option<&str> {
     }
     None
 }
+
+/// The name a hint refers to, for error messages.
+///
+/// An empty hint is reported as `fallback`, so the caller names the kind of
+/// media it is decoding.
+pub(crate) fn display_name<'a>(hint: Option<&'a str>, fallback: &'a str) -> &'a str {
+    hint.filter(|name| !name.is_empty()).unwrap_or(fallback)
+}

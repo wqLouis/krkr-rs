@@ -6,6 +6,9 @@ use api::error::MediaError;
 use media::{Media, decode_audio, open_audio, probe_audio, read_audio, seek_audio};
 use testkit::tiny_wav_mono;
 
+#[cfg(feature = "video-ffmpeg")]
+use media::decode_audio_ffmpeg;
+
 /// The committed OGG Vorbis fixture: an `ffmpeg -c:a libvorbis` encode of a
 /// 440 Hz sine tone, 0.2 s long, 44.1 kHz mono
 /// (`crates/platform/media/tests/assets/sine_440hz_0.2s.ogg`, ~4 KB).
@@ -261,4 +264,74 @@ fn mp4_aac_streaming_read_matches_whole_file() {
     }
     assert!(!all.is_empty());
     assert_eq!(all.len(), whole.interleaved.len());
+}
+
+/// The FFmpeg backend decodes the MP4/AAC fixture into the format the
+/// container declares.
+///
+/// The backend is the fallback for a track the built-in decoder cannot
+/// handle (an AAC track with the SBR extension, whose decoder has no SBR
+/// synthesis). It materializes the whole track, so the caller owns every
+/// decoded sample.
+#[cfg(feature = "video-ffmpeg")]
+#[test]
+fn the_ffmpeg_backend_decodes_the_mp4_aac_fixture() {
+    let media = Media::new();
+    let decoded = decode_audio_ffmpeg(&media, Arc::from(MP4_AAC_SINE), Some("voice.ogg"))
+        .expect("the ffmpeg backend decodes the track");
+    assert_eq!(decoded.spec.sample_rate, 44_100);
+    assert_eq!(decoded.spec.channels, 1);
+    // 0.5 s at 44.1 kHz; the AAC encoder's priming shifts the count by a
+    // frame either way.
+    let frames = decoded.frame_count();
+    assert!(
+        (20_000..=24_000).contains(&frames),
+        "0.5 s at 44.1 kHz is ~22050 frames, got {frames}"
+    );
+    let peak = decoded
+        .interleaved
+        .iter()
+        .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+    assert!(peak > 0.1, "expected audible samples, peak was {peak}");
+    assert!(decoded.interleaved.iter().all(|sample| sample.is_finite()));
+}
+
+/// The FFmpeg backend decodes a container the built-in decoder has no reader
+/// for.
+///
+/// The AU container is the proof that the fallback is reachable: the built-in
+/// decoder has no AU reader, so the track can only be decoded by FFmpeg.
+#[cfg(feature = "video-ffmpeg")]
+#[test]
+fn the_ffmpeg_backend_decodes_a_container_the_builtin_decoder_has_no_reader_for() {
+    let media = Media::new();
+    let au = au_tone(8_000, 800);
+    assert!(
+        decode_audio(&media, &au, Some("tone.au")).is_err(),
+        "the built-in decoder has no reader for this container"
+    );
+    let decoded = decode_audio_ffmpeg(&media, Arc::from(au), Some("tone.au"))
+        .expect("the ffmpeg backend decodes the track");
+    assert_eq!(decoded.spec.sample_rate, 8_000);
+    assert_eq!(decoded.spec.channels, 1);
+    assert_eq!(decoded.frame_count(), 800);
+}
+
+/// A Sun/NeXT AU file with 16-bit linear PCM.
+///
+/// The AU header is big-endian.
+#[cfg(feature = "video-ffmpeg")]
+fn au_tone(rate: u32, frames: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b".snd");
+    bytes.extend_from_slice(&24u32.to_be_bytes());
+    bytes.extend_from_slice(&(frames * 2).to_be_bytes());
+    bytes.extend_from_slice(&3u32.to_be_bytes());
+    bytes.extend_from_slice(&rate.to_be_bytes());
+    bytes.extend_from_slice(&1u32.to_be_bytes());
+    for frame in 0..frames {
+        let sample = (i16::try_from(frame % 8).expect("the phase fits") - 4) * 1000;
+        bytes.extend_from_slice(&sample.to_be_bytes());
+    }
+    bytes
 }

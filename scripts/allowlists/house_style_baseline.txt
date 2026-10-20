@@ -3526,7 +3526,6 @@
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Marks the image modified. Reference `GetProvinceImagePixelBufferForWrite`", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Mirrors the reference `tTVPGraphicsSearchData {Name, KeyIdx, Mode, DesW,", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Mouse-cursor id (reference `tTVPCursorType`, e.g. `crDefault=0`,", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Reference `AbsoluteOrderMode`/`CallOnPaint` flags.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Reference `AllocateImage` and `ChangeImageSize` (`LayerIntf.cpp:2326`,", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Reference `AllocateProvinceImage` (`LayerIntf.cpp:2359`): size the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Reference `AttentionLeft`/`AttentionTop` (attention anchor point).", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3922,8 +3921,6 @@
 {"path": "crates/platform/media/src/tlg.rs", "rule": "reference-citation", "anchor": "/// TLG6 block size (reference `TVP_TLG6_W/H_BLOCK_SIZE`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/tlg.rs", "rule": "reference-citation", "anchor": "/// calls, exactly like the reference's per-image TLG5 state.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/video/ffmpeg.rs", "rule": "reference-citation", "anchor": "/// (`reference/cpp/core/movie/ffmpeg/VideoPlayer.cpp:815-819`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/platform/media/src/video/ffmpeg.rs", "rule": "reference-citation", "anchor": "/// (`reference/cpp/core/sound/WaveIntf.h:47`); only a negative count cannot", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/platform/media/src/video/ffmpeg.rs", "rule": "reference-citation", "anchor": "/// The reference keeps the count in a 32-bit `tTVPWaveFormat::Channels`", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/video/ffmpeg.rs", "rule": "history-comment", "anchor": "/// Video stream time base, used to convert frame timestamps to ms.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/video/ffmpeg.rs", "rule": "reference-citation", "anchor": "/// reference, which substitutes 0 for an unusable PTS", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/video/mediacodec.rs", "rule": "reference-citation", "anchor": "/// (`reference/cpp/core/sound/WaveIntf.h:47`); only a negative count cannot", "reason": "legacy comment, cleanup tracked in TODO §15"}
