@@ -7,7 +7,11 @@ Agent baseline:
 1. `AGENTS.md` — roles, architecture, decisions, layer rules, the gate and the
 definition of done. The main agent orchestrates and integrates; subagents get
 narrow, disjoint, independently reviewable scopes.
-2. `docs/code-conduct.md` — the Rust-level baseline for what an agent writes:
-naming, signatures, types, traits/macros, comments, and the worker report.
+2. `docs/rules/code_styles.md` — the Rust-level baseline for what an agent writes:
+   naming, signatures, types, traits/macros, comments, and the worker report.
+   (`docs/rules/arch_rules.md` and `docs/rules/api_rules.md` carry the layer,
+   state, frame and public-surface rules; `docs/code/README.md` is the module
+   map. The superseded design record and the audits are archived in
+   `docs.old/`.)
 
-See [AGENTS.md](AGENTS.md) and [docs/code-conduct.md](docs/code-conduct.md).
+See [AGENTS.md](AGENTS.md) and [docs/rules/code_styles.md](docs/rules/code_styles.md).

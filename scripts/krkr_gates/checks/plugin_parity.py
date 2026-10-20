@@ -112,7 +112,7 @@ PLUGIN_ALLOW_HEADER = (
     "# One entry per line: Class.member, a class (`GdiPlus.Image`) or a\n"
     "# namespace object (`GdiPlus`), optionally followed by '— reason'.\n"
     "# A reason beginning with 'debt:' records a known gap that is accepted\n"
-    "# but still visible; see docs/audits/propset-parity.md.\n"
+    "# but still visible; see docs.old/audits/propset-parity.md.\n"
     "# Regenerate after intentional additions with:\n"
     "#   uv run --project scripts krkr-gate plugin-parity --update-allow\n"
     "# The checker fails when a missing entry is not listed here.\n"

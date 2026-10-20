@@ -40,7 +40,6 @@
 {"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "// The reference auto-loads `.tpm` plugins from the exe/system/plugin", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "// The reference clipboard is inert", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "// `reference/cpp/core/environ/Application.cpp:342`). The composition", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "/// (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`). A directory launch", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "/// (`reference/cpp/core/plugin/PluginImpl.cpp:76-88`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "/// Runs the resolved startup sequence (reference `TVPExecuteStartupScript`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "/// The TVP layer system the VM mutates.", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -48,11 +47,7 @@
 {"path": "crates/app/src/game.rs", "rule": "history-comment", "anchor": "/// The presentation the frame started with, used to map input positions", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "/// The reference `TVPSearchPluginsAt` keeps regular files whose name ends in", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "/// The reference matches the suffix without regard to case", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "/// The reference takes `TVPProjectDir` from the launcher and the engine only", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "/// The reference's project decision only needs to know whether `TVPProjectDir`", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "/// `system/Initialize.tjs` (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "/// called from `reference/cpp/core/environ/Application.cpp:342`). The scan is", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "/// convenience; the reference has no folder scan).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "/// loads each (`reference/cpp/core/plugin/PluginImpl.cpp:76-88`, `:148-177`,", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/lib.rs", "rule": "reference-citation", "anchor": "//! and [`Media`]). Every evolving value — the TVP layer system [`Scene`], the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/lib.rs", "rule": "reference-citation", "anchor": "/// (disabled, as in the reference). See [`CacheLimit`].", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -254,11 +249,6 @@
 {"path": "crates/compat/src/natives/clipboard.rs", "rule": "reference-citation", "anchor": "// `(tjs_int)*param[0]` raises on objects (`tjsVariant.h:933-935`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/clipboard.rs", "rule": "reference-citation", "anchor": "// consulting the platform (`utils/impl/ClipboardImpl.cpp:11-13`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/clipboard.rs", "rule": "reference-citation", "anchor": "//! # Reference semantics preserved", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/clipboard.rs", "rule": "reference-citation", "anchor": "//! (`reference/cpp/core/utils/ClipboardIntf.cpp` plus the platform", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/clipboard.rs", "rule": "reference-citation", "anchor": "//! * `asText` — the reference static text property (get/set).", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/clipboard.rs", "rule": "reference-citation", "anchor": "//! * `hasFormat(format)` — the reference static method (`cbfText == 1`);", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/clipboard.rs", "rule": "reference-citation", "anchor": "//! Behavioral reference: the reference `Clipboard`", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/clipboard.rs", "rule": "reference-citation", "anchor": "//! `ClipboardImpl.cpp`). The reference class is a stateless, static surface", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/clipboard.rs", "rule": "reference-citation", "anchor": "//! deliberately from the reference's non-platform stub, which returns", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/clipboard.rs", "rule": "reference-citation", "anchor": "//! reference's \"returns void if the clipboard does not have text data\".", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/clipboard.rs", "rule": "reference-citation", "anchor": "//! reference's `switch` default), without consulting the backend.", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -290,13 +280,9 @@
 {"path": "crates/compat/src/natives/debug.rs", "rule": "reference-citation", "anchor": "// local form and clears the location (`StorageIntf.cpp:554-560`), then", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/debug.rs", "rule": "reference-citation", "anchor": "// truncation of `param[0]->AsInteger()` otherwise (`DebugIntf.cpp:1454-1457`):", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/debug.rs", "rule": "reference-citation", "anchor": "//! (`DebugIntf.cpp:419-459`, `TJS_TEXT_OUT_CRLF` from", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/debug.rs", "rule": "reference-citation", "anchor": "//! Behavioral reference: `crates/tvp-natives/src/debug.rs` (itself a", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/debug.rs", "rule": "reference-citation", "anchor": "//! The reference returns the `Controller`/`Console` singleton class objects,", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/debug.rs", "rule": "reference-citation", "anchor": "//! `TVPLogMaxLines + 100` cap, `DebugIntf.cpp:43`, `376`), append to the file", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/debug.rs", "rule": "reference-citation", "anchor": "//! `notice` at `debug!`), push to an in-memory ring buffer (the reference's", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/debug.rs", "rule": "reference-citation", "anchor": "//! port of `reference/cpp/core/utils/DebugIntf.cpp`). This is a", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/debug.rs", "rule": "reference-citation", "anchor": "//! reference (`TVPAddLog`, `DebugIntf.cpp:331-393`), the file and the", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/debug.rs", "rule": "reference-citation", "anchor": "//! whose only member is the `visible` flag (a no-op in the reference UI too).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/debug.rs", "rule": "reference-citation", "anchor": "/// (`DebugIntf.cpp:234-236`). On success the reference writes its separator", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/debug.rs", "rule": "reference-citation", "anchor": "/// (`DebugIntf.cpp:312-340`): the stored line is prefixed with a space", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/debug.rs", "rule": "reference-citation", "anchor": "/// (`DebugIntf.cpp:356`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -351,9 +337,7 @@
 {"path": "crates/compat/src/natives/image_function.rs", "rule": "reference-citation", "anchor": "// reference; the L2 resampler picks it from `stretch_type`.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/image_function.rs", "rule": "reference-citation", "anchor": "//! (`reference/cpp/core/visual/ImageFunction.cpp`). The reference class is a", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/image_function.rs", "rule": "reference-citation", "anchor": "//! Behavioral reference: the reference `ImageFunction` native", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/image_function.rs", "rule": "reference-citation", "anchor": "//! The reference reads/writes `tTJSNI_Rect` instances. This crate's `Rect`", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/image_function.rs", "rule": "reference-citation", "anchor": "//! class surface matches the reference one-for-one.", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/image_function.rs", "rule": "reference-citation", "anchor": "//! object. The rectangle convention is the reference's half-open", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/image_function.rs", "rule": "reference-citation", "anchor": "/// (`ImageFunction.cpp:216-235`); an object that is not a native `Rect` is", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/image_function.rs", "rule": "reference-citation", "anchor": "/// (`ImageFunction.cpp:244-264` etc.), which raises on objects.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/image_function.rs", "rule": "reference-citation", "anchor": "/// (`mat.a = *param[2]`, `ImageFunction.cpp:273-278`), whose `AsReal`", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -1323,7 +1307,6 @@
 {"path": "crates/compat/src/natives/plugins/md5.rs", "rule": "reference-citation", "anchor": "/// Lowercase 32-character hex MD5 of `input` (reference `TVP_md5_*` output).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/plugins/mod.rs", "rule": "reference-citation", "anchor": "//! KiriKiri native plugins: one module per reference plugin.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/plugins/mod.rs", "rule": "reference-citation", "anchor": "/// An entry whose reference registers no TJS surface — or shares it with a", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/plugins/mod.rs", "rule": "reference-citation", "anchor": "/// Register every ported plugin class on the VM, unconditionally.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/plugins/mod.rs", "rule": "reference-citation", "anchor": "/// Shared plugin helpers (not a plugin): the reference `TVP_md5_*` hex", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/plugins/mod.rs", "rule": "reference-citation", "anchor": "/// The ported plugins, keyed by the DLL name scripts pass to `Plugins.link`.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/plugins/mod.rs", "rule": "reference-citation", "anchor": "/// `reference/cpp/plugins` (plus the CMake source list); `extrans.dll` and", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -1427,7 +1410,6 @@
 {"path": "crates/compat/src/natives/plugins/motion_player/model.rs", "rule": "reference-citation", "anchor": "//! Behavioural reference: `reference/cpp/plugins/motionplayer/RuntimeSupport.*`,", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/plugins/motion_player/model.rs", "rule": "reference-citation", "anchor": "//! `NodeTree.cpp` and `MotionNode.h`. The reference parses the PSB tree into a", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/plugins/motion_player/model.rs", "rule": "reference-citation", "anchor": "/// Source reference.", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/plugins/motion_player/model.rs", "rule": "reference-citation", "anchor": "/// The child motion clip label the layer's frames reference.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/plugins/motion_player/model.rs", "rule": "reference-citation", "anchor": "/// The icon source reference (`src/<chara>/<icon>`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/plugins/motion_player/player.rs", "rule": "reference-citation", "anchor": "// (`reference/cpp/plugins/motionplayer/main.cpp:299,588`), which ncbind", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/plugins/motion_player/player.rs", "rule": "reference-citation", "anchor": "// NB: the reference registers both a `progress` property and a", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -2549,11 +2531,9 @@
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// the default `TVPVersionInformation` template (`base/MsgIntfInc.h:5-9`):", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "//! (TVP virtual-key codes and pad/`VK_PADANY` semantics are the same as the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "//! (`reference/cpp/core/base/impl/SystemImpl.cpp:366-380`, `:819`), so it", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "//! Behavioral reference: `crates/tvp-natives/src/system.rs` (itself a", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "//! `getArgument`/`setArgument` mirror the reference's `TVPProgramArguments`:", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "//! `system` match the reference's inert values instead of consulting a host", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "//! default. `appDataPath` is not a host fact: the reference's", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "//! port of `reference/cpp/core/base/impl/SystemImpl.cpp`). This is a", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "//! reference's graphic cache.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// (`EventIntf.cpp:210-224`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// (`SystemImpl.cpp:674-691`). The port releases the L2 scene's unreferenced", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3840,7 +3820,6 @@
 {"path": "crates/engine/src/video.rs", "rule": "reference-citation", "anchor": "/// The TVP integer code the script `onPeriod(reason)` receives.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/video.rs", "rule": "reference-citation", "anchor": "/// The overlay rectangle in window coordinates (reference `tTVPRect`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/video.rs", "rule": "reference-citation", "anchor": "/// The reference status string (`onStatusChanged` argument).", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/engine/src/video.rs", "rule": "reference-citation", "anchor": "/// `onPeriod` event fires on the first decoded frame (reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/video.rs", "rule": "reference-citation", "anchor": "/// a period event that had already passed (reference `vo_rewind`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/video.rs", "rule": "reference-citation", "anchor": "/// compositing opacity applied in that path (reference `SetMixingBitmap(dest,", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/video.rs", "rule": "reference-citation", "anchor": "/// mixing-layer opacity in `0.0..=1.0` (reference `opacity / 255`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3944,7 +3923,6 @@
 {"path": "crates/platform/platform/src/audio_queue.rs", "rule": "reference-citation", "anchor": "//! silence before mixing (`reference/cpp/core/sound/win32/WaveMixer.cpp:424`),", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/platform/src/audio_queue.rs", "rule": "reference-citation", "anchor": "//! the reference's own `tTJSNI_WaveSoundBuffer::Play`, which fills several", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/platform/src/audio_queue.rs", "rule": "reference-citation", "anchor": "//! win32/WaveImpl.cpp:2911-2921`, \"fill sound buffer with some first", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/platform/platform/src/lib.rs", "rule": "history-comment", "anchor": "/// Milliseconds spent in the event poll before this frame.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/platform/src/linux.rs", "rule": "reference-citation", "anchor": "/// kHz stereo is the KiriKiri/reference mix rate and the format every", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/platform/src/linux.rs", "rule": "reference-citation", "anchor": "/// one with no KiriKiri key code) keeps its winit discriminant as a", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/render/src/cpu.rs", "rule": "reference-citation", "anchor": "// Copy the provider reference out of `self` so the sampled", "reason": "legacy comment, cleanup tracked in TODO §15"}

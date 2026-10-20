@@ -19,7 +19,7 @@
 # Blank lines and lines starting with '#' are ignored.  An entry that no
 # longer matches any finding is reported as stale so the list can shrink.
 #
-# This list holds the LEGITIMATE rows of docs/audits/error-handling.md.  Do
+# This list holds the LEGITIMATE rows of docs.old/audits/error-handling.md.  Do
 # not add a site the audit classifies as a violation; fix it instead.
 
 # --- mutex poisoning is recovered deliberately; no fallible operation is

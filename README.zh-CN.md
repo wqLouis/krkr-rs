@@ -41,7 +41,7 @@ cargo build
 
 **文档与开源许可**
 
-* **`docs/`** — 涵盖渲染、字体、Android NDK 构建（`docs/android.md`）及 API 对齐校验（`docs/native_parity.md`）的设计文档。
+* **`docs/`** — 架构说明（`docs/arch/`）、模块索引（`docs/code/`）、规则（`docs/rules/`）及 API 对齐校验（`docs/native_parity.md`）。已被取代的设计记录、审计报告与参考研究归档在 `docs.old/`。
 * **开源许可：** GPL-3.0（嵌入的 TJS2 VM 保持其上游 BSD 风格许可）。
 
 ---

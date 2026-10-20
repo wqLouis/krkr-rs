@@ -1,9 +1,12 @@
 # AGENTS.md — working rules for krkr-rs
 
 This is the contract for every human and AI agent that edits this repository.
-It distills `docs/migration/**` (the design decisions are the source of truth
-there) into the rules you must follow without re-reading them. If code and docs
-disagree, the design docs win; fix the code, then update the doc.
+It distills the current design record — `docs/arch/**` (the architecture),
+`docs/rules/**` (the obligations) and `docs/code/**` (the code map) — into the
+rules you must follow without re-reading them. The decision log and the deep
+reference evidence trail are archived in `docs.old/migration/**`. If code and
+the current docs disagree, the current docs win; fix the code, then update
+the doc.
 
 Repo: `$KRKR_REPO` · Branch: `main`
 Real game for manual checks: `$KRKR_TEST_GAME`.
@@ -12,9 +15,12 @@ Set `KRKR_REPO` to the checkout root and `KRKR_TEST_GAME` to a game directory
 before running a command that names them; `KRKR_TEST_SAVE` points at a real KAG
 save BMP for the save-fixture test.
 
-Read order: this file, then `docs/code-conduct.md` for the Rust-level baseline,
-then only the design/reference pages a task actually needs. Do not load the
-whole repository or all of `docs/migration/**` into every agent.
+Read order: this file, then `docs/rules/code_styles.md` for the Rust-level
+baseline, then only the design/reference pages a task actually needs — the
+architecture in `docs/arch/**`, the module map in `docs/code/**`, and the
+archived design record in `docs.old/migration/**` when the *why* matters. Do
+not load the whole repository or all of `docs.old/migration/**` into every
+agent.
 
 ---
 
@@ -229,8 +235,8 @@ Hard rules:
 - **L3 names the engine only through `crates/compat/src/engine_api.rs`.** That
   file is the L3↔L2 protocol surface; the `l3-engine-api` rule inside the
   `layering` check rejects `engine::` anywhere else under `compat/src`. A new
-  engine item L3 needs is re-exported there and recorded in docs
-  [`14`](docs/migration/14-l3-l2-protocol.md).
+  engine item L3 needs is re-exported there and recorded in
+  [`docs/rules/api_rules.md`](docs/rules/api_rules.md) §4.
 - **`#[cfg(target_os)]` and platform crates live only in L1 (`platform`, `media`).**
 
 Crate roles:
@@ -253,11 +259,13 @@ Crate roles:
 
 ## 3. The non-negotiable decisions (D-rules)
 
-These are recorded in `docs/migration/README.md` §3. The **code must not cite
-them by number** (§6); this section is for you to know them. The live target
-for the current work is docs [`11`](docs/migration/11-presentation-and-pixel-translation.md)
-(presentation + pixel translation), [`12`](docs/migration/12-layer-tree-and-frame.md)
-(the layer tree → frame contract).
+These are recorded in the archived decision log,
+[`docs.old/migration/README.md`](docs.old/migration/README.md) §3, and the
+rules they imply are written out in [`docs/rules/`](docs/rules/arch_rules.md).
+The **code must not cite them by number** (§6); this section is for you to
+know them. The live target for the current work is the presentation contract
+in [`docs/arch/l2.md`](docs/arch/l2.md) §4 and the frame contract in
+[`docs/arch/l2.md`](docs/arch/l2.md) §9.
 
 - **D9 — L1 is stateless.** L1 objects are facades over platform capabilities;
   methods are `&self` and take evolving state as an explicit `&mut` value
@@ -336,7 +344,8 @@ for the current work is docs [`11`](docs/migration/11-presentation-and-pixel-tra
   evidence for what it asserts and nothing else; a knowingly-left divergence
   is recorded as an **approximation** with its reference gap, never as
   "unobservable". An engine release needs a real title run on a real device
-  with the log captured (`docs/android.md` §7).
+  with the log captured (`docs.old/android.md` §7; the current Android
+  contract is [`docs/code/android/README.md`](docs/code/android/README.md)).
 - **D38 — where the reference is a binary, the DLL is the oracle and is cited
   by hash.** An unported plugin's behaviour test cites the shipped DLL build
   (`plugins/<n>/plugin/<Name>.dll <sha256[:12]> @ <function/address>`) and
@@ -345,15 +354,16 @@ for the current work is docs [`11`](docs/migration/11-presentation-and-pixel-tra
 - **D39 — presentation is one rule: Fit with letterbox.** Scale uniformly by
   `min(device/vm)`, centre, clear the margin. There is no mode enum and no
   `scaling` configuration key on any launcher; the old scaling feature is
-  deleted rather than adapted. Contract: docs
-  [`11`](docs/migration/11-presentation-and-pixel-translation.md) §2.
+  deleted rather than adapted. Contract:
+  [`docs/arch/l2.md`](docs/arch/l2.md) §4.
 - **D40 — a pixel-translation layer in L2 separates VM pixels from device
   pixels.** L3 and scripts speak VM pixels; L1 speaks device pixels; L2 owns
   the Fit mapping at the L2↔L3 boundary and applies it when projecting and
   reading back. The framebuffer is the single device-resolution backing; a VM
   pixel read samples its device region. At `s == 1` the mapping is the
   identity; script-observable values stay VM and reference-exact (D34).
-  Contract: docs [`11`](docs/migration/11-presentation-and-pixel-translation.md) §6.
+  Contract: [`docs/arch/l2.md`](docs/arch/l2.md) §4 and
+  [`docs/code/engine/translate.md`](docs/code/engine/translate.md).
 - **D41 — the VM↔device translation is embedded in L2; L3 never sees it.**
   Every L2 render/pixel method takes VM coordinates and applies the current
   `PixelTranslation` internally. L3 natives keep their VM-coordinate contract:
@@ -402,7 +412,8 @@ by the crate that declares it. Errors are values; no panics on bad input.
 
 ## 5. Idiomatic Rust (this codebase's house style)
 
-The detailed review/rewrite checklist is [`docs/code-conduct.md`](docs/code-conduct.md).
+The detailed review/rewrite checklist is
+[`docs/rules/code_styles.md`](docs/rules/code_styles.md).
 It elaborates this section; if they disagree, this file wins.
 
 - **No OOP bean accessors.** A setter whose body is only `self.field = arg`
@@ -539,20 +550,39 @@ Two-sided tests:
 
 ## 11. Reference pointers (read on demand, do not re-derive)
 
+**The current contract** — read these first:
+
 | Topic | Doc |
 |---|---|
-| Decisions + rationale | `docs/migration/README.md` §3 |
-| Layers, crate layout, acceptance criteria | `docs/migration/02-target-architecture.md` |
-| L1/L2 stateless-object contract | `docs/migration/03-middle-layer-api.md` |
-| Vulkan pipeline, blend mapping | `docs/migration/04-renderer-vulkan.md` |
-| Media engine | `docs/migration/05-media-engine.md` |
-| File system | `docs/migration/06-file-system.md` |
-| Roadmap + phase 9 (L2 owns the frame) | `docs/migration/07-roadmap.md` |
-| L3/L4, plugins, null plugin, ABI | `docs/migration/08-tjs-vm-and-native-plugins.md` |
-| Game loading, precedence, startup order | `docs/migration/09-game-loading.md` |
-| Android AAudio/MediaCodec, `AHardwareBuffer` readback | `docs/migration/10-android-backends.md`, `docs/android.md` |
-| Presentation (Fit only) and the VM↔device pixel translation | `docs/migration/11-presentation-and-pixel-translation.md` |
-| Layer tree → projection → draw tree → frame | `docs/migration/12-layer-tree-and-frame.md` |
-| L3 ↔ L2 protocol surface | `docs/migration/14-l3-l2-protocol.md` |
+| The four layers, the crate map, the coordinate spaces | `docs/arch/overall.md` |
+| L1 — the stateless platform core | `docs/arch/l1.md` |
+| L2 — the engine: the layer tree, the projection, the frame | `docs/arch/l2.md` |
+| L3 — the compatibility surface, the plugins, the events | `docs/arch/l3.md` |
+| L4 — the TJS VM host | `docs/arch/l4.md` |
+| Layers, state, frame, coordinate spaces, errors | `docs/rules/arch_rules.md` |
+| Public surfaces, the L3↔L2 protocol, ownership, error enums | `docs/rules/api_rules.md` |
+| The Rust reviewer checklist | `docs/rules/code_styles.md` |
+| The module map (one page per module) | `docs/code/README.md` |
 | Surface lock / parity | `docs/native_parity.md`, `docs/plugin_parity.md` |
-| Win32/plugin-host and Wine studies (non-goals) | `docs/plugin_host_exe.md`, `docs/wine_box64.md` |
+
+**The archived design record and the evidence trail** — read these when the
+*why* matters; they are history, not contract:
+
+| Topic | Archived doc |
+|---|---|
+| Decisions + rationale | `docs.old/migration/README.md` §3 |
+| Layers, crate layout, acceptance criteria | `docs.old/migration/02-target-architecture.md` |
+| L1/L2 stateless-object contract | `docs.old/migration/03-middle-layer-api.md` |
+| Vulkan pipeline, blend mapping | `docs.old/migration/04-renderer-vulkan.md` |
+| Media engine | `docs.old/migration/05-media-engine.md` |
+| File system | `docs.old/migration/06-file-system.md` |
+| Roadmap + phase 9 (L2 owns the frame) | `docs.old/migration/07-roadmap.md` |
+| L3/L4, plugins, null plugin, ABI | `docs.old/migration/08-tjs-vm-and-native-plugins.md` |
+| Game loading, precedence, startup order | `docs.old/migration/09-game-loading.md` |
+| Android AAudio/MediaCodec, `AHardwareBuffer` readback | `docs.old/migration/10-android-backends.md`, `docs.old/android.md` |
+| Presentation (Fit only) and the VM↔device pixel translation | `docs.old/migration/11-presentation-and-pixel-translation.md` |
+| Layer tree → projection → draw tree → frame | `docs.old/migration/12-layer-tree-and-frame.md` |
+| L3 ↔ L2 protocol surface | `docs.old/migration/14-l3-l2-protocol.md` |
+| The read-only audits | `docs.old/audits/` |
+| Win32/plugin-host and Wine studies (non-goals) | `docs.old/plugin_host_exe.md`, `docs.old/wine_box64.md` |
+| The archived Rust baseline | `docs.old/code-conduct.md` |

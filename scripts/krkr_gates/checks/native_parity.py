@@ -1608,7 +1608,7 @@ MEMBER_ALLOW_HEADER = (
     "# Native parity allowlist: reference members that are known-missing.\n"
     "# One entry per line: Class.member [— reason]\n"
     "# A reason beginning with 'debt:' records a known gap that is accepted\n"
-    "# but still visible; see docs/audits/propset-parity.md.\n"
+    "# but still visible; see docs.old/audits/propset-parity.md.\n"
     "# Regenerate after intentional additions with:\n"
     "#   uv run --project scripts krkr-gate native-parity --update-allow\n"
     "# The checker fails when a missing member is not listed here.\n"

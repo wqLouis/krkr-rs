@@ -41,7 +41,7 @@ cargo build
 
 **Documentation & License**
 
-* **`docs/`** — Design notes on rendering, fonts, NDK Android builds (`docs/android.md`), and parity verification (`docs/native_parity.md`).
+* **`docs/`** — the architecture (`docs/arch/`), the module map (`docs/code/`), the rules (`docs/rules/`), and the parity verification (`docs/native_parity.md`). The superseded design record, the audits and the reference studies are archived in `docs.old/`.
 * **License:** GPL-3.0 (the vendored TJS2 VM retains its upstream BSD-style license).
 
 ---

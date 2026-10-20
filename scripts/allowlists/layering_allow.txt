@@ -26,7 +26,7 @@
 #     not hide the violation behind a clean exit.
 #
 # --- KNOWN DEBT: AGENTS §5 SAFETY-comment gaps -----------------------------
-# docs/audits/unsafe-inventory.md §2.6 already records that the compat crate
+# docs.old/audits/unsafe-inventory.md §2.6 already records that the compat crate
 # does not meet "every unsafe block carries a // SAFETY: note".  These entries
 # baseline the existing per-file gaps so the guard still fails on a *new* file
 # or a new rule; they are file-level because the per-site list is long and
