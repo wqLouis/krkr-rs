@@ -216,10 +216,8 @@ fn decode_tlg5(raw: &[u8]) -> Result<RgbaImage, String> {
     let mut r = 0usize;
     let mut outbufs: Vec<Vec<u8>> = vec![vec![0u8; block_elems]; colors];
     let mut img = vec![0u8; width * height * 4];
-    let mut rowbuf = vec![0u8; width * 4];
-    // LZSS scratch reused across blocks; `lzss_decompress` fills it from the
-    // start after each clear.
-    let mut tmp = Vec::new();
+    // The first scanline has no upper neighbour; its contribution is zero.
+    let zero_row = vec![0u8; width * 4];
 
     for y_blk in (0..height).step_by(blockheight) {
         let y_lim = (y_blk + blockheight).min(height);
@@ -229,18 +227,17 @@ fn decode_tlg5(raw: &[u8]) -> Result<RgbaImage, String> {
             pos += 1;
             let size = read_i32(raw, pos)? as usize;
             pos += 4;
-            let data = raw
-                .get(pos..pos + size)
-                .ok_or("TLG5: truncated block data")?;
-            pos += size;
+            // A negative block size reaches the length as a huge value; the
+            // checked end keeps the slice range valid.
+            let end = pos.checked_add(size).ok_or("TLG5: truncated block data")?;
+            let data = raw.get(pos..end).ok_or("TLG5: truncated block data")?;
+            pos = end;
             if mark == 0 {
                 // modified-LZSS compressed
-                tmp.clear();
-                lzss_decompress(data, &mut text, &mut r, &mut tmp, elems)?;
-                if tmp.len() < elems {
+                let written = lzss_decompress(data, &mut text, &mut r, &mut out[..elems])?;
+                if written < elems {
                     return Err("TLG5: LZSS stream underrun".into());
                 }
-                out[..elems].copy_from_slice(&tmp[..elems]);
             } else {
                 // raw data
                 if data.len() < elems {
@@ -254,37 +251,43 @@ fn decode_tlg5(raw: &[u8]) -> Result<RgbaImage, String> {
         //   B = Σ(plane0 + plane1) + upperB, A = Σ(plane3) + upperA.
         for y in y_blk..y_lim {
             let o = (y - y_blk) * width;
-            let mut pc = [0u32; 4];
-            let upper = if y > 0 {
-                &img[(y - 1) * width * 4..]
+            let plane0 = &outbufs[0][o..o + width];
+            let plane1 = &outbufs[1][o..o + width];
+            let plane2 = &outbufs[2][o..o + width];
+            let plane3 = outbufs.get(3).map(|p| &p[o..o + width]);
+            let row_start = y * width * 4;
+            let (head, tail) = img.split_at_mut(row_start);
+            let row = &mut tail[..width * 4];
+            let upper: &[u8] = if y > 0 {
+                &head[(y - 1) * width * 4..]
             } else {
-                &[]
+                &zero_row[..]
             };
-            for x in 0..width {
-                let g = outbufs[1][o + x] as u32;
-                let b = outbufs[0][o + x] as u32; // plane0
-                let r = outbufs[2][o + x] as u32; // plane2
-                let vals = [
-                    (r + g) & 0xff, // red  = plane2 + plane1
-                    g,              // green = plane1
-                    (b + g) & 0xff, // blue = plane0 + plane1
-                ];
-                for (k, v) in vals.into_iter().enumerate() {
-                    pc[k] = (pc[k] + v) & 0xff;
-                    let upper_v = if y > 0 { upper[x * 4 + k] as u32 } else { 0 };
-                    rowbuf[x * 4 + k] = ((pc[k] + upper_v) & 0xff) as u8;
-                }
-                if colors == 4 {
-                    pc[3] = (pc[3] + outbufs[3][o + x] as u32) & 0xff;
-                    let upper_v = if y > 0 { upper[x * 4 + 3] as u32 } else { 0 };
-                    rowbuf[x * 4 + 3] = ((pc[3] + upper_v) & 0xff) as u8;
-                } else {
+            let mut acc = [0u32; 4];
+            for (x, (((p0, p1), p2), (d, u))) in plane0
+                .iter()
+                .zip(plane1.iter())
+                .zip(plane2.iter())
+                .zip(row.chunks_exact_mut(4).zip(upper.chunks_exact(4)))
+                .enumerate()
+            {
+                let g = *p1 as u32;
+                acc[0] = (acc[0] + *p2 as u32 + g) & 0xff;
+                acc[1] = (acc[1] + g) & 0xff;
+                acc[2] = (acc[2] + *p0 as u32 + g) & 0xff;
+                d[0] = ((acc[0] + u[0] as u32) & 0xff) as u8;
+                d[1] = ((acc[1] + u[1] as u32) & 0xff) as u8;
+                d[2] = ((acc[2] + u[2] as u32) & 0xff) as u8;
+                match plane3 {
+                    Some(p3) => {
+                        acc[3] = (acc[3] + p3[x] as u32) & 0xff;
+                        d[3] = ((acc[3] + u[3] as u32) & 0xff) as u8;
+                    }
                     // 24-bit TLG5 has no alpha plane: opaque (reference
                     // writes the 0xff000000 constant).
-                    rowbuf[x * 4 + 3] = 0xff;
+                    None => d[3] = 0xff,
                 }
             }
-            img[y * width * 4..(y + 1) * width * 4].copy_from_slice(&rowbuf);
         }
     }
 
@@ -339,15 +342,10 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
         }
     }
     let mut r = 0usize;
-    let mut filter_types = Vec::with_capacity(x_block_count * y_block_count);
-    lzss_decompress(
-        ft_bytes,
-        &mut ft_text,
-        &mut r,
-        &mut filter_types,
-        x_block_count * y_block_count,
-    )?;
-    if filter_types.len() < x_block_count * y_block_count {
+    let block_count = x_block_count * y_block_count;
+    let mut filter_types = vec![0u8; block_count];
+    let written = lzss_decompress(ft_bytes, &mut ft_text, &mut r, &mut filter_types)?;
+    if written < block_count {
         return Err("TLG6: filter-type stream underrun".into());
     }
 
@@ -361,14 +359,16 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
     // `TLG6_H_BLOCK_SIZE` scanlines; every byte read below is either written
     // by one of the color lanes or stays at the zeroed initial value.
     let band_pixels = TLG6_H_BLOCK_SIZE * width;
-    let mut pixelbuf = vec![0u32; band_pixels];
+    let mut pixelbuf = vec![[0u8; 4]; band_pixels];
     let mut curline = vec![0u32; width];
     let mut lane_buf = vec![0u8; band_pixels * 4];
 
     for y in (0..height).step_by(TLG6_H_BLOCK_SIZE) {
         let ylim = (y + TLG6_H_BLOCK_SIZE).min(height);
         let pixel_count = (ylim - y) * width;
-        let lane_len = pixel_count * 4;
+        let lane_len = pixel_count
+            .checked_mul(4)
+            .ok_or("TLG6: lane size overflow")?;
         let skipbytes = (ylim - y) * TLG6_W_BLOCK_SIZE;
 
         // Decode each channel's residual lane into a per-pixel byte lane.
@@ -392,14 +392,12 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
                 c == 0 && colors != 1,
                 lzt,
                 gbt,
-                &mut lane_buf[..lane_len],
+                &mut lane_buf,
             )?;
-            for (i, g) in lane_buf[..lane_len].chunks(4).enumerate() {
-                let v = pixelbuf[i];
-                let b = v.to_le_bytes();
-                let mut nb = b;
-                nb[c] = g[c];
-                pixelbuf[i] = u32::from_le_bytes(nb);
+            // The lane decoder checked the buffer length, so the slice
+            // below is inside it.
+            for (i, g) in lane_buf[..lane_len].chunks_exact(4).enumerate() {
+                pixelbuf[i][c] = g[c];
             }
         }
 
@@ -488,7 +486,7 @@ struct BlockRow<'a> {
     /// Residual lanes per block of this row.
     skipbytes: usize,
     /// Residual lanes of this block row, read in the encoder's zigzag order.
-    pixelbuf: &'a [u32],
+    pixelbuf: &'a [[u8; 4]],
     /// Predictor seed used by the row's first block.
     initialp: u32,
 }
@@ -526,7 +524,7 @@ fn decode_line(row: &mut BlockRow<'_>, pass: LinePass) -> Result<(), String> {
     let prevline: &[u32] = prevline;
     let curline: &mut [u32] = curline;
     let filter_types: &[u8] = filter_types;
-    let pixelbuf: &[u32] = pixelbuf;
+    let pixelbuf: &[[u8; 4]] = pixelbuf;
     let width = *width;
     let ft_base = *ft_base;
     let skipbytes = *skipbytes;
@@ -571,10 +569,7 @@ fn decode_line(row: &mut BlockRow<'_>, pass: LinePass) -> Result<(), String> {
         let avg_mode = ft & 1 == 1;
         for x in (i * TLG6_W_BLOCK_SIZE..).take(w) {
             let idx = usize::try_from(inpos).map_err(|_| "TLG6: block index out of range")?;
-            let err = pixelbuf
-                .get(idx)
-                .ok_or("TLG6: block data out of range")?
-                .to_le_bytes();
+            let err = *pixelbuf.get(idx).ok_or("TLG6: block data out of range")?;
             let (eb, eg, er) = color_filter(code, err[0] as i8, err[1] as i8, err[2] as i8);
             let ea = err[3] as i8;
             let u = prevline[x];
@@ -658,33 +653,38 @@ fn avg_byte(a: u8, b: u8) -> u8 {
 // Modified-LZSS (reference `TVPTLG5DecompressSlide`)
 // ---------------------------------------------------------------------------
 
-/// Decompress a modified-LZSS stream into `out` (at most `out_len` bytes).
+/// Decompress a modified-LZSS stream into `out`, writing at most
+/// `out.len()` bytes and returning how many were written. A short stream is
+/// not an error here: the caller compares the returned count against the
+/// number of bytes it needs.
 /// `text` (4096-byte window) and `r` (write position) carry state across
 /// calls, exactly like the reference's per-image TLG5 state.
 fn lzss_decompress(
     inp: &[u8],
     text: &mut [u8; 4096],
     r: &mut usize,
-    out: &mut Vec<u8>,
-    out_len: usize,
-) -> Result<(), String> {
+    out: &mut [u8],
+) -> Result<usize, String> {
     let inlim = inp.len();
     let mut ipos = 0usize;
     let mut flags: u32 = 0;
-    while ipos < inlim && out.len() < out_len {
+    let mut w = 0usize; // bytes written into `out`
+    let mut pos = *r & 0xfff; // write position inside the 4096-byte window
+    while ipos < inlim && w < out.len() {
         flags >>= 1;
         if (flags & 0x100) == 0 {
             flags = u32::from(*inp.get(ipos).ok_or("TLG: LZSS stream underrun")?) | 0xff00;
             ipos += 1;
-            if flags == 0xff00 && *r < 4096 - 8 && ipos + 8 <= inlim {
-                // raw 8-byte copy
-                for _ in 0..8 {
-                    let c = inp[ipos];
-                    ipos += 1;
-                    out.push(c);
-                    text[*r] = c;
-                    *r += 1;
-                }
+            if flags == 0xff00 && pos < 4096 - 8 && ipos + 8 <= inlim {
+                // raw 8-byte copy: the window takes the whole run, the
+                // output only the bytes that still fit in it
+                let chunk = &inp[ipos..ipos + 8];
+                text[pos..pos + 8].copy_from_slice(chunk);
+                let n = 8.min(out.len() - w);
+                out[w..w + n].copy_from_slice(&chunk[..n]);
+                w += n;
+                pos = (pos + 8) & 0xfff;
+                ipos += 8;
                 flags = 0;
                 continue;
             }
@@ -700,25 +700,39 @@ fn lzss_decompress(
                 mlen += *inp.get(ipos).ok_or("TLG: LZSS stream underrun")? as usize;
                 ipos += 1;
             }
-            for m in 0..mlen {
-                if out.len() >= out_len {
-                    break;
+            // The loop leaves at least one byte of room, so the copy is
+            // never empty and never runs past the output.
+            let n = mlen.min(out.len() - w);
+            // The window copy reads the bytes it writes when the source
+            // range overlaps the write range, so that case copies one byte
+            // at a time; disjoint ranges copy in one block.
+            if pos + n <= 4096 && mpos + n <= 4096 && (pos + n <= mpos || mpos + n <= pos) {
+                out[w..w + n].copy_from_slice(&text[mpos..mpos + n]);
+                text.copy_within(mpos..mpos + n, pos);
+                pos = (pos + n) & 0xfff;
+            } else {
+                let mut p = pos;
+                for m in 0..n {
+                    let c = text[(mpos + m) & 0xfff];
+                    out[w + m] = c;
+                    text[p] = c;
+                    p = (p + 1) & 0xfff;
                 }
-                let c = text[(mpos + m) & 0xfff];
-                out.push(c);
-                text[*r & 0xfff] = c;
-                *r += 1;
+                pos = p;
             }
+            w += n;
         } else {
             // literal
             let c = *inp.get(ipos).ok_or("TLG: LZSS stream underrun")?;
             ipos += 1;
-            out.push(c);
-            text[*r & 0xfff] = c;
-            *r += 1;
+            out[w] = c;
+            text[pos] = c;
+            pos = (pos + 1) & 0xfff;
+            w += 1;
         }
     }
-    Ok(())
+    *r = pos;
+    Ok(w)
 }
 
 // ---------------------------------------------------------------------------
@@ -759,7 +773,7 @@ impl GolombBits<'_> {
 /// `TVPTLG6DecodeGolombValues[ForFirst]`). The stream alternates zero/nonzero
 /// run lengths (Elias-gamma coded), non-zero values use Golomb-Rice coding
 /// with an adaptive `k` from the precomputed table. Writes the channel's byte
-/// into `out`, which holds `pixel_count * 4` bytes.
+/// into `out`, whose first `pixel_count * 4` bytes hold the lane.
 fn decode_golomb_lane(
     pool: &[u8],
     pixel_count: usize,
@@ -772,6 +786,15 @@ fn decode_golomb_lane(
     if pool.is_empty() {
         return Err("TLG6: empty bit pool".into());
     }
+    // The lane is four bytes per pixel; the buffer must hold all of them,
+    // so every write below stays inside it.
+    let needed = pixel_count
+        .checked_mul(4)
+        .ok_or("TLG6: lane size overflow")?;
+    if out.len() < needed {
+        return Err("TLG6: lane buffer too small".into());
+    }
+    let out = &mut out[..needed];
     let mut bs = GolombBits {
         pool,
         pos: 0,
@@ -812,13 +835,14 @@ fn decode_golomb_lane(
         let count = count.min(pixel_count - p);
 
         if zero != 0 {
-            for _ in 0..count {
-                if first {
-                    out[p * 4..p * 4 + 4].fill(0);
-                } else {
+            if first {
+                out[p * 4..p * 4 + count * 4].fill(0);
+                p += count;
+            } else {
+                for _ in 0..count {
                     out[p * 4 + lane] = 0;
+                    p += 1;
                 }
-                p += 1;
             }
         } else {
             for _ in 0..count {
