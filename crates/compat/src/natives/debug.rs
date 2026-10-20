@@ -1,8 +1,6 @@
 //! `Debug` native class.
 //!
-//! Behavioral reference: `crates/tvp-natives/src/debug.rs` (itself a
-//! port of `reference/cpp/core/utils/DebugIntf.cpp`). This is a
-//! reimplementation on the layered API: all logging state lives in
+//! `Debug` composes the per-engine dispatch state: all logging state lives in
 //! [`CompatServices::state`], never in a process global.
 //!
 //! # Implemented members
@@ -10,18 +8,18 @@
 //! Methods: `message`, `notice`, `startLogToFile`, `logAsError`,
 //! `addLoggingHandler`, `removeLoggingHandler`, `getLastLog`.
 //!
-//! Properties: `logLocation`, `logToFileOnError`, `clearLogFileOnError`,
-//! `controller`, `console`.
+//! Read/write properties: `logLocation`, `logToFileOnError`,
+//! `clearLogFileOnError`.
+//!
+//! Read-only properties: `controller`, `console`.
 //!
 //! # `controller` / `console`
 //!
-//! The reference returns the `Controller`/`Console` singleton class objects,
-//! whose only member is the `visible` flag (a no-op in the reference UI too).
-//! The port registers both as instance classes backed by the existing
-//! [`DebugState`] visibility fields and returns a lazily created, cached
-//! singleton from each property — no second state store, no process global.
-//! A script that writes `Debug.console.visible` therefore sees the same value
-//! through every reference to the object.
+//! `Debug.controller` / `Debug.console` are read-only properties: each returns
+//! a lazily created, cached `Controller` / `Console` instance backed by the
+//! existing [`DebugState`] visibility fields — no second state store, no
+//! process global. The instance's `visible` flag is read/write, so a script
+//! that writes `Debug.console.visible` sees the same value through every reference to the object.
 //!
 //! # Log flow
 //!

@@ -2602,9 +2602,14 @@ pub fn video_advance(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
             slot.follow_audio(services);
             // The frame is fetched once, after the clock moved, so the picture
             // belongs to the position the overlay is at.
-            present(&mut source, slot);
-            slot.sync_audio(services, frame_resync(&slot.overlay));
+            let presented = present(&mut source, slot);
+            // The composite happens while the overlay is still playing, so a
+            // prepared picture reaches the layer before prepare pauses it.
             composite_overlay(ctx, slot);
+            if presented {
+                slot.overlay.complete_prepare();
+            }
+            slot.sync_audio(services, frame_resync(&slot.overlay));
             let events = slot.overlay.poll();
             if !events.is_empty() {
                 pending.push((slot.objthis, events));
@@ -2634,17 +2639,22 @@ pub(crate) fn frame_resync(overlay: &VideoOverlay) -> Resync {
 
 /// Present the host frame at the overlay's current position, if any.
 ///
-/// The frame is shared with the host, so presenting it copies no pixels.
-fn present(source: &mut Option<Box<dyn VideoSource>>, slot: &mut VideoSlot) {
+/// The frame is shared with the host, so presenting it copies no pixels. The
+/// return value says whether a frame was presented, so the caller can finish
+/// a prepare only after a delivered picture has been shown.
+fn present(source: &mut Option<Box<dyn VideoSource>>, slot: &mut VideoSlot) -> bool {
     let Some(source) = source.as_mut() else {
-        return;
+        return false;
     };
     let at = slot.overlay.position_ms();
-    if let Some(frame) = source.frame_at(&slot.path, at)
-        && let Err(error) = slot.overlay.present_frame(frame)
-    {
+    let Some(frame) = source.frame_at(&slot.path, at) else {
+        return false;
+    };
+    if let Err(error) = slot.overlay.present_frame(frame) {
         log::warn!("VideoOverlay: inconsistent decoded frame: {error}");
+        return false;
     }
+    true
 }
 
 /// Composite the overlay's current frame into the layer(s) the mode selects.

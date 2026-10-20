@@ -93,6 +93,7 @@ impl Env {
         // removes on drop.
         unsafe { host.services_mut().attach_storage(&mut *storage) };
         host.install(&engine).expect("install compat surface");
+        common::link_all_builtins(&engine);
         Env {
             _host: host,
             engine,

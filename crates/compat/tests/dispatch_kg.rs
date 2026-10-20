@@ -1,9 +1,9 @@
 //! Receiver-dispatch (misrouting) tests for the KAG / plugin families named
-//! in `docs/audits/object-write-dispatch.md`: `KAGParser`, the `layer_ex`
+//! in `docs.old/audits/object-write-dispatch.md`: `KAGParser`, the `layer_ex`
 //! `draw_property!` objthis family, `VideoOverlay` and the `motion_player`
 //! plugin.
 //!
-//! The audited mechanism (`docs/audits/object-write-dispatch.md` §1): a
+//! The audited mechanism (`docs.old/audits/object-write-dispatch.md` §1): a
 //! `with(obj) { .member = v }` write inside a function whose `this` is a
 //! *different* object resolves the native member's receiver from the
 //! `with`-object's closure `ObjThis`; when that closure carries no own
@@ -67,6 +67,7 @@ impl Env {
                 .attach_scene(scene.as_mut() as *mut Scene);
         }
         host.install(&engine).expect("install compat surface");
+        common::link_all_builtins(&engine);
         Env {
             _host: host,
             engine,

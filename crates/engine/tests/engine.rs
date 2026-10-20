@@ -474,6 +474,52 @@ fn an_empty_vm_window_skips_the_draw_and_recovers() {
 }
 
 #[test]
+fn a_skipped_frame_still_runs_the_hook_and_its_due_timers() {
+    // reference/cpp/core/visual/impl/VSyncTimingThread.cpp:114,141-146
+    // A wake that presents nothing still delivers the VM/timer beat: the
+    // reference posts the continuous-handler event right after the vsync wait,
+    // whether or not that wake drew anything. The acquire-timeout skip takes
+    // the same path — it happens inside the draw, after the timers and the
+    // frame hook.
+    let mut engine = headless_engine((100, 100));
+    let window = engine.scene_mut().add_window("game", (0, 0));
+    let primary = engine.scene_mut().add_layer(window, None);
+    // A zero VM dimension has no presentation fit, so the frame draws nothing.
+    engine.scene_mut().layer_mut(primary).expect("primary").rect = Rect::new(0, 0, 0, 0);
+    let fired = Rc::new(Cell::new(0u32));
+    let hits = Rc::clone(&fired);
+    let callback: engine::timer::TimerCallback =
+        Box::new(move |_| hits.set(hits.get().saturating_add(1)));
+    engine
+        .timer_mut()
+        .create_interval(10, callback)
+        .expect("timer");
+    let mut hooks = Recorder::default();
+
+    let skipped = engine.step(16.0, &mut hooks).expect("frame");
+    assert!(!skipped.presented, "nothing was presented");
+    assert_eq!(fired.get(), 1, "the due timer still fired");
+    assert_eq!(hooks.calls.len(), 1, "the frame hook still ran");
+    assert_eq!(skipped.frame_index, 1, "the frame is still counted");
+
+    // A presentable size resumes the draw and the timer keeps its cadence.
+    engine
+        .scene_mut()
+        .window_mut(window)
+        .expect("window")
+        .inner_size = (100, 100);
+    engine.scene_mut().layer_mut(primary).expect("primary").rect = Rect::new(0, 0, 100, 100);
+    let presented = engine.step(16.0, &mut hooks).expect("frame");
+    assert!(presented.presented, "the draw resumes once a size fits");
+    assert_eq!(
+        fired.get(),
+        2,
+        "the timer fired again on the presented frame"
+    );
+    assert_eq!(presented.frame_index, 2);
+}
+
+#[test]
 fn a_skipped_frame_reuses_the_render_arena_and_a_mutation_reprojects() {
     let mut engine = headless_engine((32, 32));
     let window = engine.scene_mut().add_window("game", (32, 32));

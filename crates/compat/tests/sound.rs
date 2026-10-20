@@ -146,6 +146,7 @@ impl Env {
             }
         }
         host.install(&engine).expect("install compat surface");
+        common::link_all_builtins(&engine);
         if with_decoder {
             add_audio_decoder(
                 host.services(),
@@ -1876,6 +1877,7 @@ fn streaming_env() -> (Env, Arc<AtomicUsize>) {
             .attach_storage(storage.as_mut().unwrap().as_mut() as *mut Storage);
     }
     host.install(&engine).expect("install compat surface");
+    common::link_all_builtins(&engine);
     let reads = Arc::new(AtomicUsize::new(0));
     let counter = reads.clone();
     add_audio_decoder(

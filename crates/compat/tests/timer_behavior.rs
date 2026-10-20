@@ -1725,3 +1725,117 @@ fn dropped_timers_release_their_bindings() {
         "a dropped Timer must release its dispatch-state binding"
     );
 }
+
+/// The shipped game's `system/voice.tjs` gates its lip-sync flag on whether
+/// `getSample.dll` has already been linked: its compiled top level publishes
+/// `WaveSoundBuffer.enableGetSample` only when
+/// `typeof WaveSoundBuffer.setDefaultAheads` is `"undefined"`, and its
+/// `onFlip` timer action reads that flag before it reads the plugin's
+/// `sampleValue`. The plugin's members are `NCB_ATTACH_*` registrations
+/// (`reference/cpp/plugins/getSample.cpp:167-181`), so they exist only after
+/// `Plugins.link` runs the module's registration; the native `onTimer` then
+/// invokes the action and keeps the timer enabled
+/// (`reference/cpp/core/utils/TimerIntf.cpp:156-171`).
+///
+/// Before the link the class has no `setDefaultAheads`, which is what makes
+/// the script's probe true; after the link the flag is `1` and the action runs
+/// to its `onVoiceFlip` callback instead of raising
+/// `Member "enableGetSample" does not exist` on every fire.
+#[test]
+fn voice_tjs_publishes_its_plugin_flag_and_the_action_reads_it() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    // The plugin surface is absent until a script links it. A port that
+    // registers it at startup makes the probe false and the script skips the
+    // whole block, leaving the flag missing.
+    assert_eq!(
+        env.eval_ok("typeof WaveSoundBuffer.setDefaultAheads"),
+        TjsValue::String("undefined".into()),
+        "getSample members must not exist before `Plugins.link`"
+    );
+
+    // Decompiled top level of the game's `system/voice.tjs`. `CanLoadPlugin`
+    // is the game's own definition from `system/Initialize.tjs`; the shipped
+    // `plugin/getSample.dll` exists, so the probe is true.
+    env.run(
+        r#"
+        function CanLoadPlugin(name) { return true; }
+        global.lipFlipTime = 100;
+        if (typeof WaveSoundBuffer.setDefaultAheads == "undefined") {
+            WaveSoundBuffer.enableGetSample = 0;
+            if (CanLoadPlugin("getSample.dll")) {
+                try {
+                    Plugins.link("getSample.dll");
+                    WaveSoundBuffer.setDefaultAheads(0);
+                    WaveSoundBuffer.enableGetSample = 1;
+                } catch (e) {
+                    System.inform("getSample.dll load failed: " + e.message);
+                }
+            }
+        }
+        "#,
+    );
+
+    assert_eq!(
+        env.eval_ok("WaveSoundBuffer.enableGetSample"),
+        TjsValue::Integer(1),
+        "the script's post-link publish must be the value `onFlip` reads"
+    );
+    assert_ne!(
+        env.eval_ok("typeof WaveSoundBuffer.setDefaultAheads"),
+        TjsValue::String("undefined".into()),
+        "the link must install the plugin members"
+    );
+
+    // The `onFlip` half. The real script also guards on `status == "play"`;
+    // the flag read and the Timer delivery are the parts under test here.
+    // `global.WaveSoundBuffer` is the spelling the compiled script uses: a
+    // bare class name inside the class body resolves to the superclass
+    // object, not the global class.
+    env.run(
+        r#"
+        class VoiceProbe extends WaveSoundBuffer {
+            function VoiceProbe() {
+                super.WaveSoundBuffer();
+                this.lipLevel1 = 0.1;
+                this.lipLevel2 = 0.5;
+            }
+            function onFlip() {
+                var level = 0;
+                if (global.WaveSoundBuffer.enableGetSample) {
+                    if (this.sampleValue > this.lipLevel2) {
+                        level = 2;
+                    } else if (this.sampleValue > this.lipLevel1) {
+                        level = 1;
+                    }
+                }
+                this.owner.onVoiceFlip(this, level);
+            }
+        }
+        class VoiceOwner {
+            function VoiceOwner() { this.flips = 0; this.level = -1; }
+            function onVoiceFlip(voice, level) { this.flips++; this.level = level; }
+        }
+        var voiceOwner = new VoiceOwner();
+        var voice = new VoiceProbe();
+        voice.owner = voiceOwner;
+        voice.flipTimer = new Timer(voice.onFlip, "");
+        voice.flipTimer.interval = 100;
+        voice.flipTimer.enabled = true;
+        "#,
+    );
+
+    env.poll_for(300, 100);
+
+    assert_eq!(
+        env.eval_int("voiceOwner.flips"),
+        3,
+        "the timer action must reach `onVoiceFlip` on every fire"
+    );
+    assert_eq!(
+        env.eval_int("voice.flipTimer.enabled"),
+        1,
+        "a dispatched action leaves the timer enabled"
+    );
+}

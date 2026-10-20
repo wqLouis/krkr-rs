@@ -226,7 +226,7 @@ pub(crate) fn create(
 ///
 /// Destination-dependent modes have no slot; `None` tells
 /// [`PipelineSet::pipeline_for`] to report them as unsupported.
-fn blend_slot(mode: BlendMode) -> Option<usize> {
+pub(crate) fn blend_slot(mode: BlendMode) -> Option<usize> {
     match mode {
         // Photoshop normal is the same source-over as `ltAlpha`.
         BlendMode::SourceOver | BlendMode::PsNormal => Some(0),
@@ -490,7 +490,7 @@ fn create_unit_quad(
 }
 
 /// Loads a precompiled SPIR-V blob into a shader module.
-fn create_shader_module(
+pub(crate) fn create_shader_module(
     device: &ash::Device,
     bytes: &[u8],
 ) -> Result<vk::ShaderModule, RenderError> {
@@ -505,7 +505,7 @@ fn create_shader_module(
 }
 
 /// Builds one graphics pipeline for a blend slot.
-fn build_pipeline(
+pub(crate) fn build_pipeline(
     device: &ash::Device,
     layout: vk::PipelineLayout,
     render_pass: vk::RenderPass,

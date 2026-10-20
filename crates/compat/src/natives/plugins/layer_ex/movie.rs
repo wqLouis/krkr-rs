@@ -707,6 +707,7 @@ mod tests {
         // so a script override on the instance is what fires.
         let _lock = vm_lock();
         let env = Env::new();
+        env.run("Plugins.link('layerExMovie.dll');");
         env.run(
             "var w = new Window(); var l = new Layer(w, null); l.setImageSize(4, 4); \
              var started = 0; var updated = 0; var stopped = 0; \

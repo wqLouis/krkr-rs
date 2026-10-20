@@ -11,8 +11,9 @@ use api::blend::{BlendMode, DstBlend};
 use api::geometry::{PixelRegion, RectF};
 use engine::translate::translate_render_scene;
 use engine::{
-    Engine, EngineOverlay, EngineParts, GameFrame, PixelTranslation, Rect, Scene, compose_layer,
-    project_scene, project_window, project_window_report, resolve_blend,
+    BitmapState, Engine, EngineOverlay, EngineParts, GameFrame, PixelTranslation, Rect, Scene,
+    TransitionFrame, TransitionSource, compose_layer, project_scene, project_window,
+    project_window_report, resolve_blend,
 };
 use render::{
     Clip, PipelineConfig, RenderContent, RenderNode, RenderNodeId, RenderPipeline, RenderScene,
@@ -910,5 +911,442 @@ fn hit_test_rejects_a_point_outside_an_ancestor_rect() {
         scene.layer_at(child, 5, 45, false, false),
         None,
         "a point inside the child but outside the parent rect misses"
+    );
+}
+
+/// A running transition the host composites draws its two sources in place of
+/// the layer's image: the first with the layer's placement, blend and opacity,
+/// the second faded over it by its own alpha.
+///
+/// The reference `Process` blends the two sources into the layer's frame and
+/// the frame is drawn with the layer's own type and opacity
+/// (`reference/cpp/core/visual/TransIntf.cpp:592-600`), so a full-opacity
+/// source keeps the layer's blend and a fading one composites source-over.
+#[test]
+fn a_transition_frame_draws_both_sources_at_the_layer_placement() {
+    let mut scene = Scene::default();
+    scene.composite_transition_frames = true;
+    let win = scene.add_window("t", (64, 64));
+    let layer = scene.add_layer(win, None);
+    {
+        let state = scene.layer_mut(layer).unwrap();
+        state.rect = Rect::new(4, 6, 8, 4);
+        state.visible = true;
+        state.opacity = 0.5;
+        state.blend = BlendMode::Additive;
+    }
+    let src1 = attach_image(&mut scene, layer, 8, 4);
+    let src2 = scene.add_bitmap(8, 4, vec![0u8; 8 * 4 * 4]);
+    scene.set_transition_frame(
+        layer,
+        Some(TransitionFrame::new(
+            (8, 4),
+            true,
+            TransitionSource::new(src1, Rect::new(0, 0, 8, 4), Rect::new(0, 0, 8, 4), 1.0),
+            TransitionSource::new(src2, Rect::new(0, 0, 8, 4), Rect::new(2, 0, 6, 4), 0.4),
+        )),
+    );
+
+    let projected = project_window(&scene, win, |_| Some(null_texture(8, 4)));
+    let nodes = drawable_nodes(&projected);
+    assert_eq!(nodes.len(), 2, "one node per transition source");
+    let first = nodes[0];
+    assert_eq!(first.dst, RectF::new(4.0, 6.0, 8.0, 4.0));
+    assert_eq!(first.src, PixelRegion::new(0, 0, 8, 4));
+    assert_eq!(first.opacity, 0.5);
+    assert_eq!(
+        first.blend,
+        BlendMode::Additive,
+        "a placement keeps the blend"
+    );
+    let second = nodes[1];
+    assert_eq!(second.dst, RectF::new(6.0, 6.0, 6.0, 4.0));
+    assert_eq!(second.src, PixelRegion::new(0, 0, 6, 4));
+    assert!((second.opacity - 0.2).abs() < 1e-6);
+    assert_eq!(
+        second.blend,
+        BlendMode::SourceOver,
+        "a fade composites over"
+    );
+}
+
+/// A whole-subtree frame stands in for the layer's subtree, so its children
+/// draw through it and are reported like the children a cache covers
+/// (`reference/cpp/core/visual/LayerIntf.cpp:7221-7226`).
+#[test]
+fn a_whole_subtree_transition_frame_holds_its_children() {
+    let mut scene = Scene::default();
+    scene.composite_transition_frames = true;
+    let win = scene.add_window("t", (64, 64));
+    let layer = scene.add_layer(win, None);
+    scene.layer_mut(layer).unwrap().rect = Rect::new(0, 0, 16, 16);
+    scene.layer_mut(layer).unwrap().visible = true;
+    let child = scene.add_layer(win, Some(layer));
+    scene.layer_mut(child).unwrap().rect = Rect::new(2, 2, 4, 4);
+    scene.layer_mut(child).unwrap().visible = true;
+    attach_image(&mut scene, child, 4, 4);
+    let src1 = attach_image(&mut scene, layer, 16, 16);
+    let src2 = scene.add_bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
+    scene.inc_cache_enabled_count(layer);
+    scene.set_transition_frame(
+        layer,
+        Some(TransitionFrame::new(
+            (16, 16),
+            true,
+            TransitionSource::new(src1, Rect::new(0, 0, 16, 16), Rect::new(0, 0, 16, 16), 1.0),
+            TransitionSource::new(src2, Rect::new(0, 0, 16, 16), Rect::new(0, 0, 16, 16), 0.0),
+        )),
+    );
+
+    let report = project_window_report(&scene, win, |_| Some(null_texture(16, 16)));
+    let nodes = drawable_nodes(&report.scene);
+    assert_eq!(nodes.len(), 1, "only the frame's visible source draws");
+    assert!(
+        report.drawn_layers.contains(&child),
+        "the covered child is reported: {:?}",
+        report.drawn_layers
+    );
+    assert_eq!(
+        report
+            .drawn_layers
+            .iter()
+            .filter(|&&id| id == child)
+            .count(),
+        1
+    );
+}
+
+/// A frame placed like the layer's own image follows the image placement, so a
+/// scaled image scales the frame's sources with it.
+#[test]
+fn a_self_image_transition_frame_follows_the_image_placement() {
+    let mut scene = Scene::default();
+    scene.composite_transition_frames = true;
+    let win = scene.add_window("t", (64, 64));
+    let layer = scene.add_layer(win, None);
+    {
+        let state = scene.layer_mut(layer).unwrap();
+        state.rect = Rect::new(10, 10, 8, 8);
+        state.visible = true;
+    }
+    let src1 = attach_image(&mut scene, layer, 4, 4);
+    // The image is drawn at twice its bitmap size.
+    scene.layer_mut(layer).unwrap().image_width = 8;
+    scene.layer_mut(layer).unwrap().image_height = 8;
+    let src2 = scene.add_bitmap(4, 4, vec![0u8; 4 * 4 * 4]);
+    scene.set_transition_frame(
+        layer,
+        Some(TransitionFrame::new(
+            (4, 4),
+            false,
+            TransitionSource::new(src1, Rect::new(0, 0, 4, 4), Rect::new(0, 0, 4, 4), 1.0),
+            TransitionSource::new(src2, Rect::new(0, 0, 4, 4), Rect::new(0, 0, 4, 4), 0.5),
+        )),
+    );
+
+    let projected = project_window(&scene, win, |_| Some(null_texture(4, 4)));
+    let nodes = drawable_nodes(&projected);
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[0].dst, RectF::new(10.0, 10.0, 8.0, 8.0));
+    assert_eq!(nodes[1].dst, RectF::new(10.0, 10.0, 8.0, 8.0));
+}
+
+/// Clearing the frame returns the layer to its own image, and a layer whose
+/// frame has no visible source draws nothing.
+#[test]
+fn clearing_a_transition_frame_returns_the_main_image() {
+    let mut scene = Scene::default();
+    scene.composite_transition_frames = true;
+    let win = scene.add_window("t", (64, 64));
+    let layer = scene.add_layer(win, None);
+    scene.layer_mut(layer).unwrap().rect = Rect::new(0, 0, 4, 4);
+    scene.layer_mut(layer).unwrap().visible = true;
+    let src1 = attach_image(&mut scene, layer, 4, 4);
+    scene.set_transition_frame(
+        layer,
+        Some(TransitionFrame::new(
+            (4, 4),
+            true,
+            TransitionSource::new(src1, Rect::new(0, 0, 4, 4), Rect::new(0, 0, 0, 0), 1.0),
+            TransitionSource::new(src1, Rect::new(0, 0, 4, 4), Rect::new(0, 0, 0, 0), 0.0),
+        )),
+    );
+    let projected = project_window(&scene, win, |_| Some(null_texture(4, 4)));
+    assert!(
+        drawable_nodes(&projected).is_empty(),
+        "a frame with no visible source draws nothing"
+    );
+
+    scene.set_transition_frame(layer, None);
+    let projected = project_window(&scene, win, |_| Some(null_texture(4, 4)));
+    let nodes = drawable_nodes(&projected);
+    assert_eq!(nodes.len(), 1, "the main image is back");
+    assert_eq!(nodes[0].dst, RectF::new(0.0, 0.0, 4.0, 4.0));
+}
+
+/// Composites one scene's transition frame through the L1 pipeline into an
+/// offscreen target and returns its pixels — the same composition the Vulkan
+/// backend performs when it draws the frame.
+fn composite_frame_offscreen(scene: &Scene, window: u32, width: u32, height: u32) -> Vec<u8> {
+    let pipeline = create_render_pipeline(PipelineConfig::null()).expect("null pipeline");
+    let (_surface, mut state) = begin_render_state(&pipeline, &headless_window()).expect("begin");
+    let mut textures: std::collections::HashMap<u32, Texture> = std::collections::HashMap::new();
+    let report = project_window_report(scene, window, |id| {
+        if let Some(texture) = textures.get(&id) {
+            return Some(texture.clone());
+        }
+        let bitmap = scene.bitmap(id)?;
+        let texture =
+            create_texture(&pipeline, TextureDesc::new(bitmap.width, bitmap.height)).ok()?;
+        render::upload_texture(
+            &pipeline,
+            &mut state,
+            &texture,
+            PixelRegion::new(0, 0, bitmap.width, bitmap.height),
+            &bitmap.rgba,
+        )
+        .ok()?;
+        textures.insert(id, texture.clone());
+        Some(texture)
+    });
+    let target =
+        render::create_render_target(&pipeline, render::RenderTargetDesc::new(width, height))
+            .expect("target");
+    render::render_to_target(&pipeline, &mut state, &target, &report.scene).expect("render");
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    render::read_render_target(
+        &pipeline,
+        &state,
+        &target,
+        PixelRegion::new(0, 0, width, height),
+        &mut pixels,
+    )
+    .expect("read");
+    pixels
+}
+
+/// Builds a one-layer window whose transition frame names two source bitmaps,
+/// and returns the scene, the window and the two bitmaps.
+fn transition_scene(
+    trans: &engine::trans::Trans,
+    src1: Vec<u8>,
+    src2: Vec<u8>,
+    width: u32,
+    height: u32,
+    covers_layer: bool,
+) -> (Scene, u32, u32, u32) {
+    let mut scene = Scene::default();
+    scene.composite_transition_frames = true;
+    let win = scene.add_window("t", (width, height));
+    let layer = scene.add_layer(win, None);
+    {
+        let state = scene.layer_mut(layer).unwrap();
+        state.rect = Rect::new(0, 0, width, height);
+        state.visible = true;
+    }
+    let first = scene.add_bitmap(width, height, src1);
+    let second = scene.add_bitmap(width, height, src2);
+    scene.layer_mut(layer).unwrap().bitmap = Some(first);
+    let frame = trans
+        .transition_frame(first, second, (width, height), covers_layer)
+        .expect("composited frame");
+    scene.set_transition_frame(layer, Some(frame));
+    (scene, win, first, second)
+}
+
+/// The composited `crossfade` frame and the CPU blend agree within one level
+/// per channel wherever the second source is opaque. The reference blends the
+/// two sources per channel at `Phase`
+/// (`reference/cpp/core/visual/TransIntf.cpp:592-600,660`); the composited
+/// frame draws the same two images with the phase as the second source's
+/// alpha, so only the 8-bit rounding differs.
+#[test]
+fn a_composited_cross_fade_matches_the_cpu_blend() {
+    let width = 4u32;
+    let height = 4u32;
+    let src1: Vec<u8> = [10u8, 40, 90, 255].repeat((width * height) as usize);
+    let src2: Vec<u8> = [200u8, 120, 30, 255].repeat((width * height) as usize);
+    for step_ms in [0.0, 20.0, 40.0, 60.0, 80.0, 100.0] {
+        let mut trans = engine::trans::Trans::cross_fade(100.0).expect("crossfade");
+        trans.step(step_ms);
+        let (scene, window, first, second) =
+            transition_scene(&trans, src1.clone(), src2.clone(), width, height, true);
+        let composited = composite_frame_offscreen(&scene, window, width, height);
+
+        let src1_bitmap = scene.bitmap(first).unwrap().clone();
+        let src2_bitmap = scene.bitmap(second).unwrap().clone();
+        let mut cpu = BitmapState::new(width, height, vec![0u8; (width * height * 4) as usize]);
+        trans
+            .apply(&mut cpu, &src1_bitmap, &src2_bitmap, (0, 0, 4, 4))
+            .expect("cpu blend");
+
+        for (index, (gpu, expected)) in composited
+            .chunks_exact(4)
+            .zip(cpu.rgba.chunks_exact(4))
+            .enumerate()
+        {
+            for (channel, (gpu, expected)) in gpu.iter().zip(expected).enumerate() {
+                let difference = i32::from(*gpu) - i32::from(*expected);
+                assert!(
+                    difference.abs() <= 1,
+                    "step {step_ms} ms, pixel {index}, channel {channel}: \
+                     composited {gpu} vs cpu blend {expected}"
+                );
+            }
+        }
+    }
+}
+
+/// The composited `scroll` frame reproduces the CPU blit exactly: the two
+/// sources are copied at their placed rectangles with no blend
+/// (`reference/cpp/core/visual/TransIntf.cpp:1208-1217`).
+#[test]
+fn a_composited_scroll_matches_the_cpu_blit() {
+    let width = 4u32;
+    let height = 2u32;
+    for step_ms in [0.0, 25.0, 50.0, 75.0, 100.0] {
+        for from in [
+            engine::trans::ScrollFrom::Left,
+            engine::trans::ScrollFrom::Right,
+            engine::trans::ScrollFrom::Top,
+        ] {
+            for stay in [
+                engine::trans::ScrollStay::NoStay,
+                engine::trans::ScrollStay::StayDest,
+                engine::trans::ScrollStay::StaySrc,
+            ] {
+                let mut trans = engine::trans::Trans::scroll(100.0, from, stay).expect("scroll");
+                trans.step(step_ms);
+                let src1: Vec<u8> = [0u8, 0, 255, 255].repeat((width * height) as usize);
+                let src2: Vec<u8> = [255u8, 255, 0, 255].repeat((width * height) as usize);
+                let (scene, window, first, second) =
+                    transition_scene(&trans, src1.clone(), src2.clone(), width, height, true);
+                let composited = composite_frame_offscreen(&scene, window, width, height);
+                let src1_bitmap = scene.bitmap(first).unwrap().clone();
+                let src2_bitmap = scene.bitmap(second).unwrap().clone();
+                let mut cpu =
+                    BitmapState::new(width, height, vec![0u8; (width * height * 4) as usize]);
+                trans
+                    .apply(&mut cpu, &src1_bitmap, &src2_bitmap, (0, 0, 4, 2))
+                    .expect("cpu blit");
+                assert_eq!(
+                    composited, cpu.rgba,
+                    "step {step_ms} ms, from {from:?}, stay {stay:?}: the placements must match"
+                );
+            }
+        }
+    }
+}
+
+/// Where the second source carries alpha, the composited frame fades its
+/// contribution by `phase * alpha`, so it may differ from the CPU blend by at
+/// most `255 * t * (1 - alpha)` per channel — the documented tolerance. An
+/// opaque first source is required: the frame composites over the scene, while
+/// the CPU blend writes straight-alpha pixels.
+#[test]
+fn a_translucent_second_source_stays_within_the_documented_tolerance() {
+    let width = 2u32;
+    let height = 1u32;
+    let src1: Vec<u8> = [10u8, 40, 90, 255].repeat((width * height) as usize);
+    let src2: Vec<u8> = [200u8, 120, 30, 128].repeat((width * height) as usize);
+    let mut trans = engine::trans::Trans::cross_fade(100.0).expect("crossfade");
+    trans.step(50.0);
+    let phase = trans.phase();
+    assert!(phase > 0 && phase < engine::trans::PHASE_MAX);
+    let t = f64::from(phase) / 256.0;
+    let (scene, window, first, second) =
+        transition_scene(&trans, src1.clone(), src2.clone(), width, height, true);
+    let composited = composite_frame_offscreen(&scene, window, width, height);
+    let src1_bitmap = scene.bitmap(first).unwrap().clone();
+    let src2_bitmap = scene.bitmap(second).unwrap().clone();
+    let mut cpu = BitmapState::new(width, height, vec![0u8; (width * height * 4) as usize]);
+    trans
+        .apply(&mut cpu, &src1_bitmap, &src2_bitmap, (0, 0, 2, 1))
+        .expect("cpu blend");
+
+    let bound = 255.0 * t * (1.0 - 128.0 / 255.0) + 1.0;
+    for (index, (gpu, expected)) in composited
+        .chunks_exact(4)
+        .zip(cpu.rgba.chunks_exact(4))
+        .enumerate()
+    {
+        for (channel, (gpu, expected)) in gpu.iter().zip(expected).enumerate() {
+            let difference = (i32::from(*gpu) - i32::from(*expected)).abs();
+            assert!(
+                f64::from(difference) <= bound,
+                "pixel {index}, channel {channel}: {gpu} vs {expected} differs by \
+                 {difference}, bound {bound}"
+            );
+        }
+    }
+}
+
+/// A composited transition reaches the engine's frame as two source draws: the
+/// projection emits them, the pipeline draws them, and no display bitmap is
+/// created or uploaded while the fade advances.
+///
+/// The reference blends the two sources into the destination's frame every tick
+/// (`reference/cpp/core/visual/TransIntf.cpp:592-600`); the composited form
+/// carries the same two sources and the phase as the fade source's alpha.
+#[test]
+fn an_engine_draws_a_composited_transition_without_a_display_bitmap() {
+    let (mut engine, _projections) = headless_engine_with_projection_count((32, 32));
+    engine.scene_mut().composite_transition_frames = true;
+    let window = engine.scene_mut().add_window("game", (32, 32));
+    let (layer, src1) = drawable_layer(&mut engine, window, 16, 16);
+    {
+        let bitmap = engine.scene_mut().bitmap_mut(src1).expect("source 1");
+        bitmap.rgba.fill(180);
+        bitmap.mark_dirty();
+    }
+    let src2 = engine
+        .scene_mut()
+        .add_bitmap(16, 16, vec![255u8; 4 * 16 * 16]);
+    {
+        let bitmap = engine.scene_mut().bitmap_mut(src2).expect("source 2");
+        bitmap.rgba.fill(255);
+        bitmap.mark_dirty();
+    }
+    let mut hooks = NoHooks;
+
+    let mut last_alpha = 0.0f32;
+    for tick in 1..=4u32 {
+        let alpha = tick as f32 / 8.0;
+        engine.scene_mut().set_transition_frame(
+            layer,
+            Some(TransitionFrame::new(
+                (16, 16),
+                true,
+                TransitionSource::new(src1, Rect::new(0, 0, 16, 16), Rect::new(0, 0, 16, 16), 1.0),
+                TransitionSource::new(
+                    src2,
+                    Rect::new(0, 0, 16, 16),
+                    Rect::new(0, 0, 16, 16),
+                    alpha,
+                ),
+            )),
+        );
+        engine
+            .frame(u64::from(tick) * 16, &mut hooks)
+            .expect("frame");
+        let nodes = projected_layer_nodes(&engine);
+        assert_eq!(nodes.len(), 2, "tick {tick}: the frame's two sources draw");
+        let fade = nodes[1].opacity;
+        assert!(
+            (fade - alpha).abs() < 1e-6,
+            "tick {tick}: the fade source's alpha reached the node: {fade} vs {alpha}"
+        );
+        assert!(fade > last_alpha, "tick {tick}: the fade advances");
+        last_alpha = fade;
+        assert_eq!(
+            engine.textures().len(),
+            2,
+            "tick {tick}: only the two source bitmaps carry a texture"
+        );
+    }
+    let state = engine.scene().layer(layer).expect("layer");
+    assert!(
+        state.cache_bitmap.is_none() && state.transition_self.is_none(),
+        "a composited frame allocates no display bitmap"
     );
 }

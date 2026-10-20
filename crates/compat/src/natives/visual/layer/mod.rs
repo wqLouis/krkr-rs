@@ -118,7 +118,18 @@ pub fn refresh_cached_layers(ctx: &crate::CompatCtx) -> Result<(), String> {
     let scene = scene_mut(ctx)?;
     // The transition step owns the cache slots of these layers' ancestors too:
     // an ancestor's cache would hold the un-blended image the frame replaces.
+    // A frame or an effect draw the projection draws never reaches a bitmap at
+    // all, so an ancestor's cache cannot hold it either, and the layer has to
+    // draw live for it to appear.
     let mut blocked: Vec<u32> = Vec::new();
+    for &id in &in_transition {
+        if scene
+            .layer(id)
+            .is_some_and(|layer| layer.transition_frame.is_some() || layer.effect.is_some())
+        {
+            blocked.extend(ancestors(scene, id));
+        }
+    }
     for id in whole_subtree_transitions {
         blocked.extend(ancestors(scene, id));
     }

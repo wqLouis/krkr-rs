@@ -1,6 +1,6 @@
 //! Dispatch tests for the UI/system native families.
 //!
-//! The audited hypothesis (`docs/audits/object-write-dispatch.md`) was that a
+//! The audited hypothesis (`docs.old/audits/object-write-dispatch.md`) was that a
 //! `with(obj)` write whose register closure has no own `ObjThis` falls back to
 //! the enclosing function's `this` (`clo.ObjThis ? clo.ObjThis : ra[-1]`,
 //! `crates/tjs/cpp/tjs2/tjsInterCodeExec.cpp:1440`), so an **instance-payload**

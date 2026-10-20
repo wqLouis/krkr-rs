@@ -24,3 +24,4 @@ pub mod glyph;
 pub mod host;
 pub mod input;
 pub mod media;
+pub mod shader;

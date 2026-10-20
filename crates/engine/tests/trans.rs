@@ -241,3 +241,116 @@ fn two_transitions_are_independent() {
     assert!((b.progress() - 0.125).abs() < 1e-6);
     assert_ne!(a.kind(), b.kind());
 }
+
+/// The frame a composited `crossfade` draws: source 1 verbatim at the start,
+/// the fade carrying `phase / 256`, and source 2 verbatim at the end — the
+/// reference's two endpoint short-circuits
+/// (`reference/cpp/core/visual/TransIntf.cpp:592-600`) and the `Phase`
+/// weighting of `TVPConstAlphaBlend_SD` (`:660`).
+#[test]
+fn cross_fade_frame_is_two_full_source_draws() {
+    let mut trans = Trans::cross_fade(100.0).unwrap();
+    let frame = trans
+        .transition_frame(7, 9, (4, 2), true)
+        .expect("crossfade frame");
+    assert_eq!(frame.size, (4, 2));
+    assert!(frame.covers_layer);
+    assert_eq!(frame.src1.bitmap, 7);
+    assert_eq!(frame.src2.bitmap, 9);
+    assert_eq!(frame.src1.src, engine::Rect::new(0, 0, 4, 2));
+    assert_eq!(frame.src1.dst, engine::Rect::new(0, 0, 4, 2));
+    assert_eq!(frame.src2.src, engine::Rect::new(0, 0, 4, 2));
+    assert_eq!(frame.src2.dst, engine::Rect::new(0, 0, 4, 2));
+    assert_eq!(frame.src1.alpha, 1.0);
+    assert_eq!(frame.src2.alpha, 0.0, "phase 0 is source 1 verbatim");
+
+    trans.step(50.0); // phase 127, reference/cpp/core/visual/TransIntf.cpp:536
+    let frame = trans
+        .transition_frame(7, 9, (4, 2), false)
+        .expect("crossfade frame");
+    assert!(!frame.covers_layer);
+    assert_eq!(frame.src1.alpha, 1.0);
+    assert!(
+        (frame.src2.alpha - 127.0 / 256.0).abs() < 1e-6,
+        "the fade source carries phase/256, got {}",
+        frame.src2.alpha
+    );
+
+    trans.complete();
+    let frame = trans
+        .transition_frame(7, 9, (4, 2), true)
+        .expect("crossfade frame");
+    assert_eq!(frame.src1.alpha, 0.0, "phase max is source 2 verbatim");
+    assert_eq!(frame.src2.alpha, 1.0);
+}
+
+/// A `scroll` frame places its two sources exactly where the reference's
+/// `Blend` copies them (`reference/cpp/core/visual/TransIntf.cpp:1167-1172`)
+/// and clips both to the frame (`:1208-1217`).
+#[test]
+fn scroll_frame_tiles_the_two_sources_inside_the_frame() {
+    let src1 = black(4, 2);
+    let src2 = white(4, 2);
+    let mut dst = bitmap(4, 2, [0, 0, 0, 0]);
+    let mut trans = Trans::scroll(100.0, ScrollFrom::Left, ScrollStay::NoStay).unwrap();
+    trans.step(50.0); // phase 2: half of the 4px travel
+
+    let frame = trans
+        .transition_frame(1, 2, (4, 2), true)
+        .expect("scroll frame");
+    // Source 1 is pushed right by the phase and clipped to the frame; source 2
+    // enters from the left edge.
+    assert_eq!(frame.src1.dst, engine::Rect::new(2, 0, 2, 2));
+    assert_eq!(frame.src1.src, engine::Rect::new(0, 0, 2, 2));
+    assert_eq!(frame.src2.dst, engine::Rect::new(0, 0, 2, 2));
+    assert_eq!(frame.src2.src, engine::Rect::new(2, 0, 2, 2));
+    assert_eq!(frame.src1.alpha, 1.0);
+    assert_eq!(frame.src2.alpha, 1.0);
+
+    // The two placements reproduce the CPU blit exactly.
+    trans.apply(&mut dst, &src1, &src2, region(4, 2)).unwrap();
+    assert_eq!(&dst.rgba[0..4], &[255, 255, 255, 255]);
+    assert_eq!(&dst.rgba[4..8], &[255, 255, 255, 255]);
+    assert_eq!(&dst.rgba[8..12], &[0, 0, 0, 255]);
+    assert_eq!(&dst.rgba[12..16], &[0, 0, 0, 255]);
+}
+
+/// The completed `scroll` frame is the second source covering the whole frame,
+/// so the first source has no visible rectangle.
+#[test]
+fn completed_scroll_frame_is_the_second_source_alone() {
+    let mut trans = Trans::scroll(100.0, ScrollFrom::Left, ScrollStay::StaySrc).unwrap();
+    trans.step(100.0);
+    let frame = trans
+        .transition_frame(1, 2, (4, 2), true)
+        .expect("scroll frame");
+    assert_eq!(frame.src1.dst, engine::Rect::default());
+    assert_eq!(frame.src2.dst, engine::Rect::new(0, 0, 4, 2));
+    assert_eq!(frame.src2.src, engine::Rect::new(0, 0, 4, 2));
+}
+
+/// Only the composition kinds produce a frame; a rule or warp kind needs the
+/// per-pixel blend and returns none.
+#[test]
+fn per_pixel_kinds_have_no_composited_frame() {
+    let rule = RuleMask::new(1, 1, vec![0]).unwrap();
+    let universal = Trans::universal(10.0, 64, rule.clone()).unwrap();
+    assert!(universal.transition_frame(1, 2, (2, 2), true).is_none());
+    let mask = Trans::mask(10.0, rule).unwrap();
+    assert!(mask.transition_frame(1, 2, (2, 2), true).is_none());
+    let ripple = Trans::new(
+        TransKind::Ripple {
+            center: None,
+            map_width: 16,
+            roundness: 1.0,
+            speed: 6.0,
+            max_drift: 1,
+        },
+        10.0,
+    )
+    .unwrap();
+    assert!(ripple.transition_frame(1, 2, (2, 2), true).is_none());
+    // A zero-sized frame has nothing to place.
+    let cross_fade = Trans::cross_fade(10.0).unwrap();
+    assert!(cross_fade.transition_frame(1, 2, (0, 2), true).is_none());
+}

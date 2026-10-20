@@ -40,6 +40,7 @@
 
 mod device;
 mod draw;
+mod effect;
 mod pipelines;
 mod shaders;
 mod swapchain;
@@ -49,7 +50,7 @@ mod texture;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ash::vk;
 use raw_window_handle::{
@@ -58,7 +59,7 @@ use raw_window_handle::{
 
 use api::error::RenderError;
 use api::geometry::{Affine2, PixelRegion};
-use api::host::{Presentation, SurfaceEvent};
+use api::host::{PresentSkip, Presentation, SurfaceEvent};
 
 use crate::render_target::{RenderTarget, RenderTargetDesc};
 use crate::scene::RenderScene;
@@ -88,6 +89,9 @@ pub struct VulkanPipeline {
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// Preferred swapchain format requested by the caller.
     preferred_format: TextureFormat,
+    /// Nanoseconds a frame may wait for the display to release a swapchain
+    /// image, derived from the configured frame period.
+    acquire_timeout_ns: u64,
 }
 
 /// Owns the Vulkan loader and instance, destroying the instance and then
@@ -126,12 +130,27 @@ impl VulkanPipeline {
     /// # Errors
     ///
     /// Returns [`RenderError::DeviceUnavailable`] when the Vulkan loader,
-    /// instance or a suitable device is unavailable.
-    pub(crate) fn new(config: &crate::PipelineConfig) -> Result<Self, RenderError> {
+    /// instance or a suitable device is unavailable, and
+    /// [`RenderError::InvalidArgument`] when `acquire_timeout` does not fit
+    /// the swapchain acquire timeout.
+    pub(crate) fn new(
+        config: &crate::PipelineConfig,
+        acquire_timeout: Duration,
+    ) -> Result<Self, RenderError> {
         let bundle = device::create_instance(config)?;
         if bundle.validation {
             log::info!("Vulkan validation layer VK_LAYER_KHRONOS_validation enabled");
         }
+        // The acquire timeout is a nanosecond count; a budget that does not fit
+        // it is a typed error rather than a wrapped wait.
+        let acquire_timeout_ns = u64::try_from(acquire_timeout.as_nanos()).map_err(|_| {
+            RenderError::InvalidArgument {
+                message: format!(
+                    "the presentation budget {acquire_timeout:?} does not fit the \
+                     swapchain acquire timeout"
+                ),
+            }
+        })?;
         Ok(Self {
             instance_guard: Arc::new(InstanceGuard {
                 entry: bundle.entry,
@@ -141,6 +160,7 @@ impl VulkanPipeline {
             max_texture_dimension: bundle.max_texture_dimension,
             memory_properties: bundle.memory_properties,
             preferred_format: config.preferred_format,
+            acquire_timeout_ns,
         })
     }
 
@@ -158,6 +178,10 @@ impl VulkanPipeline {
             // uses them fails with `RenderError::Unsupported` rather than
             // rendering incorrectly.
             supports_glyph_atlas: false,
+            // Effect pipelines need a device, SPIR-V modules, a dynamic uniform
+            // buffer and a 64-byte push-constant block: all of them are inside
+            // what Vulkan 1.0 guarantees.
+            supports_effect_pipelines: true,
         }
     }
 
@@ -333,6 +357,7 @@ impl VulkanPipeline {
         drop(teardown);
 
         let surface_size = (swapchain.extent.width, swapchain.extent.height);
+        let fences = FrameFences::new(frame_slot_fences(&frames));
 
         let state = VulkanState {
             _instance_guard: self.instance_guard.clone(),
@@ -349,12 +374,14 @@ impl VulkanPipeline {
             swapchain,
             pipelines,
             frames,
+            fences,
             images_in_flight: vec![vk::Fence::null(); image_count],
             render_finished,
             frame_in_flight: 0,
             textures: HashMap::new(),
             offscreen: HashMap::new(),
             render_targets: HashMap::new(),
+            effect: None,
             upload,
             offscreen_pool,
             offscreen_command,
@@ -534,6 +561,81 @@ impl VulkanPipeline {
         gpu.destroy(&device);
     }
 
+    /// Creates an effect pipeline whose resources live in `state`.
+    ///
+    /// The device-level resources (the uniform ring and the samplers) are
+    /// created with the first effect pipeline; the descriptor set layout, the
+    /// pipeline layout and one shader module per stage are created eagerly, so
+    /// a descriptor or a module the driver rejects fails here rather than on
+    /// the first frame that draws it. The graphics pipeline itself is built per
+    /// render pass on first use, because a pipeline is tied to the pass it is
+    /// recorded in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::InvalidArgument`] for a descriptor that breaks
+    /// the binding or uniform contract, [`RenderError::Unsupported`] for a
+    /// vertex layout or a blend this backend cannot build,
+    /// [`RenderError::Shader`] for a module or pipeline the driver rejects, and
+    /// [`RenderError::OutOfMemory`] when the ring, the pools or the descriptor
+    /// sets cannot be allocated.
+    pub(crate) fn create_effect_pipeline(
+        &self,
+        state: &mut RenderState,
+        desc: &api::shader::EffectPipelineDesc<'_>,
+    ) -> Result<crate::effect::EffectPipeline, RenderError> {
+        let StateKind::Vulkan(vstate) = &mut state.kind else {
+            return Err(RenderError::InvalidArgument {
+                message: "the Vulkan backend received a null render state".to_owned(),
+            });
+        };
+        let vstate = &mut **vstate;
+        if vstate.effect.is_none() {
+            // SAFETY: `physical_device` belongs to the instance this pipeline
+            // owns and the query is read-only.
+            let limits = unsafe {
+                self.instance_guard
+                    .instance
+                    .get_physical_device_properties(vstate.physical_device)
+            }
+            .limits;
+            let created = effect::EffectState::create(
+                &vstate.device,
+                &self.memory_properties,
+                limits.min_uniform_buffer_offset_alignment,
+            )?;
+            vstate.effect = Some(created);
+        }
+        let device = vstate.device.clone();
+        let Some(effects) = vstate.effect.as_mut() else {
+            return Err(RenderError::Framebuffer {
+                message: "the effect state disappeared during creation".to_owned(),
+            });
+        };
+        effects.create_pipeline(&device, desc)
+    }
+
+    /// Releases an effect pipeline, idling the device first.
+    pub(crate) fn destroy_effect_pipeline(
+        &self,
+        state: &mut RenderState,
+        pipeline: crate::effect::EffectPipeline,
+    ) {
+        let StateKind::Vulkan(vstate) = &mut state.kind else {
+            return;
+        };
+        let Some(effects) = vstate.effect.as_mut() else {
+            return;
+        };
+        let device = vstate.device.clone();
+        // SAFETY: an in-flight frame may still draw with the pipeline, so the
+        // device is idled before the handles are freed.
+        unsafe {
+            let _ = device.device_wait_idle();
+        }
+        effects.destroy_pipeline(&device, pipeline.key());
+    }
+
     /// Renders `scene` into the offscreen `target`.
     ///
     /// The offscreen render is synchronous: its pixels are read back by a
@@ -570,6 +672,7 @@ impl VulkanPipeline {
             offscreen,
             render_targets,
             textures,
+            effect,
             ..
         } = vstate;
 
@@ -606,7 +709,20 @@ impl VulkanPipeline {
             command_buffer: *offscreen_command,
             fence: *offscreen_fence,
         };
-        target::render(&submit, gpu, pass, textures, scene)
+        // The offscreen render owns a uniform slot of its own and runs while a
+        // live frame may still be in flight.
+        if let Some(effects) = effect.as_mut() {
+            effects.begin_offscreen_frame();
+        }
+        let result = target::render(&submit, gpu, pass, textures, effect.as_mut(), scene);
+        if result.is_ok()
+            && let Some(effects) = effect.as_mut()
+        {
+            // The offscreen submit completed only after every command buffer
+            // submitted before it, so no descriptor set is in use any more.
+            effects.end_offscreen_frame(device);
+        }
+        result
     }
 
     /// Copies a sub-rectangle of an offscreen `target` into `out`.
@@ -730,27 +846,35 @@ impl VulkanPipeline {
         let mut recreate_ms = 0.0_f64;
         let mut submit_ms = 0.0_f64;
 
-        let fence_started = Instant::now();
-        // SAFETY: the fence belongs to this frame slot and was created
-        // signalled, so the first wait returns immediately.
-        unsafe { device.wait_for_fences(&[in_flight], true, u64::MAX) }
-            .map_err(|error| device::result_error("failed to wait for the frame fence", error))?;
-        fence_wait_ms += fence_started.elapsed().as_secs_f64() * 1000.0;
+        // Wait for the frame slot's previous work, but only when the queue
+        // accepted a submission with that fence. A frame that failed leaves
+        // its fence unsignalled with nothing pending, and waiting for such a
+        // fence would never return.
+        if vstate.fences.slot_running(frame_index) {
+            let fence_started = Instant::now();
+            // SAFETY: the fence belongs to this frame slot and its submission
+            // was accepted, so it will signal.
+            unsafe { device.wait_for_fences(&[in_flight], true, u64::MAX) }.map_err(|error| {
+                device::result_error("failed to wait for the frame fence", error)
+            })?;
+            fence_wait_ms += fence_started.elapsed().as_secs_f64() * 1000.0;
+            vstate.fences.completed(frame_index);
+        }
 
         let acquire_started = Instant::now();
         // SAFETY: `swapchain` is valid; `image_available` must be unsignalled.
         let acquire_result = unsafe {
             swapchain_loader.acquire_next_image(
                 swapchain,
-                u64::MAX,
+                self.acquire_timeout_ns,
                 image_available,
                 vk::Fence::null(),
             )
         };
         let acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
-        let (image_index, suboptimal) = match acquire_result {
-            Ok(value) => value,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+        let (image_index, suboptimal) = match acquire_outcome(acquire_result) {
+            Ok(AcquireOutcome::Image { index, suboptimal }) => (index, suboptimal),
+            Ok(AcquireOutcome::OutOfDate) => {
                 vstate.report_present_fault(PresentFault::AcquireOutOfDate);
                 let recreate_started = Instant::now();
                 recreate_swapchain(&device, vstate, surface_handle)?;
@@ -765,12 +889,35 @@ impl VulkanPipeline {
                 return Ok(Presentation {
                     presented: false,
                     surface_event: Some(SurfaceEvent::OutOfDate),
+                    skip: None,
                 });
             }
-            Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
+            Ok(AcquireOutcome::SurfaceLost) => {
                 return Ok(Presentation {
                     presented: false,
                     surface_event: Some(SurfaceEvent::Lost),
+                    skip: None,
+                });
+            }
+            Ok(AcquireOutcome::TimedOut) => {
+                // The timeout neither signalled nor consumed anything: the
+                // semaphore, the fences, the frame slot and the swapchain stay
+                // untouched, so the previous image stays on screen and the
+                // next frame can acquire with the same semaphore. The frame is
+                // reported as skipped rather than silently dropped, and the
+                // swapchain is not rebuilt because the display is late, not
+                // out of date.
+                vstate.last_timings = Some(FrameTimings {
+                    acquire_ms,
+                    present_ms,
+                    submit_ms,
+                    recreate_ms,
+                    fence_wait_ms,
+                });
+                return Ok(Presentation {
+                    presented: false,
+                    surface_event: None,
+                    skip: Some(PresentSkip::AcquireTimeout),
                 });
             }
             Err(error) => {
@@ -787,21 +934,23 @@ impl VulkanPipeline {
         let signal_semaphores = [vstate.render_finished[image_index as usize]];
         let submit_started = Instant::now();
         let record_result: Result<(), RenderError> = (|| {
-            if vstate.images_in_flight[image_index as usize] != vk::Fence::null() {
-                let image_fence = vstate.images_in_flight[image_index as usize];
+            let image_fence = vstate.images_in_flight[image_index as usize];
+            // The image's fence is a frame slot's fence. Wait for it only when
+            // a submission with it may still be running: a frame that failed
+            // leaves its fence unsignalled with nothing pending.
+            if vstate.fences.fence_running(image_fence) {
                 let image_wait_started = Instant::now();
-                // SAFETY: the fence guards this swapchain image.
+                // SAFETY: the fence guards this swapchain image and its
+                // submission was accepted, so it will signal.
                 unsafe { device.wait_for_fences(&[image_fence], true, u64::MAX) }.map_err(
                     |error| device::result_error("failed to wait for a swapchain image", error),
                 )?;
                 fence_wait_ms += image_wait_started.elapsed().as_secs_f64() * 1000.0;
+                vstate.fences.completed_fence(image_fence);
             }
 
-            // SAFETY: the fence/image are idle and the pool is not in use.
+            // SAFETY: the pool is not in use.
             unsafe {
-                device.reset_fences(&[in_flight]).map_err(|error| {
-                    device::result_error("failed to reset the frame fence", error)
-                })?;
                 device
                     .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())
                     .map_err(|error| {
@@ -851,12 +1000,23 @@ impl VulkanPipeline {
                 device.cmd_set_viewport(command_buffer, 0, &[viewport]);
             }
 
+            // The frame fence for this slot was waited above when it had work
+            // in flight, so the frame that owned the slot has completed: its
+            // uniform bytes may be written again and the descriptor sets it
+            // bound may be freed. The slot is the frame's own, `frame_in_flight
+            // % MAX_FRAMES_IN_FLIGHT`.
+            if let Some(effects) = vstate.effect.as_mut() {
+                effects.begin_live_frame(&device, frame_index);
+            }
+            let effects = vstate.effect.as_mut();
             draw::record_scene(
-                &draw::SceneDraw {
+                draw::SceneDraw {
                     device: &device,
                     command: command_buffer,
                     pipelines: &vstate.pipelines,
                     textures: &vstate.textures,
+                    effects,
+                    render_pass,
                     extent,
                     srgb,
                 },
@@ -888,9 +1048,21 @@ impl VulkanPipeline {
                 .command_buffers(&command_buffers)
                 .signal_semaphores(&signal_semaphores);
 
-            // SAFETY: all handles are live; the fence is reset and unsignalled.
-            unsafe { device.queue_submit(graphics_queue, &[submit], in_flight) }
-                .map_err(|error| device::result_error("failed to submit the frame", error))?;
+            // SAFETY: all handles are live. The fence is reset only
+            // immediately before the submit, so a failure above leaves it
+            // signalled and the slot reusable. A failed submit leaves the
+            // fence unsignalled, but the tracker then holds no work for it, so
+            // no later wait blocks on a signal that will not come.
+            unsafe {
+                device.reset_fences(&[in_flight]).map_err(|error| {
+                    device::result_error("failed to reset the frame fence", error)
+                })?;
+                device
+                    .queue_submit(graphics_queue, &[submit], in_flight)
+                    .map_err(|error| device::result_error("failed to submit the frame", error))?;
+            }
+            // The queue accepted the submission, so the fence will signal.
+            vstate.fences.submitted(frame_index);
             vstate.images_in_flight[image_index as usize] = in_flight;
             Ok(())
         })();
@@ -937,6 +1109,7 @@ impl VulkanPipeline {
                 return Ok(Presentation {
                     presented: false,
                     surface_event: Some(SurfaceEvent::Lost),
+                    skip: None,
                 });
             }
         }
@@ -956,6 +1129,7 @@ impl VulkanPipeline {
             return Ok(Presentation {
                 presented: true,
                 surface_event: Some(SurfaceEvent::OutOfDate),
+                skip: None,
             });
         }
 
@@ -970,6 +1144,7 @@ impl VulkanPipeline {
         Ok(Presentation {
             presented: true,
             surface_event: None,
+            skip: None,
         })
     }
 }
@@ -990,6 +1165,73 @@ pub(crate) struct VulkanFrame {
     pub(crate) in_flight: vk::Fence,
     /// Semaphore signalled when a swapchain image is acquired.
     pub(crate) image_available: vk::Semaphore,
+}
+
+/// The frame slots' fences and whether their submissions may still be running.
+///
+/// A fence is signalled only by a submission the queue accepted, so a frame
+/// that fails after its fence was reset leaves the fence unsignalled with
+/// nothing pending. Waiting for such a fence never returns, so the tracker
+/// records which fences may still be running and every wait asks it first.
+#[derive(Clone, Copy)]
+struct FrameFences {
+    /// The fence each frame slot submits with.
+    slot_fences: [vk::Fence; MAX_FRAMES_IN_FLIGHT],
+    /// Whether a submission with the slot's fence may still be running.
+    running: [bool; MAX_FRAMES_IN_FLIGHT],
+}
+
+impl FrameFences {
+    /// Tracks the fences of the frame slots.
+    fn new(slot_fences: [vk::Fence; MAX_FRAMES_IN_FLIGHT]) -> Self {
+        Self {
+            slot_fences,
+            running: [false; MAX_FRAMES_IN_FLIGHT],
+        }
+    }
+
+    /// Whether the frame slot's fence may still have work in flight.
+    fn slot_running(&self, slot: usize) -> bool {
+        self.running[slot]
+    }
+
+    /// Whether the fence may still have work in flight.
+    ///
+    /// A fence that belongs to no frame slot never has work in flight.
+    fn fence_running(&self, fence: vk::Fence) -> bool {
+        self.slot_fences
+            .iter()
+            .zip(self.running.iter())
+            .any(|(slot_fence, running)| *slot_fence == fence && *running)
+    }
+
+    /// Records that the queue accepted a submission with the slot's fence.
+    fn submitted(&mut self, slot: usize) {
+        self.running[slot] = true;
+    }
+
+    /// Records that the slot's fence was observed signalled.
+    fn completed(&mut self, slot: usize) {
+        self.running[slot] = false;
+    }
+
+    /// Records that the fence was observed signalled, whichever slot owns it.
+    fn completed_fence(&mut self, fence: vk::Fence) {
+        for (slot, slot_fence) in self.slot_fences.iter().enumerate() {
+            if *slot_fence == fence {
+                self.running[slot] = false;
+            }
+        }
+    }
+}
+
+/// Collects the frame slots' fences for [`FrameFences`].
+fn frame_slot_fences(frames: &[VulkanFrame]) -> [vk::Fence; MAX_FRAMES_IN_FLIGHT] {
+    let mut slot_fences = [vk::Fence::null(); MAX_FRAMES_IN_FLIGHT];
+    for (slot, frame) in frames.iter().enumerate().take(MAX_FRAMES_IN_FLIGHT) {
+        slot_fences[slot] = frame.in_flight;
+    }
+    slot_fences
 }
 
 /// Mutable Vulkan state owned by the middle layer.
@@ -1025,6 +1267,9 @@ pub(crate) struct VulkanState {
     pub(crate) pipelines: pipelines::PipelineSet,
     /// Per-frame command buffers and sync objects.
     pub(crate) frames: Vec<VulkanFrame>,
+    /// The frame slots' fences and whether their submissions may still be
+    /// running.
+    fences: FrameFences,
     /// Fence guarding each swapchain image.
     pub(crate) images_in_flight: Vec<vk::Fence>,
     /// Render-finished semaphore per swapchain image.
@@ -1037,6 +1282,9 @@ pub(crate) struct VulkanState {
     pub(crate) offscreen: HashMap<TextureFormat, target::OffscreenPass>,
     /// GPU offscreen targets keyed by [`RenderTarget`] identity.
     pub(crate) render_targets: HashMap<u64, target::VulkanRenderTarget>,
+    /// Custom effect pipelines, their samplers and the frame's uniform ring,
+    /// created on the first created effect pipeline.
+    pub(crate) effect: Option<effect::EffectState>,
     /// Ring of independently synchronised texture-upload slots.
     pub(crate) upload: texture::UploadRing,
     /// Pool used for one synchronous offscreen render or readback.
@@ -1099,6 +1347,9 @@ impl Drop for VulkanState {
             }
             for pass in self.offscreen.values() {
                 pass.destroy(&self.device);
+            }
+            if let Some(mut effects) = self.effect.take() {
+                effects.destroy(&self.device);
             }
             self.pipelines.destroy(&self.device);
             self.swapchain.destroy(&self.device, &self.swapchain_loader);
@@ -1398,6 +1649,40 @@ impl PresentFault {
             Self::AcquireOutOfDate => "the swapchain was out of date at image acquire",
             Self::RebuildFailed => "rebuilding the swapchain failed",
         }
+    }
+}
+
+/// The frame-relevant classification of a swapchain image acquire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcquireOutcome {
+    /// An image was acquired; `suboptimal` asks for a later rebuild.
+    Image {
+        /// Index of the acquired swapchain image.
+        index: u32,
+        /// Whether the acquire reported the swapchain as suboptimal.
+        suboptimal: bool,
+    },
+    /// The swapchain is out of date and must be rebuilt.
+    OutOfDate,
+    /// The surface is lost and must be recreated.
+    SurfaceLost,
+    /// No image became available within the frame's presentation budget.
+    TimedOut,
+}
+
+/// Classifies an acquire result, keeping every other error for the caller.
+///
+/// A timeout is a documented result of the acquire, not a failure: no image
+/// was released, and the semaphore and fence are unmodified, so the frame can
+/// be skipped without touching the swapchain. Every other error still reaches
+/// the caller as a typed error.
+fn acquire_outcome(result: Result<(u32, bool), vk::Result>) -> Result<AcquireOutcome, vk::Result> {
+    match result {
+        Ok((index, suboptimal)) => Ok(AcquireOutcome::Image { index, suboptimal }),
+        Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(AcquireOutcome::OutOfDate),
+        Err(vk::Result::ERROR_SURFACE_LOST_KHR) => Ok(AcquireOutcome::SurfaceLost),
+        Err(vk::Result::TIMEOUT) => Ok(AcquireOutcome::TimedOut),
+        Err(error) => Err(error),
     }
 }
 
@@ -1813,8 +2098,100 @@ pub fn upload_submit_count(state: &RenderState) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PresentFault, SwapchainRecovery, present_recovery, swapchain_fault};
+    use super::{
+        AcquireOutcome, FrameFences, PresentFault, SwapchainRecovery, acquire_outcome,
+        present_recovery, swapchain_fault,
+    };
     use ash::vk;
+    use ash::vk::Handle;
+
+    /// A fence handle for the test; the handle is never used with a device.
+    fn fence(raw: u64) -> vk::Fence {
+        vk::Fence::from_raw(raw)
+    }
+
+    /// A frame that fails before its submit leaves no fence to wait on.
+    ///
+    /// The fence is reset immediately before the submit, so a failure above
+    /// leaves it signalled; a failed submit leaves it unsignalled with nothing
+    /// pending. Neither may leave a later frame waiting for a signal that
+    /// will not come.
+    #[test]
+    fn a_failed_frame_leaves_no_fence_to_wait_on() {
+        let mut fences = FrameFences::new([fence(1), fence(2)]);
+
+        // The first frame submits and its work may still be running.
+        fences.submitted(0);
+        assert!(fences.slot_running(0));
+        assert!(fences.fence_running(fence(1)));
+
+        // The frame that reuses the slot waits and observes the completion.
+        fences.completed(0);
+        assert!(!fences.slot_running(0));
+        assert!(!fences.fence_running(fence(1)));
+
+        // The next frame fails before its submit: the fence was reset, but no
+        // submission was accepted, so nothing waits for it.
+        assert!(!fences.slot_running(0));
+        assert!(!fences.fence_running(fence(1)));
+    }
+
+    /// A frame that waits for a swapchain image clears the state of the frame
+    /// whose fence it waited for.
+    #[test]
+    fn an_image_wait_clears_the_frame_it_waits_for() {
+        let mut fences = FrameFences::new([fence(1), fence(2)]);
+        fences.submitted(1);
+        assert!(fences.fence_running(fence(2)));
+        fences.completed_fence(fence(2));
+        assert!(!fences.fence_running(fence(2)));
+        assert!(!fences.slot_running(1));
+        // The other frame slot is untouched.
+        assert!(!fences.slot_running(0));
+    }
+
+    /// A fence that belongs to no frame slot never has work in flight.
+    #[test]
+    fn a_foreign_fence_never_has_work_in_flight() {
+        let fences = FrameFences::new([fence(1), fence(2)]);
+        assert!(!fences.fence_running(vk::Fence::null()));
+        assert!(!fences.fence_running(fence(9)));
+        assert!(!fences.slot_running(0));
+        assert!(!fences.slot_running(1));
+    }
+
+    /// `VK_TIMEOUT` is a skippable frame while every other non-surface acquire
+    /// error still reaches the caller; the reference's present does not block
+    /// on the display, so an unavailable image is a missed frame rather than a
+    /// stall.
+    #[test]
+    fn a_timed_out_acquire_is_a_skippable_frame_and_every_other_error_reaches_the_caller() {
+        // reference/cpp/core/visual/impl/BasicDrawDevice.cpp:244
+        // reference/cpp/core/visual/impl/VSyncTimingThread.cpp:88-146
+        assert_eq!(
+            acquire_outcome(Ok((3, false))),
+            Ok(AcquireOutcome::Image {
+                index: 3,
+                suboptimal: false,
+            })
+        );
+        assert_eq!(
+            acquire_outcome(Err(vk::Result::ERROR_OUT_OF_DATE_KHR)),
+            Ok(AcquireOutcome::OutOfDate)
+        );
+        assert_eq!(
+            acquire_outcome(Err(vk::Result::ERROR_SURFACE_LOST_KHR)),
+            Ok(AcquireOutcome::SurfaceLost)
+        );
+        assert_eq!(
+            acquire_outcome(Err(vk::Result::TIMEOUT)),
+            Ok(AcquireOutcome::TimedOut)
+        );
+        assert_eq!(
+            acquire_outcome(Err(vk::Result::ERROR_DEVICE_LOST)),
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        );
+    }
 
     /// `VK_ERROR_SURFACE_LOST_KHR` is the one present result that invalidates
     /// the surface; out-of-date and suboptimal only need the swapchain

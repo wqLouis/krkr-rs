@@ -15,11 +15,13 @@
 use std::ffi::{c_char, c_int, c_void};
 
 use crate::engine_api::layer_ops::{self, GammaAdjust, RectI};
-use crate::engine_api::{BitmapState, DecodedImageMode, Scene};
+use crate::engine_api::{BitmapState, DecodedImageKey, DecodedImageMode, Scene};
 use api::blend::{BlendMode, DstBlend};
 use tjs::{NativeInstanceMethodDef, Tjs2Engine, Value};
 
-use super::super::bitmap::{COLOR_KEY_NONE, load_cached_storage_image};
+use super::super::bitmap::{
+    COLOR_KEY_NONE, install_pending_image, load_cached_storage_image, start_pending_decode,
+};
 use super::super::common::scene_mut;
 use super::super::common::{
     DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, argb_to_rgba, rgba_to_argb, set_null_out,
@@ -143,11 +145,21 @@ fn restore_alpha_inside_clip(dst: &mut BitmapState, before: &BitmapState, clip: 
 
 /// The destination bitmap + `HoldAlpha` flag of a layer, or `None` when its
 /// MainImage has been deallocated (`Layer.hasImage = false`).
-fn dest_info(scene: &Scene, id: u32, method: &str) -> Result<Option<(u32, bool)>, String> {
-    let layer = scene
-        .layer(id)
-        .ok_or_else(|| format!("Layer.{method}: this layer no longer exists"))?;
-    Ok(layer.bitmap.map(|bitmap| (bitmap, layer.hold_alpha)))
+fn dest_info(scene: &mut Scene, id: u32, method: &str) -> Result<Option<(u32, bool)>, String> {
+    // The layer's fields are copied out before the scene is borrowed again:
+    // the resolve below needs the whole scene.
+    let (bitmap, hold_alpha) = {
+        let layer = scene
+            .layer(id)
+            .ok_or_else(|| format!("Layer.{method}: this layer no longer exists"))?;
+        (layer.bitmap, layer.hold_alpha)
+    };
+    let Some(bitmap) = bitmap else {
+        return Ok(None);
+    };
+    // The image may still be decoding: every operation on it waits.
+    scene.resolve_bitmap(bitmap);
+    Ok(Some((bitmap, hold_alpha)))
 }
 
 /// Mark a layer's image modified after a pixel write. The `imageModified`
@@ -1767,7 +1779,7 @@ extern "C" fn layer_get_main_pixel(
     };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
-    let scene = match super::super::common::scene_ref(&ctx) {
+    let scene = match super::super::common::scene_mut(&ctx) {
         Ok(s) => s,
         Err(error) => return report_error(out_error, &error),
     };
@@ -1865,7 +1877,7 @@ extern "C" fn layer_get_mask_pixel(
     };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
-    let scene = match super::super::common::scene_ref(&ctx) {
+    let scene = match super::super::common::scene_mut(&ctx) {
         Ok(s) => s,
         Err(error) => return report_error(out_error, &error),
     };
@@ -2039,6 +2051,9 @@ extern "C" fn layer_copy_to_bitmap_from_main_image(
             };
         let scene = scene_mut(&ctx)?;
         let src_id = main_bitmap(scene, id, "copyToBitmapFromMainImage")?;
+        // The destination may still be decoding: the copy replaces its
+        // pixels.
+        scene.resolve_bitmap(dst_id);
         let (width, height, rgba) = {
             let src = scene
                 .bitmap(src_id)
@@ -2173,9 +2188,51 @@ fn load_layer_image(
     colorkey: u32,
 ) -> Result<(), String> {
     log::debug!("load_layer_image: layer {layer_id} <- {name:?}");
+    // The decoded-image cache comes first: a hit is installed synchronously,
+    // exactly as a cached graphic is installed.
+    let key = DecodedImageKey::new(name, colorkey, DecodedImageMode::Full, 0, 0);
+    let cached = {
+        let scene = scene_mut(ctx)?;
+        scene.lookup_decoded_image(&key)
+    };
+    if let Some(image) = cached {
+        return install_layer_image(ctx, layer_id, image.width, image.height, image.rgba);
+    }
+    // The pool takes the decode when it can: the layer's image size is
+    // known now, from the header probe, and its pixels land later.
+    if let Some((width, height, pending)) =
+        start_pending_decode(ctx, name, colorkey, DecodedImageMode::Full)?
+    {
+        let existing = {
+            let scene = scene_mut(ctx)?;
+            scene.layer(layer_id).and_then(|layer| layer.bitmap)
+        };
+        let id = install_pending_image(ctx, existing, width, height, pending)?;
+        let scene = scene_mut(ctx)?;
+        if let Some(layer) = scene.layer_mut(layer_id) {
+            layer.bitmap = Some(id);
+        }
+        if !scene.internal_set_image_size(layer_id, width, height) {
+            return Err("the layer image could not be sized".to_string());
+        }
+        return Ok(());
+    }
+    // The synchronous path: the decode runs here and the cache keeps it.
     let image = load_cached_storage_image(ctx, name, colorkey, DecodedImageMode::Full)?;
-    let (width, height) = (image.width, image.height);
-    let rgba = image.rgba;
+    install_layer_image(ctx, layer_id, image.width, image.height, image.rgba)
+}
+
+/// Installs a decoded image as the layer's main image.
+///
+/// The image size follows the decoded one, and the layer's clip is reset to
+/// it, exactly as a load does.
+fn install_layer_image(
+    ctx: &CompatCtx,
+    layer_id: u32,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+) -> Result<(), String> {
     let scene = scene_mut(ctx)?;
     if scene.layer(layer_id).is_none() {
         return Err("the layer no longer exists".to_string());
@@ -2314,6 +2371,9 @@ extern "C" fn layer_save_layer_image(
             .layer(id)
             .and_then(|layer| layer.bitmap)
             .ok_or_else(|| "unsupported layer type (no main image)".to_string())?;
+        // The image may still be decoding: the saved pixels are the decoded
+        // ones.
+        scene.resolve_bitmap(bitmap_id);
         let bitmap = scene
             .bitmap(bitmap_id)
             .ok_or_else(|| "Layer.saveLayerImage: this layer has no main image".to_string())?;
@@ -2512,15 +2572,17 @@ fn layer_draw_text_common(
 /// Ensure the layer has a main-image bitmap, allocating a transparent one
 /// sized from the layer rectangle when it does not. Returns the bitmap id.
 fn ensure_layer_bitmap(scene: &mut Scene, layer_id: u32, method: &str) -> Result<u32, String> {
-    let (width, height) = {
-        let layer = scene
-            .layer(layer_id)
-            .ok_or_else(|| format!("Layer.{method}: this layer no longer exists"))?;
-        if let Some(id) = layer.bitmap {
-            return Ok(id);
-        }
-        (layer.rect.w, layer.rect.h)
+    let Some(layer) = scene.layer(layer_id) else {
+        return Err(format!("Layer.{method}: this layer no longer exists"));
     };
+    let width = layer.rect.w;
+    let height = layer.rect.h;
+    let existing = layer.bitmap;
+    if let Some(id) = existing {
+        // The image may still be decoding: the text is drawn into it.
+        scene.resolve_bitmap(id);
+        return Ok(id);
+    }
     if width == 0 || height == 0 {
         return Err(format!(
             "Layer.{method}: unsupported layer type (no main image)"

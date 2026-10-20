@@ -5,6 +5,9 @@
 //! bitmap. This module keeps that pixel work separate from the layer-state
 //! operations in [`crate::layer_ops`].
 //!
+//! Every operation that writes pixels marks its target bitmap dirty; a caller
+//! never has to remember to do it.
+//!
 //! Coordinates are layer-local pixels with the scene's y-down convention.
 //! Anti-aliasing is a 4×4 supersample of the even-odd fill; strokes use the
 //! per-pixel distance to the segment for a round, anti-aliased band. All
@@ -16,9 +19,9 @@ use crate::scene::BitmapState;
 /// Supersample grid per axis for polygon fills (4×4 = 16 samples/pixel).
 const AA: i32 = 4;
 
-/// Alpha-composite one straight-alpha pixel. Keeping this in the middle
-/// layer makes the scene's RGBA convention explicit and avoids renderer-only
-/// drawing paths.
+/// Alpha-composite one straight-alpha pixel and mark the bitmap dirty. Keeping
+/// this in the middle layer makes the scene's RGBA convention explicit and
+/// avoids renderer-only drawing paths.
 pub fn blend_pixel(
     bitmap: &mut BitmapState,
     x: i32,
@@ -27,11 +30,26 @@ pub fn blend_pixel(
     coverage: u8,
     opa: u8,
 ) {
+    if blend_pixel_raw(bitmap, x, y, color, coverage, opa) {
+        bitmap.mark_dirty();
+    }
+}
+
+/// [`blend_pixel`] without the dirty marking: a raster operation writes many
+/// pixels and marks its target once. Returns whether the pixel exists.
+fn blend_pixel_raw(
+    bitmap: &mut BitmapState,
+    x: i32,
+    y: i32,
+    color: [u8; 4],
+    coverage: u8,
+    opa: u8,
+) -> bool {
     if x < 0 || y < 0 || x as u32 >= bitmap.width || y as u32 >= bitmap.height {
-        return;
+        return false;
     }
     let Some(i) = bitmap.pixel_offset(x as u32, y as u32) else {
-        return;
+        return false;
     };
     let mut pixel = [
         bitmap.rgba[i],
@@ -41,6 +59,7 @@ pub fn blend_pixel(
     ];
     blend_pixel_at(&mut pixel, color, coverage, opa);
     bitmap.rgba[i..i + 4].copy_from_slice(&pixel);
+    true
 }
 
 /// Alpha-composite one straight-alpha pixel in place.
@@ -96,6 +115,7 @@ pub fn fill_rect_replace(bitmap: &mut BitmapState, x: i32, y: i32, w: u32, h: u3
             bitmap.rgba[i..i + 4].copy_from_slice(&color);
         }
     }
+    bitmap.mark_dirty();
 }
 
 /// Even-odd (alternate) point-in-polygon test at a sub-pixel sample.
@@ -186,6 +206,7 @@ pub fn fill_polygon(bitmap: &mut BitmapState, pts: &[(f64, f64)], color: [u8; 4]
         return;
     }
     let samples = (AA * AA) as u32;
+    let mut painted = false;
     for py in min_y..=max_y {
         for px in min_x..=max_x {
             let mut hits = 0u32;
@@ -203,9 +224,12 @@ pub fn fill_polygon(bitmap: &mut BitmapState, pts: &[(f64, f64)], color: [u8; 4]
             }
             let coverage = ((hits * 255) / samples) as u8;
             if coverage > 0 {
-                blend_pixel(bitmap, px, py, color, coverage, 255);
+                painted = blend_pixel_raw(bitmap, px, py, color, coverage, 255) || painted;
             }
         }
+    }
+    if painted {
+        bitmap.mark_dirty();
     }
 }
 
@@ -240,8 +264,8 @@ pub fn hatch_foreground(style: i32, x: i32, y: i32) -> bool {
         5 => diag == 0 || anti == 0,
         // 5 percent: a single dot per cell.
         6 => px == 0 && py == 0,
-        // 50 percent: an every-other-pixel grid.
-        12 => px % 2 == 0 && py % 2 == 0,
+        // 50 percent: an every-other-pixel checkerboard (32 of 64 pixels).
+        12 => (px + py) % 2 == 0,
         // Zig zag: a horizontal line on every other row.
         36 => py % 2 == 0,
         // Diagonal brick: courses run along `\` with staggered `/` head
@@ -277,6 +301,7 @@ pub fn fill_polygon_hatch(
         return;
     }
     let samples = (AA * AA) as u32;
+    let mut painted = false;
     for py in min_y..=max_y {
         for px in min_x..=max_x {
             let (mut fore_hits, mut back_hits) = (0u32, 0u32);
@@ -294,26 +319,29 @@ pub fn fill_polygon_hatch(
                 }
             }
             if fore_hits > 0 {
-                blend_pixel(
+                painted = blend_pixel_raw(
                     bitmap,
                     px,
                     py,
                     fore,
                     ((fore_hits * 255) / samples) as u8,
                     255,
-                );
+                ) || painted;
             }
             if back_hits > 0 {
-                blend_pixel(
+                painted = blend_pixel_raw(
                     bitmap,
                     px,
                     py,
                     back,
                     ((back_hits * 255) / samples) as u8,
                     255,
-                );
+                ) || painted;
             }
         }
+    }
+    if painted {
+        bitmap.mark_dirty();
     }
 }
 
@@ -348,6 +376,7 @@ pub fn stroke_polyline(
     let half = width.max(1.0) / 2.0;
     let max_px = bitmap.width.saturating_sub(1).min(i32::MAX as u32) as i32;
     let max_py = bitmap.height.saturating_sub(1).min(i32::MAX as u32) as i32;
+    let mut painted = false;
     let mut segment = |a: (f64, f64), b: (f64, f64)| {
         let min_x = (a.0.min(b.0) - half - 1.0).floor() as i32;
         let min_y = (a.1.min(b.1) - half - 1.0).floor() as i32;
@@ -365,7 +394,7 @@ pub fn stroke_polyline(
                 let d = dist_point_segment((px as f64 + 0.5, py as f64 + 0.5), a, b);
                 let coverage = ((half + 0.5 - d).clamp(0.0, 1.0) * 255.0) as u8;
                 if coverage > 0 {
-                    blend_pixel(bitmap, px, py, color, coverage, 255);
+                    painted = blend_pixel_raw(bitmap, px, py, color, coverage, 255) || painted;
                 }
             }
         }
@@ -375,6 +404,9 @@ pub fn stroke_polyline(
     }
     if closed && pts.len() >= 3 {
         segment(pts[pts.len() - 1], pts[0]);
+    }
+    if painted {
+        bitmap.mark_dirty();
     }
 }
 

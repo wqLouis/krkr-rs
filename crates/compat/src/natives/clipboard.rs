@@ -1,14 +1,10 @@
 //! `Clipboard` native class.
 //!
-//! Behavioral reference: the reference `Clipboard`
-//! (`reference/cpp/core/utils/ClipboardIntf.cpp` plus the platform
-//! `ClipboardImpl.cpp`). The reference class is a stateless, static surface
-//! over the platform clipboard: it has no native instance and only three
-//! class-level members, all of which are registered here:
+//! `Clipboard` is a stateless surface over the platform clipboard: it has no
+//! native instance and registers two class-level members:
 //!
-//! * `Clipboard` — the (no-op) constructor the parity checker counts;
-//! * `hasFormat(format)` — the reference static method (`cbfText == 1`);
-//! * `asText` — the reference static text property (get/set).
+//! * `hasFormat(format)` — the static method (`cbfText == 1`);
+//! * `asText` — the static text property (get/set).
 //!
 //! # The host seam
 //!

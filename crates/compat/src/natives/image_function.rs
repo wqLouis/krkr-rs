@@ -27,11 +27,10 @@
 //!
 //! # Rectangle arguments and results
 //!
-//! The reference reads/writes `tTJSNI_Rect` instances. This crate's `Rect`
-//! native exposes the same script-visible `left`/`top`/`right`/`bottom`
-//! members, so [`read_rect`] reads those properties (a plain dictionary with
-//! the same keys also works) and the result marshaller builds a real `Rect`
-//! object. The rectangle convention is the reference's half-open
+//! [`read_rect`] accepts a native `Rect` instance and reads its four edges
+//! directly from the engine-owned payload; a non-object or `null` argument is
+//! the default `None`, and any other object raises instead of being read by
+//! member name. The rectangle convention is half-open
 //! `[left, right) x [top, bottom)`.
 //!
 //! # Text drawing
@@ -328,6 +327,9 @@ fn with_two_bitmaps<R>(
     src_id: u32,
     f: impl FnOnce(&mut BitmapState, &BitmapState) -> R,
 ) -> Result<R, String> {
+    // Both images may still be decoding: an operation reads their pixels.
+    scene.resolve_bitmap(dst_id);
+    scene.resolve_bitmap(src_id);
     let dst_index = scene
         .bitmaps
         .iter()
@@ -860,6 +862,8 @@ extern "C" fn image_flip_lr(
         let dst_id = bitmap_arg(host, &a[0], "flipLR")?;
         let rect = read_rect(host, a.get(1))?;
         let scene = scene_mut(ctx)?;
+        // The image may still be decoding: the operation reads its pixels.
+        scene.resolve_bitmap(dst_id);
         let dst = scene
             .bitmap_mut(dst_id)
             .ok_or_else(|| format!("ImageFunction.flipLR: no bitmap {dst_id}"))?;
@@ -888,6 +892,8 @@ extern "C" fn image_flip_ud(
         let dst_id = bitmap_arg(host, &a[0], "flipUD")?;
         let rect = read_rect(host, a.get(1))?;
         let scene = scene_mut(ctx)?;
+        // The image may still be decoding: the operation reads its pixels.
+        scene.resolve_bitmap(dst_id);
         let dst = scene
             .bitmap_mut(dst_id)
             .ok_or_else(|| format!("ImageFunction.flipUD: no bitmap {dst_id}"))?;
@@ -945,6 +951,8 @@ extern "C" fn image_adjust_gamma(
         let isaddalpha = opt_bool(a, 11, false);
 
         let scene = scene_mut(ctx)?;
+        // The image may still be decoding: the operation reads its pixels.
+        scene.resolve_bitmap(dst_id);
         let dst = scene
             .bitmap_mut(dst_id)
             .ok_or_else(|| format!("ImageFunction.adjustGamma: no bitmap {dst_id}"))?;
@@ -983,6 +991,8 @@ extern "C" fn image_do_box_blur(
         let isalpha = opt_bool(a, 4, true);
 
         let scene = scene_mut(ctx)?;
+        // The image may still be decoding: the operation reads its pixels.
+        scene.resolve_bitmap(dst_id);
         let dst = scene
             .bitmap_mut(dst_id)
             .ok_or_else(|| format!("ImageFunction.doBoxBlur: no bitmap {dst_id}"))?;
@@ -1030,6 +1040,8 @@ extern "C" fn image_do_gray_scale(
         let dst_id = bitmap_arg(host, &a[0], "doGrayScale")?;
         let clip = read_rect(host, a.get(1))?;
         let scene = scene_mut(ctx)?;
+        // The image may still be decoding: the operation reads its pixels.
+        scene.resolve_bitmap(dst_id);
         let dst = scene
             .bitmap_mut(dst_id)
             .ok_or_else(|| format!("ImageFunction.doGrayScale: no bitmap {dst_id}"))?;
@@ -1059,6 +1071,8 @@ extern "C" fn image_fill_rect(
         let clip = read_rect(host, a.get(4))?;
 
         let scene = scene_mut(ctx)?;
+        // The image may still be decoding: the operation reads its pixels.
+        scene.resolve_bitmap(dst_id);
         let dst = scene
             .bitmap_mut(dst_id)
             .ok_or_else(|| format!("ImageFunction.fillRect: no bitmap {dst_id}"))?;
@@ -1112,6 +1126,8 @@ extern "C" fn image_color_rect(
         let clip = read_rect(host, a.get(5))?;
 
         let scene = scene_mut(ctx)?;
+        // The image may still be decoding: the operation reads its pixels.
+        scene.resolve_bitmap(dst_id);
         let dst = scene
             .bitmap_mut(dst_id)
             .ok_or_else(|| format!("ImageFunction.colorRect: no bitmap {dst_id}"))?;
@@ -1223,6 +1239,8 @@ extern "C" fn image_draw_text(
         };
         let mut resolver = resource_state(ctx);
         let scene = scene_mut(ctx)?;
+        // The image may still be decoding: the text is drawn into it.
+        scene.resolve_bitmap(dst_id);
         let Some(bitmap) = scene.bitmap_mut(dst_id) else {
             return Err(format!("ImageFunction.drawText: no bitmap {dst_id}"));
         };
@@ -1302,6 +1320,8 @@ extern "C" fn image_draw_glyph(
             shadow_offset,
         };
         let scene = scene_mut(ctx)?;
+        // The image may still be decoding: the text is drawn into it.
+        scene.resolve_bitmap(dst_id);
         let Some(bitmap) = scene.bitmap_mut(dst_id) else {
             return Err(format!("ImageFunction.drawGlyph: no bitmap {dst_id}"));
         };

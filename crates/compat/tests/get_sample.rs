@@ -31,6 +31,7 @@ impl Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut host = CompatHost::new();
         host.install(&engine).expect("install compat surface");
+        common::link_plugin(&engine, "getSample.dll");
         Env {
             _host: host,
             engine,

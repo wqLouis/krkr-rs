@@ -45,6 +45,7 @@ impl Env {
                 .attach_scene(scene.as_mut() as *mut Scene);
         }
         host.install(&engine).expect("install compat surface");
+        common::link_all_builtins(&engine);
         Env {
             _host: host,
             engine,
@@ -350,6 +351,7 @@ impl FontEnv {
             }
         }
         host.install(&engine).expect("install compat surface");
+        common::link_all_builtins(&engine);
         FontEnv {
             _host: host,
             engine,

@@ -5,7 +5,7 @@
 //! decodes through the bundled libvorbisfile (`wu_ov_*`), attaches as the
 //! win32 TSS sound module (`GetModuleInstance`), and its `OggVorbis` /
 //! `wuvorbis` wide strings are that module's metadata (see the module docs
-//! and `docs/plugin_host_exe.md` §2.4/§5.3). In krkr-rs the decoder creator
+//! and `docs.old/plugin_host_exe.md` §2.4/§5.3). In krkr-rs the decoder creator
 //! maps to the host decoder chain ([`compat::add_audio_decoder`]), which the
 //! composition root fills with the L1 `media` symphonia ogg/vorbis backend
 //! (`crates/app/src/audio.rs`) — the test below plays that role itself.
@@ -24,7 +24,7 @@
 //!
 //! **wuvorbis exception:** the reference ships no TJS surface for
 //! `wuvorbis.dll` (no `reference/cpp/plugins/wuvorbis*` source exists; its
-//! exports are the C decoder API, `docs/plugin_host_exe.md:137`), so these
+//! exports are the C decoder API, `docs.old/plugin_host_exe.md:137`), so these
 //! tests are **regression pins for the decode chain**, not a surface audit.
 //! Each one carries a `reference/cpp/**` citation for the core behaviour it
 //! leans on (the `ov_open_callbacks`/`ov_read` chain of
@@ -165,7 +165,7 @@ impl Env {
 /// Regression pin (no TJS surface in the reference — see the module docs):
 /// `Plugins.link("wuvorbis.dll")` must resolve like any built-in and stay
 /// idempotent, and because the reference plugin registers no class
-/// (`docs/plugin_host_exe.md:137`: 40 C exports, no `NCB_REGISTER_CLASS`),
+/// (`docs.old/plugin_host_exe.md:137`: 40 C exports, no `NCB_REGISTER_CLASS`),
 /// neither `wuvorbis` nor `OggVorbis` may appear on the VM.
 #[test]
 fn plugins_link_wuvorbis_resolves_to_the_builtin_without_a_null_object() {

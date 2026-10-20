@@ -23,20 +23,25 @@
 //! layer, and [`EngineOverlay`] supplies the render-only debug overlay. This
 //! module never names those layers.
 
+use std::sync::Arc;
 use std::time::Instant;
 
+use api::blend::BlendMode;
 use api::error::RenderError;
 use api::geometry::PixelRegion;
-use api::host::{Presentation, SurfaceEvent};
+use api::host::{PresentSkip, Presentation, SurfaceEvent};
 use render::{
-    BackendKind, FrameStats, FrameTimings, RenderNode, RenderPipeline, RenderScene, RenderState,
-    Surface, Texture, TextureDesc, TextureUpload, create_texture, drop_texture, last_frame_timings,
-    recover_surface, render, resize as resize_render, upload_textures,
+    BackendKind, FrameStats, FrameTimings, GpuCapabilities, RenderNode, RenderPipeline,
+    RenderScene, RenderState, Surface, Texture, TextureDesc, TextureUpload, capabilities,
+    create_texture, drop_texture, last_frame_timings, recover_surface, render,
+    resize as resize_render, upload_textures,
 };
 
 use crate::hasher::{Map, map};
+use crate::imagedecode::{DecodePool, DecodePoolConfig, DecodePoolError, ImageDecoder};
 use crate::projection::{ProjectionReport, project_scene_report};
 use crate::scene::Scene;
+use crate::shader::{PipelineId, Program, ProgramDesc, ShaderError, ShaderId, ShaderLibrary};
 use crate::timer::TimerState;
 use crate::translate::{PixelTranslation, TranslateError, translate_render_scene};
 
@@ -160,8 +165,10 @@ pub enum EngineError {
 /// A frame the backend presented, or the reason it did not.
 ///
 /// A backend that presents nothing but reports no error leaves the previous
-/// surface contents on screen, so the frame is counted as skipped and retried
-/// instead of being treated as an ordinary frame.
+/// surface contents on screen, so the frame is counted as skipped and reported
+/// instead of being treated as an ordinary frame. A skip is reported without a
+/// retry: nothing was submitted, so there is nothing to retry until the next
+/// frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PresentOutcome {
     /// Whether the backend presented this frame.
@@ -170,8 +177,6 @@ struct PresentOutcome {
     surface_event: Option<SurfaceEvent>,
     /// The fault to report when the frame was not presented.
     fault: Option<PresentFault>,
-    /// Whether the engine should retry the presentation this frame.
-    retry: bool,
 }
 
 /// The reason a frame was not presented.
@@ -181,6 +186,8 @@ enum PresentFault {
     Unreported,
     /// The backend named the surface event that stopped presentation.
     Surface(SurfaceEvent),
+    /// The backend abandoned the frame because the display was not ready.
+    Skipped(PresentSkip),
 }
 
 /// Reduces a backend presentation to the outcome the frame reports.
@@ -191,16 +198,14 @@ fn present_outcome(presentation: Presentation) -> PresentOutcome {
         fault: if presentation.presented {
             None
         } else {
-            Some(match presentation.surface_event {
-                Some(event) => PresentFault::Surface(event),
-                None => PresentFault::Unreported,
+            Some(match (presentation.skip, presentation.surface_event) {
+                // A skip means the backend abandoned the frame before any GPU
+                // work, so it outranks any surface event it may also carry.
+                (Some(skip), _) => PresentFault::Skipped(skip),
+                (None, Some(event)) => PresentFault::Surface(event),
+                (None, None) => PresentFault::Unreported,
             })
         },
-        retry: !presentation.presented
-            && matches!(
-                presentation.surface_event,
-                None | Some(SurfaceEvent::OutOfDate)
-            ),
     }
 }
 
@@ -243,6 +248,8 @@ pub struct Engine {
     pipeline: RenderPipeline,
     /// Layer tree owned by the engine.
     scene: Scene,
+    /// The registered shader programs and the pipelines built from them.
+    shader: ShaderLibrary,
     /// Projected render tree, rebuilt in place when
     /// [`Scene::structure_revision`] changes.
     render_scene: RenderScene,
@@ -264,6 +271,13 @@ pub struct Engine {
     textures: Map<u32, Texture>,
     /// Timer registry advanced by the frame clock.
     timer: TimerState,
+    /// The image decode pool, or `None` when no decoder is installed.
+    ///
+    /// The pool is the engine's own state: it owns the worker threads, the
+    /// queue and the byte accounting. It is absent until the composition
+    /// root installs a decoder, and the frame's image barrier is a no-op
+    /// while it is.
+    decode_pool: Option<DecodePool>,
     /// Latest script-visible input state.
     input: crate::input::InputState,
     /// Current surface size in pixels.
@@ -296,9 +310,6 @@ pub struct Engine {
     reported_present_fault: Option<PresentFault>,
     /// Consecutive frames the backend did not present.
     present_skips: u32,
-    /// Whether the most recent presentation retry failed, so a repeating
-    /// retry failure is logged once.
-    present_retry_failed: bool,
 }
 
 impl Engine {
@@ -322,10 +333,15 @@ impl Engine {
             overlay,
         } = parts;
         let surface_size = (surface_size.0.max(1), surface_size.1.max(1));
-        let scene = Scene::default();
+        let mut scene = Scene::default();
+        // A backend that draws the projected scene composites a running
+        // transition's frame from the projection; the headless CPU path blends
+        // the layer's display bitmap instead.
+        scene.composite_transition_frames = pipeline.backend() != BackendKind::Null;
         let mut engine = Self {
             pipeline,
             scene,
+            shader: ShaderLibrary::new(),
             render_scene: RenderScene::with_root_node(),
             render_scene_revision: None,
             drawn_layers: Vec::new(),
@@ -333,6 +349,7 @@ impl Engine {
             render_state,
             textures: map(),
             timer: TimerState::new(),
+            decode_pool: None,
             input: crate::input::InputState::default(),
             surface_size,
             now_ms: 0,
@@ -347,7 +364,6 @@ impl Engine {
             presentation_skipped_logged: false,
             reported_present_fault: None,
             present_skips: 0,
-            present_retry_failed: false,
         };
         let event = resize_render(
             &engine.pipeline,
@@ -360,7 +376,133 @@ impl Engine {
         // backend actually took rather than the size we asked for.
         engine.surface_size = reported_surface_size(event, surface_size);
         engine.sync_presentation();
+        engine.install_effect_pipelines();
         Ok(engine)
+    }
+
+    /// Creates the pipelines for the programs the engine ships.
+    ///
+    /// The choice is the backend's: a backend that cannot run effect
+    /// pipelines gets none, and the transitions blend their display bitmap on
+    /// the CPU, the way they always have. A backend that can, but refuses one
+    /// of the programs, is reported and the transitions that need it fall
+    /// back to the CPU as well; nothing is drawn with a program the driver
+    /// rejected.
+    fn install_effect_pipelines(&mut self) {
+        if !capabilities(&self.pipeline).supports_effect_pipelines {
+            log::info!(
+                "transitions: this backend cannot run effect pipelines; the display bitmap is \
+                 blended on the CPU"
+            );
+            return;
+        }
+        for program in [Program::CrossFade, Program::Scroll] {
+            let shader = match self.shader.load(program.desc()) {
+                Ok(shader) => shader,
+                Err(error) => {
+                    log::error!(
+                        "transitions: the {:?} program was refused: {error}",
+                        program.name()
+                    );
+                    return;
+                }
+            };
+            let pipeline = match self.shader.pipeline(
+                &self.pipeline,
+                &mut self.render_state,
+                shader,
+                BlendMode::SourceOver,
+            ) {
+                Ok(pipeline) => pipeline,
+                Err(error) => {
+                    log::error!(
+                        "transitions: the {:?} program has no pipeline: {error}",
+                        program.name()
+                    );
+                    return;
+                }
+            };
+            let handle = self.shader.pipeline_handle(pipeline).cloned();
+            let Some(handle) = handle else {
+                log::error!(
+                    "transitions: the {:?} program has no pipeline handle",
+                    program.name()
+                );
+                return;
+            };
+            self.scene.effect_pipelines.insert(program, handle);
+        }
+    }
+
+    /// The backend's capabilities.
+    pub fn capabilities(&self) -> GpuCapabilities {
+        capabilities(&self.pipeline)
+    }
+
+    /// Installs the image decoder and starts the decode pool.
+    ///
+    /// The decoder is the bottom codec the pool drives; the composition root
+    /// supplies it, because the concrete implementation lives in the bottom
+    /// media layer. Installing a second decoder replaces the first pool, and
+    /// the jobs the old pool had not finished are cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodePoolError`] when the pool cannot be started.
+    pub fn install_decoder(
+        &mut self,
+        decoder: Arc<dyn ImageDecoder>,
+        config: DecodePoolConfig,
+    ) -> Result<(), DecodePoolError> {
+        self.decode_pool = Some(DecodePool::new(decoder, config)?);
+        Ok(())
+    }
+
+    /// The image decode pool, or `None` when no decoder is installed.
+    pub fn decode_pool(&self) -> Option<&DecodePool> {
+        self.decode_pool.as_ref()
+    }
+
+    /// The image decode pool, mutably, or `None` when no decoder is
+    /// installed.
+    ///
+    /// The pool's submit and cancel actions need the mutable borrow; the
+    /// compatibility layer reaches the pool through the same attachment the
+    /// scene and the timer use.
+    pub fn decode_pool_mut(&mut self) -> Option<&mut DecodePool> {
+        self.decode_pool.as_mut()
+    }
+
+    /// Registers a shader program and returns its identity.
+    ///
+    /// Registration validates the descriptor and copies the stage code, so
+    /// the program outlives the buffers it was loaded from. It does not touch
+    /// the backend: the pipeline comes from [`Engine::effect_pipeline`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShaderError`] when the descriptor is not usable.
+    pub fn load_shader(&mut self, desc: ProgramDesc<'_>) -> Result<ShaderId, ShaderError> {
+        self.shader.load(desc)
+    }
+
+    /// The pipeline for `shader` built with `blend`, created on first use.
+    ///
+    /// The blend is part of the backend's pipeline object, so the same program
+    /// drawn with two blends needs two pipelines.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShaderError`] when the program is unknown, when the backend
+    /// cannot build effect pipelines at all, or when the driver refuses the
+    /// program.
+    pub fn effect_pipeline(
+        &mut self,
+        shader: ShaderId,
+        blend: BlendMode,
+    ) -> Result<PipelineId, ShaderError> {
+        self.shader
+            .pipeline(&self.pipeline, &mut self.render_state, shader, blend)
     }
 
     /// Advances the frame clock by `dt_ms` and draws one frame.
@@ -423,6 +565,11 @@ impl Engine {
         hooks
             .before_render(now_ms, dt_ms)
             .map_err(EngineError::Frame)?;
+        // The image barrier: every image the hook queued is decoded before
+        // the upload and the projection, so the frame draws decoded pixels.
+        // The decodes run concurrently, so the wait is the time the last one
+        // needs rather than the sum of them.
+        self.scene.resolve_pending_images();
         self.sync_presentation();
 
         if self.translation.is_none() {
@@ -491,12 +638,13 @@ impl Engine {
             &self.render_scene,
         ) {
             Ok(presentation) => present_outcome(presentation),
-            // A swapchain that could not be rebuilt is retried below and on
-            // the next frame; the backend logged the precise cause when it
-            // happened.
+            // A swapchain that could not be rebuilt is reported here and
+            // retried by the next frame's render call; the backend logged the
+            // precise cause when it happened.
             Err(RenderError::SurfaceOutOfDate) => present_outcome(Presentation {
                 presented: false,
                 surface_event: Some(SurfaceEvent::OutOfDate),
+                skip: None,
             }),
             Err(error) => return Err(error.into()),
         };
@@ -515,26 +663,9 @@ impl Engine {
                 );
             }
             self.present_skips = 0;
-            self.present_retry_failed = false;
         } else {
             self.present_skips = self.present_skips.saturating_add(1);
             self.report_present_fault(outcome.fault);
-            if outcome.retry {
-                match resize_render(
-                    &self.pipeline,
-                    &self.surface,
-                    &mut self.render_state,
-                    self.surface_size,
-                ) {
-                    Ok(_) => self.present_retry_failed = false,
-                    Err(error) => {
-                        if !self.present_retry_failed {
-                            log::error!("engine: retrying the presentation failed: {error}");
-                            self.present_retry_failed = true;
-                        }
-                    }
-                }
-            }
         }
         let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -566,6 +697,14 @@ impl Engine {
             PresentFault::Unreported => {
                 log::warn!("engine: the backend presented no frame and reported no surface event")
             }
+            // A skipped frame is not a fault: the backend abandoned it before
+            // submitting anything and the previous image stays on screen. It
+            // is reported once per episode so a display that stops releasing
+            // images is visible in the log.
+            PresentFault::Skipped(PresentSkip::AcquireTimeout) => log::warn!(
+                "engine: the display did not release a swapchain image within the \
+                 presentation budget; this frame was skipped"
+            ),
             PresentFault::Surface(SurfaceEvent::Lost) => log::warn!(
                 "engine: the presentation surface was lost; this frame was not presented"
             ),
@@ -1020,7 +1159,7 @@ mod tests {
     use super::{
         PresentFault, Scene, clear_uploaded_dirty, present_outcome, reported_surface_size,
     };
-    use api::host::{Presentation, SurfaceEvent};
+    use api::host::{PresentSkip, Presentation, SurfaceEvent};
 
     #[test]
     fn a_failed_upload_leaves_every_bitmap_dirty_for_a_retry() {
@@ -1052,16 +1191,16 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_the_backend_did_not_present_is_reported_and_retried() {
+    fn a_frame_the_backend_did_not_present_is_reported() {
         // reference/cpp/core/visual/impl/VSyncTimingThread.cpp:114,141-142
         // The reference presents on every vsync wake; a wake that produced no
         // frame is a skipped, reported frame rather than a normal one.
         let outcome = present_outcome(Presentation {
             presented: false,
             surface_event: Some(SurfaceEvent::OutOfDate),
+            skip: None,
         });
         assert!(!outcome.presented);
-        assert!(outcome.retry);
         assert_eq!(
             outcome.fault,
             Some(PresentFault::Surface(SurfaceEvent::OutOfDate))
@@ -1070,30 +1209,48 @@ mod tests {
         let normal = present_outcome(Presentation {
             presented: true,
             surface_event: None,
+            skip: None,
         });
         assert!(normal.presented);
-        assert!(!normal.retry);
         assert_eq!(normal.fault, None);
     }
 
     #[test]
-    fn a_lost_surface_is_recovered_without_a_second_swapchain_rebuild() {
+    fn a_frame_the_display_never_released_is_skipped_and_reported() {
+        // reference/cpp/core/visual/impl/BasicDrawDevice.cpp:244
+        // The reference's present never blocks on the display, so an image the
+        // presentation engine does not release is a missed frame, not a stall
+        // and not a surface fault.
+        let skipped = present_outcome(Presentation {
+            presented: false,
+            surface_event: None,
+            skip: Some(PresentSkip::AcquireTimeout),
+        });
+        assert!(!skipped.presented);
+        assert_eq!(skipped.surface_event, None);
+        assert_eq!(
+            skipped.fault,
+            Some(PresentFault::Skipped(PresentSkip::AcquireTimeout))
+        );
+    }
+
+    #[test]
+    fn a_lost_surface_is_reported_as_a_surface_fault_that_recovery_owns() {
+        // The engine recovers from `surface_event`, never by rebuilding the
+        // swapchain a second time inside the frame.
         let lost = present_outcome(Presentation {
             presented: false,
             surface_event: Some(SurfaceEvent::Lost),
+            skip: None,
         });
         assert!(!lost.presented);
-        assert!(
-            !lost.retry,
-            "recovering the surface already rebuilt the swapchain"
-        );
         assert_eq!(lost.fault, Some(PresentFault::Surface(SurfaceEvent::Lost)));
 
         let unreported = present_outcome(Presentation {
             presented: false,
             surface_event: None,
+            skip: None,
         });
         assert_eq!(unreported.fault, Some(PresentFault::Unreported));
-        assert!(unreported.retry);
     }
 }

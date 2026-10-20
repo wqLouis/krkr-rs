@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 
+use crate::engine_api::DecodePool;
 use crate::engine_api::InputState;
 use crate::engine_api::Scene;
 use crate::engine_api::TimerId;
@@ -198,6 +199,20 @@ pub(crate) fn scene_mut<'a>(ctx: &CompatCtx) -> Result<&'a mut Scene, String> {
         .ok_or_else(|| "visual: no scene attached".to_string())?;
     // SAFETY: see above.
     Ok(unsafe { &mut *ptr })
+}
+
+/// The attached L2 image decode pool, mutably.
+///
+/// `None` when the host attached no pool: the loads then decode
+/// synchronously, exactly as they did before the pool existed.
+pub(crate) fn decode_pool_mut<'a>(ctx: &CompatCtx) -> Option<&'a mut DecodePool> {
+    // SAFETY: the host keeps the attached pool alive for the binding's
+    // lifetime and the VM is single-threaded (the documented
+    // `attach_decode_pool` contract), so forming the borrow is sound
+    // within the callback.
+    let ptr = unsafe { ctx.services() }.decode_pool()?;
+    // SAFETY: see above.
+    Some(unsafe { &mut *ptr })
 }
 
 /// The attached L2 scene, shared.

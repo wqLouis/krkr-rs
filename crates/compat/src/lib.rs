@@ -108,9 +108,12 @@ pub enum CompatError {
     Engine(String),
 }
 
-/// Register the built-in compatibility surface on the VM: the `Plugins`
-/// native class and the null-plugin hook.
+/// Register the built-in compatibility surface on the VM: the core native
+/// classes, the `Plugins` class, the null-plugin hook, and the one plugin
+/// module available before any script runs
+/// ([`natives::plugins::STARTUP_PLUGINS`]).
 ///
+/// Every other built-in plugin's members appear on the first `Plugins.link`.
 /// Called by [`CompatHost::install`]; idempotence is the caller's
 /// responsibility (class registration rejects duplicates).
 pub fn install(ctx: &mut CompatCtx) -> Result<(), CompatError> {

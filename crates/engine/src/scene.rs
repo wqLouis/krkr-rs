@@ -7,15 +7,23 @@
 //! no-ops.
 //!
 //! The module is deliberately backend-free and Bevy-free. It knows nothing
-//! about rendering, script objects or native registration: the L1
+//! about drawing, script objects or native registration: the L1
 //! `RenderPipeline` consumes a projected scene tree elsewhere, and the L3
-//! `compat` native adapter calls into these operations.
+//! `compat` native adapter calls into these operations. The one renderer
+//! object it names is the effect pipeline handle a layer's custom-shader draw
+//! binds ([`Scene::effect_pipelines`]); the handle is a value the projection
+//! passes on, not a service the scene calls.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use api::blend::BlendMode;
 use api::config::CacheLimit;
 use api::media::DecodedImage;
+
+use crate::imagedecode::{ImageOutcome, ImageSizeError, PendingImage};
+use crate::shader::{EffectDraw, EffectPipelines};
+use crate::trans::Trans;
 
 /// One logical window.
 #[derive(Debug, Clone)]
@@ -215,6 +223,19 @@ pub struct LayerState {
     /// `None` until the transition first needs one; the transition clears it
     /// when it ends ([`Scene::set_transition_self_image`]).
     pub transition_self: Option<u32>,
+    /// The frame a running transition draws, when the host composites it
+    /// instead of blending [`Self::cache_bitmap`] or [`Self::transition_self`]
+    /// pixel by pixel. [`Scene::composite_transition_frames`] selects which of
+    /// the two carries the frame; the projection draws the two source images
+    /// this describes in place of the layer's image. `None` while no
+    /// composited transition runs ([`Scene::set_transition_frame`]).
+    pub transition_frame: Option<TransitionFrame>,
+    /// The custom-shader draw a running transition composites, when the
+    /// backend can run effect pipelines. The projection draws its passes in
+    /// place of the layer's image; the layer keeps its bitmap untouched, so
+    /// the transition costs no per-tick pixel work. `None` while no such
+    /// transition runs ([`Scene::set_effect`]).
+    pub effect: Option<EffectDraw>,
     /// Reference `CacheRecalcRegion`: the subtree content must be
     /// recomposited before it is used again. Set for this layer and every
     /// caching ancestor whenever the layer changes, and cleared when the
@@ -277,6 +298,76 @@ impl LayerState {
     }
 }
 
+/// One source image of a [`TransitionFrame`].
+///
+/// The rectangles are in the frame's pixel space: `dst` is the rectangle the
+/// source occupies inside the frame and `src` is the sub-rectangle of
+/// `bitmap` it samples. The two have the same size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct TransitionSource {
+    /// Bitmap the source samples.
+    pub bitmap: u32,
+    /// Sub-rectangle of `bitmap` to sample, in bitmap pixels.
+    pub src: Rect,
+    /// Rectangle the source occupies inside the frame, in frame pixels.
+    pub dst: Rect,
+    /// Opacity of the source inside the frame, `0.0..=1.0`. A source with
+    /// zero opacity draws nothing; a source at full opacity is an independent
+    /// placement rather than a fade over the source drawn before it.
+    pub alpha: f32,
+}
+
+impl TransitionSource {
+    /// Builds one source draw of a transition frame.
+    pub fn new(bitmap: u32, src: Rect, dst: Rect, alpha: f32) -> Self {
+        Self {
+            bitmap,
+            src,
+            dst,
+            alpha,
+        }
+    }
+}
+
+/// The current frame of a running transition, drawn by the projection in
+/// place of a display bitmap.
+///
+/// The frame composites two source images: [`Self::src1`] is drawn first and
+/// [`Self::src2`] over it at its own alpha. A whole-subtree transition covers
+/// the layer's rect; a transition without children stands in for the layer's
+/// own image at the main image's placement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct TransitionFrame {
+    /// Frame size in pixels — the coordinate space of both sources' `dst`.
+    pub size: (u32, u32),
+    /// Whether the frame covers the layer's whole rect instead of being placed
+    /// like the layer's own image.
+    pub covers_layer: bool,
+    /// The image the frame starts from.
+    pub src1: TransitionSource,
+    /// The image composited over [`Self::src1`] as the transition advances.
+    pub src2: TransitionSource,
+}
+
+impl TransitionFrame {
+    /// Builds a transition frame of `size` pixels.
+    pub fn new(
+        size: (u32, u32),
+        covers_layer: bool,
+        src1: TransitionSource,
+        src2: TransitionSource,
+    ) -> Self {
+        Self {
+            size,
+            covers_layer,
+            src1,
+            src2,
+        }
+    }
+}
+
 /// One decoded bitmap (RGBA8, straight alpha).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -304,6 +395,13 @@ pub struct BitmapState {
     /// image edit that did not go through a layer accessor still invalidates
     /// the cache.
     pub content_generation: u64,
+    /// The decode whose pixels have not landed yet, or `None` when the
+    /// bitmap holds its pixels.
+    ///
+    /// A pending bitmap carries the probed dimensions and no pixels: every
+    /// read of the pixels waits for the decode through
+    /// [`Scene::resolve_bitmap`].
+    pub pending: Option<PendingImage>,
 }
 
 impl BitmapState {
@@ -319,6 +417,7 @@ impl BitmapState {
             dirty: false,
             script_owned: false,
             content_generation: 0,
+            pending: None,
         }
     }
 
@@ -333,6 +432,49 @@ impl BitmapState {
     pub fn pixel_offset(&self, x: u32, y: u32) -> Option<usize> {
         (x < self.width && y < self.height)
             .then_some((y as usize * self.width as usize + x as usize) * 4)
+    }
+}
+
+/// The number of bytes an image of `width` x `height` RGBA8 pixels holds.
+///
+/// `None` when the count is not representable, so a caller can refuse the
+/// size instead of wrapping it.
+fn image_pixel_bytes(width: u32, height: u32) -> Option<usize> {
+    usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)
+        .and_then(|pixels| pixels.checked_mul(4))
+}
+
+/// A fully transparent image of `width` x `height` pixels.
+///
+/// It stands in for an image whose decode failed or was cancelled: the
+/// bitmap keeps the size the header probe reported, and every pixel is
+/// transparent. `None` when the image cannot be allocated.
+fn blank_transparent(width: u32, height: u32) -> Option<Vec<u8>> {
+    let count = image_pixel_bytes(width, height)?;
+    let mut blank = Vec::new();
+    if blank.try_reserve_exact(count).is_err() {
+        return None;
+    }
+    blank.resize(count, 0);
+    Some(blank)
+}
+
+/// Installs a blank transparent image of the bitmap's own size.
+///
+/// The bitmap keeps its size and its pixels become transparent. A blank that
+/// cannot be allocated leaves the bitmap without pixels, which the frame's
+/// upload reports as an inconsistent bitmap.
+fn install_blank(bitmap: &mut BitmapState) {
+    let width = bitmap.width;
+    let height = bitmap.height;
+    match blank_transparent(width, height) {
+        Some(blank) => bitmap.rgba = blank,
+        None => {
+            log::error!("engine: a blank {width}x{height} image could not be allocated");
+            bitmap.rgba = Vec::new();
+        }
     }
 }
 
@@ -549,6 +691,18 @@ pub struct Scene {
     bitmap_index: crate::hasher::Map<u32, usize>,
     /// `font.id` → index into `fonts`.
     font_index: crate::hasher::Map<u32, usize>,
+    /// Whether a running transition is drawn from
+    /// [`LayerState::transition_frame`] instead of a CPU-blended display
+    /// bitmap. A host that draws the projected scene turns it on; the
+    /// headless CPU path leaves it off and blends the display bitmap itself.
+    pub composite_transition_frames: bool,
+    /// The backend handles of the programs the layers' custom-shader draws
+    /// name.
+    ///
+    /// The engine fills the table when it creates the pipelines for the
+    /// programs it ships; a table without an entry means the backend cannot
+    /// run effect pipelines, and a transition that needs one blends on the CPU.
+    pub effect_pipelines: EffectPipelines,
     /// Decoded-image cache (the reference graphic cache).
     image_cache: DecodedImageCache,
     /// Monotonic counter bumped by every change to the tree's structure (see
@@ -574,6 +728,8 @@ impl Default for Scene {
             layer_index: crate::hasher::map(),
             bitmap_index: crate::hasher::map(),
             font_index: crate::hasher::map(),
+            composite_transition_frames: false,
+            effect_pipelines: EffectPipelines::new(),
             image_cache: DecodedImageCache::default(),
             structure_revision: 0,
             content_revision: 0,
@@ -766,6 +922,8 @@ impl Scene {
             cache_bitmap: None,
             cache_content: None,
             transition_self: None,
+            transition_frame: None,
+            effect: None,
             cache_recalc: false,
             cache_source_generation: 0,
             hint: String::new(),
@@ -1417,7 +1575,18 @@ impl Scene {
         let Some(layer) = self.layer(id) else {
             return;
         };
-        let (win, parent, domain, font_id, bitmap, cache_bitmap, cache_content, transition_self) = (
+        let (
+            win,
+            parent,
+            domain,
+            font_id,
+            bitmap,
+            cache_bitmap,
+            cache_content,
+            transition_self,
+            transition_frame,
+            effect,
+        ) = (
             layer.window,
             layer.parent,
             layer.domain,
@@ -1426,6 +1595,8 @@ impl Scene {
             layer.cache_bitmap,
             layer.cache_content,
             layer.transition_self,
+            layer.transition_frame,
+            layer.effect.clone(),
         );
         let children = layer.children.clone();
         // `Part()`: sever this layer from its parent (or the window roots).
@@ -1471,6 +1642,18 @@ impl Scene {
         // The transition self image is layer-owned too.
         if let Some(self_image) = transition_self {
             self.release_bitmap(self_image);
+        }
+        // The transition frame names the transition's two sources; they are
+        // released when nothing else still holds them.
+        if let Some(frame) = transition_frame {
+            self.release_bitmap(frame.src1.bitmap);
+            self.release_bitmap(frame.src2.bitmap);
+        }
+        // The effect draw names the transition's sources as well.
+        if let Some(effect) = &effect {
+            for bitmap in effect.bitmaps() {
+                self.release_bitmap(bitmap);
+            }
         }
         // The removed layer owns its lazily-allocated font; drop it with the
         // layer (a surviving child keeps its own font).
@@ -1612,6 +1795,12 @@ impl Scene {
                     .chain(layer.cache_bitmap)
                     .chain(layer.cache_content)
                     .chain(layer.transition_self)
+                    .chain(
+                        layer
+                            .transition_frame
+                            .into_iter()
+                            .flat_map(|frame| [frame.src1.bitmap, frame.src2.bitmap]),
+                    )
             })
             .collect();
         // Drop the doomed ids from every surviving layer's child list and
@@ -2089,9 +2278,203 @@ impl Scene {
             dirty: true,
             script_owned: false,
             content_generation: 0,
+            pending: None,
         });
         self.touch_structure();
         id
+    }
+
+    /// Adds a bitmap whose pixels are still being decoded and returns its new
+    /// id.
+    ///
+    /// The bitmap starts with the probed `width` x `height` and no pixels:
+    /// the decode result lands in it when [`Scene::resolve_bitmap`] runs.
+    /// The bitmap is dirty, so the frame's upload sends the resolved pixels
+    /// to the texture in the same frame.
+    ///
+    /// The pending image must come from a running decode: it is the future
+    /// the result is published into, and a wait on it ends when that decode
+    /// finishes or is cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImageSizeError::TooLarge`] when the pixel count of the
+    /// probed size is not representable. The caller then decodes
+    /// synchronously and uses [`Scene::add_bitmap`].
+    pub fn add_pending_bitmap(
+        &mut self,
+        width: u32,
+        height: u32,
+        pending: PendingImage,
+    ) -> Result<u32, ImageSizeError> {
+        if image_pixel_bytes(width, height).is_none() {
+            return Err(ImageSizeError::TooLarge { width, height });
+        }
+        let id = self.next_bitmap;
+        self.next_bitmap += 1;
+        self.bitmap_index.insert(id, self.bitmaps.len());
+        self.bitmaps.push(BitmapState {
+            id,
+            width,
+            height,
+            rgba: Vec::new(),
+            name: None,
+            dirty: true,
+            script_owned: false,
+            content_generation: 0,
+            pending: Some(pending),
+        });
+        self.touch_structure();
+        Ok(id)
+    }
+
+    /// Returns the cached decoded image for `key`, or `None` when the cache
+    /// is disabled or holds no entry for the key.
+    ///
+    /// The entry is marked most recently used, exactly as
+    /// [`Scene::cached_decoded_image`] does on a hit, and the caller receives
+    /// an owned copy. A caller that wants to decide *how* the image is
+    /// produced — a decode it can defer, for instance — looks the entry up
+    /// here and only decodes on a miss.
+    pub fn lookup_decoded_image(&mut self, key: &DecodedImageKey) -> Option<DecodedImage> {
+        if !self.image_cache.enabled() {
+            return None;
+        }
+        self.image_cache.take_copy(key)
+    }
+
+    /// Puts a pending decode on an existing bitmap.
+    ///
+    /// The bitmap takes the probed `width` x `height` and no pixels: the
+    /// decode result lands in it when [`Scene::resolve_bitmap`] runs. A
+    /// pending decode the bitmap already carries is cancelled, because the
+    /// new one supersedes it.
+    ///
+    /// Returns whether the bitmap was present.
+    pub fn set_pending_image(
+        &mut self,
+        id: u32,
+        width: u32,
+        height: u32,
+        pending: PendingImage,
+    ) -> bool {
+        let Some(bitmap) = self.bitmap_mut_untracked(id) else {
+            return false;
+        };
+        if let Some(previous) = bitmap.pending.take() {
+            previous.cancel();
+        }
+        bitmap.width = width;
+        bitmap.height = height;
+        bitmap.rgba = Vec::new();
+        bitmap.pending = Some(pending);
+        bitmap.mark_dirty();
+        self.touch_structure();
+        true
+    }
+
+    /// Marks a bitmap as owned by a script `Bitmap` object.
+    ///
+    /// The flag is set without resolving a pending image, so a script object
+    /// can take ownership of a bitmap whose decode is still running. Returns
+    /// whether the bitmap was present.
+    pub fn set_bitmap_script_owned(&mut self, id: u32) -> bool {
+        let Some(bitmap) = self.bitmap_mut_untracked(id) else {
+            return false;
+        };
+        bitmap.script_owned = true;
+        true
+    }
+
+    /// The pending image of a bitmap, or `None` when it holds its pixels.
+    pub fn pending_image(&self, id: u32) -> Option<&PendingImage> {
+        self.bitmap(id).and_then(|bitmap| bitmap.pending.as_ref())
+    }
+
+    /// Waits for one bitmap's pending image and installs its pixels.
+    ///
+    /// The wait is on that image alone. A decode that failed installs a blank
+    /// transparent image of the probed size and reports the failure in the
+    /// log; a cancelled decode installs the same blank. A bitmap without a
+    /// pending image is left alone.
+    ///
+    /// Returns whether the bitmap exists.
+    pub fn resolve_bitmap(&mut self, id: u32) -> bool {
+        let Some(pending) = self.bitmap(id).and_then(|bitmap| bitmap.pending.clone()) else {
+            return self.bitmap(id).is_some();
+        };
+        // The caller waits, so the job is demanded and a worker prefers it
+        // over the normal jobs in the queue.
+        pending.demand();
+        let outcome = pending.await_ready();
+        let Some(bitmap) = self.bitmap_mut_untracked(id) else {
+            return false;
+        };
+        if bitmap.pending.take().is_none() {
+            // Another caller resolved the same image first.
+            return true;
+        }
+        let width = bitmap.width;
+        let height = bitmap.height;
+        match outcome {
+            ImageOutcome::Ready(image) => {
+                let expected = (width as usize)
+                    .checked_mul(height as usize)
+                    .and_then(|pixels| pixels.checked_mul(4));
+                match expected {
+                    Some(expected) if expected == image.rgba.len() => {
+                        let decoded = match Arc::try_unwrap(image) {
+                            Ok(decoded) => decoded,
+                            Err(shared) => (*shared).clone(),
+                        };
+                        bitmap.rgba = decoded.rgba;
+                    }
+                    _ => {
+                        log::error!(
+                            "engine: the decoded image of a {width}x{height} bitmap does not \
+                             match the probed size; the bitmap stays blank"
+                        );
+                        install_blank(bitmap);
+                    }
+                }
+            }
+            ImageOutcome::Failed(message) => {
+                log::error!("engine: an image decode failed: {message}");
+                install_blank(bitmap);
+            }
+            ImageOutcome::Cancelled => {
+                log::warn!("engine: an image decode was cancelled before it produced pixels");
+                install_blank(bitmap);
+            }
+        }
+        bitmap.mark_dirty();
+        // The pixels landed, so the bitmap's content changed; the structure
+        // revision moves with it because the projection's texture table may
+        // have skipped the bitmap while it had no pixels.
+        self.touch_content();
+        self.touch_structure();
+        true
+    }
+
+    /// Waits for every pending image and installs the pixels.
+    ///
+    /// The decodes run concurrently, so the wait is the time the last one
+    /// needs rather than the sum of them. Returns the number of images that
+    /// were resolved.
+    pub fn resolve_pending_images(&mut self) -> usize {
+        let ids: Vec<u32> = self
+            .bitmaps
+            .iter()
+            .filter(|bitmap| bitmap.pending.is_some())
+            .map(|bitmap| bitmap.id)
+            .collect();
+        let mut resolved = 0;
+        for id in ids {
+            if self.resolve_bitmap(id) {
+                resolved += 1;
+            }
+        }
+        resolved
     }
 
     /// Resize a bitmap in place, preserving the overlapping top-left region
@@ -2104,14 +2487,23 @@ impl Scene {
     pub fn resize_bitmap(&mut self, id: u32, width: u32, height: u32, fill: [u8; 4]) -> bool {
         let width = width.max(1);
         let height = height.max(1);
-        let Some(old) = self.bitmap(id) else {
+        let Some((old_w, old_h)) = self
+            .bitmap(id)
+            .map(|bitmap| (bitmap.width as usize, bitmap.height as usize))
+        else {
             return false;
         };
-        if old.width == width && old.height == height {
+        if old_w == width as usize && old_h == height as usize {
             return true;
         }
-        let old_w = old.width as usize;
-        let old_h = old.height as usize;
+        // A pending decode is cancelled: the resize replaces the pixels the
+        // decode would have filled.
+        if let Some(pending) = self.bitmap(id).and_then(|bitmap| bitmap.pending.clone()) {
+            pending.cancel();
+            if let Some(bitmap) = self.bitmap_mut_untracked(id) {
+                bitmap.pending = None;
+            }
+        }
         let copy_w = old_w.min(width as usize);
         let copy_h = old_h.min(height as usize);
         let Some(bytes) = (width as usize).checked_mul(height as usize) else {
@@ -2338,13 +2730,25 @@ impl Scene {
 
     /// Remove a bitmap unconditionally (the low-level primitive behind
     /// [`Scene::release_bitmap`]). Keeps the id→index map consistent and
-    /// bumps [`Scene::structure_revision`]. Returns true when the bitmap was
-    /// present.
+    /// bumps [`Scene::structure_revision`]. A pending decode is cancelled, so
+    /// a waiter on it does not wait for pixels nobody will read. Returns true
+    /// when the bitmap was present.
     pub fn remove_bitmap(&mut self, id: u32) -> bool {
         let before = self.bitmaps.len();
-        self.bitmaps.retain(|bitmap| bitmap.id != id);
+        let mut pending: Option<PendingImage> = None;
+        self.bitmaps.retain_mut(|bitmap| {
+            if bitmap.id == id {
+                pending = bitmap.pending.take();
+                false
+            } else {
+                true
+            }
+        });
         if self.bitmaps.len() == before {
             return false;
+        }
+        if let Some(pending) = pending {
+            pending.cancel();
         }
         self.bitmap_index.clear();
         for (index, bitmap) in self.bitmaps.iter().enumerate() {
@@ -2355,13 +2759,21 @@ impl Scene {
     }
 
     /// Whether any live layer still references `id` as its MainImage, its
-    /// subtree cache or its transition self image.
+    /// subtree cache, its transition self image or a source of its transition
+    /// frame or effect draw.
     pub fn bitmap_referenced_by_layer(&self, id: u32) -> bool {
         self.layers.iter().any(|layer| {
             layer.bitmap == Some(id)
                 || layer.cache_bitmap == Some(id)
                 || layer.cache_content == Some(id)
                 || layer.transition_self == Some(id)
+                || layer
+                    .transition_frame
+                    .is_some_and(|frame| frame.src1.bitmap == id || frame.src2.bitmap == id)
+                || layer
+                    .effect
+                    .as_ref()
+                    .is_some_and(|effect| effect.bitmaps().any(|bitmap| bitmap == id))
         })
     }
 
@@ -2588,6 +3000,9 @@ impl Scene {
     /// [`Scene::structure_revision`]; every replace bumps
     /// [`Scene::content_revision`]. Script ownership is left alone. Returns
     /// `false` when the bitmap is gone.
+    ///
+    /// A pending decode is cancelled: the replaced image supersedes it, and
+    /// a waiter on it sees the cancellation instead of the stale pixels.
     pub fn replace_bitmap_image(
         &mut self,
         id: u32,
@@ -2601,6 +3016,9 @@ impl Scene {
         let Some(bitmap) = self.bitmap_mut(id) else {
             return false;
         };
+        if let Some(pending) = bitmap.pending.take() {
+            pending.cancel();
+        }
         bitmap.width = width;
         bitmap.height = height;
         bitmap.rgba = rgba;
@@ -2714,6 +3132,107 @@ impl Scene {
             if let Some(old) = replaced {
                 self.release_bitmap(old);
             }
+        }
+    }
+
+    /// Set (or clear) the frame a running transition draws on `id`.
+    ///
+    /// A changed frame marks the layer's cache and every caching ancestor's
+    /// stale and bumps [`Scene::structure_revision`], so the projection redraws
+    /// the two source images the frame advances to. A source the outgoing frame
+    /// named and the new one does not is released once nothing else holds it;
+    /// the transition's own sources keep their owners' references.
+    pub fn set_transition_frame(&mut self, id: u32, frame: Option<TransitionFrame>) {
+        let mut replaced = None;
+        let changed = match self.layer_mut_untracked(id) {
+            Some(layer) if layer.transition_frame != frame => {
+                replaced = layer.transition_frame;
+                layer.transition_frame = frame;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.invalidate_layer_cache(id);
+            self.touch_structure();
+            if let Some(replaced) = replaced {
+                let kept = frame.map(|frame| [frame.src1.bitmap, frame.src2.bitmap]);
+                for bitmap in [replaced.src1.bitmap, replaced.src2.bitmap] {
+                    if kept.is_some_and(|kept| kept.contains(&bitmap)) {
+                        continue;
+                    }
+                    self.release_bitmap(bitmap);
+                }
+            }
+        }
+    }
+
+    /// Set (or clear) the custom-shader draw a running transition composites
+    /// on `id`.
+    ///
+    /// A changed draw marks the layer's cache and every caching ancestor's
+    /// stale and bumps [`Scene::structure_revision`], so the projection
+    /// redraws it. A source the outgoing draw named and the new one does not
+    /// is released once nothing else holds it; the transition's own sources
+    /// keep their owners' references.
+    pub fn set_effect(&mut self, id: u32, effect: Option<EffectDraw>) {
+        let kept: Vec<u32> = effect
+            .as_ref()
+            .map(|effect| effect.bitmaps().collect())
+            .unwrap_or_default();
+        let unchanged = match self.layer(id) {
+            Some(layer) => layer.effect.as_ref() == effect.as_ref(),
+            None => true,
+        };
+        let mut replaced = None;
+        let changed = if unchanged {
+            false
+        } else if let Some(layer) = self.layer_mut_untracked(id) {
+            replaced = layer.effect.take();
+            layer.effect = effect;
+            true
+        } else {
+            false
+        };
+        if changed {
+            self.invalidate_layer_cache(id);
+            self.touch_structure();
+            if let Some(replaced) = replaced {
+                for bitmap in replaced.bitmaps() {
+                    if kept.contains(&bitmap) {
+                        continue;
+                    }
+                    self.release_bitmap(bitmap);
+                }
+            }
+        }
+    }
+
+    /// The custom-shader draw a transition composites at its current phase,
+    /// or `None` when this build cannot draw it.
+    ///
+    /// `None` means the transition blends on the CPU: the kind has no program,
+    /// or the scene has no pipeline for the program's blend.
+    pub fn transition_effect_draw(
+        &self,
+        trans: &Trans,
+        src1: u32,
+        src2: u32,
+        size: (u32, u32),
+        covers_layer: bool,
+    ) -> Option<EffectDraw> {
+        let draw = trans.effect_draw(src1, src2, size, covers_layer)?;
+        // Every pass must name a program the scene can draw; a draw that
+        // names one it cannot is not drawn at all, and the transition falls
+        // back to the CPU blend.
+        if draw
+            .passes
+            .iter()
+            .all(|pass| self.effect_pipelines.contains(pass.program))
+        {
+            Some(draw)
+        } else {
+            None
         }
     }
 

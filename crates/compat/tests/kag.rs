@@ -1687,6 +1687,7 @@ fn native_registers_and_interrupt_returns_a_dictionary() {
     let engine = Tjs2Engine::new().expect("create engine");
     let mut host = compat::CompatHost::new();
     host.install(&engine).expect("install compat surface");
+    common::link_plugin(&engine, "KAGParserEx.dll");
 
     let value = engine
         .eval(
@@ -1704,6 +1705,7 @@ fn native_tag_dictionary_exposes_taglist() {
     let engine = Tjs2Engine::new().expect("create engine");
     let mut host = compat::CompatHost::new();
     host.install(&engine).expect("install compat surface");
+    common::link_plugin(&engine, "KAGParserEx.dll");
 
     let value = engine
         .eval(
@@ -1721,6 +1723,7 @@ fn native_properties_and_void_end() {
     let engine = Tjs2Engine::new().expect("create engine");
     let mut host = compat::CompatHost::new();
     host.install(&engine).expect("install compat surface");
+    common::link_plugin(&engine, "KAGParserEx.dll");
 
     let value = engine
         .eval(
@@ -1746,6 +1749,7 @@ fn native_go_to_label_error_and_macros_object() {
     let engine = Tjs2Engine::new().expect("create engine");
     let mut host = compat::CompatHost::new();
     host.install(&engine).expect("install compat surface");
+    common::link_plugin(&engine, "KAGParserEx.dll");
 
     let err = engine
         .eval(
@@ -1784,6 +1788,7 @@ fn eval_native(script: &str) -> Result<TjsValue, String> {
     let engine = Tjs2Engine::new().expect("create engine");
     let mut host = compat::CompatHost::new();
     host.install(&engine).expect("install compat surface");
+    common::link_plugin(&engine, "KAGParserEx.dll");
     engine.eval(script, "kag_test").map_err(|e| e.to_string())
 }
 

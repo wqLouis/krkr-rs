@@ -2,8 +2,11 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
+use std::sync::Arc;
 
-use crate::engine_api::{DecodedImageKey, DecodedImageMode, Scene, Storage, StorageReadError};
+use crate::engine_api::{
+    DecodedImageKey, DecodedImageMode, PendingImage, Scene, Storage, StorageReadError,
+};
 use api::media::{DecodedImage, ImageInfo};
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
@@ -11,7 +14,8 @@ use tjs::{
 };
 
 use super::common::{
-    argb_to_rgba, bound, resolve_object_id, rgba_to_argb, scene_mut, scene_ref, set_retained_out,
+    argb_to_rgba, bound, decode_pool_mut, resolve_object_id, rgba_to_argb, scene_mut, scene_ref,
+    set_retained_out,
 };
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::value_as_i64;
@@ -255,35 +259,160 @@ fn decode_storage_image(
 /// Load `name` into bitmap `id`, allocating the scene bitmap when the payload
 /// is still the reference's empty initial bitmap. Returns `(id, width,
 /// height)`. Shared by the constructor, `load` and `loadAsync`.
+///
+/// `defer` asks for the decode to run on the pool: the call returns with the
+/// image's size known and its pixels still decoding, and every read of those
+/// pixels waits for the decode. `loadAsync` does not defer: it reports the
+/// load's result to the script, so the decode must have run.
 fn load_into_bitmap(
     ctx: &CompatCtx,
     id: Option<u32>,
     name: &str,
     colorkey: u32,
+    defer: bool,
 ) -> Result<(u32, u32, u32), String> {
+    // The decoded-image cache comes first: a hit is installed synchronously,
+    // exactly as a cached graphic is installed.
+    let key = DecodedImageKey::new(name, colorkey, DecodedImageMode::Full, 0, 0);
+    let cached = {
+        let scene = scene_mut(ctx)?;
+        scene.lookup_decoded_image(&key)
+    };
+    if let Some(image) = cached {
+        return install_decoded_image(ctx, id, image);
+    }
+    if defer
+        && let Some((width, height, pending)) =
+            start_pending_decode(ctx, name, colorkey, DecodedImageMode::Full)?
+    {
+        let id = install_pending_image(ctx, id, width, height, pending)?;
+        let scene = scene_mut(ctx)?;
+        // The image is the script `Bitmap`'s, so it is released with that
+        // object; a layer's own image stays layer-owned.
+        scene.set_bitmap_script_owned(id);
+        return Ok((id, width, height));
+    }
+    // The synchronous path: the decode runs here and the cache keeps it.
     let image = decode_storage_image(ctx, name, colorkey)?;
+    install_decoded_image(ctx, id, image)
+}
+
+/// Installs a decoded image as the image of `id`, or of a new bitmap.
+fn install_decoded_image(
+    ctx: &CompatCtx,
+    id: Option<u32>,
+    image: DecodedImage,
+) -> Result<(u32, u32, u32), String> {
     let (width, height) = (image.width, image.height);
     let rgba = image.rgba;
     let scene = scene_mut(ctx)?;
     let id = match id {
         Some(id) => {
             scene.replace_bitmap_image(id, width, height, rgba);
-            // The image is the script `Bitmap`'s, so it is released with that
-            // object; a layer's own image stays layer-owned.
-            if let Some(bitmap) = scene.bitmap_mut(id) {
-                bitmap.script_owned = true;
-            }
             id
         }
-        None => {
-            let id = scene.add_bitmap(width, height, rgba);
-            if let Some(bitmap) = scene.bitmap_mut(id) {
-                bitmap.script_owned = true;
-            }
-            id
-        }
+        None => scene.add_bitmap(width, height, rgba),
     };
+    // The image is the script `Bitmap`'s, so it is released with that
+    // object; a layer's own image stays layer-owned.
+    scene.set_bitmap_script_owned(id);
     Ok((id, width, height))
+}
+
+/// Starts a pending decode for `name`, when the pool can take it.
+///
+/// Returns the probed size and the future the result lands in, or `None` when
+/// the deferred path does not apply: no pool is attached, the load carries a
+/// colour key, the load is a province load, or the pool refused the job. The
+/// caller then decodes synchronously.
+///
+/// # Errors
+///
+/// Returns the read or the probe failure. Both are raised at the call, the
+/// way a load failure is raised there: a name that does not resolve and an
+/// image the codec does not recognise never reach the pool.
+pub(crate) fn start_pending_decode(
+    ctx: &CompatCtx,
+    name: &str,
+    colorkey: u32,
+    mode: DecodedImageMode,
+) -> Result<Option<(u32, u32, PendingImage)>, String> {
+    // The colour key and the province plane are passes over the decoded
+    // pixels, and they belong to this layer: the deferred path carries the
+    // decoded pixels unchanged.
+    if colorkey != COLOR_KEY_NONE || mode != DecodedImageMode::Full {
+        return Ok(None);
+    }
+    // Without a pool the load decodes synchronously.
+    let Some(pool) = decode_pool_mut(ctx) else {
+        return Ok(None);
+    };
+    // The read and the extension resolution stay on this thread: the storage
+    // namespace is not shared with the workers.
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service
+    // pointer is valid for `start_pending_decode`.
+    let services = unsafe { ctx.services() };
+    let storage = services
+        .storage()
+        .ok_or_else(|| "no storage attached".to_string())?;
+    // SAFETY: `attach_storage` guarantees the pointer stays valid.
+    let (resolved, bytes) = read_image_from_storage(unsafe { &*storage }, name)?;
+    // The header probe gives the dimensions the image is sized from, and it
+    // rejects an image the load would have rejected at the call.
+    let info = probe_image(services, &resolved, &bytes)?;
+    let Some(expected) = decoded_size_bytes(info.width, info.height) else {
+        return Ok(None);
+    };
+    let bytes: Arc<[u8]> = Arc::from(bytes);
+    let hint = Some(resolved);
+    match pool.submit(bytes, hint, expected) {
+        Ok((_id, pending)) => Ok(Some((info.width, info.height, pending))),
+        Err(error) => {
+            // The pool refused the job: the load decodes synchronously, and
+            // the refusal is reported rather than swallowed.
+            log::warn!(
+                "image: the decode pool refused {name:?} ({error}); the load decodes synchronously"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Installs a pending decode as the image of `id`, or of a new bitmap.
+///
+/// The bitmap carries the probed size and no pixels: the decode result lands
+/// in it when the scene resolves it. Returns the bitmap id.
+pub(crate) fn install_pending_image(
+    ctx: &CompatCtx,
+    id: Option<u32>,
+    width: u32,
+    height: u32,
+    pending: PendingImage,
+) -> Result<u32, String> {
+    let scene = scene_mut(ctx)?;
+    let id = match id {
+        Some(id) => {
+            if !scene.set_pending_image(id, width, height, pending) {
+                return Err("the bitmap is gone".to_string());
+            }
+            id
+        }
+        None => scene
+            .add_pending_bitmap(width, height, pending)
+            .map_err(|error| error.to_string())?,
+    };
+    Ok(id)
+}
+
+/// The number of bytes an image of `width` x `height` RGBA8 pixels holds.
+///
+/// `None` when the count is not representable.
+fn decoded_size_bytes(width: u32, height: u32) -> Option<u64> {
+    let pixels = usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?
+        .checked_mul(4)?;
+    u64::try_from(pixels).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -357,7 +486,7 @@ extern "C" fn bitmap_ctor(
             .get(1)
             .filter(|value| value.ty != VAL_VOID)
             .map_or(COLOR_KEY_NONE, |value| value_as_i64(value) as u32);
-        match load_into_bitmap(&ctx, None, &name, colorkey) {
+        match load_into_bitmap(&ctx, None, &name, colorkey, true) {
             Ok((id, _width, _height)) => id,
             Err(error) => return report_error(out_error, &format!("Bitmap: {error}")),
         }
@@ -431,10 +560,12 @@ extern "C" fn bitmap_get_pixel(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Bitmap.getPixel: compat context is not bound");
     };
-    let scene = match scene_ref(&ctx) {
+    let scene = match scene_mut(&ctx) {
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
+    // The image may still be decoding: the pixel is the decoded one.
+    scene.resolve_bitmap(id);
     set_int(out, read_bitmap_pixel(scene, id, x, y));
     0
 }
@@ -469,6 +600,8 @@ extern "C" fn bitmap_set_pixel(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
+    // The image may still be decoding: the pixel is the decoded one.
+    scene.resolve_bitmap(id);
     write_bitmap_pixel(scene, id, x, y, color, false);
     set_void(out);
     0
@@ -502,10 +635,12 @@ extern "C" fn bitmap_get_mask_pixel(
             "Bitmap.getMaskPixel: compat context is not bound",
         );
     };
-    let scene = match scene_ref(&ctx) {
+    let scene = match scene_mut(&ctx) {
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
+    // The image may still be decoding: the pixel is the decoded one.
+    scene.resolve_bitmap(id);
     set_int(out, (read_bitmap_pixel(scene, id, x, y) >> 24) & 0xff);
     0
 }
@@ -543,6 +678,8 @@ extern "C" fn bitmap_set_mask_pixel(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
+    // The image may still be decoding: the pixel is the decoded one.
+    scene.resolve_bitmap(id);
     if let Some(bitmap) = scene.bitmap_mut(id)
         && let Some(offset) = bitmap.pixel_offset(x as u32, y as u32)
     {
@@ -670,6 +807,8 @@ extern "C" fn bitmap_copy_from(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
+    // The source may still be decoding: the copy reads its pixels.
+    scene.resolve_bitmap(source_id);
     let Some((width, height, rgba)) = scene
         .bitmap(source_id)
         .map(|b| (b.width, b.height, b.rgba.clone()))
@@ -781,10 +920,12 @@ extern "C" fn bitmap_save(
     // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `bitmap_save`.
     let services = unsafe { ctx.services() };
     let resolver = services.state::<ResourceResolver>();
-    let scene = match scene_ref(&ctx) {
+    let scene = match scene_mut(&ctx) {
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &format!("Bitmap.save: {error}")),
     };
+    // The image may still be decoding: the saved pixels are the decoded ones.
+    scene.resolve_bitmap(id);
     let Some(bitmap) = scene.bitmap(id) else {
         return report_error(out_error, "Bitmap.save: this bitmap no longer exists");
     };
@@ -834,7 +975,7 @@ extern "C" fn bitmap_load(
         return report_error(out_error, "Bitmap.load: currently async load bitmap");
     }
     let had_image = id.is_some();
-    let (id, width, height) = match load_into_bitmap(&ctx, id, &name, colorkey) {
+    let (id, width, height) = match load_into_bitmap(&ctx, id, &name, colorkey, true) {
         Ok(size) => size,
         Err(error) => return report_error(out_error, &format!("Bitmap.load: {error}")),
     };
@@ -890,7 +1031,9 @@ extern "C" fn bitmap_load_async(
         inst.loading = true;
         (id, id.is_some())
     };
-    let result = load_into_bitmap(&ctx, id, &name, COLOR_KEY_NONE);
+    // `loadAsync` reports the load's result to the script, so its decode
+    // runs here rather than on the pool.
+    let result = load_into_bitmap(&ctx, id, &name, COLOR_KEY_NONE, false);
     // SAFETY: the payload outlives the call and no other reference is live.
     unsafe { (*(instance as *mut BitmapInst)).loading = false };
     if let Ok((new_id, _width, _height)) = &result
@@ -1166,10 +1309,12 @@ extern "C" fn bitmap_buffer_get(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Bitmap.buffer: compat context is not bound");
     };
-    let scene = match scene_ref(&ctx) {
+    let scene = match scene_mut(&ctx) {
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
+    // The image may still be decoding: the address is the decoded buffer's.
+    scene.resolve_bitmap(id);
     set_int(out, scene.bitmap(id).map_or(0, |b| b.rgba.as_ptr() as i64));
     0
 }
@@ -1199,6 +1344,8 @@ extern "C" fn bitmap_buffer_for_write_get(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
+    // The image may still be decoding: the address is the decoded buffer's.
+    scene.resolve_bitmap(id);
     let address = match scene.bitmap_mut(id) {
         Some(bitmap) => {
             bitmap.mark_dirty();

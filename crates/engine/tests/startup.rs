@@ -1,7 +1,7 @@
 //! Integration tests for L2 startup-script discovery.
 //!
 //! Discovery is pure storage semantics, so these tests exercise it without
-//! the TJS VM. Order per `docs/migration/09-game-loading.md` §5:
+//! the TJS VM. Order per `docs.old/migration/09-game-loading.md` §5:
 //! `patch.tjs` (app path) → `startup.tjs` (search) → `AfterStartup.tjs`
 //! (app path) → `system/Initialize.tjs` fallback.
 
@@ -91,8 +91,11 @@ fn patch_and_after_are_app_path_only() {
     );
 }
 
-/// The searched `startup.tjs` resolves disk-first, so a loose file wins over
-/// the copy inside a mounted archive (reference `TVPSearchPlacedPath`).
+/// In a folder project the searched `startup.tjs` resolves disk-first, so a
+/// loose file wins over the copy inside a mounted archive. The app directory
+/// is the reference's current path for a folder launch
+/// (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`) and is checked
+/// before the auto-path table (`reference/cpp/core/base/StorageIntf.cpp:1061-1108`).
 #[test]
 fn disk_startup_wins_over_archive() {
     let xp3 = build_xp3(&[("startup.tjs", b"// archived", false)]);
@@ -105,6 +108,28 @@ fn disk_startup_wins_over_archive() {
     assert_eq!(
         scripts.startup,
         StartupScript::Startup(Location::Disk("/startup.tjs".into()))
+    );
+}
+
+/// In an archive project the project archive is the current path, so its
+/// `startup.tjs` wins over a loose copy on disk. The reference appends the
+/// archive delimiter to the project path before setting it as the current
+/// directory (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`) and
+/// checks that current storage before the auto-path table
+/// (`reference/cpp/core/base/StorageIntf.cpp:1061-1108`).
+#[test]
+fn archive_startup_wins_over_disk() {
+    let xp3 = build_xp3(&[("startup.tjs", b"// archived", false)]);
+    let mut storage = mount_memory_with_archives(
+        &[("data.xp3", &xp3), ("startup.tjs", b"// disk")],
+        &["data.xp3"],
+    );
+    storage.set_project("/data.xp3");
+
+    let scripts = discover_startup(&storage).expect("discover");
+    assert_eq!(
+        scripts.startup,
+        StartupScript::Startup(Location::Archive("/data.xp3".into(), "startup.tjs".into()))
     );
 }
 

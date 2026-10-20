@@ -62,6 +62,9 @@ pub enum GameError {
     /// A render action failed.
     #[error(transparent)]
     Host(#[from] HostError),
+    /// The image decode pool could not be started.
+    #[error(transparent)]
+    DecodePool(#[from] engine::imagedecode::DecodePoolError),
     /// The L1 audio device could not be opened or written (typed, never
     /// silent; headless hosts use the null backend instead).
     #[error(transparent)]
@@ -531,10 +534,9 @@ impl GameHost {
                 &discovered,
                 MountOptions { preload_archives },
             )?;
-            let project = directory_project(&base_dir, &discovered, |path| {
-                storage_has_boot_scripts(&storage, path)
-            });
-            storage.set_project(&project);
+            // A directory launch is a folder project: the app directory is the
+            // current path, and the scanned archives are searched after it.
+            storage.set_project(&base_dir);
             storage
         } else {
             let mut storage = Storage::mount_archives_with(
@@ -543,9 +545,7 @@ impl GameHost {
                 &archives,
                 MountOptions { preload_archives },
             )?;
-            let project = explicit_project(&base_dir, &archives, |path| {
-                storage_has_boot_scripts(&storage, path)
-            });
+            let project = explicit_project(&base_dir, &archives);
             storage.set_project(&project);
             storage
         });
@@ -554,6 +554,16 @@ impl GameHost {
         let storage_ptr = storage.as_ref() as *const Storage as *mut Storage;
         let timer_ptr = host.engine_mut().timer_mut() as *mut TimerState;
         let input_ptr = host.engine_mut().input_mut() as *mut InputState;
+        // The image decode pool: the bottom decoder it drives, installed
+        // before the binding so the natives can submit decodes. The pool
+        // must not be replaced while the binding is installed: the natives
+        // hold the address the host attaches here.
+        let media = media::Media::new();
+        crate::install_image_decoder(host.engine_mut(), &media).map_err(GameError::DecodePool)?;
+        let pool_ptr = host
+            .engine_mut()
+            .decode_pool_mut()
+            .map_or(std::ptr::null_mut(), |pool| pool as *mut engine::DecodePool);
         // SAFETY: `storage` and `host` are declared after `vm` in the returned
         // struct and therefore outlive it; the boxed `host` keeps the engine's
         // scene, timer and input addresses stable, and nothing else aliases
@@ -565,12 +575,12 @@ impl GameHost {
             services.attach_storage(storage_ptr);
             services.attach_timer(timer_ptr);
             services.attach_input(input_ptr);
+            services.attach_decode_pool(pool_ptr);
         })?;
 
         // Install the seams the compat natives compose: the L1 codecs and the
-        // emulated Windows host facts. The codecs clone their backend, so the
-        // `media` local may drop here.
-        let media = media::Media::new();
+        // emulated Windows host facts. The codecs clone their backend, so
+        // the `media` local may drop here.
         crate::install_audio_decoder_metered(vm.compat(), &media, &stats);
         crate::install_image_codec_metered(vm.compat(), &media, &storage, &stats);
         // `fontdb`'s own system-font scan excludes Android, so the host's font
@@ -799,64 +809,17 @@ fn log_startup(
     );
 }
 
-/// Whether the archive mounted at `path` holds the boot scripts.
+/// The project path for an explicit `--archive` list.
 ///
-/// The reference's project decision only needs to know whether `TVPProjectDir`
-/// is a storage; a directory launch has no such path, so the composition root
-/// reconstructs it by finding the archive that holds `startup.tjs` or
-/// `system/Initialize.tjs` (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`).
-fn storage_has_boot_scripts(storage: &Storage, path: &Path) -> bool {
-    let mut found = false;
-    storage.for_each_archive(|mounted, archive| {
-        if mounted == path
-            && (archive.entry("startup.tjs").is_some()
-                || archive.entry("system/initialize.tjs").is_some())
-        {
-            found = true;
-        }
-    });
-    found
-}
-
-/// The project path for a directory-only launch (the directory-scan
-/// convenience; the reference has no folder scan).
-///
-/// The reference takes `TVPProjectDir` from the launcher and the engine only
-/// decides whether it is an archive or a folder
-/// (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`). A directory launch
-/// reconstructs that path in this order: the conventional boot archive
-/// `data.xp3` when present (what the shipped packages instruct), else the
-/// archive holding the boot scripts, else the directory as a folder project.
-fn directory_project(
-    base_dir: &Path,
-    discovered: &[PathBuf],
-    contains_boot_scripts: impl Fn(&Path) -> bool,
-) -> PathBuf {
-    if let Some(data) = discovered.iter().find(|path| {
-        path.file_name()
-            .is_some_and(|name| name.eq_ignore_ascii_case("data.xp3"))
-    }) {
-        return data.clone();
+/// A single archive is the project: the launcher named that one. Two or more
+/// archives are a folder project, so the app directory is the current path and
+/// the mounts are searched after the auto paths; a later `patch.xp3` still
+/// overrides an earlier `data.xp3`.
+fn explicit_project(base_dir: &Path, archives: &[PathBuf]) -> PathBuf {
+    match archives {
+        [only] => only.clone(),
+        _ => base_dir.to_path_buf(),
     }
-    if let Some(archive) = discovered.iter().find(|path| contains_boot_scripts(path)) {
-        return archive.clone();
-    }
-    base_dir.to_path_buf()
-}
-
-/// The project path for an explicit `--archive` list: the archive holding the
-/// boot scripts, else the first named archive, else the directory.
-fn explicit_project(
-    base_dir: &Path,
-    archives: &[PathBuf],
-    contains_boot_scripts: impl Fn(&Path) -> bool,
-) -> PathBuf {
-    archives
-        .iter()
-        .find(|path| contains_boot_scripts(path))
-        .or_else(|| archives.first())
-        .cloned()
-        .unwrap_or_else(|| base_dir.to_path_buf())
 }
 
 /// The `.tpm` plugin files the reference auto-loads, in ASCII filename order.
@@ -1335,54 +1298,26 @@ mod tests {
         assert_eq!(translate_event(None, &key), key);
     }
 
-    /// A directory launch prefers the conventional boot archive `data.xp3`
-    /// even though D35 discovery sorts `bgimage.xp3` before it.
-    // Reference: `TVPBeforeSystemInit` appends `>` only when the launcher's
-    // project path is a storage (`SysInitImpl.cpp:160-165`).
-    #[test]
-    fn directory_project_prefers_data_xp3() {
-        let base = Path::new("/game");
-        let discovered = [
-            PathBuf::from("/game/bgimage.xp3"),
-            PathBuf::from("/game/data.xp3"),
-        ];
-        assert_eq!(
-            directory_project(base, &discovered, |_| false),
-            PathBuf::from("/game/data.xp3")
-        );
-    }
-
-    /// Without `data.xp3`, the archive that holds the boot scripts is the
-    /// project.
-    #[test]
-    fn directory_project_falls_back_to_the_boot_script_archive() {
-        let base = Path::new("/game");
-        let discovered = [
-            PathBuf::from("/game/aaa.xp3"),
-            PathBuf::from("/game/bbb.xp3"),
-        ];
-        assert_eq!(
-            directory_project(base, &discovered, |path| path.ends_with("bbb.xp3")),
-            PathBuf::from("/game/bbb.xp3")
-        );
-    }
-
-    /// With no boot archive, the directory is the folder project.
-    #[test]
-    fn directory_project_falls_back_to_the_folder() {
-        let base = Path::new("/game");
-        assert_eq!(directory_project(base, &[], |_| false), base.to_path_buf());
-    }
-
-    /// An explicit archive list names the project: the boot-script archive
-    /// when one is present, else the first.
+    /// A single explicit archive is the project.
     #[test]
     fn explicit_project_uses_the_named_archive() {
         let base = Path::new("/game");
         let archives = [PathBuf::from("/game/extra.xp3")];
         assert_eq!(
-            explicit_project(base, &archives, |_| false),
+            explicit_project(base, &archives),
             PathBuf::from("/game/extra.xp3")
         );
+    }
+
+    /// Two or more explicit archives are a folder project: the app directory is
+    /// the current path and the later mount still wins among the archives.
+    #[test]
+    fn explicit_project_uses_the_folder_for_several_archives() {
+        let base = Path::new("/game");
+        let archives = [
+            PathBuf::from("/game/data.xp3"),
+            PathBuf::from("/game/patch.xp3"),
+        ];
+        assert_eq!(explicit_project(base, &archives), base.to_path_buf());
     }
 }

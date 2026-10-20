@@ -49,6 +49,7 @@ impl Env {
                 .attach_storage(storage.as_mut() as *mut Storage);
         }
         host.install(&engine).expect("install compat surface");
+        common::link_plugin(&engine, "emoteplayer.dll");
         Env {
             _host: host,
             engine,

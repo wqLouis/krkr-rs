@@ -240,6 +240,9 @@ impl<P: TextureProvider> Canvas<'_, P> {
             RenderContent::Glyphs(_) => Err(RenderError::Unsupported {
                 message: "GPU glyph runs are not implemented by the CPU renderer".to_owned(),
             }),
+            RenderContent::Effect(_) => Err(RenderError::Unsupported {
+                message: "custom effect draws are not rasterized by the CPU renderer".to_owned(),
+            }),
         }
     }
 

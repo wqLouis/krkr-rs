@@ -57,6 +57,7 @@ impl Env {
                 .attach_scene(scene.as_mut() as *mut Scene);
         }
         host.install(&engine).expect("install compat surface");
+        common::link_all_builtins(&engine);
         Env {
             host,
             engine,

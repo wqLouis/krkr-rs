@@ -252,6 +252,7 @@ pub(crate) fn render(
     target: &VulkanRenderTarget,
     pass: &OffscreenPass,
     textures: &HashMap<u64, VulkanTexture>,
+    effects: Option<&mut super::effect::EffectState>,
     scene: &RenderScene,
 ) -> Result<(), RenderError> {
     let OffscreenSubmit { device, .. } = *submit;
@@ -294,11 +295,13 @@ pub(crate) fn render(
             device.cmd_set_viewport(command_buffer, 0, &[viewport]);
         }
         draw::record_scene(
-            &draw::SceneDraw {
+            draw::SceneDraw {
                 device,
                 command: command_buffer,
                 pipelines: &pass.pipelines,
                 textures,
+                effects,
+                render_pass: pass.render_pass,
                 extent,
                 srgb,
             },

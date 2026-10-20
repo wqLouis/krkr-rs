@@ -219,14 +219,15 @@ fn period_event_semantics_match_the_reference() {
 }
 
 /// `prepare` pauses, rewinds and plays; `perPrepare` fires on the first
-/// decoded frame, after which the overlay is paused at frame 0 again.
+/// decoded frame, after the caller has shown that picture, and the overlay is
+/// then paused at frame 0 again.
 ///
 /// Reference: `Prepare()` does `Pause(); Rewind(); IsPrepare = true; Play()`
 /// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:349-355`), and
-/// `EC_UPDATE` fires `perPrepare` then `Pause(); Rewind(); IsPrepare = false`
-/// (`:635-640`).
+/// `EC_UPDATE` assigns the front buffer, fires `onFrameUpdate` and then fires
+/// `perPrepare` before `Pause(); Rewind(); IsPrepare = false` (`:583-640`).
 #[test]
-fn prepare_fires_the_prepare_period_on_the_first_frame() {
+fn prepare_fires_the_prepare_period_after_the_frame_is_shown() {
     let mut v = VideoOverlay::new();
     v.open(spec(30.0, 30)).unwrap();
     v.present_frame(Arc::new(frame(1, 1, 0))).unwrap();
@@ -240,9 +241,20 @@ fn prepare_fires_the_prepare_period_on_the_first_frame() {
     v.advance(100.0);
     assert!(v.poll().is_empty(), "the prepare waits for the next frame");
     v.present_frame(Arc::new(frame(1, 1, 0))).unwrap();
-    let events = v.poll();
-    assert!(events.contains(&VideoEvent::Period(PeriodReason::Prepare)));
-    assert!(events.contains(&VideoEvent::StatusChanged(PlayStatus::Pause)));
+    assert!(
+        v.is_playing() && v.current_frame().is_some(),
+        "the caller shows the prepared frame before prepare finishes"
+    );
+    assert_eq!(v.poll(), vec![VideoEvent::FrameUpdate(0)]);
+
+    v.complete_prepare();
+    assert_eq!(
+        v.poll(),
+        vec![
+            VideoEvent::Period(PeriodReason::Prepare),
+            VideoEvent::StatusChanged(PlayStatus::Pause)
+        ]
+    );
     assert!(!v.is_playing());
     assert_eq!(v.position_ms(), 0);
 }

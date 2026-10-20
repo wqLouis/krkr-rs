@@ -19,11 +19,14 @@
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use api::fs::{FsPath, OpenMode};
+use api::media::{DecodedImage, ImageInfo};
 use compat::CompatHost;
 use engine::Storage;
+use engine::imagedecode::{ImageDecodeError, ImageDecoder};
 use engine::storage::local_name_in;
 use fs::FileSystem;
 use media::{Media, decode_image, encode_image, probe_image};
@@ -102,6 +105,53 @@ fn install_image_codec_on_metered(
             write_storage_file(&fs, &base, name, &bytes)
         },
     );
+}
+
+/// The image codec the L2 decode pool drives.
+///
+/// The pool calls it from its worker threads, so the decoder is stateless and
+/// thread-safe: it holds the bottom media backend and nothing else. The
+/// bytes it decodes are the ones the compatibility layer read from the
+/// storage, so the storage namespace never crosses a thread boundary.
+struct MediaImageDecoder {
+    /// The stateless bottom backend.
+    media: Media,
+}
+
+impl ImageDecoder for MediaImageDecoder {
+    fn probe(&self, bytes: &[u8], hint: Option<&str>) -> Result<ImageInfo, ImageDecodeError> {
+        probe_image(&self.media, bytes, hint).map_err(|error| ImageDecodeError::Failed {
+            message: error.to_string(),
+        })
+    }
+
+    fn decode(&self, bytes: &[u8], hint: Option<&str>) -> Result<DecodedImage, ImageDecodeError> {
+        decode_image(&self.media, bytes, hint).map_err(|error| ImageDecodeError::Failed {
+            message: error.to_string(),
+        })
+    }
+}
+
+/// Installs the image decoder the L2 decode pool drives, and starts the
+/// pool.
+///
+/// The decoder is the bottom media backend the pool calls; the pool owns the
+/// worker threads, the queue and the byte accounting. Call once, before any
+/// script runs: a load that runs while the pool is absent decodes
+/// synchronously.
+///
+/// # Errors
+///
+/// Returns [`engine::imagedecode::DecodePoolError`] when the pool cannot be
+/// started.
+pub fn install_image_decoder(
+    engine: &mut engine::Engine,
+    media: &Media,
+) -> Result<(), engine::imagedecode::DecodePoolError> {
+    let decoder: Arc<dyn ImageDecoder> = Arc::new(MediaImageDecoder {
+        media: media.clone(),
+    });
+    engine.install_decoder(decoder, engine::imagedecode::DecodePoolConfig::default())
 }
 
 /// Writes `bytes` to `name` under `base` in `fs`, creating missing parents.

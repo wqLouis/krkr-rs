@@ -200,3 +200,58 @@ fn builtin_table_covers_the_games_links_and_reference_aliases() {
     assert!(!registry.is_builtin("not_a_real_plugin.dll"));
     assert!(!registry.is_builtin("AlphaMovie.dll"));
 }
+
+/// A built-in whose per-frame hook counts its invocations.
+struct PollingPlugin {
+    polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl NativePlugin for PollingPlugin {
+    fn name(&self) -> &str {
+        "poll.dll"
+    }
+
+    fn register(&self, _ctx: &mut CompatCtx) -> Result<(), CompatError> {
+        Ok(())
+    }
+
+    fn poll(&self, _ctx: &mut CompatCtx) -> Result<(), CompatError> {
+        self.polls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// A plugin that no script has linked has no script-visible surface, so its
+/// per-frame hook must not run; the first `Plugins.link` makes it active and
+/// the hook then runs once per poll.
+#[test]
+fn poll_runs_only_for_activated_plugins() {
+    let _lock = vm_lock();
+    let engine = Tjs2Engine::new().expect("create engine");
+    let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = PluginRegistry::new();
+    registry.register(Box::new(PollingPlugin {
+        polls: polls.clone(),
+    }));
+    let mut host = compat::CompatHost::with_registry(registry);
+    host.install(&engine).expect("install compat surface");
+    let mut ctx = host.ctx().expect("bound context");
+
+    host.registry().poll(&mut ctx).expect("idle poll");
+    assert_eq!(
+        polls.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "an unlinked plugin's hook must not run"
+    );
+
+    host.registry()
+        .activate("poll.dll", &mut ctx)
+        .expect("link the plugin");
+    host.registry().poll(&mut ctx).expect("active poll");
+    assert_eq!(
+        polls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the linked plugin's hook ran once"
+    );
+}

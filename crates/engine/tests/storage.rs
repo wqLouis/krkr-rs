@@ -147,8 +147,15 @@ fn discover_archives_orders_numbered_patches_naturally() {
     );
 }
 
+/// A folder project checks the app directory first: the current path is the
+/// folder, so a loose file wins over a mounted archive with the same name.
+///
+/// Reference: the project path is the current directory, with a trailing `/`
+/// when it is a folder (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`),
+/// and the search checks that current storage before the auto-path table
+/// (`reference/cpp/core/base/StorageIntf.cpp:1061-1108`).
 #[test]
-fn disk_wins_over_archive() {
+fn folder_project_disk_wins_over_archive() {
     let xp3 = build_xp3(&[("data/winner.txt", b"from archive", false)]);
     let storage = mount_memory_with_archives(
         &[("data.xp3", &xp3), ("data/winner.txt", b"from disk")],
@@ -160,6 +167,46 @@ fn disk_wins_over_archive() {
         Some(Location::Disk(PathBuf::from("/data/winner.txt")))
     );
     assert_eq!(storage.read("data/winner.txt").unwrap(), b"from disk");
+}
+
+/// An archive project checks its project archive first: that archive is the
+/// reference's current directory (with the archive delimiter appended), before
+/// the app directory and the auto-path list.
+///
+/// Reference: `reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`,
+/// `reference/cpp/core/base/StorageIntf.cpp:1061-1108`.
+#[test]
+fn archive_project_wins_over_disk() {
+    let xp3 = build_xp3(&[("data/winner.txt", b"from archive", false)]);
+    let mut storage = mount_memory_with_archives(
+        &[("data.xp3", &xp3), ("data/winner.txt", b"from disk")],
+        &["data.xp3"],
+    );
+    storage.set_project("/data.xp3");
+
+    assert_eq!(
+        storage.find("data/winner.txt").unwrap(),
+        Some(Location::Archive(
+            PathBuf::from("/data.xp3"),
+            "data/winner.txt".into()
+        ))
+    );
+    assert_eq!(storage.read("data/winner.txt").unwrap(), b"from archive");
+}
+
+/// The app directory is the final fallback: a loose file still resolves when
+/// no mounted archive and no auto path holds it.
+#[test]
+fn disk_resolves_when_no_archive_or_auto_path_holds_the_name() {
+    let xp3 = build_xp3(&[("other.txt", b"from archive", false)]);
+    let fs = memory_with(&[("game/data.xp3", &xp3), ("game/loose.txt", b"from disk")]);
+    let storage = Storage::mount_archives(fs, "/game", ["data.xp3"]).expect("mount");
+
+    assert_eq!(
+        storage.find("loose.txt").unwrap(),
+        Some(Location::Disk(PathBuf::from("/game/loose.txt")))
+    );
+    assert_eq!(storage.read("loose.txt").unwrap(), b"from disk");
 }
 
 #[test]
@@ -725,11 +772,11 @@ fn dot_components_fold_and_escape_raises() {
 }
 
 /// The script-visible name `Config.tjs` resolves through each path the search
-/// order defines: the game directory, a mounted archive, a relative folder
+/// order defines: the app directory, a mounted archive, a relative folder
 /// auto path, and an archive auto path with an in-archive prefix.
 #[test]
 fn each_resolution_path_resolves_a_script_name() {
-    // The game directory (current path).
+    // The app directory (the folder project's current path).
     let disk = mount_memory(&[("Config.tjs", b"disk")]);
     assert_eq!(disk.read("Config.tjs").unwrap(), b"disk");
 
@@ -832,14 +879,14 @@ fn resolver_cache_lists_each_auto_path_once() {
     );
 
     // The second miss is served from the cached auto-path tables; only the
-    // live current-path case walk lists a directory.
+    // live disk case walk lists a directory.
     let (found, logs) = capture_logs(|| storage.find("missing.txt"));
     assert_eq!(found.unwrap(), None);
     let after_second = storage.probe_counts();
     assert_eq!(
         after_second.list,
         after_first.list + 1,
-        "a second miss must re-list only the live current-path walk"
+        "a second miss must re-list only the live disk walk"
     );
     assert_eq!(after_second.misses, 2);
     assert!(
@@ -850,9 +897,9 @@ fn resolver_cache_lists_each_auto_path_once() {
 
 /// The startup shape from the device measurement: many auto paths and many
 /// misses. The auto-path candidate table is cached (one listing per auto-path
-/// directory), while the current-path case walk reads live (one listing per
-/// miss) — matching the reference, which caches the auto-path table but
-/// `opendir`s the real directory on every lookup
+/// directory), while the disk case walk reads live (one listing per miss) —
+/// matching the reference, which caches the auto-path table but `opendir`s the
+/// real directory on every lookup
 /// (`reference/cpp/core/base/StorageIntf.cpp:959-1052`,
 /// `reference/cpp/core/base/impl/StorageImpl.cpp:339-407`).
 #[test]
@@ -1089,8 +1136,8 @@ fn reads_a_large_but_valid_archive_entry() {
     assert_eq!(read, payload);
 }
 
-/// Precedence: later-mounted archives override earlier ones, so
-/// `--archive data.xp3 --archive patch.xp3` lets `patch.xp3` win.
+/// Precedence: later-mounted archives override earlier ones in a folder
+/// project, so `--archive data.xp3 --archive patch.xp3` lets `patch.xp3` win.
 #[test]
 fn later_mounted_archive_wins() {
     let data = build_xp3(&[("shared.txt", b"from data", false)]);
@@ -1112,6 +1159,38 @@ fn later_mounted_archive_wins() {
 
     let storage = mount_memory_with_archives(&files, &["patch.xp3", "data.xp3"]);
     assert_eq!(storage.read("shared.txt").unwrap(), b"from data");
+}
+
+/// An archive project checks its project archive before the other mounts, so
+/// the project archive wins even when another archive was mounted later. A
+/// folder project keeps the later-mount rule.
+///
+/// Reference: the project archive is the current path and is checked before
+/// the auto-path table and the other mounts
+/// (`reference/cpp/core/base/StorageIntf.cpp:1061-1108`); later mounts win among
+/// themselves.
+#[test]
+fn project_archive_is_checked_before_other_mounts() {
+    let data = build_xp3(&[("shared.txt", b"from data", false)]);
+    let patch = build_xp3(&[("shared.txt", b"from patch", false)]);
+    let files = [
+        ("data.xp3", data.as_slice()),
+        ("patch.xp3", patch.as_slice()),
+    ];
+
+    let mut archive_project = mount_memory_with_archives(&files, &["data.xp3", "patch.xp3"]);
+    archive_project.set_project("/data.xp3");
+    assert_eq!(archive_project.read("shared.txt").unwrap(), b"from data");
+    assert_eq!(
+        archive_project.find("shared.txt").unwrap(),
+        Some(Location::Archive(
+            PathBuf::from("/data.xp3"),
+            "shared.txt".into()
+        ))
+    );
+
+    let folder_project = mount_memory_with_archives(&files, &["data.xp3", "patch.xp3"]);
+    assert_eq!(folder_project.read("shared.txt").unwrap(), b"from patch");
 }
 
 /// The base directory is the app path for disk assets **and** the root a
@@ -1308,12 +1387,34 @@ fn mount_archive_still_reports_a_typed_error() {
     ));
 }
 
-/// Auto paths are searched in "later added wins" order, so a folder added
-/// after an archive overrides the archive entry.
-// Reference: `TVPGetPlacedPath` checks the current path and then the auto-path
-// table (`reference/cpp/core/base/StorageIntf.cpp:1061-1108`); the shipped
-// `system/initialize.tjs` adds `patch.xp3>` before `parts/` and documents
-// "later-added wins".
+/// A folder project checks the app directory before the auto-path list, so a
+/// loose file wins over a later-added auto path.
+///
+/// Reference: the current folder is checked before the auto-path table
+/// (`reference/cpp/core/base/StorageIntf.cpp:1061-1108`).
+#[test]
+fn folder_project_disk_wins_over_auto_path() {
+    let fs = memory_with(&[
+        ("game/Config.tjs", b"disk"),
+        ("game/chs/Config.tjs", b"auto"),
+    ]);
+    let mut storage =
+        Storage::mount_archives(fs, "/game", std::iter::empty::<&str>()).expect("mount");
+    storage.add_auto_path("chs/");
+
+    assert_eq!(storage.read("Config.tjs").unwrap(), b"disk");
+    assert_eq!(
+        storage.find("Config.tjs").unwrap(),
+        Some(Location::Disk(PathBuf::from("/game/Config.tjs")))
+    );
+}
+
+/// A folder project checks the auto-path list before the mounted archives, so
+/// a later-added folder auto path wins over an archive entry with the same
+/// base name.
+///
+/// Reference: `TVPGetPlacedPath` follows the current folder with the auto-path
+/// table (`reference/cpp/core/base/StorageIntf.cpp:1061-1108`).
 #[test]
 fn later_added_auto_path_wins_over_a_mounted_archive() {
     let patch = build_xp3(&[("foo.png", b"from patch", false)]);
@@ -1329,6 +1430,80 @@ fn later_added_auto_path_wins_over_a_mounted_archive() {
         storage.find("foo.png").unwrap(),
         Some(Location::Disk(PathBuf::from("/parts/foo.png")))
     );
+}
+
+/// An archive project checks its project archive before the auto-path list,
+/// so the project archive's entry wins over a later-added folder auto path.
+///
+/// Reference: the project archive is the current path and is checked before
+/// the auto-path table (`reference/cpp/core/base/StorageIntf.cpp:1061-1108`).
+#[test]
+fn archive_project_wins_over_a_later_auto_path() {
+    let patch = build_xp3(&[("foo.png", b"from patch", false)]);
+    let mut storage = mount_memory_with_archives(
+        &[("patch.xp3", &patch), ("parts/foo.png", b"from parts")],
+        &["patch.xp3"],
+    );
+    storage.set_project("/patch.xp3");
+    storage.add_auto_path("patch.xp3>");
+    storage.add_auto_path("/parts/");
+
+    assert_eq!(storage.read("foo.png").unwrap(), b"from patch");
+    assert_eq!(
+        storage.find("foo.png").unwrap(),
+        Some(Location::Archive(
+            PathBuf::from("/patch.xp3"),
+            "foo.png".into()
+        ))
+    );
+}
+
+/// Auto paths are searched in "later added wins" order among themselves, so a
+/// folder added after an earlier one overrides it.
+///
+/// Reference: `TVPGetPlacedPath` resolves through the auto-path table, which
+/// the later `TVPAddAutoPath` entry overwrites
+/// (`reference/cpp/core/base/StorageIntf.cpp:921-937`, `:1061-1108`).
+#[test]
+fn later_added_auto_path_wins_over_an_earlier_one() {
+    let fs = memory_with(&[
+        ("game/early/Config.tjs", b"early"),
+        ("game/late/Config.tjs", b"late"),
+    ]);
+    let mut storage =
+        Storage::mount_archives(fs, "/game", std::iter::empty::<&str>()).expect("mount");
+    storage.add_auto_path("early/");
+    storage.add_auto_path("late/");
+
+    assert_eq!(storage.read("Config.tjs").unwrap(), b"late");
+    assert_eq!(
+        storage.find("Config.tjs").unwrap(),
+        Some(Location::Disk(PathBuf::from("/game/late/Config.tjs")))
+    );
+}
+
+/// An auto-path hit in an archive project wins over the app-directory
+/// fallback, which is searched after the auto paths and the other mounts.
+#[test]
+fn auto_path_wins_over_disk_in_an_archive_project() {
+    let project = build_xp3(&[("other.txt", b"project", false)]);
+    let fs = memory_with(&[
+        ("game/project.xp3", &project),
+        ("game/Config.tjs", b"disk"),
+        ("game/chs/Config.tjs", b"auto"),
+        ("game/loose.txt", b"loose"),
+    ]);
+    let mut storage = Storage::mount_archives(fs, "/game", ["project.xp3"]).expect("mount");
+    storage.set_project("/game/project.xp3");
+    storage.add_auto_path("/game/chs/");
+
+    assert_eq!(storage.read("Config.tjs").unwrap(), b"auto");
+    assert_eq!(
+        storage.find("Config.tjs").unwrap(),
+        Some(Location::Disk(PathBuf::from("/game/chs/Config.tjs")))
+    );
+    // A loose app-directory file is still reachable as the last fallback.
+    assert_eq!(storage.read("loose.txt").unwrap(), b"loose");
 }
 
 /// An archive named by an auto path or by explicit `arc.xp3>` addressing is

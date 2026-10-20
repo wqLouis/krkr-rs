@@ -65,6 +65,7 @@ impl Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut host = CompatHost::new();
         host.install(&engine).expect("install compat surface");
+        common::link_all_builtins(&engine);
         Env {
             _host: host,
             engine,
@@ -477,7 +478,7 @@ fn compile_fixture(
 /// assignment (`+=`, `VM_ADDPD`) is a **writer** gap in this reconstruction:
 /// the writer's export address table registers only the base opcode, so the
 /// variant's operands stay byte offsets and the loader multiplies them again
-/// (see `docs/audits/bytecode-scripts.md`). The assertion below still fails on
+/// (see `docs.old/audits/bytecode-scripts.md`). The assertion below still fails on
 /// a wrong context: a top-level `var` needs the global as its context, and a
 /// null/wrong one makes the `VM_SPDS` object-operand conversion raise.
 #[test]

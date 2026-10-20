@@ -15,7 +15,7 @@
 //!   `TVPSearchAvailTSSWaveDecoder`, `WaveImpl.cpp:279`);
 //! * `Query_sizeof_OggVorbis_File` and the `wu_*` symbols are that C decoder
 //!   API, not script surface: the `OggVorbis` / `wuvorbis` wide strings found
-//!   in the DLL are the module's metadata (`docs/plugin_host_exe.md` §2.4,
+//!   in the DLL are the module's metadata (`docs.old/plugin_host_exe.md` §2.4,
 //!   §5.3), and nothing in `reference/` exposes an `OggVorbis` TJS type.
 //!
 //! # Where the decoder lives in krkr-rs

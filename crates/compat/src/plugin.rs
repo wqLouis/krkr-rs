@@ -24,6 +24,14 @@ pub trait NativePlugin {
         &[]
     }
 
+    /// Modules this plugin loads when it activates (the pre-registration
+    /// dependency, e.g. `emoteplayer.dll` → `motionplayer.dll`). The registry
+    /// registers each dependency first and does not report it in
+    /// `Plugins.getList`. Default: none.
+    fn dependencies(&self) -> &[&str] {
+        &[]
+    }
+
     /// Register the plugin's native classes on the VM.
     fn register(&self, ctx: &mut CompatCtx) -> Result<(), CompatError>;
 
@@ -43,10 +51,12 @@ pub struct BuiltinPluginDef {
     pub name: &'static str,
     /// Alternate DLL names resolving to the same `register`.
     pub aliases: &'static [&'static str],
-    /// Registers the plugin's native classes — once at startup for the
-    /// built-ins (the host calls [`crate::natives::plugins::register`], and
-    /// [`PluginRegistry::builtin`] pre-marks the names), or on first link
-    /// for a registry assembled by hand.
+    /// Prerequisite modules, registered first when this plugin activates;
+    /// they are not recorded as links.
+    pub dependencies: &'static [&'static str],
+    /// Registers the plugin's native classes when `Plugins.link` activates
+    /// it, except for the [`crate::natives::plugins::STARTUP_PLUGINS`] the
+    /// host registers once at startup (see [`crate::natives::plugins::register`]).
     pub register: fn(&mut CompatCtx) -> Result<(), CompatError>,
 }
 
@@ -57,6 +67,7 @@ pub struct BuiltinPluginDef {
 pub struct BuiltinPlugin {
     name: &'static str,
     aliases: &'static [&'static str],
+    dependencies: &'static [&'static str],
     register: fn(&mut CompatCtx) -> Result<(), CompatError>,
 }
 
@@ -66,6 +77,7 @@ impl BuiltinPlugin {
         Self {
             name: def.name,
             aliases: def.aliases,
+            dependencies: def.dependencies,
             register: def.register,
         }
     }
@@ -78,6 +90,10 @@ impl NativePlugin for BuiltinPlugin {
 
     fn aliases(&self) -> &[&str] {
         self.aliases
+    }
+
+    fn dependencies(&self) -> &[&str] {
+        self.dependencies
     }
 
     fn register(&self, ctx: &mut CompatCtx) -> Result<(), CompatError> {
@@ -148,38 +164,38 @@ impl Default for PluginRegistry {
 
 impl PluginRegistry {
     /// An empty registry (no built-in emulations yet).
+    ///
+    /// The startup modules are marked registered because
+    /// [`crate::install`] always puts their surface on the VM before any
+    /// script runs, whichever registry the host was built with.
     pub fn new() -> Self {
         Self {
             plugins: Vec::new(),
             linked: Mutex::new(Vec::new()),
-            registered: Mutex::new(BTreeSet::new()),
+            registered: Mutex::new(
+                crate::natives::plugins::STARTUP_PLUGINS
+                    .iter()
+                    .map(|name| normalize_plugin_name(name))
+                    .collect(),
+            ),
         }
     }
 
     /// The built-in registry assembled at startup.
     ///
     /// Every ported plugin (the table in
-    /// [`crate::natives::plugins::BUILTIN_PLUGINS`]) is added here, and
-    /// their classes are already on the VM (the host registered them in
-    /// [`crate::install`]), so a later `Plugins.link` resolves the name to
-    /// [`PluginOutcome::Builtin`] without registering anything a second
-    /// time. A name that is not in the table falls back to the null plugin
-    /// object — installed only where the stem is free.
+    /// [`crate::natives::plugins::BUILTIN_PLUGINS`]) is added here. The
+    /// modules available before any script runs
+    /// ([`crate::natives::plugins::STARTUP_PLUGINS`], today `xp3filter.dll`)
+    /// are marked registered by [`Self::new`]; a later `Plugins.link` of any
+    /// other built-in activates it and registers its classes. A name that is
+    /// not in the table falls back to the null plugin object — installed only
+    /// where the stem is free.
     pub fn builtin() -> Self {
         let mut registry = Self::new();
         for def in crate::natives::plugins::BUILTIN_PLUGINS {
             registry.register(Box::new(BuiltinPlugin::new(def)));
         }
-        // The classes are installed once at startup
-        // (`natives::plugins::register`), so mark the built-ins registered: a
-        // later `Plugins.link` reports `Builtin` without registering them a
-        // second time (the VM rejects duplicate class names).
-        registry.registered = Mutex::new(
-            crate::natives::plugins::BUILTIN_PLUGINS
-                .iter()
-                .map(|def| normalize_plugin_name(def.name))
-                .collect(),
-        );
         registry
     }
 
@@ -238,17 +254,7 @@ impl PluginRegistry {
         if let Some(plugin) = self.plugin(&key) {
             // Track the canonical name so aliases sharing one `register`
             // (e.g. `layerExDraw.dll` / `perspective.dll`) register once.
-            let canonical = normalize_plugin_name(plugin.name());
-            {
-                let mut registered = self
-                    .registered
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
-                if !registered.contains(&canonical) {
-                    plugin.register(ctx)?;
-                    registered.insert(canonical);
-                }
-            }
+            self.ensure_registered(plugin, ctx)?;
             self.push_linked(name, &key, LinkedKind::Builtin, false);
             Ok(PluginOutcome::Builtin)
         } else {
@@ -290,10 +296,22 @@ impl PluginRegistry {
         true
     }
 
-    /// Run every built-in plugin's per-frame hook.
+    /// Run the per-frame hook of every built-in plugin that has been
+    /// activated.
+    ///
+    /// A plugin that no script has linked has no script-visible surface and
+    /// owns no per-frame hook, so its `poll` must not run: the `registered`
+    /// set is the same one `activate` fills on the first link.
     pub fn poll(&self, ctx: &mut CompatCtx) -> Result<(), CompatError> {
+        let registered = self
+            .registered
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
         for plugin in &self.plugins {
-            plugin.poll(ctx)?;
+            if registered.contains(&normalize_plugin_name(plugin.name())) {
+                plugin.poll(ctx)?;
+            }
         }
         Ok(())
     }
@@ -340,6 +358,44 @@ impl PluginRegistry {
             .iter()
             .find(|entry| entry.key == key)
             .map(|entry| entry.kind)
+    }
+
+    /// Register `plugin` and its dependencies once, without recording a link.
+    ///
+    /// `Plugins.getList` reports only the names a script linked, so a
+    /// dependency loaded on the plugin's behalf (its pre-registration hook)
+    /// is registered but not listed. The `registered` set keeps a second load
+    /// of the same module (an explicit link or another dependent) from
+    /// registering its classes twice.
+    fn ensure_registered(
+        &self,
+        plugin: &dyn NativePlugin,
+        ctx: &mut CompatCtx,
+    ) -> Result<(), CompatError> {
+        let canonical = normalize_plugin_name(plugin.name());
+        if self
+            .registered
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains(&canonical)
+        {
+            return Ok(());
+        }
+        for dependency in plugin.dependencies() {
+            match self.plugin(dependency) {
+                Some(dependency) => self.ensure_registered(dependency, ctx)?,
+                None => log::debug!(
+                    "plugin {}: dependency {dependency:?} has no built-in emulation",
+                    plugin.name()
+                ),
+            }
+        }
+        plugin.register(ctx)?;
+        self.registered
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(canonical);
+        Ok(())
     }
 
     fn push_linked(&self, name: &str, key: &str, kind: LinkedKind, installed_global: bool) {

@@ -22,10 +22,15 @@
 // methods on the re-exported `Scene`.
 pub(crate) use engine::{
     BitmapState, DecodedImageKey, DecodedImageMode, FontState, LayerState, Rect, Scene,
+    TransitionFrame,
 };
 
 // The storage namespace: mounts, archive names, locations and typed read errors.
 pub(crate) use engine::{Location, Storage, StorageReadError, normalize_in_archive_name};
+
+// The image decode pool and the pending-image future the visual natives
+// submit decodes to and wait for.
+pub(crate) use engine::imagedecode::{DecodePool, PendingImage};
 
 // The generic input state the platform events are accumulated into.
 pub(crate) use engine::input::InputState;
@@ -52,7 +57,12 @@ pub(crate) use engine::video::{
 };
 
 // The transition state machine and its rule/scroll vocabulary.
-pub(crate) use engine::trans::{RuleMask, ScrollFrom, ScrollStay, Trans, TransKind};
+pub(crate) use engine::trans::{RuleMask, ScrollFrom, ScrollStay, Trans, TransError, TransKind};
+
+// The custom-shader draw a transition records when the backend can run effect
+// pipelines. The compatibility layer carries the value from the transition
+// tick to the layer tree; it never names a program, a pipeline or a shader.
+pub(crate) use engine::shader::EffectDraw;
 
 /// Rasterization primitives compat composes directly.
 pub(crate) mod raster {

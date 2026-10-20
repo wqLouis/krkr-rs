@@ -2,7 +2,7 @@
 //! `Rect`, `text_render`, `psd_file`, `fstat`, `get_sample`, `save_struct`,
 //! `image_function` and the objthis-family plugins.
 //!
-//! Mechanism under test (`docs/audits/object-write-dispatch.md`):
+//! Mechanism under test (`docs.old/audits/object-write-dispatch.md`):
 //! native dispatch has exactly one receiver channel, the `objthis` the VM
 //! passes to `PropGet`/`PropSet`/`FuncCall`, derived in
 //! `crates/tjs/cpp/tjs2/tjsInterCodeExec.cpp:1440` as
@@ -133,6 +133,7 @@ impl Env {
             host.services_mut().attach_storage(&mut *storage);
         }
         host.install(&engine).expect("install compat surface");
+        common::link_all_builtins(&engine);
         Env {
             _host: host,
             engine,

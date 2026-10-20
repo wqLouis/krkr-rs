@@ -28,10 +28,13 @@
 //! Resolution order mirrors the reference engine:
 //!
 //! 1. explicit `arc.xp3>path` addressing,
-//! 2. disk files (normalized spelling, then the script's spelling, then a
-//!    bounded component-wise case-insensitive walk),
-//! 3. mounted archives, later mounts first (later-mounted wins),
-//! 4. the auto search-path list.
+//! 2. the current project storage: the project archive for an archive
+//!    project, the app directory for a folder project,
+//! 3. the auto search-path list, later added first,
+//! 4. the remaining mounted archives, later mounts first,
+//! 5. the app directory as the loose-file fallback for an archive project —
+//!    disk files below it are normalized before the script's spelling and the
+//!    bounded component-wise case-insensitive walk.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -526,9 +529,10 @@ impl Storage {
     ///
     /// Loading is explicit: the caller supplies the archive list (from the
     /// command line or Android Intent extras), and the loader never scans the
-    /// folder. Later archives take precedence over earlier ones, so
-    /// `--archive data.xp3 --archive patch.xp3` lets `patch.xp3` override
-    /// `data.xp3`.
+    /// folder. Later archives take precedence over earlier ones, so a folder
+    /// project with `--archive data.xp3 --archive patch.xp3` lets `patch.xp3`
+    /// override `data.xp3`. An archive project checks its project archive
+    /// before the other mounts.
     ///
     /// `fs` is the bottom file-system object; `base_dir` is the app path used
     /// for disk assets. An archive that cannot be opened or parsed is a typed
@@ -615,15 +619,21 @@ impl Storage {
     /// project leaves it disk-relative.
     ///
     /// Call after the archives are mounted, so the project archive is known,
-    /// and before any startup script runs.
+    /// and before any startup script runs. A relative path is resolved against
+    /// the app directory, the same way [`Self::mount_archive`] resolves it.
     pub fn set_project(&mut self, path: impl AsRef<Path>) {
-        let path = path.as_ref();
-        let is_archive = self.archives.iter().any(|m| m.path.as_path() == path)
+        let raw = path.as_ref();
+        let path = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            self.game_dir.join(raw)
+        };
+        let is_archive = self.archives.iter().any(|m| m.path == path)
             || matches!(
-                fs::stat(&self.fs, &FsPath::host(path)),
+                fs::stat(&self.fs, &FsPath::host(&path)),
                 Ok(meta) if !meta.is_dir
             );
-        self.project = is_archive.then(|| path.to_path_buf());
+        self.project = is_archive.then_some(path);
         self.clear_resolution_cache();
     }
 
@@ -831,10 +841,13 @@ impl Storage {
     }
 
     /// Resolves a storage name to a location, mirroring the reference search
-    /// order: explicit `arc.xp3>path` → the current path (the app directory)
-    /// → the auto search paths in "later added wins" order → the mounted
-    /// archives in later-mount order. Auto-path and explicit archives are
-    /// opened on demand when they exist on disk but were not mounted.
+    /// order: explicit `arc.xp3>path` → the current project storage → the
+    /// auto search paths in "later added wins" order → the remaining mounted
+    /// archives, later mounts first → the app directory as the loose-file
+    /// fallback for an archive project. The project storage is the project
+    /// archive for an archive project and the app directory for a folder
+    /// project. Auto-path and explicit archives are opened on demand when they
+    /// exist on disk but were not mounted.
     ///
     /// A name that simply does not resolve is `Ok(None)`; a `..` that escapes
     /// the mount is [`StorageReadError::InvalidPathName`]. A genuine
@@ -844,14 +857,14 @@ impl Storage {
     ///
     /// A miss logs one bounded `debug` line and, when trace logging is on, the
     /// full location list at `trace`. The `debug` line names the searched
-    /// locations (disk spellings, auto-path candidates grouped by resolution
-    /// shape, mounted archives in later-first order, or the explicit
-    /// `arc.xp3>path` interpretation) until a small character budget is
-    /// reached, then appends an elision marker with the number of dropped
-    /// characters; the `trace` line carries the complete list, including the
-    /// archive near-miss names. A hit logs nothing, and the trace is only built
-    /// when debug logging is enabled; the near-miss scan is added only at
-    /// `trace`.
+    /// locations (the project archive, auto-path candidates grouped by
+    /// resolution shape, mounted archives in later-first order, disk
+    /// spellings, or the explicit `arc.xp3>path` interpretation) until a small
+    /// character budget is reached, then appends an elision marker with the
+    /// number of dropped characters; the `trace` line carries the complete
+    /// list, including the archive near-miss names. A hit logs nothing, and
+    /// the trace is only built when debug logging is enabled; the near-miss
+    /// scan is added only at `trace`.
     ///
     /// Storage names are case-insensitive even when the host filesystem is
     /// not. Only the storage-relative part is normalized; the mount prefix
@@ -913,13 +926,26 @@ impl Storage {
             return Ok(None);
         };
 
-        // The current path (the app directory) is checked first.
-        if let Some(location) = self.find_disk_relative(&relative, trace)? {
-            return Ok(Some(location));
-        }
-
         let normalized = normalize_in_archive_name(&relative);
         let base = storage_base(&normalized);
+        let project = self.project.as_deref();
+
+        // The current project storage is checked first. An archive project's
+        // current directory is its project archive, with the archive
+        // delimiter appended; a folder project's current directory is the app
+        // directory.
+        match project {
+            Some(project) => {
+                if let Some(location) = self.find_in_project_archive(project, &normalized, trace)? {
+                    return Ok(Some(location));
+                }
+            }
+            None => {
+                if let Some(location) = self.find_disk_relative(&relative, trace)? {
+                    return Ok(Some(location));
+                }
+            }
+        }
 
         // Auto paths, last added first (the reference's "later added wins").
         // Each auto path's candidate table is built once and cached, so the
@@ -956,8 +982,9 @@ impl Storage {
             trace.attempt(|| auto_trace.render());
         }
 
-        // Mounted archives, later mounts first (later-mounted wins — see
-        // `mount_archives`). Looked up by the normalized name.
+        // The remaining mounted archives, later mounts first (later-mounted
+        // wins — see `mount_archives`). The project archive was already
+        // checked as the current project storage.
         if !self.archives.is_empty() {
             trace.attempt(|| {
                 let order: Vec<String> = self
@@ -970,6 +997,9 @@ impl Storage {
             });
         }
         for mounted in self.archives.iter().rev() {
+            if project.is_some_and(|project| project == mounted.path.as_path()) {
+                continue;
+            }
             if mounted.archive.entry(&normalized).is_some() {
                 return Ok(Some(Location::Archive(mounted.path.clone(), normalized)));
             }
@@ -977,7 +1007,59 @@ impl Storage {
                 archive_miss_line(&mounted.path, &mounted.archive, &normalized, detailed)
             });
         }
+
+        // An archive project still falls back to a loose app-directory file;
+        // a folder project already checked the app directory first.
+        if project.is_some()
+            && let Some(location) = self.find_disk_relative(&relative, trace)?
+        {
+            return Ok(Some(location));
+        }
         Ok(None)
+    }
+
+    /// Resolves an in-archive name in the project archive itself, opening the
+    /// archive on demand when the caller named a file that is not mounted.
+    fn find_in_project_archive(
+        &self,
+        project: &Path,
+        normalized: &str,
+        trace: &mut SearchTrace,
+    ) -> Result<Option<Location>, StorageReadError> {
+        if let Some(mounted) = self.archives.iter().find(|m| m.path.as_path() == project) {
+            trace.attempt(|| format!("project archive {}", mounted.path.display()));
+            if mounted.archive.entry(normalized).is_some() {
+                return Ok(Some(Location::Archive(
+                    mounted.path.clone(),
+                    normalized.to_string(),
+                )));
+            }
+            trace.attempt_detailed(|detailed| {
+                archive_miss_line(&mounted.path, &mounted.archive, normalized, detailed)
+            });
+            return Ok(None);
+        }
+        let file = match fs::open(&self.fs, &FsPath::host(project), OpenMode::Read) {
+            Ok(file) => file,
+            Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => {
+                trace.attempt(|| format!("project archive {} is not on disk", project.display()));
+                return Ok(None);
+            }
+            Err(error) => return Err(StorageReadError::Fs(error)),
+        };
+        let archive = Xp3Archive::open(&self.fs, &file)?;
+        trace.attempt(|| format!("project archive {} (opened on demand)", project.display()));
+        if archive.entry(normalized).is_some() {
+            Ok(Some(Location::Archive(
+                project.to_path_buf(),
+                normalized.to_string(),
+            )))
+        } else {
+            trace.attempt_detailed(|detailed| {
+                archive_miss_line(project, &archive, normalized, detailed)
+            });
+            Ok(None)
+        }
     }
 
     /// The live listing of `dir`, enumerating it on every call.

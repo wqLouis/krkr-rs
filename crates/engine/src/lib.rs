@@ -16,11 +16,13 @@
 mod hasher;
 
 pub mod engine;
+pub mod imagedecode;
 pub mod input;
 pub mod layer_ops;
 pub mod projection;
 pub mod raster;
 pub mod scene;
+pub mod shader;
 pub mod sound;
 pub mod startup;
 pub mod storage;
@@ -40,6 +42,11 @@ pub use crate::engine::{
     Engine, EngineError, EngineOverlay, EngineParts, FrameReport, GameFrame, ObjectCounts,
 };
 pub use crate::hasher::Map;
+// The image decode pool and the pending-image future.
+pub use crate::imagedecode::{
+    DecodePool, DecodePoolConfig, DecodePoolError, ImageDecodeError, ImageDecoder, ImageOutcome,
+    ImageSizeError, ImageState, JobId, PendingImage,
+};
 pub use crate::translate::{PixelTranslation, TranslateError};
 // Curated crate root. The
 // pixel primitives, blend-type numbering and TVP constants stay reachable
@@ -50,7 +57,12 @@ pub use projection::{
     project_window, project_window_report, resolve_blend,
 };
 pub use scene::{
-    BitmapState, DecodedImageKey, DecodedImageMode, FontState, LayerState, Rect, Scene, WindowState,
+    BitmapState, DecodedImageKey, DecodedImageMode, FontState, LayerState, Rect, Scene,
+    TransitionFrame, TransitionSource, WindowState,
+};
+pub use shader::{
+    EffectDraw, EffectPass, EffectPipelines, EffectTexture, LoadedProgram, PipelineId, Program,
+    ProgramDesc, ShaderError, ShaderId, ShaderLibrary,
 };
 pub use startup::{StartupError, discover_startup};
 pub use storage::{Location, MountError, Storage, StorageMetadata, StorageReadError};

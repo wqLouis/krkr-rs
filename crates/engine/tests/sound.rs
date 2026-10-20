@@ -540,31 +540,60 @@ fn resample_window() -> [f64; RESAMPLE_TAPS] {
     let mut window = [0.0f64; RESAMPLE_TAPS];
     for (k, value) in window.iter_mut().enumerate() {
         let t = k as f64 / (RESAMPLE_TAPS - 1) as f64;
-        let phase = std::f64::consts::PI * t;
+        let phase = std::f64::consts::TAU * t;
         *value = 0.42 - 0.5 * phase.cos() + 0.08 * (2.0 * phase).cos();
     }
     window
 }
 
+/// The scale of the kernel's passband.
+fn kernel_scale(src_rate: f64, out_rate: f64, rate: f64) -> f64 {
+    let ratio = out_rate / (rate * src_rate);
+    if ratio.is_finite() && ratio > 0.0 {
+        ratio.min(1.0)
+    } else {
+        1.0
+    }
+}
+
 /// The windowed-sinc weights for the fractional source position `frac`.
 ///
-/// The sinc's argument is `m - frac` with an integer `m`, so every tap's
-/// sine comes from the same `sin(pi * frac)`.
-fn resample_weights(frac: f64, window: &[f64; RESAMPLE_TAPS]) -> [f64; RESAMPLE_TAPS] {
-    let sin = (std::f64::consts::PI * frac).sin();
+/// The kernel's sine is the difference of two products, so the per-tap values
+/// are computed once per conversion.
+fn resample_weights(
+    frac: f64,
+    window: &[f64; RESAMPLE_TAPS],
+    scale: f64,
+    sine: &[f64; RESAMPLE_TAPS],
+    cosine: &[f64; RESAMPLE_TAPS],
+) -> [f64; RESAMPLE_TAPS] {
+    let phase = std::f64::consts::PI * scale * frac;
+    let (sin, cos) = (phase.sin(), phase.cos());
     let mut weights = [0.0f64; RESAMPLE_TAPS];
     for (k, weight) in weights.iter_mut().enumerate() {
-        let m = k as i64 - RESAMPLE_HALF as i64;
-        let distance = m as f64 - frac;
+        let m = k as f64 - RESAMPLE_HALF as f64;
+        let distance = scale * (m - frac);
         let sinc = if distance.abs() < f64::EPSILON {
             1.0
         } else {
-            let sign = if m.rem_euclid(2) == 0 { -1.0 } else { 1.0 };
-            sign * sin / (std::f64::consts::PI * distance)
+            (sine[k] * cos - cosine[k] * sin) / (std::f64::consts::PI * distance)
         };
         *weight = sinc * window[k];
     }
     weights
+}
+
+/// The per-tap sine and cosine of the kernel's phase.
+fn resample_phases(scale: f64) -> ([f64; RESAMPLE_TAPS], [f64; RESAMPLE_TAPS]) {
+    let mut sine = [0.0f64; RESAMPLE_TAPS];
+    let mut cosine = [0.0f64; RESAMPLE_TAPS];
+    for (k, value) in sine.iter_mut().enumerate() {
+        let m = k as f64 - RESAMPLE_HALF as f64;
+        let phase = std::f64::consts::PI * scale * m;
+        *value = phase.sin();
+        cosine[k] = phase.cos();
+    }
+    (sine, cosine)
 }
 
 /// Resample `source` into `out` one frame at a time with `SoundSource::frame`.
@@ -587,6 +616,8 @@ fn mix_source_per_frame(
     let p = pan.clamp(-1.0, 1.0);
     let (left_gain, right_gain) = (1.0 - p.max(0.0), 1.0 - (-p).max(0.0));
     let window = resample_window();
+    let scale = kernel_scale(src_rate, out_rate, rate);
+    let (sine, cosine) = resample_phases(scale);
     for (index, frame) in out.chunks_exact_mut(out_channels).enumerate() {
         let t = position_seconds + index as f64 / out_rate * rate;
         let sample_pos = (t * src_rate).max(0.0);
@@ -596,7 +627,7 @@ fn mix_source_per_frame(
         let i0 = sample_pos.floor();
         let i0u = i0 as u64;
         let frac = sample_pos - i0;
-        let weights = resample_weights(frac, &window);
+        let weights = resample_weights(frac, &window, scale, &sine, &cosine);
         let mut left = 0.0f64;
         let mut right = 0.0f64;
         let mut weight_sum = 0.0f64;
@@ -1299,7 +1330,7 @@ fn render_does_no_decode_when_the_worker_already_buffered() {
         before,
         "a render from a full buffer must not decode (WaveImpl.cpp:1448-1487)"
     );
-    assert_eq!(out[0], 0.0);
+    assert!(out[0].abs() < 1e-12, "the first ramp sample is silence");
     assert_eq!(out[1234], 1234.0);
 }
 
@@ -1590,10 +1621,7 @@ fn measured_frequency(samples: &[f32], rate: u32) -> f64 {
 /// The mixer converts a source to the output rate by interpolating between
 /// the neighbouring source frames. The conversion must keep the pitch: a
 /// movie track that plays a fifth too high or too low is a defect no rate
-/// conversion may have. The conversion is a plain interpolation and not a
-/// band-limited resampler, so content near the source's Nyquist frequency is
-/// attenuated and folded back; that is a known divergence from the audio
-/// device's own resampler.
+/// conversion may have.
 #[test]
 fn a_source_at_another_rate_keeps_its_pitch() {
     let mut mixer = Mixer::new();
@@ -1608,5 +1636,56 @@ fn a_source_at_another_rate_keeps_its_pitch() {
     assert!(
         (hz - 440.0).abs() < 5.0,
         "the tone measured {hz:.1} Hz instead of 440 Hz"
+    );
+}
+
+/// The amplitude of `samples` at `frequency`.
+///
+/// The Goertzel algorithm: the magnitude of one bin of the discrete Fourier
+/// transform, normalised to the amplitude of a sine in the same samples.
+fn amplitude_at(samples: &[f32], rate: u32, frequency: f64) -> f32 {
+    if samples.is_empty() || rate == 0 {
+        return 0.0;
+    }
+    let omega = 2.0 * PI * frequency / f64::from(rate);
+    let coefficient = 2.0 * omega.cos();
+    let mut previous = 0.0f64;
+    let mut before = 0.0f64;
+    for sample in samples {
+        let current = f64::from(*sample) + coefficient * previous - before;
+        before = previous;
+        previous = current;
+    }
+    let power = previous * previous + before * before - coefficient * previous * before;
+    let magnitude = power.max(0.0).sqrt();
+    (2.0 * magnitude / samples.len() as f64) as f32
+}
+
+/// A source at another rate does not fold its top band back.
+///
+/// The mixer converts a source to the output rate with a windowed-sinc
+/// kernel whose passband follows the output rate: the content above the
+/// output's Nyquist frequency is rejected instead of being folded back into
+/// the band. A 23.5 kHz tone in a 48 kHz source played into a 44.1 kHz
+/// output would otherwise come out as a 20.6 kHz tone at its own level.
+#[test]
+fn a_source_at_another_rate_does_not_fold_its_top_band_back() {
+    let mut mixer = Mixer::new();
+    let id = mixer.spawn_channel();
+    mixer
+        .channel(id)
+        .unwrap()
+        .play(tone_at(48_000, 1, 0.4, 23_500.0));
+
+    // 200 ms at 44.1 kHz, from a 48 kHz source.
+    let mut out = vec![0.0f32; 8820];
+    mixer.mix(&mut out, out_spec(44_100, 1)).unwrap();
+
+    // The tone would fold to 44.1 - 23.5 = 20.6 kHz.
+    let folded = amplitude_at(&out[2205..], 44_100, 20_600.0);
+    assert!(
+        folded < 0.02,
+        "the folded tone measured {folded}, the band above the output's Nyquist \
+         frequency must be rejected"
     );
 }

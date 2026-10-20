@@ -1,8 +1,6 @@
 //! `System` native class.
 //!
-//! Behavioral reference: `crates/tvp-natives/src/system.rs` (itself a
-//! port of `reference/cpp/core/base/impl/SystemImpl.cpp`). This is a
-//! reimplementation on the layered API: the class composes the L2
+//! `System` is the process and OS fact class. It composes the L2
 //! `engine_api::Storage` and `engine_api::Scene` services, the `tjs` VM and the
 //! per-engine dispatch state kept in [`CompatServices::state`] — it owns no
 //! process global.
@@ -738,10 +736,10 @@ extern "C" fn native_get_tick_count(
     0
 }
 
-/// `System.getArgument(name [, default])`
+/// `System.getArgument(name)`
 ///
-/// Returns the stored value, the caller's default (type-preserving) when the
-/// name is missing, or void when no default was given.
+/// Returns the stored value, or void when the name is missing. Extra
+/// arguments are ignored; there is no default parameter.
 extern "C" fn native_get_argument(
     engine: *mut c_void,
     argc: c_int,

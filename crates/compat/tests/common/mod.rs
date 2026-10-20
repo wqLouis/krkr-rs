@@ -244,6 +244,38 @@ impl Env {
         }
         adapter.end_input_frame(&mut ctx);
     }
+
+    /// Link a built-in plugin the way a game script does: `Plugins.link`.
+    ///
+    /// A plugin's members exist only after its first link, so a test that
+    /// exercises an attached member calls this before the script that uses
+    /// it.
+    pub fn link_plugin(&self, dll: &str) {
+        link_plugin(&self.engine, dll);
+    }
+}
+
+/// Link a built-in plugin on `engine` (`Plugins.link`).
+///
+/// The engine must already have a compat host installed. Panics with the VM's
+/// message when the link raises, so a missing built-in is a test failure
+/// rather than an absent member later.
+pub fn link_plugin(engine: &tjs::Tjs2Engine, dll: &str) {
+    engine
+        .exec_script_discard(&format!("Plugins.link('{dll}');"), "compat-test-link")
+        .unwrap_or_else(|error| panic!("Plugins.link({dll:?}) failed: {error}"));
+}
+
+/// Link every ported plugin on `engine`.
+///
+/// Test environments that exercise member dispatch need the plugin-attached
+/// members present, and the reference publishes them on the first link, not
+/// at engine startup. The regression that pins the pre-link absence builds
+/// its own environment instead of calling this.
+pub fn link_all_builtins(engine: &tjs::Tjs2Engine) {
+    for name in compat::builtin_plugin_names() {
+        link_plugin(engine, name);
+    }
 }
 
 /// Execute `write` as a statement list, then evaluate `read` separately.

@@ -443,8 +443,8 @@ impl VideoOverlay {
     }
 
     /// Enter prepare mode: pause, rewind and play; the `perPrepare`
-    /// `onPeriod` event fires on the first decoded frame (reference
-    /// `vo_prepare`).
+    /// `onPeriod` event fires on the first decoded frame after the caller has
+    /// shown that picture and called [`Self::complete_prepare`].
     ///
     /// # Errors
     ///
@@ -651,9 +651,10 @@ impl VideoOverlay {
     /// Presenting a frame fires the frame-update event: the event belongs to
     /// a decoded frame, not to the clock.
     ///
-    /// A frame also ends prepare mode: the prepare event, the pause and the
-    /// rewind belong to a delivered frame, so the prepare ends on the first
-    /// frame that arrives.
+    /// A frame delivered while prepare mode is armed does not end it: the
+    /// caller shows the picture and then calls [`Self::complete_prepare`], so
+    /// the prepare event and the pause/rewind happen after the picture is on
+    /// screen.
     ///
     /// # Errors
     ///
@@ -670,15 +671,15 @@ impl VideoOverlay {
         }
         self.frame = Some(frame);
         self.emit_frame_update();
-        self.complete_prepare();
         Ok(())
     }
 
-    /// End prepare mode now that a frame arrived.
+    /// End prepare mode now that the caller has shown the frame that ended it.
     ///
     /// The period event comes first, then the pause and the rewind, so the
-    /// script sees the event before the status change.
-    fn complete_prepare(&mut self) {
+    /// script sees the event before the status change. Calling this outside
+    /// prepare mode does nothing.
+    pub fn complete_prepare(&mut self) {
         if !self.preparing {
             return;
         }

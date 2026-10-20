@@ -2057,11 +2057,11 @@ pub fn mix_source(
 /// The number of source frames the resampler convolves per output frame.
 ///
 /// A windowed sinc needs several frames on either side of the point it
-/// interpolates, and its passband reaches `0.5 - 2/taps` of the source's
-/// rate: sixty-five taps keep the passband flat to within a twentieth of the
-/// source's Nyquist frequency, so a converted track keeps the whole spectrum
-/// a source can hold, and the kernel's stopband stays below the noise floor
-/// of a 16-bit source.
+/// interpolates, and its passband reaches `0.5 - 2/taps` of the rate the
+/// kernel is scaled to: sixty-five taps keep the passband flat to within a
+/// twentieth of that Nyquist frequency, so a converted track keeps the whole
+/// spectrum a source can hold, and the kernel's stopband stays below the
+/// noise floor of a 16-bit source.
 ///
 /// The count is odd so the kernel is symmetric around the interpolated
 /// frame: a symmetric kernel reproduces a ramp exactly, and a ramp is what
@@ -2079,33 +2079,94 @@ fn resample_window() -> [f64; RESAMPLE_TAPS] {
     let mut window = [0.0f64; RESAMPLE_TAPS];
     for (k, value) in window.iter_mut().enumerate() {
         let t = k as f64 / (RESAMPLE_TAPS - 1) as f64;
-        let phase = std::f64::consts::PI * t;
+        let phase = std::f64::consts::TAU * t;
         *value = 0.42 - 0.5 * phase.cos() + 0.08 * (2.0 * phase).cos();
     }
     window
 }
 
-/// The windowed-sinc weights for the fractional source position `frac`.
+/// The windowed-sinc kernel of one conversion.
 ///
-/// The kernel is a sinc windowed with a Blackman window. The sinc's
-/// argument is `m - frac` with an integer `m`, so every tap's sine comes
-/// from the same `sin(pi * frac)`.
-fn resample_weights(frac: f64, window: &[f64; RESAMPLE_TAPS]) -> [f64; RESAMPLE_TAPS] {
-    let sin = (std::f64::consts::PI * frac).sin();
-    let mut weights = [0.0f64; RESAMPLE_TAPS];
-    for (k, weight) in weights.iter_mut().enumerate() {
-        let m = k as i64 - RESAMPLE_HALF as i64;
-        let distance = m as f64 - frac;
-        let sinc = if distance.abs() < f64::EPSILON {
-            1.0
-        } else {
-            // `sin(pi * (m - frac))` is `(-1)^(m+1) * sin(pi * frac)`.
-            let sign = if m.rem_euclid(2) == 0 { -1.0 } else { 1.0 };
-            sign * sin / (std::f64::consts::PI * distance)
-        };
-        *weight = sinc * window[k];
+/// The kernel convolves the source frames around the interpolated one, so it
+/// interpolates on the source's sample grid and its passband reaches the
+/// source's own Nyquist frequency. A conversion that reads the source faster
+/// than the output plays has to narrow that passband: the content above the
+/// output's Nyquist frequency would fold back into the band. The scale is
+/// the ratio of the two rates, capped at one.
+///
+/// The kernel's sine is the difference of two products, so the per-tap values
+/// are computed once per conversion: `sin(pi·scale·(m - frac))` is
+/// `A·cos(pi·scale·frac) - B·sin(pi·scale·frac)` with `A = sin(pi·scale·m)`
+/// and `B = cos(pi·scale·m)`.
+struct ResampleKernel {
+    /// The scale of the kernel's passband.
+    scale: f64,
+    /// `sin(pi·scale·m)` for every tap.
+    sine: [f64; RESAMPLE_TAPS],
+    /// `cos(pi·scale·m)` for every tap.
+    cosine: [f64; RESAMPLE_TAPS],
+}
+
+impl ResampleKernel {
+    /// The kernel for a conversion from `src_rate` to `out_rate` that plays
+    /// the source at `rate`.
+    fn new(src_rate: f64, out_rate: f64, rate: f64) -> Self {
+        let scale = kernel_scale(src_rate, out_rate, rate);
+        let mut sine = [0.0f64; RESAMPLE_TAPS];
+        let mut cosine = [0.0f64; RESAMPLE_TAPS];
+        for (k, value) in sine.iter_mut().enumerate() {
+            let m = k as f64 - RESAMPLE_HALF as f64;
+            let phase = std::f64::consts::PI * scale * m;
+            *value = phase.sin();
+            cosine[k] = phase.cos();
+        }
+        Self {
+            scale,
+            sine,
+            cosine,
+        }
     }
-    weights
+
+    /// The windowed-sinc weights for the fractional source position `frac`.
+    ///
+    /// The kernel is a sinc windowed with a Blackman window. The sinc's
+    /// argument is `scale·(m - frac)` with an integer `m`, so every tap's
+    /// sine comes from the same `sin(pi·scale·frac)`.
+    fn weights(&self, frac: f64, window: &[f64; RESAMPLE_TAPS]) -> [f64; RESAMPLE_TAPS] {
+        let phase = std::f64::consts::PI * self.scale * frac;
+        let (sin, cos) = (phase.sin(), phase.cos());
+        let mut weights = [0.0f64; RESAMPLE_TAPS];
+        for (k, weight) in weights.iter_mut().enumerate() {
+            let m = k as f64 - RESAMPLE_HALF as f64;
+            let distance = self.scale * (m - frac);
+            let sinc = if distance.abs() < f64::EPSILON {
+                1.0
+            } else {
+                (self.sine[k] * cos - self.cosine[k] * sin) / (std::f64::consts::PI * distance)
+            };
+            *weight = sinc * window[k];
+        }
+        weights
+    }
+}
+
+/// The scale of the kernel's passband.
+///
+/// The kernel interpolates on the source's sample grid, so its passband
+/// reaches the source's own Nyquist frequency. A conversion that reads the
+/// source faster than the output plays has to narrow it: the content above
+/// the output's Nyquist frequency would fold back into the band.
+///
+/// The ratio is the output rate over the source's rate, scaled by the
+/// playback rate, and capped at one: an upsampling conversion keeps the
+/// source's own band.
+fn kernel_scale(src_rate: f64, out_rate: f64, rate: f64) -> f64 {
+    let ratio = out_rate / (rate * src_rate);
+    if ratio.is_finite() && ratio > 0.0 {
+        ratio.min(1.0)
+    } else {
+        1.0
+    }
 }
 
 /// Render one source into `out` without revalidating the output spec.
@@ -2133,6 +2194,7 @@ fn accumulate_source(
     let (left_gain, right_gain) = pan_gains(pan);
     let out_frames = out.len() / out_channels;
     let window = resample_window();
+    let kernel = ResampleKernel::new(src_rate, out_rate, rate);
 
     // The source frames the resampler needs are contiguous, so load them into
     // a scratch window in bulk and convolve from there. A streaming source
@@ -2203,7 +2265,7 @@ fn accumulate_source(
         // The kernel convolves the frames around the interpolated one. The
         // weights are normalised over the frames the window actually holds,
         // so a track that ends inside the kernel keeps its gain.
-        let weights = resample_weights(frac, &window);
+        let weights = kernel.weights(frac, &window);
         let mut left = 0.0f64;
         let mut right = 0.0f64;
         let mut weight_sum = 0.0f64;
@@ -2266,6 +2328,118 @@ mod tests {
     use api::media::AudioSpec;
 
     use super::*;
+
+    /// The magnitude of the kernel's response at `frequency`, in decibels.
+    ///
+    /// The response is measured on the normalised kernel — the weights are
+    /// divided by their sum, the way the mixer convolves with them — so it is
+    /// relative to the signal's own level.
+    fn kernel_gain_db(
+        kernel: &ResampleKernel,
+        window: &[f64; RESAMPLE_TAPS],
+        frac: f64,
+        frequency: f64,
+        rate: f64,
+    ) -> f64 {
+        let weights = kernel.weights(frac, window);
+        let sum: f64 = weights.iter().sum();
+        let mut real = 0.0;
+        let mut imaginary = 0.0;
+        for (k, weight) in weights.iter().enumerate() {
+            let m = k as f64 - RESAMPLE_HALF as f64;
+            let phase = std::f64::consts::TAU * frequency * m / rate;
+            let scaled = weight / sum;
+            real += scaled * phase.cos();
+            imaginary -= scaled * phase.sin();
+        }
+        let magnitude = (real * real + imaginary * imaginary).sqrt();
+        20.0 * magnitude.max(f64::MIN_POSITIVE).log10()
+    }
+
+    /// The window is the Blackman window over the kernel: it vanishes at both
+    /// of its ends and peaks at its centre, and it is symmetric about that
+    /// centre. A window that is not symmetric makes the kernel one-sided, and
+    /// the response it produces is neither flat nor linear in phase.
+    #[test]
+    fn the_resample_window_is_symmetric_about_its_centre() {
+        let window = resample_window();
+        for k in 0..RESAMPLE_TAPS {
+            let mirrored = RESAMPLE_TAPS - 1 - k;
+            assert!(
+                (window[k] - window[mirrored]).abs() < 1e-12,
+                "tap {k} is {} and tap {mirrored} is {}",
+                window[k],
+                window[mirrored]
+            );
+        }
+        assert!(
+            window[0].abs() < 1e-12,
+            "the window must vanish at its ends, it starts at {}",
+            window[0]
+        );
+        assert!(
+            (window[RESAMPLE_HALF] - 1.0).abs() < 1e-12,
+            "the window must peak at its centre, it is {} there",
+            window[RESAMPLE_HALF]
+        );
+    }
+
+    /// The kernel passes the band the output can hold and rejects the band
+    /// above it: a conversion to a lower output rate narrows the passband to
+    /// the output's Nyquist frequency, so the content above it is removed
+    /// instead of folding back into the band.
+    #[test]
+    fn the_kernel_keeps_the_passband_and_rejects_the_folded_band() {
+        let window = resample_window();
+        // A 48 kHz source played into a 44.1 kHz output: the output's
+        // Nyquist frequency is 22.05 kHz.
+        let kernel = ResampleKernel::new(48_000.0, 44_100.0, 1.0);
+        for frac in [0.0, 0.5] {
+            let passband = kernel_gain_db(&kernel, &window, frac, 1_000.0, 48_000.0);
+            assert!(
+                passband.abs() < 0.01,
+                "the 1 kHz gain is {passband} dB at frac {frac}"
+            );
+            let upper = kernel_gain_db(&kernel, &window, frac, 20_000.0, 48_000.0);
+            assert!(
+                upper.abs() < 0.05,
+                "the 20 kHz gain is {upper} dB at frac {frac}"
+            );
+            let folded = kernel_gain_db(&kernel, &window, frac, 23_500.0, 48_000.0);
+            assert!(
+                folded < -20.0,
+                "the 23.5 kHz gain is {folded} dB at frac {frac}, the band above the \
+                 output's Nyquist frequency must be rejected"
+            );
+        }
+    }
+
+    /// A conversion that does not lower the rate keeps the source's own
+    /// band: the kernel is not narrowed, so the source's top is passed.
+    #[test]
+    fn an_equal_rate_conversion_keeps_the_source_band() {
+        let window = resample_window();
+        let kernel = ResampleKernel::new(48_000.0, 48_000.0, 1.0);
+        let top = kernel_gain_db(&kernel, &window, 0.0, 23_000.0, 48_000.0);
+        assert!(
+            top.abs() < 0.01,
+            "the 23 kHz gain is {top} dB, an equal rate conversion must not narrow the band"
+        );
+    }
+
+    /// The scale follows the rates: a conversion to a lower rate narrows the
+    /// kernel, a conversion to a higher one keeps it, and a playback rate
+    /// counts as a faster read of the source.
+    #[test]
+    fn the_kernel_scale_follows_the_rates() {
+        assert_eq!(kernel_scale(48_000.0, 44_100.0, 1.0), 44_100.0 / 48_000.0);
+        assert_eq!(kernel_scale(48_000.0, 48_000.0, 1.0), 1.0);
+        assert_eq!(kernel_scale(44_100.0, 48_000.0, 1.0), 1.0);
+        assert_eq!(kernel_scale(48_000.0, 48_000.0, 2.0), 0.5);
+        // A rate that does not describe a conversion keeps the source's band.
+        assert_eq!(kernel_scale(48_000.0, 48_000.0, 0.0), 1.0);
+        assert_eq!(kernel_scale(48_000.0, 48_000.0, -1.0), 1.0);
+    }
 
     /// A stream whose decoder reports a hard failure on the first read.
     struct FailingStream {

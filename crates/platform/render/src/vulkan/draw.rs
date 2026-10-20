@@ -43,7 +43,6 @@ struct PushConstants {
 const _: () = assert!(std::mem::size_of::<PushConstants>() as u32 == super::PUSH_CONSTANT_SIZE);
 
 /// The frame-wide resources one scene traversal records with.
-#[derive(Clone, Copy)]
 pub(crate) struct SceneDraw<'a> {
     /// Logical device the command buffer belongs to.
     pub(crate) device: &'a ash::Device,
@@ -53,6 +52,13 @@ pub(crate) struct SceneDraw<'a> {
     pub(crate) pipelines: &'a PipelineSet,
     /// Uploaded textures keyed by texture identity.
     pub(crate) textures: &'a HashMap<u64, VulkanTexture>,
+    /// Custom effect pipelines and the frame's uniform ring, when the caller
+    /// has one. A scene with an effect draw and no state here is an error, not
+    /// a skipped draw.
+    pub(crate) effects: Option<&'a mut super::effect::EffectState>,
+    /// Render pass the command buffer is inside: an effect pipeline is built
+    /// per pass.
+    pub(crate) render_pass: vk::RenderPass,
     /// Target extent in device pixels.
     pub(crate) extent: vk::Extent2D,
     /// Whether the target format is an sRGB surface.
@@ -71,7 +77,7 @@ pub(crate) struct SceneDraw<'a> {
 /// Vulkan backend does not implement (mask clips, GPU glyph runs or
 /// destination-dependent blend modes).
 pub(crate) fn record_scene(
-    draw: &SceneDraw<'_>,
+    draw: SceneDraw<'_>,
     scene: &RenderScene,
     root: &Affine2,
 ) -> Result<(), RenderError> {
@@ -80,19 +86,22 @@ pub(crate) fn record_scene(
         command,
         pipelines,
         textures,
+        effects,
+        render_pass,
         extent,
         srgb,
-    } = *draw;
+    } = draw;
     let mut recorder = Recorder {
         device,
         command,
         pipelines,
         textures,
+        effects,
+        render_pass,
         scene,
         extent,
         srgb,
-        bound_pipeline: None,
-        bound_descriptor: None,
+        cache: BindCache::default(),
     };
 
     // SAFETY: the command buffer is recording; the vertex buffer is owned by
@@ -127,17 +136,60 @@ struct QuadDraw<'a> {
     scissor: vk::Rect2D,
 }
 
+/// What the recorder believes is bound in the command buffer.
+///
+/// The recorder skips a bind when the handle is already the bound one. A draw
+/// that binds another pipeline or another set behind the recorder's back must
+/// invalidate the cache, or the next draw runs with the wrong pipeline.
+#[derive(Clone, Copy, Default)]
+struct BindCache {
+    /// Pipeline bound for graphics draws.
+    pipeline: Option<vk::Pipeline>,
+    /// Descriptor set bound for graphics draws.
+    descriptor: Option<vk::DescriptorSet>,
+}
+
+impl BindCache {
+    /// Whether the pipeline must be bound before the next draw.
+    fn needs_pipeline(&self, pipeline: vk::Pipeline) -> bool {
+        self.pipeline != Some(pipeline)
+    }
+
+    /// Whether the descriptor set must be bound before the next draw.
+    fn needs_descriptor(&self, set: vk::DescriptorSet) -> bool {
+        self.descriptor != Some(set)
+    }
+
+    /// Records the bound pipeline.
+    fn bind_pipeline(&mut self, pipeline: vk::Pipeline) {
+        self.pipeline = Some(pipeline);
+    }
+
+    /// Records the bound descriptor set.
+    fn bind_descriptor(&mut self, set: vk::DescriptorSet) {
+        self.descriptor = Some(set);
+    }
+
+    /// Forgets what is bound, because another pipeline or set was bound.
+    fn invalidate(&mut self) {
+        self.pipeline = None;
+        self.descriptor = None;
+    }
+}
+
 /// Command-recording traversal state.
 struct Recorder<'a> {
     device: &'a ash::Device,
     command: vk::CommandBuffer,
     pipelines: &'a PipelineSet,
     textures: &'a HashMap<u64, VulkanTexture>,
+    effects: Option<&'a mut super::effect::EffectState>,
+    render_pass: vk::RenderPass,
     scene: &'a RenderScene,
     extent: vk::Extent2D,
     srgb: bool,
-    bound_pipeline: Option<vk::Pipeline>,
-    bound_descriptor: Option<vk::DescriptorSet>,
+    /// The pipeline and descriptor set the command buffer has bound.
+    cache: BindCache,
 }
 
 impl Recorder<'_> {
@@ -270,6 +322,37 @@ impl Recorder<'_> {
             RenderContent::Glyphs(_) => Err(RenderError::Unsupported {
                 message: "GPU glyph runs are not implemented by the Vulkan backend".to_owned(),
             }),
+            RenderContent::Effect(effect) => {
+                // Copy the borrowed fields out before the mutable borrow of the
+                // effect state below.
+                let device = self.device;
+                let command = self.command;
+                let render_pass = self.render_pass;
+                let textures = self.textures;
+                let mvp = to_ndc(world, self.extent);
+                let Some(effects) = self.effects.as_deref_mut() else {
+                    return Err(RenderError::Unsupported {
+                        message: "a scene with an effect draw needs an effect pipeline state"
+                            .to_owned(),
+                    });
+                };
+                let recorded = effects.record(
+                    &super::effect::EffectDrawContext {
+                        device,
+                        command,
+                        render_pass,
+                        textures,
+                        mvp,
+                        opacity,
+                        scissor,
+                    },
+                    effect,
+                );
+                // The effect draw binds its own pipeline and its own
+                // descriptor set, so the cache no longer says what is bound.
+                self.cache.invalidate();
+                recorded
+            }
         }
     }
 
@@ -287,16 +370,16 @@ impl Recorder<'_> {
         let pipeline = self.pipelines.pipeline_for(program, blend)?;
         // SAFETY: the command buffer is recording and every handle is live.
         unsafe {
-            if self.bound_pipeline != Some(pipeline) {
+            if self.cache.needs_pipeline(pipeline) {
                 self.device.cmd_bind_pipeline(
                     self.command,
                     vk::PipelineBindPoint::GRAPHICS,
                     pipeline,
                 );
-                self.bound_pipeline = Some(pipeline);
+                self.cache.bind_pipeline(pipeline);
             }
             if let Some(set) = descriptor
-                && self.bound_descriptor != Some(set)
+                && self.cache.needs_descriptor(set)
             {
                 self.device.cmd_bind_descriptor_sets(
                     self.command,
@@ -306,7 +389,7 @@ impl Recorder<'_> {
                     &[set],
                     &[],
                 );
-                self.bound_descriptor = Some(set);
+                self.cache.bind_descriptor(set);
             }
 
             let constants = PushConstants {
@@ -486,5 +569,59 @@ pub(crate) fn srgb_to_linear(channel: f32) -> f32 {
         channel / 12.92
     } else {
         ((channel + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ash::vk::Handle;
+
+    use super::*;
+
+    /// The bind decisions a sequence of draws makes.
+    ///
+    /// The sequence mirrors a frame that draws a textured node, an effect node
+    /// and another textured node. The effect node binds its own pipeline and
+    /// its own descriptor set, so the second textured node has to bind again.
+    #[test]
+    fn an_effect_draw_between_two_textured_draws_rebinds() {
+        let textured = vk::Pipeline::from_raw(1);
+        let textured_set = vk::DescriptorSet::from_raw(2);
+        let mut cache = BindCache::default();
+
+        // The first textured draw binds its pipeline and its set.
+        if cache.needs_pipeline(textured) {
+            cache.bind_pipeline(textured);
+        }
+        if cache.needs_descriptor(textured_set) {
+            cache.bind_descriptor(textured_set);
+        }
+        assert!(!cache.needs_pipeline(textured));
+        assert!(!cache.needs_descriptor(textured_set));
+
+        // The effect draw binds another pipeline and another set.
+        cache.invalidate();
+
+        // The second textured draw must bind again, or it would draw with the
+        // effect pipeline and the effect's descriptor set.
+        assert!(cache.needs_pipeline(textured));
+        assert!(cache.needs_descriptor(textured_set));
+    }
+
+    /// Two textured draws over the same set bind once.
+    #[test]
+    fn two_textured_draws_over_one_set_bind_once() {
+        let textured = vk::Pipeline::from_raw(1);
+        let textured_set = vk::DescriptorSet::from_raw(2);
+        let mut cache = BindCache::default();
+
+        if cache.needs_pipeline(textured) {
+            cache.bind_pipeline(textured);
+        }
+        if cache.needs_descriptor(textured_set) {
+            cache.bind_descriptor(textured_set);
+        }
+        assert!(!cache.needs_pipeline(textured));
+        assert!(!cache.needs_descriptor(textured_set));
     }
 }

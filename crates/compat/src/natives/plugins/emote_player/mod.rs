@@ -30,7 +30,8 @@
 //!
 //! In krkr-rs those classes are registered statically by the sibling
 //! [`motion_player`](crate::natives::plugins::motion_player) plugin, which the
-//! aggregator installs right after this one. That port publishes every
+//! plugin table declares as this entry's dependency and loads first. That port
+//! publishes every
 //! `Motion.*` subclass top-level (the class-registration API has no
 //! namespace-only form) and then aliases it into `Motion`; the extra top-level
 //! names are accepted and locked in `docs/surface/runtime_surface.json`. This

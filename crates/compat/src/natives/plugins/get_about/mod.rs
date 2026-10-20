@@ -5,12 +5,12 @@
 //! TVPGetAboutString)` — so it registers one member on the *existing*
 //! `System` class and defines no class of its own.
 //!
-//! That member, `System.getAboutString`, is registered once at startup by the
-//! `windowEx` port (`natives/plugins/window_ex/system.rs`), which owns the
-//! whole `System` extension surface. Registering it again here would be a
-//! duplicate class member (the VM rejects that), so this plugin legitimately
-//! installs nothing: linking `getabout.dll` resolves to the built-in table,
-//! and the surface is already present.
+//! That member, `System.getAboutString`, is registered when the `windowEx`
+//! port is linked (`natives/plugins/window_ex/system.rs`), which owns the
+//! whole `System` extension surface. This entry declares `windowEx.dll` as a
+//! dependency, so linking `getabout.dll` brings in that surface without
+//! recording a separate link; registering it again here would be a duplicate
+//! class member (the VM rejects that).
 
 use crate::{CompatCtx, CompatError};
 

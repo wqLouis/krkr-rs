@@ -15,6 +15,13 @@
 //!   `getVisBuffer(buf, counts, 1, aheads)` and returns the squared peak
 //!   amplitude in `0.0..=1.0` (`(max|sample| / 32768)²`).
 //!
+//! The members are published when a script calls
+//! `Plugins.link("getSample.dll")`, not when the engine starts. The
+//! shipped `system/voice.tjs` relies on that timing: it probes
+//! `typeof WaveSoundBuffer.setDefaultAheads` before linking the module and
+//! only then publishes the `WaveSoundBuffer.enableGetSample` flag its
+//! `onFlip` action reads.
+//!
 //! # Instance state
 //!
 //! The reference keeps the per-object `counts` / `aheads` (and the reusable

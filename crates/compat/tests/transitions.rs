@@ -31,6 +31,8 @@
 mod common;
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use api::fs::{FsPath, OpenMode};
 use api::media::{DecodedImage, ImageInfo};
@@ -85,6 +87,8 @@ struct Env {
     /// Only the rule-image tests use the storage; declared after `host` so
     /// it outlives the binding's raw pointer.
     _storage: Box<Storage>,
+    /// How many times the synthetic codec decoded an image.
+    decode_count: Arc<AtomicU32>,
 }
 
 impl Env {
@@ -103,9 +107,13 @@ impl Env {
         // `tTVPUniversalTransHandlerProvider::StartTransition`,
         // reference/cpp/core/visual/TransIntf.cpp:812-821); the codec is
         // synthetic — it decodes `RULE_BYTES` to the 2x2 checkerboard and
-        // fails anything else.
+        // fails anything else. The counter tells a cached load from a fresh
+        // decode.
+        let decode_count = Arc::new(AtomicU32::new(0));
+        let decoded = Arc::clone(&decode_count);
         host.set_image_codec(
-            |bytes, _hint| {
+            move |bytes, _hint| {
+                decoded.fetch_add(1, Ordering::Relaxed);
                 if bytes == RULE_BYTES {
                     Ok(DecodedImage::new(2, 2, RULE_RGBA.to_vec()))
                 } else {
@@ -135,7 +143,13 @@ impl Env {
             engine,
             _scene: scene,
             _storage: storage,
+            decode_count,
         }
+    }
+
+    /// How many times the synthetic codec decoded an image.
+    fn decodes(&self) -> u32 {
+        self.decode_count.load(Ordering::Relaxed)
     }
 
     fn run(&self, script: &str) {
@@ -1417,6 +1431,64 @@ fn universal_rule_image_is_loaded_grayscale_and_tiled() {
     );
 }
 
+/// The rule graphic is loaded through the scene's decoded-image cache — the
+/// reference's `TVPLoadGraphic` cache path
+/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1878-1960`), which the
+/// universal provider reaches through `LoadImage`
+/// (`reference/cpp/core/visual/TransIntf.cpp:819-821`). A repeated
+/// `beginTransition` with the same rule decodes it once while the cache is
+/// enabled, and the frame it produces is the same either way.
+///
+/// The reference's cache is off by default (`TVPGraphicCacheEnabled = false`,
+/// `GraphicsLoaderIntf.cpp:1433`; `TVPSetGraphicCacheLimit(0)`,
+/// `:2426-2428`), so the default path decodes the rule every time; a script
+/// enables it with `System.graphicCacheLimit`
+/// (`reference/cpp/core/base/SystemIntf.cpp:359-372`).
+///
+/// reference/cpp/core/visual/TransIntf.cpp:819-821
+/// reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1433,1878-1960
+#[test]
+fn the_rule_graphic_goes_through_the_decoded_image_cache() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    // The cache is off, so the rule is decoded for every transition.
+    two_layers(&env, 2);
+    env.run("b.beginTransition('universal', true, a, %[time: 100, rule: 'rule.img']);");
+    env.advance(50.0);
+    assert_eq!(env.decodes(), 1, "the first transition decodes the rule");
+    let uncached = frame_pixel(&env, "dest", 0, 0);
+    // Rule (0,0) is grey 0, so the source-2 opacity is 255.
+    assert_eq!(uncached, blend_rgb(RED, BLUE, 255));
+
+    // The cache is on, so the first transition fills it and the next one hits
+    // it.
+    env.run("System.graphicCacheLimit = 1048576;");
+    two_layers(&env, 2);
+    env.run("b.beginTransition('universal', true, a, %[time: 100, rule: 'rule.img']);");
+    env.advance(50.0);
+    assert_eq!(
+        env.decodes(),
+        2,
+        "the first cached transition decodes the rule"
+    );
+    let cached = frame_pixel(&env, "dest", 0, 0);
+    assert_eq!(
+        cached, uncached,
+        "the cached rule gives the same frame as the uncached one"
+    );
+
+    two_layers(&env, 2);
+    env.run("b.beginTransition('universal', true, a, %[time: 100, rule: 'rule.img']);");
+    env.advance(50.0);
+    assert_eq!(env.decodes(), 2, "the cached rule is not decoded again");
+    assert_eq!(
+        frame_pixel(&env, "dest", 0, 0),
+        uncached,
+        "the cached rule gives the same frame as the uncached one"
+    );
+}
+
 /// `vague` defaults to 64 (`TransIntf.cpp:806-810`) and drives the soft
 /// edge of `TVPInitUnivTransBlendTable_c` (`tvpgl.cpp:4576-4594`). With the
 /// 0/128 checkerboard rule mid-flight: the default equals an explicit
@@ -1857,4 +1929,145 @@ fn rotateswap_ignores_centre_options() {
     let plain = extrans_grid(&env, "rotateswap", "", 16);
     let centred = extrans_grid(&env, "rotateswap", ", centerx: 0, centery: 0", 16);
     assert_eq!(plain, centred, "rotateswap has no centre option");
+}
+
+/// The bitmap ids with a pending texture upload.
+fn dirty_bitmaps(env: &Env) -> Vec<u32> {
+    let mut ids: Vec<u32> = env
+        ._scene
+        .bitmaps
+        .iter()
+        .filter(|bitmap| bitmap.dirty)
+        .map(|bitmap| bitmap.id)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// A host that composites transition frames records the frame the projection
+/// draws — the two sources placed in the layer's frame
+/// (`reference/cpp/core/visual/TransIntf.cpp:592-600`) — instead of blending a
+/// display bitmap on the CPU every tick. Nothing is written into a bitmap, so a
+/// running transition adds no upload.
+#[test]
+fn a_composited_transition_records_its_frame_and_writes_no_bitmap() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    env._scene.composite_transition_frames = true;
+    two_layers(&env, 2);
+    env.run("b.beginTransition('crossfade', true, a, %[time: 100]);");
+    // The engine uploads the main images the script wrote before the first
+    // frame; nothing else is pending.
+    for id in dirty_bitmaps(&env) {
+        env._scene.set_bitmap_clean(id);
+    }
+    assert!(dirty_bitmaps(&env).is_empty());
+
+    env.advance(25.0);
+    let first = named_layer(&env, "dest")
+        .transition_frame
+        .expect("a composited frame");
+    assert_eq!(first.size, (2, 2));
+    assert!(first.covers_layer, "a whole-subtree frame covers the layer");
+    assert_eq!(first.src1.alpha, 1.0);
+    assert!(
+        first.src2.alpha > 0.0 && first.src2.alpha < 1.0,
+        "the fade source carries phase/256, got {}",
+        first.src2.alpha
+    );
+    assert!(
+        cache_bitmap_of(&env, "dest").is_none(),
+        "the composited frame needs no display bitmap"
+    );
+    assert!(
+        self_image_of(&env, "dest").is_none(),
+        "the composited frame needs no self image"
+    );
+    let after_first = dirty_bitmaps(&env);
+
+    env.advance(25.0);
+    let second = named_layer(&env, "dest")
+        .transition_frame
+        .expect("a composited frame");
+    assert!(
+        second.src2.alpha > first.src2.alpha,
+        "the frame advances: {} then {}",
+        first.src2.alpha,
+        second.src2.alpha
+    );
+    assert_eq!(
+        after_first,
+        dirty_bitmaps(&env),
+        "a composited transition frame is not re-uploaded per tick"
+    );
+    assert!(
+        after_first.is_empty(),
+        "no bitmap is written while the frame runs: {after_first:?}"
+    );
+
+    env.run("b.stopTransition();");
+    assert!(
+        named_layer(&env, "dest").transition_frame.is_none(),
+        "the teardown clears the frame"
+    );
+}
+
+/// The headless CPU path blends the same frame into the destination's display
+/// bitmap every tick, which is exactly the per-tick full-frame write the
+/// composited path avoids.
+#[test]
+fn the_cpu_path_blends_the_display_bitmap_every_tick() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    two_layers(&env, 2);
+    env.run("b.beginTransition('crossfade', true, a, %[time: 100]);");
+    for id in dirty_bitmaps(&env) {
+        env._scene.set_bitmap_clean(id);
+    }
+
+    env.advance(25.0);
+    let frame = transition_frame(&env, "dest");
+    assert_eq!(frame_pixel(&env, "dest", 0, 0), blend_rgb(RED, BLUE, 63));
+    assert!(
+        dirty_bitmaps(&env).contains(&frame),
+        "the CPU path writes (and so uploads) the display bitmap"
+    );
+    assert!(
+        named_layer(&env, "dest").transition_frame.is_none(),
+        "the CPU path records no frame"
+    );
+
+    env._scene.set_bitmap_clean(frame);
+    assert!(!dirty_bitmaps(&env).contains(&frame));
+    env.advance(25.0);
+    assert!(
+        dirty_bitmaps(&env).contains(&frame),
+        "every tick writes the display bitmap again"
+    );
+}
+
+/// A host whose backend cannot run effect pipelines has no pipeline for the
+/// transition's program, so the transition blends its display bitmap on the
+/// CPU and records no custom-shader draw. The draw is what a GPU host
+/// records instead.
+#[test]
+fn a_host_without_effect_pipelines_records_no_effect_draw() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    two_layers(&env, 2);
+    env.run("b.beginTransition('crossfade', true, a, %[time: 100]);");
+    env.advance(25.0);
+
+    assert!(
+        named_layer(&env, "dest").effect.is_none(),
+        "a host without effect pipelines records no effect draw"
+    );
+    assert!(
+        env._scene.effect_pipelines.is_empty(),
+        "the headless host has no effect pipeline"
+    );
+    assert!(
+        dirty_bitmaps(&env).contains(&transition_frame(&env, "dest")),
+        "the CPU path writes the display bitmap instead"
+    );
 }

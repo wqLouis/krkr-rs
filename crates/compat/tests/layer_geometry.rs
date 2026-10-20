@@ -71,6 +71,7 @@ impl Env {
                 .attach_storage(storage.as_mut() as *mut Storage);
         }
         host.install(&engine).expect("install compat surface");
+        common::link_all_builtins(&engine);
         Env {
             host,
             engine,

@@ -29,7 +29,9 @@ mod startup;
 mod video;
 mod window_ex;
 
-use api::config::CacheLimit;
+use std::time::Duration;
+
+use api::config::{CacheLimit, FrameRateLimit};
 use api::error::RenderError;
 use api::host::SurfaceEvent;
 use engine::Scene;
@@ -46,7 +48,7 @@ pub use audio::install_audio_decoder;
 pub(crate) use audio::install_audio_decoder_metered;
 pub use game::{GameError, GameHost};
 pub(crate) use image_codec::install_image_codec_metered;
-pub use image_codec::{install_image_codec, install_image_codec_on};
+pub use image_codec::{install_image_codec, install_image_codec_on, install_image_decoder};
 pub use render::{BackendKind, FrameStats};
 // The emulator entry point. A launcher resolves `Launch` (including the
 // `RuntimeConfig` it loaded its own way) and calls `run`; see the `runner`
@@ -139,6 +141,11 @@ pub struct HostConfig {
     /// The decoded-image cache policy, or `None` to keep the engine default
     /// (disabled, as in the reference). See [`CacheLimit`].
     pub graphic_cache_limit: Option<CacheLimit>,
+    /// Frame period the caller paces its loop at.
+    ///
+    /// It sets the presentation budget a frame may spend waiting for the
+    /// display, so the wait is bounded by the loop's own cadence.
+    pub frame_interval: Duration,
 }
 
 impl Default for HostConfig {
@@ -153,6 +160,7 @@ impl Default for HostConfig {
             display_handle: None,
             debug_overlay: false,
             graphic_cache_limit: None,
+            frame_interval: Duration::from_secs_f64(FrameRateLimit::DEFAULT.period_secs()),
         }
     }
 }
@@ -253,6 +261,7 @@ impl Host {
             application_name: config.application_name,
             preferred_format: TextureFormat::Rgba8Srgb,
             validation: config.validation,
+            frame_interval: config.frame_interval,
         })?;
         let fs = FileSystem::memory();
         let media = Media::new();

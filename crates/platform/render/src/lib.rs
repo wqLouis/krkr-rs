@@ -37,6 +37,7 @@
 #![deny(unsafe_code)]
 
 mod cpu;
+mod effect;
 pub mod glyph;
 mod null;
 pub mod render_target;
@@ -46,12 +47,14 @@ pub mod texture;
 pub mod vulkan;
 
 use std::fmt;
+use std::time::Duration;
 
 use api::error::RenderError;
 use api::geometry::PixelRegion;
 use api::host::{Presentation, SurfaceEvent};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
+pub use crate::effect::{EffectPipeline, RenderEffect};
 pub use crate::glyph::{
     Font, FontSystem, create_font_system, font_metrics, glyph_advance, load_font, rasterize_glyph,
 };
@@ -66,6 +69,7 @@ use crate::state::StateKind;
 pub use crate::state::{RenderState, Surface};
 pub use crate::texture::{Texture, TextureDesc, TextureFormat};
 pub use api::glyph::{FontMetrics, GlyphBitmap, GlyphStyle};
+pub use api::shader::EffectPipelineDesc;
 
 use crate::vulkan::VulkanPipeline;
 
@@ -100,6 +104,12 @@ pub struct PipelineConfig {
     pub preferred_format: TextureFormat,
     /// Whether backend validation should be enabled.
     pub validation: bool,
+    /// Frame period the caller paces its loop at.
+    ///
+    /// The presentation budget a frame may spend waiting for the display is
+    /// derived from it (see [`presentation_budget`]), so the wait is bounded
+    /// by the frame's own cadence rather than by a fixed constant.
+    pub frame_interval: Duration,
 }
 
 impl Default for PipelineConfig {
@@ -109,6 +119,9 @@ impl Default for PipelineConfig {
             application_name: "krkr-rs".to_owned(),
             preferred_format: TextureFormat::Rgba8Srgb,
             validation: false,
+            frame_interval: Duration::from_secs_f64(
+                api::config::FrameRateLimit::DEFAULT.period_secs(),
+            ),
         }
     }
 }
@@ -165,6 +178,12 @@ pub struct GpuCapabilities {
     pub supports_offscreen_targets: bool,
     /// Whether GPU glyph-atlas uploads are supported.
     pub supports_glyph_atlas: bool,
+    /// Whether custom effect pipelines ([`create_effect_pipeline`]) are
+    /// supported.
+    ///
+    /// A headless backend reports `false` and refuses to create one, so a
+    /// caller can choose its own CPU path instead of drawing nothing.
+    pub supports_effect_pipelines: bool,
 }
 
 /// Stateless render service.
@@ -215,19 +234,50 @@ impl fmt::Debug for RenderPipeline {
     }
 }
 
+/// Returns the time a frame may wait for the display to release a swapchain
+/// image.
+///
+/// The budget is two frame periods: one period is the frame's own, and one
+/// lets the presentation engine finish a refresh that was already in flight.
+/// A frame whose image does not arrive within the budget is skipped and
+/// reported, so the wait can never stall the frame thread for longer than this
+/// value.
+///
+/// # Errors
+///
+/// Returns [`RenderError::InvalidArgument`] when `frame_interval` is zero or
+/// when doubling it overflows. A missing or unusable frame period is a typed
+/// error, never a silently substituted wait.
+pub fn presentation_budget(frame_interval: Duration) -> Result<Duration, RenderError> {
+    if frame_interval.is_zero() {
+        return Err(RenderError::InvalidArgument {
+            message: "the frame interval for the presentation budget is zero".to_owned(),
+        });
+    }
+    frame_interval
+        .checked_mul(2)
+        .ok_or_else(|| RenderError::InvalidArgument {
+            message: "the presentation budget overflows the platform clock".to_owned(),
+        })
+}
+
 /// Creates a render pipeline for `config`.
 ///
 /// # Errors
 ///
-/// Returns [`RenderError::Unsupported`] when the requested backend is not
-/// implemented in this build, or [`RenderError::DeviceUnavailable`] when the
-/// Vulkan backend is present but its loader, instance or device cannot be
-/// brought up.
+/// Returns [`RenderError::InvalidArgument`] when the configured frame
+/// interval yields no presentation budget, [`RenderError::Unsupported`] when
+/// the requested backend is not implemented in this build, or
+/// [`RenderError::DeviceUnavailable`] when the Vulkan backend is present but
+/// its loader, instance or device cannot be brought up.
 pub fn create_render_pipeline(config: PipelineConfig) -> Result<RenderPipeline, RenderError> {
+    // Validated once for both backends, so an unusable frame period is a typed
+    // error instead of a substituted acquire wait.
+    let acquire_timeout = presentation_budget(config.frame_interval)?;
     match config.backend {
         BackendKind::Null => Ok(RenderPipeline::null()),
         BackendKind::Vulkan => {
-            let backend = VulkanPipeline::new(&config)?;
+            let backend = VulkanPipeline::new(&config, acquire_timeout)?;
             Ok(RenderPipeline {
                 kind: PipelineKind::Vulkan(Box::new(backend)),
             })
@@ -394,6 +444,49 @@ pub fn upload_textures(
             Ok(())
         }
         PipelineKind::Vulkan(backend) => backend.upload_textures(state, uploads),
+    }
+}
+
+/// Creates an effect (custom-shader) pipeline whose resource will live in
+/// `state`.
+///
+/// The descriptor is validated here and by the backend: the stage code must be
+/// SPIR-V this backend accepts, the texture bindings must fit the API budget,
+/// and the blend must be one the backend can build (a destination-dependent
+/// blend needs a destination-sampling shader, which is reported as
+/// [`RenderError::Unsupported`] rather than substituted).
+///
+/// # Errors
+///
+/// Returns [`RenderError::Unsupported`] on a backend that does not run effect
+/// pipelines, [`RenderError::Shader`] when a module or the pipeline cannot be
+/// created, [`RenderError::InvalidArgument`] for a descriptor that breaks the
+/// binding or uniform contract, and [`RenderError::OutOfMemory`] when the
+/// backend's resources cannot be allocated.
+pub fn create_effect_pipeline(
+    p: &RenderPipeline,
+    state: &mut RenderState,
+    desc: &EffectPipelineDesc<'_>,
+) -> Result<EffectPipeline, RenderError> {
+    match &p.kind {
+        PipelineKind::Null(backend) => backend.create_effect_pipeline(state, desc),
+        PipelineKind::Vulkan(backend) => backend.create_effect_pipeline(state, desc),
+    }
+}
+
+/// Releases an effect pipeline and every resource it owns.
+///
+/// The handle may still be referenced by a [`RenderScene`]; such a draw is
+/// skipped by the backend with a warning, exactly like a draw of a released
+/// texture.
+pub fn destroy_effect_pipeline(
+    p: &RenderPipeline,
+    state: &mut RenderState,
+    pipeline: EffectPipeline,
+) {
+    match &p.kind {
+        PipelineKind::Null(backend) => backend.destroy_effect_pipeline(state, pipeline),
+        PipelineKind::Vulkan(backend) => backend.destroy_effect_pipeline(state, pipeline),
     }
 }
 

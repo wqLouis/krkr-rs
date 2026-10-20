@@ -38,6 +38,7 @@ impl Env {
                 .attach_scene(scene.as_mut() as *mut Scene);
         }
         host.install(&engine).expect("install compat surface");
+        common::link_all_builtins(&engine);
         Env {
             host,
             engine,
@@ -790,6 +791,55 @@ fn prepare_only_acts_in_layer_mode() {
         0,
         "prepare ends paused at frame 0"
     );
+}
+
+/// The pump composites the prepared frame before prepare pauses and rewinds.
+///
+/// Reference: the `EC_UPDATE` handler assigns the front buffer and updates the
+/// layer, then fires `onFrameUpdate`, `perPrepare`, `Pause()` and `Rewind()` in
+/// that order (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:583-640`).
+#[test]
+fn prepare_composites_the_prepared_frame_before_pausing() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.name = 'prep'; l.visible = true; \
+         var log = ''; \
+         var v = new VideoOverlay(w); v.mode = 1; v.layer1 = l; \
+         v.onFrameUpdate = function(f) { log += 'frame' + f + ','; }; \
+         v.onPeriod = function(r) { log += 'period' + r + ','; }; \
+         v.onStatusChanged = function(s) { log += s + ','; };",
+    );
+    let mut rewound = solid_frame([0, 255, 0, 255]);
+    rewound.pts_ms = 100;
+    env.host
+        .set_video_source(movie_spec(), vec![solid_frame([255, 0, 0, 255]), rewound]);
+    env.run("v.open('movie.mpg'); v.prepare(); log = '';");
+
+    let ctx = env.host.ctx().expect("bound context");
+    compat::video_advance(&ctx, 50.0).expect("advance");
+    assert_eq!(
+        env.bitmap_color("prep", 1, 1),
+        [255, 0, 0, 255],
+        "the prepared frame must reach the layer"
+    );
+    assert_eq!(
+        env.eval_string("log"),
+        "frame0,period2,pause,",
+        "onFrameUpdate, perPrepare and the pause must keep the reference order"
+    );
+    assert_eq!(env.eval_int("v.position"), 0);
+
+    // The next pump is idle: the overlay stays paused on the rewound picture.
+    compat::video_advance(&ctx, 50.0).expect("advance");
+    assert_eq!(
+        env.bitmap_color("prep", 1, 1),
+        [255, 0, 0, 255],
+        "the rewound frame must stay on the layer"
+    );
+    assert_eq!(env.eval_string("log"), "frame0,period2,pause,");
+    assert_eq!(env.eval_int("v.position"), 0);
 }
 
 /// A `mode` write after `open` is ignored.

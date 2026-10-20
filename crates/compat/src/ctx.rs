@@ -7,7 +7,7 @@ use std::marker::PhantomData;
 
 use crate::engine_api::InputState;
 use crate::engine_api::TimerState;
-use crate::engine_api::{Scene, Storage};
+use crate::engine_api::{DecodePool, Scene, Storage};
 use tjs::{
     NativeClassBuilder, NativeInstanceBuilder, NativeInstanceMembers, NativeStaticMembers,
     RetainedValue, Tjs2Engine, Tjs2ValueId,
@@ -44,6 +44,11 @@ pub struct CompatServices {
     storage: Option<*mut Storage>,
     input: Option<*mut InputState>,
     timer: Option<*mut TimerState>,
+    /// The L2 image decode pool the visual natives submit decodes to.
+    ///
+    /// `None` when the host attached no pool: the loads then decode
+    /// synchronously, exactly as they did before the pool existed.
+    decode_pool: Option<*mut DecodePool>,
     /// Scratch buffers for `Plugins.getList` (see `plugins_native`): the C++
     /// trampoline copies the string array immediately after the callback
     /// returns, so the buffers must outlive the call. Owned here rather than
@@ -136,6 +141,23 @@ impl CompatServices {
     /// See [`Self::scene`] for why this returns a raw pointer.
     pub fn timer(&self) -> Option<*mut TimerState> {
         self.timer
+    }
+
+    /// Attach the L2 image decode pool the visual natives submit decodes to.
+    ///
+    /// # Safety
+    /// `pool` must stay valid for as long as the binding is installed, and
+    /// the pool must not be replaced while the binding is installed: the
+    /// natives hold the address of the pool the host attached.
+    pub unsafe fn attach_decode_pool(&mut self, pool: *mut DecodePool) {
+        self.decode_pool = if pool.is_null() { None } else { Some(pool) };
+    }
+
+    /// The attached L2 image decode pool pointer, if any.
+    ///
+    /// See [`Self::scene`] for why this returns a raw pointer.
+    pub fn decode_pool(&self) -> Option<*mut DecodePool> {
+        self.decode_pool
     }
 
     /// The mutable `Plugins.getList` scratch buffers.

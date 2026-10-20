@@ -15,6 +15,7 @@ use api::host::{Presentation, SurfaceEvent};
 use raw_window_handle::RawWindowHandle;
 
 use crate::cpu::{CpuTexture, TextureProvider};
+use crate::effect::EffectPipeline;
 use crate::render_target::{RenderTarget, RenderTargetDesc};
 use crate::scene::{
     RenderContent, RenderNode, RenderNodeId, RenderScene, child_sort_key, children_are_sorted,
@@ -45,6 +46,8 @@ pub struct FrameStats {
     pub texture_draws: u32,
     /// Draws of [`RenderContent::Glyphs`].
     pub glyph_draws: u32,
+    /// Draws of [`RenderContent::Effect`].
+    pub effect_draws: u32,
     /// Invisible nodes whose subtree was skipped.
     pub invisible: u32,
     /// Texture draws whose texture had not been uploaded.
@@ -80,6 +83,9 @@ impl NullRenderPipeline {
             supports_destination_dependent_blend: true,
             supports_offscreen_targets: true,
             supports_glyph_atlas: false,
+            // The headless backend has no device, so it never executes a
+            // custom-shader pipeline; the caller keeps its own CPU path.
+            supports_effect_pipelines: false,
         }
     }
 
@@ -122,6 +128,29 @@ impl NullRenderPipeline {
         validate_desc(&desc)?;
         Ok(Texture::new(desc))
     }
+
+    /// Refuses to create an effect pipeline: the headless backend does not run
+    /// custom shaders, so an effect draw would have no meaning here.
+    ///
+    /// # Errors
+    ///
+    /// Always [`RenderError::Unsupported`].
+    pub fn create_effect_pipeline(
+        &self,
+        _state: &mut RenderState,
+        desc: &api::shader::EffectPipelineDesc<'_>,
+    ) -> Result<EffectPipeline, RenderError> {
+        Err(RenderError::Unsupported {
+            message: format!(
+                "the headless backend does not run effect pipelines (program {:?})",
+                desc.name
+            ),
+        })
+    }
+
+    /// Accepts the release of an effect pipeline handle; none can exist on this
+    /// backend.
+    pub fn destroy_effect_pipeline(&self, _state: &mut RenderState, _pipeline: EffectPipeline) {}
 
     /// Releases the state slot associated with `tex`, if any.
     pub fn drop_texture(&self, state: &mut RenderState, tex: Texture) {
@@ -233,6 +262,7 @@ impl NullRenderPipeline {
         Ok(Presentation {
             presented: true,
             surface_event: None,
+            skip: None,
         })
     }
 
@@ -566,5 +596,78 @@ fn count_content(null: &mut NullState, node: &RenderNode, stats: &mut FrameStats
                 stats.missing_textures = stats.missing_textures.saturating_add(1);
             }
         }
+        RenderContent::Effect(effect) => {
+            // The headless backend never executes one, so the count is the
+            // whole story: it proves a scene carried an effect draw.
+            stats.draws = stats.draws.saturating_add(1);
+            stats.effect_draws = stats.effect_draws.saturating_add(1);
+            if effect
+                .textures
+                .iter()
+                .any(|texture| !null.textures.contains_key(&texture.key()))
+            {
+                stats.missing_textures = stats.missing_textures.saturating_add(1);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::effect::{EffectPipeline, RenderEffect};
+    use api::geometry::RectF;
+    use api::shader::EffectUniforms;
+
+    /// A scene holding one effect draw at the origin.
+    fn effect_scene() -> RenderScene {
+        let pipeline = EffectPipeline::new("test", 16, Some(15));
+        let mut scene = RenderScene::with_root_node();
+        let root = scene.root;
+        let child = scene.push(RenderNode {
+            parent: Some(root),
+            content: RenderContent::Effect(Box::new(RenderEffect::new(
+                pipeline,
+                Vec::new(),
+                EffectUniforms::new(),
+            ))),
+            dst: RectF::new(0.0, 0.0, 4.0, 4.0),
+            ..RenderNode::default()
+        });
+        if let Some(node) = scene.node_mut(root) {
+            node.children = vec![child];
+        }
+        scene
+    }
+
+    #[test]
+    fn the_headless_backend_counts_an_effect_draw() {
+        let pipeline = NullRenderPipeline::new();
+        let (surface, mut state) = pipeline.begin(&testkit::headless_window()).expect("begin");
+        let stats = {
+            pipeline
+                .render(&surface, &mut state, &effect_scene())
+                .expect("render");
+            NullRenderPipeline::last_frame(&state).expect("frame stats")
+        };
+        assert_eq!(stats.effect_draws, 1);
+        assert_eq!(stats.draws, 1);
+        assert_eq!(stats.texture_draws, 0);
+    }
+
+    #[test]
+    fn the_cpu_rasterizer_refuses_an_effect_scene() {
+        let pipeline = NullRenderPipeline::new();
+        let (_surface, mut state) = pipeline.begin(&testkit::headless_window()).expect("begin");
+        let target = pipeline
+            .create_render_target(RenderTargetDesc::new(4, 4))
+            .expect("target");
+        let error = pipeline
+            .render_to_target(&mut state, &target, &effect_scene())
+            .expect_err("the CPU rasterizer cannot evaluate a shader");
+        assert!(
+            matches!(error, RenderError::Unsupported { .. }),
+            "unexpected error: {error}"
+        );
     }
 }

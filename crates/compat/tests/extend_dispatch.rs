@@ -111,6 +111,7 @@ impl Env {
             (None, None)
         };
         host.install(&engine).expect("install compat surface");
+        common::link_all_builtins(&engine);
         Env {
             _host: host,
             engine,

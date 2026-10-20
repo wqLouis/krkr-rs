@@ -22,10 +22,13 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use crate::engine_api::Scene;
-use crate::engine_api::{RuleMask, ScrollFrom, ScrollStay, Trans, TransKind};
+use crate::engine_api::{
+    DecodedImageMode, EffectDraw, RuleMask, ScrollFrom, ScrollStay, Trans, TransError, TransKind,
+    TransitionFrame,
+};
 use tjs::{DetachedValue, NativeInstanceMethodDef, TjsValue, VAL_OBJECT, VAL_VOID, Value};
 
-use super::super::bitmap::{decode_image, read_image_from_storage};
+use super::super::bitmap::{COLOR_KEY_NONE, load_cached_storage_image};
 use super::super::common::{
     ObjectHandle, ObjectKind, VisualState, duplicate_object, resolve_object_id, scene_mut,
     scene_ref,
@@ -503,6 +506,12 @@ fn build_transition(
 /// than the source (`GraphicsLoaderIntf.cpp:1689-1696`). L3 reads it
 /// through the same storage + image-decoder pair `Layer.loadImages` uses,
 /// then hands the grayscale to L2 as a [`RuleMask`].
+///
+/// The load goes through the scene's decoded-image cache — the same cache
+/// `Layer.loadImages` uses — so a repeated transition with the same rule
+/// decodes it once. The colour key is the port's `COLOR_KEY_NONE`: the
+/// graphic keeps its own alpha, and the rule's grayscale comes from the
+/// decoded pixels.
 fn rule_mask(
     ctx: &crate::CompatCtx,
     host: &tjs::Tjs2Engine,
@@ -513,15 +522,9 @@ fn rule_mask(
          (reference: TVPSpecifyOption)"
             .to_string()
     })?;
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    let services = unsafe { ctx.services() };
-    let storage = services
-        .storage()
-        .ok_or_else(|| "Layer.beginTransition: no storage is attached".to_string())?;
-    // SAFETY: the storage pointer is the host's live L2 `Storage`, attached
-    // for the lifetime of the binding.
-    let (resolved, bytes) = read_image_from_storage(unsafe { &*storage }, &name)?;
-    let image = decode_image(services, &resolved, &bytes)?;
+    // The rule graphic goes through the same decoded-image cache as every
+    // other load, so a repeated transition does not decode it again.
+    let image = load_cached_storage_image(ctx, &name, COLOR_KEY_NONE, DecodedImageMode::Full)?;
     RuleMask::from_rgba(image.width, image.height, &image.rgba).map_err(|error| error.to_string())
 }
 
@@ -884,13 +887,15 @@ fn layer_within(scene: &Scene, node: u32, root: u32) -> bool {
 /// Advance every active transition by `dt_ms` and tear down the finished or
 /// stopped ones.
 ///
-/// Each step renders one frame through [`Trans::apply`] into the destination's
-/// transition frame, so a running whole-subtree transition is visible frame by
-/// frame; the frame it completes on is released with the caches, so the next
-/// projection draws the live subtree. A transition without children blends the
-/// two main images into the destination's self image instead, which the
-/// projection draws in place of its own image while the children stay live; the
-/// teardown clears it.
+/// Each step produces one frame, so a running transition is visible frame by
+/// frame. A host that composites the projection records the frame on the layer
+/// (`composite_transition`); every other host blends it with [`Trans::apply`]
+/// into the destination's transition frame, which the projection draws in place
+/// of the subtree and whose children stay inside it. A transition without
+/// children blends the two main images into the destination's self image
+/// instead, which the projection draws in place of its own image while the
+/// children stay live. The frame the transition completes on is released with
+/// the caches, and the teardown clears the recorded frame (or the self image).
 ///
 /// Like the reference's per-tick `InvokeTransition`
 /// (`LayerIntf.cpp:8047-8061`), a transition whose destination node is no
@@ -1108,6 +1113,8 @@ fn end_transition(ctx: &crate::CompatCtx, dest: u32, source: u32, event: bool) {
         // A childless transition drew its frames in the layer's self image;
         // the teardown leaves the layer drawing its own image again.
         scene.set_transition_self_image(dest, None);
+        scene.set_transition_frame(dest, None);
+        scene.set_effect(dest, None);
         exchange_layers(scene, dest, source, !entry.with_children);
     }
     if event {
@@ -1403,14 +1410,17 @@ fn dispatch_transition_completed(ctx: &crate::CompatCtx, dest: u32, src: u32) {
 
 /// Render one transition frame.
 ///
-/// A whole-subtree transition blends the two composited subtrees into the
-/// destination's own transition frame — the bitmap the projection draws in
-/// place of the subtree until the caches are released. A transition without
-/// children blends the layer's own main image (source 1) and the source
-/// layer's main image (source 2) into the destination's self image, which the
-/// projection draws at the main image's placement while the destination's
-/// children keep drawing live. Both main images stay read-only: a MainImage
-/// is what script pixel reads, saves and piled copies observe.
+/// A host that composites transition frames records the frame the projection
+/// draws: the two sources placed inside a frame that stands in for the
+/// destination's subtree (with children) or for its own image (without). Every
+/// other host blends that frame into a bitmap — the destination's transition
+/// frame for a whole subtree, its self image otherwise — and the projection
+/// draws the bitmap. Both main images stay read-only: a MainImage is what
+/// script pixel reads, saves and piled copies observe.
+///
+/// A backend that can run effect pipelines takes neither route: the
+/// transition records the custom-shader draw the projection draws, and no
+/// bitmap is written at all.
 fn composite_transition(
     ctx: &crate::CompatCtx,
     id: u32,
@@ -1419,31 +1429,80 @@ fn composite_transition(
     with_children: bool,
 ) -> Result<(), String> {
     let scene = scene_mut(ctx)?;
-    let (target, src1, src2) = if with_children {
-        composite_subtree(scene, id, source)?
+    let (src1, src2, w, h) = if with_children {
+        transition_sources_subtree(scene, id, source)?
     } else {
-        composite_self(scene, id, source)?
+        transition_sources_self(scene, id, source)?
+    };
+    // Both paths composite the two sources at one size; the blend rejects a
+    // mismatch before it draws, so the frame does the same.
+    let (src2_w, src2_h) = bitmap_size(scene, src2)
+        .ok_or_else(|| "Layer.beginTransition: the transition source is missing".to_string())?;
+    if (src2_w, src2_h) != (w, h) {
+        return Err(TransError::SizeMismatch {
+            src1: (w, h),
+            src2: (src2_w, src2_h),
+        }
+        .to_string());
+    }
+    // The generic effect path: the projection draws the transition with a
+    // shader, so nothing is written into a bitmap.
+    let effect: Option<EffectDraw> =
+        scene.transition_effect_draw(trans, src1, src2, (w, h), with_children);
+    if let Some(effect) = effect {
+        scene.set_effect(id, Some(effect));
+        scene.set_transition_frame(id, None);
+        return Ok(());
+    }
+    // A composited frame is drawn by the projection, which places the two
+    // sources itself. Kinds that need per-pixel work return no frame and are
+    // blended below on every host.
+    let frame: Option<TransitionFrame> = if scene.composite_transition_frames {
+        trans.transition_frame(src1, src2, (w, h), with_children)
+    } else {
+        None
+    };
+    if let Some(frame) = frame {
+        scene.set_transition_frame(id, Some(frame));
+        return Ok(());
+    }
+    // The blend needs a frame of its own, distinct from the content it reads,
+    // whatever the destination's content happens to be.
+    let target = if with_children {
+        crate::engine_api::layer_ops::ensure_transition_display(scene, id, w, h).ok_or_else(
+            || "Layer.beginTransition: cannot allocate the transition frame".to_string(),
+        )?
+    } else {
+        crate::engine_api::layer_ops::ensure_transition_self_image(scene, id, w, h).ok_or_else(
+            || "Layer.beginTransition: cannot allocate the transition self image".to_string(),
+        )?
     };
     // The blend reads both sources while it writes the target, so the three
-    // must be distinct bitmaps.
-    let Some((target, src1, src2)) = scene.bitmap_mut_with_refs(target, src1, src2) else {
+    // must be distinct bitmaps. A source whose image is still decoding waits
+    // for the decode: the blend would otherwise read a blank.
+    scene.resolve_bitmap(src1);
+    scene.resolve_bitmap(src2);
+    let Some((target, src1_bitmap, src2_bitmap)) = scene.bitmap_mut_with_refs(target, src1, src2)
+    else {
         return Err("Layer.beginTransition: the transition bitmaps are not distinct".to_string());
     };
     let region = Trans::full_region(target);
     trans
-        .apply(target, src1, src2, region)
+        .apply(target, src1_bitmap, src2_bitmap, region)
         .map_err(|error| error.to_string())
 }
 
-/// The blend target and its two sources for a whole-subtree transition: the
-/// destination's transition frame, the destination's composited subtree
-/// content and the source layer's.
+/// The two sources of a whole-subtree transition and their shared size: the
+/// destination's composited subtree content and the source layer's.
 ///
 /// `render_layer_subtree` returns the composited subtree content, reusing it
-/// while the subtree is unchanged; a trivial layer's content is its MainImage:
-/// it is read as the blend source and never written, and the blend frame is
-/// allocated separately from the content it reads.
-fn composite_subtree(scene: &mut Scene, dest: u32, source: u32) -> Result<(u32, u32, u32), String> {
+/// while the subtree is unchanged; a trivial layer's content is its MainImage,
+/// which is read as a source and never written.
+fn transition_sources_subtree(
+    scene: &mut Scene,
+    dest: u32,
+    source: u32,
+) -> Result<(u32, u32, u32, u32), String> {
     let dst_content =
         crate::engine_api::layer_ops::render_layer_subtree(scene, dest).ok_or_else(|| {
             "Layer.beginTransition: cannot render the destination subtree".to_string()
@@ -1457,24 +1516,22 @@ fn composite_subtree(scene: &mut Scene, dest: u32, source: u32) -> Result<(u32, 
     if source != dest {
         scene.set_cache_bitmap(source, Some(src_content));
     }
-    // The blend needs a frame of its own, distinct from the content it reads,
-    // whatever the destination's content happens to be.
     let (w, h) = bitmap_size(scene, dst_content).ok_or_else(|| {
         "Layer.beginTransition: the transition destination content is missing".to_string()
     })?;
-    let frame = crate::engine_api::layer_ops::ensure_transition_display(scene, dest, w, h)
-        .ok_or_else(|| "Layer.beginTransition: cannot allocate the transition frame".to_string())?;
-    Ok((frame, dst_content, src_content))
+    Ok((dst_content, src_content, w, h))
 }
 
-/// The blend target and its two sources for a transition without children: the
-/// destination's self image, the destination's own main image and the source
-/// layer's main image.
+/// The two sources of a transition without children and their shared size: the
+/// destination's and the source layer's own main images.
 ///
-/// The self image is a bitmap of the destination image's size that the
-/// projection draws where the main image would be, while the destination's
-/// children keep drawing live. Neither main image is written.
-fn composite_self(scene: &mut Scene, dest: u32, source: u32) -> Result<(u32, u32, u32), String> {
+/// Neither main image is written; the frame blends them, so its children keep
+/// drawing live.
+fn transition_sources_self(
+    scene: &mut Scene,
+    dest: u32,
+    source: u32,
+) -> Result<(u32, u32, u32, u32), String> {
     let dest_bitmap = scene
         .layer(dest)
         .ok_or_else(|| "Layer.beginTransition: the transition destination is gone".to_string())?
@@ -1489,11 +1546,7 @@ fn composite_self(scene: &mut Scene, dest: u32, source: u32) -> Result<(u32, u32
         .layer(source)
         .and_then(|layer| layer.bitmap)
         .ok_or_else(|| "Layer.beginTransition: the transition source has no image".to_string())?;
-    let self_image = crate::engine_api::layer_ops::ensure_transition_self_image(scene, dest, w, h)
-        .ok_or_else(|| {
-            "Layer.beginTransition: cannot allocate the transition self image".to_string()
-        })?;
-    Ok((self_image, dest_bitmap, source_bitmap))
+    Ok((dest_bitmap, source_bitmap, w, h))
 }
 
 fn d(name: &'static str, f: tjs::NativeInstanceMethodFn) -> NativeInstanceMethodDef {

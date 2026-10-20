@@ -44,8 +44,9 @@
 //! [`TransError`]s; nothing is silently clamped to a fallback.
 
 use crate::layer_ops::{RectI, blit_copy, blit_copy_clipped, intersect, intersect_rect};
-use crate::scene::BitmapState;
+use crate::scene::{BitmapState, Rect, TransitionFrame, TransitionSource};
 
+mod effect;
 mod extrans_mosaic;
 mod extrans_ripple;
 mod extrans_rotate;
@@ -748,6 +749,79 @@ impl Trans {
         )
     }
 
+    /// The frame `src1`/`src2` composite into at the current phase, for a host
+    /// that draws the projected scene instead of blending a display bitmap.
+    ///
+    /// Only the kinds that are a placement or a fade of the two sources return
+    /// a frame — `crossfade` and `scroll`. The rule-based and warp kinds
+    /// (`universal`, `mask`, `wave`, `mosaic`, `turn`, the `rotate*` family and
+    /// `ripple`) need a per-pixel rule or coordinate warp, so they return
+    /// `None` and [`Trans::apply`] blends them.
+    ///
+    /// `size` is the shared source size and the frame's own pixel space;
+    /// `covers_layer` records whether the frame stands in for the layer's whole
+    /// subtree (drawn over the layer's rect) rather than for its own image.
+    /// `None` also covers a zero-sized frame.
+    pub fn transition_frame(
+        &self,
+        src1: u32,
+        src2: u32,
+        size: (u32, u32),
+        covers_layer: bool,
+    ) -> Option<TransitionFrame> {
+        if size.0 == 0 || size.1 == 0 {
+            return None;
+        }
+        let full = Rect::new(0, 0, size.0, size.1);
+        match self.kind {
+            TransKind::CrossFade => {
+                // The endpoints are exact copies of one source, so the other
+                // source draws nothing there.
+                let (start, end) = if self.phase <= 0 {
+                    (1.0, 0.0)
+                } else if self.phase >= self.phase_max {
+                    (0.0, 1.0)
+                } else {
+                    // `blend_level` weights the fade by `phase >> 8`.
+                    (1.0, self.phase as f32 / 256.0)
+                };
+                Some(TransitionFrame::new(
+                    size,
+                    covers_layer,
+                    TransitionSource::new(src1, full, full, start),
+                    TransitionSource::new(src2, full, full, end),
+                ))
+            }
+            TransKind::Scroll { from, stay } => {
+                let (w, h) = (
+                    size.0.min(i32::MAX as u32) as i32,
+                    size.1.min(i32::MAX as u32) as i32,
+                );
+                let (first, second) = scroll_placements(self.progress(), (w, h), from, stay);
+                let frame = (0, 0, w, h);
+                // A source outside the frame contributes no pixel; it keeps a
+                // zero rectangle, which the projection draws nothing for.
+                let (dst1, src_rect1) = scroll_source_rects(frame, first).unwrap_or_default();
+                let (dst2, src_rect2) = scroll_source_rects(frame, second).unwrap_or_default();
+                Some(TransitionFrame::new(
+                    size,
+                    covers_layer,
+                    TransitionSource::new(src1, src_rect1, dst1, 1.0),
+                    TransitionSource::new(src2, src_rect2, dst2, 1.0),
+                ))
+            }
+            TransKind::Universal { .. }
+            | TransKind::Mask
+            | TransKind::Wave { .. }
+            | TransKind::Mosaic { .. }
+            | TransKind::Turn { .. }
+            | TransKind::RotateZoom { .. }
+            | TransKind::RotateVanish { .. }
+            | TransKind::RotateSwap { .. }
+            | TransKind::Ripple { .. } => None,
+        }
+    }
+
     fn apply_cross_fade(
         &self,
         dst: &mut BitmapState,
@@ -819,99 +893,150 @@ impl Trans {
         from: ScrollFrom,
         stay: ScrollStay,
     ) {
-        use ScrollFrom::{Bottom, Left, Right, Top};
-        use ScrollStay::{NoStay, StayDest, StaySrc};
-
         let w = src1.width.min(i32::MAX as u32) as i32;
         let h = src1.height.min(i32::MAX as u32) as i32;
-        let horizontal = matches!(from, Left | Right);
-        let extent = if horizontal { w } else { h };
-        let phase = (f64::from(self.progress()) * f64::from(extent)).round() as i32;
-
-        let (mut s1l, mut s1t, mut s2l, mut s2t) = (0i32, 0i32, 0i32, 0i32);
-        match from {
-            Left => match stay {
-                NoStay => {
-                    s1l = phase;
-                    s2l = phase - w;
-                }
-                StayDest => s2l = phase - w,
-                StaySrc => s1l = phase,
-            },
-            Top => match stay {
-                NoStay => {
-                    s1t = phase;
-                    s2t = phase - h;
-                }
-                StayDest => s2t = phase - h,
-                StaySrc => s1t = phase,
-            },
-            Right => match stay {
-                NoStay => {
-                    s1l = -phase;
-                    s2l = w - phase;
-                }
-                StayDest => s2l = w - phase,
-                StaySrc => s1l = -phase,
-            },
-            Bottom => match stay {
-                NoStay => {
-                    s1t = -phase;
-                    s2t = h - phase;
-                }
-                StayDest => s2t = h - phase,
-                StaySrc => s1t = -phase,
-            },
-        }
-
-        let mut rs1 = (s1l, s1t, w + s1l, h + s1t);
-        let mut rs2 = (s2l, s2t, w + s2l, h + s2t);
-
-        // Priority resolution: exactly the reference `Blend` ordering, where
-        // each adjustment sees the previous one.
-        if stay == StayDest {
-            if horizontal {
-                if rs2.2 >= rs1.0 && rs2.2 < rs1.2 {
-                    rs1.0 = rs2.2;
-                }
-                if rs2.0 >= rs1.0 && rs2.0 < rs1.2 {
-                    rs1.2 = rs2.0;
-                }
-            } else {
-                if rs2.3 >= rs1.1 && rs2.3 < rs1.3 {
-                    rs1.1 = rs2.3;
-                }
-                if rs2.1 >= rs1.1 && rs2.1 < rs1.3 {
-                    rs1.3 = rs2.1;
-                }
+        let (first, second) = scroll_placements(self.progress(), (w, h), from, stay);
+        for (placement, source) in [(first, src1), (second, src2)] {
+            if let Some(d) = intersect_rect(region, placement.rect) {
+                let src_rect = (
+                    d.0 - placement.left,
+                    d.1 - placement.top,
+                    d.2 - placement.left,
+                    d.3 - placement.top,
+                );
+                blit_copy_clipped(dst, d.0, d.1, source, src_rect, region);
             }
-        } else if stay == StaySrc {
-            if horizontal {
-                if rs1.2 >= rs2.0 && rs1.2 < rs2.2 {
-                    rs2.0 = rs1.2;
-                }
-                if rs1.0 >= rs2.0 && rs1.0 < rs2.2 {
-                    rs2.2 = rs1.0;
-                }
-            } else {
-                if rs1.3 >= rs2.1 && rs1.3 < rs2.3 {
-                    rs2.1 = rs1.3;
-                }
-                if rs1.1 >= rs2.1 && rs1.1 < rs2.3 {
-                    rs2.3 = rs1.1;
-                }
-            }
-        }
-
-        if let Some(d) = intersect_rect(region, rs1) {
-            let src_rect = (d.0 - s1l, d.1 - s1t, d.2 - s1l, d.3 - s1t);
-            blit_copy_clipped(dst, d.0, d.1, src1, src_rect, region);
-        }
-        if let Some(d) = intersect_rect(region, rs2) {
-            let src_rect = (d.0 - s2l, d.1 - s2t, d.2 - s2l, d.3 - s2t);
-            blit_copy_clipped(dst, d.0, d.1, src2, src_rect, region);
         }
     }
+}
+
+/// One source of a `scroll` frame: the offset it is translated by and the
+/// rectangle it occupies in the frame before clipping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScrollPlacement {
+    /// Left offset of the source inside the frame.
+    pub(crate) left: i32,
+    /// Top offset of the source inside the frame.
+    pub(crate) top: i32,
+    /// Rectangle the source occupies, in frame pixels.
+    pub(crate) rect: RectI,
+}
+
+/// The two source placements of a `scroll` frame at `progress`, after the
+/// `stay` priority resolution.
+fn scroll_placements(
+    progress: f32,
+    size: (i32, i32),
+    from: ScrollFrom,
+    stay: ScrollStay,
+) -> (ScrollPlacement, ScrollPlacement) {
+    use ScrollFrom::{Bottom, Left, Right, Top};
+    use ScrollStay::{NoStay, StayDest, StaySrc};
+
+    let (w, h) = size;
+    let horizontal = matches!(from, Left | Right);
+    let extent = if horizontal { w } else { h };
+    let phase = (f64::from(progress) * f64::from(extent)).round() as i32;
+
+    let (mut s1l, mut s1t, mut s2l, mut s2t) = (0i32, 0i32, 0i32, 0i32);
+    match from {
+        Left => match stay {
+            NoStay => {
+                s1l = phase;
+                s2l = phase - w;
+            }
+            StayDest => s2l = phase - w,
+            StaySrc => s1l = phase,
+        },
+        Top => match stay {
+            NoStay => {
+                s1t = phase;
+                s2t = phase - h;
+            }
+            StayDest => s2t = phase - h,
+            StaySrc => s1t = phase,
+        },
+        Right => match stay {
+            NoStay => {
+                s1l = -phase;
+                s2l = w - phase;
+            }
+            StayDest => s2l = w - phase,
+            StaySrc => s1l = -phase,
+        },
+        Bottom => match stay {
+            NoStay => {
+                s1t = -phase;
+                s2t = h - phase;
+            }
+            StayDest => s2t = h - phase,
+            StaySrc => s1t = -phase,
+        },
+    }
+
+    let mut rs1 = (s1l, s1t, w + s1l, h + s1t);
+    let mut rs2 = (s2l, s2t, w + s2l, h + s2t);
+
+    // Priority resolution: exactly the reference `Blend` ordering, where each
+    // adjustment sees the previous one.
+    if stay == StayDest {
+        if horizontal {
+            if rs2.2 >= rs1.0 && rs2.2 < rs1.2 {
+                rs1.0 = rs2.2;
+            }
+            if rs2.0 >= rs1.0 && rs2.0 < rs1.2 {
+                rs1.2 = rs2.0;
+            }
+        } else {
+            if rs2.3 >= rs1.1 && rs2.3 < rs1.3 {
+                rs1.1 = rs2.3;
+            }
+            if rs2.1 >= rs1.1 && rs2.1 < rs1.3 {
+                rs1.3 = rs2.1;
+            }
+        }
+    } else if stay == StaySrc {
+        if horizontal {
+            if rs1.2 >= rs2.0 && rs1.2 < rs2.2 {
+                rs2.0 = rs1.2;
+            }
+            if rs1.0 >= rs2.0 && rs1.0 < rs2.2 {
+                rs2.2 = rs1.0;
+            }
+        } else {
+            if rs1.3 >= rs2.1 && rs1.3 < rs2.3 {
+                rs2.1 = rs1.3;
+            }
+            if rs1.1 >= rs2.1 && rs1.1 < rs2.3 {
+                rs2.3 = rs1.1;
+            }
+        }
+    }
+
+    (
+        ScrollPlacement {
+            left: s1l,
+            top: s1t,
+            rect: rs1,
+        },
+        ScrollPlacement {
+            left: s2l,
+            top: s2t,
+            rect: rs2,
+        },
+    )
+}
+
+/// The destination and source rectangles one `scroll` source occupies inside
+/// `frame`, after clipping to the frame; `None` when it lies outside.
+fn scroll_source_rects(frame: RectI, placement: ScrollPlacement) -> Option<(Rect, Rect)> {
+    let d = intersect_rect(frame, placement.rect)?;
+    let width = (d.2 - d.0) as u32;
+    let height = (d.3 - d.1) as u32;
+    Some((
+        Rect::new(d.0, d.1, width, height),
+        Rect::new(d.0 - placement.left, d.1 - placement.top, width, height),
+    ))
 }
 
 /// Validate the `extrans` options that do not depend on the source size.

@@ -7,6 +7,7 @@
 use api::blend::BlendMode;
 use api::geometry::{Affine2, PixelRegion, RectF, Transform2D};
 
+use crate::effect::RenderEffect;
 use crate::texture::Texture;
 
 /// Identifier of a node in a [`RenderScene`] arena.
@@ -37,6 +38,17 @@ pub enum RenderContent {
     Texture(Texture),
     /// GPU glyph run (optional accelerated text path).
     Glyphs(GlyphRun),
+    /// One custom-shader draw: an effect pipeline over its bound textures.
+    ///
+    /// The node's `dst` places the quad, `opacity` becomes the program's
+    /// declared opacity word, and `src`/`blend` are unused — the program's
+    /// uniform rectangles select the texels and the pipeline carries the
+    /// blend.
+    ///
+    /// The payload is boxed: it carries the program's whole uniform block,
+    /// which is far larger than any other variant, and an unboxed variant
+    /// would make every node in the tree that size.
+    Effect(Box<RenderEffect>),
 }
 
 /// Clip applied to a node and its subtree.

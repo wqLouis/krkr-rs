@@ -161,11 +161,15 @@ pub(super) fn layer_clip(scene: &Scene, layer_id: u32) -> RectI {
 
 /// The layer's main image bitmap id, or a typed error when the layer has no
 /// drawable image (the reference `TVPNotDrawableLayerType`).
-pub(super) fn main_bitmap(scene: &Scene, layer_id: u32, method: &str) -> Result<u32, String> {
-    scene
+pub(super) fn main_bitmap(scene: &mut Scene, layer_id: u32, method: &str) -> Result<u32, String> {
+    let bitmap_id = scene
         .layer(layer_id)
         .and_then(|l| l.bitmap)
-        .ok_or_else(|| format!("Layer.{method}: this layer has no main image"))
+        .ok_or_else(|| format!("Layer.{method}: this layer has no main image"))?;
+    // The image may still be decoding: the pixels are not there yet, and
+    // every path that reads them waits for the decode.
+    scene.resolve_bitmap(bitmap_id);
+    Ok(bitmap_id)
 }
 
 /// The scene id of `value` when it is a native instance of `class` — the
@@ -315,6 +319,9 @@ pub(super) fn with_two_bitmaps<R>(
     src_id: u32,
     f: impl FnOnce(&mut BitmapState, &BitmapState) -> R,
 ) -> Result<R, String> {
+    // Both images may still be decoding: a composite reads their pixels.
+    scene.resolve_bitmap(dst_id);
+    scene.resolve_bitmap(src_id);
     let dst_index = scene
         .bitmaps
         .iter()

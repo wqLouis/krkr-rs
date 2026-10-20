@@ -2430,21 +2430,27 @@ fn ensure_layer_content(scene: &mut Scene, root: u32, w: u32, h: u32) -> Option<
     Some(id)
 }
 
-/// Drop `root`'s composited content and its transition frame. The two can be
-/// the same bitmap (the source endpoint draws its content); it is released
-/// once.
+/// Drop `root`'s composited content, and the cache-slot bitmap with it when
+/// the slot holds that content.
+///
+/// The cache slot holds either the composited content or the running
+/// transition's frame, and the content slot holds the composited content. The
+/// content goes with the refresh; the slot survives it, unless the slot *is*
+/// the content — then it goes with the content and is released once.
 fn release_subtree_caches(scene: &mut Scene, root: u32) {
     let (content, display) = match scene.layer_mut_untracked(root) {
         Some(layer) => (layer.cache_content.take(), layer.cache_bitmap.take()),
         None => return,
     };
-    if display != content
-        && let Some(display) = display
-    {
-        scene.release_bitmap(display);
-    }
+    let slot_is_content = display.is_some() && display == content;
     if let Some(content) = content {
         scene.release_bitmap(content);
+    }
+    if !slot_is_content
+        && let Some(display) = display
+        && let Some(layer) = scene.layer_mut_untracked(root)
+    {
+        layer.cache_bitmap = Some(display);
     }
 }
 

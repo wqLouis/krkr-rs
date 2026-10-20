@@ -2,10 +2,12 @@
 //!
 //! Relocated from the inline `#[cfg(test)]` module in `src/lib.rs`.
 
+use std::time::Duration;
+
 use api::error::RenderError;
 use render::{
     BackendKind, NULL_MAX_TEXTURE_DIMENSION, PipelineConfig, TextureFormat, capabilities,
-    create_render_pipeline,
+    create_render_pipeline, presentation_budget,
 };
 
 #[test]
@@ -34,4 +36,35 @@ fn vulkan_backend_is_either_available_or_reports_unsupported() {
     }
 
     assert_eq!(BackendKind::Vulkan.name(), "vulkan");
+}
+
+#[test]
+fn the_presentation_budget_is_two_frame_periods() {
+    // reference/cpp/core/visual/impl/BasicDrawDevice.cpp:244
+    // reference/cpp/core/visual/impl/VSyncTimingThread.cpp:88-146
+    // The reference's only display wait is bounded by its own vsync deadline,
+    // so the port waits a bounded part of the frame cadence, not forever.
+    let frame = Duration::from_millis(16);
+    assert_eq!(
+        presentation_budget(frame).expect("valid budget"),
+        Duration::from_millis(32)
+    );
+}
+
+#[test]
+fn a_zero_frame_interval_is_a_typed_error_not_a_substituted_wait() {
+    let error = presentation_budget(Duration::ZERO).expect_err("a zero interval has no budget");
+    assert!(
+        matches!(error, RenderError::InvalidArgument { .. }),
+        "error was {error:?}"
+    );
+}
+
+#[test]
+fn a_degenerate_frame_interval_is_a_typed_error_not_a_wrapped_wait() {
+    let error = presentation_budget(Duration::MAX).expect_err("a doubled maximum overflows");
+    assert!(
+        matches!(error, RenderError::InvalidArgument { .. }),
+        "error was {error:?}"
+    );
 }
