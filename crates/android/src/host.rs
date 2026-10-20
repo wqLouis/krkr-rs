@@ -37,6 +37,9 @@ pub(crate) struct AndroidHost {
     /// Whether the debug overlay (frame rate and resident memory) is drawn,
     /// from the launcher's resolved settings.
     debug_overlay: bool,
+    /// The frame interval the launcher requested; it sets the presentation
+    /// budget when the host resumes.
+    frame_interval: Duration,
     /// The running game, created by [`EventHandler::resumed`].
     running: Option<GameHost>,
     /// Input and focus events received since the last frame.
@@ -58,12 +61,14 @@ impl AndroidHost {
         game_dir: PathBuf,
         preload_archives: bool,
         debug_overlay: bool,
+        frame_interval: Duration,
     ) -> Self {
         Self {
             backend,
             game_dir,
             preload_archives,
             debug_overlay,
+            frame_interval,
             running: None,
             pending_events: Vec::new(),
             gestures: GestureSynthesizer::default(),
@@ -114,7 +119,7 @@ impl AndroidHost {
     ///
     /// The raw touch is consumed here rather than forwarded: a KAG menu reads
     /// the mouse event family, and forwarding both would fire twice
-    /// (`docs/android.md` §5).
+    /// (`docs.old/android.md` §5).
     pub(crate) fn touch(&mut self, id: u64, phase: api::host::TouchPhase, x: f32, y: f32) {
         let now_ms = self.now_ms();
         let events = self.gestures.phase(id, phase, x, y, now_ms);
@@ -165,6 +170,7 @@ impl EventHandler for AndroidHost {
         config.surface_size = window.size();
         config.window_handle = Some(window_handle);
         config.display_handle = Some(display_handle);
+        config.frame_interval = self.frame_interval;
         let host = match Host::new(config) {
             Ok(host) => host,
             Err(error) => {
@@ -224,6 +230,31 @@ impl EventHandler for AndroidHost {
     }
 }
 
+/// The instants the Android loop measures a frame's gap and wait from.
+///
+/// The gap is measured from the previous frame's start and the wait from the
+/// previous frame's end, the pair the desktop loop keeps, so a gap is
+/// attributed the same way on both hosts. The measurement runs continuously:
+/// an interval in which the app was suspended stays in the gap and in the
+/// wait, next to an engine that did no work.
+#[derive(Clone, Copy)]
+struct FrameBaseline {
+    /// The previous frame's start: the frame gap's baseline.
+    frame_start: Instant,
+    /// The previous frame's end: the platform wait's baseline.
+    frame_end: Instant,
+}
+
+impl FrameBaseline {
+    /// Creates the baseline at `now`, the start of the loop.
+    fn new(now: Instant) -> Self {
+        Self {
+            frame_start: now,
+            frame_end: now,
+        }
+    }
+}
+
 /// Runs the `android-activity` loop until the Activity is destroyed.
 ///
 /// Frames are paced by a [`Ticker`] and rendered at the deadline; the Android
@@ -235,22 +266,21 @@ pub(crate) fn run_loop(
     mut handler: AndroidHost,
     frame_period: Duration,
 ) -> state::RunOutcome {
-    let mut ticker = Ticker::new(frame_period, Instant::now());
-    let mut last_frame = Instant::now();
+    let start = Instant::now();
+    let mut ticker = Ticker::new(frame_period, start);
+    let mut baseline = FrameBaseline::new(start);
     let mut window: Option<PlatformWindow> = None;
     let mut paused = false;
     let mut frame_requested = true;
     let mut exit = false;
     let event_source = app.clone();
-    // Poll and input dispatch time accumulated since the last frame; the
-    // frame's gap spans all of it, not just the final poll call.
-    let mut accumulated_poll = Duration::ZERO;
+    // Input dispatch time accumulated since the last frame; it is a subset of
+    // the platform wait.
     let mut accumulated_input = Duration::ZERO;
 
     while !exit {
         let now = Instant::now();
         let timeout = ticker.deadline().saturating_duration_since(now);
-        let poll_started = Instant::now();
         event_source.poll_events(Some(timeout), |poll_event| {
             if exit {
                 return;
@@ -350,7 +380,6 @@ pub(crate) fn run_loop(
                 _ => {}
             }
         });
-        accumulated_poll += poll_started.elapsed();
 
         let now = Instant::now();
         // The long-press timeout is time-based, not event-based: advance the
@@ -364,17 +393,27 @@ pub(crate) fn run_loop(
         if frame_requested && !paused && !exit {
             frame_requested = false;
             if let Some(created) = &window {
-                let dt_ms = now.saturating_duration_since(last_frame).as_secs_f32() * 1000.0;
-                last_frame = now;
+                let dt_ms = now
+                    .saturating_duration_since(baseline.frame_start)
+                    .as_secs_f32()
+                    * 1000.0;
+                // The platform wait: the time from the previous frame's end to
+                // this frame's start, the measurement the desktop loop makes,
+                // so both hosts attribute a gap the same way.
+                let poll_ms = now
+                    .saturating_duration_since(baseline.frame_end)
+                    .as_secs_f64()
+                    * 1000.0;
+                baseline.frame_start = now;
                 let pacing = FramePacing {
-                    poll_ms: accumulated_poll.as_secs_f64() * 1000.0,
+                    poll_ms,
                     input_ms: accumulated_input.as_secs_f64() * 1000.0,
                 };
-                accumulated_poll = Duration::ZERO;
                 accumulated_input = Duration::ZERO;
                 if handler.frame(dt_ms, created, pacing) == Flow::Exit {
                     exit = true;
                 }
+                baseline.frame_end = Instant::now();
             }
         }
     }
