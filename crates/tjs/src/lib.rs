@@ -729,8 +729,8 @@ pub struct ValueId<'a> {
 /// (see [`Tjs2Engine::retain_value_detached`]). Dropping it releases the
 /// value. The engine MUST outlive every `DetachedValue` it created.
 ///
-/// Releasing a value drops the TJS object's reference, which can run the
-/// object's destructor. A native instance's destructor drops the Rust
+/// Releasing a value drops the engine's ownership of the TJS object, which
+/// can run the object's destructor. A native instance's destructor drops the Rust
 /// payload, and such a payload can own other `DetachedValue`s, so one
 /// release can release further values: the engine's retained-value registry
 /// is mutated while the release runs.
@@ -754,7 +754,7 @@ impl DetachedValue {
 impl Drop for DetachedValue {
     fn drop(&mut self) {
         // SAFETY: the C++ side's release is idempotent. The release drops the
-        // retained object's reference, which can run the object's destructor
+        // retained object's ownership, which can run the object's destructor
         // and therefore release further retained values.
         unsafe { tjs2_release_value(self.engine, self.id) }
     }
