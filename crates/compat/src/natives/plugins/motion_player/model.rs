@@ -208,6 +208,17 @@ impl Default for Frame {
     }
 }
 
+/// The child clip a type-3 node's active keyframe selects.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ChildSlot {
+    /// The child motion clip label.
+    pub(crate) clip: String,
+    /// The keyframe time the child clip starts at (`slot.clipStartTime`).
+    pub(crate) start: f64,
+    /// The child motion's clock offset (`slot.motionTimeOffset`).
+    pub(crate) offset: f64,
+}
+
 /// A snapshot of the state a frame contributes (after interpolation).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FrameState {
@@ -288,8 +299,6 @@ pub(crate) struct MotionNode {
     /// motion. Only own nodes answer the layer queries; the renderer draws
     /// both.
     pub(crate) own: bool,
-    /// The child motion clip label the layer's frames reference.
-    pub(crate) child_motion: Option<String>,
     /// The node type (`Motion::LayerType*`).
     pub(crate) node_type: i32,
     /// The shape type for shape nodes.
@@ -299,6 +308,13 @@ pub(crate) struct MotionNode {
     pub(crate) coordinate_mode: i32,
     /// The transform order.
     pub(crate) transform_order: [i32; 4],
+    /// The inheritance mask (`inheritMask`).
+    pub(crate) inherit_flags: i32,
+    /// The raw `stencilType`; bit 2 marks a stencil-composite group.
+    pub(crate) stencil_type: i32,
+    /// The layer labels whose images stencil-mask a composite group
+    /// (`stencilCompositeMaskLayerList`).
+    pub(crate) mask_layers: Vec<String>,
     /// The parent-clock time from which the node draws. A layer expanded from
     /// a child motion starts at the parent keyframe that named the clip.
     pub(crate) visible_from: f64,
@@ -317,6 +333,34 @@ pub(crate) struct MotionNode {
     pub(crate) time_offset: f64,
     /// Whether an ancestor is visible.
     pub(crate) draw_flag: bool,
+    /// Whether any frame names a source.
+    pub(crate) has_source: bool,
+    /// Mesh transform mode (`meshTransform`): `0` none, `1` patch, `2` grid.
+    pub(crate) mesh_type: i32,
+    /// Mesh child-sync flags (`meshSyncChildMask`).
+    pub(crate) mesh_flags: i32,
+    /// Mesh subdivision level (`meshDivision`).
+    pub(crate) mesh_division: i32,
+    /// The computed grid dimensions `[div_x, div_y]`.
+    pub(crate) mesh_div: [i32; 2],
+    /// The deformed grid points of this frame, as `(x, y)` pairs.
+    pub(crate) mesh_points: Vec<f32>,
+    /// The inverse of the node's world size matrix, for child deformation.
+    pub(crate) mesh_inv: [f64; 4],
+    /// The negated world origin the inverse matrix is applied to.
+    pub(crate) mesh_inv_offset: [f32; 2],
+    /// The node's four corner vertices in player space.
+    pub(crate) vertices: [f64; 8],
+    /// The type-7 shape's axis-aligned bounds, when the node is a shape.
+    pub(crate) shape_aabb: [f64; 4],
+    /// The nearest ancestor type-7 shape that clips this node.
+    pub(crate) parent_clip: Option<usize>,
+    /// The type-3 node this node's child clip instance is expanded from.
+    pub(crate) child_owner: Option<usize>,
+    /// The child clip label this expanded node belongs to.
+    pub(crate) child_clip: Option<String>,
+    /// The child clip a type-3 node's active keyframe selects.
+    pub(crate) child_slot: Option<ChildSlot>,
 }
 
 impl MotionNode {
@@ -326,11 +370,13 @@ impl MotionNode {
             parent,
             label,
             own: true,
-            child_motion: None,
             node_type: 0,
             shape: 0,
             coordinate_mode: 0,
             transform_order: [0, 1, 2, 3],
+            inherit_flags: 0x1FC,
+            stencil_type: 0,
+            mask_layers: Vec::new(),
             visible_from: 0.0,
             frames: Vec::new(),
             local: FrameState::default(),
@@ -338,6 +384,20 @@ impl MotionNode {
             matrix: [1.0, 0.0, 0.0, 1.0],
             time_offset: 0.0,
             draw_flag: true,
+            has_source: false,
+            mesh_type: 0,
+            mesh_flags: 0,
+            mesh_division: 0,
+            mesh_div: [0, 0],
+            mesh_points: Vec::new(),
+            mesh_inv: [0.0, 0.0, 0.0, 0.0],
+            mesh_inv_offset: [0.0, 0.0],
+            vertices: [0.0; 8],
+            shape_aabb: [0.0; 4],
+            parent_clip: None,
+            child_owner: None,
+            child_clip: None,
+            child_slot: None,
         }
     }
 }
@@ -1062,6 +1122,19 @@ pub(crate) fn build_node_tree(
     snapshot: &MotionSnapshot,
     clip: Option<&MotionClip>,
 ) -> Vec<MotionNode> {
+    build_node_tree_at(snapshot, clip, 0.0)
+}
+
+/// Build the node tree for `clip` at `time`.
+///
+/// A type-3 node's child clip instance is expanded for the keyframe active at
+/// that time, so a clip whose keyframes name different child clips builds the
+/// one that is playing.
+pub(crate) fn build_node_tree_at(
+    snapshot: &MotionSnapshot,
+    clip: Option<&MotionClip>,
+    time: f64,
+) -> Vec<MotionNode> {
     let mut nodes = vec![MotionNode::new(0, String::new())];
     let layers = clip
         .map(|clip| clip.layers.as_slice())
@@ -1077,7 +1150,7 @@ pub(crate) fn build_node_tree(
         start_time: 0.0,
     };
     for layer in layers {
-        append_node(&mut nodes, 0, layer, snapshot, &mut stack, placement);
+        append_node(&mut nodes, 0, layer, snapshot, &mut stack, placement, time);
     }
     nodes
 }
@@ -1097,6 +1170,7 @@ fn append_node(
     snapshot: &MotionSnapshot,
     stack: &mut Vec<String>,
     placement: NodePlacement,
+    time: f64,
 ) {
     let index = nodes.len();
     let label = label_of(layer).unwrap_or_default();
@@ -1107,38 +1181,48 @@ fn append_node(
     node.node_type = number_of(layer.get("type")).unwrap_or(0.0) as i32;
     node.shape = number_of(layer.get("shape")).unwrap_or(0.0) as i32;
     node.coordinate_mode = number_of(layer.get("coordinate")).unwrap_or(0.0) as i32;
+    node.inherit_flags = number_of(layer.get("inheritMask")).unwrap_or(f64::from(0x1FCu32)) as i32;
+    node.stencil_type = number_of(layer.get("stencilType")).unwrap_or(0.0) as i32;
+    node.mask_layers = list_of(layer.get("stencilCompositeMaskLayerList"))
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(|label| string_of(Some(label)))
+                .collect()
+        })
+        .unwrap_or_default();
+    node.mesh_type = number_of(layer.get("meshTransform")).unwrap_or(0.0) as i32;
+    node.mesh_flags = number_of(layer.get("meshSyncChildMask")).unwrap_or(0.0) as i32;
+    node.mesh_division = number_of(layer.get("meshDivision")).unwrap_or(0.0) as i32;
     if let Some(order) = layer.get("transformOrder").and_then(PsbValue::as_array) {
         for (slot, value) in node.transform_order.iter_mut().zip(order.iter()) {
             *slot = *value as i32;
         }
     }
     node.frames = parse_frames(layer.get("frameList"));
-    node.child_motion = node
+    node.has_source = node
         .frames
         .iter()
-        .find_map(|frame| frame.child_motion.clone());
+        .any(|frame| !frame.src.is_empty() || frame.child_motion.is_some());
+    node.child_slot = child_slot(&node.frames, (time - placement.time_offset).max(0.0))
+        .or_else(|| first_child_slot(&node.frames));
+    let child_clip = node.child_slot.as_ref().map(|slot| slot.clip.clone());
     nodes.push(node);
-    if let Some(label) = nodes[index].child_motion.clone()
-        && !label.is_empty()
-        && !stack.iter().any(|item| item == &label)
-        && let Some(clip) = snapshot.clip(&label)
+    if let Some(slot) = nodes[index].child_slot.clone()
+        && !slot.clip.is_empty()
+        && !stack.iter().any(|item| item == &slot.clip)
+        && let Some(clip) = snapshot.clip(&slot.clip)
     {
         // The child clip starts at the parent keyframe that names it, so every
         // layer of that clip runs that much behind the parent clock.
-        let start_frame = nodes[index]
-            .frames
-            .iter()
-            .find(|frame| frame.child_motion.as_deref() == Some(label.as_str()));
-        let start = start_frame.map_or(0.0, |frame| frame.time);
-        // The child motion's own time offset shifts its clock the other way.
-        let motion_offset = start_frame.map_or(0.0, |frame| frame.motion_time_offset);
-        let child_offset = placement.time_offset + start - motion_offset;
+        let child_offset = placement.time_offset + slot.start - slot.offset;
         // The child motion exists from the keyframe that names it, so its
         // layers draw from that moment on.
-        let child_start_time = placement.time_offset + start;
+        let child_start_time = placement.time_offset + slot.start;
         let layers = clip.layers.clone();
-        stack.push(label);
+        stack.push(slot.clip.clone());
         for layer in &layers {
+            let child_index = nodes.len();
             append_node(
                 nodes,
                 index,
@@ -1150,13 +1234,22 @@ fn append_node(
                     time_offset: child_offset,
                     start_time: child_start_time,
                 },
+                time,
             );
+            // Every layer the child clip expanded belongs to this instance,
+            // except the layers a nested child clip instance owns.
+            for child in &mut nodes[child_index..] {
+                if child.child_owner.is_none() {
+                    child.child_owner = Some(index);
+                    child.child_clip = child_clip.clone();
+                }
+            }
         }
         stack.pop();
     }
     if let Some(children) = list_of(layer.get("children")) {
         for child_layer in children {
-            append_node(nodes, index, child_layer, snapshot, stack, placement);
+            append_node(nodes, index, child_layer, snapshot, stack, placement, time);
         }
     }
 }
@@ -1233,6 +1326,51 @@ fn parse_frames(value: Option<&PsbValue>) -> Vec<Frame> {
         frames.push(frame);
     }
     frames
+}
+
+/// The keyframe active at `time`.
+///
+/// The trailing entry of a multi-frame list is only a terminator, so it is
+/// never the active keyframe.
+pub(crate) fn active_frame(frames: &[Frame], time: f64) -> Option<&Frame> {
+    if frames.is_empty() {
+        return None;
+    }
+    let mut index = 0usize;
+    for (position, frame) in frames.iter().enumerate() {
+        if frame.time <= time {
+            index = position;
+        } else {
+            break;
+        }
+    }
+    if frames.len() > 1 {
+        index = index.min(frames.len() - 2);
+    }
+    let frame = &frames[index];
+    frame.has_content.then_some(frame)
+}
+
+/// The child clip the keyframe active at `time` selects, when it names one.
+pub(crate) fn child_slot(frames: &[Frame], time: f64) -> Option<ChildSlot> {
+    let frame = active_frame(frames, time)?;
+    Some(ChildSlot {
+        clip: frame.child_motion.clone()?,
+        start: frame.time,
+        offset: frame.motion_time_offset,
+    })
+}
+
+/// The first keyframe that names a child clip.
+pub(crate) fn first_child_slot(frames: &[Frame]) -> Option<ChildSlot> {
+    frames
+        .iter()
+        .find(|frame| frame.child_motion.is_some() && frame.has_content)
+        .map(|frame| ChildSlot {
+            clip: frame.child_motion.clone().unwrap_or_default(),
+            start: frame.time,
+            offset: frame.motion_time_offset,
+        })
 }
 
 /// The node's effective colour, from the content's `color` member.
@@ -1916,7 +2054,10 @@ mod tests {
         // at `main`, so the title had no object layer to draw.
         assert_eq!(nodes.len(), 3, "labels: {:?}", node_labels(&nodes));
         assert_eq!(nodes[1].label, "main");
-        assert_eq!(nodes[1].child_motion.as_deref(), Some("char_move"));
+        assert_eq!(
+            nodes[1].child_slot.as_ref().map(|slot| slot.clip.as_str()),
+            Some("char_move")
+        );
         assert!(nodes[1].own, "the title clip's own layer stays queryable");
         assert_eq!(nodes[2].label, "logo");
         assert_eq!(nodes[2].node_type, 0);

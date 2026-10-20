@@ -77,6 +77,7 @@ impl Env {
             }
         }
         host.install(&engine).expect("install compat surface");
+        common::link_all_builtins(&engine);
         Env {
             _host: host,
             engine,
@@ -1441,4 +1442,100 @@ fn d3d_adaptor_constructor_validates_its_window_and_size_arguments() {
     assert!(env.eval("new Motion.D3DAdaptor()").is_err());
     assert!(env.eval("new Motion.D3DAdaptor(0, 1, 1, 0, 0)").is_err());
     assert!(env.eval("new Motion.D3DAdaptor(%[], 1, 1, 0, 0)").is_err());
+}
+
+/// The bound motion key names the clip the player shows. A play call with no
+/// label must not fall back to the module's first clip, which is what a
+/// `motion = "<clip>"; play()` sequence would otherwise render
+/// (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:1175-1232`,
+/// `reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:479-491`).
+#[test]
+fn player_motion_key_selects_its_clip_from_a_bound_project() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var m = rm.load(\"{path}\"); \
+         var p = new Motion.Player(rm); \
+         p.project = m; \
+         p.motion = \"口_笑\"; \
+         p.play();"
+    ));
+    assert_eq!(
+        env.eval_str("p.getLayerNames().join(',')"),
+        "笑",
+        "the clip the motion key names is shown"
+    );
+    // The module's first clip is `全体構造`, whose own layer carries the
+    // layout label; binding that clip must switch the tree back.
+    env.run("p.motion = \"全体構造\"; p.play();");
+    let names = env.eval_str("p.getLayerNames().join(',')");
+    assert!(
+        names.contains("■全体レイアウト"),
+        "the named clip's layers replace the previous clip's: {names}"
+    );
+    assert_ne!(names, "笑");
+}
+
+/// A stencil group masks its composed layer with the layers its
+/// `stencilCompositeMaskLayerList` names
+/// (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:839-845`,
+/// `PlayerRenderInternal.cpp:623-750`). The five composite groups in the
+/// committed e-mote module live in `全体構造` (three) and in the two eye clips
+/// (one each); the eye clips put the group's clip over the `shirome` mask, so
+/// the mask pass raises the antialiased mask edge to the threshold alpha.
+#[test]
+fn the_stencil_groups_mask_the_layout_and_eye_clips() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    let draw = |name: &str, clip: &str, width: u32, height: u32| {
+        env.run(&format!(
+            "var rm_{name} = new Motion.ResourceManager(null, 1024); \
+             var m_{name} = rm_{name}.load(\"{path}\"); \
+             var win_{name} = new Window(); \
+             var target_{name} = new Layer(win_{name}, null); \
+             target_{name}.setSize({width}, {height}); \
+             var p_{name} = new Motion.Player(rm_{name}); \
+             p_{name}.project = m_{name}; \
+             p_{name}.x = 400; \
+             p_{name}.y = 540; \
+             p_{name}.maskMode = Motion.MaskModeStencil; \
+             p_{name}.motion = \"{clip}\"; \
+             p_{name}.play(); \
+             p_{name}.draw(new Motion.SeparateLayerAdaptor(target_{name}));"
+        ));
+        // `bitmap_of` also proves the clip painted into its target.
+        env.bitmap_of(width, height).2
+    };
+    let layout = draw("layout", "全体構造", 800, 1079);
+    let eye_l = draw("eye_l", "目L", 800, 1080);
+    let eye_r = draw("eye_r", "目R", 800, 1078);
+    let alpha_at =
+        |pixels: &[u8], width: usize, x: usize, y: usize| pixels[(y * width + x) * 4 + 3];
+    // 全体構造's groups name child-motion layers, which carry no image, so
+    // their mask pass is a no-op; the clip still draws the body.
+    assert!(
+        layout.chunks_exact(4).any(|pixel| pixel[3] != 0),
+        "the three layout groups' clip draws"
+    );
+    assert!(
+        eye_r.chunks_exact(4).any(|pixel| pixel[3] != 0),
+        "the right eye's group clip draws"
+    );
+    // (435, 569) is inside the left eye group's clip and inside the `shirome`
+    // mask (alpha 89), but outside the pupil content: the threshold mask raises
+    // the composed group's alpha to 255 there. Without the mask pass the pixel
+    // keeps the mask layer's own antialiased alpha 89
+    // (`reference/cpp/plugins/motionplayer/PlayerRenderInternal.cpp:623-750`).
+    assert_eq!(
+        alpha_at(&eye_l, 800, 435, 569),
+        255,
+        "the stencil mask raises the covered pixel"
+    );
+    // A pixel clear of the eye stays transparent.
+    assert_eq!(alpha_at(&eye_l, 800, 500, 700), 0);
 }

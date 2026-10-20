@@ -25,13 +25,14 @@ use super::animator::{Animator, ColorAnimator, ease_weight};
 use super::helpers::{eval_object, inst_mut, inst_ref, set_real, set_string, value_as_f64};
 use super::model::{
     FrameState, IconInfo, MotionClip, MotionEvent, MotionNode, MotionSnapshot, TimelineState,
-    VariableFrame, build_node_tree, evaluate_frames, prime_timelines, scan_frame_events,
-    step_timelines,
+    VariableFrame, build_node_tree, build_node_tree_at, child_slot, evaluate_frames,
+    prime_timelines, scan_frame_events, step_timelines,
 };
 use super::resource::{MotionStore, ResourceInst};
 use super::texture::Pixels;
 use crate::engine_api::layer_ops::{
-    AffineBlit, BlitOptions, BlitSource, RectI, affine_blit, operate_rect,
+    AffineBlit, BlitOptions, BlitSource, RectI, affine_blit, fill_mask, intersect_rect,
+    operate_rect,
 };
 use crate::engine_api::{BitmapState, Scene, Storage};
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
@@ -523,7 +524,8 @@ impl PlayerInst {
         self.timelines.clear();
         self.playing_timelines.clear();
         prime_timelines(&resolved.snapshot, &mut self.timelines);
-        self.nodes = build_node_tree(&resolved.snapshot, None);
+        let clip = self.select_active_clip(&resolved.snapshot);
+        self.nodes = build_node_tree(&resolved.snapshot, clip);
         self.layers_dirty = true;
         // A motion activates behind the frame gate: the next progress advances
         // no clock and only presents the first pose.
@@ -811,6 +813,16 @@ impl PlayerInst {
             return;
         }
         let time = self.eval_time();
+        // A child clip instance follows the keyframe that is active now, so
+        // its clock offset is refreshed before the layers are evaluated.
+        if self.sync_child_instances(time) {
+            let snapshot = self.snapshot.clone();
+            if let Some(snapshot) = snapshot {
+                let clip = self.select_active_clip(&snapshot);
+                self.nodes = build_node_tree_at(&snapshot, clip, time);
+                self.sync_child_instances(time);
+            }
+        }
         // Evaluate each node's local state. A layer expanded from a child motion
         // runs on that clip's own clock, so it is offset by the parent keyframe
         // that named it and never evaluated before its start.
@@ -840,23 +852,69 @@ impl PlayerInst {
         root.accumulated.scale_y = self.scale.value() as f64;
         root.matrix = local_matrix(&root.accumulated, &root.transform_order);
         root.draw_flag = self.visible;
+        let snapshot = self.snapshot.clone();
+        let snapshot = snapshot.as_deref();
         // Accumulate the parent transform into world coordinates: the child's
         // position is the parent matrix applied to its local offset, and its
         // matrix is the parent's composed with its own.
         for index in 1..self.nodes.len() {
             let parent = self.nodes[index].parent;
-            let local = self.nodes[index].local.clone();
+            let mut local = self.nodes[index].local.clone();
             let parent_state = self.nodes[parent].accumulated.clone();
             let parent_matrix = self.nodes[parent].matrix;
             let transform_order = self.nodes[index].transform_order;
             let local_2x2 = local_matrix(&local, &transform_order);
+            let mut world_x =
+                parent_matrix[0] * local.x + parent_matrix[1] * local.y + parent_state.x;
+            let mut world_y =
+                parent_matrix[2] * local.x + parent_matrix[3] * local.y + parent_state.y;
+            let mut world_z = parent_state.z + local.z;
+            // A child clip is placed at its motion layer's origin corner.
+            if self.nodes[index].child_owner == Some(parent) {
+                let origin_x = parent_state.ox;
+                let origin_y = parent_state.oy;
+                world_x -= parent_matrix[1] * origin_y + origin_x * parent_matrix[0];
+                world_y -= origin_y * parent_matrix[3] + origin_x * parent_matrix[2];
+            }
+            // A child of a mesh node is warped through the parent's patch in
+            // the parent's own clip space, before its transform is composed.
+            let mut mesh_angle = 0.0;
+            let mut mesh_scale = 1.0;
+            if self.nodes[parent].mesh_type == 1 {
+                let parent_geometry = icon_geometry(snapshot, &self.nodes[parent].local.src);
+                if let Some((delta_angle, scale)) = mesh_deform(
+                    &self.nodes[parent],
+                    parent_geometry,
+                    &mut world_x,
+                    &mut world_y,
+                    &mut world_z,
+                    self.nodes[index].coordinate_mode,
+                ) {
+                    mesh_angle = delta_angle;
+                    mesh_scale = scale;
+                }
+            }
+            if mesh_angle != 0.0 || mesh_scale != 1.0 {
+                local.angle += mesh_angle;
+                local.scale_x *= mesh_scale;
+                local.scale_y *= mesh_scale;
+            }
+            let local_2x2 = if mesh_angle != 0.0 || mesh_scale != 1.0 {
+                local_matrix(&local, &transform_order)
+            } else {
+                local_2x2
+            };
+            let child_active = match self.nodes[index].child_owner {
+                Some(owner) => self.nodes[owner].child_slot.as_ref().is_some_and(|slot| {
+                    self.nodes[index].child_clip.as_deref() == Some(slot.clip.as_str())
+                }),
+                None => true,
+            };
             let node = &mut self.nodes[index];
             node.accumulated = local.clone();
-            node.accumulated.x =
-                parent_matrix[0] * local.x + parent_matrix[1] * local.y + parent_state.x;
-            node.accumulated.y =
-                parent_matrix[2] * local.x + parent_matrix[3] * local.y + parent_state.y;
-            node.accumulated.z = parent_state.z + local.z;
+            node.accumulated.x = world_x;
+            node.accumulated.y = world_y;
+            node.accumulated.z = world_z;
             // The visibility is inherited: a node draws only when every
             // ancestor does.
             node.accumulated.active = parent_state.active && local.active;
@@ -880,14 +938,68 @@ impl PlayerInst {
             node.draw_flag = parent_state.active
                 && local.active
                 && parent_state.opacity > 0.0
+                && child_active
                 && time >= node.visible_from;
         }
+        self.refresh_geometry(snapshot);
         let vertices = self.nodes.iter().filter(|node| node.draw_flag).count();
         self.processed_mesh_vertices_num = vertices as i32;
         // The gate a freshly activated motion holds is released by the first
         // layer update.
         self.queuing = false;
         self.layers_dirty = false;
+    }
+
+    /// Refresh every type-3 node's child clip instance clock, and report
+    /// whether a keyframe selected a child clip the tree was not built for.
+    fn sync_child_instances(&mut self, time: f64) -> bool {
+        let mut rebuild = false;
+        for index in 1..self.nodes.len() {
+            if self.nodes[index].node_type != 3 {
+                continue;
+            }
+            let local = (time - self.nodes[index].time_offset).max(0.0);
+            let slot = child_slot(&self.nodes[index].frames, local);
+            self.nodes[index].child_slot = slot.clone();
+            let Some(slot) = slot else {
+                continue;
+            };
+            let child_offset = self.nodes[index].time_offset + slot.start - slot.offset;
+            let child_start = self.nodes[index].visible_from + slot.start;
+            let known = self
+                .snapshot
+                .as_deref()
+                .is_some_and(|snapshot| snapshot.clip(&slot.clip).is_some());
+            let mut found = false;
+            for child in self.nodes.iter_mut() {
+                if child.child_owner != Some(index) {
+                    continue;
+                }
+                if child.child_clip.as_deref() != Some(slot.clip.as_str()) {
+                    rebuild = true;
+                    continue;
+                }
+                found = true;
+                child.time_offset = child_offset;
+                child.visible_from = child_start;
+            }
+            if !found && known {
+                rebuild = true;
+            }
+        }
+        rebuild
+    }
+
+    /// Rebuild the mesh, vertex and clip geometry of every node.
+    fn refresh_geometry(&mut self, snapshot: Option<&MotionSnapshot>) {
+        for index in 1..self.nodes.len() {
+            let parent = self.nodes[index].parent;
+            let parent_clip = self.nodes[parent].parent_clip;
+            self.nodes[index].parent_clip = parent_clip;
+            let geometry = icon_geometry(snapshot, &self.nodes[index].local.src);
+            refresh_node_geometry(&mut self.nodes, index, geometry, self.z_factor);
+            refresh_shape_bounds(&mut self.nodes, index, self.z_factor);
+        }
     }
 
     /// Dispatch the queued action and sync events to the script object.
@@ -1031,10 +1143,10 @@ impl PlayerInst {
         // The clip the play call names is the one the player shows, even when
         // the label names no timeline: the active clip is selected before the
         // node state is rebuilt.
-        if let Some(clip) = self.select_active_clip(&snapshot, label) {
+        if let Some(clip) = self.select_active_clip(&snapshot) {
             self.loop_time = clip.loop_time;
             self.frame_last_time = clip.total_frames;
-            self.nodes = build_node_tree(&snapshot, Some(clip));
+            self.nodes = build_node_tree_at(&snapshot, Some(clip), self.eval_time());
             self.layers_dirty = true;
             self.ensure_root_offsets();
         }
@@ -1049,25 +1161,21 @@ impl PlayerInst {
 
     /// The clip the player shows.
     ///
-    /// The label the play call carries wins when it names a clip. Then the
-    /// playing timelines are tried, then the module's primary labels, and the
-    /// first clip is the last resort.
+    /// The bound motion key wins when it names a clip, because a play call
+    /// commits its label there before the node state is rebuilt; then the
+    /// playing timelines, the module's primary labels, and finally the first
+    /// clip.
     pub(crate) fn select_active_clip<'a>(
         &self,
         snapshot: &'a MotionSnapshot,
-        label: &str,
     ) -> Option<&'a MotionClip> {
-        if !label.is_empty()
-            && let Some(clip) = snapshot.clip(label)
+        if !self.motion_key.is_empty()
+            && let Some(clip) = snapshot.clip(&self.motion_key)
         {
             return Some(clip);
         }
-        // The timeline names are tried in a stable order, so the clip a play
-        // call settles on does not depend on the hash order.
-        let mut playing: Vec<&String> = self.timelines.keys().collect();
-        playing.sort();
-        for item in playing {
-            if let Some(clip) = snapshot.clip(item) {
+        for label in &self.playing_timelines {
+            if let Some(clip) = snapshot.clip(label) {
                 return Some(clip);
             }
         }
@@ -1097,13 +1205,13 @@ impl PlayerInst {
 
     /// The labels of the layers this player owns.
     ///
-    /// A label that several nodes share is reported once, and the labels
-    /// come out in the order of the label map.
+    /// A label that several nodes share is reported once, and a layer without
+    /// a label contributes none; the labels come out in sorted order.
     pub(crate) fn layer_labels(&self) -> Vec<String> {
         let mut names: Vec<String> = self
             .nodes
             .iter()
-            .filter(|node| node.own)
+            .filter(|node| node.own && !node.label.is_empty())
             .map(|node| node.label.clone())
             .collect();
         names.sort();
@@ -1185,16 +1293,20 @@ impl PlayerInst {
         let total_y = origin_y + node.accumulated.oy;
         let corner_x = node.accumulated.x - (matrix[1] * total_y + total_x * matrix[0]);
         let corner_y = node.accumulated.y - (total_y * matrix[3] + total_x * matrix[2]);
-        let vtx = [
-            corner_x,
-            corner_y,
-            corner_x + matrix[0] * width,
-            corner_y + matrix[2] * width,
-            corner_x + matrix[0] * width + matrix[1] * height,
-            corner_y + matrix[2] * width + matrix[3] * height,
-            corner_x + matrix[1] * height,
-            corner_y + matrix[3] * height,
-        ];
+        // A mesh node reports the four corners of its deformed grid.
+        let vtx = match grid_corners(node) {
+            Some(corners) => corners,
+            None => [
+                corner_x,
+                corner_y,
+                corner_x + matrix[0] * width,
+                corner_y + matrix[2] * width,
+                corner_x + matrix[0] * width + matrix[1] * height,
+                corner_y + matrix[2] * width + matrix[3] * height,
+                corner_x + matrix[1] * height,
+                corner_y + matrix[3] * height,
+            ],
+        };
         (mtx, vtx, color, (origin_x, origin_y))
     }
 
@@ -1434,22 +1546,27 @@ impl PlayerInst {
         let color = color_bytes(self.color.bytes);
         let clear = clear_fill(self.clear_enabled, self.clear_color);
         let affine = self.affine;
-        let nodes = drawable_nodes(&self.nodes);
-        let tinted = &mut self.tinted;
+        let nodes = &self.nodes;
+        let mut tinted = std::mem::take(&mut self.tinted);
         // Every draw starts from a clear target; the previous pose never
         // survives into this frame.
         for pixel in bitmap.rgba.chunks_exact_mut(4) {
             pixel.copy_from_slice(&clear);
         }
-        let missing = composite_nodes(
+        let missing = composite_pose(
             bitmap,
             nodes,
             snapshot.as_deref(),
             storage,
-            color,
-            affine,
-            tinted,
+            DrawSettings {
+                color,
+                affine,
+                preview: self.preview,
+                mask_mode: self.mask_mode,
+            },
+            &mut tinted,
         );
+        self.tinted = tinted;
         bitmap.mark_dirty();
         if let Some(layer) = scene.layer_mut(layer_id) {
             layer.image_modified = true;
@@ -1462,53 +1579,64 @@ impl PlayerInst {
     }
 }
 
-/// Draw one node: the icon texture it names, mapped onto the quad its
-/// accumulated transform describes.
-///
-/// A shape node draws the placeholder quad instead, and a node whose icon has
-/// no readable texture draws nothing and is reported through `missing`.
+/// The state one pose is painted with.
+#[derive(Clone, Copy)]
+struct DrawSettings {
+    color: [u8; 4],
+    affine: [f64; 6],
+    /// Preview playback does not splice the child-motion players into the
+    /// parent's item list.
+    preview: bool,
+    /// The player's `maskMode`: `0` threshold-stencils a mask, any other value
+    /// blends the mask alpha arithmetically.
+    mask_mode: i32,
+}
+
+/// The per-draw state shared by the node painters.
 struct DrawFrame<'a> {
     snapshot: Option<&'a MotionSnapshot>,
     storage: Option<&'a Storage>,
-    color: [u8; 4],
-    affine: [f64; 6],
+    settings: DrawSettings,
     tinted: &'a mut TintedSources,
     missing: Vec<String>,
 }
 
-/// The node frames painted into the target: visible shape nodes plus object
-/// nodes that name an icon source and still compose any opacity.
-fn drawable_nodes<'a>(nodes: &'a [MotionNode]) -> impl Iterator<Item = &'a MotionNode> + 'a {
-    nodes.iter().filter(|node| {
-        node.draw_flag
-            && node.accumulated.opacity != 0.0
-            && (node.shape.is_positive() || (node.node_type == 0 && !node.local.src.is_empty()))
-    })
-}
-
-/// Paint `nodes` over `bitmap` in order, returning the icon sources that had no
-/// readable texture.
-fn composite_nodes<'a, 'b>(
+/// Paint the pose over `bitmap` in node order, returning the icon sources
+/// that had no readable texture.
+fn composite_pose(
     bitmap: &mut BitmapState,
-    nodes: impl IntoIterator<Item = &'a MotionNode>,
-    snapshot: Option<&'b MotionSnapshot>,
-    storage: Option<&'b Storage>,
-    color: [u8; 4],
-    affine: [f64; 6],
-    tinted: &'b mut TintedSources,
+    nodes: &[MotionNode],
+    snapshot: Option<&MotionSnapshot>,
+    storage: Option<&Storage>,
+    settings: DrawSettings,
+    tinted: &mut TintedSources,
 ) -> Vec<String> {
     let mut frame = DrawFrame {
         snapshot,
         storage,
-        color,
-        affine,
+        settings,
         tinted,
         missing: Vec::new(),
     };
-    for node in nodes {
-        draw_node(bitmap, node, &mut frame);
+    let bounds = (0, 0, bitmap.width as i32, bitmap.height as i32);
+    for index in 1..nodes.len() {
+        if settings.preview && nodes[index].child_owner.is_some() {
+            continue;
+        }
+        if nearest_group(nodes, index).is_some() {
+            continue;
+        }
+        if is_composite_group(&nodes[index]) {
+            draw_group(bitmap, (0, 0), bounds, nodes, index, &mut frame, 1.0);
+            continue;
+        }
+        if node_drawable(&nodes[index]) {
+            let opacity = nodes[index].accumulated.opacity;
+            let mode = blend_operation_mode(nodes[index].accumulated.blend_mode);
+            draw_clipped_item(bitmap, (0, 0), nodes, index, &mut frame, opacity, mode);
+        }
     }
-    frame.missing
+    std::mem::take(&mut frame.missing)
 }
 
 /// The target fill: transparent unless the player enables an explicit clear
@@ -1541,13 +1669,596 @@ fn blend_operation_mode(raw: i32) -> i64 {
     }
 }
 
-fn draw_node(bitmap: &mut BitmapState, node: &MotionNode, frame: &mut DrawFrame<'_>) {
+/// Whether a node has pixels to paint: a visible shape, or an object or
+/// composite group that names an icon source and still composes any opacity.
+fn node_drawable(node: &MotionNode) -> bool {
+    node.draw_flag
+        && node.accumulated.opacity != 0.0
+        && (node.shape.is_positive()
+            || ((node.node_type == 0 || node.node_type == 12) && !node.local.src.is_empty()))
+}
+
+/// Whether a node is a stencil-composite group (`type == 12`, stencil bit 2).
+fn is_composite_group(node: &MotionNode) -> bool {
+    node.node_type == 12 && (node.stencil_type & 4) != 0
+}
+
+/// The nearest composite group that contains `index`.
+fn nearest_group(nodes: &[MotionNode], index: usize) -> Option<usize> {
+    let mut current = nodes[index].parent;
+    loop {
+        if is_composite_group(&nodes[current]) {
+            return Some(current);
+        }
+        if current == 0 {
+            return None;
+        }
+        current = nodes[current].parent;
+    }
+}
+
+/// The four corners of a node's deformed mesh grid: top-left, top-right,
+/// bottom-right and bottom-left.
+fn grid_corners(node: &MotionNode) -> Option<[f64; 8]> {
+    let [div_x, div_y] = node.mesh_div;
+    if div_x < 2 || div_y < 2 {
+        return None;
+    }
+    let div_x = usize::try_from(div_x).ok()?;
+    let div_y = usize::try_from(div_y).ok()?;
+    if node.mesh_points.len() < div_x.checked_mul(div_y)?.checked_mul(2)? {
+        return None;
+    }
+    let point = |index: usize| {
+        (
+            f64::from(node.mesh_points[index * 2]),
+            f64::from(node.mesh_points[index * 2 + 1]),
+        )
+    };
+    let corners = [
+        point(0),
+        point(div_x - 1),
+        point(div_x * div_y - 1),
+        point((div_y - 1) * div_x),
+    ];
+    Some([
+        corners[0].0,
+        corners[0].1,
+        corners[1].0,
+        corners[1].1,
+        corners[2].0,
+        corners[2].1,
+        corners[3].0,
+        corners[3].1,
+    ])
+}
+
+/// The device-space paint box of a node's own source, floored and ceiled to
+/// whole pixels.
+fn node_paint_box(node: &MotionNode, frame: &DrawFrame<'_>) -> Option<(f64, f64, f64, f64)> {
+    let corners: [(f64, f64); 4] = if node.shape.is_positive() {
+        let matrix = node.matrix;
+        let corner = |local_x: f64, local_y: f64| {
+            (
+                node.accumulated.x + matrix[0] * local_x + matrix[1] * local_y,
+                node.accumulated.y + matrix[2] * local_x + matrix[3] * local_y,
+            )
+        };
+        [
+            corner(-32.0, -32.0),
+            corner(32.0, -32.0),
+            corner(32.0, 32.0),
+            corner(-32.0, 32.0),
+        ]
+    } else if node.local.src.is_empty()
+        || frame
+            .snapshot
+            .and_then(|snapshot| snapshot.icons.get(&node.local.src))
+            .is_none()
+    {
+        return None;
+    } else if let Some(vtx) = grid_corners(node) {
+        [
+            (vtx[0], vtx[1]),
+            (vtx[2], vtx[3]),
+            (vtx[4], vtx[5]),
+            (vtx[6], vtx[7]),
+        ]
+    } else {
+        let v = node.vertices;
+        [(v[0], v[1]), (v[2], v[3]), (v[4], v[5]), (v[6], v[7])]
+    };
+    let mut bounds = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for (x, y) in corners {
+        let (x, y) = draw_point(frame.settings.affine, x, y);
+        bounds.0 = bounds.0.min(x);
+        bounds.1 = bounds.1.min(y);
+        bounds.2 = bounds.2.max(x);
+        bounds.3 = bounds.3.max(y);
+    }
+    if !bounds.0.is_finite() || !bounds.1.is_finite() {
+        return None;
+    }
+    Some((
+        bounds.0.floor(),
+        bounds.1.floor(),
+        bounds.2.ceil(),
+        bounds.3.ceil(),
+    ))
+}
+
+/// The device-space rect a node is clipped to: the nearest enclosing type-7
+/// shape's bounds.
+fn node_viewport(
+    nodes: &[MotionNode],
+    node: &MotionNode,
+    frame: &DrawFrame<'_>,
+) -> Option<(f64, f64, f64, f64)> {
+    let clip = node.parent_clip?;
+    let bounds = nodes.get(clip)?.shape_aabb;
+    if bounds[2] < bounds[0] || bounds[3] < bounds[1] {
+        return None;
+    }
+    let corners = [
+        (bounds[0], bounds[1]),
+        (bounds[2], bounds[1]),
+        (bounds[2], bounds[3]),
+        (bounds[0], bounds[3]),
+    ];
+    let mut out = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for (x, y) in corners {
+        let (x, y) = draw_point(frame.settings.affine, x, y);
+        out.0 = out.0.min(x);
+        out.1 = out.1.min(y);
+        out.2 = out.2.max(x);
+        out.3 = out.3.max(y);
+    }
+    Some((out.0.floor(), out.1.floor(), out.2.ceil(), out.3.ceil()))
+}
+
+/// Union two paint boxes; an invalid box yields the other.
+fn union_paint_box(
+    a: Option<(f64, f64, f64, f64)>,
+    b: Option<(f64, f64, f64, f64)>,
+) -> Option<(f64, f64, f64, f64)> {
+    match (a, b) {
+        (None, other) | (other, None) => other,
+        (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))),
+    }
+}
+
+/// The paint box of a composite group: its own source plus every item it
+/// contains, following nested groups.
+fn group_paint_box(
+    nodes: &[MotionNode],
+    group: usize,
+    frame: &DrawFrame<'_>,
+) -> Option<(f64, f64, f64, f64)> {
+    let mut paint_box = node_paint_box(&nodes[group], frame);
+    for index in 0..nodes.len() {
+        if index == group || nearest_group(nodes, index) != Some(group) {
+            continue;
+        }
+        let node = &nodes[index];
+        if frame.settings.preview && node.child_owner.is_some() {
+            continue;
+        }
+        if is_composite_group(node) {
+            paint_box = union_paint_box(paint_box, group_paint_box(nodes, index, frame));
+        } else if node_drawable(node) {
+            paint_box = union_paint_box(paint_box, node_paint_box(node, frame));
+        }
+    }
+    paint_box
+}
+
+/// Composite one composite group into `target`.
+///
+/// The group's own source and every item it contains are drawn into an
+/// offscreen bitmap the size of the group's paint box clipped to its viewport;
+/// the group's blend mode and accumulated opacity are applied once at the
+/// composite, and a child's opacity is divided by the group's so the group
+/// factor is not applied twice.
+fn draw_group(
+    target: &mut BitmapState,
+    target_origin: (i32, i32),
+    target_bounds: (i32, i32, i32, i32),
+    nodes: &[MotionNode],
+    group: usize,
+    frame: &mut DrawFrame<'_>,
+    parent_opacity: f64,
+) {
+    let Some(paint_box) = group_paint_box(nodes, group, frame) else {
+        return;
+    };
+    let viewport = node_viewport(nodes, &nodes[group], frame);
+    let clip = match viewport {
+        Some(viewport) => (
+            paint_box.0.max(viewport.0),
+            paint_box.1.max(viewport.1),
+            paint_box.2.min(viewport.2),
+            paint_box.3.min(viewport.3),
+        ),
+        None => paint_box,
+    };
+    let clip = (
+        clip.0.max(f64::from(target_bounds.0)),
+        clip.1.max(f64::from(target_bounds.1)),
+        clip.2.min(f64::from(target_bounds.2)),
+        clip.3.min(f64::from(target_bounds.3)),
+    );
+    let left = clip.0 as i32;
+    let top = clip.1 as i32;
+    let right = clip.2 as i32;
+    let bottom = clip.3 as i32;
+    if right <= left || bottom <= top {
+        return;
+    }
+    let Ok(width) = u32::try_from(right - left) else {
+        return;
+    };
+    let Ok(height) = u32::try_from(bottom - top) else {
+        return;
+    };
+    let mut offscreen = BitmapState::new(
+        width,
+        height,
+        vec![0u8; width as usize * height as usize * 4],
+    );
+    let origin = (left, top);
+    let offset = (-origin.0, -origin.1);
+    let group_opacity = nodes[group].accumulated.opacity.clamp(0.0, 1.0);
+    if node_drawable(&nodes[group]) {
+        // The group's own source is painted source-over; the group's blend
+        // mode is applied when the completed group is composited.
+        draw_node(&mut offscreen, nodes, group, frame, 1.0, 2, offset);
+    }
+    for index in 0..nodes.len() {
+        if index == group || nearest_group(nodes, index) != Some(group) {
+            continue;
+        }
+        let node = &nodes[index];
+        if frame.settings.preview && node.child_owner.is_some() {
+            continue;
+        }
+        if is_composite_group(node) {
+            draw_group(
+                &mut offscreen,
+                origin,
+                (left, top, right, bottom),
+                nodes,
+                index,
+                frame,
+                group_opacity,
+            );
+            continue;
+        }
+        if !node_drawable(node) {
+            continue;
+        }
+        let ratio = if group_opacity > 0.0 {
+            node.accumulated.opacity / group_opacity
+        } else {
+            0.0
+        };
+        draw_clipped_item(
+            &mut offscreen,
+            origin,
+            nodes,
+            index,
+            frame,
+            ratio.clamp(0.0, 1.0),
+            blend_operation_mode(node.accumulated.blend_mode),
+        );
+    }
+    // A stencil group's mask layers change the composed group's alpha in the
+    // mask's region once, before the group is composited.
+    if !nodes[group].mask_layers.is_empty() {
+        let masks: Vec<usize> = nodes[group]
+            .mask_layers
+            .iter()
+            .filter_map(|label| nodes.iter().rposition(|node| &node.label == label))
+            .collect();
+        let group_flags = nodes[group].stencil_type;
+        for mask_index in masks {
+            let Some(mask_box) = node_drawn_box(&nodes[mask_index], frame) else {
+                continue;
+            };
+            let mut mask_bitmap = BitmapState::new(
+                width,
+                height,
+                vec![0u8; width as usize * height as usize * 4],
+            );
+            draw_node(&mut mask_bitmap, nodes, mask_index, frame, 1.0, 2, offset);
+            let rect = (
+                mask_box.0 as i32 - origin.0,
+                mask_box.1 as i32 - origin.1,
+                mask_box.2 as i32 - origin.0,
+                mask_box.3 as i32 - origin.1,
+            );
+            apply_alpha_mask(
+                &mut offscreen,
+                &mask_bitmap,
+                group_flags,
+                frame.settings.mask_mode,
+                rect,
+            );
+        }
+    }
+    let opa = ((nodes[group].accumulated.opacity.clamp(0.0, 1.0) / parent_opacity.max(1e-9))
+        .clamp(0.0, 1.0)
+        * 255.0)
+        .round() as u8;
+    if opa == 0 {
+        return;
+    }
+    let mode = blend_operation_mode(nodes[group].accumulated.blend_mode);
+    operate_rect(
+        target,
+        origin.0 - target_origin.0,
+        origin.1 - target_origin.1,
+        BlitSource {
+            bitmap: &offscreen,
+            rect: (0, 0, right - left, bottom - top),
+        },
+        BlitOptions {
+            mode,
+            opa,
+            treat_as_opaque: false,
+            hold_alpha: false,
+        },
+    );
+}
+
+/// Apply a mask layer's alpha to a composed group: `item_flags` selects the
+/// operation, a threshold mask mode cuts at 64, and a composite group also
+/// clears the alpha the mask does not cover.
+fn apply_alpha_mask(
+    dst: &mut BitmapState,
+    mask: &BitmapState,
+    item_flags: i32,
+    mask_mode: i32,
+    requested: (i32, i32, i32, i32),
+) {
+    let (dx0, dy0, dx1, dy1) = requested;
+    let Some((x0, y0, x1, y1)) = intersect_rect(
+        (dx0, dy0, dx1, dy1),
+        (0, 0, dst.width as i32, dst.height as i32),
+    ) else {
+        return;
+    };
+    let Some((ox0, oy0, ox1, oy1)) = intersect_rect(
+        (x0, y0, x1, y1),
+        (0, 0, mask.width as i32, mask.height as i32),
+    ) else {
+        return;
+    };
+    if (item_flags & 3) == 1 {
+        // The mask defines the only region the group keeps; the bands of the
+        // requested rectangle the mask does not reach are cleared.
+        fill_mask(dst, (dx0, dy0, dx1, oy0), 0);
+        fill_mask(dst, (dx0, oy1.max(dy0), dx1, dy1), 0);
+        fill_mask(dst, (dx0, oy0, ox0, oy1), 0);
+        fill_mask(dst, (ox1, oy0, dx1, oy1), 0);
+    }
+    let threshold_mask = mask_mode == 0;
+    let width = dst.width as usize;
+    for y in oy0..oy1 {
+        for x in ox0..ox1 {
+            let src_index = ((y as usize * mask.width as usize) + x as usize) * 4 + 3;
+            let Some(src_alpha) = mask.rgba.get(src_index).copied() else {
+                continue;
+            };
+            let dst_index = ((y as usize * width) + x as usize) * 4 + 3;
+            let Some(dst_alpha) = dst.rgba.get(dst_index).copied() else {
+                continue;
+            };
+            let src_alpha = i32::from(src_alpha);
+            let dst_alpha = i32::from(dst_alpha);
+            let updated = match item_flags {
+                1 => {
+                    if threshold_mask {
+                        if src_alpha < 64 { 0 } else { dst_alpha }
+                    } else {
+                        dst_alpha * src_alpha / 255
+                    }
+                }
+                2 => {
+                    if threshold_mask {
+                        if src_alpha >= 64 { 0 } else { dst_alpha }
+                    } else {
+                        (255 - src_alpha) * dst_alpha / 255
+                    }
+                }
+                5 | 6 => {
+                    if threshold_mask {
+                        if src_alpha >= 64 { 255 } else { dst_alpha }
+                    } else {
+                        src_alpha + (255 - src_alpha) * dst_alpha / 255
+                    }
+                }
+                _ => dst_alpha,
+            };
+            dst.rgba[dst_index] = updated.clamp(0, 255) as u8;
+        }
+    }
+    dst.mark_dirty();
+}
+
+/// Draw one item, clipped to its paint box intersected with the viewport of
+/// the nearest enclosing shape. A clip that trims the item renders it into an
+/// offscreen the size of the clip and composites that once.
+fn draw_clipped_item(
+    out: &mut BitmapState,
+    out_origin: (i32, i32),
+    nodes: &[MotionNode],
+    index: usize,
+    frame: &mut DrawFrame<'_>,
+    opacity: f64,
+    mode: i64,
+) {
+    let offset = (-out_origin.0, -out_origin.1);
+    let node = &nodes[index];
+    let Some(viewport) = node_viewport(nodes, node, frame) else {
+        draw_node(out, nodes, index, frame, opacity, mode, offset);
+        return;
+    };
+    let Some(paint) = node_paint_box(node, frame) else {
+        return;
+    };
+    let clip = (
+        paint.0.max(viewport.0),
+        paint.1.max(viewport.1),
+        paint.2.min(viewport.2),
+        paint.3.min(viewport.3),
+    );
+    let left = clip.0 as i32;
+    let top = clip.1 as i32;
+    let right = clip.2 as i32;
+    let bottom = clip.3 as i32;
+    if right <= left || bottom <= top {
+        return;
+    }
+    if paint.0 >= clip.0 && paint.1 >= clip.1 && paint.2 <= clip.2 && paint.3 <= clip.3 {
+        draw_node(out, nodes, index, frame, opacity, mode, offset);
+        return;
+    }
+    let Ok(width) = u32::try_from(right - left) else {
+        return;
+    };
+    let Ok(height) = u32::try_from(bottom - top) else {
+        return;
+    };
+    let opa = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+    if opa == 0 {
+        return;
+    }
+    let mut offscreen = BitmapState::new(
+        width,
+        height,
+        vec![0u8; width as usize * height as usize * 4],
+    );
+    draw_node(&mut offscreen, nodes, index, frame, 1.0, 2, (-left, -top));
+    operate_rect(
+        out,
+        left - out_origin.0,
+        top - out_origin.1,
+        BlitSource {
+            bitmap: &offscreen,
+            rect: (0, 0, right - left, bottom - top),
+        },
+        BlitOptions {
+            mode,
+            opa,
+            treat_as_opaque: false,
+            hold_alpha: false,
+        },
+    );
+}
+
+/// The world-space top-left corner of the icon quad a node draws.
+fn icon_corner(node: &MotionNode, icon: &IconInfo) -> (f64, f64) {
+    let matrix = node.matrix;
+    let origin_x = icon.origin_x + node.accumulated.ox;
+    let origin_y = icon.origin_y + node.accumulated.oy;
+    (
+        node.accumulated.x - (matrix[1] * origin_y + origin_x * matrix[0]),
+        node.accumulated.y - (origin_y * matrix[3] + origin_x * matrix[2]),
+    )
+}
+
+/// The device-space box the node's own source is drawn into.
+///
+/// The drawn box uses the same corner as the quad painter, so a mask samples
+/// the pixels the mask layer actually paints.
+fn node_drawn_box(node: &MotionNode, frame: &DrawFrame<'_>) -> Option<(f64, f64, f64, f64)> {
+    let matrix = node.matrix;
+    let corners: [(f64, f64); 4] = if node.shape.is_positive() {
+        let corner = |local_x: f64, local_y: f64| {
+            (
+                node.accumulated.x + matrix[0] * local_x + matrix[1] * local_y,
+                node.accumulated.y + matrix[2] * local_x + matrix[3] * local_y,
+            )
+        };
+        [
+            corner(-32.0, -32.0),
+            corner(32.0, -32.0),
+            corner(32.0, 32.0),
+            corner(-32.0, 32.0),
+        ]
+    } else {
+        let icon = frame.snapshot?.icons.get(&node.local.src)?;
+        let (x, y) = icon_corner(node, icon);
+        let (width, height) = (icon.width, icon.height);
+        let corner = |local_x: f64, local_y: f64| {
+            (
+                x + matrix[0] * local_x + matrix[1] * local_y,
+                y + matrix[2] * local_x + matrix[3] * local_y,
+            )
+        };
+        [
+            corner(0.0, 0.0),
+            corner(width, 0.0),
+            corner(width, height),
+            corner(0.0, height),
+        ]
+    };
+    let mut out = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for (x, y) in corners {
+        let (x, y) = draw_point(frame.settings.affine, x, y);
+        out.0 = out.0.min(x);
+        out.1 = out.1.min(y);
+        out.2 = out.2.max(x);
+        out.3 = out.3.max(y);
+    }
+    Some((out.0.floor(), out.1.floor(), out.2.ceil(), out.3.ceil()))
+}
+
+/// Draw one node: the icon texture it names, mapped onto the quad its
+/// accumulated transform describes.
+///
+/// `offset` is the destination-local origin (the negated clip origin) added to
+/// every point, so the same painter fills a full target and an offscreen clip.
+/// A shape node draws the placeholder quad instead, and a node whose icon has
+/// no readable texture draws nothing and is reported through `missing`.
+fn draw_node(
+    bitmap: &mut BitmapState,
+    nodes: &[MotionNode],
+    index: usize,
+    frame: &mut DrawFrame<'_>,
+    opacity: f64,
+    mode: i64,
+    offset: (i32, i32),
+) {
+    let node = &nodes[index];
     let icon = frame
         .snapshot
         .and_then(|snapshot| snapshot.icons.get(&node.local.src));
     let (Some(snapshot), Some(icon), Some(storage)) = (frame.snapshot, icon, frame.storage) else {
         if node.shape > 0 {
-            fill_placeholder_quad(bitmap, node, frame.color, frame.affine);
+            fill_placeholder_quad_offset(
+                bitmap,
+                node,
+                frame.settings.color,
+                frame.settings.affine,
+                opacity,
+                offset,
+            );
         } else if node.local.src.starts_with("src/") {
             // Only a `src/<group>/<name>` source names an icon; the layout and
             // blank sources of container and mask nodes draw nothing.
@@ -1571,24 +2282,73 @@ fn draw_node(bitmap: &mut BitmapState, node: &MotionNode, frame: &mut DrawFrame<
     // The icon origin is offset in world space: the matrix applied to the
     // origin is subtracted from the node position, then the quad is laid out
     // from that corner.
-    let (origin_x, origin_y) = (
-        icon.origin_x + node.accumulated.ox,
-        icon.origin_y + node.accumulated.oy,
-    );
-    let corner_x = node.accumulated.x - (matrix[1] * origin_y + origin_x * matrix[0]);
-    let corner_y = node.accumulated.y - (origin_y * matrix[3] + origin_x * matrix[2]);
+    let (corner_x, corner_y) = icon_corner(node, icon);
     let corner = |local_x: f64, local_y: f64| {
         let x = corner_x + matrix[0] * local_x + matrix[1] * local_y;
         let y = corner_y + matrix[2] * local_x + matrix[3] * local_y;
-        draw_point(frame.affine, x, y)
+        let (x, y) = draw_point(frame.settings.affine, x, y);
+        (x + f64::from(offset.0), y + f64::from(offset.1))
     };
+    let opa = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+    // A mesh node draws one affine cell per grid quad, so the texture follows
+    // the deformed grid inside its outline as well as on it.
+    let [div_x, div_y] = node.mesh_div;
+    let cells = match (usize::try_from(div_x), usize::try_from(div_y)) {
+        (Ok(div_x), Ok(div_y)) if div_x >= 2 && div_y >= 2 => {
+            div_x.checked_mul(div_y).map(|count| (div_x, div_y, count))
+        }
+        _ => None,
+    };
+    if let Some((div_x, div_y, cell_count)) = cells
+        && node.mesh_points.len() >= cell_count.saturating_mul(2)
+        && grid_corners(node).is_some()
+    {
+        let point = |gx: usize, gy: usize| {
+            let index = (gy * div_x + gx) * 2;
+            let (x, y) = draw_point(
+                frame.settings.affine,
+                f64::from(node.mesh_points[index]),
+                f64::from(node.mesh_points[index + 1]),
+            );
+            (x + f64::from(offset.0), y + f64::from(offset.1))
+        };
+        let source_edge = |index: usize, length: i32, divisions: usize| -> i32 {
+            (index as f64 * f64::from(length) / divisions as f64).round() as i32
+        };
+        for gy in 0..div_y - 1 {
+            let top = source_edge(gy, height, div_y - 1);
+            let bottom = source_edge(gy + 1, height, div_y - 1).max(top + 1);
+            for gx in 0..div_x - 1 {
+                let left = source_edge(gx, width, div_x - 1);
+                let right = source_edge(gx + 1, width, div_x - 1).max(left + 1);
+                affine_blit(
+                    bitmap,
+                    AffineBlit {
+                        corners: [point(gx, gy), point(gx + 1, gy), point(gx, gy + 1)],
+                        stretch_type: 0,
+                        clear: false,
+                        clear_color: [0, 0, 0, 0],
+                    },
+                    BlitSource {
+                        bitmap: &source,
+                        rect: (left, top, right.min(width), bottom.min(height)),
+                    },
+                    BlitOptions {
+                        mode,
+                        opa,
+                        treat_as_opaque: false,
+                        hold_alpha: false,
+                    },
+                );
+            }
+        }
+        return;
+    }
     let corners = [
         corner(0.0, 0.0),
         corner(f64::from(width), 0.0),
         corner(0.0, f64::from(height)),
     ];
-    let opa = (node.accumulated.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
-    let mode = blend_operation_mode(node.accumulated.blend_mode);
     draw_icon(bitmap, &source, width, height, corners, opa, mode);
 }
 
@@ -1600,14 +2360,14 @@ fn tinted_source(
     crop: RectI,
 ) -> Option<Arc<BitmapState>> {
     let key = TintKey {
-        color: frame.color,
+        color: frame.settings.color,
         crop,
         pixels: Arc::as_ptr(pixels) as usize,
     };
     if let Some(source) = frame.tinted.get(&key) {
         return Some(source.clone());
     }
-    let source = Arc::new(tint_crop(pixels, crop, frame.color)?);
+    let source = Arc::new(tint_crop(pixels, crop, frame.settings.color)?);
     frame.tinted.insert(key, source.clone());
     Some(source)
 }
@@ -1738,19 +2498,22 @@ fn draw_point(affine: [f64; 6], x: f64, y: f64) -> (f64, f64) {
 }
 
 /// Draw the fixed-size solid quad a shape node approximates to.
-fn fill_placeholder_quad(
+fn fill_placeholder_quad_offset(
     bitmap: &mut BitmapState,
     node: &MotionNode,
     color: [u8; 4],
     affine: [f64; 6],
+    opacity: f64,
+    offset: (i32, i32),
 ) {
     let matrix = node.matrix;
     let corner = |local_x: f64, local_y: f64| {
-        draw_point(
+        let (x, y) = draw_point(
             affine,
             node.accumulated.x + matrix[0] * local_x + matrix[1] * local_y,
             node.accumulated.y + matrix[2] * local_x + matrix[3] * local_y,
-        )
+        );
+        (x + f64::from(offset.0), y + f64::from(offset.1))
     };
     let points = [
         corner(-32.0, -32.0),
@@ -1758,7 +2521,7 @@ fn fill_placeholder_quad(
         corner(32.0, 32.0),
         corner(-32.0, 32.0),
     ];
-    let alpha = (f64::from(color[3]) * node.accumulated.opacity.clamp(0.0, 1.0)) as u8;
+    let alpha = (f64::from(color[3]) * opacity.clamp(0.0, 1.0)) as u8;
     crate::engine_api::raster::fill_polygon(bitmap, &points, [color[0], color[1], color[2], alpha]);
 }
 
@@ -1892,6 +2655,286 @@ fn local_matrix(state: &FrameState, order: &[i32; 4]) -> [f64; 4] {
 /// The byte channels a normalized color animator hands the rasterizer.
 fn color_bytes(channels: [f32; 4]) -> [u8; 4] {
     channels.map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+/// The canvas width, height and origin anchor of the icon a source names.
+fn icon_geometry(snapshot: Option<&MotionSnapshot>, src: &str) -> Option<(f64, f64, f64, f64)> {
+    let icon = snapshot?.icons.get(src)?;
+    Some((icon.width, icon.height, icon.origin_x, icon.origin_y))
+}
+
+/// Evaluate a 4×4 bezier patch over the first sixteen `(x, y)` control
+/// points of `points`.
+fn eval_bezier_patch(points: &[f32], u: f32, v: f32) -> Option<(f32, f32)> {
+    if points.len() < 32 {
+        return None;
+    }
+    let su = 1.0 - u;
+    let sv = 1.0 - v;
+    let bu = [su * su * su, 3.0 * su * su * u, 3.0 * su * u * u, u * u * u];
+    let bv = [sv * sv * sv, 3.0 * sv * sv * v, 3.0 * sv * v * v, v * v * v];
+    let mut x = 0.0f32;
+    let mut y = 0.0f32;
+    for index in 0..16 {
+        let weight = bv[index >> 2] * bu[index & 3];
+        x += points[index * 2] * weight;
+        y += points[index * 2 + 1] * weight;
+    }
+    Some((x, y))
+}
+
+/// Warp a child's position through its parent's bezier patch.
+///
+/// The child position is normalized into the parent's clip space, evaluated
+/// through the parent's patch, and mapped back; the patch's gradient can also
+/// contribute an angle and a scale when the parent's sync flags ask for it.
+/// Returns the angle delta in degrees and the scale factor.
+fn mesh_deform(
+    parent: &MotionNode,
+    geometry: Option<(f64, f64, f64, f64)>,
+    x: &mut f64,
+    y: &mut f64,
+    z: &mut f64,
+    coordinate_mode: i32,
+) -> Option<(f64, f64)> {
+    if parent.mesh_type != 1
+        || (parent.mesh_flags & 1) == 0
+        || !parent.accumulated.active
+        || !parent.has_source
+        || parent.mesh_points.len() < 32
+    {
+        return None;
+    }
+    let (width, height, origin_x, origin_y) = geometry?;
+    let width = if width > 0.0 { width } else { 1.0 };
+    let height = if height > 0.0 { height } else { 1.0 };
+    let total_ox = parent.local.ox + origin_x;
+    let total_oy = parent.local.oy + origin_y;
+    let secondary = if coordinate_mode != 0 { *z } else { *y };
+    let norm_x = ((*x + total_ox) / width) as f32;
+    let norm_y = ((secondary + total_oy) / height) as f32;
+    let (def_x, def_y) = eval_bezier_patch(&parent.mesh_points, norm_x, norm_y)?;
+    *x = f64::from(def_x) * width - total_ox;
+    if coordinate_mode != 0 {
+        *z = f64::from(def_y) * height - total_oy;
+    } else {
+        *y = f64::from(def_y) * height - total_oy;
+    }
+    let mut angle = 0.0;
+    if (parent.mesh_flags & 2) != 0 && (parent.inherit_flags & 0x10) != 0 {
+        let eps = 0.0001f32;
+        let points = &parent.mesh_points;
+        let (x1, y1) = eval_bezier_patch(points, norm_x - eps, norm_y).unwrap_or((0.0, 0.0));
+        let (x2, y2) = eval_bezier_patch(points, norm_x + eps, norm_y).unwrap_or((0.0, 0.0));
+        let (x3, y3) = eval_bezier_patch(points, norm_x, norm_y - eps).unwrap_or((0.0, 0.0));
+        let (x4, y4) = eval_bezier_patch(points, norm_x, norm_y + eps).unwrap_or((0.0, 0.0));
+        let a1 = f64::from(y3 - y4).atan2(f64::from(x4 - x3));
+        let a2 = f64::from(y2 - y1).atan2(f64::from(x2 - x1));
+        angle = (a1 + a2) * 0.5 * 360.0 / std::f64::consts::TAU;
+    }
+    let mut scale = 1.0;
+    if (parent.mesh_flags & 4) != 0 && (parent.inherit_flags & 0x60) != 0 {
+        let eps = 0.0001f32;
+        let points = &parent.mesh_points;
+        let (x1, y1) = eval_bezier_patch(points, norm_x - eps, norm_y).unwrap_or((0.0, 0.0));
+        let (x2, y2) = eval_bezier_patch(points, norm_x + eps, norm_y).unwrap_or((0.0, 0.0));
+        let (x3, y3) = eval_bezier_patch(points, norm_x, norm_y - eps).unwrap_or((0.0, 0.0));
+        let (x4, y4) = eval_bezier_patch(points, norm_x, norm_y + eps).unwrap_or((0.0, 0.0));
+        let dx1 = f64::from(x2 - x1);
+        let dy1 = f64::from(y2 - y1);
+        let area1 = (dx1 * f64::from(y4 - y1) - dy1 * f64::from(x4 - x1)).abs() * 0.5;
+        let area2 = (dx1 * f64::from(y3 - y1) - dy1 * f64::from(x3 - x1)).abs() * 0.5;
+        scale = (area1 + area2 + area2 + area1).sqrt() / 0.0002;
+    }
+    Some((angle, scale))
+}
+
+/// Rebuild one node's mesh grid, corner vertices and shape bounds.
+fn refresh_node_geometry(
+    nodes: &mut [MotionNode],
+    index: usize,
+    geometry: Option<(f64, f64, f64, f64)>,
+    z_factor: f64,
+) {
+    let Some((cw, ch, origin_x, origin_y)) = geometry else {
+        return;
+    };
+    if cw <= 0.0 || ch <= 0.0 {
+        return;
+    }
+    let matrix = nodes[index].matrix;
+    let (m11, m12, m21, m22) = (matrix[0], matrix[1], matrix[2], matrix[3]);
+    let pos_y = nodes[index].accumulated.y + nodes[index].accumulated.z * z_factor;
+    let total_ox = nodes[index].accumulated.ox + origin_x;
+    let total_oy = nodes[index].accumulated.oy + origin_y;
+    let org_x = nodes[index].accumulated.x - (m12 * total_oy + total_ox * m11);
+    let org_y = pos_y - (total_oy * m22 + total_ox * m21);
+    let mut vertices = [
+        org_x,
+        org_y,
+        org_x + m11 * cw,
+        org_y + m21 * cw,
+        org_x + m11 * cw + m12 * ch,
+        org_y + m21 * cw + m22 * ch,
+        org_x + m12 * ch,
+        org_y + m22 * ch,
+    ];
+    let previous = std::mem::take(&mut nodes[index].mesh_points);
+    let mut points = Vec::new();
+    let mut div = [0, 0];
+    let mesh_type = nodes[index].mesh_type;
+    if mesh_type == 1 || mesh_type == 2 {
+        let mw11 = m11 * cw;
+        let mw12 = m12 * ch;
+        let mw21 = m21 * cw;
+        let mw22 = m22 * ch;
+        let det = mw11 * mw22 - mw12 * mw21;
+        if det.abs() > 1e-10 {
+            nodes[index].mesh_inv = [mw22 / det, -(mw12 / det), -(mw21 / det), mw11 / det];
+            nodes[index].mesh_inv_offset = [-(org_x as f32), -(org_y as f32)];
+        }
+        let mut div_total = nodes[index].mesh_division;
+        if div_total > 50 {
+            div_total = 50;
+        }
+        if div_total < 1 {
+            div_total = 4;
+        }
+        let div_x = ((f64::from(div_total) * cw / (cw + ch)) as i32) + 1;
+        let div_y = div_total - div_x + 2;
+        div = [div_x, div_y];
+        let Ok(count) = usize::try_from(div_x.saturating_mul(div_y)) else {
+            nodes[index].mesh_points = previous;
+            return;
+        };
+        points.reserve(count * 2);
+        for gy in 0..div_y {
+            let tv = if div_y > 1 {
+                f64::from(gy) / f64::from(div_y - 1)
+            } else {
+                0.0
+            };
+            let row_base_x = org_x + (m12 * ch) * tv;
+            let row_base_y = org_y + (m22 * ch) * tv;
+            let row_end_x = row_base_x + m11 * cw;
+            let row_end_y = row_base_y + m21 * cw;
+            for gx in 0..div_x {
+                let tu = if div_x > 1 {
+                    f64::from(gx) / f64::from(div_x - 1)
+                } else {
+                    0.0
+                };
+                points.push((row_base_x * (1.0 - tu) + row_end_x * tu) as f32);
+                points.push((row_base_y * (1.0 - tu) + row_end_y * tu) as f32);
+            }
+        }
+        // The previous frame's grid is the warp field the new grid is drawn
+        // through.
+        if previous.len() >= 32 {
+            for pair in points.chunks_exact_mut(2) {
+                if let Some((x, y)) = eval_bezier_patch(&previous, pair[0], pair[1]) {
+                    pair[0] = x;
+                    pair[1] = y;
+                }
+            }
+        }
+        // Warp the whole grid through every mesh-enabled ancestor, then move
+        // the origin by the same cascade.
+        let mut chain = Vec::new();
+        let mut ancestor = nodes[index].parent;
+        while ancestor > 0 {
+            if nodes[ancestor].mesh_points.len() >= 32 {
+                chain.push((
+                    nodes[ancestor].mesh_points.clone(),
+                    nodes[ancestor].mesh_inv,
+                    nodes[ancestor].mesh_inv_offset,
+                ));
+            }
+            ancestor = nodes[ancestor].parent;
+        }
+        let mut cascade_x = org_x as f32;
+        let mut cascade_y = org_y as f32;
+        for (mesh, inverse, offset) in chain {
+            for pair in points.chunks_exact_mut(2) {
+                let tx = pair[0] + offset[0];
+                let ty = pair[1] + offset[1];
+                let ix = (inverse[0] * f64::from(tx) + inverse[1] * f64::from(ty)) as f32;
+                let iy = (inverse[2] * f64::from(tx) + inverse[3] * f64::from(ty)) as f32;
+                if let Some((x, y)) = eval_bezier_patch(&mesh, ix, iy) {
+                    pair[0] = x;
+                    pair[1] = y;
+                }
+            }
+            let tx = cascade_x + offset[0];
+            let ty = cascade_y + offset[1];
+            let ix = (inverse[0] * f64::from(tx) + inverse[1] * f64::from(ty)) as f32;
+            let iy = (inverse[2] * f64::from(tx) + inverse[3] * f64::from(ty)) as f32;
+            if let Some((x, y)) = eval_bezier_patch(&mesh, ix, iy) {
+                cascade_x = x;
+                cascade_y = y;
+            }
+        }
+        if cascade_x != org_x as f32 || cascade_y != org_y as f32 {
+            let dx = cascade_x - org_x as f32;
+            let dy = cascade_y - org_y as f32;
+            for pair in points.chunks_exact_mut(2) {
+                pair[0] += dx;
+                pair[1] += dy;
+            }
+            vertices[0] = f64::from(cascade_x);
+            vertices[1] = f64::from(cascade_y);
+            vertices[2] = vertices[0] + m11 * cw;
+            vertices[3] = vertices[1] + m21 * cw;
+            vertices[4] = vertices[0] + m11 * cw + m12 * ch;
+            vertices[5] = vertices[1] + m21 * cw + m22 * ch;
+            vertices[6] = vertices[0] + m12 * ch;
+            vertices[7] = vertices[1] + m22 * ch;
+        }
+    }
+    nodes[index].mesh_points = points;
+    nodes[index].mesh_div = div;
+    nodes[index].vertices = vertices;
+}
+
+/// Rebuild the axis-aligned bounds of a type-7 shape node and make it the clip
+/// of its descendants.
+fn refresh_shape_bounds(nodes: &mut [MotionNode], index: usize, z_factor: f64) {
+    if nodes[index].node_type != 7 || !nodes[index].accumulated.active {
+        return;
+    }
+    let matrix = nodes[index].matrix;
+    let (m11, m12, m21, m22) = (matrix[0], matrix[1], matrix[2], matrix[3]);
+    let ox = nodes[index].local.ox;
+    let oy = nodes[index].local.oy;
+    let oox = ox * m11 + oy * m12;
+    let ooy = ox * m21 + oy * m22;
+    let px = nodes[index].accumulated.x;
+    let py = nodes[index].accumulated.y + nodes[index].accumulated.z * z_factor;
+    let mut bounds = [
+        px - m11 * 16.0 - m12 * 16.0 - oox,
+        py - m21 * 16.0 - m22 * 16.0 - ooy,
+        px + m11 * 16.0 + m12 * 16.0 - oox,
+        py + m21 * 16.0 + m22 * 16.0 - ooy,
+    ];
+    if bounds[0] > bounds[2] {
+        bounds.swap(0, 2);
+    }
+    if bounds[1] > bounds[3] {
+        bounds.swap(1, 3);
+    }
+    if let Some(clip) = nodes[index].parent_clip
+        && let Some(parent) = nodes.get(clip)
+    {
+        let parent_bounds = parent.shape_aabb;
+        if parent_bounds[2] >= parent_bounds[0] && parent_bounds[3] >= parent_bounds[1] {
+            bounds[0] = bounds[0].max(parent_bounds[0]);
+            bounds[1] = bounds[1].max(parent_bounds[1]);
+            bounds[2] = bounds[2].min(parent_bounds[2]);
+            bounds[3] = bounds[3].min(parent_bounds[3]);
+        }
+    }
+    nodes[index].shape_aabb = bounds;
+    nodes[index].parent_clip = Some(index);
 }
 
 /// The layer a `Player.draw` target draws into.
@@ -2748,8 +3791,8 @@ mod tests {
     use super::color_bytes;
     use super::local_matrix;
     use super::{
-        BitmapState, MotionNode, MotionSnapshot, PlayerInst, build_node_tree, composite_nodes,
-        draw_icon, draw_point, drawable_nodes, evaluate_frames, prime_timelines,
+        BitmapState, DrawSettings, MotionNode, MotionSnapshot, PlayerInst, build_node_tree,
+        composite_pose, draw_icon, draw_point, evaluate_frames, node_drawable, prime_timelines,
         unit_axis_aligned_origin,
     };
     use crate::engine_api::Storage;
@@ -2858,17 +3901,20 @@ mod tests {
 
     fn composite(player: &mut PlayerInst) -> BitmapState {
         let mut bitmap = BitmapState::new(800, 1080, vec![0u8; 800 * 1080 * 4]);
-        let nodes = drawable_nodes(&player.nodes);
         let snapshot = player.snapshot.clone();
         let color = color_bytes(player.color.bytes);
         let affine = player.affine;
-        let missing = composite_nodes(
+        let missing = composite_pose(
             &mut bitmap,
-            nodes,
+            &player.nodes,
             snapshot.as_deref(),
             None,
-            color,
-            affine,
+            DrawSettings {
+                color,
+                affine,
+                preview: player.preview,
+                mask_mode: player.mask_mode,
+            },
             &mut player.tinted,
         );
         assert!(missing.is_empty(), "synthetic shapes need no texture");
@@ -3727,20 +4773,23 @@ mod tests {
             node.accumulated.opacity = 1.0;
             node.accumulated.blend_mode = blend_mode;
             let mut player = PlayerInst {
-                nodes: vec![node],
+                nodes: vec![MotionNode::new(0, String::new()), node],
                 ..PlayerInst::default()
             };
             let color = color_bytes(player.color.bytes);
             let affine = player.affine;
             let mut bitmap = BitmapState::new(4, 4, vec![0u8; 4 * 4 * 4]);
-            let nodes = drawable_nodes(&player.nodes);
-            let missing = composite_nodes(
+            let missing = composite_pose(
                 &mut bitmap,
-                nodes,
+                &player.nodes,
                 Some(&snapshot),
                 Some(&storage),
-                color,
-                affine,
+                DrawSettings {
+                    color,
+                    affine,
+                    preview: player.preview,
+                    mask_mode: player.mask_mode,
+                },
                 &mut player.tinted,
             );
             assert!(missing.is_empty());
@@ -3774,20 +4823,23 @@ mod tests {
             node.accumulated.opacity = opacity;
             node.accumulated.blend_mode = blend_mode;
             let mut player = PlayerInst {
-                nodes: vec![node],
+                nodes: vec![MotionNode::new(0, String::new()), node],
                 ..PlayerInst::default()
             };
             let color = color_bytes(player.color.bytes);
             let affine = player.affine;
             let mut bitmap = BitmapState::new(4, 4, vec![0u8; 4 * 4 * 4]);
-            let nodes = drawable_nodes(&player.nodes);
-            let missing = composite_nodes(
+            let missing = composite_pose(
                 &mut bitmap,
-                nodes,
+                &player.nodes,
                 Some(&snapshot),
                 Some(&storage),
-                color,
-                affine,
+                DrawSettings {
+                    color,
+                    affine,
+                    preview: player.preview,
+                    mask_mode: player.mask_mode,
+                },
                 &mut player.tinted,
             );
             assert!(missing.is_empty());
@@ -3835,22 +4887,25 @@ mod tests {
         node.accumulated.opacity = 1.0;
         let mut player = PlayerInst {
             snapshot: Some(std::sync::Arc::new(snapshot)),
-            nodes: vec![node],
+            nodes: vec![MotionNode::new(0, String::new()), node],
             ..PlayerInst::default()
         };
         let mut bitmap = BitmapState::new(4, 4, vec![0u8; 4 * 4 * 4]);
         let draw = |player: &mut PlayerInst, bitmap: &mut BitmapState| {
-            let nodes = drawable_nodes(&player.nodes);
             let snapshot = player.snapshot.clone();
             let color = color_bytes(player.color.bytes);
             let affine = player.affine;
-            composite_nodes(
+            composite_pose(
                 bitmap,
-                nodes,
+                &player.nodes,
                 snapshot.as_deref(),
                 Some(&storage),
-                color,
-                affine,
+                DrawSettings {
+                    color,
+                    affine,
+                    preview: player.preview,
+                    mask_mode: player.mask_mode,
+                },
                 &mut player.tinted,
             )
         };
@@ -3899,20 +4954,23 @@ mod tests {
         node.local.src = "src/group/art".to_string();
         node.accumulated.opacity = 1.0;
         let mut player = PlayerInst {
-            nodes: vec![node],
+            nodes: vec![MotionNode::new(0, String::new()), node],
             ..PlayerInst::default()
         };
         player.color.bytes = [1.0, 128.0 / 255.0, 64.0 / 255.0, 1.0];
         let color = color_bytes(player.color.bytes);
         let mut bitmap = BitmapState::new(4, 4, vec![0u8; 4 * 4 * 4]);
-        let nodes = drawable_nodes(&player.nodes);
-        let missing = composite_nodes(
+        let missing = composite_pose(
             &mut bitmap,
-            nodes,
+            &player.nodes,
             Some(&snapshot),
             Some(&storage),
-            color,
-            player.affine,
+            DrawSettings {
+                color,
+                affine: player.affine,
+                preview: player.preview,
+                mask_mode: player.mask_mode,
+            },
             &mut player.tinted,
         );
         assert!(missing.is_empty());
@@ -3924,14 +4982,17 @@ mod tests {
             .next()
             .expect("the tinted source is cached")
             .clone();
-        let nodes = drawable_nodes(&player.nodes);
-        let missing = composite_nodes(
+        let missing = composite_pose(
             &mut bitmap,
-            nodes,
+            &player.nodes,
             Some(&snapshot),
             Some(&storage),
-            color,
-            player.affine,
+            DrawSettings {
+                color,
+                affine: player.affine,
+                preview: player.preview,
+                mask_mode: player.mask_mode,
+            },
             &mut player.tinted,
         );
         assert!(missing.is_empty());
@@ -3956,12 +5017,12 @@ mod tests {
         node.draw_flag = true;
         node.shape = 3;
         node.accumulated.opacity = 0.0;
-        assert_eq!(drawable_nodes(std::slice::from_ref(&node)).count(), 0);
+        assert!(!node_drawable(&node));
         node.accumulated.opacity = 1.0;
         node.draw_flag = false;
-        assert_eq!(drawable_nodes(std::slice::from_ref(&node)).count(), 0);
+        assert!(!node_drawable(&node));
         node.draw_flag = true;
-        assert_eq!(drawable_nodes(std::slice::from_ref(&node)).count(), 1);
+        assert!(node_drawable(&node));
     }
 
     #[test]
@@ -4018,5 +5079,607 @@ mod tests {
         // The named clip replaces it.
         player.play("idle", 0, &ctx).expect("play the idle clip");
         assert_eq!(player.nodes[1].label, "idle_shape");
+    }
+
+    /// Six clips whose first two labels are `back_black` and `back_white`. A
+    /// play call with no label must show the clip the player's motion key
+    /// names, not the first clip in timeline order
+    /// (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:1175-1232`).
+    fn six_clip_snapshot() -> MotionSnapshot {
+        let names = [
+            "back_black",
+            "back_white",
+            "icon25",
+            "icon26",
+            "icon27",
+            "icon28",
+        ];
+        let mut motions: Vec<(&str, PsbValue)> = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let x = 100 + 100 * index as i64;
+            let layer = dict(vec![
+                ("label", text(name)),
+                ("type", num(0)),
+                ("shape", num(3)),
+                (
+                    "frameList",
+                    PsbValue::List(vec![
+                        frame(0, 2, Some(content(x, 100))),
+                        dict(vec![("time", num(10)), ("type", num(0))]),
+                    ]),
+                ),
+            ]);
+            let clip = dict(vec![
+                ("lastTime", num(10)),
+                ("layer", PsbValue::List(vec![layer])),
+            ]);
+            motions.push((*name, clip));
+        }
+        let object = dict(vec![("chara", dict(vec![("motion", dict(motions))]))]);
+        MotionSnapshot::from_psb(
+            PsbDocument {
+                root: dict(vec![("object", object)]),
+                resources: Vec::new(),
+            },
+            "six.psb",
+        )
+    }
+
+    fn set_timeline_time(player: &mut PlayerInst, label: &str, time: f64) {
+        player
+            .timelines
+            .get_mut(label)
+            .expect("the timeline is primed")
+            .current_time = time;
+    }
+
+    #[test]
+    fn the_motion_key_selects_its_clip_when_play_has_no_label() {
+        let snapshot = six_clip_snapshot();
+        let _lock = crate::native_util::test_vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let ctx = context(&engine, &mut services);
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "back_white".to_string(),
+            ..PlayerInst::default()
+        };
+        prime_timelines(&snapshot, &mut player.timelines);
+        player.nodes = build_node_tree(&snapshot, None);
+        // The module opens on its first clip; the motion key names the second.
+        assert_eq!(player.nodes[1].label, "back_black");
+        player.play("", 0, &ctx).expect("play the keyed clip");
+        player.update_layers();
+        assert_eq!(player.nodes[1].label, "back_white");
+        let bitmap = composite(&mut player);
+        assert_eq!(alpha(&bitmap, 200, 100), 255, "back_white is drawn");
+        assert_eq!(alpha(&bitmap, 100, 100), 0, "back_black is not");
+        // The bound key follows a named play call.
+        player.play("icon27", 0, &ctx).expect("play icon27");
+        player.update_layers();
+        assert_eq!(player.nodes[1].label, "icon27");
+    }
+
+    /// A child motion runs as a separate clip instance whose clock comes from
+    /// the keyframe that is active now: a later keyframe that names the same
+    /// clip restarts it
+    /// (`reference/cpp/plugins/motionplayer/PlayerUpdateChildMotion.cpp:172-181`,
+    /// `PlayerUpdateLayerEval.cpp:253`).
+    #[test]
+    fn a_child_clip_restarts_at_each_keyframe_that_names_it() {
+        let motion_frame = |time: i64, offset: i64| {
+            dict(vec![
+                ("time", num(time)),
+                ("type", num(3)),
+                (
+                    "content",
+                    dict(vec![
+                        ("mask", num(0x80001)),
+                        ("src", text("motion/chara/child")),
+                        ("ox", num(4)),
+                        ("oy", num(-4)),
+                        (
+                            "motion",
+                            dict(vec![("mask", num(0)), ("timeOffset", num(offset))]),
+                        ),
+                    ]),
+                ),
+            ])
+        };
+        let parent = dict(vec![
+            ("label", text("main")),
+            ("type", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    dict(vec![("time", num(0)), ("type", num(0))]),
+                    motion_frame(10, 0),
+                    motion_frame(50, 5),
+                    dict(vec![("time", num(90)), ("type", num(0))]),
+                    dict(vec![("time", num(100)), ("type", num(0))]),
+                ]),
+            ),
+        ]);
+        let child = dict(vec![
+            ("label", text("child")),
+            ("type", num(0)),
+            ("shape", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    frame(0, 3, Some(content(0, 0))),
+                    frame(100, 3, Some(content(100, 0))),
+                    dict(vec![("time", num(200)), ("type", num(0))]),
+                ]),
+            ),
+        ]);
+        let clip = dict(vec![
+            ("lastTime", num(100)),
+            ("layer", PsbValue::List(vec![parent])),
+        ]);
+        let child_clip = dict(vec![
+            ("lastTime", num(200)),
+            ("layer", PsbValue::List(vec![child])),
+        ]);
+        let object = dict(vec![(
+            "chara",
+            dict(vec![(
+                "motion",
+                dict(vec![("main", clip), ("child", child_clip)]),
+            )]),
+        )]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root: dict(vec![("object", object)]),
+                resources: Vec::new(),
+            },
+            "child.psb",
+        );
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "main".to_string(),
+            ..PlayerInst::default()
+        };
+        prime_timelines(&snapshot, &mut player.timelines);
+        player.nodes = build_node_tree(&snapshot, snapshot.clip("main"));
+        let child_index = player
+            .nodes
+            .iter()
+            .position(|node| node.label == "child")
+            .expect("the child clip is expanded");
+        // Parent clock 30: the t=10 keyframe named the child, so it runs at
+        // 30 - 10.
+        set_timeline_time(&mut player, "main", 30.0);
+        player.update_layers();
+        assert_eq!(player.nodes[child_index].time_offset, 10.0);
+        assert!((player.nodes[child_index].local.x - 20.0).abs() < 1e-9);
+        // The child sits at the motion layer's origin corner ((4, -4) put
+        // through the identity matrix).
+        assert!((player.nodes[child_index].accumulated.x - 16.0).abs() < 1e-9);
+        assert!((player.nodes[child_index].accumulated.y - 4.0).abs() < 1e-9);
+        // Parent clock 60: the t=50 keyframe names the same clip again with a
+        // time offset of 5, so the child restarts at 60 - 50 + 5.
+        set_timeline_time(&mut player, "main", 60.0);
+        player.update_layers();
+        assert_eq!(player.nodes[child_index].time_offset, 45.0);
+        assert!((player.nodes[child_index].local.x - 15.0).abs() < 1e-9);
+        assert!(player.nodes[child_index].draw_flag);
+        // Past the clip end the child is gone.
+        set_timeline_time(&mut player, "main", 100.0);
+        player.update_layers();
+        assert!(!player.nodes[child_index].draw_flag);
+    }
+
+    fn group_clip(children: Vec<PsbValue>, extra: Vec<PsbValue>) -> MotionSnapshot {
+        let group = dict(vec![
+            ("label", text("group")),
+            ("type", num(12)),
+            ("stencilType", num(5)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    dict(vec![
+                        ("time", num(0)),
+                        ("type", num(2)),
+                        (
+                            "content",
+                            dict(vec![
+                                ("opa", num(128)),
+                                ("coord", PsbValue::List(vec![num(0), num(0)])),
+                            ]),
+                        ),
+                    ]),
+                    dict(vec![("time", num(10)), ("type", num(0))]),
+                ]),
+            ),
+            ("children", PsbValue::List(children)),
+        ]);
+        let mut layers = vec![group];
+        layers.extend(extra);
+        let clip = dict(vec![
+            ("lastTime", num(10)),
+            ("layer", PsbValue::List(layers)),
+        ]);
+        let object = dict(vec![(
+            "chara",
+            dict(vec![("motion", dict(vec![("main", clip)]))]),
+        )]);
+        MotionSnapshot::from_psb(
+            PsbDocument {
+                root: dict(vec![("object", object)]),
+                resources: Vec::new(),
+            },
+            "group.psb",
+        )
+    }
+
+    fn shape_layer(label: &str, x: i64, y: i64) -> PsbValue {
+        dict(vec![
+            ("label", text(label)),
+            ("type", num(0)),
+            ("shape", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    frame(0, 2, Some(content(x, y))),
+                    dict(vec![("time", num(10)), ("type", num(0))]),
+                ]),
+            ),
+        ])
+    }
+
+    fn group_player(snapshot: &MotionSnapshot) -> PlayerInst {
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "main".to_string(),
+            ..PlayerInst::default()
+        };
+        prime_timelines(snapshot, &mut player.timelines);
+        player.nodes = build_node_tree(snapshot, snapshot.clip("main"));
+        player.update_layers();
+        player
+    }
+
+    /// A composite group's opacity is applied once, when the group is
+    /// composited, not again on every child that already inherited it
+    /// (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:816-850`).
+    #[test]
+    fn a_composite_group_applies_its_opacity_once() {
+        let snapshot = group_clip(
+            vec![shape_layer("inner", 100, 100)],
+            vec![shape_layer("outer", 400, 400)],
+        );
+        let mut player = group_player(&snapshot);
+        let bitmap = composite(&mut player);
+        assert_eq!(
+            alpha(&bitmap, 100, 100),
+            128,
+            "the group opacity applies once"
+        );
+        assert_eq!(alpha(&bitmap, 400, 400), 255, "the sibling keeps its alpha");
+    }
+
+    /// A composite group is clipped to its paint box intersected with the
+    /// nearest shape's viewport
+    /// (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:597-631`,
+    /// `PlayerRenderItems.cpp:877-905`).
+    #[test]
+    fn a_composite_group_clips_to_its_viewport() {
+        let viewport = dict(vec![
+            ("label", text("clip")),
+            ("type", num(7)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    frame(0, 2, Some(content(100, 100))),
+                    dict(vec![("time", num(10)), ("type", num(0))]),
+                ]),
+            ),
+            (
+                "children",
+                PsbValue::List(vec![dict(vec![
+                    ("label", text("group")),
+                    ("type", num(12)),
+                    ("stencilType", num(5)),
+                    (
+                        "frameList",
+                        PsbValue::List(vec![
+                            dict(vec![
+                                ("time", num(0)),
+                                ("type", num(2)),
+                                (
+                                    "content",
+                                    dict(vec![
+                                        ("opa", num(128)),
+                                        ("coord", PsbValue::List(vec![num(0), num(0)])),
+                                    ]),
+                                ),
+                            ]),
+                            dict(vec![("time", num(10)), ("type", num(0))]),
+                        ]),
+                    ),
+                    (
+                        "children",
+                        PsbValue::List(vec![
+                            shape_layer("inner", 0, 0),
+                            shape_layer("outside", 200, 200),
+                        ]),
+                    ),
+                ])]),
+            ),
+        ]);
+        let clip = dict(vec![
+            ("lastTime", num(10)),
+            ("layer", PsbValue::List(vec![viewport])),
+        ]);
+        let object = dict(vec![(
+            "chara",
+            dict(vec![("motion", dict(vec![("main", clip)]))]),
+        )]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root: dict(vec![("object", object)]),
+                resources: Vec::new(),
+            },
+            "group_clip.psb",
+        );
+        let mut player = group_player(&snapshot);
+        let bitmap = composite(&mut player);
+        assert_eq!(
+            alpha(&bitmap, 100, 100),
+            128,
+            "the child inside the viewport"
+        );
+        assert_eq!(alpha(&bitmap, 300, 300), 0, "the child outside is clipped");
+    }
+
+    fn mesh_snapshot() -> MotionSnapshot {
+        let icon = dict(vec![
+            ("width", num(100)),
+            ("height", num(100)),
+            ("originX", num(16)),
+            ("originY", num(16)),
+        ]);
+        let group = dict(vec![("icon", dict(vec![("art", icon)]))]);
+        let mesh = dict(vec![
+            ("label", text("mesh")),
+            ("type", num(0)),
+            ("meshTransform", num(1)),
+            ("meshDivision", num(10)),
+            ("meshSyncChildMask", num(1)),
+            ("inheritMask", num(0x7FC)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    frame(
+                        0,
+                        2,
+                        Some(dict(vec![
+                            ("src", text("src/g/art")),
+                            ("coord", PsbValue::List(vec![num(0), num(0)])),
+                        ])),
+                    ),
+                    dict(vec![("time", num(10)), ("type", num(0))]),
+                ]),
+            ),
+            (
+                "children",
+                PsbValue::List(vec![dict(vec![
+                    ("label", text("child")),
+                    ("type", num(0)),
+                    (
+                        "frameList",
+                        PsbValue::List(vec![
+                            frame(
+                                0,
+                                2,
+                                Some(dict(vec![
+                                    ("src", text("src/g/art")),
+                                    ("coord", PsbValue::List(vec![num(5), num(7)])),
+                                ])),
+                            ),
+                            dict(vec![("time", num(10)), ("type", num(0))]),
+                        ]),
+                    ),
+                ])]),
+            ),
+        ]);
+        let clip = dict(vec![
+            ("lastTime", num(10)),
+            ("layer", PsbValue::List(vec![mesh])),
+        ]);
+        let object = dict(vec![(
+            "chara",
+            dict(vec![("motion", dict(vec![("main", clip)]))]),
+        )]);
+        MotionSnapshot::from_psb(
+            PsbDocument {
+                root: dict(vec![
+                    ("source", dict(vec![("g", group)])),
+                    ("object", object),
+                ]),
+                resources: Vec::new(),
+            },
+            "mesh.psb",
+        )
+    }
+
+    /// A mesh node builds its grid from the subdivision level and reports the
+    /// deformed grid corners through `vtx`; a child is warped through the
+    /// parent's patch (`reference/cpp/plugins/motionplayer/PlayerUpdateGeometry.cpp:290-577`,
+    /// `PlayerUpdateLayersInternal.h:356-441`).
+    #[test]
+    fn a_mesh_node_builds_its_grid_and_deforms_its_child() {
+        let snapshot = mesh_snapshot();
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "main".to_string(),
+            ..PlayerInst::default()
+        };
+        prime_timelines(&snapshot, &mut player.timelines);
+        player.nodes = build_node_tree(&snapshot, snapshot.clip("main"));
+        let mesh_index = player
+            .nodes
+            .iter()
+            .position(|node| node.label == "mesh")
+            .expect("the mesh layer");
+        let child_index = player
+            .nodes
+            .iter()
+            .position(|node| node.label == "child")
+            .expect("the child layer");
+        // Seed the previous frame's patch with a constant point: the next
+        // grid and the child position both warp to it.
+        player.nodes[mesh_index].mesh_points = vec![0.5; 32];
+        player.update_layers();
+        let mesh = &player.nodes[mesh_index];
+        assert_eq!(mesh.mesh_div, [6, 6]);
+        assert_eq!(mesh.mesh_points.len(), 6 * 6 * 2);
+        let vtx = super::grid_corners(mesh).expect("the grid has corners");
+        for value in vtx {
+            assert!(
+                (value - 0.5).abs() < 1e-2,
+                "vtx reports the deformed corners: {vtx:?}"
+            );
+        }
+        assert_eq!(player.layer_getter_state(mesh).1, vtx);
+        // The child was at (5, 7); the parent patch maps its normalized
+        // position to 0.5 of the 100-pixel clip.
+        let child = &player.nodes[child_index];
+        let expected = 0.5 * 100.0 - 16.0;
+        assert!((child.accumulated.x - expected).abs() < 1e-2);
+        assert!((child.accumulated.y - expected).abs() < 1e-2);
+    }
+
+    /// A stencil group's `stencilCompositeMaskLayerList` layers mask the
+    /// composed group before it is composited: a threshold mask cuts at 64 and
+    /// an alpha mask blends the alpha arithmetically
+    /// (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:839-845`,
+    /// `PlayerRenderInternal.cpp:623-750`).
+    #[test]
+    fn a_stencil_group_applies_its_mask_layers() {
+        let dir = std::env::temp_dir();
+        let storage = Storage::mount_archives(
+            FileSystem::host(dir.clone()),
+            dir.clone(),
+            std::iter::empty::<&str>(),
+        )
+        .expect("mount storage");
+        storage.register_media(
+            "psb://mask.psb/source/content/icon/art/pixel".to_string(),
+            [200, 100, 50, 128].repeat(4),
+        );
+        storage.register_media(
+            "psb://mask.psb/source/mask/icon/art/pixel".to_string(),
+            [0, 0, 0, 128].repeat(4),
+        );
+        let icon = || dict(vec![("width", num(2)), ("height", num(2))]);
+        let source = dict(vec![
+            ("content", dict(vec![("icon", dict(vec![("art", icon())]))])),
+            ("mask", dict(vec![("icon", dict(vec![("art", icon())]))])),
+        ]);
+        let content_layer = dict(vec![
+            ("label", text("content")),
+            ("type", num(0)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    frame(
+                        0,
+                        2,
+                        Some(dict(vec![
+                            ("src", text("src/content/art")),
+                            ("coord", PsbValue::List(vec![num(100), num(100)])),
+                            ("opa", num(255)),
+                        ])),
+                    ),
+                    dict(vec![("time", num(10)), ("type", num(0))]),
+                ]),
+            ),
+        ]);
+        let group = dict(vec![
+            ("label", text("group")),
+            ("type", num(12)),
+            ("stencilType", num(5)),
+            (
+                "stencilCompositeMaskLayerList",
+                PsbValue::List(vec![text("mask_layer")]),
+            ),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    frame(0, 2, Some(content(0, 0))),
+                    dict(vec![("time", num(10)), ("type", num(0))]),
+                ]),
+            ),
+            ("children", PsbValue::List(vec![content_layer])),
+        ]);
+        let mask = dict(vec![
+            ("label", text("mask_layer")),
+            ("type", num(0)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    frame(
+                        0,
+                        2,
+                        Some(dict(vec![
+                            ("src", text("src/mask/art")),
+                            ("coord", PsbValue::List(vec![num(100), num(100)])),
+                            ("opa", num(0)),
+                        ])),
+                    ),
+                    dict(vec![("time", num(10)), ("type", num(0))]),
+                ]),
+            ),
+        ]);
+        let clip = dict(vec![
+            ("lastTime", num(10)),
+            ("layer", PsbValue::List(vec![group, mask])),
+        ]);
+        let object = dict(vec![(
+            "chara",
+            dict(vec![("motion", dict(vec![("main", clip)]))]),
+        )]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root: dict(vec![("source", source), ("object", object)]),
+                resources: Vec::new(),
+            },
+            "mask.psb",
+        );
+        let draw = |mask_mode: i32| -> u8 {
+            let mut player = PlayerInst {
+                snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+                motion_key: "main".to_string(),
+                mask_mode,
+                ..PlayerInst::default()
+            };
+            prime_timelines(&snapshot, &mut player.timelines);
+            player.nodes = build_node_tree(&snapshot, snapshot.clip("main"));
+            player.update_layers();
+            let mut bitmap = BitmapState::new(800, 1080, vec![0u8; 800 * 1080 * 4]);
+            let color = color_bytes(player.color.bytes);
+            let missing = composite_pose(
+                &mut bitmap,
+                &player.nodes,
+                player.snapshot.as_deref(),
+                Some(&storage),
+                DrawSettings {
+                    color,
+                    affine: player.affine,
+                    preview: player.preview,
+                    mask_mode,
+                },
+                &mut player.tinted,
+            );
+            assert!(missing.is_empty());
+            alpha(&bitmap, 100, 100)
+        };
+        // The content alpha 128 blended through the mask alpha 128 is 191; a
+        // threshold stencil forces the covered alpha to 255.
+        assert_eq!(draw(1), 191, "the alpha mask blends the group alpha once");
+        assert_eq!(draw(0), 255, "the threshold mask forces the covered alpha");
     }
 }
