@@ -83,7 +83,7 @@ mod stub {
         m: &Media,
         state: &mut VideoDecoderState,
         at_ms: u64,
-    ) -> Result<RgbaFrame, MediaError> {
+    ) -> Result<Arc<RgbaFrame>, MediaError> {
         let _ = (m, state, at_ms);
         Err(host_stub_error("video decode (mediacodec)"))
     }
@@ -418,7 +418,7 @@ mod android {
         /// The fully decoded audio track, shared with whoever plays it.
         audio_pcm: Option<Arc<DecodedAudio>>,
         /// The frame most recently returned by [`present`].
-        current: Option<RgbaFrame>,
+        current: Option<Arc<RgbaFrame>>,
     }
 
     impl fmt::Debug for VideoDecoderState {
@@ -634,14 +634,14 @@ mod android {
         m: &Media,
         state: &mut VideoDecoderState,
         at_ms: u64,
-    ) -> Result<RgbaFrame, MediaError> {
+    ) -> Result<Arc<RgbaFrame>, MediaError> {
         let _ = m;
 
         if let Some(current) = &state.current
             && at_ms <= current.pts_ms
             && at_ms.saturating_add(SEEK_TOLERANCE_MS) >= current.pts_ms
         {
-            return Ok(current.clone());
+            return Ok(Arc::clone(current));
         }
 
         let need_seek = match &state.current {
@@ -656,7 +656,7 @@ mod android {
             match decode_next(state)? {
                 Some(frame) => {
                     if frame.pts_ms >= at_ms {
-                        state.current = Some(frame.clone());
+                        state.current = Some(Arc::clone(&frame));
                         return Ok(frame);
                     }
                     state.current = Some(frame);
@@ -700,7 +700,7 @@ mod android {
 
     /// Decodes the next video frame, feeding samples until the decoder produces
     /// a frame. Returns `None` at end of stream.
-    fn decode_next(state: &mut VideoDecoderState) -> Result<Option<RgbaFrame>, MediaError> {
+    fn decode_next(state: &mut VideoDecoderState) -> Result<Option<Arc<RgbaFrame>>, MediaError> {
         let VideoDecoderState {
             name,
             extractor,
@@ -722,7 +722,7 @@ mod android {
         extractor: &Extractor,
         video: &mut VideoState,
         name: &str,
-    ) -> Result<Option<RgbaFrame>, MediaError> {
+    ) -> Result<Option<Arc<RgbaFrame>>, MediaError> {
         let mut steps = 0u32;
         loop {
             steps += 1;
@@ -770,12 +770,12 @@ mod android {
                         };
                         video.last_pts_ms = pts_ms;
                         release(&video.codec, output, name)?;
-                        return Ok(Some(RgbaFrame::new(
+                        return Ok(Some(Arc::new(RgbaFrame::new(
                             layout.width() as u32,
                             layout.height() as u32,
                             pts_millis(pts_ms, name)?,
                             rgba,
-                        )));
+                        ))));
                     }
                     release(&video.codec, output, name)?;
                 }

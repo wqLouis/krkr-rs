@@ -33,7 +33,7 @@ video-mediacodec = []
 api = { workspace = true }
 # Optional so the Android build never links libav*. Enabled by `video-ffmpeg`.
 ffmpeg-next = { workspace = true, optional = true }
-symphonia = { version = "0.6", default-features = false, features = ["wav", "pcm", "ogg", "vorbis", "flac", "mp3"] }
+symphonia = { version = "0.6", default-features = false, features = ["wav", "pcm", "ogg", "vorbis", "flac", "mp3", "isomp4", "aac"] }
 symphonia-adapter-libopus = "0.3"
 image = { version = "0.25", default-features = false, features = [
     "png",

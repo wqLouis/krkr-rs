@@ -16,7 +16,7 @@ use tjs::{
 };
 
 use super::StoredValue;
-use super::helpers::{inst_mut, set_retained, value_as_f64};
+use super::helpers::{eval_array, inst_mut, set_retained, value_as_f64};
 use super::model::MotionNode;
 use crate::native_util::{args, report_error, set_void};
 use crate::natives::system::{resolve, try_value_as_i64, value_as_bool, value_as_i64};
@@ -109,9 +109,11 @@ pub(crate) struct LayerGetterInst {
     origin_x: f64,
     origin_y: f64,
     opacity: i64,
-    mtx: Option<[f64; 6]>,
-    vtx: Option<[f64; 8]>,
-    color: Option<[i64; 4]>,
+    /// The matrix, the vertex list and the colour, each built once and kept
+    /// so every read hands out the same array.
+    mtx: Option<DetachedValue>,
+    vtx: Option<DetachedValue>,
+    color: Option<DetachedValue>,
 }
 
 impl Default for LayerGetterInst {
@@ -150,11 +152,12 @@ impl Default for LayerGetterInst {
 pub(crate) fn populate_layer_getter(
     getter: &mut LayerGetterInst,
     node: &MotionNode,
+    ctx: &CompatCtx,
     origin: (f64, f64),
     mtx: [f64; 6],
     vtx: [f64; 8],
     color: [i64; 4],
-) {
+) -> Result<(), String> {
     getter.kind = node.node_type;
     getter.label = node.label.clone();
     // The visibility is the inherited chain, and the layer's own flag says
@@ -177,9 +180,28 @@ pub(crate) fn populate_layer_getter(
     getter.origin_x = origin.0;
     getter.origin_y = origin.1;
     getter.opacity = (node.accumulated.opacity * 255.0).round().clamp(0.0, 255.0) as i64;
-    getter.mtx = Some(mtx);
-    getter.vtx = Some(vtx);
-    getter.color = Some(color);
+    // The three arrays are built once and kept, so a script that writes into
+    // one of them keeps the write until the getter is rebuilt.
+    getter.mtx = Some(eval_array(
+        ctx,
+        &mtx.iter()
+            .map(|value| TjsValue::Real(*value))
+            .collect::<Vec<_>>(),
+    )?);
+    getter.vtx = Some(eval_array(
+        ctx,
+        &vtx.iter()
+            .map(|value| TjsValue::Real(*value))
+            .collect::<Vec<_>>(),
+    )?);
+    getter.color = Some(eval_array(
+        ctx,
+        &color
+            .iter()
+            .map(|value| TjsValue::Integer(*value))
+            .collect::<Vec<_>>(),
+    )?);
+    Ok(())
 }
 
 macro_rules! simple_ctor {
@@ -375,16 +397,16 @@ mp_get_int!(
 // created on its own reports no value at all.
 mp_get_value_array!(getter_get_mtx, LayerGetterInst, |p: &LayerGetterInst| p
     .mtx
-    .map(|mtx| mtx.iter().map(|value| TjsValue::Real(*value)).collect()));
+    .as_ref()
+    .map(DetachedValue::raw_id));
 mp_get_value_array!(getter_get_vtx, LayerGetterInst, |p: &LayerGetterInst| p
     .vtx
-    .map(|vtx| vtx.iter().map(|value| TjsValue::Real(*value)).collect()));
+    .as_ref()
+    .map(DetachedValue::raw_id));
 mp_get_value_array!(getter_get_color, LayerGetterInst, |p: &LayerGetterInst| p
     .color
-    .map(|color| color
-        .iter()
-        .map(|value| TjsValue::Integer(*value))
-        .collect()));
+    .as_ref()
+    .map(DetachedValue::raw_id));
 
 /// The remaining variant-valued `LayerGetter` members (`bezierPatch`,
 /// `shape`, `motion`, `particle`). Nothing fills them, so the getters

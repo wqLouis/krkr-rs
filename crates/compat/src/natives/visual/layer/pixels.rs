@@ -19,7 +19,7 @@ use crate::engine_api::{BitmapState, DecodedImageMode, Scene};
 use api::blend::{BlendMode, DstBlend};
 use tjs::{NativeInstanceMethodDef, Tjs2Engine, Value};
 
-use super::super::bitmap::{COLOR_KEY_NONE, load_cached_storage_image, replace_bitmap_pixels};
+use super::super::bitmap::{COLOR_KEY_NONE, load_cached_storage_image};
 use super::super::common::scene_mut;
 use super::super::common::{
     DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, argb_to_rgba, rgba_to_argb, set_null_out,
@@ -2181,7 +2181,9 @@ fn load_layer_image(
         return Err("the layer no longer exists".to_string());
     }
     match scene.layer(layer_id).and_then(|layer| layer.bitmap) {
-        Some(id) => replace_bitmap_pixels(scene, id, width, height, rgba),
+        Some(id) => {
+            scene.replace_bitmap_image(id, width, height, rgba);
+        }
         None => {
             let id = scene.add_bitmap(width, height, rgba);
             if let Some(layer) = scene.layer_mut(layer_id) {

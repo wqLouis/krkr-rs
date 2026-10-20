@@ -460,12 +460,12 @@ fn cached_layers_composite_and_refresh_through_the_frame_pump() {
     );
 
     // An unchanged frame reuses the cache: the pass composites nothing.
-    let revision = env.scene.revision();
+    let revisions = (env.scene.structure_revision(), env.scene.content_revision());
     env.refresh_caches();
     assert_eq!(named_layer(&env, "p").cache_bitmap, Some(cache));
     assert_eq!(
-        env.scene.revision(),
-        revision,
+        (env.scene.structure_revision(), env.scene.content_revision()),
+        revisions,
         "an unchanged frame does not recomposite"
     );
 
@@ -498,4 +498,112 @@ fn cached_layers_composite_and_refresh_through_the_frame_pump() {
     assert!(live.contains(&main), "the layer draws its own image again");
     assert!(live.contains(&child_bitmap), "and the child draws live");
     assert!(!live.contains(&cache), "the released cache draws nothing");
+}
+
+/// A cached layer composites through its cached children in the same pass:
+/// the pass visits cached layers deepest first, so a parent's recomposite
+/// already samples the `CacheBitmap` its child just completed instead of the
+/// previous frame's state.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7196 (the parent's cache loop
+/// completes each child before it completes itself)
+/// reference/cpp/core/visual/LayerIntf.cpp:7226
+#[test]
+fn nested_caches_composite_deepest_first() {
+    let _lock = vm_lock();
+    let mut env = Env::with_image(2, 2);
+    env.run(
+        "var w = new Window(); \
+         var p = new Layer(w, null); p.setSize(4, 4); p.setImageSize(4, 4); p.name = 'p'; \
+         p.fillRect(0, 0, 4, 4, 0xff112233); \
+         var c = new Layer(w, p); c.setSize(4, 4); c.name = 'c'; c.visible = true; \
+         var g = new Layer(w, c); g.setSize(2, 2); g.name = 'g'; g.visible = true; \
+         g.fillRect(0, 0, 2, 2, 0xff00ff00); \
+         p.cached = true; c.cached = true;",
+    );
+    env.refresh_caches();
+    let parent_cache = named_layer(&env, "p")
+        .cache_bitmap
+        .expect("the parent cache bitmap");
+    let child_cache = named_layer(&env, "c")
+        .cache_bitmap
+        .expect("the child cache bitmap");
+    assert_ne!(parent_cache, child_cache);
+    assert_eq!(
+        scene_pixel(&env, parent_cache, 0, 0),
+        0x00ff00,
+        "the parent's cache shows the child"
+    );
+    assert_eq!(
+        scene_pixel(&env, parent_cache, 3, 3),
+        0x112233,
+        "and the parent's own image"
+    );
+
+    // Force the pass to run again without invalidating either cache. A parent
+    // that composited the child's live image would still record the live
+    // source generation and rewrite its cache now that the child's cache is
+    // current; a parent that already sampled the child cache recomposites
+    // nothing.
+    let generation = env
+        .scene
+        .bitmap(parent_cache)
+        .expect("parent cache")
+        .content_generation;
+    env.scene.add_bitmap(1, 1, vec![0; 4]);
+    env.refresh_caches();
+    assert_eq!(named_layer(&env, "p").cache_bitmap, Some(parent_cache));
+    assert_eq!(
+        env.scene
+            .bitmap(parent_cache)
+            .expect("parent cache")
+            .content_generation,
+        generation,
+        "the parent sampled the child cache in the first pass"
+    );
+}
+
+/// A bitmap content write that bypasses the layer accessors still reaches a
+/// cached subtree: the pass also keys on the scene's content revision, and
+/// the compositor recomposites when a drawn image's generation changed.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:6305-6335
+#[test]
+fn a_content_only_bitmap_write_reaches_the_subtree_cache() {
+    let _lock = vm_lock();
+    let mut env = Env::with_image(2, 2);
+    env.run(
+        "var w = new Window(); \
+         var p = new Layer(w, null); p.setSize(4, 4); p.setImageSize(4, 4); p.name = 'p'; \
+         p.fillRect(0, 0, 4, 4, 0xff112233); \
+         var c = new Layer(w, p); c.setSize(2, 2); c.setImageSize(2, 2); c.name = 'c'; \
+         c.visible = true; c.fillRect(0, 0, 2, 2, 0xff00ff00); \
+         p.cached = true;",
+    );
+    env.refresh_caches();
+    let cache = named_layer(&env, "p")
+        .cache_bitmap
+        .expect("the cache bitmap");
+    assert_eq!(scene_pixel(&env, cache, 0, 0), 0x00ff00);
+
+    let child_bitmap = named_layer(&env, "c").bitmap.expect("child image");
+    let structure = env.scene.structure_revision();
+    {
+        let bitmap = env.scene.bitmap_mut(child_bitmap).expect("child image");
+        for pixel in bitmap.rgba.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[0, 0, 255, 255]);
+        }
+        bitmap.mark_dirty();
+    }
+    assert_eq!(
+        env.scene.structure_revision(),
+        structure,
+        "a pixel write is not structural"
+    );
+    env.refresh_caches();
+    assert_eq!(
+        scene_pixel(&env, cache, 0, 0),
+        0x0000ff,
+        "the content-only write reached the cache"
+    );
 }

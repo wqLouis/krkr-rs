@@ -47,6 +47,8 @@
 //! are typed [`VideoError`]s instead of silent no-ops. Script-visible values
 //! are not validated here: the reference stores whatever it is given.
 
+use std::sync::Arc;
+
 use api::media::{RgbaFrame, VideoSpec};
 
 use crate::layer_ops::{BlitOptions, BlitSource, blit_copy_clipped, blit_over, clip_rect};
@@ -250,7 +252,10 @@ pub struct VideoOverlay {
     /// The overlay rectangle in window coordinates.
     pub bounds: VideoBounds,
     binding: OverlayBinding,
-    frame: Option<RgbaFrame>,
+    /// The frame that is on screen. The frame is shared: the decoder hands
+    /// the same buffer to every holder, so a presented frame is not copied
+    /// again.
+    frame: Option<Arc<RgbaFrame>>,
     last_frame_update: i64,
     /// Whether the last [`Self::advance`] put the clock back to a loop
     /// boundary.
@@ -334,7 +339,7 @@ impl VideoOverlay {
         self.segment_end = -1;
         self.period_event_frame = -1;
         self.frame = None;
-        self.last_frame_update = -1;
+        self.rearm_frame_update();
         // The reference `Open` closes any previous backend (firing `unload`)
         // and then enters the `stop` state.
         if was_open {
@@ -352,7 +357,7 @@ impl VideoOverlay {
         self.position_exact_ms = 0.0;
         self.preparing = false;
         self.frame = None;
-        self.last_frame_update = -1;
+        self.rearm_frame_update();
         self.set_status(PlayStatus::Unload);
     }
 
@@ -434,6 +439,7 @@ impl VideoOverlay {
         if self.period_event_frame >= 0 && self.period_past {
             self.period_past = false;
         }
+        self.rearm_frame_update();
     }
 
     /// Enter prepare mode: pause, rewind and play; the `perPrepare`
@@ -521,6 +527,7 @@ impl VideoOverlay {
     /// setter does not touch the period event.
     pub fn seek_ms(&mut self, milliseconds: i64) {
         self.position_exact_ms = milliseconds.max(0) as f64;
+        self.rearm_frame_update();
     }
 
     /// Seek to `frame` (clamped to `>= 0`). A period event whose frame is at
@@ -531,6 +538,7 @@ impl VideoOverlay {
         if self.period_event_frame >= frame && self.period_past {
             self.period_past = false;
         }
+        self.rearm_frame_update();
     }
 
     // -- loop / segment loop ----------------------------------------------
@@ -637,11 +645,21 @@ impl VideoOverlay {
     /// Hand a decoded frame (from L1 `media`) to the overlay, replacing the
     /// current one.
     ///
+    /// The frame is shared: the decoder hands out the same buffer to every
+    /// holder, so presenting a frame copies no pixels.
+    ///
+    /// Presenting a frame fires the frame-update event: the event belongs to
+    /// a decoded frame, not to the clock.
+    ///
+    /// A frame also ends prepare mode: the prepare event, the pause and the
+    /// rewind belong to a delivered frame, so the prepare ends on the first
+    /// frame that arrives.
+    ///
     /// # Errors
     ///
     /// Returns [`VideoError::InconsistentFrame`] when `frame.rgba` is not
     /// exactly `width * height * 4` bytes.
-    pub fn present_frame(&mut self, frame: RgbaFrame) -> Result<(), VideoError> {
+    pub fn present_frame(&mut self, frame: Arc<RgbaFrame>) -> Result<(), VideoError> {
         if !frame.is_consistent() {
             return Err(VideoError::InconsistentFrame {
                 width: frame.width,
@@ -651,12 +669,32 @@ impl VideoOverlay {
             });
         }
         self.frame = Some(frame);
+        self.emit_frame_update();
+        self.complete_prepare();
         Ok(())
     }
 
+    /// End prepare mode now that a frame arrived.
+    ///
+    /// The period event comes first, then the pause and the rewind, so the
+    /// script sees the event before the status change.
+    fn complete_prepare(&mut self) {
+        if !self.preparing {
+            return;
+        }
+        self.pending.push(VideoEvent::Period(PeriodReason::Prepare));
+        self.playing = false;
+        self.play_rate = 0.0;
+        self.set_status(PlayStatus::Pause);
+        self.rewind();
+        self.preparing = false;
+    }
+
     /// The most recently presented frame, if any.
+    ///
+    /// The frame is shared with the decoder, so reading it copies no pixels.
     pub fn current_frame(&self) -> Option<&RgbaFrame> {
-        self.frame.as_ref()
+        self.frame.as_deref()
     }
 
     /// Drop the currently presented frame.
@@ -717,17 +755,10 @@ impl VideoOverlay {
             return;
         }
 
-        // Prepare mode pauses and rewinds on the first decoded frame.
+        // Prepare mode waits for the next delivered frame: the clock stays
+        // where it is until the frame arrives, so the prepared picture is
+        // the one the stream starts with.
         if self.preparing {
-            if self.frame.is_some() {
-                self.emit_frame_update();
-                self.pending.push(VideoEvent::Period(PeriodReason::Prepare));
-                self.playing = false;
-                self.play_rate = 0.0;
-                self.set_status(PlayStatus::Pause);
-                self.rewind();
-                self.preparing = false;
-            }
             return;
         }
 
@@ -774,7 +805,6 @@ impl VideoOverlay {
             return;
         }
 
-        self.emit_frame_update();
         if self.period_event_frame >= 0 && !self.period_past && frame >= self.period_event_frame {
             self.period_event_frame = -1;
             self.pending.push(VideoEvent::Period(PeriodReason::Period));
@@ -792,18 +822,34 @@ impl VideoOverlay {
         }
     }
 
-    /// Queue a `FrameUpdate` when the frame index moved and a frame has been
-    /// presented (the caller-driven analogue of the reference's
-    /// `onFrameUpdate` per decoded frame).
+    /// Forget the picture that is on screen, so the next delivered picture
+    /// is reported as a new one.
+    ///
+    /// A transport jump makes the stream decode a new picture, so the frame
+    /// update fires again even when the picture index does not change.
+    fn rearm_frame_update(&mut self) {
+        self.last_frame_update = -1;
+    }
+
+    /// Queue a `FrameUpdate` when the presented picture is a new one.
+    ///
+    /// The event belongs to a picture: it fires once per decoded picture, so
+    /// a picture that is already on screen fires nothing. A picture that
+    /// arrives while the overlay is not playing fires nothing either: a
+    /// stopped or paused stream decodes no picture.
+    ///
+    /// The event goes in front of the others: a frame update is reported
+    /// before the period events of the same update.
     fn emit_frame_update(&mut self) {
-        if self.frame.is_none() {
+        if !self.playing {
             return;
         }
         let frame = self.frame();
-        if frame != self.last_frame_update {
-            self.last_frame_update = frame;
-            self.pending.push(VideoEvent::FrameUpdate(frame));
+        if frame == self.last_frame_update {
+            return;
         }
+        self.last_frame_update = frame;
+        self.pending.insert(0, VideoEvent::FrameUpdate(frame));
     }
 
     /// Borrow the open spec or fail with [`VideoError::NotOpen`].

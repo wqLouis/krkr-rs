@@ -24,8 +24,9 @@ use super::adaptors::{LayerGetterInst, SeparateInst, populate_layer_getter};
 use super::animator::{Animator, ColorAnimator, ease_weight};
 use super::helpers::{eval_object, inst_mut, inst_ref, set_real, set_string, value_as_f64};
 use super::model::{
-    FrameState, IconInfo, MotionEvent, MotionNode, MotionSnapshot, TimelineState, VariableFrame,
-    build_node_tree, evaluate_frames, prime_timelines, scan_frame_events, step_timelines,
+    FrameState, IconInfo, MotionClip, MotionEvent, MotionNode, MotionSnapshot, TimelineState,
+    VariableFrame, build_node_tree, evaluate_frames, prime_timelines, scan_frame_events,
+    step_timelines,
 };
 use super::resource::{MotionStore, ResourceInst};
 use super::texture::Pixels;
@@ -1027,9 +1028,15 @@ impl PlayerInst {
                 true
             }
         };
-        if started && !label.is_empty() {
-            self.play_clip_layers(&snapshot, label);
-            self.rebuild_tree(&snapshot, label);
+        // The clip the play call names is the one the player shows, even when
+        // the label names no timeline: the active clip is selected before the
+        // node state is rebuilt.
+        if let Some(clip) = self.select_active_clip(&snapshot, label) {
+            self.loop_time = clip.loop_time;
+            self.frame_last_time = clip.total_frames;
+            self.nodes = build_node_tree(&snapshot, Some(clip));
+            self.layers_dirty = true;
+            self.ensure_root_offsets();
         }
         // A play that does not chain re-arms the frame gate, so the first
         // progress after it presents the new pose without advancing.
@@ -1040,17 +1047,41 @@ impl PlayerInst {
         Ok(started)
     }
 
-    pub(crate) fn play_clip_layers(&mut self, snapshot: &MotionSnapshot, label: &str) {
-        if let Some(clip) = snapshot.clip(label) {
-            self.loop_time = clip.loop_time;
-            self.frame_last_time = clip.total_frames;
+    /// The clip the player shows.
+    ///
+    /// The label the play call carries wins when it names a clip. Then the
+    /// playing timelines are tried, then the module's primary labels, and the
+    /// first clip is the last resort.
+    pub(crate) fn select_active_clip<'a>(
+        &self,
+        snapshot: &'a MotionSnapshot,
+        label: &str,
+    ) -> Option<&'a MotionClip> {
+        if !label.is_empty()
+            && let Some(clip) = snapshot.clip(label)
+        {
+            return Some(clip);
         }
-    }
-
-    pub(crate) fn rebuild_tree(&mut self, snapshot: &MotionSnapshot, label: &str) {
-        self.nodes = build_node_tree(snapshot, snapshot.clip(label));
-        self.layers_dirty = true;
-        self.ensure_root_offsets();
+        // The timeline names are tried in a stable order, so the clip a play
+        // call settles on does not depend on the hash order.
+        let mut playing: Vec<&String> = self.timelines.keys().collect();
+        playing.sort();
+        for item in playing {
+            if let Some(clip) = snapshot.clip(item) {
+                return Some(clip);
+            }
+        }
+        let primary = if snapshot.main_timelines.is_empty() {
+            &snapshot.diff_timelines
+        } else {
+            &snapshot.main_timelines
+        };
+        for item in primary {
+            if let Some(clip) = snapshot.clip(item) {
+                return Some(clip);
+            }
+        }
+        snapshot.clips.first()
     }
 
     pub(crate) fn ensure_root_offsets(&mut self) {
@@ -1111,7 +1142,7 @@ impl PlayerInst {
         // created, and the object stays alive for the rest of this function.
         let payload = unsafe { &mut *(payload.as_ptr() as *mut LayerGetterInst) };
         let (mtx, vtx, color, origin) = self.layer_getter_state(node);
-        populate_layer_getter(payload, node, origin, mtx, vtx, color);
+        populate_layer_getter(payload, node, ctx, origin, mtx, vtx, color)?;
         Ok(getter)
     }
 
@@ -3967,5 +3998,25 @@ mod tests {
             scene.bitmap(bitmap).expect("target bitmap").rgba.as_ptr() as usize,
             allocated
         );
+    }
+
+    /// A play call shows the clip it names, even when the name is no
+    /// timeline: the reference selects the active clip from the motion key
+    /// before it rebuilds the node state
+    /// (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:1174-1233`,
+    /// `:646-652`).
+    #[test]
+    fn a_play_call_shows_the_clip_it_names() {
+        let snapshot = snapshot();
+        let _lock = crate::native_util::test_vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let ctx = context(&engine, &mut services);
+        let mut player = player(&snapshot);
+        // The module opens on its first clip.
+        assert_eq!(player.nodes[1].label, "intro_shape");
+        // The named clip replaces it.
+        player.play("idle", 0, &ctx).expect("play the idle clip");
+        assert_eq!(player.nodes[1].label, "idle_shape");
     }
 }

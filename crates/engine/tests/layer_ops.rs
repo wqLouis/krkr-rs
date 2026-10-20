@@ -257,12 +257,12 @@ fn render_layer_subtree_reuses_the_cache_until_the_subtree_changes() {
 
 /// Reusing the composited subtree content does not mutate the scene graph:
 /// the second `Complete` returns the existing `CacheBitmap` without bumping
-/// `Scene::revision`, so the renderer does not rebuild the projected scene
-/// for a frame that only reads the cache.
+/// either scene revision, so the renderer neither rebuilds the projected
+/// scene nor reruns the cache pass for a frame that only reads the cache.
 ///
 /// reference/cpp/core/visual/LayerIntf.cpp:7734-7737
 #[test]
-fn render_layer_subtree_reuse_does_not_touch_the_scene_revision() {
+fn render_layer_subtree_reuse_does_not_touch_the_scene_revisions() {
     let mut scene = Scene::default();
     let win = scene.add_window("t", (2, 2));
     let parent = scene.add_layer(win, None);
@@ -277,12 +277,18 @@ fn render_layer_subtree_reuse_does_not_touch_the_scene_revision() {
     }
 
     let content = render_layer_subtree(&mut scene, parent).expect("content bitmap");
-    let revision = scene.revision();
+    let structure = scene.structure_revision();
+    let texture = scene.content_revision();
     assert_eq!(render_layer_subtree(&mut scene, parent), Some(content));
     assert_eq!(
-        scene.revision(),
-        revision,
-        "a reused subtree cache does not mutate the scene graph"
+        scene.structure_revision(),
+        structure,
+        "a reused subtree cache does not mutate the tree's structure"
+    );
+    assert_eq!(
+        scene.content_revision(),
+        texture,
+        "a reused subtree cache writes no pixels"
     );
 }
 
@@ -501,9 +507,9 @@ fn render_layer_subtree_falls_back_from_a_stale_nested_cache() {
 
 /// `Scene::update_layer` skips all invalidation when its closure reports no
 /// change: the layer's subtree cache and every caching ancestor's stay clean
-/// and `Scene::revision` does not advance. The reference guards a property
-/// write the same way, comparing the requested value with the stored one
-/// before it invalidates (`tTJSNI_BaseLayer::SetVisible`,
+/// and `Scene::structure_revision` does not advance. The reference guards a
+/// property write the same way, comparing the requested value with the stored
+/// one before it invalidates (`tTJSNI_BaseLayer::SetVisible`,
 /// `reference/cpp/core/visual/LayerIntf.cpp:1183`).
 #[test]
 fn update_layer_unchanged_write_does_not_invalidate() {
@@ -525,7 +531,7 @@ fn update_layer_unchanged_write_does_not_invalidate() {
     for layer in &mut scene.layers {
         layer.cache_recalc = false;
     }
-    let revision = scene.revision();
+    let revision = scene.structure_revision();
     // The second write receives the stored value: the guard skips `Update()`
     // and `Parent->NotifyChildrenVisualStateChanged()`
     // (`reference/cpp/core/visual/LayerIntf.cpp:1183-1193`).
@@ -540,7 +546,7 @@ fn update_layer_unchanged_write_does_not_invalidate() {
         Some(false)
     );
     assert_eq!(
-        scene.revision(),
+        scene.structure_revision(),
         revision,
         "a no-op write bumps no revision"
     );
@@ -561,7 +567,7 @@ fn update_layer_changed_write_marks_subtree_and_ancestors() {
     for layer in &mut scene.layers {
         layer.cache_recalc = false;
     }
-    let revision = scene.revision();
+    let revision = scene.structure_revision();
     assert_eq!(
         scene.update_layer(child, |layer| {
             if layer.visible {
@@ -573,8 +579,8 @@ fn update_layer_changed_write_marks_subtree_and_ancestors() {
         Some(true)
     );
     assert!(
-        scene.revision() > revision,
-        "a changed write bumps revision"
+        scene.structure_revision() > revision,
+        "a changed write bumps the structural revision"
     );
     assert!(scene.layer(child).unwrap().cache_recalc);
     assert!(scene.layer(parent).unwrap().cache_recalc);
@@ -586,7 +592,7 @@ fn update_layer_changed_write_marks_subtree_and_ancestors() {
 #[test]
 fn update_layer_missing_layer_reports_absent() {
     let mut scene = Scene::default();
-    let revision = scene.revision();
+    let revision = scene.structure_revision();
     assert_eq!(scene.update_layer(9999, |_| true), None);
-    assert_eq!(scene.revision(), revision);
+    assert_eq!(scene.structure_revision(), revision);
 }

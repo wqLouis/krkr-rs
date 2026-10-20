@@ -46,9 +46,10 @@ pub use transitions::{advance_self_updating_transitions, advance_transitions};
 struct LayerExtras {
     /// Active `beginTransition` state per layer id.
     transitions: HashMap<u32, LayerTransition>,
-    /// The scene revision the last script-cached-layer pass ran at, so an
-    /// unchanged frame composites nothing.
-    cache_revision: Option<u64>,
+    /// The scene's structure and content revisions the last
+    /// script-cached-layer pass ran at, so an unchanged frame composites
+    /// nothing.
+    cache_revisions: Option<(u64, u64)>,
     /// Reference `tTVPLayerManager::ModalLayerVector`: modal layer ids.
     modes: Vec<u32>,
     /// `releaseCapture` requests the tree owner drains.
@@ -75,8 +76,8 @@ struct LayerTransition {
 /// The pass runs as a frame-body pump after the transition step, so a cache
 /// that contains a transition sees the frame just blended, and before the
 /// engine uploads and projects. It does nothing while the scene is unchanged:
-/// no layer or bitmap edit, no timer-driven composite and no revision bump
-/// means no cache can be stale.
+/// no layer or bitmap edit, no timer-driven composite and no structural or
+/// content revision bump means no cache can be stale.
 ///
 /// A layer owned by an active transition keeps its cache slots for the
 /// transition step and is left alone. A cached layer whose subtree contains a
@@ -87,17 +88,20 @@ struct LayerTransition {
 ///
 /// The compositor reuses its content bitmap and recomposites only when the
 /// subtree's recalc flag or its source images' generations changed, so a
-/// stable frame calls no pixel work. Nested caches composite independently:
-/// the subtree compositor draws a child's own image, not the child's cache, so
-/// an outer cache shows the inner layer's live subtree.
+/// stable frame calls no pixel work. Cached layers are visited deepest first,
+/// so a parent composites through the cache its children publish in the same
+/// pass instead of waiting for the next frame to see it.
 pub fn refresh_cached_layers(ctx: &crate::CompatCtx) -> Result<(), String> {
-    let revision = scene_ref(ctx)?.revision();
-    let (last_revision, in_transition, whole_subtree_transitions) = {
+    let (structure, content) = {
+        let scene = scene_ref(ctx)?;
+        (scene.structure_revision(), scene.content_revision())
+    };
+    let (last_revisions, in_transition, whole_subtree_transitions) = {
         // SAFETY: the caller resolved `ctx` from the installed binding.
         let services = unsafe { ctx.services() };
         let extras = services.state::<LayerExtras>();
         (
-            extras.cache_revision,
+            extras.cache_revisions,
             extras.transitions.keys().copied().collect::<Vec<u32>>(),
             extras
                 .transitions
@@ -107,7 +111,7 @@ pub fn refresh_cached_layers(ctx: &crate::CompatCtx) -> Result<(), String> {
                 .collect::<Vec<u32>>(),
         )
     };
-    if last_revision == Some(revision) {
+    if last_revisions == Some((structure, content)) {
         return Ok(());
     }
 
@@ -118,13 +122,17 @@ pub fn refresh_cached_layers(ctx: &crate::CompatCtx) -> Result<(), String> {
     for id in whole_subtree_transitions {
         blocked.extend(ancestors(scene, id));
     }
-    let cached: Vec<u32> = scene
-        .layers
-        .iter()
-        .filter(|layer| layer.cached)
-        .map(|layer| layer.id)
-        .collect();
-    for id in cached {
+    // Deepest first: a cached parent draws its cached descendants through the
+    // caches this pass publishes, so one pass gives every level the current
+    // child cache instead of the previous frame's.
+    let mut cached: Vec<(usize, u32)> = Vec::new();
+    for layer in &scene.layers {
+        if layer.cached {
+            cached.push((ancestors(scene, layer.id).len(), layer.id));
+        }
+    }
+    cached.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    for (_, id) in cached {
         if in_transition.contains(&id) {
             continue;
         }
@@ -147,11 +155,11 @@ pub fn refresh_cached_layers(ctx: &crate::CompatCtx) -> Result<(), String> {
             scene.set_cache_bitmap(id, Some(content));
         }
     }
-    let revision = scene.revision();
+    let revisions = (scene.structure_revision(), scene.content_revision());
     // SAFETY: see above.
     let services = unsafe { ctx.services() };
     let mut extras = services.state::<LayerExtras>();
-    extras.cache_revision = Some(revision);
+    extras.cache_revisions = Some(revisions);
     Ok(())
 }
 

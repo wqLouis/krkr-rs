@@ -117,23 +117,6 @@ fn probe_image(services: &CompatServices, name: &str, bytes: &[u8]) -> Result<Im
         .probe(bytes, Some(name))
 }
 
-/// Overwrite an existing scene bitmap's pixels in place, reusing its id (the
-/// reference `Bitmap.load` replaces the current image).
-pub(crate) fn replace_bitmap_pixels(
-    scene: &mut Scene,
-    id: u32,
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
-) {
-    if let Some(bitmap) = scene.bitmap_mut(id) {
-        bitmap.width = width;
-        bitmap.height = height;
-        bitmap.rgba = rgba;
-        bitmap.mark_dirty();
-    }
-}
-
 /// `TVP_clNone`: no color key.
 pub(crate) const COLOR_KEY_NONE: u32 = 0x1fff_ffff;
 /// `TVP_clAdapt`: the most frequent color on the first scanline.
@@ -284,7 +267,7 @@ fn load_into_bitmap(
     let scene = scene_mut(ctx)?;
     let id = match id {
         Some(id) => {
-            replace_bitmap_pixels(scene, id, width, height, rgba);
+            scene.replace_bitmap_image(id, width, height, rgba);
             // The image is the script `Bitmap`'s, so it is released with that
             // object; a layer's own image stays layer-owned.
             if let Some(bitmap) = scene.bitmap_mut(id) {
@@ -696,7 +679,7 @@ extern "C" fn bitmap_copy_from(
             "Bitmap.copyFrom: the source bitmap does not exist",
         );
     };
-    replace_bitmap_pixels(scene, id, width, height, rgba);
+    scene.replace_bitmap_image(id, width, height, rgba);
     set_void(out);
     0
 }
@@ -1388,22 +1371,4 @@ pub(super) fn register_bitmap_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
         ],
         properties: vec![],
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `replace_bitmap_pixels` serves both a script `Bitmap` and a layer's own
-    /// image, so it must not claim script ownership itself; the script callers
-    /// set the claim, and a layer's image is released with the layer.
-    #[test]
-    fn replace_bitmap_pixels_does_not_claim_script_ownership() {
-        let mut scene = Scene::default();
-        let id = scene.add_bitmap(1, 1, vec![0, 0, 0, 0]);
-        replace_bitmap_pixels(&mut scene, id, 2, 2, vec![1; 16]);
-        let bitmap = scene.bitmap(id).expect("the bitmap survives the replace");
-        assert!(!bitmap.script_owned, "a replaced image is not script-owned");
-        assert_eq!(bitmap.rgba.len(), 16);
-    }
 }

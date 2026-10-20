@@ -181,14 +181,16 @@ pub(crate) fn eval_array(
 
 /// Getter helper for a member that holds a TJS array.
 ///
-/// The array is built on every read, so a script that writes into the array
-/// it received loses that write when it reads the member again.
+/// The array is built once and kept on the instance, so every read hands out
+/// the same array and a script that writes into it keeps the write until the
+/// instance is rebuilt. The cached array is handed out under a fresh id, which
+/// keeps the same object alive for the script.
 pub(crate) fn get_value_array<T>(
     engine: *mut c_void,
     instance: *mut c_void,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    f: impl FnOnce(&T) -> Option<Vec<TjsValue>>,
+    f: impl FnOnce(&T) -> Option<tjs::Tjs2ValueId>,
 ) -> c_int {
     let Some(binding) = resolve(engine) else {
         return report_error(out_error, NO_BINDING);
@@ -197,16 +199,14 @@ pub(crate) fn get_value_array<T>(
     let Some(inst) = (unsafe { inst_ref::<T>(instance) }) else {
         return report_error(out_error, "motionplayer: null instance");
     };
-    let Some(values) = f(inst) else {
+    let Some(id) = f(inst) else {
         set_void(out);
         return 0;
     };
-    let ctx = binding.ctx();
-    let array = match eval_array(&ctx, &values) {
-        Ok(array) => array,
-        Err(error) => return report_error(out_error, &error),
+    let Ok(duplicate) = binding.engine().duplicate_retained(id) else {
+        return report_error(out_error, "motionplayer: the cached array is gone");
     };
-    set_retained(out, array);
+    set_retained(out, duplicate);
     0
 }
 

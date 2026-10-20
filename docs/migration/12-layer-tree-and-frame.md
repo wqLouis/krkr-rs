@@ -55,11 +55,18 @@ scene and all of its state:
 | `layers: Vec<LayerState>` | the layer nodes: `window`, `parent`, `rect` (x/y/w/h), `visible`, `opacity`, `blend`, `bitmap` (main image), `image_left/top/width/height`, `hold_alpha`, `cache_bitmap`/`cache_enabled_count`, `transition_self`, and every TVP property L3 writes |
 | `bitmaps: Vec<BitmapState>` | CPU RGBA pixels + dirty flags; the texture source |
 | `fonts: Vec<FontState>` | parsed faces |
-| `revision: u64` | bumped by `touch()` on every mutation; the projection's skip key (`revision()`) |
+| `structure_revision: u64` | bumped by `touch_structure()` on every change to the tree the projection reads: windows, layers, their order/parenting/geometry/draw properties, and bitmap create/remove/resize; the projection's skip key (`structure_revision()`) |
+| `content_revision: u64` | bumped by `touch_content()` on every bitmap pixel write (`bitmap_mut`, `replace_bitmap_image`, `resize_bitmap`); the subtree-cache pass's other skip key (`content_revision()`) |
 
-`Scene` keeps private id→index maps, a decoded-image cache and that revision
-counter. It holds **no** globals, locks or hidden caches; the projection is a
-pure function over it.
+`Scene` keeps private id→index maps, a decoded-image cache and those two
+revision counters. It holds **no** globals, locks or hidden caches; the
+projection is a pure function over it.
+
+The split is what lets an animated frame paint without re-projecting: a bitmap
+content write moves `content_revision` only, so the engine uploads the new
+pixels into the existing texture and reuses the projected tree. A bitmap whose
+size changed is structural (`resize_bitmap`/`replace_bitmap_image`), because the
+projection reads its dimensions.
 
 `Scene::window_layer_order(window)` returns the window's layers
 **parent-first**, which is what lets the projection compose ancestors in a
@@ -217,7 +224,8 @@ L2 drops a bitmap, so bitmap→texture lifetime is explicit L2 state.
 **The engine owns the frame.** `engine::Engine::step(dt_ms, hooks)` /
 `frame(now_ms, hooks)` set the frame clock, advance the L2 timer registry, run
 the single `GameFrame::before_render(now_ms, dt_ms)` hook, refresh the overlay,
-upload dirty bitmaps, project when `Scene::revision` changed (clearing and
+upload dirty bitmaps, project when `Scene::structure_revision` changed or the
+presentation mapping/texture table invalidated the projection (clearing and
 refilling the persistent arena, then re-attaching the overlay), and then run
 `GameFrame::after_project(&drawn_layers)` with the projection's actual emit
 report. If that hook changes the scene, the engine uploads and projects again

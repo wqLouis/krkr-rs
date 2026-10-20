@@ -7,6 +7,8 @@
 //! is `main`'s `crates/tvp-natives/src/video_overlay.rs`
 //! (`VideoOverlayInst`/`advance_playback`) and the reference `VideoOverlay`.
 
+use std::sync::Arc;
+
 use api::media::{RgbaFrame, VideoSpec};
 use engine::video::{PeriodReason, PlayStatus, VideoBounds, VideoError, VideoEvent, VideoOverlay};
 
@@ -227,7 +229,7 @@ fn period_event_semantics_match_the_reference() {
 fn prepare_fires_the_prepare_period_on_the_first_frame() {
     let mut v = VideoOverlay::new();
     v.open(spec(30.0, 30)).unwrap();
-    v.present_frame(frame(1, 1, 0)).unwrap();
+    v.present_frame(Arc::new(frame(1, 1, 0))).unwrap();
     v.prepare().unwrap();
     assert!(v.is_playing(), "prepare restarts playback");
     assert_eq!(v.position_ms(), 0);
@@ -236,6 +238,8 @@ fn prepare_fires_the_prepare_period_on_the_first_frame() {
     assert!(started.contains(&VideoEvent::StatusChanged(PlayStatus::Play)));
 
     v.advance(100.0);
+    assert!(v.poll().is_empty(), "the prepare waits for the next frame");
+    v.present_frame(Arc::new(frame(1, 1, 0))).unwrap();
     let events = v.poll();
     assert!(events.contains(&VideoEvent::Period(PeriodReason::Prepare)));
     assert!(events.contains(&VideoEvent::StatusChanged(PlayStatus::Pause)));
@@ -267,11 +271,11 @@ fn present_frame_stores_and_validates_decoded_frames() {
 
     let bad = RgbaFrame::new(2, 2, 0, vec![0; 3]);
     assert!(matches!(
-        v.present_frame(bad),
+        v.present_frame(Arc::new(bad)),
         Err(VideoError::InconsistentFrame { .. })
     ));
 
-    v.present_frame(frame(2, 2, 33)).unwrap();
+    v.present_frame(Arc::new(frame(2, 2, 33))).unwrap();
     assert_eq!(v.current_frame_pts_ms(), Some(33));
     assert_eq!(v.current_frame().unwrap().width, 2);
     v.clear_frame();
@@ -288,9 +292,24 @@ fn frame_update_fires_once_a_frame_is_presented() {
     v.advance(100.0); // frame 3, but no decoded frame yet
     assert!(v.poll().is_empty());
 
-    v.present_frame(frame(1, 1, 0)).unwrap();
+    // The event belongs to the presented frame: the reference fires it when
+    // a frame has been decoded
+    // (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:621`).
+    v.present_frame(Arc::new(frame(1, 1, 0))).unwrap();
+    assert_eq!(v.poll(), vec![VideoEvent::FrameUpdate(3)]);
+
     v.advance(100.0); // frame 6
+    assert!(
+        v.poll().is_empty(),
+        "the frame update belongs to a presented frame"
+    );
+    v.present_frame(Arc::new(frame(1, 1, 0))).unwrap();
     assert_eq!(v.poll(), vec![VideoEvent::FrameUpdate(6)]);
+
+    // The same picture again: the reference fires the event once per decoded
+    // picture, so a picture that is already on screen fires nothing.
+    v.present_frame(Arc::new(frame(1, 1, 0))).unwrap();
+    assert!(v.poll().is_empty(), "the picture on screen did not change");
 }
 
 #[test]

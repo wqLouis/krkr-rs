@@ -122,12 +122,13 @@ pub fn open_video(
 /// If the request is within `SEEK_TOLERANCE_MS` behind the current frame
 /// the current frame is returned; further back triggers a demuxer seek;
 /// otherwise the decoder decodes forward to the first frame at/after
-/// `at_ms`. Returns a tightly packed RGBA8 [`RgbaFrame`].
+/// `at_ms`. Returns a tightly packed RGBA8 [`RgbaFrame`], shared with the
+/// decoder so that handing the frame on copies no pixels.
 pub fn present_video(
     m: &Media,
     state: &mut VideoDecoderState,
     at_ms: u64,
-) -> Result<RgbaFrame, MediaError> {
+) -> Result<Arc<RgbaFrame>, MediaError> {
     backend::present(m, state, at_ms)
 }
 

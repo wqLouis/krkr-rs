@@ -90,7 +90,10 @@ impl Inner {
     }
 
     /// Decode the frame at `at_ms` for `path`, opening the stream if needed.
-    fn frame(&mut self, path: &str, at_ms: i64) -> Option<RgbaFrame> {
+    ///
+    /// The frame is shared with the decoder, so the caller does not copy its
+    /// pixels.
+    fn frame(&mut self, path: &str, at_ms: i64) -> Option<Arc<RgbaFrame>> {
         if let Err(error) = self.open(path) {
             log::warn!("video: {error}");
             return None;
@@ -140,7 +143,7 @@ impl VideoSource for MediaVideoSource {
         }
     }
 
-    fn frame_at(&mut self, path: &str, at_ms: i64) -> Option<RgbaFrame> {
+    fn frame_at(&mut self, path: &str, at_ms: i64) -> Option<Arc<RgbaFrame>> {
         self.inner.borrow_mut().frame(path, at_ms)
     }
 

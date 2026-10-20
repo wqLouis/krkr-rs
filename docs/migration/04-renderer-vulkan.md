@@ -191,8 +191,10 @@ read back. This is the compatibility baseline
 
 ## 10. Performance expectations and guards
 
-* **Idle frames**: L2's `Scene::revision` fast path skips projection when the
-  tree is unchanged, so a static frame records no new draw commands.
+* **Idle frames**: L2's `Scene::structure_revision` fast path skips projection
+  when the tree is unchanged, and a bitmap content write (the animated case)
+  only re-uploads its texture, so a frame that changes no geometry records no
+  new draw commands and re-projects nothing.
 * **Graphical submission**: one command buffer per frame, one descriptor set
   per distinct texture, quads batched by pipeline.
 * **Uploads**: sub-rect only; the staging ring is reused.

@@ -344,14 +344,12 @@ pub fn movie_poll(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
             if !slot.overlay.is_open() || !slot.playing {
                 continue;
             }
-            // Present the frame at the current position, advance, then
-            // present at the new position so the copy below shows the frame
-            // belonging to the new clock value.
-            present(&mut source, slot);
+            // The clock moves first, then the frame is fetched once, so the
+            // copy below shows the frame belonging to the new clock value.
             slot.overlay.advance(dt_ms);
             slot.follow_audio(services);
-            let events = slot.overlay.poll();
             present(&mut source, slot);
+            let events = slot.overlay.poll();
             slot.sync_audio(services, frame_resync(&slot.overlay));
             copy_frame(ctx, slot);
 
@@ -388,6 +386,8 @@ pub fn movie_poll(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
 }
 
 /// Present the host frame at the overlay's current position, if any.
+///
+/// The frame is shared with the host, so presenting it copies no pixels.
 fn present(source: &mut Option<Box<dyn VideoSource>>, slot: &mut MovieSlot) {
     let Some(source) = source.as_mut() else {
         return;
@@ -552,7 +552,7 @@ mod tests {
     use crate::CompatHost;
     use crate::engine_api::Scene;
     use api::media::VideoSpec;
-    use std::sync::MutexGuard;
+    use std::sync::{Arc, MutexGuard};
     use tjs::TjsValue;
 
     fn vm_lock() -> MutexGuard<'static, ()> {
@@ -569,7 +569,7 @@ mod tests {
             Some(self.spec)
         }
 
-        fn frame_at(&mut self, _path: &str, at_ms: i64) -> Option<api::media::RgbaFrame> {
+        fn frame_at(&mut self, _path: &str, at_ms: i64) -> Option<Arc<api::media::RgbaFrame>> {
             let mut chosen = self.frames.first()?.clone();
             for frame in &self.frames {
                 if frame.pts_ms as i64 <= at_ms {
@@ -578,7 +578,7 @@ mod tests {
                     break;
                 }
             }
-            Some(chosen)
+            Some(Arc::new(chosen))
         }
     }
 

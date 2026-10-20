@@ -22,7 +22,7 @@
 //! # Codecs
 //!
 //! The default symphonia codecs are registered (`wav`/`pcm`, `ogg`/`vorbis`,
-//! `flac`, `mp3`) plus the separately shipped
+//! `flac`, `mp3`, `mp4`/`aac`) plus the separately shipped
 //! [`symphonia_adapter_libopus::OpusDecoder`]. A stream that cannot be
 //! probed or decoded returns a typed [`MediaError`]; no silence or other
 //! placeholder is substituted.
@@ -45,7 +45,9 @@ use crate::Media;
 use crate::hint::extension_of;
 
 /// Audio format/codec names advertised by [`crate::capabilities`].
-pub(crate) const AUDIO_FORMATS: [&str; 7] = ["wav", "pcm", "ogg", "vorbis", "flac", "mp3", "opus"];
+pub(crate) const AUDIO_FORMATS: [&str; 9] = [
+    "wav", "pcm", "ogg", "vorbis", "flac", "mp3", "opus", "mp4", "aac",
+];
 
 /// Bottom-defined state for an incremental audio decode.
 ///
@@ -134,7 +136,32 @@ fn build_codec_registry() -> CodecRegistry {
 /// decide the format. `source` may be a borrowed `Cursor<&[u8]>` (whole-file
 /// probe/decode) or an owned `Cursor<Arc<[u8]>>` (the streaming state), so no
 /// whole-buffer copy is needed on any path.
-fn open_setup<'a, S>(source: S, hint: Option<&str>) -> Result<OpenedAudio<'a>, MediaError>
+fn open_setup<'a, S, F>(source: F, hint: Option<&str>) -> Result<OpenedAudio<'a>, MediaError>
+where
+    S: MediaSource + 'a,
+    F: Fn() -> S,
+{
+    let name = display_name(hint);
+    // The hint only steers the probe. A name whose extension does not match
+    // the content sends the probe down the wrong path, so a failed hinted
+    // probe is retried without the hint: the bytes decide the format.
+    match probe_source(source(), hint) {
+        Ok(opened) => Ok(opened),
+        Err(hinted) => match probe_source(source(), None) {
+            Ok(opened) => Ok(opened),
+            Err(unhinted) => Err(MediaError::Decode {
+                format: String::new(),
+                message: format!("{name}: {hinted}; without the name hint: {unhinted}"),
+            }),
+        },
+    }
+}
+
+/// Probes the container with `hint` and builds the decoder.
+///
+/// The error is the probe's own message; [`open_setup`] combines the hinted
+/// and the unhinted attempt.
+fn probe_source<'a, S>(source: S, hint: Option<&str>) -> Result<OpenedAudio<'a>, String>
 where
     S: MediaSource + 'a,
 {
@@ -151,30 +178,23 @@ where
             FormatOptions::default(),
             MetadataOptions::default(),
         )
-        .map_err(|error| MediaError::Decode {
-            format: String::new(),
-            message: format!("{name}: {error}"),
-        })?;
+        .map_err(|error| error.to_string())?;
 
     let track = format
         .default_track(TrackType::Audio)
-        .ok_or_else(|| MediaError::Unsupported {
-            message: format!("{name}: no decodable audio track"),
-        })?;
+        .ok_or_else(|| format!("{name}: no decodable audio track"))?;
     let track_id = track.id;
     let codec_params = track
         .codec_params
         .as_ref()
         .and_then(|params| params.audio())
-        .ok_or_else(|| MediaError::Unsupported {
-            message: format!("{name}: no audio codec parameters"),
-        })?;
+        .ok_or_else(|| format!("{name}: no audio codec parameters"))?;
     let sample_rate = codec_params.sample_rate.unwrap_or(0);
     let channels = match codec_params.channels.as_ref() {
         Some(channels) => {
             let count = channels.count();
-            u32::try_from(count).map_err(|_| MediaError::InvalidData {
-                message: format!("{name}: audio channel count {count} does not fit in 32 bits"),
+            u32::try_from(count).map_err(|_| {
+                format!("{name}: audio channel count {count} does not fit in 32 bits")
             })?
         }
         None => 0,
@@ -198,9 +218,7 @@ where
 
     let decoder = build_codec_registry()
         .make_audio_decoder(codec_params, &AudioDecoderOptions::default())
-        .map_err(|error| MediaError::Unsupported {
-            message: format!("{name}: {error}"),
-        })?;
+        .map_err(|error| format!("{name}: {error}"))?;
 
     Ok(OpenedAudio {
         format,
@@ -217,7 +235,7 @@ where
 /// A stream that cannot be probed returns a typed [`MediaError`].
 pub fn probe_audio(m: &Media, bytes: &[u8], hint: Option<&str>) -> Result<AudioSpec, MediaError> {
     let _ = m;
-    open_setup(Cursor::new(bytes), hint).map(|opened| opened.spec)
+    open_setup(|| Cursor::new(bytes), hint).map(|opened| opened.spec)
 }
 
 /// Decodes a whole audio file into interleaved `f32` samples.
@@ -232,7 +250,7 @@ pub fn decode_audio(
     hint: Option<&str>,
 ) -> Result<DecodedAudio, MediaError> {
     let _ = m;
-    let opened = open_setup(Cursor::new(bytes), hint)?;
+    let opened = open_setup(|| Cursor::new(bytes), hint)?;
     decode_all(opened, hint)
 }
 
@@ -305,7 +323,7 @@ pub fn open_audio(
 ) -> Result<(AudioSpec, AudioDecoderState), MediaError> {
     let _ = m;
     let hint_owned = hint.map(str::to_string);
-    let opened = open_setup(Cursor::new(Arc::clone(&bytes)), hint)?;
+    let opened = open_setup(|| Cursor::new(Arc::clone(&bytes)), hint)?;
     let spec = opened.spec;
     let state = AudioDecoderState {
         spec,
@@ -445,6 +463,23 @@ fn decode_packet_into(
 
         match setup.decoder.decode(&packet) {
             Ok(decoded) => {
+                let rate = decoded.spec().rate();
+                if rate != spec.sample_rate {
+                    // The decoder produces a different rate than the container
+                    // declares. An AAC track with the SBR extension declares
+                    // the extension's rate while the decoder produces the
+                    // core's, and the decoder has no SBR synthesis, so the
+                    // track would play at the wrong speed. The stream is
+                    // reported instead of approximated.
+                    return Err(MediaError::Unsupported {
+                        message: format!(
+                            "{name}: the decoder produces {rate} Hz while the container \
+                             declares {} Hz: the track uses a feature the decoder does \
+                             not provide",
+                            spec.sample_rate
+                        ),
+                    });
+                }
                 spec.sample_rate = decoded.spec().rate();
                 let count = decoded.spec().channels().count();
                 spec.channels = u32::try_from(count).map_err(|_| MediaError::InvalidData {
@@ -502,7 +537,7 @@ fn decode_packet_into(
 pub fn seek_audio(m: &Media, state: &mut AudioDecoderState, frame: u64) -> Result<(), MediaError> {
     let _ = m;
     let hint = state.hint.clone();
-    match open_setup(Cursor::new(Arc::clone(&state.bytes)), hint.as_deref()) {
+    match open_setup(|| Cursor::new(Arc::clone(&state.bytes)), hint.as_deref()) {
         Ok(opened) => {
             state.spec = opened.spec;
             state.setup = Some(DecoderSetup {

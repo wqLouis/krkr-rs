@@ -4,15 +4,20 @@
 //! private helpers used there are reimplemented here on top of the public
 //! `render` API.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use api::blend::{BlendMode, DstBlend};
 use api::geometry::{PixelRegion, RectF};
 use engine::{
-    Rect, Scene, compose_layer, project_scene, project_window, project_window_report, resolve_blend,
+    Engine, EngineOverlay, EngineParts, GameFrame, Rect, Scene, compose_layer, project_scene,
+    project_window, project_window_report, resolve_blend,
 };
 use render::{
-    PipelineConfig, RenderContent, RenderNode, RenderNodeId, RenderScene, Texture, TextureDesc,
-    create_render_pipeline, create_texture,
+    PipelineConfig, RenderContent, RenderNode, RenderNodeId, RenderPipeline, RenderScene,
+    RenderState, Texture, TextureDesc, begin_render_state, create_render_pipeline, create_texture,
 };
+use testkit::headless_window;
 
 /// Build a real (headless) texture handle for tests, matching how the
 /// caller-owned texture table is populated in production.
@@ -606,4 +611,203 @@ fn transition_self_image_replaces_the_main_image_at_its_placement() {
         .find(|n| n.dst == RectF::new(6.0, 9.0, 16.0, 16.0))
         .expect("main image node at the same placement");
     assert_eq!(main_node.src, PixelRegion::new(0, 0, 16, 16));
+}
+
+// ---------------------------------------------------------------------------
+// The projection's skip key: the structural revision, not the pixel content
+// ---------------------------------------------------------------------------
+
+/// An overlay that counts the engine's projections. The engine attaches it
+/// once per rebuild, so `node()` is the exact rebuild count; its content is a
+/// container, so it is not a drawable node.
+struct ProjectionSpy {
+    projections: Rc<Cell<u32>>,
+}
+
+impl EngineOverlay for ProjectionSpy {
+    fn refresh(
+        &mut self,
+        _pipeline: &RenderPipeline,
+        _state: &mut RenderState,
+        _now_ms: u64,
+        _objects: engine::ObjectCounts,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn node(&self) -> RenderNode {
+        self.projections
+            .set(self.projections.get().saturating_add(1));
+        RenderNode::default()
+    }
+}
+
+/// A headless engine and the counter its overlay increments once per
+/// projection.
+fn headless_engine_with_projection_count(size: (u32, u32)) -> (Engine, Rc<Cell<u32>>) {
+    let pipeline = create_render_pipeline(PipelineConfig::null()).expect("null pipeline");
+    let handle = headless_window();
+    let (surface, render_state) = begin_render_state(&pipeline, &handle).expect("surface");
+    let projections = Rc::new(Cell::new(0));
+    let parts = EngineParts {
+        pipeline,
+        surface,
+        render_state,
+        surface_size: size,
+        headless: true,
+        overlay: Some(Box::new(ProjectionSpy {
+            projections: Rc::clone(&projections),
+        })),
+    };
+    (Engine::new(parts).expect("engine"), projections)
+}
+
+/// A frame hook that records nothing.
+struct NoHooks;
+
+impl GameFrame for NoHooks {
+    fn before_render(&mut self, _now_ms: u64, _dt_ms: f64) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Adds the window's primary layer: a `32x32` rect carrying the `w` x `h`
+/// bitmap handed back. The image size stays unset, so the projection draws the
+/// bitmap at its own size.
+fn drawable_layer(engine: &mut Engine, window: u32, w: u32, h: u32) -> (u32, u32) {
+    let layer = engine.scene_mut().add_layer(window, None);
+    let bitmap = engine
+        .scene_mut()
+        .add_bitmap(w, h, vec![0u8; 4 * (w * h) as usize]);
+    let state = engine.scene_mut().layer_mut(layer).expect("layer");
+    state.rect = Rect::new(0, 0, 32, 32);
+    state.visible = true;
+    state.bitmap = Some(bitmap);
+    (layer, bitmap)
+}
+
+/// The projected layer nodes, in arena order. The root and the overlay are
+/// containers; only a layer node carries a texture.
+fn projected_layer_nodes(engine: &Engine) -> Vec<&RenderNode> {
+    engine
+        .render_scene()
+        .nodes
+        .iter()
+        .filter(|node| !matches!(node.content, RenderContent::None))
+        .collect()
+}
+
+/// A bitmap content write is not a change to the layer tree, so the frame
+/// uploads the pixels to the existing texture and reuses the projected scene:
+/// the projection still reads geometry from the scene graph.
+#[test]
+fn a_content_only_bitmap_write_does_not_reproject() {
+    let (mut engine, projections) = headless_engine_with_projection_count((32, 32));
+    let window = engine.scene_mut().add_window("game", (32, 32));
+    let (layer, bitmap) = drawable_layer(&mut engine, window, 8, 8);
+    let mut hooks = NoHooks;
+
+    engine.step(1.0, &mut hooks).expect("first frame");
+    assert_eq!(projections.get(), 1);
+    assert_eq!(projected_layer_nodes(&engine).len(), 1);
+
+    for value in [1u8, 2, 3] {
+        {
+            let state = engine.scene_mut().bitmap_mut(bitmap).expect("bitmap");
+            state.rgba.fill(value);
+            state.mark_dirty();
+        }
+        engine.step(1.0, &mut hooks).expect("content frame");
+        assert_eq!(
+            projections.get(),
+            1,
+            "a bitmap content write must not re-project"
+        );
+        assert!(
+            !engine.scene().bitmap(bitmap).expect("bitmap").dirty,
+            "the dirty bitmap is still uploaded"
+        );
+    }
+    assert_eq!(
+        projected_layer_nodes(&engine)[0].dst,
+        RectF::new(0.0, 0.0, 8.0, 8.0),
+        "the reused projection keeps the layer's placement"
+    );
+    assert_eq!(engine.scene().layer(layer).expect("layer").rect.w, 32);
+}
+
+/// A layer property write, a window write and a layer creation all change the
+/// tree the projection reads, so each one rebuilds the projected scene.
+#[test]
+fn layer_window_and_order_changes_reproject() {
+    let (mut engine, projections) = headless_engine_with_projection_count((32, 32));
+    let window = engine.scene_mut().add_window("game", (32, 32));
+    let (layer, _bitmap) = drawable_layer(&mut engine, window, 8, 8);
+    let mut hooks = NoHooks;
+
+    engine.step(1.0, &mut hooks).expect("first frame");
+    assert_eq!(projections.get(), 1);
+
+    engine.scene_mut().layer_mut(layer).expect("layer").rect = Rect::new(0, 0, 16, 16);
+    engine.step(1.0, &mut hooks).expect("geometry frame");
+    assert_eq!(projections.get(), 2, "a layer geometry change re-projects");
+
+    engine
+        .scene_mut()
+        .window_mut(window)
+        .expect("window")
+        .opacity = 0.5;
+    engine.step(1.0, &mut hooks).expect("window frame");
+    assert_eq!(projections.get(), 3, "a window property change re-projects");
+
+    engine.scene_mut().add_layer(window, None);
+    engine.step(1.0, &mut hooks).expect("order frame");
+    assert_eq!(projections.get(), 4, "a new layer re-projects");
+}
+
+/// A bitmap that is created, resized or removed changes the geometry the
+/// projection reads through the layer's image, so the projected node follows
+/// it even though the layer record itself is untouched in the resize case.
+#[test]
+fn a_new_resized_or_removed_bitmap_still_projects() {
+    let (mut engine, projections) = headless_engine_with_projection_count((32, 32));
+    let window = engine.scene_mut().add_window("game", (32, 32));
+    let (layer, _bitmap) = drawable_layer(&mut engine, window, 8, 8);
+    let mut hooks = NoHooks;
+
+    engine.step(1.0, &mut hooks).expect("first frame");
+    assert_eq!(projections.get(), 1);
+    assert_eq!(
+        projected_layer_nodes(&engine)[0].dst,
+        RectF::new(0.0, 0.0, 8.0, 8.0)
+    );
+
+    // A new bitmap assigned as the layer image.
+    let created = engine.scene_mut().add_bitmap(4, 4, vec![0u8; 4 * 4 * 4]);
+    engine.scene_mut().layer_mut(layer).expect("layer").bitmap = Some(created);
+    engine.step(1.0, &mut hooks).expect("new bitmap frame");
+    assert_eq!(projections.get(), 2, "a new bitmap re-projects");
+    assert_eq!(
+        projected_layer_nodes(&engine)[0].dst,
+        RectF::new(0.0, 0.0, 4.0, 4.0)
+    );
+
+    // A resize of the bitmap the layer draws.
+    assert!(engine.scene_mut().resize_bitmap(created, 6, 6, [0; 4]));
+    engine.step(1.0, &mut hooks).expect("resized bitmap frame");
+    assert_eq!(projections.get(), 3, "a resized bitmap re-projects");
+    assert_eq!(
+        projected_layer_nodes(&engine)[0].dst,
+        RectF::new(0.0, 0.0, 6.0, 6.0)
+    );
+
+    // Removing the layer's image and the bitmap drops the node.
+    engine.scene_mut().layer_mut(layer).expect("layer").bitmap = None;
+    engine.scene_mut().remove_bitmap(created);
+    engine.step(1.0, &mut hooks).expect("removed bitmap frame");
+    assert_eq!(projections.get(), 4, "a removed bitmap re-projects");
+    assert!(
+        projected_layer_nodes(&engine).is_empty(),
+        "the layer has no image to draw"
+    );
 }

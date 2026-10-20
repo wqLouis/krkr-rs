@@ -644,7 +644,8 @@ fn load_into_a_resized_bitmap_installs_the_decoded_pixels() {
     let env = Env::new(true);
 
     env.run("var b = new Bitmap(1, 1);");
-    let revision = env._scene.revision();
+    let structure = env._scene.structure_revision();
+    let content = env._scene.content_revision();
     env.run("b.load('images/test.img');");
 
     assert_eq!(env.eval_int("b.width"), 2);
@@ -668,8 +669,12 @@ fn load_into_a_resized_bitmap_installs_the_decoded_pixels() {
         "a loaded image bumps its content generation"
     );
     assert!(
-        env._scene.revision() > revision,
-        "a load invalidates the scene projection"
+        env._scene.structure_revision() > structure,
+        "a load that changes the image size invalidates the scene projection"
+    );
+    assert!(
+        env._scene.content_revision() > content,
+        "a load replaces the bitmap content"
     );
 }
 

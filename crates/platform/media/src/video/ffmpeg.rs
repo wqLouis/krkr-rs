@@ -63,8 +63,8 @@ pub struct VideoDecoderState {
     scaler: Option<scaling::Context>,
     /// Scratch RGBA output frame reused across `present_video` calls.
     rgba: VideoFrame,
-    /// The frame most recently returned by `present_video`.
-    current: Option<RgbaFrame>,
+    /// The frame most recently returned by `present_video`, shared.
+    current: Option<Arc<RgbaFrame>>,
     /// The fully decoded audio track (if the container has one), shared with
     /// whoever plays it.
     audio: Option<Arc<DecodedAudio>>,
@@ -498,7 +498,7 @@ pub fn present(
     m: &Media,
     state: &mut VideoDecoderState,
     at_ms: u64,
-) -> Result<RgbaFrame, MediaError> {
+) -> Result<Arc<RgbaFrame>, MediaError> {
     let _ = m;
 
     // A request just behind the current frame is served by that frame rather
@@ -507,7 +507,7 @@ pub fn present(
         && at_ms <= current.pts_ms
         && at_ms.saturating_add(SEEK_TOLERANCE_MS) >= current.pts_ms
     {
-        return Ok(current.clone());
+        return Ok(Arc::clone(current));
     }
 
     let need_seek = match &state.current {
@@ -522,7 +522,7 @@ pub fn present(
         match decode_next(state)? {
             Some(frame) => {
                 if frame.pts_ms >= at_ms {
-                    state.current = Some(frame.clone());
+                    state.current = Some(Arc::clone(&frame));
                     return Ok(frame);
                 }
                 state.current = Some(frame);
@@ -569,7 +569,7 @@ fn seek_to(state: &mut VideoDecoderState, at_ms: u64) -> Result<(), MediaError> 
 
 /// Decodes the next video frame, feeding packets until the decoder produces
 /// one. Returns `None` at end of stream.
-fn decode_next(state: &mut VideoDecoderState) -> Result<Option<RgbaFrame>, MediaError> {
+fn decode_next(state: &mut VideoDecoderState) -> Result<Option<Arc<RgbaFrame>>, MediaError> {
     loop {
         let mut frame = VideoFrame::empty();
         match state.decoder.receive_frame(&mut frame) {
@@ -614,7 +614,7 @@ fn decode_next(state: &mut VideoDecoderState) -> Result<Option<RgbaFrame>, Media
 fn convert_frame(
     state: &mut VideoDecoderState,
     frame: &VideoFrame,
-) -> Result<RgbaFrame, MediaError> {
+) -> Result<Arc<RgbaFrame>, MediaError> {
     let width = frame.width();
     let height = frame.height();
     if width == 0 || height == 0 {
@@ -676,7 +676,7 @@ fn convert_frame(
     }
 
     let pts_ms = frame_pts_ms(state.time_base, frame, &state.name)?;
-    Ok(RgbaFrame::new(width, height, pts_ms, rgba))
+    Ok(Arc::new(RgbaFrame::new(width, height, pts_ms, rgba)))
 }
 
 /// Converts a frame timestamp in stream time-base units to milliseconds.

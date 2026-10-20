@@ -603,13 +603,13 @@ fn unchanged_visible_write_does_not_invalidate() {
     for layer in &mut env.scene.layers {
         layer.cache_recalc = false;
     }
-    let before = env.scene.revision();
+    let before = env.scene.structure_revision();
 
     // hidden -> visible still invalidates.
     // reference/cpp/core/visual/LayerIntf.cpp:1187-1193
     env.run("l.visible = true;");
     assert!(
-        env.scene.revision() > before,
+        env.scene.structure_revision() > before,
         "a hidden->visible write still invalidates"
     );
     assert!(env.scene.layer(id).unwrap().cache_recalc);
@@ -618,11 +618,11 @@ fn unchanged_visible_write_does_not_invalidate() {
     for layer in &mut env.scene.layers {
         layer.cache_recalc = false;
     }
-    let revision = env.scene.revision();
+    let revision = env.scene.structure_revision();
     env.run("l.visible = true;");
     // reference/cpp/core/visual/LayerIntf.cpp:1183
     assert_eq!(
-        env.scene.revision(),
+        env.scene.structure_revision(),
         revision,
         "an unchanged visible write bumps no revision"
     );
@@ -635,7 +635,7 @@ fn unchanged_visible_write_does_not_invalidate() {
     env.run("l.visible = false;");
     // reference/cpp/core/visual/LayerIntf.cpp:1187-1193
     assert!(
-        env.scene.revision() > revision,
+        env.scene.structure_revision() > revision,
         "a visible->hidden write still invalidates"
     );
     assert!(env.scene.layer(id).unwrap().cache_recalc);
@@ -667,10 +667,10 @@ fn unchanged_geometry_opacity_and_blend_writes_are_no_ops() {
         for layer in &mut env.scene.layers {
             layer.cache_recalc = false;
         }
-        let revision = env.scene.revision();
+        let revision = env.scene.structure_revision();
         env.run(write);
         assert_eq!(
-            env.scene.revision(),
+            env.scene.structure_revision(),
             revision,
             "{write} repeated at the same value bumps no revision"
         );
@@ -698,10 +698,10 @@ fn unchanged_unguarded_property_write_still_invalidates() {
     for layer in &mut env.scene.layers {
         layer.cache_recalc = false;
     }
-    let revision = env.scene.revision();
+    let revision = env.scene.structure_revision();
     env.run("l.hitType = 1;");
     assert!(
-        env.scene.revision() > revision,
+        env.scene.structure_revision() > revision,
         "an unguarded repeated write bumps revision"
     );
     assert!(env.scene.layer(id).unwrap().cache_recalc);
@@ -733,11 +733,11 @@ fn unchanged_set_pos_write_does_not_invalidate() {
     for layer in &mut env.scene.layers {
         layer.cache_recalc = false;
     }
-    let revision = env.scene.revision();
+    let revision = env.scene.structure_revision();
     env.run("l.setPos(5, 7);");
     // reference/cpp/core/visual/LayerIntf.cpp:2203
     assert_eq!(
-        env.scene.revision(),
+        env.scene.structure_revision(),
         revision,
         "an unchanged setPos bumps no revision"
     );
@@ -750,7 +750,7 @@ fn unchanged_set_pos_write_does_not_invalidate() {
     // reference/cpp/core/visual/LayerIntf.cpp:2204-2211
     env.run("l.setPos(-4, -6);");
     assert!(
-        env.scene.revision() > revision,
+        env.scene.structure_revision() > revision,
         "a negative setPos still invalidates"
     );
     assert_eq!(env.eval_int("l.left"), -4);
@@ -785,11 +785,11 @@ fn unchanged_set_pos_with_bounds_write_does_not_invalidate() {
     for layer in &mut env.scene.layers {
         layer.cache_recalc = false;
     }
-    let revision = env.scene.revision();
+    let revision = env.scene.structure_revision();
     env.run("l.setPos(5, 7, 20, 30);");
     // reference/cpp/core/visual/LayerIntf.cpp:2121, :2144
     assert_eq!(
-        env.scene.revision(),
+        env.scene.structure_revision(),
         revision,
         "an unchanged setPos with bounds bumps no revision"
     );
@@ -799,7 +799,7 @@ fn unchanged_set_pos_with_bounds_write_does_not_invalidate() {
     // reference/cpp/core/visual/LayerIntf.cpp:2144-2159
     env.run("l.setPos(6, 7, 20, 30);");
     assert!(
-        env.scene.revision() > revision,
+        env.scene.structure_revision() > revision,
         "a moved setPos with bounds still invalidates"
     );
     assert_eq!(env.eval_int("l.left"), 6);
@@ -835,11 +835,11 @@ fn unchanged_set_size_write_does_not_invalidate() {
     for layer in &mut env.scene.layers {
         layer.cache_recalc = false;
     }
-    let revision = env.scene.revision();
+    let revision = env.scene.structure_revision();
     env.run("l.setSize(48, 40);");
     // reference/cpp/core/visual/LayerIntf.cpp:2121
     assert_eq!(
-        env.scene.revision(),
+        env.scene.structure_revision(),
         revision,
         "an unchanged setSize bumps no revision"
     );
@@ -851,7 +851,7 @@ fn unchanged_set_size_write_does_not_invalidate() {
     // A zero extent is a real change; the rect shrinks but the image does not.
     env.run("l.setSize(0, 0);");
     assert!(
-        env.scene.revision() > revision,
+        env.scene.structure_revision() > revision,
         "a zero-extent setSize still invalidates"
     );
     assert_eq!(env.eval_int("l.width"), 0);
@@ -879,12 +879,12 @@ fn unchanged_set_size_to_image_size_write_does_not_invalidate() {
     for layer in &mut env.scene.layers {
         layer.cache_recalc = false;
     }
-    let revision = env.scene.revision();
+    let revision = env.scene.structure_revision();
 
     // reference/cpp/core/visual/LayerIntf.cpp:8587-8588, :2122-2139
     env.run("l.setSizeToImageSize();");
     assert!(
-        env.scene.revision() > revision,
+        env.scene.structure_revision() > revision,
         "a real setSizeToImageSize resizes and invalidates"
     );
     assert_eq!(env.eval_int("l.width"), 32);
@@ -895,11 +895,11 @@ fn unchanged_set_size_to_image_size_write_does_not_invalidate() {
     for layer in &mut env.scene.layers {
         layer.cache_recalc = false;
     }
-    let revision = env.scene.revision();
+    let revision = env.scene.structure_revision();
     env.run("l.setSizeToImageSize();");
     // reference/cpp/core/visual/LayerIntf.cpp:8587, :2121
     assert_eq!(
-        env.scene.revision(),
+        env.scene.structure_revision(),
         revision,
         "an unchanged setSizeToImageSize bumps no revision"
     );
@@ -932,11 +932,11 @@ fn unchanged_set_image_pos_and_size_writes_do_not_invalidate() {
     for layer in &mut env.scene.layers {
         layer.cache_recalc = false;
     }
-    let revision = env.scene.revision();
+    let revision = env.scene.structure_revision();
     env.run("l.setImagePos(-4, -4);");
     // reference/cpp/core/visual/LayerIntf.cpp:2549
     assert_eq!(
-        env.scene.revision(),
+        env.scene.structure_revision(),
         revision,
         "an unchanged setImagePos bumps no revision"
     );
@@ -945,11 +945,11 @@ fn unchanged_set_image_pos_and_size_writes_do_not_invalidate() {
     for layer in &mut env.scene.layers {
         layer.cache_recalc = false;
     }
-    let revision = env.scene.revision();
+    let revision = env.scene.structure_revision();
     env.run("l.setImageSize(24, 24);");
     // reference/cpp/core/visual/LayerIntf.cpp:2649-2650
     assert_eq!(
-        env.scene.revision(),
+        env.scene.structure_revision(),
         revision,
         "an unchanged setImageSize bumps no revision"
     );

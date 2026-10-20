@@ -549,8 +549,12 @@ pub struct Scene {
     font_index: crate::hasher::Map<u32, usize>,
     /// Decoded-image cache (the reference graphic cache).
     image_cache: DecodedImageCache,
-    /// Monotonic mutation counter (see [`Scene::revision`]).
-    revision: u64,
+    /// Monotonic counter bumped by every change to the tree's structure (see
+    /// [`Scene::structure_revision`]).
+    structure_revision: u64,
+    /// Monotonic counter bumped by every bitmap content change (see
+    /// [`Scene::content_revision`]).
+    content_revision: u64,
 }
 
 impl Default for Scene {
@@ -569,25 +573,42 @@ impl Default for Scene {
             bitmap_index: crate::hasher::map(),
             font_index: crate::hasher::map(),
             image_cache: DecodedImageCache::default(),
-            revision: 0,
+            structure_revision: 0,
+            content_revision: 0,
         }
     }
 }
 
 impl Scene {
-    /// Monotonic counter bumped by every scene mutation (adds, removes and
-    /// every `*_mut` accessor). The renderer compares it across frames to
-    /// skip an unchanged sync entirely. [`Scene::set_bitmap_clean`]
-    /// deliberately does not bump: clearing a renderer-internal dirty flag is
-    /// not a logical mutation.
-    pub fn revision(&self) -> u64 {
-        self.revision
+    /// Monotonic counter bumped by every change to the tree's structure:
+    /// window/layer creation and removal, sibling order, parenting, the
+    /// geometry and draw properties the projection reads, and bitmap
+    /// creation, removal and resize. The projection compares it across frames
+    /// to skip an unchanged rebuild; a bitmap content change does not touch
+    /// it. [`Scene::set_bitmap_clean`] deliberately does not bump: clearing a
+    /// renderer-internal dirty flag is not a scene change.
+    pub fn structure_revision(&self) -> u64 {
+        self.structure_revision
     }
 
-    /// Bump [`Scene::revision`]. Over-approximating (bumping on a `*_mut`
-    /// accessor that ends up not writing) is safe: it only costs a resync.
-    fn touch(&mut self) {
-        self.revision = self.revision.wrapping_add(1);
+    /// Monotonic counter bumped by every bitmap content change, including a
+    /// resize; a change to the layer tree does not move it. The subtree-cache
+    /// pass compares it (with [`Scene::structure_revision`]) to decide
+    /// whether any composited content can be stale.
+    pub fn content_revision(&self) -> u64 {
+        self.content_revision
+    }
+
+    /// Bump [`Scene::structure_revision`]. Over-approximating (bumping on a
+    /// `*_mut` accessor that ends up not writing) is safe: it only costs a
+    /// resync.
+    fn touch_structure(&mut self) {
+        self.structure_revision = self.structure_revision.wrapping_add(1);
+    }
+
+    /// Bump [`Scene::content_revision`].
+    fn touch_content(&mut self) {
+        self.content_revision = self.content_revision.wrapping_add(1);
     }
 
     /// Create a window and return its new id. Starts visible, fully opaque
@@ -608,7 +629,7 @@ impl Scene {
             domain_focus: HashMap::new(),
             layers: Vec::new(),
         });
-        self.touch();
+        self.touch_structure();
         id
     }
 
@@ -624,12 +645,12 @@ impl Scene {
         self.windows.iter().find(|w| w.id == id)
     }
 
-    /// Mutably look up a window by id, bumping [`Scene::revision`]. A window
-    /// mutation can change the root render order, so the subtree caches of
-    /// its layers are marked stale.
+    /// Mutably look up a window by id, bumping [`Scene::structure_revision`].
+    /// A window mutation can change the root render order, so the subtree
+    /// caches of its layers are marked stale.
     pub fn window_mut(&mut self, id: u32) -> Option<&mut WindowState> {
         self.invalidate_window_cache(id);
-        self.touch();
+        self.touch_structure();
         let index = self
             .window_index
             .get(&id)
@@ -670,7 +691,7 @@ impl Scene {
         for (index, window) in self.windows.iter().enumerate() {
             self.window_index.insert(window.id, index);
         }
-        self.touch();
+        self.touch_structure();
         true
     }
 
@@ -695,7 +716,7 @@ impl Scene {
         self.next_layer += 1;
         self.layer_index.insert(id, self.layers.len());
         self.layers.push(Self::detached_layer_state(id));
-        self.touch();
+        self.touch_structure();
         id
     }
 
@@ -815,7 +836,7 @@ impl Scene {
                 }
             }
         }
-        self.touch();
+        self.touch_structure();
     }
 
     /// Look up a layer by id. Uses the id→index map, falling back to a
@@ -873,12 +894,12 @@ impl Scene {
         }
     }
 
-    /// Mutably look up a layer by id, bumping [`Scene::revision`]. The
-    /// layer's subtree cache and every caching ancestor's are marked stale
+    /// Mutably look up a layer by id, bumping [`Scene::structure_revision`].
+    /// The layer's subtree cache and every caching ancestor's are marked stale
     /// (`tTJSNI_BaseLayer::Update`, `LayerIntf.cpp:6305-6335`).
     pub fn layer_mut(&mut self, id: u32) -> Option<&mut LayerState> {
         self.invalidate_layer_cache(id);
-        self.touch();
+        self.touch_structure();
         self.layer_mut_untracked(id)
     }
 
@@ -886,10 +907,10 @@ impl Scene {
     ///
     /// `f` returns true when it actually mutated the layer. Only then is the
     /// layer's subtree cache, and every caching ancestor's, marked stale and
-    /// [`Scene::revision`] bumped; an unchanged write touches neither, so a
-    /// property setter that receives its current value is free. Returns
-    /// `None` when the layer is absent, which lets a caller distinguish a
-    /// missing layer from a no-op write.
+    /// [`Scene::structure_revision`] bumped; an unchanged write touches
+    /// neither, so a property setter that receives its current value is free.
+    /// Returns `None` when the layer is absent, which lets a caller
+    /// distinguish a missing layer from a no-op write.
     ///
     /// The reference guards a property write the same way, comparing the
     /// requested value with the stored one before it invalidates
@@ -902,7 +923,7 @@ impl Scene {
         let changed = f(self.layer_mut_untracked(id)?);
         if changed {
             self.invalidate_layer_cache(id);
-            self.touch();
+            self.touch_structure();
         }
         Some(changed)
     }
@@ -1258,7 +1279,7 @@ impl Scene {
             w.domain_focus.retain(|_, focused| *focused != id);
             w.sync_focused_layer();
         }
-        self.touch();
+        self.touch_structure();
     }
 
     /// Reference `tTJSNI_BaseLayer::Invalidate` (`LayerIntf.cpp:515`): the
@@ -1422,7 +1443,7 @@ impl Scene {
                 .retain(|domain, focused| !doomed.contains(domain) && !doomed.contains(focused));
             w.sync_focused_layer();
         }
-        self.touch();
+        self.touch_structure();
     }
 
     /// Reference `tTVPLayerManager::SetFocusTo`: give keyboard focus to
@@ -1789,7 +1810,7 @@ impl Scene {
                 }
             }
         }
-        self.touch();
+        self.touch_structure();
     }
 
     /// Add a decoded bitmap and return its new id. The bitmap starts dirty;
@@ -1808,7 +1829,7 @@ impl Scene {
             script_owned: false,
             content_generation: 0,
         });
-        self.touch();
+        self.touch_structure();
         id
     }
 
@@ -1816,8 +1837,9 @@ impl Scene {
     /// and filling any expansion with `fill` (RGBA) — the reference
     /// `iTVPBaseBitmap::SetSizeWithFill` (`LayerBitmapIntf.cpp:122`).
     /// Dimensions are clamped to at least 1, matching the reference
-    /// `tTVPBaseTexture` constructor. Marks the bitmap dirty. Returns true
-    /// when the bitmap was present and resized.
+    /// `tTVPBaseTexture` constructor. Marks the bitmap dirty and bumps
+    /// [`Scene::structure_revision`]. Returns true when the bitmap was
+    /// present and resized.
     pub fn resize_bitmap(&mut self, id: u32, width: u32, height: u32, fill: [u8; 4]) -> bool {
         let width = width.max(1);
         let height = height.max(1);
@@ -1861,6 +1883,7 @@ impl Scene {
         bitmap.height = height;
         bitmap.rgba = rgba;
         bitmap.mark_dirty();
+        self.touch_structure();
         true
     }
 
@@ -2054,7 +2077,8 @@ impl Scene {
 
     /// Remove a bitmap unconditionally (the low-level primitive behind
     /// [`Scene::release_bitmap`]). Keeps the id→index map consistent and
-    /// bumps [`Scene::revision`]. Returns true when the bitmap was present.
+    /// bumps [`Scene::structure_revision`]. Returns true when the bitmap was
+    /// present.
     pub fn remove_bitmap(&mut self, id: u32) -> bool {
         let before = self.bitmaps.len();
         self.bitmaps.retain(|bitmap| bitmap.id != id);
@@ -2065,7 +2089,7 @@ impl Scene {
         for (index, bitmap) in self.bitmaps.iter().enumerate() {
             self.bitmap_index.insert(bitmap.id, index);
         }
-        self.touch();
+        self.touch_structure();
         true
     }
 
@@ -2101,7 +2125,7 @@ impl Scene {
     /// content and the transition frame are freed with the last one. Returns
     /// the new count (`0` for an unknown layer).
     pub fn dec_cache_enabled_count(&mut self, id: u32) -> u32 {
-        self.touch();
+        self.touch_structure();
         let count = match self.layer_mut_untracked(id) {
             Some(layer) => {
                 layer.cache_enabled_count = layer.cache_enabled_count.saturating_sub(1);
@@ -2282,11 +2306,14 @@ impl Scene {
             .and_then(|index| self.bitmaps.get(index))
     }
 
-    /// Mutably look up a bitmap by id, bumping [`Scene::revision`] and the
-    /// bitmap's [`BitmapState::content_generation`] (every mutable access is
-    /// a possible content change).
+    /// Mutably look up a bitmap by id, bumping [`Scene::content_revision`]
+    /// and the bitmap's [`BitmapState::content_generation`] (every mutable
+    /// access is a possible content change). A dimension change is a
+    /// structural change: write it through [`Scene::resize_bitmap`] or
+    /// [`Scene::replace_bitmap_image`], which bump
+    /// [`Scene::structure_revision`].
     pub fn bitmap_mut(&mut self, id: u32) -> Option<&mut BitmapState> {
-        self.touch();
+        self.touch_content();
         let mut bitmap = self.bitmap_mut_untracked(id);
         if let Some(state) = bitmap.as_mut() {
             state.content_generation = state.content_generation.wrapping_add(1);
@@ -2294,7 +2321,36 @@ impl Scene {
         bitmap
     }
 
-    /// Mutably look up a bitmap by id without bumping the revision or the
+    /// Replace a bitmap's image with `width` x `height` RGBA pixels, marking
+    /// it dirty. A changed size is structural (the projection reads the
+    /// bitmap dimensions through the layer's image size), so it bumps
+    /// [`Scene::structure_revision`]; every replace bumps
+    /// [`Scene::content_revision`]. Script ownership is left alone. Returns
+    /// `false` when the bitmap is gone.
+    pub fn replace_bitmap_image(
+        &mut self,
+        id: u32,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    ) -> bool {
+        let Some(previous) = self.bitmap(id).map(|bitmap| (bitmap.width, bitmap.height)) else {
+            return false;
+        };
+        let Some(bitmap) = self.bitmap_mut(id) else {
+            return false;
+        };
+        bitmap.width = width;
+        bitmap.height = height;
+        bitmap.rgba = rgba;
+        bitmap.mark_dirty();
+        if previous != (width, height) {
+            self.touch_structure();
+        }
+        true
+    }
+
+    /// Mutably look up a bitmap by id without bumping either revision or the
     /// content generation. Used by a pass that writes one bitmap many times
     /// and reports the change once.
     pub(crate) fn bitmap_mut_untracked(&mut self, id: u32) -> Option<&mut BitmapState> {
@@ -2304,7 +2360,7 @@ impl Scene {
 
     /// Borrow the composite target `dst` mutably and one source `src`
     /// immutably at the same time. Unlike [`Scene::bitmap_mut`] this bumps
-    /// neither the revision nor a content generation: a composite takes one
+    /// neither revision nor a content generation: a composite takes one
     /// mutable borrow per pass and samples many sources. Returns `None` when
     /// an id is missing or `dst` and `src` are the same bitmap, because a
     /// composite never samples the bitmap it writes.
@@ -2331,7 +2387,7 @@ impl Scene {
     /// Borrow `dst` mutably and `src1`/`src2` immutably at the same time. The
     /// two sources may alias each other. Returns `None` when an id is missing
     /// or `dst` aliases a source; callers then take a copying path. Unlike
-    /// [`Scene::bitmap_mut`] this does not bump [`Scene::revision`]: a
+    /// [`Scene::bitmap_mut`] this does not bump [`Scene::content_revision`]: a
     /// whole-subtree transition rewrites the same frame bitmap every tick
     /// without changing the scene graph.
     pub fn bitmap_mut_with_refs(
@@ -2354,9 +2410,9 @@ impl Scene {
     }
 
     /// Set the frame bitmap a whole-subtree transition draws, without
-    /// touching the composited content. Bumps [`Scene::revision`] only when
-    /// the id actually changes. The replaced bitmap is released once nothing
-    /// else references it.
+    /// touching the composited content. Bumps [`Scene::structure_revision`]
+    /// only when the id actually changes. The replaced bitmap is released
+    /// once nothing else references it.
     pub fn set_cache_bitmap(&mut self, id: u32, bitmap: Option<u32>) {
         let mut replaced = None;
         let changed = match self.layer_mut_untracked(id) {
@@ -2368,7 +2424,7 @@ impl Scene {
             _ => false,
         };
         if changed {
-            self.touch();
+            self.touch_structure();
             if let Some(old) = replaced {
                 self.release_bitmap(old);
             }
@@ -2376,11 +2432,11 @@ impl Scene {
     }
 
     /// Set the image drawn in place of this layer's own image, without
-    /// touching its subtree. Bumps [`Scene::revision`] and marks the layer's
-    /// cache and every caching ancestor's stale when the id actually changes;
-    /// a cache that already composited the previous source must not keep
-    /// showing it. The replaced bitmap is released once nothing else
-    /// references it.
+    /// touching its subtree. Bumps [`Scene::structure_revision`] and marks
+    /// the layer's cache and every caching ancestor's stale when the id
+    /// actually changes; a cache that already composited the previous source
+    /// must not keep showing it. The replaced bitmap is released once nothing
+    /// else references it.
     pub fn set_transition_self_image(&mut self, id: u32, bitmap: Option<u32>) {
         let mut replaced = None;
         let changed = match self.layer_mut_untracked(id) {
@@ -2393,16 +2449,16 @@ impl Scene {
         };
         if changed {
             self.invalidate_layer_cache(id);
-            self.touch();
+            self.touch_structure();
             if let Some(old) = replaced {
                 self.release_bitmap(old);
             }
         }
     }
 
-    /// Clear a bitmap's [`BitmapState::dirty`] flag without bumping
-    /// [`Scene::revision`]. Called by the projection after a texture upload;
-    /// the flag is backend bookkeeping, not a logical scene mutation.
+    /// Clear a bitmap's [`BitmapState::dirty`] flag without bumping either
+    /// revision. Called by the projection after a texture upload; the flag is
+    /// backend bookkeeping, not a scene change.
     pub fn set_bitmap_clean(&mut self, id: u32) -> bool {
         let index = self.bitmap_index.get(&id).copied();
         if let Some(index) = index
@@ -2436,7 +2492,7 @@ impl Scene {
             underline: false,
             angle: 0.0,
         });
-        self.touch();
+        self.touch_structure();
         id
     }
 
@@ -2457,7 +2513,7 @@ impl Scene {
         font.strikeout = false;
         font.underline = false;
         font.angle = 0.0;
-        self.touch();
+        self.touch_structure();
         true
     }
 

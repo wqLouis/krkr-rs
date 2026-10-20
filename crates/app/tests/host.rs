@@ -123,23 +123,25 @@ fn unchanged_revision_reuses_arena_and_mutation_reprojects() {
     assert!(projected_len > 1, "expected projected nodes");
     let snapshot = host.render_scene().clone();
 
-    // A frame with an unchanged revision reuses the persistent arena: the
-    // node buffer keeps its identity/capacity and the projection is untouched.
+    // A frame with an unchanged structural revision reuses the persistent
+    // arena: the node buffer keeps its identity/capacity and the projection is
+    // untouched.
     host.step(16.0).expect("step");
     assert_eq!(host.render_scene().nodes.len(), projected_len);
     assert_eq!(host.render_scene().nodes.as_ptr(), projected_ptr);
     assert_eq!(host.render_scene().nodes.capacity(), projected_capacity);
     assert_eq!(host.render_scene(), &snapshot);
 
-    // A direct field edit does not bump `Scene::revision`, so the projection
-    // is deliberately skipped (the documented over-approximation contract):
-    // an unchanged revision must not rebuild the render scene.
+    // A direct field edit does not bump `Scene::structure_revision`, so the
+    // projection is deliberately skipped (the documented over-approximation
+    // contract): an unchanged structural revision must not rebuild the render
+    // scene.
     host.scene_mut().layers[1].rect.w = 123;
     host.step(16.0).expect("step");
     assert_eq!(host.render_scene(), &snapshot);
 
-    // Any `*_mut` accessor bumps the revision, so the next frame reprojects
-    // and the new layer geometry reaches the render tree.
+    // Any `*_mut` accessor bumps the structural revision, so the next frame
+    // reprojects and the new layer geometry reaches the render tree.
     let background = host.scene().layers[0].id;
     if let Some(layer) = host.scene_mut().layer_mut(background) {
         layer.rect.w = 160;

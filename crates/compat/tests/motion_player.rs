@@ -1336,6 +1336,43 @@ fn the_layer_getter_is_a_motion_layer_getter_instance() {
     assert_eq!(env.eval_int("layerGetter.color[3]"), 255);
 }
 
+/// The getter hands out the same array on every read, so a write into it
+/// survives the next read
+/// (`reference/cpp/plugins/motionplayer/PlayerLayerQuery.cpp:48-71`).
+#[test]
+fn the_layer_getter_keeps_the_writes_into_its_arrays() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\";"
+    ));
+    env.run(
+        "var names = p.getLayerNames(); \
+         var layerLabel = \"\"; \
+         for (var i = 0; i < names.count; i++) { if (names[i] != \"\") { layerLabel = names[i]; break; } } \
+         var layerGetter = p.getLayerGetter(layerLabel);",
+    );
+    // The matrix keeps the write.
+    env.run("layerGetter.mtx[0] = 42.5;");
+    assert_eq!(env.eval_real("layerGetter.mtx[0]"), 42.5);
+    // So do the vertex list and the colour.
+    env.run("layerGetter.vtx[7] = -3.5;");
+    assert_eq!(env.eval_real("layerGetter.vtx[7]"), -3.5);
+    env.run("layerGetter.color[0] = 7;");
+    assert_eq!(env.eval_int("layerGetter.color[0]"), 7);
+    // A getter the script created on its own reports no array at all: the
+    // members hold no value until the player fills them in
+    // (`reference/cpp/plugins/motionplayer/SourceCache.h:239-253`).
+    env.run("var bare = new Motion.LayerGetter();");
+    assert_eq!(env.eval_str("typeof bare.mtx"), "void");
+    assert_eq!(env.eval_str("typeof bare.vtx"), "void");
+    assert_eq!(env.eval_str("typeof bare.color"), "void");
+}
+
 /// The color weight is read and written in the swapped channel order, so a
 /// non-gray value keeps its channels apart
 /// (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:24-27`, `:144-152`).

@@ -482,42 +482,117 @@ fn lookups_fall_back_correctly_when_natives_retain_directly() {
     assert_eq!(scene.window(win).unwrap().title, "a");
 }
 
+/// The two counters move independently: a structural change (window, layer,
+/// bitmap create/remove/resize) bumps `structure_revision` and leaves
+/// `content_revision` alone, a bitmap content write bumps `content_revision`
+/// and leaves `structure_revision` alone, and clearing the renderer's dirty
+/// flag bumps neither.
 #[test]
-fn revision_tracks_mutations_but_not_dirty_clear() {
+fn structure_and_content_revisions_track_their_own_mutations() {
     let mut scene = Scene::default();
-    let start = scene.revision();
+    let start = scene.structure_revision();
     let win = scene.add_window("t", (1, 1));
-    assert!(scene.revision() > start, "add_window bumps revision");
-    let layer = scene.add_layer(win, None);
-    let after_add = scene.revision();
-    scene.layer_mut(layer).unwrap().opacity = 0.5;
-    assert!(scene.revision() > after_add, "layer_mut bumps revision");
-    let bitmap = scene.add_bitmap(1, 1, vec![0; 4]);
-    let after_bitmap = scene.revision();
-    scene.set_bitmap_clean(bitmap);
-    assert_eq!(
-        scene.revision(),
-        after_bitmap,
-        "clearing the renderer dirty flag is not a logical mutation"
+    assert!(
+        scene.structure_revision() > start,
+        "add_window bumps the structural revision"
     );
-    let after_clean = scene.revision();
+    let layer = scene.add_layer(win, None);
+    let bitmap = scene.add_bitmap(1, 1, vec![0; 4]);
+
+    let structure = scene.structure_revision();
+    let content = scene.content_revision();
+    scene.bitmap_mut(bitmap).unwrap().mark_dirty();
+    assert_eq!(
+        scene.structure_revision(),
+        structure,
+        "a bitmap content write is not structural"
+    );
+    assert!(
+        scene.content_revision() > content,
+        "a bitmap content write bumps the content revision"
+    );
+
+    let content = scene.content_revision();
+    scene.layer_mut(layer).unwrap().opacity = 0.5;
+    assert!(
+        scene.structure_revision() > structure,
+        "layer_mut bumps the structural revision"
+    );
+    assert_eq!(
+        scene.content_revision(),
+        content,
+        "a layer write moves no pixels"
+    );
+
+    let second = scene.add_bitmap(1, 1, vec![0; 4]);
+    let structure = scene.structure_revision();
+    let content = scene.content_revision();
+    scene.set_bitmap_clean(second);
+    assert_eq!(
+        (scene.structure_revision(), scene.content_revision()),
+        (structure, content),
+        "clearing the renderer dirty flag is not a scene mutation"
+    );
+
+    scene.remove_bitmap(second);
+    assert!(
+        scene.structure_revision() > structure,
+        "remove_bitmap bumps the structural revision"
+    );
     scene.remove_layer(layer);
     assert!(
-        scene.revision() > after_clean,
-        "remove_layer bumps revision"
+        scene.structure_revision() > structure,
+        "remove_layer bumps the structural revision"
     );
+}
+
+/// A bitmap image replace that keeps the size moves only the content
+/// revision; one that changes the size is also structural, because the
+/// projection reads the dimensions through the layer's image size. The
+/// replace never claims script ownership: a script `Bitmap` sets that itself
+/// and a layer's own image stays layer-owned.
+#[test]
+fn replace_bitmap_image_splits_resize_from_content_and_keeps_ownership() {
+    let mut scene = Scene::default();
+    let id = scene.add_bitmap(1, 1, vec![0; 4]);
+
+    let structure = scene.structure_revision();
+    let content = scene.content_revision();
+    assert!(scene.replace_bitmap_image(id, 1, 1, vec![1; 4]));
+    assert_eq!(
+        scene.structure_revision(),
+        structure,
+        "a same-size replace does not change the drawn tree"
+    );
+    assert!(
+        scene.content_revision() > content,
+        "a same-size replace changes the pixels"
+    );
+    let bitmap = scene.bitmap(id).expect("the bitmap survives the replace");
+    assert!(bitmap.dirty, "a replaced image is dirty");
+    assert!(!bitmap.script_owned, "a replaced image is not script-owned");
+
+    let structure = scene.structure_revision();
+    assert!(scene.replace_bitmap_image(id, 2, 2, vec![1; 16]));
+    assert!(
+        scene.structure_revision() > structure,
+        "a resize is structural"
+    );
+    assert_eq!(scene.bitmap(id).expect("the bitmap").rgba.len(), 16);
+    assert!(!scene.replace_bitmap_image(9999, 2, 2, vec![0; 16]));
 }
 
 /// `bitmap_mut_with_source` borrows the write target and one read source at
 /// once, in either pool order, and refuses the bitmap it writes. It is a
-/// borrow accessor, not a content change: neither the revision nor the
-/// target's `content_generation` moves (the caller reports the write once).
+/// borrow accessor, not a content change: neither revision nor the target's
+/// `content_generation` moves (the caller reports the write once).
 #[test]
 fn bitmap_mut_with_source_splits_without_touching_the_revision() {
     let mut scene = Scene::default();
     let first = scene.add_bitmap(1, 1, vec![1; 4]);
     let second = scene.add_bitmap(1, 1, vec![2; 4]);
-    let revision = scene.revision();
+    let structure = scene.structure_revision();
+    let content = scene.content_revision();
 
     // Source after the target in the pool.
     {
@@ -541,7 +616,8 @@ fn bitmap_mut_with_source_splits_without_touching_the_revision() {
         "a composite never samples the bitmap it writes"
     );
     assert!(scene.bitmap_mut_with_source(first, 9999).is_none());
-    assert_eq!(scene.revision(), revision);
+    assert_eq!(scene.structure_revision(), structure);
+    assert_eq!(scene.content_revision(), content);
     assert_eq!(scene.bitmap(first).unwrap().content_generation, 0);
 }
 

@@ -243,12 +243,15 @@ pub struct Engine {
     pipeline: RenderPipeline,
     /// Layer tree owned by the engine.
     scene: Scene,
-    /// Projected render tree, rebuilt in place when [`Scene::revision`]
-    /// changes.
+    /// Projected render tree, rebuilt in place when
+    /// [`Scene::structure_revision`] changes.
     render_scene: RenderScene,
-    /// [`Scene::revision`] value `render_scene` was projected from.
+    /// [`Scene::structure_revision`] value `render_scene` was projected from,
+    /// or `None` when the projection must run regardless.
     ///
-    /// `None` until the first projection, so the first frame always projects.
+    /// `None` until the first projection, so the first frame always projects;
+    /// the presentation mapping and the texture table are the other two
+    /// projection inputs, and a change to either resets it to `None`.
     render_scene_revision: Option<u64>,
     /// Layer ids the latest projection emitted, including descendants covered
     /// by a cached ancestor.
@@ -472,7 +475,9 @@ impl Engine {
         self.prune_stale_textures();
         prune_ms += prune2_started.elapsed().as_secs_f64() * 1000.0;
         sync_ms += sync2_started.elapsed().as_secs_f64() * 1000.0;
-        if self.translation.is_some() && self.render_scene_revision != Some(self.scene.revision()) {
+        if self.translation.is_some()
+            && self.render_scene_revision != Some(self.scene.structure_revision())
+        {
             let project2_started = Instant::now();
             self.reproject_render_scene();
             project_ms += project2_started.elapsed().as_secs_f64() * 1000.0;
@@ -600,22 +605,25 @@ impl Engine {
         Ok(event)
     }
 
-    /// Rebuilds [`Engine::render_scene`] when the layer tree is stale.
+    /// Rebuilds [`Engine::render_scene`] when the layer tree's structure or
+    /// the presentation mapping is stale.
     ///
-    /// The projection is skipped while [`Scene::revision`] is unchanged, so a
-    /// static tree does not reallocate the render tree every frame. A rebuild
-    /// reuses the existing arena: the node list is cleared (retaining its
-    /// capacity) and refilled, so only the projected nodes' own allocations
-    /// are touched. The revision is `None` until the first projection, so the
-    /// first frame always projects.
+    /// The projection is skipped while [`Scene::structure_revision`] is
+    /// unchanged, so a static tree does not reallocate the render tree every
+    /// frame and a bitmap content write — which moves no node — does not
+    /// re-project at all. A rebuild reuses the existing arena: the node list
+    /// is cleared (retaining its capacity) and refilled, so only the
+    /// projected nodes' own allocations are touched. The revision is `None`
+    /// until the first projection, so the first frame always projects.
     ///
     /// The tree is projected in VM pixels and then translated into device
-    /// pixels, which is why a changed presentation also invalidates it. The
-    /// overlay is attached after the translation because it is already in
-    /// device coordinates. Nothing is rebuilt while the two sizes cannot be
-    /// fitted; the frame path draws nothing in that case.
+    /// pixels, which is why a changed presentation also invalidates it (via
+    /// `render_scene_revision = None`). The overlay is attached after the
+    /// translation because it is already in device coordinates. Nothing is
+    /// rebuilt while the two sizes cannot be fitted; the frame path draws
+    /// nothing in that case.
     fn reproject_render_scene(&mut self) {
-        let revision = self.scene.revision();
+        let revision = self.scene.structure_revision();
         if self.render_scene_revision == Some(revision) {
             return;
         }
@@ -920,6 +928,12 @@ impl Engine {
                 match create_texture(&self.pipeline, TextureDesc::new(width, height)) {
                     Ok(texture) => {
                         self.textures.insert(id, texture);
+                        // The projection resolves its textures through this
+                        // table: a bitmap that had no texture when it was last
+                        // projected now has one, so the node it was skipped
+                        // for must be projected again even when the tree's
+                        // structure is unchanged.
+                        self.render_scene_revision = None;
                     }
                     Err(error) => {
                         log::warn!("failed to create a texture for bitmap #{id}: {error}");

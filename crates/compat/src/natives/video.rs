@@ -85,7 +85,10 @@ pub trait VideoSource {
 
     /// The decoded frame at `at_ms` for `path`, or `None` when the host has no
     /// frame for that position.
-    fn frame_at(&mut self, path: &str, at_ms: i64) -> Option<RgbaFrame>;
+    ///
+    /// The frame is shared with the decoder, so the caller does not copy its
+    /// pixels.
+    fn frame_at(&mut self, path: &str, at_ms: i64) -> Option<Arc<RgbaFrame>>;
 
     /// The decoded audio track for `path`.
     ///
@@ -132,7 +135,7 @@ impl VideoSource for BufferedSource {
         Some(self.spec)
     }
 
-    fn frame_at(&mut self, _path: &str, at_ms: i64) -> Option<RgbaFrame> {
+    fn frame_at(&mut self, _path: &str, at_ms: i64) -> Option<Arc<RgbaFrame>> {
         let mut chosen = self.frames.first()?;
         for frame in &self.frames {
             if frame.pts_ms as i64 <= at_ms {
@@ -141,7 +144,7 @@ impl VideoSource for BufferedSource {
                 break;
             }
         }
-        Some(chosen.clone())
+        Some(Arc::new(chosen.clone()))
     }
 }
 
@@ -2595,9 +2598,10 @@ pub fn video_advance(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
             if !slot.overlay.is_open() {
                 continue;
             }
-            present(&mut source, slot);
             slot.overlay.advance(dt_ms);
             slot.follow_audio(services);
+            // The frame is fetched once, after the clock moved, so the picture
+            // belongs to the position the overlay is at.
             present(&mut source, slot);
             slot.sync_audio(services, frame_resync(&slot.overlay));
             composite_overlay(ctx, slot);
@@ -2629,6 +2633,8 @@ pub(crate) fn frame_resync(overlay: &VideoOverlay) -> Resync {
 }
 
 /// Present the host frame at the overlay's current position, if any.
+///
+/// The frame is shared with the host, so presenting it copies no pixels.
 fn present(source: &mut Option<Box<dyn VideoSource>>, slot: &mut VideoSlot) {
     let Some(source) = source.as_mut() else {
         return;

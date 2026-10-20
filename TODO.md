@@ -30,7 +30,7 @@ Every item was verified against the tree.
 4. **Android device verification** (§14) — one real title run with its log
    captured is the release condition (D36).
 5. **Native plugin coverage** (§10) — 35 of 53 plugin names unemulated — and the
-   **comments-gate debt** (§15): 4127 baseline entries, four unsafe-note files.
+   **comments-gate debt** (§15): 4126 baseline entries, four unsafe-note files.
 6. **L3 behavioural audit** (§11) — the emulation lives in L3, and the current
    motion/transition defects show that surface lock, arity/parity and the
    static gates cannot see semantic loss (timeline evaluation, transition
@@ -313,7 +313,7 @@ an allowlist exemption.
 
 * **Citation and history baseline.** Pre-existing findings live in
   `scripts/allowlists/house_style_baseline.txt` — JSON Lines keyed to the
-  normalized comment line, **4127 entries over 170 files** (4405 finding sites).
+  normalized comment line, **4126 entries over 170 files** (4403 finding sites).
   The baseline is **debt**: burn it down in file batches, largest first
   (`compat/src/natives/sound.rs` 247, `engine/src/scene.rs` 153,
   `compat/.../player_members.rs` 150, `system.rs` 131), deleting each entry as

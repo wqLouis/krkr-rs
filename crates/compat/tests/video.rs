@@ -9,7 +9,7 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use api::error::MediaError;
 use api::media::{AudioSpec, DecodedAudio, RgbaFrame, VideoSpec};
@@ -909,7 +909,7 @@ impl compat::VideoSource for AudioSource {
         Some(self.spec)
     }
 
-    fn frame_at(&mut self, _path: &str, at_ms: i64) -> Option<RgbaFrame> {
+    fn frame_at(&mut self, _path: &str, at_ms: i64) -> Option<Arc<RgbaFrame>> {
         let mut chosen = self.frames.first()?.clone();
         for frame in &self.frames {
             if frame.pts_ms as i64 <= at_ms {
@@ -918,7 +918,7 @@ impl compat::VideoSource for AudioSource {
                 break;
             }
         }
-        Some(chosen)
+        Some(Arc::new(chosen))
     }
 
     fn audio(&mut self, _path: &str) -> Result<Option<Arc<DecodedAudio>>, MediaError> {
@@ -1227,4 +1227,110 @@ fn the_picture_follows_the_sound() {
     // behind it: the sound of the frame being rendered has not reached the
     // mixer yet.
     assert_eq!(env.eval_int("v.position"), 150);
+}
+
+/// A playing overlay asks the host for one frame per pump and shares that
+/// frame with the composite.
+///
+/// The frame the decoder produced is handed on as the same buffer, so the
+/// overlay and the composite read one allocation instead of copying the
+/// picture, and the layer shows the frame's pixels.
+#[test]
+fn a_playing_overlay_shares_one_frame_per_pump() {
+    struct CountingSource {
+        spec: VideoSpec,
+        frame: Arc<RgbaFrame>,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl compat::VideoSource for CountingSource {
+        fn spec(&self, _path: &str) -> Option<VideoSpec> {
+            Some(self.spec)
+        }
+
+        fn frame_at(&mut self, _path: &str, _at_ms: i64) -> Option<Arc<RgbaFrame>> {
+            *self.calls.lock().expect("the counter is not poisoned") += 1;
+            Some(Arc::clone(&self.frame))
+        }
+    }
+
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.name = 'video'; l.visible = true;",
+    );
+    let frame = Arc::new(solid_frame([255, 0, 0, 255]));
+    let calls = Arc::new(Mutex::new(0usize));
+    let ctx = env.host.ctx().expect("bound context");
+    compat::set_video_source(
+        &ctx,
+        Box::new(CountingSource {
+            spec: movie_spec(),
+            frame: Arc::clone(&frame),
+            calls: Arc::clone(&calls),
+        }),
+    );
+    env.run(
+        "var v = new VideoOverlay(new Window()); v.mode = 1; v.layer1 = l; \
+         v.open('movie.mpg'); v.play();",
+    );
+
+    for _ in 0..3 {
+        compat::video_advance(&ctx, 50.0).expect("advance");
+    }
+
+    assert_eq!(
+        *calls.lock().expect("the counter is not poisoned"),
+        3,
+        "the overlay must ask for one frame per pump"
+    );
+    assert!(
+        Arc::strong_count(&frame) >= 3,
+        "the overlay must share the frame's allocation, not copy it: {} holders",
+        Arc::strong_count(&frame)
+    );
+    assert_eq!(env.bitmap_color("video", 1, 1), [255, 0, 0, 255]);
+}
+
+/// The overlay fires `onFrameUpdate` from the first pump on, once per pump
+/// that reaches a new frame.
+///
+/// The reference fires the event when a picture has been decoded
+/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:621`), so the first
+/// decoded picture fires it too. The fixture is 10 fps, so a pump has to
+/// span a frame interval (100 ms) for the picture to change.
+#[test]
+fn the_overlay_fires_on_frame_update_from_the_first_pump() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.name = 'video'; l.visible = true; \
+         var updates = 0; \
+         var v = new VideoOverlay(new Window()); v.mode = 1; v.layer1 = l; \
+         v.onFrameUpdate = function() { updates++; };",
+    );
+    env.host
+        .set_video_source(movie_spec(), vec![solid_frame([255, 0, 0, 255])]);
+    env.run("v.open('movie.mpg'); v.play();");
+
+    let ctx = env.host.ctx().expect("bound context");
+    for expected in 1..=3 {
+        compat::video_advance(&ctx, 100.0).expect("advance");
+        assert_eq!(
+            env.eval_int("updates"),
+            expected,
+            "pump {expected} must fire one frame update"
+        );
+    }
+
+    // A pump that stays inside the same frame delivers the picture that is
+    // already on screen, and that fires nothing.
+    compat::video_advance(&ctx, 50.0).expect("advance");
+    assert_eq!(
+        env.eval_int("updates"),
+        3,
+        "a pump inside one frame must fire no frame update"
+    );
 }

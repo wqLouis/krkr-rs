@@ -341,12 +341,7 @@ fn write_layer_pixels(scene: &mut Scene, layer_id: u32, width: u32, height: u32,
     let Some(bitmap_id) = ensure_bitmap(scene, layer_id, width, height) else {
         return;
     };
-    if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
-        bitmap.width = width;
-        bitmap.height = height;
-        bitmap.rgba = pixels;
-        bitmap.mark_dirty();
-    }
+    scene.replace_bitmap_image(bitmap_id, width, height, pixels);
     if let Some(layer) = scene.layer_mut(layer_id) {
         layer.bitmap = Some(bitmap_id);
         layer.image_modified = true;

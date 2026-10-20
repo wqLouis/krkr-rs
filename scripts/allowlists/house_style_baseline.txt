@@ -2720,7 +2720,6 @@
 {"path": "crates/compat/src/natives/visual/bitmap.rs", "rule": "reference-citation", "anchor": "/// handler accepts it (the reference `TVPGetSaveOption` then yields `void`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/bitmap.rs", "rule": "reference-citation", "anchor": "/// immediately (the reference's synchronous cache-hit path).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/bitmap.rs", "rule": "reference-citation", "anchor": "/// is still the reference's empty initial bitmap. Returns `(id, width,", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/visual/bitmap.rs", "rule": "reference-citation", "anchor": "/// reference `Bitmap.load` replaces the current image).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/bitmap.rs", "rule": "reference-citation", "anchor": "/// reference `TVPSaveAsBMP` reads the meta dictionary's `bpp` member", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/bitmap.rs", "rule": "reference-citation", "anchor": "/// reference's 32x32 transparent white initial bitmap, and a lone non-string", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/bitmap.rs", "rule": "reference-citation", "anchor": "/// resolve, mirroring the reference `TVPFindGraphicLoadHandler` order.", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3846,7 +3845,6 @@
 {"path": "crates/engine/src/video.rs", "rule": "reference-citation", "anchor": "/// a period event that had already passed (reference `vo_rewind`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/video.rs", "rule": "reference-citation", "anchor": "/// compositing opacity applied in that path (reference `SetMixingBitmap(dest,", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/video.rs", "rule": "reference-citation", "anchor": "/// mixing-layer opacity in `0.0..=1.0` (reference `opacity / 255`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/engine/src/video.rs", "rule": "reference-citation", "anchor": "/// presented (the caller-driven analogue of the reference's", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/video.rs", "rule": "reference-citation", "anchor": "/// reference `apply_open`.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/video.rs", "rule": "reference-citation", "anchor": "/// reference posts it with `TVP_EPT_IMMEDIATE`) use this instead of", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/video.rs", "rule": "reference-citation", "anchor": "/// the reference `ssPlay`/`ssStop`/`ssPause`/`ssUnload`.", "reason": "legacy comment, cleanup tracked in TODO §15"}

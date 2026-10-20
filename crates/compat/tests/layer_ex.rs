@@ -214,8 +214,13 @@ impl VideoSource for MovieSource {
         Some(self.spec)
     }
 
-    fn frame_at(&mut self, _path: &str, _at_ms: i64) -> Option<RgbaFrame> {
-        Some(RgbaFrame::new(4, 4, 0, [0u8, 255, 0, 255].repeat(16)))
+    fn frame_at(&mut self, _path: &str, _at_ms: i64) -> Option<Arc<RgbaFrame>> {
+        Some(Arc::new(RgbaFrame::new(
+            4,
+            4,
+            0,
+            [0u8, 255, 0, 255].repeat(16),
+        )))
     }
 }
 
@@ -861,7 +866,7 @@ impl compat::VideoSource for MovieAudioSource {
         Some(self.spec)
     }
 
-    fn frame_at(&mut self, _path: &str, at_ms: i64) -> Option<RgbaFrame> {
+    fn frame_at(&mut self, _path: &str, at_ms: i64) -> Option<Arc<RgbaFrame>> {
         let mut chosen = self.frames.first()?.clone();
         for frame in &self.frames {
             if frame.pts_ms as i64 <= at_ms {
@@ -870,7 +875,7 @@ impl compat::VideoSource for MovieAudioSource {
                 break;
             }
         }
-        Some(chosen)
+        Some(Arc::new(chosen))
     }
 
     fn audio(&mut self, _path: &str) -> Result<Option<Arc<DecodedAudio>>, MediaError> {
@@ -999,9 +1004,9 @@ fn movie_audio_decode_failure_raises() {
             Some(self.spec)
         }
 
-        fn frame_at(&mut self, _path: &str, at_ms: i64) -> Option<RgbaFrame> {
+        fn frame_at(&mut self, _path: &str, at_ms: i64) -> Option<Arc<RgbaFrame>> {
             let _ = at_ms;
-            self.frames.first().cloned()
+            self.frames.first().cloned().map(Arc::new)
         }
 
         fn audio(&mut self, _path: &str) -> Result<Option<Arc<DecodedAudio>>, MediaError> {
@@ -1042,9 +1047,9 @@ impl compat::VideoSource for PathRecordingSource {
         Some(self.spec)
     }
 
-    fn frame_at(&mut self, _path: &str, at_ms: i64) -> Option<RgbaFrame> {
+    fn frame_at(&mut self, _path: &str, at_ms: i64) -> Option<Arc<RgbaFrame>> {
         let _ = at_ms;
-        self.frames.first().cloned()
+        self.frames.first().cloned().map(Arc::new)
     }
 }
 

@@ -11,6 +11,11 @@ use testkit::tiny_wav_mono;
 /// (`crates/platform/media/tests/assets/sine_440hz_0.2s.ogg`, ~4 KB).
 const OGG_SINE: &[u8] = include_bytes!("assets/sine_440hz_0.2s.ogg");
 
+/// The committed MP4/AAC fixture: an `ffmpeg -c:a aac` encode of a 440 Hz
+/// sine tone, 0.5 s long, 44.1 kHz mono
+/// (`crates/platform/media/tests/assets/sine_440hz_0.5s.m4a`, ~5 KB).
+const MP4_AAC_SINE: &[u8] = include_bytes!("assets/sine_440hz_0.5s.m4a");
+
 /// Frames a 0.2 s 44.1 kHz stream should decode to; vorbis encoder delay and
 /// the final granule may shift the count by a few dozen samples either way.
 const OGG_FRAMES: std::ops::RangeInclusive<u64> = 8_600..=9_100;
@@ -195,4 +200,65 @@ fn garbage_is_a_decode_error_not_a_panic() {
         decode_audio(&media, b"not audio", None),
         Err(MediaError::Decode { .. })
     ));
+}
+
+#[test]
+fn mp4_aac_fixture_probes_even_when_the_name_hint_is_wrong() {
+    let media = Media::new();
+    // A storage entry whose name says `.ogg` but whose content is an MP4
+    // must still be probed: the bytes decide the format, and a hint that
+    // sends the probe down the wrong path is retried without it.
+    for hint in [
+        Some("voice/len419_020.ogg"),
+        Some("ogg"),
+        Some(".ogg"),
+        None,
+    ] {
+        let spec = probe_audio(&media, MP4_AAC_SINE, hint)
+            .unwrap_or_else(|error| panic!("probe with hint {hint:?} failed: {error}"));
+        assert_eq!(spec.sample_rate, 44_100, "hint {hint:?}");
+        assert_eq!(spec.channels, 1, "hint {hint:?}");
+    }
+}
+
+#[test]
+fn mp4_aac_fixture_decodes_to_audible_samples() {
+    let media = Media::new();
+    let decoded = decode_audio(&media, MP4_AAC_SINE, Some("voice.ogg")).expect("decode mp4");
+    assert_eq!(decoded.spec.sample_rate, 44_100);
+    assert_eq!(decoded.spec.channels, 1);
+    // 0.5 s at 44.1 kHz; the AAC encoder's priming adds a frame and the
+    // final padding shifts the count, so the band is generous.
+    let frames = decoded.frame_count();
+    assert!(
+        (20_000..=24_000).contains(&frames),
+        "0.5 s at 44.1 kHz is ~22050 frames, got {frames}"
+    );
+    let peak = decoded
+        .interleaved
+        .iter()
+        .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+    assert!(peak > 0.1, "expected audible samples, peak was {peak}");
+    assert!(decoded.interleaved.iter().all(|sample| sample.is_finite()));
+}
+
+#[test]
+fn mp4_aac_streaming_read_matches_whole_file() {
+    let media = Media::new();
+    let whole = decode_audio(&media, MP4_AAC_SINE, Some("voice.ogg")).expect("whole decode");
+    let (_spec, mut state) =
+        open_audio(&media, Arc::from(MP4_AAC_SINE), Some("voice.ogg")).expect("open stream");
+
+    let mut all = Vec::new();
+    let mut chunk = vec![0.0f32; 256];
+    loop {
+        match read_audio(&media, &mut state, &mut chunk) {
+            Ok(0) => break,
+            Ok(written) => all.extend_from_slice(&chunk[..written]),
+            Err(MediaError::EndOfStream) => break,
+            Err(error) => panic!("stream read failed: {error}"),
+        }
+    }
+    assert!(!all.is_empty());
+    assert_eq!(all.len(), whole.interleaved.len());
 }
