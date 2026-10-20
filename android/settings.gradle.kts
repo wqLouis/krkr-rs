@@ -1,4 +1,4 @@
-// krkr-rs Android app (experimental). See docs/android.md.
+// krkr-rs Android app (experimental). See docs.old/android.md.
 //
 // arm64-v8a only — the engine ships a single ABI, and there is no x86_64
 // build for emulators yet.

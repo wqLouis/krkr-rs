@@ -16,7 +16,7 @@ import com.google.androidgamesdk.GameActivity
  * meta-data in the manifest). It derives from `AndroidAppCompat`, so unlike
  * `NativeActivity` it is an ordinary `AppCompatActivity` and could host a
  * Compose view hierarchy — that is why the engine uses this backend
- * (`docs/android.md` §1).
+ * (`docs.old/android.md` §1).
  *
  * The engine needs to know which folder to mount before its `android_main`
  * runs, and the only channel that exists at that point is a JNI read of this

@@ -1,4 +1,4 @@
-// Top-level Gradle build. See docs/android.md.
+// Top-level Gradle build. See docs.old/android.md.
 //
 // Versions are the latest stable as published (AGP 9.4.0, Kotlin 2.4.20), which
 // is what supports `compileSdk = 37` in app/build.gradle.kts. They are pinned

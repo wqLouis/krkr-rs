@@ -1,6 +1,7 @@
 # krkr-rs — Android frontend
 
-Experimental. See **[`docs/android.md`](../docs/android.md)** for the full design,
+Experimental. The current code map is **[`docs/code/android/`](../docs/code/android/README.md)**;
+the archived **[`docs.old/android.md`](../docs.old/android.md)** carries the full design,
 the reasoning behind each decision, the milestones and the open questions. This
 README is just how to build it.
 
@@ -19,7 +20,7 @@ The engine is Rust. It is **not** built by Gradle: `cargo ndk` produces
 `app/src/main/jniLibs/arm64-v8a/` and loaded by `KrkrGameActivity`.
 
 The library of picked folders is persisted as JSON in the app's private files
-directory (`filesDir/games.json`) — see `GameLibrary.kt` and `docs/android.md`
+directory (`filesDir/games.json`) — see `GameLibrary.kt` and `docs.old/android.md`
 §3.1. It exists so a folder only ever has to be found once.
 
 This is **Android-app state only**. The engine itself takes a game directory and
@@ -30,7 +31,7 @@ app is simply a UI in front of the same "run this directory" entry point.
 
 **`arm64-v8a` only** — by decision, so there is no emulator (x86_64) build.
 **Landscape-locked**, and storage uses `MANAGE_EXTERNAL_STORAGE` because the app
-is side loaded (docs/android.md §4).
+is side loaded (docs.old/android.md §4).
 
 ## Building
 
@@ -48,7 +49,7 @@ cd android && gradle assembleDebug
 > **Rebuilt composition root.** `crates/android` is again the `krkr_android`
 > cdylib (`android_main` plus its `build-android.sh`); it drives the shared
 > `app::Host`/`app::GameHost` from the `android-activity` `GameActivity` loop
-> (`docs/android.md` §2.1). The commands above still require the Android SDK
+> (`docs.old/android.md` §2.1). The commands above still require the Android SDK
 > and NDK, which are not part of the desktop build.
 
 `gradle assembleDebug` rather than `./gradlew`: the repository has no Gradle
@@ -89,21 +90,21 @@ inherited from the old Bevy architecture and partially rebuilt:
 |---|---|
 | Compose M3 launcher + SAF picker + JSON library (`games.json`) | present (inherited); not compiled on this branch |
 | Engine composition root (`crates/android`, cdylib + `android_main`) | **present** — reads the Activity's JNI fields, writes `krkr_state.json`, drives the host |
-| Android event loop | driven by `crates/android` through `android-activity`; `platform::run` stays the desktop (winit) driver (`docs/android.md` §2.1) |
-| L1 Android window (`platform::PlatformWindow`) | real `ANativeWindow` wrapper + raw handle + size/density; compiles for `aarch64-linux-android` (`docs/android.md` §2.1) |
+| Android event loop | driven by `crates/android` through `android-activity`; `platform::run` stays the desktop (winit) driver (`docs.old/android.md` §2.1) |
+| L1 Android window (`platform::PlatformWindow`) | real `ANativeWindow` wrapper + raw handle + size/density; compiles for `aarch64-linux-android` (`docs.old/android.md` §2.1) |
 | Android input translation (`PhysicalKey`/`TouchPhase`/`MouseButton`) | implemented and host-tested in `crates/platform/platform/src/android.rs`, consumed by the composition root's loop |
 | MediaCodec video backend | `crates/platform/media` has a compile-checked backend; never run on a device |
 | Gradle `assembleDebug` verified locally | not on this branch |
 | CI workflow (`.github/workflows/android.yml`) | inherited; runs only on the `android` branch and tags |
 
-Known unverified pieces are listed honestly in `docs/android.md` §2 and §6 rather
+Known unverified pieces are listed honestly in `docs.old/android.md` §2 and §6 rather
 than assumed to work.
 
 ## Permissions
 
 `MANAGE_EXTERNAL_STORAGE` is declared because the engine's storage layer is
 path-based and the games live in shared storage, while SAF hands out
-`content://` URIs. This is option A in `docs/android.md` §4 and is the **decided**
+`content://` URIs. This is option A in `docs.old/android.md` §4 and is the **decided**
 approach, since the app is side loaded and Google Play's policy on that
 permission does not apply. All URI→path logic lives in `SafPaths.kt` so the
 resolution behaviour is in one place.

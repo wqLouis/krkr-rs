@@ -12,7 +12,7 @@ import java.io.File
  *
  * [uri] is the SAF tree URI — the **durable identity** of the folder, and the
  * handle the persisted URI permission is granted against. [path] is the
- * filesystem path the engine is actually handed (`docs/android.md` §4). It is
+ * filesystem path the engine is actually handed (`docs.old/android.md` §4). It is
  * a cache of [SafPaths.resolve] for diagnostics and for the case where the URI
  * no longer resolves; resolving is pure string work, so a launch prefers the
  * fresh path and treats this one as a fallback. It is nullable because a

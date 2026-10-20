@@ -1,4 +1,4 @@
-# Android APK build for the experimental Android target (see docs/android.md).
+# Android APK build for the experimental Android target (see docs.old/android.md).
 #
 # Triggers: **`android-*` tags**. The tag name carries the branch, so the
 # filter does the whole job natively — no gate job, no ancestry check:
@@ -17,7 +17,7 @@
 #
 # Scope: `arm64-v8a` only, release build. No other ABIs, no emulator, no real
 # signing key (the APK is signed with the debug key so it installs — see
-# docs/android.md §1).
+# docs.old/android.md §1).
 #
 # The commands here mirror a build that was run by hand and verified end to end
 # on a development machine (94 MB APK from a 71 MB engine .so); the orchestrations

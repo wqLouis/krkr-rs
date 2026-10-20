@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  krkr-rs Android manifest (experimental). See docs/android.md.
+  krkr-rs Android manifest (experimental). See docs.old/android.md.
 
   Two activities:
     * MainActivity       — the Material 3 launcher (game library + SAF picker)
     * KrkrGameActivity   — hosts the engine surface (AGDK GameActivity)
 
   MANAGE_EXTERNAL_STORAGE is requested because the engine's storage layer is
-  path-based and the games' XP3 archives live in shared storage (docs/android.md
+  path-based and the games' XP3 archives live in shared storage (docs.old/android.md
   §4, option A). It is a Play-policy-restricted permission, acceptable for the
   current sideloaded/experimental scope; the policy-clean alternative is a
   SAF-backed storage backend (option B).

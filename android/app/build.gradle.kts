@@ -40,7 +40,7 @@ android {
         versionName = "1.0.0"
 
         ndk {
-            // arm64-v8a only, by decision (docs/android.md §1). Adding an ABI
+            // arm64-v8a only, by decision (docs.old/android.md §1). Adding an ABI
             // here requires a matching build for it (`crates/android/
             // build-android.sh` currently hardcodes arm64-v8a), otherwise the
             // APK ships without a `.so` for it and crashes at launch.

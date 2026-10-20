@@ -201,17 +201,15 @@ mod android_entry {
             runtime.debug_overlay,
             log_level.as_filter()
         );
+        let frame_interval = Duration::from_secs_f64(runtime.frame_rate_limit.period_secs());
         let handler = host::AndroidHost::new(
             BackendKind::Vulkan,
             game_dir,
             runtime.preload_archives,
             runtime.debug_overlay,
+            frame_interval,
         );
-        let outcome = host::run_loop(
-            app,
-            handler,
-            Duration::from_secs_f64(runtime.frame_rate_limit.period_secs()),
-        );
+        let outcome = host::run_loop(app, handler, frame_interval);
 
         // The terminal write reports a recorded failure, or a clean stop when
         // the loop recorded none; a later `stopped` must never erase a failure.

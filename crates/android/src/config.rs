@@ -161,7 +161,7 @@ mod tests {
         // The reference frame-rate default is 60 fps
         // (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`).
         // Archives are not preloaded, the shared built-in default
-        // (`docs/runtime-config.md` §2); the debug overlay is off by default.
+        // (`docs.old/runtime-config.md` §2); the debug overlay is off by default.
         let runtime = resolve_runtime_config(None, None, None).expect("defaults");
         assert_eq!(runtime.frame_rate_limit.fps(), 60);
         assert!(!runtime.preload_archives);
