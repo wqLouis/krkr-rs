@@ -4,10 +4,11 @@
 `$KRKR_TEST_GAME` (`data.xp3`, `patch.xp3`, loose `patch.tjs`).
 
 This file lists **only what is still open**, in priority order; a landed change
-is deleted from it and history is read with `git log`. Decisions live in
-`docs/migration/**`, the working rules in `AGENTS.md` and `scripts/README.md`,
-behaviour found correct in §17, and topic-to-doc pointers in `AGENTS.md` §11.
-Every item was verified against the tree.
+is deleted from it and history is read with `git log`. The current contract
+lives in `docs/arch/**` and `docs/rules/**`, the working rules in `AGENTS.md`
+and `scripts/README.md`, behaviour found correct in §17, and topic-to-doc
+pointers in `AGENTS.md` §11. The superseded design record and the read-only
+audits are archived in `docs.old/`. Every item was verified against the tree.
 
 ## 1. Priorities
 
@@ -18,14 +19,14 @@ Every item was verified against the tree.
    transition pumps. Remaining: move those pumps into L2, retire
    `SoundState.clock` for an L2-owned delta, add `Engine::run(clock, hooks)`,
    and privatize `TimerState::advance` (`engine/src/timer.rs`).
-   `docs/migration/07` phase 9.
-2. **Image decode scheduling.** A transition loads ~60 images serially on the VM
-   thread (~32 ms apart, ≈1.9 s end to end); a 6.77 s frame is the same sum of
-   synchronous decodes (`docs/audits/image-load-cost.md`). The decoded-image
-   cache is consulted on every load but disabled by the reference default
-   (`System.graphicCacheLimit = 0`), so the lever is scheduling: overlap
-   independent decodes on a worker pool handing results back to the VM thread
-   (the sound decode-ahead pattern), plus a per-frame budget.
+   `docs.old/migration/07` phase 9.
+2. **Deferred image decode pipeline — implemented, cleanup remains.** The L2
+   pending-image pool and the L3 load wiring are in the tree: `Layer.loadImages`
+   probes synchronously, queues the decode, and any pixel access or the frame
+   barrier waits for the future. The reference's synchronous `Layer.loadImages`
+   is preserved for no-pool hosts, colour-keyed and province loads. Remaining:
+   the full-suite failures and the deferred-cache/measurement limitations in
+   §18; the async-model docs are not yet reconciled.
 3. **The in-game menu form** (§5) — the largest compatibility blocker.
 4. **Android device verification** (§14) — one real title run with its log
    captured is the release condition (D36).
@@ -62,7 +63,7 @@ residuals:
 ## 3. Real-game reports
 
 1. **SIGSEGV while saving — open.** Of the four causes ranked in
-   `docs/audits/save-crash.md`, C2 remains: the serializer recurses without a
+   `docs.old/audits/save-crash.md`, C2 remains: the serializer recurses without a
    depth bound (`crates/tjs/cpp/tjs2/tjsArray.cpp:1161`,
    `tjsDictionary.cpp:642`; the cycle guard is the only guard). Close it by
    reproducing once and reading the decisive backtrace, not by guessing.
@@ -70,7 +71,7 @@ residuals:
    scaled and letterboxed, so the game need not change the framebuffer
    resolution and the declared script size stays what the script sees. Owed: the
    ground truth — what the title does when a resolution change is requested
-   (`docs/migration/11`).
+   (`docs.old/migration/11`).
 3. **A doubled save path is not root-caused.** One log shows `G//G/savedata/`,
    then a failed `…/savedata//savecheck` open. `System.exePath`, `personalPath`
    and `savedGamesPath` all return `TVPGetAppPath()` and only `dataPath` is
@@ -100,7 +101,7 @@ residuals:
 The reference draws its own popup: `MenuItem.popup` calls `TVPShowPopMenu` and
 returns `1` (`MenuItemImpl.cpp:309-315`), pushing the engine-drawn form at
 `InGameMenuForm.cpp:14-115` whose activation removes it and fires the item's
-`onClick`. Build that form behind L2 menu state (`docs/audits/menu-popup.md`); a
+`onClick`. Build that form behind L2 menu state (`docs.old/audits/menu-popup.md`); a
 native OS popup would be a deliberate divergence, and Linux has nothing to call
 (the XDG portal has no menu interface).
 
@@ -150,7 +151,12 @@ native OS popup would be a deliberate divergence, and Linux has nothing to call
   keys into synthetic mouse events while it is on (`TVPWindow.cpp:648-707`).
   `Window.postInputEvent` dispatches to the first window and its focused layer
   instead of `this` window: right for single-window titles, wrong for
-  multi-window ones (`docs/audits/stub-inventory.md` §Remaining).
+  multi-window ones (`docs.old/audits/stub-inventory.md` §Remaining).
+* **HE-AAC decode is unverified end to end.** The built-in decoder has no SBR
+  synthesis, so an HE-AAC track is handed to the platform backend (FFmpeg on
+  Linux, MediaCodec on Android). There is no committed HE-AAC fixture — the
+  test game's HE-AAC voice track is not committed — so the SBR band is
+  unverified here, and the Android path has never run on a device.
 * **Input imprecisions** needing a decision or a source: click/double-click
   timing (30 frames, double on the second **release**, where Windows fires on
   the press); `onTouchScaling`/`onTouchRotate` never synthesized; layer-native
@@ -248,7 +254,7 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
 * **`unsafe impl Send + Sync for Tjs2Engine` is unsound as a public API**
   (`crates/tjs/src/lib.rs`) — two engines race process-global VM state — and
   nothing requires the bounds. Remove them and let the compiler name any caller
-  (`docs/vm-defects.md` GLO-1 / LIFE-2).
+  (`docs.old/vm-defects.md` GLO-1 / LIFE-2).
 * **`compileStorage` does not round-trip a `+=` or `++` statement.** The
   writer's `TranslateCodeAddress` registers only the base opcode of each
   arithmetic family, so `VM_ADDPD`/`VM_ADDPI`/`VM_ADDP` and the
@@ -258,8 +264,8 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   the reconstruction match itself, not the reference (AGENTS §2). **Open
   question:** does the shipped engine share the snapshot's incomplete export
   table? Settle it with a `.tjsb` from a shipped writer containing a `+=`-family
-  or `++`/`--` statement. `docs/audits/bytecode-scripts.md` §5,
-  `docs/vm-defects.md` BLK-3.
+  or `++`/`--` statement. `docs.old/audits/bytecode-scripts.md` §5,
+  `docs.old/vm-defects.md` BLK-3.
 
 ## 13. GPU memory
 
@@ -297,12 +303,12 @@ run on a machine that has one; anything not compiled is documented as unverified
   use `forkunion`'s `portable` feature and record the result.
 * **Platform and launcher gaps.** Nothing handles audio focus, pause/resume or
   losing focus, and surface recreation restarts the game from scratch
-  (`docs/audits/android-jni-review.md` F5). No drift guard exists between the
+  (`docs.old/audits/android-jni-review.md` F5). No drift guard exists between the
   Kotlin option constants (`RuntimeOptions` in `android/.../RuntimeSettings.kt`)
   and the Rust ones (`crates/platform/api/src/config.rs`). The drag-slop
   threshold is a fixed 16 px where the reference scales by DPI, and the launcher
   UI is hardcoded English: `strings.xml` holds only `app_name`, with no
-  `values-zh` (`docs/audits/android-ui-review.md` F5).
+  `values-zh` (`docs.old/audits/android-ui-review.md` F5).
 
 ## 15. Comments-gate debt
 
@@ -322,27 +328,34 @@ an allowlist exemption.
   `scripts/allowlists/layering_allow.txt` now baselines four files; each still
   carries the debt: `compat/.../motion_player/{emote,helpers,player_members}.rs`
   and `natives/scripts.rs`. Write a real safety argument per block (AGENTS §5;
-  `docs/audits/unsafe-inventory.md` §2.6).
+  `docs.old/audits/unsafe-inventory.md` §2.6).
 
 ## 16. Deferred design work
 
-* **TJS VM in Rust** (`docs/migration/08` §10.7) **and `streams.cpp` as a thin
+* **TJS VM in Rust** (`docs.old/migration/08` §10.7) **and `streams.cpp` as a thin
   C++ adapter over it** — both deferred. `streams.cpp` is the only port-authored
   C++ besides the ABI boundary, and every save-path memory-safety defect was in
   it.
+* **Generic L2 shader loading for all-shader transitions.** The public API is
+  a generic shader/pipeline loader in `engine` (shader binary, pipeline
+  descriptor, bindings, uniforms), not a transition-specific effect API. L3
+  loads/selects shaders and supplies parameters through `engine_api`; L1 keeps
+  only the backend mechanism and is never named by L3. The CPU transition path
+  remains the null/headless implementation and the pixel oracle. This replaces
+  the interim two-texture composition.
 * **A GPU text path and an L3 render-target surface.** `RenderContent::Glyphs`
   is rejected by both renderers, `supports_glyph_atlas` is false everywhere, and
   `create_render_target`/`read_render_target` are plumbed by neither `engine`
   nor `compat`, so `D3DAdaptor.captureCanvas` cannot copy a rendered texture
   into its layer. Text stays CPU-rasterized into the layer bitmap (D34);
-  `docs/optimization.md`.
+  `docs.old/optimization.md`.
 * **Zero-copy image presentation** — uploads use a host-visible staging buffer;
   the surface path needs `AMediaCodec_getOutputImage`, which `ndk` lacks.
 * **C++ `-O2 -flto`** — 89.5% compile / 92.5% exec of `-O2` on the
   `scripts/perf/` harness, but the objects become LLVM bitcode and only the
   Android link validates it, so it needs a device A/B. `-O3`,
   `-fvisibility=hidden` and `mimalloc` were measured and rejected
-  (`docs/performance.md` §7).
+  (`docs.old/performance.md` §7).
 
 ## 17. Verified — do not re-open
 
@@ -369,8 +382,40 @@ new evidence.
   `PhaseVocoder.__TvpPhaseVocoder`; `docs/native_parity.md`) — but 100% parity
   is not behaviour coverage (§6 C14, §9 PN8).
 * **`VideoOverlay` frames** composite into `layer1`/`layer2`; start-up cost is
-  measurable per script, native and phase (`docs/startup-attribution.md`).
+  measurable per script, native and phase (`docs.old/startup-attribution.md`).
 * **The error-handling scan over-reports by design** (it cannot tell a `Result`
   receiver from an `Option` one); a site with no
   `scripts/allowlists/error_handling_allow.txt` entry fails the gate. Startup
   slowness on the game mount is environmental (FUSE), not code.
+
+
+## 18. Image-pipeline leftovers
+
+The deferred image pool and its L3 wiring are committed. Targeted tests are
+green: core `imagedecode` 13/13, `pending_image` 5/5, motion 42/42, media TLG
+parity 9/9, and the static gate. The full `cargo test --workspace` still has
+six failing targets; none is in the pending-image path itself:
+
+| target | failing tests | likely owner |
+|---|---|---|
+| `compat --lib` | `motion_player::player::tests::a_mesh_node_builds_its_grid_and_deforms_its_child` | the offscreen-offset fix changed the unit-test geometry expectation; verify the fixture or the test. |
+| `compat --test dispatch_ui` | 5 tests (`pad_properties...`, `system_statics...`, `window_ex_menu_item_flags...`, `window_ex_window_flags...`, `win32_dialog_message_box...`) | missing lazy plugin registration in the harness (`Pad`, `WIN32Dialog`, `enableNCMouseEvent`). |
+| `compat --test kag` | 7 `native_*` tests | same lazy plugin/registration gap in the KAG test harness. |
+| `compat --test wuvorbis` | `open_without_the_host_decoder_is_a_typed_error_not_silence` | expectation predates the current typed error text (`no audio decoder is installed`). |
+| `compat --test xp3_filter` | 8 tests | missing `exportFile`/plugin registration in the test harness after lazy registration. |
+| `compat --test xp3_filter_deferred` | `storage_attached_after_install_is_completed_before_startup` | same lazy registration (`exportFile` absent). |
+
+The deferred-image limitations that remain open:
+
+* A deferred decode is not inserted into the decoded-image cache; a repeated
+  load decodes again when `System.graphicCacheLimit` is enabled.
+* Colour-keyed and province loads stay synchronous.
+* `startup: images decoded` counts only synchronous decodes (the worker cannot
+  hold the current `Rc<Cell>` stats).
+* `layer_ex` plugin paths can read a pending bitmap's blank pixels; drawing is
+  safe because the frame barrier resolves first.
+* The async-model docs (`docs/arch/l2.md`, `docs/code/engine/scene.md`, the
+  pending-image contract) still describe the synchronous path and must be
+  reconciled with the deferred-error approximation.
+* The Android pacing code is applied but uncompiled (no NDK host); one NDK
+  build remains required.
