@@ -42,10 +42,21 @@
 //! single scalar shared by every channel and advanced once per frame, so a
 //! stereo underrun cannot shift the stereo image. Pre-fill keeps underruns
 //! rare; this only softens the one after a long stall.
+//!
+//! # Health
+//!
+//! The queue counts the **episodes** it sees: one underrun that holds the last
+//! sample for a hundred frames is one episode, and one overrun that drops a
+//! thousand samples is one episode. The counters live with the queue, inside
+//! the caller-owned state, so a caller can read a snapshot between frames and
+//! report a bad device. The device callback itself never logs: it only
+//! increments a counter.
 
 use std::collections::VecDeque;
 
 use api::error::AudioError;
+
+use crate::audio::AudioHealth;
 
 /// The most audio the queue may hold, in milliseconds.
 ///
@@ -88,6 +99,14 @@ pub(crate) struct AudioQueue {
     capacity: usize,
     /// Samples required before the device may start.
     prefill: usize,
+    /// Underrun episodes seen (a run of held samples).
+    underrun_episodes: u64,
+    /// Overrun episodes seen (a run of pushes that dropped samples).
+    overrun_episodes: u64,
+    /// Whether the queue is holding the last sample right now.
+    underrunning: bool,
+    /// Whether the last push dropped samples.
+    overrunning: bool,
     /// Interleaved samples per second, so the queue's depth reads as a time.
     #[cfg(any(feature = "platform-linux", target_os = "android"))]
     per_second: usize,
@@ -138,6 +157,10 @@ impl AudioQueue {
             samples: VecDeque::new(),
             capacity,
             prefill,
+            underrun_episodes: 0,
+            overrun_episodes: 0,
+            underrunning: false,
+            overrunning: false,
             #[cfg(any(feature = "platform-linux", target_os = "android"))]
             per_second,
             #[cfg(any(feature = "platform-linux", target_os = "android"))]
@@ -162,6 +185,12 @@ impl AudioQueue {
         if overflow > 0 {
             let drop_count = overflow.min(self.samples.len());
             self.samples.drain(..drop_count);
+            if !self.overrunning {
+                self.overrunning = true;
+                self.overrun_episodes = self.overrun_episodes.saturating_add(1);
+            }
+        } else {
+            self.overrunning = false;
         }
         self.samples.extend(pcm.iter().copied());
         self.prefilled()
@@ -170,6 +199,18 @@ impl AudioQueue {
     /// Whether the queue holds at least the pre-fill target.
     pub(crate) fn prefilled(&self) -> bool {
         self.samples.len() >= self.prefill
+    }
+
+    /// A snapshot of the queue's health counters.
+    ///
+    /// The counters count episodes, not samples: one underrun that holds the
+    /// last sample for a hundred frames is one episode.
+    pub(crate) fn health(&self) -> AudioHealth {
+        AudioHealth {
+            underrun_episodes: self.underrun_episodes,
+            overrun_episodes: self.overrun_episodes,
+            underrunning: self.underrunning,
+        }
     }
 
     /// How much audio is still buffered, in seconds.
@@ -196,6 +237,8 @@ impl AudioQueue {
         let sample = match self.samples.pop_front() {
             Some(sample) => {
                 self.last_frame[channel] = sample;
+                // Real audio resumes: the underrun episode is over.
+                self.underrunning = false;
                 if at_frame_start {
                     self.advance_gain(false);
                 }
@@ -204,6 +247,10 @@ impl AudioQueue {
             None => {
                 if at_frame_start {
                     self.advance_gain(true);
+                }
+                if !self.underrunning {
+                    self.underrunning = true;
+                    self.underrun_episodes = self.underrun_episodes.saturating_add(1);
                 }
                 self.last_frame[channel]
             }
@@ -250,6 +297,11 @@ mod tests {
     /// A small queue so the policy numbers stay small in assertions.
     fn queue() -> AudioQueue {
         AudioQueue::new(1_000, 1).expect("a 1 kHz mono queue is valid")
+    }
+
+    /// The queue's capacity in samples.
+    fn queue_capacity() -> usize {
+        1_000 * MAX_BUFFER_MS / 1_000
     }
 
     #[test]
@@ -305,7 +357,7 @@ mod tests {
     #[test]
     fn the_cap_drops_the_oldest_samples_first() {
         let mut queue = queue();
-        let capacity = 1_000 * MAX_BUFFER_MS / 1_000;
+        let capacity = queue_capacity();
         let ramp: Vec<f32> = (0..capacity).map(|i| i as f32).collect();
         queue.push(&ramp);
         assert_eq!(queue.samples.len(), capacity);
@@ -437,5 +489,100 @@ mod tests {
         let mut out = [0.0; 2];
         assert!(!queue.drain(&mut out));
         assert_eq!(out, [1.0, 2.0]);
+    }
+
+    #[test]
+    fn a_held_run_is_one_underrun_episode() {
+        // One underrun that holds the last sample for two hundred frames is
+        // one episode, not one per held sample: the counter is what a caller
+        // reports, and a per-sample count would drown the report.
+        let mut queue = queue();
+        queue.push(&[1.0]);
+        let mut held = vec![0.0; 200];
+        assert!(queue.drain(&mut held));
+
+        let health = queue.health();
+        assert_eq!(
+            health.underrun_episodes, 1,
+            "one episode, not one per sample"
+        );
+        assert!(health.underrunning, "the episode is still open");
+        assert_eq!(health.overrun_episodes, 0, "no audio was dropped");
+    }
+
+    #[test]
+    fn the_health_clears_when_real_samples_resume() {
+        let mut queue = queue();
+        queue.push(&[1.0]);
+        let mut held = vec![0.0; 50];
+        assert!(queue.drain(&mut held));
+        assert!(queue.health().underrunning, "the hold is still going");
+
+        queue.push(&[0.5; 10]);
+        let mut out = vec![0.0; 10];
+        assert!(!queue.drain(&mut out));
+
+        let health = queue.health();
+        assert!(!health.underrunning, "the resumed audio closes the episode");
+        assert_eq!(health.underrun_episodes, 1, "the episode is counted once");
+    }
+
+    #[test]
+    fn an_underrun_after_a_resume_is_a_second_episode() {
+        let mut queue = queue();
+        queue.push(&[1.0]);
+        let mut held = vec![0.0; 10];
+        assert!(queue.drain(&mut held));
+
+        queue.push(&[0.5; 10]);
+        let mut out = vec![0.0; 10];
+        assert!(!queue.drain(&mut out));
+
+        let mut held = vec![0.0; 10];
+        assert!(queue.drain(&mut held));
+        assert_eq!(queue.health().underrun_episodes, 2);
+    }
+
+    #[test]
+    fn a_dropping_run_is_one_overrun_episode() {
+        let mut queue = queue();
+        queue.push(&vec![0.0; queue_capacity()]);
+        assert_eq!(
+            queue.health().overrun_episodes,
+            0,
+            "the cap is reached but not exceeded"
+        );
+
+        queue.push(&[1.0, 2.0, 3.0]);
+        assert_eq!(queue.health().overrun_episodes, 1);
+
+        queue.push(&[4.0, 5.0]);
+        assert_eq!(
+            queue.health().overrun_episodes,
+            1,
+            "the episode is still open, so it is not counted again"
+        );
+    }
+
+    #[test]
+    fn an_overrun_after_the_queue_drains_is_a_second_episode() {
+        let mut queue = queue();
+        queue.push(&vec![0.0; queue_capacity()]);
+        queue.push(&[1.0]);
+        assert_eq!(queue.health().overrun_episodes, 1);
+
+        // The device consumes the queue, so the next push fits again and the
+        // episode ends.
+        let mut out = vec![0.0; queue_capacity()];
+        queue.drain(&mut out);
+        queue.push(&[2.0]);
+        assert_eq!(queue.health().overrun_episodes, 1, "the push fits again");
+
+        queue.push(&vec![3.0; queue_capacity()]);
+        assert_eq!(
+            queue.health().overrun_episodes,
+            2,
+            "a new episode is counted"
+        );
     }
 }

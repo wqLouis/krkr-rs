@@ -690,7 +690,8 @@ fn native_key_code(native: NativeKeyCode) -> u32 {
 /// until the queue reaches the pre-fill target, and an underrun holds the last
 /// sample while fading it to silence, then fades the resumed audio back in,
 /// rather than stepping to a hard zero (both policies live in
-/// [`crate::audio_queue`]).
+/// [`crate::audio_queue`]). The callback counts the queue's underrun and
+/// overrun episodes; [`health`] hands the counters to the caller.
 pub(crate) mod audio {
     use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -700,6 +701,7 @@ pub(crate) mod audio {
     use cpal::{FromSample, SampleFormat, SampleRate, SizedSample, StreamConfig};
 
     use crate::PlatformError;
+    use crate::audio::AudioHealth;
     use crate::audio_queue::AudioQueue;
 
     /// Immutable stream description chosen at open time.
@@ -719,8 +721,8 @@ pub(crate) mod audio {
     /// The output format used only when the device reports no usable
     /// configuration of its own.
     ///
-    /// This is a last resort, not the normal path: [`default_spec`] prefers the
-    /// device's own default (or the best 1–2 channel format it supports). 44.1
+    /// This is a last resort, not the normal path: [`default_spec`] picks the
+    /// best 1–2 channel format the device supports. 44.1
     /// kHz stereo is the KiriKiri/reference mix rate and the format every
     /// output device we target can render, so it is the safest thing to try
     /// when the device tells us nothing.
@@ -743,6 +745,12 @@ pub(crate) mod audio {
             })?;
         let supported = choose_config(&device, spec)?;
         let config = supported.config();
+        log::info!(
+            "audio: the output device is opened at {} Hz / {} channel(s) with {:?} samples",
+            config.sample_rate.0,
+            config.channels,
+            supported.sample_format()
+        );
         let queue = Arc::new(Mutex::new(AudioQueue::new(
             config.sample_rate.0,
             u32::from(config.channels),
@@ -806,6 +814,11 @@ pub(crate) mod audio {
         lock_queue(&state.queue).queued_seconds()
     }
 
+    /// A snapshot of the queue's health counters.
+    pub(crate) fn health(state: &StreamState) -> AudioHealth {
+        lock_queue(&state.queue).health()
+    }
+
     /// Returns the first available cpal host without panicking.
     fn open_host() -> Result<cpal::Host, PlatformError> {
         let id = cpal::available_hosts().into_iter().next().ok_or_else(|| {
@@ -822,39 +835,140 @@ pub(crate) mod audio {
     }
 
     /// Picks a supported config whose channels and sample rate match `spec`.
+    ///
+    /// The channels and the rate are the caller's: an explicitly requested
+    /// spec is honoured exactly. The *sample format* is the device's: among
+    /// the formats that carry the requested channels and rate, the one that
+    /// keeps the most of the mixer's signal is chosen, so a device that also
+    /// offers an eight-bit format is not driven at eight bits.
     fn choose_config(
         device: &cpal::Device,
         spec: AudioSpec,
     ) -> Result<cpal::SupportedStreamConfig, PlatformError> {
-        let wanted = SampleRate(spec.sample_rate);
-        let configs = device
+        let ranges: Vec<cpal::SupportedStreamConfigRange> = device
             .supported_output_configs()
             .map_err(|error| AudioError::Open {
                 message: error.to_string(),
-            })?;
-        for range in configs {
-            if u32::from(range.channels()) == spec.channels
-                && let Some(config) = range.try_with_sample_rate(wanted)
-            {
-                return Ok(config);
+            })?
+            .collect();
+        let formats: Vec<DeviceFormat> = ranges.iter().map(DeviceFormat::of).collect();
+        let Some(format) = best_format(&formats, spec) else {
+            return Err(unsupported_format(spec));
+        };
+        ranges
+            .iter()
+            .filter(|range| {
+                range.sample_format() == format && u32::from(range.channels()) == spec.channels
+            })
+            .find_map(|range| range.try_with_sample_rate(SampleRate(spec.sample_rate)))
+            .ok_or_else(|| unsupported_format(spec))
+    }
+
+    /// A device format the backend can choose from.
+    ///
+    /// The plain numbers describe what the device supports; the cpal range
+    /// they come from cannot be built outside cpal, so the choice is made on
+    /// this copy.
+    #[derive(Clone, Copy)]
+    struct DeviceFormat {
+        channels: u32,
+        min_rate: u32,
+        max_rate: u32,
+        format: SampleFormat,
+    }
+
+    impl DeviceFormat {
+        /// Copies a device's supported range.
+        fn of(range: &cpal::SupportedStreamConfigRange) -> Self {
+            Self {
+                channels: u32::from(range.channels()),
+                min_rate: range.min_sample_rate().0,
+                max_rate: range.max_sample_rate().0,
+                format: range.sample_format(),
             }
         }
-        Err(AudioError::Unsupported {
+
+        /// Whether the device offers this format at `spec`'s rate.
+        fn carries(&self, spec: AudioSpec) -> bool {
+            self.channels == spec.channels
+                && self.min_rate <= spec.sample_rate
+                && spec.sample_rate <= self.max_rate
+        }
+    }
+
+    /// Picks the sample format the device is driven at for `spec`.
+    ///
+    /// The requested channels and rate must be supported; among the formats
+    /// that support them the one with the best [`format_rank`] wins.
+    fn best_format(formats: &[DeviceFormat], spec: AudioSpec) -> Option<SampleFormat> {
+        let mut best: Option<(u8, SampleFormat)> = None;
+        for entry in formats {
+            if !entry.carries(spec) {
+                continue;
+            }
+            let Some(rank) = format_rank(entry.format) else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(current, _)| rank > *current) {
+                best = Some((rank, entry.format));
+            }
+        }
+        best.map(|(_, format)| format)
+    }
+
+    /// The error for a device that cannot play `spec` at all.
+    fn unsupported_format(spec: AudioSpec) -> PlatformError {
+        AudioError::Unsupported {
             message: format!(
                 "no {} Hz / {} channel output format on the default device",
                 spec.sample_rate, spec.channels
             ),
         }
-        .into())
+        .into()
+    }
+
+    /// Ranks a device sample format by the fidelity the mixer keeps.
+    ///
+    /// The mixer renders `f32`, so a float device needs no conversion at all
+    /// and an integer device of `n` bits quantizes the signal with a step of
+    /// `1 / 2^(n-1)`: more bits mean less quantisation noise. An eight-bit
+    /// format is the worst — converting a full-scale `f32` to `u8` truncates
+    /// the mantissa and keeps about 48 dB of signal-to-noise ratio — so it is
+    /// only chosen when the device offers nothing better.
+    ///
+    /// `None` means the backend cannot open a stream of that format, so the
+    /// format is never chosen.
+    fn format_rank(format: SampleFormat) -> Option<u8> {
+        let rank = match format {
+            SampleFormat::F32 => 9,
+            SampleFormat::F64 => 8,
+            SampleFormat::I64 => 7,
+            SampleFormat::U64 => 6,
+            SampleFormat::I32 => 5,
+            SampleFormat::U32 => 4,
+            SampleFormat::I16 => 3,
+            SampleFormat::U16 => 2,
+            SampleFormat::I8 => 1,
+            SampleFormat::U8 => 0,
+            // A packed 24-bit format has no stream type the backend can open,
+            // and a format added later is not opened either.
+            _ => return None,
+        };
+        Some(rank)
     }
 
     /// Returns the default output device's preferred format.
     ///
-    /// Prefers the device's own default config when it has 1–2 channels. If the
-    /// device will not report a default (or reports a multichannel layout the
-    /// mixer cannot consume), it picks the best supported 1–2 channel format;
-    /// only a device that reports nothing usable falls back to
-    /// [`FALLBACK_SPEC`].
+    /// The rate comes from the device's own supported rates: 48 kHz when the
+    /// device offers it, then 44.1 kHz, then the highest rate it offers. The
+    /// backends' own "default" rate is not used, because it is not the
+    /// device's native rate: the ALSA backend answers 44.1 kHz whenever the
+    /// device supports it, so a 48 kHz track would be resampled down in the
+    /// mixer and back up in the sound server.
+    ///
+    /// The channel count is the device's: stereo over mono, since the mixer
+    /// renders stereo. A device that reports no usable 1–2 channel format
+    /// falls back to [`FALLBACK_SPEC`].
     pub(crate) fn default_spec() -> Result<AudioSpec, PlatformError> {
         let host = open_host()?;
         let device = host
@@ -862,33 +976,24 @@ pub(crate) mod audio {
             .ok_or_else(|| AudioError::DeviceUnavailable {
                 message: "no default output device".to_owned(),
             })?;
-        match device.default_output_config() {
-            Ok(config) if (1..=2).contains(&config.channels()) => {
-                return Ok(AudioSpec {
-                    sample_rate: config.sample_rate().0,
-                    channels: u32::from(config.channels()),
-                    total_frames: None,
-                });
+        let ranges: Vec<cpal::SupportedStreamConfigRange> = match device.supported_output_configs()
+        {
+            Ok(ranges) => ranges.collect(),
+            Err(error) => {
+                log::warn!(
+                    "audio: the output device reported no supported format ({error}); \
+                     using the documented fallback"
+                );
+                Vec::new()
             }
-            Ok(config) => log::warn!(
-                "audio: default output format is {} channels; the mixer is stereo-only, \
-                 selecting a supported 1-2 channel format",
-                config.channels()
-            ),
-            Err(error) => log::warn!(
-                "audio: the output device reported no default format ({error}); selecting a \
-                 supported 1-2 channel format"
-            ),
-        }
-        let chosen = device.supported_output_configs().ok().and_then(|ranges| {
-            choose_output_spec(ranges.map(|range| {
-                (
-                    u32::from(range.channels()),
-                    range.min_sample_rate().0,
-                    range.max_sample_rate().0,
-                )
-            }))
-        });
+        };
+        let chosen = choose_output_spec(ranges.iter().map(|range| {
+            (
+                u32::from(range.channels()),
+                range.min_sample_rate().0,
+                range.max_sample_rate().0,
+            )
+        }));
         match chosen {
             Some(spec) => Ok(spec),
             None => {
@@ -965,6 +1070,11 @@ pub(crate) mod audio {
 
     /// Picks the rate inside `min..=max`: 48 kHz, then 44.1 kHz, then the
     /// maximum.
+    ///
+    /// 48 kHz is the rate nearly every modern device runs at and the rate
+    /// the content is recorded at, so opening the device there keeps a track
+    /// from being resampled twice: once in the mixer and once in the sound
+    /// server.
     fn pick_rate(min: u32, max: u32) -> u32 {
         for wanted in [48_000, 44_100] {
             if (min..=max).contains(&wanted) {
@@ -1016,6 +1126,21 @@ pub(crate) mod audio {
     mod tests {
         use super::*;
 
+        /// A device format the backend can choose from.
+        fn device_format(
+            channels: u32,
+            min_rate: u32,
+            max_rate: u32,
+            format: SampleFormat,
+        ) -> DeviceFormat {
+            DeviceFormat {
+                channels,
+                min_rate,
+                max_rate,
+                format,
+            }
+        }
+
         #[test]
         fn stereo_is_chosen_over_mono() {
             let spec = choose_output_spec([(1, 44_100, 48_000), (2, 44_100, 44_100)])
@@ -1043,6 +1168,74 @@ pub(crate) mod audio {
         fn the_fallback_is_the_documented_stereo_format() {
             assert_eq!(FALLBACK_SPEC.sample_rate, 44_100);
             assert_eq!(FALLBACK_SPEC.channels, 2);
+        }
+
+        /// A device that offers an eight-bit format next to a better one is
+        /// not driven at eight bits: the conversion truncates the mantissa and
+        /// keeps about 48 dB of signal-to-noise ratio.
+        #[test]
+        fn the_best_sample_format_wins_over_an_eight_bit_one() {
+            let formats = [
+                device_format(2, 44_100, 48_000, SampleFormat::U8),
+                device_format(2, 44_100, 48_000, SampleFormat::I16),
+                device_format(2, 44_100, 48_000, SampleFormat::F32),
+            ];
+            let spec = AudioSpec {
+                sample_rate: 48_000,
+                channels: 2,
+                total_frames: None,
+            };
+            assert_eq!(best_format(&formats, spec), Some(SampleFormat::F32));
+        }
+
+        /// A device that offers nothing but an eight-bit format is still
+        /// played; the choice is the device's, not a failure.
+        #[test]
+        fn an_eight_bit_format_is_chosen_when_nothing_better_exists() {
+            let formats = [device_format(2, 44_100, 48_000, SampleFormat::U8)];
+            let spec = AudioSpec {
+                sample_rate: 48_000,
+                channels: 2,
+                total_frames: None,
+            };
+            assert_eq!(best_format(&formats, spec), Some(SampleFormat::U8));
+        }
+
+        /// The requested rate and channel count are the caller's: a format
+        /// that carries them is chosen even when another format of the device
+        /// would rank higher.
+        #[test]
+        fn the_requested_rate_and_channels_are_honoured() {
+            let formats = [
+                device_format(2, 44_100, 48_000, SampleFormat::F32),
+                device_format(1, 8_000, 96_000, SampleFormat::U8),
+            ];
+            let spec = AudioSpec {
+                sample_rate: 48_000,
+                channels: 1,
+                total_frames: None,
+            };
+            assert_eq!(best_format(&formats, spec), Some(SampleFormat::U8));
+
+            let stereo = AudioSpec {
+                sample_rate: 48_000,
+                channels: 2,
+                total_frames: None,
+            };
+            assert_eq!(best_format(&formats, stereo), Some(SampleFormat::F32));
+        }
+
+        /// A format the device does not offer at the requested rate is not
+        /// chosen, and a device that offers nothing at that rate is reported.
+        #[test]
+        fn a_rate_the_device_does_not_offer_has_no_format() {
+            let formats = [device_format(2, 44_100, 48_000, SampleFormat::F32)];
+            let spec = AudioSpec {
+                sample_rate: 96_000,
+                channels: 2,
+                total_frames: None,
+            };
+            assert_eq!(best_format(&formats, spec), None);
         }
     }
 }

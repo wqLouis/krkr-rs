@@ -81,7 +81,7 @@ pub use crate::android::{PlatformWindow, run};
 #[cfg(all(feature = "platform-linux", not(feature = "platform-android")))]
 pub use crate::linux::{PlatformWindow, run};
 
-pub use crate::audio::{AudioDevice, AudioOutputState};
+pub use crate::audio::{AudioDevice, AudioHealth, AudioOutputState};
 pub use crate::clock::{Clock, Ticker};
 pub use crate::event::PlatformEvent;
 pub use crate::fonts::{ANDROID_SYSTEM_FONT_DIRS, system_font_dirs};
@@ -155,13 +155,14 @@ impl Default for PlatformConfig {
 /// The event loop's contribution to one frame's wall-clock gap.
 ///
 /// The gap between two frames is the previous frame's work plus the time the
-/// loop spent waiting for events, so the two are reported together and the
+/// loop spent outside that frame, so the two are reported together and the
 /// caller can subtract the measured wait from the gap. `input_ms` is a
 /// subset of `poll_ms`: the time inside the poll spent translating and
 /// dispatching input.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FramePacing {
-    /// Milliseconds spent in the event poll before this frame.
+    /// Milliseconds the loop spent outside a frame: the wait between the
+    /// previous frame's end and this frame's start.
     pub poll_ms: f64,
     /// Milliseconds of `poll_ms` spent dispatching input.
     pub input_ms: f64,

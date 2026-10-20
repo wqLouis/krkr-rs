@@ -55,6 +55,13 @@
 //! non-finite `dt` is warned about and skipped rather than turned into a
 //! giant allocation.
 //!
+//! # Device health
+//!
+//! The L1 device counts the underrun and overrun episodes its queue sees. The
+//! frame reads that count between frames and reports a new episode once, with
+//! the queue's depth, so a bad device is visible in the log. The device
+//! callback itself never logs.
+//!
 //! # Headless
 //!
 //! A headless host cannot assume an audio server exists, so it opens the L1
@@ -77,7 +84,7 @@ use compat::{
 };
 use engine::sound::{AudioStream, LoopInfo, SoundError, SoundSource};
 use media::{AudioDecoderState, Media, open_audio, read_audio, seek_audio};
-use platform::{AudioDevice, AudioOutputState, PlatformError};
+use platform::{AudioDevice, AudioHealth, AudioOutputState, PlatformError};
 use vm::VmHost;
 
 #[cfg(target_os = "linux")]
@@ -171,6 +178,29 @@ fn plan_chunk(dt_ms: f64, carry_frames: f64, max_chunk_ms: f64, rate: f64) -> Ch
         frames: frames as usize,
         carry_frames: due - frames,
         behind_ms,
+    }
+}
+
+/// The episodes a device reported since the last frame.
+///
+/// The device counts an episode once, so the difference between two health
+/// snapshots is what has to be reported: an episode that is already in the
+/// snapshot the caller holds is not reported again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AudioEpisodes {
+    /// Underrun episodes that started since the last frame.
+    underruns: u64,
+    /// Overrun episodes that started since the last frame.
+    overruns: u64,
+}
+
+impl AudioEpisodes {
+    /// The episodes between two health snapshots.
+    fn between(seen: &AudioHealth, now: AudioHealth) -> Self {
+        Self {
+            underruns: now.underrun_episodes.saturating_sub(seen.underrun_episodes),
+            overruns: now.overrun_episodes.saturating_sub(seen.overrun_episodes),
+        }
     }
 }
 
@@ -356,6 +386,8 @@ pub(crate) struct AudioOutput {
     /// Most playback one frame may advance, in milliseconds (the configured
     /// cap; see the module docs).
     max_chunk_ms: f64,
+    /// The health the last frame saw, so an episode is reported once.
+    health_seen: AudioHealth,
 }
 
 impl AudioOutput {
@@ -400,6 +432,7 @@ impl AudioOutput {
             buffer: Vec::new(),
             carry_frames: 0.0,
             max_chunk_ms,
+            health_seen: AudioHealth::default(),
         })
     }
 
@@ -425,6 +458,7 @@ impl AudioOutput {
     /// fails (a malformed output spec), [`GameError::Audio`] when the L1
     /// device rejects the write — both typed, never silent.
     pub(crate) fn pump(&mut self, vm: &VmHost, dt_ms: f64) -> Result<(), GameError> {
+        self.report_health();
         if !dt_ms.is_finite() {
             self.carry_frames = 0.0;
             log::warn!("audio: non-finite frame duration; skipping this buffer");
@@ -470,13 +504,47 @@ impl AudioOutput {
         );
         Ok(())
     }
+
+    /// Reports a device episode once, with the queue's depth.
+    ///
+    /// The device callback never logs: the counters are read here, between
+    /// frames, and an episode is reported the first time it is seen — the
+    /// snapshot the last frame held decides what is new.
+    ///
+    /// The null device is a no-op mock that discards what it is given, so the
+    /// queue it fills is an artefact of the mock and not a device fault; its
+    /// episodes are not reported.
+    fn report_health(&mut self) {
+        if self.null {
+            return;
+        }
+        let health = self.device.health(&self.state);
+        let episodes = AudioEpisodes::between(&self.health_seen, health);
+        let depth_ms = self.device.queued_seconds(&self.state) * 1000.0;
+        if episodes.underruns > 0 {
+            log::warn!(
+                "audio: the output device underran ({} episode(s) so far); the queue holds \
+                 {depth_ms:.0} ms",
+                health.underrun_episodes,
+            );
+        }
+        if episodes.overruns > 0 {
+            log::warn!(
+                "audio: the output device dropped its oldest audio ({} episode(s) so far); the \
+                 queue holds {depth_ms:.0} ms",
+                health.overrun_episodes,
+            );
+        }
+        self.health_seen = health;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use media::Media;
+    use platform::AudioHealth;
 
-    use super::{DEFAULT_MAX_CHUNK_MS, make_decoder, plan_chunk};
+    use super::{AudioEpisodes, DEFAULT_MAX_CHUNK_MS, make_decoder, plan_chunk};
     use crate::startup::StartupStats;
 
     /// A 1 kHz stream, so one millisecond is exactly one frame.
@@ -574,6 +642,38 @@ mod tests {
         assert_eq!(plan.frames, 0);
         assert!((plan.carry_frames - 0.7).abs() < 1e-9);
         assert_eq!(plan.behind_ms, 0.0);
+    }
+
+    #[test]
+    fn a_device_episode_is_reported_once() {
+        let seen = AudioHealth::default();
+        let underrun = AudioHealth {
+            underrun_episodes: 1,
+            ..AudioHealth::default()
+        };
+
+        let first = AudioEpisodes::between(&seen, underrun);
+        assert_eq!(first.underruns, 1, "the new episode is reported");
+        assert_eq!(first.overruns, 0, "nothing was dropped");
+
+        // The next frame sees the same episode: it is not reported again.
+        let second = AudioEpisodes::between(&underrun, underrun);
+        assert_eq!(second.underruns, 0, "the episode is not reported twice");
+        assert_eq!(second.overruns, 0);
+    }
+
+    #[test]
+    fn a_second_device_episode_is_reported_once_more() {
+        let first = AudioHealth {
+            underrun_episodes: 1,
+            ..AudioHealth::default()
+        };
+        let second = AudioHealth {
+            underrun_episodes: 2,
+            ..AudioHealth::default()
+        };
+        assert_eq!(AudioEpisodes::between(&first, second).underruns, 1);
+        assert_eq!(AudioEpisodes::between(&second, second).underruns, 0);
     }
 
     #[test]

@@ -73,8 +73,11 @@ pub struct AudioDecoderState {
     pending: Vec<f32>,
     /// Consumed offset into `pending`.
     pending_offset: usize,
-    /// Frames still to drop after a seek (the reader restarts at 0).
-    skip_frames: u64,
+    /// Interleaved samples still to drop (the container's delay, or the
+    /// samples a seek restarts at).
+    skip_samples: u64,
+    /// The timing the container declares, when it declares any.
+    timing: Option<EditTiming>,
     /// Frames returned to the caller so far (the decode position).
     position_frames: u64,
     /// Set once the reader is exhausted.
@@ -86,7 +89,7 @@ impl fmt::Debug for AudioDecoderState {
         f.debug_struct("AudioDecoderState")
             .field("spec", &self.spec)
             .field("position_frames", &self.position_frames)
-            .field("skip_frames", &self.skip_frames)
+            .field("skip_samples", &self.skip_samples)
             .field("eof", &self.eof)
             .finish_non_exhaustive()
     }
@@ -109,6 +112,23 @@ struct OpenedAudio<'a> {
     decoder: Box<dyn AudioDecoder>,
     track_id: u32,
     spec: AudioSpec,
+    /// The timing the container declares, when it declares any.
+    timing: Option<EditTiming>,
+}
+
+/// The timing a container declares for a track.
+///
+/// A track is encoded with a delay: the first frames hold the encoder's
+/// warm-up, not the recording, and the container states how many samples
+/// they are. It also states how long the track is presented, so the samples
+/// the encoder added at the end are not part of it. The values are counted
+/// in the samples of the decoder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EditTiming {
+    /// The leading samples the encoder inserted; the decoder skips them.
+    delay: u64,
+    /// The samples the container presents.
+    total: u64,
 }
 
 /// Builds a fresh codec registry with the default codecs plus the Opus
@@ -131,7 +151,15 @@ fn build_codec_registry() -> CodecRegistry {
 /// decide the format. `source` may be a borrowed `Cursor<&[u8]>` (whole-file
 /// probe/decode) or an owned `Cursor<Arc<[u8]>>` (the streaming state), so no
 /// whole-buffer copy is needed on any path.
-fn open_setup<'a, S, F>(source: F, hint: Option<&str>) -> Result<OpenedAudio<'a>, MediaError>
+///
+/// `edit` is the timing the container declares for its track, read from the
+/// container's own bytes; a container that declares none leaves the track's
+/// length as the decoder produces it.
+fn open_setup<'a, S, F>(
+    source: F,
+    hint: Option<&str>,
+    edit: Option<Mp4Edit>,
+) -> Result<OpenedAudio<'a>, MediaError>
 where
     S: MediaSource + 'a,
     F: Fn() -> S,
@@ -140,9 +168,9 @@ where
     // The hint only steers the probe. A name whose extension does not match
     // the content sends the probe down the wrong path, so a failed hinted
     // probe is retried without the hint: the bytes decide the format.
-    match probe_source(source(), hint) {
+    match probe_source(source(), hint, edit) {
         Ok(opened) => Ok(opened),
-        Err(hinted) => match probe_source(source(), None) {
+        Err(hinted) => match probe_source(source(), None, edit) {
             Ok(opened) => Ok(opened),
             Err(unhinted) => Err(MediaError::Decode {
                 format: String::new(),
@@ -156,7 +184,11 @@ where
 ///
 /// The error is the probe's own message; [`open_setup`] combines the hinted
 /// and the unhinted attempt.
-fn probe_source<'a, S>(source: S, hint: Option<&str>) -> Result<OpenedAudio<'a>, String>
+fn probe_source<'a, S>(
+    source: S,
+    hint: Option<&str>,
+    edit: Option<Mp4Edit>,
+) -> Result<OpenedAudio<'a>, String>
 where
     S: MediaSource + 'a,
 {
@@ -205,6 +237,20 @@ where
         (None, Some(seconds), rate) if rate > 0 => Some((seconds * f64::from(rate)).round() as u64),
         _ => None,
     };
+    // The container's own timing decides the length of the track when it
+    // declares one: the samples the encoder added at the end are not part of
+    // the presentation.
+    let timing = match edit {
+        Some(edit) => Some(
+            edit.timing(sample_rate)
+                .map_err(|error| error.to_string())?,
+        ),
+        None => None,
+    };
+    let total_frames = match timing {
+        Some(timing) => Some(timing.total),
+        None => total_frames,
+    };
     let spec = AudioSpec {
         sample_rate,
         channels,
@@ -220,6 +266,7 @@ where
         decoder,
         track_id,
         spec,
+        timing,
     })
 }
 
@@ -230,7 +277,8 @@ where
 /// A stream that cannot be probed returns a typed [`MediaError`].
 pub fn probe_audio(m: &Media, bytes: &[u8], hint: Option<&str>) -> Result<AudioSpec, MediaError> {
     let _ = m;
-    open_setup(|| Cursor::new(bytes), hint).map(|opened| opened.spec)
+    let edit = mp4_edit(bytes);
+    open_setup(|| Cursor::new(bytes), hint, edit).map(|opened| opened.spec)
 }
 
 /// Decodes a whole audio file into interleaved `f32` samples.
@@ -245,7 +293,8 @@ pub fn decode_audio(
     hint: Option<&str>,
 ) -> Result<DecodedAudio, MediaError> {
     let _ = m;
-    let opened = open_setup(|| Cursor::new(bytes), hint)?;
+    let edit = mp4_edit(bytes);
+    let opened = open_setup(|| Cursor::new(bytes), hint, edit)?;
     decode_all(opened, hint)
 }
 
@@ -260,6 +309,7 @@ fn decode_all(opened: OpenedAudio<'_>, hint: Option<&str>) -> Result<DecodedAudi
         decoder,
         track_id,
         mut spec,
+        timing,
     } = opened;
     let mut setup = DecoderSetup {
         format,
@@ -270,7 +320,11 @@ fn decode_all(opened: OpenedAudio<'_>, hint: Option<&str>) -> Result<DecodedAudi
     let mut samples: Vec<f32> = Vec::new();
     let mut pending: Vec<f32> = Vec::new();
     let mut pending_offset = 0usize;
-    let mut skip_frames = 0u64;
+    // The container's delay is the priming the encoder inserted: it is not
+    // part of the recording and is skipped.
+    let mut skip_samples = timing
+        .map_or(0, |timing| timing.delay)
+        .saturating_mul(u64::from(spec.channels.max(1)));
 
     loop {
         if pending_offset < pending.len() {
@@ -284,13 +338,34 @@ fn decode_all(opened: OpenedAudio<'_>, hint: Option<&str>) -> Result<DecodedAudi
             &mut setup,
             &mut pending,
             &mut pending_offset,
-            &mut skip_frames,
+            &mut skip_samples,
             name,
         ) {
             Ok(true) => {}
             Ok(false) => break,
             Err(error) => return Err(error),
         }
+    }
+
+    // The samples the encoder added at the end are not part of the
+    // presentation: the container states its length, and the track stops
+    // there.
+    if let Some(timing) = timing {
+        let channels = usize::try_from(spec.channels).map_err(|_| MediaError::InvalidData {
+            message: format!(
+                "{name}: audio channel count {} does not fit in memory",
+                spec.channels
+            ),
+        })?;
+        let frames = usize::try_from(timing.total).map_err(|_| MediaError::InvalidData {
+            message: format!("{name}: the container's length does not fit in memory"),
+        })?;
+        let presented = frames
+            .checked_mul(channels)
+            .ok_or_else(|| MediaError::InvalidData {
+                message: format!("{name}: the container's length does not fit in memory"),
+            })?;
+        samples.truncate(presented.min(samples.len()));
     }
 
     if samples.is_empty() {
@@ -325,8 +400,15 @@ pub fn open_audio(
 ) -> Result<(AudioSpec, AudioDecoderState), MediaError> {
     let _ = m;
     let hint_owned = hint.map(str::to_string);
-    let opened = open_setup(|| Cursor::new(Arc::clone(&bytes)), hint)?;
+    let edit = mp4_edit(&bytes);
+    let opened = open_setup(|| Cursor::new(Arc::clone(&bytes)), hint, edit)?;
     let spec = opened.spec;
+    let timing = opened.timing;
+    // The container's delay is the priming the encoder inserted: it is not
+    // part of the recording and is skipped.
+    let skip_samples = timing
+        .map_or(0, |timing| timing.delay)
+        .saturating_mul(u64::from(spec.channels.max(1)));
     let mut state = AudioDecoderState {
         spec,
         setup: Some(DecoderSetup {
@@ -338,7 +420,8 @@ pub fn open_audio(
         hint: hint_owned,
         pending: Vec::new(),
         pending_offset: 0,
-        skip_frames: 0,
+        skip_samples,
+        timing,
         position_frames: 0,
         eof: false,
     };
@@ -375,10 +458,40 @@ pub fn read_audio(
     let mut written = 0usize;
 
     while written < frame_aligned {
+        // The container states how long the track is presented: the samples
+        // the encoder added at the end are not part of it, so the track stops
+        // there.
+        if let Some(timing) = state.timing
+            && state.position_frames + (written / channels) as u64 >= timing.total
+        {
+            state.eof = true;
+            break;
+        }
         // Drain staged samples before touching the reader.
         if state.pending_offset < state.pending.len() {
             let available = state.pending.len() - state.pending_offset;
-            let take = available.min(frame_aligned - written);
+            let mut take = available.min(frame_aligned - written);
+            // The container states how long the track is presented: the
+            // samples the encoder added at the end are not part of it, so the
+            // track stops there even inside a decoded packet.
+            if let Some(timing) = state.timing {
+                let returned = state.position_frames + (written / channels) as u64;
+                let remaining = timing.total.saturating_sub(returned);
+                let remaining_samples = remaining.saturating_mul(channels as u64);
+                if remaining_samples < take as u64 {
+                    // The remaining length is smaller than the buffer, so it
+                    // fits in memory.
+                    take = usize::try_from(remaining_samples).map_err(|_| {
+                        MediaError::InvalidData {
+                            message: "the container's length does not fit in memory".to_owned(),
+                        }
+                    })?;
+                }
+                if take == 0 {
+                    state.eof = true;
+                    break;
+                }
+            }
             out[written..written + take]
                 .copy_from_slice(&state.pending[state.pending_offset..state.pending_offset + take]);
             state.pending_offset += take;
@@ -421,7 +534,7 @@ fn decode_next_packet(state: &mut AudioDecoderState) -> Result<bool, MediaError>
         setup,
         pending,
         pending_offset,
-        skip_frames,
+        skip_samples,
         hint,
         ..
     } = state;
@@ -429,7 +542,7 @@ fn decode_next_packet(state: &mut AudioDecoderState) -> Result<bool, MediaError>
         return Ok(false);
     };
     let name = display_name(hint.as_deref(), "<audio>");
-    decode_packet_into(spec, setup, pending, pending_offset, skip_frames, name)
+    decode_packet_into(spec, setup, pending, pending_offset, skip_samples, name)
 }
 
 /// Decodes one packet of `setup` into `pending`, honouring a pending seek
@@ -445,7 +558,7 @@ fn decode_packet_into(
     setup: &mut DecoderSetup<'_>,
     pending: &mut Vec<f32>,
     pending_offset: &mut usize,
-    skip_frames: &mut u64,
+    skip_samples: &mut u64,
     name: &str,
 ) -> Result<bool, MediaError> {
     let format = setup.format.format_info().short_name;
@@ -499,28 +612,28 @@ fn decode_packet_into(
                 pending.resize(start + decoded.samples_interleaved(), 0.0);
                 decoded.copy_to_slice_interleaved(&mut pending[start..]);
 
-                // Drop whole frames already seeked past. `pending` is empty on
-                // entry (read_audio only decodes once it is drained), but the
+                // Drop the samples already seeked past or already declared as
+                // the container's delay. `pending` is empty on entry
+                // (read_audio only decodes once it is drained), but the
                 // offset is kept general.
-                if *skip_frames > 0 {
-                    let channels = usize::try_from(spec.channels.max(1)).map_err(|_| {
-                        MediaError::InvalidData {
-                            message: format!(
-                                "audio channel count {} does not fit in memory",
-                                spec.channels
-                            ),
-                        }
-                    })?;
-                    let available = (pending.len() - *pending_offset) / channels;
-                    if (available as u64) <= *skip_frames {
-                        *skip_frames -= available as u64;
+                if *skip_samples > 0 {
+                    let available = (pending.len() - *pending_offset) as u64;
+                    if available <= *skip_samples {
+                        *skip_samples -= available;
                         pending.clear();
                         *pending_offset = 0;
                     } else {
-                        let drop = *skip_frames as usize * channels;
+                        let drop = usize::try_from(*skip_samples).map_err(|_| {
+                            MediaError::InvalidData {
+                                message: format!(
+                                    "{name}: the number of samples to skip does not fit in \
+                                     memory"
+                                ),
+                            }
+                        })?;
                         pending.drain(*pending_offset..*pending_offset + drop);
                         *pending_offset = 0;
-                        *skip_frames = 0;
+                        *skip_samples = 0;
                     }
                 }
                 return Ok(true);
@@ -547,9 +660,15 @@ fn decode_packet_into(
 pub fn seek_audio(m: &Media, state: &mut AudioDecoderState, frame: u64) -> Result<(), MediaError> {
     let _ = m;
     let hint = state.hint.clone();
-    match open_setup(|| Cursor::new(Arc::clone(&state.bytes)), hint.as_deref()) {
+    let edit = mp4_edit(&state.bytes);
+    match open_setup(
+        || Cursor::new(Arc::clone(&state.bytes)),
+        hint.as_deref(),
+        edit,
+    ) {
         Ok(opened) => {
             state.spec = opened.spec;
+            state.timing = opened.timing;
             state.setup = Some(DecoderSetup {
                 format: opened.format,
                 decoder: opened.decoder,
@@ -557,11 +676,196 @@ pub fn seek_audio(m: &Media, state: &mut AudioDecoderState, frame: u64) -> Resul
             });
             state.pending.clear();
             state.pending_offset = 0;
-            state.skip_frames = frame;
+            // The seek's frame is counted in the presentation, so the
+            // container's delay comes before it.
+            let delay = state.timing.map_or(0, |timing| timing.delay);
+            state.skip_samples = delay
+                .saturating_add(frame)
+                .saturating_mul(u64::from(state.spec.channels.max(1)));
             state.position_frames = frame;
             state.eof = false;
             Ok(())
         }
         Err(error) => Err(error),
     }
+}
+
+/// The timing an MP4 container declares for its audio track.
+///
+/// An MP4 states the timing of a track in its edit list: the media time the
+/// presentation starts at (the encoder's delay, the priming the decoder must
+/// skip) and the length of the presentation (the samples the encoder added at
+/// the end are not part of it). The values are in the container's own
+/// timescales.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Mp4Edit {
+    /// The media time the presentation starts at, in media timescale ticks.
+    media_time: i64,
+    /// The sum of the edits' segment durations, in movie timescale ticks.
+    segment_duration: u64,
+    /// The movie's timescale, in ticks per second.
+    movie_timescale: u32,
+    /// The media's timescale, in ticks per second.
+    media_timescale: u32,
+}
+
+impl Mp4Edit {
+    /// The edit list's timing in the samples of a decoder running at
+    /// `sample_rate`.
+    ///
+    /// The media time and the segment duration are in the container's
+    /// timescales; the decoder's samples are counted at its own rate.
+    fn timing(&self, sample_rate: u32) -> Result<EditTiming, MediaError> {
+        let delay = match u64::try_from(self.media_time) {
+            Ok(ticks) if ticks > 0 => ticks_to_samples(ticks, sample_rate, self.media_timescale)?,
+            _ => 0,
+        };
+        let total = ticks_to_samples(self.segment_duration, sample_rate, self.movie_timescale)?;
+        Ok(EditTiming { delay, total })
+    }
+}
+
+/// Converts container ticks to the samples of a decoder running at `rate`.
+fn ticks_to_samples(ticks: u64, rate: u32, timescale: u32) -> Result<u64, MediaError> {
+    if timescale == 0 {
+        return Err(MediaError::InvalidData {
+            message: "the container declares a timescale of zero".to_owned(),
+        });
+    }
+    let numerator = u128::from(ticks) * u128::from(rate);
+    let denominator = u128::from(timescale);
+    // Rounded to the nearest sample.
+    let samples = (numerator + denominator / 2) / denominator;
+    u64::try_from(samples).map_err(|_| MediaError::InvalidData {
+        message: format!("the container's timing does not fit in 64 bits: {samples} samples"),
+    })
+}
+
+/// Reads the edit list of the first sound track of an ISO-MP4 file.
+///
+/// A file that is not an MP4, or that declares no edit list, states no
+/// timing: `None` is returned and the track keeps the length the decoder
+/// produces.
+fn mp4_edit(bytes: &[u8]) -> Option<Mp4Edit> {
+    let moov = mp4_child(bytes, b"moov")?;
+    let movie_timescale = mp4_timescale(mp4_child(moov, b"mvhd")?)?;
+    for (kind, trak) in mp4_boxes(moov) {
+        if kind != *b"trak" {
+            continue;
+        }
+        let Some(mdia) = mp4_child(trak, b"mdia") else {
+            continue;
+        };
+        // The handler type tells the sound track from the other tracks.
+        let Some(handler) = mp4_child(mdia, b"hdlr").and_then(|hdlr| hdlr.get(8..12)) else {
+            continue;
+        };
+        if handler != b"soun".as_slice() {
+            continue;
+        }
+        let Some(media_timescale) = mp4_child(mdia, b"mdhd").and_then(mp4_timescale) else {
+            continue;
+        };
+        let Some(elst) = mp4_child(trak, b"edts").and_then(|edts| mp4_child(edts, b"elst")) else {
+            continue;
+        };
+        return mp4_edit_entries(elst, movie_timescale, media_timescale);
+    }
+    None
+}
+
+/// The payload of the first box of `kind` directly inside `data`.
+fn mp4_child<'a>(data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
+    mp4_boxes(data)
+        .find(|(found, _)| found == kind)
+        .map(|(_, payload)| payload)
+}
+
+/// The boxes directly inside `data`, in order.
+fn mp4_boxes(data: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8])> {
+    let mut offset = 0usize;
+    std::iter::from_fn(move || {
+        let header = data.get(offset..offset + 8)?;
+        let size = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let kind = [header[4], header[5], header[6], header[7]];
+        let (size, header_len) = match size {
+            // A 64-bit size follows the type.
+            1 => {
+                let wide = data.get(offset + 8..offset + 16)?;
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(wide);
+                (usize::try_from(u64::from_be_bytes(bytes)).ok()?, 16)
+            }
+            // The box extends to the end of the data.
+            0 => (data.len() - offset, 8),
+            _ => (size, 8),
+        };
+        if size < header_len {
+            return None;
+        }
+        let end = offset.checked_add(size)?;
+        if end > data.len() {
+            return None;
+        }
+        let payload = &data[offset + header_len..end];
+        offset = end;
+        Some((kind, payload))
+    })
+}
+
+/// The timescale of a movie or media header box.
+fn mp4_timescale(payload: &[u8]) -> Option<u32> {
+    let version = *payload.first()?;
+    // The version decides the width of the creation and modification times
+    // that precede the timescale.
+    let offset = if version == 1 { 20 } else { 12 };
+    let bytes = payload.get(offset..offset + 4)?;
+    Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// The entries of an edit list, as the media time and the segment duration.
+fn mp4_edit_entries(elst: &[u8], movie_timescale: u32, media_timescale: u32) -> Option<Mp4Edit> {
+    let version = *elst.first()?;
+    let count_bytes = elst.get(4..8)?;
+    let count = u32::from_be_bytes([
+        count_bytes[0],
+        count_bytes[1],
+        count_bytes[2],
+        count_bytes[3],
+    ]) as usize;
+    let mut pos = 8usize;
+    let mut segment_duration = 0u64;
+    let mut media_time = 0i64;
+    for index in 0..count {
+        let (segment, time) = if version == 1 {
+            let bytes = elst.get(pos..pos + 16)?;
+            let segment = u64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]);
+            let time = i64::from_be_bytes([
+                bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                bytes[15],
+            ]);
+            pos += 16;
+            (segment, time)
+        } else {
+            let bytes = elst.get(pos..pos + 8)?;
+            let segment = u64::from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+            let time = i64::from(i32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]));
+            pos += 8;
+            (segment, time)
+        };
+        // The media rate (a 16.16 fixed-point number) follows the time.
+        pos += 4;
+        if index == 0 {
+            media_time = time;
+        }
+        segment_duration = segment_duration.checked_add(segment)?;
+    }
+    Some(Mp4Edit {
+        media_time,
+        segment_duration,
+        movie_timescale,
+        media_timescale,
+    })
 }

@@ -230,13 +230,18 @@ fn mp4_aac_fixture_decodes_to_audible_samples() {
     let decoded = decode_audio(&media, MP4_AAC_SINE, Some("voice.ogg")).expect("decode mp4");
     assert_eq!(decoded.spec.sample_rate, 44_100);
     assert_eq!(decoded.spec.channels, 1);
-    // 0.5 s at 44.1 kHz; the AAC encoder's priming adds a frame and the
-    // final padding shifts the count, so the band is generous.
+    // The container states the timing of the track in its edit list: the
+    // encoder's priming (1,024 samples) is not part of the recording, and
+    // neither are the samples it padded the track with (478). The track is
+    // the 22,050 samples it was encoded from — the same length the platform
+    // backend returns.
     let frames = decoded.frame_count();
-    assert!(
-        (20_000..=24_000).contains(&frames),
-        "0.5 s at 44.1 kHz is ~22050 frames, got {frames}"
+    assert_eq!(
+        frames, 22_050,
+        "0.5 s at 44.1 kHz is 22,050 frames, the container's priming and padding \
+         must be removed, got {frames}"
     );
+    assert_eq!(decoded.spec.total_frames, Some(22_050));
     let peak = decoded
         .interleaved
         .iter()
@@ -249,7 +254,7 @@ fn mp4_aac_fixture_decodes_to_audible_samples() {
 fn mp4_aac_streaming_read_matches_whole_file() {
     let media = Media::new();
     let whole = decode_audio(&media, MP4_AAC_SINE, Some("voice.ogg")).expect("whole decode");
-    let (_spec, mut state) =
+    let (spec, mut state) =
         open_audio(&media, Arc::from(MP4_AAC_SINE), Some("voice.ogg")).expect("open stream");
 
     let mut all = Vec::new();
@@ -264,6 +269,10 @@ fn mp4_aac_streaming_read_matches_whole_file() {
     }
     assert!(!all.is_empty());
     assert_eq!(all.len(), whole.interleaved.len());
+    // The streaming reader stops where the container says the track ends:
+    // the samples the encoder padded it with are not part of it.
+    assert_eq!(spec.total_frames, Some(22_050));
+    assert_eq!(all.len(), 22_050);
 }
 
 /// The FFmpeg backend decodes the MP4/AAC fixture into the format the
@@ -273,6 +282,14 @@ fn mp4_aac_streaming_read_matches_whole_file() {
 /// handle (an AAC track with the SBR extension, whose decoder has no SBR
 /// synthesis). It materializes the whole track, so the caller owns every
 /// decoded sample.
+///
+/// The container's priming is removed: an AAC track is encoded with a delay
+/// of a frame or more, and the container says how many samples it is (the
+/// `initial_padding` of the track, which the demuxer hands to the decoder as
+/// the skip-samples side data of the first packet). The fixture is a 0.5 s
+/// encode of 22,050 samples; the decoder produces 23 AAC frames (23,552
+/// samples) of which the priming (1,024) and the encoder's padding (478) are
+/// removed, so the track is the length it was encoded from.
 #[cfg(feature = "video-ffmpeg")]
 #[test]
 fn the_ffmpeg_backend_decodes_the_mp4_aac_fixture() {
@@ -281,12 +298,11 @@ fn the_ffmpeg_backend_decodes_the_mp4_aac_fixture() {
         .expect("the ffmpeg backend decodes the track");
     assert_eq!(decoded.spec.sample_rate, 44_100);
     assert_eq!(decoded.spec.channels, 1);
-    // 0.5 s at 44.1 kHz; the AAC encoder's priming shifts the count by a
-    // frame either way.
     let frames = decoded.frame_count();
     assert!(
-        (20_000..=24_000).contains(&frames),
-        "0.5 s at 44.1 kHz is ~22050 frames, got {frames}"
+        (21_000..=22_600).contains(&frames),
+        "0.5 s at 44.1 kHz is 22,050 frames, the encoder's priming must be \
+         removed, got {frames}"
     );
     let peak = decoded
         .interleaved

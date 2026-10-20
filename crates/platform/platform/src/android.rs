@@ -446,7 +446,8 @@ mod tests {
 /// The public object/state API lives in [`crate::audio`]; this module is the
 /// real backend. As on Linux, the stream's data callback drains a software
 /// queue that `write` fills, so the object stays stateless and the queue lives
-/// in the caller-owned state value.
+/// in the caller-owned state value. The callback counts the queue's underrun
+/// and overrun episodes; [`health`] hands the counters to the caller.
 ///
 /// # Format handling
 ///
@@ -482,6 +483,7 @@ pub(crate) mod audio {
     };
 
     use crate::PlatformError;
+    use crate::audio::AudioHealth;
     use crate::audio_queue::AudioQueue;
 
     /// Immutable stream description chosen at open time.
@@ -679,6 +681,12 @@ pub(crate) mod audio {
         lock_queue(&inner.queue).queued_seconds()
     }
 
+    /// A snapshot of the queue's health counters.
+    pub(crate) fn health(state: &StreamState) -> AudioHealth {
+        let inner = lock(state);
+        lock_queue(&inner.queue).health()
+    }
+
     /// Whether AAudio reported the stream disconnected (error callback or the
     /// live stream state).
     fn is_disconnected(inner: &Inner) -> bool {
@@ -814,6 +822,7 @@ pub(crate) mod audio {
     use api::media::AudioSpec;
 
     use crate::PlatformError;
+    use crate::audio::AudioHealth;
 
     /// Immutable stream-description placeholder.
     pub(crate) struct Backend;
@@ -857,5 +866,10 @@ pub(crate) mod audio {
     /// Always `0.0` in the stub: the stub has no queue and no playback.
     pub(crate) fn queued_seconds(_state: &StreamState) -> f64 {
         0.0
+    }
+
+    /// Always an empty snapshot in the stub: it has no queue and no playback.
+    pub(crate) fn health(_state: &StreamState) -> AudioHealth {
+        AudioHealth::default()
     }
 }

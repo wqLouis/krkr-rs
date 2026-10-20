@@ -10,6 +10,23 @@
 //! The whole track is materialized: the caller plays the returned buffer.
 //! The track decoding itself is shared with the FFmpeg video backend, which
 //! decodes a movie's audio track the same way.
+//!
+//! # The container's priming
+//!
+//! An AAC track is encoded with a delay: the first frames hold the encoder's
+//! warm-up, not the recording, and the container says how many samples they
+//! are — the track's `initial_padding`, which the demuxer hands to the
+//! decoder as the skip-samples side data of the first packet. The decoder
+//! removes them, so the track this module returns starts at the recording
+//! and ends at the recording's end; without that the voice would start a
+//! frame late and run long.
+//!
+//! # The channel layout
+//!
+//! The track's channel count is the one the container declares. A track whose
+//! `AudioSpecificConfig` declares a mono core stays mono even when its
+//! bitstream carries the parametric-stereo extension: the extension is only
+//! reconstructed for a track the container declares as stereo.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -210,6 +227,10 @@ pub(crate) fn decode_audio_track(
         match packet.read(input) {
             Ok(()) => {
                 if packet.stream() == stream_index {
+                    // The packet is handed to the decoder as it came: the
+                    // demuxer's skip-samples side data, which carries the
+                    // container's priming, is what makes the decoder drop
+                    // the encoder's delay at the start of the track.
                     decoder
                         .send_packet(&packet)
                         .map_err(|error| MediaError::Decode {

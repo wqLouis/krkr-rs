@@ -12,6 +12,10 @@
 //! and out of the per-channel hold on underrun) is shared by every backend and
 //! lives in `audio_queue`.
 //!
+//! That queue also counts the underrun and overrun episodes it sees.
+//! [`AudioDevice::health`] hands the counters to the caller, so a bad device
+//! can be reported between frames; the device callback itself never logs.
+//!
 //! # Backends
 //!
 //! * the real backend is cpal on `platform-linux` and AAudio (via the `ndk`
@@ -48,6 +52,24 @@ pub struct AudioDevice {
 /// stops and releases the OS stream.
 pub struct AudioOutputState {
     kind: StateKind,
+}
+
+/// A snapshot of an output stream's health.
+///
+/// The counters count **episodes**, not samples: one underrun that holds the
+/// last sample for a hundred frames is one episode, and one overrun that
+/// drops a thousand samples is one episode. A caller reads the snapshot
+/// between frames and reports a new episode once; the device callback itself
+/// never logs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AudioHealth {
+    /// How many times the queue underran since the stream was opened.
+    pub underrun_episodes: u64,
+    /// How many times the queue dropped its oldest samples since the stream
+    /// was opened.
+    pub overrun_episodes: u64,
+    /// Whether the queue is holding the last sample right now.
+    pub underrunning: bool,
 }
 
 enum DeviceKind {
@@ -233,6 +255,26 @@ impl AudioDevice {
             (DeviceKind::Null, StateKind::Null(_)) => 0.0,
             (DeviceKind::Real(_), StateKind::Real(stream)) => backend::queued_seconds(stream),
             _ => 0.0,
+        }
+    }
+
+    /// A snapshot of the stream's health since it was opened.
+    ///
+    /// The counters count episodes, not samples: one underrun that holds the
+    /// last sample for a hundred frames is one episode. A caller reads the
+    /// snapshot between frames and reports each new episode once, so a bad
+    /// device is visible in the log; the device callback never logs.
+    ///
+    /// The null device reports its own queue's health: the mock applies the
+    /// same queue policy as the real device, so its counters mean the same
+    /// thing.
+    pub fn health(&self, state: &AudioOutputState) -> AudioHealth {
+        match (&self.kind, &state.kind) {
+            (DeviceKind::Null, StateKind::Null(null)) => null.queue.health(),
+            (DeviceKind::Real(_), StateKind::Real(stream)) => backend::health(stream),
+            // A state that does not belong to this device reports an empty
+            // snapshot, as the other queries do.
+            _ => AudioHealth::default(),
         }
     }
 }
