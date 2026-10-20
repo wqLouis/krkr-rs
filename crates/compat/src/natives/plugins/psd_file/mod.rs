@@ -420,7 +420,7 @@ fn resolve_layer_id(host: &Tjs2Engine, value: &Value) -> Result<u32, String> {
 /// The script-visible layer name, preferring the Unicode name.
 fn layer_name(layer: &LayerInfo) -> String {
     if layer.layer_name_unicode.is_empty() {
-        layer.layer_name.clone()
+        layer.extra_data.layer_name.clone()
     } else {
         layer.layer_name_unicode.clone()
     }
@@ -664,9 +664,8 @@ extern "C" fn psd_get_layer_name(
 fn build_layer_info(
     host: &Tjs2Engine,
     file: &PsdFile,
-    index: usize,
+    layer: &LayerInfo,
 ) -> Result<DetachedValue, String> {
-    let layer = &file.layers[index];
     let dict = new_object(host, "%[]", "PSD.getLayerInfo")?;
     let id = dict.raw_id();
     set_int_member(host, id, "top", i64::from(layer.top))?;
@@ -754,11 +753,11 @@ extern "C" fn psd_get_layer_info(
     let Some(no) = argv.first() else {
         return report_error(out_error, "PSD.getLayerInfo requires 1 argument");
     };
-    let no = value_as_i64(no);
-    if no < 0 || no as usize >= file.layers.len() {
-        return report_error(out_error, "PSD: not such layer");
-    }
-    match build_layer_info(binding.engine(), file, no as usize) {
+    let layer = match layer_at(file, value_as_i64(no)) {
+        Ok(layer) => layer,
+        Err(error) => return report_error(out_error, &error),
+    };
+    match build_layer_info(binding.engine(), file, layer) {
         Ok(dict) => {
             set_retained_out(out, dict);
             0

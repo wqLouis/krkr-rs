@@ -1,10 +1,10 @@
 //! Vectorized 8-bit pixel conversion.
 //!
-//! Both passes here are *prefix* passes: they convert whole 16-pixel blocks
-//! whose source bytes are all in range and return how many pixels they wrote.
-//! The caller's scalar loop owns the tail, so the short-slice rules — a missing
-//! colour plane is black, a missing alpha plane is opaque, an out-of-range
-//! sample reads `0xff` — keep exactly one implementation.
+//! Both passes convert a whole buffer: the vector body covers the blocks the
+//! source bytes reach and a scalar tail finishes the rest. The short-slice
+//! rules live here — a missing colour plane is black, a missing alpha plane is
+//! opaque and an out-of-range sample reads `0xff` — so the caller states the
+//! planes and the buffer and nothing else.
 
 use fearless_simd::prelude::*;
 use fearless_simd::{Level, u8x16, u16x8};
@@ -12,17 +12,17 @@ use fearless_simd::{Level, u8x16, u16x8};
 /// Pixels covered by one vector block: 16 bytes per plane, four planes.
 const LANES: usize = 16;
 
-/// Writes the RGBA pixels that the four planes cover completely.
+/// Write the RGBA pixels of the four planes into `out`.
 ///
 /// `planes` holds the red, green, blue and alpha channel planes. A missing
-/// plane fills with black, or opaque for the alpha plane. Returns the number of
-/// pixels written, always a multiple of the block size.
-pub(crate) fn pack_rgba8(level: Level, out: &mut [u8], planes: [Option<&[u8]>; 4]) -> usize {
+/// plane fills with black, or opaque for the alpha plane.
+pub(crate) fn pack_rgba8(out: &mut [u8], planes: [Option<&[u8]>; 4]) {
+    let level = Level::new();
     fearless_simd::dispatch!(level, simd => pack_rgba8_blocks(simd, out, planes))
 }
 
 #[inline(always)]
-fn pack_rgba8_blocks<S: Simd>(simd: S, out: &mut [u8], planes: [Option<&[u8]>; 4]) -> usize {
+fn pack_rgba8_blocks<S: Simd>(simd: S, out: &mut [u8], planes: [Option<&[u8]>; 4]) {
     let pixels = out.len() / 4;
     let mut index = 0;
     while index + LANES <= pixels && covered(&planes, index + LANES) {
@@ -34,7 +34,14 @@ fn pack_rgba8_blocks<S: Simd>(simd: S, out: &mut [u8], planes: [Option<&[u8]>; 4
         u8x16::<S>::store_four_interleaved([red, green, blue, alpha], chunk);
         index += LANES;
     }
-    index
+    while index < pixels {
+        let offset = index * 4;
+        out[offset] = plane_byte(planes[0], index, 0x00);
+        out[offset + 1] = plane_byte(planes[1], index, 0x00);
+        out[offset + 2] = plane_byte(planes[2], index, 0x00);
+        out[offset + 3] = plane_byte(planes[3], index, 0xff);
+        index += 1;
+    }
 }
 
 #[inline(always)]
@@ -53,15 +60,24 @@ fn covered(planes: &[Option<&[u8]>; 4], end: usize) -> bool {
     })
 }
 
-/// Writes `alpha[i] = alpha[i] * mask[i] / 255` over the bytes both slices
-/// cover, rounded down. Returns the number of bytes written, always a
-/// multiple of the block size.
-pub(crate) fn mul_alpha8(level: Level, alpha: &mut [u8], mask: &[u8]) -> usize {
+/// One byte of a plane: the stored sample, or `fill` when the plane is
+/// missing.
+fn plane_byte(plane: Option<&[u8]>, index: usize, fill: u8) -> u8 {
+    match plane {
+        Some(plane) => plane.get(index).copied().unwrap_or(0xff),
+        None => fill,
+    }
+}
+
+/// Write `alpha[i] = alpha[i] * mask[i] / 255` over the bytes both slices
+/// cover, rounded down.
+pub(crate) fn mul_alpha8(alpha: &mut [u8], mask: &[u8]) {
+    let level = Level::new();
     fearless_simd::dispatch!(level, simd => mul_alpha8_blocks(simd, alpha, mask))
 }
 
 #[inline(always)]
-fn mul_alpha8_blocks<S: Simd>(simd: S, alpha: &mut [u8], mask: &[u8]) -> usize {
+fn mul_alpha8_blocks<S: Simd>(simd: S, alpha: &mut [u8], mask: &[u8]) {
     let len = alpha.len().min(mask.len());
     let mut index = 0;
     while index + LANES <= len {
@@ -75,7 +91,10 @@ fn mul_alpha8_blocks<S: Simd>(simd: S, alpha: &mut [u8], mask: &[u8]) -> usize {
             .store_slice(&mut alpha[index..index + LANES]);
         index += LANES;
     }
-    index
+    while index < len {
+        alpha[index] = (alpha[index] as u32 * mask[index] as u32 / 255) as u8;
+        index += 1;
+    }
 }
 
 /// `value / 255` truncated.

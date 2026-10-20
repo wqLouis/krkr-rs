@@ -28,7 +28,7 @@
 
 use api::blend::{BlendMode, DstBlend};
 
-use crate::raster::blend_pixel;
+use crate::raster::{blend_pixel, blend_pixel_at};
 use crate::scene::{BitmapState, Rect, Scene};
 
 /// Half-open pixel rectangle `[x0, x1) x [y0, y1)`.
@@ -1757,67 +1757,80 @@ pub(crate) fn blend_pixel_mode(
     opa: u8,
     mode: i64,
 ) {
+    if x < 0 || y < 0 || x as u32 >= dst.width || y as u32 >= dst.height {
+        return;
+    }
+    let Some(i) = dst.pixel_offset(x as u32, y as u32) else {
+        return;
+    };
+    let mut pixel = [
+        dst.rgba[i],
+        dst.rgba[i + 1],
+        dst.rgba[i + 2],
+        dst.rgba[i + 3],
+    ];
+    blend_pixel_mode_at(&mut pixel, src, opa, mode);
+    dst.rgba[i..i + 4].copy_from_slice(&pixel);
+}
+
+/// The per-pixel core of [`blend_pixel_mode`]: blend `src` into one
+/// destination pixel, in place.
+///
+/// The kernel is factored out of the bitmap accessor so a pass that owns a
+/// destination row slice (the affine nearest pass) blends with the same
+/// arithmetic.
+fn blend_pixel_mode_at(pixel: &mut [u8; 4], src: [u8; 4], opa: u8, mode: i64) {
     match mode {
         // omOpaque / ltOpaque: copy the source (including alpha).
-        1 => write_pixel(dst, x, y, src),
+        1 => *pixel = src,
         // omAdditive / ltAdditive: saturating add, source scaled by `opa`.
         3 => {
-            let mut d = read_pixel(dst, x, y);
             for c in 0..3 {
-                d[c] = d[c].saturating_add(((u32::from(src[c]) * u32::from(opa)) / 255) as u8);
+                pixel[c] =
+                    pixel[c].saturating_add(((u32::from(src[c]) * u32::from(opa)) / 255) as u8);
             }
-            write_pixel(dst, x, y, d);
         }
         // omSubtractive / ltSubtractive.
         4 => {
-            let mut d = read_pixel(dst, x, y);
             for c in 0..3 {
-                d[c] = d[c].saturating_sub(((u32::from(src[c]) * u32::from(opa)) / 255) as u8);
+                pixel[c] =
+                    pixel[c].saturating_sub(((u32::from(src[c]) * u32::from(opa)) / 255) as u8);
             }
-            write_pixel(dst, x, y, d);
         }
         // omMultiplicative / ltMultiplicative.
         5 => {
-            let mut d = read_pixel(dst, x, y);
             let opa = u32::from(opa);
             for c in 0..3 {
                 let s = u32::from(src[c]) * opa / 255;
-                d[c] = (u32::from(d[c]) * s / 255) as u8;
+                pixel[c] = (u32::from(pixel[c]) * s / 255) as u8;
             }
-            write_pixel(dst, x, y, d);
         }
         // omDarken / ltDarken.
         9 => {
-            let mut d = read_pixel(dst, x, y);
             for c in 0..3 {
-                d[c] = d[c].min(src[c]);
+                pixel[c] = pixel[c].min(src[c]);
             }
-            write_pixel(dst, x, y, d);
         }
         // omLighten / ltLighten.
         10 => {
-            let mut d = read_pixel(dst, x, y);
             for c in 0..3 {
-                d[c] = d[c].max(src[c]);
+                pixel[c] = pixel[c].max(src[c]);
             }
-            write_pixel(dst, x, y, d);
         }
         // omScreen / ltScreen.
         11 => {
-            let mut d = read_pixel(dst, x, y);
             for c in 0..3 {
-                let blended = 255 - (255 - u32::from(d[c])) * (255 - u32::from(src[c])) / 255;
-                d[c] = ((u32::from(d[c]) * (255 - u32::from(opa)) + blended * 255) / 255) as u8;
+                let blended = 255 - (255 - u32::from(pixel[c])) * (255 - u32::from(src[c])) / 255;
+                pixel[c] =
+                    ((u32::from(pixel[c]) * (255 - u32::from(opa)) + blended * 255) / 255) as u8;
             }
-            write_pixel(dst, x, y, d);
         }
         // ltPsHardLight (19): standard hard-light, alpha-composited.
         19 => {
-            let d = read_pixel(dst, x, y);
             let mut blended = [0u8; 4];
             for c in 0..3 {
                 let sv = i32::from(src[c]);
-                let dv = i32::from(d[c]);
+                let dv = i32::from(pixel[c]);
                 blended[c] = if sv < 128 {
                     (2 * sv * dv / 255).clamp(0, 255) as u8
                 } else {
@@ -1825,59 +1838,54 @@ pub(crate) fn blend_pixel_mode(
                 };
             }
             blended[3] = src[3];
-            blend_pixel(dst, x, y, blended, 255, opa);
+            blend_pixel_at(pixel, blended, 255, opa);
         }
         // The Photoshop modes apply their per-channel blend function and then
         // the source alpha.
         // omPsNormal / ltPsNormal: the same alpha blend as omAlpha.
-        13 => blend_pixel(dst, x, y, src, 255, opa),
+        13 => blend_pixel_at(pixel, src, 255, opa),
         // omPsAdditive / ltPsAdditive.
         14 => {
-            let d = read_pixel(dst, x, y);
             let mut blended = [0u8; 4];
             for c in 0..3 {
-                blended[c] = d[c].saturating_add(src[c]);
+                blended[c] = pixel[c].saturating_add(src[c]);
             }
             blended[3] = src[3];
-            blend_pixel(dst, x, y, blended, 255, opa);
+            blend_pixel_at(pixel, blended, 255, opa);
         }
         // omPsSubtractive / ltPsSubtractive.
         15 => {
-            let d = read_pixel(dst, x, y);
             let mut blended = [0u8; 4];
             for c in 0..3 {
-                blended[c] = d[c].saturating_sub(src[c]);
+                blended[c] = pixel[c].saturating_sub(src[c]);
             }
             blended[3] = src[3];
-            blend_pixel(dst, x, y, blended, 255, opa);
+            blend_pixel_at(pixel, blended, 255, opa);
         }
         // omPsMultiplicative / ltPsMultiplicative.
         16 => {
-            let d = read_pixel(dst, x, y);
             let mut blended = [0u8; 4];
             for c in 0..3 {
-                blended[c] = (u32::from(d[c]) * u32::from(src[c]) / 255) as u8;
+                blended[c] = (u32::from(pixel[c]) * u32::from(src[c]) / 255) as u8;
             }
             blended[3] = src[3];
-            blend_pixel(dst, x, y, blended, 255, opa);
+            blend_pixel_at(pixel, blended, 255, opa);
         }
         // omPsScreen / ltPsScreen.
         17 => {
-            let d = read_pixel(dst, x, y);
             let mut blended = [0u8; 4];
             for c in 0..3 {
                 blended[c] =
-                    (255 - (255 - u32::from(d[c])) * (255 - u32::from(src[c])) / 255) as u8;
+                    (255 - (255 - u32::from(pixel[c])) * (255 - u32::from(src[c])) / 255) as u8;
             }
             blended[3] = src[3];
-            blend_pixel(dst, x, y, blended, 255, opa);
+            blend_pixel_at(pixel, blended, 255, opa);
         }
         // omPsColorDodge / ltPsColorDodge.
         21 => {
-            let d = read_pixel(dst, x, y);
             let mut blended = [0u8; 4];
             for c in 0..3 {
-                let dv = i32::from(d[c]);
+                let dv = i32::from(pixel[c]);
                 let sv = i32::from(src[c]);
                 blended[c] = if sv >= 255 {
                     255
@@ -1886,31 +1894,29 @@ pub(crate) fn blend_pixel_mode(
                 };
             }
             blended[3] = src[3];
-            blend_pixel(dst, x, y, blended, 255, opa);
+            blend_pixel_at(pixel, blended, 255, opa);
         }
         // omPsLighten / ltPsLighten.
         24 => {
-            let d = read_pixel(dst, x, y);
             let mut blended = [0u8; 4];
             for c in 0..3 {
-                blended[c] = d[c].max(src[c]);
+                blended[c] = pixel[c].max(src[c]);
             }
             blended[3] = src[3];
-            blend_pixel(dst, x, y, blended, 255, opa);
+            blend_pixel_at(pixel, blended, 255, opa);
         }
         // omPsDarken / ltPsDarken.
         25 => {
-            let d = read_pixel(dst, x, y);
             let mut blended = [0u8; 4];
             for c in 0..3 {
-                blended[c] = d[c].min(src[c]);
+                blended[c] = pixel[c].min(src[c]);
             }
             blended[3] = src[3];
-            blend_pixel(dst, x, y, blended, 255, opa);
+            blend_pixel_at(pixel, blended, 255, opa);
         }
         // Everything else (omAlpha=2, omAddAlpha=12 and the remaining modes):
         // source-over.
-        _ => blend_pixel(dst, x, y, src, 255, opa),
+        _ => blend_pixel_at(pixel, src, 255, opa),
     }
 }
 
@@ -2042,6 +2048,40 @@ pub fn affine_blit(
     // Inverse of the 2x2 [b c; e f].
     let inv = [m[5] / det, -m[2] / det, -m[4] / det, m[1] / det];
     // Bounding box of the mapped unit square.
+    let bbox = affine_dest_bbox(m);
+    let Some(dc) = intersect(dst, bbox) else {
+        return;
+    };
+    if clear {
+        for y in dc.1..dc.3 {
+            for x in dc.0..dc.2 {
+                write_pixel(dst, x, y, clear_color);
+            }
+        }
+    }
+    // The nearest resampler on an axis-aligned quad reads one source row per
+    // destination row, which the scanline pass does without the per-pixel
+    // inverse map.
+    let pass = AffinePass {
+        map: m,
+        inverse: inv,
+        source: src,
+        source_rect: src_rect,
+        dest_rect: dc,
+        stretch_type: stretch_type & 0xffff,
+        mode,
+        opa,
+    };
+    if pass.stretch_type == 0 && affine_nearest_axis_aligned(m) {
+        affine_blit_nearest_rows(dst, pass);
+    } else {
+        affine_blit_generic(dst, pass);
+    }
+    dst.mark_dirty();
+}
+
+/// The bounding box of the mapped unit square.
+fn affine_dest_bbox(m: [f64; 6]) -> RectI {
     let corners = [
         (m[0], m[3]),
         (m[0] + m[1], m[3] + m[4]),
@@ -2068,32 +2108,27 @@ pub fn affine_blit(
         .map(|c| c.1)
         .fold(f64::NEG_INFINITY, f64::max)
         .ceil() as i32;
-    let Some(dc) = intersect(
-        dst,
-        (
-            min_x,
-            min_y,
-            max_x.saturating_add(1),
-            max_y.saturating_add(1),
-        ),
-    ) else {
-        return;
-    };
-    if clear {
-        let clip = (
-            min_x,
-            min_y,
-            max_x.saturating_add(1),
-            max_y.saturating_add(1),
-        );
-        if let Some(cc) = intersect(dst, clip) {
-            for y in cc.1..cc.3 {
-                for x in cc.0..cc.2 {
-                    write_pixel(dst, x, y, clear_color);
-                }
-            }
-        }
-    }
+    (
+        min_x,
+        min_y,
+        max_x.saturating_add(1),
+        max_y.saturating_add(1),
+    )
+}
+
+/// The generic affine pass: every destination pixel is inverse-mapped through
+/// the 2x2 matrix and the source is sampled with the requested resampler.
+fn affine_blit_generic(dst: &mut BitmapState, pass: AffinePass<'_>) {
+    let AffinePass {
+        map: m,
+        inverse: inv,
+        source: src,
+        source_rect: src_rect,
+        dest_rect: dc,
+        stretch_type,
+        mode,
+        opa,
+    } = pass;
     let sw = (src_rect.2 - src_rect.0) as f64;
     let sh = (src_rect.3 - src_rect.1) as f64;
     for y in dc.1..dc.3 {
@@ -2111,11 +2146,165 @@ pub fn affine_blit(
             // interpolate across the source-rect border), and supports the
             // same resampler set as `stretch*`.
             let rect = (0, 0, src.width as i32, src.height as i32);
-            let color = sample_kind(src, rect, fx, fy, stretch_type & 0xffff);
+            let color = sample_kind(src, rect, fx, fy, stretch_type);
             blend_pixel_mode(dst, x, y, color, opa, mode);
         }
     }
-    dst.mark_dirty();
+}
+
+/// Whether the affine map is axis-aligned enough for the nearest pass.
+///
+/// The source's `u` axis must run along the destination's `x` axis, so the
+/// `y` extent along `u` (`m[4]`) vanishes: the source row is then the same
+/// for every pixel of a destination row, which is what lets the scanline
+/// pass resolve it once per row. `m[4]` must vanish *exactly* — a remainder
+/// would let the source row change inside a destination row, which only the
+/// per-pixel pass resolves.
+///
+/// `m[2]` (the `x` extent along `v`) is the map's shear. The scanline pass
+/// computes the source `x` with the generic pass's arithmetic, so a shear
+/// would stay correct, but a sheared quad is not the axis-aligned case.
+fn affine_nearest_axis_aligned(m: [f64; 6]) -> bool {
+    m[4] == 0.0 && m[2].abs() <= 1e-12
+}
+
+/// The nearest resampler's scanline pass over an axis-aligned quad.
+///
+/// The generic pass inverse-maps every destination pixel through the 2x2
+/// matrix and clamps one sample per pixel. On an axis-aligned quad a
+/// destination row reads a single source row, so the pass resolves that row
+/// once and walks the destination row with the generic pass's arithmetic:
+/// the sampled texel is the same, pixel for pixel.
+///
+/// The destination rows are independent, so the pass splits them into bands
+/// and runs the bands in parallel.
+fn affine_blit_nearest_rows(dst: &mut BitmapState, pass: AffinePass<'_>) {
+    let dst_width = dst.width as i32;
+    let src_width = pass.source.width as i32;
+    let src_height = pass.source.height as i32;
+    if dst_width <= 0 || src_width <= 0 || src_height <= 0 {
+        return;
+    }
+    let row_bytes = dst_width as usize * 4;
+    let rows = (pass.dest_rect.3 - pass.dest_rect.1) as usize;
+    let band_start = pass.dest_rect.1 as usize * row_bytes;
+    let Some(band) = dst.rgba.get_mut(band_start..band_start + rows * row_bytes) else {
+        return;
+    };
+    let threads = affine_thread_count(rows);
+    if threads <= 1 {
+        affine_nearest_band(band, pass.dest_rect.1, dst_width, pass);
+        return;
+    }
+    let rows_per_band = rows.div_ceil(threads);
+    let chunk_bytes = rows_per_band * row_bytes;
+    let chunks: Vec<&mut [u8]> = band.chunks_mut(chunk_bytes).collect();
+    std::thread::scope(|scope| {
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let first_row = pass.dest_rect.1 + (index * rows_per_band) as i32;
+            scope.spawn(move || {
+                affine_nearest_band(chunk, first_row, dst_width, pass);
+            });
+        }
+    });
+}
+
+/// The number of bands the nearest pass splits its destination rows across.
+///
+/// A short pass stays on the calling thread: splitting it would cost more
+/// than it saves.
+fn affine_thread_count(rows: usize) -> usize {
+    const MIN_ROWS_PER_BAND: usize = 64;
+    if rows < MIN_ROWS_PER_BAND * 2 {
+        return 1;
+    }
+    let available = std::thread::available_parallelism().map_or(1, |count| count.get());
+    available.clamp(1, 8).min(rows / MIN_ROWS_PER_BAND).max(1)
+}
+
+/// The map and the blend an affine pass walks with.
+#[derive(Clone, Copy)]
+struct AffinePass<'a> {
+    /// The forward map of the mapped quad.
+    map: [f64; 6],
+    /// The inverse of the map's 2x2 part.
+    inverse: [f64; 4],
+    /// The source bitmap.
+    source: &'a BitmapState,
+    /// The source rectangle the pass reads.
+    source_rect: RectI,
+    /// The clipped destination rectangle of the pass.
+    dest_rect: RectI,
+    /// The resampler.
+    stretch_type: i64,
+    /// The blend mode.
+    mode: i64,
+    /// The source opacity.
+    opa: u8,
+}
+
+/// The nearest pass over one band of destination rows.
+///
+/// `band` holds the destination rows from `first_row`, in order.
+fn affine_nearest_band(band: &mut [u8], first_row: i32, dst_width: i32, pass: AffinePass<'_>) {
+    let AffinePass {
+        map: m,
+        inverse: inv,
+        source: src,
+        source_rect: src_rect,
+        dest_rect: dc,
+        mode,
+        opa,
+        ..
+    } = pass;
+    let sw = (src_rect.2 - src_rect.0) as f64;
+    let sh = (src_rect.3 - src_rect.1) as f64;
+    let src_width = src.width as i32;
+    let src_height = src.height as i32;
+    let row_bytes = dst_width as usize * 4;
+    let src_row_bytes = src_width as usize * 4;
+    for (index, row) in band.chunks_exact_mut(row_bytes).enumerate() {
+        let y = first_row + index as i32;
+        let py = y as f64 + 0.5 - m[3];
+        // The map is axis-aligned, so the source row is the same for every
+        // pixel of this destination row.
+        let v = inv[3] * py;
+        if !(0.0..=1.0).contains(&v) {
+            continue;
+        }
+        let fy = src_rect.1 as f32 + (v * sh) as f32 - 0.5;
+        let sy = ((fy + 0.5).floor() as i32).clamp(0, src_height - 1);
+        let source_row = &src.rgba[(sy as usize) * src_row_bytes..][..src_row_bytes];
+        // The `u` term of the inverse map that does not depend on the
+        // destination column is the same for the whole row.
+        let inv1_py = inv[1] * py;
+        for column in dc.0 as usize..dc.2 as usize {
+            let x = column as i32;
+            let px = x as f64 + 0.5 - m[0];
+            let u = inv[0] * px + inv1_py;
+            if !(0.0..=1.0).contains(&u) {
+                continue;
+            }
+            let fx = src_rect.0 as f32 + (u * sw) as f32 - 0.5;
+            let sx = ((fx + 0.5).floor() as i32).clamp(0, src_width - 1);
+            let source_offset = sx as usize * 4;
+            let color = [
+                source_row[source_offset],
+                source_row[source_offset + 1],
+                source_row[source_offset + 2],
+                source_row[source_offset + 3],
+            ];
+            let offset = column * 4;
+            let mut destination = [
+                row[offset],
+                row[offset + 1],
+                row[offset + 2],
+                row[offset + 3],
+            ];
+            blend_pixel_mode_at(&mut destination, color, opa, mode);
+            row[offset..offset + 4].copy_from_slice(&destination);
+        }
+    }
 }
 
 /// The operation-mode number [`blend_pixel_mode`] uses for the generic
@@ -2208,6 +2397,18 @@ fn subtree_opacity(scene: &Scene, id: u32, root: u32) -> f32 {
     opacity
 }
 
+/// Allocate a zeroed `w` x `h` RGBA bitmap in the scene. `None` when the
+/// size overflows or the allocation fails.
+fn alloc_bitmap(scene: &mut Scene, w: u32, h: u32) -> Option<u32> {
+    let bytes = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    let mut rgba = Vec::new();
+    if rgba.try_reserve_exact(bytes).is_err() {
+        return None;
+    }
+    rgba.resize(bytes, 0);
+    Some(scene.add_bitmap(w, h, rgba))
+}
+
 /// Allocate `root`'s composited subtree content at `w` x `h`, reusing the
 /// existing one when its size already matches. A newly allocated content is
 /// marked for recomposition.
@@ -2221,13 +2422,7 @@ fn ensure_layer_content(scene: &mut Scene, root: u32, w: u32, h: u32) -> Option<
             scene.set_cache_bitmap(root, None);
         }
     }
-    let bytes = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
-    let mut rgba = Vec::new();
-    if rgba.try_reserve_exact(bytes).is_err() {
-        return None;
-    }
-    rgba.resize(bytes, 0);
-    let id = scene.add_bitmap(w, h, rgba);
+    let id = alloc_bitmap(scene, w, h)?;
     let layer = scene.layer_mut_untracked(root)?;
     layer.cache_content = Some(id);
     layer.cache_recalc = true;
@@ -2266,13 +2461,7 @@ pub fn ensure_transition_display(scene: &mut Scene, root: u32, w: u32, h: u32) -
     if let Some(old) = stale {
         scene.release_bitmap(old);
     }
-    let bytes = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
-    let mut rgba = Vec::new();
-    if rgba.try_reserve_exact(bytes).is_err() {
-        return None;
-    }
-    rgba.resize(bytes, 0);
-    let id = scene.add_bitmap(w, h, rgba);
+    let id = alloc_bitmap(scene, w, h)?;
     scene.set_cache_bitmap(root, Some(id));
     Some(id)
 }
@@ -2291,22 +2480,9 @@ pub fn ensure_transition_self_image(scene: &mut Scene, root: u32, w: u32, h: u32
         return Some(id);
     }
     scene.set_transition_self_image(root, None);
-    let bytes = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
-    let mut rgba = Vec::new();
-    if rgba.try_reserve_exact(bytes).is_err() {
-        return None;
-    }
-    rgba.resize(bytes, 0);
-    let id = scene.add_bitmap(w, h, rgba);
+    let id = alloc_bitmap(scene, w, h)?;
     scene.set_transition_self_image(root, Some(id));
     Some(id)
-}
-
-/// Drop `root`'s transition self image, leaving the layer's main image, its
-/// subtree cache and its children untouched. Infallible: a layer that is gone
-/// or never had a self image is a no-op.
-pub fn clear_transition_self_image(scene: &mut Scene, root: u32) {
-    scene.set_transition_self_image(root, None);
 }
 
 /// Sum of the drawn source images' [`BitmapState::content_generation`] for
@@ -2393,7 +2569,7 @@ fn grayscale_bitmap(
 fn subtree_drawn_image(layer: &crate::scene::LayerState) -> Option<u32> {
     match layer.face {
         2 | 3 => layer.bitmap,
-        _ => layer.transition_self.or(layer.bitmap),
+        _ => layer.drawn_image(),
     }
 }
 
@@ -2670,4 +2846,148 @@ pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
         }
     }
     Some(content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A source bitmap whose texels carry their own coordinates, with one
+    /// half-transparent texel.
+    fn source_texture(width: u32, height: u32) -> BitmapState {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let alpha = if x == 1 && y == 1 { 128 } else { 255 };
+                rgba.extend_from_slice(&[
+                    (x * 37 % 251) as u8,
+                    (y * 53 % 241) as u8,
+                    ((x + y) * 29 % 239) as u8,
+                    alpha,
+                ]);
+            }
+        }
+        BitmapState::new(width, height, rgba)
+    }
+
+    /// The generic (per-pixel) pass over the same mapping the scanline pass
+    /// walks, so the two can be compared pixel for pixel.
+    fn generic_pass(
+        dst: &mut BitmapState,
+        corners: [(f64, f64); 3],
+        src: &BitmapState,
+        mode: i64,
+        opa: u8,
+    ) {
+        let m = affine_forward(corners[0], corners[1], corners[2]);
+        let det = m[1] * m[5] - m[2] * m[4];
+        let inverse = [m[5] / det, -m[2] / det, -m[4] / det, m[1] / det];
+        let src_rect = (0, 0, src.width as i32, src.height as i32);
+        let Some(dest_rect) = intersect(dst, affine_dest_bbox(m)) else {
+            return;
+        };
+        affine_blit_generic(
+            dst,
+            AffinePass {
+                map: m,
+                inverse,
+                source: src,
+                source_rect: src_rect,
+                dest_rect,
+                stretch_type: 0,
+                mode,
+                opa,
+            },
+        );
+    }
+
+    /// The nearest resampler's scanline pass and the generic per-pixel pass
+    /// must sample the same texel, so the layer a script reads back is the
+    /// same whichever pass ran.
+    ///
+    /// The motion player asks the reference resampler for `stNearest`
+    /// (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:455-456`),
+    /// and the reference's affine blitter walks the quad with 16.16
+    /// fixed-point scanline steps
+    /// (`reference/cpp/core/visual/LayerBitmapIntf.cpp:2884-2930`).
+    #[test]
+    fn the_nearest_scanline_pass_matches_the_generic_pass() {
+        let src = source_texture(4, 4);
+        // Integer, fractional, scaled and clipped axis-aligned placements.
+        let placements: [[(f64, f64); 3]; 6] = [
+            [(0.0, 0.0), (4.0, 0.0), (0.0, 4.0)],
+            [(1.5, 2.25), (5.5, 2.25), (1.5, 6.25)],
+            [(2.0, 2.0), (6.0, 2.0), (2.0, 6.0)],
+            [(-2.0, -1.0), (2.0, -1.0), (-2.0, 3.0)],
+            [(0.5, 0.5), (4.5, 0.5), (0.5, 4.5)],
+            [(3.0, 3.0), (9.0, 3.0), (3.0, 9.0)],
+        ];
+        for (mode, opa) in [(2, 255), (2, 128), (1, 255)] {
+            for corners in placements {
+                let map = affine_forward(corners[0], corners[1], corners[2]);
+                assert!(
+                    affine_nearest_axis_aligned(map),
+                    "the placement must take the scanline pass: {corners:?}"
+                );
+                let mut scanline = BitmapState::new(16, 16, vec![0u8; 16 * 16 * 4]);
+                let mut generic = BitmapState::new(16, 16, vec![0u8; 16 * 16 * 4]);
+                affine_blit(
+                    &mut scanline,
+                    AffineBlit {
+                        corners,
+                        stretch_type: 0,
+                        clear: false,
+                        clear_color: [0, 0, 0, 0],
+                    },
+                    BlitSource {
+                        bitmap: &src,
+                        rect: (0, 0, src.width as i32, src.height as i32),
+                    },
+                    BlitOptions {
+                        mode,
+                        opa,
+                        treat_as_opaque: false,
+                        hold_alpha: false,
+                    },
+                );
+                generic_pass(&mut generic, corners, &src, mode, opa);
+                assert_eq!(
+                    scanline.rgba, generic.rgba,
+                    "the scanline pass must match the generic pass: {corners:?}"
+                );
+            }
+        }
+    }
+
+    /// A pass over many rows is split into bands and run in parallel; the
+    /// result must not depend on the split.
+    #[test]
+    fn the_nearest_scanline_pass_splits_long_passes() {
+        let src = source_texture(64, 64);
+        let corners = [(0.0, 0.0), (192.0, 0.0), (0.0, 192.0)];
+        let mut scanline = BitmapState::new(192, 192, vec![0u8; 192 * 192 * 4]);
+        let mut generic = BitmapState::new(192, 192, vec![0u8; 192 * 192 * 4]);
+        affine_blit(
+            &mut scanline,
+            AffineBlit {
+                corners,
+                stretch_type: 0,
+                clear: false,
+                clear_color: [0, 0, 0, 0],
+            },
+            BlitSource {
+                bitmap: &src,
+                rect: (0, 0, src.width as i32, src.height as i32),
+            },
+            BlitOptions {
+                mode: 2,
+                opa: 255,
+                treat_as_opaque: false,
+                hold_alpha: false,
+            },
+        );
+        generic_pass(&mut generic, corners, &src, 2, 255);
+        assert_eq!(scanline.rgba, generic.rgba);
+        assert!(scanline.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0));
+    }
 }

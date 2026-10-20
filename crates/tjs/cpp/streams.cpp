@@ -1,11 +1,13 @@
 // File-backed TJS2 text/binary streams for the save/load path.
 //
 // The reference wires `TJSCreate{Text,Binary}StreamFor{Read,Write}` to the
-// base module's storage-backed implementations (ScriptMgnIntf.cpp); krkr-rs
-// compiles only the tjs2 core, so those pointers stay NULL and
-// `Array/Dictionary.saveStruct/loadStruct` (and KAG's quick save/load) crash
-// or silently truncate. These factories provide the same surface with plain
-// filesystem I/O in the game directory.
+// base module's storage-backed implementations (ScriptMgnIntf.cpp:464-469):
+// every name, including `archive.xp3>member`, resolves through the storage
+// layer, and a name the storage cannot place raises `TVPCannotOpenStorage`
+// (StorageIntf.cpp:1131-1148). krkr-rs compiles only the tjs2 core, so the
+// storage lives in the compatibility layer; it installs one read callback
+// (tjs2_set_storage_read_callback) that the read factories consult before the
+// local filesystem, while the write factories stay filesystem-only.
 //
 // This is a faithful port of the reference's text streams
 // (`reference/cpp/core/base/TextStream.cpp`) and binary-stream mode handling
@@ -35,17 +37,20 @@
 //           laid out as `[u64 compressed][u64 uncompressed]` followed by the
 //           compressed UTF-16LE bytes.
 //
-// Paths: names are absolute (the game builds them from System.dataPath) or
-// resolved against the data dir set via tjs2_set_data_dir.
+// Paths: storage names (including `archive.xp3>member`) resolve through the
+// read callback the compat host installs; the local filesystem serves
+// absolute paths and the save files the write factories create.
 
 #include "tjs2_abi.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -53,6 +58,7 @@
 #include <zlib.h>
 
 #include <tjs.h>
+#include <tjsError.h>
 
 #include <spdlog/spdlog.h>
 
@@ -457,6 +463,59 @@ TJS::tTJSBinaryStream *tjs2_create_memory_stream(const void *data, size_t len) {
     return new MemoryBinaryStream(data, len);
 }
 
+// A read-only binary stream owning the bytes it serves: a storage entry the
+// compat read callback returned. The reference hands out a seekable
+// archive-member stream; reading the whole entry into memory is the port's
+// equivalent.
+class OwnedMemoryBinaryStream : public TJS::tTJSBinaryStream {
+    std::vector<uint8_t> data;
+    tjs_int64 pos;
+
+public:
+    explicit OwnedMemoryBinaryStream(std::vector<uint8_t> bytes)
+        : data(std::move(bytes)), pos(0) {}
+
+    tjs_uint64 Seek(tjs_int64 offset, tjs_int whence) override {
+        tjs_int64 base;
+        switch(whence) {
+            case SEEK_SET:
+                base = 0;
+                break;
+            case SEEK_CUR:
+                base = pos;
+                break;
+            case SEEK_END:
+                base = (tjs_int64)data.size();
+                break;
+            default:
+                return (tjs_uint64)pos;
+        }
+        tjs_int64 next = base + offset;
+        if(next < 0)
+            next = 0;
+        if(next > (tjs_int64)data.size())
+            next = (tjs_int64)data.size();
+        pos = next;
+        return (tjs_uint64)pos;
+    }
+
+    tjs_uint Read(void *buffer, tjs_uint read_size) override {
+        if(!buffer || pos >= (tjs_int64)data.size())
+            return 0;
+        size_t available = data.size() - (size_t)pos;
+        tjs_uint count = (tjs_uint)std::min<size_t>(read_size, available);
+        std::memcpy(buffer, data.data() + pos, count);
+        pos += count;
+        return count;
+    }
+
+    tjs_uint Write(const void * /*buffer*/, tjs_uint /*write_size*/) override {
+        return 0;
+    }
+
+    tjs_uint64 GetSize() override { return (tjs_uint64)data.size(); }
+};
+
 // ---------------------------------------------------------------------------
 // Text stream helpers
 // ---------------------------------------------------------------------------
@@ -543,6 +602,12 @@ static std::string ttstr_utf8(const ttstr &s) {
     return utf16_to_utf8(s.c_str(), (size_t)s.GetLen());
 }
 
+// A UTF-8 message as a TJS string (the error messages raised below).
+static TJS::ttstr ttstr_from_utf8(const std::string &utf8) {
+    std::vector<char16_t> units = utf8_to_utf16(utf8.data(), utf8.size());
+    return TJS::ttstr(units.data(), units.size());
+}
+
 // The reference's `TJS_BS_*` name for the access a factory chose.
 static const char *reference_access_name(FileAccess access) {
     switch(access) {
@@ -560,14 +625,17 @@ static const char *reference_access_name(FileAccess access) {
 
 // One `debug` line per stream the factories hand out (a `warn` when the open
 // failed), so a device log shows every attempted storage open and where it
-// resolved. Volume is one line per stream, never per byte. `resolved` follows
-// the reference `_TVPCreateStream` resolve step -- `TJS_BS_WRITE` normalizes
-// the name without requiring the file, every other access takes the placed
-// path and requires it (`reference/cpp/core/base/StorageIntf.cpp:1131-1148`) --
-// while `existed` is the host file's state before the open. A write to a new
-// name therefore shows `resolved=true existed=false opened=true`.
+// resolved. Volume is one line per stream, never per byte. `source` is
+// `storage` when the compat read callback served the entry and `filesystem`
+// otherwise; `resolved` follows the reference `_TVPCreateStream` resolve step
+// -- `TJS_BS_WRITE` normalizes the name without requiring the file, every
+// other access takes the placed path and requires it
+// (`reference/cpp/core/base/StorageIntf.cpp:1131-1148`) -- while `existed` is
+// the source's state before the open. A write to a new name therefore shows
+// `source=filesystem resolved=true existed=false`.
 static void log_stream_open(const char *kind, const ttstr &name,
                             const std::string &mode, FileAccess access,
+                            const std::string &source,
                             const std::string &host, bool existed,
                             bool opened, const std::string &reason) {
     std::string label = reference_access_name(access);
@@ -576,16 +644,188 @@ static void log_stream_open(const char *kind, const ttstr &name,
     bool resolved = access == FileAccess::Write || existed;
     if(opened) {
         spdlog::debug(
-            "stream open {} '{}' mode='{}' access={} resolved={} existed={} "
-            "host='{}'",
-            kind, ttstr_utf8(name), mode, label, resolved, existed, host);
+            "stream open {} '{}' mode='{}' access={} source={} resolved={} "
+            "existed={} host='{}'",
+            kind, ttstr_utf8(name), mode, label, source, resolved, existed,
+            host);
     } else {
         spdlog::warn(
-            "stream open {} '{}' mode='{}' access={} resolved={} existed={} "
-            "host='{}' failed: {}",
-            kind, ttstr_utf8(name), mode, label, resolved, existed, host,
-            reason);
+            "stream open {} '{}' mode='{}' access={} source={} resolved={} "
+            "existed={} host='{}' failed: {}",
+            kind, ttstr_utf8(name), mode, label, source, resolved, existed,
+            host, reason);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Storage seam
+//
+// The reference wires the four factories to the storage layer
+// (`reference/cpp/core/base/ScriptMgnIntf.cpp:464-469`), so
+// `Array.load("archive.xp3>member")` reads the archive member. The storage
+// lives in the compatibility layer, not in this crate, so the host installs
+// one read callback here; a name the storage does not serve falls back to the
+// local filesystem (absolute paths and the save files the write factories
+// create). One process-wide registration.
+// ---------------------------------------------------------------------------
+
+static tjs2_storage_read_fn g_storage_read = nullptr;
+static void *g_storage_read_user = nullptr;
+
+void tjs2_set_storage_read_callback(tjs2_storage_read_fn read, void *user) {
+    g_storage_read = read;
+    g_storage_read_user = user;
+}
+
+void tjs2_free_storage_bytes(void *data) {
+    std::free(data);
+}
+
+// The reference `TVPCannotOpenStorage`
+// (`reference/cpp/core/base/MsgIntfInc.h:22`).
+[[noreturn]] static void throw_cannot_open(const ttstr &name) {
+    throw TJS::eTJSError(
+        ttstr_from_utf8("Cannot open storage " + ttstr_utf8(name)));
+}
+
+// True when `name` carries a storage-media name other than the local `file`
+// media (`psb://...`, `var:...`). The media name is the leading ASCII-letter
+// run before the first colon; a single-letter prefix is a Windows drive letter
+// and stays a local path.
+static bool has_foreign_media_prefix(const ttstr &name) {
+    const tjs_char *start = name.c_str();
+    const tjs_char *p = start;
+    while((*p >= TJS_W('a') && *p <= TJS_W('z')) ||
+          (*p >= TJS_W('A') && *p <= TJS_W('Z')))
+        p++;
+    if(p == start || *p != TJS_W(':'))
+        return false;
+    const size_t len = (size_t)(p - start);
+    if(len == 1)
+        return false;
+    return !(len == 4 && start[0] == TJS_W('f') && start[1] == TJS_W('i') &&
+             start[2] == TJS_W('l') && start[3] == TJS_W('e'));
+}
+
+// The reference `TVPCannotWriteToArchive`
+// (`reference/cpp/core/base/MsgIntfInc.h:43`).
+[[noreturn]] static void throw_cannot_write_to_archive() {
+    throw TJS::eTJSError(ttstr_from_utf8("Cannot write to archive"));
+}
+
+// The reference `TVPCompressionFailed`
+// (`reference/cpp/core/base/MsgIntfInc.h:42`).
+[[noreturn]] static void throw_compression_failed() {
+    throw TJS::eTJSError(ttstr_from_utf8("Compression failed"));
+}
+
+// The reference `TJSSeekError` (`reference/cpp/core/tjs2/tjsError.h:331`),
+// raised when a mode's `oN` offset cannot be reached.
+[[noreturn]] static void throw_seek_error() {
+    throw TJS::eTJSError(ttstr(TJSSeekError));
+}
+
+// The reference `TVPUnsupportedCipherMode`
+// (`reference/cpp/core/base/MsgIntfInc.h:44`) for a crypt container the
+// reader cannot decode.
+[[noreturn]] static void throw_unsupported_cipher(const ttstr &name) {
+    throw TJS::eTJSError(
+        ttstr_from_utf8(ttstr_utf8(name) + " is unsupported cipher mode"));
+}
+
+// Read `name` through the installed storage callback.
+//
+// Returns true and fills `out` when the storage serves the entry. Returns
+// false when the storage does not have it, so the caller falls back to the
+// local filesystem; any other storage failure raises the callback's message.
+// With no callback installed it always returns false.
+static bool read_storage_entry(const ttstr &name, std::vector<uint8_t> &out) {
+    if(!g_storage_read)
+        return false;
+    std::string utf8 = ttstr_utf8(name);
+    unsigned char *data = nullptr;
+    size_t len = 0;
+    char *message = nullptr;
+    int result = g_storage_read(g_storage_read_user, utf8.data(), utf8.size(),
+                                &data, &len, &message);
+    if(result == TJS2_STORAGE_READ_OK) {
+        if(len > 0) {
+            if(!data) {
+                throw TJS::eTJSError(ttstr_from_utf8(
+                    "storage read returned no bytes for " + utf8));
+            }
+            out.assign(data, data + len);
+        }
+        tjs2_free_storage_bytes(data);
+        return true;
+    }
+    if(result == TJS2_STORAGE_READ_NOT_FOUND) {
+        if(message)
+            tjs2_free_string(message);
+        return false;
+    }
+    std::string reason =
+        message ? std::string(message) : std::string("storage read failed");
+    if(message)
+        tjs2_free_string(message);
+    throw TJS::eTJSError(ttstr_from_utf8(reason));
+}
+
+// Read the whole entry for a read factory: the storage first, then the local
+// filesystem. `source`, `host` and `existed` describe where the bytes came
+// from for the open log. A name that still names an archive member never falls
+// back to a literal file, and a name neither source serves raises
+// `TVPCannotOpenStorage`.
+static std::vector<uint8_t> read_entry(const char *kind, const ttstr &name,
+                                       const std::string &mode,
+                                       std::string &source,
+                                       std::string &host, bool &existed) {
+    std::vector<uint8_t> raw;
+    source = "storage";
+    host = ttstr_utf8(name);
+    existed = true;
+    if(read_storage_entry(name, raw)) {
+        log_stream_open(kind, name, mode, FileAccess::Read, source, host,
+                        existed, true, "");
+        return raw;
+    }
+
+    // A name that still carries the archive delimiter names an archive member;
+    // the local filesystem cannot serve it, so a storage miss raises here
+    // instead of probing a literal file name.
+    if(TJS_strchr(name.c_str(), TJS_W('>')) != nullptr) {
+        log_stream_open(kind, name, mode, FileAccess::Read, "storage", host,
+                        false, false, "archive member not found");
+        throw_cannot_open(name);
+    }
+
+    source = "filesystem";
+    host = resolve_path(name);
+    std::error_code ec;
+    existed = fs::exists(host, ec);
+    FileBinaryStream stream(host, FileAccess::Read);
+    if(!stream.ok()) {
+        log_stream_open(kind, name, mode, FileAccess::Read, source, host,
+                        existed, false, stream.error());
+        throw_cannot_open(name);
+    }
+    uint64_t size = stream.GetSize();
+    if(size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        log_stream_open(kind, name, mode, FileAccess::Read, source, host,
+                        existed, false,
+                        "entry is larger than the address space");
+        throw_cannot_open(name);
+    }
+    raw.resize(static_cast<size_t>(size));
+    size_t done = 0;
+    while(done < raw.size()) {
+        const size_t chunk = std::min<size_t>(raw.size() - done, 1u << 30);
+        stream.ReadBuffer(raw.data() + done, (tjs_uint)chunk);
+        done += chunk;
+    }
+    log_stream_open(kind, name, mode, FileAccess::Read, source, host, existed,
+                    true, "");
+    return raw;
 }
 
 // ---------------------------------------------------------------------------
@@ -595,45 +835,19 @@ static void log_stream_open(const char *kind, const ttstr &name,
 class TextReadStream : public TJS::iTJSTextReadStream {
     std::vector<char16_t> text; // decoded contents
     size_t pos;
-    bool opened = false;
-    std::string open_error;
 
-public:
-    TextReadStream(const std::string &path, const std::string &mode)
-        : pos(0) {
-        long long ofs = mode_offset(mode);
-        FileBinaryStream stream(path, FileAccess::Read);
-        if(!stream.ok()) {
-            open_error = stream.error();
-            return;
-        }
-        opened = true;
-        uint64_t size = stream.GetSize();
-        if(ofs < 0 || (uint64_t)ofs > size)
-            return; // offset past the end: empty stream
-        stream.SetPosition((tjs_uint64)ofs);
-        size -= (uint64_t)ofs;
-
-        std::vector<uint8_t> raw((size_t)size);
-        if(size > 0)
-            stream.ReadBuffer(raw.data(), (tjs_uint)size);
-
+    // Decode the whole entry. A container the reference rejects raises
+    // `TVPUnsupportedCipherMode`; there is no empty-stream fallback.
+    void decode(const std::vector<uint8_t> &raw, const ttstr &name) {
         if(raw.size() >= 3 && raw[0] == 0xFE && raw[1] == 0xFE) {
             uint8_t m = raw[2];
-            if(m != 0 && m != 1 && m != 2) {
-                open_error = "FE FE container mode is not supported";
-                opened = false;
-                return;
-            }
+            if(m != 0 && m != 1 && m != 2)
+                throw_unsupported_cipher(name);
             // The reference reads the two bytes after the mode as the
             // mandatory UTF-16LE byte-order mark and starts the payload at
             // offset 5 (`FE FE <mode> FF FE`).
-            if(raw.size() < 5 || raw[3] != 0xFF || raw[4] != 0xFE) {
-                open_error =
-                    "FE FE container is missing its UTF-16LE byte-order mark";
-                opened = false;
-                return;
-            }
+            if(raw.size() < 5 || raw[3] != 0xFF || raw[4] != 0xFE)
+                throw_unsupported_cipher(name);
             if(m == 0 || m == 1) {
                 // Cipher modes 0/1: decrypt the UTF-16LE code units beginning
                 // at offset 5 (reference
@@ -654,31 +868,25 @@ public:
             }
             // m == 2
             // `FE FE 02 FF FE [u64 compressed][u64 uncompressed][data]`
-            if(raw.size() < 5 + 16) {
-                open_error = "FE FE zlib container header is truncated";
-                opened = false;
-                return;
-            }
+            if(raw.size() < 5 + 16)
+                throw_unsupported_cipher(name);
             {
                 uint64_t compressed = read_u64le(raw.data() + 5);
                 uint64_t uncompressed = read_u64le(raw.data() + 13);
                 size_t payload = 5 + 16;
-                if(compressed > raw.size() - payload) {
-                    open_error = "FE FE zlib compressed size overruns the file";
-                    opened = false;
-                    return;
-                }
+                if(compressed > raw.size() - payload)
+                    throw_unsupported_cipher(name);
                 if(uncompressed == 0)
                     return;
+                if(uncompressed >
+                   static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+                    throw_unsupported_cipher(name);
                 std::vector<uint8_t> out((size_t)uncompressed);
                 uLongf dest_len = (uLongf)uncompressed;
                 int ret = uncompress(out.data(), &dest_len, raw.data() + payload,
                                      (uLong)compressed);
-                if(ret != Z_OK || dest_len != uncompressed) {
-                    open_error = "FE FE zlib payload failed to inflate";
-                    opened = false;
-                    return;
-                }
+                if(ret != Z_OK || dest_len != uncompressed)
+                    throw_unsupported_cipher(name);
                 // The reference assigns `uncompressed / 2` code units, so an
                 // odd byte count is truncated rather than rejected
                 // (reference/cpp/core/base/TextStream.cpp:129-131).
@@ -691,8 +899,9 @@ public:
             }
         }
 
-        // Plain text: BOM detection (UTF-16LE/BE, UTF-8) + UTF-16LE
-        // fallback for BOM-less `(const) [...]` payloads.
+        // Plain text: a byte-order mark selects UTF-16LE/BE or UTF-8. A
+        // BOM-less payload decodes as UTF-8, the default read encoding; the
+        // script decoder applies charset detection for legacy encodings.
         size_t off = 0;
         if(raw.size() >= 2 && raw[0] == 0xFF && raw[1] == 0xFE) {
             off = 2; // UTF-16LE BOM
@@ -708,18 +917,24 @@ public:
             text = utf8_to_utf16((const char *)raw.data() + off,
                                  raw.size() - off);
         } else if(!raw.empty()) {
-            // BOM-less: try UTF-16LE (even length) else UTF-8.
-            if(raw.size() % 2 == 0) {
-                for(size_t i = 0; i + 1 < raw.size(); i += 2)
-                    text.push_back((char16_t)(raw[i] | (raw[i + 1] << 8)));
-            } else {
-                text = utf8_to_utf16((const char *)raw.data(), raw.size());
-            }
+            text = utf8_to_utf16((const char *)raw.data(), raw.size());
         }
     }
 
-    bool ok() const { return opened; }
-    const std::string &error() const { return open_error; }
+public:
+    // `raw` is the whole entry (a storage member or a local file); `offset` is
+    // the mode's `oN` byte offset. The reference seeks before reading: an
+    // offset past the end is the TJS seek error, an offset at the end reads
+    // zero bytes, and a container the reference rejects raises.
+    TextReadStream(std::vector<uint8_t> raw, uint64_t offset, const ttstr &name)
+        : pos(0) {
+        if(offset > raw.size())
+            throw_seek_error();
+        if(offset == raw.size())
+            return; // empty stream at EOF
+        raw.erase(raw.begin(), raw.begin() + (std::ptrdiff_t)offset);
+        decode(raw, name);
+    }
 
     tjs_uint Read(TJS::tTJSString &targ, tjs_uint size) override {
         size_t remaining = text.size() - pos;
@@ -762,7 +977,7 @@ class TextWriteStream : public TJS::iTJSTextWriteStream {
         }
         if(!zs_init) {
             compression_failed = true;
-            return;
+            throw_compression_failed();
         }
         if(compression_failed)
             return;
@@ -772,7 +987,7 @@ class TextWriteStream : public TJS::iTJSTextWriteStream {
             int ret = deflate(&zs, Z_NO_FLUSH);
             if(ret != Z_OK) {
                 compression_failed = true;
-                return;
+                throw_compression_failed();
             }
             if(zs.avail_out == 0) {
                 stream->WriteBuffer(compression_buffer.data(),
@@ -791,6 +1006,7 @@ class TextWriteStream : public TJS::iTJSTextWriteStream {
         finalized = true;
         if(!zs_init)
             return;
+        bool finish_failed = false;
         try {
             if(!compression_failed) {
                 int result = 0;
@@ -798,6 +1014,7 @@ class TextWriteStream : public TJS::iTJSTextWriteStream {
                     result = deflate(&zs, Z_FINISH);
                     if(result != Z_OK && result != Z_STREAM_END) {
                         compression_failed = true;
+                        finish_failed = true;
                         break;
                     }
                     stream->WriteBuffer(compression_buffer.data(),
@@ -819,6 +1036,8 @@ class TextWriteStream : public TJS::iTJSTextWriteStream {
         }
         deflateEnd(&zs);
         zs_init = false;
+        if(finish_failed)
+            throw_compression_failed();
     }
 
 public:
@@ -860,7 +1079,7 @@ public:
             zs.opaque = Z_NULL;
             if(deflateInit(&zs, compression_level) != Z_OK) {
                 compression_failed = true;
-                return;
+                throw_compression_failed();
             }
             zs_init = true;
             zs.next_in = nullptr;
@@ -930,52 +1149,78 @@ public:
 static TJS::iTJSTextReadStream *create_text_read(const ttstr &name,
                                                  const ttstr &mode) {
     std::string m = mode.AsNarrowStdString();
-    std::string host = resolve_path(name);
-    bool existed = std::filesystem::exists(host);
-    auto *s = new TextReadStream(host, m);
-    log_stream_open("text-read", name, m, FileAccess::Read, host, existed,
-                    s->ok(), s->error());
-    return s;
+    std::string source, host;
+    bool existed = false;
+    std::vector<uint8_t> raw =
+        read_entry("text-read", name, m, source, host, existed);
+    return new TextReadStream(std::move(raw), (uint64_t)mode_offset(m), name);
 }
 
 static TJS::iTJSTextWriteStream *create_text_write(const ttstr &name,
                                                    const ttstr &mode) {
+    // `_TVPCreateStream` normalizes a write name and refuses it when the
+    // result still names an archive member
+    // (`reference/cpp/core/base/StorageIntf.cpp:1150-1153`).
+    if(TJS_strchr(name.c_str(), TJS_W('>')) != nullptr)
+        throw_cannot_write_to_archive();
+    // A media-prefixed name is routed to that storage media's writer; this
+    // layer has no write-capable media provider, so it refuses rather than
+    // creating a local file named after the media.
+    if(has_foreign_media_prefix(name))
+        throw_cannot_open(name);
     std::string m = mode.AsNarrowStdString();
     std::string host = resolve_path(name);
     bool existed = std::filesystem::exists(host);
     auto *s = new TextWriteStream(host, m);
-    log_stream_open("text-write", name, m, text_write_access(m), host, existed,
-                    s->ok(), s->error());
+    log_stream_open("text-write", name, m, text_write_access(m), "filesystem",
+                    host, existed, s->ok(), s->error());
+    if(!s->ok()) {
+        delete s;
+        throw_cannot_open(name);
+    }
     return s;
 }
 
 static TJS::tTJSBinaryStream *create_bin_read(const ttstr &name,
                                               const ttstr &mode) {
     std::string m = mode.AsNarrowStdString();
-    std::string host = resolve_path(name);
-    bool existed = std::filesystem::exists(host);
-    auto *s = new FileBinaryStream(host, FileAccess::Read);
-    log_stream_open("binary-read", name, m, FileAccess::Read, host, existed,
-                    s->ok(), s->error());
+    std::string source, host;
+    bool existed = false;
+    std::vector<uint8_t> raw =
+        read_entry("binary-read", name, m, source, host, existed);
+    std::unique_ptr<OwnedMemoryBinaryStream> s(
+        new OwnedMemoryBinaryStream(std::move(raw)));
     long long ofs = mode_offset(m);
     if(ofs != 0)
         s->SetPosition((tjs_uint64)ofs);
-    return s;
+    return s.release();
 }
 
 static TJS::tTJSBinaryStream *create_bin_write(const ttstr &name,
                                                const ttstr &mode) {
+    // `_TVPCreateStream` normalizes a write name and refuses it when the
+    // result still names an archive member
+    // (`reference/cpp/core/base/StorageIntf.cpp:1150-1153`).
+    if(TJS_strchr(name.c_str(), TJS_W('>')) != nullptr)
+        throw_cannot_write_to_archive();
+    // A media-prefixed name is routed to that storage media's writer; this
+    // layer has no write-capable media provider, so it refuses rather than
+    // creating a local file named after the media.
+    if(has_foreign_media_prefix(name))
+        throw_cannot_open(name);
     std::string m = mode.AsNarrowStdString();
     std::string host = resolve_path(name);
     bool existed = std::filesystem::exists(host);
     FileAccess access = binary_write_access(m);
-    auto *s = new FileBinaryStream(host, access);
-    log_stream_open("binary-write", name, m, access, host, existed, s->ok(),
-                    s->error());
+    std::unique_ptr<FileBinaryStream> s(new FileBinaryStream(host, access));
+    log_stream_open("binary-write", name, m, access, "filesystem", host,
+                    existed, s->ok(), s->error());
+    if(!s->ok())
+        throw_cannot_open(name);
     long long ofs = mode_offset(m);
     if(ofs != 0)
         s->SetPosition((tjs_uint64)ofs);
-    return s;
+    return s.release();
 }
 
 // Called from tjs2_create: wire the stream factories so Array/Dictionary
@@ -991,6 +1236,16 @@ void tjs2_wire_stream_factories() {
 // Diagnostic/test helper (declared in crates/tjs/src/lib.rs)
 // ---------------------------------------------------------------------------
 
+// A malloc'd NUL-terminated copy of `text` (free with `tjs2_free_string`).
+static char *alloc_c_string(const std::string &text) {
+    char *buf = (char *)std::malloc(text.size() + 1);
+    if(!buf)
+        return nullptr;
+    std::memcpy(buf, text.data(), text.size());
+    buf[text.size()] = 0;
+    return buf;
+}
+
 // Read a whole text stream (honoring the mode's `oN` offset and the `FE FE`
 // crypt container) and return the decoded text as a malloc'd UTF-8 string
 // (free with `tjs2_free_string`). Returns 0 on success, non-zero on failure.
@@ -1002,20 +1257,21 @@ extern "C" int tjs2_read_text_stream_all(const char *path_utf8,
     if(!path_utf8 || !out_utf8)
         return 1;
     try {
-        std::string path = resolve_path_str(path_utf8);
         std::string mode = mode_utf8 ? mode_utf8 : "";
-        TextReadStream stream(path, mode);
-        if(!stream.ok())
-            return 1;
+        TJS::ttstr name = ttstr_from_utf8(path_utf8);
+        std::string source, host;
+        bool existed = false;
+        std::vector<uint8_t> raw =
+            read_entry("text-read", name, mode, source, host, existed);
+        TextReadStream stream(std::move(raw), (uint64_t)mode_offset(mode),
+                              name);
         TJS::tTJSString content;
         stream.Read(content, 0);
         std::string utf8 =
             utf16_to_utf8(content.c_str(), (size_t)content.GetLen());
-        char *buf = (char *)std::malloc(utf8.size() + 1);
+        char *buf = alloc_c_string(utf8);
         if(!buf)
             return 1;
-        std::memcpy(buf, utf8.data(), utf8.size());
-        buf[utf8.size()] = 0;
         *out_utf8 = buf;
         return 0;
     } catch(...) {
@@ -1037,9 +1293,11 @@ extern "C" const char *tjs2_test_binary_write_access(const char *mode_utf8) {
 
 // Open through the wired binary factory and close immediately. `for_write`
 // selects the write factory (non-zero) or the read factory (zero).
-// `*out_opened` is 1 when the host file actually opened; `*out_access`
-// receives the reference access name (static). Returns 0, or non-zero with a
-// malloc'd message in `*out_error`.
+// `*out_opened` is 1 when the stream opened; `*out_access` receives the
+// reference access name (static). Returns 0, or non-zero with a malloc'd
+// message in `*out_error`. The read factory raises when neither the storage
+// nor the filesystem serves the name; the helper reports that as
+// `*out_opened = 0` so the mode test can observe the failure.
 extern "C" int tjs2_test_open_binary_stream(const char *name_utf8,
                                             const char *mode_utf8,
                                             int for_write, int *out_opened,
@@ -1055,27 +1313,89 @@ extern "C" int tjs2_test_open_binary_stream(const char *name_utf8,
         return 1;
     try {
         std::string mode = mode_utf8 ? mode_utf8 : "";
-        TJS::ttstr name(name_utf8);
-        TJS::ttstr tmode(mode.c_str());
-        TJS::tTJSBinaryStream *stream =
-            for_write ? create_bin_write(name, tmode)
-                      : create_bin_read(name, tmode);
-        auto *binary = dynamic_cast<FileBinaryStream *>(stream);
-        if(out_opened)
-            *out_opened = (binary && binary->ok()) ? 1 : 0;
+        TJS::ttstr name = ttstr_from_utf8(name_utf8);
+        TJS::ttstr tmode = ttstr_from_utf8(mode);
+        TJS::tTJSBinaryStream *stream = for_write ? create_bin_write(name, tmode)
+                                                  : create_bin_read(name, tmode);
         if(out_access)
             *out_access = reference_access_name(
                 for_write ? binary_write_access(mode) : FileAccess::Read);
+        if(out_opened) {
+            if(for_write) {
+                auto *binary = dynamic_cast<FileBinaryStream *>(stream);
+                *out_opened = (binary && binary->ok()) ? 1 : 0;
+            } else {
+                *out_opened = 1;
+            }
+        }
         delete stream;
         return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = alloc_c_string(err.getMessage().AsStdString());
+        return 0;
     } catch(const std::exception &err) {
-        if(out_error) {
-            std::string m = std::string("exception: ") + err.what();
-            char *buf = (char *)std::malloc(m.size() + 1);
-            if(buf)
-                std::memcpy(buf, m.c_str(), m.size() + 1);
-            *out_error = buf;
+        if(out_error)
+            *out_error = alloc_c_string(std::string("exception: ") + err.what());
+        return 1;
+    } catch(...) {
+        return 1;
+    }
+}
+
+// Read a whole binary stream through the wired read factory (honoring the
+// mode's `oN` offset) into a malloc'd buffer (free with
+// tjs2_free_storage_bytes). Returns 0 on success; on failure returns non-zero
+// and, if `out_error` is non-NULL, stores a malloc'd UTF-8 message.
+extern "C" int tjs2_test_read_binary_stream_all(const char *name_utf8,
+                                                const char *mode_utf8,
+                                                unsigned char **out_data,
+                                                size_t *out_len,
+                                                char **out_error) {
+    if(out_data)
+        *out_data = nullptr;
+    if(out_len)
+        *out_len = 0;
+    if(out_error)
+        *out_error = nullptr;
+    if(!name_utf8 || !out_data || !out_len)
+        return 1;
+    try {
+        TJS::ttstr name = ttstr_from_utf8(name_utf8);
+        TJS::ttstr tmode = ttstr_from_utf8(mode_utf8 ? mode_utf8 : "");
+        std::unique_ptr<TJS::tTJSBinaryStream> stream(create_bin_read(name, tmode));
+        tjs_uint64 size = stream->GetSize();
+        tjs_uint64 position = stream->GetPosition();
+        if(position > size)
+            position = size;
+        size -= position;
+        if(size > static_cast<tjs_uint64>(std::numeric_limits<size_t>::max())) {
+            if(out_error)
+                *out_error = alloc_c_string("stream is larger than the address space");
+            return 1;
         }
+        std::vector<uint8_t> bytes((size_t)size);
+        size_t done = 0;
+        while(done < bytes.size()) {
+            const size_t chunk = std::min<size_t>(bytes.size() - done, 1u << 30);
+            stream->ReadBuffer(bytes.data() + done, (tjs_uint)chunk);
+            done += chunk;
+        }
+        unsigned char *buf = (unsigned char *)std::malloc(bytes.size() + 1);
+        if(!buf)
+            return 1;
+        if(!bytes.empty())
+            std::memcpy(buf, bytes.data(), bytes.size());
+        *out_data = buf;
+        *out_len = bytes.size();
+        return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = alloc_c_string(err.getMessage().AsStdString());
+        return 1;
+    } catch(const std::exception &err) {
+        if(out_error)
+            *out_error = alloc_c_string(std::string("exception: ") + err.what());
         return 1;
     } catch(...) {
         return 1;

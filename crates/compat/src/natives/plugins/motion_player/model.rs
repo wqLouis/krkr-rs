@@ -28,39 +28,6 @@ pub(crate) struct VariableFrame {
     pub(crate) value: f64,
 }
 
-/// A controller binding type (`VariableControllerBinding`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ControllerBinding {
-    /// The controller type (`0..=8`).
-    pub(crate) kind: i32,
-    /// The entry index within its control list.
-    pub(crate) index: i32,
-    /// The source list name.
-    pub(crate) source: String,
-    /// The role name.
-    pub(crate) role: String,
-}
-
-/// One option of a selector control.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct SelectorOption {
-    /// The option label.
-    pub(crate) label: String,
-    /// The off value.
-    pub(crate) off: f64,
-    /// The on value.
-    pub(crate) on: f64,
-}
-
-/// A selector control binding.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct SelectorBinding {
-    /// The selector label.
-    pub(crate) label: String,
-    /// The options.
-    pub(crate) options: Vec<SelectorOption>,
-}
-
 /// A timeline control keyframe.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct TimelineFrame {
@@ -77,27 +44,10 @@ pub(crate) struct TimelineFrame {
 /// A timeline control track.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TimelineTrack {
-    /// The controlled variable label.
-    pub(crate) label: String,
     /// Whether the label is instant.
     pub(crate) instant: bool,
     /// The keyframes.
     pub(crate) frames: Vec<TimelineFrame>,
-}
-
-/// A timeline control binding.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct TimelineBinding {
-    /// The timeline label.
-    pub(crate) label: String,
-    /// The loop begin time.
-    pub(crate) loop_begin: f64,
-    /// The loop end time.
-    pub(crate) loop_end: f64,
-    /// The last frame time.
-    pub(crate) last_time: f64,
-    /// The variable tracks.
-    pub(crate) tracks: Vec<TimelineTrack>,
 }
 
 /// A cubic bezier easing curve (`BezierCurve`): `x` holds the time control
@@ -118,6 +68,42 @@ impl BezierCurve {
     }
 }
 
+/// One spline segment of a rotation control-point curve.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct SplineSegment {
+    /// The segment's parameter knots.
+    pub(crate) x: Vec<f64>,
+    /// The segment's values.
+    pub(crate) y: Vec<f64>,
+    /// The segment's spline slopes.
+    pub(crate) p: Vec<f64>,
+}
+
+/// A rotation control-point curve: the main bezier control points, the time
+/// knots and the per-segment spline data.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct ControlPointCurve {
+    /// The main bezier X control points.
+    pub(crate) x: Vec<f64>,
+    /// The main bezier Y control points.
+    pub(crate) y: Vec<f64>,
+    /// The time knot points.
+    pub(crate) t: Vec<f64>,
+    /// The per-segment spline data.
+    pub(crate) s: Vec<SplineSegment>,
+}
+
+impl ControlPointCurve {
+    /// Whether the curve carries no knots, which leaves the rotation alone.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.t.is_empty()
+    }
+}
+
+/// The node colour a frame carries when the content names none: a half
+/// gray with a full alpha.
+pub(crate) const DEFAULT_NODE_COLOR: [u8; 4] = [0x80, 0x80, 0x80, 0xFF];
+
 /// One frame of a layer's `frameList`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Frame {
@@ -134,6 +120,9 @@ pub(crate) struct Frame {
     pub(crate) child_motion: Option<String>,
     /// The blend mode (`bm`).
     pub(crate) blend_mode: i32,
+    /// The node's effective colour: the first of the four packed vertex
+    /// colours, as its red, green, blue and alpha bytes.
+    pub(crate) color: [u8; 4],
     /// Offset x (`ox`).
     pub(crate) ox: f64,
     /// Offset y (`oy`).
@@ -150,14 +139,19 @@ pub(crate) struct Frame {
     pub(crate) slant_x: f64,
     /// Slant y (`sy`).
     pub(crate) slant_y: f64,
+    /// Whether the node is mirrored along x (`fx`).
+    pub(crate) flip_x: bool,
+    /// Whether the node is mirrored along y (`fy`).
+    pub(crate) flip_y: bool,
     /// Scale x (`zx`).
     pub(crate) scale_x: f64,
     /// Scale y (`zy`).
     pub(crate) scale_y: f64,
     /// Opacity (`opa`), `0..=1`.
     pub(crate) opacity: f64,
-    /// Mask flag.
-    pub(crate) mask: bool,
+    /// The content's property mask: the bit field that says which of the
+    /// content's members carry a value.
+    pub(crate) content_mask: i64,
     /// Action name.
     pub(crate) action: String,
     /// Whether the frame carries a sync marker.
@@ -170,6 +164,12 @@ pub(crate) struct Frame {
     pub(crate) zcc: BezierCurve,
     /// Slant easing curve (`scc`).
     pub(crate) scc: BezierCurve,
+    /// Rotation control-point curve (`cp`): the path the position follows
+    /// between two keyframes.
+    pub(crate) cp: ControlPointCurve,
+    /// The child motion's clock offset (`motion.timeOffset`): the child clip
+    /// runs that much ahead of the parent clock.
+    pub(crate) motion_time_offset: f64,
 }
 
 impl Default for Frame {
@@ -181,6 +181,7 @@ impl Default for Frame {
             src: String::new(),
             child_motion: None,
             blend_mode: 16,
+            color: DEFAULT_NODE_COLOR,
             ox: 0.0,
             oy: 0.0,
             x: 0.0,
@@ -189,16 +190,20 @@ impl Default for Frame {
             angle: 0.0,
             slant_x: 0.0,
             slant_y: 0.0,
+            flip_x: false,
+            flip_y: false,
             scale_x: 1.0,
             scale_y: 1.0,
             opacity: 1.0,
-            mask: false,
+            content_mask: 0,
             action: String::new(),
             has_sync: false,
             ccc: BezierCurve::default(),
             acc: BezierCurve::default(),
             zcc: BezierCurve::default(),
             scc: BezierCurve::default(),
+            cp: ControlPointCurve::default(),
+            motion_time_offset: 0.0,
         }
     }
 }
@@ -224,6 +229,10 @@ pub(crate) struct FrameState {
     pub(crate) slant_x: f64,
     /// Slant.
     pub(crate) slant_y: f64,
+    /// Whether the node is mirrored along x.
+    pub(crate) flip_x: bool,
+    /// Whether the node is mirrored along y.
+    pub(crate) flip_y: bool,
     /// Scale.
     pub(crate) scale_x: f64,
     /// Scale.
@@ -232,14 +241,14 @@ pub(crate) struct FrameState {
     pub(crate) opacity: f64,
     /// Blend mode.
     pub(crate) blend_mode: i32,
+    /// The node's effective colour: red, green, blue and alpha bytes.
+    pub(crate) color: [u8; 4],
     /// Source reference.
     pub(crate) src: String,
     /// Action.
     pub(crate) action: String,
     /// Sync marker.
     pub(crate) has_sync: bool,
-    /// Mask flag.
-    pub(crate) mask: bool,
 }
 
 impl Default for FrameState {
@@ -254,14 +263,16 @@ impl Default for FrameState {
             angle: 0.0,
             slant_x: 0.0,
             slant_y: 0.0,
+            flip_x: false,
+            flip_y: false,
             scale_x: 1.0,
             scale_y: 1.0,
             opacity: 1.0,
             blend_mode: 16,
+            color: DEFAULT_NODE_COLOR,
             src: String::new(),
             action: String::new(),
             has_sync: false,
-            mask: false,
         }
     }
 }
@@ -271,8 +282,6 @@ impl Default for FrameState {
 pub(crate) struct MotionNode {
     /// Parent index (`0` is the root).
     pub(crate) parent: usize,
-    /// Child indices.
-    pub(crate) children: Vec<usize>,
     /// The layer label.
     pub(crate) label: String,
     /// Whether the node belongs to this player rather than an expanded child
@@ -283,34 +292,16 @@ pub(crate) struct MotionNode {
     pub(crate) child_motion: Option<String>,
     /// The node type (`Motion::LayerType*`).
     pub(crate) node_type: i32,
-    /// The coordinate mode.
-    pub(crate) coordinate: i32,
     /// The shape type for shape nodes.
     pub(crate) shape: i32,
+    /// The coordinate plane the position is interpolated in: `0` is the
+    /// screen plane, `1` the plane that carries the depth.
+    pub(crate) coordinate_mode: i32,
     /// The transform order.
     pub(crate) transform_order: [i32; 4],
-    /// The `inheritMask`.
-    pub(crate) inherit_mask: i32,
-    /// The `parameterize` index.
-    pub(crate) parameterize: i32,
-    /// Mesh division level.
-    pub(crate) mesh_division: i32,
-    /// Mesh transform mode.
-    pub(crate) mesh_type: i32,
-    /// Particle trigger.
-    pub(crate) particle_trigger: i32,
-    /// Particle max count.
-    pub(crate) particle_max: i32,
-    /// Particle acceleration ratio / camera damping.
-    pub(crate) particle_accel: f64,
-    /// Particle fly direction.
-    pub(crate) particle_fly: i32,
-    /// Particle inherits angle.
-    pub(crate) particle_inherit_angle: bool,
-    /// Particle velocity inheritance.
-    pub(crate) particle_inherit_velocity: i32,
-    /// Particle delete-outside flag.
-    pub(crate) particle_delete_outside: bool,
+    /// The parent-clock time from which the node draws. A layer expanded from
+    /// a child motion starts at the parent keyframe that named the clip.
+    pub(crate) visible_from: f64,
     /// The keyframes.
     pub(crate) frames: Vec<Frame>,
     /// The evaluated local state.
@@ -326,8 +317,6 @@ pub(crate) struct MotionNode {
     pub(crate) time_offset: f64,
     /// Whether an ancestor is visible.
     pub(crate) draw_flag: bool,
-    /// The number of live particle children (particle emitters).
-    pub(crate) particle_count: usize,
 }
 
 impl MotionNode {
@@ -335,32 +324,20 @@ impl MotionNode {
     pub(crate) fn new(parent: usize, label: String) -> Self {
         Self {
             parent,
-            children: Vec::new(),
             label,
             own: true,
             child_motion: None,
             node_type: 0,
-            coordinate: 0,
             shape: 0,
+            coordinate_mode: 0,
             transform_order: [0, 1, 2, 3],
-            inherit_mask: 0x1FC,
-            parameterize: -1,
-            mesh_division: 0,
-            mesh_type: 0,
-            particle_trigger: 0,
-            particle_max: 0,
-            particle_accel: 0.0,
-            particle_fly: 0,
-            particle_inherit_angle: false,
-            particle_inherit_velocity: 0,
-            particle_delete_outside: false,
+            visible_from: 0.0,
             frames: Vec::new(),
             local: FrameState::default(),
             accumulated: FrameState::default(),
             matrix: [1.0, 0.0, 0.0, 1.0],
             time_offset: 0.0,
             draw_flag: true,
-            particle_count: 0,
         }
     }
 }
@@ -438,16 +415,10 @@ pub(crate) struct MotionSnapshot {
     pub(crate) variable_ranges: HashMap<String, (f64, f64)>,
     /// The variable keyframes.
     pub(crate) variable_frames: HashMap<String, Vec<VariableFrame>>,
-    /// Controller bindings by label.
-    pub(crate) controller_bindings: HashMap<String, ControllerBinding>,
-    /// Selector controls by label.
-    pub(crate) selector_controls: HashMap<String, SelectorBinding>,
     /// Instant variable labels.
     pub(crate) instant_variables: HashSet<String>,
-    /// Mirror variable match list.
-    pub(crate) mirror_match_list: Vec<String>,
-    /// Timeline control bindings by label.
-    pub(crate) timeline_controls: HashMap<String, TimelineBinding>,
+    /// The control tracks of each timeline, by label.
+    pub(crate) timeline_controls: HashMap<String, Vec<TimelineTrack>>,
     /// The motion clips.
     pub(crate) clips: Vec<MotionClip>,
     /// Label → clip index.
@@ -509,9 +480,8 @@ impl MotionSnapshot {
             .or_else(|| number_of(root.get("height")))
             .unwrap_or(0.0);
         let mut icons = HashMap::new();
-        collect_icons(&root, &mut icons);
         let mut textures = HashMap::new();
-        collect_textures(&root, &mut textures);
+        collect_sources(&root, &mut icons, &mut textures);
 
         let mut snapshot = Self {
             container: container.to_string(),
@@ -525,10 +495,7 @@ impl MotionSnapshot {
             timeline_total_frames: HashMap::new(),
             variable_ranges: HashMap::new(),
             variable_frames: HashMap::new(),
-            controller_bindings: HashMap::new(),
-            selector_controls: HashMap::new(),
             instant_variables: HashSet::new(),
-            mirror_match_list: Vec::new(),
             timeline_controls: HashMap::new(),
             clips: Vec::new(),
             clip_index: HashMap::new(),
@@ -545,9 +512,8 @@ impl MotionSnapshot {
         // `metadata.base`.
         snapshot.collect_variable_list(&metadata);
         snapshot.collect_instant_variables(&metadata);
-        snapshot.collect_controls(&metadata);
-        snapshot.collect_selectors(&metadata);
-        snapshot.collect_mirror(&metadata);
+        snapshot.collect_control_labels(&metadata);
+        snapshot.collect_selector_labels(&metadata);
         snapshot.collect_timeline_controls(&metadata);
         snapshot.collect_clips();
         let event_tracks = snapshot.collect_event_tracks();
@@ -613,22 +579,23 @@ impl MotionSnapshot {
         }
     }
 
-    fn collect_controls(&mut self, metadata: &PsbValue) {
-        const CONTROLS: &[(&str, i32, &[&str])] = &[
-            ("bustControl", 0, &["var_lr", "var_ud"]),
-            ("hairControl", 1, &["var_lr", "var_lrm", "var_ud"]),
-            ("partsControl", 2, &["var_lr", "var_lrm", "var_ud"]),
-            ("loopControl", 3, &["var_loop"]),
-            ("eyeControl", 4, &["label"]),
-            ("eyebrowControl", 5, &["label"]),
-            ("mouthControl", 6, &["label", "talkLabel"]),
-            ("transitionControl", 7, &["label"]),
+    /// Collect the variable labels the enabled controller lists name.
+    fn collect_control_labels(&mut self, metadata: &PsbValue) {
+        const CONTROLS: &[(&str, &[&str])] = &[
+            ("bustControl", &["var_lr", "var_ud"]),
+            ("hairControl", &["var_lr", "var_lrm", "var_ud"]),
+            ("partsControl", &["var_lr", "var_lrm", "var_ud"]),
+            ("loopControl", &["var_loop"]),
+            ("eyeControl", &["label"]),
+            ("eyebrowControl", &["label"]),
+            ("mouthControl", &["label", "talkLabel"]),
+            ("transitionControl", &["label"]),
         ];
-        for (key, kind, roles) in CONTROLS {
+        for (key, roles) in CONTROLS {
             let Some(list) = list_of(metadata.get(key)) else {
                 continue;
             };
-            for (index, item) in list.iter().enumerate() {
+            for item in list {
                 if !bool_of(item.get("enabled")).unwrap_or(false) {
                     continue;
                 }
@@ -636,69 +603,26 @@ impl MotionSnapshot {
                     if let Some(label) = string_of(item.get(role))
                         && !label.is_empty()
                     {
-                        push_unique(&mut self.variable_labels, label.clone());
-                        self.controller_bindings.insert(
-                            label,
-                            ControllerBinding {
-                                kind: *kind,
-                                index: index as i32,
-                                source: (*key).to_string(),
-                                role: (*role).to_string(),
-                            },
-                        );
+                        push_unique(&mut self.variable_labels, label);
                     }
                 }
             }
         }
     }
 
-    fn collect_selectors(&mut self, metadata: &PsbValue) {
+    /// Collect the variable labels the enabled selector controls name.
+    fn collect_selector_labels(&mut self, metadata: &PsbValue) {
         let Some(list) = list_of(metadata.get("selectorControl")) else {
             return;
         };
-        for (index, item) in list.iter().enumerate() {
+        for item in list {
             let Some(label) = label_of(item) else {
                 continue;
             };
-            if !bool_of(item.get("enabled")).unwrap_or(false) {
-                self.controller_bindings.remove(&label);
+            if !bool_of(item.get("enabled")).unwrap_or(false) || label.is_empty() {
                 continue;
             }
-            let mut options = Vec::new();
-            if let Some(option_list) = list_of(item.get("optionList")) {
-                for option in option_list {
-                    let Some(option_label) = label_of(option) else {
-                        continue;
-                    };
-                    options.push(SelectorOption {
-                        label: option_label,
-                        off: number_of(option.get("offValue")).unwrap_or(0.0),
-                        on: number_of(option.get("onValue")).unwrap_or(0.0),
-                    });
-                }
-            }
-            self.selector_controls.insert(
-                label.clone(),
-                SelectorBinding {
-                    label: label.clone(),
-                    options,
-                },
-            );
-            self.record_binding(&label, 8, index as i32, "selectorControl", "label");
-        }
-    }
-
-    fn collect_mirror(&mut self, metadata: &PsbValue) {
-        let Some(mirror) = metadata.get("mirrorControl") else {
-            return;
-        };
-        let Some(list) = list_of(mirror.get("variableMatchList")) else {
-            return;
-        };
-        for item in list {
-            if let Some(label) = string_of(Some(item)) {
-                push_unique(&mut self.mirror_match_list, label);
-            }
+            push_unique(&mut self.variable_labels, label);
         }
     }
 
@@ -716,20 +640,13 @@ impl MotionSnapshot {
             } else {
                 push_unique(&mut self.main_timelines, label.clone());
             }
-            let mut binding = TimelineBinding {
-                label: label.clone(),
-                loop_begin: number_of(item.get("loopBegin")).unwrap_or(-1.0),
-                loop_end: number_of(item.get("loopEnd")).unwrap_or(-1.0),
-                last_time: number_of(item.get("lastTime")).unwrap_or(-1.0),
-                tracks: Vec::new(),
-            };
+            let mut tracks = Vec::new();
             if let Some(variable_list) = list_of(item.get("variableList")) {
                 for variable in variable_list {
                     let Some(track_label) = label_of(variable) else {
                         continue;
                     };
                     let mut track = TimelineTrack {
-                        label: track_label.clone(),
                         instant: self.instant_variables.contains(&track_label),
                         frames: Vec::new(),
                     };
@@ -760,13 +677,12 @@ impl MotionSnapshot {
                             });
                         }
                     }
-                    if let Some(last) = track.frames.last() {
-                        binding.last_time = binding.last_time.max(last.time);
-                        binding.tracks.push(track);
+                    if !track.frames.is_empty() {
+                        tracks.push(track);
                     }
                 }
             }
-            self.timeline_controls.insert(label, binding);
+            self.timeline_controls.insert(label, tracks);
         }
     }
 
@@ -870,22 +786,6 @@ impl MotionSnapshot {
         }
         collect_layer_events(&self.layers, &mut tracks);
         tracks
-    }
-
-    fn record_binding(&mut self, label: &str, kind: i32, index: i32, source: &str, role: &str) {
-        if label.is_empty() {
-            return;
-        }
-        push_unique(&mut self.variable_labels, label.to_string());
-        self.controller_bindings.insert(
-            label.to_string(),
-            ControllerBinding {
-                kind,
-                index,
-                source: source.to_string(),
-                role: role.to_string(),
-            },
-        );
     }
 }
 
@@ -995,22 +895,17 @@ pub(crate) fn step_timelines(
         .map(|(label, _)| label.clone())
         .collect();
     for label in labels {
-        let (loop_time, tracks) = {
-            let Some(state) = states.get(&label) else {
-                continue;
-            };
-            let tracks = snapshot
-                .timeline_controls
-                .get(&label)
-                .map(|binding| binding.tracks.clone())
-                .unwrap_or_default();
-            (state.loop_time, tracks)
-        };
         let Some(state) = states.get_mut(&label) else {
             continue;
         };
+        let tracks = snapshot
+            .timeline_controls
+            .get(&label)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         state.current_time += dt;
-        let (wrapped, keep) = wrap_timeline(state.current_time, state.total_frames, loop_time);
+        let (wrapped, keep) =
+            wrap_timeline(state.current_time, state.total_frames, state.loop_time);
         state.current_time = wrapped;
         if !state.looping && !keep {
             state.playing = false;
@@ -1020,7 +915,7 @@ pub(crate) fn step_timelines(
                 param2: String::new(),
             });
         }
-        step_timeline_controls(state, &tracks, dt);
+        step_timeline_controls(state, tracks, dt);
     }
     events
 }
@@ -1176,10 +1071,23 @@ pub(crate) fn build_node_tree(
     if let Some(clip) = clip {
         stack.push(clip.label.clone());
     }
+    let placement = NodePlacement {
+        child: false,
+        time_offset: 0.0,
+        start_time: 0.0,
+    };
     for layer in layers {
-        append_node(&mut nodes, 0, layer, snapshot, &mut stack, false, 0.0);
+        append_node(&mut nodes, 0, layer, snapshot, &mut stack, placement);
     }
     nodes
+}
+
+/// Where a node sits relative to the parent motion's clock.
+#[derive(Clone, Copy)]
+struct NodePlacement {
+    child: bool,
+    time_offset: f64,
+    start_time: f64,
 }
 
 fn append_node(
@@ -1188,29 +1096,17 @@ fn append_node(
     layer: &PsbValue,
     snapshot: &MotionSnapshot,
     stack: &mut Vec<String>,
-    child: bool,
-    time_offset: f64,
-) -> usize {
+    placement: NodePlacement,
+) {
     let index = nodes.len();
     let label = label_of(layer).unwrap_or_default();
     let mut node = MotionNode::new(parent, label);
-    node.own = !child;
-    node.time_offset = time_offset;
+    node.own = !placement.child;
+    node.time_offset = placement.time_offset;
+    node.visible_from = placement.start_time;
     node.node_type = number_of(layer.get("type")).unwrap_or(0.0) as i32;
-    node.coordinate = number_of(layer.get("coordinate")).unwrap_or(0.0) as i32;
     node.shape = number_of(layer.get("shape")).unwrap_or(0.0) as i32;
-    node.inherit_mask = number_of(layer.get("inheritMask")).unwrap_or(508.0) as i32;
-    node.parameterize = number_of(layer.get("parameterize")).unwrap_or(-1.0) as i32;
-    node.mesh_division = number_of(layer.get("meshDivision")).unwrap_or(0.0) as i32;
-    node.mesh_type = number_of(layer.get("meshTransform")).unwrap_or(0.0) as i32;
-    node.particle_trigger = number_of(layer.get("particleTrigger")).unwrap_or(0.0) as i32;
-    node.particle_max = number_of(layer.get("particleMaxNum")).unwrap_or(0.0) as i32;
-    node.particle_accel = number_of(layer.get("particleAccelRatio")).unwrap_or(0.0);
-    node.particle_fly = number_of(layer.get("particleFlyDirection")).unwrap_or(0.0) as i32;
-    node.particle_inherit_angle = bool_of(layer.get("particleInheritAngle")).unwrap_or(false);
-    node.particle_inherit_velocity =
-        number_of(layer.get("particleInheritVelocity")).unwrap_or(0.0) as i32;
-    node.particle_delete_outside = bool_of(layer.get("particleDeleteOutside")).unwrap_or(false);
+    node.coordinate_mode = number_of(layer.get("coordinate")).unwrap_or(0.0) as i32;
     if let Some(order) = layer.get("transformOrder").and_then(PsbValue::as_array) {
         for (slot, value) in node.transform_order.iter_mut().zip(order.iter()) {
             *slot = *value as i32;
@@ -1222,7 +1118,6 @@ fn append_node(
         .iter()
         .find_map(|frame| frame.child_motion.clone());
     nodes.push(node);
-    nodes[parent].children.push(index);
     if let Some(label) = nodes[index].child_motion.clone()
         && !label.is_empty()
         && !stack.iter().any(|item| item == &label)
@@ -1230,12 +1125,17 @@ fn append_node(
     {
         // The child clip starts at the parent keyframe that names it, so every
         // layer of that clip runs that much behind the parent clock.
-        let start = nodes[index]
+        let start_frame = nodes[index]
             .frames
             .iter()
-            .find(|frame| frame.child_motion.as_deref() == Some(label.as_str()))
-            .map(|frame| frame.time)
-            .unwrap_or(0.0);
+            .find(|frame| frame.child_motion.as_deref() == Some(label.as_str()));
+        let start = start_frame.map_or(0.0, |frame| frame.time);
+        // The child motion's own time offset shifts its clock the other way.
+        let motion_offset = start_frame.map_or(0.0, |frame| frame.motion_time_offset);
+        let child_offset = placement.time_offset + start - motion_offset;
+        // The child motion exists from the keyframe that names it, so its
+        // layers draw from that moment on.
+        let child_start_time = placement.time_offset + start;
         let layers = clip.layers.clone();
         stack.push(label);
         for layer in &layers {
@@ -1245,26 +1145,20 @@ fn append_node(
                 layer,
                 snapshot,
                 stack,
-                true,
-                time_offset + start,
+                NodePlacement {
+                    child: true,
+                    time_offset: child_offset,
+                    start_time: child_start_time,
+                },
             );
         }
         stack.pop();
     }
     if let Some(children) = list_of(layer.get("children")) {
         for child_layer in children {
-            append_node(
-                nodes,
-                index,
-                child_layer,
-                snapshot,
-                stack,
-                child,
-                time_offset,
-            );
+            append_node(nodes, index, child_layer, snapshot, stack, placement);
         }
     }
-    index
 }
 
 fn parse_frames(value: Option<&PsbValue>) -> Vec<Frame> {
@@ -1295,7 +1189,15 @@ fn parse_frames(value: Option<&PsbValue>) -> Vec<Frame> {
             } else {
                 frame.src = raw_src;
             }
-            frame.blend_mode = number_of(content.get("bm")).unwrap_or(16.0) as i32;
+            frame.content_mask = number_of(content.get("mask")).unwrap_or(0.0) as i64;
+            // The blend mode and the colour are read when the content's mask
+            // carries them.
+            if frame.content_mask & 0x20000 != 0 {
+                frame.blend_mode = number_of(content.get("bm")).unwrap_or(16.0) as i32;
+            }
+            if frame.content_mask & 0x200 != 0 {
+                frame.color = parse_node_color(content);
+            }
             frame.ox = number_of(content.get("ox")).unwrap_or(0.0);
             frame.oy = number_of(content.get("oy")).unwrap_or(0.0);
             if let Some(coord) = content.get("coord") {
@@ -1310,7 +1212,13 @@ fn parse_frames(value: Option<&PsbValue>) -> Vec<Frame> {
             frame.scale_y = number_of(content.get("zy")).unwrap_or(1.0);
             frame.opacity =
                 (number_of(content.get("opa")).unwrap_or(255.0) / 255.0).clamp(0.0, 1.0);
-            frame.mask = number_of(content.get("mask")).unwrap_or(0.0) != 0.0;
+            // The flip flags are read when the content's mask carries them.
+            if frame.content_mask & 0x4 != 0 {
+                frame.flip_x = number_of(content.get("fx")).unwrap_or(0.0) != 0.0;
+            }
+            if frame.content_mask & 0x8 != 0 {
+                frame.flip_y = number_of(content.get("fy")).unwrap_or(0.0) != 0.0;
+            }
             frame.action = string_of(content.get("action"))
                 .or_else(|| string_of(content.get("ac")))
                 .unwrap_or_default();
@@ -1319,10 +1227,39 @@ fn parse_frames(value: Option<&PsbValue>) -> Vec<Frame> {
             frame.acc = parse_bezier_curve(content.get("acc"));
             frame.zcc = parse_bezier_curve(content.get("zcc"));
             frame.scc = parse_bezier_curve(content.get("scc"));
+            frame.cp = parse_control_point_curve(content.get("cp"));
+            frame.motion_time_offset = motion_time_offset(content, frame.content_mask);
         }
         frames.push(frame);
     }
     frames
+}
+
+/// The node's effective colour, from the content's `color` member.
+///
+/// The member is either a dictionary of four packed colours — one per vertex —
+/// or a single packed colour for all of them. The packed value carries the red
+/// channel in its low byte, the green channel in the second, the blue channel
+/// in the third and the alpha in the high byte. The first colour is the
+/// node's effective one.
+fn parse_node_color(content: &PsbValue) -> [u8; 4] {
+    let Some(color) = content.get("color") else {
+        return DEFAULT_NODE_COLOR;
+    };
+    let packed = color
+        .get("0")
+        .and_then(PsbValue::as_f64)
+        .or_else(|| color.as_f64());
+    let Some(packed) = packed else {
+        return DEFAULT_NODE_COLOR;
+    };
+    let packed = packed as i64 as u32;
+    [
+        (packed & 0xFF) as u8,
+        ((packed >> 8) & 0xFF) as u8,
+        ((packed >> 16) & 0xFF) as u8,
+        ((packed >> 24) & 0xFF) as u8,
+    ]
 }
 
 /// Parse a `ccc`/`acc`/`zcc`/`scc` curve dictionary. Both `x` and `y` must be
@@ -1340,6 +1277,61 @@ fn parse_bezier_curve(value: Option<&PsbValue>) -> BezierCurve {
         x: numbers(x_list),
         y: numbers(y_list),
     }
+}
+
+/// Parse a `cp` rotation control-point curve.
+///
+/// The curve needs its `x`, `y` and `t` lists; the per-segment spline data
+/// (`s`) is optional.
+fn parse_control_point_curve(value: Option<&PsbValue>) -> ControlPointCurve {
+    let Some(dict) = value else {
+        return ControlPointCurve::default();
+    };
+    let (Some(x_list), Some(y_list), Some(t_list)) = (
+        list_of(dict.get("x")),
+        list_of(dict.get("y")),
+        list_of(dict.get("t")),
+    ) else {
+        return ControlPointCurve::default();
+    };
+    let numbers =
+        |list: &[PsbValue]| -> Vec<f64> { list.iter().filter_map(PsbValue::as_f64).collect() };
+    let mut curve = ControlPointCurve {
+        x: numbers(x_list),
+        y: numbers(y_list),
+        t: numbers(t_list),
+        s: Vec::new(),
+    };
+    if let Some(segments) = list_of(dict.get("s")) {
+        for segment in segments {
+            let mut spline = SplineSegment::default();
+            if let Some(values) = list_of(segment.get("x")) {
+                spline.x = numbers(values);
+            }
+            if let Some(values) = list_of(segment.get("y")) {
+                spline.y = numbers(values);
+            }
+            if let Some(values) = list_of(segment.get("p")) {
+                spline.p = numbers(values);
+            }
+            curve.s.push(spline);
+        }
+    }
+    curve
+}
+
+/// The child motion's clock offset, from the content's `motion` sub-object.
+///
+/// The sub-object is read when the content's mask carries the motion bit; its
+/// `timeOffset` shifts the child motion's own clock.
+fn motion_time_offset(content: &PsbValue, content_mask: i64) -> f64 {
+    if content_mask & 0x80000 == 0 {
+        return 0.0;
+    }
+    let Some(motion) = content.get("motion") else {
+        return 0.0;
+    };
+    number_of(motion.get("timeOffset")).unwrap_or(0.0)
 }
 
 /// Evaluate a curve at `t`, or return `t` unchanged when the frame carries no
@@ -1390,13 +1382,150 @@ fn coord_number(coord: &PsbValue, index: usize) -> f64 {
     }
 }
 
+/// Evaluate a rotation control-point curve at `input_t`.
+///
+/// The curve is sampled per segment: the segment's spline maps the local time
+/// to the curve parameter, and the main bezier maps that parameter to the
+/// rotation. A curve the segment list cannot answer leaves the rotation
+/// alone.
+fn evaluate_control_point_curve(curve: &ControlPointCurve, input_t: f64) -> (f64, f64) {
+    let identity = (1.0, 0.0);
+    if curve.t.len() < 2 || curve.x.len() < 4 || curve.y.len() < 4 {
+        return identity;
+    }
+    let mut segment_index = 0usize;
+    let mut main_index = 0usize;
+    for index in 1..curve.t.len() {
+        main_index += 3;
+        if curve.t[index] >= input_t {
+            segment_index = index - 1;
+            break;
+        }
+        segment_index = index - 1;
+    }
+    let Some(segment) = curve.s.get(segment_index) else {
+        return identity;
+    };
+    let start = curve.t[segment_index];
+    let end = curve.t.get(segment_index + 1).copied().unwrap_or(start);
+    let local_t = if end != start {
+        (input_t - start) / (end - start)
+    } else {
+        0.0
+    };
+    let mut parameter = local_t;
+    if !segment.x.is_empty() && segment.x.len() == segment.y.len() {
+        if segment.x[0] >= local_t {
+            parameter = segment.y[0];
+        } else if *segment.x.last().unwrap_or(&0.0) <= local_t {
+            parameter = *segment.y.last().unwrap_or(&0.0);
+        } else if let Some(sub_index) =
+            (0..segment.x.len() - 1).find(|index| segment.x[index + 1] >= local_t)
+        {
+            let x0 = segment.x[sub_index];
+            let x1 = segment.x[sub_index + 1];
+            let y0 = segment.y[sub_index];
+            let y1 = segment.y[sub_index + 1];
+            let span = x1 - x0;
+            if span != 0.0 {
+                let u = (local_t - x0) / span;
+                let p0 = segment.p.get(sub_index).copied().unwrap_or(0.0);
+                let p1 = segment.p.get(sub_index + 1).copied().unwrap_or(0.0);
+                parameter =
+                    span * span * ((u * u * u - u) * p1 + ((1.0 - u).powi(3) - (1.0 - u)) * p0)
+                        / 6.0
+                        + u * y1
+                        + (1.0 - u) * y0;
+            }
+        }
+    }
+    if main_index < 3 || main_index >= curve.x.len() || main_index >= curve.y.len() {
+        return identity;
+    }
+    let px = [
+        curve.x[main_index - 3],
+        curve.x[main_index - 2],
+        curve.x[main_index - 1],
+        curve.x[main_index],
+    ];
+    let py = [
+        curve.y[main_index - 3],
+        curve.y[main_index - 2],
+        curve.y[main_index - 1],
+        curve.y[main_index],
+    ];
+    let u = 1.0 - parameter;
+    let cos = u * u * u * px[0]
+        + 3.0 * u * u * parameter * px[1]
+        + 3.0 * u * parameter * parameter * px[2]
+        + parameter * parameter * parameter * px[3];
+    let sin = u * u * u * py[0]
+        + 3.0 * u * u * parameter * py[1]
+        + 3.0 * u * parameter * parameter * py[2]
+        + parameter * parameter * parameter * py[3];
+    (cos, sin)
+}
+
+/// The position between two keyframes.
+///
+/// The `ccc` curve eases the interpolation ratio. A frame that carries a `cp`
+/// curve does not move along a straight line: the curve rotates the path the
+/// position follows.
+fn interpolate_position(
+    easing: &BezierCurve,
+    rotation: &ControlPointCurve,
+    src: (f64, f64, f64),
+    dst: (f64, f64, f64),
+    coordinate_mode: i32,
+    ratio: f64,
+) -> (f64, f64, f64) {
+    let lerp = |from: f64, to: f64, r: f64| from + (to - from) * r;
+    if src == dst {
+        return src;
+    }
+    let eased = if easing.is_empty() {
+        ratio
+    } else {
+        evaluate_bezier_curve(easing, ratio)
+    };
+    if rotation.is_empty() {
+        return (
+            lerp(src.0, dst.0, eased),
+            lerp(src.1, dst.1, eased),
+            lerp(src.2, dst.2, eased),
+        );
+    }
+    let (cos, sin) = evaluate_control_point_curve(rotation, eased);
+    match coordinate_mode {
+        0 => {
+            let dx = dst.0 - src.0;
+            let dy = dst.1 - src.1;
+            (
+                src.0 + dx * cos - dy * sin,
+                src.1 + dx * sin + dy * cos,
+                lerp(src.2, dst.2, eased),
+            )
+        }
+        1 => {
+            let dx = dst.0 - src.0;
+            let dz = dst.2 - src.2;
+            (
+                src.0 + dx * cos - dz * sin,
+                lerp(src.1, dst.1, eased),
+                src.2 + dz * cos + dx * sin,
+            )
+        }
+        _ => src,
+    }
+}
+
 /// Evaluate a node's frame state at `time` frames.
 ///
 /// The last entry of a multi-frame list is a terminator: it is never selected
 /// as the active frame, so a trailing contentless frame leaves the last
 /// content frame held. Interpolation only runs toward a frame that carries
 /// content.
-pub(crate) fn evaluate_frames(frames: &[Frame], time: f64) -> FrameState {
+pub(crate) fn evaluate_frames(frames: &[Frame], time: f64, coordinate_mode: i32) -> FrameState {
     if frames.is_empty() {
         return FrameState::default();
     }
@@ -1432,7 +1561,7 @@ pub(crate) fn evaluate_frames(frames: &[Frame], time: f64) -> FrameState {
         } else {
             0.0
         };
-        return interpolate(active, next, t);
+        return interpolate(active, next, t, coordinate_mode);
     }
     FrameState {
         active: true,
@@ -1444,6 +1573,9 @@ pub(crate) fn evaluate_frames(frames: &[Frame], time: f64) -> FrameState {
         angle: active.angle,
         slant_x: active.slant_x,
         slant_y: active.slant_y,
+        flip_x: active.flip_x,
+        flip_y: active.flip_y,
+        color: active.color,
         scale_x: active.scale_x,
         scale_y: active.scale_y,
         opacity: active.opacity,
@@ -1451,14 +1583,20 @@ pub(crate) fn evaluate_frames(frames: &[Frame], time: f64) -> FrameState {
         src: active.src.clone(),
         action: active.action.clone(),
         has_sync: active.has_sync,
-        mask: active.mask,
     }
 }
 
-fn interpolate(a: &Frame, b: &Frame, t: f64) -> FrameState {
+fn interpolate(a: &Frame, b: &Frame, t: f64, coordinate_mode: i32) -> FrameState {
     // Position, angle, zoom and slant each carry their own easing curve; an
     // absent curve leaves the ratio untouched.
-    let t_pos = ease(&a.ccc, t);
+    let (x, y, z) = interpolate_position(
+        &a.ccc,
+        &a.cp,
+        (a.x, a.y, a.z),
+        (b.x, b.y, b.z),
+        coordinate_mode,
+        t,
+    );
     let t_angle = ease(&a.acc, t);
     let t_scale = ease(&a.zcc, t);
     let t_slant = ease(&a.scc, t);
@@ -1500,9 +1638,9 @@ fn interpolate(a: &Frame, b: &Frame, t: f64) -> FrameState {
         active: true,
         ox: lerp(a.ox, b.ox, t),
         oy: lerp(a.oy, b.oy, t),
-        x: lerp(a.x, b.x, t_pos),
-        y: lerp(a.y, b.y, t_pos),
-        z: lerp(a.z, b.z, t_pos),
+        x,
+        y,
+        z,
         angle,
         slant_x: lerp(a.slant_x, b.slant_x, t_slant),
         slant_y: lerp(a.slant_y, b.slant_y, t_slant),
@@ -1510,6 +1648,7 @@ fn interpolate(a: &Frame, b: &Frame, t: f64) -> FrameState {
         scale_y: lerp(a.scale_y, b.scale_y, t_scale),
         opacity,
         blend_mode: a.blend_mode,
+        color: a.color,
         src: if a.src.is_empty() {
             b.src.clone()
         } else {
@@ -1517,7 +1656,8 @@ fn interpolate(a: &Frame, b: &Frame, t: f64) -> FrameState {
         },
         action: a.action.clone(),
         has_sync: a.has_sync,
-        mask: a.mask,
+        flip_x: a.flip_x,
+        flip_y: a.flip_y,
     }
 }
 
@@ -1532,74 +1672,69 @@ fn navigate<'a>(mut value: &'a PsbValue, path: &[&str]) -> Option<&'a PsbValue> 
     Some(value)
 }
 
-/// Collect the `source.<chara>.icon.<name>` canvas geometry keyed by the
-/// `src/<chara>/<name>` path a frame's `content.src` carries.
+/// Collect the `source` geometry: the `source.<chara>.icon.<name>` canvas
+/// geometry keyed by the `src/<chara>/<name>` path a frame's `content.src`
+/// carries, and the `source.<chara>.texture` atlas sizes keyed by `<chara>`.
 ///
-/// `width`/`height` fall back to the icon's `truncated_width`/
-/// `truncated_height`, and an icon with no usable size is skipped.
-fn collect_icons(root: &PsbValue, icons: &mut HashMap<String, IconInfo>) {
+/// `width`/`height` fall back to the node's `truncated_width`/
+/// `truncated_height`, and a node with no usable size is skipped.
+fn collect_sources(
+    root: &PsbValue,
+    icons: &mut HashMap<String, IconInfo>,
+    textures: &mut HashMap<String, TextureInfo>,
+) {
     let Some(source) = root.get("source").and_then(PsbValue::as_dict) else {
         return;
     };
     for (group, node) in source {
-        let Some(icon) = node.get("icon").and_then(PsbValue::as_dict) else {
-            continue;
-        };
-        for (name, info) in icon {
-            let width = number_of(info.get("width"))
-                .or_else(|| number_of(info.get("truncated_width")))
-                .unwrap_or(0.0);
-            let height = number_of(info.get("height"))
-                .or_else(|| number_of(info.get("truncated_height")))
-                .unwrap_or(0.0);
-            if width <= 0.0 || height <= 0.0 {
-                continue;
+        if let Some(icon) = node.get("icon").and_then(PsbValue::as_dict) {
+            for (name, info) in icon {
+                let Some((width, height)) = source_size(info) else {
+                    continue;
+                };
+                if width <= 0.0 || height <= 0.0 {
+                    continue;
+                }
+                icons.insert(
+                    format!("src/{group}/{name}"),
+                    IconInfo {
+                        group: group.clone(),
+                        name: name.clone(),
+                        width,
+                        height,
+                        left: number_of(info.get("left")).unwrap_or(0.0),
+                        top: number_of(info.get("top")).unwrap_or(0.0),
+                        origin_x: number_of(info.get("originX")).unwrap_or(0.0),
+                        origin_y: number_of(info.get("originY")).unwrap_or(0.0),
+                        compressed: is_rl_compressed(info),
+                    },
+                );
             }
-            icons.insert(
-                format!("src/{group}/{name}"),
-                IconInfo {
-                    group: group.clone(),
-                    name: name.clone(),
+        }
+        if let Some(texture) = node.get("texture")
+            && let Some((width, height)) = source_size(texture)
+            && width > 0.0
+            && height > 0.0
+        {
+            textures.insert(
+                group.clone(),
+                TextureInfo {
                     width,
                     height,
-                    left: number_of(info.get("left")).unwrap_or(0.0),
-                    top: number_of(info.get("top")).unwrap_or(0.0),
-                    origin_x: number_of(info.get("originX")).unwrap_or(0.0),
-                    origin_y: number_of(info.get("originY")).unwrap_or(0.0),
-                    compressed: is_rl_compressed(info),
+                    compressed: is_rl_compressed(texture),
                 },
             );
         }
     }
 }
 
-/// Collect the `source.<chara>.texture` atlas sizes keyed by `<chara>`.
-fn collect_textures(root: &PsbValue, textures: &mut HashMap<String, TextureInfo>) {
-    let Some(source) = root.get("source").and_then(PsbValue::as_dict) else {
-        return;
-    };
-    for (group, node) in source {
-        let Some(texture) = node.get("texture") else {
-            continue;
-        };
-        let width = number_of(texture.get("width"))
-            .or_else(|| number_of(texture.get("truncated_width")))
-            .unwrap_or(0.0);
-        let height = number_of(texture.get("height"))
-            .or_else(|| number_of(texture.get("truncated_height")))
-            .unwrap_or(0.0);
-        if width <= 0.0 || height <= 0.0 {
-            continue;
-        }
-        textures.insert(
-            group.clone(),
-            TextureInfo {
-                width,
-                height,
-                compressed: is_rl_compressed(texture),
-            },
-        );
-    }
+/// The `width`/`height` of a source node, falling back to its truncated size.
+fn source_size(value: &PsbValue) -> Option<(f64, f64)> {
+    let width =
+        number_of(value.get("width")).or_else(|| number_of(value.get("truncated_width")))?;
+    let height =
+        number_of(value.get("height")).or_else(|| number_of(value.get("truncated_height")))?;
+    Some((width, height))
 }
 
 /// Whether a node's `compress` member names the `RL` pixel compression.
@@ -1848,12 +1983,12 @@ mod tests {
                 ..Frame::default()
             },
         ];
-        assert_eq!(evaluate_frames(&frames, 0.0).x, 0.0);
-        assert_eq!(evaluate_frames(&frames, 9.0).x, 0.0);
+        assert_eq!(evaluate_frames(&frames, 0.0, 0).x, 0.0);
+        assert_eq!(evaluate_frames(&frames, 9.0, 0).x, 0.0);
         // The last entry is a terminator, never an active keyframe
         // (`reference/cpp/plugins/motionplayer/PlayerUpdateLayerEval.cpp:282-311`).
-        assert_eq!(evaluate_frames(&frames, 10.0).x, 5.0);
-        assert_eq!(evaluate_frames(&frames, 1_000_000.0).x, 5.0);
+        assert_eq!(evaluate_frames(&frames, 10.0, 0).x, 5.0);
+        assert_eq!(evaluate_frames(&frames, 1_000_000.0, 0).x, 5.0);
     }
 
     #[test]
@@ -1897,11 +2032,11 @@ mod tests {
             },
         ];
         assert!(
-            !evaluate_frames(&frames, 0.0).active,
+            !evaluate_frames(&frames, 0.0, 0).active,
             "the contentless first frame is invisible"
         );
         for time in [97.0, 119.9, 120.0, 1_000_000.0] {
-            let state = evaluate_frames(&frames, time);
+            let state = evaluate_frames(&frames, time, 0);
             assert!(state.active, "t={time} must hold a content frame");
             assert_eq!(state.x, -705.0, "t={time}");
             assert_eq!(state.y, -388.0, "t={time}");
@@ -1927,7 +2062,7 @@ mod tests {
             ..Frame::default()
         }];
         for time in [0.0, 100.0] {
-            let state = evaluate_frames(&visible, time);
+            let state = evaluate_frames(&visible, time, 0);
             assert!(state.active);
             assert_eq!(state.x, -705.0);
         }
@@ -1937,7 +2072,7 @@ mod tests {
             has_content: false,
             ..Frame::default()
         }];
-        assert!(!evaluate_frames(&hidden, 0.0).active);
+        assert!(!evaluate_frames(&hidden, 0.0, 0).active);
     }
 
     #[test]
@@ -1967,10 +2102,10 @@ mod tests {
                 ..Frame::default()
             },
         ];
-        let midway = evaluate_frames(&frames, 5.0);
+        let midway = evaluate_frames(&frames, 5.0, 0);
         assert_eq!(midway.ox, 20.0);
         assert_eq!(midway.oy, 0.0);
-        let held = evaluate_frames(&frames, 20.0);
+        let held = evaluate_frames(&frames, 20.0, 0);
         assert_eq!(held.ox, 30.0);
         assert_eq!(held.oy, 4.0);
     }
@@ -2199,11 +2334,116 @@ mod tests {
         // The child pose at its own t=0 differs from its pose at t=30, so a
         // parent clock of 40 must evaluate the former.
         let frames = &child.frames;
-        assert_eq!(evaluate_frames(frames, 0.0).x, 0.0);
-        assert_eq!(evaluate_frames(frames, 30.0).x, 300.0);
+        assert_eq!(evaluate_frames(frames, 0.0, 0).x, 0.0);
+        assert_eq!(evaluate_frames(frames, 30.0, 0).x, 300.0);
         assert_eq!(
-            evaluate_frames(frames, (40.0f64 - child.time_offset).max(0.0)).x,
+            evaluate_frames(frames, (40.0f64 - child.time_offset).max(0.0), 0).x,
             0.0
+        );
+    }
+
+    /// A child motion's own `timeOffset` shifts the child clip's clock: the
+    /// child runs at `parent time - start + timeOffset`
+    /// (`reference/cpp/plugins/motionplayer/PlayerUpdateChildMotion.cpp:172-181`,
+    /// `PlayerInternal.h:1123-1159`).
+    #[test]
+    fn a_child_motion_time_offset_shifts_its_clock() {
+        // The parent names the child at t=40 and the child's own time offset
+        // moves its clock ten frames ahead.
+        let main = dict(vec![
+            ("label", text("main")),
+            ("type", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![dict(vec![
+                    ("time", num(40)),
+                    ("type", num(2)),
+                    (
+                        "content",
+                        dict(vec![
+                            // The motion bit tells the reader that the frame
+                            // carries a motion sub-object.
+                            ("mask", num(0x80001)),
+                            ("src", text("motion/title_bg/char_move")),
+                            (
+                                "motion",
+                                dict(vec![("mask", num(0)), ("timeOffset", num(10))]),
+                            ),
+                        ]),
+                    ),
+                ])]),
+            ),
+        ]);
+        let logo = dict(vec![
+            ("label", text("logo")),
+            ("type", num(0)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    dict(vec![
+                        ("time", num(0)),
+                        ("type", num(3)),
+                        (
+                            "content",
+                            dict(vec![
+                                ("src", text("src/title/logo")),
+                                ("coord", PsbValue::List(vec![num(0), num(0)])),
+                            ]),
+                        ),
+                    ]),
+                    dict(vec![
+                        ("time", num(30)),
+                        ("type", num(3)),
+                        (
+                            "content",
+                            dict(vec![
+                                ("src", text("src/title/logo")),
+                                ("coord", PsbValue::List(vec![num(300), num(0)])),
+                            ]),
+                        ),
+                    ]),
+                    dict(vec![("time", num(60)), ("type", num(0))]),
+                ]),
+            ),
+        ]);
+        let title = dict(vec![
+            ("lastTime", num(120)),
+            ("layer", PsbValue::List(vec![main])),
+        ]);
+        let char_move = dict(vec![
+            ("lastTime", num(60)),
+            ("layer", PsbValue::List(vec![logo])),
+        ]);
+        let object = dict(vec![(
+            "title_bg",
+            dict(vec![(
+                "motion",
+                dict(vec![("title", title), ("char_move", char_move)]),
+            )]),
+        )]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root: dict(vec![("object", object)]),
+                resources: Vec::new(),
+            },
+            "title.psb",
+        );
+        let nodes = build_node_tree(&snapshot, snapshot.clip("title"));
+        let child = nodes
+            .iter()
+            .find(|node| node.label == "logo")
+            .expect("the child clip layer is expanded");
+        // The child starts at the parent keyframe and its own offset shifts the
+        // clock the other way.
+        assert_eq!(child.time_offset, 30.0);
+        assert_eq!(child.visible_from, 40.0);
+        // A parent clock of 40 puts the child at its own t=10, which is a third
+        // of the way to the second keyframe.
+        let state = evaluate_frames(&child.frames, 40.0 - child.time_offset, 0);
+        assert!(
+            (state.x - 100.0).abs() < 1e-9,
+            "the offset must move the child pose: {}",
+            state.x
         );
     }
 
@@ -2251,7 +2491,7 @@ mod tests {
                 ..Frame::default()
             },
         ];
-        let state = evaluate_frames(&frames, 57.5);
+        let state = evaluate_frames(&frames, 57.5, 0);
         let expected_x = 100.0 * cubic(position, 0.5);
         let expected_scale = 1.0 + cubic(zoom, 0.5);
         assert!(
@@ -2295,7 +2535,7 @@ mod tests {
                 ..Frame::default()
             },
         ];
-        let state = evaluate_frames(&frames, 5.0);
+        let state = evaluate_frames(&frames, 5.0, 0);
         assert_eq!(state.x, 50.0);
         assert_eq!(state.scale_x, 1.5);
     }

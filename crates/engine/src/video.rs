@@ -26,6 +26,13 @@
 //! a relative position by `dt * play_rate`: the two are equivalent for a
 //! monotonically increasing clock, and a relative step is directly testable.
 //!
+//! The position is kept with sub-millisecond resolution
+//! ([`VideoOverlay::position_exact_ms`]) and never rounded per step: a
+//! step of `1000/60` ms is `16.666…` ms, and rounding it to `17` ms would
+//! make the clock run two percent fast and skip a frame's worth of audio
+//! on every step. [`VideoOverlay::position_ms`] rounds the accumulated
+//! value for the script surface.
+//!
 //! # Events (explicit state)
 //!
 //! Play/pause/stop, loop wraps, period events and stream completion are
@@ -226,7 +233,9 @@ pub struct VideoOverlay {
     spec: Option<VideoSpec>,
     status: PlayStatus,
     playing: bool,
-    position_ms: i64,
+    /// The playback position in milliseconds, with sub-millisecond
+    /// resolution. The script-visible position is this value rounded.
+    position_exact_ms: f64,
     /// The playback-rate multiplier (`1.0` is native speed). It stores any
     /// value it is given.
     pub play_rate: f64,
@@ -243,6 +252,9 @@ pub struct VideoOverlay {
     binding: OverlayBinding,
     frame: Option<RgbaFrame>,
     last_frame_update: i64,
+    /// Whether the last [`Self::advance`] put the clock back to a loop
+    /// boundary.
+    restarted_at_loop: bool,
     pending: Vec<VideoEvent>,
 }
 
@@ -252,7 +264,7 @@ impl Default for VideoOverlay {
             spec: None,
             status: PlayStatus::Unload,
             playing: false,
-            position_ms: 0,
+            position_exact_ms: 0.0,
             play_rate: 1.0,
             looping: false,
             segment_start: -1,
@@ -268,6 +280,7 @@ impl Default for VideoOverlay {
             },
             frame: None,
             last_frame_update: -1,
+            restarted_at_loop: false,
             pending: Vec::new(),
         }
     }
@@ -313,7 +326,7 @@ impl VideoOverlay {
         let was_open = self.spec.is_some();
         self.spec = Some(spec);
         self.playing = false;
-        self.position_ms = 0;
+        self.position_exact_ms = 0.0;
         self.play_rate = 0.0;
         self.preparing = false;
         self.period_past = false;
@@ -336,7 +349,7 @@ impl VideoOverlay {
     pub fn close(&mut self) {
         self.spec = None;
         self.playing = false;
-        self.position_ms = 0;
+        self.position_exact_ms = 0.0;
         self.preparing = false;
         self.frame = None;
         self.last_frame_update = -1;
@@ -408,7 +421,7 @@ impl VideoOverlay {
     pub fn stop(&mut self) -> Result<(), VideoError> {
         self.require_open()?;
         self.playing = false;
-        self.position_ms = 0;
+        self.position_exact_ms = 0.0;
         self.play_rate = 0.0;
         self.set_status(PlayStatus::Stop);
         Ok(())
@@ -417,7 +430,7 @@ impl VideoOverlay {
     /// Rewind to frame 0 without changing the playing/paused state, re-arming
     /// a period event that had already passed (reference `vo_rewind`).
     pub fn rewind(&mut self) {
-        self.position_ms = 0;
+        self.position_exact_ms = 0.0;
         if self.period_event_frame >= 0 && self.period_past {
             self.period_past = false;
         }
@@ -441,14 +454,49 @@ impl VideoOverlay {
 
     // -- position / duration ----------------------------------------------
 
-    /// The current playback position in milliseconds.
+    /// The current playback position in milliseconds, rounded to the nearest
+    /// millisecond.
     pub fn position_ms(&self) -> i64 {
-        self.position_ms
+        self.position_exact_ms.round() as i64
+    }
+
+    /// The current playback position in milliseconds, with sub-millisecond
+    /// resolution.
+    ///
+    /// This is the clock the picture and the sound are compared against; it
+    /// is never rounded per step, so a step of `1000/60` ms accumulates to
+    /// exactly the elapsed time.
+    pub fn position_exact_ms(&self) -> f64 {
+        self.position_exact_ms
     }
 
     /// The current integer frame index.
     pub fn frame(&self) -> i64 {
-        ms_to_frame(self.fps(), self.position_ms)
+        ms_to_frame(self.fps(), self.position_ms())
+    }
+
+    /// Put the clock on an absolute position without a seek.
+    ///
+    /// The position moves, but no seek and no period event is produced: the
+    /// picture follows the sound, and the sound's clock moves on its own.
+    ///
+    /// The value is clamped at `>= 0`.
+    pub fn sync_clock(&mut self, milliseconds: f64) {
+        if !milliseconds.is_finite() {
+            return;
+        }
+        self.position_exact_ms = milliseconds.max(0.0);
+    }
+
+    /// Whether the last [`Self::advance`] put the clock back to a loop
+    /// boundary.
+    ///
+    /// A whole-stream loop and a segment loop both restart the clock at
+    /// their start frame. A caller that keeps a sound in step with the
+    /// picture reads this to place the sound back onto the picture's
+    /// position.
+    pub fn restarted_at_loop(&self) -> bool {
+        self.restarted_at_loop
     }
 
     /// The stream duration in milliseconds (0 when closed).
@@ -472,14 +520,14 @@ impl VideoOverlay {
     /// Seek to `milliseconds` (clamped to `>= 0`). The reference `position`
     /// setter does not touch the period event.
     pub fn seek_ms(&mut self, milliseconds: i64) {
-        self.position_ms = milliseconds.max(0);
+        self.position_exact_ms = milliseconds.max(0) as f64;
     }
 
     /// Seek to `frame` (clamped to `>= 0`). A period event whose frame is at
     /// or after the new position is re-armed when it had already passed
     /// (reference `frame` setter).
     pub fn seek_frame(&mut self, frame: i64) {
-        self.position_ms = frame_to_ms(self.fps(), frame.max(0));
+        self.position_exact_ms = frame_to_ms(self.fps(), frame.max(0)) as f64;
         if self.period_event_frame >= frame && self.period_past {
             self.period_past = false;
         }
@@ -659,6 +707,7 @@ impl VideoOverlay {
     /// frame 0 and queues a `perLoop` period event. A configured period event
     /// fires once per arming.
     pub fn advance(&mut self, dt_ms: f64) {
+        self.restarted_at_loop = false;
         if !self.playing || !dt_ms.is_finite() || dt_ms < 0.0 {
             return;
         }
@@ -683,12 +732,15 @@ impl VideoOverlay {
         }
 
         let rate = self.play_rate;
-        self.position_ms = self
-            .position_ms
-            .saturating_add((dt_ms * rate).round() as i64)
-            .max(0);
+        // The step is not rounded: a rounded step accumulates a systematic
+        // error (a `1000/60` ms step rounds up by a third of a millisecond,
+        // two percent over a second). A step that is not a number advances
+        // nothing; an infinite step runs the clock to the end of the stream.
+        let step = dt_ms * rate;
+        let step = if step.is_nan() { 0.0 } else { step };
+        self.position_exact_ms = (self.position_exact_ms + step).max(0.0);
 
-        let frame = ms_to_frame(fps, self.position_ms);
+        let frame = ms_to_frame(fps, self.position_ms());
 
         // A configured segment loops back before the whole-stream end,
         // whether or not whole-stream looping is enabled.
@@ -699,20 +751,22 @@ impl VideoOverlay {
                 0
             };
             self.seek_frame(start);
+            self.restarted_at_loop = true;
             self.pending
                 .push(VideoEvent::Period(PeriodReason::SegmentLoop));
             return;
         }
 
         let end_ms = frame_to_ms(fps, total);
-        if frame >= total || self.position_ms >= end_ms {
+        if frame >= total || self.position_ms() >= end_ms {
             if self.looping {
                 self.rewind();
+                self.restarted_at_loop = true;
                 self.pending.push(VideoEvent::Period(PeriodReason::Loop));
             } else {
                 // The reference `EC_COMPLETE` handler calls `Stop()`, which
                 // rewinds to the start, before reporting the stop status.
-                self.position_ms = 0;
+                self.position_exact_ms = 0.0;
                 self.playing = false;
                 self.set_status(PlayStatus::Stop);
                 self.pending.push(VideoEvent::TransitionComplete);

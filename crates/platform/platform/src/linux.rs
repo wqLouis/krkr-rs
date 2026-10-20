@@ -801,6 +801,11 @@ pub(crate) mod audio {
         state.playing
     }
 
+    /// How much audio the software queue still holds, in seconds.
+    pub(crate) fn queued_seconds(state: &StreamState) -> f64 {
+        lock_queue(&state.queue).queued_seconds()
+    }
+
     /// Returns the first available cpal host without panicking.
     fn open_host() -> Result<cpal::Host, PlatformError> {
         let id = cpal::available_hosts().into_iter().next().ok_or_else(|| {

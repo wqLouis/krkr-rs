@@ -217,6 +217,24 @@ impl AudioDevice {
             _ => false,
         }
     }
+
+    /// How much audio the device has buffered, in seconds.
+    ///
+    /// This is the delay between the audio the producer wrote and the audio
+    /// the listener hears: a voice's rendered position runs that much ahead of
+    /// the position the sound has reached. A caller that keeps a picture in
+    /// step with a sound reads it here and hands it to the mixer.
+    ///
+    /// The mock device reports `0.0`: it discards what it is given, so it
+    /// adds no playback delay, and its queue's depth is an artefact of the
+    /// mock rather than a delay the listener would hear.
+    pub fn queued_seconds(&self, state: &AudioOutputState) -> f64 {
+        match (&self.kind, &state.kind) {
+            (DeviceKind::Null, StateKind::Null(_)) => 0.0,
+            (DeviceKind::Real(_), StateKind::Real(stream)) => backend::queued_seconds(stream),
+            _ => 0.0,
+        }
+    }
 }
 
 /// Rejects a spec that cannot describe a stream.

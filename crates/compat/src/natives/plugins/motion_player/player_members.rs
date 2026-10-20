@@ -37,16 +37,16 @@ fn number_pair(ctx: &CompatCtx, first: f64, second: f64) -> Result<RetainedValue
 
 mp_get_real!(player_get_x, PlayerInst, |p: &PlayerInst| p.coord.x.value()
     as f64);
-mp_set_real!(player_set_x, PlayerInst, |p: &mut PlayerInst, v: f64| p
-    .coord
-    .x
-    .set(v as f32));
+mp_set_real!(player_set_x, PlayerInst, |p: &mut PlayerInst, v: f64| {
+    p.coord.x.set(v as f32);
+    p.layers_dirty = true;
+});
 mp_get_real!(player_get_y, PlayerInst, |p: &PlayerInst| p.coord.y.value()
     as f64);
-mp_set_real!(player_set_y, PlayerInst, |p: &mut PlayerInst, v: f64| p
-    .coord
-    .y
-    .set(v as f32));
+mp_set_real!(player_set_y, PlayerInst, |p: &mut PlayerInst, v: f64| {
+    p.coord.y.set(v as f32);
+    p.layers_dirty = true;
+});
 
 mp_get_int!(
     player_get_completion,
@@ -326,15 +326,15 @@ mp_get_int!(player_get_mask, PlayerInst, |p: &PlayerInst| p.mask_mode
 mp_set_int!(player_set_mask, PlayerInst, |p: &mut PlayerInst, v: i64| {
     p.mask_mode = v as i32
 });
-mp_get_int!(
-    player_get_color_weight,
-    PlayerInst,
-    |p: &PlayerInst| p.color_weight as i64
-);
+mp_get_int!(player_get_color_weight, PlayerInst, |p: &PlayerInst| {
+    i64::from(super::animator::swap_packed_rb(p.color_weight))
+});
 mp_set_int!(
     player_set_color_weight,
     PlayerInst,
-    |p: &mut PlayerInst, v: i64| { p.color_weight = v as u32 }
+    |p: &mut PlayerInst, v: i64| {
+        p.color_weight = super::animator::swap_packed_rb(v as u32);
+    }
 );
 mp_get_bool!(player_get_independent, PlayerInst, |p: &PlayerInst| p
     .independent_layer_inherit);
@@ -722,6 +722,8 @@ extern "C" fn player_set_rotate(
     let ease = arguments.get(2).map(value_as_f64).unwrap_or(0.0);
     inst.rotate
         .transition_to(rotate as f32, transition as f32, ease_weight(ease));
+    // The rotation is part of the evaluated pose, so the layer tree is stale.
+    inst.layers_dirty = true;
     if emote {
         // `EmotePlayer::setRot` marks the shell dirty
         // (`reference/cpp/plugins/motionplayer/EmotePlayer.cpp:295-299`).
@@ -1060,8 +1062,10 @@ mp_method_void!(
     player_clear_cache,
     PlayerInst,
     |p: &mut PlayerInst, _args: &[Value], _ctx: &CompatCtx| {
-        p.layer_ids.clear();
-        p.layer_names.clear();
+        // The source cache holds the decoded sources: clearing it drops the
+        // tinted bitmaps and the decoded pixel chunks, so the next draw reads
+        // and decodes them again.
+        p.clear_cache();
         Ok(())
     }
 );
@@ -1137,6 +1141,7 @@ mp_method_void!(
         // (`reference/cpp/plugins/motionplayer/Player.h:327`).
         super::helpers::require_args(args, 1, "setFlip")?;
         p.flip = value_as_bool(&args[0]);
+        p.layers_dirty = true;
         Ok(())
     }
 );
@@ -1149,6 +1154,7 @@ mp_method_void!(
         // (`reference/cpp/plugins/motionplayer/Player.h:328`).
         super::helpers::require_args(args, 1, "setOpacity")?;
         p.opacity = value_as_f64(&args[0]);
+        p.layers_dirty = true;
         Ok(())
     }
 );
@@ -1161,6 +1167,7 @@ mp_method_void!(
         // (`reference/cpp/plugins/motionplayer/Player.h:329`).
         super::helpers::require_args(args, 1, "setVisible")?;
         p.visible = value_as_bool(&args[0]);
+        p.layers_dirty = true;
         Ok(())
     }
 );
@@ -1173,6 +1180,7 @@ mp_method_void!(
         // (`reference/cpp/plugins/motionplayer/Player.h:330`).
         super::helpers::require_args(args, 1, "setSlant")?;
         p.slant = value_as_f64(&args[0]);
+        p.layers_dirty = true;
         Ok(())
     }
 );
@@ -1185,6 +1193,7 @@ mp_method_void!(
         // (`reference/cpp/plugins/motionplayer/Player.h:331`).
         super::helpers::require_args(args, 1, "setZoom")?;
         p.zoom = value_as_f64(&args[0]);
+        p.layers_dirty = true;
         Ok(())
     }
 );
@@ -1193,12 +1202,7 @@ mp_method_variant!(
     player_get_layer_names,
     PlayerInst,
     |p: &mut PlayerInst, _args: &[Value], ctx: &CompatCtx| {
-        let names: Vec<String> = p
-            .nodes
-            .iter()
-            .filter(|node| node.own)
-            .map(|node| node.label.clone())
-            .collect();
+        let names = p.layer_labels();
         string_list(ctx, &names)
     }
 );
@@ -1231,6 +1235,14 @@ mp_method_variant!(
         engine
             .set_member(object.raw_id(), "zoom", &TjsValue::Real(p.zoom))
             .map_err(|error| error.to_string())?;
+        // The view carries the flip the setter stores.
+        engine
+            .set_member(
+                object.raw_id(),
+                "flip",
+                &TjsValue::Integer(i64::from(p.flip)),
+            )
+            .map_err(|error| error.to_string())?;
         Ok(RetainedValue::Object(object))
     }
 );
@@ -1259,7 +1271,7 @@ mp_method_variant!(
         // (`reference/cpp/plugins/motionplayer/Player.h:336`).
         super::helpers::require_args(args, 1, "getLayerGetter")?;
         let name = value_as_string(&args[0]);
-        let Some(node) = p.nodes.iter().find(|node| node.own && node.label == name) else {
+        let Some(node) = p.layer_node(&name) else {
             return Ok(RetainedValue::Value(TjsValue::Void));
         };
         let node = node.clone();
@@ -1274,7 +1286,14 @@ mp_method_variant!(
         let array = eval_object(ctx, "[]")?;
         // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for this callback.
         let engine = unsafe { ctx.engine() };
-        for (index, node) in p.nodes.iter().filter(|node| node.own).enumerate() {
+        // The list holds a getter per node but the root, which has no layer
+        // of its own.
+        for (index, node) in p
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(index, node)| *index != 0 && node.own)
+        {
             let getter = p.layer_getter_object(ctx, node)?;
             let id = getter.raw_id().as_ptr() as usize as u64;
             engine
@@ -1393,14 +1412,7 @@ mp_method_int!(
         super::helpers::require_args(args, 1, "countVariableFrameAt")?;
         p.ensure_motion_loaded(ctx)?;
         let index = value_as_i64(&args[0]).max(0) as usize;
-        let label = p
-            .snapshot()
-            .and_then(|snapshot| snapshot.variable_labels.get(index).cloned())
-            .unwrap_or_default();
-        Ok(p.snapshot()
-            .and_then(|snapshot| snapshot.variable_frames.get(&label))
-            .map(|frames| frames.len() as i64)
-            .unwrap_or(0))
+        Ok(p.variable_frames_at(index).len() as i64)
     }
 );
 
@@ -1416,13 +1428,8 @@ mp_method_string!(
         p.ensure_motion_loaded(ctx)?;
         let index = value_as_i64(&args[0]).max(0) as usize;
         let frame = value_as_i64(&args[1]).max(0) as usize;
-        let label = p
-            .snapshot()
-            .and_then(|snapshot| snapshot.variable_labels.get(index).cloned())
-            .unwrap_or_default();
-        Ok(p.snapshot()
-            .and_then(|snapshot| snapshot.variable_frames.get(&label))
-            .and_then(|frames| frames.get(frame))
+        Ok(p.variable_frames_at(index)
+            .get(frame)
             .map(|frame| frame.label.clone())
             .unwrap_or_default())
     }
@@ -1440,13 +1447,8 @@ mp_method_real!(
         p.ensure_motion_loaded(ctx)?;
         let index = value_as_i64(&args[0]).max(0) as usize;
         let frame = value_as_i64(&args[1]).max(0) as usize;
-        let label = p
-            .snapshot()
-            .and_then(|snapshot| snapshot.variable_labels.get(index).cloned())
-            .unwrap_or_default();
-        Ok(p.snapshot()
-            .and_then(|snapshot| snapshot.variable_frames.get(&label))
-            .and_then(|frames| frames.get(frame))
+        Ok(p.variable_frames_at(index)
+            .get(frame)
             .map(|frame| frame.value)
             .unwrap_or(0.0))
     }
@@ -2213,6 +2215,8 @@ mp_method_void!(
             .y
             .transition_to(y as f32, time as f32, ease_weight(ease));
         p.modified = true;
+        // The coordinates move the pose, so the layer tree is stale.
+        p.layers_dirty = true;
         Ok(())
     }
 );
@@ -2230,6 +2234,8 @@ mp_method_void!(
         p.scale
             .transition_to(scale as f32, time as f32, ease_weight(ease));
         p.modified = true;
+        // The scale changes the pose, so the layer tree is stale.
+        p.layers_dirty = true;
         Ok(())
     }
 );

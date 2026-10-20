@@ -529,9 +529,48 @@ fn mix_source_accumulates_into_the_caller_buffer() {
     ));
 }
 
+/// The number of source frames the kernel convolves per output frame.
+const RESAMPLE_TAPS: usize = 65;
+
+/// The frames the kernel reaches back from the interpolated frame.
+const RESAMPLE_HALF: usize = RESAMPLE_TAPS / 2;
+
+/// The Blackman window over the kernel.
+fn resample_window() -> [f64; RESAMPLE_TAPS] {
+    let mut window = [0.0f64; RESAMPLE_TAPS];
+    for (k, value) in window.iter_mut().enumerate() {
+        let t = k as f64 / (RESAMPLE_TAPS - 1) as f64;
+        let phase = std::f64::consts::PI * t;
+        *value = 0.42 - 0.5 * phase.cos() + 0.08 * (2.0 * phase).cos();
+    }
+    window
+}
+
+/// The windowed-sinc weights for the fractional source position `frac`.
+///
+/// The sinc's argument is `m - frac` with an integer `m`, so every tap's
+/// sine comes from the same `sin(pi * frac)`.
+fn resample_weights(frac: f64, window: &[f64; RESAMPLE_TAPS]) -> [f64; RESAMPLE_TAPS] {
+    let sin = (std::f64::consts::PI * frac).sin();
+    let mut weights = [0.0f64; RESAMPLE_TAPS];
+    for (k, weight) in weights.iter_mut().enumerate() {
+        let m = k as i64 - RESAMPLE_HALF as i64;
+        let distance = m as f64 - frac;
+        let sinc = if distance.abs() < f64::EPSILON {
+            1.0
+        } else {
+            let sign = if m.rem_euclid(2) == 0 { -1.0 } else { 1.0 };
+            sign * sin / (std::f64::consts::PI * distance)
+        };
+        *weight = sinc * window[k];
+    }
+    weights
+}
+
 /// Resample `source` into `out` one frame at a time with `SoundSource::frame`.
 /// This is the per-frame reference the bulk window path must stay
-/// byte-identical to.
+/// byte-identical to: the bulk path reads a window of source frames and
+/// convolves it, this one reads the frames the kernel needs one by one.
 fn mix_source_per_frame(
     source: &SoundSource,
     position_seconds: f64,
@@ -544,10 +583,10 @@ fn mix_source_per_frame(
     let out_channels = usize::try_from(out_spec.channels).expect("channel count fits");
     let out_rate = f64::from(out_spec.sample_rate);
     let src_rate = f64::from(source.sample_rate().max(1));
-    let src_channels = usize::try_from(source.channels()).expect("channel count fits");
     let rate = if rate.is_finite() { rate } else { 1.0 };
     let p = pan.clamp(-1.0, 1.0);
     let (left_gain, right_gain) = (1.0 - p.max(0.0), 1.0 - (-p).max(0.0));
+    let window = resample_window();
     for (index, frame) in out.chunks_exact_mut(out_channels).enumerate() {
         let t = position_seconds + index as f64 / out_rate * rate;
         let sample_pos = (t * src_rate).max(0.0);
@@ -556,20 +595,29 @@ fn mix_source_per_frame(
         }
         let i0 = sample_pos.floor();
         let i0u = i0 as u64;
-        let frac = (sample_pos - i0) as f32;
-        let Some((a0, b0)) = source.frame(i0u).expect("read") else {
-            continue;
-        };
-        let (a1, b1) = source
-            .frame(i0u.saturating_add(1))
-            .expect("read")
-            .unwrap_or((a0, b0));
-        let (left, right) = if src_channels == 1 {
-            let s = a0 + (a1 - a0) * frac;
-            (s, s)
-        } else {
-            (a0 + (a1 - a0) * frac, b0 + (b1 - b0) * frac)
-        };
+        let frac = sample_pos - i0;
+        let weights = resample_weights(frac, &window);
+        let mut left = 0.0f64;
+        let mut right = 0.0f64;
+        let mut weight_sum = 0.0f64;
+        for (k, weight) in weights.iter().enumerate() {
+            let frame_index = i0u as i64 - RESAMPLE_HALF as i64 + k as i64;
+            if frame_index < 0 {
+                continue;
+            }
+            let Some((a, b)) = source.frame(frame_index as u64).expect("read") else {
+                continue;
+            };
+            left += weight * f64::from(a);
+            right += weight * f64::from(b);
+            weight_sum += weight;
+        }
+        if weight_sum.abs() > f64::EPSILON {
+            left /= weight_sum;
+            right /= weight_sum;
+        }
+        let left = left as f32;
+        let right = right as f32;
         if out_channels == 1 {
             frame[0] += (left * left_gain + right * right_gain) * 0.5 * gain;
         } else {
@@ -1336,4 +1384,229 @@ fn decode_ahead_preserves_samples_across_chunks() {
         .unwrap();
         assert_eq!(expected, observed, "streaming differs at {position}s");
     }
+}
+
+/// A ramp source stays continuous across ordinary mixer polls: the voice
+/// keeps the mixer's own clock, so every rendered sample follows the one
+/// before it by the ramp's step.
+///
+/// A voice that was placed on another clock on every poll would jump by that
+/// clock's step instead, which is a cut in the middle of the waveform. The
+/// movie audio is never placed that way: the reference appends the decoded
+/// frames to a sound buffer that the device plays at its own rate
+/// (`reference/cpp/core/movie/ffmpeg/AEFactory.cpp:210-219`).
+#[test]
+fn a_ramp_source_stays_continuous_across_mixer_polls() {
+    /// The output rate, and the ramp's rate.
+    const RATE: u32 = 48_000;
+    /// The ramp's step per sample; the whole track spans one unit.
+    const STEP: f32 = 1.0 / 576_000.0;
+
+    let mut mixer = Mixer::new();
+    let id = mixer.spawn_channel();
+    mixer
+        .channel(id)
+        .unwrap()
+        .play(ramp_source(RATE, 1, 12.0, STEP));
+
+    // One 60 Hz frame at 48 kHz.
+    let mut out = vec![0.0f32; 800];
+    // The resampler's kernel reaches a few frames back, so the first samples of
+    // a track are interpolated with a truncated kernel. Render one chunk
+    // before the measurements start.
+    mixer.mix_advancing(&mut out, out_spec(RATE, 1)).unwrap();
+    let mut previous: Option<f32> = None;
+    for _ in 0..600 {
+        mixer.mix_advancing(&mut out, out_spec(RATE, 1)).unwrap();
+        for sample in &out {
+            if let Some(last) = previous {
+                let delta = sample - last;
+                assert!(delta > 0.0, "the ramp did not rise: {delta} after {last}");
+                assert!(
+                    delta < STEP * 2.0,
+                    "the ramp jumped: {delta} instead of {STEP}"
+                );
+            }
+            previous = Some(*sample);
+        }
+    }
+}
+
+/// A ramp source: every sample is one step above the one before it.
+fn ramp_source(rate: u32, channels: u32, seconds: f64, step: f32) -> Arc<SoundSource> {
+    let frames = (rate as f64 * seconds) as usize;
+    let mut interleaved =
+        Vec::with_capacity(frames * usize::try_from(channels).expect("channels fit"));
+    for frame in 0..frames {
+        let value = frame as f32 * step;
+        for _ in 0..channels {
+            interleaved.push(value);
+        }
+    }
+    let spec = AudioSpec {
+        sample_rate: rate,
+        channels,
+        total_frames: Some(frames as u64),
+    };
+    Arc::new(
+        SoundSource::new(Arc::new(DecodedAudio::new(spec, interleaved))).expect("valid source"),
+    )
+}
+
+/// The played position is the rendered position minus the output latency.
+///
+/// The audio device holds a queue of rendered samples, so the sound has
+/// reached the listener that much earlier than the mixer has rendered it.
+/// The reference compensates the same delay
+/// (`reference/cpp/core/movie/ffmpeg/AEFactory.cpp:228`).
+#[test]
+fn the_played_position_is_the_rendered_position_minus_the_latency() {
+    let mut mixer = Mixer::new();
+    let id = mixer.spawn_channel();
+    mixer.channel(id).unwrap().play(tone(44100, 1, 2.0));
+    mixer.set_output_latency(0.15);
+    mixer.advance(1.0);
+
+    let channel = mixer.channel_ref(id).unwrap();
+    assert!((channel.position_seconds() - 1.0).abs() < 1e-9);
+    assert!((channel.played_position_seconds() - 0.85).abs() < 1e-9);
+}
+
+/// A voice created after the latency was set inherits it.
+#[test]
+fn a_new_voice_inherits_the_output_latency() {
+    let mut mixer = Mixer::new();
+    mixer.set_output_latency(0.2);
+    let id = mixer.spawn_channel();
+    mixer.channel(id).unwrap().play(tone(44100, 1, 2.0));
+    mixer.advance(0.5);
+
+    let channel = mixer.channel_ref(id).unwrap();
+    assert!((channel.output_latency() - 0.2).abs() < 1e-9);
+    assert!((channel.played_position_seconds() - 0.3).abs() < 1e-9);
+}
+
+/// A voice that has not rendered anything yet has reached nothing.
+#[test]
+fn the_played_position_never_goes_below_zero() {
+    let mut mixer = Mixer::new();
+    let id = mixer.spawn_channel();
+    mixer.channel(id).unwrap().play(tone(44100, 1, 2.0));
+    mixer.set_output_latency(1.0);
+    mixer.advance(0.5);
+
+    let channel = mixer.channel_ref(id).unwrap();
+    assert_eq!(channel.played_position_seconds(), 0.0);
+}
+
+/// A sine tone at `frequency` as a decoded source.
+fn tone_at(rate: u32, channels: u32, seconds: f64, frequency: f64) -> Arc<SoundSource> {
+    let frames = (rate as f64 * seconds) as usize;
+    let mut interleaved =
+        Vec::with_capacity(frames * usize::try_from(channels).expect("channels fit"));
+    for f in 0..frames {
+        let value = (2.0 * PI * frequency * f as f64 / rate as f64).sin() as f32 * 0.5;
+        for _ in 0..channels {
+            interleaved.push(value);
+        }
+    }
+    let spec = AudioSpec {
+        sample_rate: rate,
+        channels,
+        total_frames: Some(frames as u64),
+    };
+    Arc::new(
+        SoundSource::new(Arc::new(DecodedAudio::new(spec, interleaved))).expect("valid source"),
+    )
+}
+
+/// The root-mean-square of `samples`.
+fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = samples
+        .iter()
+        .map(|sample| f64::from(*sample) * f64::from(*sample))
+        .sum();
+    (sum / samples.len() as f64).sqrt() as f32
+}
+
+/// A source at another rate keeps its high end.
+///
+/// The mixer converts a source to the output rate with a windowed-sinc
+/// kernel. A plain interpolation between the neighbouring frames would
+/// attenuate a tone near the source's Nyquist frequency: a 15 kHz tone in a
+/// 44.1 kHz source would come out a fifth of its level low, and the spectrum
+/// above the source's Nyquist frequency would fold back. The kernel keeps the
+/// tone at its level.
+#[test]
+fn a_source_at_another_rate_keeps_its_high_end() {
+    let mut mixer = Mixer::new();
+    let id = mixer.spawn_channel();
+    mixer
+        .channel(id)
+        .unwrap()
+        .play(tone_at(44100, 1, 1.0, 15_000.0));
+
+    // 100 ms at 48 kHz, from a 44.1 kHz source.
+    let mut out = vec![0.0f32; 4800];
+    mixer.mix(&mut out, out_spec(48000, 1)).unwrap();
+
+    // The source tone's own level: an amplitude of 0.5 has a root-mean-square
+    // of 0.5 / sqrt(2).
+    let expected = 0.5f32 / 2.0f32.sqrt();
+    let measured = rms(&out);
+    assert!(
+        measured > expected * 0.95,
+        "the tone came out at {measured} instead of {expected}"
+    );
+}
+
+/// The frequency of `samples` measured by its zero crossings, in Hz.
+///
+/// A tone crosses the mean twice per period: once up, once down.
+fn measured_frequency(samples: &[f32], rate: u32) -> f64 {
+    if samples.len() < 4 || rate == 0 {
+        return 0.0;
+    }
+    let mean = samples.iter().sum::<f32>() / samples.len() as f32;
+    let mut crossings = 0usize;
+    let mut previous = samples[0] - mean;
+    for sample in &samples[1..] {
+        let value = sample - mean;
+        // A tone crosses the mean twice per period: once up, once down.
+        if (previous < 0.0) != (value < 0.0) {
+            crossings += 1;
+        }
+        previous = value;
+    }
+    let seconds = samples.len() as f64 / f64::from(rate);
+    crossings as f64 / 2.0 / seconds
+}
+
+/// A source at another rate is converted without shifting its pitch.
+///
+/// The mixer converts a source to the output rate by interpolating between
+/// the neighbouring source frames. The conversion must keep the pitch: a
+/// movie track that plays a fifth too high or too low is a defect no rate
+/// conversion may have. The conversion is a plain interpolation and not a
+/// band-limited resampler, so content near the source's Nyquist frequency is
+/// attenuated and folded back; that is a known divergence from the audio
+/// device's own resampler.
+#[test]
+fn a_source_at_another_rate_keeps_its_pitch() {
+    let mut mixer = Mixer::new();
+    let id = mixer.spawn_channel();
+    mixer.channel(id).unwrap().play(tone(44100, 1, 1.0));
+
+    // 100 ms at 48 kHz, from a 44.1 kHz source.
+    let mut out = vec![0.0f32; 4800];
+    mixer.mix(&mut out, out_spec(48000, 1)).unwrap();
+
+    let hz = measured_frequency(&out, 48000);
+    assert!(
+        (hz - 440.0).abs() < 5.0,
+        "the tone measured {hz:.1} Hz instead of 440 Hz"
+    );
 }

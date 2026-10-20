@@ -206,6 +206,19 @@ struct ProjectionState {
     next_z: i32,
 }
 
+/// One projection pass plus the layer ids whose pixels it emitted.
+///
+/// `drawn_layers` follows the actual emit path: a layer contributes its id when
+/// it pushes a render node, and a cached layer also contributes the visible
+/// descendants whose pixels are baked into that node's texture.
+#[derive(Debug)]
+pub struct ProjectionReport {
+    /// The projected render tree.
+    pub scene: RenderScene,
+    /// Layer ids whose pixels this projection emitted, in emit order.
+    pub drawn_layers: Vec<u32>,
+}
+
 /// Append one window's drawn layers to `out`.
 ///
 /// `Scene::window_layer_order` is parent-first, so a single forward pass
@@ -218,6 +231,7 @@ fn append_window<F>(
     window: u32,
     out: &mut RenderScene,
     state: &mut ProjectionState,
+    drawn_layers: &mut Vec<u32>,
     texture: &mut F,
 ) where
     F: FnMut(u32) -> Option<Texture>,
@@ -237,10 +251,11 @@ fn append_window<F>(
     // Maps a layer id to the node its children should link to (its own node
     // when drawn, otherwise its nearest drawn ancestor).
     let mut nearest: HashMap<u32, RenderNodeId> = HashMap::new();
-    // Layers whose subtree is drawn through a cache bitmap: the cached layer
-    // itself once its cache is rendered, and every descendant the cache
-    // already contains.
-    let mut cached_subtree: HashSet<u32> = HashSet::new();
+    // Descendants whose pixels are drawn through a cached ancestor, keyed by
+    // the layer that owns the emitted cache bitmap.
+    let mut cache_owner: HashMap<u32, u32> = HashMap::new();
+    // Cached layers whose node was actually emitted this pass.
+    let mut emitted_cached: HashSet<u32> = HashSet::new();
 
     // Why layers produced no node — a scene that renders almost nothing is
     // invisible from the outside (`RUST_LOG=debug` reports it).
@@ -258,17 +273,20 @@ fn append_window<F>(
         // skipped.
         let ancestor_cached = layer
             .parent
-            .is_some_and(|parent| cached_subtree.contains(&parent));
-        if ancestor_cached {
-            cached_subtree.insert(layer_id);
+            .and_then(|parent| cache_owner.get(&parent).copied());
+        if let Some(owner) = ancestor_cached {
+            cache_owner.insert(layer_id, owner);
+            if emitted_cached.contains(&owner) && scene.node_visible(layer_id) {
+                drawn_layers.push(layer_id);
+            }
             continue;
         }
         // The image this layer draws for itself: a transition that blends the
         // layer's image with another layer's without consuming the subtree
         // stores a self image that stands in for the main image. It covers
         // only this layer's own image — the children keep drawing live — so
-        // it never puts the layer into `cached_subtree`.
-        let self_bitmap = layer.transition_self.or(layer.bitmap);
+        // the layer never becomes a cached-subtree root.
+        let self_bitmap = layer.drawn_image();
         // A layer whose cache has been rendered draws that cache instead of
         // its own image and descendants; a layer that merely enabled caching
         // but has no cache bitmap yet (its subtree is trivial) draws normally.
@@ -278,7 +296,7 @@ fn append_window<F>(
             .cache_bitmap
             .filter(|_| layer.cache_enabled_count != 0 && layer.transition_self.is_none());
         if cached_bitmap.is_some() {
-            cached_subtree.insert(layer_id);
+            cache_owner.insert(layer_id, layer_id);
         }
 
         let mut node_composed = layer
@@ -404,6 +422,10 @@ fn append_window<F>(
         match node {
             Some(node) => {
                 drawn += 1;
+                drawn_layers.push(layer_id);
+                if cached_bitmap.is_some() {
+                    emitted_cached.insert(layer_id);
+                }
                 let id = out.push(node);
                 if let Some(parent_node) = out.node_mut(parent_node) {
                     parent_node.children.push(id);
@@ -431,15 +453,34 @@ fn append_window<F>(
 /// visibility already composed. `texture` resolves a bitmap id to an L1
 /// texture handle; the caller owns the texture table and can pass, for
 /// example, `|id| textures.get(&id).cloned()`.
-pub fn project_window<F>(scene: &Scene, window: u32, mut texture: F) -> RenderScene
+pub fn project_window<F>(scene: &Scene, window: u32, texture: F) -> RenderScene
+where
+    F: FnMut(u32) -> Option<Texture>,
+{
+    project_window_report(scene, window, texture).scene
+}
+
+/// Project one window and also return the layer ids whose pixels were emitted.
+pub fn project_window_report<F>(scene: &Scene, window: u32, mut texture: F) -> ProjectionReport
 where
     F: FnMut(u32) -> Option<Texture>,
 {
     let mut out = RenderScene::with_root_node();
     out.background = Some(BACKGROUND_CLEAR);
     let mut state = ProjectionState::default();
-    append_window(scene, window, &mut out, &mut state, &mut texture);
-    out
+    let mut drawn_layers = Vec::new();
+    append_window(
+        scene,
+        window,
+        &mut out,
+        &mut state,
+        &mut drawn_layers,
+        &mut texture,
+    );
+    ProjectionReport {
+        scene: out,
+        drawn_layers,
+    }
 }
 
 /// Project every window of a [`Scene`] into one fresh [`RenderScene`].
@@ -450,15 +491,35 @@ where
 ///
 /// `texture` resolves a bitmap id to an L1 texture handle (see
 /// [`project_window`]).
-pub fn project_scene<F>(scene: &Scene, mut texture: F) -> RenderScene
+pub fn project_scene<F>(scene: &Scene, texture: F) -> RenderScene
+where
+    F: FnMut(u32) -> Option<Texture>,
+{
+    project_scene_report(scene, texture).scene
+}
+
+/// Project every window and also return the layer ids whose pixels were
+/// emitted, in emit order.
+pub fn project_scene_report<F>(scene: &Scene, mut texture: F) -> ProjectionReport
 where
     F: FnMut(u32) -> Option<Texture>,
 {
     let mut out = RenderScene::with_root_node();
     out.background = Some(BACKGROUND_CLEAR);
     let mut state = ProjectionState::default();
+    let mut drawn_layers = Vec::new();
     for window in &scene.windows {
-        append_window(scene, window.id, &mut out, &mut state, &mut texture);
+        append_window(
+            scene,
+            window.id,
+            &mut out,
+            &mut state,
+            &mut drawn_layers,
+            &mut texture,
+        );
     }
-    out
+    ProjectionReport {
+        scene: out,
+        drawn_layers,
+    }
 }

@@ -109,7 +109,7 @@ impl Inner {
 
     /// The decoded audio track for `path`; `Ok(None)` when the container has
     /// no audio stream.
-    fn audio(&mut self, path: &str) -> Result<Option<DecodedAudio>, MediaError> {
+    fn audio(&mut self, path: &str) -> Result<Option<Arc<DecodedAudio>>, MediaError> {
         let media = self.media.clone();
         let stream = self.open(path)?;
         if stream.spec.audio_streams == 0 {
@@ -144,7 +144,7 @@ impl VideoSource for MediaVideoSource {
         self.inner.borrow_mut().frame(path, at_ms)
     }
 
-    fn audio(&mut self, path: &str) -> Result<Option<DecodedAudio>, MediaError> {
+    fn audio(&mut self, path: &str) -> Result<Option<Arc<DecodedAudio>>, MediaError> {
         self.inner.borrow_mut().audio(path)
     }
 }

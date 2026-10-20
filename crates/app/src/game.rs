@@ -124,6 +124,9 @@ struct Polls {
     /// Elapsed milliseconds since the previous frame, forwarded to the layer
     /// transition step.
     dt_ms: f64,
+    /// Elapsed milliseconds since the previous frame, bounded by the audio
+    /// pump's playback cap, forwarded to the movie steps.
+    movie_dt_ms: f64,
     /// Wall-clock cost of each poll in the current frame.
     phases: FramePhases,
     /// Wall-clock cost of the VM tick's non-poll segments.
@@ -136,7 +139,7 @@ impl FrameBody for Polls {
     }
 
     fn video_poll(&mut self, ctx: &mut CompatCtx) -> Result<(), CompatError> {
-        compat::video_advance(ctx, self.dt_ms)
+        compat::video_advance(ctx, self.movie_dt_ms)
     }
 
     fn async_trigger_poll(&mut self, ctx: &mut CompatCtx) -> Result<(), CompatError> {
@@ -152,11 +155,15 @@ impl FrameBody for Polls {
         // The movie frame body advances its overlays and copies the current
         // frame into the layer before the transition step composites it
         // (reference `layerExMovie::OnContinuousCallback`).
-        compat::movie_poll(ctx, self.dt_ms)?;
+        compat::movie_poll(ctx, self.movie_dt_ms)?;
         // The frame body owns the per-frame transition step; the remaining
         // hand-offs are host drains the engine frame consumes after this poll
         // returns.
         compat::advance_transitions(ctx, self.dt_ms).map_err(CompatError::Engine)?;
+        // The script-cached layers composite after the transition step, so a
+        // cache that contains a transition takes the frame just blended, and
+        // before the engine frame uploads and projects.
+        compat::refresh_cached_layers(ctx).map_err(CompatError::Engine)?;
         // SAFETY: `ctx` is bound to a live engine for the callback.
         let services = unsafe { ctx.services() };
         let _ = compat::take_bring_to_front_requests(services);
@@ -391,6 +398,10 @@ impl GameFrame for VmHook<'_> {
     fn before_render(&mut self, now_ms: u64, dt_ms: f64) -> Result<(), String> {
         let hook_started = Instant::now();
         self.polls.dt_ms = dt_ms;
+        // A movie's picture advances by the same bound the audio pump puts on
+        // one frame's playback, so a long frame leaves the picture and the
+        // sound equally far behind.
+        self.polls.movie_dt_ms = dt_ms.min(self.audio.max_chunk_ms());
         // Pointer and touch positions arrive in device pixels while the scene's
         // hit-testing is in VM pixels, so those events are mapped back before
         // the VM sees them. Without a mapping, or at an identity mapping, the
@@ -421,6 +432,13 @@ impl GameFrame for VmHook<'_> {
             .map_err(|error| error.to_string())?;
         self.audio_ms = audio_started.elapsed().as_secs_f64() * 1000.0;
         self.hook_ms = hook_started.elapsed().as_secs_f64() * 1000.0;
+        Ok(())
+    }
+
+    fn after_project(&mut self, drawn_layers: &[u32]) -> Result<(), String> {
+        let ctx = self.vm.compat().ctx().map_err(|error| error.to_string())?;
+        compat::advance_self_updating_transitions(&ctx, drawn_layers)?;
+        compat::refresh_cached_layers(&ctx)?;
         Ok(())
     }
 }

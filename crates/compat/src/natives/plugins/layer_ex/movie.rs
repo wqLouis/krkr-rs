@@ -29,7 +29,7 @@ use tjs::{NativeObjThisMethodDef, Tjs2Engine, Value};
 
 use super::{VideoSource, bound, layer_from_objthis, scene_mut};
 use crate::native_util::{args, report_error, set_bool, set_void};
-use crate::natives::video::{MovieAudio, decoded_audio};
+use crate::natives::video::{MovieAudio, Resync, decoded_audio, frame_resync};
 use crate::natives::visual::{ObjectKind, duplicate_object};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
@@ -77,10 +77,18 @@ impl MovieSlot {
 
     /// Sync the mixer voice with the overlay's current playback state at the
     /// device defaults (unity gain, centre pan).
-    fn sync_audio(&self, services: &CompatServices) {
+    fn sync_audio(&self, services: &CompatServices, resync: Resync) {
         if let Some(audio) = &self.movie_audio {
-            audio.sync(services, &self.overlay, 1.0, 0.0);
+            audio.sync(services, &self.overlay, 1.0, 0.0, resync);
         }
+    }
+
+    /// Put the picture on the sound's position.
+    fn follow_audio(&mut self, services: &CompatServices) {
+        let Some(audio) = self.movie_audio.as_mut() else {
+            return;
+        };
+        audio.follow_picture(services, &mut self.overlay);
     }
 
     /// Drop the mixer voice, if any.
@@ -185,7 +193,7 @@ fn open_movie(ctx: &CompatCtx, layer_id: u32, filename: &str, alpha: bool) -> Re
         match MovieAudio::attach(services, decoded) {
             Ok(movie_audio) => {
                 slot.movie_audio = Some(movie_audio);
-                slot.sync_audio(services);
+                slot.sync_audio(services, Resync::Force);
             }
             Err(error) => {
                 slot.overlay.close();
@@ -218,7 +226,7 @@ fn start_movie(
             .play()
             .map_err(|error| format!("Layer.startMovie: {error}"))?;
         slot.playing = true;
-        slot.sync_audio(services);
+        slot.sync_audio(services, Resync::Force);
     }
     dispatch_callback(ctx, host, layer_id, "onStartMovie");
     Ok(())
@@ -320,7 +328,9 @@ fn copy_frame(ctx: &CompatCtx, slot: &MovieSlot) {
 ///
 /// The host calls this once per frame (reference
 /// `layerExMovie::OnContinuousCallback`). It is a free function (like
-/// `compat::video_poll`) so a host can drive it directly.
+/// `compat::video_poll`) so a host can drive it directly. The host bounds
+/// the step by the same cap its audio pump puts on one frame's playback, so
+/// the picture and the sound fall behind together.
 pub fn movie_poll(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
     // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `movie_poll`.
     let host = unsafe { ctx.engine() };
@@ -339,9 +349,10 @@ pub fn movie_poll(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
             // belonging to the new clock value.
             present(&mut source, slot);
             slot.overlay.advance(dt_ms);
+            slot.follow_audio(services);
             let events = slot.overlay.poll();
             present(&mut source, slot);
-            slot.sync_audio(services);
+            slot.sync_audio(services, frame_resync(&slot.overlay));
             copy_frame(ctx, slot);
 
             let mut ended = false;

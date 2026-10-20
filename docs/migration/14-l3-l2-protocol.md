@@ -182,13 +182,38 @@ mutation revision; the other types are its per-node/state values. Masks,
 province images and other script concepts built on top of these values stay in
 L3 state.
 
+**Layer geometry operations:** `set_layer_image_size` resizes the MainImage
+(preserving the overlap, filling the new space with the neutral colour),
+refreshes the tracked image size, resets the clip and resizes the province
+plane. `internal_set_image_size` wraps it with the rectangle/offset adjustment:
+a smaller image shrinks the rectangle and clears the matching offset, an offset
+that leaves the image short of the rectangle is shifted, then the image takes
+the new size — L3 composes it after every image replacement that must keep the
+layer geometry consistent (`loadImages`, `assignImages`, `setImageSize`,
+`copyFromBitmapToMainImage`). `layer_size_changed` grows the image to cover a
+resized rectangle and clamps the offsets. The two image-size operations return
+`false` when the requested size cannot be represented or allocated; the L3
+native turns that into a script error rather than leaving stale geometry.
+
+**Layer cache operations:** `inc_cache_enabled_count`/`dec_cache_enabled_count`
+are the paired subtree-cache consumer registrations that `Layer.cached` and
+whole-subtree transitions use; the last release frees the layer's composited
+cache and transition frame. `render_layer_subtree` returns the composited
+subtree content (or the MainImage for a trivial subtree) and allocates the
+cache content on demand; the frame body composites the script-cached layers
+with it after the transition step and before the upload and projection, and
+publishes the result as the layer's cache bitmap unless it is the layer's own
+MainImage. A layer owned by an active transition, or one whose subtree contains
+a whole-subtree transition, keeps drawing live instead.
+
 **Coordinates:** all rects and bitmap dimensions are VM pixels; bitmap buffers
 are VM-sized because scripts read them back through L3. L2 projects them into
 device space; L3 never sees that projection.
 
-**Errors:** these are infallible state values. Mutations that can fail are
-validated by the operation that receives script input (a typed error in
-`storage`/`text`, an `Option` from `layer_ops`, or a script-level check in L3).
+**Errors:** the state values themselves are infallible. A mutation that can
+fail reports it through the operation that received script input: `false`/`None`
+from the geometry and cache operations, a typed error in `storage`/`text`, or a
+script-level check in L3.
 
 **Lifetime:** `Scene` is attached to `CompatServices` as `*mut Scene`; it must
 outlive the binding.
@@ -337,8 +362,7 @@ plugin-specific gathers/scatters that have no higher-level operation.
 
 **Items:** `AffineBlit`, `BlitOptions`, `BlitSource`, `COPY_MAIN`, `COPY_MASK`,
 `GammaAdjust`, `RectI`, `adjust_gamma`, `affine_blit`, `blit_copy`,
-`blit_over`, `blit_plane`, `blur_bitmap_in_place`, `clear_transition_self_image`,
-`clip_rect`, `convert_add_alpha_to_alpha`, `convert_alpha_to_add_alpha`,
+`blit_over`, `blit_plane`, `blur_bitmap_in_place`, `clip_rect`, `convert_add_alpha_to_alpha`, `convert_alpha_to_add_alpha`,
 `copy_9patch`, `do_gray_scale`, `ensure_transition_display`,
 `ensure_transition_self_image`, `fill_color_hold_alpha`,
 `fill_color_on_add_alpha`, `fill_color_on_alpha`, `fill_mask`, `flip_lr`,
@@ -354,9 +378,9 @@ The layer slots they allocate are part of the layer state: a whole-subtree
 transition blends into `ensure_transition_display`'s frame (drawn in place of
 the subtree), and a transition that keeps its children live blends into
 `ensure_transition_self_image`'s image (drawn in place of the layer's own
-image, with the children still projected). `clear_transition_self_image`
-drops the self image when the transition ends; the slot is never part of the
-subtree cache, so releasing the cache leaves it alone.
+image, with the children still projected). The transition teardown clears the
+slot through `Scene::set_transition_self_image(..., None)`; the slot is never
+part of the subtree cache, so releasing the cache leaves it alone.
 
 **Coordinates:** VM pixels; `RectI`/clip rects are VM, and bitmap buffers are
 VM-sized. The primitives do not apply the device translation — the projection

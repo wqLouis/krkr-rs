@@ -9,13 +9,11 @@
 //! Channel payloads are independent, so a layer's channels expand on a
 //! fork-join pool when the payload is large enough to pay for the pool;
 //! `PARALLEL_DECODE_BYTES` chooses the schedule, never the output. The 8-bit
-//! plane-to-RGBA and mask-to-alpha passes run through `crate::simd`, whose
-//! vector prefix leaves the tail and the short-slice rules to the scalar loops
-//! here. Nothing is cached: every call owns its pool, its level and its buffers.
+//! plane-to-RGBA and mask-to-alpha passes run through `crate::simd`. Nothing
+//! is cached: every call owns its pool and its buffers.
 
 use std::io::Read;
 
-use fearless_simd::Level;
 use flate2::read::ZlibDecoder;
 
 use crate::error::{PsdError, PsdResult};
@@ -107,7 +105,7 @@ fn decode_channel(
             decode_packbits(&mut out, &channel.data, height.max(0) as usize, 1, 0, 0);
         }
         2 => {
-            inflate_into(&mut out, &channel.data)?;
+            inflate_channel(&mut out, &channel.data)?;
         }
         3 => {
             decode_zip_with_prediction(&mut out, &channel.data, width, height, depth)?;
@@ -117,7 +115,7 @@ fn decode_channel(
     Ok(out)
 }
 
-/// One channel decode: the record, the rectangle it covers and the result slot.
+/// One channel decode: the record, the rectangle it covers and the result.
 struct ChannelJob<'a> {
     channel: &'a ChannelInfo,
     width: i32,
@@ -144,24 +142,18 @@ impl ChannelJob<'_> {
 ///
 /// The first failing job in channel order decides the error, so the reported
 /// error does not depend on the schedule.
-fn decode_channels(jobs: &mut [ChannelJob<'_>], depth: u16) {
+fn decode_channels(mut jobs: Vec<ChannelJob<'_>>, depth: u16) -> PsdResult<Vec<Vec<u8>>> {
     let payload: usize = jobs
         .iter()
         .map(|job| channel_byte_size(job.width, job.height, depth))
         .sum();
-    if jobs.len() > 1
-        && payload >= PARALLEL_DECODE_BYTES
-        && parallel::for_each(jobs, |job| job.decode(depth))
-    {
-        return;
+    if jobs.len() > 1 && payload >= PARALLEL_DECODE_BYTES {
+        parallel::for_each(&mut jobs, |job| job.decode(depth));
+    } else {
+        for job in jobs.iter_mut() {
+            job.decode(depth);
+        }
     }
-    for job in jobs.iter_mut() {
-        job.decode(depth);
-    }
-}
-
-/// The buffers of every decoded channel, or the first error in channel order.
-fn collect_channels(jobs: Vec<ChannelJob<'_>>) -> PsdResult<Vec<Vec<u8>>> {
     let mut channels = Vec::with_capacity(jobs.len());
     for job in jobs {
         let ChannelJob { output, error, .. } = job;
@@ -238,14 +230,6 @@ fn decode_packbits(
     read_bytes
 }
 
-/// Inflate a zlib stream into `dst`.
-fn inflate_into(dst: &mut [u8], src: &[u8]) -> PsdResult<()> {
-    let (buffer, _) = inflate_exact(src, dst.len())?;
-    let count = buffer.len().min(dst.len());
-    dst[..count].copy_from_slice(&buffer[..count]);
-    Ok(())
-}
-
 /// Inflate `expected` bytes and return them with the number of input bytes
 /// consumed.
 fn inflate_exact(src: &[u8], expected: usize) -> PsdResult<(Vec<u8>, usize)> {
@@ -258,20 +242,30 @@ fn inflate_exact(src: &[u8], expected: usize) -> PsdResult<(Vec<u8>, usize)> {
     Ok((buffer, consumed))
 }
 
-/// Inflate a zip-compressed channel and undo the per-channel prediction.
+/// Inflate a zlib stream into `dst`, returning the number of input bytes the
+/// stream consumed.
+fn inflate_channel(dst: &mut [u8], src: &[u8]) -> PsdResult<usize> {
+    let (buffer, consumed) = inflate_exact(src, dst.len())?;
+    let count = buffer.len().min(dst.len());
+    dst[..count].copy_from_slice(&buffer[..count]);
+    Ok(consumed)
+}
+
+/// Inflate a zip-compressed channel and undo the per-channel prediction,
+/// returning the number of input bytes the zlib stream consumed.
 fn decode_zip_with_prediction(
     dst: &mut [u8],
     src: &[u8],
     width: i32,
     height: i32,
     depth: u16,
-) -> PsdResult<()> {
+) -> PsdResult<usize> {
     if width <= 0 || height <= 0 {
-        return Ok(());
+        return Ok(0);
     }
     let width = width as usize;
     let height = height as usize;
-    let (mut buffer, _) = inflate_exact(src, dst.len())?;
+    let (mut buffer, consumed) = inflate_exact(src, dst.len())?;
     buffer.resize(dst.len(), 0);
 
     match depth {
@@ -329,12 +323,21 @@ fn decode_zip_with_prediction(
         }
         _ => return Err(PsdError::Decompress(format!("unsupported depth {depth}"))),
     }
-    Ok(())
+    Ok(consumed)
 }
 
 // ---------------------------------------------------------------------------
 // Sampling / merging
 // ---------------------------------------------------------------------------
+
+/// The channels a merge reads: red, green, blue and alpha, as indices into
+/// the decoded channel list.
+type Planes = [Option<usize>; 4];
+
+/// The index of the first decoded channel with `id`.
+fn find_channel(ids: &[i16], id: i16) -> Option<usize> {
+    ids.iter().position(|&candidate| candidate == id)
+}
 
 /// Read one colour component scaled to 8 bits: 8-bit channels keep the byte,
 /// 16-bit channels keep their high byte and 32-bit channels are floats.
@@ -360,78 +363,40 @@ fn sample(bytes: &[u8], index: usize, depth: u16) -> u8 {
     }
 }
 
-/// The index of the first decoded channel with `id`.
-fn find_channel(ids: &[i16], id: i16) -> Option<usize> {
-    ids.iter().position(|&candidate| candidate == id)
-}
-
-/// Merge the red, green, blue and alpha planes into RGBA.
-fn merge_rgb(
-    level: Level,
-    width: usize,
-    height: usize,
-    ids: &[i16],
-    channels: &[Vec<u8>],
-    depth: u16,
-) -> Vec<u8> {
-    let red = find_channel(ids, 0);
-    let green = find_channel(ids, 1);
-    let blue = find_channel(ids, 2);
-    let alpha = find_channel(ids, -1);
-    let mut out = vec![0u8; width * height * 4];
-    let written = if depth == 8 {
-        let planes = [
-            red.map(|index| channels[index].as_slice()),
-            green.map(|index| channels[index].as_slice()),
-            blue.map(|index| channels[index].as_slice()),
-            alpha.map(|index| channels[index].as_slice()),
-        ];
-        simd::pack_rgba8(level, &mut out, planes)
-    } else {
-        0
-    };
-    for pixel in written..width * height {
-        let offset = pixel * 4;
-        out[offset] = red.map_or(0, |c| sample(&channels[c], pixel, depth));
-        out[offset + 1] = green.map_or(0, |c| sample(&channels[c], pixel, depth));
-        out[offset + 2] = blue.map_or(0, |c| sample(&channels[c], pixel, depth));
-        out[offset + 3] = alpha.map_or(0xff, |c| sample(&channels[c], pixel, depth));
+/// One colour component of a merged pixel: the channel sample, or `fill` when
+/// the channel is missing.
+fn component(plane: Option<usize>, channels: &[Vec<u8>], pixel: usize, depth: u16, fill: u8) -> u8 {
+    match plane {
+        Some(index) => sample(&channels[index], pixel, depth),
+        None => fill,
     }
-    out
 }
 
-/// Merge a grayscale plane into RGBA.
-fn merge_gray(
-    level: Level,
+/// Merge the four planes into straight-alpha RGBA.
+fn merge_planes(
     width: usize,
     height: usize,
-    ids: &[i16],
     channels: &[Vec<u8>],
     depth: u16,
+    planes: Planes,
 ) -> Vec<u8> {
-    let value = find_channel(ids, 0);
-    let alpha = find_channel(ids, -1);
     let mut out = vec![0u8; width * height * 4];
-    let written = if depth == 8 {
-        let plane = value.map(|index| channels[index].as_slice());
-        let planes = [
-            plane,
-            plane,
-            plane,
-            alpha.map(|index| channels[index].as_slice()),
+    if depth == 8 {
+        let slices = [
+            planes[0].map(|index| channels[index].as_slice()),
+            planes[1].map(|index| channels[index].as_slice()),
+            planes[2].map(|index| channels[index].as_slice()),
+            planes[3].map(|index| channels[index].as_slice()),
         ];
-        simd::pack_rgba8(level, &mut out, planes)
-    } else {
-        0
-    };
-    for pixel in written..width * height {
-        let gray = value.map_or(0, |c| sample(&channels[c], pixel, depth));
-        let alpha = alpha.map_or(0xff, |c| sample(&channels[c], pixel, depth));
+        simd::pack_rgba8(&mut out, slices);
+        return out;
+    }
+    for pixel in 0..width * height {
         let offset = pixel * 4;
-        out[offset] = gray;
-        out[offset + 1] = gray;
-        out[offset + 2] = gray;
-        out[offset + 3] = alpha;
+        out[offset] = component(planes[0], channels, pixel, depth, 0);
+        out[offset + 1] = component(planes[1], channels, pixel, depth, 0);
+        out[offset + 2] = component(planes[2], channels, pixel, depth, 0);
+        out[offset + 3] = component(planes[3], channels, pixel, depth, 0xff);
     }
     out
 }
@@ -500,6 +465,56 @@ fn merge_bitmap(width: usize, height: usize, src: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Merge a document's decoded channels into straight-alpha RGBA.
+fn merge_channels(
+    mode: u16,
+    width: usize,
+    height: usize,
+    ids: &[i16],
+    channels: &[Vec<u8>],
+    depth: u16,
+    palette: &[[u8; 4]],
+) -> Vec<u8> {
+    match mode {
+        COLOR_MODE_BITMAP => channels.first().map_or_else(
+            || vec![0; width * height * 4],
+            |c| merge_bitmap(width, height, c),
+        ),
+        COLOR_MODE_GRAYSCALE => {
+            let gray = find_channel(ids, 0);
+            merge_planes(
+                width,
+                height,
+                channels,
+                depth,
+                [gray, gray, gray, find_channel(ids, -1)],
+            )
+        }
+        COLOR_MODE_RGB => merge_planes(
+            width,
+            height,
+            channels,
+            depth,
+            [
+                find_channel(ids, 0),
+                find_channel(ids, 1),
+                find_channel(ids, 2),
+                find_channel(ids, -1),
+            ],
+        ),
+        COLOR_MODE_INDEXED => channels.first().map_or_else(
+            || vec![0; width * height * 4],
+            |c| merge_index(width, height, c, palette),
+        ),
+        COLOR_MODE_CMYK => merge_cmyk(width, height, ids, channels, depth),
+        // Multichannel / duotone / LAB have no merge.
+        COLOR_MODE_MULTICHANNEL | COLOR_MODE_DUOTONE | COLOR_MODE_LAB => {
+            vec![0; width * height * 4]
+        }
+        _ => vec![0; width * height * 4],
+    }
+}
+
 /// Read a 16-bit big-endian element.
 fn read_u16(bytes: &[u8], index: usize) -> u16 {
     let offset = index * 2;
@@ -520,7 +535,6 @@ fn write_u16(bytes: &mut [u8], index: usize, value: u16) {
 
 /// Fold a layer mask into its alpha channel.
 fn merge_mask_to_alpha(
-    level: Level,
     alpha: &mut [u8],
     alpha_rect: Rect,
     mask: &[u8],
@@ -557,10 +571,7 @@ fn merge_mask_to_alpha(
                 let m_start = (m_offset_y + y) * mw + m_offset_x;
                 let a_row = &mut alpha[a_start..a_start + width as usize];
                 let m_row = &mask[m_start..m_start + width as usize];
-                let written = simd::mul_alpha8(level, a_row, m_row);
-                for x in written..width as usize {
-                    a_row[x] = (a_row[x] as u32 * m_row[x] as u32 / 255) as u8;
-                }
+                simd::mul_alpha8(a_row, m_row);
             }
         } else {
             for y in 0..height as usize {
@@ -643,29 +654,6 @@ pub fn layer_image(
 ) -> PsdResult<Option<LayerImage>> {
     let mask = &layer.extra_data.layer_mask;
 
-    let (left, top, width, height, opacity, blend) = match mode {
-        ImageMode::Mask => {
-            let (left, top, width, height) = if mask.width <= 0 || mask.height <= 0 {
-                (0, 0, 1, 1)
-            } else {
-                (mask.left, mask.top, mask.width, mask.height)
-            };
-            (left, top, width, height, 255, BlendMode::Normal)
-        }
-        _ => (
-            layer.left,
-            layer.top,
-            layer.width,
-            layer.height,
-            layer.opacity,
-            layer.blend_mode,
-        ),
-    };
-
-    if width <= 0 || height <= 0 {
-        return Ok(None);
-    }
-
     // A mask with no stored image is a 1x1 fill with the default colour.
     if mode == ImageMode::Mask && (mask.width <= 0 || mask.height <= 0) {
         let color = mask.default_color as u8;
@@ -678,6 +666,29 @@ pub fn layer_image(
             blend: BlendMode::Normal,
             pixels: vec![color, color, color, 255],
         }));
+    }
+
+    let (left, top, width, height, opacity, blend) = match mode {
+        ImageMode::Mask => (
+            mask.left,
+            mask.top,
+            mask.width,
+            mask.height,
+            255,
+            BlendMode::Normal,
+        ),
+        _ => (
+            layer.left,
+            layer.top,
+            layer.width,
+            layer.height,
+            layer.opacity,
+            layer.blend_mode,
+        ),
+    };
+
+    if width <= 0 || height <= 0 {
+        return Ok(None);
     }
 
     let depth = psd.header.depth;
@@ -735,8 +746,7 @@ pub fn layer_image(
         return Ok(None);
     }
 
-    decode_channels(&mut jobs, depth);
-    let mut channels = collect_channels(jobs)?;
+    let mut channels = decode_channels(jobs, depth)?;
 
     let (output_width, output_height) = match mode {
         ImageMode::Mask => (
@@ -755,23 +765,19 @@ pub fn layer_image(
         psd.header.mode
     };
 
-    let level = Level::new();
-
     if mode == ImageMode::MaskedImage
         && let (Some(mask_index), Some(alpha_index)) = (mask_index, alpha_index)
     {
-        let mask_channel = channels[mask_index].clone();
-        if let Some(alpha) = channels.get_mut(alpha_index) {
-            merge_mask_to_alpha(
-                level,
-                alpha,
-                image_rect,
-                &mask_channel,
-                mask_rect,
-                mask.default_color as u8,
-                depth,
-            );
-        }
+        let mask_channel = std::mem::take(&mut channels[mask_index]);
+        let alpha = &mut channels[alpha_index];
+        merge_mask_to_alpha(
+            alpha,
+            image_rect,
+            &mask_channel,
+            mask_rect,
+            mask.default_color as u8,
+            depth,
+        );
     }
 
     // In mask mode the sole selected channel is presented as grayscale.
@@ -781,26 +787,15 @@ pub fn layer_image(
         *first = 0;
     }
 
-    let pixels = match color_mode {
-        COLOR_MODE_BITMAP => channels.first().map_or_else(
-            || vec![0; output_width * output_height * 4],
-            |c| merge_bitmap(output_width, output_height, c),
-        ),
-        COLOR_MODE_GRAYSCALE => {
-            merge_gray(level, output_width, output_height, &ids, &channels, depth)
-        }
-        COLOR_MODE_RGB => merge_rgb(level, output_width, output_height, &ids, &channels, depth),
-        COLOR_MODE_INDEXED => channels.first().map_or_else(
-            || vec![0; output_width * output_height * 4],
-            |c| merge_index(output_width, output_height, c, &psd.color_table.colors),
-        ),
-        COLOR_MODE_CMYK => merge_cmyk(output_width, output_height, &ids, &channels, depth),
-        // Multichannel / duotone / LAB have no merge.
-        COLOR_MODE_MULTICHANNEL | COLOR_MODE_DUOTONE | COLOR_MODE_LAB => {
-            vec![0; output_width * output_height * 4]
-        }
-        _ => vec![0; output_width * output_height * 4],
-    };
+    let pixels = merge_channels(
+        color_mode,
+        output_width,
+        output_height,
+        &ids,
+        &channels,
+        depth,
+        &psd.color_table.colors,
+    );
 
     Ok(Some(LayerImage {
         left,
@@ -865,11 +860,9 @@ pub fn merged_image(psd: &PsdFile) -> PsdResult<Option<(u32, u32, Vec<u8>)>> {
         2 => {
             let mut offset = 0usize;
             for _ in 0..channel_count {
-                let (buffer, consumed) = inflate_exact(&body[offset..], size)?;
-                offset += consumed;
                 let mut decoded = vec![0u8; size];
-                let count = buffer.len().min(size);
-                decoded[..count].copy_from_slice(&buffer[..count]);
+                let consumed = inflate_channel(&mut decoded, &body[offset..])?;
+                offset += consumed;
                 channels.push(decoded);
             }
         }
@@ -877,13 +870,14 @@ pub fn merged_image(psd: &PsdFile) -> PsdResult<Option<(u32, u32, Vec<u8>)>> {
             let mut offset = 0usize;
             for _ in 0..channel_count {
                 let mut decoded = vec![0u8; size];
-                // Decode from the remaining stream; the prediction consumes
-                // exactly `size` decompressed bytes.
-                let remaining = &body[offset..];
-                decode_zip_with_prediction(&mut decoded, remaining, width, height, depth)?;
-                // Advance past the zlib stream by re-inflating to measure the
-                // consumed input length.
-                let (_, consumed) = inflate_exact(remaining, size)?;
+                // The prediction consumes exactly `size` decompressed bytes.
+                let consumed = decode_zip_with_prediction(
+                    &mut decoded,
+                    &body[offset..],
+                    width,
+                    height,
+                    depth,
+                )?;
                 offset += consumed;
                 channels.push(decoded);
             }
@@ -902,24 +896,15 @@ pub fn merged_image(psd: &PsdFile) -> PsdResult<Option<(u32, u32, Vec<u8>)>> {
 
     let width = width as usize;
     let height = height as usize;
-    let level = Level::new();
-    let pixels = match psd.header.mode {
-        COLOR_MODE_BITMAP => channels.first().map_or_else(
-            || vec![0; width * height * 4],
-            |c| merge_bitmap(width, height, c),
-        ),
-        COLOR_MODE_GRAYSCALE => merge_gray(level, width, height, &ids, &channels, depth),
-        COLOR_MODE_RGB => merge_rgb(level, width, height, &ids, &channels, depth),
-        COLOR_MODE_INDEXED => channels.first().map_or_else(
-            || vec![0; width * height * 4],
-            |c| merge_index(width, height, c, &psd.color_table.colors),
-        ),
-        COLOR_MODE_CMYK => merge_cmyk(width, height, &ids, &channels, depth),
-        COLOR_MODE_MULTICHANNEL | COLOR_MODE_DUOTONE | COLOR_MODE_LAB => {
-            vec![0; width * height * 4]
-        }
-        _ => vec![0; width * height * 4],
-    };
+    let pixels = merge_channels(
+        psd.header.mode,
+        width,
+        height,
+        &ids,
+        &channels,
+        depth,
+        &psd.color_table.colors,
+    );
 
     Ok(Some((width as u32, height as u32, pixels)))
 }
@@ -933,8 +918,16 @@ mod tests {
     /// returns false when inflate fails).
     #[test]
     fn corrupt_zip_channel_is_an_error() {
-        let mut dst = [0u8; 8];
-        assert!(inflate_into(&mut dst, b"not a zlib stream").is_err());
+        let channel = ChannelInfo {
+            id: 0,
+            length: 0,
+            compression: 2,
+            data: b"not a zlib stream".to_vec(),
+        };
+        assert!(matches!(
+            decode_channel(&channel, 8, 1, 8),
+            Err(PsdError::Decompress(_))
+        ));
     }
 
     /// One PackBits-compressed channel: a per-row byte count, then literal runs
@@ -961,11 +954,11 @@ mod tests {
         }
     }
 
-    /// The channel bytes are the same whether the expansion ran on the calling
-    /// thread or on the fork-join pool
-    /// (`reference/cpp/plugins/psdfile/psdparse/psdimage.cpp:548-580`).
+    /// The channel bytes do not depend on the schedule: the same payload
+    /// expanded on the fork-join pool and on the calling thread yields the
+    /// same bytes (`reference/cpp/plugins/psdfile/psdparse/psdimage.cpp:548-580`).
     #[test]
-    fn parallel_channel_decode_matches_the_serial_decode() {
+    fn channel_decode_is_the_same_on_both_schedules() {
         let width = 512i32;
         let height = 256i32;
         let plane: Vec<u8> = (0..(width * height) as usize)
@@ -973,8 +966,13 @@ mod tests {
             .collect();
         let channel = packbits_channel(0, &plane, width as usize, height as usize);
 
-        fn jobs_for(channel: &ChannelInfo, width: i32, height: i32) -> Vec<ChannelJob<'_>> {
-            (0..4)
+        fn jobs_for(
+            channel: &ChannelInfo,
+            width: i32,
+            height: i32,
+            count: usize,
+        ) -> Vec<ChannelJob<'_>> {
+            (0..count)
                 .map(|_| ChannelJob {
                     channel,
                     width,
@@ -985,17 +983,14 @@ mod tests {
                 .collect()
         }
 
-        let mut scheduled = jobs_for(&channel, width, height);
-        decode_channels(&mut scheduled, 8);
-        let decoded = collect_channels(scheduled).expect("the payload decodes");
+        // Four channels of 128 KiB each clear the parallel threshold; a single
+        // channel of the same size stays on the calling thread.
+        let spread =
+            decode_channels(jobs_for(&channel, width, height, 4), 8).expect("the payload decodes");
+        let serial =
+            decode_channels(jobs_for(&channel, width, height, 1), 8).expect("the payload decodes");
 
-        let mut serial_jobs = jobs_for(&channel, width, height);
-        for job in serial_jobs.iter_mut() {
-            job.decode(8);
-        }
-        let serial = collect_channels(serial_jobs).expect("the payload decodes");
-
-        assert_eq!(decoded, serial);
-        assert_eq!(decoded[0], plane);
+        assert_eq!(spread[0], serial[0]);
+        assert_eq!(spread[0], plane);
     }
 }

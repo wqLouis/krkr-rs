@@ -88,6 +88,9 @@ pub(crate) struct AudioQueue {
     capacity: usize,
     /// Samples required before the device may start.
     prefill: usize,
+    /// Interleaved samples per second, so the queue's depth reads as a time.
+    #[cfg(any(feature = "platform-linux", target_os = "android"))]
+    per_second: usize,
     /// Channels per frame (at least one).
     #[cfg(any(feature = "platform-linux", target_os = "android"))]
     channels: usize,
@@ -136,6 +139,8 @@ impl AudioQueue {
             capacity,
             prefill,
             #[cfg(any(feature = "platform-linux", target_os = "android"))]
+            per_second,
+            #[cfg(any(feature = "platform-linux", target_os = "android"))]
             channels,
             #[cfg(any(feature = "platform-linux", target_os = "android"))]
             last_frame: vec![0.0; channels],
@@ -165,6 +170,19 @@ impl AudioQueue {
     /// Whether the queue holds at least the pre-fill target.
     pub(crate) fn prefilled(&self) -> bool {
         self.samples.len() >= self.prefill
+    }
+
+    /// How much audio is still buffered, in seconds.
+    ///
+    /// This is the delay between the audio the producer has written and the
+    /// audio the device plays: the listener hears the queue's content that
+    /// much later than it was rendered.
+    #[cfg(any(feature = "platform-linux", target_os = "android"))]
+    pub(crate) fn queued_seconds(&self) -> f64 {
+        if self.per_second == 0 {
+            return 0.0;
+        }
+        self.samples.len() as f64 / self.per_second as f64
     }
 
     /// Returns the next queued sample, or repeats the last sample for this
@@ -257,6 +275,21 @@ mod tests {
     /// The ramp length in frames for the 1 kHz test queue.
     fn ramp_frames(queue: &AudioQueue) -> usize {
         queue.ramp_samples
+    }
+
+    /// The queue's depth reads as the time the device has yet to play: that
+    /// is the delay between the audio the producer wrote and the audio the
+    /// listener hears.
+    #[test]
+    fn the_queue_depth_reads_as_a_time() {
+        let mut queue = queue();
+        assert_eq!(queue.queued_seconds(), 0.0);
+        queue.push(&[0.25; 500]);
+        assert!(
+            (queue.queued_seconds() - 0.5).abs() < 1e-9,
+            "500 ms of a 1 kHz queue is half a second: {}",
+            queue.queued_seconds()
+        );
     }
 
     #[test]

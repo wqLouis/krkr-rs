@@ -1274,6 +1274,9 @@ pub struct SoundChannel {
     /// Whether the source loops.
     pub looping: bool,
     position_seconds: f64,
+    /// The latency between the rendered position and the audible one, in
+    /// seconds.
+    output_latency: f64,
     done: bool,
     fade: Option<Fade>,
     fade_finished: bool,
@@ -1294,6 +1297,7 @@ impl SoundChannel {
             flags: LoopFlags::new(),
             looping: false,
             position_seconds: 0.0,
+            output_latency: 0.0,
             done: false,
             fade: None,
             fade_finished: false,
@@ -1384,6 +1388,32 @@ impl SoundChannel {
     /// Playback position in seconds.
     pub fn position_seconds(&self) -> f64 {
         self.position_seconds
+    }
+
+    /// The latency between the rendered position and the audible one, in
+    /// seconds.
+    ///
+    /// The audio device holds a queue of rendered samples, so a voice's
+    /// rendered position runs ahead of the position the listener hears. The
+    /// value is the queue's depth; the composition root reads it from the
+    /// device and hands it to the mixer.
+    pub fn output_latency(&self) -> f64 {
+        self.output_latency
+    }
+
+    /// Set the latency between the rendered position and the audible one, in
+    /// seconds (clamped at `>= 0`).
+    pub fn set_output_latency(&mut self, seconds: f64) {
+        self.output_latency = seconds.max(0.0);
+    }
+
+    /// The position the voice has reached at the listener, in seconds.
+    ///
+    /// This is the rendered position minus the output latency: the position
+    /// the sound has actually reached. A voice that is behind its own
+    /// rendered position by more than the latency reports `0`.
+    pub fn played_position_seconds(&self) -> f64 {
+        (self.position_seconds - self.output_latency).max(0.0)
     }
 
     /// Seek to `seconds` (clamped to `>= 0`).
@@ -1752,6 +1782,9 @@ pub struct Mixer {
     channels: Vec<SoundChannel>,
     next_id: u64,
     clock: f64,
+    /// The latency between the rendered position and the audible one, in
+    /// seconds.
+    output_latency: f64,
     global_volume: f32,
     global_focus_mode: i32,
     /// Whether the host window is currently active.
@@ -1768,6 +1801,7 @@ impl Default for Mixer {
             // the script surface.
             next_id: 1,
             clock: 0.0,
+            output_latency: 0.0,
             global_volume: MAX_VOLUME,
             global_focus_mode: 0,
             app_focused: true,
@@ -1791,7 +1825,9 @@ impl Mixer {
     pub fn spawn_channel(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.channels.push(SoundChannel::new(id));
+        let mut channel = SoundChannel::new(id);
+        channel.set_output_latency(self.output_latency);
+        self.channels.push(channel);
         id
     }
 
@@ -1830,6 +1866,28 @@ impl Mixer {
     /// The internal clock in seconds.
     pub fn clock(&self) -> f64 {
         self.clock
+    }
+
+    /// The latency between the rendered position and the audible one, in
+    /// seconds.
+    ///
+    /// The audio device holds a queue of rendered samples, so every voice's
+    /// rendered position runs ahead of the position the listener hears. The
+    /// composition root reads the queue's depth from the device and hands it
+    /// here; a voice's [`SoundChannel::played_position_seconds`] is its
+    /// rendered position minus this latency.
+    pub fn output_latency(&self) -> f64 {
+        self.output_latency
+    }
+
+    /// Set the latency between the rendered position and the audible one, in
+    /// seconds (clamped at `>= 0`), for every voice.
+    pub fn set_output_latency(&mut self, seconds: f64) {
+        let latency = seconds.max(0.0);
+        self.output_latency = latency;
+        for channel in &mut self.channels {
+            channel.set_output_latency(latency);
+        }
     }
 
     /// The global volume multiplier (`0..=1`).
@@ -1979,6 +2037,10 @@ pub fn mix(
 ///
 /// Existing contents of `out` are added to (use [`mix`] or clear it first).
 /// The PCM is the caller-supplied source buffer; nothing is decoded here.
+///
+/// The conversion to the output rate convolves the source frames around the
+/// interpolated one with a windowed-sinc kernel, so a converted track keeps
+/// the pitch and the spectrum a source can hold.
 pub fn mix_source(
     source: &SoundSource,
     position_seconds: f64,
@@ -1990,6 +2052,60 @@ pub fn mix_source(
 ) -> Result<(), SoundError> {
     validate_out_spec(out_spec)?;
     accumulate_source(source, position_seconds, rate, gain, pan, out, out_spec)
+}
+
+/// The number of source frames the resampler convolves per output frame.
+///
+/// A windowed sinc needs several frames on either side of the point it
+/// interpolates, and its passband reaches `0.5 - 2/taps` of the source's
+/// rate: sixty-five taps keep the passband flat to within a twentieth of the
+/// source's Nyquist frequency, so a converted track keeps the whole spectrum
+/// a source can hold, and the kernel's stopband stays below the noise floor
+/// of a 16-bit source.
+///
+/// The count is odd so the kernel is symmetric around the interpolated
+/// frame: a symmetric kernel reproduces a ramp exactly, and a ramp is what
+/// the mixer's own tests measure against.
+const RESAMPLE_TAPS: usize = 65;
+
+/// The frames the kernel reaches back from the interpolated frame.
+const RESAMPLE_HALF: usize = RESAMPLE_TAPS / 2;
+
+/// The Blackman window over the resampler's kernel.
+///
+/// The window is computed once per rendered buffer: it does not depend on
+/// the fractional position.
+fn resample_window() -> [f64; RESAMPLE_TAPS] {
+    let mut window = [0.0f64; RESAMPLE_TAPS];
+    for (k, value) in window.iter_mut().enumerate() {
+        let t = k as f64 / (RESAMPLE_TAPS - 1) as f64;
+        let phase = std::f64::consts::PI * t;
+        *value = 0.42 - 0.5 * phase.cos() + 0.08 * (2.0 * phase).cos();
+    }
+    window
+}
+
+/// The windowed-sinc weights for the fractional source position `frac`.
+///
+/// The kernel is a sinc windowed with a Blackman window. The sinc's
+/// argument is `m - frac` with an integer `m`, so every tap's sine comes
+/// from the same `sin(pi * frac)`.
+fn resample_weights(frac: f64, window: &[f64; RESAMPLE_TAPS]) -> [f64; RESAMPLE_TAPS] {
+    let sin = (std::f64::consts::PI * frac).sin();
+    let mut weights = [0.0f64; RESAMPLE_TAPS];
+    for (k, weight) in weights.iter_mut().enumerate() {
+        let m = k as i64 - RESAMPLE_HALF as i64;
+        let distance = m as f64 - frac;
+        let sinc = if distance.abs() < f64::EPSILON {
+            1.0
+        } else {
+            // `sin(pi * (m - frac))` is `(-1)^(m+1) * sin(pi * frac)`.
+            let sign = if m.rem_euclid(2) == 0 { -1.0 } else { 1.0 };
+            sign * sin / (std::f64::consts::PI * distance)
+        };
+        *weight = sinc * window[k];
+    }
+    weights
 }
 
 /// Render one source into `out` without revalidating the output spec.
@@ -2013,18 +2129,13 @@ fn accumulate_source(
     })?;
     let out_rate = f64::from(out_spec.sample_rate);
     let src_rate = f64::from(source.sample_rate().max(1));
-    let src_channels = usize::try_from(source.channels()).map_err(|_| SoundError::InvalidSpec {
-        message: format!(
-            "source channel count {} does not fit in memory",
-            source.channels()
-        ),
-    })?;
     let rate = if rate.is_finite() { rate } else { 1.0 };
     let (left_gain, right_gain) = pan_gains(pan);
     let out_frames = out.len() / out_channels;
+    let window = resample_window();
 
     // The source frames the resampler needs are contiguous, so load them into
-    // a scratch window in bulk and interpolate from there. A streaming source
+    // a scratch window in bulk and convolve from there. A streaming source
     // then takes its decode-ahead buffer lock once per window instead of once
     // per interpolated frame. `scratch` holds `(left, right)` pairs for
     // `[window_start, window_start + window_frames)`; frames past the source
@@ -2042,24 +2153,26 @@ fn accumulate_source(
         }
         let i0 = sample_pos.floor();
         let i0u = i0 as u64;
-        let frac = (sample_pos - i0) as f32;
+        let frac = sample_pos - i0;
 
         // A backwards read, or a forward gap the worker would otherwise
         // decode through, starts a fresh window at the requested frame.
         if i0u < window_start || i0u > window_start.saturating_add(window_frames as u64) {
-            window_start = i0u;
+            window_start = i0u.saturating_sub(RESAMPLE_HALF as u64);
             window_frames = 0;
             end_reached = false;
         }
         if !end_reached {
-            // Grow the window until it covers the interpolated frame and its
-            // successor, requesting the rest of the output as one batch.
-            while i0u.saturating_add(1) >= window_start.saturating_add(window_frames as u64) {
+            // Grow the window until it covers the frames the kernel
+            // convolves, requesting the rest of the output as one batch.
+            while i0u.saturating_add(RESAMPLE_HALF as u64)
+                >= window_start.saturating_add(window_frames as u64)
+            {
                 let remaining = (out_frames - index) as u64;
                 let needed = i0u
-                    .saturating_add(2)
+                    .saturating_add(RESAMPLE_HALF as u64)
                     .saturating_sub(window_start.saturating_add(window_frames as u64));
-                let want = needed.max(remaining.saturating_add(2));
+                let want = needed.max(remaining.saturating_add(RESAMPLE_HALF as u64));
                 let want = usize::try_from(want).map_err(|_| SoundError::Decode {
                     message: "interpolation window does not fit in memory".to_string(),
                 })?;
@@ -2087,27 +2200,35 @@ fn accumulate_source(
             }
         }
 
-        let offset =
-            usize::try_from(i0u.saturating_sub(window_start)).map_err(|_| SoundError::Decode {
-                message: "interpolation window does not fit in memory".to_string(),
-            })?;
-        if offset >= window_frames {
-            // The source ended before this output frame.
-            continue;
+        // The kernel convolves the frames around the interpolated one. The
+        // weights are normalised over the frames the window actually holds,
+        // so a track that ends inside the kernel keeps its gain.
+        let weights = resample_weights(frac, &window);
+        let mut left = 0.0f64;
+        let mut right = 0.0f64;
+        let mut weight_sum = 0.0f64;
+        for (k, weight) in weights.iter().enumerate() {
+            let frame_index = i0u as i64 - RESAMPLE_HALF as i64 + k as i64;
+            if frame_index < 0 {
+                // The kernel reaches before the start of the track.
+                continue;
+            }
+            let offset = frame_index - window_start as i64;
+            if offset < 0 || offset >= window_frames as i64 {
+                // The track ended inside the kernel.
+                continue;
+            }
+            let at = offset as usize * 2;
+            left += weight * f64::from(scratch[at]);
+            right += weight * f64::from(scratch[at + 1]);
+            weight_sum += weight;
         }
-        let a0 = scratch[offset * 2];
-        let b0 = scratch[offset * 2 + 1];
-        let (a1, b1) = if offset + 1 < window_frames {
-            (scratch[(offset + 1) * 2], scratch[(offset + 1) * 2 + 1])
-        } else {
-            (a0, b0)
-        };
-        let (left, right) = if src_channels == 1 {
-            let s = a0 + (a1 - a0) * frac;
-            (s, s)
-        } else {
-            (a0 + (a1 - a0) * frac, b0 + (b1 - b0) * frac)
-        };
+        if weight_sum.abs() > f64::EPSILON {
+            left /= weight_sum;
+            right /= weight_sum;
+        }
+        let left = left as f32;
+        let right = right as f32;
         if out_channels == 1 {
             frame[0] += (left * left_gain + right * right_gain) * 0.5 * gain;
         } else {

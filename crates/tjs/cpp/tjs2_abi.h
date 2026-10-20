@@ -90,6 +90,43 @@ tjs2_engine *tjs2_create(void);
 // Stream factories + data dir (see streams.cpp).
 void tjs2_wire_stream_factories(void);
 void tjs2_set_data_dir(const char *dir);
+
+/*
+ * Storage seam for the text/binary stream factories.
+ *
+ * The reference wires TJSCreate{Text,Binary}StreamFor{Read,Write} to the
+ * storage layer (ScriptMgnIntf.cpp:464-469), so `Array.load` on
+ * `archive.xp3>member` opens the archive member (StorageIntf.cpp:1131-1148).
+ * The storage lives in the compatibility layer, not in this crate, so the
+ * host installs one read callback here. The read factories call it first for
+ * every name and fall back to the local filesystem when it reports
+ * TJS2_STORAGE_READ_NOT_FOUND; a name neither source serves raises.
+ *
+ * `name`/`name_len` are UTF-8 (not NUL-terminated) and may carry the
+ * `archive.xp3>member` form. On TJS2_STORAGE_READ_OK the callback stores a
+ * malloc'd buffer in *out_data (freed by the stream layer with
+ * tjs2_free_storage_bytes) and its byte length in *out_len. On
+ * TJS2_STORAGE_READ_ERROR it may store a malloc'd UTF-8 message in
+ * *out_error (freed with tjs2_free_string).
+ */
+#define TJS2_STORAGE_READ_OK 0
+#define TJS2_STORAGE_READ_NOT_FOUND 1
+#define TJS2_STORAGE_READ_ERROR 2
+
+typedef int (*tjs2_storage_read_fn)(void *user, const char *name,
+                                    size_t name_len,
+                                    unsigned char **out_data, size_t *out_len,
+                                    char **out_error);
+
+/*
+ * Install (or, with a NULL callback, clear) the storage read callback. One
+ * process-wide registration; `user` is owned by the installer and must
+ * outlive the registration.
+ */
+void tjs2_set_storage_read_callback(tjs2_storage_read_fn read, void *user);
+
+/* Free a buffer a storage read callback returned. */
+void tjs2_free_storage_bytes(void *data);
 void tjs2_destroy(tjs2_engine *e);
 
 /* Set the console output / log callback (may be NULL). */

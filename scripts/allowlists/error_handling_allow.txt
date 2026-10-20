@@ -26,7 +26,7 @@
 #     hidden (audit §3.1). -------------------------------------------------
 crates/engine/src/sound.rs:460:PoisonError::into_inner — recover from a poisoned stream-buffer lock by design; no path panics while it is held
 crates/compat/src/plugin.rs:217:(|poison| poison.into_inner()) — plugin registry lock; poisoning is recovered by design
-crates/compat/src/binding.rs:37:result-fallback — process binding lock; poisoning is recovered by design
+crates/compat/src/binding.rs:41:result-fallback — process binding lock; poisoning is recovered by design
 crates/testkit/src/vm.rs:12:result-fallback — dev-helper VM lock; poisoning is recovered by design
 
 # --- str::strip_prefix returns Option, not Result (audit §3.1) ------------

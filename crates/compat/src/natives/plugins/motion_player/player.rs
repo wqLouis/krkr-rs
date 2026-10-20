@@ -20,17 +20,17 @@ use std::sync::Arc;
 use tjs::{DetachedValue, RetainedValue, TjsValue, VAL_OBJECT, Value};
 
 use super::StoredValue;
-use super::adaptors::SeparateInst;
+use super::adaptors::{LayerGetterInst, SeparateInst, populate_layer_getter};
 use super::animator::{Animator, ColorAnimator, ease_weight};
 use super::helpers::{eval_object, inst_mut, inst_ref, set_real, set_string, value_as_f64};
 use super::model::{
-    FrameState, IconInfo, MotionEvent, MotionNode, MotionSnapshot, TimelineState, build_node_tree,
-    evaluate_frames, prime_timelines, scan_frame_events, step_timelines,
+    FrameState, IconInfo, MotionEvent, MotionNode, MotionSnapshot, TimelineState, VariableFrame,
+    build_node_tree, evaluate_frames, prime_timelines, scan_frame_events, step_timelines,
 };
 use super::resource::{MotionStore, ResourceInst};
 use super::texture::Pixels;
 use crate::engine_api::layer_ops::{
-    AffineBlit, BlitOptions, BlitSource, RectI, affine_blit, blit_over,
+    AffineBlit, BlitOptions, BlitSource, RectI, affine_blit, operate_rect,
 };
 use crate::engine_api::{BitmapState, Scene, Storage};
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
@@ -75,9 +75,11 @@ pub(crate) struct ResolvedMotion {
 }
 
 /// A cropped icon source tinted by one player colour.
+///
+/// The crop and the decoded atlas it was cropped from identify the source, so
+/// two icons that share a crop share one tinted bitmap.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct TintKey {
-    src: String,
     color: [u8; 4],
     crop: RectI,
     pixels: usize,
@@ -114,6 +116,8 @@ pub(crate) struct PlayerInst {
     pub(crate) frame_tick_count: f64,
     pub(crate) speed: bool,
     pub(crate) mask_mode: i32,
+    /// The packed color weight, kept in the channel order the script does not
+    /// read: the getter and the setter swap the red and blue channels.
     pub(crate) color_weight: u32,
     pub(crate) independent_layer_inherit: bool,
     pub(crate) z_factor: f64,
@@ -495,6 +499,17 @@ impl PlayerInst {
         self.missing_textures.clear();
     }
 
+    /// Drop the cached sources: the layer ids, the tinted bitmaps and the
+    /// decoded pixel chunks, so the next draw reads and decodes them again.
+    pub(crate) fn clear_cache(&mut self) {
+        self.layer_ids.clear();
+        self.layer_names.clear();
+        self.tinted.clear();
+        if let Some(snapshot) = self.snapshot.as_ref() {
+            snapshot.pixels.clear();
+        }
+    }
+
     /// Activate a resolved motion and rebuild the timeline, node and variable
     /// state it owns.
     fn activate_motion(
@@ -674,7 +689,10 @@ impl PlayerInst {
     }
 
     /// Advance everything by `dt_ms` milliseconds.
-    pub(crate) fn progress(&mut self, dt_ms: f64, ctx: &CompatCtx, objthis: *mut std::ffi::c_void) {
+    ///
+    /// `target` is the retained id of the script object that receives the
+    /// `onAction` and `onSync` callbacks; a null id means there is none.
+    pub(crate) fn progress(&mut self, dt_ms: f64, ctx: &CompatCtx, target: tjs::Tjs2ValueId) {
         self.pending_events.clear();
         if !self.speed {
             return;
@@ -692,10 +710,8 @@ impl PlayerInst {
         if self.queuing {
             // A motion that was just activated records the delta but leaves
             // every clock alone; the layer update that follows clears the gate.
-            self.prune_playing_timelines();
-            self.sync_active = self.sync_waiting && self.allplaying;
-            self.update_layers();
-            self.dispatch_events(ctx, objthis);
+            self.present_pose();
+            self.dispatch_events(ctx, target);
             return;
         }
         self.frame_tick_count += frames;
@@ -709,25 +725,31 @@ impl PlayerInst {
         self.advance_timelines(frames);
         self.update_layers();
         self.step_animators(frames as f32);
-        self.dispatch_events(ctx, objthis);
+        self.dispatch_events(ctx, target);
+    }
+
+    /// Present the current pose without advancing any clock.
+    ///
+    /// A motion that was just activated sits behind the frame gate: the tick
+    /// that follows it only shows the first pose, and the layer update that
+    /// runs here releases the gate.
+    fn present_pose(&mut self) {
+        self.prune_playing_timelines();
+        self.sync_active = self.sync_waiting && self.allplaying;
+        self.update_layers();
     }
 
     /// The playback position as a `0..=1` ratio, or `1.0` once nothing plays.
     pub(crate) fn progress_ratio(&self) -> f64 {
-        let mut saw_timeline = false;
+        let mut progress = 0.0f64;
         let mut any_playing = false;
-        let mut progress: f64 = 0.0;
         for state in self.timelines.values() {
-            saw_timeline = true;
             any_playing = any_playing || state.playing;
             if state.total_frames > 0.0 {
                 progress = progress.max((state.current_time / state.total_frames).clamp(0.0, 1.0));
             } else if !state.playing {
                 progress = progress.max(1.0);
             }
-        }
-        if !saw_timeline {
-            return if any_playing { 0.0 } else { 1.0 };
         }
         if !any_playing {
             return 1.0;
@@ -742,9 +764,7 @@ impl PlayerInst {
         }
         self.frame_last_time = frames;
         if self.queuing {
-            self.prune_playing_timelines();
-            self.sync_active = self.sync_waiting && self.allplaying;
-            self.update_layers();
+            self.present_pose();
             return;
         }
         self.frame_tick_count += frames;
@@ -762,14 +782,9 @@ impl PlayerInst {
                     .map(|state| (label.clone(), state.current_time))
             })
             .collect();
-        let snapshot = self.snapshot.clone();
-        let events = if let Some(snapshot) = snapshot.as_deref() {
-            step_timelines(snapshot, &mut self.timelines, frames)
-        } else {
-            Vec::new()
-        };
-        self.pending_events.extend(events);
-        if let Some(snapshot) = snapshot.as_deref() {
+        if let Some(snapshot) = self.snapshot.clone() {
+            let events = step_timelines(&snapshot, &mut self.timelines, frames);
+            self.pending_events.extend(events);
             for (label, previous) in previous {
                 let current = self.timelines.get(&label).map(|state| state.current_time);
                 if let Some(current) = current {
@@ -800,11 +815,16 @@ impl PlayerInst {
         // that named it and never evaluated before its start.
         for index in 0..self.nodes.len() {
             let local_time = (time - self.nodes[index].time_offset).max(0.0);
-            let state = evaluate_frames(&self.nodes[index].frames, local_time);
+            let state = evaluate_frames(
+                &self.nodes[index].frames,
+                local_time,
+                self.nodes[index].coordinate_mode,
+            );
             let node = &mut self.nodes[index];
             node.local = state;
             node.draw_flag = true;
         }
+
         // The root viewport state is applied before the children inherit it,
         // so a visibility or opacity change takes effect in the same frame.
         let root = &mut self.nodes[0];
@@ -836,8 +856,15 @@ impl PlayerInst {
             node.accumulated.y =
                 parent_matrix[2] * local.x + parent_matrix[3] * local.y + parent_state.y;
             node.accumulated.z = parent_state.z + local.z;
+            // The visibility is inherited: a node draws only when every
+            // ancestor does.
+            node.accumulated.active = parent_state.active && local.active;
             node.accumulated.opacity = parent_state.opacity * local.opacity;
             node.accumulated.angle = parent_state.angle + local.angle;
+            node.accumulated.slant_x = parent_state.slant_x + local.slant_x;
+            node.accumulated.slant_y = parent_state.slant_y + local.slant_y;
+            node.accumulated.flip_x = parent_state.flip_x != local.flip_x;
+            node.accumulated.flip_y = parent_state.flip_y != local.flip_y;
             node.accumulated.scale_x = parent_state.scale_x * local.scale_x;
             node.accumulated.scale_y = parent_state.scale_y * local.scale_y;
             node.matrix = [
@@ -846,7 +873,13 @@ impl PlayerInst {
                 parent_matrix[2] * local_2x2[0] + parent_matrix[3] * local_2x2[2],
                 parent_matrix[2] * local_2x2[1] + parent_matrix[3] * local_2x2[3],
             ];
-            node.draw_flag = parent_state.active && local.active && parent_state.opacity > 0.0;
+            // A layer expanded from a child motion exists only from the
+            // parent keyframe that named the clip, so it stays hidden before
+            // that moment.
+            node.draw_flag = parent_state.active
+                && local.active
+                && parent_state.opacity > 0.0
+                && time >= node.visible_from;
         }
         let vertices = self.nodes.iter().filter(|node| node.draw_flag).count();
         self.processed_mesh_vertices_num = vertices as i32;
@@ -856,14 +889,15 @@ impl PlayerInst {
         self.layers_dirty = false;
     }
 
-    pub(crate) fn dispatch_events(&mut self, ctx: &CompatCtx, objthis: *mut std::ffi::c_void) {
-        if self.pending_events.is_empty() || objthis.is_null() {
+    /// Dispatch the queued action and sync events to the script object.
+    ///
+    /// `target` is the retained id of the receiver. A null id means there is
+    /// no receiver, and an id that names no live object makes the member
+    /// lookup fail instead of touching the object.
+    pub(crate) fn dispatch_events(&mut self, ctx: &CompatCtx, target: tjs::Tjs2ValueId) {
+        if self.pending_events.is_empty() || target.is_null() {
             return;
         }
-        // SAFETY: the VM passed a live `objthis` for this callback.
-        let Ok(target) = (unsafe { ctx.engine() }).retain_object_detached(objthis) else {
-            return;
-        };
         let events = std::mem::take(&mut self.pending_events);
         for event in events {
             let (name, arguments) = if event.kind == 0 {
@@ -879,15 +913,12 @@ impl PlayerInst {
             };
             // A class without the callback stays a no-op; a present callback
             // that raises is reported.
-            // SAFETY: the binding is live and `objthis` was retained above.
-            if unsafe { ctx.engine() }
-                .member(target.raw_id(), name)
-                .is_err()
-            {
+            // SAFETY: the binding is live and `target` is a retained id.
+            if unsafe { ctx.engine() }.member(target, name).is_err() {
                 continue;
             }
-            // SAFETY: the binding is live and `objthis` was retained above.
-            let called = unsafe { ctx.engine() }.call_member(target.raw_id(), name, &arguments);
+            // SAFETY: the binding is live and `target` is a retained id.
+            let called = unsafe { ctx.engine() }.call_member(target, name, &arguments);
             if let Err(error) = called {
                 log::warn!("Motion.Player: {name} callback failed: {error}");
             }
@@ -898,19 +929,24 @@ impl PlayerInst {
         if let Some(value) = self.variable_values.get(label) {
             return *value;
         }
-        if let Some(snapshot) = &self.snapshot {
-            if let Some(first) = snapshot
-                .variable_frames
-                .get(label)
-                .and_then(|frames| frames.first())
-            {
-                return first.value;
-            }
-            if let Some(range) = snapshot.variable_ranges.get(label) {
-                return range.0;
-            }
-        }
-        0.0
+        self.snapshot
+            .as_deref()
+            .map_or(0.0, |snapshot| default_variable(snapshot, label))
+    }
+
+    /// The keyframes of the variable at `index`, or an empty slice.
+    pub(crate) fn variable_frames_at(&self, index: usize) -> &[VariableFrame] {
+        let Some(snapshot) = self.snapshot.as_deref() else {
+            return &[];
+        };
+        let Some(label) = snapshot.variable_labels.get(index) else {
+            return &[];
+        };
+        snapshot
+            .variable_frames
+            .get(label.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     pub(crate) fn stop_timeline(&mut self, label: &str) {
@@ -1028,75 +1064,180 @@ impl PlayerInst {
         }
     }
 
+    /// The labels of the layers this player owns.
+    ///
+    /// A label that several nodes share is reported once, and the labels
+    /// come out in the order of the label map.
+    pub(crate) fn layer_labels(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|node| node.own)
+            .map(|node| node.label.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// The node a layer label names.
+    ///
+    /// The map keeps the last node that wrote the label, so a label that
+    /// several nodes share answers with the last one.
+    pub(crate) fn layer_node(&self, name: &str) -> Option<&MotionNode> {
+        self.nodes
+            .iter()
+            .rev()
+            .find(|node| node.own && node.label == name)
+    }
+
+    /// The layer getter the script receives: a `Motion.LayerGetter`
+    /// instance filled with the node's state.
     pub(crate) fn layer_getter_object(
         &self,
         ctx: &CompatCtx,
         node: &MotionNode,
     ) -> Result<DetachedValue, String> {
-        let object = eval_object(ctx, "%[]")?;
+        let getter = eval_object(ctx, "new Motion.LayerGetter()")?;
         // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `layer_getter_object`.
         let engine = unsafe { ctx.engine() };
-        let set = |key: &str, value: TjsValue| -> Result<(), String> {
-            engine
-                .set_member(object.raw_id(), key, &value)
-                .map_err(|error| error.to_string())
+        let Some(payload) = engine
+            .native_instance_payload(getter.raw_id(), "LayerGetter")
+            .map_err(|error| error.to_string())?
+        else {
+            return Err("motionplayer: the layer getter carries no payload".to_string());
         };
-        set("type", TjsValue::Integer(i64::from(node.node_type)))?;
-        set("label", TjsValue::String(node.label.clone()))?;
-        set("visible", TjsValue::Integer(i64::from(node.draw_flag)))?;
-        set(
-            "branchVisible",
-            TjsValue::Integer(i64::from(node.draw_flag)),
-        )?;
-        set(
-            "layerVisible",
-            TjsValue::Integer(i64::from(node.local.active)),
-        )?;
-        set("x", TjsValue::Real(node.accumulated.x))?;
-        set("y", TjsValue::Real(node.accumulated.y))?;
-        set("left", TjsValue::Real(node.accumulated.x))?;
-        set("top", TjsValue::Real(node.accumulated.y))?;
-        set("flipX", TjsValue::Integer(i64::from(self.flip)))?;
-        set("flipY", TjsValue::Integer(0))?;
-        set("zoomX", TjsValue::Real(node.accumulated.scale_x))?;
-        set("zoomY", TjsValue::Real(node.accumulated.scale_y))?;
-        set(
-            "angleDeg",
-            TjsValue::Real(node.accumulated.angle.to_degrees()),
-        )?;
-        set("angleRad", TjsValue::Real(node.accumulated.angle))?;
-        set("slantX", TjsValue::Real(node.accumulated.slant_x))?;
-        set("slantY", TjsValue::Real(node.accumulated.slant_y))?;
-        set("originX", TjsValue::Real(0.0))?;
-        set("originY", TjsValue::Real(0.0))?;
-        set("opacity", TjsValue::Real(node.accumulated.opacity))?;
-        set("mtx", TjsValue::Integer(0))?;
-        set("vtx", TjsValue::Integer(0))?;
-        set("color", TjsValue::Integer(i64::from(self.color.packed)))?;
-        set("bezierPatch", TjsValue::Integer(0))?;
-        set("shape", TjsValue::Integer(i64::from(node.shape)))?;
-        set("motion", TjsValue::Integer(0))?;
-        set("particle", TjsValue::Integer(node.particle_count as i64))?;
-        Ok(object)
+        // SAFETY: the payload is the `LayerGetterInst` the class constructor
+        // created, and the object stays alive for the rest of this function.
+        let payload = unsafe { &mut *(payload.as_ptr() as *mut LayerGetterInst) };
+        let (mtx, vtx, color, origin) = self.layer_getter_state(node);
+        populate_layer_getter(payload, node, origin, mtx, vtx, color);
+        Ok(getter)
     }
 
+    /// The matrix, the vertex list, the colour and the origin the layer
+    /// getter reports for a node.
+    ///
+    /// The matrix is the node's accumulated transform and its position. The
+    /// vertex list is the quad the node draws: its origin corner and the
+    /// three corners the node's transform produces. The colour is the node's
+    /// own four bytes.
+    fn layer_getter_state(&self, node: &MotionNode) -> ([f64; 6], [f64; 8], [i64; 4], (f64, f64)) {
+        let matrix = node.matrix;
+        let mtx = [
+            matrix[0],
+            matrix[1],
+            matrix[2],
+            matrix[3],
+            node.accumulated.x,
+            node.accumulated.y,
+        ];
+        let icon = self
+            .snapshot
+            .as_deref()
+            .and_then(|snapshot| snapshot.icons.get(&node.local.src));
+        let (origin_x, origin_y) = icon.map_or((0.0, 0.0), |icon| (icon.origin_x, icon.origin_y));
+        let color = [
+            i64::from(node.accumulated.color[0]),
+            i64::from(node.accumulated.color[1]),
+            i64::from(node.accumulated.color[2]),
+            i64::from(node.accumulated.color[3]),
+        ];
+        // A node without a source draws no box, so it reports no corners.
+        let Some(icon) = icon else {
+            return (mtx, [0.0; 8], color, (origin_x, origin_y));
+        };
+        let (width, height) = (icon.width, icon.height);
+        // The origin corner of the node's box: the position less the box's
+        // origin offset carried through the transform.
+        let total_x = origin_x + node.accumulated.ox;
+        let total_y = origin_y + node.accumulated.oy;
+        let corner_x = node.accumulated.x - (matrix[1] * total_y + total_x * matrix[0]);
+        let corner_y = node.accumulated.y - (total_y * matrix[3] + total_x * matrix[2]);
+        let vtx = [
+            corner_x,
+            corner_y,
+            corner_x + matrix[0] * width,
+            corner_y + matrix[2] * width,
+            corner_x + matrix[0] * width + matrix[1] * height,
+            corner_y + matrix[2] * width + matrix[3] * height,
+            corner_x + matrix[1] * height,
+            corner_y + matrix[3] * height,
+        ];
+        (mtx, vtx, color, (origin_x, origin_y))
+    }
+
+    /// Whether the point `(x, y)` hits the layer named `label`.
+    ///
+    /// The label is looked up in the layer map, which keeps the last node that
+    /// wrote it, and the node's shape geometry answers the point. Only a shape
+    /// node carries that geometry: it is the node's position, its clip origin
+    /// and its transform.
     pub(crate) fn hit_test(&self, label: &str, x: f64, y: f64) -> bool {
-        for node in &self.nodes {
-            if !label.is_empty() && node.label != label {
-                continue;
-            }
-            if !node.draw_flag {
-                continue;
-            }
-            let half_w = 32.0 * node.accumulated.scale_x.abs().max(0.0001);
-            let half_h = 32.0 * node.accumulated.scale_y.abs().max(0.0001);
-            let dx = x - node.accumulated.x;
-            let dy = y - node.accumulated.y;
-            if dx >= -half_w && dx <= half_w && dy >= -half_h && dy <= half_h {
-                return true;
-            }
+        if label.is_empty() {
+            return false;
         }
-        false
+        // The layer map keeps the last node that wrote a label.
+        let Some(node) = self.nodes.iter().rev().find(|node| node.label == label) else {
+            return false;
+        };
+        if node.node_type != 1 {
+            return false;
+        }
+        let half = node.accumulated.scale_x.abs() * 8.0;
+        match node.shape {
+            // A circle of the node's zoom.
+            1 => {
+                let radius = half;
+                let dx = x - node.accumulated.x;
+                let dy = y - node.accumulated.y;
+                dx * dx + dy * dy <= radius * radius
+            }
+            // A rectangle of the node's zoom.
+            2 => {
+                let half_w = half;
+                let half_h = node.accumulated.scale_y.abs() * 8.0;
+                x >= node.accumulated.x - half_w
+                    && x < node.accumulated.x + half_w
+                    && y >= node.accumulated.y - half_h
+                    && y < node.accumulated.y + half_h
+            }
+            // A quad the node's transform maps.
+            3 => {
+                let m = node.matrix;
+                let origin_x = node.accumulated.ox;
+                let origin_y = node.accumulated.oy;
+                let offset_x = origin_x * m[0] + origin_y * m[1];
+                let offset_y = origin_x * m[2] + origin_y * m[3];
+                let px = node.accumulated.x;
+                let py = node.accumulated.y;
+                let (ax, bx) = (m[0] * -8.0, m[1] * -8.0);
+                let (cx, dx) = (m[0] * 8.0, m[1] * 8.0);
+                let (ay, by) = (m[2] * -8.0, m[3] * -8.0);
+                let (cy, dy) = (m[2] * 8.0, m[3] * 8.0);
+                let corners = [
+                    (px + ax + bx - offset_x, py + ay + by - offset_y),
+                    (px + cx + bx - offset_x, py + cy + by - offset_y),
+                    (px + cx + dx - offset_x, py + cy + dy - offset_y),
+                    (px + ax + dx - offset_x, py + ay + dy - offset_y),
+                ];
+                let cross = |a: (f64, f64), b: (f64, f64), p: (f64, f64)| {
+                    (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0)
+                };
+                let winding = if cross(corners[0], corners[1], corners[2]) >= 0.0 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let point = (x, y);
+                winding * cross(corners[0], corners[1], point) >= 0.0
+                    && winding * cross(corners[1], corners[2], point) >= 0.0
+                    && winding * cross(corners[2], corners[3], point) >= 0.0
+                    && winding * cross(corners[3], corners[0], point) >= 0.0
+            }
+            // A point never hits.
+            _ => false,
+        }
     }
 
     pub(crate) fn serialize(&mut self, ctx: &CompatCtx) -> Result<RetainedValue, String> {
@@ -1252,7 +1393,7 @@ impl PlayerInst {
         let Some(bitmap_id) = scene.layer(layer_id).and_then(|layer| layer.bitmap) else {
             return;
         };
-        let Some(bitmap) = scene.bitmap(bitmap_id) else {
+        let Some(bitmap) = scene.bitmap_mut(bitmap_id) else {
             return;
         };
         if bitmap.width == 0 || bitmap.height == 0 {
@@ -1264,9 +1405,6 @@ impl PlayerInst {
         let affine = self.affine;
         let nodes = drawable_nodes(&self.nodes);
         let tinted = &mut self.tinted;
-        let Some(bitmap) = scene.bitmap_mut(bitmap_id) else {
-            return;
-        };
         // Every draw starts from a clear target; the previous pose never
         // survives into this frame.
         for pixel in bitmap.rgba.chunks_exact_mut(4) {
@@ -1357,6 +1495,21 @@ fn clear_fill(clear_enabled: bool, color: i32) -> [u8; 4] {
     ]
 }
 
+/// The operation mode a node's blend mode resolves to.
+///
+/// The low four bits of the node's blend mode select the operation: `1` is
+/// additive, `2` and `5` are subtractive, `3` is multiplicative, `4` is
+/// screen, and every other value composites source-over.
+fn blend_operation_mode(raw: i32) -> i64 {
+    match raw & 0x0F {
+        1 => 14,
+        2 | 5 => 15,
+        3 => 16,
+        4 => 17,
+        _ => 2,
+    }
+}
+
 fn draw_node(bitmap: &mut BitmapState, node: &MotionNode, frame: &mut DrawFrame<'_>) {
     let icon = frame
         .snapshot
@@ -1380,7 +1533,7 @@ fn draw_node(bitmap: &mut BitmapState, node: &MotionNode, frame: &mut DrawFrame<
     if width <= 0 || height <= 0 {
         return;
     }
-    let Some(source) = tinted_source(frame, &pixels, crop, &node.local.src) else {
+    let Some(source) = tinted_source(frame, &pixels, crop) else {
         return;
     };
     let matrix = node.matrix;
@@ -1404,7 +1557,8 @@ fn draw_node(bitmap: &mut BitmapState, node: &MotionNode, frame: &mut DrawFrame<
         corner(0.0, f64::from(height)),
     ];
     let opa = (node.accumulated.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
-    draw_icon(bitmap, &source, width, height, corners, opa);
+    let mode = blend_operation_mode(node.accumulated.blend_mode);
+    draw_icon(bitmap, &source, width, height, corners, opa, mode);
 }
 
 /// The cropped icon source tinted by the player colour, from the cache or
@@ -1413,10 +1567,8 @@ fn tinted_source(
     frame: &mut DrawFrame<'_>,
     pixels: &Arc<Pixels>,
     crop: RectI,
-    src: &str,
 ) -> Option<Arc<BitmapState>> {
     let key = TintKey {
-        src: src.to_string(),
         color: frame.color,
         crop,
         pixels: Arc::as_ptr(pixels) as usize,
@@ -1470,10 +1622,13 @@ fn draw_icon(
     height: i32,
     corners: [(f64, f64); 3],
     opa: u8,
+    mode: i64,
 ) {
     let rect = (0, 0, width, height);
     if let Some((x, y)) = unit_axis_aligned_origin(corners, width, height) {
-        blit_over(
+        // The unit axis-aligned placement blends with the node's operation
+        // mode, so the same kernel as the affine pass applies.
+        operate_rect(
             bitmap,
             x,
             y,
@@ -1481,9 +1636,8 @@ fn draw_icon(
                 bitmap: source,
                 rect,
             },
-            (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
             BlitOptions {
-                mode: 2,
+                mode,
                 opa,
                 treat_as_opaque: false,
                 hold_alpha: false,
@@ -1495,7 +1649,8 @@ fn draw_icon(
         bitmap,
         AffineBlit {
             corners,
-            stretch_type: 2,
+            // The nearest texel of the source is sampled.
+            stretch_type: 0,
             clear: false,
             clear_color: [0, 0, 0, 0],
         },
@@ -1504,7 +1659,7 @@ fn draw_icon(
             rect,
         },
         BlitOptions {
-            mode: 2,
+            mode,
             opa,
             treat_as_opaque: false,
             hold_alpha: false,
@@ -1523,12 +1678,12 @@ fn unit_axis_aligned_origin(
         return None;
     }
     let [origin, right, down] = corners;
-    let width = f64::from(width);
-    let height = f64::from(height);
-    if (right.0 - origin.0).to_bits() != width.to_bits()
-        || right.1.to_bits() != origin.1.to_bits()
-        || (down.1 - origin.1).to_bits() != height.to_bits()
-        || down.0.to_bits() != origin.0.to_bits()
+    // The quad spans exactly its own size, runs along the axes and starts on a
+    // whole pixel.
+    if right.0 - origin.0 != f64::from(width)
+        || down.1 - origin.1 != f64::from(height)
+        || right.1 != origin.1
+        || down.0 != origin.0
         || origin.0.fract() != 0.0
         || origin.1.fract() != 0.0
     {
@@ -1661,13 +1816,23 @@ fn pixel_offset(value: f64) -> Option<u32> {
 /// The node's local 2x2 transform as `[m11, m12, m21, m22]`, composed from the
 /// flip, angle, zoom and slant steps in the layer's `transformOrder`.
 ///
-/// The stored angle is in degrees. A step id outside `0..=3` is skipped, and a
-/// flip is already folded into the sign of the node's scale.
+/// The stored angle is in degrees. A step id outside `0..=3` is skipped.
 fn local_matrix(state: &FrameState, order: &[i32; 4]) -> [f64; 4] {
     let (mut m11, mut m12, mut m21, mut m22) = (1.0f64, 0.0f64, 0.0f64, 1.0f64);
     for &step in order {
         match step {
-            0 => {}
+            0 => {
+                // The flip mirrors the node: it negates one axis of the
+                // transform built so far.
+                if state.flip_x {
+                    m11 = -m11;
+                    m12 = -m12;
+                }
+                if state.flip_y {
+                    m21 = -m21;
+                    m22 = -m22;
+                }
+            }
             1 => {
                 if state.angle != 0.0 {
                     let (sin, cos) = state.angle.to_radians().sin_cos();
@@ -1687,7 +1852,6 @@ fn local_matrix(state: &FrameState, order: &[i32; 4]) -> [f64; 4] {
                 let (t21, t22) = (m11 * state.slant_y + m21, m22 + m12 * state.slant_y);
                 (m11, m12, m21, m22) = (t11, t12, t21, t22);
             }
-            3 => {}
             _ => {}
         }
     }
@@ -1986,12 +2150,23 @@ extern "C" fn player_play_raw(
 
 /// Advance the player by `progress`'s optional `dt` argument and return the
 /// playback ratio.
-fn progress_from_args(
-    inst: &mut PlayerInst,
-    arguments: &[Value],
-    ctx: &CompatCtx,
+fn step_progress(
+    engine: *mut std::ffi::c_void,
+    instance: *mut std::ffi::c_void,
+    argc: std::os::raw::c_int,
+    argv: *const Value,
+    out_error: *mut *mut std::ffi::c_char,
     objthis: *mut std::ffi::c_void,
-) -> f64 {
+) -> Result<f64, std::os::raw::c_int> {
+    let Some(res) = resolve(engine) else {
+        return Err(report_error(out_error, super::helpers::NO_BINDING));
+    };
+    // SAFETY: the VM guarantees the live payload.
+    let Some(inst) = (unsafe { inst_mut::<PlayerInst>(instance) }) else {
+        return Err(report_error(out_error, "Player: null instance"));
+    };
+    // SAFETY: the trampoline guarantees `argc` valid entries.
+    let arguments = unsafe { args(argv, argc) };
     let dt = arguments
         .first()
         .map(|value| match value.ty {
@@ -2000,8 +2175,17 @@ fn progress_from_args(
             _ => value_as_i64(value) as f64,
         })
         .unwrap_or(0.0);
-    inst.progress(dt, ctx, objthis);
-    inst.progress_ratio()
+    // The receiver of the action and sync callbacks is the script object the
+    // call was made on. The VM hands it over as a raw object pointer, which
+    // is retained for the duration of the call so the dispatch can address
+    // it by its retained id.
+    let receiver = res.engine().retain_object_detached(objthis).ok();
+    let target = receiver
+        .as_ref()
+        .map(DetachedValue::raw_id)
+        .unwrap_or(tjs::Tjs2ValueId::null());
+    inst.progress(dt, &res.ctx(), target);
+    Ok(inst.progress_ratio())
 }
 
 extern "C" fn player_progress_raw(
@@ -2013,19 +2197,14 @@ extern "C" fn player_progress_raw(
     out_error: *mut *mut std::ffi::c_char,
     objthis: *mut std::ffi::c_void,
 ) -> std::os::raw::c_int {
-    let Some(res) = resolve(engine) else {
-        return report_error(out_error, super::helpers::NO_BINDING);
-    };
-    // SAFETY: the VM guarantees the live payload.
-    let Some(inst) = (unsafe { inst_mut::<PlayerInst>(instance) }) else {
-        return report_error(out_error, "Player: null instance");
-    };
-    // SAFETY: the trampoline guarantees `argc` valid entries.
-    let arguments = unsafe { args(argv, argc) };
     // `Player.progress` reports the playback position after the step.
-    let ratio = progress_from_args(inst, arguments, &res.ctx(), objthis);
-    set_real(out, ratio);
-    0
+    match step_progress(engine, instance, argc, argv, out_error, objthis) {
+        Ok(ratio) => {
+            set_real(out, ratio);
+            0
+        }
+        Err(code) => code,
+    }
 }
 
 extern "C" fn player_emote_progress_raw(
@@ -2037,19 +2216,14 @@ extern "C" fn player_emote_progress_raw(
     out_error: *mut *mut std::ffi::c_char,
     objthis: *mut std::ffi::c_void,
 ) -> std::os::raw::c_int {
-    let Some(res) = resolve(engine) else {
-        return report_error(out_error, super::helpers::NO_BINDING);
-    };
-    // SAFETY: the VM guarantees the live payload.
-    let Some(inst) = (unsafe { inst_mut::<PlayerInst>(instance) }) else {
-        return report_error(out_error, "Player: null instance");
-    };
-    // SAFETY: the trampoline guarantees `argc` valid entries.
-    let arguments = unsafe { args(argv, argc) };
     // The emote player discards the result of `progress(dt)`.
-    progress_from_args(inst, arguments, &res.ctx(), objthis);
-    set_void(out);
-    0
+    match step_progress(engine, instance, argc, argv, out_error, objthis) {
+        Ok(_) => {
+            set_void(out);
+            0
+        }
+        Err(code) => code,
+    }
 }
 
 extern "C" fn player_is_playing_raw(
@@ -2679,7 +2853,7 @@ mod tests {
     /// (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:637-642`).
     fn start(player: &mut PlayerInst, label: &str, ctx: &CompatCtx) {
         player.play(label, 0, ctx).expect("start the clip");
-        player.progress(0.0, ctx, std::ptr::null_mut());
+        player.progress(0.0, ctx, tjs::Tjs2ValueId::null());
     }
 
     #[test]
@@ -2691,7 +2865,7 @@ mod tests {
         let ctx = context(&engine, &mut services);
         let mut player = player(&snapshot);
         start(&mut player, "intro", &ctx);
-        player.progress(2000.0, &ctx, std::ptr::null_mut());
+        player.progress(2000.0, &ctx, tjs::Tjs2ValueId::null());
         assert!(!player.playing_now(), "the one-shot intro stopped");
         assert!(player.playing_timelines.is_empty());
         start(&mut player, "idle", &ctx);
@@ -2707,8 +2881,12 @@ mod tests {
     /// A queued activation swallows the tick that follows it: the timeline does
     /// not advance until the gate is released
     /// (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:819-826`).
+    ///
+    /// A delta outside the accepted window is dropped, so one huge tick cannot
+    /// skip the animation ahead
+    /// (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:1002-1004`).
     #[test]
-    fn the_queuing_gate_holds_a_newly_started_timeline() {
+    fn the_queuing_gate_holds_the_first_tick_and_drops_an_out_of_range_delta() {
         let snapshot = snapshot();
         let _lock = crate::native_util::test_vm_lock();
         let engine = Tjs2Engine::new().expect("create engine");
@@ -2717,35 +2895,21 @@ mod tests {
         let mut player = player(&snapshot);
         player.play("intro", 0, &ctx).expect("start intro");
         assert!(player.queuing, "a fresh play holds the gate");
-        player.progress(500.0, &ctx, std::ptr::null_mut());
+        player.progress(500.0, &ctx, tjs::Tjs2ValueId::null());
         assert!(!player.queuing, "the layer update releases the gate");
         assert_eq!(player.timelines["intro"].current_time, 0.0);
         assert!((player.nodes[1].local.x - 100.0).abs() < 1e-9);
-        player.progress(500.0, &ctx, std::ptr::null_mut());
+        player.progress(500.0, &ctx, tjs::Tjs2ValueId::null());
         assert!(
             (player.nodes[1].local.x - 100.0).abs() > 1.0,
             "the second tick advances"
         );
-    }
-
-    /// A delta outside the accepted window is dropped, so one huge tick cannot
-    /// skip the animation ahead (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:1002-1004`).
-    #[test]
-    fn a_huge_delta_does_not_advance_the_timeline() {
-        let snapshot = snapshot();
-        let _lock = crate::native_util::test_vm_lock();
-        let engine = Tjs2Engine::new().expect("create engine");
-        let mut services = CompatServices::new();
-        let ctx = context(&engine, &mut services);
-        let mut player = player(&snapshot);
-        start(&mut player, "intro", &ctx);
-        player.progress(30.0 * 1000.0 / 60.0, &ctx, std::ptr::null_mut());
         let advanced = player.timelines["intro"].current_time;
         assert!(advanced > 0.0);
         assert!((player.progress_ratio() - advanced / 120.0).abs() < 1e-12);
-        player.progress(1.0e9, &ctx, std::ptr::null_mut());
+        player.progress(1.0e9, &ctx, tjs::Tjs2ValueId::null());
         assert_eq!(player.timelines["intro"].current_time, advanced);
-        player.progress(-1000.0, &ctx, std::ptr::null_mut());
+        player.progress(-1000.0, &ctx, tjs::Tjs2ValueId::null());
         assert_eq!(player.timelines["intro"].current_time, advanced);
     }
 
@@ -2758,14 +2922,14 @@ mod tests {
         let ctx = context(&engine, &mut services);
         let mut player = player(&snapshot);
         start(&mut player, "intro", &ctx);
-        player.progress(50.0 * 1000.0 / 60.0, &ctx, std::ptr::null_mut());
+        player.progress(50.0 * 1000.0 / 60.0, &ctx, tjs::Tjs2ValueId::null());
         assert!(
             (player.nodes[1].local.x - 100.0).abs() > 100.0,
             "50 frames move the shape"
         );
         player.play("intro", 0, &ctx).expect("replay intro");
         // The replayed clip is gated again, so its first tick only presents it.
-        player.progress(0.0, &ctx, std::ptr::null_mut());
+        player.progress(0.0, &ctx, tjs::Tjs2ValueId::null());
         // `playTimeline` resets `state.currentTime` before evaluation
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:238`,
         // `:396-403`).
@@ -2773,6 +2937,276 @@ mod tests {
         let bitmap = composite(&mut player);
         assert_eq!(alpha(&bitmap, 100, 100), 255);
         assert_eq!(alpha(&bitmap, 600, 600), 0);
+    }
+
+    /// A scaled placement samples the nearest texel, not a bilinear blend
+    /// (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:455-456`).
+    #[test]
+    fn a_scaled_placement_samples_the_nearest_texel() {
+        let source = BitmapState::new(
+            2,
+            2,
+            vec![
+                10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
+            ],
+        );
+        // The 2x2 source is placed on a 4x4 quad at (1, 1), so every source
+        // texel covers a 2x2 block of the destination.
+        let corners = [(1.0, 1.0), (5.0, 1.0), (1.0, 5.0)];
+        let mut bitmap = BitmapState::new(8, 8, vec![0u8; 8 * 8 * 4]);
+        draw_icon(&mut bitmap, &source, 2, 2, corners, 255, 2);
+        let texel = |x: usize, y: usize| {
+            let offset = (y * 8 + x) * 4;
+            [
+                bitmap.rgba[offset],
+                bitmap.rgba[offset + 1],
+                bitmap.rgba[offset + 2],
+                bitmap.rgba[offset + 3],
+            ]
+        };
+        assert_eq!(texel(1, 1), [10, 20, 30, 255], "the first texel");
+        assert_eq!(texel(2, 1), [10, 20, 30, 255], "the first texel is 2 wide");
+        assert_eq!(texel(3, 1), [40, 50, 60, 255], "the second texel");
+        assert_eq!(texel(1, 3), [70, 80, 90, 255], "the third texel");
+        assert_eq!(texel(3, 3), [100, 110, 120, 255], "the fourth texel");
+        // The quad covers four by four pixels, so the texel next to it is
+        // untouched.
+        assert_eq!(texel(5, 1), [0, 0, 0, 0]);
+    }
+
+    /// A child motion exists only from the parent keyframe that named it, so
+    /// it stays hidden before that moment
+    /// (`reference/cpp/plugins/motionplayer/PlayerUpdateChildMotion.cpp:106-215`,
+    /// `PlayerUpdateLayerEval.cpp:253`).
+    #[test]
+    fn a_child_motion_starts_at_its_parent_keyframe() {
+        let parent_layer = dict(vec![
+            ("label", text("main")),
+            ("type", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![dict(vec![
+                    ("time", num(40)),
+                    ("type", num(2)),
+                    ("content", dict(vec![("src", text("motion/test/child"))])),
+                ])]),
+            ),
+        ]);
+        let child_layer = dict(vec![
+            ("label", text("child_shape")),
+            ("type", num(0)),
+            ("shape", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![frame(0, 2, Some(content(10, 20)))]),
+            ),
+        ]);
+        let parent_clip = dict(vec![
+            ("lastTime", num(120)),
+            ("layer", PsbValue::List(vec![parent_layer])),
+        ]);
+        let child_clip = dict(vec![
+            ("lastTime", num(60)),
+            ("layer", PsbValue::List(vec![child_layer])),
+        ]);
+        let object = dict(vec![(
+            "test",
+            dict(vec![(
+                "motion",
+                dict(vec![("parent", parent_clip), ("child", child_clip)]),
+            )]),
+        )]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root: dict(vec![("object", object)]),
+                resources: Vec::new(),
+            },
+            "child.psb",
+        );
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "parent".to_string(),
+            ..PlayerInst::default()
+        };
+        prime_timelines(&snapshot, &mut player.timelines);
+        player.nodes = build_node_tree(&snapshot, snapshot.clip("parent"));
+        assert_eq!(player.nodes.len(), 3, "the child clip is expanded");
+        // Before the keyframe the child does not exist yet.
+        player
+            .timelines
+            .get_mut("parent")
+            .expect("the timeline")
+            .current_time = 0.0;
+        player.update_layers();
+        assert!(
+            !player.nodes[2].draw_flag,
+            "the child stays hidden before its keyframe"
+        );
+        // From the keyframe on it draws.
+        player
+            .timelines
+            .get_mut("parent")
+            .expect("the timeline")
+            .current_time = 40.0;
+        player.update_layers();
+        assert!(
+            player.nodes[2].draw_flag,
+            "the child draws from its keyframe"
+        );
+    }
+
+    /// The action and sync keyframes reach the `onAction` and `onSync`
+    /// callbacks when the player progresses
+    /// (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:872-914`).
+    #[test]
+    fn the_action_and_sync_callbacks_are_dispatched() {
+        let snapshot = event_snapshot();
+        let _lock = crate::native_util::test_vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let ctx = context(&engine, &mut services);
+        engine
+            .exec_script(
+                "global.events = \"\";\n\
+                 class Handler {\n\
+                 function Handler() {}\n\
+                 function onAction(action, label) { global.events += \"A:\" + action + \":\" + label + \";\"; }\n\
+                 function onSync() { global.events += \"S;\"; }\n\
+                 }\n\
+                 global.handler = new Handler();",
+                "motion-player-test",
+            )
+            .expect("define the handler");
+        let handler =
+            super::super::helpers::eval_object(&ctx, "global.handler").expect("the handler object");
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "active".to_string(),
+            ..PlayerInst::default()
+        };
+        prime_timelines(&snapshot, &mut player.timelines);
+        player.nodes = build_node_tree(&snapshot, snapshot.clip("active"));
+        player
+            .play("active", 0, &ctx)
+            .expect("start the active clip");
+        // The receiver is addressed by its retained id, the same handle the
+        // native callback hands the dispatch.
+        let receiver = handler.raw_id();
+        // The first tick releases the activation gate, the second crosses the
+        // keyframes.
+        player.progress(0.0, &ctx, receiver);
+        player.progress(500.0, &ctx, receiver);
+        // The handler recorded the action and the sync.
+        // SAFETY: the VM is single-threaded and the handler is alive.
+        let events = unsafe { ctx.engine() }
+            .eval("global.events", "motion-player-test")
+            .expect("the recorded events");
+        let events = match events {
+            tjs::TjsValue::String(text) => text,
+            other => panic!("the events are {other:?}"),
+        };
+        assert!(
+            events.contains("A:wave:active_layer;"),
+            "the action callback ran: {events}"
+        );
+        assert!(events.contains("S;"), "the sync callback ran: {events}");
+    }
+
+    /// A dispatch to a receiver that is not a live object is dropped, not
+    /// dereferenced: the member lookup fails and the events are consumed
+    /// (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:872-914`).
+    #[test]
+    fn a_dispatch_to_a_dead_receiver_is_dropped() {
+        let snapshot = event_snapshot();
+        let _lock = crate::native_util::test_vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let ctx = context(&engine, &mut services);
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "active".to_string(),
+            ..PlayerInst::default()
+        };
+        prime_timelines(&snapshot, &mut player.timelines);
+        player.nodes = build_node_tree(&snapshot, snapshot.clip("active"));
+        player
+            .play("active", 0, &ctx)
+            .expect("start the active clip");
+        // A retained id that names no live object: the engine never hands
+        // one out this high, so the lookup fails instead of touching memory.
+        let dead = tjs::Tjs2ValueId::from_raw(0x1234_usize as *mut std::ffi::c_void);
+        player.progress(0.0, &ctx, dead);
+        player.progress(500.0, &ctx, dead);
+        // The dispatch consumed the events without calling the receiver.
+        assert!(
+            player.pending_events.is_empty(),
+            "the queued events are dropped"
+        );
+    }
+
+    /// The packed color keeps the red channel in its low byte, and the color
+    /// weight is kept in the swapped order
+    /// (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:24-27`, `:144-152`,
+    /// `:1555-1565`).
+    #[test]
+    fn a_packed_color_keeps_its_channel_order() {
+        let color = super::ColorAnimator::from_packed(0x0000_00FF);
+        assert_eq!(color.bytes[0], 1.0, "the low byte is the red channel");
+        assert_eq!(color.bytes[1], 0.0, "the green channel");
+        assert_eq!(color.bytes[2], 0.0, "the blue channel");
+        assert_eq!(color.bytes[3], 0.0, "the alpha channel");
+        // The blue channel is the third byte.
+        let color = super::ColorAnimator::from_packed(0x00FF_0000);
+        assert_eq!(color.bytes[0], 0.0, "the red channel");
+        assert_eq!(color.bytes[2], 1.0, "the blue channel");
+        // The weight swap exchanges the red and blue channels.
+        assert_eq!(
+            super::super::animator::swap_packed_rb(0x0011_2233),
+            0x0033_2211
+        );
+        assert_eq!(
+            super::super::animator::swap_packed_rb(super::super::animator::swap_packed_rb(
+                0x0011_2233
+            )),
+            0x0011_2233
+        );
+        // A red tint keeps the red channel and drops the other two.
+        let pixels = super::Pixels {
+            width: 1,
+            height: 1,
+            rgba: vec![10, 20, 30, 255],
+        };
+        let tinted = super::tint_crop(&pixels, (0, 0, 1, 1), [255, 0, 0, 255])
+            .expect("the tint covers the texel");
+        assert_eq!(tinted.rgba, vec![10, 0, 0, 255]);
+    }
+
+    /// A shape node answers the hit test with its own geometry: a rectangle
+    /// of the node's zoom, a circle of the node's zoom or the quad its
+    /// transform maps
+    /// (`reference/cpp/plugins/motionplayer/PlayerLayerQuery.cpp:217-274`,
+    /// `:12-21`, `PlayerUpdateGeometry.cpp:921-979`).
+    #[test]
+    fn a_shape_node_answers_the_hit_test_with_its_geometry() {
+        let mut player = PlayerInst::default();
+        let mut node = MotionNode::new(0, "shape".to_string());
+        node.node_type = 1;
+        node.shape = 2;
+        node.draw_flag = true;
+        node.accumulated.x = 100.0;
+        node.accumulated.y = 50.0;
+        node.accumulated.scale_x = 1.0;
+        node.accumulated.scale_y = 1.0;
+        player.nodes = vec![node];
+        // A rectangle of 16 by 16 pixels around the node.
+        assert!(player.hit_test("shape", 100.0, 50.0));
+        assert!(player.hit_test("shape", 107.0, 50.0));
+        assert!(!player.hit_test("shape", 109.0, 50.0));
+        assert!(!player.hit_test("shape", 100.0, 60.0));
+        // A label that names no node never hits.
+        assert!(!player.hit_test("other", 100.0, 50.0));
+        // An empty label never hits.
+        assert!(!player.hit_test("", 100.0, 50.0));
     }
 
     /// The `title_bg` logo transition an authored clip carries on its t=40
@@ -2870,8 +3304,8 @@ mod tests {
             .play("active", 0, &ctx)
             .expect("start the active clip");
         // The first tick releases the activation gate without advancing.
-        player.progress(0.0, &ctx, std::ptr::null_mut());
-        player.progress(500.0, &ctx, std::ptr::null_mut());
+        player.progress(0.0, &ctx, tjs::Tjs2ValueId::null());
+        player.progress(500.0, &ctx, tjs::Tjs2ValueId::null());
         assert_eq!(
             player
                 .pending_events
@@ -2945,7 +3379,7 @@ mod tests {
         // contentless frame is not a keyframe
         // (`reference/cpp/plugins/motionplayer/PlayerUpdateLayerEval.cpp:282-311`).
         for time in [75.0, 97.0, 119.9, 120.0, 1_000_000.0] {
-            let state = evaluate_frames(&logo_frames(), time);
+            let state = evaluate_frames(&logo_frames(), time, 0);
             assert_eq!(logo_corner(&state), (36.0, 60.0), "t={time}");
             assert_eq!(state.src, "src/title/logo", "t={time}");
         }
@@ -2966,7 +3400,7 @@ mod tests {
             },
         ];
         for time in [0.0, 100.0] {
-            let state = evaluate_frames(&normal, time);
+            let state = evaluate_frames(&normal, time, 0);
             assert!(state.active, "t={time} holds the idle content frame");
             assert_eq!(logo_corner(&state), (36.0, 60.0), "t={time}");
             assert_eq!(state.src, "src/title/logo", "t={time}");
@@ -2985,7 +3419,7 @@ mod tests {
         let u = 1.0 - t;
         let eased =
             u * u * u * y[0] + 3.0 * u * u * t * y[1] + 3.0 * u * t * t * y[2] + t * t * t * y[3];
-        let state = evaluate_frames(&logo_frames(), 40.0 + t * 35.0);
+        let state = evaluate_frames(&logo_frames(), 40.0 + t * 35.0, 0);
         let expected_scale = 1.1 + (1.0 - 1.1) * eased;
         assert!(
             (state.scale_x - expected_scale).abs() < 1e-9,
@@ -3136,12 +3570,12 @@ mod tests {
         assert_eq!(unit_axis_aligned_origin(corners, 2, 2), Some((2, 3)));
         let mut fast = BitmapState::new(6, 6, vec![0u8; 6 * 6 * 4]);
         let mut affine = BitmapState::new(6, 6, vec![0u8; 6 * 6 * 4]);
-        draw_icon(&mut fast, &source, 2, 2, corners, 255);
+        draw_icon(&mut fast, &source, 2, 2, corners, 255, 2);
         affine_blit(
             &mut affine,
             AffineBlit {
                 corners,
-                stretch_type: 2,
+                stretch_type: 0,
                 clear: false,
                 clear_color: [0, 0, 0, 0],
             },
@@ -3177,6 +3611,229 @@ mod tests {
             unit_axis_aligned_origin([(2.5, 3.0), (4.5, 3.0), (2.5, 5.0)], 2, 2),
             None
         );
+    }
+
+    /// A label that several nodes share is reported once, and the lookup
+    /// answers with the last node that wrote it
+    /// (`reference/cpp/plugins/motionplayer/PlayerLayerQuery.cpp:101-116`,
+    /// `:159-175`).
+    #[test]
+    fn a_shared_label_is_reported_once() {
+        let mut player = PlayerInst::default();
+        let mut first = MotionNode::new(0, "body".to_string());
+        first.accumulated.x = 1.0;
+        let mut second = MotionNode::new(0, "body".to_string());
+        second.accumulated.x = 5.0;
+        let other = MotionNode::new(0, "leg".to_string());
+        player.nodes = vec![first, second, other];
+        // The label map holds one entry per label.
+        assert_eq!(
+            player.layer_labels(),
+            vec!["body".to_string(), "leg".to_string()]
+        );
+        // The map keeps the last node that wrote the label.
+        let node = player.layer_node("body").expect("the label is known");
+        assert_eq!(node.accumulated.x, 5.0);
+        assert!(player.layer_node("missing").is_none());
+    }
+
+    /// The layer getter list holds the player's own nodes but the root,
+    /// which has no layer of its own
+    /// (`reference/cpp/plugins/motionplayer/PlayerLayerQuery.cpp:177-195`).
+    #[test]
+    fn the_layer_getter_list_skips_the_root() {
+        let mut player = PlayerInst::default();
+        let root = MotionNode::new(0, String::new());
+        let child = MotionNode::new(0, "body".to_string());
+        player.nodes = vec![root, child];
+        let nodes: Vec<&MotionNode> = player
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(index, node)| *index != 0 && node.own)
+            .map(|(_, node)| node)
+            .collect();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].label, "body");
+    }
+
+    /// A storage with one opaque texel and the snapshot that names it.
+    fn icon_fixture() -> (Storage, MotionSnapshot) {
+        let dir = std::env::temp_dir();
+        let storage = Storage::mount_archives(
+            FileSystem::host(dir.clone()),
+            dir.clone(),
+            std::iter::empty::<&str>(),
+        )
+        .expect("mount storage");
+        storage.register_media(
+            "psb://cache.psb/source/group/icon/art/pixel".to_string(),
+            vec![10, 20, 30, 255],
+        );
+        let icon = dict(vec![("width", num(1)), ("height", num(1))]);
+        let group = dict(vec![("icon", dict(vec![("art", icon)]))]);
+        let root = dict(vec![("source", dict(vec![("group", group)]))]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root,
+                resources: Vec::new(),
+            },
+            "cache.psb",
+        );
+        (storage, snapshot)
+    }
+
+    /// A node's blend mode selects the operation the affine blit uses, so a
+    /// non-default mode draws differently from source-over
+    /// (`reference/cpp/plugins/motionplayer/PlayerRenderInternal.cpp:422-446`).
+    #[test]
+    fn a_node_blend_mode_selects_the_draw_operation() {
+        let (storage, snapshot) = icon_fixture();
+        let draw_with = |blend_mode: i32| {
+            let mut node = MotionNode::new(0, "art".to_string());
+            node.draw_flag = true;
+            node.local.src = "src/group/art".to_string();
+            node.accumulated.opacity = 1.0;
+            node.accumulated.blend_mode = blend_mode;
+            let mut player = PlayerInst {
+                nodes: vec![node],
+                ..PlayerInst::default()
+            };
+            let color = color_bytes(player.color.bytes);
+            let affine = player.affine;
+            let mut bitmap = BitmapState::new(4, 4, vec![0u8; 4 * 4 * 4]);
+            let nodes = drawable_nodes(&player.nodes);
+            let missing = composite_nodes(
+                &mut bitmap,
+                nodes,
+                Some(&snapshot),
+                Some(&storage),
+                color,
+                affine,
+                &mut player.tinted,
+            );
+            assert!(missing.is_empty());
+            bitmap
+        };
+        // The default blend mode composites source-over, so the texel keeps
+        // its colour.
+        let over = draw_with(16);
+        // The multiplicative mode darkens the texel to black.
+        let multiplied = draw_with(3);
+        assert_eq!(over.rgba[0], 30, "the source-over texel is the decoded one");
+        assert_eq!(over.rgba[3], 255);
+        assert_eq!(
+            &multiplied.rgba[..4],
+            &[0u8, 0, 0, 255],
+            "the multiplicative mode darkens the texel"
+        );
+        assert_ne!(over.rgba, multiplied.rgba);
+    }
+
+    /// A half transparent node keeps the source alpha under a non-default
+    /// blend mode; the mode changes the colour channels, not the coverage
+    /// (`reference/cpp/plugins/motionplayer/PlayerRenderInternal.cpp:422-446`).
+    #[test]
+    fn a_half_transparent_node_keeps_its_coverage_under_a_blend_mode() {
+        let (storage, snapshot) = icon_fixture();
+        let draw_with = |blend_mode: i32, opacity: f64| {
+            let mut node = MotionNode::new(0, "art".to_string());
+            node.draw_flag = true;
+            node.local.src = "src/group/art".to_string();
+            node.accumulated.opacity = opacity;
+            node.accumulated.blend_mode = blend_mode;
+            let mut player = PlayerInst {
+                nodes: vec![node],
+                ..PlayerInst::default()
+            };
+            let color = color_bytes(player.color.bytes);
+            let affine = player.affine;
+            let mut bitmap = BitmapState::new(4, 4, vec![0u8; 4 * 4 * 4]);
+            let nodes = drawable_nodes(&player.nodes);
+            let missing = composite_nodes(
+                &mut bitmap,
+                nodes,
+                Some(&snapshot),
+                Some(&storage),
+                color,
+                affine,
+                &mut player.tinted,
+            );
+            assert!(missing.is_empty());
+            bitmap
+        };
+        // The source-over draw keeps the texel's colour and the coverage of
+        // the node's opacity.
+        let over = draw_with(16, 0.5);
+        assert_eq!(&over.rgba[..4], &[30u8, 20, 10, 128][..]);
+        // The multiplicative mode darkens the texel to black but leaves the
+        // coverage alone.
+        let multiplied = draw_with(3, 0.5);
+        assert_eq!(&multiplied.rgba[..4], &[0u8, 0, 0, 128][..]);
+    }
+
+    /// The clear drops the decoded sources, so the next draw reads the chunk
+    /// again (`reference/cpp/plugins/motionplayer/PlayerRender.cpp:57-62`,
+    /// `SourceCache.cpp:610-622`).
+    #[test]
+    fn clearing_the_cache_reads_the_chunk_again() {
+        let dir = std::env::temp_dir();
+        let storage = Storage::mount_archives(
+            FileSystem::host(dir.clone()),
+            dir.clone(),
+            std::iter::empty::<&str>(),
+        )
+        .expect("mount storage");
+        storage.register_media(
+            "psb://cache.psb/source/group/icon/art/pixel".to_string(),
+            vec![10, 20, 30, 255],
+        );
+        let icon = dict(vec![("width", num(2)), ("height", num(2))]);
+        let group = dict(vec![("icon", dict(vec![("art", icon)]))]);
+        let root = dict(vec![("source", dict(vec![("group", group)]))]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root,
+                resources: Vec::new(),
+            },
+            "cache.psb",
+        );
+        let mut node = MotionNode::new(0, "art".to_string());
+        node.draw_flag = true;
+        node.local.src = "src/group/art".to_string();
+        node.accumulated.opacity = 1.0;
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot)),
+            nodes: vec![node],
+            ..PlayerInst::default()
+        };
+        let mut bitmap = BitmapState::new(4, 4, vec![0u8; 4 * 4 * 4]);
+        let draw = |player: &mut PlayerInst, bitmap: &mut BitmapState| {
+            let nodes = drawable_nodes(&player.nodes);
+            let snapshot = player.snapshot.clone();
+            let color = color_bytes(player.color.bytes);
+            let affine = player.affine;
+            composite_nodes(
+                bitmap,
+                nodes,
+                snapshot.as_deref(),
+                Some(&storage),
+                color,
+                affine,
+                &mut player.tinted,
+            )
+        };
+        draw(&mut player, &mut bitmap);
+        let read = storage.read_bytes();
+        assert!(read > 0, "the chunk was read");
+        // The second draw reuses the decoded chunk.
+        draw(&mut player, &mut bitmap);
+        assert_eq!(storage.read_bytes(), read, "the chunk stays cached");
+        // The clear drops the decoded chunk, so the next draw reads it again.
+        player.clear_cache();
+        assert!(player.tinted.is_empty(), "the tinted source is dropped");
+        draw(&mut player, &mut bitmap);
+        assert_eq!(storage.read_bytes(), read * 2, "the chunk is read again");
     }
 
     #[test]

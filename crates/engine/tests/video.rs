@@ -373,3 +373,91 @@ fn two_overlays_are_independent() {
     assert_eq!(a.frame(), 15);
     assert_eq!(b.frame(), 0);
 }
+
+/// The clock keeps the exact elapsed time: a step is never rounded, so 600
+/// frames of a 60 Hz display add up to exactly ten seconds.
+///
+/// The reference player clock is a `double` in microsecond units
+/// (`reference/cpp/core/movie/ffmpeg/Clock.cpp:30-52`). A rounded integer
+/// step would advance the clock by 17 ms per 16.667 ms frame, run the movie
+/// two percent fast and skip a frame's worth of audio on every step.
+#[test]
+fn the_clock_keeps_the_exact_elapsed_time() {
+    let mut v = VideoOverlay::new();
+    v.open(spec(30.0, 3000)).unwrap();
+    v.play().unwrap();
+    for _ in 0..600 {
+        v.advance(1000.0 / 60.0);
+    }
+
+    assert!(
+        (v.position_exact_ms() - 10_000.0).abs() < 0.01,
+        "expected 10000 ms, got {}",
+        v.position_exact_ms()
+    );
+    assert_eq!(v.position_ms(), 10_000);
+    assert_eq!(v.frame(), 300);
+}
+
+/// A play rate multiplies the elapsed time without rounding it away.
+#[test]
+fn the_play_rate_scales_the_exact_clock() {
+    let mut v = VideoOverlay::new();
+    v.open(spec(30.0, 3000)).unwrap();
+    v.play_rate = 2.0;
+    v.play().unwrap();
+    for _ in 0..600 {
+        v.advance(1000.0 / 60.0);
+    }
+    assert!((v.position_exact_ms() - 20_000.0).abs() < 0.01);
+}
+
+/// A loop restart puts the clock back to the start and says so, so a caller
+/// that keeps a sound in step with the picture can place the sound back too.
+#[test]
+fn a_loop_restart_is_reported() {
+    let mut v = VideoOverlay::new();
+    v.open(spec(30.0, 30)).unwrap();
+    v.looping = true;
+    v.play().unwrap();
+    v.poll();
+
+    v.advance(100.0);
+    assert!(
+        !v.restarted_at_loop(),
+        "an ordinary frame is no loop restart"
+    );
+
+    v.advance(1000.0);
+    assert!(v.restarted_at_loop(), "the loop restart is reported");
+    assert_eq!(v.position_ms(), 0);
+}
+
+/// The clock can be put on an absolute position without a seek.
+///
+/// The reference resynchronizes the player's clock from the audio device
+/// without a seek (`reference/cpp/core/movie/ffmpeg/VideoPlayerAudio.cpp:256-267`),
+/// so the picture can follow the sound.
+#[test]
+fn the_clock_can_be_moved_without_a_seek() {
+    let mut v = VideoOverlay::new();
+    v.open(spec(30.0, 300)).unwrap();
+    v.play().unwrap();
+    v.poll();
+
+    v.sync_clock(1500.0);
+    assert_eq!(v.position_ms(), 1500);
+    assert_eq!(v.frame(), 45);
+    assert!(
+        v.poll().is_empty(),
+        "moving the clock produces no seek and no period event"
+    );
+
+    // A negative position is clamped, and a position that is not a number is
+    // ignored.
+    v.sync_clock(-10.0);
+    assert_eq!(v.position_ms(), 0);
+    v.sync_clock(1200.0);
+    v.sync_clock(f64::NAN);
+    assert_eq!(v.position_ms(), 1200);
+}

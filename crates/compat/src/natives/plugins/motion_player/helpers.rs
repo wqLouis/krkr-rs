@@ -163,6 +163,53 @@ pub(crate) fn set_scalar(ctx: &crate::CompatCtx, out: *mut Value, value: TjsValu
     }
 }
 
+/// Build a TJS array holding `values`.
+pub(crate) fn eval_array(
+    ctx: &crate::CompatCtx,
+    values: &[TjsValue],
+) -> Result<tjs::DetachedValue, String> {
+    let array = eval_object(ctx, "[]")?;
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `eval_array`.
+    let engine = unsafe { ctx.engine() };
+    for (index, value) in values.iter().enumerate() {
+        engine
+            .set_member(array.raw_id(), &index.to_string(), value)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(array)
+}
+
+/// Getter helper for a member that holds a TJS array.
+///
+/// The array is built on every read, so a script that writes into the array
+/// it received loses that write when it reads the member again.
+pub(crate) fn get_value_array<T>(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    f: impl FnOnce(&T) -> Option<Vec<TjsValue>>,
+) -> c_int {
+    let Some(binding) = resolve(engine) else {
+        return report_error(out_error, NO_BINDING);
+    };
+    // SAFETY: the VM guarantees the live payload.
+    let Some(inst) = (unsafe { inst_ref::<T>(instance) }) else {
+        return report_error(out_error, "motionplayer: null instance");
+    };
+    let Some(values) = f(inst) else {
+        set_void(out);
+        return 0;
+    };
+    let ctx = binding.ctx();
+    let array = match eval_array(&ctx, &values) {
+        Ok(array) => array,
+        Err(error) => return report_error(out_error, &error),
+    };
+    set_retained(out, array);
+    0
+}
+
 /// Getter helper for a `f64` member.
 pub(crate) fn get_real<T>(
     engine: *mut c_void,

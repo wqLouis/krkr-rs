@@ -62,7 +62,8 @@ pub use natives::video::{VideoSource, set_video_source, video_advance};
 // The built-in `WaveSoundBuffer` poll, plus the host seam that installs the L1
 // media audio decoder (L3 never links a codec).
 pub use natives::sound::{
-    AudioDecoder, add_audio_decoder, set_sound_render_driven, sound_poll, sound_render,
+    AudioDecoder, add_audio_decoder, set_output_latency, set_sound_render_driven, sound_poll,
+    sound_render,
 };
 // The built-in `System` poll and the host's exit-request drain: an L4
 // [`FrameBody`] forwards its `continuous_handler_poll` step here and the frame
@@ -74,12 +75,13 @@ pub use natives::scripts::exec_storage;
 // The built-in `AsyncTrigger` poll: an L4 [`FrameBody`] forwards its
 // `async_trigger_poll` step here (deferred script callbacks).
 pub use natives::async_trigger::async_trigger_poll;
-// The tree-owner / frame-body hand-offs: the frame body's `frame_tail`
-// step advances layer transitions and drains the host's window/capture
-// requests.
+// The tree-owner / frame-body hand-offs: the frame body's `frame_tail` step
+// advances normal layer transitions and composites the script-cached layers;
+// the after-projection step advances the self-updating transitions whose layer
+// was drawn. The body also drains the host's window/capture requests.
 pub use natives::visual::{
-    advance_transitions, paint_poll, take_bring_to_front_requests, take_capture_releases,
-    take_update_requests,
+    advance_self_updating_transitions, advance_transitions, paint_poll, refresh_cached_layers,
+    take_bring_to_front_requests, take_capture_releases, take_update_requests,
 };
 // The `LayerExMovie` frame body: an L4 [`FrameBody`] forwards its per-frame
 // movie step here, and `set_movie_source` installs the host's decoded source

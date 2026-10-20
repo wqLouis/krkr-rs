@@ -505,11 +505,16 @@ fn player_draw_leaves_the_target_layer_geometry_and_visibility_alone() {
 }
 
 #[test]
-fn player_draw_marks_the_target_image_modified() {
+fn player_draw_reuses_the_target_allocation_and_marks_the_image_modified() {
     let _lock = vm_lock();
     let mut env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    // The reference composites into the target layer's image with
+    // `AffineCopy` and keys the loaded source by its name and colour
+    // (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:456-472`,
+    // `SourceCache.cpp:497-552`). A second draw of the same pose therefore
+    // reuses both the target pixels and the decoded source chunks.
     env.run(&format!(
         "var rm = new Motion.ResourceManager(null, 1024); \
          var w = new Window(); \
@@ -536,37 +541,6 @@ fn player_draw_marks_the_target_image_modified() {
         .bitmap_mut(bitmap_id)
         .expect("target bitmap")
         .dirty = false;
-    env.run("p.draw(new Motion.SeparateLayerAdaptor(target));");
-    assert!(env._scene.layer(layer_id).expect("target").image_modified);
-    assert!(env._scene.bitmap(bitmap_id).expect("target bitmap").dirty);
-}
-
-#[test]
-fn player_draw_reuses_the_target_allocation_and_the_decoded_chunks() {
-    let _lock = vm_lock();
-    let env = Env::with_reference_storage();
-    let path = "e-mote3.0バニラパジャマa.psb";
-    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
-    // The reference composites into the target layer's image with
-    // `AffineCopy` and keys the loaded source by its name and colour
-    // (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:456-472`,
-    // `SourceCache.cpp:497-552`). A second draw of the same pose therefore
-    // reuses both the target pixels and the decoded source chunks.
-    env.run(&format!(
-        "var rm = new Motion.ResourceManager(null, 1024); \
-         var w = new Window(); \
-         var target = new Layer(w, null); \
-         target.setSize(800, 1080); \
-         var p = new Motion.Player(rm); \
-         p.motionKey = \"{path}\"; \
-         p.draw(new Motion.SeparateLayerAdaptor(target));"
-    ));
-    let layer_id = env._scene.layers.last().expect("the target layer").id;
-    let bitmap_id = env
-        ._scene
-        .layer(layer_id)
-        .and_then(|layer| layer.bitmap)
-        .expect("the target bitmap");
     let allocated = env
         ._scene
         .bitmap(bitmap_id)
@@ -579,6 +553,8 @@ fn player_draw_reuses_the_target_allocation_and_the_decoded_chunks() {
         .expect("the fixture storage")
         .read_bytes();
     env.run("p.draw(new Motion.SeparateLayerAdaptor(target));");
+    assert!(env._scene.layer(layer_id).expect("target").image_modified);
+    assert!(env._scene.bitmap(bitmap_id).expect("target bitmap").dirty);
     assert_eq!(
         env._scene
             .bitmap(bitmap_id)
@@ -1302,6 +1278,80 @@ fn separate_layer_adaptor_layer_tree_owner_interface_delegates_to_its_owner() {
         env.eval_str("typeof (new Motion.SeparateLayerAdaptor()).layerTreeOwnerInterface()"),
         "void"
     );
+}
+
+/// The layer getter is an instance of the reference class and reports the
+/// node's own state
+/// (`reference/cpp/plugins/motionplayer/PlayerLayerQuery.cpp:24-71`).
+#[test]
+fn the_layer_getter_is_a_motion_layer_getter_instance() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\";"
+    ));
+    env.run(
+        "var names = p.getLayerNames(); \
+         var layerLabel = \"\"; \
+         for (var i = 0; i < names.count; i++) { if (names[i] != \"\") { layerLabel = names[i]; break; } } \
+         var layerGetter = p.getLayerGetter(layerLabel);",
+    );
+    // The getter is an instance of the registered class. `instanceof` takes a
+    // class-name string, and a native class answers under the name it was
+    // registered with
+    // (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:2684-2701`).
+    assert_eq!(env.eval_int("layerGetter instanceof \"LayerGetter\""), 1);
+    // A plain dictionary is not an instance of it.
+    assert_eq!(env.eval_int("(%[]) instanceof \"LayerGetter\""), 0);
+    // The class is reachable under the Motion namespace.
+    assert_eq!(env.eval_int("Motion.LayerGetter != null"), 1);
+    // The label is the one the getter was asked for.
+    assert_eq!(env.eval_int("layerGetter.label == layerLabel"), 1);
+    // The type and the visibility are readable.
+    assert_eq!(env.eval_int("layerGetter.type >= 0"), 1);
+    assert_eq!(
+        env.eval_int("layerGetter.visible == 0 || layerGetter.visible == 1"),
+        1
+    );
+    // The opacity is the integer 0..255 scale.
+    assert_eq!(
+        env.eval_int("layerGetter.opacity >= 0 && layerGetter.opacity <= 255"),
+        1
+    );
+    // The matrix carries the node's transform and its position, and the
+    // vertex list holds the four corners of the node's box.
+    assert_eq!(env.eval_real("layerGetter.mtx.count"), 6.0);
+    assert_eq!(env.eval_real("layerGetter.vtx.count"), 8.0);
+    // A node that names no colour of its own reports the default half gray
+    // with a full alpha, not the player's colour
+    // (`reference/cpp/plugins/motionplayer/PlayerLayerQuery.cpp:66-71`,
+    // `PlayerInternal.h:1102-1120`).
+    assert_eq!(env.eval_int("layerGetter.color[0]"), 128);
+    assert_eq!(env.eval_int("layerGetter.color[1]"), 128);
+    assert_eq!(env.eval_int("layerGetter.color[2]"), 128);
+    assert_eq!(env.eval_int("layerGetter.color[3]"), 255);
+}
+
+/// The color weight is read and written in the swapped channel order, so a
+/// non-gray value keeps its channels apart
+/// (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:24-27`, `:144-152`).
+#[test]
+fn the_color_weight_round_trips_through_the_script_surface() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var p = new Motion.Player(null);");
+    env.run("p.colorWeight = 0x00112233;");
+    assert_eq!(env.eval_int("p.colorWeight"), 0x0011_2233);
+    // A value whose red and blue channels differ keeps them apart.
+    env.run("p.colorWeight = 0x00FF0080;");
+    assert_eq!(env.eval_int("p.colorWeight"), 0x00FF_0080);
+    // The stored weight is the swapped one.
+    env.run("p.colorWeight = 0x000000FF;");
+    assert_eq!(env.eval_int("p.colorWeight"), 0x0000_00FF);
 }
 
 /// A freshly activated motion sits behind the frame gate: the first tick

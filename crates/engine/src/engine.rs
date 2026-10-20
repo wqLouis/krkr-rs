@@ -8,9 +8,11 @@
 //! One frame is: get the clock, fit the VM→device presentation, fire due
 //! timers, run the upward hook, fit the presentation again (the hook may have
 //! resized a window's primary layer), refresh the render-only overlay, upload
-//! dirty bitmaps, project the layer tree when it changed, translate it into
-//! device pixels, and draw it with a single pipeline call. A size pair that
-//! cannot be fitted skips everything that draws.
+//! dirty bitmaps, project the layer tree when it changed, run the
+//! after-projection hook with the emitted layer ids, reproject if that hook
+//! changed the scene, translate it into device pixels, and draw it with a
+//! single pipeline call. A size pair that cannot be fitted skips everything
+//! that draws.
 //!
 //! Nothing here reads a wall clock. [`Engine::frame`] takes the time and
 //! [`Engine::step`] adds a delta to the clock the engine already holds, so a
@@ -33,7 +35,7 @@ use render::{
 };
 
 use crate::hasher::{Map, map};
-use crate::projection::project_scene;
+use crate::projection::{ProjectionReport, project_scene_report};
 use crate::scene::Scene;
 use crate::timer::TimerState;
 use crate::translate::{PixelTranslation, TranslateError, translate_render_scene};
@@ -93,6 +95,21 @@ pub trait GameFrame {
     /// The message is returned to the caller as [`EngineError::Frame`]; the
     /// frame is abandoned without projecting or drawing.
     fn before_render(&mut self, now_ms: u64, dt_ms: f64) -> Result<(), String>;
+
+    /// Runs after the projection emitted this frame's layers, before the
+    /// final upload, projection and draw.
+    ///
+    /// `drawn_layers` is the projection's report for the current scene. A hook
+    /// that changes the scene here is followed by a second upload and
+    /// projection, so its changes are in the frame being drawn.
+    ///
+    /// # Errors
+    ///
+    /// The message is returned to the caller as [`EngineError::Frame`]; the
+    /// frame is abandoned without drawing.
+    fn after_project(&mut self, _drawn_layers: &[u32]) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// A render-only overlay appended above every projected layer.
@@ -233,6 +250,9 @@ pub struct Engine {
     ///
     /// `None` until the first projection, so the first frame always projects.
     render_scene_revision: Option<u64>,
+    /// Layer ids the latest projection emitted, including descendants covered
+    /// by a cached ancestor.
+    drawn_layers: Vec<u32>,
     /// Presented surface for `render_state`.
     surface: Surface,
     /// GPU/staging/texture bookkeeping.
@@ -305,6 +325,7 @@ impl Engine {
             scene,
             render_scene: RenderScene::with_root_node(),
             render_scene_revision: None,
+            drawn_layers: Vec::new(),
             surface,
             render_state,
             textures: map(),
@@ -422,15 +443,40 @@ impl Engine {
         let sync_started = Instant::now();
         let upload_started = Instant::now();
         self.sync_dirty_bitmaps();
-        let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
+        let mut upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
         let prune_started = Instant::now();
         self.prune_stale_textures();
-        let prune_ms = prune_started.elapsed().as_secs_f64() * 1000.0;
-        let sync_ms = sync_started.elapsed().as_secs_f64() * 1000.0;
+        let mut prune_ms = prune_started.elapsed().as_secs_f64() * 1000.0;
+        let mut sync_ms = sync_started.elapsed().as_secs_f64() * 1000.0;
 
         let project_started = Instant::now();
         self.reproject_render_scene();
-        let project_ms = project_started.elapsed().as_secs_f64() * 1000.0;
+        let mut project_ms = project_started.elapsed().as_secs_f64() * 1000.0;
+
+        // The upward hook sees the projection's actual draw report. A hook
+        // that changes the scene (a self-updating transition step) is
+        // followed by a second upload and projection so this same frame draws
+        // the new state, not the previous one.
+        hooks
+            .after_project(&self.drawn_layers)
+            .map_err(EngineError::Frame)?;
+        self.sync_presentation();
+
+        // The hook may have rewritten a transition frame bitmap without
+        // changing the scene graph; upload those dirty bitmaps either way.
+        let sync2_started = Instant::now();
+        let upload2_started = Instant::now();
+        self.sync_dirty_bitmaps();
+        upload_ms += upload2_started.elapsed().as_secs_f64() * 1000.0;
+        let prune2_started = Instant::now();
+        self.prune_stale_textures();
+        prune_ms += prune2_started.elapsed().as_secs_f64() * 1000.0;
+        sync_ms += sync2_started.elapsed().as_secs_f64() * 1000.0;
+        if self.translation.is_some() && self.render_scene_revision != Some(self.scene.revision()) {
+            let project2_started = Instant::now();
+            self.reproject_render_scene();
+            project_ms += project2_started.elapsed().as_secs_f64() * 1000.0;
+        }
 
         let render_started = Instant::now();
         let outcome = match render(
@@ -578,7 +624,11 @@ impl Engine {
         };
 
         let textures = &self.textures;
-        let projected = project_scene(&self.scene, |bitmap| textures.get(&bitmap).cloned());
+        let ProjectionReport {
+            scene: projected,
+            drawn_layers,
+        } = project_scene_report(&self.scene, |bitmap| textures.get(&bitmap).cloned());
+        self.drawn_layers = drawn_layers;
 
         self.render_scene.nodes.clear();
         self.render_scene.root = projected.root;
@@ -704,6 +754,12 @@ impl Engine {
     /// Returns the most recently projected render tree.
     pub fn render_scene(&self) -> &RenderScene {
         &self.render_scene
+    }
+
+    /// Returns the layer ids the latest projection actually emitted, including
+    /// visible descendants covered by a cached ancestor.
+    pub fn drawn_layers(&self) -> &[u32] {
+        &self.drawn_layers
     }
 
     /// Returns the bitmap-id → texture table.

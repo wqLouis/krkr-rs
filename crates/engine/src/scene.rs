@@ -212,7 +212,7 @@ pub struct LayerState {
     /// The projection draws it at the main image's placement and the layer's
     /// children keep drawing live, so it is never part of a cached subtree.
     /// `None` until the transition first needs one; the transition clears it
-    /// when it ends ([`crate::layer_ops::clear_transition_self_image`]).
+    /// when it ends ([`Scene::set_transition_self_image`]).
     pub transition_self: Option<u32>,
     /// Reference `CacheRecalcRegion`: the subtree content must be
     /// recomposited before it is used again. Set for this layer and every
@@ -264,6 +264,15 @@ pub struct LayerState {
     /// marks directly, and every consumer — [`Scene::node_visible`],
     /// [`Scene::layer_at`], [`Scene::window_layer_order`] — skips it.
     pub shutdown: bool,
+}
+
+impl LayerState {
+    /// The image this layer draws in place of its main image: the transition
+    /// self image while a transition blends it with another layer's image,
+    /// otherwise the main image.
+    pub fn drawn_image(&self) -> Option<u32> {
+        self.transition_self.or(self.bitmap)
+    }
 }
 
 /// One decoded bitmap (RGBA8, straight alpha).
@@ -1928,6 +1937,36 @@ impl Scene {
         }
         self.sync_layer_image(layer_id);
         true
+    }
+
+    /// Set a layer's MainImage to `width` x `height` and adjust the layer
+    /// rectangle and image offsets around it: a width or height smaller than
+    /// the rectangle shrinks the rectangle and clears the matching offset, a
+    /// rectangle the image no longer covers shifts the offset, then the image
+    /// takes the new size. Because the rectangle only shrinks when the image
+    /// is smaller, the image is guaranteed to cover it afterwards. Returns
+    /// false when the layer is missing or the image cannot be resized.
+    pub fn internal_set_image_size(&mut self, layer_id: u32, width: u32, height: u32) -> bool {
+        let Some(layer) = self.layer_mut(layer_id) else {
+            return false;
+        };
+        if i64::from(width) < i64::from(layer.rect.w) {
+            layer.image_left = 0;
+            layer.rect.w = width;
+        }
+        if i64::from(width) + i64::from(layer.image_left) < i64::from(layer.rect.w) {
+            let left = i64::from(layer.rect.w) - i64::from(width);
+            layer.image_left = left.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        }
+        if i64::from(height) < i64::from(layer.rect.h) {
+            layer.image_top = 0;
+            layer.rect.h = height;
+        }
+        if i64::from(height) + i64::from(layer.image_top) < i64::from(layer.rect.h) {
+            let top = i64::from(layer.rect.h) - i64::from(height);
+            layer.image_top = top.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        }
+        self.set_layer_image_size(layer_id, width, height)
     }
 
     /// Grow a layer's MainImage so it covers the layer rectangle and clamp

@@ -6,7 +6,9 @@
 
 use api::blend::{BlendMode, DstBlend};
 use api::geometry::{PixelRegion, RectF};
-use engine::{Rect, Scene, compose_layer, project_scene, project_window, resolve_blend};
+use engine::{
+    Rect, Scene, compose_layer, project_scene, project_window, project_window_report, resolve_blend,
+};
 use render::{
     PipelineConfig, RenderContent, RenderNode, RenderNodeId, RenderScene, Texture, TextureDesc,
     create_render_pipeline, create_texture,
@@ -438,6 +440,57 @@ fn cached_layer_draws_its_bitmap_and_hides_its_subtree() {
     assert_eq!(nodes[0].dst, RectF::new(0.0, 0.0, 64.0, 64.0));
 }
 
+/// The draw report follows the emit path: a cached ancestor emits one node and
+/// reports the visible descendants whose pixels that node's texture contains,
+/// while a hidden descendant is not reported.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7156-7226
+#[test]
+fn drawn_report_matches_emitted_nodes_and_cached_subtree() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (64, 64));
+    let parent = scene.add_layer(win, None);
+    let cache = scene.add_bitmap(64, 64, vec![0u8; 64 * 64 * 4]);
+    {
+        let l = scene.layer_mut(parent).unwrap();
+        l.rect = full_window_rect(64, 64);
+        l.visible = true;
+        l.cache_enabled_count = 1;
+        l.cache_bitmap = Some(cache);
+    }
+    let child = scene.add_layer(win, Some(parent));
+    {
+        let l = scene.layer_mut(child).unwrap();
+        l.visible = true;
+        l.rect = Rect::new(0, 0, 8, 8);
+    }
+    attach_image(&mut scene, child, 8, 8);
+    let hidden = scene.add_layer(win, Some(parent));
+    {
+        let l = scene.layer_mut(hidden).unwrap();
+        l.visible = false;
+        l.rect = Rect::new(8, 0, 8, 8);
+    }
+    attach_image(&mut scene, hidden, 8, 8);
+    let sibling = scene.add_layer(win, None);
+    {
+        let l = scene.layer_mut(sibling).unwrap();
+        l.visible = true;
+        l.rect = Rect::new(16, 0, 8, 8);
+    }
+    attach_image(&mut scene, sibling, 8, 8);
+
+    let report = project_window_report(&scene, win, |id| {
+        (id == cache || id == sibling).then(|| null_texture(8, 8))
+    });
+    assert_eq!(drawable_nodes(&report.scene).len(), 2);
+    assert_eq!(report.drawn_layers, vec![parent, child, sibling]);
+    assert!(
+        !report.drawn_layers.contains(&hidden),
+        "a hidden descendant is not drawn by the cached node"
+    );
+}
+
 /// A transition without children blends the layer's own image and the
 /// transition source's into a temporary that `DrawSelf` draws in place of the
 /// `MainImage` (`reference/cpp/core/visual/LayerIntf.cpp:6745-6768`). Only the
@@ -542,7 +595,7 @@ fn transition_self_image_replaces_the_main_image_at_its_placement() {
 
     // Clearing the slot (the transition teardown) returns the layer to its own
     // image at the same placement.
-    engine::layer_ops::clear_transition_self_image(&mut scene, layer);
+    scene.set_transition_self_image(layer, None);
     let with_main = project_window(&scene, win, |id| {
         (id == main || id == child_bitmap).then(|| null_texture(16, 16))
     });

@@ -673,6 +673,12 @@ pub(crate) mod audio {
         })
     }
 
+    /// How much audio the software queue still holds, in seconds.
+    pub(crate) fn queued_seconds(state: &StreamState) -> f64 {
+        let inner = lock(state);
+        lock_queue(&inner.queue).queued_seconds()
+    }
+
     /// Whether AAudio reported the stream disconnected (error callback or the
     /// live stream state).
     fn is_disconnected(inner: &Inner) -> bool {
@@ -846,5 +852,10 @@ pub(crate) mod audio {
     /// Always `false` in the stub.
     pub(crate) fn is_running(_state: &StreamState) -> bool {
         false
+    }
+
+    /// Always `0.0` in the stub: the stub has no queue and no playback.
+    pub(crate) fn queued_seconds(_state: &StreamState) -> f64 {
+        0.0
     }
 }

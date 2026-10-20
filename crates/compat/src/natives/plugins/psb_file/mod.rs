@@ -499,15 +499,6 @@ extern "C" fn psb_root_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    root_result(engine, instance, out, out_error)
-}
-
-fn root_result(
-    engine: *mut c_void,
-    instance: *mut c_void,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-) -> c_int {
     let Some(resolved) = resolve(engine) else {
         return report_error(out_error, "PSBFile: compat context is not bound");
     };

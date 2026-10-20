@@ -193,3 +193,160 @@ fn video_audio_returns_interleaved_pcm() {
         audio.frame_count() * u64::from(audio.spec.channels)
     );
 }
+
+/// Generates a stereo clip whose left channel carries a 440 Hz tone and
+/// whose right channel an 880 Hz tone, or `None` when no usable encoder is
+/// available.
+fn generate_stereo_clip() -> Option<TempClip> {
+    // The MediaCodec backend needs an Android device (there is no libmediandk
+    // to link on this host), so there is nothing to exercise here; skip
+    // rather than fail.
+    if !cfg!(feature = "video-ffmpeg") || !ffmpeg_available() {
+        return None;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "krkr-media-video-stereo-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("stereo.mp4");
+
+    // Prefer the always-built-in MPEG-4 part 2 encoder; fall back to x264 so
+    // the test still works on a build that only ships libx264.
+    for video_codec in ["mpeg4", "libx264"] {
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(format!("testsrc=size={WIDTH}x{HEIGHT}:rate=10:duration=3"))
+            .args(["-f", "lavfi", "-i"])
+            .arg("sine=frequency=440:sample_rate=44100:duration=3")
+            .args(["-f", "lavfi", "-i"])
+            .arg("sine=frequency=880:sample_rate=44100:duration=3")
+            .args([
+                "-filter_complex",
+                "[1:a][2:a]amerge=inputs=2[a]",
+                "-map",
+                "0:v",
+                "-map",
+                "[a]",
+                "-c:v",
+                video_codec,
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ])
+            .arg(&path)
+            .status()
+            .ok()?;
+        let non_empty = path.metadata().map(|meta| meta.len() > 0).unwrap_or(false);
+        if status.success() && non_empty {
+            return Some(TempClip { dir, path });
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    None
+}
+
+/// The frequency of `samples` measured by its zero crossings, in Hz.
+///
+/// A tone crosses the mean twice per period: once up, once down. The count
+/// is taken over the middle of the buffer, so the encoder's start-up and end
+/// artifacts do not count.
+fn measured_frequency(samples: &[f32], rate: u32) -> f64 {
+    if samples.len() < 4 || rate == 0 {
+        return 0.0;
+    }
+    let margin = samples.len() / 10;
+    let window = &samples[margin..samples.len() - margin];
+    let mean = window.iter().sum::<f32>() / window.len() as f32;
+    let mut crossings = 0usize;
+    let mut previous = window[0] - mean;
+    for sample in &window[1..] {
+        let value = sample - mean;
+        // A tone crosses the mean twice per period: once up, once down.
+        if (previous < 0.0) != (value < 0.0) {
+            crossings += 1;
+        }
+        previous = value;
+    }
+    let seconds = window.len() as f64 / f64::from(rate);
+    crossings as f64 / 2.0 / seconds
+}
+
+/// The decoded audio keeps both channels of a stereo track: the left and the
+/// right channel carry their own tone.
+///
+/// The reference keeps the file's channel count
+/// (`reference/cpp/core/movie/ffmpeg/AEFactory.cpp:136-138`); a track that
+/// was decoded as one channel would lose one of its channels, and a track
+/// whose channels were swapped would swap the tones.
+#[test]
+fn video_audio_keeps_both_channels_of_a_stereo_track() {
+    let Some(clip) = generate_stereo_clip() else {
+        eprintln!("skipping video test: no usable ffmpeg encoder");
+        return;
+    };
+    let bytes = std::fs::read(&clip.path).expect("read generated clip");
+    let media = Media::new();
+    let (spec, state) = open_video(
+        &media,
+        Arc::from(bytes.into_boxed_slice()),
+        Some("stereo.mp4"),
+    )
+    .expect("open generated clip");
+    assert_eq!(spec.channels, 2, "the stereo track must stay stereo");
+
+    let audio = video_audio(&media, &state).expect("decode audio track");
+    assert_eq!(audio.spec.channels, 2);
+    let rate = audio.spec.sample_rate;
+    let left: Vec<f32> = audio.interleaved.iter().step_by(2).copied().collect();
+    let right: Vec<f32> = audio
+        .interleaved
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .copied()
+        .collect();
+    let left_hz = measured_frequency(&left, rate);
+    let right_hz = measured_frequency(&right, rate);
+    assert!(
+        (left_hz - 440.0).abs() < 44.0,
+        "the left channel measured {left_hz:.1} Hz instead of 440 Hz"
+    );
+    assert!(
+        (right_hz - 880.0).abs() < 88.0,
+        "the right channel measured {right_hz:.1} Hz instead of 880 Hz"
+    );
+}
+
+/// The decoded track keeps the file's own rate.
+///
+/// The conversion to the output rate belongs to the mixer, not to the
+/// decoder: the decoder hands over the track as the file stores it, so the
+/// movie audio is converted once, by the mixer, on its way to the device.
+#[test]
+fn video_audio_keeps_the_files_own_rate() {
+    let Some((media, spec, state)) = open_clip() else {
+        eprintln!("skipping video test: no usable ffmpeg encoder");
+        return;
+    };
+    assert_eq!(spec.sample_rate, 44_100);
+
+    let audio = video_audio(&media, &state).expect("decode audio track");
+    assert_eq!(audio.spec.sample_rate, 44_100);
+}

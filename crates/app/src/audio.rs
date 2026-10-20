@@ -71,7 +71,9 @@ use std::sync::Arc;
 
 use api::error::{AudioError, MediaError};
 use api::media::AudioSpec;
-use compat::{CompatHost, add_audio_decoder, set_sound_render_driven, sound_render};
+use compat::{
+    CompatHost, add_audio_decoder, set_output_latency, set_sound_render_driven, sound_render,
+};
 use engine::sound::{AudioStream, SoundError, SoundSource};
 use media::{AudioDecoderState, Media, open_audio, read_audio, seek_audio};
 use platform::{AudioDevice, AudioOutputState, PlatformError};
@@ -313,6 +315,15 @@ impl AudioOutput {
         })
     }
 
+    /// The most playback one frame may advance, in milliseconds.
+    ///
+    /// A movie's picture advances by the same bound, so a frame longer than
+    /// this leaves the picture and the sound equally far behind instead of
+    /// pulling them apart.
+    pub(crate) fn max_chunk_ms(&self) -> f64 {
+        self.max_chunk_ms
+    }
+
     /// Renders one dt-derived chunk of the shared mixer and queues it.
     ///
     /// `vm` supplies the bound compat context the L3 `sound_render` seam
@@ -360,6 +371,10 @@ impl AudioOutput {
         let ctx = vm.compat().ctx().map_err(vm::VmError::from)?;
         sound_render(&ctx, &mut self.buffer, self.spec).map_err(vm::VmError::from)?;
         self.device.write(&mut self.state, &self.buffer)?;
+        // The device holds what was written, so the sound reaches the listener
+        // that much later than the mixer rendered it. The mixer needs the
+        // number to place a picture that follows the sound.
+        set_output_latency(&ctx, self.device.queued_seconds(&self.state));
         log::trace!(
             "audio: wrote {frames} frames ({:.1} ms) to the {} device",
             frames as f64 * 1000.0 / rate,

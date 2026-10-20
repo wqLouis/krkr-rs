@@ -9,6 +9,8 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use api::error::MediaError;
 use api::media::{AudioSpec, DecodedAudio, RgbaFrame, VideoSpec};
 use common::vm_lock;
@@ -919,8 +921,8 @@ impl compat::VideoSource for AudioSource {
         Some(chosen)
     }
 
-    fn audio(&mut self, _path: &str) -> Result<Option<DecodedAudio>, MediaError> {
-        Ok(Some(self.audio.clone()))
+    fn audio(&mut self, _path: &str) -> Result<Option<Arc<DecodedAudio>>, MediaError> {
+        Ok(Some(Arc::new(self.audio.clone())))
     }
 }
 
@@ -1087,4 +1089,142 @@ fn movie_audio_reaches_the_mixer_with_volume_and_pan() {
     let mut muted = vec![0.0f32; 200];
     compat::sound_render(&ctx, &mut muted, out_spec).expect("render");
     assert!(muted.iter().all(|sample| sample.abs() < 1e-6));
+}
+
+/// A ramp audio track: every sample is one step above the one before it.
+fn ramp_audio(rate: u32, seconds: f64, step: f32) -> DecodedAudio {
+    let frames = (rate as f64 * seconds) as usize;
+    let mut interleaved = Vec::with_capacity(frames);
+    for frame in 0..frames {
+        interleaved.push(frame as f32 * step);
+    }
+    DecodedAudio::new(
+        AudioSpec {
+            sample_rate: rate,
+            channels: 1,
+            total_frames: Some(frames as u64),
+        },
+        interleaved,
+    )
+}
+
+/// The movie's audio voice keeps the mixer's own clock, so the samples the
+/// device renders follow each other without a step between them.
+///
+/// The voice used to be placed on the picture's position on every frame.
+/// The picture's clock was a rounded millisecond accumulator, so it drifted
+/// away from the audio the device had rendered and every frame skipped a
+/// frame's worth of samples: a cut in the middle of the waveform, once per
+/// frame. The reference never moves the movie audio's play head; the
+/// decoded frames are appended to a sound buffer the device plays at its own
+/// rate (`reference/cpp/core/movie/ffmpeg/AEFactory.cpp:210-219`).
+#[test]
+fn the_movie_audio_stays_continuous_across_polls() {
+    /// The output rate, and the ramp's rate.
+    const RATE: u32 = 48_000;
+    /// The ramp's step per sample; the whole track spans one unit.
+    const STEP: f32 = 1.0 / 576_000.0;
+
+    let _lock = vm_lock();
+    let env = Env::new();
+    let ctx = env.host.ctx().expect("bound context");
+    // The host mixes on the frame loop, so the mixer advances by the frames
+    // it renders.
+    compat::set_sound_render_driven(env.host.services(), true);
+    compat::set_video_source(
+        &ctx,
+        Box::new(AudioSource {
+            spec: VideoSpec {
+                sample_rate: RATE,
+                channels: 1,
+                // Long enough that the movie does not end while the poll runs.
+                total_frames: Some(3000),
+                ..default_spec()
+            },
+            frames: default_frames(),
+            audio: ramp_audio(RATE, 12.0, STEP),
+        }),
+    );
+    env.run("var v = new VideoOverlay(new Window()); v.open('movie.mpg'); v.play();");
+
+    let out_spec = AudioSpec {
+        sample_rate: RATE,
+        channels: 1,
+        total_frames: None,
+    };
+    // One 60 Hz frame at 48 kHz.
+    let mut out = vec![0.0f32; 800];
+    // The resampler's kernel reaches a few frames back, so the first samples of
+    // a track are interpolated with a truncated kernel. Render one chunk
+    // before the measurements start.
+    compat::sound_render(&ctx, &mut out, out_spec).expect("render");
+    let mut previous: Option<f32> = None;
+    for _ in 0..600 {
+        compat::video_advance(&ctx, 1000.0 / 60.0).expect("advance");
+        compat::sound_render(&ctx, &mut out, out_spec).expect("render");
+        for sample in &out {
+            if let Some(last) = previous {
+                let delta = sample - last;
+                assert!(delta > 0.0, "the ramp did not rise: {delta} after {last}");
+                assert!(
+                    delta < STEP * 2.0,
+                    "the ramp jumped: {delta} instead of {STEP}"
+                );
+            }
+            previous = Some(*sample);
+        }
+    }
+}
+
+/// The picture follows the sound: the overlay's position is the position the
+/// voice reached at the listener, not the wall clock.
+///
+/// The reference schedules the picture against the audio device's clock
+/// (`reference/cpp/core/movie/ffmpeg/VideoPlayerAudio.cpp:264`), so the
+/// sound drives the picture and not the other way round.
+#[test]
+fn the_picture_follows_the_sound() {
+    /// The output rate, and the sound's rate.
+    const RATE: u32 = 48_000;
+    /// One 60 Hz frame at 48 kHz.
+    const FRAMES: usize = 800;
+
+    let _lock = vm_lock();
+    let env = Env::new();
+    let ctx = env.host.ctx().expect("bound context");
+    // The host mixes on the frame loop, so the mixer advances by the frames
+    // it renders.
+    compat::set_sound_render_driven(env.host.services(), true);
+    compat::set_video_source(
+        &ctx,
+        Box::new(AudioSource {
+            spec: VideoSpec {
+                sample_rate: RATE,
+                channels: 1,
+                // Long enough that the movie does not end while the poll runs.
+                total_frames: Some(3000),
+                ..default_spec()
+            },
+            frames: default_frames(),
+            audio: ramp_audio(RATE, 12.0, 1.0 / 576_000.0),
+        }),
+    );
+    env.run("var v = new VideoOverlay(new Window()); v.open('movie.mpg'); v.play();");
+
+    let out_spec = AudioSpec {
+        sample_rate: RATE,
+        channels: 1,
+        total_frames: None,
+    };
+    let mut out = vec![0.0f32; FRAMES];
+    for _ in 0..10 {
+        compat::video_advance(&ctx, 1000.0 / 60.0).expect("advance");
+        compat::sound_render(&ctx, &mut out, out_spec).expect("render");
+    }
+
+    // The sound has rendered ten chunks of 800 frames, so it has reached
+    // 8000 frames (166.667 ms). The picture follows the sound one frame
+    // behind it: the sound of the frame being rendered has not reached the
+    // mixer yet.
+    assert_eq!(env.eval_int("v.position"), 150);
 }

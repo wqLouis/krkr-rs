@@ -45,7 +45,10 @@ pub use crate::translate::{PixelTranslation, TranslateError};
 // pixel primitives, blend-type numbering and TVP constants stay reachable
 // through their own modules (`layer_ops`, `raster`, `projection`, `scene`,
 // `storage`, `startup`); they are not part of the stable flat surface.
-pub use projection::{ComposedLayer, compose_layer, project_scene, project_window, resolve_blend};
+pub use projection::{
+    ComposedLayer, ProjectionReport, compose_layer, project_scene, project_scene_report,
+    project_window, project_window_report, resolve_blend,
+};
 pub use scene::{
     BitmapState, DecodedImageKey, DecodedImageMode, FontState, LayerState, Rect, Scene, WindowState,
 };

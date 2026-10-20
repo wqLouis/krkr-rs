@@ -121,9 +121,6 @@ struct PsbHeader {
     offset_chunk_data: u32,
     offset_entries: u32,
     checksum: u32,
-    offset_extra_chunk_offsets: u32,
-    offset_extra_chunk_lengths: u32,
-    offset_extra_chunk_data: u32,
 }
 
 impl PsbHeader {
@@ -157,9 +154,10 @@ impl PsbHeader {
                 header.checksum = reader.u32()?;
             }
             if header.version > 3 {
-                header.offset_extra_chunk_offsets = reader.u32()?;
-                header.offset_extra_chunk_lengths = reader.u32()?;
-                header.offset_extra_chunk_data = reader.u32()?;
+                // The extra chunk tables belong to version 4, which the reader
+                // rejects; their offsets are consumed so that a short header
+                // is still a truncation.
+                reader.bytes(12)?;
             }
         }
         Ok(header)
@@ -655,7 +653,6 @@ fn decode_names(charset: &[u32], names_data: &[u32], name_indexes: &[u32]) -> Ve
 
 /// Load the version-1 name table: NUL-terminated strings at `offset_names`.
 fn load_keys(
-    data: &[u8],
     header: &PsbHeader,
     name_indexes: &[u32],
     reader: &mut Reader,
@@ -665,7 +662,6 @@ fn load_keys(
         reader.set_pos(header.offset_names as usize + index as usize)?;
         names.push(reader.null_terminated_string()?);
     }
-    let _ = data;
     Ok(names)
 }
 
@@ -684,11 +680,6 @@ fn apply_seed_decrypt(header: &mut PsbHeader, data: &mut [u8], seed: u32) {
         decrypt_u32(&mut ctx, &mut header.offset_entries);
         if header.version > 2 {
             decrypt_u32(&mut ctx, &mut header.checksum);
-        }
-        if header.version > 3 {
-            decrypt_u32(&mut ctx, &mut header.offset_extra_chunk_offsets);
-            decrypt_u32(&mut ctx, &mut header.offset_extra_chunk_lengths);
-            decrypt_u32(&mut ctx, &mut header.offset_extra_chunk_data);
         }
     }
     if header.version == 2 {
@@ -758,7 +749,7 @@ pub fn parse(mut data: Vec<u8>, seed: i64) -> PsbResult<PsbDocument> {
         reader.set_pos(offset as usize)?;
         let count_size = read_count_size(reader.u8()?)?;
         let name_indexes = read_list_body(&mut reader, count_size)?;
-        parser.names = load_keys(&data, &header, &name_indexes, &mut reader)?;
+        parser.names = load_keys(&header, &name_indexes, &mut reader)?;
     } else {
         let mut reader = Reader::at(&data, header.offset_names as usize);
         let charset_count_size = read_count_size(reader.u8()?)?;
@@ -780,21 +771,6 @@ pub fn parse(mut data: Vec<u8>, seed: i64) -> PsbResult<PsbDocument> {
         let count_size = read_count_size(reader.u8()?)?;
         read_list_body(&mut reader, count_size)?
     };
-    let (extra_chunk_offsets, extra_chunk_lengths) = if header.version >= 4 {
-        let offsets = {
-            let mut reader = Reader::at(&data, header.offset_extra_chunk_offsets as usize);
-            let count_size = read_count_size(reader.u8()?)?;
-            read_list_body(&mut reader, count_size)?
-        };
-        let lengths = {
-            let mut reader = Reader::at(&data, header.offset_extra_chunk_lengths as usize);
-            let count_size = read_count_size(reader.u8()?)?;
-            read_list_body(&mut reader, count_size)?
-        };
-        (offsets, lengths)
-    } else {
-        (Vec::new(), Vec::new())
-    };
 
     let root = {
         let mut reader = Reader::at(&data, header.offset_entries as usize);
@@ -812,17 +788,15 @@ pub fn parse(mut data: Vec<u8>, seed: i64) -> PsbResult<PsbDocument> {
         &parser.resources,
         &mut resources,
     )?;
-    let mut extra = Vec::new();
-    load_chunks(
-        &data,
-        header.offset_extra_chunk_data,
-        &extra_chunk_offsets,
-        &extra_chunk_lengths,
-        &parser.extra_resources,
-        &mut extra,
-    )?;
-    resources.extend(extra);
-    resources.sort_by_key(|(reference, _)| (reference.extra, reference.index));
+    // The extra chunk table belongs to version 4, which the reader rejects, so
+    // a resource that points into it cannot be resolved.
+    if let Some(reference) = parser.extra_resources.first() {
+        return Err(PsbError::Format(format!(
+            "chunk index {} out of range",
+            reference.index
+        )));
+    }
+    resources.sort_by_key(|(reference, _)| reference.index);
 
     Ok(PsbDocument { root, resources })
 }

@@ -34,7 +34,7 @@ pub use focus::take_capture_releases;
 pub(crate) use focus::{
     blur_tree, clear_domain_focus, clear_layer_focus, focus_layer, focus_layer_in_input_domain,
 };
-pub use transitions::advance_transitions;
+pub use transitions::{advance_self_updating_transitions, advance_transitions};
 
 /// Per-layer L3 state that has no home in the L2 `engine_api::Scene` yet: the
 /// active transition, the modal-layer stack and the pending capture-release
@@ -46,6 +46,9 @@ pub use transitions::advance_transitions;
 struct LayerExtras {
     /// Active `beginTransition` state per layer id.
     transitions: HashMap<u32, LayerTransition>,
+    /// The scene revision the last script-cached-layer pass ran at, so an
+    /// unchanged frame composites nothing.
+    cache_revision: Option<u64>,
     /// Reference `tTVPLayerManager::ModalLayerVector`: modal layer ids.
     modes: Vec<u32>,
     /// `releaseCapture` requests the tree owner drains.
@@ -64,6 +67,146 @@ struct LayerTransition {
     /// blends the destination's and source's whole subtrees rather than
     /// their MainImages.
     with_children: bool,
+}
+
+/// Composite every script-cached layer's subtree into its cache and hand the
+/// result to the projection: the per-frame step of `Layer.cached`.
+///
+/// The pass runs as a frame-body pump after the transition step, so a cache
+/// that contains a transition sees the frame just blended, and before the
+/// engine uploads and projects. It does nothing while the scene is unchanged:
+/// no layer or bitmap edit, no timer-driven composite and no revision bump
+/// means no cache can be stale.
+///
+/// A layer owned by an active transition keeps its cache slots for the
+/// transition step and is left alone. A cached layer whose subtree contains a
+/// whole-subtree transition cannot represent that transition's frame, so its
+/// published cache is withdrawn and the layer draws live until the transition
+/// ends. A layer that is hidden, or has neither its own image nor a visible
+/// child, is skipped because the projection does not draw it.
+///
+/// The compositor reuses its content bitmap and recomposites only when the
+/// subtree's recalc flag or its source images' generations changed, so a
+/// stable frame calls no pixel work. Nested caches composite independently:
+/// the subtree compositor draws a child's own image, not the child's cache, so
+/// an outer cache shows the inner layer's live subtree.
+pub fn refresh_cached_layers(ctx: &crate::CompatCtx) -> Result<(), String> {
+    let revision = scene_ref(ctx)?.revision();
+    let (last_revision, in_transition, whole_subtree_transitions) = {
+        // SAFETY: the caller resolved `ctx` from the installed binding.
+        let services = unsafe { ctx.services() };
+        let extras = services.state::<LayerExtras>();
+        (
+            extras.cache_revision,
+            extras.transitions.keys().copied().collect::<Vec<u32>>(),
+            extras
+                .transitions
+                .iter()
+                .filter(|(_, entry)| entry.with_children)
+                .map(|(&id, _)| id)
+                .collect::<Vec<u32>>(),
+        )
+    };
+    if last_revision == Some(revision) {
+        return Ok(());
+    }
+
+    let scene = scene_mut(ctx)?;
+    // The transition step owns the cache slots of these layers' ancestors too:
+    // an ancestor's cache would hold the un-blended image the frame replaces.
+    let mut blocked: Vec<u32> = Vec::new();
+    for id in whole_subtree_transitions {
+        blocked.extend(ancestors(scene, id));
+    }
+    let cached: Vec<u32> = scene
+        .layers
+        .iter()
+        .filter(|layer| layer.cached)
+        .map(|layer| layer.id)
+        .collect();
+    for id in cached {
+        if in_transition.contains(&id) {
+            continue;
+        }
+        if blocked.contains(&id) {
+            scene.set_cache_bitmap(id, None);
+            continue;
+        }
+        if !layer_seen(scene, id) {
+            continue;
+        }
+        if !layer_has_content(scene, id) {
+            // Nothing drawable is left: withdraw a cache published by an
+            // earlier frame so the projection draws the live subtree.
+            scene.set_cache_bitmap(id, None);
+            continue;
+        }
+        let content = crate::engine_api::layer_ops::render_layer_subtree(scene, id)
+            .ok_or_else(|| format!("Layer.cached: cannot composite the subtree of layer {id}"))?;
+        if scene.layer(id).and_then(|layer| layer.bitmap) != Some(content) {
+            scene.set_cache_bitmap(id, Some(content));
+        }
+    }
+    let revision = scene.revision();
+    // SAFETY: see above.
+    let services = unsafe { ctx.services() };
+    let mut extras = services.state::<LayerExtras>();
+    extras.cache_revision = Some(revision);
+    Ok(())
+}
+
+/// The layer's ancestors, nearest first.
+fn ancestors(scene: &Scene, id: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut current = scene.layer(id).and_then(|layer| layer.parent);
+    while let Some(next) = current {
+        let Some(layer) = scene.layer(next) else {
+            break;
+        };
+        out.push(layer.id);
+        if out.len() > scene.layers.len() {
+            break;
+        }
+        current = layer.parent;
+    }
+    out
+}
+
+/// Whether the layer and every ancestor is visible: the projection draws a
+/// layer only then, and its cache only in that case.
+fn layer_seen(scene: &Scene, id: u32) -> bool {
+    let mut current = Some(id);
+    let mut steps = 0usize;
+    while let Some(next) = current {
+        let Some(layer) = scene.layer(next) else {
+            return false;
+        };
+        if !layer.visible {
+            return false;
+        }
+        steps += 1;
+        if steps > scene.layers.len() {
+            return false;
+        }
+        current = layer.parent;
+    }
+    true
+}
+
+/// Whether the layer has a subtree worth compositing: its own image or a
+/// visible, non-transparent direct child, with no transition self image
+/// standing in for its own image.
+fn layer_has_content(scene: &Scene, id: u32) -> bool {
+    let Some(layer) = scene.layer(id) else {
+        return false;
+    };
+    layer.transition_self.is_none()
+        && (layer.bitmap.is_some()
+            || layer.children.iter().any(|child| {
+                scene
+                    .layer(*child)
+                    .is_some_and(|c| c.visible && c.opacity != 0.0)
+            }))
 }
 
 #[derive(Default)]
@@ -596,6 +739,14 @@ extern "C" fn layer_set_size_to_image_size(
     0
 }
 
+/// The image-offset guard the `imageLeft`/`imageTop` setters and
+/// `setImagePos` share: an offset is allowed only when it is not positive and
+/// the image (`image_extent` wide or tall) still covers the layer rectangle
+/// (`rect_extent`) after the shift.
+fn image_offset_allowed(offset: i32, image_extent: u32, rect_extent: u32) -> bool {
+    offset <= 0 && i64::from(image_extent) + i64::from(offset) >= i64::from(rect_extent)
+}
+
 /// `Layer.setImagePos(left, top)`.
 extern "C" fn layer_set_image_pos(
     engine: *mut c_void,
@@ -650,11 +801,9 @@ extern "C" fn layer_set_image_pos(
         return report_error(out_error, "Layer.setImagePos: this layer has no main image");
     }
     if current_left != left || current_top != top {
-        let invalid = left > 0
-            || top > 0
-            || i64::from(image_width) + i64::from(left) < i64::from(rect_w)
-            || i64::from(image_height) + i64::from(top) < i64::from(rect_h);
-        if invalid {
+        if !image_offset_allowed(left, image_width, rect_w)
+            || !image_offset_allowed(top, image_height, rect_h)
+        {
             return report_error(out_error, "Layer.setImagePos: invalid image position");
         }
         if let Some(layer) = scene.layer_mut(id) {
@@ -727,25 +876,8 @@ extern "C" fn layer_set_image_size(
         set_void(out);
         return 0;
     }
-    if let Some(layer) = scene.layer_mut(id) {
-        if width < layer.rect.w {
-            layer.image_left = 0;
-            layer.rect.w = width;
-        }
-        if i64::from(width) + i64::from(layer.image_left) < i64::from(layer.rect.w) {
-            let left = i64::from(layer.rect.w) - i64::from(width);
-            layer.image_left = left.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
-        }
-        if height < layer.rect.h {
-            layer.image_top = 0;
-            layer.rect.h = height;
-        }
-        if i64::from(height) + i64::from(layer.image_top) < i64::from(layer.rect.h) {
-            let top = i64::from(layer.rect.h) - i64::from(height);
-            layer.image_top = top.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
-        }
-    }
-    if !scene.set_layer_image_size(id, width, height) {
+    // The size change defers to the engine's own rectangle/offset adjustment.
+    if !scene.internal_set_image_size(id, width, height) {
         return report_error(
             out_error,
             "Layer.setImageSize: could not resize the layer image",
@@ -758,19 +890,21 @@ extern "C" fn layer_set_image_size(
 /// Copy `source`'s MainImage and ProvinceImage into `dest`, following the
 /// reference `tTJSNI_BaseLayer::AssignImages` (`LayerIntf.cpp:2394-2432`):
 /// a present source image is assigned into ours, an absent one deallocates
-/// ours (`DeallocateImage`/`DeallocateProvinceImage`, `:2349-2378`); the
-/// main image fields are adopted and the clip reset
-/// (`InternalSetImageSize`/`ResetClip`, `:2419-2430`); `ImageModified` is
+/// ours (`DeallocateImage`/`DeallocateProvinceImage`, `:2349-2378`); only the
+/// images are copied, so the destination rectangle adjusts to the assigned
+/// image size with the clip reset, leaving the destination's own image offsets
+/// in place (`InternalSetImageSize`/`ResetClip`, `:2419-2430`); `ImageModified` is
 /// set. The reference's trailing `Update(false)` is a plain repaint, which
 /// the projection already performs every frame; `pending_paint` is reserved
 /// for the `onPaint` dispatch (`CallOnPaint`, set by `UpdateByScript`), so
-/// this member must not re-arm it.
-fn assign_images(scene: &mut Scene, dest: u32, source: u32) {
+/// this member must not re-arm it. An assigned image that cannot take its
+/// size is an error rather than stale geometry.
+fn assign_images(scene: &mut Scene, dest: u32, source: u32) -> Result<(), String> {
     // A source whose layer record is gone (a shut-down object) has nothing to
     // copy; leave the destination untouched rather than treating the missing
     // image as an empty one and deallocating it.
     if scene.layer(source).is_none() {
-        return;
+        return Ok(());
     }
     // Snapshot the source before touching the destination: the two may share
     // a bitmap id, and the copy must reflect the pre-write source.
@@ -779,14 +913,6 @@ fn assign_images(scene: &mut Scene, dest: u32, source: u32) {
         .and_then(|layer| layer.bitmap)
         .and_then(|id| scene.bitmap(id))
         .map(|bitmap| (bitmap.width, bitmap.height, bitmap.rgba.clone()));
-    let src_image = scene.layer(source).map(|layer| {
-        (
-            layer.image_left,
-            layer.image_top,
-            layer.image_width,
-            layer.image_height,
-        )
-    });
     let src_province = scene.layer(source).map(|layer| {
         (
             layer.province.clone(),
@@ -806,7 +932,9 @@ fn assign_images(scene: &mut Scene, dest: u32, source: u32) {
             .filter(|id| scene.bitmap(*id).is_some_and(|bitmap| !bitmap.script_owned));
         match reusable {
             Some(bitmap_id) => {
-                scene.resize_bitmap(bitmap_id, width, height, [0, 0, 0, 0]);
+                if !scene.resize_bitmap(bitmap_id, width, height, [0, 0, 0, 0]) {
+                    return Err("the layer image could not be resized".to_string());
+                }
                 if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
                     bitmap.rgba = rgba;
                     bitmap.dirty = true;
@@ -842,22 +970,27 @@ fn assign_images(scene: &mut Scene, dest: u32, source: u32) {
     }
 
     // `InternalSetImageSize` + `ImageModified` + `ResetClip`
-    // (`LayerIntf.cpp:2419-2430`).
-    let has_main = scene
+    // (`LayerIntf.cpp:2419-2430`). The assigned image is the destination's
+    // MainImage, which is absent when the source had none; the rectangle
+    // adjusts to it and the destination keeps its own image offsets.
+    let assigned = scene
         .layer(dest)
-        .is_some_and(|layer| layer.bitmap.is_some());
-    if let Some(layer) = scene.layer_mut(dest) {
-        if has_main {
-            if let Some((left, top, width, height)) = src_image {
-                layer.image_left = left;
-                layer.image_top = top;
-                layer.image_width = width;
-                layer.image_height = height;
+        .and_then(|layer| layer.bitmap)
+        .and_then(|id| scene.bitmap(id))
+        .map(|bitmap| (bitmap.width, bitmap.height));
+    match assigned {
+        Some((width, height)) => {
+            if !scene.internal_set_image_size(dest, width, height) {
+                return Err("the layer image could not be sized".to_string());
             }
-            layer.clip = None;
         }
-        layer.image_modified = true;
+        None => {
+            if let Some(layer) = scene.layer_mut(dest) {
+                layer.image_modified = true;
+            }
+        }
     }
+    Ok(())
 }
 
 /// `Layer.assignImages(srcLayer)` — copy the source layer's images into this
@@ -906,13 +1039,17 @@ extern "C" fn layer_assign_images(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    assign_images(scene, id, source);
+    if let Err(error) = assign_images(scene, id, source) {
+        return report_error(out_error, &format!("Layer.assignImages: {error}"));
+    }
     set_void(out);
     0
 }
 
 /// `Layer.copyFromBitmapToMainImage(bitmap)` — copy the source pixels into
-/// the layer's MainImage (allocating/resizing it to match).
+/// the layer's MainImage (allocating/resizing it to match) and adjust the
+/// layer rectangle and image offsets to the assigned image; the clip resets
+/// and `ImageModified` is set.
 extern "C" fn layer_copy_from_bitmap_to_main_image(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -934,12 +1071,18 @@ extern "C" fn layer_copy_from_bitmap_to_main_image(
             "Layer.copyFromBitmapToMainImage: compat context is not bound",
         );
     };
-    let bitmap_id = match resolve_object_id(
-        resolved.engine(),
-        // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
-        &unsafe { args(argv, argc) }[0],
-        &["Bitmap"],
-    ) {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
+    let value = &unsafe { args(argv, argc) }[0];
+    // A `null` argument is an object value with no object: the copy is skipped
+    // and the call succeeds.
+    if value.ty == tjs::VAL_NULL {
+        set_void(out);
+        return 0;
+    }
+    if value.ty != tjs::VAL_OBJECT {
+        return report_error(out_error, "Layer.copyFromBitmapToMainImage: not a Bitmap");
+    }
+    let bitmap_id = match resolve_object_id(resolved.engine(), value, &["Bitmap"]) {
         Ok(id) if id >= 0 => id as u32,
         _ => {
             return report_error(out_error, "Layer.copyFromBitmapToMainImage: not a Bitmap");
@@ -966,12 +1109,23 @@ extern "C" fn layer_copy_from_bitmap_to_main_image(
             "Layer.copyFromBitmapToMainImage: the bitmap does not exist",
         );
     };
-    scene.set_layer_image_size(id, width, height);
+    if !scene.set_layer_image_size(id, width, height) {
+        return report_error(
+            out_error,
+            "Layer.copyFromBitmapToMainImage: could not resize the layer image",
+        );
+    }
     if let Some(layer_bitmap) = scene.layer(id).and_then(|l| l.bitmap)
         && let Some(bitmap) = scene.bitmap_mut(layer_bitmap)
     {
         bitmap.rgba = rgba;
         bitmap.dirty = true;
+    }
+    if !scene.internal_set_image_size(id, width, height) {
+        return report_error(
+            out_error,
+            "Layer.copyFromBitmapToMainImage: could not size the layer image",
+        );
     }
     set_void(out);
     0
@@ -1774,6 +1928,28 @@ macro_rules! layer_int_prop_scene {
     };
 }
 
+/// Define a layer property setter whose writes are validated by the whole
+/// scene; the getter is written separately when it must raise. See
+/// [`with_layer_scene`].
+macro_rules! layer_scene_set {
+    ($set:ident, $setter:expr) => {
+        extern "C" fn $set(
+            engine: *mut c_void,
+            instance: *mut c_void,
+            value: *const Value,
+            out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            // SAFETY: the trampoline passes a valid value slot.
+            let value = unsafe { &*value };
+            match with_layer_scene(engine, instance, value, $setter) {
+                Ok(()) => 0,
+                Err(error) => report_error(out_error, &error),
+            }
+        }
+    };
+}
+
 layer_blur_off_prop!(
     layer_visible_get,
     layer_visible_set,
@@ -1962,48 +2138,133 @@ layer_int_prop!(
         true
     }
 );
-layer_int_prop!(
-    layer_image_left_get,
+
+/// `Layer.imageLeft` — the stored image offset. An imageless layer is not
+/// drawable and raises instead.
+extern "C" fn layer_image_left_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_image_value_get(
+        engine,
+        instance,
+        out,
+        out_error,
+        "Layer.imageLeft",
+        |layer| i64::from(layer.image_left),
+    )
+}
+layer_scene_set!(
     layer_image_left_set,
-    |l: &LayerState| i64::from(l.image_left),
-    |l: &mut LayerState, v: &Value| {
+    |scene: &mut Scene, id: u32, v: &Value| {
         let left = value_as_i64(v) as i32;
-        if l.image_left == left {
-            return false;
-        }
-        l.image_left = left;
-        true
+        store_image_offset(
+            scene,
+            id,
+            left,
+            "Layer.imageLeft",
+            |layer| {
+                (
+                    layer.bitmap.is_some(),
+                    layer.image_left,
+                    layer.image_width,
+                    layer.rect.w,
+                )
+            },
+            |layer, value| layer.image_left = value,
+        )
     }
 );
-layer_int_prop!(
-    layer_image_top_get,
+
+/// `Layer.imageTop`; the vertical counterpart of [`layer_image_left_get`].
+extern "C" fn layer_image_top_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_image_value_get(
+        engine,
+        instance,
+        out,
+        out_error,
+        "Layer.imageTop",
+        |layer| i64::from(layer.image_top),
+    )
+}
+layer_scene_set!(
     layer_image_top_set,
-    |l: &LayerState| i64::from(l.image_top),
-    |l: &mut LayerState, v: &Value| {
+    |scene: &mut Scene, id: u32, v: &Value| {
         let top = value_as_i64(v) as i32;
-        if l.image_top == top {
-            return false;
-        }
-        l.image_top = top;
-        true
+        store_image_offset(
+            scene,
+            id,
+            top,
+            "Layer.imageTop",
+            |layer| {
+                (
+                    layer.bitmap.is_some(),
+                    layer.image_top,
+                    layer.image_height,
+                    layer.rect.h,
+                )
+            },
+            |layer, value| layer.image_top = value,
+        )
     }
 );
-/// `Layer.imageWidth`/`Layer.imageHeight` getter. The reference
-/// `GetImageWidth`/`GetImageHeight` raise `TVPNotDrawableLayerType` when the
-/// layer has no `MainImage` (`LayerIntf.cpp:2587-2592`, `:2616-2621`).
-fn layer_image_dimension_get(
+
+/// Store one image offset under the image-offset guard: an imageless layer is
+/// not drawable, a positive offset or one that would leave the image short of
+/// the layer rectangle is an invalid image position, and an unchanged offset
+/// stores nothing. `read` yields the layer's (has image, current offset, image
+/// extent, rectangle extent) for the axis, `write` stores the new offset.
+fn store_image_offset(
+    scene: &mut Scene,
+    id: u32,
+    offset: i32,
+    member: &str,
+    read: impl FnOnce(&LayerState) -> (bool, i32, u32, u32),
+    write: impl FnOnce(&mut LayerState, i32),
+) -> Result<(), String> {
+    let Some((has_image, current, image_extent, rect_extent)) = scene.layer(id).map(read) else {
+        return Err("Layer: layer no longer exists".to_string());
+    };
+    if !has_image {
+        return Err(format!("{member}: Not drawable layer type"));
+    }
+    if current == offset {
+        return Ok(());
+    }
+    if !image_offset_allowed(offset, image_extent, rect_extent) {
+        return Err(format!("{member}: invalid image position"));
+    }
+    if let Some(layer) = scene.layer_mut(id) {
+        write(layer, offset);
+    }
+    Ok(())
+}
+
+/// Read one main-image value for a `Layer` getter. An imageless layer is not
+/// drawable and raises instead; the width, the height and both image offsets
+/// behave that way.
+fn layer_image_value_get(
     engine: *mut c_void,
     instance: *mut c_void,
     out: *mut Value,
     out_error: *mut *mut c_char,
     name: &str,
-    dimension: impl FnOnce(&LayerState) -> u32,
+    value: impl FnOnce(&LayerState) -> i64,
 ) -> c_int {
     match with_layer_read(engine, instance, |layer| {
         if layer.bitmap.is_none() {
             Err(format!("{name}: Not drawable layer type"))
         } else {
-            Ok(i64::from(dimension(layer)))
+            Ok(value(layer))
         }
     }) {
         Ok(Ok(value)) => {
@@ -2021,13 +2282,13 @@ extern "C" fn layer_image_width_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    layer_image_dimension_get(
+    layer_image_value_get(
         engine,
         instance,
         out,
         out_error,
         "Layer.imageWidth",
-        |layer| layer.image_width,
+        |layer| i64::from(layer.image_width),
     )
 }
 
@@ -2038,13 +2299,13 @@ extern "C" fn layer_image_height_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    layer_image_dimension_get(
+    layer_image_value_get(
         engine,
         instance,
         out,
         out_error,
         "Layer.imageHeight",
-        |layer| layer.image_height,
+        |layer| i64::from(layer.image_height),
     )
 }
 
@@ -2214,17 +2475,30 @@ layer_blur_off_prop!(
     },
     |l: &LayerState| !l.enabled
 );
-layer_int_prop!(
+layer_int_prop_scene!(
     layer_cached_get,
     layer_cached_set,
     |l: &LayerState| i64::from(l.cached),
-    |l: &mut LayerState, v: &Value| {
+    |scene: &mut Scene, id: u32, v: &Value| {
         let cached = value_as_bool(v);
-        if l.cached == cached {
-            return false;
+        let current = scene
+            .layer(id)
+            .map(|layer| layer.cached)
+            .ok_or_else(|| "Layer: layer no longer exists".to_string())?;
+        if current == cached {
+            return Ok(());
         }
-        l.cached = cached;
-        true
+        if let Some(layer) = scene.layer_mut(id) {
+            layer.cached = cached;
+        }
+        // A cache consumer is registered while the flag is on and released
+        // when it goes off; the last release frees the rendered cache.
+        if cached {
+            scene.inc_cache_enabled_count(id);
+        } else {
+            scene.dec_cache_enabled_count(id);
+        }
+        Ok(())
     }
 );
 layer_int_prop!(

@@ -10,6 +10,8 @@
 //!   `ripple.cpp`) plus the core providers (`TransIntf.cpp`);
 //! * invalid options surface as typed errors during the `beginTransition`
 //!   call — where the reference's providers validate — never silently;
+//! * `time` is required, `callback` supplies the transition tick, and
+//!   `selfupdate` waits for a frame whose projection drew its subtree;
 //! * the phase-0 / phase-max endpoint short-circuits of
 //!   `tTVPCrossFadeTransHandler::Process`;
 //! * `universal` rule-image loading (`LoadImage` → grayscale, tiled) and
@@ -170,6 +172,15 @@ impl Env {
         let ctx = self.host.ctx().expect("bound host");
         compat::advance_transitions(&ctx, dt_ms).expect("advance transitions");
     }
+
+    /// One frame with the projection's drawn-layer report: the normal frame
+    /// step, then the self-update step for the layers the projection emitted.
+    fn advance_drawn(&self, dt_ms: f64, drawn: &[u32]) {
+        let ctx = self.host.ctx().expect("bound host");
+        compat::advance_transitions(&ctx, dt_ms).expect("advance transitions");
+        compat::advance_self_updating_transitions(&ctx, drawn)
+            .expect("advance self-updating transitions");
+    }
 }
 
 /// A window with two `size` x `size` layers: `a` — the `transwith` source,
@@ -195,6 +206,22 @@ fn two_layers_with(env: &Env, size: i64, preamble: &str) {
              a.setMainPixel(i % {size}, i / {size}, {BLUE}); \
          }}"
     ));
+}
+
+/// A window whose `a` (the transition source) and `b` (the destination) hold
+/// their content in child layers — the KAG `Sprite` shape, with no main image
+/// of their own — and a whole-subtree transition from `a` to `b` running.
+fn two_layers_with_children(env: &Env) {
+    env.run(
+        "var w = new Window(); \
+         var a = new Layer(w, null); a.setSize(2, 2); a.name = 'src'; a.hasImage = false; \
+         var ac = new Layer(w, a); ac.setSize(2, 2); ac.setImageSize(2, 2); \
+         ac.fillRect(0, 0, 2, 2, 0xff0000ff); ac.visible = true; \
+         var b = new Layer(w, null); b.setSize(2, 2); b.visible = true; b.name = 'dest'; b.hasImage = false; \
+         var bc = new Layer(w, b); bc.setSize(2, 2); bc.setImageSize(2, 2); \
+         bc.fillRect(0, 0, 2, 2, 0xffff0000); bc.visible = true; \
+         b.beginTransition('crossfade', true, a, %[time: 100]);",
+    );
 }
 
 /// Install an `onTransitionCompleted` counter on `b` (an instance member
@@ -264,13 +291,6 @@ fn self_image_of(env: &Env, name: &str) -> Option<u32> {
     named_layer(env, name).transition_self
 }
 
-/// The `0xRRGGBB` colour of `name`'s self image at `(x, y)`.
-fn self_image_pixel(env: &Env, name: &str, x: u32, y: u32) -> i64 {
-    let self_image =
-        self_image_of(env, name).unwrap_or_else(|| panic!("{name} has no transition self image"));
-    scene_pixel(env, self_image, x, y)
-}
-
 /// Every pixel of `name`'s transition frame as one comma-joined string.
 fn frame_grid(env: &Env, name: &str, size: i64) -> String {
     let frame = transition_frame(env, name);
@@ -290,6 +310,17 @@ fn scene_pixel(env: &Env, bitmap: u32, x: u32, y: u32) -> i64 {
     let offset = bitmap.pixel_offset(x, y).expect("pixel offset");
     let px = &bitmap.rgba[offset..offset + 4];
     (i64::from(px[0]) << 16) | (i64::from(px[1]) << 8) | i64::from(px[2])
+}
+
+/// Assert that every pixel of the 2x2 bitmap `bitmap` is `expected`.
+fn assert_2x2(env: &Env, bitmap: u32, expected: i64, what: &str) {
+    for (x, y) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
+        assert_eq!(
+            scene_pixel(env, bitmap, x, y),
+            expected,
+            "{what} at ({x},{y})"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +506,173 @@ fn time_below_two_milliseconds_is_raised_to_two() {
     }
 }
 
+/// Every core provider requires the `time` option: `GetAsNumber` raises
+/// `TVPSpecifyOption` for an absent, `void` or non-numeric member, and the
+/// call itself raises — there is no default duration.
+///
+/// reference/cpp/core/visual/TransIntf.cpp:512-519
+#[test]
+fn time_option_is_required() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    for options in ["null", "%[]", "%[time: void]", "%[time: %[]]"] {
+        two_layers(&env, 2);
+        let message = env.error(&format!(
+            "b.beginTransition('crossfade', true, a, {options});"
+        ));
+        assert!(
+            message.contains("Specify option time"),
+            "{options} must raise TVPSpecifyOption time, got: {message}"
+        );
+    }
+
+    // A valid `time` still starts the transition (`time: 0` is clamped to 2).
+    two_layers(&env, 2);
+    counter(&env);
+    env.run("b.beginTransition('crossfade', true, a, %[time: 0]);");
+    env.advance(1.0);
+    assert_eq!(env.eval_int("hits"), 0);
+    env.advance(1.0);
+    assert_eq!(env.eval_int("hits"), 1);
+}
+
+/// The `callback` option replaces the frame clock: `GetTransTick` calls it and
+/// uses the returned tick as the transition time, so advancing the frame by
+/// any amount does not move a callback-driven transition until the callback's
+/// value does. The initial tick is 0 (`StartTransition`'s dummy
+/// `StartProcess(0)`), so the callback's result is the elapsed time.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7807-7818
+/// reference/cpp/core/visual/LayerIntf.cpp:7909-7922
+/// reference/cpp/core/visual/LayerIntf.cpp:8053-8056
+/// reference/cpp/core/visual/LayerIntf.cpp:8261-8270
+#[test]
+fn callback_supplies_the_transition_tick() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    two_layers(&env, 2);
+    counter(&env);
+    env.run(
+        "var tick = 0; var calls = 0; \
+         var ticker = function() { calls++; return tick; }; \
+         b.beginTransition('crossfade', true, a, %[time: 100, callback: ticker]);",
+    );
+
+    // A large frame delta is ignored while the callback still returns 0.
+    env.advance(500.0);
+    assert_eq!(env.eval_int("calls"), 1, "the callback ran once");
+    assert_eq!(
+        env.eval_int("hits"),
+        0,
+        "the frame clock did not advance it"
+    );
+
+    env.run("tick = 50;");
+    env.advance(0.0);
+    assert_eq!(env.eval_int("calls"), 2);
+    assert_eq!(env.eval_int("hits"), 0, "50 ms of a 100 ms transition");
+
+    env.run("tick = 99;");
+    env.advance(0.0);
+    assert_eq!(env.eval_int("hits"), 0, "99 ms is still short");
+
+    env.run("tick = 100;");
+    env.advance(0.0);
+    assert_eq!(env.eval_int("hits"), 1, "the callback reached the duration");
+}
+
+/// `StartTransition` reads `callback` with `AsObjectClosure`, which throws for
+/// a non-object while the script is still inside `beginTransition`; it is not
+/// deferred to the first tick. A TJS `null` is an object closure, so it is the
+/// separate null-access failure at tick time.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7807-7818
+/// reference/cpp/core/tjs2/tjsVariant.h:719-726
+#[test]
+fn callback_must_be_an_object_at_begin() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    for value in ["1", "1.5", "'tick'"] {
+        two_layers(&env, 2);
+        let message = env.error(&format!(
+            "b.beginTransition('crossfade', true, a, %[time: 100, callback: {value}]);"
+        ));
+        assert!(
+            message.contains("callback must be a function"),
+            "callback: {value} must raise at begin, got: {message}"
+        );
+    }
+}
+
+/// `selfupdate: true` keeps the transition off the automatic frame pump
+/// (`StartTransition` skips `TVPAddContinuousEventHook`). It advances only on a
+/// frame whose projection drew the destination subtree; wall-clock time that
+/// passed while it waited is applied on that draw, not discarded.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7797-7803
+/// reference/cpp/core/visual/LayerIntf.cpp:7906-7908
+/// reference/cpp/core/visual/LayerIntf.cpp:6410-6422
+/// reference/cpp/core/visual/LayerIntf.cpp:8053-8056
+#[test]
+fn selfupdate_waits_for_a_drawn_layer() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    two_layers(&env, 2);
+    counter(&env);
+    env.run("b.beginTransition('crossfade', true, a, %[time: 100, selfupdate: true]);");
+    let drawn = [named_layer(&env, "dest").id];
+
+    env.advance_drawn(50.0, &[]);
+    env.advance_drawn(50.0, &[]);
+    assert_eq!(
+        env.eval_int("hits"),
+        0,
+        "without a drawn layer the transition did not run"
+    );
+
+    env.advance_drawn(0.0, &drawn);
+    assert_eq!(
+        env.eval_int("hits"),
+        1,
+        "the drawn layer applied the elapsed 100 ms"
+    );
+}
+
+/// A self-updating transition with a `callback` does not call the callback
+/// while it waits, and uses its tick on the draw that emits the layer.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7807-7818
+/// reference/cpp/core/visual/LayerIntf.cpp:7906-7908
+/// reference/cpp/core/visual/LayerIntf.cpp:6414-6422
+/// reference/cpp/core/visual/LayerIntf.cpp:8261-8270
+#[test]
+fn selfupdate_and_callback_advance_only_on_draw() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    two_layers(&env, 2);
+    counter(&env);
+    env.run(
+        "var tick = 0; var calls = 0; \
+         var ticker = function() { calls++; return tick; }; \
+         b.beginTransition('crossfade', true, a, \
+             %[time: 100, selfupdate: true, callback: ticker]);",
+    );
+    let drawn = [named_layer(&env, "dest").id];
+
+    env.advance_drawn(100.0, &[]);
+    assert_eq!(env.eval_int("calls"), 0, "no callback without a draw");
+    assert_eq!(env.eval_int("hits"), 0);
+
+    env.advance_drawn(0.0, &drawn);
+    assert_eq!(env.eval_int("calls"), 1);
+    assert_eq!(env.eval_int("hits"), 0, "the callback still reports 0");
+
+    env.run("tick = 100;");
+    env.advance_drawn(0.0, &drawn);
+    assert_eq!(env.eval_int("calls"), 2);
+    assert_eq!(env.eval_int("hits"), 1, "the draw's tick completes it");
+}
+
 // ---------------------------------------------------------------------------
 // withchildren: the whole-subtree path
 // ---------------------------------------------------------------------------
@@ -550,43 +748,34 @@ fn a_transition_without_children_blends_into_the_self_image() {
 
     // Phase 0: the self image holds source 1 verbatim.
     env.advance(0.0);
-    let first = self_image_of(&env, "dest").expect("self image");
-    for (x, y) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
-        assert_eq!(
-            self_image_pixel(&env, "dest", x, y),
-            RED,
-            "phase 0 self image at ({x},{y})"
-        );
-    }
+    let self_image = self_image_of(&env, "dest").expect("self image");
+    assert_2x2(&env, self_image, RED, "phase 0 self image");
 
-    // 50 ms into a 100 ms cross-fade is phase 128: the 50/50 blend, drawn into
-    // the same self image.
+    // 50 ms into a 100 ms cross-fade truncates to phase 127, drawn into the
+    // same self image.
     env.advance(50.0);
-    let expected = blend_rgb(RED, BLUE, 128);
     assert_eq!(
         self_image_of(&env, "dest"),
-        Some(first),
+        Some(self_image),
         "the self image is reused between frames"
     );
-    for (x, y) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
-        assert_eq!(
-            self_image_pixel(&env, "dest", x, y),
-            expected,
-            "phase 128 self image at ({x},{y})"
-        );
-    }
+    assert_2x2(
+        &env,
+        self_image,
+        blend_rgb(RED, BLUE, 127),
+        "phase 127 self image",
+    );
 
-    // The phase rounds to the maximum just before the duration elapses, so the
-    // last frame is source 2 verbatim while the transition still runs.
-    env.advance(49.9);
-    for (x, y) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
-        assert_eq!(
-            self_image_pixel(&env, "dest", x, y),
-            BLUE,
-            "final-phase self image at ({x},{y})"
-        );
-    }
-    assert_eq!(env.eval_int("hits"), 0, "still running at phase max");
+    // 99 ms into the transition truncates to phase 252, still short of the
+    // PhaseMax guarantee that makes the last frame source 2 verbatim.
+    env.advance(49.0);
+    assert_2x2(
+        &env,
+        self_image,
+        blend_rgb(RED, BLUE, 252),
+        "phase 252 self image",
+    );
+    assert_eq!(env.eval_int("hits"), 0, "still running at phase 252");
 
     // Both main images and the live child are untouched at every phase.
     assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
@@ -607,7 +796,7 @@ fn a_transition_without_children_blends_into_the_self_image() {
         "completion clears the self image slot"
     );
     assert!(
-        env._scene.bitmap(first).is_none(),
+        env._scene.bitmap(self_image).is_none(),
         "the self image bitmap is released"
     );
     assert!(
@@ -636,22 +825,23 @@ fn a_transition_without_children_blends_into_the_self_image() {
 /// reference/cpp/core/visual/LayerIntf.cpp:6781-6783
 /// reference/cpp/core/visual/LayerIntf.cpp:7156-7226
 #[test]
-fn a_second_transition_starts_from_a_clean_self_image() {
+fn a_stopped_transition_releases_its_self_image() {
     let _lock = vm_lock();
     let env = Env::new();
     two_layers(&env, 2);
     env.run("b.beginTransition('crossfade', false, a, %[time: 100]);");
     env.advance(0.0);
     let first = self_image_of(&env, "dest").expect("self image");
-    env.advance(100.0);
+    env.run("b.stopTransition();");
     assert!(
         self_image_of(&env, "dest").is_none(),
-        "the completed transition cleared its slot"
+        "stopping clears the slot"
     );
     assert!(
         env._scene.bitmap(first).is_none(),
-        "the first self image was released"
+        "and releases its bitmap"
     );
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
 
     // The teardown hid the destination; make it visible again before the second
     // transition, which ends at the first frame while its destination is
@@ -667,17 +857,7 @@ fn a_second_transition_starts_from_a_clean_self_image() {
         second > first,
         "a fresh bitmap, not the released one ({second} vs {first})"
     );
-    assert_eq!(self_image_pixel(&env, "dest", 0, 0), RED);
-    env.run("b.stopTransition();");
-    assert!(
-        self_image_of(&env, "dest").is_none(),
-        "stopping clears the slot"
-    );
-    assert!(
-        env._scene.bitmap(second).is_none(),
-        "and releases its bitmap"
-    );
-    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
+    assert_2x2(&env, second, RED, "the second transition's self image");
 }
 
 /// A layer with a transition self image that sits inside another layer's
@@ -709,10 +889,11 @@ fn a_nested_childless_transition_is_cached_as_its_self_image() {
          ps.fillRect(0, 0, 2, 2, 0xff00ff00); \
          c.beginTransition('crossfade', false, cs, %[time: 100]);",
     );
-    // 50 ms into a 100 ms cross-fade is phase 128.
+    // 50 ms into a 100 ms cross-fade truncates to phase 127.
     env.advance(50.0);
-    let blended = blend_rgb(RED, BLUE, 128);
-    assert_eq!(self_image_pixel(&env, "inner", 0, 0), blended);
+    let blended = blend_rgb(RED, BLUE, 127);
+    let inner_self = self_image_of(&env, "inner").expect("the child's self image");
+    assert_eq!(scene_pixel(&env, inner_self, 0, 0), blended);
 
     // The parent caches its subtree: `Complete` composites the child through
     // `CopySelfForRect`, so the child's transition lands in the cache.
@@ -777,16 +958,7 @@ fn with_children_blends_the_layer_subtrees() {
     // are painted opaque with `fillRect`
     // (`LayerIntf.cpp:108-110`, `LayerBitmapIntf.cpp:122-160`,
     // `LayerIntf.cpp:4272-4285`).
-    env.run(
-        "var w = new Window(); \
-         var a = new Layer(w, null); a.setSize(2, 2); a.name = 'src'; a.hasImage = false; \
-         var ac = new Layer(w, a); ac.setSize(2, 2); ac.setImageSize(2, 2); \
-         ac.fillRect(0, 0, 2, 2, 0xff0000ff); ac.visible = true; \
-         var b = new Layer(w, null); b.setSize(2, 2); b.visible = true; b.name = 'dest'; b.hasImage = false; \
-         var bc = new Layer(w, b); bc.setSize(2, 2); bc.setImageSize(2, 2); \
-         bc.fillRect(0, 0, 2, 2, 0xffff0000); bc.visible = true; \
-         b.beginTransition('crossfade', true, a, %[time: 100]);",
-    );
+    two_layers_with_children(&env);
     // Caching is enabled on both layers for the transition.
     assert_eq!(named_layer(&env, "dest").cache_enabled_count, 1);
     assert_eq!(named_layer(&env, "src").cache_enabled_count, 1);
@@ -794,15 +966,8 @@ fn with_children_blends_the_layer_subtrees() {
     env.advance(50.0);
     let cache = cache_bitmap_of(&env, "dest").expect("destination cache");
     assert!(cache_bitmap_of(&env, "src").is_some(), "source cache");
-    // 50 ms into a 100 ms cross-fade is phase 128.
-    let expected = blend_rgb(RED, BLUE, 128);
-    for (x, y) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
-        assert_eq!(
-            scene_pixel(&env, cache, x, y),
-            expected,
-            "destination cache at ({x},{y})"
-        );
-    }
+    // 50 ms into a 100 ms cross-fade truncates to phase 127.
+    assert_2x2(&env, cache, blend_rgb(RED, BLUE, 127), "destination cache");
     // The children keep their own pixels: only the cache holds the blend.
     assert_eq!(env.eval_int("bc.getMainPixel(0, 0)"), RED);
     assert_eq!(env.eval_int("ac.getMainPixel(0, 0)"), BLUE);
@@ -830,16 +995,7 @@ fn with_children_blends_the_layer_subtrees() {
 fn with_children_reuses_the_subtree_content_between_frames() {
     let _lock = vm_lock();
     let mut env = Env::new();
-    env.run(
-        "var w = new Window(); \
-         var a = new Layer(w, null); a.setSize(2, 2); a.name = 'src'; a.hasImage = false; \
-         var ac = new Layer(w, a); ac.setSize(2, 2); ac.setImageSize(2, 2); \
-         ac.fillRect(0, 0, 2, 2, 0xff0000ff); ac.visible = true; \
-         var b = new Layer(w, null); b.setSize(2, 2); b.visible = true; b.name = 'dest'; b.hasImage = false; \
-         var bc = new Layer(w, b); bc.setSize(2, 2); bc.setImageSize(2, 2); \
-         bc.fillRect(0, 0, 2, 2, 0xffff0000); bc.visible = true; \
-         b.beginTransition('crossfade', true, a, %[time: 100]);",
-    );
+    two_layers_with_children(&env);
     env.advance(25.0);
     let dest_content = named_layer(&env, "dest")
         .cache_content
@@ -859,11 +1015,12 @@ fn with_children_reuses_the_subtree_content_between_frames() {
         !env._scene.bitmap(src_content).unwrap().dirty,
         "the source subtree content is reused, not recomposited"
     );
-    // The blend still advances: 50 ms into a 100 ms cross-fade is phase 128.
+    // The blend still advances: 50 ms into a 100 ms cross-fade truncates to
+    // phase 127.
     let display = named_layer(&env, "dest")
         .cache_bitmap
         .expect("destination frame");
-    assert_eq!(scene_pixel(&env, display, 0, 0), blend_rgb(RED, BLUE, 128));
+    assert_eq!(scene_pixel(&env, display, 0, 0), blend_rgb(RED, BLUE, 127));
 }
 
 /// A mid-transition change to a drawn child invalidates the cached content:
@@ -874,16 +1031,7 @@ fn with_children_reuses_the_subtree_content_between_frames() {
 fn with_children_rebuilds_when_a_drawn_child_changes() {
     let _lock = vm_lock();
     let env = Env::new();
-    env.run(
-        "var w = new Window(); \
-         var a = new Layer(w, null); a.setSize(2, 2); a.name = 'src'; a.hasImage = false; \
-         var ac = new Layer(w, a); ac.setSize(2, 2); ac.setImageSize(2, 2); \
-         ac.fillRect(0, 0, 2, 2, 0xff0000ff); ac.visible = true; \
-         var b = new Layer(w, null); b.setSize(2, 2); b.visible = true; b.name = 'dest'; b.hasImage = false; \
-         var bc = new Layer(w, b); bc.setSize(2, 2); bc.setImageSize(2, 2); \
-         bc.fillRect(0, 0, 2, 2, 0xffff0000); bc.visible = true; \
-         b.beginTransition('crossfade', true, a, %[time: 100]);",
-    );
+    two_layers_with_children(&env);
     env.advance(25.0);
     let dest_content = named_layer(&env, "dest")
         .cache_content
@@ -901,7 +1049,7 @@ fn with_children_rebuilds_when_a_drawn_child_changes() {
         .expect("destination frame");
     assert_eq!(
         scene_pixel(&env, display, 0, 0),
-        blend_rgb(0x00ff00, BLUE, 128)
+        blend_rgb(0x00ff00, BLUE, 127)
     );
 }
 
@@ -931,10 +1079,11 @@ fn a_destination_that_shows_a_hidden_control_mid_transition_ends_clean() {
          bc.fillRect(0, 0, 2, 2, 0xff00ff00); bc.visible = false; \
          b.beginTransition('crossfade', true, a, %[time: 100]);",
     );
-    // 25 ms into a 100 ms cross-fade is phase 64. No child is visible, so the
-    // destination content is its MainImage and the frame is the pure blend.
+    // 25 ms into a 100 ms cross-fade truncates to phase 63. No child is
+    // visible, so the destination content is its MainImage and the frame is
+    // the pure blend.
     env.advance(25.0);
-    assert_eq!(frame_pixel(&env, "dest", 1, 1), blend_rgb(RED, BLUE, 64));
+    assert_eq!(frame_pixel(&env, "dest", 1, 1), blend_rgb(RED, BLUE, 63));
     assert_eq!(
         env.eval_int("b.getMainPixel(1, 1)"),
         RED,
@@ -947,12 +1096,12 @@ fn a_destination_that_shows_a_hidden_control_mid_transition_ends_clean() {
     env.advance(25.0);
     assert_eq!(
         frame_pixel(&env, "dest", 0, 0),
-        blend_rgb(0x00ff00, BLUE, 128),
+        blend_rgb(0x00ff00, BLUE, 127),
         "the control recomposited under the blend"
     );
     assert_eq!(
         frame_pixel(&env, "dest", 3, 3),
-        blend_rgb(RED, BLUE, 128),
+        blend_rgb(RED, BLUE, 127),
         "the rest of the destination content"
     );
     assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
@@ -1002,14 +1151,7 @@ fn container_source_without_image_transitions_its_children() {
     );
     env.advance(50.0);
     let cache = cache_bitmap_of(&env, "dest").expect("destination cache");
-    let expected = blend_rgb(RED, BLUE, 128);
-    for (x, y) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
-        assert_eq!(
-            scene_pixel(&env, cache, x, y),
-            expected,
-            "destination cache at ({x},{y})"
-        );
-    }
+    assert_2x2(&env, cache, blend_rgb(BLUE, RED, 127), "destination cache");
 }
 
 /// The `ttExchange` teardown runs `Exchange` (`LayerIntf.cpp:754-979`),
@@ -1065,12 +1207,13 @@ fn a_trivial_destination_keeps_its_main_image() {
     assert_eq!(frame_pixel(&env, "dest", 0, 0), RED);
     assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
 
-    // 50 ms into a 100 ms cross-fade is phase 128: the frame holds the blend,
-    // every pixel read of the MainImage still sees the original image.
+    // 50 ms into a 100 ms cross-fade truncates to phase 127: the frame holds
+    // the blend, every pixel read of the MainImage still sees the original
+    // image.
     env.advance(50.0);
-    let expected = blend_rgb(RED, BLUE, 128);
+    let expected = blend_rgb(RED, BLUE, 127);
+    assert_2x2(&env, transition_frame(&env, "dest"), expected, "frame");
     for (x, y) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
-        assert_eq!(frame_pixel(&env, "dest", x, y), expected, "frame ({x},{y})");
         assert_eq!(
             env.eval_int(&format!("b.getMainPixel({x}, {y})")),
             RED,
@@ -1219,9 +1362,9 @@ fn ripple_options_are_validated_during_begin() {
 /// through the image provider (`:819-821`), which decodes it as 8-bit
 /// grayscale (`GraphicsLoaderIntf.cpp:1697`) and **tiles** it when smaller
 /// than the source (`GraphicsLoaderIntf.cpp:1693-1696`). Mid-flight
-/// (`time: 100`, 50 ms in, vague 64 → phase 160, `phase0 = 96`,
+/// (`time: 100`, 50 ms in, vague 64 → phase 159, `phase0 = 95`,
 /// `tvpgl.cpp:4576-4594`): rule grey 0 → opacity 255 (source 2), grey 128
-/// → `255 - (128-96)*255/64 = 128`, and the 2x2 rule repeats over the 4x4
+/// → `255 - (128-95)*255/64 = 124`, and the 2x2 rule repeats over the 4x4
 /// source.
 ///
 /// reference/cpp/core/visual/TransIntf.cpp:806-821
@@ -1236,8 +1379,8 @@ fn universal_rule_image_is_loaded_grayscale_and_tiled() {
     env.advance(50.0);
     // Rule (0,0) = grey 0 → opacity 255: the blue source at full blend.
     assert_eq!(frame_pixel(&env, "dest", 0, 0), blend_rgb(RED, BLUE, 255));
-    // Rule (1,0) = grey 128 → opacity 128.
-    assert_eq!(frame_pixel(&env, "dest", 1, 0), blend_rgb(RED, BLUE, 128));
+    // Rule (1,0) = grey 128 → opacity 124.
+    assert_eq!(frame_pixel(&env, "dest", 1, 0), blend_rgb(RED, BLUE, 124));
     // Tiling: the 2x2 rule repeats over the 4x4 source, in both axes.
     assert_eq!(
         frame_pixel(&env, "dest", 2, 0),
@@ -1277,9 +1420,9 @@ fn universal_rule_image_is_loaded_grayscale_and_tiled() {
 /// `vague` defaults to 64 (`TransIntf.cpp:806-810`) and drives the soft
 /// edge of `TVPInitUnivTransBlendTable_c` (`tvpgl.cpp:4576-4594`). With the
 /// 0/128 checkerboard rule mid-flight: the default equals an explicit
-/// `vague: 64`; `vague: 0` is the hard threshold (grey 128 ≥ phase 128 →
+/// `vague: 64`; `vague: 0` is the hard threshold (grey 128 ≥ phase 127 →
 /// source 1 verbatim); `vague: 255` yields opacity
-/// `255 - 128*255/255 = 127`.
+/// `255 - (128 - (-96))*255/255 = 31`.
 ///
 /// reference/cpp/core/visual/TransIntf.cpp:806-810
 /// reference/cpp/core/visual/tvpgl.cpp:4576-4594
@@ -1302,11 +1445,28 @@ fn universal_vague_defaults_to_64_and_is_read() {
         universal(", vague: 64"),
         "vague defaults to 64"
     );
+    // `AsInteger` accepts numeric strings (reference/cpp/core/tjs2/tjsVariant.h:862-877).
+    assert_eq!(
+        default_grid,
+        universal(", vague: '64'"),
+        "a numeric string uses the same integer coercion"
+    );
+
+    // A non-numeric value cannot be converted, so it is a typed error rather
+    // than silently falling back to the default.
+    two_layers(&env, 2);
+    let message = env.error(
+        "b.beginTransition('universal', true, a, %[time: 100, rule: 'rule.img', vague: %[]]);",
+    );
+    assert!(
+        message.contains("invalid transition option vague"),
+        "unexpected error: {message}"
+    );
 
     let hard_grid = universal(", vague: 0");
     assert_ne!(hard_grid, default_grid, "vague: 0 is a hard threshold");
     // In the hard-threshold run the grey-128 pixel is source 1 verbatim
-    // (128 >= phase 128 → opacity 0).
+    // (128 >= phase 127 → opacity 0).
     two_layers(&env, 2);
     env.run("b.beginTransition('universal', true, a, %[time: 100, rule: 'rule.img', vague: 0]);");
     env.advance(50.0);
@@ -1553,15 +1713,21 @@ fn an_invalidated_source_suppresses_the_completion_event() {
 // extrans option defaults and forwarding
 // ---------------------------------------------------------------------------
 
-/// Begin `name` with `{time: 100}` plus `options`, run 50 ms in (mid
-/// flight) and return the destination's pixel grid.
-fn extrans_grid(env: &Env, name: &str, options: &str, size: i64) -> String {
-    two_layers(env, size);
+/// Begin `name` with `{time: 100}` plus `options` on the current `a`/`b`
+/// layers, run 50 ms in (mid flight) and return the destination's pixel grid.
+fn extrans_frame_grid(env: &Env, name: &str, options: &str, size: i64) -> String {
     env.run(&format!(
         "b.beginTransition('{name}', true, a, %[time: 100{options}]);"
     ));
     env.advance(50.0);
     frame_grid(env, "dest", size)
+}
+
+/// Begin `name` with `{time: 100}` plus `options`, run 50 ms in (mid
+/// flight) and return the destination's pixel grid.
+fn extrans_grid(env: &Env, name: &str, options: &str, size: i64) -> String {
+    two_layers(env, size);
+    extrans_frame_grid(env, name, options, size)
 }
 
 /// Like [`extrans_grid`], but with two **spatially varying** layers, so a
@@ -1584,11 +1750,7 @@ fn extrans_patterned_grid(env: &Env, name: &str, options: &str, size: i64) -> St
                                 ((({size} - 1 - y) * 16) << 8) | ((x + y) * 8)); \
          }}"
     ));
-    env.run(&format!(
-        "b.beginTransition('{name}', true, a, %[time: 100{options}]);"
-    ));
-    env.advance(50.0);
-    frame_grid(env, "dest", size)
+    extrans_frame_grid(env, name, options, size)
 }
 
 /// Each provider's implicit options must equal the reference's declared
@@ -1662,10 +1824,24 @@ fn extrans_options_reach_the_handlers() {
         extrans_grid(&env, "wave", ", maxh: 5", 16),
         "maxh must reach the wave handler"
     );
+    // `AsInteger` accepts numeric strings (reference/cpp/core/tjs2/tjsVariant.h:862-877).
+    assert_eq!(
+        extrans_grid(&env, "wave", ", maxh: 5", 16),
+        extrans_grid(&env, "wave", ", maxh: '5'", 16),
+        "a numeric string maxh uses the same integer coercion"
+    );
     assert_ne!(
         extrans_patterned_grid(&env, "mosaic", ", maxsize: 4", 16),
         extrans_patterned_grid(&env, "mosaic", ", maxsize: 12", 16),
         "maxsize must reach the mosaic handler"
+    );
+
+    // A non-numeric value is rejected instead of silently using the default.
+    two_layers(&env, 16);
+    let message = env.error("b.beginTransition('wave', true, a, %[time: 100, maxh: %[]]);");
+    assert!(
+        message.contains("invalid transition option maxh"),
+        "unexpected error: {message}"
     );
 }
 

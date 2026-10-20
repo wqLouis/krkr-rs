@@ -103,8 +103,12 @@ pub(crate) fn timer_count(services: &crate::CompatServices) -> usize {
     timer::binding_count(services)
 }
 // The tree-owner / frame-body hand-offs: the L4 frame body drains the host
-// requests and advances transitions from its `frame_tail` step.
-pub use layer::{advance_transitions, paint_poll, take_capture_releases};
+// requests, advances transitions and composites the script-cached layers from
+// its `frame_tail` step.
+pub use layer::{
+    advance_self_updating_transitions, advance_transitions, paint_poll, refresh_cached_layers,
+    take_capture_releases,
+};
 pub use window::{take_bring_to_front_requests, take_update_requests};
 
 /// Register the visual classes.

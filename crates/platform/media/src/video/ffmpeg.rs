@@ -65,8 +65,9 @@ pub struct VideoDecoderState {
     rgba: VideoFrame,
     /// The frame most recently returned by `present_video`.
     current: Option<RgbaFrame>,
-    /// The fully decoded audio track (if the container has one).
-    audio: Option<DecodedAudio>,
+    /// The fully decoded audio track (if the container has one), shared with
+    /// whoever plays it.
+    audio: Option<Arc<DecodedAudio>>,
     /// Set once the demuxer has hit EOF and the decoder has been flushed.
     eof: bool,
 }
@@ -262,7 +263,7 @@ pub fn open(
         scaler: None,
         rgba: VideoFrame::empty(),
         current: None,
-        audio,
+        audio: audio.map(Arc::new),
         eof: false,
     };
     Ok((spec, state))
@@ -293,10 +294,16 @@ fn decode_audio_track(
         .map_err(|error| MediaError::Unsupported {
             message: format!("{name}: no audio decoder: {error}"),
         })?;
+    // The decoder knows the stream's channel layout even when a decoded frame
+    // does not repeat it.
+    let decoder_layout = decoder.channel_layout();
 
     let mut samples: Vec<f32> = Vec::new();
     let mut spec = AudioSpec::default();
     let mut resampler: Option<resampling::Context> = None;
+    // The layout the track is converted to, known once the first frame has
+    // been decoded.
+    let mut track_layout: Option<ChannelLayout> = None;
     let mut demux_eof = false;
 
     loop {
@@ -304,13 +311,10 @@ fn decode_audio_track(
         match decoder.receive_frame(&mut frame) {
             Ok(()) => {
                 if resampler.is_none() {
-                    let layout = audio_layout(&frame);
+                    let layout = resolve_layout(frame.channel_layout(), decoder_layout, name)?;
                     let rate = frame.rate();
-                    // The reference's movie audio buffer converts to the
-                    // mixer's stereo layout
-                    // (`reference/cpp/core/movie/ffmpeg/AEFactory.cpp:150-175`);
-                    // the L2 mixer renders mono/stereo only, so a
-                    // multi-channel track is downmixed here.
+                    // The L2 mixer renders mono and stereo only, so a
+                    // track with more channels is downmixed to stereo.
                     let out_layout = if layout.channels() > 2 {
                         ChannelLayout::STEREO
                     } else {
@@ -330,11 +334,19 @@ fn decode_audio_track(
                     })?;
                     spec.sample_rate = rate;
                     spec.channels = channel_count(name, out_layout.channels())?;
+                    track_layout = Some(out_layout);
                     resampler = Some(converter);
                 }
 
-                let converted =
-                    resample_frame(resampler.as_mut().expect("resampler"), &frame, name)?;
+                let converted = match resampler.as_mut() {
+                    Some(converter) => resample_frame(converter, &frame, name)?,
+                    None => {
+                        return Err(MediaError::Decode {
+                            format: String::new(),
+                            message: format!("{name}: the audio resampler is missing"),
+                        });
+                    }
+                };
                 samples.extend_from_slice(&converted);
                 continue;
             }
@@ -379,6 +391,26 @@ fn decode_audio_track(
         }
     }
 
+    // The resampler may still hold samples of the track; flush them so the
+    // tail of the track is not dropped.
+    if let Some(converter) = resampler.as_mut()
+        && let Some(delay) = converter.delay()
+        && let Some(layout) = track_layout
+    {
+        let tail = usize::try_from(delay.output).map_err(|_| MediaError::Decode {
+            format: String::new(),
+            message: format!("{name}: the audio tail length is out of range"),
+        })?;
+        let mut output = AudioFrame::new(Sample::F32(sample::Type::Packed), tail, layout);
+        converter
+            .flush(&mut output)
+            .map_err(|error| MediaError::Decode {
+                format: String::new(),
+                message: format!("{name}: audio flush: {error}"),
+            })?;
+        samples.extend_from_slice(audio_packed_f32(&output, name)?);
+    }
+
     if samples.is_empty() {
         return Err(MediaError::Decode {
             format: String::new(),
@@ -394,15 +426,29 @@ fn decode_audio_track(
     Ok(DecodedAudio::new(spec, samples))
 }
 
-/// Returns the channel layout of a decoded frame, falling back to a default
-/// layout when the decoder did not set one.
-fn audio_layout(frame: &AudioFrame) -> ChannelLayout {
-    let layout = frame.channel_layout();
-    if layout.channels() > 0 {
-        layout
-    } else {
-        ChannelLayout::default(i32::from(frame.channels().max(1)))
+/// The channel layout a decoded audio frame is converted from.
+///
+/// The frame's own layout is authoritative. A frame that carries none is
+/// converted with the decoder's layout: the decoder knows the stream's
+/// layout from the container even when the frame does not repeat it. A
+/// track whose frame and decoder both carry no layout has an unknown
+/// channel count, and the only sound layout that could be invented for it
+/// would either drop half of a stereo track or read a mono track as
+/// interleaved stereo, so it is reported instead.
+fn resolve_layout(
+    frame_layout: ChannelLayout,
+    decoder_layout: ChannelLayout,
+    name: &str,
+) -> Result<ChannelLayout, MediaError> {
+    if frame_layout.channels() > 0 {
+        return Ok(frame_layout);
     }
+    if decoder_layout.channels() > 0 {
+        return Ok(decoder_layout);
+    }
+    Err(MediaError::InvalidData {
+        message: format!("{name}: the audio track carries no channel layout"),
+    })
 }
 
 /// Converts a decoder channel count to the `AudioSpec::channels` field.
@@ -430,16 +476,21 @@ fn resample_frame(
             format: String::new(),
             message: format!("{name}: audio resample: {error}"),
         })?;
-    Ok(audio_packed_f32(&output).to_vec())
+    Ok(audio_packed_f32(&output, name)?.to_vec())
 }
 
 /// Borrows the single packed `f32` plane of an audio frame.
-fn audio_packed_f32(frame: &AudioFrame) -> &[f32] {
+///
+/// A frame with no plane carries no samples: that is a decode failure, not
+/// an empty frame.
+fn audio_packed_f32<'a>(frame: &'a AudioFrame, name: &str) -> Result<&'a [f32], MediaError> {
     if frame.planes() == 0 {
-        &[]
-    } else {
-        frame.plane::<f32>(0)
+        return Err(MediaError::Decode {
+            format: String::new(),
+            message: format!("{name}: the converted audio frame carries no samples"),
+        });
     }
+    Ok(frame.plane::<f32>(0))
 }
 
 /// Presents the frame at (or after) `at_ms`.
@@ -484,7 +535,10 @@ pub fn present(
 }
 
 /// Returns the decoded audio track, if the container has one.
-pub fn audio(m: &Media, state: &VideoDecoderState) -> Result<DecodedAudio, MediaError> {
+///
+/// The track is shared: the caller plays the same buffer the decoder
+/// produced, so opening a movie does not copy the whole track.
+pub fn audio(m: &Media, state: &VideoDecoderState) -> Result<Arc<DecodedAudio>, MediaError> {
     let _ = m;
     state.audio.clone().ok_or_else(|| MediaError::Unsupported {
         message: format!("{}: no audio track", state.name),
@@ -647,7 +701,9 @@ fn frame_pts_ms(time_base: Rational, frame: &VideoFrame, name: &str) -> Result<u
 
 #[cfg(test)]
 mod tests {
-    use super::{Rational, VideoFrame, channel_count, frame_pts_ms};
+    use ffmpeg_next::ChannelLayout;
+
+    use super::{Rational, VideoFrame, channel_count, frame_pts_ms, resolve_layout};
 
     /// A non-negative channel count is stored as reported; the reference keeps
     /// it in a 32-bit `tTVPWaveFormat::Channels`
@@ -667,6 +723,51 @@ mod tests {
     #[test]
     fn channel_count_rejects_a_negative_count() {
         assert!(channel_count("<video>", -1).is_err());
+    }
+
+    /// A frame that carries no channel layout is converted with the decoder's
+    /// layout, so a stereo track stays stereo instead of being played as one
+    /// channel.
+    ///
+    /// The decoder's channel count is derived from the very layout that is
+    /// missing, so it cannot stand in for the layout; the decoder's own
+    /// layout is the stream's, and the reference keeps the file's channel
+    /// count (`reference/cpp/core/movie/ffmpeg/AEFactory.cpp:136-138`).
+    #[test]
+    fn an_empty_frame_layout_falls_back_to_the_decoder_layout() {
+        let layout = resolve_layout(
+            ChannelLayout::default(0),
+            ChannelLayout::default(2),
+            "<video>",
+        )
+        .expect("layout");
+        assert_eq!(layout.channels(), 2, "a stereo track must stay stereo");
+    }
+
+    /// A frame that carries its own layout is converted with it.
+    #[test]
+    fn a_frame_layout_wins_over_the_decoder_layout() {
+        let layout = resolve_layout(
+            ChannelLayout::default(1),
+            ChannelLayout::default(2),
+            "<video>",
+        )
+        .expect("layout");
+        assert_eq!(layout.channels(), 1);
+    }
+
+    /// A track whose frame and decoder both carry no layout has an unknown
+    /// channel count; it is reported instead of being played as one channel.
+    #[test]
+    fn a_track_with_no_layout_at_all_is_reported() {
+        assert!(
+            resolve_layout(
+                ChannelLayout::default(0),
+                ChannelLayout::default(0),
+                "<video>"
+            )
+            .is_err()
+        );
     }
 
     /// A frame PTS is rescaled from the stream time base to milliseconds.

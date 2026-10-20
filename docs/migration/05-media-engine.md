@@ -106,7 +106,8 @@ Keep the current `MovieDecoder` semantics as an L1-defined
 * `present_video(state, at_ms) -> RgbaFrame` with the **backward-seek
   contract** (today: seek if moving backwards more than `SEEK_TOLERANCE_MS`,
   otherwise decode forward; `ffmpeg.rs:279`);
-* `video_audio(state) -> DecodedAudio` (or a streaming variant);
+* `video_audio(state) -> Arc<DecodedAudio>` (or a streaming variant): the
+  track is shared, so a caller that plays it does not copy it;
 * dropping the state releases the codec.
 
 ### 5.2 FFmpeg backend (Linux)
@@ -117,7 +118,17 @@ Keep the current `MovieDecoder` semantics as an L1-defined
   `drain_audio` (swresample→f32) are implemented.
 * **Known inefficiency:** the audio track is decoded fully at `open`
   (`decode_audio_track`); streaming the audio through the audio decode API is
-  open work (`TODO.md` §7 `M5`).
+  open work (`TODO.md` §7 `M5`). The decoded track is handed out shared, so
+  the eager decode is paid once and not copied per caller.
+* **Known approximation:** a track with more than two channels is downmixed
+  to stereo, because the L2 mixer renders mono and stereo only. The
+  reference keeps the file's channel count
+  (`reference/cpp/core/movie/ffmpeg/AEFactory.cpp:136-138`), so a surround
+  track loses its rear channels here.
+* The track is converted to the mixer's format (interleaved `f32`) at the
+  file's own rate; the L2 mixer converts it to the output rate with a
+  windowed-sinc kernel. The reference leaves the rate conversion to the
+  audio device (`reference/cpp/core/sound/win32/WaveMixer.cpp:705-708`).
 
 ### 5.3 MediaCodec backend (Android)
 
@@ -136,8 +147,10 @@ The video frame sink exists: `present_video` returns an `RgbaFrame` and L2
 blits it into the target layer's `BitmapState` (CPU), so video is visible
 through the normal layer system; `blit_frame_to_layer_opacity` composites
 it into `layer1`/`layer2` and the mixing layer. The `video_audio` PCM sink
-returns interleaved `f32`; installing it as a mixer source remains open:
-the FFmpeg backend still decodes the whole audio track eagerly (§5.2).
+returns interleaved `f32` and is installed as a mixer source: a movie's
+track plays on the shared mixer, and the picture follows the position the
+sound has reached. The FFmpeg backend still decodes the whole audio track
+eagerly (§5.2).
 
 ## 6. Threading and the poll contract
 

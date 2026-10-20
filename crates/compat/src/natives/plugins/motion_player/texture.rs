@@ -22,7 +22,6 @@ pub(crate) struct PixelCache {
 
 impl PixelCache {
     /// Drop every decoded chunk.
-    #[cfg(test)]
     pub(crate) fn clear(&self) {
         self.entries().clear();
     }
@@ -40,22 +39,8 @@ impl PixelCache {
         if let Some(pixels) = self.entries().get(path) {
             return Some(pixels.clone());
         }
-        let bytes = match storage.read(strip_file_media(path)) {
-            Ok(bytes) => bytes,
-            Err(StorageReadError::NotFound(_)) => return None,
-            Err(error) => {
-                log::warn!("motion_player: cannot read {path}: {error}");
-                return None;
-            }
-        };
-        let palette = match storage.read(strip_file_media(palette_path)) {
-            Ok(palette) => Some(palette),
-            Err(StorageReadError::NotFound(_)) => None,
-            Err(error) => {
-                log::warn!("motion_player: cannot read {palette_path}: {error}");
-                None
-            }
-        };
+        let bytes = read_chunk(storage, path)?;
+        let palette = read_chunk(storage, palette_path);
         let pixels = match decode_pixels(&bytes, palette.as_deref(), width, height, compressed) {
             Ok(decoded) => Arc::new(decoded),
             Err(error) => {
@@ -83,6 +68,18 @@ impl std::fmt::Debug for PixelCache {
         f.debug_struct("PixelCache")
             .field("entries", &self.entries().len())
             .finish()
+    }
+}
+
+/// Read a chunk from the storage, or `None` when it is absent or unreadable.
+fn read_chunk(storage: &Storage, path: &str) -> Option<Vec<u8>> {
+    match storage.read(strip_file_media(path)) {
+        Ok(bytes) => Some(bytes),
+        Err(StorageReadError::NotFound(_)) => None,
+        Err(error) => {
+            log::warn!("motion_player: cannot read {path}: {error}");
+            None
+        }
     }
 }
 

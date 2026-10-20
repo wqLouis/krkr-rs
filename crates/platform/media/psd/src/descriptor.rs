@@ -13,33 +13,22 @@ use crate::parse::Reader;
 /// One descriptor value.
 ///
 /// Only the fields the plugin reads are kept (see the accessors below); the
-/// payload-less variants exist so the reader consumes exactly the bytes their
-/// type codes announce, keeping the descriptor cursor aligned without storing
-/// values nobody reads.
+/// values of every other type are consumed and dropped, so the reader keeps
+/// the descriptor cursor aligned without storing payloads nobody reads.
 #[derive(Debug, Clone)]
 pub(crate) enum Value {
-    /// An object pointer record (`obj `); consumed but not interpreted.
-    Reference,
+    /// A value whose payload is consumed but not interpreted.
+    Ignored,
     /// A nested descriptor (`Objc` / `GlbO`).
     Descriptor(Descriptor),
     /// A list (`VlLs`).
     List(Vec<Value>),
-    /// A double (`doub`); consumed, never read.
-    Double,
-    /// A unit float (`UntF`); consumed, never read.
-    UnitFloat,
     /// A unicode string (`TEXT`).
     Text(String),
-    /// An enumerated value (`enum`); consumed, never read.
-    Enumerated,
     /// A 32-bit integer (`long`).
     Integer(i32),
     /// A boolean (`bool`).
     Boolean(bool),
-    /// A class (`type` / `GlbC`); consumed, never read.
-    Class,
-    /// An alias string (`alis`); consumed, never read.
-    Alias,
 }
 
 impl Value {
@@ -47,16 +36,7 @@ impl Value {
     pub(crate) fn as_integer(&self) -> Option<i32> {
         match self {
             Self::Integer(value) => Some(*value),
-            Self::Reference
-            | Self::Descriptor(_)
-            | Self::List(_)
-            | Self::Double
-            | Self::UnitFloat
-            | Self::Text(_)
-            | Self::Enumerated
-            | Self::Boolean(_)
-            | Self::Class
-            | Self::Alias => None,
+            _ => None,
         }
     }
 
@@ -64,16 +44,7 @@ impl Value {
     pub(crate) fn as_descriptor(&self) -> Option<&Descriptor> {
         match self {
             Self::Descriptor(descriptor) => Some(descriptor),
-            Self::Reference
-            | Self::List(_)
-            | Self::Double
-            | Self::UnitFloat
-            | Self::Text(_)
-            | Self::Enumerated
-            | Self::Integer(_)
-            | Self::Boolean(_)
-            | Self::Class
-            | Self::Alias => None,
+            _ => None,
         }
     }
 }
@@ -154,25 +125,25 @@ fn read_item(r: &mut Reader<'_>) -> PsdResult<Value> {
         }
         b"doub" => {
             let _ = r.u64()?;
-            Ok(Value::Double)
+            Ok(Value::Ignored)
         }
         b"UntF" => {
             let _ = r.u32()?;
             let _ = r.u64()?;
-            Ok(Value::UnitFloat)
+            Ok(Value::Ignored)
         }
         b"TEXT" => Ok(Value::Text(r.unicode_string()?)),
         b"enum" => {
             let _ = read_id(r)?;
             let _ = read_id(r)?;
-            Ok(Value::Enumerated)
+            Ok(Value::Ignored)
         }
         b"long" => Ok(Value::Integer(r.i32()?)),
         b"bool" => Ok(Value::Boolean(r.u8()? != 0)),
         b"type" | b"GlbC" => {
             let _ = r.unicode_string()?;
             let _ = read_id(r)?;
-            Ok(Value::Class)
+            Ok(Value::Ignored)
         }
         b"alis" => {
             let size = r.i32()?;
@@ -180,7 +151,7 @@ fn read_item(r: &mut Reader<'_>) -> PsdResult<Value> {
                 return Err(PsdError::Invalid("negative alias size".into()));
             }
             let _ = r.take(size as usize)?;
-            Ok(Value::Alias)
+            Ok(Value::Ignored)
         }
         // `tdta` (raw data) carries no length and cannot be skipped, so it
         // aborts the descriptor.
@@ -228,7 +199,7 @@ fn read_reference(r: &mut Reader<'_>) -> PsdResult<Value> {
             }
         }
     }
-    Ok(Value::Reference)
+    Ok(Value::Ignored)
 }
 
 /// Read a descriptor: consume its unicode name and class id (cursor alignment

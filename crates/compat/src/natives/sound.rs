@@ -585,14 +585,24 @@ impl SoundState {
     /// knows nor touches it. A movie's own audio takes this path, because the
     /// reference plays it through the movie player rather than a script
     /// `SoundBuffer` (`VideoOvlImpl.cpp:882-913`).
-    pub(crate) fn add_foreign_voice(&mut self, source: Arc<SoundSource>) -> u64 {
+    ///
+    /// # Errors
+    ///
+    /// [`SoundError::InvalidSpec`] when the mixer does not hand back the
+    /// voice it just created.
+    pub(crate) fn add_foreign_voice(
+        &mut self,
+        source: Arc<SoundSource>,
+    ) -> Result<u64, SoundError> {
         let id = self.mixer.spawn_channel();
         let channel = self
             .mixer
             .channel(id)
-            .expect("spawn_channel returns a live id");
+            .ok_or_else(|| SoundError::InvalidSpec {
+                message: format!("the mixer did not return the voice it created (id {id})"),
+            })?;
         channel.play(source);
-        id
+        Ok(id)
     }
 
     /// Mutable access to a foreign voice's channel, for its gain, pan and
@@ -3161,6 +3171,22 @@ pub fn sound_render(
     result.map_err(|error| CompatError::Engine(format!("sound_render: {error}")))
 }
 
+/// Set the latency between the rendered position and the audible one, in
+/// seconds.
+///
+/// The audio device holds a queue of rendered samples, so a voice's rendered
+/// position runs ahead of the position the sound has reached. The
+/// composition root reads the queue's depth from the device and hands it
+/// here, so the mixer can report where a voice has actually reached.
+pub fn set_output_latency(ctx: &CompatCtx, seconds: f64) {
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let services = unsafe { ctx.services() };
+    services
+        .state::<SoundState>()
+        .mixer
+        .set_output_latency(seconds);
+}
+
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
@@ -3418,7 +3444,9 @@ mod tests {
         let mut state = SoundState::default();
         assert!(state.objects.is_empty(), "the mixer starts with no objects");
 
-        let id = state.add_foreign_voice(tone(44_100, 2, 0.1, None));
+        let id = state
+            .add_foreign_voice(tone(44_100, 2, 0.1, None))
+            .expect("the mixer returns the voice it created");
         assert!(
             state.objects.is_empty(),
             "a foreign voice is not a script-visible SoundBuffer object"

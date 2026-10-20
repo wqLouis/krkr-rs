@@ -67,13 +67,26 @@ single forward pass (§3).
 
 ## 3. The projection (L2 → L1)
 
-`engine::projection::project_scene(scene, texture)` (or `project_window` for
-one window) produces a fresh `RenderScene` in VM pixels:
+`engine::projection::project_scene_report(scene, texture)` (or
+`project_window_report` for one window) produces a fresh `ProjectionReport` in
+VM pixels: the `RenderScene` plus `drawn_layers`, the layer ids whose pixels the
+pass actually emitted. `project_scene`/`project_window` remain the scene-only
+wrappers.
 
 ```rust
-pub fn project_scene<F>(scene: &Scene, texture: F) -> RenderScene
+pub struct ProjectionReport {
+    pub scene: RenderScene,
+    pub drawn_layers: Vec<u32>,
+}
+
+pub fn project_scene_report<F>(scene: &Scene, texture: F) -> ProjectionReport
 where F: FnMut(u32) -> Option<Texture>;   // bitmap id → L1 texture handle
 ```
+
+`drawn_layers` comes from the emit path, never from scene order. A layer is
+reported when it pushes a node; a cached ancestor also reports the visible
+descendants whose pixels its emitted cache bitmap contains. A skipped, hidden,
+fully clipped or texture-less layer is not reported.
 
 For every layer in `window_layer_order` it builds at most one `RenderNode`:
 
@@ -205,16 +218,23 @@ L2 drops a bitmap, so bitmap→texture lifetime is explicit L2 state.
 `frame(now_ms, hooks)` set the frame clock, advance the L2 timer registry, run
 the single `GameFrame::before_render(now_ms, dt_ms)` hook, refresh the overlay,
 upload dirty bitmaps, project when `Scene::revision` changed (clearing and
-refilling the persistent arena, then re-attaching the overlay), and make one
-`render` call. The report is `FrameReport` (`frame_index`, `elapsed_ms`, the
-null counters and the upload/prune/project/render costs).
+refilling the persistent arena, then re-attaching the overlay), and then run
+`GameFrame::after_project(&drawn_layers)` with the projection's actual emit
+report. If that hook changes the scene, the engine uploads and projects again
+before the single `render` call, so the frame draws the changed state. The
+report is `FrameReport` (`frame_index`, `elapsed_ms`, the null counters, the
+upload/prune/project/render costs and the two projection passes when needed);
+the latest drawn set is also available through `Engine::drawn_layers()`.
 
 `app::Host` is a wrapper around the engine. `app::GameHost` implements the
 hook: `vm.tick` (input begin → platform events → input end), then
 `compat::run_frame_body` (drain the timer posts the engine produced, sound,
 video, async triggers, continuous handlers, idle compaction, movie/transition
-tail), then the audio drain. The mixer, video and transition pumps are the
-remaining staged work; see [07 Phase 9](07-roadmap.md).
+tail), then the audio drain. Its `after_project` hook advances the
+self-updating transitions whose destination or source subtree the projection
+reported as drawn, then recomposites script-cached layers before the engine's
+second projection. The mixer, video and non-self-updating transition pumps are
+the remaining staged work; see [07 Phase 9](07-roadmap.md).
 
 The timer contract is D27's: L2 waits and calls; L3 decides whether to arm and
 turns the fire into an `onTimer` post. `TimerState::advance` is called only by
@@ -269,7 +289,9 @@ device-pixel readback path for a GPU-composed backing uses
 
 * **L2 frame (D26)** — the frame entry point, clock, timer pump and
   projection/render ownership have landed (§6). The mixer, video and
-  transition pumps still run inside the hook, and `Engine::run` is not built.
+  non-self-updating transition pumps still run inside the hook; self-updating
+  transitions advance after the projection's draw report. `Engine::run` is not
+  built.
 * **Pixel translation (D40)** — the Fit mapping, device-space projection and
   input inverse-map have landed (§7). Device-pixel readback (the
   `vm_pixel_region` consumer) and device-resolution glyph rasterization are

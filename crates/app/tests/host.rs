@@ -271,3 +271,43 @@ fn game_host_open_installs_the_inert_clipboard() {
     drop(game);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A self-updating transition advances on the frame the projection actually
+/// draws its destination, even when no script calls `Layer.update()`.
+///
+/// The transition is started with `selfupdate: true`, so it is not on the
+/// continuous update hook; the destination is visible and the projection emits
+/// it every frame, which is the draw report that drives `BeforeCompletion`.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:6410-6422
+/// reference/cpp/core/visual/LayerIntf.cpp:7906-7908
+#[test]
+fn selfupdate_transition_advances_when_projection_draws_it() {
+    let _lock = vm_lock();
+    let (mut game, base) = open_minimal_game("selfupdate-projection");
+    game.vm()
+        .exec(
+            "var hits = 0; \
+             var w = new Window(); \
+             var a = new Layer(w, null); a.setSize(2, 2); a.setImageSize(2, 2); \
+             a.fillRect(0, 0, 2, 2, 0xff0000ff); \
+             var b = new Layer(w, null); b.setSize(2, 2); b.setImageSize(2, 2); \
+             b.fillRect(0, 0, 2, 2, 0xffff0000); b.visible = true; \
+             b.onTransitionCompleted = function(dest, src) { hits++; }; \
+             b.beginTransition('crossfade', false, a, %[time: 100, selfupdate: true]);",
+            "selfupdate-projection",
+        )
+        .expect("start self-update transition");
+
+    for _ in 0..8 {
+        game.step(16.0, &[]).expect("frame");
+    }
+    assert_eq!(
+        eval_int(game.vm(), "hits"),
+        1,
+        "the projected destination draws drove the self-update transition"
+    );
+
+    drop(game);
+    let _ = std::fs::remove_dir_all(&base);
+}

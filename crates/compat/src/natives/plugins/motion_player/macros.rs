@@ -23,6 +23,27 @@ macro_rules! mp_get_real {
     };
 }
 
+/// Generate a property getter for a member that holds a TJS array.
+///
+/// The closure returns the array's entries, or `None` when the member holds
+/// no value.
+#[macro_export]
+macro_rules! mp_get_value_array {
+    ($name:ident, $ty:ty, $f:expr) => {
+        extern "C" fn $name(
+            engine: *mut ::std::ffi::c_void,
+            instance: *mut ::std::ffi::c_void,
+            out: *mut ::tjs::Value,
+            out_error: *mut *mut ::std::ffi::c_char,
+            _objthis: *mut ::std::ffi::c_void,
+        ) -> ::std::os::raw::c_int {
+            $crate::natives::plugins::motion_player::helpers::get_value_array::<$ty>(
+                engine, instance, out, out_error, $f,
+            )
+        }
+    };
+}
+
 /// Generate a `f64` property setter.
 #[macro_export]
 macro_rules! mp_set_real {

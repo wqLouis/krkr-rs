@@ -164,7 +164,7 @@ pub(crate) fn ease_weight(ease: f64) -> f32 {
 /// A color animator that tracks four bytes plus a packed value.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ColorAnimator {
-    /// The packed `0xAARRGGBB` value.
+    /// The packed `0xAABBGGRR` value.
     pub(crate) packed: u32,
     /// The four RGBA bytes (reference `_emoteColorState.rgbaBytes`).
     pub(crate) bytes: [f32; 4],
@@ -180,16 +180,28 @@ impl Default for ColorAnimator {
 }
 
 impl ColorAnimator {
-    /// Parse a packed `0xAARRGGBB` color into the byte vector.
+    /// Parse a packed `0xAABBGGRR` color into the byte vector.
+    ///
+    /// The packed color carries the red channel in its low byte, the green
+    /// channel in the second byte, the blue channel in the third byte and the
+    /// alpha in the high byte.
     pub(crate) fn from_packed(packed: u32) -> Self {
         Self {
             packed,
             bytes: [
-                ((packed >> 16) & 0xFF) as f32 / 255.0,
-                ((packed >> 8) & 0xFF) as f32 / 255.0,
                 (packed & 0xFF) as f32 / 255.0,
+                ((packed >> 8) & 0xFF) as f32 / 255.0,
+                ((packed >> 16) & 0xFF) as f32 / 255.0,
                 ((packed >> 24) & 0xFF) as f32 / 255.0,
             ],
         }
     }
+}
+
+/// Swap the red and blue channels of a packed color.
+///
+/// The color weight is stored in the opposite channel order from the value
+/// the script reads and writes.
+pub(crate) fn swap_packed_rb(packed: u32) -> u32 {
+    (packed & 0xFF00_FF00) | ((packed >> 16) & 0xFF) | ((packed & 0xFF) << 16)
 }

@@ -361,8 +361,14 @@ namespace TJS {
                 tjs_uint64 streamlen = stream->GetSize();
                 if(streamlen >= tTJSBinarySerializer::HEADER_LENGTH) {
                     tjs_uint8 header[tTJSBinarySerializer::HEADER_LENGTH];
-                    stream->Read(header, tTJSBinarySerializer::HEADER_LENGTH);
-                    if(tTJSBinarySerializer::IsBinary(header)) {
+                    // A short read (an `oN` offset at EOF, or a stream shorter
+                    // than the header) leaves the buffer partially unwritten;
+                    // treat it as the ordinary non-binary input.
+                    if(stream->Read(header,
+                                    tTJSBinarySerializer::HEADER_LENGTH) ==
+                           static_cast<tjs_uint>(
+                               tTJSBinarySerializer::HEADER_LENGTH) &&
+                       tTJSBinarySerializer::IsBinary(header)) {
                         tTJSBinarySerializer binload(
                             (tTJSArrayObject *)objthis);
                         tTJSVariant *var = binload.Read(stream);

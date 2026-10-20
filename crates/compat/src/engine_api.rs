@@ -17,6 +17,9 @@
 //! each pointer must stay valid for as long as the binding is installed.
 
 // The logical scene: layers, bitmaps, fonts, windows, and decoded-image keys.
+// The layer geometry operations L3 drives (`internal_set_image_size`,
+// `set_layer_image_size`, `layer_size_changed`, the cache-count pair) are
+// methods on the re-exported `Scene`.
 pub(crate) use engine::{
     BitmapState, DecodedImageKey, DecodedImageMode, FontState, LayerState, Rect, Scene,
 };
@@ -63,11 +66,10 @@ pub(crate) mod layer_ops {
     pub(crate) use engine::layer_ops::{
         AffineBlit, BlitOptions, BlitSource, COPY_MAIN, COPY_MASK, GammaAdjust, RectI,
         adjust_gamma, affine_blit, blit_copy, blit_over, blit_plane, blur_bitmap_in_place,
-        clear_transition_self_image, clip_rect, convert_add_alpha_to_alpha,
-        convert_alpha_to_add_alpha, copy_9patch, do_gray_scale, ensure_transition_display,
-        ensure_transition_self_image, fill_color_hold_alpha, fill_color_on_add_alpha,
-        fill_color_on_alpha, fill_mask, flip_lr, flip_ud, gaussian_blur, intersect, intersect_rect,
-        light_contrast, operate_rect, remove_const_opacity, render_layer_subtree,
-        stretch_blit_mode, stretch_blit_plane,
+        clip_rect, convert_add_alpha_to_alpha, convert_alpha_to_add_alpha, copy_9patch,
+        do_gray_scale, ensure_transition_display, ensure_transition_self_image,
+        fill_color_hold_alpha, fill_color_on_add_alpha, fill_color_on_alpha, fill_mask, flip_lr,
+        flip_ud, gaussian_blur, intersect, intersect_rect, light_contrast, operate_rect,
+        remove_const_opacity, render_layer_subtree, stretch_blit_mode, stretch_blit_plane,
     };
 }

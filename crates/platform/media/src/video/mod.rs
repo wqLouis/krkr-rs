@@ -134,8 +134,9 @@ pub fn present_video(
 /// Returns the video's decoded audio track as interleaved `f32` PCM.
 ///
 /// The audio track is decoded when [`open_video`] opens the stream; this call
-/// returns a copy of it. When the stream has no audio track it returns a
-/// typed [`MediaError::Unsupported`].
-pub fn video_audio(m: &Media, state: &VideoDecoderState) -> Result<DecodedAudio, MediaError> {
+/// hands out the shared buffer, so a caller that plays it does not copy the
+/// whole track. When the stream has no audio track it returns a typed
+/// [`MediaError::Unsupported`].
+pub fn video_audio(m: &Media, state: &VideoDecoderState) -> Result<Arc<DecodedAudio>, MediaError> {
     backend::audio(m, state)
 }

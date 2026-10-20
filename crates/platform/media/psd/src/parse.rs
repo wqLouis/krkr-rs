@@ -362,20 +362,6 @@ pub struct LayerMask {
     pub right: i32,
     /// The colour outside the mask (0 or 255).
     pub default_color: i32,
-    /// The mask flags.
-    pub flags: i32,
-    /// The real-user-mask flags.
-    pub real_flags: i32,
-    /// The real-user-mask background byte.
-    pub real_user_mask_background: i32,
-    /// The enclosing-rectangle top edge.
-    pub enclosing_top: i32,
-    /// The enclosing-rectangle left edge.
-    pub enclosing_left: i32,
-    /// The enclosing-rectangle bottom edge.
-    pub enclosing_bottom: i32,
-    /// The enclosing-rectangle right edge.
-    pub enclosing_right: i32,
 }
 
 /// One additional layer info block.
@@ -446,8 +432,6 @@ pub struct LayerInfo {
     pub layer_id: i32,
     /// The layer kind.
     pub layer_type: LayerType,
-    /// The layer name from the extra block.
-    pub layer_name: String,
     /// The unicode layer name from the `luni` block.
     pub layer_name_unicode: String,
     /// The per-comp state recorded in the `shmd` metadata.
@@ -580,8 +564,6 @@ pub struct ColorTable {
     pub colors: Vec<[u8; 4]>,
     /// The transparent palette index, or `-1`.
     pub transparency_index: i16,
-    /// The number of valid palette entries.
-    pub valid_count: i16,
 }
 
 impl Default for ColorTable {
@@ -589,7 +571,6 @@ impl Default for ColorTable {
         Self {
             colors: vec![[0, 0, 0, 0]; 256],
             transparency_index: -1,
-            valid_count: 0,
         }
     }
 }
@@ -726,12 +707,6 @@ impl PsdFile {
             match resource.id {
                 1032 => self.load_grid_and_guide(&resource.data),
                 1050 => self.load_slice(&resource.data),
-                1046 => {
-                    // The palette count is read through the short-read
-                    // sentinels, so a short block is `-1`.
-                    let mut r = Reader::new(&resource.data);
-                    self.color_table.valid_count = r.i16_ref();
-                }
                 1047 => {
                     let mut r = Reader::new(&resource.data);
                     self.color_table.transparency_index = r.i16_ref();
@@ -743,15 +718,13 @@ impl PsdFile {
 
         // Indexed palette.
         if self.header.mode == COLOR_MODE_INDEXED && color_mode.len() == 768 {
-            for (i, &red) in color_mode[..256].iter().enumerate() {
-                self.color_table.colors[i][0] = red;
-                self.color_table.colors[i][3] = 0xff;
-            }
-            for (i, &green) in color_mode[256..512].iter().enumerate() {
-                self.color_table.colors[i][1] = green;
-            }
-            for (i, &blue) in color_mode[512..768].iter().enumerate() {
-                self.color_table.colors[i][2] = blue;
+            for index in 0..256 {
+                self.color_table.colors[index] = [
+                    color_mode[index],
+                    color_mode[index + 256],
+                    color_mode[index + 512],
+                    0xff,
+                ];
             }
             let index = self.color_table.transparency_index;
             if (0..256).contains(&index) {
@@ -760,15 +733,17 @@ impl PsdFile {
         }
 
         for layer in &mut self.layers {
-            layer.layer_name = layer.extra_data.layer_name.clone();
             layer.layer_type = LayerType::Normal;
             layer.layer_id = -1;
             layer.fill_opacity = 255;
 
-            let additionals = layer.extra_data.additional.clone();
-            for additional in &additionals {
-                apply_additional_layer(layer, additional);
+            // The additional blocks are read while the layer record is
+            // updated, so they leave the record for the duration of the walk.
+            let additional = std::mem::take(&mut layer.extra_data.additional);
+            for block in &additional {
+                apply_additional_layer(layer, block);
             }
+            layer.extra_data.additional = additional;
         }
 
         // Link each layer to its enclosing folder: walk from the topmost
@@ -972,7 +947,8 @@ fn parse_layer_and_mask(bytes: &[u8]) -> PsdResult<Vec<LayerInfo>> {
 fn parse_layer_info(bytes: &[u8]) -> PsdResult<Vec<LayerInfo>> {
     let mut r = Reader::new(bytes);
     let count = r.i16()?;
-    let _merged_alpha = count < 0;
+    // A negative count marks the merged alpha channel; the layer count is its
+    // absolute value.
     let layer_count = count.unsigned_abs() as usize;
 
     let mut layers = Vec::with_capacity(layer_count);
@@ -1023,7 +999,6 @@ fn parse_layer_info(bytes: &[u8]) -> PsdResult<Vec<LayerInfo>> {
             extra_data,
             layer_id: -1,
             layer_type: LayerType::Normal,
-            layer_name: String::new(),
             layer_name_unicode: String::new(),
             layer_comps: BTreeMap::new(),
             parent: None,
@@ -1089,9 +1064,9 @@ fn parse_layer_extra(bytes: &[u8]) -> PsdResult<LayerExtra> {
 fn parse_layer_mask(bytes: &[u8]) -> LayerMask {
     let mut mask = LayerMask::default();
     // A block shorter than the 19-byte base record leaves the
-    // zero-initialised mask; the extra fields need the full 37-byte record.
-    // Only `top`, `left`, `bottom`, `right` and `default_color` are part of
-    // the plugin surface.
+    // zero-initialised mask. Only `top`, `left`, `bottom`, `right` and
+    // `default_color` are part of the plugin surface; the bytes after them
+    // carry the mask flags and the real-user-mask record.
     if bytes.len() < 19 {
         return mask;
     }
@@ -1100,18 +1075,8 @@ fn parse_layer_mask(bytes: &[u8]) -> LayerMask {
     mask.bottom = i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
     mask.right = i32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
     mask.default_color = i32::from(bytes[16]);
-    mask.flags = i32::from(bytes[17]);
-    // Byte 18 (`kind`) is parsed and discarded.
     mask.width = mask.right - mask.left;
     mask.height = mask.bottom - mask.top;
-    if bytes.len() >= 37 {
-        mask.real_flags = i32::from(bytes[19]);
-        mask.real_user_mask_background = i32::from(bytes[20]);
-        mask.enclosing_top = i32::from_be_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
-        mask.enclosing_left = i32::from_be_bytes([bytes[25], bytes[26], bytes[27], bytes[28]]);
-        mask.enclosing_bottom = i32::from_be_bytes([bytes[29], bytes[30], bytes[31], bytes[32]]);
-        mask.enclosing_right = i32::from_be_bytes([bytes[33], bytes[34], bytes[35], bytes[36]]);
-    }
     mask
 }
 

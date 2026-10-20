@@ -77,14 +77,7 @@ impl MotionStore {
     /// Remove a snapshot by id (reference `detail::unregisterModuleSnapshot`,
     /// `RuntimeSupport.cpp:1575-1582`). A player that already loaded the
     /// snapshot keeps its own `Arc`, so an in-flight motion is unaffected.
-    pub(crate) fn remove(&mut self, id: u64) -> Option<Arc<MotionSnapshot>> {
-        self.modules.remove(&id);
-        self.paths.remove(&id);
-        self.snapshots.remove(&id)
-    }
-
-    /// Drop a snapshot whose module object could not be built.
-    pub(crate) fn discard(&mut self, id: u64) {
+    pub(crate) fn remove(&mut self, id: u64) {
         self.modules.remove(&id);
         self.paths.remove(&id);
         self.snapshots.remove(&id);
@@ -315,14 +308,14 @@ pub(crate) fn read_motion_module(
         store.get(id)
     };
     let Some(snapshot) = registered else {
-        services.state::<MotionStore>().discard(id);
+        services.state::<MotionStore>().remove(id);
         return Err("motionplayer: snapshot registration failed".into());
     };
     // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `read_motion_module`.
     let module = match module_object(ctx, id, path, Some(snapshot.as_ref())) {
         Ok(module) => module,
         Err(error) => {
-            services.state::<MotionStore>().discard(id);
+            services.state::<MotionStore>().remove(id);
             return Err(error);
         }
     };
@@ -330,7 +323,7 @@ pub(crate) fn read_motion_module(
     let registered = match unsafe { ctx.engine() }.duplicate_retained(module.raw_id()) {
         Ok(registered) => registered,
         Err(error) => {
-            services.state::<MotionStore>().discard(id);
+            services.state::<MotionStore>().remove(id);
             return Err(error.to_string());
         }
     };
@@ -599,7 +592,7 @@ fn unregister_snapshot(res: &crate::natives::system::EngineBinding, module_raw: 
     };
     let ctx = res.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let _ = unsafe { ctx.services() }
+    unsafe { ctx.services() }
         .state::<MotionStore>()
         .remove(snapshot_id as u64);
 }

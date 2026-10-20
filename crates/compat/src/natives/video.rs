@@ -90,10 +90,11 @@ pub trait VideoSource {
     /// The decoded audio track for `path`.
     ///
     /// `Ok(None)` reports that the stream has no audio track; `Err` is a
-    /// decode failure (surfaced as a TJS error, never silence). The default
-    /// reports no audio, so a source that only serves video compiles
-    /// unchanged.
-    fn audio(&mut self, _path: &str) -> Result<Option<DecodedAudio>, MediaError> {
+    /// decode failure (surfaced as a TJS error, never silence). The track is
+    /// shared, so a source that decodes it once hands the same buffer to
+    /// every caller. The default reports no audio, so a source that only
+    /// serves video compiles unchanged.
+    fn audio(&mut self, _path: &str) -> Result<Option<Arc<DecodedAudio>>, MediaError> {
         Ok(None)
     }
 }
@@ -111,7 +112,7 @@ pub(crate) fn decoded_audio(
     source: &mut dyn VideoSource,
     path: &str,
     audio_streams: u32,
-) -> Result<Option<DecodedAudio>, MediaError> {
+) -> Result<Option<Arc<DecodedAudio>>, MediaError> {
     if audio_streams == 0 {
         return Ok(None);
     }
@@ -233,15 +234,24 @@ impl VideoSlot {
     }
 
     /// Sync the mixer voice with the overlay's current playback state.
-    fn sync_audio(&self, services: &CompatServices) {
+    fn sync_audio(&self, services: &CompatServices, resync: Resync) {
         if let Some(audio) = &self.movie_audio {
             audio.sync(
                 services,
                 &self.overlay,
                 SoundState::script_volume_to_gain(self.audio_volume),
                 SoundState::script_pan_to_balance(self.audio_balance),
+                resync,
             );
         }
+    }
+
+    /// Put the picture on the sound's position.
+    fn follow_audio(&mut self, services: &CompatServices) {
+        let Some(audio) = self.movie_audio.as_mut() else {
+            return;
+        };
+        audio.follow_picture(services, &mut self.overlay);
     }
 
     /// Drop the mixer voice, if any.
@@ -261,22 +271,60 @@ impl VideoSlot {
 /// transport. A caller with script volume/pan members passes their normalized
 /// values to [`Self::sync`]; a caller with none passes the device defaults
 /// (unity gain, centre pan), which is what `layerExMovie` uses.
+///
+/// # The voice's clock
+///
+/// The voice keeps the mixer's own clock: the mixer advances it by the frames
+/// the audio device actually rendered, so the sound it plays is continuous.
+/// The picture never overwrites that clock frame by frame — placing the voice
+/// at the picture's position on every frame cuts the waveform at every frame
+/// — so the voice is put back onto the picture's position only on an explicit
+/// transport command or when the two clocks have really diverged.
 pub(crate) struct MovieAudio {
     source: Arc<SoundSource>,
     channel: u64,
+    /// The position the voice reached at the last poll, so a sound that did
+    /// not move can be told from one that did.
+    last_played_ms: Option<f64>,
 }
+
+/// When a movie's mixer voice is put back onto the picture's position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Resync {
+    /// Reposition the voice now: a transport command (open, play, pause,
+    /// stop, rewind, seek, prepare) or a loop restart.
+    Force,
+    /// Reposition the voice only when it has drifted further than
+    /// [`MOVIE_DRIFT_SECS`] from the picture's position.
+    OnDrift,
+}
+
+/// The most the mixer voice may drift from the picture's position before the
+/// per-frame poll corrects it, in seconds.
+///
+/// The drift is the difference between the position the audio device has
+/// rendered and the picture's position. The device's pre-fill keeps the
+/// rendered position ahead of the audible one by a fixed amount, so the
+/// threshold sits well above it: a threshold the pre-fill could reach would
+/// correct the voice on every frame, which is the cut this policy exists to
+/// avoid.
+const MOVIE_DRIFT_SECS: f64 = 0.25;
 
 impl MovieAudio {
     /// Wrap `decoded` in an L2 [`SoundSource`] and register it on the shared
     /// mixer as a foreign voice (the track is not a script `SoundBuffer`).
     pub(crate) fn attach(
         services: &CompatServices,
-        decoded: DecodedAudio,
+        decoded: Arc<DecodedAudio>,
     ) -> Result<Self, SoundError> {
-        let source = Arc::new(SoundSource::new(Arc::new(decoded))?);
+        let source = Arc::new(SoundSource::new(decoded)?);
         let mut sound = services.state::<SoundState>();
-        let channel = sound.add_foreign_voice(source.clone());
-        Ok(Self { source, channel })
+        let channel = sound.add_foreign_voice(source.clone())?;
+        Ok(Self {
+            source,
+            channel,
+            last_played_ms: None,
+        })
     }
 
     /// Remove the mixer voice.
@@ -295,13 +343,18 @@ impl MovieAudio {
         }
     }
 
-    /// Push the volume/pan and the overlay's playback state and position.
+    /// Push the volume/pan and the overlay's playback state, and place the
+    /// voice on the overlay's position as `resync` asks.
+    ///
+    /// A voice that ran past the end of its track is not started again by an
+    /// ordinary frame: only a transport command or a loop restart does that.
     pub(crate) fn sync(
         &self,
         services: &CompatServices,
         overlay: &VideoOverlay,
         volume: f32,
         pan: f32,
+        resync: Resync,
     ) {
         let mut sound = services.state::<SoundState>();
         let Some(channel) = sound.foreign_voice_mut(self.channel) else {
@@ -309,18 +362,81 @@ impl MovieAudio {
         };
         channel.set_volume(volume);
         channel.set_pan(pan);
-        channel.looping = overlay.looping;
-        if overlay.is_playing() {
-            if channel.is_paused() {
-                channel.resume();
-            }
-            if !channel.is_playing() {
-                channel.play(self.source.clone());
-            }
-            channel.set_position(overlay.position_ms() as f64 / 1000.0);
-        } else {
+        // The voice does not wrap on its own: the picture's loop restarts
+        // it, so the sound and the picture turn over at the same frame. A
+        // voice that wrapped at the end of its own track would restart the
+        // sound before the picture reached its loop point.
+        channel.looping = false;
+        if !overlay.is_playing() {
             channel.pause();
+            return;
         }
+        if channel.is_paused() {
+            channel.resume();
+        }
+        if !channel.is_playing() && !channel.is_done() {
+            // The voice has no source yet.
+            channel.play(self.source.clone());
+        }
+        let target = overlay.position_exact_ms() / 1000.0;
+        if channel.is_done() {
+            // The track ran to its end. Only an explicit command starts it
+            // again; an ordinary frame leaves the finished track alone.
+            if resync == Resync::Force {
+                channel.play(self.source.clone());
+                channel.set_position(target);
+            }
+            return;
+        }
+        let drift = channel.position_seconds() - target;
+        let reposition = match resync {
+            Resync::Force => true,
+            Resync::OnDrift => drift.abs() > MOVIE_DRIFT_SECS,
+        };
+        if reposition {
+            channel.set_position(target);
+        }
+    }
+
+    /// The position the voice has reached at the listener, in milliseconds,
+    /// when the voice is playing.
+    fn played_position_ms(&self, services: &CompatServices) -> Option<f64> {
+        let mut sound = services.state::<SoundState>();
+        let channel = sound.foreign_voice_mut(self.channel)?;
+        if !channel.is_playing() {
+            return None;
+        }
+        Some(channel.played_position_seconds() * 1000.0)
+    }
+
+    /// Put the picture on the sound's position.
+    ///
+    /// The picture is scheduled against the audio device's clock: the
+    /// player's clock is the audio clock plus the sound's delay, so the
+    /// picture follows the sound instead of the sound following the picture.
+    ///
+    /// A sound that did not move — no device pumping it, a paused voice —
+    /// leaves the picture on its own clock, and a loop restart leaves the
+    /// sound on the picture's.
+    pub(crate) fn follow_picture(&mut self, services: &CompatServices, overlay: &mut VideoOverlay) {
+        let Some(played_ms) = self.played_position_ms(services) else {
+            return;
+        };
+        let previous = self.last_played_ms.replace(played_ms);
+        // The first poll only records where the sound is.
+        let Some(previous) = previous else {
+            return;
+        };
+        if played_ms == previous {
+            // The sound did not move: the picture keeps its own clock.
+            return;
+        }
+        if overlay.restarted_at_loop() {
+            // A loop restart puts the sound back onto the picture's
+            // position instead.
+            return;
+        }
+        overlay.sync_clock(played_ms);
     }
 }
 
@@ -944,7 +1060,7 @@ extern "C" fn vo_open(
         match MovieAudio::attach(services, decoded) {
             Ok(movie_audio) => {
                 slot.movie_audio = Some(movie_audio);
-                slot.sync_audio(services);
+                slot.sync_audio(services, Resync::Force);
             }
             Err(error) => {
                 slot.overlay.close();
@@ -1022,7 +1138,7 @@ extern "C" fn vo_play(
             slot.overlay
                 .play()
                 .map_err(|error| format!("VideoOverlay.play: {error}"))?;
-            slot.sync_audio(services);
+            slot.sync_audio(services, Resync::Force);
         }
         Ok(())
     }) else {
@@ -1052,7 +1168,7 @@ extern "C" fn vo_pause(
             slot.overlay
                 .pause()
                 .map_err(|error| format!("VideoOverlay.pause: {error}"))?;
-            slot.sync_audio(services);
+            slot.sync_audio(services, Resync::Force);
         }
         Ok(())
     }) else {
@@ -1082,7 +1198,7 @@ extern "C" fn vo_stop(
             slot.overlay
                 .stop()
                 .map_err(|error| format!("VideoOverlay.stop: {error}"))?;
-            slot.sync_audio(services);
+            slot.sync_audio(services, Resync::Force);
         }
         Ok(())
     }) else {
@@ -1112,7 +1228,7 @@ extern "C" fn vo_rewind(
     let services = services(&ctx);
     let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
         slot.overlay.rewind();
-        slot.sync_audio(services);
+        slot.sync_audio(services, Resync::Force);
         Ok(())
     }) else {
         return 1;
@@ -1144,7 +1260,7 @@ extern "C" fn vo_prepare(
             slot.overlay
                 .prepare()
                 .map_err(|error| format!("VideoOverlay.prepare: {error}"))?;
-            slot.sync_audio(services);
+            slot.sync_audio(services, Resync::Force);
         }
         Ok(())
     }) else {
@@ -1738,6 +1854,9 @@ extern "C" fn vo_position_set(
         if slot.overlay.is_open() {
             // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
             slot.overlay.seek_ms(value_as_i64(unsafe { &*value }));
+            // The sound follows the picture to the new position.
+            let services = services(&_ctx);
+            slot.sync_audio(services, Resync::Force);
         }
         0
     })
@@ -1774,6 +1893,9 @@ extern "C" fn vo_frame_set(
         if slot.overlay.is_open() {
             // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
             slot.overlay.seek_frame(value_as_i64(unsafe { &*value }));
+            // The sound follows the picture to the new position.
+            let services = services(&_ctx);
+            slot.sync_audio(services, Resync::Force);
         }
         0
     })
@@ -2455,7 +2577,8 @@ const MODE_MIXER: i64 = 2;
 /// the queued events.
 ///
 /// The frame body passes its own per-frame `dt`; the advance never reads wall
-/// time.
+/// time. The host bounds the step by the same cap its audio pump puts on one
+/// frame's playback, so the picture and the sound fall behind together.
 pub fn video_advance(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
     // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `video_advance`.
     let host = unsafe { ctx.engine() };
@@ -2474,8 +2597,9 @@ pub fn video_advance(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
             }
             present(&mut source, slot);
             slot.overlay.advance(dt_ms);
+            slot.follow_audio(services);
             present(&mut source, slot);
-            slot.sync_audio(services);
+            slot.sync_audio(services, frame_resync(&slot.overlay));
             composite_overlay(ctx, slot);
             let events = slot.overlay.poll();
             if !events.is_empty() {
@@ -2490,6 +2614,18 @@ pub fn video_advance(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
         dispatch_events(host, objthis, &events);
     }
     Ok(())
+}
+
+/// The resync policy for one frame of a movie.
+///
+/// A loop restart puts the voice back onto the picture's position; an
+/// ordinary frame only corrects a voice that has really drifted away.
+pub(crate) fn frame_resync(overlay: &VideoOverlay) -> Resync {
+    if overlay.restarted_at_loop() {
+        Resync::Force
+    } else {
+        Resync::OnDrift
+    }
 }
 
 /// Present the host frame at the overlay's current position, if any.

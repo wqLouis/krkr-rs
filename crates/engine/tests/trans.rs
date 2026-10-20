@@ -58,9 +58,10 @@ fn cross_fade_midpoint_blends_all_channels() {
     let mut dst = bitmap(1, 1, [0, 0, 0, 0]);
 
     let mut trans = Trans::cross_fade(100.0).unwrap();
+    // 50/100 truncates to phase 127 (reference/cpp/core/visual/TransIntf.cpp:536).
     trans.step(50.0);
     trans.apply(&mut dst, &src1, &src2, region(1, 1)).unwrap();
-    assert_eq!(dst.rgba, [100, 50, 25, 255]);
+    assert_eq!(dst.rgba, [99, 49, 24, 255]);
 }
 
 #[test]
@@ -68,7 +69,7 @@ fn step_progress_is_monotonic_and_clamped() {
     let mut trans = Trans::cross_fade(100.0).unwrap();
     let first = trans.step(25.0);
     assert!((first.progress - 0.25).abs() < 1e-6);
-    assert_eq!(first.phase, 64);
+    assert_eq!(first.phase, 63);
     assert!(!first.completed);
 
     assert!((trans.step(25.0).progress - 0.5).abs() < 1e-6);
@@ -80,6 +81,23 @@ fn step_progress_is_monotonic_and_clamped() {
     assert_eq!(trans.elapsed_ms(), 100.0);
 }
 
+/// `StartProcess` computes `(tick - StartTick) * PhaseMax / Time` with
+/// integer truncation, so 50 ms of a 100 ms transition is phase 127 and the
+/// completed 100 ms is phase 255.
+///
+/// reference/cpp/core/visual/TransIntf.cpp:528-538
+#[test]
+fn phase_uses_reference_truncating_division() {
+    let mut trans = Trans::cross_fade(100.0).unwrap();
+    trans.step(50.0);
+    assert_eq!(trans.phase(), 127, "50/100 truncates to 127");
+    assert!(!trans.is_complete());
+
+    trans.step(50.0);
+    assert_eq!(trans.phase(), PHASE_MAX, "100/100 is the completed phase");
+    assert!(trans.is_complete());
+}
+
 #[test]
 fn mask_uses_the_rule_image_as_a_hard_threshold() {
     // Left rule pixel switches early, right stays.
@@ -89,7 +107,7 @@ fn mask_uses_the_rule_image_as_a_hard_threshold() {
     let mut dst = bitmap(2, 1, [0, 0, 0, 0]);
 
     let mut trans = Trans::mask(100.0, rule).unwrap();
-    trans.step(50.0); // phase 128
+    trans.step(50.0); // phase 127
     trans.apply(&mut dst, &src1, &src2, region(2, 1)).unwrap();
     // rule 0 < phase -> source 2 (the `>>8` blend gives 254, not 255).
     assert_eq!(&dst.rgba[0..4], &[254, 254, 254, 255]);

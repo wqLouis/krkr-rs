@@ -89,7 +89,7 @@ mod stub {
     }
 
     /// Returns the decoded audio track. Host stub: always fails.
-    pub fn audio(m: &Media, state: &VideoDecoderState) -> Result<DecodedAudio, MediaError> {
+    pub fn audio(m: &Media, state: &VideoDecoderState) -> Result<Arc<DecodedAudio>, MediaError> {
         let _ = (m, state);
         Err(host_stub_error("video audio (mediacodec)"))
     }
@@ -415,8 +415,8 @@ mod android {
         video_index: Option<usize>,
         /// Demuxer track index of the audio track.
         audio_index: Option<usize>,
-        /// The fully decoded audio track (if the container has one).
-        audio_pcm: Option<DecodedAudio>,
+        /// The fully decoded audio track, shared with whoever plays it.
+        audio_pcm: Option<Arc<DecodedAudio>>,
         /// The frame most recently returned by [`present`].
         current: Option<RgbaFrame>,
     }
@@ -533,7 +533,7 @@ mod android {
                     None
                 },
             };
-            self.audio_pcm = Some(DecodedAudio::new(spec, samples));
+            self.audio_pcm = Some(Arc::new(DecodedAudio::new(spec, samples)));
             Ok(())
         }
     }
@@ -667,7 +667,7 @@ mod android {
     }
 
     /// Returns the decoded audio track, if the container has one.
-    pub fn audio(m: &Media, state: &VideoDecoderState) -> Result<DecodedAudio, MediaError> {
+    pub fn audio(m: &Media, state: &VideoDecoderState) -> Result<Arc<DecodedAudio>, MediaError> {
         let _ = m;
         state
             .audio_pcm

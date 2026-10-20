@@ -494,7 +494,7 @@ fn transitions_begin_and_stop() {
         "var w = new Window(); \
          var a = new Layer(w, null); a.setImageSize(2, 2); \
          var b = new Layer(w, null); b.setImageSize(2, 2); \
-         b.beginTransition('crossfade', true, a, null); \
+         b.beginTransition('crossfade', true, a, %[time: 300]); \
          b.stopTransition();",
     );
     assert!(env.eval("b.stopTransition()").is_ok());
@@ -544,7 +544,7 @@ fn unsupported_transitions_and_media_helpers_raise_typed_errors() {
         "(function(){ var w = new Window(); var a = new Layer(w,null); a.setImageSize(2,2); \
           var b = new Layer(w,null); b.setImageSize(2,2); b.beginTransition('nope', true, a, null); })()",
         "(function(){ var w = new Window(); var a = new Layer(w,null); a.setImageSize(2,2); \
-          var b = new Layer(w,null); b.setImageSize(2,2); b.beginTransition('universal', true, a, null); })()",
+          var b = new Layer(w,null); b.setImageSize(2,2); b.beginTransition('universal', true, a, %[time: 300]); })()",
         // The extrans providers are implemented; their option validation is
         // the reference's own (`StartTransition`), surfaced as a typed error.
         "(function(){ var w = new Window(); var a = new Layer(w,null); a.setImageSize(2,2); \

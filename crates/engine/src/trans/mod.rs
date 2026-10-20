@@ -524,16 +524,40 @@ impl Trans {
         if dt_ms.is_finite() && dt_ms > 0.0 {
             self.elapsed_ms += dt_ms;
         }
+        self.settle();
+        self.view()
+    }
+
+    /// Set the elapsed time from an external tick source and return the new
+    /// [`TransStep`].
+    ///
+    /// Unlike [`Trans::step`], which adds a frame delta, this replaces the
+    /// elapsed time with `elapsed_ms`, so a caller-supplied tick can run the
+    /// transition forwards or backwards. A non-finite or negative `elapsed_ms`
+    /// leaves the state unchanged; a completed transition stays complete.
+    pub fn seek_ms(&mut self, elapsed_ms: f64) -> TransStep {
+        if self.completed {
+            return self.view();
+        }
+        if elapsed_ms.is_finite() && elapsed_ms >= 0.0 {
+            self.elapsed_ms = elapsed_ms;
+            self.settle();
+        }
+        self.view()
+    }
+
+    fn settle(&mut self) {
         if self.elapsed_ms >= self.duration_ms {
             self.elapsed_ms = self.duration_ms;
             self.phase = self.phase_max;
             self.completed = true;
         } else {
-            let progress = self.elapsed_ms / self.duration_ms;
-            self.phase = (progress * f64::from(self.phase_max)).round() as i32;
+            // The phase is `elapsed * PhaseMax / duration` with integer
+            // truncation, not rounding.
+            let phase = self.elapsed_ms * f64::from(self.phase_max) / self.duration_ms;
+            self.phase = phase.trunc() as i32;
             self.phase = self.phase.clamp(0, self.phase_max);
         }
-        self.view()
     }
 
     /// Force the transition to completion.

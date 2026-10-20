@@ -8,7 +8,8 @@
 //! [`advance_transitions`] is the frame step the frame body calls (it
 //! advances the machine by the frame's elapsed milliseconds, stops
 //! transitions the reference stops per tick, and fires
-//! `onTransitionCompleted`).
+//! `onTransitionCompleted`). [`advance_self_updating_transitions`] is the
+//! post-projection step for transitions whose destination was drawn.
 //!
 //! `onTransitionCompleted` itself is a no-op assignable handler (see
 //! [`super::events`]); [`advance_transitions`] / [`end_transition`]
@@ -17,11 +18,12 @@
 //! at the destination's owner (`LayerIntf.cpp:8000-8015`).
 #![allow(unsafe_code)]
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use crate::engine_api::Scene;
 use crate::engine_api::{RuleMask, ScrollFrom, ScrollStay, Trans, TransKind};
-use tjs::{NativeInstanceMethodDef, TjsValue, VAL_OBJECT, VAL_VOID, Value};
+use tjs::{DetachedValue, NativeInstanceMethodDef, TjsValue, VAL_OBJECT, VAL_VOID, Value};
 
 use super::super::bitmap::{decode_image, read_image_from_storage};
 use super::super::common::{
@@ -30,7 +32,22 @@ use super::super::common::{
 };
 use super::{LayerExtras, LayerInst, LayerTransition, bound};
 use crate::native_util::{args, report_error, services, set_void, value_as_string};
-use crate::natives::system::value_as_bool;
+use crate::natives::system::{tjs_string_to_real, value_as_bool};
+use crate::natives::tjsnum::tjs_string_to_integer;
+
+/// Per-transition state that is not part of the parent's `LayerTransition`:
+/// the script-driven update mode, the retained tick callback and the time
+/// accumulated while a self-updating transition waits for its next update.
+#[derive(Default)]
+struct TransitionRuntimeState {
+    entries: HashMap<u32, TransitionRuntime>,
+}
+
+struct TransitionRuntime {
+    self_update: bool,
+    callback: Option<DetachedValue>,
+    pending_ms: f64,
+}
 
 /// `beginTransition(name [, withchildren [, transwith [, options]]])`.
 ///
@@ -44,13 +61,13 @@ use crate::natives::system::value_as_bool;
 ///    (`TVPCurrentTransitionMustBeStopping`, `LayerIntf.cpp:7776-7778`);
 /// 3. a source that is itself transitioning *from this* layer is rejected
 ///    (`TVPTransitionMutualSource`, `LayerIntf.cpp:7779-7781`);
-/// 4. without children both endpoints must have a main image
-///    (`TVPTransitionSourceAndDestinationMustHaveImage`,
-///    `LayerIntf.cpp:7860-7868`), and the two sources' sizes must match
-///    (`LayerIntf.cpp:7837-7850`, checked by the provider);
-/// 5. the handler provider parses and validates its options while the
-///    script is inside the call (`wave.cpp:327-351`,
-///    `ripple.cpp:1574-1627`, `TransIntf.cpp:512-516`).
+/// 4. the provider checks the source sizes and then parses and validates its
+///    options while the script is inside the call; `time` is required and a
+///    missing or non-numeric value raises;
+/// 5. without children both endpoints must have a main image.
+///
+/// The options object's `selfupdate` and `callback` members are captured
+/// before the transition is registered.
 ///
 /// `withchildren` (default `true`, `LayerIntf.cpp:9819-9821`) selects the
 /// whole layer tree: caching is enabled for both layers
@@ -149,20 +166,8 @@ extern "C" fn layer_begin_transition(
                 Some((source_layer.rect.w, source_layer.rect.h)),
             )
         } else {
-            (
-                main_image_size(scene, dest_layer),
-                main_image_size(scene, source_layer),
-            )
+            (main_image_size(scene, id), main_image_size(scene, source))
         };
-        // Without children both endpoints must have a main image
-        // (`TVPTransitionSourceAndDestinationMustHaveImage`,
-        // `LayerIntf.cpp:7860-7868`); with children the subtree is cached
-        // instead.
-        if !with_children && (dest_layer.bitmap.is_none() || source_layer.bitmap.is_none()) {
-            return Err(
-                "Layer.beginTransition: Transition source and destination must have image".into(),
-            );
-        }
         // The provider's up-front `src1`/`src2` size check runs before it
         // parses options (`wave.cpp:319-320`, `TransIntf.cpp:493-497`).
         if let (Some(dest_size), Some(source_size)) = (dest_size, source_size)
@@ -174,8 +179,17 @@ extern "C" fn layer_begin_transition(
                 dest_size.0, dest_size.1, source_size.0, source_size.1
             ));
         }
-        let duration = options_duration(host.engine(), a.get(3)).unwrap_or(300.0);
-        let trans = build_transition(&ctx, host.engine(), &name, duration, a.get(3), dest_size)?;
+        let has_images = dest_layer.bitmap.is_some() && source_layer.bitmap.is_some();
+        let trans = build_transition(&ctx, host.engine(), &name, a.get(3), dest_size)?;
+        // Without children both endpoints must have a main image. The
+        // provider parses its options first, so a missing `time` wins over
+        // this check.
+        if !with_children && !has_images {
+            return Err(
+                "Layer.beginTransition: Transition source and destination must have image".into(),
+            );
+        }
+        let (self_update, callback) = transition_options(host.engine(), a.get(3))?;
         // Caching is enabled for both layers while a whole-subtree
         // transition runs (`LayerIntf.cpp:7869-7876`); the frame step
         // renders each subtree into its cache. Without children the frame
@@ -194,6 +208,16 @@ extern "C" fn layer_begin_transition(
                 trans,
                 source,
                 with_children,
+            },
+        );
+        // SAFETY: see above.
+        let mut runtime = unsafe { ctx.services() }.state::<TransitionRuntimeState>();
+        runtime.entries.insert(
+            id,
+            TransitionRuntime {
+                self_update,
+                callback,
+                pending_ms: 0.0,
             },
         );
         Ok(())
@@ -265,11 +289,16 @@ extern "C" fn layer_stop_transition(
 }
 
 /// A layer's main-image size in pixels, or `None` when it has no image.
-fn main_image_size(scene: &Scene, layer: &crate::engine_api::LayerState) -> Option<(u32, u32)> {
-    layer
-        .bitmap
-        .and_then(|bitmap| scene.bitmap(bitmap))
-        .map(|bitmap| (bitmap.width, bitmap.height))
+fn main_image_size(scene: &Scene, id: u32) -> Option<(u32, u32)> {
+    scene
+        .layer(id)
+        .and_then(|layer| layer.bitmap)
+        .and_then(|bitmap| bitmap_size(scene, bitmap))
+}
+
+/// The size of the bitmap `id` in pixels.
+fn bitmap_size(scene: &Scene, id: u32) -> Option<(u32, u32)> {
+    scene.bitmap(id).map(|bitmap| (bitmap.width, bitmap.height))
 }
 
 /// Build the L2 transition for a script name.
@@ -301,87 +330,106 @@ fn build_transition(
     ctx: &crate::CompatCtx,
     host: &tjs::Tjs2Engine,
     name: &str,
-    duration: f64,
     options: Option<&Value>,
     dest_size: Option<(u32, u32)>,
 ) -> Result<Trans, String> {
+    let time = || options_duration(host, options);
     match name {
         // `""` is the KAG default method; `TVPFindTransHandlerProvider`
         // misses the empty key and falls back to `crossfade`
         // (`reference/cpp/core/visual/TransIntf.cpp:331-341`).
-        "crossfade" | "fade" | "" => Trans::cross_fade(duration).map_err(|error| error.to_string()),
+        "crossfade" | "fade" | "" => Trans::cross_fade(time()?).map_err(|error| error.to_string()),
         "scroll" | "slide" | "push" => {
+            let duration = time()?;
             let from = scroll_from(host, options)?;
             let stay = scroll_stay(host, options)?;
             Trans::scroll(duration, from, stay).map_err(|error| error.to_string())
         }
         "universal" => {
-            // `tTVPUniversalTransHandlerProvider`: `vague` (default 64) and a
-            // required `rule` image (`TransIntf.cpp:806-817`).
-            let vague = option_int(host, options, &["vague"]).unwrap_or(64);
+            // The universal provider reads `time` first, then `vague`
+            // (default 64) and a required `rule` image.
+            let duration = time()?;
+            let vague = option_int(host, options, &["vague"])?.unwrap_or(64);
             let rule = rule_mask(ctx, host, options)?;
             Trans::universal(duration, vague, rule).map_err(|error| error.to_string())
         }
         "mask" => {
             // The reference's `universal` with a hard threshold.
+            let duration = time()?;
             let rule = rule_mask(ctx, host, options)?;
             Trans::mask(duration, rule).map_err(|error| error.to_string())
         }
-        "wave" => Trans::new(
-            TransKind::Wave {
-                max_height: option_int(host, options, &["maxh"]).unwrap_or(50),
-                max_omega: option_float(host, options, &["maxomega"]).unwrap_or(0.2),
-                background1: option_color(host, options, &["bgcolor1"]).unwrap_or(0),
-                background2: option_color(host, options, &["bgcolor2"]).unwrap_or(0),
-                wave_type: option_int(host, options, &["wavetype"]).unwrap_or(0),
-            },
-            duration,
-        )
-        .map_err(|error| error.to_string()),
-        "mosaic" => Trans::new(
-            TransKind::Mosaic {
-                max_size: option_int(host, options, &["maxsize"]).unwrap_or(30),
-            },
-            duration,
-        )
-        .map_err(|error| error.to_string()),
-        "turn" => Trans::new(
-            TransKind::Turn {
-                background: option_color(host, options, &["bgcolor"]).unwrap_or(0),
-            },
-            duration,
-        )
-        .map_err(|error| error.to_string()),
-        "rotatezoom" => Trans::new(
-            TransKind::RotateZoom {
-                factor: option_float(host, options, &["factor"]).unwrap_or(1.0),
-                accel: option_float(host, options, &["accel"]).unwrap_or(0.0),
-                twist: option_float(host, options, &["twist"]).unwrap_or(2.0),
-                twist_accel: option_float(host, options, &["twistaccel"]).unwrap_or(-2.0),
-                center: rotation_center(host, options, dest_size)?,
-            },
-            duration,
-        )
-        .map_err(|error| error.to_string()),
-        "rotatevanish" => Trans::new(
-            TransKind::RotateVanish {
-                accel: option_float(host, options, &["accel"]).unwrap_or(2.0),
-                twist: option_float(host, options, &["twist"]).unwrap_or(2.0),
-                twist_accel: option_float(host, options, &["twistaccel"]).unwrap_or(2.0),
-                center: rotation_center(host, options, dest_size)?,
-            },
-            duration,
-        )
-        .map_err(|error| error.to_string()),
+        "wave" => {
+            let duration = time()?;
+            Trans::new(
+                TransKind::Wave {
+                    max_height: option_int(host, options, &["maxh"])?.unwrap_or(50),
+                    max_omega: option_float(host, options, &["maxomega"])?.unwrap_or(0.2),
+                    background1: option_color(host, options, &["bgcolor1"])?.unwrap_or(0),
+                    background2: option_color(host, options, &["bgcolor2"])?.unwrap_or(0),
+                    wave_type: option_int(host, options, &["wavetype"])?.unwrap_or(0),
+                },
+                duration,
+            )
+            .map_err(|error| error.to_string())
+        }
+        "mosaic" => {
+            let duration = time()?;
+            Trans::new(
+                TransKind::Mosaic {
+                    max_size: option_int(host, options, &["maxsize"])?.unwrap_or(30),
+                },
+                duration,
+            )
+            .map_err(|error| error.to_string())
+        }
+        "turn" => {
+            let duration = time()?;
+            Trans::new(
+                TransKind::Turn {
+                    background: option_color(host, options, &["bgcolor"])?.unwrap_or(0),
+                },
+                duration,
+            )
+            .map_err(|error| error.to_string())
+        }
+        "rotatezoom" => {
+            let duration = time()?;
+            Trans::new(
+                TransKind::RotateZoom {
+                    factor: option_float(host, options, &["factor"])?.unwrap_or(1.0),
+                    accel: option_float(host, options, &["accel"])?.unwrap_or(0.0),
+                    twist: option_float(host, options, &["twist"])?.unwrap_or(2.0),
+                    twist_accel: option_float(host, options, &["twistaccel"])?.unwrap_or(-2.0),
+                    center: rotation_center(host, options, dest_size)?,
+                },
+                duration,
+            )
+            .map_err(|error| error.to_string())
+        }
+        "rotatevanish" => {
+            let duration = time()?;
+            Trans::new(
+                TransKind::RotateVanish {
+                    accel: option_float(host, options, &["accel"])?.unwrap_or(2.0),
+                    twist: option_float(host, options, &["twist"])?.unwrap_or(2.0),
+                    twist_accel: option_float(host, options, &["twistaccel"])?.unwrap_or(2.0),
+                    center: rotation_center(host, options, dest_size)?,
+                },
+                duration,
+            )
+            .map_err(|error| error.to_string())
+        }
         "rotateswap" => {
             // The reference's `rotateswap` provider reads only `time`,
             // `bgcolor` and `twist` (`rotatetrans.cpp:453-465`) — it has no
             // `centerx`/`centery` option, so a supplied centre is dropped
             // here instead of moving the pivot.
+            let duration = time()?;
             Trans::new(
                 TransKind::RotateSwap {
-                    background: option_color(host, options, &["bgcolor"]).unwrap_or(0),
-                    twist: option_float(host, options, &["twist"]).unwrap_or(1.0),
+                    background: option_color(host, options, &["bgcolor"])?.unwrap_or(0),
+                    twist: option_float(host, options, &["twist"])?.unwrap_or(1.0),
                     center: None,
                 },
                 duration,
@@ -389,6 +437,9 @@ fn build_transition(
             .map_err(|error| error.to_string())
         }
         "ripple" => {
+            // The ripple provider reads `time` first, then validates its
+            // options in its start step.
+            let duration = time()?;
             let center = rotation_center(host, options, dest_size)?;
             // `ripple` validates its options in `StartTransition` in this
             // order (`ripple.cpp:1596-1627`): centre inside the image, then
@@ -411,13 +462,13 @@ fn build_transition(
                     );
                 }
             }
-            let max_drift = option_int(host, options, &["maxdrift"]).unwrap_or(24);
+            let max_drift = option_int(host, options, &["maxdrift"])?.unwrap_or(24);
             let trans = Trans::new(
                 TransKind::Ripple {
                     center,
-                    map_width: option_int(host, options, &["rwidth"]).unwrap_or(128),
-                    roundness: option_float(host, options, &["roundness"]).unwrap_or(1.0) as f32,
-                    speed: option_float(host, options, &["speed"]).unwrap_or(6.0) as f32,
+                    map_width: option_int(host, options, &["rwidth"])?.unwrap_or(128),
+                    roundness: option_float(host, options, &["roundness"])?.unwrap_or(1.0) as f32,
+                    speed: option_float(host, options, &["speed"])?.unwrap_or(6.0) as f32,
                     max_drift,
                 },
                 duration,
@@ -475,18 +526,30 @@ fn rule_mask(
 }
 
 /// An integer option (`tjs_int` in the reference).
-fn option_int(host: &tjs::Tjs2Engine, options: Option<&Value>, names: &[&str]) -> Option<i32> {
-    options_number(host, options, names).map(|value| value as i32)
+fn option_int(
+    host: &tjs::Tjs2Engine,
+    options: Option<&Value>,
+    names: &[&str],
+) -> Result<Option<i32>, String> {
+    Ok(options_number(host, options, names)?.map(|value| value as i32))
 }
 
 /// A real option (`double` in the reference).
-fn option_float(host: &tjs::Tjs2Engine, options: Option<&Value>, names: &[&str]) -> Option<f64> {
+fn option_float(
+    host: &tjs::Tjs2Engine,
+    options: Option<&Value>,
+    names: &[&str],
+) -> Result<Option<f64>, String> {
     options_number(host, options, names)
 }
 
 /// A colour option (`tjs_uint32` in the reference, `0xAARRGGBB`).
-fn option_color(host: &tjs::Tjs2Engine, options: Option<&Value>, names: &[&str]) -> Option<i64> {
-    options_number(host, options, names).map(|value| value as i64)
+fn option_color(
+    host: &tjs::Tjs2Engine,
+    options: Option<&Value>,
+    names: &[&str],
+) -> Result<Option<i64>, String> {
+    Ok(options_number(host, options, names)?.map(|value| value as i64))
 }
 
 /// The `centerx`/`centery` pair shared by the rotate and ripple providers.
@@ -502,8 +565,8 @@ fn rotation_center(
     options: Option<&Value>,
     dest_size: Option<(u32, u32)>,
 ) -> Result<Option<(i32, i32)>, String> {
-    let x = option_int(host, options, &["centerx"]);
-    let y = option_int(host, options, &["centery"]);
+    let x = option_int(host, options, &["centerx"])?;
+    let y = option_int(host, options, &["centery"])?;
     let missing = || {
         "Layer.beginTransition: centerx/centery needs a destination image to default the other \
          side"
@@ -524,7 +587,7 @@ fn rotation_center(
 /// The `from` option of `scroll`: a number (`tTVPScrollTransFrom`,
 /// `TransIntf.h:118`) or the port's string alias.
 fn scroll_from(host: &tjs::Tjs2Engine, options: Option<&Value>) -> Result<ScrollFrom, String> {
-    match options_number(host, options, &["from"]) {
+    match options_number(host, options, &["from"])? {
         // The reference casts the number straight to the enum
         // (`TransIntf.cpp:1097-1102`); an out-of-range value has no
         // reference meaning, so it is a typed error here.
@@ -549,7 +612,7 @@ fn scroll_from(host: &tjs::Tjs2Engine, options: Option<&Value>) -> Result<Scroll
 /// The `stay` option of `scroll`: a number (`tTVPScrollTransStay`,
 /// `TransIntf.h:119`) or the port's string alias.
 fn scroll_stay(host: &tjs::Tjs2Engine, options: Option<&Value>) -> Result<ScrollStay, String> {
-    match options_number(host, options, &["stay"]) {
+    match options_number(host, options, &["stay"])? {
         // Numeric cast like [`scroll_from`] (`TransIntf.cpp:1104-1108`).
         Some(value) => match value as i32 {
             0 => Ok(ScrollStay::NoStay),
@@ -583,42 +646,166 @@ fn scroll_stay_text(value: &str) -> ScrollStay {
     }
 }
 
-/// Read the real-valued duration member (`duration`, `time` or `ms`).
+/// Read the required real-valued `time` option.
 ///
-/// The reference reads only `time`, casts it to `tjs_int64` and raises
-/// values below 2 to 2 (`reference/cpp/plugins/wave.cpp:332-336`,
-/// `reference/cpp/core/visual/TransIntf.cpp:512-516`); an absent option is
-/// a `TVPSpecifyOption` error there. This port keeps a compat default of
-/// 300 ms when the option is absent (several scripts omit it) but follows
-/// the reference clamp when it is present, so a short or zero time is a 2 ms
-/// transition and never a silent fallback to the default.
-fn options_duration(host: &tjs::Tjs2Engine, options: Option<&Value>) -> Option<f64> {
-    let value = options_number(host, options, &["duration", "time", "ms"])?;
+/// A missing or non-numeric member is an error, and values below 2 are
+/// clamped to 2. The cast truncates toward zero before the clamp, so a
+/// fractional time runs for its whole-millisecond part.
+fn options_duration(host: &tjs::Tjs2Engine, options: Option<&Value>) -> Result<f64, String> {
+    let value = options_time(host, options)
+        .ok_or_else(|| "Layer.beginTransition: Specify option time".to_string())?;
     // Non-finite values have no defined `tjs_int64` cast in the reference;
     // they pass through to L2, which rejects them as a typed
     // `InvalidDuration` instead of clamping.
     if !value.is_finite() {
-        return Some(value);
+        return Ok(value);
     }
-    // The reference's `(tjs_int64)` cast truncates toward zero before the
-    // `< 2` raise, so a fractional time runs for its whole-millisecond part.
-    Some(value.trunc().max(2.0))
+    Ok(value.trunc().max(2.0))
 }
 
-fn options_number(host: &tjs::Tjs2Engine, options: Option<&Value>, names: &[&str]) -> Option<f64> {
+/// The numeric `time` member, converted with the engine's integer coercion
+/// (a numeric string is accepted, an absent or `void` member is not).
+fn options_time(host: &tjs::Tjs2Engine, options: Option<&Value>) -> Option<f64> {
     let value = options?;
     if value.ty != VAL_OBJECT {
         return None;
     }
     let object = host.retain_object_arg(value).ok()?;
-    for name in names {
-        match host.member(object.raw_id(), name) {
-            Ok(TjsValue::Real(number)) => return Some(number),
-            Ok(TjsValue::Integer(number)) => return Some(number as f64),
-            _ => {}
+    match host.member(object.raw_id(), "time") {
+        Ok(TjsValue::Real(number)) => Some(number),
+        Ok(TjsValue::Integer(number)) => Some(number as f64),
+        Ok(TjsValue::String(text)) => Some(tjs_string_to_integer(&text) as f64),
+        _ => None,
+    }
+}
+
+/// The `selfupdate`/`callback` members of the options object.
+///
+/// `selfupdate` is false unless the member is present and non-void, and is
+/// read through integer coercion; `callback` is retained only when it is an
+/// object/function. A scalar callback is rejected here because the options
+/// reader takes its object closure while the script is still inside
+/// `beginTransition`; a null closure is retained and fails at the first tick.
+fn transition_options(
+    host: &tjs::Tjs2Engine,
+    options: Option<&Value>,
+) -> Result<(bool, Option<DetachedValue>), String> {
+    let Some(value) = options else {
+        return Ok((false, None));
+    };
+    if value.ty != VAL_OBJECT {
+        return Ok((false, None));
+    }
+    let object = host
+        .retain_object_arg(value)
+        .map_err(|error| format!("Layer.beginTransition: cannot read the options: {error}"))?;
+    let self_update = match host.member(object.raw_id(), "selfupdate") {
+        Ok(TjsValue::Void) => false,
+        Ok(value) => match value {
+            TjsValue::Integer(number) => number != 0,
+            TjsValue::Real(number) => number != 0.0,
+            TjsValue::String(text) => tjs_string_to_integer(&text) != 0,
+            TjsValue::Object | TjsValue::Retained(_) => true,
+            TjsValue::Void => false,
+        },
+        Err(error) => {
+            log::debug!("Layer.beginTransition: cannot read option selfupdate: {error}");
+            false
+        }
+    };
+    let callback = match host.member(object.raw_id(), "callback") {
+        Ok(TjsValue::Void) => None,
+        Ok(TjsValue::Object) => Some(host.retain_value_detached(&TjsValue::Object).map_err(
+            |error| {
+                format!("Layer.beginTransition: cannot retain the transition callback: {error}")
+            },
+        )?),
+        Ok(other) => {
+            return Err(format!(
+                "Layer.beginTransition: transition option callback must be a function, got {other:?}"
+            ));
+        }
+        Err(error) => {
+            log::debug!("Layer.beginTransition: cannot read option callback: {error}");
+            None
+        }
+    };
+    Ok((self_update, callback))
+}
+
+/// Call the transition tick callback and convert its result with the
+/// integer cast.
+fn transition_tick(host: &tjs::Tjs2Engine, callback: &DetachedValue) -> Result<f64, String> {
+    let result = host
+        .call_detached(callback, &[])
+        .map_err(|error| format!("Layer.beginTransition: transition callback failed: {error}"))?;
+    match result {
+        TjsValue::Void => Ok(0.0),
+        TjsValue::Integer(number) => Ok(number as f64),
+        TjsValue::Real(number) => Ok(number),
+        TjsValue::String(text) => Ok(tjs_string_to_integer(&text) as f64),
+        TjsValue::Object | TjsValue::Retained(_) => {
+            Err("Layer.beginTransition: transition callback must return a numeric tick".to_string())
         }
     }
-    None
+}
+
+fn options_number(
+    host: &tjs::Tjs2Engine,
+    options: Option<&Value>,
+    names: &[&str],
+) -> Result<Option<f64>, String> {
+    let Some(value) = options else {
+        return Ok(None);
+    };
+    if value.ty != VAL_OBJECT {
+        return Ok(None);
+    }
+    let object = host
+        .retain_object_arg(value)
+        .map_err(|error| format!("Layer.beginTransition: cannot read the options: {error}"))?;
+    for name in names {
+        match host.member(object.raw_id(), name) {
+            Ok(TjsValue::Void) => {}
+            Ok(TjsValue::Real(number)) => return Ok(Some(number)),
+            Ok(TjsValue::Integer(number)) => return Ok(Some(number as f64)),
+            Ok(TjsValue::String(text)) => {
+                if let Some(number) = numeric_string(&text) {
+                    return Ok(Some(number));
+                }
+            }
+            Ok(TjsValue::Object | TjsValue::Retained(_)) => {
+                return Err(format!(
+                    "Layer.beginTransition: invalid transition option {name}: value is not a number"
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Layer.beginTransition: cannot read option {name}: {error}"
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The numeric prefix of a string, using the engine's real-number coercion.
+/// A non-numeric string yields `None` so the caller can try its textual alias.
+fn numeric_string(text: &str) -> Option<f64> {
+    let mut rest = text;
+    if let Some(stripped) = rest.strip_prefix(['+', '-']) {
+        rest = stripped;
+    }
+    rest = rest.trim_start_matches(' ');
+    let starts_number = rest.as_bytes().first().is_some_and(u8::is_ascii_digit);
+    let starts_keyword = ["true", "false", "NaN", "Infinity"]
+        .iter()
+        .any(|keyword| rest.starts_with(keyword));
+    if starts_number || starts_keyword {
+        Some(tjs_string_to_real(text))
+    } else {
+        None
+    }
 }
 
 fn options_text(host: &tjs::Tjs2Engine, options: Option<&Value>, name: &str) -> Option<String> {
@@ -673,6 +860,27 @@ fn object_alive(ctx: &crate::CompatCtx, kind: ObjectKind, id: u32) -> bool {
         .is_ok_and(|payload| payload.is_some())
 }
 
+/// Whether the draw report contains transition `dest` or its source: a drawn
+/// descendant means the layer's subtree was drawn, and a drawn cached ancestor
+/// reports the descendants it covered.
+fn drawn_signal(scene: &Scene, drawn: &[u32], dest: u32, source: u32) -> bool {
+    drawn
+        .iter()
+        .any(|&id| layer_within(scene, id, dest) || layer_within(scene, id, source))
+}
+
+/// Whether `node` is `root` or one of its descendants.
+fn layer_within(scene: &Scene, node: u32, root: u32) -> bool {
+    let mut current = Some(node);
+    while let Some(id) = current {
+        if id == root {
+            return true;
+        }
+        current = scene.layer(id).and_then(|layer| layer.parent);
+    }
+    false
+}
+
 /// Advance every active transition by `dt_ms` and tear down the finished or
 /// stopped ones.
 ///
@@ -699,8 +907,29 @@ fn object_alive(ctx: &crate::CompatCtx, kind: ObjectKind, id: u32) -> bool {
 /// mirroring the reference's `tTJSNI_BaseLayer::BeforeCompletion`
 /// (`LayerIntf.cpp:6390-6404`), which fires the `onPaint` event and then
 /// processes the transition in the same pre-draw step.
+///
+/// A self-updating transition is not stepped here. It accumulates the frame
+/// time and is advanced by [`advance_self_updating_transitions`] once the
+/// projection reports that its layer was drawn.
 pub fn advance_transitions(ctx: &crate::CompatCtx, dt_ms: f64) -> Result<(), String> {
     super::paint_poll(ctx)?;
+    advance(ctx, dt_ms, None)
+}
+
+/// Advance the self-updating transitions whose layer the projection drew.
+///
+/// `drawn_layers` is the projection's actual emit report, including the
+/// descendants covered by a drawn cached ancestor. A transition whose
+/// destination or source subtree is in that report performs its pending step;
+/// one that was not drawn keeps its accumulated time for the next draw.
+pub fn advance_self_updating_transitions(
+    ctx: &crate::CompatCtx,
+    drawn_layers: &[u32],
+) -> Result<(), String> {
+    advance(ctx, 0.0, Some(drawn_layers))
+}
+
+fn advance(ctx: &crate::CompatCtx, dt_ms: f64, drawn_layers: Option<&[u32]>) -> Result<(), String> {
     let active: Vec<(u32, u32, bool)> = {
         // SAFETY: the caller resolved `ctx` from the installed binding.
         let services = unsafe { ctx.services() };
@@ -723,12 +952,80 @@ pub fn advance_transitions(ctx: &crate::CompatCtx, dt_ms: f64) -> Result<(), Str
             ended.push((id, source, false));
             continue;
         }
-        // An invisible destination stops at this frame, before rendering
+        let (self_update, callback) = {
+            // SAFETY: see above.
+            let services = unsafe { ctx.services() };
+            let runtime = services.state::<TransitionRuntimeState>();
+            let Some(entry) = runtime.entries.get(&id) else {
+                return Err(format!(
+                    "Layer.beginTransition: transition {id} has no runtime state"
+                ));
+            };
+            let callback = match &entry.callback {
+                Some(callback) => Some(
+                    // SAFETY: see above.
+                    unsafe { ctx.engine() }
+                        .duplicate_retained(callback.raw_id())
+                        .map_err(|error| {
+                            format!(
+                                "Layer.beginTransition: cannot retain the transition callback: \
+                                 {error}"
+                            )
+                        })?,
+                ),
+                None => None,
+            };
+            (entry.self_update, callback)
+        };
+        match drawn_layers {
+            None if self_update => {
+                // A self-updating transition is not on the continuous hook.
+                // Wall-clock time still runs, so accumulate it for the step
+                // the next draw performs.
+                // SAFETY: see above.
+                let mut runtime = unsafe { ctx.services() }.state::<TransitionRuntimeState>();
+                if let Some(entry) = runtime.entries.get_mut(&id)
+                    && entry.callback.is_none()
+                    && dt_ms.is_finite()
+                    && dt_ms > 0.0
+                {
+                    entry.pending_ms += dt_ms;
+                }
+                continue;
+            }
+            None => {}
+            Some(_) if !self_update => continue,
+            Some(drawn_layers) => {
+                let scene = scene_ref(ctx)?;
+                if !drawn_signal(scene, drawn_layers, id, source) {
+                    continue;
+                }
+            }
+        }
+        // The callback supplies the tick before the visibility check.
+        let tick = match callback {
+            Some(callback) => {
+                // SAFETY: see above.
+                Some(transition_tick(unsafe { ctx.engine() }, &callback)?)
+            }
+            None => None,
+        };
+        // An invisible destination stops at that frame, before rendering
         // (LayerIntf.cpp:8056-8060).
         if !scene_ref(ctx)?.node_visible(id) {
             ended.push((id, source, true));
             continue;
         }
+        let pending_ms = {
+            // SAFETY: see above.
+            let mut runtime = unsafe { ctx.services() }.state::<TransitionRuntimeState>();
+            let Some(entry) = runtime.entries.get_mut(&id) else {
+                continue;
+            };
+            let pending_ms = entry.pending_ms;
+            entry.pending_ms = 0.0;
+            pending_ms
+        };
         let done = {
             // SAFETY: see above.
             let services = unsafe { ctx.services() };
@@ -736,7 +1033,17 @@ pub fn advance_transitions(ctx: &crate::CompatCtx, dt_ms: f64) -> Result<(), Str
             let Some(entry) = extras.transitions.get_mut(&id) else {
                 continue;
             };
-            entry.trans.step(dt_ms);
+            match tick {
+                Some(tick) => {
+                    entry.trans.seek_ms(tick);
+                }
+                None if self_update => {
+                    entry.trans.step(pending_ms);
+                }
+                None => {
+                    entry.trans.step(dt_ms);
+                }
+            }
             let done = entry.trans.is_complete();
             // Render this frame through the borrowed machine — the same
             // `Process` write into the destination the reference performs
@@ -767,6 +1074,11 @@ pub fn advance_transitions(ctx: &crate::CompatCtx, dt_ms: f64) -> Result<(), Str
 /// through the object (the reference's synchronous event, `:7997-8015`).
 fn end_transition(ctx: &crate::CompatCtx, dest: u32, source: u32, event: bool) {
     // SAFETY: the caller resolved `ctx` from the installed binding.
+    unsafe { ctx.services() }
+        .state::<TransitionRuntimeState>()
+        .entries
+        .remove(&dest);
+    // SAFETY: see above.
     let removed = unsafe { ctx.services() }
         .state::<LayerExtras>()
         .transitions
@@ -795,7 +1107,7 @@ fn end_transition(ctx: &crate::CompatCtx, dest: u32, source: u32, event: bool) {
     if let Ok(scene) = scene_mut(ctx) {
         // A childless transition drew its frames in the layer's self image;
         // the teardown leaves the layer drawing its own image again.
-        crate::engine_api::layer_ops::clear_transition_self_image(scene, dest);
+        scene.set_transition_self_image(dest, None);
         exchange_layers(scene, dest, source, !entry.with_children);
     }
     if event {
@@ -1091,18 +1403,14 @@ fn dispatch_transition_completed(ctx: &crate::CompatCtx, dest: u32, src: u32) {
 
 /// Render one transition frame.
 ///
-/// A whole-subtree transition first renders each endpoint into its composited
-/// content, reused while the subtree is unchanged, and blends the two into the
+/// A whole-subtree transition blends the two composited subtrees into the
 /// destination's own transition frame — the bitmap the projection draws in
-/// place of the subtree until the caches are released. A trivial layer's
-/// content is its MainImage: it is read as the blend source and never written,
-/// and the blend frame is allocated separately from the content it reads.
-///
-/// A transition without children blends the layer's own main image (source 1)
-/// and the source layer's main image (source 2) into the destination's self
-/// image, which the projection draws at the main image's placement while the
-/// destination's children keep drawing live. Both main images stay read-only:
-/// a MainImage is what script pixel reads, saves and piled copies observe.
+/// place of the subtree until the caches are released. A transition without
+/// children blends the layer's own main image (source 1) and the source
+/// layer's main image (source 2) into the destination's self image, which the
+/// projection draws at the main image's placement while the destination's
+/// children keep drawing live. Both main images stay read-only: a MainImage
+/// is what script pixel reads, saves and piled copies observe.
 fn composite_transition(
     ctx: &crate::CompatCtx,
     id: u32,
@@ -1111,14 +1419,33 @@ fn composite_transition(
     with_children: bool,
 ) -> Result<(), String> {
     let scene = scene_mut(ctx)?;
-    if !with_children {
-        return composite_self_transition(scene, id, source, trans);
-    }
-    // `render_layer_subtree` returns the composited subtree content, reusing it
-    // while the subtree is unchanged; a trivial layer's content is its
-    // MainImage.
+    let (target, src1, src2) = if with_children {
+        composite_subtree(scene, id, source)?
+    } else {
+        composite_self(scene, id, source)?
+    };
+    // The blend reads both sources while it writes the target, so the three
+    // must be distinct bitmaps.
+    let Some((target, src1, src2)) = scene.bitmap_mut_with_refs(target, src1, src2) else {
+        return Err("Layer.beginTransition: the transition bitmaps are not distinct".to_string());
+    };
+    let region = Trans::full_region(target);
+    trans
+        .apply(target, src1, src2, region)
+        .map_err(|error| error.to_string())
+}
+
+/// The blend target and its two sources for a whole-subtree transition: the
+/// destination's transition frame, the destination's composited subtree
+/// content and the source layer's.
+///
+/// `render_layer_subtree` returns the composited subtree content, reusing it
+/// while the subtree is unchanged; a trivial layer's content is its MainImage:
+/// it is read as the blend source and never written, and the blend frame is
+/// allocated separately from the content it reads.
+fn composite_subtree(scene: &mut Scene, dest: u32, source: u32) -> Result<(u32, u32, u32), String> {
     let dst_content =
-        crate::engine_api::layer_ops::render_layer_subtree(scene, id).ok_or_else(|| {
+        crate::engine_api::layer_ops::render_layer_subtree(scene, dest).ok_or_else(|| {
             "Layer.beginTransition: cannot render the destination subtree".to_string()
         })?;
     let src_content = crate::engine_api::layer_ops::render_layer_subtree(scene, source)
@@ -1127,54 +1454,37 @@ fn composite_transition(
         })?;
     // The source layer draws its rendered content. A layer that is its own
     // transition source keeps the destination's slots instead.
-    if source != id {
+    if source != dest {
         scene.set_cache_bitmap(source, Some(src_content));
     }
     // The blend needs a frame of its own, distinct from the content it reads,
     // whatever the destination's content happens to be.
-    let (w, h) = scene
-        .bitmap(dst_content)
-        .map(|bitmap| (bitmap.width, bitmap.height))
-        .ok_or_else(|| {
-            "Layer.beginTransition: the transition destination content is missing".to_string()
-        })?;
-    let display = crate::engine_api::layer_ops::ensure_transition_display(scene, id, w, h)
+    let (w, h) = bitmap_size(scene, dst_content).ok_or_else(|| {
+        "Layer.beginTransition: the transition destination content is missing".to_string()
+    })?;
+    let frame = crate::engine_api::layer_ops::ensure_transition_display(scene, dest, w, h)
         .ok_or_else(|| "Layer.beginTransition: cannot allocate the transition frame".to_string())?;
-    match scene.bitmap_mut_with_refs(display, dst_content, src_content) {
-        Some((dst, src1, src2)) => {
-            let region = Trans::full_region(dst);
-            trans
-                .apply(dst, src1, src2, region)
-                .map_err(|error| error.to_string())
-        }
-        None => Err("Layer.beginTransition: the transition bitmaps are not distinct".to_string()),
-    }
+    Ok((frame, dst_content, src_content))
 }
 
-/// Blend the two main images into the destination's self image.
+/// The blend target and its two sources for a transition without children: the
+/// destination's self image, the destination's own main image and the source
+/// layer's main image.
 ///
-/// The layer's own main image is source 1 and the transition source's is
-/// source 2; the blend goes into a bitmap of the destination image's size that
-/// the projection draws where the main image would be, while the destination's
+/// The self image is a bitmap of the destination image's size that the
+/// projection draws where the main image would be, while the destination's
 /// children keep drawing live. Neither main image is written.
-fn composite_self_transition(
-    scene: &mut Scene,
-    dest: u32,
-    source: u32,
-    trans: &Trans,
-) -> Result<(), String> {
-    let (dest_bitmap, w, h) = {
-        let layer = scene.layer(dest).ok_or_else(|| {
-            "Layer.beginTransition: the transition destination is gone".to_string()
-        })?;
-        let bitmap = layer.bitmap.ok_or_else(|| {
+fn composite_self(scene: &mut Scene, dest: u32, source: u32) -> Result<(u32, u32, u32), String> {
+    let dest_bitmap = scene
+        .layer(dest)
+        .ok_or_else(|| "Layer.beginTransition: the transition destination is gone".to_string())?
+        .bitmap
+        .ok_or_else(|| {
             "Layer.beginTransition: the transition destination has no image".to_string()
         })?;
-        let image = scene.bitmap(bitmap).ok_or_else(|| {
-            "Layer.beginTransition: the transition destination image is missing".to_string()
-        })?;
-        (bitmap, image.width, image.height)
-    };
+    let (w, h) = bitmap_size(scene, dest_bitmap).ok_or_else(|| {
+        "Layer.beginTransition: the transition destination image is missing".to_string()
+    })?;
     let source_bitmap = scene
         .layer(source)
         .and_then(|layer| layer.bitmap)
@@ -1183,18 +1493,7 @@ fn composite_self_transition(
         .ok_or_else(|| {
             "Layer.beginTransition: cannot allocate the transition self image".to_string()
         })?;
-    match scene.bitmap_mut_with_refs(self_image, dest_bitmap, source_bitmap) {
-        Some((dst, src1, src2)) => {
-            let region = Trans::full_region(dst);
-            trans
-                .apply(dst, src1, src2, region)
-                .map_err(|error| error.to_string())
-        }
-        None => Err(
-            "Layer.beginTransition: the transition self image is not distinct from its sources"
-                .to_string(),
-        ),
-    }
+    Ok((self_image, dest_bitmap, source_bitmap))
 }
 
 fn d(name: &'static str, f: tjs::NativeInstanceMethodFn) -> NativeInstanceMethodDef {

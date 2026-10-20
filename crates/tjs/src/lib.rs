@@ -32,6 +32,32 @@ pub const VAL_OCTET: c_int = 7;
 /// with a zero handle.
 pub const VAL_NULL: c_int = 8;
 
+/// Storage read status: the entry was read and `out_data`/`out_len` are set.
+pub const STORAGE_READ_OK: c_int = 0;
+/// Storage read status: the storage has no such entry, so the stream factory
+/// falls back to the local filesystem.
+pub const STORAGE_READ_NOT_FOUND: c_int = 1;
+/// Storage read status: the lookup failed; `out_error` names why.
+pub const STORAGE_READ_ERROR: c_int = 2;
+
+/// Reads a whole storage entry for the text/binary stream factories (the C
+/// ABI type in `cpp/tjs2_abi.h`).
+///
+/// `name`/`name_len` are UTF-8 and may carry the `archive.xp3>member` form.
+/// On [`STORAGE_READ_OK`] the callback stores a malloc'd buffer in `out_data`
+/// (the stream layer frees it with `tjs2_free_storage_bytes`) and its byte
+/// length in `out_len`. It returns [`STORAGE_READ_NOT_FOUND`] when the storage
+/// has no such entry, or [`STORAGE_READ_ERROR`] with a malloc'd UTF-8 message
+/// in `out_error` (freed with `tjs2_free_string`).
+pub type StorageReadFn = extern "C" fn(
+    user: *mut c_void,
+    name: *const c_char,
+    name_len: usize,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+    out_error: *mut *mut c_char,
+) -> c_int;
+
 /// Callback for console output / logs from the VM. `msg` is UTF-8 and only
 /// valid for the duration of the call.
 pub type LogCb = extern "C" fn(level: c_int, msg: *const c_char, user: *mut c_void);
@@ -285,6 +311,7 @@ pub struct Engine {
 unsafe extern "C" {
     fn tjs2_create() -> *mut Engine;
     fn tjs2_set_data_dir_checked(dir: *const c_char, out_error: *mut *mut c_char) -> c_int;
+    fn tjs2_set_storage_read_callback(read: Option<StorageReadFn>, user: *mut c_void);
     fn tjs2_destroy(e: *mut Engine);
     fn tjs2_set_log_cb(e: *mut Engine, cb: LogCb, user: *mut c_void);
     fn tjs2_exec_script(
@@ -600,6 +627,11 @@ unsafe extern "C" {
 /// Opaque per-engine id of a retained script value (mirror of the C
 /// `tjs2_value_id` typedef: an opaque pointer that is never null for a live
 /// id).
+///
+/// The same type also carries a raw `iTJSDispatch2*` for the entry points that
+/// take one (e.g. [`Tjs2Engine::retain_object_detached`]). The two are not
+/// interchangeable: a retained id passed where a raw object pointer is
+/// expected is dereferenced as one.
 #[repr(transparent)]
 #[derive(Copy, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Tjs2ValueId(*mut c_void);
@@ -874,6 +906,22 @@ pub struct NativeInstanceMembers<'a> {
     pub class_name: &'a str,
     pub methods: Vec<NativeObjThisMethodDef>,
     pub properties: Vec<NativeObjThisPropertyDef>,
+}
+
+/// Install (or clear) the storage read callback the text/binary stream
+/// factories use.
+///
+/// The read factories call it for every name before falling back to the local
+/// filesystem, so `Array.load("archive.xp3>member")` reads an archive member.
+/// The registration is process-wide, like the factories themselves: install it
+/// before scripts run and clear it before `user` dies.
+///
+/// # Safety
+/// `user` must stay valid for every VM call until the callback is cleared with
+/// `None`, and `read` must follow the `cpp/tjs2_abi.h` contract.
+pub unsafe fn set_storage_read_callback(read: Option<StorageReadFn>, user: *mut c_void) {
+    // SAFETY: the caller upholds the user-pointer contract above.
+    unsafe { tjs2_set_storage_read_callback(read, user) }
 }
 
 impl Tjs2Engine {
@@ -6109,19 +6157,16 @@ var ra = a.get(); var rb = b.get();",
     }
 
     /// Read takes the placed path and requires it to exist
-    /// (`StorageIntf.cpp:1136-1144`). The port returns a closed stream rather
-    /// than throwing, which the caller sees as an empty read; the
-    /// `opened=false` flag (and the `stream open ... failed` log line) is how
-    /// that becomes visible.
+    /// (`StorageIntf.cpp:1136-1144`). A failed open raises, so the helper
+    /// reports `opened=false`; the log line names the reason.
     #[test]
     fn read_mode_requires_an_existing_file() {
         let _vm_lock = vm_lock();
         let dir = stream_temp_dir("stream-read");
         let e = Tjs2Engine::new().unwrap();
         e.set_data_dir(dir.to_str().unwrap()).unwrap();
-        let (opened, access) = open_test_binary("nope.tjs", "", false);
+        let (opened, _access) = open_test_binary("nope.tjs", "", false);
         assert!(!opened, "a missing read must not open");
-        assert_eq!(access, "TJS_BS_READ");
 
         std::fs::write(dir.join("there.tjs"), b"hi").unwrap();
         let (opened, _) = open_test_binary("there.tjs", "", false);

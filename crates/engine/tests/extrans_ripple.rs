@@ -61,7 +61,7 @@ fn ripple(center: Option<(i32, i32)>, map_width: i32, roundness: f32, max_drift:
 /// happened".
 ///
 /// The transition is built and stepped to exactly half of its 1000 ms
-/// duration — `phase` 128 of 255, inside the window where `Trans::apply`
+/// duration — `phase` 127 of 255, inside the window where `Trans::apply`
 /// dispatches to the ripple provider — and returns the error, if any. A bad
 /// option the reference rejects in `StartTransition` (i.e. while
 /// `Layer.beginTransition` runs) fails at construction; a size-dependent one

@@ -1,6 +1,6 @@
 # Plugin surface parity
 
-> **Generated** by `krkr-gate plugin-parity` on 2026-10-13 — do not edit by hand.
+> **Generated** by `krkr-gate plugin-parity` on 2026-10-20 — do not edit by hand.
 
 Machine-diff of the reference KiriKiri plugin surface (`reference/cpp/plugins/**`) against the plugin classes the Rust engine registers (`crates/compat/src/natives/plugins/**`). A *missing* member exists in the reference but is not registered by Rust. An *extra* is a genuine plugin-surface addition: a member registered by a plugin file that the reference class does not have. Core natives (`natives/*.rs`) and members inherited from a shared registration table are counted separately.
 

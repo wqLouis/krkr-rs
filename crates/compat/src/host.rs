@@ -151,7 +151,30 @@ impl CompatHost {
         // SAFETY: `bound` guarantees the stored engine/services addresses are
         // live.
         let engine = unsafe { &*(self.engine as *const Tjs2Engine) };
+        // A host that attached the storage after `install` gets the stream
+        // data directory here; re-applying it is idempotent.
+        self.apply_stream_data_dir(engine)?;
         crate::natives::plugins::activate_deferred(engine, self.services.as_ref())
+    }
+
+    /// Points the VM's stream factories at the attached storage's game
+    /// directory, so a relative save name resolves under the game path rather
+    /// than at the process working directory. No-op when no storage is
+    /// attached.
+    fn apply_stream_data_dir(&self, engine: &Tjs2Engine) -> Result<(), CompatError> {
+        let Some(storage) = self.services.storage() else {
+            return Ok(());
+        };
+        // SAFETY: `attach_storage` requires the owner to outlive the binding.
+        let game_dir = unsafe { &*storage }.game_dir();
+        let Some(game_dir) = game_dir.to_str() else {
+            return Err(CompatError::Engine(
+                "stream data dir is not valid UTF-8".to_string(),
+            ));
+        };
+        engine
+            .set_data_dir(game_dir)
+            .map_err(|error| CompatError::Engine(error.to_string()))
     }
 
     /// Closes the per-native dispatch-timing window and emits the one report
@@ -182,6 +205,12 @@ impl CompatHost {
     /// at a stable address for as long as the binding is installed: keep it
     /// behind a `Box` (as [`crate::Host`] and `vm`'s host do) and do not move
     /// the value afterwards.
+    ///
+    /// When a storage is already attached, its game directory becomes the
+    /// VM's stream data directory, so a relative save name resolves there
+    /// instead of at the process working directory. A host that attaches the
+    /// storage afterwards gets the same setting from
+    /// [`Self::activate_deferred_plugins`].
     pub fn install(&mut self, engine: &Tjs2Engine) -> Result<(), CompatError> {
         if self.bound {
             return Err(CompatError::Register(
@@ -197,6 +226,13 @@ impl CompatHost {
         // not need the binding, and a failure leaves no half-installed table.
         crate::install(&mut ctx)?;
         binding::install(engine, services_ptr as *mut CompatServices, &self.registry)?;
+        // Relative stream names resolve against the game directory before any
+        // script can write one. The storage must already be attached; undo
+        // the binding when the directory cannot be represented.
+        if let Err(error) = self.apply_stream_data_dir(engine) {
+            binding::uninstall();
+            return Err(error);
+        }
         // Create the null-plugin no-op closure once, before any native
         // callback can run, so the `missing` handler never re-enters the VM.
         self.services.ensure_noop_closure(engine);

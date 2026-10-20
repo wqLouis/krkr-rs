@@ -15,6 +15,7 @@ mod common;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use api::error::MediaError;
 use api::media::{AudioSpec, DecodedAudio, RgbaFrame, VideoSpec};
@@ -872,8 +873,8 @@ impl compat::VideoSource for MovieAudioSource {
         Some(chosen)
     }
 
-    fn audio(&mut self, _path: &str) -> Result<Option<DecodedAudio>, MediaError> {
-        Ok(Some(self.audio.clone()))
+    fn audio(&mut self, _path: &str) -> Result<Option<Arc<DecodedAudio>>, MediaError> {
+        Ok(Some(Arc::new(self.audio.clone())))
     }
 }
 
@@ -1003,7 +1004,7 @@ fn movie_audio_decode_failure_raises() {
             self.frames.first().cloned()
         }
 
-        fn audio(&mut self, _path: &str) -> Result<Option<DecodedAudio>, MediaError> {
+        fn audio(&mut self, _path: &str) -> Result<Option<Arc<DecodedAudio>>, MediaError> {
             Err(MediaError::Decode {
                 format: "mp3".to_string(),
                 message: "corrupt audio frame".to_string(),

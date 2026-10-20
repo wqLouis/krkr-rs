@@ -2163,6 +2163,9 @@ extern "C" fn layer_load_images(
 
 /// Reads, decodes and installs `name` as the layer's main image, reusing the
 /// layer's existing bitmap so repeated loads do not leak scene bitmaps.
+/// Installing the image is followed by the image-size adjustment, which shrinks
+/// the layer rectangle to a smaller image, clamps the image offsets and resets
+/// the clip.
 fn load_layer_image(
     ctx: &CompatCtx,
     layer_id: u32,
@@ -2186,10 +2189,8 @@ fn load_layer_image(
             }
         }
     }
-    if let Some(layer) = scene.layer_mut(layer_id) {
-        layer.image_width = width;
-        layer.image_height = height;
-        layer.image_modified = true;
+    if !scene.internal_set_image_size(layer_id, width, height) {
+        return Err("the layer image could not be sized".to_string());
     }
     Ok(())
 }

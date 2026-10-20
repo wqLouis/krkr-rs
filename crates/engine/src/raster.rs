@@ -33,23 +33,38 @@ pub fn blend_pixel(
     let Some(i) = bitmap.pixel_offset(x as u32, y as u32) else {
         return;
     };
+    let mut pixel = [
+        bitmap.rgba[i],
+        bitmap.rgba[i + 1],
+        bitmap.rgba[i + 2],
+        bitmap.rgba[i + 3],
+    ];
+    blend_pixel_at(&mut pixel, color, coverage, opa);
+    bitmap.rgba[i..i + 4].copy_from_slice(&pixel);
+}
+
+/// Alpha-composite one straight-alpha pixel in place.
+///
+/// This is the per-pixel core of [`blend_pixel`], without the bitmap bounds
+/// check: the caller owns the pixel, so the operation can run on a row slice
+/// of a destination bitmap.
+pub fn blend_pixel_at(pixel: &mut [u8; 4], color: [u8; 4], coverage: u8, opa: u8) {
     let alpha = (u32::from(color[3]) * u32::from(coverage) * u32::from(opa) / (255 * 255)) as u8;
     if alpha == 0 {
         return;
     }
     let inv = 255u32 - u32::from(alpha);
-    let old_a = u32::from(bitmap.rgba[i + 3]);
+    let old_a = u32::from(pixel[3]);
     let out_a = u32::from(alpha) + old_a * inv / 255;
     for (channel, &src_color) in color[..3].iter().enumerate() {
         let src = u32::from(src_color);
-        let dst = u32::from(bitmap.rgba[i + channel]);
+        let dst = u32::from(pixel[channel]);
         // Keep the scene buffer straight-alpha. This matters for antialiased
         // edges over transparent pixels: RGB must remain the requested color,
         // not color multiplied by coverage.
-        bitmap.rgba[i + channel] =
-            ((src * u32::from(alpha) * 255 + dst * old_a * inv) / (out_a * 255)) as u8;
+        pixel[channel] = ((src * u32::from(alpha) * 255 + dst * old_a * inv) / (out_a * 255)) as u8;
     }
-    bitmap.rgba[i + 3] = out_a as u8;
+    pixel[3] = out_a as u8;
 }
 
 /// Replace a rectangle's pixels with a straight-alpha color.

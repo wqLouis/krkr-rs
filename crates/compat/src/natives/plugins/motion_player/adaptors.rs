@@ -17,6 +17,7 @@ use tjs::{
 
 use super::StoredValue;
 use super::helpers::{inst_mut, set_retained, value_as_f64};
+use super::model::MotionNode;
 use crate::native_util::{args, report_error, set_void};
 use crate::natives::system::{resolve, try_value_as_i64, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
@@ -87,14 +88,30 @@ pub(crate) struct QuadInst;
 /// Defaults mirror the reference class
 /// (`reference/cpp/plugins/motionplayer/SourceCache.h:205-224`): visible
 /// flags start true, zoom starts at 1.0 and `opacity` is the integer 255.
+/// The three array members hold no value until the player fills them in,
+/// which is how an instance the script created on its own reports them.
 pub(crate) struct LayerGetterInst {
     kind: i32,
     label: String,
     visible: bool,
+    branch_visible: bool,
+    layer_visible: bool,
     x: f64,
     y: f64,
+    flip_x: bool,
+    flip_y: bool,
+    zoom_x: f64,
+    zoom_y: f64,
+    angle_deg: f64,
+    angle_rad: f64,
+    slant_x: f64,
+    slant_y: f64,
+    origin_x: f64,
+    origin_y: f64,
     opacity: i64,
-    angle: f64,
+    mtx: Option<[f64; 6]>,
+    vtx: Option<[f64; 8]>,
+    color: Option<[i64; 4]>,
 }
 
 impl Default for LayerGetterInst {
@@ -103,12 +120,66 @@ impl Default for LayerGetterInst {
             kind: 0,
             label: String::new(),
             visible: true,
+            branch_visible: true,
+            layer_visible: true,
             x: 0.0,
             y: 0.0,
+            flip_x: false,
+            flip_y: false,
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            angle_deg: 0.0,
+            angle_rad: 0.0,
+            slant_x: 0.0,
+            slant_y: 0.0,
+            origin_x: 0.0,
+            origin_y: 0.0,
             opacity: 255,
-            angle: 0.0,
+            mtx: None,
+            vtx: None,
+            color: None,
         }
     }
+}
+
+/// Fill a layer getter with the state of a motion node.
+///
+/// The values are the ones the layer getter of a motion node carries: the
+/// node's type and label, its inherited visibility, its position, its
+/// transform and its colour.
+pub(crate) fn populate_layer_getter(
+    getter: &mut LayerGetterInst,
+    node: &MotionNode,
+    origin: (f64, f64),
+    mtx: [f64; 6],
+    vtx: [f64; 8],
+    color: [i64; 4],
+) {
+    getter.kind = node.node_type;
+    getter.label = node.label.clone();
+    // The visibility is the inherited chain, and the layer's own flag says
+    // whether the node is drawn at all.
+    getter.visible = node.accumulated.active;
+    getter.branch_visible = node.accumulated.active;
+    getter.layer_visible = node.draw_flag;
+    getter.x = node.accumulated.x;
+    getter.y = node.accumulated.y;
+    getter.flip_x = node.accumulated.flip_x;
+    getter.flip_y = node.accumulated.flip_y;
+    getter.zoom_x = node.accumulated.scale_x;
+    getter.zoom_y = node.accumulated.scale_y;
+    // The radian field carries the accumulated angle, and the degree field
+    // carries that value scaled by 180 over pi.
+    getter.angle_rad = node.accumulated.angle;
+    getter.angle_deg = node.accumulated.angle * 180.0 / std::f64::consts::PI;
+    getter.slant_x = node.accumulated.slant_x;
+    getter.slant_y = node.accumulated.slant_y;
+    getter.origin_x = origin.0;
+    getter.origin_y = origin.1;
+    getter.opacity = (node.accumulated.opacity * 255.0).round().clamp(0.0, 255.0) as i64;
+    getter.mtx = Some(mtx);
+    getter.vtx = Some(vtx);
+    getter.color = Some(color);
 }
 
 macro_rules! simple_ctor {
@@ -242,66 +313,54 @@ mp_get_bool!(
 mp_get_bool!(
     getter_get_branch_visible,
     LayerGetterInst,
-    |p: &LayerGetterInst| p.visible
+    |p: &LayerGetterInst| p.branch_visible
 );
 mp_get_bool!(
     getter_get_layer_visible,
     LayerGetterInst,
-    |p: &LayerGetterInst| p.visible
+    |p: &LayerGetterInst| p.layer_visible
 );
 mp_get_real!(getter_get_x, LayerGetterInst, |p: &LayerGetterInst| p.x);
 mp_get_real!(getter_get_y, LayerGetterInst, |p: &LayerGetterInst| p.y);
 mp_get_real!(getter_get_left, LayerGetterInst, |p: &LayerGetterInst| p.x);
 mp_get_real!(getter_get_top, LayerGetterInst, |p: &LayerGetterInst| p.y);
-mp_get_bool!(
-    getter_get_flip_x,
-    LayerGetterInst,
-    |_p: &LayerGetterInst| false
-);
-mp_get_bool!(
-    getter_get_flip_y,
-    LayerGetterInst,
-    |_p: &LayerGetterInst| false
-);
-mp_get_real!(
-    getter_get_zoom_x,
-    LayerGetterInst,
-    |_p: &LayerGetterInst| 1.0
-);
-mp_get_real!(
-    getter_get_zoom_y,
-    LayerGetterInst,
-    |_p: &LayerGetterInst| 1.0
-);
+mp_get_bool!(getter_get_flip_x, LayerGetterInst, |p: &LayerGetterInst| p
+    .flip_x);
+mp_get_bool!(getter_get_flip_y, LayerGetterInst, |p: &LayerGetterInst| p
+    .flip_y);
+mp_get_real!(getter_get_zoom_x, LayerGetterInst, |p: &LayerGetterInst| p
+    .zoom_x);
+mp_get_real!(getter_get_zoom_y, LayerGetterInst, |p: &LayerGetterInst| p
+    .zoom_y);
 mp_get_real!(
     getter_get_angle_deg,
     LayerGetterInst,
-    |p: &LayerGetterInst| p.angle.to_degrees()
+    |p: &LayerGetterInst| p.angle_deg
 );
 mp_get_real!(
     getter_get_angle_rad,
     LayerGetterInst,
-    |p: &LayerGetterInst| p.angle
+    |p: &LayerGetterInst| p.angle_rad
 );
 mp_get_real!(
     getter_get_slant_x,
     LayerGetterInst,
-    |_p: &LayerGetterInst| 0.0
+    |p: &LayerGetterInst| p.slant_x
 );
 mp_get_real!(
     getter_get_slant_y,
     LayerGetterInst,
-    |_p: &LayerGetterInst| 0.0
+    |p: &LayerGetterInst| p.slant_y
 );
 mp_get_real!(
     getter_get_origin_x,
     LayerGetterInst,
-    |_p: &LayerGetterInst| 0.0
+    |p: &LayerGetterInst| p.origin_x
 );
 mp_get_real!(
     getter_get_origin_y,
     LayerGetterInst,
-    |_p: &LayerGetterInst| 0.0
+    |p: &LayerGetterInst| p.origin_y
 );
 // `LayerGetter::getOpacity` returns the raw integer (default 255)
 // (`reference/cpp/plugins/motionplayer/SourceCache.h:199`, `:221`).
@@ -311,10 +370,25 @@ mp_get_int!(
     |p: &LayerGetterInst| p.opacity
 );
 
-/// Variant-valued `LayerGetter` members (`mtx`, `vtx`, `color`,
-/// `bezierPatch`, `shape`, `motion`, `particle`). The reference getters
-/// return an unset `tTJSVariant`, i.e. void
-/// (`reference/cpp/plugins/motionplayer/SourceCache.h:213-219`).
+// The array members of the layer getter. The player fills them with the
+// node's matrix, its vertex list and its colour; an instance the script
+// created on its own reports no value at all.
+mp_get_value_array!(getter_get_mtx, LayerGetterInst, |p: &LayerGetterInst| p
+    .mtx
+    .map(|mtx| mtx.iter().map(|value| TjsValue::Real(*value)).collect()));
+mp_get_value_array!(getter_get_vtx, LayerGetterInst, |p: &LayerGetterInst| p
+    .vtx
+    .map(|vtx| vtx.iter().map(|value| TjsValue::Real(*value)).collect()));
+mp_get_value_array!(getter_get_color, LayerGetterInst, |p: &LayerGetterInst| p
+    .color
+    .map(|color| color
+        .iter()
+        .map(|value| TjsValue::Integer(*value))
+        .collect()));
+
+/// The remaining variant-valued `LayerGetter` members (`bezierPatch`,
+/// `shape`, `motion`, `particle`). Nothing fills them, so the getters
+/// return an unset `tTJSVariant`, i.e. void.
 macro_rules! getter_void {
     ($name:ident) => {
         extern "C" fn $name(
@@ -332,9 +406,6 @@ macro_rules! getter_void {
         }
     };
 }
-getter_void!(getter_get_mtx);
-getter_void!(getter_get_vtx);
-getter_void!(getter_get_color);
 getter_void!(getter_get_bezier);
 getter_void!(getter_get_shape);
 getter_void!(getter_get_motion);

@@ -87,12 +87,12 @@ fn column_runs(bitmap: &BitmapState, x: u32) -> Vec<usize> {
 }
 
 /// A `mosaic` transition with `max_size`, stepped to half of its 100 ms
-/// duration (phase 128 — the peak of the block-size triangle wave, where
+/// duration (phase 127 — the peak of the block-size triangle wave, where
 /// the reference's block size equals `maxsize` for every `maxsize >= 1`).
 fn mid_phase(max_size: i32) -> Trans {
     let mut trans = Trans::new(TransKind::Mosaic { max_size }, 100.0).unwrap();
     trans.step(50.0);
-    assert_eq!(trans.phase(), 128, "phase 128 is the midpoint of 0..=255");
+    assert_eq!(trans.phase(), 127, "50/100 truncates to phase 127");
     trans
 }
 
@@ -117,7 +117,7 @@ fn mid_phase_paints_flat_blocks() {
     trans.apply(&mut dst, &src1, &src2, region(size)).unwrap();
     assert!(dst.dirty, "the transition must mark the destination dirty");
 
-    // `t = 255 - 128 = 127` → `block = (8 - 2) * 127 / 127 + 2 = 8`, and the
+    // `t = 255 - 127 = 128` → `block = (8 - 2) * 128 / 127 + 2 = 8`, and the
     // centring offset is `(16 - 8) / 2 - (8 / 8 * 8) = -4`, i.e. blocks
     // `[-4, 4)`, `[4, 12)`, `[12, 20)`: a 16 px row runs 4, 8, 4.
     assert_eq!(row_runs(&dst, 8), vec![4, 8, 4]);
@@ -134,7 +134,7 @@ fn mid_phase_paints_flat_blocks() {
 
     // The colour is the phase blend of the block-centre sample, not the
     // raw source: block `[4, 12)` samples `x = 8` → `r1 = 128`,
-    // `BlendRatio = 128` → `128 + ((255 - 128) * 128 >> 8) = 191`.
+    // `BlendRatio = 127` → `128 + ((255 - 128) * 127 >> 8) = 191`.
     assert_eq!(pixel(&dst, 4, 8), [191, 191, 0, 255]);
 }
 
@@ -205,7 +205,7 @@ fn size_one_degenerates_to_a_per_pixel_dissolve() {
     let trans = mid_phase(1);
     trans.apply(&mut dst, &src1, &src2, region(size)).unwrap();
 
-    // At the triangle's peak `block = (1 - 2) * 127 / 127 + 2 = 1`: every
+    // At the triangle's peak `block = (1 - 2) * 128 / 127 + 2 = 1`: every
     // pixel is its own block, its own sample point and its own colour —
     // a plain per-pixel dissolve. The expectation is computed per pixel
     // from that pixel's own source value, so any block of size >= 2 would
