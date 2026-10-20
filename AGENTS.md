@@ -240,6 +240,7 @@ Crate roles:
 | `api` | L1 | shared DTOs + typed `*Error` enums, no impls |
 | `fs` | L1 | stateless `FileSystem`/`FileState` + XP3 read/parse |
 | `media` | L1 | stateless `Media` + image/audio/video decode |
+| `psd` | L1 | stateless PSB container + PSD image decode (`forkunion`/`fearless_simd`) |
 | `render` | L1 | stateless `RenderPipeline`/`FontSystem` + Vulkan |
 | `platform` | L1 | window/surface, event loop, input, clock, threads |
 | `engine` | L2 | scene graph, mixer, timers, VFS, projection |

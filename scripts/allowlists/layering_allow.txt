@@ -31,25 +31,10 @@
 # baseline the existing per-file gaps so the guard still fails on a *new* file
 # or a new rule; they are file-level because the per-site list is long and
 # churns.  New missing notes inside a listed file are not caught.
-crates/app/src/game.rs:*:unsafe-no-safety-note — debt: wired scene/storage pointer attach; unsafe-inventory §2.7
-crates/compat/src/natives/debug.rs:*:unsafe-no-safety-note — debt: callback instance deref (DebugState); unsafe-inventory §2.6
-crates/compat/src/natives/kag/mod.rs:*:unsafe-no-safety-note — debt: state_of/instance_of callback derefs; unsafe-inventory §2.6
-crates/compat/src/natives/plugins/csv_parser/mod.rs:*:unsafe-no-safety-note — debt: callback instance deref (CsvParserInst); unsafe-inventory §2.6
 crates/compat/src/natives/plugins/motion_player/emote.rs:*:unsafe-no-safety-note — debt: property *const Value deref; unsafe-inventory §2.6
 crates/compat/src/natives/plugins/motion_player/helpers.rs:*:unsafe-no-safety-note — debt: inst_ref/inst_mut plus property derefs; unsafe-inventory §2.6
 crates/compat/src/natives/plugins/motion_player/player_members.rs:*:unsafe-no-safety-note — debt: property *const Value deref; unsafe-inventory §2.6
-crates/compat/src/natives/plugins/text_render/mod.rs:*:unsafe-no-safety-note — debt: property *const Value deref; unsafe-inventory §2.6
-crates/compat/src/natives/plugins/xp3_filter/mod.rs:*:unsafe-no-safety-note — debt: wired services pointer deref; unsafe-inventory §2.6
-crates/compat/src/natives/rect.rs:*:unsafe-no-safety-note — debt: payload pointer deref (RectData); unsafe-inventory §2.6
 crates/compat/src/natives/scripts.rs:*:unsafe-no-safety-note — debt: wired services/storage deref; unsafe-inventory §2.6
-crates/compat/src/natives/sound/phase_vocoder.rs:*:unsafe-no-safety-note — debt: property *const Value deref; unsafe-inventory §2.6
-crates/compat/src/natives/sound.rs:*:unsafe-no-safety-note — debt: callback argv/instance derefs and generated setters; unsafe-inventory §2.6
-crates/compat/src/natives/system.rs:*:unsafe-no-safety-note — debt: wired services pointer deref; unsafe-inventory §2.6
-crates/compat/src/natives/tree_owner.rs:*:unsafe-no-safety-note — debt: callback instance deref (TreeOwnerInst); unsafe-inventory §2.6
-crates/compat/src/natives/video.rs:*:unsafe-no-safety-note — debt: wired services pointer deref; unsafe-inventory §2.6
-crates/compat/src/natives/visual/font.rs:*:unsafe-no-safety-note — debt: wired services pointer deref; unsafe-inventory §2.6
-crates/compat/src/natives/visual/layer/mod.rs:*:unsafe-no-safety-note — debt: wired services pointer deref; unsafe-inventory §2.6
-crates/compat/src/natives/visual/layer/transitions.rs:*:unsafe-no-safety-note — debt: wired services pointer deref; unsafe-inventory §2.6
 
 # --- LEGITIMATE EXCEPTION: missing-docs lint absent from the tjs wrapper ---
 # A peer is deciding whether the vendored FFI wrapper takes the lint; the

@@ -1,22 +1,24 @@
-//! Photoshop descriptor parser (reference `psdparse/psddesc.{h,cpp}`).
+//! Photoshop descriptor reading.
 //!
-//! Descriptors encode the layer-comp and slice metadata. The reference builds
-//! a tree of `DescriptorItem` subclasses with typed downcasts; this port uses
-//! one [`Value`] enum and extracts the handful of fields the plugin exposes.
+//! Descriptors carry the layer-comp and slice metadata. They are a tagged tree:
+//! a unicode name, a class id, then keyed items whose type codes decide the
+//! payload that follows. One [`Value`] enum covers every shape and the handful
+//! of fields the plugin surface reads are extracted through its accessors.
 
 use std::collections::BTreeMap;
 
-use super::parse::{PsdError, Reader, Result};
+use crate::error::{PsdError, PsdResult};
+use crate::parse::Reader;
 
 /// One descriptor value.
 ///
-/// Only the fields the plugin actually reads are stored (see the accessors
-/// below); the payload-less variants exist so the parser consumes exactly
-/// the bytes the reference `readItem` would — keeping the descriptor cursor
-/// aligned without keeping values nobody reads.
+/// Only the fields the plugin reads are kept (see the accessors below); the
+/// payload-less variants exist so the reader consumes exactly the bytes their
+/// type codes announce, keeping the descriptor cursor aligned without storing
+/// values nobody reads.
 #[derive(Debug, Clone)]
 pub(crate) enum Value {
-    /// An object reference (`obj `); consumed but not interpreted.
+    /// An object pointer record (`obj `); consumed but not interpreted.
     Reference,
     /// A nested descriptor (`Objc` / `GlbO`).
     Descriptor(Descriptor),
@@ -78,9 +80,9 @@ impl Value {
 
 /// A parsed descriptor: its keyed items.
 ///
-/// The leading unicode name and class id the reference keeps on its
-/// `DescriptorItem` are consumed in [`read_descriptor`] (the cursor must
-/// advance past them) but never read by this port, so they are not stored.
+/// The leading unicode name and class id are consumed by
+/// [`read_descriptor`] (the cursor must advance past them) but are not
+/// retained because no accessor reads them.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Descriptor {
     pub(crate) items: BTreeMap<String, Value>,
@@ -123,8 +125,8 @@ impl Descriptor {
 }
 
 /// Read a keyed id: a length-prefixed string, where a zero length means the
-/// next four bytes are the id (reference `readId`).
-fn read_id(r: &mut Reader<'_>) -> Result<String> {
+/// next four bytes are the id.
+fn read_id(r: &mut Reader<'_>) -> PsdResult<String> {
     let mut id_size = r.i32()?;
     if id_size == 0 {
         id_size = 4;
@@ -136,8 +138,8 @@ fn read_id(r: &mut Reader<'_>) -> Result<String> {
     Ok(String::from_utf8_lossy(bytes).into_owned())
 }
 
-/// Read one value, dispatching on its 4-byte type code (reference `readItem`).
-fn read_item(r: &mut Reader<'_>) -> Result<Value> {
+/// Read one value, dispatching on its 4-byte type code.
+fn read_item(r: &mut Reader<'_>) -> PsdResult<Value> {
     let type_code = r.key4()?;
     match &type_code {
         b"obj " => read_reference(r),
@@ -181,7 +183,7 @@ fn read_item(r: &mut Reader<'_>) -> Result<Value> {
             Ok(Value::Alias)
         }
         // `tdta` (raw data) carries no length and cannot be skipped, so it
-        // aborts the descriptor (the reference does the same).
+        // aborts the descriptor.
         _ => Err(PsdError::Invalid(format!(
             "unsupported descriptor type {:?}",
             String::from_utf8_lossy(&type_code)
@@ -189,8 +191,8 @@ fn read_item(r: &mut Reader<'_>) -> Result<Value> {
     }
 }
 
-/// Consume an object reference (`obj `) without interpreting it.
-fn read_reference(r: &mut Reader<'_>) -> Result<Value> {
+/// Consume an object pointer record (`obj `) without interpreting it.
+fn read_reference(r: &mut Reader<'_>) -> PsdResult<Value> {
     let count = r.i32()?;
     for _ in 0..count.max(0) {
         let ref_type = r.key4()?;
@@ -229,10 +231,9 @@ fn read_reference(r: &mut Reader<'_>) -> Result<Value> {
     Ok(Value::Reference)
 }
 
-/// Read a descriptor: consume its unicode name and class id (cursor
-/// alignment only — neither is retained, see [`Descriptor`]) and its keyed
-/// items.
-pub(crate) fn read_descriptor(r: &mut Reader<'_>) -> Result<Descriptor> {
+/// Read a descriptor: consume its unicode name and class id (cursor alignment
+/// only, neither is retained) and then its keyed items.
+pub(crate) fn read_descriptor(r: &mut Reader<'_>) -> PsdResult<Descriptor> {
     let _ = r.unicode_string()?;
     let _ = read_id(r)?;
     let count = r.i32()?;

@@ -41,11 +41,8 @@ use crate::natives::visual::from_native;
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
-mod decode;
-mod descriptor;
-mod parse;
-
-use parse::{ImageMode, LayerInfo, LayerType, PsdFile};
+use psd::decode;
+use psd::parse::{BlendMode, ImageMode, LayerInfo, LayerType, PsdFile};
 
 // ---------------------------------------------------------------------------
 // Per-instance payload
@@ -270,9 +267,45 @@ fn argb_to_rgba(color: i64) -> [u8; 4] {
     ]
 }
 
-/// Map a KiriKiri `tTVPLayerType` onto the render pipeline's blend mode.
-fn native_to_blend(value: i32) -> SceneBlend {
-    from_native(i64::from(value))
+/// The scene blend for a PSD blend mode.
+fn psd_blend_to_scene(blend: BlendMode) -> SceneBlend {
+    from_native(i64::from(tvp_layer_type(blend)))
+}
+
+/// The `tTVPLayerType` a PSD blend mode maps onto.
+fn tvp_layer_type(blend: BlendMode) -> i32 {
+    match blend {
+        BlendMode::Normal => 13,      // ltPsNormal
+        BlendMode::Darken => 25,      // ltPsDarken
+        BlendMode::Multiply => 16,    // ltPsMultiplicative
+        BlendMode::ColorBurn => 23,   // ltPsColorBurn
+        BlendMode::LinearBurn => 15,  // ltPsSubtractive
+        BlendMode::Lighten => 24,     // ltPsLighten
+        BlendMode::Screen => 17,      // ltPsScreen
+        BlendMode::ColorDodge => 21,  // ltPsColorDodge
+        BlendMode::LinearDodge => 14, // ltPsAdditive
+        BlendMode::Overlay => 18,     // ltPsOverlay
+        BlendMode::SoftLight => 20,   // ltPsSoftLight
+        BlendMode::HardLight => 19,   // ltPsHardLight
+        BlendMode::Difference => 26,  // ltPsDifference
+        BlendMode::Exclusion => 28,   // ltPsExclusion
+        // Every other mode is unsupported and reports the normal type.
+        BlendMode::Invalid
+        | BlendMode::Dissolve
+        | BlendMode::VividLight
+        | BlendMode::LinearLight
+        | BlendMode::PinLight
+        | BlendMode::HardMix
+        | BlendMode::Hue
+        | BlendMode::Saturation
+        | BlendMode::Color
+        | BlendMode::Luminosity
+        | BlendMode::PassThrough
+        | BlendMode::DarkerColor
+        | BlendMode::LighterColor
+        | BlendMode::Subtract
+        | BlendMode::Divide => 13,
+    }
 }
 
 /// Allocate (or resize) `layer_id`'s bitmap and return its id, filling new
@@ -334,7 +367,7 @@ fn place_layer_image(
         width,
         height,
         opacity,
-        native_type,
+        blend,
         pixels,
     } = image;
     write_layer_pixels(scene, layer_id, width, height, pixels);
@@ -349,7 +382,7 @@ fn place_layer_image(
         layer.image_height = height;
         layer.opacity = f32::from(opacity) / 255.0;
         layer.visible = visible;
-        layer.blend = native_to_blend(native_type);
+        layer.blend = psd_blend_to_scene(blend);
         layer.name = name.to_string();
         layer.image_modified = true;
     }
@@ -487,7 +520,7 @@ extern "C" fn psd_load(
     let inst = unsafe { &mut *(instance as *mut PsdInst) };
 
     match read_psd_bytes(&binding.ctx(), &filename) {
-        Ok(bytes) => match parse::parse(&bytes) {
+        Ok(bytes) => match psd::parse::parse(&bytes) {
             Ok(file) => {
                 inst.file = Some(file);
                 set_bool(out, true);
@@ -650,7 +683,12 @@ fn build_layer_info(
         "mask",
         i64::from(layer.channels.iter().any(|c| c.is_mask_channel())),
     )?;
-    set_int_member(host, id, "type", i64::from(layer.blend_mode.as_tvp()))?;
+    set_int_member(
+        host,
+        id,
+        "type",
+        i64::from(tvp_layer_type(layer.blend_mode)),
+    )?;
     set_int_member(host, id, "layer_type", i64::from(layer.layer_type.as_i32()))?;
     set_int_member(host, id, "blend_mode", i64::from(layer.blend_mode.as_i32()))?;
     set_int_member(host, id, "visible", i64::from(layer.is_visible()))?;
@@ -1274,4 +1312,39 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         }],
         properties: constant_properties(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SceneBlend, psd_blend_to_scene, tvp_layer_type};
+    use psd::parse::BlendMode;
+
+    /// `convBlendMode` maps each PSD blend onto its `tTVPLayerType`, and a mode
+    /// the plugin does not support reports `ltPsNormal`
+    /// (`reference/cpp/plugins/psdfile/psdclass.cpp:14-48`).
+    #[test]
+    fn blend_modes_map_onto_their_layer_type() {
+        assert_eq!(tvp_layer_type(BlendMode::Normal), 13);
+        assert_eq!(tvp_layer_type(BlendMode::Multiply), 16);
+        assert_eq!(tvp_layer_type(BlendMode::LinearDodge), 14);
+        assert_eq!(tvp_layer_type(BlendMode::Difference), 26);
+        assert_eq!(tvp_layer_type(BlendMode::Exclusion), 28);
+        assert_eq!(tvp_layer_type(BlendMode::Invalid), 13);
+    }
+
+    /// The blend a decoded layer is placed with is the blend mode's layer type,
+    /// read through the render pipeline's blend vocabulary
+    /// (`reference/cpp/plugins/psdfile/psdclass.cpp:14-48`).
+    #[test]
+    fn blend_modes_reach_the_scene_as_their_layer_type() {
+        assert_eq!(psd_blend_to_scene(BlendMode::Normal), SceneBlend::PsNormal);
+        assert_eq!(
+            psd_blend_to_scene(BlendMode::Multiply),
+            SceneBlend::PsMultiplicative
+        );
+        assert_eq!(
+            psd_blend_to_scene(BlendMode::Overlay),
+            SceneBlend::DestinationDependent(api::blend::DstBlend::Overlay)
+        );
+    }
 }

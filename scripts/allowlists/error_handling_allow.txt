@@ -110,9 +110,6 @@ crates/platform/fs/src/ops.rs:426:u64::try_from(v.len()) — usize -> u64 cannot
 crates/platform/fs/src/ops.rs:455:u64::try_from(n) — usize -> u64 cannot overflow on any supported target
 
 # --- reference Option defaults (audit §3.3) --------------------------------
-crates/compat/src/natives/plugins/psd_file/parse.rs:799:descriptor.integer("lastAppliedComp").unwrap_or(-1) — the reference defaults an absent lastAppliedComp to -1 (reference/cpp/plugins/psdfile/psdparse/psdresource.cpp:112-113)
-crates/compat/src/natives/plugins/psd_file/parse.rs:1146:offset.integer("Hrzn").unwrap_or(0) — the reference defaults an absent Hrzn to 0 (reference/cpp/plugins/psdfile/psdparse/psdlayer.cpp:87-89)
-crates/compat/src/natives/plugins/psd_file/parse.rs:1147:offset.integer("Hrzn").unwrap_or(0) — the reference defaults an absent Hrzn to 0 (reference/cpp/plugins/psdfile/psdparse/psdlayer.cpp:87-89)
 crates/compat/src/natives/storages.rs:163:normalize_storage_name(name) — TVPGetPlacedPath returns the normalized input when the placement is outside the game directory (reference/cpp/core/base/StorageIntf.cpp:1061-1097)
 crates/compat/src/resource.rs:225:let _ = self.resolve_face(ctx, DEFAULT_FACE); — Font.getList/defaultFaceName have no reference error path; an unresolved default yields the empty list/name (LayerIntf.cpp:11777-11786, 12177)
 crates/compat/src/resource.rs:233:let _ = self.resolve_face(ctx, DEFAULT_FACE); — Font.getList/defaultFaceName have no reference error path; an unresolved default yields the empty list/name (LayerIntf.cpp:11777-11786, 12177)
@@ -141,8 +138,6 @@ crates/compat/src/natives/sound/phase_vocoder.rs:137:instance as usize as i64 �
 
 # The receiver is a pointer but the cast is on a numeric value read through
 # it, not on the address (review-trigger false positives).
-crates/compat/src/natives/kag/mod.rs:1346:state_of(instance) }.$method() as i64 — macro reads a numeric KAG state field through the instance payload; the cast is on the field, not the pointer
-crates/compat/src/natives/kag/mod.rs:1361:state_of(instance) }.$field as i64 — macro reads a numeric KAG state field through the instance payload; the cast is on the field, not the pointer
 crates/compat/src/natives/sound/phase_vocoder.rs:150:payload.config.window as i64 — `window` is the FFT size in samples, not the payload address
 crates/compat/src/natives/system.rs:1744:&*ptr }.graphic_cache_limit() as i32 — dereferences the pointer to a numeric cache limit; the cast is on the field, not the address
 

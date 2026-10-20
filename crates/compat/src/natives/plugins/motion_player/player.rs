@@ -22,15 +22,17 @@ use tjs::{DetachedValue, RetainedValue, TjsValue, VAL_OBJECT, Value};
 use super::StoredValue;
 use super::adaptors::SeparateInst;
 use super::animator::{Animator, ColorAnimator, ease_weight};
-use super::helpers::{eval_object, inst_mut, inst_ref, set_string, value_as_f64};
+use super::helpers::{eval_object, inst_mut, inst_ref, set_real, set_string, value_as_f64};
 use super::model::{
     FrameState, IconInfo, MotionEvent, MotionNode, MotionSnapshot, TimelineState, build_node_tree,
     evaluate_frames, prime_timelines, scan_frame_events, step_timelines,
 };
 use super::resource::{MotionStore, ResourceInst};
-use super::texture::{Pixels, decode_pixels};
-use crate::engine_api::layer_ops::{AffineBlit, BlitOptions, BlitSource, RectI, affine_blit};
-use crate::engine_api::{BitmapState, Storage, StorageReadError};
+use super::texture::Pixels;
+use crate::engine_api::layer_ops::{
+    AffineBlit, BlitOptions, BlitSource, RectI, affine_blit, blit_over,
+};
+use crate::engine_api::{BitmapState, Scene, Storage};
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
 use crate::natives::system::{resolve, value_as_bool, value_as_i64};
 use crate::storage::strip_file_media;
@@ -71,6 +73,20 @@ pub(crate) struct ResolvedMotion {
     pub(crate) id: u64,
     pub(crate) path: String,
 }
+
+/// A cropped icon source tinted by one player colour.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct TintKey {
+    src: String,
+    color: [u8; 4],
+    crop: RectI,
+    pixels: usize,
+}
+
+/// The tinted icon sources the player draws, keyed by source, colour and the
+/// decoded atlas they were cropped from. The entries are dropped when the
+/// bound motion changes.
+pub(crate) type TintedSources = HashMap<TintKey, Arc<BitmapState>>;
 
 /// `Player` instance payload.
 pub(crate) struct PlayerInst {
@@ -128,10 +144,12 @@ pub(crate) struct PlayerInst {
     pub(crate) variable_values: HashMap<String, f64>,
     pub(crate) variable_animators: HashMap<String, Animator>,
     pub(crate) nodes: Vec<MotionNode>,
+    /// Whether the node tree needs an evaluation before it is drawn.
+    pub(crate) layers_dirty: bool,
     pub(crate) pending_events: Vec<MotionEvent>,
-    /// The decoded pixel chunks the active motion draws, keyed by their
-    /// `psb://` storage name.
-    pub(crate) textures: HashMap<String, Arc<Pixels>>,
+    /// The tinted icon sources the active motion draws, keyed by source and
+    /// player colour.
+    pub(crate) tinted: TintedSources,
     /// The `src` keys already reported as having no readable texture, so a
     /// missing icon is reported once instead of on every frame.
     pub(crate) missing_textures: BTreeSet<String>,
@@ -235,8 +253,9 @@ impl Default for PlayerInst {
             variable_values: HashMap::new(),
             variable_animators: HashMap::new(),
             nodes: Vec::new(),
+            layers_dirty: true,
             pending_events: Vec::new(),
-            textures: HashMap::new(),
+            tinted: HashMap::new(),
             missing_textures: BTreeSet::new(),
             coord: CoordState::default(),
             scale: Animator::at(1.0),
@@ -465,7 +484,14 @@ impl PlayerInst {
         self.variable_values.clear();
         self.variable_animators.clear();
         self.affine = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-        self.textures.clear();
+        self.clear_source_cache();
+        self.layers_dirty = true;
+    }
+
+    /// Drop the tinted sources and the missing-source report so the next draw
+    /// rebuilds them.
+    fn clear_source_cache(&mut self) {
+        self.tinted.clear();
         self.missing_textures.clear();
     }
 
@@ -476,11 +502,16 @@ impl PlayerInst {
         resolved: &ResolvedMotion,
         ctx: &CompatCtx,
     ) -> Result<(), String> {
+        self.clear_source_cache();
         self.snapshot = Some(resolved.snapshot.clone());
         self.timelines.clear();
         self.playing_timelines.clear();
         prime_timelines(&resolved.snapshot, &mut self.timelines);
         self.nodes = build_node_tree(&resolved.snapshot, None);
+        self.layers_dirty = true;
+        // A motion activates behind the frame gate: the next progress advances
+        // no clock and only presents the first pose.
+        self.queuing = true;
         for label in &resolved.snapshot.variable_labels {
             self.variable_values
                 .entry(label.clone())
@@ -549,8 +580,8 @@ impl PlayerInst {
             self.snapshot = None;
             self.timelines.clear();
             self.playing_timelines.clear();
-            self.textures.clear();
-            self.missing_textures.clear();
+            self.clear_source_cache();
+            self.layers_dirty = true;
         }
     }
 
@@ -566,8 +597,8 @@ impl PlayerInst {
         self.variable_values.clear();
         self.variable_animators.clear();
         self.affine = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-        self.textures.clear();
-        self.missing_textures.clear();
+        self.clear_source_cache();
+        self.layers_dirty = true;
         self.motion_key.clear();
         if let Some(manager) = self.resource_manager.object_id() {
             clear_manager_cache(ctx, manager);
@@ -648,9 +679,26 @@ impl PlayerInst {
         if !self.speed {
             return;
         }
+        // A delta outside the accepted range is dropped rather than clamped to
+        // the bound, so one bad tick cannot skip the animation ahead.
+        let dt_ms = if (0.0..=60000.0).contains(&dt_ms) {
+            dt_ms
+        } else {
+            0.0
+        };
         let frames = dt_ms * 60.0 / 1000.0;
-        self.frame_tick_count += frames;
         self.frame_last_time = frames;
+        self.busy = false;
+        if self.queuing {
+            // A motion that was just activated records the delta but leaves
+            // every clock alone; the layer update that follows clears the gate.
+            self.prune_playing_timelines();
+            self.sync_active = self.sync_waiting && self.allplaying;
+            self.update_layers();
+            self.dispatch_events(ctx, objthis);
+            return;
+        }
+        self.frame_tick_count += frames;
         self.coord.x.step(frames as f32);
         self.coord.y.step(frames as f32);
         self.scale.step(frames as f32);
@@ -658,11 +706,33 @@ impl PlayerInst {
         if self.wind.active {
             self.wind.phase += frames;
         }
-        self.busy = false;
         self.advance_timelines(frames);
         self.update_layers();
         self.step_animators(frames as f32);
         self.dispatch_events(ctx, objthis);
+    }
+
+    /// The playback position as a `0..=1` ratio, or `1.0` once nothing plays.
+    pub(crate) fn progress_ratio(&self) -> f64 {
+        let mut saw_timeline = false;
+        let mut any_playing = false;
+        let mut progress: f64 = 0.0;
+        for state in self.timelines.values() {
+            saw_timeline = true;
+            any_playing = any_playing || state.playing;
+            if state.total_frames > 0.0 {
+                progress = progress.max((state.current_time / state.total_frames).clamp(0.0, 1.0));
+            } else if !state.playing {
+                progress = progress.max(1.0);
+            }
+        }
+        if !saw_timeline {
+            return if any_playing { 0.0 } else { 1.0 };
+        }
+        if !any_playing {
+            return 1.0;
+        }
+        progress
     }
 
     /// Advance everything by `frames` frame units without dispatching events.
@@ -670,8 +740,14 @@ impl PlayerInst {
         if !self.speed {
             return;
         }
-        self.frame_tick_count += frames;
         self.frame_last_time = frames;
+        if self.queuing {
+            self.prune_playing_timelines();
+            self.sync_active = self.sync_waiting && self.allplaying;
+            self.update_layers();
+            return;
+        }
+        self.frame_tick_count += frames;
         self.advance_timelines(frames);
         self.update_layers();
     }
@@ -686,17 +762,20 @@ impl PlayerInst {
                     .map(|state| (label.clone(), state.current_time))
             })
             .collect();
-        let events = if let Some(snapshot) = self.snapshot.clone() {
-            step_timelines(&snapshot, &mut self.timelines, frames)
+        let snapshot = self.snapshot.clone();
+        let events = if let Some(snapshot) = snapshot.as_deref() {
+            step_timelines(snapshot, &mut self.timelines, frames)
         } else {
             Vec::new()
         };
         self.pending_events.extend(events);
-        for (label, previous) in previous {
-            let current = self.timelines.get(&label).map(|state| state.current_time);
-            if let Some(current) = current {
-                let events = scan_frame_events(&self.nodes, previous, current);
-                self.pending_events.extend(events);
+        if let Some(snapshot) = snapshot.as_deref() {
+            for (label, previous) in previous {
+                let current = self.timelines.get(&label).map(|state| state.current_time);
+                if let Some(current) = current {
+                    let events = scan_frame_events(&snapshot.event_tracks, previous, current);
+                    self.pending_events.extend(events);
+                }
             }
         }
         self.prune_playing_timelines();
@@ -712,12 +791,16 @@ impl PlayerInst {
     /// Evaluate the node tree at the selected clip's timeline time.
     pub(crate) fn update_layers(&mut self) {
         if self.nodes.is_empty() {
+            self.layers_dirty = false;
             return;
         }
         let time = self.eval_time();
-        // Evaluate each node's local state.
+        // Evaluate each node's local state. A layer expanded from a child motion
+        // runs on that clip's own clock, so it is offset by the parent keyframe
+        // that named it and never evaluated before its start.
         for index in 0..self.nodes.len() {
-            let state = evaluate_frames(&self.nodes[index].frames, time);
+            let local_time = (time - self.nodes[index].time_offset).max(0.0);
+            let state = evaluate_frames(&self.nodes[index].frames, local_time);
             let node = &mut self.nodes[index];
             node.local = state;
             node.draw_flag = true;
@@ -725,32 +808,52 @@ impl PlayerInst {
         // The root viewport state is applied before the children inherit it,
         // so a visibility or opacity change takes effect in the same frame.
         let root = &mut self.nodes[0];
-        root.accumulated.x = root.local.x + self.root_x;
-        root.accumulated.y = root.local.y + self.root_y;
+        root.accumulated.x = root.local.x + self.coord.x.value() as f64 + self.root_x;
+        root.accumulated.y = root.local.y + self.coord.y.value() as f64 + self.root_y;
         root.accumulated.ox = root.local.ox;
         root.accumulated.oy = root.local.oy;
         root.accumulated.active = self.visible;
         root.accumulated.opacity = self.opacity;
+        root.accumulated.angle = self.rotate.value() as f64;
+        root.accumulated.scale_x = self.scale.value() as f64;
+        root.accumulated.scale_y = self.scale.value() as f64;
+        root.matrix = local_matrix(&root.accumulated, &root.transform_order);
         root.draw_flag = self.visible;
-        // Accumulate parent transforms into world coordinates.
+        // Accumulate the parent transform into world coordinates: the child's
+        // position is the parent matrix applied to its local offset, and its
+        // matrix is the parent's composed with its own.
         for index in 1..self.nodes.len() {
             let parent = self.nodes[index].parent;
             let local = self.nodes[index].local.clone();
             let parent_state = self.nodes[parent].accumulated.clone();
-            let (px, py) = (parent_state.x, parent_state.y);
+            let parent_matrix = self.nodes[parent].matrix;
+            let transform_order = self.nodes[index].transform_order;
+            let local_2x2 = local_matrix(&local, &transform_order);
             let node = &mut self.nodes[index];
             node.accumulated = local.clone();
-            node.accumulated.x = px + local.x;
-            node.accumulated.y = py + local.y;
+            node.accumulated.x =
+                parent_matrix[0] * local.x + parent_matrix[1] * local.y + parent_state.x;
+            node.accumulated.y =
+                parent_matrix[2] * local.x + parent_matrix[3] * local.y + parent_state.y;
             node.accumulated.z = parent_state.z + local.z;
             node.accumulated.opacity = parent_state.opacity * local.opacity;
             node.accumulated.angle = parent_state.angle + local.angle;
             node.accumulated.scale_x = parent_state.scale_x * local.scale_x;
             node.accumulated.scale_y = parent_state.scale_y * local.scale_y;
+            node.matrix = [
+                parent_matrix[0] * local_2x2[0] + parent_matrix[1] * local_2x2[2],
+                parent_matrix[0] * local_2x2[1] + parent_matrix[1] * local_2x2[3],
+                parent_matrix[2] * local_2x2[0] + parent_matrix[3] * local_2x2[2],
+                parent_matrix[2] * local_2x2[1] + parent_matrix[3] * local_2x2[3],
+            ];
             node.draw_flag = parent_state.active && local.active && parent_state.opacity > 0.0;
         }
         let vertices = self.nodes.iter().filter(|node| node.draw_flag).count();
         self.processed_mesh_vertices_num = vertices as i32;
+        // The gate a freshly activated motion holds is released by the first
+        // layer update.
+        self.queuing = false;
+        self.layers_dirty = false;
     }
 
     pub(crate) fn dispatch_events(&mut self, ctx: &CompatCtx, objthis: *mut std::ffi::c_void) {
@@ -892,6 +995,11 @@ impl PlayerInst {
             self.play_clip_layers(&snapshot, label);
             self.rebuild_tree(&snapshot, label);
         }
+        // A play that does not chain re-arms the frame gate, so the first
+        // progress after it presents the new pose without advancing.
+        if (flags & 2) == 0 {
+            self.queuing = true;
+        }
         self.prune_playing_timelines();
         Ok(started)
     }
@@ -905,6 +1013,7 @@ impl PlayerInst {
 
     pub(crate) fn rebuild_tree(&mut self, snapshot: &MotionSnapshot, label: &str) {
         self.nodes = build_node_tree(snapshot, snapshot.clip(label));
+        self.layers_dirty = true;
         self.ensure_root_offsets();
     }
 
@@ -1106,7 +1215,11 @@ impl PlayerInst {
 
     /// Draw the current pose onto the target layer through the L2 scene.
     pub(crate) fn draw(&mut self, ctx: &CompatCtx, target: &StoredValue) -> Result<(), String> {
-        self.update_layers();
+        // The progress path evaluates the tree; a draw evaluates it only when
+        // the tree changed since the last evaluation.
+        if self.layers_dirty {
+            self.update_layers();
+        }
         let Some(target_id) = target.object_id() else {
             return Ok(());
         };
@@ -1126,60 +1239,57 @@ impl PlayerInst {
         };
         // SAFETY: the host keeps the attached scene alive for the binding.
         let scene = unsafe { &mut *scene };
-        let color = color_bytes(self.color.bytes);
-        let nodes = drawable_nodes(&self.nodes);
-        let Some(bitmap_id) = scene.layer(layer_id).and_then(|layer| layer.bitmap) else {
-            return Ok(());
-        };
-        let (width, height) = match scene.bitmap(bitmap_id) {
-            Some(bitmap) => (bitmap.width, bitmap.height),
-            None => return Ok(()),
-        };
-        if width == 0 || height == 0 {
-            return Ok(());
-        }
-        let snapshot = self.snapshot.clone();
-        let clear = clear_fill(self.clear_enabled, self.clear_color);
         // SAFETY: the host keeps the attached storage alive for the binding.
         let storage = unsafe { ctx.services() }.storage();
         // SAFETY: the host keeps the attached storage alive for the binding.
         let storage = storage.map(|storage| unsafe { &*storage });
-        let affine = self.affine;
-        let textures = &mut self.textures;
-        let rendered = scene.with_main_image_pixels_mut(layer_id, |pixels| {
-            // Every draw starts from a clear target; the previous pose never
-            // survives into this frame.
-            for pixel in pixels.chunks_exact_mut(4) {
-                pixel.copy_from_slice(&clear);
-            }
-            let mut bitmap = BitmapState::new(width, height, pixels.to_vec());
-            let missing = composite_nodes(
-                &mut bitmap,
-                &nodes,
-                snapshot.as_deref(),
-                storage,
-                color,
-                affine,
-                textures,
-            );
-            (bitmap.rgba, missing)
-        });
-        let Some((rgba, missing)) = rendered else {
-            return Ok(());
+        self.draw_into_scene(scene, layer_id, storage);
+        Ok(())
+    }
+
+    /// Clear the target image and composite the current pose into it in place.
+    fn draw_into_scene(&mut self, scene: &mut Scene, layer_id: u32, storage: Option<&Storage>) {
+        let Some(bitmap_id) = scene.layer(layer_id).and_then(|layer| layer.bitmap) else {
+            return;
         };
+        let Some(bitmap) = scene.bitmap(bitmap_id) else {
+            return;
+        };
+        if bitmap.width == 0 || bitmap.height == 0 {
+            return;
+        }
+        let snapshot = self.snapshot.clone();
+        let color = color_bytes(self.color.bytes);
+        let clear = clear_fill(self.clear_enabled, self.clear_color);
+        let affine = self.affine;
+        let nodes = drawable_nodes(&self.nodes);
+        let tinted = &mut self.tinted;
+        let Some(bitmap) = scene.bitmap_mut(bitmap_id) else {
+            return;
+        };
+        // Every draw starts from a clear target; the previous pose never
+        // survives into this frame.
+        for pixel in bitmap.rgba.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&clear);
+        }
+        let missing = composite_nodes(
+            bitmap,
+            nodes,
+            snapshot.as_deref(),
+            storage,
+            color,
+            affine,
+            tinted,
+        );
+        bitmap.mark_dirty();
+        if let Some(layer) = scene.layer_mut(layer_id) {
+            layer.image_modified = true;
+        }
         for src in missing {
             if self.missing_textures.insert(src.clone()) {
                 log::warn!("Motion.Player.draw: no texture for {src}");
             }
         }
-        if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
-            bitmap.rgba = rgba;
-            bitmap.mark_dirty();
-        }
-        if let Some(layer) = scene.layer_mut(layer_id) {
-            layer.image_modified = true;
-        }
-        Ok(())
     }
 }
 
@@ -1193,40 +1303,37 @@ struct DrawFrame<'a> {
     storage: Option<&'a Storage>,
     color: [u8; 4],
     affine: [f64; 6],
-    textures: &'a mut HashMap<String, Arc<Pixels>>,
+    tinted: &'a mut TintedSources,
     missing: Vec<String>,
 }
 
-/// The node frame painted into the target: shape nodes plus object nodes that
-/// name an icon source.
-fn drawable_nodes(nodes: &[MotionNode]) -> Vec<MotionNode> {
-    nodes
-        .iter()
-        .filter(|node| {
-            node.draw_flag
-                && (node.shape > 0 || (node.node_type == 0 && !node.local.src.is_empty()))
-        })
-        .cloned()
-        .collect()
+/// The node frames painted into the target: visible shape nodes plus object
+/// nodes that name an icon source and still compose any opacity.
+fn drawable_nodes<'a>(nodes: &'a [MotionNode]) -> impl Iterator<Item = &'a MotionNode> + 'a {
+    nodes.iter().filter(|node| {
+        node.draw_flag
+            && node.accumulated.opacity != 0.0
+            && (node.shape.is_positive() || (node.node_type == 0 && !node.local.src.is_empty()))
+    })
 }
 
 /// Paint `nodes` over `bitmap` in order, returning the icon sources that had no
 /// readable texture.
-fn composite_nodes(
+fn composite_nodes<'a, 'b>(
     bitmap: &mut BitmapState,
-    nodes: &[MotionNode],
-    snapshot: Option<&MotionSnapshot>,
-    storage: Option<&Storage>,
+    nodes: impl IntoIterator<Item = &'a MotionNode>,
+    snapshot: Option<&'b MotionSnapshot>,
+    storage: Option<&'b Storage>,
     color: [u8; 4],
     affine: [f64; 6],
-    textures: &mut HashMap<String, Arc<Pixels>>,
+    tinted: &'b mut TintedSources,
 ) -> Vec<String> {
     let mut frame = DrawFrame {
         snapshot,
         storage,
         color,
         affine,
-        textures,
+        tinted,
         missing: Vec::new(),
     };
     for node in nodes {
@@ -1264,66 +1371,176 @@ fn draw_node(bitmap: &mut BitmapState, node: &MotionNode, frame: &mut DrawFrame<
         }
         return;
     };
-    let Some((pixels, crop)) = icon_pixels(snapshot, storage, icon, frame.textures) else {
+    let Some((pixels, crop)) = icon_pixels(snapshot, storage, icon) else {
         frame.missing.push(node.local.src.clone());
         return;
     };
-    let width = (crop.2 - crop.0) as u32;
-    let height = (crop.3 - crop.1) as u32;
-    if width == 0 || height == 0 {
+    let width = crop.2 - crop.0;
+    let height = crop.3 - crop.1;
+    if width <= 0 || height <= 0 {
         return;
     }
-    // The quad's source is the cropped icon tinted by the player color, so
-    // the corners map that rectangle 1:1 onto the layer.
-    let mut source = BitmapState::new(
-        width,
-        height,
-        vec![0u8; width as usize * height as usize * 4],
-    );
-    for y in 0..height as usize {
-        for x in 0..width as usize {
-            let from = ((crop.1 as usize + y) * pixels.width as usize + crop.0 as usize + x) * 4;
-            let to = (y * width as usize + x) * 4;
-            for (channel, value) in source.rgba[to..to + 4].iter_mut().enumerate() {
-                *value = (u32::from(pixels.rgba[from + channel]) * u32::from(frame.color[channel])
-                    / 255) as u8;
-            }
-        }
-    }
-    let matrix = local_matrix(&node.accumulated, &node.transform_order);
-    let (center_x, center_y) = (node.accumulated.x, node.accumulated.y);
-    let corner = |local_x: f64, local_y: f64| {
-        let x = center_x + matrix[0] * local_x + matrix[1] * local_y;
-        let y = center_y + matrix[2] * local_x + matrix[3] * local_y;
-        draw_point(frame.affine, x, y)
+    let Some(source) = tinted_source(frame, &pixels, crop, &node.local.src) else {
+        return;
     };
+    let matrix = node.matrix;
+    // The icon origin is offset in world space: the matrix applied to the
+    // origin is subtracted from the node position, then the quad is laid out
+    // from that corner.
     let (origin_x, origin_y) = (
         icon.origin_x + node.accumulated.ox,
         icon.origin_y + node.accumulated.oy,
     );
+    let corner_x = node.accumulated.x - (matrix[1] * origin_y + origin_x * matrix[0]);
+    let corner_y = node.accumulated.y - (origin_y * matrix[3] + origin_x * matrix[2]);
+    let corner = |local_x: f64, local_y: f64| {
+        let x = corner_x + matrix[0] * local_x + matrix[1] * local_y;
+        let y = corner_y + matrix[2] * local_x + matrix[3] * local_y;
+        draw_point(frame.affine, x, y)
+    };
+    let corners = [
+        corner(0.0, 0.0),
+        corner(f64::from(width), 0.0),
+        corner(0.0, f64::from(height)),
+    ];
+    let opa = (node.accumulated.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+    draw_icon(bitmap, &source, width, height, corners, opa);
+}
+
+/// The cropped icon source tinted by the player colour, from the cache or
+/// freshly built.
+fn tinted_source(
+    frame: &mut DrawFrame<'_>,
+    pixels: &Arc<Pixels>,
+    crop: RectI,
+    src: &str,
+) -> Option<Arc<BitmapState>> {
+    let key = TintKey {
+        src: src.to_string(),
+        color: frame.color,
+        crop,
+        pixels: Arc::as_ptr(pixels) as usize,
+    };
+    if let Some(source) = frame.tinted.get(&key) {
+        return Some(source.clone());
+    }
+    let source = Arc::new(tint_crop(pixels, crop, frame.color)?);
+    frame.tinted.insert(key, source.clone());
+    Some(source)
+}
+
+/// Crop `pixels` to `crop` and scale each channel by `color`.
+fn tint_crop(pixels: &Pixels, crop: RectI, color: [u8; 4]) -> Option<BitmapState> {
+    let width = u32::try_from(crop.2.checked_sub(crop.0)?).ok()?;
+    let height = u32::try_from(crop.3.checked_sub(crop.1)?).ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let width_usize = usize::try_from(width).ok()?;
+    let height_usize = usize::try_from(height).ok()?;
+    let row_bytes = width_usize.checked_mul(4)?;
+    let source_width = usize::try_from(pixels.width).ok()?;
+    let source_left = usize::try_from(crop.0).ok()?;
+    let mut rgba = Vec::with_capacity(row_bytes.checked_mul(height_usize)?);
+    for y in crop.1..crop.3 {
+        let row = usize::try_from(y).ok()?.checked_mul(source_width)?;
+        let start = row.checked_add(source_left)?.checked_mul(4)?;
+        let row = pixels.rgba.get(start..start.checked_add(row_bytes)?)?;
+        for pixel in row.chunks_exact(4) {
+            rgba.extend_from_slice(&[
+                (u32::from(pixel[0]) * u32::from(color[0]) / 255) as u8,
+                (u32::from(pixel[1]) * u32::from(color[1]) / 255) as u8,
+                (u32::from(pixel[2]) * u32::from(color[2]) / 255) as u8,
+                (u32::from(pixel[3]) * u32::from(color[3]) / 255) as u8,
+            ]);
+        }
+    }
+    Some(BitmapState::new(width, height, rgba))
+}
+
+/// Composite a cropped icon onto its quad.
+///
+/// An axis-aligned, unit-scale, whole-pixel placement maps source texels onto
+/// destination pixels one to one, so it takes the direct blit path. Every
+/// other placement keeps the inverse-mapped affine resampler.
+fn draw_icon(
+    bitmap: &mut BitmapState,
+    source: &BitmapState,
+    width: i32,
+    height: i32,
+    corners: [(f64, f64); 3],
+    opa: u8,
+) {
+    let rect = (0, 0, width, height);
+    if let Some((x, y)) = unit_axis_aligned_origin(corners, width, height) {
+        blit_over(
+            bitmap,
+            x,
+            y,
+            BlitSource {
+                bitmap: source,
+                rect,
+            },
+            (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+            BlitOptions {
+                mode: 2,
+                opa,
+                treat_as_opaque: false,
+                hold_alpha: false,
+            },
+        );
+        return;
+    }
     affine_blit(
         bitmap,
         AffineBlit {
-            corners: [
-                corner(-origin_x, -origin_y),
-                corner(f64::from(width) - origin_x, -origin_y),
-                corner(-origin_x, f64::from(height) - origin_y),
-            ],
+            corners,
             stretch_type: 2,
             clear: false,
             clear_color: [0, 0, 0, 0],
         },
         BlitSource {
-            bitmap: &source,
-            rect: (0, 0, width as i32, height as i32),
+            bitmap: source,
+            rect,
         },
         BlitOptions {
             mode: 2,
-            opa: (node.accumulated.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
+            opa,
             treat_as_opaque: false,
             hold_alpha: false,
         },
     );
+}
+
+/// The destination origin of a unit-scale, axis-aligned, whole-pixel
+/// placement, or `None` for a placement the affine resampler must handle.
+fn unit_axis_aligned_origin(
+    corners: [(f64, f64); 3],
+    width: i32,
+    height: i32,
+) -> Option<(i32, i32)> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let [origin, right, down] = corners;
+    let width = f64::from(width);
+    let height = f64::from(height);
+    if (right.0 - origin.0).to_bits() != width.to_bits()
+        || right.1.to_bits() != origin.1.to_bits()
+        || (down.1 - origin.1).to_bits() != height.to_bits()
+        || down.0.to_bits() != origin.0.to_bits()
+        || origin.0.fract() != 0.0
+        || origin.1.fract() != 0.0
+    {
+        return None;
+    }
+    let (x, y) = (origin.0, origin.1);
+    if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&x)
+        || !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&y)
+    {
+        return None;
+    }
+    Some((x as i32, y as i32))
 }
 
 /// Map a node point through the player's draw affine.
@@ -1341,16 +1558,19 @@ fn fill_placeholder_quad(
     color: [u8; 4],
     affine: [f64; 6],
 ) {
-    let (cx, cy) = (node.accumulated.x, node.accumulated.y);
-    let (sx, sy) = (
-        node.accumulated.scale_x.abs().max(0.01),
-        node.accumulated.scale_y.abs().max(0.01),
-    );
+    let matrix = node.matrix;
+    let corner = |local_x: f64, local_y: f64| {
+        draw_point(
+            affine,
+            node.accumulated.x + matrix[0] * local_x + matrix[1] * local_y,
+            node.accumulated.y + matrix[2] * local_x + matrix[3] * local_y,
+        )
+    };
     let points = [
-        draw_point(affine, cx - 32.0 * sx, cy - 32.0 * sy),
-        draw_point(affine, cx + 32.0 * sx, cy - 32.0 * sy),
-        draw_point(affine, cx + 32.0 * sx, cy + 32.0 * sy),
-        draw_point(affine, cx - 32.0 * sx, cy + 32.0 * sy),
+        corner(-32.0, -32.0),
+        corner(32.0, -32.0),
+        corner(32.0, 32.0),
+        corner(-32.0, 32.0),
     ];
     let alpha = (f64::from(color[3]) * node.accumulated.opacity.clamp(0.0, 1.0)) as u8;
     crate::engine_api::raster::fill_polygon(bitmap, &points, [color[0], color[1], color[2], alpha]);
@@ -1365,7 +1585,6 @@ fn icon_pixels(
     snapshot: &MotionSnapshot,
     storage: &Storage,
     icon: &IconInfo,
-    textures: &mut HashMap<String, Arc<Pixels>>,
 ) -> Option<(Arc<Pixels>, RectI)> {
     let width = pixel_size(icon.width)?;
     let height = pixel_size(icon.height)?;
@@ -1380,14 +1599,13 @@ fn icon_pixels(
         );
         if let (Some(atlas_width), Some(atlas_height)) =
             (pixel_size(texture.width), pixel_size(texture.height))
-            && let Some(atlas) = cached_pixels(
+            && let Some(atlas) = snapshot.pixels.get_or_decode(
                 storage,
                 &atlas_path,
                 &palette_path,
                 atlas_width,
                 atlas_height,
                 texture.compressed,
-                textures,
             )
             && let (Some(left), Some(top)) = (pixel_offset(icon.left), pixel_offset(icon.top))
             && left + width <= atlas.width
@@ -1410,58 +1628,15 @@ fn icon_pixels(
         "psb://{}/source/{}/icon/{}/pal",
         snapshot.container, icon.group, icon.name
     );
-    let pixels = cached_pixels(
+    let pixels = snapshot.pixels.get_or_decode(
         storage,
         &icon_path,
         &palette_path,
         width,
         height,
         icon.compressed,
-        textures,
     )?;
     Some((pixels, (0, 0, width as i32, height as i32)))
-}
-
-/// The decoded pixels at `path`, from the cache or freshly decoded.
-fn cached_pixels(
-    storage: &Storage,
-    path: &str,
-    palette_path: &str,
-    width: u32,
-    height: u32,
-    compressed: bool,
-    textures: &mut HashMap<String, Arc<Pixels>>,
-) -> Option<Arc<Pixels>> {
-    if let Some(pixels) = textures.get(path) {
-        return Some(pixels.clone());
-    }
-    let bytes = match storage.read(strip_file_media(path)) {
-        Ok(bytes) => bytes,
-        Err(StorageReadError::NotFound(_)) => return None,
-        Err(error) => {
-            log::warn!("Motion.Player.draw: cannot read {path}: {error}");
-            return None;
-        }
-    };
-    let palette = match storage.read(strip_file_media(palette_path)) {
-        Ok(palette) => Some(palette),
-        Err(StorageReadError::NotFound(_)) => None,
-        Err(error) => {
-            log::warn!("Motion.Player.draw: cannot read {palette_path}: {error}");
-            None
-        }
-    };
-    match decode_pixels(&bytes, palette.as_deref(), width, height, compressed) {
-        Ok(decoded) => {
-            let pixels = Arc::new(decoded);
-            textures.insert(path.to_string(), pixels.clone());
-            Some(pixels)
-        }
-        Err(error) => {
-            log::warn!("Motion.Player.draw: cannot decode {path}: {error}");
-            None
-        }
-    }
 }
 
 /// An image dimension rounded to whole pixels, or `None` when it carries no
@@ -1809,6 +1984,26 @@ extern "C" fn player_play_raw(
     }
 }
 
+/// Advance the player by `progress`'s optional `dt` argument and return the
+/// playback ratio.
+fn progress_from_args(
+    inst: &mut PlayerInst,
+    arguments: &[Value],
+    ctx: &CompatCtx,
+    objthis: *mut std::ffi::c_void,
+) -> f64 {
+    let dt = arguments
+        .first()
+        .map(|value| match value.ty {
+            tjs::VAL_REAL => value.real,
+            tjs::VAL_INTEGER => value.integer as f64,
+            _ => value_as_i64(value) as f64,
+        })
+        .unwrap_or(0.0);
+    inst.progress(dt, ctx, objthis);
+    inst.progress_ratio()
+}
+
 extern "C" fn player_progress_raw(
     engine: *mut std::ffi::c_void,
     instance: *mut std::ffi::c_void,
@@ -1827,15 +2022,32 @@ extern "C" fn player_progress_raw(
     };
     // SAFETY: the trampoline guarantees `argc` valid entries.
     let arguments = unsafe { args(argv, argc) };
-    let dt = arguments
-        .first()
-        .map(|value| match value.ty {
-            tjs::VAL_REAL => value.real,
-            tjs::VAL_INTEGER => value.integer as f64,
-            _ => value_as_i64(value) as f64,
-        })
-        .unwrap_or(0.0);
-    inst.progress(dt, &res.ctx(), objthis);
+    // `Player.progress` reports the playback position after the step.
+    let ratio = progress_from_args(inst, arguments, &res.ctx(), objthis);
+    set_real(out, ratio);
+    0
+}
+
+extern "C" fn player_emote_progress_raw(
+    engine: *mut std::ffi::c_void,
+    instance: *mut std::ffi::c_void,
+    argc: std::os::raw::c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut std::ffi::c_char,
+    objthis: *mut std::ffi::c_void,
+) -> std::os::raw::c_int {
+    let Some(res) = resolve(engine) else {
+        return report_error(out_error, super::helpers::NO_BINDING);
+    };
+    // SAFETY: the VM guarantees the live payload.
+    let Some(inst) = (unsafe { inst_mut::<PlayerInst>(instance) }) else {
+        return report_error(out_error, "Player: null instance");
+    };
+    // SAFETY: the trampoline guarantees `argc` valid entries.
+    let arguments = unsafe { args(argv, argc) };
+    // The emote player discards the result of `progress(dt)`.
+    progress_from_args(inst, arguments, &res.ctx(), objthis);
     set_void(out);
     0
 }
@@ -2021,7 +2233,13 @@ pub(crate) fn register_named(
     method!("emoteEdit", player_emote_edit);
     method!("setVariable", player_set_variable_raw);
     method!("play", player_play_raw);
-    method!("progress", player_progress_raw);
+    // Every class registers `progress(dt)`; only `Player` returns the playback
+    // ratio, the emote classes discard it.
+    if emote {
+        method!("progress", player_emote_progress_raw);
+    } else {
+        method!("progress", player_progress_raw);
+    }
     method!("isPlaying", player_is_playing_raw);
     method!("stop", player_stop_raw);
     if emote {
@@ -2325,11 +2543,16 @@ mod tests {
     use super::color_bytes;
     use super::local_matrix;
     use super::{
-        BitmapState, MotionSnapshot, PlayerInst, build_node_tree, composite_nodes, draw_point,
-        drawable_nodes, evaluate_frames, prime_timelines,
+        BitmapState, MotionNode, MotionSnapshot, PlayerInst, build_node_tree, composite_nodes,
+        draw_icon, draw_point, drawable_nodes, evaluate_frames, prime_timelines,
+        unit_axis_aligned_origin,
     };
+    use crate::engine_api::Storage;
+    use crate::engine_api::layer_ops::{AffineBlit, BlitOptions, BlitSource, affine_blit};
     use crate::natives::plugins::psb_file::container::{PsbDocument, PsbValue};
     use crate::{CompatCtx, CompatServices};
+    use engine::Scene;
+    use fs::FileSystem;
     use tjs::Tjs2Engine;
 
     fn dict(entries: Vec<(&str, PsbValue)>) -> PsbValue {
@@ -2436,12 +2659,12 @@ mod tests {
         let affine = player.affine;
         let missing = composite_nodes(
             &mut bitmap,
-            &nodes,
+            nodes,
             snapshot.as_deref(),
             None,
             color,
             affine,
-            &mut player.textures,
+            &mut player.tinted,
         );
         assert!(missing.is_empty(), "synthetic shapes need no texture");
         bitmap
@@ -2451,19 +2674,27 @@ mod tests {
         bitmap.rgba[(y * 800 + x) * 4 + 3]
     }
 
+    /// Start a clip and run the gated first tick, which presents the pose
+    /// without advancing any clock
+    /// (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:637-642`).
+    fn start(player: &mut PlayerInst, label: &str, ctx: &CompatCtx) {
+        player.play(label, 0, ctx).expect("start the clip");
+        player.progress(0.0, ctx, std::ptr::null_mut());
+    }
+
     #[test]
     fn a_short_clip_after_a_long_one_replays_from_its_first_frame() {
         let snapshot = snapshot();
+        let _lock = crate::native_util::test_vm_lock();
         let engine = Tjs2Engine::new().expect("create engine");
         let mut services = CompatServices::new();
         let ctx = context(&engine, &mut services);
         let mut player = player(&snapshot);
-        player.play("intro", 0, &ctx).expect("start intro");
+        start(&mut player, "intro", &ctx);
         player.progress(2000.0, &ctx, std::ptr::null_mut());
         assert!(!player.playing_now(), "the one-shot intro stopped");
         assert!(player.playing_timelines.is_empty());
-        player.play("idle", 0, &ctx).expect("start idle");
-        player.progress(0.0, &ctx, std::ptr::null_mut());
+        start(&mut player, "idle", &ctx);
         assert!(player.playing_now(), "the idle timeline is playing");
         // The idle clip is one frame long; the intro reached its 120-frame
         // end. The evaluation clock is the idle timeline's own zero
@@ -2473,20 +2704,67 @@ mod tests {
         assert_eq!(alpha(&bitmap, 600, 600), 0, "the intro shape is gone");
     }
 
+    /// A queued activation swallows the tick that follows it: the timeline does
+    /// not advance until the gate is released
+    /// (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:819-826`).
     #[test]
-    fn replaying_a_clip_resets_its_evaluation_time() {
+    fn the_queuing_gate_holds_a_newly_started_timeline() {
         let snapshot = snapshot();
+        let _lock = crate::native_util::test_vm_lock();
         let engine = Tjs2Engine::new().expect("create engine");
         let mut services = CompatServices::new();
         let ctx = context(&engine, &mut services);
         let mut player = player(&snapshot);
         player.play("intro", 0, &ctx).expect("start intro");
+        assert!(player.queuing, "a fresh play holds the gate");
+        player.progress(500.0, &ctx, std::ptr::null_mut());
+        assert!(!player.queuing, "the layer update releases the gate");
+        assert_eq!(player.timelines["intro"].current_time, 0.0);
+        assert!((player.nodes[1].local.x - 100.0).abs() < 1e-9);
+        player.progress(500.0, &ctx, std::ptr::null_mut());
+        assert!(
+            (player.nodes[1].local.x - 100.0).abs() > 1.0,
+            "the second tick advances"
+        );
+    }
+
+    /// A delta outside the accepted window is dropped, so one huge tick cannot
+    /// skip the animation ahead (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:1002-1004`).
+    #[test]
+    fn a_huge_delta_does_not_advance_the_timeline() {
+        let snapshot = snapshot();
+        let _lock = crate::native_util::test_vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let ctx = context(&engine, &mut services);
+        let mut player = player(&snapshot);
+        start(&mut player, "intro", &ctx);
+        player.progress(30.0 * 1000.0 / 60.0, &ctx, std::ptr::null_mut());
+        let advanced = player.timelines["intro"].current_time;
+        assert!(advanced > 0.0);
+        assert!((player.progress_ratio() - advanced / 120.0).abs() < 1e-12);
+        player.progress(1.0e9, &ctx, std::ptr::null_mut());
+        assert_eq!(player.timelines["intro"].current_time, advanced);
+        player.progress(-1000.0, &ctx, std::ptr::null_mut());
+        assert_eq!(player.timelines["intro"].current_time, advanced);
+    }
+
+    #[test]
+    fn replaying_a_clip_resets_its_evaluation_time() {
+        let snapshot = snapshot();
+        let _lock = crate::native_util::test_vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let ctx = context(&engine, &mut services);
+        let mut player = player(&snapshot);
+        start(&mut player, "intro", &ctx);
         player.progress(50.0 * 1000.0 / 60.0, &ctx, std::ptr::null_mut());
         assert!(
             (player.nodes[1].local.x - 100.0).abs() > 100.0,
             "50 frames move the shape"
         );
         player.play("intro", 0, &ctx).expect("replay intro");
+        // The replayed clip is gated again, so its first tick only presents it.
         player.progress(0.0, &ctx, std::ptr::null_mut());
         // `playTimeline` resets `state.currentTime` before evaluation
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:238`,
@@ -2495,6 +2773,121 @@ mod tests {
         let bitmap = composite(&mut player);
         assert_eq!(alpha(&bitmap, 100, 100), 255);
         assert_eq!(alpha(&bitmap, 600, 600), 0);
+    }
+
+    /// The `title_bg` logo transition an authored clip carries on its t=40
+    /// frame: the curve control points ease the zoom back from 1.1x and fade
+    /// the icon in over t=40..75
+    /// (`reference/cpp/plugins/motionplayer/PlayerInternal.h:1306-1404`).
+    fn logo_curve() -> super::super::model::BezierCurve {
+        super::super::model::BezierCurve {
+            x: vec![0.0, 0.3, 0.7, 1.0],
+            y: vec![0.0, 0.2, 0.4, 1.0],
+        }
+    }
+
+    /// A snapshot with an `active` clip and an `inactive` clip that both carry
+    /// action/sync keyframes. Only the active clip is in the node tree.
+    fn event_snapshot() -> MotionSnapshot {
+        let eventful = |label: &str, time: i64, action: &str| {
+            dict(vec![
+                ("label", text(label)),
+                ("type", num(0)),
+                (
+                    "frameList",
+                    PsbValue::List(vec![
+                        frame(0, 2, Some(content(0, 0))),
+                        dict(vec![
+                            ("time", num(time)),
+                            ("type", num(2)),
+                            (
+                                "content",
+                                dict(vec![
+                                    ("coord", PsbValue::List(vec![num(0), num(0)])),
+                                    ("action", text(action)),
+                                    ("sync", num(1)),
+                                ]),
+                            ),
+                        ]),
+                        dict(vec![("time", num(20)), ("type", num(0))]),
+                    ]),
+                ),
+            ])
+        };
+        let active = dict(vec![
+            ("lastTime", num(20)),
+            (
+                "layer",
+                PsbValue::List(vec![eventful("active_layer", 10, "wave")]),
+            ),
+        ]);
+        let inactive = dict(vec![
+            ("lastTime", num(20)),
+            (
+                "layer",
+                PsbValue::List(vec![eventful("inactive_layer", 12, "blink")]),
+            ),
+        ]);
+        let root = dict(vec![(
+            "object",
+            dict(vec![(
+                "test",
+                dict(vec![(
+                    "motion",
+                    dict(vec![("active", active), ("inactive", inactive)]),
+                )]),
+            )]),
+        )]);
+        MotionSnapshot::from_psb(
+            PsbDocument {
+                root,
+                resources: Vec::new(),
+            },
+            "events.psb",
+        )
+    }
+
+    /// `progress` queues the action and sync keyframes of every clip layer,
+    /// including a clip that is not in the active node tree, for the
+    /// `onAction`/`onSync` dispatch that follows it
+    /// (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1814-1920`,
+    /// `PlayerFrameProgress.cpp:872-914`).
+    #[test]
+    fn action_and_sync_keyframes_reach_the_dispatch_queue() {
+        let snapshot = event_snapshot();
+        let _lock = crate::native_util::test_vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let ctx = context(&engine, &mut services);
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "active".to_string(),
+            ..PlayerInst::default()
+        };
+        prime_timelines(&snapshot, &mut player.timelines);
+        player.nodes = build_node_tree(&snapshot, snapshot.clip("active"));
+        player
+            .play("active", 0, &ctx)
+            .expect("start the active clip");
+        // The first tick releases the activation gate without advancing.
+        player.progress(0.0, &ctx, std::ptr::null_mut());
+        player.progress(500.0, &ctx, std::ptr::null_mut());
+        assert_eq!(
+            player
+                .pending_events
+                .iter()
+                .map(|event| (event.kind, event.param1.as_str(), event.param2.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                // The one-shot timeline stopping reports its own sync first.
+                (1, "active", ""),
+                (0, "wave", "active_layer"),
+                (1, "active_layer", ""),
+                (0, "blink", "inactive_layer"),
+                (1, "inactive_layer", ""),
+            ],
+            "both clips queue their keyframes"
+        );
     }
 
     fn logo_frames() -> Vec<super::super::model::Frame> {
@@ -2515,6 +2908,8 @@ mod tests {
                 scale_x: 1.1,
                 scale_y: 1.1,
                 opacity: 0.0,
+                ccc: logo_curve(),
+                zcc: logo_curve(),
                 ..Frame::default()
             },
             Frame {
@@ -2578,6 +2973,112 @@ mod tests {
         }
     }
 
+    /// Midway through the logo transition the eased ratio, not the linear one,
+    /// drives the zoom, and the opacity is the 1/255 quantized value.
+    #[test]
+    fn the_logo_transition_follows_its_curves() {
+        // Cubic bezier over the reference's shared-endpoint segment layout:
+        // B(t) = (1-t)^3 P0 + 3(1-t)^2 t P1 + 3(1-t) t^2 P2 + t^3 P3
+        // (`reference/cpp/plugins/motionplayer/PlayerInternal.h:701-734`).
+        let y = [0.0, 0.2, 0.4, 1.0];
+        let t = 0.5;
+        let u = 1.0 - t;
+        let eased =
+            u * u * u * y[0] + 3.0 * u * u * t * y[1] + 3.0 * u * t * t * y[2] + t * t * t * y[3];
+        let state = evaluate_frames(&logo_frames(), 40.0 + t * 35.0);
+        let expected_scale = 1.1 + (1.0 - 1.1) * eased;
+        assert!(
+            (state.scale_x - expected_scale).abs() < 1e-9,
+            "scale {} != {expected_scale}",
+            state.scale_x
+        );
+        assert!(
+            (state.scale_x - 1.05).abs() > 1e-3,
+            "the authored curve is not linear"
+        );
+        // 0 -> 255 in the 0..255 domain at t=0.5 is 127.5, rounded away from
+        // zero (`reference/cpp/plugins/motionplayer/PlayerInternal.h:1334-1347`).
+        assert!((state.opacity - 128.0 / 255.0).abs() < 1e-12);
+    }
+
+    /// A rotated and scaled parent moves its child by the parent matrix, not by
+    /// the child's own translation alone
+    /// (`reference/cpp/plugins/motionplayer/PlayerUpdateLayerEval.cpp:908-960`).
+    #[test]
+    fn a_child_inherits_the_parent_matrix() {
+        let transformed = dict(vec![
+            ("coord", PsbValue::List(vec![num(100), num(100)])),
+            ("angle", num(90)),
+            ("zx", num(2)),
+            ("zy", num(2)),
+        ]);
+        let child = dict(vec![
+            ("label", text("child")),
+            ("type", num(0)),
+            ("shape", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![frame(0, 2, Some(content(10, 0)))]),
+            ),
+        ]);
+        let parent = dict(vec![
+            ("label", text("parent")),
+            ("type", num(0)),
+            ("shape", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![frame(0, 2, Some(transformed))]),
+            ),
+            ("children", PsbValue::List(vec![child])),
+        ]);
+        let clip = dict(vec![
+            ("lastTime", num(1)),
+            ("layer", PsbValue::List(vec![parent])),
+        ]);
+        let root = dict(vec![(
+            "object",
+            dict(vec![(
+                "test",
+                dict(vec![("motion", dict(vec![("clip", clip)]))]),
+            )]),
+        )]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root,
+                resources: Vec::new(),
+            },
+            "matrix.psb",
+        );
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "clip".to_string(),
+            ..PlayerInst::default()
+        };
+        prime_timelines(&snapshot, &mut player.timelines);
+        player.nodes = build_node_tree(&snapshot, snapshot.clip("clip"));
+        player.update_layers();
+        let parent = &player.nodes[1];
+        let child = &player.nodes[2];
+        // The default order applies angle then zoom, so a 90 degree rotation at
+        // 2x maps local x onto +y.
+        assert!((parent.matrix[0]).abs() < 1e-9, "{:?}", parent.matrix);
+        assert!((parent.matrix[1] + 2.0).abs() < 1e-9, "{:?}", parent.matrix);
+        assert!((parent.matrix[2] - 2.0).abs() < 1e-9, "{:?}", parent.matrix);
+        assert!((parent.matrix[3]).abs() < 1e-9, "{:?}", parent.matrix);
+        // (10,0) under that matrix is (0,20) from the parent origin.
+        assert!(
+            (child.accumulated.x - 100.0).abs() < 1e-9,
+            "{}",
+            child.accumulated.x
+        );
+        assert!(
+            (child.accumulated.y - 120.0).abs() < 1e-9,
+            "{}",
+            child.accumulated.y
+        );
+        assert_eq!(child.matrix, parent.matrix);
+    }
+
     #[test]
     fn color_channels_are_scaled_from_the_normalized_animator() {
         // The animator stores normalized channels; the rasterizer takes bytes.
@@ -2615,5 +3116,199 @@ mod tests {
         let affine = [1.0, 0.0, 0.0, 1.0, 960.0, 540.0];
         assert_eq!(super::draw_point(affine, -960.0, -540.0), (0.0, 0.0));
         assert_eq!(super::draw_point(affine, 960.0, 540.0), (1920.0, 1080.0));
+    }
+
+    #[test]
+    fn a_unit_axis_aligned_placement_matches_the_affine_path_exactly() {
+        // The reference resumes every leaf with `stNearest`
+        // (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:456-472`,
+        // `:934-940`). A whole-pixel unit placement maps one source texel to
+        // one destination pixel, so the direct blit and the affine sampler
+        // must agree pixel for pixel.
+        let source = BitmapState::new(
+            2,
+            2,
+            vec![
+                10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
+            ],
+        );
+        let corners = [(2.0, 3.0), (4.0, 3.0), (2.0, 5.0)];
+        assert_eq!(unit_axis_aligned_origin(corners, 2, 2), Some((2, 3)));
+        let mut fast = BitmapState::new(6, 6, vec![0u8; 6 * 6 * 4]);
+        let mut affine = BitmapState::new(6, 6, vec![0u8; 6 * 6 * 4]);
+        draw_icon(&mut fast, &source, 2, 2, corners, 255);
+        affine_blit(
+            &mut affine,
+            AffineBlit {
+                corners,
+                stretch_type: 2,
+                clear: false,
+                clear_color: [0, 0, 0, 0],
+            },
+            BlitSource {
+                bitmap: &source,
+                rect: (0, 0, 2, 2),
+            },
+            BlitOptions {
+                mode: 2,
+                opa: 255,
+                treat_as_opaque: false,
+                hold_alpha: false,
+            },
+        );
+        assert_eq!(fast.rgba, affine.rgba);
+        let texel = |bitmap: &BitmapState, x: usize, y: usize| {
+            let offset = (y * 6 + x) * 4;
+            [
+                bitmap.rgba[offset],
+                bitmap.rgba[offset + 1],
+                bitmap.rgba[offset + 2],
+                bitmap.rgba[offset + 3],
+            ]
+        };
+        assert_eq!(texel(&fast, 2, 3), [10, 20, 30, 255]);
+        assert_eq!(texel(&fast, 3, 4), [100, 110, 120, 255]);
+        // A rotation or a fractional origin is not a whole-pixel placement.
+        assert_eq!(
+            unit_axis_aligned_origin([(2.0, 3.0), (3.0, 4.0), (1.0, 4.0)], 2, 2),
+            None
+        );
+        assert_eq!(
+            unit_axis_aligned_origin([(2.5, 3.0), (4.5, 3.0), (2.5, 5.0)], 2, 2),
+            None
+        );
+    }
+
+    #[test]
+    fn tinted_sources_are_cached_by_source_and_colour() {
+        // The source cache keys an entry by its source and packed colours and
+        // reuses it until the cache is cleared
+        // (`reference/cpp/plugins/motionplayer/SourceCache.cpp:497-552`,
+        // `:644-735`).
+        let dir = std::env::temp_dir();
+        let storage = Storage::mount_archives(
+            FileSystem::host(dir.clone()),
+            dir.clone(),
+            std::iter::empty::<&str>(),
+        )
+        .expect("mount storage");
+        storage.register_media(
+            "psb://cache.psb/source/group/icon/art/pixel".to_string(),
+            vec![10, 20, 30, 255],
+        );
+        let icon = dict(vec![("width", num(2)), ("height", num(2))]);
+        let group = dict(vec![("icon", dict(vec![("art", icon)]))]);
+        let root = dict(vec![("source", dict(vec![("group", group)]))]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root,
+                resources: Vec::new(),
+            },
+            "cache.psb",
+        );
+        let mut node = MotionNode::new(0, "art".to_string());
+        node.draw_flag = true;
+        node.local.src = "src/group/art".to_string();
+        node.accumulated.opacity = 1.0;
+        let mut player = PlayerInst {
+            nodes: vec![node],
+            ..PlayerInst::default()
+        };
+        player.color.bytes = [1.0, 128.0 / 255.0, 64.0 / 255.0, 1.0];
+        let color = color_bytes(player.color.bytes);
+        let mut bitmap = BitmapState::new(4, 4, vec![0u8; 4 * 4 * 4]);
+        let nodes = drawable_nodes(&player.nodes);
+        let missing = composite_nodes(
+            &mut bitmap,
+            nodes,
+            Some(&snapshot),
+            Some(&storage),
+            color,
+            player.affine,
+            &mut player.tinted,
+        );
+        assert!(missing.is_empty());
+        assert_eq!(&bitmap.rgba[..4], &[30u8, 10, 2, 255][..]);
+        assert_eq!(player.tinted.len(), 1);
+        let cached = player
+            .tinted
+            .values()
+            .next()
+            .expect("the tinted source is cached")
+            .clone();
+        let nodes = drawable_nodes(&player.nodes);
+        let missing = composite_nodes(
+            &mut bitmap,
+            nodes,
+            Some(&snapshot),
+            Some(&storage),
+            color,
+            player.affine,
+            &mut player.tinted,
+        );
+        assert!(missing.is_empty());
+        assert_eq!(player.tinted.len(), 1, "the second draw reuses the entry");
+        let reused = player
+            .tinted
+            .values()
+            .next()
+            .expect("the tinted source is cached");
+        assert!(std::sync::Arc::ptr_eq(&cached, reused));
+        player.clear_source_cache();
+        assert!(player.tinted.is_empty(), "the cache has a clear path");
+    }
+
+    #[test]
+    fn a_zero_opacity_or_invisible_node_is_not_prepared_for_drawing() {
+        // A render item copies the accumulated opacity and is skipped when
+        // its draw flag is clear
+        // (`reference/cpp/plugins/motionplayer/PlayerRenderItems.cpp:554-560`,
+        // `:600`).
+        let mut node = MotionNode::new(0, "shape".to_string());
+        node.draw_flag = true;
+        node.shape = 3;
+        node.accumulated.opacity = 0.0;
+        assert_eq!(drawable_nodes(std::slice::from_ref(&node)).count(), 0);
+        node.accumulated.opacity = 1.0;
+        node.draw_flag = false;
+        assert_eq!(drawable_nodes(std::slice::from_ref(&node)).count(), 0);
+        node.draw_flag = true;
+        assert_eq!(drawable_nodes(std::slice::from_ref(&node)).count(), 1);
+    }
+
+    #[test]
+    fn drawing_composites_into_the_existing_target_pixels() {
+        // The reference issues `AffineCopy` into the target layer instead of
+        // building a frame copy
+        // (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:456-472`).
+        let snapshot = snapshot();
+        let _lock = crate::native_util::test_vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let ctx = context(&engine, &mut services);
+        let mut player = player(&snapshot);
+        start(&mut player, "intro", &ctx);
+        let mut scene = Scene::default();
+        let window = scene.add_window("motion", (800, 1080));
+        let layer = scene.add_layer(window, None);
+        let bitmap = scene.add_bitmap(800, 1080, vec![0u8; 800 * 1080 * 4]);
+        scene.layer_mut(layer).expect("target layer").bitmap = Some(bitmap);
+        let allocated = scene.bitmap(bitmap).expect("target bitmap").rgba.as_ptr() as usize;
+        player.draw_into_scene(&mut scene, layer, None);
+        assert_eq!(
+            scene.bitmap(bitmap).expect("target bitmap").rgba.as_ptr() as usize,
+            allocated,
+            "the draw reuses the target allocation"
+        );
+        assert_eq!(
+            alpha(scene.bitmap(bitmap).expect("target bitmap"), 100, 100),
+            255
+        );
+        assert!(scene.layer(layer).expect("target layer").image_modified);
+        player.draw_into_scene(&mut scene, layer, None);
+        assert_eq!(
+            scene.bitmap(bitmap).expect("target bitmap").rgba.as_ptr() as usize,
+            allocated
+        );
     }
 }

@@ -16,6 +16,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::animator::Animator;
+use super::texture::PixelCache;
 use crate::natives::plugins::psb_file::container::{PsbDocument, PsbValue};
 
 /// One variable keyframe (`VariableFrameInfo`).
@@ -99,6 +100,24 @@ pub(crate) struct TimelineBinding {
     pub(crate) tracks: Vec<TimelineTrack>,
 }
 
+/// A cubic bezier easing curve (`BezierCurve`): `x` holds the time control
+/// points and `y` the eased value control points, `3N+1` entries per segment.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct BezierCurve {
+    /// The time control points.
+    pub(crate) x: Vec<f64>,
+    /// The value control points.
+    pub(crate) y: Vec<f64>,
+}
+
+impl BezierCurve {
+    /// Whether the frame carries no curve at all, which makes the easing the
+    /// identity.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.x.is_empty()
+    }
+}
+
 /// One frame of a layer's `frameList`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Frame {
@@ -143,6 +162,14 @@ pub(crate) struct Frame {
     pub(crate) action: String,
     /// Whether the frame carries a sync marker.
     pub(crate) has_sync: bool,
+    /// Position easing curve (`ccc`).
+    pub(crate) ccc: BezierCurve,
+    /// Angle easing curve (`acc`).
+    pub(crate) acc: BezierCurve,
+    /// Zoom easing curve (`zcc`).
+    pub(crate) zcc: BezierCurve,
+    /// Slant easing curve (`scc`).
+    pub(crate) scc: BezierCurve,
 }
 
 impl Default for Frame {
@@ -168,6 +195,10 @@ impl Default for Frame {
             mask: false,
             action: String::new(),
             has_sync: false,
+            ccc: BezierCurve::default(),
+            acc: BezierCurve::default(),
+            zcc: BezierCurve::default(),
+            scc: BezierCurve::default(),
         }
     }
 }
@@ -286,6 +317,13 @@ pub(crate) struct MotionNode {
     pub(crate) local: FrameState,
     /// The accumulated world state (after inheritance).
     pub(crate) accumulated: FrameState,
+    /// The accumulated 2x2 transform `[m11, m12, m21, m22]`, composed from the
+    /// parent's matrix and this node's local transform.
+    pub(crate) matrix: [f64; 4],
+    /// The parent-clock offset this node's frames run on. A layer expanded from
+    /// a child motion starts where the parent frame named that clip, so it
+    /// evaluates at `parent time - time_offset`.
+    pub(crate) time_offset: f64,
     /// Whether an ancestor is visible.
     pub(crate) draw_flag: bool,
     /// The number of live particle children (particle emitters).
@@ -293,7 +331,8 @@ pub(crate) struct MotionNode {
 }
 
 impl MotionNode {
-    fn new(parent: usize, label: String) -> Self {
+    /// A node attached to `parent` with default layer state.
+    pub(crate) fn new(parent: usize, label: String) -> Self {
         Self {
             parent,
             children: Vec::new(),
@@ -318,6 +357,8 @@ impl MotionNode {
             frames: Vec::new(),
             local: FrameState::default(),
             accumulated: FrameState::default(),
+            matrix: [1.0, 0.0, 0.0, 1.0],
+            time_offset: 0.0,
             draw_flag: true,
             particle_count: 0,
         }
@@ -411,10 +452,17 @@ pub(crate) struct MotionSnapshot {
     pub(crate) clips: Vec<MotionClip>,
     /// Label → clip index.
     pub(crate) clip_index: HashMap<String, usize>,
+    /// The action/sync keyframes of every clip layer. Every clip is scanned,
+    /// not only the ones the active node tree contains.
+    pub(crate) event_tracks: Vec<EventTrack>,
     /// `source.<chara>.icon.<name>` geometry keyed by `src/<chara>/<name>`.
     pub(crate) icons: HashMap<String, IconInfo>,
     /// `source.<chara>.texture` atlases keyed by `<chara>`.
     pub(crate) textures: HashMap<String, TextureInfo>,
+    /// The decoded pixel chunks this module's icons draw from, keyed by their
+    /// `psb://` storage name and shared by every player that loads the
+    /// snapshot.
+    pub(crate) pixels: PixelCache,
     /// The active root layer list.
     pub(crate) layers: Vec<PsbValue>,
     /// The raw metadata dictionary (for `Player::initPhysics` / `metadata`).
@@ -484,8 +532,10 @@ impl MotionSnapshot {
             timeline_controls: HashMap::new(),
             clips: Vec::new(),
             clip_index: HashMap::new(),
+            event_tracks: Vec::new(),
             icons,
             textures,
+            pixels: PixelCache::default(),
             layers: Vec::new(),
             metadata: PsbValue::Null,
             root,
@@ -500,6 +550,8 @@ impl MotionSnapshot {
         snapshot.collect_mirror(&metadata);
         snapshot.collect_timeline_controls(&metadata);
         snapshot.collect_clips();
+        let event_tracks = snapshot.collect_event_tracks();
+        snapshot.event_tracks = event_tracks;
         snapshot.metadata = metadata;
         snapshot
     }
@@ -808,6 +860,18 @@ impl MotionSnapshot {
         }
     }
 
+    /// Collect the action/sync keyframes of every clip layer. A layer that
+    /// appears both in the root list and in a clip is scanned once, so one
+    /// authored keyframe raises one event.
+    fn collect_event_tracks(&self) -> Vec<EventTrack> {
+        let mut tracks = Vec::new();
+        for clip in &self.clips {
+            collect_layer_events(&clip.layers, &mut tracks);
+        }
+        collect_layer_events(&self.layers, &mut tracks);
+        tracks
+    }
+
     fn record_binding(&mut self, label: &str, kind: i32, index: i32, source: &str, role: &str) {
         if label.is_empty() {
             return;
@@ -996,10 +1060,66 @@ fn step_timeline_controls(state: &mut TimelineState, tracks: &[TimelineTrack], d
     }
 }
 
+/// One action/sync keyframe of a clip layer.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EventFrame {
+    /// The keyframe time.
+    pub(crate) time: f64,
+    /// The action name (`content.action`), empty when the frame only syncs.
+    pub(crate) action: String,
+    /// Whether the frame carries a nonzero `content.sync` marker.
+    pub(crate) has_sync: bool,
+}
+
+/// The action/sync keyframes of one clip layer, keyed by its label.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EventTrack {
+    /// The layer label the events name.
+    pub(crate) label: String,
+    /// The keyframes that carry an action or a sync marker.
+    pub(crate) frames: Vec<EventFrame>,
+}
+
+/// Collect the action/sync keyframes of `layers` and their `children`.
+fn collect_layer_events(layers: &[PsbValue], tracks: &mut Vec<EventTrack>) {
+    for layer in layers {
+        let mut frames = Vec::new();
+        if let Some(frame_list) = list_of(layer.get("frameList")) {
+            for frame in frame_list {
+                let Some(content) = frame.get("content") else {
+                    continue;
+                };
+                let action = string_of(content.get("action")).unwrap_or_default();
+                let has_sync = content.get("sync").map(PsbValue::as_bool).unwrap_or(false);
+                if action.is_empty() && !has_sync {
+                    continue;
+                }
+                frames.push(EventFrame {
+                    time: number_of(frame.get("time")).unwrap_or(0.0),
+                    action,
+                    has_sync,
+                });
+            }
+        }
+        if !frames.is_empty() {
+            let label = label_of(layer).unwrap_or_default();
+            let duplicate = tracks
+                .iter()
+                .any(|track| track.label == label && track.frames == frames);
+            if !duplicate {
+                tracks.push(EventTrack { label, frames });
+            }
+        }
+        if let Some(children) = list_of(layer.get("children")) {
+            collect_layer_events(children, tracks);
+        }
+    }
+}
+
 /// Collect the action and sync events whose keyframe time is crossed when the
 /// evaluation clock advances from `previous` to `current`.
 pub(crate) fn scan_frame_events(
-    nodes: &[MotionNode],
+    tracks: &[EventTrack],
     previous: f64,
     current: f64,
 ) -> Vec<MotionEvent> {
@@ -1007,8 +1127,8 @@ pub(crate) fn scan_frame_events(
     if current <= previous {
         return events;
     }
-    for node in nodes {
-        for frame in &node.frames {
+    for track in tracks {
+        for frame in &track.frames {
             if frame.time <= previous || frame.time > current {
                 continue;
             }
@@ -1016,13 +1136,13 @@ pub(crate) fn scan_frame_events(
                 events.push(MotionEvent {
                     kind: 0,
                     param1: frame.action.clone(),
-                    param2: node.label.clone(),
+                    param2: track.label.clone(),
                 });
             }
             if frame.has_sync {
                 events.push(MotionEvent {
                     kind: 1,
-                    param1: node.label.clone(),
+                    param1: track.label.clone(),
                     param2: String::new(),
                 });
             }
@@ -1057,7 +1177,7 @@ pub(crate) fn build_node_tree(
         stack.push(clip.label.clone());
     }
     for layer in layers {
-        append_node(&mut nodes, 0, layer, snapshot, &mut stack, false);
+        append_node(&mut nodes, 0, layer, snapshot, &mut stack, false, 0.0);
     }
     nodes
 }
@@ -1069,11 +1189,13 @@ fn append_node(
     snapshot: &MotionSnapshot,
     stack: &mut Vec<String>,
     child: bool,
+    time_offset: f64,
 ) -> usize {
     let index = nodes.len();
     let label = label_of(layer).unwrap_or_default();
     let mut node = MotionNode::new(parent, label);
     node.own = !child;
+    node.time_offset = time_offset;
     node.node_type = number_of(layer.get("type")).unwrap_or(0.0) as i32;
     node.coordinate = number_of(layer.get("coordinate")).unwrap_or(0.0) as i32;
     node.shape = number_of(layer.get("shape")).unwrap_or(0.0) as i32;
@@ -1106,16 +1228,40 @@ fn append_node(
         && !stack.iter().any(|item| item == &label)
         && let Some(clip) = snapshot.clip(&label)
     {
+        // The child clip starts at the parent keyframe that names it, so every
+        // layer of that clip runs that much behind the parent clock.
+        let start = nodes[index]
+            .frames
+            .iter()
+            .find(|frame| frame.child_motion.as_deref() == Some(label.as_str()))
+            .map(|frame| frame.time)
+            .unwrap_or(0.0);
         let layers = clip.layers.clone();
         stack.push(label);
         for layer in &layers {
-            append_node(nodes, index, layer, snapshot, stack, true);
+            append_node(
+                nodes,
+                index,
+                layer,
+                snapshot,
+                stack,
+                true,
+                time_offset + start,
+            );
         }
         stack.pop();
     }
     if let Some(children) = list_of(layer.get("children")) {
         for child_layer in children {
-            append_node(nodes, index, child_layer, snapshot, stack, child);
+            append_node(
+                nodes,
+                index,
+                child_layer,
+                snapshot,
+                stack,
+                child,
+                time_offset,
+            );
         }
     }
     index
@@ -1162,16 +1308,75 @@ fn parse_frames(value: Option<&PsbValue>) -> Vec<Frame> {
             frame.slant_y = number_of(content.get("sy")).unwrap_or(0.0);
             frame.scale_x = number_of(content.get("zx")).unwrap_or(1.0);
             frame.scale_y = number_of(content.get("zy")).unwrap_or(1.0);
-            frame.opacity = number_of(content.get("opa")).unwrap_or(1.0);
+            frame.opacity =
+                (number_of(content.get("opa")).unwrap_or(255.0) / 255.0).clamp(0.0, 1.0);
             frame.mask = number_of(content.get("mask")).unwrap_or(0.0) != 0.0;
             frame.action = string_of(content.get("action"))
                 .or_else(|| string_of(content.get("ac")))
                 .unwrap_or_default();
             frame.has_sync = content.get("sync").map(PsbValue::as_bool).unwrap_or(false);
+            frame.ccc = parse_bezier_curve(content.get("ccc"));
+            frame.acc = parse_bezier_curve(content.get("acc"));
+            frame.zcc = parse_bezier_curve(content.get("zcc"));
+            frame.scc = parse_bezier_curve(content.get("scc"));
         }
         frames.push(frame);
     }
     frames
+}
+
+/// Parse a `ccc`/`acc`/`zcc`/`scc` curve dictionary. Both `x` and `y` must be
+/// present for the curve to be used.
+fn parse_bezier_curve(value: Option<&PsbValue>) -> BezierCurve {
+    let Some(dict) = value else {
+        return BezierCurve::default();
+    };
+    let (Some(x_list), Some(y_list)) = (list_of(dict.get("x")), list_of(dict.get("y"))) else {
+        return BezierCurve::default();
+    };
+    let numbers =
+        |list: &[PsbValue]| -> Vec<f64> { list.iter().filter_map(PsbValue::as_f64).collect() };
+    BezierCurve {
+        x: numbers(x_list),
+        y: numbers(y_list),
+    }
+}
+
+/// Evaluate a curve at `t`, or return `t` unchanged when the frame carries no
+/// curve.
+fn ease(curve: &BezierCurve, t: f64) -> f64 {
+    if curve.is_empty() {
+        t
+    } else {
+        evaluate_bezier_curve(curve, t)
+    }
+}
+
+/// Evaluate a `3N+1` cubic bezier curve at `t`.
+///
+/// The control points are read as shared endpoints, so each segment is
+/// `y[i-3..=i]`; `t` is the curve parameter itself, not a per-segment ratio.
+fn evaluate_bezier_curve(curve: &BezierCurve, t: f64) -> f64 {
+    let n = curve.x.len();
+    if n < 2 || curve.y.len() != n {
+        return t;
+    }
+    if curve.x[0] >= t {
+        return curve.y[0];
+    }
+    if curve.x[n - 1] <= t {
+        return curve.y[n - 1];
+    }
+    let mut i = 0;
+    while i < n && curve.x[i] < t {
+        i += 3;
+    }
+    if i < 3 || i >= n {
+        return t;
+    }
+    let (p0, p1, p2, p3) = (curve.y[i - 3], curve.y[i - 2], curve.y[i - 1], curve.y[i]);
+    let u = 1.0 - t;
+    u * u * u * p0 + 3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t * p3
 }
 
 fn coord_number(coord: &PsbValue, index: usize) -> f64 {
@@ -1251,20 +1456,59 @@ pub(crate) fn evaluate_frames(frames: &[Frame], time: f64) -> FrameState {
 }
 
 fn interpolate(a: &Frame, b: &Frame, t: f64) -> FrameState {
-    let lerp = |from: f64, to: f64| from + (to - from) * t;
+    // Position, angle, zoom and slant each carry their own easing curve; an
+    // absent curve leaves the ratio untouched.
+    let t_pos = ease(&a.ccc, t);
+    let t_angle = ease(&a.acc, t);
+    let t_scale = ease(&a.zcc, t);
+    let t_slant = ease(&a.scc, t);
+    let lerp = |from: f64, to: f64, ratio: f64| from + (to - from) * ratio;
+    // Opacity is interpolated in the 0..255 integer domain and rounded half
+    // away from zero, then converted back.
+    let opacity = if a.opacity != b.opacity {
+        let interp = lerp(a.opacity * 255.0, b.opacity * 255.0, t);
+        let rounded = if interp < 0.0 {
+            (interp - 0.5).ceil()
+        } else {
+            (interp + 0.5).floor()
+        };
+        (rounded / 255.0).clamp(0.0, 1.0)
+    } else {
+        a.opacity
+    };
+    // Rotation takes the shorter of the two directions across the 0/360 seam.
+    let angle = if a.angle != b.angle {
+        let mut next = b.angle;
+        if a.angle >= next {
+            if a.angle - next > 180.0 {
+                next += 360.0;
+            }
+        } else if next - a.angle > 180.0 {
+            next -= 360.0;
+        }
+        let mut interp = lerp(a.angle, next, t_angle);
+        if interp < 0.0 {
+            interp += 360.0;
+        } else if interp >= 360.0 {
+            interp -= 360.0;
+        }
+        interp
+    } else {
+        a.angle
+    };
     FrameState {
         active: true,
-        ox: lerp(a.ox, b.ox),
-        oy: lerp(a.oy, b.oy),
-        x: lerp(a.x, b.x),
-        y: lerp(a.y, b.y),
-        z: lerp(a.z, b.z),
-        angle: lerp(a.angle, b.angle),
-        slant_x: lerp(a.slant_x, b.slant_x),
-        slant_y: lerp(a.slant_y, b.slant_y),
-        scale_x: lerp(a.scale_x, b.scale_x),
-        scale_y: lerp(a.scale_y, b.scale_y),
-        opacity: lerp(a.opacity, b.opacity),
+        ox: lerp(a.ox, b.ox, t),
+        oy: lerp(a.oy, b.oy, t),
+        x: lerp(a.x, b.x, t_pos),
+        y: lerp(a.y, b.y, t_pos),
+        z: lerp(a.z, b.z, t_pos),
+        angle,
+        slant_x: lerp(a.slant_x, b.slant_x, t_slant),
+        slant_y: lerp(a.slant_y, b.slant_y, t_slant),
+        scale_x: lerp(a.scale_x, b.scale_x, t_scale),
+        scale_y: lerp(a.scale_y, b.scale_y, t_scale),
+        opacity,
         blend_mode: a.blend_mode,
         src: if a.src.is_empty() {
             b.src.clone()
@@ -1778,9 +2022,9 @@ mod tests {
             },
             "events.psb",
         );
-        let nodes = build_node_tree(&snapshot, snapshot.clip("clip"));
+        let tracks = &snapshot.event_tracks;
         assert_eq!(
-            scan_frame_events(&nodes, 0.0, 10.0),
+            scan_frame_events(tracks, 0.0, 10.0),
             vec![
                 MotionEvent {
                     kind: 0,
@@ -1794,9 +2038,266 @@ mod tests {
                 },
             ]
         );
-        assert!(scan_frame_events(&nodes, 10.0, 20.0).is_empty());
+        assert!(scan_frame_events(tracks, 10.0, 20.0).is_empty());
         // A loop restart moves the clock backwards; no crossing is reported.
-        assert!(scan_frame_events(&nodes, 20.0, 5.0).is_empty());
+        assert!(scan_frame_events(tracks, 20.0, 5.0).is_empty());
+    }
+
+    /// An inactive clip's layers still raise their action/sync keyframes: the
+    /// reference scans the whole snapshot, not the active node tree
+    /// (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1907-1917`).
+    #[test]
+    fn every_clip_layer_contributes_events() {
+        let eventful = |label: &str, time: i64, action: &str| {
+            dict(vec![
+                ("label", text(label)),
+                ("type", num(0)),
+                (
+                    "frameList",
+                    PsbValue::List(vec![
+                        frame(0, 2, text("src/a/b")),
+                        dict(vec![
+                            ("time", num(time)),
+                            ("type", num(2)),
+                            (
+                                "content",
+                                dict(vec![
+                                    ("src", text("src/a/b")),
+                                    ("action", text(action)),
+                                    ("sync", num(1)),
+                                ]),
+                            ),
+                        ]),
+                    ]),
+                ),
+            ])
+        };
+        let active = dict(vec![
+            ("lastTime", num(20)),
+            (
+                "layer",
+                PsbValue::List(vec![eventful("active", 10, "wave")]),
+            ),
+        ]);
+        let inactive = dict(vec![
+            ("lastTime", num(20)),
+            (
+                "layer",
+                PsbValue::List(vec![eventful("inactive", 12, "blink")]),
+            ),
+        ]);
+        let root = dict(vec![(
+            "object",
+            dict(vec![(
+                "test",
+                dict(vec![(
+                    "motion",
+                    dict(vec![("active", active), ("inactive", inactive)]),
+                )]),
+            )]),
+        )]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root,
+                resources: Vec::new(),
+            },
+            "events.psb",
+        );
+        let events = scan_frame_events(&snapshot.event_tracks, 0.0, 15.0);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.kind, event.param1.as_str(), event.param2.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "wave", "active"),
+                (1, "active", ""),
+                (0, "blink", "inactive"),
+                (1, "inactive", "")
+            ]
+        );
+    }
+
+    /// A child motion layer runs on its own clock: it starts at the parent
+    /// keyframe that names the clip, not at the parent's zero
+    /// (`reference/cpp/plugins/motionplayer/PlayerUpdateChildMotion.cpp:172-181`,
+    /// `PlayerUpdateLayerEval.cpp:253`).
+    #[test]
+    fn a_child_motion_layer_carries_the_parent_start_offset() {
+        let main = dict(vec![
+            ("label", text("main")),
+            ("type", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    dict(vec![("time", num(0)), ("type", num(0))]),
+                    frame(40, 3, text("motion/title_bg/char_move")),
+                    dict(vec![("time", num(120)), ("type", num(0))]),
+                ]),
+            ),
+        ]);
+        let logo = dict(vec![
+            ("label", text("logo")),
+            ("type", num(0)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    dict(vec![
+                        ("time", num(0)),
+                        ("type", num(3)),
+                        (
+                            "content",
+                            dict(vec![
+                                ("src", text("src/title/logo")),
+                                ("coord", PsbValue::List(vec![num(0), num(0)])),
+                            ]),
+                        ),
+                    ]),
+                    dict(vec![
+                        ("time", num(30)),
+                        ("type", num(3)),
+                        (
+                            "content",
+                            dict(vec![
+                                ("src", text("src/title/logo")),
+                                ("coord", PsbValue::List(vec![num(300), num(0)])),
+                            ]),
+                        ),
+                    ]),
+                    dict(vec![("time", num(60)), ("type", num(0))]),
+                ]),
+            ),
+        ]);
+        let title = dict(vec![
+            ("lastTime", num(120)),
+            ("layer", PsbValue::List(vec![main])),
+        ]);
+        let char_move = dict(vec![
+            ("lastTime", num(60)),
+            ("layer", PsbValue::List(vec![logo])),
+        ]);
+        let object = dict(vec![(
+            "title_bg",
+            dict(vec![(
+                "motion",
+                dict(vec![("title", title), ("char_move", char_move)]),
+            )]),
+        )]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root: dict(vec![("object", object)]),
+                resources: Vec::new(),
+            },
+            "title.psb",
+        );
+        let nodes = build_node_tree(&snapshot, snapshot.clip("title"));
+        let child = nodes
+            .iter()
+            .find(|node| node.label == "logo")
+            .expect("the child clip layer is expanded");
+        assert_eq!(child.time_offset, 40.0);
+        // The child pose at its own t=0 differs from its pose at t=30, so a
+        // parent clock of 40 must evaluate the former.
+        let frames = &child.frames;
+        assert_eq!(evaluate_frames(frames, 0.0).x, 0.0);
+        assert_eq!(evaluate_frames(frames, 30.0).x, 300.0);
+        assert_eq!(
+            evaluate_frames(frames, (40.0f64 - child.time_offset).max(0.0)).x,
+            0.0
+        );
+    }
+
+    /// The `ccc`/`zcc` curves on a frame ease position and zoom instead of the
+    /// linear ratio, and opacity is quantized to 1/255
+    /// (`reference/cpp/plugins/motionplayer/PlayerInternal.h:1306-1404`).
+    #[test]
+    fn frame_curves_ease_the_animated_fields() {
+        let curve = |x: [f64; 4], y: [f64; 4]| BezierCurve {
+            x: x.to_vec(),
+            y: y.to_vec(),
+        };
+        let cubic = |y: [f64; 4], t: f64| {
+            let u = 1.0 - t;
+            u * u * u * y[0] + 3.0 * u * u * t * y[1] + 3.0 * u * t * t * y[2] + t * t * t * y[3]
+        };
+        let position = [0.0, 0.05, 0.6, 1.0];
+        let zoom = [0.0, 0.2, 0.4, 1.0];
+        let frames = vec![
+            Frame {
+                time: 40.0,
+                frame_type: 3,
+                has_content: true,
+                src: "src/title/logo".to_string(),
+                x: 0.0,
+                scale_x: 1.0,
+                opacity: 1.0,
+                ccc: curve([0.0, 0.3, 0.7, 1.0], position),
+                zcc: curve([0.0, 0.3, 0.7, 1.0], zoom),
+                ..Frame::default()
+            },
+            Frame {
+                time: 75.0,
+                frame_type: 3,
+                has_content: true,
+                src: "src/title/logo".to_string(),
+                x: 100.0,
+                scale_x: 2.0,
+                opacity: 0.0,
+                ..Frame::default()
+            },
+            Frame {
+                time: 120.0,
+                frame_type: 0,
+                ..Frame::default()
+            },
+        ];
+        let state = evaluate_frames(&frames, 57.5);
+        let expected_x = 100.0 * cubic(position, 0.5);
+        let expected_scale = 1.0 + cubic(zoom, 0.5);
+        assert!(
+            (state.x - expected_x).abs() < 1e-9,
+            "x {} != {expected_x}",
+            state.x
+        );
+        assert!((state.x - 50.0).abs() > 5.0, "the curve is not linear");
+        assert!(
+            (state.scale_x - expected_scale).abs() < 1e-9,
+            "zoom {} != {expected_scale}",
+            state.scale_x
+        );
+        // 1.0 -> 0.0 in the 0..255 domain at t=0.5 is 127.5, rounded away from
+        // zero to 128, then converted back.
+        let expected_opacity = 128.0 / 255.0;
+        assert!(
+            (state.opacity - expected_opacity).abs() < 1e-12,
+            "opacity {} != {expected_opacity}",
+            state.opacity
+        );
+    }
+
+    #[test]
+    fn an_absent_curve_is_the_linear_ratio() {
+        let frames = vec![
+            Frame {
+                time: 0.0,
+                frame_type: 3,
+                has_content: true,
+                x: 0.0,
+                scale_x: 1.0,
+                ..Frame::default()
+            },
+            Frame {
+                time: 10.0,
+                frame_type: 3,
+                has_content: true,
+                x: 100.0,
+                scale_x: 2.0,
+                ..Frame::default()
+            },
+        ];
+        let state = evaluate_frames(&frames, 5.0);
+        assert_eq!(state.x, 50.0);
+        assert_eq!(state.scale_x, 1.5);
     }
 
     fn node_labels(nodes: &[MotionNode]) -> Vec<&str> {

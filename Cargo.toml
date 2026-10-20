@@ -8,6 +8,9 @@ members = [
     "crates/platform/api",
     "crates/platform/fs",
     "crates/platform/media",
+    # The PSB/PSD container reader: a stateless L1 format crate that lives
+    # beside `media` (which excludes it from its own package).
+    "crates/platform/media/psd",
     "crates/platform/render",
     "crates/engine",
     "crates/platform/platform",
@@ -31,6 +34,7 @@ tjs = { path = "crates/tjs" }
 api = { path = "crates/platform/api" }
 fs = { path = "crates/platform/fs" }
 media = { path = "crates/platform/media" }
+psd = { path = "crates/platform/media/psd" }
 render = { path = "crates/platform/render" }
 engine = { path = "crates/engine" }
 platform = { path = "crates/platform/platform" }

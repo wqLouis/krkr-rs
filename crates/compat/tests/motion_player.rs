@@ -404,9 +404,9 @@ fn player_draw_samples_the_icon_texture() {
         "the draw must sample the texture, got {} distinct values",
         distinct.len()
     );
-    // The quad ends where the icon does, so the rest of the layer keeps the
-    // layer's transparent fill instead of being covered.
-    assert_eq!(texel(700, 1000)[3], 0);
+    // The drawn icons and shape placeholders cover only part of the layer, so
+    // the untouched corner keeps the layer's transparent fill.
+    assert_eq!(texel(799, 1079)[3], 0);
 }
 
 #[test]
@@ -539,6 +539,63 @@ fn player_draw_marks_the_target_image_modified() {
     env.run("p.draw(new Motion.SeparateLayerAdaptor(target));");
     assert!(env._scene.layer(layer_id).expect("target").image_modified);
     assert!(env._scene.bitmap(bitmap_id).expect("target bitmap").dirty);
+}
+
+#[test]
+fn player_draw_reuses_the_target_allocation_and_the_decoded_chunks() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    // The reference composites into the target layer's image with
+    // `AffineCopy` and keys the loaded source by its name and colour
+    // (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:456-472`,
+    // `SourceCache.cpp:497-552`). A second draw of the same pose therefore
+    // reuses both the target pixels and the decoded source chunks.
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var w = new Window(); \
+         var target = new Layer(w, null); \
+         target.setSize(800, 1080); \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\"; \
+         p.draw(new Motion.SeparateLayerAdaptor(target));"
+    ));
+    let layer_id = env._scene.layers.last().expect("the target layer").id;
+    let bitmap_id = env
+        ._scene
+        .layer(layer_id)
+        .and_then(|layer| layer.bitmap)
+        .expect("the target bitmap");
+    let allocated = env
+        ._scene
+        .bitmap(bitmap_id)
+        .expect("the target bitmap")
+        .rgba
+        .as_ptr() as usize;
+    let read_bytes = env
+        ._storage
+        .as_ref()
+        .expect("the fixture storage")
+        .read_bytes();
+    env.run("p.draw(new Motion.SeparateLayerAdaptor(target));");
+    assert_eq!(
+        env._scene
+            .bitmap(bitmap_id)
+            .expect("the target bitmap")
+            .rgba
+            .as_ptr() as usize,
+        allocated,
+        "the draw keeps the target allocation"
+    );
+    assert_eq!(
+        env._storage
+            .as_ref()
+            .expect("the fixture storage")
+            .read_bytes(),
+        read_bytes,
+        "the second draw reads no pixel chunk again"
+    );
 }
 
 #[test]
@@ -1245,6 +1302,46 @@ fn separate_layer_adaptor_layer_tree_owner_interface_delegates_to_its_owner() {
         env.eval_str("typeof (new Motion.SeparateLayerAdaptor()).layerTreeOwnerInterface()"),
         "void"
     );
+}
+
+/// A freshly activated motion sits behind the frame gate: the first tick
+/// presents the pose without advancing, and a delta outside the accepted
+/// window is dropped rather than clamped
+/// (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:819-826`,
+/// `:1002-1004`). The `progress` member reports the playback ratio
+/// (`PlayerCore.cpp:1281-1305`).
+#[test]
+fn progress_gates_the_first_tick_and_drops_an_out_of_range_delta() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\";"
+    ));
+    // No timeline is playing yet, so the tick count starts at zero.
+    assert_eq!(env.eval_real("p.frameTickCount"), 0.0);
+    env.run("p.progress(16);");
+    assert_eq!(
+        env.eval_real("p.frameTickCount"),
+        0.0,
+        "the gated tick does not advance the clock"
+    );
+    env.run("p.progress(16);");
+    let advanced = env.eval_real("p.frameTickCount");
+    assert!(advanced > 0.0, "the second tick advances");
+    // Nothing plays, so the reported ratio is the finished 1.0.
+    assert_eq!(env.eval_real("p.progress(0)"), 1.0);
+    env.run("p.progress(1000000000);");
+    assert_eq!(
+        env.eval_real("p.frameTickCount"),
+        advanced,
+        "a delta past 60000 ms is dropped, not clamped"
+    );
+    env.run("p.progress(-5);");
+    assert_eq!(env.eval_real("p.frameTickCount"), advanced);
 }
 
 #[test]

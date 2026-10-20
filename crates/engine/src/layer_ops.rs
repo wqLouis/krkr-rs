@@ -2277,11 +2277,44 @@ pub fn ensure_transition_display(scene: &mut Scene, root: u32, w: u32, h: u32) -
     Some(id)
 }
 
+/// Allocate or reuse `root`'s self image at `w` x `h`: the image a transition
+/// blends this layer's own image and another layer's into while the layer's
+/// children keep drawing live. It is drawn in place of the layer's main image
+/// and is distinct from it, so the blend never overwrites pixels a script can
+/// read. `None` for an unknown layer or an image that cannot be allocated;
+/// the slot is not part of the subtree cache and [`release_subtree_caches`]
+/// leaves it alone.
+pub fn ensure_transition_self_image(scene: &mut Scene, root: u32, w: u32, h: u32) -> Option<u32> {
+    if let Some(id) = scene.layer(root)?.transition_self
+        && scene.bitmap(id).map(|b| (b.width, b.height)) == Some((w, h))
+    {
+        return Some(id);
+    }
+    scene.set_transition_self_image(root, None);
+    let bytes = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    let mut rgba = Vec::new();
+    if rgba.try_reserve_exact(bytes).is_err() {
+        return None;
+    }
+    rgba.resize(bytes, 0);
+    let id = scene.add_bitmap(w, h, rgba);
+    scene.set_transition_self_image(root, Some(id));
+    Some(id)
+}
+
+/// Drop `root`'s transition self image, leaving the layer's main image, its
+/// subtree cache and its children untouched. Infallible: a layer that is gone
+/// or never had a self image is a no-op.
+pub fn clear_transition_self_image(scene: &mut Scene, root: u32) {
+    scene.set_transition_self_image(root, None);
+}
+
 /// Sum of the drawn source images' [`BitmapState::content_generation`] for
-/// `root`'s subtree. It mirrors the visibility filter of
-/// [`collect_subtree_draws`] so a change to a hidden layer does not
-/// invalidate the cache, while any image edit to a drawn layer does (even
-/// one that did not go through a layer accessor).
+/// `root`'s subtree. It mirrors the visibility filter and the drawn-image
+/// selection of [`collect_subtree_draws`], so a change to a hidden layer does
+/// not invalidate the cache while an edit to any drawn image does — including
+/// the self image a transition blends into, even when the edit did not go
+/// through a layer accessor.
 fn subtree_source_generation(scene: &Scene, root: u32) -> u64 {
     let Some(root_layer) = scene.layer(root) else {
         return 0;
@@ -2301,7 +2334,7 @@ fn subtree_source_generation(scene: &Scene, root: u32) -> u64 {
         if id != root && (subtree_opacity(scene, id, root) * 255.0).round() == 0.0 {
             continue;
         }
-        if let Some(bitmap) = layer.bitmap.and_then(|bitmap| scene.bitmap(bitmap)) {
+        if let Some(bitmap) = subtree_drawn_image(layer).and_then(|id| scene.bitmap(id)) {
             sum = sum.wrapping_add(bitmap.content_generation);
         }
     }
@@ -2353,9 +2386,20 @@ fn grayscale_bitmap(
     Some(BitmapState::new(width, height, rgba))
 }
 
-/// The image a layer draws for its `face`: the main image for the ordinary
-/// faces, the alpha plane for `dfMask` (`2`) and the 8-bit province plane for
-/// `dfProvince` (`3`).
+/// The bitmap id a layer contributes to its own composite: the main image,
+/// or the self image a transition stands in for it while the subtree stays
+/// live. The `dfMask`/`dfProvince` faces derive their plane from the main
+/// image or the province buffer, so they keep the main image.
+fn subtree_drawn_image(layer: &crate::scene::LayerState) -> Option<u32> {
+    match layer.face {
+        2 | 3 => layer.bitmap,
+        _ => layer.transition_self.or(layer.bitmap),
+    }
+}
+
+/// The image a layer draws for its `face`: the main image (or the self image
+/// that replaces it) for the ordinary faces, the alpha plane for `dfMask`
+/// (`2`) and the 8-bit province plane for `dfProvince` (`3`).
 fn subtree_source_image(scene: &Scene, layer: &crate::scene::LayerState) -> Option<BitmapState> {
     match layer.face {
         2 => {
@@ -2377,7 +2421,9 @@ fn subtree_source_image(scene: &Scene, layer: &crate::scene::LayerState) -> Opti
                     .unwrap_or(0)
             })
         }
-        _ => layer.bitmap.and_then(|id| scene.bitmap(id)).cloned(),
+        _ => subtree_drawn_image(layer)
+            .and_then(|id| scene.bitmap(id))
+            .cloned(),
     }
 }
 

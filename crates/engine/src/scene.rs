@@ -207,6 +207,13 @@ pub struct LayerState {
     /// the layer first needs one; freed with the last
     /// [`Scene::dec_cache_enabled_count`].
     pub cache_content: Option<u32>,
+    /// The image drawn in place of this layer's own image while a transition
+    /// blends it with another layer's image without consuming the subtree.
+    /// The projection draws it at the main image's placement and the layer's
+    /// children keep drawing live, so it is never part of a cached subtree.
+    /// `None` until the transition first needs one; the transition clears it
+    /// when it ends ([`crate::layer_ops::clear_transition_self_image`]).
+    pub transition_self: Option<u32>,
     /// Reference `CacheRecalcRegion`: the subtree content must be
     /// recomposited before it is used again. Set for this layer and every
     /// caching ancestor whenever the layer changes, and cleared when the
@@ -726,6 +733,7 @@ impl Scene {
             cache_enabled_count: 0,
             cache_bitmap: None,
             cache_content: None,
+            transition_self: None,
             cache_recalc: false,
             cache_source_generation: 0,
             hint: String::new(),
@@ -1159,7 +1167,7 @@ impl Scene {
         let Some(layer) = self.layer(id) else {
             return;
         };
-        let (win, parent, domain, font_id, bitmap, cache_bitmap, cache_content) = (
+        let (win, parent, domain, font_id, bitmap, cache_bitmap, cache_content, transition_self) = (
             layer.window,
             layer.parent,
             layer.domain,
@@ -1167,6 +1175,7 @@ impl Scene {
             layer.bitmap,
             layer.cache_bitmap,
             layer.cache_content,
+            layer.transition_self,
         );
         let children = layer.children.clone();
         // `Part()`: sever this layer from its parent (or the window roots).
@@ -1208,6 +1217,10 @@ impl Scene {
         }
         if let Some(content) = cache_content {
             self.release_bitmap(content);
+        }
+        // The transition self image is layer-owned too.
+        if let Some(self_image) = transition_self {
+            self.release_bitmap(self_image);
         }
         // The removed layer owns its lazily-allocated font; drop it with the
         // layer (a surviving child keeps its own font).
@@ -1348,6 +1361,7 @@ impl Scene {
                     .into_iter()
                     .chain(layer.cache_bitmap)
                     .chain(layer.cache_content)
+                    .chain(layer.transition_self)
             })
             .collect();
         // Drop the doomed ids from every surviving layer's child list and
@@ -2016,13 +2030,14 @@ impl Scene {
         true
     }
 
-    /// Whether any live layer still references `id` as its MainImage or its
-    /// subtree cache.
+    /// Whether any live layer still references `id` as its MainImage, its
+    /// subtree cache or its transition self image.
     pub fn bitmap_referenced_by_layer(&self, id: u32) -> bool {
         self.layers.iter().any(|layer| {
             layer.bitmap == Some(id)
                 || layer.cache_bitmap == Some(id)
                 || layer.cache_content == Some(id)
+                || layer.transition_self == Some(id)
         })
     }
 
@@ -2078,7 +2093,8 @@ impl Scene {
     /// `tTVPBaseBitmap`; destroying the layer drops only its own reference.
     /// In this port a bitmap id can be held by more than one owner, so
     /// freeing is conservative — the bitmap is removed only when
-    /// * no live layer references it (`layer.bitmap == Some(id)`), and
+    /// * no live layer references it (MainImage, subtree cache or transition
+    ///   self image), and
     /// * it is not owned by a script `Bitmap` object
     ///   ([`BitmapState::script_owned`]).
     ///
@@ -2282,6 +2298,31 @@ impl Scene {
             _ => false,
         };
         if changed {
+            self.touch();
+            if let Some(old) = replaced {
+                self.release_bitmap(old);
+            }
+        }
+    }
+
+    /// Set the image drawn in place of this layer's own image, without
+    /// touching its subtree. Bumps [`Scene::revision`] and marks the layer's
+    /// cache and every caching ancestor's stale when the id actually changes;
+    /// a cache that already composited the previous source must not keep
+    /// showing it. The replaced bitmap is released once nothing else
+    /// references it.
+    pub fn set_transition_self_image(&mut self, id: u32, bitmap: Option<u32>) {
+        let mut replaced = None;
+        let changed = match self.layer_mut_untracked(id) {
+            Some(layer) if layer.transition_self != bitmap => {
+                replaced = layer.transition_self;
+                layer.transition_self = bitmap;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.invalidate_layer_cache(id);
             self.touch();
             if let Some(old) = replaced {
                 self.release_bitmap(old);

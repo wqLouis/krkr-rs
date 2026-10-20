@@ -45,6 +45,9 @@ api = { workspace = true }
 # in L1 only (AGENTS §2). The compat natives route their file IO through this
 # crate rather than reaching for the host themselves.
 fs = { workspace = true }
+# The `PSBFile` and `PSD` plugins decode their containers through the L1 format
+# crate; the parsers themselves are pure byte transforms and live there.
+psd = { workspace = true }
 
 [dev-dependencies]
 # Tests only: the shared `build_xp3` archive fixture (raw and zlib-index) so

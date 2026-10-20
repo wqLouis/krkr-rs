@@ -494,6 +494,7 @@ dependencies = [
  "md-5",
  "media",
  "platform",
+ "psd",
  "serde_json",
  "testkit",
  "thiserror 2.0.20",
@@ -859,6 +860,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fearless_simd"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3296eb97d869113eaf148a6bdf01884e90b3828ad7ae2340b0f93362fc158611"
+
+[[package]]
 name = "ffmpeg-next"
 version = "9.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -956,6 +963,15 @@ name = "foreign-types-shared"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
+
+[[package]]
+name = "forkunion"
+version = "3.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c08014f7d40a9672ec8abf4afa3efb9488248e1e2254e9bbcd6fa2b2ec61fcf1"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "fs"
@@ -1973,6 +1989,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "psd"
+version = "1.0.0"
+dependencies = [
+ "fearless_simd",
+ "flate2",
+ "forkunion",
+ "log",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

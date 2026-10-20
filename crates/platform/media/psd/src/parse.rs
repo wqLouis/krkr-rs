@@ -1,47 +1,26 @@
-//! PSD container parser.
+//! PSD container reading.
 //!
-//! Behavioral reference: `reference/cpp/plugins/psdfile/psdparse/`
-//! (`psdparse.{h,cpp}`, `psddata.h`, `psdparse/psdfile.cpp`). The reference
-//! uses Boost.Spirit grammars over a random-access byte iterator; this port is
-//! a hand-written reader over an in-memory byte slice, which produces the same
-//! structure without the parser combinator dependency.
+//! The reader is a hand-written cursor over an in-memory byte slice. It builds
+//! the complete [`PsdFile`] model up front: header, colour mode data, image
+//! resources, the layer/mask section (layer records, their additional layer
+//! info and each channel's compressed bytes) and the merged image data.
+//! Channel expansion lives in [`crate::decode`].
 //!
-//! The parser builds the complete [`PsdFile`] model up front: header, colour
-//! mode data, image resources, the layer/mask section (layer records, their
-//! additional layer info and each channel's compressed bytes) and the merged
-//! image data. Decoding (RLE/zip) lives in [`super::decode`].
+//! Two reading styles coexist because the format needs both: the checked
+//! accessors fail with [`PsdError::Eof`] when the input ends early, and the
+//! `*_ref` accessors return the format's own short-read sentinels (`-1`, an
+//! empty string) for the record fields that tolerate a truncated block.
 
 use std::collections::BTreeMap;
 
-use super::descriptor;
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
-
-/// A typed PSD parse/decode failure.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum PsdError {
-    /// The input ended before a required field could be read.
-    #[error("unexpected end of PSD data")]
-    Eof,
-    /// The file is structurally invalid.
-    #[error("invalid PSD: {0}")]
-    Invalid(String),
-    /// A compressed channel could not be expanded.
-    #[error("PSD decompression failed: {0}")]
-    Decompress(String),
-}
-
-/// Convenience alias for parser results.
-pub(crate) type Result<T> = std::result::Result<T, PsdError>;
+use crate::descriptor::{self, Value};
+use crate::error::{PsdError, PsdResult};
 
 // ---------------------------------------------------------------------------
 // Endian-aware byte reader
 // ---------------------------------------------------------------------------
 
-/// A big-endian byte cursor over a bounded slice (the reference
-/// `IteratorBase`).
+/// A big-endian byte cursor over a bounded slice.
 pub(crate) struct Reader<'a> {
     data: &'a [u8],
     pos: usize,
@@ -69,7 +48,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Consume `n` bytes and return them.
-    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+    pub(crate) fn take(&mut self, n: usize) -> PsdResult<&'a [u8]> {
         let end = self.pos.checked_add(n).ok_or(PsdError::Eof)?;
         if end > self.data.len() {
             return Err(PsdError::Eof);
@@ -80,39 +59,39 @@ impl<'a> Reader<'a> {
     }
 
     /// Skip `n` bytes.
-    pub(crate) fn skip(&mut self, n: usize) -> Result<()> {
+    pub(crate) fn skip(&mut self, n: usize) -> PsdResult<()> {
         self.take(n).map(|_| ())
     }
 
     /// Read one unsigned byte.
-    pub(crate) fn u8(&mut self) -> Result<u8> {
+    pub(crate) fn u8(&mut self) -> PsdResult<u8> {
         Ok(self.take(1)?[0])
     }
 
     /// Read a big-endian `u16`.
-    pub(crate) fn u16(&mut self) -> Result<u16> {
+    pub(crate) fn u16(&mut self) -> PsdResult<u16> {
         let b = self.take(2)?;
         Ok(u16::from_be_bytes([b[0], b[1]]))
     }
 
     /// Read a big-endian `i16`.
-    pub(crate) fn i16(&mut self) -> Result<i16> {
+    pub(crate) fn i16(&mut self) -> PsdResult<i16> {
         Ok(self.u16()? as i16)
     }
 
     /// Read a big-endian `u32`.
-    pub(crate) fn u32(&mut self) -> Result<u32> {
+    pub(crate) fn u32(&mut self) -> PsdResult<u32> {
         let b = self.take(4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
     /// Read a big-endian `i32`.
-    pub(crate) fn i32(&mut self) -> Result<i32> {
+    pub(crate) fn i32(&mut self) -> PsdResult<i32> {
         Ok(self.u32()? as i32)
     }
 
     /// Read a big-endian `u64`.
-    pub(crate) fn u64(&mut self) -> Result<u64> {
+    pub(crate) fn u64(&mut self) -> PsdResult<u64> {
         let b = self.take(8)?;
         Ok(u64::from_be_bytes([
             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
@@ -120,14 +99,14 @@ impl<'a> Reader<'a> {
     }
 
     /// Read a 4-byte key as a fixed array.
-    pub(crate) fn key4(&mut self) -> Result<[u8; 4]> {
+    pub(crate) fn key4(&mut self) -> PsdResult<[u8; 4]> {
         let b = self.take(4)?;
         Ok([b[0], b[1], b[2], b[3]])
     }
 
-    /// Read the reference `getUnicodeString`: a big-endian `i32` code-unit
-    /// count followed by that many UTF-16 big-endian code units.
-    pub(crate) fn unicode_string(&mut self) -> Result<String> {
+    /// Read a length-prefixed big-endian UTF-16 string: an `i32` code-unit
+    /// count followed by that many units. A negative count is empty.
+    pub(crate) fn unicode_string(&mut self) -> PsdResult<String> {
         let count = self.i32()?;
         if count < 0 {
             return Ok(String::new());
@@ -139,9 +118,8 @@ impl<'a> Reader<'a> {
         Ok(String::from_utf16_lossy(&units))
     }
 
-    /// The reference `IteratorBase::getInt16` (`psdparse.h:107-125`): `-1`
-    /// when fewer than two bytes remain, otherwise the big-endian value. The
-    /// cursor does not advance on a short read.
+    /// A big-endian `i16` that yields `-1` when fewer than two bytes remain.
+    /// The cursor does not advance on a short read.
     pub(crate) fn i16_ref(&mut self) -> i16 {
         if self.data.len().saturating_sub(self.pos) < 2 {
             return -1;
@@ -151,8 +129,7 @@ impl<'a> Reader<'a> {
         i16::from_be_bytes([b[0], b[1]])
     }
 
-    /// The reference `IteratorBase::getInt32` (`psdparse.h:127-140`): `-1`
-    /// when fewer than four bytes remain.
+    /// A big-endian `i32` that yields `-1` when fewer than four bytes remain.
     pub(crate) fn i32_ref(&mut self) -> i32 {
         if self.data.len().saturating_sub(self.pos) < 4 {
             return -1;
@@ -162,8 +139,7 @@ impl<'a> Reader<'a> {
         i32::from_be_bytes([b[0], b[1], b[2], b[3]])
     }
 
-    /// The reference `IteratorBase::getCh` (`psdparse.h:101-105`): `-1` at
-    /// the end of the data, otherwise the byte (`0..=255`).
+    /// One byte as `0..=255`, or `-1` at the end of the data.
     pub(crate) fn ch_ref(&mut self) -> i32 {
         if self.pos >= self.data.len() {
             return -1;
@@ -173,10 +149,8 @@ impl<'a> Reader<'a> {
         value
     }
 
-    /// The reference `IteratorBase::getUnicodeString` (`psdparse.h:181-187`):
-    /// a `getInt32` code-unit count followed by that many `getInt16` units. A
-    /// short read contributes `-1` units (`0xffff`), matching the reference's
-    /// `(wchar_t)-1` push.
+    /// A length-prefixed UTF-16 string read through the short-read sentinels: a
+    /// short unit contributes `-1` (`0xffff`).
     pub(crate) fn unicode_string_ref(&mut self) -> String {
         let count = self.i32_ref();
         if count <= 0 {
@@ -194,9 +168,9 @@ impl<'a> Reader<'a> {
 // Enumerations
 // ---------------------------------------------------------------------------
 
-/// Layer kind (reference `psd::LayerType`).
+/// A layer's kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LayerType {
+pub enum LayerType {
     /// A regular pixel layer.
     Normal = 0,
     /// The hidden end-of-folder marker.
@@ -210,49 +184,77 @@ pub(crate) enum LayerType {
 }
 
 impl LayerType {
-    /// The reference integer value.
-    pub(crate) fn as_i32(self) -> i32 {
+    /// The layer kind as the integer the plugin surface reports.
+    pub fn as_i32(self) -> i32 {
         self as i32
     }
 }
 
-/// Photoshop blend mode (reference `psd::BlendMode`).
+/// A Photoshop blend mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BlendMode {
-    /// An unknown / unsupported blend key.
+pub enum BlendMode {
+    /// An unknown or unsupported blend key.
     Invalid = -1,
+    /// `norm`.
     Normal = 0,
+    /// `diss`.
     Dissolve = 1,
+    /// `dark`.
     Darken = 2,
+    /// `mul `.
     Multiply = 3,
+    /// `idiv`.
     ColorBurn = 4,
+    /// `lbrn`.
     LinearBurn = 5,
+    /// `lite`.
     Lighten = 6,
+    /// `scrn`.
     Screen = 7,
+    /// `div `.
     ColorDodge = 8,
+    /// `lddg`.
     LinearDodge = 9,
+    /// `over`.
     Overlay = 10,
+    /// `sLit`.
     SoftLight = 11,
+    /// `hLit`.
     HardLight = 12,
+    /// `vLit`.
     VividLight = 13,
+    /// `lLit`.
     LinearLight = 14,
+    /// `pLit`.
     PinLight = 15,
+    /// `hMix`.
     HardMix = 16,
+    /// `diff`.
     Difference = 17,
+    /// `smud`.
     Exclusion = 18,
+    /// `hue `.
     Hue = 19,
+    /// `sat `.
     Saturation = 20,
+    /// `colr`.
     Color = 21,
+    /// `lum `.
     Luminosity = 22,
+    /// `pass`.
     PassThrough = 23,
+    /// `dkCl`.
     DarkerColor = 24,
+    /// `ltCl`.
     LighterColor = 25,
+    /// `fsub`.
     Subtract = 26,
+    /// `fdiv`.
     Divide = 27,
 }
 
 impl BlendMode {
-    /// Map a 4-byte blend key to its mode (reference `blendKeyToMode`).
+    /// Map a 4-byte blend key to its mode.
     pub(crate) fn from_key(key: [u8; 4]) -> Self {
         match &key {
             b"norm" => Self::Normal,
@@ -287,37 +289,15 @@ impl BlendMode {
         }
     }
 
-    /// The reference integer value.
-    pub(crate) fn as_i32(self) -> i32 {
+    /// The blend mode as the integer the plugin surface reports.
+    pub fn as_i32(self) -> i32 {
         self as i32
-    }
-
-    /// The KiriKiri `tTVPLayerType` this blend maps onto (reference
-    /// `convBlendMode`). Unsupported blends fall back to `ltPsNormal`.
-    pub(crate) fn as_tvp(self) -> i32 {
-        match self {
-            Self::Normal => 13,      // ltPsNormal
-            Self::Darken => 25,      // ltPsDarken
-            Self::Multiply => 16,    // ltPsMultiplicative
-            Self::ColorBurn => 23,   // ltPsColorBurn
-            Self::LinearBurn => 15,  // ltPsSubtractive
-            Self::Lighten => 24,     // ltPsLighten
-            Self::Screen => 17,      // ltPsScreen
-            Self::ColorDodge => 21,  // ltPsColorDodge
-            Self::LinearDodge => 14, // ltPsAdditive
-            Self::Overlay => 18,     // ltPsOverlay
-            Self::SoftLight => 20,   // ltPsSoftLight
-            Self::HardLight => 19,   // ltPsHardLight
-            Self::Difference => 26,  // ltPsDifference
-            Self::Exclusion => 28,   // ltPsExclusion
-            _ => 13,
-        }
     }
 }
 
-/// How a layer image should be assembled (reference `psd::ImageMode`).
+/// How a layer image should be assembled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ImageMode {
+pub enum ImageMode {
     /// The image without its mask.
     Image,
     /// The mask only, rendered as grayscale.
@@ -332,191 +312,276 @@ pub(crate) enum ImageMode {
 
 /// The PSD file header.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Header {
-    pub(crate) channels: u16,
-    pub(crate) height: i32,
-    pub(crate) width: i32,
-    pub(crate) depth: u16,
-    pub(crate) mode: u16,
+pub struct Header {
+    /// The channel count of the merged image.
+    pub channels: u16,
+    /// The document height in pixels.
+    pub height: i32,
+    /// The document width in pixels.
+    pub width: i32,
+    /// Bits per channel (1, 8, 16 or 32).
+    pub depth: u16,
+    /// The colour mode; see the `COLOR_MODE_*` constants.
+    pub mode: u16,
 }
 
 /// One layer channel's compressed payload.
 #[derive(Debug, Clone)]
-pub(crate) struct ChannelInfo {
-    pub(crate) id: i16,
-    pub(crate) length: i32,
-    pub(crate) compression: u16,
+pub struct ChannelInfo {
+    /// The channel id: 0/1/2 colour, -1 alpha, -2/-3 mask.
+    pub id: i16,
+    /// The declared byte length of the channel data, compression id included.
+    pub length: i32,
+    /// The compression id (0 raw, 1 PackBits, 2 zip, 3 zip with prediction).
+    pub compression: u16,
     /// The bytes after the 2-byte compression id.
-    pub(crate) data: Vec<u8>,
+    pub data: Vec<u8>,
 }
 
 impl ChannelInfo {
-    /// Whether this channel is a user/real user mask channel.
-    pub(crate) fn is_mask_channel(&self) -> bool {
+    /// Whether this channel is a user or real-user mask channel.
+    pub fn is_mask_channel(&self) -> bool {
         self.id == -2 || self.id == -3
     }
 }
 
 /// A layer mask rectangle and its flags.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct LayerMask {
-    pub(crate) width: i32,
-    pub(crate) height: i32,
-    pub(crate) top: i32,
-    pub(crate) left: i32,
-    pub(crate) bottom: i32,
-    pub(crate) right: i32,
-    pub(crate) default_color: i32,
-    pub(crate) flags: i32,
-    pub(crate) real_flags: i32,
-    pub(crate) real_user_mask_background: i32,
-    pub(crate) enclosing_top: i32,
-    pub(crate) enclosing_left: i32,
-    pub(crate) enclosing_bottom: i32,
-    pub(crate) enclosing_right: i32,
+pub struct LayerMask {
+    /// The mask width in pixels.
+    pub width: i32,
+    /// The mask height in pixels.
+    pub height: i32,
+    /// The mask top edge.
+    pub top: i32,
+    /// The mask left edge.
+    pub left: i32,
+    /// The mask bottom edge.
+    pub bottom: i32,
+    /// The mask right edge.
+    pub right: i32,
+    /// The colour outside the mask (0 or 255).
+    pub default_color: i32,
+    /// The mask flags.
+    pub flags: i32,
+    /// The real-user-mask flags.
+    pub real_flags: i32,
+    /// The real-user-mask background byte.
+    pub real_user_mask_background: i32,
+    /// The enclosing-rectangle top edge.
+    pub enclosing_top: i32,
+    /// The enclosing-rectangle left edge.
+    pub enclosing_left: i32,
+    /// The enclosing-rectangle bottom edge.
+    pub enclosing_bottom: i32,
+    /// The enclosing-rectangle right edge.
+    pub enclosing_right: i32,
 }
 
 /// One additional layer info block.
 #[derive(Debug, Clone)]
-pub(crate) struct AdditionalLayer {
-    /// 0 = `8BIM`, 1 = `8B64`.
-    pub(crate) sig_type: i32,
-    pub(crate) key: [u8; 4],
-    pub(crate) data: Vec<u8>,
+pub struct AdditionalLayer {
+    /// The signature kind: 0 for `8BIM`, 1 for `8B64`.
+    pub sig_type: i32,
+    /// The 4-byte info key.
+    pub key: [u8; 4],
+    /// The raw block data.
+    pub data: Vec<u8>,
 }
 
 /// A layer's parsed extra data block.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct LayerExtra {
-    pub(crate) layer_mask: LayerMask,
-    pub(crate) layer_name: String,
-    pub(crate) additional: Vec<AdditionalLayer>,
+pub struct LayerExtra {
+    /// The layer mask record.
+    pub layer_mask: LayerMask,
+    /// The legacy layer name stored in the extra block.
+    pub layer_name: String,
+    /// The additional layer info blocks, in file order.
+    pub additional: Vec<AdditionalLayer>,
 }
 
-/// Per-layer layer-comp offset/visibility state (reference `LayerCompInfo`).
+/// Per-layer layer-comp offset and visibility state.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct LayerCompInfo {
-    pub(crate) id: i32,
-    pub(crate) offset_x: i32,
-    pub(crate) offset_y: i32,
-    pub(crate) is_enabled: bool,
+pub struct LayerCompInfo {
+    /// The layer comp id.
+    pub id: i32,
+    /// The horizontal offset recorded by the comp.
+    pub offset_x: i32,
+    /// The vertical offset recorded by the comp.
+    pub offset_y: i32,
+    /// Whether the layer is enabled in the comp.
+    pub is_enabled: bool,
 }
 
 /// One Photoshop layer.
 #[derive(Debug, Clone)]
-pub(crate) struct LayerInfo {
-    pub(crate) width: i32,
-    pub(crate) height: i32,
-    pub(crate) top: i32,
-    pub(crate) left: i32,
-    pub(crate) bottom: i32,
-    pub(crate) right: i32,
-    pub(crate) channels: Vec<ChannelInfo>,
-    pub(crate) blend_mode: BlendMode,
-    pub(crate) opacity: u8,
-    pub(crate) fill_opacity: i32,
-    pub(crate) clipping: u8,
-    pub(crate) flag: u8,
-    pub(crate) extra_data: LayerExtra,
-    pub(crate) layer_id: i32,
-    pub(crate) layer_type: LayerType,
-    pub(crate) layer_name: String,
-    pub(crate) layer_name_unicode: String,
-    pub(crate) layer_comps: BTreeMap<i32, LayerCompInfo>,
+pub struct LayerInfo {
+    /// The layer width in pixels.
+    pub width: i32,
+    /// The layer height in pixels.
+    pub height: i32,
+    /// The layer top edge.
+    pub top: i32,
+    /// The layer left edge.
+    pub left: i32,
+    /// The layer bottom edge.
+    pub bottom: i32,
+    /// The layer right edge.
+    pub right: i32,
+    /// The channel records, in file order.
+    pub channels: Vec<ChannelInfo>,
+    /// The blend mode.
+    pub blend_mode: BlendMode,
+    /// The layer opacity (0..=255).
+    pub opacity: u8,
+    /// The fill opacity (0..=255, or `-1` when the block is short).
+    pub fill_opacity: i32,
+    /// The clipping flags.
+    pub clipping: u8,
+    /// The layer flags.
+    pub flag: u8,
+    /// The parsed extra data block.
+    pub extra_data: LayerExtra,
+    /// The layer id from the `lyid` block, or `-1`.
+    pub layer_id: i32,
+    /// The layer kind.
+    pub layer_type: LayerType,
+    /// The layer name from the extra block.
+    pub layer_name: String,
+    /// The unicode layer name from the `luni` block.
+    pub layer_name_unicode: String,
+    /// The per-comp state recorded in the `shmd` metadata.
+    pub layer_comps: BTreeMap<i32, LayerCompInfo>,
     /// Index into [`PsdFile::layers`] of the enclosing folder, if any.
-    pub(crate) parent: Option<usize>,
+    pub parent: Option<usize>,
 }
 
 impl LayerInfo {
-    /// Reference `isVisible`.
-    pub(crate) fn is_visible(&self) -> bool {
+    /// Whether the layer is visible.
+    pub fn is_visible(&self) -> bool {
         self.flag & (1 << 1) == 0
     }
 
-    /// Reference `isTransparencyProtected`.
-    pub(crate) fn is_transparency_protected(&self) -> bool {
+    /// Whether the layer protects its transparency.
+    pub fn is_transparency_protected(&self) -> bool {
         self.flag & (1 << 0) != 0
     }
 
-    /// Reference `isObsolete`.
-    pub(crate) fn is_obsolete(&self) -> bool {
+    /// Whether the layer record is obsolete.
+    pub fn is_obsolete(&self) -> bool {
         self.flag & (1 << 2) != 0
     }
 
-    /// Reference `isPixelDataIrrelevant`.
-    pub(crate) fn is_pixel_data_irrelevant(&self) -> bool {
+    /// Whether the layer carries no pixel data of its own.
+    pub fn is_pixel_data_irrelevant(&self) -> bool {
         self.flag & (1 << 4) != 0
     }
 }
 
-/// One image resource block (reference `ImageResourceInfo`).
+/// One image resource block.
 #[derive(Debug, Clone)]
-pub(crate) struct ImageResource {
-    pub(crate) id: u16,
-    pub(crate) data: Vec<u8>,
+pub struct ImageResource {
+    /// The resource id.
+    pub id: u16,
+    /// The raw resource data.
+    pub data: Vec<u8>,
 }
 
-/// A parsed slice item (reference `SliceItem`).
+/// A parsed slice item.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SliceItem {
-    pub(crate) id: i32,
-    pub(crate) group_id: i32,
-    pub(crate) origin: i32,
-    pub(crate) associated_layer_id: i32,
-    pub(crate) name: String,
-    pub(crate) slice_type: i32,
-    pub(crate) left: i32,
-    pub(crate) top: i32,
-    pub(crate) right: i32,
-    pub(crate) bottom: i32,
-    pub(crate) url: String,
-    pub(crate) target: String,
-    pub(crate) message: String,
-    pub(crate) alt_tag: String,
-    pub(crate) cell_text_is_html: bool,
-    pub(crate) cell_text: String,
-    pub(crate) horizontal_align: i32,
-    pub(crate) vertical_align: i32,
-    pub(crate) color_a: u8,
-    pub(crate) color_r: u8,
-    pub(crate) color_g: u8,
-    pub(crate) color_b: u8,
+pub struct SliceItem {
+    /// The slice id.
+    pub id: i32,
+    /// The group this slice belongs to.
+    pub group_id: i32,
+    /// The slice origin (0 layer-based, 1 user-based).
+    pub origin: i32,
+    /// The layer id a layer-based slice is attached to.
+    pub associated_layer_id: i32,
+    /// The slice name.
+    pub name: String,
+    /// The slice type.
+    pub slice_type: i32,
+    /// The slice left edge.
+    pub left: i32,
+    /// The slice top edge.
+    pub top: i32,
+    /// The slice right edge.
+    pub right: i32,
+    /// The slice bottom edge.
+    pub bottom: i32,
+    /// The slice URL.
+    pub url: String,
+    /// The link target.
+    pub target: String,
+    /// The rollover message.
+    pub message: String,
+    /// The alternate tag text.
+    pub alt_tag: String,
+    /// Whether the cell text is HTML.
+    pub cell_text_is_html: bool,
+    /// The cell text.
+    pub cell_text: String,
+    /// The horizontal alignment code.
+    pub horizontal_align: i32,
+    /// The vertical alignment code.
+    pub vertical_align: i32,
+    /// The slice colour alpha byte.
+    pub color_a: u8,
+    /// The slice colour red byte.
+    pub color_r: u8,
+    /// The slice colour green byte.
+    pub color_g: u8,
+    /// The slice colour blue byte.
+    pub color_b: u8,
 }
 
-/// The parsed slice resource (reference `SliceResource`).
+/// The parsed slice resource.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SliceResource {
-    pub(crate) bounding_left: i32,
-    pub(crate) bounding_top: i32,
-    pub(crate) bounding_right: i32,
-    pub(crate) bounding_bottom: i32,
-    pub(crate) group_name: String,
-    pub(crate) slices: Vec<SliceItem>,
+pub struct SliceResource {
+    /// The bounding rectangle's left edge.
+    pub bounding_left: i32,
+    /// The bounding rectangle's top edge.
+    pub bounding_top: i32,
+    /// The bounding rectangle's right edge.
+    pub bounding_right: i32,
+    /// The bounding rectangle's bottom edge.
+    pub bounding_bottom: i32,
+    /// The slice group name.
+    pub group_name: String,
+    /// The slices in the group.
+    pub slices: Vec<SliceItem>,
 }
 
-/// One guide (reference `GuideItem`).
+/// One guide.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct GuideItem {
-    pub(crate) location: i32,
-    /// 0 = vertical, 1 = horizontal (`-1` on a short read).
-    pub(crate) direction: i32,
+pub struct GuideItem {
+    /// The guide position.
+    pub location: i32,
+    /// The guide direction: 0 vertical, 1 horizontal (`-1` on a short read).
+    pub direction: i32,
 }
 
-/// The parsed grid/guide resource (reference `GridGuideResource`).
+/// The parsed grid and guide resource.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct GridGuideResource {
-    pub(crate) horizontal_grid: i32,
-    pub(crate) vertical_grid: i32,
-    pub(crate) guides: Vec<GuideItem>,
+pub struct GridGuideResource {
+    /// The horizontal grid spacing.
+    pub horizontal_grid: i32,
+    /// The vertical grid spacing.
+    pub vertical_grid: i32,
+    /// The guides in the document.
+    pub guides: Vec<GuideItem>,
 }
 
-/// The indexed-colour table (reference `ColorTable`).
+/// The indexed-colour table.
 #[derive(Debug, Clone)]
-pub(crate) struct ColorTable {
-    /// Always 256 RGBA entries.
-    pub(crate) colors: Vec<[u8; 4]>,
-    pub(crate) transparency_index: i16,
-    pub(crate) valid_count: i16,
+pub struct ColorTable {
+    /// The 256 RGBA palette entries.
+    pub colors: Vec<[u8; 4]>,
+    /// The transparent palette index, or `-1`.
+    pub transparency_index: i16,
+    /// The number of valid palette entries.
+    pub valid_count: i16,
 }
 
 impl Default for ColorTable {
@@ -529,47 +594,67 @@ impl Default for ColorTable {
     }
 }
 
-/// A document-level layer comp (reference `LayerComp`).
+/// A document-level layer comp.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct LayerComp {
-    pub(crate) id: i32,
-    pub(crate) record_visibility: bool,
-    pub(crate) record_position: bool,
-    pub(crate) record_appearance: bool,
-    pub(crate) name: String,
-    pub(crate) comment: String,
+pub struct LayerComp {
+    /// The comp id.
+    pub id: i32,
+    /// Whether the comp records layer visibility.
+    pub record_visibility: bool,
+    /// Whether the comp records layer position.
+    pub record_position: bool,
+    /// Whether the comp records layer appearance.
+    pub record_appearance: bool,
+    /// The comp name.
+    pub name: String,
+    /// The comp comment.
+    pub comment: String,
 }
 
-/// The complete parsed PSD document (reference `psd::Data`).
+/// The complete parsed PSD document.
 #[derive(Debug, Clone)]
-pub(crate) struct PsdFile {
-    pub(crate) header: Header,
-    pub(crate) layers: Vec<LayerInfo>,
-    pub(crate) slice: Option<SliceResource>,
-    pub(crate) grid_guide: Option<GridGuideResource>,
-    pub(crate) color_table: ColorTable,
-    pub(crate) layer_comps: Vec<LayerComp>,
-    pub(crate) last_applied_comp_id: i32,
-    /// The merged composite image (compression id + body), if present.
-    pub(crate) image_data: Option<Vec<u8>>,
+pub struct PsdFile {
+    /// The file header.
+    pub header: Header,
+    /// The layer records, in file order.
+    pub layers: Vec<LayerInfo>,
+    /// The slice resource, if the file carries one.
+    pub slice: Option<SliceResource>,
+    /// The grid and guide resource, if the file carries one.
+    pub grid_guide: Option<GridGuideResource>,
+    /// The indexed-colour table.
+    pub color_table: ColorTable,
+    /// The document-level layer comps.
+    pub layer_comps: Vec<LayerComp>,
+    /// The comp id the document was last saved with, or `-1`.
+    pub last_applied_comp_id: i32,
+    /// The merged composite image (compression id and body), if present.
+    pub image_data: Option<Vec<u8>>,
 }
 
-/// Colour mode constants (reference `psd::ColorMode`).
-pub(crate) const COLOR_MODE_BITMAP: u16 = 0;
-pub(crate) const COLOR_MODE_GRAYSCALE: u16 = 1;
-pub(crate) const COLOR_MODE_INDEXED: u16 = 2;
-pub(crate) const COLOR_MODE_RGB: u16 = 3;
-pub(crate) const COLOR_MODE_CMYK: u16 = 4;
-pub(crate) const COLOR_MODE_MULTICHANNEL: u16 = 7;
-pub(crate) const COLOR_MODE_DUOTONE: u16 = 8;
-pub(crate) const COLOR_MODE_LAB: u16 = 9;
+/// Bitmap colour mode.
+pub const COLOR_MODE_BITMAP: u16 = 0;
+/// Grayscale colour mode.
+pub const COLOR_MODE_GRAYSCALE: u16 = 1;
+/// Indexed colour mode.
+pub const COLOR_MODE_INDEXED: u16 = 2;
+/// RGB colour mode.
+pub const COLOR_MODE_RGB: u16 = 3;
+/// CMYK colour mode.
+pub const COLOR_MODE_CMYK: u16 = 4;
+/// Multichannel colour mode.
+pub const COLOR_MODE_MULTICHANNEL: u16 = 7;
+/// Duotone colour mode.
+pub const COLOR_MODE_DUOTONE: u16 = 8;
+/// Lab colour mode.
+pub const COLOR_MODE_LAB: u16 = 9;
 
 // ---------------------------------------------------------------------------
 // Top-level parse
 // ---------------------------------------------------------------------------
 
 /// Parse a complete PSD document.
-pub(crate) fn parse(bytes: &[u8]) -> Result<PsdFile> {
+pub fn parse(bytes: &[u8]) -> PsdResult<PsdFile> {
     let mut r = Reader::new(bytes);
 
     let signature = r.take(4)?;
@@ -601,9 +686,8 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<PsdFile> {
     let resources = parse_image_resources(resource_bytes)?;
 
     // Layer and mask information. A zero-length section carries no inner
-    // structure at all: the reference `setLayerAndMask` skips the inner
-    // parse when `size == 0` (`psdparse/psdparse.h:704-711`, inner skip at
-    // `:617-630`), so an empty section is a successful parse with no layers.
+    // structure at all, so an empty section is a successful parse with no
+    // layers rather than a truncated record.
     let layer_mask_len = r.u32()? as usize;
     let layers = if layer_mask_len > 0 {
         let layer_mask = r.take(layer_mask_len)?;
@@ -635,21 +719,20 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<PsdFile> {
 }
 
 impl PsdFile {
-    /// Second pass (reference `Data::processParsed`): expand the resources and
-    /// the per-layer additional info into the typed structures.
+    /// Second pass: expand the resources and the per-layer additional info
+    /// into the typed structures.
     fn process(&mut self, resources: &[ImageResource], color_mode: &[u8]) {
         for resource in resources {
             match resource.id {
                 1032 => self.load_grid_and_guide(&resource.data),
                 1050 => self.load_slice(&resource.data),
                 1046 => {
-                    // Reference `loadResourceColorTableCount` reads through
-                    // `IteratorBase` (`getInt16`), so a short block is `-1`.
+                    // The palette count is read through the short-read
+                    // sentinels, so a short block is `-1`.
                     let mut r = Reader::new(&resource.data);
                     self.color_table.valid_count = r.i16_ref();
                 }
                 1047 => {
-                    // Reference `loadResourceTransparencyIndex` (`getInt16`).
                     let mut r = Reader::new(&resource.data);
                     self.color_table.transparency_index = r.i16_ref();
                 }
@@ -688,8 +771,9 @@ impl PsdFile {
             }
         }
 
-        // Link each layer to its enclosing folder (reference: walk from the
-        // topmost record downwards, pushing/popping on the folder markers).
+        // Link each layer to its enclosing folder: walk from the topmost
+        // record downwards, pushing on a folder opener and popping on its
+        // hidden end marker.
         let mut stack: Vec<Option<usize>> = vec![None];
         for i in (0..self.layers.len()).rev() {
             let layer_type = self.layers[i].layer_type;
@@ -706,10 +790,9 @@ impl PsdFile {
 
     fn load_grid_and_guide(&mut self, data: &[u8]) {
         let mut r = Reader::new(data);
-        // Reference `loadResourceGridAndGuide`: the version is read and
-        // discarded, every field comes from `IteratorBase` (a short read is
-        // `-1`), a non-positive guide count yields no guides, and the
-        // resource is enabled as soon as it is seen.
+        // The version is read and discarded, every field comes from the
+        // short-read sentinels, a non-positive guide count yields no guides,
+        // and the resource is enabled as soon as it is seen.
         let _version = r.i32_ref();
         let horizontal_grid = r.i32_ref();
         let vertical_grid = r.i32_ref();
@@ -732,11 +815,10 @@ impl PsdFile {
 
     fn load_slice(&mut self, data: &[u8]) {
         let mut r = Reader::new(data);
-        // Reference `loadResourceSlice`: the v6 fields all come from
-        // `IteratorBase`, so a short read yields `-1`/empty instead of
-        // aborting, and the resource is enabled for any v6 block. The
-        // `uint8_t` colour fields store `getCh()` (so a short read is
-        // `0xff`).
+        // The version-6 fields all come from the short-read sentinels, so a
+        // short block yields `-1`/empty instead of aborting, and the resource
+        // is enabled for any version-6 block. The `uint8_t` colour fields
+        // store the byte sentinel, so a short read is `0xff`.
         let version = r.i32_ref();
         if version == 6 {
             let mut slice = SliceResource {
@@ -784,7 +866,8 @@ impl PsdFile {
             }
             self.slice = Some(slice);
         }
-        // v7/v8 are descriptor-based; the reference parses (and discards) them.
+        // Versions 7 and 8 are descriptor-based; their payload is consumed but
+        // not interpreted.
     }
 
     fn load_layer_comps(&mut self, data: &[u8]) {
@@ -796,7 +879,7 @@ impl PsdFile {
         let Ok(descriptor) = descriptor::read_descriptor(&mut r) else {
             return;
         };
-        self.last_applied_comp_id = descriptor.integer("lastAppliedComp").unwrap_or(-1);
+        self.last_applied_comp_id = descriptor.integer("lastAppliedComp").map_or(-1, |id| id);
         let Some(list) = descriptor.list("list") else {
             return;
         };
@@ -831,7 +914,7 @@ impl PsdFile {
 // Image resources
 // ---------------------------------------------------------------------------
 
-fn parse_image_resources(bytes: &[u8]) -> Result<Vec<ImageResource>> {
+fn parse_image_resources(bytes: &[u8]) -> PsdResult<Vec<ImageResource>> {
     let mut r = Reader::new(bytes);
     let mut resources = Vec::new();
     while !r.eof() {
@@ -855,7 +938,7 @@ fn parse_image_resources(bytes: &[u8]) -> Result<Vec<ImageResource>> {
 // Layer and mask section
 // ---------------------------------------------------------------------------
 
-fn parse_layer_and_mask(bytes: &[u8]) -> Result<Vec<LayerInfo>> {
+fn parse_layer_and_mask(bytes: &[u8]) -> PsdResult<Vec<LayerInfo>> {
     let mut r = Reader::new(bytes);
 
     let layer_info_len = r.u32()? as usize;
@@ -865,15 +948,15 @@ fn parse_layer_and_mask(bytes: &[u8]) -> Result<Vec<LayerInfo>> {
         layers = parse_layer_info(layer_info)?;
     }
 
-    // Global layer mask info (a size-prefixed block; parsed for structure,
-    // the fields are not exposed by the plugin).
+    // Global layer mask info: a size-prefixed block that is skipped; the
+    // plugin exposes none of its fields.
     if !r.eof() {
         let size = r.u32()? as usize;
         r.skip(size)?;
     }
 
-    // Optional additional layer information (Lr16 / Lr32) repeats a layer
-    // info block; the reference parses and discards it.
+    // An optional additional layer information block (`Lr16` / `Lr32`) repeats
+    // a layer info block; it is consumed and discarded.
     if !r.eof() {
         let signature = r.take(4)?;
         let key = r.take(4)?;
@@ -886,7 +969,7 @@ fn parse_layer_and_mask(bytes: &[u8]) -> Result<Vec<LayerInfo>> {
     Ok(layers)
 }
 
-fn parse_layer_info(bytes: &[u8]) -> Result<Vec<LayerInfo>> {
+fn parse_layer_info(bytes: &[u8]) -> PsdResult<Vec<LayerInfo>> {
     let mut r = Reader::new(bytes);
     let count = r.i16()?;
     let _merged_alpha = count < 0;
@@ -960,7 +1043,7 @@ fn parse_layer_info(bytes: &[u8]) -> Result<Vec<LayerInfo>> {
     Ok(layers)
 }
 
-fn parse_layer_extra(bytes: &[u8]) -> Result<LayerExtra> {
+fn parse_layer_extra(bytes: &[u8]) -> PsdResult<LayerExtra> {
     let mut r = Reader::new(bytes);
     let mut extra = LayerExtra::default();
 
@@ -1005,11 +1088,10 @@ fn parse_layer_extra(bytes: &[u8]) -> Result<LayerExtra> {
 
 fn parse_layer_mask(bytes: &[u8]) -> LayerMask {
     let mut mask = LayerMask::default();
-    // The reference `LayerMaskParser` grammar requires the full 19-byte base
-    // record; a shorter block fails the parse and leaves the zero-initialised
-    // mask. The extra fields need the full 37-byte record. Only `top`,
-    // `left`, `bottom`, `right` and `default_color` are script-observable
-    // (`psdclass.cpp:317-371`).
+    // A block shorter than the 19-byte base record leaves the
+    // zero-initialised mask; the extra fields need the full 37-byte record.
+    // Only `top`, `left`, `bottom`, `right` and `default_color` are part of
+    // the plugin surface.
     if bytes.len() < 19 {
         return mask;
     }
@@ -1049,19 +1131,17 @@ fn apply_additional_layer(layer: &mut LayerInfo, additional: &AdditionalLayer) {
         b"SoCo" | b"GdFl" | b"PtFl" => layer.layer_type = LayerType::Fill,
         b"lsct" | b"lsdk" => load_section_divider(layer, additional),
         b"luni" => {
-            // Reference `loadLayerUnicodeName` (`getUnicodeString`).
             let mut r = Reader::new(&additional.data);
             layer.layer_name_unicode = r.unicode_string_ref();
         }
         b"lyid" => {
-            // Reference `loadLayerId` (`getInt32`; `-1` on a short read).
+            // A short read yields `-1`.
             let mut r = Reader::new(&additional.data);
             layer.layer_id = r.i32_ref();
         }
         b"shmd" => load_layer_metadata(layer, additional),
         b"iOpa" => {
-            // Reference `loadLayerFillOpacity` (`getCh`; `-1` on a short
-            // read, which the reference stores in its `int` field).
+            // A short read yields `-1`, which is stored as-is.
             let mut r = Reader::new(&additional.data);
             layer.fill_opacity = r.ch_ref();
         }
@@ -1131,10 +1211,7 @@ fn load_layer_comp_descriptor(layer: &mut LayerInfo, r: &mut Reader<'_>) {
         let Some(comp_list) = comp.list("compList") else {
             continue;
         };
-        let Some(id) = comp_list
-            .first()
-            .and_then(super::descriptor::Value::as_integer)
-        else {
+        let Some(id) = comp_list.first().and_then(Value::as_integer) else {
             continue;
         };
         let mut info = LayerCompInfo {
@@ -1142,9 +1219,9 @@ fn load_layer_comp_descriptor(layer: &mut LayerInfo, r: &mut Reader<'_>) {
             ..Default::default()
         };
         if let Some(offset) = comp.descriptor("Ofst") {
-            // The reference reads `Hrzn` for both axes; kept for fidelity.
-            info.offset_x = offset.integer("Hrzn").unwrap_or(0);
-            info.offset_y = offset.integer("Hrzn").unwrap_or(0);
+            // Both axes read the horizontal key.
+            info.offset_x = offset.integer("Hrzn").map_or(0, |value| value);
+            info.offset_y = offset.integer("Hrzn").map_or(0, |value| value);
         }
         match comp.boolean("enab") {
             Some(enabled) => {
@@ -1161,9 +1238,9 @@ fn load_layer_comp_descriptor(layer: &mut LayerInfo, r: &mut Reader<'_>) {
 mod tests {
     use super::{Reader, parse_layer_mask};
 
-    /// A short read from the reference `IteratorBase` yields `-1`/empty
-    /// (`reference/cpp/plugins/psdfile/psdparse/psdparse.h:101-187`), not a
-    /// zero default.
+    /// A short read yields the format's sentinels (`-1`, an empty string), not
+    /// a zero default
+    /// (`reference/cpp/plugins/psdfile/psdparse/psdparse.h:101-187`).
     #[test]
     fn short_reads_use_the_reference_sentinels() {
         let mut reader = Reader::new(&[0x01]);
@@ -1176,9 +1253,10 @@ mod tests {
         assert_eq!(empty.unicode_string_ref(), "");
     }
 
-    /// A layer-mask block shorter than the reference grammar's 19-byte base
-    /// record leaves the zero-initialised mask (`LayerMaskParser` in
-    /// `reference/cpp/plugins/psdfile/psdparse/psdparse.h`).
+    /// A layer-mask block shorter than the 19-byte base record leaves the
+    /// zero-initialised mask
+    /// (`reference/cpp/plugins/psdfile/psdparse/psdparse.h` layer-mask
+    /// grammar).
     #[test]
     fn short_layer_mask_stays_zero() {
         let mask = parse_layer_mask(&[0u8; 4]);

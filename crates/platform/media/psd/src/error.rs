@@ -1,14 +1,15 @@
-//! Typed errors for the PSB container parser.
+//! Typed errors for the PSB and PSD readers.
 
-/// Convenience result alias for the PSB parser.
-pub(crate) type PsbResult<T> = Result<T, PsbError>;
+/// Convenience result alias for the PSB reader.
+pub type PsbResult<T> = Result<T, PsbError>;
 
-/// A typed PSB/MDF parse, decompression or image-bridge failure.
+/// A PSB/MDF container or decompression failure.
 ///
-/// The parser never falls back to a partially parsed result: every failure is
-/// surfaced here and turned into a TJS callback error by [`super`].
+/// The reader never returns a partially parsed document: every failure is
+/// reported here.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum PsbError {
+#[non_exhaustive]
+pub enum PsbError {
     /// The four-byte magic was not `PSB\0`.
     #[error("not a valid PSB file (signature {0:?})")]
     BadSignature([u8; 4]),
@@ -35,8 +36,22 @@ pub(crate) enum PsbError {
     Decompress(String),
 }
 
-impl From<PsbError> for String {
-    fn from(error: PsbError) -> Self {
-        error.to_string()
-    }
+/// Convenience result alias for the PSD reader and decoder.
+pub type PsdResult<T> = Result<T, PsdError>;
+
+/// A PSD parse, decompression or decode failure.
+///
+/// A damaged channel or descriptor is reported here, never zero-filled.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PsdError {
+    /// The input ended before a required field could be read.
+    #[error("unexpected end of PSD data")]
+    Eof,
+    /// The file is structurally invalid.
+    #[error("invalid PSD: {0}")]
+    Invalid(String),
+    /// A compressed channel could not be expanded.
+    #[error("PSD decompression failed: {0}")]
+    Decompress(String),
 }

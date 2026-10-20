@@ -30,7 +30,7 @@ use api::blend::BlendMode;
 use api::geometry::{PixelRegion, RectF};
 use render::{RenderContent, RenderNode, RenderNodeId, RenderScene, Texture};
 
-use crate::scene::{LayerState, Rect, Scene};
+use crate::scene::{Rect, Scene};
 
 /// Background clear colour used when a projected scene has no explicit one.
 ///
@@ -193,9 +193,8 @@ fn dim_i32(v: u32) -> i32 {
 }
 
 /// The dimensions a bitmap presents to the projection, at least 1×1.
-fn bitmap_dims(scene: &Scene, layer: &LayerState) -> (u32, u32) {
-    layer
-        .bitmap
+fn bitmap_dims(scene: &Scene, bitmap: Option<u32>) -> (u32, u32) {
+    bitmap
         .and_then(|id| scene.bitmap(id))
         .map_or((1, 1), |bitmap| (bitmap.width.max(1), bitmap.height.max(1)))
 }
@@ -264,13 +263,20 @@ fn append_window<F>(
             cached_subtree.insert(layer_id);
             continue;
         }
+        // The image this layer draws for itself: a transition that blends the
+        // layer's image with another layer's without consuming the subtree
+        // stores a self image that stands in for the main image. It covers
+        // only this layer's own image — the children keep drawing live — so
+        // it never puts the layer into `cached_subtree`.
+        let self_bitmap = layer.transition_self.or(layer.bitmap);
         // A layer whose cache has been rendered draws that cache instead of
-        // its own image and descendants. A layer that merely enabled caching
-        // but has no cache bitmap yet (its subtree is trivial) draws
-        // normally.
+        // its own image and descendants; a layer that merely enabled caching
+        // but has no cache bitmap yet (its subtree is trivial) draws normally.
+        // A self image covers only the layer's own image and leaves the
+        // children live, so it takes precedence over the cached subtree.
         let cached_bitmap = layer
             .cache_bitmap
-            .filter(|_| layer.cache_enabled_count != 0);
+            .filter(|_| layer.cache_enabled_count != 0 && layer.transition_self.is_none());
         if cached_bitmap.is_some() {
             cached_subtree.insert(layer_id);
         }
@@ -309,9 +315,11 @@ fn append_window<F>(
             let blend = resolve_blend(layer.blend, opacity);
 
             // A layer draws its texture; a cached layer draws its rendered
-            // bitmap in place of its MainImage; a layer with neither draws
+            // bitmap in place of its MainImage; a self image stands where
+            // the MainImage would be; a layer with none of them draws
             // nothing.
-            let resolved_texture = match cached_bitmap.or(layer.bitmap) {
+            let drawn_bitmap = cached_bitmap.or(self_bitmap);
+            let resolved_texture = match drawn_bitmap {
                 Some(id) => texture(id),
                 None => None,
             };
@@ -328,12 +336,7 @@ fn append_window<F>(
                     // over the whole layer rect with no image placement of its
                     // own (the reference hands `CacheBitmap` to the parent at
                     // the layer's rect, `LayerIntf.cpp:7221-7226`).
-                    let (bmp_w, bmp_h) = match cached_bitmap {
-                        Some(id) => scene
-                            .bitmap(id)
-                            .map_or((1, 1), |b| (b.width.max(1), b.height.max(1))),
-                        None => bitmap_dims(scene, layer),
-                    };
+                    let (bmp_w, bmp_h) = bitmap_dims(scene, drawn_bitmap);
                     let (image_left, image_top, img_w, img_h) = match cached_bitmap {
                         Some(_) => (0, 0, bmp_w, bmp_h),
                         None => (

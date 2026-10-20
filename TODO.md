@@ -30,7 +30,7 @@ Every item was verified against the tree.
 4. **Android device verification** (§14) — one real title run with its log
    captured is the release condition (D36).
 5. **Native plugin coverage** (§10) — 35 of 53 plugin names unemulated — and the
-   **comments-gate debt** (§15): 4260 baseline entries, four unsafe-note files.
+   **comments-gate debt** (§15): 4145 baseline entries, four unsafe-note files.
 6. **L3 behavioural audit** (§11) — the emulation lives in L3, and the current
    motion/transition defects show that surface lock, arity/parity and the
    static gates cannot see semantic loss (timeline evaluation, transition
@@ -216,11 +216,11 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
 * **L3 behavioural audit.** L1/L2 are small, stateless abstractions that the
   static gates cover well; the compatibility emulation is L3, where a member
   can exist with the right name/arity and still lose the reference semantics.
-  The current wave found this in the motion player (free-running evaluation
-  clock, interpolation into a contentless frame, silent draw no-ops, no target
-  clear), in layer transitions (blending into `MainImage` instead of a
-  transition display), and in the frame path (a healthy loop with silent
-  presentation skips). Audit L3 by subsystem against the reference oracle:
+  The current wave fixed the motion evaluation clock, child-clip time, curves,
+  events, queuing, the render cache and the transition self image; the audit
+  remains open for the remaining motion GPU/L1 resource path, the visual
+  layer/window pixel paths, KAG, each native class and plugin port, and
+  audio/video/focus event dispatch. Audit L3 by subsystem against the reference oracle:
   motion player (timeline/eval/child motion/events/draw), visual layer and
   window, KAG, each native class and plugin port, audio/video/focus event
   dispatch. For each module record the oracle path, the script-observable
@@ -292,6 +292,9 @@ run on a machine that has one; anything not compiled is documented as unverified
   recreation and **font resolution** (a requested face loads), captured in
   `<filesDir>/krkr.log`. No release without this run; the cpal audio backend has
   never played on a device.
+* **PSB/PSD L1 crate on Android.** `forkunion` has a C++ core; the host build
+  compiles, but the aarch64 Android build and run are unverified. If it fails,
+  use `forkunion`'s `portable` feature and record the result.
 * **Platform and launcher gaps.** Nothing handles audio focus, pause/resume or
   losing focus, and surface recreation restarts the game from scratch
   (`docs/audits/android-jni-review.md` F5). No drift guard exists between the
@@ -310,18 +313,16 @@ an allowlist exemption.
 
 * **Citation and history baseline.** Pre-existing findings live in
   `scripts/allowlists/house_style_baseline.txt` — JSON Lines keyed to the
-  normalized comment line, **4260 entries over 176 files** (4507 finding sites).
+  normalized comment line, **4145 entries over 170 files** (4423 finding sites).
   The baseline is **debt**: burn it down in file batches, largest first
   (`compat/src/natives/sound.rs` 247, `engine/src/scene.rs` 153,
   `compat/.../player_members.rs` 150, `system.rs` 131), deleting each entry as
   its comment is rewritten.
 * **`unsafe` blocks with no `// SAFETY:` note.**
-  `scripts/allowlists/layering_allow.txt` baselines 19 files and the guard
-  reports **15 of those entries stale**, so four files still carry the debt:
-  `compat/.../motion_player/{emote,helpers,player_members}.rs` and
-  `natives/scripts.rs`. Delete the 15 stale entries, then write a real safety
-  argument per remaining block (AGENTS §5; `docs/audits/unsafe-inventory.md`
-  §2.6).
+  `scripts/allowlists/layering_allow.txt` now baselines four files; each still
+  carries the debt: `compat/.../motion_player/{emote,helpers,player_members}.rs`
+  and `natives/scripts.rs`. Write a real safety argument per block (AGENTS §5;
+  `docs/audits/unsafe-inventory.md` §2.6).
 
 ## 16. Deferred design work
 

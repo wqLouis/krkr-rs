@@ -1,0 +1,16 @@
+[package]
+name = "psd"
+description = "krkr-rs stateless PSB/PSD container parsing and image decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+log = { workspace = true }
+flate2 = { workspace = true }
+# Parallel 8-bit channel decode. The pool is created per decode call, never
+# cached, and the crate only uses its safe `for_slices_mut` dispatch.
+forkunion = "3.0.2"
+# Runtime-dispatched SIMD for the 8-bit planar-to-RGBA and alpha passes.
+fearless_simd = "1.1.0"

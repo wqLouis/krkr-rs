@@ -63,9 +63,9 @@
 //! game script sees the same shapes as the reference `toTJSVal` conversions.
 #![allow(unsafe_code)]
 
-pub(crate) mod container;
-mod decompress;
-mod error;
+pub(crate) use psd::container;
+
+use psd::error::PsbError;
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -74,8 +74,7 @@ use tjs::{
     RetainedValue, Tjs2Engine, TjsValue, VAL_STRING, Value,
 };
 
-use container::{PsbDocument, PsbValue};
-use error::PsbError;
+use psd::container::{PsbDocument, PsbValue};
 
 use crate::engine_api::Storage;
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};

@@ -305,6 +305,8 @@ crates/
   platform/render   stateless RenderPipeline/FontSystem + Vulkan + glyph
   platform/media    stateless Media + image/audio/video decode
                     (video-ffmpeg | video-mediacodec)
+  platform/media/psd stateless PSB container + PSD image decode
+                    (forkunion | fearless_simd)
   platform/platform window/surface, event loop, input, clock, threads,
                     process lifecycle; winit | ndk; the platform
                     abstraction higher layers use
@@ -338,6 +340,7 @@ protocol. The loader is split into mount/discover (L2) and execute (L3/L4).
 | Vulkan device/pipeline/draw | L1 `render` | consumes `RenderScene` |
 | Glyph rasterization | L1 `render` | pure transform |
 | Image/audio/video decode | L1 `media` | backend by compile-time feature |
+| PSB container + PSD image decode | L1 `psd` | stateless format parsing; used by the PSB/PSD plugins and the motion player |
 | Raw path IO + XP3 parse | L1 `fs` | stateless |
 | **Layer system (generic scene graph)**, mixer, timers, VFS namespace, caches | L2 `engine` | engine state; no TVP semantics |
 | Projection scene → `RenderScene` | L2 `engine` | field copy, not a draw list |

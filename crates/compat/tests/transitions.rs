@@ -256,6 +256,21 @@ fn frame_pixel(env: &Env, name: &str, x: u32, y: u32) -> i64 {
     scene_pixel(env, transition_frame(env, name), x, y)
 }
 
+/// The layer's self image: the per-frame blend a transition without children
+/// draws in place of the layer's own image (`DrawSelf` blends into a temporary,
+/// `reference/cpp/core/visual/LayerIntf.cpp:6721-6768`), or `None` before the
+/// first frame and after the teardown.
+fn self_image_of(env: &Env, name: &str) -> Option<u32> {
+    named_layer(env, name).transition_self
+}
+
+/// The `0xRRGGBB` colour of `name`'s self image at `(x, y)`.
+fn self_image_pixel(env: &Env, name: &str, x: u32, y: u32) -> i64 {
+    let self_image =
+        self_image_of(env, name).unwrap_or_else(|| panic!("{name} has no transition self image"));
+    scene_pixel(env, self_image, x, y)
+}
+
 /// Every pixel of `name`'s transition frame as one comma-joined string.
 fn frame_grid(env: &Env, name: &str, size: i64) -> String {
     let frame = transition_frame(env, name);
@@ -499,53 +514,244 @@ fn with_children_is_read_at_argument_one() {
     assert_eq!(named_layer(&env, "dest").cache_enabled_count, 0);
 }
 
-/// Without children both endpoints are required to have a main image
-/// (`LayerIntf.cpp:7860-7868`) and the blend reads them as `Src1`/`Src2` into a
-/// temporary that `DrawSelf` hands to the draw target (`:6750-6768`): neither
-/// layer's own image is ever the target, and the layer's children keep drawing
-/// live beside the result (`:7278-7309`). The `ttExchange` teardown uses `Swap`
-/// (`Exchange(target, true)`, `LayerIntf.h:260-263`), which moves the two
+/// Without children both endpoints must have a main image
+/// (`LayerIntf.cpp:7860-7868`). `DrawSelf` blends them into a temporary it
+/// hands to the draw target (`:6721-6768`): source 1 is the layer's own main
+/// image and source 2 the transition source's (`DoDivisibleTransition`,
+/// `:8078-8133`), and the layer draws that temporary in place of its own image
+/// while its children stay live (`:7278-7309`). The endpoint short-circuits
+/// make phase 0 exactly source 1 and the final phase exactly source 2
+/// (`TransIntf.cpp:578-601`). The `ttExchange` teardown uses `Swap`
+/// (`Exchange(target, true)`, `LayerIntf.h:260-263`), which also moves the two
 /// layers' children to the other layer.
 ///
-/// reference/cpp/core/visual/LayerIntf.cpp:6721-6773
-/// reference/cpp/core/visual/LayerIntf.cpp:7860-7868
+/// reference/cpp/core/visual/LayerIntf.cpp:6721-6768
+/// reference/cpp/core/visual/LayerIntf.cpp:6781-6783
+/// reference/cpp/core/visual/LayerIntf.cpp:7278-7309
+/// reference/cpp/core/visual/LayerIntf.cpp:7673-7737
+/// reference/cpp/core/visual/LayerIntf.cpp:8154-8249
+/// reference/cpp/core/visual/TransIntf.cpp:578-601
 #[test]
-fn a_transition_without_children_leaves_both_main_images_live() {
+fn a_transition_without_children_blends_into_the_self_image() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
         "var w = new Window(); \
-         var a = new Layer(w, null); a.setSize(2, 2); a.setImageSize(2, 2); a.name = 'src'; \
+         var a = new Layer(w, null); a.setSize(2, 2); a.setImageSize(2, 2); a.name = 'src'; a.visible = false; \
          var b = new Layer(w, null); b.setSize(2, 2); b.setImageSize(2, 2); b.visible = true; b.name = 'dest'; \
          for (var i = 0; i < 4; i++) { b.setMainPixel(i % 2, i / 2, 0xff0000); a.setMainPixel(i % 2, i / 2, 0x0000ff); } \
          var bc = new Layer(w, b); bc.setSize(2, 2); bc.setImageSize(2, 2); bc.name = 'ctl'; \
-         bc.fillRect(0, 0, 1, 1, 0xff00ff00); bc.visible = true; \
+         bc.fillRect(0, 0, 2, 2, 0xff00ff00); bc.visible = true; \
          b.beginTransition('crossfade', false, a, %[time: 100]);",
     );
     counter(&env);
+    // Nothing has been drawn yet: the slot is still empty.
+    assert!(self_image_of(&env, "dest").is_none());
+
+    // Phase 0: the self image holds source 1 verbatim.
+    env.advance(0.0);
+    let first = self_image_of(&env, "dest").expect("self image");
+    for (x, y) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
+        assert_eq!(
+            self_image_pixel(&env, "dest", x, y),
+            RED,
+            "phase 0 self image at ({x},{y})"
+        );
+    }
+
+    // 50 ms into a 100 ms cross-fade is phase 128: the 50/50 blend, drawn into
+    // the same self image.
     env.advance(50.0);
-    // The transition has been running for half its duration, but no frame is
-    // stored on either layer: both main images still hold their own pixels,
-    // and the visible child is untouched and still under the destination.
+    let expected = blend_rgb(RED, BLUE, 128);
+    assert_eq!(
+        self_image_of(&env, "dest"),
+        Some(first),
+        "the self image is reused between frames"
+    );
+    for (x, y) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
+        assert_eq!(
+            self_image_pixel(&env, "dest", x, y),
+            expected,
+            "phase 128 self image at ({x},{y})"
+        );
+    }
+
+    // The phase rounds to the maximum just before the duration elapses, so the
+    // last frame is source 2 verbatim while the transition still runs.
+    env.advance(49.9);
+    for (x, y) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
+        assert_eq!(
+            self_image_pixel(&env, "dest", x, y),
+            BLUE,
+            "final-phase self image at ({x},{y})"
+        );
+    }
+    assert_eq!(env.eval_int("hits"), 0, "still running at phase max");
+
+    // Both main images and the live child are untouched at every phase.
     assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
+    assert_eq!(env.eval_int("b.getMainPixel(1, 1)"), RED);
     assert_eq!(env.eval_int("a.getMainPixel(0, 0)"), BLUE);
+    assert_eq!(env.eval_int("a.getMainPixel(1, 1)"), BLUE);
     assert_eq!(env.eval_int("bc.getMainPixel(0, 0)"), 0x00ff00);
     assert_eq!(
         named_layer(&env, "ctl").parent,
         Some(named_layer(&env, "dest").id)
     );
 
-    env.advance(50.0);
+    // Completion clears the slot and runs the `Swap` teardown.
+    env.advance(1.0);
     assert_eq!(env.eval_int("hits"), 1, "the transition completed");
-    assert_eq!(
-        env.eval_int("b.getMainPixel(0, 0)"),
-        RED,
-        "the destination image survives the whole transition"
+    assert!(
+        self_image_of(&env, "dest").is_none(),
+        "completion clears the self image slot"
+    );
+    assert!(
+        env._scene.bitmap(first).is_none(),
+        "the self image bitmap is released"
     );
     assert!(
         cache_bitmap_of(&env, "dest").is_none(),
-        "a childless transition allocates no display frame"
+        "a childless transition allocates no subtree frame"
     );
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
+    assert_eq!(env.eval_int("a.getMainPixel(0, 0)"), BLUE);
+    assert_eq!(env.eval_int("bc.getMainPixel(0, 0)"), 0x00ff00);
+    assert_eq!(
+        named_layer(&env, "ctl").parent,
+        Some(named_layer(&env, "src").id),
+        "Swap exchanges the layers' direct children"
+    );
+    assert_eq!(env.eval_int("b.visible"), 0, "b takes a's visibility");
+    assert_eq!(env.eval_int("a.visible"), 1, "a takes b's visibility");
+}
+
+/// The self image belongs to one transition: the teardown drops it, so the
+/// next transition on the layer starts from an empty slot and allocates a fresh
+/// blend target (`DrawSelf` allocates its temporary per draw,
+/// `LayerIntf.cpp:6721-6768`; `InternalStopTransition` releases the transition
+/// state, `:7950-8031`).
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:6721-6768
+/// reference/cpp/core/visual/LayerIntf.cpp:6781-6783
+/// reference/cpp/core/visual/LayerIntf.cpp:7156-7226
+#[test]
+fn a_second_transition_starts_from_a_clean_self_image() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    two_layers(&env, 2);
+    env.run("b.beginTransition('crossfade', false, a, %[time: 100]);");
+    env.advance(0.0);
+    let first = self_image_of(&env, "dest").expect("self image");
+    env.advance(100.0);
+    assert!(
+        self_image_of(&env, "dest").is_none(),
+        "the completed transition cleared its slot"
+    );
+    assert!(
+        env._scene.bitmap(first).is_none(),
+        "the first self image was released"
+    );
+
+    // The teardown hid the destination; make it visible again before the second
+    // transition, which ends at the first frame while its destination is
+    // hidden (`LayerIntf.cpp:8056-8060`).
+    env.run("b.visible = true; b.beginTransition('crossfade', false, a, %[time: 100]);");
+    assert!(
+        self_image_of(&env, "dest").is_none(),
+        "the second transition starts from a clean slot"
+    );
+    env.advance(0.0);
+    let second = self_image_of(&env, "dest").expect("second self image");
+    assert!(
+        second > first,
+        "a fresh bitmap, not the released one ({second} vs {first})"
+    );
+    assert_eq!(self_image_pixel(&env, "dest", 0, 0), RED);
+    env.run("b.stopTransition();");
+    assert!(
+        self_image_of(&env, "dest").is_none(),
+        "stopping clears the slot"
+    );
+    assert!(
+        env._scene.bitmap(second).is_none(),
+        "and releases its bitmap"
+    );
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
+}
+
+/// A layer with a transition self image that sits inside another layer's
+/// cached subtree is cached as the blended self image, not as its main image:
+/// the caching parent composites its subtree into `CacheBitmap`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:7172-7198`), and a child in a
+/// transition without children draws its self image there through
+/// `CopySelfForRect` (`:6781-6783`, `:7278-7309`). Such a child draws no
+/// cache of its own (`:7156-7157`), and the parent's cache is recomposited
+/// while a drawn image changes (`:6305-6335`).
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7172-7198
+/// reference/cpp/core/visual/LayerIntf.cpp:6781-6783
+/// reference/cpp/core/visual/LayerIntf.cpp:7278-7309
+/// reference/cpp/core/visual/LayerIntf.cpp:7156-7157
+/// reference/cpp/core/visual/LayerIntf.cpp:6305-6335
+#[test]
+fn a_nested_childless_transition_is_cached_as_its_self_image() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var p = new Layer(w, null); p.setSize(2, 2); p.name = 'parent'; p.hasImage = false; p.visible = true; \
+         var c = new Layer(w, p); c.setSize(2, 2); c.setImageSize(2, 2); c.name = 'inner'; \
+         c.fillRect(0, 0, 2, 2, 0xffff0000); c.visible = true; \
+         var cs = new Layer(w, null); cs.setSize(2, 2); cs.setImageSize(2, 2); cs.name = 'innerSrc'; \
+         cs.fillRect(0, 0, 2, 2, 0xff0000ff); \
+         var ps = new Layer(w, null); ps.setSize(2, 2); ps.setImageSize(2, 2); ps.name = 'outerSrc'; \
+         ps.fillRect(0, 0, 2, 2, 0xff00ff00); \
+         c.beginTransition('crossfade', false, cs, %[time: 100]);",
+    );
+    // 50 ms into a 100 ms cross-fade is phase 128.
+    env.advance(50.0);
+    let blended = blend_rgb(RED, BLUE, 128);
+    assert_eq!(self_image_pixel(&env, "inner", 0, 0), blended);
+
+    // The parent caches its subtree: `Complete` composites the child through
+    // `CopySelfForRect`, so the child's transition lands in the cache.
+    env.run("p.beginTransition('crossfade', true, ps, %[time: 100]);");
+    // Phase 0 repaints from the cached content verbatim at either tick order,
+    // so the nested self image is the value the parent composites.
+    env.advance(0.0);
+    assert_eq!(named_layer(&env, "parent").cache_enabled_count, 1);
+    let content = named_layer(&env, "parent")
+        .cache_content
+        .expect("the parent's cached subtree");
+    assert_eq!(
+        scene_pixel(&env, content, 0, 0),
+        blended,
+        "the cache holds the child's blended self image, not its main image"
+    );
+    assert_eq!(
+        env.eval_int("c.getMainPixel(0, 0)"),
+        RED,
+        "the child's main image is untouched"
+    );
+    // The parent's frame is its phase-0 content verbatim.
+    let frame = cache_bitmap_of(&env, "parent").expect("the parent's frame");
+    assert_eq!(scene_pixel(&env, frame, 0, 0), blended);
+
+    // The nested self image is rewritten on every tick, so the next composite
+    // rebuilds the cache in place instead of leaving the stale main image.
+    env._scene.set_bitmap_clean(content);
+    env.advance(0.0);
+    assert_eq!(
+        named_layer(&env, "parent").cache_content,
+        Some(content),
+        "the cache is recomposited into the same bitmap"
+    );
+    assert!(
+        env._scene.bitmap(content).unwrap().dirty,
+        "the changed nested self image invalidates the cache"
+    );
+    assert_eq!(scene_pixel(&env, content, 0, 0), blended);
 }
 
 /// With `withchildren = true` (the default) `StartTransition` transitions the

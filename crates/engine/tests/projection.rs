@@ -437,3 +437,120 @@ fn cached_layer_draws_its_bitmap_and_hides_its_subtree() {
     assert!(matches!(nodes[0].content, RenderContent::Texture(_)));
     assert_eq!(nodes[0].dst, RectF::new(0.0, 0.0, 64.0, 64.0));
 }
+
+/// A transition without children blends the layer's own image and the
+/// transition source's into a temporary that `DrawSelf` draws in place of the
+/// `MainImage` (`reference/cpp/core/visual/LayerIntf.cpp:6745-6768`). Only the
+/// layer's own image is replaced, so its children keep drawing live
+/// (`:7278-7309`), and a layer in such a transition draws no cache of its own
+/// (`:7156-7157`).
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:6745-6768
+/// reference/cpp/core/visual/LayerIntf.cpp:6781-6783
+/// reference/cpp/core/visual/LayerIntf.cpp:7156-7157
+#[test]
+fn transition_self_image_replaces_the_main_image_at_its_placement() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (64, 64));
+    let layer = scene.add_layer(win, None);
+    let main = attach_image(&mut scene, layer, 16, 16);
+    {
+        let l = scene.layer_mut(layer).unwrap();
+        l.rect = Rect::new(4, 6, 32, 32);
+        l.image_left = 2;
+        l.image_top = 3;
+        l.image_width = 16;
+        l.image_height = 16;
+        l.visible = true;
+    }
+    let child = scene.add_layer(win, Some(layer));
+    {
+        let l = scene.layer_mut(child).unwrap();
+        l.rect = Rect::new(20, 20, 8, 8);
+        l.visible = true;
+    }
+    let child_bitmap = attach_image(&mut scene, child, 8, 8);
+    let self_image = engine::layer_ops::ensure_transition_self_image(&mut scene, layer, 16, 16)
+        .expect("transition self image");
+
+    // Resolving the main image alone leaves the layer without a texture: the
+    // self image stands in for it, so only the live child is emitted.
+    let only_main = project_window(&scene, win, |id| {
+        (id == main || id == child_bitmap).then(|| null_texture(16, 16))
+    });
+    let nodes = drawable_nodes(&only_main);
+    assert_eq!(
+        nodes.len(),
+        1,
+        "the layer is not drawn from its main image while the self image stands in"
+    );
+    assert_eq!(nodes[0].dst, RectF::new(24.0, 26.0, 8.0, 8.0));
+    assert_eq!(nodes[0].parent, Some(only_main.root));
+
+    // The self image is drawn at the main image's placement — the layer rect
+    // plus `image_left`/`image_top`, sized by `image_width`/`image_height` —
+    // and the child stays live under it.
+    let with_self = project_window(&scene, win, |id| {
+        (id == self_image || id == child_bitmap).then(|| null_texture(16, 16))
+    });
+    let nodes = drawable_nodes(&with_self);
+    assert_eq!(nodes.len(), 2, "the self image plus the live child");
+    let self_node = nodes
+        .iter()
+        .find(|n| n.dst == RectF::new(6.0, 9.0, 16.0, 16.0))
+        .expect("self image node at the main image placement");
+    assert_eq!(self_node.src, PixelRegion::new(0, 0, 16, 16));
+    let child_node = nodes
+        .iter()
+        .find(|n| n.dst == RectF::new(24.0, 26.0, 8.0, 8.0))
+        .expect("live child node");
+    let self_id = with_self
+        .nodes
+        .iter()
+        .position(|n| n.dst == RectF::new(6.0, 9.0, 16.0, 16.0))
+        .map(|index| RenderNodeId(u32::try_from(index).expect("node index")))
+        .expect("self image node");
+    assert_eq!(
+        child_node.parent,
+        Some(self_id),
+        "the child hangs off the layer's self image node"
+    );
+
+    // A rendered cache does not stand in for the self image nor hide the
+    // children: the layer draws its self image and the children stay live.
+    let cache = scene.add_bitmap(32, 32, vec![0u8; 32 * 32 * 4]);
+    {
+        let l = scene.layer_mut(layer).unwrap();
+        l.cache_enabled_count = 1;
+        l.cache_bitmap = Some(cache);
+    }
+    let only_cache = project_window(&scene, win, |id| {
+        (id == cache || id == child_bitmap).then(|| null_texture(32, 32))
+    });
+    let nodes = drawable_nodes(&only_cache);
+    assert_eq!(
+        nodes.len(),
+        1,
+        "the cache is not drawn instead of the self image"
+    );
+    assert_eq!(nodes[0].dst, RectF::new(24.0, 26.0, 8.0, 8.0));
+    {
+        let l = scene.layer_mut(layer).unwrap();
+        l.cache_enabled_count = 0;
+        l.cache_bitmap = None;
+    }
+
+    // Clearing the slot (the transition teardown) returns the layer to its own
+    // image at the same placement.
+    engine::layer_ops::clear_transition_self_image(&mut scene, layer);
+    let with_main = project_window(&scene, win, |id| {
+        (id == main || id == child_bitmap).then(|| null_texture(16, 16))
+    });
+    let nodes = drawable_nodes(&with_main);
+    assert_eq!(nodes.len(), 2);
+    let main_node = nodes
+        .iter()
+        .find(|n| n.dst == RectF::new(6.0, 9.0, 16.0, 16.0))
+        .expect("main image node at the same placement");
+    assert_eq!(main_node.src, PixelRegion::new(0, 0, 16, 16));
+}

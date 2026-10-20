@@ -118,9 +118,10 @@ types are values owned by the module that declares them (03 §0.3):
 
 Two conventions are deliberate and are not fallbacks:
 
-* **`Option` for an absent object.** `render_layer_subtree` and
-  `ensure_transition_display` return `None` when the requested layer/subtree
-  does not exist; the caller turns that into the script-visible error. The
+* **`Option` for an absent object.** `render_layer_subtree`,
+  `ensure_transition_display` and `ensure_transition_self_image` return `None`
+  when the requested layer/subtree does not exist or the bitmap cannot be
+  allocated; the caller turns that into the script-visible error. The
   absence is distinguishable from a real failure, which is a typed error.
 * **`()` for infallible composition.** Most `layer_ops`/`raster` primitives
   operate on already-validated VM bounds and pixels; they have no error case.
@@ -336,9 +337,10 @@ plugin-specific gathers/scatters that have no higher-level operation.
 
 **Items:** `AffineBlit`, `BlitOptions`, `BlitSource`, `COPY_MAIN`, `COPY_MASK`,
 `GammaAdjust`, `RectI`, `adjust_gamma`, `affine_blit`, `blit_copy`,
-`blit_over`, `blit_plane`, `blur_bitmap_in_place`, `clip_rect`,
-`convert_add_alpha_to_alpha`, `convert_alpha_to_add_alpha`, `copy_9patch`,
-`do_gray_scale`, `ensure_transition_display`, `fill_color_hold_alpha`,
+`blit_over`, `blit_plane`, `blur_bitmap_in_place`, `clear_transition_self_image`,
+`clip_rect`, `convert_add_alpha_to_alpha`, `convert_alpha_to_add_alpha`,
+`copy_9patch`, `do_gray_scale`, `ensure_transition_display`,
+`ensure_transition_self_image`, `fill_color_hold_alpha`,
 `fill_color_on_add_alpha`, `fill_color_on_alpha`, `fill_mask`, `flip_lr`,
 `flip_ud`, `gaussian_blur`, `intersect`, `intersect_rect`, `light_contrast`,
 `operate_rect`, `remove_const_opacity`, `render_layer_subtree`,
@@ -348,14 +350,21 @@ plugin-specific gathers/scatters that have no higher-level operation.
 `BitmapState` arguments. These are the L2 composition and pixel-region
 operations: clip intersection, blits, affine/stretch blits, fills, masks,
 colour conversion, blur, flipping, gamma/light/contrast and subtree rendering.
+The layer slots they allocate are part of the layer state: a whole-subtree
+transition blends into `ensure_transition_display`'s frame (drawn in place of
+the subtree), and a transition that keeps its children live blends into
+`ensure_transition_self_image`'s image (drawn in place of the layer's own
+image, with the children still projected). `clear_transition_self_image`
+drops the self image when the transition ends; the slot is never part of the
+subtree cache, so releasing the cache leaves it alone.
 
 **Coordinates:** VM pixels; `RectI`/clip rects are VM, and bitmap buffers are
 VM-sized. The primitives do not apply the device translation — the projection
 does.
 
-**Errors:** `render_layer_subtree` and `ensure_transition_display` return
-`Option` for an absent layer/subtree; the rest are infallible on validated VM
-bounds.
+**Errors:** `render_layer_subtree`, `ensure_transition_display` and
+`ensure_transition_self_image` return `Option` for an absent layer/subtree or
+an allocation failure; the rest are infallible on validated VM bounds.
 
 ---
 

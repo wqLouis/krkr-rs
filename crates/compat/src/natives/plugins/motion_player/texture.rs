@@ -6,6 +6,86 @@
 //! 8-bit index data resolved through the sibling `pal` chunk. Decoding yields
 //! straight-alpha RGBA8 in the scene's pixel layout.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use crate::engine_api::{Storage, StorageReadError};
+use crate::storage::strip_file_media;
+
+/// The decoded pixel chunks of one motion container, keyed by their `psb://`
+/// storage name. Every player that shares the snapshot reuses the entries, so
+/// a chunk is read and decoded once for the lifetime of the snapshot.
+#[derive(Clone, Default)]
+pub(crate) struct PixelCache {
+    entries: Arc<Mutex<HashMap<String, Arc<Pixels>>>>,
+}
+
+impl PixelCache {
+    /// Drop every decoded chunk.
+    #[cfg(test)]
+    pub(crate) fn clear(&self) {
+        self.entries().clear();
+    }
+
+    /// The decoded pixels at `path`, from the cache or freshly decoded.
+    pub(crate) fn get_or_decode(
+        &self,
+        storage: &Storage,
+        path: &str,
+        palette_path: &str,
+        width: u32,
+        height: u32,
+        compressed: bool,
+    ) -> Option<Arc<Pixels>> {
+        if let Some(pixels) = self.entries().get(path) {
+            return Some(pixels.clone());
+        }
+        let bytes = match storage.read(strip_file_media(path)) {
+            Ok(bytes) => bytes,
+            Err(StorageReadError::NotFound(_)) => return None,
+            Err(error) => {
+                log::warn!("motion_player: cannot read {path}: {error}");
+                return None;
+            }
+        };
+        let palette = match storage.read(strip_file_media(palette_path)) {
+            Ok(palette) => Some(palette),
+            Err(StorageReadError::NotFound(_)) => None,
+            Err(error) => {
+                log::warn!("motion_player: cannot read {palette_path}: {error}");
+                None
+            }
+        };
+        let pixels = match decode_pixels(&bytes, palette.as_deref(), width, height, compressed) {
+            Ok(decoded) => Arc::new(decoded),
+            Err(error) => {
+                log::warn!("motion_player: cannot decode {path}: {error}");
+                return None;
+            }
+        };
+        self.entries().insert(path.to_string(), pixels.clone());
+        Some(pixels)
+    }
+
+    fn entries(&self) -> MutexGuard<'_, HashMap<String, Arc<Pixels>>> {
+        match self.entries.lock() {
+            Ok(entries) => entries,
+            Err(poisoned) => {
+                log::warn!("motion_player: the pixel cache lock was poisoned; recovering");
+                poisoned.into_inner()
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for PixelCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PixelCache")
+            .field("entries", &self.entries().len())
+            .finish()
+    }
+}
+
 /// Decoded straight-alpha RGBA8 pixels of one pixel chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Pixels {
@@ -167,7 +247,10 @@ fn rl_decode(bytes: &[u8], elements: usize, align: usize) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextureError, decode_pixels, rl_decode};
+    use std::sync::Arc;
+
+    use super::{PixelCache, TextureError, decode_pixels, rl_decode};
+    use crate::engine_api::Storage;
 
     #[test]
     fn an_rl_stream_mixes_literals_and_runs() {
@@ -241,5 +324,43 @@ mod tests {
         let raw = decode_pixels(&[1, 2, 3, 4], Some(empty), 1, 1, false)
             .expect("an empty palette falls back to the raw chunk");
         assert_eq!(raw.rgba, vec![3, 2, 1, 4]);
+    }
+
+    #[test]
+    fn a_decoded_chunk_is_served_from_the_cache_until_it_is_cleared() {
+        // The source cache keeps a decoded entry and only a clear drops it
+        // (`reference/cpp/plugins/motionplayer/SourceCache.cpp:497-552`,
+        // `:610-620`).
+        let dir = std::env::temp_dir();
+        let storage = Storage::mount_archives(
+            fs::FileSystem::host(dir.clone()),
+            dir.clone(),
+            std::iter::empty::<&str>(),
+        )
+        .expect("mount storage");
+        let path = "psb://cache.psb/source/group/icon/art/pixel";
+        let palette = "psb://cache.psb/source/group/icon/art/pal";
+        storage.register_media(path.to_string(), vec![1, 2, 3, 4]);
+        let cache = PixelCache::default();
+        let first = cache
+            .get_or_decode(&storage, path, palette, 1, 1, false)
+            .expect("the registered chunk decodes");
+        let read_bytes = storage.read_bytes();
+        assert_eq!(read_bytes, 4);
+        let second = cache
+            .get_or_decode(&storage, path, palette, 1, 1, false)
+            .expect("the cached chunk decodes");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            storage.read_bytes(),
+            read_bytes,
+            "a cache hit does not read the chunk again"
+        );
+        cache.clear();
+        let third = cache
+            .get_or_decode(&storage, path, palette, 1, 1, false)
+            .expect("the cleared chunk decodes again");
+        assert!(!Arc::ptr_eq(&first, &third));
+        assert_eq!(storage.read_bytes(), read_bytes * 2);
     }
 }

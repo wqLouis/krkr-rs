@@ -4,6 +4,9 @@ description = "krkr-rs stateless media backend: image/audio/video decode (ffmpeg
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# The PSB/PSD format reader is its own workspace member inside this directory;
+# keep it out of this package's file list.
+exclude = ["psd"]
 
 [features]
 # D13: exactly one video backend is selected at compile time. The default is

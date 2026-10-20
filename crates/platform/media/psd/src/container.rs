@@ -1,16 +1,14 @@
-//! PSB/MDF container parsing: header, name/string tables, typed values,
-//! resource chunks and type inference.
+//! PSB/MDF container reading: header, name/string tables, typed values and
+//! resource chunks.
 //!
-//! This is a faithful port of the reference `PSBHeader.h`, `PSBValue.{h,cpp}`,
-//! `PSBFile.cpp` (`loadKeys`/`loadNames`/`unpack`/`loadList`/`loadObjects`/
-//! `loadResource`/`afterLoad`) and the `types/*` `isThisType` predicates. The
-//! container is parsed eagerly into [`PsbValue`]; the raw decompressed bytes
-//! are kept so chunk reads and string lookups stay available.
+//! The container is parsed eagerly into a [`PsbValue`] tree; the raw
+//! decompressed bytes stay available so chunk reads and string lookups can be
+//! answered from the same document.
 
 use std::collections::HashMap;
 
-use super::decompress::{EmoteCtx, open_decompressed_stream};
-use super::error::{PsbError, PsbResult};
+use crate::decompress::{EmoteCtx, open_decompressed_stream};
+use crate::error::{PsbError, PsbResult};
 
 /// The `PSB\0` magic.
 const PSB_MAGIC: [u8; 4] = *b"PSB\0";
@@ -24,21 +22,21 @@ const MFL_MAGIC: [u8; 4] = *b"MFL\0";
 // ---------------------------------------------------------------------------
 
 /// A little-endian cursor over the decompressed container bytes.
-pub(crate) struct Reader<'a> {
+struct Reader<'a> {
     data: &'a [u8],
-    pub(crate) pos: usize,
+    pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    pub(crate) fn at(data: &'a [u8], pos: usize) -> Self {
+    fn at(data: &'a [u8], pos: usize) -> Self {
         Self { data, pos }
     }
 
-    pub(crate) fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.data.len()
     }
 
-    pub(crate) fn set_pos(&mut self, pos: usize) -> PsbResult<()> {
+    fn set_pos(&mut self, pos: usize) -> PsbResult<()> {
         if pos > self.data.len() {
             return Err(PsbError::Truncated("stream position"));
         }
@@ -46,7 +44,7 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    pub(crate) fn bytes(&mut self, count: usize) -> PsbResult<&'a [u8]> {
+    fn bytes(&mut self, count: usize) -> PsbResult<&'a [u8]> {
         let end = self
             .pos
             .checked_add(count)
@@ -59,22 +57,22 @@ impl<'a> Reader<'a> {
         Ok(slice)
     }
 
-    pub(crate) fn u8(&mut self) -> PsbResult<u8> {
+    fn u8(&mut self) -> PsbResult<u8> {
         Ok(self.bytes(1)?[0])
     }
 
-    pub(crate) fn u16(&mut self) -> PsbResult<u16> {
+    fn u16(&mut self) -> PsbResult<u16> {
         let b = self.bytes(2)?;
         Ok(u16::from_le_bytes([b[0], b[1]]))
     }
 
-    pub(crate) fn u32(&mut self) -> PsbResult<u32> {
+    fn u32(&mut self) -> PsbResult<u32> {
         let b = self.bytes(4)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
     /// Read `count` little-endian bytes into an unsigned integer (1..=8).
-    pub(crate) fn uint(&mut self, count: usize) -> PsbResult<u64> {
+    fn uint(&mut self, count: usize) -> PsbResult<u64> {
         if count == 0 {
             return Ok(0);
         }
@@ -90,8 +88,8 @@ impl<'a> Reader<'a> {
     }
 
     /// Read a NUL-terminated string. A missing terminator yields the rest of
-    /// the buffer (the reference `readStringZeroTrim` returns what it read).
-    pub(crate) fn null_terminated_string(&mut self) -> PsbResult<String> {
+    /// the buffer rather than an error.
+    fn null_terminated_string(&mut self) -> PsbResult<String> {
         let start = self.pos;
         let end = self.data[start..]
             .iter()
@@ -107,32 +105,33 @@ impl<'a> Reader<'a> {
 // Header
 // ---------------------------------------------------------------------------
 
-/// The fixed PSB header (`PSBHeader.h`).
+/// The fixed PSB header: the magic, the version/encryption words and the
+/// section offsets that follow them.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct PsbHeader {
-    pub signature: [u8; 4],
-    pub version: u16,
-    pub encrypt: u16,
-    pub offset_encrypt: u32,
-    pub offset_names: u32,
-    pub offset_strings: u32,
-    pub offset_strings_data: u32,
-    pub offset_chunk_offsets: u32,
-    pub offset_chunk_lengths: u32,
-    pub offset_chunk_data: u32,
-    pub offset_entries: u32,
-    pub checksum: u32,
-    pub offset_extra_chunk_offsets: u32,
-    pub offset_extra_chunk_lengths: u32,
-    pub offset_extra_chunk_data: u32,
+struct PsbHeader {
+    signature: [u8; 4],
+    version: u16,
+    encrypt: u16,
+    offset_encrypt: u32,
+    offset_names: u32,
+    offset_strings: u32,
+    offset_strings_data: u32,
+    offset_chunk_offsets: u32,
+    offset_chunk_lengths: u32,
+    offset_chunk_data: u32,
+    offset_entries: u32,
+    checksum: u32,
+    offset_extra_chunk_offsets: u32,
+    offset_extra_chunk_lengths: u32,
+    offset_extra_chunk_data: u32,
 }
 
 impl PsbHeader {
-    /// The reference `PSBHeader::MAX_LENGTH`.
-    pub(crate) const MAX_LENGTH: u32 = 56;
+    /// The largest header the reader reserves before the offsets begin.
+    const MAX_LENGTH: u32 = 56;
 
     /// Parse the header at the start of `reader`.
-    pub(crate) fn parse(reader: &mut Reader) -> PsbResult<Self> {
+    fn parse(reader: &mut Reader) -> PsbResult<Self> {
         let mut header = Self::default();
         header.signature.copy_from_slice(reader.bytes(4)?);
         header.version = reader.u16()?;
@@ -166,8 +165,8 @@ impl PsbHeader {
         Ok(header)
     }
 
-    /// The reference `PSBHeader::isEncrypted`.
-    pub(crate) fn is_encrypted(&self) -> bool {
+    /// Whether the offsets are encrypted.
+    fn is_encrypted(&self) -> bool {
         self.offset_encrypt > Self::MAX_LENGTH + 16
             || self.offset_names == 0
             || (self.version > 1
@@ -175,8 +174,8 @@ impl PsbHeader {
                 && self.offset_encrypt != 0)
     }
 
-    /// The reference `PSBHeader::GetHeaderLength`.
-    pub(crate) fn header_length(&self) -> u32 {
+    /// The header length implied by the version.
+    fn header_length(&self) -> u32 {
         if self.version < 3 {
             40
         } else if self.version > 3 {
@@ -191,25 +190,37 @@ impl PsbHeader {
 // Typed values
 // ---------------------------------------------------------------------------
 
-/// A reference to a resource chunk (`PSBResource`), normal or extra.
+/// A resource chunk handle: the index into a chunk table and which table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct ResourceRef {
+pub struct ResourceRef {
+    /// Index into the normal or extra chunk table.
     pub index: u32,
+    /// Whether the chunk comes from the extra chunk tables.
     pub extra: bool,
 }
 
-/// A parsed PSB value (`PSBValue.h`).
+/// A parsed PSB value.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum PsbValue {
+pub enum PsbValue {
+    /// A null value.
     Null,
+    /// A boolean.
     Bool(bool),
+    /// A signed integer of 1..=9 bytes.
     Int(i64),
+    /// A 32-bit float.
     Float(f32),
+    /// A 64-bit float.
     Double(f64),
+    /// An array of 32-bit integers.
     Array(Vec<u32>),
+    /// A string from the string table.
     String(String),
+    /// A value that points at a chunk of the resource table.
     Resource(ResourceRef),
+    /// A heterogeneous list.
     List(Vec<PsbValue>),
+    /// A dictionary; the entries keep the file order.
     Dictionary(Vec<(String, PsbValue)>),
 }
 
@@ -218,14 +229,16 @@ pub(crate) enum PsbValue {
 // ---------------------------------------------------------------------------
 
 /// A fully parsed PSB/MDF container.
-pub(crate) struct PsbDocument {
+pub struct PsbDocument {
+    /// The root value.
     pub root: PsbValue,
+    /// The referenced chunks, ordered by `(extra, index)`.
     pub resources: Vec<(ResourceRef, Vec<u8>)>,
 }
 
 impl PsbDocument {
-    /// The bytes of a referenced resource, if present.
-    pub(crate) fn resource_bytes(&self, reference: ResourceRef) -> Option<&[u8]> {
+    /// The bytes of a referenced resource, if the document carries them.
+    pub fn resource_bytes(&self, reference: ResourceRef) -> Option<&[u8]> {
         self.resources
             .iter()
             .find(|(candidate, _)| *candidate == reference)
@@ -235,7 +248,7 @@ impl PsbDocument {
     /// Call `visit` with the `/`-joined member path and bytes of every
     /// resource in the tree. List entries contribute their index as a path
     /// segment, and a resource is a leaf.
-    pub(crate) fn visit_resources(&self, visit: &mut impl FnMut(&str, &[u8])) {
+    pub fn visit_resources(&self, visit: &mut impl FnMut(&str, &[u8])) {
         visit_value(&self.root, self, &mut Vec::new(), visit);
     }
 }
@@ -286,7 +299,7 @@ fn visit_value(
 
 impl PsbValue {
     /// The entries of an integer-array value.
-    pub(crate) fn as_array(&self) -> Option<&[u32]> {
+    pub fn as_array(&self) -> Option<&[u32]> {
         match self {
             Self::Array(values) => Some(values),
             Self::Null
@@ -302,7 +315,7 @@ impl PsbValue {
     }
 
     /// The entry for `key` in a dictionary value.
-    pub(crate) fn get(&self, key: &str) -> Option<&PsbValue> {
+    pub fn get(&self, key: &str) -> Option<&PsbValue> {
         match self {
             Self::Dictionary(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
             Self::Null
@@ -318,7 +331,7 @@ impl PsbValue {
     }
 
     /// A numeric value coerced to `f64`.
-    pub(crate) fn as_f64(&self) -> Option<f64> {
+    pub fn as_f64(&self) -> Option<f64> {
         match self {
             Self::Int(value) => Some(*value as f64),
             Self::Float(value) => Some(f64::from(*value)),
@@ -334,7 +347,7 @@ impl PsbValue {
     }
 
     /// A boolean value (numbers coerce to `!= 0`).
-    pub(crate) fn as_bool(&self) -> bool {
+    pub fn as_bool(&self) -> bool {
         match self {
             Self::Bool(value) => *value,
             Self::Int(value) => *value != 0,
@@ -350,7 +363,7 @@ impl PsbValue {
     }
 
     /// A list value.
-    pub(crate) fn as_list(&self) -> Option<&[PsbValue]> {
+    pub fn as_list(&self) -> Option<&[PsbValue]> {
         match self {
             Self::List(items) => Some(items),
             Self::Null
@@ -366,7 +379,7 @@ impl PsbValue {
     }
 
     /// A dictionary value.
-    pub(crate) fn as_dict(&self) -> Option<&[(String, PsbValue)]> {
+    pub fn as_dict(&self) -> Option<&[(String, PsbValue)]> {
         match self {
             Self::Dictionary(entries) => Some(entries),
             Self::Null
@@ -415,7 +428,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Reference `loadString`: look the string up by index and cache it.
+    /// Look a string up by index, reading and caching it on first use.
     fn load_string(&mut self, index: u32) -> PsbResult<String> {
         if let Some(value) = self.strings.get(&index) {
             return Ok(value.clone());
@@ -445,7 +458,7 @@ impl<'a> Parser<'a> {
         reference
     }
 
-    /// Reference `unpack`.
+    /// Decode one typed value; `None` is the "no value" type byte.
     fn unpack(&mut self, reader: &mut Reader) -> PsbResult<Option<PsbValue>> {
         let type_byte = reader.u8()?;
         match type_byte {
@@ -500,7 +513,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Reference `loadList`.
+    /// Decode a list: a count, per-entry offsets, then each entry.
     fn load_list(&mut self, reader: &mut Reader) -> PsbResult<Option<PsbValue>> {
         let count_size = read_count_size(reader.u8()?)?;
         let offsets = read_list_body(reader, count_size)?;
@@ -515,7 +528,8 @@ impl<'a> Parser<'a> {
         Ok(Some(PsbValue::List(items)))
     }
 
-    /// Reference `loadObjects` / `loadObjectsV1`.
+    /// Decode a dictionary: the name indexes, the entry offsets, then each
+    /// entry.
     fn load_objects(&mut self, reader: &mut Reader) -> PsbResult<Option<PsbValue>> {
         if self.header.version == 1 {
             return self.load_objects_v1(reader);
@@ -542,7 +556,7 @@ impl<'a> Parser<'a> {
         Ok(Some(PsbValue::Dictionary(entries)))
     }
 
-    /// Reference `loadObjectsV1`: each entry starts with its name index.
+    /// Decode a version-1 dictionary: each entry starts with its name index.
     fn load_objects_v1(&mut self, reader: &mut Reader) -> PsbResult<Option<PsbValue>> {
         let count_size = read_count_size(reader.u8()?)?;
         let offsets = read_list_body(reader, count_size)?;
@@ -565,7 +579,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Decode the reference array count-size byte (`typeByte - ArrayN1 + 1`).
+/// Decode an array count-size byte (`typeByte - ArrayN1 + 1`).
 fn read_count_size(byte: u8) -> PsbResult<usize> {
     if (0x0D..=0x14).contains(&byte) {
         Ok((byte - 0x0D + 1) as usize)
@@ -574,7 +588,7 @@ fn read_count_size(byte: u8) -> PsbResult<usize> {
     }
 }
 
-/// Decode the name-index width of a PSB v1 object key type.
+/// Decode the name-index width of a version-1 object key type.
 fn key_name_width(byte: u8) -> PsbResult<usize> {
     match byte {
         0x04..=0x0C => Ok((byte - 0x04) as usize),
@@ -583,7 +597,7 @@ fn key_name_width(byte: u8) -> PsbResult<usize> {
     }
 }
 
-/// Read a `PSBArray`/`PSBList` body: count, entry width and entries.
+/// Read an array/list body: count, entry width and entries.
 fn read_list_body(reader: &mut Reader, count_size: usize) -> PsbResult<Vec<u32>> {
     let count = reader.uint(count_size)? as usize;
     if count > i32::MAX as usize {
@@ -612,7 +626,11 @@ fn read_list_body(reader: &mut Reader, count_size: usize) -> PsbResult<Vec<u32>>
     Ok(values)
 }
 
-/// Decode the v2+ name table (`PSBFile::loadNames`).
+/// Decode the version-2+ name table.
+///
+/// Each name is a path through a byte trie: a node's parent is the node's
+/// `names_data` entry, the byte on the edge is `node - charset[parent]`, and a
+/// name index is a slot whose `names_data` entry is the terminal node.
 fn decode_names(charset: &[u32], names_data: &[u32], name_indexes: &[u32]) -> Vec<String> {
     let mut names = Vec::with_capacity(name_indexes.len());
     for &index in name_indexes {
@@ -635,7 +653,7 @@ fn decode_names(charset: &[u32], names_data: &[u32], name_indexes: &[u32]) -> Ve
     names
 }
 
-/// Load the v1 name table (`PSBFile::loadKeys`).
+/// Load the version-1 name table: NUL-terminated strings at `offset_names`.
 fn load_keys(
     data: &[u8],
     header: &PsbHeader,
@@ -651,7 +669,8 @@ fn load_keys(
     Ok(names)
 }
 
-/// Decrypt the header offset fields and the v2 payload region for a seed.
+/// Decrypt the header offset fields and the version-2 payload region for a
+/// seed.
 fn apply_seed_decrypt(header: &mut PsbHeader, data: &mut [u8], seed: u32) {
     let mut ctx = EmoteCtx::new(seed);
     if header.is_encrypted() && header.header_length() as usize > data.len() {
@@ -689,11 +708,9 @@ fn decrypt_u32(ctx: &mut EmoteCtx, value: &mut u32) {
 
 /// Parse a decompressed PSB byte stream into a [`PsbDocument`].
 ///
-/// `seed` is the Emote decryption seed. The reference registers no script
-/// accessor for its `_seed`, so the port always passes `0`; with `0` the
-/// stream is left encrypted and an encrypted container fails with
-/// [`PsbError::Encrypted`].
-pub(crate) fn parse(mut data: Vec<u8>, seed: i64) -> PsbResult<PsbDocument> {
+/// `seed` is the Emote decryption seed. With a non-positive seed an encrypted
+/// container fails with [`PsbError::Encrypted`].
+pub fn parse(mut data: Vec<u8>, seed: i64) -> PsbResult<PsbDocument> {
     let mut header = {
         let mut reader = Reader::at(&data, 0);
         PsbHeader::parse(&mut reader)?
@@ -732,7 +749,8 @@ pub(crate) fn parse(mut data: Vec<u8>, seed: i64) -> PsbResult<PsbDocument> {
 
     if header.version == 1 {
         let mut reader = Reader::at(&data, 0);
-        // v1 stores the name-index table at the "encrypt" offset.
+        // A version-1 file stores the name-index table at the encryption
+        // offset, falling back to the end of the header.
         let mut offset = header.offset_encrypt;
         if offset as usize >= data.len() {
             offset = header.header_length();
@@ -809,8 +827,7 @@ pub(crate) fn parse(mut data: Vec<u8>, seed: i64) -> PsbResult<PsbDocument> {
     Ok(PsbDocument { root, resources })
 }
 
-/// Load the raw bytes of each referenced chunk (reference `loadResource` /
-/// `loadExtraResource`).
+/// Load the raw bytes of each referenced chunk.
 fn load_chunks(
     data: &[u8],
     base: u32,
@@ -845,7 +862,7 @@ fn load_chunks(
 }
 
 /// Decompress a raw file and parse it in one step.
-pub(crate) fn parse_stream(raw: &[u8], seed: i64) -> PsbResult<PsbDocument> {
+pub fn parse_stream(raw: &[u8], seed: i64) -> PsbResult<PsbDocument> {
     parse(open_decompressed_stream(raw)?, seed)
 }
 
@@ -853,10 +870,10 @@ pub(crate) fn parse_stream(raw: &[u8], seed: i64) -> PsbResult<PsbDocument> {
 mod tests {
     use super::*;
 
-    /// Build a reference name-table encoding for a set of names.
+    /// Build the version-2 name-table encoding for a set of names
+    /// (`reference/cpp/plugins/psbfile/PSBFile.cpp:29-48`).
     ///
-    /// The reference stores each name as a path through a byte trie: a node's
-    /// parent is `names_data[node]`, the byte on the edge is
+    /// A node's parent is `names_data[node]`, the byte on the edge is
     /// `node - charset[parent]`, and `name_indexes[i]` is a slot whose
     /// `names_data` entry is the terminal node. `decode_names` walks the chain
     /// back to the root and reverses it.
@@ -953,6 +970,8 @@ mod tests {
         (charset, names_data, indexes)
     }
 
+    /// The trie round-trips ASCII names, including the shared-prefix case
+    /// (`reference/cpp/plugins/psbfile/PSBFile.cpp:29-48`).
     #[test]
     fn decode_names_round_trips_ascii() {
         let (charset, names_data, indexes) = encode_names(&["num", "str", "arr"]);
@@ -962,6 +981,8 @@ mod tests {
         );
     }
 
+    /// An array body is a count, an entry-width byte and little-endian entries
+    /// (`reference/cpp/plugins/psbfile/PSBValue.h:455-480`).
     #[test]
     fn read_list_body_decodes_little_endian_entries() {
         // count size 1, count 2, entry width 2, values 0x0102 and 0x0304.

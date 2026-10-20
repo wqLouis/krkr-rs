@@ -1,7 +1,6 @@
 //! Stream decompression for PSB containers.
 //!
-//! The reference `PSBStreamDecompress.cpp` / `PSBLz4Stream.cpp` recognise
-//! three stream shapes:
+//! Three stream shapes are recognised:
 //!
 //! * a raw Emote **LZ4 frame** (`04 22 4D 18 ...`) whose blocks are either
 //!   stored uncompressed or compressed with the raw LZ4 block algorithm;
@@ -9,18 +8,16 @@
 //!   bytes is a zlib stream;
 //! * anything else, which is treated as a plain PSB byte stream.
 //!
-//! The frame *looks* like the standard LZ4 frame format, but the reference
-//! only reads and discards the header, block and content checksums (its
-//! `ReadI8LE`/`ReadI32LE` results are ignored) and decodes blocks with its
-//! own `decompressBlock`, whose malformed-input behaviour this port
-//! reproduces. A standards-validating decoder — `lz4_flex`'s frame reader
-//! verifies those checksums — could therefore reject streams the reference
-//! accepts, so the frame walk and the small raw-block decoder below stay a
-//! faithful port instead of a crate.
+//! The frame *looks* like the standard LZ4 frame format, but the header, block
+//! and content checksums are read and discarded and blocks are decoded without
+//! the standard's validation. A standards-validating decoder (for example
+//! `lz4_flex`'s frame reader, which verifies those checksums) would reject
+//! streams this loader accepts, so the frame walk and the raw-block decoder
+//! below stay hand-written.
 
 use std::io::Read;
 
-use super::error::{PsbError, PsbResult};
+use crate::error::{PsbError, PsbResult};
 
 /// The Emote LZ4 frame magic.
 const LZ4_MAGIC: [u8; 4] = [0x04, 0x22, 0x4d, 0x18];
@@ -29,9 +26,8 @@ const MDF_MAGIC: &[u8; 3] = b"MDF";
 
 /// Decompress (or pass through) an on-disk PSB/MDF stream.
 ///
-/// Mirrors the reference `openDecompressedStream`: short streams and unknown
-/// magics are errors, the LZ4 and MDF containers are inflated, and every
-/// other byte sequence is returned unchanged.
+/// Short streams and unknown magics are errors, the LZ4 and MDF containers are
+/// inflated, and every other byte sequence is returned unchanged.
 pub(crate) fn open_decompressed_stream(input: &[u8]) -> PsbResult<Vec<u8>> {
     if input.len() < 9 {
         return Err(PsbError::Truncated("stream header"));
@@ -91,8 +87,8 @@ impl Lz4FrameInfo {
 
         let mut offset = 6;
         if has_content_length {
-            // The reference reads two 32-bit halves and combines them but
-            // never uses the value for decompression.
+            // The declared length is read and discarded: decompression stops
+            // at the end-of-blocks marker, not at the declared size.
             if input.len() < offset + 8 {
                 return Err(PsbError::Truncated("LZ4 content length"));
             }
@@ -174,7 +170,7 @@ fn decompress_lz4_stream(input: &[u8]) -> PsbResult<Vec<u8>> {
 }
 
 /// Decode one raw LZ4 block into `output`, returning the number of bytes
-/// written. A faithful translation of the reference `decompressBlock`.
+/// written.
 fn decompress_block(block: &[u8], output: &mut [u8]) -> PsbResult<usize> {
     let iend = block.len();
     let oend = output.len();
@@ -258,8 +254,8 @@ fn decompress_block(block: &[u8], output: &mut [u8]) -> PsbResult<usize> {
         if match_end > oend || write_end > oend {
             return Err(PsbError::Lz4("match overruns output".into()));
         }
-        // `copy_within` has memmove semantics, which is exactly the
-        // reference's `copyOverlapped`.
+        // `copy_within` has memmove semantics, which is the required
+        // overlapping-match behaviour.
         output.copy_within(match_pos..match_end, dst);
         dst = write_end;
     }
@@ -267,7 +263,8 @@ fn decompress_block(block: &[u8], output: &mut [u8]) -> PsbResult<usize> {
     Ok(dst)
 }
 
-/// The Emote per-file decryption context (`EMoteCTX.h`).
+/// The Emote per-file decryption context: a four-word key schedule and the
+/// current keystream word.
 #[derive(Debug, Clone)]
 pub(crate) struct EmoteCtx {
     key: [u32; 4],
@@ -276,9 +273,8 @@ pub(crate) struct EmoteCtx {
 }
 
 impl EmoteCtx {
-    /// Initialise the key schedule from the four seed words.
-    ///
-    /// The reference builds `[0x075BCD15, 0x159A55E5, 0x1F123BB5, seed]`.
+    /// Initialise the key schedule from the four seed words; the first three
+    /// are fixed and the fourth is the caller's seed.
     pub(crate) fn new(seed: u32) -> Self {
         Self {
             key: [0x075B_CD15, 0x159A_55E5, 0x1F12_3BB5, seed],
@@ -287,8 +283,7 @@ impl EmoteCtx {
         }
     }
 
-    /// XOR `data` with the generated keystream (the reference
-    /// `emote_decrypt`).
+    /// XOR `data` with the generated keystream.
     pub(crate) fn decrypt(&mut self, data: &mut [u8]) {
         for byte in data.iter_mut() {
             if self.v == 0 {
@@ -313,12 +308,16 @@ impl EmoteCtx {
 mod tests {
     use super::*;
 
+    /// A stream with no recognised magic is returned unchanged
+    /// (`reference/cpp/plugins/psbfile/PSBStreamDecompress.cpp:37-60`).
     #[test]
     fn plain_stream_is_returned_unchanged() {
         let data = b"PSB\0............".to_vec();
         assert_eq!(open_decompressed_stream(&data).unwrap(), data);
     }
 
+    /// A stream shorter than the header check is rejected rather than guessed
+    /// (`reference/cpp/plugins/psbfile/PSBStreamDecompress.cpp:38-46`).
     #[test]
     fn short_stream_is_rejected() {
         assert!(matches!(
@@ -327,6 +326,8 @@ mod tests {
         ));
     }
 
+    /// `MDF` streams carry a zlib payload after the magic and the declared
+    /// length (`reference/cpp/plugins/psbfile/PSBStreamDecompress.cpp:53`).
     #[test]
     fn mdf_stream_inflates() {
         use flate2::Compression;
@@ -345,6 +346,8 @@ mod tests {
         assert_eq!(open_decompressed_stream(&input).unwrap(), payload);
     }
 
+    /// A stored block is marked by the high bit of its length
+    /// (`reference/cpp/plugins/psbfile/PSBLz4Stream.cpp:200-215`).
     #[test]
     fn lz4_frame_with_stored_block_round_trips() {
         // Magic + FLG(version 1, independent) + BD(64 KiB) + HC + one stored
@@ -356,18 +359,18 @@ mod tests {
         input.push(0x40); // max block size code 4.
         input.push(0x00); // header checksum (ignored).
         // The high bit marks the block as stored; the low 31 bits are its
-        // length (the reference `blockSize & 0x7FFFFFFF`).
+        // length.
         input.extend_from_slice(&(i32::MIN | payload.len() as i32).to_le_bytes());
         input.extend_from_slice(payload);
         input.extend_from_slice(&0i32.to_le_bytes());
         assert_eq!(open_decompressed_stream(&input).unwrap(), payload);
     }
 
+    /// An all-literal block decodes through the last-literals path
+    /// (`reference/cpp/plugins/psbfile/PSBLz4Stream.cpp:93-160`).
     #[test]
     fn raw_lz4_block_decodes_literals() {
-        // Token 0x30 => 3 literal bytes then the end marker; a block that is
-        // all literals must decode to the reference "last literals" path.
-        // Build: token, 3 literal bytes.
+        // Token 0x30 => 3 literal bytes then the end marker.
         let block = [0x30u8, b'a', b'b', b'c'];
         let mut output = [0u8; 16];
         let written = decompress_block(&block, &mut output).unwrap();

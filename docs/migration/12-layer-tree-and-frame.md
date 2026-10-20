@@ -52,7 +52,7 @@ scene and all of its state:
 | field / type | role |
 |---|---|
 | `windows: Vec<WindowState>` | one entry per `Window`; `inner_size`, `visible`, `opacity`, `primary_layer`, focused layer, focus domains, `layers` |
-| `layers: Vec<LayerState>` | the layer nodes: `window`, `parent`, `rect` (x/y/w/h), `visible`, `opacity`, `blend`, `bitmap` (main image), `image_left/top/width/height`, `hold_alpha`, `cache_bitmap`/`cache_enabled_count`, and every TVP property L3 writes |
+| `layers: Vec<LayerState>` | the layer nodes: `window`, `parent`, `rect` (x/y/w/h), `visible`, `opacity`, `blend`, `bitmap` (main image), `image_left/top/width/height`, `hold_alpha`, `cache_bitmap`/`cache_enabled_count`, `transition_self`, and every TVP property L3 writes |
 | `bitmaps: Vec<BitmapState>` | CPU RGBA pixels + dirty flags; the texture source |
 | `fonts: Vec<FontState>` | parsed faces |
 | `revision: u64` | bumped by `touch()` on every mutation; the projection's skip key (`revision()`) |
@@ -94,8 +94,9 @@ For every layer in `window_layer_order` it builds at most one `RenderNode`:
   except an opaque `Replace` below full composed alpha degrades to
   `SourceOver` (it must still blend).
 * **Content**: today only `RenderContent::Texture` is emitted — the layer's
-  `bitmap` (or its rendered `cache_bitmap`). Solid fills and glyph runs are not
-  produced by the projection.
+  `bitmap` (or its rendered `cache_bitmap`, or its transition `transition_self`
+  image, which stands in for the layer's own image while its children keep
+  drawing live). Solid fills and glyph runs are not produced by the projection.
 * **Order**: `z` comes from a per-scene monotonic `next_z`, so siblings across
   all windows of a scene are globally ordered by insertion (layer order).
 * **Root/background**: one default root node; `background = BACKGROUND_CLEAR`
@@ -105,8 +106,13 @@ For every layer in `window_layer_order` it builds at most one `RenderNode`:
 A layer is skipped (contributes no node) when it is hidden anywhere in its
 chain, has no texture, is fully clipped away, or sits under a layer whose cache
 bitmap already contains its pixels (`InternalComplete2` renders the subtree into
-`CacheBitmap`). The counts are trace-logged, so an almost-empty frame is
-diagnosable.
+`CacheBitmap`). A layer with a `transition_self` image draws that image at the
+main image's placement and is not added to the cached subtree, so its children
+keep drawing live. A cached ancestor's subtree composition takes the same self
+image in place of the layer's main image (`CopySelfForRect`,
+`reference/cpp/core/visual/LayerIntf.cpp:6781-6783`), and a change to it
+invalidates that cache like any other drawn-image change. The counts are
+trace-logged, so an almost-empty frame is diagnosable.
 
 **What the projection deliberately does not do.** It performs no batching, no
 sorting, no transform nesting, and no mask/province/face work. Every node gets
