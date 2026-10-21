@@ -4,18 +4,21 @@
 //! (`ImageConvertor`, `ImageFactory`, `ImageLoad`, `ImageClone`,
 //! `ImageBounds`, `NCB_REGISTER_GDIP_SUBCLASS2(GdipImage, ImageConvertor)`)
 //! and `blend2d/LayerExDraw.hpp` (`class GdipImage`). The wrapper holds a
-//! decoded bitmap and its rotate/flip transform. The port keeps the decoded
-//! straight-alpha RGBA and reproduces the reference's accessor results.
+//! decoded bitmap and turns its pixels in place on `RotateFlip`. The port
+//! keeps the decoded straight-alpha RGBA and reproduces the accessor results.
+//! The pixels come from the engine's decoded-image cache.
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 
-use crate::engine_api::{Storage, StorageReadError};
+use crate::engine_api::{
+    BitmapState, DecodedImageKey, DecodedImageMode, Storage, StorageReadError,
+};
 use tjs::{DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, Tjs2Engine, Value};
 
-use super::draw::Mat;
-use super::set_real;
+use super::{scene_mut, set_real};
 use crate::native_util::{args, report_error, set_int, set_void};
+use crate::natives::visual::COLOR_KEY_NONE;
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
@@ -43,6 +46,9 @@ const IMAGE_TYPE_UNKNOWN: i64 = 0;
 const IMAGE_TYPE_BITMAP: i64 = 1;
 const IMAGE_TYPE_METAFILE: i64 = 2;
 
+/// `InvalidParameter` in the `GdiPlus.Status` table.
+const INVALID_PARAMETER: i64 = 2;
+
 /// Common image extensions probed when the requested storage name does not
 /// resolve, mirroring the reference `TVPGetPlacedPath` extension search.
 const IMAGE_EXTENSION_PROBE: [&str; 21] = [
@@ -52,7 +58,7 @@ const IMAGE_EXTENSION_PROBE: [&str; 21] = [
 
 /// The reference `GdipImage` payload (`reference/cpp/plugins/layerex_draw/
 /// blend2d/LayerExDraw.hpp:630-773`): a bitmap image plus the rotate/flip
-/// transform. A freshly loaded image is always a bitmap (`type == 0`).
+/// operation. A freshly loaded image is always a bitmap (`type == 0`).
 #[derive(Clone, Debug, Default)]
 pub(super) struct ImageData {
     /// 0 = bitmap, 1 = vector metafile.
@@ -63,8 +69,6 @@ pub(super) struct ImageData {
     rgba: Vec<u8>,
     /// Whether the encoded image carried an alpha channel.
     has_alpha: bool,
-    /// The `RotateFlip` transform.
-    trans: Mat,
 }
 
 impl ImageData {
@@ -72,6 +76,157 @@ impl ImageData {
     /// are empty.
     fn is_empty(&self) -> bool {
         self.kind != 0 || self.rgba.is_empty()
+    }
+
+    /// The raster dimensions, after checking that the pixel buffer holds four
+    /// straight-alpha RGBA8 bytes per pixel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a stored dimension is negative, the size is not
+    /// representable, or the buffer length disagrees with it.
+    fn checked_raster_size(&self) -> Result<(u32, u32), String> {
+        let width = u32::try_from(self.width)
+            .map_err(|_| format!("the image width {} is out of range", self.width))?;
+        let height = u32::try_from(self.height)
+            .map_err(|_| format!("the image height {} is out of range", self.height))?;
+        let expected = usize::try_from(width)
+            .ok()
+            .zip(usize::try_from(height).ok())
+            .and_then(|(width, height)| width.checked_mul(height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| format!("the image size {width}x{height} is not representable"))?;
+        if self.rgba.len() != expected {
+            return Err(format!(
+                "the image pixel buffer holds {} bytes, {expected} expected",
+                self.rgba.len()
+            ));
+        }
+        Ok((width, height))
+    }
+
+    /// The pixels a drawing operation blits.
+    ///
+    /// `Ok(None)` when the image has nothing to place — an empty image, or the
+    /// vector kind, which has no raster.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload's dimensions and pixel buffer do not
+    /// describe the same raster.
+    pub(super) fn blit_snapshot(&self) -> Result<Option<BitmapState>, String> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+        let (width, height) = self.checked_raster_size()?;
+        Ok(Some(BitmapState::new(width, height, self.rgba.clone())))
+    }
+
+    /// Apply `transform` to the raster in place: the pixels are rotated or
+    /// mirrored and a quarter turn swaps the stored width and height, so the
+    /// size accessors and a later draw see the transformed image.
+    ///
+    /// An image with no raster has nothing to transform.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload's dimensions and pixel buffer do not
+    /// describe the same raster.
+    fn apply_rotate_flip(&mut self, transform: RotateFlip) -> Result<(), String> {
+        if transform == RotateFlip::Keep || self.is_empty() {
+            return Ok(());
+        }
+        let (width, height) = self.checked_raster_size()?;
+        let (out_width, out_height) = transform.size(width, height);
+        let (src_width, src_height) = (width as usize, height as usize);
+        let (dest_width, dest_height) = (out_width as usize, out_height as usize);
+        let src_stride = src_width * 4;
+        let dest_stride = dest_width * 4;
+        let mut rgba = vec![0u8; self.rgba.len()];
+        for y in 0..dest_height {
+            for x in 0..dest_width {
+                let (sx, sy) = transform.source(src_width, src_height, x, y);
+                let src = sy * src_stride + sx * 4;
+                let dest = y * dest_stride + x * 4;
+                rgba[dest..dest + 4].copy_from_slice(&self.rgba[src..src + 4]);
+            }
+        }
+        self.width = i32::try_from(out_width)
+            .map_err(|_| format!("the rotated image width {out_width} is out of range"))?;
+        self.height = i32::try_from(out_height)
+            .map_err(|_| format!("the rotated image height {out_height} is out of range"))?;
+        self.rgba = rgba;
+        Ok(())
+    }
+}
+
+/// The rotate/flip transforms `RotateFlip` applies to an image's pixels.
+///
+/// A quarter turn exchanges the width and the height; every other transform
+/// keeps them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RotateFlip {
+    /// `RotateNoneFlipNone`: the image stays as it is.
+    Keep,
+    /// `Rotate90FlipNone`: a quarter turn clockwise.
+    Clockwise90,
+    /// `Rotate180FlipNone`: a half turn.
+    HalfTurn,
+    /// `Rotate270FlipNone`: a quarter turn counter-clockwise.
+    CounterClockwise90,
+    /// `RotateNoneFlipX`: a horizontal mirror.
+    MirrorX,
+    /// `Rotate90FlipX`: a quarter turn clockwise, then a horizontal mirror.
+    Clockwise90MirrorX,
+    /// `RotateNoneFlipY`: a vertical mirror.
+    MirrorY,
+    /// `Rotate270FlipX`: a quarter turn counter-clockwise, then a horizontal
+    /// mirror.
+    CounterClockwise90MirrorX,
+}
+
+impl RotateFlip {
+    /// The transform `flip_type` names, or `InvalidParameter` for a value
+    /// outside the `RotateFlipType` range.
+    fn from_type(flip_type: i64) -> Result<Self, i64> {
+        Ok(match flip_type {
+            0 => Self::Keep,
+            1 => Self::Clockwise90,
+            2 => Self::HalfTurn,
+            3 => Self::CounterClockwise90,
+            4 => Self::MirrorX,
+            5 => Self::Clockwise90MirrorX,
+            6 => Self::MirrorY,
+            7 => Self::CounterClockwise90MirrorX,
+            _ => return Err(INVALID_PARAMETER),
+        })
+    }
+
+    /// The size of the raster after the transform.
+    fn size(self, width: u32, height: u32) -> (u32, u32) {
+        match self {
+            Self::Clockwise90
+            | Self::CounterClockwise90
+            | Self::Clockwise90MirrorX
+            | Self::CounterClockwise90MirrorX => (height, width),
+            Self::Keep | Self::HalfTurn | Self::MirrorX | Self::MirrorY => (width, height),
+        }
+    }
+
+    /// The source pixel the destination pixel `(x, y)` reads. `width` and
+    /// `height` are the source dimensions, and non-empty images are at least
+    /// one pixel wide and high.
+    fn source(self, width: usize, height: usize, x: usize, y: usize) -> (usize, usize) {
+        match self {
+            Self::Keep => (x, y),
+            Self::Clockwise90 => (y, height - 1 - x),
+            Self::HalfTurn => (width - 1 - x, height - 1 - y),
+            Self::CounterClockwise90 => (width - 1 - y, x),
+            Self::MirrorX => (width - 1 - x, y),
+            Self::Clockwise90MirrorX => (y, x),
+            Self::MirrorY => (x, height - 1 - y),
+            Self::CounterClockwise90MirrorX => (width - 1 - y, height - 1 - x),
+        }
     }
 }
 
@@ -104,37 +259,62 @@ fn read_image_candidate(
     Ok(None)
 }
 
-/// Decode `name` through the attached storage and the installed host decoder.
+/// Load `name` through the attached storage and the installed host decoder.
 ///
 /// The reference `loadImage` returns an empty image for a missing placed path
 /// or a decode failure, so `Ok(None)` here is the empty image. A storage read
 /// failure that is not "not found" is returned as itself instead of being
 /// retried as the next candidate.
-fn load_image_data(ctx: &CompatCtx, name: &str) -> Result<Option<ImageData>, StorageReadError> {
+///
+/// The pixels come from the engine's decoded-image cache, keyed by the storage
+/// name the candidate search resolved: a second load of that entry reuses the
+/// pixels instead of decoding them again.
+fn load_image_data(ctx: &CompatCtx, name: &str) -> Result<Option<ImageData>, String> {
     // SAFETY: `ctx` was resolved from the installed binding.
     let services = unsafe { ctx.services() };
     let Some(storage) = services.storage() else {
         return Ok(None);
     };
     // SAFETY: `attach_storage` guarantees the pointer stays valid.
-    let Some((resolved, bytes)) = read_image_candidate(unsafe { &*storage }, name)? else {
+    let storage = unsafe { &*storage };
+    let Some((resolved, bytes)) =
+        read_image_candidate(storage, name).map_err(|error| error.to_string())?
+    else {
         return Ok(None);
     };
+    let key = DecodedImageKey::new(
+        strip_file_media(&resolved),
+        COLOR_KEY_NONE,
+        DecodedImageMode::Full,
+        0,
+        0,
+    );
     let decoded = {
-        let resolver = crate::resource::resource_state(ctx);
-        match resolver.decode(&bytes, Some(&resolved)) {
-            Ok(decoded) => decoded,
-            Err(_) => return Ok(None),
+        let scene = scene_mut(ctx)?;
+        scene.cached_decoded_image(key, || {
+            let resolver = crate::resource::resource_state(ctx);
+            let decoded = resolver.decode(&bytes, Some(&resolved))?;
+            if !decoded.is_consistent() {
+                return Err("the decoded image is malformed".to_string());
+            }
+            Ok(decoded)
+        })
+    };
+    let decoded = match decoded {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            log::warn!("image: cannot decode {resolved:?}: {error}");
+            return Ok(None);
         }
     };
-    if !decoded.is_consistent() {
-        return Ok(None);
-    }
     let has_alpha = {
         let resolver = crate::resource::resource_state(ctx);
         match resolver.probe(&bytes, Some(&resolved)) {
             Ok(info) => info.has_alpha,
-            Err(_) => decoded.rgba.chunks_exact(4).any(|pixel| pixel[3] < 255),
+            Err(error) => {
+                log::warn!("image: cannot probe {resolved:?}: {error}");
+                decoded.rgba.chunks_exact(4).any(|pixel| pixel[3] < 255)
+            }
         }
     };
     Ok(Some(ImageData {
@@ -143,7 +323,6 @@ fn load_image_data(ctx: &CompatCtx, name: &str) -> Result<Option<ImageData>, Sto
         height: decoded.height as i32,
         rgba: decoded.rgba,
         has_alpha,
-        trans: Mat::IDENTITY,
     }))
 }
 
@@ -212,7 +391,7 @@ extern "C" fn ctor(
                 0
             }
             Ok(None) => report_error(out_error, &format!("cannot open:{name}")),
-            Err(error) => report_error(out_error, &error.to_string()),
+            Err(error) => report_error(out_error, &error),
         }
     } else {
         report_error(out_error, "GdiPlus.Image: invalid parameter")
@@ -246,7 +425,7 @@ extern "C" fn load(
     *inst = match load_image_data(&ctx, &name) {
         Ok(Some(data)) => data,
         Ok(None) => ImageData::default(),
-        Err(error) => return report_error(out_error, &error.to_string()),
+        Err(error) => return report_error(out_error, &error),
     };
     set_void(out);
     0
@@ -462,7 +641,7 @@ extern "C" fn get_type(
 
 /// `RotateFlip(type)` — reference `GdipImage::RotateFlip` (`reference/cpp/
 /// plugins/layerex_draw/blend2d/LayerExDraw.hpp:736-773`): `Ok` (0) for the
-/// handled transforms, `NotImplemented` (6) otherwise.
+/// handled transforms, `InvalidParameter` (2) outside the enum range.
 extern "C" fn rotate_flip(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -485,45 +664,19 @@ extern "C" fn rotate_flip(
     };
     // SAFETY: `instance` is the live `ImageData` payload the VM allocated for this script object; `rotate_flip` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut ImageData) };
-    match flip_type {
-        0 => {}
-        1 => inst.trans = rotation_matrix(std::f64::consts::PI * 0.5),
-        2 => inst.trans = rotation_matrix(std::f64::consts::PI),
-        3 => inst.trans = rotation_matrix(std::f64::consts::PI * 1.5),
-        4 => inst.trans = scaling_matrix(-1.0, 1.0),
-        5 => {
-            inst.trans = rotation_matrix(std::f64::consts::PI * 0.5);
-            inst.trans = inst.trans.mul(&scaling_matrix(-1.0, 1.0));
-        }
-        6 => inst.trans = scaling_matrix(1.0, -1.0),
-        _ => {
-            set_int(out, 6);
+    let transform = match RotateFlip::from_type(flip_type) {
+        Ok(transform) => transform,
+        Err(status) => {
+            set_int(out, status);
             return 0;
         }
-    }
-    set_int(out, 0);
-    0
-}
-
-/// The reference `BLMatrix2D::makeRotation` affine.
-fn rotation_matrix(rad: f64) -> Mat {
-    let (s, c) = rad.sin_cos();
-    Mat {
-        m11: c,
-        m12: s,
-        m21: -s,
-        m22: c,
-        dx: 0.0,
-        dy: 0.0,
-    }
-}
-
-/// The reference `BLMatrix2D::makeScaling` affine.
-fn scaling_matrix(sx: f64, sy: f64) -> Mat {
-    Mat {
-        m11: sx,
-        m22: sy,
-        ..Mat::IDENTITY
+    };
+    match inst.apply_rotate_flip(transform) {
+        Ok(()) => {
+            set_int(out, 0);
+            0
+        }
+        Err(error) => report_error(out_error, &error),
     }
 }
 

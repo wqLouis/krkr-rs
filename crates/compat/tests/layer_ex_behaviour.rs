@@ -1328,12 +1328,21 @@ fn gdiplus_image_clone_and_rotate_flip() {
     env.run("var img = new GdiPlus.Image('images/test.img'); var copy = img.Clone();");
     assert_eq!(env.eval_int("copy.GetWidth()"), 2);
     assert_eq!(env.eval_int("copy.GetHeight()"), 2);
-    // `RotateFlip` returns `Ok` (0) for the handled transforms and
-    // `NotImplemented` (6) otherwise
-    // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:736-773`).
+    // `RotateFlip` accepts every `RotateFlipType` value `0..7` and returns
+    // `Ok` (0): `reference/cpp/plugins/layerex_draw/windows/main.cpp:574`
+    // binds the member to GDI+ `Image::RotateFlip`, which covers all eight
+    // values and is the compatibility oracle. A value outside the enum range
+    // is `InvalidParameter` (2), listed with the other `Status` values by
+    // `reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:65-88`; the
+    // shipped `layerExDraw.dll` registers `InvalidParameter` = 2 and invokes
+    // `Gdiplus::Image::RotateFlip` directly
+    // (`plugins/analysis/_ghidra/layerExDraw.c:922,6020`). The blend2d build
+    // instead reports `NotImplemented` (6) for 7 and for a value outside the
+    // range (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:736-773`).
     assert_eq!(env.eval_int("copy.RotateFlip(0)"), 0);
     assert_eq!(env.eval_int("copy.RotateFlip(6)"), 0);
-    assert_eq!(env.eval_int("copy.RotateFlip(7)"), 6);
+    assert_eq!(env.eval_int("copy.RotateFlip(7)"), 0);
+    assert_eq!(env.eval_int("copy.RotateFlip(8)"), 2);
 }
 
 /// The literal name resolves before any extension is appended: with both

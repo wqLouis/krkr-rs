@@ -23,6 +23,7 @@ use tjs::{NativeObjThisMethodDef, NativeObjThisPropertyDef, TjsValue, Value};
 
 use super::appearance::{AppearanceData, AppearanceInst, Paint, paint_color_at};
 use super::font::{TextBitmap, read_font, render_text, tint_coverage};
+use super::image::ImageData;
 use super::path::{PathData, PathInst};
 use super::{
     argb_to_rgba, bound, ensure_layer_image, layer_clip, layer_from_objthis, mark_layer_paint,
@@ -1101,13 +1102,32 @@ extern "C" fn clear(
 // Image draw methods
 // ---------------------------------------------------------------------------
 
-/// Resolve a `Bitmap` or `Layer` argument to a scene bitmap snapshot.
-fn image_snapshot(engine: *mut c_void, value: &Value, what: &str) -> Result<BitmapState, String> {
+/// Resolve a `Bitmap`, `Layer` or `Image` argument to the pixels the blit
+/// reads. `Ok(None)` is an image with nothing to place.
+fn image_snapshot(
+    engine: *mut c_void,
+    value: &Value,
+    what: &str,
+) -> Result<Option<BitmapState>, String> {
     let (resolved, ctx) = bound(engine)?;
     let host = resolved.engine();
     let object = host
         .retain_object_arg(value)
         .map_err(|error| format!("{what}: the image argument is not an object: {error}"))?;
+    // An image value carries its own pixels; `None` is an image with no
+    // pixels, which has nothing to place.
+    if let Some(payload) = host
+        .native_instance_payload(object.raw_id(), "Image")
+        .map_err(|error| format!("{what}: {error}"))?
+    {
+        // SAFETY: the payload of an `Image` instance is the `ImageData` this
+        // plugin's `create` allocated. The retained argument keeps it alive
+        // for the whole call, and the snapshot copies the pixels out.
+        let image = unsafe { &*(payload.as_ptr() as *const ImageData) };
+        return image
+            .blit_snapshot()
+            .map_err(|error| format!("{what}: {error}"));
+    }
     let scene = super::scene_mut(&ctx)?;
     // The reference resolves the image argument with
     // `NativeInstanceSupport(TJS_NIS_GETINSTANCE, classid)`: a `Layer`
@@ -1120,7 +1140,7 @@ fn image_snapshot(engine: *mut c_void, value: &Value, what: &str) -> Result<Bitm
                     Ok(Some(id)) => (id, false),
                     Ok(None) => {
                         return Err(format!(
-                            "{what}: the image argument is not a Layer or Bitmap"
+                            "{what}: the image argument is not a Layer, Bitmap or Image"
                         ));
                     }
                     Err(error) => return Err(format!("{what}: {error}")),
@@ -1139,10 +1159,17 @@ fn image_snapshot(engine: *mut c_void, value: &Value, what: &str) -> Result<Bitm
     // The image may still be decoding: the pixels are not there yet, and
     // every path that reads or writes them waits for the decode.
     scene.resolve_bitmap(bitmap_id);
-    scene
+    let bitmap = scene
         .bitmap(bitmap_id)
         .cloned()
-        .ok_or_else(|| format!("{what}: the source image {bitmap_id} does not exist"))
+        .ok_or_else(|| format!("{what}: the source image {bitmap_id} does not exist"))?;
+    Ok(Some(bitmap))
+}
+
+/// The update rectangle a draw returns when the image has no pixels to place.
+fn empty_image_result(engine: *mut c_void, out: *mut Value) -> c_int {
+    set_rectf_result(engine, out, RectF64::default());
+    0
 }
 
 fn finish_image(
@@ -1208,7 +1235,8 @@ extern "C" fn draw_image(
         return report_error(out_error, "Layer.drawImage requires x, y and an image");
     }
     let src = match image_snapshot(engine, &a[2], "Layer.drawImage") {
-        Ok(src) => src,
+        Ok(Some(src)) => src,
+        Ok(None) => return empty_image_result(engine, out),
         Err(error) => return report_error(out_error, &error),
     };
     let (x, y) = (value_as_f64(&a[0]), value_as_f64(&a[1]));
@@ -1247,7 +1275,8 @@ extern "C" fn draw_image_rect(
         );
     }
     let src = match image_snapshot(engine, &a[2], "Layer.drawImageRect") {
-        Ok(src) => src,
+        Ok(Some(src)) => src,
+        Ok(None) => return empty_image_result(engine, out),
         Err(error) => return report_error(out_error, &error),
     };
     let (dleft, dtop) = (value_as_f64(&a[0]), value_as_f64(&a[1]));
@@ -1300,7 +1329,8 @@ extern "C" fn draw_image_stretch(
         );
     }
     let src = match image_snapshot(engine, &a[4], "Layer.drawImageStretch") {
-        Ok(src) => src,
+        Ok(Some(src)) => src,
+        Ok(None) => return empty_image_result(engine, out),
         Err(error) => return report_error(out_error, &error),
     };
     let (dleft, dtop, dwidth, dheight) = (
@@ -1358,7 +1388,8 @@ extern "C" fn draw_image_affine(
         );
     }
     let src = match image_snapshot(engine, &a[0], "Layer.drawImageAffine") {
-        Ok(src) => src,
+        Ok(Some(src)) => src,
+        Ok(None) => return empty_image_result(engine, out),
         Err(error) => return report_error(out_error, &error),
     };
     let (sleft, stop, swidth, sheight) = (

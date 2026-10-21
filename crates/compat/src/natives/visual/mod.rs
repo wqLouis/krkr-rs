@@ -84,6 +84,7 @@
 use crate::{CompatCtx, CompatError};
 
 mod bitmap;
+pub(crate) use bitmap::COLOR_KEY_NONE;
 mod common;
 pub(crate) use common::{ObjectKind, duplicate_object};
 pub(crate) use layer::{clear_layer_focus, focus_layer, focus_layer_in_input_domain, from_native};
