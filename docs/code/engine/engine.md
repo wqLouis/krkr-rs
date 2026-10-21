@@ -203,9 +203,9 @@ touched.
 
 * **The engine owns the clock.** Nothing above L2 accumulates a `dt` or calls
   a subsystem pump itself.
-* **The projected tree is in VM pixels** until `translate_render_scene`
-  rewrites it into device pixels; the overlay is attached *after* the
-  translation, because its node is already in device coordinates.
+* **The projected tree is in VM pixels.** The render-scene root carries the
+  Fit presentation transform; the overlay is attached with the inverse root
+  transform because its node is authored in device coordinates.
 * **A changed presentation invalidates the projection**, because the tree is
   built in VM pixels.
 * **A bitmap whose texture was missing at the last projection is projected
@@ -238,7 +238,7 @@ script window size    ──► scene window client ──► take_window_resize
                        ├─► overlay refresh
                        ├─► upload dirty bitmaps ─► texture table
                        ├─► project_scene_report ─► RenderScene (VM px)
-                       ├─► translate_render_scene ─► RenderScene (device px)
+                       ├─► set root.transform = Fit presentation
                        ├─► GameFrame::after_project(drawn_layers)
                        └─► render::render ─► one presented frame
 ```

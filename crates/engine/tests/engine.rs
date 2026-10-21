@@ -7,7 +7,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use api::geometry::RectF;
+use api::geometry::{RectF, Transform2D};
 use api::host::SurfaceEvent;
 use engine::{Engine, EngineError, EngineOverlay, EngineParts, GameFrame, Rect};
 use render::{
@@ -131,6 +131,16 @@ fn drawn_dsts(engine: &Engine) -> Vec<RectF> {
         .filter(|node| matches!(&node.content, RenderContent::Texture(_)))
         .map(|node| node.dst)
         .collect()
+}
+
+/// The transform the render scene root carries.
+fn scene_root_transform(engine: &Engine) -> Transform2D {
+    let root = engine.render_scene().root;
+    engine
+        .render_scene()
+        .node(root)
+        .expect("render scene root")
+        .transform
 }
 
 #[test]
@@ -272,7 +282,7 @@ fn resize_changes_the_framebuffer_without_touching_the_scene_window() {
 }
 
 #[test]
-fn a_scaled_presentation_maps_the_projected_tree_into_the_framebuffer() {
+fn a_scaled_presentation_sets_the_root_transform_and_keeps_the_vm_tree() {
     // The layer's VM placement (10,10,50,50) is reference-compatible; fitting
     // it into a differently sized framebuffer is the documented extension
     // (D34/D39/D40).
@@ -303,8 +313,14 @@ fn a_scaled_presentation_maps_the_projected_tree_into_the_framebuffer() {
     assert_eq!(translation.vm_size, (100, 100));
     assert_eq!(translation.device_size, (200, 200));
     assert_eq!(
+        scene_root_transform(&engine),
+        translation.root_transform(),
+        "the root carries the fit mapping"
+    );
+    assert_eq!(
         drawn_dsts(&engine),
-        vec![RectF::new(20.0, 20.0, 100.0, 100.0)]
+        vec![RectF::new(10.0, 10.0, 50.0, 50.0)],
+        "the projected nodes stay in VM pixels"
     );
 
     // A wider framebuffer letterboxes the VM surface: the scale stays 2 and
@@ -315,14 +331,70 @@ fn a_scaled_presentation_maps_the_projected_tree_into_the_framebuffer() {
     assert_eq!(translation.scale, 2.0);
     assert_eq!(translation.offset, (100.0, 0.0));
     assert_eq!(
+        scene_root_transform(&engine),
+        translation.root_transform(),
+        "the root follows the letterboxed presentation"
+    );
+    assert_eq!(
         drawn_dsts(&engine),
-        vec![RectF::new(120.0, 20.0, 100.0, 100.0)]
+        vec![RectF::new(10.0, 10.0, 50.0, 50.0)],
+        "an OS resize does not rewrite the VM nodes"
     );
     assert_eq!(
         engine.scene().window(window).expect("window").inner_size,
         (100, 100),
         "an OS resize leaves the VM window alone"
     );
+}
+
+#[test]
+fn the_overlay_stays_in_device_pixels_under_a_scaled_root() {
+    // The overlay authors its panel in framebuffer pixels; its node transform
+    // cancels the root so the Fit mapping moves no overlay pixel (D34/D39/D40).
+    let mut parts = headless_parts((200, 200));
+    let texture = create_texture(&parts.pipeline, TextureDesc::new(8, 8)).expect("texture");
+    parts.overlay = Some(Box::new(CountingOverlay {
+        texture,
+        refreshes: Rc::new(Cell::new(0)),
+    }));
+    let mut engine = Engine::new(parts).expect("engine");
+    let window = engine.scene_mut().add_window("game", (100, 100));
+    let primary = engine.scene_mut().add_layer(window, None);
+    engine.scene_mut().layer_mut(primary).expect("primary").rect = Rect::new(0, 0, 100, 100);
+    let mut hooks = Recorder::default();
+
+    engine.step(1.0, &mut hooks).expect("frame");
+    let translation = engine.translation().expect("mapping");
+    assert_eq!(translation.scale, 2.0);
+    let root = scene_root_transform(&engine);
+    assert_eq!(root, translation.root_transform());
+
+    let index = overlay_nodes(&engine).first().copied().expect("overlay");
+    let overlay = &engine.render_scene().nodes[index];
+    assert_eq!(
+        overlay.dst,
+        RectF::new(0.0, 0.0, 8.0, 8.0),
+        "the overlay authors device pixels"
+    );
+    assert_eq!(overlay.transform, translation.inverse_root_transform());
+    let composed = overlay.transform.to_affine().then(&root.to_affine());
+    assert_eq!(composed.transform_point((0.0, 0.0)), (0.0, 0.0));
+    assert_eq!(composed.transform_point((8.0, 8.0)), (8.0, 8.0));
+
+    // A letterboxed framebuffer moves the root by 100 px; the overlay stays at
+    // its device origin because its inverse transform moves with the root.
+    engine.resize((400, 200)).expect("resize");
+    engine.step(1.0, &mut hooks).expect("letterboxed frame");
+    let translation = engine.translation().expect("mapping");
+    assert_eq!(translation.offset, (100.0, 0.0));
+    let root = scene_root_transform(&engine);
+    assert_eq!(root, translation.root_transform());
+    let index = overlay_nodes(&engine).first().copied().expect("overlay");
+    let overlay = &engine.render_scene().nodes[index];
+    assert_eq!(overlay.dst, RectF::new(0.0, 0.0, 8.0, 8.0));
+    assert_eq!(overlay.transform, translation.inverse_root_transform());
+    let composed = overlay.transform.to_affine().then(&root.to_affine());
+    assert_eq!(composed.transform_point((0.0, 0.0)), (0.0, 0.0));
 }
 
 #[test]

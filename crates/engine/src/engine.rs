@@ -10,9 +10,9 @@
 //! resized a window's primary layer), refresh the render-only overlay, upload
 //! dirty bitmaps, project the layer tree when it changed, run the
 //! after-projection hook with the emitted layer ids, reproject if that hook
-//! changed the scene, translate it into device pixels, and draw it with a
-//! single pipeline call. A size pair that cannot be fitted skips everything
-//! that draws.
+//! changed the scene, carry the VM→device presentation on the render scene
+//! root, and draw it with a single pipeline call. A size pair that cannot be
+//! fitted skips everything that draws.
 //!
 //! Nothing here reads a wall clock. [`Engine::frame`] takes the time and
 //! [`Engine::step`] adds a delta to the clock the engine already holds, so a
@@ -45,7 +45,7 @@ use crate::projection::{ProjectionReport, project_scene_report};
 use crate::scene::Scene;
 use crate::shader::{PipelineId, Program, ProgramDesc, ShaderError, ShaderId, ShaderLibrary};
 use crate::timer::TimerState;
-use crate::translate::{PixelTranslation, TranslateError, translate_render_scene};
+use crate::translate::{PixelTranslation, TranslateError};
 
 /// The bottom objects and initial state [`Engine::new`] assembles into an
 /// [`Engine`].
@@ -145,7 +145,9 @@ pub trait EngineOverlay {
 
     /// Returns the overlay node, in device/framebuffer coordinates.
     ///
-    /// The engine sets its parent to the render scene root.
+    /// The engine sets its parent to the render scene root and replaces its
+    /// transform with the inverse of the presentation root transform, so the
+    /// node's `dst` and rectangle clip stay in device pixels.
     fn node(&self) -> RenderNode;
 }
 
@@ -561,8 +563,9 @@ impl Engine {
     /// The order is the frame contract: set the clock, fit the presentation,
     /// fire due timers, run the upward hook, fit the presentation again (the
     /// hook may have resized a window's primary layer), then refresh the
-    /// overlay, upload, project, translate and draw. A size pair that cannot be
-    /// fitted skips everything that draws and reports no frame statistics.
+    /// overlay, upload, project, apply the presentation root transform and
+    /// draw. A size pair that cannot be fitted skips everything that draws and
+    /// reports no frame statistics.
     fn advance(
         &mut self,
         now_ms: u64,
@@ -767,12 +770,12 @@ impl Engine {
     /// projected nodes' own allocations are touched. The revision is `None`
     /// until the first projection, so the first frame always projects.
     ///
-    /// The tree is projected in VM pixels and then translated into device
-    /// pixels, which is why a changed presentation also invalidates it (via
-    /// `render_scene_revision = None`). The overlay is attached after the
-    /// translation because it is already in device coordinates. Nothing is
-    /// rebuilt while the two sizes cannot be fitted; the frame path draws
-    /// nothing in that case.
+    /// The tree is projected in VM pixels and the render scene root carries the
+    /// presentation transform, which is why a changed presentation also
+    /// invalidates it (via `render_scene_revision = None`). The overlay is
+    /// authored in device coordinates, so it is attached with the inverse root
+    /// transform. Nothing is rebuilt while the two sizes cannot be fitted; the
+    /// frame path draws nothing in that case.
     fn reproject_render_scene(&mut self) {
         let revision = self.scene.structure_revision();
         if self.render_scene_revision == Some(revision) {
@@ -794,8 +797,11 @@ impl Engine {
         self.render_scene.background = projected.background;
         self.render_scene.nodes.extend(projected.nodes);
 
-        translate_render_scene(&mut self.render_scene, &translation);
-        self.attach_overlay();
+        let root = self.render_scene.root;
+        if let Some(root_node) = self.render_scene.node_mut(root) {
+            root_node.transform = translation.root_transform();
+        }
+        self.attach_overlay(&translation);
         self.render_scene_revision = Some(revision);
     }
 
@@ -862,17 +868,18 @@ impl Engine {
     /// Appends the overlay as the last child of the render scene root.
     ///
     /// The projection clears and refills the arena, so the overlay node is
-    /// re-added after every rebuild and never on a skipped one. The overlay is
-    /// attached after the tree has been translated, so its node stays in
-    /// device coordinates; its texture is stable across refreshes, so the node
-    /// needs no refresh here.
-    fn attach_overlay(&mut self) {
+    /// re-added after every rebuild and never on a skipped one. The node is
+    /// authored in device pixels, so its transform is set to the inverse of the
+    /// presentation root transform; its texture is stable across refreshes, so
+    /// the node needs no refresh here.
+    fn attach_overlay(&mut self, translation: &PixelTranslation) {
         let Some(overlay) = self.overlay.as_ref() else {
             return;
         };
         let root = self.render_scene.root;
         let mut node = overlay.node();
         node.parent = Some(root);
+        node.transform = translation.inverse_root_transform();
         let id = self.render_scene.push(node);
         if let Some(root_node) = self.render_scene.node_mut(root) {
             root_node.children.push(id);
@@ -911,6 +918,9 @@ impl Engine {
     }
 
     /// Returns the most recently projected render tree.
+    ///
+    /// The nodes keep VM-space coordinates; the root carries the presentation
+    /// transform that maps them into device pixels.
     pub fn render_scene(&self) -> &RenderScene {
         &self.render_scene
     }

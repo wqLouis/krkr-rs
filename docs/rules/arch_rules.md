@@ -231,8 +231,13 @@ The mapping is owned by L2 (`engine::translate::PixelTranslation`): a uniform
 is the only presentation rule** — there is no mode enum and no scaling
 configuration key on any launcher.
 
-* The translation is applied inside L2's projection and readback. At `s == 1`
-  it is the identity, so the reference is matched exactly.
+* The translation is carried as one transform on the projected render-scene
+  root; L1 composes it during traversal. The projected nodes keep VM
+  coordinates. At `s == 1` it is the identity, so the reference is matched
+  exactly.
+* **L1 never interprets the VM semantics.** It receives the VM-space tree and
+  the root transform, and writes device pixels; it does not name the
+  translation as a VM/device rule.
 * **L3 never sees the translation.** An L3 native must not call
   `to_device_*` / `to_vm_point` / `raster_scale`, must not name a device
   pixel, and must not import `PixelTranslation`.

@@ -357,19 +357,22 @@ in [`docs/arch/l2.md`](docs/arch/l2.md) §4 and the frame contract in
   deleted rather than adapted. Contract:
   [`docs/arch/l2.md`](docs/arch/l2.md) §4.
 - **D40 — a pixel-translation layer in L2 separates VM pixels from device
-  pixels.** L3 and scripts speak VM pixels; L1 speaks device pixels; L2 owns
-  the Fit mapping at the L2↔L3 boundary and applies it when projecting and
-  reading back. The framebuffer is the single device-resolution backing; a VM
+  pixels.** L3 and scripts speak VM pixels; L2 owns the Fit mapping and
+  computes one root transform for the projected render tree. L1 receives that
+  tree and composes the root transform during traversal; it never interprets
+  VM semantics. The framebuffer is the single device-resolution backing; a VM
   pixel read samples its device region. At `s == 1` the mapping is the
   identity; script-observable values stay VM and reference-exact (D34).
   Contract: [`docs/arch/l2.md`](docs/arch/l2.md) §4 and
   [`docs/code/engine/translate.md`](docs/code/engine/translate.md).
 - **D41 — the VM↔device translation is embedded in L2; L3 never sees it.**
-  Every L2 render/pixel method takes VM coordinates and applies the current
-  `PixelTranslation` internally. L3 natives keep their VM-coordinate contract:
-  they must not call `to_device_*`/`to_vm_point`/`raster_scale`, name a device
-  pixel, or import `PixelTranslation`. The composition root passes platform
-  input through an L2 mapping method; L3 receives only VM events.
+  Every L2 readback method takes VM coordinates and resolves them through the
+  current `PixelTranslation`; the projected render tree keeps VM coordinates
+  and carries the mapping on its root transform. L3 natives keep their
+  VM-coordinate contract: they must not call
+  `to_device_*`/`to_vm_point`/`raster_scale`, name a device pixel, or import
+  `PixelTranslation`. The composition root passes platform input through an L2
+  mapping method; L3 receives only VM events.
 
 ---
 
@@ -526,7 +529,7 @@ Two-sided tests:
     design; identify through real members or the L2 `Scene`.
 12. Loading is explicit (`--archive`, repeatable; later wins). There is **no** folder scan in the reference (D15), but D35 adds one opt-in exception: a directory-only launch (`--base-dir`/positional dir, no `--archive`) mounts every `*.xp3` found recursively (`engine::storage::discover_archives`).
 13. The frame is L2's: `GameHost::step` must not accumulate a `now_ms` or call the subsystem pumps itself. Pass events through `Engine::step(dt, hooks)`; the hook is `VmHook` (VM tick + audio drain). `compat::run_frame_body` starts by draining the timer posts the engine already produced; it must not call `TimerState::advance`.
-14. VM pixels are not device pixels, and the logical screen is not the window client. Layer rects, bitmap dimensions, `Font.size`, `getPixel` and `System.screenWidth` are the logical screen (the primary layer); `Window.innerWidth`/`innerHeight` are the window client; the framebuffer is device space. Only `engine::translate::PixelTranslation` names both. An OS resize changes the framebuffer only — never write it back into the scene window; a script window-size change goes the other way through `Engine::take_window_resize`, and the translation fits the unchanged screen into the new client.
+14. VM pixels are not device pixels, and the logical screen is not the window client. Layer rects, bitmap dimensions, `Font.size`, `getPixel` and `System.screenWidth` are the logical screen (the primary layer); `Window.innerWidth`/`innerHeight` are the window client; the framebuffer is device space. Only `engine::translate::PixelTranslation` names both; the render tree keeps VM coordinates and carries the Fit mapping on its root transform, which L1 composes without interpreting it. An OS resize changes the framebuffer only — never write it back into the scene window; a script window-size change goes the other way through `Engine::take_window_resize`, and the translation fits the unchanged screen into the new client.
 
 ---
 

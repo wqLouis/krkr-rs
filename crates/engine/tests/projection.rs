@@ -9,7 +9,6 @@ use std::rc::Rc;
 
 use api::blend::{BlendMode, DstBlend};
 use api::geometry::{PixelRegion, RectF};
-use engine::translate::translate_render_scene;
 use engine::{
     BitmapState, Engine, EngineOverlay, EngineParts, GameFrame, PixelTranslation, Rect, Scene,
     TransitionFrame, TransitionSource, compose_layer, project_scene, project_window,
@@ -843,13 +842,13 @@ fn textureless_parent_clips_a_child_outside_its_rect() {
 }
 
 /// A child inside the container keeps the ancestor clip; the projection emits
-/// the clip in VM pixels so `translate_render_scene` can scale it.
+/// the clip in VM pixels and the presentation root transform scales it.
 ///
 /// Reference: `r ∩ Rect` (`reference/cpp/core/visual/LayerIntf.cpp:7138-7140`)
 /// and the child intersection (`:7184-7185`); the clip is the parent's absolute
 /// rect for a child that lies wholly inside it.
 #[test]
-fn textureless_parent_clip_is_emitted_and_translated() {
+fn textureless_parent_clip_is_emitted_in_vm_pixels() {
     let mut scene = Scene::default();
     let win = scene.add_window("t", (320, 240));
     let parent = scene.add_layer(win, None);
@@ -873,15 +872,21 @@ fn textureless_parent_clip_is_emitted_and_translated() {
     );
 
     let translation = PixelTranslation::fit((100, 100), (200, 200)).expect("fit");
-    translate_render_scene(&mut projected, &translation);
+    let root = projected.root;
+    projected.node_mut(root).expect("root").transform = translation.root_transform();
     let node = drawable_nodes(&projected)
         .into_iter()
         .next()
         .expect("the child draws");
     assert_eq!(
         node.clip,
-        Some(Clip::Rect(RectF::new(20.0, 20.0, 40.0, 40.0))),
-        "a rectangle clip is in VM pixels and is scaled"
+        Some(Clip::Rect(RectF::new(10.0, 10.0, 20.0, 20.0))),
+        "a rectangle clip stays in VM pixels"
+    );
+    assert_eq!(
+        projected.node(root).expect("root").transform,
+        translation.root_transform(),
+        "the root carries the presentation"
     );
 }
 

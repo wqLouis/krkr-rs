@@ -7,18 +7,19 @@
 //! `min(device / vm)` per axis plus a centred offset, so the whole game
 //! surface is visible and the leftover margin stays clear.
 //!
-//! The mapping is applied to the projected tree by
-//! [`translate_render_scene`]. Input and readback travel the other way: a
-//! pointer position becomes a VM point with [`PixelTranslation::to_vm_point`],
-//! and one VM pixel resolves to the device pixels that cover it with
-//! [`PixelTranslation::vm_pixel_region`].
+//! The mapping is carried by the projected tree's root node: every node keeps
+//! its VM-space `dst` and rectangle clip and the root's transform applies the
+//! Fit mapping when the tree is drawn. The render-only overlay is authored in
+//! device pixels and cancels the root with its inverse transform. Input and
+//! readback travel the other way: a pointer position becomes a VM point with
+//! [`PixelTranslation::to_vm_point`], and one VM pixel resolves to the device
+//! pixels that cover it with [`PixelTranslation::vm_pixel_region`].
 //!
 //! Both sizes are passed in; nothing here reads a platform value or keeps
 //! global state. A size pair that cannot produce a mapping is a typed error
 //! rather than a substituted default.
 
-use api::geometry::{PixelRegion, RectF};
-use render::{Clip, RenderScene};
+use api::geometry::{PixelRegion, RectF, Transform2D};
 
 /// A size pair that cannot produce a uniform fit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -110,6 +111,33 @@ impl PixelTranslation {
         RectF::new(x, y, r.width * self.scale, r.height * self.scale)
     }
 
+    /// The root node transform that maps the projected VM tree into device
+    /// pixels.
+    ///
+    /// The transform scales uniformly by [`PixelTranslation::scale`] and then
+    /// translates by the centred [`PixelTranslation::offset`], so every
+    /// projected node keeps its VM `dst` and rectangle clip.
+    pub fn root_transform(&self) -> Transform2D {
+        Transform2D {
+            translate: self.offset,
+            scale: (self.scale, self.scale),
+            ..Transform2D::IDENTITY
+        }
+    }
+
+    /// The inverse of [`PixelTranslation::root_transform`].
+    ///
+    /// A node authored in device pixels, such as the render-only overlay,
+    /// carries this transform so the root's presentation leaves it where it
+    /// was authored.
+    pub fn inverse_root_transform(&self) -> Transform2D {
+        Transform2D {
+            translate: (-self.offset.0 / self.scale, -self.offset.1 / self.scale),
+            scale: (self.scale.recip(), self.scale.recip()),
+            ..Transform2D::IDENTITY
+        }
+    }
+
     /// Maps a point from device pixels back to VM pixels.
     ///
     /// This is the exact inverse of [`PixelTranslation::to_device_point`].
@@ -158,23 +186,5 @@ impl PixelTranslation {
         let start = start.min(device.saturating_sub(1));
         let width = width.min(device.saturating_sub(start));
         (start, width)
-    }
-}
-
-/// Rewrites a projected tree from VM pixels into device pixels.
-///
-/// Every node's `dst` and every rectangle clip is mapped. A mask clip and a
-/// node's `src` sub-rectangle address texture pixels, which are already in
-/// their own space, so they are left alone. At an identity mapping the tree is
-/// unchanged.
-pub fn translate_render_scene(scene: &mut RenderScene, translation: &PixelTranslation) {
-    if translation.is_identity() {
-        return;
-    }
-    for node in &mut scene.nodes {
-        node.dst = translation.to_device_rect(node.dst);
-        if let Some(Clip::Rect(clip)) = node.clip.as_mut() {
-            *clip = translation.to_device_rect(*clip);
-        }
     }
 }

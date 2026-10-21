@@ -1,5 +1,5 @@
-//! Tests for the VM-pixel → device-pixel translation and the projected-tree
-//! rewrite.
+//! Tests for the VM-pixel → device-pixel translation and the presentation root
+//! transform.
 //!
 //! The uniform Fit-with-letterbox presentation is the documented extension
 //! (D34/D39): the reference presents the VM surface at its own size and has no
@@ -7,8 +7,7 @@
 //! the extension rather than reference behaviour. The layer placements fed
 //! through it stay reference-compatible.
 
-use api::geometry::{PixelRegion, RectF};
-use engine::translate::translate_render_scene;
+use api::geometry::{PixelRegion, RectF, Transform2D};
 use engine::{PixelTranslation, TranslateError};
 use render::{
     Clip, PipelineConfig, RenderContent, RenderNode, RenderScene, Texture, TextureDesc,
@@ -180,23 +179,29 @@ fn scene_with_clips(texture: Texture) -> RenderScene {
 }
 
 #[test]
-fn translating_a_tree_maps_destinations_and_rect_clips_only() {
+fn a_root_transform_maps_the_vm_tree_into_device_pixels() {
     let pipeline = create_render_pipeline(PipelineConfig::null()).expect("null pipeline");
     let texture = create_texture(&pipeline, TextureDesc::new(8, 8)).expect("texture");
     let mut scene = scene_with_clips(texture.clone());
     let translation = PixelTranslation::fit((100, 100), (200, 300)).expect("fit");
 
-    translate_render_scene(&mut scene, &translation);
+    let root = scene.root;
+    scene.node_mut(root).expect("root").transform = translation.root_transform();
 
     let solid = &scene.nodes[1];
-    assert_eq!(solid.dst, RectF::new(20.0, 90.0, 200.0, 100.0));
+    assert_eq!(
+        solid.dst,
+        RectF::new(10.0, 20.0, 100.0, 50.0),
+        "a destination stays in VM pixels"
+    );
     assert_eq!(
         solid.clip,
-        Some(Clip::Rect(RectF::new(20.0, 70.0, 40.0, 40.0)))
+        Some(Clip::Rect(RectF::new(10.0, 10.0, 20.0, 20.0))),
+        "a rectangle clip stays in VM pixels"
     );
 
     let masked = &scene.nodes[2];
-    assert_eq!(masked.dst, RectF::new(0.0, 50.0, 16.0, 16.0));
+    assert_eq!(masked.dst, RectF::new(0.0, 0.0, 8.0, 8.0));
     assert_eq!(
         masked.src,
         PixelRegion::new(1, 2, 4, 4),
@@ -207,17 +212,49 @@ fn translating_a_tree_maps_destinations_and_rect_clips_only() {
         Some(Clip::Mask(texture)),
         "a mask clip is texture space"
     );
+
+    let device = translation.to_device_rect(solid.dst);
+    let origin = scene
+        .node(root)
+        .expect("root")
+        .transform
+        .to_affine()
+        .transform_point((solid.dst.x, solid.dst.y));
+    assert_eq!(
+        (origin.0, origin.1),
+        (device.x, device.y),
+        "the root transform draws the VM rectangle at its device position"
+    );
 }
 
 #[test]
-fn translating_a_tree_at_identity_changes_nothing() {
+fn an_identity_root_transform_changes_nothing() {
     let pipeline = create_render_pipeline(PipelineConfig::null()).expect("null pipeline");
     let texture = create_texture(&pipeline, TextureDesc::new(8, 8)).expect("texture");
     let mut scene = scene_with_clips(texture);
     let before = scene.clone();
     let identity = PixelTranslation::fit((100, 100), (100, 100)).expect("fit");
 
-    translate_render_scene(&mut scene, &identity);
+    let root = scene.root;
+    scene.node_mut(root).expect("root").transform = identity.root_transform();
 
+    assert_eq!(identity.root_transform(), Transform2D::IDENTITY);
+    assert_eq!(identity.inverse_root_transform(), Transform2D::IDENTITY);
     assert_eq!(scene, before);
+}
+
+#[test]
+fn the_overlay_inverse_cancels_the_root_transform() {
+    let translation = PixelTranslation::fit((100, 100), (200, 300)).expect("fit");
+    let composed = translation
+        .inverse_root_transform()
+        .to_affine()
+        .then(&translation.root_transform().to_affine());
+    for point in [(0.0, 0.0), (10.0, 20.0), (100.0, 100.0)] {
+        let drawn = composed.transform_point(point);
+        assert!(
+            (drawn.0 - point.0).abs() < 1e-3 && (drawn.1 - point.1).abs() < 1e-3,
+            "{point:?} authored in device pixels drew at {drawn:?}"
+        );
+    }
 }

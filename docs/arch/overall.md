@@ -140,9 +140,10 @@ form's client size). The engine keeps that split and adds the device space
 on top.
 
 **Only L2 names more than one of them.** `engine::translate::PixelTranslation`
-owns the VM↔device mapping; L3 never sees a device coordinate and L1 never
-sees a VM coordinate. Every value a script can observe stays in VM pixels and
-reference-exact. See [`l2.md`](l2.md) §4.
+owns the VM↔device mapping; L3 never sees a device coordinate, and L1
+receives the VM-space render tree with an opaque root transform but never
+interprets the VM semantics. Every value a script can observe stays in VM
+pixels and reference-exact. See [`l2.md`](l2.md) §4.
 
 ---
 
@@ -161,7 +162,8 @@ Engine::frame(now_ms, hooks)
   ├─ fit the presentation again                → a script may have resized
   ├─ refresh the render-only overlay
   ├─ upload dirty bitmaps; prune stale textures
-  ├─ project the L2 scene into the device-space RenderScene
+  ├─ project the L2 scene into the VM-space RenderScene
+  ├─ put the Fit presentation on the render-scene root
   ├─ hooks.after_project(drawn_layers)        → self-updating transitions
   ├─ upload + project again if the hook changed the scene
   └─ one L1 RenderPipeline::render call

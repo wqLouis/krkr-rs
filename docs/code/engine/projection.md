@@ -160,10 +160,10 @@ project_scene_report(scene, |id| textures.get(&id).cloned())
       └─► drawn_layers: Vec<u32>
                 │
                 ▼
-      translate_render_scene(&mut render_scene, &translation)
+      root.transform = PixelTranslation::root_transform()
                 │
                 ▼
-      RenderScene (device pixels) ──► render::render(...)
+      RenderScene (VM pixels, Fit root) ──► render::render(...)
 ```
 
 ---

@@ -24,8 +24,8 @@ audits are archived in `docs.old/`. Every item was verified against the tree.
    the L3 load wiring are complete: loads probe synchronously, queue the
    decode, resolve at every pixel seam or the frame barrier, and enter the
    decoded-image cache under the load key. Residuals are in §18 (the
-   synchronous colour-key/province paths, the `GdiPlus.Image` cache gap and
-   the Android verification); the pixel-translation follow-up is §19.
+   synchronous province path and the Android verification); the
+   pixel-translation follow-up is §19.
 3. **The in-game menu form** (§5) — the largest compatibility blocker.
 4. **Android device verification** (§14) — one real title run with its log
    captured is the release condition (D36).
@@ -407,15 +407,32 @@ The six earlier failures are closed:
 * a deferred decode enters the decoded-image cache, and the startup log adds
   the pool's decode count and time to the synchronous codec counters.
 
+Landed in this follow-up:
+
+* Colour-keyed loads defer like unkeyed ones: the key runs as a worker
+  pass, the keyed pixels enter the cache, and a repeated load is a hit.
+* Province loads allocate first, tile a smaller image up to the main size, and
+  deallocate on failure, matching `LayerIntf.cpp:2893-2914` and
+  `GraphicsLoaderIntf.cpp:980-1031` / `:1092-1112`.
+* `GdiPlus.Image` loads through the decoded-image cache, and
+  `Layer.drawImage*` accepts an `Image` argument with its rotate/flip applied.
+
 Remaining:
 
-* Colour-keyed and province loads stay synchronous by design; they apply a
-  pass over the decoded pixels and never enter the pool.
-* `GdiPlus.Image` (`layer_ex`'s own image payload) still decodes through the
-  host codec synchronously and does not enter the decoded-image cache.
-* `Layer.drawImage*` accepts a `Layer`/`Bitmap` rather than the reference's
-  `GdiPlus.Image`; that widening is what created the pending-source path and
-  is a compatibility surface change of its own.
+* Province loads stay synchronous: the plane's raw read seams (`getProvincePixel`,
+  `provinceImageBuffer*`, layer hit-testing) take `&Scene`, so making them wait
+  would require every read path to become mutable and would turn the deferral
+  into a frame pause. A full-colour or colour-keyed load has one owning bitmap,
+  which is why it can defer. The reference's province load is synchronous, so
+  this is not a compatibility gap.
+* The province loader still decodes RGBA and takes the red channel; the
+  reference decodes `glmPalettized` and rejects true-colour sources, so a
+  palettized source's plane index is not reproduced yet. The cache key also
+  omits the desired main size (output is identical; only LRU/accounting).
+  These are recorded residual gaps, not silent fallbacks.
+* `Layer.drawImage*` also accepts the compatibility `Layer`/`Bitmap` shapes
+  in addition to the reference's `GdiPlus.Image`; that widening created the
+  pending-source path and is a compatibility surface change of its own.
 * The Android pacing and `AHardwareBuffer` readback paths are uncompiled and
   unverified on a device (no NDK host); one NDK build remains required.
 * The pool's counters are cumulative from pool creation; the app merges them
@@ -448,9 +465,17 @@ capability on the existing offscreen `RenderTarget` API (never as a change to
 the reference members). `raster_scale` is deferred until the GPU text path is
 production.
 
-The per-node `dst`/clip bake and the docs' "root transform" wording are
-equivalent today (uniform scale + translation, identity node transforms) but
-diverge once a node carries a VM-space transform. The reference has no
-per-layer affine, so this is a design-contract cleanup, not a reference gap;
-if a live transform is ever added, move the mapping to a root `Affine2` and
-re-home the device-space overlay instead of scaling each node independently.
+The per-node `dst`/clip bake is gone. The presentation is one transform on the
+projected render-scene root: `PixelTranslation::root_transform()` returns
+`Transform2D { scale: (s, s), translate: offset }`, which L1 already composes
+during traversal. The render-only overlay carries the inverse transform so its
+authored device pixels stay put. No L1 API change was needed, and `Affine2`
+remains the backend's internal expansion of `Transform2D`; a full matrix field
+would be over-general for a Fit-only mapping.
+
+The remaining readback question is unchanged: `vm_pixel_region(x, y)` is the
+device region a VM pixel covers, but no reference read addresses the presented
+frame, so it stays unused rather than changing `getPixel`/`piledCopy`/
+`saveLayerImage`. A device-resolution capture is a separate additive capability
+on the offscreen `RenderTarget` API; `raster_scale` is deferred until the GPU
+text path is production.
