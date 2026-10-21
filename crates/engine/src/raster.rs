@@ -72,6 +72,12 @@ pub fn blend_pixel_at(pixel: &mut [u8; 4], color: [u8; 4], coverage: u8, opa: u8
     if alpha == 0 {
         return;
     }
+    // An opaque source replaces the destination exactly; the general
+    // straight-alpha source-over below evaluates to this same pixel.
+    if alpha == 255 {
+        *pixel = color;
+        return;
+    }
     let inv = 255u32 - u32::from(alpha);
     let old_a = u32::from(pixel[3]);
     let out_a = u32::from(alpha) + old_a * inv / 255;
@@ -123,15 +129,27 @@ pub fn fill_rect_replace(bitmap: &mut BitmapState, x: i32, y: i32, w: u32, h: u3
         return;
     }
     let width = bitmap.width as usize;
+    let row_bytes = (x1 - x0) as usize * 4;
+    let buffer_len = bitmap.rgba.len();
     for py in y0..y1 {
-        let row = py as usize * width;
-        for px in x0..x1 {
-            let Some(i) = (row + px as usize).checked_mul(4) else {
-                continue;
-            };
-            if let Some(destination) = bitmap.rgba.get_mut(i..i + 4) {
-                destination.copy_from_slice(&color);
-            }
+        let Some(start) = (py as usize)
+            .checked_mul(width)
+            .and_then(|row| row.checked_add(x0 as usize))
+            .and_then(|offset| offset.checked_mul(4))
+        else {
+            continue;
+        };
+        let Some(end) = start.checked_add(row_bytes) else {
+            continue;
+        };
+        // A row is one contiguous run of pixels, so it is written as a whole
+        // slice. A run that reaches past the buffer ends at the buffer's end:
+        // the pixels that fit are written, the rest keep their own color.
+        let Some(destination) = bitmap.rgba.get_mut(start..end.min(buffer_len)) else {
+            continue;
+        };
+        for pixel in destination.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&color);
         }
     }
     bitmap.mark_dirty();

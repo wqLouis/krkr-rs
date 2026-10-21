@@ -278,10 +278,10 @@ fn mp4_aac_streaming_read_matches_whole_file() {
 /// The FFmpeg backend decodes the MP4/AAC fixture into the format the
 /// container declares.
 ///
-/// The backend is the fallback for a track the built-in decoder cannot
-/// handle (an AAC track with the SBR extension, whose decoder has no SBR
-/// synthesis). It materializes the whole track, so the caller owns every
-/// decoded sample.
+/// The backend is the desktop build's first choice (an AAC track with the
+/// SBR extension, whose built-in decoder has no SBR synthesis, only decodes
+/// at the rate the container declares through it). It materializes the whole
+/// track, so the caller owns every decoded sample.
 ///
 /// The container's priming is removed: an AAC track is encoded with a delay
 /// of a frame or more, and the container says how many samples it is (the
@@ -312,11 +312,43 @@ fn the_ffmpeg_backend_decodes_the_mp4_aac_fixture() {
     assert!(decoded.interleaved.iter().all(|sample| sample.is_finite()));
 }
 
+/// The FFmpeg backend decodes the OGG/Vorbis fixture into the format the
+/// container declares.
+///
+/// The backend is the desktop build's first choice, so the track it decodes
+/// carries the rate and the channel count the container declares. It
+/// materializes the whole track, so the caller owns every decoded sample.
+///
+/// The encoder's delay and the padding of the last block shift the frame
+/// count a little either way: 0.2 s at 44.1 kHz is ~8,820 frames.
+#[cfg(feature = "video-ffmpeg")]
+#[test]
+fn the_ffmpeg_backend_decodes_the_ogg_fixture() {
+    let media = Media::new();
+    let decoded = decode_audio_ffmpeg(&media, Arc::from(OGG_SINE), Some("tone.ogg"))
+        .expect("the ffmpeg backend decodes the track");
+    assert_eq!(decoded.spec.sample_rate, 44_100);
+    assert_eq!(decoded.spec.channels, 1);
+    let frames = decoded.frame_count();
+    assert!(
+        (8_000..=10_500).contains(&frames),
+        "0.2 s at 44.1 kHz is ~8,820 frames, the encoder's delay and padding \
+         shift the count, got {frames}"
+    );
+    let peak = decoded
+        .interleaved
+        .iter()
+        .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+    assert!(peak > 0.1, "expected audible samples, peak was {peak}");
+    assert!(decoded.interleaved.iter().all(|sample| sample.is_finite()));
+}
+
 /// The FFmpeg backend decodes a container the built-in decoder has no reader
 /// for.
 ///
-/// The AU container is the proof that the fallback is reachable: the built-in
-/// decoder has no AU reader, so the track can only be decoded by FFmpeg.
+/// The AU container is the proof that the backend reaches a track the
+/// built-in decoder cannot read at all: the built-in decoder has no AU
+/// reader, so the track can only be decoded by FFmpeg.
 #[cfg(feature = "video-ffmpeg")]
 #[test]
 fn the_ffmpeg_backend_decodes_a_container_the_builtin_decoder_has_no_reader_for() {

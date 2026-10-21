@@ -7,13 +7,12 @@
 //! render targets, which is the correctness baseline for
 //! destination-dependent blends and pixel readback.
 
-use std::collections::HashMap;
-
 use api::error::RenderError;
 use api::geometry::PixelRegion;
 use api::host::{Presentation, SurfaceEvent};
 use raw_window_handle::RawWindowHandle;
 
+use crate::collections::Map;
 use crate::cpu::{CpuTexture, TextureProvider};
 use crate::effect::EffectPipeline;
 use crate::render_target::{RenderTarget, RenderTargetDesc};
@@ -201,8 +200,7 @@ impl NullRenderPipeline {
             textures,
             ..
         } = null;
-        if let std::collections::hash_map::Entry::Vacant(entry) = render_targets.entry(target.key())
-        {
+        if let hashbrown::hash_map::Entry::Vacant(entry) = render_targets.entry(target.key()) {
             let desc = *target.desc();
             let total = usize::try_from(desc.byte_len()).map_err(|_| RenderError::OutOfMemory {
                 message: "render target is too large for the host address space".to_owned(),
@@ -309,9 +307,9 @@ pub(crate) struct NullState {
     /// Number of frames rendered through this state.
     pub(crate) frame_index: u64,
     /// CPU storage per texture identity.
-    pub(crate) textures: HashMap<u64, NullImage>,
+    pub(crate) textures: Map<u64, NullImage>,
     /// CPU storage per offscreen render-target identity.
-    pub(crate) render_targets: HashMap<u64, NullRenderTarget>,
+    pub(crate) render_targets: Map<u64, NullRenderTarget>,
     /// Counters from the most recent frame.
     pub(crate) last_frame: Option<FrameStats>,
     /// Vulkan call timings from the most recent frame; all zero because the
@@ -326,7 +324,7 @@ pub(crate) struct NullRenderTarget {
     pub(crate) pixels: Vec<u8>,
 }
 
-impl TextureProvider for HashMap<u64, NullImage> {
+impl TextureProvider for Map<u64, NullImage> {
     fn texture(&self, key: u64) -> Option<CpuTexture<'_>> {
         self.get(&key).map(|image| CpuTexture {
             pixels: &image.pixels,

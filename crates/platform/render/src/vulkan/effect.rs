@@ -29,8 +29,6 @@
 //! cached per target format.
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
-
 use ash::vk;
 use ash::vk::Handle;
 
@@ -42,6 +40,7 @@ use api::shader::{
 
 use super::pipelines;
 use super::texture::{VulkanTexture, find_memory_type};
+use crate::collections::Map;
 use crate::effect::{EffectPipeline, RenderEffect};
 use crate::texture::Texture;
 
@@ -85,7 +84,7 @@ const POOL_SETS: u32 = (MAX_SETS_PER_PIPELINE + MAX_PENDING_SETS_PER_PIPELINE + 
 /// Effect pipelines, their samplers and the frame's uniform ring.
 pub(crate) struct EffectState {
     /// Pipelines keyed by [`EffectPipeline::key`].
-    pipelines: HashMap<u64, EffectPipelineEntry>,
+    pipelines: Map<u64, EffectPipelineEntry>,
     /// Host-visible uniform storage, one slot per frame in flight.
     ring: UniformRing,
     /// One sampler per sampler kind this build serves, created once.
@@ -93,7 +92,7 @@ pub(crate) struct EffectState {
     /// A kind this build does not serve has no entry, and a draw that names
     /// one is refused with [`RenderError::Unsupported`] rather than sampled
     /// with another kind's sampler.
-    samplers: HashMap<SamplerKind, vk::Sampler>,
+    samplers: Map<SamplerKind, vk::Sampler>,
     /// Ring slot the recording in flight writes its uniforms into.
     current_slot: usize,
     /// Frame slot of the live frame being recorded.
@@ -121,7 +120,7 @@ struct EffectPipelineEntry {
     /// Pool backing this pipeline's cached descriptor sets.
     pool: vk::DescriptorPool,
     /// Graphics pipeline per render pass, built on first use in that pass.
-    pipelines: HashMap<u64, vk::Pipeline>,
+    pipelines: Map<u64, vk::Pipeline>,
     /// Descriptor sets cached per texture tuple.
     sets: SetCache,
     /// Descriptor sets that left the cache and cannot be freed yet.
@@ -148,7 +147,7 @@ struct CachedSet {
 /// changing keeps drawing instead of failing on an exhausted pool.
 struct SetCache {
     /// Cached sets by texture tuple.
-    entries: HashMap<[u64; MAX_EFFECT_TEXTURES], CachedSet>,
+    entries: Map<[u64; MAX_EFFECT_TEXTURES], CachedSet>,
     /// Counter that orders the entries by recency.
     clock: u64,
     /// Number of sets the cache holds.
@@ -159,7 +158,7 @@ impl SetCache {
     /// Creates a cache that holds `capacity` sets.
     fn new(capacity: usize) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: Map::default(),
             clock: 0,
             capacity,
         }
@@ -279,7 +278,7 @@ pub(crate) struct EffectDrawContext<'a> {
     /// Render pass the command buffer is inside.
     pub(crate) render_pass: vk::RenderPass,
     /// Uploaded textures keyed by texture identity.
-    pub(crate) textures: &'a HashMap<u64, VulkanTexture>,
+    pub(crate) textures: &'a Map<u64, VulkanTexture>,
     /// Column-major matrix mapping the unit quad to normalised device space.
     pub(crate) mvp: [f32; 16],
     /// Composed draw opacity, written into the declared opacity word.
@@ -303,7 +302,7 @@ impl EffectState {
         offset_alignment: vk::DeviceSize,
     ) -> Result<Self, RenderError> {
         let ring = UniformRing::create(device, memory_properties, offset_alignment)?;
-        let mut samplers: HashMap<SamplerKind, vk::Sampler> = HashMap::new();
+        let mut samplers: Map<SamplerKind, vk::Sampler> = Map::default();
         for kind in [
             SamplerKind::LinearClamp,
             SamplerKind::LinearRepeat,
@@ -327,7 +326,7 @@ impl EffectState {
             }
         }
         Ok(Self {
-            pipelines: HashMap::new(),
+            pipelines: Map::default(),
             ring,
             samplers,
             current_slot: 0,
@@ -427,7 +426,7 @@ impl EffectState {
                 set_layout,
                 layout,
                 pool,
-                pipelines: HashMap::new(),
+                pipelines: Map::default(),
                 sets: SetCache::new(MAX_SETS_PER_PIPELINE),
                 retired: Vec::new(),
             },
@@ -671,9 +670,9 @@ struct SetInputs<'a> {
     /// Frame uniform ring the block binding points at.
     ring: &'a UniformRing,
     /// Samplers by kind.
-    samplers: &'a HashMap<SamplerKind, vk::Sampler>,
+    samplers: &'a Map<SamplerKind, vk::Sampler>,
     /// Uploaded textures.
-    textures: &'a HashMap<u64, VulkanTexture>,
+    textures: &'a Map<u64, VulkanTexture>,
 }
 
 /// Allocates and writes one cached descriptor set for a texture tuple.

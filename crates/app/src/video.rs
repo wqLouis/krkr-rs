@@ -30,7 +30,6 @@
 #![allow(unsafe_code)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -50,6 +49,9 @@ struct OpenStream {
     decoder: VideoDecoderState,
 }
 
+/// The open decoders, keyed by the storage path they were opened from.
+type StreamMap = hashbrown::HashMap<String, OpenStream, ahash::RandomState>;
+
 /// The source's shared decoder cache.
 struct Inner {
     /// The stateless L1 media backend.
@@ -59,7 +61,7 @@ struct Inner {
     /// Start-up counters shared with the composition root.
     stats: Rc<StartupStats>,
     /// Open decoders, keyed by the storage path they were opened from.
-    streams: HashMap<String, OpenStream>,
+    streams: StreamMap,
 }
 
 impl Inner {
@@ -193,7 +195,7 @@ pub(crate) unsafe fn install_video_source_metered(
             media: media.clone(),
             storage: storage as *const Storage,
             stats: Rc::clone(stats),
-            streams: HashMap::new(),
+            streams: StreamMap::default(),
         })),
     };
     set_video_source(&ctx, Box::new(source.clone()));

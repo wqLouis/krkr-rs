@@ -2,6 +2,7 @@
 //!
 //! Relocated from the inline `#[cfg(test)]` module in `src/scene.rs`.
 
+use api::geometry::PixelRegion;
 use engine::Scene;
 
 /// The real title scene's stack z-values (system_status.tjs:
@@ -946,4 +947,72 @@ fn first_layer_is_a_window_sized_primary() {
     scene.layer_mut(child).unwrap().bitmap = Some(bitmap);
     scene.layer_mut(child).unwrap().hit_threshold = 0;
     assert_eq!(scene.layer_at(child, 1, 1, false, false), Some(child));
+}
+
+/// A rectangle mark accumulates into the bitmap's dirty region, and a whole
+/// mark overrides it.
+///
+/// The dirty region is what the frame's upload sends to the texture: a
+/// bitmap that changed in a rectangle uploads that rectangle alone, while a
+/// bitmap that changed wholly uploads every pixel.
+#[test]
+fn a_dirty_region_accumulates_and_a_whole_mark_overrides_it() {
+    let mut bitmap = engine::BitmapState::new(16, 16, vec![0u8; 16 * 16 * 4]);
+    assert!(!bitmap.dirty, "a new bitmap is clean");
+
+    bitmap.mark_dirty_rect(PixelRegion::new(1, 2, 3, 4));
+    assert!(bitmap.dirty, "a rectangle marks the bitmap dirty");
+    assert_eq!(
+        bitmap.dirty_region,
+        Some(PixelRegion::new(1, 2, 3, 4)),
+        "the first rectangle is the whole region"
+    );
+
+    bitmap.mark_dirty_rect(PixelRegion::new(10, 10, 2, 2));
+    assert_eq!(
+        bitmap.dirty_region,
+        Some(PixelRegion::new(1, 2, 11, 10)),
+        "two rectangles mark the union of the two"
+    );
+
+    bitmap.mark_dirty();
+    assert!(bitmap.dirty, "a whole mark marks the bitmap dirty");
+    assert_eq!(bitmap.dirty_region, None, "a whole mark covers every pixel");
+}
+
+/// A rectangle that covers no pixel of the bitmap marks nothing, and a
+/// cleaned bitmap starts its next region with the rectangle it is given.
+#[test]
+fn a_rectangle_outside_the_bitmap_marks_nothing() {
+    let mut bitmap = engine::BitmapState::new(4, 4, vec![0u8; 4 * 4 * 4]);
+    bitmap.mark_dirty_rect(PixelRegion::new(10, 10, 2, 2));
+    assert!(
+        !bitmap.dirty,
+        "a rectangle outside the bitmap changes nothing"
+    );
+    assert_eq!(bitmap.dirty_region, None);
+
+    // A cleaned bitmap has no region, so the next rectangle starts one.
+    let mut scene = Scene::default();
+    let id = scene.add_bitmap(4, 4, vec![0u8; 4 * 4 * 4]);
+    scene
+        .bitmap_mut(id)
+        .expect("bitmap")
+        .mark_dirty_rect(PixelRegion::new(1, 1, 2, 2));
+    scene.set_bitmap_clean(id);
+    let bitmap = scene.bitmap(id).expect("bitmap");
+    assert!(!bitmap.dirty, "a cleaned bitmap is clean");
+    assert_eq!(bitmap.dirty_region, None, "a clean bitmap has no region");
+
+    scene
+        .bitmap_mut(id)
+        .expect("bitmap")
+        .mark_dirty_rect(PixelRegion::new(2, 2, 1, 1));
+    let bitmap = scene.bitmap(id).expect("bitmap");
+    assert!(bitmap.dirty);
+    assert_eq!(
+        bitmap.dirty_region,
+        Some(PixelRegion::new(2, 2, 1, 1)),
+        "the rectangle after a clean starts the region"
+    );
 }

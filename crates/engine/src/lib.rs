@@ -47,6 +47,12 @@ pub use crate::imagedecode::{
     DecodePool, DecodePoolConfig, DecodePoolError, ImageDecodeError, ImageDecoder, ImageOutcome,
     ImageSizeError, ImageState, JobId, PendingImage,
 };
+// The storage read pool and the pending-read future.
+pub use crate::storage::{
+    ArchiveBacking, ArchiveSource, FileSystemReader, PendingStorage, StorageJob, StorageKey,
+    StorageOutcome, StoragePoolConfig, StoragePoolError, StoragePoolStats, StorageReadPool,
+    StorageReader,
+};
 pub use crate::translate::{PixelTranslation, TranslateError};
 // Curated crate root. The
 // pixel primitives, blend-type numbering and TVP constants stay reachable

@@ -10,7 +10,7 @@ use std::rc::Rc;
 use api::blend::{BlendMode, DstBlend};
 use api::geometry::{PixelRegion, RectF};
 use engine::{
-    BitmapState, Engine, EngineOverlay, EngineParts, GameFrame, PixelTranslation, Rect, Scene,
+    BitmapState, Engine, EngineOverlay, EngineParts, GameFrame, Map, PixelTranslation, Rect, Scene,
     TransitionFrame, TransitionSource, compose_layer, project_scene, project_window,
     project_window_report, resolve_blend,
 };
@@ -1095,7 +1095,7 @@ fn clearing_a_transition_frame_returns_the_main_image() {
 fn composite_frame_offscreen(scene: &Scene, window: u32, width: u32, height: u32) -> Vec<u8> {
     let pipeline = create_render_pipeline(PipelineConfig::null()).expect("null pipeline");
     let (_surface, mut state) = begin_render_state(&pipeline, &headless_window()).expect("begin");
-    let mut textures: std::collections::HashMap<u32, Texture> = std::collections::HashMap::new();
+    let mut textures: Map<u32, Texture> = Map::default();
     let report = project_window_report(scene, window, |id| {
         if let Some(texture) = textures.get(&id) {
             return Some(texture.clone());

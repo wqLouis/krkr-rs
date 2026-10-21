@@ -11,8 +11,6 @@
 //! [`RenderError::Unsupported`](api::error::RenderError::Unsupported).
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
-
 use ash::vk;
 
 use api::error::RenderError;
@@ -21,6 +19,7 @@ use api::geometry::{Affine2, RectF};
 use super::pipelines::{PipelineSet, Program};
 use super::texture::VulkanTexture;
 use crate::MAX_TRAVERSAL_DEPTH;
+use crate::collections::Map;
 use crate::scene::{
     Clip, RenderContent, RenderNode, RenderNodeId, RenderScene, child_sort_key,
     children_are_sorted, node_spaces,
@@ -51,7 +50,7 @@ pub(crate) struct SceneDraw<'a> {
     /// Pipelines and the shared unit-quad vertex buffer.
     pub(crate) pipelines: &'a PipelineSet,
     /// Uploaded textures keyed by texture identity.
-    pub(crate) textures: &'a HashMap<u64, VulkanTexture>,
+    pub(crate) textures: &'a Map<u64, VulkanTexture>,
     /// Custom effect pipelines and the frame's uniform ring, when the caller
     /// has one. A scene with an effect draw and no state here is an error, not
     /// a skipped draw.
@@ -182,7 +181,7 @@ struct Recorder<'a> {
     device: &'a ash::Device,
     command: vk::CommandBuffer,
     pipelines: &'a PipelineSet,
-    textures: &'a HashMap<u64, VulkanTexture>,
+    textures: &'a Map<u64, VulkanTexture>,
     effects: Option<&'a mut super::effect::EffectState>,
     render_pass: vk::RenderPass,
     scene: &'a RenderScene,

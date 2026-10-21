@@ -1,5 +1,5 @@
-//! FFmpeg audio decode (Linux/desktop) — the fallback for a track the
-//! built-in decoder cannot handle.
+//! FFmpeg audio decode (Linux/desktop) — the desktop build's first choice
+//! for a track, ahead of the built-in decoder.
 //!
 //! The built-in decoder is symphonia, which has no SBR synthesis: an AAC
 //! track with the SBR extension (HE-AAC) is decoded at the core's rate while

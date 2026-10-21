@@ -24,12 +24,11 @@
 //! Hidden/empty layers and layers whose texture is missing are skipped,
 //! matching `sync_scene`.
 
-use std::collections::{HashMap, HashSet};
-
 use api::blend::BlendMode;
 use api::geometry::{PixelRegion, RectF};
 use render::{Clip, RenderContent, RenderEffect, RenderNode, RenderNodeId, RenderScene, Texture};
 
+use crate::hasher::{Map, Set, map, set};
 use crate::scene::{Rect, Scene, TransitionSource};
 
 /// Background clear colour used when a projected scene has no explicit one.
@@ -412,15 +411,15 @@ fn append_window<F>(
     // Per-window composition state, keyed by layer id. Both maps only ever
     // hold this window's layers, so a cross-window `parent` link simply misses
     // and stops the chain exactly like the old ancestor walk.
-    let mut composed: HashMap<u32, ComposedLayer> = HashMap::new();
+    let mut composed: Map<u32, ComposedLayer> = map();
     // Maps a layer id to the node its children should link to (its own node
     // when drawn, otherwise its nearest drawn ancestor).
-    let mut nearest: HashMap<u32, RenderNodeId> = HashMap::new();
+    let mut nearest: Map<u32, RenderNodeId> = map();
     // Descendants whose pixels are drawn through a cached ancestor, keyed by
     // the layer that owns the emitted cache bitmap.
-    let mut cache_owner: HashMap<u32, u32> = HashMap::new();
+    let mut cache_owner: Map<u32, u32> = map();
     // Cached layers whose node was actually emitted this pass.
-    let mut emitted_cached: HashSet<u32> = HashSet::new();
+    let mut emitted_cached: Set<u32> = set();
 
     // Why layers produced no node — a scene that renders almost nothing is
     // invisible from the outside (`RUST_LOG=debug` reports it).

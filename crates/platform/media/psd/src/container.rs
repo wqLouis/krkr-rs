@@ -5,10 +5,11 @@
 //! decompressed bytes stay available so chunk reads and string lookups can be
 //! answered from the same document.
 
-use std::collections::HashMap;
-
 use crate::decompress::{EmoteCtx, open_decompressed_stream};
 use crate::error::{PsbError, PsbResult};
+
+/// The container's string table, keyed by the string index.
+type StringMap = hashbrown::HashMap<u32, String, ahash::RandomState>;
 
 /// The `PSB\0` magic.
 const PSB_MAGIC: [u8; 4] = *b"PSB\0";
@@ -403,7 +404,7 @@ struct Parser<'a> {
     header: PsbHeader,
     names: Vec<String>,
     string_offsets: Vec<u32>,
-    strings: HashMap<u32, String>,
+    strings: StringMap,
     resources: Vec<ResourceRef>,
     extra_resources: Vec<ResourceRef>,
 }
@@ -733,7 +734,7 @@ pub fn parse(mut data: Vec<u8>, seed: i64) -> PsbResult<PsbDocument> {
         header,
         names: Vec::new(),
         string_offsets,
-        strings: HashMap::new(),
+        strings: StringMap::default(),
         resources: Vec::new(),
         extra_resources: Vec::new(),
     };

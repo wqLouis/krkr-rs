@@ -10,6 +10,7 @@ api = { workspace = true }
 thiserror = { workspace = true }
 flate2 = { workspace = true }
 ahash = { workspace = true }
+hashbrown = { workspace = true }
 
 [dev-dependencies]
 testkit = { workspace = true }

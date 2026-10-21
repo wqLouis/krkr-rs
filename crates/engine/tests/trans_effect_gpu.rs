@@ -12,14 +12,12 @@
 //! light. The reference below is the oracle's pixel put through that same
 //! composition.
 
-use std::collections::HashMap;
-
 use api::blend::BlendMode;
 use api::geometry::PixelRegion;
 use engine::shader::Program;
 use engine::shader::builtin;
 use engine::trans::{ScrollFrom, ScrollStay, Trans};
-use engine::{BitmapState, Rect, Scene, project_window_report};
+use engine::{BitmapState, Map, Rect, Scene, project_window_report};
 use render::{
     EffectPipeline, PipelineConfig, RenderContent, RenderPipeline, RenderScene, RenderState,
     RenderTargetDesc, Surface, Texture, TextureDesc, begin_render_state, create_effect_pipeline,
@@ -101,7 +99,7 @@ fn project(
     pipeline: &RenderPipeline,
     state: &mut RenderState,
 ) -> RenderScene {
-    let mut textures: HashMap<u32, Texture> = HashMap::new();
+    let mut textures: Map<u32, Texture> = Map::default();
     for bitmap in &scene.bitmaps {
         let Ok(texture) = create_texture(pipeline, TextureDesc::new(bitmap.width, bitmap.height))
         else {

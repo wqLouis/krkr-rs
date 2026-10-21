@@ -23,10 +23,12 @@
 //!   vorbis, flac, mp3, mp4/aac) plus the Ogg Opus adapter, with header-only
 //!   probing and an explicit caller-owned [`AudioDecoderState`]. The desktop
 //!   build links FFmpeg as well, and [`decode_audio_ffmpeg`] decodes a whole
-//!   track with it — the fallback for a track symphonia cannot handle (an
-//!   AAC track with the SBR extension, whose decoder has no SBR synthesis).
-//!   The Android build links no FFmpeg; there the platform's AAC decoder
-//!   does the same job (`decode_audio_mediacodec`).
+//!   track with it — the desktop build's first choice, ahead of the built-in
+//!   decoder, which has no SBR synthesis and therefore reports an AAC track
+//!   with the SBR extension instead of decoding it at the rate the
+//!   container declares. The Android build links no FFmpeg; there the
+//!   built-in decoder comes first and the platform's AAC decoder
+//!   (`decode_audio_mediacodec`) is the fallback.
 //! * **Video** — the `present_video`/`video_audio` surface over an explicit
 //!   [`VideoDecoderState`]. On Linux the FFmpeg backend (`video-ffmpeg`)
 //!   demuxes in memory, converts frames to tightly packed

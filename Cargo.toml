@@ -53,6 +53,10 @@ flate2 = "1"
 # Fast, non-cryptographic hashing for the storage/engine lookup maps. Used with
 # fixed seeds so iteration order stays stable across runs.
 ahash = "0.8"
+# Hash containers for the lookup tables: `hashbrown`'s maps and sets, keyed
+# with `ahash`. The Swiss-table layout keeps the same API as
+# `std::collections` and hashes faster than SipHash.
+hashbrown = "0.17"
 # Script text decoding: `chardetng` detects the charset of BOM-less
 # legacy-encoded scripts (the maintained successor of the reference's uchardet
 # detector) and `encoding_rs` performs the bulk decode from the reported

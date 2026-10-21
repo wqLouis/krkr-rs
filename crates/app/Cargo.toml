@@ -17,6 +17,8 @@ fs = { workspace = true }
 raw-window-handle = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+ahash = { workspace = true }
+hashbrown = { workspace = true }
 # The composition root owns the process logger (`RUST_LOG`, default `info`).
 env_logger = { workspace = true }
 # The composition root installs the L3 compat host seams (image codec, etc.).

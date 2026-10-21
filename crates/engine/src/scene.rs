@@ -14,13 +14,14 @@
 //! binds ([`Scene::effect_pipelines`]); the handle is a value the projection
 //! passes on, not a service the scene calls.
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use api::blend::BlendMode;
 use api::config::CacheLimit;
+use api::geometry::PixelRegion;
 use api::media::DecodedImage;
 
+use crate::hasher::{Map, Set, map, set};
 use crate::imagedecode::{ImageOutcome, ImageSizeError, PendingImage};
 use crate::shader::{EffectDraw, EffectPipelines};
 use crate::trans::Trans;
@@ -56,7 +57,7 @@ pub struct WindowState {
     /// The focused layer of each registered domain, when one is set. A
     /// domain absent from the map has no focus, exactly like a manager whose
     /// `FocusedLayer` is null (`reference/cpp/core/visual/LayerManager.h:483-490`).
-    pub domain_focus: HashMap<u32, u32>,
+    pub domain_focus: Map<u32, u32>,
     /// Render order, back -> front.
     pub layers: Vec<u32>,
 }
@@ -384,6 +385,13 @@ pub struct BitmapState {
     pub name: Option<String>,
     /// Set when contents changed; the L1 pipeline re-uploads on true.
     pub dirty: bool,
+    /// The part of the bitmap that changed since the last upload.
+    ///
+    /// `None` means every pixel changed and the upload sends them all;
+    /// `Some(region)` means only that rectangle changed, and the upload
+    /// sends its pixels alone. The region matters only while the bitmap is
+    /// dirty.
+    pub dirty_region: Option<PixelRegion>,
     /// True when a script `Bitmap` object owns this id (created through the
     /// `Bitmap` natives). A layer's MainImage can reference such a bitmap, so
     /// destroying the layer must not free it while the script object can
@@ -415,6 +423,7 @@ impl BitmapState {
             rgba,
             name: None,
             dirty: false,
+            dirty_region: None,
             script_owned: false,
             content_generation: 0,
             pending: None,
@@ -425,6 +434,32 @@ impl BitmapState {
     /// relying on a renderer-specific upload mechanism.
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
+        self.dirty_region = None;
+        self.content_generation = self.content_generation.wrapping_add(1);
+    }
+
+    /// Mark a rectangle of the bitmap as changed.
+    ///
+    /// The rectangle is clipped to the bitmap's bounds; one that covers no
+    /// pixel marks nothing. The marked region accumulates: a second
+    /// rectangle widens it to the union of the two. A bitmap that is already
+    /// fully dirty stays fully dirty, and a clean bitmap starts a new
+    /// region with this rectangle.
+    pub fn mark_dirty_rect(&mut self, rect: PixelRegion) {
+        let whole = PixelRegion::new(0, 0, self.width, self.height);
+        let Some(clipped) = rect.intersection(&whole) else {
+            return;
+        };
+        let region = match self.dirty_region {
+            Some(current) => current.union(&clipped),
+            // A clean bitmap has no region yet, so the rectangle starts one.
+            None if !self.dirty => clipped,
+            // A dirty bitmap without a region is fully dirty.
+            None => whole,
+        };
+        self.dirty = true;
+        // A region that covers the whole bitmap is the same as no region.
+        self.dirty_region = if region == whole { None } else { Some(region) };
         self.content_generation = self.content_generation.wrapping_add(1);
     }
 
@@ -811,7 +846,7 @@ impl Scene {
             primary_layer: None,
             focused_layer: None,
             focus_domains: Vec::new(),
-            domain_focus: HashMap::new(),
+            domain_focus: map(),
             layers: Vec::new(),
         });
         self.touch_structure();
@@ -1306,6 +1341,18 @@ impl Scene {
         self.invalidate_layer_cache(id);
         self.touch_structure();
         self.layer_mut_untracked(id)
+    }
+
+    /// Set a layer's script-visible `imageModified` flag without
+    /// invalidating its cached subtree or the structure revision.
+    ///
+    /// The layer's image content changed, not its tree shape; the bitmap's own
+    /// dirty flag drives the texture upload, so a full reprojection would only
+    /// repeat work the upload already covers.
+    pub fn mark_layer_image_modified(&mut self, id: u32) {
+        if let Some(layer) = self.layer_mut_untracked(id) {
+            layer.image_modified = true;
+        }
     }
 
     /// Apply `f` to a layer and invalidate only when `f` reports a change.
@@ -1836,7 +1883,7 @@ impl Scene {
         }
         // Merge the parent links and the maintained child lists into one
         // adjacency map; either source alone can be stale.
-        let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut children_of: Map<u32, Vec<u32>> = map();
         for layer in &self.layers {
             if let Some(parent) = layer.parent {
                 children_of.entry(parent).or_default().push(layer.id);
@@ -1848,7 +1895,7 @@ impl Scene {
                     .extend(layer.children.iter().copied());
             }
         }
-        let mut doomed: HashSet<u32> = HashSet::new();
+        let mut doomed: Set<u32> = set();
         let mut stack = vec![id];
         while let Some(current) = stack.pop() {
             if !doomed.insert(current) {
@@ -2388,6 +2435,7 @@ impl Scene {
             rgba,
             name: None,
             dirty: true,
+            dirty_region: None,
             script_owned: false,
             content_generation: 0,
             pending: None,
@@ -2432,6 +2480,7 @@ impl Scene {
             rgba: Vec::new(),
             name: None,
             dirty: true,
+            dirty_region: None,
             script_owned: false,
             content_generation: 0,
             pending: Some(pending),
@@ -2460,7 +2509,8 @@ impl Scene {
     /// The bitmap takes the probed `width` x `height` and no pixels: the
     /// decode result lands in it when [`Scene::resolve_bitmap`] runs. A
     /// pending decode the bitmap already carries is cancelled, because the
-    /// new one supersedes it.
+    /// new one supersedes it — unless it is the same decode, or another
+    /// bitmap waits for it.
     ///
     /// Returns whether the bitmap was present.
     pub fn set_pending_image(
@@ -2470,10 +2520,19 @@ impl Scene {
         height: u32,
         pending: PendingImage,
     ) -> bool {
+        // The decode the bitmap carries is superseded by the new one. The
+        // same decode installed again is not a new one, and a decode another
+        // bitmap waits for is not this bitmap's to cancel.
+        let previous = self.bitmap(id).and_then(|bitmap| bitmap.pending.clone());
+        let cancel_previous = previous.as_ref().is_some_and(|previous| {
+            !pending.same_decode(previous) && !self.another_bitmap_waits_for(previous, id)
+        });
         let Some(bitmap) = self.bitmap_mut_untracked(id) else {
             return false;
         };
-        if let Some(previous) = bitmap.pending.take() {
+        if let Some(previous) = bitmap.pending.take()
+            && cancel_previous
+        {
             previous.cancel();
         }
         bitmap.width = width;
@@ -2501,6 +2560,39 @@ impl Scene {
     /// The pending image of a bitmap, or `None` when it holds its pixels.
     pub fn pending_image(&self, id: u32) -> Option<&PendingImage> {
         self.bitmap(id).and_then(|bitmap| bitmap.pending.as_ref())
+    }
+
+    /// The decode already running for `key`, when the scene holds one.
+    ///
+    /// The lookup covers every bitmap that still carries a pending decode, so
+    /// a load of an image whose decode has not finished shares that decode
+    /// instead of reading and decoding the same bytes a second time. The
+    /// size is the probed size of the image and the pending image is a clone
+    /// of the shared future: every holder waits for the same decode and sees
+    /// the same pixels.
+    pub fn pending_decode_for(&self, key: &DecodedImageKey) -> Option<(u32, u32, PendingImage)> {
+        self.bitmaps.iter().find_map(|bitmap| {
+            let pending = bitmap.pending.as_ref()?;
+            if !pending.fills_cache_entry(key) {
+                return None;
+            }
+            Some((bitmap.width, bitmap.height, pending.clone()))
+        })
+    }
+
+    /// Whether a bitmap other than `except` waits for the same decode.
+    ///
+    /// A decode can be shared: several bitmaps carry a clone of the same
+    /// future and the pixels land in all of them. Cancelling it while
+    /// another bitmap waits would leave that bitmap without pixels.
+    fn another_bitmap_waits_for(&self, pending: &PendingImage, except: u32) -> bool {
+        self.bitmaps.iter().any(|bitmap| {
+            bitmap.id != except
+                && bitmap
+                    .pending
+                    .as_ref()
+                    .is_some_and(|other| other.same_decode(pending))
+        })
     }
 
     /// Waits for one bitmap's pending image and installs its pixels.
@@ -2921,7 +3013,11 @@ impl Scene {
             return false;
         }
         if let Some(pending) = pending {
-            pending.cancel();
+            // Another bitmap may wait for the same decode: the pixels land
+            // in it too, so the decode stays alive.
+            if !self.another_bitmap_waits_for(&pending, id) {
+                pending.cancel();
+            }
         }
         self.bitmap_index.clear();
         for (index, bitmap) in self.bitmaps.iter().enumerate() {
@@ -3188,7 +3284,8 @@ impl Scene {
     /// `false` when the bitmap is gone.
     ///
     /// A pending decode is cancelled: the replaced image supersedes it, and
-    /// a waiter on it sees the cancellation instead of the stale pixels.
+    /// a waiter on it sees the cancellation instead of the stale pixels. A
+    /// decode another bitmap waits for is left alone.
     pub fn replace_bitmap_image(
         &mut self,
         id: u32,
@@ -3196,13 +3293,23 @@ impl Scene {
         height: u32,
         rgba: Vec<u8>,
     ) -> bool {
-        let Some(previous) = self.bitmap(id).map(|bitmap| (bitmap.width, bitmap.height)) else {
+        let current = self
+            .bitmap(id)
+            .map(|bitmap| ((bitmap.width, bitmap.height), bitmap.pending.clone()));
+        let Some((previous, pending)) = current else {
             return false;
         };
+        // The decode the bitmap carries is superseded by the replaced image,
+        // unless another bitmap waits for the same decode.
+        let cancel_pending = pending
+            .as_ref()
+            .is_some_and(|pending| !self.another_bitmap_waits_for(pending, id));
         let Some(bitmap) = self.bitmap_mut(id) else {
             return false;
         };
-        if let Some(pending) = bitmap.pending.take() {
+        if let Some(pending) = bitmap.pending.take()
+            && cancel_pending
+        {
             pending.cancel();
         }
         bitmap.width = width;
@@ -3422,23 +3529,48 @@ impl Scene {
         }
     }
 
-    /// Clear a bitmap's [`BitmapState::dirty`] flag without bumping either
-    /// revision. Called by the projection after a texture upload; the flag is
-    /// backend bookkeeping, not a scene change.
+    /// Clear a bitmap's [`BitmapState::dirty`] flag and its
+    /// [`BitmapState::dirty_region`] without bumping either revision. Called
+    /// by the projection after a texture upload; the flag is backend
+    /// bookkeeping, not a scene change.
     pub fn set_bitmap_clean(&mut self, id: u32) -> bool {
+        let Some(bitmap) = self.bitmap_record_mut(id) else {
+            return false;
+        };
+        bitmap.dirty = false;
+        bitmap.dirty_region = None;
+        true
+    }
+
+    /// Marks a bitmap's dirty region as the whole bitmap.
+    ///
+    /// The frame's upload sends every pixel of a bitmap whose texture was
+    /// just created, because the rest of a new texture is undefined until
+    /// its first copy. Marking the bitmap wholly keeps a retry of that
+    /// upload whole as well.
+    pub fn mark_bitmap_whole(&mut self, id: u32) -> bool {
+        let Some(bitmap) = self.bitmap_record_mut(id) else {
+            return false;
+        };
+        bitmap.dirty_region = None;
+        true
+    }
+
+    /// The bitmap record with the given id, for mutation.
+    ///
+    /// The id-indexed lookup is the fast path; the scan covers a bitmap whose
+    /// index entry is missing.
+    fn bitmap_record_mut(&mut self, id: u32) -> Option<&mut BitmapState> {
         let index = self.bitmap_index.get(&id).copied();
         if let Some(index) = index
-            && let Some(bitmap) = self.bitmaps.get_mut(index)
-            && bitmap.id == id
+            && self
+                .bitmaps
+                .get(index)
+                .is_some_and(|bitmap| bitmap.id == id)
         {
-            bitmap.dirty = false;
-            return true;
+            return self.bitmaps.get_mut(index);
         }
-        if let Some(bitmap) = self.bitmaps.iter_mut().find(|b| b.id == id) {
-            bitmap.dirty = false;
-            return true;
-        }
-        false
+        self.bitmaps.iter_mut().find(|b| b.id == id)
     }
 
     /// Add a font record (`face`, pixel `height`, RGBA `color`) and return
@@ -3514,7 +3646,7 @@ impl Scene {
         // discovered during the walk below). The old implementation re-scanned
         // the entire layer table for every layer, which made this O(n²); the
         // index makes it a single O(n) pass plus the sibling sorts below.
-        let mut all_children: HashMap<Option<u32>, Vec<u32>> = HashMap::new();
+        let mut all_children: Map<Option<u32>, Vec<u32>> = map();
         for layer in self
             .layers
             .iter()
@@ -3539,7 +3671,7 @@ impl Scene {
         self.sort_siblings(&mut roots, &root_order);
 
         let mut order = Vec::new();
-        let mut visited = HashSet::new();
+        let mut visited = set();
         for id in roots {
             self.append_layer_subtree(window, id, &all_children, &mut order, &mut visited);
         }
@@ -3571,11 +3703,10 @@ impl Scene {
             ids.sort_by_key(|&id| self.layer(id).map_or(0, |l| l.z_order));
             return;
         }
-        let position: HashMap<u32, usize> = maintained
-            .iter()
-            .enumerate()
-            .map(|(index, &id)| (id, index))
-            .collect();
+        let mut position: Map<u32, usize> = map();
+        for (index, &id) in maintained.iter().enumerate() {
+            position.insert(id, index);
+        }
         // Resolve each id's sort key once (an O(1) layer lookup) instead of
         // re-resolving it on every comparison. The key includes `id`, so all
         // keys are unique and an unstable sort is deterministic.
@@ -3597,9 +3728,9 @@ impl Scene {
         &self,
         window: u32,
         id: u32,
-        all_children: &HashMap<Option<u32>, Vec<u32>>,
+        all_children: &Map<Option<u32>, Vec<u32>>,
         order: &mut Vec<u32>,
-        visited: &mut HashSet<u32>,
+        visited: &mut Set<u32>,
     ) {
         let Some(layer) = self.layer(id) else { return };
         if layer.window != window || layer.shutdown || !visited.insert(id) {
@@ -3614,7 +3745,10 @@ impl Scene {
             // A child exists in the parent index but is missing from the
             // maintained `children` list: merge it in. The common case (both
             // lists agree) skips the set allocation entirely.
-            let mut seen: HashSet<u32> = children.iter().copied().collect();
+            let mut seen: Set<u32> = set();
+            for &child in children.iter() {
+                seen.insert(child);
+            }
             for &child in children_of {
                 if seen.insert(child) {
                     children.push(child);

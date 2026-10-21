@@ -1,7 +1,10 @@
 //! Fixed-seed ahash maps for the engine's lookup tables.
 
-/// A `HashMap` keyed with the engine's fixed-seed hasher.
-pub type Map<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
+/// A `HashMap` keyed with `ahash`'s `RandomState`.
+pub type Map<K, V> = hashbrown::HashMap<K, V, ahash::RandomState>;
+
+/// A `HashSet` keyed with `ahash`'s `RandomState`.
+pub(crate) type Set<T> = hashbrown::HashSet<T, ahash::RandomState>;
 
 /// The engine's hasher. Fixed seeds keep hashing deterministic across runs;
 /// `ahash`'s default `RandomState` is randomized per process.
@@ -17,4 +20,9 @@ pub(crate) fn hasher() -> ahash::RandomState {
 /// An empty map using [`hasher`].
 pub(crate) fn map<K, V>() -> Map<K, V> {
     Map::with_hasher(hasher())
+}
+
+/// An empty set using [`hasher`].
+pub(crate) fn set<T>() -> Set<T> {
+    Set::with_hasher(hasher())
 }

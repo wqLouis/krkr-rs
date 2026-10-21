@@ -25,6 +25,13 @@
 //! ([`MountOptions::preload_archives`]); the image is owned by this layer and
 //! a borrow of it is handed to L1 for every entry read.
 //!
+//! The bytes of an entry are read on a worker pool
+//! ([`StorageReadPool`]): a lookup answers the entry's existence and its size
+//! without reading the bytes, the raw read and the archive decompression run
+//! on a worker, and the data access waits for that read. The pool is this
+//! layer's own state — it is installed on the storage and drained by the
+//! engine every frame — and there is no process-global registry.
+//!
 //! Resolution order mirrors the reference engine:
 //!
 //! 1. explicit `arc.xp3>path` addressing,
@@ -37,10 +44,12 @@
 //!    bounded component-wise case-insensitive walk.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::error::FsError;
 use api::fs::{FsPath, OpenMode};
@@ -62,19 +71,31 @@ struct MountedArchive {
     /// Where the archive's bytes are read from.
     backing: ArchiveBacking,
     /// Parsed index.
-    archive: Xp3Archive,
+    archive: Arc<Xp3Archive>,
 }
 
 /// Where a mounted archive's bytes are read from.
 ///
 /// The bytes are owned by the storage; the stateless L1 reader is handed the
-/// backing on every entry read and never holds it.
-enum ArchiveBacking {
+/// backing on every entry read and never holds it. The backing is shared, so
+/// a worker thread can read an entry of a mounted archive while the frame
+/// thread reads another one.
+#[derive(Clone)]
+pub enum ArchiveBacking {
     /// The archive file stays open and each entry read is positional.
-    Stream(FileState),
+    Stream(Arc<FileState>),
     /// The whole archive file was read into memory at mount; entry reads copy
     /// from this image.
-    Memory(Vec<u8>),
+    Memory(Arc<[u8]>),
+}
+
+/// A mounted archive's index together with the bytes it reads from.
+#[derive(Clone)]
+pub struct ArchiveSource {
+    /// The archive's parsed index.
+    pub archive: Arc<Xp3Archive>,
+    /// Where the archive's bytes come from.
+    pub backing: ArchiveBacking,
 }
 
 /// Options controlling how [`Storage`] mounts archives.
@@ -130,6 +151,20 @@ pub struct Storage {
     /// Lazily built resolver tables, invalidated when the auto-path list or
     /// the mounted archives change.
     resolution_cache: RefCell<ResolutionCache>,
+    /// The worker pool the entry reads run on, or `None` when every read runs
+    /// on the calling thread.
+    ///
+    /// The pool is this layer's own state: it holds the worker threads, the
+    /// queue, the in-flight reads and the drained results. The engine drains
+    /// it every frame, so a read the previous frame scheduled is published
+    /// before the next frame's script runs.
+    pub read_pool: Option<Arc<StorageReadPool>>,
+    /// The resolution generation the scheduled reads were made against.
+    ///
+    /// The generation changes whenever the mounts or the auto paths change,
+    /// so a read that was scheduled against an older resolution is never
+    /// served to a newer one.
+    generation: u64,
 }
 
 /// A resolved storage location.
@@ -474,7 +509,7 @@ pub enum MountError {
 }
 
 /// Errors while reading or listing storage entries.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum StorageReadError {
     /// The requested storage name did not resolve.
@@ -488,9 +523,835 @@ pub enum StorageReadError {
     /// A bottom file-system operation failed.
     #[error(transparent)]
     Fs(#[from] FsError),
-    /// An archive read failed.
+    /// An archive read failed; the message is the archive reader's own.
     #[error("archive error: {0}")]
-    Xp3(#[from] xp3::Xp3Error),
+    Xp3(String),
+    /// The read produced no result: the worker stopped before it published
+    /// one, or the read was cancelled.
+    #[error("the storage read produced no result: {message}")]
+    NoResult {
+        /// What the pool reported.
+        message: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// The storage read pool
+// ---------------------------------------------------------------------------
+
+/// The identity of one scheduled read.
+///
+/// A read is identified by the storage name it was made for, the number of
+/// bytes it wants and the resolution generation it was made against. The
+/// generation changes whenever the mounts or the auto paths change, so a read
+/// that was scheduled against an older resolution is never served to a newer
+/// one.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct StorageKey {
+    /// The storage name the read was made for.
+    name: String,
+    /// The number of bytes the read wants, or `None` for the whole entry.
+    limit: Option<usize>,
+    /// The resolution generation the read was made against.
+    generation: u64,
+}
+
+impl StorageKey {
+    /// The identity of a read of `name` that wants `limit` bytes.
+    ///
+    /// `limit` is `None` for the whole entry.
+    pub fn new(name: impl Into<String>, limit: Option<usize>, generation: u64) -> Self {
+        Self {
+            name: name.into(),
+            limit,
+            generation,
+        }
+    }
+
+    /// The storage name the read was made for.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// The work one scheduled read performs.
+#[derive(Clone)]
+pub enum StorageJob {
+    /// A file on the bottom file system.
+    Disk {
+        /// The bottom file system the file is read through.
+        fs: FileSystem,
+        /// The path of the file.
+        path: PathBuf,
+        /// The number of bytes to read, or `None` for the whole file.
+        limit: Option<usize>,
+    },
+    /// An entry of an archive.
+    Archive {
+        /// The bottom file system the archive is read through.
+        fs: FileSystem,
+        /// The mounted archive's index and bytes, or `None` when the archive
+        /// is not mounted and the worker opens it.
+        source: Option<ArchiveSource>,
+        /// The archive's path on the bottom file system.
+        path: PathBuf,
+        /// The normalized in-archive name.
+        in_arc: String,
+        /// The archive's logical name.
+        archive_name: String,
+        /// The number of bytes to read, or `None` for the whole entry.
+        limit: Option<usize>,
+    },
+}
+
+/// A resolved read: the work to perform and the sizes the resolution named.
+struct ReadPlan {
+    /// The work the read performs.
+    work: StorageJob,
+    /// The size of the entry, when the resolution could name it.
+    size: Option<u64>,
+    /// The number of bytes the read is charged against the pool's memory
+    /// limit.
+    charge: u64,
+}
+
+/// The backend that performs a scheduled read.
+///
+/// The implementation reads through the bottom file system; the middle layer
+/// owns the value and calls it. A reader is stateless and thread-safe: the
+/// pool calls it from several worker threads at once, so the implementation
+/// holds no per-call state.
+pub trait StorageReader: Send + Sync {
+    /// Reads the bytes the job names.
+    ///
+    /// A failure is the storage's own typed error; there is no substitute
+    /// value and no empty result.
+    fn read(&self, job: &StorageJob) -> Result<Vec<u8>, StorageReadError>;
+}
+
+/// The reader that reads through the bottom file system.
+///
+/// It is the default reader of the storage read pool: a disk file is read
+/// positionally and an archive entry through the archive's own backing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FileSystemReader;
+
+impl StorageReader for FileSystemReader {
+    fn read(&self, job: &StorageJob) -> Result<Vec<u8>, StorageReadError> {
+        match job {
+            StorageJob::Disk { fs, path, limit } => {
+                let read = match limit {
+                    Some(limit) => read_fs_file_prefix(fs, path, *limit),
+                    None => read_fs_file(fs, path),
+                };
+                read.map_err(StorageReadError::Fs)
+            }
+            StorageJob::Archive {
+                fs,
+                source,
+                path,
+                in_arc,
+                archive_name,
+                limit,
+            } => read_archive_entry(fs, source.as_ref(), path, in_arc, archive_name, *limit),
+        }
+    }
+}
+
+/// Reads an archive entry through the mounted archive's backing, or through a
+/// transient open when the archive is not mounted.
+fn read_archive_entry(
+    fs: &FileSystem,
+    source: Option<&ArchiveSource>,
+    path: &Path,
+    in_arc: &str,
+    archive_name: &str,
+    limit: Option<usize>,
+) -> Result<Vec<u8>, StorageReadError> {
+    if let Some(source) = source {
+        let read = match &source.backing {
+            ArchiveBacking::Stream(file) => match limit {
+                Some(limit) => source.archive.read_prefix_with_filter(
+                    fs,
+                    file,
+                    in_arc,
+                    archive_name,
+                    limit,
+                    None,
+                ),
+                None => source
+                    .archive
+                    .read_with_filter(fs, file, in_arc, archive_name, None),
+            },
+            ArchiveBacking::Memory(bytes) => {
+                let entry = source
+                    .archive
+                    .entry(in_arc)
+                    .ok_or_else(|| xp3_error(xp3::Xp3Error::NotFound(in_arc.to_string())))?;
+                match limit {
+                    Some(limit) => source.archive.read_entry_prefix_from_bytes(
+                        bytes,
+                        entry,
+                        archive_name,
+                        limit,
+                        None,
+                    ),
+                    None => source
+                        .archive
+                        .read_entry_from_bytes(bytes, entry, archive_name, None),
+                }
+            }
+        };
+        return read.map_err(xp3_error);
+    }
+    let file = fs::open(fs, &FsPath::host(path), OpenMode::Read).map_err(StorageReadError::Fs)?;
+    let archive = Xp3Archive::open(fs, &file).map_err(xp3_error)?;
+    match limit {
+        Some(limit) => archive
+            .read_prefix_with_filter(fs, &file, in_arc, archive_name, limit, None)
+            .map_err(xp3_error),
+        None => archive
+            .read_with_filter(fs, &file, in_arc, archive_name, None)
+            .map_err(xp3_error),
+    }
+}
+
+/// The bytes a read outcome holds.
+///
+/// A failed or cancelled read is the storage's own typed error; there is no
+/// substitute value and no empty result. A file that vanished between the
+/// resolution and the read is the same not-found the resolution reports.
+fn outcome_to_bytes(outcome: StorageOutcome, name: &str) -> Result<Vec<u8>, StorageReadError> {
+    match outcome {
+        StorageOutcome::Ready(bytes) => Ok((*bytes).clone()),
+        StorageOutcome::Failed(StorageReadError::Fs(FsError::NotFound { .. })) => {
+            Err(StorageReadError::NotFound(name.to_string()))
+        }
+        StorageOutcome::Failed(error) => Err(error),
+        StorageOutcome::Cancelled => Err(StorageReadError::NoResult {
+            message: "the read was cancelled before it produced a result".to_string(),
+        }),
+    }
+}
+
+/// Wraps an archive error in the storage's own typed error.
+///
+/// The archive reader's own message is kept, so a caller sees the same words
+/// a synchronous read would have produced.
+fn xp3_error(error: xp3::Xp3Error) -> StorageReadError {
+    StorageReadError::Xp3(error.to_string())
+}
+
+/// The result of a scheduled read.
+#[derive(Clone, Debug)]
+pub enum StorageOutcome {
+    /// The read produced these bytes.
+    Ready(Arc<Vec<u8>>),
+    /// The read failed; the error is the storage's own typed error.
+    Failed(StorageReadError),
+    /// The read was cancelled before it produced a result.
+    Cancelled,
+}
+
+impl StorageOutcome {
+    /// The number of bytes the outcome holds.
+    fn byte_len(&self) -> u64 {
+        match self {
+            StorageOutcome::Ready(bytes) => bytes.len() as u64,
+            StorageOutcome::Failed(_) | StorageOutcome::Cancelled => 0,
+        }
+    }
+}
+
+/// The result slot and the wake-up a pending read shares with its waiters.
+#[derive(Debug)]
+struct PendingShared {
+    /// The result slot; `None` while the read has not produced a result.
+    state: Mutex<Option<StorageOutcome>>,
+    /// Signalled when the slot leaves `None`.
+    ready: Condvar,
+}
+
+/// A read that has not produced its bytes yet.
+///
+/// The handle is created by [`StorageReadPool::submit`] and handed to the
+/// caller that scheduled the read. Every access to the bytes waits for it:
+/// the wait is on this read alone, never on the pool.
+#[derive(Clone, Debug)]
+pub struct PendingStorage {
+    /// The shared result slot and the wake-up.
+    shared: Arc<PendingShared>,
+    /// The size the lookup named for the entry.
+    size: Option<u64>,
+}
+
+impl PendingStorage {
+    /// Creates a pending read with no result yet.
+    fn new(size: Option<u64>) -> Self {
+        Self {
+            shared: Arc::new(PendingShared {
+                state: Mutex::new(None),
+                ready: Condvar::new(),
+            }),
+            size,
+        }
+    }
+
+    /// Creates a handle that already holds the bytes of the entry.
+    fn ready(bytes: Vec<u8>, size: Option<u64>) -> Self {
+        let pending = Self::new(size);
+        {
+            let mut state = lock(&pending.shared.state);
+            *state = Some(StorageOutcome::Ready(Arc::new(bytes)));
+        }
+        pending
+    }
+
+    /// The size the lookup named for the entry.
+    ///
+    /// `None` when the resolution could not name it: an archive that is not
+    /// mounted is opened by the worker, so its index is not known before the
+    /// read.
+    pub fn size(&self) -> Option<u64> {
+        self.size
+    }
+
+    /// Whether the read has produced a result.
+    pub fn is_ready(&self) -> bool {
+        lock(&self.shared.state).is_some()
+    }
+
+    /// The current result, without waiting.
+    pub fn outcome(&self) -> Option<StorageOutcome> {
+        lock(&self.shared.state).clone()
+    }
+
+    /// Waits until the read produced a result and returns it.
+    ///
+    /// The wait releases the lock while it sleeps, and a result published
+    /// between the check and the sleep is not missed.
+    pub fn await_outcome(&self) -> StorageOutcome {
+        let mut state = lock(&self.shared.state);
+        loop {
+            if let Some(outcome) = state.as_ref() {
+                return outcome.clone();
+            }
+            state = match self.shared.ready.wait(state) {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+    }
+
+    /// Cancels the read.
+    ///
+    /// A waiter sees [`StorageOutcome::Cancelled`] and a worker discards the
+    /// result it would have published. Returns whether the read was still
+    /// waiting.
+    pub fn cancel(&self) -> bool {
+        let mut state = lock(&self.shared.state);
+        if state.is_some() {
+            return false;
+        }
+        *state = Some(StorageOutcome::Cancelled);
+        self.shared.ready.notify_all();
+        true
+    }
+
+    /// Publishes the outcome when the read has not produced one yet.
+    fn complete(&self, outcome: StorageOutcome) -> bool {
+        let mut state = lock(&self.shared.state);
+        if state.is_some() {
+            return false;
+        }
+        *state = Some(outcome);
+        self.shared.ready.notify_all();
+        true
+    }
+}
+
+/// The pool's configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoragePoolConfig {
+    /// The number of worker threads.
+    pub workers: usize,
+    /// The maximum number of queued jobs.
+    pub queue_limit: usize,
+    /// The maximum number of bytes the pool may hold for the queued jobs and
+    /// the drained results.
+    pub memory_limit: u64,
+}
+
+impl Default for StoragePoolConfig {
+    fn default() -> Self {
+        Self {
+            workers: default_read_worker_count(),
+            queue_limit: 64,
+            memory_limit: 64 * 1024 * 1024,
+        }
+    }
+}
+
+/// The worker count the pool uses when nothing else is configured.
+///
+/// Two cores are left to the frame thread and the host, so the pool never
+/// competes with the renderer for them.
+fn default_read_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |count| count.get().saturating_sub(2))
+        .max(1)
+}
+
+/// The pool's failures.
+#[derive(Debug, thiserror::Error)]
+pub enum StoragePoolError {
+    /// A worker thread could not be started.
+    #[error("could not start a storage read worker: {message}")]
+    Worker {
+        /// The platform's message.
+        message: String,
+    },
+    /// The configuration is not usable.
+    #[error("the storage read pool configuration is invalid: {message}")]
+    Config {
+        /// What is wrong with the configuration.
+        message: String,
+    },
+    /// The queue is full.
+    #[error("the storage read pool queue holds its {limit} jobs")]
+    QueueFull {
+        /// The configured queue limit.
+        limit: usize,
+    },
+    /// The memory limit would be exceeded.
+    #[error("the storage read pool would exceed its memory limit of {limit} bytes")]
+    MemoryLimit {
+        /// The configured limit.
+        limit: u64,
+    },
+}
+
+/// The read accounting the pool keeps.
+///
+/// The counters are the number of reads the pool ran and the time they took.
+/// A worker updates them under the pool's own lock, so a counter never
+/// crosses a thread boundary: the thread that owns the pool reads the totals
+/// whenever it wants them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoragePoolStats {
+    /// The number of reads the pool ran.
+    pub reads: u64,
+    /// The accumulated time the pool spent reading.
+    pub elapsed: Duration,
+}
+
+/// One queued read.
+struct Job {
+    /// The handle the result is published into.
+    pending: PendingStorage,
+    /// The work the worker performs.
+    work: StorageJob,
+    /// The bytes this job holds against the pool's memory limit.
+    charged: u64,
+}
+
+/// The queue, the tables and the accounting the workers and the frame thread
+/// share.
+struct PoolState {
+    /// The jobs waiting for a worker.
+    queue: VecDeque<Job>,
+    /// The bytes the queued jobs hold.
+    queued_bytes: u64,
+    /// Whether the pool is shutting down.
+    stopping: bool,
+    /// The number of reads the pool ran.
+    reads: u64,
+    /// The accumulated time the workers spent reading.
+    read_time: Duration,
+    /// The reads that are in flight or finished but not yet drained.
+    pending: crate::hasher::Map<StorageKey, PendingStorage>,
+    /// The order the pending reads were scheduled in.
+    pending_order: VecDeque<StorageKey>,
+    /// The drained reads, ready to be taken.
+    completed: crate::hasher::Map<StorageKey, StorageOutcome>,
+    /// The order the drained reads were published in.
+    completed_order: VecDeque<StorageKey>,
+    /// The bytes the drained reads hold.
+    completed_bytes: u64,
+}
+
+/// The queue and the wake-up the workers and the frame thread share.
+struct PoolShared {
+    /// The pool's only lock.
+    state: Mutex<PoolState>,
+    /// Signalled when a job is queued or the pool stops.
+    wake: Condvar,
+}
+
+/// The worker pool that reads storage entries off the frame thread.
+///
+/// The pool owns its worker threads, its queue, its byte accounting and the
+/// reads it has in flight. It is middle-layer state: the engine drains it
+/// every frame and the compatibility layer schedules reads through the
+/// storage it is installed on.
+pub struct StorageReadPool {
+    /// The queue and the tables the workers and the frame thread share.
+    shared: Arc<PoolShared>,
+    /// The worker threads, joined when the pool drops.
+    workers: Vec<JoinHandle<()>>,
+    /// The configuration the pool was started with.
+    config: StoragePoolConfig,
+}
+
+impl StorageReadPool {
+    /// Starts the pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoragePoolError::Config`] when the configuration asks for no
+    /// worker or no queue, and [`StoragePoolError::Worker`] when a thread
+    /// cannot be started.
+    pub fn new(
+        reader: Arc<dyn StorageReader>,
+        config: StoragePoolConfig,
+    ) -> Result<Self, StoragePoolError> {
+        if config.workers == 0 {
+            return Err(StoragePoolError::Config {
+                message: "the pool needs at least one worker".to_string(),
+            });
+        }
+        if config.queue_limit == 0 {
+            return Err(StoragePoolError::Config {
+                message: "the pool needs a queue of at least one job".to_string(),
+            });
+        }
+        let shared = Arc::new(PoolShared {
+            state: Mutex::new(PoolState {
+                queue: VecDeque::new(),
+                queued_bytes: 0,
+                stopping: false,
+                reads: 0,
+                read_time: Duration::ZERO,
+                pending: crate::hasher::map(),
+                pending_order: VecDeque::new(),
+                completed: crate::hasher::map(),
+                completed_order: VecDeque::new(),
+                completed_bytes: 0,
+            }),
+            wake: Condvar::new(),
+        });
+        let mut workers = Vec::with_capacity(config.workers);
+        for index in 0..config.workers {
+            let worker_shared = Arc::clone(&shared);
+            let worker_reader = Arc::clone(&reader);
+            let handle = std::thread::Builder::new()
+                .name(format!("krkr-storage-read-{index}"))
+                .spawn(move || read_worker_loop(worker_reader, worker_shared));
+            match handle {
+                Ok(handle) => workers.push(handle),
+                Err(error) => {
+                    // The workers that already started must not outlive the
+                    // pool: they are stopped and joined before the error
+                    // goes out.
+                    stop_read_workers(&shared, workers);
+                    return Err(StoragePoolError::Worker {
+                        message: error.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(Self {
+            shared,
+            workers,
+            config,
+        })
+    }
+
+    /// Schedules a read and returns the handle its result lands in.
+    ///
+    /// `size` is the size the lookup named for the entry, and `charge` is the
+    /// number of bytes the read is expected to produce: it is what the job is
+    /// charged against the memory limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoragePoolError::QueueFull`] when the queue is full and
+    /// [`StoragePoolError::MemoryLimit`] when the job would push the pool
+    /// past its limit. The caller then reads on its own thread; the pool
+    /// never drops a job silently.
+    pub fn submit(
+        &self,
+        key: StorageKey,
+        work: StorageJob,
+        size: Option<u64>,
+        charge: u64,
+    ) -> Result<PendingStorage, StoragePoolError> {
+        let pending = PendingStorage::new(size);
+        {
+            let mut state = lock(&self.shared.state);
+            if state.stopping {
+                return Err(StoragePoolError::Config {
+                    message: "the storage read pool is stopping".to_string(),
+                });
+            }
+            if state.queue.len() >= self.config.queue_limit {
+                return Err(StoragePoolError::QueueFull {
+                    limit: self.config.queue_limit,
+                });
+            }
+            if state.queued_bytes.saturating_add(charge) > self.config.memory_limit {
+                return Err(StoragePoolError::MemoryLimit {
+                    limit: self.config.memory_limit,
+                });
+            }
+            state.queued_bytes = state.queued_bytes.saturating_add(charge);
+            state.pending.insert(key.clone(), pending.clone());
+            state.pending_order.push_back(key);
+            state.queue.push_back(Job {
+                pending: pending.clone(),
+                work,
+                charged: charge,
+            });
+        }
+        self.shared.wake.notify_one();
+        Ok(pending)
+    }
+
+    /// The handle of the read `key` names, when one is in flight or finished.
+    pub fn pending(&self, key: &StorageKey) -> Option<PendingStorage> {
+        lock(&self.shared.state).pending.get(key).cloned()
+    }
+
+    /// Takes the handle of the read `key` names out of the pool's table.
+    ///
+    /// The read keeps running; the caller owns its result. A later read of
+    /// the same name schedules a new one, so the storage never serves stale
+    /// bytes.
+    pub fn take_pending(&self, key: &StorageKey) -> Option<PendingStorage> {
+        let mut state = lock(&self.shared.state);
+        let pending = state.pending.remove(key)?;
+        state.pending_order.retain(|queued| queued != key);
+        Some(pending)
+    }
+
+    /// The drained result of the read `key` names, when the frame published
+    /// it.
+    pub fn take_completed(&self, key: &StorageKey) -> Option<StorageOutcome> {
+        let mut state = lock(&self.shared.state);
+        let outcome = state.completed.remove(key)?;
+        state.completed_order.retain(|queued| queued != key);
+        state.completed_bytes = state.completed_bytes.saturating_sub(outcome.byte_len());
+        Some(outcome)
+    }
+
+    /// The drained result of the read `key` names, without taking it.
+    pub fn peek_completed(&self, key: &StorageKey) -> Option<StorageOutcome> {
+        lock(&self.shared.state).completed.get(key).cloned()
+    }
+
+    /// Publishes the finished reads and returns how many were published.
+    ///
+    /// A finished read is moved from the in-flight table into the drained
+    /// table, where the caller that waits for it takes it. The drained table
+    /// is bounded by the pool's memory limit: the oldest entries are dropped
+    /// when the limit is reached, and a dropped read is simply read again.
+    pub fn drain(&self) -> usize {
+        let mut state = lock(&self.shared.state);
+        let finished: Vec<StorageKey> = state
+            .pending_order
+            .iter()
+            .filter(|key| {
+                state
+                    .pending
+                    .get(*key)
+                    .is_some_and(|pending| pending.is_ready())
+            })
+            .cloned()
+            .collect();
+        let mut drained = 0;
+        for key in finished {
+            let Some(pending) = state.pending.remove(&key) else {
+                continue;
+            };
+            state.pending_order.retain(|queued| queued != &key);
+            let Some(outcome) = pending.outcome() else {
+                continue;
+            };
+            let bytes = outcome.byte_len();
+            state.completed_bytes = state.completed_bytes.saturating_add(bytes);
+            state.completed.insert(key.clone(), outcome);
+            state.completed_order.push_back(key);
+            drained += 1;
+        }
+        while state.completed_bytes > self.config.memory_limit {
+            let Some(key) = state.completed_order.pop_front() else {
+                break;
+            };
+            if let Some(outcome) = state.completed.remove(&key) {
+                state.completed_bytes = state.completed_bytes.saturating_sub(outcome.byte_len());
+            }
+        }
+        drained
+    }
+
+    /// The number of jobs waiting for a worker.
+    pub fn queued(&self) -> usize {
+        lock(&self.shared.state).queue.len()
+    }
+
+    /// The number of reads that are in flight or finished but not drained.
+    pub fn pending_count(&self) -> usize {
+        lock(&self.shared.state).pending.len()
+    }
+
+    /// The read accounting: how many reads the pool ran and how long they
+    /// took.
+    ///
+    /// The counters cover every read the pool performed, the successful ones
+    /// and the failed ones alike.
+    pub fn stats(&self) -> StoragePoolStats {
+        let state = lock(&self.shared.state);
+        StoragePoolStats {
+            reads: state.reads,
+            elapsed: state.read_time,
+        }
+    }
+}
+
+impl Drop for StorageReadPool {
+    fn drop(&mut self) {
+        stop_read_workers(&self.shared, std::mem::take(&mut self.workers));
+    }
+}
+
+/// Stops the pool's workers and joins them.
+///
+/// The queued reads are cancelled, so a waiter on one of them wakes instead
+/// of waiting for a read that will never run. A running read is not
+/// preempted: the join waits for it, and it publishes its own result.
+fn stop_read_workers(shared: &PoolShared, workers: Vec<JoinHandle<()>>) {
+    {
+        let mut state = lock(&shared.state);
+        state.stopping = true;
+        while let Some(job) = state.queue.pop_front() {
+            state.queued_bytes = state.queued_bytes.saturating_sub(job.charged);
+            job.pending.complete(StorageOutcome::Cancelled);
+        }
+    }
+    shared.wake.notify_all();
+    for worker in workers {
+        if worker.join().is_err() {
+            log::warn!("engine: a storage read worker stopped with a panic");
+        }
+    }
+}
+
+/// Locks a mutex, recovering from a poisoned lock.
+///
+/// No code path panics while the lock is held, so the recovery cannot expose
+/// a half-updated state.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Takes the next job from the queue.
+fn take_next_read(state: &mut PoolState) -> Option<Job> {
+    state.queue.pop_front()
+}
+
+/// Returns a job's bytes to the pool's accounting.
+fn release_read_bytes(shared: &PoolShared, charged: u64) {
+    let mut state = lock(&shared.state);
+    state.queued_bytes = state.queued_bytes.saturating_sub(charged);
+}
+
+/// Records the read a worker ran: the count and the time it took.
+fn record_read(shared: &PoolShared, elapsed: Duration) {
+    let mut state = lock(&shared.state);
+    state.reads = state.reads.saturating_add(1);
+    state.read_time = state.read_time.saturating_add(elapsed);
+}
+
+/// Publishes a failure for a read whose worker stops before it does.
+///
+/// The guard holds the handle of the read a worker is running. Its drop
+/// publishes a failure when the read has not produced a result, so a waiter
+/// wakes with a failure instead of waiting for a worker that is gone.
+struct ReadGuard {
+    /// The handle the result is published into.
+    pending: PendingStorage,
+}
+
+impl Drop for ReadGuard {
+    fn drop(&mut self) {
+        self.pending
+            .complete(StorageOutcome::Failed(StorageReadError::NoResult {
+                message: "the storage read worker stopped before it published a result".to_string(),
+            }));
+    }
+}
+
+/// The message of a panic payload.
+///
+/// The payload is a `Box<dyn Any + Send>`: a string payload carries the
+/// message the panicking code wrote, and anything else is reported as an
+/// unnamed panic. The panic is never silenced: it becomes the read's failed
+/// outcome, and the waiter sees it.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "the storage reader panicked".to_string()
+}
+
+/// The worker loop: take a job, read it, then publish the result.
+fn read_worker_loop(reader: Arc<dyn StorageReader>, shared: Arc<PoolShared>) {
+    loop {
+        let job = {
+            let mut state = lock(&shared.state);
+            loop {
+                if state.stopping {
+                    return;
+                }
+                if let Some(job) = take_next_read(&mut state) {
+                    break job;
+                }
+                state = match shared.wake.wait(state) {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+            }
+        };
+        // The guard covers every path out of this iteration: a worker that
+        // stops for any reason leaves the waiter with a result.
+        let _guard = ReadGuard {
+            pending: job.pending.clone(),
+        };
+        // A read that was cancelled before it ran is dropped without reading.
+        if job.pending.is_ready() {
+            release_read_bytes(&shared, job.charged);
+            continue;
+        }
+        let started = Instant::now();
+        let outcome =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reader.read(&job.work)))
+            {
+                Ok(Ok(bytes)) => StorageOutcome::Ready(Arc::new(bytes)),
+                Ok(Err(error)) => StorageOutcome::Failed(error),
+                Err(payload) => StorageOutcome::Failed(StorageReadError::NoResult {
+                    message: panic_message(payload.as_ref()),
+                }),
+            };
+        record_read(&shared, started.elapsed());
+        release_read_bytes(&shared, job.charged);
+        job.pending.complete(outcome);
+    }
 }
 
 /// The searched startup script (reference `TVPStartupScriptName`).
@@ -659,6 +1520,8 @@ impl Storage {
             xp3_extraction_filter: None,
             media: RefCell::new(crate::hasher::map()),
             resolution_cache: RefCell::new(ResolutionCache::default()),
+            read_pool: None,
+            generation: 0,
         })
     }
 
@@ -685,7 +1548,7 @@ impl Storage {
     /// Runs `f` for every mounted archive and its parsed index.
     pub fn for_each_archive(&self, mut f: impl FnMut(&Path, &Xp3Archive)) {
         for mounted in &self.archives {
-            f(&mounted.path, &mounted.archive);
+            f(&mounted.path, mounted.archive.as_ref());
         }
     }
 
@@ -705,11 +1568,11 @@ impl Storage {
             return Ok(());
         }
         let file = fs::open(&self.fs, &FsPath::host(&path), OpenMode::Read)?;
-        let archive = Xp3Archive::open(&self.fs, &file)?;
+        let archive = Arc::new(Xp3Archive::open(&self.fs, &file)?);
         let backing = if self.preload_archives {
-            ArchiveBacking::Memory(read_archive_image(&self.fs, &file, &path)?)
+            ArchiveBacking::Memory(Arc::from(read_archive_image(&self.fs, &file, &path)?))
         } else {
-            ArchiveBacking::Stream(file)
+            ArchiveBacking::Stream(Arc::new(file))
         };
         let file_name = path
             .file_name()
@@ -838,6 +1701,196 @@ impl Storage {
         let cache = self.resolution_cache.get_mut();
         cache.auto_paths.clear();
         cache.placed.clear();
+        // The resolution changed, so a read that was scheduled against the
+        // old one must not be served to a caller that resolves now.
+        self.generation = self.generation.saturating_add(1);
+    }
+
+    /// Looks a storage name up optimistically.
+    ///
+    /// The lookup resolves the name through the namespace's own search order
+    /// and answers with the entry's existence and its size, without reading
+    /// the bytes: the size comes from the mounted archive's index or from the
+    /// file's metadata. The read itself is scheduled on the storage's read
+    /// pool, and the returned handle carries its result.
+    ///
+    /// A name that does not resolve is `Ok(None)`; a file-system failure
+    /// while probing is a typed error. The bytes of the entry are read
+    /// through [`Self::read`] and [`Self::read_prefix`], which wait for the
+    /// read this lookup scheduled.
+    ///
+    /// A storage without a read pool has no worker to schedule on: the lookup
+    /// then reads the entry on the calling thread and answers with a handle
+    /// that already holds the bytes.
+    pub fn lookup(&self, name: &str) -> Result<Option<PendingStorage>, StorageReadError> {
+        if let Some(bytes) = self.media.borrow().get(name).cloned() {
+            let size = bytes.len() as u64;
+            return Ok(Some(PendingStorage::ready(bytes, Some(size))));
+        }
+        let Some(plan) = self.plan_read(name, None)? else {
+            return Ok(None);
+        };
+        let Some(pool) = self.read_pool.as_ref() else {
+            // Without a pool the entry is read on the calling thread.
+            let bytes = FileSystemReader.read(&plan.work)?;
+            return Ok(Some(PendingStorage::ready(bytes, plan.size)));
+        };
+        let key = StorageKey::new(name, None, self.generation);
+        // A read the frame already published is answered with its result.
+        if let Some(outcome) = pool.peek_completed(&key) {
+            let bytes = outcome_to_bytes(outcome, name)?;
+            return Ok(Some(PendingStorage::ready(bytes, plan.size)));
+        }
+        // A read that is already in flight is the read this lookup names.
+        let pending = match pool.pending(&key) {
+            Some(pending) => pending,
+            None => {
+                let work = plan.work.clone();
+                match pool.submit(key, work, plan.size, plan.charge) {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        // The pool refused the read: the entry is read on the
+                        // calling thread, and the refusal is reported.
+                        log::warn!(
+                            "storage: the read pool refused {name:?} ({error}); the entry is read on the calling thread"
+                        );
+                        let bytes = FileSystemReader.read(&plan.work)?;
+                        return Ok(Some(PendingStorage::ready(bytes, plan.size)));
+                    }
+                }
+            }
+        };
+        Ok(Some(pending))
+    }
+
+    /// Reads a storage entry through the read pool.
+    ///
+    /// Returns `Ok(None)` when the pool does not serve this read: the
+    /// storage has no pool, or the installed extraction filter has to run on
+    /// the calling thread because it is script code.
+    fn read_scheduled(
+        &self,
+        name: &str,
+        limit: Option<usize>,
+    ) -> Result<Option<Vec<u8>>, StorageReadError> {
+        let Some(pool) = self.read_pool.as_ref() else {
+            return Ok(None);
+        };
+        // The extraction filter is script code: it runs on the thread that
+        // asked for the bytes, never on a worker.
+        if self.xp3_extraction_filter.is_some() {
+            return Ok(None);
+        }
+        let key = StorageKey::new(name, limit, self.generation);
+        // A read the frame already published is served without another wait.
+        if let Some(outcome) = pool.take_completed(&key) {
+            return outcome_to_bytes(outcome, name).map(Some);
+        }
+        let pending = match pool.take_pending(&key) {
+            Some(pending) => pending,
+            None => {
+                let Some(plan) = self.plan_read(name, limit)? else {
+                    return Err(StorageReadError::NotFound(name.to_string()));
+                };
+                match pool.submit(key, plan.work, plan.size, plan.charge) {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        // The pool refused the read: the entry is read on the
+                        // calling thread, and the refusal is reported.
+                        log::warn!(
+                            "storage: the read pool refused {name:?} ({error}); the entry is read on the calling thread"
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
+        };
+        let outcome = pending.await_outcome();
+        outcome_to_bytes(outcome, name).map(Some)
+    }
+
+    /// Resolves a storage name into the work a read performs.
+    ///
+    /// `limit` is the number of bytes the read wants, or `None` for the whole
+    /// entry. A name that does not resolve is `Ok(None)`.
+    fn plan_read(
+        &self,
+        name: &str,
+        limit: Option<usize>,
+    ) -> Result<Option<ReadPlan>, StorageReadError> {
+        let Some(location) = self.find(name)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.build_work(&location, limit)?))
+    }
+
+    /// Builds the work a read performs and the sizes the resolution named.
+    ///
+    /// The size of the entry comes from the mounted archive's index or from
+    /// the file's metadata. An archive that is not mounted is opened by the
+    /// worker, so its entry size is unknown before the read; the archive's
+    /// own size bounds the read for the pool's accounting.
+    fn build_work(
+        &self,
+        location: &Location,
+        limit: Option<usize>,
+    ) -> Result<ReadPlan, StorageReadError> {
+        match location {
+            Location::Disk(path) => {
+                let size = match fs::stat(&self.fs, &FsPath::host(path)) {
+                    Ok(meta) => meta.size,
+                    Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => 0,
+                    Err(error) => return Err(StorageReadError::Fs(error)),
+                };
+                Ok(ReadPlan {
+                    work: StorageJob::Disk {
+                        fs: self.fs.clone(),
+                        path: path.clone(),
+                        limit,
+                    },
+                    size: Some(size),
+                    charge: size,
+                })
+            }
+            Location::Archive(arc_path, in_arc) => {
+                let source = self
+                    .archives
+                    .iter()
+                    .find(|mounted| mounted.path.as_path() == arc_path)
+                    .map(|mounted| ArchiveSource {
+                        archive: Arc::clone(&mounted.archive),
+                        backing: mounted.backing.clone(),
+                    });
+                let size = match &source {
+                    Some(source) => source.archive.entry(in_arc).map(|entry| entry.org_size),
+                    None => None,
+                };
+                let charge = match &source {
+                    Some(_) => size.unwrap_or(0),
+                    None => match fs::stat(&self.fs, &FsPath::host(arc_path)) {
+                        Ok(meta) => meta.size,
+                        Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => 0,
+                        Err(error) => return Err(StorageReadError::Fs(error)),
+                    },
+                };
+                let archive_name = arc_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Ok(ReadPlan {
+                    work: StorageJob::Archive {
+                        fs: self.fs.clone(),
+                        source,
+                        path: arc_path.clone(),
+                        in_arc: in_arc.clone(),
+                        archive_name,
+                        limit,
+                    },
+                    size,
+                    charge,
+                })
+            }
+        }
     }
 
     /// Resolves a storage name to a location, mirroring the reference search
@@ -1047,7 +2100,7 @@ impl Storage {
             }
             Err(error) => return Err(StorageReadError::Fs(error)),
         };
-        let archive = Xp3Archive::open(&self.fs, &file)?;
+        let archive = Xp3Archive::open(&self.fs, &file).map_err(xp3_error)?;
         trace.attempt(|| format!("project archive {} (opened on demand)", project.display()));
         if archive.entry(normalized).is_some() {
             Ok(Some(Location::Archive(
@@ -1199,7 +2252,7 @@ impl Storage {
             }
             Err(error) => return Err(StorageReadError::Fs(error)),
         };
-        let archive = Xp3Archive::open(&self.fs, &file)?;
+        let archive = Xp3Archive::open(&self.fs, &file).map_err(xp3_error)?;
         let mut entries = crate::hasher::map();
         collect_archive_children(archive.entries(), prefix, &mut entries);
         Ok(Some((path, entries)))
@@ -1250,7 +2303,7 @@ impl Storage {
             }
             Err(error) => return Err(StorageReadError::Fs(error)),
         };
-        let archive = Xp3Archive::open(&self.fs, &file)?;
+        let archive = Xp3Archive::open(&self.fs, &file).map_err(xp3_error)?;
         if archive.entry(&rest).is_some() {
             Ok(Some(Location::Archive(path, rest)))
         } else {
@@ -1479,7 +2532,7 @@ impl Storage {
             return f(&mounted.archive, &mounted.file_name);
         }
         let file = fs::open(&self.fs, &FsPath::host(arc_path), OpenMode::Read)?;
-        let archive = Xp3Archive::open(&self.fs, &file)?;
+        let archive = Xp3Archive::open(&self.fs, &file).map_err(xp3_error)?;
         let file_name = arc_path
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
@@ -1500,6 +2553,10 @@ impl Storage {
     /// Reads a storage entry to bytes (disk file or archive member).
     pub fn read(&self, name: &str) -> Result<Vec<u8>, StorageReadError> {
         if let Some(bytes) = self.media.borrow().get(name).cloned() {
+            self.count_read_bytes(bytes.len());
+            return Ok(bytes);
+        }
+        if let Some(bytes) = self.read_scheduled(name, None)? {
             self.count_read_bytes(bytes.len());
             return Ok(bytes);
         }
@@ -1526,6 +2583,10 @@ impl Storage {
     pub fn read_prefix(&self, name: &str, max_len: usize) -> Result<Vec<u8>, StorageReadError> {
         if let Some(mut bytes) = self.media.borrow().get(name).cloned() {
             bytes.truncate(max_len);
+            self.count_read_bytes(bytes.len());
+            return Ok(bytes);
+        }
+        if let Some(bytes) = self.read_scheduled(name, Some(max_len))? {
             self.count_read_bytes(bytes.len());
             return Ok(bytes);
         }
@@ -1563,22 +2624,22 @@ impl Storage {
                 ArchiveBacking::Stream(file) => mounted
                     .archive
                     .read_entry_with_filter(&self.fs, file, entry, &mounted.file_name, filter)
-                    .map_err(StorageReadError::Xp3),
+                    .map_err(xp3_error),
                 ArchiveBacking::Memory(bytes) => mounted
                     .archive
                     .read_entry_from_bytes(bytes, entry, &mounted.file_name, filter)
-                    .map_err(StorageReadError::Xp3),
+                    .map_err(xp3_error),
             };
         }
         let file = fs::open(&self.fs, &FsPath::host(arc_path), OpenMode::Read)?;
-        let archive = Xp3Archive::open(&self.fs, &file)?;
+        let archive = Xp3Archive::open(&self.fs, &file).map_err(xp3_error)?;
         let file_name = arc_path
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default();
         archive
             .read_with_filter(&self.fs, &file, in_arc, &file_name, filter)
-            .map_err(StorageReadError::Xp3)
+            .map_err(xp3_error)
     }
 
     /// Prefix counterpart of [`Self::read_archive`]: the same backing and filter
@@ -1602,7 +2663,7 @@ impl Storage {
                         max_len,
                         filter,
                     )
-                    .map_err(StorageReadError::Xp3),
+                    .map_err(xp3_error),
                 ArchiveBacking::Memory(bytes) => {
                     let entry = mounted
                         .archive
@@ -1617,19 +2678,19 @@ impl Storage {
                             max_len,
                             filter,
                         )
-                        .map_err(StorageReadError::Xp3)
+                        .map_err(xp3_error)
                 }
             };
         }
         let file = fs::open(&self.fs, &FsPath::host(arc_path), OpenMode::Read)?;
-        let archive = Xp3Archive::open(&self.fs, &file)?;
+        let archive = Xp3Archive::open(&self.fs, &file).map_err(xp3_error)?;
         let file_name = arc_path
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default();
         archive
             .read_prefix_with_filter(&self.fs, &file, in_arc, &file_name, max_len, filter)
-            .map_err(StorageReadError::Xp3)
+            .map_err(xp3_error)
     }
 
     /// Returns metadata for a resolved storage entry.

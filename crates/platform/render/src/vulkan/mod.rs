@@ -48,7 +48,6 @@ mod target;
 mod texture;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -61,6 +60,7 @@ use api::error::RenderError;
 use api::geometry::{Affine2, PixelRegion};
 use api::host::{PresentSkip, Presentation, SurfaceEvent};
 
+use crate::collections::Map;
 use crate::render_target::{RenderTarget, RenderTargetDesc};
 use crate::scene::RenderScene;
 use crate::state::{RenderState, StateKind, Surface, SurfaceKind};
@@ -378,9 +378,9 @@ impl VulkanPipeline {
             images_in_flight: vec![vk::Fence::null(); image_count],
             render_finished,
             frame_in_flight: 0,
-            textures: HashMap::new(),
-            offscreen: HashMap::new(),
-            render_targets: HashMap::new(),
+            textures: Map::default(),
+            offscreen: Map::default(),
+            render_targets: Map::default(),
             effect: None,
             upload,
             offscreen_pool,
@@ -676,7 +676,7 @@ impl VulkanPipeline {
             ..
         } = vstate;
 
-        if let std::collections::hash_map::Entry::Vacant(entry) = offscreen.entry(format) {
+        if let hashbrown::hash_map::Entry::Vacant(entry) = offscreen.entry(format) {
             entry.insert(target::OffscreenPass::create(
                 device,
                 &self.memory_properties,
@@ -688,7 +688,7 @@ impl VulkanPipeline {
             .ok_or_else(|| RenderError::Framebuffer {
                 message: "offscreen pipeline state disappeared".to_owned(),
             })?;
-        if let std::collections::hash_map::Entry::Vacant(entry) = render_targets.entry(key) {
+        if let hashbrown::hash_map::Entry::Vacant(entry) = render_targets.entry(key) {
             entry.insert(target::VulkanRenderTarget::create(
                 device,
                 &self.memory_properties,
@@ -1277,11 +1277,11 @@ pub(crate) struct VulkanState {
     /// Index of the next frame slot.
     pub(crate) frame_in_flight: usize,
     /// GPU textures keyed by [`Texture`] identity.
-    pub(crate) textures: HashMap<u64, texture::VulkanTexture>,
+    pub(crate) textures: Map<u64, texture::VulkanTexture>,
     /// Per-format offscreen render passes and their pipelines.
-    pub(crate) offscreen: HashMap<TextureFormat, target::OffscreenPass>,
+    pub(crate) offscreen: Map<TextureFormat, target::OffscreenPass>,
     /// GPU offscreen targets keyed by [`RenderTarget`] identity.
-    pub(crate) render_targets: HashMap<u64, target::VulkanRenderTarget>,
+    pub(crate) render_targets: Map<u64, target::VulkanRenderTarget>,
     /// Custom effect pipelines, their samplers and the frame's uniform ring,
     /// created on the first created effect pipeline.
     pub(crate) effect: Option<effect::EffectState>,

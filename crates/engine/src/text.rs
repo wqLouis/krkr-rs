@@ -28,7 +28,6 @@
 //! holds the rasterized character masks and their blurred shadows. There are
 //! no globals, no statics and no hidden caches.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -40,6 +39,7 @@ use render::{
 };
 
 use crate::BitmapState;
+use crate::hasher::{Map, map};
 use crate::layer_ops::{RectI, intersect_rect};
 
 use cosmic_text::fontdb;
@@ -48,7 +48,8 @@ use cosmic_text::{Attrs, Buffer, Family, FontSystem as CosmicFontSystem, Metrics
 /// Maximum number of entries held by each L2 text memo.
 ///
 /// It bounds the rasterized character masks ([`TextCoverageCache`]), the
-/// shaped-layout memo ([`TextEngine`]) and the glyph atlas' entry map
+/// shaped-layout memo, the per-character advance memo and the
+/// missing-family memo ([`TextEngine`]) and the glyph atlas' entry map
 /// ([`GlyphAtlas`]).
 pub const MAX_TEXT_CACHE_ENTRIES: usize = 1300;
 
@@ -217,6 +218,9 @@ pub struct LaidOutGlyph {
     /// Pen x offset from the text origin, in pixels.
     pub x: f32,
     /// Baseline y offset from the text origin, in pixels (y grows down).
+    ///
+    /// A line's baseline is the face's ascent in whole pixels, so a glyph's
+    /// ink starts `bearing_y` pixels above it.
     pub baseline_y: f32,
     /// Shaped advance of the glyph, in pixels.
     pub advance: f32,
@@ -349,6 +353,25 @@ struct LayoutKey {
     wrap_bits: Option<u32>,
 }
 
+/// Cache key for one measured per-character advance.
+///
+/// It covers every input the rasterizer's advance depends on: the face, the
+/// character, the exact pixel size and the synthetic style. The text colour
+/// is absent because colour does not move a glyph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct AdvanceKey {
+    /// Registered face index.
+    font: FontId,
+    /// Code point.
+    codepoint: char,
+    /// `size_px.to_bits()` (so the key stays `Eq`).
+    size_bits: u32,
+    /// Synthetic bold.
+    bold: bool,
+    /// Synthetic italic.
+    italic: bool,
+}
+
 /// L2 text service: shaping/layout system plus registered faces.
 ///
 /// Created once per engine and owned by it. It keeps no globals; the glyph
@@ -362,7 +385,7 @@ pub struct TextEngine {
     /// Registered faces, indexed by [`FontId`].
     faces: Vec<Face>,
     /// Lowercased family name → face id, for name-based lookup.
-    by_name: HashMap<String, FontId>,
+    by_name: Map<String, FontId>,
     /// Lazily built host font database used by [`TextEngine::load_system_font`].
     /// It is kept separate from the shaping database so that only explicitly
     /// resolved faces participate in layout.
@@ -377,6 +400,14 @@ pub struct TextEngine {
     /// Memoized shaped layouts, keyed by shaping inputs only. Bounded at the
     /// reference limit with least-recently-used eviction.
     layout_cache: LruCache<LayoutKey, TextLayout>,
+    /// Memoized per-character advances, keyed by face, character, size and
+    /// synthetic style. Bounded at [`MAX_TEXT_CACHE_ENTRIES`] with
+    /// least-recently-used eviction.
+    advance_cache: LruCache<AdvanceKey, f32>,
+    /// Families the host's installed fonts do not provide, memoized so that a
+    /// repeated exact lookup does not scan the font database again. Bounded at
+    /// [`MAX_TEXT_CACHE_ENTRIES`] with least-recently-used eviction.
+    missing_system_families: LruCache<String, ()>,
 }
 
 impl TextEngine {
@@ -394,11 +425,13 @@ impl TextEngine {
                 cosmic_text::fontdb::Database::new(),
             ),
             faces: Vec::new(),
-            by_name: HashMap::new(),
+            by_name: map(),
             system_fonts: None,
             system_font_dirs: Vec::new(),
             default_fallback_logged: false,
             layout_cache: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
+            advance_cache: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
+            missing_system_families: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
         }
     }
 
@@ -408,9 +441,13 @@ impl TextEngine {
     /// from the host, together with `fontdb`'s default system locations. A
     /// database built before this call is discarded so the new list takes
     /// effect; call it before any face has been resolved to avoid the rescan.
+    ///
+    /// The missing-family memo is dropped with the database it describes: a
+    /// family the previous directories did not provide may be in the new ones.
     pub fn set_system_font_dirs(&mut self, dirs: Vec<PathBuf>) {
         self.system_font_dirs = dirs;
         self.system_fonts = None;
+        self.missing_system_families.clear();
     }
 
     /// Registers a font face from `bytes` (a TTF/OTF, or a TTC/OTC with
@@ -488,16 +525,42 @@ impl TextEngine {
     /// a candidate that is not installed must not silently resolve to the
     /// Japanese fallback before the next candidate is tried.
     ///
+    /// A family the host does not provide is memoized, so a repeated query
+    /// reports the same [`TextError::FontNotFound`] without scanning the host
+    /// font database again. The memo holds misses only: a family the host does
+    /// provide resolves on the first query, and a face registered afterwards
+    /// is found by [`TextEngine::font_id`] before the memo is consulted. The
+    /// memo is dropped when [`TextEngine::set_system_font_dirs`] rebuilds the
+    /// font database.
+    ///
     /// # Errors
     ///
     /// Returns [`TextError::FontNotFound`] when no installed face carries
     /// `family`, and propagates the registration errors of
     /// [`TextEngine::add_font`].
     pub fn load_system_font_exact(&mut self, family: &str) -> Result<FontId, TextError> {
+        let key = family.to_lowercase();
+        // A face registered on this engine resolves by name, so a family added
+        // after a failed lookup is not shadowed by the memoized miss.
         if let Some(id) = self.font_id(family) {
+            self.missing_system_families.remove(&key);
             return Ok(id);
         }
-        let (bytes, index) = self.system_face_bytes(family, false)?;
+        if self.missing_system_families.get(&key).is_some() {
+            return Err(TextError::FontNotFound {
+                family: family.to_string(),
+            });
+        }
+        let (bytes, index) = match self.system_face_bytes(family, false) {
+            Ok(found) => found,
+            Err(error) => {
+                if matches!(error, TextError::FontNotFound { .. }) {
+                    self.missing_system_families.insert(key, ());
+                }
+                return Err(error);
+            }
+        };
+        self.missing_system_families.remove(&key);
         self.finish_system_face(family, &bytes, index)
     }
 
@@ -642,6 +705,13 @@ impl TextEngine {
             } else {
                 style.size_px * 1.2
             };
+            // A line's baseline sits at the face's ascent in whole pixels:
+            // the ascender scaled to the pixel size and truncated, the way
+            // the outline rasterizer computes it. The line box is not
+            // vertically centred around the baseline: a glyph's ink top is
+            // `baseline - bitmap_top`, so a centred or fractional baseline
+            // moves every glyph off its row.
+            let baseline = metrics.ascent.floor();
 
             let attributes = Attrs::new()
                 .family(Family::Name(&face.family))
@@ -660,7 +730,7 @@ impl TextEngine {
                 for run in borrowed.layout_runs() {
                     max_line = max_line.max(run.line_i);
                     line_width = line_width.max(run.line_w);
-                    let baseline_y = run.line_y;
+                    let baseline_y = run.line_top + baseline;
                     for glyph in run.glyphs {
                         let cluster = &run.text[glyph.start..glyph.end];
                         let codepoint = cluster.chars().next().unwrap_or('\u{FFFD}');
@@ -732,26 +802,50 @@ impl TextEngine {
     /// This is the per-character extent a pre-rendered-font width sums in for
     /// a character the `.tft` does not carry.
     ///
+    /// The advance is memoized per face, character, size and synthetic
+    /// style, so a repeated measurement of the same character reuses the
+    /// value the rasterizer returned instead of scaling the face again. The
+    /// memoized value is the rasterizer's own result, so it is identical to
+    /// the value a fresh measurement returns.
+    ///
     /// # Errors
     ///
     /// Returns [`TextError::UnknownFont`] when `font` is not registered.
     pub fn glyph_advance(
-        &self,
+        &mut self,
         font: FontId,
         codepoint: char,
         style: &TextStyle,
     ) -> Result<f32, TextError> {
+        let key = AdvanceKey {
+            font,
+            codepoint,
+            size_bits: style.size_px.to_bits(),
+            bold: style.bold,
+            italic: style.italic,
+        };
+        if let Some(cached) = self.advance_cache.get(&key) {
+            return Ok(*cached);
+        }
         let face = self
             .faces
             .get(font.0)
             .ok_or(TextError::UnknownFont(font.0))?;
-        Ok(render::glyph_advance(
+        let advance = render::glyph_advance(
             &self.render_system,
             &face.render,
             codepoint,
             style.size_px,
             style.glyph_style(),
-        ))
+        );
+        self.advance_cache.insert(key, advance);
+        Ok(advance)
+    }
+
+    /// The number of memoized per-character advances.
+    #[cfg(test)]
+    fn cached_advances(&self) -> usize {
+        self.advance_cache.len()
     }
 
     /// Returns the bounding rectangle of the rasterized `text` in the text's
@@ -1440,7 +1534,7 @@ struct LruCache<K, V> {
     /// Indices of evicted slots available for reuse.
     free: Vec<usize>,
     /// Live key → slot index.
-    index: HashMap<K, usize>,
+    index: Map<K, usize>,
     /// Most-recently-used slot.
     head: Option<usize>,
     /// Least-recently-used slot, the next eviction victim.
@@ -1479,7 +1573,7 @@ impl<K: Eq + std::hash::Hash + Clone, V> LruCache<K, V> {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
-            index: HashMap::new(),
+            index: map(),
             head: None,
             tail: None,
             capacity,
@@ -1538,6 +1632,20 @@ impl<K: Eq + std::hash::Hash + Clone, V> LruCache<K, V> {
         self.slots[slot].next = None;
         self.index.insert(key, slot);
         self.link_front(slot);
+    }
+
+    /// Removes the entry for `key`, dropping its value, and reports whether
+    /// an entry was present.
+    fn remove(&mut self, key: &K) -> bool {
+        let Some(&slot) = self.index.get(key) else {
+            return false;
+        };
+        self.slots[slot].value = None;
+        self.slots[slot].key = None;
+        self.index.remove(key);
+        self.unlink(slot);
+        self.free.push(slot);
+        true
     }
 
     /// Removes the least recently used entry, if any.
@@ -2212,6 +2320,100 @@ mod tests {
             .find_map(|path| std::fs::read(path).ok())
     }
 
+    /// Reference: `tTVPNativeBaseBitmap::GetTextSize` sums the rasterizer's
+    /// per-character extent, one UTF-16 unit at a time
+    /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473`). A
+    /// character's advance therefore depends only on the face, the character,
+    /// the size and the synthetic style, and a memoized advance must be the
+    /// rasterizer's own value.
+    #[test]
+    fn a_memoized_advance_is_the_rasterizer_value() {
+        let Some(bytes) = load_test_font() else {
+            return;
+        };
+        let mut engine = TextEngine::new();
+        let font = engine.add_font(&bytes, 0).expect("register font");
+        let style = TextStyle::new(24.0);
+
+        let first = engine
+            .glyph_advance(font, 'A', &style)
+            .expect("measure the advance");
+        let second = engine
+            .glyph_advance(font, 'A', &style)
+            .expect("measure the advance");
+        assert_eq!(
+            first.to_bits(),
+            second.to_bits(),
+            "a repeated measurement must return the same advance"
+        );
+        assert_eq!(
+            engine.cached_advances(),
+            1,
+            "a repeated measurement must not add a cache entry"
+        );
+
+        // A second engine measures the same face bytes from scratch, so the
+        // memoized value must equal the freshly measured one.
+        let mut other = TextEngine::new();
+        let other_font = other.add_font(&bytes, 0).expect("register font");
+        let fresh = other
+            .glyph_advance(other_font, 'A', &style)
+            .expect("measure the advance");
+        assert_eq!(
+            first.to_bits(),
+            fresh.to_bits(),
+            "the memoized advance must equal a fresh measurement"
+        );
+    }
+
+    /// Reference: the rasterizer's extent depends on the face, the character,
+    /// the pixel size and the synthetic bold/italic
+    /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473`), so
+    /// each of those must select its own memo entry.
+    #[test]
+    fn the_advance_memo_is_keyed_by_character_size_and_style() {
+        let Some(bytes) = load_test_font() else {
+            return;
+        };
+        let mut engine = TextEngine::new();
+        let font = engine.add_font(&bytes, 0).expect("register font");
+        let plain = TextStyle::new(24.0);
+        let mut bold = plain;
+        bold.bold = true;
+
+        engine
+            .glyph_advance(font, 'A', &plain)
+            .expect("measure the advance");
+        assert_eq!(engine.cached_advances(), 1);
+
+        engine
+            .glyph_advance(font, 'B', &plain)
+            .expect("measure the advance");
+        assert_eq!(
+            engine.cached_advances(),
+            2,
+            "another character must select its own entry"
+        );
+
+        engine
+            .glyph_advance(font, 'A', &TextStyle::new(26.0))
+            .expect("measure the advance");
+        assert_eq!(
+            engine.cached_advances(),
+            3,
+            "another size must select its own entry"
+        );
+
+        engine
+            .glyph_advance(font, 'A', &bold)
+            .expect("measure the advance");
+        assert_eq!(
+            engine.cached_advances(),
+            4,
+            "the synthetic style must select its own entry"
+        );
+    }
+
     /// Reference: `TVPInternalEnumFonts` keys the enumerated font map by every
     /// localized `TT_NAME_ID_FONT_FAMILY` entry (Japanese, Chinese, Korean,
     /// English), not only the English family name
@@ -2340,6 +2542,114 @@ mod tests {
             .load_system_font_exact("this-family-is-not-installed")
             .expect_err("an absent exact family must not resolve");
         assert!(matches!(error, TextError::FontNotFound { .. }));
+    }
+
+    /// Reference: `TVPCreateFontStream` looks the requested name up in the
+    /// enumerated font map and falls back to the default face when the map
+    /// does not hold it (`reference/cpp/core/visual/FontImpl.cpp:159-168`),
+    /// and `TVPFindFont` matches the map by name
+    /// (`reference/cpp/core/visual/FontImpl.cpp:277-289`). A name the map
+    /// does not hold therefore reports the same absence every time it is
+    /// asked for, and the memo that answers the repeat must report the very
+    /// same error.
+    #[test]
+    fn an_absent_exact_family_reports_the_same_error_twice() {
+        let mut engine = TextEngine::new();
+        let family = "this-family-is-not-installed";
+        let first = engine
+            .load_system_font_exact(family)
+            .expect_err("an absent exact family must not resolve");
+        let second = engine
+            .load_system_font_exact(family)
+            .expect_err("an absent exact family must not resolve");
+        assert!(matches!(first, TextError::FontNotFound { .. }));
+        assert!(matches!(second, TextError::FontNotFound { .. }));
+        assert_eq!(
+            first.to_string(),
+            second.to_string(),
+            "the memoized miss must report the same error as the first lookup"
+        );
+    }
+
+    /// Reference: the font map is keyed by family name, so a face registered
+    /// under a name is found by that name
+    /// (`reference/cpp/core/visual/FontImpl.cpp:277-289`); the host's
+    /// installed fonts are consulted only for a name the map does not hold.
+    /// A face registered after a failed lookup must therefore resolve, and
+    /// the memoized miss must not shadow it.
+    #[test]
+    fn a_registered_face_is_not_shadowed_by_a_memoized_miss() {
+        let Some(bytes) = load_test_font() else {
+            return;
+        };
+        let mut engine = TextEngine::new();
+        let id = engine.add_font(&bytes, 0).expect("register the face");
+        let family = engine.family_name(id).expect("family name").to_string();
+        // The memo records the family as missing, as a failed exact lookup
+        // does.
+        engine
+            .missing_system_families
+            .insert(family.to_lowercase(), ());
+        let resolved = engine
+            .load_system_font_exact(&family)
+            .expect("the registered family must resolve");
+        assert_eq!(resolved, id, "the registered face must answer the lookup");
+        assert!(
+            engine
+                .missing_system_families
+                .get(&family.to_lowercase())
+                .is_none(),
+            "the successful lookup must drop the memoized miss"
+        );
+    }
+
+    /// A game may ship a font whose family name starts with `*`. The name
+    /// lookup answers it, so the host's installed fonts are never consulted
+    /// for it.
+    ///
+    /// Reference: the font map is keyed by family name
+    /// (`reference/cpp/core/visual/FontImpl.cpp:96-131,277-289`), so a
+    /// registered family resolves whatever its name looks like.
+    #[test]
+    fn a_registered_pseudo_family_resolves() {
+        let Some(bytes) = load_test_font() else {
+            return;
+        };
+        let mut engine = TextEngine::new();
+        let id = engine.add_font(&bytes, 0).expect("register the face");
+        engine.by_name.insert("*pseudo".to_string(), id);
+        let resolved = engine
+            .load_system_font_exact("*pseudo")
+            .expect("the registered pseudo family must resolve");
+        assert_eq!(resolved, id);
+    }
+
+    /// The memo describes one font database. Selecting the host's font
+    /// directories rebuilds that database, so the memoized misses of the
+    /// previous one are dropped with it.
+    #[test]
+    fn a_memoized_miss_is_dropped_with_the_font_database() {
+        let mut engine = TextEngine::new();
+        let family = "this-family-is-not-installed";
+        assert!(matches!(
+            engine.load_system_font_exact(family),
+            Err(TextError::FontNotFound { .. })
+        ));
+        assert!(
+            engine
+                .missing_system_families
+                .get(&family.to_lowercase())
+                .is_some(),
+            "the miss must be memoized"
+        );
+        engine.set_system_font_dirs(Vec::new());
+        assert!(
+            engine
+                .missing_system_families
+                .get(&family.to_lowercase())
+                .is_none(),
+            "the rebuilt font database must not keep the previous misses"
+        );
     }
 
     /// A directory that is not mounted is an absent source, not an error.

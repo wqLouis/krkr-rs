@@ -9,6 +9,8 @@ license.workspace = true
 thiserror = { workspace = true }
 log = { workspace = true }
 flate2 = { workspace = true }
+ahash = { workspace = true }
+hashbrown = { workspace = true }
 # Parallel 8-bit channel decode. The pool is created per decode call, never
 # cached, and the crate only uses its safe `for_slices_mut` dispatch.
 forkunion = "3.0.2"

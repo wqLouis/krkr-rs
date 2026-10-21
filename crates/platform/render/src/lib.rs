@@ -36,6 +36,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(unsafe_code)]
 
+mod collections;
 mod cpu;
 mod effect;
 pub mod glyph;

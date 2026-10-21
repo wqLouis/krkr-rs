@@ -2246,6 +2246,47 @@ name), and none was available"
         Ok(())
     }
 
+    /// Write an octet member on a retained object value.
+    ///
+    /// An octet is the VM's byte-string variant: a script reads the member
+    /// as `Octet` (`typeof`), with `.length` and index access. The safe
+    /// [`TjsValue`] surface carries no octet variant, so the bytes travel
+    /// through this dedicated entry point.
+    ///
+    /// The VM copies the bytes into the variant while the call runs, so
+    /// `bytes` only has to outlive it. A payload longer than the variant's
+    /// length field is a typed error.
+    pub fn set_member_octet(
+        &self,
+        id: Tjs2ValueId,
+        membername: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let length = c_int::try_from(bytes.len())
+            .map_err(|_| format!("octet member is too long: {} bytes", bytes.len()))?;
+        let name = std::ffi::CString::new(membername)
+            .map_err(|_| "member name contains a NUL byte".to_string())?;
+        let ffi = Value {
+            ty: VAL_OCTET,
+            integer: 0,
+            real: 0.0,
+            string: bytes.as_ptr() as *const c_char,
+            array: ptr::null(),
+            array_count: length,
+            retained: 0,
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and id is a live retained id;
+        // name follows the ABI contract for the duration of the call, and
+        // `bytes` outlives the call — the VM copies them into the variant
+        // before it returns.
+        let rc = unsafe { tjs2_prop_set(self.inner, id, name.as_ptr(), &ffi, &mut error) };
+        if rc != 0 {
+            return Err(take_error_string(error));
+        }
+        Ok(())
+    }
+
     /// Delete a named property from a retained object value
     /// (`iTJSDispatch2::DeleteMember`, reference `tjsObject.h:472`;
     /// `tTJSCustomObject::DeleteMember`, `tjsObject.cpp:1537-1552`, over

@@ -67,6 +67,9 @@ pub enum GameError {
     /// The image decode pool could not be started.
     #[error(transparent)]
     DecodePool(#[from] engine::imagedecode::DecodePoolError),
+    /// The storage read pool could not be started.
+    #[error(transparent)]
+    StoragePool(#[from] engine::storage::StoragePoolError),
     /// The L1 audio device could not be opened or written (typed, never
     /// silent; headless hosts use the null backend instead).
     #[error(transparent)]
@@ -535,7 +538,7 @@ impl GameHost {
         // scanned archive that cannot be read is skipped with a warning; an
         // explicitly requested one is a typed error.
         let mount_started = Instant::now();
-        let storage = Box::new(if archives.is_empty() {
+        let mut storage = Box::new(if archives.is_empty() {
             let discovered = engine::storage::discover_archives(&fs, &base_dir)?;
             let mut storage = Storage::mount_discovered_archives_with(
                 fs,
@@ -577,6 +580,18 @@ impl GameHost {
             storage
         });
         let mount_time = mount_started.elapsed();
+        // The storage read pool: the worker pool the entry reads run on. The
+        // engine drains it every frame and the storage schedules the reads
+        // on it, so the raw read and the archive decompression happen off the
+        // frame thread.
+        let storage_pool = host
+            .engine_mut()
+            .install_storage_reader(
+                std::sync::Arc::new(engine::storage::FileSystemReader),
+                engine::storage::StoragePoolConfig::default(),
+            )
+            .map_err(GameError::StoragePool)?;
+        storage.read_pool = Some(storage_pool);
         let scene_ptr = host.scene_mut() as *mut engine::Scene;
         let storage_ptr = storage.as_ref() as *const Storage as *mut Storage;
         let timer_ptr = host.engine_mut().timer_mut() as *mut TimerState;

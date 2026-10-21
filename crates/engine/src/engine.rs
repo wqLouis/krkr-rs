@@ -42,8 +42,9 @@ use crate::imagedecode::{
     DecodePool, DecodePoolConfig, DecodePoolError, DecodeStats, ImageDecoder,
 };
 use crate::projection::{ProjectionReport, project_scene_report};
-use crate::scene::Scene;
+use crate::scene::{BitmapState, Scene};
 use crate::shader::{PipelineId, Program, ProgramDesc, ShaderError, ShaderId, ShaderLibrary};
+use crate::storage::{StoragePoolConfig, StoragePoolError, StorageReadPool, StorageReader};
 use crate::timer::TimerState;
 use crate::translate::{PixelTranslation, TranslateError};
 
@@ -282,6 +283,13 @@ pub struct Engine {
     /// root installs a decoder, and the frame's image barrier is a no-op
     /// while it is.
     decode_pool: Option<DecodePool>,
+    /// The storage read pool, or `None` when no reader is installed.
+    ///
+    /// The pool is the engine's own state: it owns the worker threads, the
+    /// queue and the reads in flight. The composition root installs it and
+    /// hands it to the storage the script reads through, and the frame
+    /// drains it before the hook runs.
+    storage_pool: Option<Arc<StorageReadPool>>,
     /// Latest script-visible input state.
     input: crate::input::InputState,
     /// Current surface size in pixels.
@@ -354,6 +362,7 @@ impl Engine {
             textures: map(),
             timer: TimerState::new(),
             decode_pool: None,
+            storage_pool: None,
             input: crate::input::InputState::default(),
             surface_size,
             now_ms: 0,
@@ -487,6 +496,31 @@ impl Engine {
         self.decode_pool.as_ref().map(DecodePool::stats)
     }
 
+    /// Installs the storage reader and starts the storage read pool.
+    ///
+    /// The reader is the bottom backend the pool drives; the composition root
+    /// supplies it. The pool is handed to the storage the script reads
+    /// through, so the engine and the storage share it: the engine drains it
+    /// every frame and the storage schedules the reads on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoragePoolError`] when the pool cannot be started.
+    pub fn install_storage_reader(
+        &mut self,
+        reader: Arc<dyn StorageReader>,
+        config: StoragePoolConfig,
+    ) -> Result<Arc<StorageReadPool>, StoragePoolError> {
+        let pool = Arc::new(StorageReadPool::new(reader, config)?);
+        self.storage_pool = Some(Arc::clone(&pool));
+        Ok(pool)
+    }
+
+    /// The storage read pool, or `None` when no reader is installed.
+    pub fn storage_pool(&self) -> Option<&Arc<StorageReadPool>> {
+        self.storage_pool.as_ref()
+    }
+
     /// Registers a shader program and returns its identity.
     ///
     /// Registration validates the descriptor and copies the stage code, so
@@ -577,6 +611,12 @@ impl Engine {
         self.elapsed_ms = now_ms as f64;
         self.sync_presentation();
         self.timer.advance(now_ms);
+        // The storage barrier: the reads the previous frame scheduled are
+        // published before the hook runs, so a read the script makes now
+        // finds its result ready.
+        if let Some(pool) = &self.storage_pool {
+            pool.drain();
+        }
         hooks
             .before_render(now_ms, dt_ms)
             .map_err(EngineError::Frame)?;
@@ -1046,6 +1086,9 @@ impl Engine {
     /// cannot abort the frame. All dirty bitmaps are uploaded in one batch, so
     /// the frame submits them once and the present path waits for that batch
     /// instead of waiting once per bitmap.
+    ///
+    /// A bitmap that changed in a rectangle uploads that rectangle alone;
+    /// one that changed wholly uploads every pixel.
     fn sync_dirty_bitmaps(&mut self) {
         let dirty: Vec<u32> = self
             .scene
@@ -1089,6 +1132,11 @@ impl Engine {
                 match create_texture(&self.pipeline, TextureDesc::new(width, height)) {
                     Ok(texture) => {
                         self.textures.insert(id, texture);
+                        // A new texture holds no pixels: the copy has to
+                        // cover the whole bitmap, or the rest of the texture
+                        // stays undefined. Marking the bitmap wholly keeps a
+                        // retry of that upload whole as well.
+                        self.scene.mark_bitmap_whole(id);
                         // The projection resolves its textures through this
                         // table: a bitmap that had no texture when it was last
                         // projected now has one, so the node it was skipped
@@ -1106,15 +1154,33 @@ impl Engine {
         }
 
         if !ready.is_empty() {
-            let uploads: Vec<TextureUpload<'_>> = ready
+            // The region every dirty bitmap uploads, with the packed pixels
+            // of the partial ones.
+            let mut planned: Vec<(u32, PixelRegion, Vec<u8>)> = Vec::with_capacity(ready.len());
+            for id in &ready {
+                let Some(bitmap) = self.scene.bitmap(*id) else {
+                    continue;
+                };
+                let (region, pixels) = dirty_upload(bitmap);
+                planned.push((*id, region, pixels));
+            }
+            let uploads: Vec<TextureUpload<'_>> = planned
                 .iter()
-                .filter_map(|id| {
+                .filter_map(|(id, region, pixels)| {
                     let bitmap = self.scene.bitmap(*id)?;
                     let texture = self.textures.get(id)?;
+                    let whole = PixelRegion::new(0, 0, bitmap.width, bitmap.height);
+                    // The whole bitmap uploads its own buffer; a region
+                    // uploads the packed copy of its rows.
+                    let source = if *region == whole {
+                        &bitmap.rgba[..]
+                    } else {
+                        pixels.as_slice()
+                    };
                     Some(TextureUpload {
                         texture,
-                        region: PixelRegion::new(0, 0, bitmap.width, bitmap.height),
-                        pixels: &bitmap.rgba,
+                        region: *region,
+                        pixels: source,
                     })
                 })
                 .collect();
@@ -1162,6 +1228,50 @@ fn reported_surface_size(event: SurfaceEvent, requested: (u32, u32)) -> (u32, u3
     }
 }
 
+/// The region a dirty bitmap uploads, with the packed pixels of a partial
+/// region.
+///
+/// A bitmap that changed wholly uploads every pixel; a bitmap that changed
+/// in a rectangle uploads that rectangle alone, with its rows packed
+/// together. A region that no longer fits the bitmap (it was resized) or
+/// that covers no pixel uploads every pixel.
+fn dirty_upload(bitmap: &BitmapState) -> (PixelRegion, Vec<u8>) {
+    let whole = PixelRegion::new(0, 0, bitmap.width, bitmap.height);
+    let Some(region) = bitmap.dirty_region else {
+        return (whole, Vec::new());
+    };
+    if region.is_empty() || region.right() > bitmap.width || region.bottom() > bitmap.height {
+        return (whole, Vec::new());
+    }
+    if region == whole {
+        return (whole, Vec::new());
+    }
+    match region_pixels(bitmap, region) {
+        Some(pixels) => (region, pixels),
+        None => (whole, Vec::new()),
+    }
+}
+
+/// The pixels of `region` inside `bitmap`, packed row after row.
+///
+/// `None` when the region does not fit the bitmap's buffer.
+fn region_pixels(bitmap: &BitmapState, region: PixelRegion) -> Option<Vec<u8>> {
+    let width = usize::try_from(bitmap.width).ok()?;
+    let row_bytes = usize::try_from(region.width).ok()?.checked_mul(4)?;
+    let height = usize::try_from(region.height).ok()?;
+    let mut pixels = Vec::with_capacity(row_bytes.checked_mul(height)?);
+    for row in 0..height {
+        let y = usize::try_from(region.y).ok()?.checked_add(row)?;
+        let start = y
+            .checked_mul(width)?
+            .checked_add(usize::try_from(region.x).ok()?)?;
+        let start = start.checked_mul(4)?;
+        let end = start.checked_add(row_bytes)?;
+        pixels.extend_from_slice(bitmap.rgba.get(start..end)?);
+    }
+    Some(pixels)
+}
+
 /// Clears the dirty flag of every bitmap in `uploaded` after a batch upload.
 ///
 /// A failed batch did not reach the backend, so the bitmaps stay dirty and the
@@ -1179,9 +1289,98 @@ fn clear_uploaded_dirty(scene: &mut Scene, uploaded: &[u32], succeeded: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        PresentFault, Scene, clear_uploaded_dirty, present_outcome, reported_surface_size,
+        Engine, EngineParts, GameFrame, PresentFault, Scene, clear_uploaded_dirty, present_outcome,
+        reported_surface_size,
     };
+    use api::geometry::PixelRegion;
     use api::host::{PresentSkip, Presentation, SurfaceEvent};
+    use render::{NullRenderPipeline, PipelineConfig, begin_render_state, create_render_pipeline};
+    use testkit::headless_window;
+
+    /// A frame hook that changes nothing.
+    struct NoFrame;
+
+    impl GameFrame for NoFrame {
+        fn before_render(&mut self, _now_ms: u64, _dt_ms: f64) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// Builds a headless engine over the null backend.
+    fn headless_engine(size: (u32, u32)) -> Engine {
+        let pipeline = create_render_pipeline(PipelineConfig::null()).expect("null pipeline");
+        let handle = headless_window();
+        let (surface, render_state) = begin_render_state(&pipeline, &handle).expect("surface");
+        Engine::new(EngineParts {
+            pipeline,
+            surface,
+            render_state,
+            surface_size: size,
+            headless: true,
+            overlay: None,
+        })
+        .expect("engine")
+    }
+
+    /// A bitmap that changed in a rectangle uploads that rectangle alone.
+    #[test]
+    fn a_dirty_region_uploads_only_its_own_pixels() {
+        let mut engine = headless_engine((64, 64));
+        let mut hooks = NoFrame;
+        let id = engine.scene_mut().add_bitmap(8, 8, vec![0u8; 8 * 8 * 4]);
+
+        // The first frame creates the texture, so it takes every pixel.
+        engine.frame(0, &mut hooks).expect("first frame");
+        let texture = engine.textures().get(&id).expect("texture").clone();
+        let uploaded = NullRenderPipeline::texture_uploaded_bytes(&engine.render_state, &texture)
+            .expect("uploaded bytes");
+        assert_eq!(uploaded, 8 * 8 * 4, "a new texture takes every pixel");
+
+        // The next frame uploads the marked rectangle alone.
+        engine
+            .scene_mut()
+            .bitmap_mut(id)
+            .expect("bitmap")
+            .mark_dirty_rect(PixelRegion::new(2, 2, 3, 3));
+        engine.frame(16, &mut hooks).expect("second frame");
+        let uploaded = NullRenderPipeline::texture_uploaded_bytes(&engine.render_state, &texture)
+            .expect("uploaded bytes");
+        assert_eq!(
+            uploaded,
+            8 * 8 * 4 + 3 * 3 * 4,
+            "only the marked rectangle is uploaded"
+        );
+        assert!(
+            !engine.scene().bitmap(id).expect("bitmap").dirty,
+            "an uploaded bitmap is clean"
+        );
+    }
+
+    /// A failed upload keeps the bitmap's dirty region for the retry.
+    #[test]
+    fn a_failed_upload_keeps_the_dirty_region_for_the_retry() {
+        let mut scene = Scene::default();
+        let id = scene.add_bitmap(4, 4, vec![0u8; 4 * 4 * 4]);
+        scene.set_bitmap_clean(id);
+        scene
+            .bitmap_mut(id)
+            .expect("bitmap")
+            .mark_dirty_rect(PixelRegion::new(1, 1, 2, 2));
+
+        clear_uploaded_dirty(&mut scene, &[id], false);
+        let bitmap = scene.bitmap(id).expect("bitmap");
+        assert!(bitmap.dirty, "a batch that failed is retried");
+        assert_eq!(
+            bitmap.dirty_region,
+            Some(PixelRegion::new(1, 1, 2, 2)),
+            "the failed region is uploaded again"
+        );
+
+        clear_uploaded_dirty(&mut scene, &[id], true);
+        let bitmap = scene.bitmap(id).expect("bitmap");
+        assert!(!bitmap.dirty, "an uploaded bitmap is clean");
+        assert_eq!(bitmap.dirty_region, None, "a clean bitmap has no region");
+    }
 
     #[test]
     fn a_failed_upload_leaves_every_bitmap_dirty_for_a_retry() {

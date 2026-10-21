@@ -8,8 +8,10 @@
 
 use raw_window_handle::{RawWindowHandle, XlibWindowHandle};
 
+use engine::BitmapState;
 use engine::text::{
-    GlyphAtlas, PositionedGlyph, TextEngine, TextError, TextStyle, compose_text_cpu, project_text,
+    GlyphAtlas, PositionedGlyph, TextCoverageCache, TextEngine, TextError, TextStyle,
+    compose_text_cpu, compose_text_into, project_text, rasterize_text_coverage,
 };
 use render::{
     PipelineConfig, RenderContent, RenderScene, begin_render_state, create_render_pipeline,
@@ -67,6 +69,66 @@ fn layout_positions_glyphs_across_lines() {
     let mut lines: Vec<usize> = layout.glyphs.iter().map(|glyph| glyph.line).collect();
     lines.dedup();
     assert_eq!(lines.len(), 2, "expected two visual lines");
+}
+
+/// Reference: the outline rasterizer puts the baseline of a line at the
+/// face's ascent in whole pixels — the ascender scaled to the pixel size and
+/// truncated (`reference/cpp/core/visual/FreeType.cpp:494`) — and a glyph's
+/// ink box starts at `y + baseline - bitmap_top`
+/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:911-914`).
+///
+/// A baseline that is centred in the line box, or a fractional ascent, puts
+/// every glyph a pixel off its row, which crops the bottom of the text.
+#[test]
+fn a_line_baseline_sits_at_the_face_ascent() {
+    let Some(bytes) = load_test_font() else {
+        return;
+    };
+    let mut engine = TextEngine::new();
+    let font = engine.add_font(&bytes, 0).expect("register font");
+    let style = TextStyle::new(32.0);
+    let metrics = engine.font_metrics(font, 32.0).expect("font metrics");
+    let baseline = metrics.ascent.floor();
+    let layout = engine.layout(font, "A", &style, None).expect("layout");
+    assert_eq!(
+        layout.glyphs[0].baseline_y, baseline,
+        "the line baseline must be the face's ascent in whole pixels"
+    );
+
+    let glyph = engine
+        .rasterize_glyph(font, 'A', &style)
+        .expect("rasterize the glyph");
+    let first_covered_row = glyph
+        .coverage
+        .iter()
+        .position(|coverage| *coverage > 0)
+        .map(|index| index / glyph.width as usize)
+        .expect("the glyph has ink");
+    let mut canvas = BitmapState::new(64, 64, vec![0u8; 64 * 64 * 4]);
+    let mut cache = TextCoverageCache::new();
+    let masks = rasterize_text_coverage(&mut cache, &engine, &layout, &style, true)
+        .expect("rasterize the coverage");
+    compose_text_into(
+        &masks,
+        &style,
+        (0.0, 0.0),
+        0.0,
+        &mut canvas,
+        (0, 0, 64, 64),
+        255,
+    )
+    .expect("compose the text");
+    let ink_row = canvas
+        .rgba
+        .chunks_exact(4)
+        .position(|pixel| pixel[3] != 0)
+        .map(|index| index / 64)
+        .expect("the composed text has ink");
+    assert_eq!(
+        ink_row as i32,
+        baseline as i32 - glyph.bearing_y as i32 + first_covered_row as i32,
+        "the ink must start at the baseline minus the glyph's bitmap top"
+    );
 }
 
 #[test]
@@ -326,4 +388,45 @@ fn layout_cache_memoizes_shaping_and_invalidates_on_change() {
         .layout(font, "cached", &TextStyle::new(22.0), None)
         .expect("layout");
     assert_eq!(engine.cached_layouts(), 2, "a size change re-shapes");
+}
+
+/// Reference: `tTVPNativeBaseBitmap::GetTextSize` sums the rasterizer's
+/// per-character extent, one UTF-16 unit at a time
+/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473`). The
+/// measured advance of a character must not depend on how often it has been
+/// measured before, so a memoized advance has to be the rasterizer's own
+/// value.
+#[test]
+fn a_repeated_advance_measures_the_same_value() {
+    let Some(bytes) = load_test_font() else {
+        return;
+    };
+    let mut engine = TextEngine::new();
+    let font = engine.add_font(&bytes, 0).expect("register font");
+    let style = TextStyle::new(24.0);
+
+    let first = engine
+        .glyph_advance(font, 'A', &style)
+        .expect("measure the advance");
+    let second = engine
+        .glyph_advance(font, 'A', &style)
+        .expect("measure the advance");
+    assert_eq!(
+        first.to_bits(),
+        second.to_bits(),
+        "a repeated measurement must return the same advance"
+    );
+
+    // A second engine measures the same face bytes from scratch, so the
+    // memoized value must equal the freshly measured one.
+    let mut other = TextEngine::new();
+    let other_font = other.add_font(&bytes, 0).expect("register font");
+    let fresh = other
+        .glyph_advance(other_font, 'A', &style)
+        .expect("measure the advance");
+    assert_eq!(
+        first.to_bits(),
+        fresh.to_bits(),
+        "the memoized advance must equal a fresh measurement"
+    );
 }

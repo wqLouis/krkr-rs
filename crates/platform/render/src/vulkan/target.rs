@@ -11,13 +11,12 @@
 //! [`super::VulkanState`].
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
-
 use ash::vk;
 
 use api::error::RenderError;
 use api::geometry::{Affine2, PixelRegion};
 
+use crate::collections::Map;
 use crate::render_target::RenderTargetDesc;
 use crate::scene::RenderScene;
 use crate::texture::TextureFormat;
@@ -251,7 +250,7 @@ pub(crate) fn render(
     submit: &OffscreenSubmit<'_>,
     target: &VulkanRenderTarget,
     pass: &OffscreenPass,
-    textures: &HashMap<u64, VulkanTexture>,
+    textures: &Map<u64, VulkanTexture>,
     effects: Option<&mut super::effect::EffectState>,
     scene: &RenderScene,
 ) -> Result<(), RenderError> {

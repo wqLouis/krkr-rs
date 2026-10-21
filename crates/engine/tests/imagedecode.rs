@@ -5,7 +5,6 @@
 //! tests therefore observe *which* decode ran and *when*, without a timing
 //! assumption.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
@@ -15,7 +14,7 @@ use engine::imagedecode::{
     DecodePool, DecodePoolConfig, DecodePoolError, ImageDecodeError, ImageDecoder, ImageOutcome,
     ImageSizeError, ImageState, JobId, PendingImage,
 };
-use engine::{DecodedImageKey, DecodedImageMode, Engine, EngineParts, GameFrame, Scene};
+use engine::{DecodedImageKey, DecodedImageMode, Engine, EngineParts, GameFrame, Map, Scene};
 use render::{PipelineConfig, begin_render_state, create_render_pipeline};
 use testkit::headless_window;
 
@@ -65,7 +64,7 @@ struct GatedDecoder {
     /// Signalled when a decode enters the decoder.
     entered: Condvar,
     /// The gate of each hint.
-    gates: Mutex<HashMap<String, Arc<Gate>>>,
+    gates: Mutex<Map<String, Arc<Gate>>>,
     /// The hints whose decode fails.
     failing: Mutex<Vec<String>>,
 }
@@ -76,7 +75,7 @@ impl GatedDecoder {
         Self {
             started: Mutex::new(Vec::new()),
             entered: Condvar::new(),
-            gates: Mutex::new(HashMap::new()),
+            gates: Mutex::new(Map::default()),
             failing: Mutex::new(Vec::new()),
         }
     }
@@ -906,5 +905,92 @@ fn a_deferred_decode_counts_once_in_the_pool_accounting() {
         pool.stats().decodes,
         1,
         "the image was decoded once, however often it resolved"
+    );
+}
+
+/// The scene finds the decode that is already running for a cache key, so a
+/// second load of the same image shares it instead of decoding the bytes a
+/// second time.
+///
+/// The reference consults the decoded-image cache before it loads and stores
+/// the decoded image under the same key
+/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1952-1960`), so the
+/// second load of one image is served from the first one's result.
+#[test]
+fn the_scene_finds_the_decode_running_for_a_key() {
+    let decoder = Arc::new(GatedDecoder::new());
+    let mut pool = DecodePool::new(decoder.clone(), config(1)).expect("pool");
+    let key = cache_key("shared.png");
+    let (_, pending) = pool
+        .submit_cached(
+            key.clone(),
+            Arc::from(b"payload".as_slice()),
+            Some("shared".to_string()),
+            PIXELS.len() as u64,
+            None,
+        )
+        .expect("the job is accepted");
+    let mut scene = Scene::default();
+    let id = scene
+        .add_pending_bitmap(2, 2, pending.clone())
+        .expect("the pending bitmap");
+
+    // The running decode is found under the key the load named.
+    let (width, height, found) = scene
+        .pending_decode_for(&key)
+        .expect("the running decode is found");
+    assert_eq!((width, height), (2, 2), "the probed size comes with it");
+    assert!(
+        found.same_decode(&pending),
+        "the found future is the running decode"
+    );
+
+    // A key no decode fills is not found.
+    assert!(
+        scene.pending_decode_for(&cache_key("other.png")).is_none(),
+        "another key has no running decode"
+    );
+
+    // A bitmap that holds no pending decode answers nothing.
+    scene.remove_bitmap(id);
+    assert!(
+        scene.pending_decode_for(&key).is_none(),
+        "the removed bitmap carries no decode"
+    );
+}
+
+/// A decode can be shared: two bitmaps carry the same future and the pixels
+/// land in both. Removing one of them leaves the decode alive, so the other
+/// bitmap still gets the pixels.
+#[test]
+fn removing_one_holder_of_a_shared_decode_keeps_the_decode() {
+    let decoder = Arc::new(GatedDecoder::new());
+    let mut pool = DecodePool::new(decoder.clone(), config(1)).expect("pool");
+    let key = cache_key("shared.png");
+    let (_, pending) = pool
+        .submit_cached(
+            key.clone(),
+            Arc::from(b"payload".as_slice()),
+            Some("shared".to_string()),
+            PIXELS.len() as u64,
+            None,
+        )
+        .expect("the job is accepted");
+    let mut scene = Scene::default();
+    let first = scene
+        .add_pending_bitmap(2, 2, pending.clone())
+        .expect("the first bitmap");
+    let second = scene
+        .add_pending_bitmap(2, 2, pending.clone())
+        .expect("the second bitmap");
+
+    // The first holder goes away while the second one waits for the decode.
+    assert!(scene.remove_bitmap(first));
+    assert!(scene.resolve_bitmap(second), "the second bitmap resolves");
+    let bitmap = scene.bitmap(second).expect("the bitmap");
+    assert_eq!(
+        bitmap.rgba,
+        PIXELS.to_vec(),
+        "the shared decode landed in the bitmap that stayed"
     );
 }

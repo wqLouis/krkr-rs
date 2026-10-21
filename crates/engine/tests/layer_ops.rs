@@ -3,12 +3,14 @@
 //! These lock in the behaviour of the separable running-sum box blur
 //! (`blur_bitmap_in_place`) against the original 2-D summation it replaced.
 
+use api::geometry::PixelRegion;
 use engine::BitmapState;
 use engine::Scene;
 use engine::layer_ops::{
-    AffineBlit, BlitOptions, BlitSource, COPY_MAIN, COPY_MASK, affine_blit, blit_copy, blit_over,
-    blit_plane, blur_bitmap_in_place, copy_9patch, do_gray_scale, fill_color_on_alpha, fill_mask,
-    flip_lr, gaussian_blur, render_layer_subtree, stretch_blit, tile_rect,
+    AffineBlit, BlitOptions, BlitSource, COPY_MAIN, COPY_MASK, affine_blit, affine_blit_clipped,
+    blit_copy, blit_over, blit_plane, blur_bitmap_in_place, copy_9patch, do_gray_scale,
+    fill_color_on_alpha, fill_mask, flip_lr, gaussian_blur, operate_rect, render_layer_subtree,
+    stretch_blit, tile_rect,
 };
 use engine::raster::fill_rect_replace;
 use engine::scene::Rect;
@@ -811,5 +813,159 @@ fn a_transition_over_an_image_without_pixels_writes_nothing() {
     assert!(
         dst.rgba.is_empty(),
         "an image without pixels is not written by the transition"
+    );
+}
+
+/// An affine blit marks the rectangle it wrote, not the whole bitmap.
+///
+/// The frame's upload sends only the marked region to the texture, so a
+/// blit that covered one corner does not re-upload the whole image.
+#[test]
+fn an_affine_blit_marks_only_the_rectangle_it_wrote() {
+    let source = bitmap(4, 4, vec![255u8; 4 * 4 * 4]);
+    let mut destination = bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
+    affine_blit(
+        &mut destination,
+        AffineBlit {
+            corners: [(2.0, 3.0), (6.0, 3.0), (2.0, 7.0)],
+            stretch_type: 0,
+            clear: false,
+            clear_color: [0, 0, 0, 0],
+        },
+        BlitSource {
+            bitmap: &source,
+            rect: (0, 0, 4, 4),
+        },
+        BlitOptions {
+            mode: 2,
+            opa: 255,
+            treat_as_opaque: false,
+            hold_alpha: false,
+        },
+    );
+    assert!(destination.dirty, "the blit marks the bitmap dirty");
+    assert_eq!(
+        destination.dirty_region,
+        Some(PixelRegion::new(2, 3, 5, 5)),
+        "only the mapped rectangle is marked"
+    );
+}
+
+/// A clipped affine blit writes inside the clip alone, and the pixels it
+/// writes there are the ones the unclipped blit writes.
+///
+/// The caller of a clipped blit needs no copy of the destination to restore
+/// the pixels outside the clip, because the pass never touches them.
+#[test]
+fn a_clipped_affine_blit_writes_inside_the_clip_alone() {
+    let source = bitmap(4, 4, vec![255u8; 4 * 4 * 4]);
+    let affine = AffineBlit {
+        corners: [(2.0, 2.0), (10.0, 2.0), (2.0, 10.0)],
+        stretch_type: 0,
+        clear: false,
+        clear_color: [0, 0, 0, 0],
+    };
+    let options = BlitOptions {
+        mode: 2,
+        opa: 255,
+        treat_as_opaque: false,
+        hold_alpha: false,
+    };
+    let mut unclipped = bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
+    let mut clipped = bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
+    affine_blit(
+        &mut unclipped,
+        affine,
+        BlitSource {
+            bitmap: &source,
+            rect: (0, 0, 4, 4),
+        },
+        options,
+    );
+    affine_blit_clipped(
+        &mut clipped,
+        affine,
+        BlitSource {
+            bitmap: &source,
+            rect: (0, 0, 4, 4),
+        },
+        options,
+        (4, 4, 8, 8),
+    );
+
+    for y in 0..16usize {
+        for x in 0..16usize {
+            let i = (y * 16 + x) * 4;
+            let inside = (4..8).contains(&x) && (4..8).contains(&y);
+            if inside {
+                assert_eq!(
+                    clipped.rgba[i..i + 4],
+                    unclipped.rgba[i..i + 4],
+                    "the clipped blit writes the pixels of the unclipped one"
+                );
+            } else {
+                assert_eq!(
+                    clipped.rgba[i..i + 4],
+                    [0, 0, 0, 0],
+                    "the pixels outside the clip are untouched"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        clipped.dirty_region,
+        Some(PixelRegion::new(4, 4, 4, 4)),
+        "only the clipped rectangle is marked"
+    );
+}
+
+/// An `operateRect` marks the rectangle it wrote, not the whole bitmap.
+///
+/// The frame's upload sends only the marked region to the texture, so the
+/// icons the motion player draws do not re-upload the whole target image.
+#[test]
+fn an_operate_rect_marks_only_the_rectangle_it_wrote() {
+    let source = bitmap(4, 4, vec![255u8; 4 * 4 * 4]);
+    let options = BlitOptions {
+        mode: 2,
+        opa: 255,
+        treat_as_opaque: false,
+        hold_alpha: false,
+    };
+
+    let mut destination = bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
+    operate_rect(
+        &mut destination,
+        3,
+        5,
+        BlitSource {
+            bitmap: &source,
+            rect: (0, 0, 4, 4),
+        },
+        options,
+    );
+    assert!(destination.dirty, "the blit marks the bitmap dirty");
+    assert_eq!(
+        destination.dirty_region,
+        Some(PixelRegion::new(3, 5, 4, 4)),
+        "only the written rectangle is marked"
+    );
+
+    // A rectangle that runs past the bitmap is marked clipped.
+    let mut destination = bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
+    operate_rect(
+        &mut destination,
+        14,
+        14,
+        BlitSource {
+            bitmap: &source,
+            rect: (0, 0, 4, 4),
+        },
+        options,
+    );
+    assert_eq!(
+        destination.dirty_region,
+        Some(PixelRegion::new(14, 14, 2, 2)),
+        "the marked rectangle is the clipped one"
     );
 }

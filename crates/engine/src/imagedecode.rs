@@ -168,6 +168,22 @@ impl PendingImage {
         lock(&self.shared.cache_key).clone()
     }
 
+    /// Whether this decode fills the decoded-image cache entry `key`.
+    ///
+    /// The key is compared under the lock, so the lookup allocates nothing.
+    pub fn fills_cache_entry(&self, key: &DecodedImageKey) -> bool {
+        let cache_key = lock(&self.shared.cache_key);
+        cache_key.as_ref() == Some(key)
+    }
+
+    /// Whether `other` waits for the same decode as this one.
+    ///
+    /// Two clones of one pending image share the result slot: the pixels
+    /// land in every holder, and cancelling the decode takes them all.
+    pub fn same_decode(&self, other: &PendingImage) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
     /// Marks the image demanded: a worker prefers a demanded job over a
     /// normal one.
     pub fn demand(&self) {

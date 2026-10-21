@@ -182,3 +182,78 @@ fn raster_operations_mark_the_bitmap_dirty() {
         stroke_polyline(bmp, &[(0.0, 0.0), (8.0, 8.0)], false, [255, 0, 0, 255], 1.0);
     });
 }
+
+/// A clipped fill copies the color — alpha included — into the rectangle and
+/// leaves every pixel outside it alone.
+///
+/// The reference `Layer.fillRect` builds the rectangle from the origin and
+/// the size (`reference/cpp/core/visual/LayerIntf.cpp:8658-8670`); the layer
+/// clips it to its image and fills it with a color **copy**
+/// (`reference/cpp/core/visual/LayerIntf.cpp:4272-4286`), which the bitmap
+/// runs as the `FillARGB` render method
+/// (`reference/cpp/core/visual/LayerBitmapIntf.cpp:286-303`). That method
+/// writes the 32-bit color into every pixel of each row
+/// (`reference/cpp/core/visual/RenderManager.cpp:1122-1140`), so the alpha
+/// becomes the pixel's alpha and the pixels outside the rectangle are
+/// untouched.
+#[test]
+fn fill_rect_replace_copies_the_color_and_leaves_the_outside_alone() {
+    let mut bmp = bitmap(6, 4);
+    // Give every pixel its own color so that a stray write shows up.
+    for y in 0..4u32 {
+        for x in 0..6u32 {
+            let i = bmp.pixel_offset(x, y).expect("pixel in range");
+            bmp.rgba[i..i + 4].copy_from_slice(&[x as u8, y as u8, 0x5a, 0x11]);
+        }
+    }
+    let before = bmp.rgba.clone();
+
+    // The rectangle runs past the right and the bottom edge, so it is
+    // clipped to the image.
+    fill_rect_replace(&mut bmp, 1, 1, 10, 10, [0x10, 0x20, 0x30, 0x40]);
+
+    for y in 0..4u32 {
+        for x in 0..6u32 {
+            let i = bmp.pixel_offset(x, y).expect("pixel in range");
+            let inside = x >= 1 && y >= 1;
+            if inside {
+                assert_eq!(
+                    &bmp.rgba[i..i + 4],
+                    &[0x10, 0x20, 0x30, 0x40],
+                    "the fill copies the color, alpha included, at ({x}, {y})"
+                );
+            } else {
+                assert_eq!(
+                    &bmp.rgba[i..i + 4],
+                    &before[i..i + 4],
+                    "the pixel at ({x}, {y}) is outside the fill and keeps its color"
+                );
+            }
+        }
+    }
+}
+
+/// An empty rectangle covers no pixel, so the image is left as it was.
+///
+/// The reference fills the rectangle the caller gives it
+/// (`reference/cpp/core/visual/LayerIntf.cpp:8658-8670`); a zero width or a
+/// zero height covers nothing, so the image is not modified
+/// (`reference/cpp/core/visual/LayerIntf.cpp:4272-4286`).
+#[test]
+fn fill_rect_replace_with_an_empty_rect_writes_nothing() {
+    let mut bmp = bitmap(4, 4);
+    for y in 0..4u32 {
+        for x in 0..4u32 {
+            let i = bmp.pixel_offset(x, y).expect("pixel in range");
+            bmp.rgba[i..i + 4].copy_from_slice(&[x as u8, y as u8, 0x5a, 0x11]);
+        }
+    }
+    let before = bmp.rgba.clone();
+
+    fill_rect_replace(&mut bmp, 1, 1, 0, 0, [0x10, 0x20, 0x30, 0x40]);
+    fill_rect_replace(&mut bmp, 1, 1, 0, 4, [0x10, 0x20, 0x30, 0x40]);
+    fill_rect_replace(&mut bmp, 1, 1, 4, 0, [0x10, 0x20, 0x30, 0x40]);
+
+    assert_eq!(bmp.rgba, before, "an empty fill writes no pixel");
+    assert!(!bmp.dirty, "an empty fill does not modify the image");
+}

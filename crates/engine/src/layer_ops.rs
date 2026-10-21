@@ -27,6 +27,7 @@
 //! region.
 
 use api::blend::{BlendMode, DstBlend};
+use api::geometry::PixelRegion;
 
 use crate::hasher::Map;
 use crate::raster::{blend_pixel, blend_pixel_at};
@@ -1892,25 +1893,172 @@ pub(crate) fn blend_pixel_mode(
 /// destination row slice (the affine nearest pass) blends with the same
 /// arithmetic.
 fn blend_pixel_mode_at(pixel: &mut [u8; 4], src: [u8; 4], opa: u8, mode: i64) {
+    apply_mode_kernel(mode_kernel(mode), pixel, src, opa);
+}
+
+/// The per-channel operation a numeric blend mode applies.
+///
+/// The mode numbers are the native layer-type numbers (`omOpaque == 1`,
+/// `ltOpaque == 1`, …). A mode without a kernel of its own is source-over.
+#[derive(Clone, Copy)]
+enum ModeKernel {
+    /// The source replaces the destination, including its alpha.
+    Copy,
+    /// Saturating add of the source, scaled by the opacity.
+    Additive,
+    /// Saturating subtract of the source, scaled by the opacity.
+    Subtractive,
+    /// Multiply by the source, scaled by the opacity.
+    Multiplicative,
+    /// The darker of the two channels.
+    Darken,
+    /// The lighter of the two channels.
+    Lighten,
+    /// Screen.
+    Screen,
+    /// Hard light, alpha-composited.
+    HardLight,
+    /// Photoshop additive, alpha-composited.
+    PsAdditive,
+    /// Photoshop subtractive, alpha-composited.
+    PsSubtractive,
+    /// Photoshop multiplicative, alpha-composited.
+    PsMultiplicative,
+    /// Photoshop screen, alpha-composited.
+    PsScreen,
+    /// Photoshop color dodge, alpha-composited.
+    PsColorDodge,
+    /// Photoshop lighten, alpha-composited.
+    PsLighten,
+    /// Photoshop darken, alpha-composited.
+    PsDarken,
+    /// Source-over.
+    SourceOver,
+}
+
+/// The kernel a numeric operation mode applies.
+///
+/// The modes with a kernel of their own name it; `omPsNormal`, `omAlpha`,
+/// `omAddAlpha` and every mode without a kernel of its own reduce to
+/// source-over.
+fn mode_kernel(mode: i64) -> ModeKernel {
     match mode {
+        1 => ModeKernel::Copy,
+        3 => ModeKernel::Additive,
+        4 => ModeKernel::Subtractive,
+        5 => ModeKernel::Multiplicative,
+        9 => ModeKernel::Darken,
+        10 => ModeKernel::Lighten,
+        11 => ModeKernel::Screen,
+        19 => ModeKernel::HardLight,
+        14 => ModeKernel::PsAdditive,
+        15 => ModeKernel::PsSubtractive,
+        16 => ModeKernel::PsMultiplicative,
+        17 => ModeKernel::PsScreen,
+        21 => ModeKernel::PsColorDodge,
+        24 => ModeKernel::PsLighten,
+        25 => ModeKernel::PsDarken,
+        _ => ModeKernel::SourceOver,
+    }
+}
+
+/// The blend one destination pixel of a pass receives.
+///
+/// A pass resolves its operation mode once and blends every sampled texel
+/// with the resolved kernel, so the per-pixel loop does not dispatch on the
+/// mode.
+trait BandBlend {
+    /// Blends `src` into `pixel` with the operation `mode`.
+    fn blend(mode: i64, pixel: &mut [u8; 4], src: [u8; 4], opa: u8);
+}
+
+/// The source replaces the destination.
+struct ReplaceBlend;
+
+impl BandBlend for ReplaceBlend {
+    fn blend(_mode: i64, pixel: &mut [u8; 4], src: [u8; 4], _opa: u8) {
+        *pixel = src;
+    }
+}
+
+/// The source is composited over the destination.
+struct SourceOverBlend;
+
+impl BandBlend for SourceOverBlend {
+    fn blend(_mode: i64, pixel: &mut [u8; 4], src: [u8; 4], opa: u8) {
+        // An opaque source at full opacity replaces the destination, which
+        // is the pixel the general blend computes for it.
+        if opa == 255 && src[3] == 255 {
+            *pixel = src;
+            return;
+        }
+        blend_pixel_at(pixel, src, 255, opa);
+    }
+}
+
+/// A numeric operation mode with its own per-channel kernel.
+struct ModeBlend;
+
+impl BandBlend for ModeBlend {
+    fn blend(mode: i64, pixel: &mut [u8; 4], src: [u8; 4], opa: u8) {
+        blend_pixel_mode_at(pixel, src, opa, mode);
+    }
+}
+
+/// The blend a pass's operation mode applies.
+#[derive(Clone, Copy)]
+enum AffineBlend {
+    /// The source replaces the destination.
+    Replace,
+    /// The source is composited over the destination.
+    SourceOver,
+    /// A numeric operation mode with its own per-channel kernel.
+    Mode,
+}
+
+/// The blend an operation mode applies, resolved once per pass.
+fn affine_blend(mode: i64) -> AffineBlend {
+    match mode_kernel(mode) {
+        ModeKernel::Copy => AffineBlend::Replace,
+        ModeKernel::SourceOver => AffineBlend::SourceOver,
+        ModeKernel::Additive
+        | ModeKernel::Subtractive
+        | ModeKernel::Multiplicative
+        | ModeKernel::Darken
+        | ModeKernel::Lighten
+        | ModeKernel::Screen
+        | ModeKernel::HardLight
+        | ModeKernel::PsAdditive
+        | ModeKernel::PsSubtractive
+        | ModeKernel::PsMultiplicative
+        | ModeKernel::PsScreen
+        | ModeKernel::PsColorDodge
+        | ModeKernel::PsLighten
+        | ModeKernel::PsDarken => AffineBlend::Mode,
+    }
+}
+
+/// Blends `src` into one destination pixel with the kernel of `mode`.
+fn apply_mode_kernel(kernel: ModeKernel, pixel: &mut [u8; 4], src: [u8; 4], opa: u8) {
+    match kernel {
         // omOpaque / ltOpaque: copy the source (including alpha).
-        1 => *pixel = src,
+        ModeKernel::Copy => *pixel = src,
         // omAdditive / ltAdditive: saturating add, source scaled by `opa`.
-        3 => {
+        ModeKernel::Additive => {
             for c in 0..3 {
                 pixel[c] =
                     pixel[c].saturating_add(((u32::from(src[c]) * u32::from(opa)) / 255) as u8);
             }
         }
         // omSubtractive / ltSubtractive.
-        4 => {
+        ModeKernel::Subtractive => {
             for c in 0..3 {
                 pixel[c] =
                     pixel[c].saturating_sub(((u32::from(src[c]) * u32::from(opa)) / 255) as u8);
             }
         }
         // omMultiplicative / ltMultiplicative.
-        5 => {
+        ModeKernel::Multiplicative => {
             let opa = u32::from(opa);
             for c in 0..3 {
                 let s = u32::from(src[c]) * opa / 255;
@@ -1918,19 +2066,19 @@ fn blend_pixel_mode_at(pixel: &mut [u8; 4], src: [u8; 4], opa: u8, mode: i64) {
             }
         }
         // omDarken / ltDarken.
-        9 => {
+        ModeKernel::Darken => {
             for c in 0..3 {
                 pixel[c] = pixel[c].min(src[c]);
             }
         }
         // omLighten / ltLighten.
-        10 => {
+        ModeKernel::Lighten => {
             for c in 0..3 {
                 pixel[c] = pixel[c].max(src[c]);
             }
         }
         // omScreen / ltScreen.
-        11 => {
+        ModeKernel::Screen => {
             for c in 0..3 {
                 let blended = 255 - (255 - u32::from(pixel[c])) * (255 - u32::from(src[c])) / 255;
                 pixel[c] =
@@ -1938,7 +2086,7 @@ fn blend_pixel_mode_at(pixel: &mut [u8; 4], src: [u8; 4], opa: u8, mode: i64) {
             }
         }
         // ltPsHardLight (19): standard hard-light, alpha-composited.
-        19 => {
+        ModeKernel::HardLight => {
             let mut blended = [0u8; 4];
             for c in 0..3 {
                 let sv = i32::from(src[c]);
@@ -1954,10 +2102,8 @@ fn blend_pixel_mode_at(pixel: &mut [u8; 4], src: [u8; 4], opa: u8, mode: i64) {
         }
         // The Photoshop modes apply their per-channel blend function and then
         // the source alpha.
-        // omPsNormal / ltPsNormal: the same alpha blend as omAlpha.
-        13 => blend_pixel_at(pixel, src, 255, opa),
         // omPsAdditive / ltPsAdditive.
-        14 => {
+        ModeKernel::PsAdditive => {
             let mut blended = [0u8; 4];
             for c in 0..3 {
                 blended[c] = pixel[c].saturating_add(src[c]);
@@ -1966,7 +2112,7 @@ fn blend_pixel_mode_at(pixel: &mut [u8; 4], src: [u8; 4], opa: u8, mode: i64) {
             blend_pixel_at(pixel, blended, 255, opa);
         }
         // omPsSubtractive / ltPsSubtractive.
-        15 => {
+        ModeKernel::PsSubtractive => {
             let mut blended = [0u8; 4];
             for c in 0..3 {
                 blended[c] = pixel[c].saturating_sub(src[c]);
@@ -1975,7 +2121,7 @@ fn blend_pixel_mode_at(pixel: &mut [u8; 4], src: [u8; 4], opa: u8, mode: i64) {
             blend_pixel_at(pixel, blended, 255, opa);
         }
         // omPsMultiplicative / ltPsMultiplicative.
-        16 => {
+        ModeKernel::PsMultiplicative => {
             let mut blended = [0u8; 4];
             for c in 0..3 {
                 blended[c] = (u32::from(pixel[c]) * u32::from(src[c]) / 255) as u8;
@@ -1984,7 +2130,7 @@ fn blend_pixel_mode_at(pixel: &mut [u8; 4], src: [u8; 4], opa: u8, mode: i64) {
             blend_pixel_at(pixel, blended, 255, opa);
         }
         // omPsScreen / ltPsScreen.
-        17 => {
+        ModeKernel::PsScreen => {
             let mut blended = [0u8; 4];
             for c in 0..3 {
                 blended[c] =
@@ -1994,7 +2140,7 @@ fn blend_pixel_mode_at(pixel: &mut [u8; 4], src: [u8; 4], opa: u8, mode: i64) {
             blend_pixel_at(pixel, blended, 255, opa);
         }
         // omPsColorDodge / ltPsColorDodge.
-        21 => {
+        ModeKernel::PsColorDodge => {
             let mut blended = [0u8; 4];
             for c in 0..3 {
                 let dv = i32::from(pixel[c]);
@@ -2009,7 +2155,7 @@ fn blend_pixel_mode_at(pixel: &mut [u8; 4], src: [u8; 4], opa: u8, mode: i64) {
             blend_pixel_at(pixel, blended, 255, opa);
         }
         // omPsLighten / ltPsLighten.
-        24 => {
+        ModeKernel::PsLighten => {
             let mut blended = [0u8; 4];
             for c in 0..3 {
                 blended[c] = pixel[c].max(src[c]);
@@ -2018,7 +2164,7 @@ fn blend_pixel_mode_at(pixel: &mut [u8; 4], src: [u8; 4], opa: u8, mode: i64) {
             blend_pixel_at(pixel, blended, 255, opa);
         }
         // omPsDarken / ltPsDarken.
-        25 => {
+        ModeKernel::PsDarken => {
             let mut blended = [0u8; 4];
             for c in 0..3 {
                 blended[c] = pixel[c].min(src[c]);
@@ -2026,9 +2172,9 @@ fn blend_pixel_mode_at(pixel: &mut [u8; 4], src: [u8; 4], opa: u8, mode: i64) {
             blended[3] = src[3];
             blend_pixel_at(pixel, blended, 255, opa);
         }
-        // Everything else (omAlpha=2, omAddAlpha=12 and the remaining modes):
-        // source-over.
-        _ => blend_pixel_at(pixel, src, 255, opa),
+        // omPsNormal / ltPsNormal, omAlpha, omAddAlpha and every mode
+        // without a kernel of its own: source-over.
+        ModeKernel::SourceOver => blend_pixel_at(pixel, src, 255, opa),
     }
 }
 
@@ -2074,7 +2220,9 @@ pub fn operate_rect(
             }
         }
     }
-    dst.mark_dirty();
+    // The pass wrote inside the clipped destination rectangle only, so the
+    // upload needs that rectangle and not the whole bitmap.
+    dst.mark_dirty_rect(clipped_region(dc));
 }
 
 /// `StretchPile`/`StretchBlend`/`OperateStretch`: resample `src[src_rect]`
@@ -2119,7 +2267,9 @@ pub fn stretch_blit_mode(
             }
         }
     }
-    dst.mark_dirty();
+    // The pass wrote inside the clipped destination rectangle only, so the
+    // upload needs that rectangle and not the whole bitmap.
+    dst.mark_dirty_rect(clipped_region(dc));
 }
 
 /// The forward affine map of the three destination corners `p0` (src LT),
@@ -2145,6 +2295,21 @@ pub fn affine_blit(
     affine: AffineBlit,
     source: BlitSource<'_>,
     options: BlitOptions,
+) {
+    affine_blit_clipped(dst, affine, source, options, clip_rect(None))
+}
+
+/// [`affine_blit`] with the clip rectangle the pass writes inside.
+///
+/// The pass touches the pixels of `clip` alone; the ones outside keep their
+/// pixels. A caller that draws into a clipped region needs no copy of the
+/// destination to restore afterwards.
+pub fn affine_blit_clipped(
+    dst: &mut BitmapState,
+    affine: AffineBlit,
+    source: BlitSource<'_>,
+    options: BlitOptions,
+    clip: RectI,
 ) {
     let AffineBlit {
         corners,
@@ -2173,6 +2338,10 @@ pub fn affine_blit(
     let Some(dc) = intersect(dst, bbox) else {
         return;
     };
+    // The pass writes inside the clip alone.
+    let Some(dc) = intersect_rect(dc, clip) else {
+        return;
+    };
     if clear {
         for y in dc.1..dc.3 {
             for x in dc.0..dc.2 {
@@ -2198,7 +2367,22 @@ pub fn affine_blit(
     } else {
         affine_blit_generic(dst, pass);
     }
-    dst.mark_dirty();
+    // The pass wrote inside the clipped destination rectangle only, so the
+    // upload needs that rectangle and not the whole bitmap.
+    dst.mark_dirty_rect(clipped_region(dc));
+}
+
+/// The pixel region a clipped rectangle covers.
+///
+/// The rectangle comes from [`intersect`], so it lies inside the bitmap's
+/// own bounds.
+fn clipped_region(rect: RectI) -> PixelRegion {
+    PixelRegion::from_min_max(
+        rect.0.max(0) as u32,
+        rect.1.max(0) as u32,
+        rect.2.max(0) as u32,
+        rect.3.max(0) as u32,
+    )
 }
 
 /// The bounding box of the mapped unit square.
@@ -2240,6 +2424,15 @@ fn affine_dest_bbox(m: [f64; 6]) -> RectI {
 /// The generic affine pass: every destination pixel is inverse-mapped through
 /// the 2x2 matrix and the source is sampled with the requested resampler.
 fn affine_blit_generic(dst: &mut BitmapState, pass: AffinePass<'_>) {
+    match affine_blend(pass.mode) {
+        AffineBlend::Replace => affine_blit_generic_with::<ReplaceBlend>(dst, pass),
+        AffineBlend::SourceOver => affine_blit_generic_with::<SourceOverBlend>(dst, pass),
+        AffineBlend::Mode => affine_blit_generic_with::<ModeBlend>(dst, pass),
+    }
+}
+
+/// The generic affine pass with its blend resolved.
+fn affine_blit_generic_with<B: BandBlend>(dst: &mut BitmapState, pass: AffinePass<'_>) {
     let AffinePass {
         map: m,
         inverse: inv,
@@ -2252,7 +2445,12 @@ fn affine_blit_generic(dst: &mut BitmapState, pass: AffinePass<'_>) {
     } = pass;
     let sw = (src_rect.2 - src_rect.0) as f64;
     let sh = (src_rect.3 - src_rect.1) as f64;
+    let row_bytes = dst.width as usize * 4;
     for y in dc.1..dc.3 {
+        let row_start = y as usize * row_bytes;
+        let Some(row) = dst.rgba.get_mut(row_start..row_start + row_bytes) else {
+            continue;
+        };
         for x in dc.0..dc.2 {
             let px = x as f64 + 0.5 - m[0];
             let py = y as f64 + 0.5 - m[3];
@@ -2268,7 +2466,15 @@ fn affine_blit_generic(dst: &mut BitmapState, pass: AffinePass<'_>) {
             // same resampler set as `stretch*`.
             let rect = (0, 0, dim_i32(src.width), dim_i32(src.height));
             let color = sample_kind(src, rect, fx, fy, stretch_type);
-            blend_pixel_mode(dst, x, y, color, opa, mode);
+            let offset = x as usize * 4;
+            let mut destination = [
+                row[offset],
+                row[offset + 1],
+                row[offset + 2],
+                row[offset + 3],
+            ];
+            B::blend(mode, &mut destination, color, opa);
+            row[offset..offset + 4].copy_from_slice(&destination);
         }
     }
 }
@@ -2308,11 +2514,12 @@ fn affine_blit_nearest_rows(dst: &mut BitmapState, pass: AffinePass<'_>) {
     }
     let row_bytes = dst_width as usize * 4;
     let rows = (pass.dest_rect.3 - pass.dest_rect.1) as usize;
+    let columns = (pass.dest_rect.2 - pass.dest_rect.0) as usize;
     let band_start = pass.dest_rect.1 as usize * row_bytes;
     let Some(band) = dst.rgba.get_mut(band_start..band_start + rows * row_bytes) else {
         return;
     };
-    let threads = affine_thread_count(rows);
+    let threads = affine_thread_count(rows, columns);
     if threads <= 1 {
         affine_nearest_band(band, pass.dest_rect.1, dst_width, pass);
         return;
@@ -2332,15 +2539,25 @@ fn affine_blit_nearest_rows(dst: &mut BitmapState, pass: AffinePass<'_>) {
 
 /// The number of bands the nearest pass splits its destination rows across.
 ///
-/// A short pass stays on the calling thread: splitting it would cost more
-/// than it saves.
-fn affine_thread_count(rows: usize) -> usize {
+/// A pass that is short or narrow stays on the calling thread: the threads
+/// it would spawn cost more to start than such a pass saves. A wide pass
+/// splits into bands that each cover enough pixels to pay for their thread.
+fn affine_thread_count(rows: usize, columns: usize) -> usize {
     const MIN_ROWS_PER_BAND: usize = 64;
+    const MIN_PIXELS_PER_BAND: usize = 1 << 18;
     if rows < MIN_ROWS_PER_BAND * 2 {
         return 1;
     }
+    let pixels = rows.saturating_mul(columns);
+    if pixels < MIN_PIXELS_PER_BAND * 2 {
+        return 1;
+    }
     let available = std::thread::available_parallelism().map_or(1, |count| count.get());
-    available.clamp(1, 8).min(rows / MIN_ROWS_PER_BAND).max(1)
+    available
+        .clamp(1, 8)
+        .min(rows / MIN_ROWS_PER_BAND)
+        .min(pixels / MIN_PIXELS_PER_BAND)
+        .max(1)
 }
 
 /// The map and the blend an affine pass walks with.
@@ -2368,6 +2585,27 @@ struct AffinePass<'a> {
 ///
 /// `band` holds the destination rows from `first_row`, in order.
 fn affine_nearest_band(band: &mut [u8], first_row: i32, dst_width: i32, pass: AffinePass<'_>) {
+    match affine_blend(pass.mode) {
+        AffineBlend::Replace => {
+            affine_nearest_band_with::<ReplaceBlend>(band, first_row, dst_width, pass);
+        }
+        AffineBlend::SourceOver => {
+            affine_nearest_band_with::<SourceOverBlend>(band, first_row, dst_width, pass);
+        }
+        AffineBlend::Mode => {
+            affine_nearest_band_with::<ModeBlend>(band, first_row, dst_width, pass);
+        }
+    }
+}
+
+/// The nearest pass over one band of destination rows, with its blend
+/// resolved.
+fn affine_nearest_band_with<B: BandBlend>(
+    band: &mut [u8],
+    first_row: i32,
+    dst_width: i32,
+    pass: AffinePass<'_>,
+) {
     let AffinePass {
         map: m,
         inverse: inv,
@@ -2394,7 +2632,10 @@ fn affine_nearest_band(band: &mut [u8], first_row: i32, dst_width: i32, pass: Af
             continue;
         }
         let fy = src_rect.1 as f32 + (v * sh) as f32 - 0.5;
-        let sy = ((fy + 0.5).floor() as i32).clamp(0, src_height - 1);
+        // The source row is the floor of the sample position, clamped to the
+        // source. A negative position clamps to the first row either way, so
+        // the truncation is the floor.
+        let sy = ((fy + 0.5) as i32).clamp(0, src_height - 1);
         let row_start = sy as usize * src_row_bytes;
         let Some(source_row) = src.rgba.get(row_start..row_start + src_row_bytes) else {
             continue;
@@ -2402,15 +2643,21 @@ fn affine_nearest_band(band: &mut [u8], first_row: i32, dst_width: i32, pass: Af
         // The `u` term of the inverse map that does not depend on the
         // destination column is the same for the whole row.
         let inv1_py = inv[1] * py;
+        // The destination column's half-pixel position grows by exactly one
+        // per column, so it is stepped instead of recomputed.
+        let mut x_half = dc.0 as f64 + 0.5;
         for column in dc.0 as usize..dc.2 as usize {
-            let x = column as i32;
-            let px = x as f64 + 0.5 - m[0];
+            let px = x_half - m[0];
+            x_half += 1.0;
             let u = inv[0] * px + inv1_py;
             if !(0.0..=1.0).contains(&u) {
                 continue;
             }
             let fx = src_rect.0 as f32 + (u * sw) as f32 - 0.5;
-            let sx = ((fx + 0.5).floor() as i32).clamp(0, src_width - 1);
+            // The source column is the floor of the sample position, clamped
+            // to the source; a negative position clamps to the first column
+            // either way, so the truncation is the floor.
+            let sx = ((fx + 0.5) as i32).clamp(0, src_width - 1);
             let source_offset = sx as usize * 4;
             let color = [
                 source_row[source_offset],
@@ -2425,7 +2672,7 @@ fn affine_nearest_band(band: &mut [u8], first_row: i32, dst_width: i32, pass: Af
                 row[offset + 2],
                 row[offset + 3],
             ];
-            blend_pixel_mode_at(&mut destination, color, opa, mode);
+            B::blend(mode, &mut destination, color, opa);
             row[offset..offset + 4].copy_from_slice(&destination);
         }
     }
@@ -3321,12 +3568,16 @@ mod tests {
 
     /// A pass over many rows is split into bands and run in parallel; the
     /// result must not depend on the split.
+    ///
+    /// The pass covers enough pixels to be split: a smaller one stays on the
+    /// calling thread, because the threads it would spawn cost more than the
+    /// pass saves.
     #[test]
     fn the_nearest_scanline_pass_splits_long_passes() {
         let src = source_texture(64, 64);
-        let corners = [(0.0, 0.0), (192.0, 0.0), (0.0, 192.0)];
-        let mut scanline = BitmapState::new(192, 192, vec![0u8; 192 * 192 * 4]);
-        let mut generic = BitmapState::new(192, 192, vec![0u8; 192 * 192 * 4]);
+        let corners = [(0.0, 0.0), (1024.0, 0.0), (0.0, 1024.0)];
+        let mut scanline = BitmapState::new(1024, 1024, vec![0u8; 1024 * 1024 * 4]);
+        let mut generic = BitmapState::new(1024, 1024, vec![0u8; 1024 * 1024 * 4]);
         affine_blit(
             &mut scanline,
             AffineBlit {

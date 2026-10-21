@@ -22,10 +22,10 @@
 //!
 //! [`InputState`] owns no global and no clock: all state is explicit.
 
-use std::collections::HashMap;
-
 use api::host::{TouchPhase, TouchPoint};
 use api::input::{InputEvent, MouseButton};
+
+use crate::hasher::{Map, map};
 
 /// Default number of frames a follow-up press stays in the same click
 /// sequence.
@@ -107,11 +107,11 @@ pub struct InputState {
     /// Whether the pointer is visible.
     pub pointer_visible: bool,
     warp_request: Option<(f32, f32)>,
-    buttons: HashMap<MouseButton, ButtonState>,
+    buttons: Map<MouseButton, ButtonState>,
     wheel: f32,
-    keys: HashMap<u32, KeyState>,
+    keys: Map<u32, KeyState>,
     last_pressed: Vec<u32>,
-    touches: HashMap<u64, TouchContact>,
+    touches: Map<u64, TouchContact>,
     text_input: String,
     frame: u64,
     click_sequence_frames: u64,
@@ -125,11 +125,11 @@ impl Default for InputState {
             pointer_inside: false,
             pointer_visible: true,
             warp_request: None,
-            buttons: HashMap::new(),
+            buttons: map(),
             wheel: 0.0,
-            keys: HashMap::new(),
+            keys: map(),
             last_pressed: Vec::new(),
-            touches: HashMap::new(),
+            touches: map(),
             text_input: String::new(),
             frame: 0,
             click_sequence_frames: DEFAULT_CLICK_SEQUENCE_FRAMES,

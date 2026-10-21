@@ -9,17 +9,22 @@
 //! backend cannot run effect pipelines — and the transition that needs it
 //! blends on the CPU instead.
 
-use std::collections::HashMap;
-
 use render::EffectPipeline;
 
+use crate::hasher::{Map, map};
 use crate::shader::Program;
 
 /// The backend handles of the programs the scene can draw.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct EffectPipelines {
     /// The pipeline of each program that has one.
-    handles: HashMap<Program, EffectPipeline>,
+    handles: Map<Program, EffectPipeline>,
+}
+
+impl Default for EffectPipelines {
+    fn default() -> Self {
+        Self { handles: map() }
+    }
 }
 
 impl EffectPipelines {

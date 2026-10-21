@@ -221,7 +221,7 @@ fn entry_hasher() -> ahash::RandomState {
 }
 
 /// Archive entries keyed by normalized name.
-type EntryMap = std::collections::HashMap<String, Entry, ahash::RandomState>;
+type EntryMap = hashbrown::HashMap<String, Entry, ahash::RandomState>;
 
 fn entry_map() -> EntryMap {
     EntryMap::with_hasher(entry_hasher())

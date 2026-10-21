@@ -6,13 +6,12 @@
 //! `SHADER_READ_ONLY_OPTIMAL`, which is the layout the pipelines sample.
 #![allow(unsafe_code)]
 
-use std::collections::{HashMap, HashSet};
-
 use ash::vk;
 
 use api::error::RenderError;
 use api::geometry::PixelRegion;
 
+use crate::collections::{Map, Set, set_with_capacity};
 use crate::state::{RenderState, StateKind};
 use crate::texture::{TextureDesc, TextureFormat};
 
@@ -260,7 +259,7 @@ impl UploadRing {
         device: &ash::Device,
         keys: &[u64],
     ) -> Result<&mut UploadSlot, RenderError> {
-        let incoming: HashSet<u64> = keys.iter().copied().collect();
+        let incoming: Set<u64> = keys.iter().copied().collect();
         let overlaps = self
             .slots
             .iter()
@@ -647,7 +646,7 @@ pub(crate) struct TextureUpload<'a> {
 pub(crate) fn upload_batch(
     context: &UploadContext<'_>,
     ring: &mut UploadRing,
-    textures: &mut HashMap<u64, VulkanTexture>,
+    textures: &mut Map<u64, VulkanTexture>,
     uploads: &[TextureUpload<'_>],
 ) -> Result<(), RenderError> {
     if uploads.is_empty() {
@@ -659,7 +658,7 @@ pub(crate) fn upload_batch(
     // A texture repeated in one batch is only in `UNDEFINED` for its first
     // copy; every later copy starts from the sampled layout the previous
     // transition left behind.
-    let mut seen: HashSet<u64> = HashSet::with_capacity(uploads.len());
+    let mut seen: Set<u64> = set_with_capacity(uploads.len());
     let batch = StageBatch {
         keys: &keys,
         uploads,

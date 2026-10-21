@@ -47,6 +47,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocator-api2"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+
+[[package]]
 name = "alsa"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -168,11 +174,13 @@ dependencies = [
 name = "app"
 version = "1.0.0"
 dependencies = [
+ "ahash",
  "api",
  "compat",
  "engine",
  "env_logger",
  "fs",
+ "hashbrown",
  "log",
  "media",
  "platform",
@@ -484,12 +492,14 @@ dependencies = [
 name = "compat"
 version = "1.0.0"
 dependencies = [
+ "ahash",
  "api",
  "chardetng",
  "encoding_rs",
  "engine",
  "flate2",
  "fs",
+ "hashbrown",
  "libc",
  "log",
  "md-5",
@@ -779,6 +789,7 @@ dependencies = [
  "api",
  "cosmic-text",
  "fs",
+ "hashbrown",
  "log",
  "raw-window-handle",
  "render",
@@ -908,6 +919,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "font-types"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -981,6 +998,7 @@ dependencies = [
  "ahash",
  "api",
  "flate2",
+ "hashbrown",
  "testkit",
  "thiserror 2.0.20",
 ]
@@ -1097,6 +1115,11 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash",
+]
 
 [[package]]
 name = "hermit-abi"
@@ -1997,9 +2020,11 @@ dependencies = [
 name = "psd"
 version = "1.0.0"
 dependencies = [
+ "ahash",
  "fearless_simd",
  "flate2",
  "forkunion",
+ "hashbrown",
  "log",
  "thiserror 2.0.20",
 ]
@@ -2159,9 +2184,11 @@ name = "render"
 version = "1.0.0"
 dependencies = [
  "ab_glyph",
+ "ahash",
  "api",
  "ash",
  "ash-window",
+ "hashbrown",
  "log",
  "raw-window-handle",
  "testkit",
