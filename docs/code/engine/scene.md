@@ -53,7 +53,7 @@ projected scene.
 | `WindowState` | the client size, visibility, opacity, the primary layer, the focus domains and their focus, and the window's layer list |
 | `LayerState` | the parent/child links, the focus domain, the rect, visibility, opacity, the generic `BlendMode`, the sibling sort key, the image placement, the province plane, the hit-test mode, the clip rect, the focus and hint properties, the cache slots (`cache_bitmap`, `cache_content`, `transition_self`, `transition_frame`, `cache_enabled_count`, `cache_recalc`) and the `pending_paint` / `shutdown` flags |
 | `TransitionFrame` / `TransitionSource` | the frame a composited transition draws on a layer: its pixel size, whether it covers the layer rect, and the two source draws (`bitmap`, `src`, `dst`, `alpha`) |
-| `BitmapState` | the RGBA8 pixels, the dimensions, the dirty flag, the script-ownership flag, the `content_generation` counter and the pending decode (`pending`) |
+| `BitmapState` | the RGBA8 pixels, the dimensions, the dirty flag and dirty region, the script-ownership flag, the `content_generation` counter and the pending decode (`pending`) |
 | `FontState` | the requested face, height, colour and the style flags |
 | `Rect` | a window-coordinate rectangle (`x`, `y`, `w`, `h`) |
 | `DecodedImageKey` / `DecodedImageMode` | the cache key of one decoded image and its load variant (`Full` / `Province`) |
@@ -115,6 +115,7 @@ A bitmap whose pixels are still being decoded carries the decode future in
 | `add_pending_bitmap(width, height, pending)` | adds a bitmap with the probed size and no pixels, and returns its id. `ImageSizeError::TooLarge` when the pixel count is not representable. |
 | `set_pending_image(id, width, height, pending)` | puts a pending decode on an existing bitmap and cancels the one it carried. |
 | `pending_image(id)` | the bitmap's pending future, or `None` when it holds its pixels. |
+| `pending_decode_for(key)` | the decode already running for the key: the probed size and a clone of the shared future, or `None` when no bitmap carries that decode. |
 | `resolve_bitmap(id)` | waits for one bitmap's pending image and installs its pixels; a successful decode is also stored in the decoded-image cache under the key the load named. |
 | `resolve_pending_images()` | waits for every pending image and installs the pixels; returns how many it resolved. |
 
@@ -202,7 +203,8 @@ hit. The caller decodes only on a miss.
   bitmap's image, giving it a new pending decode or removing it cancels the
   decode it carried; a size change resolves it first, so the decoded overlap
   is what the resize preserves and a waiter sees the cancellation instead of
-  stale pixels.
+  stale pixels. A decode another bitmap still waits for is left alone, and
+  the same decode installed again is not a new one.
 * **A failed decode installs a blank, not an exception.** The bitmap keeps the
   probed size and every pixel becomes transparent; the failure is logged. The
   load that queued the decode already returned, so there is no call to fail.
@@ -243,13 +245,14 @@ Scene::add_layer / update_layer / layer_mut / bitmap_mut …
 Scene  ──► projection::project_scene_report ──► RenderScene (VM pixels)
    │                    (reads rect, blend, image placement, cache slots)
    │
-   ├──► engine::Engine::sync_dirty_bitmaps  (reads `dirty`, uploads `rgba`)
-   └──► layer_ops / raster (write pixels through BitmapState, then mark_dirty)
+   ├──► engine::Engine::sync_dirty_bitmaps  (reads `dirty_region`, uploads the region)
+   └──► layer_ops / raster (write pixels through BitmapState, then mark_dirty[_rect])
 ```
 
-`BitmapState::mark_dirty` sets the dirty flag and bumps
-`content_generation`, which the subtree-cache bookkeeping sums to detect an
-image edit that did not go through a layer accessor.
+`BitmapState::mark_dirty` sets the whole bitmap dirty; `mark_dirty_rect`
+widens a partial region. Both bump `content_generation`, which the
+subtree-cache bookkeeping sums to detect an image edit that did not go through
+a layer accessor. A full mark (`dirty_region == None`) overrides a partial one.
 
 ### The pending-image path
 
@@ -271,6 +274,11 @@ Scene::add_pending_bitmap / set_pending_image   (probed size, no pixels)
    ▼
 the decoded pixels land in the bitmap  (or a transparent blank, on a failure)
 ```
+
+A load of an image whose decode is already running shares that decode: the
+scene finds it with `pending_decode_for`, and every holder carries a clone of
+the same future. The pixels land in all of them, and the decode stays alive
+as long as one of them waits for it.
 
 ---
 
@@ -310,8 +318,11 @@ the decoded pixels land in the bitmap  (or a transparent blank, on a failure)
 
 ## 6. Current limits
 
-* **`BitmapState` carries no dirty region**, so a full-frame upload cannot be
-  narrowed without a cross-cutting change.
+* **The dirty region is a conservative bounding rectangle.** A partial mark
+  widens to the union of the rectangles, and only the affine,
+  `operate_rect` and `stretch_blit_mode` writes use partial marks so far; the
+  other primitive families still mark the whole bitmap. A new-texture upload
+  is always whole.
 * **The decoded-image cache is consulted on every load but is disabled by the
   reference default** (`System.graphicCacheLimit = 0`).
 * **A deferred decode enters the decoded-image cache.** The synchronous

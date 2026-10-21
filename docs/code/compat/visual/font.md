@@ -42,7 +42,7 @@ A second construction raises `"Font: this font is already constructed"`.
 | Member | Behaviour |
 |---|---|
 | `Font([face, height, color])` | creates or resets the font. The face defaults to `"MS Gothic"`, the height to `16` and the colour to `0xffffffff`. A negative height is normalised to positive. Returns the scene font id. |
-| `getTextWidth(text)` | the shaped width in pixels (an integer). For a **layer-bound** font with a mapped `.tft`, the sum of the `.tft` `Inc` values instead. |
+| `getTextWidth(text)` | the sum of each character's rounded advance in pixels (an integer). For a **layer-bound** font with a mapped `.tft`, the sum of the `.tft` `Inc` values instead. |
 | `getTextHeight(text)` | `abs(Font.Height)` in pixels (an integer). |
 | `getEscWidthX(text)` | `cos(θ) · width`, with `θ = angle · π / 1800` (a real). |
 | `getEscWidthY(text)` | `−sin(θ) · width` (a real). |
@@ -70,7 +70,7 @@ colour (set only by the constructor).
 
 * A **mapped `.tft`** gives `width = Σ Inc` (falling back to the rasterizer
   advance for a unit the `.tft` lacks) and `height = abs(Font.Height)`.
-* Otherwise the width is the shaped width and the height is `abs(Font.Height)`.
+* Otherwise the width is the sum of each character's rounded advance and the height is `abs(Font.Height)`.
 * `getTextWidth` and `getTextHeight` are **unrotated**; only the `getEsc*`
   variants apply the angle.
 * `getGlyphDrawRect` always returns a **fresh** `Rect` object; a missing

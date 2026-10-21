@@ -1,8 +1,10 @@
 # wuvorbis (`wuvorbis.dll`)
 
-**DLL name:** `wuvorbis.dll` — linked with `Plugins.link("wuvorbis.dll")`
+**DLL name:** `wuvorbis.dll` (aliases: none) — linked with `Plugins.link("wuvorbis.dll")`
 **Rust module:** `crates/compat/src/natives/plugins/wuvorbis/`
-**Reference:** no `reference/cpp` source — the reference is the shipped binary; the decoder's call pattern is documented in `reference/cpp/core/sound/VorbisWaveDecoder.cpp`
+**Reference:** no `reference/cpp` source — the reference is the shipped binary;
+the decoder's call pattern is documented in
+`reference/cpp/core/sound/VorbisWaveDecoder.cpp`
 **Registers:** nothing — the `.ogg` decoder lives in the host audio chain
 
 ## Surface
@@ -22,9 +24,9 @@ function:
   prefix);
 * it attaches to the win32 sound system as a TSS sound module
   (`GetModuleInstance` → `ITSSModule::GetSupportExts` /
-  `GetMediaInstance`, declared in `reference/cpp/core/sound/win32/tvpsnd.h`
-  and consumed by `TVPSearchAvailTSSWaveDecoder`,
-  `reference/cpp/core/sound/WaveImpl.cpp:279`);
+  `GetMediaInstance`, declared in `reference/cpp/core/sound/win32/tvpsnd.h` and
+  consumed by `TVPSearchAvailTSSWaveDecoder`,
+  `reference/cpp/core/sound/win32/WaveImpl.cpp:279`);
 * `Query_sizeof_OggVorbis_File` and the `wu_*` symbols are that C decoder API,
   not script surface: the `OggVorbis` / `wuvorbis` wide strings found in the
   DLL are the module's metadata (`docs.old/plugin_host_exe.md` §2.4, §5.3), and
@@ -32,14 +34,18 @@ function:
 
 ## Behaviour
 
-`Plugins.link("wuvorbis.dll")` resolves to the built-in table and succeeds,
-so the game is not routed to the null plugin object.
+`Plugins.link("wuvorbis.dll")` resolves to the built-in table and succeeds, so
+the game is not routed to the null plugin object. The entry carries no
+members of its own, so the link changes nothing else either.
 
 The compat layer never links a codec: it exposes the host decoder seam
-`add_audio_decoder`, and the composition root (`crates/app/src/audio.rs`)
-fills it with the L1 `media` decoders. The reference's decoder *creator*
-maps to that seam, so `.ogg` decoding is the host's job and the plugin entry
-itself installs nothing.
+`compat::add_audio_decoder`
+(`crates/compat/src/natives/sound.rs`), and the composition root
+(`crates/app/src/audio.rs`) fills it with the L1 `media` decoder
+(symphonia with the `ogg` and `vorbis` features,
+`crates/platform/media/Cargo.toml`). The reference's decoder *creator* maps to
+that seam, so `.ogg` decoding is the host's job and the plugin entry itself
+installs nothing.
 
 The result is that a `WaveSoundBuffer` opened over an `.ogg` storage decodes
 through the host chain, exactly as on the reference, and the game sees the
@@ -48,7 +54,8 @@ same samples.
 ## State and lifetime
 
 No state inside the plugin: the decoder lives in the host chain the
-composition root installs before any script runs.
+composition root installs before any script runs, and the decoded sound source
+belongs to the engine's mixer.
 
 ## Errors
 
@@ -61,10 +68,10 @@ composition root installs before any script runs.
 
 | file | what it pins |
 |---|---|
-| `crates/compat/tests/wuvorbis.rs` | the link resolves to the built-in table and is idempotent (no `wuvorbis` null global, no TJS class); a `WaveSoundBuffer` over the committed 0.2 s / 44.1 kHz fixture decodes through the host chain installed the way the composition root installs it; running without the host decoder is a typed error; a corrupt `.ogg` reports the decoder's typed error |
-| `crates/platform/media/tests/audio.rs` | the same fixture probes and decodes with the `.ogg` name, the bare extension and no hints; a stream decodes frame-identically to the whole-file decode; a truncated stream is a typed `MediaError` |
-| `crates/compat/tests/plugin.rs` | that `Plugins.link("wuvorbis.dll")` resolves to the built-in table |
-| `crates/compat/tests/null_plugin.rs` | that the link does not install a null object |
+| `crates/compat/tests/wuvorbis.rs` | that the link resolves to the built-in table and is idempotent (no `wuvorbis` null global, no TJS class); that a `WaveSoundBuffer` over the committed 0.2 s / 44.1 kHz fixture decodes through the host chain installed the way the composition root installs it; that running without the host decoder is a typed error; and that a corrupt `.ogg` reports the decoder's typed error |
+| `crates/platform/media/tests/audio.rs` | that the same fixture probes and decodes with the `.ogg` name, the bare extension and no hints; that a stream decodes frame-identically to the whole-file decode; and that a truncated stream is a typed `MediaError` |
+| `crates/compat/tests/plugin.rs` | that `wuvorbis.dll` — one of the DLLs the shipped game links — resolves to the built-in table |
+| `crates/compat/tests/null_plugin.rs` | that linking `wuvorbis.dll` installs no null plugin object under the DLL's stem |
 
 ## Known gaps
 

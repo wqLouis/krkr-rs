@@ -45,7 +45,36 @@ User-visible design, cross-layer changes, the surface baseline, commits, tags,
 and the final gate stay with the main agent. Routine module cleanup, a scoped
 bug fix, and a mechanical migration are delegated.
 
-### 0.1 Subagents are scoped workers
+### 0.1 The main agent's loop — set direction, verify, integrate
+
+The main agent does not research every hotspot or type the mechanical change
+itself. It runs one loop:
+
+1. **Set direction.** Name the module, the exact files, the reference lines and
+   the outcome. The brief says *what* and *where*; the worker works out the
+   *how*.
+2. **Dispatch disjoint workers.** One coherent change per worker, and no two
+   workers writing the same file in one wave. Work is produced in an isolated
+   `/tmp/<task>-work` copy or worktree of the current tree and delivered as
+   `/tmp/<task>.patch`: the worker commits a baseline there, edits, and runs
+   `git diff > /tmp/<task>.patch`. A worker never commits or pushes the real
+   checkout.
+3. **Verify the patch.** Read the diff, apply it with `git apply --3way`,
+   resolve conflicts, and check the layer boundary, the reference behaviour,
+   the surface lock, the task's non-goals and silent fallbacks.
+4. **Run the gate.** Only the main agent runs `cargo fmt`, clippy, the full
+   static gate and both test suites.
+5. **Measure.** Re-run the trace or benchmark that motivated the change; a
+   performance claim is only done after a symbol-rich release measurement.
+6. **Integrate.** Delete the superseded path/doc, update the design record and
+   commit only after the gate and tests are green. A worker report is a
+   proposal, not a completed change.
+
+The main agent edits the real checkout only to integrate: resolve a conflict,
+fix a gate failure, update a doc, or run a small verification harness. It may
+read code to judge a patch, but it does not duplicate the worker's research.
+
+### 0.2 Subagents are scoped workers
 
 A subagent is a worker with a **narrow, explicit scope**. It implements one
 coherent change, in the assigned files, against the reference and the layer
@@ -68,7 +97,8 @@ A task brief is deliberately short enough to paste into a worker:
 
 ```text
 Goal:        one behavior or cleanup, with the evidence that proves it
-Write:       exact files/directories; no other writes
+Write:       exact files/directories inside the isolated copy; no other writes
+Work:        /tmp/<task>-work; deliver /tmp/<task>.patch; no repo commit
 Read:        the module, its callers, and the cited reference lines
 Must hold:   invariants, public/script surface, layer boundary
 Do not:      unrelated fixes, new deps, public renames, commits
@@ -79,6 +109,12 @@ Report:      files, patterns, risk, left alone, blockers
 Parallel workers only run on **disjoint write scopes**. Two workers never edit
 the same file in one wave. A worker that finds a bug outside its scope reports
 it; it does not fix it.
+
+**The delivered artifact is a patch.** New work is produced from an isolated
+`/tmp/<task>-work` copy/worktree and delivered as `/tmp/<task>.patch`; a direct
+repository write scope is only for an urgent in-flight branch, and even then
+the worker reports the diff rather than committing. The main agent applies the
+patch to the real checkout, so the worker cannot leave the tree half-edited.
 
 **Deletion is part of the change.** When a patch replaces an implementation,
 test, allowlist entry or doc, the superseded one is deleted in the same patch.
@@ -93,21 +129,26 @@ Workers must not run `cargo build`, `cargo check`, `cargo clippy`, `cargo test`,
 tree before. Workers *may* run `cargo fmt` / `rustfmt` and already-built
 binaries under `target/debug/`.
 
-### 0.2 What the main agent does with a worker result
+### 0.3 What the main agent does with a worker result
 
-1. Read the diff, not only the report. Check the layer boundary, the reference
+1. Read the patch, not only the report. Check the layer boundary, the reference
    behaviour, the surface lock and the task's non-goals.
 2. Reject silent fallbacks, unrelated refactors, new dependencies,
    unreviewed public/script changes, an added path that leaves the superseded
    one in place, and a doc that appends a superseded section instead of
    replacing it.
-3. Integrate, then run the full static gate and the test suites.
-4. Commit only after both are green. Update the design doc when the code change
+3. Apply the patch with `git apply --check`, then `git apply --3way`; resolve
+   conflicts deliberately. Never accept a patch with conflict markers.
+4. Integrate, then run the full static gate and the test suites.
+5. Commit only after both are green. Update the design doc when the code change
    changes a recorded contract.
+
+A worker's report is a proposal until the main agent has applied it and the
+gate and tests are green.
 
 The main agent owns the camera; workers own the pixels.
 
-### 0.3 The gate — the main agent runs it, nobody else
+### 0.4 The gate — the main agent runs it, nobody else
 
 Only the **main agent** runs the build/test gate. Subagents (any delegated
 worker) may **not** run `cargo build`, `cargo check`, `cargo clippy`,

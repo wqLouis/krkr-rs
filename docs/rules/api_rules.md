@@ -347,7 +347,7 @@ objects explicitly.
    or the old document section "for compatibility". Deleting them is part of
    the change.
 6. **Verify:** `cargo fmt`, then the compiler-free checks of
-   [`AGENTS.md`](../../AGENTS.md) §0.3, then the main agent's full gate.
+   [`AGENTS.md`](../../AGENTS.md) §0.4, then the main agent's full gate.
 
 ---
 

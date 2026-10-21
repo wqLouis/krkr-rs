@@ -89,6 +89,7 @@ bookkeeping see them like any other layer bitmap.
 | `operate_rect` | blend a source region onto the destination with a mode and opacity |
 | `fill_operate_rect` | fill a rectangle with a solid colour through a blend mode |
 | `affine_blit` | map the source rect's LT/RT/LB corners and resample |
+| `affine_blit_clipped` | the same, with an explicit clip rectangle the pass writes inside |
 | `copy_9patch` | scale a bitmap with a 9-slice margin |
 
 ### Effects
@@ -123,9 +124,11 @@ projection draws the two sources, so nothing is written to a bitmap per tick
 * **Every write is clipped** to the destination bitmap's bounds and to the
   supplied clip rectangle. A write outside the clip is dropped, not clamped.
 * **A write marks the bitmap dirty**, so the engine re-uploads it on the next
-  frame. `mark_dirty` also bumps the bitmap's `content_generation`, which the
-  subtree-cache bookkeeping sums to detect an edit that did not go through a
-  layer accessor.
+  frame. `mark_dirty_rect` narrows the upload to the written rectangle for the
+  affine, `operate_rect` and `stretch_blit_mode` passes; the other families
+  mark the whole bitmap. Both marks bump the bitmap's `content_generation`,
+  which the subtree-cache bookkeeping sums to detect an edit that did not go
+  through a layer accessor.
 * **The source rectangle is half-open**, and a source region that leaves the
   source bitmap contributes nothing rather than a repeated edge pixel.
 * **`blit_plane` with both plane bits is a straight copy**, not a blend: the

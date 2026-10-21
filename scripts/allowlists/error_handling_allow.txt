@@ -91,8 +91,6 @@ crates/compat/src/natives/plugins/layer_ex/gdiplus.rs:324:let _ = ctx.delete_mem
 crates/compat/src/natives/plugins/layer_ex/movie.rs:239:let _ = slot.overlay.stop(); — the reference stopMovie stops and releases the overlay unconditionally (layerExMovie.cpp:214-227); stop() only fails with NotOpen during teardown
 crates/compat/src/natives/plugins/layer_ex/movie.rs:366:let _ = slot.overlay.stop(); — the reference onEnded posts stopMovie, which stops and releases the overlay (layerExMovie.cpp:281-289); stop() only fails with NotOpen during teardown
 crates/compat/src/natives/plugins/motion_player/resource.rs:174:let _ = engine_ref.set_member(window.raw_id(), name, &TjsValue::Retained(id)); — the reference ignores the PropSet result when pre-defining the pad-key dictionaries (ResourceManager.cpp:88-100)
-crates/compat/src/natives/plugins/psb_file/mod.rs:202:let _ = host.set_member(global.raw_id(), PSB_BUF_GLOBAL, &TjsValue::Void); — clearing a temporary global after exec_script; the live global makes the write infallible
-crates/compat/src/natives/plugins/psb_file/mod.rs:203:let _ = host.set_member(global.raw_id(), PSB_KEY_GLOBAL, &TjsValue::Void); — clearing a temporary global after exec_script; the live global makes the write infallible
 crates/compat/src/null_plugin.rs:103:let _ = host.set_call_missing(object.raw_id()); — the retained null-plugin object is live, so the catch-all flag cannot fail to be set
 crates/compat/src/null_plugin.rs:177:let _ = host.set_default_member( — both ids are live retentions; the access has already been logged
 

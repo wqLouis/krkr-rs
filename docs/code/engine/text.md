@@ -40,13 +40,13 @@ statics and no hidden caches.
 
 | value | state |
 |---|---|
-| `TextEngine` | the L1 `FontSystem`, the `cosmic-text` shaping system, the registered faces, the name→face index, the lazily built host font database, and the memoized shaped layouts |
+| `TextEngine` | the L1 `FontSystem`, the `cosmic-text` shaping system, the registered faces, the name→face index, the lazily built host font database, the memoized shaped layouts, the memoized per-character advances and the memoized missing system families |
 | `GlyphAtlas` | the atlas texture, its CPU mirror, the shelf packer, the glyph entry map and the pending GPU uploads |
 | `TextCoverageCache` | the rasterized character masks and their blurred shadows |
 
-The three L2 memos — the shaped layouts, the coverage masks and the atlas
-entries — share the bound `MAX_TEXT_CACHE_ENTRIES` (1300) and evict
-least-recently-used.
+The five L2 memos — the shaped layouts, the per-character advances, the
+missing system families, the coverage masks and the atlas entries — share the
+bound `MAX_TEXT_CACHE_ENTRIES` (1300) and evict least-recently-used.
 
 ---
 
@@ -71,7 +71,7 @@ impl TextEngine {
     pub fn cached_layouts(&self) -> usize;
     pub fn rasterize_glyph(&self, font: FontId, codepoint: char,
                            style: &TextStyle) -> Result<GlyphBitmap, TextError>;
-    pub fn glyph_advance(&self, font: FontId, codepoint: char, style: &TextStyle)
+    pub fn glyph_advance(&mut self, font: FontId, codepoint: char, style: &TextStyle)
         -> Result<f32, TextError>;
     pub fn glyph_draw_rect(&self, font: FontId, codepoint: char, style: &TextStyle)
         -> Result<Option<(f32, f32, f32, f32)>, TextError>;
@@ -84,6 +84,16 @@ resolves a family against the host's installed fonts (case-insensitively,
 including the localized family names in the name table), then tries the
 CJK fallback families, then the well-known Noto CJK collection paths; only
 the resolved face enters the shaping database.
+
+`load_system_font_exact` resolves a family **without** the CJK fallback: it
+is the query a comma-separated candidate list needs, because a candidate that
+is not installed must not silently resolve to the Japanese fallback before
+the next candidate is tried. A family the host does not provide is memoized,
+so a repeated query reports the same `TextError::FontNotFound` without
+scanning the host font database again. The memo holds misses only: a family
+the host does provide resolves on the first query, a face registered
+afterwards is found by `font_id` before the memo is consulted, and the memo
+is dropped when `set_system_font_dirs` rebuilds the font database.
 
 ### The glyph atlas
 
@@ -148,9 +158,17 @@ pub fn compose_text_cpu(atlas: &GlyphAtlas, glyphs: &[PositionedGlyph],
   `cpu` and `gpu` backends are built from the same `TextLayout`, so the
   advances and metrics agree; only the rasterization and the draw path
   differ. Every script-visible measurement stays in VM pixels.
+* **A line's baseline is the face's ascent truncated to whole pixels.** The
+  ink box top is `baseline - bitmap_top`; a fractional or vertically centred
+  baseline moves every glyph off its row (`reference/cpp/core/visual/FreeType.cpp:494`,
+  `reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:911-914`).
 * **The colour is not part of the atlas cache key.** The atlas stores
   colour-independent coverage and the colour is applied as a per-node tint,
   so recolouring reuses the cached glyphs.
+* **A memoized per-character advance is the rasterizer's own value.** The
+  advance memo is keyed by face, character, size and synthetic style, so a
+  repeated measurement returns exactly the value a fresh measurement
+  returns.
 * **A coverage mask is always internally consistent**: `coverage.len() ==
   width * height`, enforced by the constructor.
 * **The cached coverage is pen-relative.** The same coverage is reused at any

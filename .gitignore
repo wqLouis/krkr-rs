@@ -43,3 +43,6 @@ krkr-rs-logs*.txt
 
 # Local subagent evidence, probe workspaces and logs (not source)
 /.agent-tmp/
+
+# Archived migration record kept locally, not published
+/docs.old/

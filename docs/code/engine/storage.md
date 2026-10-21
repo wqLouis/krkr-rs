@@ -39,10 +39,14 @@ only the namespace.
 | `xp3_extraction_filter: Option<Box<Xp3ExtractionFilter<'static>>>` | the per-segment XP3 extraction filter (the `xp3filter` seam) |
 | `media: RefCell<Map<String, Vec<u8>>>` | the virtual media entries registered by L3 storage-media providers |
 | `resolution_cache: RefCell<ResolutionCache>` | the lazily built resolver tables and the placed-hit cache |
+| `read_pool: Option<Arc<StorageReadPool>>` | the worker pool the entry reads run on; `None` reads on the calling thread |
+| `generation: u64` | the resolution generation the scheduled reads were made against |
 
 Each mounted archive keeps its logical path, the backing that owns its bytes
-(a `FileState` for a streamed archive, a `Vec<u8>` for a preloaded one) and
-its parsed index.
+(a `FileState` for a streamed archive, a `Vec<u8>` image for a preloaded one)
+and its parsed index. The backing and the index are shared (`Arc`), so a
+worker thread can read an entry of a mounted archive while the frame thread
+reads another one.
 
 There are no globals and no process-wide caches: a `Storage` is a plain value
 the caller owns, and all `FileState`s live inside it.
@@ -109,8 +113,12 @@ impl Storage {
     pub fn archive_count(&self) -> usize;
     pub fn archive_paths(&self) -> impl Iterator<Item = &Path>;
     pub fn for_each_archive(&self, f: impl FnMut(&Path, &Xp3Archive));
+    pub fn lookup(&self, name: &str) -> Result<Option<PendingStorage>, StorageReadError>;
 }
 ```
+
+The storage's `read_pool` field is public: the composition root installs the
+pool there, and the engine drains the same pool every frame.
 
 ### Free functions
 
@@ -138,6 +146,44 @@ local name.
 | `StartupPlan` | the four startup script names, resolved |
 | `ProbeCounts` | the number of `list`/`stat` probes and misses — a diagnostic |
 | `ATTR_DIRECTORY`, `ATTR_NORMAL` | the Windows file attribute bits the listing understands |
+
+### The read pool
+
+```rust
+pub struct StorageReadPool { /* the workers, the queue, the reads in flight */ }
+
+impl StorageReadPool {
+    pub fn new(reader: Arc<dyn StorageReader>, config: StoragePoolConfig)
+        -> Result<Self, StoragePoolError>;
+    pub fn submit(&self, key: StorageKey, work: StorageJob, size: Option<u64>, charge: u64)
+        -> Result<PendingStorage, StoragePoolError>;
+    pub fn pending(&self, key: &StorageKey) -> Option<PendingStorage>;
+    pub fn take_pending(&self, key: &StorageKey) -> Option<PendingStorage>;
+    pub fn take_completed(&self, key: &StorageKey) -> Option<StorageOutcome>;
+    pub fn peek_completed(&self, key: &StorageKey) -> Option<StorageOutcome>;
+    pub fn drain(&self) -> usize;
+    pub fn queued(&self) -> usize;
+    pub fn pending_count(&self) -> usize;
+    pub fn stats(&self) -> StoragePoolStats;
+}
+
+pub trait StorageReader: Send + Sync {
+    fn read(&self, job: &StorageJob) -> Result<Vec<u8>, StorageReadError>;
+}
+
+pub struct FileSystemReader;             // the default reader
+pub struct StorageKey;                   // the identity of one scheduled read
+pub enum StorageJob { Disk { .. }, Archive { .. } };
+pub enum StorageOutcome { Ready(Arc<Vec<u8>>), Failed(StorageReadError), Cancelled };
+pub struct PendingStorage;               // the future a scheduled read lands in
+pub struct ArchiveBacking;               // a mounted archive's bytes
+pub struct ArchiveSource;                // a mounted archive's index and bytes
+```
+
+The pool is the middle layer's own state: it owns the worker threads, the
+queue, the byte accounting and the reads in flight. The engine drains it
+every frame; the storage schedules the reads on it. There is no process
+global — two pools in one process do not interact.
 
 ---
 
@@ -224,6 +270,22 @@ A `..` component that escapes the mount is the reference's invalid path name
   return a registered virtual entry before the disk and archive resolution, so
   a `psb://…` / `psd://…` provider wins over a file of the same name. A later
   registration for the same name replaces the earlier bytes.
+* **A read is scheduled, not cached.** `lookup` answers the entry's
+  existence and its size and schedules the read; `read` and `read_prefix`
+  wait for that read. The bytes are never served from a cache: a read that
+  the frame published is taken once, and a later read of the same name reads
+  the entry again, so an edited file is seen.
+* **A scheduled read belongs to one resolution.** The key carries the
+  storage name, the number of bytes the read wants and the resolution
+  generation; the generation changes whenever the mounts or the auto paths
+  change, so a read scheduled against an older resolution is never served to
+  a newer one.
+* **A failed read is the storage's own typed error.** The worker publishes
+  the failure it saw; the data access raises it. There is no substitute
+  value, no empty result and no silent fall back to a miss.
+* **The extraction filter runs on the calling thread.** The filter is script
+  code, so a read that has to run it stays on the thread that asked for the
+  bytes; only the filter-free reads run on a worker.
 
 ---
 
@@ -245,6 +307,12 @@ read:
    name ──► Storage::read ──► Location
               ├─► Disk(path)    ──► fs::open + read_at (L1)
               └─► Archive(path, name) ──► the archive's backing ──► fs::xp3 entry read (L1)
+
+read through the pool:
+   name ──► Storage::lookup ──► Location ──► StorageJob ──► StorageReadPool
+              └─► PendingStorage ──► the worker reads the entry ──► StorageOutcome
+   Storage::read ──► the pending read ──► await ──► the bytes or the typed error
+   Engine::step  ──► StorageReadPool::drain ──► the finished reads are published
 ```
 
 ---

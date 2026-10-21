@@ -1,9 +1,13 @@
 # fftgraph (`fftgraph.dll`)
 
-**DLL name:** `fftgraph.dll` — linked with `Plugins.link("fftgraph.dll")`
+**DLL name:** `fftgraph.dll` (aliases: none) — linked with `Plugins.link("fftgraph.dll")`
 **Rust module:** `crates/compat/src/natives/plugins/fft_graph/`
 **Reference:** `reference/cpp/plugins/fftgraph.cpp`
 **Registers:** one global function — `drawFFTGraph`
+
+The function appears when the script links `fftgraph.dll`: a ported plugin
+installs its members on the first `Plugins.link` that names it, not at engine
+startup. See the [plugin index](../plugins.md) for the linking model.
 
 ## Surface
 
@@ -28,18 +32,15 @@ NCB_PRE_REGIST_CALLBACK(InitPlugin);
 (`reference/cpp/plugins/fftgraph.cpp:5-7`.)
 
 `fftgraph.dll` registers exactly one global function, `drawFFTGraph`, and the
-reference body is empty. It is the stub the reference `util_graph.dll` (and
-some games) replace with their own implementation, so the contract is only
-that the *name* exists and is a function.
+reference body is empty. The port executes the same script, so the
+script-visible surface is identical.
 
 ## Behaviour
 
-The port executes the same script, so the script-visible surface is identical:
-a global `drawFFTGraph` function that returns `void`.
-
-The definition lives on the VM, so a game that later assigns
-`drawFFTGraph = function(...) {...}` keeps working exactly as it does on the
-reference — the stub is an ordinary script member and is replaceable.
+`drawFFTGraph()` is a global function with an empty body, so it returns
+`void`. The definition lives on the VM as an ordinary script member, so a game
+that later assigns `drawFFTGraph = function(...) {...}` replaces it and the new
+binding wins — the stub is meant to be replaced.
 
 `typeof` of any function value is `"Object"`
 (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:2614-2616`).
@@ -57,8 +58,7 @@ accepts extra arguments to a zero-parameter function.
 
 | file | what it pins |
 |---|---|
-| `crates/compat/tests/misc_plugins.rs` | that `drawFFTGraph` exists as a global, is a function, returns `void`, and is an ordinary replaceable script member |
-| `crates/compat/tests/plugin.rs` | that `Plugins.link("fftgraph.dll")` resolves to the built-in table |
+| `crates/compat/tests/misc_plugins.rs` | that `drawFFTGraph` exists as a global, is a function (`typeof` is `"Object"`), returns `void` with and without arguments, and is an ordinary replaceable script member |
 
 ## Known gaps
 

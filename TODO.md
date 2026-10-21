@@ -237,6 +237,68 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   the surface lock and parity reports remain the contract but are not the
   evidence of behaviour. Do not rewrite L1/L2 for this; change an L1/L2
   signature only where the L3 behaviour cannot otherwise match.
+* **The M2 motion path is CPU-rasterized and is the title's frame budget.**
+  `Motion.Player.draw` composes every icon into the target bitmap with the L2
+  `affine_blit`; before the optimization the 千恋万花 title motion
+  (`title_bg.mtn`) cost roughly **11–14 ms/frame of CPU in a release run**
+  (~85 % `raster::blend_pixel_at` / `layer_ops::affine_nearest_band`). The
+  reference submits cached textured quads to D3D
+  (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:1100`,
+  `PlayerRenderTargets.cpp:344-366`). Landed: node four-vertex alpha tint
+  (`SourceCache.cpp:82-150`), no unconditional clear
+  (`PlayerRenderTargets.cpp:1127-1131`), `imageModified` without a structure
+  revision, opaque copy fast path, per-pass blend-kernel dispatch, integer
+  nearest sampling (no `floorf`), a pixel-work thread threshold instead of a
+  thread per small blit, and a real L2 dirty rectangle: `BitmapState.dirty_region`,
+  `mark_dirty_rect`, partial texture uploads, and partial marks for
+  `affine_blit`/`operate_rect`/`stretch_blit_mode`. The release 40 000-frame
+  headless run dropped from **24.2 s to 17.3 s wall**. Remaining, in impact
+  order: a GPU motion node type (L1 batched textured quads), a persistent
+  worker pool (the threshold only removes the small-blit spawns), per-snapshot
+  icon-path keys instead of per-frame `format!`, and reusable group/mask
+  offscreens. Per-frame `snapshot.clone()` is an `Arc` clone, not the deep
+  `PsbValue` copy the first audit suspected.
+* **The title-load `AsyncTrigger` callback stalls the frame loop and skips the
+  title motion.** A game `AsyncTrigger` (`id=5`, unnamed action) runs in
+  `async_trigger_poll` for **1.8–5.7 s** on the title load (measured in a debug
+  headless run; the release slow-frame line shows the same `async` phase). The
+  title_bg `title` motion is created before the stall and the next
+  `Motion.Player.progress` receives `dt=2417 ms`; at 60 frames/s that is
+  `145.02` frames, past the clip's 120-frame `lastTime`, so the timeline stops
+  and the 2 s title animation is never shown. The m2logo `back_white` player is
+  unaffected (91 frames over ~1.5 s, `playing=["back_white"]`).
+  **Measured root cause: the `PSBFile.root` octet path, not the motion.**
+  The callback is the title scenario — `data/sysscn/title.ks` (`*init` →
+  `*logo` → `*title` → `*title_common` → `[dialog name="title"]`) with the
+  `patch/custom.ks` syshooks — and the title UI it builds comes from the PSB
+  containers `window.pimg` / `title.pimg`. The port's `psb_root_get` →
+  `set_octet_member` builds a **hex TJS script per octet member** and
+  re-parses it (`global.__krkr_psb_buf[global.__krkr_psb_key] = <% xx xx … %>;`):
+  **150 calls cost 5.349 s**, and the **158 `exec_script` calls** behind them
+  cost **6.941 s**. The reference builds the octet as a *value* —
+  `PSBResource::toTJSVal` returns `tTJSVariant(this->data.data(),
+  this->data.size())` (`reference/cpp/plugins/psbfile/PSBValue.cpp:201-204`) —
+  so no script text exists to parse. The stall is pure CPU, not I/O: over the
+  2.4 s gap the process reads only the 387 KB `window.pimg` entry
+  (`/proc/<pid>/io` `rchar` is flat) and the TJS interpreter itself uses
+  ~0.2 s of the whole run, so neither the storage nor the script is the cost.
+  **Fixed:** the native `Tjs2Engine::set_member_octet` installs the member as
+  a `VAL_OCTET` value, and `PSBFile` no longer generates or parses a script.
+  The release title load fell from ~5.1 s to **46 ms** (22 000-frame run) and
+  the title animation plays; no motion `dt` clamp was needed. `perf record` is
+  blocked on this host by `kernel.perf_event_paranoid=2` (software `perf stat`
+  works); gprofng works and is what the timings above come from.
+* **The `Layer`/`layer_ex` affine paths now honour the destination clip.** The
+  reference passes the clip into the blit —
+  `MainImage->AffineBlt(ClipRect, …)` (`reference/cpp/core/visual/
+  LayerIntf.cpp:4736`) — and writes inside that rectangle only
+  (`reference/cpp/core/visual/LayerBitmapIntf.cpp:3960-4000`). The L2
+  `affine_blit_clipped` writes the clip alone; `Layer.affine*`,
+  `ImageFunction.operateAffine` and `layer_ex`'s `blit_with_transform` /
+  `blit_parallelogram` now pass their clip and no longer clone/restore the
+  whole bitmap. The layerExDraw plugin's `clipLeft/…` members remain
+  unmodelled (pre-existing surface gap), so its affine path uses the layer's
+  clip.
 * `Window.registerMessageReceiver` records the receiver but **nothing dispatches
   messages** (`natives/visual/window.rs`; the registry is read only by its unit
   test, and `WindowImpl.cpp:2150-2163` forwards received messages to the
@@ -290,7 +352,7 @@ allocate a texture descriptor set`, every frame.
 The Android target is **never built or tested on the development host**: no NDK
 is installed and none may be installed. Android-only code is reviewed here and
 run on a machine that has one; anything not compiled is documented as unverified
-(`AGENTS.md` §0.3).
+(`AGENTS.md` §0.4).
 
 * **On-device validation of everything (D36)**: startup, decode, render,
   MediaCodec (compile-checked, never run), `memfd`, touch mapping, surface

@@ -372,7 +372,7 @@ For each module, in order:
    changing behaviour**. A script-visible value, an error, a member name and
    the registration surface stay exactly as they are.
 4. Run `cargo fmt`. Run the compiler-free checks of
-   [`AGENTS.md`](../../AGENTS.md) §0.3 — `stateless`, `error-handling`,
+   [`AGENTS.md`](../../AGENTS.md) §0.4 — `stateless`, `error-handling`,
    `house-style`, `layering`, `storage-boundary`, `native-construction`,
    `lifecycle-order`, `storage-media`, `callback-objthis`, `native-arity`,
    `void-getter`, `host-facts`.

@@ -179,12 +179,12 @@ skip has nothing to retry.
 6. **if the sizes cannot be fitted** → count the frame as not presented, skip
    everything that draws and return a report with no statistics;
 7. `refresh_overlay(now_ms)`;
-8. upload the dirty bitmaps, prune the textures whose bitmap is gone;
+8. upload the dirty bitmap regions, prune the textures whose bitmap is gone;
 9. project the scene when `Scene::structure_revision` changed (or the
    presentation/texture table invalidated the projection);
 10. `hooks.after_project(&drawn_layers)`;
 11. `sync_presentation()` again;
-12. upload the dirty bitmaps again (a CPU-blended transition frame is a bitmap
+12. upload the dirty bitmap regions again (a CPU-blended transition frame is a bitmap
     the hook rewrote without changing the tree) and prune again;
 13. project again if the hook changed the scene's structure;
 14. one `render` call;

@@ -49,7 +49,6 @@ crates/compat/src/natives/menu_item.rs:221:can reach reference count zero and fi
 crates/compat/src/natives/menu_item.rs:451:borrow is released: releasing the last reference to a script object — our own refcount, not a citation
 crates/compat/src/natives/menu_item.rs:497:*outside* the state borrow: releasing the last reference to a script — our own refcount, not a citation
 crates/compat/src/natives/plugins/layer_ex/geom.rs:560:a non-object would give the reference a null — Rust reference parameter of our own adapter, not a citation
-crates/compat/src/natives/plugins/psb_file/mod.rs:203:Clear the temporaries on every path so no reference to the parent — Rust borrow of our own parent object, not a citation
 crates/compat/src/natives/plugins/xp3_filter/mod.rs:444:single-threaded, so no other reference is live here. — Rust borrow, not a citation
 crates/compat/src/natives/sound.rs:917:reference count zero and finalize, running its destroy callback. — our own refcount, not a citation
 crates/compat/src/natives/storages.rs:260:and the VM is single-threaded, so no other reference is live here. — Rust borrow, not a citation

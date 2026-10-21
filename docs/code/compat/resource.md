@@ -111,10 +111,20 @@ Resolution order:
      probing the storage for a bare family name would miss on every text
      draw;
    * the host's installed system fonts (exact family only);
-3. the host's **default face**, loaded under the fixed name
+3. the last family registered by `System.addFont`;
+4. the host's **default face**, loaded under the fixed name
    `__krkr_default_face__`;
-4. the engine's first registered face for that face;
-5. otherwise the typed error `"no font is available for face '{face}'"`.
+5. the engine's first registered face for that face;
+6. otherwise the typed error `"no font is available for face '{face}'"`.
+
+A candidate is tried like any other name: the reference's font map is keyed
+by family name, so a family the host or the game provides under a `*` name
+resolves through the same lookup.
+
+The exact system-font lookup memoizes its misses inside the L2 text engine,
+so a candidate no source knows is not scanned against the host's font
+database again on the next draw. The memo holds misses only, so a family
+that resolves later is not shadowed by it.
 
 The fixed fallback name is load-bearing: it keeps the *requested* family free
 so a face registered later for that family (`System.addFont`,
