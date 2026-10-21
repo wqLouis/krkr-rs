@@ -1939,6 +1939,10 @@ fn native_multi_line_tag_enabled_joins_ams_continuations() {
     // `reference/cpp/plugins/KAGParser/readme.txt:14-38`).
     let _lock = common::vm_lock();
     let env = common::Env::with_storage();
+    // The `KAGParser` class is published by `KAGParserEx.dll`
+    // (`reference/cpp/plugins/KAGParser/readme.txt:1-38`), so the plugin must
+    // be linked before the parser is created.
+    env.link_plugin("KAGParserEx.dll");
     std::fs::write(
         env.game_dir().expect("mounted game dir").join("motion.ams"),
         b"*loop\n@motion id=MARK accel=2 time=750 \\\n; path=\"0, 0, 255\" area=10 zoom=1 rotate=0\n",
@@ -1964,6 +1968,10 @@ fn native_cur_line_is_zero_based() {
     // on the second source line therefore reports `curLine == 1`.
     let _lock = common::vm_lock();
     let env = common::Env::with_storage();
+    // The `KAGParser` class is published by `KAGParserEx.dll`
+    // (`reference/cpp/plugins/KAGParser/readme.txt:1-38`), so the plugin must
+    // be linked before the parser is created.
+    env.link_plugin("KAGParserEx.dll");
     std::fs::write(
         env.game_dir().expect("mounted game dir").join("line.ks"),
         b"*start\nA\n",
@@ -2003,6 +2011,10 @@ fn native_param_macros_expands_into_a_tag() {
     // (`reference/cpp/plugins/KAGParser/readme.txt:51-60`).
     let _lock = common::vm_lock();
     let env = common::Env::with_storage();
+    // The `KAGParser` class is published by `KAGParserEx.dll`
+    // (`reference/cpp/plugins/KAGParser/readme.txt:1-38`), so the plugin must
+    // be linked before the parser is created.
+    env.link_plugin("KAGParserEx.dll");
     std::fs::write(
         env.game_dir().expect("mounted game dir").join("pm.ks"),
         b"*start\n[x greet]\n",
@@ -2028,6 +2040,10 @@ fn native_macros_table_is_live() {
     // (`reference/cpp/core/base/KAGParser.cpp:2471-2481`).
     let _lock = common::vm_lock();
     let env = common::Env::with_storage();
+    // The `KAGParser` class is published by `KAGParserEx.dll`
+    // (`reference/cpp/plugins/KAGParser/readme.txt:1-38`), so the plugin must
+    // be linked before the parser is created.
+    env.link_plugin("KAGParserEx.dll");
     std::fs::write(
         env.game_dir().expect("mounted game dir").join("m.ks"),
         b"*start\n[greet]\n",
@@ -2051,6 +2067,10 @@ fn native_on_script_fires() {
     // passes an `[iscript]` block (`KAGParser.cpp:1161-1172`).
     let _lock = common::vm_lock();
     let env = common::Env::with_storage();
+    // The `KAGParser` class is published by `KAGParserEx.dll`
+    // (`reference/cpp/plugins/KAGParser/readme.txt:1-38`), so the plugin must
+    // be linked before the subclass is declared.
+    env.link_plugin("KAGParserEx.dll");
     std::fs::write(
         env.game_dir().expect("mounted game dir").join("s.ks"),
         b"*start\n[iscript]\nvar x = 1;\n[endscript]\n",
@@ -2143,6 +2163,10 @@ fn state_reference_store_accessors_round_trip() {
 fn native_object_valued_exp_is_truthy() {
     let _lock = common::vm_lock();
     let env = common::Env::with_storage();
+    // The `KAGParser` class is published by `KAGParserEx.dll`
+    // (`reference/cpp/plugins/KAGParser/readme.txt:1-38`), so the plugin must
+    // be linked before the parser is created.
+    env.link_plugin("KAGParserEx.dll");
     std::fs::write(
         env.game_dir()
             .expect("mounted game dir")
@@ -2170,6 +2194,10 @@ fn native_object_valued_exp_is_evaluated_once() {
     let env = common::Env::with_storage();
     // The array literal has a side effect (it increments the global counter);
     // a single evaluation must leave the counter at 1.
+    // The `KAGParser` class is published by `KAGParserEx.dll`
+    // (`reference/cpp/plugins/KAGParser/readme.txt:1-38`), so the plugin must
+    // be linked before the parser is created.
+    env.link_plugin("KAGParserEx.dll");
     std::fs::write(
         env.game_dir()
             .expect("mounted game dir")

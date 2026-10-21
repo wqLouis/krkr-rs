@@ -18,6 +18,14 @@
 //! The harness is the shared [`common::Env`] + [`common::vm_lock`] (the
 //! engine → context binding is process-wide), which binds a VM, the compat
 //! host and the L2 scene / timer / input the app uses.
+//!
+//! A plugin-attached member exists only after the plugin is linked: the
+//! reference loads `xp3filter.dll` at startup
+//! (`reference/cpp/core/plugin/PluginImpl.cpp:90-93`) and every other module
+//! when a script calls `Plugins.link`
+//! (`reference/cpp/core/plugin/PluginImpl.cpp:300-313`), so every test that
+//! uses a plugin-attached member links the plugin that owns it before the
+//! script runs.
 
 mod common;
 
@@ -188,6 +196,11 @@ fn menu_item_static_tables_are_receiver_independent() {
 fn window_ex_window_flags_reach_the_target() {
     let _lock = vm_lock();
     let env = Env::new();
+    // `disableResize`/`enableNCMouseEvent` and the `ncht*` constants are
+    // attached to `Window` by `windowEx.dll`
+    // (`reference/cpp/plugins/windowEx.cpp:934-991`), so the plugin must be
+    // linked before the windows are created.
+    env.link_plugin("windowEx.dll");
     env.run(
         "class SubWindow extends Window { \
              var held = null; \
@@ -251,6 +264,11 @@ fn window_ex_window_flags_reach_the_target() {
 fn window_ex_menu_item_flags_reach_the_target() {
     let _lock = vm_lock();
     let env = Env::new();
+    // `rightJustify`/`bmpItem` and the `bi*` constants are attached to
+    // `MenuItem` by `windowEx.dll`
+    // (`reference/cpp/plugins/windowEx.cpp:1219-1239`), so the plugin must be
+    // linked before the items are created.
+    env.link_plugin("windowEx.dll");
     env.run(
         "var exWindow = new Window(); \
          class SubItemEx extends MenuItem { \
@@ -316,6 +334,10 @@ fn window_ex_menu_item_flags_reach_the_target() {
 fn win32_dialog_message_box_is_receiver_independent() {
     let _lock = vm_lock();
     let env = Env::new();
+    // The `WIN32Dialog` class is published by `win32dialog.dll`
+    // (`reference/cpp/plugins/win32dialog.cpp:4-11`), so the plugin must be
+    // linked before the dialog is created.
+    env.link_plugin("win32dialog.dll");
     env.run(
         "var informSeen = ''; \
          System.inform = function(m, c, t) { \
@@ -357,6 +379,10 @@ fn win32_dialog_message_box_is_receiver_independent() {
 fn pad_properties_are_receiver_independent_constants() {
     let _lock = vm_lock();
     let env = Env::new();
+    // `Pad.registerExEvent` is attached by `windowEx.dll`
+    // (`reference/cpp/plugins/windowEx.cpp:1416-1418`), so the plugin must be
+    // linked before the pads are created.
+    env.link_plugin("windowEx.dll");
     env.run(
         "class SubPad extends Pad { \
              var held = null; \
@@ -433,6 +459,10 @@ fn mouse_and_key_statics_are_receiver_independent() {
 fn system_statics_and_dialog_notify_are_receiver_independent() {
     let _lock = vm_lock();
     let env = Env::new();
+    // `System.getDoubleClickTime` is attached by `windowEx.dll`
+    // (`reference/cpp/plugins/windowEx.cpp:1522`), so the plugin must be
+    // linked before the call.
+    env.link_plugin("windowEx.dll");
     env.run(
         "var systemWindow = new Window(); \
          class SubProbe extends MenuItem { \

@@ -207,6 +207,10 @@ impl Env {
                 .attach_storage(storage.as_mut() as *mut Storage);
         }
         host.install(&engine).expect("install compat surface");
+        // `Storages.exportFile` is published by `fstat.dll`
+        // (`reference/cpp/plugins/fstat/main.cpp:913-925`), so the plugin must
+        // be linked before the archive member is read back.
+        common::link_plugin(&engine, "fstat.dll");
         Env {
             _host: host,
             engine,

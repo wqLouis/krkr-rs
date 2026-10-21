@@ -114,6 +114,10 @@ fn storage_attached_after_install_is_completed_before_startup() {
     // seam install; a read failure would surface here.
     host.activate_deferred_plugins()
         .expect("deferred plugin activation");
+    // `Storages.exportFile` is published by `fstat.dll`
+    // (`reference/cpp/plugins/fstat/main.cpp:913-925`), so the plugin must be
+    // linked before the archive member is read back.
+    common::link_plugin(&engine, "fstat.dll");
 
     let dest = dir.path().join("out.bin");
     engine

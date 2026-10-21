@@ -206,11 +206,12 @@ fn plugins_link_wuvorbis_resolves_to_the_builtin_without_a_null_object() {
 #[test]
 fn wave_sound_buffer_decodes_the_ogg_fixture_through_the_host_chain() {
     let _lock = vm_lock();
-    // The host appends its `media` decoder *after* `host.install`, so the
-    // chain already holds the `wutcwf` plugin's TCWF decoder first: opening
-    // the `.ogg` walks past it to the first decoder that succeeds — exactly
-    // the composition order in `crates/app/src/game.rs`.
+    // The host appends its `media` decoder *after* `host.install`, so it is
+    // the chain's first entry and decodes the `.ogg`; the `wutcwf` plugin's
+    // TCWF decoder, which the script links below, accepts only the TCWF
+    // format and would reject these bytes by their signature.
     let env = Env::new(true);
+    env.run("Plugins.link('wutcwf.dll');");
     env.run("Plugins.link('wuvorbis.dll');");
     env.run("var s = new WaveSoundBuffer(); s.open('sine.ogg');");
 
@@ -241,12 +242,13 @@ fn wave_sound_buffer_decodes_the_ogg_fixture_through_the_host_chain() {
 #[test]
 fn open_without_the_host_decoder_is_a_typed_error_not_silence() {
     let _lock = vm_lock();
-    // The composition root's `media` decoder is absent. The only chain entry
-    // is the `wutcwf` plugin's TCWF decoder (every built-in registers at
-    // install), which rejects the Ogg stream by its signature; `open` reports
-    // that typed failure — never a silent/zero-filled buffer — and leaves the
+    // The composition root's `media` decoder is absent, so the chain holds
+    // only the `wutcwf` plugin's TCWF decoder, which the script links; that
+    // decoder rejects the Ogg stream by its signature, and `open` reports the
+    // typed failure — never a silent/zero-filled buffer — and leaves the
     // buffer unloaded.
     let env = Env::new(false);
+    env.run("Plugins.link('wutcwf.dll');");
     env.run("var s = new WaveSoundBuffer();");
 
     let message = env.error("s.open('sine.ogg')");
@@ -265,6 +267,9 @@ fn open_without_the_host_decoder_is_a_typed_error_not_silence() {
 fn corrupt_ogg_reports_the_decoders_typed_error() {
     let _lock = vm_lock();
     let env = Env::new(true);
+    // The chain holds the host's `media` decoder and the `wutcwf` plugin's
+    // TCWF decoder, which the script links; both reject the corrupt stream.
+    env.run("Plugins.link('wutcwf.dll');");
     env.run("var s = new WaveSoundBuffer();");
 
     let message = env.error("s.open('broken.ogg')");
