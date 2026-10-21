@@ -621,6 +621,44 @@ pub(super) fn blit_parallelogram(
 // Layer dispatch helpers
 // ---------------------------------------------------------------------------
 
+/// Check that a bitmap holds the pixels its declared size names.
+///
+/// A bitmap's pixel buffer is `width * height * 4` bytes long. A bitmap whose
+/// buffer disagrees with its size cannot be read or blitted, so every path
+/// that touches the pixels of a resolved bitmap checks it first.
+///
+/// # Errors
+///
+/// Returns an error naming `operation` and the bitmap when the declared size
+/// is not representable or the pixel buffer holds a different number of bytes.
+fn check_pixels(bitmap: &BitmapState, operation: &str) -> Result<(), String> {
+    let expected = usize::try_from(bitmap.width)
+        .ok()
+        .zip(usize::try_from(bitmap.height).ok())
+        .and_then(|(width, height)| width.checked_mul(height))
+        .and_then(|pixels| pixels.checked_mul(4));
+    let Some(expected) = expected else {
+        let error = format!(
+            "{operation}: the bitmap {} size {}x{} is not representable",
+            bitmap.id, bitmap.width, bitmap.height
+        );
+        log::error!("{error}");
+        return Err(error);
+    };
+    if bitmap.rgba.len() != expected {
+        let error = format!(
+            "{operation}: the bitmap {} holds {} bytes, {expected} expected for {}x{}",
+            bitmap.id,
+            bitmap.rgba.len(),
+            bitmap.width,
+            bitmap.height
+        );
+        log::error!("{error}");
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Resolve the receiving `Layer` id and its current draw state, then run `f`
 /// with the layer bitmap, the state, the clip rectangle and the combined
 /// transform.
@@ -659,6 +697,7 @@ fn with_layer<R>(
         let bitmap = scene
             .bitmap_mut(bitmap_id)
             .ok_or_else(|| format!("{method}: the bitmap no longer exists"))?;
+        check_pixels(bitmap, method)?;
         f(bitmap, layer_draw, clip, ctm)
     };
     if update {
@@ -1163,6 +1202,7 @@ fn image_snapshot(
         .bitmap(bitmap_id)
         .cloned()
         .ok_or_else(|| format!("{what}: the source image {bitmap_id} does not exist"))?;
+    check_pixels(&bitmap, what)?;
     Ok(Some(bitmap))
 }
 
@@ -1779,7 +1819,9 @@ fn update_transforms(
         apply(layer_draw);
     }
     // The reference re-renders the recording when the transform changes.
-    redraw_recording(engine, objthis);
+    if let Err(error) = redraw_recording(engine, objthis, method) {
+        return report_error(out_error, &error);
+    }
     set_void(out);
     0
 }
@@ -2018,13 +2060,24 @@ extern "C" fn translate_view_transform(
 // Record
 // ---------------------------------------------------------------------------
 
-fn redraw_recording(engine: *mut c_void, objthis: *mut c_void) {
-    let Ok((resolved, ctx)) = bound(engine) else {
-        return;
-    };
-    let Ok(Some(layer_id)) = layer_from_objthis(resolved.engine(), objthis) else {
-        return;
-    };
+/// Replay the layer's recorded operations into its main image.
+///
+/// `operation` names the member the replay runs for, so a failure names the
+/// call the script made.
+///
+/// # Errors
+///
+/// Returns an error when the binding or the scene is unavailable, when the
+/// receiver is not a Layer, or when the resolved image does not hold the
+/// pixels its size names.
+fn redraw_recording(
+    engine: *mut c_void,
+    objthis: *mut c_void,
+    operation: &str,
+) -> Result<(), String> {
+    let (resolved, ctx) = bound(engine)?;
+    let layer_id = layer_from_objthis(resolved.engine(), objthis)?
+        .ok_or_else(|| format!("{operation}: the receiver is not a Layer"))?;
     let ops = {
         let state = draw_state(&ctx);
         match state
@@ -2033,15 +2086,12 @@ fn redraw_recording(engine: *mut c_void, objthis: *mut c_void) {
             .and_then(|layer| layer.recording.clone())
         {
             Some(ops) if !ops.is_empty() => ops,
-            _ => return,
+            _ => return Ok(()),
         }
     };
-    let scene = match scene_mut(&ctx) {
-        Ok(scene) => scene,
-        Err(_) => return,
-    };
+    let scene = scene_mut(&ctx)?;
     let Some(bitmap_id) = scene.layer(layer_id).and_then(|layer| layer.bitmap) else {
-        return;
+        return Ok(());
     };
     // The image may still be decoding: the pixels are not there yet, and
     // the replay writes into them.
@@ -2055,11 +2105,14 @@ fn redraw_recording(engine: *mut c_void, objthis: *mut c_void) {
             .map(LayerDraw::calc_transform)
             .unwrap_or_default()
     };
-    if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
-        raster::fill_rect_replace(bitmap, 0, 0, bitmap.width, bitmap.height, [0, 0, 0, 0]);
-        replay_record(bitmap, &ops, ctm, clip);
-    }
+    let bitmap = scene
+        .bitmap_mut(bitmap_id)
+        .ok_or_else(|| format!("{operation}: the bitmap {bitmap_id} no longer exists"))?;
+    check_pixels(bitmap, operation)?;
+    raster::fill_rect_replace(bitmap, 0, 0, bitmap.width, bitmap.height, [0, 0, 0, 0]);
+    replay_record(bitmap, &ops, ctm, clip);
     mark_layer_paint(scene, layer_id);
+    Ok(())
 }
 
 extern "C" fn record_get(
@@ -2179,12 +2232,18 @@ extern "C" fn get_record_image(
         }
         Err(error) => return report_error(out_error, &error),
     };
-    if let Ok(scene) = scene_mut(&ctx)
-        && let Some(bitmap) = scene.bitmap_mut(bitmap_id)
-    {
-        let clip = (0, 0, width as i32, height as i32);
-        replay_record(bitmap, &ops, ctm, clip);
+    let scene = match scene_mut(&ctx) {
+        Ok(scene) => scene,
+        Err(error) => return report_error(out_error, &error),
+    };
+    let Some(bitmap) = scene.bitmap_mut(bitmap_id) else {
+        return report_error(out_error, "Layer.getRecordImage: the bitmap does not exist");
+    };
+    if let Err(error) = check_pixels(bitmap, "Layer.getRecordImage") {
+        return report_error(out_error, &error);
     }
+    let clip = (0, 0, width as i32, height as i32);
+    replay_record(bitmap, &ops, ctm, clip);
     set_retained_out(out, object.raw_id());
     std::mem::forget(object);
     0
@@ -2208,7 +2267,9 @@ extern "C" fn redraw_record(
     if !has_recording {
         return report_error(out_error, "Layer.redrawRecord: the receiver is not a Layer");
     }
-    redraw_recording(engine, objthis);
+    if let Err(error) = redraw_recording(engine, objthis, "Layer.redrawRecord") {
+        return report_error(out_error, &error);
+    }
     set_bool(out, true);
     0
 }
@@ -2297,7 +2358,9 @@ extern "C" fn load_record(
         let mut state = draw_state(&ctx);
         state.layers.entry(layer_id).or_default().recording = Some(ops);
     }
-    redraw_recording(engine, objthis);
+    if let Err(error) = redraw_recording(engine, objthis, "Layer.loadRecord") {
+        return report_error(out_error, &error);
+    }
     set_bool(out, true);
     0
 }

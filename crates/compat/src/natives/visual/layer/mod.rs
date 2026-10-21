@@ -906,6 +906,40 @@ extern "C" fn layer_set_image_size(
     0
 }
 
+/// The pixels of a scene bitmap, with a still-decoding image resolved first.
+///
+/// A bitmap whose decode is still running holds no pixels until
+/// [`Scene::resolve_bitmap`] installs them. `operation` names the caller and
+/// the bitmap id goes into the error a bitmap raises when it still holds no
+/// pixel buffer after the wait, so no caller clones or indexes an empty
+/// image.
+pub(super) fn resolved_bitmap_pixels(
+    scene: &mut Scene,
+    bitmap: u32,
+    operation: &str,
+) -> Result<(u32, u32, Vec<u8>), String> {
+    // The decode has not landed yet: wait for it on the mutable scene borrow
+    // the caller already holds.
+    scene.resolve_bitmap(bitmap);
+    let Some(state) = scene.bitmap(bitmap) else {
+        return Err(format!("{operation}: the bitmap {bitmap} does not exist"));
+    };
+    let expected = usize::try_from(state.width)
+        .ok()
+        .zip(usize::try_from(state.height).ok())
+        .and_then(|(width, height)| width.checked_mul(height))
+        .and_then(|pixels| pixels.checked_mul(4));
+    if expected != Some(state.rgba.len()) {
+        return Err(format!(
+            "{operation}: the bitmap {bitmap} holds {} pixel bytes instead of its {}x{} image",
+            state.rgba.len(),
+            state.width,
+            state.height
+        ));
+    }
+    Ok((state.width, state.height, state.rgba.clone()))
+}
+
 /// Copy `source`'s MainImage and ProvinceImage into `dest`, following the
 /// reference `tTJSNI_BaseLayer::AssignImages` (`LayerIntf.cpp:2394-2432`):
 /// a present source image is assigned into ours, an absent one deallocates
@@ -926,12 +960,12 @@ fn assign_images(scene: &mut Scene, dest: u32, source: u32) -> Result<(), String
         return Ok(());
     }
     // Snapshot the source before touching the destination: the two may share
-    // a bitmap id, and the copy must reflect the pre-write source.
-    let src_main = scene
-        .layer(source)
-        .and_then(|layer| layer.bitmap)
-        .and_then(|id| scene.bitmap(id))
-        .map(|bitmap| (bitmap.width, bitmap.height, bitmap.rgba.clone()));
+    // a bitmap id, and the copy must reflect the pre-write source. The source
+    // may still be decoding, so the snapshot waits for its pixels.
+    let src_main = match scene.layer(source).and_then(|layer| layer.bitmap) {
+        Some(bitmap) => Some(resolved_bitmap_pixels(scene, bitmap, "Layer.assignImages")?),
+        None => None,
+    };
     let src_province = scene.layer(source).map(|layer| {
         (
             layer.province.clone(),
@@ -951,12 +985,13 @@ fn assign_images(scene: &mut Scene, dest: u32, source: u32) -> Result<(), String
             .filter(|id| scene.bitmap(*id).is_some_and(|bitmap| !bitmap.script_owned));
         match reusable {
             Some(bitmap_id) => {
-                if !scene.resize_bitmap(bitmap_id, width, height, [0, 0, 0, 0]) {
-                    return Err("the layer image could not be resized".to_string());
-                }
-                if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
-                    bitmap.rgba = rgba;
-                    bitmap.dirty = true;
+                // The assigned image replaces the destination's pixels: a
+                // decode the destination still carries is cancelled, so the
+                // assigned pixels are not overwritten by the stale image.
+                if !scene.replace_bitmap_image(bitmap_id, width, height, rgba) {
+                    return Err(
+                        "Layer.assignImages: the layer image could not be replaced".to_string()
+                    );
                 }
             }
             None => {
@@ -1000,7 +1035,7 @@ fn assign_images(scene: &mut Scene, dest: u32, source: u32) -> Result<(), String
     match assigned {
         Some((width, height)) => {
             if !scene.internal_set_image_size(dest, width, height) {
-                return Err("the layer image could not be sized".to_string());
+                return Err("Layer.assignImages: the layer image could not be sized".to_string());
             }
         }
         None => {
@@ -1059,7 +1094,7 @@ extern "C" fn layer_assign_images(
         Err(error) => return report_error(out_error, &error),
     };
     if let Err(error) = assign_images(scene, id, source) {
-        return report_error(out_error, &format!("Layer.assignImages: {error}"));
+        return report_error(out_error, &error);
     }
     set_void(out);
     0
@@ -1119,26 +1154,30 @@ extern "C" fn layer_copy_from_bitmap_to_main_image(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    let Some((width, height, rgba)) = scene
-        .bitmap(bitmap_id)
-        .map(|b| (b.width, b.height, b.rgba.clone()))
-    else {
-        return report_error(
-            out_error,
-            "Layer.copyFromBitmapToMainImage: the bitmap does not exist",
-        );
-    };
+    let (width, height, rgba) =
+        match resolved_bitmap_pixels(scene, bitmap_id, "Layer.copyFromBitmapToMainImage") {
+            Ok(pixels) => pixels,
+            Err(error) => return report_error(out_error, &error),
+        };
     if !scene.set_layer_image_size(id, width, height) {
         return report_error(
             out_error,
             "Layer.copyFromBitmapToMainImage: could not resize the layer image",
         );
     }
-    if let Some(layer_bitmap) = scene.layer(id).and_then(|l| l.bitmap)
-        && let Some(bitmap) = scene.bitmap_mut(layer_bitmap)
-    {
-        bitmap.rgba = rgba;
-        bitmap.dirty = true;
+    let Some(layer_bitmap) = scene.layer(id).and_then(|l| l.bitmap) else {
+        return report_error(
+            out_error,
+            "Layer.copyFromBitmapToMainImage: the layer has no main image",
+        );
+    };
+    // The copy replaces the layer's image: a decode the layer still carries is
+    // cancelled, so the copied pixels are not overwritten by the stale image.
+    if !scene.replace_bitmap_image(layer_bitmap, width, height, rgba) {
+        return report_error(
+            out_error,
+            "Layer.copyFromBitmapToMainImage: the layer image could not be replaced",
+        );
     }
     if !scene.internal_set_image_size(id, width, height) {
         return report_error(
@@ -1179,15 +1218,16 @@ extern "C" fn layer_independ_main_image(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    let Some((width, height, rgba)) = scene
-        .layer(id)
-        .and_then(|l| l.bitmap)
-        .and_then(|bitmap| scene.bitmap(bitmap))
-        .map(|b| (b.width, b.height, b.rgba.clone()))
-    else {
+    let Some(bitmap_id) = scene.layer(id).and_then(|l| l.bitmap) else {
         set_void(out);
         return 0;
     };
+    // The image may still be decoding: the copy is of the resolved pixels.
+    let (width, height, rgba) =
+        match resolved_bitmap_pixels(scene, bitmap_id, "Layer.independMainImage") {
+            Ok(pixels) => pixels,
+            Err(error) => return report_error(out_error, &error),
+        };
     // Install the fresh copy, then release the layer's reference to the
     // replaced image.
     let replaced = scene.layer_mut(id).and_then(|layer| layer.bitmap.take());
@@ -1585,10 +1625,15 @@ extern "C" fn layer_get_layer_at(
         return report_error(out_error, "Layer.getLayerAt: this layer is not constructed");
     };
     let hit = {
-        let scene = match scene_ref(&ctx) {
+        let scene = match scene_mut(&ctx) {
             Ok(scene) => scene,
             Err(error) => return report_error(out_error, &error),
         };
+        // The hit test reads a layer's main image: an image whose decode has
+        // not landed yet is waited for first.
+        if let Some(window) = scene.layer(id).map(|layer| layer.window) {
+            crate::event::resolve_layer_images(scene, window);
+        }
         scene.layer_at(id, x, y, exclude_self, get_disabled)
     };
     let object =
@@ -1637,9 +1682,9 @@ extern "C" fn layer_fill_rect(
         set_void(out);
         return 0;
     };
-    let Some(bitmap_id) = scene.layer(id).and_then(|layer| layer.bitmap) else {
+    if scene.layer(id).and_then(|layer| layer.bitmap).is_none() {
         return report_error(out_error, "Layer.fillRect: this layer has no main image");
-    };
+    }
     let face = pixels::draw_face(scene, id);
     if face == pixels::DF_PROVINCE {
         pixels::fill_province_region(scene, id, dest, color[2]);
@@ -1647,6 +1692,13 @@ extern "C" fn layer_fill_rect(
         return 0;
     }
     let hold_alpha = scene.layer(id).is_some_and(|layer| layer.hold_alpha);
+    // The image may still be decoding: the fill lands on the decoded pixels,
+    // and an image that resolved without its pixels is an error rather than a
+    // silently dropped fill.
+    let bitmap_id = match util::main_bitmap(scene, id, "fillRect") {
+        Ok(bitmap_id) => bitmap_id,
+        Err(error) => return report_error(out_error, &error),
+    };
     let Some(bitmap) = scene.bitmap_mut(bitmap_id) else {
         return report_error(
             out_error,
@@ -3006,10 +3058,13 @@ extern "C" fn layer_main_image_buffer_get(
             "Layer.mainImageBuffer: compat context is not bound",
         );
     };
-    let scene = match scene_ref(&ctx) {
+    let scene = match scene_mut(&ctx) {
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
+    if let Some(bitmap) = scene.layer(id).and_then(|layer| layer.bitmap) {
+        scene.resolve_bitmap(bitmap);
+    }
     set_int(out, scene.main_image_pixel_buffer(id) as i64);
     0
 }
@@ -3039,6 +3094,9 @@ extern "C" fn layer_main_image_buffer_for_write_get(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
+    if let Some(bitmap) = scene.layer(id).and_then(|layer| layer.bitmap) {
+        scene.resolve_bitmap(bitmap);
+    }
     set_int(out, scene.main_image_pixel_buffer_for_write(id) as i64);
     0
 }

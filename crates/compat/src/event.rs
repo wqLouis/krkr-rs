@@ -505,20 +505,46 @@ fn resolve_pointer(ctx: &CompatCtx, name: &str) -> Option<u32> {
 }
 
 /// The layer under a window-space point in the first visible window.
+///
+/// The hit test reads a layer's main image, so the images of the window it
+/// tests are waited for first: a load whose decode is still running leaves the
+/// bitmap with the probed size and no pixels.
 fn hit_layer(ctx: &CompatCtx, x: i32, y: i32) -> Option<u32> {
-    let scene = scene(ctx)?;
-    for window in &scene.windows {
-        if !window.visible {
-            continue;
-        }
-        let Some(primary) = window.primary_layer else {
-            continue;
-        };
+    let scene = scene_mut(ctx)?;
+    let roots: Vec<(u32, u32)> = scene
+        .windows
+        .iter()
+        .filter(|window| window.visible)
+        .filter_map(|window| window.primary_layer.map(|primary| (window.id, primary)))
+        .collect();
+    for (window, primary) in roots {
+        resolve_layer_images(scene, window);
         if let Some(layer) = scene.layer_at(primary, x, y, false, false) {
             return Some(layer);
         }
     }
     None
+}
+
+/// Waits for the main images of `window`'s layers.
+///
+/// A layer can carry an image whose decode is still running: the bitmap then
+/// has the probed size and no pixels. A hit test that reads those pixels waits
+/// here first, and only for this window's layers — a decode for another window
+/// stays with the frame's image barrier.
+pub(crate) fn resolve_layer_images(scene: &mut Scene, window: u32) {
+    // Nothing is decoding in the steady state, and the walk below allocates.
+    if !scene.bitmaps.iter().any(|bitmap| bitmap.pending.is_some()) {
+        return;
+    }
+    let bitmap_ids: Vec<u32> = scene
+        .window_layer_order(window)
+        .into_iter()
+        .filter_map(|id| scene.layer(id).and_then(|layer| layer.bitmap))
+        .collect();
+    for bitmap_id in bitmap_ids {
+        scene.resolve_bitmap(bitmap_id);
+    }
 }
 
 /// Hit-test a touch event's window-space point.
@@ -556,6 +582,16 @@ fn scene(ctx: &CompatCtx) -> Option<&Scene> {
     // SAFETY: `attach_scene` keeps the pointer valid while the binding is
     // installed.
     Some(unsafe { &*scene })
+}
+
+/// The attached scene, mutably, or `None` when the host did not attach one.
+fn scene_mut<'a>(ctx: &CompatCtx) -> Option<&'a mut Scene> {
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let services = unsafe { ctx.services() };
+    let scene = services.scene()?;
+    // SAFETY: `attach_scene` keeps the pointer valid while the binding is
+    // installed, and the VM is single-threaded.
+    Some(unsafe { &mut *scene })
 }
 
 /// The attached input state, or `None` when the host did not attach one.

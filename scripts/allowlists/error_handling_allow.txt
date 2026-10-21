@@ -125,7 +125,7 @@ crates/platform/render/src/glyph.rs:303:debug_assert!(size_px > 0.0 — px_scale
 # (D37).  A new sign test on one of these is a violation, not an allowlisted
 # site.
 crates/compat/src/natives/visual/window.rs:1700:instance as i64 — `Window.HWND`; the reference casts `_this` to `tTVInteger` as an opaque handle (WindowImpl.cpp:2288-2298)
-crates/compat/src/natives/visual/bitmap.rs:1187:b.rgba.as_ptr() as i64 — `Bitmap.buffer`; the reference pixel-buffer address, opaque to the script
+crates/compat/src/natives/visual/bitmap.rs:1399:bitmap.rgba.as_ptr() as i64 — `Bitmap.buffer`; the reference pixel-buffer address, opaque to the script
 crates/compat/src/natives/visual/bitmap.rs:1219:bitmap.rgba.as_mut_ptr() as i64 — `Bitmap.bufferForWrite`; the reference pixel-buffer address, opaque to the script
 crates/compat/src/natives/visual/layer/mod.rs:2227:scene.main_image_pixel_buffer(id) as i64 — `Layer.mainImageBuffer`; the reference MainImage address (LayerIntf.cpp:3005), opaque
 crates/compat/src/natives/visual/layer/mod.rs:2256:scene.main_image_pixel_buffer_for_write(id) as i64 — `Layer.mainImageBufferForWrite`; the reference MainImage address, opaque
@@ -169,8 +169,7 @@ crates/compat/src/natives/plugins/fstat/mod.rs:361:Err(_) => DiskInfo { — the 
 crates/compat/src/natives/plugins/fstat/mod.rs:1075:Err(_) => return Ok(()), — the reference `_dirtree` returns void on an unreadable directory
 crates/compat/src/natives/plugins/layer_ex/appearance.rs:177:Err(_) => None, — a missing angle member is absent, not a default the reference fabricates
 crates/compat/src/natives/plugins/layer_ex/appearance.rs:442:Err(_) => 1.0, — the reference's `AsReal` default for a non-numeric width
-crates/compat/src/natives/plugins/layer_ex/draw.rs:637:Err(_) => set_void(out), — a failed RectF construction returns void to the script, as the reference draw does
-crates/compat/src/natives/plugins/layer_ex/draw.rs:1948:Err(_) => return, — a detached scene cannot run the draw callback; the reference no-ops
+crates/compat/src/natives/plugins/layer_ex/draw.rs:722:Err(_) => set_void(out), — a failed RectF construction returns void to the script, as the reference draw does
 crates/compat/src/natives/plugins/layer_ex/font.rs:616:Err(_) => break, — a non-zero-index load failure ends the candidate loop; index 0 already raised above
 crates/compat/src/natives/plugins/motion_player/mod.rs:254:Err(_) => false, — a `typeof` evaluation failure means the global is not defined
 crates/compat/src/natives/plugins/scripts_ex/mod.rs:718:Err(_) => Ok(Owned::Object(object)), — a missing `clone` is one of the error codes the reference compares away

@@ -31,20 +31,20 @@ A second construction on the same payload raises
 
 | Member | Behaviour |
 |---|---|
-| `getPixel(x, y)` | the pixel as ARGB (`0xAARRGGBB`). `0` for an out-of-range or negative coordinate — **no raise**. Waits for a pending decode. |
-| `setPixel(x, y, color)` | writes ARGB into the bitmap and marks it dirty. An out-of-range write is silently ignored. Waits for a pending decode. |
-| `getMaskPixel(x, y)` | the alpha channel `0..255`. Waits for a pending decode. |
-| `setMaskPixel(x, y, alpha)` | writes only the alpha byte, **clamped** to `0..255`. Waits for a pending decode. |
+| `getPixel(x, y)` | the pixel as ARGB (`0xAARRGGBB`). `0` for an out-of-range or negative coordinate — **no raise**. A pixel the buffer does not hold is out of range too, so its answer is `0`. Waits for a pending decode. |
+| `setPixel(x, y, color)` | writes ARGB into the bitmap and marks it dirty. An out-of-range write is silently ignored; a pixel the buffer does not hold is out of range too, so the write is ignored. Waits for a pending decode. |
+| `getMaskPixel(x, y)` | the alpha channel `0..255`. A pixel the buffer does not hold reads as `0`. Waits for a pending decode. |
+| `setMaskPixel(x, y, alpha)` | writes only the alpha byte, **clamped** to `0..255`. A pixel the buffer does not hold is ignored. Waits for a pending decode. |
 | `independ()` | a no-op — every `Bitmap` already owns a private scene bitmap. |
 | `setSize(width, height)` | resizes, preserving the overlapping top-left region and filling the rest with `[0, 0, 0, 0]`. A zero dimension raises. A pending decode is resolved first, so the decoded overlap survives. |
-| `copyFrom(bitmap)` | copies the source bitmap's pixels and dimensions into this one. |
-| `save(name[, type[, meta]])` | encodes and writes through the host saver. |
+| `copyFrom(bitmap)` | copies the source bitmap's pixels and dimensions into this one. The source is resolved first, and a source whose pixel buffer is not the bytes its size declares **raises** — copying its empty buffer would give this bitmap the same inconsistent state. |
+| `save(name[, type[, meta]])` | encodes and writes through the host saver. An image whose pixel buffer is not the bytes its size declares **raises** instead of encoding an empty buffer. |
 | `load(name[, colorkey])` | decodes the storage image and installs it; returns a `{width, height, bpp}` metainfo dictionary (`bpp` is always 32). The decode may be deferred to the L2 pool — see §4. |
 | `loadAsync(name)` | runs the load synchronously and dispatches `onLoaded(meta, async, error, message)` immediately with `async == 0`. It never defers: the result is reported to the script, so the decode must have run. |
 | `onLoaded(meta, async, error, message)` | the registered completion hook; returns void. |
 | `width`, `height` | the scene bitmap's dimension. While a decode is pending this is the **probed** size. The setters resize, preserving the overlap; a pending decode is resolved first. |
-| `buffer` | the RGBA buffer address as an integer; `0` when there is no image. Read-only. Waits for a pending decode. |
-| `bufferForWrite` | the RGBA buffer address, marking the bitmap dirty; `0` when there is no image. Read-only. Waits for a pending decode. |
+| `buffer` | the RGBA buffer address as an integer; `0` when there is no image **and** when the resolved image's pixel buffer is not the `width * height * 4` bytes its size declares. Read-only. Waits for a pending decode. |
+| `bufferForWrite` | the RGBA buffer address, marking the bitmap dirty; `0` when there is no image **and** when the resolved image's pixel buffer is not the `width * height * 4` bytes its size declares. Read-only. Waits for a pending decode. |
 | `bufferPitch` | `width * 4` (saturating) bytes per row; `0` when there is no image. Read-only. |
 | `loading` | `1` while an async load is in flight — always `0` outside the `loadAsync` call in this port. Read-only. |
 | `Bitmap.loadHeader(name)` (static) | probes the header through the host prober and returns `{width, height, bpp}` (`bpp` is 32 with alpha, else 24). Returns **void** (no raise) when no handler accepts the data. |
@@ -52,6 +52,21 @@ A second construction on the same payload raises
 
 There is **no** `id` / `nativeId` member — the scene bitmap id is read back
 through the VM's native-instance lookup instead.
+
+### The image that holds no pixels
+
+A bitmap can **declare** a size and hold a pixel buffer that is not the
+`width * height * 4` bytes the size names: a blank image whose allocation
+failed keeps the probed size and an empty buffer. The members answer that
+state instead of reading past the buffer:
+
+* a pixel read answers the out-of-range value and a pixel write is ignored;
+* `buffer` and `bufferForWrite` answer `0` — the reference's "no image"
+  answer — so no address of an empty buffer is handed out;
+* `copyFrom` and `save` **raise**, so an empty buffer is neither copied into
+  another bitmap nor encoded into a file.
+
+`bufferPitch` is unaffected: it is the row pitch the size declares.
 
 ---
 
@@ -203,6 +218,11 @@ The decoded-image cache lives in the L2 scene, keyed by
 * **`setSize`** rejects a zero width or height.
 * **The decoded image must be consistent** — an inconsistent decode raises
   `"the decoded image is malformed"`.
+* **An image whose pixel buffer is not the bytes its size declares has no
+  address and no pixels to copy or encode.** The buffer addresses are `0`, a
+  pixel read is the out-of-range value, a pixel write is ignored, and
+  `copyFrom` and `save` raise: an empty buffer is never handed out, copied or
+  encoded.
 * **`copyFrom`** resolves the source through the VM's native-instance lookup,
   so a non-`Bitmap` object is a typed error, not a sentinel.
 * **A pending bitmap knows its size.** The width and the height are the
@@ -228,8 +248,8 @@ The decoded-image cache lives in the L2 scene, keyed by
 | `"Bitmap: bitmap no longer exists"` | the scene bitmap is gone |
 | `"Bitmap.getPixel requires 2 arguments"`, `"Bitmap.setPixel requires 3 arguments"`, `"Bitmap.getMaskPixel requires 2 arguments"`, `"Bitmap.setMaskPixel requires 3 arguments"`, `"Bitmap.setSize requires 2 arguments"` | the arity checks |
 | `"Bitmap.setSize: cannot create empty layer image"` | a zero dimension |
-| `"Bitmap.copyFrom requires a Bitmap argument"`, `"Bitmap.copyFrom: not a Bitmap object"`, `"Bitmap.copyFrom: the source bitmap does not exist"` | the source argument |
-| `"Bitmap.save requires a storage name"`, `"Bitmap.save: the storage name is empty"`, `"Bitmap.save: the meta argument is not an object"`, `"Bitmap.save: currently async load bitmap"`, `"Bitmap.save: this bitmap has no image"`, `"Bitmap.save: this bitmap no longer exists"`, `"Bitmap.save: {error}"` | the save path |
+| `"Bitmap.copyFrom requires a Bitmap argument"`, `"Bitmap.copyFrom: not a Bitmap object"`, `"Bitmap.copyFrom: the source bitmap does not exist"`, `"Bitmap.copyFrom: the source image does not hold its pixels"` | the source argument |
+| `"Bitmap.save requires a storage name"`, `"Bitmap.save: the storage name is empty"`, `"Bitmap.save: the meta argument is not an object"`, `"Bitmap.save: currently async load bitmap"`, `"Bitmap.save: this bitmap has no image"`, `"Bitmap.save: this bitmap no longer exists"`, `"Bitmap.save: this image does not hold its pixels"`, `"Bitmap.save: {error}"` | the save path |
 | `"Bitmap.load requires a storage name"`, `"Bitmap.load: the storage name is empty"`, `"Bitmap.load: currently async load bitmap"`, `"Bitmap.load: {error}"` | the load path |
 | `"Bitmap.loadAsync requires a storage name"`, `"Bitmap.loadAsync: the storage name is empty"`, `"Bitmap.loadAsync: currently async load bitmap"` | the async load path |
 | `"Bitmap.loadHeader requires a storage name"`, `"Bitmap.loadHeader: no storage attached"`, `"Bitmap.loadHeader: {error}"` | the header probe |
@@ -253,7 +273,7 @@ The decoded-image cache lives in the L2 scene, keyed by
 
 | Test | What it asserts |
 |---|---|
-| `crates/compat/tests/bitmap.rs` | the load populates the bitmap and returns the metainfo; `id`/`nativeId` raise; `loadHeader` probes without decoding; `getSaveOption` returns real objects; the save path encodes and writes through the host seam; the media prefix is stripped; the type is passed verbatim; `meta.bpp` is read as an index; `loadAsync` dispatches `onLoaded`; the typed errors when the codec is absent; the four constructor shapes; dropping a script bitmap releases its image; a stored member result does not pin the bitmap; a single numeric argument leaves the bitmap null; the load into a resized and a same-size bitmap; the name resolution order and the extension probe; the cache limit behaviour and the pristine-pixel cache hit. |
+| `crates/compat/tests/bitmap.rs` | the load populates the bitmap and returns the metainfo; `id`/`nativeId` raise; `loadHeader` probes without decoding; `getSaveOption` returns real objects; the save path encodes and writes through the host seam; the media prefix is stripped; the type is passed verbatim; `meta.bpp` is read as an index; `loadAsync` dispatches `onLoaded`; the typed errors when the codec is absent; the four constructor shapes; dropping a script bitmap releases its image; a stored member result does not pin the bitmap; a single numeric argument leaves the bitmap null; the load into a resized and a same-size bitmap; the name resolution order and the extension probe; the cache limit behaviour and the pristine-pixel cache hit; an image whose pixel buffer is not the bytes its size declares answers the out-of-range pixel value, hands out no buffer address, and refuses to be saved or copied from. |
 | `crates/compat/tests/visual.rs` | `bitmap_pixels_and_size`, `bitmap_copy_from_copies_pixels`. |
 | `crates/compat/tests/dispatch_visual.rs` | the receiver routing. |
 | `crates/compat/tests/layer_behaviour.rs` | the Layer-only members reject a bitmap source. |

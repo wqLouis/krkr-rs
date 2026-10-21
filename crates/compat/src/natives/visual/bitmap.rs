@@ -2,10 +2,12 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::engine_api::{
-    DecodePass, DecodedImageKey, DecodedImageMode, PendingImage, Scene, Storage, StorageReadError,
+    BitmapState, DecodePass, DecodedImageKey, DecodedImageMode, PendingImage, Scene, Storage,
+    StorageReadError,
 };
 use api::media::{DecodedImage, ImageInfo};
 use tjs::{
@@ -517,19 +519,31 @@ extern "C" fn bitmap_ctor(
             Err(error) => return report_error(out_error, &format!("Bitmap: {error}")),
         }
     } else if a.len() > 1 {
-        let width = value_as_i64(&a[0]) as u32;
-        let height = value_as_i64(&a[1]) as u32;
+        let Some(width) = bitmap_dimension(&a[0]) else {
+            return report_error(out_error, "Bitmap: the requested size is too large");
+        };
+        let Some(height) = bitmap_dimension(&a[1]) else {
+            return report_error(out_error, "Bitmap: the requested size is too large");
+        };
+        // A zero dimension is a one-pixel image: the image is never empty.
+        let width = width.max(1);
+        let height = height.max(1);
         let Some(pixels) = (width as usize)
             .checked_mul(height as usize)
             .and_then(|count| count.checked_mul(4))
         else {
             return report_error(out_error, "Bitmap: the requested size is too large");
         };
+        let mut rgba = Vec::new();
+        if rgba.try_reserve_exact(pixels).is_err() {
+            return report_error(out_error, "Bitmap: the requested size is too large");
+        }
+        rgba.resize(pixels, 0);
         let scene = match scene_mut(&ctx) {
             Ok(scene) => scene,
             Err(error) => return report_error(out_error, &error),
         };
-        let id = scene.add_bitmap(width, height, vec![0u8; pixels]);
+        let id = scene.add_bitmap(width, height, rgba);
         if let Some(bitmap) = scene.bitmap_mut(id) {
             bitmap.script_owned = true;
         }
@@ -707,13 +721,70 @@ extern "C" fn bitmap_set_mask_pixel(
     // The image may still be decoding: the pixel is the decoded one.
     scene.resolve_bitmap(id);
     if let Some(bitmap) = scene.bitmap_mut(id)
-        && let Some(offset) = bitmap.pixel_offset(x as u32, y as u32)
+        && let Some(range) = pixel_range(bitmap, x, y)
     {
-        bitmap.rgba[offset + 3] = alpha;
+        bitmap.rgba[range.start + 3] = alpha;
         bitmap.mark_dirty();
     }
     set_void(out);
     0
+}
+
+/// The byte length of a `width` x `height` straight-alpha RGBA8 image.
+///
+/// `None` when the count is not representable.
+fn image_bytes(width: u32, height: u32) -> Option<usize> {
+    usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)
+        .and_then(|pixels| pixels.checked_mul(4))
+}
+
+/// Whether a bitmap's buffer is the pixels its declared size names.
+///
+/// An empty buffer is never an addressable image: `Vec::new().as_ptr()` is a
+/// dangling one-byte pointer, not the null the script members report for an
+/// image that is not there.
+fn holds_addressable_pixels(bitmap: &BitmapState) -> bool {
+    image_bytes(bitmap.width, bitmap.height) == Some(bitmap.rgba.len()) && !bitmap.rgba.is_empty()
+}
+
+/// A `Bitmap` constructor dimension: a non-negative integer that fits in
+/// `u32`.
+///
+/// A negative dimension names no image: it is refused here rather than
+/// wrapping into a size that asks the allocator for gigabytes of pixels.
+fn bitmap_dimension(value: &Value) -> Option<u32> {
+    let requested = value_as_i64(value);
+    if requested < 0 {
+        return None;
+    }
+    u32::try_from(requested).ok()
+}
+
+/// The byte range of one RGBA pixel inside a bitmap's buffer.
+///
+/// `None` when the point is outside the bitmap's declared size, or when the
+/// bitmap declares the pixel but does not hold its four bytes: a blank image
+/// whose allocation failed keeps the probed size and an empty buffer, and a
+/// read or a write of it is then the same no-op as a point outside the image.
+fn pixel_range(bitmap: &BitmapState, x: i32, y: i32) -> Option<Range<usize>> {
+    if x < 0 || y < 0 {
+        return None;
+    }
+    let offset = bitmap.pixel_offset(x as u32, y as u32)?;
+    let end = offset.checked_add(4)?;
+    if end > bitmap.rgba.len() {
+        log::error!(
+            "Bitmap: the image {} declares {}x{} pixels but holds {} bytes",
+            bitmap.id,
+            bitmap.width,
+            bitmap.height,
+            bitmap.rgba.len()
+        );
+        return None;
+    }
+    Some(offset..end)
 }
 
 /// Read one bitmap pixel as ARGB.
@@ -721,15 +792,12 @@ fn read_bitmap_pixel(scene: &Scene, id: u32, x: i32, y: i32) -> i64 {
     let Some(bitmap) = scene.bitmap(id) else {
         return 0;
     };
-    if x < 0 || y < 0 {
-        return 0;
-    }
-    match bitmap.pixel_offset(x as u32, y as u32) {
-        Some(offset) => rgba_to_argb([
-            bitmap.rgba[offset],
-            bitmap.rgba[offset + 1],
-            bitmap.rgba[offset + 2],
-            bitmap.rgba[offset + 3],
+    match pixel_range(bitmap, x, y) {
+        Some(range) => rgba_to_argb([
+            bitmap.rgba[range.start],
+            bitmap.rgba[range.start + 1],
+            bitmap.rgba[range.start + 2],
+            bitmap.rgba[range.start + 3],
         ]),
         None => 0,
     }
@@ -750,16 +818,17 @@ fn write_bitmap_pixel(
     let Some(bitmap) = scene.bitmap_mut(id) else {
         return;
     };
-    if let Some(offset) = bitmap.pixel_offset(x as u32, y as u32) {
-        if hold_alpha {
-            bitmap.rgba[offset] = color[0];
-            bitmap.rgba[offset + 1] = color[1];
-            bitmap.rgba[offset + 2] = color[2];
-        } else {
-            bitmap.rgba[offset..offset + 4].copy_from_slice(&color);
-        }
-        bitmap.mark_dirty();
+    let Some(range) = pixel_range(bitmap, x, y) else {
+        return;
+    };
+    if hold_alpha {
+        bitmap.rgba[range.start] = color[0];
+        bitmap.rgba[range.start + 1] = color[1];
+        bitmap.rgba[range.start + 2] = color[2];
+    } else {
+        bitmap.rgba[range].copy_from_slice(&color);
     }
+    bitmap.mark_dirty();
 }
 
 /// `Bitmap.setSize(width, height)`.
@@ -844,6 +913,15 @@ extern "C" fn bitmap_copy_from(
             "Bitmap.copyFrom: the source bitmap does not exist",
         );
     };
+    // A source that declares its size and holds no pixels has nothing to
+    // copy: copying its empty buffer would give this bitmap the same
+    // inconsistent state.
+    if image_bytes(width, height) != Some(rgba.len()) {
+        return report_error(
+            out_error,
+            "Bitmap.copyFrom: the source image does not hold its pixels",
+        );
+    }
     scene.replace_bitmap_image(id, width, height, rgba);
     set_void(out);
     0
@@ -956,6 +1034,15 @@ extern "C" fn bitmap_save(
         return report_error(out_error, "Bitmap.save: this bitmap no longer exists");
     };
     let (width, height, rgba) = (bitmap.width, bitmap.height, bitmap.rgba.clone());
+    // A bitmap that declares its size and holds no pixels has nothing to
+    // encode: handing the encoder an empty buffer would write a truncated
+    // image.
+    if image_bytes(width, height) != Some(rgba.len()) {
+        return report_error(
+            out_error,
+            "Bitmap.save: this image does not hold its pixels",
+        );
+    }
     match resolver.save_image(&name, &type_name, width, height, &rgba) {
         Ok(()) => {
             set_void(out);
@@ -1341,7 +1428,14 @@ extern "C" fn bitmap_buffer_get(
     };
     // The image may still be decoding: the address is the decoded buffer's.
     scene.resolve_bitmap(id);
-    set_int(out, scene.bitmap(id).map_or(0, |b| b.rgba.as_ptr() as i64));
+    let address = scene.bitmap(id).map_or(0, |bitmap| {
+        if holds_addressable_pixels(bitmap) {
+            bitmap.rgba.as_ptr() as i64
+        } else {
+            0
+        }
+    });
+    set_int(out, address);
     0
 }
 
@@ -1373,11 +1467,11 @@ extern "C" fn bitmap_buffer_for_write_get(
     // The image may still be decoding: the address is the decoded buffer's.
     scene.resolve_bitmap(id);
     let address = match scene.bitmap_mut(id) {
-        Some(bitmap) => {
+        Some(bitmap) if holds_addressable_pixels(bitmap) => {
             bitmap.mark_dirty();
             bitmap.rgba.as_mut_ptr() as i64
         }
-        None => 0,
+        _ => 0,
     };
     set_int(out, address);
     0

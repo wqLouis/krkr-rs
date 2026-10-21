@@ -340,6 +340,8 @@ fn with_two_bitmaps<R>(
         .iter()
         .position(|b| b.id == src_id)
         .ok_or_else(|| format!("ImageFunction: the source bitmap {src_id} does not exist"))?;
+    ensure_pixels(&scene.bitmaps[dst_index], "destination")?;
+    ensure_pixels(&scene.bitmaps[src_index], "source")?;
     if dst_index == src_index {
         let source = scene.bitmaps[src_index].clone();
         return Ok(f(&mut scene.bitmaps[dst_index], &source));
@@ -351,6 +353,27 @@ fn with_two_bitmaps<R>(
         let (left, right) = scene.bitmaps.split_at_mut(dst_index);
         Ok(f(&mut right[0], &left[src_index]))
     }
+}
+
+/// Verify that a resolved bitmap holds the pixels its declared size names.
+fn ensure_pixels(bitmap: &BitmapState, role: &str) -> Result<(), String> {
+    let expected = (bitmap.width as usize)
+        .checked_mul(bitmap.height as usize)
+        .and_then(|pixels| pixels.checked_mul(4));
+    if expected == Some(bitmap.rgba.len()) {
+        return Ok(());
+    }
+    log::error!(
+        "ImageFunction: the {role} bitmap {} declares {}x{} pixels but holds {} bytes",
+        bitmap.id,
+        bitmap.width,
+        bitmap.height,
+        bitmap.rgba.len()
+    );
+    Err(format!(
+        "ImageFunction: the {role} image {} does not hold its pixels",
+        bitmap.id
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -469,13 +492,16 @@ fn clip_dest_src(dx: i32, dy: i32, src: RectI, clip: RectI) -> Option<(i32, i32,
 
 /// In-place horizontal mirror of `rect`, using the whole-image primitive for
 /// the common full-bitmap case.
-fn flip_lr_region(bitmap: &mut BitmapState, rect: RectI) {
+///
+/// Fails when the bitmap does not hold the pixels its declared size names.
+fn flip_lr_region(bitmap: &mut BitmapState, rect: RectI) -> Result<(), String> {
+    ensure_pixels(bitmap, "flipLR")?;
     let Some(r) = layer_ops::intersect(bitmap, rect) else {
-        return;
+        return Ok(());
     };
     if r == full_rect(bitmap) {
         layer_ops::flip_lr(bitmap);
-        return;
+        return Ok(());
     }
     let width = bitmap.width as usize;
     for y in r.1..r.3 {
@@ -490,16 +516,20 @@ fn flip_lr_region(bitmap: &mut BitmapState, rect: RectI) {
         }
     }
     bitmap.mark_dirty();
+    Ok(())
 }
 
 /// In-place vertical mirror of `rect`.
-fn flip_ud_region(bitmap: &mut BitmapState, rect: RectI) {
+///
+/// Fails when the bitmap does not hold the pixels its declared size names.
+fn flip_ud_region(bitmap: &mut BitmapState, rect: RectI) -> Result<(), String> {
+    ensure_pixels(bitmap, "flipUD")?;
     let Some(r) = layer_ops::intersect(bitmap, rect) else {
-        return;
+        return Ok(());
     };
     if r == full_rect(bitmap) {
         layer_ops::flip_ud(bitmap);
-        return;
+        return Ok(());
     }
     let width = bitmap.width as usize;
     for x in r.0..r.2 {
@@ -514,6 +544,7 @@ fn flip_ud_region(bitmap: &mut BitmapState, rect: RectI) {
         }
     }
     bitmap.mark_dirty();
+    Ok(())
 }
 
 /// Copy `rect` out of `src` into a new standalone bitmap (the scratch the
@@ -867,11 +898,12 @@ extern "C" fn image_flip_lr(
         let dst = scene
             .bitmap_mut(dst_id)
             .ok_or_else(|| format!("ImageFunction.flipLR: no bitmap {dst_id}"))?;
+        ensure_pixels(dst, "destination")?;
         let rect = rect.unwrap_or_else(|| full_rect(dst));
         if !rect_in_bounds(dst, rect) {
             return Err("ImageFunction.flipLR: the rectangle is outside the bitmap".into());
         }
-        flip_lr_region(dst, rect);
+        flip_lr_region(dst, rect)?;
         Ok(Some(rect))
     })
 }
@@ -897,11 +929,12 @@ extern "C" fn image_flip_ud(
         let dst = scene
             .bitmap_mut(dst_id)
             .ok_or_else(|| format!("ImageFunction.flipUD: no bitmap {dst_id}"))?;
+        ensure_pixels(dst, "destination")?;
         let rect = rect.unwrap_or_else(|| full_rect(dst));
         if !rect_in_bounds(dst, rect) {
             return Err("ImageFunction.flipUD: the rectangle is outside the bitmap".into());
         }
-        flip_ud_region(dst, rect);
+        flip_ud_region(dst, rect)?;
         Ok(Some(rect))
     })
 }
@@ -956,6 +989,7 @@ extern "C" fn image_adjust_gamma(
         let dst = scene
             .bitmap_mut(dst_id)
             .ok_or_else(|| format!("ImageFunction.adjustGamma: no bitmap {dst_id}"))?;
+        ensure_pixels(dst, "destination")?;
         let clip = clip.unwrap_or_else(|| full_rect(dst));
         if isaddalpha {
             // No dedicated additive-alpha gamma table is exposed through L2;
@@ -996,6 +1030,7 @@ extern "C" fn image_do_box_blur(
         let dst = scene
             .bitmap_mut(dst_id)
             .ok_or_else(|| format!("ImageFunction.doBoxBlur: no bitmap {dst_id}"))?;
+        ensure_pixels(dst, "destination")?;
         let clip = clip.unwrap_or_else(|| full_rect(dst));
         if xblur == 0 && yblur == 0 {
             return Ok(None);
@@ -1045,6 +1080,7 @@ extern "C" fn image_do_gray_scale(
         let dst = scene
             .bitmap_mut(dst_id)
             .ok_or_else(|| format!("ImageFunction.doGrayScale: no bitmap {dst_id}"))?;
+        ensure_pixels(dst, "destination")?;
         let clip = clip.unwrap_or_else(|| full_rect(dst));
         layer_ops::do_gray_scale(dst, clip);
         Ok(Some(clip))
@@ -1076,6 +1112,7 @@ extern "C" fn image_fill_rect(
         let dst = scene
             .bitmap_mut(dst_id)
             .ok_or_else(|| format!("ImageFunction.fillRect: no bitmap {dst_id}"))?;
+        ensure_pixels(dst, "destination")?;
         let rect = rect.unwrap_or_else(|| full_rect(dst));
         let clip = clip.unwrap_or_else(|| full_rect(dst));
         let Some(dest) = layer_ops::intersect_rect(rect, clip) else {
@@ -1131,6 +1168,7 @@ extern "C" fn image_color_rect(
         let dst = scene
             .bitmap_mut(dst_id)
             .ok_or_else(|| format!("ImageFunction.colorRect: no bitmap {dst_id}"))?;
+        ensure_pixels(dst, "destination")?;
         let rect = rect.unwrap_or_else(|| full_rect(dst));
         let clip = clip.unwrap_or_else(|| full_rect(dst));
         let Some(dest) = layer_ops::intersect_rect(rect, clip) else {
@@ -1244,6 +1282,7 @@ extern "C" fn image_draw_text(
         let Some(bitmap) = scene.bitmap_mut(dst_id) else {
             return Err(format!("ImageFunction.drawText: no bitmap {dst_id}"));
         };
+        ensure_pixels(bitmap, "destination")?;
         let clip = clip.unwrap_or_else(|| {
             (
                 0,
@@ -1325,6 +1364,7 @@ extern "C" fn image_draw_glyph(
         let Some(bitmap) = scene.bitmap_mut(dst_id) else {
             return Err(format!("ImageFunction.drawGlyph: no bitmap {dst_id}"));
         };
+        ensure_pixels(bitmap, "destination")?;
         let clip = clip.unwrap_or_else(|| {
             (
                 0,

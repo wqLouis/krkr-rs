@@ -2498,3 +2498,42 @@ fn higher_absolute_puts_the_return_button_above_the_sidebar() {
         "the overlap hit-tests to the front-most return button"
     );
 }
+
+/// A hit test of a layer image that declares its size and holds no pixels is
+/// a miss, not a read past the buffer.
+///
+/// `_HitTestNoVisibleCheck` compares the main image's alpha at the point with
+/// `hitThreshold` (`reference/cpp/core/visual/LayerIntf.cpp:3233-3246`); the
+/// reference image always holds its pixels, so an image that declares the
+/// probed size without a buffer answers like a point outside it.
+#[test]
+fn a_hit_test_of_a_bufferless_layer_image_is_a_miss() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.name = 'l'; \
+         l.setSize(2, 2); l.setImageSize(2, 2);",
+    );
+    let bitmap_id = env
+        .scene
+        .layers
+        .iter()
+        .find(|l| l.name == "l")
+        .and_then(|l| l.bitmap)
+        .expect("the layer has a main image");
+    // The state a failed blank allocation leaves: the layer keeps the image
+    // size and the buffer is empty.
+    env.scene
+        .bitmap_mut(bitmap_id)
+        .expect("the image is real")
+        .rgba
+        .clear();
+
+    // reference/cpp/core/visual/LayerIntf.cpp:3233-3246
+    assert_eq!(
+        env.eval_int("l.getLayerAt(0, 0) === null"),
+        1,
+        "an image without pixels hits nothing"
+    );
+}

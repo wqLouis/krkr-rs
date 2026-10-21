@@ -31,8 +31,8 @@ Every method composes the L2 `engine_api::layer_ops` and
 | `blendRect(dx, dy, src, sx, sy, sw, sh[, opa])` | blends the source rect at `(dx, dy)`. **Layer-only** source. |
 | `piledCopy(dx, dy, src, sx, sy, sw, sh[, opa])` | copies the source **layer's composited subtree** (its own image plus its visible children). **Layer-only** source. |
 | `copy9Patch(src)` | copies the 9-patch source and returns its margin `Rect`, or `void`. |
-| `copyToBitmapFromMainImage(bitmap)` | replaces the bitmap's content with the layer's main image (resizing the bitmap). |
-| `fillRect(x, y, w, h, color[, opa])` | fills the rect with the colour. |
+| `copyToBitmapFromMainImage(bitmap)` | replaces the bitmap's content with the layer's main image (resizing the bitmap). The main image is **resolved first** — a pending decode is waited for — and an image that declares more pixels than its buffer holds raises. The destination's pending decode is **cancelled** and its pixels replaced, so a stale decode cannot overwrite the copy. |
+| `fillRect(x, y, w, h, color[, opa])` | fills the rect with the colour. The main image is **resolved first** — a pending decode is waited for — so the fill lands on the decoded pixels instead of being overwritten by them; an image that declares more pixels than its buffer holds raises. |
 | `colorRect(x, y, w, h, color[, opa])` | fills the rect with `0xAARRGGBB`; a **negative** `opa` removes the const opacity instead of painting. |
 
 ### The filters
@@ -47,6 +47,14 @@ Every method composes the L2 `engine_api::layer_ops` and
 | `light(brightness, contrast)` | applies brightness and contrast to the clipped region. |
 | `convertType(fromtype)` | converts the alpha plane between `dfAlpha` and `dfAddAlpha` (one direction only). |
 
+Every filter **resolves the main image first**: a pending decode is waited
+for, and an image that declares more pixels than its buffer holds raises
+rather than being filtered over an empty buffer. The region helpers that back
+the blurs — the extraction of the clipped region and the restore of the held
+alpha and colour planes — therefore run on a resolved, validated image; their
+own guards keep an image that holds no pixels from being indexed, and report
+the image in the log.
+
 ### The pixel accessors
 
 | Member | Behaviour |
@@ -60,6 +68,10 @@ Every method composes the L2 `engine_api::layer_ops` and
 `getMainPixel` and `getMaskPixel` **never raise** on a missing image — they
 return `0`. `setMainPixel` and `setMaskPixel` set `imageModified`.
 
+The reads wait for a pending decode first, and an image that declares more
+pixels than its buffer holds answers `0` like a missing one. The writes
+**raise** for such an image — see §10.
+
 ### The image and text paths
 
 | Member | Behaviour |
@@ -67,8 +79,8 @@ return `0`. `setMainPixel` and `setMaskPixel` set `imageModified`.
 | `independProvinceImage([copy])` | allocates the layer's 8-bit province plane; the default keeps the existing content, `copy = false` clears it. |
 | `loadImages(name[, key])` | reads and probes the storage image, queues the decode in the L2 pool when possible, and installs it as the layer's main image (a pending bitmap until the pixels land). Returns `null` — the reference's absent metainfo. |
 | `loadProvinceImage(name)` | loads an 8-bit province plane sized to the main image. A smaller image is tiled up to that size; a larger one is a size mismatch. The **red channel** of every pixel becomes the province value. |
-| `saveLayerImage(name[, type])` | encodes the main image through the host encoder and writes it through the storage. `type` defaults to `"bmp"`. |
-| `drawText(x, y, text, color[, opacity[, antialias[, shadowLevel[, shadowColor[, shadowWidth[, shadowOffsetX[, shadowOffsetY]]]]]]])` | rasterizes a text run into the layer's main image. |
+| `saveLayerImage(name[, type])` | encodes the main image through the host encoder and writes it through the storage. `type` defaults to `"bmp"`. The main image is **resolved first** — a pending decode is waited for — and an image that declares more pixels than its buffer holds raises instead of encoding an empty image. |
+| `drawText(x, y, text, color[, opacity[, antialias[, shadowLevel[, shadowColor[, shadowWidth[, shadowOffsetX[, shadowOffsetY]]]]]]])` | rasterizes a text run into the layer's main image. The main image is **resolved first** and validated, so the text lands on the decoded pixels; an image that declares more pixels than its buffer holds raises. |
 | `drawGlyph(x, y, glyph, color[, …same optionals…])` | the same, but the text comes from the glyph object's `text`/`char`/`character` member. |
 | `dump()` | logs the layer's structure at debug level. |
 
@@ -284,6 +296,12 @@ main image is read and handed to the host encoder, and the media prefix is
 stripped first. With no encoder installed the error is
 `"no image encoder is installed"`.
 
+The main image is **resolved first**: a pending decode is waited for, so the
+saved pixels are the decoded ones. An image that declares more pixels than
+its buffer holds **raises** instead of encoding an empty image — a truncated
+file is never written. A layer with no main image raises
+`"Layer.saveLayerImage: unsupported layer type (no main image)"`.
+
 ---
 
 ## 8. The text path
@@ -314,6 +332,9 @@ stripped first. With no encoder installed the error is
 * The destination is the layer's own main image; a layer without one gets a
   transparent one allocated from its rect. A zero-sized rect raises
   `"unsupported layer type (no main image)"`.
+* An existing main image is **resolved first** — a pending decode is waited
+  for — and validated: an image that declares more pixels than its buffer
+  holds raises instead of dropping the text silently.
 * The L3 `ResourceResolver` resolves the face, uses a **pre-rendered** font
   mapped under the same key when one exists, and otherwise lays the text out
   and rasterizes the coverage.
@@ -347,12 +368,17 @@ stripped first. With no encoder installed the error is
 | `"Layer.<method>: compat context is not bound"` | the binding is not installed |
 | `"Layer.<method>: this layer no longer exists"` | the scene record is gone |
 | `"Layer.<method>: this layer has no main image"` | the layer has no drawable image |
+| `"Layer.<method>: this layer's image no longer exists"` | the scene bitmap is gone |
+| `"Layer.<method>: Layer: the main-image image {id} does not hold its pixels"` | the main image declares more pixels than its buffer holds |
 | `"Layer.<method> requires N argument(s)"` | the arity checks |
 | `"Layer.<method>: unsupported draw face {face}"` | a rejected face |
 | `"Layer: the operation mode {mode} cannot draw on draw face {face}"` | a face-sensitive mode on an incompatible face |
 | `"Layer: the source must be a Layer object"` | a `Bitmap` passed to a Layer-only member |
 | `"Layer: the source is not a Layer or Bitmap object"` | an unresolvable source |
 | `"Layer: the source layer has no main image"` | the source layer is imageless |
+| `"Layer: the layer image {id} does not hold its pixels"` | the text path's main image declares more pixels than its buffer holds |
+| `"Layer: the destination image {id} does not hold its pixels"`, `"Layer: the source image {id} does not hold its pixels"` | a blit copies between images that declare more pixels than their buffers hold |
+| `"Layer: the destination bitmap {id} does not exist"`, `"Layer: the source bitmap {id} does not exist"` | the blit's image is gone |
 | `"Layer.colorRect: negative opacity is not supported on dfAddAlpha"` | a negative opacity on the add-alpha face |
 | `"Layer.convertType: cannot convert the layer type in the given direction"` | an unsupported conversion direction |
 | `"Layer.gaussianBlur: radius must be positive"`, `"Layer.gaussianBlur: sigma must be positive"` | a non-positive radius or sigma |
@@ -366,6 +392,10 @@ stripped first. With no encoder installed the error is
 | `"Layer.loadProvinceImage: the province plane is missing"` | the plane disappeared before it could be filled |
 | `"Layer.loadProvinceImage: the layer has no main image"` | the layer is imageless |
 | `"Layer.saveLayerImage: no image encoder is installed"` | the host encoder is missing |
+| `"Layer.saveLayerImage: unsupported layer type (no main image)"` | the layer is imageless |
+| `"Layer.saveLayerImage: the bitmap {id} holds {bytes} pixel bytes instead of its {width}x{height} image"` | the main image declares more pixels than its buffer holds |
+| `"Layer.copyToBitmapFromMainImage: the bitmap {id} holds {bytes} pixel bytes instead of its {width}x{height} image"` | the copied main image declares more pixels than its buffer holds — the generic main-image check above raises first |
+| `"Layer.copyToBitmapFromMainImage: the destination bitmap {id} does not exist"`, `"Layer.copyToBitmapFromMainImage: the destination bitmap {id} could not be replaced"` | the destination bitmap is gone or cannot take the copy |
 
 ### Deliberate no-ops
 
@@ -381,6 +411,11 @@ These are **not** errors — they match the reference:
 * `doBoxBlur` with `xblur == 0 && yblur == 0` returns without touching the
   image.
 
+A main image that *declares* more pixels than its buffer holds is not one of
+these silent paths: the operation raises (§10), so no filter, blit, fill or
+text run silently works over an empty buffer. The two pixel **reads** are the
+exception — they answer the out-of-range value `0`.
+
 ---
 
 ## 11. Tests
@@ -392,6 +427,7 @@ These are **not** errors — they match the reference:
 | `crates/compat/tests/image_function.rs` | the same primitives through the `ImageFunction` surface. |
 | `crates/compat/tests/bitmap.rs` | the codec seam the image path uses. |
 | `crates/compat/tests/font.rs` | the pre-rendered font pixels matching the rasterizer's coverage. |
+| `crates/engine/tests/layer_ops.rs` | the L2 pixel primitives over an image that declares pixels it does not hold: a blit draws nothing from it, a fill writes nothing into it, and a transition leaves it alone. |
 
 ---
 

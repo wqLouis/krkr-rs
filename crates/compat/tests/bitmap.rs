@@ -961,3 +961,289 @@ fn two_different_names_are_cached_separately() {
     assert_eq!(env.eval_int("beta.getPixel(0, 0)"), 0xff42_4242);
     assert_eq!(env.eval_int("betaAgain.getPixel(0, 0)"), 0xff42_4242);
 }
+
+/// A bitmap that declares its size and holds no pixels answers a pixel read
+/// with the out-of-range value, and a pixel write of it is a no-op.
+///
+/// `Bitmap.getPixel`/`getMaskPixel` read the image's point
+/// (`reference/cpp/core/visual/BitmapIntf.cpp:57`,
+/// `reference/cpp/core/visual/BitmapIntf.cpp:75`), `setPixel`/`setMaskPixel`
+/// write it (`reference/cpp/core/visual/BitmapIntf.cpp:66`,
+/// `reference/cpp/core/visual/BitmapIntf.cpp:84`), and each point access is
+/// bounds-checked against the image before it touches the buffer
+/// (`reference/cpp/core/visual/LayerBitmapIntf.cpp:165-170`,
+/// `:194-209`, `:211-226`).
+///
+/// The reference **raises** `TVPOutOfRectangle` for such a point
+/// (`reference/cpp/core/visual/LayerBitmapIntf.cpp:167`,
+/// `:181`, `:200`, `:219`); this port answers `0` and ignores the write
+/// instead. That is a pre-existing divergence of the port's point members,
+/// not a property of the deferred model, and it is recorded here rather than
+/// changed: the test below pins the port's answer so the deferred model's
+/// bufferless image reads the same way an out-of-range point does, instead of
+/// reading past the buffer.
+#[test]
+fn a_pixel_member_on_a_bufferless_bitmap_is_the_out_of_range_answer() {
+    let _lock = vm_lock();
+    let mut env = Env::new(true);
+    env.run("var b = new Bitmap(2, 2);");
+    let id = env._scene.bitmaps.last().expect("the script bitmap").id;
+    // The state a failed blank allocation leaves: the size is declared and
+    // the pixel buffer is empty.
+    env._scene
+        .bitmap_mut(id)
+        .expect("the image is real")
+        .rgba
+        .clear();
+
+    // reference/cpp/core/visual/BitmapIntf.cpp:57, :75 — a point the buffer
+    // does not hold reads as the out-of-range value.
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0);
+    assert_eq!(env.eval_int("b.getMaskPixel(1, 1)"), 0);
+    // reference/cpp/core/visual/BitmapIntf.cpp:66, :84 — the writes keep the
+    // declared size and touch no bytes.
+    env.run("b.setPixel(0, 0, 0xff112233); b.setMaskPixel(1, 1, 255);");
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0);
+    assert_eq!(env.eval_int("b.getMaskPixel(1, 1)"), 0);
+    assert_eq!(env.eval_int("b.width"), 2);
+    assert!(
+        env._scene
+            .bitmap(id)
+            .expect("the image is real")
+            .rgba
+            .is_empty(),
+        "the writes did not invent a buffer for the image"
+    );
+}
+
+/// `new Bitmap(0, 0)` is a 1x1 image, not an empty one.
+///
+/// The reference's texture constructor clamps a zero dimension to one
+/// (`reference/cpp/core/visual/LayerBitmapIntf.cpp:4777-4780`), so the image
+/// is addressable: `buffer` hands out its scanline instead of the null the
+/// script members report for an image that is not there
+/// (`reference/cpp/core/visual/BitmapIntf.cpp:194-198`).
+#[test]
+fn a_zero_sized_bitmap_is_clamped_to_one_pixel() {
+    let _lock = vm_lock();
+    let env = Env::new(true);
+    env.run("var b = new Bitmap(0, 0);");
+    let id = env._scene.bitmaps.last().expect("the script bitmap").id;
+    assert_eq!(env.eval_int("b.width"), 1, "the width is clamped to one");
+    assert_eq!(env.eval_int("b.height"), 1, "the height is clamped to one");
+    let bitmap = env._scene.bitmap(id).expect("the image is real");
+    assert_eq!(bitmap.rgba.len(), 4, "the image holds one pixel");
+    assert_ne!(
+        env.eval_int("b.buffer"),
+        0,
+        "a one-pixel image has an address"
+    );
+}
+
+/// A negative constructor dimension raises instead of asking for an enormous
+/// image.
+///
+/// The reference reads the arguments as `tjs_uint32`
+/// (`reference/cpp/core/visual/BitmapIntf.cpp:33-34`), so a negative value
+/// wraps there into a huge size the texture manager refuses. This port
+/// refuses it up front, so no gigabyte-sized buffer is ever requested.
+#[test]
+fn a_negative_bitmap_dimension_raises() {
+    let _lock = vm_lock();
+    let env = Env::new(true);
+    let error = env.error("new Bitmap(-1, 1);");
+    assert!(
+        error.contains("the requested size is too large"),
+        "the refusal reaches the script: {error}"
+    );
+    let error = env.error("new Bitmap(1, -1);");
+    assert!(
+        error.contains("the requested size is too large"),
+        "the refusal reaches the script: {error}"
+    );
+    assert!(
+        env._scene.bitmaps.is_empty(),
+        "the refused images were never allocated"
+    );
+}
+
+/// `Bitmap.save` refuses an image that declares its size and holds no pixels
+/// instead of handing the encoder an empty buffer.
+///
+/// The reference encodes the image's own scanlines
+/// (`reference/cpp/core/visual/BitmapIntf.cpp:116-124`), which always holds
+/// them; the deferred model can leave the probed size without the buffer when
+/// the blank allocation fails, and a truncated image is not saved.
+#[test]
+fn save_raises_for_a_bufferless_bitmap() {
+    let _lock = vm_lock();
+    let mut env = Env::new(true);
+    env.run("var b = new Bitmap(2, 2);");
+    let id = env._scene.bitmaps.last().expect("the script bitmap").id;
+    env._scene
+        .bitmap_mut(id)
+        .expect("the image is real")
+        .rgba
+        .clear();
+    let error = env.error("b.save('out/test.bmp')");
+    assert!(
+        error.contains("does not hold its pixels"),
+        "the inconsistency reaches the script: {error}"
+    );
+}
+
+/// `Bitmap.copyFrom` refuses a source that declares its size and holds no
+/// pixels instead of copying its empty buffer into the destination.
+///
+/// The reference assigns the source image
+/// (`reference/cpp/core/visual/BitmapIntf.cpp:212-214`), which always holds
+/// its pixels; the deferred model can leave the probed size without the buffer
+/// when the blank allocation fails, and the copy would give the destination
+/// the same inconsistent state.
+#[test]
+fn copy_from_raises_for_a_bufferless_source() {
+    let _lock = vm_lock();
+    let mut env = Env::new(true);
+    env.run("var src = new Bitmap(2, 2); var dst = new Bitmap(2, 2);");
+    let ids: Vec<u32> = env._scene.bitmaps.iter().map(|bitmap| bitmap.id).collect();
+    let source_id = ids[0];
+    let destination_id = ids[1];
+    env._scene
+        .bitmap_mut(source_id)
+        .expect("the source image is real")
+        .rgba
+        .clear();
+    let error = env.error("dst.copyFrom(src)");
+    assert!(
+        error.contains("does not hold its pixels"),
+        "the inconsistency reaches the script: {error}"
+    );
+    assert_eq!(
+        env._scene
+            .bitmap(destination_id)
+            .expect("the destination image is real")
+            .rgba
+            .len(),
+        16,
+        "the destination keeps its own pixels"
+    );
+}
+
+/// `Bitmap.buffer` and `Bitmap.bufferForWrite` answer 0 for an image that
+/// declares its size and holds no pixels.
+///
+/// The reference hands out the image's first scanline
+/// (`reference/cpp/core/visual/BitmapIntf.cpp:194-198` and
+/// `reference/cpp/core/visual/BitmapIntf.cpp:200-204`) and 0 when the object
+/// has no image at all; the script members are
+/// `reference/cpp/core/visual/BitmapIntf.cpp:490-502` and
+/// `reference/cpp/core/visual/BitmapIntf.cpp:504-517`. A blank image whose
+/// allocation failed keeps the probed size and an empty buffer, so the
+/// address is 0 — the reference's "no image" answer — instead of a pointer to
+/// no pixels.
+#[test]
+fn the_buffer_addresses_of_a_bufferless_bitmap_are_zero() {
+    let _lock = vm_lock();
+    let mut env = Env::new(true);
+    env.run("var b = new Bitmap(2, 2);");
+    let id = env._scene.bitmaps.last().expect("the script bitmap").id;
+    // An image that holds its pixels has an address.
+    assert_ne!(
+        env.eval_int("b.buffer"),
+        0,
+        "an image with pixels has an address"
+    );
+
+    // The state a failed blank allocation leaves: the size is declared and
+    // the pixel buffer is empty.
+    env._scene
+        .bitmap_mut(id)
+        .expect("the image is real")
+        .rgba
+        .clear();
+    env._scene.bitmap_mut(id).expect("the image is real").dirty = false;
+
+    // reference/cpp/core/visual/BitmapIntf.cpp:490-502
+    assert_eq!(
+        env.eval_int("b.buffer"),
+        0,
+        "an image without pixels has no address"
+    );
+    // reference/cpp/core/visual/BitmapIntf.cpp:504-517
+    assert_eq!(
+        env.eval_int("b.bufferForWrite"),
+        0,
+        "an image without pixels has no write address"
+    );
+    assert!(
+        !env._scene.bitmap(id).expect("the image is real").dirty,
+        "no write address is handed out, so the image is not modified"
+    );
+}
+
+/// `Layer.mainImageBuffer` and `Layer.mainImageBufferForWrite` answer 0 for a
+/// layer image that declares its size and holds no pixels.
+///
+/// The reference hands out the MainImage's first scanline
+/// (`reference/cpp/core/visual/LayerIntf.cpp:3005-3009` and
+/// `reference/cpp/core/visual/LayerIntf.cpp:3012-3017`) and 0 when the layer
+/// has no MainImage; the script members are
+/// `reference/cpp/core/visual/LayerIntf.cpp:11406-11418` and
+/// `reference/cpp/core/visual/LayerIntf.cpp:11420-11433`. A blank image whose
+/// allocation failed keeps the probed size and an empty buffer, so the
+/// address is 0 instead of a pointer to no pixels.
+#[test]
+fn the_main_image_addresses_of_a_bufferless_layer_are_zero() {
+    let _lock = vm_lock();
+    let mut env = Env::new(true);
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.name = 'l'; \
+         l.setSize(2, 2); l.setImageSize(2, 2);",
+    );
+    let bitmap_id = env
+        ._scene
+        .layers
+        .iter()
+        .find(|layer| layer.name == "l")
+        .and_then(|layer| layer.bitmap)
+        .expect("the layer has a main image");
+    // A layer image that holds its pixels has an address.
+    assert_ne!(
+        env.eval_int("l.mainImageBuffer"),
+        0,
+        "a layer image with pixels has an address"
+    );
+
+    // The state a failed blank allocation leaves: the image keeps its size
+    // and the pixel buffer is empty.
+    env._scene
+        .bitmap_mut(bitmap_id)
+        .expect("the image is real")
+        .rgba
+        .clear();
+    env._scene
+        .bitmap_mut(bitmap_id)
+        .expect("the image is real")
+        .dirty = false;
+
+    // reference/cpp/core/visual/LayerIntf.cpp:11406-11418
+    assert_eq!(
+        env.eval_int("l.mainImageBuffer"),
+        0,
+        "a layer image without pixels has no address"
+    );
+    // reference/cpp/core/visual/LayerIntf.cpp:11420-11433
+    assert_eq!(
+        env.eval_int("l.mainImageBufferForWrite"),
+        0,
+        "a layer image without pixels has no write address"
+    );
+    assert!(
+        !env._scene
+            .bitmap(bitmap_id)
+            .expect("the image is real")
+            .dirty,
+        "no write address is handed out, so the image is not modified"
+    );
+}

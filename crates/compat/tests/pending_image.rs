@@ -17,6 +17,7 @@ use engine::input::InputState;
 use engine::timer::TimerState;
 use engine::{DecodedImageKey, DecodedImageMode, Scene, Storage};
 use fs::FileSystem;
+use platform::{InputEvent, PlatformEvent};
 use tjs::{Tjs2Engine, TjsValue};
 
 /// The image the synthetic codec and the pool's decoder both produce.
@@ -211,6 +212,21 @@ impl Env {
                     .is_some_and(|bitmap| bitmap.pending.is_some())
             })
             .expect("a layer with a pending image")
+    }
+
+    /// Runs one input frame over the adapter, the sequence the frame body
+    /// uses.
+    fn dispatch_events(&self, events: &[PlatformEvent]) {
+        let mut adapter = compat::EventAdapter::new();
+        let mut ctx = self._host.ctx().expect("bound compat context");
+        adapter.begin_input_frame(&mut ctx);
+        for event in events {
+            adapter.apply_input_event(&mut ctx, event);
+            if let Some(mapped) = adapter.map(event) {
+                adapter.dispatch(&mut ctx, &mapped).expect("dispatch event");
+            }
+        }
+        adapter.end_input_frame(&mut ctx);
     }
 }
 
@@ -648,4 +664,300 @@ fn a_failed_province_load_drops_the_previous_plane() {
     assert_eq!(env.eval_int("l.getProvincePixel(0, 0)"), 0);
     let layer = env.scene.layers.first().expect("the layer exists");
     assert!(layer.province.is_none(), "the failed load drops the plane");
+}
+
+/// A hit test waits for the layer's pending image before it reads the alpha.
+///
+/// `_HitTestNoVisibleCheck` compares the main image's alpha against
+/// `hitThreshold` (`reference/cpp/core/visual/LayerIntf.cpp:3233-3246`), and
+/// `GetMostFrontChildAt` returns the layer that hit
+/// (`reference/cpp/core/visual/LayerIntf.cpp:3363-3385`). The reference image
+/// is complete when the hit test runs because the load decodes it before it
+/// returns (`reference/cpp/core/visual/LayerIntf.cpp:2850`).
+#[test]
+fn a_hit_test_waits_for_the_pending_layer_image() {
+    let _lock = common::vm_lock();
+    let env = Env::with_pool(config());
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.loadImages('picture.png');",
+    );
+    // The load returned with the probed size and no pixels, and the default
+    // `hitThreshold` is 16, so the hit test has to read the image.
+    let bitmap_id = env
+        .pending_layer()
+        .bitmap
+        .expect("the layer has a main image");
+    assert!(
+        env.scene
+            .bitmap(bitmap_id)
+            .expect("the image exists")
+            .rgba
+            .is_empty(),
+        "the pixels have not landed yet"
+    );
+
+    // reference/cpp/core/visual/LayerIntf.cpp:3233-3246, :3363-3385
+    assert_eq!(
+        env.eval_int("l.getLayerAt(0, 0) === l"),
+        1,
+        "the layer under the point is itself"
+    );
+    let bitmap = env.scene.bitmap(bitmap_id).expect("the image exists");
+    assert!(
+        bitmap.pending.is_none(),
+        "the hit test waited for the decode"
+    );
+    assert_eq!(bitmap.rgba.len(), 16, "the image is decoded");
+}
+
+/// The pointer hit test waits for the pending image of the window it tests.
+///
+/// A pointer move hit-tests the layer tree
+/// (`reference/cpp/core/visual/LayerManager.cpp:461`) and fires
+/// `onMouseMove` on the layer it found
+/// (`reference/cpp/core/visual/LayerManager.cpp:506-509`); the layer hit test
+/// reads the main image's alpha
+/// (`reference/cpp/core/visual/LayerIntf.cpp:3233-3246`), and the reference
+/// image is complete because the load decodes it before it returns
+/// (`reference/cpp/core/visual/LayerIntf.cpp:2850`).
+#[test]
+fn a_pointer_hit_test_waits_for_the_pending_layer_image() {
+    let _lock = common::vm_lock();
+    let env = Env::with_pool(config());
+    env.run(
+        "var w = new Window(); \
+         w.setSize(320, 240); \
+         var l = new Layer(w, null); \
+         l.loadImages('picture.png'); \
+         var moves = 0; \
+         l.onMouseMove = function(x, y, shift) { moves = moves + 1; };",
+    );
+    let bitmap_id = env
+        .pending_layer()
+        .bitmap
+        .expect("the layer has a main image");
+    assert!(
+        env.scene
+            .bitmap(bitmap_id)
+            .expect("the image exists")
+            .rgba
+            .is_empty(),
+        "the pixels have not landed yet"
+    );
+
+    env.dispatch_events(&[PlatformEvent::Input(InputEvent::PointerMoved {
+        x: 1.0,
+        y: 1.0,
+    })]);
+    // reference/cpp/core/visual/LayerManager.cpp:461, :506-509
+    assert_eq!(
+        env.eval_int("moves"),
+        1,
+        "the pointer reached the layer whose image was decoding"
+    );
+    let bitmap = env.scene.bitmap(bitmap_id).expect("the image exists");
+    assert!(
+        bitmap.pending.is_none(),
+        "the pointer hit test waited for the decode"
+    );
+    assert_eq!(bitmap.rgba.len(), 16, "the image is decoded");
+}
+
+/// A fill into a layer whose image is still decoding waits for the decode and
+/// fills the decoded pixels.
+///
+/// `tTJSNI_BaseLayer::FillRect` intersects the rectangle with the clip and
+/// fills the main image and its mask
+/// (`reference/cpp/core/visual/LayerIntf.cpp:4272-4286`), and the fill
+/// operates on the image's own texture
+/// (`reference/cpp/core/visual/LayerBitmapIntf.cpp:286-303`). The reference
+/// image is complete when the fill runs because the load decodes it before it
+/// returns (`reference/cpp/core/visual/LayerIntf.cpp:2850`); the deferred
+/// model waits for the decode at the fill, so the fill lands on the decoded
+/// pixels instead of being dropped.
+#[test]
+fn a_fill_waits_for_the_pending_layer_image() {
+    let _lock = common::vm_lock();
+    let mut env = Env::with_pool(config());
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.loadImages('picture.png');",
+    );
+    let bitmap_id = env
+        .pending_layer()
+        .bitmap
+        .expect("the layer has a main image");
+    assert!(
+        env.scene
+            .bitmap(bitmap_id)
+            .expect("the image exists")
+            .rgba
+            .is_empty(),
+        "the pixels have not landed yet"
+    );
+
+    env.run("l.fillRect(0, 0, 2, 2, 0x00ff00);");
+    let bitmap = env.scene.bitmap(bitmap_id).expect("the image exists");
+    assert!(bitmap.pending.is_none(), "the fill waited for the decode");
+    assert_eq!(bitmap.rgba.len(), 16, "the image holds its pixels");
+
+    // The barrier resolves nothing: the fill is still the image's content,
+    // not the decoded image's own pixels.
+    env.scene.resolve_pending_images();
+    assert_eq!(
+        env.eval_int("l.getMainPixel(0, 0)"),
+        0x00ff00,
+        "the fill survives the image barrier"
+    );
+}
+
+/// A copy into a destination whose image is still decoding replaces the
+/// destination's pixels, and the decode it carried is superseded.
+///
+/// `Layer.copyToBitmapFromMainImage` assigns the layer's MainImage into the
+/// bitmap (`reference/cpp/core/visual/LayerIntf.cpp:2427-2432`); the
+/// assignment replaces the destination's image, so the pixels that land later
+/// are the copied ones and not the stale decode.
+#[test]
+fn a_copied_image_replaces_a_pending_destination_bitmap() {
+    let _lock = common::vm_lock();
+    let mut env = Env::with_pool(config());
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.setImageSize(2, 2); \
+         l.fillRect(0, 0, 2, 2, 0x00ff00); \
+         var b = new Bitmap('picture.png');",
+    );
+    let destination = env
+        .scene
+        .bitmaps
+        .iter()
+        .find(|bitmap| bitmap.pending.is_some())
+        .expect("the destination image is still decoding")
+        .id;
+    assert!(
+        env.scene
+            .bitmap(destination)
+            .expect("the destination exists")
+            .rgba
+            .is_empty(),
+        "the destination holds no pixels yet"
+    );
+
+    env.run("l.copyToBitmapFromMainImage(b);");
+    assert!(
+        env.scene
+            .bitmap(destination)
+            .expect("the destination exists")
+            .pending
+            .is_none(),
+        "the copy superseded the destination's decode"
+    );
+    env.scene.resolve_pending_images();
+    assert_eq!(
+        env.eval_int("b.getPixel(0, 0) & 0xffffff"),
+        0x00ff00,
+        "the copied pixels survive the image barrier"
+    );
+}
+
+/// A copy into a layer whose image is still decoding replaces the layer's
+/// pixels, and the decode it carried is superseded.
+///
+/// `Layer.copyFromBitmapToMainImage` assigns the bitmap into the layer's
+/// MainImage (`reference/cpp/core/visual/LayerIntf.cpp:2404-2412`); the
+/// assignment replaces the layer's image, so the pixels that land later are
+/// the copied ones and not the stale decode.
+#[test]
+fn a_copied_image_replaces_a_pending_layer_image() {
+    let _lock = common::vm_lock();
+    let mut env = Env::with_pool(config());
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.loadImages('picture.png'); \
+         var src = new Bitmap(2, 2); \
+         src.setPixel(0, 0, 0x00ff00);",
+    );
+    let destination = env
+        .pending_layer()
+        .bitmap
+        .expect("the layer has a main image");
+    assert!(
+        env.scene
+            .bitmap(destination)
+            .expect("the layer image exists")
+            .rgba
+            .is_empty(),
+        "the layer holds no pixels yet"
+    );
+
+    env.run("l.copyFromBitmapToMainImage(src);");
+    assert!(
+        env.scene
+            .bitmap(destination)
+            .expect("the layer image exists")
+            .pending
+            .is_none(),
+        "the copy superseded the layer's decode"
+    );
+    env.scene.resolve_pending_images();
+    assert_eq!(
+        env.eval_int("l.getMainPixel(0, 0) & 0xffffff"),
+        0x00ff00,
+        "the copied pixels survive the image barrier"
+    );
+}
+
+/// An assignment into a layer whose image is still decoding replaces the
+/// layer's pixels, and the decode it carried is superseded.
+///
+/// `tTJSNI_BaseLayer::AssignImages` assigns the source's MainImage into the
+/// destination's (`reference/cpp/core/visual/LayerIntf.cpp:2399-2408`), so the
+/// assigned pixels are the destination's image and the decode it still
+/// carries is superseded by them.
+#[test]
+fn an_assigned_image_replaces_a_pending_layer_image() {
+    let _lock = common::vm_lock();
+    let mut env = Env::with_pool(config());
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.loadImages('picture.png'); \
+         var src = new Layer(w, null); \
+         src.setImageSize(2, 2); \
+         src.fillRect(0, 0, 2, 2, 0x00ff00);",
+    );
+    let destination = env
+        .pending_layer()
+        .bitmap
+        .expect("the layer has a main image");
+    assert!(
+        env.scene
+            .bitmap(destination)
+            .expect("the layer image exists")
+            .rgba
+            .is_empty(),
+        "the layer holds no pixels yet"
+    );
+
+    env.run("l.assignImages(src);");
+    assert!(
+        env.scene
+            .bitmap(destination)
+            .expect("the layer image exists")
+            .pending
+            .is_none(),
+        "the assignment superseded the layer's decode"
+    );
+    env.scene.resolve_pending_images();
+    assert_eq!(
+        env.eval_int("l.getMainPixel(0, 0) & 0xffffff"),
+        0x00ff00,
+        "the assigned pixels survive the image barrier"
+    );
 }

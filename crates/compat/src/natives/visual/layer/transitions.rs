@@ -1477,11 +1477,32 @@ fn composite_transition(
             || "Layer.beginTransition: cannot allocate the transition self image".to_string(),
         )?
     };
+    // The blend writes into the target and reads both sources, so all three
+    // must hold the pixels their size names. The target is the frame the
+    // blend writes: a cached frame that carries a layer's main image rather
+    // than its own pixels is a target the blend cannot write into.
+    {
+        let target_state = scene
+            .bitmap(target)
+            .ok_or_else(|| "Layer.beginTransition: the transition frame is missing".to_string())?;
+        super::util::bitmap_holds_pixels(target_state, "transition target")?;
+    }
     // The blend reads both sources while it writes the target, so the three
     // must be distinct bitmaps. A source whose image is still decoding waits
-    // for the decode: the blend would otherwise read a blank.
+    // for the decode: the blend would otherwise read a blank. A source that
+    // resolved without its pixels is an error rather than a blank frame.
     scene.resolve_bitmap(src1);
     scene.resolve_bitmap(src2);
+    {
+        let src1_state = scene
+            .bitmap(src1)
+            .ok_or_else(|| "Layer.beginTransition: the transition source is missing".to_string())?;
+        super::util::bitmap_holds_pixels(src1_state, "transition source")?;
+        let src2_state = scene
+            .bitmap(src2)
+            .ok_or_else(|| "Layer.beginTransition: the transition source is missing".to_string())?;
+        super::util::bitmap_holds_pixels(src2_state, "transition source")?;
+    }
     let Some((target, src1_bitmap, src2_bitmap)) = scene.bitmap_mut_with_refs(target, src1, src2)
     else {
         return Err("Layer.beginTransition: the transition bitmaps are not distinct".to_string());

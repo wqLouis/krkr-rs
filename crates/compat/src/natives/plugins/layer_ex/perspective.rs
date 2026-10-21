@@ -90,14 +90,32 @@ fn project(h: &[f64; 8], x: f64, y: f64) -> Option<(f64, f64)> {
     ))
 }
 
+/// Whether the bitmap's buffer covers every pixel its declared size names.
+///
+/// A bitmap can carry a size with no pixels behind it: a decode that has not
+/// landed keeps the probed size and an empty buffer, and a blank image that
+/// could not be allocated leaves the same state. The copy below treats such an
+/// image as empty and reports it once.
+fn pixels_present(bitmap: &BitmapState) -> bool {
+    usize::try_from(bitmap.width)
+        .ok()
+        .zip(usize::try_from(bitmap.height).ok())
+        .and_then(|(width, height)| width.checked_mul(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .is_some_and(|bytes| bytes <= bitmap.rgba.len())
+}
+
+/// The pixel at `(x, y)`, or the transparent miss value when the image holds
+/// no pixel there.
 fn read_pixel(bitmap: &BitmapState, x: i32, y: i32) -> [u8; 4] {
-    match bitmap.pixel_offset(x as u32, y as u32) {
-        Some(i) => [
-            bitmap.rgba[i],
-            bitmap.rgba[i + 1],
-            bitmap.rgba[i + 2],
-            bitmap.rgba[i + 3],
-        ],
+    let (Ok(x), Ok(y)) = (u32::try_from(x), u32::try_from(y)) else {
+        return [0, 0, 0, 0];
+    };
+    let Some(i) = bitmap.pixel_offset(x, y) else {
+        return [0, 0, 0, 0];
+    };
+    match bitmap.rgba.get(i..i + 4) {
+        Some(pixel) => [pixel[0], pixel[1], pixel[2], pixel[3]],
         None => [0, 0, 0, 0],
     }
 }
@@ -132,14 +150,46 @@ fn sample_bilinear(src: &BitmapState, fx: f32, fy: f32) -> [u8; 4] {
 
 /// Projective-copy `src` (the sub-rectangle `src_pts`) onto the destination
 /// quad `dst_pts`.
+///
+/// # Errors
+///
+/// Returns an error when the source or the destination image does not hold
+/// the pixels its size names. The copy then draws nothing.
 fn perspective_blit(
     dst: &mut BitmapState,
     src: &BitmapState,
     src_pts: [(f64, f64); 4],
     dst_pts: [(f64, f64); 4],
-) {
+) -> Result<(), String> {
+    if !pixels_present(src) {
+        log::error!(
+            "Layer.perspectiveCopy: the source image {} declares {}x{} pixels but holds {} bytes",
+            src.id,
+            src.width,
+            src.height,
+            src.rgba.len()
+        );
+        return Err(format!(
+            "Layer.perspectiveCopy: the source image {} does not hold its {}x{} pixels",
+            src.id, src.width, src.height
+        ));
+    }
+    if !pixels_present(dst) {
+        log::error!(
+            "Layer.perspectiveCopy: the destination image {} declares {}x{} pixels but holds {} \
+             bytes",
+            dst.id,
+            dst.width,
+            dst.height,
+            dst.rgba.len()
+        );
+        return Err(format!(
+            "Layer.perspectiveCopy: the destination image {} does not hold its {}x{} pixels",
+            dst.id, dst.width, dst.height
+        ));
+    }
     let Some(h) = solve_homography(dst_pts, src_pts) else {
-        return;
+        return Ok(());
     };
     // The source rectangle bounds (the quad may be given with a negative
     // width/height, so normalize).
@@ -184,7 +234,7 @@ fn perspective_blit(
             max_y.saturating_add(1),
         ),
     ) else {
-        return;
+        return Ok(());
     };
     let eps = 1e-6;
     for y in y0..y1 {
@@ -200,6 +250,7 @@ fn perspective_blit(
         }
     }
     dst.mark_dirty();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +293,12 @@ fn layer_source_id(host: &Tjs2Engine, value: &Value) -> Result<u32, String> {
 
 /// Run the reference `perspectiveCopy` with the destination layer already
 /// resolved.
+///
+/// # Errors
+///
+/// Returns an error when the source is not a layer with a main image, when
+/// the destination has no main image, or when an image does not hold the
+/// pixels its size names.
 pub(super) fn perspective_copy(
     ctx: &CompatCtx,
     host: &tjs::Tjs2Engine,
@@ -297,7 +354,7 @@ pub(super) fn perspective_copy(
         let dest = scene.bitmap_mut(dst_bitmap_id).ok_or_else(|| {
             "Layer.perspectiveCopy: the destination bitmap does not exist".to_string()
         })?;
-        perspective_blit(dest, &source, src_pts, dst_pts);
+        perspective_blit(dest, &source, src_pts, dst_pts)?;
     }
     if let Some(layer) = scene.layer_mut(dst_id) {
         layer.pending_paint = true;

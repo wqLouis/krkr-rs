@@ -64,12 +64,13 @@ does not exist**, by design.
 
 | Member | Behaviour |
 |---|---|
-| `assignImages(srcLayer)` | copies the source's main image and province image. An absent source image deallocates the destination's; the destination rect adjusts to the assigned image size, the clip resets and `imageModified` is set. A script-`Bitmap`-owned bitmap is never overwritten — a fresh copy is adopted. |
-| `copyFromBitmapToMainImage(bitmap)` | `null` is a successful no-op; a non-`Bitmap` argument raises. |
-| `copyToBitmapFromMainImage(bitmap)` | replaces the bitmap's content with the layer's main image. |
-| `independMainImage()` | gives the layer a private main image. |
+| `assignImages(srcLayer)` | copies the source's main image and province image. An absent source image deallocates the destination's; the destination rect adjusts to the assigned image size, the clip resets and `imageModified` is set. A script-`Bitmap`-owned bitmap is never overwritten — a fresh copy is adopted. The source image is **resolved first** — a pending decode is waited for — and a source whose pixel buffer is not the bytes its size declares raises. |
+| `copyFromBitmapToMainImage(bitmap)` | `null` is a successful no-op; a non-`Bitmap` argument raises. The bitmap is resolved first, and a bitmap whose pixel buffer is not the bytes its size declares raises. |
+| `copyToBitmapFromMainImage(bitmap)` | replaces the bitmap's content with the layer's main image. The main image is resolved first, and an image whose pixel buffer is not the bytes its size declares raises. |
+| `independMainImage()` | gives the layer a private main image. The image is resolved first, and an image whose pixel buffer is not the bytes its size declares raises. |
 | `independProvinceImage([copy])` | allocates the 8-bit province plane; the default keeps the existing content, `copy = false` clears it. |
-| `mainImageBuffer`, `mainImageBufferForWrite`, `mainImageBufferPitch`, `provinceImageBuffer`, `provinceImageBufferForWrite`, `provinceImageBufferPitch` | read-only. The address is `0` when the buffer is absent. The `ForWrite` variants mark the image modified or allocate the province plane. |
+| `mainImageBuffer`, `mainImageBufferForWrite` | read-only. The address is `0` when the main image is absent **and** when the main image declares more pixels than its pixel buffer holds. Both wait for a pending decode first; the `ForWrite` variant marks the image modified, and an image with no address is not marked. |
+| `mainImageBufferPitch`, `provinceImageBuffer`, `provinceImageBufferForWrite`, `provinceImageBufferPitch` | read-only. The address is `0` when the buffer is absent. The `ForWrite` variant allocates the province plane. |
 | `imageModified` | set by the operations that write pixels. |
 
 ### The pending main image
@@ -84,6 +85,9 @@ calling thread — and the pixels still decoding:
   image offsets and the clip already carry the loaded image's geometry;
 * every read of the main image's pixels waits for the decode, and the frame's
   image barrier waits for all of them;
+* the `mainImageBuffer` and `mainImageBufferForWrite` addresses wait for it
+  too, so a script never receives the address of an image whose pixels have
+  not landed;
 * a decode that **fails after** the probe installs a transparent blank of the
   probed size and logs the failure. It does **not** raise — the load already
   returned. A **probe** failure raises at the load, the way a load failure
@@ -319,6 +323,14 @@ image-tag API.
 * **Every path that reads the main image's pixels waits for the decode** —
   the pixel accessors, the copy members, the text and filter operations and
   the `layerExDraw` plugin paths.
+* **Every path that reads the main image's pixels refuses an image that
+  declares more pixels than its buffer holds.** The pixel accessors and the
+  pixel operations raise rather than read past the buffer.
+* **A main image that declares more pixels than its buffer holds has no
+  address.** `mainImageBuffer` and `mainImageBufferForWrite` answer `0`, and
+  the copy seams — `assignImages`, `copyFromBitmapToMainImage`,
+  `copyToBitmapFromMainImage`, `independMainImage` and `saveLayerImage` —
+  raise instead of copying or encoding an empty buffer.
 
 ---
 
@@ -339,7 +351,10 @@ image-tag API.
 | `"Layer.setImagePos: invalid image position"`, `"Layer.imageLeft: invalid image position"`, `"Layer.imageTop: invalid image position"` | the image-offset guard is violated |
 | `"Layer.setImageSize: cannot create an empty layer image"`, `"Layer.imageWidth: Cannot create empty layer image"`, `"Layer.imageHeight: Cannot create empty layer image"` | a zero extent |
 | `"Layer.assignImages: not a Layer object"` | the argument is not a `Layer` |
+| `"Layer.assignImages: the bitmap {id} holds {bytes} pixel bytes instead of its {width}x{height} image"`, `"Layer.copyFromBitmapToMainImage: the bitmap {id} holds {bytes} pixel bytes instead of its {width}x{height} image"`, `"Layer.copyToBitmapFromMainImage: the bitmap {id} holds {bytes} pixel bytes instead of its {width}x{height} image"`, `"Layer.independMainImage: the bitmap {id} holds {bytes} pixel bytes instead of its {width}x{height} image"`, `"Layer.saveLayerImage: the bitmap {id} holds {bytes} pixel bytes instead of its {width}x{height} image"` | the image's pixel buffer is not the bytes its size declares |
 | `"Layer.copyFromBitmapToMainImage: not a Bitmap"` | the argument is not a `Bitmap` |
+| `"Layer.{member}: Layer: the main-image image {id} does not hold its pixels"` | a pixel member reads a main image that declares more pixels than its buffer holds |
+| `"Layer: the destination image {id} does not hold its pixels"`, `"Layer: the source image {id} does not hold its pixels"` | a pixel operation copies between images that declare more pixels than their buffers hold |
 | `"Layer: the source must be a Layer object"` | a `Bitmap` passed to a Layer-only member |
 | `"Layer: the source is not a Layer or Bitmap object"` | an unresolvable source |
 | `"Layer.moveBefore: cannot move a layer next to itself or a non-sibling"` | a self-move or a non-sibling target |
@@ -360,12 +375,13 @@ image-tag API.
 | Test | What it asserts |
 |---|---|
 | `crates/compat/tests/layer.rs` | every member the parity report listed as missing is registered; the event handlers are assignable and default to a no-op; the pixel, geometry, focus, ordering, transition and mode behaviour; the **invalidation** cases — writing the stored value does not bump the cache revision, a changed write does; the lifecycle — a subclass member write before the base constructor lands, a repeated parent cycle releases the layers, bitmaps and fonts, invalidating a parent releases the children's font wrappers and finalizes them in order. |
-| `crates/compat/tests/layer_behaviour.rs` | the reference behaviour suite: the blend numbering round-trips, the event arity counts, the focus search, the cursor and attention, the ordering, the modal stack, the pixel argument counts and semantics, the geometry and image rules. |
+| `crates/compat/tests/layer_behaviour.rs` | the reference behaviour suite: the blend numbering round-trips, the event arity counts, the focus search, the cursor and attention, the ordering, the modal stack, the pixel argument counts and semantics, the geometry and image rules; a hit test of a layer image that declares more pixels than its buffer holds is a miss. |
 | `crates/compat/tests/layer_geometry.rs` | the geometry rules. |
 | `crates/compat/tests/visual.rs` | the scene round-trips and the cross-object properties. |
 | `crates/compat/tests/focus_behaviour.rs` | the focus model. |
 | `crates/compat/tests/dispatch_visual.rs` | the receiver routing. |
-| `crates/compat/tests/pending_image.rs` | the deferred load of a layer image: the image size is known before the pixels land, the first pixel read waits for the decode, and a probe failure raises at the load. |
+| `crates/compat/tests/bitmap.rs` | the `Bitmap` class, and the main-image addresses of a layer whose image declares more pixels than its buffer holds. |
+| `crates/compat/tests/pending_image.rs` | the deferred load of a layer image: the image size is known before the pixels land, the first pixel read waits for the decode, and a probe failure raises at the load; the hit test and the pointer hit test wait for the pending layer image. |
 
 ---
 

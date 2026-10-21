@@ -169,6 +169,11 @@ pub(super) fn main_bitmap(scene: &mut Scene, layer_id: u32, method: &str) -> Res
     // The image may still be decoding: the pixels are not there yet, and
     // every path that reads them waits for the decode.
     scene.resolve_bitmap(bitmap_id);
+    let bitmap = scene
+        .bitmap(bitmap_id)
+        .ok_or_else(|| format!("Layer.{method}: this layer's image no longer exists"))?;
+    bitmap_holds_pixels(bitmap, "main-image")
+        .map_err(|error| format!("Layer.{method}: {error}"))?;
     Ok(bitmap_id)
 }
 
@@ -332,6 +337,8 @@ pub(super) fn with_two_bitmaps<R>(
         .iter()
         .position(|b| b.id == src_id)
         .ok_or_else(|| format!("Layer: the source bitmap {src_id} does not exist"))?;
+    bitmap_holds_pixels(&scene.bitmaps[dst_index], "destination")?;
+    bitmap_holds_pixels(&scene.bitmaps[src_index], "source")?;
     if dst_index == src_index {
         let source = scene.bitmaps[src_index].clone();
         return Ok(f(&mut scene.bitmaps[dst_index], &source));
@@ -343,6 +350,34 @@ pub(super) fn with_two_bitmaps<R>(
         let (left, right) = scene.bitmaps.split_at_mut(dst_index);
         Ok(f(&mut right[0], &left[src_index]))
     }
+}
+
+/// Check that a bitmap whose decode has resolved actually holds a full RGBA
+/// buffer before a CPU operation indexes it.
+///
+/// A failed blank allocation can leave the probed dimensions with no pixels;
+/// the operation then has no source to read. The error is typed instead of a
+/// silent transparent substitute, and the buffer is never indexed.
+pub(super) fn bitmap_holds_pixels(bitmap: &BitmapState, role: &str) -> Result<(), String> {
+    let expected = usize::try_from(bitmap.width)
+        .ok()
+        .zip(usize::try_from(bitmap.height).ok())
+        .and_then(|(width, height)| width.checked_mul(height))
+        .and_then(|pixels| pixels.checked_mul(4));
+    if expected == Some(bitmap.rgba.len()) {
+        return Ok(());
+    }
+    log::error!(
+        "Layer: the {role} bitmap {} declares {}x{} pixels but holds {} bytes",
+        bitmap.id,
+        bitmap.width,
+        bitmap.height,
+        bitmap.rgba.len()
+    );
+    Err(format!(
+        "Layer: the {role} image {} does not hold its pixels",
+        bitmap.id
+    ))
 }
 
 /// Map a source layer's generic [`BlendMode`] to the operation mode the

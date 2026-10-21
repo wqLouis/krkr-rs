@@ -1536,10 +1536,28 @@ impl PlayerInst {
         let Some(bitmap_id) = scene.layer(layer_id).and_then(|layer| layer.bitmap) else {
             return;
         };
+        // A pending image is waited for before the target is cleared, so the
+        // pose composites onto the pixels the bitmap declares.
+        if !scene.resolve_bitmap(bitmap_id) {
+            return;
+        }
         let Some(bitmap) = scene.bitmap_mut(bitmap_id) else {
             return;
         };
         if bitmap.width == 0 || bitmap.height == 0 {
+            return;
+        }
+        let declared_bytes = (bitmap.width as usize)
+            .checked_mul(bitmap.height as usize)
+            .and_then(|pixels| pixels.checked_mul(4));
+        if declared_bytes != Some(bitmap.rgba.len()) {
+            log::error!(
+                "Motion.Player.draw: the {}x{} target bitmap holds {} bytes of pixels instead of \
+                 its declared size; nothing is drawn",
+                bitmap.width,
+                bitmap.height,
+                bitmap.rgba.len()
+            );
             return;
         }
         let snapshot = self.snapshot.clone();
@@ -2060,11 +2078,11 @@ fn apply_alpha_mask(
                 continue;
             };
             let dst_index = ((y as usize * width) + x as usize) * 4 + 3;
-            let Some(dst_alpha) = dst.rgba.get(dst_index).copied() else {
+            let Some(target_alpha) = dst.rgba.get_mut(dst_index) else {
                 continue;
             };
             let src_alpha = i32::from(src_alpha);
-            let dst_alpha = i32::from(dst_alpha);
+            let dst_alpha = i32::from(*target_alpha);
             let updated = match item_flags {
                 1 => {
                     if threshold_mask {
@@ -2089,7 +2107,7 @@ fn apply_alpha_mask(
                 }
                 _ => dst_alpha,
             };
-            dst.rgba[dst_index] = updated.clamp(0, 255) as u8;
+            *target_alpha = updated.clamp(0, 255) as u8;
         }
     }
     dst.mark_dirty();

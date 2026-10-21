@@ -56,8 +56,26 @@ const DF_AUTO: i32 = 128;
 // Small geometry helpers
 // ---------------------------------------------------------------------------
 
+/// Whether the bitmap's buffer covers every pixel its declared size names.
+///
+/// A bitmap can carry a size with no pixels behind it: a decode that has not
+/// landed keeps the probed size and an empty buffer, and a blank image that
+/// could not be allocated leaves the same state. The pixel helpers below read
+/// such a bitmap as empty and report it once for the operation.
+fn pixels_present(bitmap: &BitmapState) -> bool {
+    usize::try_from(bitmap.width)
+        .ok()
+        .zip(usize::try_from(bitmap.height).ok())
+        .and_then(|(width, height)| width.checked_mul(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .is_some_and(|bytes| bytes <= bitmap.rgba.len())
+}
+
 /// Extract `[left, top, right, bottom)` of `src` into a new standalone
 /// bitmap (the scratch the rect-limited box blur runs on).
+///
+/// A source that holds no pixels yields an empty region: the missing pixels
+/// stay transparent and the operation reports the image once.
 fn extract_region(src: &BitmapState, rect: RectI) -> BitmapState {
     let width = (rect.2 - rect.0) as u32;
     let height = (rect.3 - rect.1) as u32;
@@ -66,40 +84,89 @@ fn extract_region(src: &BitmapState, rect: RectI) -> BitmapState {
         height,
         vec![0u8; width as usize * height as usize * 4],
     );
+    if !pixels_present(src) {
+        log::error!(
+            "Layer: the blur source holds {} pixel bytes for a {}x{} image; the region stays empty",
+            src.rgba.len(),
+            src.width,
+            src.height
+        );
+        return out;
+    }
     let src_width = src.width as usize;
     let dst_width = width as usize;
     for y in rect.1..rect.3 {
         for x in rect.0..rect.2 {
             let si = (y as usize * src_width + x as usize) * 4;
             let di = ((y - rect.1) as usize * dst_width + (x - rect.0) as usize) * 4;
-            out.rgba[di..di + 4].copy_from_slice(&src.rgba[si..si + 4]);
+            let Some(pixel) = src.rgba.get(si..si + 4) else {
+                continue;
+            };
+            let Some(target) = out.rgba.get_mut(di..di + 4) else {
+                continue;
+            };
+            target.copy_from_slice(pixel);
         }
     }
     out
 }
 
 /// Restore the alpha plane of `dst` (an extracted region) from `src`.
+///
+/// A destination that holds no pixels keeps its plane as it is, and the
+/// operation reports the image once.
 fn restore_region_alpha(src: &BitmapState, dst: &mut BitmapState, rect: RectI) {
+    if !pixels_present(dst) {
+        log::error!(
+            "Layer: the blur target holds {} pixel bytes for a {}x{} image; the alpha plane \
+             is not restored",
+            dst.rgba.len(),
+            dst.width,
+            dst.height
+        );
+        return;
+    }
     let src_width = src.width as usize;
     let dst_width = dst.width as usize;
     for y in rect.1..rect.3 {
         for x in rect.0..rect.2 {
             let si = (y as usize * src_width + x as usize) * 4 + 3;
             let di = ((y - rect.1) as usize * dst_width + (x - rect.0) as usize) * 4 + 3;
-            dst.rgba[di] = src.rgba[si];
+            let (Some(value), Some(target)) = (src.rgba.get(si), dst.rgba.get_mut(di)) else {
+                continue;
+            };
+            *target = *value;
         }
     }
 }
 
 /// Restore the RGB planes of `dst` (an extracted region) from `src`.
+///
+/// A destination that holds no pixels keeps its planes as they are, and the
+/// operation reports the image once.
 fn restore_region_rgb(src: &BitmapState, dst: &mut BitmapState, rect: RectI) {
+    if !pixels_present(dst) {
+        log::error!(
+            "Layer: the blur target holds {} pixel bytes for a {}x{} image; the colour planes \
+             are not restored",
+            dst.rgba.len(),
+            dst.width,
+            dst.height
+        );
+        return;
+    }
     let src_width = src.width as usize;
     let dst_width = dst.width as usize;
     for y in rect.1..rect.3 {
         for x in rect.0..rect.2 {
             let si = (y as usize * src_width + x as usize) * 4;
             let di = ((y - rect.1) as usize * dst_width + (x - rect.0) as usize) * 4;
-            dst.rgba[di..di + 3].copy_from_slice(&src.rgba[si..si + 3]);
+            let (Some(pixel), Some(target)) =
+                (src.rgba.get(si..si + 3), dst.rgba.get_mut(di..di + 3))
+            else {
+                continue;
+            };
+            target.copy_from_slice(pixel);
         }
     }
 }
@@ -107,8 +174,21 @@ fn restore_region_rgb(src: &BitmapState, dst: &mut BitmapState, rect: RectI) {
 /// Restore every pixel outside `clip` from `before` (used to emulate the
 /// reference `ClipRect` around the L2 affine primitive, which has no clip
 /// argument).
+///
+/// An image that holds no pixels keeps its pixels as they are, and the
+/// operation reports the image once.
 fn restore_outside_clip(dst: &mut BitmapState, before: &BitmapState, clip: RectI) {
     if dst.width != before.width || dst.height != before.height {
+        return;
+    }
+    if !pixels_present(dst) || !pixels_present(before) {
+        log::error!(
+            "Layer: the affine target holds {} pixel bytes for a {}x{} image; the area outside \
+             the clip is not restored",
+            dst.rgba.len(),
+            dst.width,
+            dst.height
+        );
         return;
     }
     let width = dst.width as usize;
@@ -118,7 +198,12 @@ fn restore_outside_clip(dst: &mut BitmapState, before: &BitmapState, clip: RectI
                 continue;
             }
             let i = (y as usize * width + x as usize) * 4;
-            dst.rgba[i..i + 4].copy_from_slice(&before.rgba[i..i + 4]);
+            let (Some(pixel), Some(target)) =
+                (before.rgba.get(i..i + 4), dst.rgba.get_mut(i..i + 4))
+            else {
+                continue;
+            };
+            target.copy_from_slice(pixel);
         }
     }
     dst.mark_dirty();
@@ -126,8 +211,21 @@ fn restore_outside_clip(dst: &mut BitmapState, before: &BitmapState, clip: RectI
 
 /// Restore the alpha plane inside `clip` from `before` (the reference
 /// `HoldAlpha` for the affine primitive).
+///
+/// An image that holds no pixels keeps its plane as it is, and the operation
+/// reports the image once.
 fn restore_alpha_inside_clip(dst: &mut BitmapState, before: &BitmapState, clip: RectI) {
     if dst.width != before.width || dst.height != before.height {
+        return;
+    }
+    if !pixels_present(dst) || !pixels_present(before) {
+        log::error!(
+            "Layer: the affine target holds {} pixel bytes for a {}x{} image; the alpha plane \
+             inside the clip is not restored",
+            dst.rgba.len(),
+            dst.width,
+            dst.height
+        );
         return;
     }
     let width = dst.width as usize;
@@ -138,7 +236,10 @@ fn restore_alpha_inside_clip(dst: &mut BitmapState, before: &BitmapState, clip: 
     for y in y0..y1 {
         for x in x0..x1 {
             let i = (y * width + x) * 4 + 3;
-            dst.rgba[i] = before.rgba[i];
+            let (Some(value), Some(target)) = (before.rgba.get(i), dst.rgba.get_mut(i)) else {
+                continue;
+            };
+            *target = *value;
         }
     }
     dst.mark_dirty();
@@ -158,8 +259,10 @@ fn dest_info(scene: &mut Scene, id: u32, method: &str) -> Result<Option<(u32, bo
     let Some(bitmap) = bitmap else {
         return Ok(None);
     };
-    // The image may still be decoding: every operation on it waits.
-    scene.resolve_bitmap(bitmap);
+    // The image may still be decoding: every operation on it waits, and an
+    // image that resolved without its pixels is a typed error rather than an
+    // empty buffer for the caller to index.
+    main_bitmap(scene, id, method)?;
     Ok(Some((bitmap, hold_alpha)))
 }
 
@@ -1837,10 +1940,9 @@ extern "C" fn layer_set_main_pixel(
     }
     if let Some(bitmap) = scene.bitmap_mut(dst)
         && let Some(offset) = bitmap.pixel_offset(x as u32, y as u32)
+        && let Some(pixel) = bitmap.rgba.get_mut(offset..offset + 3)
     {
-        bitmap.rgba[offset] = color[0];
-        bitmap.rgba[offset + 1] = color[1];
-        bitmap.rgba[offset + 2] = color[2];
+        pixel.copy_from_slice(&color[..3]);
         bitmap.mark_dirty();
     }
     if let Some(layer) = scene.layer_mut(id) {
@@ -1938,8 +2040,9 @@ extern "C" fn layer_set_mask_pixel(
     }
     if let Some(bitmap) = scene.bitmap_mut(dst)
         && let Some(offset) = bitmap.pixel_offset(x as u32, y as u32)
+        && let Some(alpha) = bitmap.rgba.get_mut(offset + 3)
     {
-        bitmap.rgba[offset + 3] = mask;
+        *alpha = mask;
         bitmap.mark_dirty();
     }
     if let Some(layer) = scene.layer_mut(id) {
@@ -1949,15 +2052,12 @@ extern "C" fn layer_set_mask_pixel(
     0
 }
 
-/// Read one bitmap pixel as straight-alpha RGBA, or `None` out of bounds.
+/// Read one bitmap pixel as straight-alpha RGBA, or `None` when the image
+/// holds no pixel there.
 fn read_pixel(bitmap: &BitmapState, x: i32, y: i32) -> Option<[u8; 4]> {
     let offset = bitmap.pixel_offset(u32::try_from(x).ok()?, u32::try_from(y).ok()?)?;
-    Some([
-        bitmap.rgba[offset],
-        bitmap.rgba[offset + 1],
-        bitmap.rgba[offset + 2],
-        bitmap.rgba[offset + 3],
-    ])
+    let pixel = bitmap.rgba.get(offset..offset + 4)?;
+    Some([pixel[0], pixel[1], pixel[2], pixel[3]])
 }
 
 /// `independProvinceImage([copy])`.
@@ -2052,24 +2152,23 @@ extern "C" fn layer_copy_to_bitmap_from_main_image(
             };
         let scene = scene_mut(&ctx)?;
         let src_id = main_bitmap(scene, id, "copyToBitmapFromMainImage")?;
-        // The destination may still be decoding: the copy replaces its
-        // pixels.
-        scene.resolve_bitmap(dst_id);
-        let (width, height, rgba) = {
-            let src = scene
-                .bitmap(src_id)
-                .ok_or_else(|| "Layer.copyToBitmapFromMainImage: no source image".to_string())?;
-            (src.width, src.height, src.rgba.clone())
-        };
+        // Both images may still be decoding: the source is copied and the
+        // destination replaced from the resolved pixels.
+        let (width, height, rgba) =
+            super::resolved_bitmap_pixels(scene, src_id, "Layer.copyToBitmapFromMainImage")?;
         if scene.bitmap(dst_id).is_none() {
             return Err(format!(
                 "Layer.copyToBitmapFromMainImage: the destination bitmap {dst_id} does not exist"
             ));
         }
-        scene.resize_bitmap(dst_id, width, height, [0, 0, 0, 0]);
-        if let Some(bitmap) = scene.bitmap_mut(dst_id) {
-            bitmap.rgba = rgba;
-            bitmap.dirty = true;
+        // The copy replaces the destination's pixels: a decode the destination
+        // still carries is cancelled, so the copied pixels are not overwritten
+        // by the stale image.
+        if !scene.replace_bitmap_image(dst_id, width, height, rgba) {
+            return Err(format!(
+                "Layer.copyToBitmapFromMainImage: the destination bitmap {dst_id} could not be \
+                 replaced"
+            ));
         }
         Ok(())
     })();
@@ -2394,7 +2493,10 @@ fn province_plane(image: &DecodedImage, width: u32, height: u32) -> Result<Vec<u
         for x in 0..width {
             let source_x = x % image_width;
             let source = (source_y * image_width + source_x) * 4;
-            plane[y * width + x] = image.rgba[source];
+            let Some(value) = image.rgba.get(source).copied() else {
+                return Err("the province image is malformed".to_string());
+            };
+            plane[y * width + x] = value;
         }
     }
     Ok(plane)
@@ -2447,22 +2549,24 @@ extern "C" fn layer_save_layer_image(
         let bitmap_id = scene
             .layer(id)
             .and_then(|layer| layer.bitmap)
-            .ok_or_else(|| "unsupported layer type (no main image)".to_string())?;
+            .ok_or_else(|| {
+                "Layer.saveLayerImage: unsupported layer type (no main image)".to_string()
+            })?;
         // The image may still be decoding: the saved pixels are the decoded
-        // ones.
-        scene.resolve_bitmap(bitmap_id);
-        let bitmap = scene
-            .bitmap(bitmap_id)
-            .ok_or_else(|| "Layer.saveLayerImage: this layer has no main image".to_string())?;
-        let (width, height, rgba) = (bitmap.width, bitmap.height, bitmap.rgba.clone());
-        resource_state(&ctx).save_image(&name, &type_name, width, height, &rgba)
+        // ones, and a bitmap that holds none is a raise rather than an empty
+        // file.
+        let (width, height, rgba) =
+            super::resolved_bitmap_pixels(scene, bitmap_id, "Layer.saveLayerImage")?;
+        resource_state(&ctx)
+            .save_image(&name, &type_name, width, height, &rgba)
+            .map_err(|error| format!("Layer.saveLayerImage: {error}"))
     })();
     match result {
         Ok(()) => {
             set_void(out);
             0
         }
-        Err(error) => report_error(out_error, &format!("Layer.saveLayerImage: {error}")),
+        Err(error) => report_error(out_error, &error),
     }
 }
 
@@ -2656,8 +2760,14 @@ fn ensure_layer_bitmap(scene: &mut Scene, layer_id: u32, method: &str) -> Result
     let height = layer.rect.h;
     let existing = layer.bitmap;
     if let Some(id) = existing {
-        // The image may still be decoding: the text is drawn into it.
+        // The image may still be decoding: the text is drawn into the decoded
+        // pixels, and an image that resolved without them is an error rather
+        // than a silently dropped text.
         scene.resolve_bitmap(id);
+        let bitmap = scene
+            .bitmap(id)
+            .ok_or_else(|| format!("Layer.{method}: the layer has no main image"))?;
+        util::bitmap_holds_pixels(bitmap, "layer image")?;
         return Ok(id);
     }
     if width == 0 || height == 0 {
