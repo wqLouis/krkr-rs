@@ -428,10 +428,17 @@ impl BitmapState {
         self.content_generation = self.content_generation.wrapping_add(1);
     }
 
-    /// Return the byte offset of a pixel, or `None` outside the bitmap.
+    /// Return the byte offset of a pixel, or `None` outside the bitmap or
+    /// when the offset is not representable.
     pub fn pixel_offset(&self, x: u32, y: u32) -> Option<usize> {
-        (x < self.width && y < self.height)
-            .then_some((y as usize * self.width as usize + x as usize) * 4)
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        usize::try_from(y)
+            .ok()?
+            .checked_mul(usize::try_from(self.width).ok()?)?
+            .checked_add(usize::try_from(x).ok()?)?
+            .checked_mul(4)
     }
 }
 
@@ -444,6 +451,26 @@ fn image_pixel_bytes(width: u32, height: u32) -> Option<usize> {
         .ok()?
         .checked_mul(usize::try_from(height).ok()?)
         .and_then(|pixels| pixels.checked_mul(4))
+}
+
+/// Whether a bitmap's buffer covers every pixel its declared size names.
+///
+/// An empty buffer is never an addressable image: `Vec::new().as_ptr()` is a
+/// dangling one-byte pointer, so a bitmap that holds no pixel has no address.
+pub(crate) fn bitmap_holds_pixels(bitmap: &BitmapState) -> bool {
+    image_pixel_bytes(bitmap.width, bitmap.height)
+        .is_some_and(|bytes| bytes > 0 && bytes <= bitmap.rgba.len())
+}
+
+/// Byte offset of `(x, y)` in a plane whose rows are `pitch` bytes wide.
+///
+/// `None` when the row computation is not representable, so a declared plane
+/// size can never wrap its way into a valid index.
+fn plane_offset(pitch: u32, x: u32, y: u32) -> Option<usize> {
+    usize::try_from(y)
+        .ok()?
+        .checked_mul(usize::try_from(pitch).ok()?)?
+        .checked_add(usize::try_from(x).ok()?)
 }
 
 /// A fully transparent image of `width` x `height` pixels.
@@ -1357,19 +1384,26 @@ impl Scene {
         layer.province_width
     }
 
-    /// Address of the layer's MainImage pixel buffer, or 0 when absent.
+    /// Address of the layer's MainImage pixel buffer, or 0 when absent or
+    /// when the bitmap declares pixels it does not hold.
     /// Reference `GetMainImagePixelBuffer` (`LayerIntf.cpp:3005`).
     pub fn main_image_pixel_buffer(&self, layer_id: u32) -> usize {
         let Some(bitmap_id) = self.layer(layer_id).and_then(|l| l.bitmap) else {
             return 0;
         };
-        self.bitmap(bitmap_id)
-            .map_or(0, |b| b.rgba.as_ptr() as usize)
+        self.bitmap(bitmap_id).map_or(0, |bitmap| {
+            if bitmap_holds_pixels(bitmap) {
+                bitmap.rgba.as_ptr() as usize
+            } else {
+                0
+            }
+        })
     }
 
     /// Address of the layer's MainImage pixel buffer for writing, marking the
     /// bitmap dirty (the reference `GetMainImagePixelBufferForWrite` sets
-    /// `ImageModified` and calls `GetScanLineForWrite`). 0 when absent.
+    /// `ImageModified` and calls `GetScanLineForWrite`). 0 when absent or when
+    /// the bitmap declares pixels it does not hold.
     pub fn main_image_pixel_buffer_for_write(&mut self, layer_id: u32) -> usize {
         let Some(bitmap_id) = self.layer(layer_id).and_then(|l| l.bitmap) else {
             return 0;
@@ -1377,6 +1411,9 @@ impl Scene {
         let Some(bitmap) = self.bitmap_mut(bitmap_id) else {
             return 0;
         };
+        if !bitmap_holds_pixels(bitmap) {
+            return 0;
+        }
         bitmap.mark_dirty();
         bitmap.rgba.as_mut_ptr() as usize
     }
@@ -1386,6 +1423,7 @@ impl Scene {
     pub fn province_image_pixel_buffer(&self, layer_id: u32) -> usize {
         self.layer(layer_id)
             .and_then(|l| l.province.as_deref())
+            .filter(|plane| !plane.is_empty())
             .map_or(0, |p| p.as_ptr() as usize)
     }
 
@@ -1405,6 +1443,7 @@ impl Scene {
         layer
             .province
             .as_deref_mut()
+            .filter(|plane| !plane.is_empty())
             .map_or(0, |p| p.as_mut_ptr() as usize)
     }
 
@@ -1523,6 +1562,9 @@ impl Scene {
 
     /// Reference `GetProvincePixel` (`LayerIntf.cpp:2973`): 0 when the plane is
     /// absent or the coordinate is outside it.
+    ///
+    /// A plane shorter than the size it declares reads as 0 and reports the
+    /// inconsistency.
     pub fn province_pixel(&self, layer_id: u32, x: i32, y: i32) -> i32 {
         let Some(layer) = self.layer(layer_id) else {
             return 0;
@@ -1530,15 +1572,36 @@ impl Scene {
         let Some(buf) = layer.province.as_deref() else {
             return 0;
         };
-        if x < 0 || y < 0 || x >= layer.province_width as i32 || y >= layer.province_height as i32 {
+        let Ok(px) = u32::try_from(x) else {
+            return 0;
+        };
+        let Ok(py) = u32::try_from(y) else {
+            return 0;
+        };
+        if px >= layer.province_width || py >= layer.province_height {
             return 0;
         }
-        i32::from(buf[y as usize * layer.province_width as usize + x as usize])
+        match plane_offset(layer.province_width, px, py).and_then(|offset| buf.get(offset)) {
+            Some(byte) => i32::from(*byte),
+            None => {
+                log::error!(
+                    "engine: the province pixel read of a {}x{} province plane found {} plane \
+                     bytes",
+                    layer.province_width,
+                    layer.province_height,
+                    buf.len()
+                );
+                0
+            }
+        }
     }
 
     /// Reference `SetProvincePixel` (`LayerIntf.cpp:2985`): allocate the plane
     /// when absent, clip against `ClipRect` (and the plane bounds), store the
     /// low byte and mark the image modified.
+    ///
+    /// A plane shorter than the size it declares is a no-op that reports the
+    /// inconsistency.
     pub fn set_province_pixel(&mut self, layer_id: u32, x: i32, y: i32, n: i32) {
         self.allocate_province_image(layer_id);
         let Some(layer) = self.layer_mut(layer_id) else {
@@ -1554,12 +1617,36 @@ impl Scene {
             }
             None => true,
         };
-        if !in_clip || x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+        if !in_clip {
             return;
         }
-        if let Some(buf) = layer.province.as_deref_mut() {
-            buf[y as usize * w as usize + x as usize] = n as u8;
-            layer.image_modified = true;
+        let Ok(px) = u32::try_from(x) else {
+            return;
+        };
+        let Ok(py) = u32::try_from(y) else {
+            return;
+        };
+        if px >= w || py >= h {
+            return;
+        }
+        let Some(offset) = plane_offset(w, px, py) else {
+            log::error!(
+                "engine: the province pixel write of a {w}x{h} province plane has no address"
+            );
+            return;
+        };
+        let Some(plane) = layer.province.as_deref_mut() else {
+            return;
+        };
+        match plane.get_mut(offset) {
+            Some(slot) => {
+                *slot = n as u8;
+                layer.image_modified = true;
+            }
+            None => log::error!(
+                "engine: the province pixel write of a {w}x{h} province plane found {} plane bytes",
+                plane.len()
+            ),
         }
     }
 
@@ -2204,14 +2291,26 @@ impl Scene {
                 };
                 let px = x.saturating_sub(layer.image_left);
                 let py = y.saturating_sub(layer.image_top);
-                if px < 0
-                    || py < 0
-                    || px >= layer.province_width as i32
-                    || py >= layer.province_height as i32
-                {
+                let (Ok(px), Ok(py)) = (u32::try_from(px), u32::try_from(py)) else {
+                    return false;
+                };
+                if px >= layer.province_width || py >= layer.province_height {
                     return false;
                 }
-                buf[py as usize * layer.province_width as usize + px as usize] != 0
+                // The plane can be shorter than the size it declares, so the
+                // byte is read only when the buffer carries it.
+                let byte =
+                    plane_offset(layer.province_width, px, py).and_then(|offset| buf.get(offset));
+                let Some(byte) = byte else {
+                    log::error!(
+                        "engine: the hit test of a {}x{} province plane found {} plane bytes",
+                        layer.province_width,
+                        layer.province_height,
+                        buf.len()
+                    );
+                    return false;
+                };
+                *byte != 0
             }
             // htMask = 0
             0 => match layer.bitmap.and_then(|id| self.bitmap(id)) {
@@ -2224,8 +2323,21 @@ impl Scene {
                     if layer.hit_threshold <= 0 {
                         return true;
                     }
-                    let alpha = bmp.rgba[(py as usize * bmp.width as usize + px as usize) * 4 + 3];
-                    alpha as i32 >= layer.hit_threshold
+                    // A bitmap can declare a pixel and hold no bytes for it
+                    // (a blank image whose allocation failed), so the alpha is
+                    // read only when the buffer actually carries it.
+                    let Some(offset) = bmp.pixel_offset(px as u32, py as u32) else {
+                        return false;
+                    };
+                    let Some(alpha) = bmp.rgba.get(offset + 3) else {
+                        log::error!(
+                            "engine: the hit test of a {}x{} image found no pixel buffer",
+                            bmp.width,
+                            bmp.height
+                        );
+                        return false;
+                    };
+                    *alpha as i32 >= layer.hit_threshold
                 }
                 None => layer.hit_threshold <= 0,
             },
@@ -2500,30 +2612,45 @@ impl Scene {
     /// and filling any expansion with `fill` (RGBA) — the reference
     /// `iTVPBaseBitmap::SetSizeWithFill` (`LayerBitmapIntf.cpp:122`).
     /// Dimensions are clamped to at least 1, matching the reference
-    /// `tTVPBaseTexture` constructor. Marks the bitmap dirty and bumps
-    /// [`Scene::structure_revision`]. Returns true when the bitmap was
+    /// `tTVPBaseTexture` constructor. Only the rows the source buffer
+    /// actually holds are preserved: a bitmap that declares a size without
+    /// holding its pixels keeps the fill, and the missing rows are reported
+    /// in the log rather than read out of bounds. Marks the bitmap dirty and
+    /// bumps [`Scene::structure_revision`]. Returns true when the bitmap was
     /// present and resized.
     pub fn resize_bitmap(&mut self, id: u32, width: u32, height: u32, fill: [u8; 4]) -> bool {
         let width = width.max(1);
         let height = height.max(1);
-        let Some((old_w, old_h)) = self
-            .bitmap(id)
-            .map(|bitmap| (bitmap.width as usize, bitmap.height as usize))
+        let Some((old_w, old_h)) = self.bitmap(id).map(|bitmap| (bitmap.width, bitmap.height))
         else {
             return false;
         };
-        if old_w == width as usize && old_h == height as usize {
+        if old_w == width && old_h == height {
             return true;
         }
         // The image may still be decoding: the decoded pixels are the ones
         // the size change preserves.
-        self.resolve_bitmap(id);
-        let copy_w = old_w.min(width as usize);
-        let copy_h = old_h.min(height as usize);
-        let Some(bytes) = (width as usize).checked_mul(height as usize) else {
+        if !self.resolve_bitmap(id) {
+            return false;
+        }
+        let (Ok(old_w), Ok(old_h), Ok(new_w), Ok(new_h)) = (
+            usize::try_from(old_w),
+            usize::try_from(old_h),
+            usize::try_from(width),
+            usize::try_from(height),
+        ) else {
             return false;
         };
-        let Some(pixels) = bytes.checked_mul(4) else {
+        let Some(pixels) = image_pixel_bytes(width, height) else {
+            return false;
+        };
+        let (Some(old_pitch), Some(new_pitch)) = (old_w.checked_mul(4), new_w.checked_mul(4))
+        else {
+            return false;
+        };
+        let copy_w = old_w.min(new_w);
+        let copy_h = old_h.min(new_h);
+        let Some(copy_bytes) = copy_w.checked_mul(4) else {
             return false;
         };
         let mut rgba: Vec<u8> = Vec::new();
@@ -2534,14 +2661,46 @@ impl Scene {
         for chunk in rgba.chunks_exact_mut(4) {
             chunk.copy_from_slice(&fill);
         }
-        // Copy the overlapping region row by row (the row pitch changes).
+        // Copy the overlapping region row by row (the row pitch changes). The
+        // source rows are contiguous from the first, so the first row the
+        // buffer does not hold ends the copy and the rest of the destination
+        // keeps the fill.
         let Some(source) = self.bitmap(id) else {
             return false;
         };
+        let available = source.rgba.len();
+        let mut preserved = 0usize;
         for y in 0..copy_h {
-            let src = &source.rgba[y * old_w * 4..(y * old_w + copy_w) * 4];
-            let dst = &mut rgba[y * width as usize * 4..(y * width as usize + copy_w) * 4];
-            dst.copy_from_slice(src);
+            let (Some(src_start), Some(dst_start)) =
+                (y.checked_mul(old_pitch), y.checked_mul(new_pitch))
+            else {
+                break;
+            };
+            let (Some(src_end), Some(dst_end)) = (
+                src_start.checked_add(copy_bytes),
+                dst_start.checked_add(copy_bytes),
+            ) else {
+                break;
+            };
+            if src_end > available {
+                break;
+            }
+            let (Some(src_row), Some(dst_row)) = (
+                source.rgba.get(src_start..src_end),
+                rgba.get_mut(dst_start..dst_end),
+            ) else {
+                break;
+            };
+            dst_row.copy_from_slice(src_row);
+            preserved += 1;
+        }
+        if preserved < copy_h {
+            let missing_rows = copy_h - preserved;
+            log::error!(
+                "engine: bitmap #{id} declares {old_w}x{old_h} but holds {available} pixel bytes; \
+                 a resize to {new_w}x{new_h} keeps the fill for {missing_rows} of {copy_h} \
+                 preserved rows"
+            );
         }
         let Some(bitmap) = self.bitmap_mut(id) else {
             return false;

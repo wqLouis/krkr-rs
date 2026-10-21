@@ -1083,13 +1083,11 @@ pub(crate) fn read_pixel(bitmap: &BitmapState, x: i32, y: i32) -> [u8; 4] {
     if x < 0 || y < 0 {
         return [0; 4];
     }
-    match bitmap.pixel_offset(x as u32, y as u32) {
-        Some(i) => [
-            bitmap.rgba[i],
-            bitmap.rgba[i + 1],
-            bitmap.rgba[i + 2],
-            bitmap.rgba[i + 3],
-        ],
+    match bitmap
+        .pixel_offset(x as u32, y as u32)
+        .and_then(|i| bitmap.rgba.get(i..i + 4))
+    {
+        Some(pixel) => [pixel[0], pixel[1], pixel[2], pixel[3]],
         None => [0; 4],
     }
 }
@@ -1098,8 +1096,10 @@ pub(crate) fn read_pixel(bitmap: &BitmapState, x: i32, y: i32) -> [u8; 4] {
 ///
 /// The `extrans` providers (see the submodules) store through this.
 pub(crate) fn write_pixel(bitmap: &mut BitmapState, x: i32, y: i32, rgba: [u8; 4]) {
-    if let Some(i) = bitmap.pixel_offset(x as u32, y as u32) {
-        bitmap.rgba[i..i + 4].copy_from_slice(&rgba);
+    if let Some(i) = bitmap.pixel_offset(x as u32, y as u32)
+        && let Some(pixel) = bitmap.rgba.get_mut(i..i + 4)
+    {
+        pixel.copy_from_slice(&rgba);
     }
 }
 

@@ -5,9 +5,14 @@
 
 use engine::BitmapState;
 use engine::Scene;
-use engine::layer_ops::{blur_bitmap_in_place, render_layer_subtree};
+use engine::layer_ops::{
+    AffineBlit, BlitOptions, BlitSource, COPY_MAIN, COPY_MASK, affine_blit, blit_copy, blit_over,
+    blit_plane, blur_bitmap_in_place, copy_9patch, do_gray_scale, fill_color_on_alpha, fill_mask,
+    flip_lr, gaussian_blur, render_layer_subtree, stretch_blit, tile_rect,
+};
 use engine::raster::fill_rect_replace;
 use engine::scene::Rect;
+use engine::trans::Trans;
 
 fn bitmap(width: u32, height: u32, rgba: Vec<u8>) -> BitmapState {
     BitmapState::new(width, height, rgba)
@@ -630,4 +635,181 @@ fn update_layer_missing_layer_reports_absent() {
     let revision = scene.structure_revision();
     assert_eq!(scene.update_layer(9999, |_| true), None);
     assert_eq!(scene.structure_revision(), revision);
+}
+
+/// A bitmap may declare a size while holding no pixel bytes: a pending decode
+/// keeps its probed size and an empty buffer. Every CPU pixel primitive clips
+/// against the declared rectangle and writes nothing when nothing is
+/// drawable, so such a bitmap must neither abort nor corrupt the bitmaps it
+/// is composited with.
+///
+/// `iTVPBaseBitmap::CopyRect` clips the source rect against the source's
+/// declared size and the destination rect against the destination's declared
+/// size, and returns `false` before touching a pixel when either is empty
+/// (`reference/cpp/core/visual/LayerBitmapIntf.cpp:969-1021`).
+#[test]
+fn a_bitmap_declaring_pixels_it_does_not_hold_is_left_alone() {
+    const FULL: (i32, i32, i32, i32) = (0, 0, 4, 4);
+    let source = sample(4, 4, 11);
+    let mut destination = sample(4, 4, 12);
+    let intact = destination.rgba.clone();
+    let mut pixel_less = BitmapState::new(4, 4, Vec::new());
+    let options = BlitOptions {
+        mode: 0,
+        opa: 255,
+        treat_as_opaque: false,
+        hold_alpha: false,
+    };
+
+    // A source with a declared size but no pixel bytes contributes nothing.
+    blit_copy(&mut destination, 0, 0, &pixel_less, FULL);
+    blit_plane(
+        &mut destination,
+        0,
+        0,
+        &pixel_less,
+        FULL,
+        FULL,
+        COPY_MAIN | COPY_MASK,
+    );
+    blit_over(
+        &mut destination,
+        0,
+        0,
+        BlitSource {
+            bitmap: &pixel_less,
+            rect: FULL,
+        },
+        FULL,
+        options,
+    );
+    tile_rect(
+        &mut destination,
+        Rect::new(0, 0, 4, 4),
+        &pixel_less,
+        FULL,
+        (0, 0),
+    );
+    stretch_blit(&mut destination, FULL, &pixel_less, FULL, 0);
+    // Axis-aligned `stNearest` takes the scanline pass.
+    affine_blit(
+        &mut destination,
+        AffineBlit {
+            corners: [(0.0, 0.0), (4.0, 0.0), (0.0, 4.0)],
+            stretch_type: 0,
+            clear: false,
+            clear_color: [0, 0, 0, 0],
+        },
+        BlitSource {
+            bitmap: &pixel_less,
+            rect: FULL,
+        },
+        options,
+    );
+    assert_eq!(
+        destination.rgba, intact,
+        "a pixel-less source draws nothing"
+    );
+
+    // A destination with a declared size but no pixel bytes takes nothing and
+    // keeps its empty buffer instead of aborting.
+    fill_color_on_alpha(&mut pixel_less, FULL, [9, 8, 7, 255], 255);
+    fill_mask(&mut pixel_less, FULL, 7);
+    do_gray_scale(&mut pixel_less, FULL);
+    flip_lr(&mut pixel_less);
+    blur_bitmap_in_place(&mut pixel_less, 2, 2);
+    gaussian_blur(&mut pixel_less, FULL, 2, 1.0);
+    blit_copy(&mut pixel_less, 0, 0, &source, FULL);
+    blit_plane(&mut pixel_less, 0, 0, &source, FULL, FULL, COPY_MASK);
+    blit_over(
+        &mut pixel_less,
+        0,
+        0,
+        BlitSource {
+            bitmap: &source,
+            rect: FULL,
+        },
+        FULL,
+        options,
+    );
+    tile_rect(
+        &mut pixel_less,
+        Rect::new(0, 0, 4, 4),
+        &source,
+        FULL,
+        (0, 0),
+    );
+    stretch_blit(&mut pixel_less, FULL, &source, FULL, 0);
+    // Fractional corners take the generic (per-pixel) affine pass.
+    affine_blit(
+        &mut pixel_less,
+        AffineBlit {
+            corners: [(0.0, 0.0), (3.5, 0.25), (0.25, 3.5)],
+            stretch_type: 2,
+            clear: true,
+            clear_color: [1, 2, 3, 4],
+        },
+        BlitSource {
+            bitmap: &source,
+            rect: FULL,
+        },
+        BlitOptions {
+            mode: 2,
+            opa: 128,
+            ..options
+        },
+    );
+    assert!(
+        pixel_less.rgba.is_empty(),
+        "a pixel-less destination stays empty"
+    );
+
+    // `copy_9patch` already reports failure through its `Option`.
+    let mut patch_target = BitmapState::new(16, 16, Vec::new());
+    assert!(copy_9patch(&mut patch_target, &sample(16, 16, 13)).is_none());
+    assert!(patch_target.rgba.is_empty());
+}
+
+/// A fill of an image that declares its size and holds no pixels writes
+/// nothing and does not abort.
+///
+/// The reference fills the clipped rectangle of the layer's image
+/// (`reference/cpp/core/visual/LayerIntf.cpp:4272-4286`,
+/// `reference/cpp/core/visual/LayerBitmapIntf.cpp:286-303`); the image
+/// always holds its pixels there, so an image that declares the probed size
+/// without a buffer has nothing to fill.
+#[test]
+fn fill_rect_replace_skips_an_image_without_pixels() {
+    let mut bmp = BitmapState::new(4, 4, Vec::new());
+    fill_rect_replace(&mut bmp, 0, 0, 4, 4, [1, 2, 3, 4]);
+    assert!(bmp.rgba.is_empty(), "an image without pixels is not filled");
+    assert!(
+        !bmp.dirty,
+        "an image without pixels is not modified by the fill"
+    );
+}
+
+/// A transition that blends into an image that declares its size and holds no
+/// pixels writes nothing and does not abort.
+///
+/// The reference's cross-fade blends the two sources into the destination
+/// (`reference/cpp/core/visual/TransIntf.cpp:584-612`,
+/// `reference/cpp/core/visual/TransIntf.cpp:614-701`); the images always hold
+/// their pixels there, so a destination that declares the probed size without
+/// a buffer has nothing to write.
+#[test]
+fn a_transition_over_an_image_without_pixels_writes_nothing() {
+    let src1 = sample(4, 4, 31);
+    let src2 = sample(4, 4, 32);
+    let mut dst = BitmapState::new(4, 4, Vec::new());
+    let mut trans = Trans::cross_fade(100.0).expect("a cross-fade");
+    // The midpoint phase, so the blend runs instead of an endpoint copy.
+    trans.step(50.0);
+    trans
+        .apply(&mut dst, &src1, &src2, (0, 0, 4, 4))
+        .expect("the transition applies");
+    assert!(
+        dst.rgba.is_empty(),
+        "an image without pixels is not written by the transition"
+    );
 }

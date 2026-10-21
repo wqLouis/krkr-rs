@@ -52,7 +52,7 @@ use std::sync::Arc;
 use api::media::{RgbaFrame, VideoSpec};
 
 use crate::layer_ops::{BlitOptions, BlitSource, blit_copy_clipped, blit_over, clip_rect};
-use crate::scene::{BitmapState, Scene};
+use crate::scene::{BitmapState, Scene, bitmap_holds_pixels};
 
 /// Playback status (`tTVPStatus` for the video overlay).
 ///
@@ -878,8 +878,9 @@ pub fn blit_frame_to_layer(
 /// stream) over the straight replacement (an opaque stream); `opacity` is the
 /// compositing opacity applied in that path (reference `SetMixingBitmap(dest,
 /// alpha)`). The layer must already own a MainImage; `false` is returned when
-/// it has none or the frame has no pixels. This is the shared primitive behind
-/// the movie layer copy and the layer-mode video overlay composite.
+/// it has none, the frame has no pixels, or the image does not hold the pixels
+/// its size declares. This is the shared primitive behind the movie layer copy
+/// and the layer-mode video overlay composite.
 pub fn blit_frame_to_layer_opacity(
     scene: &mut Scene,
     layer_id: u32,
@@ -890,14 +891,28 @@ pub fn blit_frame_to_layer_opacity(
     if frame.width == 0 || frame.height == 0 {
         return false;
     }
+    // The frame rectangle is an `i32` one; a frame or a layer larger than
+    // that cannot be expressed, and the truncated rectangle would be an
+    // inverted source the copy silently drops.
+    if frame.width > i32::MAX as u32 || frame.height > i32::MAX as u32 {
+        return false;
+    }
     let Some(dst_bitmap_id) = scene.layer(layer_id).and_then(|layer| layer.bitmap) else {
         return false;
     };
+    // The destination image may still be decoding: the copy writes into the
+    // pixels its resolution installs.
+    if !scene.resolve_bitmap(dst_bitmap_id) {
+        return false;
+    }
     let clip = clip_rect(scene.layer(layer_id).and_then(|layer| layer.clip));
     let (layer_w, layer_h) = scene
         .layer(layer_id)
         .map(|layer| (layer.rect.w, layer.rect.h))
         .unwrap_or((0, 0));
+    if layer_w > i32::MAX as u32 || layer_h > i32::MAX as u32 {
+        return false;
+    }
     let sw = layer_w.min(frame.width);
     let sh = layer_h.min(frame.height);
     if sw == 0 || sh == 0 {
@@ -910,6 +925,18 @@ pub fn blit_frame_to_layer_opacity(
     let Some(dst) = scene.bitmap_mut(dst_bitmap_id) else {
         return false;
     };
+    if !bitmap_holds_pixels(dst) {
+        log::error!(
+            "engine: the destination of a {}x{} video frame declares {}x{} but holds {} pixel \
+             bytes; the frame is not copied",
+            frame.width,
+            frame.height,
+            dst.width,
+            dst.height,
+            dst.rgba.len()
+        );
+        return false;
+    }
     if source_over {
         blit_over(
             dst,

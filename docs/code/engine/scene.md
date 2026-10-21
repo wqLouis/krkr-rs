@@ -186,6 +186,11 @@ hit. The caller decodes only on a miss.
   an 8-bit plane allocated on demand
   (`reference/cpp/core/visual/LayerIntf.cpp:2359`, `AllocateProvinceImage`)
   and freed with the layer.
+* **The hit test and the province reads are total.** A province plane shorter
+  than the size it declares reads as `0`, a province write into it writes
+  nothing, and a hit test over a short province plane — or over a main image
+  that declares more pixels than its buffer holds — is a miss. No read runs
+  past the buffer, and each inconsistency is reported in the log.
 * **A script-owned bitmap outlives the layer that shows it.** `script_owned`
   marks a bitmap a script `Bitmap` object owns; destroying the layer must not
   free it.
@@ -216,7 +221,10 @@ hit. The caller decodes only on a miss.
   reference reports
   (`reference/cpp/core/visual/LayerIntf.cpp:3005-3044`); the safe
   `with_*_pixels` closures are the access path. The address is valid until the
-  next resize of that image.
+  next resize of that image. The main-image address is `0` when the layer has
+  no main image **and** when the image declares more pixels than its pixel
+  buffer holds: an image with no pixels has no address to hand out, and the
+  write variant does not mark it dirty.
 * **The transition self image stands in for the main image** in a cached
   subtree, the reference's `CopySelfForRect`
   (`reference/cpp/core/visual/LayerIntf.cpp:6781-6783`).
@@ -270,6 +278,17 @@ the decoded pixels land in the bitmap  (or a transparent blank, on a failure)
 
 * An operation on an unknown id returns `None`/`false` or is a no-op; it never
   panics and never creates a record implicitly.
+* `main_image_pixel_buffer` and `main_image_pixel_buffer_for_write` report
+  `0` when the layer has no main image and when the image declares more pixels
+  than its pixel buffer holds; the write variant marks no such image dirty.
+* `province_pixel` reads `0` and `set_province_pixel` writes nothing when the
+  province plane is shorter than the size it declares; the inconsistency is
+  logged.
+* `layer_at` answers a miss when the province plane is short or when the main
+  image declares more pixels than its buffer holds.
+* `resize_bitmap` preserves only the whole rows the source buffer holds; the
+  rest of the overlap keeps the fill, and the rows the source does not hold
+  are reported in the log.
 * `set_order_index` and `set_absolute_order_index` return `Result<(), String>`
   when the requested order cannot be represented.
 * The image-size operations (`set_layer_image_size`,
@@ -317,7 +336,9 @@ the decoded pixels land in the bitmap  (or a transparent blank, on a failure)
 ## 7. Tests
 
 * `crates/engine/tests/scene.rs` — the tree: creation, ordering, focus
-  domains, hit-testing, cache counts, province images.
+  domains, hit-testing, cache counts, province images; a resize keeps only
+  the rows the source buffer holds, and a layer image that declares more
+  pixels than its buffer holds has no main-image address.
 * `crates/engine/tests/bitmap.rs` — the bitmap lifetime and the pixel
   buffers.
 * `crates/engine/tests/imagedecode.rs` — the decode pool: the workers, the

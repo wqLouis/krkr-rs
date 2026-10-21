@@ -135,20 +135,54 @@ fn blend_channel(d: u8, s: u8, alpha: u8) -> u8 {
     out.clamp(0, 255) as u8
 }
 
+/// Whether a bitmap's buffer holds every pixel its declared size names.
+///
+/// A bitmap can carry a size with no pixels behind it: a decode that has not
+/// landed keeps the probed size and an empty buffer, and a blank image that
+/// could not be allocated leaves the same state. The pixel primitives treat
+/// such a bitmap as empty: they read the miss value and write nothing, so a
+/// declared size can never index past the buffer.
+fn pixels_present(bitmap: &BitmapState) -> bool {
+    (bitmap.width as usize)
+        .checked_mul(bitmap.height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .is_some_and(|bytes| bytes <= bitmap.rgba.len())
+}
+
+/// Whether `bitmap` may take part in `operation`, reporting a declared size
+/// its buffer does not cover.
+///
+/// The report is issued once for the operation, not once for every pixel it
+/// would have touched.
+fn pixels_usable(bitmap: &BitmapState, operation: &str) -> bool {
+    if pixels_present(bitmap) {
+        return true;
+    }
+    log::error!(
+        "engine: {operation} met a {}x{} bitmap holding {} pixel bytes; the operation is skipped",
+        bitmap.width,
+        bitmap.height,
+        bitmap.rgba.len()
+    );
+    false
+}
+
 fn write_pixel(bitmap: &mut BitmapState, x: i32, y: i32, rgba: [u8; 4]) {
-    if let Some(i) = bitmap.pixel_offset(x as u32, y as u32) {
-        bitmap.rgba[i..i + 4].copy_from_slice(&rgba);
+    if let Some(i) = bitmap.pixel_offset(x as u32, y as u32)
+        && let Some(pixel) = bitmap.rgba.get_mut(i..i + 4)
+    {
+        pixel.copy_from_slice(&rgba);
     }
 }
 
+/// The pixel at `(x, y)`, or the transparent miss value when the bitmap holds
+/// no pixel there.
 fn read_pixel(bitmap: &BitmapState, x: i32, y: i32) -> [u8; 4] {
-    match bitmap.pixel_offset(x as u32, y as u32) {
-        Some(i) => [
-            bitmap.rgba[i],
-            bitmap.rgba[i + 1],
-            bitmap.rgba[i + 2],
-            bitmap.rgba[i + 3],
-        ],
+    let Some(i) = bitmap.pixel_offset(x as u32, y as u32) else {
+        return [0, 0, 0, 0];
+    };
+    match bitmap.rgba.get(i..i + 4) {
+        Some(pixel) => [pixel[0], pixel[1], pixel[2], pixel[3]],
         None => [0, 0, 0, 0],
     }
 }
@@ -169,6 +203,9 @@ fn dim_i32(v: u32) -> i32 {
 ///   the output alpha is `255 - ((255 - dst_a) * (255 - opa) >> 8)`.
 pub fn fill_color_on_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 4], opa: i32) {
     if opa <= 0 {
+        return;
+    }
+    if !pixels_usable(bitmap, "fillColorOnAlpha") {
         return;
     }
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
@@ -212,6 +249,9 @@ fn saturated_add(a: u32, b: u32) -> u32 {
 /// `FillColorOnAddAlpha`: additive-alpha (premultiplied) fill.
 pub fn fill_color_on_add_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 4], opa: i32) {
     if opa <= 0 {
+        return;
+    }
+    if !pixels_usable(bitmap, "fillColorOnAddAlpha") {
         return;
     }
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
@@ -259,6 +299,9 @@ pub fn fill_color_hold_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 
     if opa <= 0 {
         return;
     }
+    if !pixels_usable(bitmap, "fillColor") {
+        return;
+    }
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
     };
@@ -286,6 +329,9 @@ pub fn fill_color_hold_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 
 /// `FillMask`: replace the alpha channel with `value`, holding the RGB. In
 /// this engine the alpha channel *is* the mask plane.
 pub fn fill_mask(bitmap: &mut BitmapState, rect: RectI, value: u8) {
+    if !pixels_usable(bitmap, "fillMask") {
+        return;
+    }
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
     };
@@ -304,6 +350,9 @@ pub fn fill_mask(bitmap: &mut BitmapState, rect: RectI, value: u8) {
 /// clears the alpha.
 pub fn remove_const_opacity(bitmap: &mut BitmapState, rect: RectI, level: i32) {
     if level <= 0 {
+        return;
+    }
+    if !pixels_usable(bitmap, "removeConstOpacity") {
         return;
     }
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
@@ -397,6 +446,9 @@ fn hsl_to_rgb(h: u8, s: u8, l: u8) -> (u8, u8, u8) {
 /// saturation while preserving lightness. Operates in place on the
 /// already-clipped region.
 pub fn colorize(bitmap: &mut BitmapState, rect: RectI, hue: i32, sat: i32, blend: f64) {
+    if !pixels_usable(bitmap, "colorize") {
+        return;
+    }
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
     };
@@ -461,6 +513,9 @@ pub fn noise(bitmap: &mut BitmapState, rect: RectI, level: i32, seed: u64) {
     if level <= 0 {
         return;
     }
+    if !pixels_usable(bitmap, "noise") {
+        return;
+    }
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
     };
@@ -518,6 +573,9 @@ pub fn blit_copy_clipped(
     if src.width == 0 || src.height == 0 {
         return;
     }
+    if !pixels_usable(dst, "copyRect") || !pixels_usable(src, "copyRect") {
+        return;
+    }
     for y in dest_clip.1..dest_clip.3 {
         for x in dest_clip.0..dest_clip.2 {
             let sx = src_rect.0 + (x - dx);
@@ -560,6 +618,9 @@ pub fn blit_over(
     let sw = src_rect.2.saturating_sub(src_rect.0);
     let sh = src_rect.3.saturating_sub(src_rect.1);
     if sw <= 0 || sh <= 0 || opa == 0 || src.width == 0 || src.height == 0 {
+        return;
+    }
+    if !pixels_usable(dst, "blt") || !pixels_usable(src, "blt") {
         return;
     }
     let Some(in_bounds) = intersect(dst, (dx, dy, dx.saturating_add(sw), dy.saturating_add(sh)))
@@ -615,6 +676,9 @@ pub fn blit_plane(
     clip: RectI,
     plane: u8,
 ) {
+    if !pixels_usable(dst, "copyRect") || !pixels_usable(src, "copyRect") {
+        return;
+    }
     if plane & (COPY_MAIN | COPY_MASK) == (COPY_MAIN | COPY_MASK) {
         // `Copy` writes the source rect straight over the destination (RGB
         // *and* alpha), transparent source pixels included — NOT a source-over
@@ -695,6 +759,9 @@ pub fn tile_rect(
     tile_rect: RectI,
     phase: (i32, i32),
 ) {
+    if !pixels_usable(dst, "tileRect") || !pixels_usable(tile, "tileRect") {
+        return;
+    }
     let Rect {
         x: left,
         y: top,
@@ -846,6 +913,9 @@ pub fn do_drop_shadow(
     if bitmap.width == 0 || bitmap.height == 0 {
         return;
     }
+    if !pixels_usable(bitmap, "doDropShadow") {
+        return;
+    }
     // `original` supplies the top layer and the shadow's alpha source;
     // `shadow` is the recoloured, blurred buffer. `bitmap` itself is the work
     // buffer, so only two full-buffer copies are made.
@@ -877,6 +947,9 @@ pub fn do_blur_light(
     light_type: i64,
 ) {
     if bitmap.width == 0 || bitmap.height == 0 {
+        return;
+    }
+    if !pixels_usable(bitmap, "doBlurLight") {
         return;
     }
     let mut light = bitmap.clone();
@@ -918,6 +991,9 @@ pub fn fill_operate_rect(
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
     };
+    if !pixels_usable(bitmap, "fillOperateRect") {
+        return;
+    }
     // `ltOpaque`/`omOpaque` copy the source (including alpha); `ltAdditive`
     // and `ltSubtractive` do not consider the destination alpha; the rest are
     // source-over in this engine.
@@ -1022,8 +1098,18 @@ pub fn fill_operate_rect(
 /// `rgba[y][max(0, x-rx) ..= min(w-1, x+rx)]` (four channels). Uses a sliding
 /// running sum, so the row costs `O(w)`.
 fn horizontal_box_sum(rgba: &[u8], w: usize, y: usize, rx: usize, out: &mut [[u64; 4]]) {
-    let base = y * w * 4;
-    let src = &rgba[base..base + w * 4];
+    let Some(row_bytes) = w.checked_mul(4) else {
+        return;
+    };
+    let Some(base) = y.checked_mul(row_bytes) else {
+        return;
+    };
+    let Some(src) = base
+        .checked_add(row_bytes)
+        .and_then(|end| rgba.get(base..end))
+    else {
+        return;
+    };
     let mut running = [0u64; 4];
     for x in 0..=rx.min(w - 1) {
         let i = x * 4;
@@ -1061,6 +1147,9 @@ fn horizontal_box_sum(rgba: &[u8], w: usize, y: usize, rx: usize, out: &mut [[u6
 /// including at the clamped edges where the window is smaller.
 pub fn blur_bitmap_in_place(bitmap: &mut BitmapState, xradius: u32, yradius: u32) {
     if bitmap.width == 0 || bitmap.height == 0 || (xradius == 0 && yradius == 0) {
+        return;
+    }
+    if !pixels_usable(bitmap, "blurBitmapInPlace") {
         return;
     }
     let w = bitmap.width as usize;
@@ -1136,7 +1225,7 @@ fn read_pixel_rect(bitmap: &BitmapState, rect: RectI, x: i32, y: i32) -> [u8; 4]
     let (x0, y0, x1, y1) = if rect.2 > rect.0 && rect.3 > rect.1 {
         rect
     } else {
-        (0, 0, bitmap.width as i32, bitmap.height as i32)
+        (0, 0, dim_i32(bitmap.width), dim_i32(bitmap.height))
     };
     read_pixel(bitmap, x.clamp(x0, x1 - 1), y.clamp(y0, y1 - 1))
 }
@@ -1265,7 +1354,7 @@ fn stretch_sample(
     let kind = stretch_type & 0xffff;
     let ref_no_clip = stretch_type & 0x1_0000 != 0;
     let rect = if ref_no_clip {
-        (0, 0, bitmap.width as i32, bitmap.height as i32)
+        (0, 0, dim_i32(bitmap.width), dim_i32(bitmap.height))
     } else {
         src
     };
@@ -1364,6 +1453,9 @@ pub fn stretch_blit_plane(
     if dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0 {
         return;
     }
+    if !pixels_usable(dst, "stretchBlt") || !pixels_usable(src, "stretchBlt") {
+        return;
+    }
     let Some(dc) = intersect(dst, dest) else {
         return;
     };
@@ -1390,6 +1482,9 @@ pub fn stretch_blit_plane(
 /// Luma `(54*R + 183*G + 19*B) >> 8` written to all three channels, alpha
 /// held.
 pub fn do_gray_scale(bitmap: &mut BitmapState, rect: RectI) {
+    if !pixels_usable(bitmap, "doGrayScale") {
+        return;
+    }
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
     };
@@ -1463,6 +1558,9 @@ fn gamma_table(gamma: f64, floor: i32, ceil: i32) -> [u8; 256] {
 /// Per-channel gamma/level remap applied only to non-fully-transparent
 /// pixels.
 pub fn adjust_gamma(bitmap: &mut BitmapState, rect: RectI, data: GammaAdjust) {
+    if !pixels_usable(bitmap, "adjustGamma") {
+        return;
+    }
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
     };
@@ -1492,6 +1590,9 @@ pub fn adjust_gamma(bitmap: &mut BitmapState, rect: RectI, data: GammaAdjust) {
 /// `(259*(C+255))/(255*(259-C))` contrast factor, both clamped per channel;
 /// alpha held.
 pub fn light_contrast(bitmap: &mut BitmapState, rect: RectI, brightness: i32, contrast: i32) {
+    if !pixels_usable(bitmap, "lightContrast") {
+        return;
+    }
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
     };
@@ -1522,6 +1623,9 @@ pub fn light_contrast(bitmap: &mut BitmapState, rect: RectI, brightness: i32, co
 /// `ConvertAlphaToAddAlpha`: premultiply RGB by alpha (`(c * a) >> 8`),
 /// holding alpha.
 pub fn convert_alpha_to_add_alpha(bitmap: &mut BitmapState, rect: RectI) {
+    if !pixels_usable(bitmap, "convertAlphaToAddAlpha") {
+        return;
+    }
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
     };
@@ -1541,6 +1645,9 @@ pub fn convert_alpha_to_add_alpha(bitmap: &mut BitmapState, rect: RectI) {
 /// `ConvertAddAlphaToAlpha`: unpremultiply RGB (`c * 255 / a` clamped to
 /// `255`; alpha 0 leaves RGB zero), holding alpha.
 pub fn convert_add_alpha_to_alpha(bitmap: &mut BitmapState, rect: RectI) {
+    if !pixels_usable(bitmap, "convertAddAlphaToAlpha") {
+        return;
+    }
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
     };
@@ -1571,6 +1678,9 @@ pub fn convert_add_alpha_to_alpha(bitmap: &mut BitmapState, rect: RectI) {
 /// are stretched along one axis and the center on both. `right`/`bottom` are
 /// *offsets from the far edge*.
 pub fn copy_9patch(dst: &mut BitmapState, src: &BitmapState) -> Option<RectI> {
+    if !pixels_usable(dst, "copy9Patch") || !pixels_usable(src, "copy9Patch") {
+        return None;
+    }
     if dst.width == 0 || dst.height == 0 || src.width < 11 || src.height < 11 {
         return None;
     }
@@ -1641,6 +1751,9 @@ pub fn flip_lr(bitmap: &mut BitmapState) {
     if bitmap.width < 2 || bitmap.height == 0 {
         return;
     }
+    if !pixels_usable(bitmap, "flipLR") {
+        return;
+    }
     let w = bitmap.width as usize;
     for y in 0..bitmap.height as usize {
         for x in 0..w / 2 {
@@ -1657,6 +1770,9 @@ pub fn flip_lr(bitmap: &mut BitmapState) {
 /// `UDFlip`: mirror the whole main image vertically.
 pub fn flip_ud(bitmap: &mut BitmapState) {
     if bitmap.height < 2 || bitmap.width == 0 {
+        return;
+    }
+    if !pixels_usable(bitmap, "flipUD") {
         return;
     }
     let w = bitmap.width as usize;
@@ -1696,6 +1812,9 @@ fn gaussian_kernel(radius: i32, sigma: f32) -> Vec<f32> {
 /// Pixels outside the region clamp to the edge.
 pub fn gaussian_blur(bitmap: &mut BitmapState, rect: RectI, radius: i32, sigma: f32) {
     if radius <= 0 || sigma <= 0.0 {
+        return;
+    }
+    if !pixels_usable(bitmap, "gaussianBlur") {
         return;
     }
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
@@ -1761,17 +1880,9 @@ pub(crate) fn blend_pixel_mode(
     if x < 0 || y < 0 || x as u32 >= dst.width || y as u32 >= dst.height {
         return;
     }
-    let Some(i) = dst.pixel_offset(x as u32, y as u32) else {
-        return;
-    };
-    let mut pixel = [
-        dst.rgba[i],
-        dst.rgba[i + 1],
-        dst.rgba[i + 2],
-        dst.rgba[i + 3],
-    ];
+    let mut pixel = read_pixel(dst, x, y);
     blend_pixel_mode_at(&mut pixel, src, opa, mode);
-    dst.rgba[i..i + 4].copy_from_slice(&pixel);
+    write_pixel(dst, x, y, pixel);
 }
 
 /// The per-pixel core of [`blend_pixel_mode`]: blend `src` into one
@@ -1945,6 +2056,9 @@ pub fn operate_rect(
     if sw <= 0 || sh <= 0 {
         return;
     }
+    if !pixels_usable(dst, "operateRect") || !pixels_usable(src, "operateRect") {
+        return;
+    }
     let Some(dc) = intersect(dst, (dx, dy, dx.saturating_add(sw), dy.saturating_add(sh))) else {
         return;
     };
@@ -1985,6 +2099,9 @@ pub fn stretch_blit_mode(
     let dw = dest.2 - dest.0;
     let dh = dest.3 - dest.1;
     if dw <= 0 || dh <= 0 || src_rect.2 <= src_rect.0 || src_rect.3 <= src_rect.1 {
+        return;
+    }
+    if !pixels_usable(dst, "operateStretch") || !pixels_usable(src, "operateStretch") {
         return;
     }
     let Some(dc) = intersect(dst, dest) else {
@@ -2044,6 +2161,9 @@ pub fn affine_blit(
     let m = affine_forward(p0, p1, p2);
     let det = m[1] * m[5] - m[2] * m[4];
     if det.abs() < 1e-12 {
+        return;
+    }
+    if !pixels_usable(dst, "affineCopy") || !pixels_usable(src, "affineCopy") {
         return;
     }
     // Inverse of the 2x2 [b c; e f].
@@ -2146,7 +2266,7 @@ fn affine_blit_generic(dst: &mut BitmapState, pass: AffinePass<'_>) {
             // Affine sampling clamps to the whole source image (it may
             // interpolate across the source-rect border), and supports the
             // same resampler set as `stretch*`.
-            let rect = (0, 0, src.width as i32, src.height as i32);
+            let rect = (0, 0, dim_i32(src.width), dim_i32(src.height));
             let color = sample_kind(src, rect, fx, fy, stretch_type);
             blend_pixel_mode(dst, x, y, color, opa, mode);
         }
@@ -2275,7 +2395,10 @@ fn affine_nearest_band(band: &mut [u8], first_row: i32, dst_width: i32, pass: Af
         }
         let fy = src_rect.1 as f32 + (v * sh) as f32 - 0.5;
         let sy = ((fy + 0.5).floor() as i32).clamp(0, src_height - 1);
-        let source_row = &src.rgba[(sy as usize) * src_row_bytes..][..src_row_bytes];
+        let row_start = sy as usize * src_row_bytes;
+        let Some(source_row) = src.rgba.get(row_start..row_start + src_row_bytes) else {
+            continue;
+        };
         // The `u` term of the inverse map that does not depend on the
         // destination column is the same for the whole row.
         let inv1_py = inv[1] * py;
@@ -2669,9 +2792,12 @@ fn subtree_source(
     match layer.face {
         2 => {
             let main = layer.bitmap.and_then(|id| scene.bitmap(id))?;
+            if !pixels_usable(main, "renderLayerSubtree") {
+                return None;
+            }
             grayscale_bitmap(main.width, main.height, |x, y| {
                 main.pixel_offset(x, y)
-                    .map(|i| main.rgba[i + 3])
+                    .and_then(|i| main.rgba.get(i + 3).copied())
                     .unwrap_or(0)
             })
             .map(SubtreeSource::Derived)
@@ -3049,6 +3175,10 @@ pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
         return bitmap;
     }
     let content = ensure_layer_content(scene, root, w, h)?;
+    let content_bitmap = scene.bitmap(content)?;
+    if !pixels_usable(content_bitmap, "renderLayerSubtree") {
+        return None;
+    }
     let current_generation = subtree_source_generation(scene, root, 0);
     let (recalc, recorded) = {
         let layer = scene.layer(root)?;

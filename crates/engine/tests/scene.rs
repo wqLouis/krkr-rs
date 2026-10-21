@@ -651,6 +651,136 @@ fn resize_province_image_handles_large_sizes() {
     );
 }
 
+/// A resize preserves only the rows the source buffer actually holds and
+/// fills the rest (`LayerBitmapIntf.cpp:122-163`: `SetSize` keeps the
+/// overlapping pixels, then the expanded region is filled). A bitmap that
+/// declares a size without holding the pixels — a decode whose blank image
+/// could not be allocated, or a truncated image buffer — must keep the fill
+/// instead of reading outside its buffer.
+#[test]
+fn resize_bitmap_keeps_the_fill_for_rows_the_source_does_not_hold() {
+    let mut scene = Scene::default();
+
+    // A bitmap that declares 4x4 pixels but holds none.
+    let empty = scene.add_bitmap(4, 4, Vec::new());
+    assert!(scene.resize_bitmap(empty, 6, 2, [9, 8, 7, 6]));
+    let bitmap = scene.bitmap(empty).expect("the bitmap survives the resize");
+    assert_eq!((bitmap.width, bitmap.height), (6, 2));
+    assert_eq!(bitmap.rgba.len(), 6 * 2 * 4);
+    assert!(
+        bitmap
+            .rgba
+            .chunks_exact(4)
+            .all(|pixel| pixel == [9, 8, 7, 6]),
+        "a bitmap without pixels keeps the fill"
+    );
+    assert!(bitmap.dirty, "a resized bitmap is dirty");
+
+    // A 3x3 bitmap whose buffer stops after two rows: those rows are
+    // preserved, the third keeps the fill.
+    let short = scene.add_bitmap(3, 3, vec![1; 3 * 2 * 4]);
+    assert!(scene.resize_bitmap(short, 5, 3, [9, 8, 7, 6]));
+    let bitmap = scene.bitmap(short).expect("the bitmap survives the resize");
+    assert_eq!((bitmap.width, bitmap.height), (5, 3));
+    assert_eq!(bitmap.rgba.len(), 5 * 3 * 4);
+    // Each destination row is 20 bytes: two preserved rows (12 bytes of
+    // source plus 8 bytes of fill) and one row of fill only.
+    assert_eq!(&bitmap.rgba[..12], &[1u8; 12]);
+    assert_eq!(&bitmap.rgba[12..20], &[9, 8, 7, 6, 9, 8, 7, 6]);
+    assert_eq!(&bitmap.rgba[20..32], &[1u8; 12]);
+    assert_eq!(&bitmap.rgba[32..40], &[9, 8, 7, 6, 9, 8, 7, 6]);
+    assert!(
+        bitmap.rgba[40..]
+            .chunks_exact(4)
+            .all(|pixel| pixel == [9, 8, 7, 6]),
+        "the row the source does not hold keeps the fill"
+    );
+}
+
+/// A resize keeps the whole rows a partially held buffer contains and fills
+/// the rest.
+///
+/// The reference's `SetSizeWithFill` keeps the overlapping pixels and fills
+/// the expanded region (`reference/cpp/core/visual/LayerBitmapIntf.cpp:122-163`);
+/// a buffer that stops inside a row holds no whole row to keep, so the copy
+/// stops there and the remaining rows keep the fill.
+#[test]
+fn resize_bitmap_keeps_the_whole_rows_a_partial_buffer_holds() {
+    let mut scene = Scene::default();
+
+    // A 4x4 image whose buffer holds two whole rows and six bytes of a third.
+    let mut rgba = Vec::new();
+    rgba.extend_from_slice(&[1u8; 16]);
+    rgba.extend_from_slice(&[2u8; 16]);
+    rgba.extend_from_slice(&[3u8; 6]);
+    let id = scene.add_bitmap(4, 4, rgba);
+    assert!(scene.resize_bitmap(id, 6, 4, [9, 8, 7, 6]));
+
+    let bitmap = scene.bitmap(id).expect("the bitmap survives the resize");
+    assert_eq!((bitmap.width, bitmap.height), (6, 4));
+    assert_eq!(bitmap.rgba.len(), 6 * 4 * 4);
+    // Each destination row is 24 bytes: the two whole source rows keep their
+    // 16 bytes and take 8 bytes of fill, the last two rows are fill only.
+    assert_eq!(&bitmap.rgba[..16], &[1u8; 16], "the first row is preserved");
+    assert_eq!(&bitmap.rgba[16..24], &[9, 8, 7, 6, 9, 8, 7, 6]);
+    assert_eq!(
+        &bitmap.rgba[24..40],
+        &[2u8; 16],
+        "the second row is preserved"
+    );
+    assert_eq!(&bitmap.rgba[40..48], &[9, 8, 7, 6, 9, 8, 7, 6]);
+    assert!(
+        bitmap.rgba[48..]
+            .chunks_exact(4)
+            .all(|pixel| pixel == [9, 8, 7, 6]),
+        "the half-held row and the row after it keep the fill"
+    );
+}
+
+/// The address of a layer's main image is 0 when the image declares its size
+/// and holds no pixels.
+///
+/// The reference hands out the MainImage's first scanline
+/// (`reference/cpp/core/visual/LayerIntf.cpp:3005-3009`) and 0 when the layer
+/// has no MainImage; the write variant marks the image modified
+/// (`reference/cpp/core/visual/LayerIntf.cpp:3012-3017`). An image that
+/// declares the probed size without a buffer has no address to hand out.
+#[test]
+fn a_layer_image_without_pixels_has_no_main_image_address() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (2, 2));
+    let layer = scene.add_layer(win, None);
+    let bitmap = scene.add_bitmap(2, 2, vec![0u8; 16]);
+    scene.layer_mut(layer).unwrap().bitmap = Some(bitmap);
+    // An image that holds its pixels has an address.
+    assert_ne!(
+        scene.main_image_pixel_buffer(layer),
+        0,
+        "an image with pixels has an address"
+    );
+
+    // The state a failed blank allocation leaves: the size is declared and
+    // the pixel buffer is empty.
+    let image = scene.bitmap_mut(bitmap).expect("the image is real");
+    image.rgba.clear();
+    image.dirty = false;
+
+    assert_eq!(
+        scene.main_image_pixel_buffer(layer),
+        0,
+        "an image without pixels has no address"
+    );
+    assert_eq!(
+        scene.main_image_pixel_buffer_for_write(layer),
+        0,
+        "an image without pixels has no write address"
+    );
+    assert!(
+        !scene.bitmap(bitmap).expect("the image is real").dirty,
+        "no write address is handed out, so the image is not modified"
+    );
+}
+
 /// An invalid `set_focus` id leaves the current holder untouched (the doc
 /// previously claimed it blurred the holder).
 #[test]

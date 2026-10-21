@@ -2031,13 +2031,10 @@ pub fn blit_coverage_into(
             if x < drawn.0 || y < drawn.1 || x >= drawn.2 || y >= drawn.3 {
                 continue;
             }
-            if let Some(offset) = bitmap.pixel_offset(x as u32, y as u32) {
-                blend_tinted_coverage(
-                    &mut bitmap.rgba[offset..offset + 4],
-                    coverage,
-                    color,
-                    opacity,
-                );
+            if let Some(offset) = bitmap.pixel_offset(x as u32, y as u32)
+                && let Some(pixel) = bitmap.rgba.get_mut(offset..offset + 4)
+            {
+                blend_tinted_coverage(pixel, coverage, color, opacity);
             }
         }
     }

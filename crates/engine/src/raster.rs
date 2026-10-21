@@ -51,14 +51,14 @@ fn blend_pixel_raw(
     let Some(i) = bitmap.pixel_offset(x as u32, y as u32) else {
         return false;
     };
-    let mut pixel = [
-        bitmap.rgba[i],
-        bitmap.rgba[i + 1],
-        bitmap.rgba[i + 2],
-        bitmap.rgba[i + 3],
-    ];
+    let Some(pixel) = bitmap.rgba.get(i..i + 4) else {
+        return false;
+    };
+    let mut pixel = [pixel[0], pixel[1], pixel[2], pixel[3]];
     blend_pixel_at(&mut pixel, color, coverage, opa);
-    bitmap.rgba[i..i + 4].copy_from_slice(&pixel);
+    if let Some(destination) = bitmap.rgba.get_mut(i..i + 4) {
+        destination.copy_from_slice(&pixel);
+    }
     true
 }
 
@@ -98,6 +98,21 @@ pub fn fill_rect_replace(bitmap: &mut BitmapState, x: i32, y: i32, w: u32, h: u3
     if bitmap.width == 0 || bitmap.height == 0 {
         return;
     }
+    let Some(expected) = (bitmap.width as usize)
+        .checked_mul(bitmap.height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        return;
+    };
+    if bitmap.rgba.len() < expected {
+        log::error!(
+            "engine: fillRect met a {}x{} bitmap holding {} pixel bytes",
+            bitmap.width,
+            bitmap.height,
+            bitmap.rgba.len()
+        );
+        return;
+    }
     let w = w.min(i32::MAX as u32) as i32;
     let h = h.min(i32::MAX as u32) as i32;
     let x0 = x.max(0);
@@ -111,8 +126,12 @@ pub fn fill_rect_replace(bitmap: &mut BitmapState, x: i32, y: i32, w: u32, h: u3
     for py in y0..y1 {
         let row = py as usize * width;
         for px in x0..x1 {
-            let i = (row + px as usize) * 4;
-            bitmap.rgba[i..i + 4].copy_from_slice(&color);
+            let Some(i) = (row + px as usize).checked_mul(4) else {
+                continue;
+            };
+            if let Some(destination) = bitmap.rgba.get_mut(i..i + 4) {
+                destination.copy_from_slice(&color);
+            }
         }
     }
     bitmap.mark_dirty();

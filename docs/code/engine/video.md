@@ -163,6 +163,11 @@ percent fast and skip a frame's worth of audio on every step.
   `Stop()`, which rewinds before reporting the status.
 * **A configured period event fires once per arming.**
 * **The bounds, the frame size and the blit rects are VM pixels.**
+* **The frame copy resolves its destination.** A destination image whose
+  decode is still running is waited for, and the copy writes into the pixels
+  that resolution installed. A destination that declares more pixels than its
+  pixel buffer holds aborts the copy: `blit_frame_to_layer*` returns
+  `false`.
 * **The current frame is shared, not copied**: the decoder hands the same
   buffer to every holder.
 
@@ -200,6 +205,8 @@ events: VideoOverlay::poll() ──► VideoEvent list ──► L3 dispatches o
 | a playback command on a closed overlay | `VideoError::NotOpen` |
 | a decoded frame whose length disagrees with its dimensions | `VideoError::InconsistentFrame` |
 | a frame with no pixels or a layer with no main image | `blit_frame_to_layer*` returns `false` |
+| a destination image whose decode is still running | the destination is resolved first; the copy writes into the pixels the resolution installed |
+| a destination image that declares more pixels than its pixel buffer holds | `blit_frame_to_layer*` returns `false`, and the inconsistency is logged |
 
 Script-visible values are not validated here: the reference stores whatever
 it is given.
