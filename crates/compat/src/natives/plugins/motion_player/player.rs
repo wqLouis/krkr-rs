@@ -2829,10 +2829,20 @@ fn refresh_node_geometry(
             }
         }
         // The previous frame's grid is the warp field the new grid is drawn
-        // through.
-        if previous.len() >= 32 {
+        // through. The patch is indexed by the node's normalized box
+        // coordinates, so a grid point is mapped through the inverse of the
+        // box matrix before the patch is evaluated, the same mapping the
+        // ancestor cascade uses. The point's pixel coordinates would put the
+        // patch parameters far outside `0..=1`, where the Bernstein weights
+        // grow past the precision of the sum and the evaluation loses every
+        // digit of its result.
+        if previous.len() >= 32 && det.abs() > 1e-10 {
             for pair in points.chunks_exact_mut(2) {
-                if let Some((x, y)) = eval_bezier_patch(&previous, pair[0], pair[1]) {
+                let tx = f64::from(pair[0]) - org_x;
+                let ty = f64::from(pair[1]) - org_y;
+                let u = ((mw22 * tx - mw12 * ty) / det) as f32;
+                let v = ((mw11 * ty - mw21 * tx) / det) as f32;
+                if let Some((x, y)) = eval_bezier_patch(&previous, u, v) {
                     pair[0] = x;
                     pair[1] = y;
                 }
@@ -5505,9 +5515,10 @@ mod tests {
         )
     }
 
-    /// A mesh node builds its grid from the subdivision level and reports the
-    /// deformed grid corners through `vtx`; a child is warped through the
-    /// parent's patch (`reference/cpp/plugins/motionplayer/PlayerUpdateGeometry.cpp:290-577`,
+    /// A mesh node builds its grid from the subdivision level, warps it
+    /// through the previous frame's patch and reports the deformed grid
+    /// corners through `vtx`; a child is warped through the parent's patch
+    /// (`reference/cpp/plugins/motionplayer/PlayerUpdateGeometry.cpp:290-577`,
     /// `PlayerUpdateLayersInternal.h:356-441`).
     #[test]
     fn a_mesh_node_builds_its_grid_and_deforms_its_child() {
