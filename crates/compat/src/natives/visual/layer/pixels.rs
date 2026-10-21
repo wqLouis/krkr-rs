@@ -17,6 +17,7 @@ use std::ffi::{c_char, c_int, c_void};
 use crate::engine_api::layer_ops::{self, GammaAdjust, RectI};
 use crate::engine_api::{BitmapState, DecodedImageKey, DecodedImageMode, Scene};
 use api::blend::{BlendMode, DstBlend};
+use api::media::DecodedImage;
 use tjs::{NativeInstanceMethodDef, Tjs2Engine, Value};
 
 use super::super::bitmap::{
@@ -2295,32 +2296,108 @@ extern "C" fn layer_load_province_image(
 }
 
 /// Reads and installs `name` as the layer's province plane. The decoded image
-/// must match the main image's size (reference `TVPProvinceSizeMismatch`);
-/// its red channel becomes the 8-bit province value.
+/// must not be larger than the main image; a smaller image is tiled up to the
+/// main size. Its red channel becomes the 8-bit province value.
 fn load_layer_province(ctx: &CompatCtx, layer_id: u32, name: &str) -> Result<(), String> {
-    let image = load_cached_storage_image(ctx, name, COLOR_KEY_NONE, DecodedImageMode::Province)?;
+    let (main_w, main_h) = {
+        let scene = scene_mut(ctx)?;
+        let dimensions = scene
+            .layer(layer_id)
+            .and_then(|layer| layer.bitmap)
+            .and_then(|id| scene.bitmap(id))
+            .map(|bitmap| (bitmap.width, bitmap.height))
+            .ok_or_else(|| "the layer has no main image".to_string())?;
+        // The plane is allocated before the load and dropped when the load
+        // fails.
+        scene.resize_province_image(layer_id, dimensions.0, dimensions.1);
+        dimensions
+    };
+    let image =
+        match load_cached_storage_image(ctx, name, COLOR_KEY_NONE, DecodedImageMode::Province) {
+            Ok(image) => image,
+            Err(error) => return Err(discard_province_plane(ctx, layer_id, error)),
+        };
+    let plane = match province_plane(&image, main_w, main_h) {
+        Ok(plane) => plane,
+        Err(error) => return Err(discard_province_plane(ctx, layer_id, error)),
+    };
     let scene = scene_mut(ctx)?;
-    let (main_w, main_h) = scene
-        .layer(layer_id)
-        .and_then(|layer| layer.bitmap)
-        .and_then(|id| scene.bitmap(id))
-        .map(|bitmap| (bitmap.width, bitmap.height))
-        .ok_or_else(|| "the layer has no main image".to_string())?;
-    if image.width != main_w || image.height != main_h {
+    let sized = scene.layer(layer_id).is_some_and(|layer| {
+        layer.province_width == main_w
+            && layer.province_height == main_h
+            && layer
+                .province
+                .as_deref()
+                .is_some_and(|province| province.len() == plane.len())
+    });
+    if !sized {
+        scene.deallocate_province_image(layer_id);
+        return Err("the province plane could not be sized to the main image".to_string());
+    }
+    let Some(layer) = scene.layer_mut(layer_id) else {
+        return Err("the layer has no main image".to_string());
+    };
+    let Some(province) = layer.province.as_mut() else {
+        return Err("the province plane is missing".to_string());
+    };
+    province.copy_from_slice(&plane);
+    layer.image_modified = true;
+    Ok(())
+}
+
+/// Drops the layer's province plane after a failed load and returns `error`
+/// for the caller to raise. A plane that cannot be dropped is reported; it
+/// does not replace the load's failure.
+fn discard_province_plane(ctx: &CompatCtx, layer_id: u32, error: String) -> String {
+    match scene_mut(ctx) {
+        Ok(scene) => scene.deallocate_province_image(layer_id),
+        Err(drop_error) => log::error!(
+            "loadProvinceImage: the province plane of layer {layer_id} could not be dropped: {drop_error}"
+        ),
+    }
+    error
+}
+
+/// Extracts the red channel of `image` into a province plane of `width` x
+/// `height`, tiling a smaller image to the destination size.
+fn province_plane(image: &DecodedImage, width: u32, height: u32) -> Result<Vec<u8>, String> {
+    if image.width > width || image.height > height {
         return Err(format!(
-            "the province image is {}x{} but the main image is {main_w}x{main_h}",
+            "the province image is {}x{} but the main image is {width}x{height}",
             image.width, image.height,
         ));
     }
-    let plane: Vec<u8> = image.rgba.chunks_exact(4).map(|pixel| pixel[0]).collect();
-    scene.resize_province_image(layer_id, main_w, main_h);
-    if let Some(layer) = scene.layer_mut(layer_id)
-        && let Some(province) = layer.province.as_mut()
-    {
-        province.copy_from_slice(&plane);
-        layer.image_modified = true;
+    if image.width == 0 || image.height == 0 {
+        return Err("the province image has an empty dimension".to_string());
     }
-    Ok(())
+    if !image.is_consistent() {
+        return Err("the decoded image is malformed".to_string());
+    }
+    let image_width = usize::try_from(image.width)
+        .map_err(|_| "the province image width is not representable".to_string())?;
+    let image_height = usize::try_from(image.height)
+        .map_err(|_| "the province image height is not representable".to_string())?;
+    let width = usize::try_from(width)
+        .map_err(|_| "the main image width is not representable".to_string())?;
+    let height = usize::try_from(height)
+        .map_err(|_| "the main image height is not representable".to_string())?;
+    let byte_count = width
+        .checked_mul(height)
+        .ok_or_else(|| "the province plane size is not representable".to_string())?;
+    let mut plane = Vec::new();
+    plane
+        .try_reserve_exact(byte_count)
+        .map_err(|_| "the province plane is too large to allocate".to_string())?;
+    plane.resize(byte_count, 0);
+    for y in 0..height {
+        let source_y = y % image_height;
+        for x in 0..width {
+            let source_x = x % image_width;
+            let source = (source_y * image_width + source_x) * 4;
+            plane[y * width + x] = image.rgba[source];
+        }
+    }
+    Ok(plane)
 }
 
 /// `saveLayerImage(name [, type])` — encode the layer's main image through

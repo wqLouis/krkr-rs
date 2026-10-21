@@ -28,9 +28,10 @@ pub(crate) use engine::{
 // The storage namespace: mounts, archive names, locations and typed read errors.
 pub(crate) use engine::{Location, Storage, StorageReadError, normalize_in_archive_name};
 
-// The image decode pool and the pending-image future the visual natives
-// submit decodes to and wait for.
-pub(crate) use engine::imagedecode::{DecodePool, PendingImage};
+// The image decode pool, the pending-image future and the pass a worker runs
+// over decoded pixels: the visual natives submit decodes, wait for them and
+// name their pass through these.
+pub(crate) use engine::imagedecode::{DecodePass, DecodePool, PendingImage};
 
 // The generic input state the platform events are accumulated into.
 pub(crate) use engine::input::InputState;

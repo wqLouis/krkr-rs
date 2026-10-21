@@ -314,6 +314,17 @@ pub enum DecodePoolError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct JobId(u64);
 
+/// A pass over decoded pixels that a worker runs before it publishes the
+/// result.
+///
+/// The load that submits a job names the pass; the pool carries it opaquely,
+/// so a caller can transform the pixels without the pool knowing what the
+/// transform means. A pass runs on a worker thread, so it is `Send + Sync`
+/// and borrows no frame-thread state. A pass that fails publishes its message
+/// as the job's failure: the load already returned, so there is no call left
+/// to raise at.
+pub type DecodePass = dyn Fn(DecodedImage) -> Result<DecodedImage, String> + Send + Sync;
+
 /// One queued decode.
 struct Job {
     /// The job's identity.
@@ -324,6 +335,9 @@ struct Job {
     bytes: Arc<[u8]>,
     /// The storage name the bytes came from.
     hint: Option<String>,
+    /// The pass the load wants run over the decoded pixels, when it wants
+    /// one.
+    pass: Option<Arc<DecodePass>>,
     /// The bytes this job holds against the pool's memory limit.
     charged: u64,
 }
@@ -435,7 +449,9 @@ impl DecodePool {
     ///
     /// `expected_bytes` is the size of the pixels the decode will produce; it
     /// is what the job is charged against the memory limit. `hint` is the
-    /// storage name the bytes were read from.
+    /// storage name the bytes were read from. `pass` is the pass the worker
+    /// runs over the decoded pixels before it publishes them, when the load
+    /// needs one.
     ///
     /// # Errors
     ///
@@ -450,8 +466,9 @@ impl DecodePool {
         bytes: Arc<[u8]>,
         hint: Option<String>,
         expected_bytes: u64,
+        pass: Option<Arc<DecodePass>>,
     ) -> Result<(JobId, PendingImage), DecodePoolError> {
-        self.enqueue(None, bytes, hint, expected_bytes)
+        self.enqueue(None, bytes, hint, expected_bytes, pass)
     }
 
     /// Submits a decode that fills the decoded-image cache entry `key`.
@@ -459,7 +476,9 @@ impl DecodePool {
     /// The scene's cache takes the decoded pixels under `key` when the image
     /// resolves, so a later load of the same image is a cache hit instead of
     /// a second decode. `key` is the entry the synchronous load path stores
-    /// under, so both paths share one cache entry.
+    /// under, so both paths share one cache entry. `pass` is the pass the
+    /// worker runs over the decoded pixels, when the load needs one; the
+    /// cached entry is the pass's output, the pixels the load would install.
     ///
     /// # Errors
     ///
@@ -470,20 +489,23 @@ impl DecodePool {
         bytes: Arc<[u8]>,
         hint: Option<String>,
         expected_bytes: u64,
+        pass: Option<Arc<DecodePass>>,
     ) -> Result<(JobId, PendingImage), DecodePoolError> {
-        self.enqueue(Some(key), bytes, hint, expected_bytes)
+        self.enqueue(Some(key), bytes, hint, expected_bytes, pass)
     }
 
     /// Queues a decode and returns the future its result lands in.
     ///
     /// `cache_key` names the decoded-image cache entry the result fills, when
-    /// the caller wants the scene's cache to keep it.
+    /// the caller wants the scene's cache to keep it; `pass` is the post-decode
+    /// pass the worker runs, when the load needs one.
     fn enqueue(
         &mut self,
         cache_key: Option<DecodedImageKey>,
         bytes: Arc<[u8]>,
         hint: Option<String>,
         expected_bytes: u64,
+        pass: Option<Arc<DecodePass>>,
     ) -> Result<(JobId, PendingImage), DecodePoolError> {
         let byte_len = u64::try_from(bytes.len()).map_err(|_| DecodePoolError::SizeOverflow)?;
         let charged = byte_len
@@ -518,6 +540,7 @@ impl DecodePool {
                 pending: pending.clone(),
                 bytes,
                 hint,
+                pass,
                 charged,
             });
         }
@@ -676,8 +699,8 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     "the image decoder panicked".to_string()
 }
 
-/// The worker loop: take a job, decode it outside the lock and publish the
-/// result.
+/// The worker loop: take a job, decode it and run its pass outside the lock,
+/// then publish the result.
 fn worker_loop(decoder: Arc<dyn ImageDecoder>, shared: Arc<PoolShared>) {
     loop {
         let job = {
@@ -708,10 +731,16 @@ fn worker_loop(decoder: Arc<dyn ImageDecoder>, shared: Arc<PoolShared>) {
         }
         let started = Instant::now();
         let outcome = match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            decoder.decode(&job.bytes, job.hint.as_deref())
+            let image = decoder
+                .decode(&job.bytes, job.hint.as_deref())
+                .map_err(|error| error.to_string())?;
+            match job.pass.as_deref() {
+                Some(pass) => pass(image),
+                None => Ok(image),
+            }
         })) {
             Ok(Ok(image)) => ImageOutcome::Ready(Arc::new(image)),
-            Ok(Err(error)) => ImageOutcome::Failed(error.to_string()),
+            Ok(Err(message)) => ImageOutcome::Failed(message),
             Err(payload) => ImageOutcome::Failed(panic_message(payload.as_ref())),
         };
         record_decode(&shared, started.elapsed());

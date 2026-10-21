@@ -66,7 +66,7 @@ return `0`. `setMainPixel` and `setMaskPixel` set `imageModified`.
 |---|---|
 | `independProvinceImage([copy])` | allocates the layer's 8-bit province plane; the default keeps the existing content, `copy = false` clears it. |
 | `loadImages(name[, key])` | reads and probes the storage image, queues the decode in the L2 pool when possible, and installs it as the layer's main image (a pending bitmap until the pixels land). Returns `null` — the reference's absent metainfo. |
-| `loadProvinceImage(name)` | loads an 8-bit province plane whose size **must** equal the main image's size. The **red channel** of every pixel becomes the province value. |
+| `loadProvinceImage(name)` | loads an 8-bit province plane sized to the main image. A smaller image is tiled up to that size; a larger one is a size mismatch. The **red channel** of every pixel becomes the province value. |
 | `saveLayerImage(name[, type])` | encodes the main image through the host encoder and writes it through the storage. `type` defaults to `"bmp"`. |
 | `drawText(x, y, text, color[, opacity[, antialias[, shadowLevel[, shadowColor[, shadowWidth[, shadowOffsetX[, shadowOffsetY]]]]]]])` | rasterizes a text run into the layer's main image. |
 | `drawGlyph(x, y, glyph, color[, …same optionals…])` | the same, but the text comes from the glyph object's `text`/`char`/`character` member. |
@@ -247,8 +247,9 @@ A `Bitmap` passed to a Layer-only member raises
    decodes once. A cache miss reads the storage and probes the header on
    the calling thread, then queues the decode in the L2 pool and installs a
    pending bitmap with the probed size; the pixels land when the scene
-   resolves it. A colour-keyed or province load, a load with no pool and a
-   refused job decode synchronously.
+   resolves it. A colour key is a pass the worker applies to the decoded
+   pixels, so it does not keep the load synchronous. A province load, a load
+   with no pool and a refused job decode synchronously.
 3. The storage read tries the **plain name first**; only on a miss are the 21
    common image extensions probed in order (`.webp .bmp .dib .jpeg .jpg .jif
    .png .tlg .tlg5 .tlg6 .gif .tif .tiff .tga .dds .pnm .ico .qoi .hdr .exr
@@ -267,10 +268,14 @@ A `Bitmap` passed to a Layer-only member raises
 
 ### `loadProvinceImage(name)`
 
-The decoded size **must** equal the main image's size, otherwise
-`"the province image is {w}x{h} but the main image is {mw}x{mh}"`. The
-**red channel** of every pixel becomes the province value. A layer with no
-main image raises `"the layer has no main image"`.
+The decoded image may not be **larger** than the main image; a smaller one is
+tiled to the main size, so the resulting plane always matches it. A larger
+image raises
+`"the province image is {w}x{h} but the main image is {mw}x{mh}"`. The layer's
+plane is allocated before the load and dropped when the load or the size check
+fails, so a previous plane never survives a failed load. The **red channel** of
+every pixel becomes the province value. A layer with no main image raises
+`"the layer has no main image"`.
 
 ### `saveLayerImage(name[, type])`
 
@@ -354,7 +359,11 @@ stripped first. With no encoder installed the error is
 | `"Layer.loadImages: storage not found: {name}"` | the image does not resolve |
 | `"Layer.loadImages: the decoded image is malformed"` | the decoded image is inconsistent |
 | `"Layer.loadImages: the layer image could not be sized"` | the reference size adjustment failed |
-| `"Layer.loadProvinceImage: the province image is {w}x{h} but the main image is {mw}x{mh}"` | the province size mismatch |
+| `"Layer.loadProvinceImage: the province image is {w}x{h} but the main image is {mw}x{mh}"` | the province image is larger than the main image |
+| `"Layer.loadProvinceImage: the province image has an empty dimension"` | the decoded image has a zero axis |
+| `"Layer.loadProvinceImage: the decoded image is malformed"` | the decoded pixel buffer is inconsistent |
+| `"Layer.loadProvinceImage: the province plane could not be sized to the main image"` | the plane allocation did not produce the main-sized plane |
+| `"Layer.loadProvinceImage: the province plane is missing"` | the plane disappeared before it could be filled |
 | `"Layer.loadProvinceImage: the layer has no main image"` | the layer is imageless |
 | `"Layer.saveLayerImage: no image encoder is installed"` | the host encoder is missing |
 

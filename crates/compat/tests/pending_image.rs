@@ -15,7 +15,7 @@ use compat::CompatHost;
 use engine::imagedecode::{DecodePool, DecodePoolConfig, ImageDecodeError, ImageDecoder};
 use engine::input::InputState;
 use engine::timer::TimerState;
-use engine::{Scene, Storage};
+use engine::{DecodedImageKey, DecodedImageMode, Scene, Storage};
 use fs::FileSystem;
 use tjs::{Tjs2Engine, TjsValue};
 
@@ -31,6 +31,10 @@ fn image() -> DecodedImage {
 /// The ARGB value of the first pixel of [`image`], as `Bitmap.getPixel`
 /// reports it.
 const FIRST_PIXEL: i64 = 0xFF01_0203;
+
+/// The RGB value of the first pixel of [`image`]: the colour key the keyed
+/// loads use.
+const COLOR_KEY: u32 = 0x01_0203;
 
 /// The RGB value of the first pixel of [`image`], as `Layer.getMainPixel`
 /// reports it: that member masks the alpha away.
@@ -407,4 +411,241 @@ fn a_refused_submit_falls_back_to_the_synchronous_decode() {
         "a refused job leaves no pending image"
     );
     assert_eq!(bitmap.rgba.len(), 16, "the bitmap holds its pixels");
+}
+
+/// A colour-keyed `Bitmap` load is deferred like an unkeyed one: the pool
+/// runs the key on the worker, the load returns with the probe size, and the
+/// first pixel read waits for the keyed pixels.
+///
+/// The reference passes the constructor's colour key to the load
+/// (`reference/cpp/core/visual/BitmapIntf.cpp:19-28`,
+/// `:98-105`) and applies it to the decoded scanlines, so the keyed pixel is
+/// transparent and every other pixel is opaque
+/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1068-1074`).
+#[test]
+fn a_deferred_colour_keyed_bitmap_load_applies_the_key_on_the_worker() {
+    let _lock = common::vm_lock();
+    let mut env = Env::with_pool(config());
+    env.scene.set_graphic_cache_limit(1024 * 1024);
+    env.run(&format!("var b = new Bitmap('picture.png', {COLOR_KEY});"));
+    let bitmap = env.scene.bitmaps.first().expect("the bitmap exists");
+    assert!(
+        bitmap.pending.is_some(),
+        "the colour-keyed load was deferred"
+    );
+    assert!(bitmap.rgba.is_empty(), "the pixels have not landed yet");
+
+    // The first pixel is the key and turns transparent; the second does not
+    // and keeps its alpha.
+    assert_eq!(
+        env.eval_int("b.getPixel(0, 0)"),
+        0x0001_0203,
+        "the keyed pixel is transparent"
+    );
+    assert_eq!(
+        env.eval_int("b.getPixel(1, 0)"),
+        0xFF04_0506,
+        "a different colour stays opaque"
+    );
+    let bitmap = env.scene.bitmaps.first().expect("the bitmap exists");
+    assert!(bitmap.pending.is_none(), "the pending image was resolved");
+    assert_eq!(bitmap.rgba[3], 0, "the keyed pixel's alpha is zero");
+    assert_eq!(
+        env._pool
+            .as_ref()
+            .expect("the pool is attached")
+            .stats()
+            .decodes,
+        1,
+        "the pool ran the keyed decode"
+    );
+
+    // The keyed image is the entry the load caches, under the keyed load key
+    // (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1952-1960`).
+    let key = DecodedImageKey::new("picture.png", COLOR_KEY, DecodedImageMode::Full, 0, 0);
+    let cached = env
+        .scene
+        .lookup_decoded_image(&key)
+        .expect("the keyed image is cached");
+    assert_eq!(cached.rgba[3], 0, "the cache holds the keyed image");
+
+    // A second keyed load is a cache hit: the same entry answers it, so the
+    // key is not applied a second time and no new decode runs.
+    env.run(&format!("var b2 = new Bitmap('picture.png', {COLOR_KEY});"));
+    assert_eq!(
+        env.eval_int("b2.getPixel(0, 0)"),
+        0x0001_0203,
+        "the cache hit installs the keyed image"
+    );
+    assert_eq!(
+        env._pool
+            .as_ref()
+            .expect("the pool is attached")
+            .stats()
+            .decodes,
+        1,
+        "the repeated keyed load did not decode the image again"
+    );
+}
+
+/// `Layer.loadImages` takes the same colour key and defers the same way: the
+/// layer's image size comes from the probe and the pending image holds the
+/// keyed decode until a read waits for it.
+///
+/// Reference `reference/cpp/core/visual/LayerIntf.cpp:2845-2855` (the key
+/// reaches the load), `:8429-8440` (the `loadImages` member), and
+/// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1068-1074` (the keyed
+/// scanline).
+#[test]
+fn a_deferred_colour_keyed_layer_load_applies_the_key_on_the_worker() {
+    let _lock = common::vm_lock();
+    let env = Env::with_pool(config());
+    env.run(&format!(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.setImageSize(10, 10); \
+         l.loadImages('picture.png', {COLOR_KEY});"
+    ));
+    assert_eq!(
+        env.eval_int("l.imageWidth"),
+        image().width as i64,
+        "the image width comes from the probe"
+    );
+    assert_eq!(
+        env.eval_int("l.imageHeight"),
+        image().height as i64,
+        "the image height comes from the probe"
+    );
+    assert!(
+        env.pending_layer().bitmap.is_some(),
+        "the layer's image is still decoding"
+    );
+
+    // The first pixel's alpha is the keyed zero; the second's is opaque.
+    assert_eq!(
+        env.eval_int("l.getMaskPixel(0, 0)"),
+        0,
+        "the keyed pixel is transparent"
+    );
+    assert_eq!(
+        env.eval_int("l.getMaskPixel(1, 0)"),
+        255,
+        "a different colour stays opaque"
+    );
+    let bitmap = env
+        .scene
+        .layers
+        .first()
+        .and_then(|layer| layer.bitmap)
+        .and_then(|id| env.scene.bitmap(id))
+        .expect("the layer's bitmap exists");
+    assert!(
+        bitmap.pending.is_none(),
+        "the pixel read resolved the keyed decode"
+    );
+    assert_eq!(bitmap.rgba[3], 0, "the keyed pixel's alpha is zero");
+}
+
+/// A province image smaller than the main image is tiled up to the main size,
+/// not rejected; only an image larger than the main image is a size mismatch.
+///
+/// Reference `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:980-1031`
+/// sizes the buffer to the requested destination and `:1092-1112` tiles the
+/// smaller image into it; `LayerIntf.cpp:2893-2914` checks the resulting
+/// province size against the main image.
+#[test]
+fn a_smaller_province_image_is_tiled_to_the_main_image() {
+    let _lock = common::vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.setImageSize(5, 5); \
+         l.loadProvinceImage('picture.png');",
+    );
+    // The plane is the main size, not the 2x2 image's.
+    assert_eq!(env.eval_int("l.provinceImageBufferPitch"), 5);
+    // The red channel of the 2x2 image (1 4 / 7 10) repeats across both axes;
+    // the last column and row are the partial tile, which the reference fills
+    // from the start of the source.
+    assert_eq!(env.eval_int("l.getProvincePixel(0, 0)"), 1);
+    assert_eq!(env.eval_int("l.getProvincePixel(1, 0)"), 4);
+    assert_eq!(env.eval_int("l.getProvincePixel(2, 0)"), 1);
+    assert_eq!(env.eval_int("l.getProvincePixel(3, 0)"), 4);
+    assert_eq!(env.eval_int("l.getProvincePixel(4, 0)"), 1);
+    assert_eq!(env.eval_int("l.getProvincePixel(0, 1)"), 7);
+    assert_eq!(env.eval_int("l.getProvincePixel(1, 1)"), 10);
+    assert_eq!(env.eval_int("l.getProvincePixel(0, 2)"), 1);
+    assert_eq!(env.eval_int("l.getProvincePixel(3, 3)"), 10);
+    assert_eq!(env.eval_int("l.getProvincePixel(4, 4)"), 1);
+}
+
+/// A province image larger than the main image raises the reference's size
+/// mismatch, and the failed load drops the plane instead of leaving the
+/// previous allocation behind.
+///
+/// Reference `reference/cpp/core/visual/LayerIntf.cpp:2893-2914`: allocation
+/// happens before the load and the catch deallocates it on any failure.
+/// `:2985-3002` writes the previous plane; `:2973-2982` and `:3042-3046`
+/// read it, so 7 and a pitch of 1 before the load and 0 after prove the drop.
+#[test]
+fn a_larger_province_image_raises_and_deallocates_the_plane() {
+    let _lock = common::vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.setImageSize(1, 1); \
+         l.setProvincePixel(0, 0, 7);",
+    );
+    // The layer already has a plane the failed load must not leave behind.
+    assert_eq!(env.eval_int("l.provinceImageBufferPitch"), 1);
+    assert_eq!(env.eval_int("l.getProvincePixel(0, 0)"), 7);
+    let error = env
+        .try_run("l.loadProvinceImage('picture.png');")
+        .expect_err("the larger province image is a size mismatch");
+    assert!(
+        error.contains("the province image is 2x2 but the main image is 1x1"),
+        "the failure names the mismatch: {error}"
+    );
+    // The failed load dropped the plane, so it no longer answers.
+    assert_eq!(env.eval_int("l.provinceImageBufferPitch"), 0);
+    assert_eq!(env.eval_int("l.getProvincePixel(0, 0)"), 0);
+    let layer = env.scene.layers.first().expect("the layer exists");
+    assert!(
+        layer.province.is_none(),
+        "a failed load drops the previous plane"
+    );
+}
+
+/// A load failure also drops the plane the allocation created: the catch
+/// covers every failure, not only the size mismatch.
+///
+/// Reference `reference/cpp/core/visual/LayerIntf.cpp:2893-2914`: the plane is
+/// allocated before the load and the catch deallocates it on any failure.
+/// `:2985-3002` writes the previous plane; `:2973-2982` and `:3042-3046`
+/// read it, so 7 and a pitch of 2 before the load and 0 after prove the drop.
+#[test]
+fn a_failed_province_load_drops_the_previous_plane() {
+    let _lock = common::vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.setImageSize(2, 2); \
+         l.setProvincePixel(0, 0, 7);",
+    );
+    assert_eq!(env.eval_int("l.provinceImageBufferPitch"), 2);
+    assert_eq!(env.eval_int("l.getProvincePixel(0, 0)"), 7);
+    let error = env
+        .try_run("l.loadProvinceImage('missing.png');")
+        .expect_err("a missing province image raises");
+    assert!(
+        error.contains("storage not found: missing.png"),
+        "the storage failure reaches the script: {error}"
+    );
+    assert_eq!(env.eval_int("l.provinceImageBufferPitch"), 0);
+    assert_eq!(env.eval_int("l.getProvincePixel(0, 0)"), 0);
+    let layer = env.scene.layers.first().expect("the layer exists");
+    assert!(layer.province.is_none(), "the failed load drops the plane");
 }

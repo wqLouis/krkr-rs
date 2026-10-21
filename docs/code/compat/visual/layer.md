@@ -89,9 +89,9 @@ calling thread — and the pixels still decoding:
   returned. A **probe** failure raises at the load, the way a load failure
   raises there.
 
-A load that carries a **colour key**, a **province** load
-(`loadProvinceImage`) and every load on a host with **no decode pool**
-decode synchronously, on the calling thread. The member details are in
+A **province** load (`loadProvinceImage`) and every load on a host with **no
+decode pool** decode synchronously, on the calling thread; a colour key is a
+worker pass and does not prevent deferral. The member details are in
 [`pixels.md`](pixels.md) §7.
 
 ### Visibility, opacity, blend and the draw face

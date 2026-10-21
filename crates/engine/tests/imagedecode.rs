@@ -174,6 +174,7 @@ fn submit(pool: &mut DecodePool, hint: &str) -> (JobId, PendingImage) {
         Arc::from(b"payload".as_slice()),
         Some(hint.to_string()),
         PIXELS.len() as u64,
+        None,
     )
     .expect("the job is accepted")
 }
@@ -412,6 +413,7 @@ fn the_frame_barrier_resolves_before_the_upload() {
             Arc::from(b"payload".as_slice()),
             Some("frame".to_string()),
             PIXELS.len() as u64,
+            None,
         )
         .expect("the job is accepted");
     let scene_ptr = engine.scene_mut() as *mut Scene;
@@ -556,6 +558,7 @@ fn a_job_whose_size_does_not_fit_is_refused() {
         Arc::from(b"payload".as_slice()),
         Some("huge".to_string()),
         u64::MAX,
+        None,
     );
     assert!(
         matches!(&refused, Err(DecodePoolError::SizeOverflow)),
@@ -638,6 +641,7 @@ fn a_resolved_deferred_decode_enters_the_image_cache() {
             Arc::from(b"payload".as_slice()),
             Some("cached".to_string()),
             PIXELS.len() as u64,
+            None,
         )
         .expect("the job is accepted");
     // The cache is enabled, so the resolved image is kept.
@@ -726,6 +730,144 @@ impl GameFrame for QueueCachedImage {
     }
 }
 
+/// A job's pass runs on the worker that decoded the image, and the pending
+/// image publishes its output rather than the raw decode.
+///
+/// The reference applies a load's colour key to the decoded scanlines before
+/// the image is installed
+/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1068-1074`), so the
+/// installation never sees the unkeyed pixels.
+#[test]
+fn a_job_pass_runs_on_the_worker_and_publishes_its_output() {
+    let decoder = Arc::new(GatedDecoder::new());
+    let mut pool = DecodePool::new(decoder.clone(), config(1)).expect("pool");
+    let gate = decoder.gate("keyed");
+    let pass_thread = Arc::new(Mutex::new(None));
+    let pass: Arc<dyn Fn(DecodedImage) -> Result<DecodedImage, String> + Send + Sync> = {
+        let pass_thread = Arc::clone(&pass_thread);
+        Arc::new(move |image: DecodedImage| {
+            *pass_thread.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some(thread::current().id());
+            let mut rgba = image.rgba;
+            for pixel in rgba.chunks_exact_mut(4) {
+                pixel[3] = 0;
+            }
+            Ok(DecodedImage::new(image.width, image.height, rgba))
+        })
+    };
+    let (_, pending) = pool
+        .submit(
+            Arc::from(b"payload".as_slice()),
+            Some("keyed".to_string()),
+            PIXELS.len() as u64,
+            Some(pass),
+        )
+        .expect("the job is accepted");
+    decoder.wait_for_started(1);
+    gate.open();
+    let image = match pending.await_ready() {
+        ImageOutcome::Ready(image) => image,
+        other => panic!("the decode succeeded, got {other:?}"),
+    };
+    let ran_on = pass_thread
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .expect("the pass ran");
+    assert_ne!(
+        ran_on,
+        thread::current().id(),
+        "the pass ran on the decode worker"
+    );
+    assert!(
+        image.rgba.chunks_exact(4).all(|pixel| pixel[3] == 0),
+        "the published pixels are the pass output"
+    );
+    assert_eq!(&image.rgba[..3], &PIXELS[..3], "the pass kept the colours");
+}
+
+/// A pass that refuses the pixels fails the job; the raw decode is never
+/// published.
+///
+/// The reference runs a load's pass over the decoded image before the image
+/// is used (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1068-1074`), so
+/// a refusal is the load's failure and never its raw pixels.
+#[test]
+fn a_failing_pass_fails_the_job() {
+    let decoder = Arc::new(GatedDecoder::new());
+    let mut pool = DecodePool::new(decoder.clone(), config(1)).expect("pool");
+    let gate = decoder.gate("bad-key");
+    let pass: Arc<dyn Fn(DecodedImage) -> Result<DecodedImage, String> + Send + Sync> =
+        Arc::new(|_image: DecodedImage| Err("the colour key is unusable".to_string()));
+    let (_, pending) = pool
+        .submit(
+            Arc::from(b"payload".as_slice()),
+            Some("bad-key".to_string()),
+            PIXELS.len() as u64,
+            Some(pass),
+        )
+        .expect("the job is accepted");
+    decoder.wait_for_started(1);
+    gate.open();
+    match pending.await_ready() {
+        ImageOutcome::Failed(message) => {
+            assert_eq!(message, "the colour key is unusable", "the pass's message");
+        }
+        other => panic!("the pass failed as expected, got {other:?}"),
+    }
+}
+
+/// The image a pass produced is what the pending resolution installs and
+/// caches: a deferred colour-keyed load leaves the keyed image under the load
+/// key, not the raw decode.
+///
+/// The reference stores the graphic in the cache after the load's own pass
+/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1952-1960`).
+#[test]
+fn a_resolved_pass_is_the_cached_image() {
+    let decoder = Arc::new(GatedDecoder::new());
+    let mut pool = DecodePool::new(decoder.clone(), config(1)).expect("pool");
+    let gate = decoder.gate("cached-key");
+    let key = DecodedImageKey::new("cached-key.png", 0x01_0203, DecodedImageMode::Full, 0, 0);
+    let pass: Arc<dyn Fn(DecodedImage) -> Result<DecodedImage, String> + Send + Sync> =
+        Arc::new(|image: DecodedImage| {
+            let mut rgba = image.rgba;
+            for pixel in rgba.chunks_exact_mut(4) {
+                pixel[3] = 7;
+            }
+            Ok(DecodedImage::new(image.width, image.height, rgba))
+        });
+    let (_, pending) = pool
+        .submit_cached(
+            key.clone(),
+            Arc::from(b"payload".as_slice()),
+            Some("cached-key".to_string()),
+            PIXELS.len() as u64,
+            Some(pass),
+        )
+        .expect("the job is accepted");
+    decoder.wait_for_started(1);
+    gate.open();
+
+    let mut scene = Scene::default();
+    scene.set_graphic_cache_limit(1024 * 1024);
+    let id = scene
+        .add_pending_bitmap(2, 2, pending)
+        .expect("the pending bitmap");
+    assert!(scene.resolve_bitmap(id));
+    let bitmap = scene.bitmap(id).expect("the bitmap");
+    assert!(
+        bitmap.rgba.chunks_exact(4).all(|pixel| pixel[3] == 7),
+        "the bitmap holds the pass output"
+    );
+    let cached = scene
+        .lookup_decoded_image(&key)
+        .expect("the cache holds the resolved image");
+    assert!(
+        cached.rgba.chunks_exact(4).all(|pixel| pixel[3] == 7),
+        "the cache holds the pass output, not the raw decode"
+    );
+}
+
 /// A deferred decode counts once in the pool's accounting, and resolving the
 /// image again does not count a second decode.
 #[test]
@@ -740,6 +882,7 @@ fn a_deferred_decode_counts_once_in_the_pool_accounting() {
             Arc::from(b"payload".as_slice()),
             Some("counted".to_string()),
             PIXELS.len() as u64,
+            None,
         )
         .expect("the job is accepted");
     decoder.wait_for_started(1);

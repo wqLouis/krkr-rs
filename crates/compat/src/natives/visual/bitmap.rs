@@ -5,7 +5,7 @@ use std::ffi::{c_char, c_int, c_void};
 use std::sync::Arc;
 
 use crate::engine_api::{
-    DecodedImageKey, DecodedImageMode, PendingImage, Scene, Storage, StorageReadError,
+    DecodePass, DecodedImageKey, DecodedImageMode, PendingImage, Scene, Storage, StorageReadError,
 };
 use api::media::{DecodedImage, ImageInfo};
 use tjs::{
@@ -168,6 +168,27 @@ fn make_alpha_from_key(rgba: &mut [u8], key: u32) {
     }
 }
 
+/// The pass a decode worker runs for a colour-keyed load, when the load has
+/// one: the key transformation over the decoded pixels.
+///
+/// The pass owns no frame-thread state, so it runs on the pool's worker with
+/// the decode it belongs to; the load installs the keyed pixels the worker
+/// produced.
+fn color_key_pass(colorkey: u32) -> Option<Arc<DecodePass>> {
+    if colorkey == COLOR_KEY_NONE {
+        return None;
+    }
+    Some(Arc::new(move |image: DecodedImage| {
+        if !image.is_consistent() {
+            return Err("the decoded image is malformed".to_string());
+        }
+        let (width, height) = (image.width, image.height);
+        let mut rgba = image.rgba;
+        apply_color_key(&mut rgba, width, colorkey);
+        Ok(DecodedImage::new(width, height, rgba))
+    }))
+}
+
 /// The metainfo dictionary returned by `Bitmap.load`/`Bitmap.loadAsync` (the
 /// game-visible `width`/`height`/`bpp` subset of the reference meta tags).
 fn metainfo_object(
@@ -322,9 +343,10 @@ fn install_decoded_image(
 /// Starts a pending decode for `name`, when the pool can take it.
 ///
 /// Returns the probed size and the future the result lands in, or `None` when
-/// the deferred path does not apply: no pool is attached, the load carries a
-/// colour key, the load is a province load, or the pool refused the job. The
-/// caller then decodes synchronously.
+/// the deferred path does not apply: no pool is attached, the load is a
+/// province load, or the pool refused the job. The caller then decodes
+/// synchronously. A colour key does not keep the load synchronous: the key is
+/// a pass over the decoded pixels, and the pool runs it on the worker.
 ///
 /// # Errors
 ///
@@ -337,10 +359,9 @@ pub(crate) fn start_pending_decode(
     colorkey: u32,
     mode: DecodedImageMode,
 ) -> Result<Option<(u32, u32, PendingImage)>, String> {
-    // The colour key and the province plane are passes over the decoded
-    // pixels, and they belong to this layer: the deferred path carries the
-    // decoded pixels unchanged.
-    if colorkey != COLOR_KEY_NONE || mode != DecodedImageMode::Full {
+    // The province plane is a separate target whose reads cannot wait for a
+    // decode, so only a full-colour image is deferred.
+    if mode != DecodedImageMode::Full {
         return Ok(None);
     }
     // Without a pool the load decodes synchronously.
@@ -366,7 +387,11 @@ pub(crate) fn start_pending_decode(
     let bytes: Arc<[u8]> = Arc::from(bytes);
     let hint = Some(resolved);
     let key = DecodedImageKey::new(name, colorkey, mode, 0, 0);
-    match pool.submit_cached(key, bytes, hint, expected) {
+    // A colour key is a pass over the decoded pixels: the worker applies it,
+    // so the frame thread never sees the unkeyed image and never runs the
+    // pass.
+    let pass = color_key_pass(colorkey);
+    match pool.submit_cached(key, bytes, hint, expected, pass) {
         Ok((_id, pending)) => Ok(Some((info.width, info.height, pending))),
         Err(error) => {
             // The pool refused the job: the load decodes synchronously, and
