@@ -285,6 +285,10 @@ pub(super) fn perspective_copy(
         .layer(dst_id)
         .and_then(|layer| layer.bitmap)
         .ok_or_else(|| "Layer.perspectiveCopy: this layer has no main image".to_string())?;
+    // The images may still be decoding: the pixels are not there yet, and
+    // every path that reads or writes them waits for the decode.
+    scene.resolve_bitmap(src_bitmap_id);
+    scene.resolve_bitmap(dst_bitmap_id);
     let source = scene
         .bitmap(src_bitmap_id)
         .cloned()

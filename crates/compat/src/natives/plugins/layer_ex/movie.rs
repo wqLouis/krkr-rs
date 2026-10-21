@@ -159,6 +159,12 @@ fn open_movie(ctx: &CompatCtx, layer_id: u32, filename: &str, alpha: bool) -> Re
     };
     {
         let scene = scene_mut(ctx)?;
+        // The layer's image may still be decoding: the pixels are not there
+        // yet, and the size change below preserves the decoded ones.
+        let bitmap_id = scene.layer(layer_id).and_then(|layer| layer.bitmap);
+        if let Some(bitmap_id) = bitmap_id {
+            scene.resolve_bitmap(bitmap_id);
+        }
         if !scene.set_layer_image_size(layer_id, movie_width, movie_height) {
             return Err("Layer.openMovie: could not allocate the movie image".to_string());
         }
@@ -310,6 +316,12 @@ fn copy_frame(ctx: &CompatCtx, slot: &MovieSlot) {
     let Ok(scene) = scene_mut(ctx) else {
         return;
     };
+    // The layer's image may still be decoding: the pixels are not there yet,
+    // and the copy writes into them.
+    let bitmap_id = scene.layer(slot.layer).and_then(|layer| layer.bitmap);
+    if let Some(bitmap_id) = bitmap_id {
+        scene.resolve_bitmap(bitmap_id);
+    }
     if !blit_frame_to_layer(scene, slot.layer, frame, slot.alpha) {
         log::warn!(
             "LayerExMovie: layer #{} has no image to copy into",

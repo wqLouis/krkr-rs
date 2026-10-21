@@ -648,6 +648,9 @@ fn with_layer<R>(
         .layer(layer_id)
         .and_then(|l| l.bitmap)
         .ok_or_else(|| format!("{method}: the layer has no main image"))?;
+    // The image may still be decoding: the pixels are not there yet, and
+    // every path that reads or writes them waits for the decode.
+    scene.resolve_bitmap(bitmap_id);
     let clip = layer_clip(scene, layer_id);
     let ctm = layer_draw.calc_transform();
     let update = layer_draw.update_when_draw;
@@ -1105,7 +1108,7 @@ fn image_snapshot(engine: *mut c_void, value: &Value, what: &str) -> Result<Bitm
     let object = host
         .retain_object_arg(value)
         .map_err(|error| format!("{what}: the image argument is not an object: {error}"))?;
-    let scene = super::scene_ref(&ctx)?;
+    let scene = super::scene_mut(&ctx)?;
     // The reference resolves the image argument with
     // `NativeInstanceSupport(TJS_NIS_GETINSTANCE, classid)`: a `Layer`
     // argument contributes its main image, a `Bitmap` argument itself.
@@ -1133,6 +1136,9 @@ fn image_snapshot(engine: *mut c_void, value: &Value, what: &str) -> Result<Bitm
     } else {
         id
     };
+    // The image may still be decoding: the pixels are not there yet, and
+    // every path that reads or writes them waits for the decode.
+    scene.resolve_bitmap(bitmap_id);
     scene
         .bitmap(bitmap_id)
         .cloned()
@@ -2006,6 +2012,9 @@ fn redraw_recording(engine: *mut c_void, objthis: *mut c_void) {
     let Some(bitmap_id) = scene.layer(layer_id).and_then(|layer| layer.bitmap) else {
         return;
     };
+    // The image may still be decoding: the pixels are not there yet, and
+    // the replay writes into them.
+    scene.resolve_bitmap(bitmap_id);
     let clip = layer_clip(scene, layer_id);
     let ctm = {
         let state = draw_state(&ctx);
