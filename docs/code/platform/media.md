@@ -172,7 +172,7 @@ The pure YUV conversion, used by the MediaCodec backend's
 
 ---
 
-## 5. The audio fallback chain
+## 5. The audio decode chain
 
 The built-in decoder (symphonia) has **no SBR synthesis**. An AAC track with
 the SBR extension (HE-AAC) declares the extension's rate (48 kHz) while the
@@ -181,12 +181,27 @@ speed.
 
 The built-in decoder **reports** that mismatch instead of approximating it:
 `open_audio` decodes the first packet, so the report happens at the open, as
-`MediaError::Unsupported`. The track is then handed to the platform's AAC
-decoder:
+`MediaError::Unsupported`. The platform's AAC decoder reconstructs the SBR
+band instead:
 
-| step | the decoder | entry point |
+| entry point | backend |
+|---|---|
+| `media::decode_audio_ffmpeg` (the `video-ffmpeg` feature, Linux) | FFmpeg's AAC decoder, which reconstructs the SBR band |
+| `media::decode_audio_mediacodec` (the `video-mediacodec` feature, Android) | the NDK `audio/mp4a-latm` decoder |
+
+**The host owns the order**, not L1:
+
+| build | first | fallback |
 |---|---|---|
-| 1 | the platform's AAC decoder, which reconstructs the SBR band | `media::decode_audio_ffmpeg` (the `video-ffmpeg` feature, Linux) / `media::decode_audio_mediacodec` (the `video-mediacodec` feature, Android) |
+| desktop (Linux) | the FFmpeg backend | the built-in decoder |
+| Android | the built-in decoder | the platform's AAC decoder |
+
+The desktop build decodes with FFmpeg first: it reconstructs the SBR band,
+so the tracks the built-in decoder reports are decoded at the rate the
+container declares. The built-in decoder stays in the chain because it
+**streams** — the container is probed at the open and the samples are decoded
+as playback reads them — so a track the FFmpeg backend cannot read still
+plays without holding the whole track in memory.
 
 The platform step materializes the **whole track** into interleaved `f32`;
 the caller plays the returned buffer. The Android path reuses the MediaCodec
@@ -194,17 +209,13 @@ backend's extractor, codec and audio state, so there is one implementation of
 the demux/decode loop; a decoder that cannot be created, configured or started
 is logged with the mime and the reason and reported as a typed error.
 
-**The host owns the choice**, not L1: the built-in decoder is tried first, so
-wav/ogg/opus/flac/mp3/aac-lc keep their streaming decode; when it fails the
-platform backend decodes the whole track and hands it to the mixer as a
-materialized source (the spec, the loop information and the frame seek stay
-intact); when the attempt fails the error names the reason. The chain lives in
-`crates/app/src/audio.rs` (`decode_with_platform_backend`), and the platform
-step is selected per target with `#[cfg(target_os = …)]`.
+The chain lives in `crates/app/src/audio.rs` (`decode_attempts` and
+`decode_with_attempts`), and the order is selected per target with
+`#[cfg(target_os = …)]`. When every backend in the chain fails, the error
+names each of them and the reason it gave, so neither is lost.
 
-The fallback materializes the whole track, so it costs the memory a
-whole-file decode costs. It is a fallback for tracks that cannot be played at
-all otherwise, not a general policy.
+The materialized step costs the memory a whole-file decode costs, and the
+desktop build pays it for every track it opens.
 
 ### The container's priming and channel count
 
@@ -333,8 +344,8 @@ overflowing, unsupported) is an error, not a truncated result.
   on the requested frame, the Ogg Vorbis and MP4/AAC fixtures (probe, decode
   to audible samples, streaming match), the truncated Ogg returning a typed
   error rather than silence, the undecodable Opus, the hint handling, the
-  garbage input, and the FFmpeg backend decoding the MP4/AAC fixture into
-  the format the container declares.
+  garbage input, and the FFmpeg backend decoding the Ogg Vorbis and the
+  MP4/AAC fixtures into the format the container declares.
 * `crates/platform/media/tests/bmp_encode.rs` — the BMP header and total
   length against the reference, the `bmp`/`bmp32` mode equivalence, the
   bottom-up BGRA body, the 24 bpp row padding, the 8 bpp palette and pitch,

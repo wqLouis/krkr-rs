@@ -26,17 +26,29 @@ The installation marks the mixer as render-driven and adds one decoder to
 the chain. The decoder owns a clone of the stateless `Media` backend and its
 own explicit decoder state.
 
-The built-in decoder **streams**: the container is probed when the sound is
-opened (sample rate, channels, total frames) and the samples are decoded as
-playback reads them.
+A track is decoded by a **chain** of backends, and the chain stops at the
+first backend that decodes it:
 
-A track the built-in decoder cannot handle falls back to the platform's media
-backend — FFmpeg on Linux, MediaCodec on Android. The fallback
-**materializes the whole track**, so playback seeks by frame without decoding
-again; the reason is a container whose declared rate the built-in decoder does
-not produce (an AAC track with the SBR extension), which would otherwise play
-at the wrong speed. When the attempt fails, the error names the reason, so it
-is not lost.
+| build | first | fallback |
+|---|---|---|
+| desktop (Linux) | the FFmpeg backend | the built-in decoder |
+| Android | the built-in decoder | the platform's AAC decoder (MediaCodec) |
+
+On the desktop the FFmpeg backend comes first: it reconstructs the SBR band
+of an AAC track with the SBR extension, so such a track decodes at the rate
+the container declares — the built-in decoder reports that track instead of
+playing it at the wrong speed. The FFmpeg path **materializes the whole
+track**, so playback seeks by frame without decoding again; the spec, the
+loop information and the frame seek stay intact.
+
+The built-in decoder stays in the chain because it **streams**: the container
+is probed when the sound is opened (sample rate, channels, total frames) and
+the samples are decoded as playback reads them. So a track the FFmpeg backend
+cannot read still plays without holding the whole track in memory. It is the
+Android build's first choice and the desktop build's fallback.
+
+When every backend in the chain fails, the error names each of them and the
+reason it gave, so neither is lost.
 
 `MediaAudioStream` is the L2 `SoundSource` view of a decoded track: it
 reports its spec, reads samples into the mixer's buffer and seeks by frame.
@@ -146,7 +158,9 @@ device that rejects the write is a typed error — never a silent frame.
 | `a_long_frame_does_not_carry_the_excess` | the excess is behind, not carried |
 | `a_different_cap_changes_the_advance` | the cap is the only bound |
 | `a_negative_frame_renders_only_the_carry` | a negative `dt` renders nothing |
-| `a_track_the_builtin_decoder_cannot_read_is_decoded_by_the_ffmpeg_backend` | the platform fallback works and materializes the track |
+| `a_track_the_builtin_decoder_cannot_read_is_decoded_by_the_ffmpeg_backend` | the FFmpeg backend reads a container the built-in decoder has no reader for |
+| `the_desktop_chain_decodes_an_ogg_track_with_the_ffmpeg_backend` | the desktop chain decodes with FFmpeg first, at the container's rate and channel count |
+| `the_fallback_decodes_a_wav_with_the_builtin_decoder` | a backend that cannot decode hands the track to the built-in decoder |
 | `a_track_neither_backend_can_decode_names_both_reasons` | neither reason is lost |
 
 ---
