@@ -2,9 +2,10 @@
 //! sequence through the L4 VM host, and drive the VM frame body together with
 //! the L2 engine frame.
 //!
-//! Loading is explicit: the caller
-//! supplies the `--archive` list and base directory; nothing scans a folder
-//! for `*.xp3` or `startup.tjs`. [`GameHost`] is the composition-root
+//! Loading starts from the base directory plus either an explicit `--archive`
+//! list or, when that list is empty, every `*.xp3` found under the base
+//! directory. The project path is chosen from that mount input; no folder is
+//! scanned for `startup.tjs`. [`GameHost`] is the composition-root
 //! counterpart of the empty-scene [`Host`]: it adds the VM host, the mounted
 //! game [`Storage`] and the ordered frame body, which it runs inside the
 //! engine's frame hook.
@@ -485,6 +486,13 @@ impl GameHost {
     /// read positionally per entry; use [`Self::open_with_preload`] to hold
     /// the archives in memory instead.
     ///
+    /// The project path is chosen from the mount input: for a directory launch
+    /// the conventional `data.xp3` when it mounted, else the archive holding
+    /// the boot scripts, else the base directory itself; for an explicit list
+    /// the archive holding the boot scripts, else the first named archive. A
+    /// relative `Storages.addAutoPath("system/")` therefore scopes to that
+    /// archive rather than to the folder.
+    ///
     /// # Errors
     ///
     /// Returns [`GameError`] when the audio device cannot be opened (typed,
@@ -535,9 +543,23 @@ impl GameHost {
                 &discovered,
                 MountOptions { preload_archives },
             )?;
-            // A directory launch is a folder project: the app directory is the
-            // current path, and the scanned archives are searched after it.
-            storage.set_project(&base_dir);
+            // A directory launch names no archive, so the project path is
+            // reconstructed from what the folder holds (`directory_project`).
+            // Only an archive that mounted can be the project: the project
+            // archive is opened on demand for a relative lookup, so one that
+            // failed to mount cannot serve a file.
+            let project = directory_project(
+                &base_dir,
+                &discovered,
+                |path| storage_has_boot_scripts(&storage, path),
+                |path| {
+                    let mounted = resolved_archive_path(&storage, path);
+                    storage
+                        .archive_paths()
+                        .any(|archive| archive == mounted.as_path())
+                },
+            );
+            storage.set_project(&project);
             storage
         } else {
             let mut storage = Storage::mount_archives_with(
@@ -546,7 +568,11 @@ impl GameHost {
                 &archives,
                 MountOptions { preload_archives },
             )?;
-            let project = explicit_project(&base_dir, &archives);
+            // The list is the launcher's own choice of archives; the project
+            // is the one that holds the boot scripts, else the first named.
+            let project = explicit_project(&base_dir, &archives, |path| {
+                storage_has_boot_scripts(&storage, path)
+            });
             storage.set_project(&project);
             storage
         });
@@ -821,17 +847,88 @@ fn log_startup(
     );
 }
 
-/// The project path for an explicit `--archive` list.
+/// The path an archive is mounted under.
 ///
-/// A single archive is the project: the launcher named that one. Two or more
-/// archives are a folder project, so the app directory is the current path and
-/// the mounts are searched after the auto paths; a later `patch.xp3` still
-/// overrides an earlier `data.xp3`.
-fn explicit_project(base_dir: &Path, archives: &[PathBuf]) -> PathBuf {
-    match archives {
-        [only] => only.clone(),
-        _ => base_dir.to_path_buf(),
+/// A relative path is resolved against the app directory, the same way the
+/// mount resolves it; an absolute path is used as given.
+fn resolved_archive_path(storage: &Storage, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        storage.game_dir().join(path)
     }
+}
+
+/// Whether the archive mounted at `path` holds the boot scripts
+/// (`startup.tjs` or `system/Initialize.tjs`).
+///
+/// The archive entry lookup is case-insensitive, so either spelling finds the
+/// same entry. A relative `path` is resolved against the app directory, the
+/// same way the mount resolves it; a path that is not one of the mounted
+/// archives holds no boot scripts.
+fn storage_has_boot_scripts(storage: &Storage, path: &Path) -> bool {
+    let path = resolved_archive_path(storage, path);
+    let mut found = false;
+    storage.for_each_archive(|mounted, archive| {
+        if mounted == path.as_path()
+            && (archive.entry("startup.tjs").is_some()
+                || archive.entry("system/Initialize.tjs").is_some())
+        {
+            found = true;
+        }
+    });
+    found
+}
+
+/// The project path for a directory-only launch.
+///
+/// The project decides whether a relative auto path resolves inside an archive
+/// (`Storages.addAutoPath("system/")` searches the project archive's
+/// `system/`) or on disk, so a launch that mounts archives needs one of them as
+/// the project. A directory launch names no archive, so the path is
+/// reconstructed: the conventional `data.xp3` when it mounted, else the archive
+/// that holds the boot scripts, else the folder itself.
+///
+/// Only a mounted archive can be the project. The project archive is opened on
+/// demand for a relative lookup, so an archive that failed to mount cannot
+/// serve a file and must not be named; `is_mounted` reports which of the
+/// discovered archives are mounted.
+fn directory_project(
+    base_dir: &Path,
+    discovered: &[PathBuf],
+    contains_boot_scripts: impl Fn(&Path) -> bool,
+    is_mounted: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    if let Some(data) = discovered.iter().find(|path| {
+        path.file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("data.xp3"))
+            && is_mounted(path)
+    }) {
+        return data.clone();
+    }
+    if let Some(archive) = discovered.iter().find(|path| contains_boot_scripts(path)) {
+        return archive.clone();
+    }
+    base_dir.to_path_buf()
+}
+
+/// The project path for an explicit `--archive` list: the archive holding the
+/// boot scripts, else the first named archive, else the directory.
+///
+/// The mount order and precedence are unchanged: every named archive is still
+/// mounted in order and a later mount still overrides an earlier one outside
+/// the project archive.
+fn explicit_project(
+    base_dir: &Path,
+    archives: &[PathBuf],
+    contains_boot_scripts: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    archives
+        .iter()
+        .find(|path| contains_boot_scripts(path))
+        .or_else(|| archives.first())
+        .cloned()
+        .unwrap_or_else(|| base_dir.to_path_buf())
 }
 
 /// The `.tpm` plugin files the reference auto-loads, in ASCII filename order.
@@ -1310,26 +1407,276 @@ mod tests {
         assert_eq!(translate_event(None, &key), key);
     }
 
+    /// A directory launch names no archive, so the project path is
+    /// reconstructed. The conventional boot archive `data.xp3` wins even
+    /// though discovery sorts `bgimage.xp3` before it.
+    // The reference only asks whether the project path is a storage and
+    // appends the archive delimiter when it is
+    // (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`).
+    #[test]
+    fn directory_project_prefers_data_xp3() {
+        let base = Path::new("/game");
+        let discovered = [
+            PathBuf::from("/game/bgimage.xp3"),
+            PathBuf::from("/game/data.xp3"),
+        ];
+        assert_eq!(
+            directory_project(base, &discovered, |_| false, |_| true),
+            PathBuf::from("/game/data.xp3")
+        );
+    }
+
+    /// The conventional name is matched without regard to case.
+    #[test]
+    fn directory_project_matches_the_data_name_case_insensitively() {
+        let base = Path::new("/game");
+        let discovered = [PathBuf::from("/game/DATA.XP3")];
+        assert_eq!(
+            directory_project(base, &discovered, |_| false, |_| true),
+            PathBuf::from("/game/DATA.XP3")
+        );
+    }
+
+    /// A `data.xp3` that did not mount is not the project: the archive that
+    /// holds the boot scripts and did mount takes its place.
+    // The reference appends the archive delimiter to the project path only
+    // when that path is a storage
+    // (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`), so a path
+    // that names no readable archive cannot be one.
+    #[test]
+    fn directory_project_skips_a_data_archive_that_did_not_mount() {
+        let base = Path::new("/game");
+        let discovered = [
+            PathBuf::from("/game/data.xp3"),
+            PathBuf::from("/game/bbb.xp3"),
+        ];
+        assert_eq!(
+            directory_project(
+                base,
+                &discovered,
+                |path| path.ends_with("bbb.xp3"),
+                |path| !path.ends_with("data.xp3"),
+            ),
+            PathBuf::from("/game/bbb.xp3")
+        );
+    }
+
+    /// Without `data.xp3`, the archive that holds the boot scripts is the
+    /// project.
+    #[test]
+    fn directory_project_falls_back_to_the_boot_script_archive() {
+        let base = Path::new("/game");
+        let discovered = [
+            PathBuf::from("/game/aaa.xp3"),
+            PathBuf::from("/game/bbb.xp3"),
+        ];
+        assert_eq!(
+            directory_project(
+                base,
+                &discovered,
+                |path| path.ends_with("bbb.xp3"),
+                |_| true,
+            ),
+            PathBuf::from("/game/bbb.xp3")
+        );
+    }
+
+    /// With no boot archive, the directory is the folder project.
+    #[test]
+    fn directory_project_falls_back_to_the_folder() {
+        let base = Path::new("/game");
+        assert_eq!(
+            directory_project(base, &[], |_| false, |_| true),
+            base.to_path_buf()
+        );
+    }
+
+    /// A `data.xp3` that did not mount and holds no boot archive leaves the
+    /// folder as the project.
+    #[test]
+    fn directory_project_falls_back_to_the_folder_when_data_did_not_mount() {
+        let base = Path::new("/game");
+        let discovered = [PathBuf::from("/game/data.xp3")];
+        assert_eq!(
+            directory_project(base, &discovered, |_| false, |_| false),
+            base.to_path_buf()
+        );
+    }
+
+    /// A directory launch whose conventional `data.xp3` cannot be mounted
+    /// keeps the folder as the project, so the loose files next to it stay
+    /// reachable.
+    ///
+    /// The project archive is opened on demand for a relative lookup, so an
+    /// archive that failed to mount fails the lookup instead of serving the
+    /// file. The reference asks the same question of the project path — is it
+    /// a storage? — and appends the archive delimiter when it is
+    /// (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`).
+    #[test]
+    fn directory_launch_skips_an_unmountable_data_archive() {
+        let _lock = vm_lock();
+        let base = unique_temp_dir("unmountable-data");
+        std::fs::create_dir_all(&base).expect("game dir");
+        std::fs::write(base.join("data.xp3"), b"not an xp3 archive").expect("corrupt archive");
+        std::fs::write(base.join("startup.tjs"), "// no-op startup\n").expect("startup script");
+        let host = crate::Host::new(crate::HostConfig::headless()).expect("headless host");
+        let game = GameHost::open(host, Vec::new(), base.clone())
+            .expect("the folder project reaches the loose startup script");
+        assert_eq!(
+            game.storage().archive_count(),
+            0,
+            "the archive that failed to mount is not mounted"
+        );
+        drop(game);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The boot-script predicate reads the mounted archives: an archive with
+    /// `startup.tjs` holds the boot script, an archive with only
+    /// `system/Initialize.tjs` holds the fallback, and an archive with neither
+    /// holds neither. A relative archive path resolves against the app
+    /// directory, the way the mount resolves it.
+    ///
+    /// The reference checks an archive for the boot script by the normalized
+    /// entry name (`reference/cpp/core/base/impl/StorageImpl.cpp:562-590`),
+    /// and runs `system/Initialize.tjs` when `startup.tjs` is absent
+    /// (`reference/cpp/core/base/ScriptMgnIntf.cpp:958-965`).
+    #[test]
+    fn storage_has_boot_scripts_reads_the_mounted_archives() {
+        let base = unique_temp_dir("boot-scripts");
+        std::fs::create_dir_all(&base).expect("game dir");
+        assert!(base.is_absolute(), "the app directory is absolute");
+        let startup = base.join("startup.xp3");
+        let initialize = base.join("initialize.xp3");
+        let plain = base.join("plain.xp3");
+        std::fs::write(
+            &startup,
+            testkit::build_xp3(&[("startup.tjs", b"// startup\n", false)]),
+        )
+        .expect("write the startup archive");
+        std::fs::write(
+            &initialize,
+            testkit::build_xp3(&[("system/Initialize.tjs", b"// initialize\n", false)]),
+        )
+        .expect("write the initialize archive");
+        std::fs::write(
+            &plain,
+            testkit::build_xp3(&[("readme.txt", b"nothing to boot\n", false)]),
+        )
+        .expect("write the plain archive");
+
+        let storage = Storage::mount_archives(
+            FileSystem::host(base.clone()),
+            base.clone(),
+            [&startup, &initialize, &plain],
+        )
+        .expect("mount the archives");
+
+        assert!(
+            storage_has_boot_scripts(&storage, &startup),
+            "an archive with startup.tjs holds the boot script"
+        );
+        assert!(
+            storage_has_boot_scripts(&storage, &initialize),
+            "an archive with only system/Initialize.tjs holds the fallback"
+        );
+        assert!(
+            !storage_has_boot_scripts(&storage, &plain),
+            "an archive with neither holds no boot script"
+        );
+        assert!(
+            storage_has_boot_scripts(&storage, Path::new("startup.xp3")),
+            "a relative archive path resolves against the app directory"
+        );
+        assert!(
+            !storage_has_boot_scripts(&storage, Path::new("plain.xp3")),
+            "a relative archive path resolves against the app directory"
+        );
+        assert!(
+            !storage_has_boot_scripts(&storage, Path::new("missing.xp3")),
+            "an archive that is not mounted holds no boot script"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A directory launch with only `boot.xp3` uses it as the project: the
+    /// relative name resolves inside the project archive, ahead of the loose
+    /// file with the same name.
+    ///
+    /// The reference makes the project path the current directory and appends
+    /// the archive delimiter when that path is a storage
+    /// (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`), so the
+    /// current directory is the archive and its files shadow the app path.
+    #[test]
+    fn directory_launch_uses_the_boot_archive_as_the_project() {
+        let _lock = vm_lock();
+        let base = unique_temp_dir("boot-archive-project");
+        std::fs::create_dir_all(&base).expect("game dir");
+        std::fs::write(
+            base.join("boot.xp3"),
+            testkit::build_xp3(&[
+                ("startup.tjs", b"var booted = 1;\n", false),
+                ("marker.txt", b"archive\n", false),
+            ]),
+        )
+        .expect("write the boot archive");
+        // The same name on disk: the project archive is searched first.
+        std::fs::write(base.join("marker.txt"), b"disk\n").expect("loose marker");
+
+        let host = crate::Host::new(crate::HostConfig::headless()).expect("headless host");
+        let game = GameHost::open(host, Vec::new(), base.clone()).expect("open game");
+        let location = game.storage().find("marker.txt").expect("find the marker");
+        assert!(
+            matches!(location, Some(engine::storage::Location::Archive(_, _))),
+            "the project archive serves the relative name, got {location:?}"
+        );
+        match game.vm().eval("booted", "t").expect("eval `booted`") {
+            tjs::TjsValue::Integer(1) => {}
+            other => panic!("expected Integer 1 for `booted`, got {other:?}"),
+        }
+        drop(game);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A single explicit archive is the project.
     #[test]
     fn explicit_project_uses_the_named_archive() {
         let base = Path::new("/game");
         let archives = [PathBuf::from("/game/extra.xp3")];
         assert_eq!(
-            explicit_project(base, &archives),
+            explicit_project(base, &archives, |_| false),
             PathBuf::from("/game/extra.xp3")
         );
     }
 
-    /// Two or more explicit archives are a folder project: the app directory is
-    /// the current path and the later mount still wins among the archives.
+    /// An explicit list prefers the archive that holds the boot scripts, not
+    /// the first one named.
     #[test]
-    fn explicit_project_uses_the_folder_for_several_archives() {
+    fn explicit_project_prefers_the_boot_script_archive() {
         let base = Path::new("/game");
         let archives = [
             PathBuf::from("/game/data.xp3"),
             PathBuf::from("/game/patch.xp3"),
         ];
-        assert_eq!(explicit_project(base, &archives), base.to_path_buf());
+        assert_eq!(
+            explicit_project(base, &archives, |path| path.ends_with("patch.xp3")),
+            PathBuf::from("/game/patch.xp3")
+        );
+    }
+
+    /// When no named archive holds the boot scripts, the first named archive
+    /// is the project.
+    #[test]
+    fn explicit_project_falls_back_to_the_first_archive() {
+        let base = Path::new("/game");
+        let archives = [
+            PathBuf::from("/game/data.xp3"),
+            PathBuf::from("/game/patch.xp3"),
+        ];
+        assert_eq!(
+            explicit_project(base, &archives, |_| false),
+            PathBuf::from("/game/data.xp3")
+        );
     }
 }

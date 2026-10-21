@@ -276,12 +276,14 @@ locations, and the complete list at `trace`.
   the auto paths, with later mounts winning; a script auto path therefore
   overrides a non-project mount, as the reference's later-added auto path
   would.
-* **The project path for a directory launch is the folder.** The D35 scan
-  mounts the discovered archives, but a directory launch stays a folder
-  project, as in the reference. The tension: a relative
-  `Storages.addAutoPath("system/")` resolves against the folder, not inside a
-  mounted archive; an archive-only game that relies on the archive current
-  path must be launched with that archive explicitly (one `--archive`).
+* **The project path of a directory launch is reconstructed.** The D35 scan
+  mounts the discovered archives, and the root rebuilds the project from what
+  the scanned folder holds: the conventional `data.xp3` when it mounted, else
+  the archive with the boot scripts, else the folder. An explicit archive list
+  takes the archive with the boot scripts, else the first named one. A
+  relative `Storages.addAutoPath("system/")` resolves against that project, so
+  it scopes to the project archive; a folder project resolves it against the
+  app directory.
 * **`Storages.getFullPath` / `getPlacedPath`** return a normalized relative
   name or `arc>entry`, not the reference's full `file://domain/path` — the
   script-facing shape is L3's.

@@ -178,6 +178,7 @@ dependencies = [
  "platform",
  "raw-window-handle",
  "render",
+ "testkit",
  "thiserror 2.0.20",
  "tjs",
  "vm",

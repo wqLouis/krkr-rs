@@ -41,3 +41,6 @@ media = { path = "../platform/media", default-features = false, features = ["vid
 
 [dev-dependencies]
 tjs = { workspace = true }
+# The shared test helper builds the synthetic XP3 archives the storage tests
+# mount; it is a workspace member, not an external dependency.
+testkit = { workspace = true }

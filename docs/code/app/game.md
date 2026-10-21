@@ -56,8 +56,8 @@ ordered, and every step of it matters:
    list means a **directory launch**, and the root then discovers every
    `*.xp3` under the base directory and mounts the discovered list. The
    discovered order and the precedence are L2's contract.
-3. **The project path.** `storage.set_project(...)` records which path the
-   launcher named as the project — see §3.
+3. **The project path.** `storage.set_project(...)` records the project path
+   chosen from the mount input — see §3.
 4. **The L2 service attachment.** The scene, the storage, the timer registry
    and the input state are handed to the compat surface *before* the
    surface is installed. The order is not cosmetic: a plugin may read a
@@ -88,22 +88,21 @@ whether it is an archive or a folder. The root reconstructs it:
 
 | launch | project path |
 |---|---|
-| directory (D35 scan, loose or archive-only) | the directory (folder project) |
-| a single `--archive` | that archive (archive project) |
-| two or more `--archive` entries | the directory (folder project) |
+| directory (D35 scan, loose or archive-only) | the conventional `data.xp3` when it mounted, else the scanned archive with the boot scripts, else the directory (folder project) |
+| an explicit `--archive` list | the named archive with the boot scripts, else the first named archive (archive project) |
 
 The "boot scripts" are `startup.tjs` and `system/Initialize.tjs` (an archive
-entry lookup is case-insensitive, so either spelling finds the same
-entry). A single archive is the reference's archive launch; a directory launch
-is always a folder project, as in the reference; several archives model the
-reference's folder launch with the archives in the auto-path table, so a later
-`patch.xp3` still overrides an earlier `data.xp3`.
+entry lookup is case-insensitive, so either spelling finds the same entry).
+The conventional `data.xp3` is matched without regard to case as well, and
+only when that archive mounted: an archive that failed to mount is skipped as
+a project candidate; the app cannot use it as the project archive, and the
+next candidate is used. The project archive is searched first, so a later
+`patch.xp3` overrides an earlier `data.xp3` only when `data.xp3` is not the
+project.
 
-The D35 directory scan mounts archives but does not make one of them the
-project. A relative `Storages.addAutoPath("system/")` therefore resolves
-against the folder, not inside a mounted archive; that is the reference
-folder-launch behaviour. A game that relies on the archive current path must
-be launched with that archive explicitly (one `--archive`).
+A relative `Storages.addAutoPath("system/")` resolves against the project
+path, so it scopes to the project archive when the launch names one and to
+the app directory when the project is the folder.
 
 ---
 
@@ -263,13 +262,28 @@ nothing, the first frame emits nothing, the line names the previous frame
 and balances the gap, and a later frame replaces the attribution), the
 `.tpm` scan (regular files only, from the three directories, in ASCII name
 order, with a missing directory tolerated), the project-path choice (the
-`data.xp3` preference, the boot-script archive, the folder fallback, the
-explicit list), the input mapping (a pointer and a touch mapped into VM
-pixels, a key passed through), and the service-attachment order (the
-`xp3filter` seam is installed by `GameHost::open`).
+`directory_project` and `explicit_project` cases: the conventional `data.xp3`,
+its case-insensitive spelling, an unmounted `data.xp3` skipped for the
+boot-script archive, the boot-script archive, the folder fallback, an
+unmounted `data.xp3` leaving the folder as the project, the explicit named
+archive, the explicit boot-script archive, and the explicit first named
+archive), the input mapping (a pointer and a touch mapped into VM pixels, a
+key passed through), and the service-attachment order (the `xp3filter` seam is
+installed by `GameHost::open`).
 
-The integration test `step_runs_the_game_hook_inside_the_engine_frame` in
-`crates/app/tests/host.rs` drives the production path: a script installs a
+The project-path tests that drive a real launch live in
+`crates/app/src/game.rs`: `storage_has_boot_scripts_reads_the_mounted_archives`
+mounts real XP3 bytes and reads the boot scripts out of them (`startup.tjs`,
+`system/Initialize.tjs`, neither, and a relative archive path);
+`directory_launch_skips_an_unmountable_data_archive` opens a game whose
+`data.xp3` is not an archive, so the archive fails to mount, the folder stays
+the project, and the loose `startup.tjs` next to it still runs; and
+`directory_launch_uses_the_boot_archive_as_the_project` opens a game whose only
+archive holds the boot script, and checks that the relative name resolves
+inside that project archive rather than the loose file beside it.
+
+The unit test `step_runs_the_game_hook_inside_the_engine_frame` in
+`crates/app/src/game.rs` drives the production path: a script installs a
 timer, and the counter only advances because the engine frame ran the
 host's hook.
 
