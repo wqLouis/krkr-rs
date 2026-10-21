@@ -65,7 +65,7 @@ return `0`. `setMainPixel` and `setMaskPixel` set `imageModified`.
 | Member | Behaviour |
 |---|---|
 | `independProvinceImage([copy])` | allocates the layer's 8-bit province plane; the default keeps the existing content, `copy = false` clears it. |
-| `loadImages(name[, key])` | reads and decodes the storage image and installs it as the layer's main image. Returns `null` — the reference's absent metainfo. |
+| `loadImages(name[, key])` | reads and probes the storage image, queues the decode in the L2 pool when possible, and installs it as the layer's main image (a pending bitmap until the pixels land). Returns `null` — the reference's absent metainfo. |
 | `loadProvinceImage(name)` | loads an 8-bit province plane whose size **must** equal the main image's size. The **red channel** of every pixel becomes the province value. |
 | `saveLayerImage(name[, type])` | encodes the main image through the host encoder and writes it through the storage. `type` defaults to `"bmp"`. |
 | `drawText(x, y, text, color[, opacity[, antialias[, shadowLevel[, shadowColor[, shadowWidth[, shadowOffsetX[, shadowOffsetY]]]]]]])` | rasterizes a text run into the layer's main image. |
@@ -244,7 +244,11 @@ A `Bitmap` passed to a Layer-only member raises
    argument keeps the default.
 2. The load goes through the scene's **decoded-image cache**, keyed by
    (name, colour key, mode, 0, 0), so a repeated load of the same file
-   decodes once.
+   decodes once. A cache miss reads the storage and probes the header on
+   the calling thread, then queues the decode in the L2 pool and installs a
+   pending bitmap with the probed size; the pixels land when the scene
+   resolves it. A colour-keyed or province load, a load with no pool and a
+   refused job decode synchronously.
 3. The storage read tries the **plain name first**; only on a miss are the 21
    common image extensions probed in order (`.webp .bmp .dib .jpeg .jpg .jif
    .png .tlg .tlg5 .tlg6 .gif .tif .tiff .tga .dds .pnm .ico .qoi .hdr .exr

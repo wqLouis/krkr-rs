@@ -47,6 +47,7 @@ its tests.
 |---|---|---|---|
 | `engine` | `src/engine.rs` | the frame-owning object: scene, projection, textures, timers, presentation | [engine.md](engine.md) |
 | `scene` | `src/scene.rs` | the logical layer tree: windows, layers, bitmaps, fonts, focus domains | [scene.md](scene.md) |
+| `imagedecode` | `src/imagedecode.rs` | the deferred image decode pool and its pending-image future | [scene.md](scene.md#the-pending-image) |
 | `projection` | `src/projection.rs` | the pure field copy from the logical tree to the L1 `RenderScene` | [projection.md](projection.md) |
 | `translate` | `src/translate.rs` | the VM-pixel ↔ device-pixel mapping (Fit with letterbox) | [translate.md](translate.md) |
 | `layer_ops` | `src/layer_ops.rs` | in-place CPU pixel operations on bitmaps (fills, blits, blur, subtree compositing) | [layer_ops.md](layer_ops.md) |

@@ -12,7 +12,8 @@ reads them back.
 maintain the id → index lookup tables, the sibling ordering, the focus domains
 and the subtree-cache bookkeeping; keep two monotonic revisions so a consumer
 can tell a structural change from a content change; own the decoded-image
-cache (the reference's graphic cache).
+cache (the reference's graphic cache) and the pending images — the bitmaps
+whose pixels are still being decoded.
 
 The module is backend-free: it knows nothing about rendering, script objects
 or native registration. The field-level description of the tree and the draw
@@ -52,7 +53,7 @@ projected scene.
 | `WindowState` | the client size, visibility, opacity, the primary layer, the focus domains and their focus, and the window's layer list |
 | `LayerState` | the parent/child links, the focus domain, the rect, visibility, opacity, the generic `BlendMode`, the sibling sort key, the image placement, the province plane, the hit-test mode, the clip rect, the focus and hint properties, the cache slots (`cache_bitmap`, `cache_content`, `transition_self`, `transition_frame`, `cache_enabled_count`, `cache_recalc`) and the `pending_paint` / `shutdown` flags |
 | `TransitionFrame` / `TransitionSource` | the frame a composited transition draws on a layer: its pixel size, whether it covers the layer rect, and the two source draws (`bitmap`, `src`, `dst`, `alpha`) |
-| `BitmapState` | the RGBA8 pixels, the dimensions, the dirty flag, the script-ownership flag and the `content_generation` counter |
+| `BitmapState` | the RGBA8 pixels, the dimensions, the dirty flag, the script-ownership flag, the `content_generation` counter and the pending decode (`pending`) |
 | `FontState` | the requested face, height, colour and the style flags |
 | `Rect` | a window-coordinate rectangle (`x`, `y`, `w`, `h`) |
 | `DecodedImageKey` / `DecodedImageMode` | the cache key of one decoded image and its load variant (`Full` / `Province`) |
@@ -104,15 +105,45 @@ sibling reference is left dangling.
 `remove_bitmap`, `release_bitmap`, `release_script_bitmap`,
 `collect_unused_bitmaps`, `bitmap_referenced_by_layer`, `set_bitmap_clean`.
 
+### The pending image
+
+A bitmap whose pixels are still being decoded carries the decode future in
+`BitmapState::pending`.
+
+| method | what it does |
+|---|---|
+| `add_pending_bitmap(width, height, pending)` | adds a bitmap with the probed size and no pixels, and returns its id. `ImageSizeError::TooLarge` when the pixel count is not representable. |
+| `set_pending_image(id, width, height, pending)` | puts a pending decode on an existing bitmap and cancels the one it carried. |
+| `pending_image(id)` | the bitmap's pending future, or `None` when it holds its pixels. |
+| `resolve_bitmap(id)` | waits for one bitmap's pending image and installs its pixels; a successful decode is also stored in the decoded-image cache under the key the load named. |
+| `resolve_pending_images()` | waits for every pending image and installs the pixels; returns how many it resolved. |
+
+`resolve_bitmap` **waits on that image alone**, never on the pool. It marks
+the image *demanded* first, so a worker takes it before the ordinary jobs in
+the queue. The outcome decides what lands:
+
+| outcome | what is installed |
+|---|---|
+| the decoded pixels | the pixels, when their length matches the probed size; otherwise a blank, and the mismatch is logged |
+| a failure | a fully transparent blank of the probed size, and the failure is logged |
+| a cancellation | a fully transparent blank of the probed size, and the cancellation is logged |
+
+None of the three raises: the load that queued the decode already returned.
+
 ### Fonts
 
 `add_font`, `reset_font`, `font`.
 
 ### The decoded-image cache
 
-`cached_decoded_image`, `graphic_cache_limit`, `decoded_image_cache_limit`,
-`set_graphic_cache_limit`, `set_decoded_image_cache_limit`,
-`clear_decoded_image_cache`.
+`cached_decoded_image`, `lookup_decoded_image`, `graphic_cache_limit`,
+`decoded_image_cache_limit`, `set_graphic_cache_limit`,
+`set_decoded_image_cache_limit`, `clear_decoded_image_cache`.
+
+`lookup_decoded_image` is the cache lookup a caller that may **defer** the
+decode uses: it looks the entry up, marks it most recently used and returns
+an **owned copy** of the pixels, exactly as `cached_decoded_image` does on a
+hit. The caller decodes only on a miss.
 
 ---
 
@@ -158,6 +189,18 @@ sibling reference is left dangling.
 * **A script-owned bitmap outlives the layer that shows it.** `script_owned`
   marks a bitmap a script `Bitmap` object owns; destroying the layer must not
   free it.
+* **A pending bitmap carries the probed size and no pixels.** The size comes
+  from the header probe, so it is known before the decode finishes; the pixels
+  arrive when the scene resolves the image, and every read of the pixels waits
+  for that resolution.
+* **A pending decode is cancelled when it is superseded.** Replacing the
+  bitmap's image, giving it a new pending decode or removing it cancels the
+  decode it carried; a size change resolves it first, so the decoded overlap
+  is what the resize preserves and a waiter sees the cancellation instead of
+  stale pixels.
+* **A failed decode installs a blank, not an exception.** The bitmap keeps the
+  probed size and every pixel becomes transparent; the failure is logged. The
+  load that queued the decode already returned, so there is no call to fail.
 * **`set_bitmap_clean` does not move the structure revision.** Clearing a
   renderer-internal dirty flag is not a scene change.
 * **The decoded-image cache is disabled by default**, matching the reference's
@@ -200,6 +243,27 @@ Scene  ──► projection::project_scene_report ──► RenderScene (VM pixe
 `content_generation`, which the subtree-cache bookkeeping sums to detect an
 image edit that did not go through a layer accessor.
 
+### The pending-image path
+
+A load whose decode the L2 pool took installs a **pending** bitmap: the
+probed size, no pixels, and the decode future in `BitmapState::pending`.
+
+```
+L3 native (Layer.loadImages / Bitmap.load)
+   │  read the bytes, probe the header      ── on the calling thread
+   ▼
+DecodePool::submit ──► pending image (the future)
+   │
+   ▼
+Scene::add_pending_bitmap / set_pending_image   (probed size, no pixels)
+   │
+   ├──► Scene::resolve_bitmap        ── a pixel read waits for the future
+   └──► Scene::resolve_pending_images ── the frame barrier waits for them all
+   │
+   ▼
+the decoded pixels land in the bitmap  (or a transparent blank, on a failure)
+```
+
 ---
 
 ## 5. Failure modes
@@ -212,6 +276,12 @@ image edit that did not go through a layer accessor.
   `internal_set_image_size`) return `false` when the requested size cannot be
   represented or allocated; L3 turns that into a script error.
 * `cached_decoded_image` returns the decoder's own error unchanged.
+* `add_pending_bitmap` returns `ImageSizeError::TooLarge` when the probed
+  size's pixel count is not representable; the caller then decodes
+  synchronously and uses `add_bitmap`.
+* A pending decode that failed, was cancelled or produced a size that
+  disagrees with the probe installs a transparent blank and logs the cause.
+  It never raises and never leaves a bitmap without pixels.
 * A `*_mut` accessor over-approximates: it bumps the revision even when the
   caller writes the same value. That only costs a resync.
 * The hit-test and focus walks are bounded by the layer count, so a cyclic
@@ -224,8 +294,14 @@ image edit that did not go through a layer accessor.
 * **`BitmapState` carries no dirty region**, so a full-frame upload cannot be
   narrowed without a cross-cutting change.
 * **The decoded-image cache is consulted on every load but is disabled by the
-  reference default** (`System.graphicCacheLimit = 0`), and the decode itself
-  is synchronous on the VM thread.
+  reference default** (`System.graphicCacheLimit = 0`).
+* **A deferred decode enters the decoded-image cache.** The synchronous
+  path and the pending-image path store through the same insert, under the
+  same key, with the same LRU and byte accounting. A failed, cancelled or
+  malformed decode stores nothing.
+* **The frame waits for the images it loaded.** The image barrier blocks the
+  frame until every pending decode has landed, so the decodes overlap with
+  each other but not with the frame that waits for them.
 * **`Layer.face` is not read** by the steady-state projection: a
   `dfMask`/`dfProvince` layer is faithful only during a transition.
 * **Masks and province images are not emitted** by the projection; `hold_alpha`
@@ -244,9 +320,17 @@ image edit that did not go through a layer accessor.
   domains, hit-testing, cache counts, province images.
 * `crates/engine/tests/bitmap.rs` — the bitmap lifetime and the pixel
   buffers.
+* `crates/engine/tests/imagedecode.rs` — the decode pool: the workers, the
+  queue, the byte accounting, the demanded-job order and the outcomes a
+  waiter sees.
 * `crates/engine/tests/oop_semantics.rs` — the value semantics of the state
   types.
 * `crates/engine/src/scene.rs` `mod tests` — the unit-level invariants.
+* `crates/compat/tests/pending_image.rs` — the pending image through the
+  real natives: a load without a pool decodes synchronously, a load with a
+  pool leaves the bitmap pending, the first pixel read waits for the decode,
+  the image size is known before the pixels land, a probe failure raises at
+  the load and a refused submit falls back to the synchronous decode.
 
 ---
 
@@ -259,4 +343,5 @@ image edit that did not go through a layer accessor.
 | the projection that reads this tree | [projection.md](projection.md) |
 | the pixel operations that write into it | [layer_ops.md](layer_ops.md) |
 | the frame that owns it | [engine.md](engine.md) |
+| the frame that waits for the pending images | [`arch/l2.md`](../../arch/l2.md) §9 |
 | the archived protocol trail | [`docs.old/migration/14-l3-l2-protocol.md`](../../../docs.old/migration/14-l3-l2-protocol.md) §6.1 |

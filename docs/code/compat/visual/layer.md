@@ -72,6 +72,28 @@ does not exist**, by design.
 | `mainImageBuffer`, `mainImageBufferForWrite`, `mainImageBufferPitch`, `provinceImageBuffer`, `provinceImageBufferForWrite`, `provinceImageBufferPitch` | read-only. The address is `0` when the buffer is absent. The `ForWrite` variants mark the image modified or allocate the province plane. |
 | `imageModified` | set by the operations that write pixels. |
 
+### The pending main image
+
+`Layer.loadImages` may hand the decode to the L2 decode pool. The load then
+returns with the layer's **image size known** — the header probe ran on the
+calling thread — and the pixels still decoding:
+
+* the layer's main image is a **pending** bitmap: the probed size and no
+  pixels;
+* the image-size adjustment runs on the probed size, so the layer rect, the
+  image offsets and the clip already carry the loaded image's geometry;
+* every read of the main image's pixels waits for the decode, and the frame's
+  image barrier waits for all of them;
+* a decode that **fails after** the probe installs a transparent blank of the
+  probed size and logs the failure. It does **not** raise — the load already
+  returned. A **probe** failure raises at the load, the way a load failure
+  raises there.
+
+A load that carries a **colour key**, a **province** load
+(`loadProvinceImage`) and every load on a host with **no decode pool**
+decode synchronously, on the calling thread. The member details are in
+[`pixels.md`](pixels.md) §7.
+
 ### Visibility, opacity, blend and the draw face
 
 | Member | Behaviour |
@@ -141,6 +163,9 @@ does not exist**, by design.
 The pixel members (`fillRect`, `colorRect`, `copyRect`, the stretches, the
 affines, the filters, the pixel accessors, `loadImages`, `saveLayerImage`,
 `drawText`, `drawGlyph`, …) are on [`pixels.md`](pixels.md).
+
+The `layerExDraw` paths wait for a pending decode as well, so a plugin draw
+never sees a bitmap whose pixels have not landed.
 
 ---
 
@@ -257,6 +282,8 @@ image-tag API.
 |---|---|
 | the whole layer tree, the rect, the visibility, the opacity, the blend, the z-order, the children, the parent, the domain, the image placement, the province plane, the clip, the hit settings, the face, the cache state, the font id, the pending-paint flag, the shutdown flag | L2 `Scene` / `LayerState` |
 | the bitmaps | L2 `Scene` / `BitmapState` |
+| the pending decode of a main image whose pixels have not landed yet | L2 `Scene` / `BitmapState` (`pending`) |
+| the decode pool, its workers and its queue | L2 `engine::imagedecode::DecodePool`, attached to the host by the composition root |
 | the focus | L2 `Scene` (per window and domain) |
 | the projection and the draw order | L2 `Scene` |
 | the input state | L2 `InputState` |
@@ -283,6 +310,15 @@ image-tag API.
   not bump the cache revision.
 * A layer that is **invalidated** has `shutdown = true` set *before* any
   detach or blur.
+* **A pending main image carries the probed size.** The layer's image width,
+  image height and clip are the loaded image's geometry before its pixels
+  land; every read of the main image's pixels waits for the decode.
+* **A failed pending decode installs a blank, not an exception.** The main
+  image keeps the probed size and every pixel becomes transparent; the
+  failure is logged. The load already returned, so there is no call to fail.
+* **Every path that reads the main image's pixels waits for the decode** —
+  the pixel accessors, the copy members, the text and filter operations and
+  the `layerExDraw` plugin paths.
 
 ---
 
@@ -329,6 +365,7 @@ image-tag API.
 | `crates/compat/tests/visual.rs` | the scene round-trips and the cross-object properties. |
 | `crates/compat/tests/focus_behaviour.rs` | the focus model. |
 | `crates/compat/tests/dispatch_visual.rs` | the receiver routing. |
+| `crates/compat/tests/pending_image.rs` | the deferred load of a layer image: the image size is known before the pixels land, the first pixel read waits for the decode, and a probe failure raises at the load. |
 
 ---
 
@@ -338,4 +375,5 @@ image-tag API.
 * [`pixels.md`](pixels.md) — the pixel operations
 * [`transitions.md`](transitions.md) — `beginTransition` and the script cache
 * [`common.md`](common.md) — the object registry and the re-parenting
+* [`bitmap.md`](bitmap.md) — the `Bitmap` class and the shared load path
 * [`../../../../arch/l2.md`](../../../arch/l2.md) §2 — the logical layer tree on the engine side

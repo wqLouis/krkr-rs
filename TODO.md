@@ -20,13 +20,12 @@ audits are archived in `docs.old/`. Every item was verified against the tree.
    `SoundState.clock` for an L2-owned delta, add `Engine::run(clock, hooks)`,
    and privatize `TimerState::advance` (`engine/src/timer.rs`).
    `docs.old/migration/07` phase 9.
-2. **Deferred image decode pipeline — implemented, cleanup remains.** The L2
-   pending-image pool and the L3 load wiring are in the tree: `Layer.loadImages`
-   probes synchronously, queues the decode, and any pixel access or the frame
-   barrier waits for the future. The reference's synchronous `Layer.loadImages`
-   is preserved for no-pool hosts, colour-keyed and province loads. Remaining:
-   the full-suite failures and the deferred-cache/measurement limitations in
-   §18; the async-model docs are not yet reconciled.
+2. **Deferred image decode pipeline — landed.** The L2 pending-image pool and
+   the L3 load wiring are complete: loads probe synchronously, queue the
+   decode, resolve at every pixel seam or the frame barrier, and enter the
+   decoded-image cache under the load key. Residuals are in §18 (the
+   synchronous colour-key/province paths, the `GdiPlus.Image` cache gap and
+   the Android verification); the pixel-translation follow-up is §19.
 3. **The in-game menu form** (§5) — the largest compatibility blocker.
 4. **Android device verification** (§14) — one real title run with its log
    captured is the release condition (D36).
@@ -389,33 +388,69 @@ new evidence.
   slowness on the game mount is environmental (FUSE), not code.
 
 
-## 18. Image-pipeline leftovers
+## 18. Image-pipeline follow-ups
 
-The deferred image pool and its L3 wiring are committed. Targeted tests are
-green: core `imagedecode` 13/13, `pending_image` 5/5, motion 42/42, media TLG
-parity 9/9, and the static gate. The full `cargo test --workspace` still has
-six failing targets; none is in the pending-image path itself:
+The deferred image pool, its L3 wiring, the cache insert and the startup
+counters are landed. The whole workspace suite and the static gate are green.
+The six earlier failures are closed:
 
-| target | failing tests | likely owner |
-|---|---|---|
-| `compat --lib` | `motion_player::player::tests::a_mesh_node_builds_its_grid_and_deforms_its_child` | the offscreen-offset fix changed the unit-test geometry expectation; verify the fixture or the test. |
-| `compat --test dispatch_ui` | 5 tests (`pad_properties...`, `system_statics...`, `window_ex_menu_item_flags...`, `window_ex_window_flags...`, `win32_dialog_message_box...`) | missing lazy plugin registration in the harness (`Pad`, `WIN32Dialog`, `enableNCMouseEvent`). |
-| `compat --test kag` | 7 `native_*` tests | same lazy plugin/registration gap in the KAG test harness. |
-| `compat --test wuvorbis` | `open_without_the_host_decoder_is_a_typed_error_not_silence` | expectation predates the current typed error text (`no audio decoder is installed`). |
-| `compat --test xp3_filter` | 8 tests | missing `exportFile`/plugin registration in the test harness after lazy registration. |
-| `compat --test xp3_filter_deferred` | `storage_attached_after_install_is_completed_before_startup` | same lazy registration (`exportFile` absent). |
+* the motion mesh test now evaluates the previous-frame patch in normalized
+  box coordinates instead of player-pixel coordinates;
+* `dispatch_ui`, `kag`, `xp3_filter`, `xp3_filter_deferred` and `wuvorbis`
+  link the lazy plugin that owns the member they use (`windowEx.dll`,
+  `win32dialog.dll`, `KAGParserEx.dll`, `fstat.dll`, `wutcwf.dll`) before they
+  create the object or open the stream — lazy registration is the reference
+  behavior, not a test workaround;
+* `Scene::resize_bitmap` resolves a pending image before preserving the
+  overlap, so `Layer.setImageSize` and `Layer.openMovie` no longer panic;
+* every `layer_ex` read/write seam resolves the pending image first;
+* a deferred decode enters the decoded-image cache, and the startup log adds
+  the pool's decode count and time to the synchronous codec counters.
 
-The deferred-image limitations that remain open:
+Remaining:
 
-* A deferred decode is not inserted into the decoded-image cache; a repeated
-  load decodes again when `System.graphicCacheLimit` is enabled.
-* Colour-keyed and province loads stay synchronous.
-* `startup: images decoded` counts only synchronous decodes (the worker cannot
-  hold the current `Rc<Cell>` stats).
-* `layer_ex` plugin paths can read a pending bitmap's blank pixels; drawing is
-  safe because the frame barrier resolves first.
-* The async-model docs (`docs/arch/l2.md`, `docs/code/engine/scene.md`, the
-  pending-image contract) still describe the synchronous path and must be
-  reconciled with the deferred-error approximation.
-* The Android pacing code is applied but uncompiled (no NDK host); one NDK
-  build remains required.
+* Colour-keyed and province loads stay synchronous by design; they apply a
+  pass over the decoded pixels and never enter the pool.
+* `GdiPlus.Image` (`layer_ex`'s own image payload) still decodes through the
+  host codec synchronously and does not enter the decoded-image cache.
+* `Layer.drawImage*` accepts a `Layer`/`Bitmap` rather than the reference's
+  `GdiPlus.Image`; that widening is what created the pending-source path and
+  is a compatibility surface change of its own.
+* The Android pacing and `AHardwareBuffer` readback paths are uncompiled and
+  unverified on a device (no NDK host); one NDK build remains required.
+* The pool's counters are cumulative from pool creation; the app merges them
+  before the startup snapshot, so they are a startup figure, not a live
+  gauge.
+
+## 19. Pixel-translation wiring decision
+
+The L2 mapping is required and correctly placed: `Engine::vm_size()` reads the
+primary-layer rect (L2 state), `surface_size()` comes from L1, and only L2's
+projection/input seam can name both spaces. L3 must not name a device pixel;
+`app` only applies the value.
+
+The audit found that the two currently test-only methods have no correct
+script-visible consumer:
+
+* `raster_scale()` is one line, but using it requires the text path to stop
+  compositing glyph coverage into the VM-resolution layer bitmap; the current
+  softness at `s > 1` is a permitted D34 rasterization approximation.
+* `vm_pixel_region()` is the device-access mapping for a **framebuffer**
+  read. Every reference read (`Bitmap.getPixel`, `Layer.piledCopy`,
+  `Layer.saveLayerImage`, province images, the layer_ex raw readers) addresses
+  a bitmap, not the presented frame; routing those through the device backing
+  would change script-observable values away from the reference.
+
+Decision: keep the CPU VM bitmaps for every reference read, leave
+`vm_pixel_region` unused rather than wire it into `getPixel`/`piledCopy`/
+`saveLayerImage`, and treat a device-resolution capture as a separate additive
+capability on the existing offscreen `RenderTarget` API (never as a change to
+the reference members). `raster_scale` is deferred until the GPU text path is
+production.
+
+The per-node `dst`/clip bake and the docs' "root transform" wording are
+equivalent today (uniform scale + translation, identity node transforms) but
+diverge once a node carries a VM-space transform. The reference has no
+per-layer affine, so this is a design-contract cleanup, not a reference gap;
+if a live transform is ever added, move the mapping to a root `Affine2` and
+re-home the device-space overlay instead of scaling each node independently.

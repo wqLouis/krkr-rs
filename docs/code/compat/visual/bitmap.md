@@ -17,7 +17,7 @@ The constructor has four shapes, distinguished by its arguments:
 
 | Form | Behaviour |
 |---|---|
-| `Bitmap(name[, colorkey])` | loads the named storage image into a fresh bitmap and returns the scene bitmap id as an integer. An empty name raises. |
+| `Bitmap(name[, colorkey])` | loads the named storage image into a fresh bitmap and returns the scene bitmap id as an integer. An empty name raises. The decode may be deferred to the L2 pool — see §4. |
 | `Bitmap(width, height[, bpp])` | allocates a `width × height` all-zero (transparent) RGBA image. `bpp` is accepted and ignored. |
 | `Bitmap()` | creates the reference's 32×32 transparent-white initial bitmap (`[255, 255, 255, 0]` per pixel). |
 | `Bitmap(x)` — one non-string argument | constructs but leaves the bitmap **null** (no image) and returns `0`. Every image-dependent member then raises, while `buffer` and `bufferPitch` report `0`. |
@@ -31,20 +31,20 @@ A second construction on the same payload raises
 
 | Member | Behaviour |
 |---|---|
-| `getPixel(x, y)` | the pixel as ARGB (`0xAARRGGBB`). `0` for an out-of-range or negative coordinate — **no raise**. |
-| `setPixel(x, y, color)` | writes ARGB into the bitmap and marks it dirty. An out-of-range write is silently ignored. |
-| `getMaskPixel(x, y)` | the alpha channel `0..255`. |
-| `setMaskPixel(x, y, alpha)` | writes only the alpha byte, **clamped** to `0..255`. |
+| `getPixel(x, y)` | the pixel as ARGB (`0xAARRGGBB`). `0` for an out-of-range or negative coordinate — **no raise**. Waits for a pending decode. |
+| `setPixel(x, y, color)` | writes ARGB into the bitmap and marks it dirty. An out-of-range write is silently ignored. Waits for a pending decode. |
+| `getMaskPixel(x, y)` | the alpha channel `0..255`. Waits for a pending decode. |
+| `setMaskPixel(x, y, alpha)` | writes only the alpha byte, **clamped** to `0..255`. Waits for a pending decode. |
 | `independ()` | a no-op — every `Bitmap` already owns a private scene bitmap. |
-| `setSize(width, height)` | resizes, preserving the overlapping top-left region and filling the rest with `[0, 0, 0, 0]`. A zero dimension raises. |
+| `setSize(width, height)` | resizes, preserving the overlapping top-left region and filling the rest with `[0, 0, 0, 0]`. A zero dimension raises. A pending decode is resolved first, so the decoded overlap survives. |
 | `copyFrom(bitmap)` | copies the source bitmap's pixels and dimensions into this one. |
 | `save(name[, type[, meta]])` | encodes and writes through the host saver. |
-| `load(name[, colorkey])` | decodes the storage image and installs it; returns a `{width, height, bpp}` metainfo dictionary (`bpp` is always 32). |
-| `loadAsync(name)` | runs the load synchronously and dispatches `onLoaded(meta, async, error, message)` immediately with `async == 0`. |
+| `load(name[, colorkey])` | decodes the storage image and installs it; returns a `{width, height, bpp}` metainfo dictionary (`bpp` is always 32). The decode may be deferred to the L2 pool — see §4. |
+| `loadAsync(name)` | runs the load synchronously and dispatches `onLoaded(meta, async, error, message)` immediately with `async == 0`. It never defers: the result is reported to the script, so the decode must have run. |
 | `onLoaded(meta, async, error, message)` | the registered completion hook; returns void. |
-| `width`, `height` | the scene bitmap's dimension. The setters resize, preserving the overlap. |
-| `buffer` | the RGBA buffer address as an integer; `0` when there is no image. Read-only. |
-| `bufferForWrite` | the RGBA buffer address, marking the bitmap dirty; `0` when there is no image. Read-only. |
+| `width`, `height` | the scene bitmap's dimension. While a decode is pending this is the **probed** size. The setters resize, preserving the overlap; a pending decode is resolved first. |
+| `buffer` | the RGBA buffer address as an integer; `0` when there is no image. Read-only. Waits for a pending decode. |
+| `bufferForWrite` | the RGBA buffer address, marking the bitmap dirty; `0` when there is no image. Read-only. Waits for a pending decode. |
 | `bufferPitch` | `width * 4` (saturating) bytes per row; `0` when there is no image. Read-only. |
 | `loading` | `1` while an async load is in flight — always `0` outside the `loadAsync` call in this port. Read-only. |
 | `Bitmap.loadHeader(name)` (static) | probes the header through the host prober and returns `{width, height, bpp}` (`bpp` is 32 with alpha, else 24). Returns **void** (no raise) when no handler accepts the data. |
@@ -65,8 +65,8 @@ host.set_image_codec(decode, probe, save);
 
 | Closure | Backs |
 |---|---|
-| `decode` | `Bitmap.load`, `Bitmap.loadAsync` |
-| `probe` | `Bitmap.loadHeader` |
+| `decode` | the **synchronous** load path: `Bitmap.load`, `Bitmap.loadAsync` and every load that cannot be deferred (§4) |
+| `probe` | `Bitmap.loadHeader` and the header probe of a deferred load |
 | `save` | `Bitmap.save` |
 
 A member whose closure is missing raises a typed error — `"no image decoder
@@ -103,7 +103,53 @@ pixels become alpha `0`; every other pixel becomes alpha `255`.
 
 ---
 
-## 4. The save path
+## 4. The load path
+
+`Bitmap.load` and the `Bitmap(name)` constructor share one path:
+
+1. The **decoded-image cache** is consulted first. A hit is installed
+   synchronously, exactly as a cached graphic is installed (§6).
+2. Without a hit, the load reads the bytes through the attached storage and
+   **probes the header**, both on the calling thread.
+3. The decode is then either **deferred** to the L2 decode pool or run
+   **synchronously** on the calling thread.
+
+### The deferred path
+
+When the load can be deferred, the call returns with the image's **size
+known** and its **pixels still decoding**:
+
+* the bitmap is installed with the **probed** width and height and no pixels;
+* the decode runs on a pool worker, and the bitmap carries the future;
+* every read of the pixels — `getPixel`, `setPixel`, `getMaskPixel`,
+  `setMaskPixel`, `buffer`, `bufferForWrite` — **waits** for the decode, and
+  the frame's image barrier waits for all of them;
+* the metainfo the load returns carries the probed size.
+
+A **post-probe decode failure** installs a fully transparent blank of the
+probed size and logs the failure. It does **not** raise: the load already
+returned, so there is no call to fail. A **probe** failure is different — the
+probe runs on the calling thread, so it raises at the load, the way a load
+failure raises there.
+
+### When the load is synchronous
+
+The load decodes on the calling thread when:
+
+* **no pool is attached** — the host installed no decode pool;
+* the load carries a **colour key** — the key is a pass over the decoded
+  pixels, and the deferred path carries the pixels unchanged;
+* the load is a **province** load (`DecodedImageMode::Province`);
+* the **pool refused the job** — the queue was full, the memory limit would
+  be exceeded, or the size accounting did not fit. The refusal is logged and
+  the load decodes synchronously.
+
+`Bitmap.loadAsync` never defers: it reports the load's result to the script,
+so its decode must have run.
+
+---
+
+## 5. The save path
 
 | Argument | Rule |
 |---|---|
@@ -115,7 +161,7 @@ The saver receives `(name, type, width, height, rgba)`.
 
 ---
 
-## 5. The cache
+## 6. The cache
 
 The decoded-image cache lives in the L2 scene, keyed by
 `DecodedImageKey { name, color_key, mode, desired_width, desired_height }`.
@@ -124,21 +170,27 @@ The decoded-image cache lives in the L2 scene, keyed by
   corrupt a cached entry.
 * With `System.graphicCacheLimit == 0` the cache is disabled and every load
   decodes.
+* **A deferred decode enters the cache.** When the scene resolves a
+  pending image it stores the decoded pixels under the key the load named,
+  through the same insert and eviction path as the synchronous load. A
+  failed, cancelled or malformed decode stores nothing.
 
 ---
 
-## 6. State ownership
+## 7. State ownership
 
 | State | Owner |
 |---|---|
 | the pixels, the dimensions, the dirty flag, the script-ownership flag, the content generation | L2 `Scene` / `BitmapState` |
+| the pending decode of a bitmap whose pixels have not landed yet | L2 `Scene` / `BitmapState` (`pending`) |
 | the decoded-image cache | L2 `Scene` |
+| the decode pool, its workers and its queue | L2 `engine::imagedecode::DecodePool`, attached to the host by the composition root |
 | the scene bitmap id, the async `loading` flag | the L3 `BitmapInst` payload |
 | the host codec closures | the L3 `ResourceResolver` |
 
 ---
 
-## 7. Invariants
+## 8. Invariants
 
 * **Construct once** — a second construction raises.
 * **Script ownership** — every bitmap created through the natives is marked
@@ -153,10 +205,18 @@ The decoded-image cache lives in the L2 scene, keyed by
   `"the decoded image is malformed"`.
 * **`copyFrom`** resolves the source through the VM's native-instance lookup,
   so a non-`Bitmap` object is a typed error, not a sentinel.
+* **A pending bitmap knows its size.** The width and the height are the
+  probed ones, so they are correct before the decode lands; the pixels are
+  empty until the scene resolves the image.
+* **Every pixel read waits for the pending decode.** The read resolves the
+  bitmap first, so a script never sees a half-decoded image.
+* **A failed pending decode installs a blank, not an exception.** The bitmap
+  keeps the probed size and every pixel becomes transparent; the failure is
+  logged.
 
 ---
 
-## 8. Errors
+## 9. Errors
 
 | Message | Raised when |
 |---|---|
@@ -183,10 +243,13 @@ The decoded-image cache lives in the L2 scene, keyed by
 * `Bitmap.load` logs `"Bitmap.load: {error}"` and yields void when the
   metainfo object cannot be built.
 * `loadAsync` reports the failure through `onLoaded` instead of raising.
+* A **deferred** decode that fails after the probe logs the failure and
+  installs a transparent blank of the probed size. The load already returned,
+  so nothing raises.
 
 ---
 
-## 9. Tests
+## 10. Tests
 
 | Test | What it asserts |
 |---|---|
@@ -194,6 +257,7 @@ The decoded-image cache lives in the L2 scene, keyed by
 | `crates/compat/tests/visual.rs` | `bitmap_pixels_and_size`, `bitmap_copy_from_copies_pixels`. |
 | `crates/compat/tests/dispatch_visual.rs` | the receiver routing. |
 | `crates/compat/tests/layer_behaviour.rs` | the Layer-only members reject a bitmap source. |
+| `crates/compat/tests/pending_image.rs` | the deferred load through the real natives: a load without a pool decodes synchronously, a load with a pool leaves the bitmap pending with the probed size, the first pixel read waits for the decode, a probe failure raises at the load, and a refused submit falls back to the synchronous decode. |
 
 ---
 
@@ -202,3 +266,4 @@ The decoded-image cache lives in the L2 scene, keyed by
 * [`../resource.md`](../resource.md) — the codec seam and the face resolution
 * [`pixels.md`](pixels.md) — the layer-side image path that shares the codec
 * [`../engine_api.md`](../engine_api.md) — the L2 bitmap state
+* [`../../engine/scene.md`](../../engine/scene.md) — the pending bitmap and the image barrier
