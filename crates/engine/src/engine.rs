@@ -38,7 +38,9 @@ use render::{
 };
 
 use crate::hasher::{Map, map};
-use crate::imagedecode::{DecodePool, DecodePoolConfig, DecodePoolError, ImageDecoder};
+use crate::imagedecode::{
+    DecodePool, DecodePoolConfig, DecodePoolError, DecodeStats, ImageDecoder,
+};
 use crate::projection::{ProjectionReport, project_scene_report};
 use crate::scene::Scene;
 use crate::shader::{PipelineId, Program, ProgramDesc, ShaderError, ShaderId, ShaderLibrary};
@@ -471,6 +473,16 @@ impl Engine {
     /// scene and the timer use.
     pub fn decode_pool_mut(&mut self) -> Option<&mut DecodePool> {
         self.decode_pool.as_mut()
+    }
+
+    /// The decode accounting of the image decode pool, or `None` when no
+    /// decoder is installed.
+    ///
+    /// The counters are the number of image decodes the pool ran and the time
+    /// they took. A worker updates them under the pool's own lock, so the
+    /// totals are read here on the thread that owns the engine.
+    pub fn decode_stats(&self) -> Option<DecodeStats> {
+        self.decode_pool.as_ref().map(DecodePool::stats)
     }
 
     /// Registers a shader program and returns its identity.

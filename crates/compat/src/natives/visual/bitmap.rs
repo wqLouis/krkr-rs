@@ -365,7 +365,8 @@ pub(crate) fn start_pending_decode(
     };
     let bytes: Arc<[u8]> = Arc::from(bytes);
     let hint = Some(resolved);
-    match pool.submit(bytes, hint, expected) {
+    let key = DecodedImageKey::new(name, colorkey, mode, 0, 0);
+    match pool.submit_cached(key, bytes, hint, expected) {
         Ok((_id, pending)) => Ok(Some((info.width, info.height, pending))),
         Err(error) => {
             // The pool refused the job: the load decodes synchronously, and

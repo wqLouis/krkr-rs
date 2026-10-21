@@ -16,6 +16,7 @@ use api::error::FsError;
 use api::fs::FsPath;
 use api::input::InputEvent;
 use compat::{CompatCtx, CompatError, FrameBody};
+use engine::imagedecode::DecodeStats;
 use engine::input::InputState;
 use engine::storage::{MountOptions, StartupPlan, StorageReadError};
 use engine::timer::TimerState;
@@ -624,7 +625,13 @@ impl GameHost {
         vm.compat().end_native_timing();
         startup_result?;
         let startup_time = startup_started.elapsed();
-        log_startup(&storage, &stats, mount_time, startup_time);
+        log_startup(
+            &storage,
+            &stats,
+            host.engine().decode_stats(),
+            mount_time,
+            startup_time,
+        );
         Ok(Self {
             audio,
             vm,
@@ -771,6 +778,7 @@ impl GameHost {
 fn log_startup(
     storage: &Storage,
     stats: &StartupStats,
+    deferred: Option<DecodeStats>,
     mount_time: Duration,
     startup_time: Duration,
 ) {
@@ -785,7 +793,11 @@ fn log_startup(
             }
         }
     });
-    let snapshot: StartupSnapshot = stats.snapshot();
+    let mut snapshot: StartupSnapshot = stats.snapshot();
+    if let Some(deferred) = deferred {
+        snapshot.images_decoded = snapshot.images_decoded.saturating_add(deferred.decodes);
+        snapshot.image_decode = snapshot.image_decode.saturating_add(deferred.elapsed);
+    }
     log::info!(
         "startup: archives mounted count={} entries={entries} bytes={bytes} in {:.1} ms",
         storage.archive_count(),

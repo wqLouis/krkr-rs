@@ -8,13 +8,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
+use std::time::Duration;
 
 use api::media::{DecodedImage, ImageInfo};
 use engine::imagedecode::{
     DecodePool, DecodePoolConfig, DecodePoolError, ImageDecodeError, ImageDecoder, ImageOutcome,
     ImageSizeError, ImageState, JobId, PendingImage,
 };
-use engine::{Engine, EngineParts, GameFrame, Scene};
+use engine::{DecodedImageKey, DecodedImageMode, Engine, EngineParts, GameFrame, Scene};
 use render::{PipelineConfig, begin_render_state, create_render_pipeline};
 use testkit::headless_window;
 
@@ -605,4 +606,162 @@ fn resolving_an_image_moves_the_revisions_and_marks_the_bitmap_dirty() {
     );
     let bitmap = scene.bitmap(id).expect("the bitmap");
     assert!(bitmap.dirty, "the resolved bitmap is uploaded this frame");
+}
+
+/// The cache key a load names: the entry the decoded image is stored under.
+fn cache_key(name: &str) -> DecodedImageKey {
+    DecodedImageKey::new(name, 0, DecodedImageMode::Full, 0, 0)
+}
+
+/// A deferred decode that the frame barrier resolves enters the scene's
+/// decoded-image cache, so a repeated load of the same image is a cache hit
+/// and does not decode the image again.
+///
+/// The cache stores the decoded image under the key the load named and
+/// evicts the least-recently-used entries down to the limit
+/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1952-1960`).
+#[test]
+fn a_resolved_deferred_decode_enters_the_image_cache() {
+    let decoder = Arc::new(GatedDecoder::new());
+    let mut engine = headless_engine();
+    engine
+        .install_decoder(decoder.clone(), config(1))
+        .expect("the pool starts");
+    let gate = decoder.gate("cached");
+    let key = cache_key("cached.png");
+    // The load submits the decode under the key the cache stores it under.
+    let (_, pending) = engine
+        .decode_pool_mut()
+        .expect("the pool is installed")
+        .submit_cached(
+            key.clone(),
+            Arc::from(b"payload".as_slice()),
+            Some("cached".to_string()),
+            PIXELS.len() as u64,
+        )
+        .expect("the job is accepted");
+    // The cache is enabled, so the resolved image is kept.
+    engine.scene_mut().set_graphic_cache_limit(1024 * 1024);
+    // Nothing is cached before the decode produced its pixels.
+    assert!(
+        engine.scene_mut().lookup_decoded_image(&key).is_none(),
+        "the cache holds nothing before the decode finished"
+    );
+    let scene_ptr = engine.scene_mut() as *mut Scene;
+    let mut hook = QueueCachedImage {
+        scene: scene_ptr,
+        pending: Some(pending),
+        key: key.clone(),
+        hits: 0,
+    };
+    // The decode is released as soon as it starts, so the barrier does not
+    // wait for the test.
+    let opener = {
+        let decoder = decoder.clone();
+        let gate = Arc::clone(&gate);
+        thread::spawn(move || {
+            decoder.wait_for_started(1);
+            gate.open();
+        })
+    };
+    engine.step(16.0, &mut hook).expect("the frame ran");
+    opener.join().expect("the opener finished");
+    assert_eq!(
+        decoder.started().len(),
+        1,
+        "the frame decoded the image once"
+    );
+
+    // The next frame loads the same image again: the cache answers, so the
+    // image is not decoded a second time.
+    engine.step(16.0, &mut hook).expect("the second frame ran");
+    assert_eq!(hook.hits, 1, "the repeated load was a cache hit");
+    assert_eq!(
+        decoder.started().len(),
+        1,
+        "the repeated load did not decode the image again"
+    );
+    let cached = engine
+        .scene_mut()
+        .lookup_decoded_image(&key)
+        .expect("the cache holds the image");
+    assert_eq!(
+        cached.rgba,
+        PIXELS.to_vec(),
+        "the cached pixels are the decoded ones"
+    );
+}
+
+/// The hook that queues one deferred decode into the engine's scene and, on
+/// the next frame, loads the same image again.
+struct QueueCachedImage {
+    /// The scene the engine owns.
+    scene: *mut Scene,
+    /// The image the hook queues on the first frame.
+    pending: Option<PendingImage>,
+    /// The cache key the load uses.
+    key: DecodedImageKey,
+    /// The number of cache hits the repeated load saw.
+    hits: usize,
+}
+
+impl GameFrame for QueueCachedImage {
+    fn before_render(&mut self, _now_ms: u64, _dt_ms: f64) -> Result<(), String> {
+        // SAFETY: the engine owns the scene for the whole test and does not
+        // move it while the hook runs.
+        let scene = unsafe { &mut *self.scene };
+        match self.pending.take() {
+            Some(pending) => {
+                scene
+                    .add_pending_bitmap(2, 2, pending)
+                    .map_err(|error| error.to_string())?;
+            }
+            None => {
+                if scene.lookup_decoded_image(&self.key).is_some() {
+                    self.hits += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A deferred decode counts once in the pool's accounting, and resolving the
+/// image again does not count a second decode.
+#[test]
+fn a_deferred_decode_counts_once_in_the_pool_accounting() {
+    let decoder = Arc::new(GatedDecoder::new());
+    let mut pool = DecodePool::new(decoder.clone(), config(1)).expect("pool");
+    assert_eq!(pool.stats().decodes, 0, "no decode ran yet");
+    let gate = decoder.gate("counted");
+    let (_, pending) = pool
+        .submit_cached(
+            cache_key("counted.png"),
+            Arc::from(b"payload".as_slice()),
+            Some("counted".to_string()),
+            PIXELS.len() as u64,
+        )
+        .expect("the job is accepted");
+    decoder.wait_for_started(1);
+    gate.open();
+    assert!(matches!(pending.await_ready(), ImageOutcome::Ready(_)));
+    let stats = pool.stats();
+    assert_eq!(stats.decodes, 1, "the deferred decode counted once");
+    assert!(
+        stats.elapsed > Duration::ZERO,
+        "the decode time was accumulated"
+    );
+
+    // Resolving the image installs the pixels; it does not decode again.
+    let mut scene = Scene::default();
+    let id = scene
+        .add_pending_bitmap(2, 2, pending)
+        .expect("the pending bitmap");
+    assert!(scene.resolve_bitmap(id));
+    assert!(scene.resolve_bitmap(id));
+    assert_eq!(
+        pool.stats().decodes,
+        1,
+        "the image was decoded once, however often it resolved"
+    );
 }

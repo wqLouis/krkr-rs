@@ -2398,6 +2398,11 @@ impl Scene {
     /// log; a cancelled decode installs the same blank. A bitmap without a
     /// pending image is left alone.
     ///
+    /// A decode that produced pixels of the probed size also enters the
+    /// decoded-image cache, under the key the load named — the same entry the
+    /// synchronous load path stores, so a later load of the same image is a
+    /// cache hit. A failed, cancelled or malformed decode caches nothing.
+    ///
     /// Returns whether the bitmap exists.
     pub fn resolve_bitmap(&mut self, id: u32) -> bool {
         let Some(pending) = self.bitmap(id).and_then(|bitmap| bitmap.pending.clone()) else {
@@ -2416,6 +2421,9 @@ impl Scene {
         }
         let width = bitmap.width;
         let height = bitmap.height;
+        // The entry the decoded pixels take in the cache, once the decode has
+        // produced them and they match the probed size.
+        let mut cache_entry: Option<(DecodedImageKey, DecodedImage)> = None;
         match outcome {
             ImageOutcome::Ready(image) => {
                 let expected = (width as usize)
@@ -2427,6 +2435,14 @@ impl Scene {
                             Ok(decoded) => decoded,
                             Err(shared) => (*shared).clone(),
                         };
+                        // The cache takes the image only when it is
+                        // consistent; the synchronous path refuses a
+                        // malformed image too.
+                        if let Some(key) = pending.cache_key()
+                            && decoded.is_consistent()
+                        {
+                            cache_entry = Some((key, decoded.clone()));
+                        }
                         bitmap.rgba = decoded.rgba;
                     }
                     _ => {
@@ -2453,6 +2469,9 @@ impl Scene {
         // have skipped the bitmap while it had no pixels.
         self.touch_content();
         self.touch_structure();
+        if let Some((key, image)) = cache_entry {
+            self.cache_decoded_image(key, image);
+        }
         true
     }
 
@@ -2496,14 +2515,9 @@ impl Scene {
         if old_w == width as usize && old_h == height as usize {
             return true;
         }
-        // A pending decode is cancelled: the resize replaces the pixels the
-        // decode would have filled.
-        if let Some(pending) = self.bitmap(id).and_then(|bitmap| bitmap.pending.clone()) {
-            pending.cancel();
-            if let Some(bitmap) = self.bitmap_mut_untracked(id) {
-                bitmap.pending = None;
-            }
-        }
+        // The image may still be decoding: the decoded pixels are the ones
+        // the size change preserves.
+        self.resolve_bitmap(id);
         let copy_w = old_w.min(width as usize);
         let copy_h = old_h.min(height as usize);
         let Some(bytes) = (width as usize).checked_mul(height as usize) else {
@@ -2958,8 +2972,21 @@ impl Scene {
             return Ok(image);
         }
         let image = decode()?;
-        self.image_cache.insert(key, image.clone());
+        self.cache_decoded_image(key, image.clone());
         Ok(image)
+    }
+
+    /// Store `image` in the decoded-image cache under `key`.
+    ///
+    /// Nothing is stored while the cache is disabled. The entry replaces a
+    /// previous one under the same key, and the least-recently-used entries
+    /// are evicted down to the limit first — the accounting the synchronous
+    /// load path uses.
+    fn cache_decoded_image(&mut self, key: DecodedImageKey, image: DecodedImage) {
+        if !self.image_cache.enabled() {
+            return;
+        }
+        self.image_cache.insert(key, image);
     }
 
     /// The pool index of a bitmap id. Uses the id→index map, falling back to

@@ -283,6 +283,56 @@ fn a_pending_image_resolves_before_the_script_reads_a_pixel() {
     assert_eq!(bitmap.rgba.len(), 16, "the bitmap holds its pixels");
 }
 
+/// A deferred decode enters the decoded-image cache, so a repeated load of
+/// the same image is a cache hit instead of a second decode.
+///
+/// The reference consults the decoded-image cache before loading and stores
+/// the decoded image under the same key
+/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1952-1960`).
+#[test]
+fn a_resolved_deferred_load_is_a_cache_hit_next_time() {
+    let _lock = common::vm_lock();
+    let mut env = Env::with_pool(config());
+    env.scene.set_graphic_cache_limit(1024 * 1024);
+    env.run("var b = new Bitmap('picture.png');");
+    assert_eq!(
+        env.eval_int("b.getPixel(0, 0)"),
+        FIRST_PIXEL,
+        "the first read resolves the decode"
+    );
+    let decodes = env
+        ._pool
+        .as_ref()
+        .expect("the pool is attached")
+        .stats()
+        .decodes;
+    assert_eq!(decodes, 1, "the first load decoded once");
+
+    env.run("var b2 = new Bitmap('picture.png');");
+    assert_eq!(
+        env.eval_int("b2.getPixel(0, 0)"),
+        FIRST_PIXEL,
+        "the repeated load reads the cached image"
+    );
+    assert_eq!(
+        env._pool
+            .as_ref()
+            .expect("the pool is attached")
+            .stats()
+            .decodes,
+        1,
+        "the cache hit did not decode the image again"
+    );
+    assert!(
+        env.scene
+            .bitmaps
+            .iter()
+            .filter(|bitmap| bitmap.id != 0)
+            .all(|bitmap| bitmap.pending.is_none()),
+        "the repeated load installs the image synchronously"
+    );
+}
+
 /// The layer's image size is known before its pixels land: the size comes
 /// from the header probe, not from the decode.
 #[test]
