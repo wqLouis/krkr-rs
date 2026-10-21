@@ -15,7 +15,6 @@
 //! reference's disabled host-selection call.
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use crate::engine_api::FontState;
@@ -29,6 +28,7 @@ use super::common::{
     DEFAULT_FONT_COLOR, DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, argb_to_rgba, bound, scene_mut,
     scene_ref, set_real, set_visual_string_out,
 };
+use crate::collections::Map;
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
 use crate::natives::system::{value_as_bool, value_as_i64};
 use crate::resource::{PrerenderedBody, PrerenderedKey};
@@ -67,7 +67,7 @@ pub(super) fn font_payload_id(payload: *mut c_void) -> Option<u32> {
 /// live in the shared [`crate::resource::ResourceResolver`].
 #[derive(Default)]
 struct FontMetricsState {
-    face_is_file_name: HashMap<u32, bool>,
+    face_is_file_name: Map<u32, bool>,
     rasterizer: i64,
 }
 
@@ -115,12 +115,13 @@ fn font_prerendered_key(
     })
 }
 
-/// Lay `text` out with the instance's face/size/style and return
+/// Measure `text` with the instance's face/size/style and return
 /// `(width, height, angle)`.
 ///
 /// A mapped pre-rendered font supplies the width (the sum of its `Inc`
 /// values) and the height (`abs(Font.Height)`); the reference's
-/// `getTextWidth`/`getTextHeight` are otherwise the rasterizer's shaped width
+/// `getTextWidth`/`getTextHeight` are otherwise the rasterizer's
+/// per-character advance sum
 /// and `abs(Font.Height)` (`reference/cpp/core/visual/LayerIntf.cpp:11702-11731`,
 /// `reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473`). The angle
 /// is returned unchanged for the `getEsc*` callers, which apply the rotation.
@@ -135,6 +136,7 @@ fn measure_text(
     // (`reference/cpp/core/visual/LayerIntf.cpp:11716-11731`). `owns_state`
     // is true for `new Font()` and false for the `Layer.font` wrapper.
     // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; no `&mut` to it is live in `measure_text`.
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this callback; no `&mut` to it is live here.
     let standalone = unsafe { &*(instance as *const FontInst) }.owns_state;
     let (_resolved, ctx) = bound(engine)?;
     let mut resolver = crate::resource::resource_state(&ctx);
@@ -151,22 +153,49 @@ fn measure_text(
     };
     if !standalone && let Some(prerendered) = resolver.prerendered_for(&key) {
         let body = prerendered.ensure_body(&ctx)?;
-        let width = prerendered_text_width(&resolver.engine, id, &body, text, &style)
+        let width = prerendered_text_width(&mut resolver.engine, id, &body, text, &style)
             .map_err(|error| format!("Font: text layout failed: {error}"))?;
         return Ok((width, f64::from(font.height), font.angle));
     }
-    let layout = resolver
+    // An empty run resolves the face and the size, so an unusable one is
+    // still reported, but the text itself is never shaped: the width is
+    // measured one character at a time.
+    resolver
         .engine
-        .layout(id, text, &style, None)
+        .layout(id, "", &style, None)
         .map_err(|error| format!("Font: text layout failed: {error}"))?;
-    Ok((layout.width as f64, f64::from(font.height), font.angle))
+    let width = measured_text_width(&mut resolver.engine, id, text, &style)
+        .map_err(|error| format!("Font: text measurement failed: {error}"))?;
+    Ok((width, f64::from(font.height), font.angle))
+}
+
+/// The measured text width: the sum of every character's rounded advance.
+///
+/// A run is measured one character at a time: each character's advance comes
+/// from the rasterizer and is rounded to whole pixels. A shaped run's width
+/// applies kerning and rounds once, so a kerned pair measures narrower than
+/// the sum of its two characters.
+fn measured_text_width(
+    engine: &mut TextEngine,
+    font: FontId,
+    text: &str,
+    style: &TextStyle,
+) -> Result<f64, TextError> {
+    let mut width: i64 = 0;
+    // A TJS string is UTF-16, so each code unit (not each Unicode scalar
+    // value) contributes an advance; a surrogate pair contributes two.
+    for unit in text.encode_utf16() {
+        let ch = char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}');
+        width = width.saturating_add(engine.glyph_advance(font, ch, style)?.round() as i64);
+    }
+    Ok(width as f64)
 }
 
 /// The pre-rendered text width: the sum of each UTF-16 unit's `Inc`, falling
 /// back to the rasterizer advance for a unit the `.tft` does not carry
 /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473`).
 fn prerendered_text_width(
-    engine: &TextEngine,
+    engine: &mut TextEngine,
     font: FontId,
     body: &PrerenderedBody,
     text: &str,
@@ -588,7 +617,7 @@ extern "C" fn font_get_text_height(
     engine: *mut c_void,
     instance: *mut c_void,
     argc: c_int,
-    argv: *const Value,
+    _argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
@@ -596,11 +625,28 @@ extern "C" fn font_get_text_height(
     if argc < 1 {
         return report_error(out_error, "Font.getTextHeight requires a string argument");
     }
-    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
-    let text = value_as_string(&unsafe { args(argv, argc) }[0]);
-    match measure_text(engine, instance, &text) {
-        Ok((_, height, _)) => {
-            set_int(out, height.round() as i64);
+    // A standalone font answers from its own height without applying the
+    // face. A layer-bound font goes through the layer's `GetTextSize`, whose
+    // `ApplyFont` can still raise for an unusable face, so resolve it here.
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for
+    // this callback; no `&mut` to it is live here.
+    let standalone = unsafe { &*(instance as *const FontInst) }.owns_state;
+    let result: Result<i32, String> = (|| {
+        let height = with_font_read(engine, instance, |font| {
+            i32::try_from(font.height.unsigned_abs())
+                .map_err(|_| "Font.getTextHeight: the font height is out of range".to_string())
+        })??;
+        if !standalone {
+            let font = measured_font(engine, instance)?;
+            let (_resolved, ctx) = bound(engine)?;
+            let mut resolver = crate::resource::resource_state(&ctx);
+            resolver.resolve_face(&ctx, &font.face)?;
+        }
+        Ok(height)
+    })();
+    match result {
+        Ok(height) => {
+            set_int(out, i64::from(height));
             0
         }
         Err(error) => report_error(out_error, &error),

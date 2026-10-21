@@ -171,78 +171,81 @@ fn restore_region_rgb(src: &BitmapState, dst: &mut BitmapState, rect: RectI) {
     }
 }
 
-/// Restore every pixel outside `clip` from `before` (used to emulate the
-/// reference `ClipRect` around the L2 affine primitive, which has no clip
-/// argument).
+/// The alpha bytes of `bitmap` inside `clip`, in row-major order.
 ///
-/// An image that holds no pixels keeps its pixels as they are, and the
-/// operation reports the image once.
-fn restore_outside_clip(dst: &mut BitmapState, before: &BitmapState, clip: RectI) {
-    if dst.width != before.width || dst.height != before.height {
-        return;
-    }
-    if !pixels_present(dst) || !pixels_present(before) {
-        log::error!(
-            "Layer: the affine target holds {} pixel bytes for a {}x{} image; the area outside \
-             the clip is not restored",
-            dst.rgba.len(),
-            dst.width,
-            dst.height
-        );
-        return;
-    }
-    let width = dst.width as usize;
-    for y in 0..dst.height as i32 {
-        for x in 0..dst.width as i32 {
-            if x >= clip.0 && x < clip.2 && y >= clip.1 && y < clip.3 {
-                continue;
-            }
-            let i = (y as usize * width + x as usize) * 4;
-            let (Some(pixel), Some(target)) =
-                (before.rgba.get(i..i + 4), dst.rgba.get_mut(i..i + 4))
-            else {
-                continue;
+/// The L2 affine primitive has no `hold_alpha` argument, so the
+/// `HoldAlpha` behaviour is emulated by restoring the alpha the destination
+/// held before the pass.
+///
+/// # Errors
+///
+/// Returns an error naming the image when its buffer does not cover the
+/// alpha plane of the clipped region.
+fn snapshot_alpha_in_clip(bitmap: &BitmapState, clip: RectI) -> Result<Vec<u8>, String> {
+    let Some(region) = layer_ops::intersect(bitmap, clip) else {
+        return Ok(Vec::new());
+    };
+    let width = bitmap.width as usize;
+    let region_width = (region.2 - region.0) as usize;
+    let region_height = (region.3 - region.1) as usize;
+    let mut alpha = Vec::with_capacity(region_width * region_height);
+    for y in region.1..region.3 {
+        for x in region.0..region.2 {
+            let index = (y as usize * width + x as usize) * 4 + 3;
+            let Some(value) = bitmap.rgba.get(index) else {
+                return Err(format!(
+                    "Layer: the affine target holds {} pixel bytes for a {}x{} image; the alpha \
+                     plane inside the clip is not kept",
+                    bitmap.rgba.len(),
+                    bitmap.width,
+                    bitmap.height
+                ));
             };
-            target.copy_from_slice(pixel);
+            alpha.push(*value);
         }
     }
-    dst.mark_dirty();
+    Ok(alpha)
 }
 
-/// Restore the alpha plane inside `clip` from `before` (the reference
-/// `HoldAlpha` for the affine primitive).
+/// Restore the alpha plane inside `clip` from a snapshot taken by
+/// [`snapshot_alpha_in_clip`].
 ///
-/// An image that holds no pixels keeps its plane as it is, and the operation
-/// reports the image once.
-fn restore_alpha_inside_clip(dst: &mut BitmapState, before: &BitmapState, clip: RectI) {
-    if dst.width != before.width || dst.height != before.height {
-        return;
-    }
-    if !pixels_present(dst) || !pixels_present(before) {
-        log::error!(
-            "Layer: the affine target holds {} pixel bytes for a {}x{} image; the alpha plane \
-             inside the clip is not restored",
-            dst.rgba.len(),
-            dst.width,
-            dst.height
-        );
-        return;
-    }
+/// # Errors
+///
+/// Returns an error naming the image when its buffer does not cover the
+/// alpha plane of the clipped region.
+fn restore_alpha_in_clip(dst: &mut BitmapState, clip: RectI, alpha: &[u8]) -> Result<(), String> {
+    let Some(region) = layer_ops::intersect(dst, clip) else {
+        return Ok(());
+    };
     let width = dst.width as usize;
-    let x0 = clip.0.max(0) as usize;
-    let y0 = clip.1.max(0) as usize;
-    let x1 = clip.2.min(dst.width as i32).max(0) as usize;
-    let y1 = clip.3.min(dst.height as i32).max(0) as usize;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let i = (y * width + x) * 4 + 3;
-            let (Some(value), Some(target)) = (before.rgba.get(i), dst.rgba.get_mut(i)) else {
-                continue;
+    let mut index = 0usize;
+    for y in region.1..region.3 {
+        for x in region.0..region.2 {
+            let Some(value) = alpha.get(index) else {
+                return Err(format!(
+                    "Layer: the affine target holds {} pixel bytes for a {}x{} image; the alpha \
+                     plane inside the clip is not restored",
+                    dst.rgba.len(),
+                    dst.width,
+                    dst.height
+                ));
             };
-            *target = *value;
+            let target = (y as usize * width + x as usize) * 4 + 3;
+            let Some(slot) = dst.rgba.get_mut(target) else {
+                return Err(format!(
+                    "Layer: the affine target holds {} pixel bytes for a {}x{} image; the alpha \
+                     plane inside the clip is not restored",
+                    dst.rgba.len(),
+                    dst.width,
+                    dst.height
+                ));
+            };
+            *slot = *value;
+            index += 1;
         }
     }
-    dst.mark_dirty();
+    Ok(())
 }
 
 /// The destination bitmap + `HoldAlpha` flag of a layer, or `None` when its
@@ -420,9 +423,16 @@ fn affine_run(run: AffineRun<'_>) -> Result<(), String> {
         neutral,
         clip,
     } = run;
-    let before = scene.bitmap(dst_id).cloned();
-    with_two_bitmaps(scene, dst_id, src_id, |dst, src| {
-        layer_ops::affine_blit(
+    with_two_bitmaps(scene, dst_id, src_id, |dst, src| -> Result<(), String> {
+        // The pass writes inside the clip alone, so the pixels outside it
+        // keep their values; `HoldAlpha` still needs the alpha the
+        // destination held inside the clip.
+        let alpha = if hold_alpha {
+            Some(snapshot_alpha_in_clip(dst, clip)?)
+        } else {
+            None
+        };
+        layer_ops::affine_blit_clipped(
             dst,
             layer_ops::AffineBlit {
                 corners: [p0, p1, p2],
@@ -439,16 +449,13 @@ fn affine_run(run: AffineRun<'_>) -> Result<(), String> {
                 opa,
                 ..Default::default()
             },
+            clip,
         );
-    })?;
-    if let Some(before) = before
-        && let Some(dst) = scene.bitmap_mut(dst_id)
-    {
-        restore_outside_clip(dst, &before, clip);
-        if hold_alpha {
-            restore_alpha_inside_clip(dst, &before, clip);
+        if let Some(alpha) = alpha {
+            restore_alpha_in_clip(dst, clip, &alpha)?;
         }
-    }
+        Ok(())
+    })??;
     Ok(())
 }
 

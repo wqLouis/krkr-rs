@@ -1,7 +1,6 @@
 //! The visual `Window` native class.
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use crate::engine_api::InputState;
@@ -16,6 +15,7 @@ use super::common::{
     set_retained_out,
 };
 use super::{clear_layer_focus, focus_layer_in_input_domain};
+use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::{set_string_out, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
@@ -118,7 +118,7 @@ impl Default for WindowInst {
 #[derive(Default)]
 struct MouseVelocityState {
     /// window scene id → pointer position at the previous sample.
-    last: HashMap<u32, (f32, f32)>,
+    last: Map<u32, (f32, f32)>,
 }
 
 /// Resolve a `getTouchPoint`/`getTouchVelocity` argument that may be a

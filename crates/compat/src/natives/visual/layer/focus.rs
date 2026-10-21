@@ -27,6 +27,7 @@ use crate::engine_api::Scene;
 use tjs::{NativeInstanceMethodDef, Tjs2Engine, TjsValue, Value};
 
 use super::super::common::{ObjectKind, duplicate_object, scene_mut, scene_ref, set_object_out};
+use super::order::remove_tree_modal_state;
 use super::util::input_mut;
 use super::{LayerExtras, LayerInst, bound};
 use crate::CompatCtx;
@@ -314,6 +315,10 @@ fn deliver(ctx: &CompatCtx, host: &Tjs2Engine, layer: u32, name: &str, args: &[T
 /// `SetEnabled(false)` `:3801-3832`, `SeverChild` `:657-665`, `NotifyPart`
 /// via `LayerManager.cpp:197-201`).
 pub(crate) fn blur_tree(ctx: &CompatCtx, root: u32) {
+    // The modal state of the tree goes first: a layer that is parted,
+    // hidden, disabled or invalidated leaves the modal stack with its tree,
+    // so it must not keep blocking `setMode` on its ancestors.
+    remove_tree_modal_state(ctx, root);
     let (window, domain, focused) = {
         let scene = match scene_ref(ctx) {
             Ok(scene) => scene,

@@ -849,7 +849,7 @@ extern "C" fn image_operate_affine(
             // and restore the result region's alpha to emulate the reference
             // `bmCopyOnAlpha`/`hda` handling.
             let saved = hold_alpha.then(|| snapshot_alpha(dst, result));
-            layer_ops::affine_blit(
+            layer_ops::affine_blit_clipped(
                 dst,
                 layer_ops::AffineBlit {
                     corners: [p0, p1, p2],
@@ -866,6 +866,7 @@ extern "C" fn image_operate_affine(
                     opa,
                     ..Default::default()
                 },
+                clip,
             );
             if let Some(saved) = saved {
                 restore_alpha(dst, result, &saved);

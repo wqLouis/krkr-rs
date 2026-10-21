@@ -21,7 +21,7 @@ use crate::CompatError;
 /// for the whole `CompatServices` lifetime.
 type StateCell = RefCell<Box<dyn std::any::Any>>;
 /// The per-family dispatch-state map, keyed by [`std::any::TypeId`].
-type StateMap = RefCell<std::collections::HashMap<std::any::TypeId, Box<StateCell>>>;
+type StateMap = RefCell<crate::collections::Map<std::any::TypeId, Box<StateCell>>>;
 
 /// Explicit handles to the L2 services the native classes compose.
 ///

@@ -281,6 +281,29 @@ fn operate_affine_points_mode_maps_the_source_quad() {
     }
 }
 
+/// Reference: `operateAffine` hands the clip rectangle to `AffineBlt`
+/// (`reference/cpp/core/visual/ImageFunction.cpp:279-290`), so the pass
+/// writes the pixels of the clip alone and leaves the ones outside it.
+#[test]
+fn operate_affine_writes_inside_the_clip_rect_alone() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var dst = new Bitmap(2, 2); var src = new Bitmap(1, 1); \
+         src.setPixel(0, 0, 0xffff0000);",
+    );
+    // The source rect's LT/RT/LB corners map to (0,0)/(2,0)/(0,2), and the
+    // clip rectangle keeps the pass inside its top-left pixel.
+    env.run(
+        "ImageFunction.operateAffine(dst, src, 0, 0, 2, 0, 0, 2, null, new Rect(0, 0, 1, 1), \
+         false, omOpaque, dfOpaque, 255, 0, false);",
+    );
+    assert_eq!(env.eval_int("dst.getPixel(0, 0)"), 0xffff0000);
+    assert_eq!(env.eval_int("dst.getPixel(1, 0)"), 0);
+    assert_eq!(env.eval_int("dst.getPixel(0, 1)"), 0);
+    assert_eq!(env.eval_int("dst.getPixel(1, 1)"), 0);
+}
+
 #[test]
 fn draw_text_and_draw_glyph_raise_explicit_errors() {
     let _lock = vm_lock();

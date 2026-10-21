@@ -17,6 +17,7 @@ use tjs::{
 };
 
 use crate::binding;
+use crate::collections::Map;
 
 /// Scratch buffer for a string result. The C++ trampoline copies `out.string`
 /// before the next native call, so a per-binding buffer (never a global) is
@@ -234,7 +235,7 @@ fn state_token(engine: &Tjs2Engine, objthis: *mut c_void) -> Option<i64> {
 /// that address; resets the entry (releasing whatever it retained) and
 /// stamps the object with a fresh token when the address has been reused.
 pub(crate) fn sync_object_state<V: Default>(
-    entries: &mut std::collections::HashMap<usize, Tokened<V>>,
+    entries: &mut Map<usize, Tokened<V>>,
     next_token: &mut i64,
     engine: &Tjs2Engine,
     objthis: *mut c_void,

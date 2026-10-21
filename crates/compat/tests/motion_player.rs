@@ -396,7 +396,7 @@ fn player_draw_samples_the_icon_texture() {
     );
     // A solid quad would paint every covered pixel with one value; the
     // texture carries thousands of distinct colours.
-    let distinct: std::collections::HashSet<[u8; 4]> = pixels
+    let distinct: hashbrown::HashSet<[u8; 4], ahash::RandomState> = pixels
         .chunks_exact(4)
         .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
         .collect();
@@ -443,15 +443,15 @@ fn player_draw_applies_the_draw_affine_translate() {
 }
 
 #[test]
-fn player_draw_clears_the_target_before_compositing() {
+fn player_draw_leaves_the_target_uncleared_by_default() {
     let _lock = vm_lock();
     let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
-    // A fully red target with a player that paints no node: the reference
-    // clears the render layer before compositing, so the old red pose must not
-    // survive (`reference/cpp/plugins/motionplayer/PlayerRenderInternal.cpp:369-387`,
-    // `PlayerRenderExecute.cpp:421-422`).
+    // The ordinary draw path paints over the target image without clearing it:
+    // a pose that covers nothing leaves the prefilled pixels in place
+    // (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:1127-1131`,
+    // `PlayerRenderInternal.cpp:444-451`).
     env.run(&format!(
         "var rm = new Motion.ResourceManager(null, 1024); \
          var w = new Window(); \
@@ -468,7 +468,7 @@ fn player_draw_clears_the_target_before_compositing() {
         let offset = (y * 800 + x) * 4;
         assert_eq!(
             &pixels[offset..offset + 4],
-            &[0, 0, 0, 0],
+            &[255, 0, 0, 255],
             "pixel ({x},{y}) keeps the prefilled red pose"
         );
     }

@@ -131,7 +131,6 @@
 //!   `new WaveSoundBuffer(null)` does.
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::Arc;
 
@@ -149,6 +148,7 @@ use tjs::{
     Tjs2ValueId, TjsValue, VAL_INTEGER, VAL_REAL, VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
 };
 
+use crate::collections::Map;
 use crate::native_util::{
     callback_args, host_ref, inst_mut, inst_ref, report_error, set_int, set_void, value_as_string,
     value_ref,
@@ -545,12 +545,11 @@ struct SoundFormat {
 
 /// `Sound` dispatch state, keyed by type inside
 /// [`CompatServices::state`](crate::CompatServices::state).
-#[derive(Default)]
 pub struct SoundState {
     /// The single shared mixer (all objects play through it).
     mixer: Mixer,
     /// Live objects by id.
-    objects: HashMap<u64, SoundObject>,
+    objects: Map<u64, SoundObject>,
     /// Next object id (ids start at 1; 0 is the "not constructed" sentinel).
     next_id: u64,
     /// The L1 monotonic clock that drives the fade beat in [`sound_poll`].
@@ -566,15 +565,35 @@ pub struct SoundState {
     /// Live `PhaseVocoder` filters by `interface` token (the instance
     /// address), so `sound_play` can resolve the `filters` chain to DSP
     /// parameters. Entries are removed when the filter object is destroyed.
-    vocoders: HashMap<usize, VocoderConfig>,
+    vocoders: Map<usize, VocoderConfig>,
     /// Sample buffers a plugin registered as `getVisBuffer` destinations,
     /// keyed by address, holding the buffer length in `i16` samples. Only a
     /// registered destination is writable.
-    vis_buffers: HashMap<usize, usize>,
+    vis_buffers: Map<usize, usize>,
     /// The script-visible `globalFocusMode`, stored verbatim like the
     /// reference static (`WaveImpl.cpp:1889-1891`, `WaveIntf.cpp:1616-1618`
     /// — the reference casts and stores without clamping).
     global_focus_mode: i32,
+}
+
+impl Default for SoundState {
+    fn default() -> Self {
+        Self {
+            mixer: Mixer::default(),
+            // The live objects are walked to dispatch their completion
+            // events, so the table's order is fixed and the same in every
+            // run.
+            objects: Map::with_hasher(crate::collections::hasher()),
+            next_id: 0,
+            clock: Clock::default(),
+            last_poll_ms: 0,
+            render_driven: false,
+            decoders: Vec::new(),
+            vocoders: Map::default(),
+            vis_buffers: Map::default(),
+            global_focus_mode: 0,
+        }
+    }
 }
 
 impl SoundState {
@@ -771,7 +790,7 @@ fn with_object<R>(
 fn collect_vocoder_configs(
     host: &Tjs2Engine,
     filters: Tjs2ValueId,
-    vocoders: &HashMap<usize, VocoderConfig>,
+    vocoders: &Map<usize, VocoderConfig>,
 ) -> Vec<VocoderConfig> {
     let count = match host.member(filters, "count") {
         Ok(TjsValue::Integer(count)) => count,

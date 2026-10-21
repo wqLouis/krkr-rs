@@ -12,7 +12,6 @@
 //! `engine_api::raster` compositor; there is no second GPU path.
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use crate::engine_api::BitmapState;
@@ -31,6 +30,7 @@ use super::{
     value_as_f64, value_as_usize,
 };
 use crate::CompatCtx;
+use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
 use crate::natives::system::{value_as_bool, value_as_i64};
 use crate::storage::strip_file_media;
@@ -180,7 +180,7 @@ impl LayerDraw {
 /// Per-layer drawing state, keyed by layer id.
 #[derive(Default)]
 pub(super) struct DrawState {
-    pub(super) layers: HashMap<u32, LayerDraw>,
+    pub(super) layers: Map<u32, LayerDraw>,
 }
 
 fn draw_state(ctx: &CompatCtx) -> std::cell::RefMut<'_, DrawState> {
@@ -523,7 +523,7 @@ pub(super) fn blit_with_transform(
     let p0 = ctm.apply(origin);
     let p1 = ctm.apply((origin.0 + sw as f64, origin.1));
     let p2 = ctm.apply((origin.0, origin.1 + sh as f64));
-    layer_ops::affine_blit(
+    layer_ops::affine_blit_clipped(
         bitmap,
         layer_ops::AffineBlit {
             corners: [p0, p1, p2],
@@ -540,6 +540,7 @@ pub(super) fn blit_with_transform(
             opa: 255,
             ..Default::default()
         },
+        clip,
     );
 }
 
@@ -597,7 +598,7 @@ pub(super) fn blit_parallelogram(
             return;
         }
     }
-    layer_ops::affine_blit(
+    layer_ops::affine_blit_clipped(
         bitmap,
         layer_ops::AffineBlit {
             corners: [p0, p1, p2],
@@ -614,6 +615,7 @@ pub(super) fn blit_parallelogram(
             opa: 255,
             ..Default::default()
         },
+        clip,
     );
 }
 

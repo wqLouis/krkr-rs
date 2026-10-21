@@ -9,6 +9,7 @@ mod common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use api::media::{DecodedImage, ImageInfo};
 use compat::CompatHost;
@@ -41,6 +42,9 @@ const COLOR_KEY: u32 = 0x01_0203;
 /// reports it: that member masks the alpha away.
 const FIRST_LAYER_PIXEL: i64 = FIRST_PIXEL & 0x00ff_ffff;
 
+/// The bytes of the picture the storage holds.
+const PICTURE: &[u8] = b"not-a-real-image";
+
 /// The decoder the pool drives: every decode produces [`image`].
 struct FixedDecoder;
 
@@ -69,11 +73,14 @@ struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
     scene: Box<Scene>,
-    _storage: Box<Storage>,
+    /// Kept alive for the host's raw pointer; the test reads its byte counter.
+    storage: Box<Storage>,
     _input: Box<InputState>,
     _timer: Box<TimerState>,
     /// Kept alive for the host's raw pointer; never read directly.
     _pool: Option<Box<DecodePool>>,
+    /// The number of header probes the installed codec answered.
+    probes: Arc<AtomicUsize>,
     /// The game directory the storage is mounted from; removed on drop.
     _game_dir: PathBuf,
 }
@@ -105,8 +112,7 @@ impl Env {
     fn build_with_probe(pool: Option<DecodePoolConfig>, probe_fails: bool) -> Env {
         let game_dir = unique_dir("krkr-pending-test");
         std::fs::create_dir_all(&game_dir).expect("create temp game dir");
-        std::fs::write(game_dir.join("picture.png"), b"not-a-real-image")
-            .expect("write the picture");
+        std::fs::write(game_dir.join("picture.png"), PICTURE).expect("write the picture");
         let mut storage = Box::new(
             Storage::mount_archives(
                 FileSystem::host(&game_dir),
@@ -121,9 +127,12 @@ impl Env {
         let mut timer = Box::new(TimerState::new());
         let mut input = Box::new(InputState::new());
         let mut host = CompatHost::new();
+        let probes = Arc::new(AtomicUsize::new(0));
+        let probe_count = Arc::clone(&probes);
         host.set_image_codec(
             |_bytes, _hint| Ok(image()),
             move |_bytes, _hint| {
+                probe_count.fetch_add(1, Ordering::SeqCst);
                 if probe_fails {
                     return Err("the image is not a picture".to_string());
                 }
@@ -163,10 +172,11 @@ impl Env {
             _host: host,
             engine,
             scene,
-            _storage: storage,
+            storage,
             _input: input,
             _timer: timer,
             _pool: pool,
+            probes,
             _game_dir: game_dir,
         }
     }
@@ -350,6 +360,82 @@ fn a_resolved_deferred_load_is_a_cache_hit_next_time() {
             .filter(|bitmap| bitmap.id != 0)
             .all(|bitmap| bitmap.pending.is_none()),
         "the repeated load installs the image synchronously"
+    );
+}
+
+/// The same layer loading the same image twice in one frame keeps the
+/// pixels: the second load shares the running decode instead of cancelling
+/// it.
+#[test]
+fn a_layer_loading_the_same_image_twice_keeps_the_pixels() {
+    let _lock = common::vm_lock();
+    let env = Env::with_pool(config());
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.loadImages('picture.png'); \
+         l.loadImages('picture.png');",
+    );
+    assert_eq!(
+        env.eval_int("l.getMainPixel(0, 0)"),
+        FIRST_LAYER_PIXEL,
+        "the layer holds the decoded pixels"
+    );
+}
+
+/// Two loads of the same image in one frame share the decode that is already
+/// running: the storage is read once, the header is probed once and the pool
+/// runs one decode.
+///
+/// The reference consults the decoded-image cache before it loads and stores
+/// the decoded image under the same key
+/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1952-1960`), so the
+/// second load of one image is served from the first load's result instead of
+/// a second load of the same bytes.
+#[test]
+fn two_loads_of_the_same_image_in_one_frame_share_one_decode() {
+    let _lock = common::vm_lock();
+    let mut env = Env::with_pool(config());
+    let read_before = env.storage.read_bytes();
+    // Two layers load the same image in one script run: one frame.
+    env.run(
+        "var w = new Window(); \
+         var l1 = new Layer(w, null); \
+         l1.loadImages('picture.png'); \
+         var l2 = new Layer(w, null); \
+         l2.loadImages('picture.png');",
+    );
+    assert_eq!(
+        env.storage.read_bytes() - read_before,
+        PICTURE.len() as u64,
+        "the storage was read once"
+    );
+    assert_eq!(
+        env.probes.load(Ordering::SeqCst),
+        1,
+        "the header was probed once"
+    );
+    // Both layers wait for the one decode, and it runs once.
+    env.scene.resolve_pending_images();
+    assert_eq!(
+        env._pool
+            .as_ref()
+            .expect("the pool is attached")
+            .stats()
+            .decodes,
+        1,
+        "the pool ran one decode"
+    );
+    // Both layers hold the decoded pixels.
+    assert_eq!(
+        env.eval_int("l1.getMainPixel(0, 0)"),
+        FIRST_LAYER_PIXEL,
+        "the first layer holds the decoded pixels"
+    );
+    assert_eq!(
+        env.eval_int("l2.getMainPixel(0, 0)"),
+        FIRST_LAYER_PIXEL,
+        "the second layer holds the decoded pixels"
     );
 }
 

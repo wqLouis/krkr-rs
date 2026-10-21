@@ -13,10 +13,9 @@
 //! (or a [`ResourceManager`](super::resource::ResourceManager) cache entry);
 //! there is no global registry.
 
-use std::collections::{HashMap, HashSet};
-
 use super::animator::Animator;
 use super::texture::PixelCache;
+use crate::collections::{Map, Set};
 use crate::natives::plugins::psb_file::container::{PsbDocument, PsbValue};
 
 /// One variable keyframe (`VariableFrameInfo`).
@@ -100,9 +99,9 @@ impl ControlPointCurve {
     }
 }
 
-/// The node colour a frame carries when the content names none: a half
-/// gray with a full alpha.
-pub(crate) const DEFAULT_NODE_COLOR: [u8; 4] = [0x80, 0x80, 0x80, 0xFF];
+/// The four vertex colours a frame carries when the content names none: a
+/// half gray with a full alpha on every corner.
+pub(crate) const DEFAULT_NODE_COLORS: [[u8; 4]; 4] = [[0x80, 0x80, 0x80, 0xFF]; 4];
 
 /// One frame of a layer's `frameList`.
 #[derive(Debug, Clone, PartialEq)]
@@ -120,9 +119,9 @@ pub(crate) struct Frame {
     pub(crate) child_motion: Option<String>,
     /// The blend mode (`bm`).
     pub(crate) blend_mode: i32,
-    /// The node's effective colour: the first of the four packed vertex
-    /// colours, as its red, green, blue and alpha bytes.
-    pub(crate) color: [u8; 4],
+    /// The four packed vertex colours, each as red, green, blue and alpha
+    /// bytes.
+    pub(crate) colors: [[u8; 4]; 4],
     /// Offset x (`ox`).
     pub(crate) ox: f64,
     /// Offset y (`oy`).
@@ -181,7 +180,7 @@ impl Default for Frame {
             src: String::new(),
             child_motion: None,
             blend_mode: 16,
-            color: DEFAULT_NODE_COLOR,
+            colors: DEFAULT_NODE_COLORS,
             ox: 0.0,
             oy: 0.0,
             x: 0.0,
@@ -252,8 +251,9 @@ pub(crate) struct FrameState {
     pub(crate) opacity: f64,
     /// Blend mode.
     pub(crate) blend_mode: i32,
-    /// The node's effective colour: red, green, blue and alpha bytes.
-    pub(crate) color: [u8; 4],
+    /// The four packed vertex colours, each as red, green, blue and alpha
+    /// bytes.
+    pub(crate) colors: [[u8; 4]; 4],
     /// Source reference.
     pub(crate) src: String,
     /// Action.
@@ -280,7 +280,7 @@ impl Default for FrameState {
             scale_y: 1.0,
             opacity: 1.0,
             blend_mode: 16,
-            color: DEFAULT_NODE_COLOR,
+            colors: DEFAULT_NODE_COLORS,
             src: String::new(),
             action: String::new(),
             has_sync: false,
@@ -466,30 +466,30 @@ pub(crate) struct MotionSnapshot {
     /// Variable labels in declaration order.
     pub(crate) variable_labels: Vec<String>,
     /// Whether each timeline loops.
-    pub(crate) loop_timelines: HashMap<String, bool>,
+    pub(crate) loop_timelines: Map<String, bool>,
     /// The loop restart time per timeline.
-    pub(crate) timeline_loop_times: HashMap<String, f64>,
+    pub(crate) timeline_loop_times: Map<String, f64>,
     /// The total frame count per timeline.
-    pub(crate) timeline_total_frames: HashMap<String, f64>,
+    pub(crate) timeline_total_frames: Map<String, f64>,
     /// The variable value range.
-    pub(crate) variable_ranges: HashMap<String, (f64, f64)>,
+    pub(crate) variable_ranges: Map<String, (f64, f64)>,
     /// The variable keyframes.
-    pub(crate) variable_frames: HashMap<String, Vec<VariableFrame>>,
+    pub(crate) variable_frames: Map<String, Vec<VariableFrame>>,
     /// Instant variable labels.
-    pub(crate) instant_variables: HashSet<String>,
+    pub(crate) instant_variables: Set<String>,
     /// The control tracks of each timeline, by label.
-    pub(crate) timeline_controls: HashMap<String, Vec<TimelineTrack>>,
+    pub(crate) timeline_controls: Map<String, Vec<TimelineTrack>>,
     /// The motion clips.
     pub(crate) clips: Vec<MotionClip>,
     /// Label → clip index.
-    pub(crate) clip_index: HashMap<String, usize>,
+    pub(crate) clip_index: Map<String, usize>,
     /// The action/sync keyframes of every clip layer. Every clip is scanned,
     /// not only the ones the active node tree contains.
     pub(crate) event_tracks: Vec<EventTrack>,
     /// `source.<chara>.icon.<name>` geometry keyed by `src/<chara>/<name>`.
-    pub(crate) icons: HashMap<String, IconInfo>,
+    pub(crate) icons: Map<String, IconInfo>,
     /// `source.<chara>.texture` atlases keyed by `<chara>`.
-    pub(crate) textures: HashMap<String, TextureInfo>,
+    pub(crate) textures: Map<String, TextureInfo>,
     /// The decoded pixel chunks this module's icons draw from, keyed by their
     /// `psb://` storage name and shared by every player that loads the
     /// snapshot.
@@ -539,8 +539,8 @@ impl MotionSnapshot {
             })
             .or_else(|| number_of(root.get("height")))
             .unwrap_or(0.0);
-        let mut icons = HashMap::new();
-        let mut textures = HashMap::new();
+        let mut icons = Map::default();
+        let mut textures = Map::default();
         collect_sources(&root, &mut icons, &mut textures);
 
         let mut snapshot = Self {
@@ -550,15 +550,15 @@ impl MotionSnapshot {
             main_timelines: Vec::new(),
             diff_timelines: Vec::new(),
             variable_labels: Vec::new(),
-            loop_timelines: HashMap::new(),
-            timeline_loop_times: HashMap::new(),
-            timeline_total_frames: HashMap::new(),
-            variable_ranges: HashMap::new(),
-            variable_frames: HashMap::new(),
-            instant_variables: HashSet::new(),
-            timeline_controls: HashMap::new(),
+            loop_timelines: Map::default(),
+            timeline_loop_times: Map::default(),
+            timeline_total_frames: Map::default(),
+            variable_ranges: Map::default(),
+            variable_frames: Map::default(),
+            instant_variables: Set::default(),
+            timeline_controls: Map::default(),
             clips: Vec::new(),
-            clip_index: HashMap::new(),
+            clip_index: Map::default(),
             event_tracks: Vec::new(),
             icons,
             textures,
@@ -894,10 +894,7 @@ impl TimelineState {
 }
 
 /// Prime the timeline states for a snapshot.
-pub(crate) fn prime_timelines(
-    snapshot: &MotionSnapshot,
-    states: &mut HashMap<String, TimelineState>,
-) {
+pub(crate) fn prime_timelines(snapshot: &MotionSnapshot, states: &mut Map<String, TimelineState>) {
     states.clear();
     for label in snapshot
         .main_timelines
@@ -942,10 +939,18 @@ pub(crate) fn wrap_timeline(current: f64, total: f64, loop_time: f64) -> (f64, b
     }
 }
 
+/// The clock of a child-motion instance.
+///
+/// The child clip's own length bounds it: a clip that does not loop stops at
+/// its last frame, and a clip that loops restarts at its loop time.
+pub(crate) fn child_clip_time(clip: &MotionClip, local_time: f64) -> f64 {
+    wrap_timeline(local_time, clip.total_frames, clip.loop_time).0
+}
+
 /// Step the active timelines by `dt` frames, returning the events generated.
 pub(crate) fn step_timelines(
     snapshot: &MotionSnapshot,
-    states: &mut HashMap<String, TimelineState>,
+    states: &mut Map<String, TimelineState>,
     dt: f64,
 ) -> Vec<MotionEvent> {
     let mut events = Vec::new();
@@ -1216,9 +1221,15 @@ fn append_node(
         // The child clip starts at the parent keyframe that names it, so every
         // layer of that clip runs that much behind the parent clock.
         let child_offset = placement.time_offset + slot.start - slot.offset;
-        // The child motion exists from the keyframe that names it, so its
-        // layers draw from that moment on.
-        let child_start_time = placement.time_offset + slot.start;
+        // The clip a type-3 node names first exists from the player's start:
+        // its clock is zero before the keyframe that named it, so it draws
+        // its first pose right away. A clip that replaces it later starts at
+        // the keyframe that named it instead.
+        let child_start_time = if names_first_child(&nodes[index].frames, &slot) {
+            placement.start_time
+        } else {
+            placement.time_offset + slot.start
+        };
         let layers = clip.layers.clone();
         stack.push(slot.clip.clone());
         for layer in &layers {
@@ -1289,7 +1300,7 @@ fn parse_frames(value: Option<&PsbValue>) -> Vec<Frame> {
                 frame.blend_mode = number_of(content.get("bm")).unwrap_or(16.0) as i32;
             }
             if frame.content_mask & 0x200 != 0 {
-                frame.color = parse_node_color(content);
+                frame.colors = parse_node_colors(content);
             }
             frame.ox = number_of(content.get("ox")).unwrap_or(0.0);
             frame.oy = number_of(content.get("oy")).unwrap_or(0.0);
@@ -1373,24 +1384,39 @@ pub(crate) fn first_child_slot(frames: &[Frame]) -> Option<ChildSlot> {
         })
 }
 
-/// The node's effective colour, from the content's `color` member.
+/// Whether `slot` names the child clip a layer names first.
 ///
-/// The member is either a dictionary of four packed colours — one per vertex —
-/// or a single packed colour for all of them. The packed value carries the red
-/// channel in its low byte, the green channel in the second, the blue channel
-/// in the third and the alpha in the high byte. The first colour is the
-/// node's effective one.
-fn parse_node_color(content: &PsbValue) -> [u8; 4] {
+/// The clip a type-3 node names first is the one its player starts with; a
+/// later keyframe can replace it with another clip.
+pub(crate) fn names_first_child(frames: &[Frame], slot: &ChildSlot) -> bool {
+    first_child_slot(frames).is_some_and(|first| first.clip == slot.clip)
+}
+
+/// The node's four vertex colours, from the content's `color` member.
+///
+/// The member is either a dictionary of four packed colours — one per vertex,
+/// keyed `"0"` through `"3"` — or a single packed colour broadcast to all of
+/// them. The packed value carries the red channel in its low byte, the green
+/// channel in the second, the blue channel in the third and the alpha in the
+/// high byte.
+fn parse_node_colors(content: &PsbValue) -> [[u8; 4]; 4] {
     let Some(color) = content.get("color") else {
-        return DEFAULT_NODE_COLOR;
+        return DEFAULT_NODE_COLORS;
     };
-    let packed = color
-        .get("0")
-        .and_then(PsbValue::as_f64)
-        .or_else(|| color.as_f64());
-    let Some(packed) = packed else {
-        return DEFAULT_NODE_COLOR;
-    };
+    if let Some(packed) = color.as_f64() {
+        return [unpack_color(packed); 4];
+    }
+    let mut colors = DEFAULT_NODE_COLORS;
+    for (index, slot) in colors.iter_mut().enumerate() {
+        if let Some(packed) = color.get(&index.to_string()).and_then(PsbValue::as_f64) {
+            *slot = unpack_color(packed);
+        }
+    }
+    colors
+}
+
+/// Unpack a `0xAABBGGRR` colour into red, green, blue and alpha bytes.
+fn unpack_color(packed: f64) -> [u8; 4] {
     let packed = packed as i64 as u32;
     [
         (packed & 0xFF) as u8,
@@ -1713,7 +1739,7 @@ pub(crate) fn evaluate_frames(frames: &[Frame], time: f64, coordinate_mode: i32)
         slant_y: active.slant_y,
         flip_x: active.flip_x,
         flip_y: active.flip_y,
-        color: active.color,
+        colors: active.colors,
         scale_x: active.scale_x,
         scale_y: active.scale_y,
         opacity: active.opacity,
@@ -1786,7 +1812,7 @@ fn interpolate(a: &Frame, b: &Frame, t: f64, coordinate_mode: i32) -> FrameState
         scale_y: lerp(a.scale_y, b.scale_y, t_scale),
         opacity,
         blend_mode: a.blend_mode,
-        color: a.color,
+        colors: a.colors,
         src: if a.src.is_empty() {
             b.src.clone()
         } else {
@@ -1818,8 +1844,8 @@ fn navigate<'a>(mut value: &'a PsbValue, path: &[&str]) -> Option<&'a PsbValue> 
 /// `truncated_height`, and a node with no usable size is skipped.
 fn collect_sources(
     root: &PsbValue,
-    icons: &mut HashMap<String, IconInfo>,
-    textures: &mut HashMap<String, TextureInfo>,
+    icons: &mut Map<String, IconInfo>,
+    textures: &mut Map<String, TextureInfo>,
 ) {
     let Some(source) = root.get("source").and_then(PsbValue::as_dict) else {
         return;
@@ -2098,6 +2124,42 @@ mod tests {
         let clip = snapshot.clip("self").expect("the self clip parses");
         let nodes = build_node_tree(&snapshot, Some(clip));
         assert_eq!(nodes.len(), 2);
+    }
+
+    /// The child clip's own length bounds the child's clock: a clip that does
+    /// not loop stops at its last frame, and a clip that loops restarts at its
+    /// loop time (`reference/cpp/plugins/motionplayer/RuntimeSupport.h:445-458`).
+    #[test]
+    fn a_child_clip_bounds_its_own_clock() {
+        let clip = MotionClip {
+            label: "child".to_string(),
+            loop_time: -1.0,
+            total_frames: 10.0,
+            layers: Vec::new(),
+        };
+        assert_eq!(child_clip_time(&clip, 4.0), 4.0, "inside the clip");
+        assert_eq!(child_clip_time(&clip, 10.0), 10.0, "at the clip's end");
+        assert_eq!(
+            child_clip_time(&clip, 30.0),
+            10.0,
+            "a clip that does not loop stops at its last frame"
+        );
+        let looping = MotionClip {
+            label: "looping".to_string(),
+            loop_time: 4.0,
+            total_frames: 10.0,
+            layers: Vec::new(),
+        };
+        assert_eq!(
+            child_clip_time(&looping, 14.0),
+            8.0,
+            "a clip that loops restarts at its loop time"
+        );
+        assert_eq!(
+            child_clip_time(&looping, 30.0),
+            6.0,
+            "a clip that loops wraps into its own length"
+        );
     }
 
     #[test]
@@ -2574,10 +2636,10 @@ mod tests {
             .iter()
             .find(|node| node.label == "logo")
             .expect("the child clip layer is expanded");
-        // The child starts at the parent keyframe and its own offset shifts the
-        // clock the other way.
+        // The child exists from the player's start, but its clock starts at the
+        // parent keyframe and its own offset shifts the clock the other way.
         assert_eq!(child.time_offset, 30.0);
-        assert_eq!(child.visible_from, 40.0);
+        assert_eq!(child.visible_from, 0.0);
         // A parent clock of 40 puts the child at its own t=10, which is a third
         // of the way to the second keyframe.
         let state = evaluate_frames(&child.frames, 40.0 - child.time_offset, 0);

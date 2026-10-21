@@ -12,7 +12,6 @@
 //! (`-1`/`0`).
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use tjs::{
@@ -22,6 +21,7 @@ use tjs::{
 
 use crate::CompatCtx;
 use crate::CompatError;
+use crate::collections::Map;
 use crate::native_util::{report_error, set_int, set_void};
 
 use super::util::{as_bool, int_property_getter, is_object, resolve};
@@ -29,7 +29,7 @@ use super::util::{as_bool, int_property_getter, is_object, resolve};
 /// Per-binding `MenuItem` plugin state.
 #[derive(Default)]
 pub(crate) struct MenuItemExState {
-    flags: HashMap<usize, super::util::Tokened<ItemFlags>>,
+    flags: Map<usize, super::util::Tokened<ItemFlags>>,
     /// Identity-token counter; see [`super::util::sync_object_state`].
     next_token: i64,
 }

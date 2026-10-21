@@ -317,6 +317,68 @@ fn layer_draw_members_accept_a_gdiplus_image() {
     assert_eq!(env.pixel(dst, 2, 1), [16, 17, 18, 255]);
 }
 
+/// The plugin draws inside the clip rectangle, so an affine pass writes the
+/// pixels of the clip alone and leaves the ones outside it.
+///
+/// The reference sets the drawing surface's clip region from the plugin's
+/// `clipLeft`/`clipTop`/`clipWidth`/`clipHeight`
+/// (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:964-976`);
+/// the port applies the layer's own clip rectangle to every draw, so the
+/// pass stays inside it.
+#[test]
+fn layer_draw_affine_writes_inside_the_clip_alone() {
+    let _lock = vm_lock();
+    let env = Env::with_layer();
+    let dst = env.layer_id("dst");
+    // A second layer without a clip receives the same pass, so the pixels
+    // inside the clip can be compared with the ones an unclipped pass writes.
+    env.run(
+        "var whole = new Layer(w, null); \
+         whole.name = 'whole'; \
+         whole.setImageSize(4, 4);",
+    );
+    let whole = env.layer_id("whole");
+    let mut before = Vec::new();
+    for y in 0..4u32 {
+        for x in 0..4u32 {
+            before.push(env.pixel(dst, x, y));
+        }
+    }
+    env.run("dst.setClip(1, 1, 2, 2);");
+    env.run(&format!(
+        "var img = new GdiPlus.Image('{IMAGE_NAME}'); \
+         dst.drawImageAffine(img, 0, 0, 3, 2, true, 2, 0, 0, 2, 0, 0); \
+         whole.drawImageAffine(img, 0, 0, 3, 2, true, 2, 0, 0, 2, 0, 0);"
+    ));
+    for y in 0..4u32 {
+        for x in 0..4u32 {
+            let index = (y * 4 + x) as usize;
+            let inside = (1..3).contains(&x) && (1..3).contains(&y);
+            let clipped = env.pixel(dst, x, y);
+            let unclipped = env.pixel(whole, x, y);
+            if inside {
+                assert_eq!(
+                    clipped, unclipped,
+                    "the clipped pass writes the pixels of the unclipped one at ({x}, {y})"
+                );
+                assert_ne!(
+                    clipped, before[index],
+                    "the pass writes inside the clip at ({x}, {y})"
+                );
+            } else {
+                assert_eq!(
+                    clipped, before[index],
+                    "the pixels outside the clip keep their value at ({x}, {y})"
+                );
+                assert_ne!(
+                    unclipped, before[index],
+                    "the unclipped pass writes outside the clip at ({x}, {y})"
+                );
+            }
+        }
+    }
+}
+
 /// `RotateFlip` turns the image's pixels in place: a quarter turn swaps the
 /// reported width and height, and `GetBounds` and `drawImage` agree with the
 /// rotated raster.

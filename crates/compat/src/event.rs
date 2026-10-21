@@ -10,8 +10,8 @@
 #![allow(unsafe_code)]
 
 use api::host::TouchPhase;
-use std::collections::HashMap;
 
+use crate::collections::Map;
 use crate::engine_api::InputState;
 use crate::engine_api::Scene;
 use platform::{InputEvent, MouseButton, PlatformEvent};
@@ -468,7 +468,7 @@ struct InputDispatchState {
     last_mouse_layer: Option<u32>,
     /// The layer that captured each active touch contact
     /// (`SetTouchCapture`), so a drag stays on the pressed layer.
-    touch_capture: HashMap<u64, u32>,
+    touch_capture: Map<u64, u32>,
     /// Whether the pointer is currently inside the window (the window-level
     /// enter/leave transition).
     pointer_inside: bool,

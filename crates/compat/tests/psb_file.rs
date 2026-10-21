@@ -791,4 +791,34 @@ fn resource_members_are_octets() {
     assert_eq!(env.string("kind"), "Octet");
     assert_eq!(env.int("len"), 9);
     assert_eq!(env.int("first"), i64::from(b'F'));
+    // Every byte of the chunk reads back unchanged.
+    for (index, expected) in b"FAKEIMAGE".iter().enumerate() {
+        assert_eq!(
+            env.int(&format!("res[{index}]")),
+            i64::from(*expected),
+            "byte {index} of the chunk must match"
+        );
+    }
+}
+
+// The octet member is installed natively on the parent object, so the
+// parse path never runs a script. The temporary globals that carried the
+// parent object and the member name are therefore never created, and an
+// absent member reads as `undefined` (the `typeof` of a missing member,
+// `reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1898-1904`).
+#[test]
+fn resource_members_are_installed_without_a_script_round_trip() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.write_fixture("fixture.psb", &build_fixture());
+
+    env.run(
+        "var f = new PSBFile(); \
+         f.load('fixture.psb'); \
+         var bufKind = typeof global.__krkr_psb_buf; \
+         var keyKind = typeof global.__krkr_psb_key;",
+    );
+
+    assert_eq!(env.string("bufKind"), "undefined");
+    assert_eq!(env.string("keyKind"), "undefined");
 }

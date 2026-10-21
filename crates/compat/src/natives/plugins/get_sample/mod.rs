@@ -40,7 +40,6 @@
 //! method exactly like the reference `objthis->FuncCall(0, "getVisBuffer", …)`.
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use tjs::{
@@ -48,6 +47,7 @@ use tjs::{
     VAL_REAL, Value,
 };
 
+use crate::collections::Map;
 use crate::native_util::{args, report_error, set_int, set_void};
 use crate::natives::sound::VisBufferRegistration;
 use crate::natives::system::{resolve, value_as_i64};
@@ -81,7 +81,7 @@ struct GetSampleState {
     default_counts: i32,
     default_aheads: i32,
     /// Per-object parameters keyed by the raw `objthis` pointer.
-    params: HashMap<usize, SampleParams>,
+    params: Map<usize, SampleParams>,
 }
 
 impl Default for GetSampleState {
@@ -89,7 +89,7 @@ impl Default for GetSampleState {
         Self {
             default_counts: DEFAULT_COUNTS,
             default_aheads: DEFAULT_AHEADS,
-            params: HashMap::new(),
+            params: Map::default(),
         }
     }
 }

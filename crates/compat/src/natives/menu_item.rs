@@ -47,7 +47,6 @@
 //! `FuncCall`.
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 
@@ -57,6 +56,7 @@ use tjs::{
     VAL_NULL, VAL_OBJECT, VAL_RETAINED, Value,
 };
 
+use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::{resolve, set_string_out, try_value_as_i64, value_as_bool};
 use crate::{CompatCtx, CompatError, CompatServices};
@@ -80,7 +80,7 @@ struct MenuNode {
     children: Vec<u64>,
     /// Strong references to the child script objects, held for as long as the
     /// child stays attached so `root.add(new MenuItem(...))` keeps it alive.
-    retained_children: HashMap<u64, DetachedValue>,
+    retained_children: Map<u64, DetachedValue>,
     /// Retained action owner (`MenuItem` constructor argument 0); the default
     /// `onClick` handler dispatches to it.
     action_owner: Option<DetachedValue>,
@@ -113,7 +113,7 @@ impl Default for MenuNode {
             shortcut: String::new(),
             parent: None,
             children: Vec::new(),
-            retained_children: HashMap::new(),
+            retained_children: Map::default(),
             action_owner: None,
             window: None,
             self_handle: 0,
@@ -128,12 +128,12 @@ impl Default for MenuNode {
 #[derive(Default)]
 struct MenuState {
     /// Live nodes by id (ids start at 1; 0 is the "not constructed" sentinel).
-    nodes: HashMap<u64, MenuNode>,
+    nodes: Map<u64, MenuNode>,
     /// Next node id.
     next_id: u64,
     /// Raw `objthis` pointer → node id, so an item passed as a method argument
     /// resolves to its node without exposing an `id` member.
-    instances: HashMap<usize, u64>,
+    instances: Map<usize, u64>,
     /// Cached `MenuItem.textToKeycode` dictionary.
     text_to_keycode: Option<DetachedValue>,
     /// Cached `MenuItem.keycodeToText` array.

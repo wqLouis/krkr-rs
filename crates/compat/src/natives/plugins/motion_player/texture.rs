@@ -6,9 +6,9 @@
 //! 8-bit index data resolved through the sibling `pal` chunk. Decoding yields
 //! straight-alpha RGBA8 in the scene's pixel layout.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::collections::Map;
 use crate::engine_api::{Storage, StorageReadError};
 use crate::storage::strip_file_media;
 
@@ -17,7 +17,7 @@ use crate::storage::strip_file_media;
 /// a chunk is read and decoded once for the lifetime of the snapshot.
 #[derive(Clone, Default)]
 pub(crate) struct PixelCache {
-    entries: Arc<Mutex<HashMap<String, Arc<Pixels>>>>,
+    entries: Arc<Mutex<Map<String, Arc<Pixels>>>>,
 }
 
 impl PixelCache {
@@ -52,7 +52,7 @@ impl PixelCache {
         Some(pixels)
     }
 
-    fn entries(&self) -> MutexGuard<'_, HashMap<String, Arc<Pixels>>> {
+    fn entries(&self) -> MutexGuard<'_, Map<String, Arc<Pixels>>> {
         match self.entries.lock() {
             Ok(entries) => entries,
             Err(poisoned) => {

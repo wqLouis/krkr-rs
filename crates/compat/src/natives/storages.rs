@@ -36,7 +36,6 @@
 //! not exist" error rather than a silent fallback.
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 
@@ -44,6 +43,7 @@ use crate::engine_api::{Location, Storage, StorageReadError, normalize_in_archiv
 use tjs::{Engine, NativeClassBuilder, NativeMethodDef, VAL_OBJECT, VAL_STRING, Value};
 
 use crate::binding;
+use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
@@ -128,7 +128,7 @@ fn chop_storage_ext(name: &str) -> String {
 /// Positive-result cache for `getPlacedPath` (the reference's
 /// `TVPAutoPathCache`), keyed by the requested name.
 #[derive(Default)]
-struct PlacedCache(HashMap<String, String>);
+struct PlacedCache(Map<String, String>);
 
 /// Scratch buffer for a string result; the C++ trampoline copies it before the
 /// next native call.

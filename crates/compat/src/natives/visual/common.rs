@@ -2,7 +2,6 @@
 #![allow(unsafe_code)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 
 use crate::engine_api::DecodePool;
@@ -15,6 +14,7 @@ use tjs::{
 };
 
 use crate::CompatCtx;
+use crate::collections::Map;
 use crate::native_util::set_void;
 use crate::natives::system::resolve;
 
@@ -37,8 +37,8 @@ pub(crate) const DEFAULT_FONT_COLOR: i64 = 0xffff_ffff;
 /// entries are non-owning [`ObjectHandle`]s.
 #[derive(Default)]
 pub(crate) struct ObjectRegistry {
-    pub(crate) windows: HashMap<u32, ObjectHandle>,
-    pub(crate) layers: HashMap<u32, ObjectHandle>,
+    pub(crate) windows: Map<u32, ObjectHandle>,
+    pub(crate) layers: Map<u32, ObjectHandle>,
 }
 
 /// A non-owning handle to a script object, keyed by scene id.
@@ -164,9 +164,9 @@ pub(crate) struct VisualState {
     pub(crate) objects: ObjectRegistry,
     /// Window scene id → objects registered through `Window.add`, in
     /// registration order (reference `ObjectVector`).
-    pub(crate) window_objects: HashMap<u32, Vec<WindowObject>>,
+    pub(crate) window_objects: Map<u32, Vec<WindowObject>>,
     /// L3 payload per L2 timer id.
-    pub(crate) timers: HashMap<TimerId, TimerBinding>,
+    pub(crate) timers: Map<TimerId, TimerBinding>,
     /// `Window.bringToFront` requests for the host to drain.
     pub(crate) bring_to_front: Vec<u32>,
     /// `Window.update` requests `(window_id, update_type)`.

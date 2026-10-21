@@ -18,6 +18,7 @@ use tjs::{NativeInstanceMethodDef, Value};
 
 use super::super::common::{resolve_object_id, scene_mut, scene_ref};
 use super::{LayerExtras, LayerInst, bound, clear_domain_focus, focus_layer};
+use crate::CompatCtx;
 use crate::native_util::{args, report_error, set_void};
 
 /// Mutable access to the sibling order vector that holds `id`.
@@ -228,6 +229,89 @@ fn is_ancestor_or_self(scene: &Scene, ancestor: u32, node: u32) -> bool {
         current = scene.layer(id).and_then(|l| l.parent);
     }
     false
+}
+
+/// Whether `node` is `root` or a descendant of it.
+///
+/// The modal vector holds the layers that are modal; the tree cleanup
+/// selects the entries that are the blurred root or below it.
+fn is_in_subtree(scene: &Scene, root: u32, node: u32) -> bool {
+    if node == root {
+        return true;
+    }
+    let mut current = scene.layer(node).and_then(|layer| layer.parent);
+    let mut steps = 0usize;
+    while let Some(id) = current {
+        if id == root {
+            return true;
+        }
+        steps += 1;
+        if steps > scene.layers.len() {
+            return false;
+        }
+        current = scene.layer(id).and_then(|layer| layer.parent);
+    }
+    false
+}
+
+/// Drop every modal layer that is `root` or a descendant of it, and hand the
+/// focus to the next focusable layer after `root` when one was dropped.
+///
+/// Blurring a tree drops the modal state of that tree before the focus
+/// moves, so a layer that is parted, hidden, disabled or invalidated is no
+/// longer a modal layer and must not keep blocking `setMode` on its
+/// ancestors. Returns whether a modal layer was dropped.
+pub(super) fn remove_tree_modal_state(ctx: &CompatCtx, root: u32) -> bool {
+    let doomed: Vec<u32> = {
+        // SAFETY: the caller resolved `ctx` from the installed binding.
+        let extras = unsafe { ctx.services() }.state::<LayerExtras>();
+        if extras.modes.is_empty() {
+            return false;
+        }
+        let Ok(scene) = scene_ref(ctx) else {
+            return false;
+        };
+        extras
+            .modes
+            .iter()
+            .copied()
+            .filter(|&id| is_in_subtree(scene, root, id))
+            .collect()
+    };
+    if doomed.is_empty() {
+        return false;
+    }
+    {
+        // SAFETY: the caller resolved `ctx` from the installed binding.
+        let mut extras = unsafe { ctx.services() }.state::<LayerExtras>();
+        extras.modes.retain(|&id| !doomed.contains(&id));
+    }
+    // The focus moves to the next focusable layer after `root`.
+    let (window, domain, next) = {
+        let Ok(scene) = scene_ref(ctx) else {
+            return true;
+        };
+        let Some(layer) = scene.layer(root) else {
+            return true;
+        };
+        // A shutdown `root` has no manager left, so the focus search after
+        // it yields nothing.
+        let next = if layer.shutdown {
+            None
+        } else {
+            scene.next_focusable(root)
+        };
+        (layer.window, layer.domain, next)
+    };
+    match next {
+        Some(next) => {
+            focus_layer(ctx, next, true);
+        }
+        None => {
+            clear_domain_focus(ctx, window, domain, true);
+        }
+    }
+    true
 }
 
 /// The first focusable node of `root`'s subtree, depth-first — the port of

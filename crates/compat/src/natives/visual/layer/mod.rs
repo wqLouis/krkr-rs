@@ -1,7 +1,6 @@
 //! The visual `Layer` native class.
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use crate::engine_api::InputState;
@@ -17,6 +16,7 @@ use super::common::{
     resolve_object_id, scene_mut, scene_ref, set_null_out, set_object_out, set_retained_out,
     set_visual_string_out,
 };
+use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::{value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
@@ -45,7 +45,7 @@ pub use transitions::{advance_self_updating_transitions, advance_transitions};
 #[derive(Default)]
 struct LayerExtras {
     /// Active `beginTransition` state per layer id.
-    transitions: HashMap<u32, LayerTransition>,
+    transitions: Map<u32, LayerTransition>,
     /// The scene's structure and content revisions the last
     /// script-cached-layer pass ran at, so an unchanged frame composites
     /// nothing.

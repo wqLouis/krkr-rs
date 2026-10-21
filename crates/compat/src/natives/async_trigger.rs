@@ -48,7 +48,6 @@
 //!   invalidation (`EventIntf.cpp:1036-1037`, `1044`, `1065`).
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use tjs::{
@@ -56,6 +55,7 @@ use tjs::{
     RetainedValue, Tjs2Engine, TjsValue, VAL_VOID, Value,
 };
 
+use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::{resolve, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError, CompatServices};
@@ -107,7 +107,7 @@ struct AsyncTriggerState {
     /// Monotonic id source; never reused.
     next_id: u64,
     /// Per-object state keyed by [`AsyncTriggerId`].
-    triggers: HashMap<AsyncTriggerId, AsyncTriggerBinding>,
+    triggers: Map<AsyncTriggerId, AsyncTriggerBinding>,
     /// Scheduled fires in `trigger()` order. A `cached` object appears at
     /// most once. Each entry retains its source object until delivery, like
     /// the reference event queue.

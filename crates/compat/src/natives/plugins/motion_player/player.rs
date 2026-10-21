@@ -8,13 +8,12 @@
 //! (timeline state, variable animators, coordinate/scale/rotate/color
 //! transitions, wind / outer force, hit testing, layer queries). Node-tree
 //! evaluation reads the selected clip's timeline time; drawing composes the
-//! L2 `engine_api::Scene` layer system: [`PlayerInst::draw`] clears the target
-//! image and maps each node's icon pixels onto its transformed quad with
-//! `engine_api::layer_ops`, decoding the container's `RL`/palettized pixel
-//! chunks itself.
+//! L2 `engine_api::Scene` layer system: [`PlayerInst::draw`] maps each node's
+//! icon pixels onto its transformed quad with `engine_api::layer_ops`,
+//! decoding the container's `RL`/palettized pixel chunks itself.
 #![allow(unsafe_code)]
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use tjs::{DetachedValue, RetainedValue, TjsValue, VAL_OBJECT, Value};
@@ -24,12 +23,13 @@ use super::adaptors::{LayerGetterInst, SeparateInst, populate_layer_getter};
 use super::animator::{Animator, ColorAnimator, ease_weight};
 use super::helpers::{eval_object, inst_mut, inst_ref, set_real, set_string, value_as_f64};
 use super::model::{
-    FrameState, IconInfo, MotionClip, MotionEvent, MotionNode, MotionSnapshot, TimelineState,
-    VariableFrame, build_node_tree, build_node_tree_at, child_slot, evaluate_frames,
-    prime_timelines, scan_frame_events, step_timelines,
+    DEFAULT_NODE_COLORS, FrameState, IconInfo, MotionClip, MotionEvent, MotionNode, MotionSnapshot,
+    TimelineState, VariableFrame, build_node_tree, build_node_tree_at, child_clip_time, child_slot,
+    evaluate_frames, names_first_child, prime_timelines, scan_frame_events, step_timelines,
 };
 use super::resource::{MotionStore, ResourceInst};
 use super::texture::Pixels;
+use crate::collections::Map;
 use crate::engine_api::layer_ops::{
     AffineBlit, BlitOptions, BlitSource, RectI, affine_blit, fill_mask, intersect_rect,
     operate_rect,
@@ -76,13 +76,14 @@ pub(crate) struct ResolvedMotion {
     pub(crate) path: String,
 }
 
-/// A cropped icon source tinted by one player colour.
+/// A cropped icon source tinted by one node's four vertex colours.
 ///
 /// The crop and the decoded atlas it was cropped from identify the source, so
-/// two icons that share a crop share one tinted bitmap.
+/// two icons that share a crop and a colour share one tinted bitmap.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct TintKey {
-    color: [u8; 4],
+    colors: [[u8; 4]; 4],
+    half_alpha: bool,
     crop: RectI,
     pixels: usize,
 }
@@ -90,7 +91,7 @@ pub(crate) struct TintKey {
 /// The tinted icon sources the player draws, keyed by source, colour and the
 /// decoded atlas they were cropped from. The entries are dropped when the
 /// bound motion changes.
-pub(crate) type TintedSources = HashMap<TintKey, Arc<BitmapState>>;
+pub(crate) type TintedSources = Map<TintKey, Arc<BitmapState>>;
 
 /// `Player` instance payload.
 pub(crate) struct PlayerInst {
@@ -144,11 +145,11 @@ pub(crate) struct PlayerInst {
     // Runtime.
     pub(crate) snapshot: Option<Arc<MotionSnapshot>>,
     /// Motions resolved by name or path, keyed by both.
-    pub(crate) motions_by_key: HashMap<String, ResolvedMotion>,
-    pub(crate) timelines: HashMap<String, TimelineState>,
+    pub(crate) motions_by_key: Map<String, ResolvedMotion>,
+    pub(crate) timelines: Map<String, TimelineState>,
     pub(crate) playing_timelines: Vec<String>,
-    pub(crate) variable_values: HashMap<String, f64>,
-    pub(crate) variable_animators: HashMap<String, Animator>,
+    pub(crate) variable_values: Map<String, f64>,
+    pub(crate) variable_animators: Map<String, Animator>,
     pub(crate) nodes: Vec<MotionNode>,
     /// Whether the node tree needs an evaluation before it is drawn.
     pub(crate) layers_dirty: bool,
@@ -201,8 +202,8 @@ pub(crate) struct PlayerInst {
     pub(crate) captions: Vec<StoredValue>,
 
     // Layer ids.
-    pub(crate) layer_ids: HashMap<String, i32>,
-    pub(crate) layer_names: HashMap<i32, String>,
+    pub(crate) layer_ids: Map<String, i32>,
+    pub(crate) layer_names: Map<i32, String>,
     pub(crate) next_layer_id: i32,
 }
 
@@ -253,15 +254,15 @@ impl Default for PlayerInst {
             meshline: String::new(),
             busy: false,
             snapshot: None,
-            motions_by_key: HashMap::new(),
-            timelines: HashMap::new(),
+            motions_by_key: Map::default(),
+            timelines: Map::default(),
             playing_timelines: Vec::new(),
-            variable_values: HashMap::new(),
-            variable_animators: HashMap::new(),
+            variable_values: Map::default(),
+            variable_animators: Map::default(),
             nodes: Vec::new(),
             layers_dirty: true,
             pending_events: Vec::new(),
-            tinted: HashMap::new(),
+            tinted: Map::default(),
             missing_textures: BTreeSet::new(),
             coord: CoordState::default(),
             scale: Animator::at(1.0),
@@ -298,8 +299,8 @@ impl Default for PlayerInst {
             size: (0, 0),
             backgrounds: Vec::new(),
             captions: Vec::new(),
-            layer_ids: HashMap::new(),
-            layer_names: HashMap::new(),
+            layer_ids: Map::default(),
+            layer_names: Map::default(),
             next_layer_id: 0,
         }
     }
@@ -806,6 +807,41 @@ impl PlayerInst {
         }
     }
 
+    /// The clock of the node at `index`, in its own clip's time space.
+    ///
+    /// A node of the selected clip runs on that clip's clock. A layer a child
+    /// motion expanded runs on the child clip's clock: the owner's clock
+    /// measured from the keyframe that named the clip, plus that keyframe's
+    /// `motion.timeOffset`, bounded by the child clip's own length.
+    fn node_clock(&self, index: usize, time: f64, clocks: &[f64]) -> f64 {
+        let node = &self.nodes[index];
+        let Some(owner) = node.child_owner else {
+            return (time - node.time_offset).max(0.0);
+        };
+        // The child's offset carries the keyframe that named the clip and that
+        // keyframe's motion time offset.
+        let start = node.time_offset - self.nodes[owner].time_offset;
+        let local = (clocks[owner] - start).max(0.0);
+        let Some(clip) = node
+            .child_clip
+            .as_deref()
+            .and_then(|label| self.snapshot.as_deref().and_then(|s| s.clip(label)))
+        else {
+            return local;
+        };
+        child_clip_time(clip, local)
+    }
+
+    /// The clock of every node, in its own clip's time space.
+    fn node_clocks(&self, time: f64) -> Vec<f64> {
+        let mut clocks = Vec::with_capacity(self.nodes.len());
+        for (index, _) in self.nodes.iter().enumerate() {
+            let clock = self.node_clock(index, time, &clocks);
+            clocks.push(clock);
+        }
+        clocks
+    }
+
     /// Evaluate the node tree at the selected clip's timeline time.
     pub(crate) fn update_layers(&mut self) {
         if self.nodes.is_empty() {
@@ -824,10 +860,10 @@ impl PlayerInst {
             }
         }
         // Evaluate each node's local state. A layer expanded from a child motion
-        // runs on that clip's own clock, so it is offset by the parent keyframe
-        // that named it and never evaluated before its start.
-        for index in 0..self.nodes.len() {
-            let local_time = (time - self.nodes[index].time_offset).max(0.0);
+        // runs on that clip's own clock: the parent's clock measured from the
+        // keyframe that named the clip and bounded by the child clip's length.
+        let clocks = self.node_clocks(time);
+        for (index, &local_time) in clocks.iter().enumerate() {
             let state = evaluate_frames(
                 &self.nodes[index].frames,
                 local_time,
@@ -954,38 +990,49 @@ impl PlayerInst {
     /// whether a keyframe selected a child clip the tree was not built for.
     fn sync_child_instances(&mut self, time: f64) -> bool {
         let mut rebuild = false;
-        for index in 1..self.nodes.len() {
-            if self.nodes[index].node_type != 3 {
-                continue;
-            }
-            let local = (time - self.nodes[index].time_offset).max(0.0);
-            let slot = child_slot(&self.nodes[index].frames, local);
-            self.nodes[index].child_slot = slot.clone();
-            let Some(slot) = slot else {
-                continue;
-            };
-            let child_offset = self.nodes[index].time_offset + slot.start - slot.offset;
-            let child_start = self.nodes[index].visible_from + slot.start;
-            let known = self
-                .snapshot
-                .as_deref()
-                .is_some_and(|snapshot| snapshot.clip(&slot.clip).is_some());
-            let mut found = false;
-            for child in self.nodes.iter_mut() {
-                if child.child_owner != Some(index) {
-                    continue;
+        // The clocks are walked in node order: a node's owner comes first, so
+        // a type-3 node inside a child instance reads the clock its owner has
+        // already been given.
+        let mut clocks = Vec::with_capacity(self.nodes.len());
+        let mut index = 0;
+        while index < self.nodes.len() {
+            let clock = self.node_clock(index, time, &clocks);
+            clocks.push(clock);
+            if self.nodes[index].node_type == 3
+                && let Some(slot) = child_slot(&self.nodes[index].frames, clock)
+            {
+                self.nodes[index].child_slot = Some(slot.clone());
+                let child_offset = self.nodes[index].time_offset + slot.start - slot.offset;
+                // The clip a type-3 node names first exists from the player's
+                // start; a clip that replaces it later starts at the keyframe
+                // that named it.
+                let child_start = if names_first_child(&self.nodes[index].frames, &slot) {
+                    self.nodes[index].visible_from
+                } else {
+                    self.nodes[index].visible_from + slot.start
+                };
+                let known = self
+                    .snapshot
+                    .as_deref()
+                    .is_some_and(|snapshot| snapshot.clip(&slot.clip).is_some());
+                let mut found = false;
+                for child in self.nodes.iter_mut() {
+                    if child.child_owner != Some(index) {
+                        continue;
+                    }
+                    if child.child_clip.as_deref() != Some(slot.clip.as_str()) {
+                        rebuild = true;
+                        continue;
+                    }
+                    found = true;
+                    child.time_offset = child_offset;
+                    child.visible_from = child_start;
                 }
-                if child.child_clip.as_deref() != Some(slot.clip.as_str()) {
+                if !found && known {
                     rebuild = true;
-                    continue;
                 }
-                found = true;
-                child.time_offset = child_offset;
-                child.visible_from = child_start;
             }
-            if !found && known {
-                rebuild = true;
-            }
+            index += 1;
         }
         rebuild
     }
@@ -1276,12 +1323,7 @@ impl PlayerInst {
             .as_deref()
             .and_then(|snapshot| snapshot.icons.get(&node.local.src));
         let (origin_x, origin_y) = icon.map_or((0.0, 0.0), |icon| (icon.origin_x, icon.origin_y));
-        let color = [
-            i64::from(node.accumulated.color[0]),
-            i64::from(node.accumulated.color[1]),
-            i64::from(node.accumulated.color[2]),
-            i64::from(node.accumulated.color[3]),
-        ];
+        let color = node.accumulated.colors[0].map(i64::from);
         // A node without a source draws no box, so it reports no corners.
         let Some(icon) = icon else {
             return (mtx, [0.0; 8], color, (origin_x, origin_y));
@@ -1562,14 +1604,16 @@ impl PlayerInst {
         }
         let snapshot = self.snapshot.clone();
         let color = color_bytes(self.color.bytes);
-        let clear = clear_fill(self.clear_enabled, self.clear_color);
         let affine = self.affine;
         let nodes = &self.nodes;
         let mut tinted = std::mem::take(&mut self.tinted);
-        // Every draw starts from a clear target; the previous pose never
-        // survives into this frame.
-        for pixel in bitmap.rgba.chunks_exact_mut(4) {
-            pixel.copy_from_slice(&clear);
+        // A draw leaves the target image in place unless the player enables an
+        // explicit clear; the pixels outside the drawn items survive.
+        if self.clear_enabled {
+            let clear = clear_fill(self.clear_enabled, self.clear_color);
+            for pixel in bitmap.rgba.chunks_exact_mut(4) {
+                pixel.copy_from_slice(&clear);
+            }
         }
         let missing = composite_pose(
             bitmap,
@@ -1586,9 +1630,10 @@ impl PlayerInst {
         );
         self.tinted = tinted;
         bitmap.mark_dirty();
-        if let Some(layer) = scene.layer_mut(layer_id) {
-            layer.image_modified = true;
-        }
+        // The pose changed the target's pixels, not the layer tree: setting
+        // `imageModified` must not invalidate the cached layer subtree or the
+        // whole render scene is rebuilt on every motion frame.
+        scene.mark_layer_image_modified(layer_id);
         for src in missing {
             if self.missing_textures.insert(src.clone()) {
                 log::warn!("Motion.Player.draw: no texture for {src}");
@@ -2272,7 +2317,7 @@ fn draw_node(
             fill_placeholder_quad_offset(
                 bitmap,
                 node,
-                frame.settings.color,
+                compose_tint(node.accumulated.colors, frame.settings.color)[0],
                 frame.settings.affine,
                 opacity,
                 offset,
@@ -2293,7 +2338,13 @@ fn draw_node(
     if width <= 0 || height <= 0 {
         return;
     }
-    let Some(source) = tinted_source(frame, &pixels, crop) else {
+    let Some(source) = tinted_source(
+        frame,
+        node.accumulated.colors,
+        node.accumulated.blend_mode,
+        &pixels,
+        crop,
+    ) else {
         return;
     };
     let matrix = node.matrix;
@@ -2370,28 +2421,61 @@ fn draw_node(
     draw_icon(bitmap, &source, width, height, corners, opa, mode);
 }
 
-/// The cropped icon source tinted by the player colour, from the cache or
+/// The node's four vertex colours composed with the player's diffuse colour.
+///
+/// The default half-gray and an opaque-white set mean "no tint" and leave the
+/// source untouched; every other set multiplies the source by the
+/// interpolated corner colour.
+fn compose_tint(node: [[u8; 4]; 4], diffuse: [u8; 4]) -> [[u8; 4]; 4] {
+    let neutral = node == DEFAULT_NODE_COLORS || node.iter().all(|corner| *corner == [0xFF; 4]);
+    let mut colors = if neutral { [[0xFF; 4]; 4] } else { node };
+    if diffuse != [0xFF; 4] {
+        for corner in &mut colors {
+            for (channel, scale) in corner.iter_mut().zip(diffuse) {
+                *channel = (u32::from(*channel) * u32::from(scale) / 255) as u8;
+            }
+        }
+    }
+    colors
+}
+
+/// The cropped icon source tinted by the node colours, from the cache or
 /// freshly built.
 fn tinted_source(
     frame: &mut DrawFrame<'_>,
+    node_colors: [[u8; 4]; 4],
+    blend_mode: i32,
     pixels: &Arc<Pixels>,
     crop: RectI,
 ) -> Option<Arc<BitmapState>> {
+    // The node's own colour decides whether the per-node half-alpha divisor
+    // applies; the default half-gray and opaque white have no node tint.
+    let neutral =
+        node_colors == DEFAULT_NODE_COLORS || node_colors.iter().all(|corner| *corner == [0xFF; 4]);
+    let colors = compose_tint(node_colors, frame.settings.color);
+    let half_alpha = !neutral && (blend_mode & 0xF0) == 0x10;
     let key = TintKey {
-        color: frame.settings.color,
+        colors,
+        half_alpha,
         crop,
         pixels: Arc::as_ptr(pixels) as usize,
     };
     if let Some(source) = frame.tinted.get(&key) {
         return Some(source.clone());
     }
-    let source = Arc::new(tint_crop(pixels, crop, frame.settings.color)?);
+    let source = Arc::new(tint_crop(pixels, crop, colors, half_alpha)?);
     frame.tinted.insert(key, source.clone());
     Some(source)
 }
 
-/// Crop `pixels` to `crop` and scale each channel by `color`.
-fn tint_crop(pixels: &Pixels, crop: RectI, color: [u8; 4]) -> Option<BitmapState> {
+/// Crop `pixels` to `crop` and scale each channel by the bilinearly
+/// interpolated corner colour.
+fn tint_crop(
+    pixels: &Pixels,
+    crop: RectI,
+    colors: [[u8; 4]; 4],
+    half_alpha: bool,
+) -> Option<BitmapState> {
     let width = u32::try_from(crop.2.checked_sub(crop.0)?).ok()?;
     let height = u32::try_from(crop.3.checked_sub(crop.1)?).ok()?;
     if width == 0 || height == 0 {
@@ -2402,17 +2486,47 @@ fn tint_crop(pixels: &Pixels, crop: RectI, color: [u8; 4]) -> Option<BitmapState
     let row_bytes = width_usize.checked_mul(4)?;
     let source_width = usize::try_from(pixels.width).ok()?;
     let source_left = usize::try_from(crop.0).ok()?;
+    let divisor = if half_alpha { 128u32 } else { 255u32 };
+    let span_x = i32::try_from(width).ok()?.saturating_sub(1).max(1);
+    let span_y = i32::try_from(height).ok()?.saturating_sub(1).max(1);
+    let lerp = |from: u8, to: u8, step: i32, span: i32| -> u32 {
+        let from = i32::from(from);
+        let to = i32::from(to);
+        (from + step * (to - from) / span) as u32
+    };
     let mut rgba = Vec::with_capacity(row_bytes.checked_mul(height_usize)?);
     for y in crop.1..crop.3 {
         let row = usize::try_from(y).ok()?.checked_mul(source_width)?;
         let start = row.checked_add(source_left)?.checked_mul(4)?;
         let row = pixels.rgba.get(start..start.checked_add(row_bytes)?)?;
-        for pixel in row.chunks_exact(4) {
+        let row_step = y - crop.1;
+        let left = [
+            lerp(colors[0][0], colors[3][0], row_step, span_y),
+            lerp(colors[0][1], colors[3][1], row_step, span_y),
+            lerp(colors[0][2], colors[3][2], row_step, span_y),
+            lerp(colors[0][3], colors[3][3], row_step, span_y),
+        ];
+        let right = [
+            lerp(colors[1][0], colors[2][0], row_step, span_y),
+            lerp(colors[1][1], colors[2][1], row_step, span_y),
+            lerp(colors[1][2], colors[2][2], row_step, span_y),
+            lerp(colors[1][3], colors[2][3], row_step, span_y),
+        ];
+        for (index, pixel) in row.chunks_exact(4).enumerate() {
+            let column = i32::try_from(index).ok()?;
             rgba.extend_from_slice(&[
-                (u32::from(pixel[0]) * u32::from(color[0]) / 255) as u8,
-                (u32::from(pixel[1]) * u32::from(color[1]) / 255) as u8,
-                (u32::from(pixel[2]) * u32::from(color[2]) / 255) as u8,
-                (u32::from(pixel[3]) * u32::from(color[3]) / 255) as u8,
+                ((u32::from(pixel[0]) * lerp(left[0] as u8, right[0] as u8, column, span_x))
+                    / divisor)
+                    .min(255) as u8,
+                ((u32::from(pixel[1]) * lerp(left[1] as u8, right[1] as u8, column, span_x))
+                    / divisor)
+                    .min(255) as u8,
+                ((u32::from(pixel[2]) * lerp(left[2] as u8, right[2] as u8, column, span_x))
+                    / divisor)
+                    .min(255) as u8,
+                ((u32::from(pixel[3]) * lerp(left[3] as u8, right[3] as u8, column, span_x))
+                    / divisor)
+                    .min(255) as u8,
             ]);
         }
     }
@@ -3819,9 +3933,9 @@ mod tests {
     use super::color_bytes;
     use super::local_matrix;
     use super::{
-        BitmapState, DrawSettings, MotionNode, MotionSnapshot, PlayerInst, build_node_tree,
-        composite_pose, draw_icon, draw_point, evaluate_frames, node_drawable, prime_timelines,
-        unit_axis_aligned_origin,
+        BitmapState, DEFAULT_NODE_COLORS, DrawSettings, MotionNode, MotionSnapshot, PlayerInst,
+        build_node_tree, composite_pose, draw_icon, draw_point, evaluate_frames, node_drawable,
+        prime_timelines, unit_axis_aligned_origin,
     };
     use crate::engine_api::Storage;
     use crate::engine_api::layer_ops::{AffineBlit, BlitOptions, BlitSource, affine_blit};
@@ -4079,10 +4193,9 @@ mod tests {
         assert_eq!(texel(5, 1), [0, 0, 0, 0]);
     }
 
-    /// A child motion exists only from the parent keyframe that named it, so
-    /// it stays hidden before that moment
-    /// (`reference/cpp/plugins/motionplayer/PlayerUpdateChildMotion.cpp:106-215`,
-    /// `PlayerUpdateLayerEval.cpp:253`).
+    /// A child motion exists from the player's start, so it draws its first
+    /// pose before the keyframe that named it
+    /// (`reference/cpp/plugins/motionplayer/PlayerUpdateChildMotion.cpp:171-213`).
     #[test]
     fn a_child_motion_starts_at_its_parent_keyframe() {
         let parent_layer = dict(vec![
@@ -4136,7 +4249,8 @@ mod tests {
         prime_timelines(&snapshot, &mut player.timelines);
         player.nodes = build_node_tree(&snapshot, snapshot.clip("parent"));
         assert_eq!(player.nodes.len(), 3, "the child clip is expanded");
-        // Before the keyframe the child does not exist yet.
+        // The child exists from the player's start: its clock is zero before
+        // the keyframe that named it, so it draws its first pose right away.
         player
             .timelines
             .get_mut("parent")
@@ -4144,10 +4258,10 @@ mod tests {
             .current_time = 0.0;
         player.update_layers();
         assert!(
-            !player.nodes[2].draw_flag,
-            "the child stays hidden before its keyframe"
+            player.nodes[2].draw_flag,
+            "the child draws from the player's start"
         );
-        // From the keyframe on it draws.
+        // From the keyframe on it keeps drawing.
         player
             .timelines
             .get_mut("parent")
@@ -4157,6 +4271,319 @@ mod tests {
         assert!(
             player.nodes[2].draw_flag,
             "the child draws from its keyframe"
+        );
+    }
+
+    /// A child motion's clock is bounded by the child clip's own length: the
+    /// child stops at its clip's end instead of running past it
+    /// (`reference/cpp/plugins/motionplayer/PlayerUpdateChildMotion.cpp:171-213`,
+    /// `reference/cpp/plugins/motionplayer/PlayerCore.cpp:578-581`).
+    #[test]
+    fn a_child_motion_stops_at_the_end_of_its_own_clip() {
+        let parent_layer = dict(vec![
+            ("label", text("main")),
+            ("type", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![dict(vec![
+                    ("time", num(40)),
+                    ("type", num(2)),
+                    ("content", dict(vec![("src", text("motion/test/child"))])),
+                ])]),
+            ),
+        ]);
+        // The child clip is shorter than its own last keyframe, so a clock
+        // that ran past the clip's end would show the later keyframe.
+        let child_layer = dict(vec![
+            ("label", text("child_layer")),
+            ("type", num(0)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    dict(vec![
+                        ("time", num(0)),
+                        ("type", num(2)),
+                        (
+                            "content",
+                            dict(vec![
+                                ("src", text("src/test/child")),
+                                ("coord", PsbValue::List(vec![num(10), num(0)])),
+                            ]),
+                        ),
+                    ]),
+                    dict(vec![
+                        ("time", num(8)),
+                        ("type", num(2)),
+                        (
+                            "content",
+                            dict(vec![
+                                ("src", text("src/test/child")),
+                                ("coord", PsbValue::List(vec![num(30), num(0)])),
+                            ]),
+                        ),
+                    ]),
+                    dict(vec![("time", num(9)), ("type", num(0))]),
+                ]),
+            ),
+        ]);
+        let parent_clip = dict(vec![
+            ("lastTime", num(120)),
+            ("layer", PsbValue::List(vec![parent_layer])),
+        ]);
+        let child_clip = dict(vec![
+            ("lastTime", num(4)),
+            ("layer", PsbValue::List(vec![child_layer])),
+        ]);
+        let object = dict(vec![(
+            "test",
+            dict(vec![(
+                "motion",
+                dict(vec![("parent", parent_clip), ("child", child_clip)]),
+            )]),
+        )]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root: dict(vec![("object", object)]),
+                resources: Vec::new(),
+            },
+            "child.psb",
+        );
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "parent".to_string(),
+            ..PlayerInst::default()
+        };
+        prime_timelines(&snapshot, &mut player.timelines);
+        player.nodes = build_node_tree(&snapshot, snapshot.clip("parent"));
+        assert_eq!(player.nodes.len(), 3, "the child clip is expanded");
+        // The child's clock starts at the keyframe that named the clip.
+        player
+            .timelines
+            .get_mut("parent")
+            .expect("the timeline")
+            .current_time = 40.0;
+        player.update_layers();
+        assert_eq!(
+            player.nodes[2].local.x, 10.0,
+            "the child starts at its keyframe"
+        );
+        // Past the child clip's end the clock stops there, so the child keeps
+        // the pose its own length allows.
+        player
+            .timelines
+            .get_mut("parent")
+            .expect("the timeline")
+            .current_time = 100.0;
+        player.update_layers();
+        assert_eq!(
+            player.nodes[2].local.x, 10.0,
+            "the child stops at the end of its own clip"
+        );
+    }
+
+    /// A child clip that loops restarts at its loop time instead of stopping
+    /// at its end (`reference/cpp/plugins/motionplayer/RuntimeSupport.h:445-458`).
+    #[test]
+    fn a_looping_child_motion_wraps_into_its_own_clip() {
+        let parent_layer = dict(vec![
+            ("label", text("main")),
+            ("type", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![dict(vec![
+                    ("time", num(40)),
+                    ("type", num(2)),
+                    ("content", dict(vec![("src", text("motion/test/child"))])),
+                ])]),
+            ),
+        ]);
+        let child_layer = dict(vec![
+            ("label", text("child_layer")),
+            ("type", num(0)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    dict(vec![
+                        ("time", num(0)),
+                        ("type", num(2)),
+                        (
+                            "content",
+                            dict(vec![
+                                ("src", text("src/test/child")),
+                                ("coord", PsbValue::List(vec![num(10), num(0)])),
+                            ]),
+                        ),
+                    ]),
+                    dict(vec![
+                        ("time", num(8)),
+                        ("type", num(2)),
+                        (
+                            "content",
+                            dict(vec![
+                                ("src", text("src/test/child")),
+                                ("coord", PsbValue::List(vec![num(30), num(0)])),
+                            ]),
+                        ),
+                    ]),
+                    dict(vec![("time", num(9)), ("type", num(0))]),
+                ]),
+            ),
+        ]);
+        let parent_clip = dict(vec![
+            ("lastTime", num(120)),
+            ("layer", PsbValue::List(vec![parent_layer])),
+        ]);
+        let child_clip = dict(vec![
+            ("lastTime", num(10)),
+            ("loopTime", num(4)),
+            ("layer", PsbValue::List(vec![child_layer])),
+        ]);
+        let object = dict(vec![(
+            "test",
+            dict(vec![(
+                "motion",
+                dict(vec![("parent", parent_clip), ("child", child_clip)]),
+            )]),
+        )]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root: dict(vec![("object", object)]),
+                resources: Vec::new(),
+            },
+            "child.psb",
+        );
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "parent".to_string(),
+            ..PlayerInst::default()
+        };
+        prime_timelines(&snapshot, &mut player.timelines);
+        player.nodes = build_node_tree(&snapshot, snapshot.clip("parent"));
+        // A parent clock of 100 puts the child 60 frames past its keyframe;
+        // the child clip wraps that into its own length and lands on its
+        // first keyframe instead of its last one.
+        player
+            .timelines
+            .get_mut("parent")
+            .expect("the timeline")
+            .current_time = 100.0;
+        player.update_layers();
+        assert_eq!(
+            player.nodes[2].local.x, 10.0,
+            "the looping child wraps into its own clip"
+        );
+    }
+
+    /// The clip a type-3 node names first exists from the player's start: its
+    /// clock is zero before the keyframe that named it, so the child draws its
+    /// first pose right away, and the clock stays bounded by the child clip's
+    /// own length afterwards
+    /// (`reference/cpp/plugins/motionplayer/PlayerUpdateChildMotion.cpp:171-213`).
+    #[test]
+    fn a_child_motion_draws_before_the_keyframe_that_named_it() {
+        let parent_layer = dict(vec![
+            ("label", text("main")),
+            ("type", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![dict(vec![
+                    ("time", num(40)),
+                    ("type", num(2)),
+                    ("content", dict(vec![("src", text("motion/test/child"))])),
+                ])]),
+            ),
+        ]);
+        // The child clip is shorter than its own last keyframe, so a clock
+        // that ran past the clip's end would show the later keyframe.
+        let child_layer = dict(vec![
+            ("label", text("child_layer")),
+            ("type", num(0)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    dict(vec![
+                        ("time", num(0)),
+                        ("type", num(2)),
+                        (
+                            "content",
+                            dict(vec![
+                                ("src", text("src/test/child")),
+                                ("coord", PsbValue::List(vec![num(10), num(0)])),
+                            ]),
+                        ),
+                    ]),
+                    dict(vec![
+                        ("time", num(8)),
+                        ("type", num(2)),
+                        (
+                            "content",
+                            dict(vec![
+                                ("src", text("src/test/child")),
+                                ("coord", PsbValue::List(vec![num(30), num(0)])),
+                            ]),
+                        ),
+                    ]),
+                    dict(vec![("time", num(9)), ("type", num(0))]),
+                ]),
+            ),
+        ]);
+        let parent_clip = dict(vec![
+            ("lastTime", num(120)),
+            ("layer", PsbValue::List(vec![parent_layer])),
+        ]);
+        let child_clip = dict(vec![
+            ("lastTime", num(4)),
+            ("layer", PsbValue::List(vec![child_layer])),
+        ]);
+        let object = dict(vec![(
+            "test",
+            dict(vec![(
+                "motion",
+                dict(vec![("parent", parent_clip), ("child", child_clip)]),
+            )]),
+        )]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root: dict(vec![("object", object)]),
+                resources: Vec::new(),
+            },
+            "child.psb",
+        );
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "parent".to_string(),
+            ..PlayerInst::default()
+        };
+        prime_timelines(&snapshot, &mut player.timelines);
+        player.nodes = build_node_tree(&snapshot, snapshot.clip("parent"));
+        assert_eq!(player.nodes.len(), 3, "the child clip is expanded");
+        // The parent's start is before the keyframe that named the child, and
+        // the child's clock is zero there.
+        player
+            .timelines
+            .get_mut("parent")
+            .expect("the timeline")
+            .current_time = 0.0;
+        player.update_layers();
+        assert!(
+            player.nodes[2].draw_flag,
+            "the child draws before the keyframe that named it"
+        );
+        assert_eq!(
+            player.nodes[2].local.x, 10.0,
+            "the child shows its own first frame"
+        );
+        // Past the child clip's end the clock stops there, so the child keeps
+        // the pose its own length allows.
+        player
+            .timelines
+            .get_mut("parent")
+            .expect("the timeline")
+            .current_time = 100.0;
+        player.update_layers();
+        assert_eq!(
+            player.nodes[2].local.x, 10.0,
+            "the child stops at the end of its own clip"
         );
     }
 
@@ -4281,7 +4708,7 @@ mod tests {
             height: 1,
             rgba: vec![10, 20, 30, 255],
         };
-        let tinted = super::tint_crop(&pixels, (0, 0, 1, 1), [255, 0, 0, 255])
+        let tinted = super::tint_crop(&pixels, (0, 0, 1, 1), [[255, 0, 0, 255]; 4], false)
             .expect("the tint covers the texel");
         assert_eq!(tinted.rgba, vec![10, 0, 0, 255]);
     }
@@ -4836,6 +5263,61 @@ mod tests {
             "the multiplicative mode darkens the texel"
         );
         assert_ne!(over.rgba, multiplied.rgba);
+    }
+
+    /// A node's own four vertex colours tint its icon; the reference applies
+    /// them to the source bitmap and skips the default half-gray and an
+    /// opaque-white set (`reference/cpp/plugins/motionplayer/SourceCache.cpp:44-55`,
+    /// `:82-150`). The `0x10` blend bit divides by 128 instead of 255
+    /// (`SourceCache.cpp:719-729`).
+    #[test]
+    fn a_node_colour_tints_its_own_icon() {
+        let (storage, snapshot) = icon_fixture();
+        let draw_with = |colors: [[u8; 4]; 4], blend_mode: i32| {
+            let mut node = MotionNode::new(0, "art".to_string());
+            node.draw_flag = true;
+            node.local.src = "src/group/art".to_string();
+            node.accumulated.opacity = 1.0;
+            node.accumulated.blend_mode = blend_mode;
+            node.accumulated.colors = colors;
+            let mut player = PlayerInst {
+                nodes: vec![MotionNode::new(0, String::new()), node],
+                ..PlayerInst::default()
+            };
+            let color = color_bytes(player.color.bytes);
+            let affine = player.affine;
+            let mut bitmap = BitmapState::new(4, 4, vec![0u8; 4 * 4 * 4]);
+            let missing = composite_pose(
+                &mut bitmap,
+                &player.nodes,
+                Some(&snapshot),
+                Some(&storage),
+                DrawSettings {
+                    color,
+                    affine,
+                    preview: player.preview,
+                    mask_mode: player.mask_mode,
+                },
+                &mut player.tinted,
+            );
+            assert!(missing.is_empty());
+            [
+                bitmap.rgba[0],
+                bitmap.rgba[1],
+                bitmap.rgba[2],
+                bitmap.rgba[3],
+            ]
+        };
+        // The decoded texel is (30, 20, 10, 255): a red node colour keeps
+        // only red.
+        assert_eq!(draw_with([[255, 0, 0, 255]; 4], 0), [30, 0, 0, 255]);
+        // The default half-gray and opaque white mean "no tint".
+        assert_eq!(draw_with(DEFAULT_NODE_COLORS, 0), [30, 20, 10, 255]);
+        assert_eq!(draw_with(DEFAULT_NODE_COLORS, 16), [30, 20, 10, 255]);
+        assert_eq!(draw_with([[255, 255, 255, 255]; 4], 0), [30, 20, 10, 255]);
+        // The 0x10 blend bit halves the tint divisor, so alpha 128 reaches 255.
+        assert_eq!(draw_with([[255, 255, 255, 128]; 4], 0), [30, 20, 10, 128]);
+        assert_eq!(draw_with([[255, 255, 255, 128]; 4], 16), [59, 39, 19, 255]);
     }
 
     /// A half transparent node keeps the source alpha under a non-default

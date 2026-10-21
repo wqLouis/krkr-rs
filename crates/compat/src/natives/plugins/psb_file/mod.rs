@@ -39,8 +39,8 @@
 //!   `i32::MAX` wrap to negative;
 //! * `PSBResource` → a TJS **octet** (`:201-204`) — octet values cannot
 //!   cross the port's member ABI as scalars, so resource members are
-//!   installed by a script-side `<% … %>` literal assignment against the
-//!   parent object (see [`set_octet_member`]);
+//!   installed on the parent object through the engine's octet member
+//!   setter (see [`set_built`]);
 //! * nested lists/dictionaries → real TJS `Array`/`Dictionary` objects.
 //!
 //! # `psb://` media
@@ -154,61 +154,6 @@ fn dictionary_new(host: &Tjs2Engine) -> Result<DetachedValue, String> {
     eval_object(host, "%[]", "PSBFile.dictionary")
 }
 
-/// The temporary globals through which an octet-valued member is installed.
-///
-/// A `VAL_OCTET` cannot cross the port's member ABI as a scalar (the safe
-/// `TjsValue` surface has no octet variant and a handle-less `Object` value
-/// resolves against the last object result), but a TJS script *can* build a
-/// `<% … %>` literal. The parent object is parked in a temporary global, the
-/// assignment runs as script text, and the globals are cleared afterwards —
-/// so the reference's octet member (`PSBValue.cpp:201-204`) is reproduced
-/// without changing the VM surface.
-const PSB_BUF_GLOBAL: &str = "__krkr_psb_buf";
-const PSB_KEY_GLOBAL: &str = "__krkr_psb_key";
-
-/// Install `bytes` as the octet member `key` on `parent` via a script-side
-/// octet literal (see [`PSB_BUF_GLOBAL`]).
-fn set_octet_member(
-    host: &Tjs2Engine,
-    parent: tjs::Tjs2ValueId,
-    key: &str,
-    bytes: &[u8],
-) -> Result<(), String> {
-    let global = eval_object(host, "global", "PSBFile.global")?;
-    // A duplicate so the caller's own retention of `parent` stays intact;
-    // `set_member` consumes the duplicate.
-    let holder = host.duplicate_retained(parent)?;
-    host.set_member(
-        global.raw_id(),
-        PSB_BUF_GLOBAL,
-        &TjsValue::Retained(holder.raw_id().as_ptr() as u64),
-    )?;
-    drop(holder);
-    host.set_member(
-        global.raw_id(),
-        PSB_KEY_GLOBAL,
-        &TjsValue::String(key.to_string()),
-    )?;
-    let mut source = String::with_capacity(bytes.len() * 3 + 64);
-    source.push_str("global.");
-    source.push_str(PSB_BUF_GLOBAL);
-    source.push_str("[global.");
-    source.push_str(PSB_KEY_GLOBAL);
-    source.push_str("] = <% ");
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(source, "{byte:02x} ");
-    }
-    source.push_str("%>;");
-    let result = host.exec_script(&source, "PSBFile.resource");
-    // Clear the temporaries on every path so no reference to the parent
-    // object survives the call.
-    let _ = host.set_member(global.raw_id(), PSB_BUF_GLOBAL, &TjsValue::Void);
-    let _ = host.set_member(global.raw_id(), PSB_KEY_GLOBAL, &TjsValue::Void);
-    result.map(|_| ()).map_err(|error| error.to_string())?;
-    Ok(())
-}
-
 /// Install `built` as `key` on `parent`.
 fn set_built(
     host: &Tjs2Engine,
@@ -224,7 +169,7 @@ fn set_built(
             drop(object);
             Ok(())
         }
-        Built::Octet(bytes) => set_octet_member(host, parent, key, &bytes),
+        Built::Octet(bytes) => host.set_member_octet(parent, key, &bytes),
     }
 }
 

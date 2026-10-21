@@ -19,6 +19,7 @@ use common::vm_lock;
 use compat::CompatHost;
 use engine::Scene;
 use engine::Storage;
+use engine::text::TextEngine;
 use fs::FileSystem;
 use tjs::{Tjs2Engine, TjsValue};
 
@@ -223,6 +224,195 @@ fn font_metrics_use_the_l2_text_engine() {
     // (`reference/cpp/core/visual/LayerIntf.cpp:11716-11746`).
     assert_eq!(env.eval_int("f.getTextWidth('Hello')"), width);
     assert_eq!(env.eval_int("f.getTextHeight('Hello')"), 24);
+}
+
+/// Reference: `tTJSNI_Font::GetTextHeight` returns `abs(Font.Height)` and
+/// measures nothing (`reference/cpp/core/visual/LayerIntf.cpp:11724-11731`),
+/// so the height is the font's own height whatever the text is.
+#[test]
+fn font_get_text_height_is_the_font_height() {
+    let _lock = vm_lock();
+    let env = Env::new(None);
+    env.run("var f = new Font('Ghost', 24, 0);");
+
+    // The height is the font's own height, whatever the text is.
+    assert_eq!(env.eval_int("f.height"), 24);
+    assert_eq!(env.eval_int("f.getTextHeight('Hello')"), 24);
+    assert_eq!(env.eval_int("f.getTextHeight('')"), 24);
+
+    // A negative height is normalized to positive
+    // (`reference/cpp/core/visual/LayerIntf.cpp:5962-5969`).
+    env.run("f.height = -18;");
+    assert_eq!(env.eval_int("f.height"), 18);
+    assert_eq!(env.eval_int("f.getTextHeight('x')"), 18);
+
+    // The string argument is required (the reference's arity).
+    assert!(env.eval("f.getTextHeight()").is_err());
+}
+
+/// Reference: `tTJSNI_Font::GetTextHeight` returns `abs(Font.Height)` without
+/// reading the font's data (`reference/cpp/core/visual/LayerIntf.cpp:11724-11731`),
+/// so the height is reported even where the width cannot be measured.
+#[test]
+fn font_get_text_height_does_not_read_the_font_data() {
+    let _lock = vm_lock();
+    let Some((font_dir, font_name)) = test_font() else {
+        return;
+    };
+    let font_bytes = std::fs::read(font_dir.join(&font_name)).expect("read test font");
+    let env = common::Env::with_storage();
+    let game_dir = env.game_dir().expect("game dir").clone();
+    std::fs::write(game_dir.join("Pre"), &font_bytes).expect("write face");
+    std::fs::write(game_dir.join("sample.tft"), build_tft(&[b'A' as u16], 7)).expect("write tft");
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         var f = new Font('Pre', 12, 0); \
+         f.mapPrerenderedFont('sample.tft'); \
+         l.font.face = 'Pre'; \
+         l.font.height = 12; \
+         l.font.bold = false; \
+         l.font.italic = false; \
+         l.font.angle = 0;",
+    );
+    // The pre-rendered body is read on first use, so removing it makes the
+    // width unreadable.
+    std::fs::remove_file(game_dir.join("sample.tft")).expect("remove the tft");
+    assert!(
+        env.eval("l.font.getTextWidth('AB')").is_err(),
+        "the width needs the pre-rendered data"
+    );
+    // The height is the font's own height and needs no data at all.
+    assert_eq!(env.eval_int("l.font.getTextHeight('AB')"), 12);
+}
+
+/// Reference: `tTJSNI_Font::GetTextWidthDirect` measures a run one character
+/// at a time — the rasterizer's per-character extent, rounded to whole pixels
+/// (`reference/cpp/core/visual/LayerIntf.cpp:11700-11714`,
+/// `reference/cpp/core/visual/FreeType.cpp:620-630`) — so a run measures as
+/// the sum of its characters' advances. A shaped run's width applies kerning
+/// and rounds once, so it is narrower than that sum
+/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473`).
+#[test]
+fn font_text_width_sums_the_per_character_advances() {
+    let Some((dir, name)) = test_font() else {
+        return;
+    };
+    let _lock = vm_lock();
+    let storage = Storage::mount_archives(
+        FileSystem::host(&dir),
+        dir.clone(),
+        std::iter::empty::<&str>(),
+    )
+    .expect("mount font directory");
+    let env = Env::new(Some(storage));
+    env.run(&format!("var f = new Font('{name}', 48, 0);"));
+
+    // "AV" is a kerned pair: the shaped run is narrower than the two
+    // characters measured on their own.
+    let whole = env.eval_int("f.getTextWidth('AV')");
+    let parts = env.eval_int("f.getTextWidth('A')") + env.eval_int("f.getTextWidth('V')");
+    assert_eq!(
+        whole, parts,
+        "a run must measure as the sum of its characters' advances"
+    );
+    assert!(parts > 0, "the characters must have a positive advance");
+}
+
+/// The last face registered by `System.addFont` is the default font, so a
+/// face no source knows — a pre-rendered `*name`, for example — falls back to
+/// it rather than to the host's default family.
+#[test]
+fn an_unknown_face_falls_back_to_the_last_registered_font() {
+    let _lock = vm_lock();
+    let Some((font_dir, font_name)) = test_font() else {
+        return;
+    };
+    let bytes = std::fs::read(font_dir.join(&font_name)).expect("read test font");
+    let mut engine = TextEngine::new();
+    let id = engine.add_font(&bytes, 0).expect("register the face");
+    let family = engine.family_name(id).expect("family name").to_string();
+
+    let env = common::Env::with_storage();
+    let game_dir = env.game_dir().expect("game dir").clone();
+    std::fs::write(game_dir.join("Pre.ttf"), &bytes).expect("write face");
+    env.run(
+        "Plugins.link('addFont.dll'); System.addFont('Pre.ttf'); \
+         var f = new Font('*missing', 12, 0); f.getTextWidth('A');",
+    );
+    match env.eval_ok("Font.defaultFaceName") {
+        TjsValue::String(value) => assert_eq!(
+            value, family,
+            "the default must be the last registered face, not the host fallback"
+        ),
+        other => panic!("Font.defaultFaceName returned {other:?}"),
+    }
+}
+
+/// A pseudo-face (`*name`) is tried as an ordinary candidate and, when no
+/// source knows it, falls back to the default face.
+///
+/// Reference: the font map is keyed by family name
+/// (`reference/cpp/core/visual/FontImpl.cpp:96-131`), so a name the map does
+/// not hold — a pseudo-face among them — is answered by the default font
+/// (`reference/cpp/core/visual/FontImpl.cpp:159-168`).
+#[test]
+fn a_pseudo_face_measures_with_the_default_registered_face() {
+    let _lock = vm_lock();
+    let Some((font_dir, font_name)) = test_font() else {
+        return;
+    };
+    let bytes = std::fs::read(font_dir.join(&font_name)).expect("read test font");
+    let mut engine = TextEngine::new();
+    let id = engine.add_font(&bytes, 0).expect("register the face");
+    let family = engine.family_name(id).expect("family name").to_string();
+
+    let env = common::Env::with_storage();
+    let game_dir = env.game_dir().expect("game dir").clone();
+    std::fs::write(game_dir.join("Pre.ttf"), &bytes).expect("write face");
+    env.run(&format!(
+        "Plugins.link('addFont.dll'); System.addFont('Pre.ttf'); \
+         var pseudo = new Font('*システム', 24, 0); pseudo.getTextWidth('A'); \
+         var registered = new Font('{family}', 24, 0);"
+    ));
+    let pseudo_width = env.eval_int("pseudo.getTextWidth('A')");
+    let registered_width = env.eval_int("registered.getTextWidth('A')");
+    assert!(
+        pseudo_width > 0,
+        "a pseudo-face must measure with the default face, got {pseudo_width}"
+    );
+    assert_eq!(
+        pseudo_width, registered_width,
+        "a pseudo-face must measure exactly like the default registered face"
+    );
+}
+
+/// A pseudo-face candidate is tried like any other candidate: a name spelled
+/// like a font file is read from the storage.
+///
+/// Reference: the font map is keyed by family name
+/// (`reference/cpp/core/visual/FontImpl.cpp:96-131,277-289`), so a name the
+/// map does not hold is looked up among the enumerated fonts and, when it is
+/// not there either, answered by the default font
+/// (`reference/cpp/core/visual/FontImpl.cpp:159-168`).
+#[test]
+fn a_pseudo_face_candidate_is_read_from_the_storage() {
+    let _lock = vm_lock();
+    let Some((font_dir, font_name)) = test_font() else {
+        return;
+    };
+    let bytes = std::fs::read(font_dir.join(&font_name)).expect("read test font");
+
+    let env = common::Env::with_storage();
+    let game_dir = env.game_dir().expect("game dir").clone();
+    std::fs::write(game_dir.join("*システム.ttf"), &bytes).expect("write pseudo face");
+    let storage = env.storage().expect("storage");
+    let read_bytes = storage.read_bytes();
+    env.run("var pseudo = new Font('*システム.ttf', 24, 0); pseudo.getTextWidth('A');");
+    assert!(
+        storage.read_bytes() > read_bytes,
+        "a pseudo-face candidate must be read from the storage like any other"
+    );
 }
 
 #[test]
@@ -552,6 +742,143 @@ fn layer_draw_text_prerendered_pixels_match_the_coverage() {
         ),
         (1, 1),
         "the painted pixels form one 2x2 block"
+    );
+    let mut alphas = [0u8; 4];
+    for (x, y, alpha) in &painted {
+        alphas[((y - y0) * 2 + (x - x0)) as usize] = *alpha;
+    }
+    assert_eq!(alphas, [0x40, 0x80, 0xC0, 0xFC]);
+}
+
+/// Reference: a character the mapped `.tft` does not carry falls back to the
+/// outline rasterizer, whose glyph box starts at `y + ascent - bitmap_top`
+/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:911-914`) with the
+/// ascent truncated to whole pixels
+/// (`reference/cpp/core/visual/FreeType.cpp:494`). A rounded ascent puts the
+/// fallback glyph a pixel below the row the reference draws it on.
+#[test]
+fn a_prerendered_fallback_glyph_sits_on_the_truncated_ascent() {
+    let _lock = vm_lock();
+    let Some((font_dir, font_name)) = test_font() else {
+        return;
+    };
+    let font_bytes = std::fs::read(font_dir.join(&font_name)).expect("read test font");
+    let mut text_engine = engine::text::TextEngine::new();
+    let face = text_engine
+        .add_font(&font_bytes, 0)
+        .expect("register the face");
+    let mut style = engine::text::TextStyle::new(12.0);
+    style.color = [255, 255, 255, 255];
+    let metrics = text_engine.font_metrics(face, 12.0).expect("font metrics");
+    let ascent = metrics.ascent.floor() as i32;
+    let fallback = text_engine
+        .rasterize_glyph(face, 'B', &style)
+        .expect("rasterize the fallback glyph");
+    let first_row = fallback
+        .coverage
+        .iter()
+        .position(|coverage| *coverage > 0)
+        .map(|index| index / fallback.width as usize)
+        .expect("the fallback glyph has ink") as i32;
+
+    let env = common::Env::with_storage();
+    let game_dir = env.game_dir().expect("game dir").clone();
+    // The face name carries a font extension, so the face resolves to the
+    // stored bytes and the test does not depend on the host's fonts.
+    std::fs::write(game_dir.join("Pre.ttf"), &font_bytes).expect("write face");
+    // The `.tft` carries only 'A', so 'B' takes the rasterizer's path.
+    std::fs::write(game_dir.join("sample.tft"), build_tft(&[b'A' as u16], 3)).expect("write tft");
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.setImageSize(64, 64); \
+         var f = new Font('Pre.ttf', 12, 0); \
+         f.mapPrerenderedFont('sample.tft'); \
+         l.font.face = 'Pre.ttf'; \
+         l.font.height = 12; \
+         l.font.bold = false; \
+         l.font.italic = false; \
+         l.font.angle = 0; \
+         l.drawText(4, 4, 'B', 0x00ffffff, 255);",
+    );
+    let layer = env.scene.layers.last().expect("the layer exists");
+    let bitmap = env
+        .scene
+        .bitmap(layer.bitmap.expect("the layer has a main image"))
+        .expect("the bitmap exists");
+    let ink_top = (0..bitmap.height)
+        .position(|row| {
+            (0..bitmap.width).any(|column| {
+                let at = ((row * bitmap.width + column) * 4) as usize;
+                bitmap.rgba[at + 3] != 0
+            })
+        })
+        .map(|row| row as i32)
+        .expect("the fallback glyph has ink");
+    assert_eq!(
+        ink_top,
+        4 + ascent - fallback.bearing_y as i32 + first_row,
+        "the fallback glyph must start at the baseline minus its bitmap top"
+    );
+}
+
+#[test]
+fn a_prerendered_glyph_is_drawn_at_the_ascent_minus_its_origin() {
+    let _lock = vm_lock();
+    let Some((font_dir, font_name)) = test_font() else {
+        return;
+    };
+    let font_bytes = std::fs::read(font_dir.join(&font_name)).expect("read test font");
+    let mut text_engine = engine::text::TextEngine::new();
+    let face = text_engine
+        .add_font(&font_bytes, 0)
+        .expect("register the face");
+    let metrics = text_engine.font_metrics(face, 12.0).expect("font metrics");
+    let ascent = metrics.ascent.floor() as i32;
+
+    let env = common::Env::with_storage();
+    let game_dir = env.game_dir().expect("game dir").clone();
+    // The face name carries a font extension, so the face resolves to the
+    // stored bytes and the test does not depend on the host's fonts.
+    std::fs::write(game_dir.join("Pre.ttf"), &font_bytes).expect("write face");
+    // The fixture's descriptor has `origin_y == 0`, so the ink starts one
+    // ascent below the draw position.
+    std::fs::write(game_dir.join("sample.tft"), build_tft(&[b'A' as u16], 3)).expect("write tft");
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.setImageSize(64, 64); \
+         var f = new Font('Pre.ttf', 12, 0); \
+         f.mapPrerenderedFont('sample.tft'); \
+         l.font.face = 'Pre.ttf'; \
+         l.font.height = 12; \
+         l.font.bold = false; \
+         l.font.italic = false; \
+         l.font.angle = 0; \
+         l.drawText(4, 4, 'A', 0x00ffffff, 255);",
+    );
+    let layer = env.scene.layers.last().expect("the layer exists");
+    let bitmap = env
+        .scene
+        .bitmap(layer.bitmap.expect("the layer has a main image"))
+        .expect("the bitmap exists");
+    let mut painted: Vec<(u32, u32, u8)> = Vec::new();
+    for y in 0..bitmap.height {
+        for x in 0..bitmap.width {
+            let at = ((y * bitmap.width + x) * 4) as usize;
+            if bitmap.rgba[at + 3] != 0 {
+                painted.push((x, y, bitmap.rgba[at + 3]));
+            }
+        }
+    }
+    assert_eq!(painted.len(), 4, "exactly the 2x2 glyph is painted");
+    let x0 = painted.iter().map(|p| p.0).min().expect("a painted pixel");
+    let y0 = painted.iter().map(|p| p.1).min().expect("a painted pixel");
+    assert_eq!(x0, 4, "the glyph starts at the draw position");
+    assert_eq!(
+        y0,
+        (4 + ascent) as u32,
+        "the glyph must start one ascent below the draw position"
     );
     let mut alphas = [0u8; 4];
     for (x, y, alpha) in &painted {

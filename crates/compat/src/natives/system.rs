@@ -57,7 +57,6 @@
 //! [`SystemState`], not a process global.
 #![allow(unsafe_code)]
 
-use std::collections::HashSet;
 use std::ffi::{c_char, c_int, c_void};
 use std::path::Path;
 use std::time::Instant;
@@ -69,6 +68,7 @@ use tjs::{
 };
 
 use crate::binding;
+use crate::collections::Set;
 use crate::host::host_desktop_rect;
 use crate::native_util::{
     args, host_ref, report_error, services, set_bool, set_int, set_void, value_as_string,
@@ -126,7 +126,7 @@ struct SystemState {
     /// Virtual-key codes already observed by a `getKeyState` query since they
     /// went down (the reference scancode `0x10` "pressed since last query"
     /// bit).
-    key_query_seen: HashSet<u32>,
+    key_query_seen: Set<u32>,
 }
 
 impl Default for SystemState {
@@ -148,7 +148,7 @@ impl Default for SystemState {
             continuous: Vec::new(),
             current_continuous: None,
             remove_current_continuous: false,
-            key_query_seen: HashSet::new(),
+            key_query_seen: Set::default(),
         }
     }
 }

@@ -20,7 +20,6 @@
 //! them on the layer instance (the reference reads the script members).
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use crate::engine_api::{VideoEvent, VideoOverlay, blit_frame_to_layer};
@@ -28,6 +27,7 @@ use api::blend::BlendMode;
 use tjs::{NativeObjThisMethodDef, Tjs2Engine, Value};
 
 use super::{VideoSource, bound, layer_from_objthis, scene_mut};
+use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_void};
 use crate::natives::video::{MovieAudio, Resync, decoded_audio, frame_resync};
 use crate::natives::visual::{ObjectKind, duplicate_object};
@@ -100,12 +100,22 @@ impl MovieSlot {
 }
 
 /// The movie family's dispatch state.
-#[derive(Default)]
 struct LayerExMovieState {
     /// Host-installed decoded source (see [`set_movie_source`]).
     source: Option<Box<dyn VideoSource>>,
     /// Layer id → playback slot.
-    slots: HashMap<u32, MovieSlot>,
+    slots: Map<u32, MovieSlot>,
+}
+
+impl Default for LayerExMovieState {
+    fn default() -> Self {
+        Self {
+            source: None,
+            // The slots are walked to dispatch the movie events, so the
+            // table's order is fixed and the same in every run.
+            slots: Map::with_hasher(crate::collections::hasher()),
+        }
+    }
 }
 
 /// Install the decoded-movie source `LayerExMovie.openMovie` reads from.

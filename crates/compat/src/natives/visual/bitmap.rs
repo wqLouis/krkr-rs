@@ -19,6 +19,7 @@ use super::common::{
     argb_to_rgba, bound, decode_pool_mut, resolve_object_id, rgba_to_argb, scene_mut, scene_ref,
     set_retained_out,
 };
+use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::value_as_i64;
 use crate::resource::ResourceResolver;
@@ -146,8 +147,7 @@ pub(crate) fn apply_color_key(rgba: &mut [u8], width: u32, keyidx: u32) {
 
 /// The most frequent RGB value on the first scanline.
 fn adaptive_color_key(rgba: &[u8], width: u32) -> u32 {
-    use std::collections::HashMap;
-    let mut counts: HashMap<u32, u32> = HashMap::new();
+    let mut counts: Map<u32, u32> = Map::default();
     let mut best = 0u32;
     let mut best_count = 0u32;
     for pixel in rgba.chunks_exact(4).take(width as usize) {
@@ -350,6 +350,11 @@ fn install_decoded_image(
 /// synchronously. A colour key does not keep the load synchronous: the key is
 /// a pass over the decoded pixels, and the pool runs it on the worker.
 ///
+/// A decode that is already running for the same image is shared: the load
+/// takes the future of that decode instead of reading the bytes, probing the
+/// header and submitting a second job. Every holder of the shared future
+/// waits for the same pixels.
+///
 /// # Errors
 ///
 /// Returns the read or the probe failure. Both are raised at the call, the
@@ -370,6 +375,19 @@ pub(crate) fn start_pending_decode(
     let Some(pool) = decode_pool_mut(ctx) else {
         return Ok(None);
     };
+    // The key depends on the load's inputs alone, so it is known before the
+    // bytes are read.
+    let key = DecodedImageKey::new(name, colorkey, mode, 0, 0);
+    // A decode that is already running for the same image is shared: the
+    // load reads no bytes, probes no header and submits no second job. Every
+    // holder of the shared decode waits for the same pixels.
+    let running = {
+        let scene = scene_ref(ctx)?;
+        scene.pending_decode_for(&key)
+    };
+    if let Some((width, height, pending)) = running {
+        return Ok(Some((width, height, pending)));
+    }
     // The read and the extension resolution stay on this thread: the storage
     // namespace is not shared with the workers.
     // SAFETY: `ctx` is only created for a bound, live engine, so its service
@@ -388,7 +406,6 @@ pub(crate) fn start_pending_decode(
     };
     let bytes: Arc<[u8]> = Arc::from(bytes);
     let hint = Some(resolved);
-    let key = DecodedImageKey::new(name, colorkey, mode, 0, 0);
     // A colour key is a pass over the decoded pixels: the worker applies it,
     // so the frame thread never sees the unkeyed image and never runs the
     // pass.

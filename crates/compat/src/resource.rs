@@ -11,9 +11,9 @@
 #![allow(unsafe_code)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::collections::Map;
 use crate::engine_api::layer_ops::RectI;
 use crate::engine_api::{BitmapState, Location, Storage, StorageReadError};
 use crate::engine_api::{
@@ -24,6 +24,7 @@ use api::media::{DecodedImage, ImageInfo};
 use tjs::{Tjs2Engine, TjsValue, Value};
 
 use crate::CompatCtx;
+use crate::natives::plugins::add_font::registry::FontRegistry;
 use crate::storage::strip_file_media;
 
 /// Default face requested when `Font.getList`/`Font.defaultFaceName` need to
@@ -56,7 +57,7 @@ pub(crate) struct ResourceResolver {
     /// reference `tTVPFontCache`.
     pub(crate) coverage_cache: TextCoverageCache,
     /// Requested face string → registered face id.
-    pub(crate) faces: HashMap<String, FontId>,
+    pub(crate) faces: Map<String, FontId>,
     /// Registered family names in registration order (`Font.getList`).
     registered: Vec<String>,
     /// First registered family name (`Font.defaultFaceName`).
@@ -68,7 +69,7 @@ pub(crate) struct ResourceResolver {
     /// Host image encoder/saver.
     save: Option<Rc<SaveFn>>,
     /// Loaded pre-rendered fonts, keyed by the resolved placed path.
-    prerendered_storage: HashMap<String, Rc<PrerenderedFont>>,
+    prerendered_storage: Map<String, Rc<PrerenderedFont>>,
     /// Font-value → pre-rendered font mappings, in registration order.
     prerendered: Vec<(PrerenderedKey, Rc<PrerenderedFont>)>,
 }
@@ -256,7 +257,10 @@ impl ResourceResolver {
 /// The face may be a comma-separated candidate list with an optional leading
 /// `@` (vertical writing). Each candidate is tried through the
 /// `System.addFont` registry, the attached storage, then the host's installed
-/// system fonts. When no candidate resolves, the host's default face is tried
+/// system fonts.
+///
+/// When no candidate resolves, the last family registered by `System.addFont`
+/// is tried. Then the host's default face is tried
 /// (the reference `TVPCreateFontStream` default,
 /// `reference/cpp/core/visual/FontImpl.cpp:159-168`), then the engine's first
 /// registered face; only an engine with no registered face at all raises.
@@ -269,7 +273,7 @@ impl ResourceResolver {
 pub(crate) fn resolve_face(
     ctx: &CompatCtx,
     engine: &mut TextEngine,
-    cache: &mut HashMap<String, FontId>,
+    cache: &mut Map<String, FontId>,
     face: &str,
 ) -> Result<FontId, String> {
     if let Some(id) = cache.get(face).copied() {
@@ -286,10 +290,20 @@ pub(crate) fn resolve_face(
             return Ok(id);
         }
     }
-    // No candidate is registered, in storage or an installed family: fall
-    // back to the host's default face (the reference `TVPCreateFontStream`
-    // default, `FontImpl.cpp:159-168`). Loading it under a fixed name keeps
-    // `face` free for a later registration.
+    // The default face is the last face added to the registered font map, so
+    // it is tried before the host's default family.
+    let registered_default = {
+        // SAFETY: the caller resolved `ctx` from the installed binding.
+        let registry = unsafe { ctx.services() }.state::<FontRegistry>();
+        registry.last_family()
+    };
+    if let Some(family) = registered_default
+        && let Ok(id) = try_face(ctx, engine, &family)
+    {
+        return Ok(id);
+    }
+    // No registered game face: fall back to the host's default face. Loading
+    // it under a fixed name keeps `face` free for a later registration.
     if let Ok(id) = engine.load_system_font(FALLBACK_FACE) {
         return Ok(id);
     }
@@ -589,18 +603,20 @@ fn draw_prerendered_text(
         style,
         angle_tenths,
     } = run;
-    let ascent = f64::from(
-        resolver
-            .engine
-            .font_metrics(font, size_px)
-            .map_err(|error| format!("text metrics failed: {error}"))?
-            .ascent,
-    );
+    // The ascent is the face's ascender scaled to the pixel size and
+    // truncated to whole pixels; the ascent offset is that integer projected
+    // onto the rotation axes.
+    let ascent = resolver
+        .engine
+        .font_metrics(font, size_px)
+        .map_err(|error| format!("text metrics failed: {error}"))?
+        .ascent
+        .floor() as i32;
     let angle = angle_tenths * std::f64::consts::PI / 1800.0;
     let angle90 = angle + std::f64::consts::FRAC_PI_2;
     // The ascent projection is truncated to an integer.
-    let ascent_ofs_x = (-angle90.cos() * ascent) as i32;
-    let ascent_ofs_y = (angle90.sin() * ascent) as i32;
+    let ascent_ofs_x = (-angle90.cos() * f64::from(ascent)) as i32;
+    let ascent_ofs_y = (angle90.sin() * f64::from(ascent)) as i32;
     let opacity = params.opacity.clamp(0, 255) as u8;
 
     let mut pen_x = params.x as f64;
@@ -649,8 +665,7 @@ fn draw_prerendered_text(
                 glyphs.push(PrerenderedGlyph {
                     mask,
                     x: pen_x.round() as i32 + glyph.bearing_x.round() as i32 + ascent_ofs_x,
-                    y: pen_y.round() as i32 + ascent.round() as i32
-                        - glyph.bearing_y.round() as i32,
+                    y: pen_y.round() as i32 + ascent - glyph.bearing_y.round() as i32,
                 });
             }
             let advance = f64::from(glyph.advance);

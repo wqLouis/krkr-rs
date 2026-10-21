@@ -43,6 +43,7 @@ use tjs::{
 };
 
 use crate::binding;
+use crate::collections::Map;
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
 use crate::natives::system::value_as_i64;
 use crate::storage::strip_file_media;
@@ -81,7 +82,7 @@ unsafe extern "C" {
 #[derive(Default)]
 struct ScriptsExState {
     scratch: Vec<u8>,
-    helpers: std::collections::HashMap<&'static str, tjs::Tjs2ValueId>,
+    helpers: Map<&'static str, tjs::Tjs2ValueId>,
 }
 
 // ---------------------------------------------------------------------------

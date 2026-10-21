@@ -16,7 +16,6 @@
 //! L2 timer while the binding keeps reporting the script's `enabled`.
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use crate::engine_api::{TimerCallback, TimerId, TimerState};
@@ -26,6 +25,7 @@ use tjs::{
 };
 
 use super::common::{DEFAULT_TIMER_CAPACITY, TimerBinding, VisualState, bound, set_real};
+use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::{value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError, CompatServices};
@@ -85,7 +85,7 @@ struct TimerPosts {
     /// before delivery.
     pending: Vec<TimerPost>,
     /// Cancellation generation per timer. An absent entry is generation 0.
-    generation: HashMap<TimerId, u64>,
+    generation: Map<TimerId, u64>,
 }
 
 /// One queued `onTimer` posting: the timer, the mode captured at fire time,

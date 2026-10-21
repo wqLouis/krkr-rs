@@ -9,7 +9,6 @@
 //! that cannot be loaded is a typed error, never a fabricated metric.
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use crate::engine_api::{BitmapState, StorageReadError};
@@ -21,6 +20,7 @@ use tjs::{
 
 use super::appearance::{Paint, paint_color_at};
 use super::{set_real, value_as_f64};
+use crate::collections::Map;
 use crate::native_util::{args, report_error, set_void};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
@@ -49,7 +49,7 @@ impl FontData {
 #[derive(Default)]
 pub(super) struct TextState {
     pub(super) engine: TextEngine,
-    pub(super) faces: HashMap<String, FontId>,
+    pub(super) faces: Map<String, FontId>,
     /// Family names of the faces added by `GdiPlus.addPrivateFont`, in
     /// registration order (the reference `bl_font_face_name`).
     pub(super) private_fonts: Vec<String>,

@@ -847,6 +847,46 @@ fn set_mode_follows_the_modal_stack_rules() {
     env.assert_script("ancestor_ok == 1"); // ancestor of the modal → error
 }
 
+/// Reference `tTVPLayerManager::BlurTree` drops the modal state of the tree
+/// it blurs before it moves the focus
+/// (`reference/cpp/core/visual/LayerManager.cpp:690-692`), and
+/// `RemoveTreeModalState` (`:899-925`) removes every modal layer that is
+/// the blurred root or a descendant of it. A modal layer that is hidden
+/// (`SetVisible(false)`, `reference/cpp/core/visual/LayerIntf.cpp:1199`) or
+/// disabled (`SetEnabled(false)`, `:3817`) therefore leaves the modal stack
+/// with its tree, so `SetModeTo` (`:834-867`) no longer sees the closed
+/// modal layer as the layer that blocks its ancestor — a modal layer that
+/// is still **live** keeps blocking it.
+#[test]
+fn a_closed_modal_layer_leaves_the_modal_stack() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var g = new Layer(w, null); g.name = 'g'; \
+         var hidden = new Layer(w, g); hidden.name = 'hidden'; \
+         var disabled = new Layer(w, g); disabled.name = 'disabled'; \
+         var live = new Layer(w, g); live.name = 'live'; \
+         hidden.setMode(); \
+         hidden.visible = false; \
+         var hidden_ok = 1; \
+         try { g.setMode(); } catch (e) { hidden_ok = 0; } \
+         g.removeMode(); \
+         disabled.setMode(); \
+         disabled.enabled = false; \
+         var disabled_ok = 1; \
+         try { g.setMode(); } catch (e) { disabled_ok = 0; } \
+         g.removeMode(); \
+         live.setMode(); \
+         var live_blocked = 0; \
+         try { g.setMode(); } catch (e) { live_blocked = 1; } \
+         live.removeMode();",
+    );
+    env.assert_script("hidden_ok == 1"); // the hidden modal left the stack
+    env.assert_script("disabled_ok == 1"); // the disabled modal left the stack
+    env.assert_script("live_blocked == 1"); // a live modal still blocks its ancestor
+}
+
 /// Reference: `SetModeTo` throws `TVPCannotSetModeToDisabledOrModal` for a
 /// disabled layer (`reference/cpp/core/visual/LayerManager.cpp:849-850`)
 /// after forcing an invisible layer visible (`847-848`).
@@ -1306,6 +1346,59 @@ fn fill_rect_respects_the_clip_rect() {
     assert_eq!(env.eval_int("l.getMainPixel(1, 1)"), 0xff0000);
     assert_eq!(env.eval_int("l.getMainPixel(2, 2)"), 0xff0000);
     assert_eq!(env.eval_int("l.getMainPixel(3, 3)"), 0x000000);
+}
+
+/// Reference: `AffineCopy` hands the layer's `ClipRect` to `AffineBlt`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:4736-4747`), so the pass writes
+/// inside the clip alone: the pixels outside it keep the values they had.
+///
+/// The clipped layer and the unclipped one receive the same pass, so the
+/// pixels inside the clip are the ones the unclipped pass writes.
+#[test]
+fn affine_copy_writes_inside_the_clip_rect_alone() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var clipped = new Layer(w, null); \
+         clipped.setImageSize(4, 4); \
+         clipped.fillRect(0, 0, 4, 4, 0xff000000); \
+         var whole = new Layer(w, null); \
+         whole.setImageSize(4, 4); \
+         whole.fillRect(0, 0, 4, 4, 0xff000000); \
+         var src = new Layer(w, null); \
+         src.setImageSize(4, 4); \
+         src.fillRect(0, 0, 4, 4, 0xffff0000); \
+         clipped.setClip(1, 1, 2, 2); \
+         clipped.affineCopy(src, 0, 0, 4, 4, true, 1, 0, 0, 1, 0, 0); \
+         whole.affineCopy(src, 0, 0, 4, 4, true, 1, 0, 0, 1, 0, 0);",
+    );
+    for y in 0..4 {
+        for x in 0..4 {
+            let inside = (1..3).contains(&x) && (1..3).contains(&y);
+            let clipped = env.eval_int(&format!("clipped.getMainPixel({x}, {y})"));
+            let whole = env.eval_int(&format!("whole.getMainPixel({x}, {y})"));
+            if inside {
+                assert_eq!(
+                    clipped, whole,
+                    "the clipped pass writes the pixels of the unclipped one at ({x}, {y})"
+                );
+                assert_eq!(
+                    clipped, 0xff0000,
+                    "the pass writes the source inside the clip at ({x}, {y})"
+                );
+            } else {
+                assert_eq!(
+                    clipped, 0x000000,
+                    "the pixels outside the clip keep their value at ({x}, {y})"
+                );
+                assert_eq!(
+                    whole, 0xff0000,
+                    "the unclipped pass writes outside the clip at ({x}, {y})"
+                );
+            }
+        }
+    }
 }
 
 /// Reference: `SetImageSize` -> `InternalSetImageSize`

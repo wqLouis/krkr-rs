@@ -32,6 +32,7 @@
 #![deny(unsafe_code)]
 
 mod binding;
+mod collections;
 mod ctx;
 // The single seam through which compat names the engine crate.
 mod engine_api;

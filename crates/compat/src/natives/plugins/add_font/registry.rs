@@ -68,6 +68,17 @@ impl FontRegistry {
         }
         None
     }
+
+    /// The family name of the most recently registered face.
+    ///
+    /// The last face added to the font map is the default font, which is what
+    /// a face the map does not know (a pre-rendered `*name`, for example)
+    /// falls back to.
+    pub(crate) fn last_family(&self) -> Option<String> {
+        let source = self.sources.last()?;
+        let id = source.ids.last()?;
+        source.engine.family_name(*id).map(str::to_owned)
+    }
 }
 
 /// Register every usable face in `bytes` under `source`.

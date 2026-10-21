@@ -42,7 +42,6 @@
 //! [`CompatServices::state`]: crate::CompatServices::state
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::Arc;
 
@@ -59,6 +58,7 @@ use tjs::{
     VAL_RETAINED, VAL_STRING, Value,
 };
 
+use crate::collections::Map;
 use crate::native_util::{
     args, report_error, services, set_bool, set_int, set_void, value_as_string, value_ref,
 };
@@ -454,15 +454,26 @@ struct LayerRef {
 
 /// The video family's dispatch state, keyed by type inside
 /// [`CompatServices::state`](crate::CompatServices::state).
-#[derive(Default)]
 struct VideoState {
     /// Id → overlay state; ids are allocated by `create` and freed by
     /// `destroy`.
-    overlays: HashMap<u32, VideoSlot>,
+    overlays: Map<u32, VideoSlot>,
     /// The next object id.
     next_id: u32,
     /// The host-decoded source (installed by the host before `open`).
     source: Option<Box<dyn VideoSource>>,
+}
+
+impl Default for VideoState {
+    fn default() -> Self {
+        Self {
+            // The overlays are walked to deliver their events, so the table's
+            // order is fixed and the same in every run.
+            overlays: Map::with_hasher(crate::collections::hasher()),
+            next_id: 0,
+            source: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

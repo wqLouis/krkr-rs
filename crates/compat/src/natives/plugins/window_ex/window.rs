@@ -16,7 +16,6 @@
 //! live on `System` and raise a typed error until installed.
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use tjs::{
@@ -24,6 +23,7 @@ use tjs::{
     NativePropertyDef, NativeStaticMembers, RetainedValue, Tjs2Engine, TjsValue, Value,
 };
 
+use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::{CompatCtx, CompatError};
 
@@ -50,7 +50,7 @@ struct WindowFlags {
 /// results.
 #[derive(Default)]
 pub(crate) struct WindowEx {
-    windows: HashMap<usize, super::util::Tokened<WindowFlags>>,
+    windows: Map<usize, super::util::Tokened<WindowFlags>>,
     /// Identity-token counter; see [`super::util::sync_object_state`].
     next_token: i64,
 }

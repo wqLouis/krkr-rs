@@ -18,7 +18,6 @@
 //! at the destination's owner (`LayerIntf.cpp:8000-8015`).
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use crate::engine_api::Scene;
@@ -34,6 +33,7 @@ use super::super::common::{
     scene_ref,
 };
 use super::{LayerExtras, LayerInst, LayerTransition, bound};
+use crate::collections::Map;
 use crate::native_util::{args, report_error, services, set_void, value_as_string};
 use crate::natives::system::{tjs_string_to_real, value_as_bool};
 use crate::natives::tjsnum::tjs_string_to_integer;
@@ -43,7 +43,7 @@ use crate::natives::tjsnum::tjs_string_to_integer;
 /// accumulated while a self-updating transition waits for its next update.
 #[derive(Default)]
 struct TransitionRuntimeState {
-    entries: HashMap<u32, TransitionRuntime>,
+    entries: Map<u32, TransitionRuntime>,
 }
 
 struct TransitionRuntime {

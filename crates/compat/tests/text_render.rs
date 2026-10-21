@@ -19,11 +19,12 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
+use api::glyph::FontMetrics;
 use common::vm_lock;
 use compat::CompatHost;
 use engine::Scene;
 use engine::Storage;
-use engine::text::{CoverageMask, blur_coverage};
+use engine::text::{CoverageMask, TextEngine, TextStyle, blur_coverage};
 use fs::FileSystem;
 use tjs::{Tjs2Engine, TjsValue};
 
@@ -371,6 +372,123 @@ fn text_render_breaks_lines_at_the_box_width() {
     assert!(
         last_y > first_y,
         "a one-pixel box should wrap the characters (first y {first_y}, last y {last_y})"
+    );
+}
+
+/// The reference's ascent for a face at a pixel size: the face's ascender in
+/// font units, scaled by the pixel size and truncated by the integer division
+/// `ascender * ppem / units_per_EM`
+/// (`reference/cpp/core/visual/FreeType.h:96-99`).
+fn reference_ascent(metrics: &FontMetrics, size: f32) -> i64 {
+    let units_per_em = f64::from(metrics.units_per_em);
+    // The face's ascender in font units, recovered from the scaled ascent.
+    let ascender = (f64::from(metrics.ascent) * units_per_em / f64::from(size)).round() as i64;
+    // The reference's integer division truncates towards zero.
+    (ascender * size as i64) / units_per_em as i64
+}
+
+/// The reference's `GetAscentHeight()` computes the ascent with integer
+/// arithmetic, so the value is truncated and never rounded
+/// (`reference/cpp/core/visual/FreeType.h:96-99`).
+/// `TextRenderBase::pushCharacter` reports the ascent as the character's
+/// `size` (`reference/cpp/plugins/TextRender.cpp:895`) and
+/// `performLinebreak` advances the line by it plus `lineSpacing`
+/// (`reference/cpp/plugins/TextRender.cpp:853`), so a rounded ascent moves
+/// every line one pixel too far down.
+#[test]
+fn text_render_ascent_is_truncated_like_the_reference() {
+    let _lock = vm_lock();
+    let Some((dir, name)) = test_font() else {
+        return;
+    };
+    let Some((env, _)) = Env::with_font() else {
+        return;
+    };
+    let bytes = std::fs::read(dir.join(&name)).expect("the font file is readable");
+    let mut engine = TextEngine::new();
+    let id = engine.add_font(&bytes, 0).expect("the font loads");
+
+    // A size whose scaled ascent has a fractional part of at least a half
+    // tells a truncated ascent from a rounded one.
+    let mut size = 0;
+    let mut expected = 0;
+    for candidate in 8..64 {
+        let metrics = engine
+            .font_metrics(id, candidate as f32)
+            .expect("the face has metrics");
+        let scaled = f64::from(metrics.ascent);
+        if scaled - scaled.floor() >= 0.5 {
+            size = candidate;
+            expected = reference_ascent(&metrics, candidate as f32);
+            break;
+        }
+    }
+    assert!(
+        size > 0,
+        "the face must have a size whose ascent tells truncation from rounding"
+    );
+
+    env.run(&format!(
+        "var t = new TextRenderBase(); t.defaultFace = '{name}'; \
+         t.defaultFontSize = {size}; t.setRenderSize(1000, 1000);"
+    ));
+    env.run("t.render('A', 0, 0, 0, false); t.done();");
+    assert_eq!(env.eval_int("t.getCharacters(0, 0)[0].size"), expected);
+
+    // A line break advances the pen by the ascent plus `lineSpacing`
+    // (`reference/cpp/plugins/TextRender.cpp:849-856`), so the second line
+    // starts at the truncated ascent.
+    env.run("t.clear(); t.render('A\\\\nB', 0, 0, 0, false); t.done();");
+    assert_eq!(env.eval_int("t.getCharacters(0, 0)[0].y"), 0);
+    assert_eq!(
+        env.eval_int("t.getCharacters(0, 0)[1].y"),
+        expected + 6,
+        "the second line starts at the ascent plus the default line spacing"
+    );
+}
+
+/// Reference: `TextRenderBase::pushCharacter` asks the rasterizer for the
+/// character's extent (`reference/cpp/plugins/TextRender.cpp:899`), which is
+/// that character's own pen advance; the port reports the same value.
+#[test]
+fn text_render_advance_is_the_single_character_extent() {
+    let _lock = vm_lock();
+    let Some((dir, name)) = test_font() else {
+        return;
+    };
+    let Some((env, _)) = Env::with_font() else {
+        return;
+    };
+    let bytes = std::fs::read(dir.join(&name)).expect("the font file is readable");
+    let mut engine = TextEngine::new();
+    let id = engine.add_font(&bytes, 0).expect("the font loads");
+    let mut style = TextStyle::new(24.0);
+    style.color = [255, 255, 255, 255];
+    // The advance the shaped layout reports for one character.
+    let expected = engine
+        .layout(id, "A", &style, None)
+        .expect("the character lays out")
+        .width
+        .round() as i32;
+
+    env.run(&format!(
+        "var t = new TextRenderBase(); t.defaultFace = '{name}'; \
+         t.defaultFontSize = 24; t.setRenderSize(1000, 1000);"
+    ));
+    env.run("t.render('A', 0, 0, 0, false); t.done();");
+    assert_eq!(
+        env.eval_int("t.getCharacters(0, 0)[0].cw"),
+        i64::from(expected),
+        "the character's advance is its own extent"
+    );
+
+    // A bold character keeps the shaped measurement: the shaper measures the
+    // face's normal weight, so the advance does not change.
+    env.run("t.clear(); t.render('%b1A', 0, 0, 0, false); t.done();");
+    assert_eq!(
+        env.eval_int("t.getCharacters(0, 0)[0].cw"),
+        i64::from(expected),
+        "a bold character measures the face's normal weight"
     );
 }
 
