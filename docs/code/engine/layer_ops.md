@@ -133,6 +133,13 @@ projection draws the two sources, so nothing is written to a bitmap per tick
   marks bump the bitmap's `content_generation`, which the subtree-cache
   bookkeeping sums to detect an edit that did not go through a layer
   accessor.
+* **An integer one-to-one affine replace is a copy.** When the corner map is
+  axis-aligned at unit scale with an integer origin, the supported resamplers
+  are exact at integer source centres, so the pass routes to the clipped copy
+  instead of the per-pixel inverse map and float kernel. The half-pixel
+  `affine = true` convention and the blur/area kernels stay on the resampler.
+  A clipped copy whose source rows are all in bounds copies those rows as
+  rows; the per-pixel path remains for a partially out-of-bounds source.
 * **The source rectangle is half-open**, and a source region that leaves the
   source bitmap contributes nothing rather than a repeated edge pixel.
 * **`blit_plane` with both plane bits is a straight copy**, not a blend: the
@@ -145,6 +152,9 @@ projection draws the two sources, so nothing is written to a bitmap per tick
   frame is drawn in place of the subtree, the self image in place of the
   layer's own image while the children keep drawing live. The self image is
   never part of the subtree cache, so releasing the cache leaves it alone.
+  The display slot is not the script cache or the main image either: a slot
+  that holds either is replaced by a fresh display bitmap, so a transition
+  blend never overwrites pixels the script or the frame source owns.
 * **The subtree root never sources its own cache**, and a descendant whose own
   cache is live is composited through that cache bitmap.
 

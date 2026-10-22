@@ -577,6 +577,12 @@ pub fn blit_copy_clipped(
     if !pixels_usable(dst, "copyRect") || !pixels_usable(src, "copyRect") {
         return;
     }
+    // A rectangle whose source rows are all in bounds is a row copy, not a
+    // per-pixel read/write walk. The bytes are identical; the row copy is the
+    // path the full-screen UI copies take.
+    if copy_rows_within(dst, dest_clip, src, src_rect, dx, dy) {
+        return;
+    }
     for y in dest_clip.1..dest_clip.3 {
         for x in dest_clip.0..dest_clip.2 {
             let sx = src_rect.0 + (x - dx);
@@ -591,6 +597,89 @@ pub fn blit_copy_clipped(
     // The pass wrote inside the clipped destination rectangle only, so the
     // upload needs that rectangle and not the whole bitmap.
     dst.mark_dirty_rect(clipped_region(dest_clip));
+}
+
+/// Copy the destination rectangle from the matching source rows when every
+/// source row is inside the source bitmap. Returns whether the row copy ran; a
+/// partial source row keeps the per-pixel path that skips out-of-bounds texels.
+fn copy_rows_within(
+    dst: &mut BitmapState,
+    dest: RectI,
+    src: &BitmapState,
+    src_rect: RectI,
+    dx: i32,
+    dy: i32,
+) -> bool {
+    let width = i64::from(dest.2) - i64::from(dest.0);
+    let rows = i64::from(dest.3) - i64::from(dest.1);
+    let src_left = i64::from(src_rect.0) + i64::from(dest.0) - i64::from(dx);
+    let src_top = i64::from(src_rect.1) + i64::from(dest.1) - i64::from(dy);
+    if width <= 0
+        || rows <= 0
+        || src_left < 0
+        || src_top < 0
+        || src_left + width > i64::from(src.width)
+        || src_top + rows > i64::from(src.height)
+    {
+        return false;
+    }
+    let (Ok(width), Ok(rows), Ok(src_left), Ok(src_top)) = (
+        usize::try_from(width),
+        usize::try_from(rows),
+        usize::try_from(src_left),
+        usize::try_from(src_top),
+    ) else {
+        return false;
+    };
+    let (Some(row_bytes), Some(src_pitch), Some(dst_pitch)) = (
+        width.checked_mul(4),
+        usize::try_from(src.width)
+            .ok()
+            .and_then(|w| w.checked_mul(4)),
+        usize::try_from(dst.width)
+            .ok()
+            .and_then(|w| w.checked_mul(4)),
+    ) else {
+        return false;
+    };
+    let Some(src_x) = src_left.checked_mul(4) else {
+        return false;
+    };
+    let Some(dst_x) = usize::try_from(dest.0).ok().and_then(|x| x.checked_mul(4)) else {
+        return false;
+    };
+    let Ok(dst_y) = usize::try_from(dest.1) else {
+        return false;
+    };
+    for row in 0..rows {
+        let Some(source_start) = (src_top + row)
+            .checked_mul(src_pitch)
+            .and_then(|start| start.checked_add(src_x))
+        else {
+            return false;
+        };
+        let Some(source_end) = source_start.checked_add(row_bytes) else {
+            return false;
+        };
+        let Some(dest_start) = (dst_y + row)
+            .checked_mul(dst_pitch)
+            .and_then(|start| start.checked_add(dst_x))
+        else {
+            return false;
+        };
+        let Some(dest_end) = dest_start.checked_add(row_bytes) else {
+            return false;
+        };
+        let (Some(source), Some(target)) = (
+            src.rgba.get(source_start..source_end),
+            dst.rgba.get_mut(dest_start..dest_end),
+        ) else {
+            return false;
+        };
+        target.copy_from_slice(source);
+    }
+    dst.mark_dirty_rect(clipped_region(dest));
+    true
 }
 
 /// `Blt` source-over: composite `src[src_rect]` onto `dst` at `(dx, dy)`,
@@ -2359,6 +2448,20 @@ pub fn affine_blit_clipped(
             }
         }
     }
+    // A one-to-one integer transfer is a copy, whatever the affine resampler:
+    // every supported kernel is exact at an integer source centre. This is
+    // the full-screen UI/stage copy that otherwise pays the per-pixel inverse
+    // map and float kernel. The affine = true half-pixel convention has a
+    // half-integer centre and stays on the resampler.
+    if matches!(affine_blend(mode), AffineBlend::Replace)
+        && let Some((dx, dy)) = affine_unit_copy(m, src_rect, src, stretch_type)
+    {
+        blit_copy_clipped(dst, dx, dy, src, src_rect, clip);
+        // The affine pass marks the mapped bounding box, even the one-pixel
+        // margin the resampler skips; keep that upload region.
+        dst.mark_dirty_rect(clipped_region(dc));
+        return;
+    }
     // The nearest resampler on an axis-aligned quad reads one source row per
     // destination row, which the scanline pass does without the per-pixel
     // inverse map.
@@ -2503,6 +2606,55 @@ fn affine_blit_generic_with<B: BandBlend>(dst: &mut BitmapState, pass: AffinePas
 /// would stay correct, but a sheared quad is not the axis-aligned case.
 fn affine_nearest_axis_aligned(m: [f64; 6]) -> bool {
     m[4] == 0.0 && m[2].abs() <= 1e-12
+}
+
+/// The destination origin of a one-to-one, integer-aligned affine copy, or
+/// None when the map resamples or the source rect leaves the image.
+///
+/// The generic pass samples at src_rect.0 + dest_x - m[0]; this is an integer
+/// source centre exactly when m[0] and m[3] are integers. At an integer centre
+/// the nearest, linear, cubic, spline and Lanczos kernels all return the source
+/// texel unchanged, so the transfer is a row copy. The blur-style and
+/// area-average kernels do not have that property.
+fn affine_unit_copy(
+    m: [f64; 6],
+    src_rect: RectI,
+    src: &BitmapState,
+    stretch_type: i64,
+) -> Option<(i32, i32)> {
+    let kind = stretch_type & 0xffff;
+    if !matches!(kind, 0..=13) {
+        return None;
+    }
+    let width = i64::from(src_rect.2) - i64::from(src_rect.0);
+    let height = i64::from(src_rect.3) - i64::from(src_rect.1);
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let width = width as f64;
+    let height = height as f64;
+    if m[1] != width || m[5] != height || m[2] != 0.0 || m[4] != 0.0 {
+        return None;
+    }
+    if !m[0].is_finite()
+        || !m[3].is_finite()
+        || m[0].fract() != 0.0
+        || m[3].fract() != 0.0
+        || m[0] < f64::from(i32::MIN)
+        || m[0] > f64::from(i32::MAX)
+        || m[3] < f64::from(i32::MIN)
+        || m[3] > f64::from(i32::MAX)
+    {
+        return None;
+    }
+    if src_rect.0 < 0
+        || src_rect.1 < 0
+        || i64::from(src_rect.2) > i64::from(src.width)
+        || i64::from(src_rect.3) > i64::from(src.height)
+    {
+        return None;
+    }
+    Some((m[0] as i32, m[3] as i32))
 }
 
 /// The nearest resampler's scanline pass over an axis-aligned quad.
@@ -2839,7 +2991,14 @@ fn release_subtree_caches(scene: &mut Scene, root: u32) {
 /// of the layer's subtree. Distinct from the composited content so the blend
 /// never overwrites the content it reads.
 pub fn ensure_transition_display(scene: &mut Scene, root: u32, w: u32, h: u32) -> Option<u32> {
-    if let Some(id) = scene.layer(root)?.cache_bitmap
+    let layer = scene.layer(root)?;
+    if let Some(id) = layer.cache_bitmap
+        // A cache slot that holds the layer's own image or its composited
+        // content is not a transition display: blending into it would
+        // overwrite script-owned pixels and invalidate the content the frame
+        // samples. Only a display left by this transition is reusable.
+        && layer.cache_content != Some(id)
+        && layer.bitmap != Some(id)
         && scene.bitmap(id).map(|b| (b.width, b.height)) == Some((w, h))
     {
         return Some(id);
@@ -3610,5 +3769,31 @@ mod tests {
         generic_pass(&mut generic, corners, &src, 2, 255);
         assert_eq!(scanline.rgba, generic.rgba);
         assert!(scanline.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0));
+    }
+
+    /// A one-to-one integer copy is recognised as a copy, while the affine
+    /// half-pixel convention and the blur-style resamplers stay on the generic
+    /// sampler: their output is not the source texel.
+    #[test]
+    fn a_one_to_one_integer_affine_copy_is_recognised() {
+        let src = source_texture(4, 4);
+        let corners = [(2.0, 3.0), (6.0, 3.0), (2.0, 7.0)];
+        let map = affine_forward(corners[0], corners[1], corners[2]);
+        for kind in [0, 1, 2, 3, 6, 8, 13] {
+            assert_eq!(
+                affine_unit_copy(map, (0, 0, 4, 4), &src, kind),
+                Some((2, 3)),
+                "stretch kind {kind} is exact at integer centres"
+            );
+        }
+        assert!(
+            affine_unit_copy(map, (0, 0, 4, 4), &src, 16).is_none(),
+            "a Gaussian kernel does not copy at an integer centre"
+        );
+        let half = affine_forward((-0.5, -0.5), (3.5, -0.5), (-0.5, 3.5));
+        assert!(
+            affine_unit_copy(half, (0, 0, 4, 4), &src, 1).is_none(),
+            "the affine half-pixel convention still resamples"
+        );
     }
 }

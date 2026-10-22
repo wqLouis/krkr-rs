@@ -9,8 +9,8 @@ use engine::Scene;
 use engine::layer_ops::{
     AffineBlit, BlitOptions, BlitSource, COPY_MAIN, COPY_MASK, affine_blit, affine_blit_clipped,
     blit_copy, blit_over, blit_plane, blur_bitmap_in_place, copy_9patch, do_gray_scale,
-    fill_color_on_alpha, fill_mask, flip_lr, gaussian_blur, operate_rect, render_layer_subtree,
-    stretch_blit, tile_rect,
+    ensure_transition_display, fill_color_on_alpha, fill_mask, flip_lr, gaussian_blur,
+    operate_rect, render_layer_subtree, stretch_blit, tile_rect,
 };
 use engine::raster::fill_rect_replace;
 use engine::scene::Rect;
@@ -916,6 +916,44 @@ fn a_clipped_affine_blit_writes_inside_the_clip_alone() {
         clipped.dirty_region,
         Some(PixelRegion::new(4, 4, 4, 4)),
         "only the clipped rectangle is marked"
+    );
+}
+
+/// A whole-subtree transition gets a display bitmap distinct from a script
+/// cache. Reusing the cache as the blend target would overwrite pixels the
+/// script owns and make the cache stale on every transition tick.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7961-7964
+#[test]
+fn a_transition_display_never_reuses_the_script_cache() {
+    let mut scene = Scene::default();
+    let window = scene.add_window("t", (8, 8));
+    let layer = scene.add_layer(window, None);
+    let cache = scene.add_bitmap(4, 4, vec![1u8; 4 * 4 * 4]);
+    {
+        let state = scene.layer_mut(layer).expect("layer");
+        state.cache_enabled_count = 1;
+        state.cache_bitmap = Some(cache);
+        state.cache_content = Some(cache);
+    }
+
+    let display = ensure_transition_display(&mut scene, layer, 4, 4).expect("display");
+    assert_ne!(display, cache, "the display is not the script cache");
+    assert_eq!(
+        scene.layer(layer).expect("layer").cache_content,
+        Some(cache),
+        "the composited content stays available as the frame source"
+    );
+    assert_eq!(
+        scene.layer(layer).expect("layer").cache_bitmap,
+        Some(display),
+        "the display takes the transition slot"
+    );
+
+    let reused = ensure_transition_display(&mut scene, layer, 4, 4).expect("display");
+    assert_eq!(
+        reused, display,
+        "a running transition reuses its own display"
     );
 }
 
