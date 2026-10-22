@@ -844,7 +844,7 @@ impl fmt::Debug for SoundSource {
 }
 
 impl SoundSource {
-    /// Wrap decoded PCM, deriving the frame count from the buffer.
+    /// Wrap decoded PCM, taking the frame count from the decoder's spec.
     ///
     /// Fails with a typed error when the spec is unusable or the buffer
     /// length disagrees with `sample_rate`/`channels`.
@@ -853,6 +853,12 @@ impl SoundSource {
     }
 
     /// Like [`Self::new`], attaching generic loop/label information.
+    ///
+    /// The frame count is the one the decoder reported: a decoder that
+    /// states the container's length keeps it, so the source's length does
+    /// not depend on which decoder produced the samples. A spec without a
+    /// frame count — or one that contradicts a non-empty buffer — falls back
+    /// to the buffer's length.
     pub fn with_loops(
         audio: Arc<DecodedAudio>,
         info: Option<LoopInfo>,
@@ -870,7 +876,10 @@ impl SoundSource {
             });
         }
         let spec = AudioSpec {
-            total_frames: Some(frames),
+            total_frames: Some(match audio.spec.total_frames {
+                Some(count) if count > 0 => count,
+                _ => frames,
+            }),
             ..audio.spec
         };
         Ok(Self {
@@ -996,9 +1005,12 @@ impl SoundSource {
 
     /// Total number of frames.
     ///
-    /// For a streaming source whose container did not report a length, this is
-    /// the number of frames decoded so far; it reaches the true total once
-    /// playback has decoded to the end.
+    /// For a materialized source this is the length the decoder stated — the
+    /// container's own length — so the track's duration does not depend on
+    /// which decoder produced the samples. For a streaming source whose
+    /// container did not report a length, this is the number of frames
+    /// decoded so far; it reaches the true total once playback has decoded to
+    /// the end.
     pub fn frames(&self) -> u64 {
         match self.spec.total_frames {
             Some(frames) => frames,

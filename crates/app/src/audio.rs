@@ -40,6 +40,20 @@
 //! When every backend in the chain fails, the error names each of them and
 //! the reason it gave, so neither is lost.
 //!
+//! # The spec the script sees
+//!
+//! The spec is the **container's**, whichever backend decodes the samples.
+//! The desktop path probes the bytes with the built-in probe before it
+//! decodes them with FFmpeg, so the rate, the channel count and the frame
+//! count the container states are the ones the script reads (`Frequency`,
+//! `Channels`, `TotalTime`) — the same values the built-in path reported.
+//! The samples are FFmpeg's.
+//!
+//! A probe that fails, or a rate or a channel count that disagrees with the
+//! decode, leaves the decoder's own spec in place: an HE-AAC track declares
+//! the extension's rate while the built-in probe reports the core's, and a
+//! container the built-in probe cannot read has no probe to compare with.
+//!
 //! # Buffer/dt policy (the documented decision)
 //!
 //! The mixer is **render-driven**: [`sound_render`] advances it by the frames
@@ -109,7 +123,7 @@ use compat::{
     sound_render,
 };
 use engine::sound::{AudioStream, LoopInfo, SoundError, SoundSource};
-use media::{AudioDecoderState, Media, open_audio, probe_audio, read_audio, seek_audio};
+use media::{AudioDecoderState, Media, open_audio, read_audio, seek_audio};
 use platform::{AudioDevice, AudioHealth, AudioOutputState, PlatformError};
 use vm::VmHost;
 
@@ -117,6 +131,8 @@ use vm::VmHost;
 use media::decode_audio_ffmpeg;
 #[cfg(target_os = "android")]
 use media::decode_audio_mediacodec;
+#[cfg(target_os = "linux")]
+use media::probe_audio;
 
 use crate::GameError;
 use crate::startup::StartupStats;
@@ -656,6 +672,11 @@ mod tests {
     use platform::AudioHealth;
     use testkit::tiny_wav_mono;
 
+    #[cfg(target_os = "linux")]
+    use media::{decode_audio_ffmpeg, probe_audio};
+
+    #[cfg(target_os = "linux")]
+    use super::decode_with_ffmpeg;
     use super::{
         AudioEpisodes, DEFAULT_MAX_CHUNK_MS, DecodeAttempt, decode_with_attempts,
         decode_with_builtin, make_decoder, plan_chunk,
@@ -842,6 +863,46 @@ mod tests {
             source.frames() > 8_000,
             "0.2 s at 44.1 kHz is ~8,820 frames, got {}",
             source.frames()
+        );
+    }
+
+    /// The desktop path decodes the samples with FFmpeg, but the spec the
+    /// script sees is the container's: the frame count is the one the
+    /// container states, not the number of samples the decoder produced.
+    ///
+    /// The OGG fixture's container states 8,820 frames (0.2 s at 44.1 kHz)
+    /// while the FFmpeg decoder produces more (the encoder's padding), so the
+    /// two counts differ and the container's is the one the source carries.
+    /// The script reads the source's frame count as `totalTime`
+    /// (`crates/compat/src/natives/sound.rs`).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_ffmpeg_path_reports_the_container_s_frame_count() {
+        let media = Media::new();
+        let probed = probe_audio(&media, OGG_SINE, Some("tone.ogg")).expect("probe the container");
+        let raw = decode_audio_ffmpeg(&media, Arc::from(OGG_SINE), Some("tone.ogg"))
+            .expect("the ffmpeg backend decodes the track");
+        let source = decode_with_ffmpeg(&media, Arc::from(OGG_SINE), Some("tone.ogg"), None)
+            .expect("the ffmpeg backend decodes the track");
+
+        assert_eq!(source.sample_rate(), probed.sample_rate);
+        assert_eq!(source.channels(), probed.channels);
+        assert_eq!(
+            source.frames(),
+            probed
+                .total_frames
+                .expect("the container states a frame count"),
+            "the frame count is the container's"
+        );
+        assert!(
+            (source.duration_seconds() - 0.2).abs() < 1e-9,
+            "0.2 s at 44.1 kHz, got {}",
+            source.duration_seconds()
+        );
+        assert_ne!(
+            source.frames(),
+            raw.frame_count(),
+            "the decoder's own frame count is not the container's"
         );
     }
 

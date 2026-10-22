@@ -102,6 +102,11 @@ A streaming source takes the container's `AudioSpec` (so the duration is
 known without decoding) and the decoder itself; the two must agree on the
 sample rate and the channel count, or the source is rejected.
 
+A materialized source takes the decoded buffer and the spec the decoder
+reported: a spec that states a frame count keeps it — the container's own
+length, so the track's duration does not depend on which decoder produced
+the samples — and a spec without one falls back to the buffer's length.
+
 ### Channels, buffers and the mixer
 
 ```rust

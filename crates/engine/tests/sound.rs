@@ -514,6 +514,46 @@ fn sound_source_rejects_bad_buffers() {
     ));
 }
 
+/// The frame count a decoder states is the container's own, so a source's
+/// length does not depend on which decoder produced the samples.
+///
+/// A decoder that reports the length the container states keeps it: the
+/// source's frame count is the container's, and the frames past it are not
+/// played. A spec without a frame count falls back to the buffer's length.
+#[test]
+fn a_materialized_source_keeps_the_stated_frame_count() {
+    let stated = 1_000u64;
+    let spec = AudioSpec {
+        sample_rate: 1_000,
+        channels: 1,
+        total_frames: Some(stated),
+    };
+    let buffer = vec![0.0f32; 1_500];
+    let source = SoundSource::new(Arc::new(DecodedAudio::new(spec, buffer))).expect("valid source");
+    assert_eq!(
+        source.frames(),
+        stated,
+        "the container's frame count is the source's length"
+    );
+    assert!(
+        source.frame(stated).expect("a frame").is_none(),
+        "the frames past the container's end are not played"
+    );
+
+    let spec = AudioSpec {
+        sample_rate: 1_000,
+        channels: 1,
+        total_frames: None,
+    };
+    let buffer = vec![0.0f32; 1_500];
+    let source = SoundSource::new(Arc::new(DecodedAudio::new(spec, buffer))).expect("valid source");
+    assert_eq!(
+        source.frames(),
+        1_500,
+        "a spec without a frame count falls back to the buffer's length"
+    );
+}
+
 #[test]
 fn mix_source_accumulates_into_the_caller_buffer() {
     let source = tone(44100, 1, 0.05);

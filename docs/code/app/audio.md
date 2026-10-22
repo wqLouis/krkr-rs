@@ -47,6 +47,16 @@ the samples are decoded as playback reads them. So a track the FFmpeg backend
 cannot read still plays without holding the whole track in memory. It is the
 Android build's first choice and the desktop build's fallback.
 
+The **spec** is the container's whichever backend decodes the samples. The
+desktop path probes the bytes with the built-in probe before it decodes them
+with FFmpeg, and the rate, the channel count and the frame count the
+container states are the ones the script reads (`Frequency`, `Channels`,
+`TotalTime`) — the same values the built-in path reported. The samples are
+FFmpeg's. A probe that fails, or a rate or a channel count that disagrees
+with the decode, leaves the decoder's own spec in place: an HE-AAC track
+declares the extension's rate while the built-in probe reports the core's,
+and a container the built-in probe cannot read has no probe to compare with.
+
 When every backend in the chain fails, the error names each of them and the
 reason it gave, so neither is lost.
 
@@ -160,6 +170,7 @@ device that rejects the write is a typed error — never a silent frame.
 | `a_negative_frame_renders_only_the_carry` | a negative `dt` renders nothing |
 | `a_track_the_builtin_decoder_cannot_read_is_decoded_by_the_ffmpeg_backend` | the FFmpeg backend reads a container the built-in decoder has no reader for |
 | `the_desktop_chain_decodes_an_ogg_track_with_the_ffmpeg_backend` | the desktop chain decodes with FFmpeg first, at the container's rate and channel count |
+| `the_ffmpeg_path_reports_the_container_s_frame_count` | the frame count the script reads is the container's, not the decoder's |
 | `the_fallback_decodes_a_wav_with_the_builtin_decoder` | a backend that cannot decode hands the track to the built-in decoder |
 | `a_track_neither_backend_can_decode_names_both_reasons` | neither reason is lost |
 
