@@ -77,6 +77,16 @@ residuals:
    `<app>/savedata/`, yet an `exePath + <property>` expression still doubles.
    Needs the title's `Config.tjs` or a TJS trace of `saveDataLocation`; no
    title-specific patch (D28).
+   * Traced in the test3 title: `System.dataPath` is `<app>/savedata/` and the
+     title appends `"/savecheck"`, so the *doubled slash* is the title's own
+     concatenation; the resolved host path is `<app>/savedata/savecheck`. The
+     open failed because the data directory did not exist — the reference
+     creates the parent folders when it opens a local file for write
+     (`tTVPLocalFileStream`, `reference/cpp/core/base/impl/StorageImpl.cpp:618-641`),
+     and the port did not, so the title's `checkSave` failed and every later
+     save was refused. The port now creates those folders; the residual
+     question is the `G//G/` spelling in the original log, which this title
+     does not produce.
 
 ## 4. Rendering and layers
 
@@ -258,6 +268,44 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   icon-path keys instead of per-frame `format!`, and reusable group/mask
   offscreens. Per-frame `snapshot.clone()` is an `Arc` clone, not the deep
   `PsbValue` copy the first audit suspected.
+* **The in-game character art is a full-resolution WebP, and its decode is the
+  avatar/expression switch's frame cost.** The 千恋万花 stand system
+  (`system/StandImage.tjs` → `StandLayer.tjs` → `AffineSourceStand.tjs`, the
+  `.tlg` files of `fgimage1080.xp3`) loads the character art through
+  `Layer.loadImages`; the art is a **WebP** (a RIFF `VP8X` container) of
+  **1445×3304** pixels (the half-resolution `_0_` variant is 725×1652).
+  Measured in a release **windowed Vulkan** run of the game mirror (the
+  archive mirror, the probe loading `fgimage1080/レナb_598.tlg` into a visible
+  1920×1080 layer):
+
+  | step | first load | repeat (cache hit) |
+  |---|---|---|
+  | storage read (the XP3 entry) | 2–38 ms | 1–2 ms |
+  | header probe | 1 ms | 1 ms |
+  | **WebP decode** | **90–120 ms** | 0 |
+  | install, upload, render | 12–16 ms | 12–16 ms |
+
+  The decode runs on the decode-pool worker, but the frame barrier
+  (`Engine::advance` → `Scene::resolve_pending_images`) waits for it, so the
+  frame that first shows a character runs at **7–9 fps** — the reported
+  symptom. The same load twice is a decoded-image-cache hit (the game's
+  `main/Config.tjs` sets `System.graphicCacheLimit = gcsAuto`, so the cache
+  holds 512 MB), and two loads in one frame share one decode
+  (`crates/compat/tests/pending_image.rs`
+  `two_loads_of_the_same_image_in_one_frame_share_one_decode`): there is **no
+  duplicate decode to remove**. The affine composite of the sprite costs
+  1–2 ms and the full-texture upload 2–4 ms, so neither is the cost.
+  **Landed:** the copy and blend passes (`blit_copy_clipped`, `blit_plane`,
+  `blit_over`, `stretch_blit_plane`) mark the rectangle they wrote instead of
+  the whole bitmap, so the sprite's texture is no longer re-uploaded whole
+  when the game copies a face into it; the affine, `operate_rect` and
+  `stretch_blit_mode` passes already marked their rectangle.
+  **Remaining:** the decode itself. The reference decodes WebP with **libwebp**
+  (`reference/cpp/core/visual/LoadWEBP.cpp:1-48`, `WebPDecode`); the port
+  uses the pure-Rust `image-webp` (≈40 Mpixel/s against libwebp's ≈100
+  Mpixel/s), and the workspace has no native WebP decoder. A native decoder
+  is the only way to close that 2–3x; until then the first load of each
+  character art costs a frame.
 * **The title-load `AsyncTrigger` callback stalls the frame loop and skips the
   title motion.** A game `AsyncTrigger` (`id=5`, unnamed action) runs in
   `async_trigger_poll` for **1.8–5.7 s** on the title load (measured in a debug
