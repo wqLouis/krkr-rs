@@ -4,8 +4,9 @@
 
 L1 owns the event loop and pushes `platform::PlatformEvent`s. This module
 maps them to the TJS-visible events the VM dispatches to script handlers.
-`EventAdapter::map` is the mapping; `EventAdapter::dispatch` is the delivery
-seam.
+`EventAdapter::map` is the mapping, `EventAdapter::dispatch` is the delivery
+seam and `EventAdapter::dispatch_frame` is the batch the VM host's frame
+body runs.
 
 L3 does **not** redeclare the platform event type: the event type and loop
 are L1, and only the TJS mapping lives here. The layer-level description is
@@ -75,7 +76,51 @@ state-free and still needs the position to build the positional arguments.
 
 ---
 
-## 3. Delivery
+## 3. The batch path
+
+`dispatch_frame(ctx, events)` is what the VM host's frame body runs
+(`crates/vm/src/host.rs`). It applies every event to the L2 input state,
+maps it and delivers it, in the order the platform produced the events. No
+event is merged with another and none is dropped.
+
+### The dispatch budget
+
+A frame that collects a flood of events (a pointer-move burst, a held key,
+a scroll) dispatches as many of them as fit in the **dispatch budget** and
+defers the rest to the next frame:
+
+| Rule | Value |
+|---|---|
+| the budget | the wall-clock time one frame may spend dispatching events — 4 ms by default (`EventAdapter::DEFAULT_DISPATCH_BUDGET`) |
+| the check | after an event was dispatched, so **every frame delivers at least one event** |
+| the deferred events | stay queued in the adapter, in arrival order, and the next `dispatch_frame` delivers them **first** |
+| the order | the delivery order is the arrival order; nothing is dropped or reordered |
+
+The budget is a **presentation policy**, not a compatibility rule: it bounds
+how long one frame may spend in the event loop, so a flood cannot spend
+seconds in a single frame. 4 ms is a quarter of a 60 fps frame, which leaves
+the rest of the frame for the presentation, and it is far above the cost of
+ordinary input — a frame with a handful of events never defers anything.
+
+`EventAdapter::with_dispatch_budget(budget)` builds an adapter with another
+budget; a budget of zero dispatches exactly one event per frame, which is
+what the tests use to pin the deferral.
+
+Because the events are delivered in the order they arrived, the L2 input
+state follows the deliveries: an event that waits for the next frame is
+applied to the state of that frame.
+
+### The events are not merged
+
+The pointer move, the wheel, the key, the text and the touch events are each
+delivered on their own, in arrival order. The reference posts every one of
+them as an ordinary event (`reference/cpp/core/visual/LayerIntf.cpp:3438-3447`,
+`:3506-3513`, `:3882-3889`, `:3844-3877`), so their count and their order
+are script-observable.
+
+---
+
+## 4. Delivery
 
 `dispatch(ctx, event)` delivers a mapped event to the script handler that
 owns it.
@@ -129,7 +174,7 @@ logged at warn and **never aborts the frame**.
 
 ---
 
-## 4. The dispatch state
+## 5. The dispatch state
 
 Some mouse state has no L2 home, so it lives in
 `CompatServices::state::<InputDispatchState>()`:
@@ -158,7 +203,7 @@ it; `onTouchMove` uses the stored capture (falling back to a hit test).
 
 ---
 
-## 5. The hit test
+## 6. The hit test
 
 `hit_layer(ctx, x, y)` walks the **visible** windows of the scene, and for
 each takes its primary layer and asks the L2 scene for the layer at the
@@ -170,7 +215,7 @@ the hit test.
 
 ---
 
-## 6. Errors
+## 7. Errors
 
 The adapter does not raise. A missing handler is logged at debug; a throwing
 handler is logged at warn. The only message it produces is:
@@ -185,11 +230,12 @@ The error text of a missing member is recognised by the substring
 
 ---
 
-## 7. Host seams
+## 8. Host seams
 
 | Seam | Where |
 |---|---|
 | `EventAdapter::new()` | the composition root creates one and drives it |
+| `dispatch_frame(ctx, events)` | the VM host's frame body delivers one frame's events |
 | `cache_input_state(&InputState)` | called after each input event is applied, so the adapter can build the positional arguments |
 | `attach_input` | the L2 `InputState` the adapter reads |
 
@@ -199,12 +245,13 @@ translation lives in L2 and is not repeated here.
 
 ---
 
-## 8. Tests
+## 9. Tests
 
 | Test | What it asserts |
 |---|---|
 | `crates/compat/tests/event.rs` | the platform → TJS mapping table, the argument lists, the wheel scale, the shift mask, the touch family |
 | `crates/compat/tests/event_dispatch.rs` | the delivery order: the window first, then the layer; the enter/leave transition; the click/double-click synthesis |
+| `crates/compat/tests/event_batch.rs` | the batch path: a burst of pointer moves is delivered across the frames in order, a deferred wheel reaches the focused layer in the next frame, the wheel/key/text events are all delivered, a target without a handler is a no-op and a throwing handler is reported |
 | `crates/compat/tests/input.rs` | the input state the adapter feeds |
 | `crates/compat/tests/focus_behaviour.rs` | the focused layer receives the key and wheel events |
 | `crates/compat/tests/layer_behaviour.rs` | the layer-local coordinate conversion |

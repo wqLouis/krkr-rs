@@ -1404,6 +1404,48 @@ impl Tjs2Engine {
         self.retain_object_result(v)
     }
 
+    /// Evaluate an expression through the script cache.
+    ///
+    /// An expression evaluated without a name is cached by its text, so a
+    /// repeated expression compiles once and the cached block runs
+    /// afterwards. A **named** evaluation compiles a fresh block every time,
+    /// which is what [`Self::eval_retained`] does.
+    ///
+    /// The evaluation runs in the global context, exactly like
+    /// [`Self::eval_retained`], and the cached block produces a fresh result
+    /// on every run — an expression that builds an object returns a new
+    /// object each time.
+    pub fn eval_retained_cached(&self, expression: &str) -> Result<RetainedValue, TjsError> {
+        let mut result = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: the pointers are valid for the call; a null name is the
+        // "no name" case, which selects the script cache.
+        let rc = unsafe {
+            tjs2_eval(
+                self.inner,
+                expression.as_ptr().cast::<c_char>(),
+                expression.len(),
+                ptr::null(),
+                Tjs2ValueId::null().as_ptr(),
+                0,
+                &mut result as *mut Value,
+                &mut error,
+            )
+        };
+        if rc != 0 {
+            return Err(take_error(error));
+        }
+        self.retain_object_result(take_value(&result))
+    }
+
     /// Execute a TJS script given as UTF-16 code units, keeping every unit
     /// exactly as the reference text stream does.
     ///

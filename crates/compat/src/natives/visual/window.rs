@@ -1699,6 +1699,8 @@ fn set_event_member(
 /// member, and `TVP_ACTION_INVOKE_END` calls `action` on the action owner
 /// (`reference/cpp/core/base/EventIntf.h:208-238`). The `FuncCall` result is
 /// never inspected, so a missing `action` member is ignored.
+/// The event object is the empty-array literal, evaluated through the
+/// script cache, so the literal is compiled once instead of once per event.
 fn dispatch_action_event(
     host: &Tjs2Engine,
     owner: &DetachedValue,
@@ -1708,7 +1710,7 @@ fn dispatch_action_event(
     argv: *const Value,
     members: &[EventMember],
 ) -> Result<(), String> {
-    let event = match host.eval_retained("%[]", "Window action") {
+    let event = match host.eval_retained_cached("%[]") {
         Ok(RetainedValue::Object(event)) => event,
         Ok(RetainedValue::Value(value)) => {
             return Err(format!("event dictionary came back as {value:?}"));

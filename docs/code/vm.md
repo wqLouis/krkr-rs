@@ -113,8 +113,11 @@ pub struct FrameCtx<'a> {
 `VmHost::tick` is the whole per-frame body:
 
 1. `begin_input_frame` — clear the per-frame input state;
-2. for each platform event: apply it to the L2 input state, then map it to
-   a TJS event and dispatch it;
+2. `dispatch_frame` — deliver the frame's platform events: each event is
+   applied to the L2 input state, then mapped to a TJS event and dispatched.
+   The frame stops when its dispatch budget is exhausted; the events that did
+   not fit stay queued and the next frame delivers them first, in the same
+   order;
 3. `end_input_frame` — commit, so the held and repeat counters advance
    exactly once;
 4. `run_frame_body(body, &mut ctx)` — drain the timer posts the engine

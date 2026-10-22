@@ -50,6 +50,10 @@ pub struct Env {
     _input: Box<InputState>,
     _storage: Option<Box<Storage>>,
     _game_dir: Option<PathBuf>,
+    /// The adapter the events are delivered through. It outlives one call
+    /// because it keeps the events a frame deferred, the way the VM host's
+    /// adapter does.
+    adapter: RefCell<compat::EventAdapter>,
 }
 
 impl Env {
@@ -116,6 +120,7 @@ impl Env {
             _input: input,
             _storage: storage,
             _game_dir: game_dir,
+            adapter: RefCell::new(compat::EventAdapter::new()),
         }
     }
 
@@ -231,17 +236,30 @@ impl Env {
 
     /// Feed one frame's platform events through the L3 adapter and deliver
     /// each mapped event to the script handler the adapter resolves (the
-    /// [`compat::EventAdapter::dispatch`] seam the VM host's `tick` uses).
+    /// [`compat::EventAdapter::dispatch_frame`] seam the VM host's `tick`
+    /// uses).
     pub fn dispatch_events(&self, events: &[PlatformEvent]) {
-        let mut adapter = compat::EventAdapter::new();
+        let mut adapter = self.adapter.borrow_mut();
         let mut ctx = self._host.ctx().expect("bound compat context");
         adapter.begin_input_frame(&mut ctx);
-        for event in events {
-            adapter.apply_input_event(&mut ctx, event);
-            if let Some(mapped) = adapter.map(event) {
-                adapter.dispatch(&mut ctx, &mapped).expect("dispatch event");
-            }
-        }
+        adapter
+            .dispatch_frame(&mut ctx, events)
+            .expect("dispatch events");
+        adapter.end_input_frame(&mut ctx);
+    }
+
+    /// Feed one frame's platform events through `adapter` and deliver each
+    /// mapped event to the script handler the adapter resolves.
+    ///
+    /// The caller owns the adapter, so a test can give it a dispatch budget
+    /// and drive several frames through it — the events a frame defers are
+    /// then delivered by the next call.
+    pub fn dispatch_with(&self, adapter: &mut compat::EventAdapter, events: &[PlatformEvent]) {
+        let mut ctx = self._host.ctx().expect("bound compat context");
+        adapter.begin_input_frame(&mut ctx);
+        adapter
+            .dispatch_frame(&mut ctx, events)
+            .expect("dispatch events");
         adapter.end_input_frame(&mut ctx);
     }
 

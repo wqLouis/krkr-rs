@@ -422,12 +422,7 @@ impl VmHost {
         self.adapter.begin_input_frame(&mut ctx);
         frame.body.input_begin_completed(started.elapsed());
         let started = Instant::now();
-        for event in frame.events {
-            self.adapter.apply_input_event(&mut ctx, event);
-            if let Some(mapped) = self.adapter.map(event) {
-                self.adapter.dispatch(&mut ctx, &mapped)?;
-            }
-        }
+        self.adapter.dispatch_frame(&mut ctx, frame.events)?;
         frame.body.input_events_completed(started.elapsed());
         let started = Instant::now();
         self.adapter.end_input_frame(&mut ctx);

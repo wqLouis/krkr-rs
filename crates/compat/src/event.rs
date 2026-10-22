@@ -2,12 +2,16 @@
 //!
 //! L1 owns the event loop and pushes [`platform::PlatformEvent`]s; L3
 //! maps them to the TJS-visible events the VM dispatches to script handlers.
-//! [`EventAdapter::map`] is the mapping and [`EventAdapter::dispatch`] is the
-//! delivery seam.
+//! [`EventAdapter::map`] is the mapping, [`EventAdapter::dispatch`] is the
+//! delivery seam and [`EventAdapter::dispatch_frame`] is the batch the VM
+//! host's frame body runs.
 //!
 //! L3 does **not** redeclare the platform event type: the event loop/type is
 //! L1 and only the TJS mapping lives here.
 #![allow(unsafe_code)]
+
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use api::host::TouchPhase;
 
@@ -71,18 +75,58 @@ pub enum EventValue {
 /// The pointer position and shift mask are cached from the most recent
 /// [`EventAdapter::apply_input_event`] so the state-free [`Self::map`] can
 /// build the positional arguments the reference input events carry.
-#[derive(Default)]
+///
+/// The adapter also holds the events a frame did not dispatch: the dispatch
+/// budget stops a frame, and the next frame delivers what was left.
 pub struct EventAdapter {
     /// The latest L2 pointer position in physical pixels.
     pointer: (f32, f32),
     /// The latest TVP `TVP_SS_*` shift mask.
     shift: u32,
+    /// The events a frame did not dispatch, oldest first.
+    deferred: VecDeque<PlatformEvent>,
+    /// The wall-clock time one frame may spend dispatching events.
+    dispatch_budget: Duration,
+}
+
+impl Default for EventAdapter {
+    fn default() -> Self {
+        Self {
+            pointer: (0.0, 0.0),
+            shift: 0,
+            deferred: VecDeque::new(),
+            dispatch_budget: Self::DEFAULT_DISPATCH_BUDGET,
+        }
+    }
 }
 
 impl EventAdapter {
+    /// The wall-clock time one frame may spend dispatching events.
+    ///
+    /// This is a presentation policy, not a compatibility rule: a frame
+    /// that collects a flood of events dispatches as many of them as fit in
+    /// the budget and defers the rest to the next frame, so one frame
+    /// cannot spend seconds in the event loop. The budget is a quarter of a
+    /// 60 fps frame, which leaves the rest of the frame for the
+    /// presentation, and it is far above the cost of ordinary input.
+    pub const DEFAULT_DISPATCH_BUDGET: Duration = Duration::from_millis(4);
+
     /// Create an adapter.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create an adapter whose frame dispatch budget is `budget`.
+    ///
+    /// The budget bounds the wall-clock time one frame spends dispatching
+    /// events; the events that do not fit stay queued for the next frame.
+    /// A budget of zero still dispatches one event per frame, so no event
+    /// waits forever.
+    pub fn with_dispatch_budget(budget: Duration) -> Self {
+        Self {
+            dispatch_budget: budget,
+            ..Self::default()
+        }
     }
 
     /// Map a platform event to the TJS-visible event it produces, or `None`
@@ -216,6 +260,59 @@ impl EventAdapter {
         }
     }
 
+    /// Deliver one frame's platform events to the script handlers.
+    ///
+    /// This is the batch entry point the VM host's frame body uses: every
+    /// event is applied to the L2 input state, mapped and delivered, in the
+    /// order the platform produced it. No event is merged with another and
+    /// none is dropped.
+    ///
+    /// The frame stops dispatching when its dispatch time reaches the
+    /// budget (see [`EventAdapter::with_dispatch_budget`]). The events that
+    /// did not fit stay queued and the next call delivers them **first**, in
+    /// the same order, so the delivery order is the arrival order. The
+    /// budget is checked after an event was dispatched, so every frame
+    /// delivers at least one event and no event waits forever.
+    pub fn dispatch_frame(
+        &mut self,
+        ctx: &mut CompatCtx,
+        events: &[PlatformEvent],
+    ) -> Result<(), CompatError> {
+        let started = Instant::now();
+        // The events the last frame did not dispatch come first.
+        let mut deferred = std::mem::take(&mut self.deferred);
+        let mut queued = 0;
+        let mut index = 0;
+        loop {
+            let event = if queued < deferred.len() {
+                &deferred[queued]
+            } else if let Some(event) = events.get(index) {
+                event
+            } else {
+                break;
+            };
+            self.apply_input_event(ctx, event);
+            if let Some(mapped) = self.map(event) {
+                self.dispatch(ctx, &mapped)?;
+            }
+            if queued < deferred.len() {
+                queued += 1;
+            } else {
+                index += 1;
+            }
+            // The budget is checked after the dispatch, so a frame always
+            // delivers at least one event.
+            if started.elapsed() >= self.dispatch_budget {
+                break;
+            }
+        }
+        // The events that did not fit stay queued, oldest first.
+        deferred.drain(..queued);
+        deferred.extend(events[index..].iter().cloned());
+        self.deferred = deferred;
+        Ok(())
+    }
+
     /// Deliver a mapped event to the script handler that owns it.
     ///
     /// The reference posts every input event to the window **and** to the
@@ -265,8 +362,13 @@ impl EventAdapter {
             None
         };
 
+        // The window that receives the event is resolved once: the window
+        // delivery, the enter a move posts and the click a release posts all
+        // go to the same window.
+        let window = first_window(ctx);
+
         // The window receives every mapped event.
-        if let Some(id) = first_window(ctx) {
+        if let Some(id) = window {
             deliver_checked(ctx, event.name, &event.window_args(), Target::Window(id));
         }
 
@@ -298,7 +400,7 @@ impl EventAdapter {
         // `reference/cpp/core/visual/WindowIntf.h:473-478`).
         if event.name == "onMouseMove" && !pointer_inside(ctx) {
             set_pointer_inside(ctx, true);
-            if let Some(id) = first_window(ctx) {
+            if let Some(id) = window {
                 deliver_checked(ctx, "onMouseEnter", &[], Target::Window(id));
             }
         }
@@ -311,7 +413,7 @@ impl EventAdapter {
                 let args = self.layer_args(ctx, &click, id);
                 deliver_checked(ctx, click.name, &args, Target::Layer(id));
             }
-            if let Some(id) = first_window(ctx) {
+            if let Some(id) = window {
                 deliver_checked(ctx, click.name, &click.args, Target::Window(id));
             }
         }
