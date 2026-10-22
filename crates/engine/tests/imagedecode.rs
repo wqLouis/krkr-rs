@@ -21,6 +21,16 @@ use testkit::headless_window;
 /// The pixels the fake decoder produces.
 const PIXELS: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
+/// The bytes one full-resolution character part charges the pool.
+///
+/// The character art is a 1445x3304 WebP, so its RGBA pixels are
+/// 19 112 720 bytes; with the compressed bytes the measured charge of one
+/// part is about 19.6 MB.
+const CHARACTER_PART_CHARGE: u64 = 19_600_000;
+
+/// The compressed bytes of one character part, as the pool charges them.
+const CHARACTER_PART_BYTES: &[u8] = b"character-part";
+
 /// A latch the test opens to release a decode.
 struct Gate {
     /// Whether the gate is open.
@@ -54,6 +64,31 @@ impl Gate {
         let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
         *open = true;
         self.signal.notify_all();
+    }
+}
+
+/// A set of gates that opens when the test leaves.
+///
+/// A decode worker waits for its gate, so a test that fails while a worker
+/// is inside the decoder must open the gates on the way out; otherwise the
+/// pool's drop waits for a worker that never returns.
+struct GateSet {
+    /// The gates to open.
+    gates: Vec<Arc<Gate>>,
+}
+
+impl GateSet {
+    /// Opens every gate.
+    fn open(&self) {
+        for gate in &self.gates {
+            gate.open();
+        }
+    }
+}
+
+impl Drop for GateSet {
+    fn drop(&mut self) {
+        self.open();
     }
 }
 
@@ -178,6 +213,25 @@ fn submit(pool: &mut DecodePool, hint: &str) -> (JobId, PendingImage) {
     .expect("the job is accepted")
 }
 
+/// Submits a decode charged like one full-resolution character part.
+///
+/// A job is charged the size of its bytes plus the size of the pixels it
+/// will produce, so the measured charge of one part is split between the
+/// two.
+fn submit_character_part(
+    pool: &mut DecodePool,
+    hint: &str,
+) -> Result<(JobId, PendingImage), DecodePoolError> {
+    let pixels =
+        CHARACTER_PART_CHARGE - u64::try_from(CHARACTER_PART_BYTES.len()).expect("the length fits");
+    pool.submit(
+        Arc::from(CHARACTER_PART_BYTES),
+        Some(hint.to_string()),
+        pixels,
+        None,
+    )
+}
+
 /// A batch of decodes runs at the same time: the pool overlaps them instead
 /// of running them one after another.
 #[test]
@@ -198,6 +252,99 @@ fn a_batch_of_decodes_runs_in_parallel() {
         gate.open();
     }
     for (pending, _) in &futures {
+        assert!(matches!(pending.await_ready(), ImageOutcome::Ready(_)));
+    }
+}
+
+/// The default limit holds the four character parts of an avatar switch at
+/// once.
+///
+/// A part that does not fit is refused, and the load then decodes on the
+/// calling thread: the whole decode time lands on the frame that loads the
+/// art. The default limit holds four parts of the measured charge, so the
+/// fourth part of an avatar switch is not refused.
+#[test]
+fn the_default_limit_holds_four_character_parts() {
+    let config = DecodePoolConfig::default();
+    assert!(
+        config.memory_limit >= 4 * CHARACTER_PART_CHARGE,
+        "the default limit of {} bytes holds four character parts of {CHARACTER_PART_CHARGE} bytes",
+        config.memory_limit
+    );
+    let decoder = Arc::new(GatedDecoder::new());
+    let mut pool = DecodePool::new(decoder.clone(), config).expect("pool");
+    // The gates open when the test leaves, so a refused part cannot leave a
+    // worker waiting for a gate that never opens.
+    let mut gates = GateSet { gates: Vec::new() };
+    let mut submitted = Vec::new();
+    for index in 0..4 {
+        let hint = format!("part{index}");
+        gates.gates.push(decoder.gate(&hint));
+        submitted.push(submit_character_part(&mut pool, &hint));
+    }
+    for (index, result) in submitted.iter().enumerate() {
+        assert!(
+            result.is_ok(),
+            "the character part {index} is accepted: {result:?}"
+        );
+    }
+    assert_eq!(
+        pool.held_bytes(),
+        4 * CHARACTER_PART_CHARGE,
+        "the pool holds the four character parts at once"
+    );
+    // A request that does not fit the limit is still refused.
+    let refused = pool.submit(
+        Arc::from(CHARACTER_PART_BYTES),
+        Some("huge".to_string()),
+        config.memory_limit,
+        None,
+    );
+    match refused {
+        Err(DecodePoolError::MemoryLimit { limit }) => {
+            assert_eq!(limit, config.memory_limit, "the refusal names the limit");
+        }
+        other => panic!("the oversized job is refused, got {other:?}"),
+    }
+    gates.open();
+}
+
+/// The four character parts of an avatar switch decode at the same time.
+///
+/// The pool holds them all, so the avatar switch decodes them concurrently
+/// instead of refusing the fourth and decoding it on the calling thread.
+#[test]
+fn four_character_parts_decode_at_the_same_time() {
+    let decoder = Arc::new(GatedDecoder::new());
+    let config = DecodePoolConfig {
+        workers: 4,
+        ..DecodePoolConfig::default()
+    };
+    let mut pool = DecodePool::new(decoder.clone(), config).expect("pool");
+    // The gates open when the test leaves, so a refused part cannot leave a
+    // worker waiting for a gate that never opens.
+    let mut gates = GateSet { gates: Vec::new() };
+    let mut submitted = Vec::new();
+    for index in 0..4 {
+        let hint = format!("part{index}");
+        gates.gates.push(decoder.gate(&hint));
+        submitted.push(submit_character_part(&mut pool, &hint));
+    }
+    for (index, result) in submitted.iter().enumerate() {
+        assert!(
+            result.is_ok(),
+            "the character part {index} is accepted: {result:?}"
+        );
+    }
+    // All four decodes are inside the decoder at once: the fourth one can
+    // only be there when the three others are still waiting for their gate.
+    decoder.wait_for_started(4);
+    gates.open();
+    for (index, result) in submitted.into_iter().enumerate() {
+        let (_, pending) = match result {
+            Ok(submitted) => submitted,
+            Err(error) => panic!("the character part {index} is accepted: {error}"),
+        };
         assert!(matches!(pending.await_ready(), ImageOutcome::Ready(_)));
     }
 }

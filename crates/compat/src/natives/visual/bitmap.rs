@@ -414,9 +414,10 @@ pub(crate) fn start_pending_decode(
         Ok((_id, pending)) => Ok(Some((info.width, info.height, pending))),
         Err(error) => {
             // The pool refused the job: the load decodes synchronously, and
-            // the refusal is reported rather than swallowed.
+            // the refusal is reported rather than swallowed. The error names
+            // the limit the pool refused the job against.
             log::warn!(
-                "image: the decode pool refused {name:?} ({error}); the load decodes synchronously"
+                "image: the decode pool refused {name:?} ({error}); the load decodes synchronously on the calling thread"
             );
             Ok(None)
         }

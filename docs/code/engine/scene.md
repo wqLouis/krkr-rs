@@ -280,6 +280,20 @@ scene finds it with `pending_decode_for`, and every holder carries a clone of
 the same future. The pixels land in all of them, and the decode stays alive
 as long as one of them waits for it.
 
+### The pool's byte limit
+
+The pool bounds the bytes the queued and the in-flight decodes hold: a job is
+charged the size of its bytes plus the size of the pixels it will produce, so
+the limit bounds the pool's footprint. The default is **256 MiB**
+(`engine::imagedecode::DEFAULT_MEMORY_LIMIT`).
+
+A full-resolution character part is a 1445×3304 WebP that charges the pool
+about 19.6 MB — the compressed bytes plus the 19 112 720 bytes of RGBA pixels
+it decodes into — so the default holds the four character parts of an avatar
+switch at once. A job that does not fit is refused with
+`DecodePoolError::MemoryLimit`, and the load decodes synchronously on the
+calling thread instead.
+
 ---
 
 ## 5. Failure modes

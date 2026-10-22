@@ -267,7 +267,11 @@ pub struct DecodePoolConfig {
     /// in-flight decodes.
     ///
     /// A job is charged the size of its bytes plus the size of the pixels it
-    /// will produce, so the limit bounds the pool's footprint.
+    /// will produce, so the limit bounds the pool's footprint. A job that
+    /// does not fit is refused with [`DecodePoolError::MemoryLimit`], and the
+    /// caller decodes it synchronously.
+    ///
+    /// The default is [`DEFAULT_MEMORY_LIMIT`].
     pub memory_limit: u64,
 }
 
@@ -276,10 +280,23 @@ impl Default for DecodePoolConfig {
         Self {
             workers: default_worker_count(),
             queue_limit: 64,
-            memory_limit: 64 * 1024 * 1024,
+            memory_limit: DEFAULT_MEMORY_LIMIT,
         }
     }
 }
+
+/// The default byte limit of the decode pool.
+///
+/// The limit bounds the bytes the queued and the in-flight decodes hold: a
+/// job is charged the size of its bytes plus the size of the pixels it will
+/// produce, so the limit bounds the pool's footprint.
+///
+/// The default is 256 MiB. A full-resolution character part is a 1445x3304
+/// WebP that charges the pool about 19.6 MB - the compressed bytes plus the
+/// 19 112 720 bytes of RGBA pixels it decodes into - so the limit holds the
+/// four character parts of an avatar switch at once, with room for the rest
+/// of the frame's images.
+pub const DEFAULT_MEMORY_LIMIT: u64 = 256 * 1024 * 1024;
 
 /// The worker count the pool uses when nothing else is configured.
 ///
@@ -313,7 +330,10 @@ pub enum DecodePoolError {
         limit: usize,
     },
     /// The memory limit would be exceeded.
-    #[error("the image decode pool would exceed its memory limit of {limit} bytes")]
+    #[error(
+        "the memory limit of {limit} bytes ({} MiB) would be exceeded",
+        *limit / (1024u64 * 1024)
+    )]
     MemoryLimit {
         /// The configured limit.
         limit: u64,

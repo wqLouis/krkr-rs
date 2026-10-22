@@ -152,12 +152,14 @@ failure raises there.
 The load decodes on the calling thread when:
 
 * **no pool is attached** — the host installed no decode pool;
-* the load carries a **colour key** — the key is a pass over the decoded
-  pixels, and the deferred path carries the pixels unchanged;
 * the load is a **province** load (`DecodedImageMode::Province`);
 * the **pool refused the job** — the queue was full, the memory limit would
-  be exceeded, or the size accounting did not fit. The refusal is logged and
-  the load decodes synchronously.
+  be exceeded, or the size accounting did not fit. The refusal is logged with
+  the limit it refused the job against, and the load decodes synchronously.
+
+A **colour key** does not keep the load synchronous: the key is a pass the
+worker runs over the decoded pixels, so a keyed load is deferred like an
+unkeyed one.
 
 `Bitmap.loadAsync` never defers: it reports the load's result to the script,
 so its decode must have run.

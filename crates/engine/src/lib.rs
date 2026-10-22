@@ -44,8 +44,8 @@ pub use crate::engine::{
 pub use crate::hasher::Map;
 // The image decode pool and the pending-image future.
 pub use crate::imagedecode::{
-    DecodePool, DecodePoolConfig, DecodePoolError, ImageDecodeError, ImageDecoder, ImageOutcome,
-    ImageSizeError, ImageState, JobId, PendingImage,
+    DEFAULT_MEMORY_LIMIT, DecodePool, DecodePoolConfig, DecodePoolError, ImageDecodeError,
+    ImageDecoder, ImageOutcome, ImageSizeError, ImageState, JobId, PendingImage,
 };
 // The storage read pool and the pending-read future.
 pub use crate::storage::{

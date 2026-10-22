@@ -300,12 +300,27 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   the whole bitmap, so the sprite's texture is no longer re-uploaded whole
   when the game copies a face into it; the affine, `operate_rect` and
   `stretch_blit_mode` passes already marked their rectangle.
+  **The decode pool's byte limit refused the fourth part.** One part charges
+  the pool about **19.6 MB** (the compressed bytes plus the **19 112 720**
+  bytes of RGBA pixels it decodes into), and the pool's default limit was
+  **64 MiB**: three parts fit (58.8 MB) and the **fourth** was refused, so the
+  load fell back to a **synchronous decode on the frame thread** instead of
+  decoding concurrently on a worker. The measured log line was `image: the
+  decode pool refused "…" (the image decode pool would exceed its memory
+  limit of 67108864 bytes); the load decodes synchronously`. The avatar
+  switch loads several character parts, so it hit the refusal.
+  **Landed:** the decode pool's default byte limit is now **256 MiB**
+  (`engine::imagedecode::DEFAULT_MEMORY_LIMIT`), which holds the four
+  character parts of an avatar switch at once (78.4 MB of charge) with room
+  to spare; the refusal and its synchronous fallback are unchanged, and the
+  refusal log now names the limit it refused the job against.
   **Remaining:** the decode itself. The reference decodes WebP with **libwebp**
   (`reference/cpp/core/visual/LoadWEBP.cpp:1-48`, `WebPDecode`); the port
   uses the pure-Rust `image-webp` (≈40 Mpixel/s against libwebp's ≈100
-  Mpixel/s), and the workspace has no native WebP decoder. A native decoder
-  is the only way to close that 2–3x; until then the first load of each
-  character art costs a frame.
+  Mpixel/s), and the workspace has no native WebP decoder. Measured on the
+  1445×3304 art, one decode costs **~105 ms** with `image-webp` against
+  **~46 ms** with libwebp. A native decoder is the only way to close that
+  2–3x; until then the first load of each character art costs a frame.
 * **The title-load `AsyncTrigger` callback stalls the frame loop and skips the
   title motion.** A game `AsyncTrigger` (`id=5`, unnamed action) runs in
   `async_trigger_poll` for **1.8–5.7 s** on the title load (measured in a debug
