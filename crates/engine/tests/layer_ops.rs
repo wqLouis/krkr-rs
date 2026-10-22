@@ -969,3 +969,104 @@ fn an_operate_rect_marks_only_the_rectangle_it_wrote() {
         "the marked rectangle is the clipped one"
     );
 }
+
+/// A `copyRect` marks the rectangle it copied, not the whole bitmap.
+///
+/// The frame's upload sends only the marked region to the texture, so the
+/// character sprite a game copies a face into is not re-uploaded whole: the
+/// layer holds the full-resolution sprite and only the face rectangle
+/// changes.
+#[test]
+fn a_copy_rect_marks_only_the_rectangle_it_copied() {
+    let source = bitmap(4, 4, vec![255u8; 4 * 4 * 4]);
+    let mut destination = bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
+    blit_plane(
+        &mut destination,
+        3,
+        5,
+        &source,
+        (0, 0, 4, 4),
+        (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+        COPY_MAIN | COPY_MASK,
+    );
+    assert!(destination.dirty, "the copy marks the bitmap dirty");
+    assert_eq!(
+        destination.dirty_region,
+        Some(PixelRegion::new(3, 5, 4, 4)),
+        "only the copied rectangle is marked"
+    );
+
+    // A copy that runs past the bitmap is marked clipped.
+    let mut destination = bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
+    blit_plane(
+        &mut destination,
+        14,
+        14,
+        &source,
+        (0, 0, 4, 4),
+        (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+        COPY_MAIN | COPY_MASK,
+    );
+    assert_eq!(
+        destination.dirty_region,
+        Some(PixelRegion::new(14, 14, 2, 2)),
+        "the marked rectangle is the clipped one"
+    );
+}
+
+/// A copy clipped to a rectangle marks the clipped rectangle alone.
+#[test]
+fn a_clipped_copy_marks_only_the_clipped_rectangle() {
+    let source = bitmap(4, 4, vec![255u8; 4 * 4 * 4]);
+    let mut destination = bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
+    blit_copy(&mut destination, 2, 2, &source, (0, 0, 4, 4));
+    assert_eq!(
+        destination.dirty_region,
+        Some(PixelRegion::new(2, 2, 4, 4)),
+        "the copied rectangle is marked"
+    );
+}
+
+/// A `Blt` source-over marks the rectangle it wrote, not the whole bitmap.
+#[test]
+fn a_blt_marks_only_the_rectangle_it_wrote() {
+    let source = bitmap(4, 4, vec![255u8; 4 * 4 * 4]);
+    let options = BlitOptions {
+        mode: 2,
+        opa: 255,
+        treat_as_opaque: false,
+        hold_alpha: false,
+    };
+    let mut destination = bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
+    blit_over(
+        &mut destination,
+        2,
+        6,
+        BlitSource {
+            bitmap: &source,
+            rect: (0, 0, 4, 4),
+        },
+        (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+        options,
+    );
+    assert!(destination.dirty, "the blit marks the bitmap dirty");
+    assert_eq!(
+        destination.dirty_region,
+        Some(PixelRegion::new(2, 6, 4, 4)),
+        "only the written rectangle is marked"
+    );
+}
+
+/// A `stretchCopy` marks the destination rectangle it resampled into.
+#[test]
+fn a_stretch_copy_marks_only_the_destination_rectangle() {
+    let source = bitmap(4, 4, vec![255u8; 4 * 4 * 4]);
+    let mut destination = bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
+    stretch_blit(&mut destination, (2, 3, 10, 9), &source, (0, 0, 4, 4), 0);
+    assert!(destination.dirty, "the copy marks the bitmap dirty");
+    assert_eq!(
+        destination.dirty_region,
+        Some(PixelRegion::new(2, 3, 8, 6)),
+        "only the destination rectangle is marked"
+    );
+}

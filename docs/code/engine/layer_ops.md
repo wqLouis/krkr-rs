@@ -19,7 +19,9 @@ straight-alpha channels directly.
   exposes.
 * Clip every operation against the destination bitmap **and** the layer's
   `ClipRect`.
-* Mark the bitmap dirty after a write, so the engine re-uploads it.
+* Mark the bitmap dirty after a write, so the engine re-uploads it. The
+  writes that touch one rectangle mark that rectangle, so the upload sends
+  the changed part and not the whole bitmap.
 * Provide the two transition slots (the whole-subtree frame and the
   transition's self image) and the subtree compositing that fills them.
 
@@ -125,10 +127,12 @@ projection draws the two sources, so nothing is written to a bitmap per tick
   supplied clip rectangle. A write outside the clip is dropped, not clamped.
 * **A write marks the bitmap dirty**, so the engine re-uploads it on the next
   frame. `mark_dirty_rect` narrows the upload to the written rectangle for the
-  affine, `operate_rect` and `stretch_blit_mode` passes; the other families
-  mark the whole bitmap. Both marks bump the bitmap's `content_generation`,
-  which the subtree-cache bookkeeping sums to detect an edit that did not go
-  through a layer accessor.
+  affine, `operate_rect`, `stretch_blit_mode` and the copy and blend passes
+  (`copyRect`, `Blt` and `stretchCopy`); the families that rewrite the whole
+  bitmap (the fills, the blurs, the colour operations) mark it wholly. Both
+  marks bump the bitmap's `content_generation`, which the subtree-cache
+  bookkeeping sums to detect an edit that did not go through a layer
+  accessor.
 * **The source rectangle is half-open**, and a source region that leaves the
   source bitmap contributes nothing rather than a repeated edge pixel.
 * **`blit_plane` with both plane bits is a straight copy**, not a blend: the

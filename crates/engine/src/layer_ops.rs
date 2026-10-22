@@ -30,7 +30,7 @@ use api::blend::{BlendMode, DstBlend};
 use api::geometry::PixelRegion;
 
 use crate::hasher::Map;
-use crate::raster::{blend_pixel, blend_pixel_at};
+use crate::raster::{blend_pixel, blend_pixel_at, blend_pixel_raw};
 use crate::scene::{BitmapState, Rect, Scene};
 
 /// Half-open pixel rectangle `[x0, x1) x [y0, y1)`.
@@ -588,7 +588,9 @@ pub fn blit_copy_clipped(
             write_pixel(dst, x, y, color);
         }
     }
-    dst.mark_dirty();
+    // The pass wrote inside the clipped destination rectangle only, so the
+    // upload needs that rectangle and not the whole bitmap.
+    dst.mark_dirty_rect(clipped_region(dest_clip));
 }
 
 /// `Blt` source-over: composite `src[src_rect]` onto `dst` at `(dx, dy)`,
@@ -648,7 +650,7 @@ pub fn blit_over(
             // channel entirely; capture it first so the composite math still
             // sees the real destination alpha.
             let old_alpha = read_pixel(dst, x, y)[3];
-            blend_pixel(dst, x, y, color, 255, opa);
+            blend_pixel_raw(dst, x, y, color, 255, opa);
             if hold_alpha {
                 let mut d = read_pixel(dst, x, y);
                 d[3] = old_alpha;
@@ -656,7 +658,9 @@ pub fn blit_over(
             }
         }
     }
-    dst.mark_dirty();
+    // The pass wrote inside the clipped destination rectangle only, so the
+    // upload needs that rectangle and not the whole bitmap.
+    dst.mark_dirty_rect(clipped_region(dc));
 }
 
 /// `CopyRect` with an explicit `plane` selection (`TVP_BB_COPY_MAIN` /
@@ -711,7 +715,9 @@ pub fn blit_plane(
                 write_pixel(dst, x, y, s);
             }
         }
-        dst.mark_dirty();
+        // The pass wrote inside the clipped destination rectangle only, so the
+        // upload needs that rectangle and not the whole bitmap.
+        dst.mark_dirty_rect(clipped_region(dc));
         return;
     }
     let sw = src_rect.2.saturating_sub(src_rect.0);
@@ -744,7 +750,9 @@ pub fn blit_plane(
             write_pixel(dst, x, y, d);
         }
     }
-    dst.mark_dirty();
+    // The pass wrote inside the clipped destination rectangle only, so the
+    // upload needs that rectangle and not the whole bitmap.
+    dst.mark_dirty_rect(clipped_region(dc));
 }
 
 /// `layerExImage`/`AddAutoPath`-style tile: repeated `copyRect` of the
@@ -1477,7 +1485,9 @@ pub fn stretch_blit_plane(
             write_pixel(dst, x, y, d);
         }
     }
-    dst.mark_dirty();
+    // The pass wrote inside the clipped destination rectangle only, so the
+    // upload needs that rectangle and not the whole bitmap.
+    dst.mark_dirty_rect(clipped_region(dc));
 }
 
 /// Luma `(54*R + 183*G + 19*B) >> 8` written to all three channels, alpha

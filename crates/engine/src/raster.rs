@@ -37,7 +37,7 @@ pub fn blend_pixel(
 
 /// [`blend_pixel`] without the dirty marking: a raster operation writes many
 /// pixels and marks its target once. Returns whether the pixel exists.
-fn blend_pixel_raw(
+pub(crate) fn blend_pixel_raw(
     bitmap: &mut BitmapState,
     x: i32,
     y: i32,
