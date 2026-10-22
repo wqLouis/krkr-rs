@@ -42,7 +42,7 @@ map for the module.
 | `timer: TimerState` | the timer registry the frame advances |
 | `input: InputState` | the script-visible input state |
 | `surface_size: (u32, u32)` | the current framebuffer size in device pixels |
-| `now_ms`, `last_now_ms`, `elapsed_ms`, `frame_index` | the frame clock and counters |
+| `clock_ms`, `now_ms`, `last_now_ms`, `frame_index` | the frame clock and counters |
 | `headless: bool` | whether the engine runs with no window |
 | `overlay: Option<Box<dyn EngineOverlay>>` | the render-only debug overlay |
 | `translation: Option<PixelTranslation>` | the current VM↔device mapping; `None` when the sizes cannot be fitted |
@@ -86,11 +86,15 @@ impl Engine {
 }
 ```
 
-* `frame(now_ms, …)` **sets** the clock; the delta handed to the hook is the
+* `frame(now_ms, …)` **sets** the clock exactly, discarding any fractional
+  remainder left by an earlier `step`; the delta handed to the hook is the
   distance from the previous frame's clock (zero on the first frame), so a
   test can jump between frames deterministically.
-* `step(dt_ms, …)` **adds** the delta to the engine's own clock; a negative
-  delta counts as zero.
+* `step(dt_ms, …)` **adds** the full float delta to the engine's own clock; a
+  negative delta counts as zero. The sub-millisecond part is retained across
+  frames, so sixty `step(16.6)` calls advance the clock by 996 ms rather than
+  960. The timer, hook and overlay receive the accumulated clock's whole
+  millisecond `now_ms`.
 * `resize(size, …)` rebinds the surface to a new framebuffer size. The
   logical screen is untouched: the scene keeps its window client sizes and
   primary-layer rects, and the presentation refits the screen into the new
@@ -167,9 +171,9 @@ skip has nothing to retry.
 
 ## 3. The frame, in order
 
-`Engine::advance(now_ms, dt_ms, hooks)` runs exactly this sequence:
+`Engine::advance(now_ms, clock_ms, dt_ms, hooks)` runs exactly this sequence:
 
-1. set the clock (`now_ms`, `last_now_ms`, `elapsed_ms`);
+1. set the clock (`clock_ms`, `now_ms`, `last_now_ms`);
 2. `sync_presentation()` — refit the VM↔device mapping, observe the window
    client size;
 3. `timer.advance(now_ms)` — fire the due timers;
@@ -202,7 +206,10 @@ touched.
 ## 4. Invariants
 
 * **The engine owns the clock.** Nothing above L2 accumulates a `dt` or calls
-  a subsystem pump itself.
+  a subsystem pump itself. The clock is one `f64` millisecond accumulator:
+  `step` adds to it and saturates at the integer ceiling, `frame` replaces it
+  with the injected whole value, and the timer and upward edge receive its
+  whole-millisecond part.
 * **The projected tree is in VM pixels.** The render-scene root carries the
   Fit presentation transform; the overlay is attached with the inverse root
   transform because its node is authored in device coordinates.

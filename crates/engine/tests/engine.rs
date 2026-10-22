@@ -166,6 +166,83 @@ fn step_advances_the_frame_clock_and_frame_index() {
 }
 
 #[test]
+fn step_keeps_the_fractional_millisecond_across_frames() {
+    // reference/cpp/core/utils/impl/TimerImpl.cpp:113,128-146
+    // Each timer check re-arms from the current tick, so a frame delta must
+    // not discard its sub-millisecond remainder.
+    let mut engine = headless_engine((16, 16));
+    let fired = Rc::new(Cell::new(0u32));
+    let counter = Rc::clone(&fired);
+    engine
+        .timer_mut()
+        .create_interval(
+            16,
+            Box::new(move |_id| counter.set(counter.get().saturating_add(1))),
+        )
+        .expect("timer");
+    let mut hooks = Recorder::default();
+
+    let mut last = None;
+    for _ in 0..60 {
+        last = Some(engine.step(16.6, &mut hooks).expect("frame"));
+    }
+    let last = last.expect("60 frames");
+
+    assert!(
+        (last.elapsed_ms - 996.0).abs() < 0.01,
+        "60 x 16.6 ms must reach 996 ms, got {}",
+        last.elapsed_ms
+    );
+    assert_eq!(last.frame_index, 60);
+    assert_eq!(
+        fired.get(),
+        60,
+        "a 16 ms timer fires on every 16.6 ms frame"
+    );
+    assert_eq!(engine.elapsed_ms(), last.elapsed_ms);
+}
+
+#[test]
+fn a_saturating_delta_keeps_the_clock_monotonic() {
+    let mut engine = headless_engine((16, 16));
+    let mut hooks = Recorder::default();
+
+    engine.step(f32::MAX, &mut hooks).expect("saturating frame");
+    let saturated = engine.elapsed_ms();
+    assert!(saturated.is_finite(), "the clock stays representable");
+    assert_eq!(hooks.calls.last().expect("call").0, u64::MAX);
+
+    let repeated = engine
+        .step(f32::MAX, &mut hooks)
+        .expect("second saturating frame");
+    assert!(repeated.elapsed_ms >= saturated);
+    assert_eq!(repeated.elapsed_ms, saturated, "the clock stays capped");
+    assert_eq!(hooks.calls.last().expect("call").0, u64::MAX);
+
+    let paused = engine.step(0.0, &mut hooks).expect("zero-delta frame");
+    assert_eq!(
+        paused.elapsed_ms, saturated,
+        "a pause neither wraps nor rewinds"
+    );
+    assert_eq!(hooks.calls.last().expect("call").0, u64::MAX);
+}
+
+#[test]
+fn frame_discards_the_fractional_step_remainder() {
+    let mut engine = headless_engine((16, 16));
+    let mut hooks = Recorder::default();
+
+    engine.step(10.6, &mut hooks).expect("step");
+    assert!((engine.elapsed_ms() - 10.6).abs() < 1e-3);
+
+    let framed = engine.frame(40, &mut hooks).expect("frame");
+    assert_eq!(framed.elapsed_ms, 40.0, "frame sets the clock exactly");
+
+    let stepped = engine.step(0.5, &mut hooks).expect("step");
+    assert!((stepped.elapsed_ms - 40.5).abs() < f64::EPSILON);
+}
+
+#[test]
 fn frame_report_carries_the_null_backend_stats() {
     let mut engine = headless_engine((32, 32));
     let mut hooks = Recorder::default();
