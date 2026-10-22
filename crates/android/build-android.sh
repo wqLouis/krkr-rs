@@ -27,8 +27,16 @@
 # this `.so` straight out of the APK. NDK r27 and older link with 4 KB page
 # alignment (PT_LOAD p_align = 0x1000) by default; per Google's "Support 16 KB
 # page sizes", such a library "crashes at runtime with a segmentation fault".
-# We therefore link with 16 KB alignment and *verify* it before staging — see
-# the "16 KB page-size alignment" and "verify 16 KB page alignment" sections.
+# We therefore link with 16 KB alignment and *verify* it before the package is
+# handed to Gradle — see the "16 KB page-size alignment" and "verify the
+# package" sections.
+#
+# ## The C++ runtime
+#
+# The engine links the C++ runtime statically. The shared runtime
+# (`libc++_shared.so`) is not part of the Android platform: a library that
+# needs it must package it, and one that does not is loaded by the device
+# without it. See "the C++ runtime" below.
 #
 # ## Usage
 #
@@ -120,6 +128,21 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC"
 # this; without it the Opus build fails with "Failed to find tool".
 export ANDROID_NDK_HOME="$NDK"
 
+# --- the C++ runtime --------------------------------------------------------
+#
+# The engine links the C++ runtime **statically**. `cc` — the build-script
+# helper the C++ crates use — defaults to `c++_shared` on Android, and that
+# puts `libc++_shared.so` into the engine's `DT_NEEDED`: the library then has
+# to be packaged into the APK as well, or the loader fails on the device with
+# "failed to dlopen libc++_shared.so". `CXXSTDLIB` is the variable `cc` reads
+# for that choice; it is set target-scoped, so the host build is untouched.
+#
+# The static runtime is the right one here: the APK ships a single C++
+# library, so there is no second copy of the runtime to disagree with, and
+# the runtime ends up inside this library's own 16 KB-aligned image instead
+# of in a separate file the loader would have to map.
+export CXXSTDLIB_aarch64_linux_android="c++_static"
+
 # --- 16 KB page-size alignment ----------------------------------------------
 #
 # Pass the alignment to the Rust link via the *target-scoped* rustflags variable
@@ -140,6 +163,15 @@ for tool in "$CC" "$CXX" "$AR"; do
         exit 1
     fi
 done
+
+# The package is verified with `readelf` (the dependencies and the page
+# alignment of every staged library); without it nothing can be verified, so
+# the build stops before it packages anything.
+if ! command -v readelf >/dev/null 2>&1; then
+    echo "error: readelf (binutils) is required to verify the staged libraries" >&2
+    echo "  install binutils; refusing to package unverifiable libraries" >&2
+    exit 1
+fi
 
 echo "krkr-rs android: abi=$ABI target=$RUST_TARGET api=$API_LEVEL profile=$PROFILE"
 echo "krkr-rs android: ndk=$NDK"
@@ -204,33 +236,53 @@ case "$ARCH" in
         ;;
 esac
 
-# --- verify 16 KB page alignment --------------------------------------------
+# --- the C++ runtime in the package ----------------------------------------
 #
-# The flags above are the fix; this is the proof. `extractNativeLibs=false`
-# maps the `.so` directly out of the APK, so a PT_LOAD whose p_align is not a
-# multiple of 0x4000 (16 KB) crashes on a 16 KB-page device. Refuse to stage a
-# library that is not compliant, and refuse to guess when the tool needed to
-# check it is missing.
-if ! command -v readelf >/dev/null 2>&1; then
-    echo "error: readelf (binutils) is required to verify 16 KB page alignment" >&2
-    echo "  install binutils; refusing to stage an unverifiable $LIB_NAME" >&2
-    exit 1
-fi
-
-LOAD_ALIGNS="$(readelf -lW "$JNI_LIBS/$LIB_NAME" | awk '$1 == "LOAD" { print $NF }')"
-if [[ -z "$LOAD_ALIGNS" ]]; then
-    echo "error: no PT_LOAD segments found in $JNI_LIBS/$LIB_NAME (unexpected readelf output)" >&2
-    exit 1
-fi
-while read -r align; do
-    if (( align == 0 || align % 0x4000 != 0 )); then
-        echo "error: $LIB_NAME is not 16 KB page aligned: PT_LOAD p_align=$align" >&2
-        echo "  every p_align must be a non-zero multiple of 0x4000 (16384);" >&2
-        echo "  Android 15+ 16 KB-page devices will crash loading it." >&2
+# The engine links the C++ runtime statically (see CXXSTDLIB above), so the
+# package normally carries no C++ runtime at all. If a dependency pulls the
+# shared runtime in anyway, the NDK's copy has to be packaged next to the
+# engine, or the loader fails with "failed to dlopen libc++_shared.so".
+#
+# The NDK's prebuilt runtime is only 16 KB aligned from NDK r28 on, and the
+# package is mapped straight out of the APK (`extractNativeLibs=false`), so a
+# runtime that the device cannot map is refused by the packaging check below
+# rather than shipped.
+CXX_RUNTIME="libc++_shared.so"
+NEEDED="$(readelf -dW "$JNI_LIBS/$LIB_NAME" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')"
+if [[ " $NEEDED " == *" $CXX_RUNTIME "* ]]; then
+    # The shared runtime is per ABI, but the NDK also keeps it per API level.
+    NDK_RUNTIME=""
+    for candidate in \
+        "$TOOLCHAIN/sysroot/usr/lib/aarch64-linux-android/$CXX_RUNTIME" \
+        "$TOOLCHAIN/sysroot/usr/lib/aarch64-linux-android/$API_LEVEL/$CXX_RUNTIME"; do
+        if [[ -f "$candidate" ]]; then
+            NDK_RUNTIME="$candidate"
+            break
+        fi
+    done
+    if [[ -z "$NDK_RUNTIME" ]]; then
+        echo "error: $LIB_NAME needs $CXX_RUNTIME, but the NDK does not provide it:" >&2
+        echo "  $TOOLCHAIN/sysroot/usr/lib/aarch64-linux-android/$CXX_RUNTIME" >&2
+        echo "  link the C++ runtime statically (CXXSTDLIB=c++_static) instead." >&2
         exit 1
     fi
-done <<< "$LOAD_ALIGNS"
-echo "krkr-rs android: all PT_LOAD segments are 16 KB aligned"
+    cp "$NDK_RUNTIME" "$JNI_LIBS/$CXX_RUNTIME"
+    echo "krkr-rs android: staged $CXX_RUNTIME from the NDK"
+else
+    # A runtime left over from an earlier build would be packaged for
+    # nothing; the engine does not need it.
+    rm -f "$JNI_LIBS/$CXX_RUNTIME"
+fi
+
+# --- verify the package ------------------------------------------------------
+#
+# The staged directory is what Gradle puts into the APK, so it is checked as
+# a package: every dependency of every library must be resolvable on the
+# device (the platform or another packaged library), and every library must
+# be loadable from the APK as it is — `extractNativeLibs=false` maps the file
+# straight out of the APK, so a PT_LOAD whose p_align is not a multiple of
+# 0x4000 (16 KB) crashes on a 16 KB-page device.
+bash "$ROOT/crates/android/check-jni-libs.sh" "$JNI_LIBS"
 
 echo "krkr-rs android: staged $JNI_LIBS/$LIB_NAME ($(du -h "$JNI_LIBS/$LIB_NAME" | cut -f1))"
 echo "krkr-rs android: next, from android/: gradle assembleDebug"

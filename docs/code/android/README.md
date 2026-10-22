@@ -31,6 +31,7 @@ MediaCodec backend and the packaging — is in
 | `config` | `src/config.rs` | the launcher's settings → the validated `RuntimeConfig` | [config.md](config.md) |
 | `jni_fields` | `src/jni_fields.rs` | the static-field JNI reads | [config.md](config.md) §4 |
 | — | `build-android.sh` | the cross-compile, the staging and the verification | [build.md](build.md) |
+| — | `check-jni-libs.sh` | the packaging check: the dependencies and the page alignment of the staged libraries | [build.md](build.md) §6 |
 
 ---
 

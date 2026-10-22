@@ -46,6 +46,15 @@ ANDROID_NDK_HOME=/path/to/android-ndk-r27c ./crates/android/build-android.sh
 cd android && gradle assembleDebug
 ```
 
+The first step also checks the staged package: every dependency of every
+native library must be resolvable on the device (the platform or another
+library of the package) and every library must be 16 KB page aligned. The
+same check runs on the finished APK:
+
+```bash
+./crates/android/check-jni-libs.sh android/app/build/outputs/apk/release/app-release.apk
+```
+
 > **Rebuilt composition root.** `crates/android` is again the `krkr_android`
 > cdylib (`android_main` plus its `build-android.sh`); it drives the shared
 > `app::Host`/`app::GameHost` from the `android-activity` `GameActivity` loop

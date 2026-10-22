@@ -1,7 +1,7 @@
 # `build` — the cross-compile, the staging and the packaging
 
-Source: `crates/android/build-android.sh`, `android/` (the Gradle project),
-`.github/workflows/android.yml`
+Source: `crates/android/build-android.sh`, `crates/android/check-jni-libs.sh`,
+`android/` (the Gradle project), `.github/workflows/android.yml`
 
 Everything Android-specific about the *build* lives in the script and in the
 Gradle project, so the engine crates stay platform-neutral: they only need a
@@ -19,6 +19,10 @@ toolchain in the standard environment variables.
 The APK's `native-code` is `arm64-v8a` only, by decision: there is no
 emulator (x86_64) build. The game's own files never ship in the APK; the user
 picks the folder at runtime.
+
+The package is checked by `crates/android/check-jni-libs.sh`, which runs on
+the staged directory before Gradle sees it and on the finished APK in CI —
+see §6.
 
 ---
 
@@ -41,6 +45,7 @@ export CXX="$BIN/aarch64-linux-android${API_LEVEL}-clang++"
 export AR="$BIN/llvm-ar"
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC"
 export ANDROID_NDK_HOME="$NDK"
+export CXXSTDLIB_aarch64_linux_android="c++_static"
 ```
 
 and then runs a plain `cargo build --target aarch64-linux-android -p android`.
@@ -51,6 +56,28 @@ is what tells clang to emit Android code — `crates/tjs/build.rs` passes no
 `ANDROID_NDK_HOME` is exported because `opusic-sys`'s build script switches to
 the NDK's cmake toolchain when it sees it; without it the Opus build fails
 with "Failed to find tool".
+
+### The C++ runtime
+
+The C++ runtime is linked **statically**, and that is what `CXXSTDLIB` is for.
+`cc` — the build-script helper the C++ crates use — defaults to `c++_shared`
+on Android, which puts `libc++_shared.so` into the engine's `DT_NEEDED`. That
+library is **not** part of the Android platform: it has to be packaged into
+the APK next to the engine, and when it is not, the app dies on the device
+with `failed to dlopen libc++_shared.so` — long after the build went green.
+`forkunion` (the C++ core of the `psd` crate) is the crate that pulls it in.
+
+`CXXSTDLIB` is the variable `cc` reads for that choice; the script sets it
+**target-scoped** (`CXXSTDLIB_aarch64_linux_android`), so the desktop build
+is untouched. `crates/tjs/build.rs` links the runtime itself as well
+(`static=c++_static`, `static=c++abi`) right after the VM's archive, so the
+C++ code of the VM is resolved by the runtime whatever order the linker sees
+the crates in.
+
+The static runtime is also the right choice for the page size: the shared
+runtime of the NDK is only 16 KB aligned from NDK r28 on, and the package is
+mapped straight out of the APK (§3), so a separate runtime file would have to
+be aligned as well.
 
 ### Why not `cargo ndk`
 
@@ -100,9 +127,10 @@ preserved, because cargo treats the target-scoped variable as a *replacement*
 for `RUSTFLAGS` and dropping it would silently discard the caller's flags.
 
 The verification reads the `PT_LOAD` alignments with `readelf` and refuses to
-stage a library whose alignment is not a non-zero multiple of `0x4000`. A
-missing `readelf` is an error too: the script refuses to stage an
-*unverifiable* library.
+package a library whose alignment is not a non-zero multiple of `0x4000`. A
+missing `readelf` is an error too: the script refuses to package an
+*unverifiable* library. The rule lives in `check-jni-libs.sh` (§6), which
+checks every library of the package, not only the engine's.
 
 ---
 
@@ -189,7 +217,27 @@ first.
 
 ---
 
-## 6. CI
+## 6. The packaging check
+
+`crates/android/check-jni-libs.sh` verifies that the native libraries of the
+package can be loaded on a device. It takes either a directory of `.so` files
+or an `.apk`, and for every library it checks that
+
+* every `DT_NEEDED` entry is either an Android platform library or another
+  library of the same package — a dependency that is neither is what the
+  device reports as `failed to dlopen <library>`; `libc++_shared.so` is
+  deliberately **not** a platform library, so an engine that needs it has to
+  package it;
+* every `PT_LOAD` segment is aligned to 16 KB (§3).
+
+`build-android.sh` runs it on the staged directory, before Gradle packages
+it, and the workflow runs it on the finished APK. The script has a
+`--self-test` that builds fixtures with the host compiler and asserts that
+the rules fire — a check that cannot fail is not a check.
+
+---
+
+## 7. CI
 
 `.github/workflows/android.yml` triggers on **`android-*` tags** and on
 `workflow_dispatch`. A branch push triggers nothing, so ordinary engine work
@@ -199,8 +247,9 @@ not match either.
 The workflow installs the NDK, the SDK platform and the build tools, JDK 21,
 Rust with the `aarch64-linux-android` target, Zig (the C++ dependency fetch
 needs it) and `bison` (the TJS2 parser generator), runs the same
-`build-android.sh`, runs `gradle :app:assembleRelease`, and publishes the APK
-as an artifact — and, for a tag run, as a GitHub Release asset.
+`build-android.sh`, runs `gradle :app:assembleRelease`, checks the packaged
+native libraries (§6), and publishes the APK as an artifact — and, for a tag
+run, as a GitHub Release asset.
 
 The pinned versions are the ones the port was verified against: NDK r27c
 compiles the vendored C++ TJS2 VM, so a version bump changes the compiler
@@ -208,7 +257,7 @@ that builds the VM and must be re-verified.
 
 ---
 
-## 7. What is not verified here
+## 8. What is not verified here
 
 **The Android target is never built or tested on the development host.** There
 is no NDK and none may be installed. The host-side equivalents are:
@@ -239,7 +288,7 @@ staging-copy transport is the current default.
 
 ---
 
-## 8. Related documents
+## 9. Related documents
 
 | topic | document |
 |---|---|

@@ -186,6 +186,17 @@ jobs:
           KRKR_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: gradle :app:assembleRelease --no-daemon --stacktrace
 
+      # The APK is the artifact that reaches a device, so it is the thing that
+      # is checked: every native library it ships must have its dependencies
+      # resolvable (the platform or another library of the package) and must be
+      # loadable from the APK as it is. A library that needs a C++ runtime the
+      # package does not carry fails on the device with "failed to dlopen
+      # libc++_shared.so", long after the build went green.
+      - name: Verify the packaged native libraries
+        run: |
+          bash ./crates/android/check-jni-libs.sh \
+            android/app/build/outputs/apk/release/app-release.apk
+
       - name: Upload the APK
         uses: actions/upload-artifact@v7
         with:

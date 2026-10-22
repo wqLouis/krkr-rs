@@ -658,5 +658,15 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=c++");
         println!("cargo:rustc-link-lib=dylib=c++abi");
         println!("cargo:rustc-link-arg=-pthread");
+    } else if target_os == "android" {
+        // The NDK's C++ runtime comes in two shapes: `libc++_static.a` and
+        // `libc++_shared.so`. The shared one is not part of the Android
+        // platform, so a library that needs it has to package it — the
+        // engine's package does not, and the static runtime keeps the C++
+        // code of the VM inside the engine library itself. It is linked here,
+        // right after the VM's archive, so the runtime is resolved by the
+        // objects that need it whatever order the linker sees the crates in.
+        println!("cargo:rustc-link-lib=static=c++_static");
+        println!("cargo:rustc-link-lib=static=c++abi");
     }
 }
