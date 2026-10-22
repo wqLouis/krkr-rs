@@ -23,7 +23,8 @@
 //!
 //! A mount can optionally read each archive into memory in full
 //! ([`MountOptions::preload_archives`]); the image is owned by this layer and
-//! a borrow of it is handed to L1 for every entry read.
+//! a borrow of it is handed to L1 for every entry read. The image is read in
+//! the background, so the mount does not wait for the archive's bytes.
 //!
 //! The bytes of an entry are read on a worker pool
 //! ([`StorageReadPool`]): a lookup answers the entry's existence and its size
@@ -53,7 +54,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::error::FsError;
 use api::fs::{FsPath, OpenMode};
-use fs::xp3::{self, Xp3Archive, Xp3ExtractionFilter, normalize_in_archive_name};
+use fs::xp3::{self, Entry, Xp3Archive, Xp3ExtractionFilter, normalize_in_archive_name};
 use fs::{FileState, FileSystem};
 
 /// Windows `FILE_ATTRIBUTE_DIRECTORY` (0x10).
@@ -84,9 +85,155 @@ struct MountedArchive {
 pub enum ArchiveBacking {
     /// The archive file stays open and each entry read is positional.
     Stream(Arc<FileState>),
-    /// The whole archive file was read into memory at mount; entry reads copy
-    /// from this image.
-    Memory(Arc<[u8]>),
+    /// The archive file stays open and its whole image is read into memory in
+    /// the background; an entry read copies from the image once it is loaded
+    /// and reads the entry from the file until then.
+    Image(Arc<ArchiveImage>),
+}
+
+/// The whole image of one preloaded archive.
+///
+/// The image is read on its own thread, so the mount returns as soon as the
+/// index is parsed and the archive's bytes are read while the game runs. An
+/// entry read copies from the image once it is loaded and reads the entry
+/// from the archive file until then; the bytes are the same either way. A
+/// load that fails is reported as a typed read error and is never ignored.
+pub struct ArchiveImage {
+    /// The bottom file system the archive is read through.
+    fs: FileSystem,
+    /// The open archive file; the entry reads use it while the image loads.
+    file: Arc<FileState>,
+    /// The load's state.
+    state: Mutex<ImageState>,
+}
+
+/// The state of one archive image load.
+enum ImageState {
+    /// The image is being read.
+    Loading,
+    /// The image is in memory.
+    Ready(Arc<[u8]>),
+    /// The load failed.
+    Failed(PreloadError),
+}
+
+impl ArchiveImage {
+    /// Creates an image whose load has not started.
+    fn pending(fs: &FileSystem, file: &Arc<FileState>) -> Arc<Self> {
+        Arc::new(ArchiveImage {
+            fs: fs.clone(),
+            file: Arc::clone(file),
+            state: Mutex::new(ImageState::Loading),
+        })
+    }
+
+    /// Starts the background load of an archive file's whole image.
+    ///
+    /// The load runs on its own thread, so the mount does not wait for the
+    /// archive's bytes: the index is parsed at the mount and the image is
+    /// filled while the game runs. A thread that cannot be started loads the
+    /// image on the calling thread instead, which keeps the image in memory
+    /// before the first entry read.
+    ///
+    /// `len` is the archive's size in bytes, already checked to be
+    /// addressable by the mount.
+    fn start(fs: &FileSystem, file: &Arc<FileState>, path: &Path, len: usize) -> Arc<Self> {
+        let image = Self::pending(fs, file);
+        let worker_fs = fs.clone();
+        let worker_file = Arc::clone(file);
+        let worker_path = path.to_path_buf();
+        let worker_image = Arc::clone(&image);
+        let worker = std::thread::Builder::new()
+            .name("krkr-archive-image".to_owned())
+            .spawn(move || {
+                let started = Instant::now();
+                let result = load_archive_image(&worker_fs, &worker_file, &worker_path, len);
+                worker_image.publish(&worker_path, result, started.elapsed());
+            });
+        if let Err(error) = worker {
+            log::warn!(
+                "the archive image of {} is loaded on the mounting thread: {error}",
+                path.display()
+            );
+            let started = Instant::now();
+            let result = load_archive_image(fs, file, path, len);
+            image.publish(path, result, started.elapsed());
+        }
+        image
+    }
+
+    /// Publishes the load's result and reports how long the load took.
+    fn publish(&self, path: &Path, result: Result<Arc<[u8]>, PreloadError>, elapsed: Duration) {
+        let mut state = lock(&self.state);
+        *state = match result {
+            Ok(image) => {
+                log::info!(
+                    "the archive image of {} is loaded ({} bytes in {:.1} ms)",
+                    path.display(),
+                    image.len(),
+                    elapsed.as_secs_f64() * 1000.0
+                );
+                ImageState::Ready(image)
+            }
+            Err(error) => {
+                log::warn!(
+                    "the archive image of {} could not be read: {error}",
+                    path.display()
+                );
+                ImageState::Failed(error)
+            }
+        };
+    }
+
+    /// The image, once the load has finished; `None` while it is still
+    /// running.
+    fn loaded(&self) -> Result<Option<Arc<[u8]>>, PreloadError> {
+        let state = lock(&self.state);
+        match &*state {
+            ImageState::Loading => Ok(None),
+            ImageState::Ready(image) => Ok(Some(Arc::clone(image))),
+            ImageState::Failed(error) => Err(error.clone()),
+        }
+    }
+
+    /// Reads the entry `entry` of `archive`, at most `limit` bytes.
+    ///
+    /// The bytes come from the image once it is loaded and from the archive
+    /// file until then.
+    fn read_entry(
+        &self,
+        archive: &Xp3Archive,
+        entry: &Entry,
+        archive_name: &str,
+        limit: Option<usize>,
+        filter: Option<&Xp3ExtractionFilter<'_>>,
+    ) -> Result<Vec<u8>, StorageReadError> {
+        match self.loaded()? {
+            Some(image) => match limit {
+                Some(limit) => archive
+                    .read_entry_prefix_from_bytes(&image, entry, archive_name, limit, filter)
+                    .map_err(xp3_error),
+                None => archive
+                    .read_entry_from_bytes(&image, entry, archive_name, filter)
+                    .map_err(xp3_error),
+            },
+            None => match limit {
+                Some(limit) => archive
+                    .read_prefix_with_filter(
+                        &self.fs,
+                        &self.file,
+                        &entry.name,
+                        archive_name,
+                        limit,
+                        filter,
+                    )
+                    .map_err(xp3_error),
+                None => archive
+                    .read_entry_with_filter(&self.fs, &self.file, entry, archive_name, filter)
+                    .map_err(xp3_error),
+            },
+        }
+    }
 }
 
 /// A mounted archive's index together with the bytes it reads from.
@@ -102,17 +249,19 @@ pub struct ArchiveSource {
 ///
 /// The default keeps every archive on the file system and reads each entry
 /// positionally. Enabling [`preload_archives`](Self::preload_archives) reads
-/// each archive into memory once at mount.
+/// each archive into memory in full while the game runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MountOptions {
-    /// Read each mounted archive into memory in full at mount.
+    /// Read each mounted archive into memory in full.
     ///
     /// The resident-memory cost is the archive's own size; there is no cap.
     /// Every entry then reads from that buffer instead of the file system,
     /// which removes the per-entry random reads a slow backing store makes
-    /// visible. A short read, an unrepresentable size or a failed allocation
-    /// is a typed [`MountError`], never a silent fall back to the streaming
-    /// path.
+    /// visible. The image is read in the background from the mount, so the
+    /// mount does not wait for the archive's bytes: an entry read copies
+    /// from the image once it is loaded and reads the entry from the file
+    /// until then. A load that fails is a typed [`PreloadError`], never a
+    /// silent fall back to the streaming path.
     pub preload_archives: bool,
 }
 
@@ -128,7 +277,7 @@ pub struct Storage {
     archives: Vec<MountedArchive>,
     /// Auto search-path prefixes (plain dirs or `arc.xp3>` prefixes).
     auto_paths: Vec<String>,
-    /// Whether an archive is read into memory in full when it is mounted.
+    /// Whether an archive's whole image is read into memory in the background.
     preload_archives: bool,
     /// The project storage path (the reference's current directory), supplied
     /// by the composition root via [`Self::set_project`]. `Some` when the
@@ -479,16 +628,6 @@ pub enum MountError {
     /// An archive failed to open or parse.
     #[error("archive error: {0}")]
     Xp3(#[from] xp3::Xp3Error),
-    /// A preloaded archive was shorter than its reported size.
-    #[error("archive {path} is truncated: read {read} of {expected} bytes")]
-    TruncatedArchive {
-        /// Archive path as mounted.
-        path: String,
-        /// Size the archive reported.
-        expected: u64,
-        /// Bytes actually read before the file ended.
-        read: u64,
-    },
     /// A preloaded archive is larger than this platform can address in a
     /// single buffer.
     #[error("archive {path} is too large to hold in memory: {size} bytes")]
@@ -498,13 +637,42 @@ pub enum MountError {
         /// Reported size in bytes.
         size: u64,
     },
-    /// A preloaded archive's buffer could not be allocated.
+}
+
+/// A preloaded archive's image could not be read into memory.
+///
+/// The image is read in the background, so the failure is reported to the
+/// read that needs the image rather than to the mount. It is a typed error
+/// in every case: the archive never falls back to serving the entry from
+/// the file after a failed load.
+#[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
+pub enum PreloadError {
+    /// The archive was shorter than the size the mount read.
+    #[error("archive {path} is truncated: read {read} of {expected} bytes")]
+    Truncated {
+        /// Archive path as mounted.
+        path: String,
+        /// Size the archive reported.
+        expected: u64,
+        /// Bytes actually read before the file ended.
+        read: u64,
+    },
+    /// The archive's buffer could not be allocated.
     #[error("archive {path} could not be read into memory: {size} bytes")]
-    ArchiveAllocation {
+    Allocation {
         /// Archive path as mounted.
         path: String,
         /// Reported size in bytes.
         size: u64,
+    },
+    /// A bottom file-system read failed.
+    #[error("archive {path} could not be read: {message}")]
+    Io {
+        /// Archive path as mounted.
+        path: String,
+        /// What the file system reported.
+        message: String,
     },
 }
 
@@ -526,6 +694,9 @@ pub enum StorageReadError {
     /// An archive read failed; the message is the archive reader's own.
     #[error("archive error: {0}")]
     Xp3(String),
+    /// A preloaded archive's image could not be read into memory.
+    #[error("archive image error: {0}")]
+    Preload(#[from] PreloadError),
     /// The read produced no result: the worker stopped before it published
     /// one, or the read was cancelled.
     #[error("the storage read produced no result: {message}")]
@@ -669,40 +840,25 @@ fn read_archive_entry(
     limit: Option<usize>,
 ) -> Result<Vec<u8>, StorageReadError> {
     if let Some(source) = source {
-        let read = match &source.backing {
+        return match &source.backing {
             ArchiveBacking::Stream(file) => match limit {
-                Some(limit) => source.archive.read_prefix_with_filter(
-                    fs,
-                    file,
-                    in_arc,
-                    archive_name,
-                    limit,
-                    None,
-                ),
+                Some(limit) => source
+                    .archive
+                    .read_prefix_with_filter(fs, file, in_arc, archive_name, limit, None)
+                    .map_err(xp3_error),
                 None => source
                     .archive
-                    .read_with_filter(fs, file, in_arc, archive_name, None),
+                    .read_with_filter(fs, file, in_arc, archive_name, None)
+                    .map_err(xp3_error),
             },
-            ArchiveBacking::Memory(bytes) => {
+            ArchiveBacking::Image(image) => {
                 let entry = source
                     .archive
                     .entry(in_arc)
                     .ok_or_else(|| xp3_error(xp3::Xp3Error::NotFound(in_arc.to_string())))?;
-                match limit {
-                    Some(limit) => source.archive.read_entry_prefix_from_bytes(
-                        bytes,
-                        entry,
-                        archive_name,
-                        limit,
-                        None,
-                    ),
-                    None => source
-                        .archive
-                        .read_entry_from_bytes(bytes, entry, archive_name, None),
-                }
+                image.read_entry(&source.archive, entry, archive_name, limit, None)
             }
         };
-        return read.map_err(xp3_error);
     }
     let file = fs::open(fs, &FsPath::host(path), OpenMode::Read).map_err(StorageReadError::Fs)?;
     let archive = Xp3Archive::open(fs, &file).map_err(xp3_error)?;
@@ -1557,6 +1713,10 @@ impl Storage {
     /// The path is resolved against the storage base directory (absolute
     /// paths are used as given) and opened through the bottom file system.
     /// Mounting the same archive twice is a no-op.
+    ///
+    /// A preloaded archive's whole image is read in the background: the
+    /// mount returns as soon as the index is parsed, and the image is filled
+    /// while the game runs.
     pub fn mount_archive(&mut self, path: impl AsRef<Path>) -> Result<(), MountError> {
         let raw = path.as_ref();
         let path = if raw.is_absolute() {
@@ -1570,7 +1730,12 @@ impl Storage {
         let file = fs::open(&self.fs, &FsPath::host(&path), OpenMode::Read)?;
         let archive = Arc::new(Xp3Archive::open(&self.fs, &file)?);
         let backing = if self.preload_archives {
-            ArchiveBacking::Memory(Arc::from(read_archive_image(&self.fs, &file, &path)?))
+            let size = fs::file_size(&self.fs, &file)?;
+            let len = usize::try_from(size).map_err(|_| MountError::ArchiveTooLarge {
+                path: path.display().to_string(),
+                size,
+            })?;
+            ArchiveBacking::Image(ArchiveImage::start(&self.fs, &Arc::new(file), &path, len))
         } else {
             ArchiveBacking::Stream(Arc::new(file))
         };
@@ -2625,10 +2790,9 @@ impl Storage {
                     .archive
                     .read_entry_with_filter(&self.fs, file, entry, &mounted.file_name, filter)
                     .map_err(xp3_error),
-                ArchiveBacking::Memory(bytes) => mounted
-                    .archive
-                    .read_entry_from_bytes(bytes, entry, &mounted.file_name, filter)
-                    .map_err(xp3_error),
+                ArchiveBacking::Image(image) => {
+                    image.read_entry(&mounted.archive, entry, &mounted.file_name, None, filter)
+                }
             };
         }
         let file = fs::open(&self.fs, &FsPath::host(arc_path), OpenMode::Read)?;
@@ -2664,21 +2828,18 @@ impl Storage {
                         filter,
                     )
                     .map_err(xp3_error),
-                ArchiveBacking::Memory(bytes) => {
+                ArchiveBacking::Image(image) => {
                     let entry = mounted
                         .archive
                         .entry(in_arc)
                         .ok_or_else(|| StorageReadError::NotFound(in_arc.to_string()))?;
-                    mounted
-                        .archive
-                        .read_entry_prefix_from_bytes(
-                            bytes,
-                            entry,
-                            &mounted.file_name,
-                            max_len,
-                            filter,
-                        )
-                        .map_err(xp3_error)
+                    image.read_entry(
+                        &mounted.archive,
+                        entry,
+                        &mounted.file_name,
+                        Some(max_len),
+                        filter,
+                    )
                 }
             };
         }
@@ -3360,35 +3521,37 @@ fn read_fs_file_prefix(fs: &FileSystem, path: &Path, max_len: usize) -> Result<V
 
 /// Reads the whole of an open archive file into memory.
 ///
-/// The size the file system reports is authoritative: a file that ends before
-/// it is a typed error, never a shortened buffer. There is no size cap; a size
-/// the platform cannot represent or allocate is a typed error instead. The
-/// returned image is owned by the storage and handed to L1 for each entry
-/// read; L1 never keeps it.
-fn read_archive_image(
+/// The size the mount read is authoritative: a file that ends before it is a
+/// typed error, never a shortened buffer. There is no size cap; a buffer the
+/// platform cannot allocate is a typed error instead. The returned image is
+/// owned by the archive's backing and handed to L1 for each entry read; L1
+/// never keeps it.
+fn load_archive_image(
     fs: &FileSystem,
     file: &FileState,
     path: &Path,
-) -> Result<Vec<u8>, MountError> {
-    let size = fs::file_size(fs, file)?;
+    len: usize,
+) -> Result<Arc<[u8]>, PreloadError> {
     let display = path.display().to_string();
-    let len = usize::try_from(size).map_err(|_| MountError::ArchiveTooLarge {
-        path: display.clone(),
-        size,
-    })?;
+    let size = len as u64;
     let mut image = Vec::new();
     image
         .try_reserve_exact(len)
-        .map_err(|_| MountError::ArchiveAllocation {
+        .map_err(|_| PreloadError::Allocation {
             path: display.clone(),
             size,
         })?;
     image.resize(len, 0);
     let mut read = 0usize;
     while read < len {
-        let n = fs::read_at(fs, file, read as u64, &mut image[read..])?;
+        let n = fs::read_at(fs, file, read as u64, &mut image[read..]).map_err(|error| {
+            PreloadError::Io {
+                path: display.clone(),
+                message: error.to_string(),
+            }
+        })?;
         if n == 0 {
-            return Err(MountError::TruncatedArchive {
+            return Err(PreloadError::Truncated {
                 path: display,
                 expected: size,
                 read: read as u64,
@@ -3396,7 +3559,7 @@ fn read_archive_image(
         }
         read += n;
     }
-    Ok(image)
+    Ok(Arc::from(image))
 }
 
 /// Case-insensitive `*`/`?` wildcard match (ASCII case folding).
@@ -3646,5 +3809,113 @@ mod tests {
                 "resolution differs for {name:?} between trace levels"
             );
         }
+    }
+
+    /// An entry read that arrives before the image is loaded reads the entry
+    /// from the archive file, and the same read copies from the image once
+    /// the load has published it. The bytes are the same either way.
+    #[test]
+    fn an_entry_read_uses_the_image_once_it_is_loaded() {
+        let xp3 = testkit::build_xp3(&[("data/a.bin", b"payload", false)]);
+        let fs = FileSystem::memory();
+        write_mem(&fs, "/game/data.xp3", &xp3);
+        let file = fs::open(&fs, &FsPath::host("/game/data.xp3"), OpenMode::Read).expect("open");
+        let archive = Xp3Archive::open(&fs, &file).expect("parse archive");
+        let entry = archive.entry("data/a.bin").expect("entry");
+        let image = ArchiveImage::pending(&fs, &Arc::new(file));
+
+        assert!(
+            image.loaded().expect("the image state").is_none(),
+            "the image is not loaded yet"
+        );
+        let from_file = image
+            .read_entry(&archive, entry, "data.xp3", None, None)
+            .expect("read from the file");
+        assert_eq!(from_file, b"payload");
+
+        image.publish(
+            Path::new("/game/data.xp3"),
+            Ok(Arc::from(xp3)),
+            Duration::ZERO,
+        );
+        assert!(
+            image.loaded().expect("the image state").is_some(),
+            "the image is loaded"
+        );
+        let from_image = image
+            .read_entry(&archive, entry, "data.xp3", None, None)
+            .expect("read from the image");
+        assert_eq!(from_image, from_file);
+    }
+
+    /// A failed image load is a typed read error: the archive never falls
+    /// back to serving the entry from the file after the load failed.
+    #[test]
+    fn a_failed_image_load_is_a_typed_read_error() {
+        let xp3 = testkit::build_xp3(&[("data/a.bin", b"payload", false)]);
+        let fs = FileSystem::memory();
+        write_mem(&fs, "/game/data.xp3", &xp3);
+        let file = fs::open(&fs, &FsPath::host("/game/data.xp3"), OpenMode::Read).expect("open");
+        let archive = Xp3Archive::open(&fs, &file).expect("parse archive");
+        let entry = archive.entry("data/a.bin").expect("entry");
+        let image = ArchiveImage::pending(&fs, &Arc::new(file));
+
+        image.publish(
+            Path::new("/game/data.xp3"),
+            Err(PreloadError::Allocation {
+                path: "/game/data.xp3".to_owned(),
+                size: 4096,
+            }),
+            Duration::ZERO,
+        );
+        let error = image
+            .read_entry(&archive, entry, "data.xp3", None, None)
+            .expect_err("the failed image is an error");
+        assert!(
+            matches!(error, StorageReadError::Preload(_)),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// The mount does not wait for a preloaded archive's image: the mount
+    /// returns while the image is still being read, and the image lands in
+    /// the archive afterwards.
+    ///
+    /// The fixture carries megabytes of payload, so the image load takes far
+    /// longer than the index parse the mount does.
+    #[test]
+    fn the_mount_does_not_wait_for_the_archive_image() {
+        let payload = vec![b'x'; 16 << 20];
+        let xp3 = testkit::build_xp3(&[("data/big.bin", &payload, false)]);
+        let fs = FileSystem::memory();
+        write_mem(&fs, "/game/data.xp3", &xp3);
+        let storage = Storage::mount_archives_with(
+            fs,
+            "/game",
+            ["data.xp3"],
+            MountOptions {
+                preload_archives: true,
+            },
+        )
+        .expect("mount");
+
+        let mounted = &storage.archives[0];
+        let ArchiveBacking::Image(image) = &mounted.backing else {
+            panic!("a preloaded archive is backed by its image");
+        };
+        assert!(
+            image.loaded().expect("the image state").is_none(),
+            "the mount waited for the archive's image"
+        );
+
+        let mut loaded = false;
+        for _ in 0..10_000 {
+            if image.loaded().expect("the image state").is_some() {
+                loaded = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(loaded, "the archive image is read in the background");
     }
 }

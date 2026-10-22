@@ -1073,3 +1073,34 @@ fn read_prefix_preserves_a_bottom_read_failure() {
         "typed FsError was not preserved: {err:?}"
     );
 }
+
+/// The index parse costs one pass over the index: a large synthetic index
+/// parses in a small fraction of a second, so a quadratic name or index
+/// operation shows up as a blow-up instead of as a slow frame.
+///
+/// The measurement is printed, so a run records the parse cost of the index
+/// size a real archive carries.
+#[test]
+fn a_large_index_parses_in_linear_time() {
+    const ENTRIES: usize = 20_000;
+    let names: Vec<String> = (0..ENTRIES)
+        .map(|index| format!("data/dir{:02}/file{:05}.bin", index % 64, index))
+        .collect();
+    let payload: &[u8] = b"payload";
+    let entries: Vec<(&str, &[u8], bool)> = names
+        .iter()
+        .map(|name| (name.as_str(), payload, false))
+        .collect();
+    let archive = build_xp3_compressed_index(&entries);
+
+    let started = std::time::Instant::now();
+    let parsed = Xp3Archive::open_reader(&mut std::io::Cursor::new(archive.as_slice()))
+        .expect("parse index");
+    let elapsed = started.elapsed();
+    println!("parsed {ENTRIES} entries in {elapsed:?}");
+    assert_eq!(parsed.len(), ENTRIES);
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "the index parse of {ENTRIES} entries took {elapsed:?}"
+    );
+}

@@ -32,7 +32,7 @@ pub struct RuntimeConfig {
 | field | meaning |
 |---|---|
 | `frame_rate_limit` | the number of frames the host tries to present per second; it paces the windowed loop and the headless step |
-| `preload_archives` | read every mounted archive into memory in full at mount, trading the archive's size in resident memory for removing the per-entry reads a mounted archive otherwise does |
+| `preload_archives` | read every mounted archive into memory in the background, trading the archive's size in resident memory for removing the per-entry reads a mounted archive otherwise does; the mount itself does not wait for the bytes |
 | `debug_overlay` | draw the debug panel; it is a render-only node, so it cannot change what a script observes |
 | `graphic_cache_limit` | the decoded-image cache policy; `None` leaves the engine's reference default (disabled) in place, and a startup script may still change it through `System.graphicCacheLimit` |
 

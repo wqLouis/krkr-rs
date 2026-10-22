@@ -23,10 +23,10 @@
 //!   `--archive` and a directory app path, every `*.xp3` under it mounts
 //!   recursively; an explicit archive list suppresses that, and the reference
 //!   has no such scan.
-//! * `--preload-archives` reads each mounted archive into memory when it
-//!   mounts, trading the archive's size in resident memory for never reading it
-//!   back from storage. Off by default; entries return the same bytes either
-//!   way.
+//! * `--preload-archives` reads each mounted archive into memory in the
+//!   background, trading the archive's size in resident memory for never
+//!   reading it back from storage. Off by default; entries return the same
+//!   bytes either way, and the mount does not wait for the bytes.
 //! * `--debug-overlay` draws frame rate and its 1% low, CPU usage, disk I/O,
 //!   resident memory and live object counts in the top-left corner. It is a
 //!   render-only node (never a script-visible layer or bitmap) and off by

@@ -71,4 +71,4 @@ pub use shader::{
     ProgramDesc, ShaderError, ShaderId, ShaderLibrary,
 };
 pub use startup::{StartupError, discover_startup};
-pub use storage::{Location, MountError, Storage, StorageMetadata, StorageReadError};
+pub use storage::{Location, MountError, PreloadError, Storage, StorageMetadata, StorageReadError};

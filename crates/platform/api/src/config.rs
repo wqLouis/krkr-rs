@@ -190,10 +190,11 @@ pub struct RuntimeConfig {
     /// [`DEFAULT_FRAME_RATE`] (60). It paces the host loop and the headless
     /// step.
     pub frame_rate_limit: FrameRateLimit,
-    /// Whether a mounted archive is read into memory in full at mount, default
+    /// Whether a mounted archive's whole image is read into memory, default
     /// `false`. It trades the archive's size in resident memory for removing
     /// the per-entry reads a mounted archive otherwise does, which is the cost
-    /// a slow backing filesystem makes visible.
+    /// a slow backing filesystem makes visible. The image is read in the
+    /// background, so the mount does not wait for the archive's bytes.
     pub preload_archives: bool,
     /// Whether the running app draws the debug overlay (frame rate and
     /// resident memory) in the top-left corner, default `false`.

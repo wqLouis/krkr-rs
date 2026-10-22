@@ -34,7 +34,7 @@ only the namespace.
 | `game_dir: PathBuf` | the app path used for disk assets |
 | `archives: Vec<MountedArchive>` | the mounted archives in mount order; later entries take precedence |
 | `auto_paths: Vec<String>` | the auto search-path prefixes (a plain directory or an `arc.xp3>` prefix) |
-| `preload_archives: bool` | whether an archive is read into memory in full at mount |
+| `preload_archives: bool` | whether an archive's whole image is read into memory in the background |
 | `project: Option<PathBuf>` | the project storage path (the reference's current directory); `None` means a folder project, `Some` an archive project |
 | `xp3_extraction_filter: Option<Box<Xp3ExtractionFilter<'static>>>` | the per-segment XP3 extraction filter (the `xp3filter` seam) |
 | `media: RefCell<Map<String, Vec<u8>>>` | the virtual media entries registered by L3 storage-media providers |
@@ -43,10 +43,10 @@ only the namespace.
 | `generation: u64` | the resolution generation the scheduled reads were made against |
 
 Each mounted archive keeps its logical path, the backing that owns its bytes
-(a `FileState` for a streamed archive, a `Vec<u8>` image for a preloaded one)
-and its parsed index. The backing and the index are shared (`Arc`), so a
-worker thread can read an entry of a mounted archive while the frame thread
-reads another one.
+(a `FileState` for a streamed archive, a background-loaded image for a
+preloaded one) and its parsed index. The backing and the index are shared
+(`Arc`), so a worker thread can read an entry of a mounted archive while the
+frame thread reads another one.
 
 There are no globals and no process-wide caches: a `Storage` is a plain value
 the caller owns, and all `FileState`s live inside it.
@@ -142,6 +142,7 @@ local name.
 | `Location` | a resolved location: `Disk(PathBuf)` or `Archive(PathBuf, String)` |
 | `StorageMetadata` | size, modified, accessed and created times |
 | `MountError` | the mounting failures |
+| `PreloadError` | the failures of a preloaded archive's image load |
 | `StorageReadError` | the read/lookup failures |
 | `StartupPlan` | the four startup script names, resolved |
 | `ProbeCounts` | the number of `list`/`stat` probes and misses — a diagnostic |
@@ -177,6 +178,7 @@ pub enum StorageJob { Disk { .. }, Archive { .. } };
 pub enum StorageOutcome { Ready(Arc<Vec<u8>>), Failed(StorageReadError), Cancelled };
 pub struct PendingStorage;               // the future a scheduled read lands in
 pub struct ArchiveBacking;               // a mounted archive's bytes
+pub struct ArchiveImage;                 // a preloaded archive's whole image
 pub struct ArchiveSource;                // a mounted archive's index and bytes
 ```
 
@@ -261,9 +263,12 @@ A `..` component that escapes the mount is the reference's invalid path name
   wins), then the full path.
 * **Symbolic-link directories are not followed** by the discovery scan, so a
   link cycle cannot recurse forever.
-* **A preloaded archive is read in full at mount.** A short read, an
-  unrepresentable size or a failed allocation is a typed `MountError`, never
-  a silent fall back to the streaming path.
+* **A preloaded archive's image is read in the background.** The mount
+  parses the index and returns; the image is read while the game runs. An
+  entry read copies from the image once it is loaded and reads the entry
+  from the file until then, so the bytes are the same either way. A load
+  that fails is a typed `PreloadError`, never a silent fall back to the
+  streaming path.
 * **The extraction filter is L2 state.** The stateless L1 reader receives the
   closure as a borrow on every read; it is never stored in L1.
 * **The media table is served first**: `read`, `read_prefix` and `exists`
@@ -323,9 +328,10 @@ read through the pool:
 |---|---|
 | the mount path is not a directory | `MountError::NotADirectory` |
 | an archive cannot be opened or parsed | `MountError::Xp3` |
-| a preloaded archive is shorter than its reported size | `MountError::TruncatedArchive` |
 | a preloaded archive is too large to address in one buffer | `MountError::ArchiveTooLarge` |
-| a preloaded archive's buffer cannot be allocated | `MountError::ArchiveAllocation` |
+| a preloaded archive's image is shorter than its reported size | `PreloadError::Truncated` |
+| a preloaded archive's image buffer cannot be allocated | `PreloadError::Allocation` |
+| a preloaded archive's image cannot be read | `PreloadError::Io` |
 | the name does not resolve | `StorageReadError::NotFound` |
 | a `..` component escapes the mount | `StorageReadError::InvalidPathName` |
 | a file-system operation fails | `StorageReadError::Fs` |

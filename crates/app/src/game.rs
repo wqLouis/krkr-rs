@@ -506,17 +506,18 @@ impl GameHost {
         Self::open_with_preload(host, archives, base_dir, false)
     }
 
-    /// Like [`Self::open`], but reads every mounted archive into memory in
-    /// full at mount when `preload_archives` is set.
+    /// Like [`Self::open`], but reads every mounted archive into memory in the
+    /// background when `preload_archives` is set.
     ///
     /// The resident-memory cost is the sum of the mounted archives' sizes and
-    /// there is no cap; the mount order and precedence are unchanged. See
+    /// there is no cap; the mount order and precedence are unchanged, and the
+    /// mount does not wait for the archive's bytes. See
     /// [`engine::storage::MountOptions`].
     ///
     /// # Errors
     ///
-    /// As [`Self::open`], plus a typed error when a preloaded archive cannot
-    /// be read into memory in full.
+    /// As [`Self::open`], plus a typed error when a preloaded archive is
+    /// larger than this platform can address in one buffer.
     #[allow(unsafe_code)]
     pub fn open_with_preload(
         host: Host,

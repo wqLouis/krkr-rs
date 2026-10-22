@@ -182,7 +182,7 @@ path never hands L1 ownership of the buffer.
 | the backend kind and the base directory | L1 (`FileSystem`, immutable) |
 | the open handle, the mode and the cursor | L2 (`FileState`) |
 | the mounted archives, the parsed index, the auto-path tables, the resolution cache | L2 (`engine::storage`) |
-| the preloaded archive image | L2 (`ArchiveBacking::Memory`) |
+| the preloaded archive image | L2 (`ArchiveBacking::Image`) |
 
 `fs` keeps no table of open files and no cache. The extraction filter is
 L2 state: the stateless L1 reader receives the closure as a borrow on every

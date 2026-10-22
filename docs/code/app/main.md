@@ -29,7 +29,7 @@ krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan]
 | `--frames N` | frames | 120 | how many frames the headless loop steps |
 | `--fps N` | `1..=1000` | 60 | the frame-rate limit; paces the windowed loop and the headless step |
 | `--backend` | `null`, `vulkan` (`vk`) | `null` | the render backend to create |
-| `--preload-archives` | — | off | read every mounted archive into memory at mount |
+| `--preload-archives` | — | off | read every mounted archive into memory in the background |
 | `--debug-overlay` | — | off | draw the debug panel in the top-left corner |
 | `--graphic-cache-limit` | `none`, `unlimited`, `0`, bytes | the reference default (disabled) | the decoded-image cache policy |
 | `--archive XP3` | path | — | mount an archive; repeatable, order-significant, later wins |
