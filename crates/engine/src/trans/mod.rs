@@ -741,12 +741,7 @@ impl Trans {
 
     /// A full-image processing region for `bitmap`.
     pub fn full_region(bitmap: &BitmapState) -> RectI {
-        (
-            0,
-            0,
-            bitmap.width.min(i32::MAX as u32) as i32,
-            bitmap.height.min(i32::MAX as u32) as i32,
-        )
+        (0, 0, dimension(bitmap.width), dimension(bitmap.height))
     }
 
     /// The frame `src1`/`src2` composite into at the current phase, for a host
@@ -793,10 +788,7 @@ impl Trans {
                 ))
             }
             TransKind::Scroll { from, stay } => {
-                let (w, h) = (
-                    size.0.min(i32::MAX as u32) as i32,
-                    size.1.min(i32::MAX as u32) as i32,
-                );
+                let (w, h) = (dimension(size.0), dimension(size.1));
                 let (first, second) = scroll_placements(self.progress(), (w, h), from, stay);
                 let frame = (0, 0, w, h);
                 // A source outside the frame contributes no pixel; it keeps a
@@ -840,12 +832,10 @@ impl Trans {
         let Some((x0, y0, x1, y1)) = intersect(dst, region) else {
             return;
         };
+        // One weight for the whole rectangle: the phase.
         for y in y0..y1 {
-            for x in x0..x1 {
-                let s1 = read_pixel(src1, x, y);
-                let s2 = read_pixel(src2, x, y);
-                write_pixel(dst, x, y, blend_level(s1, s2, self.phase));
-            }
+            let row = BlendRow { x0, x1, y };
+            blend_row(dst, src1, src2, row, self.phase);
         }
         dst.mark_dirty();
     }
@@ -872,13 +862,10 @@ impl Trans {
         let Some((x0, y0, x1, y1)) = intersect(dst, region) else {
             return Ok(());
         };
+        // Each pixel takes its own weight from the rule image.
         for y in y0..y1 {
-            for x in x0..x1 {
-                let opa = i32::from(table[usize::from(rule.at(x, y))]);
-                let s1 = read_pixel(src1, x, y);
-                let s2 = read_pixel(src2, x, y);
-                write_pixel(dst, x, y, blend_level(s1, s2, opa));
-            }
+            let row = BlendRow { x0, x1, y };
+            blend_rule_row(dst, src1, src2, row, &table, rule);
         }
         dst.mark_dirty();
         Ok(())
@@ -893,8 +880,8 @@ impl Trans {
         from: ScrollFrom,
         stay: ScrollStay,
     ) {
-        let w = src1.width.min(i32::MAX as u32) as i32;
-        let h = src1.height.min(i32::MAX as u32) as i32;
+        let w = dimension(src1.width);
+        let h = dimension(src1.height);
         let (first, second) = scroll_placements(self.progress(), (w, h), from, stay);
         for (placement, source) in [(first, src1), (second, src2)] {
             if let Some(d) = intersect_rect(region, placement.rect) {
@@ -1122,12 +1109,206 @@ pub(crate) fn argb_to_rgba(color: i64) -> [u8; 4] {
 /// The `extrans` providers blend with the same arithmetic (their
 /// `TVP_RIPPLE_BLEND`/`TVPLinTransBlend` macros are the same expression).
 pub(crate) fn blend_level(s1: [u8; 4], s2: [u8; 4], opa: i32) -> [u8; 4] {
-    let mut out = [0u8; 4];
-    for c in 0..4 {
-        let v = i32::from(s1[c]) + (((i32::from(s2[c]) - i32::from(s1[c])) * opa) >> 8);
-        out[c] = v.clamp(0, 255) as u8;
+    [
+        blend_channel(s1[0], s2[0], opa),
+        blend_channel(s1[1], s2[1], opa),
+        blend_channel(s1[2], s2[2], opa),
+        blend_channel(s1[3], s2[3], opa),
+    ]
+}
+
+/// One channel of [`blend_level`]: `src1 + (src2 - src1) * opa / 256`, clamped
+/// to the byte range.
+///
+/// The row blend and the per-pixel blend share this expression, so the two
+/// cannot drift apart.
+#[inline(always)]
+fn blend_channel(s1: u8, s2: u8, opa: i32) -> u8 {
+    let s1 = i32::from(s1);
+    let s2 = i32::from(s2);
+    let value = s1 + (((s2 - s1) * opa) >> 8);
+    value.clamp(0, 255) as u8
+}
+
+/// A bitmap dimension as the `i32` the pixel coordinates use.
+fn dimension(value: u32) -> i32 {
+    value.min(i32::MAX as u32) as i32
+}
+
+/// One row of a blend: the columns `[x0, x1)` and the row `y`.
+#[derive(Clone, Copy, Debug)]
+struct BlendRow {
+    /// The first column of the row.
+    x0: i32,
+    /// The column after the last one.
+    x1: i32,
+    /// The row itself.
+    y: i32,
+}
+
+/// The bytes of one bitmap row, restricted to the columns `[x0, x1)`.
+///
+/// `None` when the row holds no readable pixel: a pixel read outside the
+/// bitmap is transparent.
+fn row_bytes(bitmap: &BitmapState, row: BlendRow) -> Option<&[u8]> {
+    if row.y < 0 || row.y >= dimension(bitmap.height) {
+        return None;
     }
-    out
+    let start = row.x0.max(0);
+    let end = row.x1.min(dimension(bitmap.width));
+    if start >= end {
+        return Some(&[]);
+    }
+    let offset = bitmap.pixel_offset(start as u32, row.y as u32)?;
+    let len = ((end - start) as usize).checked_mul(4)?;
+    let last = offset.checked_add(len)?;
+    bitmap.rgba.get(offset..last)
+}
+
+/// The destination's bytes for the columns `[x0, x1)` of row `y`.
+fn dst_row_bytes(dst: &mut BitmapState, row: BlendRow) -> Option<&mut [u8]> {
+    let start = row.x0.max(0);
+    let end = row.x1.min(dimension(dst.width));
+    if start >= end {
+        return None;
+    }
+    let offset = dst.pixel_offset(start as u32, row.y as u32)?;
+    let len = ((end - start) as usize).checked_mul(4)?;
+    let last = offset.checked_add(len)?;
+    dst.rgba.get_mut(offset..last)
+}
+
+/// The rule's grayscale row for `y`, the row the blend reads.
+fn rule_row(rule: &RuleMask, y: i32) -> &[u8] {
+    let width = rule.width as usize;
+    let height = dimension(rule.height);
+    let row = y.rem_euclid(height) as usize;
+    &rule.gray[row * width..(row + 1) * width]
+}
+
+/// Blends one row of the destination with the two sources and one weight for
+/// the whole row.
+fn blend_row(
+    dst: &mut BitmapState,
+    src1: &BitmapState,
+    src2: &BitmapState,
+    row: BlendRow,
+    opa: i32,
+) {
+    let Some(dst_row) = dst_row_bytes(dst, row) else {
+        return;
+    };
+    let first = row_bytes(src1, row);
+    let second = row_bytes(src2, row);
+    match (first, second) {
+        (Some(a), Some(b)) if a.len() == dst_row.len() && b.len() == dst_row.len() => {
+            blend_pixels(dst_row, a, b, opa);
+        }
+        _ => blend_pixels_sparse(dst_row, src1, src2, row, opa),
+    }
+}
+
+/// Blends the pixels of one row: `dst = src1 + (src2 - src1) * opa / 256`,
+/// clamped per channel.
+///
+/// The rows hold whole pixels, so every pixel of the row is blended.
+fn blend_pixels(dst: &mut [u8], src1: &[u8], src2: &[u8], opa: i32) {
+    for (d, (a, b)) in dst
+        .chunks_exact_mut(4)
+        .zip(src1.chunks_exact(4).zip(src2.chunks_exact(4)))
+    {
+        d[0] = blend_channel(a[0], b[0], opa);
+        d[1] = blend_channel(a[1], b[1], opa);
+        d[2] = blend_channel(a[2], b[2], opa);
+        d[3] = blend_channel(a[3], b[3], opa);
+    }
+}
+
+/// Blends the pixels of one row whose sources do not cover every column: a
+/// column outside a source reads as transparent.
+fn blend_pixels_sparse(
+    dst: &mut [u8],
+    src1: &BitmapState,
+    src2: &BitmapState,
+    row: BlendRow,
+    opa: i32,
+) {
+    for (index, pixel) in dst.chunks_exact_mut(4).enumerate() {
+        let x = row.x0.max(0) + index as i32;
+        let blended = blend_level(read_pixel(src1, x, row.y), read_pixel(src2, x, row.y), opa);
+        pixel[0] = blended[0];
+        pixel[1] = blended[1];
+        pixel[2] = blended[2];
+        pixel[3] = blended[3];
+    }
+}
+
+/// Blends one row of the destination with the two sources and the weight
+/// each pixel takes from the rule image.
+fn blend_rule_row(
+    dst: &mut BitmapState,
+    src1: &BitmapState,
+    src2: &BitmapState,
+    row: BlendRow,
+    table: &[u8; 256],
+    rule: &RuleMask,
+) {
+    let Some(dst_row) = dst_row_bytes(dst, row) else {
+        return;
+    };
+    let first = row_bytes(src1, row);
+    let second = row_bytes(src2, row);
+    let gray_row = rule_row(rule, row.y);
+    let width = gray_row.len();
+    let mut column = row.x0.max(0).rem_euclid(dimension(rule.width)) as usize;
+    match (first, second) {
+        (Some(a), Some(b)) if a.len() == dst_row.len() && b.len() == dst_row.len() => {
+            for (d, (left, right)) in dst_row
+                .chunks_exact_mut(4)
+                .zip(a.chunks_exact(4).zip(b.chunks_exact(4)))
+            {
+                let opa = i32::from(table[usize::from(gray_row[column])]);
+                column += 1;
+                if column == width {
+                    column = 0;
+                }
+                if opa == 0 {
+                    // A zero weight leaves the first source untouched.
+                    d[0] = left[0];
+                    d[1] = left[1];
+                    d[2] = left[2];
+                    d[3] = left[3];
+                    continue;
+                }
+                d[0] = blend_channel(left[0], right[0], opa);
+                d[1] = blend_channel(left[1], right[1], opa);
+                d[2] = blend_channel(left[2], right[2], opa);
+                d[3] = blend_channel(left[3], right[3], opa);
+            }
+        }
+        _ => blend_rule_pixels_sparse(dst_row, src1, src2, row, table, rule),
+    }
+}
+
+/// Blends the pixels of one row whose sources do not cover every column: a
+/// column outside a source reads as transparent.
+fn blend_rule_pixels_sparse(
+    dst: &mut [u8],
+    src1: &BitmapState,
+    src2: &BitmapState,
+    row: BlendRow,
+    table: &[u8; 256],
+    rule: &RuleMask,
+) {
+    for (index, pixel) in dst.chunks_exact_mut(4).enumerate() {
+        let x = row.x0.max(0) + index as i32;
+        let opa = i32::from(table[usize::from(rule.at(x, row.y))]);
+        let blended = blend_level(read_pixel(src1, x, row.y), read_pixel(src2, x, row.y), opa);
+        pixel[0] = blended[0];
+        pixel[1] = blended[1];
+        pixel[2] = blended[2];
+        pixel[3] = blended[3];
+    }
 }
 
 /// `TVPInitUnivTransBlendTable_c` (`tvpgl.cpp:4576`): map a rule grayscale
@@ -1151,4 +1332,132 @@ fn universal_table(phase: i32, vague: i32) -> [u8; 256] {
         *slot = value.clamp(0, 255) as u8;
     }
     table
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pixels the blend tests read: the channel extremes, the alpha
+    /// extremes and a mid-tone.
+    const PIXELS: [[u8; 4]; 6] = [
+        [0, 0, 0, 0],
+        [255, 255, 255, 255],
+        [0, 255, 0, 255],
+        [255, 0, 255, 0],
+        [1, 254, 128, 64],
+        [200, 100, 50, 255],
+    ];
+
+    /// The two source rows the blend tests read: the pixels and their
+    /// mirror image, so every channel pair of the two sources appears.
+    fn source_row() -> (Vec<u8>, Vec<u8>) {
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        for pixel in PIXELS {
+            first.extend_from_slice(&pixel);
+            second.extend_from_slice(&[pixel[3], pixel[2], pixel[1], pixel[0]]);
+        }
+        (first, second)
+    }
+
+    /// One pixel of a row buffer.
+    fn pixel(row: &[u8], index: usize) -> [u8; 4] {
+        [
+            row[index * 4],
+            row[index * 4 + 1],
+            row[index * 4 + 2],
+            row[index * 4 + 3],
+        ]
+    }
+
+    /// The row blend and the per-pixel blend must write the same bytes.
+    ///
+    /// The blend is the per-channel `src1 + (src2 - src1) * opa / 256` the
+    /// reference applies to a whole row at a time
+    /// (`reference/cpp/core/visual/tvpgl.cpp:4387-4399`).
+    #[test]
+    fn the_row_blend_matches_the_per_pixel_blend() {
+        let (first, second) = source_row();
+        for opa in 0..=256 {
+            let mut row = vec![0u8; first.len()];
+            blend_pixels(&mut row, &first, &second, opa);
+            let mut per_pixel = vec![0u8; first.len()];
+            for (index, out) in per_pixel.chunks_exact_mut(4).enumerate() {
+                let blended = blend_level(pixel(&first, index), pixel(&second, index), opa);
+                out.copy_from_slice(&blended);
+            }
+            assert_eq!(row, per_pixel, "weight {opa}");
+        }
+    }
+
+    /// The rule row blend and the per-pixel rule blend must write the same
+    /// bytes.
+    ///
+    /// The rule supplies the weight of every pixel
+    /// (`reference/cpp/core/visual/tvpgl.cpp:4624-4636`) and the table maps
+    /// the rule's grayscale value to that weight
+    /// (`reference/cpp/core/visual/tvpgl.cpp:4576-4595`).
+    #[test]
+    fn the_rule_row_blend_matches_the_per_pixel_blend() {
+        let (first, second) = source_row();
+        let width = PIXELS.len() as u32;
+        let height = 3;
+        // A ramp that reaches the weights of zero and of the whole range.
+        let gray: Vec<u8> = (0..(width * height)).map(|i| (i * 14) as u8).collect();
+        let rule = RuleMask::new(width, height, gray).expect("rule");
+        let table = universal_table(120, 64);
+        let mut first_image = Vec::new();
+        let mut second_image = Vec::new();
+        for _ in 0..height {
+            first_image.extend_from_slice(&first);
+            second_image.extend_from_slice(&second);
+        }
+        let size = first_image.len();
+        let src1 = BitmapState::new(width, height, first_image);
+        let src2 = BitmapState::new(width, height, second_image);
+        let mut dst = BitmapState::new(width, height, vec![0u8; size]);
+        for y in 0..height as i32 {
+            let row = BlendRow {
+                x0: 0,
+                x1: width as i32,
+                y,
+            };
+            blend_rule_row(&mut dst, &src1, &src2, row, &table, &rule);
+        }
+        for y in 0..height as i32 {
+            for x in 0..width as i32 {
+                let opa = i32::from(table[usize::from(rule.at(x, y))]);
+                let expected =
+                    blend_level(pixel(&first, x as usize), pixel(&second, x as usize), opa);
+                let index = (y as usize) * width as usize + x as usize;
+                assert_eq!(
+                    pixel(&dst.rgba, index),
+                    expected,
+                    "pixel ({x},{y}) with weight {opa}"
+                );
+            }
+        }
+    }
+
+    /// A row whose sources do not cover every column blends the covered
+    /// columns and leaves the rest transparent, the way a per-pixel read
+    /// outside a bitmap does.
+    ///
+    /// The blend of the covered columns is the per-channel arithmetic above
+    /// (`reference/cpp/core/visual/tvpgl.cpp:4387-4399`).
+    #[test]
+    fn a_row_without_full_sources_blends_what_it_covers() {
+        let src1 = BitmapState::new(2, 1, vec![10, 20, 30, 40, 50, 60, 70, 80]);
+        let src2 = BitmapState::new(1, 1, vec![90, 100, 110, 120]);
+        let mut dst = BitmapState::new(3, 1, vec![0u8; 12]);
+        let row = BlendRow { x0: 0, x1: 3, y: 0 };
+        blend_row(&mut dst, &src1, &src2, row, 128);
+        // The first column blends both sources, the second only the first
+        // one (the second source reads as transparent there) and the third
+        // reads as transparent in both.
+        assert_eq!(&dst.rgba[0..4], &[50, 60, 70, 80]);
+        assert_eq!(&dst.rgba[4..8], &[25, 30, 35, 40]);
+        assert_eq!(&dst.rgba[8..12], &[0, 0, 0, 0]);
+    }
 }

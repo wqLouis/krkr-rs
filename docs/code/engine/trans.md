@@ -244,6 +244,14 @@ typed error, and L3 turns it into the script error text.
 * **The non-self-updating transition pumps still run inside the L3 hook**,
   not inside L2. The self-updating ones advance from the frame hook's
   `after_project`, which sees the projection's draw report.
+* **The CPU blend runs a row at a time.** `Trans::apply` blends the
+  cross-fade and the rule blend row by row: the row slices of the two
+  sources and of the destination are taken once per row, and the per-channel
+  arithmetic of `blend_level` is applied to the whole row. The rule's
+  grayscale value is read from the rule's row, so a row costs one rule
+  lookup per pixel instead of two divisions. A source that does not cover
+  the destination's columns falls back to the per-pixel read, which reads
+  the missing columns as transparent.
 
 ---
 
@@ -251,6 +259,9 @@ typed error, and L3 turns it into the script error text.
 
 * `crates/engine/tests/trans.rs` — the state machine, the kinds, the rule
   mask and the errors.
+* `crates/engine/tests/trans_blend.rs` — the blend the CPU path writes: the
+  cross-fade and the rule blend against the per-channel arithmetic of the
+  reference, and a timing measurement of the 1920x1080 cross-fade.
 * `crates/engine/tests/extrans_wave.rs`, `extrans_mosaic.rs`,
   `extrans_turn.rs`, `extrans_rotate.rs`, `extrans_ripple.rs` — one file per
   `extrans` provider.
