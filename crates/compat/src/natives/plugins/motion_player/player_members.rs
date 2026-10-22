@@ -1129,9 +1129,6 @@ mp_method_void!(
         super::helpers::require_args(args, 1, "frameProgress")?;
         let dt = value_as_f64(&args[0]);
         p.frame_progress(dt);
-        // The layer update follows the clock step, so the pose the step
-        // selected is the one that is presented.
-        p.update_layers();
         Ok(())
     }
 );
