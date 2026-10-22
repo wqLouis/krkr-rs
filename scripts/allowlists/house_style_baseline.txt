@@ -60,10 +60,8 @@
 {"path": "crates/app/src/main.rs", "rule": "reference-citation", "anchor": "/// The first positional argument (reference `argv[1]`): a game directory", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/main.rs", "rule": "reference-citation", "anchor": "/// The reference discovers the game from its first command-line argument", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/main.rs", "rule": "reference-citation", "anchor": "/// otherwise it is the first archive's parent (the reference `TVPGetAppPath`", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/app/src/runner.rs", "rule": "reference-citation", "anchor": "// (`reference/cpp/core/visual/WindowIntf.cpp:302-310`). The", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/runner.rs", "rule": "history-comment", "anchor": "// A missing handle is fatal, never replaced by a synthetic one.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/runner.rs", "rule": "reference-citation", "anchor": "// Layers the window's root list can actually reach — the reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/app/src/runner.rs", "rule": "reference-citation", "anchor": "// reference window posts `onResize`", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/video.rs", "rule": "reference-citation", "anchor": "//! display-independent meaning is `vomOverlay`, whose frames the reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/binding.rs", "rule": "reference-citation", "anchor": "//! The C++ ABI hands native callbacks only the raw `tjs2_engine*`, and", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/binding.rs", "rule": "reference-citation", "anchor": "/// Resolve the binding for the C++ engine pointer a callback received.", "reason": "legacy comment, cleanup tracked in TODO §15"}

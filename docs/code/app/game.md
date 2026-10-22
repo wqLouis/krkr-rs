@@ -224,12 +224,15 @@ reaches `SLOW_FRAME_MS` (250 ms), logs one line that names the **previous**
 frame — the gap spans it, so its phases and host costs are the ones that
 explain the gap.
 
-The line carries: the five poll phases and their sum; the VM tick and its
-three input segments, plus the tick residual; the engine frame's sync,
-upload, prune, project and render costs, the GPU acquire/present/submit/
-fence costs, and the host residual; the audio drain; and the total. The
-current step's `platform_wait` and `input` come from the platform loop's
-own pacing measurement, and `unaccounted` closes the budget.
+The line carries: whether the frame it spans reached the surface
+(`presented`), so a skipped presentation shows up as `presented=false`
+with the wait attributed to the GPU `acquire` instead of the VM; the five
+poll phases and their sum; the VM tick and its three input segments, plus the
+tick residual; the engine frame's sync, upload, prune, project and render
+costs, the GPU acquire/present/submit/fence costs, and the host residual; the
+audio drain; and the total. The current step's `platform_wait` and `input`
+come from the platform loop's own pacing measurement, and `unaccounted`
+closes the budget.
 
 A fast frame emits nothing, and the very first frame emits nothing: there
 is no predecessor to attribute.

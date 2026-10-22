@@ -235,6 +235,13 @@ struct DesktopApp {
     /// Input and focus events received since the last frame, delivered to
     /// the VM.
     pending_events: Vec<PlatformEvent>,
+    /// The newest window size an OS resize reported since the last frame.
+    ///
+    /// A compositor can report several sizes for one layout change; the
+    /// surface follows the newest one at the frame boundary, so one change
+    /// costs at most one swapchain rebuild and none is rebuilt from a size a
+    /// later report already replaced.
+    pending_surface_size: Option<(u32, u32)>,
     /// Frames delivered since the last heartbeat line.
     heartbeat_frames: u64,
     /// Instant of the most recent heartbeat line.
@@ -307,6 +314,7 @@ impl DesktopApp {
             frame_interval,
             running: None,
             pending_events: Vec::new(),
+            pending_surface_size: None,
             heartbeat_frames: 0,
             heartbeat_at: Instant::now(),
         }
@@ -400,18 +408,17 @@ impl EventHandler for DesktopApp {
     fn event(&mut self, event: PlatformEvent) -> Flow {
         match event {
             PlatformEvent::Resized(width, height) => {
-                let Some(running) = self.running.as_mut() else {
+                if self.running.is_none() {
                     return Flow::Continue;
-                };
-                if let Err(error) = running.resize((width, height)) {
-                    eprintln!("krkr: resize failed: {error}");
-                    return Flow::Exit;
                 }
+                // The surface follows the newest size at the next frame
+                // boundary. A compositor can report several sizes for one
+                // layout change; rebuilding between them would build a
+                // swapchain nothing is presented from.
+                self.pending_surface_size = Some((width, height));
                 // The VM learns about the new size as a script event: the
-                // reference window posts `onResize`
-                // (`reference/cpp/core/visual/WindowIntf.cpp:302-310`). The
-                // surface was already resized above, so the frame body only
-                // dispatches.
+                // window posts `onResize` to script, and the frame body
+                // dispatches it after the surface follows the size.
                 self.pending_events
                     .push(PlatformEvent::Resized(width, height));
                 Flow::Continue
@@ -445,6 +452,14 @@ impl EventHandler for DesktopApp {
             let Some(running) = self.running.as_mut() else {
                 return Flow::Continue;
             };
+            // An OS resize is applied once, with the newest size the event
+            // loop reported, before the frame body and the draw see it.
+            if let Some(size) = self.pending_surface_size.take()
+                && let Err(error) = running.resize(size)
+            {
+                eprintln!("krkr: resize failed: {error}");
+                return Flow::Exit;
+            }
             let events = std::mem::take(&mut self.pending_events);
             let report = match running.step(dt_ms, &events, pacing) {
                 Ok(report) => report,
@@ -458,7 +473,9 @@ impl EventHandler for DesktopApp {
             // taken, so a size that does not change again is not applied
             // twice, and a request the window already shows needs no action.
             // A backend that applies it synchronously emits no `Resized`, so
-            // the surface is resized here from the size the backend reports.
+            // the surface is resized here from the size the backend reports;
+            // when the compositor keeps the final size it reports it as a
+            // `Resized` event instead, which the next frame applies.
             if let Some(size) = running.take_window_resize()
                 && size.0 != 0
                 && size.1 != 0

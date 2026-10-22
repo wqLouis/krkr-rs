@@ -48,7 +48,7 @@ map for the module.
 | `translation: Option<PixelTranslation>` | the current VM↔device mapping; `None` when the sizes cannot be fitted |
 | `last_window_client_size`, `pending_window_resize` | the window client size the engine observed, and the resize the composition root still has to apply |
 | `presentation_skipped_logged` | whether the unfittable-size warning was already logged |
-| `reported_present_fault`, `present_skips` | presentation-fault bookkeeping |
+| `stall: PresentationStall` | the run of frames the display did not accept: its frame count, start clock, distinct causes and next age report |
 
 ---
 
@@ -159,13 +159,26 @@ pub struct FrameReport {
 
 `stats` is the null backend's counters (`None` on a GPU backend). `presented ==
 false` means the scene was updated but the backend kept the previous surface
-contents; the engine counts the frame as skipped and reports it — the
-reference presents on every vsync wake, and a wake that produced no frame is a
-skipped, reported frame
+contents; the engine counts the frame into the current `PresentationStall` —
+the reference presents on every vsync wake, and a wake that produced no frame
+is a skipped, reported frame
 (`reference/cpp/core/visual/impl/VSyncTimingThread.cpp:114,141-142`). The
 engine does not retry a presentation inside the same frame: the backend already
 rebuilds its swapchain at the start of the next frame when it needs to, and a
 skip has nothing to retry.
+
+A stall is a **run**, not a per-frame fault. The first skipped frame opens it;
+each distinct cause warns once (`engine: the display did not release a
+swapchain image within the presentation budget; this frame was skipped` and
+its siblings); at one second and then every ten seconds it reports its age and
+frame count, so a display that stops accepting frames is never silent; and the
+next presented frame closes it with
+`engine: presentation resumed after {frames} skipped frame(s) in {seconds} s:
+{causes}`. The causes are the distinct reasons the frames were skipped — an
+`AcquireTimeout` from the display, a lost or out-of-date surface, a backend
+that presented nothing, or a game surface that cannot be fitted into the
+framebuffer — so a resume that follows an occlusion, a resize storm and an
+unfittable size names all three instead of only the last one.
 
 ---
 
@@ -192,9 +205,11 @@ skip has nothing to retry.
     the hook rewrote without changing the tree) and prune again;
 13. project again if the hook changed the scene's structure;
 14. one `render` call;
-15. recover a lost surface and report a presentation fault — a skipped frame
-    is counted, a surface fault is reported once per episode, and the next
-    frame's render call rebuilds a stale swapchain;
+15. recover a lost surface, then record the frame in the presentation stall —
+    a presented frame closes the run and reports its span and causes, a
+    skipped one records its cause (warned once per cause) and the stall's age
+    when it is due, and the next frame's render call rebuilds a stale
+    swapchain;
 16. bump the frame counter and return the `FrameReport`.
 
 The projection is rebuilt **in place**: the node list is cleared (retaining its
@@ -259,14 +274,14 @@ script window size    ──► scene window client ──► take_window_resize
 | the frame hook returns an error | `EngineError::Frame`; the frame is abandoned without projecting or drawing |
 | the overlay fails to refresh | `EngineError::Overlay`; the frame is abandoned |
 | a bottom render action fails | `EngineError::Render` (a transparent `RenderError`) |
-| the backend presents nothing and names no surface event | the frame is counted as skipped and reported once |
-| the display does not release a swapchain image within the presentation budget | the backend skipped the frame before submitting; the engine counts it and warns once per episode, and the VM, timers and audio keep running |
+| the backend presents nothing and names no surface event | the frame is recorded in the stall as that cause, warned once for the run, and the stall reports its age while it lasts |
+| the display does not release a swapchain image within the presentation budget | the backend skipped the frame before submitting; the engine records it in the stall (warned once for the run, age reported at one second and then every ten), the resume line names the cause and the span, and the VM, timers and audio keep running |
 | the surface is lost | the surface and swapchain are rebuilt in L1; the scene, textures and VM stay in place; the recovered frame is skipped |
-| the surface is out of date | the fault is logged once per stall; the backend rebuilds the swapchain at the start of the next frame |
+| the surface is out of date | the cause is recorded in the stall and logged once for the run; the backend rebuilds the swapchain at the start of the next frame |
 | a bitmap has a zero dimension or a wrong pixel length | the bitmap is skipped with a warning; the frame continues |
 | a texture cannot be created for a bitmap | the bitmap is skipped with a warning; the frame continues |
 | a texture batch upload fails | the bitmaps stay dirty and the next frame retries them |
-| the VM size and the framebuffer size cannot be fitted | the translation is `None`; the frame draws nothing and the engine warns **once** until the sizes fit again |
+| the VM size and the framebuffer size cannot be fitted | the translation is `None`; the frame draws nothing, joins the current stall under that cause, and the engine warns **once** until the sizes fit again |
 
 No failure is swallowed into a default value: each one is a typed error, a
 warning with a named cause, or a counted skipped frame.
@@ -296,7 +311,8 @@ warning with a named cause, or a counted skipped frame.
   bitmap dirty; a resize event reports the extent the surface accepted; a
   frame the backend did not present is reported; a frame the display never
   released is a reported skip; a lost surface is reported as the surface fault
-  that recovery owns.
+  that recovery owns; a stall keeps every distinct cause and reports its span,
+  reports its age on a bounded schedule, and names each cause once.
 
 ---
 

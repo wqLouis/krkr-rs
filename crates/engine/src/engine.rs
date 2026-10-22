@@ -214,6 +214,181 @@ fn present_outcome(presentation: Presentation) -> PresentOutcome {
     }
 }
 
+/// How long a presentation stall may last before its age is reported.
+const STALL_REPORT_MS: u64 = 1_000;
+
+/// How often a continuing presentation stall reports its age after the first
+/// report.
+const STALL_REPORT_INTERVAL_MS: u64 = 10_000;
+
+/// A reason a frame's image did not reach the display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StallCause {
+    /// The backend did not present the frame.
+    Backend(PresentFault),
+    /// The game surface and the framebuffer have no presentation mapping, so
+    /// the frame drew nothing.
+    NoMapping,
+}
+
+impl StallCause {
+    /// Warns once about this cause when it opens or joins a stall.
+    fn warn(self) {
+        match self {
+            Self::Backend(PresentFault::Unreported) => {
+                log::warn!("engine: the backend presented no frame and reported no surface event")
+            }
+            // A skipped frame is not a fault: the backend abandoned it before
+            // submitting anything and the previous image stays on screen.
+            Self::Backend(PresentFault::Skipped(PresentSkip::AcquireTimeout)) => log::warn!(
+                "engine: the display did not release a swapchain image within the \
+                 presentation budget; this frame was skipped"
+            ),
+            Self::Backend(PresentFault::Surface(SurfaceEvent::Lost)) => log::warn!(
+                "engine: the presentation surface was lost; this frame was not presented"
+            ),
+            Self::Backend(PresentFault::Surface(SurfaceEvent::OutOfDate)) => log::warn!(
+                "engine: the presentation surface is out of date; rebuilding the swapchain"
+            ),
+            Self::Backend(PresentFault::Surface(SurfaceEvent::Restored)) => {
+                log::warn!("engine: the surface was restored but this frame was not presented")
+            }
+            Self::Backend(PresentFault::Surface(SurfaceEvent::Resized(width, height))) => {
+                log::warn!(
+                    "engine: this frame was not presented after a resize to {width}x{height}"
+                )
+            }
+            // The unfittable-size warning is emitted where the mapping is
+            // rebuilt, once per unsupported size pair.
+            Self::NoMapping => {}
+        }
+    }
+
+    /// The phrase a stall summary uses for this cause.
+    fn describe(self) -> String {
+        match self {
+            Self::Backend(PresentFault::Unreported) => {
+                "the backend presented no frame and named no surface event".to_owned()
+            }
+            Self::Backend(PresentFault::Skipped(PresentSkip::AcquireTimeout)) => {
+                "the display did not release a swapchain image within the presentation budget"
+                    .to_owned()
+            }
+            Self::Backend(PresentFault::Surface(SurfaceEvent::Lost)) => {
+                "the presentation surface was lost".to_owned()
+            }
+            Self::Backend(PresentFault::Surface(SurfaceEvent::OutOfDate)) => {
+                "the presentation surface was out of date".to_owned()
+            }
+            Self::Backend(PresentFault::Surface(SurfaceEvent::Restored)) => {
+                "the presentation surface was restored".to_owned()
+            }
+            Self::Backend(PresentFault::Surface(SurfaceEvent::Resized(width, height))) => {
+                format!("the presentation surface was resized to {width}x{height}")
+            }
+            Self::NoMapping => "the game surface and the framebuffer cannot be fitted".to_owned(),
+        }
+    }
+}
+
+/// Joins the distinct causes of a stall into one log phrase.
+fn describe_stall_causes(causes: &[StallCause]) -> String {
+    causes
+        .iter()
+        .map(|cause| cause.describe())
+        .collect::<Vec<String>>()
+        .join("; ")
+}
+
+/// One run of consecutive frames the display did not accept.
+///
+/// The stall starts with the first frame whose image did not reach the display
+/// and ends with the next presented frame. It keeps the distinct causes, so a
+/// resume names every reason the display was starved rather than only the last
+/// one, and it reports its own age while it lasts, so a display that stops
+/// accepting frames is never silent between the first warning and the resume.
+#[derive(Default)]
+struct PresentationStall {
+    /// Frames the display did not accept since the last presented frame.
+    frames: u64,
+    /// The frame clock the stall began at.
+    started_ms: u64,
+    /// Distinct causes in first-seen order.
+    causes: Vec<StallCause>,
+    /// The frame clock of the next age report.
+    next_report_ms: Option<u64>,
+}
+
+impl PresentationStall {
+    /// Whether the run has recorded a frame.
+    fn active(&self) -> bool {
+        self.frames > 0
+    }
+
+    /// Records a frame the display did not accept, returning the cause when it
+    /// is new to this stall.
+    fn record(&mut self, cause: StallCause, now_ms: u64) -> Option<StallCause> {
+        if !self.active() {
+            self.started_ms = now_ms;
+            self.next_report_ms = Some(now_ms.saturating_add(STALL_REPORT_MS));
+        }
+        self.frames = self.frames.saturating_add(1);
+        if self.causes.contains(&cause) {
+            return None;
+        }
+        self.causes.push(cause);
+        Some(cause)
+    }
+
+    /// Returns the stall's age when a report is due at `now_ms`.
+    fn due_report(&mut self, now_ms: u64) -> Option<StallAge> {
+        let due = self.next_report_ms?;
+        if now_ms < due {
+            return None;
+        }
+        self.next_report_ms = Some(now_ms.saturating_add(STALL_REPORT_INTERVAL_MS));
+        Some(StallAge {
+            frames: self.frames,
+            elapsed_ms: now_ms.saturating_sub(self.started_ms),
+        })
+    }
+
+    /// Ends the run at `now_ms`, returning what to report when it lasted.
+    fn resumed(&mut self, now_ms: u64) -> Option<StallSummary> {
+        if !self.active() {
+            return None;
+        }
+        let summary = StallSummary {
+            frames: self.frames,
+            elapsed_ms: now_ms.saturating_sub(self.started_ms),
+            causes: std::mem::take(&mut self.causes),
+        };
+        self.frames = 0;
+        self.next_report_ms = None;
+        Some(summary)
+    }
+}
+
+/// The age of a presentation stall that is still running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StallAge {
+    /// Frames the display did not accept so far.
+    frames: u64,
+    /// Milliseconds since the stall began.
+    elapsed_ms: u64,
+}
+
+/// The span of a presentation stall that ended.
+#[derive(Debug, PartialEq, Eq)]
+struct StallSummary {
+    /// Frames the display did not accept.
+    frames: u64,
+    /// Milliseconds between the first skipped frame and the resumed one.
+    elapsed_ms: u64,
+    /// Distinct causes in first-seen order.
+    causes: Vec<StallCause>,
+}
+
 /// Outcome of one [`Engine::step`] or [`Engine::frame`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FrameReport {
@@ -328,11 +503,9 @@ pub struct Engine {
     /// Whether the unfittable-size warning has been logged since the sizes
     /// last fitted.
     presentation_skipped_logged: bool,
-    /// Presentation fault the engine has already reported, or `None` while
-    /// frames present normally.
-    reported_present_fault: Option<PresentFault>,
-    /// Consecutive frames the backend did not present.
-    present_skips: u32,
+    /// The run of frames the display has not accepted, ended by the next
+    /// presented frame.
+    stall: PresentationStall,
 }
 
 impl Engine {
@@ -386,8 +559,7 @@ impl Engine {
             last_window_client_size: None,
             pending_window_resize: None,
             presentation_skipped_logged: false,
-            reported_present_fault: None,
-            present_skips: 0,
+            stall: PresentationStall::default(),
         };
         let event = resize_render(
             &engine.pipeline,
@@ -649,7 +821,7 @@ impl Engine {
 
         if self.translation.is_none() {
             self.frame_index = self.frame_index.saturating_add(1);
-            self.present_skips = self.present_skips.saturating_add(1);
+            self.note_presentation_stall(StallCause::NoMapping, now_ms);
             return Ok(FrameReport {
                 frame_index: self.frame_index,
                 elapsed_ms: self.clock_ms,
@@ -731,16 +903,15 @@ impl Engine {
             log::info!("engine: presentation surface recreated after it was lost");
         }
         if outcome.presented {
-            if self.reported_present_fault.take().is_some() {
-                log::info!(
-                    "engine: presentation resumed after {} skipped frame(s)",
-                    self.present_skips
-                );
-            }
-            self.present_skips = 0;
+            self.finish_presentation_stall(now_ms);
         } else {
-            self.present_skips = self.present_skips.saturating_add(1);
-            self.report_present_fault(outcome.fault);
+            // `present_outcome` names a fault for every non-presented frame; a
+            // frame without one is the backend's silence, reported as such.
+            let fault = match outcome.fault {
+                Some(fault) => fault,
+                None => PresentFault::Unreported,
+            };
+            self.note_presentation_stall(StallCause::Backend(fault), now_ms);
         }
         let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -759,41 +930,36 @@ impl Engine {
         })
     }
 
-    /// Reports a presentation fault once for as long as it is the current
-    /// fault, so a persistent stall does not log on every frame.
-    fn report_present_fault(&mut self, fault: Option<PresentFault>) {
-        let Some(fault) = fault else {
-            return;
-        };
-        if self.reported_present_fault == Some(fault) {
-            return;
+    /// Records a frame the display did not accept.
+    ///
+    /// A cause is reported the first time it joins the stall, and the stall's
+    /// age is reported once it lasts long enough that a game frozen on screen
+    /// would otherwise look like a hung process.
+    fn note_presentation_stall(&mut self, cause: StallCause, now_ms: u64) {
+        if let Some(cause) = self.stall.record(cause, now_ms) {
+            cause.warn();
         }
-        match fault {
-            PresentFault::Unreported => {
-                log::warn!("engine: the backend presented no frame and reported no surface event")
-            }
-            // A skipped frame is not a fault: the backend abandoned it before
-            // submitting anything and the previous image stays on screen. It
-            // is reported once per episode so a display that stops releasing
-            // images is visible in the log.
-            PresentFault::Skipped(PresentSkip::AcquireTimeout) => log::warn!(
-                "engine: the display did not release a swapchain image within the \
-                 presentation budget; this frame was skipped"
-            ),
-            PresentFault::Surface(SurfaceEvent::Lost) => log::warn!(
-                "engine: the presentation surface was lost; this frame was not presented"
-            ),
-            PresentFault::Surface(SurfaceEvent::OutOfDate) => log::warn!(
-                "engine: the presentation surface is out of date; rebuilding the swapchain"
-            ),
-            PresentFault::Surface(SurfaceEvent::Restored) => {
-                log::warn!("engine: the surface was restored but this frame was not presented")
-            }
-            PresentFault::Surface(SurfaceEvent::Resized(width, height)) => log::warn!(
-                "engine: this frame was not presented after a resize to {width}x{height}"
-            ),
+        if let Some(age) = self.stall.due_report(now_ms) {
+            log::warn!(
+                "engine: the display has not accepted a frame for {:.1} s (frames skipped: {}); \
+                 {}",
+                age.elapsed_ms as f64 / 1000.0,
+                age.frames,
+                describe_stall_causes(&self.stall.causes),
+            );
         }
-        self.reported_present_fault = Some(fault);
+    }
+
+    /// Ends a presentation stall and reports how long it lasted and why.
+    fn finish_presentation_stall(&mut self, now_ms: u64) {
+        if let Some(summary) = self.stall.resumed(now_ms) {
+            log::info!(
+                "engine: presentation resumed after {} skipped frame(s) in {:.1} s: {}",
+                summary.frames,
+                summary.elapsed_ms as f64 / 1000.0,
+                describe_stall_causes(&summary.causes),
+            );
+        }
     }
 
     /// Rebinds the surface to a new size in physical pixels.
@@ -1312,7 +1478,8 @@ fn clear_uploaded_dirty(scene: &mut Scene, uploaded: &[u32], succeeded: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Engine, EngineParts, GameFrame, PresentFault, Scene, clear_uploaded_dirty, present_outcome,
+        Engine, EngineParts, GameFrame, PresentFault, PresentationStall, Scene, StallAge,
+        StallCause, StallSummary, clear_uploaded_dirty, describe_stall_causes, present_outcome,
         reported_surface_size,
     };
     use api::geometry::PixelRegion;
@@ -1475,6 +1642,96 @@ mod tests {
         assert_eq!(
             skipped.fault,
             Some(PresentFault::Skipped(PresentSkip::AcquireTimeout))
+        );
+    }
+
+    #[test]
+    fn a_stall_names_every_cause_it_saw_and_its_span() {
+        // reference/cpp/core/visual/impl/VSyncTimingThread.cpp:114,141-142
+        // The reference presents on every vsync wake; a wake that produced no
+        // frame is a skipped frame, so one stall is the run of such wakes and
+        // its length is the frames they produced.
+        let mut stall = PresentationStall::default();
+        assert!(!stall.active());
+        assert_eq!(
+            stall.resumed(5_000),
+            None,
+            "a run that never skipped has no span to report"
+        );
+
+        let skip = StallCause::Backend(PresentFault::Skipped(PresentSkip::AcquireTimeout));
+        assert_eq!(stall.record(skip, 1_000), Some(skip));
+        assert_eq!(
+            stall.record(skip, 1_008),
+            None,
+            "a cause already in the run is named once"
+        );
+
+        let out_of_date = StallCause::Backend(PresentFault::Surface(SurfaceEvent::OutOfDate));
+        assert_eq!(stall.record(out_of_date, 1_016), Some(out_of_date));
+        assert_eq!(stall.record(out_of_date, 1_024), None);
+        // The unfittable mapping keeps the same frame count, so a run that
+        // changes cause does not lose the frames it already skipped.
+        assert_eq!(
+            stall.record(StallCause::NoMapping, 1_032),
+            Some(StallCause::NoMapping)
+        );
+
+        assert_eq!(
+            stall.resumed(2_032),
+            Some(StallSummary {
+                frames: 5,
+                elapsed_ms: 1_032,
+                causes: vec![skip, out_of_date, StallCause::NoMapping],
+            })
+        );
+        assert!(!stall.active(), "the resume ends the run");
+        assert_eq!(stall.resumed(2_040), None);
+    }
+
+    #[test]
+    fn a_stall_reports_its_age_on_a_bounded_schedule() {
+        let mut stall = PresentationStall::default();
+        let cause = StallCause::Backend(PresentFault::Skipped(PresentSkip::AcquireTimeout));
+        assert_eq!(stall.record(cause, 0), Some(cause));
+
+        assert_eq!(
+            stall.due_report(999),
+            None,
+            "nothing is reported before the first interval"
+        );
+        assert_eq!(
+            stall.due_report(1_000),
+            Some(StallAge {
+                frames: 1,
+                elapsed_ms: 1_000,
+            })
+        );
+        assert_eq!(
+            stall.due_report(1_100),
+            None,
+            "an age is reported once per interval"
+        );
+        assert_eq!(stall.record(cause, 10_900), None);
+        assert_eq!(
+            stall.due_report(11_000),
+            Some(StallAge {
+                frames: 2,
+                elapsed_ms: 11_000,
+            })
+        );
+    }
+
+    #[test]
+    fn a_stall_summary_names_each_cause_once() {
+        let causes = [
+            StallCause::Backend(PresentFault::Skipped(PresentSkip::AcquireTimeout)),
+            StallCause::NoMapping,
+        ];
+        assert_eq!(
+            describe_stall_causes(&causes),
+            "the display did not release a swapchain image within the presentation budget; \
+             the game surface and the framebuffer cannot be fitted"
         );
     }
 

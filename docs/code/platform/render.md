@@ -153,6 +153,22 @@ swapchain and its synchronisation objects are untouched, and the result is
 The frame and per-image fence waits stay unbounded — waiting there is GPU
 progress, and a wedged device is reported by the driver.
 
+`resize` adopts the new size and rebuilds the swapchain, with two rules that
+keep a compositor's layout churn from costing frames:
+
+* A resize that repeats the extent the swapchain already has rebuilds nothing.
+  A compositor can report a size it has just applied (a scale or tiling
+  rounding included); rebuilding for it cannot change the frame the display
+  shows. An unusable swapchain is still rebuilt, because the retry is what
+  makes it usable again.
+* The swapchain a rebuild replaces is **retired**, not destroyed: the display
+  may still be showing its last presented image. A retired swapchain is
+  destroyed after a frame of its replacement has been presented (or at
+  teardown). A swapchain that never presented has no image on screen and is
+  destroyed immediately, and a lost surface destroys every retired swapchain
+  before the surface it targets. The swapchain render pass is shared along the
+  chain and is destroyed once, with the last swapchain that uses it.
+
 `begin_render_state_with_display` is the complete entry point for X11, XCB
 and Wayland: `VK_KHR_surface` needs the platform display connection in
 addition to the window handle, and `raw-window-handle` splits the two.
@@ -395,7 +411,8 @@ Every failure is a typed `RenderError` (the variants are listed in
 | the logical device was lost | `RenderError::DeviceLost` |
 | the presentation surface was lost | reported as `SurfaceEvent::Lost` in the returned `Presentation` — **not** as an error; the caller recovers it through `recover_surface` |
 | the surface is out of date | `SurfaceEvent::OutOfDate` |
-| the display does not release a swapchain image within the presentation budget | `Presentation { presented: false, skip: Some(PresentSkip::AcquireTimeout) }` — **not** an error and no swapchain rebuild; the caller counts the skipped frame and keeps ticking |
+| the display does not release a swapchain image within the presentation budget | `Presentation { presented: false, skip: Some(PresentSkip::AcquireTimeout) }` — **not** an error and no swapchain rebuild; the caller records the skipped frame in its stall and keeps ticking |
+| `resize` repeats the current swapchain extent | no rebuild; `SurfaceEvent::Resized` with the extent the swapchain already has |
 | a GPU allocation failed | `RenderError::OutOfMemory` |
 | the descriptor is empty, oversized or non-RGBA8 | `RenderError::InvalidArgument` |
 | the state/surface/target does not belong to this pipeline | `RenderError::InvalidArgument` |

@@ -148,15 +148,23 @@ handler owns the host.
 | callback | what it does |
 |---|---|
 | `resumed` | takes the window and display handles — a missing handle is fatal, never replaced by a synthetic one — creates the `Host` at the window's **real physical size**, and opens the `GameHost` when a game is present |
-| `event` | `Resized` resizes the surface and is also queued for the VM (the reference posts `onResize`); `ScaleFactorChanged` needs no action, because winit follows it with a `Resized`; input and focus events are queued and delivered with the next frame; `CloseRequested` exits |
+| `event` | `Resized` queues the newest surface size and the VM's `onResize` (the reference posts `onResize`); the size is applied once at the next frame boundary, before the frame body draws; `ScaleFactorChanged` needs no action, because winit follows it with a `Resized`; input and focus events are queued and delivered with the next frame; `CloseRequested` exits |
 | `frame` | delivers the queued events, steps the host, applies a script-requested window resize, and logs the heartbeat |
+
+An **OS window resize** is applied at the frame boundary, with the newest size
+the event loop reported. A compositor can report several sizes for one layout
+change (a fractional-scale tiling rounds the height back and forth); applying
+them as they arrive rebuilds a swapchain for each, and a rebuild nothing is
+presented from cannot show the frame. One size per frame is applied instead.
 
 The **script-requested window resize** is the other direction of the resize
 story: a script's `Window.setInnerSize` makes the engine produce a request,
 `Host::take_window_resize` takes it (so a size that does not change again
 is applied once), and the handler asks the OS window to adopt it. A backend
 that applies the size synchronously emits no `Resized`, so the surface is
-resized from the size the backend reports back.
+resized from the size the backend reports back. When the compositor keeps the
+final say on the size (a tiled window), the size it settles on arrives as the
+following `Resized` event, which the next frame applies.
 
 The **heartbeat** is one `debug` line per second of delivered frames, with
 the frame index, the frame gap and whether the frame reached the surface.

@@ -390,6 +390,8 @@ impl VulkanPipeline {
             surface_size,
             frame_index: 0,
             swapchain_ready: true,
+            swapchain_presented: false,
+            retired_swapchain: None,
             present_fault: None,
             last_timings: None,
         };
@@ -434,6 +436,15 @@ impl VulkanPipeline {
             });
         }
 
+        let current = vstate.swapchain.extent;
+        // A surface event that repeats the extent the swapchain already has
+        // cannot change the frame the display shows, so it does not rebuild
+        // one. An unusable swapchain is always rebuilt, even for the same
+        // size, because the retry is what makes it usable again.
+        if vstate.swapchain_ready && (current.width, current.height) == size {
+            vstate.surface_size = size;
+            return Ok(SurfaceEvent::Resized(current.width, current.height));
+        }
         vstate.surface_size = size;
         let device = vstate.device.clone();
         // `recreate_swapchain` idles the device before touching the swapchain.
@@ -1125,6 +1136,9 @@ impl VulkanPipeline {
                 recreate_ms,
                 fence_wait_ms,
             });
+            // The frame was presented on the swapchain the recreate just
+            // replaced, so it is on screen until a frame of the replacement
+            // presents; it is retired, not destroyed.
             vstate.clear_present_fault();
             return Ok(Presentation {
                 presented: true,
@@ -1141,6 +1155,8 @@ impl VulkanPipeline {
             fence_wait_ms,
         });
         vstate.clear_present_fault();
+        vstate.swapchain_presented = true;
+        vstate.dispose_retired_swapchain();
         Ok(Presentation {
             presented: true,
             surface_event: None,
@@ -1263,6 +1279,12 @@ pub(crate) struct VulkanState {
     pub(crate) preferred_format: TextureFormat,
     /// Swapchain, render pass and framebuffers.
     pub(crate) swapchain: swapchain::SwapchainState,
+    /// The swapchain the most recent recreate replaced.
+    ///
+    /// The display may still be showing one of its images, so it is destroyed
+    /// only after a frame of the replacement has been presented, or at
+    /// teardown.
+    retired_swapchain: Option<swapchain::SwapchainState>,
     /// Compiled pipelines and descriptor resources.
     pub(crate) pipelines: pipelines::PipelineSet,
     /// Per-frame command buffers and sync objects.
@@ -1304,6 +1326,12 @@ pub(crate) struct VulkanState {
     pub(crate) frame_index: u64,
     /// Whether the swapchain is usable.
     pub(crate) swapchain_ready: bool,
+    /// Whether the current swapchain presented a frame.
+    ///
+    /// A swapchain that never presented has no image on screen, so a recreate
+    /// may destroy it at once; one that did present is retired until its
+    /// replacement presents.
+    swapchain_presented: bool,
     /// Presentation fault already reported, so a persistent stall logs once
     /// per cause instead of once per frame.
     present_fault: Option<PresentFault>,
@@ -1312,6 +1340,17 @@ pub(crate) struct VulkanState {
 }
 
 impl VulkanState {
+    /// Destroys the swapchain a recreate replaced, once a frame of its
+    /// replacement has been presented.
+    fn dispose_retired_swapchain(&mut self) {
+        let Some(retired) = self.retired_swapchain.take() else {
+            return;
+        };
+        // The render pass is shared with the swapchain that replaced this one
+        // and is destroyed with the last swapchain that uses it.
+        retired.destroy(&self.device, &self.swapchain_loader);
+    }
+
     /// Reports `fault` as a warning when it is not the fault already reported.
     fn report_present_fault(&mut self, fault: PresentFault) {
         if self.present_fault == Some(fault) {
@@ -1352,6 +1391,10 @@ impl Drop for VulkanState {
                 effects.destroy(&self.device);
             }
             self.pipelines.destroy(&self.device);
+            if let Some(retired) = self.retired_swapchain.take() {
+                // The render pass is shared with the current swapchain.
+                retired.destroy(&self.device, &self.swapchain_loader);
+            }
             self.swapchain.destroy(&self.device, &self.swapchain_loader);
             self.swapchain.destroy_render_pass(&self.device);
             for frame in &self.frames {
@@ -1748,8 +1791,22 @@ fn recreate_swapchain(
 
     match new_swapchain {
         Ok(new_swapchain) => {
-            let old = std::mem::replace(&mut state.swapchain, new_swapchain);
-            old.destroy(device, &state.swapchain_loader);
+            if state.swapchain_presented {
+                // The display may still be showing the last image the current
+                // swapchain presented, so it is retired and destroyed only
+                // after a frame of its replacement has been presented. A
+                // swapchain retired earlier no longer has a frame on screen.
+                state.dispose_retired_swapchain();
+                let old = std::mem::replace(&mut state.swapchain, new_swapchain);
+                state.retired_swapchain = Some(old);
+            } else {
+                // The current swapchain never presented, so nothing of it is
+                // on screen and it is destroyed now. The swapchain retired
+                // before it may still be on screen and stays retired.
+                let unused = std::mem::replace(&mut state.swapchain, new_swapchain);
+                unused.destroy(device, &state.swapchain_loader);
+            }
+            state.swapchain_presented = false;
             if let Err(error) = rebuild_image_sync(state, device) {
                 state.swapchain_ready = false;
                 return Err(error);
@@ -1832,10 +1889,15 @@ fn recreate_surface(
     // The new swapchain references the new surface from here on, so the swap
     // is adopted before anything else can fail. The old swapchain is the old
     // surface's last user and is destroyed before it.
+    // A swapchain retired by an earlier resize targets the old surface, so it
+    // is destroyed before the surface goes; a lost surface has no image on
+    // screen to keep it alive for.
+    state.dispose_retired_swapchain();
     let old_surface = std::mem::replace(&mut state.surface, new_surface);
     surface.surface = new_surface;
     let old_swapchain = std::mem::replace(&mut state.swapchain, new_swapchain);
     old_swapchain.destroy(&state.device, &state.swapchain_loader);
+    state.swapchain_presented = false;
     // SAFETY: the old swapchain is gone and the device is idle.
     unsafe { state.surface_loader.destroy_surface(old_surface, None) };
 

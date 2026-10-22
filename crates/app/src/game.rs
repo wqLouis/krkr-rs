@@ -288,7 +288,9 @@ impl FrameAttribution {
     /// gap is below the threshold or no previous frame exists yet.
     ///
     /// The named phases and host/GPU costs are the previous frame's, because
-    /// the gap spans it. `platform_wait` and `input` are this step's
+    /// the gap spans it, and `presented` says whether that frame reached the
+    /// surface: an acquisition timeout appears as `presented=false` with the
+    /// wait in `acquire`. `platform_wait` and `input` are this step's
     /// measurement; `unaccounted` is `gap - previous total - platform wait`,
     /// so a non-zero value is loop overhead or a stall outside both the
     /// frame and the event poll. `tick_residual` is the VM tick not covered
@@ -306,7 +308,7 @@ impl FrameAttribution {
         let tick_residual = tick.tick_ms - tick.input_ms() - phases.body_ms;
         let host_residual = self.host_ms - report.sync_ms - report.project_ms - report.render_ms;
         Some(format!(
-            "frame {} slow: gap={gap_ms:.1} ms since the previous frame; \
+            "frame {} slow: presented={}, gap={gap_ms:.1} ms since the previous frame; \
              the gap spans the previous frame, so these are its phases: \
              sound={:.1} video={:.1} async={:.1} continuous={:.1} \
              frame_tail={:.1} body={:.1}; its vm: tick={:.1} \
@@ -318,6 +320,7 @@ impl FrameAttribution {
              present={:.1} recreate={:.1} fence_wait={:.1}; this wait: \
              platform_wait={:.1} input={:.1} unaccounted={unaccounted:.1} ms",
             report.frame_index,
+            report.presented,
             phases.sound_ms,
             phases.video_ms,
             phases.async_trigger_ms,
@@ -1166,6 +1169,10 @@ mod tests {
             .expect("slow gap emits a line");
 
         assert!(line.contains("frame 7 slow"), "line was: {line}");
+        assert!(
+            line.contains("presented=false"),
+            "a slow gap names whether the frame it spans reached the surface: {line}"
+        );
         assert!(line.contains("frame_tail=480.0"), "line was: {line}");
         assert!(line.contains("body=480.0"), "line was: {line}");
         assert!(line.contains("tick=487.5"), "line was: {line}");
