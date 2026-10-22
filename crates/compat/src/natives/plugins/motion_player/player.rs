@@ -162,6 +162,11 @@ pub(crate) struct PlayerInst {
     pub(crate) missing_textures: BTreeSet<String>,
 
     // Emote transform state.
+    /// Whether the player is one of the emote classes.
+    ///
+    /// The emote classes advance their clocks on every tick and do not hold
+    /// the frame gate, while the plain player holds it.
+    pub(crate) emote: bool,
     pub(crate) coord: CoordState,
     pub(crate) scale: Animator,
     pub(crate) rotate: Animator,
@@ -264,6 +269,7 @@ impl Default for PlayerInst {
             pending_events: Vec::new(),
             tinted: Map::default(),
             missing_textures: BTreeSet::new(),
+            emote: false,
             coord: CoordState::default(),
             scale: Animator::at(1.0),
             rotate: Animator::at(0.0),
@@ -698,9 +704,6 @@ impl PlayerInst {
     /// `onAction` and `onSync` callbacks; a null id means there is none.
     pub(crate) fn progress(&mut self, dt_ms: f64, ctx: &CompatCtx, target: tjs::Tjs2ValueId) {
         self.pending_events.clear();
-        if !self.speed {
-            return;
-        }
         // A delta outside the accepted range is dropped rather than clamped to
         // the bound, so one bad tick cannot skip the animation ahead.
         let dt_ms = if (0.0..=60000.0).contains(&dt_ms) {
@@ -709,38 +712,39 @@ impl PlayerInst {
             0.0
         };
         let frames = dt_ms * 60.0 / 1000.0;
-        self.frame_last_time = frames;
         self.busy = false;
-        if self.queuing {
-            // A motion that was just activated records the delta but leaves
-            // every clock alone; the layer update that follows clears the gate.
-            self.present_pose();
-            self.dispatch_events(ctx, target);
+        if self.emote {
+            self.progress_emote(frames, ctx, target);
             return;
         }
-        self.frame_tick_count += frames;
-        self.coord.x.step(frames as f32);
-        self.coord.y.step(frames as f32);
-        self.scale.step(frames as f32);
-        self.rotate.step(frames as f32);
-        if self.wind.active {
-            self.wind.phase += frames;
-        }
-        self.advance_timelines(frames);
+        self.frame_progress(frames);
+        // The layer update runs on every tick, so the gate a fresh activation
+        // holds is released by the tick that follows it.
         self.update_layers();
-        self.step_animators(frames as f32);
         self.dispatch_events(ctx, target);
     }
 
-    /// Present the current pose without advancing any clock.
+    /// Advance the emote playback by `frames` frame units.
     ///
-    /// A motion that was just activated sits behind the frame gate: the tick
-    /// that follows it only shows the first pose, and the layer update that
-    /// runs here releases the gate.
-    fn present_pose(&mut self) {
-        self.prune_playing_timelines();
-        self.sync_active = self.sync_waiting && self.allplaying;
+    /// The emote path advances the frame loop and the loop clock on every
+    /// tick and does not hold the frame gate.
+    fn progress_emote(&mut self, frames: f64, ctx: &CompatCtx, target: tjs::Tjs2ValueId) {
+        self.frame_last_time = frames;
+        if self.speed && frames > 0.0 {
+            self.frame_loop_time += frames;
+            self.loop_time += frames;
+            self.coord.x.step(frames as f32);
+            self.coord.y.step(frames as f32);
+            self.scale.step(frames as f32);
+            self.rotate.step(frames as f32);
+            if self.wind.active {
+                self.wind.phase += frames;
+            }
+            self.advance_timelines(frames);
+            self.step_animators(frames as f32);
+        }
         self.update_layers();
+        self.dispatch_events(ctx, target);
     }
 
     /// The playback position as a `0..=1` ratio, or `1.0` once nothing plays.
@@ -761,19 +765,33 @@ impl PlayerInst {
         progress
     }
 
-    /// Advance everything by `frames` frame units without dispatching events.
+    /// Advance the playback clocks by `frames` frame units.
+    ///
+    /// The frame gate holds the clocks: a motion that was just activated
+    /// records the delta and advances nothing. The layer update that follows
+    /// the tick releases the gate.
     pub(crate) fn frame_progress(&mut self, frames: f64) {
         if !self.speed {
             return;
         }
         self.frame_last_time = frames;
         if self.queuing {
-            self.present_pose();
+            self.prune_playing_timelines();
+            self.sync_active = self.sync_waiting && self.allplaying;
             return;
         }
+        self.frame_loop_time += frames;
+        self.loop_time += frames;
         self.frame_tick_count += frames;
+        self.coord.x.step(frames as f32);
+        self.coord.y.step(frames as f32);
+        self.scale.step(frames as f32);
+        self.rotate.step(frames as f32);
+        if self.wind.active {
+            self.wind.phase += frames;
+        }
         self.advance_timelines(frames);
-        self.update_layers();
+        self.step_animators(frames as f32);
     }
 
     fn advance_timelines(&mut self, frames: f64) {
@@ -810,9 +828,9 @@ impl PlayerInst {
     /// The clock of the node at `index`, in its own clip's time space.
     ///
     /// A node of the selected clip runs on that clip's clock. A layer a child
-    /// motion expanded runs on the child clip's clock: the owner's clock
-    /// measured from the keyframe that named the clip, plus that keyframe's
-    /// `motion.timeOffset`, bounded by the child clip's own length.
+    /// motion expanded runs on the child clip's clock: the owner's frame loop
+    /// clock measured from the keyframe that named the clip, plus that
+    /// keyframe's `motion.timeOffset`, bounded by the child clip's own length.
     fn node_clock(&self, index: usize, time: f64, clocks: &[f64]) -> f64 {
         let node = &self.nodes[index];
         let Some(owner) = node.child_owner else {
@@ -821,7 +839,14 @@ impl PlayerInst {
         // The child's offset carries the keyframe that named the clip and that
         // keyframe's motion time offset.
         let start = node.time_offset - self.nodes[owner].time_offset;
-        let local = (clocks[owner] - start).max(0.0);
+        // A root-level owner runs on the player's frame loop clock; a nested
+        // owner runs on the clock its own parent gave it.
+        let base = if self.nodes[owner].child_owner.is_none() {
+            self.frame_loop_time
+        } else {
+            clocks[owner]
+        };
+        let local = (base - start).max(0.0);
         let Some(clip) = node
             .child_clip
             .as_deref()
@@ -1192,15 +1217,16 @@ impl PlayerInst {
         // node state is rebuilt.
         if let Some(clip) = self.select_active_clip(&snapshot) {
             self.loop_time = clip.loop_time;
-            self.frame_last_time = clip.total_frames;
             self.nodes = build_node_tree_at(&snapshot, Some(clip), self.eval_time());
             self.layers_dirty = true;
             self.ensure_root_offsets();
         }
-        // A play that does not chain re-arms the frame gate, so the first
-        // progress after it presents the new pose without advancing.
+        // A play that does not chain re-arms the frame gate and rewinds the
+        // frame loop clock, so the first progress after it presents the new
+        // pose without advancing.
         if (flags & 2) == 0 {
             self.queuing = true;
+            self.frame_loop_time = 0.0;
         }
         self.prune_playing_timelines();
         Ok(started)
@@ -3251,6 +3277,18 @@ extern "C" fn player_create(_engine: *mut std::ffi::c_void) -> *mut std::ffi::c_
     Box::into_raw(Box::new(PlayerInst::default())) as *mut std::ffi::c_void
 }
 
+/// The payload of an emote class.
+///
+/// The emote classes advance their clocks on every tick and do not hold the
+/// frame gate.
+extern "C" fn player_create_emote(_engine: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
+    let player = PlayerInst {
+        emote: true,
+        ..PlayerInst::default()
+    };
+    Box::into_raw(Box::new(player)) as *mut std::ffi::c_void
+}
+
 extern "C" fn player_destroy(_engine: *mut std::ffi::c_void, instance: *mut std::ffi::c_void) {
     if instance.is_null() {
         return;
@@ -3916,7 +3954,11 @@ pub(crate) fn register_named(
 
     ctx.register_instance(&NativeInstanceBuilder {
         name: class_name,
-        create: player_create,
+        create: if emote {
+            player_create_emote
+        } else {
+            player_create
+        },
         destroy: player_destroy,
         invalidate: None,
         methods,
@@ -4132,6 +4174,106 @@ mod tests {
         assert_eq!(player.timelines["intro"].current_time, advanced);
     }
 
+    /// The gated tick records the delta and advances no clock; the layer
+    /// update that follows it releases the gate, so the next tick advances
+    /// the frame loop and the loop clock
+    /// (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:819-826`,
+    /// `:828-829`, `:958-983`, `PlayerUpdateLayers.cpp:160-161`).
+    #[test]
+    fn the_gate_releases_on_the_first_tick_and_the_clocks_advance_afterwards() {
+        let snapshot = snapshot();
+        let _lock = crate::native_util::test_vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let ctx = context(&engine, &mut services);
+        let mut player = player(&snapshot);
+        player.play("intro", 0, &ctx).expect("start intro");
+        assert!(player.queuing, "a fresh play holds the gate");
+        let loop_time = player.loop_time;
+        player.progress(1.0, &ctx, tjs::Tjs2ValueId::null());
+        assert!(!player.queuing, "the layer update releases the gate");
+        assert_eq!(
+            player.frame_loop_time, 0.0,
+            "the gated tick advances no clock"
+        );
+        assert_eq!(
+            player.loop_time, loop_time,
+            "the gated tick advances no clock"
+        );
+        assert!(
+            (player.frame_last_time - 0.06).abs() < 1e-9,
+            "the gated tick records the delta"
+        );
+        player.progress(0.0, &ctx, tjs::Tjs2ValueId::null());
+        assert_eq!(
+            player.frame_loop_time, 0.0,
+            "a zero delta advances no clock"
+        );
+        player.progress(1000.0 / 60.0, &ctx, tjs::Tjs2ValueId::null());
+        assert!(
+            (player.frame_loop_time - 1.0).abs() < 1e-9,
+            "one frame advances the frame loop clock"
+        );
+        assert!(
+            (player.loop_time - (loop_time + 1.0)).abs() < 1e-9,
+            "one frame advances the loop clock"
+        );
+        assert!(
+            (player.frame_last_time - 1.0).abs() < 1e-9,
+            "the last delta is the frame count"
+        );
+    }
+
+    /// A play that does not chain rewinds the frame loop clock and leaves the
+    /// last delta alone
+    /// (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:637-641`,
+    /// `PlayerFrameProgress.cpp:815`).
+    #[test]
+    fn a_play_rewinds_the_frame_loop_clock_and_leaves_the_last_delta() {
+        let snapshot = snapshot();
+        let _lock = crate::native_util::test_vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let ctx = context(&engine, &mut services);
+        let mut player = player(&snapshot);
+        player.progress(1000.0, &ctx, tjs::Tjs2ValueId::null());
+        assert!(player.frame_loop_time > 0.0, "the tick advanced the clock");
+        let last = player.frame_last_time;
+        player.play("intro", 0, &ctx).expect("replay intro");
+        assert_eq!(player.frame_loop_time, 0.0, "the play rewinds the clock");
+        assert_eq!(
+            player.frame_last_time, last,
+            "the play keeps the last delta"
+        );
+        assert!(player.queuing, "the play re-arms the gate");
+    }
+
+    /// The emote classes advance their clocks on every tick and do not hold
+    /// the frame gate
+    /// (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:917-957`).
+    #[test]
+    fn the_emote_player_advances_its_clocks_through_the_gate() {
+        let snapshot = snapshot();
+        let _lock = crate::native_util::test_vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let ctx = context(&engine, &mut services);
+        let mut player = player(&snapshot);
+        player.emote = true;
+        player.play("intro", 0, &ctx).expect("start intro");
+        assert!(player.queuing, "a fresh play holds the gate");
+        player.progress(1000.0 / 60.0, &ctx, tjs::Tjs2ValueId::null());
+        assert!(
+            (player.frame_loop_time - 1.0).abs() < 1e-9,
+            "the emote clock advances through the gate"
+        );
+        assert!(
+            (player.frame_last_time - 1.0).abs() < 1e-9,
+            "the emote path records the delta"
+        );
+        assert!(!player.queuing, "the layer update releases the gate");
+    }
+
     #[test]
     fn replaying_a_clip_resets_its_evaluation_time() {
         let snapshot = snapshot();
@@ -4251,22 +4393,14 @@ mod tests {
         assert_eq!(player.nodes.len(), 3, "the child clip is expanded");
         // The child exists from the player's start: its clock is zero before
         // the keyframe that named it, so it draws its first pose right away.
-        player
-            .timelines
-            .get_mut("parent")
-            .expect("the timeline")
-            .current_time = 0.0;
+        set_timeline_time(&mut player, "parent", 0.0);
         player.update_layers();
         assert!(
             player.nodes[2].draw_flag,
             "the child draws from the player's start"
         );
         // From the keyframe on it keeps drawing.
-        player
-            .timelines
-            .get_mut("parent")
-            .expect("the timeline")
-            .current_time = 40.0;
+        set_timeline_time(&mut player, "parent", 40.0);
         player.update_layers();
         assert!(
             player.nodes[2].draw_flag,
@@ -4357,11 +4491,7 @@ mod tests {
         player.nodes = build_node_tree(&snapshot, snapshot.clip("parent"));
         assert_eq!(player.nodes.len(), 3, "the child clip is expanded");
         // The child's clock starts at the keyframe that named the clip.
-        player
-            .timelines
-            .get_mut("parent")
-            .expect("the timeline")
-            .current_time = 40.0;
+        set_timeline_time(&mut player, "parent", 40.0);
         player.update_layers();
         assert_eq!(
             player.nodes[2].local.x, 10.0,
@@ -4369,15 +4499,84 @@ mod tests {
         );
         // Past the child clip's end the clock stops there, so the child keeps
         // the pose its own length allows.
-        player
-            .timelines
-            .get_mut("parent")
-            .expect("the timeline")
-            .current_time = 100.0;
+        set_timeline_time(&mut player, "parent", 100.0);
         player.update_layers();
         assert_eq!(
             player.nodes[2].local.x, 10.0,
             "the child stops at the end of its own clip"
+        );
+    }
+
+    /// The child's clock is the player's frame loop clock measured from the
+    /// keyframe that named the clip, not the timeline's own time
+    /// (`reference/cpp/plugins/motionplayer/PlayerUpdateChildMotion.cpp:171-213`).
+    #[test]
+    fn a_child_motion_runs_on_the_frame_loop_clock() {
+        let parent_layer = dict(vec![
+            ("label", text("main")),
+            ("type", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![dict(vec![
+                    ("time", num(40)),
+                    ("type", num(2)),
+                    ("content", dict(vec![("src", text("motion/test/child"))])),
+                ])]),
+            ),
+        ]);
+        let child_layer = dict(vec![
+            ("label", text("child_layer")),
+            ("type", num(0)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    frame(0, 2, Some(content(10, 0))),
+                    frame(20, 2, Some(content(30, 0))),
+                    dict(vec![("time", num(60)), ("type", num(0))]),
+                ]),
+            ),
+        ]);
+        let parent_clip = dict(vec![
+            ("lastTime", num(120)),
+            ("layer", PsbValue::List(vec![parent_layer])),
+        ]);
+        let child_clip = dict(vec![
+            ("lastTime", num(60)),
+            ("layer", PsbValue::List(vec![child_layer])),
+        ]);
+        let object = dict(vec![(
+            "test",
+            dict(vec![(
+                "motion",
+                dict(vec![("parent", parent_clip), ("child", child_clip)]),
+            )]),
+        )]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root: dict(vec![("object", object)]),
+                resources: Vec::new(),
+            },
+            "child.psb",
+        );
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "parent".to_string(),
+            ..PlayerInst::default()
+        };
+        prime_timelines(&snapshot, &mut player.timelines);
+        player.nodes = build_node_tree(&snapshot, snapshot.clip("parent"));
+        // The timeline stands still while the frame loop clock runs on, so
+        // the child is 60 - 40 = 20 frames into its own clip.
+        player
+            .timelines
+            .get_mut("parent")
+            .expect("the timeline")
+            .current_time = 0.0;
+        player.frame_loop_time = 60.0;
+        player.update_layers();
+        assert_eq!(
+            player.nodes[2].local.x, 30.0,
+            "the child follows the frame loop clock"
         );
     }
 
@@ -4462,11 +4661,7 @@ mod tests {
         // A parent clock of 100 puts the child 60 frames past its keyframe;
         // the child clip wraps that into its own length and lands on its
         // first keyframe instead of its last one.
-        player
-            .timelines
-            .get_mut("parent")
-            .expect("the timeline")
-            .current_time = 100.0;
+        set_timeline_time(&mut player, "parent", 100.0);
         player.update_layers();
         assert_eq!(
             player.nodes[2].local.x, 10.0,
@@ -4559,11 +4754,7 @@ mod tests {
         assert_eq!(player.nodes.len(), 3, "the child clip is expanded");
         // The parent's start is before the keyframe that named the child, and
         // the child's clock is zero there.
-        player
-            .timelines
-            .get_mut("parent")
-            .expect("the timeline")
-            .current_time = 0.0;
+        set_timeline_time(&mut player, "parent", 0.0);
         player.update_layers();
         assert!(
             player.nodes[2].draw_flag,
@@ -4575,11 +4766,7 @@ mod tests {
         );
         // Past the child clip's end the clock stops there, so the child keeps
         // the pose its own length allows.
-        player
-            .timelines
-            .get_mut("parent")
-            .expect("the timeline")
-            .current_time = 100.0;
+        set_timeline_time(&mut player, "parent", 100.0);
         player.update_layers();
         assert_eq!(
             player.nodes[2].local.x, 10.0,
@@ -5635,12 +5822,15 @@ mod tests {
         )
     }
 
+    /// Move a timeline to `time` and the player's frame loop clock with
+    /// it, the way a tick that advances both does.
     fn set_timeline_time(player: &mut PlayerInst, label: &str, time: f64) {
         player
             .timelines
             .get_mut(label)
             .expect("the timeline is primed")
             .current_time = time;
+        player.frame_loop_time = time;
     }
 
     #[test]

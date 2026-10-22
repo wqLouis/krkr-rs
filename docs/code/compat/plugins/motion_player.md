@@ -527,11 +527,12 @@ layer's image through the engine's layer system:
   ancestor's patch, and draws one affine cell per grid quad. `LayerGetter.vtx`
   reports the four deformed grid corners, and a child of a mesh node is warped
   through the parent's patch.
-* each **type-3 node** owns a child clip instance. Its clock comes from the
-  keyframe that is active now (`clipStartTime` and `motion.timeOffset`), so a
-  later keyframe that names the same clip restarts it and a keyframe that
-  names a different clip rebuilds the instance. The instance is placed at its
-  motion layer's origin corner
+* each **type-3 node** owns a child clip instance. Its clock is the player's
+  frame loop clock measured from the keyframe that is active now
+  (`clipStartTime` and `motion.timeOffset`), so a later keyframe that names
+  the same clip restarts it and a keyframe that names a different clip
+  rebuilds the instance. The instance is placed at its motion layer's origin
+  corner
   (`reference/cpp/plugins/motionplayer/PlayerUpdateChildMotion.cpp:106-215`).
 * any item with a viewport (a type-7 shape ancestor) is clipped to its paint
   box intersected with that viewport; a trimmed item is rendered into a
@@ -558,9 +559,17 @@ layer leaves nothing to draw into and the call returns void without raising
   the accepted window is **dropped**, not clamped, so one bad tick cannot skip
   the animation ahead (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:1002-1004`).
 * A motion that was just activated sits behind the **frame gate**: the tick
-  that follows it only presents the first pose, and the layer update that runs
-  with it releases the gate
-  (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:819-826`).
+  that follows it records the delta and advances no clock, and the layer
+  update that runs with it releases the gate
+  (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:819-826`,
+  `PlayerUpdateLayers.cpp:160-161`).
+* The tick advances `frameLoopTime` and `loopTime` by the frame count, and
+  `frameLastTime` holds the last delta
+  (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:815`,
+  `:828-829`).
+* The emote classes do not hold the gate: their tick advances the frame loop
+  and the loop clock on every tick
+  (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:917-957`).
 * `Player.progress(dt)` returns the playback ratio; the emote classes discard
   it (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:1281-1305`).
 * The timelines, the variables and the transition animators are stepped
@@ -570,9 +579,12 @@ layer leaves nothing to draw into and the call returns void without raising
   values. `Motion.PlayFlagForce` re-runs the load for the same key,
   `Motion.PlayFlagStealth` stores the motion without activating it while no
   project is bound, and a same-key request without force or as-can is ignored
-  (`reference/cpp/plugins/motionplayer/PlayerMotionLoad.cpp:20-40`).
-* `speed = false` freezes every clock: `progress` records the delta and
-  advances nothing.
+  (`reference/cpp/plugins/motionplayer/PlayerMotionLoad.cpp:20-40`). A play
+  that does not chain rewinds the frame loop clock and re-arms the frame gate
+  (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:637-641`).
+* `speed = false` freezes every clock: the plain player's tick advances
+  nothing and records no delta, the emote tick records the delta and advances
+  nothing.
 
 ### Motion lookup
 
@@ -678,9 +690,9 @@ A draw target that names no layer, a `Point` or `Quad` hit test and a
 
 | file | what it pins |
 |---|---|
-| `crates/compat/tests/motion_player.rs` | the namespace constants and the subclass placement (top-level versus `Motion.*`), the geometry hit-test classes, the `LayerGetter` defaults and its array identity, the resource manager's layer-id allocator and the decrypt seed, the `D3DEmoteModule` class statics, the player's property surface, the variable and timeline queries, the arity gates, the `onFindMotion` override, the emote shell, the PSB module load and unload, the `motionKey` candidate list, the `ShortCutInitial*` globals, the `SeparateLayerAdaptor` owner, the layer getter, the colour-weight channel order, the progress gate and the dropped delta, and the draw path (texture sampling, the draw affine, the node colour tint, the uncleared target, the untouched target geometry, the reused allocation, the `psb://` media registration) |
+| `crates/compat/tests/motion_player.rs` | the namespace constants and the subclass placement (top-level versus `Motion.*`), the geometry hit-test classes, the `LayerGetter` defaults and its array identity, the resource manager's layer-id allocator and the decrypt seed, the `D3DEmoteModule` class statics, the player's property surface, the variable and timeline queries, the arity gates, the `onFindMotion` override, the emote shell, the PSB module load and unload, the `motionKey` candidate list, the `ShortCutInitial*` globals, the `SeparateLayerAdaptor` owner, the layer getter, the colour-weight channel order, the progress gate and the dropped delta, the emote classes' ungated clocks, the play that rewinds the frame loop clock, and the draw path (texture sampling, the draw affine, the node colour tint, the uncleared target, the untouched target geometry, the reused allocation, the `psb://` media registration) |
 | `crates/compat/tests/emote_player.rs` | the loader shim defines no globals of its own and the `motionplayer.dll` classes are reachable through it |
-| `crates/compat/src/natives/plugins/motion_player/player.rs` unit tests | the replay of a short clip after a long one, the queuing gate and the dropped delta, the reset of the evaluation time on replay, the nearest-texel sampling of a scaled placement, the child motion's start at its parent keyframe, the action and sync dispatch, the packed colour order, the shape hit test, the logo's held corner and transition, the inherited parent matrix, the node matrix order, the draw affine, the shared label and the layer getter list, and the node blend mode |
+| `crates/compat/src/natives/plugins/motion_player/player.rs` unit tests | the replay of a short clip after a long one, the queuing gate and the dropped delta, the clocks that advance after the gate, the play that rewinds the frame loop clock, the emote classes' ungated clocks, the reset of the evaluation time on replay, the nearest-texel sampling of a scaled placement, the child motion's start at its parent keyframe, the child motion's frame loop clock, the action and sync dispatch, the packed colour order, the shape hit test, the logo's held corner and transition, the inherited parent matrix, the node matrix order, the draw affine, the shared label and the layer getter list, and the node blend mode |
 | `crates/compat/tests/plugin.rs` | that `Plugins.link("motionplayer.dll")` resolves to the built-in table |
 
 ## Known gaps
@@ -730,3 +742,11 @@ A draw target that names no layer, a `Point` or `Quad` hit test and a
   engine's own generator rather than the reference's `Math.RandomGenerator`
   instance; the observable contract — a fresh real in `[0, 1)` per call — is
   the same (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:1318-1332`).
+* The emote tick advances the clocks the way the reference's emote path does
+  (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:917-957`), but
+  the reference evaluates an emote motion's layer tree at the fixed time zero
+  and lets the variables carry the motion, while the port evaluates the tree
+  at the clip's own time.
+* A nested child motion takes its clock from the clock its own parent gave
+  it, where the reference gives every child the parent's frame loop clock
+  (`reference/cpp/plugins/motionplayer/PlayerUpdateChildMotion.cpp:171-213`).
