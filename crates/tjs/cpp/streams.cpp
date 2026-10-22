@@ -39,7 +39,10 @@
 //
 // Paths: storage names (including `archive.xp3>member`) resolve through the
 // read callback the compat host installs; the local filesystem serves
-// absolute paths and the save files the write factories create.
+// absolute paths and the save files the write factories create. A write
+// factory creates the missing parent folders of the file it is about to
+// create, the way the reference's local file stream does
+// (`reference/cpp/core/base/impl/StorageImpl.cpp:618-641`).
 
 #include "tjs2_abi.h"
 
@@ -1156,6 +1159,34 @@ static TJS::iTJSTextReadStream *create_text_read(const ttstr &name,
     return new TextReadStream(std::move(raw), (uint64_t)mode_offset(m), name);
 }
 
+// Creates the missing parent folders of `path`.
+//
+// The reference creates the folder tree when it opens a local file for
+// write: `tTVPLocalFileStream` checks the parent directory of the target
+// and calls `TVPCreateFolders` (mkdir -p) before the file is created, and
+// raises `TVPCannotOpenStorage` when that fails
+// (`reference/cpp/core/base/impl/StorageImpl.cpp:618-641`). Without it a
+// write into a directory that does not exist yet fails with "No such file
+// or directory", which is what makes a game's save fail when its data
+// directory is missing.
+//
+// Returns false and fills `error` with the reason when the folders cannot
+// be created; the caller then raises the reference's open error.
+static bool create_parent_folders(const std::string &path, std::string &error) {
+    fs::path parent = fs::path(path).parent_path();
+    if(parent.empty())
+        return true;
+    std::error_code ec;
+    if(fs::is_directory(parent, ec))
+        return true;
+    fs::create_directories(parent, ec);
+    if(ec) {
+        error = ec.message();
+        return false;
+    }
+    return true;
+}
+
 static TJS::iTJSTextWriteStream *create_text_write(const ttstr &name,
                                                    const ttstr &mode) {
     // `_TVPCreateStream` normalizes a write name and refuses it when the
@@ -1171,8 +1202,19 @@ static TJS::iTJSTextWriteStream *create_text_write(const ttstr &name,
     std::string m = mode.AsNarrowStdString();
     std::string host = resolve_path(name);
     bool existed = std::filesystem::exists(host);
+    FileAccess access = text_write_access(m);
+    // The reference creates the parent folders of a file it is about to
+    // create (`tTVPLocalFileStream`,
+    // `reference/cpp/core/base/impl/StorageImpl.cpp:618-641`).
+    std::string folder_error;
+    if(access == FileAccess::Write && !existed &&
+       !create_parent_folders(host, folder_error)) {
+        log_stream_open("text-write", name, m, access, "filesystem", host,
+                        existed, false, folder_error);
+        throw_cannot_open(name);
+    }
     auto *s = new TextWriteStream(host, m);
-    log_stream_open("text-write", name, m, text_write_access(m), "filesystem",
+    log_stream_open("text-write", name, m, access, "filesystem",
                     host, existed, s->ok(), s->error());
     if(!s->ok()) {
         delete s;
@@ -1212,6 +1254,16 @@ static TJS::tTJSBinaryStream *create_bin_write(const ttstr &name,
     std::string host = resolve_path(name);
     bool existed = std::filesystem::exists(host);
     FileAccess access = binary_write_access(m);
+    // The reference creates the parent folders of a file it is about to
+    // create (`tTVPLocalFileStream`,
+    // `reference/cpp/core/base/impl/StorageImpl.cpp:618-641`).
+    std::string folder_error;
+    if(access == FileAccess::Write && !existed &&
+       !create_parent_folders(host, folder_error)) {
+        log_stream_open("binary-write", name, m, access, "filesystem", host,
+                        existed, false, folder_error);
+        throw_cannot_open(name);
+    }
     std::unique_ptr<FileBinaryStream> s(new FileBinaryStream(host, access));
     log_stream_open("binary-write", name, m, access, "filesystem", host,
                     existed, s->ok(), s->error());

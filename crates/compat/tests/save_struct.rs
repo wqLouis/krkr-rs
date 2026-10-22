@@ -228,6 +228,25 @@ fn array_save_struct2_resolves_relative_names_against_the_game_dir() {
     assert_eq!(env.read_struct("rel_struct.txt"), "[\"rel\"]");
 }
 
+// The reference writes the struct form through `TVPCreateStream`, whose
+// local file stream creates the missing parent folders of the target before
+// the file is created (`tTVPLocalFileStream`,
+// `reference/cpp/core/base/impl/StorageImpl.cpp:618-641`); a save into a
+// directory that does not exist yet lands there instead of failing.
+#[test]
+fn array_save_struct2_creates_a_new_subdirectory() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    env.run("var a = [\"x\", 7]; a.saveStruct2(\"savedata/sub/struct.txt\");");
+
+    assert_eq!(
+        env.read_struct("savedata/sub/struct.txt"),
+        "[\"x\",int 7]",
+        "the save must land in the new subdirectory"
+    );
+}
+
 // `save2` reads every element with `tTJSVariant::GetString()`, which raises
 // the variant-convert error for non-strings (`reference/cpp/plugins/saveStruct.cpp:256`,
 // `reference/cpp/core/tjs2/tjsVariant.h:794-798`), so a non-string element

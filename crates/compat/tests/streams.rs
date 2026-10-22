@@ -403,26 +403,85 @@ fn binary_stream_offset_past_the_end_raises() {
     assert!(error.contains("Seek error"), "{error}");
 }
 
+// The reference creates the missing parent folders of a file it is about to
+// create: `tTVPLocalFileStream` checks the target's parent directory and
+// calls `TVPCreateFolders` (mkdir -p) before the file is created
+// (`reference/cpp/core/base/impl/StorageImpl.cpp:618-641`). A write into a
+// directory that does not exist yet therefore lands in the game directory
+// instead of failing with "No such file or directory" — the failure that
+// made a game's save report a failure while writing no file.
+#[test]
+fn a_write_into_a_new_subdirectory_creates_it() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    env.run("var a = ['hello', 'world']; a.save('savedata/sub/out.txt');");
+
+    let written = env.dir.path().join("savedata/sub/out.txt");
+    assert!(
+        written.is_file(),
+        "the write must create the parent directories"
+    );
+    // The payload round-trips through the same stream factories.
+    env.run("var b = []; b.load('savedata/sub/out.txt');");
+    assert_eq!(env.string("b[0] + '|' + b[1]"), "hello|world");
+}
+
+// The built-in `Array.saveStruct` writes through the same text write factory
+// (`reference/cpp/core/tjs2/tjsArray.cpp:440-489`), so it creates the parent
+// folders of a target that does not exist yet as well
+// (`reference/cpp/core/base/impl/StorageImpl.cpp:618-641`). This is the
+// path a game's save data takes.
+#[test]
+fn save_struct_into_a_new_subdirectory_creates_it() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    env.run("var a = ['x', 7]; a.saveStruct('savedata/sub/struct.txt');");
+
+    let written = env.dir.path().join("savedata/sub/struct.txt");
+    assert!(
+        written.is_file(),
+        "the save must create the parent directories"
+    );
+    // The binary struct form is written and read through the binary stream
+    // factories, which create the parent folders the same way.
+    env.run("var c = ['x', 7]; c.saveStruct('savedata/sub/struct.bin', 'b');");
+    let binary = env.dir.path().join("savedata/sub/struct.bin");
+    assert!(
+        binary.is_file(),
+        "the binary save must create the parent directories"
+    );
+    env.run("var d = []; d.loadStruct('savedata/sub/struct.bin');");
+    assert_eq!(env.string("d[0]"), "x");
+    assert_eq!(env.int("d[1]"), 7);
+}
+
 // A write target that cannot be opened raises the storage open error instead
-// of producing a closed stream that silently drops the payload.
+// of producing a closed stream that silently drops the payload. The
+// reference creates the missing parent folders of a file it is about to
+// create (`tTVPLocalFileStream`,
+// `reference/cpp/core/base/impl/StorageImpl.cpp:618-641`), so the failure is
+// reached through a parent that is a regular file, where the folder tree
+// cannot be created.
 #[test]
 fn write_open_failure_raises() {
     let _lock = vm_lock();
     let env = Env::new();
+    std::fs::write(env.dir.path().join("blocker"), b"not a directory")
+        .expect("write the blocking file");
+
     for (script, label) in [
+        ("var a = ['x']; a.save('blocker/out.txt');", "text write"),
         (
-            "var a = ['x']; a.save('missing-dir/out.txt');",
-            "text write",
-        ),
-        (
-            "var a = ['x']; a.saveStruct('missing-dir/out.bin', 'b');",
+            "var a = ['x']; a.saveStruct('blocker/out.bin', 'b');",
             "binary write",
         ),
     ] {
         let error = env
             .engine
             .exec_script(script, "streams-test")
-            .expect_err(&format!("{label} to a missing directory must raise"));
+            .expect_err(&format!("{label} below a regular file must raise"));
         assert!(
             error.to_string().contains("Cannot open storage"),
             "{label}: {error}"
