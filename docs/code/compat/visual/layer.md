@@ -69,6 +69,7 @@ does not exist**, by design.
 | `copyToBitmapFromMainImage(bitmap)` | replaces the bitmap's content with the layer's main image. The main image is resolved first, and an image whose pixel buffer is not the bytes its size declares raises. |
 | `independMainImage()` | gives the layer a private main image. The image is resolved first, and an image whose pixel buffer is not the bytes its size declares raises. |
 | `independProvinceImage([copy])` | allocates the 8-bit province plane; the default keeps the existing content, `copy = false` clears it. |
+| `loadImages(name[, key])` | loads the image and installs it as the layer's main image. The **rect is not resized to the image**: the image-size adjustment only *shrinks* a rect the image is smaller than, so a rect smaller than the loaded image keeps its own extent and only `imageWidth`/`imageHeight` follow the image. The image offsets and the clip follow the loaded image, and the metainfo is `null` (the codec reports none). The load may be deferred to the decode pool — see below. |
 | `mainImageBuffer`, `mainImageBufferForWrite` | read-only. The address is `0` when the main image is absent **and** when the main image declares more pixels than its pixel buffer holds. Both wait for a pending decode first; the `ForWrite` variant marks the image modified, and an image with no address is not marked. |
 | `mainImageBufferPitch`, `provinceImageBuffer`, `provinceImageBufferForWrite`, `provinceImageBufferPitch` | read-only. The address is `0` when the buffer is absent. The `ForWrite` variant allocates the province plane. |
 | `imageModified` | set by the operations that write pixels. |
@@ -81,8 +82,10 @@ calling thread — and the pixels still decoding:
 
 * the layer's main image is a **pending** bitmap: the probed size and no
   pixels;
-* the image-size adjustment runs on the probed size, so the layer rect, the
-  image offsets and the clip already carry the loaded image's geometry;
+* the image-size adjustment runs on the probed size: a rect the image is
+  smaller than shrinks to the image, a rect the image is larger than keeps
+  its own extent, and the image offsets and the clip follow the loaded
+  image;
 * every read of the main image's pixels waits for the decode, and the frame's
   image barrier waits for all of them;
 * the `mainImageBuffer` and `mainImageBufferForWrite` addresses wait for it

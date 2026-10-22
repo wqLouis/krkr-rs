@@ -289,6 +289,65 @@ fn a_load_without_a_pool_decodes_synchronously() {
     );
 }
 
+/// A layer whose rectangle is smaller than the image it loads keeps its
+/// rectangle: the load only changes the image size.
+///
+/// The reference's `LoadImages` ends in `InternalSetImageSize`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:2823-2854`), which shrinks the
+/// layer rect only when the image is smaller than the rect
+/// (`reference/cpp/core/visual/LayerIntf.cpp:2623-2642`); an image larger
+/// than the rect leaves the rect alone and only the image size changes.
+#[test]
+fn loading_an_image_larger_than_the_rect_keeps_the_rect() {
+    let _lock = common::vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.setSize(1, 1); \
+         l.loadImages('picture.png');",
+    );
+    assert_eq!(env.eval_int("l.width"), 1, "the rect width is unchanged");
+    assert_eq!(env.eval_int("l.height"), 1, "the rect height is unchanged");
+    assert_eq!(
+        env.eval_int("l.imageWidth"),
+        image().width as i64,
+        "the image width is the loaded image's"
+    );
+    assert_eq!(
+        env.eval_int("l.imageHeight"),
+        image().height as i64,
+        "the image height is the loaded image's"
+    );
+}
+
+/// The same rule holds for the deferred load: the image-size adjustment runs
+/// on the probed size, so the rect of a layer smaller than the image stays
+/// the layer's own.
+#[test]
+fn a_deferred_load_of_an_image_larger_than_the_rect_keeps_the_rect() {
+    let _lock = common::vm_lock();
+    let env = Env::with_pool(config());
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.setSize(1, 1); \
+         l.loadImages('picture.png');",
+    );
+    assert_eq!(env.eval_int("l.width"), 1, "the rect width is unchanged");
+    assert_eq!(env.eval_int("l.height"), 1, "the rect height is unchanged");
+    assert_eq!(
+        env.eval_int("l.imageWidth"),
+        image().width as i64,
+        "the image width is the loaded image's"
+    );
+    assert_eq!(
+        env.eval_int("l.imageHeight"),
+        image().height as i64,
+        "the image height is the loaded image's"
+    );
+}
+
 /// With a pool the load returns before the decode finishes, and the first
 /// pixel read waits for it.
 #[test]
