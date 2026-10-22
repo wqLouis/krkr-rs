@@ -1037,6 +1037,54 @@ fn with_children_reuses_the_subtree_content_between_frames() {
     assert_eq!(scene_pixel(&env, display, 0, 0), blend_rgb(RED, BLUE, 127));
 }
 
+/// The composited-frame host records a new frame every tick, but the frame's
+/// sources are the endpoint subtrees: their content is unchanged, so it is
+/// reused rather than recomposited. `Complete` returns the existing
+/// `CacheBitmap` while `CacheRecalcRegion` is empty
+/// (`LayerIntf.cpp:7734-7737`), and a frame change is not a source change
+/// (`LayerIntf.cpp:6305-6335`).
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7734-7737
+/// reference/cpp/core/visual/LayerIntf.cpp:6305-6335
+#[test]
+fn a_composited_whole_subtree_transition_reuses_its_content() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    env._scene.composite_transition_frames = true;
+    two_layers_with_children(&env);
+    env.advance(25.0);
+    let dest_content = named_layer(&env, "dest")
+        .cache_content
+        .expect("destination content");
+    let src_content = named_layer(&env, "src")
+        .cache_content
+        .expect("source content");
+    env._scene.set_bitmap_clean(dest_content);
+    env._scene.set_bitmap_clean(src_content);
+    env.advance(25.0);
+    assert!(
+        named_layer(&env, "dest").transition_frame.is_some(),
+        "the composited frame advances"
+    );
+    assert!(
+        !env._scene.bitmap(dest_content).unwrap().dirty,
+        "the destination subtree content is reused, not recomposited"
+    );
+    assert!(
+        !env._scene.bitmap(src_content).unwrap().dirty,
+        "the source subtree content is reused, not recomposited"
+    );
+
+    // The teardown returns the layer to its own subtree; a cache kept from
+    // before or during the transition is stale and must be recomposited
+    // (LayerIntf.cpp:7961-7991).
+    env.run("b.stopTransition();");
+    assert!(
+        named_layer(&env, "dest").cache_recalc,
+        "the ended transition resumes from a fresh composite"
+    );
+}
+
 /// A mid-transition change to a drawn child invalidates the cached content:
 /// the next frame recomposites it before blending.
 ///

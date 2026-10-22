@@ -1316,8 +1316,21 @@ impl Scene {
     /// caching ancestor's as stale because this layer changed. A malformed
     /// parent cycle terminates after the pool of layers is exhausted.
     fn invalidate_layer_cache(&mut self, id: u32) {
+        if let Some(layer) = self.layer_mut_untracked(id) {
+            layer.cache_recalc = true;
+        }
+        self.invalidate_ancestor_caches(id);
+    }
+
+    /// Mark every caching ancestor of `id` for recomposite, leaving `id`'s
+    /// own subtree cache alone. A transition advances its own frame every
+    /// tick, but its *sources* (the endpoint subtrees) are unchanged: the
+    /// layer's composited content stays valid even though an ancestor's cache
+    /// has to see the new frame. A malformed parent cycle terminates after the
+    /// pool of layers is exhausted.
+    fn invalidate_ancestor_caches(&mut self, id: u32) {
         let limit = self.layers.len().saturating_add(1);
-        let mut current = Some(id);
+        let mut current = self.layer(id).and_then(|layer| layer.parent);
         let mut steps = 0usize;
         while let Some(c) = current {
             if steps > limit {
@@ -3430,9 +3443,11 @@ impl Scene {
 
     /// Set (or clear) the frame a running transition draws on `id`.
     ///
-    /// A changed frame marks the layer's cache and every caching ancestor's
-    /// stale and bumps [`Scene::structure_revision`], so the projection redraws
-    /// the two source images the frame advances to. A source the outgoing frame
+    /// A changed frame marks every caching ancestor's cache stale and bumps
+    /// [`Scene::structure_revision`], so the projection redraws the two source
+    /// images the frame advances to. The layer's own composited content is the
+    /// frame's source and does not change with the frame, so it stays reusable
+    /// instead of being recomposited every tick. A source the outgoing frame
     /// named and the new one does not is released once nothing else holds it;
     /// the transition's own sources keep their owners' references.
     pub fn set_transition_frame(&mut self, id: u32, frame: Option<TransitionFrame>) {
@@ -3446,7 +3461,14 @@ impl Scene {
             _ => false,
         };
         if changed {
-            self.invalidate_layer_cache(id);
+            if frame.is_none() {
+                // The layer returns to drawing its own subtree: a cache kept
+                // from before the transition (or the one its transition ran
+                // through) is stale now, so resume from a fresh composite.
+                self.invalidate_layer_cache(id);
+            } else {
+                self.invalidate_ancestor_caches(id);
+            }
             self.touch_structure();
             if let Some(replaced) = replaced {
                 let kept = frame.map(|frame| [frame.src1.bitmap, frame.src2.bitmap]);
@@ -3463,12 +3485,15 @@ impl Scene {
     /// Set (or clear) the custom-shader draw a running transition composites
     /// on `id`.
     ///
-    /// A changed draw marks the layer's cache and every caching ancestor's
-    /// stale and bumps [`Scene::structure_revision`], so the projection
-    /// redraws it. A source the outgoing draw named and the new one does not
-    /// is released once nothing else holds it; the transition's own sources
-    /// keep their owners' references.
+    /// A changed draw marks every caching ancestor's cache stale and bumps
+    /// [`Scene::structure_revision`], so the projection redraws it. The
+    /// layer's own composited content is one of the draw's sources and does
+    /// not change with the draw, so it stays reusable instead of being
+    /// recomposited every tick. A source the outgoing draw named and the new
+    /// one does not is released once nothing else holds it; the transition's
+    /// own sources keep their owners' references.
     pub fn set_effect(&mut self, id: u32, effect: Option<EffectDraw>) {
+        let cleared = effect.is_none();
         let kept: Vec<u32> = effect
             .as_ref()
             .map(|effect| effect.bitmaps().collect())
@@ -3488,7 +3513,14 @@ impl Scene {
             false
         };
         if changed {
-            self.invalidate_layer_cache(id);
+            if cleared {
+                // The layer returns to drawing its own subtree: a cache kept
+                // from before the transition (or the one its transition ran
+                // through) is stale now, so resume from a fresh composite.
+                self.invalidate_layer_cache(id);
+            } else {
+                self.invalidate_ancestor_caches(id);
+            }
             self.touch_structure();
             if let Some(replaced) = replaced {
                 for bitmap in replaced.bitmaps() {

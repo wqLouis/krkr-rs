@@ -230,6 +230,11 @@ hit. The caller decodes only on a miss.
 * **The transition self image stands in for the main image** in a cached
   subtree, the reference's `CopySelfForRect`
   (`reference/cpp/core/visual/LayerIntf.cpp:6781-6783`).
+* **A running transition frame or effect leaves the endpoint subtrees
+  reusable.** A frame update marks only the layer's caching **ancestors**
+  stale; the layer's own composited content is one of the frame's sources and
+  does not change. Clearing the frame invalidates the layer itself, because
+  it resumes drawing its own subtree.
 
 ---
 

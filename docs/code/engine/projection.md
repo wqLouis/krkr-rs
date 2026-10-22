@@ -130,6 +130,12 @@ across windows are globally ordered by insertion.
   once, the second source's node is the layer's `nearest` node for its
   children, and a whole-subtree frame covers the children exactly like a cache
   bitmap (they are reported, not emitted).
+* **A transition draw takes precedence over the cached subtree.** While a
+  layer owns a transition frame or effect draw, its own `cache_bitmap` is
+  not drawn: the frame/effect replaces the image the cache holds. A frame
+  that covers only the layer's own image leaves the children live and never
+  becomes a cached-subtree root; a whole-subtree frame holds them like a
+  cache does.
 * **A transition self image takes precedence over the cached subtree**: it
   covers only the layer's own image, so the children keep drawing live and
   the layer never becomes a cached-subtree root.

@@ -138,6 +138,54 @@ fn a_scene_without_a_pipeline_blends_on_the_cpu() {
     );
 }
 
+/// Advancing an effect draw changes only the blend weights, not the endpoint
+/// subtrees it samples: the layer's composited content stays reusable. When
+/// the draw is cleared the layer returns to its own subtree, so the cache it
+/// may have kept through the transition is stale and must be recomposited.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7734-7737
+/// reference/cpp/core/visual/LayerIntf.cpp:7961-7991
+#[test]
+fn advancing_an_effect_keeps_the_layer_content_reusable() {
+    let mut scene = Scene::default();
+    let window = scene.add_window("t", (4, 4));
+    let layer = scene.add_layer(window, None);
+    let pixels = 4 * 4 * 4;
+    let source = scene.add_bitmap(4, 4, vec![0u8; pixels]);
+    let other = scene.add_bitmap(4, 4, vec![0u8; pixels]);
+    {
+        let state = scene.layer_mut(layer).expect("layer");
+        state.rect = Rect::new(0, 0, 4, 4);
+        state.visible = true;
+        state.bitmap = Some(source);
+        state.cache_recalc = false;
+    }
+
+    let first = cross_fade(25.0)
+        .effect_draw(source, other, (4, 4), true)
+        .expect("first draw");
+    scene.set_effect(layer, Some(first));
+    assert!(
+        !scene.layer(layer).expect("layer").cache_recalc,
+        "a new frame does not recomposite the layer's unchanged content"
+    );
+
+    let second = cross_fade(50.0)
+        .effect_draw(source, other, (4, 4), true)
+        .expect("second draw");
+    scene.set_effect(layer, Some(second));
+    assert!(
+        !scene.layer(layer).expect("layer").cache_recalc,
+        "the next tick reuses the content too"
+    );
+
+    scene.set_effect(layer, None);
+    assert!(
+        scene.layer(layer).expect("layer").cache_recalc,
+        "clearing the draw resumes from a fresh composite"
+    );
+}
+
 /// The generic path writes no bitmap: the sources are read, the frame is
 /// drawn by the renderer, and the transition's display bitmap is never
 /// touched. That is what makes the path cheaper than the CPU blend, which

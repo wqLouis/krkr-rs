@@ -454,11 +454,15 @@ fn append_window<F>(
         // A layer whose cache has been rendered draws that cache instead of
         // its own image and descendants; a layer that merely enabled caching
         // but has no cache bitmap yet (its subtree is trivial) draws normally.
-        // A self image covers only the layer's own image and leaves the
-        // children live, so it takes precedence over the cached subtree.
-        let cached_bitmap = layer
-            .cache_bitmap
-            .filter(|_| layer.cache_enabled_count != 0 && layer.transition_self.is_none());
+        // Any running transition takes precedence over the cached subtree:
+        // its frame or effect replaces the image the cache holds, and a frame
+        // that covers only the layer's own image leaves the children live.
+        let cached_bitmap = layer.cache_bitmap.filter(|_| {
+            layer.cache_enabled_count != 0
+                && layer.transition_self.is_none()
+                && layer.transition_frame.is_none()
+                && layer.effect.is_none()
+        });
         // A running transition the host composites draws its two sources in
         // place of the layer's display bitmap, at the same placement and with
         // the same precedence. Its whole-subtree form holds the children, so

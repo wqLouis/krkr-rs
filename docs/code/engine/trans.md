@@ -197,7 +197,9 @@ two hosts, one frame:
 The second form exists for a host that draws the projected scene: the frame is
 composited by the pipeline from the two source textures, so the transition
 writes no pixels and uploads no bitmap per tick. The headless CPU path keeps
-`Trans::apply` and the display bitmap.
+`Trans::apply` and the display bitmap. On either path the endpoint subtree
+content is recomposited only when a source actually changes; a new frame's
+blend weights or placements do not invalidate it.
 
 ### 6.1 The composited frame's tolerance
 

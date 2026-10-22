@@ -975,6 +975,74 @@ fn a_transition_frame_draws_both_sources_at_the_layer_placement() {
     );
 }
 
+/// A frame that covers only the layer's own image leaves the children live,
+/// and a layer in a transition draws no cache of its own even when it is
+/// marked cached: the frame replaces the image the cache holds
+/// (`reference/cpp/core/visual/LayerIntf.cpp:6745-6768`, `:7156-7157`).
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:6745-6768
+/// reference/cpp/core/visual/LayerIntf.cpp:7156-7157
+#[test]
+fn a_self_frame_transition_draws_no_cache_and_keeps_its_children_live() {
+    let mut scene = Scene::default();
+    scene.composite_transition_frames = true;
+    let win = scene.add_window("t", (64, 64));
+    let layer = scene.add_layer(win, None);
+    {
+        let state = scene.layer_mut(layer).unwrap();
+        state.rect = Rect::new(0, 0, 32, 32);
+        state.visible = true;
+    }
+    let main = attach_image(&mut scene, layer, 16, 16);
+    let child = scene.add_layer(win, Some(layer));
+    scene.layer_mut(child).unwrap().rect = Rect::new(20, 20, 8, 8);
+    scene.layer_mut(child).unwrap().visible = true;
+    let child_bitmap = attach_image(&mut scene, child, 8, 8);
+    let cache = scene.add_bitmap(32, 32, vec![0u8; 32 * 32 * 4]);
+    {
+        let state = scene.layer_mut(layer).unwrap();
+        state.cache_enabled_count = 1;
+        state.cache_bitmap = Some(cache);
+    }
+    let src2 = scene.add_bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
+    scene.set_transition_frame(
+        layer,
+        Some(TransitionFrame::new(
+            (16, 16),
+            false,
+            TransitionSource::new(main, Rect::new(0, 0, 16, 16), Rect::new(0, 0, 16, 16), 1.0),
+            TransitionSource::new(src2, Rect::new(0, 0, 16, 16), Rect::new(0, 0, 16, 16), 0.5),
+        )),
+    );
+
+    let projected = project_window(&scene, win, |id| {
+        (id == main || id == src2 || id == child_bitmap || id == cache).then(|| {
+            null_texture(
+                if id == child_bitmap { 8 } else { 16 },
+                if id == child_bitmap { 8 } else { 16 },
+            )
+        })
+    });
+    let nodes = drawable_nodes(&projected);
+    assert_eq!(
+        nodes.len(),
+        3,
+        "the two frame sources plus the live child draw; the cache does not"
+    );
+    assert!(
+        nodes
+            .iter()
+            .any(|node| node.dst == RectF::new(20.0, 20.0, 8.0, 8.0)),
+        "the child keeps drawing live"
+    );
+    assert!(
+        nodes
+            .iter()
+            .all(|node| node.dst != RectF::new(0.0, 0.0, 32.0, 32.0)),
+        "the layer's cached subtree is not drawn"
+    );
+}
+
 /// A whole-subtree frame stands in for the layer's subtree, so its children
 /// draw through it and are reported like the children a cache covers
 /// (`reference/cpp/core/visual/LayerIntf.cpp:7221-7226`).
