@@ -143,6 +143,35 @@ export ANDROID_NDK_HOME="$NDK"
 # of in a separate file the loader would have to map.
 export CXXSTDLIB_aarch64_linux_android="c++_static"
 
+# --- the link search order ---------------------------------------------------
+#
+# The NDK keeps two kinds of library in the sysroot:
+#
+#   * the per-API directory (`usr/lib/<triple>/<api>/`) holds the *shared*
+#     platform libraries the device actually provides — `libc.so`, `libm.so`,
+#     `libdl.so`, `libz.so`, and the versioned NDK stubs;
+#   * the sysroot root (`usr/lib/<triple>/`) holds the static archives the
+#     build needs to find: `libc++_static.a`, `libc++abi.a`, and also the
+#     *static* platform libraries `libc.a`, `libm.a`, `libdl.a`, `libz.a`.
+#
+# The static C++ runtime lives only in the root, so a search path for it is
+# required. It must come **after** the per-API directory: with the root first,
+# `-lc` resolves the root's `libc.a` instead of the per-API `libc.so`, and the
+# engine links a private copy of bionic. A shared object cannot carry its own
+# libc — the dynamic linker never initialises that copy — so the library
+# crashes before `android_main` and the launcher reports a launch that never
+# reached the engine.
+#
+# `check-jni-libs.sh` rejects such a package; this ordering is what prevents it.
+SYSROOT_LIB_DIR="$TOOLCHAIN/sysroot/usr/lib/aarch64-linux-android"
+API_LIB_DIR="$SYSROOT_LIB_DIR/$API_LEVEL"
+if [[ ! -f "$API_LIB_DIR/libc.so" ]]; then
+    echo "error: no per-API platform stubs at $API_LIB_DIR" >&2
+    echo "  NDK r27c ships them for API levels 21..35;" >&2
+    echo "  linking without this directory resolves -lc to the sysroot's libc.a." >&2
+    exit 1
+fi
+
 # --- 16 KB page-size alignment ----------------------------------------------
 #
 # Pass the alignment to the Rust link via the *target-scoped* rustflags variable
@@ -153,13 +182,13 @@ export CXXSTDLIB_aarch64_linux_android="c++_static"
 # that is unset, a global RUSTFLAGS — is preserved: cargo treats the
 # target-scoped variable as a replacement for RUSTFLAGS, so dropping it would
 # silently discard the caller's flags.
-# The NDK keeps the static C++ runtime in the target sysroot, which rustc's
-# default Android link search does not include. Without this the `tjs` build
-# script's `cargo:rustc-link-lib=static=c++_static` fails at link time.
-CXX_LIB_DIR="$TOOLCHAIN/sysroot/usr/lib/aarch64-linux-android"
-ALIGN_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384 -L native=$CXX_LIB_DIR"
+#
+# The sysroot root is last and the per-API directory is first, even when a
+# caller supplied its own target-scoped flags: an existing `-L` for the root
+# must not be able to shadow the platform's shared libraries.
+ALIGN_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384 -L native=$SYSROOT_LIB_DIR"
 EXISTING_RUSTFLAGS="${CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS:-${RUSTFLAGS:-}}"
-export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="${EXISTING_RUSTFLAGS} ${ALIGN_RUSTFLAGS}"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-L native=$API_LIB_DIR ${EXISTING_RUSTFLAGS} ${ALIGN_RUSTFLAGS}"
 
 for tool in "$CC" "$CXX" "$AR"; do
     if [[ ! -x "$tool" ]]; then

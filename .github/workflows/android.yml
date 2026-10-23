@@ -194,6 +194,10 @@ jobs:
       # libc++_shared.so", long after the build went green.
       - name: Verify the packaged native libraries
         run: |
+          # The self-test proves the check can still fail (an unresolvable
+          # dependency, a private static libc, a misaligned library); the
+          # second run checks the package that reaches the device.
+          bash ./crates/android/check-jni-libs.sh --self-test
           bash ./crates/android/check-jni-libs.sh \
             android/app/build/outputs/apk/release/app-release.apk
 

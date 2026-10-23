@@ -131,6 +131,23 @@ check_lib() {
   $(basename "$0") if it really is a platform library."
     done <<< "$needed"
 
+    # The Android C library is part of the platform. A link search path that
+    # reaches the NDK sysroot's `libc.a` before the per-API `libc.so` stub
+    # links bionic into the library: `DT_NEEDED` then has no `libc.so`, and the
+    # private copy is never initialised by the dynamic linker, so the library
+    # crashes before its entry point runs. Bionic's static sources leave their
+    # build paths in `.rodata` and a weak `__loader_add_thread_local_dtor` in
+    # the symbol table; either is proof the static archive was linked, whether
+    # or not `libc.so` also appears in `DT_NEEDED`.
+    if grep -aq 'bionic/libc/bionic/' "$lib" ||
+        grep -aq '__loader_add_thread_local_dtor' "$lib"; then
+        die "$name carries bionic's static C library (libc.a). A shared object
+  cannot carry a private libc — the dynamic linker never initialises that copy,
+  so the library crashes before its entry point. Order every link search path so
+  the NDK's per-API directory (.../sysroot/usr/lib/<triple>/<api>) comes before
+  the sysroot root, where libc.a lives; then -lc resolves libc.so instead."
+    fi
+
     local aligns
     aligns="$(readelf -lW "$lib" | awk '$1 == "LOAD" { print $NF }')"
     if [[ -z "$aligns" ]]; then
@@ -195,6 +212,27 @@ self_test() {
     cp "$tmp/alone/libneeds.so" "$tmp/runtime/libc++_shared.so" "$tmp/complete/"
     check_dir "$tmp/complete" >/dev/null
     echo "check-jni-libs: self-test: a packaged dependency is accepted"
+
+    # A shared object that carries bionic's static libc has no `libc.so` in
+    # DT_NEEDED and keeps bionic's source paths in `.rodata`. That is the shape
+    # of a link whose search path reached the NDK sysroot's `libc.a` first;
+    # the check must refuse to ship it, because the loader cannot initialise a
+    # private libc inside a shared object.
+    mkdir -p "$tmp/static-libc"
+    cat > "$tmp/static_libc.c" <<'C'
+__attribute__((used)) static const char bionic_libc_marker[] =
+    "bionic/libc/bionic/bionic_elf_tls.cpp";
+int krkr_static_libc_marker(void) { return bionic_libc_marker[0]; }
+C
+    "$cc" -shared -fPIC -nostdlib -o "$tmp/static-libc/libstaticlibc.so" \
+        "$tmp/static_libc.c" -Wl,-z,max-page-size=16384
+    if out="$(check_dir "$tmp/static-libc" 2>&1)"; then
+        die "self-test: a library with a private static libc was accepted"
+    fi
+    if [[ "$out" != *"carries bionic's static C library"* ]]; then
+        die "self-test: the failure does not name the static C library: $out"
+    fi
+    echo "check-jni-libs: self-test: a private static libc is rejected"
 
     # A library that is not 16 KB aligned is rejected.
     "$cc" -shared -fPIC -nostdlib -o "$tmp/misaligned/libsmall.so" "$tmp/fake.c"

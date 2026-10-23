@@ -74,6 +74,16 @@ is untouched. `crates/tjs/build.rs` links the runtime itself as well
 C++ code of the VM is resolved by the runtime whatever order the linker sees
 the crates in.
 
+The runtime lives in the NDK sysroot's root directory, next to the **static**
+platform libraries (`libc.a`, `libm.a`, `libdl.a`, `libz.a`); the **shared**
+platform libraries the device provides (`libc.so`, …) live in the per-API
+directory below it (`usr/lib/<triple>/<api>/`). The build therefore puts the
+per-API directory **first** and the root **last** in the link search path. With
+the root first, `-lc` resolves `libc.a` and the engine links a private bionic:
+the library then has no `libc.so` in `DT_NEEDED`, the dynamic linker never
+initialises that copy, and it crashes before `android_main`. The ordering is
+pinned in `build-android.sh`; §6 rejects a package that carries bionic.
+
 The static runtime is also the right choice for the page size: the shared
 runtime of the NDK is only 16 KB aligned from NDK r28 on, and the package is
 mapped straight out of the APK (§3), so a separate runtime file would have to
@@ -228,6 +238,13 @@ or an `.apk`, and for every library it checks that
   device reports as `failed to dlopen <library>`; `libc++_shared.so` is
   deliberately **not** a platform library, so an engine that needs it has to
   package it;
+* a library must not contain bionic's static libc sources
+  (`bionic/libc/bionic/`) or the weak loader hook
+  `__loader_add_thread_local_dtor`, whether or not `libc.so` also appears in
+  `DT_NEEDED`. Either means `libc.a` was linked in place of the platform's
+  `libc.so`; the loader cannot initialise a private libc inside a shared
+  object, so it would crash before its entry point. The search-order fix that
+  prevents this is in §2;
 * every `PT_LOAD` segment is aligned to 16 KB (§3).
 
 `build-android.sh` runs it on the staged directory, before Gradle packages
