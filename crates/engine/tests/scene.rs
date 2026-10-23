@@ -698,6 +698,72 @@ fn resize_bitmap_keeps_the_fill_for_rows_the_source_does_not_hold() {
     );
 }
 
+/// A resize clears or fills only the part the old image does not cover and
+/// keeps the overlapping pixels, whichever way the row pitch changes.
+///
+/// Reference `SetSizeWithFill` keeps the overlapping pixels and fills the
+/// expanded region (`reference/cpp/core/visual/LayerBitmapIntf.cpp:122-163`).
+#[test]
+fn resize_bitmap_keeps_the_overlap_and_clears_only_the_new_region() {
+    let mut scene = Scene::default();
+    let mut rgba = Vec::new();
+    for y in 0..3u8 {
+        for x in 0..4u8 {
+            rgba.extend_from_slice(&[x + 1, y + 1, 0x11, 0xff]);
+        }
+    }
+    let id = scene.add_bitmap(4, 3, rgba);
+
+    // Wider rows: the old pixels keep their values and the new right-hand
+    // columns are zero, not the old buffer's trailing bytes.
+    assert!(scene.resize_bitmap(id, 6, 3, [0, 0, 0, 0]));
+    let bitmap = scene.bitmap(id).expect("the bitmap survives the resize");
+    assert_eq!((bitmap.width, bitmap.height), (6, 3));
+    for y in 0..3u8 {
+        for x in 0..4u8 {
+            let at = ((y as usize * 6) + x as usize) * 4;
+            assert_eq!(
+                &bitmap.rgba[at..at + 4],
+                &[x + 1, y + 1, 0x11, 0xff],
+                "old pixel ({x}, {y})"
+            );
+        }
+        for x in 4..6u8 {
+            let at = ((y as usize * 6) + x as usize) * 4;
+            assert_eq!(&bitmap.rgba[at..at + 4], &[0, 0, 0, 0], "new column {x}");
+        }
+    }
+
+    // Narrower and shorter: the top-left overlap survives.
+    assert!(scene.resize_bitmap(id, 2, 2, [0, 0, 0, 0]));
+    let bitmap = scene.bitmap(id).expect("the bitmap survives the resize");
+    assert_eq!((bitmap.width, bitmap.height), (2, 2));
+    for y in 0..2u8 {
+        for x in 0..2u8 {
+            let at = ((y as usize * 2) + x as usize) * 4;
+            assert_eq!(&bitmap.rgba[at..at + 4], &[x + 1, y + 1, 0x11, 0xff]);
+        }
+    }
+
+    // A non-transparent fill covers only the rows the old image does not
+    // reach.
+    assert!(scene.resize_bitmap(id, 2, 4, [5, 6, 7, 8]));
+    let bitmap = scene.bitmap(id).expect("the bitmap survives the resize");
+    for y in 0..2u8 {
+        for x in 0..2u8 {
+            let at = ((y as usize * 2) + x as usize) * 4;
+            assert_eq!(
+                &bitmap.rgba[at..at + 4],
+                &[x + 1, y + 1, 0x11, 0xff],
+                "the overlap keeps ({x}, {y})"
+            );
+        }
+    }
+    for pixel in bitmap.rgba[2 * 2 * 4..].chunks_exact(4) {
+        assert_eq!(pixel, &[5, 6, 7, 8], "the new rows take the fill");
+    }
+}
+
 /// A resize keeps the whole rows a partially held buffer contains and fills
 /// the rest.
 ///

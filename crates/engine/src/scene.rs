@@ -2770,47 +2770,125 @@ impl Scene {
         let Some(copy_bytes) = copy_w.checked_mul(4) else {
             return false;
         };
-        let mut rgba: Vec<u8> = Vec::new();
-        if rgba.try_reserve_exact(pixels).is_err() {
-            return false;
-        }
-        rgba.resize(pixels, 0);
-        for chunk in rgba.chunks_exact_mut(4) {
-            chunk.copy_from_slice(&fill);
-        }
-        // Copy the overlapping region row by row (the row pitch changes). The
-        // source rows are contiguous from the first, so the first row the
-        // buffer does not hold ends the copy and the rest of the destination
-        // keeps the fill.
-        let Some(source) = self.bitmap(id) else {
+        // The old pixels are reused in place: growing only has to extend the
+        // buffer, and the preserved rows move within it. The uncovered part
+        // alone takes the fill, so a resize never rewrites the preserved
+        // pixels.
+        let Some(bitmap) = self.bitmap_mut_untracked(id) else {
             return false;
         };
-        let available = source.rgba.len();
+        let mut rgba = std::mem::take(&mut bitmap.rgba);
+        let available = rgba.len();
+        // The source rows are contiguous from the first, so the first row the
+        // buffer does not hold ends the preserved region.
         let mut preserved = 0usize;
         for y in 0..copy_h {
-            let (Some(src_start), Some(dst_start)) =
-                (y.checked_mul(old_pitch), y.checked_mul(new_pitch))
+            let Some(src_end) = y
+                .checked_mul(old_pitch)
+                .and_then(|start| start.checked_add(copy_bytes))
             else {
-                break;
-            };
-            let (Some(src_end), Some(dst_end)) = (
-                src_start.checked_add(copy_bytes),
-                dst_start.checked_add(copy_bytes),
-            ) else {
                 break;
             };
             if src_end > available {
                 break;
             }
-            let (Some(src_row), Some(dst_row)) = (
-                source.rgba.get(src_start..src_end),
-                rgba.get_mut(dst_start..dst_end),
-            ) else {
-                break;
-            };
-            dst_row.copy_from_slice(src_row);
             preserved += 1;
         }
+        if rgba.len() < pixels {
+            if rgba.try_reserve_exact(pixels - rgba.len()).is_err() {
+                if let Some(bitmap) = self.bitmap_mut_untracked(id) {
+                    bitmap.rgba = rgba;
+                }
+                return false;
+            }
+            rgba.resize(pixels, 0);
+        }
+        // Move the preserved rows within the buffer when the row pitch
+        // changes. A wider pitch moves a row forward past rows that are still
+        // to be read, so those move from the last row to the first; a narrower
+        // pitch moves the other way. An unchanged pitch keeps every row where
+        // it is.
+        if new_pitch > old_pitch {
+            for y in (0..preserved).rev() {
+                let Some(src_start) = y.checked_mul(old_pitch) else {
+                    break;
+                };
+                let Some(dst_start) = y.checked_mul(new_pitch) else {
+                    break;
+                };
+                let (Some(src_end), Some(dst_end)) = (
+                    src_start.checked_add(copy_bytes),
+                    dst_start.checked_add(copy_bytes),
+                ) else {
+                    break;
+                };
+                if src_end <= available && dst_end <= pixels {
+                    rgba.copy_within(src_start..src_end, dst_start);
+                }
+            }
+        } else if new_pitch < old_pitch {
+            for y in 0..preserved {
+                let Some(src_start) = y.checked_mul(old_pitch) else {
+                    break;
+                };
+                let Some(dst_start) = y.checked_mul(new_pitch) else {
+                    break;
+                };
+                let (Some(src_end), Some(dst_end)) = (
+                    src_start.checked_add(copy_bytes),
+                    dst_start.checked_add(copy_bytes),
+                ) else {
+                    break;
+                };
+                if src_end <= available && dst_end <= pixels {
+                    rgba.copy_within(src_start..src_end, dst_start);
+                }
+            }
+        }
+        let fill_span = |span: &mut [u8]| {
+            if fill == [0, 0, 0, 0] {
+                span.fill(0);
+            } else {
+                for chunk in span.chunks_exact_mut(4) {
+                    chunk.copy_from_slice(&fill);
+                }
+            }
+        };
+        if copy_bytes < new_pitch {
+            for y in 0..preserved {
+                let Some(start) = y
+                    .checked_mul(new_pitch)
+                    .and_then(|start| start.checked_add(copy_bytes))
+                else {
+                    break;
+                };
+                let Some(end) = y.checked_add(1).and_then(|row| row.checked_mul(new_pitch)) else {
+                    break;
+                };
+                if let Some(span) = rgba.get_mut(start..end) {
+                    fill_span(span);
+                }
+            }
+        }
+        for y in preserved..new_h {
+            let Some(start) = y.checked_mul(new_pitch) else {
+                break;
+            };
+            let Some(end) = start.checked_add(new_pitch) else {
+                break;
+            };
+            // A row entirely inside the grown tail was zeroed by the resize
+            // above, so a transparent fill has nothing to do.
+            if fill == [0, 0, 0, 0] && start >= available {
+                continue;
+            }
+            if let Some(span) = rgba.get_mut(start..end) {
+                fill_span(span);
+            }
+        }
+        // The source rows were read from the whole old buffer, so the
+        // truncation to the new size happens after the copies and fills.
+        rgba.truncate(pixels);
         if preserved < copy_h {
             let missing_rows = copy_h - preserved;
             log::error!(

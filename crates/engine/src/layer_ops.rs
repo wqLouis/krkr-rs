@@ -908,6 +908,121 @@ fn blit_over_band(
     }
 }
 
+/// Copies the rectangle `dc` row by row when every destination row maps to
+/// one contiguous source run. Returns false when the mapping needs the
+/// per-pixel bounds checks, leaving the destination untouched for the caller's
+/// scalar pass.
+fn copy_plane_rows(
+    dst: &mut BitmapState,
+    dx: i32,
+    dy: i32,
+    src: &BitmapState,
+    src_rect: RectI,
+    dc: RectI,
+) -> bool {
+    let (Some(columns), Some(rows)) = (
+        usize::try_from(dc.2 - dc.0).ok(),
+        usize::try_from(dc.3 - dc.1).ok(),
+    ) else {
+        return false;
+    };
+    if columns == 0 || rows == 0 {
+        return false;
+    }
+    let (Some(offset_x), Some(offset_y)) = (dc.0.checked_sub(dx), dc.1.checked_sub(dy)) else {
+        return false;
+    };
+    let (Some(src_x), Some(src_y)) = (
+        src_rect.0.checked_add(offset_x),
+        src_rect.1.checked_add(offset_y),
+    ) else {
+        return false;
+    };
+    if src_x < 0 || src_y < 0 {
+        return false;
+    }
+    let (Ok(src_x), Ok(src_y), Ok(src_w), Ok(src_h), Ok(dst_w)) = (
+        usize::try_from(src_x),
+        usize::try_from(src_y),
+        usize::try_from(src.width),
+        usize::try_from(src.height),
+        usize::try_from(dst.width),
+    ) else {
+        return false;
+    };
+    let (Some(end_x), Some(end_y)) = (src_x.checked_add(columns), src_y.checked_add(rows)) else {
+        return false;
+    };
+    if end_x > src_w || end_y > src_h {
+        return false;
+    }
+    let (Some(src_pitch), Some(dst_pitch), Some(row_bytes)) = (
+        src_w.checked_mul(4),
+        dst_w.checked_mul(4),
+        columns.checked_mul(4),
+    ) else {
+        return false;
+    };
+    let (Ok(dst_x), Ok(dst_y)) = (usize::try_from(dc.0), usize::try_from(dc.1)) else {
+        return false;
+    };
+    let (Some(src_x_bytes), Some(dst_x_bytes)) = (src_x.checked_mul(4), dst_x.checked_mul(4))
+    else {
+        return false;
+    };
+    // Reject a short buffer before writing any row, so a failure leaves the
+    // destination to the caller's scalar pass unchanged.
+    let (Some(last_src_start), Some(last_dst_start)) = (
+        src_y
+            .checked_add(rows - 1)
+            .and_then(|y| y.checked_mul(src_pitch))
+            .and_then(|start| start.checked_add(src_x_bytes)),
+        dst_y
+            .checked_add(rows - 1)
+            .and_then(|y| y.checked_mul(dst_pitch))
+            .and_then(|start| start.checked_add(dst_x_bytes)),
+    ) else {
+        return false;
+    };
+    let (Some(last_src_end), Some(last_dst_end)) = (
+        last_src_start.checked_add(row_bytes),
+        last_dst_start.checked_add(row_bytes),
+    ) else {
+        return false;
+    };
+    if last_src_end > src.rgba.len() || last_dst_end > dst.rgba.len() {
+        return false;
+    }
+    for row in 0..rows {
+        let (Some(src_start), Some(dst_start)) = (
+            src_y
+                .checked_add(row)
+                .and_then(|y| y.checked_mul(src_pitch))
+                .and_then(|start| start.checked_add(src_x_bytes)),
+            dst_y
+                .checked_add(row)
+                .and_then(|y| y.checked_mul(dst_pitch))
+                .and_then(|start| start.checked_add(dst_x_bytes)),
+        ) else {
+            return false;
+        };
+        let (Some(src_end), Some(dst_end)) = (
+            src_start.checked_add(row_bytes),
+            dst_start.checked_add(row_bytes),
+        ) else {
+            return false;
+        };
+        let (Some(src_row), Some(dst_row)) = (
+            src.rgba.get(src_start..src_end),
+            dst.rgba.get_mut(dst_start..dst_end),
+        ) else {
+            return false;
+        };
+        dst_row.copy_from_slice(src_row);
+    }
+    true
+}
+
 /// `CopyRect` with an explicit `plane` selection (`TVP_BB_COPY_MAIN` /
 /// `TVP_BB_COPY_MASK`), the primitive behind `Layer.copyRect`.
 ///
@@ -949,15 +1064,19 @@ pub fn blit_plane(
         let Some(dc) = intersect_rect(in_bounds, clip) else {
             return;
         };
-        for y in dc.1..dc.3 {
-            for x in dc.0..dc.2 {
-                let sx = src_rect.0 + (x - dx);
-                let sy = src_rect.1 + (y - dy);
-                if sx < 0 || sy < 0 || sx as u32 >= src.width || sy as u32 >= src.height {
-                    continue;
+        // The common copy is a whole rectangle whose rows map one to one;
+        // copy each row as a run instead of resolving every pixel.
+        if !copy_plane_rows(dst, dx, dy, src, src_rect, dc) {
+            for y in dc.1..dc.3 {
+                for x in dc.0..dc.2 {
+                    let sx = src_rect.0 + (x - dx);
+                    let sy = src_rect.1 + (y - dy);
+                    if sx < 0 || sy < 0 || sx as u32 >= src.width || sy as u32 >= src.height {
+                        continue;
+                    }
+                    let s = read_pixel(src, sx, sy);
+                    write_pixel(dst, x, y, s);
                 }
-                let s = read_pixel(src, sx, sy);
-                write_pixel(dst, x, y, s);
             }
         }
         // The pass wrote inside the clipped destination rectangle only, so the
@@ -4167,6 +4286,66 @@ mod tests {
             255,
         );
         assert_eq!(&actual[8..12], &expected[8..12]);
+    }
+
+    /// A full-plane copy maps every destination pixel to one source pixel,
+    /// including the clipped rectangle and the offset placement
+    /// (`reference/cpp/core/visual/LayerIntf.cpp:8796-8831`).
+    #[test]
+    fn copy_rect_copies_the_clipped_rectangle_from_the_mapped_source() {
+        let src = source_texture(40, 40);
+        let mut dst = BitmapState::new(64, 64, vec![9u8; 64 * 64 * 4]);
+        let clip = (5, 6, 43, 31);
+        blit_plane(
+            &mut dst,
+            5,
+            6,
+            &src,
+            (2, 3, 40, 33),
+            clip,
+            COPY_MAIN | COPY_MASK,
+        );
+        for y in clip.1..clip.3 {
+            for x in clip.0..clip.2 {
+                let sx = 2 + (x - 5);
+                let sy = 3 + (y - 6);
+                let got = read_pixel(&dst, x, y);
+                let expected = read_pixel(&src, sx, sy);
+                assert_eq!(got, expected, "pixel ({x}, {y})");
+            }
+        }
+        // Outside the clip the destination keeps its own pixels.
+        assert_eq!(read_pixel(&dst, 4, 6), [9, 9, 9, 9]);
+        assert_eq!(read_pixel(&dst, 5, 5), [9, 9, 9, 9]);
+        assert_eq!(read_pixel(&dst, 43, 6), [9, 9, 9, 9]);
+    }
+
+    /// A source rectangle whose left edge is outside the source falls back to
+    /// the per-pixel pass, which skips the pixels the source does not hold.
+    ///
+    /// The reference's copy clips the source and leaves the destination
+    /// outside the clipped region untouched
+    /// (`reference/cpp/core/visual/LayerIntf.cpp:8796-8831`).
+    #[test]
+    fn copy_rect_leaves_pixels_the_source_does_not_cover() {
+        let src = source_texture(10, 10);
+        let mut dst = BitmapState::new(20, 20, vec![7u8; 20 * 20 * 4]);
+        blit_plane(
+            &mut dst,
+            0,
+            0,
+            &src,
+            (-2, -2, 8, 8),
+            (0, 0, 20, 20),
+            COPY_MAIN | COPY_MASK,
+        );
+        // The destination pixels the source rectangle does not cover keep
+        // their own value; the first covered destination pixel takes the
+        // source's first pixel.
+        assert_eq!(read_pixel(&dst, 0, 0), [7, 7, 7, 7]);
+        assert_eq!(read_pixel(&dst, 2, 2), read_pixel(&src, 0, 0));
+        assert_eq!(read_pixel(&dst, 7, 7), read_pixel(&src, 5, 5));
+        assert_eq!(read_pixel(&dst, 10, 10), [7, 7, 7, 7]);
     }
 
     /// The generic (per-pixel) pass over the same mapping the scanline pass
