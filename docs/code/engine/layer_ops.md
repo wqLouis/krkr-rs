@@ -149,6 +149,14 @@ projection draws the two sources, so nothing is written to a bitmap per tick
   same threshold the nearest affine pass uses. A band owns whole rows, so its
   pixel loop walks the destination row directly; the bytes are identical to
   the single-band path.
+* **A one-to-one stretch is a blit.** When the source and destination rects
+  have the same extent and the resampler is one of the exact-at-integer kinds,
+  the stretch maps each destination pixel to the matching source texel. It
+  routes to the clipped copy for Copy mode and to the source-over blit for
+  SourceOver mode instead of the float resampler.
+* The optional `simd-experiment` feature adds a SIMD fast path for a
+  fully-opaque source-over row; it is exact, and the scalar band remains the
+  default and the fallback for every other row.
 * **The source rectangle is half-open**, and a source region that leaves the
   source bitmap contributes nothing rather than a repeated edge pixel.
 * **`blit_plane` with both plane bits is a straight copy**, not a blend: the

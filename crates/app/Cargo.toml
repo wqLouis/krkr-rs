@@ -9,6 +9,10 @@ license.workspace = true
 name = "krkr"
 path = "src/main.rs"
 
+[features]
+# Forward the engine's opt-in SIMD experiment to the game binary.
+simd-experiment = ["engine/simd-experiment"]
+
 [dependencies]
 api = { workspace = true }
 engine = { workspace = true }

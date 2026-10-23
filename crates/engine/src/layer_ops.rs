@@ -836,6 +836,28 @@ fn blit_over_band(
         if sy >= src_height {
             continue;
         }
+        #[cfg(feature = "simd-experiment")]
+        if opa == 255 && !treat_as_opaque && !hold_alpha {
+            let columns = usize::try_from(x1.saturating_sub(x0)).ok();
+            let source_x = usize::try_from(src_rect.0.saturating_add(x0.saturating_sub(dx))).ok();
+            let dest_x = usize::try_from(x0).ok();
+            if let (Some(columns), Some(source_x), Some(dest_x)) = (columns, source_x, dest_x)
+                && source_x.saturating_add(columns) <= src_width
+                && let (Some(source_start), Some(dest_start), Some(len)) = (
+                    sy.checked_mul(src_pitch)
+                        .and_then(|row| row.checked_add(source_x.checked_mul(4)?)),
+                    dest_x.checked_mul(4),
+                    columns.checked_mul(4),
+                )
+                && let (Some(source), Some(destination)) = (
+                    src.rgba.get(source_start..source_start.saturating_add(len)),
+                    row.get_mut(dest_start..dest_start.saturating_add(len)),
+                )
+                && crate::simd::copy_opaque_row(source, destination)
+            {
+                continue;
+            }
+        }
         for x in x0..x1 {
             let sx = src_rect.0.saturating_add(x.saturating_sub(dx));
             if sx < 0 || usize::try_from(sx).map_or(true, |sx| sx >= src_width) {
@@ -2471,6 +2493,12 @@ pub fn stretch_blit_mode(
         bitmap: src,
         rect: src_rect,
     } = source;
+    let BlitOptions {
+        mode,
+        opa,
+        hold_alpha,
+        ..
+    } = options;
     let dw = dest.2 - dest.0;
     let dh = dest.3 - dest.1;
     if dw <= 0 || dh <= 0 || src_rect.2 <= src_rect.0 || src_rect.3 <= src_rect.1 {
@@ -2482,6 +2510,46 @@ pub fn stretch_blit_mode(
     let Some(dc) = intersect(dst, dest) else {
         return;
     };
+    // The measured stage/UI stretches are one-to-one rectangles: the source
+    // and destination have the same extent and only their origins differ.
+    // At integer source centres every supported resampler returns the source
+    // texel, so the pass is a copy (Copy mode) or a source-over blit. This
+    // avoids the per-pixel float resampler without changing any pixel.
+    if let Some((dx, dy)) = stretch_exact_translation(dest, src_rect, stretch_type) {
+        match mode_kernel(mode) {
+            ModeKernel::Copy if !hold_alpha => {
+                blit_copy_clipped(
+                    dst,
+                    dx,
+                    dy,
+                    src,
+                    src_rect,
+                    (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+                );
+                return;
+            }
+            ModeKernel::SourceOver => {
+                blit_over(
+                    dst,
+                    dx,
+                    dy,
+                    BlitSource {
+                        bitmap: src,
+                        rect: src_rect,
+                    },
+                    (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+                    BlitOptions {
+                        mode: 0,
+                        opa,
+                        treat_as_opaque: false,
+                        hold_alpha,
+                    },
+                );
+                return;
+            }
+            _ => {}
+        }
+    }
     let rows = (dc.3 - dc.1) as usize;
     let columns = (dc.2 - dc.0) as usize;
     let threads = affine_thread_count(rows, columns);
@@ -2542,6 +2610,25 @@ pub fn stretch_blit_mode(
     // The pass wrote inside the clipped destination rectangle only, so the
     // upload needs that rectangle and not the whole bitmap.
     dst.mark_dirty_rect(clipped_region(dc));
+}
+
+/// A one-to-one stretch with integer origins: the mapping is an integer
+/// translation, so every supported resampler is exact.
+fn stretch_exact_translation(
+    dest: RectI,
+    src_rect: RectI,
+    stretch_type: i64,
+) -> Option<(i32, i32)> {
+    let kind = stretch_type & 0xffff;
+    if !matches!(kind, 0..=13) {
+        return None;
+    }
+    if dest.2.saturating_sub(dest.0) != src_rect.2.saturating_sub(src_rect.0)
+        || dest.3.saturating_sub(dest.1) != src_rect.3.saturating_sub(src_rect.1)
+    {
+        return None;
+    }
+    Some((dest.0, dest.1))
 }
 
 /// The destination window of one stretch pass.
@@ -4054,6 +4141,43 @@ mod tests {
         generic_pass(&mut generic, corners, &src, 2, 255);
         assert_eq!(scanline.rgba, generic.rgba);
         assert!(scanline.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0));
+    }
+
+    /// A one-to-one stretch takes the exact source-over blit path.
+    #[test]
+    fn a_one_to_one_stretch_matches_the_source_over_blit() {
+        let src = source_texture(8, 4);
+        let full = (0, 0, 8, 4);
+        let mut stretched = BitmapState::new(16, 16, vec![0u8; 16 * 16 * 4]);
+        let mut blitted = BitmapState::new(16, 16, vec![0u8; 16 * 16 * 4]);
+        let options = BlitOptions {
+            mode: 2,
+            opa: 255,
+            treat_as_opaque: false,
+            hold_alpha: false,
+        };
+        stretch_blit_mode(
+            &mut stretched,
+            (3, 4, 11, 8),
+            BlitSource {
+                bitmap: &src,
+                rect: full,
+            },
+            1,
+            options,
+        );
+        blit_over(
+            &mut blitted,
+            3,
+            4,
+            BlitSource {
+                bitmap: &src,
+                rect: full,
+            },
+            (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+            options,
+        );
+        assert_eq!(stretched.rgba, blitted.rgba);
     }
 
     /// A one-to-one integer copy is recognised as a copy, including the

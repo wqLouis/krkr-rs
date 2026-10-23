@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Opt-in experiment: SIMD source-over rows. The scalar path is the default.
+simd-experiment = ["dep:fearless_simd"]
+
 [dependencies]
 api = { workspace = true }
 fs = { workspace = true }
@@ -14,6 +18,8 @@ thiserror = { workspace = true }
 log = { workspace = true, features = ["std"] }
 ahash = { workspace = true }
 hashbrown = { workspace = true }
+# Runtime-dispatched SIMD for the optional source-over row experiment.
+fearless_simd = { version = "1.1.0", optional = true }
 
 [dev-dependencies]
 testkit = { workspace = true }

@@ -788,6 +788,7 @@ dependencies = [
  "ahash",
  "api",
  "cosmic-text",
+ "fearless_simd",
  "fs",
  "hashbrown",
  "log",
