@@ -97,6 +97,12 @@ pub trait FrameBody {
 /// Each poll's wall-clock duration is reported to the matching `*_completed`
 /// hook; the remaining polls do not run after an error.
 pub fn run_frame_body(body: &mut dyn FrameBody, ctx: &mut CompatCtx) -> Result<(), CompatError> {
+    // Request the 1500 ms TJS object rehash before any script poll. An object
+    // that grew past its initial bucket count rebuilds its member table on
+    // the next property access, so the frame's handlers walk the rebuilt
+    // table instead of the old chain.
+    crate::natives::system::rehash_poll(ctx);
+
     // L2 advanced the timer registry before the hook ran, and the registry's
     // callbacks only post, so the frame's `onTimer` events are complete now.
     // Deliver them before any other poll can disable or reschedule a timer.

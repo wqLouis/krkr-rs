@@ -184,7 +184,8 @@ Engine::frame(now_ms, hooks) / Engine::step(dt_ms, hooks)
 * The hook is the one upward edge: `GameFrame`, declared in L2 and implemented
   by L3/L4 and wired by the composition root. L2 never names L3 or L4.
 * The frame body (`compat::run_frame_body`) **drains the timer posts the engine
-  produced**; it must not advance the timer registry. It then runs the sound,
+  produced**; it must not advance the timer registry. It first requests the
+  reference's periodic TJS object rehash (1500 ms), then runs the sound,
   video, async-trigger and continuous-handler polls, the idle compaction and
   the movie/transition tail. Those pumps are still staged inside the L3 hook;
   they keep deterministic test clocks.

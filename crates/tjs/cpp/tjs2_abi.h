@@ -252,6 +252,14 @@ const char *tjs2_compile_time(void);
 int tjs2_dump(tjs2_engine *e, char **out_error);
 
 /*
+ * Request a member-table rebuild for every live object. The rebuild is lazy:
+ * an object rebuilds on its next property access. The frame body calls this
+ * every 1500 ms. Returns nothing; the request only bumps the VM's rebuild
+ * magic.
+ */
+void tjs2_do_rehash(void);
+
+/*
  * Run the TJS2 garbage collector (reference `tTJS::DoGarbageCollection`).
  * This is the `clIdle` half of `System.doCompact`: the reference's compact
  * event hook calls it whenever the compact level reaches

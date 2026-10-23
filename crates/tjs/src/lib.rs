@@ -407,6 +407,8 @@ unsafe extern "C" {
     /// Run the TJS2 garbage collector (`tTJS::DoGarbageCollection`); the
     /// `clIdle` half of `System.doCompact`.
     fn tjs2_do_gc(e: *mut Engine, out_error: *mut *mut c_char) -> c_int;
+    /// Request a member-table rebuild for every live object.
+    fn tjs2_do_rehash();
     /// Class names of a retained object, as a retained TJS Array (reference
     /// `Scripts.getClassNames`).
     pub fn tjs2_get_class_names(
@@ -1316,6 +1318,19 @@ impl Tjs2Engine {
             return Err(take_error(error));
         }
         Ok(())
+    }
+
+    /// Request a rebuild of every live object's member table. The rebuild
+    /// itself is lazy: the next property access sees the new magic and
+    /// rebuilds the object, so a large object that grew past its initial
+    /// bucket count gets a table proportional to its member count.
+    ///
+    /// The frame body requests this every 1500 ms. It returns no value; the
+    /// magic bump itself cannot fail.
+    pub fn do_rehash(&self) {
+        // SAFETY: the VM is linked into this binary and the call only bumps a
+        // process-wide counter; it needs no live engine state.
+        unsafe { tjs2_do_rehash() };
     }
 
     /// Run the TJS2 garbage collector (reference `tTJS::DoGarbageCollection`,

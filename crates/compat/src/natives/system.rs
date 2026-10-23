@@ -113,6 +113,8 @@ struct SystemState {
     /// check (the reference `LastCompactedTick`,
     /// `reference/cpp/core/environ/impl/SystemControl.cpp:52`).
     last_compacted_ms: Option<i64>,
+    /// Rough tick of the last periodic object rehash.
+    last_rehashed_ms: i64,
     /// Counter mixed into `createUUID` seeds (keeps the UUID generator
     /// stateless without a process global).
     uuid_counter: u64,
@@ -144,6 +146,7 @@ impl Default for SystemState {
             draw_thread_num: 0,
             tick_epoch: None,
             last_compacted_ms: None,
+            last_rehashed_ms: 0,
             uuid_counter: 0,
             continuous: Vec::new(),
             current_continuous: None,
@@ -237,6 +240,49 @@ pub fn continuous_handler_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError>
 /// callback runs `tTJS::DoGarbageCollection`
 /// (`reference/cpp/core/base/ScriptMgnIntf.cpp:377-386`).
 const COMPACT_INTERVAL_MS: i64 = 4000;
+
+/// The interval after which the frame body requests a TJS object rehash.
+///
+/// The call only bumps the rebuild magic; an object rebuilds its member table
+/// on its next property access. The frame body starts from zero, so the first
+/// due tick is the one after the interval.
+const REHASH_INTERVAL_MS: i64 = 1500;
+
+/// Whether the periodic rehash is due at `tick`, recording it when it is.
+///
+/// The check is strict: a tick exactly one interval past the last one is not
+/// due, matching the frame body's `tick > last + interval` rule.
+fn rehash_due(state: &mut SystemState, tick: i64) -> bool {
+    if tick <= state.last_rehashed_ms.saturating_add(REHASH_INTERVAL_MS) {
+        return false;
+    }
+    state.last_rehashed_ms = tick;
+    true
+}
+
+/// Request a TJS object rehash when the periodic interval has elapsed.
+///
+/// The frame body calls this before its script polls, so a dictionary that
+/// grew past its initial bucket count is rehashed before the next script body
+/// can run against it. The call is cheap; the actual rebuild is deferred to
+/// the next property access on each object. Returns whether the rehash was
+/// requested this frame.
+pub fn rehash_poll(ctx: &mut CompatCtx) -> bool {
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let engine = unsafe { ctx.engine() };
+    // SAFETY: see above.
+    let services = unsafe { ctx.services() };
+    let due = {
+        let mut state = services.state::<SystemState>();
+        let epoch = *state.tick_epoch.get_or_insert_with(Instant::now);
+        let tick = epoch.elapsed().as_millis() as i64;
+        rehash_due(&mut state, tick)
+    };
+    if due {
+        engine.do_rehash();
+    }
+    due
+}
 
 /// Run the TJS collector when the idle interval has elapsed.
 ///
@@ -2583,7 +2629,20 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{tjs_string_to_integer, tjs_string_to_real};
+    use super::{SystemState, rehash_due, tjs_string_to_integer, tjs_string_to_real};
+
+    /// The reference rehashes when `tick > LastRehashedTick + 1500` and
+    /// records the tick (`reference/cpp/core/environ/impl/SystemControl.cpp:181-185`),
+    /// with `LastRehashedTick` starting at 0 (`:56`).
+    #[test]
+    fn rehash_due_follows_the_reference_interval() {
+        let mut state = SystemState::default();
+        assert!(!rehash_due(&mut state, 0));
+        assert!(!rehash_due(&mut state, 1500));
+        assert!(rehash_due(&mut state, 1501));
+        assert!(!rehash_due(&mut state, 3001));
+        assert!(rehash_due(&mut state, 3002));
+    }
 
     /// `TJSStringToReal` parses the leading number token
     /// (`reference/cpp/core/tjs2/tjsVariant.cpp:309-313`,

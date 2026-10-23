@@ -16,7 +16,8 @@ half.
 ## 1. The order
 
 ```
-drain the onTimer posts L2 already fired
+rehash the TJS object tables when the 1500 ms tick is due
+        → drain the onTimer posts L2 already fired
         → sound_poll → video_poll → async_trigger_poll
         → continuous_handler_poll → idle compaction → frame_tail
         → L2 projects the scene → L1 RenderPipeline::render
@@ -24,7 +25,13 @@ drain the onTimer posts L2 already fired
 
 `run_frame_body` enforces this order; an implementor never does.
 
-**The timer posts come first** because L2 advanced the timer registry and
+**The rehash tick comes first** because it stands in for the reference's
+system watch timer (`reference/cpp/core/environ/impl/SystemControl.cpp:181-185`):
+it only bumps the VM's rebuild magic, and the next property access on a grown
+object rebuilds its member table. Running it before the frame's handlers means
+they walk the rebuilt table rather than the old chain.
+
+**The timer posts precede the script polls** because L2 advanced the timer registry and
 its frame clock *before* the hook ran, and the registry's callbacks only
 *post*. Delivering them before any other poll means the frame's `onTimer`
 events are complete, and no other poll can disable or reschedule a timer
@@ -79,17 +86,22 @@ pub fn run_frame_body(body: &mut dyn FrameBody, ctx: &mut CompatCtx) -> Result<(
 
 The steps, in order:
 
-1. `timer_posts_poll(ctx)` — deliver the `onTimer` events L2's advance
+1. `rehash_poll(ctx)` — request the periodic TJS object rehash. The reference
+   system watch timer calls `TJSDoRehash()` when the rough tick is more than
+   1500 ms past the last rehash
+   (`reference/cpp/core/environ/impl/SystemControl.cpp:181-185`); the rebuild
+   is lazy, so this only bumps the magic before the frame's script polls.
+2. `timer_posts_poll(ctx)` — deliver the `onTimer` events L2's advance
    posted.
-2. `sound_poll` → `sound_completed`.
-3. `video_poll` → `video_completed`.
-4. `async_trigger_poll` → `async_trigger_completed`.
-5. `continuous_handler_poll` → `continuous_handler_completed`.
-6. `compact_poll(ctx)` — the idle compaction. The reference delivers
+3. `sound_poll` → `sound_completed`.
+4. `video_poll` → `video_completed`.
+5. `async_trigger_poll` → `async_trigger_completed`.
+6. `continuous_handler_poll` → `continuous_handler_completed`.
+7. `compact_poll(ctx)` — the idle compaction. The reference delivers
    `TVP_COMPACT_LEVEL_IDLE` from its per-loop idle check; it runs after the
    events and before the frame's draw, so the collector never runs inside a
    native callback.
-7. `frame_tail` → `frame_tail_completed`.
+8. `frame_tail` → `frame_tail_completed`.
 
 **What `run_frame_body` does *not* do:** it does not fire timers and does not
 project or render. `TimerState::advance` is private to L2 and is called by
@@ -101,6 +113,7 @@ the engine frame; the body only delivers the posts that advance produced.
 
 | Poll | Module | What it advances |
 |---|---|---|
+| `rehash_poll` | `natives/system.rs` | the periodic TJS object rehash (1500 ms) |
 | `timer_posts_poll` | `natives/visual/timer.rs` | the queued `onTimer` events, sorted by the timer `mode` priority (exclusive → normal → idle) |
 | `timer_poll` | `natives/visual/timer.rs` | the registry **and** the drain — for a host or test that drives the registry itself |
 | `sound_poll` | `natives/sound.rs` | the mixer to the L1 clock, and the `onStatusChanged` / `onFadeCompleted` / `onLabel` events |

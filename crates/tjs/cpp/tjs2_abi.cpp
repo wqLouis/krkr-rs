@@ -2284,6 +2284,12 @@ int tjs2_dump(tjs2_engine *e, char **out_error) {
     }
 }
 
+void tjs2_do_rehash(void) {
+    // Bump the rebuild-hash magic; every live object rebuilds its member table
+    // on its next property access. The frame body requests this every 1500 ms.
+    TJS::TJSDoRehash();
+}
+
 int tjs2_do_gc(tjs2_engine *e, char **out_error) {
     if(out_error)
         *out_error = nullptr;

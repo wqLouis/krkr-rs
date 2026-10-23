@@ -59,15 +59,6 @@ const TJS_IGNOREPROP: i64 = 0x0000_0800;
 const TJS_HIDDENMEMBER: i64 = 0x0000_1000;
 const TJS_STATICMEMBER: i64 = 0x0001_0000;
 
-// The vendored VM exports `TJS::TJSDoRehash()` with Itanium C++ linkage; the
-// C ABI has no entry for it, but it is part of the statically linked VM and
-// is exactly the function the reference binds `rehash` to.
-// SAFETY: `TJSDoRehash` is exported by the statically linked vendored VM under this Itanium C++ mangled name and its signature matches the declaration below.
-unsafe extern "C" {
-    #[link_name = "_ZN3TJS11TJSDoRehashEv"]
-    fn tjs_do_rehash();
-}
-
 // ---------------------------------------------------------------------------
 // per-VM dispatch state
 // ---------------------------------------------------------------------------
@@ -1389,10 +1380,8 @@ extern "C" fn scripts_rehash(
         out,
         out_error,
         "Scripts.rehash",
-        |_engine, _services| {
-            // SAFETY: the VM is linked into this binary; the function only bumps
-            // the global rebuild-hash magic.
-            unsafe { tjs_do_rehash() };
+        |engine, _services| {
+            engine.do_rehash();
             Ok(Owned::Void)
         },
     )

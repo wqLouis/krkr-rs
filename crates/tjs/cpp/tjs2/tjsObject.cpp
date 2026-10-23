@@ -506,6 +506,14 @@ namespace TJS {
             return data;
         }
 
+        // Grow the bucket table once it is full. Without this a fresh object
+        // keeps its initial eight buckets and every later lookup walks one
+        // collision chain, which turns building a large dictionary quadratic.
+        // The insert below happens after the growth, so its symbol pointer is
+        // not invalidated by the rebuild.
+        if(Count >= HashSize)
+            RebuildHash(Count);
+
         tjs_uint32 hash;
         if(hint && *hint)
             hash = *hint; // hint must be hash because of previous
@@ -559,6 +567,11 @@ namespace TJS {
             // the element is already alive
             return data;
         }
+
+        // See the char* overload: grow before the insert, not before the
+        // lookup, so an existing member's name stays valid.
+        if(Count >= HashSize)
+            RebuildHash(Count);
 
         tjs_uint32 hash;
         if(*(name->GetHint()))

@@ -117,6 +117,18 @@ The vector lives in the per-engine dispatch state, not in a process global.
 `getTickCount` returns the milliseconds since the **first** call — the epoch
 is created lazily and kept for the life of the engine.
 
+### The periodic object rehash
+
+The reference system watch timer calls `TJSDoRehash()` when the rough tick is
+more than 1500 ms past the last rehash
+(`reference/cpp/core/environ/impl/SystemControl.cpp:181-185`). The frame body
+asks for the same rehash through `rehash_poll` before its script polls
+(`crates/compat/src/frame.rs`); the call only bumps the rebuild magic, and each
+live object rebuilds its member table on its next property access
+(`reference/cpp/core/tjs2/tjsObject.cpp:1280-1282`). Without the tick, an
+object whose member count grew past its initial bucket count keeps walking a
+long collision chain for the rest of the run.
+
 ### The keyboard
 
 `getKeyState(code[, getcurrent])` reads the attached L2 input state through
@@ -166,23 +178,26 @@ process.
 
 | state | owner |
 |---|---|
-| the command-line vector, the exit request, `title`, `eventDisabled`, `exitOnWindowClose`, `exitOnNoWindowStartup`, `drawThreadNum`, the tick epoch, the compaction tick, the UUID counter, the continuous handlers, the key-query edges | the **per-engine dispatch state** (`CompatServices::state::<SystemState>()`) |
+| the command-line vector, the exit request, `title`, `eventDisabled`, `exitOnWindowClose`, `exitOnNoWindowStartup`, `drawThreadNum`, the tick epoch, the compaction tick, the rehash tick, the UUID counter, the continuous handlers, the key-query edges | the **per-engine dispatch state** (`CompatServices::state::<SystemState>()`) |
 | the string scratch buffer for returned strings | the **per-engine dispatch state** |
 | the screen size, the graphic cache, the graphic-cache limit | the **L2 scene** |
 | the key state | the **L2 input state** |
 | the app path, `RegisterData.tjs` | the **L2 storage** |
 | the desktop rectangle | the **host facts seam** (`CompatHost::set_desktop_rect`) |
 
-Two helpers are public for the host:
+The helpers public for the host:
 
 ```rust
 pub fn take_exit_request(services: &CompatServices) -> Option<i32>;
 pub fn continuous_handler_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError>;
+pub fn rehash_poll(ctx: &mut CompatCtx) -> bool;
+pub fn compact_poll(ctx: &mut CompatCtx) -> bool;
 ```
 
 `take_exit_request` consumes the recorded exit code exactly once, so a request
 is reported once and the frame loop maps it to its own exit path.
-`continuous_handler_poll` is the frame body's `continuous_handler_poll` step.
+`continuous_handler_poll` is the frame body's `continuous_handler_poll` step;
+`rehash_poll` and `compact_poll` are its rehash-tick and idle-compaction steps.
 
 ---
 
