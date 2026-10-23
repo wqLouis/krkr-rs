@@ -2433,6 +2433,89 @@ fn apply_mode_kernel(kernel: ModeKernel, pixel: &mut [u8; 4], src: [u8; 4], opa:
     }
 }
 
+#[cfg(feature = "simd-experiment")]
+struct SourceOverRowSlices {
+    height: usize,
+    src_stride: usize,
+    dst_stride: usize,
+    src_base: usize,
+    dst_base: usize,
+    row_bytes: usize,
+}
+
+#[cfg(feature = "simd-experiment")]
+fn source_over_row_slices(
+    dst: &BitmapState,
+    src: &BitmapState,
+    dc: RectI,
+    dx: i32,
+    dy: i32,
+    src_rect: RectI,
+) -> Option<SourceOverRowSlices> {
+    let width = i64::from(dc.2) - i64::from(dc.0);
+    let height = i64::from(dc.3) - i64::from(dc.1);
+    let src_x = i64::from(src_rect.0) + i64::from(dc.0) - i64::from(dx);
+    let src_y = i64::from(src_rect.1) + i64::from(dc.1) - i64::from(dy);
+    if src_x < 0
+        || src_y < 0
+        || src_x.checked_add(width)? > i64::from(src.width)
+        || src_y.checked_add(height)? > i64::from(src.height)
+    {
+        return None;
+    }
+    let width = usize::try_from(width).ok()?;
+    let height = usize::try_from(height).ok()?;
+    let src_x = usize::try_from(src_x).ok()?;
+    let src_y = usize::try_from(src_y).ok()?;
+    let dc_x = usize::try_from(dc.0).ok()?;
+    let dc_y = usize::try_from(dc.1).ok()?;
+    let src_stride = usize::try_from(src.width).ok()?.checked_mul(4)?;
+    let dst_stride = usize::try_from(dst.width).ok()?.checked_mul(4)?;
+    let row_bytes = width.checked_mul(4)?;
+    let src_base = src_y
+        .checked_mul(src_stride)?
+        .checked_add(src_x.checked_mul(4)?)?;
+    let dst_base = dc_y
+        .checked_mul(dst_stride)?
+        .checked_add(dc_x.checked_mul(4)?)?;
+    Some(SourceOverRowSlices {
+        height,
+        src_stride,
+        dst_stride,
+        src_base,
+        dst_base,
+        row_bytes,
+    })
+}
+
+#[cfg(feature = "simd-experiment")]
+fn source_over_runs(src: &[u8], dst: &mut [u8], opa: u8) {
+    if src.len() != dst.len() || !src.len().is_multiple_of(4) {
+        return;
+    }
+    let mut index = 0;
+    while index + 4 <= src.len() {
+        let alpha = src[index + 3];
+        let start = index;
+        if alpha == 0 {
+            while index + 4 <= src.len() && src[index + 3] == 0 {
+                index += 4;
+            }
+        } else if alpha == 255 && opa == 255 {
+            while index + 4 <= src.len() && src[index + 3] == 255 {
+                index += 4;
+            }
+            dst[start..index].copy_from_slice(&src[start..index]);
+        } else {
+            let mut pixel = [dst[index], dst[index + 1], dst[index + 2], dst[index + 3]];
+            let color = [src[index], src[index + 1], src[index + 2], alpha];
+            blend_pixel_at(&mut pixel, color, 255, opa);
+            dst[index..index + 4].copy_from_slice(&pixel);
+            index += 4;
+        }
+    }
+}
+
 /// `OperateRect`: blend a source region onto `dst` at `(dx, dy)` with `mode`
 /// and `opa`.
 pub fn operate_rect(
@@ -2463,6 +2546,51 @@ pub fn operate_rect(
     let Some(dc) = intersect(dst, (dx, dy, dx.saturating_add(sw), dy.saturating_add(sh))) else {
         return;
     };
+    // SIMD experiment: exact source-over spans. Opaque blocks copy, transparent
+    // blocks leave the destination alone, and a row with partial alpha is
+    // reduced to its exact runs (copy/leave) plus scalar blending only for the
+    // partial pixels.
+    #[cfg(feature = "simd-experiment")]
+    if opa == 255
+        && !hold_alpha
+        && matches!(mode_kernel(mode), ModeKernel::SourceOver)
+        && let Some(simd_rows) = source_over_row_slices(dst, src, dc, dx, dy, src_rect)
+    {
+        let mut handled = true;
+        for row in 0..simd_rows.height {
+            let Some(src_start) = row
+                .checked_mul(simd_rows.src_stride)
+                .and_then(|offset| simd_rows.src_base.checked_add(offset))
+            else {
+                handled = false;
+                break;
+            };
+            let Some(dst_start) = row
+                .checked_mul(simd_rows.dst_stride)
+                .and_then(|offset| simd_rows.dst_base.checked_add(offset))
+            else {
+                handled = false;
+                break;
+            };
+            let (Some(src_row), Some(dst_row)) = (
+                src.rgba
+                    .get(src_start..src_start.saturating_add(simd_rows.row_bytes)),
+                dst.rgba
+                    .get_mut(dst_start..dst_start.saturating_add(simd_rows.row_bytes)),
+            ) else {
+                handled = false;
+                break;
+            };
+            if crate::simd::source_over_row(src_row, dst_row) {
+                continue;
+            }
+            source_over_runs(src_row, dst_row, opa);
+        }
+        if handled {
+            dst.mark_dirty_rect(clipped_region(dc));
+            return;
+        }
+    }
     for y in dc.1..dc.3 {
         for x in dc.0..dc.2 {
             let color = read_pixel(src, src_rect.0 + (x - dx), src_rect.1 + (y - dy));
@@ -4016,6 +4144,29 @@ mod tests {
             }
         }
         BitmapState::new(width, height, rgba)
+    }
+
+    #[cfg(feature = "simd-experiment")]
+    #[test]
+    fn source_over_runs_copy_opaque_skip_transparent_and_blend_partial() {
+        let src = [
+            10, 20, 30, 255, // opaque
+            40, 50, 60, 0, // transparent
+            70, 80, 90, 128, // partial
+        ];
+        let original = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let mut actual = original;
+        source_over_runs(&src, &mut actual, 255);
+        assert_eq!(&actual[0..4], &[10, 20, 30, 255]);
+        assert_eq!(&actual[4..8], &original[4..8]);
+        let mut expected = original;
+        blend_pixel_at(
+            (&mut expected[8..12]).try_into().expect("one pixel"),
+            [70, 80, 90, 128],
+            255,
+            255,
+        );
+        assert_eq!(&actual[8..12], &expected[8..12]);
     }
 
     /// The generic (per-pixel) pass over the same mapping the scanline pass
