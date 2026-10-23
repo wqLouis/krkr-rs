@@ -910,19 +910,19 @@ impl PlayerInst {
         // position is the parent matrix applied to its local offset, and its
         // matrix is the parent's composed with its own.
         for index in 1..self.nodes.len() {
-            let parent = self.nodes[index].parent;
+            let actual_parent = self.nodes[index].parent;
+            let parent = inherited_parent(&self.nodes, index);
             let mut local = self.nodes[index].local.clone();
             let parent_state = self.nodes[parent].accumulated.clone();
             let parent_matrix = self.nodes[parent].matrix;
             let transform_order = self.nodes[index].transform_order;
-            let local_2x2 = local_matrix(&local, &transform_order);
             let mut world_x =
                 parent_matrix[0] * local.x + parent_matrix[1] * local.y + parent_state.x;
             let mut world_y =
                 parent_matrix[2] * local.x + parent_matrix[3] * local.y + parent_state.y;
             let mut world_z = parent_state.z + local.z;
             // A child clip is placed at its motion layer's origin corner.
-            if self.nodes[index].child_owner == Some(parent) {
+            if self.nodes[index].child_owner == Some(actual_parent) {
                 let origin_x = parent_state.ox;
                 let origin_y = parent_state.oy;
                 world_x -= parent_matrix[1] * origin_y + origin_x * parent_matrix[0];
@@ -951,19 +951,24 @@ impl PlayerInst {
                 local.scale_x *= mesh_scale;
                 local.scale_y *= mesh_scale;
             }
-            let local_2x2 = if mesh_angle != 0.0 || mesh_scale != 1.0 {
-                local_matrix(&local, &transform_order)
-            } else {
-                local_2x2
-            };
             let child_active = match self.nodes[index].child_owner {
                 Some(owner) => self.nodes[owner].child_slot.as_ref().is_some_and(|slot| {
                     self.nodes[index].child_clip.as_deref() == Some(slot.clip.as_str())
                 }),
                 None => true,
             };
+            let root_state = self.nodes[0].accumulated.clone();
+            let root_matrix = self.nodes[0].matrix;
+            let (inherited, matrix) = inherited_transform(
+                &local,
+                &transform_order,
+                self.nodes[index].inherit_flags,
+                (&parent_state, parent_matrix),
+                (&root_state, root_matrix),
+                self.independent_layer_inherit,
+            );
             let node = &mut self.nodes[index];
-            node.accumulated = local.clone();
+            node.accumulated = inherited;
             node.accumulated.x = world_x;
             node.accumulated.y = world_y;
             node.accumulated.z = world_z;
@@ -971,19 +976,7 @@ impl PlayerInst {
             // ancestor does.
             node.accumulated.active = parent_state.active && local.active;
             node.accumulated.opacity = parent_state.opacity * local.opacity;
-            node.accumulated.angle = parent_state.angle + local.angle;
-            node.accumulated.slant_x = parent_state.slant_x + local.slant_x;
-            node.accumulated.slant_y = parent_state.slant_y + local.slant_y;
-            node.accumulated.flip_x = parent_state.flip_x != local.flip_x;
-            node.accumulated.flip_y = parent_state.flip_y != local.flip_y;
-            node.accumulated.scale_x = parent_state.scale_x * local.scale_x;
-            node.accumulated.scale_y = parent_state.scale_y * local.scale_y;
-            node.matrix = [
-                parent_matrix[0] * local_2x2[0] + parent_matrix[1] * local_2x2[2],
-                parent_matrix[0] * local_2x2[1] + parent_matrix[1] * local_2x2[3],
-                parent_matrix[2] * local_2x2[0] + parent_matrix[3] * local_2x2[2],
-                parent_matrix[2] * local_2x2[1] + parent_matrix[3] * local_2x2[3],
-            ];
+            node.matrix = matrix;
             // A layer expanded from a child motion exists only from the
             // parent keyframe that named the clip, so it stays hidden before
             // that moment.
@@ -2800,6 +2793,118 @@ fn local_matrix(state: &FrameState, order: &[i32; 4]) -> [f64; 4] {
     [m11, m12, m21, m22]
 }
 
+/// Compose a node's accumulated transform and 2x2 matrix from its local
+/// state and the inheritance mask.
+///
+/// The accumulated matrix is the full parent matrix only when all transform
+/// bits (`0x1FC`) are inherited.  Otherwise the selected parent components are
+/// accumulated, but a non-independent layer builds its matrix from the root
+/// matrix (with the root component removed before the local matrix is built).
+/// The child position itself is always mapped through the parent matrix.
+/// Resolve the ancestor a node takes its parent transform from.
+///
+/// A node whose `inheritMask` carries `0x00400000` is skipped as a parent, so
+/// its children read the next ancestor's accumulated state instead.
+fn inherited_parent(nodes: &[MotionNode], index: usize) -> usize {
+    let mut parent = nodes[index].parent;
+    while parent > 0 && (nodes[parent].inherit_flags & 0x0040_0000) != 0 {
+        parent = nodes[parent].parent;
+    }
+    parent
+}
+
+fn inherited_transform(
+    local: &FrameState,
+    order: &[i32; 4],
+    flags: i32,
+    parent_space: (&FrameState, [f64; 4]),
+    root_space: (&FrameState, [f64; 4]),
+    independent: bool,
+) -> (FrameState, [f64; 4]) {
+    let (parent, parent_matrix) = parent_space;
+    let (root, root_matrix) = root_space;
+    let mut accumulated = local.clone();
+    if (flags & 0x1FC) == 0x1FC {
+        accumulated.flip_x ^= parent.flip_x;
+        accumulated.flip_y ^= parent.flip_y;
+        accumulated.angle += parent.angle;
+        accumulated.scale_x *= parent.scale_x;
+        accumulated.scale_y *= parent.scale_y;
+        accumulated.slant_x += parent.slant_x;
+        accumulated.slant_y += parent.slant_y;
+        let local_matrix = local_matrix(local, order);
+        return (
+            accumulated,
+            [
+                parent_matrix[0] * local_matrix[0] + parent_matrix[1] * local_matrix[2],
+                parent_matrix[0] * local_matrix[1] + parent_matrix[1] * local_matrix[3],
+                parent_matrix[2] * local_matrix[0] + parent_matrix[3] * local_matrix[2],
+                parent_matrix[2] * local_matrix[1] + parent_matrix[3] * local_matrix[3],
+            ],
+        );
+    }
+
+    if flags & 0x004 != 0 {
+        accumulated.flip_x ^= parent.flip_x;
+    }
+    if flags & 0x008 != 0 {
+        accumulated.flip_y ^= parent.flip_y;
+    }
+    if flags & 0x010 != 0 {
+        accumulated.angle += parent.angle;
+    }
+    if flags & 0x020 != 0 {
+        accumulated.scale_x *= parent.scale_x;
+    }
+    if flags & 0x040 != 0 {
+        accumulated.scale_y *= parent.scale_y;
+    }
+    if flags & 0x080 != 0 {
+        accumulated.slant_x += parent.slant_x;
+    }
+    if flags & 0x100 != 0 {
+        accumulated.slant_y += parent.slant_y;
+    }
+
+    if independent {
+        let matrix = local_matrix(&accumulated, order);
+        return (accumulated, matrix);
+    }
+
+    let mut matrix_state = accumulated.clone();
+    if flags & 0x004 != 0 {
+        matrix_state.flip_x ^= root.flip_x;
+    }
+    if flags & 0x008 != 0 {
+        matrix_state.flip_y ^= root.flip_y;
+    }
+    if flags & 0x010 != 0 {
+        matrix_state.angle -= root.angle;
+    }
+    if flags & 0x020 != 0 {
+        matrix_state.scale_x /= root.scale_x;
+    }
+    if flags & 0x040 != 0 {
+        matrix_state.scale_y /= root.scale_y;
+    }
+    if flags & 0x080 != 0 {
+        matrix_state.slant_x -= root.slant_x;
+    }
+    if flags & 0x100 != 0 {
+        matrix_state.slant_y -= root.slant_y;
+    }
+    let local_matrix = local_matrix(&matrix_state, order);
+    (
+        accumulated,
+        [
+            root_matrix[0] * local_matrix[0] + root_matrix[1] * local_matrix[2],
+            root_matrix[0] * local_matrix[1] + root_matrix[1] * local_matrix[3],
+            root_matrix[2] * local_matrix[0] + root_matrix[3] * local_matrix[2],
+            root_matrix[2] * local_matrix[1] + root_matrix[3] * local_matrix[3],
+        ],
+    )
+}
+
 /// The byte channels a normalized color animator hands the rasterizer.
 fn color_bytes(channels: [f32; 4]) -> [u8; 4] {
     channels.map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8)
@@ -3950,8 +4055,8 @@ mod tests {
     use super::local_matrix;
     use super::{
         BitmapState, DEFAULT_NODE_COLORS, DrawSettings, MotionNode, MotionSnapshot, PlayerInst,
-        build_node_tree, composite_pose, draw_icon, draw_point, evaluate_frames, node_drawable,
-        prime_timelines, unit_axis_aligned_origin,
+        build_node_tree, composite_pose, draw_icon, draw_point, evaluate_frames, inherited_parent,
+        inherited_transform, node_drawable, prime_timelines, unit_axis_aligned_origin,
     };
     use crate::engine_api::Storage;
     use crate::engine_api::layer_ops::{AffineBlit, BlitOptions, BlitSource, affine_blit};
@@ -5113,6 +5218,86 @@ mod tests {
         assert!((matrix[1] + 2.0).abs() < 1e-9, "m12 = -sin*sx: {matrix:?}");
         assert!((matrix[2] - 3.0).abs() < 1e-9, "m21 = sin*sy: {matrix:?}");
         assert!(matrix[3].abs() < 1e-9, "m22 = cos*sy: {matrix:?}");
+    }
+
+    /// The m2 logo's text hierarchy uses non-full `inheritMask` values
+    /// (`str_clip`/glyph nodes); those layers must build their matrix from the
+    /// root, not from the parent's full matrix.  The parent matrix still
+    /// maps the node's position, which is why the root-vs-parent matrix
+    /// distinction shows up in child scale/rotation but not in the parent
+    /// translation.
+    /// A layout node marked `0x00400000` is skipped by the child's parent
+    /// lookup; the m2 `str_clip` layout carries that bit, so its text
+    /// children take the main layout's accumulated state instead.
+    #[test]
+    fn inherit_mask_parent_boundary_skips_the_layout_node() {
+        let mut nodes = vec![
+            MotionNode::new(0, String::new()),
+            MotionNode::new(0, "str_clip".to_string()),
+            MotionNode::new(1, "str_locate".to_string()),
+        ];
+        nodes[1].inherit_flags = 0x0040_0000 | 0x1FC;
+        assert_eq!(inherited_parent(&nodes, 2), 0);
+    }
+
+    #[test]
+    fn inherit_mask_chooses_root_or_parent_matrix_for_the_child_space() {
+        let local = FrameState {
+            scale_x: 2.0,
+            scale_y: 2.0,
+            ..FrameState::default()
+        };
+        let parent = FrameState {
+            scale_x: 4.0,
+            scale_y: 4.0,
+            ..FrameState::default()
+        };
+        let root = FrameState {
+            scale_x: 2.0,
+            scale_y: 2.0,
+            ..FrameState::default()
+        };
+        let parent_matrix = [4.0, 0.0, 0.0, 4.0];
+        let root_matrix = [2.0, 0.0, 0.0, 2.0];
+        let order = [3, 2, 1, 0];
+
+        // A layer with no transform inheritance uses the root matrix for its
+        // child space, while its own position is still parent-mapped.
+        let (accumulated, matrix) = inherited_transform(
+            &local,
+            &order,
+            0,
+            (&parent, parent_matrix),
+            (&root, root_matrix),
+            false,
+        );
+        assert_eq!(accumulated.scale_x, 2.0);
+        assert_eq!(matrix, [4.0, 0.0, 0.0, 4.0]);
+
+        // Scale inheritance accumulates the parent scale, but the matrix is
+        // root × (accumulated/root), not parent × local.
+        let (accumulated, matrix) = inherited_transform(
+            &local,
+            &order,
+            0x020,
+            (&parent, parent_matrix),
+            (&root, root_matrix),
+            false,
+        );
+        assert_eq!(accumulated.scale_x, 8.0);
+        assert_eq!(matrix, [8.0, 0.0, 0.0, 4.0]);
+
+        // Full inheritance keeps the reference parent composition.
+        let (accumulated, matrix) = inherited_transform(
+            &local,
+            &order,
+            0x1FC,
+            (&parent, parent_matrix),
+            (&root, root_matrix),
+            false,
+        );
+        assert_eq!(accumulated.scale_x, 8.0);
+        assert_eq!(matrix, [8.0, 0.0, 0.0, 8.0]);
     }
 
     #[test]
