@@ -97,7 +97,7 @@ fn render(kind: TransKind, src1: &BitmapState, src2: &BitmapState) -> BitmapStat
 /// width of the quadrilateral currently showing it.
 fn extent(bitmap: &BitmapState) -> i32 {
     let (mut lo, mut hi) = (i32::MAX, i32::MIN);
-    for (i, px) in bitmap.rgba.chunks_exact(4).enumerate() {
+    for (i, px) in bitmap.rgba.as_chunks::<4>().0.iter().enumerate() {
         if px[2] == BLUE2 {
             let x = (i % SIZE as usize) as i32;
             lo = lo.min(x);
@@ -109,7 +109,12 @@ fn extent(bitmap: &BitmapState) -> i32 {
 
 /// Whether any pixel was sampled from the source marked `blue`.
 fn uses(bitmap: &BitmapState, blue: u8) -> bool {
-    bitmap.rgba.chunks_exact(4).any(|px| px[2] == blue)
+    bitmap
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|px| px[2] == blue)
 }
 
 #[test]
@@ -180,7 +185,7 @@ fn rotate_swap_mid_phase_transforms_and_reveals_the_background() {
     // else.
     assert_eq!(at(&dst, 1, 1), BG_RGBA);
     assert_eq!(at(&dst, 30, 30), BG_RGBA);
-    assert!(dst.rgba.chunks_exact(4).any(|px| *px == BG_RGBA));
+    assert!(dst.rgba.as_chunks::<4>().0.contains(&BG_RGBA));
     assert!(uses(&dst, BLUE1), "source 1 is still on screen");
     assert!(uses(&dst, BLUE2), "source 2 has grown into the frame");
 }

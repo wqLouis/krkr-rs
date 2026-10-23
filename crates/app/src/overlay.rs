@@ -266,7 +266,7 @@ impl Panel {
     /// Creates a `PANEL_WIDTH`x`PANEL_HEIGHT` panel filled with `color`.
     fn filled(color: [u8; 4]) -> Self {
         let mut rgba = vec![0u8; PANEL_WIDTH as usize * PANEL_HEIGHT as usize * 4];
-        for texel in rgba.chunks_exact_mut(4) {
+        for texel in rgba.as_chunks_mut::<4>().0 {
             texel.copy_from_slice(&color);
         }
         Self { rgba }
@@ -782,7 +782,9 @@ mod tests {
         draw_text_color(&mut panel, 4, 4, "1", TEXT_COLOR).expect("draw");
         let inked = panel
             .rgba()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|pixel| pixel.iter().any(|&byte| byte != 0))
             .count();
         assert!(inked > 0, "the glyph drew no ink");

@@ -1008,7 +1008,12 @@ fn layer_draw_text_uses_a_mapped_prerendered_font() {
         .bitmap(layer.bitmap.expect("the layer has a main image"))
         .expect("the bitmap exists");
     assert!(
-        bitmap.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0),
+        bitmap
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] != 0),
         "drawText should use the mapped pre-rendered coverage"
     );
 }

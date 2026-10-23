@@ -854,7 +854,11 @@ impl PsdFile {
         let Ok(descriptor) = descriptor::read_descriptor(&mut r) else {
             return;
         };
-        self.last_applied_comp_id = descriptor.integer("lastAppliedComp").map_or(-1, |id| id);
+        let mut last_applied = -1;
+        if let Some(id) = descriptor.integer("lastAppliedComp") {
+            last_applied = id;
+        }
+        self.last_applied_comp_id = last_applied;
         let Some(list) = descriptor.list("list") else {
             return;
         };
@@ -1185,8 +1189,10 @@ fn load_layer_comp_descriptor(layer: &mut LayerInfo, r: &mut Reader<'_>) {
         };
         if let Some(offset) = comp.descriptor("Ofst") {
             // Both axes read the horizontal key.
-            info.offset_x = offset.integer("Hrzn").map_or(0, |value| value);
-            info.offset_y = offset.integer("Hrzn").map_or(0, |value| value);
+            if let Some(hrzn) = offset.integer("Hrzn") {
+                info.offset_x = hrzn;
+                info.offset_y = hrzn;
+            }
         }
         match comp.boolean("enab") {
             Some(enabled) => {

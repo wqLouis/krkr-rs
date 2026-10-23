@@ -313,7 +313,12 @@ fn load_image_data(ctx: &CompatCtx, name: &str) -> Result<Option<ImageData>, Str
             Ok(info) => info.has_alpha,
             Err(error) => {
                 log::warn!("image: cannot probe {resolved:?}: {error}");
-                decoded.rgba.chunks_exact(4).any(|pixel| pixel[3] < 255)
+                decoded
+                    .rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] < 255)
             }
         }
     };

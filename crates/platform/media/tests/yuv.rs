@@ -29,14 +29,14 @@ fn solid_black_and_white_planar() {
     let black = planar_buffer(&[16; 4], &[128; 2], &[128; 2], 2, 2);
     let rgba = yuv420_to_rgba(&black, &layout);
     assert_eq!(rgba.len(), 2 * 2 * 4);
-    for pixel in rgba.chunks_exact(4) {
-        assert_eq!(pixel, [0, 0, 0, 255], "black pixel");
+    for pixel in rgba.as_chunks::<4>().0 {
+        assert_eq!(pixel, &[0, 0, 0, 255], "black pixel");
     }
 
     let white = planar_buffer(&[235; 4], &[128; 2], &[128; 2], 2, 2);
     let rgba = yuv420_to_rgba(&white, &layout);
-    for pixel in rgba.chunks_exact(4) {
-        assert_eq!(pixel, [255, 255, 255, 255], "white pixel");
+    for pixel in rgba.as_chunks::<4>().0 {
+        assert_eq!(pixel, &[255, 255, 255, 255], "white pixel");
     }
 }
 
@@ -64,8 +64,8 @@ fn odd_width_rounds_chroma_up() {
     let buffer = planar_buffer(&[235; 6], &[128; 2], &[128; 2], 3, 2);
     let rgba = yuv420_to_rgba(&buffer, &layout);
     assert_eq!(rgba.len(), 3 * 2 * 4);
-    for pixel in rgba.chunks_exact(4) {
-        assert_eq!(pixel, [255, 255, 255, 255]);
+    for pixel in rgba.as_chunks::<4>().0 {
+        assert_eq!(pixel, &[255, 255, 255, 255]);
     }
 }
 
@@ -87,8 +87,8 @@ fn stride_larger_than_width_skips_padding() {
     let buffer = planar_buffer(&y, &[128; 2], &[128; 2], 4, 2);
     let rgba = yuv420_to_rgba(&buffer, &layout);
     assert_eq!(rgba.len(), 2 * 2 * 4);
-    for pixel in rgba.chunks_exact(4) {
-        assert_eq!(pixel, [255, 255, 255, 255]);
+    for pixel in rgba.as_chunks::<4>().0 {
+        assert_eq!(pixel, &[255, 255, 255, 255]);
     }
 }
 
@@ -120,8 +120,8 @@ fn crop_rectangle_selects_the_visible_region() {
     let buffer = planar_buffer(&y, &[128; 4], &[128; 4], 4, 4);
     let rgba = yuv420_to_rgba(&buffer, &layout);
     assert_eq!(rgba.len(), 2 * 2 * 4);
-    for pixel in rgba.chunks_exact(4) {
-        assert_eq!(pixel, [255, 255, 255, 255], "cropped-in pixel is white");
+    for pixel in rgba.as_chunks::<4>().0 {
+        assert_eq!(pixel, &[255, 255, 255, 255], "cropped-in pixel is white");
     }
 }
 
@@ -132,8 +132,8 @@ fn semi_planar_nv12_interleaves_chroma() {
     assert_eq!(layout.uv_stride, 2);
     let buffer = vec![235, 235, 235, 235, 128, 128, 128, 128];
     let rgba = yuv420_to_rgba(&buffer, &layout);
-    for pixel in rgba.chunks_exact(4) {
-        assert_eq!(pixel, [255, 255, 255, 255]);
+    for pixel in rgba.as_chunks::<4>().0 {
+        assert_eq!(pixel, &[255, 255, 255, 255]);
     }
 }
 
@@ -144,7 +144,7 @@ fn short_buffer_does_not_panic() {
     assert_eq!(rgba.len(), 2 * 2 * 4);
     // Every read is bounds-checked, so the pixel is opaque; the value is
     // otherwise meaningless (all-zero chroma is not neutral).
-    for pixel in rgba.chunks_exact(4) {
+    for pixel in rgba.as_chunks::<4>().0 {
         assert_eq!(pixel[3], 255);
     }
 }

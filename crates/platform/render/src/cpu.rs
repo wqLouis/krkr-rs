@@ -89,7 +89,7 @@ pub(crate) fn render_scene<P: TextureProvider>(
         to_u8(clear[2]),
         to_u8(clear[3]),
     ];
-    for texel in pixels.chunks_exact_mut(4) {
+    for texel in pixels.as_chunks_mut::<4>().0 {
         texel.copy_from_slice(&clear);
     }
 

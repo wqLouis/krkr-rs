@@ -259,7 +259,12 @@ fn layer_draw_text_writes_non_transparent_pixels() {
         .bitmap(layer.bitmap.expect("the layer has a main image"))
         .expect("the bitmap exists");
     assert!(
-        bitmap.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0),
+        bitmap
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] != 0),
         "drawText should write non-transparent pixels"
     );
 }
@@ -306,7 +311,12 @@ fn image_function_draw_text_writes_into_the_destination_bitmap() {
 
     let bitmap = env.scene.bitmaps.last().expect("the destination bitmap");
     assert!(
-        bitmap.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0),
+        bitmap
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] != 0),
         "ImageFunction.drawText should write non-transparent pixels"
     );
 }

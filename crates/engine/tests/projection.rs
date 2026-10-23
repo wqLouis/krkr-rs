@@ -1300,8 +1300,10 @@ fn a_composited_cross_fade_matches_the_cpu_blend() {
             .expect("cpu blend");
 
         for (index, (gpu, expected)) in composited
-            .chunks_exact(4)
-            .zip(cpu.rgba.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(cpu.rgba.as_chunks::<4>().0.iter())
             .enumerate()
         {
             for (channel, (gpu, expected)) in gpu.iter().zip(expected).enumerate() {
@@ -1385,8 +1387,10 @@ fn a_translucent_second_source_stays_within_the_documented_tolerance() {
 
     let bound = 255.0 * t * (1.0 - 128.0 / 255.0) + 1.0;
     for (index, (gpu, expected)) in composited
-        .chunks_exact(4)
-        .zip(cpu.rgba.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(cpu.rgba.as_chunks::<4>().0.iter())
         .enumerate()
     {
         for (channel, (gpu, expected)) in gpu.iter().zip(expected).enumerate() {

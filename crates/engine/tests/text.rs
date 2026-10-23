@@ -120,7 +120,9 @@ fn a_line_baseline_sits_at_the_face_ascent() {
     .expect("compose the text");
     let ink_row = canvas
         .rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .position(|pixel| pixel[3] != 0)
         .map(|index| index / 64)
         .expect("the composed text has ink");
@@ -165,7 +167,7 @@ fn atlas_rasterizes_and_caches_glyphs() {
     assert_eq!(first, second, "repeat request must reuse the atlas cell");
     assert_eq!(atlas.len(), 1);
     assert!(!first.is_empty());
-    assert!(atlas.pixels().chunks_exact(4).any(|px| px[3] > 0));
+    assert!(atlas.pixels().as_chunks::<4>().0.iter().any(|px| px[3] > 0));
 }
 
 #[test]
@@ -239,11 +241,15 @@ fn cpu_composition_matches_atlas_ink() {
     let buffer = compose_text_cpu(&atlas, &positioned, 64, 64);
     assert_eq!(buffer.len(), 64 * 64 * 4);
     assert!(
-        buffer.chunks_exact(4).any(|px| px[3] > 0),
+        buffer.as_chunks::<4>().0.iter().any(|px| px[3] > 0),
         "the composited text must contain ink"
     );
     assert!(
-        buffer.chunks_exact(4).any(|px| px[3] > 0 && px[0] > 0),
+        buffer
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|px| px[3] > 0 && px[0] > 0),
         "ink must carry the requested colour"
     );
 }
@@ -277,14 +283,18 @@ fn colour_change_reuses_the_cached_glyph() {
     assert!(
         atlas
             .pixels()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .all(|px| px[0] == px[1] && px[1] == px[2]),
         "the atlas must store colour-independent coverage"
     );
     assert!(
         atlas
             .pixels()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|px| px[3] > 0 && px[0] == 255),
         "covered texels must be white so the node tint supplies the colour"
     );

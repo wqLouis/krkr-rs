@@ -138,7 +138,12 @@ impl Env {
             .find(|bitmap| bitmap.width == width && bitmap.height == height)
             .expect("the draw target's bitmap");
         assert!(
-            bitmap.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0),
+            bitmap
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] != 0),
             "Player.draw must write pixels into the target layer"
         );
         (bitmap.width, bitmap.height, bitmap.rgba.clone())
@@ -397,7 +402,9 @@ fn player_draw_samples_the_icon_texture() {
     // A solid quad would paint every covered pixel with one value; the
     // texture carries thousands of distinct colours.
     let distinct: hashbrown::HashSet<[u8; 4], ahash::RandomState> = pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
         .collect();
     assert!(
@@ -1519,11 +1526,11 @@ fn the_stencil_groups_mask_the_layout_and_eye_clips() {
     // 全体構造's groups name child-motion layers, which carry no image, so
     // their mask pass is a no-op; the clip still draws the body.
     assert!(
-        layout.chunks_exact(4).any(|pixel| pixel[3] != 0),
+        layout.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0),
         "the three layout groups' clip draws"
     );
     assert!(
-        eye_r.chunks_exact(4).any(|pixel| pixel[3] != 0),
+        eye_r.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0),
         "the right eye's group clip draws"
     );
     // (435, 569) is inside the left eye group's clip and inside the `shirome`

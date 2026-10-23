@@ -1620,7 +1620,7 @@ impl PlayerInst {
         // explicit clear; the pixels outside the drawn items survive.
         if self.clear_enabled {
             let clear = clear_fill(self.clear_enabled, self.clear_color);
-            for pixel in bitmap.rgba.chunks_exact_mut(4) {
+            for pixel in bitmap.rgba.as_chunks_mut::<4>().0.iter_mut() {
                 pixel.copy_from_slice(&clear);
             }
         }
@@ -2521,7 +2521,7 @@ fn tint_crop(
             lerp(colors[1][2], colors[2][2], row_step, span_y),
             lerp(colors[1][3], colors[2][3], row_step, span_y),
         ];
-        for (index, pixel) in row.chunks_exact(4).enumerate() {
+        for (index, pixel) in row.as_chunks::<4>().0.iter().enumerate() {
             let column = i32::try_from(index).ok()?;
             rgba.extend_from_slice(&[
                 ((u32::from(pixel[0]) * lerp(left[0] as u8, right[0] as u8, column, span_x))
@@ -3090,7 +3090,7 @@ fn refresh_node_geometry(
         // grow past the precision of the sum and the evaluation loses every
         // digit of its result.
         if previous.len() >= 32 && det.abs() > 1e-10 {
-            for pair in points.chunks_exact_mut(2) {
+            for pair in points.as_chunks_mut::<2>().0.iter_mut() {
                 let tx = f64::from(pair[0]) - org_x;
                 let ty = f64::from(pair[1]) - org_y;
                 let u = ((mw22 * tx - mw12 * ty) / det) as f32;
@@ -3118,7 +3118,7 @@ fn refresh_node_geometry(
         let mut cascade_x = org_x as f32;
         let mut cascade_y = org_y as f32;
         for (mesh, inverse, offset) in chain {
-            for pair in points.chunks_exact_mut(2) {
+            for pair in points.as_chunks_mut::<2>().0.iter_mut() {
                 let tx = pair[0] + offset[0];
                 let ty = pair[1] + offset[1];
                 let ix = (inverse[0] * f64::from(tx) + inverse[1] * f64::from(ty)) as f32;
@@ -3140,7 +3140,7 @@ fn refresh_node_geometry(
         if cascade_x != org_x as f32 || cascade_y != org_y as f32 {
             let dx = cascade_x - org_x as f32;
             let dy = cascade_y - org_y as f32;
-            for pair in points.chunks_exact_mut(2) {
+            for pair in points.as_chunks_mut::<2>().0.iter_mut() {
                 pair[0] += dx;
                 pair[1] += dy;
             }

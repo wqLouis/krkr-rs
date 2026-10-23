@@ -2849,7 +2849,7 @@ impl Scene {
             if fill == [0, 0, 0, 0] {
                 span.fill(0);
             } else {
-                for chunk in span.chunks_exact_mut(4) {
+                for chunk in span.as_chunks_mut::<4>().0 {
                     chunk.copy_from_slice(&fill);
                 }
             }
@@ -3057,7 +3057,7 @@ impl Scene {
             return false;
         }
         rgba.resize(bytes, 0);
-        for chunk in rgba.chunks_exact_mut(4) {
+        for chunk in rgba.as_chunks_mut::<4>().0 {
             chunk.copy_from_slice(&fill);
         }
         let bitmap_id = self.add_bitmap(w, h, rgba);

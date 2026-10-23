@@ -9,7 +9,7 @@ fn encode_jpeg(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     use image::ImageEncoder;
     // The JPEG encoder accepts RGB (not RGBA); drop the alpha channel.
     let mut rgb = Vec::with_capacity((width as usize * height as usize) * 3);
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         rgb.extend_from_slice(&px[..3]);
     }
     let mut out = Vec::new();

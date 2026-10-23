@@ -325,7 +325,7 @@ fn ensure_bitmap(scene: &mut Scene, layer_id: u32, width: u32, height: u32) -> O
                 .checked_mul(height as usize)?
                 .checked_mul(4)?;
             let mut rgba = vec![0u8; count];
-            for chunk in rgba.chunks_exact_mut(4) {
+            for chunk in rgba.as_chunks_mut::<4>().0.iter_mut() {
                 chunk.copy_from_slice(&fill);
             }
             Some(scene.add_bitmap(width, height, rgba))

@@ -671,8 +671,10 @@ fn resize_bitmap_keeps_the_fill_for_rows_the_source_does_not_hold() {
     assert!(
         bitmap
             .rgba
-            .chunks_exact(4)
-            .all(|pixel| pixel == [9, 8, 7, 6]),
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel == &[9, 8, 7, 6]),
         "a bitmap without pixels keeps the fill"
     );
     assert!(bitmap.dirty, "a resized bitmap is dirty");
@@ -692,8 +694,10 @@ fn resize_bitmap_keeps_the_fill_for_rows_the_source_does_not_hold() {
     assert_eq!(&bitmap.rgba[32..40], &[9, 8, 7, 6, 9, 8, 7, 6]);
     assert!(
         bitmap.rgba[40..]
-            .chunks_exact(4)
-            .all(|pixel| pixel == [9, 8, 7, 6]),
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel == &[9, 8, 7, 6]),
         "the row the source does not hold keeps the fill"
     );
 }
@@ -759,7 +763,7 @@ fn resize_bitmap_keeps_the_overlap_and_clears_only_the_new_region() {
             );
         }
     }
-    for pixel in bitmap.rgba[2 * 2 * 4..].chunks_exact(4) {
+    for pixel in bitmap.rgba[2 * 2 * 4..].as_chunks::<4>().0.iter() {
         assert_eq!(pixel, &[5, 6, 7, 8], "the new rows take the fill");
     }
 }
@@ -798,8 +802,10 @@ fn resize_bitmap_keeps_the_whole_rows_a_partial_buffer_holds() {
     assert_eq!(&bitmap.rgba[40..48], &[9, 8, 7, 6, 9, 8, 7, 6]);
     assert!(
         bitmap.rgba[48..]
-            .chunks_exact(4)
-            .all(|pixel| pixel == [9, 8, 7, 6]),
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel == &[9, 8, 7, 6]),
         "the half-held row and the row after it keep the fill"
     );
 }

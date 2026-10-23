@@ -806,7 +806,7 @@ impl Xp3Archive {
                         .get(22..22 + name_len * 2)
                         .ok_or(Xp3Error::CorruptIndex("name overruns info sub-chunk"))?;
                     let mut units = Vec::with_capacity(name_len);
-                    for c in name_bytes.chunks_exact(2) {
+                    for c in name_bytes.as_chunks::<2>().0 {
                         units.push(u16::from_le_bytes([c[0], c[1]]));
                     }
                     raw_name = String::from_utf16_lossy(&units);
@@ -824,7 +824,7 @@ impl Xp3Archive {
                             "segm sub-chunk size not multiple of 28",
                         ));
                     }
-                    for s in payload.chunks_exact(28) {
+                    for s in payload.as_chunks::<28>().0 {
                         let (flags, s) = s.split_at(4);
                         let (start, s) = s.split_at(8);
                         let (org_size, arc_size) = s.split_at(8);

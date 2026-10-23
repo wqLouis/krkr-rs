@@ -218,8 +218,10 @@ fn composited(oracle: [u8; 4], background: [u8; 4]) -> [f32; 4] {
 /// most one level before the composition carries it.
 fn assert_matches_cpu(drawn: &[u8], cpu: &BitmapState, bound: f32, what: &str) {
     for (index, (got, expected)) in drawn
-        .chunks_exact(4)
-        .zip(cpu.rgba.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(cpu.rgba.as_chunks::<4>().0.iter())
         .enumerate()
     {
         let reference = composited(

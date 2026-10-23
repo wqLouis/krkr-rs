@@ -448,7 +448,7 @@ fn nested_cache_scene() -> (Scene, u32, u32, u32, u32) {
 /// Fill a bitmap with one opaque colour.
 fn paint(scene: &mut Scene, id: u32, color: [u8; 4]) {
     let bitmap = scene.bitmap_mut(id).expect("bitmap to paint");
-    for pixel in bitmap.rgba.chunks_exact_mut(4) {
+    for pixel in bitmap.rgba.as_chunks_mut::<4>().0.iter_mut() {
         pixel.copy_from_slice(&color);
     }
 }
@@ -1005,8 +1005,10 @@ fn a_large_stretch_blit_matches_the_solid_source() {
     assert!(
         destination
             .rgba
-            .chunks_exact(4)
-            .all(|pixel| pixel == [10, 20, 30, 255]),
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel == &[10, 20, 30, 255]),
         "the stretch row bands write the solid source"
     );
 }
@@ -1061,8 +1063,10 @@ fn a_large_blit_over_matches_the_single_pixel_path() {
     assert!(
         destination
             .rgba
-            .chunks_exact(4)
-            .all(|pixel| pixel == [128, 128, 128, 128]),
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel == &[128, 128, 128, 128]),
         "the row bands write the same straight-alpha result"
     );
 }

@@ -130,7 +130,7 @@ fn expected_rgba_len(width: u32, height: u32) -> Result<usize, MediaError> {
 /// Flattens straight-alpha RGBA8 to RGB8, dropping the alpha channel.
 fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
-    for pixel in rgba.chunks_exact(4) {
+    for pixel in rgba.as_chunks::<4>().0 {
         rgb.extend_from_slice(&pixel[..3]);
     }
     rgb
@@ -295,7 +295,7 @@ fn encode_bmp(mode: BmpMode, width: u32, height: u32, rgba: &[u8]) -> Result<Vec
         BmpMode::Bpp32 => {
             for y in (0..height as usize).rev() {
                 let row = &rgba[y * row_len..y * row_len + row_len];
-                for pixel in row.chunks_exact(4) {
+                for pixel in row.as_chunks::<4>().0 {
                     out.push(pixel[2]); // B
                     out.push(pixel[1]); // G
                     out.push(pixel[0]); // R
@@ -307,7 +307,7 @@ fn encode_bmp(mode: BmpMode, width: u32, height: u32, rgba: &[u8]) -> Result<Vec
             let pad = pitch - row_bytes;
             for y in (0..height as usize).rev() {
                 let row = &rgba[y * row_len..y * row_len + row_len];
-                for pixel in row.chunks_exact(4) {
+                for pixel in row.as_chunks::<4>().0 {
                     out.push(pixel[2]); // B
                     out.push(pixel[1]); // G
                     out.push(pixel[0]); // R
@@ -321,7 +321,7 @@ fn encode_bmp(mode: BmpMode, width: u32, height: u32, rgba: &[u8]) -> Result<Vec
             let pad = pitch - row_bytes;
             for y in (0..height as usize).rev() {
                 let row = &rgba[y * row_len..y * row_len + row_len];
-                for (x, pixel) in row.chunks_exact(4).enumerate() {
+                for (x, pixel) in row.as_chunks::<4>().0.iter().enumerate() {
                     let low = table[0][y & 3][x & 3][pixel[0] as usize] as usize;
                     let mid = table[1][y & 3][x & 3][pixel[1] as usize] as usize;
                     let high = table[2][y & 3][x & 3][pixel[2] as usize] as usize;

@@ -63,7 +63,7 @@ fn tlg6_rgba_roundtrip_all_filters() {
 fn tlg6_rgb_roundtrip_all_filters() {
     let (w, h) = (40usize, 24usize);
     let mut img = test_image(w, h);
-    for px in img.chunks_exact_mut(4) {
+    for px in img.as_chunks_mut::<4>().0 {
         px[3] = 0xff; // opaque 24-bit image
     }
     let encoded = encode_tlg6(&img, w, h, 3);
@@ -107,7 +107,7 @@ fn tlg6_multi_band_partial_rgb_roundtrip() {
     // is checked on a channel count whose unused alpha lane stays zero.
     let (w, h) = (45usize, 21usize);
     let mut img = test_image(w, h);
-    for px in img.chunks_exact_mut(4) {
+    for px in img.as_chunks_mut::<4>().0 {
         px[3] = 0xff;
     }
     let encoded = encode_tlg6(&img, w, h, 3);
@@ -152,7 +152,7 @@ fn tlg5_block_height_larger_than_the_image_roundtrip() {
 fn tlg5_rgb_roundtrip() {
     let (w, h) = (21usize, 19usize);
     let mut img = test_image(w, h);
-    for px in img.chunks_exact_mut(4) {
+    for px in img.as_chunks_mut::<4>().0 {
         px[3] = 0xff;
     }
     let encoded = encode_tlg5(&img, w, h, 3, 4);

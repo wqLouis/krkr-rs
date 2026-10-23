@@ -148,7 +148,7 @@ pub fn fill_rect_replace(bitmap: &mut BitmapState, x: i32, y: i32, w: u32, h: u3
         let Some(destination) = bitmap.rgba.get_mut(start..end.min(buffer_len)) else {
             continue;
         };
-        for pixel in destination.chunks_exact_mut(4) {
+        for pixel in destination.as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(&color);
         }
     }

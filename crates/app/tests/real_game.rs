@@ -87,7 +87,13 @@ fn decodes_real_images_and_probes_audio() {
         // content; it does not prove the pixels are reference-exact, which
         // needs a committed reference asset to compare against.
         let first = &image.rgba[..4];
-        if image.rgba.chunks_exact(4).any(|pixel| pixel != first) {
+        if image
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel != first)
+        {
             saw_non_uniform = true;
         }
         decoded += 1;

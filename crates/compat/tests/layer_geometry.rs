@@ -591,7 +591,7 @@ fn a_content_only_bitmap_write_reaches_the_subtree_cache() {
     let structure = env.scene.structure_revision();
     {
         let bitmap = env.scene.bitmap_mut(child_bitmap).expect("child image");
-        for pixel in bitmap.rgba.chunks_exact_mut(4) {
+        for pixel in bitmap.rgba.as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(&[0, 0, 255, 255]);
         }
         bitmap.mark_dirty();

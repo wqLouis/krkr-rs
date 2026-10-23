@@ -150,7 +150,7 @@ fn adaptive_color_key(rgba: &[u8], width: u32) -> u32 {
     let mut counts: Map<u32, u32> = Map::default();
     let mut best = 0u32;
     let mut best_count = 0u32;
-    for pixel in rgba.chunks_exact(4).take(width as usize) {
+    for pixel in rgba.as_chunks::<4>().0.iter().take(width as usize) {
         let rgb = (u32::from(pixel[0]) << 16) | (u32::from(pixel[1]) << 8) | u32::from(pixel[2]);
         let count = counts.entry(rgb).or_insert(0);
         *count += 1;
@@ -164,7 +164,7 @@ fn adaptive_color_key(rgba: &[u8], width: u32) -> u32 {
 
 /// Make `key`-colored pixels transparent and everything else opaque.
 fn make_alpha_from_key(rgba: &mut [u8], key: u32) {
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0.iter_mut() {
         let rgb = (u32::from(pixel[0]) << 16) | (u32::from(pixel[1]) << 8) | u32::from(pixel[2]);
         pixel[3] = if rgb == key { 0 } else { 255 };
     }

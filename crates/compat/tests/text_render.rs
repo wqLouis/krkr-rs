@@ -889,7 +889,9 @@ fn layer_draw_text_zero_offset_shadow_leaves_a_dark_halo() {
         .expect("the bitmap exists");
     let dark: Vec<[u8; 4]> = bitmap
         .rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|pixel| pixel[3] > 0 && pixel[0] < 64 && pixel[1] < 64 && pixel[2] < 64)
         .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
         .collect();

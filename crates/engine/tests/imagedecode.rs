@@ -895,7 +895,7 @@ fn a_job_pass_runs_on_the_worker_and_publishes_its_output() {
             *pass_thread.lock().unwrap_or_else(PoisonError::into_inner) =
                 Some(thread::current().id());
             let mut rgba = image.rgba;
-            for pixel in rgba.chunks_exact_mut(4) {
+            for pixel in rgba.as_chunks_mut::<4>().0 {
                 pixel[3] = 0;
             }
             Ok(DecodedImage::new(image.width, image.height, rgba))
@@ -925,7 +925,12 @@ fn a_job_pass_runs_on_the_worker_and_publishes_its_output() {
         "the pass ran on the decode worker"
     );
     assert!(
-        image.rgba.chunks_exact(4).all(|pixel| pixel[3] == 0),
+        image
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel[3] == 0),
         "the published pixels are the pass output"
     );
     assert_eq!(&image.rgba[..3], &PIXELS[..3], "the pass kept the colours");
@@ -977,7 +982,7 @@ fn a_resolved_pass_is_the_cached_image() {
     let pass: Arc<dyn Fn(DecodedImage) -> Result<DecodedImage, String> + Send + Sync> =
         Arc::new(|image: DecodedImage| {
             let mut rgba = image.rgba;
-            for pixel in rgba.chunks_exact_mut(4) {
+            for pixel in rgba.as_chunks_mut::<4>().0 {
                 pixel[3] = 7;
             }
             Ok(DecodedImage::new(image.width, image.height, rgba))
@@ -1002,14 +1007,24 @@ fn a_resolved_pass_is_the_cached_image() {
     assert!(scene.resolve_bitmap(id));
     let bitmap = scene.bitmap(id).expect("the bitmap");
     assert!(
-        bitmap.rgba.chunks_exact(4).all(|pixel| pixel[3] == 7),
+        bitmap
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel[3] == 7),
         "the bitmap holds the pass output"
     );
     let cached = scene
         .lookup_decoded_image(&key)
         .expect("the cache holds the resolved image");
     assert!(
-        cached.rgba.chunks_exact(4).all(|pixel| pixel[3] == 7),
+        cached
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel[3] == 7),
         "the cache holds the pass output, not the raw decode"
     );
 }

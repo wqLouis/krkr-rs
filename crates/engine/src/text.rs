@@ -2234,7 +2234,12 @@ fn validate_size(size_px: f32) -> Result<(), TextError> {
 /// cell can be tinted with any text colour at draw time without re-rasterizing.
 fn coverage_rgba(bitmap: &GlyphBitmap) -> Vec<u8> {
     let mut out = vec![0u8; (bitmap.width as usize) * (bitmap.height as usize) * 4];
-    for (pixel, &coverage) in out.chunks_exact_mut(4).zip(bitmap.coverage.iter()) {
+    for (pixel, &coverage) in out
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(bitmap.coverage.iter())
+    {
         pixel[0] = 255;
         pixel[1] = 255;
         pixel[2] = 255;

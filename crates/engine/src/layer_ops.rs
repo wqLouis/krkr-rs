@@ -1296,7 +1296,7 @@ pub fn do_drop_shadow(
     // The shadow buffer starts from the alpha of `bitmap`, with RGB set to the
     // shadow color, and is then blurred.
     let mut shadow = bitmap.clone();
-    for chunk in shadow.rgba.chunks_exact_mut(4) {
+    for chunk in shadow.rgba.as_chunks_mut::<4>().0 {
         chunk[0] = shadow_color[0];
         chunk[1] = shadow_color[1];
         chunk[2] = shadow_color[2];
@@ -4470,7 +4470,14 @@ mod tests {
         );
         generic_pass(&mut generic, corners, &src, 2, 255);
         assert_eq!(scanline.rgba, generic.rgba);
-        assert!(scanline.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        assert!(
+            scanline
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] != 0)
+        );
     }
 
     /// A one-to-one stretch takes the exact source-over blit path.

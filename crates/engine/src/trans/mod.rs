@@ -253,7 +253,9 @@ impl RuleMask {
             });
         }
         let gray = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|px| {
                 ((u32::from(px[0]) * 77 + u32::from(px[1]) * 150 + u32::from(px[2]) * 29) >> 8)
                     as u8
@@ -1213,10 +1215,12 @@ fn blend_row(
 ///
 /// The rows hold whole pixels, so every pixel of the row is blended.
 fn blend_pixels(dst: &mut [u8], src1: &[u8], src2: &[u8], opa: i32) {
-    for (d, (a, b)) in dst
-        .chunks_exact_mut(4)
-        .zip(src1.chunks_exact(4).zip(src2.chunks_exact(4)))
-    {
+    for (d, (a, b)) in dst.as_chunks_mut::<4>().0.iter_mut().zip(
+        src1.as_chunks::<4>()
+            .0
+            .iter()
+            .zip(src2.as_chunks::<4>().0.iter()),
+    ) {
         d[0] = blend_channel(a[0], b[0], opa);
         d[1] = blend_channel(a[1], b[1], opa);
         d[2] = blend_channel(a[2], b[2], opa);
@@ -1233,7 +1237,7 @@ fn blend_pixels_sparse(
     row: BlendRow,
     opa: i32,
 ) {
-    for (index, pixel) in dst.chunks_exact_mut(4).enumerate() {
+    for (index, pixel) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let x = row.x0.max(0) + index as i32;
         let blended = blend_level(read_pixel(src1, x, row.y), read_pixel(src2, x, row.y), opa);
         pixel[0] = blended[0];
@@ -1264,8 +1268,10 @@ fn blend_rule_row(
     match (first, second) {
         (Some(a), Some(b)) if a.len() == dst_row.len() && b.len() == dst_row.len() => {
             for (d, (left, right)) in dst_row
-                .chunks_exact_mut(4)
-                .zip(a.chunks_exact(4).zip(b.chunks_exact(4)))
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0.iter()))
             {
                 let opa = i32::from(table[usize::from(gray_row[column])]);
                 column += 1;
@@ -1300,7 +1306,7 @@ fn blend_rule_pixels_sparse(
     table: &[u8; 256],
     rule: &RuleMask,
 ) {
-    for (index, pixel) in dst.chunks_exact_mut(4).enumerate() {
+    for (index, pixel) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let x = row.x0.max(0) + index as i32;
         let opa = i32::from(table[usize::from(rule.at(x, row.y))]);
         let blended = blend_level(read_pixel(src1, x, row.y), read_pixel(src2, x, row.y), opa);
@@ -1383,7 +1389,7 @@ mod tests {
             let mut row = vec![0u8; first.len()];
             blend_pixels(&mut row, &first, &second, opa);
             let mut per_pixel = vec![0u8; first.len()];
-            for (index, out) in per_pixel.chunks_exact_mut(4).enumerate() {
+            for (index, out) in per_pixel.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let blended = blend_level(pixel(&first, index), pixel(&second, index), opa);
                 out.copy_from_slice(&blended);
             }

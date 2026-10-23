@@ -67,8 +67,8 @@ fn null_offscreen_target_reads_back_the_clear_colour() {
         &mut out,
     )
     .expect("read");
-    for texel in out.chunks_exact(4) {
-        assert_eq!(texel, [255, 0, 0, 255]);
+    for texel in out.as_chunks::<4>().0 {
+        assert_eq!(texel, &[255, 0, 0, 255]);
     }
 }
 
@@ -141,8 +141,8 @@ fn null_offscreen_textured_quad_reads_back() {
         &mut out,
     )
     .expect("read");
-    for texel in out.chunks_exact(4) {
-        assert_eq!(texel, [0, 255, 0, 255]);
+    for texel in out.as_chunks::<4>().0 {
+        assert_eq!(texel, &[0, 255, 0, 255]);
     }
 }
 

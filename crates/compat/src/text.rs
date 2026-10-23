@@ -375,9 +375,11 @@ fn require_container_bom(bytes: &[u8], mode: u8) -> Result<(), String> {
 fn decode_container_cipher(bytes: &[u8], mode: u8) -> Result<Decoded, String> {
     let payload: &[u8] = bytes.get(5..).unwrap_or_default();
     let units = payload
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| {
-            let ch = u16::from_le_bytes([chunk[0], chunk[1]]);
+            let ch = u16::from_le_bytes(*chunk);
             if mode == 0 {
                 if ch >= 0x20 {
                     ch ^ (((ch & 0xfe) << 8) ^ 1)
@@ -430,8 +432,10 @@ fn decode_container_zlib(bytes: &[u8]) -> Result<Decoded, String> {
         ));
     }
     let units = out
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk))
         .collect();
     Ok(Decoded::Units {
         units,
@@ -472,8 +476,8 @@ fn decoded_into_string(decoded: Decoded, path: DecodePath<'_>) -> String {
 fn decode_utf32(bytes: &[u8], label: &str, word: impl Fn([u8; 4]) -> u32) -> String {
     let mut dropped = bytes.len() % 4;
     let mut text = String::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
-        let code = word(chunk.try_into().expect("chunks_exact(4) yields 4 bytes"));
+    for chunk in bytes.as_chunks::<4>().0.iter() {
+        let code = word(*chunk);
         match char::from_u32(code) {
             Some(ch) => text.push(ch),
             None => dropped += 4,

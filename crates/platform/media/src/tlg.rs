@@ -268,7 +268,12 @@ fn decode_tlg5(raw: &[u8]) -> Result<RgbaImage, String> {
                 .iter()
                 .zip(plane1.iter())
                 .zip(plane2.iter())
-                .zip(row.chunks_exact_mut(4).zip(upper.chunks_exact(4)))
+                .zip(
+                    row.as_chunks_mut::<4>()
+                        .0
+                        .iter_mut()
+                        .zip(upper.as_chunks::<4>().0.iter()),
+                )
                 .enumerate()
             {
                 let g = *p1 as u32;
@@ -396,7 +401,7 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
             )?;
             // The lane decoder checked the buffer length, so the slice
             // below is inside it.
-            for (i, g) in lane_buf[..lane_len].chunks_exact(4).enumerate() {
+            for (i, g) in lane_buf[..lane_len].as_chunks::<4>().0.iter().enumerate() {
                 pixelbuf[i][c] = g[c];
             }
         }
@@ -459,7 +464,7 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
     if colors == 1 {
         // Grayscale TLG6: the reference stores the luminance in the first
         // byte lane. Present it as proper grayscale with opaque alpha.
-        for px in img.chunks_exact_mut(4) {
+        for px in img.as_chunks_mut::<4>().0.iter_mut() {
             let v = px[0];
             px[1] = v;
             px[2] = v;

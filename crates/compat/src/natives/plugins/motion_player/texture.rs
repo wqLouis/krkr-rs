@@ -159,7 +159,7 @@ pub(crate) fn decode_pixels(
 /// the scene bitmap stores R,G,B,A, so the two channels are exchanged once
 /// after decoding. The palette path already writes the scene order.
 fn swap_red_blue(mut rgba: Vec<u8>) -> Vec<u8> {
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0.iter_mut() {
         pixel.swap(0, 2);
     }
     rgba

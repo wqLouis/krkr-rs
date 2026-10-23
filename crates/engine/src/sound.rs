@@ -710,7 +710,13 @@ impl StreamSource {
             let available = usize::try_from(available).map_err(|_| SoundError::Decode {
                 message: "decoded window length does not fit in memory".to_string(),
             })?;
-            for (k, pair) in out.chunks_exact_mut(2).take(available).enumerate() {
+            for (k, pair) in out
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .take(available)
+                .enumerate()
+            {
                 let (left, right) = buffer.read_frame(start.saturating_add(k as u64))?;
                 pair[0] = left;
                 pair[1] = right;
@@ -1139,7 +1145,13 @@ impl SoundSource {
                         }
                     })?
                 };
-                for (k, pair) in out.chunks_exact_mut(2).take(available).enumerate() {
+                for (k, pair) in out
+                    .as_chunks_mut::<2>()
+                    .0
+                    .iter_mut()
+                    .take(available)
+                    .enumerate()
+                {
                     let (left, right) = buffer_frame(audio, start_frame.saturating_add(k as u64))
                         .ok_or_else(|| SoundError::Decode {
                         message: "decoded buffer is shorter than the frame index".to_string(),
