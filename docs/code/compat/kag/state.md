@@ -194,8 +194,14 @@ identity, the walk position, the flags, the conditional levels and their
 stacks, the macro-argument levels, the macro and parameter-macro tables, the
 call-stack frames and the live expansion splices.
 
-`restore(s, env)` decodes that list and re-applies it, re-loading the
-scenario from storage like the reference does.
+`restore(s, env)` decodes that list, re-loads the scenario from storage and
+rewinds to `curLabel`, like the reference `Restore`
+(`reference/cpp/core/base/KAGParser.cpp:723-906`). It re-applies the
+reference restore fields — macros, macro arguments, call-stack frames,
+conditional levels and their stacks, and the macro-argument base — but it
+does **not** re-apply the saved current walk position (`eventIndex`,
+`charIndex`, `curLine`, `curPos`) or the active expansion buffer. A scenario
+saved while paused on a tag runs that tag again after load.
 
 `restore_decoded(entries, env)` is the same over already-decoded entries; the
 native uses it to import a reference-format dictionary.
@@ -250,5 +256,5 @@ with an injected environment: the text/line-end tag stream, `curLine`/
 `curPos`, `ignoreCR`, the `if`/`elsif`/`else`/`endif` machinery, `ignore`
 regions, macro recording and expansion, `emb` splicing, `jump`/`call`/
 `return`, the veto callbacks, `interrupt`, `assign`, `clear`, the
-`store`/`restore` round trip, the `store` dictionary's shape, and the
+`store`/`restore` label rewind, the `store` dictionary's shape, and the
 reference-format import.

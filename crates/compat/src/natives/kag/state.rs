@@ -1600,6 +1600,11 @@ impl KagParserState {
 
     /// Serialize the full parser state (the reference `Store`, string
     /// encoded because objects cannot cross the C ABI).
+    ///
+    /// The walk position is recorded for the save snapshot, but
+    /// [`Self::restore`] does not apply it: restore reloads the scenario and
+    /// rewinds to `curLabel`, so a scenario that was paused on a tag runs
+    /// that tag again after load.
     pub fn store(&self) -> String {
         let mut v: Vec<(String, String)> = vec![("version".into(), "1".into())];
         v.push(("storageName".into(), self.storage_name.clone()));
@@ -1745,19 +1750,11 @@ impl KagParserState {
 
         let storage = get("storageName").unwrap_or("").to_string();
         let cur_label = get("curLabel").unwrap_or("").to_string();
-        let cur_page = get("curPage").unwrap_or("").to_string();
         let storage_short = get("storageShortName").unwrap_or("").to_string();
 
-        // Parser options must be in place *before* `load_scenario`, because
-        // `multi_line_tag_enabled` changes how the scenario text is parsed.
-        self.ignore_cr = get_bool("ignoreCR");
-        self.process_special_tags = get_bool("processSpecialTags");
-        self.multi_line_tag_enabled = get_bool("multiLineTagEnabled");
-        self.interrupted = get_bool("interrupted");
-        if let Some(d) = get_int("debugLevel") {
-            self.debug_level = d as i32;
-        }
-
+        // Parser options stay with the destination parser: `IgnoreCR`,
+        // `ProcessSpecialTags` and `MultiLineTagEnabled` are not part of the
+        // save protocol.
         self.clear();
         if !storage.is_empty() {
             self.load_scenario(&storage, env)?;
@@ -1766,37 +1763,12 @@ impl KagParserState {
             self.go_to_label(&cur_label)?;
         }
 
-        // flags (the rest are position/state restored below)
-        if let Some(i) = get_int("eventIndex") {
-            self.event_index = i as usize;
-        }
-        if let Some(c) = get_int("charIndex") {
-            self.char_index = c as usize;
-        }
-        if let Some(l) = get_int("curLine") {
-            self.cur_line = l as usize;
-        }
-        if let Some(p) = get_int("curPos") {
-            self.cur_pos = p as usize;
-        }
-        if get_bool("lineBufferUsing")
-            && let Some(buffer) = get("lineBuffer")
-            && !buffer.is_empty()
-        {
-            let (events, cols) = parse_macro_content(buffer)?;
-            self.splice_stack.push(Splice {
-                events,
-                cols,
-                buffer: buffer.to_string(),
-                event_pos: 0,
-                char_pos: 0,
-                line_r_after: false,
-            });
-        }
-        if let Some(p) = get_int("pendingRs") {
-            self.pending_rs = p as usize;
-        }
-        self.cur_page = cur_page;
+        // Restore reloads the scenario and calls `GoToLabel`, but does not
+        // restore `CurLine`/`CurPos` or the active line buffer. The walk
+        // therefore resumes at the label; a tag the save was paused on runs
+        // again. Restoring the saved position here would skip that tag, e.g.
+        // the `[sceneplay]` that keeps `start.ks` in the game instead of
+        // falling through to its title exit.
         self.storage_short_name = storage_short;
 
         // condition state
@@ -1937,16 +1909,6 @@ impl KagParserState {
             }
         }
 
-        // splice stack
-        self.splice_stack.clear();
-        if let Some(n) = get_int("spliceCount") {
-            let n = n as usize;
-            for j in 0..n {
-                if let Some(v) = get(&format!("splice.{j}")) {
-                    self.splice_stack.push(decode_splice(v)?);
-                }
-            }
-        }
         Ok(())
     }
 

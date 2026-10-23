@@ -424,7 +424,6 @@
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "//! The reference `getNextTag` returns a *string encoding* of the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "//! member names in source order, matching the reference's `ArgValue`). The", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "//! tag dictionary. `tjs` can retain an object and the C++ trampoline consumes a", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// (`AsObjectNoAddRef`, `tjsVariant.h:686-694`); our own snapshots round-trip", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// (`GetMacrosNoAddRef` / `GetMacroTopNoAddRef`, `KAGParser.cpp:2471-2508`)", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// (`KAGParser.cpp:2471-2481`). Our walk state owns the table, so:", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// (`KAGParser.cpp:373-391`), so the cache lives with the payload and the", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -443,7 +442,6 @@
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// Reusable `out.string` scratch. The C++ trampoline copies the string", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// The reference hands the *same* dictionary object out on every read", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// The reference keeps one `Macros` dictionary that scripts and", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// The reference takes an **object**, raising on a non-object argument", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// Write TJS `null` into `out` (the reference hands a null pointer through", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// Write a retained object into `out` as `VAL_RETAINED`; the C++ trampoline", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// `DicClear` from the *class object* at `KAGParser.cpp:336-344`) and the C", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -459,7 +457,6 @@
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// changed. The reference mutates its dictionary in place instead, but a TJS", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// check, `KAGParser.cpp:2273-2295`): a non-object or a non-`KAGParser`", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// dictionaries releases everything the reference releases and leaves no", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// losslessly through the `data` member, and reference-format dictionaries", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// next string result overwrites it (after the C++ side has copied).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// nullptr`. The reference conversion never fails, so neither does this.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// object raises the reference `TVPKAGSpecifyKAGParser`", "reason": "legacy comment, cleanup tracked in TODO §15"}

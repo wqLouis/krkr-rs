@@ -1469,7 +1469,7 @@ fn call_and_return_resume_after_the_call() {
 }
 
 #[test]
-fn store_and_restore_round_trip() {
+fn store_and_restore_rewinds_to_the_label() {
     let text = "*start\nA\n@wait 10\nB\n";
     let mut state = KagParserState::default();
     state.load_scenario_text("t.ks", text).unwrap();
@@ -1507,7 +1507,70 @@ fn store_and_restore_round_trip() {
     restored.restore(&saved, &mut env2).unwrap();
     assert_eq!(restored.storage_name(), "t.ks");
     assert_eq!(restored.cur_label(), "*start");
-    assert_eq!(restored.cur_line(), state.cur_line());
+    // `Restore` reloads the scenario and calls `GoToLabel`; it does not apply
+    // the saved `CurLine`/`CurPos` (`reference/cpp/core/base/KAGParser.cpp:723-906`).
+    assert_eq!(restored.cur_line(), 0);
+    let again = restored.next_tag(&mut env2).unwrap().unwrap();
+    assert_eq!(again.0, "ch");
+    assert_eq!(
+        again
+            .1
+            .iter()
+            .find(|(k, _)| k == "text")
+            .map(|(_, v)| v.as_str()),
+        Some("A")
+    );
+}
+
+#[test]
+fn restore_rewinds_to_the_label_so_a_paused_scene_tag_runs_again() {
+    // The real KAG runtime saves while `start.ks` is blocked in
+    // `[sceneplay]`: the walk has already advanced to the following exit tag,
+    // but `Restore` reloads the scenario and rewinds to `*envplay`
+    // (`reference/cpp/core/base/KAGParser.cpp:723-906`). Skipping the saved
+    // position is what keeps the loaded game from falling through to the
+    // title exit.
+    let text = "*envstart\n[scenestart storage=\"scene.ks\"]\n*envplay\n[sceneplay]\n[exit storage=\"start.ks\" target=\"*gameend_title\"]\n";
+    let mut state = KagParserState::default();
+    state.load_scenario_text("start.ks", text).unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let mut load = |_name: &str| Ok(text.to_string());
+    let mut env = Environ {
+        eval: &mut eval,
+        load_storage: &mut load,
+        fire_label: None,
+        fire_script: None,
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
+    };
+    state.go_to_label("*envplay").unwrap();
+    let paused = state.next_tag(&mut env).unwrap().unwrap();
+    assert_eq!(paused.0, "sceneplay");
+    let saved = state.store();
+
+    let mut restored = KagParserState::default();
+    let mut eval2 = |_e: &str| Ok(EvalResult::Void);
+    let mut load2 = |_name: &str| Ok(text.to_string());
+    let mut env2 = Environ {
+        eval: &mut eval2,
+        load_storage: &mut load2,
+        fire_label: None,
+        fire_script: None,
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
+    };
+    restored.restore(&saved, &mut env2).unwrap();
+    let after_load = restored.next_tag(&mut env2).unwrap().unwrap();
+    assert_eq!(
+        after_load.0, "sceneplay",
+        "restore must rewind to *envplay, not resume after [sceneplay]"
+    );
 }
 
 #[test]
@@ -1811,14 +1874,17 @@ fn native_store_returns_the_reference_dictionary_shape() {
 }
 
 #[test]
-fn native_store_restore_round_trips_state() {
+fn native_restore_keeps_the_destination_debug_level() {
+    // `Store` does not store `DebugLevel`, and `Restore` does not set it
+    // (`reference/cpp/core/base/KAGParser.cpp:605-606`, `:723-906`). The
+    // emulator snapshot carries it, but it is not a reference restore field.
     let value = eval_native(
         "(function(){ var p = new KAGParser(); p.debugLevel = 3; \
          var d = p.store(); var q = new KAGParser(); q.restore(d); \
          return q.debugLevel; })()",
     )
     .expect("script");
-    assert_eq!(value, TjsValue::Integer(3));
+    assert_eq!(value, TjsValue::Integer(1));
 }
 
 #[test]
@@ -1828,16 +1894,18 @@ fn native_restore_imports_a_reference_format_dictionary() {
     // `count` and the matching `macroArgStackDepth` check at 768-769).
     let value = eval_native(
         "(function(){ var p = new KAGParser(); \
-         var d = %[ curLine: 4, ExcludeLevel: 2, macroArgStackDepth: 1, \
+         var d = %[ curLine: 4, curPos: 9, ExcludeLevel: 2, macroArgStackDepth: 1, \
                     macros: %[ greet: 'Hello' ], \
                     macroArgs: [%[ a: '1' ]], \
                     callStack: [] ]; \
          p.restore(d); \
-         return p.curLine + ',' + p.macros['greet'] + ',' + p.mp['a'] \
+         return p.curLine + ',' + p.curPos + ',' + p.macros['greet'] + ',' + p.mp['a'] \
          + ',' + p.store().ExcludeLevel; })()",
     )
     .expect("script");
-    assert_eq!(value, TjsValue::String("4,Hello,1,2".to_string()));
+    // `Restore` reloads the scenario and rewinds to `curLabel`; it never
+    // applies the saved `CurLine`/`CurPos` (`KAGParser.cpp:723-906`).
+    assert_eq!(value, TjsValue::String("0,0,Hello,1,2".to_string()));
 
     // `TVPKAGMalformedSaveData` when the depth does not match the array
     // (KAGParser.cpp:51, 768-769).

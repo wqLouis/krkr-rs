@@ -945,9 +945,10 @@ extern "C" fn native_clear(
 /// `store()` — serialize the parser state into a **dictionary** (reference
 /// `tTJSNI_KAGParser::Store`, `KAGParser.cpp:469-636`): the reference
 /// top-level members (`storageName`, `curLine`, `ExcludeLevel`, ... plus the
-/// nested `macros`, `macroArgs` and `callStack` containers) and the lossless
-/// emulator snapshot under `data`, which [`native_restore`] prefers for an
-/// exact round-trip.
+/// nested `macros`, `macroArgs` and `callStack` containers) and the emulator
+/// snapshot under `data`, which [`native_restore`] uses as its ordered entry
+/// source. Restore reloads the scenario and rewinds to `curLabel`, ignoring
+/// the saved walk position.
 extern "C" fn native_store(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -975,7 +976,8 @@ extern "C" fn native_store(
 fn build_store_dict(host: &Tjs2Engine, state: &KagParserState) -> Result<DetachedValue, String> {
     let dict = retained_object(host, "%[]")?;
     let raw = dict.raw_id();
-    // The lossless emulator snapshot (preferred by `restore`).
+    // The emulator snapshot `restore` reads; its saved walk position is
+    // ignored so the label rewind still applies.
     host.set_member(raw, "data", &TjsValue::String(state.store()))?;
     // Reference top-level members (`KAGParser.cpp:616-634` and the cur*
     // block below it).
@@ -1106,10 +1108,9 @@ fn build_store_dict(host: &Tjs2Engine, state: &KagParserState) -> Result<Detache
 
 /// `restore(dict)` — restore from a `store()` dictionary (reference
 /// `tTJSNI_KAGParser::Restore(iTJSDispatch2*)`, `KAGParser.cpp:723-906`).
-/// The reference takes an **object**, raising on a non-object argument
-/// (`AsObjectNoAddRef`, `tjsVariant.h:686-694`); our own snapshots round-trip
-/// losslessly through the `data` member, and reference-format dictionaries
-/// are imported through [`dict_to_entries`].
+/// The argument must be an **object**, raising on a non-object argument; our
+/// own snapshots are read through the `data` member, and dictionary-shaped
+/// saves are imported through [`dict_to_entries`].
 extern "C" fn native_restore(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -1144,7 +1145,8 @@ extern "C" fn native_restore(
     };
     let state = state_of(instance);
     match host.member(object.raw_id(), "data") {
-        // The emulator's own snapshot: exact round-trip.
+        // The emulator's own snapshot; `restore_decoded` applies the save
+        // fields and rewinds to `curLabel`.
         Ok(TjsValue::String(snapshot)) => match state.restore(&snapshot, &mut env.environ()) {
             Ok(()) => {
                 set_void(out);

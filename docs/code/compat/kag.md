@@ -84,8 +84,10 @@ retain an object and the C++ trampoline consumes a `VAL_RETAINED` result:
   Dictionary, or `null` when the stack is empty.
 * `paramMacros` returns a Dictionary of macro name → the flattened
   `[name, value, name, value, …]` array.
-* `store()` returns a Dictionary whose `data` member holds a lossless
-  emulator snapshot, alongside the reference's own top-level members.
+* `store()` returns a Dictionary whose `data` member holds the emulator
+  snapshot `restore()` reads, alongside the reference's own top-level
+  members. The snapshot records the walk position, but `restore()` follows
+  the reference and does not apply it.
 
 `macros` and `macroParams` are **cached**: the same Dictionary object is
 handed back on every read while its content is unchanged, and it is rebuilt
@@ -253,9 +255,12 @@ in the file still yields its earlier tags first.
 
 `store()` returns a Dictionary with two kinds of member:
 
-* `data` — a lossless emulator snapshot: the whole walk state encoded with
-  the `kag/kvp.rs` codec. `restore()` prefers it, so a store/restore round
-  trip is exact.
+* `data` — the emulator snapshot `restore()` reads: the whole walk state
+  encoded with the `kag/kvp.rs` codec. It records the position, but
+  `restore()` does **not** apply `eventIndex`, `curLine`, `curPos` or the
+  active line buffer: the reference `Restore` reloads the scenario and calls
+  `GoToLabel(curLabel)` instead (`reference/cpp/core/base/KAGParser.cpp:723-906`).
+  A scenario saved while paused on a tag therefore runs that tag again.
 * the reference's own top-level members: `storageName`, `storageShortName`,
   `curLabel`, `curLine`, `curPos`, `lineBuffer`, `lineBufferUsing`,
   `ExcludeLevel`, `IfLevel`, `ExcludeLevelStack`, `IfLevelExecutedStack`,
@@ -263,10 +268,13 @@ in the file still yields its earlier tags first.
   `macroArgs` and `callStack` containers.
 
 `restore(dict)` accepts either shape: a dictionary with a string `data`
-member is restored exactly; anything else is imported as a reference-format
-dictionary. The import maps the reference's member names onto the emulator's
-(`orgLineStr` → the call frame's original line, `pos` → the frame's cursor
-position) and enforces the reference's depth check.
+member is imported from that snapshot; anything else is imported as a
+reference-format dictionary. Both paths restore the reference fields and
+rewind to `curLabel`; the saved current position is not restored. The import
+maps the reference's member names onto the emulator's (`orgLineStr` → the
+call frame's original line, `pos` → the frame's cursor position) and
+enforces the reference's depth check. Call-stack frames keep their own saved
+positions, so `return` still resumes after its `call`.
 
 ---
 
@@ -285,7 +293,7 @@ VM. It covers:
   callbacks, `interrupt`, `assign`, `clear`;
 * the native surface: the tag Dictionary and its `taglist`, the read-only and
   stable `macros` property, `paramMacros` round-trip and expansion, the
-  `store`/`restore` round trip, the reference-format import, the
+  `store`/`restore` label rewind, the reference-format import, the
   `assign` rejection of a non-parser, the `debugLevel` integer conversion and
   the 0-based `curLine`.
 
