@@ -989,6 +989,28 @@ fn a_pixel_center_one_to_one_affine_copy_is_exact() {
     );
 }
 
+/// A large stretch pass splits its rows across bands; a solid source scaled
+/// into every destination pixel must produce that solid color everywhere.
+#[test]
+fn a_large_stretch_blit_matches_the_solid_source() {
+    let source = bitmap(2, 2, vec![10, 20, 30, 255].repeat(4));
+    let mut destination = bitmap(1024, 1024, vec![0u8; 1024 * 1024 * 4]);
+    stretch_blit(
+        &mut destination,
+        (0, 0, 1024, 1024),
+        &source,
+        (0, 0, 2, 2),
+        0,
+    );
+    assert!(
+        destination
+            .rgba
+            .chunks_exact(4)
+            .all(|pixel| pixel == [10, 20, 30, 255]),
+        "the stretch row bands write the solid source"
+    );
+}
+
 /// A large source-over pass splits its rows across bands; the bytes must be
 /// identical to the single-threaded path.
 #[test]

@@ -2471,12 +2471,7 @@ pub fn stretch_blit_mode(
         bitmap: src,
         rect: src_rect,
     } = source;
-    let BlitOptions {
-        mode,
-        opa,
-        hold_alpha,
-        ..
-    } = options;
+    let BlitOptions { mode, opa, .. } = options;
     let dw = dest.2 - dest.0;
     let dh = dest.3 - dest.1;
     if dw <= 0 || dh <= 0 || src_rect.2 <= src_rect.0 || src_rect.3 <= src_rect.1 {
@@ -2488,21 +2483,136 @@ pub fn stretch_blit_mode(
     let Some(dc) = intersect(dst, dest) else {
         return;
     };
-    for y in dc.1..dc.3 {
-        for x in dc.0..dc.2 {
-            let color = stretch_sample(src, src_rect, dest, x, y, stretch_type);
-            let old_alpha = read_pixel(dst, x, y)[3];
-            blend_pixel_mode(dst, x, y, color, opa, mode);
-            if hold_alpha {
-                let mut d = read_pixel(dst, x, y);
-                d[3] = old_alpha;
-                write_pixel(dst, x, y, d);
+    let rows = (dc.3 - dc.1) as usize;
+    let columns = (dc.2 - dc.0) as usize;
+    let threads = affine_thread_count(rows, columns);
+    let row_bytes = match usize::try_from(dst.width)
+        .ok()
+        .and_then(|w| w.checked_mul(4))
+    {
+        Some(width) => width,
+        None => return,
+    };
+    let band_start = (dc.1 as usize).saturating_mul(row_bytes);
+    let band_len = rows.saturating_mul(row_bytes);
+    let Some(band) = dst
+        .rgba
+        .get_mut(band_start..band_start.saturating_add(band_len))
+    else {
+        return;
+    };
+    let area = StretchArea { dest, clip: dc };
+    if threads <= 1 {
+        stretch_blit_mode_band(
+            band,
+            dc.1,
+            dst.width as i32,
+            area,
+            BlitSource {
+                bitmap: src,
+                rect: src_rect,
+            },
+            stretch_type,
+            options,
+        );
+    } else {
+        let rows_per_band = rows.div_ceil(threads);
+        let chunk_bytes = rows_per_band.saturating_mul(row_bytes);
+        let chunks: Vec<&mut [u8]> = band.chunks_mut(chunk_bytes).collect();
+        let dst_width = dst.width as i32;
+        std::thread::scope(|scope| {
+            for (index, chunk) in chunks.into_iter().enumerate() {
+                let first_row = dc.1 + (index * rows_per_band) as i32;
+                scope.spawn(move || {
+                    stretch_blit_mode_band(
+                        chunk,
+                        first_row,
+                        dst_width,
+                        area,
+                        BlitSource {
+                            bitmap: src,
+                            rect: src_rect,
+                        },
+                        stretch_type,
+                        options,
+                    );
+                });
             }
-        }
+        });
     }
     // The pass wrote inside the clipped destination rectangle only, so the
     // upload needs that rectangle and not the whole bitmap.
     dst.mark_dirty_rect(clipped_region(dc));
+}
+
+/// The destination window of one stretch pass.
+#[derive(Clone, Copy)]
+struct StretchArea {
+    /// Destination rectangle the source is mapped onto.
+    dest: RectI,
+    /// Clipped destination rectangle the pass writes inside.
+    clip: RectI,
+}
+
+/// One contiguous band of destination rows for [`stretch_blit_mode`].
+fn stretch_blit_mode_band(
+    band: &mut [u8],
+    first_row: i32,
+    dst_width: i32,
+    area: StretchArea,
+    source: BlitSource<'_>,
+    stretch_type: i64,
+    options: BlitOptions,
+) {
+    let BlitSource {
+        bitmap: src,
+        rect: src_rect,
+    } = source;
+    let BlitOptions {
+        mode,
+        opa,
+        hold_alpha,
+        ..
+    } = options;
+    let Ok(dst_width) = usize::try_from(dst_width) else {
+        return;
+    };
+    let Some(dst_pitch) = dst_width.checked_mul(4) else {
+        return;
+    };
+    let (x0, x1) = (area.clip.0, area.clip.2);
+    for (row_index, row) in band.chunks_mut(dst_pitch).enumerate() {
+        let Ok(row_index) = i32::try_from(row_index) else {
+            break;
+        };
+        let y = first_row.saturating_add(row_index);
+        for x in x0..x1 {
+            let color = stretch_sample(src, src_rect, area.dest, x, y, stretch_type);
+            let Ok(x) = usize::try_from(x) else {
+                continue;
+            };
+            let Some(dest_start) = x.checked_mul(4) else {
+                continue;
+            };
+            let Some(destination) = row.get(dest_start..dest_start.saturating_add(4)) else {
+                continue;
+            };
+            let old_alpha = destination[3];
+            let mut pixel = [
+                destination[0],
+                destination[1],
+                destination[2],
+                destination[3],
+            ];
+            blend_pixel_mode_at(&mut pixel, color, opa, mode);
+            if hold_alpha {
+                pixel[3] = old_alpha;
+            }
+            if let Some(destination) = row.get_mut(dest_start..dest_start.saturating_add(4)) {
+                destination.copy_from_slice(&pixel);
+            }
+        }
+    }
 }
 
 /// The forward affine map of the three destination corners `p0` (src LT),
@@ -2794,17 +2904,23 @@ fn affine_unit_copy(
     }
     let width = width as f64;
     let height = height as f64;
-    if m[1] != width || m[5] != height || m[2] != 0.0 || m[4] != 0.0 {
+    const EPSILON: f64 = 1e-6;
+    if (m[1] - width).abs() > EPSILON
+        || (m[5] - height).abs() > EPSILON
+        || m[2].abs() > EPSILON
+        || m[4].abs() > EPSILON
+    {
         return None;
     }
     // The points convention maps the source corner itself; the affine matrix
     // convention maps the corner pixel centre at -0.5. Both describe a
     // pixel-edge origin exactly when adding the convention offset lands on an
     // integer.
-    let (origin_x, origin_y) = if m[0].fract() == 0.0 && m[3].fract() == 0.0 {
-        (m[0], m[3])
-    } else if pixel_center && (m[0] + 0.5).fract() == 0.0 && (m[3] + 0.5).fract() == 0.0 {
-        (m[0] + 0.5, m[3] + 0.5)
+    let near_integer = |value: f64| (value - value.round()).abs() <= EPSILON;
+    let (origin_x, origin_y) = if near_integer(m[0]) && near_integer(m[3]) {
+        (m[0].round(), m[3].round())
+    } else if pixel_center && near_integer(m[0] + 0.5) && near_integer(m[3] + 0.5) {
+        ((m[0] + 0.5).round(), (m[3] + 0.5).round())
     } else {
         return None;
     };
@@ -3966,6 +4082,16 @@ mod tests {
             affine_unit_copy(half, (0, 0, 4, 4), &src, 1, true),
             Some((0, 0)),
             "the affine half-pixel convention copies at its integer origin"
+        );
+        let noisy = affine_forward(
+            (-0.499999999999864, -0.499999999999727),
+            (3.500000000000136, -0.499999999999727),
+            (-0.499999999999864, 3.500000000000273),
+        );
+        assert_eq!(
+            affine_unit_copy(noisy, (0, 0, 4, 4), &src, 1, true),
+            Some((0, 0)),
+            "a floating-point half origin is still the pixel boundary"
         );
         let fractional = affine_forward((-0.25, -0.5), (3.75, -0.5), (-0.25, 3.5));
         assert!(

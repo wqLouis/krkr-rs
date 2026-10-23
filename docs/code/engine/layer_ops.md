@@ -139,15 +139,16 @@ projection draws the two sources, so nothing is written to a bitmap per tick
   instead of the per-pixel inverse map and float kernel. A caller using the
   pixel-centre convention marks the pass with
   `affine_blit_clipped_pixel_center`, which resolves a half-pixel origin to
-  the same boundary; a fractional boundary and the blur/area kernels stay on
+  the same boundary; a floating-point corner within 1e-6 of that boundary is
+  treated as exact. A fractional boundary and the blur/area kernels stay on
   the resampler. A clipped copy whose source rows are all in bounds copies
   those rows as rows; the per-pixel path remains for a partially out-of-bounds
   source.
-* **Large copy/blend bands run in parallel.** A clipped copy or source-over
-  pass splits its destination rows into bands on the same threshold the
-  nearest affine pass uses. A band owns whole rows, so its pixel loop walks
-  the destination row directly; the bytes are identical to the single-band
-  path.
+* **Large copy/blend/stretch bands run in parallel.** A clipped copy,
+  source-over or stretch pass splits its destination rows into bands on the
+  same threshold the nearest affine pass uses. A band owns whole rows, so its
+  pixel loop walks the destination row directly; the bytes are identical to
+  the single-band path.
 * **The source rectangle is half-open**, and a source region that leaves the
   source bitmap contributes nothing rather than a repeated edge pixel.
 * **`blit_plane` with both plane bits is a straight copy**, not a blend: the
