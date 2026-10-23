@@ -175,7 +175,11 @@ checks;
 `cargo clippy -p platform --features platform-android --all-targets -- -D warnings`;
 `android-target`;
 `surface-lock --update`; `surface-lock`; `native-parity`;
-`plugin-parity --no-doc`; `host-facts`.
+`plugin-parity --no-doc`; `host-facts`; `ci`.
+
+The ordered gate, the separate test suites, every check's contract and the CI
+release pipeline are documented once in
+[`docs/rules/gates.md`](docs/rules/gates.md).
 
 The static gate does **not** run the test suites. Run them separately with
 `uv run --project scripts krkr-gate test` (`cargo test --workspace
@@ -200,6 +204,7 @@ uv run --project scripts krkr-gate native-arity
 uv run --project scripts krkr-gate void-getter
 uv run --project scripts krkr-gate host-facts
 uv run --project scripts krkr-gate android-target
+uv run --project scripts krkr-gate ci
 uv run --project scripts krkr-gate surface-lock --no-regen
 uv run --project scripts krkr-gate native-parity
 uv run --project scripts krkr-gate plugin-parity --no-doc
@@ -210,11 +215,14 @@ agent only**, after the change is understood.
 
 ### Releases are metered — push a tag only on the user's go-ahead
 
-`.github/workflows/android.yml` triggers on `android-*` **tags** (a branch push
-triggers nothing). Each tag runs a full Android build, which costs CI minutes,
-so: commit locally, keep the gate green, and **hold the tag until the user says
-the build is wanted**. Do not tag and push on every green gate. Batch the work,
-report what is ready, and wait.
+`.github/workflows/release.yml` triggers on `v*` **tags** and on
+`workflow_dispatch` (a branch push triggers nothing). One `v*` tag builds the
+Linux x86_64 binary and the Android APK, then a single final job publishes both
+to the same GitHub Release. Each tag runs that full pipeline, which costs CI
+minutes, so: commit locally, keep the gate green, and **hold the tag until the
+user says the build is wanted**. Do not tag and push on every green gate. Batch
+the work, report what is ready, and wait. `krkr-gate ci` fails if the workflow
+stops matching this contract.
 
 The `platform-android` steps build the **feature on the host**, not the Android
 target: the feature compiles the platform-independent helpers plus a typed stub,

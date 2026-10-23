@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Static gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install the Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libavcodec-dev pkg-config
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run the static gate
+        run: uv run --project scripts krkr-gate gate
+
+  linux:
+    name: Linux x86_64 binary
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build the release binary
+        run: cargo build --release -p app
+      - name: Package the Linux binary
+        run: |
+          cp target/release/krkr dist/krkr
+          cp LICENSE dist/LICENSE
+          cp README.txt dist/README.txt
+          tar -czf krkr-rs-linux-x86_64.tar.gz dist
+      - name: Upload the Linux binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: krkr-rs-linux-x86_64
+          path: krkr-rs-linux-x86_64.tar.gz
+
+  apk:
+    name: Release APK
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build and verify
+        run: |
+          bash ./crates/android/build-android.sh --ndk "$ANDROID_NDK_HOME"
+          bash ./crates/android/check-jni-libs.sh app-release.apk
+      - name: Upload the APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: krkr-rs-release-arm64-v8a
+          path: android/app/build/outputs/apk/release/*.apk
+
+  release:
+    name: Publish the GitHub Release
+    needs: [linux, apk]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: krkr-rs-linux-x86_64
+          path: dist/linux
+      - name: Download the APK
+        uses: actions/download-artifact@v4
+        with:
+          name: krkr-rs-release-arm64-v8a
+          path: dist/android
+      - name: Publish both artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          linux=dist/linux/krkr-rs-linux-x86_64.tar.gz
+          apk="$(find dist/android -name '*.apk' -print -quit)"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$linux" "$apk" --clobber
+          else
+            gh release create "$tag" "$linux" "$apk" --verify-tag
+          fi

@@ -5,7 +5,7 @@ Usage::
     uv run --project scripts krkr-gate <check> [check options]
 
 ``<check>`` is one of ``stateless``, ``error-handling``, ``house-style``,
-``layering``, ``host-facts``, ``android-target``, ``surface-lock``,
+``layering``, ``host-facts``, ``android-target``, ``ci``, ``surface-lock``,
 ``native-parity``, ``plugin-parity``, ``callback-objthis``, ``native-arity``,
 ``void-getter``, or the ``extract-xp3`` helper. ``gate`` runs the full ordered
 sequence; its ``cargo`` steps are for the main agent.
@@ -22,6 +22,7 @@ from collections.abc import Callable
 from .checks import (
     android_target,
     callback_objthis,
+    ci,
     error_handling,
     extract_xp3,
     host_facts,
@@ -56,6 +57,7 @@ CHECKS: dict[str, Callable[[list[str]], int]] = {
     "void-getter": void_getter.main,
     "host-facts": host_facts.main,
     "android-target": android_target.main,
+    "ci": ci.main,
     "surface-lock": surface_lock.main,
     "native-parity": native_parity.main,
     "plugin-parity": plugin_parity.main,
@@ -105,6 +107,7 @@ GATE_SEQUENCE: list[tuple[str, str, str, list[str]]] = [
     ("native-parity", "check", "native-parity", []),
     ("plugin-parity", "check", "plugin-parity", ["--no-doc"]),
     ("host-facts", "check", "host-facts", []),
+    ("ci", "check", "ci", []),
 ]
 
 # The workspace and per-target test suites. These are deliberately **not** part
@@ -138,6 +141,7 @@ Checks:
   void-getter      native getters returning a raw void where the reference returns an object
   host-facts       host seams with no production installer
   android-target   per-target backend-feature resolution
+  ci               the release workflow: v* -> gate -> Linux + Android -> one release
   surface-lock     VM dispatch surface vs the committed baseline
   native-parity    native class surface vs the reference
   plugin-parity    plugin surface vs the reference

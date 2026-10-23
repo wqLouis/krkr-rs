@@ -19,6 +19,15 @@ steps, so it is for the main agent; the tests run separately with
 compiler-free checks. Every check also runs on its own; `android-target`
 shells out to `cargo tree`, the rest read the tree.
 
+The static gate sequence is `cargo fmt` → `stateless` → `error-handling` →
+`house-style` → `layering` → `storage-boundary` → `native-construction` →
+`lifecycle-order` → `storage-media` → `callback-objthis` → `native-arity` →
+`void-getter` → `cargo clippy` → `cargo clippy platform-android` →
+`android-target` → `surface-lock --update` → `surface-lock` → `native-parity`
+→ `plugin-parity --no-doc` → `host-facts` → `ci`. The ordered gate, the test
+suites and the CI release pipeline are documented in
+[`../docs/rules/gates.md`](../docs/rules/gates.md).
+
 ## Layout
 
 - `krkr_gates/` — the package; `cli.py` is the entry point.
@@ -32,7 +41,7 @@ shells out to `cargo tree`, the rest read the tree.
 `stateless`, `error-handling`, `house-style`, `layering`,
 `storage-boundary`, `native-construction`, `lifecycle-order`, `storage-media`,
 `callback-objthis`, `native-arity`, `void-getter`, `host-facts`,
-`android-target`, `surface-lock`, `native-parity`, `plugin-parity`, the
+`android-target`, `ci`, `surface-lock`, `native-parity`, `plugin-parity`, the
 `extract-xp3` helper, and `gate`.
 
 `house-style` also enforces the AGENTS §6 comment rules: a **non-test**
@@ -54,6 +63,14 @@ L3 may not contain platform code, and L3 reaches the engine only through
 `crates/compat/src/engine_api.rs` (the `l3-engine-api` rule). It also checks
 that every `unsafe` block carries a `// SAFETY:` note and that the file-level
 `unsafe_code` allow appears only in reviewed FFI files.
+
+`ci` statically validates the release workflow contract: the `v*` tag
+trigger (and the absence of any `android-*` tag), the `gate` job running
+`uv run --project scripts krkr-gate gate`, the Linux and Android build jobs
+waiting for it, the Linux archive, the Android build/packaging scripts, and a
+single final release job that attaches both artifacts. It reads the workflow
+as text (standard library only) and has a fixture self-test under
+`fixtures/ci/` that proves every rule fires.
 
 `void-getter` fails a native property getter that returns a `StoredValue`
 field whose constructor default is `StoredValue::Void` unchanged: the script
@@ -80,3 +97,7 @@ starts with `debt:` tracks a known defect and does not silence the finding.
 - `surface-lock` regenerates the VM dispatch dump by running the compat
   surface test unless `--no-regen` is given; `--update` rewrites the committed
   baseline and is main-agent only.
+- `vendor-tjs2.sh` re-vendors the C++ TJS2 core and re-applies
+  `patches/tjs2-krkr-rs.patch`. Every edit under `crates/tjs/cpp/tjs2/**` must
+  be recorded in that patch, or the next re-vendor drops it; see
+  [`../docs/rules/gates.md`](../docs/rules/gates.md) §7.

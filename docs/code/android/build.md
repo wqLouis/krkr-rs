@@ -1,7 +1,7 @@
 # `build` — the cross-compile, the staging and the packaging
 
 Source: `crates/android/build-android.sh`, `crates/android/check-jni-libs.sh`,
-`android/` (the Gradle project), `.github/workflows/android.yml`
+`android/` (the Gradle project), `.github/workflows/release.yml`
 
 Everything Android-specific about the *build* lives in the script and in the
 Gradle project, so the engine crates stay platform-neutral: they only need a
@@ -256,21 +256,32 @@ the rules fire — a check that cannot fail is not a check.
 
 ## 7. CI
 
-`.github/workflows/android.yml` triggers on **`android-*` tags** and on
-`workflow_dispatch`. A branch push triggers nothing, so ordinary engine work
-cannot start an Android build; a `v*` tag (an engine release on `main`) does
-not match either.
+`.github/workflows/release.yml` triggers on **`v*` tags** and on
+`workflow_dispatch`. A branch push triggers nothing. One tag builds the Linux
+x86_64 binary and the Android APK in the same workflow:
 
-The workflow installs the NDK, the SDK platform and the build tools, JDK 21,
-Rust with the `aarch64-linux-android` target, Zig (the C++ dependency fetch
-needs it) and `bison` (the TJS2 parser generator), runs the same
-`build-android.sh`, runs `gradle :app:assembleRelease`, checks the packaged
-native libraries (§6), and publishes the APK as an artifact — and, for a tag
-run, as a GitHub Release asset.
+```
+gate  ──┬──> linux ──┐
+        └──> apk   ──┴──> release
+```
+
+The `gate` job runs the repository's static gate
+(`uv run --project scripts krkr-gate gate`) first. The Android `apk` job then
+installs the NDK, the SDK platform and the build tools, JDK 21, Rust with the
+`aarch64-linux-android` target, Zig (the C++ dependency fetch needs it) and
+`bison` (the TJS2 parser generator), runs the same `build-android.sh`, runs
+`gradle :app:assembleRelease`, checks the packaged native libraries (§6), and
+uploads the APK as an artifact. The Linux job builds the desktop binary and
+uploads its archive. A single final `release` job needs both of them and is the
+only job that creates or updates the GitHub Release, so the two platform jobs
+cannot race each other.
 
 The pinned versions are the ones the port was verified against: NDK r27c
 compiles the vendored C++ TJS2 VM, so a version bump changes the compiler
 that builds the VM and must be re-verified.
+
+The complete gate, test and release contract is
+[`docs/rules/gates.md`](../../rules/gates.md).
 
 ---
 

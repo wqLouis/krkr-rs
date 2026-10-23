@@ -22,6 +22,7 @@ Related documents:
 | the layer tree → frame contract | [`docs.old/migration/12-layer-tree-and-frame.md`](../../docs.old/migration/12-layer-tree-and-frame.md) |
 | the VM ↔ device pixel mapping | [`docs.old/migration/11-presentation-and-pixel-translation.md](../../docs.old/migration/11-presentation-and-pixel-translation.md) |
 | the agent contract and the gate | [`AGENTS.md`](../../AGENTS.md) |
+| the ordered gate, the tests and the release pipeline | [`gates.md`](gates.md) |
 
 ---
 

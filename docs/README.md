@@ -42,6 +42,7 @@ above and adds the process rules (the gate, the roles, the release metering).
 | [`rules/arch_rules.md`](rules/arch_rules.md) | the layering, the state ownership, the frame contract, the coordinate spaces, the typed errors, the backend selection |
 | [`rules/api_rules.md`](rules/api_rules.md) | the public surfaces, the L3↔L2 protocol, the ownership rules, the error enums |
 | [`rules/code_styles.md`](rules/code_styles.md) | the Rust-level review checklist |
+| [`rules/gates.md`](rules/gates.md) | the ordered static gate, the test suites, the CI release pipeline, the `v*` tag convention, the vendored TJS2 patch |
 
 ---
 

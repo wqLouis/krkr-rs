@@ -1,46 +1,39 @@
-# Android APK build for the experimental Android target (see docs.old/android.md).
+# Release build: one `v*` tag builds the Linux binary and the Android APK,
+# then publishes both to the same GitHub Release.
 #
-# Triggers: **`android-*` tags**. The tag name carries the branch, so the
-# filter does the whole job natively — no gate job, no ancestry check:
+# Triggers: **`v*` tags** and `workflow_dispatch`. A branch push triggers
+# nothing: releases are metered, so a full Linux + Android build runs only when
+# a release is deliberately tagged (or a maintainer starts a manual run).
 #
-#   * a `v*` tag (an engine release on `main`) does not match, so it cannot
-#     start an Android build;
-#   * an `android-*` tag is only ever created on the `android` branch, which is
-#     the convention this trigger relies on;
-#   * pushing the branch builds nothing — only tagging does.
+# Pipeline: `gate` (the repository's static gate) runs first; `linux` and
+# `apk` run in parallel once it is green; `release` waits for both and is the
+# only job that creates or uploads a GitHub Release, so the two platform jobs
+# cannot race each other.
 #
-# That is "tagged AND android" expressed in one line, where combining
-# `branches:` with `tags:` could only ever express OR.
+# Scope of the Android build: `arm64-v8a` only, release build. No other ABIs,
+# no emulator, no real signing key (the APK is signed with the debug key when
+# no keystore secret is configured, so it installs — see docs.old/android.md
+# §1).
 #
-# `workflow_dispatch` is retained for ad-hoc runs and is not filtered: it is
-# manual, and whoever triggers it has already decided.
-#
-# Scope: `arm64-v8a` only, release build. No other ABIs, no emulator, no real
-# signing key (the APK is signed with the debug key so it installs — see
-# docs.old/android.md §1).
-#
-# The commands here mirror a build that was run by hand and verified end to end
-# on a development machine (94 MB APK from a 71 MB engine .so); the orchestrations
-# below are exercised by every `android-*` tag.
-name: Android
+# The commands mirror builds that were run by hand and verified end to end on a
+# development machine; the orchestrations below are exercised by every `v*`
+# tag and by manual runs.
+name: Release
 
 on:
   push:
     tags:
-      # Only Android tags. `v*` is deliberately absent: those are engine
-      # releases tagged on `main`, and matching them would build an APK for
-      # every one of them.
-      - 'android-*'
+      - 'v*'
   workflow_dispatch:
 
+# The platform jobs only read the repository. The release job raises its own
+# `contents: write` permission, which is where a token with write access is
+# actually needed.
 permissions:
-  # `contents: write` is needed to publish the APK to a GitHub Release when the
-  # run was triggered by a tag. The default is read-only, which would make the
-  # release step fail with a confusing 403.
-  contents: write
+  contents: read
 
 concurrency:
-  group: android-${{ github.ref }}
+  group: release-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -69,8 +62,153 @@ env:
   ZIG_VERSION: '0.16.0'
 
 jobs:
+  gate:
+    name: Static gate
+    runs-on: ubuntu-latest
+    # The static gate runs fmt, the compiler-free checks, clippy for the whole
+    # workspace (both platform features), the surface lock and both parity
+    # reports. A hung step would bill for hours at the default six-hour limit.
+    timeout-minutes: 90
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # Everything the static gate compiles needs: the C++ TJS2 build (bison,
+      # python3, zig below), ffmpeg-next (pkg-config + the FFmpeg development
+      # headers), cpal (ALSA headers), the Rust C++ runtime (libc++), and
+      # ffmpeg-sys-next/opusic-sys (bindgen/libclang, cmake, a C/C++ toolchain).
+      - name: Install the Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison build-essential clang cmake libclang-dev \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libswresample-dev libswscale-dev \
+            libasound2-dev libc++-dev libc++abi-dev pkg-config python3
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Zig is needed before the Rust build, not for compiling on the desktop —
+      # `crates/tjs/build.rs` fetches its C/C++ dependencies (fmt, spdlog,
+      # boost, oniguruma) with `zig build` in `deps/`, and compiles the VM
+      # with `zig c++`. Pinned, and fetched directly rather than through a
+      # third-party action, so there is one less moving part.
+      - name: Install Zig
+        run: |
+          ZIG_DIR="$RUNNER_TEMP/zig"
+          mkdir -p "$ZIG_DIR"
+          curl -sSL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" \
+            | tar -xJ --strip-components=1 -C "$ZIG_DIR"
+          echo "$ZIG_DIR" >> "$GITHUB_PATH"
+          "$ZIG_DIR/zig" version
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-gate
+
+      # native-parity and plugin-parity compare the Rust surface against the
+      # reference C++ checkout; the reference is not vendored into this
+      # repository, so the gate needs its own shallow clone.
+      - name: Check out the reference sources
+        run: git clone --depth 1 https://github.com/2468785842/krkr2.git reference
+
+      - name: Run the static gate
+        run: uv run --project scripts krkr-gate gate
+
+  linux:
+    name: Linux x86_64 binary
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # Same dependency set as the gate job: the release build compiles the
+      # same workspace, plus the C++ TJS2 VM and its Zig-fetched dependencies.
+      - name: Install the Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison build-essential clang cmake libclang-dev \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libswresample-dev libswscale-dev \
+            libasound2-dev libc++-dev libc++abi-dev pkg-config python3
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Zig
+        run: |
+          ZIG_DIR="$RUNNER_TEMP/zig"
+          mkdir -p "$ZIG_DIR"
+          curl -sSL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" \
+            | tar -xJ --strip-components=1 -C "$ZIG_DIR"
+          echo "$ZIG_DIR" >> "$GITHUB_PATH"
+          "$ZIG_DIR/zig" version
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-x86_64
+
+      - name: Build the release binary
+        run: cargo build --release -p app
+
+      # The archive carries the run note, not just the executable: the binary
+      # is dynamically linked against the system FFmpeg, ALSA, libc++/libc++abi
+      # and the C library, so calling it a static build would be wrong.
+      - name: Package the Linux binary
+        run: |
+          set -euo pipefail
+          dist="krkr-rs-linux-x86_64"
+          tarball="$dist.tar.gz"
+          rm -rf "$dist" "$tarball"
+          mkdir -p "$dist"
+          cp target/release/krkr "$dist/krkr"
+          cp LICENSE "$dist/LICENSE"
+          cat > "$dist/README.txt" <<'EOF'
+          krkr-rs Linux x86_64
+          ====================
+
+          Run:
+            ./krkr --base-dir /path/to/game
+
+          Headless smoke test:
+            ./krkr --headless --frames 1000 --base-dir /path/to/game
+
+          This is a dynamically linked build, not a static binary. It links the
+          system FFmpeg runtime libraries, ALSA, libc++/libc++abi and the C
+          library, and loads Vulkan, X11 and Wayland at run time. Install the
+          distribution packages that provide them, for example on Debian/Ubuntu:
+
+            libavcodec* libavformat* libavutil* libswscale* libswresample*
+            libasound2 (or libasound2t64) libc++1 libc++abi1 libvulkan1
+
+          The exact soname and package names follow the distribution release.
+          The binary was built on GitHub's ubuntu-latest runner.
+          EOF
+          tar -C . -czf "$tarball" "$dist"
+          tar -tzf "$tarball"
+
+      - name: Upload the Linux binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: krkr-rs-linux-x86_64
+          path: krkr-rs-linux-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
   apk:
     name: Release APK (arm64-v8a)
+    needs: gate
     runs-on: ubuntu-latest
     # A build takes about seven minutes. The default is six hours, so a hung
     # step would bill for hours before failing; this fails fast instead.
@@ -209,26 +347,55 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      # A tag run also becomes a GitHub Release, with the APK attached — an
-      # artifact is only reachable from the run that produced it, whereas the
-      # release is where someone who just wants the app will look. A branch run
-      # has no tag to hang a release on, so it stops at the artifact.
-      #
+  # The only job that creates or uploads a GitHub Release. Waiting for both
+  # platform jobs here means the release is assembled once, after both
+  # artifacts exist; a manual run has no tag to hang a release on, so it stops
+  # at the two artifacts.
+  release:
+    name: Publish the GitHub Release
+    needs: [linux, apk]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Download the Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: krkr-rs-linux-x86_64
+          path: dist/linux
+
+      - name: Download the APK
+        uses: actions/download-artifact@v4
+        with:
+          name: krkr-rs-release-arm64-v8a
+          path: dist/android
+
       # `gh` rather than a third-party release action: fewer moving parts, and
-      # the token is already in the environment.
-      - name: Publish the APK as a GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+      # the token is already in the environment. Re-running a tag build must not
+      # fail on an existing release, so an existing one is updated in place.
+      - name: Publish both artifacts as one GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
+          set -euo pipefail
           tag="$GITHUB_REF_NAME"
-          apk=android/app/build/outputs/apk/release/app-release.apk
+          linux=dist/linux/krkr-rs-linux-x86_64.tar.gz
+          apk="$(find dist/android -name '*.apk' -print -quit)"
+          if [ -z "$apk" ]; then
+            echo "error: no APK under dist/android; the Android job produced no artifact" >&2
+            exit 1
+          fi
           if gh release view "$tag" >/dev/null 2>&1; then
-            # Re-running a tag build must not fail on an existing release.
-            gh release upload "$tag" "$apk" --clobber
+            gh release upload "$tag" "$linux" "$apk" --clobber
           else
-            gh release create "$tag" "$apk" \
+            gh release create "$tag" "$linux" "$apk" \
               --title "krkr-rs $tag" \
-              --notes "Android build (arm64-v8a, Android 15+) from \`$GITHUB_SHA\`." \
+              --notes "Linux x86_64 binary and Android APK (arm64-v8a, Android 15+) built from $GITHUB_SHA." \
               --verify-tag
           fi
