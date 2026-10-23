@@ -14,7 +14,7 @@ use fearless_simd::{Level, u8x16};
 /// scalar blend over the whole row. Blocks already copied are also opaque, so
 /// re-blending them with the same opaque source leaves the same bytes.
 pub(crate) fn copy_opaque_row(src: &[u8], dst: &mut [u8]) -> bool {
-    if src.len() != dst.len() || src.len() % 4 != 0 {
+    if src.len() != dst.len() || !src.len().is_multiple_of(4) {
         return false;
     }
     let level = Level::new();
@@ -51,7 +51,10 @@ mod tests {
 
     #[test]
     fn an_opaque_row_copies_exactly() {
-        let src = vec![17u8; 4 * 40];
+        let mut src = vec![17u8; 4 * 40];
+        for pixel in src.chunks_mut(4) {
+            pixel[3] = 255;
+        }
         let mut dst = vec![0u8; 4 * 40];
         assert!(copy_opaque_row(&src, &mut dst));
         assert_eq!(dst, src);

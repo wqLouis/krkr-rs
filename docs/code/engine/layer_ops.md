@@ -154,9 +154,9 @@ projection draws the two sources, so nothing is written to a bitmap per tick
   the stretch maps each destination pixel to the matching source texel. It
   routes to the clipped copy for Copy mode and to the source-over blit for
   SourceOver mode instead of the float resampler.
-* The optional `simd-experiment` feature adds a SIMD fast path for a
-  fully-opaque source-over row; it is exact, and the scalar band remains the
-  default and the fallback for every other row.
+* The `simd-experiment` feature adds a SIMD fast path for a fully-opaque
+  source-over row; it is exact, enabled by default in the app build, and the
+  scalar band remains the fallback for every other row.
 * **The source rectangle is half-open**, and a source region that leaves the
   source bitmap contributes nothing rather than a repeated edge pixel.
 * **`blit_plane` with both plane bits is a straight copy**, not a blend: the
