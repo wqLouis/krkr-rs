@@ -3077,7 +3077,17 @@ fn affine_blit_clipped_impl(
         mode,
         opa,
     };
-    if pass.stretch_type == 0 && affine_nearest_axis_aligned(m) {
+    // A bilinear copy of an axis-aligned quad resolves its taps once per
+    // column and row instead of once per pixel. The pass writes the generic
+    // pass's pixels, so a blend other than copy keeps the generic path.
+    let separable = if matches!(affine_blend(mode), AffineBlend::Replace) {
+        AffineAxisAlignedBilinear::new(&pass)
+    } else {
+        None
+    };
+    if let Some(separable) = separable {
+        separable.run(dst, &pass);
+    } else if pass.stretch_type == 0 && affine_nearest_axis_aligned(m) {
         affine_blit_nearest_rows(dst, pass);
     } else {
         affine_blit_generic(dst, pass);
@@ -3360,6 +3370,312 @@ struct AffinePass<'a> {
     mode: i64,
     /// The source opacity.
     opa: u8,
+}
+
+/// One destination column or row of a separable bilinear affine pass.
+#[derive(Clone, Copy)]
+struct AffineAxisTap {
+    /// The source coordinate the generic pass computes for this column/row.
+    coordinate: f32,
+    /// The first source index the kernel reads; the second is `index + 1`.
+    index: i32,
+    /// The kernel weights of `index` and `index + 1`.
+    first_weight: f32,
+    second_weight: f32,
+    /// Whether the generic pass's source-range check accepts this column/row.
+    inside: bool,
+}
+
+/// A separable bilinear affine pass for an axis-aligned map.
+///
+/// The generic pass inverse-maps every destination pixel and evaluates the
+/// kernel there. For an axis-aligned quad the source x depends on the
+/// destination column alone and the source y on the destination row alone, so
+/// the taps and weights repeat across the image. Building them once and
+/// walking the destination with the same float arithmetic samples exactly the
+/// pixels the generic pass samples.
+struct AffineAxisAlignedBilinear {
+    /// First destination column the column table covers.
+    x0: i32,
+    /// The tap of each destination column, in order.
+    columns: Vec<AffineAxisTap>,
+    /// First destination row the row table covers.
+    y0: i32,
+    /// The tap of each destination row, in order.
+    rows: Vec<AffineAxisTap>,
+    /// Source width in pixels (the kernel clamps to it).
+    source_width: usize,
+    /// Source height in pixels.
+    source_height: usize,
+}
+
+/// The largest source coordinate the separable pass accepts.
+///
+/// `index as f32` and `(index + 1) as f32` must be exact for the generic
+/// pass's tap arithmetic, which holds below 2^23. A larger coordinate takes
+/// the generic pass, which has no such bound.
+const MAX_AXIS_COORDINATE: f32 = 8_388_608.0;
+
+impl AffineAxisAlignedBilinear {
+    /// Builds the separable pass for `pass`, or `None` when the resampler is
+    /// not bilinear, the map shears or rotates, or a source coordinate cannot
+    /// use the generic pass's tap arithmetic.
+    fn new(pass: &AffinePass<'_>) -> Option<Self> {
+        if !matches!(pass.stretch_type, 1 | 2 | 4) {
+            return None;
+        }
+        // The generic pass's source x is `inv[0]*px + inv[1]*py`; an
+        // axis-aligned map makes `inv[1]` and `inv[2]` signed zeros, so each
+        // axis depends on its own destination coordinate alone.
+        if pass.map[1] == 0.0 || pass.map[5] == 0.0 || pass.map[2] != 0.0 || pass.map[4] != 0.0 {
+            return None;
+        }
+        if !pass.map[0].is_finite()
+            || !pass.map[3].is_finite()
+            || !pass.inverse[0].is_finite()
+            || !pass.inverse[3].is_finite()
+        {
+            return None;
+        }
+        if pass.source.width == 0
+            || pass.source.height == 0
+            || pass.source.width > i32::MAX as u32
+            || pass.source.height > i32::MAX as u32
+        {
+            return None;
+        }
+        let source_width = pass.source.width as usize;
+        let source_height = pass.source.height as usize;
+        let source_extent_x = (pass.source_rect.2 - pass.source_rect.0) as f64;
+        let source_extent_y = (pass.source_rect.3 - pass.source_rect.1) as f64;
+        if source_extent_x <= 0.0 || source_extent_y <= 0.0 {
+            return None;
+        }
+        let (x0, x1) = (pass.dest_rect.0, pass.dest_rect.2);
+        let (y0, y1) = (pass.dest_rect.1, pass.dest_rect.3);
+        if x0 < 0 || x1 <= x0 || y0 < 0 || y1 <= y0 {
+            return None;
+        }
+        let column_count = usize::try_from(x1 - x0).ok()?;
+        let row_count = usize::try_from(y1 - y0).ok()?;
+        let mut columns = Vec::with_capacity(column_count);
+        for x in x0..x1 {
+            columns.push(axis_tap(
+                x,
+                pass.map[0],
+                pass.inverse[0],
+                pass.source_rect.0 as f32,
+                source_extent_x,
+            )?);
+        }
+        let mut rows = Vec::with_capacity(row_count);
+        for y in y0..y1 {
+            rows.push(axis_tap(
+                y,
+                pass.map[3],
+                pass.inverse[3],
+                pass.source_rect.1 as f32,
+                source_extent_y,
+            )?);
+        }
+        Some(Self {
+            x0,
+            columns,
+            y0,
+            rows,
+            source_width,
+            source_height,
+        })
+    }
+
+    /// Runs the pass over the destination rectangle of `pass`.
+    fn run(&self, dst: &mut BitmapState, pass: &AffinePass<'_>) {
+        let dest = pass.dest_rect;
+        let row_bytes = match usize::try_from(dst.width)
+            .ok()
+            .and_then(|w| w.checked_mul(4))
+        {
+            Some(row_bytes) if row_bytes > 0 => row_bytes,
+            _ => return,
+        };
+        let Ok(rows) = usize::try_from(dest.3 - dest.1) else {
+            return;
+        };
+        let Ok(columns) = usize::try_from(dest.2 - dest.0) else {
+            return;
+        };
+        let Some(band_len) = rows.checked_mul(row_bytes) else {
+            return;
+        };
+        let Some(band_start) = usize::try_from(dest.1)
+            .ok()
+            .and_then(|row| row.checked_mul(row_bytes))
+        else {
+            return;
+        };
+        let Some(band) = dst
+            .rgba
+            .get_mut(band_start..band_start.saturating_add(band_len))
+        else {
+            return;
+        };
+        let threads = affine_thread_count(rows, columns);
+        if threads <= 1 {
+            self.run_band(band, dest.1, row_bytes, pass.source);
+            return;
+        }
+        let rows_per_band = rows.div_ceil(threads);
+        let chunk_bytes = rows_per_band.saturating_mul(row_bytes);
+        let chunks: Vec<&mut [u8]> = band.chunks_mut(chunk_bytes).collect();
+        std::thread::scope(|scope| {
+            for (index, chunk) in chunks.into_iter().enumerate() {
+                let first_row = dest.1 + (index * rows_per_band) as i32;
+                scope.spawn(move || self.run_band(chunk, first_row, row_bytes, pass.source));
+            }
+        });
+    }
+
+    /// Runs one band of destination rows.
+    fn run_band(&self, band: &mut [u8], first_row: i32, row_bytes: usize, src: &BitmapState) {
+        let Some(first) = usize::try_from(first_row - self.y0).ok() else {
+            return;
+        };
+        let rows = band.len() / row_bytes;
+        let Some(table) = self.rows.get(first..first.saturating_add(rows)) else {
+            return;
+        };
+        let source_height = self.source_height as i32;
+        let source_width = self.source_width as i32;
+        let column_start = self.x0 as usize * 4;
+        for (row, pixels) in table.iter().zip(band.chunks_exact_mut(row_bytes)) {
+            if !row.inside {
+                continue;
+            }
+            let Some(pixels) = pixels.get_mut(column_start..) else {
+                continue;
+            };
+            let source_row0 =
+                self.clamped_index(row.index, source_height) as usize * self.source_width;
+            let source_row1 = self.clamped_index(row.index.saturating_add(1), source_height)
+                as usize
+                * self.source_width;
+            for (column, target) in self
+                .columns
+                .iter()
+                .zip(pixels.as_chunks_mut::<4>().0.iter_mut())
+            {
+                if !column.inside {
+                    continue;
+                }
+                let source_col0 = self.clamped_index(column.index, source_width) as usize;
+                let source_col1 =
+                    self.clamped_index(column.index.saturating_add(1), source_width) as usize;
+                let color = self.sample(
+                    src,
+                    row,
+                    column,
+                    (source_row0, source_row1),
+                    (source_col0, source_col1),
+                );
+                target.copy_from_slice(&color);
+            }
+        }
+    }
+
+    /// The clamped source index the kernel reads for `index`.
+    fn clamped_index(&self, index: i32, limit: i32) -> i32 {
+        index.clamp(0, limit - 1)
+    }
+
+    /// Samples one destination pixel with the generic pass's tap order and
+    /// float arithmetic.
+    ///
+    /// The generic kernel skips a zero weight; adding the same `pixel * 0.0`
+    /// term instead leaves the accumulator and the weight sum unchanged, so
+    /// the four taps run unconditionally.
+    fn sample(
+        &self,
+        src: &BitmapState,
+        row: &AffineAxisTap,
+        column: &AffineAxisTap,
+        source_row_offsets: (usize, usize),
+        source_columns: (usize, usize),
+    ) -> [u8; 4] {
+        let weight00 = row.first_weight * column.first_weight;
+        let weight01 = row.first_weight * column.second_weight;
+        let weight10 = row.second_weight * column.first_weight;
+        let weight11 = row.second_weight * column.second_weight;
+        let offset00 = (source_row_offsets.0 + source_columns.0) * 4;
+        let offset01 = (source_row_offsets.0 + source_columns.1) * 4;
+        let offset10 = (source_row_offsets.1 + source_columns.0) * 4;
+        let offset11 = (source_row_offsets.1 + source_columns.1) * 4;
+        let p00 = &src.rgba[offset00..offset00 + 4];
+        let p01 = &src.rgba[offset01..offset01 + 4];
+        let p10 = &src.rgba[offset10..offset10 + 4];
+        let p11 = &src.rgba[offset11..offset11 + 4];
+        let mut acc = [0.0f32; 4];
+        for (channel, value) in acc.iter_mut().enumerate() {
+            *value += f32::from(p00[channel]) * weight00;
+            *value += f32::from(p01[channel]) * weight01;
+            *value += f32::from(p10[channel]) * weight10;
+            *value += f32::from(p11[channel]) * weight11;
+        }
+        let wsum = weight00 + weight01 + weight10 + weight11;
+        if wsum.abs() < 1e-6 {
+            return read_pixel_rect(
+                src,
+                (0, 0, self.source_width as i32, self.source_height as i32),
+                column.coordinate.round() as i32,
+                row.coordinate.round() as i32,
+            );
+        }
+        let mut out = [0u8; 4];
+        if wsum == 1.0 {
+            for (channel, value) in acc.iter().enumerate() {
+                out[channel] = value.round().clamp(0.0, 255.0) as u8;
+            }
+        } else {
+            for (channel, value) in acc.iter().enumerate() {
+                out[channel] = (*value / wsum).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        out
+    }
+}
+
+/// The tap of one destination column or row.
+fn axis_tap(
+    destination: i32,
+    origin: f64,
+    inverse: f64,
+    source_origin: f32,
+    source_extent: f64,
+) -> Option<AffineAxisTap> {
+    let position = f64::from(destination) + 0.5 - origin;
+    let unit = inverse * position;
+    if !(0.0..=1.0).contains(&unit) {
+        return Some(AffineAxisTap {
+            coordinate: 0.0,
+            index: 0,
+            first_weight: 0.0,
+            second_weight: 0.0,
+            inside: false,
+        });
+    }
+    let coordinate = source_origin + (unit * source_extent) as f32 - 0.5;
+    if !coordinate.is_finite() || coordinate.abs() > MAX_AXIS_COORDINATE {
+        return None;
+    }
+    let index = coordinate.floor() as i32;
+    let first_weight = (1.0 - (coordinate - index as f32).abs()).max(0.0);
+    let second_weight = (1.0 - (coordinate - (index + 1) as f32).abs()).max(0.0);
+    Some(AffineAxisTap {
+        coordinate,
+        index,
+        first_weight,
+        second_weight,
+        inside: true,
+    })
 }
 
 /// The nearest pass over one band of destination rows.
@@ -4357,6 +4673,18 @@ mod tests {
         mode: i64,
         opa: u8,
     ) {
+        generic_pass_typed(dst, corners, src, mode, opa, 0);
+    }
+
+    /// [`generic_pass`] with an explicit resampler.
+    fn generic_pass_typed(
+        dst: &mut BitmapState,
+        corners: [(f64, f64); 3],
+        src: &BitmapState,
+        mode: i64,
+        opa: u8,
+        stretch_type: i64,
+    ) {
         let m = affine_forward(corners[0], corners[1], corners[2]);
         let det = m[1] * m[5] - m[2] * m[4];
         let inverse = [m[5] / det, -m[2] / det, -m[4] / det, m[1] / det];
@@ -4372,7 +4700,7 @@ mod tests {
                 source: src,
                 source_rect: src_rect,
                 dest_rect,
-                stretch_type: 0,
+                stretch_type,
                 mode,
                 opa,
             },
@@ -4478,6 +4806,136 @@ mod tests {
                 .iter()
                 .any(|pixel| pixel[3] != 0)
         );
+    }
+
+    /// The separable bilinear pass and the generic per-pixel pass must sample
+    /// the same texels for an axis-aligned quad.
+    ///
+    /// A character stand's per-frame redraw is an `affineCopy` of an
+    /// axis-aligned quad with `stFastLinear | stRefNoClip`
+    /// (`reference/cpp/core/visual/LayerIntf.cpp:9227-9251`,
+    /// `reference/cpp/core/visual/LayerBitmapIntf.cpp:2773-2860`), so the
+    /// separable pass must not change a single pixel that the generic pass
+    /// would write.
+    #[test]
+    fn the_separable_bilinear_pass_matches_the_generic_pass() {
+        let src = source_texture(9, 7);
+        let placements: [[(f64, f64); 3]; 8] = [
+            [(0.4, 0.0), (9.4, 0.0), (0.4, 7.0)],
+            [(1.5, 2.25), (10.5, 2.25), (1.5, 9.25)],
+            [(0.0, 0.0), (13.0, 0.0), (0.0, 10.0)],
+            [(-2.0, -1.0), (7.0, -1.0), (-2.0, 6.0)],
+            [(0.5, 0.5), (4.5, 0.5), (0.5, 4.5)],
+            [(3.0, 3.0), (9.0, 3.0), (3.0, 9.0)],
+            [(0.25, 0.75), (15.5, 0.75), (0.25, 12.25)],
+            [(-1.75, 3.5), (2.25, 3.5), (-1.75, 7.5)],
+        ];
+        for corners in placements {
+            let m = affine_forward(corners[0], corners[1], corners[2]);
+            assert_eq!(m[2], 0.0, "the placement must be axis-aligned");
+            assert_eq!(m[4], 0.0, "the placement must be axis-aligned");
+            let mut fast = BitmapState::new(20, 20, vec![0u8; 20 * 20 * 4]);
+            let mut generic = BitmapState::new(20, 20, vec![0u8; 20 * 20 * 4]);
+            let mut public = BitmapState::new(20, 20, vec![0u8; 20 * 20 * 4]);
+            let det = m[1] * m[5] - m[2] * m[4];
+            let src_rect = (0, 0, src.width as i32, src.height as i32);
+            let dest_rect = intersect(&fast, affine_dest_bbox(m)).expect("a destination");
+            let pass = AffinePass {
+                map: m,
+                inverse: [m[5] / det, -m[2] / det, -m[4] / det, m[1] / det],
+                source: &src,
+                source_rect: src_rect,
+                dest_rect,
+                stretch_type: 1,
+                mode: 1,
+                opa: 255,
+            };
+            let separable = AffineAxisAlignedBilinear::new(&pass)
+                .expect("an axis-aligned bilinear map takes the separable pass");
+            separable.run(&mut fast, &pass);
+            generic_pass_typed(&mut generic, corners, &src, 1, 255, 1);
+            assert_eq!(
+                fast.rgba, generic.rgba,
+                "the separable pass must match the generic pass: {corners:?}"
+            );
+            affine_blit(
+                &mut public,
+                AffineBlit {
+                    corners,
+                    stretch_type: 0x1_0001,
+                    clear: false,
+                    clear_color: [0, 0, 0, 0],
+                },
+                BlitSource {
+                    bitmap: &src,
+                    rect: src_rect,
+                },
+                BlitOptions {
+                    mode: 1,
+                    opa: 255,
+                    treat_as_opaque: false,
+                    hold_alpha: false,
+                },
+            );
+            assert_eq!(
+                public.rgba, generic.rgba,
+                "affineCopy must write the generic pixels: {corners:?}"
+            );
+        }
+    }
+
+    /// The separable pass writes the same pixels when its rows are handed to
+    /// `run_band` in pieces.
+    ///
+    /// A large pass splits into row bands and runs them in parallel; the band
+    /// bookkeeping must not shift a row or lose a column.  The split is driven
+    /// directly because the thread threshold would make this test pay for a
+    /// large generic pass in a debug build.
+    #[test]
+    fn the_separable_bilinear_pass_covers_every_row_band() {
+        let src = source_texture(24, 18);
+        let corners = [(1.25, 2.5), (33.25, 2.5), (1.25, 26.5)];
+        let mut whole = BitmapState::new(40, 32, vec![0u8; 40 * 32 * 4]);
+        let mut banded = BitmapState::new(40, 32, vec![0u8; 40 * 32 * 4]);
+        let mut generic = BitmapState::new(40, 32, vec![0u8; 40 * 32 * 4]);
+        let m = affine_forward(corners[0], corners[1], corners[2]);
+        let det = m[1] * m[5] - m[2] * m[4];
+        let src_rect = (0, 0, src.width as i32, src.height as i32);
+        let dest_rect = intersect(&whole, affine_dest_bbox(m)).expect("a destination");
+        let pass = AffinePass {
+            map: m,
+            inverse: [m[5] / det, -m[2] / det, -m[4] / det, m[1] / det],
+            source: &src,
+            source_rect: src_rect,
+            dest_rect,
+            stretch_type: 1,
+            mode: 1,
+            opa: 255,
+        };
+        let plan = AffineAxisAlignedBilinear::new(&pass).expect("a separable pass");
+        plan.run(&mut whole, &pass);
+        let row_bytes = 40 * 4;
+        let top_start = dest_rect.1 as usize * row_bytes;
+        let split = (dest_rect.1 + 12) as usize * row_bytes;
+        let end = dest_rect.3 as usize * row_bytes;
+        plan.run_band(
+            &mut banded.rgba[top_start..split],
+            dest_rect.1,
+            row_bytes,
+            &src,
+        );
+        plan.run_band(
+            &mut banded.rgba[split..end],
+            dest_rect.1 + 12,
+            row_bytes,
+            &src,
+        );
+        assert_eq!(
+            whole.rgba, banded.rgba,
+            "the rows must not depend on the band split"
+        );
+        generic_pass_typed(&mut generic, corners, &src, 1, 255, 1);
+        assert_eq!(whole.rgba, generic.rgba);
     }
 
     /// A one-to-one stretch takes the exact source-over blit path.
