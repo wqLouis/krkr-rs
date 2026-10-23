@@ -223,6 +223,7 @@ elif [[ -f "$target" ]]; then
     trap cleanup EXIT
     libdir="$(unpack_apk "$target" "$tmp")"
     [[ -d "$libdir" ]] || die "$target contains no native libraries"
-    check_dir "$libdir"else
+    check_dir "$libdir"
+else
     die "$target is neither a directory nor a file"
 fi
