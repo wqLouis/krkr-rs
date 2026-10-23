@@ -2471,7 +2471,6 @@ pub fn stretch_blit_mode(
         bitmap: src,
         rect: src_rect,
     } = source;
-    let BlitOptions { mode, opa, .. } = options;
     let dw = dest.2 - dest.0;
     let dh = dest.3 - dest.1;
     if dw <= 0 || dh <= 0 || src_rect.2 <= src_rect.0 || src_rect.3 <= src_rect.1 {

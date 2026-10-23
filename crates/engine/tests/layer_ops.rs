@@ -993,7 +993,7 @@ fn a_pixel_center_one_to_one_affine_copy_is_exact() {
 /// into every destination pixel must produce that solid color everywhere.
 #[test]
 fn a_large_stretch_blit_matches_the_solid_source() {
-    let source = bitmap(2, 2, vec![10, 20, 30, 255].repeat(4));
+    let source = bitmap(2, 2, [10, 20, 30, 255].repeat(4));
     let mut destination = bitmap(1024, 1024, vec![0u8; 1024 * 1024 * 4]);
     stretch_blit(
         &mut destination,
