@@ -8,9 +8,9 @@ use engine::BitmapState;
 use engine::Scene;
 use engine::layer_ops::{
     AffineBlit, BlitOptions, BlitSource, COPY_MAIN, COPY_MASK, affine_blit, affine_blit_clipped,
-    blit_copy, blit_over, blit_plane, blur_bitmap_in_place, copy_9patch, do_gray_scale,
-    ensure_transition_display, fill_color_on_alpha, fill_mask, flip_lr, gaussian_blur,
-    operate_rect, render_layer_subtree, stretch_blit, tile_rect,
+    affine_blit_clipped_pixel_center, blit_copy, blit_over, blit_plane, blur_bitmap_in_place,
+    copy_9patch, do_gray_scale, ensure_transition_display, fill_color_on_alpha, fill_mask, flip_lr,
+    gaussian_blur, operate_rect, render_layer_subtree, stretch_blit, tile_rect,
 };
 use engine::raster::fill_rect_replace;
 use engine::scene::Rect;
@@ -954,6 +954,69 @@ fn a_transition_display_never_reuses_the_script_cache() {
     assert_eq!(
         reused, display,
         "a running transition reuses its own display"
+    );
+}
+
+/// The pixel-centre convention maps the half-pixel corner back to the pixel
+/// boundary: a 1:1 copy is the source exactly, including its alpha.
+#[test]
+fn a_pixel_center_one_to_one_affine_copy_is_exact() {
+    let source = sample(4, 4, 31);
+    let mut destination = bitmap(4, 4, vec![0u8; 4 * 4 * 4]);
+    affine_blit_clipped_pixel_center(
+        &mut destination,
+        AffineBlit {
+            corners: [(-0.5, -0.5), (3.5, -0.5), (-0.5, 3.5)],
+            stretch_type: 1,
+            clear: false,
+            clear_color: [0, 0, 0, 0],
+        },
+        BlitSource {
+            bitmap: &source,
+            rect: (0, 0, 4, 4),
+        },
+        BlitOptions {
+            mode: 1,
+            opa: 255,
+            treat_as_opaque: false,
+            hold_alpha: false,
+        },
+        (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+    );
+    assert_eq!(
+        destination.rgba, source.rgba,
+        "the half-origin fast path copies exact texels"
+    );
+}
+
+/// A large source-over pass splits its rows across bands; the bytes must be
+/// identical to the single-threaded path.
+#[test]
+fn a_large_blit_over_matches_the_single_pixel_path() {
+    let source = bitmap(1024, 1024, vec![128u8; 1024 * 1024 * 4]);
+    let mut destination = bitmap(1024, 1024, vec![0u8; 1024 * 1024 * 4]);
+    blit_over(
+        &mut destination,
+        0,
+        0,
+        BlitSource {
+            bitmap: &source,
+            rect: (0, 0, 1024, 1024),
+        },
+        (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+        BlitOptions {
+            mode: 0,
+            opa: 255,
+            treat_as_opaque: false,
+            hold_alpha: false,
+        },
+    );
+    assert!(
+        destination
+            .rgba
+            .chunks_exact(4)
+            .all(|pixel| pixel == [128, 128, 128, 128]),
+        "the row bands write the same straight-alpha result"
     );
 }
 

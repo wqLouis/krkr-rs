@@ -30,7 +30,7 @@ use api::blend::{BlendMode, DstBlend};
 use api::geometry::PixelRegion;
 
 use crate::hasher::Map;
-use crate::raster::{blend_pixel, blend_pixel_at, blend_pixel_raw};
+use crate::raster::{blend_pixel, blend_pixel_at};
 use crate::scene::{BitmapState, Rect, Scene};
 
 /// Half-open pixel rectangle `[x0, x1) x [y0, y1)`.
@@ -701,12 +701,7 @@ pub fn blit_over(
         bitmap: src,
         rect: src_rect,
     } = source;
-    let BlitOptions {
-        opa,
-        treat_as_opaque,
-        hold_alpha,
-        ..
-    } = options;
+    let BlitOptions { opa, .. } = options;
     let sw = src_rect.2.saturating_sub(src_rect.0);
     let sh = src_rect.3.saturating_sub(src_rect.1);
     if sw <= 0 || sh <= 0 || opa == 0 || src.width == 0 || src.height == 0 {
@@ -722,34 +717,173 @@ pub fn blit_over(
     let Some(dc) = intersect_rect(in_bounds, clip) else {
         return;
     };
-    for y in dc.1..dc.3 {
-        for x in dc.0..dc.2 {
-            let sx = src_rect.0 + (x - dx);
-            let sy = src_rect.1 + (y - dy);
-            if sx < 0 || sy < 0 || sx as u32 >= src.width || sy as u32 >= src.height {
+    let rows = (dc.3 - dc.1) as usize;
+    let columns = (dc.2 - dc.0) as usize;
+    let threads = affine_thread_count(rows, columns);
+    let row_bytes = match usize::try_from(dst.width)
+        .ok()
+        .and_then(|w| w.checked_mul(4))
+    {
+        Some(width) => width,
+        None => return,
+    };
+    let band_start = (dc.1 as usize).saturating_mul(row_bytes);
+    let band_len = rows.saturating_mul(row_bytes);
+    let Some(band) = dst
+        .rgba
+        .get_mut(band_start..band_start.saturating_add(band_len))
+    else {
+        return;
+    };
+    if threads <= 1 {
+        blit_over_band(
+            band,
+            dc.1,
+            dst.width as i32,
+            BlitOverArea { clip: dc, dx, dy },
+            BlitSource {
+                bitmap: src,
+                rect: src_rect,
+            },
+            options,
+        );
+    } else {
+        let rows_per_band = rows.div_ceil(threads);
+        let chunk_bytes = rows_per_band.saturating_mul(row_bytes);
+        let chunks: Vec<&mut [u8]> = band.chunks_mut(chunk_bytes).collect();
+        let dst_width = dst.width as i32;
+        std::thread::scope(|scope| {
+            for (index, chunk) in chunks.into_iter().enumerate() {
+                let first_row = dc.1 + (index * rows_per_band) as i32;
+                scope.spawn(move || {
+                    blit_over_band(
+                        chunk,
+                        first_row,
+                        dst_width,
+                        BlitOverArea { clip: dc, dx, dy },
+                        BlitSource {
+                            bitmap: src,
+                            rect: src_rect,
+                        },
+                        options,
+                    );
+                });
+            }
+        });
+    }
+    // The pass wrote inside the clipped destination rectangle only, so the
+    // upload needs that rectangle and not the whole bitmap.
+    dst.mark_dirty_rect(clipped_region(dc));
+}
+
+/// The destination window of one [`blit_over`] call: the clipped rectangle
+/// plus the source placement.
+#[derive(Clone, Copy)]
+struct BlitOverArea {
+    /// Clipped destination rectangle the pass writes inside.
+    clip: RectI,
+    /// Source origin on the destination.
+    dx: i32,
+    /// Source origin on the destination.
+    dy: i32,
+}
+
+/// One contiguous band of destination rows for [`blit_over`].
+///
+/// A band owns whole rows, so the pixel loop can address its destination row
+/// directly instead of resolving a scene offset per pixel. The parallel pass
+/// splits the clipped rows into bands and runs this function per band.
+fn blit_over_band(
+    band: &mut [u8],
+    first_row: i32,
+    dst_width: i32,
+    area: BlitOverArea,
+    source: BlitSource<'_>,
+    options: BlitOptions,
+) {
+    let BlitSource {
+        bitmap: src,
+        rect: src_rect,
+    } = source;
+    let BlitOptions {
+        opa,
+        treat_as_opaque,
+        hold_alpha,
+        ..
+    } = options;
+    let (x0, x1) = (area.clip.0, area.clip.2);
+    let (dx, dy) = (area.dx, area.dy);
+    let (Ok(dst_width), Ok(src_width), Ok(src_height)) = (
+        usize::try_from(dst_width),
+        usize::try_from(src.width),
+        usize::try_from(src.height),
+    ) else {
+        return;
+    };
+    let (Some(dst_pitch), Some(src_pitch)) = (dst_width.checked_mul(4), src_width.checked_mul(4))
+    else {
+        return;
+    };
+    for (row_index, row) in band.chunks_mut(dst_pitch).enumerate() {
+        let Ok(row_index) = i32::try_from(row_index) else {
+            break;
+        };
+        let y = first_row.saturating_add(row_index);
+        let sy = src_rect.1.saturating_add(y.saturating_sub(dy));
+        let Ok(sy) = usize::try_from(sy) else {
+            continue;
+        };
+        if sy >= src_height {
+            continue;
+        }
+        for x in x0..x1 {
+            let sx = src_rect.0.saturating_add(x.saturating_sub(dx));
+            if sx < 0 || usize::try_from(sx).map_or(true, |sx| sx >= src_width) {
                 continue;
             }
-            let mut color = read_pixel(src, sx, sy);
+            let (Ok(sx), Ok(x)) = (usize::try_from(sx), usize::try_from(x)) else {
+                continue;
+            };
+            let Some(source_start) = sy
+                .checked_mul(src_pitch)
+                .and_then(|row| row.checked_add(sx.checked_mul(4)?))
+            else {
+                continue;
+            };
+            let Some(source) = src.rgba.get(source_start..source_start.saturating_add(4)) else {
+                continue;
+            };
+            let mut color = [source[0], source[1], source[2], source[3]];
             if treat_as_opaque {
                 // `bmCopyOnAlpha`/`bmAlpha` treat the source as a fully
                 // opaque image; the constant `opa` supplies the coverage.
                 color[3] = 255;
             }
+            let Some(dest_start) = x.checked_mul(4) else {
+                continue;
+            };
+            let Some(destination) = row.get(dest_start..dest_start.saturating_add(4)) else {
+                continue;
+            };
             // `holdAlpha` suppresses the write to the destination alpha
             // channel entirely; capture it first so the composite math still
             // sees the real destination alpha.
-            let old_alpha = read_pixel(dst, x, y)[3];
-            blend_pixel_raw(dst, x, y, color, 255, opa);
+            let old_alpha = destination[3];
+            let mut pixel = [
+                destination[0],
+                destination[1],
+                destination[2],
+                destination[3],
+            ];
+            blend_pixel_at(&mut pixel, color, 255, opa);
             if hold_alpha {
-                let mut d = read_pixel(dst, x, y);
-                d[3] = old_alpha;
-                write_pixel(dst, x, y, d);
+                pixel[3] = old_alpha;
+            }
+            if let Some(destination) = row.get_mut(dest_start..dest_start.saturating_add(4)) {
+                destination.copy_from_slice(&pixel);
             }
         }
     }
-    // The pass wrote inside the clipped destination rectangle only, so the
-    // upload needs that rectangle and not the whole bitmap.
-    dst.mark_dirty_rect(clipped_region(dc));
 }
 
 /// `CopyRect` with an explicit `plane` selection (`TVP_BB_COPY_MAIN` /
@@ -2410,6 +2544,30 @@ pub fn affine_blit_clipped(
     options: BlitOptions,
     clip: RectI,
 ) {
+    affine_blit_clipped_impl(dst, affine, source, options, clip, false);
+}
+
+/// [`affine_blit_clipped`] for corners expressed in the pixel-centre
+/// convention: an origin at a half pixel denotes the pixel boundary, so a
+/// one-to-one transfer still copies exact source texels.
+pub fn affine_blit_clipped_pixel_center(
+    dst: &mut BitmapState,
+    affine: AffineBlit,
+    source: BlitSource<'_>,
+    options: BlitOptions,
+    clip: RectI,
+) {
+    affine_blit_clipped_impl(dst, affine, source, options, clip, true);
+}
+
+fn affine_blit_clipped_impl(
+    dst: &mut BitmapState,
+    affine: AffineBlit,
+    source: BlitSource<'_>,
+    options: BlitOptions,
+    clip: RectI,
+    pixel_center: bool,
+) {
     let AffineBlit {
         corners,
         stretch_type,
@@ -2451,10 +2609,11 @@ pub fn affine_blit_clipped(
     // A one-to-one integer transfer is a copy, whatever the affine resampler:
     // every supported kernel is exact at an integer source centre. This is
     // the full-screen UI/stage copy that otherwise pays the per-pixel inverse
-    // map and float kernel. The affine = true half-pixel convention has a
-    // half-integer centre and stays on the resampler.
+    // map and float kernel. A pixel-centre origin at half a pixel denotes the
+    // boundary, so the caller's convention decides whether the half offset is
+    // applied; a fractional boundary still stays on the resampler.
     if matches!(affine_blend(mode), AffineBlend::Replace)
-        && let Some((dx, dy)) = affine_unit_copy(m, src_rect, src, stretch_type)
+        && let Some((dx, dy)) = affine_unit_copy(m, src_rect, src, stretch_type, pixel_center)
     {
         blit_copy_clipped(dst, dx, dy, src, src_rect, clip);
         // The affine pass marks the mapped bounding box, even the one-pixel
@@ -2612,15 +2771,17 @@ fn affine_nearest_axis_aligned(m: [f64; 6]) -> bool {
 /// None when the map resamples or the source rect leaves the image.
 ///
 /// The generic pass samples at src_rect.0 + dest_x - m[0]; this is an integer
-/// source centre exactly when m[0] and m[3] are integers. At an integer centre
-/// the nearest, linear, cubic, spline and Lanczos kernels all return the source
-/// texel unchanged, so the transfer is a row copy. The blur-style and
+/// source centre exactly when the mapped origin (with the half-pixel offset of
+/// the affine-matrix convention when present) is an integer. At an integer
+/// centre the nearest, linear, cubic, spline and Lanczos kernels all return the
+/// source texel unchanged, so the transfer is a row copy. The blur-style and
 /// area-average kernels do not have that property.
 fn affine_unit_copy(
     m: [f64; 6],
     src_rect: RectI,
     src: &BitmapState,
     stretch_type: i64,
+    pixel_center: bool,
 ) -> Option<(i32, i32)> {
     let kind = stretch_type & 0xffff;
     if !matches!(kind, 0..=13) {
@@ -2636,14 +2797,23 @@ fn affine_unit_copy(
     if m[1] != width || m[5] != height || m[2] != 0.0 || m[4] != 0.0 {
         return None;
     }
-    if !m[0].is_finite()
-        || !m[3].is_finite()
-        || m[0].fract() != 0.0
-        || m[3].fract() != 0.0
-        || m[0] < f64::from(i32::MIN)
-        || m[0] > f64::from(i32::MAX)
-        || m[3] < f64::from(i32::MIN)
-        || m[3] > f64::from(i32::MAX)
+    // The points convention maps the source corner itself; the affine matrix
+    // convention maps the corner pixel centre at -0.5. Both describe a
+    // pixel-edge origin exactly when adding the convention offset lands on an
+    // integer.
+    let (origin_x, origin_y) = if m[0].fract() == 0.0 && m[3].fract() == 0.0 {
+        (m[0], m[3])
+    } else if pixel_center && (m[0] + 0.5).fract() == 0.0 && (m[3] + 0.5).fract() == 0.0 {
+        (m[0] + 0.5, m[3] + 0.5)
+    } else {
+        return None;
+    };
+    if !origin_x.is_finite()
+        || !origin_y.is_finite()
+        || origin_x < f64::from(i32::MIN)
+        || origin_x > f64::from(i32::MAX)
+        || origin_y < f64::from(i32::MIN)
+        || origin_y > f64::from(i32::MAX)
     {
         return None;
     }
@@ -2654,7 +2824,7 @@ fn affine_unit_copy(
     {
         return None;
     }
-    Some((m[0] as i32, m[3] as i32))
+    Some((origin_x as i32, origin_y as i32))
 }
 
 /// The nearest resampler's scanline pass over an axis-aligned quad.
@@ -3771,9 +3941,10 @@ mod tests {
         assert!(scanline.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0));
     }
 
-    /// A one-to-one integer copy is recognised as a copy, while the affine
-    /// half-pixel convention and the blur-style resamplers stay on the generic
-    /// sampler: their output is not the source texel.
+    /// A one-to-one integer copy is recognised as a copy, including the
+    /// pixel-centre half-pixel origin. A fractional boundary and the
+    /// blur-style resamplers stay on the generic sampler: their output is not
+    /// the source texel.
     #[test]
     fn a_one_to_one_integer_affine_copy_is_recognised() {
         let src = source_texture(4, 4);
@@ -3781,19 +3952,25 @@ mod tests {
         let map = affine_forward(corners[0], corners[1], corners[2]);
         for kind in [0, 1, 2, 3, 6, 8, 13] {
             assert_eq!(
-                affine_unit_copy(map, (0, 0, 4, 4), &src, kind),
+                affine_unit_copy(map, (0, 0, 4, 4), &src, kind, false),
                 Some((2, 3)),
                 "stretch kind {kind} is exact at integer centres"
             );
         }
         assert!(
-            affine_unit_copy(map, (0, 0, 4, 4), &src, 16).is_none(),
+            affine_unit_copy(map, (0, 0, 4, 4), &src, 16, false).is_none(),
             "a Gaussian kernel does not copy at an integer centre"
         );
         let half = affine_forward((-0.5, -0.5), (3.5, -0.5), (-0.5, 3.5));
+        assert_eq!(
+            affine_unit_copy(half, (0, 0, 4, 4), &src, 1, true),
+            Some((0, 0)),
+            "the affine half-pixel convention copies at its integer origin"
+        );
+        let fractional = affine_forward((-0.25, -0.5), (3.75, -0.5), (-0.25, 3.5));
         assert!(
-            affine_unit_copy(half, (0, 0, 4, 4), &src, 1).is_none(),
-            "the affine half-pixel convention still resamples"
+            affine_unit_copy(fractional, (0, 0, 4, 4), &src, 1, true).is_none(),
+            "a fractional origin still resamples"
         );
     }
 }

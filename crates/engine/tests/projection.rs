@@ -1043,6 +1043,52 @@ fn a_self_frame_transition_draws_no_cache_and_keeps_its_children_live() {
     );
 }
 
+/// A frame update keeps a transition source that is also an ancestor of the
+/// destination cache-current: that source subtree supplies the frame pixels,
+/// so recompositing it would be pure per-tick work.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7734-7737
+#[test]
+fn a_frame_update_keeps_an_ancestor_source_cache_current() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (16, 16));
+    let source = scene.add_layer(win, None);
+    scene.layer_mut(source).unwrap().rect = Rect::new(0, 0, 8, 8);
+    scene.layer_mut(source).unwrap().visible = true;
+    let source_bitmap = attach_image(&mut scene, source, 8, 8);
+    let dest = scene.add_layer(win, Some(source));
+    scene.layer_mut(dest).unwrap().rect = Rect::new(4, 4, 8, 8);
+    scene.layer_mut(dest).unwrap().visible = true;
+    let dest_bitmap = attach_image(&mut scene, dest, 8, 8);
+    // Clearing the destination's cache through `layer_mut` also invalidates
+    // its ancestors, so clear the source last.
+    scene.layer_mut(dest).unwrap().cache_recalc = false;
+    scene.layer_mut(source).unwrap().cache_recalc = false;
+
+    let frame = TransitionFrame::new(
+        (8, 8),
+        true,
+        TransitionSource::new(
+            dest_bitmap,
+            Rect::new(0, 0, 8, 8),
+            Rect::new(0, 0, 8, 8),
+            1.0,
+        ),
+        TransitionSource::new(
+            source_bitmap,
+            Rect::new(0, 0, 8, 8),
+            Rect::new(0, 0, 8, 8),
+            0.5,
+        ),
+    );
+    scene.set_transition_frame_for(dest, source, Some(frame));
+    assert!(!scene.layer(dest).unwrap().cache_recalc);
+    assert!(
+        !scene.layer(source).unwrap().cache_recalc,
+        "the ancestor source stays reusable as the frame source"
+    );
+}
+
 /// A whole-subtree frame stands in for the layer's subtree, so its children
 /// draw through it and are reported like the children a cache covers
 /// (`reference/cpp/core/visual/LayerIntf.cpp:7221-7226`).

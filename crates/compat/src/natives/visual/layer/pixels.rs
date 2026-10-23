@@ -405,6 +405,7 @@ struct AffineRun<'a> {
     clear: bool,
     neutral: [u8; 4],
     clip: RectI,
+    pixel_center: bool,
 }
 
 /// Run an affine operation clipped to `clip`, emulating `HoldAlpha`.
@@ -422,6 +423,7 @@ fn affine_run(run: AffineRun<'_>) -> Result<(), String> {
         clear,
         neutral,
         clip,
+        pixel_center,
     } = run;
     with_two_bitmaps(scene, dst_id, src_id, |dst, src| -> Result<(), String> {
         // The pass writes inside the clip alone, so the pixels outside it
@@ -432,7 +434,12 @@ fn affine_run(run: AffineRun<'_>) -> Result<(), String> {
         } else {
             None
         };
-        layer_ops::affine_blit_clipped(
+        let blit = if pixel_center {
+            layer_ops::affine_blit_clipped_pixel_center
+        } else {
+            layer_ops::affine_blit_clipped
+        };
+        blit(
             dst,
             layer_ops::AffineBlit {
                 corners: [p0, p1, p2],
@@ -713,6 +720,7 @@ fn affine_op(
         argb_to_rgba(color)
     };
     let hold = hold_alpha && layer_hold_alpha;
+    let pixel_center = affine || p0.0.fract() != 0.0 || p0.1.fract() != 0.0;
     affine_run(AffineRun {
         scene,
         dst_id: dst,
@@ -726,6 +734,7 @@ fn affine_op(
         clear,
         neutral: neutral_color,
         clip,
+        pixel_center,
     })?;
     mark_image_modified(scene, id);
     Ok(())

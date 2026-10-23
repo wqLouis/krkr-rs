@@ -1450,7 +1450,7 @@ fn composite_transition(
     let effect: Option<EffectDraw> =
         scene.transition_effect_draw(trans, src1, src2, (w, h), with_children);
     if let Some(effect) = effect {
-        scene.set_effect(id, Some(effect));
+        scene.set_effect_for(id, source, Some(effect));
         scene.set_transition_frame(id, None);
         return Ok(());
     }
@@ -1463,7 +1463,7 @@ fn composite_transition(
         None
     };
     if let Some(frame) = frame {
-        scene.set_transition_frame(id, Some(frame));
+        scene.set_transition_frame_for(id, source, Some(frame));
         return Ok(());
     }
     // The blend needs a frame of its own, distinct from the content it reads,

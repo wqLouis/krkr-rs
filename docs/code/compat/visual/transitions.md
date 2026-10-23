@@ -151,12 +151,14 @@ A composited frame changes every tick, but only because its blend weights (or
 placements) change: the endpoint **subtrees** it samples do not. The frame
 update therefore marks only the transitioning layer's caching **ancestors**
 stale, which must repaint the frame, and leaves the layer's own composited
-content reusable as the frame's source. Marking the layer itself stale would
-recomposite a full-screen endpoint subtree on every transition tick for no
-visible change. Clearing the frame does invalidate the layer itself, because
-it then returns to drawing its own subtree and any cache kept from before or
-during the transition is stale. The same rule applies to the custom-shader
-effect draw.
+content reusable as the frame's source. A source layer that is also one of
+the destination's ancestors is excluded from that invalidation: its content is
+the frame source, not part of the changed output. Marking the layer itself
+stale would recomposite a full-screen endpoint subtree on every transition
+tick for no visible change. Clearing the frame does invalidate the layer
+itself, because it then returns to drawing its own subtree and any cache kept
+from before or during the transition is stale. The same rule applies to the
+custom-shader effect draw.
 
 While a layer owns a frame or effect draw, the projection never draws that
 layer's own `cache_bitmap`: the draw replaces the image the cache holds.

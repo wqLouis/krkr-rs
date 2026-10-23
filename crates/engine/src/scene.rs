@@ -1329,6 +1329,14 @@ impl Scene {
     /// has to see the new frame. A malformed parent cycle terminates after the
     /// pool of layers is exhausted.
     fn invalidate_ancestor_caches(&mut self, id: u32) {
+        self.invalidate_ancestor_caches_except(id, None);
+    }
+
+    /// The same walk, skipping `except` itself. A transition source that is
+    /// also an ancestor of the destination supplies the frame's source pixels,
+    /// so its cached content must stay current even though the destination's
+    /// frame changed.
+    fn invalidate_ancestor_caches_except(&mut self, id: u32, except: Option<u32>) {
         let limit = self.layers.len().saturating_add(1);
         let mut current = self.layer(id).and_then(|layer| layer.parent);
         let mut steps = 0usize;
@@ -1337,6 +1345,10 @@ impl Scene {
                 break;
             }
             steps += 1;
+            if except == Some(c) {
+                current = self.layer(c).and_then(|layer| layer.parent);
+                continue;
+            }
             current = match self.layer_mut_untracked(c) {
                 Some(layer) => {
                     layer.cache_recalc = true;
@@ -3451,6 +3463,29 @@ impl Scene {
     /// named and the new one does not is released once nothing else holds it;
     /// the transition's own sources keep their owners' references.
     pub fn set_transition_frame(&mut self, id: u32, frame: Option<TransitionFrame>) {
+        self.set_transition_frame_except(id, None, frame);
+    }
+
+    /// Set a running transition's frame while keeping the transition source
+    /// layer's own cache current. When the source is one of the destination's
+    /// ancestors its composited content is also the frame source, so the frame
+    /// change must not recomposite it; only the other caching ancestors need
+    /// the new frame.
+    pub fn set_transition_frame_for(
+        &mut self,
+        id: u32,
+        source: u32,
+        frame: Option<TransitionFrame>,
+    ) {
+        self.set_transition_frame_except(id, Some(source), frame);
+    }
+
+    fn set_transition_frame_except(
+        &mut self,
+        id: u32,
+        source: Option<u32>,
+        frame: Option<TransitionFrame>,
+    ) {
         let mut replaced = None;
         let changed = match self.layer_mut_untracked(id) {
             Some(layer) if layer.transition_frame != frame => {
@@ -3467,7 +3502,7 @@ impl Scene {
                 // through) is stale now, so resume from a fresh composite.
                 self.invalidate_layer_cache(id);
             } else {
-                self.invalidate_ancestor_caches(id);
+                self.invalidate_ancestor_caches_except(id, source);
             }
             self.touch_structure();
             if let Some(replaced) = replaced {
@@ -3493,6 +3528,17 @@ impl Scene {
     /// one does not is released once nothing else holds it; the transition's
     /// own sources keep their owners' references.
     pub fn set_effect(&mut self, id: u32, effect: Option<EffectDraw>) {
+        self.set_effect_except(id, None, effect);
+    }
+
+    /// Set a running transition's effect draw while keeping the transition
+    /// source layer's own cache current, for the same reason as
+    /// [`Scene::set_transition_frame_for`].
+    pub fn set_effect_for(&mut self, id: u32, source: u32, effect: Option<EffectDraw>) {
+        self.set_effect_except(id, Some(source), effect);
+    }
+
+    fn set_effect_except(&mut self, id: u32, source: Option<u32>, effect: Option<EffectDraw>) {
         let cleared = effect.is_none();
         let kept: Vec<u32> = effect
             .as_ref()
@@ -3519,7 +3565,7 @@ impl Scene {
                 // through) is stale now, so resume from a fresh composite.
                 self.invalidate_layer_cache(id);
             } else {
-                self.invalidate_ancestor_caches(id);
+                self.invalidate_ancestor_caches_except(id, source);
             }
             self.touch_structure();
             if let Some(replaced) = replaced {
