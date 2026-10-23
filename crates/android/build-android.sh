@@ -153,7 +153,11 @@ export CXXSTDLIB_aarch64_linux_android="c++_static"
 # that is unset, a global RUSTFLAGS — is preserved: cargo treats the
 # target-scoped variable as a replacement for RUSTFLAGS, so dropping it would
 # silently discard the caller's flags.
-ALIGN_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
+# The NDK keeps the static C++ runtime in the target sysroot, which rustc's
+# default Android link search does not include. Without this the `tjs` build
+# script's `cargo:rustc-link-lib=static=c++_static` fails at link time.
+CXX_LIB_DIR="$TOOLCHAIN/sysroot/usr/lib/aarch64-linux-android"
+ALIGN_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384 -L native=$CXX_LIB_DIR"
 EXISTING_RUSTFLAGS="${CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS:-${RUSTFLAGS:-}}"
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="${EXISTING_RUSTFLAGS} ${ALIGN_RUSTFLAGS}"
 
