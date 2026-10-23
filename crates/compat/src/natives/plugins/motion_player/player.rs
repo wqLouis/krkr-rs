@@ -311,6 +311,22 @@ impl PlayerInst {
         self.allplaying
     }
 
+    /// The `loopTime` value KAG's `AffineSourceMotion.canSync` reads.
+    ///
+    /// The image wait created by `[ev storage]` is evaluated before the first
+    /// full frame has advanced, while `[ev waitmovie]` uses `_playing`
+    /// instead.  Returning the clip's negative loop time at that point makes
+    /// `canSync` report the just-presented motion as a transition to wait for,
+    /// so the image wait consumes the whole movie.  Keep the value neutral
+    /// until the first full frame; `playing` and `_playing` are untouched.
+    pub(crate) fn sync_loop_time(&self) -> f64 {
+        if self.frame_tick_count == 0.0 {
+            0.0
+        } else {
+            self.loop_time
+        }
+    }
+
     /// Recompute the playing timeline list and report whether any timeline is
     /// still playing.
     pub(crate) fn playing_now(&mut self) -> bool {
@@ -4130,6 +4146,31 @@ mod tests {
         assert_eq!(player.timelines["intro"].current_time, advanced);
         player.progress(-1000.0, &ctx, tjs::Tjs2ValueId::null());
         assert_eq!(player.timelines["intro"].current_time, advanced);
+    }
+
+    /// The `canSync` input is neutral only while the first presented pose
+    /// has not advanced; the real `loopTime` stays available for every other
+    /// read, and `playing` is never changed.
+    #[test]
+    fn the_can_sync_loop_time_is_neutral_until_the_first_full_frame() {
+        let snapshot = snapshot();
+        let _lock = crate::native_util::test_vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let ctx = context(&engine, &mut services);
+        let mut player = player(&snapshot);
+        player.play("intro", 0, &ctx).expect("start intro");
+        assert_eq!(player.sync_loop_time(), 0.0, "the image wait is closed");
+        player.progress(0.0, &ctx, tjs::Tjs2ValueId::null());
+        assert_eq!(player.sync_loop_time(), 0.0, "the zero tick stays closed");
+        assert!(player.playing(), "playing remains for the movie wait");
+        player.progress(20.0, &ctx, tjs::Tjs2ValueId::null());
+        assert!(player.frame_tick_count > 0.0);
+        assert_eq!(
+            player.sync_loop_time(),
+            player.loop_time,
+            "the real loop time returns after the first full frame"
+        );
     }
 
     #[test]

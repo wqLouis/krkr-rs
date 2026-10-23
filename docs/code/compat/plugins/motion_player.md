@@ -561,6 +561,14 @@ layer leaves nothing to draw into and the call returns void without raising
   that follows it only presents the first pose, and the layer update that runs
   with it releases the gate
   (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:819-826`).
+* `Player.loopTime` reads `0` until the first full frame has advanced, while
+  `Player.playing` keeps its reference value.  KAG's `[ev storage]` image wait
+  (`EnvLayerObject.createWait(1)`) reads `loopTime` through
+  `AffineSourceMotion.canSync`; the neutral value keeps that wait from
+  covering the movie.  The following `[ev waitmovie]`
+  (`EnvLayerObject.createWait(2)`) reads the image's `_playing` field, which
+  stays true, and waits the remaining playback (`system/world.tjs`,
+  `system/affinesourcemotion.tjs`).
 * `Player.progress(dt)` returns the playback ratio; the emote classes discard
   it (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:1281-1305`).
 * The timelines, the variables and the transition animators are stepped
@@ -678,9 +686,9 @@ A draw target that names no layer, a `Point` or `Quad` hit test and a
 
 | file | what it pins |
 |---|---|
-| `crates/compat/tests/motion_player.rs` | the namespace constants and the subclass placement (top-level versus `Motion.*`), the geometry hit-test classes, the `LayerGetter` defaults and its array identity, the resource manager's layer-id allocator and the decrypt seed, the `D3DEmoteModule` class statics, the player's property surface, the variable and timeline queries, the arity gates, the `onFindMotion` override, the emote shell, the PSB module load and unload, the `motionKey` candidate list, the `ShortCutInitial*` globals, the `SeparateLayerAdaptor` owner, the layer getter, the colour-weight channel order, the progress gate and the dropped delta, and the draw path (texture sampling, the draw affine, the node colour tint, the uncleared target, the untouched target geometry, the reused allocation, the `psb://` media registration) |
+| `crates/compat/tests/motion_player.rs` | the namespace constants and the subclass placement (top-level versus `Motion.*`), the geometry hit-test classes, the `LayerGetter` defaults and its array identity, the resource manager's layer-id allocator and the decrypt seed, the `D3DEmoteModule` class statics, the player's property surface, the variable and timeline queries, the arity gates, the `onFindMotion` override, the emote shell, the PSB module load and unload, the `motionKey` candidate list, the `ShortCutInitial*` globals, the `SeparateLayerAdaptor` owner, the layer getter, the colour-weight channel order, the progress gate and the dropped delta, the image-wait/movie-wait `canSync` split, and the draw path (texture sampling, the draw affine, the node colour tint, the uncleared target, the untouched target geometry, the reused allocation, the `psb://` media registration) |
 | `crates/compat/tests/emote_player.rs` | the loader shim defines no globals of its own and the `motionplayer.dll` classes are reachable through it |
-| `crates/compat/src/natives/plugins/motion_player/player.rs` unit tests | the replay of a short clip after a long one, the queuing gate and the dropped delta, the reset of the evaluation time on replay, the nearest-texel sampling of a scaled placement, the child motion's start at its parent keyframe, the action and sync dispatch, the packed colour order, the shape hit test, the logo's held corner and transition, the inherited parent matrix, the node matrix order, the draw affine, the shared label and the layer getter list, and the node blend mode |
+| `crates/compat/src/natives/plugins/motion_player/player.rs` unit tests | the replay of a short clip after a long one, the queuing gate and the dropped delta, the canSync loop-time gate before the first full frame, the reset of the evaluation time on replay, the nearest-texel sampling of a scaled placement, the child motion's start at its parent keyframe, the action and sync dispatch, the packed colour order, the shape hit test, the logo's held corner and transition, the inherited parent matrix, the node matrix order, the draw affine, the shared label and the layer getter list, and the node blend mode |
 | `crates/compat/tests/plugin.rs` | that `Plugins.link("motionplayer.dll")` resolves to the built-in table |
 
 ## Known gaps

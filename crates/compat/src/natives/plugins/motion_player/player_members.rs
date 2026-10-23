@@ -152,7 +152,7 @@ mp_set_real!(
     }
 );
 mp_get_real!(player_get_loop_time, PlayerInst, |p: &PlayerInst| p
-    .loop_time);
+    .sync_loop_time());
 mp_set_real!(
     player_set_loop_time,
     PlayerInst,

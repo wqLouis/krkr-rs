@@ -1539,3 +1539,40 @@ fn the_stencil_groups_mask_the_layout_and_eye_clips() {
     // A pixel clear of the eye stays transparent.
     assert_eq!(alpha_at(&eye_l, 800, 500, 700), 0);
 }
+
+/// KAG's `[ev storage]` image wait reads `AffineSourceMotion.canSync`; the
+/// game's `[ev waitmovie]` instead reads its captured `_playing` field.  This
+/// fixture has no timeline, so it pins the native `loopTime` input only: the
+/// value is neutral while the presented pose has not advanced and returns to
+/// the clip's negative loop time after the first full frame.  The synthetic
+/// player test above covers the `playing` side of the two waits.
+///
+/// The game script is `system/world.tjs` (`EnvLayerObject.createWait(1)` /
+/// `:2`) and `system/affinesourcemotion.tjs` (`canSync`).
+#[test]
+fn a_real_motion_keeps_can_sync_closed_until_the_first_full_frame() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var m = rm.load(\"{path}\"); \
+         var p = new Motion.Player(rm); \
+         p.project = m; \
+         p.motion = \"口_笑\"; \
+         p.play(); \
+         p.frameTickCount = 1; \
+         var realLoop = p.loopTime; \
+         p.frameTickCount = 0; \
+         p.progress(0);"
+    ));
+    assert_eq!(env.eval_real("p.loopTime"), 0.0, "the image wait is closed");
+    env.run("p.progress(16.6667);");
+    assert_eq!(
+        env.eval_real("p.loopTime"),
+        env.eval_real("realLoop"),
+        "the clip loop time returns after the first full frame"
+    );
+    assert_eq!(env.eval_int("p.frameTickCount > 0 ? 1 : 0"), 1);
+}
