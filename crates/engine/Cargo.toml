@@ -6,7 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# Opt-in experiment: SIMD source-over rows. The scalar path is the default.
+# Opt-in experiment: SIMD source-over rows. The app enables it by default;
+# build the app with --no-default-features for the scalar A/B arm.
 simd-experiment = ["dep:fearless_simd"]
 
 [dependencies]

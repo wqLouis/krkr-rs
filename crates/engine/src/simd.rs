@@ -25,14 +25,11 @@ pub(crate) fn copy_opaque_row(src: &[u8], dst: &mut [u8]) -> bool {
 fn copy_opaque_blocks<S: Simd>(simd: S, src: &[u8], dst: &mut [u8]) -> bool {
     let mut index = 0;
     while index + 64 <= src.len() {
-        let [_, _, _, alpha] = u8x16::<S>::load_four_interleaved(simd, &src[index..index + 64]);
-        if !alpha.simd_eq(u8x16::<S>::splat(simd, 255)).all_true() {
+        let channels = u8x16::<S>::load_four_interleaved(simd, &src[index..index + 64]);
+        if !channels[3].simd_eq(u8x16::<S>::splat(simd, 255)).all_true() {
             return false;
         }
-        for offset in [0, 16, 32, 48] {
-            let value = u8x16::<S>::from_slice(simd, &src[index + offset..index + offset + 16]);
-            value.store_slice(&mut dst[index + offset..index + offset + 16]);
-        }
+        u8x16::<S>::store_four_interleaved(channels, &mut dst[index..index + 64]);
         index += 64;
     }
     while index + 4 <= src.len() {

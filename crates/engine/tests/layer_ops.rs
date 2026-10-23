@@ -1011,6 +1011,31 @@ fn a_large_stretch_blit_matches_the_solid_source() {
     );
 }
 
+/// A fully opaque source-over row takes the exact copy fast path, including
+/// when the row is wide enough for the SIMD block.
+#[test]
+fn a_large_opaque_source_over_row_copies_exactly() {
+    let source = bitmap(32, 32, [21, 43, 65, 255].repeat(32 * 32));
+    let mut destination = bitmap(32, 32, vec![7u8; 32 * 32 * 4]);
+    blit_over(
+        &mut destination,
+        0,
+        0,
+        BlitSource {
+            bitmap: &source,
+            rect: (0, 0, 32, 32),
+        },
+        (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+        BlitOptions {
+            mode: 0,
+            opa: 255,
+            treat_as_opaque: false,
+            hold_alpha: false,
+        },
+    );
+    assert_eq!(destination.rgba, source.rgba);
+}
+
 /// A large source-over pass splits its rows across bands; the bytes must be
 /// identical to the single-threaded path.
 #[test]
