@@ -529,23 +529,19 @@ fn main() {
 
     // krkr-rs: optimisation level for the vendored C++ VM.
     //
-    // History: upstream tjs2 reads uninitialised VM register slots in the
-    // exception-display dump and performs member calls on a null
-    // `tTJSVariantString` `this`. Both are UB that clang >= -O1 exploits
-    // (the null-`this` guards are removed, then a null string pointer is
-    // dereferenced). Both classes are now fixed in the vendored sources
-    // (`tjsInterCodeExec.cpp` zeroes the register area before the dump; the
-    // null-string call sites in `tjsString.h/.cpp`, `tjsVariant.h/.cpp` and
-    // `tjsInterCodeExec.cpp` check for the canonical null empty-string pointer
-    // first), so the whole VM runs at -O2.
+    // The vendored sources may be optimised because a member call on a null
+    // `tTJSVariantString` `this` is guarded: the call sites in
+    // `tjsString.h/.cpp`, `tjsVariant.h/.cpp` and `tjsInterCodeExec.cpp` check
+    // for the canonical null empty-string pointer first. Without those guards
+    // clang >= -O1 drops the null check and dereferences a null string
+    // pointer, which is why the guards are a condition for -O2 here.
     //
-    // This matters because save loading parses/evaluates a multi-megabyte TJS
-    // literal: measured on the real game, `-O0` spends ~670 ms in parse+eval
-    // while `-O2` spends ~136 ms. Every translation unit (upstream
+    // The level matters because save loading parses/evaluates a multi-megabyte
+    // TJS literal: measured on the real game, `-O0` spends ~670 ms in
+    // parse+eval while `-O2` spends ~136 ms. Every translation unit (vendored
     // sources, generated parsers, ABI/stream shims) uses this same level — no
-    // per-file exception is needed. If a future regression is traced to one
-    // TU, special-case its file name here. `TJS2_OPT` overrides the level for
-    // benchmarking.
+    // per-file exception is needed. To special-case one translation unit, name
+    // its file here. `TJS2_OPT` overrides the level for benchmarking.
     let opt = env::var("TJS2_OPT").unwrap_or_else(|_| "-O2".to_string());
     flags.push(opt);
     // `TJS2_EXTRA_CXXFLAGS` appends whitespace-separated flags after the

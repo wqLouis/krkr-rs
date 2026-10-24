@@ -3255,7 +3255,6 @@
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// (`WindowIntf.cpp:233-234`): drop the window's reference to the device.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// (`WindowIntf.cpp:255-292`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// (`reference/cpp/core/environ/WindowIntf.cpp:1781` goes through the", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// (`reference/cpp/core/visual/WindowIntf.cpp:211-221`). Registered", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// (`reference/cpp/core/visual/WindowIntf.cpp:934-1250`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// (`reference/cpp/core/visual/impl/WindowImpl.cpp:1237-1242`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// (`reference/cpp/core/visual/impl/WindowImpl.cpp:1258-1261`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3272,7 +3271,6 @@
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// The reference stores the size on the form, and the form does not exist", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// The reference's `CreateNativeInstance` returns a window whose fields are", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// `CreateNew` fails (`reference/cpp/core/visual/WindowIntf.cpp:150-156`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// `Invalidate` (`WindowIntf.cpp:177`), before the script object is", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// `TJS_E_ACCESSDENYED` (`impl/MenuItemImpl.cpp:84-91`); a", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// `mainWindow` is a static member of the reference `Window` class, so it", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// `reference/cpp/core/visual/MenuItemIntf.cpp:559-573`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3281,7 +3279,6 @@
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// error (`reference/cpp/core/visual/impl/WindowImpl.cpp:1213-1216`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// leaves it null and the reference raises the needs-parameter", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// owner and the second is the window (reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// record: the reference unregisters the window from its list at", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// reference compares `tTJSVariantClosure`s).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// runs (`WindowImpl.cpp:1469-1472`), so a re-entrant `close()` sees no", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "// to `LayerTreeOwnerImpl.cpp:385-389` and `LayerManager.h:488-490`):", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3291,7 +3288,6 @@
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "/// (`reference/cpp/core/base/EventIntf.h:208-238`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "/// (`reference/cpp/core/base/EventIntf.h:208-238`). The `FuncCall` result is", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "/// (`reference/cpp/core/environ/impl/TVPWindow.h:143-144`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "/// (`reference/cpp/core/visual/WindowIntf.cpp:175-241`): it invalidates every", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "/// (`reference/cpp/core/visual/WindowIntf.cpp:913-930`,", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "/// (`reference/cpp/core/visual/impl/WindowImpl.cpp:1687-1697`), whose getter", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "/// (reference `WindowImpl.cpp:2288-2298`):", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3471,7 +3467,6 @@
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Decoded-image cache (the reference graphic cache).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// DesH}` (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1257-1264`); the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Destroy a layer and its **entire** child subtree — the reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Destroy a window and **every** layer belonging to it — the reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Detach one layer — the reference `tTJSNI_BaseLayer::Part()`", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Dimensions are clamped to at least 1, matching the reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Drop every decoded-image cache entry (the reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3525,7 +3520,6 @@
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Reference `tTJSNI_BaseLayer::Invalidate` (`LayerIntf.cpp:515`): the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Reference `tTJSNI_BaseLayer::Shutdown` (`LayerIntf.cpp:516`). A shut-down", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Reference `tTJSNI_BaseLayer::UpdateChildRegion`", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Reference `tTJSNI_BaseWindow::Invalidate` (`WindowIntf.cpp:175`): the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Reference `tTVPLayerManager::SetFocusTo`: give keyboard focus to", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Reference semantics: a layer's MainImage is a **reference-counted**", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Rotation in the reference's tenths-of-a-degree units (game code does", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3533,7 +3527,6 @@
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// The reference derives its system limit from physical memory at startup", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// The reference guards a property write the same way, comparing the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// The reference's `tTVPGraphicsSearchData` carries a `tTVPGraphicLoadMode`", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// This is the L2 primitive behind `Window.close()`; the reference keeps", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// `Bitmap` natives). A layer's MainImage can reference such a bitmap, so", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// `FocusedLayer` is null (`reference/cpp/core/visual/LayerManager.h:483-490`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// `GetChildrenArrayObjectNoAddRef` (`LayerIntf.cpp:669`) builds the", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3547,7 +3540,6 @@
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1952-1960`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// `reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:20`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// `tTJSNI_BaseLayer::Invalidate` (`LayerIntf.cpp:535`) followed by the", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// `tTJSNI_BaseWindow::Invalidate` (`WindowIntf.cpp:175`) followed by the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// `tTVPBaseBitmap`; destroying the layer drops only its own reference.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// `tTVPLayerManager::FocusedLayer` assignment (`LayerTreeOwnerImpl.h:483-490`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// against it exactly like the reference.", "reason": "legacy comment, cleanup tracked in TODO §15"}
