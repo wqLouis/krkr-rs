@@ -130,6 +130,7 @@ per-plugin pages are indexed in [`compat/README.md`](compat/README.md).
 | [`android/input.md`](android/input.md) | `android` | the touch bridge |
 | [`android/gesture.md`](android/gesture.md) | `android` | the gesture recognizer |
 | [`android/config.md`](android/config.md) | `android` | the launcher settings |
+| [`android/ui.md`](android/ui.md) | `android` | the launcher's Material 3 UI: the navigation rail, the three destinations, the library, the settings and the logs |
 | [`android/build.md`](android/build.md) | `android` | the Gradle packaging and the CI build |
 
 ---

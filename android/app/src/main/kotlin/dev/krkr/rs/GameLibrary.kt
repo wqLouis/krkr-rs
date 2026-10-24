@@ -92,12 +92,22 @@ class GameLibrary(context: Context) {
     }
 
     /**
-     * Removes [uri]. [SaveResult.FAILED] means the library file could not be
-     * written, so the removal did not actually stick.
+     * Removes every entry whose folder is one of [uris], in a single write.
+     *
+     * One write for the whole set: a removal that is written one entry at a
+     * time can leave the library half-updated when a write fails, and the
+     * file is written atomically, so the set is either removed as a whole or
+     * not at all.
+     *
+     * [SaveResult.UNCHANGED] means none of the folders were in the library;
+     * [SaveResult.FAILED] means the file could not be written, so nothing was
+     * removed.
      */
-    fun remove(uri: Uri): SaveResult {
+    fun removeAll(uris: Collection<Uri>): SaveResult {
+        if (uris.isEmpty()) return SaveResult.UNCHANGED
+        val keys = uris.map { it.toString() }.toSet()
         val entries = all()
-        val kept = entries.filterNot { it.key == uri.toString() }
+        val kept = entries.filterNot { it.key in keys }
         if (kept.size == entries.size) return SaveResult.UNCHANGED
         return if (write(kept)) SaveResult.SAVED else SaveResult.FAILED
     }

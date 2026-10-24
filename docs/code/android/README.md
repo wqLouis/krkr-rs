@@ -16,6 +16,9 @@ MediaCodec backend and the packaging — is in
 [`android.md`](../../../docs.old/android.md) (evidence trail:
 [`docs.old/android.md`](../../../docs.old/android.md)).
 
+The launcher's own interface — the Kotlin side of the app, under
+`android/app/src/main/kotlin/` — is documented in [ui.md](ui.md).
+
 ---
 
 ## 1. The modules
