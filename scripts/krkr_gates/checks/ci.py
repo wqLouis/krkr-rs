@@ -208,6 +208,14 @@ def validate(text: str) -> list[Finding]:
                     f"the '{LINUX_JOB}' job must run 'cargo build --release -p app'",
                 )
             )
+        for setting in ("CC: clang", "CXX: clang++ -stdlib=libc++"):
+            if setting not in linux:
+                findings.append(
+                    (
+                        "linux-libcxx",
+                        f"the '{LINUX_JOB}' job must compile the C++ VM with the distro toolchain ('{setting}') so libc++ headers and runtime match",
+                    )
+                )
         package_lines = [
             line
             for line in linux.splitlines()

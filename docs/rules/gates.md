@@ -150,9 +150,14 @@ reference checkout or rerun `krkr-gate gate`; that gate is the local pre-tag
 check and repeats compilation the two build jobs already do. The tag must
 therefore point at a commit whose static gate and test suites are already
 green (section 6).
+
 * **`linux`** runs `cargo build --release -p app` on `ubuntu-latest`
   (x86_64) and packages `target/release/krkr`, `LICENSE` and a `README.txt`
-  run note as `krkr-rs-linux-x86_64.tar.gz`.
+  run note as `krkr-rs-linux-x86_64.tar.gz`. Zig 0.17 fetches the C++
+  dependencies, but the VM itself is compiled with the runner's
+  `clang++ -stdlib=libc++`: Zig's bundled libc++ is newer than Ubuntu's
+  `libc++` runtime, and the Rust link step uses that runtime, so compiling
+  with Zig's headers would leave `std::__1::__hash_memory` unresolved.
 * **`apk`** is the Android build: NDK r27c, SDK platform/build-tools, JDK 21,
   Zig, `build-android.sh`, Gradle, the `check-jni-libs.sh` self-test and
   package verification. The APK is signed with the configured keystore when the

@@ -85,8 +85,10 @@ select the NDK's cmake toolchain, and it **verifies the produced `.so` is arm64*
 before staging it, so a host toolchain fails loudly instead of shipping a broken
 library.
 
-Zig stays the toolchain for the Linux/host build (`build.rs` defaults to
-`zig c++`); only the Android cross-build uses the NDK clang.
+Zig stays the dependency fetcher and the default host C++ compiler
+(`build.rs` defaults to `zig c++`); the release workflow overrides `CXX` with
+the runner's `clang++ -stdlib=libc++` so its libc++ headers match the runtime
+it links. The Android cross-build uses the NDK clang.
 
 The game's own files never ship in the APK: the user picks a folder at runtime.
 

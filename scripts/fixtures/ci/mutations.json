@@ -130,5 +130,11 @@
     "old": "        run: cargo build --release -p app",
     "new": "        run: |\n          uv run --project scripts krkr-gate gate\n          cargo build --release -p app",
     "rule": "no-static-gate"
+  },
+  {
+    "name": "linux libc++ headers and runtime match",
+    "old": "          CXX: clang++ -stdlib=libc++",
+    "new": "          CXX: zig c++",
+    "rule": "linux-libcxx"
   }
 ]

@@ -15,6 +15,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Build the release binary
+        env:
+          CC: clang
+          CXX: clang++ -stdlib=libc++
         run: cargo build --release -p app
       - name: Package the Linux binary
         run: |

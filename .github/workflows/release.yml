@@ -59,7 +59,7 @@ env:
   # `crates/tjs/build.rs` runs `zig build` in `deps/` to fetch
   # fmt/spdlog/boost/oniguruma through the zig package manager; the NDK clang
   # does the actual cross-compiling, but zig is still required to fetch.
-  ZIG_VERSION: '0.16.0'
+  ZIG_VERSION: '0.17.0'
 
 jobs:
   linux:
@@ -98,7 +98,14 @@ jobs:
         with:
           key: linux-x86_64
 
+      # Compile the C++ VM with the distribution's clang/libc++ pair. Zig's
+      # bundled libc++ is newer than the runtime installed on the runner, and
+      # the Rust link step uses the system runtime; using the matching compiler
+      # here keeps headers and runtime in the same ABI.
       - name: Build the release binary
+        env:
+          CC: clang
+          CXX: clang++ -stdlib=libc++
         run: cargo build --release -p app
 
       # The archive carries the run note, not just the executable: the binary
