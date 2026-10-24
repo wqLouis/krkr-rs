@@ -71,7 +71,7 @@ the port registers.
 | `getabout.dll` | — | `get_about` | none (`System.getAboutString` is owned by `windowEx`) | [get_about](plugins/get_about.md) |
 | `getSample.dll` | — | `get_sample` | members on `WaveSoundBuffer` (`getSample`, `sampleValue`, `sampleCount`, `sampleAhead`, the defaults setters) | [get_sample](plugins/get_sample.md) |
 | `json.dll` | — | `json` | `Scripts.evalJSON`, `evalJSONStorage`, `saveJSON`, `toJSONString` | [json](plugins/json.md) |
-| `KAGParserEx.dll` | `KAGParser.dll` | `natives::kag` | `KAGParser` | — (core native, not a plugin module) |
+| `KAGParserEx.dll` | `KAGParser.dll` | `natives::kag` (core) | none — `KAGParser` is a core native registered at startup | — (core native, not a plugin module) |
 | `layerExDraw.dll` | `layerExMovie.dll`, `perspective.dll` | `layer_ex` | the `GdiPlus` namespace, `Layer.draw*`, `Layer.perspectiveCopy`, the movie members | [layer_ex](plugins/layer_ex.md) |
 | `menu.dll` | — | `natives::menu_item` | `MenuItem` | — (core native, not a plugin module) |
 | `motionplayer.dll` | — | `motion_player` | `Motion`, `Player`, the `Motion.*` subclasses, the emote classes | [motion_player](plugins/motion_player.md) |

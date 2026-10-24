@@ -8,6 +8,33 @@ use compat::{
 };
 use tjs::{NativeClassBuilder, Tjs2Engine, TjsValue};
 
+/// Top-level classes the reference registers as core natives before any game
+/// script runs (`reference/cpp/core/base/ScriptMgnIntf.cpp:484-542`).
+const CORE_STARTUP_CLASSES: &[&str] = &[
+    "Debug",                // :484
+    "Font",                 // :485
+    "Layer",                // :486
+    "CDDASoundBuffer",      // :487-488
+    "MIDISoundBuffer",      // :489-490
+    "Timer",                // :491
+    "AsyncTrigger",         // :492
+    "System",               // :493
+    "Storages",             // :494
+    "Plugins",              // :495
+    "VideoOverlay",         // :496
+    "Pad",                  // :497
+    "Clipboard",            // :498
+    "Scripts",              // :499-500
+    "Rect",                 // :501
+    "Bitmap",               // :502
+    "ImageFunction",        // :503-504
+    "BitmapLayerTreeOwner", // :505-506
+    "KAGParser",            // :509
+    "WaveSoundBuffer",      // :513-514
+    "Window",               // :523-524
+    "MenuItem",             // :542
+];
+
 struct StubPlugin;
 
 impl NativePlugin for StubPlugin {
@@ -199,6 +226,62 @@ fn builtin_table_covers_the_games_links_and_reference_aliases() {
     }
     assert!(!registry.is_builtin("not_a_real_plugin.dll"));
     assert!(!registry.is_builtin("AlphaMovie.dll"));
+}
+
+/// The reference registers these classes in its startup block
+/// (`reference/cpp/core/base/ScriptMgnIntf.cpp:484-542`), so each must be on
+/// the VM immediately after `CompatHost::install` and before any
+/// `Plugins.link`.
+#[test]
+fn core_startup_classes_exist_before_any_plugin_link() {
+    let _lock = vm_lock();
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut host = compat::CompatHost::new();
+    host.install(&engine).expect("install compat surface");
+    assert!(
+        host.registry().linked().is_empty(),
+        "this test must not link a plugin"
+    );
+    for name in CORE_STARTUP_CLASSES {
+        let value = engine
+            .eval(&format!("typeof {name}"), "plugin_test")
+            .unwrap_or_else(|error| panic!("eval typeof {name} failed: {error}"));
+        assert_eq!(
+            value,
+            TjsValue::String("Object".to_string()),
+            "{name} must exist as a core startup class"
+        );
+    }
+}
+
+/// `KAGParser` is core-registered (`reference/cpp/core/base/ScriptMgnIntf.cpp:509`)
+/// and the plugin is an empty placeholder
+/// (`reference/cpp/plugins/KAGParser/kagparserex.cpp:1-8`), so both DLL names
+/// link without registering the class a second time. A duplicate registration
+/// would make the link itself raise.
+#[test]
+fn kagparser_plugin_names_are_empty_placeholders() {
+    let _lock = vm_lock();
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut host = compat::CompatHost::new();
+    host.install(&engine).expect("install compat surface");
+    for name in [
+        "KAGParser.dll",
+        "KAGParserEx.dll",
+        "KAGParser.dll",
+        "KAGParserEx.dll",
+    ] {
+        engine
+            .exec_script_discard(&format!("Plugins.link('{name}');"), "plugin_test")
+            .unwrap_or_else(|error| panic!("Plugins.link({name:?}) failed: {error}"));
+    }
+    assert_eq!(
+        host.registry().linked(),
+        vec!["KAGParser.dll".to_string(), "KAGParserEx.dll".to_string()]
+    );
+    engine
+        .exec_script_discard("class AfterParserLink extends KAGParser { }", "plugin_test")
+        .expect("the core class must still be usable after both links");
 }
 
 /// A built-in whose per-frame hook counts its invocations.

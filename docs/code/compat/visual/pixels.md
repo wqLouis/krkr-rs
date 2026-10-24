@@ -2,8 +2,9 @@
 
 **Source:** `crates/compat/src/natives/visual/layer/pixels.rs`
 
-This module registers 37 `Layer` members: the blits and the filters, the
-pixel accessors, the image load/save path and the text drawing.
+This module registers 39 `Layer` members: the blits and the filters, the
+pixel accessors, the image load/save path, the text drawing and the layer text
+measurements.
 
 Every method composes the L2 `engine_api::layer_ops` and
 `engine_api::raster` primitives directly — it never calls into
@@ -82,6 +83,8 @@ pixels than its buffer holds answers `0` like a missing one. The writes
 | `saveLayerImage(name[, type])` | encodes the main image through the host encoder and writes it through the storage. `type` defaults to `"bmp"`. The main image is **resolved first** — a pending decode is waited for — and an image that declares more pixels than its buffer holds raises instead of encoding an empty image. |
 | `drawText(x, y, text, color[, opacity[, antialias[, shadowLevel[, shadowColor[, shadowWidth[, shadowOffsetX[, shadowOffsetY]]]]]]])` | rasterizes a text run into the layer's main image. The main image is **resolved first** and validated, so the text lands on the decoded pixels; an image that declares more pixels than its buffer holds raises. |
 | `drawGlyph(x, y, glyph, color[, …same optionals…])` | the same, but the text comes from the glyph object's `text`/`char`/`character` member. |
+| `getTextWidth(text)` | the layer font's unrotated width: the mapped pre-rendered `Inc` sum, falling back to the rasterizer advance for a code unit the `.tft` lacks. |
+| `getTextHeight(text)` | `abs(Font.Height)` for the layer font. |
 | `dump()` | logs the layer's structure at debug level. |
 
 ---
@@ -307,6 +310,9 @@ file is never written. A layer with no main image raises
 ## 8. The text path
 
 `drawText` and `drawGlyph` share `layer_draw_text_common`.
+`getTextWidth` and `getTextHeight` share `layer_text_metric`, which copies the
+layer's font fields and measures them through the same pre-rendered-font path
+as the layer-bound `Font` wrapper.
 
 | Argument | Meaning |
 |---|---|

@@ -7,6 +7,12 @@ scenario out of the storage namespace and hands the script one tag at a
 time. The class is the *native adapter*; the work happens in three modules
 underneath it.
 
+`KAGParser` is a **core native class**: `natives::register_all` registers it
+before any startup script runs (`reference/cpp/core/base/ScriptMgnIntf.cpp:509`).
+`KAGParserEx.dll` / `KAGParser.dll` are empty placeholder modules
+(`reference/cpp/plugins/KAGParser/kagparserex.cpp:1-8`), so `Plugins.link`
+still succeeds but does not register the class a second time.
+
 | module | role | document |
 |---|---|---|
 | `kag/mod.rs` | the native adapter: registers `KAGParser`, marshals TJS values, owns the per-instance payload | this page |

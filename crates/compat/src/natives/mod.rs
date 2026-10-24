@@ -211,6 +211,7 @@ pub fn register_all(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     cdda_midi::register(ctx)?;
     async_trigger::register(ctx)?;
     menu_item::register(ctx)?;
+    kag::register(ctx)?;
     video::register(ctx)?;
     rect::register(ctx)?;
     image_function::register(ctx)?;

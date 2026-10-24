@@ -1028,6 +1028,8 @@
       "getMaskPixel",
       "getProvincePixel",
       "getRecordImage",
+      "getTextHeight",
+      "getTextWidth",
       "hasImage",
       "height",
       "hint",

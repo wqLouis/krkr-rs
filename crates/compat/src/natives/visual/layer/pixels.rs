@@ -25,7 +25,8 @@ use super::super::bitmap::{
 };
 use super::super::common::scene_mut;
 use super::super::common::{
-    DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, argb_to_rgba, rgba_to_argb, set_null_out,
+    DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, argb_to_rgba, bound, rgba_to_argb, scene_ref,
+    set_null_out,
 };
 use super::LayerInst;
 use super::util::{
@@ -2639,6 +2640,117 @@ struct TextKind<'a> {
     glyph: bool,
 }
 
+/// `getTextWidth(text)` — the layer font's unrotated text width.
+///
+/// A mapped pre-rendered font contributes each character's `Inc`; otherwise
+/// the width is the sum of the rasterizer advances.
+extern "C" fn layer_get_text_width(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_text_metric(engine, instance, argc, argv, out, out_error, true)
+}
+
+/// `getTextHeight(text)` — the absolute height of the layer's current font.
+extern "C" fn layer_get_text_height(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_text_metric(engine, instance, argc, argv, out, out_error, false)
+}
+
+/// Shared body of `getTextWidth`/`getTextHeight`: copy the layer font, then
+/// measure outside the scene borrow.
+fn layer_text_metric(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    width: bool,
+) -> c_int {
+    let method = if width {
+        "getTextWidth"
+    } else {
+        "getTextHeight"
+    };
+    if argc < 1 {
+        return report_error(
+            out_error,
+            &format!("Layer.{method} requires a text argument"),
+        );
+    }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
+    let text = crate::native_util::value_as_string(&unsafe { args(argv, argc) }[0]);
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_text_metric`.
+    let inst = unsafe { &*(instance as *const LayerInst) };
+    let Some(id) = inst.id else {
+        return report_error(
+            out_error,
+            &format!("Layer.{method}: this layer is not constructed"),
+        );
+    };
+    let result: Result<i64, String> = (|| {
+        let (face, height, bold, italic, angle) = {
+            let (_resolved, ctx) =
+                bound(engine).map_err(|error| format!("Layer.{method}: {error}"))?;
+            let scene = scene_ref(&ctx).map_err(|error| format!("Layer.{method}: {error}"))?;
+            let layer = scene
+                .layer(id)
+                .ok_or_else(|| format!("Layer.{method}: this layer no longer exists"))?;
+            match layer.font_id.and_then(|font_id| scene.font(font_id)) {
+                Some(font) => (
+                    font.face.clone(),
+                    font.height,
+                    font.bold,
+                    font.italic,
+                    font.angle,
+                ),
+                None => (
+                    DEFAULT_FONT_FACE.to_string(),
+                    DEFAULT_FONT_HEIGHT,
+                    false,
+                    false,
+                    0.0,
+                ),
+            }
+        };
+        let font = super::super::font::MeasuredFont {
+            size_px: height.unsigned_abs() as f32,
+            height: height.unsigned_abs() as i32,
+            face,
+            bold,
+            italic,
+            angle,
+        };
+        let (width_px, height_px) = super::super::font::measure_layer_text(
+            engine,
+            &font,
+            &text,
+            &format!("Layer.{method}"),
+        )?;
+        Ok(i64::from(if width { width_px } else { height_px }))
+    })();
+    match result {
+        Ok(value) => {
+            set_int(out, value);
+            0
+        }
+        Err(error) => report_error(out_error, &error),
+    }
+}
+
 /// Shared body of `drawText`/`drawGlyph` (the glyph argument only differs in
 /// how the text is extracted).
 fn layer_draw_text_common(
@@ -2845,6 +2957,8 @@ pub(super) fn method_defs() -> Vec<NativeInstanceMethodDef> {
         d("dump", layer_dump),
         d("drawText", layer_draw_text),
         d("drawGlyph", layer_draw_glyph),
+        d("getTextWidth", layer_get_text_width),
+        d("getTextHeight", layer_get_text_height),
     ]
 }
 

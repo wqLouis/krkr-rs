@@ -582,7 +582,7 @@ are constructed and queried, never played.
 | `kag/parser.rs` | a dependency-free **push** parser: text → `Vec<Event>` plus a label index. Pure `std` + `thiserror`. |
 | `kag/state.rs` | the **pull** state machine: parses once into events, then walks them one tag at a time (the reference's `_GetNextTag`). It holds the `Environ` hooks, the call stack, the macro recording and expansion, and `store`/`restore`. |
 | `kag/kvp.rs` | the string codec for the dictionary-shaped data kept as strings: `key=value` lines joined with `\n`, with `\` → `\\`, `\n` → `\n`, `\r` → `\r` escaping. |
-| `kag/mod.rs` | the thin native adapter: registers `KAGParser` and marshals the script values. |
+| `kag/mod.rs` | the thin native adapter: registers `KAGParser` in the core startup pass and marshals the script values. |
 
 ### The members
 

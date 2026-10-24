@@ -139,10 +139,12 @@ native OS popup would be a deliberate divergence, and Linux has nothing to call
 
 ## 7. Input / audio / video
 
-* **M3 (P1)** `onCloseQuery` is registered as a no-op
-  (`natives/visual/window.rs`) and `PlatformEvent::CloseRequested` exits
-  outright (`crates/app/src/runner.rs`), so the reference's `OnCloseQueryCalled`
-  veto (`TVPWindow.cpp:790-880`) cannot happen.
+* **M3 (P2, deferred until the Rust TJS VM)** the window-close handshake is
+  not wired: `onCloseQuery` is a no-op and `CloseRequested` exits before the
+  script close hook runs, so the title Continue/suspend save is never written.
+  Wiring it also exposes the exit-time heap corruption in the vendored TJS
+  teardown (`free(): chunks in smallbin corrupted`; §13), so the close/save/exit
+  chain is deferred with the VM replacement.
 * **M5 (P2)** `getVisBuffer` reads the decoded source, not the device ring
   (`natives/sound.rs`); a positive `sampleAhead` past the decoded end yields
   silence where the reference reads the ring (`ahead = 0` is exact).
@@ -521,11 +523,11 @@ The six earlier failures are closed:
 
 * the motion mesh test now evaluates the previous-frame patch in normalized
   box coordinates instead of player-pixel coordinates;
-* `dispatch_ui`, `kag`, `xp3_filter`, `xp3_filter_deferred` and `wuvorbis`
-  link the lazy plugin that owns the member they use (`windowEx.dll`,
-  `win32dialog.dll`, `KAGParserEx.dll`, `fstat.dll`, `wutcwf.dll`) before they
-  create the object or open the stream — lazy registration is the reference
-  behavior, not a test workaround;
+* `dispatch_ui`, `xp3_filter`, `xp3_filter_deferred` and `wuvorbis`
+  link the lazy plugin that owns the member or decoder they use
+  (`windowEx.dll`, `win32dialog.dll`, `fstat.dll`, `wuvorbis.dll`,
+  `wutcwf.dll`) before they create the object or open the stream — lazy
+  registration is the reference behavior, not a test workaround;
 * `Scene::resize_bitmap` resolves a pending image before preserving the
   overlap, so `Layer.setImageSize` and `Layer.openMovie` no longer panic;
 * every `layer_ex` read/write seam resolves the pending image first;

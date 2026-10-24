@@ -934,6 +934,52 @@ fn font_prerendered_metrics_use_the_mapped_inc_and_height() {
     assert_ne!(env.eval_int("f.getTextWidth('AB')"), 200);
 }
 
+/// Reference: `tTJSNI_BaseLayer::GetTextWidth` / `GetTextHeight` forward to
+/// the main image's measurement, whose `GetTextSize` sums each mapped
+/// pre-rendered `Inc` and reports `abs(Font.Height)`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:6065-6084`,
+/// `reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1483`). KAG's
+/// `SelectLayer` uses these layer methods to centre choice text, so they must
+/// exist and agree with the layer-bound `Font` wrapper.
+#[test]
+fn layer_text_metrics_use_the_layer_font() {
+    let _lock = vm_lock();
+    let Some((font_dir, font_name)) = test_font() else {
+        return;
+    };
+    let font_bytes = std::fs::read(font_dir.join(&font_name)).expect("read test font");
+    let env = common::Env::with_storage();
+    let game_dir = env.game_dir().expect("game dir").clone();
+    std::fs::write(game_dir.join("Pre"), &font_bytes).expect("write face");
+    std::fs::write(
+        game_dir.join("sample.tft"),
+        build_tft(&[b'A' as u16, b'B' as u16], 100),
+    )
+    .expect("write tft");
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         var f = new Font('Pre', 12, 0); \
+         f.mapPrerenderedFont('sample.tft'); \
+         l.font.face = 'Pre'; \
+         l.font.height = 12; \
+         l.font.bold = false; \
+         l.font.italic = false; \
+         l.font.angle = 0;",
+    );
+
+    assert_eq!(env.eval_int("l.getTextWidth('AB')"), 200);
+    assert_eq!(env.eval_int("l.getTextHeight('AB')"), 12);
+    assert_eq!(
+        env.eval_int("l.getTextWidth('AB')"),
+        env.eval_int("l.font.getTextWidth('AB')")
+    );
+    assert_eq!(
+        env.eval_int("l.getTextHeight('AB')"),
+        env.eval_int("l.font.getTextHeight('AB')")
+    );
+}
+
 /// Reference: `tTVPNativeBaseBitmap::UnmapPrerenderedFont` →
 /// `TVPUnmapPrerenderedFont` drops the font-value mapping, so a later measure
 /// falls back to the rasterizer's width instead of the pre-rendered `Inc`

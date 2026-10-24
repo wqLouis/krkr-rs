@@ -5,9 +5,9 @@
 * `crates/compat/src/natives/visual/layer/mod.rs` — the class
 * `crates/compat/src/natives/visual/layer/order.rs` — the sibling order, the absolute order and the modal stack
 
-The registered `Layer` surface is 197 members: the core class plus the
+The registered `Layer` surface is 199 members: the core class plus the
 `layerExDraw.dll`, `layerExMovie.dll` and `perspective.dll` plugin members
-attached to it. (The surface dump lists 199 entries for `Layer` — the
+attached to it. (The surface dump lists 201 entries for `Layer` — the
 class-name constructor and the VM's `finalize` are two of them.)
 
 ---

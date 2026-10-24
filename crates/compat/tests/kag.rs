@@ -1744,13 +1744,39 @@ fn state_accessors_and_call_label() {
 
 use tjs::{Tjs2Engine, TjsValue};
 
+/// `KAGParser` is registered by the core startup pass, not by linking
+/// `KAGParserEx.dll`: `reference/cpp/core/base/ScriptMgnIntf.cpp:509` puts the
+/// class on the VM before any script runs, and
+/// `reference/cpp/plugins/KAGParser/kagparserex.cpp:1-8` is an empty
+/// `InitPlugin`. The test2 startup script declares
+/// `class BaseConductor extends KAGParser` without linking either DLL.
+#[test]
+fn native_class_exists_without_linking_the_plugin() {
+    let _lock = common::vm_lock();
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut host = compat::CompatHost::new();
+    host.install(&engine).expect("install compat surface");
+
+    let value = engine
+        .eval("typeof KAGParser", "kag_test")
+        .expect("KAGParser must exist immediately after install");
+    assert_eq!(value, TjsValue::String("Object".to_string()));
+
+    engine
+        .exec_script_discard("class BaseConductor extends KAGParser { }", "kag_test")
+        .expect("the subclass header must evaluate before any Plugins.link");
+    let value = engine
+        .eval("typeof BaseConductor", "kag_test")
+        .expect("the subclass declaration must produce a class object");
+    assert_eq!(value, TjsValue::String("Object".to_string()));
+}
+
 #[test]
 fn native_registers_and_interrupt_returns_a_dictionary() {
     let _lock = common::vm_lock();
     let engine = Tjs2Engine::new().expect("create engine");
     let mut host = compat::CompatHost::new();
     host.install(&engine).expect("install compat surface");
-    common::link_plugin(&engine, "KAGParserEx.dll");
 
     let value = engine
         .eval(
@@ -1768,7 +1794,6 @@ fn native_tag_dictionary_exposes_taglist() {
     let engine = Tjs2Engine::new().expect("create engine");
     let mut host = compat::CompatHost::new();
     host.install(&engine).expect("install compat surface");
-    common::link_plugin(&engine, "KAGParserEx.dll");
 
     let value = engine
         .eval(
@@ -1786,7 +1811,6 @@ fn native_properties_and_void_end() {
     let engine = Tjs2Engine::new().expect("create engine");
     let mut host = compat::CompatHost::new();
     host.install(&engine).expect("install compat surface");
-    common::link_plugin(&engine, "KAGParserEx.dll");
 
     let value = engine
         .eval(
@@ -1812,7 +1836,6 @@ fn native_go_to_label_error_and_macros_object() {
     let engine = Tjs2Engine::new().expect("create engine");
     let mut host = compat::CompatHost::new();
     host.install(&engine).expect("install compat surface");
-    common::link_plugin(&engine, "KAGParserEx.dll");
 
     let err = engine
         .eval(
@@ -1851,7 +1874,6 @@ fn eval_native(script: &str) -> Result<TjsValue, String> {
     let engine = Tjs2Engine::new().expect("create engine");
     let mut host = compat::CompatHost::new();
     host.install(&engine).expect("install compat surface");
-    common::link_plugin(&engine, "KAGParserEx.dll");
     engine.eval(script, "kag_test").map_err(|e| e.to_string())
 }
 
@@ -2007,10 +2029,6 @@ fn native_multi_line_tag_enabled_joins_ams_continuations() {
     // `reference/cpp/plugins/KAGParser/readme.txt:14-38`).
     let _lock = common::vm_lock();
     let env = common::Env::with_storage();
-    // The `KAGParser` class is published by `KAGParserEx.dll`
-    // (`reference/cpp/plugins/KAGParser/readme.txt:1-38`), so the plugin must
-    // be linked before the parser is created.
-    env.link_plugin("KAGParserEx.dll");
     std::fs::write(
         env.game_dir().expect("mounted game dir").join("motion.ams"),
         b"*loop\n@motion id=MARK accel=2 time=750 \\\n; path=\"0, 0, 255\" area=10 zoom=1 rotate=0\n",
@@ -2036,10 +2054,6 @@ fn native_cur_line_is_zero_based() {
     // on the second source line therefore reports `curLine == 1`.
     let _lock = common::vm_lock();
     let env = common::Env::with_storage();
-    // The `KAGParser` class is published by `KAGParserEx.dll`
-    // (`reference/cpp/plugins/KAGParser/readme.txt:1-38`), so the plugin must
-    // be linked before the parser is created.
-    env.link_plugin("KAGParserEx.dll");
     std::fs::write(
         env.game_dir().expect("mounted game dir").join("line.ks"),
         b"*start\nA\n",
@@ -2079,10 +2093,6 @@ fn native_param_macros_expands_into_a_tag() {
     // (`reference/cpp/plugins/KAGParser/readme.txt:51-60`).
     let _lock = common::vm_lock();
     let env = common::Env::with_storage();
-    // The `KAGParser` class is published by `KAGParserEx.dll`
-    // (`reference/cpp/plugins/KAGParser/readme.txt:1-38`), so the plugin must
-    // be linked before the parser is created.
-    env.link_plugin("KAGParserEx.dll");
     std::fs::write(
         env.game_dir().expect("mounted game dir").join("pm.ks"),
         b"*start\n[x greet]\n",
@@ -2108,10 +2118,6 @@ fn native_macros_table_is_live() {
     // (`reference/cpp/core/base/KAGParser.cpp:2471-2481`).
     let _lock = common::vm_lock();
     let env = common::Env::with_storage();
-    // The `KAGParser` class is published by `KAGParserEx.dll`
-    // (`reference/cpp/plugins/KAGParser/readme.txt:1-38`), so the plugin must
-    // be linked before the parser is created.
-    env.link_plugin("KAGParserEx.dll");
     std::fs::write(
         env.game_dir().expect("mounted game dir").join("m.ks"),
         b"*start\n[greet]\n",
@@ -2135,10 +2141,6 @@ fn native_on_script_fires() {
     // passes an `[iscript]` block (`KAGParser.cpp:1161-1172`).
     let _lock = common::vm_lock();
     let env = common::Env::with_storage();
-    // The `KAGParser` class is published by `KAGParserEx.dll`
-    // (`reference/cpp/plugins/KAGParser/readme.txt:1-38`), so the plugin must
-    // be linked before the subclass is declared.
-    env.link_plugin("KAGParserEx.dll");
     std::fs::write(
         env.game_dir().expect("mounted game dir").join("s.ks"),
         b"*start\n[iscript]\nvar x = 1;\n[endscript]\n",
@@ -2231,10 +2233,6 @@ fn state_reference_store_accessors_round_trip() {
 fn native_object_valued_exp_is_truthy() {
     let _lock = common::vm_lock();
     let env = common::Env::with_storage();
-    // The `KAGParser` class is published by `KAGParserEx.dll`
-    // (`reference/cpp/plugins/KAGParser/readme.txt:1-38`), so the plugin must
-    // be linked before the parser is created.
-    env.link_plugin("KAGParserEx.dll");
     std::fs::write(
         env.game_dir()
             .expect("mounted game dir")
@@ -2262,10 +2260,6 @@ fn native_object_valued_exp_is_evaluated_once() {
     let env = common::Env::with_storage();
     // The array literal has a side effect (it increments the global counter);
     // a single evaluation must leave the counter at 1.
-    // The `KAGParser` class is published by `KAGParserEx.dll`
-    // (`reference/cpp/plugins/KAGParser/readme.txt:1-38`), so the plugin must
-    // be linked before the parser is created.
-    env.link_plugin("KAGParserEx.dll");
     std::fs::write(
         env.game_dir()
             .expect("mounted game dir")

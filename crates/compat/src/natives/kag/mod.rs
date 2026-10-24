@@ -1793,6 +1793,9 @@ extern "C" fn prop_param_macros_set(
 // ---------------------------------------------------------------------------
 
 /// Register the `KAGParser` native instance class.
+///
+/// The core startup pass calls this from
+/// [`crate::natives::register_all`]; no plugin link is required.
 pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     ctx.register_instance(&NativeInstanceBuilder {
         name: "KAGParser",
@@ -1927,6 +1930,16 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             },
         ],
     })
+}
+
+/// The `KAGParserEx.dll` / `KAGParser.dll` plugin entry.
+///
+/// `KAGParser` is a core native class, registered once at startup by
+/// [`register`] from [`crate::natives::register_all`]. The DLLs register no
+/// TJS surface of their own, so linking them must succeed without adding the
+/// class again.
+pub fn register_plugin(_ctx: &mut CompatCtx) -> Result<(), CompatError> {
+    Ok(())
 }
 
 #[cfg(test)]

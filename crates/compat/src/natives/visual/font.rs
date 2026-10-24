@@ -79,13 +79,13 @@ fn font_state(ctx: &CompatCtx) -> std::cell::RefMut<'_, FontMetricsState> {
 
 /// The font fields the measurement methods need, copied out of the scene so
 /// the scene borrow is released before the text engine runs.
-struct MeasuredFont {
-    face: String,
-    size_px: f32,
-    height: i32,
-    bold: bool,
-    italic: bool,
-    angle: f64,
+pub(crate) struct MeasuredFont {
+    pub(crate) face: String,
+    pub(crate) size_px: f32,
+    pub(crate) height: i32,
+    pub(crate) bold: bool,
+    pub(crate) italic: bool,
+    pub(crate) angle: f64,
 }
 
 /// Read the measured font fields from the scene for `instance`.
@@ -138,6 +138,22 @@ fn measure_text(
     // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; no `&mut` to it is live in `measure_text`.
     // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this callback; no `&mut` to it is live here.
     let standalone = unsafe { &*(instance as *const FontInst) }.owns_state;
+    let (width, height) = measure_text_with(engine, &font, text, !standalone, "Font")?;
+    Ok((width, f64::from(height), font.angle))
+}
+
+/// Measure `text` with the copied font fields, optionally consulting the
+/// mapped pre-rendered font.
+///
+/// `error_prefix` names the caller in the layout/rasterizer error, so the
+/// `Font` and `Layer` measurement methods keep their own messages.
+fn measure_text_with(
+    engine: *mut c_void,
+    font: &MeasuredFont,
+    text: &str,
+    use_prerendered: bool,
+    error_prefix: &str,
+) -> Result<(f64, i32), String> {
     let (_resolved, ctx) = bound(engine)?;
     let mut resolver = crate::resource::resource_state(&ctx);
     let id = resolver.resolve_face(&ctx, &font.face)?;
@@ -151,11 +167,11 @@ fn measure_text(
         italic: font.italic,
         angle: font.angle.round() as i32,
     };
-    if !standalone && let Some(prerendered) = resolver.prerendered_for(&key) {
+    if use_prerendered && let Some(prerendered) = resolver.prerendered_for(&key) {
         let body = prerendered.ensure_body(&ctx)?;
         let width = prerendered_text_width(&mut resolver.engine, id, &body, text, &style)
-            .map_err(|error| format!("Font: text layout failed: {error}"))?;
-        return Ok((width, f64::from(font.height), font.angle));
+            .map_err(|error| format!("{error_prefix}: text layout failed: {error}"))?;
+        return Ok((width, font.height));
     }
     // An empty run resolves the face and the size, so an unusable one is
     // still reported, but the text itself is never shaped: the width is
@@ -163,10 +179,26 @@ fn measure_text(
     resolver
         .engine
         .layout(id, "", &style, None)
-        .map_err(|error| format!("Font: text layout failed: {error}"))?;
+        .map_err(|error| format!("{error_prefix}: text layout failed: {error}"))?;
     let width = measured_text_width(&mut resolver.engine, id, text, &style)
-        .map_err(|error| format!("Font: text measurement failed: {error}"))?;
-    Ok((width, f64::from(font.height), font.angle))
+        .map_err(|error| format!("{error_prefix}: text measurement failed: {error}"))?;
+    Ok((width, font.height))
+}
+
+/// Measure `text` with a layer's font fields (`Layer.getTextWidth` /
+/// `Layer.getTextHeight`).
+///
+/// The width is the mapped pre-rendered `Inc` sum when the font has a mapping,
+/// otherwise the rasterizer advance sum; the height is the absolute font
+/// height.
+pub(crate) fn measure_layer_text(
+    engine: *mut c_void,
+    font: &MeasuredFont,
+    text: &str,
+    method: &str,
+) -> Result<(i32, i32), String> {
+    let (width, height) = measure_text_with(engine, font, text, true, method)?;
+    Ok((width.round() as i32, height))
 }
 
 /// The measured text width: the sum of every character's rounded advance.

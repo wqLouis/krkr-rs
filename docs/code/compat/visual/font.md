@@ -78,6 +78,9 @@ colour (set only by the constructor).
 * A **pre-rendered** font is consulted only through a **layer-bound** font
   (`owns_state == false`); a standalone `new Font()` measures through the
   rasterizer.
+* `Layer.getTextWidth` / `Layer.getTextHeight` measure the layer's current
+  font with the same rules; the height is `abs(Font.Height)` and the angle
+  does not rotate either result.
 
 ---
 

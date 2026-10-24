@@ -59,7 +59,7 @@ adding a ported plugin is **one table entry** rather than a trait impl.
 | `getabout.dll` | — | `windowEx.dll` | nothing of its own — `System.getAboutString` belongs to the `windowEx` port |
 | `getSample.dll` | — | — | the `WaveSoundBuffer` sample members |
 | `json.dll` | — | — | the JSON members |
-| `KAGParserEx.dll` | `KAGParser.dll` | — | the `KAGParser` class |
+| `KAGParserEx.dll` | `KAGParser.dll` | — | nothing of its own — `KAGParser` is a core native registered at startup |
 | `layerExDraw.dll` | `layerExMovie.dll`, `perspective.dll` | — | the layer drawing, movie and perspective members |
 | `menu.dll` | — | — | the `MenuItem` surface (registered by the core `MenuItem` module) |
 | `motionplayer.dll` | — | — | the `Motion` / `Player` classes |
@@ -99,6 +99,10 @@ on the VM **before any script runs**. It holds exactly one entry,
 module at startup
 (`reference/cpp/core/plugin/PluginImpl.cpp:90-91`), and every other plugin's
 members appear from `V2Link`.
+
+Core native classes such as `KAGParser` are registered by
+`natives::register_all` before the plugin startup pass; their DLL names in
+the table are empty placeholders, not link-time class registrations.
 
 Every other built-in registers its native classes on the **first**
 `Plugins.link` that names it. The timing is script-observable, so it is

@@ -49,18 +49,18 @@ mod md5;
 ///
 /// `aliases` are additional DLL names whose classes the same `register`
 /// installs (`layerExDraw.dll`, `layerExMovie.dll` and `perspective.dll` are
-/// one `layerEx` port, and `KAGParser.dll`/`KAGParserEx.dll` are one
-/// `KAGParser` port), so linking several of them registers once. Names and
+/// one `layerEx` port), so linking several of them registers once. Names and
 /// aliases match the reference `NCB_MODULE_NAME` strings under
 /// `reference/cpp/plugins` (plus the CMake source list); `extrans.dll` and
 /// `wuvorbis.dll` have no sources in that tree — their link-time surface was
 /// verified against the shipped binaries (`docs.old/plugin_host_exe.md`,
-/// `docs.old/wine_box64.md`).
+/// `docs.old/wine_box64.md`). `KAGParser.dll` aliases `KAGParserEx.dll`; both
+/// are empty placeholders for the core `KAGParser` class.
 ///
 /// An entry whose reference registers no TJS surface — or shares it with a
 /// sibling port — carries a documented no-op [`BuiltinPluginDef::register`]
-/// (`emote_player`, `extrans`, `wuvorbis`, `var_file`, `get_about`; see each
-/// module's documentation for the reason).
+/// (`emote_player`, `extrans`, `KAGParserEx`, `wuvorbis`, `var_file`,
+/// `get_about`; see each module's documentation for the reason).
 pub const BUILTIN_PLUGINS: &[BuiltinPluginDef] = &[
     BuiltinPluginDef {
         name: "addFont.dll",
@@ -129,7 +129,7 @@ pub const BUILTIN_PLUGINS: &[BuiltinPluginDef] = &[
         name: "KAGParserEx.dll",
         aliases: &["KAGParser.dll"],
         dependencies: &[],
-        register: crate::natives::kag::register,
+        register: crate::natives::kag::register_plugin,
     },
     BuiltinPluginDef {
         name: "layerExDraw.dll",
