@@ -37,12 +37,13 @@ use render::{
     resize as resize_render, upload_textures,
 };
 
+use crate::damage::{DamageRegion, LayerDamage};
 use crate::hasher::{Map, map};
 use crate::imagedecode::{
     DecodePool, DecodePoolConfig, DecodePoolError, DecodeStats, ImageDecoder,
 };
-use crate::projection::{ProjectionReport, project_scene_report};
-use crate::scene::{BitmapState, Scene};
+use crate::projection::{ProjectionReport, compose_layer, project_scene_report};
+use crate::scene::{BitmapState, Rect, Scene};
 use crate::shader::{PipelineId, Program, ProgramDesc, ShaderError, ShaderId, ShaderLibrary};
 use crate::storage::{StoragePoolConfig, StoragePoolError, StorageReadPool, StorageReader};
 use crate::timer::TimerState;
@@ -506,6 +507,15 @@ pub struct Engine {
     /// The run of frames the display has not accepted, ended by the next
     /// presented frame.
     stall: PresentationStall,
+    /// The surface area that changed since the last successful render.
+    ///
+    /// The region is in VM pixels and is conservative: it covers every pixel
+    /// whose rendered result may differ, and may cover more. It stays pending
+    /// until a frame is presented, because a frame the display did not accept
+    /// leaves the previous frame's content on screen.
+    pending_damage: DamageRegion,
+    /// The area the last successful render repainted.
+    last_damage: DamageRegion,
 }
 
 impl Engine {
@@ -560,6 +570,10 @@ impl Engine {
             pending_window_resize: None,
             presentation_skipped_logged: false,
             stall: PresentationStall::default(),
+            // The first frame has no previous content to keep, so it repaints
+            // the whole surface.
+            pending_damage: DamageRegion::full(),
+            last_damage: DamageRegion::empty(),
         };
         let event = resize_render(
             &engine.pipeline,
@@ -877,6 +891,11 @@ impl Engine {
             project_ms += project2_started.elapsed().as_secs_f64() * 1000.0;
         }
 
+        // Every change the frame made is resolved into the surface area it
+        // covers, so the region the frame repaints covers the whole change
+        // set.
+        self.collect_damage();
+
         let render_started = Instant::now();
         let outcome = match render(
             &self.pipeline,
@@ -904,6 +923,10 @@ impl Engine {
         }
         if outcome.presented {
             self.finish_presentation_stall(now_ms);
+            // The presented frame carries the damage, so the next frame
+            // starts from a clean region. A frame the display did not accept
+            // keeps it: the previous frame's content is still on screen.
+            self.last_damage = std::mem::take(&mut self.pending_damage);
         } else {
             // `present_outcome` names a fault for every non-presented frame; a
             // frame without one is the backend's silence, reported as such.
@@ -1063,6 +1086,9 @@ impl Engine {
         if translation != self.translation {
             self.translation = translation;
             self.render_scene_revision = None;
+            // A new mapping rescales the whole surface, so every pixel of the
+            // previous frame's content is different.
+            self.pending_damage = DamageRegion::full();
             if let Some(translation) = translation {
                 log::info!(
                     "presentation: VM {}x{} -> framebuffer {}x{} (scale {:.3})",
@@ -1118,9 +1144,113 @@ impl Engine {
         let Some(overlay) = self.overlay.as_mut() else {
             return Ok(());
         };
+        // The overlay is drawn in device coordinates, outside the screen the
+        // damage is expressed in, so the area it covers cannot be named here.
+        // A frame with an overlay repaints the whole surface.
+        self.pending_damage = DamageRegion::full();
         overlay
             .refresh(&self.pipeline, &mut self.render_state, now_ms, objects)
             .map_err(EngineError::Overlay)
+    }
+
+    /// The surface area that changed since the last successful render.
+    ///
+    /// The region is in VM pixels and is conservative: it covers every pixel
+    /// whose rendered result may differ from the last presented frame, and it
+    /// may cover more. It stays pending until a frame is presented, because a
+    /// frame the display did not accept leaves the previous frame's content
+    /// on screen.
+    pub fn pending_damage(&self) -> &DamageRegion {
+        &self.pending_damage
+    }
+
+    /// The area the last successful render repainted.
+    ///
+    /// Empty when the last frame changed nothing, and unbounded when the
+    /// frame repainted the whole surface.
+    pub fn last_damage(&self) -> &DamageRegion {
+        &self.last_damage
+    }
+
+    /// Resolve the scene's recorded changes into surface damage.
+    ///
+    /// The resolution runs once per frame, after every change the frame made,
+    /// so the region covers the frame's whole change set.
+    fn collect_damage(&mut self) {
+        let log = self.scene.take_damage();
+        if log.full {
+            self.pending_damage = DamageRegion::full();
+            return;
+        }
+        for entry in &log.changed {
+            self.damage_layer(entry);
+        }
+    }
+
+    /// Damage the old and the new rectangle of one changed layer.
+    ///
+    /// The new rectangle is the layer's composed rectangle; the old one is
+    /// the rectangle the layer had before the change, composed onto the
+    /// parent's current origin. When the parent has itself moved, the
+    /// parent's own damage covers the gap: a parent's rectangle clips its
+    /// whole subtree.
+    fn damage_layer(&mut self, entry: &LayerDamage) {
+        if self.scene.layer(entry.layer).is_none() {
+            // The layer is gone: its old rectangle can no longer be composed,
+            // so the whole surface is repainted rather than an area that is
+            // guessed at.
+            self.pending_damage = DamageRegion::full();
+            return;
+        }
+        let parent = self.scene.layer(entry.layer).and_then(|layer| layer.parent);
+        let current = compose_layer(&self.scene, entry.layer).map(|composed| composed.rect);
+        if let Some(current) = current {
+            self.pending_damage.add(current);
+        }
+        let Some(previous) = entry.previous else {
+            return;
+        };
+        let origin = match parent {
+            Some(parent) => match compose_layer(&self.scene, parent) {
+                Some(composed) => (composed.rect.x, composed.rect.y),
+                None => {
+                    self.pending_damage = DamageRegion::full();
+                    return;
+                }
+            },
+            None => (0, 0),
+        };
+        let previous = Rect::new(
+            origin.0.saturating_add(previous.x),
+            origin.1.saturating_add(previous.y),
+            previous.w,
+            previous.h,
+        );
+        // A change that did not move the layer leaves the same rectangle
+        // twice; the region holds it once.
+        if Some(previous) != current {
+            self.pending_damage.add(previous);
+        }
+    }
+
+    /// Record the damage of a bitmap whose pixels changed.
+    ///
+    /// Every layer that draws the bitmap changed its pixels, so each of them
+    /// is damaged. The scan is linear in the layer count; a reverse index
+    /// would replace it.
+    fn damage_bitmap(&mut self, bitmap: u32) {
+        let layers: Vec<u32> = self
+            .scene
+            .layers
+            .iter()
+            .filter(|layer| layer.bitmap == Some(bitmap))
+            .map(|layer| layer.id)
+            .collect();
+        for id in layers {
+            if let Some(composed) = compose_layer(&self.scene, id) {
+                self.pending_damage.add(composed.rect);
+            }
+        }
     }
 
     /// Returns the stateless render pipeline.
@@ -1385,6 +1515,11 @@ impl Engine {
                 }
             };
             drop(uploads);
+            // The uploaded pixels are the ones the layers drawing the bitmap
+            // show, so those layers changed.
+            for id in &ready {
+                self.damage_bitmap(*id);
+            }
             clear_uploaded_dirty(&mut self.scene, &ready, uploaded);
         }
     }

@@ -21,6 +21,7 @@ use api::config::CacheLimit;
 use api::geometry::PixelRegion;
 use api::media::DecodedImage;
 
+use crate::damage::{ChangeLog, LayerDamage};
 use crate::hasher::{Map, Set, map, set};
 use crate::imagedecode::{ImageOutcome, ImageSizeError, PendingImage};
 use crate::shader::{EffectDraw, EffectPipelines};
@@ -773,6 +774,9 @@ pub struct Scene {
     /// Monotonic counter bumped by every bitmap content change (see
     /// [`Scene::content_revision`]).
     content_revision: u64,
+    /// The changes accumulated since the last collection (see
+    /// [`Scene::take_damage`]).
+    damage: ChangeLog,
 }
 
 impl Default for Scene {
@@ -795,6 +799,7 @@ impl Default for Scene {
             image_cache: DecodedImageCache::default(),
             structure_revision: 0,
             content_revision: 0,
+            damage: ChangeLog::empty(),
         }
     }
 }
@@ -817,6 +822,41 @@ impl Scene {
     /// whether any composited content can be stale.
     pub fn content_revision(&self) -> u64 {
         self.content_revision
+    }
+
+    /// The changes accumulated since the last collection.
+    ///
+    /// The log names the layers whose content or geometry may have changed.
+    /// It holds no surface rectangle: the engine resolves it once per frame,
+    /// when it owns both the scene and the projection.
+    pub fn damage(&self) -> &ChangeLog {
+        &self.damage
+    }
+
+    /// Take the accumulated changes, leaving the scene with no damage.
+    ///
+    /// The caller owns the log from here on.
+    pub fn take_damage(&mut self) -> ChangeLog {
+        std::mem::take(&mut self.damage)
+    }
+
+    /// Record that the whole surface must be repainted.
+    ///
+    /// The engine uses this for a change it cannot bound to an area.
+    pub fn damage_full(&mut self) {
+        self.damage.full = true;
+    }
+
+    /// Record that `id`'s content or geometry may have changed.
+    ///
+    /// `previous` is the layer's own rectangle before the change. The engine
+    /// damages the old and the new composed rectangle, so a layer that moved
+    /// leaves no stale pixels behind.
+    fn record_damage(&mut self, id: u32, previous: Option<Rect>) {
+        self.damage.changed.push(LayerDamage {
+            layer: id,
+            previous,
+        });
     }
 
     /// Bump [`Scene::structure_revision`]. Over-approximating (bumping on a
@@ -1240,6 +1280,7 @@ impl Scene {
             layer.z_order = absolute;
         }
         self.touch_structure();
+        self.record_damage(id, None);
         Ok(())
     }
 
@@ -1281,6 +1322,7 @@ impl Scene {
         parent_layer.children.insert(index, id);
         self.renumber_siblings(id);
         self.touch_structure();
+        self.record_damage(id, None);
         Ok(())
     }
 
@@ -1396,7 +1438,10 @@ impl Scene {
     pub fn mark_layer_image_modified(&mut self, id: u32) {
         if let Some(layer) = self.layer_mut_untracked(id) {
             layer.image_modified = true;
+        } else {
+            return;
         }
+        self.record_damage(id, None);
     }
 
     /// Apply `f` to a layer and invalidate only when `f` reports a change.
@@ -1416,10 +1461,12 @@ impl Scene {
         id: u32,
         f: impl FnOnce(&mut LayerState) -> bool,
     ) -> Option<bool> {
+        let previous = self.layer(id).map(|layer| layer.rect);
         let changed = f(self.layer_mut_untracked(id)?);
         if changed {
             self.invalidate_layer_cache(id);
             self.touch_structure();
+            self.record_damage(id, previous);
         }
         Some(changed)
     }
@@ -1802,6 +1849,11 @@ impl Scene {
             }
         }
         self.layers.retain(|l| l.id != id);
+        // The removed layer leaves a hole in the surface: the area it covered
+        // must be repainted from the layers below it. The old rectangle
+        // cannot be composed any more — the layer is gone — so the whole
+        // surface is repainted rather than an area that is guessed at.
+        self.damage_full();
         // The removed layer releases its MainImage. A bitmap still held by a
         // surviving layer or a script `Bitmap` object is kept
         // (see [`Scene::release_bitmap`]).
@@ -3544,6 +3596,7 @@ impl Scene {
         if changed {
             self.invalidate_layer_cache(id);
             self.touch_structure();
+            self.record_damage(id, None);
             if let Some(old) = replaced {
                 self.release_bitmap(old);
             }
@@ -3602,6 +3655,7 @@ impl Scene {
                 self.invalidate_ancestor_caches_except(id, source);
             }
             self.touch_structure();
+            self.record_damage(id, None);
             if let Some(replaced) = replaced {
                 let kept = frame.map(|frame| [frame.src1.bitmap, frame.src2.bitmap]);
                 for bitmap in [replaced.src1.bitmap, replaced.src2.bitmap] {
@@ -3665,6 +3719,7 @@ impl Scene {
                 self.invalidate_ancestor_caches_except(id, source);
             }
             self.touch_structure();
+            self.record_damage(id, None);
             if let Some(replaced) = replaced {
                 for bitmap in replaced.bitmaps() {
                     if kept.contains(&bitmap) {
