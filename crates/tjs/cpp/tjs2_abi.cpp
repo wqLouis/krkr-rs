@@ -51,6 +51,10 @@ struct tjs2_engine {
     tjs2_log_cb log_cb;
     void *log_user;
     std::string last_string; // storage for the last string result
+    // The reason the last tjs2_invalidate_retained call failed: the failing
+    // script's own message when the finalizer raised, a description of the
+    // failure otherwise. Empty when the last call succeeded.
+    std::string last_invalidate_error;
     // Registered native classes. Each class object is held with one AddRef
     // (independent of the reference the global object keeps) so it stays
     // alive even if a script deletes the global member early, and is
@@ -343,23 +347,30 @@ void variant_to_value(tjs2_engine *e, const TJS::tTJSVariant &v,
     }
 }
 
+// The text of a TJS exception: its message, prefixed with the script block
+// and source line for a script error.
+std::string error_message_text(const TJS::eTJS &e) {
+    std::string msg = u16_to_utf8(e.getMessage().c_str());
+    // Script errors carry the block name and source line; surface them so
+    // a host-side failure names the failing script, not just the message.
+    if(const auto *se = dynamic_cast<const TJS::eTJSScriptError *>(&e)) {
+        try {
+            std::string where = u16_to_utf8(se->GetBlockName());
+            where += "(";
+            where += std::to_string(se->GetSourceLine());
+            where += ")";
+            msg = where + ": " + msg;
+        } catch(...) {
+        }
+    }
+    return msg;
+}
+
 // Convert a TJS exception into a malloc'd UTF-8 message (or fall back to a
 // generic message on unexpected error types).
 char *make_error_message(const TJS::eTJS &e) {
     try {
-        std::string msg = u16_to_utf8(e.getMessage().c_str());
-        // Script errors carry the block name and source line; surface them so
-        // a host-side failure names the failing script, not just the message.
-        if(const auto *se = dynamic_cast<const TJS::eTJSScriptError *>(&e)) {
-            try {
-                std::string where = u16_to_utf8(se->GetBlockName());
-                where += "(";
-                where += std::to_string(se->GetSourceLine());
-                where += ")";
-                msg = where + ": " + msg;
-            } catch(...) {
-            }
-        }
+        std::string msg = error_message_text(e);
         char *buf = (char *)malloc(msg.size() + 1);
         if(!buf)
             return nullptr;
@@ -3165,22 +3176,54 @@ void tjs2_release_value(void *engine, tjs2_value_id id) {
 // statement): invokes the object's iTJSDispatch2::Invalidate so its script
 // `finalize` runs. Returns 0 on success, 1 on an unknown id or an exception.
 // The retention is left in place; release it with tjs2_release_value.
+// A failure records its reason in the engine; read it back with
+// tjs2_invalidate_error_message.
 int tjs2_invalidate_retained(void *engine, tjs2_value_id id) {
     tjs2_engine *e = (tjs2_engine *)engine;
     if(!e || !id)
         return 1;
+    e->last_invalidate_error.clear();
     try {
         auto it = e->retained.find((uintptr_t)id);
-        if(it == e->retained.end())
+        if(it == e->retained.end()) {
+            e->last_invalidate_error = "unknown retained id";
             return 1;
+        }
         TJS::tTJSVariantClosure clo = it->second.AsObjectClosureNoAddRef();
-        if(!clo.Object)
+        if(!clo.Object) {
+            e->last_invalidate_error = "the retained value is not an object";
             return 1;
+        }
         clo.Invalidate(0, nullptr, nullptr, nullptr);
         return 0;
+    } catch(const TJS::eTJS &err) {
+        // The finalizer's own message reaches the caller: the window teardown
+        // logs it, and a generic failure hides the real cause.
+        try {
+            e->last_invalidate_error = error_message_text(err);
+        } catch(...) {
+            e->last_invalidate_error = "the script raised an unreadable error";
+        }
+        return 1;
+    } catch(const std::exception &err) {
+        e->last_invalidate_error = std::string("C++ exception: ") + err.what();
+        return 1;
     } catch(...) {
+        e->last_invalidate_error =
+            "the object invalidation failed with an unknown error";
         return 1;
     }
+}
+
+// The reason the last tjs2_invalidate_retained call failed: the failing
+// script's message when the finalizer raised, a description of the failure
+// otherwise. NULL when the last call succeeded. The string is malloc'd; free
+// it with tjs2_free_string.
+char *tjs2_invalidate_error_message(void *engine) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e || e->last_invalidate_error.empty())
+        return nullptr;
+    return make_error_string(e->last_invalidate_error.c_str());
 }
 
 // Invoke the retained value's default member with the given arguments.

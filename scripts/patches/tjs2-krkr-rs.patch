@@ -1,3 +1,43 @@
+diff -ruN a/tjsArray.cpp b/tjsArray.cpp
+--- a/tjsArray.cpp
++++ b/tjsArray.cpp
+@@ -361,8 +361,14 @@
+                 tjs_uint64 streamlen = stream->GetSize();
+                 if(streamlen >= tTJSBinarySerializer::HEADER_LENGTH) {
+                     tjs_uint8 header[tTJSBinarySerializer::HEADER_LENGTH];
+-                    stream->Read(header, tTJSBinarySerializer::HEADER_LENGTH);
+-                    if(tTJSBinarySerializer::IsBinary(header)) {
++                    // A short read (an `oN` offset at EOF, or a stream shorter
++                    // than the header) leaves the buffer partially unwritten;
++                    // treat it as the ordinary non-binary input.
++                    if(stream->Read(header,
++                                    tTJSBinarySerializer::HEADER_LENGTH) ==
++                           static_cast<tjs_uint>(
++                               tTJSBinarySerializer::HEADER_LENGTH) &&
++                       tTJSBinarySerializer::IsBinary(header)) {
+                         tTJSBinarySerializer binload(
+                             (tTJSArrayObject *)objthis);
+                         tTJSVariant *var = binload.Read(stream);
+diff -ruN a/tjsDictionary.cpp b/tjsDictionary.cpp
+--- a/tjsDictionary.cpp
++++ b/tjsDictionary.cpp
+@@ -83,8 +83,14 @@
+                 tjs_uint64 streamlen = stream->GetSize();
+                 if(streamlen >= tTJSBinarySerializer::HEADER_LENGTH) {
+                     tjs_uint8 header[tTJSBinarySerializer::HEADER_LENGTH];
+-                    stream->Read(header, tTJSBinarySerializer::HEADER_LENGTH);
+-                    if(tTJSBinarySerializer::IsBinary(header)) {
++                    // A short read (an `oN` offset at EOF, or a stream shorter
++                    // than the header) leaves the buffer partially unwritten;
++                    // treat it as the ordinary non-binary input.
++                    if(stream->Read(header,
++                                    tTJSBinarySerializer::HEADER_LENGTH) ==
++                           static_cast<tjs_uint>(
++                               tTJSBinarySerializer::HEADER_LENGTH) &&
++                       tTJSBinarySerializer::IsBinary(header)) {
+                         if(!dic)
+                             dic = (tTJSDictionaryObject *)
+                                 TJSCreateDictionaryObject();
 diff -ruN a/tjsInterCodeExec.cpp b/tjsInterCodeExec.cpp
 --- a/tjsInterCodeExec.cpp
 +++ b/tjsInterCodeExec.cpp
@@ -38,21 +78,7 @@ diff -ruN a/tjsInterCodeExec.cpp b/tjsInterCodeExec.cpp
              if(n == len) {
                  *result = tTJSVariant(TJS_W(""));
                  return;
-@@ -644,6 +647,13 @@
-         //	if(objthis) objthis->AddRef();
-         try {
-             tTJSVariant *regs = TJSVariantArrayStack->Allocate(num_alloc);
-+            // krkr-rs patch: the exception-display register dump reads ALL
-+            // num_alloc slots, including ones the VM never wrote; the
-+            // allocator reuses memory, so those slots are uninitialized and
-+            // reading them is UB (crashes under clang -O2, which eliminates
-+            // tTJSVariantString's `if(!this)` guard). Zero them so the dump
-+            // always sees tvtVoid slots.
-+            std::memset(regs, 0, sizeof(tTJSVariant) * num_alloc);
-             tTJSVariant *ra =
-                 regs + MaxVariableCount + VariableReserveCount; // register area
- 
-@@ -1514,10 +1524,11 @@
+@@ -1514,10 +1517,11 @@
              try {
                  // TODO: verify here needs hint holding
                  hr = clo.PropGet(
@@ -66,7 +92,7 @@ diff -ruN a/tjsInterCodeExec.cpp b/tjsInterCodeExec.cpp
              } catch(...) {
                  if(str)
                      str->Release();
-@@ -1573,10 +1584,11 @@
+@@ -1573,10 +1577,11 @@
                      clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());
                  if(hr == TJS_E_NOTIMPL)
                      hr = clo.PropSet(
@@ -80,7 +106,7 @@ diff -ruN a/tjsInterCodeExec.cpp b/tjsInterCodeExec.cpp
              } catch(...) {
                  if(str)
                      str->Release();
-@@ -1648,12 +1660,12 @@
+@@ -1648,12 +1653,12 @@
              }
              try {
                  tjs_error hr = clo.Operation(
@@ -95,7 +121,7 @@ diff -ruN a/tjsInterCodeExec.cpp b/tjsInterCodeExec.cpp
              } catch(...) {
                  if(str)
                      str->Release();
-@@ -1747,12 +1759,12 @@
+@@ -1747,12 +1752,12 @@
              tjs_error hr;
              try {
                  hr = clo.Operation(
@@ -110,7 +136,7 @@ diff -ruN a/tjsInterCodeExec.cpp b/tjsInterCodeExec.cpp
              } catch(...) {
                  if(str)
                      str->Release();
-@@ -1842,7 +1854,7 @@
+@@ -1842,7 +1847,7 @@
  
          try {
              tjs_error hr = clo.DeleteMember(
@@ -119,7 +145,7 @@ diff -ruN a/tjsInterCodeExec.cpp b/tjsInterCodeExec.cpp
                  clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());
              if(code[1]) {
                  if(TJS_FAILED(hr))
-@@ -1942,7 +1954,8 @@
+@@ -1942,7 +1947,8 @@
              try {
                  // TODO: verify here needs hint holding
                  hr = clo.PropGet(
@@ -129,7 +155,7 @@ diff -ruN a/tjsInterCodeExec.cpp b/tjsInterCodeExec.cpp
                      clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());
                  if(hr == TJS_S_OK) {
                      TypeOf(TJS_GET_VM_REG(ra, code[1]));
-@@ -2664,7 +2677,7 @@
+@@ -2664,7 +2670,7 @@
          // puts val's character code on val
          tTJSVariantString *str = val.AsString();
          if(str) {
@@ -138,7 +164,7 @@ diff -ruN a/tjsInterCodeExec.cpp b/tjsInterCodeExec.cpp
              val = tTVInteger(ch[0]);
              str->Release();
              return;
-@@ -2688,7 +2701,8 @@
+@@ -2688,7 +2694,8 @@
          if(str) {
              tjs_error hr;
              try {
@@ -163,6 +189,36 @@ diff -ruN a/tjsInterCodeGen.cpp b/tjsInterCodeGen.cpp
      }
  
      //---------------------------------------------------------------------------
+diff -ruN a/tjsObject.cpp b/tjsObject.cpp
+--- a/tjsObject.cpp
++++ b/tjsObject.cpp
+@@ -506,6 +506,14 @@
+             return data;
+         }
+ 
++        // Grow the bucket table once it is full. Without this a fresh object
++        // keeps its initial eight buckets and every later lookup walks one
++        // collision chain, which turns building a large dictionary quadratic.
++        // The insert below happens after the growth, so its symbol pointer is
++        // not invalidated by the rebuild.
++        if(Count >= HashSize)
++            RebuildHash(Count);
++
+         tjs_uint32 hash;
+         if(hint && *hint)
+             hash = *hint; // hint must be hash because of previous
+@@ -560,6 +568,11 @@
+             return data;
+         }
+ 
++        // See the char* overload: grow before the insert, not before the
++        // lookup, so an existing member's name stays valid.
++        if(Count >= HashSize)
++            RebuildHash(Count);
++
+         tjs_uint32 hash;
+         if(*(name->GetHint()))
+             hash = *(name->GetHint()); // hint must be hash because of
 diff -ruN a/tjsString.cpp b/tjsString.cpp
 --- a/tjsString.cpp
 +++ b/tjsString.cpp

@@ -400,6 +400,12 @@ void tjs2_release_value(void *engine, tjs2_value_id id);
  * script exception. The retention is *not* released. */
 int tjs2_invalidate_retained(void *engine, tjs2_value_id id);
 
+/* The reason the last tjs2_invalidate_retained call failed: the failing
+ * script's own message when the finalizer raised, a description of the
+ * failure otherwise. NULL when the last call succeeded. The string is
+ * malloc'd; free it with tjs2_free_string. */
+char *tjs2_invalidate_error_message(void *engine);
+
 /* Diagnostic: number of entries currently in the retained-value map (used by
  * the test suite to detect retention leaks). */
 size_t tjs2_retained_count(void *engine);

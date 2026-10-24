@@ -560,6 +560,9 @@ unsafe extern "C" {
     fn tjs2_release_value(engine: *mut Engine, id: Tjs2ValueId);
     /// Invalidate a retained object value (runs its script `finalize`).
     fn tjs2_invalidate_retained(engine: *mut Engine, id: Tjs2ValueId) -> c_int;
+    /// The reason the last `tjs2_invalidate_retained` call failed; malloc'd,
+    /// free with `tjs2_free_string`. Null when the last call succeeded.
+    fn tjs2_invalidate_error_message(engine: *mut Engine) -> *mut c_char;
     /// Number of entries currently in the engine's retained-value map
     /// (diagnostic; the test suite uses it to prove retentions are consumed
     /// or released).
@@ -2231,8 +2234,9 @@ name), and none was available"
     /// Invalidate a retained object value (the reference `invalidate obj;`
     /// statement): invokes the object's `iTJSDispatch2::Invalidate`, running
     /// its script `finalize`. Returns an error string on an unknown id or a
-    /// script exception. The retention is **not** released; the owning
-    /// [`DetachedValue`] still releases it when dropped.
+    /// script exception; the error carries the failing script's own message,
+    /// so a caller that logs it names the real cause. The retention is **not**
+    /// released; the owning [`DetachedValue`] still releases it when dropped.
     pub fn invalidate_retained(&self, id: Tjs2ValueId) -> Result<(), String> {
         if id.is_null() {
             return Err("cannot invalidate a null retained id".into());
@@ -2241,10 +2245,16 @@ name), and none was available"
         // owned by the caller's handle.
         let rc = unsafe { tjs2_invalidate_retained(self.inner, id) };
         if rc == 0 {
-            Ok(())
-        } else {
-            Err("tjs2_invalidate_retained failed".into())
+            return Ok(());
         }
+        // SAFETY: self.inner is a live engine; the failing call recorded the
+        // reason and hands it over as a malloc'd string (null when it
+        // recorded none).
+        let message = unsafe { tjs2_invalidate_error_message(self.inner) };
+        if message.is_null() {
+            return Err("tjs2_invalidate_retained failed".into());
+        }
+        Err(take_error_string(message))
     }
 
     /// Invoke a named member on a retained object value (e.g. a Timer
