@@ -10,24 +10,8 @@ permissions:
   contents: read
 
 jobs:
-  gate:
-    name: Static gate
-    runs-on: ubuntu-latest
-    steps:
-      - name: Install the Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libavcodec-dev pkg-config
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v5
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Run the static gate
-        run: uv run --project scripts krkr-gate gate
-
   linux:
     name: Linux x86_64 binary
-    needs: gate
     runs-on: ubuntu-latest
     steps:
       - name: Build the release binary
@@ -46,7 +30,6 @@ jobs:
 
   apk:
     name: Release APK
-    needs: gate
     runs-on: ubuntu-latest
     steps:
       - name: Build and verify

@@ -218,11 +218,12 @@ agent only**, after the change is understood.
 `.github/workflows/release.yml` triggers on `v*` **tags** and on
 `workflow_dispatch` (a branch push triggers nothing). One `v*` tag builds the
 Linux x86_64 binary and the Android APK, then a single final job publishes both
-to the same GitHub Release. Each tag runs that full pipeline, which costs CI
-minutes, so: commit locally, keep the gate green, and **hold the tag until the
-user says the build is wanted**. Do not tag and push on every green gate. Batch
-the work, report what is ready, and wait. `krkr-gate ci` fails if the workflow
-stops matching this contract.
+to the same GitHub Release. The workflow is build-only: it does **not** rerun
+the static gate or the tests, so the tag must point at a commit that already
+passed them locally. Each tag still costs CI minutes, so: commit locally, keep
+the gate green, and **hold the tag until the user says the build is wanted**.
+Do not tag and push on every green gate. Batch the work, report what is ready,
+and wait. `krkr-gate ci` fails if the workflow stops matching this contract.
 
 The `platform-android` steps build the **feature on the host**, not the Android
 target: the feature compiles the platform-independent helpers plus a typed stub,

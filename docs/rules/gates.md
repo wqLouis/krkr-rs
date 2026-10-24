@@ -44,7 +44,7 @@ It runs the steps below in this order and stops at the first failure:
 | 18 | `native-parity` | check | native class surface vs the reference |
 | 19 | `plugin-parity --no-doc` | check | plugin surface vs the reference |
 | 20 | `host-facts` | check | every host seam has a production installer |
-| 21 | `ci` | check | the release workflow contract (v* → gate → Linux + Android → one release) |
+| 21 | `ci` | check | the release workflow contract (v* → Linux + Android in parallel → one release) |
 
 The `cargo` steps are the main agent's; they are the reason a worker may run a
 compiler-free check but may not run the build gate. `gate --no-cargo` runs the
@@ -117,10 +117,9 @@ without running it.
   `workflow_dispatch` is missing;
 * any workflow still names an `android-*` tag, or the old Android-only
   workflow file exists;
-* the `gate` job is missing, does not run
-  `uv run --project scripts krkr-gate gate`, or does not install uv, Rust and
-  the Linux build dependencies;
-* the `linux` or `apk` job does not `needs: gate`;
+* the workflow runs the repository static gate (`krkr-gate gate`), which is a
+  local pre-tag check rather than a release job;
+* the `linux` and `apk` jobs are not independent;
 * the Linux job does not run `cargo build --release -p app` or does not package
   `krkr-rs-linux-x86_64.tar.gz` with the binary, `LICENSE` and a run note;
 * the Android job does not invoke `crates/android/build-android.sh` and
@@ -141,17 +140,16 @@ rule fires, so adding a rule without a fixture fails the check.
 `workflow_dispatch`. A branch push triggers nothing. The jobs are:
 
 ```
-gate  ──┬──> linux ──┐
-        └──> apk   ──┴──> release
+linux ──┐
+        ├──> release
+apk   ──┘
 ```
 
-* **`gate`** installs the Linux build dependencies (FFmpeg development
-  libraries, ALSA, libc++, pkg-config, clang/libclang for bindgen, cmake,
-  bison, python3), uv, Rust with rustfmt/clippy, and Zig. It clones the
-  reference checkout shallowly — `native-parity` and `plugin-parity` compare
-  against `reference/cpp`, which is not vendored — then runs the full static
-  gate. It does not run `krkr-gate test`; the gate already builds every
-  target the host can build, and the release jobs build the two artifacts.
+The workflow is deliberately **build-only**. It does not install uv, clone the
+reference checkout or rerun `krkr-gate gate`; that gate is the local pre-tag
+check and repeats compilation the two build jobs already do. The tag must
+therefore point at a commit whose static gate and test suites are already
+green (section 6).
 * **`linux`** runs `cargo build --release -p app` on `ubuntu-latest`
   (x86_64) and packages `target/release/krkr`, `LICENSE` and a `README.txt`
   run note as `krkr-rs-linux-x86_64.tar.gz`.

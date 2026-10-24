@@ -5,10 +5,10 @@
 # nothing: releases are metered, so a full Linux + Android build runs only when
 # a release is deliberately tagged (or a maintainer starts a manual run).
 #
-# Pipeline: `gate` (the repository's static gate) runs first; `linux` and
-# `apk` run in parallel once it is green; `release` waits for both and is the
-# only job that creates or uploads a GitHub Release, so the two platform jobs
-# cannot race each other.
+# Pipeline: `linux` and `apk` run in parallel; `release` waits for both and is
+# the only job that creates or uploads a GitHub Release, so the two platform jobs
+# cannot race each other. The repository static gate is a local pre-tag check,
+# not a release job: it is slow and repeats work these builds already compile.
 #
 # Scope of the Android build: `arm64-v8a` only, release build. No other ABIs,
 # no emulator, no real signing key (the APK is signed with the debug key when
@@ -62,77 +62,16 @@ env:
   ZIG_VERSION: '0.16.0'
 
 jobs:
-  gate:
-    name: Static gate
-    runs-on: ubuntu-latest
-    # The static gate runs fmt, the compiler-free checks, clippy for the whole
-    # workspace (both platform features), the surface lock and both parity
-    # reports. A hung step would bill for hours at the default six-hour limit.
-    timeout-minutes: 90
-    steps:
-      - name: Check out
-        uses: actions/checkout@v7
-
-      # Everything the static gate compiles needs: the C++ TJS2 build (bison,
-      # python3, zig below), ffmpeg-next (pkg-config + the FFmpeg development
-      # headers), cpal (ALSA headers), the Rust C++ runtime (libc++), and
-      # ffmpeg-sys-next/opusic-sys (bindgen/libclang, cmake, a C/C++ toolchain).
-      - name: Install the Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bison build-essential clang cmake libclang-dev \
-            libavcodec-dev libavformat-dev libavutil-dev \
-            libswresample-dev libswscale-dev \
-            libasound2-dev libc++-dev libc++abi-dev pkg-config python3
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v5
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      # Zig is needed before the Rust build, not for compiling on the desktop —
-      # `crates/tjs/build.rs` fetches its C/C++ dependencies (fmt, spdlog,
-      # boost, oniguruma) with `zig build` in `deps/`, and compiles the VM
-      # with `zig c++`. Pinned, and fetched directly rather than through a
-      # third-party action, so there is one less moving part.
-      - name: Install Zig
-        run: |
-          ZIG_DIR="$RUNNER_TEMP/zig"
-          mkdir -p "$ZIG_DIR"
-          curl -sSL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" \
-            | tar -xJ --strip-components=1 -C "$ZIG_DIR"
-          echo "$ZIG_DIR" >> "$GITHUB_PATH"
-          "$ZIG_DIR/zig" version
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: linux-gate
-
-      # native-parity and plugin-parity compare the Rust surface against the
-      # reference C++ checkout; the reference is not vendored into this
-      # repository, so the gate needs its own shallow clone.
-      - name: Check out the reference sources
-        run: git clone --depth 1 https://github.com/2468785842/krkr2.git reference
-
-      - name: Run the static gate
-        run: uv run --project scripts krkr-gate gate
-
   linux:
     name: Linux x86_64 binary
-    needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - name: Check out
         uses: actions/checkout@v7
 
-      # Same dependency set as the gate job: the release build compiles the
-      # same workspace, plus the C++ TJS2 VM and its Zig-fetched dependencies.
+      # The release build compiles the workspace, the C++ TJS2 VM and its
+      # Zig-fetched dependencies.
       - name: Install the Linux build dependencies
         run: |
           sudo apt-get update
@@ -208,7 +147,6 @@ jobs:
 
   apk:
     name: Release APK (arm64-v8a)
-    needs: gate
     runs-on: ubuntu-latest
     # A build takes about seven minutes. The default is six hours, so a hung
     # step would bill for hours before failing; this fails fast instead.

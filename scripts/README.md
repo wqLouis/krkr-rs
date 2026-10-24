@@ -65,12 +65,12 @@ that every `unsafe` block carries a `// SAFETY:` note and that the file-level
 `unsafe_code` allow appears only in reviewed FFI files.
 
 `ci` statically validates the release workflow contract: the `v*` tag
-trigger (and the absence of any `android-*` tag), the `gate` job running
-`uv run --project scripts krkr-gate gate`, the Linux and Android build jobs
-waiting for it, the Linux archive, the Android build/packaging scripts, and a
-single final release job that attaches both artifacts. It reads the workflow
-as text (standard library only) and has a fixture self-test under
-`fixtures/ci/` that proves every rule fires.
+trigger (and the absence of any `android-*` tag), a build-only workflow that
+does not rerun the local static gate, independent Linux and Android build jobs,
+the Linux archive, the Android build/packaging scripts, and a single final
+release job that attaches both artifacts. It reads the workflow as text
+(standard library only) and has a fixture self-test under `fixtures/ci/` that
+proves every rule fires.
 
 `void-getter` fails a native property getter that returns a `StoredValue`
 field whose constructor default is `StoredValue::Void` unchanged: the script

@@ -24,12 +24,6 @@
     "rule": "dispatch"
   },
   {
-    "name": "gate job",
-    "old": "\n  gate:\n",
-    "new": "\n  checks:\n",
-    "rule": "job-gate"
-  },
-  {
     "name": "linux job",
     "old": "\n  linux:\n",
     "new": "\n  desktop:\n",
@@ -46,36 +40,6 @@
     "old": "\n  release:\n",
     "new": "\n  publish:\n",
     "rule": "job-release"
-  },
-  {
-    "name": "gate command",
-    "old": "uv run --project scripts krkr-gate gate",
-    "new": "echo static gate",
-    "rule": "gate-command"
-  },
-  {
-    "name": "gate uv",
-    "old": "astral-sh/setup-uv@v5",
-    "new": "actions/setup-python@v5",
-    "rule": "gate-uv"
-  },
-  {
-    "name": "gate rust",
-    "old": "dtolnay/rust-toolchain@stable",
-    "new": "actions/setup-rust@v1",
-    "rule": "gate-rust"
-  },
-  {
-    "name": "gate dependencies",
-    "old": "libavcodec-dev",
-    "new": "ffmpeg",
-    "rule": "gate-deps"
-  },
-  {
-    "name": "linux waits for gate",
-    "old": "  linux:\n    name: Linux x86_64 binary\n    needs: gate",
-    "new": "  linux:\n    name: Linux x86_64 binary\n    needs: []",
-    "rule": "linux-needs-gate"
   },
   {
     "name": "linux build",
@@ -100,12 +64,6 @@
     "old": "          name: krkr-rs-linux-x86_64",
     "new": "          name: linux-binary",
     "rule": "linux-artifact"
-  },
-  {
-    "name": "android waits for gate",
-    "old": "  apk:\n    name: Release APK\n    needs: gate",
-    "new": "  apk:\n    name: Release APK\n    needs: []",
-    "rule": "android-needs-gate"
   },
   {
     "name": "android build script",
@@ -166,5 +124,11 @@
     "old": "cargo build --release -p app",
     "new": "cargo build --release -p app\n          gh release upload evil",
     "rule": "release-single"
+  },
+  {
+    "name": "static gate in release",
+    "old": "        run: cargo build --release -p app",
+    "new": "        run: |\n          uv run --project scripts krkr-gate gate\n          cargo build --release -p app",
+    "rule": "no-static-gate"
   }
 ]

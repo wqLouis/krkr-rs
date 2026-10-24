@@ -104,7 +104,7 @@ inherited from the old Bevy architecture and partially rebuilt:
 | Android input translation (`PhysicalKey`/`TouchPhase`/`MouseButton`) | implemented and host-tested in `crates/platform/platform/src/android.rs`, consumed by the composition root's loop |
 | MediaCodec video backend | `crates/platform/media` has a compile-checked backend; never run on a device |
 | Gradle `assembleDebug` verified locally | not on this branch |
-| CI workflow (`.github/workflows/release.yml`) | builds the APK on `v*` tags after the static gate; the same workflow builds the Linux binary |
+| CI workflow (`.github/workflows/release.yml`) | builds the APK on `v*` tags in parallel with the Linux binary; the static gate is a local pre-tag check |
 
 Known unverified pieces are listed honestly in `docs.old/android.md` §2 and §6 rather
 than assumed to work.

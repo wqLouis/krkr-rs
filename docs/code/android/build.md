@@ -261,20 +261,21 @@ the rules fire — a check that cannot fail is not a check.
 x86_64 binary and the Android APK in the same workflow:
 
 ```
-gate  ──┬──> linux ──┐
-        └──> apk   ──┴──> release
+linux ──┐
+        ├──> release
+apk   ──┘
 ```
 
-The `gate` job runs the repository's static gate
-(`uv run --project scripts krkr-gate gate`) first. The Android `apk` job then
-installs the NDK, the SDK platform and the build tools, JDK 21, Rust with the
-`aarch64-linux-android` target, Zig (the C++ dependency fetch needs it) and
-`bison` (the TJS2 parser generator), runs the same `build-android.sh`, runs
-`gradle :app:assembleRelease`, checks the packaged native libraries (§6), and
-uploads the APK as an artifact. The Linux job builds the desktop binary and
-uploads its archive. A single final `release` job needs both of them and is the
-only job that creates or updates the GitHub Release, so the two platform jobs
-cannot race each other.
+The workflow is build-only and the two platform jobs run in parallel. The
+Android `apk` job installs the NDK, the SDK platform and the build tools, JDK
+21, Rust with the `aarch64-linux-android` target, Zig (the C++ dependency fetch
+needs it) and `bison` (the TJS2 parser generator), runs the same
+`build-android.sh`, runs `gradle :app:assembleRelease`, checks the packaged
+native libraries (§6), and uploads the APK as an artifact. The Linux job builds
+the desktop binary and uploads its archive. A single final `release` job needs
+both of them and is the only job that creates or updates the GitHub Release, so
+the two platform jobs cannot race each other. The static gate is the local
+pre-tag check; the tag must point at a commit that already passed it.
 
 The pinned versions are the ones the port was verified against: NDK r27c
 compiles the vendored C++ TJS2 VM, so a version bump changes the compiler

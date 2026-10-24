@@ -9,7 +9,9 @@ the contract the repository relies on:
 
 * the tag trigger is 'v*' and nothing else, with 'workflow_dispatch' kept for
   manual runs;
-* the static gate is a job, and both platform jobs wait for it;
+* the workflow does not run the slow repository static gate: that gate is a
+  local pre-tag check, and the release jobs are builds-first;
+* the Linux and Android jobs are independent (neither waits for the other);
 * the Linux job builds 'target/release/krkr' and packages it with the license
   and a run note;
 * the Android job invokes 'build-android.sh' and 'check-jni-libs.sh';
@@ -17,7 +19,7 @@ the contract the repository relies on:
 
 The check deliberately validates names and commands, not a full YAML schema; a
 real workflow parser would be a dependency and would still not know which
-command is the gate. The fixture under 'scripts/fixtures/ci/' proves each rule
+command builds which artifact. The fixture under 'scripts/fixtures/ci/' proves each rule
 can fail.
 
 Usage:
@@ -40,12 +42,9 @@ FIXTURES = FIXTURES_DIR / "ci"
 FIXTURE_WORKFLOW = FIXTURES / "good.yml"
 FIXTURE_MUTATIONS = FIXTURES / "mutations.json"
 
-GATE_JOB = "gate"
 LINUX_JOB = "linux"
 ANDROID_JOB = "apk"
 RELEASE_JOB = "release"
-
-GATE_COMMAND = "uv run --project scripts krkr-gate gate"
 LINUX_ARTIFACT = "krkr-rs-linux-x86_64"
 ANDROID_ARTIFACT = "krkr-rs-release-arm64-v8a"
 LINUX_TARBALL = "krkr-rs-linux-x86_64.tar.gz"
@@ -151,6 +150,14 @@ def validate(text: str) -> list[Finding]:
             )
         )
 
+    if re.search(r"krkr-gate\s+gate", text):
+        findings.append(
+            (
+                "no-static-gate",
+                "the release workflow must not run the local static gate; build and publish only",
+            )
+        )
+
     on_block = _top_level_block(text, "on")
     if on_block is None:
         findings.append(("trigger-v", "the workflow has no top-level 'on:' trigger block"))
@@ -185,7 +192,6 @@ def validate(text: str) -> list[Finding]:
 
     jobs = _job_blocks(text)
     for job, rule in (
-        (GATE_JOB, "job-gate"),
         (LINUX_JOB, "job-linux"),
         (ANDROID_JOB, "job-android"),
         (RELEASE_JOB, "job-release"),
@@ -193,38 +199,8 @@ def validate(text: str) -> list[Finding]:
         if job not in jobs:
             findings.append((rule, f"the release workflow has no '{job}:' job"))
 
-    gate = jobs.get(GATE_JOB)
-    if gate is not None:
-        if GATE_COMMAND not in gate:
-            findings.append(
-                (
-                    "gate-command",
-                    f"the '{GATE_JOB}' job must run '{GATE_COMMAND}'",
-                )
-            )
-        if "astral-sh/setup-uv" not in gate:
-            findings.append(
-                ("gate-uv", f"the '{GATE_JOB}' job must install uv (astral-sh/setup-uv)")
-            )
-        if "dtolnay/rust-toolchain" not in gate:
-            findings.append(
-                ("gate-rust", f"the '{GATE_JOB}' job must install the Rust toolchain")
-            )
-        for package in ("libavcodec-dev", "pkg-config"):
-            if package not in gate:
-                findings.append(
-                    (
-                        "gate-deps",
-                        f"the '{GATE_JOB}' job must install the Linux build dependency '{package}'",
-                    )
-                )
-
     linux = jobs.get(LINUX_JOB)
     if linux is not None:
-        if GATE_JOB not in _needs(linux):
-            findings.append(
-                ("linux-needs-gate", f"the '{LINUX_JOB}' job must 'needs: {GATE_JOB}'")
-            )
         if "cargo build --release -p app" not in linux:
             findings.append(
                 (
@@ -268,10 +244,6 @@ def validate(text: str) -> list[Finding]:
 
     android = jobs.get(ANDROID_JOB)
     if android is not None:
-        if GATE_JOB not in _needs(android):
-            findings.append(
-                ("android-needs-gate", f"the '{ANDROID_JOB}' job must 'needs: {GATE_JOB}'")
-            )
         if "crates/android/build-android.sh" not in android:
             findings.append(
                 (
@@ -476,7 +448,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if not args.quiet:
         print(
-            "check-ci: v* -> static gate -> Linux + Android -> one release publisher OK"
+            "check-ci: v* -> Linux + Android in parallel -> one release publisher OK"
         )
     return 0
 
