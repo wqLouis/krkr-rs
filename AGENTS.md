@@ -235,6 +235,15 @@ host and none may be installed (see §14 of `TODO.md`); it is compiled and run o
 machine that has one, and Android-only code that has not been compiled is
 documented as unverified rather than described as working.
 
+**Do not download or install the Android SDK, the NDK or any Android
+toolchain on the development host.** `sdkmanager`, the command-line tools and
+the platform/build-tools packages are all off limits, and no agent may fetch
+them: the Android build belongs to the `apk` CI job and to a machine that has
+the toolchain. Kotlin launcher changes are therefore reviewed and read, not
+compiled here, and are documented as unverified until CI or a device builds
+them. The gate covers the Rust side only; `krkr-gate android-target` resolves
+the dependency graph without compiling.
+
 `uv run --project scripts krkr-gate android-target` resolves the dependency
 graph per target
 without compiling anything and fails when a desktop-only backend feature leaks

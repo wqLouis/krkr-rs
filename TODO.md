@@ -427,6 +427,13 @@ is installed and none may be installed. Android-only code is reviewed here and
 run on a machine that has one; anything not compiled is documented as unverified
 (`AGENTS.md` §0.4).
 
+* **No Android toolchain on the host.** Downloading or installing the Android
+  SDK, the NDK, the command-line tools or any platform/build-tools package is
+  not permitted. The Android build belongs to the `apk` CI job and to a
+  machine that has the toolchain. Kotlin changes in `android/` are reviewed by
+  reading, and the launcher UI is therefore unverified until CI or a device
+  builds it.
+
 * **On-device validation of everything (D36)**: startup, decode, render,
   MediaCodec (compile-checked, never run), `memfd`, touch mapping, surface
   recreation and **font resolution** (a requested face loads), captured in
