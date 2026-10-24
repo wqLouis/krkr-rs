@@ -916,6 +916,11 @@ fn layer_within(scene: &Scene, node: u32, root: u32) -> bool {
 /// A self-updating transition is not stepped here. It accumulates the frame
 /// time and is advanced by [`advance_self_updating_transitions`] once the
 /// projection reports that its layer was drawn.
+///
+/// # Errors
+///
+/// Returns the failure of one transition step as a message; the remaining
+/// transitions still advance.
 pub fn advance_transitions(ctx: &crate::CompatCtx, dt_ms: f64) -> Result<(), String> {
     super::paint_poll(ctx)?;
     advance(ctx, dt_ms, None)
@@ -927,6 +932,11 @@ pub fn advance_transitions(ctx: &crate::CompatCtx, dt_ms: f64) -> Result<(), Str
 /// descendants covered by a drawn cached ancestor. A transition whose
 /// destination or source subtree is in that report performs its pending step;
 /// one that was not drawn keeps its accumulated time for the next draw.
+///
+/// # Errors
+///
+/// Returns the failure of one transition step as a message; the remaining
+/// transitions still advance.
 pub fn advance_self_updating_transitions(
     ctx: &crate::CompatCtx,
     drawn_layers: &[u32],

@@ -18,7 +18,7 @@ type MonitorRect = (i32, i32, i32, i32, i32, i32, i32, i32, bool);
 /// yields no value, and a surface dimension that does not fit the Win32
 /// monitor rectangle makes `getDisplayMonitors` and `System.desktop*`
 /// report an error.
-pub fn install_window_ex_facts(host: &CompatHost, surface_size: (u32, u32)) {
+pub(crate) fn install_window_ex_facts(host: &CompatHost, surface_size: (u32, u32)) {
     host.set_window_ex_display_monitors(move || {
         primary_monitor(surface_size).map(|monitor| vec![monitor])
     });

@@ -441,6 +441,9 @@ pub type AudioDecoder =
 /// it. The L4 host appends its `media` decoder; plugin `register` calls append
 /// theirs. When no decoder matches, `open` reports every decoder's error,
 /// joined in chain order.
+///
+/// The decoder is owned by the host's dispatch state and is called from the
+/// VM's single thread; it lives as long as the host does.
 pub fn add_audio_decoder(services: &CompatServices, decoder: AudioDecoder) {
     services.state::<SoundState>().decoders.push(decoder);
 }
@@ -3162,6 +3165,12 @@ pub fn set_sound_render_driven(services: &CompatServices, enabled: bool) {
 ///
 /// `out.len()` must be a whole number of frames (`len % channels == 0`); a
 /// partial frame is a typed error rather than a truncated write.
+///
+/// # Errors
+///
+/// Returns [`CompatError::Engine`] when the channel count does not fit in
+/// memory, when `out.len()` is not a whole number of frames, or when the
+/// mixer cannot render the requested layout.
 pub fn sound_render(
     ctx: &CompatCtx,
     out: &mut [f32],
@@ -3197,6 +3206,9 @@ pub fn sound_render(
 /// position runs ahead of the position the sound has reached. The
 /// composition root reads the queue's depth from the device and hands it
 /// here, so the mixer can report where a voice has actually reached.
+///
+/// The value is the device's queue depth in seconds; the mixer reads it on
+/// its next advance and it never reaches a script.
 pub fn set_output_latency(ctx: &CompatCtx, seconds: f64) {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let services = unsafe { ctx.services() };

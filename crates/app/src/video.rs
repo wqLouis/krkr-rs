@@ -25,8 +25,8 @@
 //!
 //! [`compat::VideoSource`] is stored in the compat state and is therefore
 //! `'static`, while the bytes come from the L2 [`Storage`] the game host owns.
-//! The source holds the storage address; [`install_video_source`] documents the
-//! ordering invariant that keeps it valid.
+//! The source holds the storage address; [`install_video_source_metered`]
+//! documents the ordering invariant that keeps it valid.
 #![allow(unsafe_code)]
 
 use std::cell::RefCell;
@@ -71,8 +71,8 @@ impl Inner {
     /// log it and report absence; the audio seam propagates it.
     fn open(&mut self, path: &str) -> Result<&OpenStream, MediaError> {
         if !self.streams.contains_key(path) {
-            // SAFETY: `install_video_source` requires the storage to outlive
-            // the compat host that owns this source.
+            // SAFETY: `install_video_source_metered` requires the storage to
+            // outlive the compat host that owns this source.
             let storage = unsafe { &*self.storage };
             let bytes = storage.read(path).map_err(|error| MediaError::Io {
                 message: format!("video: cannot read {path:?}: {error}"),
@@ -155,7 +155,8 @@ impl VideoSource for MediaVideoSource {
 }
 
 /// Installs the `media`-backed video source on `host` for both the
-/// `VideoOverlay` and `LayerExMovie` seams.
+/// `VideoOverlay` and `LayerExMovie` seams, with the shared
+/// [`StartupStats`] counter set.
 ///
 /// # Safety
 ///
@@ -168,21 +169,6 @@ impl VideoSource for MediaVideoSource {
 ///
 /// Returns [`CompatError::Engine`] when `host` is not installed (there is no
 /// bound context to install the source on).
-pub unsafe fn install_video_source(
-    host: &CompatHost,
-    media: &Media,
-    storage: &Storage,
-) -> Result<(), CompatError> {
-    let stats = StartupStats::new();
-    // SAFETY: the caller upholds the storage lifetime documented above.
-    unsafe { install_video_source_metered(host, media, storage, &stats) }
-}
-
-/// Installs the video source with the shared [`StartupStats`] counter set.
-///
-/// # Safety
-///
-/// The same storage-lifetime contract as [`install_video_source`].
 pub(crate) unsafe fn install_video_source_metered(
     host: &CompatHost,
     media: &Media,

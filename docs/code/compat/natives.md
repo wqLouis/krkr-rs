@@ -21,8 +21,8 @@ constants → system → debug → storages → scripts → visual → input →
 → clipboard → plugins → tree_owner
 ```
 
-`crate::install` registers the null-plugin hook first, then `register_all`,
-then the `Plugins` class.
+The crate-internal `install` registers the null-plugin hook first, then
+`register_all`, then the `Plugins` class.
 
 The order matters in two places:
 

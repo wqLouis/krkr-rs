@@ -4,9 +4,9 @@
 //! `compat` (L3) never links a codec and never sees a device. Two seams cross
 //! the boundary and this module wires both, playing the composition-root role:
 //!
-//! * [`install_audio_decoder`] installs the L1 `media` decoder on the
-//!   `add_audio_decoder` chain so `WaveSoundBuffer` (and the legacy
-//!   `CDDASoundBuffer`/`MIDISoundBuffer` classes) can decode and play;
+//! * the L1 `media` decoder is installed on the `add_audio_decoder` chain
+//!   so `WaveSoundBuffer` (and the legacy `CDDASoundBuffer`/`MIDISoundBuffer`
+//!   classes) can decode and play;
 //! * [`AudioOutput`] opens the L1 [`AudioDevice`] at game start and, once per
 //!   frame, renders `dt` worth of the shared mixer through
 //!   [`compat::sound_render`] and [`AudioDevice::write`]s it.
@@ -444,7 +444,8 @@ fn decode_with_mediacodec(
         .map_err(|error| error.to_string())
 }
 
-/// Install the `media` audio decoder on `host`.
+/// Installs the `media` audio decoder with the shared [`StartupStats`]
+/// counter set.
 ///
 /// Call once, before any script runs. Opening a sound decodes the track
 /// through the build's decode chain (see [`decode_attempts`]) and installs
@@ -452,13 +453,6 @@ fn decode_with_mediacodec(
 /// [`Media`] backend.
 ///
 /// When every backend in the chain fails, the error names them all.
-pub fn install_audio_decoder(host: &CompatHost, media: &Media) {
-    let stats = StartupStats::new();
-    install_audio_decoder_metered(host, media, &stats);
-}
-
-/// Installs the `media` audio decoder with the shared [`StartupStats`]
-/// counter set.
 pub(crate) fn install_audio_decoder_metered(
     host: &CompatHost,
     media: &Media,

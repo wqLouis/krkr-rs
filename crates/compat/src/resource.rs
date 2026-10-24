@@ -1127,22 +1127,6 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, PrerenderedFontError> {
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
-/// The per-engine seam for the host's system-font directories.
-///
-/// L3 owns no platform paths, so the composition root supplies the list the
-/// L1 platform crate returns. The directories are scanned lazily, the first
-/// time a face is resolved from the host; install them before the game's
-/// startup script runs so no face has been resolved yet.
-impl crate::CompatHost {
-    /// Install the host's system-font directories on the shared text engine.
-    pub fn set_system_font_dirs(&self, dirs: Vec<std::path::PathBuf>) {
-        self.services()
-            .state::<ResourceResolver>()
-            .engine
-            .set_system_font_dirs(dirs);
-    }
-}
-
 #[cfg(test)]
 mod prerendered_tests {
     use super::*;

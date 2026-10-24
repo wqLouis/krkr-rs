@@ -33,9 +33,19 @@ pub trait NativePlugin {
     }
 
     /// Register the plugin's native classes on the VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompatError::Register`] when a class or a member of the
+    /// plugin cannot be registered on the VM.
     fn register(&self, ctx: &mut CompatCtx) -> Result<(), CompatError>;
 
     /// Optional per-frame hook (async triggers, video overlay, timers).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompatError::Engine`] when the hook cannot advance its
+    /// subsystem; the frame body stops at the first failing poll.
     fn poll(&self, _ctx: &mut CompatCtx) -> Result<(), CompatError> {
         Ok(())
     }
@@ -46,6 +56,10 @@ pub trait NativePlugin {
 ///
 /// `aliases` are additional DLL names that resolve to the same `register`,
 /// so the classes are registered once even when a game links several of them.
+///
+/// The entry *is* the [`NativePlugin`] implementation: adding a plugin to the
+/// table is one row rather than a trait impl.
+#[derive(Clone, Copy)]
 pub struct BuiltinPluginDef {
     /// The canonical DLL name (`"layerExDraw.dll"`).
     pub name: &'static str,
@@ -60,30 +74,7 @@ pub struct BuiltinPluginDef {
     pub register: fn(&mut CompatCtx) -> Result<(), CompatError>,
 }
 
-/// A built-in plugin whose classes are registered by a plain function.
-///
-/// The registry is assembled from the table, so adding a ported plugin is one
-/// entry rather than a trait impl.
-pub struct BuiltinPlugin {
-    name: &'static str,
-    aliases: &'static [&'static str],
-    dependencies: &'static [&'static str],
-    register: fn(&mut CompatCtx) -> Result<(), CompatError>,
-}
-
-impl BuiltinPlugin {
-    /// Creates a built-in plugin entry from a [`BuiltinPluginDef`].
-    pub const fn new(def: &BuiltinPluginDef) -> Self {
-        Self {
-            name: def.name,
-            aliases: def.aliases,
-            dependencies: def.dependencies,
-            register: def.register,
-        }
-    }
-}
-
-impl NativePlugin for BuiltinPlugin {
+impl NativePlugin for BuiltinPluginDef {
     fn name(&self) -> &str {
         self.name
     }
@@ -108,8 +99,7 @@ pub enum PluginOutcome {
     Builtin,
     /// The plugin is not emulated; the null-plugin path was taken. The null
     /// object becomes `global[stem]` only when that name is not already
-    /// bound — an existing binding is kept, never clobbered (see
-    /// [`crate::null_plugin`]).
+    /// bound — an existing binding is kept, never clobbered.
     Null,
 }
 
@@ -139,8 +129,8 @@ struct LinkedEntry {
 ///
 /// `link` is idempotent: a name that was already activated is not registered
 /// twice (the C++ side rejects duplicate class names). A name with no
-/// built-in emulation installs the [null plugin object](crate::null_plugin)
-/// instead — the single documented exception, and it is not silent
+/// built-in emulation installs the null plugin object instead — the single
+/// documented exception, and it is not silent
 /// (every member access logs a warning). The null global is installed only
 /// where the stem is free: a `global[stem]` that already holds a native
 /// class or script value is kept, and `unlink` then leaves it alone.
@@ -166,7 +156,7 @@ impl PluginRegistry {
     /// An empty registry (no built-in emulations yet).
     ///
     /// The startup modules are marked registered because
-    /// [`crate::install`] always puts their surface on the VM before any
+    /// The host's install always puts their surface on the VM before any
     /// script runs, whichever registry the host was built with.
     pub fn new() -> Self {
         Self {
@@ -183,18 +173,16 @@ impl PluginRegistry {
 
     /// The built-in registry assembled at startup.
     ///
-    /// Every ported plugin (the table in
-    /// [`crate::natives::plugins::BUILTIN_PLUGINS`]) is added here. The
-    /// modules available before any script runs
-    /// ([`crate::natives::plugins::STARTUP_PLUGINS`], today `xp3filter.dll`)
-    /// are marked registered by [`Self::new`]; a later `Plugins.link` of any
+    /// Every plugin in the built-in table is added here. The module
+    /// available before any script runs (today `xp3filter.dll`) is marked
+    /// registered by [`Self::new`]; a later `Plugins.link` of any
     /// other built-in activates it and registers its classes. A name that is
     /// not in the table falls back to the null plugin object — installed only
     /// where the stem is free.
     pub fn builtin() -> Self {
         let mut registry = Self::new();
         for def in crate::natives::plugins::BUILTIN_PLUGINS {
-            registry.register(Box::new(BuiltinPlugin::new(def)));
+            registry.register(Box::new(*def));
         }
         registry
     }
@@ -239,10 +227,16 @@ impl PluginRegistry {
     /// Activate a plugin name: register the built-in emulation, or install
     /// the null plugin object when none exists — never over a `global[stem]`
     /// that is already bound (that binding wins and is preserved on
-    /// [`Self::unlink`]; see [`crate::null_plugin`]).
+    /// [`Self::unlink`]).
     ///
-    /// The null hook class must already be registered (the host does this in
-    /// [`crate::install`]).
+    /// The null hook class must already be registered (the host does this
+    /// when it installs the compatibility surface).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompatError::Register`] when the plugin's own registration
+    /// fails, or when the null-plugin object cannot be created or installed as
+    /// a script global.
     pub fn activate(&self, name: &str, ctx: &mut CompatCtx) -> Result<PluginOutcome, CompatError> {
         let key = normalize_plugin_name(name);
         if let Some(kind) = self.linked_kind(&key) {
@@ -302,6 +296,11 @@ impl PluginRegistry {
     /// A plugin that no script has linked has no script-visible surface and
     /// owns no per-frame hook, so its `poll` must not run: the `registered`
     /// set is the same one `activate` fills on the first link.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error a plugin's `poll` reports; the remaining
+    /// plugins do not run after it.
     pub fn poll(&self, ctx: &mut CompatCtx) -> Result<(), CompatError> {
         let registered = self
             .registered
@@ -332,6 +331,11 @@ impl PluginRegistry {
     /// activates its built-in emulation, an unported name gets the null-plugin
     /// object and one warning (the reference tries to load the DLL and creates
     /// no global when it fails).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompatError::Register`] when a named plugin cannot be
+    /// registered. The names already linked stay linked.
     pub fn autoload<I, S>(&self, names: I, ctx: &mut CompatCtx) -> Result<(), CompatError>
     where
         I: IntoIterator<Item = S>,

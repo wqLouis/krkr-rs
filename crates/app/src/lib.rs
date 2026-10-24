@@ -1,13 +1,15 @@
-//! krkr-rs host assembly: the middle-layer engine plus the stateless services
-//! the composition root holds, wired to the L1 platform by the `krkr` binary.
+//! krkr-rs host assembly: the middle-layer engine, wired to the L1
+//! platform by the `krkr` binary.
 //!
-//! [`Host`] wraps the middle-layer [`engine::Engine`] together with the two
-//! stateless bottom objects the composition root also keeps ([`FileSystem`]
-//! and [`Media`]). Every evolving value — the TVP layer system [`Scene`], the
-//! projected [`RenderScene`], the [`RenderState`]/[`Surface`] pair, the
-//! bitmap-id → [`Texture`] table, the timer registry and the script-visible
-//! input state — belongs to the engine, so the host holds no frame state of
-//! its own and drives one engine frame per [`Host::step`].
+//! [`Host`] wraps the middle-layer [`engine::Engine`] and nothing else.
+//! Every evolving value — the layer tree [`Scene`], the projected
+//! [`RenderScene`], the [`RenderState`]/[`Surface`] pair, the bitmap-id →
+//! [`Texture`] table, the timer registry and the script-visible input state
+//! — belongs to the engine, so the host holds no frame state of its own and
+//! drives one engine frame per [`Host::step`]. The stateless L1 services are
+//! created where they are used: the pipeline and the surface by
+//! [`Host::new`], the file system and the media backend by
+//! [`GameHost::open_with_preload`].
 //!
 //! There are no globals, statics or hidden caches: every value is a local
 //! field of [`Host`] and is passed to the bottom objects explicitly. Two
@@ -35,28 +37,24 @@ use api::config::{CacheLimit, FrameRateLimit};
 use api::error::RenderError;
 use api::host::SurfaceEvent;
 use engine::Scene;
-use fs::FileSystem;
-use media::Media;
 use overlay::Overlay;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use render::{
-    FrameTimings, PipelineConfig, RenderPipeline, RenderScene, RenderState, Surface, Texture,
-    TextureFormat, begin_render_state, begin_render_state_with_display, create_render_pipeline,
+    FrameTimings, PipelineConfig, RenderScene, RenderState, Surface, Texture, TextureFormat,
+    begin_render_state, begin_render_state_with_display, create_render_pipeline,
 };
 
-pub use audio::install_audio_decoder;
 pub(crate) use audio::install_audio_decoder_metered;
 pub use game::{GameError, GameHost};
-pub(crate) use image_codec::install_image_codec_metered;
-pub use image_codec::{install_image_codec, install_image_codec_on, install_image_decoder};
-pub use render::{BackendKind, FrameStats};
+pub use image_codec::install_image_codec;
+pub(crate) use image_codec::{install_image_codec_metered, install_image_decoder};
+pub use render::BackendKind;
 // The emulator entry point. A launcher resolves `Launch` (including the
 // `RuntimeConfig` it loaded its own way) and calls `run`; see the `runner`
 // module for the entry point contract.
-pub use runner::{GameInput, Launch, RunMode, RunReport, run};
-pub use video::install_video_source;
+pub use runner::{GameInput, Launch, RunError, RunMode, RunReport, run};
 pub(crate) use video::install_video_source_metered;
-pub use window_ex::install_window_ex_facts;
+pub(crate) use window_ex::install_window_ex_facts;
 
 /// Errors surfaced by [`Host`].
 ///
@@ -183,24 +181,6 @@ impl HostConfig {
         self
     }
 
-    /// Returns this configuration with a different surface size.
-    pub fn with_surface_size(mut self, size: (u32, u32)) -> Self {
-        self.surface_size = size;
-        self
-    }
-
-    /// Returns this configuration bound to a real window handle.
-    pub fn with_window_handle(mut self, handle: RawWindowHandle) -> Self {
-        self.window_handle = Some(handle);
-        self
-    }
-
-    /// Returns this configuration bound to a display handle.
-    pub fn with_display_handle(mut self, display: RawDisplayHandle) -> Self {
-        self.display_handle = Some(display);
-        self
-    }
-
     /// Returns this configuration with the debug overlay enabled or disabled.
     pub fn with_debug_overlay(mut self, debug_overlay: bool) -> Self {
         self.debug_overlay = debug_overlay;
@@ -214,8 +194,7 @@ impl HostConfig {
     }
 }
 
-/// The assembled host: the middle-layer engine plus the stateless services
-/// the composition root also holds.
+/// The assembled host: the middle-layer engine and the frame it owns.
 ///
 /// See the crate documentation for the ownership model. Callers reach the
 /// layer system through [`Host::scene`] / [`Host::scene_mut`] and drive
@@ -224,10 +203,6 @@ pub struct Host {
     /// The middle-layer engine: scene, projection, textures, timers, input
     /// and the frame clock.
     engine: engine::Engine,
-    /// Stateless file-system service (constructed, not yet exercised).
-    fs: FileSystem,
-    /// Stateless media service (constructed, not yet exercised).
-    media: Media,
 }
 
 /// A frame hook that does nothing, for a host with no game above it.
@@ -242,8 +217,9 @@ impl engine::GameFrame for EmptyFrame {
 impl Host {
     /// Creates a host and its surface from `config`.
     ///
-    /// The file system is an in-memory root and the media object uses its
-    /// default configuration; the host does not exercise either yet.
+    /// The host owns the engine and the render pipeline the engine draws
+    /// through; it keeps no file system and no media backend, because it
+    /// exercises neither.
     ///
     /// # Errors
     ///
@@ -263,8 +239,6 @@ impl Host {
             validation: config.validation,
             frame_interval: config.frame_interval,
         })?;
-        let fs = FileSystem::memory();
-        let media = Media::new();
 
         let headless_handle;
         let handle: &RawWindowHandle = if config.headless {
@@ -304,7 +278,7 @@ impl Host {
             engine.scene_mut().set_decoded_image_cache_limit(limit);
         }
 
-        Ok(Self { engine, fs, media })
+        Ok(Self { engine })
     }
 
     /// Advances the host by one frame and presents it.
@@ -369,32 +343,22 @@ impl Host {
         Ok(self.engine.resize(size)?)
     }
 
-    /// Returns the stateless render pipeline.
-    pub fn pipeline(&self) -> &RenderPipeline {
-        self.engine.pipeline()
-    }
-
     /// Returns the backend the pipeline was created with.
     pub fn backend(&self) -> BackendKind {
         self.engine.backend()
     }
 
-    /// Returns the file-system service (constructed, not yet used).
-    pub fn fs(&self) -> &FileSystem {
-        &self.fs
-    }
-
-    /// Returns the media service (constructed, not yet used).
-    pub fn media(&self) -> &Media {
-        &self.media
-    }
-
-    /// Returns the TVP layer system.
+    /// Returns the layer tree.
     pub fn scene(&self) -> &Scene {
         self.engine.scene()
     }
 
-    /// Returns the TVP layer system for script-driven mutation.
+    /// Returns the layer tree for script-driven mutation.
+    ///
+    /// A field written through this mutable handle does **not** bump the
+    /// scene's structure revision, so the next frame reuses the projected tree
+    /// and the change is not drawn. A change the projection must see goes
+    /// through the scene's own mutable accessors, which bump the revision.
     pub fn scene_mut(&mut self) -> &mut Scene {
         self.engine.scene_mut()
     }
@@ -460,11 +424,6 @@ impl Host {
     /// Returns the frame clock of the most recent frame.
     pub fn elapsed_ms(&self) -> f64 {
         self.engine.elapsed_ms()
-    }
-
-    /// Returns the null backend's counters for the last frame, if available.
-    pub fn last_frame(&self) -> Option<FrameStats> {
-        self.engine.last_frame()
     }
 
     /// Returns the presentation calls' costs for the last presented frame.

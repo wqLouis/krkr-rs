@@ -1,4 +1,4 @@
-//! TVP layer-system state model (L2).
+//! The layer-system state model.
 //!
 //! This is the state half of the middle layer: the logical `Scene` value and
 //! its windows, layers, bitmaps and fonts, plus every CPU operation on them.
@@ -1188,6 +1188,15 @@ impl Scene {
     /// store that index. The insertion point is the first sibling whose
     /// absolute index is not less than the requested value, compensating for
     /// the removed layer when it moves forward.
+    ///
+    /// The layer keeps its place in the tree; only its draw position changes.
+    ///
+    /// # Errors
+    ///
+    /// The message names the reason the move was refused: the layer no longer
+    /// exists, it has no parent (the primary layer and a siblingless layer
+    /// cannot be moved), or the sibling list no longer holds it. The scene is
+    /// left unchanged when the move is refused.
     pub fn set_absolute_order_index(&mut self, id: u32, absolute: i32) -> Result<(), String> {
         let Some(layer) = self.layer(id) else {
             return Err("Layer: layer no longer exists".to_string());
@@ -1237,6 +1246,16 @@ impl Scene {
     /// Require a parent, leave absolute order mode, clamp the requested
     /// position to the sibling range, move the layer there, and renumber the
     /// siblings so the relative order index equals the draw position.
+    ///
+    /// The requested position is clamped to the sibling range; it is never an
+    /// error to ask for a position outside it.
+    ///
+    /// # Errors
+    ///
+    /// The message names the reason the move was refused: the layer no longer
+    /// exists, it has no parent (the primary layer and a siblingless layer
+    /// cannot be moved), or the parent no longer holds the layer. The scene is
+    /// left unchanged when the move is refused.
     pub fn set_order_index(&mut self, id: u32, order: i32) -> Result<(), String> {
         let Some(layer) = self.layer(id) else {
             return Err("Layer: layer no longer exists".to_string());

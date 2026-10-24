@@ -198,7 +198,7 @@ string, or an object's `text`, `char` or `character` member.
 
 | Seam | Installed by | Purpose |
 |---|---|---|
-| `set_image_codec(decode, probe, save)` | `CompatHost` (defined in `natives/visual/bitmap.rs`) | the L1 `media` image codec |
+| `set_image_codec(decode, probe, save)` | `CompatHost` (defined in `host.rs`) | the L1 `media` image codec |
 | `set_system_font_dirs(dirs)` | the composition root, on the L2 `TextEngine` | where the host's system fonts live |
 
 The L2 `TextEngine` itself, the `System.addFont` registry and the attached

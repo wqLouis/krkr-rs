@@ -15,7 +15,7 @@
 //! The test harness derives the archive list from the directory; the product
 //! load path (`krkr --archive …`) never scans (doc 09 §1).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use app::{GameHost, Host, HostConfig};
 
@@ -29,16 +29,7 @@ fn boots_the_real_game() {
     let dir = Path::new(&dir);
 
     // The product takes an explicit list; the test derives one for convenience.
-    let mut archives: Vec<PathBuf> = std::fs::read_dir(dir)
-        .expect("list game directory")
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("xp3"))
-        })
-        .collect();
-    archives.sort();
+    let archives = testkit::game_archives(dir).expect("list game directory");
 
     let host = Host::new(HostConfig::headless()).expect("create host");
     let mut game = GameHost::open(host, archives, dir.to_path_buf()).expect("open game");

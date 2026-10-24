@@ -253,7 +253,7 @@ missing registry and the missing owner handle.
 | Seam | Purpose |
 |---|---|
 | `attach_timer(*mut TimerState)` | the L2 registry |
-| `compat::timer_posts_poll(&mut ctx)` | the frame body's timer drain |
+| `timer_posts_poll(&mut ctx)` | the frame body's timer drain (crate-internal) |
 | `compat::timer_poll(&mut ctx)` | the combined form for a host or test that drives the registry itself |
 | `CompatHost::timer_count()` | the retention-leak diagnostic |
 

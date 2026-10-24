@@ -1,14 +1,17 @@
-//! krkr-rs middle layer.
+//! The engine: the layer that owns every evolving value.
 //!
-//! Owns all state: the TVP layer system, the storage namespace, the mixer,
-//! and every bottom-defined state value (`RenderScene`, `RenderState`,
-//! `FileState`, decoder states). Performs actions on the stateless bottom
-//! objects.
+//! The crate owns the scene (windows, layers, bitmaps, fonts), the storage
+//! namespace, the mixer, the timer registry, the input state, the text
+//! engine, the video overlay and the transition machine, plus the state
+//! values the stateless platform services take (`RenderState`, `FileState`,
+//! the decoder states). It performs actions on the stateless platform
+//! objects and keeps no process-global state: every value is a field of a
+//! caller-owned object.
 //!
-//! This crate must not depend on Bevy, wgpu, `ash`, winit, FFmpeg, cpal or any
-//! render/media backend. The storage namespace is the exception: it is built
-//! over the bottom [`fs::FileSystem`] object, while the remaining bottom
-//! services are reached through the API types ([`api`]).
+//! The crate depends on the platform type crates (`api`, `fs` and `render`)
+//! and on no render or media backend. The storage namespace is built over the
+//! platform [`fs::FileSystem`] object; the remaining platform services are
+//! reached through the API types ([`api`]).
 //!
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -35,43 +38,40 @@ pub mod trans;
 pub mod translate;
 pub mod video;
 
-pub use api::config::CacheLimit;
+// The crate root is a curated surface: it re-exports the names a consumer
+// reaches through `engine::`, and nothing else. Every other item stays
+// reachable through the module that owns it (`engine::layer_ops`,
+// `engine::raster`, `engine::projection`, `engine::scene`,
+// `engine::shader`, `engine::storage`, `engine::startup`, …), so the flat
+// root never becomes an accidental copy of the crate's whole API.
 
-// Archive name normalization is a shared storage-naming rule; the parser
-// itself now lives in L1 `fs::xp3`.
-pub use fs::xp3::normalize_in_archive_name;
-// The fixed-seed lookup map the engine keys its per-bitmap tables with.
+// The frame owner: the clock, the timer pump, the projection and the single
+// render call, plus the one upward hook the composition root implements.
 pub use crate::engine::{
     Engine, EngineError, EngineOverlay, EngineParts, FrameReport, GameFrame, ObjectCounts,
 };
+// The fixed-seed lookup map the engine keys its per-bitmap tables with.
 pub use crate::hasher::Map;
-// The image decode pool and the pending-image future.
-pub use crate::imagedecode::{
-    DEFAULT_MEMORY_LIMIT, DecodePool, DecodePoolConfig, DecodePoolError, ImageDecodeError,
-    ImageDecoder, ImageOutcome, ImageSizeError, ImageState, JobId, PendingImage,
-};
-// The storage read pool and the pending-read future.
-pub use crate::storage::{
-    ArchiveBacking, ArchiveSource, FileSystemReader, PendingStorage, StorageJob, StorageKey,
-    StorageOutcome, StoragePoolConfig, StoragePoolError, StoragePoolStats, StorageReadPool,
-    StorageReader,
-};
+// The image decode pool the engine owns and drains every frame.
+pub use crate::imagedecode::DecodePool;
+// The VM-to-device pixel mapping the engine applies when it projects.
 pub use crate::translate::{PixelTranslation, TranslateError};
-// Curated crate root. The
-// pixel primitives, blend-type numbering and TVP constants stay reachable
-// through their own modules (`layer_ops`, `raster`, `projection`, `scene`,
-// `storage`, `startup`); they are not part of the stable flat surface.
-pub use projection::{
-    ComposedLayer, ProjectionReport, compose_layer, project_scene, project_scene_report,
-    project_window, project_window_report, resolve_blend,
-};
+// Archive name normalization is a shared storage-naming rule; the parser
+// itself lives in `fs::xp3`.
+pub use fs::xp3::normalize_in_archive_name;
+// The scene: the logical tree the projection reads.
 pub use scene::{
     BitmapState, DecodedImageKey, DecodedImageMode, FontState, LayerState, Rect, Scene,
-    TransitionFrame, TransitionSource, WindowState,
+    TransitionFrame, TransitionSource,
 };
-pub use shader::{
-    EffectDraw, EffectPass, EffectPipelines, EffectTexture, LoadedProgram, PipelineId, Program,
-    ProgramDesc, ShaderError, ShaderId, ShaderLibrary,
+// The projection: the scene-to-render-tree conversion and the blend
+// resolution it applies.
+pub use projection::{
+    ComposedLayer, compose_layer, project_scene, project_window, project_window_report,
+    resolve_blend,
 };
+// The storage namespace: the mounts, the resolved locations and the typed
+// read errors.
+pub use storage::{Location, Storage, StorageReadError};
+// The startup-script discovery.
 pub use startup::{StartupError, discover_startup};
-pub use storage::{Location, MountError, PreloadError, Storage, StorageMetadata, StorageReadError};

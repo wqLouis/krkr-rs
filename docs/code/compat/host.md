@@ -36,10 +36,10 @@ is moved — the binding stores raw addresses and relies on that stability.
 
 1. **Refuses a second install** — `CompatError::Register("compat host is already installed")`.
 2. Builds a `CompatCtx` from the engine and services addresses.
-3. Calls `crate::install(&mut ctx)`, which registers the null-plugin hook,
-   then every native family, then the `Plugins` class. **Registration happens
-   before the binding**, so a registration failure leaves no half-installed
-   table.
+3. Calls the crate-internal `install(&mut ctx)`, which registers the
+   null-plugin hook, then every native family, then the `Plugins` class.
+   **Registration happens before the binding**, so a registration failure
+   leaves no half-installed table.
 4. Installs the process-wide binding ([`binding.md`](binding.md)). A failure
    here means a binding was already present.
 5. Points the VM's stream factories at the attached storage's game directory,
@@ -54,6 +54,9 @@ The `engine` argument must stay at a **stable address** for as long as the
 binding is installed — keep it behind a `Box` and do not move it afterwards.
 
 ### `uninstall(&mut self)`
+
+**Crate-internal.** The public teardown is `shutdown`, which also drops
+the dispatch state while the engine is alive.
 
 Idempotent. Removes the binding and forgets the cached no-op closure id so a
 later re-install against a different engine creates a fresh one. The service
@@ -81,14 +84,15 @@ destruction, which is safe but leaks the retention bookkeeping until then.
 | Method | Purpose |
 |---|---|
 | `services()` / `services_mut()` | the L2 service handles and the per-family state map — attach the scene, storage, input and timer **before** `install` |
-| `registry()` / `registry_mut()` | the plugin registry; add plugins before installing |
+| `registry()` | the plugin registry; a host that wants its own builds it with `PluginRegistry::new` and hands it to `with_registry` |
 | `with_registry(registry)` | a host that uses a **given** registry instead of the built-in one; `new()` is `with_registry(PluginRegistry::builtin())` |
 | `ctx()` | a dispatch context handle for the bound VM; `CompatError::Engine("compat host is not installed")` before `install` |
 | `is_bound()` | whether the binding is currently installed |
 | `set_video_source(spec, frames)` | install the host-decoded video source |
 | `set_clipboard_backend(backend)` | install the platform clipboard |
 | `set_desktop_rect(f)` | install the virtual-desktop rectangle (`System.desktop*`) |
-| `set_image_codec(decode, probe, save)` | install the host image codec (defined in `natives/visual/bitmap.rs`) |
+| `set_image_codec(decode, probe, save)` | install the host image codec (defined in `host.rs`) |
+| `set_system_font_dirs(dirs)` | install the host's system-font directories (defined in `host.rs`) |
 | `set_window_ex_*` | install the `windowEx.dll` host facts (defined in `natives/plugins/window_ex/host.rs`) |
 
 Every `set_*` seam installs a **closure**; a member whose closure is missing

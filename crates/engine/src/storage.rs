@@ -1,6 +1,6 @@
 //! Game storage namespace (L2).
 //!
-//! A [`Storage`] value owns everything needed to resolve TVP storage names:
+//! A [`Storage`] value owns everything needed to resolve a storage name:
 //!
 //! * an immutable bottom [`FileSystem`] object (created by L1) and the base
 //!   directory it is mounted at;
@@ -1511,14 +1511,14 @@ fn read_worker_loop(reader: Arc<dyn StorageReader>, shared: Arc<PoolShared>) {
 }
 
 /// The searched startup script (reference `TVPStartupScriptName`).
-pub const STARTUP_SCRIPT: &str = "startup.tjs";
+pub(crate) const STARTUP_SCRIPT: &str = "startup.tjs";
 /// The compatibility fallback run when `startup.tjs` is absent or fails
 /// (reference `system/Initialize.tjs`).
-pub const INITIALIZE_SCRIPT: &str = "system/Initialize.tjs";
+pub(crate) const INITIALIZE_SCRIPT: &str = "system/Initialize.tjs";
 /// `patch.tjs`, app-path only (reference `TVPExecuteStartupScript`).
-pub const PATCH_SCRIPT: &str = "patch.tjs";
+pub(crate) const PATCH_SCRIPT: &str = "patch.tjs";
 /// `AfterStartup.tjs`, app-path only (reference `TVPExecuteStartupScript`).
-pub const AFTER_STARTUP_SCRIPT: &str = "AfterStartup.tjs";
+pub(crate) const AFTER_STARTUP_SCRIPT: &str = "AfterStartup.tjs";
 
 /// The startup scripts resolved against a [`Storage`] (reference
 /// `TVPExecuteStartupScript`).
@@ -1554,6 +1554,13 @@ impl Storage {
     /// `fs` is the bottom file-system object; `base_dir` is the app path used
     /// for disk assets. An archive that cannot be opened or parsed is a typed
     /// error, because the caller asked for it.
+    ///
+    /// # Errors
+    ///
+    /// [`MountError`] when the base directory cannot be resolved, when an
+    /// archive cannot be opened or parsed, or when a preloaded archive cannot
+    /// be read into memory in full. The mount is abandoned at the first
+    /// failure; no archive is left half-mounted.
     pub fn mount_archives(
         fs: FileSystem,
         base_dir: impl Into<PathBuf>,
@@ -1594,6 +1601,12 @@ impl Storage {
     /// `TVPCheckArchive` catch-and-log
     /// (`reference/cpp/core/base/impl/StorageImpl.cpp:562-587`). Use
     /// [`Self::mount_archives`] for a caller-supplied list.
+    ///
+    /// # Errors
+    ///
+    /// [`MountError`] when the base directory cannot be resolved or when the
+    /// preload of the archive image fails. An archive that cannot be opened or
+    /// parsed is skipped and reported, not an error.
     pub fn mount_discovered_archives(
         fs: FileSystem,
         base_dir: impl Into<PathBuf>,
@@ -1611,6 +1624,12 @@ impl Storage {
     /// on a scanned archive is one more archive that is skipped and reported,
     /// exactly like a parse failure — preloading never changes which archive
     /// wins.
+    ///
+    /// # Errors
+    ///
+    /// [`MountError`] when the base directory cannot be resolved or when the
+    /// preload of the archive image fails. An archive that cannot be opened or
+    /// parsed is skipped and reported, not an error.
     pub fn mount_discovered_archives_with(
         fs: FileSystem,
         base_dir: impl Into<PathBuf>,
@@ -1717,6 +1736,12 @@ impl Storage {
     /// A preloaded archive's whole image is read in the background: the
     /// mount returns as soon as the index is parsed, and the image is filled
     /// while the game runs.
+    ///
+    /// # Errors
+    ///
+    /// [`MountError`] when the archive cannot be opened, when its container
+    /// cannot be parsed, or when the preload of the archive image fails. The
+    /// mount is left as it was; the failed archive is not registered.
     pub fn mount_archive(&mut self, path: impl AsRef<Path>) -> Result<(), MountError> {
         let raw = path.as_ref();
         let path = if raw.is_absolute() {
@@ -1887,6 +1912,12 @@ impl Storage {
     /// A storage without a read pool has no worker to schedule on: the lookup
     /// then reads the entry on the calling thread and answers with a handle
     /// that already holds the bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageReadError`] when the name is malformed (a `..` that escapes
+    /// the mount) or when a file-system failure occurs while probing. A name
+    /// that does not resolve is `Ok(None)`, never an error.
     pub fn lookup(&self, name: &str) -> Result<Option<PendingStorage>, StorageReadError> {
         if let Some(bytes) = self.media.borrow().get(name).cloned() {
             let size = bytes.len() as u64;
@@ -2089,6 +2120,12 @@ impl Storage {
     /// keeps the real filesystem spelling. A `..` component that escapes the
     /// mount is [`StorageReadError::InvalidPathName`] (`TVPInvalidPathName`),
     /// not a miss.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageReadError::InvalidPathName`] for a name that escapes the
+    /// mount, and a file-system error when the probe itself fails. A name that
+    /// does not resolve is `Ok(None)`.
     pub fn find(&self, name: &str) -> Result<Option<Location>, StorageReadError> {
         // The reference caches a resolved hit and never a miss
         // (`TVPAutoPathCache`; a miss is not cached,
@@ -2520,6 +2557,12 @@ impl Storage {
     /// Resolves an existing disk file for a storage name, case-insensitively.
     /// Returns the real on-disk path so writers can update the existing file
     /// instead of creating a case-variant duplicate.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageReadError::InvalidPathName`] for a name that escapes the
+    /// mount, and a file-system error when the probe itself fails. A name
+    /// that does not resolve to a disk file is `Ok(None)`.
     pub fn find_disk(&self, name: &str) -> Result<Option<PathBuf>, StorageReadError> {
         let Some(relative) = self.relative_disk_name_checked(name)? else {
             return Ok(None);
@@ -2545,6 +2588,11 @@ impl Storage {
     /// `Ok(None)` means `name` is not below the mount (including an in-archive
     /// name); a `..` that escapes the mount is
     /// [`StorageReadError::InvalidPathName`].
+    ///
+    /// # Errors
+    ///
+    /// [`StorageReadError::InvalidPathName`] for a name that escapes the
+    /// mount, and a file-system error when the directory listing fails.
     pub fn local_name(&self, name: &str) -> Result<Option<PathBuf>, StorageReadError> {
         local_name_in(&self.fs, &self.game_dir, name)
     }
@@ -2716,6 +2764,12 @@ impl Storage {
     }
 
     /// Reads a storage entry to bytes (disk file or archive member).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageReadError::NotFound`] when the name does not resolve, and a
+    /// file-system or archive error when the entry cannot be read. A failed
+    /// read never yields an empty buffer.
     pub fn read(&self, name: &str) -> Result<Vec<u8>, StorageReadError> {
         if let Some(bytes) = self.media.borrow().get(name).cloned() {
             self.count_read_bytes(bytes.len());
@@ -2745,6 +2799,11 @@ impl Storage {
     /// This is our own API: the reference exposes a seekable per-member stream
     /// (`tTVPXP3ArchiveStream`) instead. Resolution and filter semantics are
     /// [`Self::read`]'s.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageReadError::NotFound`] when the name does not resolve, and a
+    /// file-system or archive error when the entry cannot be read.
     pub fn read_prefix(&self, name: &str, max_len: usize) -> Result<Vec<u8>, StorageReadError> {
         if let Some(mut bytes) = self.media.borrow().get(name).cloned() {
             bytes.truncate(max_len);
@@ -2863,6 +2922,12 @@ impl Storage {
     ///
     /// A name that does not resolve is `Ok(None)`; a file-system failure while
     /// probing propagates.
+    ///
+    /// # Errors
+    ///
+    /// A file-system error while probing, and
+    /// [`StorageReadError::InvalidPathName`] for a name that escapes the
+    /// mount. A name that does not resolve is `Ok(None)`.
     pub fn stat(&self, name: &str) -> Result<Option<StorageMetadata>, StorageReadError> {
         match self.find(name)? {
             Some(Location::Disk(path)) => {
@@ -2896,6 +2961,12 @@ impl Storage {
     /// This matches `TVPIsExistentStorage`, which reports directories as
     /// existing; [`Self::find`] itself is file-only. A file-system failure
     /// while probing propagates.
+    ///
+    /// # Errors
+    ///
+    /// A file-system error while probing, and
+    /// [`StorageReadError::InvalidPathName`] for a name that escapes the
+    /// mount. A name that does not resolve is `Ok(false)`.
     pub fn exists(&self, name: &str) -> Result<bool, StorageReadError> {
         if self.media.borrow().contains_key(name) {
             return Ok(true);
@@ -2947,6 +3018,11 @@ impl Storage {
     ///
     /// A missing or non-directory `dir` lists nothing (it does not error);
     /// only a bottom file-system failure propagates.
+    ///
+    /// # Errors
+    ///
+    /// A file-system failure while listing the directory. A missing or
+    /// non-directory `dir` is not an error.
     pub fn list(&self, dir: &str) -> Result<Vec<String>, StorageReadError> {
         let normalized = normalize_in_archive_name(dir);
         let normalized = normalized.trim_end_matches('/').to_string();
@@ -3015,6 +3091,11 @@ impl Storage {
     ///
     /// A genuine file-system failure while walking the disk tree propagates;
     /// only a missing or non-directory subtree is treated as empty.
+    ///
+    /// # Errors
+    ///
+    /// A file-system failure while walking the disk tree. A missing or
+    /// non-directory subtree is not an error; it contributes no names.
     pub fn file_list(&self, mask: &str, attr: i64) -> Result<Vec<String>, StorageReadError> {
         let mask = normalize_in_archive_name(mask);
         let (arc_pat, in_arc_mask) = match mask.split_once('>') {
@@ -3267,6 +3348,12 @@ fn relative_disk_name_checked(
 /// lowercased form of a mixed-case on-disk path (the shape
 /// `System.dataPath` produces) resolves to the real spelling instead of
 /// creating a second lowercase tree.
+///
+/// # Errors
+///
+/// [`StorageReadError::InvalidPathName`] for a name that escapes `game_dir`,
+/// and a file-system error when the directory listing fails. A name that is
+/// not below `game_dir` (including an in-archive name) is `Ok(None)`.
 pub fn local_name_in(
     fs: &FileSystem,
     game_dir: &Path,

@@ -2376,11 +2376,17 @@ extern "C" fn window_touch_rotate_threshold_set(
 }
 
 /// Drain the queued `Window.bringToFront` requests (`(window_id)`).
+///
+/// The queue is emptied; the returned window ids are the scene ids the
+/// script asked to raise.
 pub fn take_bring_to_front_requests(services: &crate::CompatServices) -> Vec<u32> {
     std::mem::take(&mut services.state::<VisualState>().bring_to_front)
 }
 
 /// Drain the queued `Window.update` requests (`(window_id, update_type)`).
+///
+/// The queue is emptied; the returned pairs are the scene ids the script
+/// asked to redraw and the update type it passed.
 pub fn take_update_requests(services: &crate::CompatServices) -> Vec<(u32, i32)> {
     std::mem::take(&mut services.state::<VisualState>().update_requests)
 }

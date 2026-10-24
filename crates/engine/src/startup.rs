@@ -17,7 +17,10 @@
 use api::error::FsError;
 use api::fs::FsPath;
 
-use crate::storage::{Location, Storage, StorageReadError};
+use crate::storage::{
+    AFTER_STARTUP_SCRIPT, INITIALIZE_SCRIPT, Location, PATCH_SCRIPT, STARTUP_SCRIPT, Storage,
+    StorageReadError,
+};
 
 /// The resolved sequence of startup scripts.
 ///
@@ -86,13 +89,21 @@ pub enum StartupError {
 ///   through [`Storage::find`].
 /// * When `startup.tjs` is absent, `system/Initialize.tjs` is the fallback;
 ///   a miss on both is [`StartupError::NoStartupScript`].
+///
+/// # Errors
+///
+/// [`StartupError::NoStartupScript`] when neither `startup.tjs` nor
+/// `system/Initialize.tjs` exists, [`StartupError::Fs`] when the app-path
+/// probe fails, and [`StartupError::Storage`] when a storage lookup fails.
+/// A plain miss on the app path is not an error: the optional scripts are
+/// reported as absent.
 pub fn discover_startup(storage: &Storage) -> Result<StartupScripts, StartupError> {
-    let patch = app_path_file(storage, "patch.tjs")?;
-    let after_startup = app_path_file(storage, "AfterStartup.tjs")?;
+    let patch = app_path_file(storage, PATCH_SCRIPT)?;
+    let after_startup = app_path_file(storage, AFTER_STARTUP_SCRIPT)?;
 
-    let startup = match storage.find("startup.tjs")? {
+    let startup = match storage.find(STARTUP_SCRIPT)? {
         Some(location) => StartupScript::Startup(location),
-        None => match storage.find("system/Initialize.tjs")? {
+        None => match storage.find(INITIALIZE_SCRIPT)? {
             Some(location) => StartupScript::Initialize(location),
             None => return Err(StartupError::NoStartupScript),
         },

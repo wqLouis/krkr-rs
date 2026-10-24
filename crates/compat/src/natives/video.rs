@@ -161,6 +161,9 @@ pub(crate) fn set_source(services: &CompatServices, spec: VideoSpec, frames: Vec
 /// [`CompatHost::set_video_source`](crate::CompatHost::set_video_source): the
 /// composition root installs a decoder-backed source that opens each path on
 /// demand. `open` raises when no source has been installed.
+///
+/// The source is owned by the host's dispatch state and lives as long as the
+/// host does; it is called from the VM's single thread.
 pub fn set_video_source(ctx: &CompatCtx, source: Box<dyn VideoSource>) {
     // SAFETY: the caller holds a live, bound context.
     let services = unsafe { ctx.services() };
@@ -2593,6 +2596,11 @@ const MODE_MIXER: i64 = 2;
 /// The frame body passes its own per-frame `dt`; the advance never reads wall
 /// time. The host bounds the step by the same cap its audio pump puts on one
 /// frame's playback, so the picture and the sound fall behind together.
+///
+/// # Errors
+///
+/// Returns [`CompatError::Engine`] when an overlay cannot be advanced or
+/// its frame cannot be composited into the script layers.
 pub fn video_advance(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
     // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `video_advance`.
     let host = unsafe { ctx.engine() };

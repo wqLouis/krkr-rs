@@ -67,7 +67,7 @@ pub(crate) fn blend_pixel_raw(
 /// This is the per-pixel core of [`blend_pixel`], without the bitmap bounds
 /// check: the caller owns the pixel, so the operation can run on a row slice
 /// of a destination bitmap.
-pub fn blend_pixel_at(pixel: &mut [u8; 4], color: [u8; 4], coverage: u8, opa: u8) {
+pub(crate) fn blend_pixel_at(pixel: &mut [u8; 4], color: [u8; 4], coverage: u8, opa: u8) {
     let alpha = (u32::from(color[3]) * u32::from(coverage) * u32::from(opa) / (255 * 255)) as u8;
     if alpha == 0 {
         return;
@@ -219,16 +219,6 @@ fn bounds(pts: &[(f64, f64)]) -> Option<(i32, i32, i32, i32)> {
         max_x.ceil() as i32,
         max_y.ceil() as i32,
     ))
-}
-
-/// The layer-wide allocation size needed to contain an open polyline.
-pub fn bbox_size(pts: &[(f64, f64)]) -> (u32, u32) {
-    let (mut max_x, mut max_y) = (0.0f64, 0.0f64);
-    for &(x, y) in pts {
-        max_x = max_x.max(x);
-        max_y = max_y.max(y);
-    }
-    (max_x.ceil().max(1.0) as u32, max_y.ceil().max(1.0) as u32)
 }
 
 /// Fill a closed polygon with a flat color (even-odd rule), anti-aliased by

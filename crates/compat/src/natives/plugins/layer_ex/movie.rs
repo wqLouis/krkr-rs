@@ -123,6 +123,9 @@ impl Default for LayerExMovieState {
 /// L3 owns no decoder: the host installs the same [`VideoSource`] it uses for
 /// `VideoOverlay` (or any other implementation) so `openMovie` can read the
 /// stream metadata and the frame body can present frames.
+///
+/// The source is owned by the host's dispatch state and lives as long as the
+/// host does; it is called from the VM's single thread.
 pub fn set_movie_source(ctx: &CompatCtx, source: Box<dyn VideoSource>) {
     // SAFETY: the caller holds a live, bound context.
     let services = unsafe { ctx.services() };
@@ -353,6 +356,11 @@ fn copy_frame(ctx: &CompatCtx, slot: &MovieSlot) {
 /// `compat::video_poll`) so a host can drive it directly. The host bounds
 /// the step by the same cap its audio pump puts on one frame's playback, so
 /// the picture and the sound fall behind together.
+///
+/// # Errors
+///
+/// Returns [`CompatError::Engine`] when a movie cannot be advanced or its
+/// frame cannot be composited into the layer.
 pub fn movie_poll(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
     // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `movie_poll`.
     let host = unsafe { ctx.engine() };

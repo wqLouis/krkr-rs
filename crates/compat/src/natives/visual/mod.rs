@@ -94,7 +94,10 @@ mod layer;
 mod timer;
 mod window;
 
-pub use timer::{timer_poll, timer_posts_poll};
+pub use timer::timer_poll;
+// The frame body's own drain of the queued `onTimer` events: the frame body
+// runs it, no host calls it.
+pub(crate) use timer::timer_posts_poll;
 
 /// The number of live `Timer` bindings in the dispatch state.
 ///

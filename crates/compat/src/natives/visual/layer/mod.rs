@@ -91,6 +91,11 @@ struct LayerTransition {
 /// stable frame calls no pixel work. Cached layers are visited deepest first,
 /// so a parent composites through the cache its children publish in the same
 /// pass instead of waiting for the next frame to see it.
+///
+/// # Errors
+///
+/// Returns the composite failure of one cached layer as a message; the
+/// other layers are still composited.
 pub fn refresh_cached_layers(ctx: &crate::CompatCtx) -> Result<(), String> {
     let (structure, content) = {
         let scene = scene_ref(ctx)?;
@@ -1436,6 +1441,11 @@ extern "C" fn layer_update(
 ///
 /// The clear happens **before** the call, like the reference, so a re-entrant
 /// `update()` from inside `onPaint` persists to the next frame's dispatch.
+///
+/// # Errors
+///
+/// Returns the failure of one `onPaint` handler as a message; the other
+/// layers still receive their event.
 pub fn paint_poll(ctx: &CompatCtx) -> Result<(), String> {
     let ids: Vec<u32> = scene_ref(ctx)?
         .layers

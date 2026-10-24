@@ -60,9 +60,12 @@ therefore contains no `#[cfg(target_os = …)]` of its own.
 
 ## 3. The two hosts
 
-`Host` is the assembled **engine host**: the L2 `Engine` plus the two
-stateless services the root also holds (`FileSystem`, `Media`). It has no
-frame state of its own; `Host::step` drives exactly one engine frame.
+`Host` is the assembled **engine host**: the L2 `Engine` and the frame it
+owns. It has no frame state of its own; `Host::step` drives exactly one
+engine frame. The stateless L1 services are created where they are used — the
+pipeline and the surface by `Host::new`, the file system and the media
+backend by `GameHost::open_with_preload` — so the host holds no copy of a
+service it does not exercise.
 
 `GameHost` is the **game host**: `Host` plus the L4 `VmHost`, the mounted
 `Storage`, the L1 audio device and the ordered frame body. It is the
@@ -100,23 +103,22 @@ pub struct Launch { runtime, backend, game, mode }
 pub enum RunMode { Headless { frames: u32 }, Windowed }
 pub struct GameInput { base_dir: PathBuf, archives: Vec<PathBuf> }
 pub struct RunReport { last_frame: Option<StepReport> }
-pub fn run(launch: Launch) -> Result<RunReport, String>;
+pub enum RunError { Host(HostError), Game(GameError), Platform(PlatformError) }
+pub fn run(launch: Launch) -> Result<RunReport, RunError>;
 
-// the seams a launcher may install itself
-pub fn install_audio_decoder(host: &CompatHost, media: &Media);
+// the one seam a launcher may install itself
 pub fn install_image_codec(host: &CompatHost, media: &Media, storage: &Storage);
-pub fn install_image_codec_on(host: &CompatHost, media: &Media, fs: FileSystem, base: PathBuf);
-pub unsafe fn install_video_source(host: &CompatHost, media: &Media, storage: &Storage)
-    -> Result<(), CompatError>;
-pub fn install_window_ex_facts(host: &CompatHost, surface_size: (u32, u32));
 
 // re-exported from L1
-pub use render::{BackendKind, FrameStats};
+pub use render::BackendKind;
 ```
 
-The `install_*` functions are public because a launcher that embeds the
-emulator may own its own services; `GameHost::open` installs the same seams
-with the shared start-up counters.
+The audio decoder, the image codec, the video source and the emulated
+Windows host facts are installed by `GameHost::open` with the shared
+start-up counters; only the image codec is public, because a launcher that
+embeds the emulator may own its own storage. `run` reports a typed
+`RunError`, so the host, the game and the platform failures stay
+distinguishable instead of being flattened into a message.
 
 ---
 
@@ -201,7 +203,8 @@ scan and the project-path choice (`game.rs`), the chunk arithmetic
 
 The tests that bind the process-global VM serialize on a mutex: the VM keeps
 process-global state, so two engines may not run at once. `testkit::vm_lock`
-is the shared helper.
+is the shared helper, and `testkit::game_archives` derives the archive list
+a real-game test mounts.
 
 ---
 

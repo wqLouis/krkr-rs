@@ -38,8 +38,9 @@ pub trait NativePlugin {
 | `register` | registers the plugin's native classes on the VM |
 | `poll` | an optional per-frame hook |
 
-`BuiltinPlugin` is the trait implementation over a plain function pointer, so
-adding a ported plugin is **one table entry** rather than a trait impl.
+`BuiltinPluginDef` *is* the `NativePlugin` implementation over a plain
+function pointer, so adding a ported plugin is **one table entry** rather than a
+trait impl.
 
 ---
 

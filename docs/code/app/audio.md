@@ -19,7 +19,11 @@ links a codec and never sees a device.
 ## 1. The decoder seam
 
 ```rust
-pub fn install_audio_decoder(host: &CompatHost, media: &Media);
+pub(crate) fn install_audio_decoder_metered(
+    host: &CompatHost,
+    media: &Media,
+    stats: &Rc<StartupStats>,
+);
 ```
 
 The installation marks the mixer as render-driven and adds one decoder to

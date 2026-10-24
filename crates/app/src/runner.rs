@@ -10,9 +10,12 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use api::config::{CacheLimit, RuntimeConfig};
-use platform::{EventHandler, Flow, FramePacing, PlatformConfig, PlatformEvent, PlatformWindow};
+use platform::{
+    EventHandler, Flow, FramePacing, PlatformConfig, PlatformError, PlatformEvent, PlatformWindow,
+};
+use render::FrameStats;
 
-use crate::{BackendKind, FrameStats, GameHost, Host, HostConfig, StepReport};
+use crate::{BackendKind, GameError, GameHost, Host, HostConfig, HostError, StepReport};
 
 /// The game a launcher asks the emulator to open.
 ///
@@ -67,6 +70,26 @@ pub struct RunReport {
     pub last_frame: Option<StepReport>,
 }
 
+/// The failures a [`run`] reports.
+///
+/// Each source keeps its own typed error: the host's configuration and frame
+/// failures, the game's mount and startup failures, and the platform's window
+/// and event-loop failures. A launcher prints the error; nothing is flattened
+/// into a message.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RunError {
+    /// The host could not be created, or a frame action failed.
+    #[error(transparent)]
+    Host(#[from] HostError),
+    /// The game could not be opened, stepped or presented.
+    #[error(transparent)]
+    Game(#[from] GameError),
+    /// The platform window or its event loop failed.
+    #[error(transparent)]
+    Platform(#[from] PlatformError),
+}
+
 /// Runs the emulator with a launcher-resolved [`Launch`].
 ///
 /// The caller owns configuration loading and game-path resolution; this
@@ -76,9 +99,10 @@ pub struct RunReport {
 ///
 /// # Errors
 ///
-/// A human-readable message when the host cannot be created or the game
-/// cannot be opened, stepped or presented.
-pub fn run(launch: Launch) -> Result<RunReport, String> {
+/// Returns [`RunError`] when the host cannot be created, when the game
+/// cannot be opened, stepped or presented, or when the platform window and
+/// its event loop fail.
+pub fn run(launch: Launch) -> Result<RunReport, RunError> {
     match launch.mode {
         RunMode::Headless { frames } => run_headless(&launch, frames),
         RunMode::Windowed => run_windowed(&launch).map(|()| RunReport::default()),
@@ -101,12 +125,12 @@ fn format_stats(stats: &FrameStats) -> String {
 }
 
 /// Runs offscreen and prints the final frame stats (or the game's scene size).
-fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, String> {
+fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
     let config = HostConfig::headless()
         .with_backend(launch.backend)
         .with_debug_overlay(launch.runtime.debug_overlay)
         .with_graphic_cache_limit(launch.runtime.graphic_cache_limit);
-    let mut host = Host::new(config).map_err(|error| error.to_string())?;
+    let mut host = Host::new(config)?;
     let dt_ms = launch.runtime.frame_rate_limit.period_ms();
 
     if let Some(input) = &launch.game {
@@ -115,8 +139,7 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, String> {
             input.archives.clone(),
             input.base_dir.clone(),
             launch.runtime.preload_archives,
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         println!(
             "krkr headless game: backend={} frames={} archives={}",
             game.host().backend().name(),
@@ -125,7 +148,7 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, String> {
         );
         let mut last = None;
         for _ in 0..frames {
-            last = Some(game.step(dt_ms, &[]).map_err(|error| error.to_string())?);
+            last = Some(game.step(dt_ms, &[])?);
         }
         if let Some(report) = last
             && let Some(stats) = report.stats
@@ -177,7 +200,7 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, String> {
 
     let mut last = None;
     for _ in 0..frames {
-        last = Some(host.step(dt_ms).map_err(|error| error.to_string())?);
+        last = Some(host.step(dt_ms)?);
     }
     if let Some(report) = last
         && let Some(stats) = report.stats
@@ -192,12 +215,12 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, String> {
 }
 
 /// Opens a window through the L1 platform and drives [`Host::step`].
-fn run_windowed(launch: &Launch) -> Result<(), String> {
+fn run_windowed(launch: &Launch) -> Result<(), RunError> {
     let frame_interval = Duration::from_secs_f64(launch.runtime.frame_rate_limit.period_secs());
     let mut config = PlatformConfig::default();
     config.title = "krkr-rs".to_owned();
     config.frame_interval = frame_interval;
-    platform::run(
+    Ok(platform::run(
         config,
         DesktopApp::new(
             launch.backend,
@@ -207,8 +230,7 @@ fn run_windowed(launch: &Launch) -> Result<(), String> {
             launch.runtime.graphic_cache_limit,
             frame_interval,
         ),
-    )
-    .map_err(|error| error.to_string())
+    )?)
 }
 
 /// The composition root's bridge from L1 platform events to the L2 host.

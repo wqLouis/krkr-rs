@@ -5,7 +5,7 @@
 //! ```
 //!
 //! * `--headless` runs an empty scene for `N` frames (default 120) through
-//!   [`app::Host`] and prints the null backend [`app::FrameStats`]. It needs
+//!   [`app::Host`] and prints the null backend [`render::FrameStats`]. It needs
 //!   neither a display nor a GPU.
 //! * Without `--headless` the process opens a window through the L1
 //!   [`platform`] event loop and drives [`app::Host::step`] on the configured
@@ -389,8 +389,8 @@ fn main() -> ExitCode {
 
     match app::run(launch) {
         Ok(_) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("krkr: {message}");
+        Err(error) => {
+            eprintln!("krkr: {error}");
             ExitCode::FAILURE
         }
     }

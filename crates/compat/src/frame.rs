@@ -29,6 +29,11 @@ use crate::{CompatCtx, CompatError};
 /// with the poll's wall-clock duration. A host that wants per-frame cost
 /// attribution overrides the hooks it cares about; the default discards the
 /// measurement. A poll that returns an error does not report a duration.
+///
+/// Every poll reports its failure as a [`CompatError`](crate::CompatError);
+/// the frame body stops at the first error and the remaining polls do not
+/// run. A poll never unwinds into the VM: a script handler that raises is
+/// caught by the native that dispatched it and logged.
 pub trait FrameBody {
     /// Audio playback progress.
     fn sound_poll(&mut self, _ctx: &mut CompatCtx) -> Result<(), CompatError> {
@@ -96,6 +101,11 @@ pub trait FrameBody {
 ///
 /// Each poll's wall-clock duration is reported to the matching `*_completed`
 /// hook; the remaining polls do not run after an error.
+///
+/// # Errors
+///
+/// Returns the first error a poll reports. The remaining polls do not run
+/// after it, and the frame's remaining work is skipped.
 pub fn run_frame_body(body: &mut dyn FrameBody, ctx: &mut CompatCtx) -> Result<(), CompatError> {
     // Request the 1500 ms TJS object rehash before any script poll. An object
     // that grew past its initial bucket count rebuilds its member table on

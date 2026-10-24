@@ -41,8 +41,8 @@ mod md5;
 /// The ported plugins, keyed by the DLL name scripts pass to `Plugins.link`.
 ///
 /// [`PluginRegistry::builtin`](crate::PluginRegistry::builtin) builds one
-/// [`BuiltinPlugin`](crate::BuiltinPlugin) per entry. The list of startup
-/// modules is [`STARTUP_PLUGINS`]; every other entry registers its native
+/// [`BuiltinPluginDef`] per entry. The list of startup modules is
+/// [`STARTUP_PLUGINS`]; every other entry registers its native
 /// classes on the first `Plugins.link` that names it. A name that is not in
 /// this table installs the null plugin object (doc 08 §4.2) — but only where
 /// the plugin's stem does not already name a global.

@@ -18,6 +18,27 @@
 //! * [`EventAdapter`] — the L1 → L3 → L4 event mapping skeleton;
 //! * [`FrameBody`] / [`run_frame_body`] — the ordered per-frame poll body.
 //!
+//! # The public surface
+//!
+//! Everything an L4 host (or a test) can reach is re-exported here, and
+//! nothing else is public:
+//!
+//! | group | items |
+//! |---|---|
+//! | the host and its context | [`CompatHost`], [`CompatCtx`], [`CompatServices`], [`CompatError`] |
+//! | the frame body | [`FrameBody`], [`run_frame_body`] |
+//! | the event adapter | [`EventAdapter`], [`EventValue`], [`TjsEvent`] |
+//! | the per-frame polls | [`timer_poll`], [`sound_poll`], [`sound_render`], [`video_advance`], [`async_trigger_poll`], [`continuous_handler_poll`], [`movie_poll`] |
+//! | the tree-owner hand-offs | [`advance_transitions`], [`advance_self_updating_transitions`], [`paint_poll`], [`refresh_cached_layers`] |
+//! | the host seams | [`VideoSource`], [`set_video_source`], [`set_movie_source`], [`AudioDecoder`], [`add_audio_decoder`], [`set_output_latency`], [`set_sound_render_driven`] |
+//! | the request drains | [`take_exit_request`], [`take_bring_to_front_requests`], [`take_update_requests`], [`take_capture_releases`] |
+//! | the startup script | [`exec_storage`] |
+//! | the plugin architecture | [`NativePlugin`], [`PluginOutcome`], [`PluginRegistry`], [`normalize_plugin_name`], [`plugin_stem`], [`builtin_plugin_names`] |
+//!
+//! Every item above states its ownership, its error contract and its panic
+//! and FFI-safety rules in its own documentation. The L2 seam
+//! (`engine_api`) and the per-family modules stay crate-internal.
+//!
 //! # The one process-wide binding
 //!
 //! The C++ ABI hands native callbacks only the raw `tjs2_engine*` and
@@ -52,10 +73,10 @@ pub use ctx::{CompatCtx, CompatServices};
 pub use event::{EventAdapter, EventValue, TjsEvent};
 pub use frame::{FrameBody, run_frame_body};
 pub use host::CompatHost;
-// The built-in `Timer` delivery: the frame body drains the `onTimer` posts the
-// L2 registry produced. `timer_poll` remains for a host or test that advances
-// the attached registry itself.
-pub use natives::visual::{timer_poll, timer_posts_poll};
+// The built-in `Timer` delivery for a host or a test that advances the
+// attached registry itself. The frame body's own drain of the `onTimer` posts
+// is crate-internal: the frame body runs it, no host calls it.
+pub use natives::visual::timer_poll;
 // The built-in `VideoOverlay` advance: an L4 [`FrameBody`] forwards its
 // `video_poll` step to `video_advance` with its own per-frame `dt`;
 // `VideoSource`/`set_video_source` install the host-decoded source.
@@ -99,6 +120,12 @@ pub fn builtin_plugin_names() -> impl Iterator<Item = &'static str> {
 }
 
 /// Errors from the compatibility surface.
+///
+/// The two variants separate the two failure kinds a host can act on: a
+/// [`Register`](Self::Register) failure means the VM refused a class or a
+/// member, an [`Engine`](Self::Engine) failure means an L2 operation or the
+/// host's own wiring failed. The message is what the host logs; it is not a
+/// script-visible string unless a native forwards it.
 #[derive(Debug, thiserror::Error)]
 pub enum CompatError {
     /// A native class could not be registered.
@@ -117,7 +144,14 @@ pub enum CompatError {
 /// Every other built-in plugin's members appear on the first `Plugins.link`.
 /// Called by [`CompatHost::install`]; idempotence is the caller's
 /// responsibility (class registration rejects duplicates).
-pub fn install(ctx: &mut CompatCtx) -> Result<(), CompatError> {
+///
+/// # Errors
+///
+/// Returns [`CompatError::Register`] when a class, a member or the null-plugin
+/// hook cannot be registered on the VM. A failure leaves the VM without the
+/// compatibility surface; the caller must not retry against the same engine,
+/// because class registration rejects duplicates.
+pub(crate) fn install(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     null_plugin::register_hook(ctx)?;
     natives::register_all(ctx)?;
     plugins_native::register(ctx)

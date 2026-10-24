@@ -34,12 +34,12 @@ use crate::hasher::{Map, map};
 /// [`InputState::set_click_sequence`].
 pub const DEFAULT_CLICK_SEQUENCE_FRAMES: u64 = 30;
 /// Default maximum pointer movement for a press to continue a click sequence.
-pub const DEFAULT_CLICK_MAX_MOVE: f32 = 4.0;
+pub(crate) const DEFAULT_CLICK_MAX_MOVE: f32 = 4.0;
 
 /// Per-button state tracked by [`InputState`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
-pub struct ButtonState {
+struct ButtonState {
     /// Whether the button is currently held.
     pub held: bool,
     /// Whether the button was released during the current frame.
@@ -70,7 +70,7 @@ impl Default for ButtonState {
 /// Per-key state tracked by [`InputState`], keyed by the opaque platform code.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct KeyState {
+struct KeyState {
     /// Whether the key is currently held.
     pub held: bool,
     /// Whether the key was released during the current frame.
@@ -297,11 +297,6 @@ impl InputState {
             entry.released = true;
             entry.hold_frames = 0;
         }
-    }
-
-    /// The state of `button`, if it has ever changed.
-    pub fn button_state(&self, button: MouseButton) -> Option<&ButtonState> {
-        self.buttons.get(&button)
     }
 
     /// Whether `button` is currently held.

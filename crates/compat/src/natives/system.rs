@@ -168,6 +168,9 @@ struct StringScratch(Vec<u8>);
 /// Returns the code recorded by the most recent call and clears it so a
 /// request is reported **exactly once**; the host's frame loop polls this and
 /// maps it to its own exit path.
+///
+/// The request is consumed by this call: the next call reports `None` until a
+/// script calls `System.exit` or `System.terminate` again.
 #[must_use]
 pub fn take_exit_request(services: &CompatServices) -> Option<i32> {
     services.state::<SystemState>().exit_request.take()
@@ -181,6 +184,12 @@ pub fn take_exit_request(services: &CompatServices) -> Option<i32> {
 /// and a newly registered handler is delivered in the same pass. The
 /// per-engine state borrow is released across each callback so a re-entrant
 /// `System` call cannot panic on the `RefCell`.
+///
+/// # Errors
+///
+/// Returns [`CompatError::Engine`] when the handler list cannot be read
+/// from the dispatch state. A handler that raises is removed and logged, not
+/// reported as an error.
 pub fn continuous_handler_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let engine = unsafe { ctx.engine() };

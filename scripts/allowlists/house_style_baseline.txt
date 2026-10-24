@@ -49,10 +49,7 @@
 {"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "/// The reference matches the suffix without regard to case", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "/// called from `reference/cpp/core/environ/Application.cpp:342`). The scan is", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/game.rs", "rule": "reference-citation", "anchor": "/// loads each (`reference/cpp/core/plugin/PluginImpl.cpp:76-88`, `:148-177`,", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/app/src/lib.rs", "rule": "reference-citation", "anchor": "//! and [`Media`]). Every evolving value — the TVP layer system [`Scene`], the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/lib.rs", "rule": "reference-citation", "anchor": "/// (disabled, as in the reference). See [`CacheLimit`].", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/app/src/lib.rs", "rule": "reference-citation", "anchor": "/// Returns the TVP layer system for script-driven mutation.", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/app/src/lib.rs", "rule": "reference-citation", "anchor": "/// Returns the TVP layer system.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/lib.rs", "rule": "history-comment", "anchor": "/// Window handle used to create the surface.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/main.rs", "rule": "reference-citation", "anchor": "//! VM host. One positional path is also accepted, mirroring the reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/app/src/main.rs", "rule": "reference-citation", "anchor": "//! positive integer is a byte cap. Without the option the reference default", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3361,11 +3358,9 @@
 {"path": "crates/compat/src/null_plugin.rs", "rule": "reference-citation", "anchor": "// function the script put where our instance was, where the reference's", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/null_plugin.rs", "rule": "history-comment", "anchor": "/// a real binding must not be silently replaced by the null path. The link", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// (`reference/cpp/core/plugin/PluginImpl.cpp:113-133`), so an auto-loaded", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// Every ported plugin (the table in", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// Linking goes through the same path as `Plugins.link`: a ported name", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// The reference `tvpLoadPlugins` scans the exe directory,", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// The reference does the same before loading an internal plugin", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// The registry is assembled from the table, so adding a ported plugin is one", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// `TVPLoadInternalPlugin` (`PluginImpl.cpp:113-133`), and each is logged", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// and loads each in turn (`reference/cpp/core/plugin/PluginImpl.cpp:148-177`,", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// called from `reference/cpp/core/environ/Application.cpp:342`). The scan", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3420,8 +3415,6 @@
 {"path": "crates/engine/src/input.rs", "rule": "reference-citation", "anchor": "/// L3 overrides this with its TVP-specific value through", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/input.rs", "rule": "reference-citation", "anchor": "/// TVP-free: L3 owns the virtual-key table, the click-sequence constants and", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/input.rs", "rule": "reference-citation", "anchor": "/// the TVP-specific policy.", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/engine/src/lib.rs", "rule": "reference-citation", "anchor": "// pixel primitives, blend-type numbering and TVP constants stay reachable", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/engine/src/lib.rs", "rule": "reference-citation", "anchor": "//! Owns all state: the TVP layer system, the storage namespace, the mixer,", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/projection.rs", "rule": "reference-citation", "anchor": "// `CacheBitmap`, `LayerIntf.cpp:7156-7226`), so it contributes no", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/projection.rs", "rule": "reference-citation", "anchor": "// own (the reference hands `CacheBitmap` to the parent at", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/projection.rs", "rule": "reference-citation", "anchor": "// the layer's rect, `LayerIntf.cpp:7221-7226`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3451,7 +3444,6 @@
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "// reference `tTVPLayerManager::AttachPrimary` forces visible (a new", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "// reference sets `*lay = nullptr` and returns true).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "// reference's raw-pointer contract. All access goes through the safe", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "//! TVP layer-system state model (L2).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// (`LayerIntf.cpp:2656`). A layer with no MainImage is left untouched.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// (`LayerIntf.cpp:3020`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// (`LayerIntf.cpp:3034`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3614,7 +3606,6 @@
 {"path": "crates/engine/src/storage.rs", "rule": "reference-citation", "anchor": "// `reference/cpp/core/base/StorageIntf.cpp:1101`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/storage.rs", "rule": "reference-citation", "anchor": "// the mount; a `..` that escapes it is the reference's invalid name.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/storage.rs", "rule": "reference-citation", "anchor": "// the reference on any host.", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/engine/src/storage.rs", "rule": "reference-citation", "anchor": "//! A [`Storage`] value owns everything needed to resolve TVP storage names:", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/storage.rs", "rule": "reference-citation", "anchor": "//! Resolution order mirrors the reference engine:", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/storage.rs", "rule": "reference-citation", "anchor": "/// (`reference/cpp/core/base/impl/StorageImpl.cpp:301-407`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/storage.rs", "rule": "reference-citation", "anchor": "/// (`reference/cpp/core/base/impl/StorageImpl.cpp:339-407`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3939,9 +3930,9 @@
 {"path": "crates/platform/render/src/vulkan/pipelines.rs", "rule": "reference-citation", "anchor": "// reference applies around it is the approximation the non-Photoshop", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/render/src/vulkan/pipelines.rs", "rule": "reference-citation", "anchor": "/// approximation of the legacy KiriKiri rule.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/render/src/vulkan/texture.rs", "rule": "history-comment", "anchor": "/// Textures touched by the in-flight batch; used to serialise two batches", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/testkit/src/lib.rs", "rule": "reference-citation", "anchor": "/// (`reference/cpp/core/archive/xp3/XP3Archive.cpp:340-343`); a raw index", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/testkit/src/lib.rs", "rule": "reference-citation", "anchor": "/// The bytes follow the reference reader `tTVPXP3Archive::Init`: the index", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/testkit/src/lib.rs", "rule": "reference-citation", "anchor": "/// stream (`reference/cpp/core/archive/xp3/XP3Archive.cpp:360-390`). The", "reason": "legacy comment, cleanup tracked in TODO §15"}
+{"path": "crates/testkit/src/archives.rs", "rule": "reference-citation", "anchor": "/// (`reference/cpp/core/archive/xp3/XP3Archive.cpp:340-343`); a raw index", "reason": "legacy comment, cleanup tracked in TODO §15"}
+{"path": "crates/testkit/src/archives.rs", "rule": "reference-citation", "anchor": "/// The bytes follow the reference reader `tTVPXP3Archive::Init`: the index", "reason": "legacy comment, cleanup tracked in TODO §15"}
+{"path": "crates/testkit/src/archives.rs", "rule": "reference-citation", "anchor": "/// stream (`reference/cpp/core/archive/xp3/XP3Archive.cpp:360-390`). The", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/testkit/src/media_fixtures.rs", "rule": "reference-citation", "anchor": "// Golomb unary part with the reference's 4-byte \"give", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/testkit/src/media_fixtures.rs", "rule": "reference-citation", "anchor": "// LZSS window state persists across blocks, like the reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/testkit/src/media_fixtures.rs", "rule": "reference-citation", "anchor": "// up\" escape (reference `GOLOMB_GIVE_UP_BYTES`): when", "reason": "legacy comment, cleanup tracked in TODO §15"}

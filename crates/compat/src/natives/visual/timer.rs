@@ -1039,6 +1039,11 @@ extern "C" fn timer_mode_set(
 /// Delivery failures inside the callbacks are logged by
 /// [`dispatch_on_timer`] and never disable the timer — the reference has no
 /// disable-on-error path in `TimerIntf.cpp`/`TimerImpl.cpp`.
+///
+/// # Errors
+///
+/// Returns [`CompatError::Engine`] when the L2 timer registry is not
+/// attached to the host.
 pub fn timer_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let timer_ptr = unsafe { ctx.services() }.timer();
@@ -1075,7 +1080,14 @@ pub fn timer_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
 /// (`EventIntf.cpp:426-519`). The queue is taken out whole, so a handler that
 /// posts again lands in the next drain rather than re-entering the VM
 /// mid-drain.
-pub fn timer_posts_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
+///
+/// # Errors
+///
+/// Returns [`CompatError::Engine`] when the L2 timer registry is not
+/// attached to the host, so the queue cannot be drained against a live
+/// registry. A delivery failure inside a handler is logged and never
+/// disables the timer.
+pub(crate) fn timer_posts_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let host = unsafe { ctx.engine() };
     // SAFETY: see above.

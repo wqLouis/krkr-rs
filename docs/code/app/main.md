@@ -119,7 +119,7 @@ pub struct GameInput {
 
 pub struct RunReport { pub last_frame: Option<StepReport> }
 
-pub fn run(launch: Launch) -> Result<RunReport, String>
+pub fn run(launch: Launch) -> Result<RunReport, RunError>
 ```
 
 `run` dispatches on the mode and returns after the headless loop finishes or

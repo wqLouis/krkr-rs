@@ -96,10 +96,33 @@ the family's own state ownership:
 | [`visual/focus.md`](visual/focus.md) | `natives/visual/layer/focus.rs` | the focus domain model and the blur-off properties |
 | [`visual/pixels.md`](visual/pixels.md) | `natives/visual/layer/pixels.rs` | the pixel operations, the image load/save path, the text path |
 | [`visual/transitions.md`](visual/transitions.md) | `natives/visual/layer/transitions.rs` | `beginTransition`, the transition pumps, the script cache |
-| [`visual/bitmap.md`](visual/bitmap.md) | `natives/visual/bitmap.rs` | the `Bitmap` class and the host image codec seam |
+| [`visual/bitmap.md`](visual/bitmap.md) | `natives/visual/bitmap.rs` | the `Bitmap` class; the image codec it consumes is installed through `CompatHost::set_image_codec` |
 | [`visual/font.md`](visual/font.md) | `natives/visual/font.rs` | the `Font` class and face resolution |
 | [`visual/timer.md`](visual/timer.md) | `natives/visual/timer.rs` | the `Timer` class and the L2 timer schedule |
 | [`visual/draw_device.md`](visual/draw_device.md) | `natives/visual/draw_device.rs` | `BasicDrawDevice` / `PassThroughDrawDevice` |
+
+### The crate-root public API
+
+Everything an L4 host (or a test) can reach is re-exported from `lib.rs`,
+and nothing else is public. The groups:
+
+| Group | Items |
+|---|---|
+| the host and its context | `CompatHost`, `CompatCtx`, `CompatServices`, `CompatError` |
+| the frame body | `FrameBody`, `run_frame_body` |
+| the event adapter | `EventAdapter`, `EventValue`, `TjsEvent` |
+| the per-frame polls | `timer_poll`, `sound_poll`, `sound_render`, `video_advance`, `async_trigger_poll`, `continuous_handler_poll`, `movie_poll` |
+| the tree-owner hand-offs | `advance_transitions`, `advance_self_updating_transitions`, `paint_poll`, `refresh_cached_layers` |
+| the host seams | `VideoSource`, `set_video_source`, `set_movie_source`, `AudioDecoder`, `add_audio_decoder`, `set_output_latency`, `set_sound_render_driven` |
+| the request drains | `take_exit_request`, `take_bring_to_front_requests`, `take_update_requests`, `take_capture_releases` |
+| the startup script | `exec_storage` |
+| the plugin architecture | `NativePlugin`, `PluginOutcome`, `PluginRegistry`, `normalize_plugin_name`, `plugin_stem`, `builtin_plugin_names` |
+
+Every one of them states its ownership, its error contract and its panic
+and FFI-safety rules in its own rustdoc. The L2 seam (`engine_api.rs`) and the
+per-family modules stay crate-internal: a native family reaches the engine
+only through the seam, and the host reaches a family only through the
+re-exports above.
 
 ---
 

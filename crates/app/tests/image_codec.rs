@@ -8,7 +8,6 @@
 //! L1 `media` decoder — proving the whole encode → write → decode path.
 
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use api::fs::{FsPath, OpenMode};
 use app::install_image_codec;
@@ -16,15 +15,8 @@ use compat::CompatHost;
 use engine::{Scene, Storage};
 use fs::FileSystem;
 use media::{Media, decode_image, encode_image};
+use testkit::vm_lock;
 use tjs::Tjs2Engine;
-
-/// Serializes the process-global TJS VM and its single engine binding.
-fn vm_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-}
 
 /// Deterministic RGBA8 pattern used as the source image.
 fn pattern(width: u32, height: u32) -> Vec<u8> {

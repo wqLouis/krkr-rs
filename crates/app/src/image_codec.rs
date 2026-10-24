@@ -45,9 +45,8 @@ use crate::startup::StartupStats;
 /// parents are created. An unknown save type is a typed encoder error
 /// surfaced to the script, never a silently skipped write.
 ///
-/// `media` is the same stateless L1 backend the composition root passes to
-/// [`install_audio_decoder`](crate::install_audio_decoder); the closures own
-/// a clone of it.
+/// `media` is the same stateless L1 backend the composition root installs on
+/// the audio decoder; the closures own a clone of it.
 pub fn install_image_codec(host: &CompatHost, media: &Media, storage: &Storage) {
     let stats = StartupStats::new();
     install_image_codec_metered(host, media, storage, &stats);
@@ -65,18 +64,12 @@ pub(crate) fn install_image_codec_metered(
     install_image_codec_on_metered(host, media, fs, base, stats);
 }
 
-/// Installs the `media` image codec with an explicit write target.
+/// Installs the image codec with an explicit write target and the shared
+/// [`StartupStats`] counter set.
 ///
 /// [`install_image_codec`] derives `(fs, base)` from a [`Storage`]; this
 /// lower-level entry point is for hosts that keep the output elsewhere
 /// (for example a dedicated screenshot directory).
-pub fn install_image_codec_on(host: &CompatHost, media: &Media, fs: FileSystem, base: PathBuf) {
-    let stats = StartupStats::new();
-    install_image_codec_on_metered(host, media, fs, base, &stats);
-}
-
-/// Installs the image codec with an explicit write target and the shared
-/// [`StartupStats`] counter set.
 fn install_image_codec_on_metered(
     host: &CompatHost,
     media: &Media,
@@ -144,7 +137,7 @@ impl ImageDecoder for MediaImageDecoder {
 ///
 /// Returns [`engine::imagedecode::DecodePoolError`] when the pool cannot be
 /// started.
-pub fn install_image_decoder(
+pub(crate) fn install_image_decoder(
     engine: &mut engine::Engine,
     media: &Media,
 ) -> Result<(), engine::imagedecode::DecodePoolError> {

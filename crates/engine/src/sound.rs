@@ -852,8 +852,12 @@ impl fmt::Debug for SoundSource {
 impl SoundSource {
     /// Wrap decoded PCM, taking the frame count from the decoder's spec.
     ///
-    /// Fails with a typed error when the spec is unusable or the buffer
-    /// length disagrees with `sample_rate`/`channels`.
+    /// # Errors
+    ///
+    /// A typed [`SoundError`] when the spec is unusable (no sample rate or
+    /// no channel) or when the buffer length disagrees with the frame count,
+    /// the sample rate and the channel count. A source that cannot be
+    /// described is never built with a guessed length.
     pub fn new(audio: Arc<DecodedAudio>) -> Result<Self, SoundError> {
         Self::with_loops(audio, None)
     }
@@ -865,6 +869,12 @@ impl SoundSource {
     /// not depend on which decoder produced the samples. A spec without a
     /// frame count — or one that contradicts a non-empty buffer — falls back
     /// to the buffer's length.
+    ///
+    /// # Errors
+    ///
+    /// The same typed [`SoundError`] as [`Self::new`]: an unusable spec, or
+    /// a buffer whose length disagrees with the frame count, the sample rate
+    /// and the channel count.
     pub fn with_loops(
         audio: Arc<DecodedAudio>,
         info: Option<LoopInfo>,
@@ -904,6 +914,13 @@ impl SoundSource {
     /// sample rate and channel count. A decode-ahead worker is created for
     /// the stream but decodes nothing until playback starts (or the first
     /// frame read), so `open` never waits on the decoder.
+    ///
+    /// # Errors
+    ///
+    /// A typed [`SoundError`] when the container spec is unusable, when the
+    /// stream's own sample rate or channel count disagrees with it, or when
+    /// the stream cannot be opened. The stream is dropped and no source is
+    /// built when the formats disagree.
     pub fn streaming(
         spec: AudioSpec,
         stream: Box<dyn AudioStream>,
@@ -1078,6 +1095,11 @@ impl SoundSource {
     /// edge waits for the worker, and a read outside the window asks the
     /// worker to reseek. A frame at or past the end returns `None`, and a
     /// decoder failure is a typed error, never silence.
+    ///
+    /// # Errors
+    ///
+    /// [`SoundError::Decode`] when the decoder fails; the failure is never
+    /// reported as silence.
     pub fn frame(&self, frame: u64) -> Result<Option<(f32, f32)>, SoundError> {
         if let Some(total) = self.spec.total_frames
             && frame >= total
@@ -1717,6 +1739,11 @@ impl SoundBuffer {
 
     /// Install this buffer's source on `channel` without playing it,
     /// carrying the buffer's loop flags over.
+    ///
+    /// # Errors
+    ///
+    /// [`SoundError::NoSource`] when the buffer holds no source; the channel
+    /// is left unchanged.
     pub fn load_on(&mut self, channel: &mut SoundChannel) -> Result<(), SoundError> {
         let Some(source) = &self.source else {
             return Err(SoundError::NoSource);
@@ -1730,6 +1757,11 @@ impl SoundBuffer {
 
     /// Reset the label cursor and start `channel` on this buffer's source,
     /// carrying the buffer's loop flags over.
+    ///
+    /// # Errors
+    ///
+    /// [`SoundError::NoSource`] when the buffer holds no source; the channel
+    /// is left unchanged.
     pub fn play_on(&mut self, channel: &mut SoundChannel) -> Result<(), SoundError> {
         let Some(source) = &self.source else {
             return Err(SoundError::NoSource);
@@ -1950,6 +1982,12 @@ impl Mixer {
     /// The output spec must have a non-zero sample rate and 1 or 2 channels;
     /// anything else is a typed [`SoundError::InvalidSpec`]. The caller owns
     /// `out`; the L1 `AudioDevice` consumes it.
+    ///
+    /// # Errors
+    ///
+    /// [`SoundError::InvalidSpec`] when the output spec has no sample rate or
+    /// a channel count other than one or two. A rejected spec leaves `out`
+    /// untouched.
     pub fn mix(&self, out: &mut [f32], out_spec: AudioSpec) -> Result<(), SoundError> {
         mix(
             &self.channels,
@@ -1970,6 +2008,12 @@ impl Mixer {
     /// callback does not replay it. A headless application instead uses
     /// [`Self::advance`]/[`Self::advance_to`]; do not drive both clocks at
     /// once for the same mixer.
+    ///
+    /// # Errors
+    ///
+    /// [`SoundError::InvalidSpec`] when the output spec is unusable, as in
+    /// [`Self::mix`]. The mixer clock and the channel positions are advanced
+    /// only after the chunk was rendered.
     pub fn mix_advancing(
         &mut self,
         out: &mut [f32],
@@ -2021,6 +2065,13 @@ impl Default for MixSettings {
 /// The PCM buffers are the caller-supplied sources held by each channel; a
 /// streaming source decodes forward as it is read. [`Mixer::mix`] is the usual
 /// entry point.
+///
+/// # Errors
+///
+/// [`SoundError::InvalidSpec`] when the output spec has no sample rate or a
+/// channel count other than one or two, and [`SoundError::Decode`] when a
+/// source fails to decode. The output is cleared before the mix, so a
+/// rejected spec leaves it silent.
 pub fn mix(
     channels: &[SoundChannel],
     settings: MixSettings,
@@ -2065,6 +2116,13 @@ pub fn mix(
 /// The conversion to the output rate convolves the source frames around the
 /// interpolated one with a windowed-sinc kernel, so a converted track keeps
 /// the pitch and the spectrum a source can hold.
+///
+/// # Errors
+///
+/// [`SoundError::InvalidSpec`] when the output spec has no sample rate or a
+/// channel count other than one or two, and [`SoundError::Decode`] when the
+/// source fails to decode. The existing contents of `out` are left as they
+/// were when the spec is rejected.
 pub fn mix_source(
     source: &SoundSource,
     position_seconds: f64,

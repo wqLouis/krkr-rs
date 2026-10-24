@@ -164,7 +164,7 @@ yields void when the result object cannot be built.
 |---|---|
 | `attach_scene` | the `FontState` store |
 | `attach_storage` | a face string is read as a storage name |
-| `ResourceResolver::set_system_font_dirs(dirs)` | where the host's system fonts live — the composition root wires `platform::system_font_dirs()` into it |
+| `CompatHost::set_system_font_dirs(dirs)` | where the host's system fonts live — the composition root wires `platform::system_font_dirs()` into it |
 | the `System.addFont` registry and `GdiPlus.addPrivateFont` | the other face sources |
 | the L2 `engine::text::TextEngine` | shaping, layout, glyph rasterization, `glyph_advance`, `glyph_draw_rect` |
 

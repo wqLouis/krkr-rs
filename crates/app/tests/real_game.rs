@@ -9,6 +9,8 @@
 //! KRKR_TEST_GAME=/path/to/game cargo test -p app --test real_game -- --ignored --nocapture
 //! ```
 
+use std::path::Path;
+
 use engine::storage::Storage;
 use fs::FileSystem;
 use media::{Media, decode_image, probe_audio};
@@ -26,16 +28,7 @@ fn game_dir() -> Option<String> {
 fn mount(dir: &str) -> Storage {
     // The loader takes an explicit archive list (doc 09); a test harness may
     // scan the directory, but the engine itself never does.
-    let mut archives: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-        .expect("list game directory")
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("xp3"))
-        })
-        .collect();
-    archives.sort();
+    let archives = testkit::game_archives(Path::new(dir)).expect("list game directory");
     Storage::mount_archives(FileSystem::host(dir), dir, archives).expect("mount game")
 }
 

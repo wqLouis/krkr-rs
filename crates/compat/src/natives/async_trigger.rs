@@ -653,6 +653,11 @@ extern "C" fn async_trigger_mode_set(
 /// could not be retained the action is invoked directly. The pending list is
 /// taken before any VM call, so a `trigger()` issued from inside a handler is
 /// deferred to the next poll rather than re-entering the VM mid-dispatch.
+///
+/// # Errors
+///
+/// Returns [`CompatError::Engine`] when a scheduled trigger cannot be
+/// dispatched; the remaining triggers still fire.
 pub fn async_trigger_poll(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let (host, services) = unsafe { (ctx.engine(), ctx.services()) };

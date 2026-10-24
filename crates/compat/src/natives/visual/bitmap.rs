@@ -41,37 +41,6 @@ pub(super) fn bitmap_payload_id(payload: *mut c_void) -> Option<u32> {
     unsafe { &*(payload as *const BitmapInst) }.id
 }
 
-// ---------------------------------------------------------------------------
-// Host-supplied image codec (the L1 `media` seam)
-// ---------------------------------------------------------------------------
-
-/// The per-engine image-codec seam.
-///
-/// L3 (`compat`) never links the L1 `media` codec; the L4 host installs the
-/// decode/probe/save closures through [`crate::CompatHost::set_image_codec`],
-/// exactly like the `WaveSoundBuffer` audio decoder seam. A member whose
-/// closure is missing raises a typed error instead of fabricating a
-/// result.
-impl crate::CompatHost {
-    /// Install the host image codec the `Bitmap` natives compose.
-    ///
-    /// `decode` backs `Bitmap.load`/`Bitmap.loadAsync`, `probe` backs
-    /// `Bitmap.loadHeader` and `save` backs `Bitmap.save`. Only the L4 host
-    /// links the L1 `media` crate; the integration tests install a synthetic
-    /// codec here. A member whose closure is absent raises a typed error
-    /// instead of fabricating a result.
-    pub fn set_image_codec(
-        &self,
-        decode: impl Fn(&[u8], Option<&str>) -> Result<DecodedImage, String> + 'static,
-        probe: impl Fn(&[u8], Option<&str>) -> Result<ImageInfo, String> + 'static,
-        save: impl Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String> + 'static,
-    ) {
-        self.services()
-            .state::<ResourceResolver>()
-            .set_codec(decode, probe, save);
-    }
-}
-
 /// Common image extensions probed when the requested storage name does not
 /// resolve, mirroring the reference `TVPFindGraphicLoadHandler` order.
 const IMAGE_EXTENSION_PROBE: [&str; 21] = [

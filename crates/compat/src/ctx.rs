@@ -303,6 +303,12 @@ impl CompatCtx {
 
     /// Register a static native class, mapping the `tjs` error string
     /// into a [`CompatError`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompatError::Register`] when the VM rejects the class — a
+    /// duplicate class name, for instance. The registration is atomic: a
+    /// rejected class leaves nothing behind.
     pub fn register_class(&self, builder: &NativeClassBuilder<'_>) -> Result<(), CompatError> {
         // SAFETY: a `CompatCtx` is only created for a bound, live engine.
         unsafe { self.engine() }
@@ -333,6 +339,11 @@ impl CompatCtx {
     /// `AsyncTrigger.onFire`, `MenuItem.onClick`,
     /// `Layer.onTransitionCompleted`) instead of invoking our native
     /// callback directly — verified by `tests/extend_dispatch.rs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompatError::Register`] when the VM rejects the class — a
+    /// duplicate class name, for instance.
     pub fn register_instance(
         &self,
         builder: &NativeInstanceBuilder<'_>,
@@ -344,6 +355,11 @@ impl CompatCtx {
     }
 
     /// Attach static (class-level) members to an already-registered class.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompatError::Register`] when the VM rejects the members or
+    /// the class does not exist.
     pub fn register_static_members(
         &self,
         members: &NativeStaticMembers<'_>,
@@ -361,6 +377,11 @@ impl CompatCtx {
     /// Like [`Self::register_instance`], the members land on the class (or,
     /// for a builtin, the class object looked up on the VM global), so a
     /// script-defined member of an instance or subclass still shadows them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompatError::Register`] when the VM rejects the members or
+    /// the class does not exist.
     pub fn register_instance_members(
         &self,
         members: &NativeInstanceMembers<'_>,
@@ -380,6 +401,11 @@ impl CompatCtx {
     /// for the duration of the delay (reference
     /// `cpp/core/plugin/ncbind.hpp:1963-1970`). An absent member and a
     /// non-object id are reported as [`CompatError::Engine`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompatError::Engine`] when the member is absent or the id
+    /// does not name an object.
     pub fn delete_member(&self, id: Tjs2ValueId, membername: &str) -> Result<(), CompatError> {
         // SAFETY: a `CompatCtx` is only created for a bound, live engine.
         unsafe { self.engine() }

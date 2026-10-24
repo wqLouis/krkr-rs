@@ -18,11 +18,15 @@ a runtime dependency**: the crates that need it pull it in under
 
 | module | source | what it holds |
 |---|---|---|
-| `media_fixtures` | `src/media_fixtures.rs` | synthetic image, audio, TLG and XP3 byte builders |
+| `archives` | `src/archives.rs` | the in-memory XP3 archive builders |
+| `game` | `src/game.rs` | the real-game directory helpers |
+| `media_fixtures` | `src/media_fixtures.rs` | synthetic image, audio and TLG byte builders |
 | `render` | `src/render.rs` | a headless window handle for the null render backend |
 | `vm` | `src/vm.rs` | the process-global lock that serializes the TJS VM tests |
 
-The crate root holds the XP3 archive builders, next to the media fixtures:
+The crate root re-exports the intended contract item by item, so a test
+writes `testkit::build_xp3(…)` rather than naming the module. The XP3
+builders live in `archives`:
 
 ```rust
 pub fn build_xp3(entries: &[(&str, &[u8], bool)]) -> Vec<u8>;
@@ -55,6 +59,13 @@ themselves hold no process-global state.
 ## 3. The public surface
 
 ```rust
+// archives
+pub fn build_xp3(entries: &[(&str, &[u8], bool)]) -> Vec<u8>;
+pub fn build_xp3_compressed_index(entries: &[(&str, &[u8], bool)]) -> Vec<u8>;
+
+// game
+pub fn game_archives(dir: &Path) -> io::Result<Vec<PathBuf>>;
+
 // media fixtures
 pub fn pattern(width: u32, height: u32) -> Vec<u8>;
 pub fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8>;
@@ -77,6 +88,11 @@ pub fn vm_lock() -> MutexGuard<'static, ()>;
 ignores the handle's contents, so it exercises every public entry point
 without a display server.
 
+`game_archives` lists the `*.xp3` files of a game directory, sorted by
+name. The product takes an explicit archive list and never scans a folder,
+so this is a test convenience: the test derives the list from the directory
+it was given.
+
 `vm_lock` serializes the tests that touch the process-global TJS VM. The VM
 keeps process-global state (the script cache, string interning), so two
 engines may not run at once; the lock makes the second one wait. A poisoned
@@ -89,6 +105,7 @@ cascade into every test that follows it.
 
 | crate | what it takes |
 |---|---|
+| `app` | the XP3 builders, `vm_lock` and `game_archives` |
 | `compat` | the XP3 builders |
 | `engine` | the XP3 builders and `headless_window` |
 | `platform/fs` | the XP3 builders |

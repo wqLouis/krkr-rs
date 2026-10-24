@@ -5,11 +5,10 @@
 
 mod common;
 
-use std::sync::{Mutex, MutexGuard};
-
 use api::config::CacheLimit;
 use api::host::SurfaceEvent;
 use common::{build_solid_and_bitmap_scene, headless_host};
+use testkit::vm_lock;
 use tjs::TjsValue;
 use vm::VmHost;
 
@@ -24,12 +23,6 @@ fn host_applies_the_configured_graphic_cache_limit() {
         host.scene().decoded_image_cache_limit(),
         CacheLimit::bytes(1_048_576)
     );
-}
-
-/// Serializes the tests that bind the process-global VM.
-fn vm_lock() -> MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
 /// Evaluates `expression` and returns its integer result.

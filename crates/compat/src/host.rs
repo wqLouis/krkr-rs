@@ -85,14 +85,42 @@ impl CompatHost {
         crate::natives::clipboard::set_backend(&self.services, Box::new(backend));
     }
 
+    /// Install the host image codec the `Bitmap` natives compose.
+    ///
+    /// `decode` backs `Bitmap.load`/`Bitmap.loadAsync`, `probe` backs
+    /// `Bitmap.loadHeader` and `save` backs `Bitmap.save`. Only the L4 host
+    /// links the L1 `media` crate; the integration tests install a synthetic
+    /// codec here. A member whose closure is absent raises a typed error
+    /// instead of fabricating a result.
+    ///
+    /// The three closures are owned by the host's dispatch state and live as
+    /// long as the host does; they are called from the VM's single thread.
+    pub fn set_image_codec(
+        &self,
+        decode: impl Fn(&[u8], Option<&str>) -> Result<api::media::DecodedImage, String> + 'static,
+        probe: impl Fn(&[u8], Option<&str>) -> Result<api::media::ImageInfo, String> + 'static,
+        save: impl Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String> + 'static,
+    ) {
+        self.services()
+            .state::<crate::resource::ResourceResolver>()
+            .set_codec(decode, probe, save);
+    }
+
+    /// Install the host's system-font directories on the shared text engine.
+    ///
+    /// The directories are scanned lazily, the first time a face is resolved
+    /// from the host; install them before the game's startup script runs so
+    /// no face has been resolved yet.
+    pub fn set_system_font_dirs(&self, dirs: Vec<std::path::PathBuf>) {
+        self.services()
+            .state::<crate::resource::ResourceResolver>()
+            .engine
+            .set_system_font_dirs(dirs);
+    }
+
     /// The plugin registry.
     pub fn registry(&self) -> &PluginRegistry {
         &self.registry
-    }
-
-    /// The plugin registry, mutably (add built-ins before installing).
-    pub fn registry_mut(&mut self) -> &mut PluginRegistry {
-        &mut self.registry
     }
 
     /// Whether the binding is currently installed.
@@ -144,6 +172,12 @@ impl CompatHost {
     /// the caller can stop instead of running unfiltered. Idempotent and a
     /// no-op once the work has run (including when registration already
     /// completed it).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompatError::Engine`] when the game directory of the attached
+    /// storage is not valid UTF-8, or when the deferred plugin read fails.
+    /// The host is not installed: the call is a no-op that reports success.
     pub fn activate_deferred_plugins(&self) -> Result<(), CompatError> {
         if !self.bound {
             return Ok(());
@@ -187,6 +221,12 @@ impl CompatHost {
 
     /// A dispatch context handle for the bound VM.
     ///
+    /// The handle borrows nothing: it carries the addresses of the bound
+    /// engine and of the host's service set, both of which the host keeps
+    /// alive until it is uninstalled.
+    ///
+    /// # Errors
+    ///
     /// Returns [`CompatError::Engine`] before [`Self::install`], so the
     /// handle can never dereference the null addresses of an unbound host.
     pub fn ctx(&self) -> Result<CompatCtx, CompatError> {
@@ -203,14 +243,25 @@ impl CompatHost {
     ///
     /// The binding stores the **address** of `engine`, so `engine` must stay
     /// at a stable address for as long as the binding is installed: keep it
-    /// behind a `Box` (as [`crate::Host`] and `vm`'s host do) and do not move
-    /// the value afterwards.
+    /// behind a `Box` (as the `app` crate's host and `vm`'s host do) and do
+    /// not move the value afterwards.
     ///
     /// When a storage is already attached, its game directory becomes the
     /// VM's stream data directory, so a relative save name resolves there
     /// instead of at the process working directory. A host that attaches the
     /// storage afterwards gets the same setting from
     /// [`Self::activate_deferred_plugins`].
+    ///
+    /// The host keeps the engine alive for the whole binding: the engine must
+    /// outlive the host, or the binding must be removed with [`Self::shutdown`]
+    /// first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompatError::Register`] when the host is already installed or
+    /// when a native class cannot be registered, and [`CompatError::Engine`]
+    /// when the attached storage's game directory is not valid UTF-8. A
+    /// failure leaves no binding installed.
     pub fn install(&mut self, engine: &Tjs2Engine) -> Result<(), CompatError> {
         if self.bound {
             return Err(CompatError::Register(
@@ -243,7 +294,12 @@ impl CompatHost {
     }
 
     /// Remove the binding (idempotent).
-    pub fn uninstall(&mut self) {
+    ///
+    /// Crate-internal: the public teardown is [`Self::shutdown`], which also
+    /// drops the dispatch state while the engine is still alive. A host that
+    /// wants a registry other than the built-in one builds it first and hands
+    /// it to [`Self::with_registry`].
+    pub(crate) fn uninstall(&mut self) {
         if self.bound {
             binding::uninstall();
             self.bound = false;

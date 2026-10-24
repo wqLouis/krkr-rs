@@ -9,10 +9,11 @@ fills it: it reads each stream's bytes through the L2 `Storage`, opens them
 with the L1 decoder and serves frames and the decoded audio track.
 
 ```rust
-pub unsafe fn install_video_source(
+pub(crate) unsafe fn install_video_source_metered(
     host: &CompatHost,
     media: &Media,
     storage: &Storage,
+    stats: &Rc<StartupStats>,
 ) -> Result<(), CompatError>;
 ```
 
@@ -66,8 +67,8 @@ one:
 
 `GameHost` declares the VM host before the storage, so the source drops
 first and the invariant holds. The module is the one place in the crate
-where this is written down, and `install_video_source` is `unsafe` so the
-caller states the obligation at the call site.
+where this is written down, and `install_video_source_metered` is `unsafe`
+so the caller states the obligation at the call site.
 
 ---
 

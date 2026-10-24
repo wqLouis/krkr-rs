@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use compat::{CompatCtx, CompatError, FrameBody, run_frame_body};
 use engine::input::InputState;
 use engine::timer::TimerState;
+use testkit::vm_lock;
 use vm::{FrameCtx, VmHost};
 
 /// A frame body that records every phase completion and can make the sound
@@ -86,6 +87,9 @@ fn vm_host() -> (VmHost, Box<InputState>, Box<TimerState>) {
 
 #[test]
 fn slow_phase_dominates_and_the_wall_total_contains_the_sum() {
+    // The VM host binds the process-global engine, so the test serializes on
+    // the same lock the other VM tests take.
+    let _lock = vm_lock();
     let (mut host, _input, _timer) = vm_host();
     let mut ctx = host.compat().ctx().expect("bound compat context");
     let mut body = RecordingBody {
