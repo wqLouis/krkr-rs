@@ -24,7 +24,7 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/a
 | reference members | 660 |
 | matched | 660 |
 | **missing** | **0** |
-| extra (Rust only) | 3 |
+| extra (Rust only) | 5 |
 | coverage | **100.0%** |
 
 ## Reference registration mechanisms
@@ -56,7 +56,7 @@ _None._
 
 | class | ref | rust | matched | missing | extra | coverage |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `Layer` | 149 | 149 | 149 | 0 | 0 | 100.0% |
+| `Layer` | 149 | 151 | 149 | 0 | 2 | 100.0% |
 | `Bitmap` | 19 | 19 | 19 | 0 | 0 | 100.0% |
 | `Window` | 91 | 91 | 91 | 0 | 0 | 100.0% |
 | `Font` | 21 | 21 | 21 | 0 | 0 | 100.0% |
@@ -88,6 +88,10 @@ _None for tracked classes._
 ## Extra members by class
 
 Rust registrations with no reference counterpart; usually intentional engine internals.
+
+### `Layer` — 2 extra
+
+`getTextHeight`, `getTextWidth`
 
 ### `KAGParser` — 2 extra
 
