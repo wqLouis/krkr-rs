@@ -19,13 +19,27 @@ use crate::VmError;
 
 /// The per-frame inputs handed to [`VmHost::tick`].
 pub struct FrameCtx<'a> {
-    /// Monotonic frame timestamp in milliseconds.
+    /// The engine's frame clock for this frame, in milliseconds.
+    ///
+    /// The engine owns the clock; the host does not read this value. A
+    /// composition root hands the per-frame delta to the polls it owns
+    /// through the frame body.
     pub now_ms: u64,
-    /// Elapsed milliseconds since the previous frame.
+    /// The elapsed milliseconds since the previous frame.
+    ///
+    /// The host does not read this value either: the polls receive their
+    /// own per-frame delta through the frame body.
     pub dt_ms: u32,
-    /// The ordered frame-body polls (doc 08 §6).
+    /// The ordered frame-body polls.
+    ///
+    /// The host runs them in the order the L3 frame body defines, and each
+    /// poll reports its wall-clock cost through the matching
+    /// `FrameBody::*_completed` hook.
     pub body: &'a mut dyn FrameBody,
-    /// Platform events for L3 to adapt and deliver this frame.
+    /// The platform events for this frame.
+    ///
+    /// The host adapts them into script events and delivers them before the
+    /// polls run.
     pub events: &'a [PlatformEvent],
 }
 
@@ -321,14 +335,18 @@ extern "C" fn vm_log(level: c_int, msg: *const c_char, user: *mut c_void) {
 
 impl VmHost {
     /// Create a host with the built-in plugin registry.
+    ///
+    /// No L2 service is attached, so the compatibility surface runs with
+    /// nothing to compose against. Use
+    /// [`Self::with_default_services`] when the host needs one.
     pub fn with_default() -> Result<Self, VmError> {
         Self::new(PluginRegistry::builtin())
     }
 
     /// Create a host with the given plugin registry.
     ///
-    /// The host boxes the engine and installs the L3 binding/classes before
-    /// returning, so it is ready to [`exec`](Self::exec) and
+    /// The host boxes the engine and installs the L3 binding and classes
+    /// before returning, so it is ready to [`exec`](Self::exec) and
     /// [`tick`](Self::tick).
     pub fn new(registry: PluginRegistry) -> Result<Self, VmError> {
         Self::new_with_services(registry, |_| {})
@@ -380,24 +398,27 @@ impl VmHost {
     }
 
     /// The underlying TJS engine.
+    ///
+    /// The engine is boxed, so the address the L3 binding recorded stays
+    /// valid for the whole life of the host. The engine is single-threaded:
+    /// it is used from the one thread that owns the host.
     pub fn engine(&self) -> &Tjs2Engine {
         &self.engine
     }
 
     /// The L3 compatibility host.
+    ///
+    /// The host owns the native dispatch state and the plugin registry; it
+    /// is installed against the engine when the host is created.
     pub fn compat(&self) -> &CompatHost {
         &self.compat
     }
 
-    /// The L3 compatibility host, mutably.
-    pub fn compat_mut(&mut self) -> &mut CompatHost {
-        &mut self.compat
-    }
-
     /// Execute a TJS script.
     ///
-    /// The `Storages` native and the boot sequence are a later wave; this is
-    /// the raw execution seam they will call.
+    /// `name` labels the block in a failure message. A compile or runtime
+    /// failure is reported as [`VmError::Script`], whose message carries
+    /// the block name and the line.
     pub fn exec(&self, source: &str, name: &str) -> Result<TjsValue, VmError> {
         self.engine
             .exec_script(source, name)
@@ -405,14 +426,22 @@ impl VmHost {
     }
 
     /// Evaluate a TJS expression.
+    ///
+    /// `name` labels the block in a failure message; a compile or runtime
+    /// failure is reported as [`VmError::Script`].
     pub fn eval(&self, expression: &str, name: &str) -> Result<TjsValue, VmError> {
         self.engine
             .eval(expression, name)
             .map_err(|err| VmError::Script(err.to_string()))
     }
 
-    /// Run one frame body: adapt/deliver platform events, then run the
-    /// ordered polls (doc 08 §6).
+    /// Run one frame body: adapt and deliver the platform events, then run
+    /// the ordered polls.
+    ///
+    /// The events are delivered before the polls run, so a script sees this
+    /// frame's input before any poll advances. A failure in the event
+    /// dispatch or in a poll is reported as [`VmError::Compat`]; the polls
+    /// after the failing one do not run.
     pub fn tick(&mut self, frame: FrameCtx<'_>) -> Result<(), VmError> {
         let mut ctx = self.compat.ctx()?;
         // The input state is per-frame: clear it, fold in every raw event,

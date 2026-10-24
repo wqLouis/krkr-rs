@@ -3968,8 +3968,6 @@
 {"path": "crates/tjs/src/lib.rs", "rule": "reference-citation", "anchor": "// save container with zlib. Linking it here keeps the build.rs C++ compile", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/tjs/src/lib.rs", "rule": "reference-citation", "anchor": "// valid for the call. The C++ side copies everything it needs", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/tjs/src/lib.rs", "rule": "reference-citation", "anchor": "// valid for the call. The C++ side copies what it needs during", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/tjs/src/lib.rs", "rule": "reference-citation", "anchor": "//! FFI bindings to the C++ TJS2 scripting VM.", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/tjs/src/lib.rs", "rule": "reference-citation", "anchor": "//! The C++ side is compiled by `build.rs` (bison + clang/gcc, no cmake) and", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/tjs/src/lib.rs", "rule": "reference-citation", "anchor": "/// (`iTJSDispatch2::DeleteMember`, reference `tjsObject.h:472`;", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/tjs/src/lib.rs", "rule": "reference-citation", "anchor": "/// (`tjsInterCodeExec.cpp:1826`); only the object's own member table is", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/tjs/src/lib.rs", "rule": "reference-citation", "anchor": "/// (`tjsInterCodeExec.cpp:1829-1833`). A [`Tjs2ValueId`] that is not a", "reason": "legacy comment, cleanup tracked in TODO §15"}

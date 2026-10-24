@@ -1,8 +1,22 @@
-//! FFI bindings to the C++ TJS2 scripting VM.
+//! FFI bindings to the TJS2 scripting VM.
 //!
-//! The C++ side is compiled by `build.rs` (bison + clang/gcc, no cmake) and
+//! The VM is compiled by `build.rs` (bison + clang/gcc, no cmake) and
 //! statically linked. This crate exposes a small, hand-written safe wrapper
 //! over the C ABI defined in `cpp/tjs2_abi.h`.
+//!
+//! # The surface
+//!
+//! [`Tjs2Engine`] owns one script engine: it compiles and runs scripts,
+//! registers the native classes a compatibility layer installs, and owns the
+//! values those classes retain. Every retained value is an RAII handle
+//! ([`DetachedValue`]), and the engine must outlive every handle it
+//! created.
+//!
+//! The C ABI is mirrored by hand, not generated. The raw `extern`
+//! declarations a caller does not need are private to this crate, so the
+//! safe wrapper is the surface a caller works with.
+
+#![warn(missing_docs)]
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr;
@@ -11,17 +25,28 @@ use std::ptr;
 // C ABI mirror of cpp/tjs2_abi.h
 // ---------------------------------------------------------------------------
 
+/// The log level of a debug record.
 pub const LOG_DEBUG: c_int = 0;
+/// The log level of an informational record.
 pub const LOG_INFO: c_int = 1;
+/// The log level of a warning record.
 pub const LOG_WARN: c_int = 2;
+/// The log level of an error record.
 pub const LOG_ERROR: c_int = 3;
 
+/// The value type of a void result.
 pub const VAL_VOID: c_int = 0;
+/// The value type of an integer result.
 pub const VAL_INTEGER: c_int = 1;
+/// The value type of a real result.
 pub const VAL_REAL: c_int = 2;
+/// The value type of a string result.
 pub const VAL_STRING: c_int = 3;
+/// The value type of an object result.
 pub const VAL_OBJECT: c_int = 4;
+/// The value type of an array result.
 pub const VAL_ARRAY: c_int = 5;
+/// The value type of a retained-value result.
 pub const VAL_RETAINED: c_int = 6;
 /// Raw binary data (C++ `tvtOctet`). For values produced by the engine the
 /// bytes live in `string` and the length in `array_count`; native callbacks
@@ -93,7 +118,9 @@ pub type NativeMethodFn = extern "C" fn(
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct NativeMethod {
+    /// The member name, NUL-terminated.
     pub name: *const c_char,
+    /// The callback the VM calls.
     pub f: NativeMethodFn,
 }
 
@@ -111,8 +138,11 @@ pub type NativePropertySetFn =
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct NativeProperty {
+    /// The member name, NUL-terminated.
     pub name: *const c_char,
+    /// The getter; null when the property is write-only.
     pub get: Option<NativePropertyGetFn>,
+    /// The setter; null when the property is read-only.
     pub set: Option<NativePropertySetFn>,
 }
 
@@ -146,7 +176,9 @@ pub type NativeInstanceMethodFn = extern "C" fn(
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct NativeInstanceMethod {
+    /// The member name, NUL-terminated.
     pub name: *const c_char,
+    /// The callback the VM calls.
     pub f: NativeInstanceMethodFn,
 }
 
@@ -175,8 +207,11 @@ pub type NativeInstancePropertySetFn = extern "C" fn(
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct NativeInstanceProperty {
+    /// The member name, NUL-terminated.
     pub name: *const c_char,
+    /// The getter; null when the property is write-only.
     pub get: Option<NativeInstancePropertyGetFn>,
+    /// The setter; null when the property is read-only.
     pub set: Option<NativeInstancePropertySetFn>,
 }
 
@@ -202,7 +237,9 @@ pub type NativeObjThisMethodFn = extern "C" fn(
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct NativeObjThisMethod {
+    /// The member name, NUL-terminated.
     pub name: *const c_char,
+    /// The callback the VM calls.
     pub f: NativeObjThisMethodFn,
 }
 
@@ -227,20 +264,38 @@ pub type NativeObjThisPropertySetFn = extern "C" fn(
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct NativeObjThisProperty {
+    /// The member name, NUL-terminated.
     pub name: *const c_char,
+    /// The getter; null when the property is write-only.
     pub get: Option<NativeObjThisPropertyGetFn>,
+    /// The setter; null when the property is read-only.
     pub set: Option<NativeObjThisPropertySetFn>,
 }
 
+/// A value that crossed the C ABI.
+///
+/// The layout mirrors the `tjs2_value` struct of `cpp/tjs2_abi.h`. A
+/// value carries one payload, selected by `ty`; the other fields are zero.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Value {
+    /// The value type, one of the `VAL_*` constants.
     pub ty: c_int,
+    /// The payload of an integer value.
     pub integer: i64,
+    /// The payload of a real value.
     pub real: f64,
+    /// The NUL-terminated UTF-8 payload of a string value; for an octet
+    /// value it points at the raw bytes instead.
     pub string: *const c_char,
+    /// The array payload of an array value; for an object value it carries
+    /// the closure receiver.
     pub array: *const *const c_char,
+    /// The element count of an array value; for an octet value it carries
+    /// the byte length.
     pub array_count: c_int,
+    /// The per-engine id of a retained value; for an object argument it
+    /// carries the raw object pointer.
     pub retained: usize,
 }
 
@@ -303,6 +358,10 @@ impl Value {
     }
 }
 
+/// The opaque engine handle the C ABI works with.
+///
+/// The layout is private; [`Tjs2Engine`] owns one and hands out the raw
+/// pointer when an FFI helper needs it.
 #[repr(C)]
 pub struct Engine {
     _private: [u8; 0],
@@ -375,7 +434,7 @@ unsafe extern "C" {
     fn tjs2_compile_time() -> *const c_char;
     /// Compile a UTF-8 script to a binary bytecode file (reference
     /// `tTJS::CompileScript` / `TVPCompileStorage`).
-    pub fn tjs2_compile_script(
+    fn tjs2_compile_script(
         e: *mut Engine,
         script: *const c_char,
         script_len: usize,
@@ -403,7 +462,7 @@ unsafe extern "C" {
         out_error: *mut *mut c_char,
     ) -> c_int;
     /// Dump all live script blocks to the console/log output (`tTJS::Dump`).
-    pub fn tjs2_dump(e: *mut Engine, out_error: *mut *mut c_char) -> c_int;
+    fn tjs2_dump(e: *mut Engine, out_error: *mut *mut c_char) -> c_int;
     /// Run the TJS2 garbage collector (`tTJS::DoGarbageCollection`); the
     /// `clIdle` half of `System.doCompact`.
     fn tjs2_do_gc(e: *mut Engine, out_error: *mut *mut c_char) -> c_int;
@@ -411,7 +470,7 @@ unsafe extern "C" {
     fn tjs2_do_rehash();
     /// Class names of a retained object, as a retained TJS Array (reference
     /// `Scripts.getClassNames`).
-    pub fn tjs2_get_class_names(
+    fn tjs2_get_class_names(
         e: *mut Engine,
         obj: Tjs2ValueId,
         out: *mut Value,
@@ -419,7 +478,7 @@ unsafe extern "C" {
     ) -> c_int;
     /// Member names of a retained object, as a retained TJS Array of strings
     /// (reference `Scripts.getObjectKeys` / `ScriptsAdd::_getKeys`).
-    pub fn tjs2_enum_members(
+    fn tjs2_enum_members(
         e: *mut Engine,
         obj: Tjs2ValueId,
         out: *mut Value,
@@ -427,7 +486,7 @@ unsafe extern "C" {
     ) -> c_int;
     /// Enable the `missing` member handler on a retained object (reference
     /// `Scripts.setCallMissing`).
-    pub fn tjs2_set_call_missing(
+    fn tjs2_set_call_missing(
         e: *mut Engine,
         obj: Tjs2ValueId,
         out_error: *mut *mut c_char,
@@ -441,6 +500,8 @@ unsafe extern "C" {
         obj: Tjs2ValueId,
         class_name: *const c_char,
     ) -> *mut c_void;
+    /// Free a string the C side allocated with `tjs2_malloc` (an error
+    /// message or a stack-trace string).
     pub fn tjs2_free_string(s: *mut c_char);
     fn tjs2_register_native_class_ex(
         e: *mut Engine,
@@ -488,14 +549,10 @@ unsafe extern "C" {
     fn tjs2_retain_value(engine: *mut Engine, v: *const Value) -> Tjs2ValueId;
     /// Retain a raw TJS object (see the C++ side). Returns a per-engine id
     /// or 0 on failure.
-    pub fn tjs2_retain_object(engine: *mut Engine, obj: *mut c_void) -> Tjs2ValueId;
+    fn tjs2_retain_object(engine: *mut Engine, obj: *mut c_void) -> Tjs2ValueId;
     /// Duplicate an existing retained id into a fresh id (the original stays
     /// live). Used to return a cached object without consuming the cache.
-    pub fn tjs2_retain_retained_id(engine: *mut Engine, id: Tjs2ValueId) -> Tjs2ValueId;
-    /// Find the retained id of a value already in the engine's retained
-    /// map, without retaining anything new (identity match: the same
-    /// function object + ObjThis). Returns the null id when not found.
-    fn tjs2_find_retained_id(engine: *mut Engine, v: *const Value) -> Tjs2ValueId;
+    fn tjs2_retain_retained_id(engine: *mut Engine, id: Tjs2ValueId) -> Tjs2ValueId;
     /// Stack trace string (Scripts.getTraceString); malloc'd, free with
     /// `tjs2_free_string`.
     pub fn tjs2_get_stack_trace_string(engine: *mut Engine, limit: c_int) -> *mut c_char;
@@ -777,10 +834,16 @@ unsafe impl Sync for Tjs2Engine {}
 /// Result of executing a script or evaluating an expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TjsValue {
+    /// No value; the result of an expression that produces nothing.
     Void,
+    /// An integral value.
     Integer(i64),
+    /// A floating-point value.
     Real(f64),
+    /// A text value.
     String(String),
+    /// An object value. No handle crosses the ABI, so the object itself is
+    /// reached through a retained id.
     Object,
     /// A retained value id (from [`Tjs2Engine::retain_value_detached`] /
     /// [`Tjs2Engine::retain_object_detached`]) passed as an argument. The
@@ -792,7 +855,8 @@ pub enum TjsValue {
     Retained(u64),
 }
 
-/// Result of [`Tjs2Engine::eval_retained`] / [`Tjs2Engine::exec_script_retained`].
+/// Result of [`Tjs2Engine::eval_retained`] /
+/// [`Tjs2Engine::exec_script_retained_with_context`].
 ///
 /// Scalars cross the ABI directly, but an object/function result cannot be
 /// represented by a [`TjsValue`] (no object handle crosses the boundary).
@@ -814,7 +878,9 @@ pub struct TjsError(String);
 
 /// Definition of one native method to attach to a class.
 pub struct NativeMethodDef {
+    /// The member name the script sees.
     pub name: &'static str,
+    /// The callback the VM calls.
     pub f: NativeMethodFn,
 }
 
@@ -822,21 +888,29 @@ pub struct NativeMethodDef {
 /// `set` are optional: a property without a getter reads as Void, one
 /// without a setter raises an access-denied error on writes.
 pub struct NativePropertyDef {
+    /// The member name the script sees.
     pub name: &'static str,
+    /// The getter; absent when the property is write-only.
     pub get: Option<NativePropertyGetFn>,
+    /// The setter; absent when the property is read-only.
     pub set: Option<NativePropertySetFn>,
 }
 
 /// Definition of one instance method to attach to a class.
 pub struct NativeInstanceMethodDef {
+    /// The member name the script sees.
     pub name: &'static str,
+    /// The callback the VM calls.
     pub f: NativeInstanceMethodFn,
 }
 
 /// Definition of one instance property to attach to a class.
 pub struct NativeInstancePropertyDef {
+    /// The member name the script sees.
     pub name: &'static str,
+    /// The getter; absent when the property is write-only.
     pub get: Option<NativeInstancePropertyGetFn>,
+    /// The setter; absent when the property is read-only.
     pub set: Option<NativeInstancePropertySetFn>,
 }
 
@@ -846,8 +920,11 @@ pub struct NativeInstancePropertyDef {
 /// The VM is single-threaded: register classes only from the thread that
 /// owns the engine.
 pub struct NativeClassBuilder<'a> {
+    /// The class name the script sees.
     pub name: &'a str,
+    /// The static methods the class carries.
     pub methods: Vec<NativeMethodDef>,
+    /// The static properties the class carries.
     pub properties: Vec<NativePropertyDef>,
 }
 
@@ -859,13 +936,18 @@ pub struct NativeClassBuilder<'a> {
 /// The VM is single-threaded: register classes only from the thread that
 /// owns the engine.
 pub struct NativeInstanceBuilder<'a> {
+    /// The class name the script sees.
     pub name: &'a str,
+    /// Allocates the payload of a new instance.
     pub create: NativeCreateInstanceFn,
+    /// Frees the payload when the object is destroyed.
     pub destroy: NativeDestroyInstanceFn,
     /// Optional native teardown hook (reference `Invalidate`). `None` keeps
     /// the previous behaviour: the payload is released only at destroy.
     pub invalidate: Option<NativeInvalidateInstanceFn>,
+    /// The instance methods the class carries.
     pub methods: Vec<NativeInstanceMethodDef>,
+    /// The instance properties the class carries.
     pub properties: Vec<NativeInstancePropertyDef>,
 }
 
@@ -883,15 +965,20 @@ pub struct NativeInstanceBuilder<'a> {
 /// The VM is single-threaded: register members only from the thread that
 /// owns the engine, and after the class itself is registered.
 pub struct NativeStaticMembers<'a> {
+    /// The class the members attach to.
     pub class_name: &'a str,
+    /// The static methods to attach.
     pub methods: Vec<NativeMethodDef>,
+    /// The static properties to attach.
     pub properties: Vec<NativePropertyDef>,
 }
 
 /// Definition of one objthis-only instance method to attach to an existing
 /// class (see [`Tjs2Engine::register_native_instance_members`]).
 pub struct NativeObjThisMethodDef {
+    /// The member name the script sees.
     pub name: &'static str,
+    /// The callback the VM calls.
     pub f: NativeObjThisMethodFn,
 }
 
@@ -899,8 +986,11 @@ pub struct NativeObjThisMethodDef {
 /// class. Both `get` and `set` are optional, with the same semantics as
 /// [`NativeInstancePropertyDef`].
 pub struct NativeObjThisPropertyDef {
+    /// The member name the script sees.
     pub name: &'static str,
+    /// The getter; absent when the property is write-only.
     pub get: Option<NativeObjThisPropertyGetFn>,
+    /// The setter; absent when the property is read-only.
     pub set: Option<NativeObjThisPropertySetFn>,
 }
 
@@ -913,8 +1003,11 @@ pub struct NativeObjThisPropertyDef {
 /// The VM is single-threaded: register members only from the thread that
 /// owns the engine, and after the class itself exists.
 pub struct NativeInstanceMembers<'a> {
+    /// The class the members attach to.
     pub class_name: &'a str,
+    /// The instance methods to attach.
     pub methods: Vec<NativeObjThisMethodDef>,
+    /// The instance properties to attach.
     pub properties: Vec<NativeObjThisPropertyDef>,
 }
 
@@ -1044,7 +1137,7 @@ impl Tjs2Engine {
     /// `context` is a raw `iTJSDispatch2*` obtained from an object argument's
     /// [`Value::object_handle`]; it is only dereferenced on the C++ side while
     /// the argument is alive.
-    pub fn exec_script_with_context(
+    fn exec_script_with_context(
         &self,
         script: &str,
         name: &str,
@@ -1094,7 +1187,7 @@ impl Tjs2Engine {
     /// Evaluate a TJS expression with an explicit `this` (`context`) and a
     /// reported line-number offset (`lineofs`), matching the reference
     /// `TJS::tTJS::EvalExpression(content, result, context, name, lineofs)`.
-    pub fn eval_with_context(
+    fn eval_with_context(
         &self,
         expression: &str,
         name: &str,
@@ -1112,7 +1205,7 @@ impl Tjs2Engine {
     /// `result` pointer: an expression that produces no value (a `swap`, for
     /// instance) then compiles, and the discarded value comes back as
     /// [`TjsValue::Void`].
-    pub fn eval_with_context_result(
+    fn eval_with_context_result(
         &self,
         expression: &str,
         name: &str,
@@ -1355,16 +1448,13 @@ impl Tjs2Engine {
     /// resolve an [`TjsValue::Object`] to the freshly produced object. Only
     /// the object arm is retained; void/integer/real/string results are
     /// returned as [`RetainedValue::Value`] and never allocate a retention.
-    pub fn exec_script_retained(
-        &self,
-        script: &str,
-        name: &str,
-    ) -> Result<RetainedValue, TjsError> {
+    #[cfg(test)]
+    fn exec_script_retained(&self, script: &str, name: &str) -> Result<RetainedValue, TjsError> {
         self.exec_script_retained_with_context(script, name, Tjs2ValueId::null(), 0)
     }
 
-    /// [`Self::exec_script_retained`] with an explicit `this` and line offset;
-    /// see [`Self::exec_script_with_context`].
+    /// Execute a script with an explicit `this` and line offset; see
+    /// [`Self::exec_script`].
     pub fn exec_script_retained_with_context(
         &self,
         script: &str,
@@ -1378,14 +1468,12 @@ impl Tjs2Engine {
     }
 
     /// Evaluate an expression like [`Self::eval`], but retain an object
-    /// result instead of losing it across the ABI. See
-    /// [`Self::exec_script_retained`].
+    /// result instead of losing it across the ABI.
     pub fn eval_retained(&self, expression: &str, name: &str) -> Result<RetainedValue, TjsError> {
         self.eval_retained_with_context(expression, name, Tjs2ValueId::null(), 0)
     }
 
-    /// [`Self::eval_retained`] with an explicit `this` and line offset; see
-    /// [`Self::eval_with_context`].
+    /// [`Self::eval_retained`] with an explicit `this` and line offset.
     pub fn eval_retained_with_context(
         &self,
         expression: &str,
@@ -1401,7 +1489,7 @@ impl Tjs2Engine {
     /// flag. When `need_result` is false the expression compiles without a
     /// result slot (reference: a native method whose caller discarded the
     /// result) and the discarded value is returned as [`TjsValue::Void`];
-    /// nothing is retained. See [`Self::eval_with_context_result`].
+    /// nothing is retained.
     pub fn eval_retained_with_context_result(
         &self,
         expression: &str,
@@ -1464,10 +1552,10 @@ impl Tjs2Engine {
     /// Execute a TJS script given as UTF-16 code units, keeping every unit
     /// exactly as the reference text stream does.
     ///
-    /// This is the lossless counterpart of [`Self::exec_script_with_context`]:
+    /// This is the lossless counterpart of [`Self::exec_script`]:
     /// `script` is a code-unit slice, so an unpaired surrogate survives the
     /// boundary instead of being dropped by a UTF-8 round trip.
-    pub fn exec_script_wide_with_context(
+    fn exec_script_wide_with_context(
         &self,
         script: &[u16],
         name: &str,
@@ -1506,8 +1594,8 @@ impl Tjs2Engine {
         Ok(take_value(&result))
     }
 
-    /// [`Self::exec_script_wide_with_context`] retaining an object result; see
-    /// [`Self::exec_script_retained`].
+    /// Execute a UTF-16 script with an explicit `this`, retaining an
+    /// object result.
     pub fn exec_script_retained_wide_with_context(
         &self,
         script: &[u16],
@@ -1522,8 +1610,8 @@ impl Tjs2Engine {
 
     /// Evaluate a TJS expression given as UTF-16 code units.
     ///
-    /// The lossless counterpart of [`Self::eval_with_context`].
-    pub fn eval_wide_with_context(
+    /// The lossless counterpart of [`Self::eval`].
+    fn eval_wide_with_context(
         &self,
         expression: &[u16],
         name: &str,
@@ -1562,8 +1650,7 @@ impl Tjs2Engine {
         Ok(take_value(&result))
     }
 
-    /// [`Self::eval_wide_with_context`] retaining an object result; see
-    /// [`Self::eval_retained`].
+    /// Evaluate a UTF-16 expression, retaining an object result.
     pub fn eval_retained_wide_with_context(
         &self,
         expression: &[u16],
@@ -2158,33 +2245,6 @@ name), and none was available"
         } else {
             Err("tjs2_invalidate_retained failed".into())
         }
-    }
-
-    /// Find the retained id of a script value already retained on this
-    /// engine, without creating a new entry (identity match: same closure
-    /// object + ObjThis). Returns `None` when the value is not retained.
-    /// Object values are resolved against the most recent object-valued
-    /// script result, like [`Self::retain_value_detached`].
-    pub fn find_retained_id(&self, v: &TjsValue) -> Option<Tjs2ValueId> {
-        let mut strings = Vec::new();
-        let ffi = match v {
-            TjsValue::Object => Value {
-                ty: VAL_OBJECT,
-                integer: 0,
-                real: 0.0,
-                string: ptr::null(),
-                array: ptr::null(),
-                array_count: 0,
-                retained: 0,
-            },
-            other => match value_to_ffi(other, &mut strings) {
-                Ok(v) => v,
-                Err(_) => return None,
-            },
-        };
-        // SAFETY: `ffi` mirrors `v` and self.inner is a live engine.
-        let id = unsafe { tjs2_find_retained_id(self.inner, &ffi) };
-        if id.is_null() { None } else { Some(id) }
     }
 
     /// Invoke a named member on a retained object value (e.g. a Timer

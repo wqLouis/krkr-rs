@@ -78,7 +78,6 @@ while it registers, so the handle must already be there when
 impl VmHost {
     pub fn engine(&self) -> &Tjs2Engine;
     pub fn compat(&self) -> &CompatHost;
-    pub fn compat_mut(&mut self) -> &mut CompatHost;
     pub fn exec(&self, source: &str, name: &str) -> Result<TjsValue, VmError>;
     pub fn eval(&self, expression: &str, name: &str) -> Result<TjsValue, VmError>;
     pub fn tick(&mut self, frame: FrameCtx<'_>) -> Result<(), VmError>;
@@ -89,11 +88,16 @@ impl VmHost {
 failure as `VmError::Script`, whose message carries the block name and the
 line.
 
+The host exposes no mutable accessor to the compatibility host: the
+dispatch state is owned by the host and is configured through the service
+handles passed to the constructor, so a caller cannot mutate it behind the
+host's back.
+
 `VmError` is the crate's error type:
 
 | variant | meaning |
 |---|---|
-| `VmError::Vm` | the VM could not be created |
+| `VmError::Vm` | the script engine could not be created |
 | `VmError::Script` | compilation or execution failed |
 | `VmError::Compat` | the compatibility surface failed |
 
@@ -129,7 +133,10 @@ the polls. Each segment reports its wall-clock cost through the `FrameBody`
 hooks, which is how the composition root attributes a slow frame.
 
 The engine owns the clock: the host receives `now_ms` and `dt_ms` from the
-engine's frame and never accumulates a delta of its own.
+engine's frame and never accumulates a delta of its own. The host reads
+neither: the polls a composition root owns get their per-frame delta
+through the frame body, and the frame body is the only per-frame state the
+host keeps.
 
 ---
 

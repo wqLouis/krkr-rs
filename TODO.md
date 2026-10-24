@@ -453,7 +453,7 @@ an allowlist exemption.
 
 * **Citation and history baseline.** Pre-existing findings live in
   `scripts/allowlists/house_style_baseline.txt` — JSON Lines keyed to the
-  normalized comment line, **4126 entries over 170 files** (4403 finding sites).
+  normalized comment line, **4076 entries over 168 files** (4352 finding sites).
   The baseline is **debt**: burn it down in file batches, largest first
   (`compat/src/natives/sound.rs` 247, `engine/src/scene.rs` 153,
   `compat/.../player_members.rs` 150, `system.rs` 131), deleting each entry as

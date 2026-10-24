@@ -35,8 +35,3 @@ crates/compat/src/natives/plugins/motion_player/emote.rs:*:unsafe-no-safety-note
 crates/compat/src/natives/plugins/motion_player/helpers.rs:*:unsafe-no-safety-note — debt: inst_ref/inst_mut plus property derefs; unsafe-inventory §2.6
 crates/compat/src/natives/plugins/motion_player/player_members.rs:*:unsafe-no-safety-note — debt: property *const Value deref; unsafe-inventory §2.6
 crates/compat/src/natives/scripts.rs:*:unsafe-no-safety-note — debt: wired services/storage deref; unsafe-inventory §2.6
-
-# --- LEGITIMATE EXCEPTION: missing-docs lint absent from the tjs wrapper ---
-# A peer is deciding whether the vendored FFI wrapper takes the lint; the
-# allowlist records the decision point rather than pre-empting it.
-crates/tjs/src/lib.rs:*:missing-docs-lint — FFI wrapper; missing-docs decision tracked by the crate owner

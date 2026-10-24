@@ -188,4 +188,3 @@ crates/compat/src/text.rs:373:Err(_) => dropped += 1, — an unpaired UTF-16 sur
 crates/platform/media/src/image_decode.rs:123:Err(_) => {} — a mislabeled `.tlg` falls through to content detection (both occurrences)
 crates/platform/media/src/tlg.rs:78:Err(_) => return false, — `bytes[11..15]` is exactly four bytes, so `try_into` cannot fail
 crates/platform/render/src/vulkan/device.rs:278:Err(_) => false, — a failed extension-property query means the extension is unavailable
-crates/tjs/src/lib.rs:1694:Err(_) => return None, — a value the FFI layer cannot convert yields no value to the caller

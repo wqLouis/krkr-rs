@@ -95,7 +95,6 @@ impl Tjs2Engine {
     pub fn exec_script_discard(&self, script: &str, name: &str) -> Result<(), TjsError>;
     pub fn eval(&self, expression: &str, name: &str) -> Result<TjsValue, TjsError>;
     pub fn eval_retained(&self, expression: &str, name: &str) -> Result<RetainedValue, TjsError>;
-    pub fn exec_script_retained(&self, script: &str, name: &str) -> Result<RetainedValue, TjsError>;
     pub fn register_native_class(&self, builder: &NativeClassBuilder) -> Result<(), String>;
     pub fn register_native_class_instance(&self, builder: &NativeInstanceBuilder) -> Result<(), String>;
     pub fn register_native_static_members(&self, members: &NativeStaticMembers) -> Result<(), String>;
@@ -109,6 +108,15 @@ take: a **static** class member, a **per-instance** member with a native
 payload, a **static** member attached to a class that already exists, and
 an **objthis-only** member attached to an existing class (including a TJS2
 builtin such as `Array` or `Dictionary`).
+
+The surface is deliberately narrow. An entry point that no caller outside
+the crate uses is private to it: the context-carrying variants of the
+execution calls (`exec_script_with_context`, `eval_with_context`,
+`eval_with_context_result`, `exec_script_wide_with_context`,
+`eval_wide_with_context`) and the `exec_script_retained` form are crate
+internals, and the raw `extern` declarations a caller does not need are
+private too. The crate carries `#![warn(missing_docs)]`, so every public
+item states its contract.
 
 ### The value types
 
