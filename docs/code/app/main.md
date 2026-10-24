@@ -167,10 +167,17 @@ final say on the size (a tiled window), the size it settles on arrives as the
 following `Resized` event, which the next frame applies.
 
 The **heartbeat** is one `debug` line per second of delivered frames, with
-the frame index, the frame gap and whether the frame reached the surface.
-The platform loop logs the ticker deadline for the same second, so an alive
-loop that presents nothing is distinguishable from one that stopped
-delivering frames.
+the frame index, the frame gap, whether the frame reached the surface and how
+many of the frames changed the scene. The platform loop logs the ticker
+deadline for the same second, so an alive loop that presents nothing is
+distinguishable from one that stopped delivering frames.
+
+The **scene-change count** is a measurement, not a decision. A frame that
+moves neither the scene's structure revision nor its content revision drew
+the same image as the frame before it, so the count says how many frames
+*could* have been skipped. It is conservative: a frame that only refreshed
+the debug overlay, or that wrote to a bitmap no layer shows, still counts as
+an unchanged scene.
 
 ---
 

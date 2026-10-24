@@ -191,6 +191,7 @@ a game folder cannot stop an otherwise playable mount), and a `patch.tjs` or
 | `tests/debug_overlay.rs` | the overlay node: present only when enabled, uploaded before it is drawn |
 | `tests/frame_timing.rs` | the slow-frame attribution: the phase that dominates, and the wall-clock total that contains the sum |
 | `tests/image_codec.rs` | `Bitmap.save` through the installed codec, and the resolution of a lowercased absolute name to the real path |
+| `tests/script_timing.rs` | the script-observable frame timing: a script timer and a continuous handler are delivered once per frame |
 | `tests/real_game.rs` | the mounted archives and the decoded assets of a real title |
 | `tests/boot_game.rs` | booting a real title end to end — **ignored**; it needs `KRKR_TEST_GAME` |
 | `tests/common/mod.rs` | `headless_host`, `build_solid_and_bitmap_scene` |

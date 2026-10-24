@@ -266,8 +266,29 @@ struct DesktopApp {
     pending_surface_size: Option<(u32, u32)>,
     /// Frames delivered since the last heartbeat line.
     heartbeat_frames: u64,
+    /// Frames since the last heartbeat line whose scene changed.
+    changed_frames: u64,
+    /// The scene revisions the previous frame ended on, or `None` before the
+    /// first frame.
+    last_revisions: Option<SceneRevisions>,
     /// Instant of the most recent heartbeat line.
     heartbeat_at: Instant,
+}
+
+/// The scene's two revision counters.
+///
+/// The counters are the engine's own: the structure revision moves when the
+/// layer tree changes and the content revision when a bitmap's pixels change.
+/// A frame that moves neither drew the same image as the frame before it.
+///
+/// The debug overlay is not part of the scene, so a frame that only refreshed
+/// the overlay leaves both counters where they were.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SceneRevisions {
+    /// The layer tree's structure revision.
+    structure: u64,
+    /// The bitmaps' content revision.
+    content: u64,
 }
 
 /// What the windowed loop is driving.
@@ -279,6 +300,18 @@ enum Running {
 }
 
 impl Running {
+    /// The scene revisions the last frame ended on.
+    fn scene_revisions(&self) -> SceneRevisions {
+        let scene = match self {
+            Running::Empty(host) => host.scene(),
+            Running::Game(game) => game.scene(),
+        };
+        SceneRevisions {
+            structure: scene.structure_revision(),
+            content: scene.content_revision(),
+        }
+    }
+
     /// Resizes the render surface.
     fn resize(&mut self, size: (u32, u32)) -> Result<(), String> {
         match self {
@@ -338,6 +371,8 @@ impl DesktopApp {
             pending_events: Vec::new(),
             pending_surface_size: None,
             heartbeat_frames: 0,
+            changed_frames: 0,
+            last_revisions: None,
             heartbeat_at: Instant::now(),
         }
     }
@@ -355,14 +390,18 @@ impl DesktopApp {
             return;
         }
         log::debug!(
-            "app: frame={} (+{} in {:.1} s), dt={dt_ms:.1} ms, presented={}",
+            "app: frame={} (+{} in {:.1} s), dt={dt_ms:.1} ms, presented={}, \
+             scene_changed={}/{}",
             report.frame_index,
             self.heartbeat_frames,
             elapsed.as_secs_f64(),
             report.presented,
+            self.changed_frames,
+            self.heartbeat_frames,
         );
         self.heartbeat_at = now;
         self.heartbeat_frames = 0;
+        self.changed_frames = 0;
     }
 }
 
@@ -470,7 +509,7 @@ impl EventHandler for DesktopApp {
     }
 
     fn frame(&mut self, dt_ms: f32, window: &PlatformWindow, pacing: FramePacing) -> Flow {
-        let report = {
+        let (report, revisions) = {
             let Some(running) = self.running.as_mut() else {
                 return Flow::Continue;
             };
@@ -508,8 +547,15 @@ impl EventHandler for DesktopApp {
                 eprintln!("krkr: frame resize failed: {error}");
                 return Flow::Exit;
             }
-            report
+            (report, running.scene_revisions())
         };
+        // A frame that moves neither revision drew the same image as the
+        // frame before it. The count is a measurement, not a decision: the
+        // frame still ran, and the script still saw the same clock.
+        if self.last_revisions != Some(revisions) {
+            self.changed_frames = self.changed_frames.saturating_add(1);
+        }
+        self.last_revisions = Some(revisions);
         self.log_heartbeat(&report, dt_ms, Instant::now());
         Flow::Continue
     }
