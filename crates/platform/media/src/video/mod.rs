@@ -31,6 +31,14 @@
 //! lazy caches and no backend registry; dropping the state releases every
 //! underlying decoder/format context (RAII).
 //!
+//! # The backend seam
+//!
+//! The backend module is private. [`open_video`], [`present_video`] and
+//! [`video_audio`] are the only path into it, and they forward to the
+//! backend's `open`/`present`/`audio`; those three stay inside the crate.
+//! Only the state type and, on the MediaCodec build, the standalone audio
+//! path are re-exported, because the crate root publishes them.
+//!
 //! # Backward-seek contract
 //!
 //! [`present_video`] returns the frame at (or after) the requested time. A
@@ -83,6 +91,7 @@ pub use backend::decode_audio as decode_audio_mediacodec;
 
 /// How far a backwards request may lag the current frame before the decoder
 /// seeks instead of reusing it. Mirrors the reference `SEEK_TOLERANCE_MS`.
+#[cfg(any(target_os = "android", feature = "video-ffmpeg"))]
 pub(crate) const SEEK_TOLERANCE_MS: u64 = 500;
 
 /// Video container/codec names advertised by [`crate::capabilities`].

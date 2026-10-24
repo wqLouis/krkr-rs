@@ -112,7 +112,7 @@ fn fps_from(avg: Rational, frame_rate: Option<Rational>) -> f32 {
 }
 
 /// Opens a video stream and probes its [`VideoSpec`].
-pub fn open(
+pub(crate) fn open(
     m: &Media,
     bytes: Arc<[u8]>,
     hint: Option<&str>,
@@ -234,7 +234,7 @@ pub fn open(
 }
 
 /// Presents the frame at (or after) `at_ms`.
-pub fn present(
+pub(crate) fn present(
     m: &Media,
     state: &mut VideoDecoderState,
     at_ms: u64,
@@ -278,7 +278,7 @@ pub fn present(
 ///
 /// The track is shared: the caller plays the same buffer the decoder
 /// produced, so opening a movie does not copy the whole track.
-pub fn audio(m: &Media, state: &VideoDecoderState) -> Result<Arc<DecodedAudio>, MediaError> {
+pub(crate) fn audio(m: &Media, state: &VideoDecoderState) -> Result<Arc<DecodedAudio>, MediaError> {
     let _ = m;
     state.audio.clone().ok_or_else(|| MediaError::Unsupported {
         message: format!("{}: no audio track", state.name),

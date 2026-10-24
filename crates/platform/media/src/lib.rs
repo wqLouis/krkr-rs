@@ -32,7 +32,7 @@
 //!   demuxes in memory, converts frames to tightly packed
 //!   RGBA8 and decodes the audio track; on Android the `video-mediacodec`
 //!   feature selects the NDK backend (`ndk` + a raw `AMediaExtractor` shim).
-//!   Exactly one backend must be selected (see [`video`]).
+//!   Exactly one backend must be selected (see the `video` module).
 //! * **YUV** — the pure `yuv420_to_rgba` conversion in [`yuv`].
 //!
 //! # Safety lint
@@ -54,7 +54,7 @@ mod hint;
 pub mod image_decode;
 pub mod image_encode;
 pub(crate) mod tlg;
-pub mod video;
+mod video;
 pub mod yuv;
 
 pub use audio::{AudioDecoderState, decode_audio, open_audio, probe_audio, read_audio, seek_audio};

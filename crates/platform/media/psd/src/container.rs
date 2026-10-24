@@ -228,6 +228,9 @@ pub enum PsbValue {
 // ---------------------------------------------------------------------------
 
 /// A fully parsed PSB/MDF container.
+///
+/// The document owns the parsed value tree and the raw chunk bytes, so the
+/// caller may drop the bytes it was parsed from.
 pub struct PsbDocument {
     /// The root value.
     pub root: PsbValue,

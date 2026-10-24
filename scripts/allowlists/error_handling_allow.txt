@@ -37,16 +37,16 @@ crates/compat/src/natives/plugins/json/mod.rs:768:strip_prefix('+') — Option o
 
 # --- MediaFormat::i32 returns Option (absent key); the default is the
 #     documented absent-key value (audit §3.2 rank 3) ----------------------
-crates/platform/media/src/video/mediacodec.rs:634:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
-crates/platform/media/src/video/mediacodec.rs:913:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
-crates/platform/media/src/video/mediacodec.rs:914:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
-crates/platform/media/src/video/mediacodec.rs:917:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
-crates/platform/media/src/video/mediacodec.rs:924:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
-crates/platform/media/src/video/mediacodec.rs:929:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
-crates/platform/media/src/video/mediacodec.rs:1085:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
-crates/platform/media/src/video/mediacodec.rs:1086:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
-crates/platform/media/src/video/mediacodec.rs:1105:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
-crates/platform/media/src/video/mediacodec.rs:1117:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:645:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:927:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:928:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:931:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:938:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:943:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:1099:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:1100:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:1119:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:1131:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
 
 # --- u64::try_from(bytes.len()) cannot overflow on the 64-bit host
 #     (audit §3.1) --------------------------------------------------------
@@ -62,7 +62,7 @@ crates/platform/fs/src/ops.rs:167:std::fs::metadata — metadata only rejects di
 crates/compat/src/natives/kag/mod.rs:250:let _ = engine.call_member( — onLabel/onScript/onScenarioLoaded handler errors are ignored, matching the reference
 
 # --- best-effort cleanup (audit §5.1) -------------------------------------
-crates/platform/media/src/video/mediacodec.rs:376:let-underscore — codec.stop() during teardown is best-effort
+crates/platform/media/src/video/mediacodec.rs:387:let-underscore — codec.stop() during teardown is best-effort
 
 # --- debug_assert backed by adjacent validation (audit §8) ----------------
 crates/compat/src/natives/plugins/wutcwf/mod.rs:305:debug-assert — TcwfHeader::parse rejects bytes_per_block < 32; the equal assert is redundant

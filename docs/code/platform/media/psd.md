@@ -46,6 +46,10 @@ parsed model or a typed error. Nothing is cached, nothing is registered and
 no value outlives the call, so a caller can decode any number of documents
 concurrently.
 
+The parsed model — `PsdFile` and `PsbDocument` — is **plain data**: its
+fields are public, a caller reads them directly, and every value owns the
+bytes it was parsed from. There is no accessor layer over it.
+
 ### The PSB container
 
 ```rust
@@ -79,7 +83,6 @@ pub struct LayerMask { … }
 pub struct AdditionalLayer { … }
 pub struct LayerExtra { … }
 pub struct LayerCompInfo { … }
-pub struct ImageResource { … }
 pub struct SliceItem { … }
 pub struct SliceResource { … }
 pub struct GuideItem { … }
@@ -94,7 +97,13 @@ pub enum ImageMode { … }
 The colour-mode constants are public: `COLOR_MODE_BITMAP = 0`,
 `COLOR_MODE_GRAYSCALE = 1`, `COLOR_MODE_INDEXED = 2`, `COLOR_MODE_RGB = 3`,
 `COLOR_MODE_CMYK = 4`, `COLOR_MODE_MULTICHANNEL = 7`,
-`COLOR_MODE_DUOTONE = 8`, `COLOR_MODE_LAB = 9`.
+`COLOR_MODE_DUOTONE = 8`, `COLOR_MODE_LAB = 9`. They name the code
+`Header::mode` carries, so a consumer that reads the mode compares it
+against them.
+
+The image-resource block (`ImageResource`) is the one record that is not
+part of the model: the parser reads it and consumes it while the document is
+assembled, so it stays inside the crate.
 
 ### The pixel decode
 
@@ -107,11 +116,13 @@ pub struct LayerImage {
     pub pixels: Vec<u8>,          // straight-alpha RGBA, row by row
 }
 
-pub fn layer_image(psd: &PsdFile, layer: &LayerInfo) -> PsdResult<LayerImage>;
+pub fn layer_image(psd: &PsdFile, layer: &LayerInfo, mode: ImageMode) -> PsdResult<Option<LayerImage>>;
 pub fn merged_image(psd: &PsdFile) -> PsdResult<Option<(u32, u32, Vec<u8>)>>;
 ```
 
-`merged_image` returns `None` when the document carries no merged composite.
+`layer_image` returns `None` when the layer stores no image for that mode,
+and `merged_image` returns `None` when the document carries no merged
+composite.
 
 ---
 

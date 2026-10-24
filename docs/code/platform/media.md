@@ -158,6 +158,12 @@ on copies no pixels.
 `video_audio` hands out the shared decoded track, so a caller that plays it
 does not copy the whole track.
 
+The `video` module itself is private. The three actions above and
+`VideoDecoderState` are published at the crate root, and the backend's own
+`open`/`present`/`audio` stay inside the crate: `crate::video` is their
+only caller. The MediaCodec build also publishes `decode_audio_mediacodec`
+(the standalone audio path) at the crate root.
+
 ### YUV
 
 The YUV vocabulary lives in the `media::yuv` module; it is not re-exported at

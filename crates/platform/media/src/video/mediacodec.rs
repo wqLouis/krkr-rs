@@ -45,11 +45,19 @@
 //! `Cargo.toml`), so [`stub`] provides the typed `Unsupported` placeholder
 //! that keeps `cargo check` green.
 
+// The state type and the standalone audio path are the backend's public
+// face: the crate re-exports them as `VideoDecoderState` and
+// `decode_audio_mediacodec`. The three decode actions stay inside the
+// crate, because `crate::video` is their only caller.
 #[cfg(not(target_os = "android"))]
-pub use stub::{VideoDecoderState, audio, decode_audio, open, present};
+pub use stub::{VideoDecoderState, decode_audio};
+#[cfg(not(target_os = "android"))]
+pub(crate) use stub::{audio, open, present};
 
 #[cfg(target_os = "android")]
-pub use android::{VideoDecoderState, audio, decode_audio, open, present};
+pub use android::{VideoDecoderState, decode_audio};
+#[cfg(target_os = "android")]
+pub(crate) use android::{audio, open, present};
 
 /// Non-Android placeholder backend.
 ///
@@ -75,7 +83,7 @@ mod stub {
     pub struct VideoDecoderState {}
 
     /// Opens a video stream. Host stub: always fails.
-    pub fn open(
+    pub(crate) fn open(
         m: &Media,
         bytes: Arc<[u8]>,
         hint: Option<&str>,
@@ -85,7 +93,7 @@ mod stub {
     }
 
     /// Presents a frame. Host stub: always fails.
-    pub fn present(
+    pub(crate) fn present(
         m: &Media,
         state: &mut VideoDecoderState,
         at_ms: u64,
@@ -95,7 +103,10 @@ mod stub {
     }
 
     /// Returns the decoded audio track. Host stub: always fails.
-    pub fn audio(m: &Media, state: &VideoDecoderState) -> Result<Arc<DecodedAudio>, MediaError> {
+    pub(crate) fn audio(
+        m: &Media,
+        state: &VideoDecoderState,
+    ) -> Result<Arc<DecodedAudio>, MediaError> {
         let _ = (m, state);
         Err(host_stub_error("video audio (mediacodec)"))
     }
@@ -583,7 +594,7 @@ mod android {
     /// returns the spec plus the caller-owned [`VideoDecoderState`]. A
     /// container with no video track, an unknown decoder or a malformed source
     /// returns a typed [`MediaError`].
-    pub fn open(
+    pub(crate) fn open(
         m: &Media,
         bytes: Arc<[u8]>,
         hint: Option<&str>,
@@ -668,7 +679,7 @@ mod android {
     /// seeks the extractor and flushes the decoder; otherwise the decoder
     /// decodes forward to the first frame at/after `at_ms`. Returns a tightly
     /// packed RGBA8 [`RgbaFrame`].
-    pub fn present(
+    pub(crate) fn present(
         m: &Media,
         state: &mut VideoDecoderState,
         at_ms: u64,
@@ -705,7 +716,10 @@ mod android {
     }
 
     /// Returns the decoded audio track, if the container has one.
-    pub fn audio(m: &Media, state: &VideoDecoderState) -> Result<Arc<DecodedAudio>, MediaError> {
+    pub(crate) fn audio(
+        m: &Media,
+        state: &VideoDecoderState,
+    ) -> Result<Arc<DecodedAudio>, MediaError> {
         let _ = m;
         state
             .audio_pcm

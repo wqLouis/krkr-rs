@@ -20,6 +20,10 @@
 //! registered and no value outlives the call, so a caller can decode any
 //! number of documents concurrently.
 //!
+//! The parsed model — [`parse::PsdFile`] and [`container::PsbDocument`] —
+//! is plain data: the fields are public, a caller reads them directly, and
+//! every value owns the bytes it was parsed from.
+//!
 //! # Cost model
 //!
 //! The metadata walk is a single serial cursor pass. Pixel work is the only

@@ -10,6 +10,12 @@
 //! accessors fail with [`PsdError::Eof`] when the input ends early, and the
 //! `*_ref` accessors return the format's own short-read sentinels (`-1`, an
 //! empty string) for the record fields that tolerate a truncated block.
+//!
+//! # The model
+//!
+//! [`PsdFile`] and the records it holds are plain data: the fields are
+//! public, a caller reads them directly, and every value owns the bytes it
+//! was parsed from.
 
 use std::collections::BTreeMap;
 
@@ -463,12 +469,15 @@ impl LayerInfo {
 }
 
 /// One image resource block.
+///
+/// The block is read by the parser and consumed while the document is
+/// assembled; it never leaves the crate.
 #[derive(Debug, Clone)]
-pub struct ImageResource {
+pub(crate) struct ImageResource {
     /// The resource id.
-    pub id: u16,
+    pub(crate) id: u16,
     /// The raw resource data.
-    pub data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
 }
 
 /// A parsed slice item.

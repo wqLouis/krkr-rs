@@ -33,6 +33,8 @@ use crate::simd;
 const PARALLEL_DECODE_BYTES: usize = 256 * 1024;
 
 /// A decoded layer image ready to be placed on a scene bitmap.
+///
+/// The image owns its pixels; the decoder keeps nothing.
 pub struct LayerImage {
     /// The image left edge in document pixels.
     pub left: i32,
