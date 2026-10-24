@@ -21,7 +21,6 @@ use api::config::CacheLimit;
 use api::geometry::PixelRegion;
 use api::media::DecodedImage;
 
-use crate::damage::{ChangeLog, LayerDamage};
 use crate::hasher::{Map, Set, map, set};
 use crate::imagedecode::{ImageOutcome, ImageSizeError, PendingImage};
 use crate::shader::{EffectDraw, EffectPipelines};
@@ -774,9 +773,13 @@ pub struct Scene {
     /// Monotonic counter bumped by every bitmap content change (see
     /// [`Scene::content_revision`]).
     content_revision: u64,
-    /// The changes accumulated since the last collection (see
-    /// [`Scene::take_damage`]).
-    damage: ChangeLog,
+    /// Whether the scene changed since the last presented frame.
+    ///
+    /// The flag is set by every change that can alter the picture, and
+    /// cleared by the engine only after a frame the display accepted: a
+    /// frame that was skipped leaves the previous frame's content on screen,
+    /// and the change must be drawn again.
+    dirty: bool,
 }
 
 impl Default for Scene {
@@ -799,7 +802,7 @@ impl Default for Scene {
             image_cache: DecodedImageCache::default(),
             structure_revision: 0,
             content_revision: 0,
-            damage: ChangeLog::empty(),
+            dirty: false,
         }
     }
 }
@@ -824,39 +827,31 @@ impl Scene {
         self.content_revision
     }
 
-    /// The changes accumulated since the last collection.
+    /// Whether the scene changed since the last presented frame.
     ///
-    /// The log names the layers whose content or geometry may have changed.
-    /// It holds no surface rectangle: the engine resolves it once per frame,
-    /// when it owns both the scene and the projection.
-    pub fn damage(&self) -> &ChangeLog {
-        &self.damage
+    /// A change that can alter the picture sets the flag, so a frame with
+    /// nothing to show is not drawn again. The flag is cleared only after a
+    /// frame the display accepted: a frame that was skipped leaves the
+    /// previous frame's content on screen, and the change must be drawn
+    /// again.
+    pub fn dirty(&self) -> bool {
+        self.dirty
     }
 
-    /// Take the accumulated changes, leaving the scene with no damage.
+    /// Record that the scene changed.
     ///
-    /// The caller owns the log from here on.
-    pub fn take_damage(&mut self) -> ChangeLog {
-        std::mem::take(&mut self.damage)
+    /// The engine calls this for a change it made outside the scene, and
+    /// the scene calls it for a change that does not move a revision.
+    pub(crate) fn mark_dirty(&mut self) {
+        self.dirty = true;
     }
 
-    /// Record that the whole surface must be repainted.
+    /// Clear the change flag.
     ///
-    /// The engine uses this for a change it cannot bound to an area.
-    pub fn damage_full(&mut self) {
-        self.damage.full = true;
-    }
-
-    /// Record that `id`'s content or geometry may have changed.
-    ///
-    /// `previous` is the layer's own rectangle before the change. The engine
-    /// damages the old and the new composed rectangle, so a layer that moved
-    /// leaves no stale pixels behind.
-    fn record_damage(&mut self, id: u32, previous: Option<Rect>) {
-        self.damage.changed.push(LayerDamage {
-            layer: id,
-            previous,
-        });
+    /// Only the engine clears it, and only after a frame the display
+    /// accepted.
+    pub(crate) fn clear_dirty(&mut self) {
+        self.dirty = false;
     }
 
     /// Bump [`Scene::structure_revision`]. Over-approximating (bumping on a
@@ -864,11 +859,13 @@ impl Scene {
     /// resync.
     fn touch_structure(&mut self) {
         self.structure_revision = self.structure_revision.wrapping_add(1);
+        self.mark_dirty();
     }
 
     /// Bump [`Scene::content_revision`].
     fn touch_content(&mut self) {
         self.content_revision = self.content_revision.wrapping_add(1);
+        self.mark_dirty();
     }
 
     /// Create a window and return its new id. Starts visible, fully opaque
@@ -1280,7 +1277,6 @@ impl Scene {
             layer.z_order = absolute;
         }
         self.touch_structure();
-        self.record_damage(id, None);
         Ok(())
     }
 
@@ -1322,7 +1318,6 @@ impl Scene {
         parent_layer.children.insert(index, id);
         self.renumber_siblings(id);
         self.touch_structure();
-        self.record_damage(id, None);
         Ok(())
     }
 
@@ -1438,10 +1433,7 @@ impl Scene {
     pub fn mark_layer_image_modified(&mut self, id: u32) {
         if let Some(layer) = self.layer_mut_untracked(id) {
             layer.image_modified = true;
-        } else {
-            return;
         }
-        self.record_damage(id, None);
     }
 
     /// Apply `f` to a layer and invalidate only when `f` reports a change.
@@ -1461,12 +1453,10 @@ impl Scene {
         id: u32,
         f: impl FnOnce(&mut LayerState) -> bool,
     ) -> Option<bool> {
-        let previous = self.layer(id).map(|layer| layer.rect);
         let changed = f(self.layer_mut_untracked(id)?);
         if changed {
             self.invalidate_layer_cache(id);
             self.touch_structure();
-            self.record_damage(id, previous);
         }
         Some(changed)
     }
@@ -1849,11 +1839,6 @@ impl Scene {
             }
         }
         self.layers.retain(|l| l.id != id);
-        // The removed layer leaves a hole in the surface: the area it covered
-        // must be repainted from the layers below it. The old rectangle
-        // cannot be composed any more — the layer is gone — so the whole
-        // surface is repainted rather than an area that is guessed at.
-        self.damage_full();
         // The removed layer releases its MainImage. A bitmap still held by a
         // surviving layer or a script `Bitmap` object is kept
         // (see [`Scene::release_bitmap`]).
@@ -3507,14 +3492,16 @@ impl Scene {
     /// Borrow the composite target `dst` mutably and one source `src`
     /// immutably at the same time. Unlike [`Scene::bitmap_mut`] this bumps
     /// neither revision nor a content generation: a composite takes one
-    /// mutable borrow per pass and samples many sources. Returns `None` when
-    /// an id is missing or `dst` and `src` are the same bitmap, because a
-    /// composite never samples the bitmap it writes.
+    /// mutable borrow per pass and samples many sources. It does mark the
+    /// scene changed, because the composite writes the target's pixels.
+    /// Returns `None` when an id is missing or `dst` and `src` are the
+    /// same bitmap, because a composite never samples the bitmap it writes.
     pub fn bitmap_mut_with_source(
         &mut self,
         dst: u32,
         src: u32,
     ) -> Option<(&mut BitmapState, &BitmapState)> {
+        self.mark_dirty();
         let di = self.bitmap_position(dst)?;
         let si = self.bitmap_position(src)?;
         if di == si {
@@ -3535,13 +3522,15 @@ impl Scene {
     /// or `dst` aliases a source; callers then take a copying path. Unlike
     /// [`Scene::bitmap_mut`] this does not bump [`Scene::content_revision`]: a
     /// whole-subtree transition rewrites the same frame bitmap every tick
-    /// without changing the scene graph.
+    /// without changing the scene graph. It does mark the scene changed,
+    /// because the transition rewrites the frame's pixels.
     pub fn bitmap_mut_with_refs(
         &mut self,
         dst: u32,
         src1: u32,
         src2: u32,
     ) -> Option<(&mut BitmapState, &BitmapState, &BitmapState)> {
+        self.mark_dirty();
         let di = self.bitmaps.iter().position(|b| b.id == dst)?;
         let a = self.bitmaps.iter().position(|b| b.id == src1)?;
         let b = self.bitmaps.iter().position(|b| b.id == src2)?;
@@ -3596,7 +3585,6 @@ impl Scene {
         if changed {
             self.invalidate_layer_cache(id);
             self.touch_structure();
-            self.record_damage(id, None);
             if let Some(old) = replaced {
                 self.release_bitmap(old);
             }
@@ -3655,7 +3643,6 @@ impl Scene {
                 self.invalidate_ancestor_caches_except(id, source);
             }
             self.touch_structure();
-            self.record_damage(id, None);
             if let Some(replaced) = replaced {
                 let kept = frame.map(|frame| [frame.src1.bitmap, frame.src2.bitmap]);
                 for bitmap in [replaced.src1.bitmap, replaced.src2.bitmap] {
@@ -3719,7 +3706,6 @@ impl Scene {
                 self.invalidate_ancestor_caches_except(id, source);
             }
             self.touch_structure();
-            self.record_damage(id, None);
             if let Some(replaced) = replaced {
                 for bitmap in replaced.bitmaps() {
                     if kept.contains(&bitmap) {

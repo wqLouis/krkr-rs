@@ -21,7 +21,6 @@ mod hasher;
 #[cfg(feature = "simd-experiment")]
 mod simd;
 
-pub mod damage;
 pub mod engine;
 pub mod imagedecode;
 pub mod input;
