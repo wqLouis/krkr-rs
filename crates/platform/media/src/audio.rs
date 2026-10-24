@@ -274,7 +274,12 @@ where
 ///
 /// `hint` is the storage name or extension the caller used to find `bytes`;
 /// it only steers backend selection and is never trusted over the content.
-/// A stream that cannot be probed returns a typed [`MediaError`].
+///
+/// # Errors
+///
+/// [`MediaError::Unsupported`] when the build has no decoder for the
+/// detected format, [`MediaError::Decode`] when the container is malformed,
+/// and [`MediaError::NotFound`] when the bytes hold no audio track.
 pub fn probe_audio(m: &Media, bytes: &[u8], hint: Option<&str>) -> Result<AudioSpec, MediaError> {
     let _ = m;
     let edit = mp4_edit(bytes);
@@ -284,9 +289,14 @@ pub fn probe_audio(m: &Media, bytes: &[u8], hint: Option<&str>) -> Result<AudioS
 /// Decodes a whole audio file into interleaved `f32` samples.
 ///
 /// The result carries the probed [`AudioSpec`]; the samples are interleaved
-/// per channel (`interleaved[frame * channels + channel]`). A stream that
-/// cannot be decoded returns a typed [`MediaError`] — no silence is
-/// substituted.
+/// per channel (`interleaved[frame * channels + channel]`).
+///
+/// # Errors
+///
+/// [`MediaError::Unsupported`] when the build has no decoder for the
+/// detected format, [`MediaError::Decode`] when the container or the stream
+/// is malformed, and [`MediaError::NotFound`] when the bytes hold no audio
+/// track. No silence is substituted for a failed decode.
 pub fn decode_audio(
     m: &Media,
     bytes: &[u8],
@@ -392,7 +402,12 @@ fn decode_all(opened: OpenedAudio<'_>, hint: Option<&str>) -> Result<DecodedAudi
 /// at the wrong speed; the decoded packet is staged in the state, so nothing
 /// is lost.
 ///
-/// A stream that cannot be opened returns a typed [`MediaError`].
+/// # Errors
+///
+/// [`MediaError::Unsupported`] when the build has no decoder for the
+/// detected format, [`MediaError::Decode`] when the container is malformed or
+/// yields no decodable audio, and [`MediaError::NotFound`] when the bytes
+/// hold no audio track.
 pub fn open_audio(
     m: &Media,
     bytes: Arc<[u8]>,
@@ -440,7 +455,13 @@ pub fn open_audio(
 ///
 /// Returns the number of samples written, always a whole number of frames
 /// (the tail of `out` that cannot hold a complete frame is left untouched).
-/// [`MediaError::EndOfStream`] marks the end of the stream.
+///
+/// # Errors
+///
+/// [`MediaError::EndOfStream`] marks the end of the stream,
+/// [`MediaError::InvalidData`] when the channel count cannot be represented
+/// in memory, and [`MediaError::Decode`] when the decoder fails on the next
+/// packet.
 pub fn read_audio(
     m: &Media,
     state: &mut AudioDecoderState,
@@ -655,8 +676,12 @@ fn decode_packet_into(
 /// The reader is reopened from the retained compressed bytes (the reference
 /// `StreamDecoder` behaviour on seek/loop wrap), then decoded frames are
 /// discarded until `frame` is reached. The decode position is updated
-/// immediately. A stream that cannot be reopened returns a typed
-/// [`MediaError`].
+/// immediately.
+///
+/// # Errors
+///
+/// The errors of [`open_audio`]: a stream that cannot be reopened reports the
+/// same typed failure as its first open.
 pub fn seek_audio(m: &Media, state: &mut AudioDecoderState, frame: u64) -> Result<(), MediaError> {
     let _ = m;
     let hint = state.hint.clone();

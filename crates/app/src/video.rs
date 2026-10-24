@@ -77,7 +77,7 @@ impl Inner {
             let bytes = storage.read(path).map_err(|error| MediaError::Io {
                 message: format!("video: cannot read {path:?}: {error}"),
             })?;
-            let media = self.media.clone();
+            let media = self.media;
             let (spec, decoder) =
                 open_video(&media, Arc::from(bytes.into_boxed_slice()), Some(path))?;
             self.stats.record_video_decoder();
@@ -100,7 +100,7 @@ impl Inner {
             log::warn!("video: {error}");
             return None;
         }
-        let media = self.media.clone();
+        let media = self.media;
         let stream = self.streams.get_mut(path)?;
         let at = at_ms.max(0) as u64;
         match present_video(&media, &mut stream.decoder, at) {
@@ -115,7 +115,7 @@ impl Inner {
     /// The decoded audio track for `path`; `Ok(None)` when the container has
     /// no audio stream.
     fn audio(&mut self, path: &str) -> Result<Option<Arc<DecodedAudio>>, MediaError> {
-        let media = self.media.clone();
+        let media = self.media;
         let stream = self.open(path)?;
         if stream.spec.audio_streams == 0 {
             return Ok(None);
@@ -192,7 +192,7 @@ pub(crate) unsafe fn install_video_source_metered(
     let ctx = host.ctx()?;
     let source = MediaVideoSource {
         inner: Rc::new(RefCell::new(Inner {
-            media: media.clone(),
+            media: *media,
             storage: storage as *const Storage,
             stats: Rc::clone(stats),
             streams: StreamMap::default(),

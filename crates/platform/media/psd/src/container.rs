@@ -701,7 +701,17 @@ fn decrypt_u32(ctx: &mut EmoteCtx, value: &mut u32) {
 /// Parse a decompressed PSB byte stream into a [`PsbDocument`].
 ///
 /// `seed` is the Emote decryption seed. With a non-positive seed an encrypted
-/// container fails with [`PsbError::Encrypted`].
+/// container fails with [`PsbError::Encrypted`]. The bytes are consumed by the
+/// call: the returned document owns its own copies of the parsed data.
+///
+/// # Errors
+///
+/// [`PsbError::BadSignature`] when the header is not `PSB\0`,
+/// [`PsbError::ArchiveNotPsb`] when the bytes are an MDF/MFL archive,
+/// [`PsbError::UnsupportedVersion`] for a version outside 1..=3,
+/// [`PsbError::Encrypted`] when the container is encrypted and no seed was
+/// supplied, [`PsbError::Truncated`] when the stream ends early, and
+/// [`PsbError::Format`] when the structure is invalid.
 pub fn parse(mut data: Vec<u8>, seed: i64) -> PsbResult<PsbDocument> {
     let mut header = {
         let mut reader = Reader::at(&data, 0);
@@ -837,6 +847,15 @@ fn load_chunks(
 }
 
 /// Decompress a raw file and parse it in one step.
+///
+/// `raw` is the file as it was read: a plain PSB stream, an MDF zlib payload
+/// or an Emote LZ4 frame. The decompressed bytes are parsed with the same
+/// rules as [`parse`].
+///
+/// # Errors
+///
+/// [`PsbError::Decompress`] when the payload cannot be inflated or the LZ4
+/// frame is invalid, plus the errors of [`parse`].
 pub fn parse_stream(raw: &[u8], seed: i64) -> PsbResult<PsbDocument> {
     parse(open_decompressed_stream(raw)?, seed)
 }

@@ -20,9 +20,20 @@ use crate::{Backend, FileHandle, FileState, FileSystem, lock};
 
 /// Opens `path` under `fs` with `mode` and returns a caller-owned handle.
 ///
-/// The returned [`FileState`] holds the open handle and the initial cursor
-/// (0, or the file length for [`OpenMode::Append`]). No state is retained by
-/// `fs`.
+/// `fs` selects the backend; `path` is resolved against it (relative host
+/// paths against the root's base directory). The returned [`FileState`] holds
+/// the open handle and the initial cursor (0, or the file length for
+/// [`OpenMode::Append`]). No state is retained by `fs`: the caller owns the
+/// handle and closes it by dropping it.
+///
+/// # Errors
+///
+/// [`FsError::InvalidPath`] when the path is not valid for the backend,
+/// [`FsError::NotFound`] when the file does not exist and `mode` does not
+/// create it, [`FsError::AlreadyExists`] when `mode` is
+/// [`OpenMode::CreateNew`] and the file exists, [`FsError::IsADirectory`]
+/// when the path names a directory and [`FsError::PermissionDenied`] when the
+/// backend refuses access.
 pub fn open(fs: &FileSystem, path: &FsPath, mode: OpenMode) -> Result<FileState, FsError> {
     match &fs.backend {
         Backend::Host { base } => open_host(base, path, mode),
@@ -31,6 +42,16 @@ pub fn open(fs: &FileSystem, path: &FsPath, mode: OpenMode) -> Result<FileState,
 }
 
 /// Returns metadata for `path`.
+///
+/// The result reports the size of a regular file (a directory reports `0`),
+/// whether the path is a directory, and the modification time in milliseconds
+/// since the Unix epoch when the backend records one. A backend that cannot
+/// represent a timestamp reports `None` rather than a substitute.
+///
+/// # Errors
+///
+/// [`FsError::NotFound`] when the path does not exist and
+/// [`FsError::PermissionDenied`] when the backend refuses to read it.
 pub fn stat(fs: &FileSystem, path: &FsPath) -> Result<FileStat, FsError> {
     match &fs.backend {
         Backend::Host { base } => {
@@ -72,6 +93,10 @@ pub fn stat(fs: &FileSystem, path: &FsPath) -> Result<FileStat, FsError> {
 }
 
 /// Returns `true` if `path` exists and can be stat-ed.
+///
+/// A stat that fails for any reason — a missing path, a permission error, an
+/// I/O failure — reports `false`. A caller that must tell those apart uses
+/// [`stat`] instead.
 pub fn exists(fs: &FileSystem, path: &FsPath) -> bool {
     stat(fs, path).is_ok()
 }
@@ -79,7 +104,14 @@ pub fn exists(fs: &FileSystem, path: &FsPath) -> bool {
 /// Lists the immediate children of directory `path`.
 ///
 /// Entries are sorted by name for deterministic output. The result contains
-/// no `"."` or `".."` entries.
+/// no `"."` or `".."` entries, and it lists one level only: a subdirectory
+/// appears as an entry, not as its children.
+///
+/// # Errors
+///
+/// [`FsError::NotFound`] when the directory does not exist,
+/// [`FsError::NotADirectory`] when the path names a regular file, and
+/// [`FsError::PermissionDenied`] when the backend refuses to read it.
 pub fn list(fs: &FileSystem, path: &FsPath) -> Result<Vec<DirEntry>, FsError> {
     match &fs.backend {
         Backend::Host { base } => {
@@ -136,6 +168,13 @@ pub fn list(fs: &FileSystem, path: &FsPath) -> Result<Vec<DirEntry>, FsError> {
 }
 
 /// Recursively creates directory `path` and any missing parents.
+///
+/// Creating a directory that already exists succeeds; the call is idempotent.
+///
+/// # Errors
+///
+/// [`FsError::InvalidPath`] when the path is not valid for the backend and
+/// [`FsError::PermissionDenied`] when the backend refuses to create it.
 pub fn create_dir_all(fs: &FileSystem, path: &FsPath) -> Result<(), FsError> {
     match &fs.backend {
         Backend::Host { base } => {
@@ -159,6 +198,12 @@ pub fn create_dir_all(fs: &FileSystem, path: &FsPath) -> Result<(), FsError> {
 ///
 /// The in-memory backend does not remove directories here; use the middle
 /// layer's namespace logic if directory removal is required.
+///
+/// # Errors
+///
+/// [`FsError::NotFound`] when the path does not exist,
+/// [`FsError::IsADirectory`] when it names a directory, and
+/// [`FsError::PermissionDenied`] when the backend refuses to remove it.
 pub fn remove_file(fs: &FileSystem, path: &FsPath) -> Result<(), FsError> {
     match &fs.backend {
         Backend::Host { base } => {
@@ -189,7 +234,13 @@ pub fn remove_file(fs: &FileSystem, path: &FsPath) -> Result<(), FsError> {
 /// Copies the file `from` to `to`.
 ///
 /// The destination's parent directory must already exist, matching
-/// `std::fs::copy`.
+/// `std::fs::copy`. Copying a file onto itself leaves it unchanged.
+///
+/// # Errors
+///
+/// [`FsError::NotFound`] when `from` does not exist,
+/// [`FsError::IsADirectory`] when either path names a directory, and
+/// [`FsError::PermissionDenied`] when the backend refuses the copy.
 pub fn copy(fs: &FileSystem, from: &FsPath, to: &FsPath) -> Result<(), FsError> {
     match &fs.backend {
         Backend::Host { base } => {
@@ -237,6 +288,15 @@ pub fn copy(fs: &FileSystem, from: &FsPath, to: &FsPath) -> Result<(), FsError> 
 }
 
 /// Renames (moves) `from` to `to`.
+///
+/// A directory move relocates every descendant with it. The destination's
+/// parent directory must already exist.
+///
+/// # Errors
+///
+/// [`FsError::NotFound`] when `from` does not exist,
+/// [`FsError::IsADirectory`] when the destination names a directory, and
+/// [`FsError::PermissionDenied`] when the backend refuses the move.
 pub fn rename(fs: &FileSystem, from: &FsPath, to: &FsPath) -> Result<(), FsError> {
     match &fs.backend {
         Backend::Host { base } => {
@@ -315,8 +375,15 @@ pub fn rename(fs: &FileSystem, from: &FsPath, to: &FsPath) -> Result<(), FsError
 
 /// Reads up to `buf.len()` bytes at `offset` from `file`.
 ///
-/// Positional: the logical cursor is not modified. Returns the number of
-/// bytes read; `0` means end of file.
+/// `offset` is a byte position from the start of the file and `buf` receives
+/// the bytes read. Positional: the logical cursor is not modified. Returns the
+/// number of bytes read; `0` means end of file or an offset past it.
+///
+/// # Errors
+///
+/// [`FsError::InvalidState`] when the handle was not opened for reading or
+/// does not belong to `fs`, and [`FsError::NotFound`] when the in-memory
+/// backend no longer holds the file.
 pub fn read_at(
     fs: &FileSystem,
     file: &FileState,
@@ -365,6 +432,13 @@ pub fn read_at(
 /// There is no artificial size cap. The in-memory backend grows the backing
 /// buffer with `try_reserve`, so a write the platform cannot represent or
 /// allocate returns a typed [`FsError`] rather than aborting the process.
+///
+/// # Errors
+///
+/// [`FsError::InvalidState`] when the handle was not opened for writing or
+/// does not belong to `fs`, [`FsError::NotFound`] when the in-memory backend
+/// no longer holds the file, and [`FsError::Io`] when the region is not
+/// representable or the buffer cannot grow.
 pub fn write_at(
     fs: &FileSystem,
     file: &FileState,
@@ -412,6 +486,14 @@ pub fn write_at(
 }
 
 /// Returns the current size of `file` in bytes.
+///
+/// The size is the length of the file's content, not the position of the
+/// logical cursor.
+///
+/// # Errors
+///
+/// [`FsError::InvalidState`] when the handle does not belong to `fs`, and
+/// [`FsError::NotFound`] when the in-memory backend no longer holds the file.
 pub fn file_size(fs: &FileSystem, file: &FileState) -> Result<u64, FsError> {
     match (&fs.backend, &file.handle) {
         (Backend::Host { .. }, FileHandle::Host(handle)) => handle
@@ -434,7 +516,12 @@ pub fn file_size(fs: &FileSystem, file: &FileState) -> Result<u64, FsError> {
 
 /// Flushes any buffered data for `file` to its backing store.
 ///
-/// The in-memory backend has no buffering, so this is a no-op.
+/// The in-memory backend has no buffering, so this is a no-op there.
+///
+/// # Errors
+///
+/// [`FsError::InvalidState`] when the handle does not belong to `fs`, and
+/// [`FsError::Io`] when the host backend cannot flush the file.
 pub fn flush(fs: &FileSystem, file: &FileState) -> Result<(), FsError> {
     match (&fs.backend, &file.handle) {
         (Backend::Host { .. }, FileHandle::Host(handle)) => {
@@ -450,6 +537,11 @@ pub fn flush(fs: &FileSystem, file: &FileState) -> Result<(), FsError> {
 ///
 /// This is the sequential convenience used by the middle layer's stream
 /// wrapper. Returns `0` at end of file, leaving the cursor unchanged.
+///
+/// # Errors
+///
+/// The same errors as [`read_at`]: the handle must be readable and must
+/// belong to `fs`.
 pub fn read_seq(fs: &FileSystem, file: &mut FileState, buf: &mut [u8]) -> Result<usize, FsError> {
     let n = read_at(fs, file, file.cursor, buf)?;
     file.cursor += u64::try_from(n).unwrap_or(u64::MAX);
@@ -459,7 +551,13 @@ pub fn read_seq(fs: &FileSystem, file: &mut FileState, buf: &mut [u8]) -> Result
 /// Moves `file`'s logical cursor to `from` and returns the new position.
 ///
 /// This only affects [`read_seq`] / [`seek`]; positional IO ignores the
-/// cursor.
+/// cursor. The returned position is the new cursor.
+///
+/// # Errors
+///
+/// [`FsError::Io`] when the target is before the start of the file or does
+/// not fit a byte position, and the errors of [`file_size`] when `from` is
+/// [`SeekFrom::End`].
 pub fn seek(fs: &FileSystem, file: &mut FileState, from: SeekFrom) -> Result<u64, FsError> {
     let target: i128 = match from {
         SeekFrom::Start(off) => off as i128,
@@ -493,6 +591,11 @@ fn backend_mismatch() -> FsError {
 /// Unlike [`stat`], this reports the raw size of a directory and the three
 /// host timestamps plus the permission bits the platform exposes. A time the
 /// backend cannot represent is `None`.
+///
+/// # Errors
+///
+/// [`FsError::NotFound`] when the path does not exist and
+/// [`FsError::PermissionDenied`] when the backend refuses to read it.
 pub fn metadata(fs: &FileSystem, path: &FsPath) -> Result<FileMetadata, FsError> {
     match &fs.backend {
         Backend::Host { base } => {
@@ -544,6 +647,10 @@ fn system_time_millis(time: std::time::SystemTime) -> Option<i64> {
 /// failure distinguishable from “not a directory”. A caller that needs the
 /// reference's “missing or unreadable is `false`” convenience decides so at
 /// its own boundary.
+///
+/// # Errors
+///
+/// The errors of [`metadata`]: a missing path or a refused read.
 pub fn is_dir(fs: &FileSystem, path: &FsPath) -> Result<bool, FsError> {
     metadata(fs, path).map(|meta| meta.is_dir)
 }
@@ -555,6 +662,10 @@ pub fn is_dir(fs: &FileSystem, path: &FsPath) -> Result<bool, FsError> {
 /// failure distinguishable from “not a regular file”. A caller that needs the
 /// reference's “missing or unreadable is `false`” convenience decides so at
 /// its own boundary.
+///
+/// # Errors
+///
+/// The errors of [`metadata`]: a missing path or a refused read.
 pub fn is_file(fs: &FileSystem, path: &FsPath) -> Result<bool, FsError> {
     metadata(fs, path).map(|meta| meta.is_file)
 }
@@ -564,6 +675,12 @@ pub fn is_file(fs: &FileSystem, path: &FsPath) -> Result<bool, FsError> {
 /// A directory with children is a typed error on both backends; use the
 /// namespace layer for a recursive delete. The in-memory backend removes only
 /// directories it explicitly created (or an implicit parent), never the root.
+///
+/// # Errors
+///
+/// [`FsError::NotFound`] when the directory does not exist,
+/// [`FsError::NotADirectory`] when the path names a regular file, and
+/// [`FsError::Io`] when the directory is not empty or is the storage root.
 pub fn remove_dir(fs: &FileSystem, path: &FsPath) -> Result<(), FsError> {
     match &fs.backend {
         Backend::Host { base } => {
@@ -604,6 +721,12 @@ pub fn remove_dir(fs: &FileSystem, path: &FsPath) -> Result<(), FsError> {
 /// A path that names a directory is [`FsError::IsADirectory`], and a missing
 /// path is [`FsError::NotFound`]. The buffer grows fallibly, so a file the
 /// platform cannot allocate is a typed error rather than a panic.
+///
+/// # Errors
+///
+/// [`FsError::NotFound`] when the path does not exist,
+/// [`FsError::IsADirectory`] when it names a directory, and
+/// [`FsError::PermissionDenied`] when the backend refuses to read it.
 pub fn read(fs: &FileSystem, path: &FsPath) -> Result<Vec<u8>, FsError> {
     match &fs.backend {
         Backend::Host { base } => {
@@ -630,6 +753,12 @@ pub fn read(fs: &FileSystem, path: &FsPath) -> Result<Vec<u8>, FsError> {
 ///
 /// The destination's parent directory must already exist, matching
 /// `std::fs::write`.
+///
+/// # Errors
+///
+/// [`FsError::IsADirectory`] when the path names a directory,
+/// [`FsError::PermissionDenied`] when the backend refuses the write, and
+/// [`FsError::Io`] when the bytes cannot be stored.
 pub fn write(fs: &FileSystem, path: &FsPath, bytes: &[u8]) -> Result<(), FsError> {
     match &fs.backend {
         Backend::Host { base } => {
@@ -656,6 +785,11 @@ pub fn write(fs: &FileSystem, path: &FsPath, bytes: &[u8]) -> Result<(), FsError
 /// The position is read from the file's current length on every call, so the
 /// logical cursor is not modified. The file must have been opened for
 /// writing.
+///
+/// # Errors
+///
+/// The errors of [`file_size`] and [`write_at`]: the handle must be writable
+/// and must belong to `fs`.
 pub fn append(fs: &FileSystem, file: &FileState, buf: &[u8]) -> Result<usize, FsError> {
     let end = file_size(fs, file)?;
     write_at(fs, file, end, buf)
@@ -668,6 +802,12 @@ pub fn append(fs: &FileSystem, file: &FileState, buf: &[u8]) -> Result<usize, Fs
 /// file for writing (a read-only file is a typed error) and applies the same
 /// instant to both timestamps. The in-memory backend does not track times and
 /// reports [`FsError::Unsupported`].
+///
+/// # Errors
+///
+/// [`FsError::Unsupported`] on the in-memory backend,
+/// [`FsError::NotFound`] when the path does not exist, and
+/// [`FsError::PermissionDenied`] when the file cannot be opened for writing.
 pub fn set_times(fs: &FileSystem, path: &FsPath, seconds: i64) -> Result<(), FsError> {
     match &fs.backend {
         Backend::Host { base } => {

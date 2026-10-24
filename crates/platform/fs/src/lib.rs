@@ -25,9 +25,9 @@
 //! container read + parse itself is a stateless transform over bytes, so it
 //! lives here in [`xp3`].
 //!
-//! The public operations live in the private [`ops`] module and are
-//! re-exported here, so their `fs::…` paths are stable while the crate
-//! is split into host, memory and operation modules.
+//! The public operations live in the private `ops` module and are
+//! re-exported here, so a caller names them `fs::open`, `fs::read_at` and so
+//! on.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -56,7 +56,7 @@ use memory::MemoryStore;
 /// Backend kind and base configuration of a [`FileSystem`].
 ///
 /// This is private state: callers select a backend through
-/// [`FileSystem::host`] / [`FileSystem::memory`] / [`FsConfig`].
+/// [`FileSystem::host`] or [`FileSystem::memory`].
 #[derive(Clone, Debug)]
 enum Backend {
     /// A host directory used as the base for relative paths.
@@ -69,26 +69,6 @@ enum Backend {
         /// Shared backing store (a resource, not per-file handle state).
         store: Arc<Mutex<MemoryStore>>,
     },
-}
-
-/// Configuration for constructing a [`FileSystem`].
-///
-/// Mirrors the two implemented backends. URI roots are intentionally absent
-/// until an Android SAF / APK asset backend is added.
-///
-/// Marked `#[non_exhaustive]`: new backends may be added without it being a
-/// breaking change for callers that match on this enum.
-#[derive(Clone, Debug, Default)]
-#[non_exhaustive]
-pub enum FsConfig {
-    /// A `std::fs` root: relative host paths resolve against `base`.
-    Host {
-        /// Base directory for relative paths.
-        base: PathBuf,
-    },
-    /// A fresh, private in-memory root.
-    #[default]
-    Memory,
 }
 
 /// A stateless file-system service.
@@ -109,6 +89,10 @@ impl FileSystem {
     /// Relative [`FsPath::Host`] paths are joined to `base`; absolute paths
     /// are used as given. Namespace and sandbox policy are the middle
     /// layer's responsibility.
+    ///
+    /// The returned object owns nothing but the base directory: it opens no
+    /// file and keeps no handle. Every file it returns is owned by the
+    /// caller as a [`FileState`].
     pub fn host(base: impl Into<PathBuf>) -> Self {
         Self {
             backend: Backend::Host { base: base.into() },
@@ -118,7 +102,8 @@ impl FileSystem {
     /// Creates an in-memory root backed by a fresh, private store.
     ///
     /// Two clones of the returned object share the same store; two separate
-    /// calls to `memory` do not.
+    /// calls to `memory` do not. The store outlives every [`FileState`] the
+    /// root hands out, because each state holds its own handle on it.
     pub fn memory() -> Self {
         Self {
             backend: Backend::Memory {
@@ -127,15 +112,10 @@ impl FileSystem {
         }
     }
 
-    /// Creates a file system from an [`FsConfig`].
-    pub fn from_config(config: FsConfig) -> Self {
-        match config {
-            FsConfig::Host { base } => Self::host(base),
-            FsConfig::Memory => Self::memory(),
-        }
-    }
-
     /// Returns the host base directory, or `None` for the in-memory backend.
+    ///
+    /// The returned path is the directory the root was created with; it is
+    /// not resolved against the process working directory.
     pub fn base(&self) -> Option<&Path> {
         match &self.backend {
             Backend::Host { base } => Some(base.as_path()),
@@ -144,21 +124,21 @@ impl FileSystem {
     }
 
     /// Returns `true` if this file system uses the host-path backend.
+    ///
+    /// A host root resolves relative paths against its base directory on the
+    /// host filesystem; an in-memory root resolves them against its own
+    /// store.
     pub fn is_host(&self) -> bool {
         matches!(self.backend, Backend::Host { .. })
     }
 
     /// Returns `true` if this file system uses the in-memory backend.
+    ///
+    /// The counterpart of [`FileSystem::is_host`]; exactly one of the two is
+    /// true for every root.
     pub fn is_memory(&self) -> bool {
         matches!(self.backend, Backend::Memory { .. })
     }
-}
-
-/// Creates a file system from an [`FsConfig`].
-///
-/// Convenience alias for [`FileSystem::from_config`].
-pub fn create_file_system(config: FsConfig) -> FileSystem {
-    FileSystem::from_config(config)
 }
 
 /// The open handle plus the logical cursor for one file.
@@ -180,11 +160,18 @@ pub struct FileState {
 
 impl FileState {
     /// Returns the current logical cursor, in bytes from the start.
+    ///
+    /// The cursor is the logical position [`read_seq`] reads at and
+    /// [`seek`] moves; the positional actions [`read_at`] and [`write_at`]
+    /// ignore it.
     pub fn cursor(&self) -> u64 {
         self.cursor
     }
 
     /// Returns the access mode this file was opened with.
+    ///
+    /// The mode is the one requested at [`open`] time and never changes for
+    /// the lifetime of the handle.
     pub fn mode(&self) -> OpenMode {
         self.mode
     }

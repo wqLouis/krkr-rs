@@ -68,7 +68,7 @@ use crate::texture::{Texture, TextureDesc};
 use crate::{BackendKind, FrameTimings, GpuCapabilities, TextureFormat};
 
 /// Number of frames recorded concurrently.
-pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
+pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 /// Size of the push-constant block shared with the shaders.
 pub(crate) const PUSH_CONSTANT_SIZE: u32 = 96;
@@ -78,7 +78,7 @@ pub(crate) const PUSH_CONSTANT_SIZE: u32 = 96;
 /// This value contains only handles and configuration selected at creation
 /// time. The logical device, swapchain and every GPU resource that changes per
 /// caller live in the caller-owned [`VulkanState`].
-pub struct VulkanPipeline {
+pub(crate) struct VulkanPipeline {
     /// The Vulkan loader and instance, destroyed when the last owner drops.
     instance_guard: Arc<InstanceGuard>,
     /// Selected physical device.
@@ -165,7 +165,7 @@ impl VulkanPipeline {
     }
 
     /// Returns the capabilities advertised by the selected device.
-    pub fn capabilities(&self) -> GpuCapabilities {
+    pub(crate) fn capabilities(&self) -> GpuCapabilities {
         GpuCapabilities {
             backend: BackendKind::Vulkan,
             max_texture_dimension: self.max_texture_dimension,
@@ -2151,7 +2151,8 @@ fn validate_upload(
 /// This is a diagnostic for asserting that a frame's uploads were merged: a
 /// frame that rasterizes N new glyphs should report one batch for them, not N.
 /// It is only meaningful on a machine that can create a Vulkan device.
-pub fn upload_submit_count(state: &RenderState) -> Option<u64> {
+#[cfg(test)]
+fn upload_submit_count(state: &RenderState) -> Option<u64> {
     match &state.kind {
         StateKind::Vulkan(vstate) => Some(vstate.upload.submits()),
         StateKind::Null(_) => None,
@@ -2162,10 +2163,64 @@ pub fn upload_submit_count(state: &RenderState) -> Option<u64> {
 mod tests {
     use super::{
         AcquireOutcome, FrameFences, PresentFault, SwapchainRecovery, acquire_outcome,
-        present_recovery, swapchain_fault,
+        present_recovery, swapchain_fault, upload_submit_count,
     };
+    use api::geometry::PixelRegion;
     use ash::vk;
     use ash::vk::Handle;
+    use testkit::headless_window;
+
+    use crate::{
+        PipelineConfig, TextureDesc, TextureUpload, begin_render_state, create_render_pipeline,
+        create_texture, upload_textures,
+    };
+
+    /// The upload ring merges every texture of one `upload_textures` call into
+    /// a single queue submit, so a frame's dirty bitmaps cost one submit, not
+    /// one per texture.
+    ///
+    /// A headless CI machine has no window surface, so this returns early when
+    /// the Vulkan device or surface cannot be created. On a machine with a GPU
+    /// it asserts the submit count, which is the host-observable half of the
+    /// ring contract (the null backend cannot count GPU submits).
+    #[test]
+    fn vulkan_upload_batch_is_one_submit_or_skips() {
+        let Ok(pipeline) = create_render_pipeline(PipelineConfig::vulkan()) else {
+            return;
+        };
+        let Ok((_surface, mut state)) = begin_render_state(&pipeline, &headless_window()) else {
+            return;
+        };
+        let a = create_texture(&pipeline, TextureDesc::new(4, 4)).expect("texture a");
+        let b = create_texture(&pipeline, TextureDesc::new(4, 4)).expect("texture b");
+        let a_pixels = [1u8; 16];
+        let b_pixels = [2u8; 16];
+
+        let before = upload_submit_count(&state).expect("vulkan state");
+        upload_textures(
+            &pipeline,
+            &mut state,
+            &[
+                TextureUpload {
+                    texture: &a,
+                    region: PixelRegion::new(0, 0, 2, 2),
+                    pixels: &a_pixels,
+                },
+                TextureUpload {
+                    texture: &b,
+                    region: PixelRegion::new(0, 0, 2, 2),
+                    pixels: &b_pixels,
+                },
+            ],
+        )
+        .expect("batch upload");
+        let after = upload_submit_count(&state).expect("vulkan state");
+        assert_eq!(
+            after - before,
+            1,
+            "two textures in one batch must be one submit"
+        );
+    }
 
     /// A fence handle for the test; the handle is never used with a device.
     fn fence(raw: u64) -> vk::Fence {

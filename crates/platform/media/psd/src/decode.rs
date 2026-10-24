@@ -647,6 +647,16 @@ fn merge_mask_to_alpha(
 // ---------------------------------------------------------------------------
 
 /// Decode one layer with `mode` applied.
+///
+/// `mode` selects which image of the layer is decoded (the colour composite,
+/// a single channel or the layer mask). `Ok(None)` means the layer stores no
+/// image for that mode; the pixels are RGBA8, row-major.
+///
+/// # Errors
+///
+/// [`PsdError::Eof`] when a channel ends early,
+/// [`PsdError::Decompress`] when a compressed channel cannot be expanded, and
+/// [`PsdError::Invalid`] when the channel data is malformed.
 pub fn layer_image(
     psd: &PsdFile,
     layer: &LayerInfo,
@@ -809,6 +819,16 @@ pub fn layer_image(
 }
 
 /// Decode the merged composite image.
+///
+/// The result is the composite's width, height and row-major RGBA8 pixels.
+/// `Ok(None)` means the document carries no merged composite or no usable
+/// image data.
+///
+/// # Errors
+///
+/// [`PsdError::Eof`] when a channel ends early,
+/// [`PsdError::Decompress`] when a compressed channel cannot be expanded, and
+/// [`PsdError::Invalid`] when the composite is malformed.
 pub fn merged_image(psd: &PsdFile) -> PsdResult<Option<(u32, u32, Vec<u8>)>> {
     let Some(image_data) = psd.image_data.as_ref() else {
         return Ok(None);

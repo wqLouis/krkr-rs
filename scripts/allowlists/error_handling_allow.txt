@@ -100,8 +100,8 @@ crates/compat/src/natives/visual/layer/mod.rs:342:let _ = scene.update_layer(id,
 
 # --- Path::strip_prefix's error means "not under the prefix", and the rename
 #     filter intentionally skips those keys (audit §3.3) --------------------
-crates/platform/fs/src/ops.rs:281:ok-discard — Path::strip_prefix's error is exactly "not under src"; the rename filter skips keys outside the moved directory
-crates/platform/fs/src/ops.rs:290:ok-discard — Path::strip_prefix's error is exactly "not under src"; the rename filter skips keys outside the moved directory
+crates/platform/fs/src/ops.rs:341:ok-discard — Path::strip_prefix's error is exactly "not under src"; the rename filter skips keys outside the moved directory
+crates/platform/fs/src/ops.rs:350:ok-discard — Path::strip_prefix's error is exactly "not under src"; the rename filter skips keys outside the moved directory
 
 # --- usize -> u64 cannot overflow (audit §3.1) -----------------------------
 crates/platform/fs/src/ops.rs:426:u64::try_from(v.len()) — usize -> u64 cannot overflow on any supported target

@@ -21,16 +21,14 @@ use crate::scene::{
 };
 use crate::state::{RenderState, StateKind, Surface, SurfaceKind};
 use crate::texture::{Texture, TextureDesc};
-use crate::{BackendKind, FrameTimings, GpuCapabilities, TextureFormat};
+use crate::{BackendKind, FrameTimings, GpuCapabilities, MAX_TRAVERSAL_DEPTH, TextureFormat};
 
-/// Maximum width/height advertised by the null backend.
-pub const NULL_MAX_TEXTURE_DIMENSION: u32 = 16384;
-
-/// Maximum traversal depth before the null backend stops descending.
+/// Maximum width/height advertised by null backend.
 ///
-/// Guards against a cyclic or excessively deep tree produced by a buggy
-/// caller.
-pub const MAX_TRAVERSAL_DEPTH: u32 = 1024;
+/// The limit belongs to this backend: a real device reports its own limit
+/// through
+/// [`GpuCapabilities::max_texture_dimension`](crate::GpuCapabilities::max_texture_dimension).
+pub const NULL_MAX_TEXTURE_DIMENSION: u32 = 16384;
 
 /// Per-frame traversal counters produced by [`NullRenderPipeline::render`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -89,6 +87,13 @@ impl NullRenderPipeline {
     }
 
     /// Creates a headless surface and its state, ignoring `window`.
+    ///
+    /// The null backend has no window, so the handle is accepted and
+    /// discarded; the returned pair is a surface and the state that owns it.
+    ///
+    /// # Errors
+    ///
+    /// Never: the null backend can always produce a surface.
     pub fn begin(&self, _window: &RawWindowHandle) -> Result<(Surface, RenderState), RenderError> {
         let surface = Surface {
             kind: SurfaceKind::Null(NullSurface),
@@ -100,6 +105,13 @@ impl NullRenderPipeline {
     }
 
     /// Updates the tracked surface size.
+    ///
+    /// The size is recorded in the state; the null backend never presents it.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::InvalidArgument`] when the state does not belong to
+    /// this backend.
     pub fn resize(
         &self,
         surface: &Surface,
@@ -113,6 +125,11 @@ impl NullRenderPipeline {
     }
 
     /// Recreates a lost surface; the null backend never loses one.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::InvalidArgument`] when the state does not belong to
+    /// this backend.
     pub fn recover_surface(
         &self,
         surface: &Surface,
@@ -123,6 +140,14 @@ impl NullRenderPipeline {
     }
 
     /// Creates a texture handle after validating its descriptor.
+    ///
+    /// The handle owns no storage yet; the pixels arrive through
+    /// [`upload_texture`](Self::upload_texture).
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::InvalidArgument`] when the descriptor is empty,
+    /// oversized for the backend or otherwise malformed.
     pub fn create_texture(&self, desc: TextureDesc) -> Result<Texture, RenderError> {
         validate_desc(&desc)?;
         Ok(Texture::new(desc))
@@ -149,6 +174,10 @@ impl NullRenderPipeline {
 
     /// Accepts the release of an effect pipeline handle; none can exist on this
     /// backend.
+    ///
+    /// The call is a no-op because
+    /// [`create_effect_pipeline`](Self::create_effect_pipeline) always
+    /// refuses, so there is never a handle to release.
     pub fn destroy_effect_pipeline(&self, _state: &mut RenderState, _pipeline: EffectPipeline) {}
 
     /// Releases the state slot associated with `tex`, if any.
@@ -159,6 +188,14 @@ impl NullRenderPipeline {
     }
 
     /// Copies a sub-rectangle of pixels into the texture's CPU storage.
+    ///
+    /// The pixels are tightly packed and row-major for `region`.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::InvalidArgument`] when the state does not belong to
+    /// this backend, and [`RenderError::Upload`] when the region is out of
+    /// bounds or the pixel slice does not match it.
     pub fn upload_texture(
         &self,
         state: &mut RenderState,
@@ -172,6 +209,13 @@ impl NullRenderPipeline {
 
     /// Creates an offscreen render-target handle after validating its
     /// descriptor.
+    ///
+    /// The CPU storage is allocated when the target is first rendered into.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::InvalidArgument`] when the descriptor is empty,
+    /// oversized or not RGBA8.
     pub fn create_render_target(
         &self,
         desc: RenderTargetDesc,
@@ -188,6 +232,17 @@ impl NullRenderPipeline {
     }
 
     /// Renders `scene` into the CPU storage of `target`.
+    ///
+    /// The target's pixels are composited by the CPU software rasterizer, so
+    /// the result is the correctness baseline for the destination-dependent
+    /// blends.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::InvalidArgument`] when the state does not belong to
+    /// this backend, [`RenderError::Framebuffer`] when the target is not
+    /// owned by the state, and [`RenderError::OutOfMemory`] when the target is
+    /// too large for the host address space.
     pub fn render_to_target(
         &self,
         state: &mut RenderState,
@@ -227,6 +282,15 @@ impl NullRenderPipeline {
     }
 
     /// Copies a sub-rectangle of `target` into `out`.
+    ///
+    /// `out` receives tightly packed, row-major pixels and must be exactly
+    /// `region.area() * 4` bytes long.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::InvalidArgument`] when the state does not belong to
+    /// this backend, and [`RenderError::Framebuffer`] when the target is not
+    /// owned by the state or the region does not match `out`.
     pub fn read_render_target(
         &self,
         state: &RenderState,
@@ -245,6 +309,14 @@ impl NullRenderPipeline {
     }
 
     /// Traverses `scene` and records per-frame counters.
+    ///
+    /// The frame is always reported as presented: the null backend has no
+    /// display to present to.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::InvalidArgument`] when the surface or the state does
+    /// not belong to this backend.
     pub fn render(
         &self,
         surface: &Surface,
@@ -297,7 +369,7 @@ impl NullRenderPipeline {
 
 /// Immutable null-backend surface handle.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct NullSurface;
+pub(crate) struct NullSurface;
 
 /// Mutable headless state owned by the middle layer.
 #[derive(Debug, Default)]

@@ -49,19 +49,20 @@ crate-wide `forbid`. The shim module carries the single scoped
 ## 3. The service object and the state values
 
 ```rust
-pub struct Media { config: MediaConfig }     // #[non_exhaustive] MediaConfig, currently empty
+pub struct Media;
 impl Media {
-    pub fn new() -> Self;
-    pub fn with_config(config: MediaConfig) -> Self;
-    pub fn config(&self) -> &MediaConfig;
+    pub const fn new() -> Self;
 }
-pub fn create_media(config: MediaConfig) -> Media;
 pub fn capabilities(m: &Media) -> MediaCapabilities;
 ```
 
-`Media` holds only immutable configuration and has **no `&mut self` method**.
-Every evolving value is a separate value created by this crate and owned by
-the caller:
+`Media` holds no state and has **no `&mut self` method**. It is the facade the
+architecture mandates: the decode actions take `&Media` so the call reads like
+a service call, and the object selects nothing. There is no configuration to
+pass — a decode that cannot be performed returns a typed `MediaError` rather
+than a substituted value — so there is no configuration type and no second
+factory spelling. Every evolving value is a separate value created by this
+crate and owned by the caller:
 
 | value | what it holds | owner |
 |---|---|---|
@@ -158,6 +159,9 @@ on copies no pixels.
 does not copy the whole track.
 
 ### YUV
+
+The YUV vocabulary lives in the `media::yuv` module; it is not re-exported at
+the crate root.
 
 ```rust
 pub fn yuv420_to_rgba(yuv: &[u8], layout: &Yuv420Layout) -> Vec<u8>;

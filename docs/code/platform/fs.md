@@ -42,22 +42,20 @@ is spelled out in [`06-file-system.md`](../../../docs.old/migration/06-file-syst
 pub struct FileSystem { /* backend kind + base directory */ }
 pub struct FileState  { /* open handle + logical cursor + mode */ }
 
-pub enum FsConfig { Host { base: PathBuf }, Memory }   // #[non_exhaustive]
-
 impl FileSystem {
     pub fn host(base: impl Into<PathBuf>) -> Self;
     pub fn memory() -> Self;
-    pub fn from_config(config: FsConfig) -> Self;
     pub fn base(&self) -> Option<&Path>;
     pub fn is_host(&self) -> bool;
     pub fn is_memory(&self) -> bool;
 }
-pub fn create_file_system(config: FsConfig) -> FileSystem;
 ```
 
 * `FileSystem` stores **only** configuration: a backend kind and, for the host
   backend, a base directory. No mutable field, no cache, no open-file
-  registry.
+  registry. The backend is selected by the constructor — `host` for a host
+  directory, `memory` for the in-memory store — so there is no configuration
+  enum and no second factory spelling.
 * `FileState` is created by `open` and **owned by L2**, which stores every
   handle and makes every position decision. It exposes `cursor()` and
   `mode()`; the handle itself is private.

@@ -300,7 +300,15 @@ parent_opacity, scissor, depth)`:
    `Unsupported` for an effect draw);
 5. recurse into the children in `z` order.
 
-Both backends are capped at `MAX_TRAVERSAL_DEPTH` (1024).
+Both backends are capped at `MAX_TRAVERSAL_DEPTH` (1024), the crate-root
+constant that names the limit for the pipeline as a whole.
+
+The **Vulkan** backend is a private module: the public spelling of a backend
+is [`BackendKind::Vulkan`] and the actions in §4, so no consumer can reach
+the device handles. The **null** backend is the public `render::null` module,
+because its introspection — `NullRenderPipeline::last_frame`,
+`texture_pixels`, `texture_uploaded_bytes` — and its
+`NULL_MAX_TEXTURE_DIMENSION` cap are part of the headless contract.
 
 The **null** backend has two jobs: for the framebuffer it only *counts* the
 draws (there is no window to show); for an **offscreen target** it runs the
@@ -462,10 +470,13 @@ L2-side registry is documented in [`../engine/shader.md`](../engine/shader.md).
   validation, the rejected mismatched buffer and region, the dropped target
   releasing its pixels, and the Vulkan target capabilities (or a skip).
 * `crates/platform/render/tests/texture.rs` — the upload region and length
-  validation, the rejected invalid descriptors, and the Vulkan upload batch
-  being **one** submit (or a skip on a machine with no surface).
+  validation, and the rejected invalid descriptors.
 * `crates/platform/render/src/lib.rs` `mod tests` — the batch upload applying
   every region, and the null frame timings recorded as zero.
+* `crates/platform/render/src/vulkan/mod.rs` `mod tests` — the Vulkan upload
+  batch being **one** submit (or a skip on a machine with no surface). The
+  assertion lives inside the crate because the submit counter is a
+  test-only probe, not a public counter.
 
 ---
 

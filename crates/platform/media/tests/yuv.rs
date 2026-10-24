@@ -1,6 +1,6 @@
 //! Integration tests for the pure YUV420 -> RGBA conversion.
 
-use media::{CropRect, Yuv420Layout, YuvSampling, micros_to_millis, yuv420_to_rgba};
+use media::yuv::{CropRect, Yuv420Layout, YuvSampling, micros_to_millis, yuv420_to_rgba};
 
 /// Build a planar (I420) buffer whose Y plane is `ys`, U plane `us`, V
 /// plane `vs`, with the given stride and slice height.

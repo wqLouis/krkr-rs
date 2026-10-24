@@ -178,6 +178,7 @@ struct UploadSlot {
     /// that would otherwise transition the same image at the same time.
     keys: Vec<u64>,
     /// Number of batches submitted from this slot; a diagnostic counter.
+    #[cfg(test)]
     submits: u64,
 }
 
@@ -226,6 +227,7 @@ impl UploadRing {
     ///
     /// This is a diagnostic: a caller can assert that a frame's N texture
     /// uploads were merged into one batch instead of N.
+    #[cfg(test)]
     pub(crate) fn submits(&self) -> u64 {
         self.slots.iter().map(|slot| slot.submits).sum()
     }
@@ -354,6 +356,7 @@ fn create_upload_slot(
         fence,
         in_flight: false,
         keys: Vec::new(),
+        #[cfg(test)]
         submits: 0,
     })
 }
@@ -792,7 +795,10 @@ where
     slot.in_flight = true;
     slot.keys.clear();
     slot.keys.extend_from_slice(keys);
-    slot.submits = slot.submits.saturating_add(1);
+    #[cfg(test)]
+    {
+        slot.submits = slot.submits.saturating_add(1);
+    }
     Ok(())
 }
 

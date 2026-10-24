@@ -45,7 +45,7 @@ pub const XP3_MAGIC: [u8; 11] = [
 ];
 
 /// Index encode method mask (low 3 bits of the index flag byte).
-pub const INDEX_ENCODE_METHOD_MASK: u8 = 0x07;
+pub(crate) const INDEX_ENCODE_METHOD_MASK: u8 = 0x07;
 /// Index stored raw.
 pub const INDEX_ENCODE_RAW: u8 = 0;
 /// Index stored zlib-compressed.
@@ -54,7 +54,7 @@ pub const INDEX_ENCODE_ZLIB: u8 = 1;
 pub const INDEX_CONTINUE: u8 = 0x80;
 
 /// Segment encode method mask.
-pub const SEGM_ENCODE_METHOD_MASK: u32 = 0x07;
+pub(crate) const SEGM_ENCODE_METHOD_MASK: u32 = 0x07;
 /// Segment stored raw.
 pub const SEGM_ENCODE_RAW: u32 = 0;
 /// Segment stored zlib-compressed.
@@ -103,7 +103,10 @@ pub enum Xp3Error {
     NoIndex,
 }
 
-/// Convenience alias for XP3 results.
+/// The result of an XP3 parse or read.
+///
+/// The error is always [`Xp3Error`]; the alias exists so the archive's
+/// signatures name the failure mode instead of spelling it out.
 pub type Result<T> = std::result::Result<T, Xp3Error>;
 
 /// Stateless per-segment extraction filter (the `xp3filter` hook).
@@ -244,6 +247,17 @@ pub struct Xp3Archive {
 
 impl Xp3Archive {
     /// Parse an XP3 index from an already-open [`FileState`].
+    ///
+    /// `fs` and `file` locate the archive's bytes; the returned value holds
+    /// the parsed index only, and every later read takes the same pair again.
+    ///
+    /// # Errors
+    ///
+    /// [`Xp3Error::NotAnXp3`] when the bytes do not start with the XP3 magic,
+    /// [`Xp3Error::NoIndex`] when the archive has no index block,
+    /// [`Xp3Error::BadIndexFlag`] or [`Xp3Error::CorruptIndex`] when the index
+    /// is malformed, and [`Xp3Error::Io`] or [`Xp3Error::Fs`] when the read
+    /// itself fails.
     pub fn open(fs: &FileSystem, file: &FileState) -> Result<Self> {
         let mut reader = FileReader { fs, file, pos: 0 };
         Self::open_reader(&mut reader)
@@ -258,6 +272,10 @@ impl Xp3Archive {
     /// [`Seek`] so callers other than the L1 [`FileState`] surface (for
     /// example an EXE/APK wrapper or a positional adapter) can parse an
     /// archive without materializing a full [`FileState`].
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`open`](Self::open).
     pub fn open_reader<R: Read + Seek>(reader: &mut R) -> Result<Self> {
         // Read the 11-byte magic. A file shorter than the magic is simply not
         // an XP3 archive; a genuine read failure is preserved as its typed
@@ -359,6 +377,12 @@ impl Xp3Archive {
     }
 
     /// Read the full contents of an entry by name.
+    ///
+    /// # Errors
+    ///
+    /// [`Xp3Error::NotFound`] when the archive has no entry with that name,
+    /// [`Xp3Error::Inflate`] when a compressed segment cannot be decoded, and
+    /// [`Xp3Error::Io`] or [`Xp3Error::Fs`] when the read fails.
     pub fn read(&self, fs: &FileSystem, file: &FileState, name: &str) -> Result<Vec<u8>> {
         self.read_with_filter(fs, file, name, "", None)
     }
@@ -368,6 +392,10 @@ impl Xp3Archive {
     ///
     /// `archive_name` is passed through to the filter for diagnostics and
     /// content-filter context; `filter` is never stored (L1 is stateless).
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`read`](Self::read).
     pub fn read_with_filter(
         &self,
         fs: &FileSystem,
@@ -385,6 +413,11 @@ impl Xp3Archive {
     }
 
     /// Read the full contents of an entry.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`read`](Self::read), except that a missing name is
+    /// not one of them: the caller supplies the entry.
     pub fn read_entry(&self, fs: &FileSystem, file: &FileState, entry: &Entry) -> Result<Vec<u8>> {
         self.read_entry_with_filter(fs, file, entry, "", None)
     }
@@ -395,6 +428,10 @@ impl Xp3Archive {
     /// The filter is invoked with the running uncompressed offset, matching
     /// the reference's `tTVPXP3ArchiveStream::Read`, so a whole-entry read
     /// sees the same `(offset, buffer)` sequence a streaming read would.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`read_entry`](Self::read_entry).
     pub fn read_entry_with_filter(
         &self,
         fs: &FileSystem,
@@ -417,6 +454,13 @@ impl Xp3Archive {
     ///
     /// Like [`Self::read_entry_with_filter`], `filter` is applied to each
     /// decoded segment and is never stored.
+    ///
+    /// # Errors
+    ///
+    /// [`Xp3Error::CorruptIndex`] when a segment offset overflows or a
+    /// segment runs past the end of the image, [`Xp3Error::Inflate`] when a
+    /// compressed segment cannot be decoded, and [`Xp3Error::Io`] when the
+    /// read fails.
     pub fn read_entry_from_bytes(
         &self,
         bytes: &[u8],
@@ -458,6 +502,10 @@ impl Xp3Archive {
     /// returns short; the caller decides whether a short result is an error
     /// (the middle-layer wrapper treats a short header as the reference's own
     /// short-read case).
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`read_with_filter`](Self::read_with_filter).
     pub fn read_prefix_with_filter(
         &self,
         fs: &FileSystem,
@@ -478,6 +526,10 @@ impl Xp3Archive {
 
     /// Read at most `max_len` bytes of an entry from an in-memory archive
     /// image, with the same bounds checks as [`Self::read_entry_from_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`read_entry_from_bytes`](Self::read_entry_from_bytes).
     pub fn read_entry_prefix_from_bytes(
         &self,
         bytes: &[u8],

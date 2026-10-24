@@ -177,7 +177,9 @@ cannot believe a format exists that the backend cannot consume. The budgets
 (`MAX_EFFECT_TEXTURES`, `MAX_EFFECT_UNIFORMS`,
 `EFFECT_PUSH_CONSTANT_BYTES`) are **API** budgets, not driver limits: a
 descriptor that exceeds one is refused with a `ShaderDataError`, never
-truncated.
+truncated. The SPIR-V header words (`SPIRV_MAGIC`, `SPIRV_VERSION_MAX`) and the
+reserved binding index (`RESERVED_BINDING`) are crate-private: the validation
+that uses them is the contract, not the numbers.
 
 ### `api::config`
 
@@ -196,9 +198,12 @@ pub fn parse_bool(option: &'static str, value: &str) -> Result<bool, ConfigError
 pub fn parse_overrides(text: &str) -> Result<RuntimeConfigOverrides, ConfigError>;
 ```
 
-`MIN_FRAME_RATE = 1`, `MAX_FRAME_RATE = 1000`, `DEFAULT_FRAME_RATE = 60`,
-and `FRAME_RATE_RANGE = "an integer in 1..=1000 frames per second"` — the
-accepted-values text the errors name. The configuration surface as a whole is
+The accepted frame-rate range is 1..=1000 with a built-in default of 60,
+and the accepted-values text the errors name is
+`"an integer in 1..=1000 frames per second"`. Those numbers are
+crate-private: `FrameRateLimit::new` and `FrameRateLimit::parse` validate
+against them and the errors quote them, so a caller reads the range from the
+error rather than from a constant. The configuration surface as a whole is
 in [`runtime-config.md`](../../../docs.old/runtime-config.md).
 
 ---

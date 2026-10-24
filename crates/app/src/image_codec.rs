@@ -84,9 +84,9 @@ fn install_image_codec_on_metered(
     base: PathBuf,
     stats: &Rc<StartupStats>,
 ) {
-    let decode_media = media.clone();
-    let probe_media = media.clone();
-    let save_media = media.clone();
+    let decode_media = *media;
+    let probe_media = *media;
+    let save_media = *media;
     let decode_stats = Rc::clone(stats);
 
     host.set_image_codec(
@@ -148,9 +148,7 @@ pub fn install_image_decoder(
     engine: &mut engine::Engine,
     media: &Media,
 ) -> Result<(), engine::imagedecode::DecodePoolError> {
-    let decoder: Arc<dyn ImageDecoder> = Arc::new(MediaImageDecoder {
-        media: media.clone(),
-    });
+    let decoder: Arc<dyn ImageDecoder> = Arc::new(MediaImageDecoder { media: *media });
     engine.install_decoder(decoder, engine::imagedecode::DecodePoolConfig::default())
 }
 

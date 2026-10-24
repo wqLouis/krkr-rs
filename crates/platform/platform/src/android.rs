@@ -132,6 +132,11 @@ pub struct PlatformWindow {
 #[cfg(not(target_os = "android"))]
 impl PlatformWindow {
     /// Returns the raw window handle (always an error in the stub).
+    ///
+    /// # Errors
+    ///
+    /// Always [`PlatformError::NotImplemented`]: the stub has no
+    /// `ANativeWindow` to wrap.
     pub fn raw_window_handle(&self) -> Result<RawWindowHandle, PlatformError> {
         Err(PlatformError::NotImplemented(
             "android raw window handle".to_owned(),
@@ -139,6 +144,11 @@ impl PlatformWindow {
     }
 
     /// Returns the raw display handle (always an error in the stub).
+    ///
+    /// # Errors
+    ///
+    /// Always [`PlatformError::NotImplemented`]: the stub has no
+    /// display connection to wrap.
     pub fn raw_display_handle(&self) -> Result<RawDisplayHandle, PlatformError> {
         Err(PlatformError::NotImplemented(
             "android raw display handle".to_owned(),

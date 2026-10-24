@@ -1,6 +1,6 @@
 //! Integration tests for the crate-level `Media` object and capabilities.
 
-use media::{Media, MediaConfig, capabilities, create_media, open_video};
+use media::{Media, capabilities, open_video};
 
 #[test]
 fn capabilities_advertise_the_image_and_audio_backends() {
@@ -22,15 +22,14 @@ fn capabilities_advertise_the_image_and_audio_backends() {
     assert!(!caps.is_empty());
 }
 
+/// The backend object holds no state: two independently created values are
+/// equal, and a clone equals its original.
 #[test]
-fn config_is_preserved_and_media_is_stateless() {
-    let config = MediaConfig::new();
-    let media = Media::with_config(config.clone());
-    assert_eq!(media.config(), &config);
-    // The default config is identical for every object; clones are independent.
-    let other = create_media(MediaConfig::default());
+fn media_is_stateless() {
+    let media = Media::new();
+    let other = Media::new();
     assert_eq!(media, other);
-    assert_eq!(media, media.clone());
+    assert_eq!(media, media);
 }
 
 #[test]

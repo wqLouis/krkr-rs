@@ -57,8 +57,14 @@ use crate::hint::{display_name, extension_of};
 ///
 /// `hint` is the storage name or extension that located the bytes;
 /// it only steers the container detection and is never trusted over the
-/// content. A track that cannot be decoded returns a typed [`MediaError`] —
-/// no silence is substituted.
+/// content.
+///
+/// # Errors
+///
+/// [`MediaError::Unsupported`] when the container holds no audio stream,
+/// [`MediaError::Decode`] when the container or the stream is malformed, and
+/// [`MediaError::Io`] when the bytes cannot be demuxed. No silence is
+/// substituted for a failed decode.
 pub fn decode_audio_ffmpeg(
     m: &Media,
     bytes: Arc<[u8]>,

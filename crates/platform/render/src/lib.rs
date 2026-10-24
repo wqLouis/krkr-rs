@@ -19,7 +19,7 @@
 //!   (`03-middle-layer-api.md` §3).
 //!
 //! Round 1 ships the whole API plus a fully functional headless
-//! [`NullRenderPipeline`]. The Vulkan (`ash`) backend in [`vulkan`] is a real
+//! [`NullRenderPipeline`]. The Vulkan (`ash`) backend is a real
 //! implementation: instance/device creation, `ash-window` surface creation,
 //! swapchain management, staging uploads, fixed-function blend pipelines and
 //! scene-tree traversal and presentation. Offscreen render targets are
@@ -45,7 +45,7 @@ pub mod render_target;
 pub mod scene;
 mod state;
 pub mod texture;
-pub mod vulkan;
+mod vulkan;
 
 use std::fmt;
 use std::time::Duration;
@@ -59,9 +59,7 @@ pub use crate::effect::{EffectPipeline, RenderEffect};
 pub use crate::glyph::{
     Font, FontSystem, create_font_system, font_metrics, glyph_advance, load_font, rasterize_glyph,
 };
-pub use crate::null::{
-    FrameStats, MAX_TRAVERSAL_DEPTH, NULL_MAX_TEXTURE_DIMENSION, NullRenderPipeline,
-};
+pub use crate::null::{FrameStats, NULL_MAX_TEXTURE_DIMENSION, NullRenderPipeline};
 pub use crate::render_target::{RenderTarget, RenderTargetDesc};
 pub use crate::scene::{
     Clip, GlyphPlacement, GlyphRun, RenderContent, RenderNode, RenderNodeId, RenderScene,
@@ -73,6 +71,13 @@ pub use api::glyph::{FontMetrics, GlyphBitmap, GlyphStyle};
 pub use api::shader::EffectPipelineDesc;
 
 use crate::vulkan::VulkanPipeline;
+
+/// Maximum depth the backends descend into a scene tree.
+///
+/// Both backends stop descending at this depth, so a cyclic or excessively
+/// deep tree produced by a buggy caller cannot make a frame recurse without
+/// bound. The limit is a property of the pipeline, not of one backend.
+pub const MAX_TRAVERSAL_DEPTH: u32 = 1024;
 
 /// Which render backend a [`RenderPipeline`] uses.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

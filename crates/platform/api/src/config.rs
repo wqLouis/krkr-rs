@@ -99,26 +99,27 @@ impl From<CacheLimit> for Option<u64> {
 /// Lowest accepted frame-rate limit, in frames per second.
 ///
 /// A lower limit has no positive frame period to pace the loop with.
-pub const MIN_FRAME_RATE: u32 = 1;
+pub(crate) const MIN_FRAME_RATE: u32 = 1;
 
 /// Highest accepted frame-rate limit, in frames per second.
 ///
 /// 1000 fps is the point at which the frame period reaches the platform
 /// ticker's 1 ms minimum frame interval; a higher limit would have to be
 /// silently clamped, so it is rejected instead.
-pub const MAX_FRAME_RATE: u32 = 1000;
+pub(crate) const MAX_FRAME_RATE: u32 = 1000;
 
 /// Built-in default frame-rate limit, in frames per second.
-pub const DEFAULT_FRAME_RATE: u32 = 60;
+pub(crate) const DEFAULT_FRAME_RATE: u32 = 60;
 
 /// Human-readable accepted range for frame-rate errors.
-pub const FRAME_RATE_RANGE: &str = "an integer in 1..=1000 frames per second";
+pub(crate) const FRAME_RATE_RANGE: &str = "an integer in 1..=1000 frames per second";
 
 /// A validated frame-rate limit in frames per second.
 ///
 /// The limit is the number of frames the host tries to present per second;
 /// its period is [`FrameRateLimit::period_secs`]. It cannot be constructed
-/// outside [`MIN_FRAME_RATE`]..=[`MAX_FRAME_RATE`].
+/// outside `MIN_FRAME_RATE..=MAX_FRAME_RATE`; the accepted range is named in
+/// the error a rejected value produces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FrameRateLimit(u32);
 
@@ -133,8 +134,8 @@ impl FrameRateLimit {
     ///
     /// # Errors
     ///
-    /// [`ConfigError::InvalidValue`] when `fps` is outside
-    /// [`MIN_FRAME_RATE`]..=[`MAX_FRAME_RATE`].
+    /// [`ConfigError::InvalidValue`] when `fps` is outside the accepted
+    /// range.
     pub fn new(option: &'static str, fps: u32) -> Result<Self, ConfigError> {
         if (MIN_FRAME_RATE..=MAX_FRAME_RATE).contains(&fps) {
             Ok(Self(fps))
@@ -185,10 +186,9 @@ impl FrameRateLimit {
 /// already validated, so the fields are plain public values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RuntimeConfig {
-    /// Frame-rate limit in frames per second; range
-    /// [`MIN_FRAME_RATE`]..=[`MAX_FRAME_RATE`], default
-    /// [`DEFAULT_FRAME_RATE`] (60). It paces the host loop and the headless
-    /// step.
+    /// Frame-rate limit in frames per second, default 60. The accepted
+    /// range is named in the error a rejected value produces. The limit paces
+    /// the host loop and the headless step.
     pub frame_rate_limit: FrameRateLimit,
     /// Whether a mounted archive's whole image is read into memory, default
     /// `false`. It trades the archive's size in resident memory for removing

@@ -73,6 +73,11 @@ pub use backend::VideoDecoderState;
 /// track, whose SBR band the platform decoder reconstructs) with the
 /// platform's `audio/mp4a-latm` decoder. The FFmpeg backend has no
 /// counterpart: its track decoding belongs to the video backend.
+///
+/// # Errors
+///
+/// [`MediaError::Unsupported`] when the bytes hold no track the platform
+/// decoder accepts, and [`MediaError::Decode`] when the track is malformed.
 #[cfg(feature = "video-mediacodec")]
 pub use backend::decode_audio as decode_audio_mediacodec;
 
@@ -116,8 +121,11 @@ pub(crate) const STREAMING_VIDEO: bool = true;
 /// `bytes` is shared by `Arc` so the caller can keep the compressed buffer
 /// alive; the state retains it for seeking.
 ///
-/// A stream that cannot be probed, has no video track, or has no decoder in
-/// this build returns a typed [`MediaError`].
+/// # Errors
+///
+/// [`MediaError::Unsupported`] when the build has no decoder for the
+/// container, [`MediaError::Decode`] when the container is malformed, and
+/// [`MediaError::NotFound`] when the stream holds no video track.
 pub fn open_video(
     m: &Media,
     bytes: Arc<[u8]>,
@@ -133,6 +141,13 @@ pub fn open_video(
 /// otherwise the decoder decodes forward to the first frame at/after
 /// `at_ms`. Returns a tightly packed RGBA8 [`RgbaFrame`], shared with the
 /// decoder so that handing the frame on copies no pixels.
+///
+/// # Errors
+///
+/// [`MediaError::Decode`] when the frame cannot be decoded,
+/// [`MediaError::InvalidState`] when the state does not belong to this
+/// backend, and [`MediaError::Unsupported`] when the build has no decoder for
+/// the stream.
 pub fn present_video(
     m: &Media,
     state: &mut VideoDecoderState,
@@ -147,6 +162,11 @@ pub fn present_video(
 /// hands out the shared buffer, so a caller that plays it does not copy the
 /// whole track. When the stream has no audio track it returns a typed
 /// [`MediaError::Unsupported`].
+///
+/// # Errors
+///
+/// [`MediaError::Unsupported`] when the stream carries no audio track, and
+/// [`MediaError::Decode`] when the track cannot be decoded.
 pub fn video_audio(m: &Media, state: &VideoDecoderState) -> Result<Arc<DecodedAudio>, MediaError> {
     backend::audio(m, state)
 }

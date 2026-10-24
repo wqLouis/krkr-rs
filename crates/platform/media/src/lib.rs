@@ -8,17 +8,15 @@
 //!
 //! # Stateless objects, explicit state
 //!
-//! [`Media`] holds only immutable configuration and has no `&mut self`
-//! methods. Every evolving value (the streaming decoder states) is a separate
-//! value created by this crate and owned by the caller. There are no globals,
-//! no lazy caches and no engine state; the decoder lookup tables are
-//! compile-time `const`s.
+//! [`Media`] holds no state and has no `&mut self` methods. Every evolving
+//! value (the streaming decoder states) is a separate value created by this
+//! crate and owned by the caller. There are no globals, no lazy caches and no
+//! engine state; the decoder lookup tables are compile-time `const`s.
 //!
 //! # What is implemented
 //!
-//! * **Images** — the native TLG5/TLG6 decoder (ported from
-//!   `tvp-visual/src/tlg.rs`) and `image`-crate formats, with header probing
-//!   and PNG/BMP/JPEG encoding.
+//! * **Images** — the native TLG5/TLG6 decoder and `image`-crate formats,
+//!   with header probing and PNG/BMP/JPEG encoding.
 //! * **Audio** — symphonia whole-file/streaming decode (wav, pcm, ogg,
 //!   vorbis, flac, mp3, mp4/aac) plus the Ogg Opus adapter, with header-only
 //!   probing and an explicit caller-owned [`AudioDecoderState`]. The desktop
@@ -35,8 +33,7 @@
 //!   RGBA8 and decodes the audio track; on Android the `video-mediacodec`
 //!   feature selects the NDK backend (`ndk` + a raw `AMediaExtractor` shim).
 //!   Exactly one backend must be selected (see [`video`]).
-//! * **YUV** — the pure `yuv420_to_rgba` conversion ported from
-//!   `tvp-natives/src/video/yuv.rs`.
+//! * **YUV** — the pure `yuv420_to_rgba` conversion in [`yuv`].
 //!
 //! # Safety lint
 //!
@@ -68,69 +65,39 @@ pub use image_encode::encode_image;
 #[cfg(feature = "video-mediacodec")]
 pub use video::decode_audio_mediacodec;
 pub use video::{VideoDecoderState, open_video, present_video, video_audio};
-pub use yuv::{CropRect, Yuv420Layout, YuvSampling, micros_to_millis, yuv420_to_rgba};
 
 use api::media::MediaCapabilities;
 
-/// Immutable configuration for a [`Media`] object.
-///
-/// The media engine currently exposes no configurable options. In
-/// particular there is no size limit to configure: a decode that cannot be
-/// performed (malformed, overflowing, or unsupported data) returns a typed
-/// [`api::error::MediaError`] rather than a substituted value. This type stays
-/// `#[non_exhaustive]` so options can be added without an API break.
-#[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct MediaConfig {}
-
-impl MediaConfig {
-    /// Creates the default (currently empty) configuration.
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
 /// Stateless media backend object.
 ///
-/// Created once and shared by reference.
-/// It owns only immutable [`MediaConfig`]; every decode action either is a
-/// free function or takes the evolving decoder state as an explicit
-/// parameter, so two independent `Media` values can coexist in one process.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Media {
-    config: MediaConfig,
-}
+/// The object carries no configuration and no state. Every decode action
+/// either is a free function or takes the evolving decoder state as an
+/// explicit parameter, so two independent [`Media`] values can coexist in one
+/// process and the backend remembers nothing between calls.
+///
+/// There is nothing to configure. In particular there is no size limit: a
+/// decode that cannot be performed (malformed, overflowing, or unsupported
+/// data) returns a typed [`api::error::MediaError`] rather than a substituted
+/// value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Media;
 
 impl Media {
-    /// Creates a media backend with the default configuration.
-    pub fn new() -> Self {
-        Self {
-            config: MediaConfig::default(),
-        }
+    /// Creates a media backend.
+    ///
+    /// The value is a facade over the codecs the build links; creating two of
+    /// them does not create two decoders.
+    pub const fn new() -> Self {
+        Self
     }
-
-    /// Creates a media backend with an explicit configuration.
-    pub fn with_config(config: MediaConfig) -> Self {
-        Self { config }
-    }
-
-    /// Returns the immutable configuration this object was created with.
-    pub fn config(&self) -> &MediaConfig {
-        &self.config
-    }
-}
-
-/// Creates a stateless [`Media`] backend (the factory spelling used by the
-/// middle-layer API).
-pub fn create_media(config: MediaConfig) -> Media {
-    Media::with_config(config)
 }
 
 /// Reports which formats this backend can decode.
 ///
 /// Stateless: the result depends only on how the crate was compiled, not on
-/// per-object state. The middle layer uses it to choose a decode path without
-/// backend-specific `#[cfg]` branches.
+/// per-object state — `m` selects nothing and is accepted only so the call
+/// reads like every other media action. The middle layer uses the result to
+/// choose a decode path without backend-specific `#[cfg]` branches.
 pub fn capabilities(m: &Media) -> MediaCapabilities {
     let _ = m;
     MediaCapabilities {

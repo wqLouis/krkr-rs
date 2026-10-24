@@ -381,7 +381,7 @@ fn decode_with_builtin(
 ) -> Result<Arc<SoundSource>, String> {
     let (spec, state) = open_audio(media, bytes, hint).map_err(|error| error.to_string())?;
     let stream = MediaAudioStream {
-        media: media.clone(),
+        media: *media,
         state,
         spec,
     };
@@ -465,10 +465,7 @@ pub(crate) fn install_audio_decoder_metered(
     stats: &Rc<StartupStats>,
 ) {
     set_sound_render_driven(host.services(), true);
-    add_audio_decoder(
-        host.services(),
-        make_decoder(media.clone(), Rc::clone(stats)),
-    );
+    add_audio_decoder(host.services(), make_decoder(*media, Rc::clone(stats)));
 }
 
 /// The decoder the host installs on the sound chain.

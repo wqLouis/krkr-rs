@@ -41,13 +41,13 @@ pub const MAX_EFFECT_UNIFORMS: usize = 64;
 pub const EFFECT_PUSH_CONSTANT_BYTES: u32 = 64;
 
 /// The first word of every SPIR-V module, little-endian.
-pub const SPIRV_MAGIC: u32 = 0x0723_0203;
+pub(crate) const SPIRV_MAGIC: u32 = 0x0723_0203;
 
 /// Highest SPIR-V version word accepted, encoded `0x00MMmm00` (1.5).
 ///
 /// The check is a single comparison because the encoding is monotonic in the
 /// major then the minor version.
-pub const SPIRV_VERSION_MAX: u32 = 0x0001_0500;
+pub(crate) const SPIRV_VERSION_MAX: u32 = 0x0001_0500;
 
 /// The smallest valid SPIR-V module: the five-word header.
 const SPIRV_HEADER_BYTES: usize = 20;
@@ -56,7 +56,7 @@ const SPIRV_HEADER_BYTES: usize = 20;
 ///
 /// A pipeline's set 0 always binds the uniform block at index 0, so every
 /// texture binding sits at 1 or above.
-pub const RESERVED_BINDING: u32 = 0;
+pub(crate) const RESERVED_BINDING: u32 = 0;
 
 /// A shader stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

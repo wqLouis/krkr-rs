@@ -110,8 +110,13 @@ fn decoded_from_dynamic(image: DynamicImage) -> DecodedImage {
 ///
 /// `hint` is the storage name or extension the caller used to find the
 /// bytes; it only steers format selection and is never trusted over the
-/// content. Returns [`MediaError::Decode`] when the bytes are not a
-/// recognizable image.
+/// content.
+///
+/// # Errors
+///
+/// [`MediaError::Decode`] when the bytes are not a recognizable image, and
+/// [`MediaError::Unsupported`] when the detected format has no header probe in
+/// this build.
 pub fn probe_image(m: &Media, bytes: &[u8], hint: Option<&str>) -> Result<ImageInfo, MediaError> {
     let _ = m;
 
@@ -186,8 +191,14 @@ fn decode_with_format(bytes: &[u8], format: ImageFormat) -> Result<DynamicImage,
 /// Dispatch matches the reference [[`format_for_hint`]] router (see the
 /// module docs). `hint` is the storage name or extension the caller used and
 /// only steers format selection; content always wins when the hint is
-/// wrong. A failed decode is a real [`MediaError::Decode`], never a
-/// placeholder image.
+/// wrong.
+///
+/// # Errors
+///
+/// [`MediaError::Decode`] when the bytes are not a decodable image,
+/// [`MediaError::InvalidData`] when the decoded size is not representable, and
+/// [`MediaError::Unsupported`] when the detected format has no decoder in
+/// this build. A failed decode is never a placeholder image.
 pub fn decode_image(
     m: &Media,
     bytes: &[u8],

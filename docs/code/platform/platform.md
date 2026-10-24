@@ -18,7 +18,7 @@ It is the only L1 crate with a `#[cfg(target_os)]`.
 | input devices | `InputEvent`, `MouseButton`, `PhysicalKey` |
 | clock | `Clock`, `Ticker`, `FramePacing` |
 | audio output | `AudioDevice`, `AudioOutputState`, `AudioQueue` |
-| fonts | `system_font_dirs`, `ANDROID_SYSTEM_FONT_DIRS` |
+| fonts | `system_font_dirs` |
 | metrics | `memory_usage`, `process_cpu_ns`, `process_io` |
 
 ---
@@ -282,7 +282,6 @@ documented 44.1 kHz stereo spec with a logged warning.
 ## 7. Fonts and metrics
 
 ```rust
-pub const ANDROID_SYSTEM_FONT_DIRS: &[&str] = &["/system/fonts", "/product/fonts", "/vendor/fonts"];
 pub fn system_font_dirs() -> Vec<PathBuf>;
 
 pub fn memory_usage() -> Option<u64>;
@@ -291,8 +290,10 @@ pub fn process_io() -> Option<ProcessIo>;
 ```
 
 `system_font_dirs` returns the host's system-font directories: the Android
-list on Android, and the Unix system directories plus the per-user XDG
-locations on a desktop. A returned directory may not exist; the caller treats
+list (`/system/fonts`, `/product/fonts`, `/vendor/fonts`) on Android, and the
+Unix system directories plus the per-user XDG locations on a desktop. The
+Android list itself is crate-private: the function is the only way to reach
+it. A returned directory may not exist; the caller treats
 a missing entry as an absent source rather than an error. The engine (L2) may
 not name a platform path, so the composition root supplies this list.
 

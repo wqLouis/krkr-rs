@@ -3852,11 +3852,6 @@
 {"path": "crates/platform/media/src/image_encode.rs", "rule": "reference-citation", "anchor": "/// Indexed `[channel][row][column][level]`, exactly as the reference builds", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/image_encode.rs", "rule": "reference-citation", "anchor": "/// The reference's 4x4 ordered dither matrix (`TVPDither4x4`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/image_encode.rs", "rule": "reference-citation", "anchor": "/// full storage name (`\"out/shot.jpg\"`) or a reference BMP mode", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/platform/media/src/lib.rs", "rule": "reference-citation", "anchor": "//! * **Images** — the native TLG5/TLG6 decoder (ported from", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/platform/media/src/lib.rs", "rule": "reference-citation", "anchor": "//! * **YUV** — the pure `yuv420_to_rgba` conversion ported from", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/platform/media/src/lib.rs", "rule": "reference-citation", "anchor": "//! `tvp-natives/src/video/yuv.rs`.", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/platform/media/src/lib.rs", "rule": "reference-citation", "anchor": "//! `tvp-visual/src/tlg.rs`) and `image`-crate formats, with header probing", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/platform/media/src/lib.rs", "rule": "reference-citation", "anchor": "/// Created once and shared by reference.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/tlg.rs", "rule": "reference-citation", "anchor": "// 24-bit TLG5 has no alpha plane: opaque (reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/tlg.rs", "rule": "reference-citation", "anchor": "// Compose rows. Residual chain (reference `TVPTLG5ComposeColors*`):", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/tlg.rs", "rule": "reference-citation", "anchor": "// Grayscale TLG6: the reference stores the luminance in the first", "reason": "legacy comment, cleanup tracked in TODO §15"}

@@ -84,7 +84,7 @@ pub use crate::linux::{PlatformWindow, run};
 pub use crate::audio::{AudioDevice, AudioHealth, AudioOutputState};
 pub use crate::clock::{Clock, Ticker};
 pub use crate::event::PlatformEvent;
-pub use crate::fonts::{ANDROID_SYSTEM_FONT_DIRS, system_font_dirs};
+pub use crate::fonts::system_font_dirs;
 pub use crate::input::{InputEvent, MouseButton, PhysicalKey};
 pub use crate::memory::memory_usage;
 pub use crate::metrics::{ProcessIo, process_cpu_ns, process_io};

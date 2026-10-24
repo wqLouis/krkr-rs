@@ -351,6 +351,13 @@ fn encode_bmp(mode: BmpMode, width: u32, height: u32, rgba: &[u8]) -> Result<Vec
 /// An unknown target is [`MediaError::Unsupported`], and a failure inside the
 /// underlying codec is [`MediaError::Encode`]. JPEG drops the alpha channel;
 /// BMP matches the reference byte for byte.
+///
+/// # Errors
+///
+/// [`MediaError::Unsupported`] when `hint` names no encoder this build has,
+/// [`MediaError::InvalidData`] when `rgba` does not hold exactly
+/// `width * height * 4` bytes or the size is not representable, and
+/// [`MediaError::Encode`] when the codec itself fails.
 pub fn encode_image(
     m: &Media,
     width: u32,

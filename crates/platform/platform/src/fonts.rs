@@ -16,19 +16,22 @@ use std::path::PathBuf;
 /// `product` and `vendor` partitions carry OEM/vendor aliases on some
 /// devices. The list is target-independent so it is testable on a desktop
 /// host.
-pub const ANDROID_SYSTEM_FONT_DIRS: &[&str] = &["/system/fonts", "/product/fonts", "/vendor/fonts"];
+pub(crate) const ANDROID_SYSTEM_FONT_DIRS: &[&str] =
+    &["/system/fonts", "/product/fonts", "/vendor/fonts"];
 
 /// System-wide font directories on a Unix-like desktop.
 const UNIX_SYSTEM_FONT_DIRS: &[&str] = &["/usr/share/fonts", "/usr/local/share/fonts"];
 
 /// Returns the host's system font directories.
 ///
-/// On Android this is [`ANDROID_SYSTEM_FONT_DIRS`]. On a Unix-like desktop it
-/// is the system directories plus the per-user XDG locations
+/// On Android this is the platform's `/system/fonts`, `/product/fonts` and
+/// `/vendor/fonts` directories. On a Unix-like desktop it is the system
+/// directories plus the per-user XDG locations
 /// (`$XDG_DATA_HOME/fonts`, falling back to `$HOME/.local/share/fonts`, and
 /// the legacy `$HOME/.fonts`).
 ///
-/// A returned directory may not exist; the caller treats a missing entry as
+/// The caller owns the returned list and hands it to the text engine. A
+/// returned directory may not exist; the caller treats a missing entry as
 /// an absent source rather than an error.
 pub fn system_font_dirs() -> Vec<PathBuf> {
     if cfg!(target_os = "android") {
@@ -50,6 +53,7 @@ pub fn system_font_dirs() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// The Android list must name the platform directory the text engine has
     /// no other way to reach; `fontdb`'s own Unix scan excludes Android.
@@ -57,6 +61,12 @@ mod tests {
     fn android_font_dirs_include_system_fonts() {
         assert!(!ANDROID_SYSTEM_FONT_DIRS.is_empty());
         assert!(ANDROID_SYSTEM_FONT_DIRS.contains(&"/system/fonts"));
+        for dir in ANDROID_SYSTEM_FONT_DIRS {
+            assert!(
+                Path::new(dir).is_absolute(),
+                "Android font directory {dir} is relative"
+            );
+        }
     }
 
     /// The host always names at least one directory, so an empty list can

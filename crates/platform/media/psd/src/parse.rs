@@ -635,6 +635,15 @@ pub const COLOR_MODE_LAB: u16 = 9;
 // ---------------------------------------------------------------------------
 
 /// Parse a complete PSD document.
+///
+/// The bytes are the whole file; the returned model owns its own copies of
+/// the parsed sections, so the caller may drop the input.
+///
+/// # Errors
+///
+/// [`PsdError::Invalid`] when the signature is not `8BPS` or the structure is
+/// malformed, and [`PsdError::Eof`] when the file ends before a required
+/// field.
 pub fn parse(bytes: &[u8]) -> PsdResult<PsdFile> {
     let mut r = Reader::new(bytes);
 
