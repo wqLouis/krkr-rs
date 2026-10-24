@@ -58,7 +58,7 @@ its tests.
 | `sound` | `src/sound.rs` | the sound model and the software mixer | [sound.md](sound.md) |
 | `video` | `src/video.rs` | the video-overlay playback machine | [video.md](video.md) |
 | `trans` | `src/trans/` | the transition state machine and the `extrans` providers | [trans.md](trans.md) |
-| `shader` | `src/shader/` | the shader-program registry: the L2 half of the custom-shader contract | [shader.md](shader.md) |
+| `shader` | `src/shader/` | the shader programs, their pipelines and the effect draw they are drawn with | [shader.md](shader.md) |
 | `timer` | `src/timer.rs` | the timer registry | [timer.md](timer.md) |
 | `input` | `src/input.rs` | the generic input state | [input.md](input.md) |
 | — | `src/hasher.rs` | the fixed-seed hash map used by the crate's lookup tables | — |
@@ -88,7 +88,10 @@ pub use scene::{
     BitmapState, DecodedImageKey, DecodedImageMode, FontState, LayerState, Rect, Scene,
     TransitionFrame, TransitionSource, WindowState,
 };
-pub use shader::{LoadedProgram, ProgramDesc, ShaderError, ShaderId, ShaderLibrary};
+pub use shader::{
+    EffectDraw, EffectPass, EffectPipelines, EffectTexture, LoadedProgram, PipelineId, Program,
+    ProgramDesc, ShaderError, ShaderId, ShaderLibrary,
+};
 pub use startup::{StartupError, discover_startup};
 pub use storage::{Location, MountError, Storage, StorageMetadata, StorageReadError};
 ```
@@ -116,6 +119,11 @@ Two things are deliberately **outside** the seam: the projection and the draw
 tree (`RenderScene`, `RenderState`, `Surface`) — L2 projects, L1 draws, and
 L3 is not on that path at all — and `PixelTranslation` with its
 `to_device_*` / `to_vm_point` / `raster_scale` methods, which stay L2-internal.
+
+The seam carries the custom-shader draw (`EffectDraw`) a transition records,
+because the compatibility layer moves that value from the transition tick to
+the layer tree. It carries no program, no pipeline and no shader: a
+compatibility-layer member never names one.
 
 ---
 

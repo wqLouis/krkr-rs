@@ -101,6 +101,8 @@ impl Trans {
     pub fn full_region(bitmap: &BitmapState) -> RectI;
     pub fn transition_frame(&self, src1: u32, src2: u32, size: (u32, u32),
                             covers_layer: bool) -> Option<TransitionFrame>;
+    pub fn effect_draw(&self, src1: u32, src2: u32, size: (u32, u32),
+                       covers_layer: bool) -> Option<EffectDraw>;
 }
 ```
 
@@ -127,11 +129,19 @@ impl Trans {
 
 All of them are `ttExchange` (two sources).
 
-`CrossFade` and `Scroll` are the two **composition** kinds: their frame is the
-two sources placed in one rectangle (a per-pixel fade of the second source, or
-two disjoint placements), so a host that draws the projected scene never
-rasterizes it. `Universal`, `Mask` and the seven `extrans` kinds need a
-per-pixel rule or coordinate warp and are always blended by `Trans::apply`.
+A kind is composited in one of three ways, and the host picks the first one
+it can serve:
+
+* **A custom-shader draw** — `CrossFade` and `Scroll` have a program, so
+  `Trans::effect_draw` builds the passes the projection draws with the
+  backend's effect pipeline. No bitmap is written and none is uploaded.
+* **A composited frame** — `CrossFade` and `Scroll` are the two
+  **composition** kinds: their frame is the two sources placed in one
+  rectangle (a per-pixel fade of the second source, or two disjoint
+  placements), so a host that draws the projected scene never rasterizes it.
+* **A CPU blend** — `Universal`, `Mask` and the seven `extrans` kinds need a
+  per-pixel rule or coordinate warp, so they have no program and no frame;
+  `Trans::apply` blends them into the destination bitmap.
 
 ---
 
@@ -184,14 +194,17 @@ Trans::new / Trans::with_rule ──► TransError on an invalid parameter
 Trans::step(dt_ms) ──► TransStep { progress, phase, completed }
    │
    ▼
-two hosts, one frame:
+three hosts, one frame:
    ├─ Trans::apply(dst, src1, src2, region)
    │     → the destination bitmap (VM pixels)
    │     → the layer's transition slot (cache_bitmap / transition_self)
    │     → the projection draws that slot in place of the layer's image/subtree
-   └─ Trans::transition_frame(src1, src2, size, covers_layer)
-         → LayerState::transition_frame (a TransitionFrame)
-         → the projection draws the frame's two sources in its place
+   ├─ Trans::transition_frame(src1, src2, size, covers_layer)
+   │     → LayerState::transition_frame (a TransitionFrame)
+   │     → the projection draws the frame's two sources in its place
+   └─ Trans::effect_draw(src1, src2, size, covers_layer)
+         → LayerState::effect (an EffectDraw)
+         → the projection draws one node per pass, in place of the layer's image
 ```
 
 The second form exists for a host that draws the projected scene: the frame is
@@ -200,6 +213,12 @@ writes no pixels and uploads no bitmap per tick. The headless CPU path keeps
 `Trans::apply` and the display bitmap. On either path the endpoint subtree
 content is recomposited only when a source actually changes; a new frame's
 blend weights or placements do not invalidate it.
+
+The third form is the same idea with a program instead of two fixed-function
+sources: the passes are the effect draw the projection renders in place of
+the layer's image, and the sources are the two transition bitmaps the passes
+sample. The draw is a value the layer tree holds, so the transition writes
+no pixels and uploads no bitmap per tick either.
 
 ### 6.1 The composited frame's tolerance
 
@@ -236,13 +255,18 @@ typed error, and L3 turns it into the script error text.
 
 ## 8. Current limits
 
-* **Only `crossfade` and `scroll` are composited.** `universal`, `mask` and the
-  seven `extrans` kinds return no frame: their per-pixel rule or coordinate
-  warp would need a fragment shader, so `Trans::apply` blends them on every
-  host, GPU included. That is a renderer limitation, not a per-run fallback.
-  The generic shader loading that would replace it is deferred work
-  (`TODO.md` §16); the registry that will carry it is documented in
-  [shader.md](shader.md).
+* **Only `crossfade` and `scroll` reach the GPU.** `universal`, `mask` and
+  the seven `extrans` kinds have no program: their per-pixel rule or
+  coordinate warp would need a fragment shader this crate does not ship, so
+  `Trans::apply` blends them on every host, GPU included. That is a
+  renderer limitation, not a per-run fallback. The programs that would
+  replace it are deferred work (`TODO.md` §16); the registry that carries
+  them is documented in [shader.md](shader.md).
+* **The custom-shader draw needs a backend that runs effect pipelines.** A
+  backend that cannot build one (the headless backend) has no pipeline for
+  any program, so the transition takes the composited frame or the CPU
+  blend instead. The choice is the backend's and is made once, when the
+  engine installs the programs' pipelines.
 * **The non-self-updating transition pumps still run inside the L3 hook**,
   not inside L2. The self-updating ones advance from the frame hook's
   `after_project`, which sees the projection's draw report.

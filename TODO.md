@@ -237,7 +237,15 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   events, queuing, the render cache and the transition self image; the audit
   remains open for the remaining motion GPU/L1 resource path, the visual
   layer/window pixel paths, KAG, each native class and plugin port, and
-  audio/video/focus event dispatch. Audit L3 by subsystem against the reference oracle:
+  audio/video/focus event dispatch. The motion GPU path is the sharpest
+  case: the reference renders a motion into a texture and copies it into the
+  target layer, while the port's `Motion.D3DAdaptor.captureCanvas` copies
+  nothing and `Motion.Player.draw` with such a target draws nothing at all,
+  silently. Closing it needs a layer-tree primitive for a batch of textured
+  quads, an L1 draw for that batch and the render-target plumbing in
+  `engine` — the geometry is per-node affine, so neither the effect draw
+  (one axis-aligned rectangle per pass) nor a layer node covers it. Audit L3
+  by subsystem against the reference oracle:
   motion player (timeline/eval/child motion/events/draw), visual layer and
   window, KAG, each native class and plugin port, audio/video/focus event
   dispatch. For each module record the oracle path, the script-observable
@@ -462,13 +470,16 @@ an allowlist exemption.
   C++ adapter over it** — both deferred. `streams.cpp` is the only port-authored
   C++ besides the ABI boundary, and every save-path memory-safety defect was in
   it.
-* **Generic L2 shader loading for all-shader transitions.** The public API is
-  a generic shader/pipeline loader in `engine` (shader binary, pipeline
-  descriptor, bindings, uniforms), not a transition-specific effect API. L3
-  loads/selects shaders and supplies parameters through `engine_api`; L1 keeps
-  only the backend mechanism and is never named by L3. The CPU transition path
-  remains the null/headless implementation and the pixel oracle. This replaces
-  the interim two-texture composition.
+* **The all-shader transitions need their own programs.** The generic loader
+  landed with the effect draw path: `engine::shader` registers a program,
+  creates and caches its pipeline, and the kinds that have a program
+  (`crossfade`, `scroll`) are drawn by the projection instead of being
+  blended into a bitmap. What is left is a program per kind that needs a
+  per-pixel rule or a coordinate warp (`universal`, `mask` and the seven
+  `extrans` kinds), and the selection of a program from `engine_api` (the
+  seam carries the draw today, not a program). L1 keeps only the backend
+  mechanism and is never named by L3. The CPU transition path remains the
+  null/headless implementation and the pixel oracle.
 * **A GPU text path and an L3 render-target surface.** `RenderContent::Glyphs`
   is rejected by both renderers, `supports_glyph_atlas` is false everywhere, and
   `create_render_target`/`read_render_target` are plumbed by neither `engine`
