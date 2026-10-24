@@ -736,6 +736,24 @@ impl VulkanPipeline {
         result
     }
 
+    /// Renders `scene` into the `region` of an offscreen `target`.
+    ///
+    /// The Vulkan backend does not implement the region render: its offscreen
+    /// render pass clears the whole attachment, so the pixels outside the
+    /// region cannot be preserved.
+    pub(crate) fn render_to_target_region(
+        &self,
+        _state: &mut RenderState,
+        _target: &RenderTarget,
+        _scene: &RenderScene,
+        _region: PixelRegion,
+    ) -> Result<(), RenderError> {
+        Err(RenderError::Unsupported {
+            message: "the Vulkan backend does not render into a region of an offscreen target"
+                .to_owned(),
+        })
+    }
+
     /// Copies a sub-rectangle of an offscreen `target` into `out`.
     ///
     /// The copy is synchronous: a script observes `out` on return. The

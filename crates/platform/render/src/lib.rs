@@ -546,6 +546,44 @@ pub fn render_to_target(
     }
 }
 
+/// Renders `scene` into the `region` of the offscreen `target`.
+///
+/// The pixels outside `region` keep the values they had — the target's
+/// content is preserved — and the pixels inside `region` are cleared to the
+/// scene's background and then composited, exactly as [`render_to_target`]
+/// produces them.
+///
+/// `region` is in the target's own pixels. A region that reaches past the
+/// target's edge writes only the part inside it, and an empty region writes
+/// nothing.
+///
+/// The caller owns the damage: `region` must cover every pixel whose
+/// content differs from the target's current content, or the target keeps
+/// stale pixels outside it. A region that covers the whole target is
+/// equivalent to [`render_to_target`].
+///
+/// # Errors
+///
+/// Returns [`RenderError::InvalidArgument`] for a mismatched state/target and
+/// [`RenderError::Unsupported`] for a backend that does not implement the
+/// region render.
+pub fn render_to_target_region(
+    p: &RenderPipeline,
+    state: &mut RenderState,
+    target: &RenderTarget,
+    scene: &RenderScene,
+    region: PixelRegion,
+) -> Result<(), RenderError> {
+    match &p.kind {
+        PipelineKind::Null(backend) => {
+            backend.render_to_target_region(state, target, scene, region)
+        }
+        PipelineKind::Vulkan(backend) => {
+            backend.render_to_target_region(state, target, scene, region)
+        }
+    }
+}
+
 /// Copies a sub-rectangle of `target` into the caller-owned buffer `out`.
 ///
 /// `out` receives tightly packed, row-major pixels in the target's format and

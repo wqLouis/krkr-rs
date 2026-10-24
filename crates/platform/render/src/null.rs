@@ -255,22 +255,8 @@ impl NullRenderPipeline {
             textures,
             ..
         } = null;
-        if let hashbrown::hash_map::Entry::Vacant(entry) = render_targets.entry(target.key()) {
-            let desc = *target.desc();
-            let total = usize::try_from(desc.byte_len()).map_err(|_| RenderError::OutOfMemory {
-                message: "render target is too large for the host address space".to_owned(),
-            })?;
-            entry.insert(NullRenderTarget {
-                desc,
-                pixels: vec![0; total],
-            });
-        }
-        let image =
-            render_targets
-                .get_mut(&target.key())
-                .ok_or_else(|| RenderError::Framebuffer {
-                    message: "render target is not owned by this render state".to_owned(),
-                })?;
+        let image = target_storage(render_targets, target)?;
+        let full = PixelRegion::new(0, 0, image.desc.width, image.desc.height);
         crate::cpu::render_scene(
             image.desc.width,
             image.desc.height,
@@ -278,6 +264,44 @@ impl NullRenderPipeline {
             scene.background,
             scene,
             textures,
+            full,
+        )
+    }
+
+    /// Renders `scene` into the `region` of the CPU storage of `target`.
+    ///
+    /// The pixels outside `region` keep the values they had, and the pixels
+    /// inside are cleared to the scene's background and then composited,
+    /// exactly as a full render produces them.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::InvalidArgument`] when the state does not belong to
+    /// this backend, [`RenderError::Framebuffer`] when the target is not
+    /// owned by the state, and [`RenderError::OutOfMemory`] when the target is
+    /// too large for the host address space.
+    pub fn render_to_target_region(
+        &self,
+        state: &mut RenderState,
+        target: &RenderTarget,
+        scene: &RenderScene,
+        region: PixelRegion,
+    ) -> Result<(), RenderError> {
+        let null = null_state_mut(state)?;
+        let NullState {
+            render_targets,
+            textures,
+            ..
+        } = null;
+        let image = target_storage(render_targets, target)?;
+        crate::cpu::render_scene(
+            image.desc.width,
+            image.desc.height,
+            &mut image.pixels,
+            scene.background,
+            scene,
+            textures,
+            region,
         )
     }
 
@@ -434,6 +458,31 @@ fn null_state(state: &RenderState) -> Result<&NullState, RenderError> {
             message: "the null backend received a Vulkan render state".to_owned(),
         }),
     }
+}
+
+/// Returns the CPU storage of `target`, allocating it on first use.
+///
+/// The storage is the target's pixels; the caller composites into them and
+/// the content a later render leaves outside its region is kept.
+fn target_storage<'a>(
+    render_targets: &'a mut Map<u64, NullRenderTarget>,
+    target: &RenderTarget,
+) -> Result<&'a mut NullRenderTarget, RenderError> {
+    if let hashbrown::hash_map::Entry::Vacant(entry) = render_targets.entry(target.key()) {
+        let desc = *target.desc();
+        let total = usize::try_from(desc.byte_len()).map_err(|_| RenderError::OutOfMemory {
+            message: "render target is too large for the host address space".to_owned(),
+        })?;
+        entry.insert(NullRenderTarget {
+            desc,
+            pixels: vec![0; total],
+        });
+    }
+    render_targets
+        .get_mut(&target.key())
+        .ok_or_else(|| RenderError::Framebuffer {
+            message: "render target is not owned by this render state".to_owned(),
+        })
 }
 
 /// Validates a render-target descriptor against the null backend's limits.

@@ -129,6 +129,9 @@ pub fn destroy_effect_pipeline(p: &RenderPipeline, state: &mut RenderState,
                                pipeline: EffectPipeline);
 pub fn render_to_target(p: &RenderPipeline, state: &mut RenderState, target: &RenderTarget,
                          scene: &RenderScene) -> Result<(), RenderError>;
+pub fn render_to_target_region(p: &RenderPipeline, state: &mut RenderState,
+                               target: &RenderTarget, scene: &RenderScene,
+                               region: PixelRegion) -> Result<(), RenderError>;
 pub fn read_render_target(p: &RenderPipeline, state: &RenderState, target: &RenderTarget,
                            region: PixelRegion, out: &mut [u8]) -> Result<(), RenderError>;
 pub fn render(p: &RenderPipeline, surface: &Surface, state: &mut RenderState,
@@ -192,6 +195,19 @@ The identity comes from a monotonic atomic counter rather than the backing
 allocation address, which removes the ABA hazard where a dropped-and-freed
 handle could be replaced by a new one at the same address and silently reuse a
 stale resource.
+
+`render_to_target_region` composites a scene into **one region** of a target:
+the pixels outside the region keep the values they had, and the pixels inside
+are cleared to the scene's background and then composited, exactly as a full
+render produces them. It is the primitive a caller uses to keep a target
+alive across frames and to repaint only what changed: the caller owns the
+damage and must pass a region that covers every pixel whose content differs
+from the target's current content.
+
+The null backend implements the region render with its CPU rasterizer, which
+is the correctness baseline for it. The Vulkan backend does not implement it
+yet — its offscreen render pass clears the whole attachment — and reports a
+typed `RenderError::Unsupported` for it.
 
 ### Glyphs
 

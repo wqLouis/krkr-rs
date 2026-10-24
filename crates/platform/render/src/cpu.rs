@@ -53,11 +53,16 @@ struct Vertex {
     v: f64,
 }
 
-/// Composites `scene` into `pixels`.
+/// Composites `scene` into `pixels`, inside `region`.
 ///
 /// `pixels` must be `width * height * 4` bytes of tightly packed RGBA8. The
-/// target is cleared with `background` (defaulting to opaque black, matching
-/// the Vulkan clear value) before traversal.
+/// region's pixels are cleared with `background` (defaulting to opaque
+/// black, matching the Vulkan clear value) before traversal; the pixels
+/// outside the region keep the values they had.
+///
+/// `region` is in the target's own pixels and is clipped to the buffer, so a
+/// region that reaches past the target's edge writes only the part inside
+/// it.
 ///
 /// # Errors
 ///
@@ -71,6 +76,7 @@ pub(crate) fn render_scene<P: TextureProvider>(
     background: Option<[f32; 4]>,
     scene: &RenderScene,
     textures: &P,
+    region: PixelRegion,
 ) -> Result<(), RenderError> {
     let expected = (width as usize) * (height as usize) * 4;
     if pixels.len() != expected {
@@ -82,6 +88,13 @@ pub(crate) fn render_scene<P: TextureProvider>(
         });
     }
 
+    let Some(area) = region.intersection(&PixelRegion::new(0, 0, width, height)) else {
+        return Ok(());
+    };
+    if area.is_empty() {
+        return Ok(());
+    }
+
     let clear = background.unwrap_or([0.0, 0.0, 0.0, 1.0]);
     let clear = [
         to_u8(clear[0]),
@@ -89,8 +102,13 @@ pub(crate) fn render_scene<P: TextureProvider>(
         to_u8(clear[2]),
         to_u8(clear[3]),
     ];
-    for texel in pixels.as_chunks_mut::<4>().0 {
-        texel.copy_from_slice(&clear);
+    let stride = (width as usize) * 4;
+    for y in area.y..area.bottom() {
+        let start = (y as usize) * stride + (area.x as usize) * 4;
+        let end = start + (area.width as usize) * 4;
+        for texel in pixels[start..end].as_chunks_mut::<4>().0 {
+            texel.copy_from_slice(&clear);
+        }
     }
 
     if scene.is_empty() || scene.node(scene.root).is_none() {
@@ -103,8 +121,7 @@ pub(crate) fn render_scene<P: TextureProvider>(
         pixels,
         textures,
     };
-    let full = PixelRegion::new(0, 0, width, height);
-    canvas.visit(scene, scene.root, &Affine2::IDENTITY, 1.0, full, 0)
+    canvas.visit(scene, scene.root, &Affine2::IDENTITY, 1.0, area, 0)
 }
 
 /// Mutable rasterization state.
