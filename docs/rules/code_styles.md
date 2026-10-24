@@ -398,7 +398,7 @@ until both the static gate and the test suites are green.
 | `storage-boundary` | a script-supplied storage name is stripped of its media prefix before it crosses into L2 or the host filesystem |
 | `storage-media` | every `scheme://` domain the reference registers is served or explicitly documented as missing |
 | `native-construction` | a native payload carries the state its members need the moment it exists |
-| `lifecycle-order` | a native owner finalizes its child script objects before it removes their records |
+| `lifecycle-order` | a native teardown removes or invalidates only the records its own script object owns |
 | `callback-objthis` | a member that invokes a caller's callback receives the caller's `objthis` |
 | `native-arity` | a native method whose reference form takes zero arguments has a zero-argument branch |
 | `void-getter` | §8: a native getter never hands the script a raw `void` where the reference returns a value |

@@ -31,7 +31,7 @@ It runs the steps below in this order and stops at the first failure:
 | 5 | `layering` | check | layer vocabulary, unsafe placement, the L3↔L2 protocol |
 | 6 | `storage-boundary` | check | script storage names do not reach L2 or the host unstripped |
 | 7 | `native-construction` | check | native instances are constructed when they are created |
-| 8 | `lifecycle-order` | check | scene removal runs the child finalizers in order |
+| 8 | `lifecycle-order` | check | a native teardown must not take another script object's Scene record |
 | 9 | `storage-media` | check | reference storage-media domains are served or documented |
 | 10 | `callback-objthis` | check | callback-invoking native members carry objthis |
 | 11 | `native-arity` | check | reference zero-argument natives are not rejected |

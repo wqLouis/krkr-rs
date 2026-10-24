@@ -88,9 +88,10 @@ the constraint; the reference behaviour constrains the semantics.
 * A native payload carries the state its members need **the moment it
   exists**: the VM creates the instance before the script's constructor runs,
   so a member touched from a class prelude must already work.
-* A native owner finalizes its child script objects **before** it removes their
-  records, so a child finalizer that writes a native property does not hit a
-  removed record.
+* A native teardown removes or invalidates only the records the **same** script
+  object owns. A layer's record belongs to the layer's own script object, so a
+  parent layer or a window only detaches it; the layer keeps its native state
+  and its finalizer still runs against a live record.
 * A property getter returns what the reference returns. A backing
   `StoredValue` field whose constructor default is `StoredValue::Void` is
   mapped to the reference's non-void value — an empty array, a dictionary, the
@@ -364,7 +365,7 @@ objects explicitly.
 | `native-arity` | §2.4 — a zero-argument reference form keeps a zero-argument branch |
 | `callback-objthis` | §2.4 — a callback receives the caller's `objthis` |
 | `native-construction` | §2.4 — the payload carries the state its members need |
-| `lifecycle-order` | §2.4 — the children are finalized before the records are removed |
+| `lifecycle-order` | §2.4 — a teardown removes or invalidates only its own records |
 | `storage-boundary` | §2.5 — a script name is stripped before it crosses the boundary |
 | `host-facts` | §7.3 — every host-fact seam is installed by production code |
 | `native-parity`, `plugin-parity` | §2.3 — reports, not gates |

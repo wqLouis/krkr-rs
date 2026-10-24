@@ -80,9 +80,12 @@ re-projecting.
 
 `add_window`, `window`, `window_mut`, `remove_window`.
 
-`remove_window` destroys **every** layer of the window (through
-`destroy_layer`), so the layers' owned bitmaps and fonts are released and no
-sibling reference is left dangling.
+`remove_window` drops **only** the window record. Its layers keep their
+records: a layer's native state belongs to the layer's **script object**, so
+it is released by that object's own `invalidate_layer`, not by the window.
+The surviving records are inert — a missing window has an empty
+`window_layer_order`, so they are not drawn, hit-tested or focused — and their
+bitmaps and fonts are released with them.
 
 ### Layers
 
@@ -92,7 +95,7 @@ sibling reference is left dangling.
 | lookup | `layer`, `layer_mut`, `layer_mut_untracked` (crate-private), `is_primary_layer` |
 | geometry | `set_layer_image_size`, `internal_set_image_size`, `layer_size_changed`, `ensure_layer_image`, `clipping_rect`, `absolute_offset`, `main_image_pitch` |
 | ordering | `assign_front_order`, `sibling_position`, `order_index`, `absolute_order_index`, `set_absolute_order_mode`, `set_absolute_order_index`, `set_order_index`, `renumber_siblings`, `ordered_children`, `window_layer_order`, `layer_move_to_front` |
-| lifetime | `remove_layer` (detach), `destroy_layer` (destroy the subtree), `invalidate_layer`, `invalidate_window` |
+| lifetime | `remove_layer` (detach), `destroy_layer` (destroy the subtree), `invalidate_layer` |
 | focus | `set_focus`, `clear_focus`, `focused_in`, `set_domain_focus`, `window_input_root`, `next_focusable`, `prev_focusable`, `node_focusable` |
 | visibility / hit-test | `node_visible`, `node_enabled`, `layer_at` |
 | caches | `inc_cache_enabled_count`, `dec_cache_enabled_count`, `set_cache_bitmap`, `set_transition_self_image`, `set_transition_frame`, `update_layer` |

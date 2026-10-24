@@ -1087,10 +1087,11 @@ fn repeated_parent_layer_cycles_release_layers_bitmaps_and_fonts() {
     );
 }
 
-/// Invalidating a parent layer removes its child Scene records; the child
-/// script objects may still be referenced by script arrays, so their cached
-/// `Font` wrappers must be released rather than staying in the engine's
-/// retained map.
+/// A child `Font` wrapper must not stay in the engine's retained map once the
+/// child's own script object is collected. A parent invalidation only severs
+/// the child (`reference/cpp/core/visual/LayerIntf.cpp:543-549`), so the
+/// record and its wrapper are released by the child's finalizer; the script may
+/// still hold the child in an array until it drops its reference.
 #[test]
 fn invalidating_a_parent_layer_releases_child_font_wrappers() {
     let _lock = vm_lock();
@@ -1121,12 +1122,19 @@ fn invalidating_a_parent_layer_releases_child_font_wrappers() {
     );
 }
 
-/// A parent invalidation finalizes its direct children while their Scene
-/// records still exist. A layer finalizer can write a native property; if the
-/// parent had already removed the child records that write raised
-/// `Layer: layer no longer exists` and aborted the invalidation.
+/// A parent invalidation leaves its children alone; each child record
+/// outlives the parent's invalidation and is released with the child's own
+/// script object.
+///
+/// Reference `tTJSNI_BaseLayer::Invalidate`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:515-579`) severs the children
+/// with `child->Part()` (`:546-549`) and never invalidates them, so a
+/// child's script object stays valid until the script drops it
+/// (`reference/cpp/core/tjs2/tjsObject.cpp:389-405`). A layer finalizer can
+/// write a native property, and it must still find its own Scene record when
+/// it runs.
 #[test]
-fn invalidating_a_parent_finalizes_children_before_removing_their_records() {
+fn invalidating_a_parent_leaves_the_child_record_until_the_child_is_collected() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
@@ -1139,9 +1147,75 @@ fn invalidating_a_parent_finalizes_children_before_removing_their_records() {
 
     env.run("invalidate page; page = null; row = null;");
 
+    // The parent's own record is gone; the child's is not, because the child
+    // script object has not been collected yet.
+    assert_eq!(
+        env.scene.layers.len(),
+        1,
+        "the child record must outlive the parent's invalidation"
+    );
+
+    // The child is torn down with its own script object: its finalizer runs
+    // against a live record, and the record goes with it.
+    env.run("System.doCompact();");
+    env.engine.do_gc().expect("idle compact");
     assert_eq!(
         env.scene.layers.len(),
         0,
-        "the finalized child must remove its own Scene record"
+        "the collected child must remove its own Scene record"
+    );
+}
+
+/// Reference `tTJSNI_BaseLayer::Invalidate`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:515-579`) severs its direct
+/// children with `child->Part()` (`:546-549`); `Part()` (`:624-631`) only
+/// detaches, so a child keeps its native layer, its script object and its
+/// validity. The child is torn down when its **own** script object is
+/// finalized (`reference/cpp/core/tjs2/tjsObject.cpp:389-405`).
+///
+/// Invalidating the children as well would kill script objects the reference
+/// keeps alive: a member read on such a child answers "The object is already
+/// invalidated" (`reference/cpp/core/tjs2/tjsError.h:298`) instead of
+/// working, which is the divergence this test pins.
+#[test]
+fn invalidating_a_parent_layer_leaves_the_child_script_object_valid() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var page = new Layer(w, null); \
+         var row = new Layer(w, page); \
+         row.name = 'alive';",
+    );
+    assert_eq!(env.scene.layers.len(), 2);
+
+    env.run("invalidate page;");
+
+    // The parent is gone: the VM refuses every dispatch on it.
+    assert!(
+        env.eval("page.name").is_err(),
+        "the invalidated parent must refuse dispatch"
+    );
+    // The child is untouched: its script object is still valid ...
+    assert_eq!(
+        env.eval("row.name"),
+        Ok(TjsValue::String("alive".to_string())),
+        "the child script object must stay valid after its parent is invalidated"
+    );
+    // ... and its Scene record is still there.
+    assert_eq!(
+        env.scene.layers.len(),
+        1,
+        "the child record must outlive its parent's invalidation"
+    );
+
+    // The child is torn down with its own script object.
+    env.run("row = null;");
+    env.run("System.doCompact();");
+    env.engine.do_gc().expect("idle compact");
+    assert_eq!(
+        env.scene.layers.len(),
+        0,
+        "the child must be released with its own script object"
     );
 }

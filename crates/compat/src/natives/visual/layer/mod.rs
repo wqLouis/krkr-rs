@@ -375,36 +375,17 @@ extern "C" fn layer_invalidate(engine: *mut c_void, instance: *mut c_void) {
         layer.shutdown = true;
     }
     blur_tree(&ctx, id);
-    // Finalize the direct child script objects while their Scene records
-    // still exist, since a child finalizer expects its own layer record.
-    let children: Vec<u32> = scene_ref(&ctx)
-        .ok()
-        .and_then(|scene| scene.layer(id).map(|layer| layer.children.clone()))
-        .unwrap_or_default();
-    for child in children {
-        let raw = {
-            // SAFETY: the caller resolved a live compat context.
-            let services = unsafe { ctx.services() };
-            let state = services.state::<VisualState>();
-            state
-                .objects
-                .layers
-                .get(&child)
-                .map(crate::natives::visual::common::ObjectHandle::as_ptr)
-        };
-        let Some(raw) = raw else {
-            continue;
-        };
-        let Ok(object) = _resolved.engine().retain_object_detached(raw) else {
-            continue;
-        };
-        if let Err(error) = _resolved.engine().invalidate_retained(object.raw_id()) {
-            log::debug!("Layer: child invalidate failed for #{child}: {error}");
-        }
-    }
     if let Ok(scene) = scene_mut(&ctx) {
-        // Detach the layer from the scene so hit-testing and event dispatch
-        // no longer resolve it once its script object is invalidated.
+        // The layer is parted from its parent and every direct child is
+        // severed with a plain detach: a child keeps its native layer, its
+        // script object and its validity until that child is finalized on its
+        // own. `Scene::invalidate_layer` performs exactly that detach: it
+        // removes this layer's record and leaves the children's records alive.
+        //
+        // The children are therefore **not** invalidated here. Doing so would
+        // kill script objects that must stay usable, and a child the script
+        // still uses would answer "The object is already invalidated" instead
+        // of working.
         scene.invalidate_layer(id);
     }
     // The plugin families keep their per-layer state keyed by layer id; the

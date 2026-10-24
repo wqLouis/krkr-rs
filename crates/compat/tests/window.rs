@@ -581,7 +581,8 @@ fn subclass_member_calls_before_the_base_constructor_leave_global_kag_set() {
 }
 
 /// Dropping the last script reference to a window must release the scene
-/// window and the whole layer subtree it roots.
+/// window; the layer subtree goes with the layer script objects, not with the
+/// window.
 ///
 /// The reference native instance keeps its owner without adding a reference
 /// (`tTJSNI_BaseWindow::Construct`: `Owner = tjs_obj; // no addref`,
@@ -591,6 +592,10 @@ fn subclass_member_calls_before_the_base_constructor_leave_global_kag_set() {
 /// (`reference/cpp/core/visual/LayerIntf.cpp:515-561`). A strong L3 registry
 /// entry rooted every window forever, so the native destroy never ran and the
 /// window's layers, bitmaps and fonts stayed in the scene.
+///
+/// The window's `Invalidate` does not touch the layers (reference
+/// `:186-187`, `:208-222`), so the tree is released when the script drops
+/// the layer references — which this test does.
 #[test]
 fn dropping_the_last_window_reference_releases_its_scene_tree() {
     let _lock = vm_lock();
@@ -641,10 +646,13 @@ fn dropping_the_last_window_reference_releases_its_scene_tree() {
 }
 
 /// `invalidate w;` runs the reference `tTJSNI_BaseWindow::Invalidate` path:
-/// every object registered with the window is invalidated, the layer tree is
-/// severed, and the window is unregistered
-/// (`reference/cpp/core/visual/WindowIntf.cpp:175-241`). The layers'
-/// resources go with them (`reference/cpp/core/visual/LayerIntf.cpp:515-561`).
+/// every object registered with the window is invalidated and the window is
+/// unregistered (`reference/cpp/core/visual/WindowIntf.cpp:175-241`). The
+/// window's **layers are not touched**: the reference invalidates only the
+/// `Window.add` registry (`:208-222`) and leaves the primary layer attached
+/// (`:186-187`); a layer's native instance belongs to its own script object
+/// (`reference/cpp/core/visual/LayerIntf.h:165-186`), so the layers and
+/// their resources live until their own script objects are finalized.
 #[test]
 fn invalidating_a_window_releases_its_scene_tree_and_registered_objects() {
     let _lock = vm_lock();
@@ -666,26 +674,32 @@ fn invalidating_a_window_releases_its_scene_tree_and_registered_objects() {
     );
     assert_eq!(env.scene().windows.len(), 1);
 
+    let layers_before = env.scene().layers.len();
+    let bitmaps_before = env.scene().bitmaps.len();
+    let fonts_before = env.scene().fonts.len();
+
     env.run("invalidate w;");
 
     // Reference `Invalidate` walks `ObjectVector` and invalidates (and so
     // finalizes) each registered object before the native teardown
     // (`reference/cpp/core/visual/WindowIntf.cpp:211-221`).
     assert_eq!(env.eval_int("finals"), 1);
+    // The layers survive the window: their records and the resources they own
+    // are released with their own script objects, not with the window.
     assert_eq!(
         env.scene().layers.len(),
-        baseline_layers,
-        "Invalidate severs the window's layer tree"
+        layers_before,
+        "Invalidate must not touch the window's layers"
     );
     assert_eq!(
         env.scene().bitmaps.len(),
-        baseline_bitmaps,
-        "Invalidate releases the layers' bitmaps"
+        bitmaps_before,
+        "the layers' bitmaps live with the layers"
     );
     assert_eq!(
         env.scene().fonts.len(),
-        baseline_fonts,
-        "Invalidate releases the layers' fonts"
+        fonts_before,
+        "the layers' fonts live with the layers"
     );
     // Reference `TVPUnregisterWindowToList` removes the window from the list
     // at Invalidate (`reference/cpp/core/visual/WindowIntf.cpp:177`), so it is
@@ -708,12 +722,16 @@ fn invalidating_a_window_releases_its_scene_tree_and_registered_objects() {
     assert_eq!(env.scene().fonts.len(), baseline_fonts);
 }
 
-/// `Window.close()` tears the window down: the scene window and its layer
-/// subtree go, and the objects registered through `Window.add` are invalidated
-/// (running their `finalize`) and released. The window script object survives
-/// `close()`, so its destroy callback cannot be relied on for that release
-/// (`reference/cpp/core/visual/WindowIntf.cpp:175-241`,
-/// `reference/cpp/core/visual/LayerIntf.cpp:515-561`).
+/// `Window.close()` tears the window down: the scene window record goes and
+/// the objects registered through `Window.add` are invalidated (running their
+/// `finalize`) and released. The window script object survives `close()`, so
+/// its destroy callback cannot be relied on for that release
+/// (`reference/cpp/core/visual/WindowIntf.cpp:175-241`). The window's layers
+/// are not invalidated: the reference's `Close` only closes the form
+/// (`reference/cpp/core/visual/impl/WindowImpl.cpp:1469-1472`) and the
+/// window's `Invalidate` leaves the primary layer attached
+/// (`WindowIntf.cpp:186-187`), so the layers live with their own script
+/// objects.
 #[test]
 fn close_invalidates_registered_objects_and_drops_the_scene_tree() {
     let _lock = vm_lock();
@@ -736,6 +754,10 @@ fn close_invalidates_registered_objects_and_drops_the_scene_tree() {
     assert_eq!(env.scene().windows.len(), 1);
     assert_eq!(env.scene().layers.len(), baseline_layers + 2);
 
+    let layers_before = env.scene().layers.len();
+    let bitmaps_before = env.scene().bitmaps.len();
+    let fonts_before = env.scene().fonts.len();
+
     env.run("w.close();");
 
     assert_eq!(
@@ -744,13 +766,15 @@ fn close_invalidates_registered_objects_and_drops_the_scene_tree() {
         "close must run the registered objects' finalizers"
     );
     assert_eq!(env.scene().windows.len(), 0);
+    // The layers survive the window; their records and resources are released
+    // with their own script objects.
     assert_eq!(
         env.scene().layers.len(),
-        baseline_layers,
-        "close must release the window's layer subtree"
+        layers_before,
+        "close must not release the window's layers"
     );
-    assert_eq!(env.scene().bitmaps.len(), baseline_bitmaps);
-    assert_eq!(env.scene().fonts.len(), baseline_fonts);
+    assert_eq!(env.scene().bitmaps.len(), bitmaps_before);
+    assert_eq!(env.scene().fonts.len(), fonts_before);
 
     // The script object outlives `close()`; collecting it must not resurrect
     // or leak anything.
@@ -761,4 +785,87 @@ fn close_invalidates_registered_objects_and_drops_the_scene_tree() {
     assert_eq!(env.scene().layers.len(), baseline_layers);
     assert_eq!(env.scene().bitmaps.len(), baseline_bitmaps);
     assert_eq!(env.scene().fonts.len(), baseline_fonts);
+}
+
+/// Reference `tTJSNI_BaseWindow::Invalidate`
+/// (`reference/cpp/core/visual/WindowIntf.cpp:175-241`) invalidates **only**
+/// the objects the script registered through `Window.add` (the
+/// `ObjectVector`, `:208-222`). The window's layers are not registered
+/// there, and the primary-layer detach is commented out (`:186-187`): a
+/// layer's native instance belongs to its own script object
+/// (`reference/cpp/core/visual/LayerIntf.h:165-186`), so the window's death
+/// leaves them valid.
+#[test]
+fn invalidating_a_window_keeps_its_layer_script_objects_valid() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window();");
+    env.run(
+        "var page = new Layer(w, null); \
+         page.name = 'page'; \
+         var finals = 0; \
+         class Sink { function finalize() { finals = finals + 1; } } \
+         var reg = new Sink(); \
+         w.add(reg);",
+    );
+    assert_eq!(env.scene().windows.len(), 1);
+    assert_eq!(env.scene().layers.len(), 1);
+
+    env.run("invalidate w;");
+
+    // The `Window.add` registry is invalidated (reference `:208-222`).
+    assert_eq!(
+        env.eval_int("finals"),
+        1,
+        "Invalidate must run the registered objects' finalizers"
+    );
+    // The window's layer is not: its script object is still valid and its
+    // Scene record is still there.
+    assert_eq!(
+        env.eval_ok("page.name"),
+        TjsValue::String("page".to_string()),
+        "the window's layer script object must stay valid"
+    );
+    assert_eq!(
+        env.scene().layers.len(),
+        1,
+        "the layer record must outlive the window"
+    );
+    // The window record itself is gone (reference `:177`).
+    assert_eq!(env.scene().windows.len(), 0);
+}
+
+/// A layer's Scene record must outlive its script `finalize`: the finalizer
+/// may write a native property (`SelectItemBase.finalize` writes `cursor`).
+/// With the reference model the window's death does not take the layer records
+/// with it (`reference/cpp/core/visual/WindowIntf.cpp:186-187`, `:208-222`),
+/// so the finalizer still finds its record instead of raising
+/// `Layer: layer no longer exists`.
+#[test]
+fn a_layer_of_an_invalidated_window_finalizes_against_a_live_record() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window();");
+    env.run(
+        "var page = new Layer(w, null); \
+         var finals = 0; \
+         page.finalize = function() { cursor = 0; finals = finals + 1; };",
+    );
+    assert_eq!(env.scene().layers.len(), 1);
+
+    env.run("invalidate w;");
+    env.run("page = null;");
+    env.run("System.doCompact();");
+    env.engine.do_gc().expect("idle compact");
+
+    assert_eq!(
+        env.eval_int("finals"),
+        1,
+        "the layer finalizer must run against a live Scene record"
+    );
+    assert_eq!(
+        env.scene().layers.len(),
+        0,
+        "the layer record is released with the layer's own script object"
+    );
 }

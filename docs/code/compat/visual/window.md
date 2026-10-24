@@ -18,9 +18,9 @@ constructor and the VM's `finalize` are two of them.)
 |---|---|
 | **native create** | allocates the payload and **already creates the L2 scene window** at the default client size `1280 × 720`. The reference's `CreateNativeInstance` returns a window whose fields are usable, so a script subclass may touch a `Window` member **before** `super.Window(…)`. |
 | **the `Window(…)` constructor** | raises `"Window: this window is already constructed"` on a second call; registers the script object in the object registry; installs the **default draw device** by evaluating `new Window.BasicDrawDevice()`; writes the scene window id into the out slot. A draw device that cannot be constructed raises `"Internal error"` (the reference's `TVPInternalError`). |
-| **`Invalidate`** | invalidates every object registered through `Window.add`, drops the draw-device reference, invalidates the window's layer script objects, then removes the window from the scene. |
-| **native destroy** | releases the `Window.add` vector, invalidates the layer objects, and removes the window and its whole layer subtree from the scene. |
-| **`close()`** | drops the form first, then releases the registered objects, invalidates the layer objects and removes the window. A second `close()` raises `"Window.close: this window is not constructed"`. |
+| **`Invalidate`** | invalidates every object registered through `Window.add`, drops the draw-device reference, then removes the window record from the scene. The window's layer script objects are **not** invalidated. |
+| **native destroy** | releases the `Window.add` vector and removes the window record from the scene. The layer records stay: each one is released by its own script object's finalizer. |
+| **`close()`** | drops the form first, then releases the registered objects and removes the window record. The layer records stay. A second `close()` raises `"Window.close: this window is not constructed"`. |
 
 ---
 
@@ -186,8 +186,10 @@ the object natively (`reference/cpp/core/base/EventIntf.cpp:709-736`).
    is not node-focusable is rejected before any state change, and no
    `onBlur`/`onFocus` fires.
 9. `close()`, `Invalidate` and the native destroy all release the
-   `Window.add` objects (running their `finalize`), invalidate the layer
-   objects, and remove the window and its whole layer subtree.
+   `Window.add` objects (running their `finalize`) and remove the window
+   record. None of them touches the window's layers: a layer's native state
+   belongs to the layer's script object, so its record — and the finalizer
+   that still writes to it — outlive the window.
 10. Adding the same closure to `Window.add` twice is a no-op.
 11. `Window.drawDevice` must be an object with a non-zero `interface`; the
     window always has one after construction.

@@ -417,8 +417,19 @@ fn layer_image_allocation_and_province_pixels() {
     assert_eq!(layer.province.as_deref().unwrap()[2 * 16 + 3], 42);
 }
 
+/// `Window.close()` drops the window record; the layers live with their own
+/// script objects.
+///
+/// The reference's `tTJSNI_Window::Close`
+/// (`reference/cpp/core/visual/impl/WindowImpl.cpp:1469-1472`) only
+/// closes the form, and the window's `Invalidate`
+/// (`reference/cpp/core/visual/WindowIntf.cpp:175-241`) invalidates
+/// only the `Window.add` registry (`:208-222`) — the primary-layer detach is
+/// commented out (`:186-187`). A layer's native instance belongs to its own
+/// script object, so closing the window leaves the layers alive until the
+/// script drops them.
 #[test]
-fn window_close_removes_the_window_and_layers() {
+fn window_close_removes_the_window_and_keeps_the_layers() {
     let _lock = vm_lock();
     let env = Env::new();
 
@@ -430,7 +441,20 @@ fn window_close_removes_the_window_and_layers() {
     );
 
     assert!(env.scene.windows.is_empty());
-    assert!(env.scene.layers.is_empty());
+    assert_eq!(
+        env.scene.layers.len(),
+        2,
+        "close must not take the window's layers with it"
+    );
+
+    // The layers go with their own script objects.
+    env.run("w = null; a = null; b = null;");
+    env.run("System.doCompact();");
+    env.engine.do_gc().expect("idle compact");
+    assert!(
+        env.scene.layers.is_empty(),
+        "the collected layers must release their records"
+    );
 }
 
 #[test]

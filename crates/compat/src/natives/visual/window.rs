@@ -180,43 +180,6 @@ fn release_window_objects(ctx: &CompatCtx, host: &Tjs2Engine, id: u32) {
     }
 }
 
-/// Finalize every layer script object belonging to `id` before the scene
-/// window and its records disappear. A layer finalizer may write a native
-/// property (`SelectItemBase.finalize` writes `cursor`); without this it would
-/// run against a removed Scene record.
-fn invalidate_window_layers(ctx: &CompatCtx, host: &Tjs2Engine, id: u32) {
-    let Ok(scene) = scene_ref(ctx) else {
-        return;
-    };
-    let layer_ids: Vec<u32> = scene
-        .layers
-        .iter()
-        .filter(|layer| layer.window == id)
-        .map(|layer| layer.id)
-        .collect();
-    for layer_id in layer_ids {
-        let raw = {
-            // SAFETY: the caller resolved a live compat context.
-            let services = unsafe { ctx.services() };
-            let state = services.state::<VisualState>();
-            state
-                .objects
-                .layers
-                .get(&layer_id)
-                .map(ObjectHandle::as_ptr)
-        };
-        let Some(raw) = raw else {
-            continue;
-        };
-        let Ok(object) = host.retain_object_detached(raw) else {
-            continue;
-        };
-        if let Err(error) = host.invalidate_retained(object.raw_id()) {
-            log::debug!("Window: layer invalidate failed for #{layer_id}: {error}");
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Window
 // ---------------------------------------------------------------------------
@@ -248,10 +211,12 @@ extern "C" fn window_destroy(engine: *mut c_void, instance: *mut c_void) {
     };
     if let (Some(id), Ok((resolved, ctx))) = (id, bound(engine)) {
         release_window_objects(&ctx, resolved.engine(), id);
-        invalidate_window_layers(&ctx, resolved.engine(), id);
-        // The window owns the whole layer subtree and its per-layer bitmaps
-        // and fonts; destroy them with it so a dropped window leaves no scene
-        // records behind.
+        // The window is unregistered and only the objects registered through
+        // `Window.add` are invalidated; the window's layers keep their native
+        // instances, because a layer belongs to its **script object** and not
+        // to the window. `Scene::remove_window` therefore keeps the layer
+        // records; each one is released when its own script object is
+        // finalized.
         if let Ok(scene) = scene_mut(&ctx) {
             scene.remove_window(id);
         }
@@ -264,11 +229,14 @@ extern "C" fn window_destroy(engine: *mut c_void, instance: *mut c_void) {
 /// Native `Invalidate` for a `Window` — the `invalidate win;` path and the
 /// teardown the VM runs before `window_destroy`.
 ///
-/// Mirrors `tTJSNI_BaseWindow::Invalidate`
-/// (`reference/cpp/core/visual/WindowIntf.cpp:175-241`): it invalidates every
-/// object registered through `Window.add` (`ObjectVector`), severs the primary
-/// layer by invalidating the window's layer tree, releases the draw device and
-/// unregisters the window. The payload stays alive for the later destroy.
+/// Mirrors the native window teardown: it invalidates every object
+/// registered through `Window.add` (the `ObjectVector`), releases the draw
+/// device and unregisters the window.
+///
+/// The window's **layers are not touched**: a layer's native instance belongs
+/// to its script object, so the layers are torn down by their own
+/// `Invalidate`, not by the window's. The payload stays alive for the later
+/// destroy.
 extern "C" fn window_invalidate(engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
@@ -301,13 +269,10 @@ extern "C" fn window_invalidate(engine: *mut c_void, instance: *mut c_void) {
     let Some(id) = id else {
         return;
     };
-    invalidate_window_layers(&ctx, resolved.engine(), id);
     if let Ok(scene) = scene_mut(&ctx) {
-        // Invalidate any remaining layer records, then drop the window
-        // record: the reference unregisters the window from its list at
-        // `Invalidate` (`WindowIntf.cpp:177`), before the script object is
-        // destroyed.
-        scene.invalidate_window(id);
+        // Drop the window record: the window is unregistered before the script
+        // object is destroyed. The window's layer records stay until their own
+        // script objects are finalized.
         scene.remove_window(id);
     }
 }
@@ -383,7 +348,7 @@ extern "C" fn window_ctor(
     0
 }
 
-/// `Window.close()` — destroy the window and its layer tree.
+/// `Window.close()` — drop the window record.
 extern "C" fn window_close(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -409,11 +374,14 @@ extern "C" fn window_close(
         id
     };
     // The window object survives `close()`, so its destroy callback cannot be
-    // relied on to release the `ObjectVector`: invalidate and release it here
-    // (`reference/cpp/core/visual/WindowIntf.cpp:211-221`). Registered
-    // objects and layers finalize while the window record still exists.
+    // relied on to release the `ObjectVector`: invalidate and release it
+    // here. The registered objects finalize while the window record still
+    // exists.
+    //
+    // The window's layers are **not** invalidated: closing the window only
+    // closes the form, and the window teardown never touches the layers.
+    // Their records stay until their own script objects are finalized.
     release_window_objects(&ctx, resolved.engine(), id);
-    invalidate_window_layers(&ctx, resolved.engine(), id);
     let scene = match scene_mut(&ctx) {
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),

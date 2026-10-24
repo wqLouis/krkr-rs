@@ -138,7 +138,7 @@ Checks:
   layering         layer vocabulary and unsafe placement (AGENTS §2/§5)
   storage-boundary script storage names that reach L2 or the host unstripped
   native-construction native instances left unconstructed at create time
-  lifecycle-order  Scene removal without child-finalizer ordering
+  lifecycle-order  a native teardown must not take another script object's record
   storage-media    reference storage-media domains neither served nor documented
   callback-objthis  callback-invoking native members registered without objthis
   native-arity     reference zero-argument native methods rejected by a Rust guard

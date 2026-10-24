@@ -919,29 +919,27 @@ impl Scene {
         }
     }
 
-    /// Destroy a window and **every** layer belonging to it — the reference
-    /// `tTJSNI_BaseWindow::Invalidate` (`WindowIntf.cpp:175`) followed by the
-    /// script object's destruction. Each layer's whole subtree is removed
-    /// through [`Scene::destroy_layer`], so the layers' owned bitmaps and
-    /// fonts are released and any surviving sibling references are cleaned
-    /// up. Returns true when the window was present.
+    /// Remove a window record; the window's layers survive until their own
+    /// script objects are finalized.
     ///
-    /// This is the L2 primitive behind `Window.close()`; the reference keeps
-    /// no window list beyond the native objects, but the scene owns the
-    /// records, so removing them here keeps the model from leaking.
+    /// The native window teardown unregisters the window, releases the draw
+    /// device and invalidates **only** the objects the script registered
+    /// through `Window.add`; the primary-layer detach is not performed. A
+    /// layer's native instance belongs to its **script object**, so the
+    /// window's death does not take the layers with it: each layer is torn
+    /// down by its own `Invalidate`.
+    ///
+    /// The surviving layer records are inert: with the window record gone they
+    /// are in no window's draw order (`Scene::window_layer_order` returns an
+    /// empty list for a missing window), so they are not drawn, not hit-tested
+    /// and not focused. Each record — with the bitmap and the font it owns —
+    /// is released by [`Scene::remove_layer`] when its own script object is
+    /// finalized, so a layer finalizer still finds a live record.
+    ///
+    /// Returns true when the window was present.
     pub fn remove_window(&mut self, id: u32) -> bool {
         if self.window(id).is_none() {
             return false;
-        }
-        // Collect first: `destroy_layer` mutates the layer table.
-        let layer_ids: Vec<u32> = self
-            .layers
-            .iter()
-            .filter(|layer| layer.window == id)
-            .map(|layer| layer.id)
-            .collect();
-        for layer_id in layer_ids {
-            self.destroy_layer(layer_id);
         }
         self.windows.retain(|window| window.id != id);
         self.window_index.clear();
@@ -1924,25 +1922,6 @@ impl Scene {
         self.font_index.clear();
         for (index, font) in self.fonts.iter().enumerate() {
             self.font_index.insert(font.id, index);
-        }
-    }
-
-    /// Reference `tTJSNI_BaseWindow::Invalidate` (`WindowIntf.cpp:175`): the
-    /// window invalidates every object registered to it (`ObjectVector`) and
-    /// severs its primary layer. In this port every layer whose `window` is
-    /// `window` is such a registered object, so invalidate each of them. The
-    /// window keeps no strong TJS reference to its layers, but this still
-    /// detaches the tree and releases the per-layer resources so an
-    /// `invalidate win` cannot leave the layer tree rooted.
-    pub fn invalidate_window(&mut self, window: u32) {
-        let ids: Vec<u32> = self
-            .layers
-            .iter()
-            .filter(|layer| layer.window == window)
-            .map(|layer| layer.id)
-            .collect();
-        for id in ids {
-            self.invalidate_layer(id);
         }
     }
 
