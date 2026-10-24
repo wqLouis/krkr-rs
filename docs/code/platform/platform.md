@@ -171,9 +171,9 @@ impl Ticker {
 }
 ```
 
-`Clock` is a read-only wall-clock view and is also L1's implementation of the
-`api::host::Clock` contract. `Ticker` decides when the next frame is due, so
-the frame pacing lives in L1.
+`Clock` is a read-only wall-clock view: a higher layer reads the elapsed time
+through it, so no layer above owns a platform timer. `Ticker` decides when the
+next frame is due, so the frame pacing lives in L1.
 
 `Ticker::new` clamps the interval into `[1 ms, 1 h]`: a zero interval would
 make the loop busy-spin, and an absurdly large one could overflow the

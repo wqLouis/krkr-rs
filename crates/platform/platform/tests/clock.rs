@@ -2,7 +2,6 @@
 
 use std::time::{Duration, Instant};
 
-use api::host::Clock as ClockTrait;
 use platform::{Clock, Ticker};
 
 #[test]
@@ -70,7 +69,6 @@ fn ticker_accepts_a_huge_interval_without_panicking() {
 fn clock_reports_monotonic_milliseconds() {
     let clock = Clock::new();
     let first = clock.now_ms();
-    let trait_first = ClockTrait::now_ms(&clock);
-    assert!(first <= trait_first, "the clock is monotonic");
+    assert!(first <= clock.now_ms(), "the clock is monotonic");
     assert!(clock.elapsed() < Duration::from_secs(1));
 }

@@ -22,8 +22,8 @@ const MAX_FRAME_INTERVAL: Duration = Duration::from_secs(3600);
 /// A monotonic wall-clock source.
 ///
 /// The clock is created once and reports the milliseconds elapsed since then.
-/// It is also the L1 implementation of the [`api::host::Clock`] contract
-/// so higher layers can observe time without owning a platform timer.
+/// A higher layer reads the elapsed time through it, so no layer above owns a
+/// platform timer.
 #[derive(Clone, Copy, Debug)]
 pub struct Clock {
     start: Instant,
@@ -51,12 +51,6 @@ impl Clock {
 impl Default for Clock {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl api::host::Clock for Clock {
-    fn now_ms(&self) -> u64 {
-        Clock::now_ms(self)
     }
 }
 

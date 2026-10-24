@@ -16,7 +16,7 @@ use crate::host::TouchPhase;
 ///
 /// [`PhysicalKey::index`] sets it on a raw native code so it can never collide
 /// with a named key's id.
-pub const NATIVE_KEY_FLAG: u32 = 0x8000_0000;
+pub(crate) const NATIVE_KEY_FLAG: u32 = 0x8000_0000;
 
 macro_rules! define_physical_keys {
     ($( $id:literal => $variant:ident ),* $(,)?) => {
@@ -35,7 +35,7 @@ macro_rules! define_physical_keys {
             /// A key the backend could not identify, carrying its raw native
             /// code.
             ///
-            /// [`PhysicalKey::index`] sets [`NATIVE_KEY_FLAG`], so a native
+            /// [`PhysicalKey::index`] sets `NATIVE_KEY_FLAG`, so a native
             /// code can never collide with a named key.
             Native(u32),
         }
@@ -45,7 +45,7 @@ macro_rules! define_physical_keys {
             /// state.
             ///
             /// Named keys return their declared id; [`PhysicalKey::Native`]
-            /// returns the raw code with [`NATIVE_KEY_FLAG`] set. The named
+            /// returns the raw code with `NATIVE_KEY_FLAG` set. The named
             /// ids are stable across builds.
             pub fn index(self) -> u32 {
                 match self {

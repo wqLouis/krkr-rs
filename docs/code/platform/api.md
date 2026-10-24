@@ -16,9 +16,7 @@ nothing else: **no implementations**. It is DTOs, plain enums and the typed
 ## 1. Responsibility
 
 * the shared value types (geometry, blend, media, glyph, input, host, config);
-* the typed error enums the L1 crates return;
-* the *traits* a higher layer may implement against a platform service
-  (`InputSource`, `HostWindow`, `Clock`, `LogSink`).
+* the typed error enums the L1 crates return.
 
 `api` owns no state and starts no work. It is the vocabulary the other L1
 crates speak.
@@ -50,8 +48,8 @@ in [`arch_rules.md`](../../rules/arch_rules.md) §3.1 and §6.
 | `api::fs` | `FsPath`, `OpenMode`, `SeekFrom`, `FileStat`, `FileMetadata`, `DirEntry` |
 | `api::geometry` | `RectF`, `PixelRegion`, `Affine2`, `Transform2D` |
 | `api::glyph` | `GlyphBackend`, `GlyphStyle`, `GlyphBitmap`, `FontMetrics` |
-| `api::host` | `InputState`, `KeyState`, `TouchPhase`, `TouchPoint`, `SurfaceEvent`, `PresentSkip`, `Presentation`, `ProcessEnv`, `LogLevel`, `LogRecord`, and the traits `InputSource`, `HostWindow`, `Clock`, `LogSink` |
-| `api::input` | `InputEvent`, `MouseButton`, `PhysicalKey`, `NATIVE_KEY_FLAG` |
+| `api::host` | `TouchPhase`, `TouchPoint`, `SurfaceEvent`, `PresentSkip`, `Presentation` |
+| `api::input` | `InputEvent`, `MouseButton`, `PhysicalKey` |
 | `api::media` | `ImageInfo`, `DecodedImage`, `AudioSpec`, `DecodedAudio`, `RgbaFrame`, `VideoSpec`, `MediaCapabilities` |
 | `api::shader` | the custom-shader **data** half: `ShaderStage`, `ShaderCode`, `ShaderModule`, `VertexLayout`, `SamplerKind`, `BindingKind`, `BindingDesc`, `EffectUniforms`, `EffectPipelineDesc`, `ShaderDataError` and the `MAX_EFFECT_*` budgets |
 
@@ -127,19 +125,16 @@ pub enum InputEvent { Key { code: PhysicalKey, pressed: bool },
                       MouseButton { button: MouseButton, pressed: bool },
                       PointerMoved { x: f32, y: f32 },
                       Touch { … } }
-pub const NATIVE_KEY_FLAG: u32 = 0x8000_0000;
 ```
 
 `PhysicalKey::Native(u32)` keeps an unmapped platform key's raw identity
 instead of dropping or guessing at it; the compatibility layer maps a
 physical key onto the reference virtual-key table, and only the L3 side knows
-that table.
+that table. The high bit that separates a raw native code from a named key
+is crate-private: `PhysicalKey::index` is the only way to read it.
 
-`api::host` adds the *state* shapes the host seam uses — `InputState`,
-`KeyState` (`MAX_KEY_CODE = 256`), `TouchPhase`, `TouchPoint`,
-`SurfaceEvent` (`Lost`, `OutOfDate`, …), `Presentation`, `ProcessEnv` — plus
-the traits a platform service may implement (`InputSource`, `HostWindow`,
-`Clock`, `LogSink`).
+`api::host` holds the shapes the engine stores — `TouchPhase`, `TouchPoint`,
+`SurfaceEvent` (`Lost`, `OutOfDate`, …), `PresentSkip` and `Presentation`.
 
 ### `api::host::Presentation` and `PresentSkip`
 
@@ -213,9 +208,8 @@ in [`runtime-config.md`](../../../docs.old/runtime-config.md).
 `api` owns nothing. Every type in it is a value: a DTO copied into a struct, a
 state value L2 stores and hands back, or an error returned by value.
 
-The trait set (`InputSource`, `HostWindow`, `Clock`, `LogSink`) is a
-*contract*, implemented by whoever owns the resource — L1's `platform::Clock`
-implements `api::host::Clock`, for example.
+The crate declares no traits: a contract with a single implementor is an
+inherent method, and a contract with no implementor is not a contract.
 
 ---
 
@@ -271,8 +265,7 @@ absent-versus-invalid distinction the launcher relies on is in
   turn and inverse round trip; the `Transform2D` pivot.
 * `crates/platform/api/tests/glyph.rs` — the `GlyphBitmap` consistency, the
   `FontMetrics` line height and the default `GlyphStyle`.
-* `crates/platform/api/tests/host.rs` — the `KeyState` press/release and its
-  bounds, the default `InputState` and the default `Presentation`.
+* `crates/platform/api/tests/host.rs` — the default `Presentation`.
 * `crates/platform/api/tests/media.rs` — the `DecodedImage`/`DecodedAudio`/
   `RgbaFrame` consistency, the frame count, the zero-channel safety, the
   `VideoSpec` audio detection and the default `MediaCapabilities`.
