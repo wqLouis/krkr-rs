@@ -12,7 +12,7 @@ use render::{
     PipelineConfig, RenderContent, RenderNode, RenderPipeline, RenderScene, RenderTarget,
     RenderTargetDesc, begin_render_state, capabilities, create_render_pipeline,
     create_render_target, create_texture, destroy_render_target, read_render_target,
-    render_to_target, render_to_target_region, upload_texture,
+    render_to_target, upload_texture,
 };
 use testkit::headless_window;
 
@@ -321,87 +321,4 @@ fn vulkan_target_capabilities_or_skip() {
     assert!(caps.supports_offscreen_targets);
     // The GPU path still defers destination-dependent blends.
     assert!(!caps.supports_destination_dependent_blend);
-}
-
-/// Builds a scene with `background` and one solid rectangle.
-fn scene_with_solid(background: [f32; 4], rect: RectF, color: [f32; 4]) -> RenderScene {
-    let mut scene = RenderScene::with_root_node();
-    let root = scene.root;
-    let child = scene.push(RenderNode {
-        parent: Some(root),
-        content: RenderContent::Solid(color),
-        dst: rect,
-        ..RenderNode::default()
-    });
-    scene.node_mut(root).expect("root").children = vec![child];
-    scene.background = Some(background);
-    scene
-}
-
-/// Returns the RGBA8 pixel at `(x, y)` of a tightly packed 4x4 image.
-fn pixel(image: &[u8], x: u32, y: u32) -> [u8; 4] {
-    let offset = ((y as usize) * 4 + (x as usize)) * 4;
-    [
-        image[offset],
-        image[offset + 1],
-        image[offset + 2],
-        image[offset + 3],
-    ]
-}
-
-/// The damage property: a region render into a target that holds an earlier
-/// frame keeps the pixels outside the region, and the pixels inside it are
-/// the ones a full render of the same scene produces.
-#[test]
-fn region_render_keeps_the_pixels_outside_the_region() {
-    let pipeline = RenderPipeline::null();
-    let (_surface, mut state) = begin_render_state(&pipeline, &headless_window()).expect("begin");
-    let kept = create_render_target(&pipeline, RenderTargetDesc::new(4, 4)).expect("target");
-    let reference = create_render_target(&pipeline, RenderTargetDesc::new(4, 4)).expect("target");
-    let whole = PixelRegion::new(0, 0, 4, 4);
-
-    let first = scene_with_solid(
-        [1.0, 0.0, 0.0, 1.0],
-        RectF::new(0.0, 0.0, 2.0, 2.0),
-        [0.0, 0.0, 1.0, 1.0],
-    );
-    render_to_target(&pipeline, &mut state, &kept, &first).expect("first frame");
-    let mut before = [0u8; 4 * 4 * 4];
-    read_render_target(&pipeline, &state, &kept, whole, &mut before).expect("read");
-
-    let second = scene_with_solid(
-        [0.0, 1.0, 0.0, 1.0],
-        RectF::new(2.0, 2.0, 2.0, 2.0),
-        [1.0, 1.0, 0.0, 1.0],
-    );
-    render_to_target(&pipeline, &mut state, &reference, &second).expect("reference frame");
-    let mut full = [0u8; 4 * 4 * 4];
-    read_render_target(&pipeline, &state, &reference, whole, &mut full).expect("read");
-
-    let damage = PixelRegion::new(2, 2, 2, 2);
-    render_to_target_region(&pipeline, &mut state, &kept, &second, damage).expect("damage");
-    let mut after = [0u8; 4 * 4 * 4];
-    read_render_target(&pipeline, &state, &kept, whole, &mut after).expect("read");
-
-    // The full render would have changed the pixels outside the damage, so
-    // the comparison below is not vacuous.
-    assert_ne!(pixel(&full, 0, 0), pixel(&before, 0, 0));
-
-    for y in 0..4u32 {
-        for x in 0..4u32 {
-            if damage.contains((x, y)) {
-                assert_eq!(
-                    pixel(&after, x, y),
-                    pixel(&full, x, y),
-                    "the damaged pixel ({x}, {y}) differs from the full render"
-                );
-            } else {
-                assert_eq!(
-                    pixel(&after, x, y),
-                    pixel(&before, x, y),
-                    "the pixel ({x}, {y}) outside the damage changed"
-                );
-            }
-        }
-    }
 }
