@@ -315,10 +315,10 @@ int tjs2_set_call_missing(tjs2_engine *e, tjs2_value_id obj,
  * Resolve a retained object to the Rust payload pointer of an
  * instance-based native class — the C++ equivalent of the reference's
  * `objthis->NativeInstanceSupport(TJS_NIS_GETINSTANCE, classid, &native)`
- * + `GetNativePtr()` lookup that TJS_GET_NATIVE_INSTANCE performs in method
- * bodies (the same mechanism tjs2_dispatch_native_instance_method uses),
- * exposed so Rust can map "script object" -> "our native payload" without
- * the script-visible `id` / `nativeId` helper properties.
+ * lookup that TJS_GET_NATIVE_INSTANCE performs in method bodies, followed by
+ * the payload the VM kept for that instance. It is exposed so Rust can map
+ * "script object" -> "our native payload" without the script-visible `id` /
+ * `nativeId` helper properties.
  *
  * `obj` is a retained object id (see tjs2_retain_value /
  * tjs2_retain_object). `class_name_utf8` is the UTF-8 name the class was
@@ -340,11 +340,15 @@ int tjs2_set_call_missing(tjs2_engine *e, tjs2_value_id obj,
  *     an instance of another native class, or the class object itself
  *     (class objects have no native instance registered under their own
  *     class id);
- *   - the instance exists but its payload was released: the object was
- *     invalidated (reference `Invalidate`; GetNativePtr() returns NULL
- *     afterwards) or the create callback produced no payload.
- * NULL is therefore an ordinary, non-error outcome; this entry point never
- * raises a TJS error and never lets a C++ exception cross the ABI.
+ *   - the create callback produced no payload.
+ *
+ * An object whose native instance was invalidated is still a hit: the
+ * reference NativeInstanceSupport keeps the instance registered until the
+ * object is destructed (`tTJSCustomObject::Finalize` calls Invalidate, the
+ * class ids stay until Destruct), so an argument lookup must keep
+ * recognizing its class. NULL is therefore an ordinary, non-error outcome;
+ * this entry point never raises a TJS error and never lets a C++ exception
+ * cross the ABI.
  *
  * Ownership: the payload stays owned by the engine (allocated by the
  * tjs2_native_create_instance_fn callback, freed exactly once by
@@ -352,11 +356,13 @@ int tjs2_set_call_missing(tjs2_engine *e, tjs2_value_id obj,
  * the pointer and never transfers ownership — callers must not free it.
  *
  * Validity: the pointer is valid only while the object stays alive (keep
- * the retained id live) and is not invalidated — i.e. exactly while
- * `GetNativePtr()` would keep returning it (see the tjs2_native_instance
- * contract: `valid && !invalidated`). Once the object is invalidated or
- * released, a previously returned pointer must be discarded; query again
- * after any doubt. It must not outlive tjs2_destroy.
+ * the retained id live) and must not outlive tjs2_destroy. An `invalidate
+ * obj;` still resolves, but the invalidate callback has already released the
+ * resources the payload owns; callers must treat the payload's state as shut
+ * down (a layer has no images, a window has no draw device). Direct
+ * method/property dispatch is separate: it keeps rejecting a finalized
+ * instance, so this lookup must not be used to run methods on such an
+ * object.
  */
 void *tjs2_get_native_instance(tjs2_engine *e, tjs2_value_id obj,
                                const char *class_name_utf8);

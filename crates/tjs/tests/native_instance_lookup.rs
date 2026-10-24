@@ -279,7 +279,7 @@ fn null_value_returns_null() {
 }
 
 #[test]
-fn invalidated_instance_returns_null() {
+fn invalidated_instance_still_resolves_for_lookup() {
     let _lock = vm_lock();
     let e = Tjs2Engine::new().unwrap();
     e.register_native_class_instance(&widget_builder()).unwrap();
@@ -293,14 +293,14 @@ fn invalidated_instance_returns_null() {
     );
 
     // Reference `invalidate obj;` — the instance is finalized but not yet
-    // destroyed, so the payload is still allocated while direct dispatch
-    // (and therefore the lookup) must stop.
+    // destroyed, so its class registration survives for an argument lookup;
+    // direct dispatch on the object still stops.
     e.invalidate_retained(object.raw_id()).unwrap();
     assert!(
         e.native_instance_payload(object.raw_id(), "Widget")
             .expect("lookup must not error for an invalidated object")
-            .is_none(),
-        "an invalidated instance must miss"
+            .is_some(),
+        "an invalidated instance still belongs to its native class"
     );
 }
 

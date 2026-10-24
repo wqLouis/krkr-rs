@@ -36,15 +36,16 @@ It runs the steps below in this order and stops at the first failure:
 | 10 | `callback-objthis` | check | callback-invoking native members carry objthis |
 | 11 | `native-arity` | check | reference zero-argument natives are not rejected |
 | 12 | `void-getter` | check | a native getter does not return a raw void where the reference returns an object |
-| 13 | `cargo clippy --workspace --all-targets -- -D warnings` | cargo | the host build |
-| 14 | `cargo clippy -p platform --features platform-android --all-targets -- -D warnings` | cargo | the Android feature on the host |
-| 15 | `android-target` | check | no desktop-only backend leaks into the Android graph, or vice versa |
-| 16 | `surface-lock --update` | check | regenerate the live VM dispatch dump |
-| 17 | `surface-lock` | check | the dump matches the reviewed baseline (D29) |
-| 18 | `native-parity` | check | native class surface vs the reference |
-| 19 | `plugin-parity --no-doc` | check | plugin surface vs the reference |
-| 20 | `host-facts` | check | every host seam has a production installer |
-| 21 | `ci` | check | the release workflow contract (v* → Linux + Android in parallel → one release) |
+| 13 | `native-instance-lookup` | check | invalidated instances resolve by class; dispatch keeps the invalidation guard |
+| 14 | `cargo clippy --workspace --all-targets -- -D warnings` | cargo | the host build |
+| 15 | `cargo clippy -p platform --features platform-android --all-targets -- -D warnings` | cargo | the Android feature on the host |
+| 16 | `android-target` | check | no desktop-only backend leaks into the Android graph, or vice versa |
+| 17 | `surface-lock --update` | check | regenerate the live VM dispatch dump |
+| 18 | `surface-lock` | check | the dump matches the reviewed baseline (D29) |
+| 19 | `native-parity` | check | native class surface vs the reference |
+| 20 | `plugin-parity --no-doc` | check | plugin surface vs the reference |
+| 21 | `host-facts` | check | every host seam has a production installer |
+| 22 | `ci` | check | the release workflow contract (v* → Linux + Android in parallel → one release) |
 
 The `cargo` steps are the main agent's; they are the reason a worker may run a
 compiler-free check but may not run the build gate. `gate --no-cargo` runs the
@@ -91,6 +92,7 @@ uv run --project scripts krkr-gate storage-media
 uv run --project scripts krkr-gate callback-objthis
 uv run --project scripts krkr-gate native-arity
 uv run --project scripts krkr-gate void-getter
+uv run --project scripts krkr-gate native-instance-lookup
 uv run --project scripts krkr-gate host-facts
 uv run --project scripts krkr-gate android-target
 uv run --project scripts krkr-gate ci
@@ -106,6 +108,16 @@ a regex from silently matching nothing.
 `surface-lock --update` is **main-agent only** and is only for a reviewed
 surface change. The `ci` check is described in §4 and validates the workflow
 without running it.
+
+`native-instance-lookup` guards the native-instance ABI seam in
+`crates/tjs/cpp/tjs2_abi.cpp`: `tjs2_get_native_instance` must resolve a
+live-but-invalidated instance through `GetNativePtrForLookup()`, that accessor
+must stay the valid-only class lookup, and the method/property/constructor
+dispatch bodies must keep using the invalidation-guarded `GetNativePtr()`.
+Its fixture self-test applies four mutations (lookup uses the dispatch
+accessor, lookup accessor grows the dispatch guard, a dispatch body drops the
+guarded accessor, and the dispatch accessor loses its invalidation guard) and
+requires the matching rule to fire.
 
 ---
 

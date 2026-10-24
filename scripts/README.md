@@ -22,7 +22,7 @@ shells out to `cargo tree`, the rest read the tree.
 The static gate sequence is `cargo fmt` → `stateless` → `error-handling` →
 `house-style` → `layering` → `storage-boundary` → `native-construction` →
 `lifecycle-order` → `storage-media` → `callback-objthis` → `native-arity` →
-`void-getter` → `cargo clippy` → `cargo clippy platform-android` →
+`void-getter` → `native-instance-lookup` → `cargo clippy` → `cargo clippy platform-android` →
 `android-target` → `surface-lock --update` → `surface-lock` → `native-parity`
 → `plugin-parity --no-doc` → `host-facts` → `ci`. The ordered gate, the test
 suites and the CI release pipeline are documented in
@@ -40,9 +40,9 @@ suites and the CI release pipeline are documented in
 
 `stateless`, `error-handling`, `house-style`, `layering`,
 `storage-boundary`, `native-construction`, `lifecycle-order`, `storage-media`,
-`callback-objthis`, `native-arity`, `void-getter`, `host-facts`,
-`android-target`, `ci`, `surface-lock`, `native-parity`, `plugin-parity`, the
-`extract-xp3` helper, and `gate`.
+`callback-objthis`, `native-arity`, `void-getter`, `native-instance-lookup`,
+`host-facts`, `android-target`, `ci`, `surface-lock`, `native-parity`,
+`plugin-parity`, the `extract-xp3` helper, and `gate`.
 
 `house-style` also enforces the AGENTS §6 comment rules: a **non-test**
 comment may not cite the external engine (`reference/cpp`, a `*.cpp:line`, a
@@ -80,6 +80,14 @@ matches the void default and returns the reference's non-void value is clean.
 A property whose reference getter genuinely reads back void is recorded in
 `allowlists/void_getter_allow.txt` as `path:field — reason`; a reason that
 starts with `debt:` tracks a known defect and does not silence the finding.
+
+`native-instance-lookup` guards the native-instance ABI seam in
+`crates/tjs/cpp/tjs2_abi.cpp`: `tjs2_get_native_instance` must resolve a
+live-but-invalidated instance through `GetNativePtrForLookup()`, that accessor
+must stay the valid-only class lookup, and the four method/property/constructor
+dispatch bodies must keep using the invalidation-guarded `GetNativePtr()`.
+Its fixture self-test applies four mutations and requires the matching rule to
+fire.
 
 ## Environment
 

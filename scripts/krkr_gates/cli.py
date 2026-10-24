@@ -7,8 +7,9 @@ Usage::
 ``<check>`` is one of ``stateless``, ``error-handling``, ``house-style``,
 ``layering``, ``host-facts``, ``android-target``, ``ci``, ``surface-lock``,
 ``native-parity``, ``plugin-parity``, ``callback-objthis``, ``native-arity``,
-``void-getter``, or the ``extract-xp3`` helper. ``gate`` runs the full ordered
-sequence; its ``cargo`` steps are for the main agent.
+``void-getter``, ``native-instance-lookup``, or the ``extract-xp3`` helper.
+``gate`` runs the full ordered sequence; its ``cargo`` steps are for the main
+agent.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from .checks import (
     lifecycle_order,
     native_arity,
     native_construction,
+    native_instance_lookup,
     native_parity,
     plugin_parity,
     stateless,
@@ -55,6 +57,7 @@ CHECKS: dict[str, Callable[[list[str]], int]] = {
     "callback-objthis": callback_objthis.main,
     "native-arity": native_arity.main,
     "void-getter": void_getter.main,
+    "native-instance-lookup": native_instance_lookup.main,
     "host-facts": host_facts.main,
     "android-target": android_target.main,
     "ci": ci.main,
@@ -78,6 +81,7 @@ GATE_SEQUENCE: list[tuple[str, str, str, list[str]]] = [
     ("callback-objthis", "check", "callback-objthis", []),
     ("native-arity", "check", "native-arity", []),
     ("void-getter", "check", "void-getter", []),
+    ("native-instance-lookup", "check", "native-instance-lookup", []),
     (
         "cargo clippy",
         "cargo",
@@ -139,6 +143,7 @@ Checks:
   callback-objthis  callback-invoking native members registered without objthis
   native-arity     reference zero-argument native methods rejected by a Rust guard
   void-getter      native getters returning a raw void where the reference returns an object
+  native-instance-lookup invalidated native instances resolve by class; dispatch stays guarded
   host-facts       host seams with no production installer
   android-target   per-target backend-feature resolution
   ci               the release workflow: v* -> gate -> Linux + Android -> one release

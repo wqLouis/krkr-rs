@@ -953,12 +953,11 @@ pub(super) fn resolved_bitmap_pixels(
 /// this member must not re-arm it. An assigned image that cannot take its
 /// size is an error rather than stale geometry.
 fn assign_images(scene: &mut Scene, dest: u32, source: u32) -> Result<(), String> {
-    // A source whose layer record is gone (a shut-down object) has nothing to
-    // copy; leave the destination untouched rather than treating the missing
-    // image as an empty one and deallocating it.
-    if scene.layer(source).is_none() {
-        return Ok(());
-    }
+    // An invalidated source still resolves as a Layer — its native instance
+    // stays registered until the object is destructed — but invalidation has
+    // already released its MainImage and ProvinceImage, so it carries no
+    // images and the destination's images are deallocated. A missing scene
+    // record therefore means an empty source, not a rejected argument.
     // Snapshot the source before touching the destination: the two may share
     // a bitmap id, and the copy must reflect the pre-write source. The source
     // may still be decoding, so the snapshot waits for its pixels.
@@ -1052,7 +1051,10 @@ fn assign_images(scene: &mut Scene, dest: u32, source: u32) -> Result<(), String
 /// `LayerIntf.cpp:2394-2432`). The argument is resolved only through the
 /// Layer native instance, so a non-object, `null`, or a non-Layer object
 /// raises `TVPSpecifyLayer` (`LayerIntf.cpp:9860-9882`); a missing argument
-/// is `TJS_E_BADPARAMCOUNT` (`:9860-9861`).
+/// is `TJS_E_BADPARAMCOUNT` (`:9860-9861`). An invalidated Layer is still a
+/// Layer for the lookup — its native instance stays registered until the
+/// object is destructed — and contributes no images, so the destination's
+/// images are deallocated.
 extern "C" fn layer_assign_images(
     engine: *mut c_void,
     instance: *mut c_void,

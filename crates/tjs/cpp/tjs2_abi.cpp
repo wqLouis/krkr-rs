@@ -1243,6 +1243,18 @@ public:
     void *GetNativePtr() const {
         return (valid && !invalidated) ? native_ptr : nullptr;
     }
+
+    // The payload for a NativeInstanceSupport(TJS_NIS_GETINSTANCE) hit. The
+    // instance object stays registered until Destruct (tjsObject.cpp
+    // Finalize), so a reference lookup still finds it after Invalidate; the
+    // payload is likewise alive until the destroy callback. Invalidate may
+    // have released the resources the payload owns, so callers must treat
+    // its state as shut down. This deliberately differs from GetNativePtr:
+    // direct dispatch must reject a finalized instance, while an argument
+    // lookup must still recognize its class.
+    void *GetNativePtrForLookup() const {
+        return valid ? native_ptr : nullptr;
+    }
     bool IsValid() const { return valid; }
 };
 
@@ -2356,9 +2368,14 @@ void *tjs2_get_native_instance(tjs2_engine *e, tjs2_value_id obj,
         if(TJS_FAILED(hr) || !native)
             return nullptr; // not an instance (or the class object itself)
         // Same static_cast as the dispatchers: every native instance
-        // registered under this class id is a tjs2_native_instance.
-        // GetNativePtr() is null once the instance was invalidated.
-        return static_cast<tjs2_native_instance *>(native)->GetNativePtr();
+        // registered under this class id is a tjs2_native_instance. The
+        // reference NativeInstanceSupport keeps returning the instance after
+        // Invalidate (tjsObject.cpp Finalize only releases its resources);
+        // an argument lookup must therefore still recognize the class. The
+        // instance method/property dispatchers keep using GetNativePtr(),
+        // whose invalidation guard rejects calls on a finalized object.
+        return static_cast<tjs2_native_instance *>(native)
+            ->GetNativePtrForLookup();
     } catch(...) {
         // Never let a C++ exception cross the C ABI.
         return nullptr;

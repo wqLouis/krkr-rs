@@ -169,7 +169,8 @@ the `stateless`, `error-handling`, `house-style`, `layering`, `storage-boundary`
 `storage-media`,
 `callback-objthis`,
 `native-arity`,
-`void-getter`
+`void-getter`,
+`native-instance-lookup`
 checks;
 `cargo clippy --workspace --all-targets -- -D warnings`;
 `cargo clippy -p platform --features platform-android --all-targets -- -D warnings`;
@@ -202,6 +203,7 @@ uv run --project scripts krkr-gate storage-media
 uv run --project scripts krkr-gate callback-objthis
 uv run --project scripts krkr-gate native-arity
 uv run --project scripts krkr-gate void-getter
+uv run --project scripts krkr-gate native-instance-lookup
 uv run --project scripts krkr-gate host-facts
 uv run --project scripts krkr-gate android-target
 uv run --project scripts krkr-gate ci

@@ -2538,8 +2538,8 @@ name), and none was available"
     /// Resolve a retained script object to the payload pointer of an
     /// instance-based native class (reference
     /// `iTJSDispatch2::NativeInstanceSupport(TJS_NIS_GETINSTANCE, classid)`
-    /// and `GetNativePtr()` — the lookup behind TJS_GET_NATIVE_INSTANCE and
-    /// the instance method/property dispatchers).
+    /// — the lookup behind TJS_GET_NATIVE_INSTANCE in native method bodies
+    /// and argument adaptors).
     ///
     /// `class_name` must be the name the class was registered with via
     /// [`Self::register_native_class_instance`]; `obj` is a live retained
@@ -2547,10 +2547,13 @@ name), and none was available"
     /// [`Self::retain_object_arg`], [`Self::eval_retained`], …).
     ///
     /// Returns `Ok(Some(payload))` when `obj` is a live instance of that
-    /// class. Returns `Ok(None)` — an ordinary miss, never an error — when
-    /// the object is TJS `null`, a plain script object, the class object
-    /// itself, an instance of a different native class, an invalidated
-    /// instance, a retained id that is not an object, or when
+    /// class, including an instance whose `Invalidate` has run:
+    /// `NativeInstanceSupport(TJS_NIS_GETINSTANCE, classid)` keeps finding
+    /// the instance until the object is destructed, so an argument lookup
+    /// must keep recognizing its class. Returns `Ok(None)` — an
+    /// ordinary miss, never an error — when the object is TJS `null`, a
+    /// plain script object, the class object itself, an instance of a
+    /// different native class, a retained id that is not an object, or when
     /// `class_name` is not an instance-capable class registered on this
     /// engine (static-only and builtin class names never carry a Rust
     /// payload). A NUL byte in `class_name` and a null `obj` id are
@@ -2561,10 +2564,13 @@ name), and none was available"
     /// The payload stays owned by the engine (freed by the class's destroy
     /// callback when the object dies); this only borrows the pointer — do
     /// not free it. The pointer is valid only while the object is kept
-    /// alive by its retained id **and** has not been invalidated (exactly
-    /// the `GetNativePtr()` / `IsValid()` contract in `tjs2_abi.cpp`):
-    /// discard it once the id is released or the object is invalidated,
-    /// and never let it outlive the engine.
+    /// alive by its retained id, and never outlives the engine. An
+    /// invalidated instance still resolves, but its invalidate callback has
+    /// already released the resources the payload owns, so treat its state
+    /// as shut down. Direct method/property dispatch keeps rejecting a
+    /// finalized instance; this lookup is for resolving class identity and
+    /// the state that survives invalidation (a layer id), not for running a
+    /// method on an invalidated object.
     pub fn native_instance_payload(
         &self,
         obj: Tjs2ValueId,
@@ -3957,6 +3963,40 @@ var ra = a.get(); var rb = b.get();",
             COUNTER_DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "payload must be destroyed exactly once"
+        );
+    }
+
+    /// Reference: `tTJSCustomObject::Finalize` invalidates each registered
+    /// native instance and clears the object's members, but the class ids stay
+    /// registered until `Destruct` (`reference/cpp/core/tjs2/tjsObject.cpp:377-399`).
+    /// `NativeInstanceSupport(TJS_NIS_GETINSTANCE, classid)` therefore still
+    /// finds the instance after `invalidate obj;`; an argument lookup such as
+    /// `Layer.assignImages` must keep recognizing the class even though direct
+    /// dispatch on the finalized object stays refused.
+    #[test]
+    fn native_instance_payload_survives_invalidation() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class_instance(&counter_builder())
+            .unwrap();
+        e.exec_script("var c = new Counter(); c.value = 41; invalidate c;", "test")
+            .unwrap();
+        let value = e
+            .eval("c", "test")
+            .expect("the object survives invalidation");
+        let id = e.retain_value_detached(&value).unwrap();
+        let payload = e
+            .native_instance_payload(id.raw_id(), "Counter")
+            .expect("the class lookup is not an error");
+        assert!(
+            payload.is_some(),
+            "an invalidated instance still belongs to its class"
+        );
+        // Direct dispatch on a finalized object is still refused.
+        let err = e.eval("c.inc()", "test").unwrap_err();
+        assert!(
+            err.to_string().contains("invalidated"),
+            "expected an invalidated-instance error, got: {err}"
         );
     }
 

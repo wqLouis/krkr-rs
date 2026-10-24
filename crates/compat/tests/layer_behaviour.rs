@@ -2404,6 +2404,60 @@ fn assign_images_copies_a_layer_and_deallocates_on_an_imageless_source() {
     );
 }
 
+/// Reference: an invalidated Layer keeps its native-instance registration.
+/// `tTJSCustomObject::Finalize` invalidates every registered instance and
+/// clears the object's members, but the class ids stay until `Destruct`
+/// (`reference/cpp/core/tjs2/tjsObject.cpp:377-399`), so
+/// `Layer.assignImages`'s `NativeInstanceSupport(TJS_NIS_GETINSTANCE,
+/// Layer::ClassID)` still resolves it (`LayerIntf.cpp:9863-9875`).
+/// `Invalidate` already deallocated the source's images (`:515-580`), so
+/// `AssignImages` deallocates the destination's (`:2394-2432`). This is the
+/// shape of the game's `ButtonLayer.assign -> AnimKAGLayer.assignImages`
+/// copy after a page clear invalidated the old link objects.
+#[test]
+fn assign_images_accepts_an_invalidated_layer_source() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        r#"
+        var w = new Window();
+        class AnimLike extends Layer {
+            function AnimLike(win, parent) { super.Layer(win, parent); }
+            function assignImages(src, copyState) { super.assignImages(src); }
+        }
+        class ButtonLike extends AnimLike {
+            function ButtonLike(win, parent) { super.AnimLike(win, parent); }
+            function assign(src) { assignImages(src, 1); }
+        }
+        var src = new ButtonLike(w, null);
+        src.setImageSize(2, 2);
+        src.setMainPixel(0, 0, 0x123456);
+        var dst = new ButtonLike(w, null);
+        dst.setImageSize(3, 3);
+        dst.assign(src);
+        "#,
+    );
+    assert_eq!(
+        env.eval_int("dst.hasImage"),
+        1,
+        "the valid copy must give the destination the source image"
+    );
+    env.run("invalidate src;");
+    env.run("dst.assign(src);");
+    assert_eq!(
+        env.eval_int("dst.hasImage"),
+        0,
+        "an invalidated Layer is still a Layer and its freed images deallocate the destination's"
+    );
+    // A non-Layer stays rejected even when it was invalidated: the class
+    // lookup is on the native instance, not on the script object's lifetime.
+    assert!(
+        env.try_run("var bmp = new Bitmap(1, 1, 32); invalidate bmp; dst.assignImages(bmp);")
+            .is_err(),
+        "an invalidated Bitmap is still a non-Layer"
+    );
+}
+
 /// Reference: `tTVPLayerManager::AttachPrimary` forces a window's first layer
 /// visible (`reference/cpp/core/visual/LayerManager.cpp:161-172`), while a
 /// later layer keeps the default hidden state. The shared
