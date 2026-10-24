@@ -145,6 +145,37 @@ class KrkrGameActivity : GameActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        LauncherLog.i("KrkrGameActivity.onStart")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        LauncherLog.i("KrkrGameActivity.onResume")
+    }
+
+    override fun onPause() {
+        super.onPause()
+        LauncherLog.i("KrkrGameActivity.onPause")
+    }
+
+    override fun onStop() {
+        super.onStop()
+        LauncherLog.i("KrkrGameActivity.onStop")
+    }
+
+    /**
+     * The end of the Activity.
+     *
+     * A finished Activity logs this line; a process that died does not, so
+     * the launcher log tells the two apart.
+     */
+    override fun onDestroy() {
+        LauncherLog.i("KrkrGameActivity.onDestroy: finishing=$isFinishing")
+        super.onDestroy()
+    }
+
     /**
      * `launchMode="singleTask"`: a second launch while an instance is alive is
      * delivered here rather than to [onCreate]. The native side reads

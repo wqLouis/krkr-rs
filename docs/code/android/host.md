@@ -55,7 +55,7 @@ The symbol is resolved by the `GameActivity` glue, which the manifest names
 through `android.app.lib_name`. It uses the Rust ABI because the glue
 declares `extern "Rust" { fn android_main(app: AndroidApp); }`.
 
-The startup order is in [README.md](README.md) §3. Two details are worth
+The startup order is in [README.md](README.md) §3. Three details are worth
 restating here:
 
 * **The log level is read before the logger exists**, because it selects the
@@ -65,6 +65,14 @@ restating here:
 * **The log file is opened before the global logger is claimed.** An unusable
   log file is a reported startup failure rather than a fallback that leaves
   the Logs screen empty.
+* **A panic hook is installed once the state directory is known.** The Android
+  glue catches a panic that unwinds out of the entry point and finishes the
+  Activity, so the terminal state write at the end of the entry point never
+  runs and the state file keeps the mid-flight state, which the launcher reads
+  as "the game is still running". The hook writes the terminal state (the
+  panic's payload and its location) before the unwind continues, so the crash
+  is a *reported* failure. The hook never panics: a failure to write the state
+  file is logged, and the original panic continues either way.
 
 ### The logger
 
@@ -142,17 +150,20 @@ The contract with the launcher is fixed:
 * a flat JSON object:
 
 ```json
-{ "state": "starting", "message": null, "pid": 1234, "at": "2026-09-15T12:00:00Z" }
+{ "state": "starting", "message": null, "kind": null, "pid": 1234, "at": "2026-09-15T12:00:00Z" }
 ```
 
 `state` is one of `starting`, `running`, `failed`, `stopped`; `message`
-carries the error text for `failed` (otherwise `null`); `pid` is the process
-id; `at` is an RFC 3339 UTC timestamp.
+carries the error text for `failed` (otherwise `null`); `kind` says what
+kind of failure a `failed` state records, `reported` for a failure the game
+reported itself and `panic` for one that unwound out of the entry point
+(otherwise `null`); `pid` is the process id; `at` is an RFC 3339 UTC
+timestamp.
 
-**The file is not cleared on entry.** A process that dies by panic or
-`SIGKILL` leaves the last state it wrote behind — `starting` or `running` —
-which is exactly how the launcher tells a crash apart from a normal exit
-(which writes `stopped`).
+**The file is not cleared on entry.** A process that is killed (`SIGKILL`,
+a low-memory kill) leaves the last state it wrote behind — `starting` or
+`running` — which is exactly how the launcher tells a crash apart from a
+normal exit (which writes `stopped`).
 
 The write is **atomic**: the record is written to a temp file in the same
 directory, flushed to the backing store (`sync_all`), and then renamed over
@@ -235,6 +246,7 @@ Android-only.
 | the render host cannot be created | fatal |
 | the game cannot be opened | fatal |
 | a frame fails | fatal: the first fatal error is recorded and the state file reports it |
+| a panic unwinds out of the entry point | the panic hook writes `failed` with the kind `panic`, the panic's payload and its location; the panic itself continues |
 | the state file cannot be written | logged and swallowed (the file is a debugging aid) |
 | the log file cannot be opened or written | reported to stderr once (the logger cannot log its own failure without recursing) |
 
@@ -246,8 +258,8 @@ fallback.
 ## 10. Tests
 
 * `crates/android/src/state.rs` `mod tests` — the JSON shape, the RFC 3339
-  timestamp, the atomic replace, the missing-directory path and the
-  `RunOutcome` precedence (a failure is terminal).
+  timestamp, the atomic replace, the missing-directory path, the kind a
+  failure records and the `RunOutcome` precedence (a failure is terminal).
 * `crates/android/src/log_file.rs` `mod tests` — the record format, the byte
   accounting, the multi-step rotation (the slot order, the dropped oldest, a
   previous process's file rotated rather than appended, and the cap holding

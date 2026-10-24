@@ -11,7 +11,7 @@ import java.io.File
  * JSON object at `<filesDir>/krkr_state.json`:
  *
  * ```json
- * { "state": "starting", "message": null, "pid": 12345, "at": "2025-..." }
+ * { "state": "starting", "message": null, "kind": null, "pid": 12345, "at": "2025-..." }
  * ```
  *
  * `state` is one of `starting`, `running`, `failed`, `stopped`. The launcher
@@ -22,6 +22,10 @@ import java.io.File
  *  * `starting`/`running` — a crash or a kill: the process never got to write
  *                           `stopped`, so the file is left mid-flight;
  *  * `stopped`            — a normal exit, nothing to report.
+ *
+ * [kind] says what kind of failure a `failed` state records: `reported` for a
+ * failure the game reported itself, `panic` for one that unwound out of the
+ * entry point. It is null for every other state.
  *
  * The directory is `<filesDir>` because
  * [KrkrGameActivity.pendingStateDir] is set to `filesDir.absolutePath` before
@@ -34,6 +38,7 @@ import java.io.File
 data class EngineState(
     val state: String,
     val message: String?,
+    val kind: String?,
     val pid: Int?,
     val at: String?,
 )
@@ -114,6 +119,8 @@ object EngineDiagnostics {
                 state = state,
                 message = if (obj.isNull("message")) null
                 else obj.optString("message").takeIf { it.isNotBlank() && it != "null" },
+                kind = if (obj.isNull("kind")) null
+                else obj.optString("kind").takeIf { it.isNotBlank() && it != "null" },
                 pid = if (obj.isNull("pid")) null else obj.optInt("pid"),
                 at = if (obj.isNull("at")) null
                 else obj.optString("at").takeIf { it.isNotBlank() && it != "null" },

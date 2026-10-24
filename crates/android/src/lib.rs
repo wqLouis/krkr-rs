@@ -42,7 +42,7 @@ mod state;
 #[cfg(target_os = "android")]
 mod android_entry {
     use std::path::PathBuf;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, Once};
     use std::time::Duration;
 
     use android_activity::AndroidApp;
@@ -82,6 +82,17 @@ mod android_entry {
             Err(error) => {
                 eprintln!("krkr-rs: cannot read KrkrGameActivity.pendingStateDir: {error}");
             }
+        }
+        // A panic that unwinds out of this function is caught by the Android
+        // glue, which finishes the Activity and leaves the process running:
+        // the terminal state write at the end of this function never runs and
+        // the launcher reads the mid-flight state as "the game is still
+        // running". The hook records the panic as a failure before the unwind
+        // continues, so the crash is reported instead of guessed at. It is
+        // installed only once the state directory is known, because without it
+        // there is nowhere to write the report.
+        if state::state_dir().is_some() {
+            install_panic_hook();
         }
         // The log level is the launcher's choice and the filter is fixed when
         // the logger is installed, so it is read and validated first. This is
@@ -215,6 +226,66 @@ mod android_entry {
         // the loop recorded none; a later `stopped` must never erase a failure.
         let (terminal, message) = outcome.terminal();
         state::write_state(terminal, message);
+    }
+
+    /// Installs the process panic hook.
+    ///
+    /// The hook writes the terminal state — the panic's payload and location
+    /// — before the unwind continues, so a panic that escapes the entry point
+    /// becomes a *reported* failure instead of a state file left mid-flight.
+    /// The previous hook still runs, so the panic is printed as before.
+    ///
+    /// The hook runs while the panic unwinds: a panic inside it would replace
+    /// the original one and abort the process, so both steps are guarded and
+    /// the original panic continues whatever they do.
+    fn install_panic_hook() {
+        static INSTALLED: Once = Once::new();
+        INSTALLED.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    report_panic(info.payload(), info.location());
+                }))
+                .is_err()
+                {
+                    log::error!("krkr-state: the panic could not be written to the state file");
+                }
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    previous(info);
+                }))
+                .is_err()
+                {
+                    log::error!("krkr-state: the panic hook failed");
+                }
+            }));
+        });
+    }
+
+    /// Writes the terminal state for a panic.
+    ///
+    /// The payload says what went wrong and the location says where; both are
+    /// what the launcher shows and what a bug report needs.
+    fn report_panic(
+        payload: &(dyn std::any::Any + Send),
+        location: Option<&std::panic::Location<'static>>,
+    ) {
+        let payload = panic_message(payload);
+        let message = match location {
+            Some(location) => format!("{payload} (at {location})"),
+            None => payload,
+        };
+        state::write_failure(state::FailureKind::Panic, &message);
+    }
+
+    /// The panic's message, whatever type it was raised with.
+    fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(text) = payload.downcast_ref::<&str>() {
+            (*text).to_owned()
+        } else if let Some(text) = payload.downcast_ref::<String>() {
+            text.clone()
+        } else {
+            "the panic carried no message".to_owned()
+        }
     }
 
     /// Reads one optional settings field, turning a JNI read failure into the

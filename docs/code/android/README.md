@@ -25,7 +25,7 @@ The launcher's own interface — the Kotlin side of the app, under
 
 | module | source | role | document |
 |---|---|---|---|
-| `android_entry` | `src/lib.rs` | the `android_main` entry point: the startup order, the logger install, the settings hand-off | [host.md](host.md) |
+| `android_entry` | `src/lib.rs` | the `android_main` entry point: the startup order, the panic hook, the logger install, the settings hand-off | [host.md](host.md) |
 | `host` | `src/host.rs` | the `GameActivity` event loop and the `AndroidHost` handler | [host.md](host.md) |
 | `state` | `src/state.rs` | the `krkr_state.json` startup-state file the launcher polls | [host.md](host.md) §5 |
 | `log_file` | `src/log_file.rs` | the capped, rotated `krkr.log` the launcher's Logs screen reads | [host.md](host.md) §6 |
@@ -67,22 +67,29 @@ depends on it:
    state file and the logger are then available for every later failure. A
    read failure is not the same as an unset field, but with no directory there
    is nowhere to write the state file, so stderr is the only channel here.
-2. **Read and validate the log level** (`pendingLogLevel`). This is the one
+2. **Install the panic hook.** A panic that unwinds out of the entry point
+   is caught by the Android glue, which finishes the Activity and leaves the
+   process running: the terminal state write at the end never runs, and the
+   launcher reads the mid-flight state as "the game is still running". The hook
+   writes the terminal state — the panic's payload and its location — before
+   the unwind continues, so the crash is a reported failure. It is installed
+   only once the state directory is known, and it never panics itself.
+3. **Read and validate the log level** (`pendingLogLevel`). This is the one
    settings read that happens *before* the logger exists, because the level
    selects the filter. An unknown level is echoed on stderr and written to
    the state file as a failure; the loop is never started.
-3. **Install the logger.** The file is opened *before* the global logger is
+4. **Install the logger.** The file is opened *before* the global logger is
    claimed: an unusable log file is a reported startup failure, never a
    fallback that leaves the launcher's Logs screen empty.
-4. **Write `starting`** to the state file.
-5. **Read the game directory** (`pendingGameDir`). A missing directory is a
+5. **Write `starting`** to the state file.
+6. **Read the game directory** (`pendingGameDir`). A missing directory is a
    startup failure.
-6. **Read the game name** (`pendingGameName`). It only decorates a log line,
+7. **Read the game name** (`pendingGameName`). It only decorates a log line,
    so a read failure is logged rather than fatal.
-7. **Read the remaining settings** (`pendingFrameRate`,
+8. **Read the remaining settings** (`pendingFrameRate`,
    `pendingPreloadArchives`, `pendingDebugOverlay`) and resolve them into the
    `RuntimeConfig`.
-8. **Create the handler and run the loop.** The loop's outcome is written to
+9. **Create the handler and run the loop.** The loop's outcome is written to
    the state file at the end: a recorded failure, or a clean stop. A later
    `stopped` must never erase a failure.
 

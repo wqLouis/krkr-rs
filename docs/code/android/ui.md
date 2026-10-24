@@ -60,6 +60,8 @@ The Activity itself and the state that must survive a game:
 * the **engine's last report** — the pending-launch marker is read and
   reconciled in `onResume`, so a crash inside a game is reported on the next
   start;
+* the **exit reason** — Android's record of how the process ended, read when
+  the reconciliation finds a process that stopped without shutting down;
 * the **dialogs** — the permission gate, the engine's issue report, the
   removal confirmation and the folder-path dialog. They belong to the launcher
   rather than to a destination, so they are shown wherever the user is;
@@ -68,6 +70,36 @@ The Activity itself and the state that must survive a game:
 
 The screens themselves live in `ui/`; the Activity only chooses which one is
 composed and passes the state down.
+
+### The crash report
+
+The launcher and the engine share one process, so a crash inside a game is
+also the launcher's crash. Two sources say what happened:
+
+* the **engine state file** (`krkr_state.json`, written by the Rust side)
+  says whether the game shut down cleanly, reported a failure, or was killed
+  mid-flight. A failure carries its kind: `reported` for a problem the game
+  reported itself, `panic` for one that unwound out of the entry point. The
+  launcher shows a different report for each;
+* **Android's exit record** (`ActivityManager.getHistoricalProcessExitReasons`,
+  read in `ExitReason.kt`) says how the *process* ended: a native crash, an
+  unhandled exception, a low-memory kill, a signal, an unresponsive app, or
+  the user closing the app. `ExitReason.kt` turns the platform's reason code
+  into a sentence, and the exit status into the signal number where the
+  platform records one.
+
+The report the user reads is therefore specific — `The game crashed with a
+native error (signal 11).` — and the log tail stays as the detail. When
+Android has no record, the report says so instead of claiming a crash; when
+the record cannot be read, it says that too.
+
+### The lifecycle log
+
+Both Activities log `onStart`, `onResume`, `onPause`, `onStop` and
+`onDestroy`. A finished Activity logs its `onDestroy`; a process that died
+does not, so the launcher log tells "the game Activity was closed" apart from
+"the process vanished". The launcher's own `onCreate` line says whether the
+Activity was restored, so a configuration change is not read as a crash.
 
 ---
 
@@ -191,6 +223,8 @@ Still unverified, and only a device or the CI APK can show it:
 
 * the layout of the rail, the card grid and the settings list on a real
   screen, and the dialogs' stacking;
+* the exit records Android returns for a killed process, and the crash
+  report built from them;
 * the log level filter against a captured log file;
 * the dynamic colour path on a device that has it;
 * the share sheet, the document picker and the SAF picker flows;

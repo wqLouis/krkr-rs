@@ -87,7 +87,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         LauncherLog.init(this)
         LauncherLog.installUncaughtExceptionHandler()
-        LauncherLog.i("MainActivity.onCreate")
+        LauncherLog.i("MainActivity.onCreate: restored=${savedInstanceState != null}")
         permissionGranted.value = SafPaths.hasAllFilesAccess()
         val library = GameLibrary(this)
         val settings = RuntimeSettingsStore(this)
@@ -111,12 +111,32 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        LauncherLog.i("MainActivity.onStart")
+    }
+
     override fun onResume() {
         super.onResume()
         val granted = SafPaths.hasAllFilesAccess()
         LauncherLog.i("onResume: all-files access = $granted")
         permissionGranted.value = granted
         reconcilePendingLaunch()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        LauncherLog.i("MainActivity.onPause")
+    }
+
+    override fun onStop() {
+        super.onStop()
+        LauncherLog.i("MainActivity.onStop")
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        LauncherLog.i("MainActivity.onDestroy")
     }
 
     /**
@@ -152,6 +172,8 @@ class MainActivity : ComponentActivity() {
      *  * engine still alive (same pid)  -> keep the marker, show nothing (a
      *                                      later resume after a crash must still
      *                                      be able to report);
+     *  * the process is gone            -> Android's exit record says how it
+     *                                      ended; the report names the reason;
      *  * any Issue shown                -> keep the marker;
      *                                      [onDismissStartupIssue] clears it, so
      *                                      a rotation cannot swallow the report.
@@ -183,10 +205,18 @@ class MainActivity : ComponentActivity() {
 
         when (state.state) {
             "failed" -> {
+                // A panic that unwound out of the engine is a crash, not a
+                // problem the game reported; the two get different reports.
+                val crashed = state.kind == "panic"
+                val message = state.message
+                    ?: "The engine reported a failure but did not leave a message."
                 startupIssue.value = Issue(
-                    title = "The game could not start",
-                    message = state.message
-                        ?: "The engine reported a failure but did not leave a message.",
+                    title = if (crashed) "The game crashed" else "The game could not start",
+                    message = if (crashed) {
+                        "The game stopped because of an error inside the app.\n\n$message"
+                    } else {
+                        message
+                    },
                     detail = LauncherLog.tail(EngineDiagnostics.engineLogFile(this), ISSUE_TAIL_LINES),
                 )
             }
@@ -199,10 +229,14 @@ class MainActivity : ComponentActivity() {
                     LauncherLog.i("engine still alive (pid=${state.pid}); keeping pending marker")
                     return
                 }
+                // The process is gone and never wrote a clean stop. Android
+                // knows how it ended: a crash, a kill by the system and the
+                // user closing the app are three different reports, and the
+                // state file alone cannot tell them apart.
+                val report = ProcessExit.read(this, state.pid).report(pending.name)
                 startupIssue.value = Issue(
-                    title = "The game stopped unexpectedly",
-                    message = "\"${pending.name}\" did not shut down normally. It may have crashed, " +
-                        "or Android may have killed it while it was in the background.",
+                    title = report.title,
+                    message = report.message,
                     detail = LauncherLog.tail(EngineDiagnostics.engineLogFile(this), ISSUE_TAIL_LINES),
                 )
             }

@@ -15,18 +15,22 @@
 //! * a flat JSON object:
 //!
 //!   ```json
-//!   { "state": "starting", "message": null, "pid": 1234, "at": "2026-09-15T12:00:00Z" }
+//!   { "state": "starting", "message": null, "kind": null, "pid": 1234, "at": "2026-09-15T12:00:00Z" }
 //!   ```
 //!
 //!   where `state` is one of `starting`, `running`, `failed`, `stopped`,
-//!   `message` carries the error text for `failed` (otherwise `null`), `pid`
-//!   is [`std::process::id`] and `at` is an RFC 3339 UTC timestamp.
+//!   `message` carries the error text for `failed` (otherwise `null`),
+//!   `kind` says what kind of failure `failed` records (otherwise `null`),
+//!   `pid` is [`std::process::id`] and `at` is an RFC 3339 UTC timestamp.
 //!
-//! The file is **not** cleared on entry. A process that dies by panic or
-//! `SIGKILL` therefore leaves the last state it wrote behind — `starting` or
-//! `running` — which is exactly how the launcher tells a crash apart from a
-//! normal exit (which writes `stopped`). Writes are atomic (temp file +
-//! rename) so a reader never sees a half-written object.
+//! The file is **not** cleared on entry. A process that is killed (`SIGKILL`,
+//! a low-memory kill) therefore leaves the last state it wrote behind —
+//! `starting` or `running` — which is exactly how the launcher tells a
+//! crash apart from a normal exit (which writes `stopped`). A panic that
+//! unwinds out of the entry point is caught by the runtime before the process
+//! dies, so it writes `failed` with the kind `panic` on its way out.
+//! Writes are atomic (temp file + rename) so a reader never sees a
+//! half-written object.
 //!
 //! ## Off-device behaviour
 //!
@@ -72,6 +76,37 @@ impl State {
             State::Failed => "failed",
             State::Stopped => "stopped",
         }
+    }
+}
+
+/// What kind of failure a `failed` state records.
+///
+/// The launcher shows a different report for a crash inside the game than for
+/// a problem the game reported itself, and the error text alone cannot say
+/// which of the two it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// The game reported the failure itself.
+    Reported,
+    /// A panic unwound out of the entry point.
+    Panic,
+}
+
+impl FailureKind {
+    /// String written to the JSON `kind` field (also used by the launcher).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailureKind::Reported => "reported",
+            FailureKind::Panic => "panic",
+        }
+    }
+}
+
+/// The kind a state carries: a failure has one, every other state has none.
+fn default_kind(state: State) -> Option<FailureKind> {
+    match state {
+        State::Failed => Some(FailureKind::Reported),
+        _ => None,
     }
 }
 
@@ -139,10 +174,32 @@ pub(crate) fn state_dir() -> Option<&'static Path> {
 /// become a startup failure.
 #[cfg(target_os = "android")]
 pub fn write_state(state: State, message: Option<&str>) {
+    write_to_state_dir(|dir| write_state_at(dir, state, message));
+}
+
+/// Write a failure with its kind to the state file.
+///
+/// A panic that unwinds out of the entry point is reported through here, so
+/// the launcher can tell a crash apart from a failure the game reported
+/// itself. Like every other state write, a file that cannot be written is
+/// logged and swallowed: the state file is a debugging aid and must not
+/// become the failure it is reporting.
+#[cfg(target_os = "android")]
+pub fn write_failure(kind: FailureKind, message: &str) {
+    write_to_state_dir(|dir| write_state_at_kind(dir, State::Failed, Some(message), Some(kind)));
+}
+
+/// Write one record into the configured directory.
+///
+/// The record is written by `write`; a file that cannot be written is logged
+/// and swallowed, because the state file is a debugging aid and must not
+/// itself become a startup failure.
+#[cfg(target_os = "android")]
+fn write_to_state_dir(write: impl FnOnce(&Path) -> std::io::Result<()>) {
     let Some(dir) = STATE_DIR.get() else {
         return;
     };
-    if let Err(e) = write_state_at(dir, state, message) {
+    if let Err(e) = write(dir) {
         log::error!(
             "krkr-state: cannot write {}: {e}",
             dir.join(STATE_FILE_NAME).display()
@@ -156,7 +213,21 @@ pub fn write_state(state: State, message: Option<&str>) {
 /// can decide what to do; [`write_state`] logs and ignores it. A missing `dir`
 /// is reported as an ordinary error, never a panic.
 pub fn write_state_at(dir: &Path, state: State, message: Option<&str>) -> std::io::Result<()> {
-    let json = state_json(state, message);
+    write_state_at_kind(dir, state, message, default_kind(state))
+}
+
+/// Write `state` into `dir/krkr_state.json` atomically, with the kind of
+/// failure it records.
+///
+/// This is the direct form of the writer the tests exercise; it works
+/// anywhere, with or without a configured state directory.
+pub fn write_state_at_kind(
+    dir: &Path,
+    state: State,
+    message: Option<&str>,
+    kind: Option<FailureKind>,
+) -> std::io::Result<()> {
+    let json = state_json(state, message, kind);
     let destination = dir.join(STATE_FILE_NAME);
     // Same directory as the destination so the rename is atomic; the pid keeps
     // two processes from clobbering each other's temp file.
@@ -191,13 +262,17 @@ pub fn write_state_at(dir: &Path, state: State, message: Option<&str>) -> std::i
 
 /// Serialize one state record. Exposed inside the crate so the log format and
 /// the JSON shape stay next to the writer.
-pub(crate) fn state_json(state: State, message: Option<&str>) -> String {
+pub(crate) fn state_json(state: State, message: Option<&str>, kind: Option<FailureKind>) -> String {
     let message = match message {
         Some(m) => format!("\"{}\"", escape_json(m)),
         None => "null".to_string(),
     };
+    let kind = match kind {
+        Some(kind) => format!("\"{}\"", kind.as_str()),
+        None => "null".to_string(),
+    };
     format!(
-        "{{ \"state\": \"{}\", \"message\": {message}, \"pid\": {}, \"at\": \"{}\" }}",
+        "{{ \"state\": \"{}\", \"message\": {message}, \"kind\": {kind}, \"pid\": {}, \"at\": \"{}\" }}",
         state.as_str(),
         std::process::id(),
         now_iso8601(),
@@ -411,6 +486,37 @@ mod tests {
         let json = std::fs::read_to_string(dir.join(STATE_FILE_NAME)).expect("read state file");
         assert!(json.contains("\"state\": \"failed\""), "json: {json}");
         assert!(json.contains("cannot open the game"), "json: {json}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failure carries the kind of failure it is, so the launcher can tell a
+    /// crash from a problem the game reported itself. Every other state has
+    /// no kind.
+    #[test]
+    fn a_failure_records_its_kind() {
+        let dir = scratch_dir("kind");
+        write_state_at(&dir, State::Failed, Some("cannot open the game")).expect("write failed");
+
+        let json = std::fs::read_to_string(dir.join(STATE_FILE_NAME)).expect("read state file");
+        assert!(json.contains("\"kind\": \"reported\""), "json: {json}");
+
+        write_state_at_kind(
+            &dir,
+            State::Failed,
+            Some("index out of bounds"),
+            Some(FailureKind::Panic),
+        )
+        .expect("write panic");
+
+        let json = std::fs::read_to_string(dir.join(STATE_FILE_NAME)).expect("read state file");
+        assert!(json.contains("\"kind\": \"panic\""), "json: {json}");
+        assert!(json.contains("index out of bounds"), "json: {json}");
+
+        write_state_at(&dir, State::Running, None).expect("write running");
+
+        let json = std::fs::read_to_string(dir.join(STATE_FILE_NAME)).expect("read state file");
+        assert!(json.contains("\"kind\": null"), "json: {json}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
