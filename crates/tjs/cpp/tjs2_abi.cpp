@@ -70,21 +70,13 @@ struct tjs2_engine {
     // up under these ids (never a builtin class id such as ClassID_Array,
     // whose native instance is a different C++ type).
     std::unordered_map<std::string, tjs_int32> native_instance_class_ids;
-    // Retained values: id -> variant. Each variant holds its own reference
-    // (tTJSVariant copy/assign semantics AddRef object contents), so the
-    // value stays callable until the id is erased. Erasing (or destroying
-    // the map with the engine) releases the reference. Ids are engine-local
-    // and never 0 (0 is the null tjs2_value_id sentinel).
+    // The native-dispatch state. It is declared BEFORE the retained-value
+    // registry so that it outlives it: a registry member's destructor runs
+    // the script finalizer of the TJS object it holds, and that finalizer
+    // calls native methods, which push onto `param_stack` and clear
+    // `last_object`. A registry destroyed before this state would leave
+    // those calls writing into a destroyed vector.
     //
-    // Releasing an entry releases the TJS object it holds, and that
-    // object's destructor can release other entries (a native instance's
-    // payload owns the retained values it holds). The registry is therefore
-    // detached from the engine before its values are destroyed: the teardown
-    // moves the entries into a local map, leaves this map empty, and clears
-    // the local map, so a nested release cannot unlink a node the walk is
-    // following.
-    std::unordered_map<uintptr_t, TJS::tTJSVariant> retained;
-    uintptr_t next_retained_id = 1;
     // The most recent object-valued result this engine produced (from
     // exec/eval results and native-callback argument conversions). A
     // tjs2_value carries no object handle, so tjs2_retain_value resolves an
@@ -107,6 +99,21 @@ struct tjs2_engine {
     // restores this around each callback so a nested native call reports its
     // own value. Defaults to true for calls made outside a native callback.
     bool result_needed = true;
+    // Retained values: id -> variant. Each variant holds its own reference
+    // (tTJSVariant copy/assign semantics AddRef object contents), so the
+    // value stays callable until the id is erased. Erasing (or destroying
+    // the map with the engine) releases the reference. Ids are engine-local
+    // and never 0 (0 is the null tjs2_value_id sentinel).
+    //
+    // Releasing an entry releases the TJS object it holds, and that
+    // object's destructor can release other entries (a native instance's
+    // payload owns the retained values it holds). The registry is therefore
+    // detached from the engine before its values are destroyed: the teardown
+    // moves the entries into a local map, leaves this map empty, and clears
+    // the local map, so a nested release cannot unlink a node the walk is
+    // following.
+    std::unordered_map<uintptr_t, TJS::tTJSVariant> retained;
+    uintptr_t next_retained_id = 1;
 };
 
 namespace {
@@ -1732,6 +1739,39 @@ static tjs2_value_id retain_variant(tjs2_engine *e,
     return (tjs2_value_id)id;
 }
 
+// Release every retained value, with the registry detached from the engine.
+//
+// Releasing a value releases the TJS object it holds, and destroying that
+// object can run a native instance's `destroy` callback, which drops the
+// Rust payload and releases the retained values that payload owns. Each of
+// those releases erases an entry of the engine's retained registry, so the
+// entries are moved into a local map first: the engine's registry stays
+// empty, a nested release finds nothing to erase, and the local map
+// releases every value exactly once. A teardown that retained a value put
+// it back into the engine's registry, so the swap repeats until the
+// registry is empty.
+//
+// A script finalizer can raise (a native callback that reports an error),
+// and the exception must not leave the engine's registry populated: the
+// registry's own destructor would then run that finalizer again, with the
+// engine's dispatch state already destroyed. Each entry is therefore
+// released on its own, and a raising finalizer is swallowed - the engine
+// is shutting down.
+static void drain_retained(tjs2_engine *e) {
+    std::unordered_map<uintptr_t, TJS::tTJSVariant> retained;
+    while(!e->retained.empty()) {
+        retained.swap(e->retained);
+        for(auto &entry : retained) {
+            try {
+                entry.second.Clear();
+            } catch(...) {
+                // The script finalizer raised; the engine is shutting down.
+            }
+        }
+        retained.clear();
+    }
+}
+
 // Resolve a retained id to the object it holds (null when the id is not a
 // live retained object). Shared by the ClassInstanceInfo entry points, which
 // take an object argument the Rust side has retained.
@@ -1822,29 +1862,19 @@ void tjs2_destroy(tjs2_engine *e) {
         // classes while the VM is still alive: their releases/destructors
         // may touch global VM state that ~tTJS frees. (The global object's
         // refs were already dropped by Shutdown's Global->Clear().)
-        //
-        // The retained values are released with the registry detached from
-        // the engine. Releasing a value releases the TJS object it holds,
-        // and destroying that object can run a native instance's `destroy`
-        // callback, which drops the Rust payload and releases the retained
-        // values that payload owns. Each of those releases erases an entry
-        // of the engine's retained map, so the entries are moved into a
-        // local map first: the engine's map stays empty, a nested release
-        // finds nothing to erase, and the local map releases every value
-        // exactly once while the VM is still alive. A teardown that
-        // retained a value put it back into the engine's map, so the swap
-        // repeats until the map is empty.
-        std::unordered_map<uintptr_t, TJS::tTJSVariant> retained;
-        while(!e->retained.empty()) {
-            retained.swap(e->retained);
-            retained.clear();
-        }
+        drain_retained(e);
         e->last_object.Clear();
         for(TJS::iTJSDispatch2 *cls : e->native_classes)
             cls->Release();
         e->native_classes.clear();
         e->native_class_names.clear();
         e->inner->Release(); // refcounted; ~tTJS is protected
+        // The releases above run script finalizers, and a finalizer can
+        // retain a value again. Drain what is left, so the registry the
+        // engine's destructor sees is empty: a finalizer that ran while the
+        // registry was being destroyed would call native methods with the
+        // engine's dispatch state already gone.
+        drain_retained(e);
     } catch(...) {
     }
     delete e;
