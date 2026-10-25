@@ -106,6 +106,13 @@ ordinary input — a frame with a handful of events never defers anything.
 budget; a budget of zero dispatches exactly one event per frame, which is
 what the tests use to pin the deferral.
 
+The budget is a wall-clock slice, so it can also expire on a machine that is
+busy: a frame that dispatches a handful of events then defers the rest of
+them, and a caller that drives one frame only sees the first ones. The test
+harness therefore builds its adapter with `Duration::MAX`, so a test that
+drives an explicit event sequence gets all of it; the tests that exercise
+the budget build their own adapter.
+
 Because the events are delivered in the order they arrived, the L2 input
 state follows the deliveries: an event that waits for the next frame is
 applied to the state of that frame.

@@ -238,6 +238,46 @@ fn a_target_without_a_handler_is_a_no_op() {
     );
 }
 
+/// The harness delivers every event of the frame it is given.
+///
+/// The adapter's default dispatch budget is a wall-clock slice, so on a
+/// loaded machine it can cut a frame's event sequence short and leave the
+/// rest for a frame the caller never drives. A test that drives an explicit
+/// sequence needs all of it delivered, so the harness adapter does not
+/// defer; the tests that exercise the budget itself build their own adapter
+/// (`EventAdapter::with_dispatch_budget`).
+#[test]
+fn the_harness_delivers_every_event_of_the_frame() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         w.setSize(320, 240); \
+         var l = new Layer(w, null); \
+         l.setPos(0, 0); l.setSize(100, 50); l.visible = true; l.focusable = true; l.hitThreshold = 0; \
+         var downs = 0; \
+         l.onMouseDown = function(x, y, btn, shift) { downs = downs + 1; };",
+    );
+
+    let mut events = vec![PlatformEvent::Input(InputEvent::PointerMoved {
+        x: 10.0,
+        y: 10.0,
+    })];
+    for _ in 0..8 {
+        events.push(PlatformEvent::Input(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: true,
+        }));
+        events.push(PlatformEvent::Input(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: false,
+        }));
+    }
+    env.dispatch_events(&events);
+    // Every press in the frame reaches the layer, in order.
+    assert_eq!(env.eval_int("downs"), 8);
+}
+
 /// A throwing handler is reported and the frame continues.
 ///
 /// The reference propagates the `FuncCall` error out of the event delivery

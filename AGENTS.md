@@ -592,6 +592,8 @@ Two-sided tests:
 13. The frame is L2's: `GameHost::step` must not accumulate a `now_ms` or call the subsystem pumps itself. Pass events through `Engine::step(dt, hooks)`; the hook is `VmHook` (VM tick + audio drain). `compat::run_frame_body` starts by draining the timer posts the engine already produced; it must not call `TimerState::advance`.
 14. VM pixels are not device pixels, and the logical screen is not the window client. Layer rects, bitmap dimensions, `Font.size`, `getPixel` and `System.screenWidth` are the logical screen (the primary layer); `Window.innerWidth`/`innerHeight` are the window client; the framebuffer is device space. Only `engine::translate::PixelTranslation` names both; the render tree keeps VM coordinates and carries the Fit mapping on its root transform, which L1 composes without interpreting it. An OS resize changes the framebuffer only — never write it back into the scene window; a script window-size change goes the other way through `Engine::take_window_resize`, and the translation fits the unchanged screen into the new client.
 
+15. The input adapter's dispatch budget is **wall-clock time** (4 ms by default), so a frame that dispatches several events can cut the sequence short on a loaded machine and defer the rest to a frame the caller never drives. The default is a presentation policy for the real game; a test that drives an explicit event sequence uses the harness adapter, whose budget does not defer. A test that exercises the budget itself builds its own `EventAdapter::with_dispatch_budget`.
+
 ---
 
 ## 10. Definition of done for a change

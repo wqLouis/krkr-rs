@@ -11,6 +11,7 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use api::media::{DecodedImage, ImageInfo};
 use compat::CompatHost;
@@ -120,7 +121,13 @@ impl Env {
             _input: input,
             _storage: storage,
             _game_dir: game_dir,
-            adapter: RefCell::new(compat::EventAdapter::new()),
+            // The adapter's default budget is a wall-clock slice, so on a
+            // loaded machine it can cut a test's event sequence short and
+            // defer the rest to a frame the test never drives. The tests that
+            // exercise the budget build their own adapter
+            // (`EventAdapter::with_dispatch_budget`); this one delivers every
+            // event it is given.
+            adapter: RefCell::new(compat::EventAdapter::with_dispatch_budget(Duration::MAX)),
         }
     }
 
