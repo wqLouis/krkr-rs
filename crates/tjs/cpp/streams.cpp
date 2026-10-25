@@ -978,8 +978,16 @@ public:
             targ.Clear();
             return 0;
         }
-        targ = TJS::tTJSString(text.data() + pos, n);
+        // The reference copies the requested units into a buffer it allocates
+        // and terminates itself (`reference/cpp/core/base/TextStream.cpp:197-216`).
+        // Handing the source pointer and a length to the string constructor
+        // instead makes the constructor scan for a terminator, which reads past
+        // the last unit of the source when it holds no terminator.
+        tjs_char *buf = targ.AllocBuffer((tjs_uint)n);
+        std::copy_n(text.data() + pos, n, buf);
+        buf[n] = 0;
         pos += n;
+        targ.FixLen();
         return (tjs_uint)n;
     }
 
@@ -1367,6 +1375,41 @@ static char *alloc_c_string(const std::string &text) {
     std::memcpy(buf, text.data(), text.size());
     buf[text.size()] = 0;
     return buf;
+}
+
+// Read a text stream and return the first `size` units (0 = all of them) as a
+// malloc'd UTF-8 string (free with `tjs2_free_string`). The size-limited form
+// exists so the stream tests can check that a partial read returns exactly the
+// units it was asked for. Returns 0 on success, non-zero on failure.
+extern "C" int tjs2_read_text_stream_n(const char *path_utf8,
+                                        const char *mode_utf8,
+                                        tjs_uint size,
+                                        char **out_utf8) {
+    if(out_utf8)
+        *out_utf8 = nullptr;
+    if(!path_utf8 || !out_utf8)
+        return 1;
+    try {
+        std::string mode = mode_utf8 ? mode_utf8 : "";
+        TJS::ttstr name = ttstr_from_utf8(path_utf8);
+        std::string source, host;
+        bool existed = false;
+        std::vector<uint8_t> raw =
+            read_entry("text-read", name, mode, source, host, existed);
+        TextReadStream stream(std::move(raw), (uint64_t)mode_offset(mode),
+                              name);
+        TJS::tTJSString content;
+        stream.Read(content, size);
+        std::string utf8 =
+            utf16_to_utf8(content.c_str(), (size_t)content.GetLen());
+        char *buf = alloc_c_string(utf8);
+        if(!buf)
+            return 1;
+        *out_utf8 = buf;
+        return 0;
+    } catch(...) {
+        return 1;
+    }
 }
 
 // Read a whole text stream (honoring the mode's `oN` offset and the `FE FE`

@@ -47,6 +47,13 @@ unsafe extern "C" {
         mode_utf8: *const c_char,
         out_utf8: *mut *mut c_char,
     ) -> c_int;
+    /// Read only the first `size` units (0 = all of them).
+    fn tjs2_read_text_stream_n(
+        path_utf8: *const c_char,
+        mode_utf8: *const c_char,
+        size: u32,
+        out_utf8: *mut *mut c_char,
+    ) -> c_int;
     fn tjs2_free_string(s: *mut c_char);
 }
 
@@ -69,6 +76,25 @@ fn decode_stream(path: &std::path::Path, mode: &str) -> String {
     // NUL-terminated UTF-8 string into `out`.
     let rc = unsafe { tjs2_read_text_stream_all(path_c.as_ptr(), mode_c.as_ptr(), &mut out) };
     assert_eq!(rc, 0, "tjs2_read_text_stream_all failed for mode {mode:?}");
+    assert!(!out.is_null(), "the reader returned a null string");
+    // SAFETY: out is a NUL-terminated malloc'd string owned by us.
+    let text = unsafe { CStr::from_ptr(out) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: the helper allocated it with malloc; free it exactly once.
+    unsafe { tjs2_free_string(out) };
+    text
+}
+
+/// Read only the first `size` units of a text stream.
+fn decode_stream_n(path: &std::path::Path, mode: &str, size: u32) -> String {
+    let path_c = CString::new(path.to_string_lossy().as_bytes()).unwrap();
+    let mode_c = CString::new(mode).unwrap();
+    let mut out: *mut c_char = ptr::null_mut();
+    // SAFETY: both C strings live for the call; the helper writes a malloc'd
+    // NUL-terminated UTF-8 string into `out`.
+    let rc = unsafe { tjs2_read_text_stream_n(path_c.as_ptr(), mode_c.as_ptr(), size, &mut out) };
+    assert_eq!(rc, 0, "tjs2_read_text_stream_n failed for mode {mode:?}");
     assert!(!out.is_null(), "the reader returned a null string");
     // SAFETY: out is a NUL-terminated malloc'd string owned by us.
     let text = unsafe { CStr::from_ptr(out) }
@@ -405,6 +431,33 @@ fn builtin_reader_truncates_an_odd_utf16_payload_length() {
     // `uncompressed` bytes, so the buffer holds `uncompressed / 2` code units
     // and the odd trailing byte is dropped rather than rejected.
     assert_eq!(text, "䉁", "the odd trailing byte must be truncated");
+}
+
+#[test]
+fn builtin_reader_reads_exactly_the_units_it_was_asked_for() {
+    let _lock = vm_lock();
+    // A UTF-16LE payload with no terminator. A partial read must return the
+    // units it was asked for: the reference allocates the buffer, copies `n`
+    // units and terminates it itself
+    // (`reference/cpp/core/base/TextStream.cpp:197-216`). Handing the source
+    // pointer and a length to the string constructor instead makes the
+    // constructor scan for a terminator, and the scan reads one unit past the
+    // ones the read asked for - past the end of the buffer when the read
+    // covers all of it. The scan is capped at the requested length, so the
+    // unit count this test checks is the same either way; the read past the
+    // buffer is what a sanitizer build reports.
+    let units: &[u16] = &[0x0041, 0x0042, 0x0043, 0x0044];
+    let mut bytes: Vec<u8> = vec![0xff, 0xfe];
+    for unit in units {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    let path = temp_path("partial");
+    std::fs::write(&path, &bytes).unwrap();
+    let two = decode_stream_n(&path, "", 2);
+    let all = decode_stream(&path, "");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(all, "ABCD", "the whole payload must be read back");
+    assert_eq!(two, "AB", "a two-unit read must return two units");
 }
 
 #[test]
