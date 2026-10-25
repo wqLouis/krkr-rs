@@ -808,11 +808,20 @@ impl MotionSnapshot {
             .or_else(|| number_of(motion.get("frameCount")))
             .or_else(|| number_of(motion.get("frames")))
             .unwrap_or(0.0);
-        let loop_time = number_of(motion.get("loopTime")).unwrap_or(-1.0);
-        let looping = if motion.get("loopTime").is_some() {
-            loop_time >= 0.0
-        } else {
-            bool_of(motion.get("loop")).unwrap_or(false)
+        // The clip's loop is read in two steps: a numeric `loopTime` is the
+        // loop restart time, and the clip loops when it is not negative;
+        // otherwise the boolean `loop`/`repeat`/`is_loop` decides, and a
+        // looping clip restarts at time 0 - so its timeline wraps instead of
+        // stopping at the clip's last frame.
+        let (loop_time, looping) = match number_of(motion.get("loopTime")) {
+            Some(value) => (value, value >= 0.0),
+            None => {
+                let looping = ["loop", "repeat", "is_loop"]
+                    .iter()
+                    .find_map(|key| bool_value(motion.get(key)))
+                    .unwrap_or(false);
+                (if looping { 0.0 } else { -1.0 }, looping)
+            }
         };
         let layers = list_of(motion.get("layer"))
             .map(<[PsbValue]>::to_vec)
@@ -976,7 +985,10 @@ pub(crate) fn step_timelines(
         let (wrapped, keep) =
             wrap_timeline(state.current_time, state.total_frames, state.loop_time);
         state.current_time = wrapped;
-        if !state.looping && !keep {
+        // A timeline stops when its time ran past the length and cannot wrap:
+        // the wrap fails, and a failed wrap ends the timeline. A timeline that
+        // can wrap keeps playing, so a clip that loops plays for ever.
+        if !keep {
             state.playing = false;
             events.push(MotionEvent {
                 kind: 1,
@@ -2004,6 +2016,19 @@ fn bool_of(value: Option<&PsbValue>) -> Option<bool> {
     value.map(PsbValue::as_bool)
 }
 
+/// Whether a PSB value reads as a boolean: a boolean, or a number that is
+/// not zero. Any other value is not a boolean, so a reader moves on to the
+/// next key.
+fn bool_value(value: Option<&PsbValue>) -> Option<bool> {
+    match value? {
+        PsbValue::Bool(value) => Some(*value),
+        PsbValue::Int(value) => Some(*value != 0),
+        PsbValue::Float(value) => Some(*value != 0.0),
+        PsbValue::Double(value) => Some(*value != 0.0),
+        _ => None,
+    }
+}
+
 fn push_unique(list: &mut Vec<String>, value: String) {
     if !list.contains(&value) {
         list.push(value);
@@ -2079,6 +2104,93 @@ mod tests {
             ("layer", PsbValue::List(vec![logo])),
         ]);
         let motions = dict(vec![("title", title), ("char_move", char_move)]);
+        let owner = dict(vec![("motion", motions)]);
+        let object = dict(vec![("title_bg", owner)]);
+        let icon = dict(vec![(
+            "logo",
+            dict(vec![
+                ("width", num(437)),
+                ("height", num(184)),
+                ("originX", num(219)),
+                ("originY", num(92)),
+                ("left", num(12)),
+                ("top", num(7)),
+            ]),
+        )]);
+        let texture = dict(vec![("width", num(800)), ("height", num(1080))]);
+        let source = dict(vec![(
+            "title",
+            dict(vec![("icon", icon), ("texture", texture)]),
+        )]);
+        let root = dict(vec![("object", object), ("source", source)]);
+        MotionSnapshot::from_psb(
+            PsbDocument {
+                root,
+                resources: Vec::new(),
+            },
+            "title.psb",
+        )
+    }
+
+    /// A clip that loops by flag restarts at time 0, and that restart time is
+    /// what the timeline wraps on
+    /// (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1010-1017`).
+    /// A clip without a loop keeps the reference's `-1`, which stops the
+    /// timeline at its last frame.
+    #[test]
+    fn a_clip_that_loops_by_flag_restarts_at_time_zero() {
+        let snapshot = clip_with(vec![("loop", PsbValue::Bool(true))]);
+        assert_eq!(snapshot.loop_timelines.get("title"), Some(&true));
+        assert_eq!(snapshot.timeline_loop_times.get("title"), Some(&0.0));
+
+        let snapshot = clip_with(vec![("repeat", PsbValue::Bool(true))]);
+        assert_eq!(snapshot.loop_timelines.get("title"), Some(&true));
+        assert_eq!(snapshot.timeline_loop_times.get("title"), Some(&0.0));
+
+        let snapshot = clip_with(vec![("is_loop", PsbValue::Bool(true))]);
+        assert_eq!(snapshot.loop_timelines.get("title"), Some(&true));
+        assert_eq!(snapshot.timeline_loop_times.get("title"), Some(&0.0));
+
+        // a numeric loopTime is the restart time itself
+        let snapshot = clip_with(vec![("loopTime", num(30))]);
+        assert_eq!(snapshot.loop_timelines.get("title"), Some(&true));
+        assert_eq!(snapshot.timeline_loop_times.get("title"), Some(&30.0));
+
+        // and a clip that does not loop keeps the reference's -1
+        let snapshot = clip_with(vec![]);
+        assert_eq!(snapshot.loop_timelines.get("title"), Some(&false));
+        assert_eq!(snapshot.timeline_loop_times.get("title"), Some(&-1.0));
+    }
+
+    /// The snapshot of `snapshot()`, with the `title` clip carrying the given
+    /// extra members.
+    fn clip_with(extra: Vec<(&str, PsbValue)>) -> MotionSnapshot {
+        let main = dict(vec![
+            ("label", text("main")),
+            ("type", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![frame(0, 3, text("motion/title_bg/char_move"))]),
+            ),
+        ]);
+        let logo = dict(vec![
+            ("label", text("logo")),
+            ("type", num(0)),
+            (
+                "frameList",
+                PsbValue::List(vec![frame(0, 2, text("src/title/logo"))]),
+            ),
+        ]);
+        let mut title = vec![
+            ("lastTime", num(120)),
+            ("layer", PsbValue::List(vec![main])),
+        ];
+        title.extend(extra);
+        let char_move = dict(vec![
+            ("lastTime", num(120)),
+            ("layer", PsbValue::List(vec![logo])),
+        ]);
+        let motions = dict(vec![("title", dict(title)), ("char_move", char_move)]);
         let owner = dict(vec![("motion", motions)]);
         let object = dict(vec![("title_bg", owner)]);
         let icon = dict(vec![(

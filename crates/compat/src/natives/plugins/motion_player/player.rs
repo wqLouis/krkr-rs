@@ -4111,6 +4111,39 @@ mod tests {
     /// Two clips: a 120-frame `intro` that moves its shape to (600,600), and a
     /// one-frame `idle` whose shape rests at (300,300). Each clip's last entry
     /// has no content and is only a terminator.
+    /// The snapshot of [`snapshot`], with the `intro` clip looping by the
+    /// boolean flag.
+    fn looping_snapshot() -> MotionSnapshot {
+        let intro = dict(vec![
+            ("label", text("intro_shape")),
+            ("type", num(0)),
+            ("shape", num(3)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    frame(0, 3, Some(content(100, 100))),
+                    frame(60, 2, Some(content(600, 600))),
+                    frame(120, 0, None),
+                ]),
+            ),
+        ]);
+        let intro_clip = dict(vec![
+            ("lastTime", num(120)),
+            ("loop", PsbValue::Bool(true)),
+            ("layer", PsbValue::List(vec![intro])),
+        ]);
+        let motions = dict(vec![("intro", intro_clip)]);
+        let object = dict(vec![("test", dict(vec![("motion", motions)]))]);
+        let root = dict(vec![("object", object)]);
+        MotionSnapshot::from_psb(
+            PsbDocument {
+                root,
+                resources: Vec::new(),
+            },
+            "test.psb",
+        )
+    }
+
     fn snapshot() -> MotionSnapshot {
         let intro = dict(vec![
             ("label", text("intro_shape")),
@@ -4347,6 +4380,53 @@ mod tests {
         assert_eq!(player.timelines["intro"].current_time, advanced);
         player.progress(-1000.0, &ctx, tjs::Tjs2ValueId::null());
         assert_eq!(player.timelines["intro"].current_time, advanced);
+    }
+
+    /// A clip that loops by the flag keeps playing past its last frame: its
+    /// timeline wraps to the loop restart time instead of stopping.
+    ///
+    /// The reference reads the clip's loop flag and gives a looping clip the
+    /// restart time 0
+    /// (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1010-1017`), so
+    /// the wrap succeeds and the timeline plays on
+    /// (`reference/cpp/plugins/motionplayer/RuntimeSupport.h:421-443`; the stop
+    /// is the wrap failing,
+    /// `reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:468-476`).
+    /// A clip that does not loop stops at its last frame.
+    #[test]
+    fn a_clip_that_loops_by_flag_wraps_past_its_last_frame() {
+        let looping = looping_snapshot();
+        let _lock = crate::native_util::test_vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let ctx = context(&engine, &mut services);
+        let mut looping_player = player(&looping);
+        looping_player.play("intro", 0, &ctx).expect("start intro");
+        // The first tick only presents the pose; the next ones advance. A
+        // delta is in milliseconds and counts at 60 frames a second, so 3000 ms
+        // is 180 frames - past the clip's 120.
+        looping_player.progress(3000.0, &ctx, tjs::Tjs2ValueId::null());
+        looping_player.progress(3000.0, &ctx, tjs::Tjs2ValueId::null());
+        assert!(
+            looping_player.timelines["intro"].playing,
+            "a clip that loops keeps playing past its last frame"
+        );
+        let time = looping_player.timelines["intro"].current_time;
+        assert!(
+            time < 120.0,
+            "the timeline wraps to the restart time instead of stopping: {time}"
+        );
+
+        // A clip that does not loop stops at its last frame.
+        let plain = snapshot();
+        let mut plain_player = player(&plain);
+        plain_player.play("intro", 0, &ctx).expect("start intro");
+        plain_player.progress(3000.0, &ctx, tjs::Tjs2ValueId::null());
+        plain_player.progress(3000.0, &ctx, tjs::Tjs2ValueId::null());
+        assert!(
+            !plain_player.timelines["intro"].playing,
+            "a clip that does not loop stops at its last frame"
+        );
     }
 
     /// The `canSync` input is neutral only while the first presented pose
