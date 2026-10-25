@@ -232,6 +232,6 @@ state makes concurrent engines unsafe.
 | the L4 layer as a whole | [`../arch/l4.md`](../arch/l4.md) |
 | the layer rules and the ABI constraint | [`../rules/arch_rules.md`](../rules/arch_rules.md) §2, §8 |
 | the VM, the compatibility surface and the plugins | [`../migration/08-tjs-vm-and-native-plugins.md`](../../docs.old/migration/08-tjs-vm-and-native-plugins.md) |
-| the TJS2 language and the Rust port audit | [`../arch/l4.md`](../arch/l4.md) §4–§5 |
+| the TJS2 language, the VM's architecture and the Rust port audit | [`../arch/l4.md`](../arch/l4.md) §4–§6 |
 | the VM defect record | [`../vm-defects.md`](../../docs.old/vm-defects.md) |
 | the evidence trail for the VM decisions | [`../../docs.old/migration/08-tjs-vm-and-native-plugins.md`](../../docs.old/migration/08-tjs-vm-and-native-plugins.md) |
