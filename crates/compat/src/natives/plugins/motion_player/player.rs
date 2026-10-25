@@ -1212,6 +1212,13 @@ impl PlayerInst {
             self.queuing = true;
         }
         self.prune_playing_timelines();
+        // Playing a motion makes the player "all playing" whether or not a
+        // timeline is playing. Only a later progress step recomputes the flag
+        // from the playing timelines, so between the play and that first
+        // progress the flag reports the play. A script that reads it there
+        // sees that value, and a motion source asks for it there: the flip
+        // path starts only when the source reports that it is a flip.
+        self.allplaying = true;
         Ok(started)
     }
 
@@ -1510,39 +1517,44 @@ impl PlayerInst {
         Ok(())
     }
 
+    /// The playing-timeline info list: one entry per *playing* timeline - a
+    /// label whose timeline is gone or has stopped is skipped - and each entry
+    /// carries the timeline state (`label`, `flags`, `loop`, `playing`,
+    /// `currentTime`, `totalFrames`, `blendRatio`).
     pub(crate) fn build_info_list(&self, ctx: &CompatCtx) -> Result<RetainedValue, String> {
         let array = eval_object(ctx, "[]")?;
         // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `build_info_list`.
         let engine = unsafe { ctx.engine() };
-        for (index, label) in self.playing_timelines.iter().enumerate() {
+        let mut index = 0usize;
+        for label in &self.playing_timelines {
+            let Some(state) = self.timelines.get(label) else {
+                continue;
+            };
+            if !state.playing {
+                continue;
+            }
             let entry = eval_object(ctx, "%[]")?;
-            engine
-                .set_member(entry.raw_id(), "label", &TjsValue::String(label.clone()))
-                .map_err(|error| error.to_string())?;
-            let flags = self
-                .timelines
-                .get(label)
-                .map(|state| state.flags)
-                .unwrap_or(1);
+            for (name, value) in [
+                ("label", TjsValue::String(label.clone())),
+                ("flags", TjsValue::Integer(i64::from(state.flags))),
+                ("loop", TjsValue::Integer(i64::from(state.looping))),
+                ("playing", TjsValue::Integer(i64::from(state.playing))),
+                ("currentTime", TjsValue::Real(state.current_time)),
+                ("totalFrames", TjsValue::Real(state.total_frames)),
+                ("blendRatio", TjsValue::Real(state.blend_ratio)),
+            ] {
+                engine
+                    .set_member(entry.raw_id(), name, &value)
+                    .map_err(|error| error.to_string())?;
+            }
             engine
                 .set_member(
-                    entry.raw_id(),
-                    "flags",
-                    &TjsValue::Integer(1 | i64::from(flags & 2)),
+                    array.raw_id(),
+                    &index.to_string(),
+                    &TjsValue::Retained(entry.raw_id().as_ptr() as usize as u64),
                 )
                 .map_err(|error| error.to_string())?;
-            let ratio = self
-                .timelines
-                .get(label)
-                .map(|state| state.blend_ratio)
-                .unwrap_or(1.0);
-            engine
-                .set_member(entry.raw_id(), "blendRatio", &TjsValue::Real(ratio))
-                .map_err(|error| error.to_string())?;
-            let id = entry.raw_id().as_ptr() as usize as u64;
-            engine
-                .set_member(array.raw_id(), &index.to_string(), &TjsValue::Retained(id))
-                .map_err(|error| error.to_string())?;
+            index += 1;
             drop(entry);
         }
         Ok(RetainedValue::Object(array))
@@ -4055,8 +4067,9 @@ mod tests {
     use super::local_matrix;
     use super::{
         BitmapState, DEFAULT_NODE_COLORS, DrawSettings, MotionNode, MotionSnapshot, PlayerInst,
-        build_node_tree, composite_pose, draw_icon, draw_point, evaluate_frames, inherited_parent,
-        inherited_transform, node_drawable, prime_timelines, unit_axis_aligned_origin,
+        RetainedValue, TimelineState, TjsValue, build_node_tree, composite_pose, draw_icon,
+        draw_point, evaluate_frames, inherited_parent, inherited_transform, node_drawable,
+        prime_timelines, unit_axis_aligned_origin,
     };
     use crate::engine_api::Storage;
     use crate::engine_api::layer_ops::{AffineBlit, BlitOptions, BlitSource, affine_blit};
@@ -4194,6 +4207,89 @@ mod tests {
     fn start(player: &mut PlayerInst, label: &str, ctx: &CompatCtx) {
         player.play(label, 0, ctx).expect("start the clip");
         player.progress(0.0, ctx, tjs::Tjs2ValueId::null());
+    }
+
+    /// The reference publishes one entry per *playing* timeline, and each
+    /// entry carries the timeline state verbatim
+    /// (`reference/cpp/plugins/motionplayer/PlayerInternal.h:356-364`):
+    /// `label`, `flags`, `loop`, `playing`, `currentTime`, `totalFrames` and
+    /// `blendRatio`. A label whose timeline is gone or has stopped is skipped
+    /// (`reference/cpp/plugins/motionplayer/PlayerInternal.h:349-353`).
+    #[test]
+    fn the_playing_timeline_info_list_carries_the_reference_entry() {
+        let _lock = crate::native_util::test_vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let ctx = context(&engine, &mut services);
+
+        let mut main = TimelineState::new(120.0, true, 0.0);
+        main.flags = 4;
+        main.playing = true;
+        main.current_time = 12.5;
+        main.blend_ratio = 0.5;
+        // `TimelineState::new` starts a timeline stopped.
+        let stopped = TimelineState::new(60.0, false, -1.0);
+
+        let mut player = PlayerInst::default();
+        player.timelines.insert("main".to_string(), main);
+        player.timelines.insert("stopped".to_string(), stopped);
+        // "stopped" is not playing and "ghost" has no timeline at all.
+        player.playing_timelines = vec![
+            "main".to_string(),
+            "stopped".to_string(),
+            "ghost".to_string(),
+        ];
+
+        let list = player.build_info_list(&ctx).expect("build the list");
+        let RetainedValue::Object(list) = list else {
+            panic!("the list is an array");
+        };
+        let count = engine
+            .member(list.raw_id(), "count")
+            .expect("read the list length");
+        assert_eq!(
+            count,
+            TjsValue::Integer(1),
+            "only the playing timeline is published"
+        );
+        // An object member crosses the ABI as `TjsValue::Object`, so the
+        // entry is retained to get a handle to enumerate.
+        let entry = engine.member(list.raw_id(), "0").expect("read the entry");
+        assert!(
+            matches!(entry, TjsValue::Object),
+            "the entry is an object, got {entry:?}"
+        );
+        let entry = engine
+            .retain_value_detached(&TjsValue::Object)
+            .expect("retain the entry");
+        let entry_id = entry.raw_id();
+        let mut keys = engine.enum_members(entry_id).expect("list the entry keys");
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "blendRatio".to_string(),
+                "currentTime".to_string(),
+                "flags".to_string(),
+                "label".to_string(),
+                "loop".to_string(),
+                "playing".to_string(),
+                "totalFrames".to_string(),
+            ],
+            "the entry carries the reference's keys"
+        );
+        for (name, expected) in [
+            ("label", TjsValue::String("main".to_string())),
+            ("flags", TjsValue::Integer(4)),
+            ("loop", TjsValue::Integer(1)),
+            ("playing", TjsValue::Integer(1)),
+            ("currentTime", TjsValue::Real(12.5)),
+            ("totalFrames", TjsValue::Real(120.0)),
+            ("blendRatio", TjsValue::Real(0.5)),
+        ] {
+            let value = engine.member(entry_id, name).expect("read an entry member");
+            assert_eq!(value, expected, "the entry member {name}");
+        }
     }
 
     #[test]
@@ -4959,6 +5055,40 @@ mod tests {
         )
     }
 
+    /// A played motion reports itself as playing, whether or not a timeline
+    /// is playing.
+    ///
+    /// The reference's motion initialisation ends by setting the flag
+    /// unconditionally (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:641-643`
+    /// for a non-emote motion and `:719-720` for an emote one), and only a
+    /// later progress step recomputes it from the playing timelines
+    /// (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:823`). A
+    /// script that reads the flag between the play and that first progress
+    /// sees the reference's value - and the game's motion source reads it
+    /// there, to decide whether the source is a flip.
+    #[test]
+    fn a_played_motion_reports_itself_as_all_playing() {
+        let snapshot = event_snapshot();
+        let _lock = crate::native_util::test_vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let ctx = context(&engine, &mut services);
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "active".to_string(),
+            ..PlayerInst::default()
+        };
+        // The snapshot carries no timeline, so no timeline is playing: the
+        // flag can only come from the play itself.
+        player
+            .play("active", 0, &ctx)
+            .expect("play the active clip");
+        assert!(
+            player.allplaying,
+            "a played motion reports itself as all playing"
+        );
+    }
+
     /// `progress` queues the action and sync keyframes of every clip layer,
     /// including a clip that is not in the active node tree, for the
     /// `onAction`/`onSync` dispatch that follows it
@@ -4993,6 +5123,12 @@ mod tests {
             vec![
                 // The one-shot timeline stopping reports its own sync first.
                 (1, "active", ""),
+                // The container's own layer list is scanned first.
+                (0, "wave", "active_layer"),
+                (1, "active_layer", ""),
+                (0, "blink", "inactive_layer"),
+                (1, "inactive_layer", ""),
+                // Then every clip's layer array, which holds the same layers.
                 (0, "wave", "active_layer"),
                 (1, "active_layer", ""),
                 (0, "blink", "inactive_layer"),

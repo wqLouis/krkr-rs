@@ -580,8 +580,12 @@ layer leaves nothing to draw into and the call returns void without raising
 * `Player.progress(dt)` returns the playback ratio; the emote classes discard
   it (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:1281-1305`).
 * The timelines, the variables and the transition animators are stepped
-  together, and the action and sync keyframes of the active clip are
-  dispatched to the receiver.
+  together, and the action and sync keyframes are dispatched to the
+  receiver. The container's own layer list is scanned first and every clip's
+  layer array after it, so a clip's top layer raises its keyframes twice and
+  a nested layer raises them once
+  (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:869-893`,
+  `:1907-1919`).
 * `play(label, flags)` starts a clip; the flags are the `Motion.PlayFlag*`
   values. `Motion.PlayFlagForce` re-runs the load for the same key,
   `Motion.PlayFlagStealth` stores the motion without activating it while no
@@ -696,6 +700,7 @@ A draw target that names no layer, a `Point` or `Quad` hit test and a
 |---|---|
 | `crates/compat/tests/motion_player.rs` | the namespace constants and the subclass placement (top-level versus `Motion.*`), the geometry hit-test classes, the `LayerGetter` defaults and its array identity, the resource manager's layer-id allocator and the decrypt seed, the `D3DEmoteModule` class statics, the player's property surface, the variable and timeline queries, the arity gates, the `onFindMotion` override, the emote shell, the PSB module load and unload, the `motionKey` candidate list, the `ShortCutInitial*` globals, the `SeparateLayerAdaptor` owner, the layer getter, the colour-weight channel order, the progress gate and the dropped delta, the image-wait/movie-wait `canSync` split, and the draw path (texture sampling, the draw affine, the node colour tint, the uncleared target, the untouched target geometry, the reused allocation, the `psb://` media registration) |
 | `crates/compat/tests/emote_player.rs` | the loader shim defines no globals of its own and the `motionplayer.dll` classes are reachable through it |
+| `crates/compat/src/natives/plugins/motion_player/model.rs` unit tests | the icon canvas geometry, the child motion expansion and its clock, the frame evaluation by time, the visibility of a contentless frame, the origin interpolation, the action/sync keyframe scan (the container's layer list before the clips' layer arrays, the doubled top layer, the nested layer and the sync marker types) and the frame curves |
 | `crates/compat/src/natives/plugins/motion_player/player.rs` unit tests | the replay of a short clip after a long one, the queuing gate and the dropped delta, the canSync loop-time gate before the first full frame, the `inheritMask` root/parent matrix split, the reset of the evaluation time on replay, the nearest-texel sampling of a scaled placement, the child motion's start at its parent keyframe, the action and sync dispatch, the packed colour order, the shape hit test, the logo's held corner and transition, the inherited parent matrix, the node matrix order, the draw affine, the shared label and the layer getter list, and the node blend mode |
 | `crates/compat/tests/plugin.rs` | that `Plugins.link("motionplayer.dll")` resolves to the built-in table |
 

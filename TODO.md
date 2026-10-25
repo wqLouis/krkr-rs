@@ -365,35 +365,34 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   count is the engine's frame clock now, so the game and its timers share one
   clock — the reference has one clock too,
   `reference/cpp/core/base/impl/SystemImpl.cpp:622-629`). What is still open:
+  * **The title's motion is driven by the flip chain, and the chain never
+    starts.** The game's `AffineSourceMotion` advances its source only through
+    `updateFlip(delta)`, which does `_interval += delta`; `_drawAffine` then
+    calls `progress(_interval)` and the timeline advances. The chain that calls
+    it is `AffineLayer.entryFlip()` -> `window.entryFlipLayer` -> `flipLayers`
+    -> `onFlipTimerInterval` -> `updateFlipLayers(dt)` -> `layer.updateFlip(dt)`,
+    and the gate is the source's `isFlip()`, which for a non-emote source is
+    `!_player.allplaying && _lastPlaying`. So the flag that decides it is
+    `Motion.Player.allplaying`: the reference sets it when a motion is
+    initialised and recomputes it from the playing timelines at the next
+    progress step
+    (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:641-643` and
+    `:719-720`; `reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:823`),
+    while ours recomputed it at the end of the play as well. Establish the
+    order of the play, the first progress and the `isFlip` check in our run and
+    make it the reference's.
   * **The world's per-frame env update never runs in our engine.**
     `world.updateAll`, `world.updateSource` and `world.refresh` are never
     called, and `world.envlayerList` holds only the one object the scenario
-    reached. The world's own update is the only place a real delta still
-    exists for a motion: `world.updateAll` -> `env.updateCurrent` ->
-    `world._updateAll(currentData, 0, delta)`. Find what the reference calls
-    per frame and make our frame body deliver the same call.
-  * **The env-image `.mtn` path cannot animate the title in ANY engine,** the
-    reference included, so the reference's animated title is a THIRD mechanism
-    (the game gates it on its own `enableSceneAnimEffect`).
-    `AffineSourceMotion._drawAffine` advances the player only when
-    `_interval > 0` (`progress(_interval)` against `progress(0)`), and
-    `_interval` is written in exactly three places in the whole game (class
-    init = void, constructor = 0, `_drawAffine` = 0) and **no script ever
-    sets it above 0**; `progress(0)` does not advance in the reference either
-    (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:988-1019`;
-    the plugin never reads a clock). The KAG **generic-flip** machinery is not
-    it either: `createGenericFlip` is the only producer of
-    `kag.activeGenericFlips`, its only caller is
-    `system/affinesourceflip.tjs` (the `.flip` source class), and the game's
-    motion containers author no `action`/`sync` keyframes at all. The motion
-    player itself is not at fault — driven directly,
-    `Motion.ResourceManager.load("title_bg.mtn")` -> `Motion.Player.play("title")`
-    -> `progress(16)` + `draw(layer)` changes the sampled pixel every frame.
+    reached. Find what the reference calls per frame and make our frame body
+    deliver the same call.
   * **A probe lesson worth keeping:** adding a member to a script class at
     runtime perturbs that class's property dispatch, so a probe that mutates a
     game class can manufacture an error the engine never had. Wrap the
     INSTANCE, or hook `Scripts.execStorage` and wrap the class the moment its
-    script finishes loading.
+    script finishes loading. The jump targets in the compiled scripts are
+    RELATIVE, and `VM_JF` jumps if the flag is true while `VM_JNF` jumps if it
+    is false (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:898-965`).
 * **The `Layer`/`layer_ex` affine paths now honour the destination clip.** The
   reference passes the clip into the blit —
   `MainImage->AffineBlt(ClipRect, …)` (`reference/cpp/core/visual/

@@ -836,15 +836,19 @@ impl MotionSnapshot {
         }
     }
 
-    /// Collect the action/sync keyframes of every clip layer. A layer that
-    /// appears both in the root list and in a clip is scanned once, so one
-    /// authored keyframe raises one event.
+    /// Collect the action/sync keyframes of the container's layer
+    /// dictionaries and of every clip's layer array.
+    ///
+    /// The container scan records every layer dictionary it finds into one
+    /// flat list, and the event scan walks that list before the clips' own
+    /// layer arrays. A clip's top layer therefore raises its keyframes twice
+    /// and a nested layer raises them once.
     fn collect_event_tracks(&self) -> Vec<EventTrack> {
         let mut tracks = Vec::new();
+        collect_container_layer_events(&self.root, &mut Vec::new(), &mut tracks);
         for clip in &self.clips {
             collect_layer_events(&clip.layers, &mut tracks);
         }
-        collect_layer_events(&self.layers, &mut tracks);
         tracks
     }
 }
@@ -1040,39 +1044,108 @@ pub(crate) struct EventTrack {
     pub(crate) frames: Vec<EventFrame>,
 }
 
-/// Collect the action/sync keyframes of `layers` and their `children`.
+/// Collect the action/sync keyframes of a clip's layer array.
+///
+/// The clip scan reads the clip's own layer dictionaries and does not descend
+/// into their children.
 fn collect_layer_events(layers: &[PsbValue], tracks: &mut Vec<EventTrack>) {
     for layer in layers {
-        let mut frames = Vec::new();
-        if let Some(frame_list) = list_of(layer.get("frameList")) {
-            for frame in frame_list {
-                let Some(content) = frame.get("content") else {
-                    continue;
-                };
-                let action = string_of(content.get("action")).unwrap_or_default();
-                let has_sync = content.get("sync").map(PsbValue::as_bool).unwrap_or(false);
-                if action.is_empty() && !has_sync {
-                    continue;
-                }
-                frames.push(EventFrame {
-                    time: number_of(frame.get("time")).unwrap_or(0.0),
-                    action,
-                    has_sync,
-                });
+        collect_layer_event_frames(layer, tracks);
+    }
+}
+
+/// Collect the action/sync keyframes of every layer dictionary in the
+/// container, in the container's order.
+///
+/// The container scan walks the whole tree and records every layer-like
+/// dictionary into one flat list; the event scan walks that list.
+fn collect_container_layer_events(
+    value: &PsbValue,
+    path: &mut Vec<String>,
+    tracks: &mut Vec<EventTrack>,
+) {
+    match value {
+        PsbValue::Dictionary(entries) => {
+            if is_layer_dictionary(value, path.as_slice()) {
+                collect_layer_event_frames(value, tracks);
+            }
+            for (key, child) in entries {
+                path.push(key.clone());
+                collect_container_layer_events(child, path, tracks);
+                path.pop();
             }
         }
-        if !frames.is_empty() {
-            let label = label_of(layer).unwrap_or_default();
-            let duplicate = tracks
-                .iter()
-                .any(|track| track.label == label && track.frames == frames);
-            if !duplicate {
-                tracks.push(EventTrack { label, frames });
+        PsbValue::List(items) => {
+            for (index, item) in items.iter().enumerate() {
+                path.push(index.to_string());
+                collect_container_layer_events(item, path, tracks);
+                path.pop();
             }
         }
-        if let Some(children) = list_of(layer.get("children")) {
-            collect_layer_events(children, tracks);
+        _ => {}
+    }
+}
+
+/// Whether a dictionary is one of the container's layer dictionaries.
+///
+/// A dictionary is a layer when it carries a non-empty label and either sits
+/// under a `layer` path segment or looks like a layer by its keys.
+fn is_layer_dictionary(value: &PsbValue, path: &[String]) -> bool {
+    let has_label = ["label", "name", "id"]
+        .iter()
+        .copied()
+        .any(|key| matches!(value.get(key), Some(PsbValue::String(text)) if !text.is_empty()));
+    if !has_label {
+        return false;
+    }
+    path.iter()
+        .any(|part| part.to_ascii_lowercase().contains("layer"))
+        || value.get("layer_id").is_some()
+        || value.get("layer_type").is_some()
+        || (value.get("label").is_some() && value.get("frameList").is_some())
+        || (value.get("width").is_some()
+            && value.get("height").is_some()
+            && (value.get("left").is_some() || value.get("top").is_some()))
+}
+
+/// Collect the action/sync keyframes of one layer dictionary.
+fn collect_layer_event_frames(layer: &PsbValue, tracks: &mut Vec<EventTrack>) {
+    let mut frames = Vec::new();
+    if let Some(frame_list) = list_of(layer.get("frameList")) {
+        for frame in frame_list {
+            let Some(content) = frame.get("content") else {
+                continue;
+            };
+            let action = string_of(content.get("action")).unwrap_or_default();
+            let has_sync = sync_marker(content.get("sync"));
+            if action.is_empty() && !has_sync {
+                continue;
+            }
+            frames.push(EventFrame {
+                time: number_of(frame.get("time")).unwrap_or(0.0),
+                action,
+                has_sync,
+            });
         }
+    }
+    if frames.is_empty() {
+        return;
+    }
+    tracks.push(EventTrack {
+        label: label_of(layer).unwrap_or_default(),
+        frames,
+    });
+}
+
+/// Whether a frame's `sync` marker is set.
+///
+/// The marker is read as a number, and only the float and the integer forms
+/// count; a double marker is ignored.
+fn sync_marker(value: Option<&PsbValue>) -> bool {
+    match value {
+        Some(PsbValue::Int(number)) => *number != 0,
+        Some(PsbValue::Float(number)) => *number != 0.0,
+        _ => false,
     }
 }
 
@@ -2361,9 +2434,22 @@ mod tests {
             "events.psb",
         );
         let tracks = &snapshot.event_tracks;
+        // The clip's layer is scanned twice: once through the container's own
+        // layer list and once through the clip's layer array
+        // (reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1907-1919).
         assert_eq!(
             scan_frame_events(tracks, 0.0, 10.0),
             vec![
+                MotionEvent {
+                    kind: 0,
+                    param1: "wave".to_string(),
+                    param2: "layer".to_string(),
+                },
+                MotionEvent {
+                    kind: 1,
+                    param1: "layer".to_string(),
+                    param2: String::new(),
+                },
                 MotionEvent {
                     kind: 0,
                     param1: "wave".to_string(),
@@ -2384,6 +2470,11 @@ mod tests {
     /// An inactive clip's layers still raise their action/sync keyframes: the
     /// reference scans the whole snapshot, not the active node tree
     /// (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1907-1917`).
+    ///
+    /// Every layer is scanned twice, because the container's own layer list
+    /// holds the clip's layers as well
+    /// (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:869-893`,
+    /// `:1907-1919`).
     #[test]
     fn every_clip_layer_contributes_events() {
         let eventful = |label: &str, time: i64, action: &str| {
@@ -2442,6 +2533,10 @@ mod tests {
             "events.psb",
         );
         let events = scan_frame_events(&snapshot.event_tracks, 0.0, 15.0);
+        // Every layer is scanned twice, because the container's own layer list
+        // holds the clip's layers as well
+        // (reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:869-893,
+        // :1907-1919).
         assert_eq!(
             events
                 .iter()
@@ -2451,8 +2546,180 @@ mod tests {
                 (0, "wave", "active"),
                 (1, "active", ""),
                 (0, "blink", "inactive"),
+                (1, "inactive", ""),
+                (0, "wave", "active"),
+                (1, "active", ""),
+                (0, "blink", "inactive"),
                 (1, "inactive", "")
             ]
+        );
+    }
+
+    /// The container's own layer list is scanned before the clips' layer
+    /// arrays, and a nested layer belongs to the container's list only.
+    /// (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:869-893`,
+    /// `:1907-1919`).
+    #[test]
+    fn a_clip_layer_raises_its_keyframes_twice_and_a_nested_layer_once() {
+        let eventful = |label: &str, time: i64, action: &str| {
+            dict(vec![
+                ("label", text(label)),
+                ("type", num(0)),
+                (
+                    "frameList",
+                    PsbValue::List(vec![
+                        frame(0, 2, text("src/a/b")),
+                        dict(vec![
+                            ("time", num(time)),
+                            ("type", num(2)),
+                            (
+                                "content",
+                                dict(vec![
+                                    ("src", text("src/a/b")),
+                                    ("action", text(action)),
+                                    ("sync", num(1)),
+                                ]),
+                            ),
+                        ]),
+                    ]),
+                ),
+            ])
+        };
+        let child = eventful("child", 12, "blink");
+        let parent = dict(vec![
+            ("label", text("parent")),
+            ("type", num(0)),
+            ("children", PsbValue::List(vec![child])),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    frame(0, 2, text("src/a/b")),
+                    dict(vec![
+                        ("time", num(10)),
+                        ("type", num(2)),
+                        (
+                            "content",
+                            dict(vec![
+                                ("src", text("src/a/b")),
+                                ("action", text("wave")),
+                                ("sync", num(1)),
+                            ]),
+                        ),
+                    ]),
+                ]),
+            ),
+        ]);
+        let clip = dict(vec![
+            ("lastTime", num(20)),
+            ("layer", PsbValue::List(vec![parent])),
+        ]);
+        let root = dict(vec![(
+            "object",
+            dict(vec![(
+                "test",
+                dict(vec![("motion", dict(vec![("clip", clip)]))]),
+            )]),
+        )]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root,
+                resources: Vec::new(),
+            },
+            "events.psb",
+        );
+        let events = scan_frame_events(&snapshot.event_tracks, 0.0, 15.0);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.kind, event.param1.as_str(), event.param2.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                // The container's layer list holds the parent and its child.
+                (0, "wave", "parent"),
+                (1, "parent", ""),
+                (0, "blink", "child"),
+                (1, "child", ""),
+                // The clip's layer array holds the parent alone.
+                (0, "wave", "parent"),
+                (1, "parent", ""),
+            ]
+        );
+    }
+
+    /// A frame's `sync` marker is read as a number, and only the float and
+    /// the integer forms count; a double marker is ignored
+    /// (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1892-1904`).
+    #[test]
+    fn only_a_float_or_an_integer_sync_marker_counts() {
+        let layer_with = |sync: PsbValue| {
+            dict(vec![
+                ("label", text("layer")),
+                ("type", num(0)),
+                (
+                    "frameList",
+                    PsbValue::List(vec![dict(vec![
+                        ("time", num(10)),
+                        ("type", num(2)),
+                        ("content", dict(vec![("sync", sync)])),
+                    ])]),
+                ),
+            ])
+        };
+        let clip = dict(vec![
+            ("lastTime", num(20)),
+            (
+                "layer",
+                PsbValue::List(vec![layer_with(PsbValue::Float(1.0))]),
+            ),
+        ]);
+        let root = dict(vec![(
+            "object",
+            dict(vec![(
+                "test",
+                dict(vec![("motion", dict(vec![("clip", clip)]))]),
+            )]),
+        )]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root,
+                resources: Vec::new(),
+            },
+            "events.psb",
+        );
+        let events = scan_frame_events(&snapshot.event_tracks, 0.0, 20.0);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.kind, event.param1.as_str(), event.param2.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "layer", ""), (1, "layer", "")],
+            "a float marker raises the sync event"
+        );
+
+        let clip = dict(vec![
+            ("lastTime", num(20)),
+            (
+                "layer",
+                PsbValue::List(vec![layer_with(PsbValue::Double(1.0))]),
+            ),
+        ]);
+        let root = dict(vec![(
+            "object",
+            dict(vec![(
+                "test",
+                dict(vec![("motion", dict(vec![("clip", clip)]))]),
+            )]),
+        )]);
+        let snapshot = MotionSnapshot::from_psb(
+            PsbDocument {
+                root,
+                resources: Vec::new(),
+            },
+            "events.psb",
+        );
+        assert!(
+            scan_frame_events(&snapshot.event_tracks, 0.0, 20.0).is_empty(),
+            "a double marker raises nothing"
         );
     }
 
