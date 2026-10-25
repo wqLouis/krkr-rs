@@ -434,6 +434,20 @@ allocate a texture descriptor set`, every frame.
    directory, and does not happen with another title, so the corruption is
    introduced during the game's own script work and only surfaces at the
    final free.
+   **The debug build's abort site is a debug-only facility, and the release
+   build aborts through a different path.** `TJSEnableDebugMode` is true only
+   under `_DEBUG` (`crates/tjs/cpp/tjs2/tjs.cpp:64-69`, the reference is
+   byte-identical), and `crates/tjs/build.rs:520-530` defines `_DEBUG` only
+   for the dev profile. The object hash map that holds the damaged record is
+   created only under that flag (`tjs.cpp:115-118`), and
+   `TJSAddObjectHashRecord` returns at once when it is absent
+   (`tjsDebug.cpp:396-399`). So the release binary never executes that path,
+   yet **the release binary aborts with the same message** — there are two
+   corruptions, and the release-reachable one is the one that matters: it is
+   what the shipped binary does, and therefore the likelier cause of the
+   device death. The dev profile also turns on a facility the reference never
+   runs in a shipped build; the full list of `_DEBUG`/`DEBUG` gates in the
+   vendored tree is small (13 sites) and should be reviewed.
 3. Keep the overlay object counters (windows/layers/bitmaps/fonts/textures) as
    regression evidence; descriptor-set and `ObjectRegistry` counts are missing.
 
