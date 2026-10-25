@@ -359,38 +359,49 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   the title animation plays; no motion `dt` clamp was needed. `perf record` is
   blocked on this host by `kernel.perf_event_paranoid=2` (software `perf stat`
   works); gprofng works and is what the timings above come from.
-* **The title-entry animation is static: the title background never advances.**
-  The title background (`title_bg.mtn`, `chara:"title_bg"`, `motion:"title"`,
-  registered in `envinit.tjs`) is a static image in our run while the
-  reference animates it. The mechanism is in the game's own script, and it is
-  now read out of the bytecode:
-  `system/affinesourcemotion.tjs` keeps `_innerStorage` on the **class**, and
-  a TJS2 script class copies its member table into every instance, so
-  `_innerStorage` is shared by every `AffineSourceMotion`. The **first**
-  load of a `.mtn` takes the animating `"emote"` mode (its
-  `Motion.Player.progress(delta)` gets a real delta); a load whose storage
-  already equals the class's `_innerStorage` takes the reload branch and the
-  static `"motion"` mode, where the game calls `progress(0)`.
-  `AffineSourceMotion.clone()` calls `_loadImages(this._innerStorage)` on the
-  new instance, so **every clone of a motion source is static** — and the
-  world's `getImageSource(data, owner)` clones an existing source whenever an
-  env layer's `_image.dynamicsource.filename` equals `data.storage`, instead
-  of creating a fresh one. Our run reaches the clone path and the reference
-  does not.
-  **The motion player is not at fault**: driven directly from a script probe,
-  `Motion.ResourceManager.load("title_bg.mtn")` -> `Motion.Player.play("title")`
-  -> `progress(16)` + `draw(layer)` changes the sampled pixel every frame.
-  **Open:** which env layer supplies the clone, and why it is registered before
-  the title's own source is created — the game uses the key `"title_bg"` both
-  for the stage object (`class:"event"`) and for the motion config, so the
-  ORDER in which the env objects and their layers are created decides which
-  one gets the fresh source and which gets the clone. Also open: the world's
-  per-frame update (`world.updateAll`/`updateSource`/`refresh`) is never
-  called in our run, so the `onPaint` chain that reaches
-  `AffineSourceMotion.drawAffine`
-  (`reference/cpp/core/visual/LayerIntf.cpp:6394-6405`) is dead here; and
-  `sysscn/gfx_motion.tjs`, the game's only per-frame caller of
-  `Motion.Player.progress(dt)` with a real delta, is never loaded in our run.
+* **The title-entry animation is static, and the run never even reaches the
+  title.** Three separate things are open; they are in the order they block
+  each other.
+  * **The engine has two clocks, and the game reads the wrong one.**
+    `System.getTickCount()` returns a wall clock
+    (`crates/compat/src/natives/system.rs`, `tick_count_ms`) while the engine
+    owns the frame clock (`crates/engine/src/engine.rs`: "Nothing here reads a
+    wall clock"), and the runners advance that clock by a fixed period
+    (`crates/app/src/runner.rs`). The game's own Conductor computes its next
+    timer tick from `System.getTickCount()`, so in a headless run — 1 200
+    frames take ~60 ms of wall time while the engine's clock advanced 20 s -
+    every KAG timer and `[wait]` **starves**, and the scenario hangs at the
+    first real-time wait (measured: it never leaves `custom.ks:60 "*caution"`).
+    Overriding `System.getTickCount` from a patch script with a counter that
+    follows the frame clock makes the scenario advance. The reference has ONE
+    clock: `System.getTickCount` calls `TVPStartTickCount()` and returns
+    `TVPGetTickCount()` (`reference/cpp/core/base/impl/SystemImpl.cpp:622-629`),
+    and the reference's frame pacing follows it.
+  * **With the clock fixed, the scenario dies fatally**: `Member "label" does
+    not exist` at `custom.ks:63` (`[clearlayers]`), inside
+    `KAGEnvImage.updateImageSource` <- `_setImageFile` <- `setImageFile` <-
+    `doCommand`, so the conductor stops. `"label"` appears in no game script
+    except `system/kagenvimagemapperstage.tjs` (the stage mapper that owns
+    `title_bg`), and our Rust KAG also emits `"label"` keys
+    (`crates/compat/src/natives/kag/mod.rs:1060`, `:1255`) — check whether the
+    failing `.label` read is on a dictionary our native produces.
+  * **The title's motion is not driven by the env-image path at all.**
+    `AffineSourceMotion._drawAffine` advances the player only when
+    `_interval > 0` (`progress(_interval)` against `progress(0)`), and
+    `_interval` is written in exactly three places in the whole game (class
+    init = void, constructor = 0, `_drawAffine` = 0) and **no script ever
+    sets it above 0**. `progress(0)` does not advance in the reference either
+    (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:988-1019`; the
+    plugin never reads a clock). So this path can never animate the title — in
+    the reference included — and `_storageType` ("emote" for a `.PSB`,
+    "motion" otherwise) does not select an animating path. The reference must
+    animate the title through the KAG **generic-flip** machinery
+    (`onFlipTimerInterval` -> `updateGenericFlips` -> `GenericFlip.update(dt)`
+    -> `Motion.Player.progress(dt)`), and in our run `kag.activeGenericFlips`
+    is empty: that is the divergence to explain next. The motion player itself
+    is not at fault — driven directly, `Motion.ResourceManager.load("title_bg.mtn")`
+    -> `Motion.Player.play("title")` -> `progress(16)` + `draw(layer)` changes
+    the sampled pixel every frame.
 * **The `Layer`/`layer_ex` affine paths now honour the destination clip.** The
   reference passes the clip into the blit —
   `MainImage->AffineBlt(ClipRect, …)` (`reference/cpp/core/visual/
