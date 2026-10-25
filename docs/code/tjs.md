@@ -53,6 +53,17 @@ a cross target), `CXX` (the C++ compiler, default `zig c++`) and `AR`.
 float semantics must not be used, because script-observable values are part
 of the compatibility surface.
 
+The C++ VM carries the reference's heap behaviour, and a defect in it is
+invisible to a Rust-only sanitizer run. `TJS2_EXTRA_CXXFLAGS` is the hook that
+instruments it: build with the C++ and the Rust side under AddressSanitizer,
+and the VM's own allocations are checked too.
+
+```sh
+TJS2_EXTRA_CXXFLAGS='-fsanitize=address -fno-omit-frame-pointer' \
+RUSTFLAGS='-Zsanitizer=address' \
+cargo +nightly build -p app --bin krkr --target x86_64-unknown-linux-gnu
+```
+
 After the compile, the produced objects are checked against the Cargo
 target's ELF architecture. A compiler that defaulted to the build host is
 rejected with an actionable error instead of silently producing host
