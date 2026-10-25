@@ -359,40 +359,42 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   the title animation plays; no motion `dt` clamp was needed. `perf record` is
   blocked on this host by `kernel.perf_event_paranoid=2` (software `perf stat`
   works); gprofng works and is what the timings above come from.
-* **The title-entry animation is static, and the run never even reaches the
-  title.** The engine had two clocks and the game read the wrong one, so every
-  KAG timer starved and the scenario hung in silence; that is fixed (the tick
-  count is the engine's frame clock now, so the game and its timers share one
-  clock — the reference has one clock too,
-  `reference/cpp/core/base/impl/SystemImpl.cpp:622-629`). What is still open:
-  * **The title's motion is driven by the flip chain, and the chain never
-    starts.** The game's `AffineSourceMotion` advances its source only through
-    `updateFlip(delta)`, which does `_interval += delta`; `_drawAffine` then
-    calls `progress(_interval)` and the timeline advances. The chain that calls
-    it is `AffineLayer.entryFlip()` -> `window.entryFlipLayer` -> `flipLayers`
-    -> `onFlipTimerInterval` -> `updateFlipLayers(dt)` -> `layer.updateFlip(dt)`,
-    and the gate is the source's `isFlip()`, which for a non-emote source is
-    `!_player.allplaying && _lastPlaying`. So the flag that decides it is
-    `Motion.Player.allplaying`: the reference sets it when a motion is
-    initialised and recomputes it from the playing timelines at the next
-    progress step
-    (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:641-643` and
-    `:719-720`; `reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:823`),
-    while ours recomputed it at the end of the play as well. Establish the
-    order of the play, the first progress and the `isFlip` check in our run and
-    make it the reference's.
+* **The title's background animation is fixed, but the world's per-frame env
+  update still never runs.**
+  * **The engine had two clocks and the game read the wrong one.**
+    `System.getTickCount()` returned a wall clock while the engine owns the
+    frame clock, and the game's Conductor schedules its next timer tick from
+    `getTickCount` — so in a headless run every KAG timer and `[wait]` starved
+    and the scenario hung in silence at the caution screen's voice wait. The
+    tick count is the engine's frame clock now, so the game and its timers
+    share one clock (the reference has one clock too,
+    `reference/cpp/core/base/impl/SystemImpl.cpp:622-629`). With that the
+    scenario reaches the title, and the title's background animates: every
+    frame of the motion changes the layer's pixels, and only the frame after
+    the clip's end repeats — the asset's own one-shot behaviour, which the
+    reference shares (`title_bg.mtn`'s `title` clip carries `loopTime -1`).
+  * **What is displayed AFTER the two-second intro may still differ.** The
+    game's `custom.ks:*title_start` has two branches — the last `.mtn` frame
+    and the `title_bg.png` stage image — and which one the reference shows is
+    not yet established.
   * **The world's per-frame env update never runs in our engine.**
     `world.updateAll`, `world.updateSource` and `world.refresh` are never
-    called, and `world.envlayerList` holds only the one object the scenario
-    reached. Find what the reference calls per frame and make our frame body
-    deliver the same call.
+    called, and `world.envlayerList` holds only the objects the scenario
+    reached. The flip chain that drives the title's motion is a different
+    path (`AffineLayer.entryFlip` -> `window.entryFlipLayer` -> `flipLayers` ->
+    `onFlipTimerInterval` -> `updateFlipLayers(dt)` -> `layer.updateFlip(dt)`,
+    and `updateFlip` does `_interval += delta`), and it works. Find what the
+    reference calls per frame for the world and make our frame body deliver
+    the same call.
   * **A probe lesson worth keeping:** adding a member to a script class at
     runtime perturbs that class's property dispatch, so a probe that mutates a
     game class can manufacture an error the engine never had. Wrap the
     INSTANCE, or hook `Scripts.execStorage` and wrap the class the moment its
     script finishes loading. The jump targets in the compiled scripts are
     RELATIVE, and `VM_JF` jumps if the flag is true while `VM_JNF` jumps if it
-    is false (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:898-965`).
+    is false (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:898-965`). Two
+    more TJS2 traps for probes: `%` is the dictionary-literal token and not a
+    modulo operator, and an empty `catch(e) {}` block is a syntax error.
 * **The `Layer`/`layer_ex` affine paths now honour the destination clip.** The
   reference passes the clip into the blit —
   `MainImage->AffineBlt(ClipRect, …)` (`reference/cpp/core/visual/
