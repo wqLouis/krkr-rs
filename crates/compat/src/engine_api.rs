@@ -13,8 +13,9 @@
 //! error (`StorageReadError`, `TextError`, `SoundError`, …).
 //!
 //! [`CompatServices`](crate::CompatServices) attaches raw pointers to the
-//! stateful handles ([`Scene`], [`Storage`], [`InputState`], [`TimerState`]);
-//! each pointer must stay valid for as long as the binding is installed.
+//! stateful handles ([`Scene`], [`Storage`], [`InputState`], [`TimerState`],
+//! [`FrameClock`]); each pointer must stay valid for as long as the binding is
+//! installed.
 
 // The logical scene: layers, bitmaps, fonts, windows, and decoded-image keys.
 // The layer geometry operations L3 drives (`internal_set_image_size`,
@@ -38,6 +39,11 @@ pub(crate) use engine::input::InputState;
 
 // The timer registry, its ids and the stored callback shape.
 pub(crate) use engine::timer::{TimerCallback, TimerId, TimerState};
+
+// The frame clock: the time base the frame advances. The `System` native
+// reads it for the script's tick count, so the script and the frame share
+// one clock.
+pub(crate) use engine::clock::FrameClock;
 
 // Text shaping, coverage rasterization, the glyph cache and font identity.
 pub(crate) use engine::text::{

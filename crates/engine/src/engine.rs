@@ -37,6 +37,7 @@ use render::{
     resize as resize_render, upload_textures,
 };
 
+use crate::clock::FrameClock;
 use crate::hasher::{Map, map};
 use crate::imagedecode::{
     DecodePool, DecodePoolConfig, DecodePoolError, DecodeStats, ImageDecoder,
@@ -472,22 +473,17 @@ pub struct Engine {
     input: crate::input::InputState,
     /// Current surface size in pixels.
     surface_size: (u32, u32),
-    /// The frame clock of the last frame, in whole milliseconds.
-    ///
-    /// `step` derives it from `clock_ms`; `frame` sets it to the injected
-    /// value.
-    now_ms: u64,
     /// The frame clock of the previous frame, or `None` before the first one.
     last_now_ms: Option<u64>,
     /// Frames drawn so far.
     frame_index: u64,
-    /// The frame clock in milliseconds, including the fractional part.
+    /// The frame clock: the time base the frame advances.
     ///
     /// `frame` sets it to the injected whole millisecond and `step`
     /// accumulates each delta, so sub-millisecond frame times add up instead
-    /// of being discarded. `now_ms` is its whole-millisecond part for the
-    /// timer, hook and overlay.
-    clock_ms: f64,
+    /// of being discarded. Its whole-millisecond part is the `now_ms` the
+    /// timer, hook and overlay receive.
+    clock: FrameClock,
     /// Whether the engine runs offscreen with no window.
     headless: bool,
     /// Render-only overlay, or `None` when none is drawn.
@@ -549,10 +545,9 @@ impl Engine {
             storage_pool: None,
             input: crate::input::InputState::default(),
             surface_size,
-            now_ms: 0,
             last_now_ms: None,
             frame_index: 0,
-            clock_ms: 0.0,
+            clock: FrameClock::new(),
             headless,
             overlay,
             translation: None,
@@ -755,13 +750,10 @@ impl Engine {
         hooks: &mut dyn GameFrame,
     ) -> Result<FrameReport, EngineError> {
         let dt_ms = f64::from(dt_ms.max(0.0));
-        // Keep the sub-millisecond remainder; truncating each step would lose
-        // most of a millisecond at 60 fps. The cap is the integer clock's
-        // ceiling, so a delta that would overflow it saturates instead of
-        // wrapping.
-        let clock_ms = (self.clock_ms + dt_ms).min(u64::MAX as f64);
-        let now_ms = clock_ms as u64;
-        self.advance(now_ms, clock_ms, dt_ms, hooks)
+        // The clock keeps the sub-millisecond remainder, so a 60 fps step
+        // does not lose most of a millisecond on every frame.
+        let now_ms = self.clock.advance(dt_ms);
+        self.run_frame(now_ms, dt_ms, hooks)
     }
 
     /// Draws one frame at the injected clock value `now_ms`.
@@ -781,28 +773,28 @@ impl Engine {
         hooks: &mut dyn GameFrame,
     ) -> Result<FrameReport, EngineError> {
         let dt_ms = now_ms.saturating_sub(self.last_now_ms.unwrap_or(now_ms)) as f64;
-        self.advance(now_ms, now_ms as f64, dt_ms, hooks)
+        self.clock.set(now_ms);
+        self.run_frame(now_ms, dt_ms, hooks)
     }
 
-    /// Runs one frame at `now_ms`, with `clock_ms` as the accumulated clock
-    /// and `dt_ms` as the hook's delta.
+    /// Runs one frame at `now_ms`, with `dt_ms` as the hook's delta.
     ///
-    /// The order is the frame contract: set the clock, fit the presentation,
-    /// fire due timers, run the upward hook, fit the presentation again (the
-    /// hook may have resized a window's primary layer), then refresh the
-    /// overlay, upload, project, apply the presentation root transform and
-    /// draw. A size pair that cannot be fitted skips everything that draws and
-    /// reports no frame statistics.
-    fn advance(
+    /// The clock is already set when this runs: `step` accumulated the delta
+    /// into it and `frame` put it at the injected value.
+    ///
+    /// The order is the frame contract: fit the presentation, fire due
+    /// timers, run the upward hook, fit the presentation again (the hook may
+    /// have resized a window's primary layer), then refresh the overlay,
+    /// upload, project, apply the presentation root transform and draw. A size
+    /// pair that cannot be fitted skips everything that draws and reports no
+    /// frame statistics.
+    fn run_frame(
         &mut self,
         now_ms: u64,
-        clock_ms: f64,
         dt_ms: f64,
         hooks: &mut dyn GameFrame,
     ) -> Result<FrameReport, EngineError> {
-        self.now_ms = now_ms;
         self.last_now_ms = Some(now_ms);
-        self.clock_ms = clock_ms;
         self.sync_presentation();
         self.timer.advance(now_ms);
         // The storage barrier: the reads the previous frame scheduled are
@@ -826,7 +818,7 @@ impl Engine {
             self.note_presentation_stall(StallCause::NoMapping, now_ms);
             return Ok(FrameReport {
                 frame_index: self.frame_index,
-                elapsed_ms: self.clock_ms,
+                elapsed_ms: self.clock.now_f64(),
                 presented: false,
                 stats: None,
                 sync_ms: 0.0,
@@ -936,7 +928,7 @@ impl Engine {
 
         Ok(FrameReport {
             frame_index: self.frame_index,
-            elapsed_ms: self.clock_ms,
+            elapsed_ms: self.clock.now_f64(),
             presented,
             stats: self.last_frame(),
             sync_ms,
@@ -1167,6 +1159,20 @@ impl Engine {
         &mut self.scene
     }
 
+    /// Returns the frame clock.
+    ///
+    /// The clock is the engine's time base: the frame advances it, the timer
+    /// registry and the upward hook read it, and the script reads it through
+    /// `System.getTickCount`.
+    pub fn clock(&self) -> &FrameClock {
+        &self.clock
+    }
+
+    /// Returns the frame clock for mutation.
+    pub fn clock_mut(&mut self) -> &mut FrameClock {
+        &mut self.clock
+    }
+
     /// Returns the most recently projected render tree.
     ///
     /// The nodes keep VM-space coordinates; the root carries the presentation
@@ -1270,7 +1276,7 @@ impl Engine {
     /// A clock advanced with [`Engine::step`] carries the accumulated
     /// fractional part; [`Engine::frame`] sets it to the injected whole value.
     pub fn elapsed_ms(&self) -> f64 {
-        self.clock_ms
+        self.clock.now_f64()
     }
 
     /// Returns the null backend's counters for the last frame, if available.

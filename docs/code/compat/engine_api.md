@@ -31,6 +31,7 @@ or `FontSystem` — it reaches the platform only through L2.
 | the storage namespace | `Storage`, `Location`, `StorageReadError`, `normalize_in_archive_name` | mounting, resolving and reading a script storage name |
 | input | `InputState` | the generic pointer, key, button and touch state |
 | timers | `TimerState`, `TimerId`, `TimerCallback` | the L2 timer registry L3 arms and disarms |
+| the frame clock | `FrameClock` | the engine's time base: the tick count `System.getTickCount` returns |
 | text | `TextEngine`, `TextStyle`, `TextError`, `FontId`, `TextCoverageCache`, `CoverageMask`, `rasterize_text_coverage`, `blit_coverage_into`, `blur_coverage`, `blurred_text_coverage`, `compose_text_into` | shaping, coverage rasterization, the glyph cache |
 | sound | `Mixer`, `SoundBuffer`, `SoundChannel`, `SoundSource`, `SoundEvent`, `SoundLabel`, `SoundError`, `LoopInfo`, `LoopLink`, `LoopCondition`, `Status`, `AudioStream`, `LOOP_FLAG_COUNT` | the shared mixer and its channels, buffers and sources |
 | video | `VideoOverlay`, `VideoBounds`, `VideoEvent`, `PlayStatus`, `blit_frame_to_layer`, `blit_frame_to_layer_opacity` | the playback machine and the frame blits |
@@ -84,6 +85,7 @@ host attaches to `CompatServices` ([`ctx.md`](ctx.md)):
 | storage | `*mut Storage` | `CompatServices::attach_storage` |
 | input | `*mut InputState` | `CompatServices::attach_input` |
 | timer | `*mut TimerState` | `CompatServices::attach_timer` |
+| clock | `*mut FrameClock` | `CompatServices::attach_clock` |
 
 A native that needs the scene takes the raw pointer from the services and
 dereferences it under its own `unsafe` contract — see

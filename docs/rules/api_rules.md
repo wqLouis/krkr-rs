@@ -201,7 +201,10 @@ signature, no "kept for reference" copy.
 * The pixel translation itself. `PixelTranslation` and its `to_device_*` /
   `to_vm_point` / `raster_scale` are L2-internal; exposing one to L3 would
   spread the coordinate rule across hundreds of call sites.
-* The frame clock and `Engine`. The composition root owns them.
+* `Engine` itself. The composition root owns it. The **frame
+  clock** does cross the seam, as `FrameClock`: the script's tick count is
+  the clock the frame advances, so L3 reads the engine's clock instead of
+  keeping a second one.
 * The platform backends, the game loading and the startup discovery.
 * The VM.
 
@@ -279,7 +282,8 @@ user-data slot, so the compatibility layer keeps exactly **one**
 process-wide binding between the engine and the context.
 
 * `CompatServices` holds explicit handles to the L2 services the natives
-  compose: `attach_scene`, `attach_storage`, `attach_input`, `attach_timer`.
+  compose: `attach_scene`, `attach_storage`, `attach_input`, `attach_timer`,
+  `attach_clock`.
 * The attachment is `unsafe`, and the invariant is: **the pointed-to value must
   stay alive for as long as the binding is installed** (the VM's lifetime).
   Detaching and teardown happen before the L2 owner is dropped.

@@ -61,6 +61,7 @@ the composition root above everything. No layer may call up.
 |---|---|---|
 | [`engine/README.md`](engine/README.md) | `engine` | the crate at a glance: the state it owns, the services it calls |
 | [`engine/engine.md`](engine/engine.md) | `engine.rs` | the frame-owning object: the clock, the timer pump, the projection, the presentation |
+| [`engine/clock.md`](engine/clock.md) | `clock.rs` | the frame clock: the time base the frame advances and the script reads |
 | [`engine/scene.md`](engine/scene.md) | `scene.rs` | the logical layer tree and the per-layer state |
 | [`engine/projection.md`](engine/projection.md) | `projection.rs` | the L2 → L1 seam: the `RenderScene` the pipeline draws |
 | [`engine/layer_ops.md`](engine/layer_ops.md) | `layer_ops.rs` | the pixel primitives and the subtree compositing |

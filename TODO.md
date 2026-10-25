@@ -360,48 +360,40 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   blocked on this host by `kernel.perf_event_paranoid=2` (software `perf stat`
   works); gprofng works and is what the timings above come from.
 * **The title-entry animation is static, and the run never even reaches the
-  title.** Three separate things are open; they are in the order they block
-  each other.
-  * **The engine has two clocks, and the game reads the wrong one.**
-    `System.getTickCount()` returns a wall clock
-    (`crates/compat/src/natives/system.rs`, `tick_count_ms`) while the engine
-    owns the frame clock (`crates/engine/src/engine.rs`: "Nothing here reads a
-    wall clock"), and the runners advance that clock by a fixed period
-    (`crates/app/src/runner.rs`). The game's own Conductor computes its next
-    timer tick from `System.getTickCount()`, so in a headless run — 1 200
-    frames take ~60 ms of wall time while the engine's clock advanced 20 s -
-    every KAG timer and `[wait]` **starves**, and the scenario hangs at the
-    first real-time wait (measured: it never leaves `custom.ks:60 "*caution"`).
-    Overriding `System.getTickCount` from a patch script with a counter that
-    follows the frame clock makes the scenario advance. The reference has ONE
-    clock: `System.getTickCount` calls `TVPStartTickCount()` and returns
-    `TVPGetTickCount()` (`reference/cpp/core/base/impl/SystemImpl.cpp:622-629`),
-    and the reference's frame pacing follows it.
-  * **With the clock fixed, the scenario dies fatally**: `Member "label" does
-    not exist` at `custom.ks:63` (`[clearlayers]`), inside
-    `KAGEnvImage.updateImageSource` <- `_setImageFile` <- `setImageFile` <-
-    `doCommand`, so the conductor stops. `"label"` appears in no game script
-    except `system/kagenvimagemapperstage.tjs` (the stage mapper that owns
-    `title_bg`), and our Rust KAG also emits `"label"` keys
-    (`crates/compat/src/natives/kag/mod.rs:1060`, `:1255`) — check whether the
-    failing `.label` read is on a dictionary our native produces.
-  * **The title's motion is not driven by the env-image path at all.**
+  title.** The engine had two clocks and the game read the wrong one, so every
+  KAG timer starved and the scenario hung in silence; that is fixed (the tick
+  count is the engine's frame clock now, so the game and its timers share one
+  clock — the reference has one clock too,
+  `reference/cpp/core/base/impl/SystemImpl.cpp:622-629`). What is still open:
+  * **The world's per-frame env update never runs in our engine.**
+    `world.updateAll`, `world.updateSource` and `world.refresh` are never
+    called, and `world.envlayerList` holds only the one object the scenario
+    reached. The world's own update is the only place a real delta still
+    exists for a motion: `world.updateAll` -> `env.updateCurrent` ->
+    `world._updateAll(currentData, 0, delta)`. Find what the reference calls
+    per frame and make our frame body deliver the same call.
+  * **The env-image `.mtn` path cannot animate the title in ANY engine,** the
+    reference included, so the reference's animated title is a THIRD mechanism
+    (the game gates it on its own `enableSceneAnimEffect`).
     `AffineSourceMotion._drawAffine` advances the player only when
     `_interval > 0` (`progress(_interval)` against `progress(0)`), and
     `_interval` is written in exactly three places in the whole game (class
     init = void, constructor = 0, `_drawAffine` = 0) and **no script ever
-    sets it above 0**. `progress(0)` does not advance in the reference either
-    (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:988-1019`; the
-    plugin never reads a clock). So this path can never animate the title — in
-    the reference included — and `_storageType` ("emote" for a `.PSB`,
-    "motion" otherwise) does not select an animating path. The reference must
-    animate the title through the KAG **generic-flip** machinery
-    (`onFlipTimerInterval` -> `updateGenericFlips` -> `GenericFlip.update(dt)`
-    -> `Motion.Player.progress(dt)`), and in our run `kag.activeGenericFlips`
-    is empty: that is the divergence to explain next. The motion player itself
-    is not at fault — driven directly, `Motion.ResourceManager.load("title_bg.mtn")`
-    -> `Motion.Player.play("title")` -> `progress(16)` + `draw(layer)` changes
-    the sampled pixel every frame.
+    sets it above 0**; `progress(0)` does not advance in the reference either
+    (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:988-1019`;
+    the plugin never reads a clock). The KAG **generic-flip** machinery is not
+    it either: `createGenericFlip` is the only producer of
+    `kag.activeGenericFlips`, its only caller is
+    `system/affinesourceflip.tjs` (the `.flip` source class), and the game's
+    motion containers author no `action`/`sync` keyframes at all. The motion
+    player itself is not at fault — driven directly,
+    `Motion.ResourceManager.load("title_bg.mtn")` -> `Motion.Player.play("title")`
+    -> `progress(16)` + `draw(layer)` changes the sampled pixel every frame.
+  * **A probe lesson worth keeping:** adding a member to a script class at
+    runtime perturbs that class's property dispatch, so a probe that mutates a
+    game class can manufacture an error the engine never had. Wrap the
+    INSTANCE, or hook `Scripts.execStorage` and wrap the class the moment its
+    script finishes loading.
 * **The `Layer`/`layer_ex` affine paths now honour the destination clip.** The
   reference passes the clip into the blit —
   `MainImage->AffineBlt(ClipRect, …)` (`reference/cpp/core/visual/

@@ -2534,9 +2534,7 @@
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// (the game folder), not its `savedata/` subfolder. The reference's", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// **identity** — the `(Object, ObjThis)` pair the reference's", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// Convert a TVP system color (high byte set) to its actual `0xRRGGBB` value.", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// Epoch of the first `getTickCount` call (the reference's", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// Hand a retained evaluation result to the C++ side. Scalars are copied;", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// Milliseconds since the first call (the reference's", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// Ported from `ColorToRGB` + the byte-order swap in `TVPToActualColor`.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// Reference `TVPSetCommandLine`: rewrite the first prefix-matching entry to", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// Reference `tTVPTouchDevice` capability bits (`SystemImpl.cpp:424-434`).", "reason": "legacy comment, cleanup tracked in TODO §15"}

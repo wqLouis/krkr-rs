@@ -17,6 +17,7 @@ use api::media::{DecodedImage, ImageInfo};
 use compat::CompatHost;
 use engine::Scene;
 use engine::Storage;
+use engine::clock::FrameClock;
 use engine::input::InputState;
 use engine::timer::TimerState;
 use fs::FileSystem;
@@ -39,7 +40,8 @@ pub fn vm_lock() -> MutexGuard<'static, ()> {
 ///
 /// Fields drop in declaration order: the host first (releasing every retained
 /// script object and removing the process-wide binding), then the engine, then
-/// the boxed scene / timer / input / storage the host's raw pointers refer to.
+/// the boxed scene / timer / input / clock / storage the host's raw pointers
+/// refer to.
 pub struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
@@ -48,6 +50,9 @@ pub struct Env {
     /// The attached timer registry; tests move its injected time directly so a
     /// poll never depends on the wall clock.
     timer: RefCell<Box<TimerState>>,
+    /// The attached frame clock; tests advance it directly so a tick count
+    /// never depends on the wall clock.
+    clock: RefCell<Box<FrameClock>>,
     _input: Box<InputState>,
     _storage: Option<Box<Storage>>,
     _game_dir: Option<PathBuf>,
@@ -74,9 +79,11 @@ impl Env {
         let mut scene = Box::new(Scene::default());
         let mut timer = Box::new(TimerState::new());
         let mut input = Box::new(InputState::new());
+        let mut clock = Box::new(FrameClock::new());
         let mut host = CompatHost::new();
-        // SAFETY: the boxed scene, timer registry and input state outlive the
-        // host (they are declared after `_host`), matching `attach_*`.
+        // SAFETY: the boxed scene, timer registry, input state and frame clock
+        // outlive the host (they are declared after `_host`), matching
+        // `attach_*`.
         unsafe {
             host.services_mut()
                 .attach_scene(scene.as_mut() as *mut Scene);
@@ -84,6 +91,8 @@ impl Env {
                 .attach_timer(timer.as_mut() as *mut TimerState);
             host.services_mut()
                 .attach_input(input.as_mut() as *mut InputState);
+            host.services_mut()
+                .attach_clock(clock.as_mut() as *mut FrameClock);
         }
         let (storage, game_dir) = if with_storage {
             let dir = unique_dir("krkr-compat-test");
@@ -118,6 +127,7 @@ impl Env {
             engine,
             scene,
             timer: RefCell::new(timer),
+            clock: RefCell::new(clock),
             _input: input,
             _storage: storage,
             _game_dir: game_dir,
@@ -215,6 +225,16 @@ impl Env {
             },
             |_name, _type, _width, _height, _rgba| Ok(()),
         );
+    }
+
+    /// Advance the attached frame clock by `dt_ms` and return its new
+    /// whole-millisecond value.
+    ///
+    /// The clock is the engine's frame clock, so a test drives time instead
+    /// of waiting for it.
+    pub fn advance_clock(&self, dt_ms: f64) -> u64 {
+        let mut clock = self.clock.borrow_mut();
+        clock.advance(dt_ms)
     }
 
     /// Move the attached timer registry's injected time forward by `ms`

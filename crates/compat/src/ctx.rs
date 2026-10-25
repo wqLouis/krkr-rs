@@ -5,6 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::ffi::c_char;
 use std::marker::PhantomData;
 
+use crate::engine_api::FrameClock;
 use crate::engine_api::InputState;
 use crate::engine_api::TimerState;
 use crate::engine_api::{DecodePool, Scene, Storage};
@@ -44,6 +45,11 @@ pub struct CompatServices {
     storage: Option<*mut Storage>,
     input: Option<*mut InputState>,
     timer: Option<*mut TimerState>,
+    /// The L2 frame clock the `System` native reads.
+    ///
+    /// `None` when the host attached no clock: the tick count then raises
+    /// instead of reporting a time the game never reached.
+    clock: Option<*mut FrameClock>,
     /// The L2 image decode pool the visual natives submit decodes to.
     ///
     /// `None` when the host attached no pool: the loads then decode
@@ -141,6 +147,21 @@ impl CompatServices {
     /// See [`Self::scene`] for why this returns a raw pointer.
     pub fn timer(&self) -> Option<*mut TimerState> {
         self.timer
+    }
+
+    /// Attach the L2 frame clock the `System` native reads.
+    ///
+    /// # Safety
+    /// `clock` must stay valid for as long as the binding is installed.
+    pub unsafe fn attach_clock(&mut self, clock: *mut FrameClock) {
+        self.clock = Some(clock);
+    }
+
+    /// The attached L2 frame clock pointer, if any.
+    ///
+    /// See [`Self::scene`] for why this returns a raw pointer.
+    pub fn clock(&self) -> Option<*mut FrameClock> {
+        self.clock
     }
 
     /// Attach the L2 image decode pool the visual natives submit decodes to.

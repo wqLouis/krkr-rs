@@ -1,9 +1,9 @@
 //! `System` native class.
 //!
 //! `System` is the process and OS fact class. It composes the L2
-//! `engine_api::Storage` and `engine_api::Scene` services, the `tjs` VM and the
-//! per-engine dispatch state kept in [`CompatServices::state`] — it owns no
-//! process global.
+//! `engine_api::Storage`, `engine_api::Scene` and `engine_api::FrameClock`
+//! services, the `tjs` VM and the per-engine dispatch state kept in
+//! [`CompatServices::state`] — it owns no process global.
 //!
 //! # Implemented members
 //!
@@ -23,6 +23,11 @@
 //! `desktopHeight`, `touchDevice`.
 //!
 //! # Composition
+//!
+//! `getTickCount` reads the attached L2 `engine_api::FrameClock`: the
+//! tick count is the engine's frame clock, the value the frame advances and
+//! the timer registry is fired against, so the script and the game share one
+//! clock.
 //!
 //! `getKeyState` reads the attached L2 `engine_api::InputState`
 //! (TVP virtual-key codes and pad/`VK_PADANY` semantics are the same as the
@@ -106,9 +111,11 @@ struct SystemState {
     exit_on_no_window_startup: bool,
     /// `System.drawThreadNum` (stored for compatibility).
     draw_thread_num: i64,
-    /// Epoch of the first `getTickCount` call (the reference's
-    /// `TVPStartTickCount`).
-    tick_epoch: Option<Instant>,
+    /// Epoch of the rough tick the housekeeping intervals use.
+    ///
+    /// The rough tick is a wall clock of its own: it paces the periodic
+    /// object rehash and the idle compaction, not the frame.
+    rough_tick_epoch: Option<Instant>,
     /// Rough tick of the last automatic compact, or `None` before the first
     /// check (the reference `LastCompactedTick`,
     /// `reference/cpp/core/environ/impl/SystemControl.cpp:52`).
@@ -144,7 +151,7 @@ impl Default for SystemState {
             // (`SysInitImpl.cpp:383`).
             exit_on_no_window_startup: true,
             draw_thread_num: 0,
-            tick_epoch: None,
+            rough_tick_epoch: None,
             last_compacted_ms: None,
             last_rehashed_ms: 0,
             uuid_counter: 0,
@@ -194,7 +201,7 @@ pub fn continuous_handler_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError>
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let engine = unsafe { ctx.engine() };
     let services = services(ctx);
-    let tick = tick_count_ms(services);
+    let tick = tick_count_ms(services).map_err(CompatError::Engine)?;
     let mut index = 0usize;
     loop {
         // Root the handler for the call, leaving a tombstone in its slot.
@@ -283,7 +290,7 @@ pub fn rehash_poll(ctx: &mut CompatCtx) -> bool {
     let services = unsafe { ctx.services() };
     let due = {
         let mut state = services.state::<SystemState>();
-        let epoch = *state.tick_epoch.get_or_insert_with(Instant::now);
+        let epoch = *state.rough_tick_epoch.get_or_insert_with(Instant::now);
         let tick = epoch.elapsed().as_millis() as i64;
         rehash_due(&mut state, tick)
     };
@@ -313,7 +320,7 @@ pub fn compact_poll(ctx: &mut CompatCtx) -> bool {
     let services = unsafe { ctx.services() };
     let due = {
         let mut state = services.state::<SystemState>();
-        let epoch = *state.tick_epoch.get_or_insert_with(Instant::now);
+        let epoch = *state.rough_tick_epoch.get_or_insert_with(Instant::now);
         let tick = epoch.elapsed().as_millis() as i64;
         match state.last_compacted_ms {
             Some(last) if tick - last <= COMPACT_INTERVAL_MS => false,
@@ -602,12 +609,23 @@ fn set_retained_value_out(ctx: &CompatCtx, out: *mut Value, value: RetainedValue
     }
 }
 
-/// Milliseconds since the first call (the reference's
-/// `TVPStartTickCount`/`TVPGetTickCount`).
-fn tick_count_ms(services: &CompatServices) -> i64 {
-    let mut state = services.state::<SystemState>();
-    let epoch = *state.tick_epoch.get_or_insert_with(Instant::now);
-    epoch.elapsed().as_millis() as i64
+/// The frame clock's tick count in milliseconds.
+///
+/// The tick count is the engine's frame clock: the value the frame advances,
+/// so the script's clock and the game's timers are the same clock.
+///
+/// # Errors
+///
+/// Returns the message for a host that attached no clock: a tick count
+/// without a frame clock would be a time the game never reached.
+fn tick_count_ms(services: &CompatServices) -> Result<i64, String> {
+    let Some(clock) = services.clock() else {
+        return Err("System.getTickCount: clock is not attached".to_owned());
+    };
+    // SAFETY: `attach_clock` guarantees the pointer stays valid.
+    let now_ms = unsafe { &*clock }.now_ms();
+    i64::try_from(now_ms)
+        .map_err(|_| "System.getTickCount: the frame clock is out of tick range".to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -771,7 +789,7 @@ fn inform_button_count(engine: *mut c_void, value: &Value) -> Result<i64, String
     try_value_as_i64(value)
 }
 
-/// `System.getTickCount()` → milliseconds since the first call.
+/// `System.getTickCount()` → the frame clock's tick count in milliseconds.
 extern "C" fn native_get_tick_count(
     engine: *mut c_void,
     _argc: c_int,
@@ -787,7 +805,12 @@ extern "C" fn native_get_tick_count(
     };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    set_int(out, tick_count_ms(unsafe { ctx.services() }));
+    let services = unsafe { ctx.services() };
+    let tick = match tick_count_ms(services) {
+        Ok(tick) => tick,
+        Err(message) => return report_error(out_error, &message),
+    };
+    set_int(out, tick);
     0
 }
 

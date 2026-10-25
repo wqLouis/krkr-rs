@@ -46,6 +46,7 @@ its tests.
 | module | source | one-line role | document |
 |---|---|---|---|
 | `engine` | `src/engine.rs` | the frame-owning object: scene, projection, textures, timers, presentation | [engine.md](engine.md) |
+| `clock` | `src/clock.rs` | the frame clock: the time base the frame advances and the script reads | [clock.md](clock.md) |
 | `scene` | `src/scene.rs` | the logical layer tree: windows, layers, bitmaps, fonts, focus domains | [scene.md](scene.md) |
 | `imagedecode` | `src/imagedecode.rs` | the deferred image decode pool and its pending-image future | [scene.md](scene.md#the-pending-image) |
 | `projection` | `src/projection.rs` | the pure field copy from the logical tree to the L1 `RenderScene` | [projection.md](projection.md) |
@@ -74,6 +75,7 @@ reachable through the module path.
 pub use api::config::CacheLimit;
 pub use fs::xp3::normalize_in_archive_name;
 
+pub use crate::clock::FrameClock;
 pub use crate::engine::{
     Engine, EngineError, EngineOverlay, EngineParts, FrameReport, GameFrame, ObjectCounts,
 };
@@ -174,6 +176,7 @@ rule that L2 is the only layer that names two of them are in
 | file | covers |
 |---|---|
 | `engine.rs` | the frame: clock, projection cadence, upload retry, presentation faults |
+| `clock.rs` | the frame clock: the fractional millisecond, the exact set, the saturation |
 | `scene.rs`, `bitmap.rs`, `oop_semantics.rs` | the layer tree, bitmaps, focus, ordering |
 | `projection.rs` | the L2 → L1 seam |
 | `translate.rs` | the VM ↔ device mapping |

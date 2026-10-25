@@ -22,13 +22,14 @@ pub struct CompatServices {
     storage: Option<*mut Storage>,
     input:  Option<*mut InputState>,
     timer:  Option<*mut TimerState>,
+    clock:  Option<*mut FrameClock>,
     linked_array: RefCell<(Vec<*const c_char>, Vec<Vec<u8>>)>,
     noop_closure: Cell<Tjs2ValueId>,
     states: StateMap,
 }
 ```
 
-### The four handles
+### The five handles
 
 | Handle | Attached by | Used by |
 |---|---|---|
@@ -36,6 +37,7 @@ pub struct CompatServices {
 | `storage: *mut Storage` | `attach_storage` | `Storages`, `Scripts`, `WaveSoundBuffer.open`, `Bitmap.load`, the pre-rendered font map |
 | `input: *mut InputState` | `attach_input` | `Mouse`, `Key`, the event adapter, the touch getters, `Layer.setCursorPos` |
 | `timer: *mut TimerState` | `attach_timer` | the `Timer` class and the frame body's timer drain |
+| `clock: *mut FrameClock` | `attach_clock` | `System.getTickCount`, the script's tick count |
 
 The handles are **raw pointers**, not borrows, because the process-wide
 binding is lifetime-free: the host owns the services for the lifetime of the
@@ -100,7 +102,7 @@ The families that use it:
 | State type | Family | Holds |
 |---|---|---|
 | `VisualState` | `natives/visual` | the scene-id → script-object registry, the `Window.add` vector, the `Timer` bindings, the host request queues, the string scratch |
-| `SystemState` | `natives/system` | the command line, the exit request, the title, the continuous handlers, the tick epoch |
+| `SystemState` | `natives/system` | the command line, the exit request, the title, the continuous handlers, the rough tick epoch |
 | `StringScratch` | several | the reusable `out.string` buffer (one per family, so a re-entrant visual callback cannot clobber a `System` result mid-marshal) |
 | `SoundState` | `natives/sound` | the shared mixer, the sound objects, the decoder chain, the vis-buffer registrations |
 | `VideoState` | `natives/video` | the overlays, the installed `VideoSource` |
@@ -191,7 +193,7 @@ duration of the delay.
 
 | Test | What it asserts |
 |---|---|
-| `crates/compat/tests/common/mod.rs` | the shared harness attaches the scene, storage, input and timer through `services_mut()` before `install` |
+| `crates/compat/tests/common/mod.rs` | the shared harness attaches the scene, storage, input, timer and frame clock through `services_mut()` before `install` |
 | `crates/compat/tests/extend_dispatch.rs` | a script subclass override wins over the native member for every event forwarder |
 | `crates/compat/tests/oop.rs::instanceof_walks_the_script_to_native_chain` | the class chain a subclass builds resolves through the native base |
 | `crates/compat/tests/dispatch_*.rs` | a `with`-style write from a foreign receiver lands on the **member's** object, not the receiver's |
@@ -202,5 +204,5 @@ duration of the delay.
 
 * [`binding.md`](binding.md) — the table that resolves a raw engine pointer to a `CompatCtx`
 * [`host.md`](host.md) — who owns the services
-* [`engine_api.md`](engine_api.md) — what the four handles point at
+* [`engine_api.md`](engine_api.md) — what the five handles point at
 * [`../../arch/l3.md`](../../arch/l3.md) §7 — the one binding and the surface lock

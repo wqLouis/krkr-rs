@@ -850,3 +850,57 @@ fn graphic_cache_limit_edges_control_decoding() {
 fn decode_count(hints: &Arc<Mutex<Vec<String>>>) -> usize {
     hints.lock().expect("decode lock").len()
 }
+
+/// The tick count is the engine's frame clock.
+///
+/// The reference's `System.getTickCount` returns the tick counter its frame
+/// pacing follows, so the script and the frame share one clock
+/// (`reference/cpp/core/base/impl/SystemImpl.cpp:622-629`). A second,
+/// wall-clock counter would starve every timer the script arms.
+#[test]
+fn get_tick_count_reads_the_engine_frame_clock() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    assert_eq!(
+        env.eval_int("System.getTickCount()"),
+        0,
+        "the frame clock starts at zero"
+    );
+
+    env.advance_clock(1000.0);
+    assert_eq!(
+        env.eval_int("System.getTickCount()"),
+        1000,
+        "the tick count is the clock the frame advances"
+    );
+    // A wall clock keeps counting between two reads; the frame clock only
+    // moves when the frame advances it.
+    assert_eq!(
+        env.eval_int("System.getTickCount()"),
+        1000,
+        "the tick count does not follow the wall clock"
+    );
+
+    // The clock keeps its fractional part, and the tick count is the whole
+    // milliseconds of it.
+    env.advance_clock(16.5);
+    assert_eq!(
+        env.eval_int("System.getTickCount()"),
+        1016,
+        "the fractional part is kept, and the tick count is whole milliseconds"
+    );
+}
+
+/// A host that attached no clock cannot report a tick count: the time the
+/// game never reached is not a value a script may read.
+#[test]
+fn get_tick_count_without_a_clock_raises_a_typed_error() {
+    let _lock = vm_lock();
+    with_vm(|e| {
+        let error = e
+            .eval("System.getTickCount()", "t")
+            .expect_err("a missing clock must raise")
+            .to_string();
+        assert!(error.contains("clock"), "unexpected error: {error}");
+    });
+}

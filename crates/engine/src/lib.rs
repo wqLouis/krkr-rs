@@ -21,6 +21,7 @@ mod hasher;
 #[cfg(feature = "simd-experiment")]
 mod simd;
 
+pub mod clock;
 pub mod engine;
 pub mod imagedecode;
 pub mod input;
@@ -45,6 +46,8 @@ pub mod video;
 // `engine::shader`, `engine::storage`, `engine::startup`, …), so the flat
 // root never becomes an accidental copy of the crate's whole API.
 
+// The frame clock: the time base the frame advances and the script reads.
+pub use crate::clock::FrameClock;
 // The frame owner: the clock, the timer pump, the projection and the single
 // render call, plus the one upward hook the composition root implements.
 pub use crate::engine::{

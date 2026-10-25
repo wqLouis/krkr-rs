@@ -5,7 +5,7 @@ Source: `crates/engine/src/engine.rs`
 `Engine` is the object the composition root drives. It holds the logical
 [`Scene`](scene.md), the projected L1 `RenderScene`, the surface/render-state
 pair, the bitmap→texture table, the [`TimerState`](timer.md), the
-[`InputState`](input.md) and the VM↔device
+[`InputState`](input.md), the [`FrameClock`](clock.md) and the VM↔device
 [`PixelTranslation`](translate.md) — and it owns the **frame**: the clock, the
 timer pump, the projection and the single draw call.
 
@@ -42,7 +42,7 @@ map for the module.
 | `timer: TimerState` | the timer registry the frame advances |
 | `input: InputState` | the script-visible input state |
 | `surface_size: (u32, u32)` | the current framebuffer size in device pixels |
-| `clock_ms`, `now_ms`, `last_now_ms`, `frame_index` | the frame clock and counters |
+| `clock: FrameClock`, `last_now_ms`, `frame_index` | the frame clock and counters |
 | `headless: bool` | whether the engine runs with no window |
 | `overlay: Option<Box<dyn EngineOverlay>>` | the render-only debug overlay |
 | `translation: Option<PixelTranslation>` | the current VM↔device mapping; `None` when the sizes cannot be fitted |
@@ -95,6 +95,9 @@ impl Engine {
   frames, so sixty `step(16.6)` calls advance the clock by 996 ms rather than
   960. The timer, hook and overlay receive the accumulated clock's whole
   millisecond `now_ms`.
+* The clock is the [`FrameClock`](clock.md) object the engine owns, and it is
+  the tick count the script reads through `System.getTickCount`: the script
+  and the frame share one clock.
 * `resize(size, …)` rebinds the surface to a new framebuffer size. The
   logical screen is untouched: the scene keeps its window client sizes and
   primary-layer rects, and the presentation refits the screen into the new
@@ -126,11 +129,11 @@ tree.
 
 ### Inspection
 
-`pipeline()`, `backend()`, `scene()`, `scene_mut()`, `render_scene()`,
-`drawn_layers()`, `textures()`, `input()`, `input_mut()`, `timer()`,
-`timer_mut()`, `is_headless()`, `surface_size()`, `vm_size()`,
-`object_counts()`, `translation()`, `take_window_resize()`, `frame_index()`,
-`elapsed_ms()`, `last_frame()`, `last_frame_timings()`,
+`pipeline()`, `backend()`, `scene()`, `scene_mut()`, `clock()`,
+`clock_mut()`, `render_scene()`, `drawn_layers()`, `textures()`, `input()`,
+`input_mut()`, `timer()`, `timer_mut()`, `is_headless()`, `surface_size()`,
+`vm_size()`, `object_counts()`, `translation()`, `take_window_resize()`,
+`frame_index()`, `elapsed_ms()`, `last_frame()`, `last_frame_timings()`,
 `debug_overlay_enabled()`.
 
 `vm_size()` is the **script-visible screen size**: the first window's
@@ -184,9 +187,11 @@ unfittable size names all three instead of only the last one.
 
 ## 3. The frame, in order
 
-`Engine::advance(now_ms, clock_ms, dt_ms, hooks)` runs exactly this sequence:
+`Engine::run_frame(now_ms, dt_ms, hooks)` runs exactly this sequence. The
+clock is already set when it starts: `step` accumulated the delta into it and
+`frame` put it at the injected value.
 
-1. set the clock (`clock_ms`, `now_ms`, `last_now_ms`);
+1. record the frame's clock (`last_now_ms`);
 2. `sync_presentation()` — refit the VM↔device mapping, observe the window
    client size;
 3. `timer.advance(now_ms)` — fire the due timers;
@@ -221,10 +226,11 @@ touched.
 ## 4. Invariants
 
 * **The engine owns the clock.** Nothing above L2 accumulates a `dt` or calls
-  a subsystem pump itself. The clock is one `f64` millisecond accumulator:
+  a subsystem pump itself. The clock is the [`FrameClock`](clock.md) object:
   `step` adds to it and saturates at the integer ceiling, `frame` replaces it
   with the injected whole value, and the timer and upward edge receive its
-  whole-millisecond part.
+  whole-millisecond part. It is also the tick count the script reads, so the
+  script and the frame share one clock.
 * **The projected tree is in VM pixels.** The render-scene root carries the
   Fit presentation transform; the overlay is attached with the inverse root
   transform because its node is authored in device coordinates.
@@ -304,6 +310,9 @@ warning with a named cause, or a counted skipped frame.
 
 ## 8. Tests
 
+* `crates/engine/tests/clock.rs` — the frame clock: the fractional
+  millisecond across the deltas, the negative delta, the exact set and the
+  saturation.
 * `crates/engine/tests/engine.rs` — the frame: clock behaviour, projection
   cadence, upload retry, presentation faults, a skipped frame still running
   the hook and its due timers, and the window-resize handoff.
@@ -324,5 +333,6 @@ warning with a named cause, or a counted skipped frame.
 | the presentation mapping | [translate.md](translate.md) |
 | the projection | [projection.md](projection.md) |
 | the timer contract | [timer.md](timer.md) |
+| the frame clock | [clock.md](clock.md) |
 | the L2↔L1 surface this object drives | [`arch/l1.md`](../../arch/l1.md) §3 |
 | the archived design trail | [`docs.old/migration/12-layer-tree-and-frame.md`](../../../docs.old/migration/12-layer-tree-and-frame.md) §6 |

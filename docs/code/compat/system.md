@@ -16,7 +16,7 @@ engine has no other way to know.
 | member | behaviour |
 |---|---|
 | `inform(text[, caption[, buttons]])` | logs the message; returns void without a button count, `0` for one or two buttons, `-1` otherwise |
-| `getTickCount()` | milliseconds since the first call |
+| `getTickCount()` | the engine's frame clock, in whole milliseconds |
 | `getArgument(name)` | the `name=value` argument, or void |
 | `setArgument(name, value)` | rewrites or inserts an argument |
 | `createAppLock(name)` | always true — the single-process emulator always wins the lock |
@@ -114,8 +114,15 @@ The vector lives in the per-engine dispatch state, not in a process global.
 
 ### The clock
 
-`getTickCount` returns the milliseconds since the **first** call — the epoch
-is created lazily and kept for the life of the engine.
+`getTickCount` returns the engine's **frame clock** in whole milliseconds:
+the value the frame advances and the timer registry is fired against, so the
+script and the game measure the same time. The clock is attached by the
+composition root; a host that attached none raises
+`System.getTickCount: clock is not attached` rather than reporting a time
+the game never reached.
+
+The periodic housekeeping intervals — the object rehash and the idle
+compaction — run on the **rough tick**, a wall clock of their own.
 
 ### The periodic object rehash
 
@@ -178,7 +185,8 @@ process.
 
 | state | owner |
 |---|---|
-| the command-line vector, the exit request, `title`, `eventDisabled`, `exitOnWindowClose`, `exitOnNoWindowStartup`, `drawThreadNum`, the tick epoch, the compaction tick, the rehash tick, the UUID counter, the continuous handlers, the key-query edges | the **per-engine dispatch state** (`CompatServices::state::<SystemState>()`) |
+| the command-line vector, the exit request, `title`, `eventDisabled`, `exitOnWindowClose`, `exitOnNoWindowStartup`, `drawThreadNum`, the rough tick epoch, the compaction tick, the rehash tick, the UUID counter, the continuous handlers, the key-query edges | the **per-engine dispatch state** (`CompatServices::state::<SystemState>()`) |
+| the tick count (`getTickCount`) | the **L2 frame clock** (`engine_api::FrameClock`) |
 | the string scratch buffer for returned strings | the **per-engine dispatch state** |
 | the screen size, the graphic cache, the graphic-cache limit | the **L2 scene** |
 | the key state | the **L2 input state** |
@@ -213,6 +221,7 @@ Every member that can fail raises. The message vocabulary:
 | `"System.<member>: the host fact is not installed"` | the desktop fact was never installed |
 | `"System.<member>: missing value"` | a setter without a value slot |
 | `"System.<member>: input state is not attached"` | no L2 input state |
+| `"System.getTickCount: clock is not attached"` | no L2 frame clock |
 | `"System.<member>: {error}"` | an inner failure |
 
 The integer/real conversion errors are reported **unprefixed**, because they
@@ -232,8 +241,9 @@ defaults, the version and environment properties, the storage-backed paths
 L2 scene, `readRegValue`, the no-op members and their arity checks, the
 continuous handlers' de-duplication and removal, `exit`/`terminate`, the host
 fact errors and the host fact seam, `getKeyState` (held state and the
-consumed edge), the constant `touchDevice`, `clearGraphicCache`, and the
-graphic-cache limit's edges and truncation.
+consumed edge), the constant `touchDevice`, `clearGraphicCache`, the
+graphic-cache limit's edges and truncation, and the tick count: it reads the
+L2 frame clock and raises when no clock is attached.
 
 ---
 

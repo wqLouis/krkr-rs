@@ -202,6 +202,26 @@ fn step_keeps_the_fractional_millisecond_across_frames() {
     assert_eq!(engine.elapsed_ms(), last.elapsed_ms);
 }
 
+/// The engine's clock is the value the frame advances, and the accessor
+/// exposes that same clock.
+#[test]
+fn the_engine_exposes_the_frame_clock_it_advances() {
+    let mut engine = headless_engine((16, 16));
+    let mut hooks = Recorder::default();
+
+    engine.step(16.6, &mut hooks).expect("frame");
+    assert_eq!(engine.clock().now_ms(), 16);
+    assert!(
+        (engine.clock().now_f64() - 16.6).abs() < 0.01,
+        "the clock keeps the fractional millisecond"
+    );
+
+    // A frame that carries its own time sets the clock exactly.
+    engine.frame(40, &mut hooks).expect("frame");
+    assert_eq!(engine.clock().now_ms(), 40);
+    assert_eq!(engine.clock().now_f64(), 40.0);
+}
+
 #[test]
 fn a_saturating_delta_keeps_the_clock_monotonic() {
     let mut engine = headless_engine((16, 16));

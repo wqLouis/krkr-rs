@@ -600,6 +600,9 @@ impl GameHost {
         let storage_ptr = storage.as_ref() as *const Storage as *mut Storage;
         let timer_ptr = host.engine_mut().timer_mut() as *mut TimerState;
         let input_ptr = host.engine_mut().input_mut() as *mut InputState;
+        // The frame clock: the tick count the script reads is the clock the
+        // frame advances, so the game and its timers share one clock.
+        let clock_ptr = host.engine_mut().clock_mut() as *mut engine::FrameClock;
         // The image decode pool: the bottom decoder it drives, installed
         // before the binding so the natives can submit decodes. The pool
         // must not be replaced while the binding is installed: the natives
@@ -612,15 +615,17 @@ impl GameHost {
             .map_or(std::ptr::null_mut(), |pool| pool as *mut engine::DecodePool);
         // SAFETY: `storage` and `host` are declared after `vm` in the returned
         // struct and therefore outlive it; the boxed `host` keeps the engine's
-        // scene, timer and input addresses stable, and nothing else aliases
-        // any of them while the binding is installed. Attaching before the
-        // compat surface is installed lets a registration-time service read
-        // (the `xp3filter` `xp3filter.tjs` read) see the mounted archives.
+        // scene, timer, input and clock addresses stable, and nothing else
+        // aliases any of them while the binding is installed. Attaching before
+        // the compat surface is installed lets a registration-time service
+        // read (the `xp3filter` `xp3filter.tjs` read) see the mounted
+        // archives.
         let vm = VmHost::with_default_services(|services| unsafe {
             services.attach_scene(scene_ptr);
             services.attach_storage(storage_ptr);
             services.attach_timer(timer_ptr);
             services.attach_input(input_ptr);
+            services.attach_clock(clock_ptr);
             services.attach_decode_pool(pool_ptr);
         })?;
 
