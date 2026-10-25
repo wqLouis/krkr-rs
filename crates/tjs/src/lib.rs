@@ -6086,15 +6086,20 @@ var ra = a.get(); var rb = b.get();",
         let _ = std::fs::remove_file(&path);
     }
 
+    // reference/cpp/core/base/TextStream.cpp:245-258 — the write mode
+    // selects the cipher mode: the `c` digit, 1 for a `c` without a number,
+    // -1 when `c` is absent, and the compressed container for a `z` without a
+    // number. A `z` with a number only sets the compression level, so the
+    // text stays plain. The reader accepts every form the writer produces.
     #[test]
-    fn array_save_load_roundtrips_each_crypt_mode() {
+    fn array_save_load_roundtrips_each_write_form() {
         let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         for (name, mode) in [
-            ("default-mode2", "o8"),
-            ("mode0", "o8c0"),
+            ("default-plain", "o8"),
             ("mode1", "o8c1"),
-            ("mode2-level", "o8z9"),
+            ("mode2", "o8c2"),
+            ("z-with-number", "o8z9"),
         ] {
             let path = temp_path(name);
             let prefix = b"PREFIX!!";
@@ -6125,17 +6130,14 @@ var ra = a.get(); var rb = b.get();",
 
     // reference/cpp/core/base/TextStream.cpp:82-105 — the cipher modes write a
     // five-byte header (`FE FE <mode> FF FE`); mode 2 keeps the same
-    // five-byte `FE FE 02 FF FE` header (`:104-116`).
+    // five-byte `FE FE 02 FF FE` header (`:104-116`). A plain write has no
+    // container header at all: the UTF-16LE byte-order mark alone.
     #[test]
-    fn writer_emits_the_reference_crypt_header() {
+    fn writer_emits_the_reference_file_header() {
         let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         for (name, mode, expected) in [
-            (
-                "header-mode0",
-                "o8c0",
-                &[0xFEu8, 0xFE, 0x00, 0xFF, 0xFE][..],
-            ),
+            ("header-plain", "o8", &[0xFFu8, 0xFE][..]),
             (
                 "header-mode1",
                 "o8c1",
@@ -6161,6 +6163,28 @@ var ra = a.get(); var rb = b.get();",
             );
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    // reference/cpp/core/base/TextStream.cpp:256-258 — the cipher mode must
+    // be -1, 1 or 2; any other mode raises the unsupported-mode-string error
+    // ("unsupported cipher mode is unsupported mode string",
+    // reference/cpp/core/base/MsgIntfInc.h:46).
+    #[test]
+    fn a_cipher_mode_outside_the_supported_set_raises() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        let path = temp_path("mode0");
+        let path_lit = format!("{:?}", path.to_string_lossy());
+        let setup = format!("var a = ['x']; a.save({path_lit}, 'o8c0');");
+        let error = e
+            .exec_script(&setup, "mode0")
+            .expect_err("cipher mode 0 must raise");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported cipher mode is unsupported mode string"),
+            "{error}"
+        );
     }
 
     #[test]

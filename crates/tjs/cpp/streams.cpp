@@ -17,13 +17,18 @@
 //                         the leading bytes, e.g. a KAG BMP thumbnail, are
 //                         preserved); without `o` the file is created or
 //                         truncated (WRITE).
-//   * write mode `cN`  -> crypt mode N (N is a single digit, 0/1/2).
-//   * write mode `zN`  -> zlib compression (crypt mode 2) at level N.
-//   * neither `c` nor `z` -> zlib compressed (crypt mode 2). This is the
-//                         default the real KAG engine uses for its
-//                         `"o<byteOffset>"` saves (the reference's
-//                         `tTVPTextWriteStream` falls into `_cryptMode = 2`
-//                         when no `z` is given).
+//   * write mode `cN`  -> cipher mode N (N is a single digit): `c1` is the
+//                         simple cipher, `c2` the compressed container. A
+//                         cipher mode outside {-1, 1, 2} raises the
+//                         unsupported-mode-string error.
+//   * write mode `c`   -> cipher mode 1 (a `c` without a digit).
+//   * write mode `z`   -> the compressed container (cipher mode 2) at zlib
+//                         level 0 (a `z` without a digit).
+//   * write mode `zN`  -> zlib level N. The cipher mode stays what the `c`
+//                         key decided, so `zN` on its own does not select the
+//                         container.
+//   * neither `c` nor `z` -> plain UTF-16 text with a byte-order mark and no
+//                         container.
 //   * read mode `oN`   -> start reading at byte offset N.
 //
 // Text payload (`FE FE <mode>` crypt container):
@@ -36,6 +41,8 @@
 //   mode 2: five-byte header `FE FE 02 FF FE` (`:104-116`), then a zlib stream
 //           laid out as `[u64 compressed][u64 uncompressed]` followed by the
 //           compressed UTF-16LE bytes.
+//   plain text: the UTF-16LE byte-order mark `FF FE` followed by the UTF-16LE
+//           code units, with no container header.
 //
 // Paths: storage names (including `archive.xp3>member`) resolve through the
 // read callback the compat host installs; the local filesystem serves
@@ -243,17 +250,28 @@ static std::string resolve_path(const ttstr &name) {
 // Mode-string parsing
 // ---------------------------------------------------------------------------
 
-// The reference's `parseModeNumber` (BinaryStream.h): find `key` and, if it
-// is directly followed by 1..max_digits decimal digits, parse them. Returns
-// false when the key is absent or has no number — the caller applies the
-// default it wants (`o` -> 0, `c` -> 2/1, `z` -> mode 2).
-static bool parse_mode_number(const std::string &mode, char key, int max_digits,
-                              long long &out) {
+// The outcome of reading a mode number. The three cases are distinct
+// because the caller reacts to them differently: a key that is absent selects
+// the caller's default, while a key that is present without a number selects
+// another output form than a key with a number.
+enum class ModeNumber {
+    // The key is not in the mode string.
+    Absent,
+    // The key is in the mode string but is not followed by a digit.
+    NoNumber,
+    // The key is followed by a digit; the value is in `out`.
+    Value,
+};
+
+// Finds `key` and, when it is directly followed by 1..max_digits decimal
+// digits, parses them into `out`.
+static ModeNumber parse_mode_number(const std::string &mode, char key,
+                                     int max_digits, long long &out) {
     size_t pos = mode.find(key);
     if(pos == std::string::npos)
-        return false;
+        return ModeNumber::Absent;
     if(pos + 1 >= mode.size() || mode[pos + 1] < '0' || mode[pos + 1] > '9')
-        return false;
+        return ModeNumber::NoNumber;
     long long value = 0;
     size_t i = pos + 1;
     for(int n = 0; n < max_digits && i < mode.size() && mode[i] >= '0' &&
@@ -261,12 +279,15 @@ static bool parse_mode_number(const std::string &mode, char key, int max_digits,
         ++n, ++i)
         value = value * 10 + (mode[i] - '0');
     out = value;
-    return true;
+    return ModeNumber::Value;
 }
 
+// The byte offset the mode's `oN` selects. An `o` without a digit carries
+// no offset, so the file is written from its start.
 static long long mode_offset(const std::string &mode) {
     long long ofs = 0;
-    parse_mode_number(mode, 'o', 255, ofs);
+    if(parse_mode_number(mode, 'o', 255, ofs) != ModeNumber::Value)
+        return 0;
     return ofs;
 }
 
@@ -736,6 +757,15 @@ static bool has_foreign_media_prefix(const ttstr &name) {
         ttstr_from_utf8(ttstr_utf8(name) + " is unsupported cipher mode"));
 }
 
+// The mode-string error: the cipher mode a write mode selects is outside the
+// supported set {-1, 1, 2}. The message is the mode string complaint
+// ("<argument> is unsupported mode string") with "unsupported cipher mode"
+// as its argument.
+[[noreturn]] static void throw_unsupported_mode_string() {
+    throw TJS::eTJSError(
+        ttstr_from_utf8("unsupported cipher mode is unsupported mode string"));
+}
+
 // Read `name` through the installed storage callback.
 //
 // Returns true and fills `out` when the storage serves the entry. Returns
@@ -960,6 +990,53 @@ public:
 // Text write stream
 // ---------------------------------------------------------------------------
 
+// The output form a write mode selects.
+//
+// The cipher mode comes from the `c` key: its digit when the key carries
+// one, 1 when the key is present without a number, and -1 (no cipher) when
+// the key is absent. A `z` key that is present without a number selects the
+// compressed container (cipher mode 2). Any other cipher mode is an error.
+//
+// The compression level is the `z` number when the key carries one, the zlib
+// default when the key is absent, and 0 when the key is present without a
+// number.
+struct TextWriteFormat {
+    int crypt_mode;
+    int compression_level;
+};
+
+// Decides the output form of a text write stream from its mode string.
+static TextWriteFormat text_write_format(const std::string &mode) {
+    long long value = 0;
+    int crypt_mode = -1;
+    switch(parse_mode_number(mode, 'c', 1, value)) {
+        case ModeNumber::Absent:
+            crypt_mode = -1; // no cipher
+            break;
+        case ModeNumber::NoNumber:
+            crypt_mode = 1; // the simple cipher
+            break;
+        case ModeNumber::Value:
+            crypt_mode = (int)value;
+            break;
+    }
+    int compression_level = 0;
+    switch(parse_mode_number(mode, 'z', 1, value)) {
+        case ModeNumber::Absent:
+            compression_level = Z_DEFAULT_COMPRESSION;
+            break;
+        case ModeNumber::NoNumber:
+            crypt_mode = 2; // the compressed container
+            break;
+        case ModeNumber::Value:
+            compression_level = (int)value;
+            break;
+    }
+    if(crypt_mode != -1 && crypt_mode != 1 && crypt_mode != 2)
+        throw_unsupported_mode_string();
+    return {crypt_mode, compression_level};
+}
+
 class TextWriteStream : public TJS::iTJSTextWriteStream {
     static constexpr size_t COMPRESSION_BUFFER_SIZE = 1024 * 1024;
 
@@ -1045,7 +1122,7 @@ class TextWriteStream : public TJS::iTJSTextWriteStream {
 
 public:
     TextWriteStream(const std::string &path, const std::string &mode)
-        : crypt_mode(2), // default: zlib compressed (real KAG `"oN"` saves)
+        : crypt_mode(-1), // no cipher until the mode decides
           compression_level(Z_DEFAULT_COMPRESSION),
           zs(),
           zs_init(false),
@@ -1053,15 +1130,9 @@ public:
           finalized(false),
           compression_size_position(0),
           compression_buffer(COMPRESSION_BUFFER_SIZE) {
-        long long v = 0;
-        if(parse_mode_number(mode, 'c', 1, v))
-            crypt_mode = (int)v; // c0 / c1 / c2
-        if(parse_mode_number(mode, 'z', 1, v)) {
-            crypt_mode = 2; // zN -> zlib at level N
-            compression_level = (int)v;
-        }
-        if(crypt_mode < 0 || crypt_mode > 2)
-            crypt_mode = 2;
+        TextWriteFormat format = text_write_format(mode);
+        crypt_mode = format.crypt_mode;
+        compression_level = format.compression_level;
 
         long long ofs = mode_offset(mode);
         FileAccess access = text_write_access(mode);
@@ -1094,13 +1165,17 @@ public:
             compression_size_position = (int64_t)stream->GetPosition();
             write_u64le(*stream, 0);
             write_u64le(*stream, 0);
-        } else {
-            // Cipher modes 0/1: the three-byte signature `FE FE m` then the
+        } else if(crypt_mode == 1) {
+            // The simple cipher: the three-byte signature `FE FE 01` then the
             // UTF-16LE byte-order mark, so the reader's mandatory-BOM header
-            // matches. The reference writer emits the same 3-byte signature
-            // followed by the BOM.
-            uint8_t sig[5] = {0xFE, 0xFE, (uint8_t)crypt_mode, 0xFF, 0xFE};
+            // matches.
+            uint8_t sig[5] = {0xFE, 0xFE, 0x01, 0xFF, 0xFE};
             stream->WriteBuffer(sig, 5);
+        } else {
+            // Plain text: the UTF-16LE byte-order mark and no container
+            // header.
+            uint8_t bom[2] = {0xFF, 0xFE};
+            stream->WriteBuffer(bom, 2);
         }
     }
 
@@ -1119,12 +1194,8 @@ public:
         const tjs_char *src = targ.c_str();
         for(tjs_int i = 0; i < len; i++) {
             char16_t ch = (char16_t)src[i];
-            if(crypt_mode == 1) {
+            if(crypt_mode == 1)
                 ch = (char16_t)(((ch >> 1) & 0x5555) | ((ch << 1) & 0xaaaa));
-            } else if(crypt_mode == 0) {
-                if(ch >= 0x20)
-                    ch ^= (char16_t)(((ch & 0xfe) << 8) ^ 1);
-            }
             buf[(size_t)i] = ch;
         }
         write_raw(buf.data(), (size_t)len * sizeof(char16_t));

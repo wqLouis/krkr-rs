@@ -14,6 +14,16 @@
 //! The test writes a realistic payload through the built-in
 //! `Array.saveStruct`, then checks the container layout directly and decodes
 //! the zlib payload through the same reader the VM uses on load.
+//!
+//! The write mode selects the output form. `reference/cpp/core/base/BinaryStream.h:22-39`
+//! parses a mode number into an optional — a key that is absent yields the
+//! caller's default, a key that is present without a digit yields an empty
+//! optional, a key with a digit yields the number — and
+//! `reference/cpp/core/base/TextStream.cpp:245-258` turns that into the
+//! cipher mode: the `c` digit, 1 for a `c` without a number, -1 when `c` is
+//! absent, and the compressed container for a `z` without a number. A mode
+//! without `c` and without `z` therefore writes plain UTF-16LE text, which
+//! is the form a game save takes.
 
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::path::PathBuf;
@@ -215,6 +225,159 @@ fn builtin_save_struct_writes_the_reference_crypt_container() {
     assert_eq!(
         engine.eval("__restored[0][\"arr\"][1]", "restore").unwrap(),
         TjsValue::String("two".into())
+    );
+}
+
+/// The output form a write mode selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WrittenForm {
+    /// Plain UTF-16LE text with a byte-order mark and no container.
+    Plain,
+    /// The `FE FE 01 FF FE` cipher container.
+    Cipher,
+    /// The `FE FE 02 FF FE` compressed container.
+    Compressed,
+}
+
+/// Classifies the bytes a write produced.
+fn written_form(bytes: &[u8]) -> WrittenForm {
+    match bytes {
+        [0xFF, 0xFE, ..] => WrittenForm::Plain,
+        [0xFE, 0xFE, 0x01, ..] => WrittenForm::Cipher,
+        [0xFE, 0xFE, 0x02, ..] => WrittenForm::Compressed,
+        other => panic!("unexpected file header: {other:?}"),
+    }
+}
+
+/// The mode string selects the output form of a text write stream.
+///
+/// `reference/cpp/core/base/BinaryStream.h:22-39` — `parseModeNumber` returns
+/// an optional: a key that is absent yields the caller's default, a key that
+/// is present without a digit yields an empty optional, and a key with a digit
+/// yields the number.
+///
+/// `reference/cpp/core/base/TextStream.cpp:245-258` — the writer reads the
+/// cipher mode from the `c` key (its digit, 1 for a `c` without a number,
+/// -1 when the key is absent) and selects the compressed container (cipher
+/// mode 2) when a `z` key carries no number. The `z` number is the
+/// compression level; the cipher mode stays what the `c` key decided, so
+/// `zN` on its own leaves the text plain.
+///
+/// | mode   | cipher mode | output                      |
+/// |--------|-------------|-----------------------------|
+/// | `""`   | -1          | plain UTF-16LE text         |
+/// | `"z5"` | -1          | plain UTF-16LE text         |
+/// | `"c"`  | 1           | the simple cipher container |
+/// | `"c1"` | 1           | the simple cipher container |
+/// | `"c2"` | 2           | the compressed container    |
+/// | `"z"`  | 2           | the compressed container    |
+#[test]
+fn the_write_mode_selects_the_output_form() {
+    let _lock = vm_lock();
+    let engine = Tjs2Engine::new().unwrap();
+    for (mode, expected) in [
+        ("", WrittenForm::Plain),
+        ("w", WrittenForm::Plain),
+        ("z5", WrittenForm::Plain),
+        ("c", WrittenForm::Cipher),
+        ("c1", WrittenForm::Cipher),
+        ("c2", WrittenForm::Compressed),
+        ("z", WrittenForm::Compressed),
+    ] {
+        let path = temp_path(&format!("mode-{mode}"));
+        let path_lit = format!("{:?}", path.to_string_lossy());
+        engine
+            .exec_script(
+                &format!("{PAYLOAD_SCRIPT}temp.saveStruct({path_lit}, {mode:?});"),
+                "save_struct_mode",
+            )
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(written_form(&bytes), expected, "mode {mode:?}");
+    }
+}
+
+/// A cipher mode outside {-1, 1, 2} raises the mode-string error; the writer
+/// does not pick a mode of its own.
+///
+/// `reference/cpp/core/base/TextStream.cpp:256-258` — the cipher mode must be
+/// -1, 1 or 2, otherwise the writer raises the unsupported-mode-string error
+/// with "unsupported cipher mode" as its argument. The message format is
+/// "%1 is unsupported mode string" (`reference/cpp/core/base/MsgIntfInc.h:46`),
+/// so the raised message reads "unsupported cipher mode is unsupported mode
+/// string".
+#[test]
+fn an_unsupported_cipher_mode_raises() {
+    let _lock = vm_lock();
+    let engine = Tjs2Engine::new().unwrap();
+    for mode in ["c0", "c3"] {
+        let path = temp_path(&format!("raise-{mode}"));
+        let path_lit = format!("{:?}", path.to_string_lossy());
+        let error = engine
+            .exec_script(
+                &format!("{PAYLOAD_SCRIPT}temp.saveStruct({path_lit}, {mode:?});"),
+                "save_struct_raise",
+            )
+            .expect_err("an unsupported cipher mode must raise");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported cipher mode is unsupported mode string"),
+            "mode {mode:?}: {error}"
+        );
+        assert!(!path.exists(), "the file must not be created");
+    }
+}
+
+/// The plain form is the UTF-16LE text after a byte-order mark, and the
+/// reader decodes it.
+///
+/// `reference/cpp/core/base/TextStream.cpp:136-190` — a payload that does not
+/// start with the `FE FE` container signature is read as text, and the
+/// UTF-16LE byte-order mark selects the UTF-16 decoder.
+#[test]
+fn the_plain_form_is_the_utf16_text_and_round_trips() {
+    let _lock = vm_lock();
+    let engine = Tjs2Engine::new().unwrap();
+    let path = temp_path("plain");
+    let path_lit = format!("{:?}", path.to_string_lossy());
+
+    engine
+        .exec_script(
+            &format!("{PAYLOAD_SCRIPT}temp.saveStruct({path_lit}, \"\");"),
+            "save_struct_plain",
+        )
+        .unwrap();
+
+    let bytes = std::fs::read(&path).unwrap();
+    let text = decode_stream(&path, "");
+    let _ = std::fs::remove_file(&path);
+
+    // The byte-order mark and nothing else precedes the text.
+    assert_eq!(
+        &bytes[..2],
+        &[0xFF, 0xFE],
+        "the plain form starts with the UTF-16LE byte-order mark"
+    );
+    let expected: Vec<u8> = text
+        .encode_utf16()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect();
+    assert_eq!(
+        &bytes[2..],
+        expected.as_slice(),
+        "the plain form is the UTF-16LE text after the byte-order mark"
+    );
+
+    // The reader hands the same struct back.
+    assert!(
+        text.starts_with("(const) [\r\n"),
+        "unexpected struct: {text:?}"
+    );
+    assert!(
+        text.contains("\"integer\" => 42"),
+        "missing integer: {text:?}"
     );
 }
 
