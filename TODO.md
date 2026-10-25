@@ -142,9 +142,7 @@ native OS popup would be a deliberate divergence, and Linux has nothing to call
 * **M3 (P2, deferred until the Rust TJS VM)** the window-close handshake is
   not wired: `onCloseQuery` is a no-op and `CloseRequested` exits before the
   script close hook runs, so the title Continue/suspend save is never written.
-  Wiring it also exposes the exit-time heap corruption in the vendored TJS
-  teardown (`free(): chunks in smallbin corrupted`; §13), so the close/save/exit
-  chain is deferred with the VM replacement.
+  The close/save/exit chain is deferred with the VM replacement.
 * **M5 (P2)** `getVisBuffer` reads the decoded source, not the device ring
   (`natives/sound.rs`); a positive `sampleAhead` past the decoded end yields
   silence where the reference reads the ring (`ahead = 0` is exact).
@@ -403,10 +401,10 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
 
 ## 13. GPU memory
 
-Open: the config-cycle growth is explained; the fixed descriptor pool and the
-exit-time heap corruption are not. Symptom (windowed Vulkan, real title, after a
-while of play): `failed to upload N bitmap(s): out of GPU memory: failed to
-allocate a texture descriptor set`, every frame.
+Open: the config-cycle growth is explained; the fixed descriptor pool is not.
+Symptom (windowed Vulkan, real title, after a while of play): `failed to upload
+N bitmap(s): out of GPU memory: failed to allocate a texture descriptor set`,
+every frame.
 
 1. Grow or size the Vulkan descriptor pool from the live texture count instead
    of the fixed cap (`create_descriptor_pool`,
@@ -414,41 +412,7 @@ allocate a texture descriptor set`, every frame.
    reference's bound. It exhausts past 1024 live textures or when a texture is
    dropped without `destroy`: a hard cap, not a cache limit, and
    `System.graphicCacheLimit` bounds no layers.
-2. Fix the exit-time `free(): chunks in smallbin corrupted` abort; it reproduces
-   on a no-config title run, so it is independent of layer count and caching.
-   Audit the compat-context/FFI release order at teardown.
-   **The aborting frame is known.** A batch gdb run of the real title
-   (`target/debug/krkr --headless --frames 60 --base-dir <the title>`) aborts
-   inside `TJSVS_free` (`crates/tjs/cpp/tjs2/tjsVariantString.cpp:101`) called
-   from `TJSDeallocStringHeap` (`:417`), releasing the `ttstr` member of a
-   `tTJSObjectHashMapRecord` (`tjsDebug.cpp:94`) that the object hash map drops
-   while the last reference to a script object dies. The released record holds
-   a **short** string (it lives in the inline `ShortString` buffer) while the
-   `LongString` pointer slot holds a pointer built out of those bytes, so
-   `free((char*)buf - sizeof(size_t))` frees a non-heap pointer. The vendored
-   `tjsVariantString.cpp` and `tjsDebug.cpp` are byte-identical to the
-   reference, so the corrupting write is upstream of them: the `ttstr` copy
-   path (`tjsString.h`/`tjsString.cpp`) or our ABI layer
-   (`crates/tjs/cpp/tjs2_abi.cpp`). The abort is a **teardown** fault: it
-   fires at any frame count, survives deleting the whole `savedata/`
-   directory, and does not happen with another title, so the corruption is
-   introduced during the game's own script work and only surfaces at the
-   final free.
-   **The debug build's abort site is a debug-only facility, and the release
-   build aborts through a different path.** `TJSEnableDebugMode` is true only
-   under `_DEBUG` (`crates/tjs/cpp/tjs2/tjs.cpp:64-69`, the reference is
-   byte-identical), and `crates/tjs/build.rs:520-530` defines `_DEBUG` only
-   for the dev profile. The object hash map that holds the damaged record is
-   created only under that flag (`tjs.cpp:115-118`), and
-   `TJSAddObjectHashRecord` returns at once when it is absent
-   (`tjsDebug.cpp:396-399`). So the release binary never executes that path,
-   yet **the release binary aborts with the same message** — there are two
-   corruptions, and the release-reachable one is the one that matters: it is
-   what the shipped binary does, and therefore the likelier cause of the
-   device death. The dev profile also turns on a facility the reference never
-   runs in a shipped build; the full list of `_DEBUG`/`DEBUG` gates in the
-   vendored tree is small (13 sites) and should be reviewed.
-3. Keep the overlay object counters (windows/layers/bitmaps/fonts/textures) as
+2. Keep the overlay object counters (windows/layers/bitmaps/fonts/textures) as
    regression evidence; descriptor-set and `ObjectRegistry` counts are missing.
 
 ## 14. Android
