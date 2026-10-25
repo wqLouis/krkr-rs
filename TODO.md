@@ -417,6 +417,23 @@ allocate a texture descriptor set`, every frame.
 2. Fix the exit-time `free(): chunks in smallbin corrupted` abort; it reproduces
    on a no-config title run, so it is independent of layer count and caching.
    Audit the compat-context/FFI release order at teardown.
+   **The aborting frame is known.** A batch gdb run of the real title
+   (`target/debug/krkr --headless --frames 60 --base-dir <the title>`) aborts
+   inside `TJSVS_free` (`crates/tjs/cpp/tjs2/tjsVariantString.cpp:101`) called
+   from `TJSDeallocStringHeap` (`:417`), releasing the `ttstr` member of a
+   `tTJSObjectHashMapRecord` (`tjsDebug.cpp:94`) that the object hash map drops
+   while the last reference to a script object dies. The released record holds
+   a **short** string (it lives in the inline `ShortString` buffer) while the
+   `LongString` pointer slot holds a pointer built out of those bytes, so
+   `free((char*)buf - sizeof(size_t))` frees a non-heap pointer. The vendored
+   `tjsVariantString.cpp` and `tjsDebug.cpp` are byte-identical to the
+   reference, so the corrupting write is upstream of them: the `ttstr` copy
+   path (`tjsString.h`/`tjsString.cpp`) or our ABI layer
+   (`crates/tjs/cpp/tjs2_abi.cpp`). The abort is a **teardown** fault: it
+   fires at any frame count, survives deleting the whole `savedata/`
+   directory, and does not happen with another title, so the corruption is
+   introduced during the game's own script work and only surfaces at the
+   final free.
 3. Keep the overlay object counters (windows/layers/bitmaps/fonts/textures) as
    regression evidence; descriptor-set and `ObjectRegistry` counts are missing.
 
@@ -442,6 +459,21 @@ run on a machine that has one; anything not compiled is documented as unverified
 * **PSB/PSD L1 crate on Android.** `forkunion` has a C++ core; the host build
   compiles, but the aarch64 Android build and run are unverified. If it fails,
   use `forkunion`'s `portable` feature and record the result.
+* **A device launch can die with no report in the engine log.** On a
+  device, four launches of one title ended with the app process gone a few
+  seconds after the game Activity started: the launcher's log shows the
+  launcher Activity being recreated, the engine's log stops mid-startup, and
+  the state file is left at `starting` with a dead pid. There is no Rust
+  error, no panic message and no `failed` state, so the process died outside
+  the engine's error paths: a native abort or a system kill. The engine log
+  cannot say which, because a native abort leaves no trace in it. The
+  launcher now reads Android's record of why the process ended
+  (`ApplicationExitInfo`) and names the reason, and the engine writes a
+  failure when a panic unwinds out of the entry point, so the next occurrence
+  is diagnosable. **Open: the underlying death is not root-caused.** The
+  decisive artefact is the device's own crash record (`adb logcat -b crash`,
+  or `dumpsys dropbox data_app_native_crash`), which names the faulting
+  library; the engine's log cannot.
 * **Platform and launcher gaps.** Nothing handles audio focus, pause/resume or
   losing focus, and surface recreation restarts the game from scratch
   (`docs.old/audits/android-jni-review.md` F5). No drift guard exists between the
