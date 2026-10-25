@@ -359,6 +359,38 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   the title animation plays; no motion `dt` clamp was needed. `perf record` is
   blocked on this host by `kernel.perf_event_paranoid=2` (software `perf stat`
   works); gprofng works and is what the timings above come from.
+* **The title-entry animation is static: the title background never advances.**
+  The title background (`title_bg.mtn`, `chara:"title_bg"`, `motion:"title"`,
+  registered in `envinit.tjs`) is a static image in our run while the
+  reference animates it. The mechanism is in the game's own script, and it is
+  now read out of the bytecode:
+  `system/affinesourcemotion.tjs` keeps `_innerStorage` on the **class**, and
+  a TJS2 script class copies its member table into every instance, so
+  `_innerStorage` is shared by every `AffineSourceMotion`. The **first**
+  load of a `.mtn` takes the animating `"emote"` mode (its
+  `Motion.Player.progress(delta)` gets a real delta); a load whose storage
+  already equals the class's `_innerStorage` takes the reload branch and the
+  static `"motion"` mode, where the game calls `progress(0)`.
+  `AffineSourceMotion.clone()` calls `_loadImages(this._innerStorage)` on the
+  new instance, so **every clone of a motion source is static** — and the
+  world's `getImageSource(data, owner)` clones an existing source whenever an
+  env layer's `_image.dynamicsource.filename` equals `data.storage`, instead
+  of creating a fresh one. Our run reaches the clone path and the reference
+  does not.
+  **The motion player is not at fault**: driven directly from a script probe,
+  `Motion.ResourceManager.load("title_bg.mtn")` -> `Motion.Player.play("title")`
+  -> `progress(16)` + `draw(layer)` changes the sampled pixel every frame.
+  **Open:** which env layer supplies the clone, and why it is registered before
+  the title's own source is created — the game uses the key `"title_bg"` both
+  for the stage object (`class:"event"`) and for the motion config, so the
+  ORDER in which the env objects and their layers are created decides which
+  one gets the fresh source and which gets the clone. Also open: the world's
+  per-frame update (`world.updateAll`/`updateSource`/`refresh`) is never
+  called in our run, so the `onPaint` chain that reaches
+  `AffineSourceMotion.drawAffine`
+  (`reference/cpp/core/visual/LayerIntf.cpp:6394-6405`) is dead here; and
+  `sysscn/gfx_motion.tjs`, the game's only per-frame caller of
+  `Motion.Player.progress(dt)` with a real delta, is never loaded in our run.
 * **The `Layer`/`layer_ex` affine paths now honour the destination clip.** The
   reference passes the clip into the blit —
   `MainImage->AffineBlt(ClipRect, …)` (`reference/cpp/core/visual/
