@@ -104,6 +104,29 @@ residuals:
   '/', '\\' or '>'; got …"`; the reference raises
   `TVPMissingPathDelimiterAtLast` = `"Use path delimiter '>' or '/'"`
   (`MsgIntfInc.h:32`) — script-observable.
+* **`Layer.face` is one value, not the reference's two faces.** The reference
+  keeps an outward face and an actual draw face: `Face` and `DrawFace`, with
+  `SetFace` storing the outward value and calling `UpdateDrawFace()` to
+  resolve the actual one (`LayerIntf.h:738-750`, `LayerIntf.h:352`). The
+  outward face defaults to `dfAuto` and the resolution table maps the layer's
+  display type onto `dfOpaque`/`dfAlpha`/`dfAddAlpha`
+  (`LayerIntf.cpp:371`, `LayerIntf.cpp:1525-1600`; the values are
+  `tTVPDrawFace`, `LayerIntf.h:59-70`, also listed at
+  `ScriptMgnIntf.cpp:75`). The face then selects the blend *method* together
+  with the operation mode: `omAlpha`/`omAddAlpha`/`omOpaque` ×
+  `dfAlpha`/`dfAddAlpha`/`dfOpaque` pick `bmAlphaOnAlpha`,
+  `bmAlphaOnAddAlpha`, `bmAlpha`, `bmAddAlphaOnAlpha`,
+  `bmAddAlphaOnAddAlpha`, `bmAddAlpha`, `bmCopyOnAlpha`,
+  `bmCopyOnAddAlpha` and `bmCopy` (`ImageFunction.cpp:78-130`).
+  Ours stores a single `face: i32` that defaults to `0`
+  (`engine/src/scene.rs`, `LayerState::face`) and the steady-state
+  projection always draws the main image; only `dfMask`/`dfProvince` reach
+  the subtree path (`engine/src/layer_ops.rs`, `subtree_source`). So
+  `Layer.face` returns `0` where the reference returns `128` (`dfAuto`),
+  `dfAuto` and `dfAddAlpha` are inert, and an explicit `dfOpaque` does not
+  change the blend. Closing this needs the engine's blend dispatcher to carry
+  the "on alpha" and "on add alpha" variants; until then the divergence is
+  observable whenever a script sets the face explicitly or reads the property.
 
 ## 5. Dialogs and popups
 
