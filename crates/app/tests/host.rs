@@ -296,7 +296,8 @@ fn selfupdate_transition_advances_when_projection_draws_it() {
         .expect("start self-update transition");
 
     for _ in 0..8 {
-        game.step(&InjectedFrameTime::new(16.0), &[]).expect("frame");
+        game.step(&InjectedFrameTime::new(16.0), &[])
+            .expect("frame");
     }
     assert_eq!(
         eval_int(game.vm(), "hits"),

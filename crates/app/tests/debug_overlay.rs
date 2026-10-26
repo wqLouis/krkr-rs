@@ -39,7 +39,11 @@ fn overlay_node_present_only_when_enabled() {
 fn overlay_texture_is_uploaded_before_it_is_drawn() {
     let config = HostConfig::headless().with_debug_overlay(true);
     let mut host = Host::new(config).expect("headless host");
-    let stats = host.step(&InjectedFrameTime::new(16.0)).expect("step").stats.expect("null stats");
+    let stats = host
+        .step(&InjectedFrameTime::new(16.0))
+        .expect("step")
+        .stats
+        .expect("null stats");
     assert_eq!(stats.texture_draws, 1);
     assert_eq!(stats.missing_textures, 0);
 }
