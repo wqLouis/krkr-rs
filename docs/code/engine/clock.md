@@ -77,7 +77,7 @@ impl FrameTimeSource for InjectedFrameTime {
 | item | behaviour |
 |---|---|
 | `FrameTimeSource` | the trait the frame's elapsed time comes through; `elapsed_ms()` is the milliseconds since the previous frame |
-| `InjectedFrameTime` | the value the caller injects; the windowed loop writes the real time the platform measured into it, the headless runner writes the frame period it simulates |
+| `InjectedFrameTime` | the value the caller injects; the windowed loop writes the real time the platform measured into it, the headless runner writes the time it measured between its frames |
 
 | method | behaviour |
 |---|---|

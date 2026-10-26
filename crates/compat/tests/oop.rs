@@ -342,6 +342,17 @@ fn script_override_wins_over_native_on_timer() {
     );
 
     // And through the real frame path: arm the timer and poll.
+    // The harness's poll advances 16 ms and the timer's interval is 1 ms,
+    // so the registry replays the sixteen intervals the frame covered: the
+    // timer fires sixteen times and the capacity bounds the postings still
+    // outstanding for it, so the script sees six of them.
+    //
+    // reference/cpp/core/utils/impl/TimerImpl.cpp:118-148 — the catch-up
+    // count is n = (curtick - NextTick) / Interval + 1.
+    // reference/cpp/core/utils/TimerIntf.cpp:69-111 — `Fire(n)` posts
+    // min(n, cap - count) events.
+    // reference/cpp/core/utils/TimerIntf.cpp:17,32 — the default capacity is
+    // TVP_DEFAULT_TIMER_CAPACITY = 6.
     env.run("ot.interval = 1; ot.enabled = true;");
     assert_eq!(
         env.eval_int("ot.enabled"),
@@ -349,9 +360,11 @@ fn script_override_wins_over_native_on_timer() {
         "arming must reach the native"
     );
     env.poll_until("fires >= 2", 500);
+    // One "S" from the dispatch above and six from the poll: the poll
+    // delivers the capacity's worth of postings.
     assert_eq!(
         env.eval_ok("log"),
-        TjsValue::String("SS".into()),
+        TjsValue::String("SSSSSSS".into()),
         "every timer_poll dispatch must run the script override, never the \
          native base method or the constructor callback"
     );

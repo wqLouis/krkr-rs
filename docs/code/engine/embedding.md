@@ -194,7 +194,7 @@ pub trait FrameTimeSource {
 `engine::InjectedFrameTime` is the built-in implementation: a public
 `elapsed_ms` field the host writes before every frame. The windowed loop in
 this repository writes the real time the platform measured; the headless
-runner writes the frame period it simulates.
+runner writes the time it measured between its frames.
 
 ### What this repository's own platform crate does
 

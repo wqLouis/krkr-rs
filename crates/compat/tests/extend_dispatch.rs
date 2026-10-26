@@ -198,6 +198,18 @@ impl Env {
 /// reach the *script override* (not the native `Timer::onTimer`), through the
 /// **subclass instance** retained as `objthis` in the native constructor, and
 /// the override must be able to call back into the stored owner.
+///
+/// The harness's poll advances 16 ms and the timer's interval is 1 ms, so
+/// the registry replays the sixteen intervals the frame covered: the timer
+/// fires sixteen times and the capacity bounds the `onTimer` postings still
+/// outstanding for it, so the script sees six of them.
+///
+/// reference/cpp/core/utils/impl/TimerImpl.cpp:118-148 — the catch-up count
+/// is n = (curtick - NextTick) / Interval + 1.
+/// reference/cpp/core/utils/TimerIntf.cpp:69-111 — `Fire(n)` posts
+/// min(n, cap - count) events.
+/// reference/cpp/core/utils/TimerIntf.cpp:17,32 — the default capacity is
+/// TVP_DEFAULT_TIMER_CAPACITY = 6.
 #[test]
 fn timer_subclass_override_wins_over_the_native_on_timer() {
     let _lock = vm_lock();
@@ -225,14 +237,14 @@ fn timer_subclass_override_wins_over_the_native_on_timer() {
 
     assert_eq!(
         env.eval_int("hits"),
-        1,
+        6,
         "the script subclass `onTimer` must run instead of the native Timer::onTimer"
     );
     assert_eq!(
         env.eval_int("cb"),
-        1,
-        "the owner stored by the subclass runs exactly once (once via the override, \
-         never additionally via the native ctor-callback path)"
+        6,
+        "the owner stored by the subclass runs once per posting (once via the \
+         override, never additionally via the native ctor-callback path)"
     );
     assert_eq!(
         env.eval_int("ends"),
@@ -245,6 +257,18 @@ fn timer_subclass_override_wins_over_the_native_on_timer() {
 /// A subclass that does *not* override `onTimer` keeps the reference
 /// behaviour: the member lookup falls through to the native `Timer::onTimer`,
 /// which invokes the callback retained by `super.Timer(...)`.
+///
+/// The harness's poll advances 16 ms and the timer's interval is 1 ms, so
+/// the registry replays the sixteen intervals the frame covered: the timer
+/// fires sixteen times and the capacity bounds the `onTimer` postings still
+/// outstanding for it, so the script sees six of them.
+///
+/// reference/cpp/core/utils/impl/TimerImpl.cpp:118-148 — the catch-up count
+/// is n = (curtick - NextTick) / Interval + 1.
+/// reference/cpp/core/utils/TimerIntf.cpp:69-111 — `Fire(n)` posts
+/// min(n, cap - count) events.
+/// reference/cpp/core/utils/TimerIntf.cpp:17,32 — the default capacity is
+/// TVP_DEFAULT_TIMER_CAPACITY = 6.
 #[test]
 fn timer_subclass_without_an_override_reaches_the_native_ctor_callback() {
     let _lock = vm_lock();
@@ -260,7 +284,7 @@ fn timer_subclass_without_an_override_reaches_the_native_ctor_callback() {
     env.poll_timer();
     assert_eq!(
         env.eval_int("n"),
-        1,
+        6,
         "the native onTimer invokes the ctor callback"
     );
     assert_eq!(
@@ -434,6 +458,18 @@ fn timer_capacity_zero_is_the_reference_no_limit_sentinel() {
 /// retained `objthis` (reference `tTJSNI_BaseTimer::Invalidate` cancels the
 /// events and drops `Owner`/`ActionOwner`), while the native payload stays
 /// coherent until the object is destroyed (`timer_destroy` ordering).
+///
+/// The harness's poll advances 16 ms and the timer's interval is 1 ms, so
+/// the registry replays the sixteen intervals the frame covered: the timer
+/// fires sixteen times and the capacity bounds the `onTimer` postings still
+/// outstanding for it, so the script sees six of them.
+///
+/// reference/cpp/core/utils/impl/TimerImpl.cpp:118-148 — the catch-up count
+/// is n = (curtick - NextTick) / Interval + 1.
+/// reference/cpp/core/utils/TimerIntf.cpp:69-111 — `Fire(n)` posts
+/// min(n, cap - count) events.
+/// reference/cpp/core/utils/TimerIntf.cpp:17,32 — the default capacity is
+/// TVP_DEFAULT_TIMER_CAPACITY = 6.
 #[test]
 fn timer_invalidate_stops_the_dispatch_and_reports_not_valid() {
     let _lock = vm_lock();
@@ -448,7 +484,7 @@ fn timer_invalidate_stops_the_dispatch_and_reports_not_valid() {
          it.enabled = 1;",
     );
     env.poll_timer();
-    assert_eq!(env.eval_int("hits"), 1);
+    assert_eq!(env.eval_int("hits"), 6);
 
     env.run("invalidate it;");
     assert_eq!(
@@ -460,7 +496,7 @@ fn timer_invalidate_stops_the_dispatch_and_reports_not_valid() {
     env.poll_timer();
     assert_eq!(
         env.eval_int("hits"),
-        1,
+        6,
         "an invalidated timer must not dispatch anymore"
     );
     // The payload survived the invalidate (released only by destroy): the VM
@@ -508,6 +544,18 @@ fn timer_callback_invalidate_stops_further_fires() {
 /// poll must cancel its fire (reference `SetEnabled(false)` cancels the
 /// queued event, `TimerImpl.cpp:277-281`). Due timers dispatch in id order,
 /// so the first timer disables the second.
+///
+/// The harness's poll advances 16 ms and the timer's interval is 1 ms, so
+/// the registry replays the sixteen intervals the frame covered: the timer
+/// fires sixteen times and the capacity bounds the `onTimer` postings still
+/// outstanding for it, so the script sees six of them.
+///
+/// reference/cpp/core/utils/impl/TimerImpl.cpp:118-148 — the catch-up count
+/// is n = (curtick - NextTick) / Interval + 1.
+/// reference/cpp/core/utils/TimerIntf.cpp:69-111 — `Fire(n)` posts
+/// min(n, cap - count) events.
+/// reference/cpp/core/utils/TimerIntf.cpp:17,32 — the default capacity is
+/// TVP_DEFAULT_TIMER_CAPACITY = 6.
 #[test]
 fn timer_peer_disabled_mid_dispatch_is_cancelled() {
     let _lock = vm_lock();
@@ -516,14 +564,14 @@ fn timer_peer_disabled_mid_dispatch_is_cancelled() {
         "var na = 0; var nb = 0; \n         var ta = new Timer(function(){ na++; tb.enabled = 0; }, ''); \n         ta.interval = 1; \n         var tb = new Timer(function(){ nb++; }, ''); \n         tb.interval = 1; \n         ta.enabled = 1; tb.enabled = 1;",
     );
     env.poll_timer();
-    assert_eq!(env.eval_int("na"), 1, "the first timer fired");
+    assert_eq!(env.eval_int("na"), 6, "the first timer fired");
     assert_eq!(
         env.eval_int("nb"),
         0,
         "the peer-disabled timer must not fire in the same round"
     );
     env.poll_timer();
-    assert_eq!(env.eval_int("na"), 2, "the first timer keeps repeating");
+    assert_eq!(env.eval_int("na"), 12, "the first timer keeps repeating");
     assert_eq!(env.eval_int("nb"), 0, "the disabled timer stays off");
 }
 

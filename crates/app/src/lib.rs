@@ -47,7 +47,7 @@ use render::{
 pub(crate) use audio::install_audio_decoder_metered;
 // The clock source the composition roots inject the frame's elapsed time
 // into: the windowed loop writes the real time the platform measured, the
-// headless runner writes the frame period it simulates.
+// headless runner writes the time it measured between its frames.
 pub use engine::{FrameTimeSource, InjectedFrameTime};
 pub use game::{GameError, GameHost};
 pub use image_codec::install_image_codec;

@@ -1599,10 +1599,19 @@ fn engine_driven_fire_delivers_type_target_and_this() {
          probeTimer.interval = 10; \
          probeTimer.enabled = true;",
     );
+    // The frame lands 20 ms past the timer's first deadline (10 ms): the
+    // registry replays the two intervals it missed together with the one
+    // that was due, so the timer fires three times and the script sees
+    // three invocations (the capacity of six does not bite).
+    //
+    // reference/cpp/core/utils/impl/TimerImpl.cpp:118-148 — the catch-up
+    // count is n = (curtick - NextTick) / Interval + 1.
+    // reference/cpp/core/utils/TimerIntf.cpp:69-111 — `Fire(n)` posts
+    // min(n, cap - count) events.
     env.advance(30);
     env.poll();
 
-    check(&mut problems, "action invocations", env.eval_int("hits"), 1);
+    check(&mut problems, "action invocations", env.eval_int("hits"), 3);
     check(
         &mut problems,
         "event `type`",
@@ -1650,6 +1659,13 @@ fn engine_driven_fire_is_delivered_exclusive_before_idle() {
          idleTimer.enabled = true; \
          exclusiveTimer.enabled = true;",
     );
+    // The frame lands 20 ms past the timers' first deadline (10 ms): each
+    // timer fires three times (the two intervals it missed and the one
+    // that was due), so the queue holds three postings per timer and the
+    // capacity of six does not bite.
+    //
+    // reference/cpp/core/utils/impl/TimerImpl.cpp:118-148 — the catch-up
+    // count is n = (curtick - NextTick) / Interval + 1.
     env.advance(30);
     env.poll();
 
@@ -1663,6 +1679,18 @@ fn engine_driven_fire_is_delivered_exclusive_before_idle() {
         &mut problems,
         "second delivered event",
         env.eval_ok("order[1]"),
+        TjsValue::String("exclusive".into()),
+    );
+    check(
+        &mut problems,
+        "third delivered event",
+        env.eval_ok("order[2]"),
+        TjsValue::String("exclusive".into()),
+    );
+    check(
+        &mut problems,
+        "fourth delivered event",
+        env.eval_ok("order[3]"),
         TjsValue::String("idle".into()),
     );
 

@@ -13,6 +13,12 @@ from the injected now, and keeps re-arming until it is removed or disabled.
 There is no one-shot mode, no fire budget and no suppression flag — L2's only
 job is "wait, then call".
 
+A frame that took longer than the timer's interval **replays the intervals it
+missed**: the timer fires once per elapsed interval and its next deadline
+continues the schedule it missed, so the timer keeps its place in the
+schedule instead of drifting with the frame rate
+(`reference/cpp/core/utils/impl/TimerImpl.cpp:118-148`).
+
 Whether a timer is armed *at all* is L3's decision: the reference's "armed
 and enabled yet never posts" shapes — a negative capacity, a non-positive
 interval — are expressed by L3 simply not arming the timer.
@@ -23,7 +29,7 @@ interval — are expressed by L3 simply not arming the timer.
 
 * Register a repeating callback with an interval.
 * Arm, disarm, reschedule and remove timers.
-* Deliver the due callbacks in creation order, exactly once per advance.
+* Deliver the due callbacks in creation order, once per elapsed interval.
 * Stay consistent when a callback re-enters the registry or panics.
 
 ---
@@ -109,10 +115,11 @@ handle the host attached. The delivery is therefore structured as three
 phases:
 
 1. **Collect first.** Every due timer is collected in creation order and
-   re-armed from `now_ms` *before* any callback runs. No phase iterates a
-   collection it is mutating, a late frame fires exactly once (no catch-up
-   burst), and a nested `advance` can never deliver the same timer twice in
-   one round.
+   re-armed *before* any callback runs. No phase iterates a collection it is
+   mutating, and a nested `advance` can never deliver the same timer twice
+   in one round. A timer that missed intervals fires once per missed interval
+   and is re-armed from the deadline it missed, so a late frame replays the
+   intervals it lost instead of making the schedule drift.
 2. **Then invoke.** The callback box is *taken out* of the entry before the
    call, so the entry is plain registry state while the callback runs. A
    collected timer fires only if its schedule is untouched since collection:
@@ -132,8 +139,13 @@ and dropped entirely within one callback invocation, strictly sequential with
 
 ## 6. Invariants
 
-* **A timer fires at most once per advance** and is re-armed from `now_ms`,
-  so a late frame does not burst catch-up fires.
+* **A timer fires once per elapsed interval.** A timer whose deadline
+  passed by `n` intervals fires `n + 1` times in that advance — the missed
+  intervals are replayed — and its next deadline is the deadline it missed
+  plus the intervals it fired, so the schedule does not drift. A backlog of
+  more than 40 intervals is discarded: the timer fires once and re-arms from
+  the injected now
+  (`reference/cpp/core/utils/impl/TimerImpl.cpp:118-148`).
 * **A timer whose schedule was mutated between collection and delivery is
   skipped** — the mutation cancelled its pending fire. A timer removed
   mid-round has no entry left to invoke.
@@ -158,7 +170,8 @@ Engine::frame(now_ms)
    │
    ▼
 timer::deliver_due(&mut timer, now_ms)
-   ├─ collect the due timers in creation order, re-armed from now_ms
+   ├─ collect the due timers in creation order, re-armed from the deadline
+   │  they missed (one fire per missed interval, up to the cap)
    └─ invoke each callback with its TimerId
           │
           ▼

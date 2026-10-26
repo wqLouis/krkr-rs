@@ -91,9 +91,9 @@ impl Engine {
 
 * `run(clock, …)` is the loop-level entry point: the caller chooses **where**
   the elapsed time comes from — the windowed loop injects the real time the
-  platform measured, the headless runner injects the frame period it
-  simulates — and the engine adds it to its own clock. Every timeline the
-  frame derives comes from that one value.
+  platform measured, the headless runner injects the time it measured
+  between its frames — and the engine adds it to its own clock. Every timeline
+  the frame derives comes from that one value.
 * `frame(now_ms, …)` **sets** the clock exactly, discarding any fractional
   remainder left by an earlier `step`; the delta handed to the hook is the
   distance from the previous frame's clock (zero on the first frame), so a

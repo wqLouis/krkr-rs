@@ -194,10 +194,16 @@ fn step_keeps_the_fractional_millisecond_across_frames() {
         last.elapsed_ms
     );
     assert_eq!(last.frame_index, 60);
+    // The timer fires once per elapsed interval, so the sixty frames —
+    // 996 ms — reach the deadlines 16, 32, ... 992: sixty-two of them.
+    //
+    // reference/cpp/core/utils/impl/TimerImpl.cpp:118-148 — the timer fires
+    // once for every interval the clock passed, and re-arms from the deadline
+    // it missed.
     assert_eq!(
         fired.get(),
-        60,
-        "a 16 ms timer fires on every 16.6 ms frame"
+        62,
+        "a 16 ms timer fires once per elapsed interval over 996 ms"
     );
     assert_eq!(engine.elapsed_ms(), last.elapsed_ms);
 }
@@ -680,10 +686,16 @@ fn a_skipped_frame_still_runs_the_hook_and_its_due_timers() {
     engine.scene_mut().layer_mut(primary).expect("primary").rect = Rect::new(0, 0, 100, 100);
     let presented = engine.step(16.0, &mut hooks).expect("frame");
     assert!(presented.presented, "the draw resumes once a size fits");
+    // The second frame lands at 32 ms, and the timer's deadline is the
+    // 20 ms it missed: it fires for that deadline and for the one at 30 ms,
+    // so it fires twice more and the total is three.
+    //
+    // reference/cpp/core/utils/impl/TimerImpl.cpp:118-148 — the catch-up
+    // count is n = (curtick - NextTick) / Interval + 1.
     assert_eq!(
         fired.get(),
-        2,
-        "the timer fired again on the presented frame"
+        3,
+        "the timer replayed the intervals it missed on the presented frame"
     );
     assert_eq!(presented.frame_index, 2);
 }

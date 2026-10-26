@@ -881,21 +881,26 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   the title animation plays; no motion `dt` clamp was needed. `perf record` is
   blocked on this host by `kernel.perf_event_paranoid=2` (software `perf stat`
   works); gprofng works and is what the timings above come from.
-* **The title's background animation is computed but never reaches the
-  screen.**
-  * **The environment layer holds a 1x1 image on a 0x0 rectangle.** A
-    13 000-frame probe of the layer tree at the title found the last change
-    of any kind at frame 3266 and no change at all in the ~8 700 frames after
-    it. The environment layer named `title_bg` - the one thing that animates
-    during the two-second intro - holds a 1x1 image on a 0x0 rectangle, so
-    its single pixel changes every frame and none of it reaches the screen.
-    With the game's static branch forced (`enableSceneAnimEffect = false`,
-    `custom.ks:*title_start`) the same layer holds a 32x32 white placeholder
-    on a 0x0 rectangle, and the title art (`title_bg.png`, a 1920x1080 WebP
-    in `data1080.xp3`) is in no layer's image at the title. The size is lost
-    in the env-image/affine path, not in the presentation path: the dirty
-    signal is sound, since every pixel write arms both the upload and the
-    scene change.
+* **The title's background animation is fixed; what the reference shows
+  after the two-second intro is not established.**
+  * **The motion player did not give the target layer the size of the canvas
+    it draws into.** The environment layer the title's motion paints into
+    (`title_bg`) has an empty rectangle, and a layer with an empty rectangle
+    draws nothing at all, so the pose the player computed into the layer's
+    image never reached the screen. The layer's rectangle and image are the
+    game's own script-set members, and the reference reports the same
+    script-visible values, so the layer is what it is and the player owes it
+    the canvas size. The reference asks the target layer for the size of the
+    canvas it is drawn into — the layer's own rectangle, and its image when
+    that rectangle is empty
+    (`reference/cpp/plugins/motionplayer/PlayerRenderInternal.cpp:346-361`) —
+    and gives the layer that size before the pose is drawn
+    (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:1126-1131`).
+    **Fixed:** the motion player now hands the target layer the size of the
+    canvas it draws into before the pose is drawn, and clips the pose to that
+    canvas (`crates/compat/src/natives/plugins/motion_player/player.rs`); the
+    behaviour test (`crates/compat/tests/env_image.rs`) pins the canvas size
+    the target layer keeps.
   * **The engine had two clocks and the game read the wrong one.**
     `System.getTickCount()` returned a wall clock while the engine owns the
     frame clock, and the game's Conductor schedules its next timer tick from
@@ -908,8 +913,6 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
     every frame of the motion changes the layer's pixels, and only the frame
     after the clip's end repeats — the asset's own one-shot behaviour, which
     the reference shares (`title_bg.mtn`'s `title` clip carries `loopTime -1`).
-    That layer holds a 1x1 image on a 0x0 rectangle, so the computed motion
-    does not reach the screen (the bullet above).
   * **What is displayed AFTER the two-second intro may still differ.** The
     game's `custom.ks:*title_start` has two branches — the last `.mtn` frame
     and the `title_bg.png` stage image — and which one the reference shows is
@@ -1104,6 +1107,16 @@ an allowlist exemption.
   Android link validates it, so it needs a device A/B. `-O3`,
   `-fvisibility=hidden` and `mimalloc` were measured and rejected
   (`docs.old/performance.md` §7).
+* **The timer's fire boundary is a whole millisecond, the reference's
+  is a sub-millisecond one.** The reference's timer thread compares the
+  deadline against the wall clock in sub-millisecond units and fires when the
+  clock is *strictly* past the deadline
+  (`reference/cpp/core/utils/impl/TimerImpl.cpp:128`); the port's timer sees
+  the engine clock's whole-millisecond value and fires at the deadline. The
+  two agree everywhere except when the elapsed time lands exactly on a
+  deadline, which no real frame sequence does — 100 000 frames of 16.6 ms
+  never hit one. Closing it would mean handing the registry a fractional
+  time, and the registry's whole-millisecond interface is the L2 surface.
 
 ## 17. Verified — do not re-open
 

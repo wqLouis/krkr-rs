@@ -5,8 +5,9 @@
 //! deliver), so every
 //! test is
 //! deterministic. The contract under test: a timer repeats by construction
-//! until removed or disabled, due callbacks run in creation order exactly
-//! once per delivery, callbacks may re-enter the registry (create timers,
+//! until removed or disabled, a late frame replays the intervals the timer
+//! missed (bounded, and without letting the schedule drift), due callbacks
+//! run in creation order, callbacks may re-enter the registry (create timers,
 //! change intervals, remove themselves, even panic), and every stale id or
 //! zero interval is a typed error — never a panic, never a silent success.
 
@@ -49,12 +50,13 @@ fn create_interval_fires_one_interval_from_now_then_repeats() {
     assert_eq!(deliver_due(&mut timers, 1_019), 0);
     assert_eq!(deliver_due(&mut timers, 1_020), 1);
 
-    // A late frame fires exactly once and re-arms from `now` — no catch-up
-    // burst.
-    assert_eq!(deliver_due(&mut timers, 1_100), 1);
+    // A late frame replays the intervals it missed: the deadline was 1_030
+    // and the frame landed at 1_100, so the timer fires eight times and
+    // keeps its place in the schedule.
+    assert_eq!(deliver_due(&mut timers, 1_100), 8);
     assert_eq!(deliver_due(&mut timers, 1_101), 0);
     assert_eq!(deliver_due(&mut timers, 1_110), 1);
-    assert_eq!(log.borrow().len(), 4);
+    assert_eq!(log.borrow().len(), 11);
 }
 
 #[test]
@@ -372,8 +374,10 @@ fn a_peer_disabled_from_a_callback_is_cancelled_before_it_fires() {
     // Re-enabling the peer brings it back into the rounds.
     timers.now_ms = 30;
     timers.set_enabled(peer, true).expect("re-enable peer");
-    assert_eq!(deliver_due(&mut timers, 40), 2);
-    assert_eq!(*log.borrow(), vec![0u64, 0u64, 0u64, 1u64]);
+    // The killer's deadline was 30 and the frame landed at 40, so the killer
+    // replays the interval it missed and fires twice; the peer fires once.
+    assert_eq!(deliver_due(&mut timers, 40), 3);
+    assert_eq!(*log.borrow(), vec![0u64, 0u64, 0u64, 0u64, 1u64]);
 }
 
 /// A callback that records a fixed `1` marker (the peer's tag).
@@ -419,4 +423,106 @@ fn a_panicking_callback_unwinds_over_consistent_state() {
     assert_eq!(deliver_due(&mut timers, 30), 1);
     assert_eq!(hits.get(), 3);
     timers.remove(id).expect("remove");
+}
+
+// ---------------------------------------------------------------------------
+// The late frame: the missed intervals are replayed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_late_frame_replays_the_missed_intervals_without_drift() {
+    let mut timers = TimerState::new();
+    let (callback, hits) = counter();
+    // The timer is armed at the injected now (0), so its first deadline is
+    // one interval out: 10 ms.
+    timers.create_interval(10, callback).expect("create");
+
+    // The frame lands 35 ms past that deadline (at 45 ms). The intervals
+    // the timer missed are the ones at 20, 30 and 40 ms, and the fire that
+    // was due at 10 ms joins them: four fires in this one frame.
+    //
+    // reference/cpp/core/utils/impl/TimerImpl.cpp:118-148 — the timer
+    // thread computes n = (curtick - NextTick) / Interval, increments it,
+    // and triggers the timer n times, re-arming from the deadline it
+    // missed: NextTick + n * Interval.
+    assert_eq!(deliver_due(&mut timers, 45), 4);
+    assert_eq!(hits.get(), 4);
+
+    // The next deadline is the old deadline plus four intervals (10 + 40),
+    // so the schedule did not drift: the timer is due again at 50 ms, not
+    // at 55 ms.
+    assert_eq!(deliver_due(&mut timers, 49), 0);
+    assert_eq!(deliver_due(&mut timers, 50), 1);
+    assert_eq!(hits.get(), 5);
+}
+
+#[test]
+fn a_backlog_beyond_the_cap_fires_once_and_rearms_from_now() {
+    let mut timers = TimerState::new();
+    let (callback, hits) = counter();
+    timers.create_interval(10, callback).expect("create");
+
+    // Forty missed intervals are still replayed: the deadline was 10 ms,
+    // the frame lands at 400 ms, so n = (400 - 10) / 10 + 1 = 40 fires, and
+    // the next deadline is the old one plus forty intervals.
+    //
+    // reference/cpp/core/utils/impl/TimerImpl.cpp:118-148 — the catch-up
+    // count is n = (curtick - NextTick) / Interval + 1.
+    assert_eq!(deliver_due(&mut timers, 400), 40);
+    assert_eq!(hits.get(), 40);
+    assert_eq!(deliver_due(&mut timers, 409), 0);
+    assert_eq!(deliver_due(&mut timers, 410), 1);
+    assert_eq!(hits.get(), 41);
+
+    // One interval more is past the cap: the backlog is discarded, the
+    // timer fires once and the next deadline starts from now.
+    //
+    // reference/cpp/core/utils/impl/TimerImpl.cpp:118-148 — n > 40 discards
+    // the rest: Trigger(1) and SetNextTick(curtick + Interval).
+    let (callback, hits) = counter();
+    let mut timers = TimerState::new();
+    timers.create_interval(10, callback).expect("create");
+    assert_eq!(deliver_due(&mut timers, 411), 1);
+    assert_eq!(hits.get(), 1);
+    assert_eq!(deliver_due(&mut timers, 420), 0);
+    assert_eq!(deliver_due(&mut timers, 421), 1);
+    assert_eq!(hits.get(), 2);
+}
+
+#[test]
+fn a_schedule_write_during_a_catch_up_cancels_the_remaining_fires() {
+    let mut timers = TimerState::new();
+    // SAFETY: see `a_callback_removing_itself_leaves_consistent_state`.
+    let registry = &mut timers as *mut TimerState;
+    let hits = Rc::new(Cell::new(0u64));
+    let once = Rc::new(Cell::new(false));
+    let hits_ref = Rc::clone(&hits);
+    let flag = Rc::clone(&once);
+    let callback: TimerCallback = Box::new(move |id| {
+        hits_ref.set(hits_ref.get() + 1);
+        if !flag.get() {
+            flag.set(true);
+            // The reschedule cancels the timer's remaining fires, the way a
+            // cancelled pending event is dropped.
+            //
+            // reference/cpp/core/utils/impl/TimerImpl.cpp:73-120 — a
+            // schedule write cancels the queued events and re-derives the
+            // next tick.
+            //
+            // SAFETY: see above.
+            unsafe { (*registry).set_interval(id, 100) }.expect("set interval");
+        }
+    });
+    timers.create_interval(10, callback).expect("create");
+
+    // The frame lands at 45 ms: four fires are due, and the first one
+    // reschedules the timer, so only the first fire happens.
+    assert_eq!(deliver_due(&mut timers, 45), 1);
+    assert_eq!(hits.get(), 1);
+
+    // The reschedule re-armed the timer at the delivery's now (45) plus
+    // the new interval, so it is due at 145 ms.
+    assert_eq!(deliver_due(&mut timers, 144), 0);
+    assert_eq!(deliver_due(&mut timers, 145), 1);
+    assert_eq!(hits.get(), 2);
 }

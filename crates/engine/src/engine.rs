@@ -740,9 +740,9 @@ impl Engine {
     ///
     /// This is the frame's loop-level entry point: the caller chooses where
     /// the elapsed time comes from — the windowed loop injects the real time
-    /// the platform measured, the headless runner injects the frame period it
-    /// simulates — and every timeline the frame derives comes from that one
-    /// value.
+    /// the platform measured, the headless runner injects the time it measured
+    /// between its frames — and every timeline the frame derives comes from
+    /// that one value.
     ///
     /// A negative elapsed time counts as zero. The delta is accumulated with
     /// its fractional part, so sixty 16.6 ms frames advance the clock by

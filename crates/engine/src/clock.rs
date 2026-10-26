@@ -9,9 +9,9 @@
 ///
 /// The engine owns the clock it advances; the caller owns where the elapsed
 /// time comes from. The windowed loop injects the real time the platform
-/// measured, the headless runner injects the frame period it simulates, and a
-/// test injects whatever it needs. One source per run: every timeline the
-/// frame derives comes from the value this reports.
+/// measured, the headless runner injects the time it measured between its
+/// frames, and a test injects whatever it needs. One source per run: every
+/// timeline the frame derives comes from the value this reports.
 pub trait FrameTimeSource {
     /// The milliseconds elapsed since the previous frame.
     fn elapsed_ms(&self) -> f64;
@@ -21,7 +21,7 @@ pub trait FrameTimeSource {
 ///
 /// The value is written from outside the engine: the windowed loop writes
 /// the real elapsed time the platform measured, the headless runner writes
-/// the frame period it simulates.
+/// the time it measured between its frames.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct InjectedFrameTime {
     /// The milliseconds elapsed since the previous frame.

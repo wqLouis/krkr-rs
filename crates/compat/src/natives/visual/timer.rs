@@ -116,11 +116,13 @@ fn mode_priority(mode: i64) -> u8 {
 /// The reference computes `cap = TVPLimitTimerCapacity ? 1 : (Capacity == 0 ?
 /// 65535 : Capacity)` and posts only while `cap - <queued> > 0`
 /// (`TimerIntf.cpp:71-93`); a non-positive capacity posts nothing. The L2
-/// registry fires a timer at most once per delivery and never
-/// catches up a late frame, so the queue depth here is at most one entry per
-/// timer and a positive capacity never drops a fire; a negative capacity is
-/// already expressed by not arming the L2 timer (`sync_schedule`). The check
-/// is kept so the mapping stays explicit.
+/// registry hands the L3 one fire per interval the timer missed, and this
+/// function queues one `onTimer` posting per fire: the room left in the
+/// capacity is counted again for every fire, so a catch-up of `n` fires
+/// queues the same `min(n, cap - <already queued>)` postings a single
+/// clamped call queues, and a backlog that does not fit is dropped. A
+/// negative capacity is already expressed by not arming the L2 timer
+/// (`sync_schedule`). The check is kept so the mapping stays explicit.
 fn post_on_timer(services: &CompatServices, id: TimerId) {
     let mut posts = services.state::<TimerPosts>();
     let (mode, capacity) = {

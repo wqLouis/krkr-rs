@@ -129,11 +129,12 @@ fn format_stats(stats: &FrameStats) -> String {
 /// The headless loop's frame pacing.
 ///
 /// The loop waits for each frame's deadline, so the frames are as far apart
-/// as the frame-rate limit says. The engine's clock advances by the frame
-/// period the loop injects, so a paced loop makes that clock the wall clock:
-/// a run that paced nothing would advance the clock by the frame period for
-/// every frame while the wall clock ran on as fast as the host could step,
-/// and every duration the script measures would collapse into that gap.
+/// as the frame-rate limit says. The engine's clock advances by the time the
+/// loop measured between the frames, so a paced loop makes that clock the
+/// wall clock: a run that paced nothing would advance the clock by the frame
+/// period for every frame while the wall clock ran on as fast as the host
+/// could step, and every duration the script measures would collapse into
+/// that gap.
 struct HeadlessPacer {
     /// The frame deadlines, paced by the frame-rate limit.
     ticker: Ticker,
@@ -159,19 +160,66 @@ impl HeadlessPacer {
     }
 }
 
+/// The headless loop's frame clock.
+///
+/// The engine's clock advances by the time the loop measured between the
+/// frames, so the script's tick count is the wall clock: it moves with the
+/// time the run really took, and not with the nominal frame period. A
+/// nominal period would leave the script's clock behind the wall clock by the
+/// accumulated cost of the frames themselves.
+struct HeadlessClock {
+    /// The frame time the loop injects into the engine.
+    time: InjectedFrameTime,
+    /// The instant the previous frame started.
+    ///
+    /// The first frame measures from the run's start, the way the windowed
+    /// loop measures its first frame from the moment its window was created:
+    /// the time the run spent before the first frame is part of the elapsed
+    /// time the script sees.
+    previous_at: Instant,
+}
+
+impl HeadlessClock {
+    /// A clock whose first frame measures from `started`.
+    fn new(started: Instant) -> Self {
+        Self {
+            time: InjectedFrameTime::default(),
+            previous_at: started,
+        }
+    }
+
+    /// Measures the time since the previous frame and returns the frame time.
+    ///
+    /// The measurement happens where the frame starts, like the platform's
+    /// own measurement in the windowed loop, so a frame's own cost is part of
+    /// the next frame's elapsed time.
+    fn advance(&mut self, now: Instant) -> &InjectedFrameTime {
+        self.time.elapsed_ms = now
+            .saturating_duration_since(self.previous_at)
+            .as_secs_f64()
+            * 1000.0;
+        self.previous_at = now;
+        &self.time
+    }
+}
+
 /// Runs offscreen and prints the final frame stats (or the game's scene size).
 fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
+    let started = Instant::now();
     let config = HostConfig::headless()
         .with_backend(launch.backend)
         .with_debug_overlay(launch.runtime.debug_overlay)
         .with_graphic_cache_limit(launch.runtime.graphic_cache_limit);
     let mut host = Host::new(config)?;
     // The headless step is paced by the frame-rate limit, like the windowed
-    // loop, and the engine's clock advances by the frame period the loop
-    // injects: the script's tick count is the wall clock, so a duration the
-    // script measures lasts here as long as it lasts in a windowed run.
+    // loop, and the engine's clock advances by the time the loop measured
+    // since the previous frame: the script's tick count is the wall clock, so
+    // a duration the script measures lasts here as long as it lasts in a
+    // windowed run. The period the limit names paces the frames; the clock
+    // counts the time that actually passed, which is that period plus the
+    // frame's own cost.
     let mut pacer = HeadlessPacer::new(launch.runtime.frame_rate_limit.period_secs());
-    let clock = InjectedFrameTime::new(f64::from(launch.runtime.frame_rate_limit.period_ms()));
+    let mut clock = HeadlessClock::new(started);
 
     if let Some(input) = &launch.game {
         let mut game = GameHost::open_with_preload(
@@ -189,7 +237,8 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
         let mut last = None;
         for _ in 0..frames {
             pacer.wait();
-            last = Some(game.step(&clock, &[])?);
+            let frame_time = clock.advance(Instant::now());
+            last = Some(game.step(frame_time, &[])?);
         }
         if let Some(report) = last
             && let Some(stats) = report.stats
@@ -242,7 +291,8 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
     let mut last = None;
     for _ in 0..frames {
         pacer.wait();
-        last = Some(host.step(&clock)?);
+        let frame_time = clock.advance(Instant::now());
+        last = Some(host.step(frame_time)?);
     }
     if let Some(report) = last
         && let Some(stats) = report.stats
@@ -623,6 +673,7 @@ mod tests {
             frame_rate_limit: FrameRateLimit::new("test", 500).expect("valid"),
             ..RuntimeConfig::default()
         };
+        let started = Instant::now();
         let report = run(Launch {
             runtime,
             backend: BackendKind::Null,
@@ -630,14 +681,15 @@ mod tests {
             mode: RunMode::Headless { frames: 2 },
         })
         .expect("headless run");
+        let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         let last = report.last_frame.expect("two frames were stepped");
         assert_eq!(last.frame_index, 2);
-        // 500 fps is a 2 ms frame period, so two frames advance 4 ms; a
-        // default 60 fps run would have advanced about 33 ms instead.
+        // The engine's clock counts the time the run really took: it is the
+        // wall clock, and not the sum of the nominal frame periods.
         assert!(
-            (last.elapsed_ms - 4.0).abs() < 1e-9,
-            "elapsed {} ms",
+            last.elapsed_ms > 0.0 && last.elapsed_ms <= wall_ms,
+            "the clock advanced {} ms while the wall clock advanced {wall_ms} ms",
             last.elapsed_ms
         );
     }

@@ -129,11 +129,11 @@ after the windowed event loop exits.
 
 `run_headless` builds a headless `HostConfig` (null backend, the requested
 overlay and cache policy), opens a `GameHost` when the launch names a game,
-and steps `frames` frames with `dt_ms` derived from the frame-rate limit.
+and steps `frames` frames.
 The step waits for the frame's deadline, so the frames are as far apart as
-the limit says and the engine's clock — which advances by that period — is
-the wall clock: the script's tick count measures the same time here as it
-does in a windowed run.
+the limit says, and the engine's clock — which advances by the time the loop
+measured between the frames — is the wall clock: the script's tick count
+measures the same time here as it does in a windowed run.
 It prints the null backend's counters and the scene summary — the window
 count, the layer count, the bitmap count and, per window, how many layers
 the window's root list can actually reach. That last number is the

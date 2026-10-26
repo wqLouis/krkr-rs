@@ -137,7 +137,7 @@ state, the clock and the presentation; it advances them one frame at a time.
 | `EngineOverlay` | the render-only debug overlay: a node drawn above every layer, refreshed once per frame. It is not part of the scene and owns no bitmap a script could reach. |
 | `FrameReport` | what one frame did: the frame index, the clock, whether the frame was presented, the backend counters and the per-phase millisecond costs. |
 | `FrameTimeSource` | the trait the frame's elapsed time comes through. The engine owns the clock it advances; the caller owns where the elapsed time comes from. |
-| `InjectedFrameTime` | the frame time the caller injects. The windowed loop writes the real time the platform measured into it; the headless runner writes the frame period it simulates. |
+| `InjectedFrameTime` | the frame time the caller injects. The windowed loop writes the real time the platform measured into it; the headless runner writes the time it measured between its frames. |
 | `EngineError` | the errors a frame or a surface action surfaces. |
 | `ObjectCounts` | the live object counts (windows, layers, bitmaps, fonts, textures) the overlay is refreshed with. |
 
@@ -424,10 +424,13 @@ face is the free function `timer::deliver_due(registry, now_ms) -> usize`).
 Assigning the registry's public `now_ms` field injects the current time
 **without** delivering.
 
-Invariants: a timer fires at most once per advance and is re-armed from the
-injected now, so a late frame does not burst catch-up fires; a timer whose
-schedule was mutated between collection and delivery is skipped; the
-interval is at least 1 ms; enabling arms at `now + interval_ms`; delivery
+Invariants: a timer fires once per elapsed interval — a timer whose
+deadline passed by `n` intervals fires `n + 1` times in that advance and is
+re-armed from the deadline it missed, so the schedule does not drift, and a
+backlog of more than 40 intervals is discarded (one fire, re-armed from the
+injected now) (`reference/cpp/core/utils/impl/TimerImpl.cpp:118-148`); a
+timer whose schedule was mutated between collection and delivery is skipped;
+the interval is at least 1 ms; enabling arms at `now + interval_ms`; delivery
 order is creation order; the delivery collects the due timers before it
 invokes any of them, so a callback may re-enter the registry; a callback that
 panics leaves the registry consistent and the panic propagates.
