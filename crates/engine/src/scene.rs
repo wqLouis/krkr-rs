@@ -158,6 +158,9 @@ pub struct LayerState {
     /// Province plane height in pixels (0 when absent).
     pub province_height: u32,
     /// Alpha threshold for `htMask` hit-testing; `≤0` accepts any pixel.
+    ///
+    /// A layer starts at the constructor's threshold; the window's screen
+    /// root starts at zero, so it takes every pixel of its area.
     pub hit_threshold: i32,
     /// Hit-test mode (reference `tTVPHitType`): `htMask=0` (per-pixel
     /// threshold) or `htProvince=1` (non-transparent province). Stored so
@@ -1020,6 +1023,8 @@ impl Scene {
             province: None,
             province_width: 0,
             province_height: 0,
+            // The constructor's threshold; the screen root lowers it to zero
+            // when it joins a window.
             hit_threshold: 16,
             hit_type: 0,
             hit_test_accepted: true,
@@ -1097,6 +1102,11 @@ impl Scene {
             if let Some(l) = self.layer_mut(id) {
                 l.is_primary = true;
                 l.visible = true;
+                // The screen root takes every pixel: a zero threshold makes
+                // the hit test accept the point without reading the image's
+                // alpha, so a click that misses every layer above lands on
+                // the root.
+                l.hit_threshold = 0;
             }
         }
         // A new child is appended at the front-most slot.

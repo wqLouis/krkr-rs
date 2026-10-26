@@ -822,9 +822,10 @@ fn a_hit_test_waits_for_the_pending_layer_image() {
     env.run(
         "var w = new Window(); \
          var l = new Layer(w, null); \
+         l.hitThreshold = 16; \
          l.loadImages('picture.png');",
     );
-    // The load returned with the probed size and no pixels, and the default
+    // The load returned with the probed size and no pixels, and the
     // `hitThreshold` is 16, so the hit test has to read the image.
     let bitmap_id = env
         .pending_layer()
@@ -871,6 +872,7 @@ fn a_pointer_hit_test_waits_for_the_pending_layer_image() {
         "var w = new Window(); \
          w.setSize(320, 240); \
          var l = new Layer(w, null); \
+         l.hitThreshold = 16; \
          l.loadImages('picture.png'); \
          var moves = 0; \
          l.onMouseMove = function(x, y, shift) { moves = moves + 1; };",

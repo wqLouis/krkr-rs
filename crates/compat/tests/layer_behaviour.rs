@@ -2699,6 +2699,7 @@ fn a_hit_test_of_a_bufferless_layer_image_is_a_miss() {
     env.run(
         "var w = new Window(); \
          var l = new Layer(w, null); l.name = 'l'; \
+         l.hitThreshold = 16; \
          l.setSize(2, 2); l.setImageSize(2, 2);",
     );
     let bitmap_id = env

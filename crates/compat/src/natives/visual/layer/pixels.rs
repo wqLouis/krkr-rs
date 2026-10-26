@@ -352,6 +352,16 @@ fn check_operate_face(mode: i64, face: i32) -> Result<(), String> {
 /// the same way whatever the face is.
 const FACE_SENSITIVE_MODES: [i64; 3] = [OM_ALPHA, OM_OPAQUE, super::blend::LT_ADD_ALPHA];
 
+/// Whether the operation mode and the draw face select a blend that is
+/// not implemented.
+///
+/// The additive-alpha-on-alpha blend is not implemented: the operation leaves
+/// the destination untouched. The engine's blend table has no additive-alpha
+/// kernel, so the operation does nothing here either.
+fn blend_is_unimplemented(mode: i64, face: i32) -> bool {
+    mode == super::blend::LT_ADD_ALPHA && face == DF_ALPHA
+}
+
 /// Whether a blend the draw face selected holds the destination's alpha.
 ///
 /// The face-selected blend methods come in two spellings: the plain one on
@@ -543,6 +553,9 @@ extern "C" fn layer_operate_rect(
         // Reference order: clip first (`LayerIntf.cpp:5232-5234`), then the
         // mode/face validation (`LayerIntf.cpp:5235-5242`).
         check_operate_face(mode, face)?;
+        if blend_is_unimplemented(mode, face) {
+            return Ok(());
+        }
         let hold_alpha = face_hold_alpha(mode, face, layer_hold_alpha);
         with_two_bitmaps(scene, dst, src_id, |d, s| {
             layer_ops::operate_rect(
@@ -630,6 +643,9 @@ extern "C" fn layer_operate_stretch(
         // Reference order: clip first (`LayerIntf.cpp:5387-5390`), then the
         // mode/face validation (`LayerIntf.cpp:5392-5399`).
         check_operate_face(mode, face)?;
+        if blend_is_unimplemented(mode, face) {
+            return Ok(());
+        }
         let hold_alpha = face_hold_alpha(mode, face, layer_hold_alpha);
         let src_rect = (sx, sy, sx.saturating_add(sw), sy.saturating_add(sh));
         let src_trimmed = scale_rect(src_rect, dst_rect, dest);
@@ -737,7 +753,12 @@ fn affine_op(
                 return Err(format!("Layer.{method}: unsupported draw face {face}"));
             }
         }
-        AffineKind::Operate => check_operate_face(mode, face)?,
+        AffineKind::Operate => {
+            check_operate_face(mode, face)?;
+            if blend_is_unimplemented(mode, face) {
+                return Ok(());
+            }
+        }
     }
     let clip = layer_clip(scene, id);
     let neutral_color = {
@@ -2838,7 +2859,23 @@ fn layer_draw_text_common(
         // colour is taken as it is.
         let rgb = actual_color_bytes(value_as_i64(&a[3]));
         let color = [rgb[0], rgb[1], rgb[2], 255];
-        let opacity = opt_i64(a, 4, 255).clamp(0, 255) as i32;
+        let opacity = opt_i64(a, 4, 255) as i32;
+        {
+            // The text is drawn with the blend method the draw face selects,
+            // and the faces that are not drawable raise. The add-alpha face
+            // cannot take a negative opacity.
+            let scene = scene_mut(&ctx)?;
+            let text_face = draw_face(scene, id);
+            if !matches!(text_face, DF_ALPHA | DF_ADD_ALPHA | DF_OPAQUE) {
+                return Err(format!("Layer.{method}: unsupported draw face {text_face}"));
+            }
+            if text_face == DF_ADD_ALPHA && opacity < 0 {
+                return Err(format!(
+                    "Layer.{method}: negative opacity is not supported on the add-alpha face"
+                ));
+            }
+        }
+        let opacity = opacity.clamp(0, 255);
         let antialias = opt_bool(a, 5, true);
         let shadow_level = opt_i64(a, 6, 0) as i32;
         let mut shadow_color = argb_to_rgba(opt_i64(a, 7, 0));

@@ -67,6 +67,8 @@ const OM_OPAQUE: i64 = 1;
 const OM_ALPHA: i64 = 2;
 /// `omAuto` — normalised to [`OM_ALPHA`], matching the reference.
 const OM_AUTO: i64 = 128;
+/// `omAddAlpha`.
+const OM_ADD_ALPHA: i64 = 12;
 /// `dfAlpha` / `dfBoth`.
 const DF_ALPHA: i64 = 0;
 /// `dfOpaque` / `dfMain`.
@@ -400,20 +402,43 @@ fn normalize_color_face(face: i64) -> i64 {
 }
 
 /// Map the reference `tTVPBlendOperationMode` + `tTVPDrawFace` to the
-/// operation mode `engine_api::layer_ops` takes, plus whether the destination
-/// alpha plane must be held.
+/// operation mode `engine_api::layer_ops` takes, plus whether the
+/// destination alpha plane may be held.
 ///
 /// The reference maps through `GetBltMethodFromOperationMode`; for `omOpaque`
-/// the `OnAlpha`/`OnAddAlpha` methods hold the destination alpha, which the
-/// engine's `omOpaque` copy does not do, so it becomes the `hold_alpha`
-/// flag. The remaining modes pass through unchanged (the engine's blend table
-/// is keyed by operation mode).
+/// the `OnAlpha`/`OnAddAlpha` methods ignore the hold argument and the plain
+/// method takes it, so the argument reaches the blend on an opaque face only.
+/// The face-independent modes always pick a plain method. The engine's blend
+/// table is keyed by the operation mode alone, so the method's own arithmetic
+/// is not expressible here.
 fn blit_method(mode: i64, face: i64) -> (i64, bool) {
-    let mode = if mode == OM_AUTO { OM_ALPHA } else { mode };
-    match mode {
-        OM_OPAQUE => (OM_OPAQUE, normalize_draw_face(face) != DF_OPAQUE),
-        _ => (mode, false),
+    if mode == OM_AUTO {
+        // The auto mode keeps the first method of the table, the
+        // alpha-on-alpha one, which takes no hold argument.
+        return (OM_ALPHA, false);
     }
+    let face = normalize_draw_face(face);
+    let plain = if FACE_SENSITIVE_MODES.contains(&mode) {
+        face == DF_OPAQUE
+    } else {
+        true
+    };
+    (mode, plain)
+}
+
+/// The operation modes whose blend method the draw face selects: the
+/// `omAlpha`, `omAddAlpha` and `omOpaque` modes. Every other mode blends
+/// the same way whatever the face is.
+const FACE_SENSITIVE_MODES: [i64; 3] = [OM_ALPHA, OM_ADD_ALPHA, OM_OPAQUE];
+
+/// Whether the operation mode and the draw face select a blend that is
+/// not implemented.
+///
+/// The additive-alpha-on-alpha blend is not implemented: the operation leaves
+/// the destination untouched. The engine's blend table has no additive-alpha
+/// kernel, so the operation does nothing here either.
+fn blend_is_unimplemented(mode: i64, face: i64) -> bool {
+    mode == OM_ADD_ALPHA && face == DF_ALPHA
 }
 
 // ---------------------------------------------------------------------------
@@ -669,6 +694,9 @@ extern "C" fn image_operate_rect(
         let Some((dx, dy, src_rect)) = clip_dest_src(dx, dy, src_rect, clip) else {
             return Ok(None);
         };
+        if blend_is_unimplemented(mode, face) {
+            return Ok(None);
+        }
         let (mode, face_hold) = blit_method(mode, face);
         with_two_bitmaps(scene, dst_id, src_id, |dst, src| {
             layer_ops::operate_rect(
@@ -682,7 +710,7 @@ extern "C" fn image_operate_rect(
                 layer_ops::BlitOptions {
                     mode,
                     opa,
-                    hold_alpha: hda || face_hold,
+                    hold_alpha: hda && face_hold,
                     ..Default::default()
                 },
             );
@@ -750,6 +778,9 @@ extern "C" fn image_operate_stretch(
             return Ok(None);
         };
         let src_trimmed = scale_rect(src_rect, dst_rect, dest);
+        if blend_is_unimplemented(mode, face) {
+            return Ok(None);
+        }
         let (mode, face_hold) = blit_method(mode, face);
         with_two_bitmaps(scene, dst_id, src_id, |dst, src| {
             layer_ops::stretch_blit_mode(
@@ -763,7 +794,7 @@ extern "C" fn image_operate_stretch(
                 layer_ops::BlitOptions {
                     mode,
                     opa,
-                    hold_alpha: hda || face_hold,
+                    hold_alpha: hda && face_hold,
                     ..Default::default()
                 },
             );
@@ -844,8 +875,11 @@ extern "C" fn image_operate_affine(
                 (coords[4], coords[5]),
             )
         };
+        if blend_is_unimplemented(mode, face) {
+            return Ok(None);
+        }
         let (mode, face_hold) = blit_method(mode, face);
-        let hold_alpha = hda || face_hold;
+        let hold_alpha = hda && face_hold;
         with_two_bitmaps(scene, dst_id, src_id, |dst, src| {
             // The L2 affine primitive has no `hold_alpha` argument; snapshot
             // and restore the result region's alpha to emulate the reference
@@ -1254,7 +1288,16 @@ extern "C" fn image_draw_text(
         // colour is taken as it is.
         let rgb = actual_color_bytes(try_value_as_i64(&a[5])?);
         let color = [rgb[0], rgb[1], rgb[2], 255];
-        let opacity = opt_i64(a, 6, 255)?.clamp(0, 255) as i32;
+        let draw_face = opt_i64(a, 8, DF_ALPHA)?;
+        let opacity = opt_i64(a, 6, 255)? as i32;
+        // The add-alpha face cannot take a negative opacity.
+        if draw_face == DF_ADD_ALPHA && opacity < 0 {
+            return Err(
+                "ImageFunction.drawText: negative opacity is not supported on the add-alpha face"
+                    .into(),
+            );
+        }
+        let opacity = opacity.clamp(0, 255);
         let antialias = opt_bool(a, 7, true);
         let shadow_level = opt_i64(a, 9, 0)? as i32;
         let mut shadow_color = argb_to_rgba(opt_i64(a, 10, 0)?);
@@ -1347,7 +1390,16 @@ extern "C" fn image_draw_glyph(
         // colour is taken as it is.
         let rgb = actual_color_bytes(try_value_as_i64(&a[4])?);
         let color = [rgb[0], rgb[1], rgb[2], 255];
-        let opacity = opt_i64(a, 5, 255)?.clamp(0, 255) as i32;
+        let draw_face = opt_i64(a, 7, DF_ALPHA)?;
+        let opacity = opt_i64(a, 5, 255)? as i32;
+        // The add-alpha face cannot take a negative opacity.
+        if draw_face == DF_ADD_ALPHA && opacity < 0 {
+            return Err(
+                "ImageFunction.drawGlyph: negative opacity is not supported on the add-alpha face"
+                    .into(),
+            );
+        }
+        let opacity = opacity.clamp(0, 255);
         let antialias = opt_bool(a, 6, true);
         let shadow_level = opt_i64(a, 8, 0)? as i32;
         let mut shadow_color = argb_to_rgba(opt_i64(a, 9, 0)?);

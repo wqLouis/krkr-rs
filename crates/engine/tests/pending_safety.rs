@@ -78,7 +78,16 @@ fn a_short_province_plane_is_a_miss_and_a_no_op() {
             .map(|candidate| candidate.layer),
         Some(child)
     );
-    assert!(scene.layer_hit_next(child, 0, 1, false, None).is_none());
+    // The point outside the plane is not the child's hit: the province
+    // there is empty. The screen root takes the point instead, because its
+    // hit threshold is zero
+    // (reference/cpp/core/visual/LayerIntf.cpp:3239-3240, :472).
+    assert_eq!(
+        scene
+            .layer_hit_next(child, 0, 1, false, None)
+            .map(|candidate| candidate.layer),
+        Some(primary)
+    );
 }
 
 /// The overlay mixes the decoded picture into the bound layer's MainImage

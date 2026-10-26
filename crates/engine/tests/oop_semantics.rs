@@ -209,7 +209,15 @@ fn layer_invalidated_while_transition_is_active_leaves_only_typed_misses() {
     assert!(!scene.node_enabled(victim));
     assert!(!scene.node_focusable(victim));
     assert_eq!(scene.absolute_offset(victim), None);
-    assert!(scene.layer_hit_next(bg, 0, 0, false, None).is_none());
+    // The invalidated id is not a candidate. The screen root takes the
+    // point instead, because its hit threshold is zero
+    // (reference/cpp/core/visual/LayerIntf.cpp:3239-3240, :472).
+    assert_ne!(
+        scene
+            .layer_hit_next(bg, 0, 0, false, None)
+            .map(|candidate| candidate.layer),
+        Some(victim)
+    );
     assert!(!scene.window_layer_order(win).contains(&victim));
 
     // No dangling ids survive: window roots, focus and primary slot are

@@ -111,53 +111,62 @@ residuals:
   '/', '\\' or '>'; got …"`; the reference raises
   `TVPMissingPathDelimiterAtLast` = `"Use path delimiter '>' or '/'"`
   (`MsgIntfInc.h:32`) — script-observable.
-* **The face selects the blend *method*, but the engine's blend table has
-  no per-method kernels.** The layer now keeps the reference's two faces: the
+* **The face selects the blend *method*, and the engine's blend table has
+  no per-method kernels.** The layer keeps the reference's two faces: the
   outward face the script reads and writes (defaulting to `dfAuto` = `128`)
   and the actual draw face the operations use, resolved from the layer's
   display type (`LayerIntf.h:738-750`, `LayerIntf.cpp:371-372`,
   `:1525-1618`), so `Layer.face` returns the reference's number, a type
   change resolves the face again (`LayerIntf.cpp:1910`, `:1517-1518`) and
-  the pixel operations follow the resolved face. What is left is the
-  *arithmetic* of the face-selected blend methods: the reference picks
-  `bmAlphaOnAlpha`, `bmAlphaOnAddAlpha`, `bmAlpha`,
-  `bmAddAlphaOnAlpha`, `bmAddAlphaOnAddAlpha`, `bmAddAlpha`,
-  `bmCopyOnAlpha`, `bmCopyOnAddAlpha` and `bmCopy` from the operation mode
-  and the draw face (`ImageFunction.cpp:78-130`,
-  `LayerIntf.cpp:4118-4271`), and each method has its own arithmetic
-  (`LayerBitmapIntf.cpp:1580-1830`). The engine's blend table is keyed by
-  the operation mode alone (`engine/src/layer_ops.rs`, `mode_kernel`), so
-  the face reaches the blend only through the destination-alpha handling: the
-  layer's `holdAlpha` argument reaches a face-selected blend on an opaque
-  face only, because the `OnAlpha`/`OnAddAlpha` methods handle the
-  destination's alpha themselves. `bmCopyOnAlpha` copies the source as an
-  opaque image — the destination's alpha becomes opaque
-  (`LayerBitmapIntf.cpp:1611-1622`, `tvpgl.cpp:3326-3380`) — where the
-  engine's copy keeps the source's alpha, and `bmAddAlphaOnAlpha` is not
-  implemented in the reference at all (`LayerBitmapIntf.cpp:1705-1708`) where
-  the engine blends it. The `ImageFunction`'s own mapping
-  (`natives/image_function.rs`, `blit_method`) holds the destination's alpha
-  on a non-opaque face, which the reference does not do; it is left as it is
-  until the engine's blend dispatcher carries the per-method kernels.
-  Closing this needs that dispatcher to carry them.
-* **The container layer types still collapse, and the primary layer's hit
-  threshold stays at the default.** `ltBinder` (0), `ltEffect` (6) and
-  `ltFilter` (7) read back as `ltAlpha` (2) (`natives/visual/layer/blend.rs`),
-  so the resolution table's default arm (`dfOpaque`, `LayerIntf.cpp:1611-1613`)
-  is unreachable and those layers resolve to `dfAlpha`; the reference gives them
-  no image, so no face-sensitive operation can observe the difference there.
-  The reference's primary layer also carries `HitThreshold = 0`
-  (`LayerIntf.cpp:472`, `:506`), so every pixel of its image is a hit; ours
-  keeps the default 16, so a click that lands on a transparent part of the
-  screen hits nothing. Closing that needs the creation defaults to carry the
-  hit threshold as well, which changes the hit test's outcome for the screen
-  root: the pointer dispatch then finds the primary layer where it found
-  nothing. A second parentless layer keeps the constructor's type here: the
-  reference gives every parentless root its own manager and the opaque type
+  the pixel operations follow the resolved face. The reference picks the blend
+  *method* from the operation mode and the draw face
+  (`LayerIntf.cpp:4118-4271`, `ImageFunction.cpp:78-130`) and gives each
+  method its own arithmetic (`LayerBitmapIntf.cpp:1580-1830`,
+  `tvpgl.cpp`); the engine's table is keyed by the operation mode alone
+  (`engine/src/layer_ops.rs`, `mode_kernel`), so three of the nine
+  combinations still differ:
+  * `omAlpha`/`dfAlpha` (`bmAlphaOnAlpha`, `LayerBitmapIntf.cpp:1630-1640`)
+    scales the source's contribution by the *destination's* alpha, and
+    `omAlpha`/`dfAddAlpha` (`bmAlphaOnAddAlpha`, `:1710-1724`) by the
+    destination's additive alpha; the engine's source-over does neither, so
+    the destination's RGB and alpha differ wherever it is translucent.
+  * `omAddAlpha`/`dfAddAlpha` (`bmAddAlphaOnAddAlpha`, `:1688-1703`) and
+    `omAddAlpha`/`dfOpaque` (`bmAddAlpha`, `:1682-1687`) are the
+    additive-alpha blends; the engine has no additive-alpha kernel and blends
+    them source-over instead. The third combination,
+    `omAddAlpha`/`dfAlpha` (`bmAddAlphaOnAlpha`), is not implemented in the
+    reference at all (`:1705-1708`, `RenderManager.cpp:2557-2561`), and the
+    operation now leaves the destination untouched here too.
+  * `omOpaque`/`dfAlpha` (`bmCopyOnAlpha`, `:1611-1622`) and
+    `omOpaque`/`dfAddAlpha` (`bmCopyOnAddAlpha`, `:1726-1738`) copy the
+    source as an *opaque* image, so the destination's alpha becomes opaque
+    (`tvpgl.cpp:3326-3380`); the engine's copy keeps the source's alpha, so
+    the destination's alpha differs for a translucent source. Fixing this
+    needs the face in the engine's kernel table (the copy would then force
+    the source's alpha, one store per pixel, with the kernel resolved per
+    pass); the per-pixel cost of the other eight methods is the reference's
+    own table lookups, which the engine's straight-alpha source-over does
+    not pay.
+  The destination's alpha-hold argument is the reference's `hda`: only the
+  plain methods take it, so it reaches a face-selected blend on an opaque
+  face only (`LayerBitmapIntf.cpp:1589-1622`). The `ImageFunction`'s
+  mapping (`natives/image_function.rs`, `blit_method`) now follows that
+  rule; the text members' `hda` argument and the layer's `holdAlpha` do not
+  reach the text rasterizer (`ImageFunction.cpp:1024-1025`,
+  `LayerIntf.cpp:4467-4469`), and the face's method selection for the text
+  is the same arithmetic gap.
+* **The container layer types still collapse.** `ltBinder` (0), `ltEffect` (6)
+  and `ltFilter` (7) read back as `ltAlpha` (2)
+  (`natives/visual/layer/blend.rs`), so the resolution table's default arm
+  (`dfOpaque`, `LayerIntf.cpp:1611-1613`) is unreachable and those layers
+  resolve to `dfAlpha`; the reference gives them no image, so no face-sensitive
+  operation can observe the difference there. A second parentless layer keeps
+  the constructor's type and hit threshold here: the reference gives every
+  parentless root its own manager and the opaque type and the zero threshold
   (`LayerIntf.cpp:463-472`), but its draw devices take one manager per window
   (`BasicDrawDevice.cpp:478-487`, `PassThroughDrawDevice.cpp:345-357`), so the
-  second root raises there and its type is never observed; the per-window model
-  is §2's residual.
+  second root raises there and its type and threshold are never observed; the
+  per-window model is §2's residual.
 * **What a fresh layer's image starts as is not established.** The reference's
   primary layer and a fresh `Bitmap` both start from the shared initial
   bitmap (`reference/cpp/core/visual/LayerIntf.cpp:214-220`,
