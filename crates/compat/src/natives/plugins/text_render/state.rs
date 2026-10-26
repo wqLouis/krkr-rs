@@ -271,7 +271,7 @@ fn member(host: &Tjs2Engine, id: Tjs2ValueId, name: &str) -> Option<TjsValue> {
 /// `lineSpacing`, ...). A dictionary that carries both takes the lower-case
 /// value.
 fn style_member(host: &Tjs2Engine, id: Tjs2ValueId, names: &[&str]) -> Option<TjsValue> {
-    names.iter().find_map(|name| member(host, id, *name))
+    names.iter().find_map(|name| member(host, id, name))
 }
 
 /// TJS `operator bool` for a member value.
