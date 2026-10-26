@@ -413,8 +413,7 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   the title animation plays; no motion `dt` clamp was needed. `perf record` is
   blocked on this host by `kernel.perf_event_paranoid=2` (software `perf stat`
   works); gprofng works and is what the timings above come from.
-* **The title's background animation is fixed, but the world's per-frame env
-  update still never runs.**
+* **The title's background animation is fixed.**
   * **The engine had two clocks and the game read the wrong one.**
     `System.getTickCount()` returned a wall clock while the engine owns the
     frame clock, and the game's Conductor schedules its next timer tick from
@@ -431,15 +430,36 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
     game's `custom.ks:*title_start` has two branches — the last `.mtn` frame
     and the `title_bg.png` stage image — and which one the reference shows is
     not yet established.
-  * **The world's per-frame env update never runs in our engine.**
-    `world.updateAll`, `world.updateSource` and `world.refresh` are never
-    called, and `world.envlayerList` holds only the objects the scenario
-    reached. The flip chain that drives the title's motion is a different
-    path (`AffineLayer.entryFlip` -> `window.entryFlipLayer` -> `flipLayers` ->
-    `onFlipTimerInterval` -> `updateFlipLayers(dt)` -> `layer.updateFlip(dt)`,
-    and `updateFlip` does `_interval += delta`), and it works. Find what the
-    reference calls per frame for the world and make our frame body deliver
-    the same call.
+  * **The world's per-frame env update: there is none, and ours is not
+    short.** An earlier reading took `world.updateAll`, `world.updateSource`
+    and `world.refresh` never being called for a missing per-frame world
+    pump, and took `world.envlayerList` holding only the reached objects for
+    a lost registration. Both readings were wrong, and the measurement that
+    settles them is the one taken AT THE TITLE: there
+    `kag.env.objects` and `world.envobjects` hold the same pair
+    (`bgm`, `title_bg`) and `kag.env.layerList` and
+    `world.envlayerList` hold the same one (`title_bg`) — the two
+    registries are in sync and complete. The earlier counts came from a run
+    that had not reached the title yet, where both registries held exactly
+    `ev`. And the reference has no per-frame world update either:
+    `KAGWorldPlugin.updateAll` is reached only from `updateAllTrans` and the
+    `onRefresh`/`onSync`/`onResetAll` handlers, `KAGWorldPlugin.refresh`
+    only from the save/restore path, and `EnvObjectWorld.updateSource` only
+    from the tag-driven `_updateAll`/`updateDiff`/`syncObject`/`doAfter`/
+    `prepareTransition` — all tag-driven. The reference's per-frame work for
+    an environment layer is the layer DRAW path
+    (`reference/cpp/core/visual/LayerIntf.cpp:6394-6407`, `onPaint` on every
+    draw completion), which ours delivers. The flip chain that drives the
+    title's motion is that draw path (`AffineLayer.entryFlip` ->
+    `window.entryFlipLayer` -> `flipLayers` -> `onFlipTimerInterval` ->
+    `updateFlipLayers(dt)` -> `layer.updateFlip(dt)`, and `updateFlip` does
+    `_interval += delta`). No engine-side divergence here.
+    * Still open, and cheap to settle: the reference-side confirmation of the
+      tag-driven reading (a run that opens the mini player or the stand view —
+      the only scripts that reference `updateAll`), and what the reference
+      shows AFTER the title's two-second intro (the last `.mtn` frame or the
+      `title_bg.png` stage image; both engines should freeze, the clip being
+      a one-shot).
   * **A probe lesson worth keeping:** adding a member to a script class at
     runtime perturbs that class's property dispatch, so a probe that mutates a
     game class can manufacture an error the engine never had. Wrap the
