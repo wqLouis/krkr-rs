@@ -1604,6 +1604,33 @@ impl PlayerInst {
         if !scene.resolve_bitmap(bitmap_id) {
             return;
         }
+        // The canvas the pose is drawn into: the target layer's own rectangle,
+        // or its image when that rectangle is empty.
+        let Some((canvas_width, canvas_height)) =
+            canvas_size(scene, layer_id, self.snapshot.as_deref())
+        else {
+            return;
+        };
+        let (Ok(bounds_width), Ok(bounds_height)) =
+            (i32::try_from(canvas_width), i32::try_from(canvas_height))
+        else {
+            return;
+        };
+        let bounds = (0, 0, bounds_width, bounds_height);
+        // The target layer is given the canvas size before the pose is drawn.
+        // A layer with an empty rectangle draws nothing at all, so a pose
+        // computed into its image would never reach the screen.
+        if scene.update_layer(layer_id, |layer| {
+            if layer.rect.w == canvas_width && layer.rect.h == canvas_height {
+                return false;
+            }
+            layer.rect.w = canvas_width;
+            layer.rect.h = canvas_height;
+            true
+        }) == Some(true)
+        {
+            scene.layer_size_changed(layer_id);
+        }
         let Some(bitmap) = scene.bitmap_mut(bitmap_id) else {
             return;
         };
@@ -1648,6 +1675,7 @@ impl PlayerInst {
                 mask_mode: self.mask_mode,
             },
             &mut tinted,
+            bounds,
         );
         self.tinted = tinted;
         bitmap.mark_dirty();
@@ -1661,6 +1689,51 @@ impl PlayerInst {
             }
         }
     }
+}
+
+/// The canvas a motion pose is drawn into.
+///
+/// The target layer's own rectangle is the canvas; a layer whose rectangle is
+/// empty falls back to the size of its image, and a layer that has neither
+/// falls back to the size of the motion that is being played.
+fn canvas_size(
+    scene: &Scene,
+    layer_id: u32,
+    snapshot: Option<&MotionSnapshot>,
+) -> Option<(u32, u32)> {
+    let (rect_width, rect_height) = scene
+        .layer(layer_id)
+        .map(|layer| (layer.rect.w, layer.rect.h))
+        .unwrap_or((0, 0));
+    let (image_width, image_height) = scene
+        .layer(layer_id)
+        .and_then(|layer| layer.bitmap)
+        .and_then(|id| scene.bitmap(id))
+        .map(|bitmap| (bitmap.width, bitmap.height))
+        .unwrap_or((0, 0));
+    let (width, height) = if rect_width > 0 && rect_height > 0 {
+        (rect_width, rect_height)
+    } else {
+        (image_width, image_height)
+    };
+    if width > 0 && height > 0 {
+        return Some((width, height));
+    }
+    let snapshot = snapshot?;
+    Some((
+        motion_extent(snapshot.width)?,
+        motion_extent(snapshot.height)?,
+    ))
+}
+
+/// The motion's own extent as a canvas size, when it is a usable one.
+fn motion_extent(value: f64) -> Option<u32> {
+    if !value.is_finite() || value <= 0.0 || value > f64::from(u32::MAX) {
+        return None;
+    }
+    let rounded = value.round();
+    let extent = u32::try_from(rounded as u64).ok()?;
+    (extent > 0).then_some(extent)
 }
 
 /// The state one pose is painted with.
@@ -1694,6 +1767,7 @@ fn composite_pose(
     storage: Option<&Storage>,
     settings: DrawSettings,
     tinted: &mut TintedSources,
+    bounds: (i32, i32, i32, i32),
 ) -> Vec<String> {
     let mut frame = DrawFrame {
         snapshot,
@@ -1702,7 +1776,6 @@ fn composite_pose(
         tinted,
         missing: Vec::new(),
     };
-    let bounds = (0, 0, bitmap.width as i32, bitmap.height as i32);
     for index in 1..nodes.len() {
         if settings.preview && nodes[index].child_owner.is_some() {
             continue;
@@ -4225,6 +4298,7 @@ mod tests {
                 mask_mode: player.mask_mode,
             },
             &mut player.tinted,
+            (0, 0, 800, 1080),
         );
         assert!(missing.is_empty(), "synthetic shapes need no texture");
         bitmap
@@ -5688,6 +5762,7 @@ mod tests {
                     mask_mode: player.mask_mode,
                 },
                 &mut player.tinted,
+                (0, 0, 4, 4),
             );
             assert!(missing.is_empty());
             bitmap
@@ -5741,6 +5816,7 @@ mod tests {
                     mask_mode: player.mask_mode,
                 },
                 &mut player.tinted,
+                (0, 0, 4, 4),
             );
             assert!(missing.is_empty());
             [
@@ -5793,6 +5869,7 @@ mod tests {
                     mask_mode: player.mask_mode,
                 },
                 &mut player.tinted,
+                (0, 0, 4, 4),
             );
             assert!(missing.is_empty());
             bitmap
@@ -5859,6 +5936,7 @@ mod tests {
                     mask_mode: player.mask_mode,
                 },
                 &mut player.tinted,
+                (0, 0, 4, 4),
             )
         };
         draw(&mut player, &mut bitmap);
@@ -5924,6 +6002,7 @@ mod tests {
                 mask_mode: player.mask_mode,
             },
             &mut player.tinted,
+            (0, 0, 4, 4),
         );
         assert!(missing.is_empty());
         assert_eq!(&bitmap.rgba[..4], &[30u8, 10, 2, 255][..]);
@@ -5946,6 +6025,7 @@ mod tests {
                 mask_mode: player.mask_mode,
             },
             &mut player.tinted,
+            (0, 0, 4, 4),
         );
         assert!(missing.is_empty());
         assert_eq!(player.tinted.len(), 1, "the second draw reuses the entry");
@@ -6626,6 +6706,7 @@ mod tests {
                     mask_mode,
                 },
                 &mut player.tinted,
+                (0, 0, 800, 1080),
             );
             assert!(missing.is_empty());
             alpha(&bitmap, 100, 100)

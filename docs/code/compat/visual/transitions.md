@@ -126,6 +126,22 @@ an unreadable member raises
 
 The teardown clears the self image and the recorded transition frame.
 
+### The blend the destination's type selects
+
+The blend a cross-fade runs is chosen by the destination layer's type, and
+the type is read once, when `beginTransition` starts the transition:
+
+| the destination's type | the blend |
+|---|---|
+| a type that uses its alpha channel (`ltAlpha` and the Photoshop spellings) | the alpha-vs-alpha blend: the source covers the destination with the share the two alphas give it, and the result's own alpha is the two alphas mixed by the phase |
+| `ltAddAlpha` | the additive blend: all four channels are mixed with the phase as the ratio |
+| every other type (`ltOpaque`, `ltAdditive`, the subtractive and the multiplicative ones) | the plain blend: the colour channels are mixed with the phase as the ratio |
+
+L3 states the destination's handling as `engine_api::DestAlpha`, the generic
+vocabulary the engine's transition machine understands; the engine never sees
+the script's type numbering. The `universal` and `mask` kinds and the
+`extrans` providers keep the four-channel mix.
+
 ### The composited form
 
 `Scene::composite_transition_frames` is the one host-selected field: it says
@@ -285,7 +301,7 @@ This is what makes an `AffineLayer` render: its `onPaint` copies the hidden
 
 | State | Owner |
 |---|---|
-| the transition machine, the rule image, the blend target | L2 `engine_api::Trans` / `TransKind` / `RuleMask` |
+| the transition machine, the rule image, the blend target, the destination's alpha handling | L2 `engine_api::Trans` / `TransKind` / `RuleMask` / `DestAlpha` |
 | the active transition per layer (`Trans`, the source id, `with_children`) | L3 `LayerExtras::transitions` |
 | the runtime state (`self_update`, the retained tick callback, `pending_ms`) | L3 `TransitionRuntimeState` |
 | the cache revisions | L3 `LayerExtras::cache_revisions` |

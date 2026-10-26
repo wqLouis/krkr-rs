@@ -48,7 +48,7 @@ rather than raising.
 | `flipUD(dst, rect)` | mirrors a region vertically, in place |
 | `adjustGamma(bmp, rgamma, rfloor, rceil, ggamma, gfloor, gceil, bgamma, bfloor, bceil, cliprect, isaddalpha)` | applies a per-channel gamma ramp |
 | `doBoxBlur(bmp, xblur, yblur, clipRect, isalpha)` | a box blur |
-| `doGrayScale(bmp, clipRect)` | a luma grayscale |
+| `doGrayScale(bmp, clipRect)` | a grey: `(19*R + 183*G + 54*B) >> 8` written to the three colour channels, the alpha held |
 | `fillRect(bmp, value, rect, isalpha, cliprect)` | fills a rectangle |
 | `colorRect(bmp, value, opa, rect, face, cliprect)` | fills a rectangle with a blend face |
 | `drawText(bmp, font, x, y, text, color, opacity, antialias, …, cliprect)` | draws a string with a `Font` |
@@ -155,11 +155,15 @@ an integer`, `value cannot be converted to an integer`.
 `crates/compat/tests/image_function.rs` covers the member registration, the
 constructor, `fillRect` in both alpha modes, `colorRect` with `dfMask` and
 `dfOpaque`, `flipLR` over a sub-rect, `flipUD` over the whole bitmap, the
-out-of-bounds rejection, `doGrayScale` with the reference's exact luma,
+out-of-bounds rejection, `doGrayScale` with the reference's exact grey,
 `adjustGamma` as a no-op on identity data, `doBoxBlur` as an average over the
 kernel, `operateRect`, `operateStretch`, `operateAffine` in points mode, the
 `drawText` / `drawGlyph` errors, and the argument-count and unknown-bitmap
 errors.
+
+`crates/compat/tests/greyscale.rs` covers the grey's weights, the layer's own
+`doGrayScale`, the gamma ramp's per-channel tables and the blur's channel
+symmetry.
 
 ---
 

@@ -224,12 +224,14 @@ fn color_rect_and_pixel_accessors() {
          l.setMainPixel(1, 0, 0x00ff00); \
          var main2 = l.getMainPixel(1, 0);",
     );
-    // `getMainPixel` masks the alpha out (0x00RRGGBB)
-    // (`reference/cpp/core/visual/LayerIntf.cpp:2917-2923`). The colour the
-    // fill resolved is the one the reference paints
-    // (`reference/cpp/core/visual/LayerIntf.cpp:4351`): `0xffff0000` keeps
-    // its low 24 bits with the red and blue bytes swapped.
-    assert_eq!(env.eval_int("main"), 0x0000_00ff);
+    // `getMainPixel` masks the alpha out and reports the packed word of the
+    // RGBA planes, read little-endian
+    // (`reference/cpp/core/visual/LayerIntf.cpp:2917-2923`,
+    // `reference/cpp/core/visual/RenderManager.cpp:346-350`), so the red is in
+    // its low byte. The colour the fill resolved is the one the reference
+    // paints (`reference/cpp/core/visual/LayerIntf.cpp:4351`): `0xffff0000`
+    // keeps its low 24 bits with the red and blue bytes swapped.
+    assert_eq!(env.eval_int("main"), 0x00ff_0000);
     assert_eq!(env.eval_int("mask"), 255);
     assert_eq!(env.eval_int("mask2"), 128);
     assert_eq!(env.eval_int("main2"), 0x0000_ff00);
@@ -247,8 +249,8 @@ fn flip_lr_and_ud_mirror_the_image() {
          var left = l.getMainPixel(0, 0); \
          var right = l.getMainPixel(1, 0);",
     );
-    assert_eq!(env.eval_int("left"), 0x00ff_0000);
-    assert_eq!(env.eval_int("right"), 0x0000_00ff);
+    assert_eq!(env.eval_int("left"), 0x0000_00ff);
+    assert_eq!(env.eval_int("right"), 0x00ff_0000);
 }
 
 #[test]
@@ -263,7 +265,7 @@ fn copy_rect_copies_pixels_between_layers() {
          b.copyRect(0, 0, a, 1, 1, 1, 1); \
          var p = b.getMainPixel(0, 0);",
     );
-    assert_eq!(env.eval_int("p"), 0x0012_3456);
+    assert_eq!(env.eval_int("p"), 0x0056_3412);
 }
 
 #[test]
@@ -414,7 +416,7 @@ fn copy_to_bitmap_and_copy9patch() {
          l.copyToBitmapFromMainImage(b); \
          var p = b.getPixel(0, 0);",
     );
-    assert_eq!(env.eval_int("p"), 0xab_cdef);
+    assert_eq!(env.eval_int("p"), 0xef_cdab);
     // A 1x1 source is too small for the 9-patch; the call is still valid.
     assert!(env.eval("l.copy9Patch(b)").is_ok());
 }

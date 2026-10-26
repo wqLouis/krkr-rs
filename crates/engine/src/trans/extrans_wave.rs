@@ -69,9 +69,11 @@
 //!
 //! `Process` dispatches on the destination layer type between
 //! `TVPConstAlphaBlend_SD`, `_a` (additive alpha) and `_d` (alpha-vs-alpha).
-//! L2 stores one straight-alpha representation, so all three collapse into
-//! [`blend_level`], the shared `TVPConstAlphaBlend_SD` arithmetic of the
-//! parent module.
+//! The cross-fade mixes by the destination's alpha handling
+//! ([`DestAlpha`](super::DestAlpha)), but the wave names the straight-alpha
+//! type alone, which the generic handling does not single out, so the wave
+//! keeps [`blend_level`], the shared `TVPConstAlphaBlend_SD` arithmetic of
+//! the parent module.
 
 use super::{PI_TRUNCATED, Trans, TransError, argb_to_rgba, blend_level, read_pixel, write_pixel};
 use crate::layer_ops::{RectI, intersect};

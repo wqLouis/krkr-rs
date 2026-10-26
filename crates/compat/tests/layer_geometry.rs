@@ -300,7 +300,7 @@ fn copy_from_bitmap_accepts_null_as_a_noop() {
     assert_eq!(env.eval_int("l.height"), 8);
     assert_eq!(env.eval_int("l.imageWidth"), 8);
     assert_eq!(env.eval_int("l.imageHeight"), 8);
-    assert_eq!(env.eval_int("l.getMainPixel(0, 0)"), 0xff0000);
+    assert_eq!(env.eval_int("l.getMainPixel(0, 0)"), 0x00_00ff);
 
     // A non-object argument is a variant-conversion error, not a no-op, and a
     // non-Bitmap object is an invalid parameter.

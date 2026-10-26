@@ -58,6 +58,10 @@ pub(crate) struct TextRenderState {
     pub(super) italic: bool,
     pub(super) face: String,
     pub(super) font_size: i32,
+    /// The big size the `%B` escape selects.
+    pub(super) big_font_size: i32,
+    /// The small size the `%S` escape selects.
+    pub(super) small_font_size: i32,
     pub(super) font_scale: f64,
     pub(super) ch_color: u32,
     pub(super) ruby_size: i32,
@@ -81,6 +85,8 @@ impl Default for TextRenderState {
             italic: false,
             face: "user".to_string(),
             font_size: 24,
+            big_font_size: 48,
+            small_font_size: 12,
             font_scale: 1.0,
             ch_color: 0x00ff_ffff,
             ruby_size: 10,
@@ -103,55 +109,88 @@ impl TextRenderState {
     /// Reference `TextRenderState::deserialize`: only the style fields are
     /// read; `renderOver`/`renderDelay`/`renderText` are deliberately left
     /// untouched (the reference's `deserialize` omits them).
+    ///
+    /// Every style member has two spellings: the lower-case one the shipped
+    /// `textrender.dll` reads and the camel-case one the class properties
+    /// use. Both are accepted, the lower-case one first. The members only the
+    /// shipped build reads are taken under its spelling alone: `bigfontsize`,
+    /// `smallfontsize`, `shadowdiff`, `align` and `valign`.
     pub(super) fn deserialize(&mut self, host: &Tjs2Engine, value: &Value) -> Result<(), String> {
         let Some(id) = object_id(host, value)? else {
             return Ok(());
         };
-        if let Some(v) = member(host, id, "bold") {
+        if let Some(v) = style_member(host, id, &["bold"]) {
             self.bold = tjs_bool(&v);
         }
-        if let Some(v) = member(host, id, "italic") {
+        if let Some(v) = style_member(host, id, &["italic"]) {
             self.italic = tjs_bool(&v);
         }
-        if let Some(v) = member(host, id, "fontSize") {
-            self.font_size = tjs_i64(&v) as i32;
+        let base_size = style_member(host, id, &["fontsize", "fontSize"]);
+        if let Some(v) = &base_size {
+            self.font_size = tjs_i64(v) as i32;
         }
-        if let Some(v) = member(host, id, "fontScale") {
+        // The shipped build keeps the big and the small size beside the base
+        // one and derives them from it when the dictionary does not name
+        // them: the big size is twice the base size, the small size half of
+        // it.
+        match style_member(host, id, &["bigfontsize"]) {
+            Some(v) => self.big_font_size = tjs_i64(&v) as i32,
+            None if base_size.is_some() => {
+                self.big_font_size = self.font_size.saturating_mul(2);
+            }
+            None => {}
+        }
+        match style_member(host, id, &["smallfontsize"]) {
+            Some(v) => self.small_font_size = tjs_i64(&v) as i32,
+            None if base_size.is_some() => {
+                self.small_font_size = self.font_size / 2;
+            }
+            None => {}
+        }
+        if let Some(v) = style_member(host, id, &["fontScale"]) {
             self.font_scale = tjs_f64(&v);
         }
-        if let Some(TjsValue::String(face)) = member(host, id, "face") {
+        if let Some(TjsValue::String(face)) = style_member(host, id, &["face"]) {
             self.face = face;
         }
-        if let Some(v) = member(host, id, "chColor") {
+        if let Some(v) = style_member(host, id, &["color", "chColor"]) {
             self.ch_color = tjs_i64(&v) as u32;
         }
-        if let Some(v) = member(host, id, "rubySize") {
+        if let Some(v) = style_member(host, id, &["rubysize", "rubySize"]) {
             self.ruby_size = tjs_i64(&v) as i32;
         }
-        if let Some(v) = member(host, id, "rubyOffset") {
+        if let Some(v) = style_member(host, id, &["rubyoffset", "rubyOffset"]) {
             self.ruby_offset = tjs_i64(&v) as i32;
         }
-        if let Some(v) = member(host, id, "shadow") {
+        if let Some(v) = style_member(host, id, &["shadow"]) {
             self.shadow = tjs_bool(&v);
         }
-        if let Some(v) = member(host, id, "shadowColor") {
+        if let Some(v) = style_member(host, id, &["shadowcolor", "shadowColor"]) {
             self.shadow_color = tjs_i64(&v) as u32;
         }
-        if let Some(v) = member(host, id, "edge") {
+        if let Some(v) = style_member(host, id, &["edge"]) {
             self.edge = tjs_bool(&v);
         }
-        if let Some(v) = member(host, id, "edgeColor") {
+        if let Some(v) = style_member(host, id, &["edgecolor", "edgeColor"]) {
             self.edge_color = tjs_i64(&v) as u32;
         }
-        if let Some(v) = member(host, id, "lineSpacing") {
+        if let Some(v) = style_member(host, id, &["linespacing", "lineSpacing"]) {
             self.line_spacing = tjs_i64(&v) as i32;
         }
-        if let Some(v) = member(host, id, "pitch") {
+        if let Some(v) = style_member(host, id, &["pitch"]) {
             self.pitch = tjs_i64(&v) as i32;
         }
-        if let Some(v) = member(host, id, "lineSize") {
+        if let Some(v) = style_member(host, id, &["linesize", "lineSize"]) {
             self.line_size = tjs_i64(&v) as i32;
         }
+        // The shipped build keeps the shadow difference and the alignment in
+        // the style and no code path reads them back, so the port takes them
+        // out of the dictionary and applies the same nil effect.
+        let _inert = (
+            style_member(host, id, &["shadowdiff"]),
+            style_member(host, id, &["align"]),
+            style_member(host, id, &["valign"]),
+        );
         Ok(())
     }
 }
@@ -222,6 +261,17 @@ fn member(host: &Tjs2Engine, id: Tjs2ValueId, name: &str) -> Option<TjsValue> {
         Ok(TjsValue::Void) | Err(_) => None,
         Ok(value) => Some(value),
     }
+}
+
+/// Read a style member under the first spelling the dictionary carries.
+///
+/// The style members have two spellings: the lower-case one the shipped
+/// `textrender.dll` reads (`color`, `fontsize`, `linespacing`, ...) and the
+/// camel-case one the class properties use (`chColor`, `fontSize`,
+/// `lineSpacing`, ...). A dictionary that carries both takes the lower-case
+/// value.
+fn style_member(host: &Tjs2Engine, id: Tjs2ValueId, names: &[&str]) -> Option<TjsValue> {
+    names.iter().find_map(|name| member(host, id, *name))
 }
 
 /// TJS `operator bool` for a member value.

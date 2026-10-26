@@ -1591,8 +1591,8 @@ pub fn stretch_blit_plane(
     dst.mark_dirty_rect(clipped_region(dc));
 }
 
-/// Luma `(54*R + 183*G + 19*B) >> 8` written to all three channels, alpha
-/// held.
+/// Grey `(19*R + 183*G + 54*B) >> 8` written to all three colour channels,
+/// the alpha held.
 pub fn do_gray_scale(bitmap: &mut BitmapState, rect: RectI) {
     if !pixels_usable(bitmap, "doGrayScale") {
         return;
@@ -1604,7 +1604,7 @@ pub fn do_gray_scale(bitmap: &mut BitmapState, rect: RectI) {
         for x in x0..x1 {
             let mut d = read_pixel(bitmap, x, y);
             let gray =
-                ((54 * u32::from(d[0]) + 183 * u32::from(d[1]) + 19 * u32::from(d[2])) >> 8) as u8;
+                ((19 * u32::from(d[0]) + 183 * u32::from(d[1]) + 54 * u32::from(d[2])) >> 8) as u8;
             d[0] = gray;
             d[1] = gray;
             d[2] = gray;

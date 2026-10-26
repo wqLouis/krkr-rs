@@ -3890,7 +3890,6 @@
 {"path": "crates/platform/render/src/cpu.rs", "rule": "reference-citation", "anchor": "/// This is the reference's default layer blit sampling: the software", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/render/src/cpu.rs", "rule": "reference-citation", "anchor": "/// `reference/cpp/core/visual/gl/blend_functor_c.h` (including the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/render/src/glyph.rs", "rule": "reference-citation", "anchor": "//! The rasterization core is adapted from `crates/tvp-text` (read-only", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/platform/render/src/glyph.rs", "rule": "history-comment", "anchor": "//! oblique slant the middle layer previously applied at paint time. Unlike the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/render/src/glyph.rs", "rule": "reference-citation", "anchor": "//! reference): [`px_scale_for_height`] preserves the reference height-to-scale", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/render/src/glyph.rs", "rule": "reference-citation", "anchor": "/// Rounds a pixel-space advance the way the reference `FT_PosToInt` does:", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/render/src/glyph.rs", "rule": "history-comment", "anchor": "/// `0.25` is the conventional ~14° oblique the middle layer previously applied", "reason": "legacy comment, cleanup tracked in TODO §15"}

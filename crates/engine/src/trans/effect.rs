@@ -19,7 +19,7 @@ use api::shader::EffectUniforms;
 use crate::scene::Rect;
 use crate::shader::builtin::{self, Program};
 use crate::shader::{EffectDraw, EffectPass, EffectTexture};
-use crate::trans::{Trans, TransKind};
+use crate::trans::{DestAlpha, Trans, TransKind};
 
 /// The weight the cross-fade blends at, for a phase.
 ///
@@ -44,19 +44,39 @@ fn normalized_uv(src: Rect, size: (u32, u32)) -> [f32; 4] {
     ]
 }
 
+/// The mix the cross-fade program runs, for the destination's alpha
+/// handling.
+///
+/// The program covers the four channels alike for a destination that ignores
+/// its alpha and for one that stores an additive alpha; a destination that
+/// stores a straight alpha per pixel gets the mix that covers the source with
+/// the share of the destination its two alphas give it.
+fn blend_method(dest_alpha: DestAlpha) -> f32 {
+    match dest_alpha {
+        DestAlpha::Opaque | DestAlpha::Additive => 0.0,
+        DestAlpha::Straight => 1.0,
+    }
+}
+
 /// Builds the uniform block of a pass, or `None` when the block is not
 /// usable.
 ///
 /// The layout is the one every shipped program declares: two source
 /// rectangles, a parameters `vec4` and the spare `vec4` whose `w` the
 /// renderer overwrites with the composed draw opacity.
-fn pass_uniforms(first: [f32; 4], second: [f32; 4], weight: f32) -> Option<EffectUniforms> {
+fn pass_uniforms(
+    first: [f32; 4],
+    second: [f32; 4],
+    weight: f32,
+    method: f32,
+) -> Option<EffectUniforms> {
     let mut words = [0.0f32; builtin::UNIFORM_WORDS as usize];
     let first_words = builtin::RECT0_UNIFORM as usize;
     let second_words = builtin::RECT1_UNIFORM as usize;
     words[first_words..first_words + 4].copy_from_slice(&first);
     words[second_words..second_words + 4].copy_from_slice(&second);
     words[builtin::PARAM_UNIFORM as usize] = weight;
+    words[builtin::METHOD_UNIFORM as usize] = method;
     match EffectUniforms::from_words(&words) {
         Ok(uniforms) => Some(uniforms),
         Err(error) => {
@@ -101,7 +121,12 @@ impl Trans {
                     (src1, src2)
                 };
                 let full = [0.0, 0.0, 1.0, 1.0];
-                let uniforms = pass_uniforms(full, full, phase_weight(self.phase))?;
+                let uniforms = pass_uniforms(
+                    full,
+                    full,
+                    phase_weight(self.phase),
+                    blend_method(self.dest_alpha),
+                )?;
                 let pass = EffectPass::new(
                     Program::CrossFade,
                     vec![EffectTexture::new(first), EffectTexture::new(second)],
@@ -124,7 +149,7 @@ impl Trans {
                     let Some((dst, src)) = super::scroll_source_rects(frame, placement) else {
                         continue;
                     };
-                    let uniforms = pass_uniforms(normalized_uv(src, size), [0.0; 4], 0.0)?;
+                    let uniforms = pass_uniforms(normalized_uv(src, size), [0.0; 4], 0.0, 0.0)?;
                     passes.push(EffectPass::new(
                         Program::Scroll,
                         vec![EffectTexture::new(bitmap)],

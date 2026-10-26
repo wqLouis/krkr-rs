@@ -1,11 +1,14 @@
 #version 450
 
-// Cross-fade: the per-channel lerp of two sources at the phase weight.
+// Cross-fade: the per-pixel mix of two sources at the phase weight.
 //
 // Uniform block layout (16 words, shared by every effect program):
 //   words  0..4  u_rect0.xyzw = (u0, v0, u1, v1) of the source at binding 1
 //   words  4..8  u_rect1.xyzw = the same for the source at binding 2
-//   words  8..12 u_extra0     = parameters; x is the blend weight
+//   words  8..12 u_extra0     = parameters; x is the blend weight, y is the
+//                               mix (0: the four channels are covered alike,
+//                               1: the source covers the destination with the
+//                               share the two alphas give it)
 //   words 12..16 u_extra1     = parameters; w is the composed draw opacity
 // The renderer overwrites the declared opacity word (15) with the layer and
 // window opacity for the frame, so the program never reads a stale value.
@@ -16,6 +19,11 @@
 // its encoded value, mixes there, and converts the mixed value back to linear
 // for the sRGB target. The alpha channel carries no transfer function, so it
 // is mixed as it comes.
+//
+// The mix is the one the destination's alpha handling selects. A destination
+// that ignores its alpha and one that stores an additive alpha both mix the
+// four channels alike; a destination that stores a straight alpha per pixel
+// mixes the colour by the share of the destination the source covers.
 
 layout(location = 0) in vec2 in_uv;
 layout(location = 0) out vec4 out_color;
@@ -53,8 +61,17 @@ void main() {
     // difference first, so two equal samples mix to exactly that sample.
     vec3 first = to_encoded(a.rgb);
     vec3 second = to_encoded(b.rgb);
-    vec3 encoded = first + (second - first) * params.u_extra0.x;
-    float alpha = a.a + (b.a - a.a) * params.u_extra0.x;
+    float weight = params.u_extra0.x;
+    // The share of the destination the source covers: the source's own alpha
+    // scaled by the weight, over the destination's alpha scaled by the rest
+    // of it. The epsilon keeps the division finite when both are transparent.
+    float ratio = weight;
+    if (params.u_extra0.y > 0.5) {
+        ratio = b.a * weight
+            / (a.a * (1.0 - weight) * (1.0 - b.a * weight) + b.a * weight + 0.0001);
+    }
+    vec3 encoded = first + (second - first) * ratio;
+    float alpha = a.a + (b.a - a.a) * weight;
     // Two equal samples are that sample; keeping the value the sampler gave
     // spares the conversion's rounding where one source is copied verbatim.
     vec3 rgb = all(equal(a.rgb, b.rgb)) ? a.rgb : to_linear(encoded);

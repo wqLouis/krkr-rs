@@ -480,7 +480,7 @@ All the arithmetic is `wrapping_*`, matching the reference's 32-bit edges.
 | `operateRect`, `operateStretch`, `operateAffine` | the blits. |
 | `flipLR`, `flipUD` | mirror a region in place. |
 | `fillRect`, `colorRect` | `fillRect` replaces RGB (and the alpha when given); without an alpha argument it **holds** the destination alpha. `colorRect` writes the alpha channel on the `dfMask` face and RGB on the `dfOpaque` face. |
-| `adjustGamma`, `doBoxBlur`, `doGrayScale` | the filters; `doGrayScale` uses the reference luma. |
+| `adjustGamma`, `doBoxBlur`, `doGrayScale` | the filters; `doGrayScale` uses the reference's grey weights. |
 | `drawText`, `drawGlyph` | `drawText` reads the face and the style from the `Font` argument; `drawGlyph` extracts the glyph's text and draws it with the resolver's default face. |
 
 The rectangle convention is half-open, the arguments are read through

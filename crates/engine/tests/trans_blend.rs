@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use engine::BitmapState;
 use engine::layer_ops::RectI;
-use engine::trans::{PHASE_MAX, RuleMask, Trans};
+use engine::trans::{DestAlpha, PHASE_MAX, RuleMask, Trans};
 
 /// The pixels the blend tests read: the channel extremes, the alpha
 /// extremes and a mid-tone.
@@ -88,10 +88,12 @@ fn sources() -> (BitmapState, BitmapState) {
     )
 }
 
-/// A cross-fade that stands at `phase`.
-fn cross_fade_at(phase: i32) -> Trans {
+/// A cross-fade that stands at `phase` and mixes the way the
+/// destination's alpha handling selects.
+fn cross_fade_at(phase: i32, dest_alpha: DestAlpha) -> Trans {
     let duration = 1000.0;
     let mut trans = Trans::cross_fade(duration).expect("crossfade");
+    trans.dest_alpha = dest_alpha;
     // Half a phase into the phase's own interval, so the truncation of the
     // phase cannot land on its neighbour.
     let elapsed = f64::from(phase) + 0.5;
@@ -120,13 +122,14 @@ fn pixel(bitmap: &BitmapState, index: usize) -> [u8; 4] {
 /// every phase and every channel of the test pixels.
 ///
 /// The blend is the per-channel `src1 + (src2 - src1) * opa / 256` the
-/// reference applies to a whole row at a time
-/// (`reference/cpp/core/visual/tvpgl.cpp:4387-4399`).
+/// reference applies to a whole row at a time, over all four channels
+/// (`reference/cpp/core/visual/tvpgl.cpp:4446-4473`,
+/// `reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3265-3268`).
 #[test]
 fn the_cross_fade_blends_every_phase_like_the_reference() {
     let (src1, src2) = sources();
     for phase in 1..PHASE_MAX {
-        let trans = cross_fade_at(phase);
+        let trans = cross_fade_at(phase, DestAlpha::Additive);
         let mut dst = BitmapState::new(src1.width, src1.height, vec![0u8; src1.rgba.len()]);
         trans
             .apply(&mut dst, &src1, &src2, region(&src1))
@@ -163,12 +166,58 @@ fn the_cross_fade_endpoints_are_copies_of_one_source() {
     assert_eq!(dst.rgba, src2.rgba, "the last phase is source 2");
 }
 
+/// The mix follows the destination's alpha handling.
+///
+/// The reference picks the blend by the destination's type
+/// (`reference/cpp/core/visual/TransIntf.cpp:664-686`): a destination that
+/// ignores its alpha and one that stores an additive alpha both cover the four
+/// channels alike (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3265-3268`,
+/// the plain and the additive cross-fade blends share that script), and a
+/// destination that stores a straight alpha per pixel gets the blend that
+/// covers the source with the share of the destination its two alphas give it
+/// (`RenderManager_ogl.cpp:3278-3291`).
+///
+/// The CPU path writes the alpha-vs-alpha blend with the byte-exact opacity
+/// table the reference's software path reads
+/// (`reference/cpp/core/visual/tvpgl.cpp:224-251`,
+/// `reference/cpp/core/visual/gl/blend_functor_c.h:689-707`).
+///
+/// The values are the ones the reference writes for an opaque red source 1 and
+/// a source 2 that carries half of its alpha, at phase 127.
+#[test]
+fn the_cross_fade_mixes_by_the_destination_alpha_handling() {
+    let src1 = BitmapState::new(1, 1, vec![255, 0, 0, 255]);
+    let src2 = BitmapState::new(1, 1, vec![0, 0, 255, 128]);
+    let area = (0, 0, 1, 1);
+
+    let mut dst = BitmapState::new(1, 1, vec![0u8; 4]);
+    cross_fade_at(127, DestAlpha::Opaque)
+        .apply(&mut dst, &src1, &src2, area)
+        .expect("crossfade");
+    assert_eq!(dst.rgba, [128, 0, 126, 191], "the four-channel mix");
+
+    let mut dst = BitmapState::new(1, 1, vec![0u8; 4]);
+    cross_fade_at(127, DestAlpha::Additive)
+        .apply(&mut dst, &src1, &src2, area)
+        .expect("crossfade");
+    assert_eq!(dst.rgba, [128, 0, 126, 191], "the additive mix");
+
+    let mut dst = BitmapState::new(1, 1, vec![0u8; 4]);
+    cross_fade_at(127, DestAlpha::Straight)
+        .apply(&mut dst, &src1, &src2, area)
+        .expect("crossfade");
+    assert_eq!(dst.rgba, [155, 0, 99, 191], "the alpha-vs-alpha mix");
+}
+
 /// The rule blend takes the weight of every pixel from the rule image and
 /// leaves the pixels the rule has not reached at source 1.
 ///
 /// The weight comes from the rule (`reference/cpp/core/visual/tvpgl.cpp:4624-4636`)
 /// and the table that maps the rule's grayscale value to it
-/// (`reference/cpp/core/visual/tvpgl.cpp:4576-4595`).
+/// (`reference/cpp/core/visual/tvpgl.cpp:4576-4595`). The mix is the one the
+/// destination's alpha handling selects
+/// (`reference/cpp/core/visual/TransIntf.cpp:737-761`); the additive one
+/// covers the four channels alike, which is the arithmetic this test states.
 #[test]
 fn the_rule_blend_takes_the_weight_of_every_pixel_from_the_rule() {
     let (src1, src2) = sources();
@@ -176,6 +225,9 @@ fn the_rule_blend_takes_the_weight_of_every_pixel_from_the_rule() {
     let rule = RuleMask::new(4, 1, vec![0, 57, 90, 119]).expect("rule");
     let vague = 64;
     let mut trans = Trans::universal(1000.0, vague, rule.clone()).expect("universal");
+    // The additive mix covers the four channels alike, which is the arithmetic
+    // this test states.
+    trans.dest_alpha = DestAlpha::Additive;
     let phase = 120;
     // A universal transition runs to `PHASE_MAX + vague`.
     trans.seek_ms((f64::from(phase) + 0.5) * 1000.0 / f64::from(PHASE_MAX + vague));
@@ -200,6 +252,48 @@ fn the_rule_blend_takes_the_weight_of_every_pixel_from_the_rule() {
     }
 }
 
+/// The rule blend's mix follows the destination's alpha handling too.
+///
+/// The reference's universal handler picks its blend by the destination's
+/// type with the same test the cross-fade uses
+/// (`reference/cpp/core/visual/TransIntf.cpp:737-761`): a destination that
+/// ignores its alpha mixes the colour channels alone and keeps its own
+/// alpha, one that stores an additive alpha covers the four channels alike,
+/// and one that stores a straight alpha per pixel gets the mix that covers
+/// the source with the share of the destination its two alphas give it
+/// (`reference/cpp/core/visual/tvpgl.cpp:4612-4686`, `:5106-5138`,
+/// `:4831-4905`).
+///
+/// The values are the ones the reference writes for an opaque red source 1
+/// and a source 2 that carries half of its alpha, at the rule's weight 128.
+#[test]
+fn the_rule_blend_mixes_by_the_destination_alpha_handling() {
+    let src1 = BitmapState::new(1, 1, vec![255, 0, 0, 255]);
+    let src2 = BitmapState::new(1, 1, vec![0, 0, 255, 128]);
+    // A rule of one pixel: its gray 150 maps to the weight 128 at phase 200
+    // with a vague of 100.
+    let rule = RuleMask::new(1, 1, vec![150]).expect("rule");
+    let area = (0, 0, 1, 1);
+
+    for (dest_alpha, expected) in [
+        (DestAlpha::Opaque, [0x7f, 0x00, 0x7f, 0xff]),
+        (DestAlpha::Additive, [0x7f, 0x00, 0x7f, 0xbf]),
+        (DestAlpha::Straight, [0x99, 0x00, 0x65, 0xbf]),
+    ] {
+        let mut trans = Trans::universal(1000.0, 100, rule.clone()).expect("universal");
+        trans.dest_alpha = dest_alpha;
+        // 564 ms into a 1000 ms universal transition with a vague of 100
+        // truncates to phase 200, where the rule's gray 150 weighs 128.
+        trans.seek_ms(564.0);
+        assert_eq!(trans.phase(), 200, "the transition stands at the phase");
+        let mut dst = BitmapState::new(1, 1, vec![0u8; 4]);
+        trans
+            .apply(&mut dst, &src1, &src2, area)
+            .expect("universal");
+        assert_eq!(dst.rgba, expected, "the mix of {dest_alpha:?}");
+    }
+}
+
 /// A timing measurement of the 1920x1080 cross-fade blend.
 ///
 /// The measurement is a note, not an assertion: run it with
@@ -213,7 +307,7 @@ fn the_cross_fade_blend_timing_note() {
     let src1 = BitmapState::new(width, height, vec![7u8; bytes]);
     let src2 = BitmapState::new(width, height, vec![219u8; bytes]);
     let mut dst = BitmapState::new(width, height, vec![0u8; bytes]);
-    let trans = cross_fade_at(127);
+    let trans = cross_fade_at(127, DestAlpha::Additive);
     let area = region(&src1);
 
     let frames = 10;

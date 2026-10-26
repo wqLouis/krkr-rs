@@ -28,7 +28,7 @@
 //!
 //! | kind | reference provider | options |
 //! |---|---|---|
-//! | [`TransKind::CrossFade`] | `crossfade` | linear blend src1 → src2 |
+//! | [`TransKind::CrossFade`] | `crossfade` | blend src1 → src2 |
 //! | [`TransKind::Universal`] | `universal` | `vague`, rule image |
 //! | [`TransKind::Mask`] | (`universal` with `vague=0`) | rule image |
 //! | [`TransKind::Scroll`] | `scroll` | `from`, `stay` |
@@ -37,11 +37,24 @@
 //! [`RuleMask`] tiled over the source, exactly like
 //! `iTVPSimpleImageProvider::LoadImage` tiles a smaller rule graphic.
 //!
+//! # The mix
+//!
+//! The mix is chosen by the surface the transition writes into, not by its
+//! kind ([`DestAlpha`]). A surface that ignores its alpha and one that stores
+//! an additive alpha mix the four channels alike; a surface that stores a
+//! straight alpha per pixel mixes the colour by the share of the destination
+//! the source covers, and the alpha by the phase. The rule-based kinds mix
+//! the colour channels alone for a surface that ignores its alpha and keep
+//! that surface's own alpha. The caller states the destination's handling in
+//! [`Trans::dest_alpha`].
+//!
 //! # Errors
 //!
 //! A non-positive/NaN duration, a negative `vague`, a missing or unexpected
 //! rule, an inconsistent rule and mismatched source sizes are typed
 //! [`TransError`]s; nothing is silently clamped to a fallback.
+
+use std::sync::OnceLock;
 
 use crate::layer_ops::{RectI, blit_copy, blit_copy_clipped, intersect, intersect_rect};
 use crate::scene::{BitmapState, Rect, TransitionFrame, TransitionSource};
@@ -89,6 +102,30 @@ pub enum ScrollStay {
     StaySrc,
 }
 
+/// The alpha handling of the surface a transition writes into.
+///
+/// The mix a transition runs is chosen by the destination's own
+/// composition, not by the transition's kind: a surface that ignores its
+/// alpha, one that stores a straight alpha per pixel and one that stores an
+/// additive (premultiplied) alpha each mix the two sources differently.
+///
+/// The default is [`DestAlpha::Straight`], the handling of the default
+/// layer, whose blend is a straight source-over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DestAlpha {
+    /// The destination ignores its alpha channel: the mix does not account
+    /// for the alpha of either source.
+    Opaque,
+    /// The destination stores a straight alpha per pixel: the mix accounts
+    /// for the alpha of both sources, and the source's coverage of the
+    /// destination decides how much of it shows.
+    #[default]
+    Straight,
+    /// The destination stores an additive (premultiplied) alpha: the mix
+    /// covers all four channels alike.
+    Additive,
+}
+
 /// The transition algorithm and its parameters.
 ///
 /// The `crossfade`/`universal`/`mask`/`scroll` kinds are the engine's own
@@ -102,7 +139,9 @@ pub enum ScrollStay {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum TransKind {
-    /// `crossfade`: a linear per-pixel blend from source 1 to source 2.
+    /// `crossfade`: a per-pixel blend from source 1 to source 2. The mix
+    /// is the one the destination's alpha handling selects
+    /// ([`DestAlpha`]).
     CrossFade,
     /// `universal`: a rule-image blend whose soft edge is `vague` pixels
     /// wide (the reference's `vague` option, default 64).
@@ -365,6 +404,13 @@ pub struct TransStep {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Trans {
+    /// The alpha handling of the surface the transition writes into.
+    ///
+    /// The mix is chosen by this and not by the kind: the destination's own
+    /// composition decides whether the mix covers the four channels alike,
+    /// accounts for the alpha of both sources, or leaves the destination's
+    /// own alpha alone.
+    pub dest_alpha: DestAlpha,
     kind: TransKind,
     duration_ms: f64,
     elapsed_ms: f64,
@@ -421,6 +467,7 @@ impl Trans {
             _ => PHASE_MAX,
         };
         Ok(Self {
+            dest_alpha: DestAlpha::default(),
             kind,
             duration_ms,
             elapsed_ms: 0.0,
@@ -861,10 +908,11 @@ impl Trans {
         let Some((x0, y0, x1, y1)) = intersect(dst, region) else {
             return;
         };
-        // One weight for the whole rectangle: the phase.
+        // One weight for the whole rectangle: the phase. The mix itself is
+        // the one the destination's alpha handling selects.
         for y in y0..y1 {
             let row = BlendRow { x0, x1, y };
-            blend_row(dst, src1, src2, row, self.phase);
+            blend_row(dst, src1, src2, row, self.phase, self.dest_alpha);
         }
         dst.mark_dirty();
     }
@@ -891,10 +939,11 @@ impl Trans {
         let Some((x0, y0, x1, y1)) = intersect(dst, region) else {
             return Ok(());
         };
-        // Each pixel takes its own weight from the rule image.
+        // Each pixel takes its own weight from the rule image, and the mix
+        // is the one the destination's alpha handling selects.
         for y in y0..y1 {
             let row = BlendRow { x0, x1, y };
-            blend_rule_row(dst, src1, src2, row, &table, rule);
+            blend_rule_row(dst, src1, src2, row, &table, rule, self.dest_alpha);
         }
         dst.mark_dirty();
         Ok(())
@@ -1146,6 +1195,117 @@ pub(crate) fn blend_level(s1: [u8; 4], s2: [u8; 4], opa: i32) -> [u8; 4] {
     ]
 }
 
+/// The mix that covers all four channels alike.
+///
+/// The destination ignores its alpha or stores an additive one, so every
+/// channel is mixed with the same ratio.
+fn mix_four_channel(s1: [u8; 4], s2: [u8; 4], opa: i32) -> [u8; 4] {
+    blend_level(s1, s2, opa)
+}
+
+/// The mix that covers the colour channels and leaves the destination's own
+/// alpha as it was.
+///
+/// The destination's alpha is not part of the mix, so the destination keeps
+/// the alpha it had.
+fn mix_colour_only(s1: [u8; 4], s2: [u8; 4], opa: i32) -> [u8; 4] {
+    [
+        blend_channel(s1[0], s2[0], opa),
+        blend_channel(s1[1], s2[1], opa),
+        blend_channel(s1[2], s2[2], opa),
+        s1[3],
+    ]
+}
+
+/// The mix that accounts for the alpha of both sources.
+///
+/// The source covers the destination with the share the two alphas give it,
+/// and the result's own alpha is the two alphas mixed by the ratio. `opa` is
+/// the source's share of the range and `iopa` the destination's.
+fn mix_coverage(s1: [u8; 4], s2: [u8; 4], opa: i32, iopa: i32) -> [u8; 4] {
+    let a1 = i32::from(s1[3]);
+    let a2 = i32::from(s2[3]);
+    let source = ((a2 as u32) * (opa as u32)) & 0xff00;
+    let destination = (a1 as u32) * (iopa as u32);
+    let weight = i32::from(coverage(opacity_table(), source >> 8, destination >> 8));
+    [
+        blend_channel(s1[0], s2[0], weight),
+        blend_channel(s1[1], s2[1], weight),
+        blend_channel(s1[2], s2[2], weight),
+        (a1 + (((a2 - a1) * opa) >> 8)) as u8,
+    ]
+}
+
+/// The cross-fade's mix for the destination's alpha handling.
+///
+/// A destination that ignores its alpha and one that stores an additive alpha
+/// both cover the four channels alike; a destination that stores a straight
+/// alpha per pixel gets the mix that covers the source with the share of the
+/// destination its two alphas give it.
+fn cross_fade_mix(s1: [u8; 4], s2: [u8; 4], opa: i32, dest_alpha: DestAlpha) -> [u8; 4] {
+    match dest_alpha {
+        DestAlpha::Opaque | DestAlpha::Additive => mix_four_channel(s1, s2, opa),
+        DestAlpha::Straight => mix_coverage(s1, s2, opa, 256 - opa),
+    }
+}
+
+/// The rule blend's mix for the destination's alpha handling.
+///
+/// A destination that ignores its alpha mixes the colour channels alone and
+/// keeps its own alpha; one that stores an additive alpha covers the four
+/// channels alike; one that stores a straight alpha per pixel gets the mix
+/// that covers the source with the share of the destination its two alphas
+/// give it.
+fn rule_mix(s1: [u8; 4], s2: [u8; 4], opa: i32, dest_alpha: DestAlpha) -> [u8; 4] {
+    match dest_alpha {
+        DestAlpha::Opaque => mix_colour_only(s1, s2, opa),
+        DestAlpha::Additive => mix_four_channel(s1, s2, opa),
+        DestAlpha::Straight => mix_coverage(s1, s2, opa, 256 - opa),
+    }
+}
+
+/// The table that maps a source opacity and a destination opacity to the
+/// share of the destination the source covers.
+///
+/// The table is built once and shared: the alpha-vs-alpha mix reads one
+/// entry per pixel. Its values are the share the graphics path computes, so
+/// the two paths of this port agree.
+fn opacity_table() -> &'static [u8] {
+    static TABLE: OnceLock<Box<[u8]>> = OnceLock::new();
+    TABLE.get_or_init(build_opacity_table)
+}
+
+/// Builds the opacity table.
+///
+/// A transparent destination is covered completely; otherwise the source's
+/// share of the destination is the ratio of the source's opacity to the sum
+/// of it and the destination's opacity the source does not hide.
+fn build_opacity_table() -> Box<[u8]> {
+    let mut table = vec![0u8; 256 * 256].into_boxed_slice();
+    for destination in 0..256u32 {
+        for source in 0..256u32 {
+            // The share of the destination the source covers: the source's
+            // scaled opacity over the destination's scaled opacity the source
+            // does not hide, with the epsilon that keeps the division finite
+            // when both are transparent. A transparent source covers nothing,
+            // so the share is zero there.
+            let hidden = f64::from(destination) / 255.0;
+            let shown = f64::from(source) / 255.0;
+            let share = shown / (hidden * (1.0 - shown) + shown + 0.0001);
+            let scaled = (share * 255.0) as i32;
+            let value = scaled.clamp(0, 255) as u8;
+            table[(source as usize) * 256 + destination as usize] = value;
+        }
+    }
+    table
+}
+
+/// The share of a destination of the given opacity that a source of the
+/// given opacity covers, read from the table.
+fn coverage(table: &[u8], source: u32, destination: u32) -> u8 {
+    table[(source as usize) * 256 + destination as usize]
+}
+
 /// One channel of [`blend_level`]: `src1 + (src2 - src1) * opa / 256`, clamped
 /// to the byte range.
 ///
@@ -1223,6 +1383,7 @@ fn blend_row(
     src2: &BitmapState,
     row: BlendRow,
     opa: i32,
+    dest_alpha: DestAlpha,
 ) {
     let Some(dst_row) = dst_row_bytes(dst, row) else {
         return;
@@ -1231,27 +1392,53 @@ fn blend_row(
     let second = row_bytes(src2, row);
     match (first, second) {
         (Some(a), Some(b)) if a.len() == dst_row.len() && b.len() == dst_row.len() => {
-            blend_pixels(dst_row, a, b, opa);
+            blend_pixels(dst_row, a, b, opa, dest_alpha);
         }
-        _ => blend_pixels_sparse(dst_row, src1, src2, row, opa),
+        _ => blend_pixels_sparse(dst_row, src1, src2, row, opa, dest_alpha),
     }
 }
 
-/// Blends the pixels of one row: `dst = src1 + (src2 - src1) * opa / 256`,
-/// clamped per channel.
+/// Blends the pixels of one row with the mix the destination's alpha
+/// handling selects.
 ///
-/// The rows hold whole pixels, so every pixel of the row is blended.
-fn blend_pixels(dst: &mut [u8], src1: &[u8], src2: &[u8], opa: i32) {
-    for (d, (a, b)) in dst.as_chunks_mut::<4>().0.iter_mut().zip(
-        src1.as_chunks::<4>()
-            .0
-            .iter()
-            .zip(src2.as_chunks::<4>().0.iter()),
-    ) {
-        d[0] = blend_channel(a[0], b[0], opa);
-        d[1] = blend_channel(a[1], b[1], opa);
-        d[2] = blend_channel(a[2], b[2], opa);
-        d[3] = blend_channel(a[3], b[3], opa);
+/// The rows hold whole pixels, so every pixel of the row is blended. Each
+/// mix has its own loop: the row is the hot path of a full-screen
+/// transition, and the alpha-vs-alpha mix reads the opacity table once per
+/// row.
+fn blend_pixels(dst: &mut [u8], src1: &[u8], src2: &[u8], opa: i32, dest_alpha: DestAlpha) {
+    match dest_alpha {
+        DestAlpha::Opaque | DestAlpha::Additive => {
+            for (d, (a, b)) in dst.as_chunks_mut::<4>().0.iter_mut().zip(
+                src1.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(src2.as_chunks::<4>().0.iter()),
+            ) {
+                d[0] = blend_channel(a[0], b[0], opa);
+                d[1] = blend_channel(a[1], b[1], opa);
+                d[2] = blend_channel(a[2], b[2], opa);
+                d[3] = blend_channel(a[3], b[3], opa);
+            }
+        }
+        DestAlpha::Straight => {
+            let table = opacity_table();
+            for (d, (a, b)) in dst.as_chunks_mut::<4>().0.iter_mut().zip(
+                src1.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(src2.as_chunks::<4>().0.iter()),
+            ) {
+                let a1 = i32::from(a[3]);
+                let a2 = i32::from(b[3]);
+                let source = ((a2 as u32) * (opa as u32)) & 0xff00;
+                let destination = (a1 as u32) * ((256 - opa) as u32);
+                let weight = i32::from(coverage(table, source >> 8, destination >> 8));
+                d[0] = blend_channel(a[0], b[0], weight);
+                d[1] = blend_channel(a[1], b[1], weight);
+                d[2] = blend_channel(a[2], b[2], weight);
+                d[3] = (a1 + (((a2 - a1) * opa) >> 8)) as u8;
+            }
+        }
     }
 }
 
@@ -1263,10 +1450,16 @@ fn blend_pixels_sparse(
     src2: &BitmapState,
     row: BlendRow,
     opa: i32,
+    dest_alpha: DestAlpha,
 ) {
     for (index, pixel) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let x = row.x0.max(0) + index as i32;
-        let blended = blend_level(read_pixel(src1, x, row.y), read_pixel(src2, x, row.y), opa);
+        let blended = cross_fade_mix(
+            read_pixel(src1, x, row.y),
+            read_pixel(src2, x, row.y),
+            opa,
+            dest_alpha,
+        );
         pixel[0] = blended[0];
         pixel[1] = blended[1];
         pixel[2] = blended[2];
@@ -1283,6 +1476,7 @@ fn blend_rule_row(
     row: BlendRow,
     table: &[u8; 256],
     rule: &RuleMask,
+    dest_alpha: DestAlpha,
 ) {
     let Some(dst_row) = dst_row_bytes(dst, row) else {
         return;
@@ -1313,13 +1507,19 @@ fn blend_rule_row(
                     d[3] = left[3];
                     continue;
                 }
-                d[0] = blend_channel(left[0], right[0], opa);
-                d[1] = blend_channel(left[1], right[1], opa);
-                d[2] = blend_channel(left[2], right[2], opa);
-                d[3] = blend_channel(left[3], right[3], opa);
+                let blended = rule_mix(
+                    [left[0], left[1], left[2], left[3]],
+                    [right[0], right[1], right[2], right[3]],
+                    opa,
+                    dest_alpha,
+                );
+                d[0] = blended[0];
+                d[1] = blended[1];
+                d[2] = blended[2];
+                d[3] = blended[3];
             }
         }
-        _ => blend_rule_pixels_sparse(dst_row, src1, src2, row, table, rule),
+        _ => blend_rule_pixels_sparse(dst_row, src1, src2, row, table, rule, dest_alpha),
     }
 }
 
@@ -1332,11 +1532,17 @@ fn blend_rule_pixels_sparse(
     row: BlendRow,
     table: &[u8; 256],
     rule: &RuleMask,
+    dest_alpha: DestAlpha,
 ) {
     for (index, pixel) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let x = row.x0.max(0) + index as i32;
         let opa = i32::from(table[usize::from(rule.at(x, row.y))]);
-        let blended = blend_level(read_pixel(src1, x, row.y), read_pixel(src2, x, row.y), opa);
+        let blended = rule_mix(
+            read_pixel(src1, x, row.y),
+            read_pixel(src2, x, row.y),
+            opa,
+            dest_alpha,
+        );
         pixel[0] = blended[0];
         pixel[1] = blended[1];
         pixel[2] = blended[2];
@@ -1406,21 +1612,28 @@ mod tests {
 
     /// The row blend and the per-pixel blend must write the same bytes.
     ///
-    /// The blend is the per-channel `src1 + (src2 - src1) * opa / 256` the
-    /// reference applies to a whole row at a time
-    /// (`reference/cpp/core/visual/tvpgl.cpp:4387-4399`).
+    /// The mixes are the three const-alpha blends the destination's alpha
+    /// handling selects
+    /// (`reference/cpp/core/visual/gl/blend_functor_c.h:662-707`).
     #[test]
     fn the_row_blend_matches_the_per_pixel_blend() {
         let (first, second) = source_row();
-        for opa in 0..=256 {
-            let mut row = vec![0u8; first.len()];
-            blend_pixels(&mut row, &first, &second, opa);
-            let mut per_pixel = vec![0u8; first.len()];
-            for (index, out) in per_pixel.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                let blended = blend_level(pixel(&first, index), pixel(&second, index), opa);
-                out.copy_from_slice(&blended);
+        for dest_alpha in [DestAlpha::Opaque, DestAlpha::Additive, DestAlpha::Straight] {
+            for opa in 0..=255 {
+                let mut row = vec![0u8; first.len()];
+                blend_pixels(&mut row, &first, &second, opa, dest_alpha);
+                let mut per_pixel = vec![0u8; first.len()];
+                for (index, out) in per_pixel.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    let blended = cross_fade_mix(
+                        pixel(&first, index),
+                        pixel(&second, index),
+                        opa,
+                        dest_alpha,
+                    );
+                    out.copy_from_slice(&blended);
+                }
+                assert_eq!(row, per_pixel, "weight {opa} with {dest_alpha:?}");
             }
-            assert_eq!(row, per_pixel, "weight {opa}");
         }
     }
 
@@ -1456,7 +1669,15 @@ mod tests {
                 x1: width as i32,
                 y,
             };
-            blend_rule_row(&mut dst, &src1, &src2, row, &table, &rule);
+            blend_rule_row(
+                &mut dst,
+                &src1,
+                &src2,
+                row,
+                &table,
+                &rule,
+                DestAlpha::Additive,
+            );
         }
         for y in 0..height as i32 {
             for x in 0..width as i32 {
@@ -1477,15 +1698,16 @@ mod tests {
     /// columns and leaves the rest transparent, the way a per-pixel read
     /// outside a bitmap does.
     ///
-    /// The blend of the covered columns is the per-channel arithmetic above
-    /// (`reference/cpp/core/visual/tvpgl.cpp:4387-4399`).
+    /// The blend of the covered columns is the per-channel arithmetic of the
+    /// additive-alpha mix
+    /// (`reference/cpp/core/visual/gl/blend_functor_c.h:673-680`).
     #[test]
     fn a_row_without_full_sources_blends_what_it_covers() {
         let src1 = BitmapState::new(2, 1, vec![10, 20, 30, 40, 50, 60, 70, 80]);
         let src2 = BitmapState::new(1, 1, vec![90, 100, 110, 120]);
         let mut dst = BitmapState::new(3, 1, vec![0u8; 12]);
         let row = BlendRow { x0: 0, x1: 3, y: 0 };
-        blend_row(&mut dst, &src1, &src2, row, 128);
+        blend_row(&mut dst, &src1, &src2, row, 128, DestAlpha::Additive);
         // The first column blends both sources, the second only the first
         // one (the second source reads as transparent there) and the third
         // reads as transparent in both.

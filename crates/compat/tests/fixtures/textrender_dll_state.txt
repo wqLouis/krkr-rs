@@ -1,0 +1,58 @@
+# textrender.dll style dictionary fixture (derived from the shipped binary, not
+# loaded by any test).
+#
+# source DLL:   plugin/textrender.dll (the plugin directory of the shipped game)
+# sha256:       0a014cc2b5811a0a80719c7d88ae28e2ff4add9d7c1354ad941903d485af7a76
+# version:      textrend 1.0.0.1, wamsoft, copyright (C) 2014
+# extraction:   the state deserializer that starts at 0x100022a0 reads the
+#               members in the order the rows below stand in; each member is
+#               pushed as the wide string whose file offset the second column
+#               names, read from the dictionary and stored in the state field
+#               the third column names. The rows stand in the order the
+#               deserializer reads them, which is also the order the wide
+#               strings sit in .rdata.
+#
+# The last two columns are the test's inputs: the value the member is driven
+# with and the value the named property must then hold. A property of "-" means
+# the shipped build has no class property for the member: the port has none
+# either (the surface lock), so the member is only driven.
+#
+# member          string offset   state field   the port's property   drive   expected
+face              0x294a0        +0x134        defaultFace            'serif' serif
+bold              0x294ac        +0x16c        defaultBold            42      1
+fontsize          0x294b8        +0xb8         defaultFontSize        42      42
+bigfontsize       0x294cc        +0xbc         -                      42      -
+smallfontsize     0x294e4        +0xc0         -                      42      -
+rubysize          0x29500        +0xec         defaultRubySize        42      42
+rubyoffset        0x29514        +0xf0         defaultRubyOffset      42      42
+color             0x2952c        +0x13c        defaultChColor         42      42
+shadow            0x29538        +0x144        defaultShadow          42      1
+shadowcolor       0x29548        +0x148        -                      42      -
+shadowdiff        0x29560        +0x150        -                      42      -
+edge              0x29578        +0x158        defaultEdge            42      1
+edgecolor         0x29584        +0x15c        -                      42      -
+linespacing       0x29598        +0xcc         defaultLineSpacing     42      42
+pitch             0x295b0        +0xd4         defaultPitch           42      42
+linesize          0x295bc        +0xc4         defaultLineSize        42      42
+align             0x295d0        +0xdc         -                      42      -
+valign            0x295dc        +0xe4         -                      42      -
+#
+# The shipped build keeps the shadow difference and the alignment in the style
+# and no code path reads them back, so the port applies the same nil effect.
+# The shipped build's class exposes the big and the small size, the shadow
+# difference and the alignment as properties (defaultBigFontSize,
+# defaultSmallFontSize, defaultShadowDiff, defaultAlign, defaultValign); the
+# port registers neither, because the surface lock does not move.
+#
+# The members the shipped build shares with the camel-case spelling: face
+# 0x294a0, bold 0x294ac, shadow 0x29538, edge 0x29578, pitch 0x295b0. The
+# camel-case names of the other members are the shipped build's class property
+# names, not style dictionary keys; the tree build's deserializer reads them
+# as dictionary keys (reference/cpp/plugins/TextRender.cpp:137-158), so the
+# port reads both spellings, the lower-case one first.
+#
+# The shipped build's defaults: the colour 0xffffffff, the face "normal", the
+# size 24, the big size 48, the small size 12, the line size 24, the line
+# spacing 6, the pitch 0, the ruby size 10, the ruby offset -2, the shadow on
+# with the colour 0xff000000, the shadow difference 1, the edge off with the
+# colour 0xff0080ff, bold and italic off, the alignment -1.

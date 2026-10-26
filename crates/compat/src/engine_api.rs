@@ -67,8 +67,10 @@ pub(crate) use engine::video::{
     blit_frame_to_layer_opacity,
 };
 
-// The transition state machine and its rule/scroll vocabulary.
-pub(crate) use engine::trans::{RuleMask, ScrollFrom, ScrollStay, Trans, TransError, TransKind};
+// The transition state machine and its rule/scroll/destination vocabulary.
+pub(crate) use engine::trans::{
+    DestAlpha, RuleMask, ScrollFrom, ScrollStay, Trans, TransError, TransKind,
+};
 
 // The custom-shader draw a transition records when the backend can run effect
 // pipelines. The compatibility layer carries the value from the transition

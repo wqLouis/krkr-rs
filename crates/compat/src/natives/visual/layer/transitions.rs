@@ -182,6 +182,11 @@ extern "C" fn layer_begin_transition(
         }
         let has_images = dest_layer.bitmap.is_some() && source_layer.bitmap.is_some();
         let mut trans = build_transition(&ctx, host.engine(), &name, a.get(3), dest_size)?;
+        // The mix the transition runs is the one the destination's own alpha
+        // handling selects, and the destination's type decides that. The type
+        // is read once, when the transition starts, and holds for the whole
+        // run.
+        trans.dest_alpha = super::blend::dest_alpha(dest_layer.blend);
         // The transition's elapsed time is the difference between the
         // engine's clock and the tick it starts at, so the phase follows the
         // clock rather than the frames that happen to run.

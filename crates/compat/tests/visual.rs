@@ -313,7 +313,9 @@ fn bitmap_pixels_and_size() {
     // `setPixel` writes the colour planes and holds the mask plane
     // (`reference/cpp/core/visual/BitmapIntf.cpp:60-66`); `getPixel` reports
     // the colour without the mask (`:51-58`) and `getMaskPixel` reports the
-    // mask alone (`:67-75`).
+    // mask alone (`:67-75`). The reported word holds the red in its low byte
+    // (`reference/cpp/core/visual/RenderManager.cpp:346-350`), so the green
+    // `0x00ff00` is reported as `0x00ff00`.
     assert_eq!(env.eval_int("p == 0x00ff00"), 1);
     assert_eq!(env.eval_int("m"), 128);
     assert_eq!(env.eval_int("w0"), 2);
@@ -343,8 +345,10 @@ fn bitmap_copy_from_copies_pixels() {
          var p = b.getPixel(1, 0);",
     );
     // `getPixel` reports the colour planes without the mask
-    // (`reference/cpp/core/visual/BitmapIntf.cpp:51-58`).
-    assert_eq!(env.eval_int("p == 0xff0000"), 1);
+    // (`reference/cpp/core/visual/BitmapIntf.cpp:51-58`), as the packed word
+    // with the red in its low byte
+    // (`reference/cpp/core/visual/RenderManager.cpp:346-350`).
+    assert_eq!(env.eval_int("p == 0x0000ff"), 1);
     assert_eq!(env.eval_int("b.width"), 2);
     assert_eq!(env.eval_int("b.height"), 2);
 }

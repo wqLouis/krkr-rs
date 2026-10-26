@@ -5,6 +5,16 @@
 //! in-memory [`engine::Storage`]. The typed-error paths (no codec installed)
 //! and the `loadAsync` → `onLoaded` dispatch are covered here; the full
 //! `media`-backed decode is the L4 host's job.
+//!
+//! The colour a pixel member reports is the packed word of the RGBA planes,
+//! read little-endian: the red is in the low byte, the green in the second,
+//! the blue in the third and the alpha in the fourth
+//! (`reference/cpp/core/visual/BitmapIntf.cpp:51-58`,
+//! `reference/cpp/core/visual/LayerBitmapIntf.cpp:165-171`,
+//! `reference/cpp/core/visual/RenderManager.cpp:346-350`). The colour a
+//! pixel member writes names its planes the other way round, so the red goes
+//! to the first plane (`reference/cpp/core/visual/BitmapIntf.cpp:60-66`,
+//! `reference/cpp/core/visual/LayerBitmapIntf.cpp:194-209`).
 
 mod common;
 
@@ -207,10 +217,10 @@ fn load_populates_the_bitmap_and_returns_metainfo() {
     );
     assert_eq!(env.eval_int("b.width"), 2);
     assert_eq!(env.eval_int("b.height"), 2);
-    // Straight-alpha RGBA (1, 2, 3, 255) reads back as the colour
-    // 0x010203; the mask plane is a separate member
-    // (`reference/cpp/core/visual/BitmapIntf.cpp:51-58`, `:67-75`).
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x01_0203);
+    // Straight-alpha RGBA (1, 2, 3, 255) reads back as the packed word
+    // 0x030201 — the red in the low byte; the mask plane is a separate
+    // member (`reference/cpp/core/visual/BitmapIntf.cpp:51-58`, `:67-75`).
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x03_0201);
     assert_eq!(env.eval_int("b.getMaskPixel(0, 0)"), 255);
     assert_eq!(env.eval_int("meta.width"), 2);
     assert_eq!(env.eval_int("meta.height"), 2);
@@ -529,8 +539,8 @@ fn the_name_constructor_loads_the_storage_image() {
     // loads the named storage image.
     assert_eq!(env.eval_int("b.width"), 2);
     assert_eq!(env.eval_int("b.height"), 2);
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x01_0203);
-    assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0x0a_0b0c);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x03_0201);
+    assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0x0c_0b0a);
 }
 
 #[test]
@@ -663,10 +673,10 @@ fn load_into_a_resized_bitmap_installs_the_decoded_pixels() {
     // Straight-alpha RGBA (1, 2, 3, 255) reads back as the colour
     // 0x010203, and every pixel comes from the decoded buffer, not the
     // zero-filled resize.
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x01_0203);
-    assert_eq!(env.eval_int("b.getPixel(1, 0)"), 0x04_0506);
-    assert_eq!(env.eval_int("b.getPixel(0, 1)"), 0x07_0809);
-    assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0x0a_0b0c);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x03_0201);
+    assert_eq!(env.eval_int("b.getPixel(1, 0)"), 0x06_0504);
+    assert_eq!(env.eval_int("b.getPixel(0, 1)"), 0x09_0807);
+    assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0x0c_0b0a);
     assert_eq!(env.eval_int("b.getMaskPixel(0, 1)"), 255);
 
     let bitmap = env._scene.bitmaps.last().expect("the loaded image");
@@ -702,8 +712,8 @@ fn load_into_a_same_size_bitmap_installs_the_decoded_pixels() {
 
     assert_eq!(env.eval_int("b.width"), 2);
     assert_eq!(env.eval_int("b.height"), 2);
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x01_0203);
-    assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0x0a_0b0c);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x03_0201);
+    assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0x0c_0b0a);
 
     let bitmap = env._scene.bitmaps.last().expect("the loaded image");
     assert_eq!(bitmap.rgba.as_slice(), DECODED_RGBA.as_slice());
@@ -817,8 +827,8 @@ fn the_default_cache_limit_decodes_every_load() {
     // Each load installed the decoded buffer
     // (`reference/cpp/core/visual/BitmapIntf.cpp:98-106`).
     assert_eq!(env.eval_int("second.width"), 2);
-    assert_eq!(env.eval_int("second.getPixel(0, 0)"), 0x01_0203);
-    assert_eq!(env.eval_int("second.getPixel(1, 1)"), 0x0a_0b0c);
+    assert_eq!(env.eval_int("second.getPixel(0, 0)"), 0x03_0201);
+    assert_eq!(env.eval_int("second.getPixel(1, 1)"), 0x0c_0b0a);
 }
 
 /// A limit above zero enables the cache: the second load of the same name
@@ -855,7 +865,7 @@ fn an_enabled_cache_decodes_once_per_name() {
         );
     }
     assert_eq!(env.eval_int("second.width"), 2);
-    assert_eq!(env.eval_int("second.getPixel(0, 0)"), 0x01_0203);
+    assert_eq!(env.eval_int("second.getPixel(0, 0)"), 0x03_0201);
 
     env.run("System.graphicCacheLimit = 0;");
     env.run("var third = new Bitmap(); third.load('images/test.img');");
@@ -898,10 +908,10 @@ fn a_cache_hit_returns_pristine_pixels_after_a_set_pixel_write() {
         "the second load is a cache hit"
     );
     // The write reached only the first Bitmap.
-    assert_eq!(env.eval_int("first.getPixel(0, 0)"), 0x11_2233);
+    assert_eq!(env.eval_int("first.getPixel(0, 0)"), 0x33_2211);
     // The reloaded Bitmap still has the decoded pixels.
-    assert_eq!(env.eval_int("second.getPixel(0, 0)"), 0x01_0203);
-    assert_eq!(env.eval_int("second.getPixel(1, 1)"), 0x0a_0b0c);
+    assert_eq!(env.eval_int("second.getPixel(0, 0)"), 0x03_0201);
+    assert_eq!(env.eval_int("second.getPixel(1, 1)"), 0x0c_0b0a);
 }
 
 /// Two different names occupy two cache entries: each decodes once and

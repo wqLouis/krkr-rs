@@ -342,12 +342,26 @@ pub(crate) fn argb_to_rgba(color: i64) -> [u8; 4] {
     ]
 }
 
-/// Straight-alpha RGBA → ARGB (`0xAARRGGBB`).
-pub(crate) fn rgba_to_argb(color: [u8; 4]) -> i64 {
+/// Straight-alpha RGBA → the packed pixel word.
+///
+/// The word is the RGBA planes read as a little-endian word, so the red is
+/// in the low byte, the green in the second, the blue in the third and the
+/// alpha in the fourth.
+pub(crate) fn rgba_to_pixel_word(color: [u8; 4]) -> i64 {
     (i64::from(color[3]) << 24)
-        | (i64::from(color[0]) << 16)
+        | (i64::from(color[2]) << 16)
         | (i64::from(color[1]) << 8)
-        | i64::from(color[2])
+        | i64::from(color[0])
+}
+
+/// A colour with its red and blue bytes swapped.
+///
+/// The glyph path and the image function's text paths hand the colour to
+/// the bitmap as it is, and the bitmap reads the value's low bytes as the
+/// red, green and blue planes, so the drawn colour names the red and the
+/// blue the other way round.
+pub(crate) fn swap_red_blue(color: [u8; 4]) -> [u8; 4] {
+    [color[2], color[1], color[0], color[3]]
 }
 
 pub(crate) use crate::natives::system::actual_color_bytes;

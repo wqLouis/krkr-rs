@@ -1275,11 +1275,18 @@ fn transition_scene(
 }
 
 /// The composited `crossfade` frame and the CPU blend agree within one level
-/// per channel wherever the second source is opaque. The reference blends the
-/// two sources per channel at `Phase`
-/// (`reference/cpp/core/visual/TransIntf.cpp:592-600,660`); the composited
-/// frame draws the same two images with the phase as the second source's
-/// alpha, so only the 8-bit rounding differs.
+/// per channel wherever the second source is opaque.
+///
+/// The composited frame draws the two sources with the phase as the second
+/// source's alpha, which is the reference's plain blend
+/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3265-3268`,
+/// `mix(s, d, opacity)`), so the CPU blend is compared with the plain mix —
+/// the one a destination that ignores its alpha gets
+/// (`reference/cpp/core/visual/TransIntf.cpp:682-686`). A destination that
+/// uses its alpha channel gets the coverage mix instead
+/// (`:664-673`, `RenderManager_ogl.cpp:3278-3291`), which the composited
+/// frame cannot express and which the cross-fade program
+/// (`engine/shaders/crossfade.frag`) runs.
 #[test]
 fn a_composited_cross_fade_matches_the_cpu_blend() {
     let width = 4u32;
@@ -1288,6 +1295,9 @@ fn a_composited_cross_fade_matches_the_cpu_blend() {
     let src2: Vec<u8> = [200u8, 120, 30, 255].repeat((width * height) as usize);
     for step_ms in [0.0, 20.0, 40.0, 60.0, 80.0, 100.0] {
         let mut trans = engine::trans::Trans::cross_fade(100.0).expect("crossfade");
+        // The composited frame draws the plain mix, so the CPU blend is
+        // compared with the plain mix.
+        trans.dest_alpha = engine::trans::DestAlpha::Opaque;
         trans.step(step_ms);
         let (scene, window, first, second) =
             transition_scene(&trans, src1.clone(), src2.clone(), width, height, true);

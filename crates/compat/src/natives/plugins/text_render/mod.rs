@@ -196,6 +196,11 @@ extern "C" fn text_render_set_render_size(
 }
 
 /// `setDefault(dictionary)` — replace the default style.
+///
+/// The style members are read under the lower-case spellings the shipped
+/// `textrender.dll` uses (`color`, `fontsize`, `linespacing`, ...) and under
+/// the camel-case ones the class properties use (`chColor`, `fontSize`,
+/// `lineSpacing`, ...).
 extern "C" fn text_render_set_default(
     engine: *mut c_void,
     instance: *mut c_void,

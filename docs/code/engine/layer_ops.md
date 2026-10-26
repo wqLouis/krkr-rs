@@ -72,7 +72,7 @@ bookkeeping see them like any other layer bitmap.
 | `remove_const_opacity` | scale the alpha by `1 - level / 255` |
 | `colorize` | reblend hue and saturation, preserving lightness |
 | `noise` | add uniform per-channel noise, holding alpha |
-| `do_gray_scale` | luminance-preserving greyscale |
+| `do_gray_scale` | greyscale: a weighted sum of the three colour channels, written to all three |
 | `adjust_gamma` | per-channel gamma with floors and ceilings |
 | `light_contrast` | brightness/contrast adjustment |
 | `convert_alpha_to_add_alpha` / `convert_add_alpha_to_alpha` | premultiplied ↔ straight alpha |

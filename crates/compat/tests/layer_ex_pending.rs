@@ -36,9 +36,12 @@ fn image() -> DecodedImage {
     )
 }
 
-/// The RGB value of the first pixel of [`image`], as `Bitmap.getPixel`
-/// reports it: that member masks the alpha away.
-const FIRST_PIXEL: i64 = 0x0A_141E;
+/// The packed word of the first pixel of [`image`], as `Bitmap.getPixel`
+/// reports it: that member masks the alpha away and hands back the word of
+/// the RGBA planes, read little-endian, so the red is in the low byte
+/// (`reference/cpp/core/visual/BitmapIntf.cpp:51-58`,
+/// `reference/cpp/core/visual/RenderManager.cpp:346-350`).
+const FIRST_PIXEL: i64 = 0x1E_140A;
 
 /// The decoder the pool drives: every decode produces [`image`], unless the
 /// decoder was built to fail.

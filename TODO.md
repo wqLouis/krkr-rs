@@ -118,43 +118,220 @@ residuals:
   display type (`LayerIntf.h:738-750`, `LayerIntf.cpp:371-372`,
   `:1525-1618`), so `Layer.face` returns the reference's number, a type
   change resolves the face again (`LayerIntf.cpp:1910`, `:1517-1518`) and
-  the pixel operations follow the resolved face. The reference picks the blend
-  *method* from the operation mode and the draw face
-  (`LayerIntf.cpp:4118-4271`, `ImageFunction.cpp:78-130`) and gives each
-  method its own arithmetic (`LayerBitmapIntf.cpp:1580-1830`,
-  `tvpgl.cpp`); the engine's table is keyed by the operation mode alone
-  (`engine/src/layer_ops.rs`, `mode_kernel`), so three of the nine
-  combinations still differ:
-  * `omAlpha`/`dfAlpha` (`bmAlphaOnAlpha`, `LayerBitmapIntf.cpp:1630-1640`)
-    scales the source's contribution by the *destination's* alpha, and
-    `omAlpha`/`dfAddAlpha` (`bmAlphaOnAddAlpha`, `:1710-1724`) by the
-    destination's additive alpha; the engine's source-over does neither, so
-    the destination's RGB and alpha differ wherever it is translucent.
-  * `omAddAlpha`/`dfAddAlpha` (`bmAddAlphaOnAddAlpha`, `:1688-1703`) and
-    `omAddAlpha`/`dfOpaque` (`bmAddAlpha`, `:1682-1687`) are the
-    additive-alpha blends; the engine has no additive-alpha kernel and blends
-    them source-over instead. The third combination,
-    `omAddAlpha`/`dfAlpha` (`bmAddAlphaOnAlpha`), is not implemented in the
-    reference at all (`:1705-1708`, `RenderManager.cpp:2557-2561`), and the
-    operation now leaves the destination untouched here too.
-  * `omOpaque`/`dfAlpha` (`bmCopyOnAlpha`, `:1611-1622`) and
-    `omOpaque`/`dfAddAlpha` (`bmCopyOnAddAlpha`, `:1726-1738`) copy the
-    source as an *opaque* image, so the destination's alpha becomes opaque
-    (`tvpgl.cpp:3326-3380`); the engine's copy keeps the source's alpha, so
-    the destination's alpha differs for a translucent source. Fixing this
-    needs the face in the engine's kernel table (the copy would then force
-    the source's alpha, one store per pixel, with the kernel resolved per
-    pass); the per-pixel cost of the other eight methods is the reference's
-    own table lookups, which the engine's straight-alpha source-over does
-    not pay.
-  The destination's alpha-hold argument is the reference's `hda`: only the
-  plain methods take it, so it reaches a face-selected blend on an opaque
-  face only (`LayerBitmapIntf.cpp:1589-1622`). The `ImageFunction`'s
-  mapping (`natives/image_function.rs`, `blit_method`) now follows that
-  rule; the text members' `hda` argument and the layer's `holdAlpha` do not
-  reach the text rasterizer (`ImageFunction.cpp:1024-1025`,
-  `LayerIntf.cpp:4467-4469`), and the face's method selection for the text
-  is the same arithmetic gap.
+  the pixel operations follow the resolved face. The reference picks the
+  blend *method* from the operation mode and the draw face
+  (`LayerIntf.cpp:4217-4262`, `ImageFunction.cpp:78-130`) and gives each
+  method its own arithmetic; the live dispatch is the render-method cache
+  over the `tvpgl.cpp` kernels (`RenderManager.cpp:2396-2424`,
+  `:2472-2565`, `:2854-2884`), and the per-method switch in
+  `LayerBitmapIntf.cpp:1527-1826` sits inside `#if 0` — it states the same
+  mapping but runs nowhere. The engine's table is keyed by the operation
+  mode alone (`engine/src/layer_ops.rs`, `mode_kernel`), so three of the
+  nine combinations still differ:
+  * `omAlpha`/`dfAddAlpha` (`bmAlphaOnAddAlpha`, `LayerIntf.cpp:4224`)
+    is the premultiplied over: the straight source is premultiplied
+    (`TVPAlphaToAdditiveAlpha`, `tvpgl.h:169-174`) and
+    `TVPAddAlphaBlend_a_a` (`tvpgl.h:116-137`) gives, per channel,
+    `out = sat((dest * (255 - sa) >> 8) + src)` and
+    `out_a = dopa - (dopa >> 8)` with `dopa = da + sa - (da * sa >> 8)`
+    (`tvpgl.cpp:708-736`). The engine's source-over composites the
+    straight source instead, so the destination's RGB differs by up to
+    212/255. The other half, `omAlpha`/`dfAlpha` (`bmAlphaOnAlpha`), is
+    the destination-alpha blend `TVPAlphaBlend_d` (`tvpgl.cpp:582-704`):
+    with `addr = (sa << 8) | da`, `w = TVPOpacityOnOpacityTable[addr]` and
+    `out_a = TVPNegativeMulTable[addr]`, per channel
+    `out = dest + ((src - dest) * w >> 8)`, the two 64 KiB tables built in
+    `f32` at `tvpgl.cpp:224-251`. The engine's straight source-over
+    (`engine/src/raster.rs:70`) is that formula without the tables and
+    differs by at most 6/255 on a channel (mean 0.5/255 over a 16×16 grid
+    of source and destination alphas and five colours), and the reference's
+    own OpenGL path (`ogl/RenderManager_ogl.cpp:3549-3557`) is the same
+    formula in float, so this half is a rounding gap, not a structural one.
+  * `omAddAlpha`/`dfAddAlpha` (`bmAddAlphaOnAddAlpha`, `:4239`) and
+    `omAddAlpha`/`dfOpaque` (`bmAddAlpha`, `:4243`) are the
+    additive-alpha blends: `TVPAddAlphaBlend_a_a` (`tvpgl.cpp:1058-1085`)
+    for the first, and `TVPAddAlphaBlend_HDA_n_a` (`tvpgl.cpp:944-971`,
+    `tvpgl.h:88-99`) for the second, which also holds the destination's
+    alpha. The engine has no additive-alpha kernel and blends them
+    source-over instead, which differs from the reference by up to 225/255
+    on a channel. The third combination, `omAddAlpha`/`dfAlpha`
+    (`bmAddAlphaOnAlpha`), is not implemented in the reference at all
+    (`RenderManager.cpp:2557-2561`), and the operation now leaves the
+    destination untouched here too.
+  * `omOpaque`/`dfAlpha` (`bmCopyOnAlpha`, `:4250`) and
+    `omOpaque`/`dfAddAlpha` (`bmCopyOnAddAlpha`, `:4254`) copy the
+    source as an *opaque* image: `TVPCopyOpaqueImage`
+    (`tvpgl.cpp:3326-3375`) copies the source's RGB and forces the
+    destination's alpha to 255 (`src | 0xff000000`); below full opacity the
+    reference blends instead (`TVPConstAlphaBlend_d`,
+    `tvpgl.cpp:3506-3581`, and `TVPConstAlphaBlend_a`, `:3583-3613`).
+    The engine's copy keeps the source's alpha, so the destination's alpha
+    differs by up to 255/255, and only where the source carries a
+    translucent pixel.
+  The three formulas cost less per pixel than the source-over they would
+  replace. Measured on the development host as the arithmetic alone (one
+  thread, a 1920×1080 surface): the engine's straight source-over is
+  11.0 ms/frame, the table-driven blend 5.1 ms/frame, the additive-alpha
+  blend 6.4 ms/frame and the opaque copy 1.7 ms/frame — 0.2 ms/frame with
+  AVX2, at the 0.18 ms/frame memory floor. An AVX2 gather over 32-bit
+  tables is slower than the scalar byte-table lookup (6.8 against
+  5.1 ms/frame) and the same formula without the tables is slower still
+  (8.8 ms/frame), so the two lookups are a win, not a cost; the price of
+  carrying the face is the dispatch, not the pixels.
+  The face must not reach the engine as a face. What the engine needs is
+  one generic fact — whether the destination's alpha is straight,
+  premultiplied or absent — which is graphics vocabulary and belongs in the
+  `api` crate next to `BlendMode`, re-exported through
+  `engine_api.rs`, keying the engine's `mode_kernel` table as
+  `(mode, dst_alpha)`. The kernel is then resolved once per pass instead
+  of once per pixel (the current code re-resolves `mode_kernel(mode)` for
+  every pixel, `engine/src/layer_ops.rs:2006`), and the same resolver can
+  serve the affine path's own dispatch
+  (`engine/src/layer_ops.rs:2133-2151`); a kernel function pointer in
+  `BlitOptions` would have to be re-derived for the affine and stretch
+  paths, and a new engine entry point per blend would duplicate the
+  operate, stretch and affine loops.
+  The differences are observable only where the additive-alpha type is in
+  play: `omAlpha`/`dfAddAlpha` and both `omAddAlpha` combinations need a
+  `dfAddAlpha` destination or an `ltAddAlpha` source, and `omOpaque`
+  differs only in the destination's alpha and only for a translucent
+  source. The common case, `omAlpha` onto the default `dfAlpha` face, is
+  already within 6/255 of the reference.
+  What is still open is the alpha-hold argument. The reference passes the
+  layer's `holdAlpha` to every method (`LayerIntf.cpp:5250`) and the
+  render-method cache is what honours it (`RenderManager.cpp:2396-2424`):
+  only the copy methods have a second, hold-aware spelling
+  (`CopyColor`), the plain alpha methods hold the destination's alpha
+  unconditionally, and `bmCopyOnAddAlpha` has no hold spelling at all, so
+  with the hold set and full opacity the operation does nothing
+  (`RenderManager.cpp:2423`, `LayerBitmapIntf.cpp:1483-1485`). The compat
+  derives the hold from the face instead
+  (`natives/visual/layer/pixels.rs:365-380`), which is a different rule;
+  whether to replace it is separate from the kernel table and still open.
+  The `ImageFunction`'s mapping (`natives/image_function.rs`,
+  `blit_method`) follows the face-derived rule too; the text members'
+  `hda` argument and the layer's `holdAlpha` do not reach the text
+  rasterizer (`ImageFunction.cpp:1024-1025`, `LayerIntf.cpp:4444-4468`),
+  and the face's method selection for the text is the same arithmetic gap.
+* **The transition's mix methods: what landed, and the alpha byte the
+  reference's two paths disagree on.** The cross-fade's blend is chosen by
+  the destination layer's type (`reference/cpp/core/visual/TransIntf.cpp:664-686`):
+  a type that uses its alpha channel (`drawable.h:53-61`) gets the
+  alpha-vs-alpha mix, the additive-alpha type (`drawable.h:63-65`) gets the
+  four-channel mix, and every other type the plain one. The three mixes are
+  `reference/cpp/core/visual/gl/blend_functor_c.h:662-672` (plain), `:673-680`
+  (additive) and `:689-707` (alpha-vs-alpha), and the opacity table the last
+  one reads is `reference/cpp/core/visual/tvpgl.cpp:224-251`. The reference's
+  *software* path writes the plain mix's alpha byte as zero — the blend masks
+  the green byte away and the alpha byte with it (`blend_functor_c.h:668-670`)
+  — while its *graphics* path mixes the alpha with the phase
+  (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3265-3268`, whose script
+  the plain and the additive type share, `:3274`); the reference's own two
+  paths therefore disagree, and its shader comparison says so
+  (`TEST_SHADER_IGNORE_ALPHA`, `:3270`). This port follows the graphics path
+  on **both** of its paths — the CPU blend (`engine/src/trans/mod.rs`) and the
+  cross-fade program (`engine/shaders/crossfade.frag`, which takes the mix
+  from the uniform the transition's effect draw writes) — so the headless
+  result and the desktop show the same transition. The residual is the
+  software path's zeroed alpha byte: it is not observable in the drawn result
+  (a destination that ignores its alpha is drawn opaque) and observable only
+  in the alpha byte of the transition frame the CPU blend writes. The
+  alpha-vs-alpha mix differs by at most one 8-bit level between the port's two
+  paths, because the CPU path reads the byte-exact opacity table and the
+  program computes the share in floating point — the same difference the
+  reference's own two paths have.
+* **The `wave` provider still mixes the four channels alike.** The
+  reference's `wave` plugin picks its blend by the destination's type too,
+  but it names the straight-alpha type alone (`reference/cpp/plugins/wave.cpp:238-246`,
+  `LayerType == ltAlpha`), not the whole set of alpha-using types the core
+  handlers name (`drawable.h:53-61`), so the generic handling the engine has
+  does not single it out. The core cross-fade and universal handlers use the
+  same three-way selection (`TransIntf.cpp:664-686` and `:737-761`) and are
+  implemented; the `wave` provider keeps the four-channel mix.
+* **The composited frame is the GPU path's remaining gap.** A host that
+  cannot run the cross-fade program falls back to the composited frame, which
+  draws the two sources with the phase as their weights and therefore mixes
+  the four channels alike whatever the destination's type is
+  (`engine/src/trans/mod.rs` `Trans::transition_frame`,
+  `engine/src/projection.rs`). The rule-based kinds have no program at all and
+  are blended on the CPU on every host, with the mix the destination's alpha
+  handling selects.
+
+* **The transition's mix methods: what landed, and the alpha byte the
+  reference's two paths disagree on.** The cross-fade's blend is chosen by
+  the destination layer's type (`reference/cpp/core/visual/TransIntf.cpp:664-686`):
+  a type that uses its alpha channel (`drawable.h:53-61`) gets the
+  alpha-vs-alpha mix, the additive-alpha type (`drawable.h:63-65`) gets the
+  four-channel mix, and every other type the plain one. The three mixes are
+  `reference/cpp/core/visual/gl/blend_functor_c.h:662-672` (plain), `:673-680`
+  (additive) and `:689-707` (alpha-vs-alpha), and the opacity table the last
+  one reads is `reference/cpp/core/visual/tvpgl.cpp:224-251`. The reference's
+  *software* path writes the plain mix's alpha byte as zero — the blend masks
+  the green byte away and the alpha byte with it (`blend_functor_c.h:668-670`)
+  — while its *graphics* path mixes the alpha with the phase
+  (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3265-3268`, whose script
+  the plain and the additive type share, `:3274`); the reference's own two
+  paths therefore disagree, and its shader comparison says so
+  (`TEST_SHADER_IGNORE_ALPHA`, `:3270`). This port follows the graphics path
+  on **both** of its paths — the CPU blend (`engine/src/trans/mod.rs`) and the
+  cross-fade program (`engine/shaders/crossfade.frag`, which takes the mix
+  from the uniform the transition's effect draw writes) — so the headless
+  result and the desktop show the same transition, and both match the build
+  the user compares against. Two residuals remain against the software path.
+  Its plain mix writes a zeroed alpha byte: that is not observable in the
+  drawn result — a destination that ignores its alpha is drawn opaque — but
+  it is observable in the alpha byte of the transition frame the CPU blend
+  writes. Its alpha-vs-alpha mix takes the share from the byte table, whose
+  rule for a transparent destination (`blend_functor_c.h:689-707` with the
+  table at `tvpgl.cpp:224-251`) is 255 where the graphics path's
+  `d.a * opacity / (… + 0.0001)` is zero, so a transparent source covers
+  nothing here and covers everything there. The port's own two paths differ by
+  at most one 8-bit level per channel, because the CPU path reads the share
+  from a byte table and the program computes it in floating point — the same
+  difference the reference's own two paths have.
+* **The `wave` provider still mixes the four channels alike.** The
+  reference's `wave` plugin picks its blend by the destination's type too,
+  but it names the straight-alpha type alone (`reference/cpp/plugins/wave.cpp:238-246`,
+  `LayerType == ltAlpha`), not the whole set of alpha-using types the core
+  handlers name (`drawable.h:53-61`), so the generic handling the engine has
+  does not single it out. The core cross-fade and universal handlers use the
+  same three-way selection (`TransIntf.cpp:664-686` and `:737-761`) and are
+  implemented; the `wave` provider keeps the four-channel mix.
+* **The composited frame is the GPU path's remaining gap.** A host that
+  cannot run the cross-fade program falls back to the composited frame, which
+  draws the two sources with the phase as their weights — the reference's
+  plain blend (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3265-3268`)
+  — so it mixes the four channels alike whatever the destination's type is
+  (`engine/src/trans/mod.rs` `Trans::transition_frame`,
+  `engine/src/projection.rs`). A destination that uses its alpha channel gets
+  the coverage mix instead (`reference/cpp/core/visual/TransIntf.cpp:664-673`),
+  which the composited frame cannot express: at a full-screen fade the two
+  differ by up to five 8-bit levels per channel. The cross-fade program
+  (`engine/shaders/crossfade.frag`) runs the coverage mix, so a host that can
+  run it — the desktop and the Android build — matches the reference; the
+  composited frame is the fallback for a host that cannot. The rule-based
+  kinds have no program at all and are blended on the CPU on every host, with
+  the mix the destination's alpha handling selects.
+* **The shipped build's plugin surface is larger than the port's.** The
+  shipped `textrender.dll` registers members the port does not have: `setFont`,
+  `setStyle`, `timeScale`, `renderLines`, `contains`, `maxScrollOffset`,
+  `maxScrollLine`, `calcLineOffset`, `getLinkNames`, `getLinkRects`,
+  `getLinkCharacters`, `isLinkContains`, `getLinkOfPosition`,
+  `defaultBigFontSize`, `defaultSmallFontSize`, `defaultAlign`, `defaultValign`,
+  `defaultShadowColor`, `defaultShadowDiff` and `defaultEdgeColor` - adding
+  them is a reviewed surface-lock baseline change.
+* **The shipped build's `setOption` reads the option members** (`following`,
+  `leading`, `begin`, `end`, `vertical`, `kinsoku_max`) where the reference
+  tree's option deserializer does nothing
+  (`reference/cpp/plugins/TextRender.cpp:137-158`), so the port's `setOption`
+  still discards them and the game's message-layer path lays the text out
+  with the compiled-in sets only.
+* **The shipped build's default face is `normal`** (the reference tree's is
+  `user`), and its colours are ARGB where the tree's are RGB.
+* **The caption's centring is not the plugin's business.** The shipped build
+  stores `align`, `valign` and `shadowdiff` and never reads them back, so the
+  caption's offset comes from the game's own `FilterDrawTextParam`, which is
+  defined in no archive of the shipped game.
 * **The container layer types still collapse.** `ltBinder` (0), `ltEffect` (6)
   and `ltFilter` (7) read back as `ltAlpha` (2)
   (`natives/visual/layer/blend.rs`), so the resolution table's default arm
@@ -210,6 +387,43 @@ residuals:
   ignores it (`reference/cpp/core/environ/impl/TVPWindow.h:458-467`) and
   ours is drained without being read (`crates/app/src/game.rs`), so an
   update redraws the whole window in both.
+
+* **The greyscale weighed the red and the blue the other way round.** The
+  reference's grey is `(19*R + 183*G + 54*B) >> 8`: the packed pixel word's
+  low byte carries the weight 19, the second byte 183 and the third byte 54,
+  the sum is shifted right by eight and written to all three colour bytes
+  while the alpha is held (`reference/cpp/core/visual/tvpgl.cpp:10350-10400`,
+  the weights at `:10359-10365`; the shader spells the same ramp as 0.0743 /
+  0.7148 / 0.2109, `reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3970-3972`).
+  The word holds the image's RGBA planes little-endian, so its low byte is
+  the red plane (`reference/cpp/core/visual/LayerBitmapIntf.h:19-21` stores a
+  colour in that byte order, `reference/cpp/core/visual/impl/LayerImpl.cpp:21-31`
+  names the conversion, `reference/cpp/core/visual/RenderManager.cpp:346-350`
+  reads the word back as the texture's RGBA planes). Ours weighed the red 54
+  and the blue 19, so a pure red pixel came out at 53 instead of 18; the
+  weights are now the reference's. The gamma ramp needed no change: the
+  reference builds a table per channel and applies the red table to the
+  word's low byte, the green table to the second byte and the blue table to
+  the third (`reference/cpp/core/visual/tvpgl.cpp:10405-10460`,
+  `:10473-10486`), which is what ours does.
+
+* **The box blur's kernel and its alpha plane are still ours.** The blur
+  averages every colour channel with the same weights, so the byte order
+  cannot reach it. The reference has two implementations and they do not
+  describe the same blur: the live one is a shader that sums nine samples
+  and divides them by nine, with the samples at the corners and the edge
+  midpoints of the blur area
+  (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3991-4005`), while
+  the other one - compiled out - averages the whole `(2x+1) x (2y+1)` window
+  (`reference/cpp/core/visual/LayerBitmapIntf.cpp:4158-4406`, the `#if 0`
+  at `:4090` takes it out of the build, and the call site is compiled out
+  too, `:4424-4444`). Ours averages the whole window, which is the
+  compiled-out one's rule. The alpha plane follows the kernel in both: the
+  shader divides it by nine and the window's average divides it by the
+  sample count (`reference/cpp/core/visual/argb.cpp:43-49`), while ours
+  holds the alpha when the member is called with `isalpha` false
+  (`natives/image_function.rs`). Closing this needs the reference's kernel
+  to be settled first.
 
 ## 5. Dialogs and popups
 
@@ -355,6 +569,184 @@ and function against a committed fixture — the DLL never loads at test time
 (D38). Order: `plugins/analysis/PRIORITY.md`. `PackinOne` is the one unemulated
 plugin real games actually link, so a storage proxy there needs behaviour, not
 surface; `krmovie`/`yuzuex` need L1/L2 backends.
+* **The shipped `textrender.dll` is not the reference's `TextRender.cpp`.**
+  The game installs `textrender.dll` = wamsoft `textrend` 1.0.0.1 (2014),
+  sha256[:12] `0a014cc2b581`; `reference/cpp/plugins/TextRender.cpp` is a
+  different build of the same plugin name. They agree on the size, the
+  spacing and the ruby defaults (24 / 6 / 10 / -2) and on the edge colour
+  (`0x0080ff`), and they disagree on the style dictionary's member names:
+  the shipped build reads `color`, `fontsize`, `linespacing`, `rubysize`,
+  `rubyoffset`, `shadowcolor`, `edgecolor` and `linesize`, the reference
+  reads `chColor`, `fontSize`, `lineSpacing`, `rubySize`, `rubyOffset`,
+  `shadowColor`, `edgeColor` and `lineSize`. The game's own dictionary is in
+  the shipped spelling (`sound.item` in the game's `default.tjs`: `color:
+  0x442200`, `fontsize: 16`, `linespacing: 0`), so the plugin ignored it and
+  the extra mode's music-list caption came out white at 24 px instead of the
+  game's colour at 16 px. The port now reads both spellings, the lower-case
+  one first (`crates/compat/src/natives/plugins/text_render/state.rs`,
+  `style_member`; `crates/compat/tests/textrender.rs`).
+  Four builds of the plugin exist and all four read the style dictionary in
+  lower case only - `face`, `bold`, `fontsize`, `bigfontsize`, `smallfontsize`,
+  `rubysize`, `rubyoffset`, `color`, `shadow`, `shadowcolor`, `shadowdiff`,
+  `edge`, `edgecolor`, `linespacing`, `pitch`, `linesize`, `align`, `valign` -
+  and no build reads a camelCase style member: those names are the class
+  properties. The game reads the lower-case members out of its own style
+  dictionary (`system/messagelayer.tjs`), and its own `smallsize` key is the
+  game's vocabulary, not the plugin's - the builds read `smallfontsize`. The
+  port reads what the shipped build reads, so the tree build's camelCase
+  spelling and the shipped build's lower-case one both work.
+  In the vendored tree `Plugins.link("textrender.dll")` registers the tree's
+  own build - the loader resolves only statically compiled modules
+  (`reference/cpp/core/plugin/PluginImpl.cpp:145`,
+  `reference/cpp/core/plugin/ncbind.cpp:14-28`) and the tree's module name
+  lower-cases to the same key (`reference/cpp/plugins/TextRender.cpp:5`) - so
+  the game's shipped DLL never runs there, while a real engine loads the
+  application's plugin directory and runs it. The tree and a real engine thus
+  disagree about which build answers the link, and the shipped DLL is the
+  oracle for this plugin's behaviour.
+  Its `setOption` reads the option members (`following`, `leading`,
+  `begin`, `end`, `vertical`, `kinsoku_max`) where the reference's option
+  deserializer does nothing, so the port's `setOption` still discards them
+  and the game's message-layer path (`setDefaultFromMessageLayer` passes the
+  message layer's character sets) lays the text out with the compiled-in sets
+  only. That is a behaviour change in the layout, and the reference tree says
+  the option deserializer is a no-op, so it needs the integrator's decision.
+  Still open, and a reviewed baseline change: the shipped build's class
+  registers members the port does not have (`setFont`, `setStyle`,
+  `timeScale`, `renderLines`, `contains`, `maxScrollOffset`, `maxScrollLine`,
+  `calcLineOffset`, `getLinkNames`, `getLinkRects`, `getLinkCharacters`,
+  `isLinkContains`, `getLinkOfPosition`, `defaultBigFontSize`,
+  `defaultSmallFontSize`, `defaultAlign`, `defaultValign`,
+  `defaultShadowColor`, `defaultShadowDiff`, `defaultEdgeColor`), and its
+  style carries the big and the small font size and the shadow difference,
+  which the port's style does not. Its `align`/`valign` are stored but never
+  read by its layout, so the port's ignoring them is equivalent.
+  The caption's *position* is therefore not the plugin's business: the extra
+  mode's caption path (`txrend.draw`) puts the characters where the plugin's
+  layout put them — the box's origin — and the offset comes from the game's
+  own `FilterDrawTextParam("sound.txofs", …)`, whose function is in no
+  archive of the shipped game (the patch's scripts call it, no script
+  defines it), so the offset the shipped build uses cannot be read from the
+  game either. The base class's caption path centres the text with
+  `drawButtonCaptionWithAlign` (align 5, `x += (w - getTextWidth(text)) >> 1`,
+  `y += (h - getTextHeight(text)) >> 1`) and the extra mode replaces that path
+  with its own. Closing the centring needs the game's own offset dict and
+  the text measurement, not the plugin.
+* **The vendored tree's plugin loader never loads the `textrender.dll` the
+  game ships; it registers the tree's own `TextRender.cpp`.**
+  The tree's `Plugins.link` calls `TVPLoadPlugin`, which ends in
+  `ncbAutoRegister::LoadModule` (`reference/cpp/core/plugin/PluginImpl.cpp:145`);
+  `LoadModule` looks the lower-cased name up in the map of the statically
+  compiled modules and loads nothing from the file system
+  (`reference/cpp/core/plugin/ncbind.cpp:14-28`), and the tree's
+  `TextRender.cpp` registers under `NCB_MODULE_NAME` = `TextRender.dll`
+  (`reference/cpp/plugins/TextRender.cpp:5`), whose lower-cased key is
+  `textrender.dll`. The `.tpm` autoload is not the path either: it scans the
+  executable's folder, `system/` and `plugin/` for `*.tpm`
+  (`reference/cpp/core/plugin/PluginImpl.cpp:74-88`), and the game ships
+  `plugin/*.dll` and no `.tpm`. So in the tree the game's own DLL is never
+  loaded and the tree's camel-case build answers every `Plugins.link`; a
+  real KiriKiri2 build loads the application's plugin directory instead, so
+  the game's own wamsoft `textrend` DLL is the one that runs there, it reads
+  the lower-case names, and the caption comes out in the game's colour. The
+  vendored tree and a real engine therefore disagree about which build of
+  this plugin runs.
+  The game links the plugin itself: `system/textrender.tjs` (in `data.xp3`)
+  is compiled TJS2 bytecode whose top level is `global.TextRender = <the
+  script's own class>` and then `Plugins.link("textrender.dll")` — the
+  top-level object disassembles to `const %1, *3`, `spds %-1.*'TextRender',
+  %1`, `cl %1`, `const %1, *0` (`textrender.dll`), `gpd %2, %-2.*'Plugins'`,
+  `calld %0, %2.*'link'(%1)`, `srv %0`, `ret`. Nothing checks the result: the
+  tree's `link` returns void and reports nothing
+  (`reference/cpp/core/plugin/PluginImpl.cpp:299-311`), and a failed link
+  surfaces later as a missing `TextRenderBase`.
+  The shipped DLL is the oracle for this plugin's behaviour (the rule for an
+  unported plugin): the port honours the shipped build's vocabulary — both
+  spellings, the lower-case one first — and cites the DLL build by hash and
+  gates on the committed fixture
+  (`crates/compat/tests/fixtures/textrender_dll_state.txt`,
+  `crates/compat/tests/textrender.rs`).
+* **The plugin ships in four distinct builds, and every one of them reads
+  the style dictionary in the lower-case spelling only.**
+  The inventory holds six copies of `textrender.dll` in four builds
+  (`plugins/INVENTORY.md`): `da1c09f846aa` (233472 bytes — the copies in
+  `plugins/1`, `plugins/3` and `plugins/7`), `0a014cc2b581` (220672 —
+  `plugins/2`), `44d7b0566c2f` (233472 — `plugins/5`) and `f180790ea6d1`
+  (199680 — `plugins/6`). All four carry the same version resource (wamsoft,
+  `textrend`, 1.0.0.1, copyright (C) 2014) and are four different binaries.
+  Two of the games on this host ship the plugin: the directory
+  `Others/doinaka_brother` ships `da1c09f846aa` and the game under test
+  ships `0a014cc2b581`; a scan of the 486 DLLs under `/mnt/DATA/Games` for
+  the `textrend` version string and for the file name found no other copy and
+  no renamed one.
+
+  All four read the same style members, and all of them in the lower-case
+  spelling: `face`, `bold`, `fontsize`, `bigfontsize`, `smallfontsize`,
+  `rubysize`, `rubyoffset`, `color`, `shadow`, `shadowcolor`, `shadowdiff`,
+  `edge`, `edgecolor`, `linespacing`, `pitch`, `linesize`, `align` and
+  `valign`; the two 233472-byte builds read `wordbreak` as well. The
+  camel-case names in their string tables — `chColor`, `fontSize`,
+  `lineSpacing`, `rubySize`, `rubyOffset`, `shadowColor`, `edgeColor`,
+  `lineSize` — are the class property names, and `shadowColor`, `edgeColor`
+  and `shadowDiff` also name the character dictionary's members; none of
+  them is a style dictionary member in any shipped build. The shipped
+  build's style deserializer is the function at `0x100022a0` of the
+  `0a014cc2b581` build: it pushes each member name as a wide string and
+  reads the dictionary through one of three member readers, and no
+  camel-case name is among them.
+
+  The game writes that spelling itself. The configuration entry
+  `"sound.item"` in the game's `default.tjs` (in `patch.xp3`) is
+  `%[ face:SystemDefaultFontFace, edge:false, shadow:false,
+  fontsize:SizeCoef(16), smallsize:SizeCoef(12), linespacing:0,
+  color:0x442200, valign:0 ]` and carries the comment `// for TextRender`,
+  and the game's `system/messagelayer.tjs` builds the same dictionary with
+  `fontsize`, `linespacing`, `rubysize`, `rubyoffset`, `shadowcolor` and
+  `edgecolor` while reading the plugin's camel-case class properties
+  (`defaultFontSize`, `defaultChColor`, `defaultRubySize`,
+  `defaultRubyOffset`, `defaultShadow`, `defaultShadowColor`, `defaultEdge`,
+  `defaultEdgeColor`, `defaultLineSpacing`, `defaultPitch`, `defaultAlign`,
+  `defaultLineSize`, `defaultFace`, `defaultBold`) back. The game's
+  `system/textrender.tjs` reads the same camel-case properties and the
+  character dictionary's `color`, `edgeColor` and `shadowColor`, and calls
+  the shipped build's `setDefaultFromMessageLayer`, `setDefaultFont` and
+  `setDefaultStyle`, none of which the tree's build has. The game was
+  written against the shipped build, and the lower-case spelling is the one
+  its dictionaries carry. It reads that spelling back too: the game's own
+  `system/messagelayer.tjs` reads `rubysize`, `rubyoffset`, `shadowcolor`
+  and `edgecolor` out of its style dictionary in `setFont`, `rubysize`,
+  `rubyoffset`, `shadowcolor`, `edgecolor` and `smallsize` in
+  `setDefaultFont`, `linespacing` and `linesize` in `setStyle` and
+  `setDefaultStyle`, and `fontsize` in `addButton`, while the same methods
+  read the plugin's camel-case `default*` properties. The lower-case names
+  are the game's own, and they are the names the shipped build reads.
+
+  The port's two-spelling read therefore covers every build a real game
+  ships: the lower-case spelling is the only one the shipped builds use and
+  the port reads it first, while the camel-case spelling is the reference
+  build's (`reference/cpp/plugins/TextRender.cpp:137-158`) and no shipped
+  build is that build. The oracle for the lower-case names is the shipped
+  DLL by hash — the derived fixture for the `0a014cc2b581` build is
+  `crates/compat/tests/fixtures/textrender_dll_state.txt` and the citation
+  is in `crates/compat/tests/textrender.rs`.
+
+  Two gaps are left in the port's `deserialize`
+  (`crates/compat/src/natives/plugins/text_render/state.rs`), and both are
+  gaps against the shipped builds:
+  * the port reads `italic` and `fontScale` from the dictionary and no
+    shipped build does: the shipped build reads `bold` but not `italic`,
+    and `fontScale` is a class property there. A dictionary carrying
+    `italic` therefore renders italic in the port and upright in the shipped
+    build; a dictionary carrying `fontScale` moves the port's `fontScale`
+    property and nothing else.
+  * the port reads neither `bigfontsize`, `smallfontsize` nor `shadowdiff`,
+    which every shipped build reads, and the port's style has no field for
+    the big and the small font size or for the shadow difference. A game
+    that sets them gets the normal size and no shadow offset in the port.
+    The shipped build's `align` and `valign` are stored but never read by
+    its layout, so the port's ignoring them is equivalent.
+
+## 11. L3 blockers
 
 ## 11. L3 blockers
 
@@ -489,7 +881,21 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   the title animation plays; no motion `dt` clamp was needed. `perf record` is
   blocked on this host by `kernel.perf_event_paranoid=2` (software `perf stat`
   works); gprofng works and is what the timings above come from.
-* **The title's background animation is fixed.**
+* **The title's background animation is computed but never reaches the
+  screen.**
+  * **The environment layer holds a 1x1 image on a 0x0 rectangle.** A
+    13 000-frame probe of the layer tree at the title found the last change
+    of any kind at frame 3266 and no change at all in the ~8 700 frames after
+    it. The environment layer named `title_bg` - the one thing that animates
+    during the two-second intro - holds a 1x1 image on a 0x0 rectangle, so
+    its single pixel changes every frame and none of it reaches the screen.
+    With the game's static branch forced (`enableSceneAnimEffect = false`,
+    `custom.ks:*title_start`) the same layer holds a 32x32 white placeholder
+    on a 0x0 rectangle, and the title art (`title_bg.png`, a 1920x1080 WebP
+    in `data1080.xp3`) is in no layer's image at the title. The size is lost
+    in the env-image/affine path, not in the presentation path: the dirty
+    signal is sound, since every pixel write arms both the upload and the
+    scene change.
   * **The engine had two clocks and the game read the wrong one.**
     `System.getTickCount()` returned a wall clock while the engine owns the
     frame clock, and the game's Conductor schedules its next timer tick from
@@ -498,10 +904,12 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
     tick count is the engine's frame clock now, so the game and its timers
     share one clock (the reference has one clock too,
     `reference/cpp/core/base/impl/SystemImpl.cpp:622-629`). With that the
-    scenario reaches the title, and the title's background animates: every
-    frame of the motion changes the layer's pixels, and only the frame after
-    the clip's end repeats — the asset's own one-shot behaviour, which the
-    reference shares (`title_bg.mtn`'s `title` clip carries `loopTime -1`).
+    scenario reaches the title, and the title's background motion is computed:
+    every frame of the motion changes the layer's pixels, and only the frame
+    after the clip's end repeats — the asset's own one-shot behaviour, which
+    the reference shares (`title_bg.mtn`'s `title` clip carries `loopTime -1`).
+    That layer holds a 1x1 image on a 0x0 rectangle, so the computed motion
+    does not reach the screen (the bullet above).
   * **What is displayed AFTER the two-second intro may still differ.** The
     game's `custom.ks:*title_start` has two branches — the last `.mtn` frame
     and the `title_bg.png` stage image — and which one the reference shows is
@@ -729,6 +1137,16 @@ new evidence.
   slowness on the game mount is environmental (FUSE), not code.
 
 
+* **An archive member that carries the game's text cipher is read as text.**
+  The cipher container is the three-byte signature `FE FE <mode>`, the
+  mandatory UTF-16LE mark and then the payload
+  (`reference/cpp/core/base/TextStream.cpp:271-280`), and the port decodes it
+  in the text layer (`docs/code/compat/text.md`); the reference's text
+  *reader* takes the payload one byte earlier
+  (`reference/cpp/core/base/TextStream.cpp:87-89`), so such a member decodes to
+  shifted garbage there. The XP3 filter is a different mechanism and is
+  registered only when the application ships `xp3filter.tjs`
+  (`reference/cpp/plugins/xp3filter.cpp:550-564`).
 ## 18. Image-pipeline follow-ups
 
 The deferred image pool, its L3 wiring, the cache insert and the startup

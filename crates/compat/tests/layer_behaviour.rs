@@ -1050,7 +1050,7 @@ fn color_rect_opacity_default_and_negative_removal() {
     assert_eq!(env.eval_int("a_full"), 255);
     assert_eq!(env.eval_int("a_removed"), 199);
     // Negative opacity does not repaint the colour.
-    assert_eq!(env.eval_int("rgb_after"), 0x302010);
+    assert_eq!(env.eval_int("rgb_after"), 0x10_2030);
 }
 
 /// Reference: `ColorRect` on `dfAddAlpha` throws
@@ -1158,11 +1158,11 @@ fn pixel_accessors_mask_alpha_and_hold_the_mask_plane() {
          var alpha_after = l.getMaskPixel(0, 0); \
          var rgb_after = l.getMainPixel(0, 0);",
     );
-    assert_eq!(env.eval("rgb").expect("rgb"), TjsValue::Integer(0xab_cdef));
+    assert_eq!(env.eval("rgb").expect("rgb"), TjsValue::Integer(0xef_cdab));
     assert_eq!(env.eval_int("alpha"), 77);
     assert_eq!(env.eval_int("alpha_after"), 77);
     // 0x00ff00 is green: r = 0, g = 255, b = 0.
-    assert_eq!(env.eval_int("rgb_after"), 0x00ff00);
+    assert_eq!(env.eval_int("rgb_after"), 0x00_ff00);
 }
 
 /// Reference: `SetPointMask` writes `(mask & 0xff) << 24` into the alpha
@@ -1296,7 +1296,7 @@ fn copy_rect_works_on_a_set_size_layer() {
          dst.copyRect(0, 0, src, 0, 0, 2, 2);",
     );
     assert_eq!(env.eval_int("dst.hasImage"), 1);
-    assert_eq!(env.eval_int("dst.getMainPixel(0, 0)"), 0x123456);
+    assert_eq!(env.eval_int("dst.getMainPixel(0, 0)"), 0x56_3412);
 }
 
 /// Reference: `tTJSNI_BaseLayer::PiledCopy` copies `src->Complete(rect)`
@@ -1329,9 +1329,9 @@ fn piled_copy_composites_the_source_layer_subtree() {
     );
     // The child's red is composited over the primary's opaque black, and the
     // 2x2 screenshot downscales to the same red (`system/advscreen.tjs:7405-7436`).
-    assert_eq!(env.eval_int("spr.getMainPixel(0, 0)"), 0xff0000);
-    assert_eq!(env.eval_int("spr.getMainPixel(1, 1)"), 0xff0000);
-    assert_eq!(env.eval_int("thumb.getMainPixel(0, 0)"), 0xff0000);
+    assert_eq!(env.eval_int("spr.getMainPixel(0, 0)"), 0x00_00ff);
+    assert_eq!(env.eval_int("spr.getMainPixel(1, 1)"), 0x00_00ff);
+    assert_eq!(env.eval_int("thumb.getMainPixel(0, 0)"), 0x00_00ff);
 }
 
 /// Reference: `FillRect` intersects the requested rectangle with `ClipRect`
@@ -1351,9 +1351,9 @@ fn fill_rect_fills_only_the_clipped_rectangle() {
     );
     // The red fill covers the [0,3) square, the green fill overwrites its
     // [2,4) corner, and the black base survives outside both.
-    assert_eq!(env.eval_int("l.getMainPixel(0, 0)"), 0xff0000);
-    assert_eq!(env.eval_int("l.getMainPixel(2, 2)"), 0x00ff00);
-    assert_eq!(env.eval_int("l.getMainPixel(3, 3)"), 0x00ff00);
+    assert_eq!(env.eval_int("l.getMainPixel(0, 0)"), 0x00_00ff);
+    assert_eq!(env.eval_int("l.getMainPixel(2, 2)"), 0x00_ff00);
+    assert_eq!(env.eval_int("l.getMainPixel(3, 3)"), 0x00_ff00);
     assert_eq!(env.eval_int("l.getMainPixel(0, 3)"), 0x000000);
 }
 
@@ -1371,8 +1371,8 @@ fn fill_rect_respects_the_clip_rect() {
          l.fillRect(0, 0, 4, 4, 0xffff0000);",
     );
     assert_eq!(env.eval_int("l.getMainPixel(0, 0)"), 0x000000);
-    assert_eq!(env.eval_int("l.getMainPixel(1, 1)"), 0xff0000);
-    assert_eq!(env.eval_int("l.getMainPixel(2, 2)"), 0xff0000);
+    assert_eq!(env.eval_int("l.getMainPixel(1, 1)"), 0x00_00ff);
+    assert_eq!(env.eval_int("l.getMainPixel(2, 2)"), 0x00_00ff);
     assert_eq!(env.eval_int("l.getMainPixel(3, 3)"), 0x000000);
 }
 
@@ -1412,7 +1412,7 @@ fn affine_copy_writes_inside_the_clip_rect_alone() {
                     "the clipped pass writes the pixels of the unclipped one at ({x}, {y})"
                 );
                 assert_eq!(
-                    clipped, 0xff0000,
+                    clipped, 0x00_00ff,
                     "the pass writes the source inside the clip at ({x}, {y})"
                 );
             } else {
@@ -1421,7 +1421,7 @@ fn affine_copy_writes_inside_the_clip_rect_alone() {
                     "the pixels outside the clip keep their value at ({x}, {y})"
                 );
                 assert_eq!(
-                    whole, 0xff0000,
+                    whole, 0x00_00ff,
                     "the unclipped pass writes outside the clip at ({x}, {y})"
                 );
             }
@@ -1482,7 +1482,7 @@ fn image_width_and_height_setters_resize_the_image() {
     assert_eq!(env.eval_int("l.width"), 32);
     assert_eq!(env.eval_int("l.height"), 32);
     assert_eq!(env.eval_int("l.imageLeft"), 0);
-    assert_eq!(env.eval_int("l.getMainPixel(1, 1)"), 0x123456);
+    assert_eq!(env.eval_int("l.getMainPixel(1, 1)"), 0x56_3412);
     assert_eq!(env.eval_int("l.getMainPixel(35, 1)"), 0xffffff);
     // A width below the rect shrinks the rect and clears the offset.
     env.run("l.imageWidth = 16;");
@@ -2008,6 +2008,120 @@ fn operate_rect_om_auto_uses_the_source_layer_type() {
     assert_ne!(env.eval_int("auto"), env.eval_int("alpha"));
 }
 
+/// Reference: the script-visible `operateRect` resolves the automatic mode
+/// before the layer implementation sees it — the mode argument defaults to
+/// `omAuto` (`reference/cpp/core/visual/LayerIntf.cpp:8977-8981`) and is
+/// replaced by the source layer's `GetOperationModeFromType()`
+/// (`LayerIntf.cpp:8989-8991`, the table at `:1621-1686`) before
+/// `OperateRect` is called (`:8993`). An explicitly passed `omAuto` (128)
+/// is replaced as well: the replacement tests the value, not where it came
+/// from. The `omAuto` guard inside the layer implementation
+/// (`LayerIntf.cpp:5233-5235`, the message `TVPCannotAcceptModeAuto` =
+/// "Cannot accept omAuto mode",
+/// `reference/cpp/core/base/MsgIntfInc.h:63`) is therefore unreachable from
+/// a script.
+#[test]
+fn operate_rect_resolves_an_explicit_auto_mode() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "function make() { \
+             var w = new Window(); \
+             var dst = new Layer(w, null); dst.setImageSize(2, 2); \
+             var src = new Layer(w, null); src.setImageSize(2, 2); \
+             src.type = 3; \
+             dst.colorRect(0, 0, 2, 2, 0x00006400, 255); \
+             src.colorRect(0, 0, 2, 2, 0x000000c8, 128); \
+             return %[dst: dst, src: src]; \
+         } \
+         var p = make(); \
+         p.dst.operateRect(0, 0, p.src, 0, 0, 2, 2); var omitted = p.dst.getMainPixel(0, 0); \
+         var q = make(); \
+         q.dst.operateRect(0, 0, q.src, 0, 0, 2, 2, 128); var auto = q.dst.getMainPixel(0, 0); \
+         var r = make(); \
+         r.dst.operateRect(0, 0, r.src, 0, 0, 2, 2, 3); var additive = r.dst.getMainPixel(0, 0); \
+         var s = make(); \
+         s.dst.operateRect(0, 0, s.src, 0, 0, 2, 2, 2); var alpha = s.dst.getMainPixel(0, 0);",
+    );
+    // The omitted mode and an explicitly passed `omAuto` are the same
+    // operation, and both are the source layer's type (3 = ltAdditive) and
+    // not the alpha default: the additive result differs from the alpha one
+    // because the destination is not black.
+    assert_eq!(env.eval_int("omitted"), env.eval_int("auto"));
+    assert_eq!(env.eval_int("auto"), env.eval_int("additive"));
+    assert_ne!(env.eval_int("auto"), env.eval_int("alpha"));
+}
+
+/// Reference: `Layer.operateStretch` resolves the automatic mode the same
+/// way `operateRect` does — the mode argument defaults to `omAuto`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:9196-9200`) and is replaced by
+/// the source layer's operation mode (`LayerIntf.cpp:9217-9219`) before
+/// `OperateStretch` is called (`:9221`), so the `omAuto` guard inside the
+/// implementation (`LayerIntf.cpp:5391-5392`) is unreachable from a script.
+#[test]
+fn operate_stretch_resolves_an_explicit_auto_mode() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "function make() { \
+             var w = new Window(); \
+             var dst = new Layer(w, null); dst.setImageSize(2, 2); \
+             var src = new Layer(w, null); src.setImageSize(2, 2); \
+             src.type = 3; \
+             dst.colorRect(0, 0, 2, 2, 0x00006400, 255); \
+             src.colorRect(0, 0, 2, 2, 0x000000c8, 128); \
+             return %[dst: dst, src: src]; \
+         } \
+         var p = make(); \
+         p.dst.operateStretch(0, 0, 2, 2, p.src, 0, 0, 2, 2); var omitted = p.dst.getMainPixel(0, 0); \
+         var q = make(); \
+         q.dst.operateStretch(0, 0, 2, 2, q.src, 0, 0, 2, 2, 128); var auto = q.dst.getMainPixel(0, 0); \
+         var r = make(); \
+         r.dst.operateStretch(0, 0, 2, 2, r.src, 0, 0, 2, 2, 3); var additive = r.dst.getMainPixel(0, 0); \
+         var s = make(); \
+         s.dst.operateStretch(0, 0, 2, 2, s.src, 0, 0, 2, 2, 2); var alpha = s.dst.getMainPixel(0, 0);",
+    );
+    assert_eq!(env.eval_int("omitted"), env.eval_int("auto"));
+    assert_eq!(env.eval_int("auto"), env.eval_int("additive"));
+    assert_ne!(env.eval_int("auto"), env.eval_int("alpha"));
+}
+
+/// Reference: `Layer.operateAffine` resolves the automatic mode the same
+/// way — the mode argument defaults to `omAuto`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:9474-9478`) and is replaced by
+/// the source layer's operation mode (`LayerIntf.cpp:9480-9482`) before
+/// `OperateAffine` is called (`:9493` for the matrix form, `:9503` for
+/// the points form), so the `omAuto` guard inside the implementation
+/// (`LayerIntf.cpp:5627-5628` and `:5664-5665`) is unreachable from a
+/// script.
+#[test]
+fn operate_affine_resolves_an_explicit_auto_mode() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "function make() { \
+             var w = new Window(); \
+             var dst = new Layer(w, null); dst.setImageSize(2, 2); \
+             var src = new Layer(w, null); src.setImageSize(2, 2); \
+             src.type = 3; \
+             dst.colorRect(0, 0, 2, 2, 0x00006400, 255); \
+             src.colorRect(0, 0, 2, 2, 0x000000c8, 128); \
+             return %[dst: dst, src: src]; \
+         } \
+         var p = make(); \
+         p.dst.operateAffine(p.src, 0, 0, 2, 2, true, 1, 0, 0, 1, 0, 0); var omitted = p.dst.getMainPixel(0, 0); \
+         var q = make(); \
+         q.dst.operateAffine(q.src, 0, 0, 2, 2, true, 1, 0, 0, 1, 0, 0, 128); var auto = q.dst.getMainPixel(0, 0); \
+         var r = make(); \
+         r.dst.operateAffine(r.src, 0, 0, 2, 2, true, 1, 0, 0, 1, 0, 0, 3); var additive = r.dst.getMainPixel(0, 0); \
+         var s = make(); \
+         s.dst.operateAffine(s.src, 0, 0, 2, 2, true, 1, 0, 0, 1, 0, 0, 2); var alpha = s.dst.getMainPixel(0, 0);",
+    );
+    assert_eq!(env.eval_int("omitted"), env.eval_int("auto"));
+    assert_eq!(env.eval_int("auto"), env.eval_int("additive"));
+    assert_ne!(env.eval_int("auto"), env.eval_int("alpha"));
+}
+
 /// Reference: `GetBltMethodFromOperationModeAndDrawFace` only knows the
 /// `omAlpha` / `omAddAlpha` / `omOpaque` modes on the `dfAlpha` /
 /// `dfAddAlpha` / `dfOpaque` faces and reports failure —
@@ -2080,8 +2194,8 @@ fn color_rect_on_an_out_of_vocabulary_face_is_silent() {
     // The colour goes through the system-colour table first
     // (`reference/cpp/core/visual/LayerIntf.cpp:4351`), so `0xff304050`
     // keeps its low 24 bits with the red and blue bytes swapped.
-    assert_eq!(env.eval_int("before"), 0x504030);
-    assert_eq!(env.eval_int("after"), 0x504030);
+    assert_eq!(env.eval_int("before"), 0x30_4050);
+    assert_eq!(env.eval_int("after"), 0x30_4050);
 }
 
 /// Reference: with `face == dfAuto` (128, the reference default
@@ -2209,8 +2323,8 @@ fn grayscale_and_flips_take_no_arguments() {
     );
     // Grayscale of (0x30, 0x60, 0x90) is not the original colour, and the
     // left-right flip moved the pixel to x = 1.
-    assert!(env.eval_int("gray") != 0x306090);
-    assert_eq!(env.eval_int("flipped"), 0x0000ff);
+    assert!(env.eval_int("gray") != 0x90_6030);
+    assert_eq!(env.eval_int("flipped"), 0xff_0000);
 }
 
 // ---------------------------------------------------------------------------
@@ -2405,9 +2519,12 @@ fn assign_images_copies_a_layer_and_deallocates_on_an_imageless_source() {
         1,
         "assignImages must copy the source MainImage pixels"
     );
+    // The readback is the little-endian word of the RGBA planes, so the
+    // red is in the low byte (`reference/cpp/core/visual/LayerBitmapIntf.cpp:165-171`,
+    // `reference/cpp/core/visual/RenderManager.cpp:346-350`).
     assert_eq!(
         env.eval_int("dst.getMainPixel(0, 0)"),
-        0x123456,
+        0x56_3412,
         "the copied pixel is the source pixel"
     );
 

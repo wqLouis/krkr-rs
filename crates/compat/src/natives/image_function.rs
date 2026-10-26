@@ -54,6 +54,7 @@ use crate::native_util::{args, report_error, set_void, value_as_string};
 use crate::natives::system::{
     EngineBinding, actual_color_bytes, resolve, try_value_as_i64, value_as_bool,
 };
+use crate::natives::visual::swap_red_blue;
 use crate::resource::{TextDrawParams, draw_text_into_bitmap, glyph_text, resource_state};
 use crate::{CompatCtx, CompatError};
 
@@ -412,11 +413,10 @@ fn normalize_color_face(face: i64) -> i64 {
 /// table is keyed by the operation mode alone, so the method's own arithmetic
 /// is not expressible here.
 fn blit_method(mode: i64, face: i64) -> (i64, bool) {
-    if mode == OM_AUTO {
-        // The auto mode keeps the first method of the table, the
-        // alpha-on-alpha one, which takes no hold argument.
-        return (OM_ALPHA, false);
-    }
+    // The auto mode is the alpha mode before the face is applied, so the
+    // face still selects the method and the hold argument reaches a
+    // face-selected blend on an opaque face.
+    let mode = if mode == OM_AUTO { OM_ALPHA } else { mode };
     let face = normalize_draw_face(face);
     let plain = if FACE_SENSITIVE_MODES.contains(&mode) {
         face == DF_OPAQUE
@@ -1287,7 +1287,6 @@ extern "C" fn image_draw_text(
         // The main colour goes through the system-colour table; the shadow
         // colour is taken as it is.
         let rgb = actual_color_bytes(try_value_as_i64(&a[5])?);
-        let color = [rgb[0], rgb[1], rgb[2], 255];
         let draw_face = opt_i64(a, 8, DF_ALPHA)?;
         let opacity = opt_i64(a, 6, 255)? as i32;
         // The add-alpha face cannot take a negative opacity.
@@ -1300,8 +1299,12 @@ extern "C" fn image_draw_text(
         let opacity = opacity.clamp(0, 255);
         let antialias = opt_bool(a, 7, true);
         let shadow_level = opt_i64(a, 9, 0)? as i32;
-        let mut shadow_color = argb_to_rgba(opt_i64(a, 10, 0)?);
-        shadow_color[3] = 255;
+        let mut shadow_rgba = argb_to_rgba(opt_i64(a, 10, 0)?);
+        shadow_rgba[3] = 255;
+        // The text path hands the colour to the bitmap as it is, so the
+        // drawn colour names the red and the blue the other way round.
+        let color = swap_red_blue([rgb[0], rgb[1], rgb[2], 255]);
+        let shadow_color = swap_red_blue(shadow_rgba);
         let shadow_width = opt_i64(a, 11, 0)? as i32;
         let shadow_offset = (opt_i64(a, 12, 0)? as i32, opt_i64(a, 13, 0)? as i32);
         let clip = read_rect(host, a.get(15))?;
@@ -1389,7 +1392,6 @@ extern "C" fn image_draw_glyph(
         // The main colour goes through the system-colour table; the shadow
         // colour is taken as it is.
         let rgb = actual_color_bytes(try_value_as_i64(&a[4])?);
-        let color = [rgb[0], rgb[1], rgb[2], 255];
         let draw_face = opt_i64(a, 7, DF_ALPHA)?;
         let opacity = opt_i64(a, 5, 255)? as i32;
         // The add-alpha face cannot take a negative opacity.
@@ -1402,8 +1404,12 @@ extern "C" fn image_draw_glyph(
         let opacity = opacity.clamp(0, 255);
         let antialias = opt_bool(a, 6, true);
         let shadow_level = opt_i64(a, 8, 0)? as i32;
-        let mut shadow_color = argb_to_rgba(opt_i64(a, 9, 0)?);
-        shadow_color[3] = 255;
+        let mut shadow_rgba = argb_to_rgba(opt_i64(a, 9, 0)?);
+        shadow_rgba[3] = 255;
+        // The glyph path hands the colour to the bitmap as it is, so the
+        // drawn colour names the red and the blue the other way round.
+        let color = swap_red_blue([rgb[0], rgb[1], rgb[2], 255]);
+        let shadow_color = swap_red_blue(shadow_rgba);
         let shadow_width = opt_i64(a, 10, 0)? as i32;
         let shadow_offset = (opt_i64(a, 11, 0)? as i32, opt_i64(a, 12, 0)? as i32);
         let clip = read_rect(host, a.get(14))?;

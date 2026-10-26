@@ -25,8 +25,8 @@ use super::super::bitmap::{
 };
 use super::super::common::scene_mut;
 use super::super::common::{
-    DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, actual_color_bytes, argb_to_rgba, bound, rgba_to_argb,
-    scene_ref, set_null_out,
+    DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, actual_color_bytes, argb_to_rgba, bound,
+    rgba_to_pixel_word, scene_ref, set_null_out, swap_red_blue,
 };
 use super::LayerInst;
 use super::util::{
@@ -1928,7 +1928,8 @@ extern "C" fn layer_light(
 // Pixel accessors / province / bitmap copy / dump
 // ---------------------------------------------------------------------------
 
-/// `getMainPixel(x, y)` → the pixel's `0x00RRGGBB` colour.
+/// `getMainPixel(x, y)` → the pixel's packed colour word: the red in the low
+/// byte, the green in the second, the blue in the third.
 extern "C" fn layer_get_main_pixel(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -1964,7 +1965,7 @@ extern "C" fn layer_get_main_pixel(
         .ok()
         .and_then(|dst| scene.bitmap(dst))
         .and_then(|b| read_pixel(b, x, y))
-        .map_or(0, |px| rgba_to_argb(px) & 0x00ff_ffff);
+        .map_or(0, |px| rgba_to_pixel_word(px) & 0x00ff_ffff);
     set_int(out, value);
     0
 }
@@ -2858,7 +2859,7 @@ fn layer_draw_text_common(
         // The main colour goes through the system-colour table; the shadow
         // colour is taken as it is.
         let rgb = actual_color_bytes(value_as_i64(&a[3]));
-        let color = [rgb[0], rgb[1], rgb[2], 255];
+        let mut color = [rgb[0], rgb[1], rgb[2], 255];
         let opacity = opt_i64(a, 4, 255) as i32;
         {
             // The text is drawn with the blend method the draw face selects,
@@ -2880,6 +2881,12 @@ fn layer_draw_text_common(
         let shadow_level = opt_i64(a, 6, 0) as i32;
         let mut shadow_color = argb_to_rgba(opt_i64(a, 7, 0));
         shadow_color[3] = 255;
+        if glyph {
+            // The glyph path hands the colour to the bitmap as it is, so the
+            // drawn colour names the red and the blue the other way round.
+            color = swap_red_blue(color);
+            shadow_color = swap_red_blue(shadow_color);
+        }
         let shadow_width = opt_i64(a, 8, 0) as i32;
         let shadow_offset = (opt_i64(a, 9, 0) as i32, opt_i64(a, 10, 0) as i32);
         let params = TextDrawParams {

@@ -29,6 +29,7 @@ and renders with `Trans::apply` once per frame.
 
 ```rust
 pub struct Trans {
+    pub dest_alpha: DestAlpha,
     kind: TransKind,
     duration_ms: f64,
     elapsed_ms: f64,
@@ -66,6 +67,7 @@ pub enum TransKind {
 
 pub enum ScrollFrom { Left, Top, Right, Bottom }
 pub enum ScrollStay { NoStay, StayDest, StaySrc }
+pub enum DestAlpha { Opaque, Straight, Additive }
 
 impl RuleMask {
     pub fn new(width: u32, height: u32, gray: Vec<u8>) -> Result<Self, TransError>;
@@ -77,6 +79,8 @@ impl RuleMask {
 }
 
 impl Trans {
+    pub dest_alpha: DestAlpha;
+
     pub fn new(kind: TransKind, duration_ms: f64) -> Result<Self, TransError>;
     pub fn with_rule(kind: TransKind, duration_ms: f64, rule: Option<RuleMask>) -> Result<Self, TransError>;
     pub fn cross_fade(duration_ms: f64) -> Result<Self, TransError>;
@@ -180,6 +184,15 @@ it can serve:
   `blend_level` applies. Every other kind returns `None`; a zero-sized frame
   returns `None` too.
 * **The rule mask is tiled** over the source; `RuleMask::at` does the tiling.
+* **The mix follows the destination's alpha handling.**
+  `Trans::dest_alpha` names the mix: a destination that ignores its alpha
+  and one that stores an additive alpha cover the four channels alike, and
+  a destination that stores a straight alpha per pixel gets the mix that
+  covers the source with the share of the destination its two alphas give
+  it. The rule-based kinds mix the colour channels alone for a destination
+  that ignores its alpha and keep that destination's own alpha. The caller
+  states the destination's handling when the transition starts; the kinds
+  that do not blend two sources ignore it.
 * **`phase_max` is `PHASE_MAX + vague` for `Universal`**, so the soft edge
   has room; every other kind uses `PHASE_MAX`.
 * **The `extrans` providers keep the reference's integer arithmetic.** The
@@ -286,6 +299,16 @@ typed error, and L3 turns it into the script error text.
   lookup per pixel instead of two divisions. A source that does not cover
   the destination's columns falls back to the per-pixel read, which reads
   the missing columns as transparent.
+* **The composited frame does not honour the destination's alpha
+  handling.** The cross-fade's own program
+  (`crates/engine/shaders/crossfade.frag`) does: it takes the mix from the
+  uniform the transition's effect draw writes. The composited frame — the
+  fallback for a host that cannot run the program — draws the two sources
+  with the phase as their weights, so it mixes the four channels alike.
+* **The `extrans` providers keep the four-channel mix.** The reference's
+  `wave` plugin picks its blend by the destination's type too, but it names
+  the straight-alpha type alone, which the generic handling does not single
+  out.
 
 ---
 

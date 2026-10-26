@@ -63,6 +63,12 @@ pub const OPACITY_UNIFORM: u32 = 15;
 /// Word a program reads its own per-frame parameter from (the phase weight for
 /// the cross-fade).
 pub const PARAM_UNIFORM: u32 = 8;
+/// Word the cross-fade program reads its mix from: the `y` of the parameter
+/// word.
+///
+/// `0` covers the four channels alike, `1` covers the source with the share
+/// of the destination its two alphas give it.
+pub const METHOD_UNIFORM: u32 = 9;
 /// Word the first source's texture rectangle starts at.
 ///
 /// The rectangle is `(u0, v0, u1, v1)` in normalized texture coordinates: the
@@ -84,8 +90,9 @@ pub const SCROLL_BINDINGS: [BindingDesc; 1] = [BindingDesc::texture(1, SamplerKi
 
 /// The cross-fade program.
 ///
-/// Source 1 is bound at 1 and source 2 at 2; the fragment stage lerps them per
-/// channel at [`PARAM_UNIFORM`] and scales the alpha by [`OPACITY_UNIFORM`].
+/// Source 1 is bound at 1 and source 2 at 2; the fragment stage mixes them at
+/// [`PARAM_UNIFORM`] with the mix [`METHOD_UNIFORM`] names, and scales the
+/// alpha by [`OPACITY_UNIFORM`].
 pub fn crossfade() -> ProgramDesc<'static> {
     let mut desc = ProgramDesc::new("crossfade", VERTEX, CROSSFADE_FRAGMENT);
     desc.bindings = &CROSSFADE_BINDINGS;

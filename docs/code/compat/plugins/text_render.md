@@ -2,7 +2,9 @@
 
 **DLL name:** `TextRender.dll` — linked with `Plugins.link("TextRender.dll")`
 **Rust module:** `crates/compat/src/natives/plugins/text_render/`
-**Reference:** `reference/cpp/plugins/TextRender.cpp`
+**Reference:** `reference/cpp/plugins/TextRender.cpp` — the `textrender.dll`
+a game installs is a *different* build with a different member set; see
+[Known gaps](#known-gaps).
 **Registers:** the `TextRenderBase` class — one constructor, 12 methods and 36 properties; no static member
 
 The DLL is one entry of the built-in table
@@ -123,7 +125,8 @@ The escapes the parser understands:
 | `%p<n>;` | sets the character pitch |
 | `%d<n>;`, `%w<n>;`, `%D<n>;` | the integer is read and discarded |
 | `%l…;` | the text up to `;` is read and discarded |
-| `%B`, `%S`, `%C`, `%R`, `%L` | logged and ignored |
+| `%B`, `%S` | the font size becomes the big or the small size of the default style |
+| `%C`, `%R`, `%L` | logged and ignored |
 | `%<n>;` | the font size becomes `defaultFontSize * n / 100` |
 | `\n` | flush the buffer and break the line |
 | `\t` | inserts a tab character |
@@ -233,10 +236,45 @@ void leaves the field unchanged, an argument that is not an object is ignored
 altogether, and the render-state members (`renderOver`, `renderDelay`,
 `renderText`) are never read.
 
+Eight of the style members have a second spelling: the lower-case name the
+shipped `textrender.dll` reads — `color`, `fontsize`, `linespacing`,
+`rubysize`, `rubyoffset`, `shadowcolor`, `edgecolor`, `linesize` — beside the
+camel-case name above. The port reads both, the lower-case one first, so a
+dictionary that carries either spelling reaches the style and a dictionary
+that carries both takes the lower-case value.
+
+Five members only the shipped build reads are taken under its spelling
+alone: `bigfontsize`, `smallfontsize`, `shadowdiff`, `align` and `valign`.
+The shipped build is wamsoft's `textrend` 1.0.0.1 (2014), sha256[:12]
+`0a014cc2b581`; its state deserializer reads the members in the order the
+committed fixture
+[`tests/fixtures/textrender_dll_state.txt`](../../../crates/compat/tests/fixtures/textrender_dll_state.txt)
+lists them, and the fixture names each member's wide string in the binary's
+`.rdata` and the state field the deserializer stores it in.
+
+* `bigfontsize` and `smallfontsize` are the sizes the `%B` and `%S` escapes
+  select. A dictionary that names the base size and neither of them leaves
+  the shipped build's derived sizes in place: the big size is twice the base
+  size, the small size half of it.
+* `shadowdiff`, `align` and `valign` are kept in the shipped build's style and
+  no code path reads them back, so the port applies the same nil effect. The
+  shipped build exposes them as class properties (`defaultShadowDiff`,
+  `defaultAlign`, `defaultValign`); the port registers neither, because the
+  surface lock does not move.
+
+A game builds its style dictionary in the shipped build's spelling — the
+game's `sound.item` entry carries `color: 0x442200`, `fontsize: 16`,
+`linespacing: 0`, `shadow: false` and `edge: false` — so the caption's
+colour and size come from the lower-case spelling. The game's own `smallsize`
+key is the game's vocabulary: it is read by the game's own message layer
+script, not by the plugin, and no build reads it.
+
 `fontScale`, `rubySize`, `rubyOffset`, `lineSize`, `renderDelay` and
 `vertical` are stored but do not influence the layout: the reference stores
 them without using them either, and its ruby, graphical and variable escapes
-are read and discarded.
+are read and discarded. The shipped build's `shadowdiff`, `align` and `valign`
+are stored the same way: no code path reads them back, so the port applies the
+same nil effect.
 
 ### The characters dictionary
 
@@ -304,6 +342,8 @@ raises the same message.
 
 | file | what it pins |
 |---|---|
+| `crates/compat/tests/textrender.rs` | the style dictionary's two spellings — the lower-case names the shipped `textrender.dll` reads, the camel-case names the class properties use, the lower-case name winning when a dictionary carries both — and the drawn characters carrying the dictionary's colour, shadow colour, edge colour and size |
+| `crates/compat/tests/fixtures/textrender_dll_state.txt` | every style member the shipped build reads, in the order its deserializer reads them, with the offset of each member's wide string in the binary, the state field it fills, the class property that shows it and the value the test drives it with |
 | `crates/compat/tests/text_render.rs` | the defaults and the style round-trip, the derived `renderRight` / `renderBottom`, the layout against the engine's text engine, the line break at the box width, the KAG markup parser, the typed parse errors, the unknown-face fallback, the `"user"` face through the scene font, `setDefault` / `clear` / `resetFont` / `resetStyle`, `setRenderSize`, the refused setters and `keyWait`, the ignored `setOption`, the argument counts, the flag escapes at the end of the text, the surrogate-pair rejection and the `getCharacters` ranges |
 | `crates/compat/src/natives/plugins/text_render/mod.rs` (the `tests` module) | that the class registers and that a fresh instance carries the reference's defaults |
 | `crates/compat/tests/add_font.rs` | the `System.addFont` registry the plugin consults for a face; the plugin itself is not exercised there |
@@ -348,3 +388,35 @@ the error cases assert a typed error rather than a fabricated metric.
 * The four option character sets (leading, following, begin, end) are fixed
   in both, because the reference's option deserializer does nothing
   (`reference/cpp/plugins/TextRender.cpp:191-196`).
+* The shipped `textrender.dll` a game installs is a different build from the
+  reference's `TextRender.cpp`: it is wamsoft's `textrend` 1.0.0.1 (2014),
+  sha256[:12] `0a014cc2b581`, and its class registers a member set the port
+  does not have — `setFont`, `setStyle`, `timeScale`, `renderLines`,
+  `contains`, `maxScrollOffset`, `maxScrollLine`, `calcLineOffset`,
+  `getLinkNames`, `getLinkRects`, `getLinkCharacters`, `isLinkContains`,
+  `getLinkOfPosition`, `defaultBigFontSize`, `defaultSmallFontSize`,
+  `defaultAlign`, `defaultValign`, `defaultShadowColor`,
+  `defaultShadowDiff`, `defaultEdgeColor`. Its style also carries the big
+  and the small font size (`bigfontsize`, `smallfontsize`) and a shadow
+  difference (`shadowdiff`), which the port's style does not. The port
+  implements the reference's class, so the members the shipped build has and
+  the port does not are missing. Its `align` and `valign` are stored but
+  never read by its layout, so the port's ignoring them is equivalent: both
+  lay the text out from the box's origin.
+* The shipped build's parser selects the big and the small size for the
+  `%B` and `%S` escapes and keeps the alignment for the `%C`, `%R` and `%L`
+  escapes, where the tree build's parser leaves all five unimplemented
+  (`reference/cpp/plugins/TextRender.cpp:580-598`). The port selects the size
+  as the shipped build does; the alignment stays without effect, because no
+  code path in the shipped build reads it back either.
+* The shipped build's `setOption` reads the option members (`following`,
+  `leading`, `begin`, `end`, `vertical`, `kinsoku_max`) where the reference's
+  option deserializer does nothing; the port's `setOption` discards them, so
+  a game that hands the plugin its character sets gets the compiled-in ones.
+* The shipped build's default face is `normal` where the reference's is
+  `user`, and its colours are ARGB (`0xffffffff` for the character colour,
+  `0xff000000` for the shadow, `0xff0080ff` for the edge) where the
+  reference's are RGB (`0xffffff`, `0x000000`, `0x0080ff`). The port keeps
+  the reference's defaults and reads a colour as the number the dictionary
+  carries, so the alpha byte of the shipped build's defaults does not reach
+  the port.

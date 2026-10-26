@@ -16,7 +16,7 @@ use tjs::{
 };
 
 use super::common::{
-    actual_color_bytes, bound, decode_pool_mut, resolve_object_id, rgba_to_argb, scene_mut,
+    actual_color_bytes, bound, decode_pool_mut, resolve_object_id, rgba_to_pixel_word, scene_mut,
     scene_ref, set_retained_out,
 };
 use crate::collections::Map;
@@ -562,7 +562,8 @@ extern "C" fn bitmap_ctor(
     0
 }
 
-/// `Bitmap.getPixel(x, y)` → the pixel's `0x00RRGGBB` colour.
+/// `Bitmap.getPixel(x, y)` → the pixel's packed colour word: the red in the
+/// low byte, the green in the second, the blue in the third.
 extern "C" fn bitmap_get_pixel(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -597,8 +598,8 @@ extern "C" fn bitmap_get_pixel(
     0
 }
 
-/// `Bitmap.setPixel(x, y, color)` → the red, green and blue planes; the
-/// mask plane is held.
+/// `Bitmap.setPixel(x, y, color)` → the red, green and blue planes of the
+/// named colour; the mask plane is held.
 extern "C" fn bitmap_set_pixel(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -775,13 +776,13 @@ fn pixel_range(bitmap: &BitmapState, x: i32, y: i32) -> Option<Range<usize>> {
     Some(offset..end)
 }
 
-/// Read one bitmap pixel as ARGB.
+/// Read one bitmap pixel as the packed word.
 fn read_bitmap_pixel(scene: &Scene, id: u32, x: i32, y: i32) -> i64 {
     let Some(bitmap) = scene.bitmap(id) else {
         return 0;
     };
     match pixel_range(bitmap, x, y) {
-        Some(range) => rgba_to_argb([
+        Some(range) => rgba_to_pixel_word([
             bitmap.rgba[range.start],
             bitmap.rgba[range.start + 1],
             bitmap.rgba[range.start + 2],

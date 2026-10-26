@@ -49,8 +49,23 @@ const SCRIPT: &str = "transitions-test";
 
 /// `0xRRGGBB` of the destination layer's fill (`Layer.setMainPixel`).
 const RED: i64 = 0xFF0000;
+/// The destination layer's opaque fill: an opaque red (`0xAARRGGBB`).
+const RED_OPAQUE: i64 = 0xFFFF0000;
+/// The transition source's opaque fill: an opaque blue (`0xAARRGGBB`).
+const BLUE_OPAQUE: i64 = 0xFF0000FF;
 /// `0xRRGGBB` of the transition source layer's fill.
 const BLUE: i64 = 0x0000FF;
+/// The packed word a pixel getter reports for the red fill: the red is in
+/// the low byte (`reference/cpp/core/visual/RenderManager.cpp:346-350`,
+/// `reference/cpp/core/visual/LayerIntf.cpp:2917-2923`).
+const RED_WORD: i64 = 0x0000FF;
+/// The packed word a pixel getter reports for the blue fill.
+const BLUE_WORD: i64 = 0xFF0000;
+/// The packed word a pixel getter reports for the green `0x00ff00`: the
+/// word is 0xAABBGGRR, so the green sits in the second byte from the low
+/// end (`reference/cpp/core/visual/RenderManager.cpp:346-350`,
+/// `reference/cpp/core/visual/LayerIntf.cpp:2917-2923`).
+const GREEN_WORD: i64 = 0x0000FF00;
 
 /// The bytes stored as `rule.img`; the synthetic decoder below recognises
 /// them and returns [`RULE_RGBA`].
@@ -219,6 +234,31 @@ impl Env {
 /// (`0xff0000`) and made visible (a non-primary layer defaults to hidden,
 /// and an invisible destination ends the transition at the first frame —
 /// reference/cpp/core/visual/LayerIntf.cpp:8056-8060).
+/// The two layers of [`two_layers`] with opaque fills, so the mix the
+/// destination's type selects is observable in the frame.
+///
+/// The alpha-using mix's share is `d.a * opacity / (s.a * (1.0 - opacity) *
+/// (1.0 - d.a * opacity) + d.a * opacity + 0.0001)`
+/// (reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3278-3291): with
+/// transparent sources it is zero and the frame holds source 1 whatever the
+/// phase is, with opaque sources it is not.
+fn two_opaque_layers(env: &Env, size: i64) {
+    two_opaque_layers_with(env, size, "");
+}
+
+/// [`two_opaque_layers`] with `preamble` inserted right after the window is
+/// created, like [`two_layers_with`].
+fn two_opaque_layers_with(env: &Env, size: i64, preamble: &str) {
+    env.run(&format!(
+        "var w = new Window(); {preamble} \
+         var a = new Layer(w, null); a.setSize({size}, {size}); a.setImageSize({size}, {size}); a.name = 'src'; \
+         var b = new Layer(w, null); b.setSize({size}, {size}); b.setImageSize({size}, {size}); b.visible = true; b.name = 'dest'; \
+         b.fillRect(0, 0, {size}, {size}, 0x{RED_OPAQUE:08x}); \
+         a.fillRect(0, 0, {size}, {size}, 0x{BLUE_OPAQUE:08x});"
+    ));
+}
+
+/// The two layers of [`two_layers`] with transparent fills.
 fn two_layers(env: &Env, size: i64) {
     two_layers_with(env, size, "");
 }
@@ -242,6 +282,10 @@ fn two_layers_with(env: &Env, size: i64, preamble: &str) {
 /// A window whose `a` (the transition source) and `b` (the destination) hold
 /// their content in child layers — the KAG `Sprite` shape, with no main image
 /// of their own — and a whole-subtree transition from `a` to `b` running.
+///
+/// The destination's type decides the blend the transition runs, so the
+/// destination is pinned to the opaque type: the blend is then the plain one,
+/// the per-channel mix these tests state.
 fn two_layers_with_children(env: &Env) {
     env.run(
         "var w = new Window(); \
@@ -249,6 +293,7 @@ fn two_layers_with_children(env: &Env) {
          var ac = new Layer(w, a); ac.setSize(2, 2); ac.setImageSize(2, 2); \
          ac.fillRect(0, 0, 2, 2, 0xff0000ff); ac.visible = true; \
          var b = new Layer(w, null); b.setSize(2, 2); b.visible = true; b.name = 'dest'; b.hasImage = false; \
+         b.type = ltOpaque; \
          var bc = new Layer(w, b); bc.setSize(2, 2); bc.setImageSize(2, 2); \
          bc.fillRect(0, 0, 2, 2, 0xffff0000); bc.visible = true; \
          b.beginTransition('crossfade', true, a, %[time: 100]);",
@@ -445,7 +490,7 @@ fn an_empty_method_name_is_the_reference_crossfade_default() {
     // Without children the frame blends the two main images into a temporary
     // that is never stored on either layer (`LayerIntf.cpp:6721-6744`), so the
     // destination's own image is untouched when the transition ends.
-    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED_WORD);
 }
 
 /// `StartTransition` refuses to begin while the layer is already in a
@@ -768,6 +813,7 @@ fn a_transition_without_children_blends_into_the_self_image() {
         "var w = new Window(); \
          var a = new Layer(w, null); a.setSize(2, 2); a.setImageSize(2, 2); a.name = 'src'; a.visible = false; \
          var b = new Layer(w, null); b.setSize(2, 2); b.setImageSize(2, 2); b.visible = true; b.name = 'dest'; \
+         b.type = ltOpaque; \
          for (var i = 0; i < 4; i++) { b.setMainPixel(i % 2, i / 2, 0xff0000); a.setMainPixel(i % 2, i / 2, 0x0000ff); } \
          var bc = new Layer(w, b); bc.setSize(2, 2); bc.setImageSize(2, 2); bc.name = 'ctl'; \
          bc.fillRect(0, 0, 2, 2, 0xff00ff00); bc.visible = true; \
@@ -809,11 +855,11 @@ fn a_transition_without_children_blends_into_the_self_image() {
     assert_eq!(env.eval_int("hits"), 0, "still running at phase 252");
 
     // Both main images and the live child are untouched at every phase.
-    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
-    assert_eq!(env.eval_int("b.getMainPixel(1, 1)"), RED);
-    assert_eq!(env.eval_int("a.getMainPixel(0, 0)"), BLUE);
-    assert_eq!(env.eval_int("a.getMainPixel(1, 1)"), BLUE);
-    assert_eq!(env.eval_int("bc.getMainPixel(0, 0)"), 0x00ff00);
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED_WORD);
+    assert_eq!(env.eval_int("b.getMainPixel(1, 1)"), RED_WORD);
+    assert_eq!(env.eval_int("a.getMainPixel(0, 0)"), BLUE_WORD);
+    assert_eq!(env.eval_int("a.getMainPixel(1, 1)"), BLUE_WORD);
+    assert_eq!(env.eval_int("bc.getMainPixel(0, 0)"), GREEN_WORD);
     assert_eq!(
         named_layer(&env, "ctl").parent,
         Some(named_layer(&env, "dest").id)
@@ -834,9 +880,9 @@ fn a_transition_without_children_blends_into_the_self_image() {
         cache_bitmap_of(&env, "dest").is_none(),
         "a childless transition allocates no subtree frame"
     );
-    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
-    assert_eq!(env.eval_int("a.getMainPixel(0, 0)"), BLUE);
-    assert_eq!(env.eval_int("bc.getMainPixel(0, 0)"), 0x00ff00);
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED_WORD);
+    assert_eq!(env.eval_int("a.getMainPixel(0, 0)"), BLUE_WORD);
+    assert_eq!(env.eval_int("bc.getMainPixel(0, 0)"), GREEN_WORD);
     assert_eq!(
         named_layer(&env, "ctl").parent,
         Some(named_layer(&env, "src").id),
@@ -872,7 +918,7 @@ fn a_stopped_transition_releases_its_self_image() {
         env._scene.bitmap(first).is_none(),
         "and releases its bitmap"
     );
-    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED_WORD);
 
     // The teardown hid the destination; make it visible again before the second
     // transition, which ends at the first frame while its destination is
@@ -913,7 +959,7 @@ fn a_nested_childless_transition_is_cached_as_its_self_image() {
         "var w = new Window(); \
          var p = new Layer(w, null); p.setSize(2, 2); p.name = 'parent'; p.hasImage = false; p.visible = true; \
          var c = new Layer(w, p); c.setSize(2, 2); c.setImageSize(2, 2); c.name = 'inner'; \
-         c.fillRect(0, 0, 2, 2, 0xffff0000); c.visible = true; \
+         c.fillRect(0, 0, 2, 2, 0xffff0000); c.visible = true; c.type = ltOpaque; \
          var cs = new Layer(w, null); cs.setSize(2, 2); cs.setImageSize(2, 2); cs.name = 'innerSrc'; \
          cs.fillRect(0, 0, 2, 2, 0xff0000ff); \
          var ps = new Layer(w, null); ps.setSize(2, 2); ps.setImageSize(2, 2); ps.name = 'outerSrc'; \
@@ -943,7 +989,7 @@ fn a_nested_childless_transition_is_cached_as_its_self_image() {
     );
     assert_eq!(
         env.eval_int("c.getMainPixel(0, 0)"),
-        RED,
+        RED_WORD,
         "the child's main image is untouched"
     );
     // The parent's frame is its phase-0 content verbatim.
@@ -1000,8 +1046,8 @@ fn with_children_blends_the_layer_subtrees() {
     // 50 ms into a 100 ms cross-fade truncates to phase 127.
     assert_2x2(&env, cache, blend_rgb(RED, BLUE, 127), "destination cache");
     // The children keep their own pixels: only the cache holds the blend.
-    assert_eq!(env.eval_int("bc.getMainPixel(0, 0)"), RED);
-    assert_eq!(env.eval_int("ac.getMainPixel(0, 0)"), BLUE);
+    assert_eq!(env.eval_int("bc.getMainPixel(0, 0)"), RED_WORD);
+    assert_eq!(env.eval_int("ac.getMainPixel(0, 0)"), BLUE_WORD);
 
     // The teardown drops both caches (`DecCacheEnabledCount`,
     // LayerIntf.cpp:7961-7964).
@@ -1153,7 +1199,7 @@ fn a_destination_that_shows_a_hidden_control_mid_transition_ends_clean() {
          var a = new Layer(w, null); a.setSize(4, 4); a.setImageSize(4, 4); a.name = 'src'; \
          a.fillRect(0, 0, 4, 4, 0xff0000ff); \
          var b = new Layer(w, null); b.setSize(4, 4); b.setImageSize(4, 4); b.visible = true; b.name = 'dest'; \
-         b.fillRect(0, 0, 4, 4, 0xffff0000); \
+         b.fillRect(0, 0, 4, 4, 0xffff0000); b.type = ltOpaque; \
          var bc = new Layer(w, b); bc.setSize(2, 2); bc.setImageSize(2, 2); bc.name = 'ctl'; \
          bc.fillRect(0, 0, 2, 2, 0xff00ff00); bc.visible = false; \
          b.beginTransition('crossfade', true, a, %[time: 100]);",
@@ -1165,7 +1211,7 @@ fn a_destination_that_shows_a_hidden_control_mid_transition_ends_clean() {
     assert_eq!(frame_pixel(&env, "dest", 1, 1), blend_rgb(RED, BLUE, 63));
     assert_eq!(
         env.eval_int("b.getMainPixel(1, 1)"),
-        RED,
+        RED_WORD,
         "the main image is never the blend target"
     );
 
@@ -1183,7 +1229,7 @@ fn a_destination_that_shows_a_hidden_control_mid_transition_ends_clean() {
         blend_rgb(RED, BLUE, 127),
         "the rest of the destination content"
     );
-    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED_WORD);
 
     // Completion releases the frame: the projection draws the live subtree,
     // which still carries the control and the original image — no ghost of
@@ -1196,11 +1242,11 @@ fn a_destination_that_shows_a_hidden_control_mid_transition_ends_clean() {
     assert_eq!(named_layer(&env, "dest").cache_enabled_count, 0);
     assert_eq!(
         env.eval_int("bc.getMainPixel(0, 0)"),
-        0x00ff00,
+        GREEN_WORD,
         "the control is still there"
     );
     assert_eq!(env.eval_int("bc.visible"), 1, "and still visible");
-    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED_WORD);
 }
 
 /// The exact game path (`system/advscreen.tjs:216-217,3353,3719`: the source
@@ -1230,7 +1276,17 @@ fn container_source_without_image_transitions_its_children() {
     );
     env.advance(50.0);
     let cache = cache_bitmap_of(&env, "dest").expect("destination cache");
-    assert_2x2(&env, cache, blend_rgb(BLUE, RED, 127), "destination cache");
+    // The destination carries the default type, ltAlpha, so the blend is the
+    // alpha-vs-alpha one
+    // (reference/cpp/core/visual/TransIntf.cpp:664-673): the source covers
+    // the destination with the share its two alphas give it
+    // (reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3278-3291). The
+    // destination content is its child opaque blue and the source content its
+    // child opaque red, so at phase 127 the source covers
+    // 0.49609375 / (0.50390625 * 0.50390625 + 0.49609375) = 0.661357 of the
+    // destination, and the byte-space mix writes 0xA70057 (the graphics path
+    // mixes in floating point, so its channels are within one level of that).
+    assert_2x2(&env, cache, 0xA70057, "destination cache");
 }
 
 /// The `ttExchange` teardown runs `Exchange` (`LayerIntf.cpp:754-979`),
@@ -1284,18 +1340,26 @@ fn a_trivial_destination_keeps_its_main_image() {
     // Phase 0: the frame holds source 1 verbatim; the MainImage is untouched.
     env.advance(0.0);
     assert_eq!(frame_pixel(&env, "dest", 0, 0), RED);
-    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED_WORD);
 
     // 50 ms into a 100 ms cross-fade truncates to phase 127: the frame holds
     // the blend, every pixel read of the MainImage still sees the original
     // image.
+    //
+    // The destination carries the default type, ltAlpha, so the blend is the
+    // alpha-vs-alpha one
+    // (reference/cpp/core/visual/TransIntf.cpp:664-673): the source covers
+    // the destination with the share its two alphas give it
+    // (reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3278-3291). Both
+    // sources are transparent, so the source covers nothing of the
+    // destination — the share is d.a * opacity / (... + 0.0001) and d.a is
+    // zero — and the frame holds source 1 verbatim.
     env.advance(50.0);
-    let expected = blend_rgb(RED, BLUE, 127);
-    assert_2x2(&env, transition_frame(&env, "dest"), expected, "frame");
+    assert_2x2(&env, transition_frame(&env, "dest"), RED, "frame");
     for (x, y) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
         assert_eq!(
             env.eval_int(&format!("b.getMainPixel({x}, {y})")),
-            RED,
+            RED_WORD,
             "the main image at ({x},{y}) is not the blend"
         );
     }
@@ -1307,8 +1371,8 @@ fn a_trivial_destination_keeps_its_main_image() {
     assert_eq!(env.eval_int("hits"), 1, "the transition completed");
     assert!(cache_bitmap_of(&env, "dest").is_none(), "frame released");
     assert_eq!(named_layer(&env, "dest").cache_enabled_count, 0);
-    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
-    assert_eq!(env.eval_int("b.getMainPixel(1, 1)"), RED);
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED_WORD);
+    assert_eq!(env.eval_int("b.getMainPixel(1, 1)"), RED_WORD);
 }
 
 // ---------------------------------------------------------------------------
@@ -1453,27 +1517,38 @@ fn ripple_options_are_validated_during_begin() {
 fn universal_rule_image_is_loaded_grayscale_and_tiled() {
     let _lock = vm_lock();
     let env = Env::new();
-    two_layers(&env, 4);
+    two_opaque_layers(&env, 4);
     env.run("b.beginTransition('universal', true, a, %[time: 100, rule: 'rule.img']);");
     env.advance(50.0);
-    // Rule (0,0) = grey 0 → opacity 255: the blue source at full blend.
-    assert_eq!(frame_pixel(&env, "dest", 0, 0), blend_rgb(RED, BLUE, 255));
-    // Rule (1,0) = grey 128 → opacity 124.
-    assert_eq!(frame_pixel(&env, "dest", 1, 0), blend_rgb(RED, BLUE, 124));
-    // Tiling: the 2x2 rule repeats over the 4x4 source, in both axes.
-    assert_eq!(
-        frame_pixel(&env, "dest", 2, 0),
-        frame_pixel(&env, "dest", 0, 0)
-    );
-    assert_eq!(
-        frame_pixel(&env, "dest", 1, 2),
-        frame_pixel(&env, "dest", 1, 0)
-    );
-    assert_eq!(
-        frame_pixel(&env, "dest", 3, 3),
-        frame_pixel(&env, "dest", 1, 1)
-    );
-    // A mid-grey rule value is not an endpoint of either source.
+    // The rule is the 2x2 checkerboard of greys 0 and 128, decoded as 8-bit
+    // grayscale and tiled over the 4x4 source
+    // (reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1689-1697), so the
+    // frame alternates the two weights in both axes.
+    //
+    // At 50 ms the phase is 159 and phase0 is 95
+    // (reference/cpp/core/visual/tvpgl.cpp:4576-4595), so the grey 0 weighs
+    // 255 and the grey 128 weighs 255 - (128 - 95) * 255 / 64 = 124. The
+    // alpha-using mix's share is
+    // `s2.a * (1 - opa) / (s2.a * (1 - opa) * (1 - s1.a * opa) + s1.a * opa +
+    // 0.0001)` (reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3336-3350):
+    // with opaque sources it is 254/256 for the grey 0 and 164/256 for the
+    // grey 128, and the byte-space mix writes 0x0100FD and 0x5B00A3.
+    let expected = [
+        [0x0100FD, 0x5B00A3, 0x0100FD, 0x5B00A3],
+        [0x5B00A3, 0x0100FD, 0x5B00A3, 0x0100FD],
+        [0x0100FD, 0x5B00A3, 0x0100FD, 0x5B00A3],
+        [0x5B00A3, 0x0100FD, 0x5B00A3, 0x0100FD],
+    ];
+    for (y, row) in expected.iter().enumerate() {
+        for (x, colour) in row.iter().enumerate() {
+            assert_eq!(
+                frame_pixel(&env, "dest", x as u32, y as u32),
+                *colour as i64,
+                "the frame at ({x},{y})"
+            );
+        }
+    }
+    // The mid-grey pixel is a blend of the two sources, not either of them.
     assert_ne!(frame_pixel(&env, "dest", 1, 0), RED);
     assert_ne!(frame_pixel(&env, "dest", 1, 0), BLUE);
 
@@ -1518,18 +1593,22 @@ fn the_rule_graphic_goes_through_the_decoded_image_cache() {
     let env = Env::new();
 
     // The cache is off, so the rule is decoded for every transition.
-    two_layers(&env, 2);
+    two_opaque_layers(&env, 2);
     env.run("b.beginTransition('universal', true, a, %[time: 100, rule: 'rule.img']);");
     env.advance(50.0);
     assert_eq!(env.decodes(), 1, "the first transition decodes the rule");
     let uncached = frame_pixel(&env, "dest", 0, 0);
-    // Rule (0,0) is grey 0, so the source-2 opacity is 255.
-    assert_eq!(uncached, blend_rgb(RED, BLUE, 255));
+    // The rule's grey-0 pixel weighs 255 at the phase 159
+    // (reference/cpp/core/visual/tvpgl.cpp:4576-4595), so the alpha-using
+    // mix's share is 254/256 of the destination
+    // (reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3336-3350) and the
+    // byte-space mix writes 0x0100FD.
+    assert_eq!(uncached, 0x0100FD);
 
     // The cache is on, so the first transition fills it and the next one hits
     // it.
     env.run("System.graphicCacheLimit = 1048576;");
-    two_layers(&env, 2);
+    two_opaque_layers(&env, 2);
     env.run("b.beginTransition('universal', true, a, %[time: 100, rule: 'rule.img']);");
     env.advance(50.0);
     assert_eq!(
@@ -1543,7 +1622,7 @@ fn the_rule_graphic_goes_through_the_decoded_image_cache() {
         "the cached rule gives the same frame as the uncached one"
     );
 
-    two_layers(&env, 2);
+    two_opaque_layers(&env, 2);
     env.run("b.beginTransition('universal', true, a, %[time: 100, rule: 'rule.img']);");
     env.advance(50.0);
     assert_eq!(env.decodes(), 2, "the cached rule is not decoded again");
@@ -1600,8 +1679,22 @@ fn universal_vague_defaults_to_64_and_is_read() {
         "unexpected error: {message}"
     );
 
+    // The rule's weight is not observable through the frame with
+    // transparent sources. The alpha-using rule blend mixes the colour by
+    // `s2.a * (1 - opa) / (s2.a * (1 - opa) * (1 - s1.a * opa) + s1.a * opa +
+    // 0.0001)` (reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3336-3350)
+    // and both sources are transparent, so the share is zero whatever the
+    // rule's weight is: the frame holds source 1 — the red fill — for the
+    // whole grid, with vague 0 and with the default 64 alike. A vague of 0
+    // divides by zero in the shader, and the reference's own table takes the
+    // hard threshold instead (reference/cpp/core/visual/tvpgl.cpp:4576-4595:
+    // the phase bounds the branch, so the division never runs), which is the
+    // same grid.
     let hard_grid = universal(", vague: 0");
-    assert_ne!(hard_grid, default_grid, "vague: 0 is a hard threshold");
+    assert_eq!(
+        hard_grid, default_grid,
+        "the rule's weight is not observable"
+    );
     // In the hard-threshold run the grey-128 pixel is source 1 verbatim
     // (128 >= phase 127 → opacity 0).
     two_layers(&env, 2);
@@ -1609,10 +1702,88 @@ fn universal_vague_defaults_to_64_and_is_read() {
     env.advance(50.0);
     assert_eq!(frame_pixel(&env, "dest", 1, 0), RED);
 
-    assert_ne!(
+    assert_eq!(
         universal(", vague: 255"),
         default_grid,
-        "vague: 255 differs"
+        "the rule's weight is not observable either"
+    );
+}
+
+/// A transparent source leaves the frame at source 1.
+///
+/// The destination carries the default alpha-using type, so the frame is
+/// mixed by the share the two alphas give the source
+/// (reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3278-3291):
+/// `d.a * opacity / (s.a * (1.0 - opacity) * (1.0 - d.a * opacity) + d.a *
+/// opacity + 0.0001)`. The source is transparent, so `d.a` is zero and the
+/// share is zero: the frame holds source 1 — the red fill — at every phase.
+///
+/// This is the reference's behaviour, not a port artefact: the graphics path
+/// divides by the epsilon, so the share is zero and nothing of the source
+/// shows.
+#[test]
+fn a_transparent_source_leaves_the_frame_at_source_one() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    two_layers(&env, 2);
+    env.run("b.beginTransition('crossfade', true, a, %[time: 1000]);");
+    env.advance(50.0);
+    assert_eq!(
+        frame_pixel(&env, "dest", 0, 0),
+        RED,
+        "the frame holds source 1"
+    );
+    env.advance(450.0);
+    assert_eq!(
+        frame_pixel(&env, "dest", 0, 0),
+        RED,
+        "and it still holds source 1"
+    );
+}
+
+/// The rule's weight reaches the blend when the sources are opaque.
+///
+/// The universal handler mixes the two sources by the rule's weight
+/// (reference/cpp/core/visual/TransIntf.cpp:737-761), and the alpha-using
+/// mix's share is `s2.a * (1 - opa) / (s2.a * (1 - opa) * (1 - s1.a * opa) +
+/// s1.a * opa + 0.0001)`
+/// (reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3336-3350). With
+/// opaque sources the share is not zero, so the rule's grayscale shows in the
+/// frame: at the default vague of 64 the grey-0 pixel weighs 255 and the
+/// grey-128 pixel 124 (the software table,
+/// reference/cpp/core/visual/tvpgl.cpp:4576-4595), and a vague of 0 weighs
+/// the grey-0 pixel 255 and the grey-128 pixel 0.
+#[test]
+fn the_rule_weight_reaches_the_blend_with_opaque_sources() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    two_opaque_layers(&env, 2);
+    env.run("b.beginTransition('universal', true, a, %[time: 100, rule: 'rule.img']);");
+    env.advance(50.0);
+    // The grey-0 pixel weighs 255: the share is 254/256 of the destination
+    // and the byte-space mix writes 0x0100FD.
+    assert_eq!(
+        frame_pixel(&env, "dest", 0, 0),
+        0x0100FD,
+        "the grey-0 pixel is the source at the full weight"
+    );
+    // The grey-128 pixel weighs 124: the share is 164/256 and the mix writes
+    // 0x5B00A3.
+    assert_eq!(
+        frame_pixel(&env, "dest", 1, 0),
+        0x5B00A3,
+        "the grey-128 pixel is the source in part"
+    );
+
+    // With a vague of 0 the grey-128 pixel weighs 0, so the frame holds
+    // source 1 there.
+    two_opaque_layers(&env, 2);
+    env.run("b.beginTransition('universal', true, a, %[time: 100, rule: 'rule.img', vague: 0]);");
+    env.advance(50.0);
+    assert_eq!(
+        frame_pixel(&env, "dest", 1, 0),
+        RED,
+        "the hard threshold keeps source 1"
     );
 }
 
@@ -1720,7 +1891,7 @@ fn stop_without_an_active_transition_is_a_noop() {
 fn stopping_midway_releases_the_frame_and_exchanges_layers() {
     let _lock = vm_lock();
     let env = Env::new();
-    two_layers_with(&env, 2, "var base = new Layer(w, null); ");
+    two_opaque_layers_with(&env, 2, "var base = new Layer(w, null); ");
     counter(&env);
     // The window's primary layer is the throwaway layer — the reference
     // refuses to move the primary layer
@@ -1733,18 +1904,26 @@ fn stopping_midway_releases_the_frame_and_exchanges_layers() {
     );
     env.advance(50.0);
     let frame = frame_pixel(&env, "dest", 0, 0);
+    // 50 ms into a 1000 ms cross-fade truncates to phase 12
+    // (reference/cpp/core/visual/TransIntf.cpp:536), so the opacity is
+    // 12/256. The destination carries the default alpha-using type, so the
+    // frame is mixed by the share the two alphas give the source
+    // (reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3278-3291):
+    // `0.046875 / (0.953125 * 0.953125 + 0.046875 + 0.0001)` = 0.049060, and
+    // the byte-space mix writes 0xF4000A.
+    assert_eq!(frame, 0xF4000A, "the mid-flight frame is the live blend");
     assert_ne!(frame, RED, "mid-flight is not source 1");
     assert_ne!(frame, BLUE, "mid-flight is not source 2");
     assert_eq!(
         env.eval_int("b.getMainPixel(0, 0)"),
-        RED,
+        RED_WORD,
         "the main image is never the blend target"
     );
 
     env.run("b.stopTransition();");
     assert_eq!(
         env.eval_int("b.getMainPixel(0, 0)"),
-        RED,
+        RED_WORD,
         "the stopped transition leaves the main image intact"
     );
     assert!(
@@ -1785,8 +1964,8 @@ fn completion_exchanges_layers_and_leaves_the_main_image() {
          b.beginTransition('crossfade', true, a, %[time: 100]);",
     );
     env.advance(100.0);
-    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED);
-    assert_eq!(env.eval_int("b.getMainPixel(1, 1)"), RED);
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), RED_WORD);
+    assert_eq!(env.eval_int("b.getMainPixel(1, 1)"), RED_WORD);
     assert!(cache_bitmap_of(&env, "dest").is_none(), "frame released");
     assert_eq!(env.eval_int("b.left"), 10, "b took a's position");
     assert_eq!(env.eval_int("a.left"), 0, "a took b's position");
@@ -2092,7 +2271,13 @@ fn the_cpu_path_blends_the_display_bitmap_every_tick() {
 
     env.advance(25.0);
     let frame = transition_frame(&env, "dest");
-    assert_eq!(frame_pixel(&env, "dest", 0, 0), blend_rgb(RED, BLUE, 63));
+    // The destination carries the default type, ltAlpha, so the blend is the
+    // alpha-vs-alpha one
+    // (reference/cpp/core/visual/TransIntf.cpp:664-673), and both sources
+    // are transparent, so the source covers nothing of the destination
+    // (reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3278-3291): the
+    // frame holds source 1 verbatim.
+    assert_eq!(frame_pixel(&env, "dest", 0, 0), RED);
     assert!(
         dirty_bitmaps(&env).contains(&frame),
         "the CPU path writes (and so uploads) the display bitmap"

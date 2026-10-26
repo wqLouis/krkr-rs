@@ -16,6 +16,27 @@
 //! (`reference/cpp/core/visual/impl/LayerImpl.cpp:20-31`,
 //! `reference/cpp/core/environ/Application.cpp:874-941`,
 //! `reference/cpp/core/visual/impl/TVPColor.h:6-45`).
+//!
+//! ## The packed pixel word
+//!
+//! The reference's image planes are RGBA **bytes** — a PNG's rows are
+//! copied into the image verbatim, with the byte swap the loader could do
+//! left out (`reference/cpp/core/visual/LoadPNG.cpp:346-351`,
+//! `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1374-1382`) — and a
+//! point is read as the little-endian word of those four bytes
+//! (`reference/cpp/core/visual/LayerBitmapIntf.cpp:165-171`,
+//! `reference/cpp/core/visual/RenderManager.cpp:346-350`). The word is
+//! therefore `0xAABBGGRR`: the **red is in the low byte**, the green in the
+//! second, the blue in the third and the alpha in the fourth. A colour
+//! getter reports the word's low 24 bits, so it reports `0x00BBGGRR`
+//! (`reference/cpp/core/visual/BitmapIntf.cpp:51-58`,
+//! `reference/cpp/core/visual/LayerIntf.cpp:2917-2923`,
+//! `reference/cpp/core/visual/impl/LayerImpl.cpp:33-36`).
+//!
+//! A colour setter writes the other way round: the colour names its planes,
+//! and the named red goes to the first plane
+//! (`reference/cpp/core/visual/BitmapIntf.cpp:60-66`,
+//! `reference/cpp/core/visual/LayerBitmapIntf.cpp:194-209`).
 
 mod common;
 
@@ -30,6 +51,10 @@ const CL_WINDOW: i64 = 0x8000_0005;
 /// (`reference/cpp/core/visual/impl/TVPColor.h:6-45`).
 const CL_HIGHLIGHT: i64 = 0x8000_000d;
 
+/// The colour the round-trip test writes: its red and blue differ, so a
+/// swapped pair is visible.
+const NAMED: i64 = 0x0020_3040;
+
 /// `Bitmap.getPixel` reports the colour planes alone: the mask plane of an
 /// opaque pixel is not part of the value.
 ///
@@ -38,6 +63,12 @@ const CL_HIGHLIGHT: i64 = 0x8000_000d;
 /// `TVPFromActualColor` masks them once more
 /// (`reference/cpp/core/visual/impl/LayerImpl.cpp:33-36`). The mask is a
 /// member of its own (`reference/cpp/core/visual/BitmapIntf.cpp:67-75`).
+///
+/// The reported word holds the red in its low byte
+/// (`reference/cpp/core/visual/LayerBitmapIntf.cpp:165-171`,
+/// `reference/cpp/core/visual/RenderManager.cpp:346-350`), so the colour
+/// `0x123456` — whose planes are the red `0x12`, the green `0x34` and
+/// the blue `0x56` — is reported as `0x563412`.
 #[test]
 fn bitmap_get_pixel_reports_the_colour_without_the_mask() {
     let _lock = vm_lock();
@@ -47,7 +78,7 @@ fn bitmap_get_pixel_reports_the_colour_without_the_mask() {
          b.setMaskPixel(0, 0, 255); \
          b.setPixel(0, 0, 0x123456);",
     );
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x12_3456);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x56_3412);
     assert_eq!(env.eval_int("b.getMaskPixel(0, 0)"), 255);
 }
 
@@ -67,8 +98,9 @@ fn bitmap_set_pixel_writes_the_colour_and_holds_the_mask() {
          b.setMaskPixel(0, 0, 128); \
          b.setPixel(0, 0, 0xff0000);",
     );
-    // The red is written; the 0x80 mask is the one the destination had.
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0xff_0000);
+    // The red is written; the 0x80 mask is the one the destination had. The
+    // word reports the red in its low byte.
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x00_00ff);
     assert_eq!(env.eval_int("b.getMaskPixel(0, 0)"), 128);
 }
 
@@ -81,6 +113,9 @@ fn bitmap_set_pixel_writes_the_colour_and_holds_the_mask() {
 /// (`reference/cpp/core/visual/impl/TVPColor.h:6-45`), and swaps the red and
 /// blue bytes of the result. An identifier the table does not name keeps its
 /// low 24 bits.
+///
+/// The reported word holds the red in its low byte, so a resolved colour
+/// comes back in the table's own `0xBBGGRR` order.
 #[test]
 fn bitmap_set_pixel_resolves_a_system_colour() {
     let _lock = vm_lock();
@@ -90,13 +125,13 @@ fn bitmap_set_pixel_resolves_a_system_colour() {
     env.run(&format!("b.setPixel(0, 0, {CL_WINDOW:#x});"));
     assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x00ff_ffff);
     // `clHighlight` is `0xff9933` in the table's `0xBBGGRR` order, so the
-    // colour the pixel gets is `0x3399ff`.
+    // colour the pixel gets is the table's own value.
     env.run(&format!("b.setPixel(0, 0, {CL_HIGHLIGHT:#x});"));
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x33_99ff);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x00ff_9933);
     // An identifier the table does not name keeps its low 24 bits, with the
     // red and blue bytes swapped.
     env.run("b.setPixel(0, 0, 0x80112233);");
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x33_2211);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x00_112233);
 }
 
 /// The mask plane is written and read through the mask members alone.
@@ -104,6 +139,12 @@ fn bitmap_set_pixel_resolves_a_system_colour() {
 /// `tTJSNI_Bitmap::SetMaskPixel` writes the mask byte of the pixel
 /// (`reference/cpp/core/visual/BitmapIntf.cpp:77-85`) and `GetMaskPixel`
 /// reads it back (`reference/cpp/core/visual/BitmapIntf.cpp:67-75`).
+///
+/// The mask is the alpha byte of the same packed word, not a plane of its
+/// own: `SetPointMask` keeps the colour bits and writes the mask into the
+/// word's high byte (`reference/cpp/core/visual/LayerBitmapIntf.cpp:211-226`,
+/// `reference/cpp/core/visual/LayerIntf.cpp:2946-2975`). The byte order of
+/// the colour does not touch it.
 #[test]
 fn bitmap_mask_members_round_trip_the_alpha() {
     let _lock = vm_lock();
@@ -134,8 +175,9 @@ fn layer_main_pixel_writes_the_colour_and_holds_the_mask() {
          l.setMaskPixel(0, 0, 128); \
          l.setMainPixel(0, 0, 0xff0000);",
     );
-    // The red is written; the 0x80 mask is the one the destination had.
-    assert_eq!(env.eval_int("l.getMainPixel(0, 0)"), 0xff_0000);
+    // The red is written; the 0x80 mask is the one the destination had. The
+    // word reports the red in its low byte.
+    assert_eq!(env.eval_int("l.getMainPixel(0, 0)"), 0x00_00ff);
     assert_eq!(env.eval_int("l.getMaskPixel(0, 0)"), 128);
 }
 
@@ -154,7 +196,37 @@ fn layer_set_main_pixel_resolves_a_system_colour() {
     env.run(&format!("l.setMainPixel(0, 0, {CL_WINDOW:#x});"));
     assert_eq!(env.eval_int("l.getMainPixel(0, 0)"), 0x00ff_ffff);
     env.run(&format!("l.setMainPixel(0, 0, {CL_HIGHLIGHT:#x});"));
-    assert_eq!(env.eval_int("l.getMainPixel(0, 0)"), 0x33_99ff);
+    assert_eq!(env.eval_int("l.getMainPixel(0, 0)"), 0x00ff_9933);
     env.run("l.setMainPixel(0, 0, 0x80112233);");
-    assert_eq!(env.eval_int("l.getMainPixel(0, 0)"), 0x33_2211);
+    assert_eq!(env.eval_int("l.getMainPixel(0, 0)"), 0x00_112233);
+}
+
+/// The round trip of a pixel write and a pixel read keeps the planes and
+/// reports the reference's word.
+///
+/// The write puts the named red, green and blue into the first, second and
+/// third plane (`reference/cpp/core/visual/LayerBitmapIntf.cpp:194-209`,
+/// `reference/cpp/core/visual/BitmapIntf.cpp:60-66`), and the read reports
+/// the little-endian word of those planes
+/// (`reference/cpp/core/visual/LayerBitmapIntf.cpp:165-171`,
+/// `reference/cpp/core/visual/RenderManager.cpp:346-350`,
+/// `reference/cpp/core/visual/BitmapIntf.cpp:51-58`). The word therefore
+/// holds the red in its low byte: the colour `0x203040` is reported as
+/// `0x403020`.
+#[test]
+fn a_pixel_round_trip_keeps_the_planes_and_reports_the_reference_word() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var b = new Bitmap(1, 1);");
+    env.run(&format!("b.setPixel(0, 0, {NAMED:#x});"));
+    // The word the reference reports: the red in the low byte.
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x40_3020);
+    // The planes the write left behind: the named red, green and blue.
+    let bitmap = env.scene.bitmaps.last().expect("the script bitmap");
+    let offset = bitmap.pixel_offset(0, 0).expect("the pixel");
+    assert_eq!(
+        &bitmap.rgba[offset..offset + 4],
+        &[0x20, 0x30, 0x40, 0x00],
+        "the named colour reached the named planes"
+    );
 }

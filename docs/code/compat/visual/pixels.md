@@ -60,14 +60,40 @@ the image in the log.
 
 | Member | Behaviour |
 |---|---|
-| `getMainPixel(x, y)` | `0x00RRGGBB` — the RGB of the main image with the alpha masked out. |
-| `setMainPixel(x, y, color)` | writes the RGB; the alpha (mask) plane survives. The write is **clipped to the layer's clip rect**. |
-| `getMaskPixel(x, y)` | the alpha byte `0..255`. |
-| `setMaskPixel(x, y, alpha)` | writes the alpha byte, **truncated to its low 8 bits, not clamped** — `256` → `0`, `-1` → `255`, `300` → `44`. |
+| `getMainPixel(x, y)` | the pixel as the packed word of the RGBA planes, read little-endian: the **red is in the low byte**, the green in the second, the blue in the third — `0x00BBGGRR` for the 24 colour bits, the alpha masked out. |
+| `setMainPixel(x, y, color)` | writes the colour's red, green and blue into the first, second and third plane; the alpha (mask) byte survives. The write is **clipped to the layer's clip rect**. |
+| `getMaskPixel(x, y)` | the alpha byte `0..255` — the **alpha byte of the same packed word**, not a plane of its own. |
+| `setMaskPixel(x, y, alpha)` | writes the alpha byte of the packed word, **truncated to its low 8 bits, not clamped** — `256` → `0`, `-1` → `255`, `300` → `44`. |
 | `getProvincePixel(x, y)`, `setProvincePixel(x, y, n)` | the 8-bit province plane (registered in `layer/mod.rs`). |
 
 `getMainPixel` and `getMaskPixel` **never raise** on a missing image — they
 return `0`. `setMainPixel` and `setMaskPixel` set `imageModified`.
+
+### The packed pixel word
+
+A pixel is four RGBA **bytes** — the main image's planes are the red, the
+green, the blue and the alpha in that order — and a point is read as the
+little-endian word of those four bytes
+(`reference/cpp/core/visual/LayerBitmapIntf.cpp:165-171`,
+`reference/cpp/core/visual/RenderManager.cpp:346-350`). The word is therefore
+`0xAABBGGRR`: the red in the low byte, the green in the second, the blue in
+the third and the alpha in the fourth. `getMainPixel` reports the word's low
+24 bits, so it reports `0x00BBGGRR`
+(`reference/cpp/core/visual/LayerIntf.cpp:2917-2923`,
+`reference/cpp/core/visual/impl/LayerImpl.cpp:33-36`).
+
+`setMainPixel` writes the other way round: the colour names its planes, and
+the named red goes to the first plane
+(`reference/cpp/core/visual/LayerIntf.cpp:2925-2946`,
+`reference/cpp/core/visual/LayerBitmapIntf.cpp:194-209`). A colour whose high
+byte is set names a system colour and is resolved through the colour table
+first (`reference/cpp/core/visual/impl/LayerImpl.cpp:20-31`).
+
+The mask is the **alpha byte of the same word**, not a plane of its own:
+`setMaskPixel` keeps the colour bits and writes the mask into the word's high
+byte (`reference/cpp/core/visual/LayerIntf.cpp:2946-2975`,
+`reference/cpp/core/visual/LayerBitmapIntf.cpp:211-226`). The colour's byte
+order does not touch it.
 
 The reads wait for a pending decode first, and an image that declares more
 pixels than its buffer holds answers `0` like a missing one. The writes

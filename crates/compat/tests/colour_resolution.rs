@@ -12,6 +12,12 @@
 //!
 //! The tests drive the real script surface: they create layers and bitmaps
 //! through the VM and read the pixels the operations leave behind.
+//!
+//! A pixel getter reports the packed word of the RGBA planes, read
+//! little-endian, so the red is in the low byte and the blue in the third
+//! (`reference/cpp/core/visual/BitmapIntf.cpp:51-58`,
+//! `reference/cpp/core/visual/LayerIntf.cpp:2917-2923`,
+//! `reference/cpp/core/visual/RenderManager.cpp:346-350`).
 
 mod common;
 
@@ -109,10 +115,12 @@ fn layer_fill_rect_on_the_opaque_face_resolves_a_system_colour() {
     ));
     // `clWindow` is white; `clHighlight` is the table's `0xff9933` in the
     // table's `0xBBGGRR` order, which the swap turns into `0x3399ff`.
+    // The reported word holds the red in its low byte
+    // (`reference/cpp/core/visual/RenderManager.cpp:346-350`).
     assert_eq!(env.eval_int("window_color"), 0x00ff_ffff);
-    assert_eq!(env.eval_int("highlight_color"), 0x33_99ff);
+    assert_eq!(env.eval_int("highlight_color"), 0x00ff_9933);
     // A plain colour is not a system colour and passes through unchanged.
-    assert_eq!(env.eval_int("plain_color"), 0x11_2233);
+    assert_eq!(env.eval_int("plain_color"), 0x33_2211);
 }
 
 /// Reference: `FillRect` keeps the `0xAARRGGBB` meaning on the alpha and
@@ -132,8 +140,9 @@ fn layer_fill_rect_on_the_alpha_face_keeps_the_argb_colour() {
          var color = l.getMainPixel(0, 0); \
          var alpha = l.getMaskPixel(0, 0);",
     ));
-    // The high byte is the alpha and the low 24 bits are the colour.
-    assert_eq!(env.eval_int("color"), 0x00_0005);
+    // The high byte is the alpha and the low 24 bits are the colour. The
+    // reported word holds the red in its low byte.
+    assert_eq!(env.eval_int("color"), 0x05_0000);
     assert_eq!(env.eval_int("alpha"), 0x80);
 }
 
@@ -165,9 +174,9 @@ fn layer_color_rect_resolves_a_system_colour_on_every_painting_face() {
     assert_eq!(env.eval_int("alpha_color"), 0x00ff_ffff);
     // The additive-alpha face writes the resolved colour in the additive
     // representation, where each channel is scaled by the fill's opacity.
-    assert_eq!(env.eval_int("additive_color"), 0x32_98fe);
+    assert_eq!(env.eval_int("additive_color"), 0xfe_9832);
     // The opaque face writes the resolved colour and holds the alpha.
-    assert_eq!(env.eval_int("opaque_color"), 0x33_99ff);
+    assert_eq!(env.eval_int("opaque_color"), 0x00ff_9933);
 }
 
 /// Reference: the mask face of `ColorRect` takes the low byte of the colour
@@ -187,8 +196,9 @@ fn layer_color_rect_on_the_mask_face_keeps_the_low_byte() {
          var color = l.getMainPixel(0, 0); \
          var mask = l.getMaskPixel(0, 0);",
     ));
-    // The colour planes are untouched and the mask is the low byte.
-    assert_eq!(env.eval_int("color"), 0x10_2030);
+    // The colour planes are untouched and the mask is the low byte. The
+    // reported word holds the red in its low byte.
+    assert_eq!(env.eval_int("color"), 0x30_2010);
     assert_eq!(env.eval_int("mask"), 0x0d);
 }
 
@@ -233,7 +243,11 @@ fn layer_draw_text_resolves_the_main_colour_and_keeps_the_shadow_raw() {
 }
 
 /// Reference: `DrawGlyph` resolves the main colour the way `DrawText` does
-/// (`reference/cpp/core/visual/LayerIntf.cpp:4511-4517`).
+/// (`reference/cpp/core/visual/LayerIntf.cpp:4511-4517`), but it hands the
+/// colour to the image as it is (`reference/cpp/core/visual/LayerIntf.cpp:4513-4516`)
+/// and the image reads the value's low bytes as the red, green and blue
+/// planes (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:836-903`), so
+/// the red and the blue of the drawn colour are the other way round.
 #[test]
 fn layer_draw_glyph_resolves_the_main_colour() {
     let _lock = vm_lock();
@@ -252,9 +266,10 @@ fn layer_draw_glyph_resolves_the_main_colour() {
     ));
     let colours = layer_colours(&env);
     // `clHighlight` is the table's `0xff9933` in the table's `0xBBGGRR`
-    // order, which the swap turns into `0x3399ff`.
+    // order, which the swap turns into `0x3399ff`; the glyph path paints
+    // the red and the blue the other way round.
     assert!(
-        colours.contains(&[0x33, 0x99, 0xff]),
+        colours.contains(&[0xff, 0x99, 0x33]),
         "the resolved main colour is missing from {colours:?}"
     );
 }
@@ -280,7 +295,7 @@ fn image_function_fill_rect_without_the_alpha_resolves_a_system_colour() {
     assert_eq!(env.eval_int("window_color"), 0x00ff_ffff);
     // The destination alpha is held.
     assert_eq!(env.eval_int("window_alpha"), 0x80);
-    assert_eq!(env.eval_int("highlight_color"), 0x33_99ff);
+    assert_eq!(env.eval_int("highlight_color"), 0x00ff_9933);
 }
 
 /// Reference: `ImageFunction.fillRect` with `isalpha = true` copies the
@@ -297,7 +312,7 @@ fn image_function_fill_rect_with_the_alpha_keeps_the_argb_colour() {
          var color = b.getPixel(0, 0); \
          var alpha = b.getMaskPixel(0, 0);",
     ));
-    assert_eq!(env.eval_int("color"), 0x00_0005);
+    assert_eq!(env.eval_int("color"), 0x05_0000);
     assert_eq!(env.eval_int("alpha"), 0x80);
 }
 
@@ -325,8 +340,8 @@ fn image_function_color_rect_resolves_a_system_colour_on_every_painting_face() {
     assert_eq!(env.eval_int("alpha_color"), 0x00ff_ffff);
     // The additive-alpha face writes the resolved colour in the additive
     // representation, where each channel is scaled by the fill's opacity.
-    assert_eq!(env.eval_int("additive_color"), 0x32_98fe);
-    assert_eq!(env.eval_int("opaque_color"), 0x33_99ff);
+    assert_eq!(env.eval_int("additive_color"), 0xfe_9832);
+    assert_eq!(env.eval_int("opaque_color"), 0x00ff_9933);
     // The opaque face holds the destination alpha.
     assert_eq!(env.eval_int("opaque_alpha"), 0x80);
 }
@@ -352,8 +367,13 @@ fn image_function_draw_text_resolves_the_main_colour_and_keeps_the_shadow_raw() 
         colours.contains(&[0xff, 0xff, 0xff]),
         "the resolved main colour is missing from {colours:?}"
     );
+    // The text path hands the shadow colour to the image as it is
+    // (`reference/cpp/core/visual/ImageFunction.cpp:1060-1063`), and the image
+    // reads the value's low bytes as the red, green and blue planes
+    // (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:836-903`), so the
+    // shadow's low byte is the red.
     assert!(
-        colours.contains(&[0x00, 0x00, 0x0d]),
+        colours.contains(&[0x0d, 0x00, 0x00]),
         "the raw shadow colour is missing from {colours:?}"
     );
     assert!(
@@ -363,7 +383,12 @@ fn image_function_draw_text_resolves_the_main_colour_and_keeps_the_shadow_raw() 
 }
 
 /// Reference: `ImageFunction.drawGlyph` resolves the main colour the way
-/// `drawText` does (`reference/cpp/core/visual/ImageFunction.cpp:1159-1162`).
+/// `drawText` does (`reference/cpp/core/visual/ImageFunction.cpp:1159-1162`),
+/// but it hands the colour to the image as it is
+/// (`reference/cpp/core/visual/ImageFunction.cpp:1161`), and the image reads
+/// the value's low bytes as the red, green and blue planes
+/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:836-903`), so the red
+/// and the blue of the drawn colour are the other way round.
 #[test]
 fn image_function_draw_glyph_resolves_the_main_colour() {
     let _lock = vm_lock();
@@ -380,7 +405,7 @@ fn image_function_draw_glyph_resolves_the_main_colour() {
     ));
     let colours = bitmap_colours(&env, first_bitmap);
     assert!(
-        colours.contains(&[0x33, 0x99, 0xff]),
+        colours.contains(&[0xff, 0x99, 0x33]),
         "the resolved main colour is missing from {colours:?}"
     );
 }

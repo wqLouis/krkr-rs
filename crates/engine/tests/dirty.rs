@@ -237,3 +237,121 @@ fn a_change_followed_by_a_frame_that_presents_nothing_stays_dirty() {
         "a frame that presented nothing keeps the change"
     );
 }
+
+/// A layer whose pixels change is presented again.
+///
+/// The frame draws the whole scene when the scene changed and draws nothing
+/// when it did not, so a pixel write must mark the scene changed: a frame
+/// that skipped the change would leave the old pixels on the screen, and the
+/// change would never be presented.
+#[test]
+fn a_layer_whose_pixels_change_is_presented_again() {
+    let mut engine = headless_engine((64, 64));
+    let mut hook = NoopFrame;
+    let window = engine.scene_mut().add_window("t", (64, 64));
+    let layer = primary_layer(&mut engine, window);
+    assert!(
+        engine.scene_mut().ensure_layer_image(layer, 8, 8),
+        "the layer has an image"
+    );
+    engine.frame(0, &mut hook).expect("frame");
+    assert!(
+        !engine.scene().dirty(),
+        "the first frame carried the change"
+    );
+
+    engine
+        .scene_mut()
+        .with_main_image_pixels_mut(layer, |pixels| pixels[0] = 255)
+        .expect("the layer has an image");
+
+    assert!(
+        engine.scene().dirty(),
+        "the pixel write changes the picture"
+    );
+    let report = engine.frame(16, &mut hook).expect("frame");
+    assert!(report.presented, "the changed frame draws");
+    assert!(
+        !engine.scene().dirty(),
+        "the presented frame carried the change away"
+    );
+}
+
+/// A child whose pixels change is presented again.
+///
+/// The child is drawn through its own node, so its new pixels reach the
+/// screen when the frame draws again. A container that draws a child's pixels
+/// must not hide the change behind an unchanged container image.
+#[test]
+fn a_child_that_changes_is_presented_again() {
+    let mut engine = headless_engine((64, 64));
+    let mut hook = NoopFrame;
+    let window = engine.scene_mut().add_window("t", (64, 64));
+    let parent = primary_layer(&mut engine, window);
+    let child = engine.scene_mut().add_layer(window, Some(parent));
+    engine
+        .scene_mut()
+        .update_layer(child, |layer| {
+            layer.rect = Rect::new(0, 0, 8, 8);
+            true
+        })
+        .expect("the child");
+    assert!(
+        engine.scene_mut().ensure_layer_image(child, 8, 8),
+        "the child has an image"
+    );
+    engine.frame(0, &mut hook).expect("frame");
+    assert!(
+        !engine.scene().dirty(),
+        "the first frame carried the change"
+    );
+
+    engine
+        .scene_mut()
+        .with_main_image_pixels_mut(child, |pixels| pixels[0] = 255)
+        .expect("the child has an image");
+
+    assert!(
+        engine.scene().dirty(),
+        "the child's pixel write changes the picture"
+    );
+    let report = engine.frame(16, &mut hook).expect("frame");
+    assert!(report.presented, "the changed frame draws");
+}
+
+/// A pixel write arms the upload of the image that carries the pixels.
+///
+/// The scene flag makes the frame draw again; the bitmap's own flag makes
+/// the backend receive the new pixels. A change that arms only the first is
+/// drawn again and shows the old picture.
+#[test]
+fn a_pixel_write_arms_the_upload() {
+    let mut engine = headless_engine((64, 64));
+    let mut hook = NoopFrame;
+    let window = engine.scene_mut().add_window("t", (64, 64));
+    let layer = primary_layer(&mut engine, window);
+    assert!(
+        engine.scene_mut().ensure_layer_image(layer, 8, 8),
+        "the layer has an image"
+    );
+    let image = engine
+        .scene()
+        .layer(layer)
+        .and_then(|layer| layer.bitmap)
+        .expect("the layer image");
+    engine.frame(0, &mut hook).expect("frame");
+    assert!(
+        !engine.scene().bitmap(image).expect("the image").dirty,
+        "the uploaded image is clean"
+    );
+
+    engine
+        .scene_mut()
+        .with_main_image_pixels_mut(layer, |pixels| pixels[0] = 255)
+        .expect("the layer has an image");
+
+    assert!(
+        engine.scene().bitmap(image).expect("the image").dirty,
+        "the pixel write arms the upload, or the change is never presented"
+    );
+}

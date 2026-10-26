@@ -51,17 +51,27 @@ fn cross_fade_hits_both_endpoints_exactly() {
     assert_eq!(dst.rgba, src2.rgba);
 }
 
+/// The cross-fade's midpoint mixes the colour by the share of the
+/// destination the source covers, because the destination carries the default
+/// alpha-using type
+/// (`reference/cpp/core/visual/TransIntf.cpp:664-673`,
+/// `reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3278-3291`).
+///
+/// Both sources are opaque, so at phase 127 (50/100 truncates to it,
+/// `reference/cpp/core/visual/TransIntf.cpp:536`) the share is
+/// `0.49609375 / (0.50390625 * 0.50390625 + 0.49609375)` = 0.661377 and the
+/// byte-space mix writes 131, 65 and 32 — the graphics path mixes the same
+/// share in floating point and lands one level higher.
 #[test]
-fn cross_fade_midpoint_blends_all_channels() {
+fn cross_fade_midpoint_covers_the_source_by_the_destination_alphas() {
     let src1 = bitmap(1, 1, [0, 0, 0, 255]);
     let src2 = bitmap(1, 1, [200, 100, 50, 255]);
     let mut dst = bitmap(1, 1, [0, 0, 0, 0]);
 
     let mut trans = Trans::cross_fade(100.0).unwrap();
-    // 50/100 truncates to phase 127 (reference/cpp/core/visual/TransIntf.cpp:536).
     trans.step(50.0);
     trans.apply(&mut dst, &src1, &src2, region(1, 1)).unwrap();
-    assert_eq!(dst.rgba, [99, 49, 24, 255]);
+    assert_eq!(dst.rgba, [131, 65, 32, 255]);
 }
 
 #[test]
@@ -109,8 +119,13 @@ fn mask_uses_the_rule_image_as_a_hard_threshold() {
     let mut trans = Trans::mask(100.0, rule).unwrap();
     trans.step(50.0); // phase 127
     trans.apply(&mut dst, &src1, &src2, region(2, 1)).unwrap();
-    // rule 0 < phase -> source 2 (the `>>8` blend gives 254, not 255).
-    assert_eq!(&dst.rgba[0..4], &[254, 254, 254, 255]);
+    // rule 0 < phase -> source 2. The destination carries the default
+    // alpha-using type, so the mix is the coverage one
+    // (reference/cpp/core/visual/TransIntf.cpp:664-673,
+    // reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3278-3291): the
+    // source covers the destination with the share its two alphas give it,
+    // and the byte-space share is 254, so the blend gives 253, not 255.
+    assert_eq!(&dst.rgba[0..4], &[253, 253, 253, 255]);
     assert_eq!(&dst.rgba[4..8], &[0, 0, 0, 255]);
 
     // At completion every pixel is source 2 verbatim.

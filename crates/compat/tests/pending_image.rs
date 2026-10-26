@@ -30,9 +30,13 @@ fn image() -> DecodedImage {
     )
 }
 
-/// The RGB value of the first pixel of [`image`], as `Bitmap.getPixel` and
-/// `Layer.getMainPixel` report it: both members mask the alpha away.
-const FIRST_PIXEL: i64 = 0x01_0203;
+/// The packed word of the first pixel of [`image`], as `Bitmap.getPixel` and
+/// `Layer.getMainPixel` report it: both members mask the alpha away and hand
+/// back the word of the RGBA planes, read little-endian, so the red is in the
+/// low byte (`reference/cpp/core/visual/BitmapIntf.cpp:51-58`,
+/// `reference/cpp/core/visual/LayerIntf.cpp:2917-2923`,
+/// `reference/cpp/core/visual/RenderManager.cpp:346-350`).
+const FIRST_PIXEL: i64 = 0x03_0201;
 
 /// The RGB value of the first pixel of [`image`]: the colour key the keyed
 /// loads use.
@@ -596,12 +600,12 @@ fn a_deferred_colour_keyed_bitmap_load_applies_the_key_on_the_worker() {
     // and keeps its alpha.
     assert_eq!(
         env.eval_int("b.getPixel(0, 0)"),
-        0x0001_0203,
+        0x0003_0201,
         "the keyed pixel is transparent"
     );
     assert_eq!(
         env.eval_int("b.getPixel(1, 0)"),
-        0x04_0506,
+        0x06_0504,
         "a different colour stays opaque"
     );
     let bitmap = env.scene.bitmaps.first().expect("the bitmap exists");
@@ -631,7 +635,7 @@ fn a_deferred_colour_keyed_bitmap_load_applies_the_key_on_the_worker() {
     env.run(&format!("var b2 = new Bitmap('picture.png', {COLOR_KEY});"));
     assert_eq!(
         env.eval_int("b2.getPixel(0, 0)"),
-        0x0001_0203,
+        0x0003_0201,
         "the cache hit installs the keyed image"
     );
     assert_eq!(
@@ -952,7 +956,7 @@ fn a_fill_waits_for_the_pending_layer_image() {
     env.scene.resolve_pending_images();
     assert_eq!(
         env.eval_int("l.getMainPixel(0, 0)"),
-        0x00ff00,
+        0x00_ff00,
         "the fill survives the image barrier"
     );
 }
@@ -1001,9 +1005,11 @@ fn a_copied_image_replaces_a_pending_destination_bitmap() {
         "the copy superseded the destination's decode"
     );
     env.scene.resolve_pending_images();
+    // The readback is the little-endian word of the RGBA planes, so the
+    // red is in the low byte (`reference/cpp/core/visual/LayerBitmapIntf.cpp:165-171`).
     assert_eq!(
         env.eval_int("b.getPixel(0, 0)"),
-        0x00ff00,
+        0x00_ff00,
         "the copied pixels survive the image barrier"
     );
 }
@@ -1051,7 +1057,7 @@ fn a_copied_image_replaces_a_pending_layer_image() {
     env.scene.resolve_pending_images();
     assert_eq!(
         env.eval_int("l.getMainPixel(0, 0) & 0xffffff"),
-        0x00ff00,
+        0x00_ff00,
         "the copied pixels survive the image barrier"
     );
 }
@@ -1100,7 +1106,7 @@ fn an_assigned_image_replaces_a_pending_layer_image() {
     env.scene.resolve_pending_images();
     assert_eq!(
         env.eval_int("l.getMainPixel(0, 0) & 0xffffff"),
-        0x00ff00,
+        0x00_ff00,
         "the assigned pixels survive the image barrier"
     );
 }

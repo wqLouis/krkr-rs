@@ -8,10 +8,10 @@
 //! The rasterization core is adapted from `crates/tvp-text` (read-only
 //! reference): [`px_scale_for_height`] preserves the reference height-to-scale
 //! convention, and the rasterizer reproduces the atlas' missing-glyph fallback,
-//! synthetic bold (1 px right dilation + advance bump) and the synthetic
-//! oblique slant the middle layer previously applied at paint time. Unlike the
-//! old atlas, this API returns per-glyph coverage positioned by its bearings
-//! instead of packing pixels into a shared RGBA cell.
+//! the synthetic bold (a 1 px right dilation of the drawn coverage, which
+//! leaves the measured advance alone) and the synthetic oblique slant. Unlike
+//! the old atlas, this API returns per-glyph coverage positioned by its
+//! bearings instead of packing pixels into a shared RGBA cell.
 
 use std::fmt;
 
@@ -137,7 +137,8 @@ pub fn load_font(fs: &FontSystem, bytes: &[u8], index: u32) -> Result<Font, Glyp
 /// * A glyph the face maps but does not outline (a space, a combining mark)
 ///   produces an empty bitmap carrying that glyph's advance.
 /// * [`GlyphStyle::bold`] applies a 1 px rightward coverage dilation and adds
-///   1 px to the advance.
+///   1 px to the drawn advance. The measured advance ([`glyph_advance`]) is
+///   the face's own and does not change.
 /// * [`GlyphStyle::italic`] applies a synthetic oblique shear about the
 ///   glyph's vertical center without changing the advance.
 ///
@@ -227,16 +228,17 @@ pub fn rasterize_glyph(
 
 /// Returns the horizontal pen advance for `glyph`.
 ///
-/// The result is the glyph's rounded advance plus the 1 px synthetic-bold bump,
-/// i.e. exactly the `advance` field [`rasterize_glyph`] reports for the same
-/// arguments. Control characters advance by `0`. A non-positive or non-finite
-/// `size_px` also returns `0`.
+/// The result is the glyph's rounded advance, the extent a text measurement
+/// sums. The synthetic style does not change it: the bold widens the drawn
+/// coverage and the drawn advance ([`rasterize_glyph`]), while the measured
+/// advance stays the face's own. Control characters advance by `0`. A
+/// non-positive or non-finite `size_px` also returns `0`.
 pub fn glyph_advance(
     fs: &FontSystem,
     font: &Font,
     glyph: char,
     size_px: f32,
-    style: GlyphStyle,
+    _style: GlyphStyle,
 ) -> f32 {
     let _ = fs;
     if size_px <= 0.0 || !size_px.is_finite() || glyph.is_control() {
@@ -245,11 +247,7 @@ pub fn glyph_advance(
     let scale = px_scale_for_height(font.face(), size_px);
     let scaled = font.face().as_scaled(scale);
     let id = glyph_id_with_fallback(glyph, &scaled);
-    let mut advance = round_advance(scaled.h_advance(id)) as f32;
-    if style.bold {
-        advance += 1.0;
-    }
-    advance
+    round_advance(scaled.h_advance(id)) as f32
 }
 
 /// Returns the scaled metrics of `font` at `size_px`.

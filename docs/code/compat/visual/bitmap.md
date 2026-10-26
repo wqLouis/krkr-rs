@@ -31,10 +31,10 @@ A second construction on the same payload raises
 
 | Member | Behaviour |
 |---|---|
-| `getPixel(x, y)` | the pixel as ARGB (`0xAARRGGBB`). `0` for an out-of-range or negative coordinate — **no raise**. A pixel the buffer does not hold is out of range too, so its answer is `0`. Waits for a pending decode. |
-| `setPixel(x, y, color)` | writes ARGB into the bitmap and marks it dirty. An out-of-range write is silently ignored; a pixel the buffer does not hold is out of range too, so the write is ignored. Waits for a pending decode. |
-| `getMaskPixel(x, y)` | the alpha channel `0..255`. A pixel the buffer does not hold reads as `0`. Waits for a pending decode. |
-| `setMaskPixel(x, y, alpha)` | writes only the alpha byte, **clamped** to `0..255`. A pixel the buffer does not hold is ignored. Waits for a pending decode. |
+| `getPixel(x, y)` | the pixel as the packed word of the RGBA planes, read little-endian: the **red is in the low byte**, the green in the second, the blue in the third — `0x00BBGGRR` for the 24 colour bits, the alpha masked away. `0` for an out-of-range or negative coordinate — **no raise**. A pixel the buffer does not hold is out of range too, so its answer is `0`. Waits for a pending decode. |
+| `setPixel(x, y, color)` | writes the colour's red, green and blue into the first, second and third plane, and marks it dirty; the alpha byte is held. An out-of-range write is silently ignored; a pixel the buffer does not hold is out of range too, so the write is ignored. Waits for a pending decode. |
+| `getMaskPixel(x, y)` | the alpha channel `0..255` — the **alpha byte of the same packed word**, not a plane of its own. A pixel the buffer does not hold reads as `0`. Waits for a pending decode. |
+| `setMaskPixel(x, y, alpha)` | writes only the alpha byte of the packed word, **clamped** to `0..255`. A pixel the buffer does not hold is ignored. Waits for a pending decode. |
 | `independ()` | a no-op — every `Bitmap` already owns a private scene bitmap. |
 | `setSize(width, height)` | resizes, preserving the overlapping top-left region and filling the rest with `[0, 0, 0, 0]`. A zero dimension raises. A pending decode is resolved first, so the decoded overlap survives. |
 | `copyFrom(bitmap)` | copies the source bitmap's pixels and dimensions into this one. The source is resolved first, and a source whose pixel buffer is not the bytes its size declares **raises** — copying its empty buffer would give this bitmap the same inconsistent state. |
@@ -52,6 +52,30 @@ A second construction on the same payload raises
 
 There is **no** `id` / `nativeId` member — the scene bitmap id is read back
 through the VM's native-instance lookup instead.
+
+### The packed pixel word
+
+A pixel is four RGBA **bytes**, and a point is read as the little-endian word
+of those four bytes (`reference/cpp/core/visual/LayerBitmapIntf.cpp:165-171`,
+`reference/cpp/core/visual/RenderManager.cpp:346-350`). The word is therefore
+`0xAABBGGRR`: the red in the low byte, the green in the second, the blue in
+the third and the alpha in the fourth. `getPixel` reports the word's low 24
+bits, so it reports `0x00BBGGRR`
+(`reference/cpp/core/visual/BitmapIntf.cpp:51-58`,
+`reference/cpp/core/visual/impl/LayerImpl.cpp:33-36`).
+
+`setPixel` writes the other way round: the colour names its planes, and the
+named red goes to the first plane
+(`reference/cpp/core/visual/BitmapIntf.cpp:60-66`,
+`reference/cpp/core/visual/LayerBitmapIntf.cpp:194-209`). A colour whose high
+byte is set names a system colour and is resolved through the colour table
+first (`reference/cpp/core/visual/impl/LayerImpl.cpp:20-31`).
+
+The mask is the **alpha byte of the same word**, not a plane of its own:
+`setMaskPixel` keeps the colour bits and writes the mask into the word's high
+byte (`reference/cpp/core/visual/BitmapIntf.cpp:67-85`,
+`reference/cpp/core/visual/LayerBitmapIntf.cpp:211-226`). The colour's byte
+order does not touch it.
 
 ### The image that holds no pixels
 

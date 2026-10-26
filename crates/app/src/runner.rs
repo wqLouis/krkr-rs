@@ -13,6 +13,7 @@ use api::config::{CacheLimit, RuntimeConfig};
 use engine::{FrameTimeSource, InjectedFrameTime};
 use platform::{
     EventHandler, Flow, FramePacing, PlatformConfig, PlatformError, PlatformEvent, PlatformWindow,
+    Ticker,
 };
 use render::FrameStats;
 
@@ -125,6 +126,39 @@ fn format_stats(stats: &FrameStats) -> String {
     )
 }
 
+/// The headless loop's frame pacing.
+///
+/// The loop waits for each frame's deadline, so the frames are as far apart
+/// as the frame-rate limit says. The engine's clock advances by the frame
+/// period the loop injects, so a paced loop makes that clock the wall clock:
+/// a run that paced nothing would advance the clock by the frame period for
+/// every frame while the wall clock ran on as fast as the host could step,
+/// and every duration the script measures would collapse into that gap.
+struct HeadlessPacer {
+    /// The frame deadlines, paced by the frame-rate limit.
+    ticker: Ticker,
+}
+
+impl HeadlessPacer {
+    /// A pacer whose frames are due every `period_secs` seconds.
+    fn new(period_secs: f64) -> Self {
+        Self {
+            ticker: Ticker::new(Duration::from_secs_f64(period_secs), Instant::now()),
+        }
+    }
+
+    /// Waits for the frame's deadline.
+    fn wait(&mut self) {
+        loop {
+            let now = Instant::now();
+            if self.ticker.poll(now) {
+                return;
+            }
+            std::thread::sleep(self.ticker.deadline().saturating_duration_since(now));
+        }
+    }
+}
+
 /// Runs offscreen and prints the final frame stats (or the game's scene size).
 fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
     let config = HostConfig::headless()
@@ -132,9 +166,11 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
         .with_debug_overlay(launch.runtime.debug_overlay)
         .with_graphic_cache_limit(launch.runtime.graphic_cache_limit);
     let mut host = Host::new(config)?;
-    // The headless run has no wall clock to measure: it injects the frame
-    // period it simulates, and every timeline the frame derives comes from
-    // that one value.
+    // The headless step is paced by the frame-rate limit, like the windowed
+    // loop, and the engine's clock advances by the frame period the loop
+    // injects: the script's tick count is the wall clock, so a duration the
+    // script measures lasts here as long as it lasts in a windowed run.
+    let mut pacer = HeadlessPacer::new(launch.runtime.frame_rate_limit.period_secs());
     let clock = InjectedFrameTime::new(f64::from(launch.runtime.frame_rate_limit.period_ms()));
 
     if let Some(input) = &launch.game {
@@ -152,6 +188,7 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
         );
         let mut last = None;
         for _ in 0..frames {
+            pacer.wait();
             last = Some(game.step(&clock, &[])?);
         }
         if let Some(report) = last
@@ -204,6 +241,7 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
 
     let mut last = None;
     for _ in 0..frames {
+        pacer.wait();
         last = Some(host.step(&clock)?);
     }
     if let Some(report) = last
@@ -601,6 +639,41 @@ mod tests {
             (last.elapsed_ms - 4.0).abs() < 1e-9,
             "elapsed {} ms",
             last.elapsed_ms
+        );
+    }
+
+    /// The headless step waits for the frame's deadline, so the frames are as
+    /// far apart as the frame-rate limit says.
+    ///
+    /// The script's tick count is the wall clock
+    /// (`reference/cpp/core/utils/TickCount.cpp:110-118`), and the windowed
+    /// loop measures the same way
+    /// (`reference/cpp/core/base/impl/EventImpl.cpp:161`); a headless loop
+    /// that paced nothing would advance the engine's clock by the frame
+    /// period for every frame while the wall clock ran on as fast as the
+    /// host could step, and every duration the script measures would
+    /// collapse into that gap.
+    #[test]
+    fn the_headless_step_waits_for_the_frame_deadline() {
+        let runtime = RuntimeConfig {
+            frame_rate_limit: FrameRateLimit::new("test", 500).expect("valid"),
+            ..RuntimeConfig::default()
+        };
+        let started = Instant::now();
+        run(Launch {
+            runtime,
+            backend: BackendKind::Null,
+            game: None,
+            mode: RunMode::Headless { frames: 5 },
+        })
+        .expect("headless run");
+        let elapsed = started.elapsed();
+        // 500 fps is a 2 ms frame period: the first frame is due at once and
+        // the four that follow wait for their deadlines, so the five frames
+        // span at least 8 ms.
+        assert!(
+            elapsed >= Duration::from_millis(8),
+            "five paced frames took {elapsed:?}"
         );
     }
 }

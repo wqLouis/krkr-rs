@@ -800,7 +800,9 @@ impl TextEngine {
     /// Returns the rasterizer's pen advance for one character.
     ///
     /// This is the per-character extent a pre-rendered-font width sums in for
-    /// a character the `.tft` does not carry.
+    /// a character the `.tft` does not carry. The synthetic style does not
+    /// change it: the bold widens the drawn coverage, not the measured
+    /// extent.
     ///
     /// The advance is memoized per face, character, size and synthetic
     /// style, so a repeated measurement of the same character reuses the

@@ -11,6 +11,8 @@
 
 use api::blend::{BlendMode, DstBlend};
 
+use crate::engine_api::DestAlpha;
+
 /// `ltBinder` — a container that draws nothing.
 pub(super) const LT_BINDER: i64 = 0;
 /// `ltOpaque`/`ltCoverRect`.
@@ -109,6 +111,28 @@ pub(crate) const fn from_native(value: i64) -> BlendMode {
         LT_PS_SOFT_LIGHT => BlendMode::DestinationDependent(DstBlend::SoftLight),
         LT_BINDER | LT_EFFECT | LT_FILTER => BlendMode::SourceOver,
         _ => BlendMode::SourceOver,
+    }
+}
+
+/// The destination alpha handling a transition's mix is chosen by.
+///
+/// The mix follows the destination layer's type: a type that uses its alpha
+/// channel gets the alpha-vs-alpha mix, the additive-alpha type gets the
+/// additive mix, and every other type gets the plain mix.
+///
+/// The three types that have no generic equivalent — the binder, the effect
+/// and the filter types — are read as the straight-alpha one, because the
+/// generic blend they carry is the straight source-over.
+pub(crate) const fn dest_alpha(blend: BlendMode) -> DestAlpha {
+    match to_native(blend) {
+        LT_ALPHA | LT_PS_NORMAL | LT_PS_ADDITIVE | LT_PS_SUBTRACTIVE | LT_PS_MULTIPLICATIVE
+        | LT_PS_SCREEN | LT_PS_OVERLAY | LT_PS_HARD_LIGHT | LT_PS_SOFT_LIGHT
+        | LT_PS_COLOR_DODGE | LT_PS_COLOR_DODGE5 | LT_PS_COLOR_BURN | LT_PS_LIGHTEN
+        | LT_PS_DARKEN | LT_PS_DIFFERENCE | LT_PS_DIFFERENCE5 | LT_PS_EXCLUSION => {
+            DestAlpha::Straight
+        }
+        LT_ADD_ALPHA => DestAlpha::Additive,
+        _ => DestAlpha::Opaque,
     }
 }
 

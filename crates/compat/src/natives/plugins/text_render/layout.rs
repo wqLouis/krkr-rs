@@ -106,8 +106,14 @@ impl TextRenderInst {
             'i' => self.state.italic = read_flag(chars, i),
             's' => self.state.shadow = read_flag(chars, i),
             'e' => self.state.edge = read_flag(chars, i),
-            'B' | 'S' | 'C' | 'R' | 'L' => {
-                log::debug!("TextRenderBase.render: %{format} is a no-op in the reference");
+            // The shipped build's parser selects the big and the small size
+            // for these two escapes. The alignment escapes change nothing
+            // there: the alignment is kept in the style and no code path
+            // reads it back.
+            'B' => self.state.font_size = self.default.big_font_size,
+            'S' => self.state.font_size = self.default.small_font_size,
+            'C' | 'R' | 'L' => {
+                log::debug!("TextRenderBase.render: %{format} changes nothing");
             }
             'r' => self.reset_font(),
             'l' => {

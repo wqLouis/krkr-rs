@@ -309,6 +309,17 @@ impl Env {
     pub fn link_plugin(&self, dll: &str) {
         link_plugin(&self.engine, dll);
     }
+
+    /// One frame-body transition step: the `onPaint` dispatch for the layers
+    /// whose `update()` armed it, and the transition advance.
+    ///
+    /// The frame body runs this step before the draw, so a layer that
+    /// redraws itself in `onPaint` has its new pixels in the frame the engine
+    /// draws.
+    pub fn advance_transitions(&self) {
+        let ctx = self._host.ctx().expect("bound compat context");
+        compat::advance_transitions(&ctx).expect("transition step");
+    }
 }
 
 /// Link a built-in plugin on `engine` (`Plugins.link`).
