@@ -286,7 +286,11 @@ process-wide binding between the engine and the context.
   `attach_clock`.
 * The attachment is `unsafe`, and the invariant is: **the pointed-to value must
   stay alive for as long as the binding is installed** (the VM's lifetime).
-  Detaching and teardown happen before the L2 owner is dropped.
+  Detaching and teardown happen before the L2 owner is dropped. A value that
+  holds the handle must also keep its **address** stable: the handle is a
+  pointer, so moving the value out from under it invalidates every
+  attachment. A replacement engine's state objects are bound the same way and
+  owe the same obligation.
 * The accessors return the **raw pointer**, not a reference. The services
   cannot prove the owner is still alive, so forming a `&Scene` there would be
   an unsound shared reference; the natives dereference under their own

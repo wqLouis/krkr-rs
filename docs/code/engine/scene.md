@@ -97,7 +97,7 @@ bitmaps and fonts are released with them.
 | ordering | `assign_front_order`, `sibling_position`, `order_index`, `absolute_order_index`, `set_absolute_order_mode`, `set_absolute_order_index`, `set_order_index`, `renumber_siblings`, `ordered_children`, `window_layer_order`, `layer_move_to_front` |
 | lifetime | `remove_layer` (detach), `destroy_layer` (destroy the subtree), `invalidate_layer` |
 | focus | `set_focus`, `clear_focus`, `focused_in`, `set_domain_focus`, `window_input_root`, `next_focusable`, `prev_focusable`, `node_focusable` |
-| visibility / hit-test | `node_visible`, `node_enabled`, `layer_at` |
+| visibility / hit-test | `node_visible`, `node_enabled`, `layer_hit_next`, `layer_hit_outcome` |
 | caches | `inc_cache_enabled_count`, `dec_cache_enabled_count`, `set_cache_bitmap`, `set_transition_self_image`, `set_transition_frame`, `update_layer` |
 | pixels | `main_image_pixel_buffer`, `main_image_pixel_buffer_for_write`, `province_image_pixel_buffer`, `province_image_pixel_buffer_for_write`, `with_main_image_pixels`, `with_main_image_pixels_mut`, `with_province_pixels`, `with_province_pixels_mut`, `allocate_province_image`, `resize_province_image`, `deallocate_province_image`, `province_pixel`, `set_province_pixel` |
 
@@ -174,7 +174,7 @@ hit. The caller decodes only on a miss.
   vectors, so a stale link cannot leave an orphan.
 * **A shut-down layer is inert.** `invalidate_layer` marks it before
   unregistering it (`reference/cpp/core/visual/LayerIntf.cpp:515`); every
-  consumer (`node_visible`, `layer_at`, `window_layer_order`) skips it.
+  consumer (`node_visible`, `layer_hit_next`, `window_layer_order`) skips it.
 * **The focus domain is fixed at creation.** A parentless layer founds its own
   domain (its own id); a child inherits its parent's, and the reference
   assigns the manager once and never reassigns it
@@ -314,7 +314,7 @@ calling thread instead.
 * `province_pixel` reads `0` and `set_province_pixel` writes nothing when the
   province plane is shorter than the size it declares; the inconsistency is
   logged.
-* `layer_at` answers a miss when the province plane is short or when the main
+* `layer_hit_next` answers a miss when the province plane is short or when the main
   image declares more pixels than its buffer holds.
 * `resize_bitmap` preserves only the whole rows the source buffer holds; the
   rest of the overlap keeps the fill, and the rows the source does not hold
@@ -358,7 +358,7 @@ calling thread instead.
   `dfMask`/`dfProvince` layer is faithful only during a transition.
 * **Masks and province images are not emitted** by the projection; `hold_alpha`
   travels but is not interpreted.
-* **The hit-test is flattened across the focus domains.** `layer_at` walks
+* **The hit-test is flattened across the focus domains.** `layer_hit_next` walks
   `window_layer_order` for the whole window, where the reference binds input
   to the window's input domain (the first registered root's);
   `Scene::window_input_root` names that root, and the dispatch does not use

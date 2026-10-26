@@ -333,6 +333,12 @@ input?
 errors, defaulted coercions and dropped results. It does not judge whether an
 error enum is the right one for its domain; that is review.
 
+**The one cap that is not a cap.** The decode pool bounds the bytes it holds
+in flight (256 MiB). That is a resource limit on the engine, not a limit on
+what a script may ask for: a script that loads a larger image is served, not
+refused. A replacement that bounds its own memory does the same - the bound
+is on the engine's working set, never on the script's request.
+
 **Worked example.** `EngineError`, `TranslateError`, `TimerError`,
 `StorageReadError`, `MountError`, `StartupError`, `TextError`,
 `SoundError`, `VideoError` and `TransError` — one per domain, each
@@ -491,11 +497,19 @@ Four properties of this order matter to a replacement:
 
 * **The hook runs between the timer pump and the projection**, so the scene
   the layer above left behind is the one the frame presents.
+* **A change made through `Engine::scene_mut` is a change the engine does
+  not see.** The handle's writes do not mark the tree as structurally
+  changed, so the projection is not redrawn until something else marks it.
+  A host that mutates the tree that way marks it too.
 * **The projection is skipped when nothing structural changed.** A bitmap
   content write re-uploads the texture without re-projecting the tree; a
   bitmap resize is structural, because the projection reads its dimensions.
 * **The tree is projected in VM pixels** and the root carries the
   presentation transform. A changed presentation invalidates the projection.
+* **A frame the display did not accept is reported as such.** The report
+  carries whether the frame reached the display, and the engine keeps the
+  stall's accounting across frames; a replacement reports a skipped frame in
+  the same field rather than dropping it silently.
 * **A frame with nothing to show does not draw.** The window keeps the
   previous frame's contents, and the change waits for a frame that has
   something to show.

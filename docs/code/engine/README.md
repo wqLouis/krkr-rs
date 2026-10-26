@@ -12,6 +12,13 @@ state, the text engine — and performs actions on the stateless L1 services
 It speaks no TJS and no TVP vocabulary of its own: everything a script sees is
 expressed by L3 on top of the generic values documented here.
 
+Three pages sit beside this code map and are read with it: the public
+API reference ([`arch/l2-api.md`](../../arch/l2-api.md)) - the crate's types,
+operations, error types and stability contract; the contract an engine
+implementation must satisfy ([`implementing.md`](implementing.md)); and the
+guide for embedding the engine in another project
+([`embedding.md`](embedding.md)).
+
 The architecture this crate implements is in [`arch/l2.md`](../../arch/l2.md);
 its public surface is in [`arch/l2-api.md`](../../arch/l2-api.md);
 the rules it obeys are in [`rules/arch_rules.md`](../../rules/arch_rules.md)

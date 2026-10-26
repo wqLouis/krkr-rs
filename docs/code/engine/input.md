@@ -169,7 +169,7 @@ InputState::end_frame()         ── at the end of the frame
 L3's event adapter ──► the script's onMouseDown / onMouseUp / onKeyDown …
    │
    ▼
-Scene::layer_at (the hit-test, in VM pixels)
+Scene::layer_hit_next (the hit-test, in VM pixels)
 ```
 
 ---
