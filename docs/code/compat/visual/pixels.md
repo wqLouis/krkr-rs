@@ -142,9 +142,12 @@ The reference's order is preserved exactly:
 | `dfAddAlpha` | 4 | |
 | `dfAuto` | 128 | the face is derived from the layer type |
 
-`draw_face(scene, id)` is the port of the reference's `UpdateDrawFace`: when
-`layer.face != dfAuto` the stored face is used verbatim; otherwise the
-blend decides it.
+The layer keeps the reference's two faces: `LayerState::face` is the
+**outward** face the script reads and writes, and it defaults to `dfAuto`.
+`draw_face(scene, id)` is the **actual** draw face the operations use — the
+port of the reference's `UpdateDrawFace`: when the outward face is not
+`dfAuto` the stored face is used verbatim; otherwise the blend decides it, so
+a type change resolves the face again.
 
 | Layer type / blend | Face |
 |---|---|
@@ -153,6 +156,14 @@ blend decides it.
 | `ltAdditive`, `ltSubtractive`, `ltMultiplicative`, `ltScreen`, `ltDodge`, `ltDarken`, `ltLighten` | `dfOpaque` |
 | `ltAddAlpha` | `dfAddAlpha` |
 | every Photoshop type | `dfAlpha` |
+
+### The destination alpha
+
+The face selects the blend method together with the operation mode, and the
+layer's `holdAlpha` property is the argument the *plain* methods take: the
+`OnAlpha`/`OnAddAlpha` methods handle the destination's alpha themselves.
+`holdAlpha` therefore reaches a face-selected blend on an opaque face only;
+the face-independent modes take it whatever the face is.
 
 ### The per-method face gates
 

@@ -908,13 +908,14 @@ fn hit_test_rejects_a_point_outside_an_ancestor_rect() {
     scene.layer_mut(child).unwrap().hit_threshold = 0;
 
     assert_eq!(
-        scene.layer_at(child, 5, 5, false, false),
+        scene
+            .layer_hit_next(child, 5, 5, false, None)
+            .map(|candidate| candidate.layer),
         Some(child),
         "a point inside both rects hits"
     );
-    assert_eq!(
-        scene.layer_at(child, 5, 45, false, false),
-        None,
+    assert!(
+        scene.layer_hit_next(child, 5, 45, false, None).is_none(),
         "a point inside the child but outside the parent rect misses"
     );
 }

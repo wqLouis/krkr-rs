@@ -132,10 +132,12 @@ fn the_screen_follows_the_primary_layer_at_the_real_game_sizes() {
 
     // reference/cpp/core/visual/WindowIntf.cpp:895-903 — `setZoom` only stores
     // the ratio; it never resizes the window or the screen.
+    // reference/cpp/core/environ/impl/TVPWindow.h:393-408 — the stored ratio
+    // is the pair in lowest terms, so 150/100 is kept as 3/2.
     env.run("win.setZoom(150, 100);");
-    assert_eq!(env.eval_int("win.zoomNumer"), 150);
-    assert_eq!(env.eval_int("win.zoomDenom"), 100);
-    // reference/cpp/core/environ/impl/TVPWindow.h:389-406 — SetZoom stores the
+    assert_eq!(env.eval_int("win.zoomNumer"), 3);
+    assert_eq!(env.eval_int("win.zoomDenom"), 2);
+    // reference/cpp/core/environ/impl/TVPWindow.h:393-408 — SetZoom stores the
     // ratio and leaves the content size alone.
     assert_eq!(env.eval_int("win.innerWidth"), 1920);
     assert_eq!(env.eval_int("System.screenWidth"), 1280);

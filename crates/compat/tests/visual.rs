@@ -301,7 +301,7 @@ fn bitmap_pixels_and_size() {
 
     env.run(
         "var b = new Bitmap(2, 2); \
-         b.setPixel(0, 0, 0xff00ff00); \
+         b.setPixel(0, 0, 0x00ff00); \
          var p = b.getPixel(0, 0); \
          b.setMaskPixel(1, 1, 128); \
          var m = b.getMaskPixel(1, 1); \
@@ -310,8 +310,11 @@ fn bitmap_pixels_and_size() {
          b.setSize(4, 3);",
     );
 
-    // 0xff00ff00 = opaque green.
-    assert_eq!(env.eval_int("p == 0xff00ff00"), 1);
+    // `setPixel` writes the colour planes and holds the mask plane
+    // (`reference/cpp/core/visual/BitmapIntf.cpp:60-66`); `getPixel` reports
+    // the colour without the mask (`:51-58`) and `getMaskPixel` reports the
+    // mask alone (`:67-75`).
+    assert_eq!(env.eval_int("p == 0x00ff00"), 1);
     assert_eq!(env.eval_int("m"), 128);
     assert_eq!(env.eval_int("w0"), 2);
     assert_eq!(env.eval_int("h0"), 2);
@@ -322,8 +325,9 @@ fn bitmap_pixels_and_size() {
     let bitmap = env.scene.bitmaps.first().expect("one bitmap");
     assert_eq!((bitmap.width, bitmap.height), (4, 3));
     assert!(bitmap.script_owned);
-    // The green pixel survived the resize (top-left region preserved).
-    assert_eq!(&bitmap.rgba[0..4], &[0x00, 0xff, 0x00, 0xff]);
+    // The green pixel survived the resize (top-left region preserved); its
+    // mask plane is still the one the fresh bitmap was allocated with.
+    assert_eq!(&bitmap.rgba[0..4], &[0x00, 0xff, 0x00, 0x00]);
 }
 
 #[test]
@@ -333,12 +337,14 @@ fn bitmap_copy_from_copies_pixels() {
 
     env.run(
         "var a = new Bitmap(2, 2); \
-         a.setPixel(1, 0, 0xffff0000); \
+         a.setPixel(1, 0, 0xff0000); \
          var b = new Bitmap(1, 1); \
          b.copyFrom(a); \
          var p = b.getPixel(1, 0);",
     );
-    assert_eq!(env.eval_int("p == 0xffff0000"), 1);
+    // `getPixel` reports the colour planes without the mask
+    // (`reference/cpp/core/visual/BitmapIntf.cpp:51-58`).
+    assert_eq!(env.eval_int("p == 0xff0000"), 1);
     assert_eq!(env.eval_int("b.width"), 2);
     assert_eq!(env.eval_int("b.height"), 2);
 }

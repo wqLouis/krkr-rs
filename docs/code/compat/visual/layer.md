@@ -108,7 +108,7 @@ worker pass and does not prevent deferral. The member details are in
 | `visible` | a "blur-off" property: setting it false blurs the focused subtree. |
 | `opacity` | the reference `0..255` scale, stored as a clamped `0.0..=1.0`. |
 | `type` | the native `tTVPLayerType` number — see §4. |
-| `face` | the draw face: `dfBoth = 0`, `dfMain = 1`, `dfMask = 2`, `dfProvince = 3`, `dfAddAlpha = 4`. |
+| `face` | the outward draw face: `dfBoth = 0`, `dfMain = 1`, `dfMask = 2`, `dfProvince = 3`, `dfAddAlpha = 4`, `dfAuto = 128`. It defaults to `dfAuto`, and the actual draw face is resolved from the layer's type — see [`pixels.md`](pixels.md) §3. |
 | `holdAlpha` | the reference hold-alpha flag; see [`pixels.md`](pixels.md). |
 | `cached` | registers or unregisters a cache consumer; see [`transitions.md`](transitions.md). |
 | `callOnPaint` | the reference flag. |

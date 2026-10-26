@@ -3436,7 +3436,6 @@
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "// calls `child->Part()` for each of them (`LayerIntf.cpp:535`), and", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "// initializer (`LayerIntf.cpp:334`), encoded `0xAARRGGBB`.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "// reference `tTVPLayerManager::AttachPrimary` forces visible (a new", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "// reference sets `*lay = nullptr` and returns true).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "// reference's raw-pointer contract. All access goes through the safe", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// (`LayerIntf.cpp:2656`). A layer with no MainImage is left untouched.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// (`LayerIntf.cpp:3020`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3488,7 +3487,6 @@
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Reference `FocusWork` (`LayerIntf.h:528`): the transient layer selected", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Reference `Focusable`: whether the layer may receive focus.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Reference `GetMainImagePixelBuffer` (`LayerIntf.cpp:3005`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Reference `GetMostFrontChildAt` (`LayerIntf.cpp:3363`) behind the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Reference `GetNodeEnabled`: `enabled` and every ancestor enabled.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Reference `GetNodeFocusable` (`LayerIntf.h:665`): `focusable` plus", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/engine/src/scene.rs", "rule": "reference-citation", "anchor": "/// Reference `GetNodeVisible`: `visible` and every ancestor visible.", "reason": "legacy comment, cleanup tracked in TODO §15"}

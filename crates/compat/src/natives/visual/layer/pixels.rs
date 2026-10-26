@@ -25,8 +25,8 @@ use super::super::bitmap::{
 };
 use super::super::common::scene_mut;
 use super::super::common::{
-    DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, argb_to_rgba, bound, rgba_to_argb, scene_ref,
-    set_null_out,
+    DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, actual_color_bytes, argb_to_rgba, bound, rgba_to_argb,
+    scene_ref, set_null_out,
 };
 use super::LayerInst;
 use super::util::{
@@ -338,13 +338,35 @@ const fn blend_face(blend: BlendMode) -> i32 {
 /// reference raise `TVPNotDrawableFaceType`. The face-independent modes
 /// (additive, subtractive, … , every `omPs*`) accept any face.
 fn check_operate_face(mode: i64, face: i32) -> Result<(), String> {
-    const FACE_SENSITIVE: [i64; 3] = [OM_ALPHA, OM_OPAQUE, super::blend::LT_ADD_ALPHA];
-    if FACE_SENSITIVE.contains(&mode) && !matches!(face, DF_ALPHA | DF_OPAQUE | DF_ADD_ALPHA) {
+    if FACE_SENSITIVE_MODES.contains(&mode) && !matches!(face, DF_ALPHA | DF_OPAQUE | DF_ADD_ALPHA)
+    {
         return Err(format!(
             "Layer: the operation mode {mode} cannot draw on draw face {face}"
         ));
     }
     Ok(())
+}
+
+/// The operation modes whose blend method the draw face selects: the
+/// `omAlpha`, `omAddAlpha` and `omOpaque` modes. Every other mode blends
+/// the same way whatever the face is.
+const FACE_SENSITIVE_MODES: [i64; 3] = [OM_ALPHA, OM_OPAQUE, super::blend::LT_ADD_ALPHA];
+
+/// Whether a blend the draw face selected holds the destination's alpha.
+///
+/// The face-selected blend methods come in two spellings: the plain one on
+/// an opaque face and the `OnAlpha` / `OnAddAlpha` one on an alpha face.
+/// Only the plain spelling takes the destination's alpha-hold argument; the
+/// other spellings handle the destination's alpha themselves. The layer's
+/// `holdAlpha` property is that argument, so it reaches a blend the face
+/// selected on an opaque face only; the face-independent modes take it
+/// whatever the face is.
+fn face_hold_alpha(mode: i64, face: i32, layer_hold_alpha: bool) -> bool {
+    if FACE_SENSITIVE_MODES.contains(&mode) {
+        face == DF_OPAQUE && layer_hold_alpha
+    } else {
+        layer_hold_alpha
+    }
 }
 
 /// Resolve an `omAuto` operation mode against the source layer's blend.
@@ -509,7 +531,7 @@ extern "C" fn layer_operate_rect(
         let mode = resolve_mode(opt_i64(a, 7, OM_AUTO), src_type, "operateRect")?;
         let opa = opt_i64(a, 8, 255).clamp(0, 255) as u8;
         let scene = scene_mut(&ctx)?;
-        let Some((dst, hold_alpha)) = dest_info(scene, id, "operateRect")? else {
+        let Some((dst, layer_hold_alpha)) = dest_info(scene, id, "operateRect")? else {
             return Ok(());
         };
         let face = draw_face(scene, id);
@@ -521,6 +543,7 @@ extern "C" fn layer_operate_rect(
         // Reference order: clip first (`LayerIntf.cpp:5232-5234`), then the
         // mode/face validation (`LayerIntf.cpp:5235-5242`).
         check_operate_face(mode, face)?;
+        let hold_alpha = face_hold_alpha(mode, face, layer_hold_alpha);
         with_two_bitmaps(scene, dst, src_id, |d, s| {
             layer_ops::operate_rect(
                 d,
@@ -595,7 +618,7 @@ extern "C" fn layer_operate_stretch(
         let opa = opt_i64(a, 10, 255).clamp(0, 255) as u8;
         let stretch_type = opt_i64(a, 11, 0);
         let scene = scene_mut(&ctx)?;
-        let Some((dst, hold_alpha)) = dest_info(scene, id, "operateStretch")? else {
+        let Some((dst, layer_hold_alpha)) = dest_info(scene, id, "operateStretch")? else {
             return Ok(());
         };
         let face = draw_face(scene, id);
@@ -607,6 +630,7 @@ extern "C" fn layer_operate_stretch(
         // Reference order: clip first (`LayerIntf.cpp:5387-5390`), then the
         // mode/face validation (`LayerIntf.cpp:5392-5399`).
         check_operate_face(mode, face)?;
+        let hold_alpha = face_hold_alpha(mode, face, layer_hold_alpha);
         let src_rect = (sx, sy, sx.saturating_add(sw), sy.saturating_add(sh));
         let src_trimmed = scale_rect(src_rect, dst_rect, dest);
         with_two_bitmaps(scene, dst, src_id, |d, s| {
@@ -669,27 +693,27 @@ fn affine_op(
     let src_rect = (sx, sy, sx.saturating_add(sw), sy.saturating_add(sh));
     let coords = &a[6..12];
     let (p0, p1, p2) = affine_points(affine, coords, src_rect);
-    let (mode, opa, stretch_type, clear, hold_alpha) = match kind {
+    let (mode, opa, stretch_type, clear) = match kind {
         AffineKind::Copy => {
             let stretch_type = opt_i64(a, 12, 0);
             let clear = opt_bool(a, 13, false);
-            (OM_OPAQUE, 255, stretch_type, clear, true)
+            (OM_OPAQUE, 255, stretch_type, clear)
         }
         AffineKind::Pile => {
             let opa = opt_i64(a, 12, 255).clamp(0, 255) as u8;
             let stretch_type = opt_i64(a, 13, 0);
-            (OM_ALPHA, opa, stretch_type, false, true)
+            (OM_ALPHA, opa, stretch_type, false)
         }
         AffineKind::Blend => {
             let opa = opt_i64(a, 12, 255).clamp(0, 255) as u8;
             let stretch_type = opt_i64(a, 13, 0);
-            (OM_ALPHA, opa, stretch_type, false, true)
+            (OM_ALPHA, opa, stretch_type, false)
         }
         AffineKind::Operate => {
             let mode = resolve_mode(opt_i64(a, 12, OM_AUTO), src_type, method)?;
             let opa = opt_i64(a, 13, 255).clamp(0, 255) as u8;
             let stretch_type = opt_i64(a, 14, 0);
-            (mode, opa, stretch_type, false, true)
+            (mode, opa, stretch_type, false)
         }
     };
     let scene = scene_mut(ctx)?;
@@ -720,7 +744,11 @@ fn affine_op(
         let color = scene.layer(id).map_or(0, |l| l.neutral_color);
         argb_to_rgba(color)
     };
-    let hold = hold_alpha && layer_hold_alpha;
+    // The blend comes from the operation mode and the draw face; the
+    // layer's `holdAlpha` property holds the destination alpha on top of
+    // that. The copy, pile and blend methods are the face-sensitive modes
+    // whatever the operation mode they run under.
+    let hold = face_hold_alpha(mode, face, layer_hold_alpha);
     let pixel_center = affine || p0.0.fract() != 0.0 || p0.1.fract() != 0.0;
     affine_run(AffineRun {
         scene,
@@ -879,6 +907,7 @@ fn stretch_op(
             } else {
                 OM_ALPHA
             };
+            let hold_alpha = face_hold_alpha(mode, face, layer_hold_alpha);
             with_two_bitmaps(scene, dst, src_id, |d, s| {
                 layer_ops::stretch_blit_mode(
                     d,
@@ -891,7 +920,7 @@ fn stretch_op(
                     layer_ops::BlitOptions {
                         mode,
                         opa,
-                        hold_alpha: layer_hold_alpha,
+                        hold_alpha,
                         ..Default::default()
                     },
                 );
@@ -1872,7 +1901,7 @@ extern "C" fn layer_light(
 // Pixel accessors / province / bitmap copy / dump
 // ---------------------------------------------------------------------------
 
-/// `getMainPixel(x, y)` → ARGB with the alpha masked out.
+/// `getMainPixel(x, y)` → the pixel's `0x00RRGGBB` colour.
 extern "C" fn layer_get_main_pixel(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -1913,7 +1942,8 @@ extern "C" fn layer_get_main_pixel(
     0
 }
 
-/// `setMainPixel(x, y, color)` (RGB written, alpha held).
+/// `setMainPixel(x, y, color)` (the red, green and blue planes written, the
+/// mask plane held).
 extern "C" fn layer_set_main_pixel(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -1941,7 +1971,7 @@ extern "C" fn layer_set_main_pixel(
     };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
-    let color = argb_to_rgba(value_as_i64(&a[2]));
+    let color = actual_color_bytes(value_as_i64(&a[2]));
     let scene = match scene_mut(&ctx) {
         Ok(s) => s,
         Err(error) => return report_error(out_error, &error),
@@ -1959,7 +1989,7 @@ extern "C" fn layer_set_main_pixel(
         && let Some(offset) = bitmap.pixel_offset(x as u32, y as u32)
         && let Some(pixel) = bitmap.rgba.get_mut(offset..offset + 3)
     {
-        pixel.copy_from_slice(&color[..3]);
+        pixel.copy_from_slice(&color);
         bitmap.mark_dirty();
     }
     if let Some(layer) = scene.layer_mut(id) {

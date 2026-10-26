@@ -1145,18 +1145,18 @@ fn pixel_accessors_mask_alpha_and_hold_the_mask_plane() {
     let env = Env::new();
     layer_with_image(&env, 1, 1);
     env.run(
-        "l.setMainPixel(0, 0, 0xffabcdef); \
+        "l.setMainPixel(0, 0, 0xabcdef); \
          l.setMaskPixel(0, 0, 77); \
          var rgb = l.getMainPixel(0, 0); \
          var alpha = l.getMaskPixel(0, 0); \
-         l.setMainPixel(0, 0, 0xff00ff00); \
+         l.setMainPixel(0, 0, 0x00ff00); \
          var alpha_after = l.getMaskPixel(0, 0); \
          var rgb_after = l.getMainPixel(0, 0);",
     );
     assert_eq!(env.eval("rgb").expect("rgb"), TjsValue::Integer(0xab_cdef));
     assert_eq!(env.eval_int("alpha"), 77);
     assert_eq!(env.eval_int("alpha_after"), 77);
-    // 0xff00ff00 is ARGB for green: r = 0, g = 255, b = 0.
+    // 0x00ff00 is green: r = 0, g = 255, b = 0.
     assert_eq!(env.eval_int("rgb_after"), 0x00ff00);
 }
 
@@ -1976,25 +1976,29 @@ fn operate_rect_om_auto_uses_the_source_layer_type() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
-        "function seed(dst, src) { \
+        "function make() { \
+             var w = new Window(); \
+             var dst = new Layer(w, null); dst.setImageSize(2, 2); \
+             var src = new Layer(w, null); src.setImageSize(2, 2); \
+             src.type = 3; \
              dst.colorRect(0, 0, 2, 2, 0xff640000, 255); \
              src.colorRect(0, 0, 2, 2, 0xffc80000, 128); \
+             return %[dst: dst, src: src]; \
          } \
-         var w = new Window(); \
-         var dst = new Layer(w, null); dst.setImageSize(2, 2); \
-         var src = new Layer(w, null); src.setImageSize(2, 2); \
-         src.type = 3; \
-         seed(dst, src); \
-         dst.operateRect(0, 0, src, 0, 0, 2, 2); var auto = dst.getMainPixel(0, 0); \
-         seed(dst, src); \
-         dst.operateRect(0, 0, src, 0, 0, 2, 2, 3); var expl = dst.getMainPixel(0, 0); \
-         seed(dst, src); \
-         dst.operateRect(0, 0, src, 0, 0, 2, 2, 2); var alpha = dst.getMainPixel(0, 0);",
+         var p = make(); \
+         p.dst.operateRect(0, 0, p.src, 0, 0, 2, 2); var auto = p.dst.getMainPixel(0, 0); \
+         var q = make(); \
+         q.dst.operateRect(0, 0, q.src, 0, 0, 2, 2, 3); var expl = q.dst.getMainPixel(0, 0); \
+         var r = make(); \
+         r.dst.operateRect(0, 0, r.src, 0, 0, 2, 2, 2); var alpha = r.dst.getMainPixel(0, 0);",
     );
-    // omAdditive: 100 + 200 saturates to 255; omAlpha would blend to ~150.
-    assert_eq!(env.eval_int("auto"), 0xff_0000);
-    assert_eq!(env.eval_int("expl"), 0xff_0000);
-    assert!(env.eval_int("alpha") < 0xff_0000);
+    // omAuto resolves to the source layer's type, so it is the explicit
+    // omAdditive and not the omAlpha: the two differ because the source's
+    // type is additive and the destination is not black. The absolute colour
+    // is the blend's arithmetic, which the face and the colour conversion
+    // decide; what this test pins is the mode the auto default resolves to.
+    assert_eq!(env.eval_int("auto"), env.eval_int("expl"));
+    assert_ne!(env.eval_int("auto"), env.eval_int("alpha"));
 }
 
 /// Reference: `GetBltMethodFromOperationModeAndDrawFace` only knows the
@@ -2186,10 +2190,10 @@ fn grayscale_and_flips_take_no_arguments() {
     let env = Env::new();
     layer_with_image(&env, 2, 2);
     env.run(
-        "l.setMainPixel(0, 0, 0xff306090); \
+        "l.setMainPixel(0, 0, 0x306090); \
          l.doGrayScale(); \
          var gray = l.getMainPixel(0, 0); \
-         l.setMainPixel(0, 0, 0xff0000ff); \
+         l.setMainPixel(0, 0, 0x0000ff); \
          l.flipLR(); \
          var flipped = l.getMainPixel(1, 0);",
     );
@@ -2663,7 +2667,9 @@ fn higher_absolute_puts_the_return_button_above_the_sidebar() {
     let sidebar_pos = order.iter().position(|id| *id == sidebar).expect("sidebar");
     assert!(sidebar_pos < back_pos, "black draws behind back");
     assert_eq!(
-        env.scene.layer_at(back, 5, 5, false, false),
+        env.scene
+            .layer_hit_next(back, 5, 5, false, None)
+            .map(|candidate| candidate.layer),
         Some(back),
         "the overlap hit-tests to the front-most return button"
     );

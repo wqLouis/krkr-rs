@@ -178,7 +178,12 @@ fn layer_invalidated_while_transition_is_active_leaves_only_typed_misses() {
     let order_before = scene.window_layer_order(win);
     assert!(order_before.contains(&victim));
     // The victim is the front hit at (1, 1) while it is alive.
-    assert_eq!(scene.layer_at(bg, 1, 1, false, false), Some(victim));
+    assert_eq!(
+        scene
+            .layer_hit_next(bg, 1, 1, false, None)
+            .map(|candidate| candidate.layer),
+        Some(victim)
+    );
 
     // A cross-fade is armed and half-way when the script invalidates the
     // layer the transition was going to replace.
@@ -204,7 +209,7 @@ fn layer_invalidated_while_transition_is_active_leaves_only_typed_misses() {
     assert!(!scene.node_enabled(victim));
     assert!(!scene.node_focusable(victim));
     assert_eq!(scene.absolute_offset(victim), None);
-    assert_eq!(scene.layer_at(bg, 0, 0, false, false), None);
+    assert!(scene.layer_hit_next(bg, 0, 0, false, None).is_none());
     assert!(!scene.window_layer_order(win).contains(&victim));
 
     // No dangling ids survive: window roots, focus and primary slot are
@@ -289,7 +294,7 @@ fn stale_ids_are_typed_misses_across_the_query_surface() {
     assert!(!scene.node_focusable(ghost));
     assert!(!scene.is_primary_layer(ghost));
     assert_eq!(scene.absolute_offset(ghost), None);
-    assert_eq!(scene.layer_at(ghost, 0, 0, false, false), None);
+    assert!(scene.layer_hit_next(ghost, 0, 0, false, None).is_none());
     assert_eq!(scene.next_focusable(ghost), None);
     assert_eq!(scene.prev_focusable(ghost), None);
     assert_eq!(scene.ordered_children(ghost), Vec::<u32>::new());

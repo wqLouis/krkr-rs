@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use api::host::TouchPhase;
 
 use crate::collections::Map;
+use crate::engine_api::HitCandidate;
 use crate::engine_api::InputState;
 use crate::engine_api::Scene;
 use platform::{InputEvent, MouseButton, PlatformEvent};
@@ -612,20 +613,89 @@ fn resolve_pointer(ctx: &CompatCtx, name: &str) -> Option<u32> {
 /// tests are waited for first: a load whose decode is still running leaves the
 /// bitmap with the probed size and no pixels.
 fn hit_layer(ctx: &CompatCtx, x: i32, y: i32) -> Option<u32> {
-    let scene = scene_mut(ctx)?;
-    let roots: Vec<(u32, u32)> = scene
-        .windows
-        .iter()
-        .filter(|window| window.visible)
-        .filter_map(|window| window.primary_layer.map(|primary| (window.id, primary)))
-        .collect();
+    let roots: Vec<(u32, u32)> = {
+        let scene = scene_mut(ctx)?;
+        scene
+            .windows
+            .iter()
+            .filter(|window| window.visible)
+            .filter_map(|window| window.primary_layer.map(|primary| (window.id, primary)))
+            .collect()
+    };
     for (window, primary) in roots {
-        resolve_layer_images(scene, window);
-        if let Some(layer) = scene.layer_at(primary, x, y, false, false) {
+        {
+            let scene = scene_mut(ctx)?;
+            resolve_layer_images(scene, window);
+        }
+        if let Some(layer) = hit_test(ctx, primary, x, y, false, false) {
             return Some(layer);
         }
     }
     None
+}
+
+/// The layer at the point, with the `onHitTest` hook the hit test fires.
+///
+/// The hit test posts `onHitTest` to the layer that hits geometrically and
+/// takes the layer's hit flag as the result: the flag starts accepted, the
+/// event may clear it, and a cleared flag sends the search on to the layer
+/// behind. The event is delivered synchronously, inside the hit test, and the
+/// layer that receives it is the layer's own script object.
+///
+/// The scene is read and written one step at a time, and no borrow of it is
+/// live while the event runs: the handler is free to change the layer tree.
+pub(crate) fn hit_test(
+    ctx: &CompatCtx,
+    layer_id: u32,
+    x: i32,
+    y: i32,
+    exclude_self: bool,
+    get_disabled: bool,
+) -> Option<u32> {
+    let mut after = None;
+    loop {
+        let candidate = {
+            let scene = scene(ctx)?;
+            scene.layer_hit_next(layer_id, x, y, exclude_self, after)
+        }?;
+        after = Some(candidate.layer);
+        {
+            let scene = scene_mut(ctx)?;
+            scene.set_hit_test_accepted(candidate.layer, true);
+        }
+        deliver_hit_test(ctx, &candidate);
+        let accepted = {
+            let scene = scene(ctx)?;
+            scene.hit_test_accepted(candidate.layer)
+        };
+        match accepted {
+            Some(true) => {
+                let scene = scene(ctx)?;
+                return scene.layer_hit_outcome(candidate.layer, get_disabled);
+            }
+            // The layer cleared its hit flag: the search continues behind it.
+            Some(false) => continue,
+            // The layer is gone: it cannot be hit.
+            None => continue,
+        }
+    }
+}
+
+/// Deliver the `onHitTest` event to the hit layer.
+///
+/// The event carries the point in the layer's own coordinates and `true` as
+/// the third argument.
+fn deliver_hit_test(ctx: &CompatCtx, candidate: &HitCandidate) {
+    deliver_checked(
+        ctx,
+        "onHitTest",
+        &[
+            EventValue::Int(i64::from(candidate.x)),
+            EventValue::Int(i64::from(candidate.y)),
+            EventValue::Bool(true),
+        ],
+        Target::Layer(candidate.layer),
+    );
 }
 
 /// Waits for the main images of `window`'s layers.

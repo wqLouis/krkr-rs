@@ -1076,12 +1076,7 @@ extern "C" fn native_to_actual_color(
     }
     // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let color = value_as_i64(&unsafe { args(argv, argc) }[0]) as u32;
-    let actual = if color & 0xff00_0000 != 0 {
-        color_to_actual(color)
-    } else {
-        color & 0x00ff_ffff
-    };
-    set_int(out, i64::from(actual));
+    set_int(out, i64::from(to_actual_color(color)));
     0
 }
 
@@ -2249,7 +2244,13 @@ extern "C" fn prop_touch_device(
 
 /// Convert a TVP system color (high byte set) to its actual `0xRRGGBB` value.
 /// Ported from `ColorToRGB` + the byte-order swap in `TVPToActualColor`.
-fn color_to_actual(color: u32) -> u32 {
+///
+/// A color whose high byte is clear is not a system color: it passes through
+/// unchanged, so the result is the color's own `0x00RRGGBB`.
+pub(crate) fn to_actual_color(color: u32) -> u32 {
+    if color & 0xff00_0000 == 0 {
+        return color;
+    }
     // `ColorToRGB`'s table is in `0xBBGGRR`; the swap below returns `0xRRGGBB`.
     let rgb_bbggrr = match color {
         0x8000_0000 => 0x00c8_c8c8, // clScrollBar

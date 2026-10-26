@@ -19,7 +19,7 @@ use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::{set_string_out, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
-use tjs::VAL_OBJECT;
+use tjs::{VAL_OBJECT, VAL_VOID};
 
 /// The client size a window starts with.
 const DEFAULT_WINDOW_SIZE: (u32, u32) = (1280, 720);
@@ -40,8 +40,8 @@ struct WindowInst {
     max_width: i32,
     max_height: i32,
     focusable: bool,
-    zoom_numer: i32,
-    zoom_denom: i32,
+    zoom_numer: i64,
+    zoom_denom: i64,
     full_screen: bool,
     wait_vsync: bool,
     enable_touch: bool,
@@ -51,7 +51,6 @@ struct WindowInst {
     use_mouse_key: bool,
     trap_key: bool,
     modal: bool,
-    mask_region: Option<i32>,
     /// `tTVPBorderStyle` (0 = `bsNone`).
     border_style: i32,
     stay_on_top: bool,
@@ -95,7 +94,6 @@ impl Default for WindowInst {
             use_mouse_key: false,
             trap_key: false,
             modal: false,
-            mask_region: None,
             border_style: 0,
             stay_on_top: false,
             touch_scale_threshold: 5.0,
@@ -119,6 +117,20 @@ impl Default for WindowInst {
 struct MouseVelocityState {
     /// window scene id → pointer position at the previous sample.
     last: Map<u32, (f32, f32)>,
+}
+
+/// The guard a full-screen window applies before a geometry change.
+///
+/// A full-screen window cannot be resized, moved or restyled: the write
+/// raises instead of changing the window. The message is the one the window
+/// raises for every member it rejects.
+fn full_screen_guard(instance: *mut c_void) -> Result<(), String> {
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
+    let inst = unsafe { &*(instance as *const WindowInst) };
+    if inst.attached && inst.full_screen {
+        return Err("Invalid property in fullscreen : %1".to_string());
+    }
+    Ok(())
 }
 
 /// Resolve a `getTouchPoint`/`getTouchVelocity` argument that may be a
@@ -434,9 +446,16 @@ extern "C" fn window_update(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.update: compat context is not bound");
     };
-    let update_type = if argc >= 1 {
+    // The update type is read from the first argument, and only when a
+    // second argument is present.
+    let update_type = if argc >= 2 {
         // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
-        value_as_i64(&unsafe { args(argv, argc) }[0]) as i32
+        let a = unsafe { args(argv, argc) };
+        if a[1].ty == VAL_VOID {
+            0
+        } else {
+            value_as_i64(&a[0]) as i32
+        }
     } else {
         0
     };
@@ -562,6 +581,9 @@ extern "C" fn window_set_size(
     if argc < 2 {
         return report_error(out_error, "Window.setSize requires 2 arguments");
     }
+    if let Err(error) = full_screen_guard(instance) {
+        return report_error(out_error, &error);
+    }
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.setSize: compat context is not bound");
     };
@@ -620,6 +642,9 @@ extern "C" fn window_set_pos(
     if argc < 2 {
         return report_error(out_error, "Window.setPos requires 2 arguments");
     }
+    if let Err(error) = full_screen_guard(instance) {
+        return report_error(out_error, &error);
+    }
     // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
@@ -651,13 +676,16 @@ extern "C" fn window_set_layer_pos(
 /// `Window.beginMove()` — the reference form's base body does nothing.
 extern "C" fn window_begin_move(
     _engine: *mut c_void,
-    _instance: *mut c_void,
+    instance: *mut c_void,
     _argc: c_int,
     _argv: *const Value,
     out: *mut Value,
-    _out_error: *mut *mut c_char,
+    out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    if let Err(error) = full_screen_guard(instance) {
+        return report_error(out_error, &error);
+    }
     set_void(out);
     0
 }
@@ -674,6 +702,9 @@ extern "C" fn window_set_min_size(
 ) -> c_int {
     if argc < 2 {
         return report_error(out_error, "Window.setMinSize requires 2 arguments");
+    }
+    if let Err(error) = full_screen_guard(instance) {
+        return report_error(out_error, &error);
     }
     // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
@@ -698,6 +729,9 @@ extern "C" fn window_set_max_size(
     if argc < 2 {
         return report_error(out_error, "Window.setMaxSize requires 2 arguments");
     }
+    if let Err(error) = full_screen_guard(instance) {
+        return report_error(out_error, &error);
+    }
     // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
@@ -708,10 +742,31 @@ extern "C" fn window_set_max_size(
     0
 }
 
+/// Reduce a zoom fraction to its lowest terms.
+///
+/// The pair is divided by their greatest common divisor, so `4/8` is kept as
+/// `1/2` and `150/100` as `3/2`. A pair whose common divisor is zero has no
+/// reduction and is kept as it is.
+fn reduce_zoom(numer: i64, denom: i64) -> (i64, i64) {
+    let mut a = numer;
+    let mut b = denom;
+    while b != 0 {
+        let t = b;
+        // `wrapping_rem` keeps the loop free of the overflow the division
+        // itself cannot express.
+        b = a.wrapping_rem(b);
+        a = t;
+    }
+    if a == 0 {
+        return (numer, denom);
+    }
+    (numer.wrapping_div(a), denom.wrapping_div(a))
+}
+
 /// `Window.setZoom(numer, denom)`.
 ///
-/// The ratio is stored for the script to read back; the window client size and
-/// the primary layer keep their sizes.
+/// The ratio is stored in lowest terms for the script to read back; the
+/// window client size and the primary layer keep their sizes.
 extern "C" fn window_set_zoom(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -728,8 +783,7 @@ extern "C" fn window_set_zoom(
     let a = unsafe { args(argv, argc) };
     // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
     let inst = unsafe { &mut *(instance as *mut WindowInst) };
-    let numer = value_as_i64(&a[0]).max(1) as i32;
-    let denom = value_as_i64(&a[1]).max(1) as i32;
+    let (numer, denom) = reduce_zoom(value_as_i64(&a[0]), value_as_i64(&a[1]));
     inst.zoom_numer = numer;
     inst.zoom_denom = denom;
     set_void(out);
@@ -743,9 +797,12 @@ extern "C" fn window_show_modal(
     argc: c_int,
     argv: *const Value,
     out: *mut Value,
-    _out_error: *mut *mut c_char,
+    out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    if let Err(error) = full_screen_guard(instance) {
+        return report_error(out_error, &error);
+    }
     // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
     let inst = unsafe { &mut *(instance as *mut WindowInst) };
     inst.modal = if argc >= 1 {
@@ -759,39 +816,57 @@ extern "C" fn window_show_modal(
 }
 
 /// `Window.setMaskRegion(threshold)`.
+///
+/// The window must have a primary layer; without one the call raises. With a
+/// primary layer the window keeps no mask region, so the call only checks the
+/// layer.
 extern "C" fn window_set_mask_region(
-    _engine: *mut c_void,
+    engine: *mut c_void,
     instance: *mut c_void,
-    argc: c_int,
-    argv: *const Value,
+    _argc: c_int,
+    _argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    if argc < 1 {
-        return report_error(out_error, "Window.setMaskRegion requires 1 argument");
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return report_error(
+            out_error,
+            "Window.setMaskRegion: compat context is not bound",
+        );
+    };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
+    let inst = unsafe { &*(instance as *const WindowInst) };
+    let Some(id) = inst.id else {
+        // A window without a scene record has no layer to check.
+        set_void(out);
+        return 0;
+    };
+    let scene = match scene_ref(&ctx) {
+        Ok(scene) => scene,
+        Err(error) => return report_error(out_error, &error),
+    };
+    if !scene
+        .window(id)
+        .is_some_and(|window| window.primary_layer.is_some())
+    {
+        return report_error(out_error, "Window has no layer");
     }
-    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
-    let inst = unsafe { &mut *(instance as *mut WindowInst) };
-    // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
-    inst.mask_region = Some(value_as_i64(&unsafe { args(argv, argc) }[0]) as i32);
     set_void(out);
     0
 }
 
-/// `Window.removeMaskRegion()`.
+/// `Window.removeMaskRegion()` — the window keeps no mask region, so there is
+/// nothing to remove.
 extern "C" fn window_remove_mask_region(
     _engine: *mut c_void,
-    instance: *mut c_void,
+    _instance: *mut c_void,
     _argc: c_int,
     _argv: *const Value,
     out: *mut Value,
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
-    let inst = unsafe { &mut *(instance as *mut WindowInst) };
-    inst.mask_region = None;
     set_void(out);
     0
 }
@@ -1001,6 +1076,9 @@ extern "C" fn window_visible_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.visible: compat context is not bound");
     };
+    if let Err(error) = full_screen_guard(instance) {
+        return report_error(out_error, &error);
+    }
     // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
@@ -1106,6 +1184,9 @@ extern "C" fn window_width_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.width: compat context is not bound");
     };
+    if let Err(error) = full_screen_guard(instance) {
+        return report_error(out_error, &error);
+    }
     // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
@@ -1159,6 +1240,9 @@ extern "C" fn window_height_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.height: compat context is not bound");
     };
+    if let Err(error) = full_screen_guard(instance) {
+        return report_error(out_error, &error);
+    }
     // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
@@ -1181,6 +1265,12 @@ extern "C" fn window_height_set(
 /// Shared accessor for the `WindowInst`-held integer/bool properties.
 macro_rules! window_i64_prop {
     ($get:ident, $set:ident, $field:ident) => {
+        window_i64_prop!(@impl $get, $set, $field, unguarded);
+    };
+    ($get:ident, $set:ident, $field:ident, guarded) => {
+        window_i64_prop!(@impl $get, $set, $field, guarded);
+    };
+    (@impl $get:ident, $set:ident, $field:ident, $guard:ident) => {
         extern "C" fn $get(
             _engine: *mut c_void,
             instance: *mut c_void,
@@ -1200,6 +1290,7 @@ macro_rules! window_i64_prop {
             _out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
+            window_i64_prop!(@check $guard, instance, _out_error);
             // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
             let inst = unsafe { &mut *(instance as *mut WindowInst) };
             // SAFETY: the C++ property dispatcher passes a live `Value` for the duration of this call.
@@ -1207,16 +1298,108 @@ macro_rules! window_i64_prop {
             0
         }
     };
+    // The guard is expanded here, where the setter's own parameters are in
+    // scope: a macro argument carries its caller's hygiene, so the guard
+    // cannot name the setter's parameters from the arm that passes it in.
+    (@check guarded, $instance:ident, $out_error:ident) => {
+        if let Err(error) = full_screen_guard($instance) {
+            return report_error($out_error, &error);
+        }
+    };
+    (@check unguarded, $instance:ident, $out_error:ident) => {};
 }
 
-window_i64_prop!(window_left_get, window_left_set, left);
-window_i64_prop!(window_top_get, window_top_set, top);
-window_i64_prop!(window_min_width_get, window_min_width_set, min_width);
-window_i64_prop!(window_min_height_get, window_min_height_set, min_height);
-window_i64_prop!(window_max_width_get, window_max_width_set, max_width);
-window_i64_prop!(window_max_height_get, window_max_height_set, max_height);
-window_i64_prop!(window_zoom_numer_get, window_zoom_numer_set, zoom_numer);
-window_i64_prop!(window_zoom_denom_get, window_zoom_denom_set, zoom_denom);
+window_i64_prop!(window_left_get, window_left_set, left, guarded);
+window_i64_prop!(window_top_get, window_top_set, top, guarded);
+window_i64_prop!(
+    window_min_width_get,
+    window_min_width_set,
+    min_width,
+    guarded
+);
+window_i64_prop!(
+    window_min_height_get,
+    window_min_height_set,
+    min_height,
+    guarded
+);
+window_i64_prop!(
+    window_max_width_get,
+    window_max_width_set,
+    max_width,
+    guarded
+);
+window_i64_prop!(
+    window_max_height_get,
+    window_max_height_set,
+    max_height,
+    guarded
+);
+/// `Window.zoomNumer` — the numerator of the window's zoom fraction.
+extern "C" fn window_zoom_numer_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
+    let inst = unsafe { &*(instance as *const WindowInst) };
+    set_int(out, inst.zoom_numer);
+    0
+}
+
+/// `Window.zoomNumer = n` — the fraction is reduced again, so the stored
+/// numerator and denominator stay coprime.
+extern "C" fn window_zoom_numer_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
+    let inst = unsafe { &mut *(instance as *mut WindowInst) };
+    // SAFETY: the C++ property dispatcher passes a live `Value` for the duration of this call.
+    let numer = value_as_i64(unsafe { &*value });
+    let (numer, denom) = reduce_zoom(numer, inst.zoom_denom);
+    inst.zoom_numer = numer;
+    inst.zoom_denom = denom;
+    0
+}
+
+/// `Window.zoomDenom` — the denominator of the window's zoom fraction.
+extern "C" fn window_zoom_denom_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
+    let inst = unsafe { &*(instance as *const WindowInst) };
+    set_int(out, inst.zoom_denom);
+    0
+}
+
+/// `Window.zoomDenom = d` — the fraction is reduced again, so the stored
+/// numerator and denominator stay coprime.
+extern "C" fn window_zoom_denom_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
+    let inst = unsafe { &mut *(instance as *mut WindowInst) };
+    // SAFETY: the C++ property dispatcher passes a live `Value` for the duration of this call.
+    let denom = value_as_i64(unsafe { &*value });
+    let (numer, new_denom) = reduce_zoom(inst.zoom_numer, denom);
+    inst.zoom_numer = numer;
+    inst.zoom_denom = new_denom;
+    0
+}
 window_i64_prop!(window_hint_delay_get, window_hint_delay_set, hint_delay);
 window_i64_prop!(
     window_mouse_cursor_state_get,
@@ -1324,9 +1507,23 @@ extern "C" fn window_show_scroll_bars_get(
     0
 }
 
+/// `Window.innerSunken` — a full-screen window rejects the write; the
+/// window itself ignores it.
+extern "C" fn window_inner_sunken_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    if let Err(error) = full_screen_guard(instance) {
+        return report_error(out_error, &error);
+    }
+    0
+}
+
 /// The empty setter shared by the obsolete properties whose reference form
-/// setter is a no-op (`layerLeft`, `layerTop`, `showScrollBars`,
-/// `innerSunken`).
+/// setter is a no-op (`layerLeft`, `layerTop`, `showScrollBars`).
 extern "C" fn window_ignored_prop_set(
     _engine: *mut c_void,
     _instance: *mut c_void,
@@ -2283,7 +2480,8 @@ extern "C" fn window_layer_tree_owner_interface_get(
 window_i64_prop!(
     window_border_style_get,
     window_border_style_set,
-    border_style
+    border_style,
+    guarded
 );
 window_bool_prop!(window_stay_on_top_get, window_stay_on_top_set, stay_on_top);
 
@@ -2617,7 +2815,7 @@ pub(super) fn register_window_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
             NativeInstancePropertyDef {
                 name: "innerSunken",
                 get: Some(window_inner_sunken_get),
-                set: Some(window_ignored_prop_set),
+                set: Some(window_inner_sunken_set),
             },
             NativeInstancePropertyDef {
                 name: "minWidth",

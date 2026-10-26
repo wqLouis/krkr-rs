@@ -1018,7 +1018,12 @@ fn first_layer_is_a_window_sized_primary() {
     let bitmap = scene.add_bitmap(4, 4, vec![255; 64]);
     scene.layer_mut(child).unwrap().bitmap = Some(bitmap);
     scene.layer_mut(child).unwrap().hit_threshold = 0;
-    assert_eq!(scene.layer_at(child, 1, 1, false, false), Some(child));
+    assert_eq!(
+        scene
+            .layer_hit_next(child, 1, 1, false, None)
+            .map(|candidate| candidate.layer),
+        Some(child)
+    );
 }
 
 /// A rectangle mark accumulates into the bitmap's dirty region, and a whole
@@ -1087,4 +1092,46 @@ fn a_rectangle_outside_the_bitmap_marks_nothing() {
         Some(PixelRegion::new(2, 2, 1, 1)),
         "the rectangle after a clean starts the region"
     );
+}
+
+/// The hit test offers the candidates front to back, and a disabled hit
+/// stops the search with no layer.
+///
+/// Reference `tTJSNI_BaseLayer::GetMostFrontChildAt`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:3312-3357`): the children are
+/// tried front to back, a rejected candidate sends the search on to the layer
+/// behind it, and a disabled hit reports no layer and ends the search.
+#[test]
+fn the_hit_test_offers_the_candidates_front_to_back() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (320, 240));
+    let primary = scene.add_layer(win, None);
+    let back = scene.add_layer(win, Some(primary));
+    let front = scene.add_layer(win, Some(primary));
+    for id in [back, front] {
+        let layer = scene.layer_mut(id).unwrap();
+        layer.rect = engine::Rect::new(0, 0, 100, 50);
+        layer.visible = true;
+        layer.hit_threshold = 0;
+    }
+
+    let first = scene
+        .layer_hit_next(primary, 10, 10, false, None)
+        .expect("the front layer hits");
+    assert_eq!(first.layer, front, "the frontmost layer is offered first");
+    assert_eq!((first.x, first.y), (10, 10), "the point is layer-local");
+
+    let second = scene
+        .layer_hit_next(primary, 10, 10, false, Some(first.layer))
+        .expect("the layer behind is offered next");
+    assert_eq!(
+        second.layer, back,
+        "the search continues behind the candidate the caller rejected"
+    );
+
+    // A disabled hit reports no layer, unless the caller asks for the
+    // disabled layers too.
+    scene.layer_mut(front).unwrap().enabled = false;
+    assert_eq!(scene.layer_hit_outcome(front, false), None);
+    assert_eq!(scene.layer_hit_outcome(front, true), Some(front));
 }

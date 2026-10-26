@@ -162,13 +162,21 @@ pub struct LayerState {
     /// Hit-test mode (reference `tTVPHitType`): `htMask=0` (per-pixel
     /// threshold) or `htProvince=1` (non-transparent province). Stored so
     /// `SelectItemBase` can set it; the render input bridge and
-    /// [`Scene::layer_at`] read it during hit-testing.
+    /// [`Scene::layer_hit_next`] read it during hit-testing.
     pub hit_type: i32,
+    /// Whether the layer accepts the hit test running on it.
+    ///
+    /// A hit test starts accepted and the caller may clear the flag while
+    /// the test runs; the flag after the test is the test's verdict.
+    pub hit_test_accepted: bool,
     /// Mouse-cursor id (reference `tTVPCursorType`, e.g. `crDefault=0`,
     /// `crHandPoint=-21`). Stored; the desktop cursor is not yet driven.
     pub cursor: i32,
-    /// Draw face (`dfBoth=0`, `dfMain=1`, `dfMask=2`, `dfProvince=3`,
-    /// `dfAddAlpha=4`). Stored; the projection always draws the main image.
+    /// Outward draw face: the value the script reads and writes. `128` means
+    /// "resolve the face from the layer's type"; the concrete faces are `0`
+    /// (alpha), `1` (opaque), `2` (mask), `3` (province) and `4` (add
+    /// alpha). The compat layer owns the vocabulary and the resolution; the
+    /// projection always draws the main image.
     pub face: i32,
     /// Reference `ClipRect` set by `Layer.setClip(left, top, width, height)`:
     /// a half-open `[x, x+w) x [y, y+h)` region in image pixels. `None` means
@@ -286,7 +294,7 @@ pub struct LayerState {
     /// it (the record then leaves [`Scene::layers`] immediately, so a stale id
     /// becomes a typed miss); the flag also survives on any record a caller
     /// marks directly, and every consumer — [`Scene::node_visible`],
-    /// [`Scene::layer_at`], [`Scene::window_layer_order`] — skips it.
+    /// [`Scene::layer_hit_next`], [`Scene::window_layer_order`] — skips it.
     pub shutdown: bool,
 }
 
@@ -297,6 +305,18 @@ impl LayerState {
     pub fn drawn_image(&self) -> Option<u32> {
         self.transition_self.or(self.bitmap)
     }
+}
+
+/// One layer a hit test accepted, with the point in the layer's own
+/// coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HitCandidate {
+    /// The layer the point hit.
+    pub layer: u32,
+    /// The point in the layer's own coordinates.
+    pub x: i32,
+    /// The point in the layer's own coordinates.
+    pub y: i32,
 }
 
 /// One source image of a [`TransitionFrame`].
@@ -1002,8 +1022,9 @@ impl Scene {
             province_height: 0,
             hit_threshold: 16,
             hit_type: 0,
+            hit_test_accepted: true,
             cursor: 0,
-            face: 0,
+            face: 128,
             clip: None,
             hold_alpha: false,
             focusable: false,
@@ -2257,19 +2278,27 @@ impl Scene {
         None
     }
 
-    /// Reference `GetMostFrontChildAt` (`LayerIntf.cpp:3363`) behind the
-    /// `getLayerAt` native: the frontmost layer at window point `(x, y)`,
-    /// where `(x, y)` is given in `layer_id`'s local coordinates. Returns
-    /// `None` when the point misses everything or the frontmost hit is
-    /// disabled and `get_disabled` is false.
-    pub fn layer_at(
+    /// The next layer whose geometry accepts the point, front to back.
+    ///
+    /// The point `(x, y)` is given in `layer_id`'s local coordinates; the
+    /// search converts it to the window's and walks the window's layer tree
+    /// from the front back, so the first candidate is the frontmost layer
+    /// the point hits.
+    ///
+    /// `after` is the layer the caller tested last: the search continues
+    /// behind it, so a candidate the caller rejected is skipped. `None`
+    /// starts the search at the front.
+    ///
+    /// The candidate carries the point in the candidate's own coordinates,
+    /// the coordinate space a hit test reports.
+    pub fn layer_hit_next(
         &self,
         layer_id: u32,
         x: i32,
         y: i32,
         exclude_self: bool,
-        get_disabled: bool,
-    ) -> Option<u32> {
+        after: Option<u32>,
+    ) -> Option<HitCandidate> {
         let layer = self.layer(layer_id)?;
         let window = layer.window;
         // Convert to window coordinates (the native `getLayerAt` adds this
@@ -2296,7 +2325,19 @@ impl Scene {
         }
         // Front-to-back over the flattened tree; an invisible parent prunes
         // its subtree through `node_visible`.
-        for id in self.window_layer_order(window).into_iter().rev() {
+        let order = self.window_layer_order(window);
+        // The search continues behind the layer the caller tested last. A
+        // layer that left the order in the meantime (the caller removed it
+        // while the test ran) restarts the search at the front.
+        let after = after.filter(|last| order.contains(last));
+        let mut behind = after.is_none();
+        for id in order.into_iter().rev() {
+            if !behind {
+                if Some(id) == after {
+                    behind = true;
+                }
+                continue;
+            }
             if exclude_self && id == layer_id {
                 continue;
             }
@@ -2321,15 +2362,43 @@ impl Scene {
                 continue;
             }
             if self.hit_test_layer(l, lx, ly) {
-                // A disabled topmost hit stops the search with no layer (the
-                // reference sets `*lay = nullptr` and returns true).
-                if !get_disabled && !self.node_enabled(id) {
-                    return None;
-                }
-                return Some(id);
+                return Some(HitCandidate {
+                    layer: id,
+                    x: lx,
+                    y: ly,
+                });
             }
         }
         None
+    }
+
+    /// The layer a hit test that accepted `id` reports.
+    ///
+    /// `None` when the layer is disabled and `get_disabled` is false: the
+    /// search stops there and reports no layer.
+    pub fn layer_hit_outcome(&self, id: u32, get_disabled: bool) -> Option<u32> {
+        if !get_disabled && !self.node_enabled(id) {
+            return None;
+        }
+        Some(id)
+    }
+
+    /// Whether the layer accepts the hit test running on it.
+    ///
+    /// `None` when the layer does not exist.
+    pub fn hit_test_accepted(&self, id: u32) -> Option<bool> {
+        self.layer(id).map(|layer| layer.hit_test_accepted)
+    }
+
+    /// Set whether the layer accepts the hit test running on it.
+    ///
+    /// A layer that does not exist has no flag to set. The flag is neither
+    /// the layer's geometry nor its content, so the write touches neither
+    /// the structure revision nor the cached subtrees.
+    pub fn set_hit_test_accepted(&mut self, id: u32, accepted: bool) {
+        if let Some(layer) = self.layer_mut_untracked(id) {
+            layer.hit_test_accepted = accepted;
+        }
     }
 
     /// Whether `(x, y)`, in window coordinates, lies inside every ancestor
@@ -2387,8 +2456,8 @@ impl Scene {
     /// Reference `_HitTestNoVisibleCheck` (`LayerIntf.cpp:3229`). `htMask`
     /// compares the main-image alpha against `hit_threshold` (&#8804;0 accepts
     /// any pixel; 256 rejects everything); `htProvince` treats a non-zero
-    /// province byte as a hit. The `onHitTest` script hook is not dispatched
-    /// here.
+    /// province byte as a hit. Whether the hit stands is the caller's
+    /// decision; see [`Scene::layer_hit_next`].
     fn hit_test_layer(&self, layer: &LayerState, x: i32, y: i32) -> bool {
         match layer.hit_type {
             // htProvince = 1

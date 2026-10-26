@@ -217,10 +217,11 @@ fn color_rect_and_pixel_accessors() {
          var mask = l.getMaskPixel(0, 0); \
          l.setMaskPixel(1, 1, 128); \
          var mask2 = l.getMaskPixel(1, 1); \
-         l.setMainPixel(1, 0, 0xff00ff00); \
+         l.setMainPixel(1, 0, 0x00ff00); \
          var main2 = l.getMainPixel(1, 0);",
     );
-    // `getMainPixel` masks the alpha out (0x00RRGGBB).
+    // `getMainPixel` masks the alpha out (0x00RRGGBB)
+    // (`reference/cpp/core/visual/LayerIntf.cpp:2917-2923`).
     assert_eq!(env.eval_int("main"), 0x00ff_0000);
     assert_eq!(env.eval_int("mask"), 255);
     assert_eq!(env.eval_int("mask2"), 128);
@@ -233,8 +234,8 @@ fn flip_lr_and_ud_mirror_the_image() {
     let env = Env::new();
     layer_with_image(&env, 2, 1);
     env.run(
-        "l.setMainPixel(0, 0, 0xff0000ff); \
-         l.setMainPixel(1, 0, 0xffff0000); \
+        "l.setMainPixel(0, 0, 0x0000ff); \
+         l.setMainPixel(1, 0, 0xff0000); \
          l.flipLR(); \
          var left = l.getMainPixel(0, 0); \
          var right = l.getMainPixel(1, 0);",
@@ -251,7 +252,7 @@ fn copy_rect_copies_pixels_between_layers() {
         "var w = new Window(); \
          var a = new Layer(w, null); a.setImageSize(2, 2); \
          var b = new Layer(w, null); b.setImageSize(2, 2); \
-         a.setMainPixel(1, 1, 0xff123456); \
+         a.setMainPixel(1, 1, 0x123456); \
          b.copyRect(0, 0, a, 1, 1, 1, 1); \
          var p = b.getMainPixel(0, 0);",
     );
@@ -380,7 +381,7 @@ fn convert_type_round_trips_additive_alpha() {
     let env = Env::new();
     layer_with_image(&env, 1, 1);
     env.run(
-        "l.setMainPixel(0, 0, 0xff204080); \
+        "l.setMainPixel(0, 0, 0x204080); \
          l.setMaskPixel(0, 0, 128); \
          l.face = 4; \
          l.convertType(0); \
@@ -400,13 +401,13 @@ fn copy_to_bitmap_and_copy9patch() {
     let env = Env::new();
     layer_with_image(&env, 2, 2);
     env.run(
-        "l.setMainPixel(0, 0, 0xffabcdef); \
+        "l.setMainPixel(0, 0, 0xabcdef); \
          l.setMaskPixel(0, 0, 255); \
          var b = new Bitmap(1, 1); \
          l.copyToBitmapFromMainImage(b); \
          var p = b.getPixel(0, 0);",
     );
-    assert_eq!(env.eval_int("p"), 0xffab_cdef);
+    assert_eq!(env.eval_int("p"), 0xab_cdef);
     // A 1x1 source is too small for the 9-patch; the call is still valid.
     assert!(env.eval("l.copy9Patch(b)").is_ok());
 }

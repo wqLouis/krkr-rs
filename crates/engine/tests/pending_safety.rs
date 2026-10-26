@@ -72,8 +72,13 @@ fn a_short_province_plane_is_a_miss_and_a_no_op() {
     );
 
     // reference/cpp/core/visual/LayerIntf.cpp:3262-3278
-    assert_eq!(scene.layer_at(child, 0, 0, false, false), Some(child));
-    assert_eq!(scene.layer_at(child, 0, 1, false, false), None);
+    assert_eq!(
+        scene
+            .layer_hit_next(child, 0, 0, false, None)
+            .map(|candidate| candidate.layer),
+        Some(child)
+    );
+    assert!(scene.layer_hit_next(child, 0, 1, false, None).is_none());
 }
 
 /// The overlay mixes the decoded picture into the bound layer's MainImage

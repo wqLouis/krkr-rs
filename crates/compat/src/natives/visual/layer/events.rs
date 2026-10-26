@@ -10,6 +10,10 @@
 //! (`layer.onClick = function …`) shadows the method; the adapter resolves
 //! the object member by name and calls it.
 //!
+//! `onHitTest` is the one member that is not a no-op: the member is a plain
+//! setter for the layer's hit flag, and the hit test reads that flag back
+//! after it delivered the event, so the member is written out here.
+//!
 //! Argument counts follow the reference exactly: every handler builds its
 //! event object behind `TVP_ACTION_INVOKE_BEGIN(argnum, …)`
 //! (`reference/cpp/core/base/EventIntf.h:208-211`), whose first statement is
@@ -26,7 +30,10 @@ use std::ffi::{c_char, c_int, c_void};
 
 use tjs::{NativeInstanceMethodDef, Value};
 
-use crate::native_util::{report_error, set_void};
+use super::super::common::scene_mut;
+use super::{LayerInst, bound};
+use crate::native_util::{args, report_error, set_void};
+use crate::natives::system::value_as_bool;
 
 /// Define one event handler method with its reference `TVP_ACTION_INVOKE_BEGIN`
 /// argument count.
@@ -81,7 +88,6 @@ event_method!(on_blur, "onBlur", 1);
 event_method!(on_click, "onClick", 2);
 event_method!(on_double_click, "onDoubleClick", 2);
 event_method!(on_focus, "onFocus", 1);
-event_method!(on_hit_test, "onHitTest", 3);
 event_method!(on_key_down, "onKeyDown", 3);
 event_method!(on_key_press, "onKeyPress", 2);
 event_method!(on_key_up, "onKeyUp", 3);
@@ -103,6 +109,44 @@ event_method!(on_touch_rotate, "onTouchRotate", 6);
 event_method!(on_touch_scaling, "onTouchScaling", 5);
 event_method!(on_touch_up, "onTouchUp", 5);
 event_method!(on_transition_completed, "onTransitionCompleted", 2);
+
+/// `Layer.onHitTest(x, y, hit)` - set the layer's hit flag.
+///
+/// The member requires three arguments and stores the third one's truthiness
+/// as the layer's hit flag. The action owner is not called, so the member is
+/// a plain setter.
+extern "C" fn on_hit_test(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    if argc < 3 {
+        return report_error(out_error, "Layer.onHitTest: requires 3 arguments");
+    }
+    // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
+    let a = unsafe { args(argv, argc) };
+    let hit = value_as_bool(&a[2]);
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return report_error(out_error, "Layer.onHitTest: compat context is not bound");
+    };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for
+    // this script object; no `&mut` to it is live in `on_hit_test`.
+    let inst = unsafe { &*(instance as *const LayerInst) };
+    let Some(id) = inst.id else {
+        return report_error(out_error, "Layer.onHitTest: this layer is not constructed");
+    };
+    let scene = match scene_mut(&ctx) {
+        Ok(scene) => scene,
+        Err(error) => return report_error(out_error, &error),
+    };
+    scene.set_hit_test_accepted(id, hit);
+    set_void(out);
+    0
+}
 
 fn d(name: &'static str, f: tjs::NativeInstanceMethodFn) -> NativeInstanceMethodDef {
     NativeInstanceMethodDef { name, f }

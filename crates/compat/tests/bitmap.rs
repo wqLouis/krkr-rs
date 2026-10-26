@@ -207,8 +207,10 @@ fn load_populates_the_bitmap_and_returns_metainfo() {
     );
     assert_eq!(env.eval_int("b.width"), 2);
     assert_eq!(env.eval_int("b.height"), 2);
-    // Straight-alpha RGBA (1, 2, 3, 255) reads back as ARGB 0xff010203.
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0xff01_0203);
+    // Straight-alpha RGBA (1, 2, 3, 255) reads back as the colour
+    // 0x010203; the mask plane is a separate member
+    // (`reference/cpp/core/visual/BitmapIntf.cpp:51-58`, `:67-75`).
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x01_0203);
     assert_eq!(env.eval_int("b.getMaskPixel(0, 0)"), 255);
     assert_eq!(env.eval_int("meta.width"), 2);
     assert_eq!(env.eval_int("meta.height"), 2);
@@ -527,8 +529,8 @@ fn the_name_constructor_loads_the_storage_image() {
     // loads the named storage image.
     assert_eq!(env.eval_int("b.width"), 2);
     assert_eq!(env.eval_int("b.height"), 2);
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0xff01_0203);
-    assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0xff0a_0b0c);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x01_0203);
+    assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0x0a_0b0c);
 }
 
 #[test]
@@ -566,10 +568,15 @@ fn dropping_a_script_bitmap_releases_its_image() {
     let _lock = vm_lock();
     let env = Env::new(true);
 
-    env.run("var b = new Bitmap(2, 2); b.setPixel(0, 0, 0xff112233);");
+    env.run(
+        "var b = new Bitmap(2, 2); \
+         b.setPixel(0, 0, 0x112233); \
+         b.setMaskPixel(0, 0, 255);",
+    );
     let id = env._scene.bitmaps.last().expect("the script bitmap").id;
-    // reference/cpp/core/visual/BitmapIntf.cpp:60-63: `SetPixel` writes the
-    // object's image, so the scene holds the color as straight-alpha RGBA.
+    // reference/cpp/core/visual/BitmapIntf.cpp:60-66: `SetPixel` writes the
+    // object's image, so the scene holds the color as straight-alpha RGBA;
+    // the mask plane is written by `SetMaskPixel` (`:77-85`).
     assert_eq!(
         &env._scene.bitmap(id).expect("the image is real").rgba[..4],
         &[0x11, 0x22, 0x33, 0xff],
@@ -602,7 +609,7 @@ fn a_stored_member_result_does_not_pin_the_script_bitmap() {
         "function f() { var b = new Bitmap(2, 2); var p = b.getPixel(0, 0); } f(); System.doCompact();",
         "function read(b) { return b.getPixel(0, 0); } var b = new Bitmap(2, 2); var p = read(b); b = null; System.doCompact();",
         "var h = %[b: new Bitmap(2, 2)]; var p = h.b.getPixel(0, 0); h = null; System.doCompact();",
-        "var b = new Bitmap(2, 2); b.setPixel(0, 0, 0xff112233); b = null; System.doCompact();",
+        "var b = new Bitmap(2, 2); b.setPixel(0, 0, 0x112233); b = null; System.doCompact();",
     ];
     for (index, script) in scripts.iter().enumerate() {
         let env = Env::new(true);
@@ -653,12 +660,13 @@ fn load_into_a_resized_bitmap_installs_the_decoded_pixels() {
     assert_eq!(env.eval_int("b.width"), 2);
     assert_eq!(env.eval_int("b.height"), 2);
     assert_eq!(env.eval_int("b.bufferPitch"), 8);
-    // Straight-alpha RGBA (1, 2, 3, 255) reads back as ARGB 0xff010203, and
-    // every pixel comes from the decoded buffer, not the zero-filled resize.
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0xff01_0203);
-    assert_eq!(env.eval_int("b.getPixel(1, 0)"), 0xff04_0506);
-    assert_eq!(env.eval_int("b.getPixel(0, 1)"), 0xff07_0809);
-    assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0xff0a_0b0c);
+    // Straight-alpha RGBA (1, 2, 3, 255) reads back as the colour
+    // 0x010203, and every pixel comes from the decoded buffer, not the
+    // zero-filled resize.
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x01_0203);
+    assert_eq!(env.eval_int("b.getPixel(1, 0)"), 0x04_0506);
+    assert_eq!(env.eval_int("b.getPixel(0, 1)"), 0x07_0809);
+    assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0x0a_0b0c);
     assert_eq!(env.eval_int("b.getMaskPixel(0, 1)"), 255);
 
     let bitmap = env._scene.bitmaps.last().expect("the loaded image");
@@ -689,13 +697,13 @@ fn load_into_a_same_size_bitmap_installs_the_decoded_pixels() {
     let _lock = vm_lock();
     let env = Env::new(true);
 
-    env.run("var b = new Bitmap(2, 2); b.setPixel(0, 0, 0xff112233);");
+    env.run("var b = new Bitmap(2, 2); b.setPixel(0, 0, 0x112233);");
     env.run("b.load('images/test.img');");
 
     assert_eq!(env.eval_int("b.width"), 2);
     assert_eq!(env.eval_int("b.height"), 2);
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0xff01_0203);
-    assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0xff0a_0b0c);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x01_0203);
+    assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0x0a_0b0c);
 
     let bitmap = env._scene.bitmaps.last().expect("the loaded image");
     assert_eq!(bitmap.rgba.as_slice(), DECODED_RGBA.as_slice());
@@ -809,8 +817,8 @@ fn the_default_cache_limit_decodes_every_load() {
     // Each load installed the decoded buffer
     // (`reference/cpp/core/visual/BitmapIntf.cpp:98-106`).
     assert_eq!(env.eval_int("second.width"), 2);
-    assert_eq!(env.eval_int("second.getPixel(0, 0)"), 0xff01_0203);
-    assert_eq!(env.eval_int("second.getPixel(1, 1)"), 0xff0a_0b0c);
+    assert_eq!(env.eval_int("second.getPixel(0, 0)"), 0x01_0203);
+    assert_eq!(env.eval_int("second.getPixel(1, 1)"), 0x0a_0b0c);
 }
 
 /// A limit above zero enables the cache: the second load of the same name
@@ -847,7 +855,7 @@ fn an_enabled_cache_decodes_once_per_name() {
         );
     }
     assert_eq!(env.eval_int("second.width"), 2);
-    assert_eq!(env.eval_int("second.getPixel(0, 0)"), 0xff01_0203);
+    assert_eq!(env.eval_int("second.getPixel(0, 0)"), 0x01_0203);
 
     env.run("System.graphicCacheLimit = 0;");
     env.run("var third = new Bitmap(); third.load('images/test.img');");
@@ -881,7 +889,7 @@ fn a_cache_hit_returns_pristine_pixels_after_a_set_pixel_write() {
 
     env.run("System.graphicCacheLimit = 1048576;");
     env.run("var first = new Bitmap(); first.load('images/test.img');");
-    env.run("first.setPixel(0, 0, 0xff112233);");
+    env.run("first.setPixel(0, 0, 0x112233);");
     env.run("var second = new Bitmap(); second.load('images/test.img');");
 
     assert_eq!(
@@ -890,10 +898,10 @@ fn a_cache_hit_returns_pristine_pixels_after_a_set_pixel_write() {
         "the second load is a cache hit"
     );
     // The write reached only the first Bitmap.
-    assert_eq!(env.eval_int("first.getPixel(0, 0)"), 0xff11_2233);
+    assert_eq!(env.eval_int("first.getPixel(0, 0)"), 0x11_2233);
     // The reloaded Bitmap still has the decoded pixels.
-    assert_eq!(env.eval_int("second.getPixel(0, 0)"), 0xff01_0203);
-    assert_eq!(env.eval_int("second.getPixel(1, 1)"), 0xff0a_0b0c);
+    assert_eq!(env.eval_int("second.getPixel(0, 0)"), 0x01_0203);
+    assert_eq!(env.eval_int("second.getPixel(1, 1)"), 0x0a_0b0c);
 }
 
 /// Two different names occupy two cache entries: each decodes once and
@@ -956,10 +964,10 @@ fn two_different_names_are_cached_separately() {
     );
     // The files start with 'A' (0x41) and 'B' (0x42): each reload reads its
     // own entry's pixels.
-    assert_eq!(env.eval_int("alpha.getPixel(0, 0)"), 0xff41_4141);
-    assert_eq!(env.eval_int("alphaAgain.getPixel(0, 0)"), 0xff41_4141);
-    assert_eq!(env.eval_int("beta.getPixel(0, 0)"), 0xff42_4242);
-    assert_eq!(env.eval_int("betaAgain.getPixel(0, 0)"), 0xff42_4242);
+    assert_eq!(env.eval_int("alpha.getPixel(0, 0)"), 0x41_4141);
+    assert_eq!(env.eval_int("alphaAgain.getPixel(0, 0)"), 0x41_4141);
+    assert_eq!(env.eval_int("beta.getPixel(0, 0)"), 0x42_4242);
+    assert_eq!(env.eval_int("betaAgain.getPixel(0, 0)"), 0x42_4242);
 }
 
 /// A bitmap that declares its size and holds no pixels answers a pixel read
@@ -1002,7 +1010,7 @@ fn a_pixel_member_on_a_bufferless_bitmap_is_the_out_of_range_answer() {
     assert_eq!(env.eval_int("b.getMaskPixel(1, 1)"), 0);
     // reference/cpp/core/visual/BitmapIntf.cpp:66, :84 — the writes keep the
     // declared size and touch no bytes.
-    env.run("b.setPixel(0, 0, 0xff112233); b.setMaskPixel(1, 1, 255);");
+    env.run("b.setPixel(0, 0, 0x112233); b.setMaskPixel(1, 1, 255);");
     assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0);
     assert_eq!(env.eval_int("b.getMaskPixel(1, 1)"), 0);
     assert_eq!(env.eval_int("b.width"), 2);

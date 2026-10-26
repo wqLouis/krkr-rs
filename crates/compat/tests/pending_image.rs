@@ -30,17 +30,13 @@ fn image() -> DecodedImage {
     )
 }
 
-/// The ARGB value of the first pixel of [`image`], as `Bitmap.getPixel`
-/// reports it.
-const FIRST_PIXEL: i64 = 0xFF01_0203;
+/// The RGB value of the first pixel of [`image`], as `Bitmap.getPixel` and
+/// `Layer.getMainPixel` report it: both members mask the alpha away.
+const FIRST_PIXEL: i64 = 0x01_0203;
 
 /// The RGB value of the first pixel of [`image`]: the colour key the keyed
 /// loads use.
 const COLOR_KEY: u32 = 0x01_0203;
-
-/// The RGB value of the first pixel of [`image`], as `Layer.getMainPixel`
-/// reports it: that member masks the alpha away.
-const FIRST_LAYER_PIXEL: i64 = FIRST_PIXEL & 0x00ff_ffff;
 
 /// The bytes of the picture the storage holds.
 const PICTURE: &[u8] = b"not-a-real-image";
@@ -437,7 +433,7 @@ fn a_layer_loading_the_same_image_twice_keeps_the_pixels() {
     );
     assert_eq!(
         env.eval_int("l.getMainPixel(0, 0)"),
-        FIRST_LAYER_PIXEL,
+        FIRST_PIXEL,
         "the layer holds the decoded pixels"
     );
 }
@@ -488,12 +484,12 @@ fn two_loads_of_the_same_image_in_one_frame_share_one_decode() {
     // Both layers hold the decoded pixels.
     assert_eq!(
         env.eval_int("l1.getMainPixel(0, 0)"),
-        FIRST_LAYER_PIXEL,
+        FIRST_PIXEL,
         "the first layer holds the decoded pixels"
     );
     assert_eq!(
         env.eval_int("l2.getMainPixel(0, 0)"),
-        FIRST_LAYER_PIXEL,
+        FIRST_PIXEL,
         "the second layer holds the decoded pixels"
     );
 }
@@ -527,7 +523,7 @@ fn the_image_size_is_known_before_the_pixels_land() {
     );
     assert_eq!(
         env.eval_int("l.getMainPixel(0, 0)"),
-        FIRST_LAYER_PIXEL,
+        FIRST_PIXEL,
         "the pixel read waits for the decode"
     );
 }
@@ -605,7 +601,7 @@ fn a_deferred_colour_keyed_bitmap_load_applies_the_key_on_the_worker() {
     );
     assert_eq!(
         env.eval_int("b.getPixel(1, 0)"),
-        0xFF04_0506,
+        0x04_0506,
         "a different colour stays opaque"
     );
     let bitmap = env.scene.bitmaps.first().expect("the bitmap exists");
@@ -1004,7 +1000,7 @@ fn a_copied_image_replaces_a_pending_destination_bitmap() {
     );
     env.scene.resolve_pending_images();
     assert_eq!(
-        env.eval_int("b.getPixel(0, 0) & 0xffffff"),
+        env.eval_int("b.getPixel(0, 0)"),
         0x00ff00,
         "the copied pixels survive the image barrier"
     );

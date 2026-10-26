@@ -16,8 +16,8 @@ use tjs::{
 };
 
 use super::common::{
-    argb_to_rgba, bound, decode_pool_mut, resolve_object_id, rgba_to_argb, scene_mut, scene_ref,
-    set_retained_out,
+    actual_color_bytes, bound, decode_pool_mut, resolve_object_id, rgba_to_argb, scene_mut,
+    scene_ref, set_retained_out,
 };
 use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
@@ -562,7 +562,7 @@ extern "C" fn bitmap_ctor(
     0
 }
 
-/// `Bitmap.getPixel(x, y)` → ARGB.
+/// `Bitmap.getPixel(x, y)` → the pixel's `0x00RRGGBB` colour.
 extern "C" fn bitmap_get_pixel(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -593,11 +593,12 @@ extern "C" fn bitmap_get_pixel(
     };
     // The image may still be decoding: the pixel is the decoded one.
     scene.resolve_bitmap(id);
-    set_int(out, read_bitmap_pixel(scene, id, x, y));
+    set_int(out, read_bitmap_pixel(scene, id, x, y) & 0x00ff_ffff);
     0
 }
 
-/// `Bitmap.setPixel(x, y, color)`.
+/// `Bitmap.setPixel(x, y, color)` → the red, green and blue planes; the
+/// mask plane is held.
 extern "C" fn bitmap_set_pixel(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -614,7 +615,7 @@ extern "C" fn bitmap_set_pixel(
     let a = unsafe { args(argv, argc) };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
-    let color = argb_to_rgba(value_as_i64(&a[2]));
+    let color = actual_color_bytes(value_as_i64(&a[2]));
     // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; no `&mut` to it is live in `bitmap_set_pixel`.
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
@@ -629,7 +630,7 @@ extern "C" fn bitmap_set_pixel(
     };
     // The image may still be decoding: the pixel is the decoded one.
     scene.resolve_bitmap(id);
-    write_bitmap_pixel(scene, id, x, y, color, false);
+    write_bitmap_pixel(scene, id, x, y, color);
     set_void(out);
     0
 }
@@ -790,15 +791,9 @@ fn read_bitmap_pixel(scene: &Scene, id: u32, x: i32, y: i32) -> i64 {
     }
 }
 
-/// Write one bitmap pixel. `hold_alpha` keeps the destination alpha.
-fn write_bitmap_pixel(
-    scene: &mut Scene,
-    id: u32,
-    x: i32,
-    y: i32,
-    color: [u8; 4],
-    hold_alpha: bool,
-) {
+/// Write one bitmap pixel's red, green and blue bytes. The mask byte is
+/// left as it is.
+fn write_bitmap_pixel(scene: &mut Scene, id: u32, x: i32, y: i32, rgb: [u8; 3]) {
     if x < 0 || y < 0 {
         return;
     }
@@ -808,13 +803,7 @@ fn write_bitmap_pixel(
     let Some(range) = pixel_range(bitmap, x, y) else {
         return;
     };
-    if hold_alpha {
-        bitmap.rgba[range.start] = color[0];
-        bitmap.rgba[range.start + 1] = color[1];
-        bitmap.rgba[range.start + 2] = color[2];
-    } else {
-        bitmap.rgba[range].copy_from_slice(&color);
-    }
+    bitmap.rgba[range.start..range.start + 3].copy_from_slice(&rgb);
     bitmap.mark_dirty();
 }
 

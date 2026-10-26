@@ -1617,18 +1617,20 @@ extern "C" fn layer_get_layer_at(
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.getLayerAt: this layer is not constructed");
     };
-    let hit = {
+    // The hit test reads a layer's main image: an image whose decode has
+    // not landed yet is waited for first.
+    let window = scene_ref(&ctx)
+        .ok()
+        .and_then(|scene| scene.layer(id))
+        .map(|layer| layer.window);
+    if let Some(window) = window {
         let scene = match scene_mut(&ctx) {
             Ok(scene) => scene,
             Err(error) => return report_error(out_error, &error),
         };
-        // The hit test reads a layer's main image: an image whose decode has
-        // not landed yet is waited for first.
-        if let Some(window) = scene.layer(id).map(|layer| layer.window) {
-            crate::event::resolve_layer_images(scene, window);
-        }
-        scene.layer_at(id, x, y, exclude_self, get_disabled)
-    };
+        crate::event::resolve_layer_images(scene, window);
+    }
+    let hit = crate::event::hit_test(&ctx, id, x, y, exclude_self, get_disabled);
     let object =
         hit.and_then(|layer| duplicate_object(&ctx, resolved.engine(), ObjectKind::Layer, layer));
     set_object_out(resolved.engine(), out, object.as_ref());

@@ -16,7 +16,7 @@ use tjs::{
 use crate::CompatCtx;
 use crate::collections::Map;
 use crate::native_util::set_void;
-use crate::natives::system::resolve;
+use crate::natives::system::{resolve, to_actual_color};
 
 /// Default font face used when a `Font` is created without a face (the
 /// reference `TVPDefaultFontFaceName`).
@@ -348,6 +348,18 @@ pub(crate) fn rgba_to_argb(color: [u8; 4]) -> i64 {
         | (i64::from(color[0]) << 16)
         | (i64::from(color[1]) << 8)
         | i64::from(color[2])
+}
+
+/// The red, green and blue bytes a pixel setter writes for `color`.
+///
+/// A colour whose high byte is set names a system colour (`clWindow`,
+/// `clScrollBar`, ...): it is resolved through the system-colour table and
+/// its red and blue bytes are swapped. Every other colour passes through
+/// unchanged, so `0x00RRGGBB` writes the red, green and blue planes as they
+/// are and never names an alpha.
+pub(crate) fn actual_color_bytes(color: i64) -> [u8; 3] {
+    let rgb = to_actual_color(color as u32);
+    [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8]
 }
 
 /// Which [`ObjectRegistry`] map an id belongs to.

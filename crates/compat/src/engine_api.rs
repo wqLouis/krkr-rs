@@ -26,6 +26,10 @@ pub(crate) use engine::{
     TransitionFrame,
 };
 
+// The hit test's candidate: the layer that hit and the point in its own
+// coordinates.
+pub(crate) use engine::scene::HitCandidate;
+
 // The storage namespace: mounts, archive names, locations and typed read errors.
 pub(crate) use engine::{Location, Storage, StorageReadError, normalize_in_archive_name};
 

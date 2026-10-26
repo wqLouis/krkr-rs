@@ -36,9 +36,9 @@ fn image() -> DecodedImage {
     )
 }
 
-/// The ARGB value of the first pixel of [`image`], as `Bitmap.getPixel`
-/// reports it.
-const FIRST_PIXEL: i64 = 0xFF0A_141E;
+/// The RGB value of the first pixel of [`image`], as `Bitmap.getPixel`
+/// reports it: that member masks the alpha away.
+const FIRST_PIXEL: i64 = 0x0A_141E;
 
 /// The decoder the pool drives: every decode produces [`image`], unless the
 /// decoder was built to fail.

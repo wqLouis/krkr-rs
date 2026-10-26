@@ -111,29 +111,77 @@ residuals:
   '/', '\\' or '>'; got …"`; the reference raises
   `TVPMissingPathDelimiterAtLast` = `"Use path delimiter '>' or '/'"`
   (`MsgIntfInc.h:32`) — script-observable.
-* **`Layer.face` is one value, not the reference's two faces.** The reference
-  keeps an outward face and an actual draw face: `Face` and `DrawFace`, with
-  `SetFace` storing the outward value and calling `UpdateDrawFace()` to
-  resolve the actual one (`LayerIntf.h:738-750`, `LayerIntf.h:352`). The
-  outward face defaults to `dfAuto` and the resolution table maps the layer's
-  display type onto `dfOpaque`/`dfAlpha`/`dfAddAlpha`
-  (`LayerIntf.cpp:371`, `LayerIntf.cpp:1525-1600`; the values are
-  `tTVPDrawFace`, `LayerIntf.h:59-70`, also listed at
-  `ScriptMgnIntf.cpp:75`). The face then selects the blend *method* together
-  with the operation mode: `omAlpha`/`omAddAlpha`/`omOpaque` ×
-  `dfAlpha`/`dfAddAlpha`/`dfOpaque` pick `bmAlphaOnAlpha`,
-  `bmAlphaOnAddAlpha`, `bmAlpha`, `bmAddAlphaOnAlpha`,
-  `bmAddAlphaOnAddAlpha`, `bmAddAlpha`, `bmCopyOnAlpha`,
-  `bmCopyOnAddAlpha` and `bmCopy` (`ImageFunction.cpp:78-130`).
-  Ours stores a single `face: i32` that defaults to `0`
-  (`engine/src/scene.rs`, `LayerState::face`) and the steady-state
-  projection always draws the main image; only `dfMask`/`dfProvince` reach
-  the subtree path (`engine/src/layer_ops.rs`, `subtree_source`). So
-  `Layer.face` returns `0` where the reference returns `128` (`dfAuto`),
-  `dfAuto` and `dfAddAlpha` are inert, and an explicit `dfOpaque` does not
-  change the blend. Closing this needs the engine's blend dispatcher to carry
-  the "on alpha" and "on add alpha" variants; until then the divergence is
-  observable whenever a script sets the face explicitly or reads the property.
+* **The face selects the blend *method*, but the engine's blend table has
+  no per-method kernels.** The layer now keeps the reference's two faces: the
+  outward face the script reads and writes (defaulting to `dfAuto` = `128`)
+  and the actual draw face the operations use, resolved from the layer's
+  display type (`LayerIntf.h:738-750`, `LayerIntf.cpp:371-372`,
+  `:1525-1618`), so `Layer.face` returns the reference's number, a type
+  change resolves the face again (`LayerIntf.cpp:1910`, `:1517-1518`) and
+  the pixel operations follow the resolved face. What is left is the
+  *arithmetic* of the face-selected blend methods: the reference picks
+  `bmAlphaOnAlpha`, `bmAlphaOnAddAlpha`, `bmAlpha`,
+  `bmAddAlphaOnAlpha`, `bmAddAlphaOnAddAlpha`, `bmAddAlpha`,
+  `bmCopyOnAlpha`, `bmCopyOnAddAlpha` and `bmCopy` from the operation mode
+  and the draw face (`ImageFunction.cpp:78-130`,
+  `LayerIntf.cpp:4118-4271`), and each method has its own arithmetic
+  (`LayerBitmapIntf.cpp:1580-1830`). The engine's blend table is keyed by
+  the operation mode alone (`engine/src/layer_ops.rs`, `mode_kernel`), so
+  the face reaches the blend only through the destination-alpha handling: the
+  layer's `holdAlpha` argument reaches a face-selected blend on an opaque
+  face only, because the `OnAlpha`/`OnAddAlpha` methods handle the
+  destination's alpha themselves. `bmCopyOnAlpha` copies the source as an
+  opaque image — the destination's alpha becomes opaque
+  (`LayerBitmapIntf.cpp:1611-1622`, `tvpgl.cpp:3326-3380`) — where the
+  engine's copy keeps the source's alpha, and `bmAddAlphaOnAlpha` is not
+  implemented in the reference at all (`LayerBitmapIntf.cpp:1705-1708`) where
+  the engine blends it. The `ImageFunction`'s own mapping
+  (`natives/image_function.rs`, `blit_method`) holds the destination's alpha
+  on a non-opaque face, which the reference does not do; it is left as it is
+  until the engine's blend dispatcher carries the per-method kernels.
+  Closing this needs that dispatcher to carry them.
+* **The container layer types still collapse, and so does the primary
+  layer's type.** `ltBinder` (0), `ltEffect` (6) and `ltFilter` (7) read
+  back as `ltAlpha` (2) (`natives/visual/layer/blend.rs`), so the
+  resolution table's default arm (`dfOpaque`, `LayerIntf.cpp:1611-1613`) is
+  unreachable and those layers resolve to `dfAlpha`; the reference gives them
+  no image, so no face-sensitive operation can observe the difference there.
+  The reference's primary layer is `ltOpaque` (`LayerIntf.cpp:469`,
+  `:503`), so its face resolves to `dfOpaque`, while ours is `ltAlpha` and
+  resolves to `dfAlpha`.
+* **The window's outer-rect members report the platform window's values,
+  not the reference frontend's.** The reference's window form ignores
+  `setPos`, `setMinSize` and `setMaxSize`, and its getters report
+  `left`/`top` = 0, `minWidth`/`minHeight` = 0, `maxWidth`/`maxHeight` =
+  1920/1080 and `borderStyle` = `bsNone`
+  (`reference/cpp/core/environ/impl/TVPWindow.h:97-124`, the block the
+  frontend marks "dummy function"; the native class only forwards,
+  `reference/cpp/core/visual/WindowIntf.cpp:855-884`). Those are the
+  Cocos2d frontend's values, not the engine's: the engine keeps whatever
+  the form reports (`reference/cpp/core/visual/impl/WindowImpl.cpp:1559-1660`),
+  and the engine-level rule in this family is the full-screen guard, which
+  is implemented (`reference/cpp/core/visual/impl/WindowImpl.cpp:1183-1188`).
+  Ours reports the values the platform window has, so a script that reads
+  `win.maxWidth` sees what the platform says rather than the frontend's
+  1920 — the divergence is scoped to the frontend's stub values.
+* **A negative window size is clamped to zero.** The engine forwards the size
+  it was given to the window form without validating it
+  (`reference/cpp/core/visual/impl/WindowImpl.cpp:1583-1588`), and the
+  engine models a layer's size as unsigned
+  (`reference/cpp/core/visual/LayerIntf.cpp:2250-2252`), so neither raises
+  nor clamps a negative window size. Ours clamps it to 0 because the L2
+  window size is unsigned (`crates/engine/src/scene.rs`,
+  `WindowState::inner_size`). A signed L2 size would carry the value the way
+  the reference does; until then a negative size is a zero size here.
+* **`Window.update(type)` cannot narrow the redraw.** The argument handling
+  is the engine's own and is implemented: the type is read from the first
+  argument, and only when a second argument is present
+  (`reference/cpp/core/visual/WindowIntf.cpp:769-778`; the type is
+  `utNormal`/`utEntire`, `reference/cpp/core/visual/WindowIntf.h:36-39`).
+  What the type *does* is the frontend's: the reference's window form
+  ignores it (`reference/cpp/core/environ/impl/TVPWindow.h:458-467`) and
+  ours is drained without being read (`crates/app/src/game.rs`), so an
+  update redraws the whole window in both.
 
 ## 5. Dialogs and popups
 

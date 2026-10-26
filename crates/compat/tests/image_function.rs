@@ -102,9 +102,12 @@ fn fill_rect_replaces_rgb_and_alpha_and_reports_the_region() {
     // (`reference/cpp/core/visual/ImageFunction.cpp:787-859`).
     env.run("var r = ImageFunction.fillRect(b, 0xff112233, new Rect(1, 1, 3, 3), true, null);");
     assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0);
-    assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0xff112233);
-    assert_eq!(env.eval_int("b.getPixel(2, 2)"), 0xff112233);
+    assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0x11_2233);
+    assert_eq!(env.eval_int("b.getPixel(2, 2)"), 0x11_2233);
     assert_eq!(env.eval_int("b.getPixel(3, 3)"), 0);
+    // The alpha plane the fill wrote is a separate member
+    // (`reference/cpp/core/visual/BitmapIntf.cpp:67-75`).
+    assert_eq!(env.eval_int("b.getMaskPixel(1, 1)"), 255);
     // The returned update region is a real `Rect`.
     assert_eq!(env.eval_int("r.left"), 1);
     assert_eq!(env.eval_int("r.top"), 1);
@@ -116,33 +119,44 @@ fn fill_rect_replaces_rgb_and_alpha_and_reports_the_region() {
 fn fill_rect_without_alpha_holds_the_destination_alpha() {
     let _lock = vm_lock();
     let env = Env::new();
-    env.run("var b = new Bitmap(1, 1); b.setPixel(0, 0, 0x80000000);");
+    env.run(
+        "var b = new Bitmap(1, 1); \
+         b.setPixel(0, 0, 0x00ff00); \
+         b.setMaskPixel(0, 0, 0x80);",
+    );
     // `isalpha = false` maps to `FillColor`, which holds alpha.
     env.run("ImageFunction.fillRect(b, 0xff0000ff, null, false, null);");
     // RGB becomes the requested blue; the 0x80 alpha is preserved.
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x800000ff);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x00_00ff);
+    assert_eq!(env.eval_int("b.getMaskPixel(0, 0)"), 0x80);
 }
 
 #[test]
 fn color_rect_mask_face_writes_the_alpha_channel() {
     let _lock = vm_lock();
     let env = Env::new();
-    env.run("var b = new Bitmap(1, 1); b.setPixel(0, 0, 0xff102030);");
+    env.run("var b = new Bitmap(1, 1); b.setPixel(0, 0, 0x102030);");
     // `dfMask` replaces the alpha plane from the low byte (blue)
     // (`reference/cpp/core/visual/ImageFunction.cpp:861-965`).
     env.run("ImageFunction.colorRect(b, 0x0000007f, 255, null, dfMask, null);");
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x7f102030);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x10_2030);
+    assert_eq!(env.eval_int("b.getMaskPixel(0, 0)"), 0x7f);
 }
 
 #[test]
 fn color_rect_opaque_face_sets_rgb_and_holds_alpha() {
     let _lock = vm_lock();
     let env = Env::new();
-    env.run("var b = new Bitmap(1, 1); b.setPixel(0, 0, 0x80112233);");
+    env.run(
+        "var b = new Bitmap(1, 1); \
+         b.setPixel(0, 0, 0x112233); \
+         b.setMaskPixel(0, 0, 0x80);",
+    );
     // `dfOpaque` holds the destination alpha
     // (`reference/cpp/core/visual/ImageFunction.cpp:861-965`).
     env.run("ImageFunction.colorRect(b, 0xff445566, 255, null, dfOpaque, null);");
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x80445566);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x44_5566);
+    assert_eq!(env.eval_int("b.getMaskPixel(0, 0)"), 0x80);
 }
 
 #[test]
@@ -151,15 +165,15 @@ fn flip_lr_mirrors_a_region_in_place() {
     let env = Env::new();
     env.run(
         "var b = new Bitmap(4, 1); \
-         b.setPixel(0, 0, 0xff000001); b.setPixel(1, 0, 0xff000002); \
-         b.setPixel(2, 0, 0xff000003); b.setPixel(3, 0, 0xff000004);",
+         b.setPixel(0, 0, 0x000001); b.setPixel(1, 0, 0x000002); \
+         b.setPixel(2, 0, 0x000003); b.setPixel(3, 0, 0x000004);",
     );
     env.run("ImageFunction.flipLR(b, new Rect(1, 0, 3, 1));");
     // Reference: `flipLR` `reference/cpp/core/visual/ImageFunction.cpp:531-569`.
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0xff000001);
-    assert_eq!(env.eval_int("b.getPixel(1, 0)"), 0xff000003);
-    assert_eq!(env.eval_int("b.getPixel(2, 0)"), 0xff000002);
-    assert_eq!(env.eval_int("b.getPixel(3, 0)"), 0xff000004);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x00_0001);
+    assert_eq!(env.eval_int("b.getPixel(1, 0)"), 0x00_0003);
+    assert_eq!(env.eval_int("b.getPixel(2, 0)"), 0x00_0002);
+    assert_eq!(env.eval_int("b.getPixel(3, 0)"), 0x00_0004);
 }
 
 #[test]
@@ -168,14 +182,14 @@ fn flip_ud_mirrors_the_full_bitmap() {
     let env = Env::new();
     env.run(
         "var b = new Bitmap(1, 3); \
-         b.setPixel(0, 0, 0xff000001); b.setPixel(0, 1, 0xff000002); \
-         b.setPixel(0, 2, 0xff000003);",
+         b.setPixel(0, 0, 0x000001); b.setPixel(0, 1, 0x000002); \
+         b.setPixel(0, 2, 0x000003);",
     );
     env.run("ImageFunction.flipUD(b, null);");
     // Reference: `flipUD` `reference/cpp/core/visual/ImageFunction.cpp:571-609`.
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0xff000003);
-    assert_eq!(env.eval_int("b.getPixel(0, 1)"), 0xff000002);
-    assert_eq!(env.eval_int("b.getPixel(0, 2)"), 0xff000001);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x00_0003);
+    assert_eq!(env.eval_int("b.getPixel(0, 1)"), 0x00_0002);
+    assert_eq!(env.eval_int("b.getPixel(0, 2)"), 0x00_0001);
 }
 
 #[test]
@@ -193,23 +207,33 @@ fn flip_rejects_an_out_of_bounds_rectangle() {
 fn do_gray_scale_uses_the_reference_luma() {
     let _lock = vm_lock();
     let env = Env::new();
-    env.run("var b = new Bitmap(1, 1); b.setPixel(0, 0, 0xffff0000);");
+    env.run(
+        "var b = new Bitmap(1, 1); \
+         b.setPixel(0, 0, 0xff0000); \
+         b.setMaskPixel(0, 0, 255);",
+    );
     env.run("ImageFunction.doGrayScale(b, null);");
     // The reference luma is `(54*R + 183*G + 19*B) >> 8` and the packed
     // colour's low byte is blue (`tvpgl.h:1102-1103`), so pure red is
     // `(54*255) >> 8 == 53 == 0x35` (`tvpgl.cpp:10350-10400`).
     // `doGrayScale` itself is `reference/cpp/core/visual/ImageFunction.cpp:747-785`.
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0xff353535);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x35_3535);
+    assert_eq!(env.eval_int("b.getMaskPixel(0, 0)"), 255);
 }
 
 #[test]
 fn adjust_gamma_with_identity_data_is_a_no_op() {
     let _lock = vm_lock();
     let env = Env::new();
-    env.run("var b = new Bitmap(1, 1); b.setPixel(0, 0, 0x80808080);");
+    env.run(
+        "var b = new Bitmap(1, 1); \
+         b.setPixel(0, 0, 0x808080); \
+         b.setMaskPixel(0, 0, 0x80);",
+    );
     // Identity gamma is a no-op (`reference/cpp/core/visual/ImageFunction.cpp:611-683`).
     env.run("ImageFunction.adjustGamma(b, 1.0, 0, 255, 1.0, 0, 255, 1.0, 0, 255, null, false);");
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x80808080);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x80_8080);
+    assert_eq!(env.eval_int("b.getMaskPixel(0, 0)"), 0x80);
 }
 
 #[test]
@@ -218,13 +242,15 @@ fn do_box_blur_averages_over_the_kernel() {
     let env = Env::new();
     env.run(
         "var b = new Bitmap(3, 1); \
-         b.setPixel(0, 0, 0xff000000); b.setPixel(1, 0, 0xffffffff); \
-         b.setPixel(2, 0, 0xff000000);",
+         b.setPixel(0, 0, 0x000000); b.setMaskPixel(0, 0, 255); \
+         b.setPixel(1, 0, 0xffffff); b.setMaskPixel(1, 0, 255); \
+         b.setPixel(2, 0, 0x000000); b.setMaskPixel(2, 0, 255);",
     );
     env.run("ImageFunction.doBoxBlur(b, 1, 0, null, true);");
     // A 1x3 horizontal box average of (0, 255, 0) is 85 == 0x55
     // (`reference/cpp/core/visual/ImageFunction.cpp:685-745`).
-    assert_eq!(env.eval_int("b.getPixel(1, 0)"), 0xff555555);
+    assert_eq!(env.eval_int("b.getPixel(1, 0)"), 0x55_5555);
+    assert_eq!(env.eval_int("b.getMaskPixel(1, 0)"), 255);
 }
 
 #[test]
@@ -233,14 +259,15 @@ fn operate_rect_copies_a_source_region() {
     let env = Env::new();
     env.run(
         "var dst = new Bitmap(2, 2); var src = new Bitmap(1, 1); \
-         src.setPixel(0, 0, 0xff112233);",
+         src.setPixel(0, 0, 0x112233); src.setMaskPixel(0, 0, 255);",
     );
     // `omOpaque` + `dfOpaque` is the reference `bmCopy` (alpha included)
     // (`reference/cpp/core/visual/ImageFunction.cpp:310-406`).
     env.run(
         "ImageFunction.operateRect(dst, 1, 1, src, null, null, omOpaque, dfOpaque, 255, false);",
     );
-    assert_eq!(env.eval_int("dst.getPixel(1, 1)"), 0xff112233);
+    assert_eq!(env.eval_int("dst.getPixel(1, 1)"), 0x11_2233);
+    assert_eq!(env.eval_int("dst.getMaskPixel(1, 1)"), 255);
     assert_eq!(env.eval_int("dst.getPixel(0, 0)"), 0);
 }
 
@@ -250,7 +277,7 @@ fn operate_stretch_scales_into_the_destination_rect() {
     let env = Env::new();
     env.run(
         "var dst = new Bitmap(2, 2); var src = new Bitmap(1, 1); \
-         src.setPixel(0, 0, 0xff00ff00);",
+         src.setPixel(0, 0, 0x00ff00); src.setMaskPixel(0, 0, 255);",
     );
     env.run(
         "ImageFunction.operateStretch(dst, src, new Rect(0, 0, 2, 2), new Rect(0, 0, 1, 1), \
@@ -258,7 +285,7 @@ fn operate_stretch_scales_into_the_destination_rect() {
     );
     // Reference: `operateStretch` `reference/cpp/core/visual/ImageFunction.cpp:408-529`.
     for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-        assert_eq!(env.eval_int(&format!("dst.getPixel({x}, {y})")), 0xff00ff00);
+        assert_eq!(env.eval_int(&format!("dst.getPixel({x}, {y})")), 0x00_ff00);
     }
 }
 
@@ -268,7 +295,7 @@ fn operate_affine_points_mode_maps_the_source_quad() {
     let env = Env::new();
     env.run(
         "var dst = new Bitmap(2, 2); var src = new Bitmap(1, 1); \
-         src.setPixel(0, 0, 0xffff0000);",
+         src.setPixel(0, 0, 0xff0000); src.setMaskPixel(0, 0, 255);",
     );
     // The source rect's LT/RT/LB corners map to (0,0)/(2,0)/(0,2)
     // (`reference/cpp/core/visual/ImageFunction.cpp:188-308`).
@@ -277,7 +304,7 @@ fn operate_affine_points_mode_maps_the_source_quad() {
          omOpaque, dfOpaque, 255, 0, false);",
     );
     for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-        assert_eq!(env.eval_int(&format!("dst.getPixel({x}, {y})")), 0xffff0000);
+        assert_eq!(env.eval_int(&format!("dst.getPixel({x}, {y})")), 0xff_0000);
     }
 }
 
@@ -290,7 +317,7 @@ fn operate_affine_writes_inside_the_clip_rect_alone() {
     let env = Env::new();
     env.run(
         "var dst = new Bitmap(2, 2); var src = new Bitmap(1, 1); \
-         src.setPixel(0, 0, 0xffff0000);",
+         src.setPixel(0, 0, 0xff0000); src.setMaskPixel(0, 0, 255);",
     );
     // The source rect's LT/RT/LB corners map to (0,0)/(2,0)/(0,2), and the
     // clip rectangle keeps the pass inside its top-left pixel.
@@ -298,7 +325,7 @@ fn operate_affine_writes_inside_the_clip_rect_alone() {
         "ImageFunction.operateAffine(dst, src, 0, 0, 2, 0, 0, 2, null, new Rect(0, 0, 1, 1), \
          false, omOpaque, dfOpaque, 255, 0, false);",
     );
-    assert_eq!(env.eval_int("dst.getPixel(0, 0)"), 0xffff0000);
+    assert_eq!(env.eval_int("dst.getPixel(0, 0)"), 0xff_0000);
     assert_eq!(env.eval_int("dst.getPixel(1, 0)"), 0);
     assert_eq!(env.eval_int("dst.getPixel(0, 1)"), 0);
     assert_eq!(env.eval_int("dst.getPixel(1, 1)"), 0);
