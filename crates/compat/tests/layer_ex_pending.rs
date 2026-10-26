@@ -405,7 +405,8 @@ fn a_pending_layer_image_survives_a_size_change() {
     let env = Env::with_pool();
     env.run(
         "var w = new Window(); \
-         var dst = new Layer(w, null); \
+         var screen = new Layer(w, null); \
+         var dst = new Layer(w, screen); \
          dst.name = 'dst'; \
          dst.loadImages('picture.png');",
     );
@@ -416,6 +417,11 @@ fn a_pending_layer_image_survives_a_size_change() {
         [10, 20, 30, 255],
         "the decoded overlap survives the resize"
     );
+    // The layer has a parent, so it keeps the constructor's transparent
+    // neutral colour and the expansion is transparent
+    // (`reference/cpp/core/visual/LayerIntf.cpp:332-334`). The window's
+    // primary layer carries the opaque one instead
+    // (`reference/cpp/core/visual/LayerIntf.cpp:469-471`).
     assert_eq!(env.pixel("dst", 3, 3)[3], 0, "the expansion is transparent");
 }
 

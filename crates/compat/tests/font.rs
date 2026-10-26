@@ -702,9 +702,14 @@ fn layer_draw_text_prerendered_pixels_match_the_coverage() {
     let game_dir = env.game_dir().expect("game dir").clone();
     std::fs::write(game_dir.join("Pre"), &font_bytes).expect("write face");
     std::fs::write(game_dir.join("sample.tft"), build_tft(&[b'A' as u16], 3)).expect("write tft");
+    // The canvas is a layer with a parent: the window's primary layer grows
+    // its image into an opaque backdrop
+    // (`reference/cpp/core/visual/LayerIntf.cpp:469-470`), and the test
+    // pins the painted glyph alone.
     env.run(
         "var w = new Window(); \
-         var l = new Layer(w, null); \
+         var base = new Layer(w, null); \
+         var l = new Layer(w, base); \
          l.setImageSize(64, 64); \
          var f = new Font('Pre', 12, 0); \
          f.mapPrerenderedFont('sample.tft'); \
@@ -788,9 +793,14 @@ fn a_prerendered_fallback_glyph_sits_on_the_truncated_ascent() {
     std::fs::write(game_dir.join("Pre.ttf"), &font_bytes).expect("write face");
     // The `.tft` carries only 'A', so 'B' takes the rasterizer's path.
     std::fs::write(game_dir.join("sample.tft"), build_tft(&[b'A' as u16], 3)).expect("write tft");
+    // The canvas is a layer with a parent: the window's primary layer grows
+    // its image into an opaque backdrop
+    // (`reference/cpp/core/visual/LayerIntf.cpp:469-470`), and the test
+    // pins the painted glyph alone.
     env.run(
         "var w = new Window(); \
-         var l = new Layer(w, null); \
+         var base = new Layer(w, null); \
+         var l = new Layer(w, base); \
          l.setImageSize(64, 64); \
          var f = new Font('Pre.ttf', 12, 0); \
          f.mapPrerenderedFont('sample.tft'); \
@@ -844,9 +854,14 @@ fn a_prerendered_glyph_is_drawn_at_the_ascent_minus_its_origin() {
     // The fixture's descriptor has `origin_y == 0`, so the ink starts one
     // ascent below the draw position.
     std::fs::write(game_dir.join("sample.tft"), build_tft(&[b'A' as u16], 3)).expect("write tft");
+    // The canvas is a layer with a parent: the window's primary layer grows
+    // its image into an opaque backdrop
+    // (`reference/cpp/core/visual/LayerIntf.cpp:469-470`), and the test
+    // pins the painted glyph alone.
     env.run(
         "var w = new Window(); \
-         var l = new Layer(w, null); \
+         var base = new Layer(w, null); \
+         var l = new Layer(w, base); \
          l.setImageSize(64, 64); \
          var f = new Font('Pre.ttf', 12, 0); \
          f.mapPrerenderedFont('sample.tft'); \
@@ -1035,9 +1050,14 @@ fn layer_draw_text_uses_a_mapped_prerendered_font() {
     let game_dir = env.game_dir().expect("game dir").clone();
     std::fs::write(game_dir.join("Pre"), &font_bytes).expect("write face");
     std::fs::write(game_dir.join("sample.tft"), build_tft(&[b'A' as u16], 7)).expect("write tft");
+    // The canvas is a layer with a parent: the window's primary layer grows
+    // its image into an opaque backdrop
+    // (`reference/cpp/core/visual/LayerIntf.cpp:469-470`), and the test
+    // pins the painted glyph alone.
     env.run(
         "var w = new Window(); \
-         var l = new Layer(w, null); \
+         var base = new Layer(w, null); \
+         var l = new Layer(w, base); \
          l.setImageSize(64, 64); \
          var f = new Font('Pre', 12, 0); \
          f.mapPrerenderedFont('sample.tft'); \

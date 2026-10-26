@@ -2289,6 +2289,17 @@ pub(crate) fn to_actual_color(color: u32) -> u32 {
     ((rgb_bbggrr & 0xff) << 16) | (rgb_bbggrr & 0xff00) | ((rgb_bbggrr & 0xff0000) >> 16)
 }
 
+/// The red, green and blue bytes a colour names.
+///
+/// A colour whose high byte is set names a system colour: it is resolved
+/// through the system-colour table and its red and blue bytes are swapped.
+/// Every other colour passes through unchanged, so `0x00RRGGBB` names the
+/// red, green and blue planes as they are and never names an alpha.
+pub(crate) fn actual_color_bytes(color: i64) -> [u8; 3] {
+    let rgb = to_actual_color(color as u32);
+    [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8]
+}
+
 /// Generate a random RFC-4122 v4 UUID string. The seed mixes the clock, a
 /// per-engine counter and the stack address; there is no process global.
 fn make_uuid(state: &mut SystemState) -> String {

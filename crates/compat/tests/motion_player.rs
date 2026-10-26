@@ -379,7 +379,8 @@ fn player_draw_samples_the_icon_texture() {
     env.run(&format!(
         "var rm = new Motion.ResourceManager(null, 1024); \
          var w = new Window(); \
-         var target = new Layer(w, null); \
+         var screen = new Layer(w, null); \
+         var target = new Layer(w, screen); \
          target.setSize(800, 1080); \
          var p = new Motion.Player(rm); \
          p.motionKey = \"{path}\"; \
@@ -430,9 +431,10 @@ fn player_draw_applies_the_draw_affine_translate() {
     env.run(&format!(
         "var rm = new Motion.ResourceManager(null, 1024); \
          var w = new Window(); \
-         var plain = new Layer(w, null); \
+         var screen = new Layer(w, null); \
+         var plain = new Layer(w, screen); \
          plain.setSize(1600, 1080); \
-         var moved = new Layer(w, null); \
+         var moved = new Layer(w, screen); \
          moved.setSize(1600, 1081); \
          var p = new Motion.Player(rm); \
          p.motionKey = \"{path}\"; \
@@ -1504,7 +1506,8 @@ fn the_stencil_groups_mask_the_layout_and_eye_clips() {
             "var rm_{name} = new Motion.ResourceManager(null, 1024); \
              var m_{name} = rm_{name}.load(\"{path}\"); \
              var win_{name} = new Window(); \
-             var target_{name} = new Layer(win_{name}, null); \
+             var screen_{name} = new Layer(win_{name}, null); \
+             var target_{name} = new Layer(win_{name}, screen_{name}); \
              target_{name}.setSize({width}, {height}); \
              var p_{name} = new Motion.Player(rm_{name}); \
              p_{name}.project = m_{name}; \

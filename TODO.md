@@ -56,7 +56,7 @@ residuals:
 
 * **Input is still flattened across domains.** Hit-testing walks
   `Scene::window_layer_order` for the whole window (`crates/compat/src/event.rs`
-  `hit_layer` → `Scene::layer_at`) where the reference binds input to manager
+  `hit_layer` → `Scene::layer_hit_next`) where the reference binds input to manager
   index 0 (`LayerTreeOwnerImpl.h:21`), so a click can reach a layer in a second
   root the reference would never deliver to. `Scene::window_input_root` exists
   for this; the dispatch does not use it.
@@ -140,15 +140,34 @@ residuals:
   on a non-opaque face, which the reference does not do; it is left as it is
   until the engine's blend dispatcher carries the per-method kernels.
   Closing this needs that dispatcher to carry them.
-* **The container layer types still collapse, and so does the primary
-  layer's type.** `ltBinder` (0), `ltEffect` (6) and `ltFilter` (7) read
-  back as `ltAlpha` (2) (`natives/visual/layer/blend.rs`), so the
-  resolution table's default arm (`dfOpaque`, `LayerIntf.cpp:1611-1613`) is
-  unreachable and those layers resolve to `dfAlpha`; the reference gives them
+* **The container layer types still collapse, and the primary layer's hit
+  threshold stays at the default.** `ltBinder` (0), `ltEffect` (6) and
+  `ltFilter` (7) read back as `ltAlpha` (2) (`natives/visual/layer/blend.rs`),
+  so the resolution table's default arm (`dfOpaque`, `LayerIntf.cpp:1611-1613`)
+  is unreachable and those layers resolve to `dfAlpha`; the reference gives them
   no image, so no face-sensitive operation can observe the difference there.
-  The reference's primary layer is `ltOpaque` (`LayerIntf.cpp:469`,
-  `:503`), so its face resolves to `dfOpaque`, while ours is `ltAlpha` and
-  resolves to `dfAlpha`.
+  The reference's primary layer also carries `HitThreshold = 0`
+  (`LayerIntf.cpp:472`, `:506`), so every pixel of its image is a hit; ours
+  keeps the default 16, so a click that lands on a transparent part of the
+  screen hits nothing. Closing that needs the creation defaults to carry the
+  hit threshold as well, which changes the hit test's outcome for the screen
+  root: the pointer dispatch then finds the primary layer where it found
+  nothing. A second parentless layer keeps the constructor's type here: the
+  reference gives every parentless root its own manager and the opaque type
+  (`LayerIntf.cpp:463-472`), but its draw devices take one manager per window
+  (`BasicDrawDevice.cpp:478-487`, `PassThroughDrawDevice.cpp:345-357`), so the
+  second root raises there and its type is never observed; the per-window model
+  is §2's residual.
+* **What a fresh layer's image starts as is not established.** The reference's
+  primary layer and a fresh `Bitmap` both start from the shared initial
+  bitmap (`reference/cpp/core/visual/LayerIntf.cpp:214-220`,
+  `reference/cpp/core/visual/BitmapIntf.cpp:41`), whose size and content the
+  tree does not say: the holder that owns it is not vendored. Ours starts from
+  an empty image that the size change fills with the layer's neutral colour -
+  the reference's opaque white for the primary layer, the transparent white for
+  a layer with a parent. Whether the reference's initial bitmap leaves any
+  region of the grown image untouched is therefore an open question, not a
+  known divergence.
 * **The window's outer-rect members report the platform window's values,
   not the reference frontend's.** The reference's window form ignores
   `setPos`, `setMinSize` and `setMaxSize`, and its getters report

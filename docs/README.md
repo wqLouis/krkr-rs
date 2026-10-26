@@ -30,6 +30,7 @@ above and adds the process rules (the gate, the roles, the release metering).
 | [`arch/overall.md`](arch/overall.md) | the four layers, the dependency direction, the crate map, the coordinate spaces, the frame |
 | [`arch/l1.md`](arch/l1.md) | L1 — the stateless platform core: the services, the state values, the object/state split |
 | [`arch/l2.md`](arch/l2.md) | L2 — the engine: the layer tree, the projection, the storage namespace, the frame |
+| [`arch/l2-api.md`](arch/l2-api.md) | the L2 public API: the engine crate's types, operations, error types and stability contract |
 | [`arch/l3.md`](arch/l3.md) | L3 — the compatibility surface: the native classes, the plugins, the events, the frame body |
 | [`arch/l4.md`](arch/l4.md) | L4 — the TJS VM host: the engine wrapper, the script cache, the vendored VM |
 

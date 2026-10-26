@@ -663,6 +663,7 @@ in the commit that introduced the change.
 | The four layers, the crate map, the coordinate spaces, the frame | `docs/arch/overall.md` |
 | L1 — the stateless platform core | `docs/arch/l1.md` |
 | L2 — the engine: the layer tree, the projection, the frame | `docs/arch/l2.md` |
+| The L2 public API: the engine crate's types, operations, error types | `docs/arch/l2-api.md` |
 | L3 — the compatibility surface, the plugins, the events | `docs/arch/l3.md` |
 | L4 — the TJS VM host | `docs/arch/l4.md` |
 | The Vulkan pipeline and the blend mapping | `docs/arch/l1.md` §3, `docs/code/platform/render.md` |

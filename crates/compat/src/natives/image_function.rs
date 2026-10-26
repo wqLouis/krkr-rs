@@ -51,7 +51,9 @@ use tjs::{
 };
 
 use crate::native_util::{args, report_error, set_void, value_as_string};
-use crate::natives::system::{EngineBinding, resolve, try_value_as_i64, value_as_bool};
+use crate::natives::system::{
+    EngineBinding, actual_color_bytes, resolve, try_value_as_i64, value_as_bool,
+};
 use crate::resource::{TextDrawParams, draw_text_into_bitmap, glyph_text, resource_state};
 use crate::{CompatCtx, CompatError};
 
@@ -182,8 +184,8 @@ fn set_region_out(host: &Tjs2Engine, out: *mut Value, region: Option<RectI>) {
     std::mem::forget(object);
 }
 
-/// `TVPToActualColor`/`argb_to_rgba`: script `0xAARRGGBB` → straight-alpha
-/// `[r, g, b, a]`.
+/// The script's `0xAARRGGBB` colour as straight-alpha `[r, g, b, a]`: the
+/// high byte is the alpha and the low 24 bits are the colour.
 fn argb_to_rgba(color: i64) -> [u8; 4] {
     let value = color as u32;
     [
@@ -1102,7 +1104,8 @@ extern "C" fn image_fill_rect(
         }
         let host = resolved.engine();
         let dst_id = bitmap_arg(host, &a[0], "fillRect")?;
-        let color = argb_to_rgba(try_value_as_i64(&a[1])?);
+        let script_color = try_value_as_i64(&a[1])?;
+        let color = argb_to_rgba(script_color);
         let rect = read_rect(host, a.get(2))?;
         let isalpha = opt_bool(a, 3, true);
         let clip = read_rect(host, a.get(4))?;
@@ -1123,8 +1126,8 @@ extern "C" fn image_fill_rect(
             return Ok(None);
         };
         if isalpha {
-            // Reference `Fill` (`FillARGB`): copy the colour *including* its
-            // alpha. `fill_rect_replace` is that exact primitive.
+            // The colour is copied as it is, alpha included: the high byte is
+            // the alpha and the low 24 bits are the colour.
             raster::fill_rect_replace(
                 dst,
                 dest.0,
@@ -1135,9 +1138,10 @@ extern "C" fn image_fill_rect(
             );
             dst.mark_dirty();
         } else {
-            // Reference `FillColor`: replace the RGB, hold the destination
-            // alpha.
-            layer_ops::fill_color_hold_alpha(dst, dest, color, 255);
+            // The colour goes through the system-colour table first, then the
+            // RGB replaces the pixel's and the destination alpha is held.
+            let rgb = actual_color_bytes(script_color);
+            layer_ops::fill_color_hold_alpha(dst, dest, [rgb[0], rgb[1], rgb[2], 0], 255);
         }
         Ok(Some(dest))
     })
@@ -1157,7 +1161,13 @@ extern "C" fn image_color_rect(
         }
         let host = resolved.engine();
         let dst_id = bitmap_arg(host, &a[0], "colorRect")?;
-        let color = argb_to_rgba(try_value_as_i64(&a[1])?);
+        let script_color = try_value_as_i64(&a[1])?;
+        let color = argb_to_rgba(script_color);
+        // The faces that paint the colour take it through the system-colour
+        // table first, so an identifier names its table entry and the red and
+        // blue bytes are swapped. The resolved colour names no alpha.
+        let rgb = actual_color_bytes(script_color);
+        let resolved_color = [rgb[0], rgb[1], rgb[2], 0];
         let opa = opt_i64(a, 2, 255)? as i32;
         let rect = read_rect(host, a.get(3))?;
         let face = normalize_color_face(opt_i64(a, 4, DF_ALPHA)?);
@@ -1181,7 +1191,7 @@ extern "C" fn image_color_rect(
         let updated = match face {
             DF_ALPHA => {
                 if opa > 0 {
-                    layer_ops::fill_color_on_alpha(dst, dest, color, opa);
+                    layer_ops::fill_color_on_alpha(dst, dest, resolved_color, opa);
                     true
                 } else {
                     layer_ops::remove_const_opacity(dst, dest, -opa);
@@ -1190,14 +1200,14 @@ extern "C" fn image_color_rect(
             }
             DF_ADD_ALPHA => {
                 if opa >= 0 {
-                    layer_ops::fill_color_on_add_alpha(dst, dest, color, opa);
+                    layer_ops::fill_color_on_add_alpha(dst, dest, resolved_color, opa);
                     true
                 } else {
                     false
                 }
             }
             DF_OPAQUE => {
-                layer_ops::fill_color_hold_alpha(dst, dest, color, opa);
+                layer_ops::fill_color_hold_alpha(dst, dest, resolved_color, opa);
                 true
             }
             DF_MASK => {
@@ -1240,8 +1250,10 @@ extern "C" fn image_draw_text(
         let x = try_value_as_i64(&a[2])? as i32;
         let y = try_value_as_i64(&a[3])? as i32;
         let text = value_as_string(&a[4]);
-        let mut color = argb_to_rgba(try_value_as_i64(&a[5])?);
-        color[3] = 255;
+        // The main colour goes through the system-colour table; the shadow
+        // colour is taken as it is.
+        let rgb = actual_color_bytes(try_value_as_i64(&a[5])?);
+        let color = [rgb[0], rgb[1], rgb[2], 255];
         let opacity = opt_i64(a, 6, 255)?.clamp(0, 255) as i32;
         let antialias = opt_bool(a, 7, true);
         let shadow_level = opt_i64(a, 9, 0)? as i32;
@@ -1331,8 +1343,10 @@ extern "C" fn image_draw_glyph(
         }
         let x = try_value_as_i64(&a[1])? as i32;
         let y = try_value_as_i64(&a[2])? as i32;
-        let mut color = argb_to_rgba(try_value_as_i64(&a[4])?);
-        color[3] = 255;
+        // The main colour goes through the system-colour table; the shadow
+        // colour is taken as it is.
+        let rgb = actual_color_bytes(try_value_as_i64(&a[4])?);
+        let color = [rgb[0], rgb[1], rgb[2], 255];
         let opacity = opt_i64(a, 5, 255)?.clamp(0, 255) as i32;
         let antialias = opt_bool(a, 6, true);
         let shadow_level = opt_i64(a, 8, 0)? as i32;

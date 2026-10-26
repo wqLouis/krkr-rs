@@ -12,7 +12,7 @@ in the two sibling directories:
 
 | Directory | Holds | Read it when |
 |---|---|---|
-| [`../arch/`](../arch/overall.md) | the architecture: the layers, the crate map, the coordinate spaces, the frame, the L3↔L2 protocol | you need to know *why* a module is shaped the way it is |
+| [`../arch/`](../arch/overall.md) | the architecture: the layers, the crate map, the coordinate spaces, the frame, the L3↔L2 protocol, and the [L2 public API reference](../arch/l2-api.md) | you need to know *why* a module is shaped the way it is, or *what* the engine crate offers a caller |
 | [`../rules/`](../rules/arch_rules.md) | the rules: layers, state, frame, coordinate spaces, errors, the Rust review checklist | you are reviewing or writing code |
 | [`../README.md`](../README.md) | the index of the whole documentation tree | you are looking for a page |
 

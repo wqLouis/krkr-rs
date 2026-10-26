@@ -13,6 +13,7 @@ It speaks no TJS and no TVP vocabulary of its own: everything a script sees is
 expressed by L3 on top of the generic values documented here.
 
 The architecture this crate implements is in [`arch/l2.md`](../../arch/l2.md);
+its public surface is in [`arch/l2-api.md`](../../arch/l2-api.md);
 the rules it obeys are in [`rules/arch_rules.md`](../../rules/arch_rules.md)
 (state ownership, frame contract, coordinate spaces), [`rules/api_rules.md`](../../rules/api_rules.md)
 (public surface, the L3 ↔ L2 protocol, error enums) and
@@ -72,36 +73,34 @@ its tests.
 reachable through the module path.
 
 ```rust
-pub use api::config::CacheLimit;
 pub use fs::xp3::normalize_in_archive_name;
 
-pub use crate::clock::FrameClock;
+pub use crate::clock::{FrameClock, FrameTimeSource, InjectedFrameTime};
 pub use crate::engine::{
     Engine, EngineError, EngineOverlay, EngineParts, FrameReport, GameFrame, ObjectCounts,
 };
 pub use crate::hasher::Map;
+pub use crate::imagedecode::DecodePool;
 pub use crate::translate::{PixelTranslation, TranslateError};
 
 pub use projection::{
-    ComposedLayer, ProjectionReport, compose_layer, project_scene, project_scene_report,
-    project_window, project_window_report, resolve_blend,
+    ComposedLayer, compose_layer, project_scene, project_window, project_window_report,
+    resolve_blend,
 };
 pub use scene::{
     BitmapState, DecodedImageKey, DecodedImageMode, FontState, LayerState, Rect, Scene,
-    TransitionFrame, TransitionSource, WindowState,
-};
-pub use shader::{
-    EffectDraw, EffectPass, EffectPipelines, EffectTexture, LoadedProgram, PipelineId, Program,
-    ProgramDesc, ShaderError, ShaderId, ShaderLibrary,
+    TransitionFrame, TransitionSource,
 };
 pub use startup::{StartupError, discover_startup};
-pub use storage::{Location, MountError, Storage, StorageMetadata, StorageReadError};
+pub use storage::{Location, Storage, StorageReadError};
 ```
 
-The pixel primitives, the blend-type numbering and the storage/startup
-constants are **not** re-exported flat: they are reached through
-`engine::layer_ops`, `engine::raster`, `engine::projection`, `engine::scene`,
-`engine::storage` and `engine::startup`.
+The pixel primitives, the blend-type numbering, the shader surface and the
+storage/startup constants are **not** re-exported flat: they are reached
+through `engine::layer_ops`, `engine::raster`, `engine::projection`,
+`engine::scene`, `engine::shader`, `engine::storage` and `engine::startup`.
+The full list, and what each name means to a caller, is in
+[`arch/l2-api.md`](../../arch/l2-api.md) §1.
 
 `engine::Map` is the crate's `HashMap` with a **fixed-seed** hasher, so the
 lookup tables key deterministically across runs (`ahash`'s default

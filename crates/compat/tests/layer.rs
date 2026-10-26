@@ -206,13 +206,17 @@ fn event_handlers_are_assignable_and_default_to_noop() {
     assert!(env.eval("l.onTouchUp(0, 0, 0, 0, 0)").is_ok());
 }
 
+/// The face decides whether a `colorRect` writes the alpha plane or
+/// holds the destination's (`reference/cpp/core/visual/LayerIntf.cpp:4348-4403`),
+/// so the test pins the alpha face.
 #[test]
 fn color_rect_and_pixel_accessors() {
     let _lock = vm_lock();
     let env = Env::new();
     layer_with_image(&env, 2, 2);
     env.run(
-        "l.colorRect(0, 0, 2, 2, 0xffff0000, 255); \
+        "l.face = dfAlpha; \
+         l.colorRect(0, 0, 2, 2, 0xffff0000, 255); \
          var main = l.getMainPixel(0, 0); \
          var mask = l.getMaskPixel(0, 0); \
          l.setMaskPixel(1, 1, 128); \
@@ -221,8 +225,11 @@ fn color_rect_and_pixel_accessors() {
          var main2 = l.getMainPixel(1, 0);",
     );
     // `getMainPixel` masks the alpha out (0x00RRGGBB)
-    // (`reference/cpp/core/visual/LayerIntf.cpp:2917-2923`).
-    assert_eq!(env.eval_int("main"), 0x00ff_0000);
+    // (`reference/cpp/core/visual/LayerIntf.cpp:2917-2923`). The colour the
+    // fill resolved is the one the reference paints
+    // (`reference/cpp/core/visual/LayerIntf.cpp:4351`): `0xffff0000` keeps
+    // its low 24 bits with the red and blue bytes swapped.
+    assert_eq!(env.eval_int("main"), 0x0000_00ff);
     assert_eq!(env.eval_int("mask"), 255);
     assert_eq!(env.eval_int("mask2"), 128);
     assert_eq!(env.eval_int("main2"), 0x0000_ff00);

@@ -238,6 +238,7 @@ See [`l3.md`](l3.md) §7.
 | the layers, the crate map, the frame, the coordinate spaces | this file, [`l2.md`](l2.md) §9 |
 | stateless L1, the object/state split | [`l1.md`](l1.md) §1 |
 | the layer tree, the projection, cache/clip/order | [`l2.md`](l2.md) §2–§3 |
+| the L2 public API: the engine crate's types, operations and error types | [`l2-api.md`](l2-api.md) |
 | presentation and the pixel-translation layer | [`l2.md`](l2.md) §4 |
 | the render pipeline, blend slots, the CPU baseline | [`l1.md`](l1.md) §3 |
 | media backends (FFmpeg / MediaCodec), the PSB/PSD reader | [`l1.md`](l1.md) §4–§5 |

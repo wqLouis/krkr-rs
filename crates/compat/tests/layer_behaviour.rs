@@ -1028,7 +1028,10 @@ fn pixel_methods_enforce_reference_argument_counts() {
 /// (`reference/cpp/core/visual/LayerIntf.cpp:8677-8684`); on `dfAlpha` a
 /// positive opacity fills colour *and* alpha while a negative opacity only
 /// removes const opacity, leaving the colour untouched
-/// (`ColorRect`, `LayerIntf.cpp:4352-4362`). `TVPRemoveConstOpacity_c`
+/// (`ColorRect`, `LayerIntf.cpp:4348-4362`). The colour itself goes through
+/// the system-colour table first (`LayerIntf.cpp:4351`), so `0xff102030`
+/// names no plain colour: it keeps its low 24 bits with the red and blue
+/// bytes swapped. `TVPRemoveConstOpacity_c`
 /// multiplies alpha by `(255 - strength)` (`reference/cpp/core/visual/tvpgl.cpp:6401-6413`),
 /// so `255 → 199` for `strength = 55`.
 #[test]
@@ -1037,7 +1040,8 @@ fn color_rect_opacity_default_and_negative_removal() {
     let env = Env::new();
     layer_with_image(&env, 2, 2);
     env.run(
-        "l.colorRect(0, 0, 2, 2, 0xff102030); \
+        "l.face = dfAlpha; \
+         l.colorRect(0, 0, 2, 2, 0xff102030); \
          var a_full = l.getMaskPixel(0, 0); \
          l.colorRect(0, 0, 2, 2, 0xff405060, -55); \
          var a_removed = l.getMaskPixel(0, 0); \
@@ -1046,7 +1050,7 @@ fn color_rect_opacity_default_and_negative_removal() {
     assert_eq!(env.eval_int("a_full"), 255);
     assert_eq!(env.eval_int("a_removed"), 199);
     // Negative opacity does not repaint the colour.
-    assert_eq!(env.eval_int("rgb_after"), 0x102030);
+    assert_eq!(env.eval_int("rgb_after"), 0x302010);
 }
 
 /// Reference: `ColorRect` on `dfAddAlpha` throws
@@ -1119,7 +1123,8 @@ fn adjust_gamma_parses_string_reals_and_accepts_no_arguments() {
              return s; \
          } \
          var w = new Window(); \
-         var l = new Layer(w, null); l.setImageSize(2, 2); \
+         var screen = new Layer(w, null); \
+         var l = new Layer(w, screen); l.setImageSize(2, 2); \
          fill(l); var plain = sig(l); \
          l.adjustGamma(); var noop = sig(l); \
          l.adjustGamma('1.5', 0, 255, 1.0, 0, 255, 1.0, 0, 255); var from_str = sig(l); \
@@ -1970,7 +1975,9 @@ fn clip_property_setters_intersect_the_image_like_set_clip() {
 /// `tTVPLayerType` numbering (`LayerIntf.h:76-105`,
 /// `LayerIntf.cpp:1621-1686`) — `ltAdditive` → `omAdditive` (3). Against a
 /// non-black destination, additive and alpha differ, so the auto mode is
-/// observable.
+/// observable. The seeded colours are plain `0x00RRGGBB` values, so they name
+/// no system colour and the test does not depend on the colour table the
+/// fill resolves them through (`reference/cpp/core/visual/LayerIntf.cpp:4351`).
 #[test]
 fn operate_rect_om_auto_uses_the_source_layer_type() {
     let _lock = vm_lock();
@@ -1981,8 +1988,8 @@ fn operate_rect_om_auto_uses_the_source_layer_type() {
              var dst = new Layer(w, null); dst.setImageSize(2, 2); \
              var src = new Layer(w, null); src.setImageSize(2, 2); \
              src.type = 3; \
-             dst.colorRect(0, 0, 2, 2, 0xff640000, 255); \
-             src.colorRect(0, 0, 2, 2, 0xffc80000, 128); \
+             dst.colorRect(0, 0, 2, 2, 0x00006400, 255); \
+             src.colorRect(0, 0, 2, 2, 0x000000c8, 128); \
              return %[dst: dst, src: src]; \
          } \
          var p = make(); \
@@ -2070,8 +2077,11 @@ fn color_rect_on_an_out_of_vocabulary_face_is_silent() {
          l.colorRect(0, 0, 1, 1, 0xffffffff); \
          var after = l.getMainPixel(0, 0);",
     );
-    assert_eq!(env.eval_int("before"), 0x304050);
-    assert_eq!(env.eval_int("after"), 0x304050);
+    // The colour goes through the system-colour table first
+    // (`reference/cpp/core/visual/LayerIntf.cpp:4351`), so `0xff304050`
+    // keeps its low 24 bits with the red and blue bytes swapped.
+    assert_eq!(env.eval_int("before"), 0x504030);
+    assert_eq!(env.eval_int("after"), 0x504030);
 }
 
 /// Reference: with `face == dfAuto` (128, the reference default

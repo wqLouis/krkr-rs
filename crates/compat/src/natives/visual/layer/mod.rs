@@ -12,9 +12,9 @@ use tjs::{
 
 use super::common::{
     DEFAULT_FONT_COLOR, DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, ObjectHandle, ObjectKind,
-    VisualState, argb_to_rgba, bound, duplicate_object, input_ref, reparent_layer,
-    resolve_object_id, scene_mut, scene_ref, set_null_out, set_object_out, set_retained_out,
-    set_visual_string_out,
+    VisualState, actual_color_bytes, argb_to_rgba, bound, duplicate_object, input_ref,
+    reparent_layer, resolve_object_id, scene_mut, scene_ref, set_null_out, set_object_out,
+    set_retained_out, set_visual_string_out,
 };
 use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
@@ -35,6 +35,10 @@ pub(crate) use focus::{
     blur_tree, clear_domain_focus, clear_layer_focus, focus_layer, focus_layer_in_input_domain,
 };
 pub use transitions::{advance_self_updating_transitions, advance_transitions};
+
+/// The neutral colour of a window's primary layer: opaque white, so the
+/// region its image grows into is an opaque backdrop.
+const PRIMARY_NEUTRAL_COLOR: i64 = 0xffff_ffff;
 
 /// Per-layer L3 state that has no home in the L2 `engine_api::Scene` yet: the
 /// active transition, the modal-layer stack and the pending capture-release
@@ -558,6 +562,16 @@ extern "C" fn layer_ctor(
             id
         }
     };
+    // The window's primary layer is the screen root: it carries the opaque
+    // type, so its image is copied over the window surface instead of being
+    // blended into it, and its neutral colour is opaque white, so the region
+    // its image grows into is an opaque backdrop.
+    if scene.is_primary_layer(id)
+        && let Some(layer) = scene.layer_mut(id)
+    {
+        layer.blend = blend::from_native(blend::LT_OPAQUE);
+        layer.neutral_color = PRIMARY_NEUTRAL_COLOR;
+    }
     inst.attached = true;
     log::trace!("Layer created: id={id} parent={parent:?}");
     register_layer(&ctx, id, objthis);
@@ -1656,7 +1670,8 @@ extern "C" fn layer_fill_rect(
     let y = value_as_i64(&a[1]) as i32;
     let w = value_as_i64(&a[2]) as i32;
     let h = value_as_i64(&a[3]) as i32;
-    let color = argb_to_rgba(value_as_i64(&a[4]));
+    let script_color = value_as_i64(&a[4]);
+    let color = argb_to_rgba(script_color);
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.fillRect: compat context is not bound");
     };
@@ -1716,7 +1731,17 @@ extern "C" fn layer_fill_rect(
             true
         }
         pixels::DF_OPAQUE => {
-            crate::engine_api::layer_ops::fill_color_hold_alpha(bitmap, dest, color, 255);
+            // The whole colour goes through the system-colour table on this
+            // face, so an identifier names its table entry and the red and
+            // blue bytes are swapped. The destination alpha is held, so the
+            // colour names no alpha of its own.
+            let rgb = actual_color_bytes(script_color);
+            crate::engine_api::layer_ops::fill_color_hold_alpha(
+                bitmap,
+                dest,
+                [rgb[0], rgb[1], rgb[2], 0],
+                255,
+            );
             true
         }
         pixels::DF_MASK => {

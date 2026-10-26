@@ -875,7 +875,8 @@ fn layer_draw_text_zero_offset_shadow_leaves_a_dark_halo() {
     };
     env.run(&format!(
         "var w = new Window(); \
-         var l = new Layer(w, null); \
+         var screen = new Layer(w, null); \
+         var l = new Layer(w, screen); \
          l.setImageSize(96, 96); \
          l.font.face = '{name}'; \
          l.font.height = 40; \

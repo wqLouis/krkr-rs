@@ -1307,7 +1307,13 @@ extern "C" fn layer_color_rect(
         let y = value_as_i64(&a[1]) as i32;
         let w = value_as_i64(&a[2]) as i32;
         let h = value_as_i64(&a[3]) as i32;
-        let color = argb_to_rgba(value_as_i64(&a[4]));
+        let script_color = value_as_i64(&a[4]);
+        let color = argb_to_rgba(script_color);
+        // The faces that paint the colour take it through the system-colour
+        // table first, so an identifier names its table entry and the red and
+        // blue bytes are swapped. The resolved colour names no alpha.
+        let rgb = actual_color_bytes(script_color);
+        let resolved_color = [rgb[0], rgb[1], rgb[2], 0];
         let opa = opt_i64(a, 5, 255).clamp(-255, 255) as i32;
         let scene = scene_mut(&ctx)?;
         let Some((dst, _hold_alpha)) = dest_info(scene, id, "colorRect")? else {
@@ -1341,7 +1347,7 @@ extern "C" fn layer_color_rect(
         let modified = match face {
             DF_ALPHA => {
                 if opa > 0 {
-                    layer_ops::fill_color_on_alpha(bitmap, dest, color, opa);
+                    layer_ops::fill_color_on_alpha(bitmap, dest, resolved_color, opa);
                 } else {
                     layer_ops::remove_const_opacity(bitmap, dest, -opa);
                 }
@@ -1350,14 +1356,14 @@ extern "C" fn layer_color_rect(
             DF_ADD_ALPHA => {
                 if opa < 0 {
                     return Err(
-                        "Layer.colorRect: negative opacity is not supported on dfAddAlpha".into(),
+                        "Layer.colorRect: Negative opacity not supported on this face".into(),
                     );
                 }
-                layer_ops::fill_color_on_add_alpha(bitmap, dest, color, opa);
+                layer_ops::fill_color_on_add_alpha(bitmap, dest, resolved_color, opa);
                 opa > 0
             }
             DF_OPAQUE => {
-                layer_ops::fill_color_hold_alpha(bitmap, dest, color, opa);
+                layer_ops::fill_color_hold_alpha(bitmap, dest, resolved_color, opa);
                 opa > 0
             }
             DF_MASK => {
@@ -2828,8 +2834,10 @@ fn layer_draw_text_common(
     let result: Result<(), String> = (|| {
         let x = value_as_i64(&a[0]) as i32;
         let y = value_as_i64(&a[1]) as i32;
-        let mut color = argb_to_rgba(value_as_i64(&a[3]));
-        color[3] = 255;
+        // The main colour goes through the system-colour table; the shadow
+        // colour is taken as it is.
+        let rgb = actual_color_bytes(value_as_i64(&a[3]));
+        let color = [rgb[0], rgb[1], rgb[2], 255];
         let opacity = opt_i64(a, 4, 255).clamp(0, 255) as i32;
         let antialias = opt_bool(a, 5, true);
         let shadow_level = opt_i64(a, 6, 0) as i32;

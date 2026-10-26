@@ -124,10 +124,13 @@ fn fill_rect_without_alpha_holds_the_destination_alpha() {
          b.setPixel(0, 0, 0x00ff00); \
          b.setMaskPixel(0, 0, 0x80);",
     );
-    // `isalpha = false` maps to `FillColor`, which holds alpha.
+    // `isalpha = false` maps to `FillColor`, which holds alpha
+    // (`reference/cpp/core/visual/ImageFunction.cpp:841-845`). The colour
+    // goes through the system-colour table first, so `0xff0000ff` keeps its
+    // low 24 bits with the red and blue bytes swapped.
     env.run("ImageFunction.fillRect(b, 0xff0000ff, null, false, null);");
-    // RGB becomes the requested blue; the 0x80 alpha is preserved.
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x00_00ff);
+    // RGB becomes the resolved red; the 0x80 alpha is preserved.
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0xff_0000);
     assert_eq!(env.eval_int("b.getMaskPixel(0, 0)"), 0x80);
 }
 
@@ -153,9 +156,12 @@ fn color_rect_opaque_face_sets_rgb_and_holds_alpha() {
          b.setMaskPixel(0, 0, 0x80);",
     );
     // `dfOpaque` holds the destination alpha
-    // (`reference/cpp/core/visual/ImageFunction.cpp:861-965`).
+    // (`reference/cpp/core/visual/ImageFunction.cpp:861-965`). The colour
+    // goes through the system-colour table first
+    // (`reference/cpp/core/visual/ImageFunction.cpp:939`), so `0xff445566`
+    // keeps its low 24 bits with the red and blue bytes swapped.
     env.run("ImageFunction.colorRect(b, 0xff445566, 255, null, dfOpaque, null);");
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x44_5566);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x66_5544);
     assert_eq!(env.eval_int("b.getMaskPixel(0, 0)"), 0x80);
 }
 
