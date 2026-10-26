@@ -8,9 +8,10 @@ scroll, and the seven `extrans.dll` providers) as explicit L2 state over the
 
 A `Trans` is a **caller-owned value**: it stores the transition kind, the
 duration and the elapsed time, and it composites two source bitmaps into a
-destination at the current progress. There is no global handler registry, no
-plugin lookup and no clock. The application calls `Trans::step` with the
-elapsed milliseconds each frame and `Trans::apply` once per frame to render.
+destination at the current progress. There is no global handler registry and
+no plugin lookup. The application drives it with `Trans::advance_to`, which
+takes the clock's tick and differences it against the transition's start tick,
+and renders with `Trans::apply` once per frame.
 
 ---
 
@@ -94,6 +95,8 @@ impl Trans {
 
     pub fn step(&mut self, dt_ms: f64) -> TransStep;
     pub fn seek_ms(&mut self, elapsed_ms: f64) -> TransStep;
+    pub fn start_at(&mut self, tick: u64);
+    pub fn advance_to(&mut self, tick: u64) -> TransStep;
     pub fn complete(&mut self);
     pub fn reset(&mut self);
     pub fn apply(&self, dst: &mut BitmapState, src1: &BitmapState, src2: &BitmapState,
@@ -157,6 +160,11 @@ it can serve:
   state pinned at `progress = 1.0` and `phase = phase_max`.
 * **A non-finite or non-positive `dt_ms` leaves the state unchanged**; a
   non-finite or negative `elapsed_ms` does the same for `seek_ms`.
+* **The phase follows the clock, not the frames.** `advance_to(tick)` sets the
+  elapsed time to the difference between `tick` and the tick the transition
+  started at, which is the form the reference computes its phase in — a tick
+  difference, never an accumulated delta. A transition that is not started at
+  a tick takes the tick of its first advance as its start.
 * **The endpoints are exact**: at `phase == 0` the destination is a copy of
   source 1, at `phase == phase_max` a copy of source 2. Every `ttExchange`
   provider is `tutDivisible`, so the reference short-circuits the endpoints;

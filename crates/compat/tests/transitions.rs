@@ -23,13 +23,15 @@
 //! * the `ttExchange` teardown: the two layers exchange position and
 //!   visibility, and a stopped transition keeps the last rendered frame.
 //!
-//! Time is driven by calling [`compat::advance_transitions`] directly — the
-//! frame-body step — with short millisecond deltas; no frame loop is
-//! needed. Every scenario gets a fresh set of layers inside one [`Env`],
+//! Time is driven by the engine's frame clock: the test moves the clock
+//! forward and calls [`compat::advance_transitions`] — the frame-body step —
+//! so the transition's phase follows the clock; no frame loop is needed.
+//! Every scenario gets a fresh set of layers inside one [`Env`],
 //! serialized through [`common::vm_lock`].
 
 mod common;
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -38,7 +40,7 @@ use api::fs::{FsPath, OpenMode};
 use api::media::{DecodedImage, ImageInfo};
 use common::vm_lock;
 use compat::CompatHost;
-use engine::{Scene, Storage};
+use engine::{FrameClock, Scene, Storage};
 use fs::FileSystem;
 use tjs::{Tjs2Engine, TjsValue};
 
@@ -87,6 +89,8 @@ struct Env {
     /// Only the rule-image tests use the storage; declared after `host` so
     /// it outlives the binding's raw pointer.
     _storage: Box<Storage>,
+    /// The engine's frame clock: the transition's phase follows it.
+    clock: RefCell<Box<FrameClock>>,
     /// How many times the synthetic codec decoded an image.
     decode_count: Arc<AtomicU32>,
 }
@@ -130,12 +134,15 @@ impl Env {
             },
             |_name, _type, _width, _height, _rgba| Ok(()),
         );
-        // SAFETY: the boxed scene and storage outlive the host.
+        let mut clock = Box::new(FrameClock::new());
+        // SAFETY: the boxed scene, storage and clock outlive the host.
         unsafe {
             host.services_mut()
                 .attach_scene(scene.as_mut() as *mut Scene);
             host.services_mut()
                 .attach_storage(storage.as_mut() as *mut Storage);
+            host.services_mut()
+                .attach_clock(clock.as_mut() as *mut FrameClock);
         }
         host.install(&engine).expect("install compat surface");
         Env {
@@ -143,6 +150,7 @@ impl Env {
             engine,
             _scene: scene,
             _storage: storage,
+            clock: RefCell::new(clock),
             decode_count,
         }
     }
@@ -181,19 +189,28 @@ impl Env {
             .expect_err(&format!("{expression:?} should have raised"))
     }
 
-    /// The frame-body step: advance every active transition by `dt_ms`.
+    /// The frame-body step: move the clock forward by `dt_ms` and advance
+    /// every active transition to it.
     fn advance(&self, dt_ms: f64) {
+        self.advance_clock(dt_ms);
         let ctx = self.host.ctx().expect("bound host");
-        compat::advance_transitions(&ctx, dt_ms).expect("advance transitions");
+        compat::advance_transitions(&ctx).expect("advance transitions");
     }
 
     /// One frame with the projection's drawn-layer report: the normal frame
     /// step, then the self-update step for the layers the projection emitted.
     fn advance_drawn(&self, dt_ms: f64, drawn: &[u32]) {
+        self.advance_clock(dt_ms);
         let ctx = self.host.ctx().expect("bound host");
-        compat::advance_transitions(&ctx, dt_ms).expect("advance transitions");
+        compat::advance_transitions(&ctx).expect("advance transitions");
         compat::advance_self_updating_transitions(&ctx, drawn)
             .expect("advance self-updating transitions");
+    }
+
+    /// Move the engine's frame clock forward by `dt_ms`.
+    fn advance_clock(&self, dt_ms: f64) {
+        let mut clock = self.clock.borrow_mut();
+        clock.advance(dt_ms);
     }
 }
 

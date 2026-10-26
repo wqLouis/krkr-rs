@@ -5,6 +5,42 @@
 //! wall clock is read here, and nothing above this layer keeps a second time
 //! base of its own.
 
+/// The source of a frame's elapsed time.
+///
+/// The engine owns the clock it advances; the caller owns where the elapsed
+/// time comes from. The windowed loop injects the real time the platform
+/// measured, the headless runner injects the frame period it simulates, and a
+/// test injects whatever it needs. One source per run: every timeline the
+/// frame derives comes from the value this reports.
+pub trait FrameTimeSource {
+    /// The milliseconds elapsed since the previous frame.
+    fn elapsed_ms(&self) -> f64;
+}
+
+/// A frame time the caller injects before every frame.
+///
+/// The value is written from outside the engine: the windowed loop writes
+/// the real elapsed time the platform measured, the headless runner writes
+/// the frame period it simulates.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct InjectedFrameTime {
+    /// The milliseconds elapsed since the previous frame.
+    pub elapsed_ms: f64,
+}
+
+impl InjectedFrameTime {
+    /// A frame time of `elapsed_ms` milliseconds.
+    pub fn new(elapsed_ms: f64) -> Self {
+        Self { elapsed_ms }
+    }
+}
+
+impl FrameTimeSource for InjectedFrameTime {
+    fn elapsed_ms(&self) -> f64 {
+        self.elapsed_ms
+    }
+}
+
 /// The engine's frame clock: a millisecond time base the frame advances.
 ///
 /// The clock holds the elapsed milliseconds since the engine started. The

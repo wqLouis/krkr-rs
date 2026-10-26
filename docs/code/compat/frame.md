@@ -87,12 +87,12 @@ pub fn run_frame_body(body: &mut dyn FrameBody, ctx: &mut CompatCtx) -> Result<(
 The steps, in order:
 
 1. `rehash_poll(ctx)` — request the periodic TJS object rehash. The reference
-   system watch timer calls `TJSDoRehash()` when the rough tick is more than
+   system watch timer calls `TJSDoRehash()` when its tick is more than
    1500 ms past the last rehash
    (`reference/cpp/core/environ/impl/SystemControl.cpp:181-185`); the rebuild
    is lazy, so this only bumps the magic before the frame's script polls.
-2. `timer_posts_poll(ctx)` — deliver the `onTimer` events L2's advance
-   posted.
+2. `timer_posts_poll(ctx)` — deliver the `onTimer` events the engine's
+   delivery posted.
 3. `sound_poll` → `sound_completed`.
 4. `video_poll` → `video_completed`.
 5. `async_trigger_poll` → `async_trigger_completed`.

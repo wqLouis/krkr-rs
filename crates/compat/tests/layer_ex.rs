@@ -21,6 +21,7 @@ use api::error::MediaError;
 use api::media::{AudioSpec, DecodedAudio, RgbaFrame, VideoSpec};
 use common::vm_lock;
 use compat::{CompatHost, VideoSource, movie_poll, set_movie_source};
+use engine::FrameClock;
 use engine::Scene;
 use tjs::{Tjs2Engine, TjsValue};
 
@@ -32,17 +33,23 @@ struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
     scene: Box<Scene>,
+    /// The engine's frame clock: the movie's picture follows it.
+    clock: RefCell<Box<FrameClock>>,
 }
 
 impl Env {
     fn new() -> Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut scene = Box::new(Scene::default());
+        let mut clock = Box::new(FrameClock::new());
         let mut host = CompatHost::new();
-        // SAFETY: the boxed scene outlives the host (declared after `_host`).
+        // SAFETY: the boxed scene and clock outlive the host (declared after
+        // `_host`).
         unsafe {
             host.services_mut()
                 .attach_scene(scene.as_mut() as *mut Scene);
+            host.services_mut()
+                .attach_clock(clock.as_mut() as *mut FrameClock);
         }
         host.install(&engine).expect("install compat surface");
         common::link_all_builtins(&engine);
@@ -50,7 +57,16 @@ impl Env {
             _host: host,
             engine,
             scene,
+            clock: RefCell::new(clock),
         }
+    }
+
+    /// Move the engine's clock forward by the given milliseconds and advance
+    /// the movie.
+    fn advance_movie(&self, dt_ms: f64) {
+        self.clock.borrow_mut().advance(dt_ms);
+        let ctx = self._host.ctx().expect("bound host");
+        movie_poll(&ctx, f64::MAX).expect("movie step");
     }
 
     fn run(&self, script: &str) {
@@ -266,7 +282,7 @@ fn a_movie_layer_is_released_when_the_script_drops_it() {
     // The callback is dispatched through the layer object, so the non-owning
     // handle must still resolve a live receiver.
     assert_eq!(env.eval_int("started"), 1);
-    movie_poll(&ctx, 16.0).expect("movie step");
+    env.advance_movie(16.0);
     assert_eq!(env.eval_int("mov.isPlayingMovie()"), 1);
     assert_eq!(env.scene.layers.len(), 1);
     assert_eq!(env.scene.bitmaps.len(), 1);
@@ -290,7 +306,7 @@ fn a_movie_layer_is_released_when_the_script_drops_it() {
         "the layer's main image must be freed with it"
     );
     // The frame body keeps running after the layer is gone.
-    movie_poll(&ctx, 16.0).expect("movie step after teardown");
+    env.advance_movie(16.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -966,7 +982,7 @@ fn movie_audio_reaches_the_mixer_at_the_default_gain() {
     // (`reference/cpp/core/movie/ffmpeg/VideoPlayer.cpp:201-205`), so
     // `startMovie` is where the audio starts.
     env.run("l.startMovie(false);");
-    compat::movie_poll(&ctx, 10.0).expect("poll");
+    env.advance_movie(10.0);
 
     let mut out = vec![0.0f32; 200];
     compat::sound_render(&ctx, &mut out, out_spec).expect("render");

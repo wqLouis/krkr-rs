@@ -56,7 +56,8 @@
 //! * `Timer`: constructor, `onTimer`; properties `interval`, `enabled`,
 //!   `capacity`, `mode`; [`timer_posts_poll`] delivers the queued `onTimer`
 //!   events through the object's `onTimer` member (so a script subclass
-//!   override runs), and [`timer_poll`] advances the attached registry first.
+//!   override runs), and [`timer_poll`] delivers the same events for a host
+//!   that advances the registry itself.
 //!
 //! # Deliberately deferred
 //!
@@ -70,15 +71,14 @@
 //!
 //! # Timer polling
 //!
-//! The L2 `engine_api::TimerState` registry is advanced by the L2 frame
+//! The L2 `engine_api::TimerState` registry is advanced by the engine's frame
 //! clock; its callbacks only queue `onTimer` events. [`timer_posts_poll`]
 //! delivers those queued events and is the first step of the frame body
-//! (`compat::frame::run_frame_body`). [`timer_poll`] stays for a host or test
-//! that drives the attached registry itself: it advances the registry at the
-//! registry's own injected `now_ms` and then drains. Both are `pub` free
-//! functions (like `system::continuous_handler_poll`) so the host can wire them
-//! without the natives exposing anything else; the dispatch itself stays in
-//! L3.
+//! (`compat::frame::run_frame_body`). [`timer_poll`] delivers the same events
+//! for a host or a test that advances the registry itself, and reports whether
+//! any timer remains armed. Both are `pub` free functions (like
+//! `system::continuous_handler_poll`) so the host can wire them without the
+//! natives exposing anything else; the dispatch itself stays in L3.
 #![allow(unsafe_code)]
 
 use crate::{CompatCtx, CompatError};
@@ -126,93 +126,4 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     font::register_font_class(ctx)?;
     timer::register_timer_class(ctx)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::cell::RefCell;
-
-    use super::timer_poll;
-    use crate::CompatHost;
-    use crate::engine_api::Scene;
-    use crate::engine_api::TimerState;
-    use tjs::{Tjs2Engine, TjsValue};
-
-    /// A bound VM + host + attached scene and timer registry.
-    ///
-    /// Fields drop in declaration order: the host first (releasing every
-    /// retained script object), then the engine, the scene and the L2 timer
-    /// registry.
-    struct Env {
-        host: CompatHost,
-        engine: Box<Tjs2Engine>,
-        /// Kept alive for the host's raw pointer; never read directly.
-        _scene: Box<Scene>,
-        /// The attached registry; tests move its injected time directly so a
-        /// poll never depends on the wall clock.
-        timer: RefCell<Box<TimerState>>,
-    }
-
-    impl Env {
-        fn new() -> Env {
-            let engine = Box::new(Tjs2Engine::new().expect("create engine"));
-            let mut scene = Box::new(Scene::default());
-            let mut timer = Box::new(TimerState::new());
-            let mut host = CompatHost::new();
-            // SAFETY: the boxed scene and timer registry outlive the host.
-            unsafe {
-                host.services_mut()
-                    .attach_scene(scene.as_mut() as *mut Scene);
-                host.services_mut()
-                    .attach_timer(timer.as_mut() as *mut TimerState);
-            }
-            host.install(&engine).expect("install compat surface");
-            Env {
-                host,
-                engine,
-                _scene: scene,
-                timer: RefCell::new(timer),
-            }
-        }
-
-        /// Move the attached registry's injected time forward by `ms`.
-        fn advance(&self, ms: u64) {
-            let mut timer = self.timer.borrow_mut();
-            timer.now_ms = timer.now_ms.saturating_add(ms);
-        }
-
-        fn eval_int(&self, expression: &str) -> i64 {
-            match self.engine.eval(expression, "timer-test") {
-                Ok(TjsValue::Integer(value)) => value,
-                other => panic!("{expression:?} returned {other:?}, expected an integer"),
-            }
-        }
-    }
-
-    #[test]
-    fn timer_poll_fires_the_callback() {
-        let _lock = crate::native_util::test_vm_lock();
-        let env = Env::new();
-        env.engine
-            .exec_script(
-                "var hits = 0; \
-                 var t = new Timer(function() { hits++; }, ''); \
-                 t.interval = 1; \
-                 t.enabled = true;",
-                "timer-test",
-            )
-            .expect("define timer");
-
-        // `timer_poll` advances the attached registry to its injected
-        // `now_ms`; a virtual frame step is enough for the 1 ms timer.
-        for _ in 0..200 {
-            env.advance(16);
-            let mut ctx = env.host.ctx().expect("bound host");
-            timer_poll(&mut ctx).expect("timer poll");
-            if env.eval_int("hits") >= 1 {
-                break;
-            }
-        }
-        assert!(env.eval_int("hits") >= 1, "the timer callback never ran");
-    }
 }

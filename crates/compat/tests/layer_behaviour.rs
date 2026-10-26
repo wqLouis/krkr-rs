@@ -37,9 +37,10 @@ use std::cell::RefCell;
 
 use common::vm_lock;
 use compat::CompatHost;
+use engine::FrameClock;
 use engine::Scene;
 use engine::input::InputState;
-use engine::timer::TimerState;
+use engine::timer::{TimerState, deliver_due};
 use tjs::{Tjs2Engine, TjsValue};
 
 /// Script label for diagnostics.
@@ -59,6 +60,8 @@ struct Env {
     timer: RefCell<Box<TimerState>>,
     /// Kept alive for the host's raw pointer; never read directly.
     input: Box<InputState>,
+    /// The engine's frame clock: the transition's phase follows it.
+    clock: RefCell<Box<FrameClock>>,
 }
 
 impl Env {
@@ -67,9 +70,10 @@ impl Env {
         let mut scene = Box::new(Scene::default());
         let mut timer = Box::new(TimerState::new());
         let mut input = Box::new(InputState::new());
+        let mut clock = Box::new(FrameClock::new());
         let mut host = CompatHost::new();
-        // SAFETY: the boxed scene, timer registry and input state outlive
-        // the host (they are declared after `_host`).
+        // SAFETY: the boxed scene, timer registry, input state and clock
+        // outlive the host (they are declared after `_host`).
         unsafe {
             host.services_mut()
                 .attach_scene(scene.as_mut() as *mut Scene);
@@ -77,6 +81,8 @@ impl Env {
                 .attach_timer(timer.as_mut() as *mut TimerState);
             host.services_mut()
                 .attach_input(input.as_mut() as *mut InputState);
+            host.services_mut()
+                .attach_clock(clock.as_mut() as *mut FrameClock);
         }
         host.install(&engine).expect("install compat surface");
         common::link_all_builtins(&engine);
@@ -86,6 +92,7 @@ impl Env {
             scene,
             timer: RefCell::new(timer),
             input,
+            clock: RefCell::new(clock),
         }
     }
 
@@ -123,16 +130,32 @@ impl Env {
         }
     }
 
-    /// Move the attached timer registry's injected time forward by `ms`.
+    /// Move the engine's frame clock forward by `ms` and move the timer
+    /// registry's injected time with it.
+    ///
+    /// The frame clock is the engine's time base; the registry's injected time
+    /// is the clock's value, the way the engine's pump sets it.
     fn advance_time(&self, ms: u64) {
+        let now_ms = self.clock.borrow_mut().advance(ms as f64);
         let mut timer = self.timer.borrow_mut();
-        timer.now_ms = timer.now_ms.saturating_add(ms);
+        timer.now_ms = now_ms;
+    }
+
+    /// Deliver the timers due at the registry's injected time.
+    ///
+    /// The registry's pump belongs to the engine; a test that owns the
+    /// registry drives it directly.
+    fn deliver_due(&self) {
+        let mut timer = self.timer.borrow_mut();
+        let now = timer.now_ms;
+        deliver_due(timer.as_mut(), now);
     }
 
     /// Move the attached timer registry's injected time forward by `ms` and
     /// poll once, so a due timer fires without a wall-clock wait.
     fn poll_timer_after(&self, ms: u64) {
         self.advance_time(ms);
+        self.deliver_due();
         let mut ctx = self._host.ctx().expect("bound host");
         compat::timer_poll(&mut ctx).expect("timer poll");
     }
@@ -2224,7 +2247,7 @@ fn layer_update_dispatches_on_paint_before_drawing() {
     // `compat::advance_transitions` / `compat::paint_poll`) runs the pending
     // `onPaint` before anything is rendered.
     let ctx = env._host.ctx().expect("bound host");
-    compat::advance_transitions(&ctx, 0.0).expect("advance transitions");
+    compat::advance_transitions(&ctx).expect("advance transitions");
     assert_eq!(
         env.eval_int("paints"),
         1,
@@ -2233,7 +2256,7 @@ fn layer_update_dispatches_on_paint_before_drawing() {
 
     // The reference clears `CallOnPaint` before posting, so a frame with no
     // new `update()` dispatches nothing.
-    compat::advance_transitions(&ctx, 0.0).expect("advance transitions");
+    compat::advance_transitions(&ctx).expect("advance transitions");
     assert_eq!(
         env.eval_int("paints"),
         1,
@@ -2242,7 +2265,7 @@ fn layer_update_dispatches_on_paint_before_drawing() {
 
     // A re-armed flag dispatches again on the following frame.
     env.run("p.update();");
-    compat::advance_transitions(&ctx, 0.0).expect("advance transitions");
+    compat::advance_transitions(&ctx).expect("advance transitions");
     assert_eq!(
         env.eval_int("paints"),
         2,

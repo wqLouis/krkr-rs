@@ -31,7 +31,7 @@ use std::cell::RefCell;
 
 use common::vm_lock;
 use compat::{CompatHost, timer_poll};
-use engine::timer::TimerState;
+use engine::timer::{TimerState, deliver_due};
 use tjs::{Tjs2Engine, TjsValue};
 
 /// Script label for diagnostics.
@@ -113,9 +113,15 @@ impl Env {
             .map_err(|error| error.to_string())
     }
 
-    /// One frame-body `timer_poll` step at the current injected time; returns
-    /// the registry's "any timer still enabled" reading.
+    /// One frame-body timer step at the current injected time: deliver the
+    /// timers due now, then hand the queued `onTimer` events to the script.
+    /// Returns the registry's "any timer still enabled" reading.
     fn poll(&self) -> bool {
+        {
+            let mut timer = self.timer.borrow_mut();
+            let now = timer.now_ms;
+            deliver_due(timer.as_mut(), now);
+        }
         let mut ctx = self._host.ctx().expect("bound host");
         timer_poll(&mut ctx).expect("timer poll")
     }
@@ -1567,7 +1573,7 @@ fn throwing_action_owner_keeps_its_receiver_on_the_next_fire() {
 /// with its own receiver as `this` (`tTJSVariantClosure::FuncCall` prefers
 /// `ObjThis` over the fallback object, `tjsVariant.h:219-228`).
 ///
-/// This drives the **engine** path (`timer_poll` → `TimerState::advance` →
+/// This drives the **engine** path (the registry's delivery →
 /// the registered callback → `dispatch_on_timer`), never a direct
 /// `timer.onTimer()` call, so it pins that the timer object is still retained
 /// at fire time and `target` is present in the delivered event.
@@ -1838,4 +1844,34 @@ fn voice_tjs_publishes_its_plugin_flag_and_the_action_reads_it() {
         1,
         "a dispatched action leaves the timer enabled"
     );
+}
+
+/// The registry's pump delivers the timer: the L2 registry advances, its
+/// callback posts the `onTimer` event, and the delivery step hands it to the
+/// script.
+///
+/// Reference: `tTJSNI_BaseTimer::Fire` does not call the action, it **posts**
+/// `onTimer` to the owner (`reference/cpp/core/utils/TimerIntf.cpp:100`), and
+/// the event loop delivers the queued events later, exclusive first and idle
+/// last (`reference/cpp/core/tjs2/EventIntf.cpp:426-519`).
+#[test]
+fn the_registry_pump_delivers_the_timer_to_the_script() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var hits = 0; \
+         var t = new Timer(function() { hits++; }, ''); \
+         t.interval = 1; \
+         t.enabled = true;",
+    );
+
+    // A virtual frame step is enough for the 1 ms timer.
+    for _ in 0..200 {
+        env.advance(16);
+        env.poll();
+        if env.eval_int("hits") >= 1 {
+            break;
+        }
+    }
+    assert!(env.eval_int("hits") >= 1, "the timer callback never ran");
 }

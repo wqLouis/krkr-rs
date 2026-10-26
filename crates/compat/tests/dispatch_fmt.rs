@@ -49,7 +49,7 @@ use compat::CompatHost;
 use engine::Scene;
 use engine::Storage;
 use engine::input::InputState;
-use engine::timer::TimerState;
+use engine::timer::{TimerState, deliver_due};
 use fs::FileSystem;
 use tjs::{Tjs2Engine, TjsValue};
 
@@ -187,9 +187,20 @@ impl Env {
         timer.now_ms = timer.now_ms.saturating_add(ms);
     }
 
+    /// Deliver the timers due at the registry's injected time.
+    ///
+    /// The registry's pump belongs to the engine; a test that owns the
+    /// registry drives it directly.
+    fn deliver_due(&self) {
+        let mut timer = self.timer.borrow_mut();
+        let now = timer.now_ms;
+        deliver_due(timer.as_mut(), now);
+    }
+
     /// One frame-body `timer_poll` step at a virtual 16 ms frame step.
     fn poll_timer(&self) -> bool {
         self.advance_time(16);
+        self.deliver_due();
         let mut ctx = self._host.ctx().expect("bound host");
         compat::timer_poll(&mut ctx).expect("timer poll")
     }

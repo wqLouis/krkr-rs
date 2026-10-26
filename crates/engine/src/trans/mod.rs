@@ -372,6 +372,9 @@ pub struct Trans {
     phase: i32,
     rule: Option<RuleMask>,
     completed: bool,
+    /// The tick the transition started at, when the caller drives it from a
+    /// clock.
+    start_tick: Option<u64>,
 }
 
 impl Trans {
@@ -425,6 +428,7 @@ impl Trans {
             phase: 0,
             rule,
             completed: false,
+            start_tick: None,
         })
     }
 
@@ -531,6 +535,28 @@ impl Trans {
         self.view()
     }
 
+    /// Records the tick the transition starts at.
+    ///
+    /// The transition's elapsed time is the difference between the clock's
+    /// value and this tick, so the phase follows the clock instead of an
+    /// accumulated frame delta. A transition that is not started at a tick
+    /// takes the tick of its first advance as its start.
+    pub fn start_at(&mut self, tick: u64) {
+        self.start_tick = Some(tick);
+    }
+
+    /// Advances the transition to the absolute tick `tick` and returns the new
+    /// [`TransStep`].
+    ///
+    /// The elapsed time is the difference between `tick` and the tick the
+    /// transition started at ([`Trans::start_at`]), so the phase is a function
+    /// of the clock rather than of the frames that happened to run. A tick
+    /// before the start counts as no elapsed time.
+    pub fn advance_to(&mut self, tick: u64) -> TransStep {
+        let start = *self.start_tick.get_or_insert(tick);
+        self.seek_ms(tick.saturating_sub(start) as f64)
+    }
+
     /// Set the elapsed time from an external tick source and return the new
     /// [`TransStep`].
     ///
@@ -575,6 +601,7 @@ impl Trans {
         self.elapsed_ms = 0.0;
         self.phase = 0;
         self.completed = false;
+        self.start_tick = None;
     }
 
     fn view(&self) -> TransStep {

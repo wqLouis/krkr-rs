@@ -21,7 +21,7 @@ use engine::imagedecode::DecodeStats;
 use engine::input::InputState;
 use engine::storage::{MountOptions, StartupPlan, StorageReadError};
 use engine::timer::TimerState;
-use engine::{GameFrame, PixelTranslation, Storage};
+use engine::{FrameTimeSource, GameFrame, PixelTranslation, Storage};
 use fs::{FileSystem, list};
 use platform::{FramePacing, PlatformError, PlatformEvent};
 use vm::{FrameCtx, VmHost};
@@ -129,12 +129,9 @@ impl TickPhases {
 /// The ordered frame-body polls the game host runs each frame (doc 08 §6).
 #[derive(Default)]
 struct Polls {
-    /// Elapsed milliseconds since the previous frame, forwarded to the layer
-    /// transition step.
-    dt_ms: f64,
-    /// Elapsed milliseconds since the previous frame, bounded by the audio
+    /// The most playback one frame may advance, in milliseconds: the audio
     /// pump's playback cap, forwarded to the movie steps.
-    movie_dt_ms: f64,
+    max_step_ms: f64,
     /// Wall-clock cost of each poll in the current frame.
     phases: FramePhases,
     /// Wall-clock cost of the VM tick's non-poll segments.
@@ -147,7 +144,7 @@ impl FrameBody for Polls {
     }
 
     fn video_poll(&mut self, ctx: &mut CompatCtx) -> Result<(), CompatError> {
-        compat::video_advance(ctx, self.movie_dt_ms)
+        compat::video_advance(ctx, self.max_step_ms)
     }
 
     fn async_trigger_poll(&mut self, ctx: &mut CompatCtx) -> Result<(), CompatError> {
@@ -163,11 +160,11 @@ impl FrameBody for Polls {
         // The movie frame body advances its overlays and copies the current
         // frame into the layer before the transition step composites it
         // (reference `layerExMovie::OnContinuousCallback`).
-        compat::movie_poll(ctx, self.movie_dt_ms)?;
+        compat::movie_poll(ctx, self.max_step_ms)?;
         // The frame body owns the per-frame transition step; the remaining
         // hand-offs are host drains the engine frame consumes after this poll
         // returns.
-        compat::advance_transitions(ctx, self.dt_ms).map_err(CompatError::Engine)?;
+        compat::advance_transitions(ctx).map_err(CompatError::Engine)?;
         // The script-cached layers composite after the transition step, so a
         // cache that contains a transition takes the frame just blended, and
         // before the engine frame uploads and projects.
@@ -408,11 +405,10 @@ struct VmHook<'a> {
 impl GameFrame for VmHook<'_> {
     fn before_render(&mut self, now_ms: u64, dt_ms: f64) -> Result<(), String> {
         let hook_started = Instant::now();
-        self.polls.dt_ms = dt_ms;
         // A movie's picture advances by the same bound the audio pump puts on
         // one frame's playback, so a long frame leaves the picture and the
         // sound equally far behind.
-        self.polls.movie_dt_ms = dt_ms.min(self.audio.max_chunk_ms());
+        self.polls.max_step_ms = self.audio.max_chunk_ms();
         // Pointer and touch positions arrive in device pixels while the scene's
         // hit-testing is in VM pixels, so those events are mapped back before
         // the VM sees them. Without a mapping, or at an identity mapping, the
@@ -740,8 +736,12 @@ impl GameHost {
     /// Returns the engine [`StepReport`] so a headless run can print the draw
     /// counters (they exist on the null backend only, see [`StepReport::stats`]);
     /// the windowed loop ignores them.
-    pub fn step(&mut self, dt_ms: f32, events: &[PlatformEvent]) -> Result<StepReport, GameError> {
-        self.step_with_pacing(dt_ms, events, FramePacing::default())
+    pub fn step(
+        &mut self,
+        clock: &dyn FrameTimeSource,
+        events: &[PlatformEvent],
+    ) -> Result<StepReport, GameError> {
+        self.step_with_pacing(clock, events, FramePacing::default())
     }
 
     /// Runs one frame exactly like [`Self::step`], but attributes a slow gap
@@ -758,11 +758,11 @@ impl GameHost {
     /// As [`Self::step`].
     pub fn step_with_pacing(
         &mut self,
-        dt_ms: f32,
+        clock: &dyn FrameTimeSource,
         events: &[PlatformEvent],
         pacing: FramePacing,
     ) -> Result<StepReport, GameError> {
-        let dt = f64::from(dt_ms.max(0.0));
+        let dt = clock.elapsed_ms().max(0.0);
         // The gap spans the previous frame, so attribute it before this step
         // overwrites the stored frame.
         if let Some(line) = self.last_frame.slow_frame_line(dt, pacing) {
@@ -787,7 +787,7 @@ impl GameHost {
                 hook_ms: 0.0,
                 audio_ms: 0.0,
             };
-            let report = self.host.step_with_frame(dt_ms, &mut hook)?;
+            let report = self.host.step_with_frame(clock, &mut hook)?;
             (report, hook.hook_ms, hook.audio_ms)
         };
         let total_ms = step_started.elapsed().as_secs_f64() * 1000.0;
@@ -1072,6 +1072,7 @@ fn run_startup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine::InjectedFrameTime;
 
     /// Serializes the tests that bind the process-global VM.
     fn vm_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1377,8 +1378,9 @@ mod tests {
         }
 
         assert_eq!(fired(&game), 0, "no frame has run yet");
+        let clock = InjectedFrameTime::new(16.0);
         for _ in 0..3 {
-            game.step(16.0, &[]).expect("step");
+            game.step(&clock, &[]).expect("step");
         }
         assert!(
             fired(&game) >= 1,

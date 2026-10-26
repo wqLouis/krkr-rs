@@ -172,22 +172,22 @@ The reference's layer exchange uses the swap form for a transition that ran
 
 ## 6. The frame pumps
 
-### `advance_transitions(ctx, dt_ms)`
+### `advance_transitions(ctx)`
 
 The frame-body step:
 
 1. `paint_poll(ctx)` — fires `onPaint` for every layer whose pending-paint
    flag is set, mirroring the reference's pre-draw step, which fires the
    `onPaint` event and then processes the transition in the same step.
-2. `advance(ctx, dt_ms, None)` — the continuous pump.
+2. `advance(ctx, None)` — the continuous pump.
 
 ### `advance_self_updating_transitions(ctx, drawn_layers)`
 
-The post-projection step: `advance(ctx, 0.0, Some(drawn_layers))`. The
+The post-projection step: `advance(ctx, Some(drawn_layers))`. The
 `drawn_layers` argument is the projection's actual emit report, including the
 descendants covered by a drawn cached ancestor.
 
-### `advance(ctx, dt_ms, drawn_layers)`
+### `advance(ctx, drawn_layers)`
 
 For each active transition:
 
@@ -195,15 +195,14 @@ For each active transition:
    died, the transition is torn down **without** the completion event.
 2. **Self-update routing.**
    * the continuous pump with `selfupdate` → the transition is **not** stepped;
-     the wall-clock time accumulates into `pending_ms` (only when there is no
-     `callback`);
+     the draw that reports its layer steps it;
    * the continuous pump without `selfupdate` → the transition steps
      normally;
    * the self-update pump without `selfupdate` → the transition is skipped;
    * the self-update pump with `selfupdate` → the transition proceeds **only
      if the projection drew it**. A drawn descendant counts, and a drawn
      cached ancestor reports the descendants it covered. If it was not drawn,
-     the accumulated time is kept for the next draw.
+     it keeps its place until a frame draws it.
 3. **The callback tick** is fetched *before* the visibility check. The
    callback's return value is the transition's elapsed time, converted with
    the integer cast. A non-numeric return raises
@@ -212,9 +211,11 @@ For each active transition:
    `"Layer.beginTransition: transition callback failed: {error}"`.
 4. **An invisible destination stops at that frame**, before rendering — but
    the completion event still fires.
-5. **Stepping**: with a callback the transition seeks to the tick; with
-   `selfupdate` and no callback it steps by the accumulated time; otherwise it
-   steps by `dt_ms`.
+5. **Stepping**: with a callback the transition seeks to the tick; otherwise
+   it advances to the **engine clock's** tick, and the machine's elapsed time
+   is the difference against the tick the transition started at — the form the
+   reference computes its phase in, a tick difference rather than an
+   accumulated frame delta.
 6. **Rendering**: the transition frame is written through the borrowed
    machine.
 7. **Completion**: the transition is torn down.

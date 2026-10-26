@@ -16,7 +16,8 @@ the texture table in step with the bitmaps; own the surface size and the
 presentation mapping, and report a script-side window resize to the composition
 root.
 
-The engine does **not** own a `dt`: the frame clock is injected
+The engine does **not** own a `dt`: the frame's elapsed time comes
+from the caller's clock source (`run(clock, …)`), the frame clock is injected
 (`frame(now_ms, …)`) or accumulated (`step(dt_ms, …)`). Nothing above L2 owns
 the delta.
 
@@ -80,12 +81,19 @@ and fits the presentation.
 
 ```rust
 impl Engine {
+    pub fn run(&mut self, clock: &dyn FrameTimeSource, hooks: &mut dyn GameFrame)
+        -> Result<FrameReport, EngineError>;
     pub fn step(&mut self, dt_ms: f32, hooks: &mut dyn GameFrame) -> Result<FrameReport, EngineError>;
     pub fn frame(&mut self, now_ms: u64, hooks: &mut dyn GameFrame) -> Result<FrameReport, EngineError>;
     pub fn resize(&mut self, size: (u32, u32)) -> Result<SurfaceEvent, EngineError>;
 }
 ```
 
+* `run(clock, …)` is the loop-level entry point: the caller chooses **where**
+  the elapsed time comes from — the windowed loop injects the real time the
+  platform measured, the headless runner injects the frame period it
+  simulates — and the engine adds it to its own clock. Every timeline the
+  frame derives comes from that one value.
 * `frame(now_ms, …)` **sets** the clock exactly, discarding any fractional
   remainder left by an earlier `step`; the delta handed to the hook is the
   distance from the previous frame's clock (zero on the first frame), so a
@@ -188,13 +196,13 @@ unfittable size names all three instead of only the last one.
 ## 3. The frame, in order
 
 `Engine::run_frame(now_ms, dt_ms, hooks)` runs exactly this sequence. The
-clock is already set when it starts: `step` accumulated the delta into it and
-`frame` put it at the injected value.
+clock is already set when it starts: `run` and `step` accumulated the delta
+into it and `frame` put it at the injected value.
 
 1. record the frame's clock (`last_now_ms`);
 2. `sync_presentation()` — refit the VM↔device mapping, observe the window
    client size;
-3. `timer.advance(now_ms)` — fire the due timers;
+3. `deliver_due(&mut self.timer, now_ms)` — fire the due timers;
 4. `hooks.before_render(now_ms, dt_ms)`;
 5. `sync_presentation()` again — the hook may have resized a window's primary
    layer;
@@ -261,7 +269,7 @@ script window size    ──► scene window client ──► take_window_resize
    L1 input events ──► (composition root maps device→VM) ──► InputState
                                                      │
   Engine::frame(now) ─┬─► sync_presentation ─► PixelTranslation::fit
-                       ├─► TimerState::advance ─► timer callbacks ─► L3 onTimer posts
+                       ├─► timer::deliver_due ─► timer callbacks ─► L3 onTimer posts
                        ├─► GameFrame::before_render ─► vm.tick + L3 event dispatch
                        ├─► overlay refresh
                        ├─► upload dirty bitmaps ─► texture table
@@ -296,13 +304,17 @@ warning with a named cause, or a counted skipped frame.
 
 ## 7. Current limits
 
-* **The mixer, the video pump and the non-self-updating transition pumps run
-  inside the `GameFrame` hook**, not inside L2; the self-updating
-  transitions advance from the `after_project` hook, which sees the
-  projection's draw report.
-* **`Engine::run(clock, hooks)` does not exist**: the platform loop still
-  owns the event pump and drives `Engine::step`.
-* **`TimerState::advance` is public**; it runs only inside `Engine::frame`.
+* **The mixer, the video pump and the transition pumps run inside the
+  `GameFrame` hook**, not inside L2; the self-updating transitions advance
+  from the `after_project` hook, which sees the projection's draw report.
+  Their *time* comes from the engine's clock: the transition's phase is the
+  clock's difference against the transition's start tick, and the picture's
+  step is the clock's elapsed time bounded by the audio cap.
+* **`Engine::run(clock, hooks)` takes the elapsed time from the caller's
+  clock source**; the platform loop still owns the event pump and drives the
+  engine once per frame.
+* **`TimerState::advance` is crate-private**; the pump's public face is
+  `timer::deliver_due`, which the compatibility layer does not call.
 * **The framebuffer is not a readback source.** `getPixel`, `piledCopy` and
   `saveLayerImage` read the CPU layer bitmap, which is VM-exact.
 

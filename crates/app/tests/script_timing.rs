@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use app::{GameHost, Host, HostConfig};
+use app::{GameHost, Host, HostConfig, InjectedFrameTime};
 use testkit::vm_lock;
 use tjs::TjsValue;
 use vm::VmHost;
@@ -86,7 +86,8 @@ fn a_script_timer_and_a_continuous_handler_fire_once_per_frame() {
     let (mut game, base) = open_game("script-timing", SCRIPT);
 
     for _ in 0..FRAMES {
-        game.step(FRAME_MS, &[]).expect("frame");
+        game.step(&InjectedFrameTime::new(f64::from(FRAME_MS)), &[])
+            .expect("frame");
     }
 
     let fires = eval_int(game.vm(), "fires");

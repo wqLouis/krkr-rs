@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use android_activity::{AndroidApp, MainEvent, PollEvent};
-use app::{BackendKind, GameHost, Host, HostConfig};
+use app::{BackendKind, GameHost, Host, HostConfig, InjectedFrameTime};
 use platform::{
     EventHandler, Flow, FramePacing, PlatformError, PlatformEvent, PlatformWindow, Ticker,
 };
@@ -42,6 +42,9 @@ pub(crate) struct AndroidHost {
     frame_interval: Duration,
     /// The running game, created by [`EventHandler::resumed`].
     running: Option<GameHost>,
+    /// The frame's elapsed time: the real time the platform measured,
+    /// injected into the engine's clock every frame.
+    frame_time: InjectedFrameTime,
     /// Input and focus events received since the last frame.
     pending_events: Vec<PlatformEvent>,
     /// Touch -> mouse synthesizer, kept across input batches because a tap or
@@ -70,6 +73,7 @@ impl AndroidHost {
             debug_overlay,
             frame_interval,
             running: None,
+            frame_time: InjectedFrameTime::default(),
             pending_events: Vec::new(),
             gestures: GestureSynthesizer::default(),
             gesture_clock: Instant::now(),
@@ -221,8 +225,11 @@ impl EventHandler for AndroidHost {
         let Some(game) = self.running.as_mut() else {
             return Flow::Continue;
         };
+        // The platform measured the real time since the previous frame; that
+        // measurement is the elapsed time the engine's clock advances by.
+        self.frame_time.elapsed_ms = f64::from(dt_ms);
         let events = std::mem::take(&mut self.pending_events);
-        let result = game.step_with_pacing(dt_ms, &events, pacing);
+        let result = game.step_with_pacing(&self.frame_time, &events, pacing);
         match result {
             Ok(_) => Flow::Continue,
             Err(error) => self.fail(format!("frame failed: {error}")),

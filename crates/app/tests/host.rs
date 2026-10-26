@@ -7,6 +7,7 @@ mod common;
 
 use api::config::CacheLimit;
 use api::host::SurfaceEvent;
+use app::InjectedFrameTime;
 use common::{build_solid_and_bitmap_scene, headless_host};
 use testkit::vm_lock;
 use tjs::TjsValue;
@@ -63,7 +64,7 @@ fn headless_frame_draws_texture_nodes() {
     let mut host = headless_host();
     build_solid_and_bitmap_scene(host.scene_mut());
 
-    let report = host.step(16.0).expect("step");
+    let report = host.step(&InjectedFrameTime::new(16.0)).expect("step");
     let stats = report.stats.expect("null frame stats");
     assert!(stats.texture_draws >= 2, "expected both layers as textures");
     assert_eq!(stats.missing_textures, 0, "dirty bitmaps must be uploaded");
@@ -76,12 +77,12 @@ fn dirty_bitmaps_create_and_upload_one_texture() {
     let bitmap = host.scene_mut().add_bitmap(2, 1, vec![9; 8]);
     assert!(host.textures().is_empty());
 
-    host.step(16.0).expect("step");
+    host.step(&InjectedFrameTime::new(16.0)).expect("step");
     assert_eq!(host.textures().len(), 1);
     assert!(!host.scene().bitmap(bitmap).expect("bitmap").dirty);
 
     // A clean bitmap must not be re-uploaded or re-created.
-    host.step(16.0).expect("step");
+    host.step(&InjectedFrameTime::new(16.0)).expect("step");
     assert_eq!(host.textures().len(), 1);
 }
 
@@ -97,7 +98,7 @@ fn resize_updates_surface_size() {
 fn frame_index_and_elapsed_advance() {
     let mut host = headless_host();
     for _ in 0..3 {
-        host.step(10.0).expect("step");
+        host.step(&InjectedFrameTime::new(10.0)).expect("step");
     }
     assert_eq!(host.frame_index(), 3);
     assert!((host.elapsed_ms() - 30.0).abs() < f64::EPSILON);
@@ -109,7 +110,7 @@ fn unchanged_revision_reuses_arena_and_mutation_reprojects() {
     build_solid_and_bitmap_scene(host.scene_mut());
 
     // The first frame always projects, whatever the revision.
-    host.step(16.0).expect("step");
+    host.step(&InjectedFrameTime::new(16.0)).expect("step");
     let projected_len = host.render_scene().nodes.len();
     let projected_ptr = host.render_scene().nodes.as_ptr();
     let projected_capacity = host.render_scene().nodes.capacity();
@@ -119,7 +120,7 @@ fn unchanged_revision_reuses_arena_and_mutation_reprojects() {
     // A frame with an unchanged structural revision reuses the persistent
     // arena: the node buffer keeps its identity/capacity and the projection is
     // untouched.
-    host.step(16.0).expect("step");
+    host.step(&InjectedFrameTime::new(16.0)).expect("step");
     assert_eq!(host.render_scene().nodes.len(), projected_len);
     assert_eq!(host.render_scene().nodes.as_ptr(), projected_ptr);
     assert_eq!(host.render_scene().nodes.capacity(), projected_capacity);
@@ -130,7 +131,7 @@ fn unchanged_revision_reuses_arena_and_mutation_reprojects() {
     // contract): an unchanged structural revision must not rebuild the render
     // scene.
     host.scene_mut().layers[1].rect.w = 123;
-    host.step(16.0).expect("step");
+    host.step(&InjectedFrameTime::new(16.0)).expect("step");
     assert_eq!(host.render_scene(), &snapshot);
 
     // Any `*_mut` accessor bumps the structural revision, so the next frame
@@ -139,7 +140,7 @@ fn unchanged_revision_reuses_arena_and_mutation_reprojects() {
     if let Some(layer) = host.scene_mut().layer_mut(background) {
         layer.rect.w = 160;
     }
-    host.step(16.0).expect("step");
+    host.step(&InjectedFrameTime::new(16.0)).expect("step");
     assert_ne!(host.render_scene(), &snapshot);
 }
 
@@ -190,7 +191,7 @@ fn a_script_window_resize_is_surfaced_once() {
 
     // The window the scene created is surfaced on the first frame, because
     // its client size differs from the framebuffer.
-    host.step(16.0).expect("step");
+    host.step(&InjectedFrameTime::new(16.0)).expect("step");
     assert_eq!(host.take_window_resize(), Some((320, 240)));
     assert_eq!(host.take_window_resize(), None, "a taken request is gone");
 
@@ -201,7 +202,7 @@ fn a_script_window_resize_is_surfaced_once() {
     if let Some(window_state) = host.scene_mut().window_mut(window) {
         window_state.inner_size = (400, 300);
     }
-    host.step(16.0).expect("step");
+    host.step(&InjectedFrameTime::new(16.0)).expect("step");
     assert_eq!(host.take_window_resize(), Some((400, 300)));
     assert_eq!(host.take_window_resize(), None, "a taken request is gone");
 
@@ -295,7 +296,7 @@ fn selfupdate_transition_advances_when_projection_draws_it() {
         .expect("start self-update transition");
 
     for _ in 0..8 {
-        game.step(16.0, &[]).expect("frame");
+        game.step(&InjectedFrameTime::new(16.0), &[]).expect("frame");
     }
     assert_eq!(
         eval_int(game.vm(), "hits"),

@@ -45,8 +45,8 @@
 //!
 //! [`sound_poll`] is the `sound_poll` step of the documented frame body
 //! (`compat::frame::FrameBody`); the host calls it once per frame. It advances
-//! the shared mixer to the L1 clock and forwards the L2 [`SoundEvent`]s the
-//! [`SoundBuffer::poll`] observed — `onStatusChanged(status)`,
+//! the shared mixer to the engine's frame clock and forwards the L2
+//! [`SoundEvent`]s the [`SoundBuffer::poll`] observed — `onStatusChanged(status)`,
 //! `onFadeCompleted()` and `onLabel(name)` — to the object's class chain, so a
 //! script subclass override runs first and may call `super`. The dispatch
 //! happens with the state borrow released, so a handler may call back into the
@@ -141,7 +141,6 @@ use crate::engine_api::{
     LoopCondition, LoopInfo, LoopLink, Mixer, SoundBuffer, SoundChannel, SoundError, SoundEvent,
     SoundLabel, SoundSource, Status,
 };
-use platform::Clock;
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
     NativeMethodDef, NativePropertyDef, NativeStaticMembers, RetainedValue, Tjs2Engine,
@@ -555,9 +554,7 @@ pub struct SoundState {
     objects: Map<u64, SoundObject>,
     /// Next object id (ids start at 1; 0 is the "not constructed" sentinel).
     next_id: u64,
-    /// The L1 monotonic clock that drives the fade beat in [`sound_poll`].
-    clock: Clock,
-    /// Milliseconds the clock read at the previous [`sound_poll`].
+    /// Milliseconds the frame clock read at the previous [`sound_poll`].
     last_poll_ms: u64,
     /// Whether [`sound_render`] advances the mixer by the frames it produces
     /// and [`sound_poll`] only dispatches events. The composition root enables
@@ -588,7 +585,6 @@ impl Default for SoundState {
             // run.
             objects: Map::with_hasher(crate::collections::hasher()),
             next_id: 0,
-            clock: Clock::default(),
             last_poll_ms: 0,
             render_driven: false,
             decoders: Vec::new(),
@@ -3125,13 +3121,24 @@ fn advance_and_dispatch(ctx: &mut CompatCtx, dt: f64) -> Result<(), CompatError>
 ///
 /// When the mixer is render-driven ([`set_sound_render_driven`]) the render
 /// seam has already advanced it, so this step only dispatches; otherwise it
-/// first advances the shared mixer to the L1 monotonic clock.
+/// first advances the shared mixer to the engine's frame clock.
+///
+/// # Errors
+///
+/// Returns [`CompatError::Engine`] when the host attached no frame clock: a
+/// playback position without a clock would be a time the game never reached.
 pub fn sound_poll(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let services = unsafe { ctx.services() };
+    let Some(clock) = services.clock() else {
+        return Err(CompatError::Engine(
+            "sound_poll: the frame clock is not attached".into(),
+        ));
+    };
     let dt = {
         let mut state = services.state::<SoundState>();
-        let now_ms = state.clock.now_ms();
+        // SAFETY: `attach_clock` guarantees the pointer stays valid.
+        let now_ms = unsafe { &*clock }.now_ms();
         // The first poll advances by the time elapsed since 0; timestamps that
         // move backwards advance by 0 (the same rule as `Mixer::advance_to`).
         let dt = now_ms.saturating_sub(state.last_poll_ms) as f64 / 1000.0;

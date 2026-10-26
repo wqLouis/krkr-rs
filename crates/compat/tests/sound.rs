@@ -27,6 +27,7 @@
 
 mod common;
 
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -36,6 +37,7 @@ use api::media::{AudioSpec, DecodedAudio};
 use common::vm_lock;
 use compat::{CompatHost, add_audio_decoder, set_sound_render_driven, sound_poll, sound_render};
 use engine::Storage;
+use engine::clock::FrameClock;
 use engine::sound::{AudioStream, LoopInfo, SoundError, SoundSource};
 use fs::FileSystem;
 use tjs::{Tjs2Engine, TjsValue};
@@ -110,6 +112,10 @@ struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
     _storage: Option<Box<Storage>>,
+    /// The frame clock the sound poll reads.
+    clock: RefCell<Box<FrameClock>>,
+    /// The instant the previous poll measured.
+    last_poll: Cell<Instant>,
 }
 
 impl Env {
@@ -145,6 +151,13 @@ impl Env {
                     .attach_storage(storage.as_mut() as *mut Storage);
             }
         }
+        let mut clock = Box::new(FrameClock::new());
+        // SAFETY: the boxed clock outlives the host (it is declared after
+        // `_host`, so it drops later), matching `attach_clock`.
+        unsafe {
+            host.services_mut()
+                .attach_clock(clock.as_mut() as *mut FrameClock);
+        }
         host.install(&engine).expect("install compat surface");
         common::link_all_builtins(&engine);
         if with_decoder {
@@ -162,6 +175,8 @@ impl Env {
             _host: host,
             engine,
             _storage: storage,
+            clock: RefCell::new(clock),
+            last_poll: Cell::new(Instant::now()),
         }
     }
 
@@ -236,7 +251,20 @@ impl Env {
     }
 
     /// One frame-body `sound_poll` step.
+    ///
+    /// The frame clock advances by the real time since the previous poll,
+    /// which is the elapsed time the application injects into every frame.
     fn poll(&self) {
+        let now = Instant::now();
+        let elapsed_ms = now
+            .saturating_duration_since(self.last_poll.get())
+            .as_secs_f64()
+            * 1000.0;
+        self.last_poll.set(now);
+        {
+            let mut clock = self.clock.borrow_mut();
+            clock.advance(elapsed_ms);
+        }
         let mut ctx = self._host.ctx().expect("bound host");
         sound_poll(&mut ctx).expect("sound poll");
     }
@@ -1876,6 +1904,13 @@ fn streaming_env() -> (Env, Arc<AtomicUsize>) {
         host.services_mut()
             .attach_storage(storage.as_mut().unwrap().as_mut() as *mut Storage);
     }
+    let mut clock = Box::new(FrameClock::new());
+    // SAFETY: the boxed clock outlives the host (it is declared after
+    // `_host`, so it drops later), matching `attach_clock`.
+    unsafe {
+        host.services_mut()
+            .attach_clock(clock.as_mut() as *mut FrameClock);
+    }
     host.install(&engine).expect("install compat surface");
     common::link_all_builtins(&engine);
     let reads = Arc::new(AtomicUsize::new(0));
@@ -1900,6 +1935,8 @@ fn streaming_env() -> (Env, Arc<AtomicUsize>) {
             _host: host,
             engine,
             _storage: storage,
+            clock: RefCell::new(clock),
+            last_poll: Cell::new(Instant::now()),
         },
         reads,
     )

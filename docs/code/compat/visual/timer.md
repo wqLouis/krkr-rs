@@ -155,18 +155,21 @@ For a host or a test that drives the registry itself:
 
 1. It requires an attached registry, else
    `CompatError::Engine("timer registry is not attached")`.
-2. It reads the registry's own injected `now_ms` and calls
-   `TimerState::advance(now)`. The advance collects the due timers in
-   **creation order**, re-arms them from `now` (no catch-up burst) and
-   invokes each callback. Each callback enqueues one post.
-3. It drains with `timer_posts_poll`.
-4. It returns whether any binding is **armed** — the "any timer still
+2. It drains with `timer_posts_poll`, which hands the queued `onTimer`
+   events to the script.
+3. It returns whether any binding is **armed** — the "any timer still
    enabled" signal the continuous-handler convention uses. A script-disabled
    timer, or one the reference would never post, does not keep the frame loop
    polling.
 
 **The frame body does not call `timer_poll`.** The L2 engine advances the
 registry before the hook runs.
+
+**The poll does not advance the registry.** The registry's pump belongs to
+the engine: `TimerState::advance` is crate-private and the compatibility
+layer cannot reach it. A host or a test that owns a registry delivers the due
+timers itself through `engine::timer::deliver_due`, and the callbacks enqueue
+the posts this poll drains.
 
 ---
 
@@ -254,7 +257,7 @@ missing registry and the missing owner handle.
 |---|---|
 | `attach_timer(*mut TimerState)` | the L2 registry |
 | `timer_posts_poll(&mut ctx)` | the frame body's timer drain (crate-internal) |
-| `compat::timer_poll(&mut ctx)` | the combined form for a host or test that drives the registry itself |
+| `compat::timer_poll(&mut ctx)` | the delivery form for a host or test that drives the registry itself |
 | `CompatHost::timer_count()` | the retention-leak diagnostic |
 
 The **host** (or the L2 engine) must advance the L2 registry; the L3 side
@@ -271,7 +274,7 @@ only delivers what the advance produced.
 | `crates/compat/tests/extend_dispatch.rs` | the subclass override and the capacity rules through the real dispatch path. |
 | `crates/compat/tests/visual.rs` | `timer_properties_round_trip`. |
 | `crates/compat/tests/dispatch_visual.rs` | the receiver routing. |
-| `crates/compat/src/natives/visual/mod.rs::timer_poll_fires_the_callback` | the in-crate poll. |
+| `crates/compat/tests/timer_behavior.rs::the_registry_pump_delivers_the_timer_to_the_script` | the registry's pump delivers the timer to the script. |
 
 ---
 

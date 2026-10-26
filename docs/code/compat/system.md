@@ -122,7 +122,12 @@ composition root; a host that attached none raises
 the game never reached.
 
 The periodic housekeeping intervals — the object rehash and the idle
-compaction — run on the **rough tick**, a wall clock of their own.
+compaction — run on the **same clock**: the reference derives the
+game-visible tick count from the platform's monotonic counter, so its rough
+tick and its tick count are one base read two ways
+(`reference/cpp/core/utils/TickCount.cpp:34` and `:112`), and the port has
+one clock too. A host that attached none raises rather than pacing the
+intervals against no clock at all.
 
 ### The periodic object rehash
 
@@ -185,7 +190,7 @@ process.
 
 | state | owner |
 |---|---|
-| the command-line vector, the exit request, `title`, `eventDisabled`, `exitOnWindowClose`, `exitOnNoWindowStartup`, `drawThreadNum`, the rough tick epoch, the compaction tick, the rehash tick, the UUID counter, the continuous handlers, the key-query edges | the **per-engine dispatch state** (`CompatServices::state::<SystemState>()`) |
+| the command-line vector, the exit request, `title`, `eventDisabled`, `exitOnWindowClose`, `exitOnNoWindowStartup`, `drawThreadNum`, the compaction tick, the rehash tick, the UUID counter, the continuous handlers, the key-query edges | the **per-engine dispatch state** (`CompatServices::state::<SystemState>()`) |
 | the tick count (`getTickCount`) | the **L2 frame clock** (`engine_api::FrameClock`) |
 | the string scratch buffer for returned strings | the **per-engine dispatch state** |
 | the screen size, the graphic cache, the graphic-cache limit | the **L2 scene** |

@@ -384,9 +384,11 @@ track on the shared mixer at the device defaults — unity gain, centre pan,
 because `layerExMovie` exposes no volume or pan members
 (`reference/cpp/plugins/layerExMovie.cpp:154-227`).
 
-The host drives the playback: `compat::movie_poll(ctx, dt_ms)` advances every
-playing movie, presents the frame, copies it into the layer and dispatches
-the callbacks. It is the analogue of the reference's continuous event hook
+The host drives the playback: `compat::movie_poll(ctx, max_step_ms)` advances
+every playing movie by the **engine clock's** elapsed time since the previous
+advance, bounded by the caller's cap, presents the frame, copies it into the
+layer and dispatches the callbacks. It is the analogue of the reference's
+continuous event hook
 (`reference/cpp/plugins/layerExMovie.cpp:288-312`).
 
 The compatibility layer owns no decoder: the host installs the same

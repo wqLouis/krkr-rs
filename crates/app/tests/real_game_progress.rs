@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use app::{GameHost, Host, HostConfig};
+use app::{GameHost, Host, HostConfig, InjectedFrameTime};
 use tjs::TjsValue;
 
 /// The frames the run drives.
@@ -192,7 +192,7 @@ fn drive(game: &mut GameHost) -> Run {
             run.budget_exceeded = true;
             break;
         }
-        if let Err(error) = game.step(FRAME_MS, &[]) {
+        if let Err(error) = game.step(&InjectedFrameTime::new(f64::from(FRAME_MS)), &[]) {
             run.frame_error = Some(format!("frame {frame}: {error}"));
             break;
         }

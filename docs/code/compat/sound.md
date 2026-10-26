@@ -245,7 +245,7 @@ scale, so the loop points keep their musical position.
 
 | state | owner |
 |---|---|
-| the mixer, the live buffers, the next id, the clock, the last poll tick, the render-driven flag, the installed decoders, the vocoder configs, the registered vis buffers, the focus mode | the **per-engine dispatch state** (`CompatServices::state::<SoundState>()`) |
+| the mixer, the live buffers, the next id, the last poll tick, the render-driven flag, the installed decoders, the vocoder configs, the registered vis buffers, the focus mode | the **per-engine dispatch state** (`CompatServices::state::<SoundState>()`) |
 | the L2 `SoundBuffer`, the channel id, the source, the last decoded format, the raw owner handle, the retained action owner, the retained `filters` array, the cached `flags` / `labels` objects, the flags (`use_vis_buffer`, `frequency`, `paused`), the fade state, the pending event queue | the **per-object payload** |
 | the playback state, the loop flags, the label cursor, the status | the **L2 sound model** |
 | the decoding | the **L1 media crate**, behind the host-installed decoder |
@@ -253,6 +253,10 @@ scale, so the loop points keep their musical position.
 The mixer's clock has two sources: the frame poll advances it, or the render
 path advances it by the frames it produced. The host selects with
 `set_sound_render_driven`.
+
+The frame poll's own step comes from the **engine's clock**: the sound state
+keeps no clock of its own, and the poll differences the engine's frame clock
+against the previous poll. The fade beat follows the same step.
 
 ---
 

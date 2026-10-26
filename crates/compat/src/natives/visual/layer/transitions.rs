@@ -35,12 +35,11 @@ use super::super::common::{
 use super::{LayerExtras, LayerInst, LayerTransition, bound};
 use crate::collections::Map;
 use crate::native_util::{args, report_error, services, set_void, value_as_string};
-use crate::natives::system::{tjs_string_to_real, value_as_bool};
+use crate::natives::system::{frame_clock_ms, tjs_string_to_real, value_as_bool};
 use crate::natives::tjsnum::tjs_string_to_integer;
 
 /// Per-transition state that is not part of the parent's `LayerTransition`:
-/// the script-driven update mode, the retained tick callback and the time
-/// accumulated while a self-updating transition waits for its next update.
+/// the script-driven update mode and the retained tick callback.
 #[derive(Default)]
 struct TransitionRuntimeState {
     entries: Map<u32, TransitionRuntime>,
@@ -49,7 +48,6 @@ struct TransitionRuntimeState {
 struct TransitionRuntime {
     self_update: bool,
     callback: Option<DetachedValue>,
-    pending_ms: f64,
 }
 
 /// `beginTransition(name [, withchildren [, transwith [, options]]])`.
@@ -183,7 +181,14 @@ extern "C" fn layer_begin_transition(
             ));
         }
         let has_images = dest_layer.bitmap.is_some() && source_layer.bitmap.is_some();
-        let trans = build_transition(&ctx, host.engine(), &name, a.get(3), dest_size)?;
+        let mut trans = build_transition(&ctx, host.engine(), &name, a.get(3), dest_size)?;
+        // The transition's elapsed time is the difference between the
+        // engine's clock and the tick it starts at, so the phase follows the
+        // clock rather than the frames that happen to run.
+        // SAFETY: the caller resolved `ctx` from the installed binding.
+        let services = unsafe { ctx.services() };
+        let start_tick = frame_clock_ms(services).map_err(|error| error.to_string())?;
+        trans.start_at(start_tick);
         // Without children both endpoints must have a main image. The
         // provider parses its options first, so a missing `time` wins over
         // this check.
@@ -220,7 +225,6 @@ extern "C" fn layer_begin_transition(
             TransitionRuntime {
                 self_update,
                 callback,
-                pending_ms: 0.0,
             },
         );
         Ok(())
@@ -884,8 +888,8 @@ fn layer_within(scene: &Scene, node: u32, root: u32) -> bool {
     false
 }
 
-/// Advance every active transition by `dt_ms` and tear down the finished or
-/// stopped ones.
+/// Advance every active transition to the engine's clock and tear down the
+/// finished or stopped ones.
 ///
 /// Each step produces one frame, so a running transition is visible frame by
 /// frame. A host that composites the projection records the frame on the layer
@@ -913,25 +917,25 @@ fn layer_within(scene: &Scene, node: u32, root: u32) -> bool {
 /// (`LayerIntf.cpp:6390-6404`), which fires the `onPaint` event and then
 /// processes the transition in the same pre-draw step.
 ///
-/// A self-updating transition is not stepped here. It accumulates the frame
-/// time and is advanced by [`advance_self_updating_transitions`] once the
-/// projection reports that its layer was drawn.
+/// A self-updating transition is not stepped here. It is advanced by
+/// [`advance_self_updating_transitions`] once the projection reports that its
+/// layer was drawn.
 ///
 /// # Errors
 ///
 /// Returns the failure of one transition step as a message; the remaining
 /// transitions still advance.
-pub fn advance_transitions(ctx: &crate::CompatCtx, dt_ms: f64) -> Result<(), String> {
+pub fn advance_transitions(ctx: &crate::CompatCtx) -> Result<(), String> {
     super::paint_poll(ctx)?;
-    advance(ctx, dt_ms, None)
+    advance(ctx, None)
 }
 
 /// Advance the self-updating transitions whose layer the projection drew.
 ///
 /// `drawn_layers` is the projection's actual emit report, including the
 /// descendants covered by a drawn cached ancestor. A transition whose
-/// destination or source subtree is in that report performs its pending step;
-/// one that was not drawn keeps its accumulated time for the next draw.
+/// destination or source subtree is in that report performs its step; one that
+/// was not drawn keeps its place until a frame draws it.
 ///
 /// # Errors
 ///
@@ -941,10 +945,14 @@ pub fn advance_self_updating_transitions(
     ctx: &crate::CompatCtx,
     drawn_layers: &[u32],
 ) -> Result<(), String> {
-    advance(ctx, 0.0, Some(drawn_layers))
+    advance(ctx, Some(drawn_layers))
 }
 
-fn advance(ctx: &crate::CompatCtx, dt_ms: f64, drawn_layers: Option<&[u32]>) -> Result<(), String> {
+fn advance(ctx: &crate::CompatCtx, drawn_layers: Option<&[u32]>) -> Result<(), String> {
+    // The transition's phase follows the engine's clock.
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    let services = unsafe { ctx.services() };
+    let clock_tick = frame_clock_ms(services).map_err(|error| error.to_string())?;
     let active: Vec<(u32, u32, bool)> = {
         // SAFETY: the caller resolved `ctx` from the installed binding.
         let services = unsafe { ctx.services() };
@@ -994,18 +1002,8 @@ fn advance(ctx: &crate::CompatCtx, dt_ms: f64, drawn_layers: Option<&[u32]>) -> 
         };
         match drawn_layers {
             None if self_update => {
-                // A self-updating transition is not on the continuous hook.
-                // Wall-clock time still runs, so accumulate it for the step
-                // the next draw performs.
-                // SAFETY: see above.
-                let mut runtime = unsafe { ctx.services() }.state::<TransitionRuntimeState>();
-                if let Some(entry) = runtime.entries.get_mut(&id)
-                    && entry.callback.is_none()
-                    && dt_ms.is_finite()
-                    && dt_ms > 0.0
-                {
-                    entry.pending_ms += dt_ms;
-                }
+                // A self-updating transition is not on the continuous hook:
+                // it is stepped by the draw that reports its layer.
                 continue;
             }
             None => {}
@@ -1031,16 +1029,6 @@ fn advance(ctx: &crate::CompatCtx, dt_ms: f64, drawn_layers: Option<&[u32]>) -> 
             ended.push((id, source, true));
             continue;
         }
-        let pending_ms = {
-            // SAFETY: see above.
-            let mut runtime = unsafe { ctx.services() }.state::<TransitionRuntimeState>();
-            let Some(entry) = runtime.entries.get_mut(&id) else {
-                continue;
-            };
-            let pending_ms = entry.pending_ms;
-            entry.pending_ms = 0.0;
-            pending_ms
-        };
         let done = {
             // SAFETY: see above.
             let services = unsafe { ctx.services() };
@@ -1050,13 +1038,16 @@ fn advance(ctx: &crate::CompatCtx, dt_ms: f64, drawn_layers: Option<&[u32]>) -> 
             };
             match tick {
                 Some(tick) => {
+                    // The script's tick is the transition's elapsed time: the
+                    // handler's tick count starts at zero when the script
+                    // supplies the tick.
                     entry.trans.seek_ms(tick);
                 }
-                None if self_update => {
-                    entry.trans.step(pending_ms);
-                }
                 None => {
-                    entry.trans.step(dt_ms);
+                    // The phase follows the engine's clock: the elapsed time
+                    // is the difference between the clock and the tick the
+                    // transition started at.
+                    entry.trans.advance_to(clock_tick);
                 }
             }
             let done = entry.trans.is_complete();

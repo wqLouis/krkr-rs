@@ -13,7 +13,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use engine::timer::{TimerError, TimerState};
+use engine::timer::{TimerError, TimerState, deliver_due};
 use engine::trans::Trans;
 use engine::{BitmapState, Scene};
 
@@ -38,7 +38,7 @@ fn once_timer_family_is_stopped_by_cancellation_not_by_a_budget() {
         .expect("create");
 
     for now in [1_000u64, 2_000, 3_000] {
-        assert_eq!(timers.advance(now), 2, "both fire at {now} ms");
+        assert_eq!(deliver_due(&mut timers, now), 2, "both fire at {now} ms");
     }
 
     // The script cancels one member mid-flight: every mutator of its id is
@@ -64,14 +64,14 @@ fn once_timer_family_is_stopped_by_cancellation_not_by_a_budget() {
         .enumerate()
     {
         assert_eq!(
-            timers.advance(now),
+            deliver_due(&mut timers, now),
             1,
             "survivor fire {} at {now} ms",
             5 + i
         );
     }
     timers.remove(survivor).expect("cancel survivor");
-    assert_eq!(timers.advance(100_000), 0);
+    assert_eq!(deliver_due(&mut timers, 100_000), 0);
 }
 
 /// Script-shaped gating round trip (what L3 does when the reference would
@@ -89,15 +89,15 @@ fn disarming_mid_flight_gates_delivery_and_rearming_starts_fresh() {
         .create_interval(10, Box::new(move |_| *inner.borrow_mut() += 1))
         .expect("create");
 
-    assert_eq!(timers.advance(10), 1);
-    assert_eq!(timers.advance(20), 1);
+    assert_eq!(deliver_due(&mut timers, 10), 1);
+    assert_eq!(deliver_due(&mut timers, 20), 1);
     assert_eq!(*hits.borrow(), 2);
 
     // The script gates the timer mid-flight; the deadline is gone, not
     // merely ignored.
     timers.set_enabled(id, false).expect("disarm");
     for now in [30u64, 40, 50, 10_000] {
-        assert_eq!(timers.advance(now), 0, "fired at {now} ms");
+        assert_eq!(deliver_due(&mut timers, now), 0, "fired at {now} ms");
     }
     assert_eq!(*hits.borrow(), 2);
 
@@ -107,9 +107,9 @@ fn disarming_mid_flight_gates_delivery_and_rearming_starts_fresh() {
     timers.set_interval(id, 5).expect("store");
     timers.now_ms = 20_000;
     timers.set_enabled(id, true).expect("re-arm");
-    assert_eq!(timers.advance(20_004), 0);
-    assert_eq!(timers.advance(20_005), 1);
-    assert_eq!(timers.advance(20_010), 1);
+    assert_eq!(deliver_due(&mut timers, 20_004), 0);
+    assert_eq!(deliver_due(&mut timers, 20_005), 1);
+    assert_eq!(deliver_due(&mut timers, 20_010), 1);
     assert_eq!(*hits.borrow(), 4);
 }
 
@@ -132,8 +132,8 @@ fn timer_removed_mid_flight_is_a_typed_miss_never_a_fire() {
 
     // Remove before the first due tick: only the survivor fires.
     timers.remove(doomed).expect("remove");
-    assert_eq!(timers.advance(10), 1);
-    assert_eq!(timers.advance(20), 1);
+    assert_eq!(deliver_due(&mut timers, 10), 1);
+    assert_eq!(deliver_due(&mut timers, 20), 1);
 
     // Typed errors for every mutator of the removed id — never a panic.
     assert_eq!(
@@ -150,7 +150,7 @@ fn timer_removed_mid_flight_is_a_typed_miss_never_a_fire() {
     // is safe: the next advance never mentions it again.
     timers.remove(survivor).expect("remove survivor");
     for now in [30u64, 40, 50] {
-        assert_eq!(timers.advance(now), 0);
+        assert_eq!(deliver_due(&mut timers, now), 0);
     }
 }
 

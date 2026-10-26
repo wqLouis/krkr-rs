@@ -116,7 +116,7 @@ fn mode_priority(mode: i64) -> u8 {
 /// The reference computes `cap = TVPLimitTimerCapacity ? 1 : (Capacity == 0 ?
 /// 65535 : Capacity)` and posts only while `cap - <queued> > 0`
 /// (`TimerIntf.cpp:71-93`); a non-positive capacity posts nothing. The L2
-/// registry fires a timer at most once per [`TimerState::advance`] and never
+/// registry fires a timer at most once per delivery and never
 /// catches up a late frame, so the queue depth here is at most one entry per
 /// timer and a positive capacity never drops a fire; a negative capacity is
 /// already expressed by not arming the L2 timer (`sync_schedule`). The check
@@ -1022,19 +1022,18 @@ extern "C" fn timer_mode_set(
     0
 }
 
-/// Fire every due timer: advance the attached L2 registry to its own injected
-/// `now_ms` — its callbacks post the `onTimer` events (see [`timer_callback`]) —
-/// then drain those posts, and return whether any timer remains **armed** (the
-/// `system::continuous_handler_poll` convention): a timer the script disabled
+/// Deliver the `onTimer` events the timer registry queued and return
+/// whether any timer remains **armed** (the `system::continuous_handler_poll`
+/// convention): a timer the script disabled
 /// or that the reference would never post (negative capacity, non-positive
 /// interval) does not keep the frame loop polling.
 ///
-/// The frame body does not call this: the L2 engine advances the timer
-/// registry before it runs, so [`timer_posts_poll`] already finds the posts
-/// here. This entry point stays for a host or test that drives the registry
-/// itself by writing [`TimerState::now_ms`]. Advancing at the registry's own
-/// `now_ms` delivers whatever is due and re-arms from it, so calling it twice
-/// at one timestamp delivers nothing the second time.
+/// The registry's pump belongs to the engine: it advances the registry and
+/// its callbacks post the `onTimer` events (see [`timer_callback`]). This
+/// step delivers the posts the pump produced and reports the armed state.
+///
+/// The frame body does not call this: the engine advances the timer registry
+/// before it runs, so [`timer_posts_poll`] already finds the posts here.
 ///
 /// Delivery failures inside the callbacks are logged by
 /// [`dispatch_on_timer`] and never disable the timer — the reference has no
@@ -1046,18 +1045,9 @@ extern "C" fn timer_mode_set(
 /// attached to the host.
 pub fn timer_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let timer_ptr = unsafe { ctx.services() }.timer();
-    let Some(timer_ptr) = timer_ptr else {
+    let attached = unsafe { ctx.services() }.timer().is_some();
+    if !attached {
         return Err(CompatError::Engine("timer registry is not attached".into()));
-    };
-    // SAFETY: `attach_timer` guarantees the pointer stays valid; the read ends
-    // before `advance` borrows the registry mutably.
-    let now = unsafe { &*timer_ptr }.now_ms;
-    // SAFETY: the callbacks invoked inside `advance` re-enter through the same
-    // handle strictly sequentially (the single-threaded attach contract).
-    let fired = unsafe { &mut *timer_ptr }.advance(now);
-    if fired > 0 {
-        log::trace!("timer_poll: {fired} timer(s) fired at {now}");
     }
     timer_posts_poll(ctx)?;
     // L3 mirrors what it pushed to L2 (`TimerBinding::armed`).

@@ -132,7 +132,7 @@ distinguishable instead of being flattened into a message.
   L1 render ─┤ RenderPipeline + Surface     ──▶ Engine (L2)                          │
   L1 platform┤ platform::run(DesktopApp)    ──▶ the event loop and the ticker        │
              │                                                                       │
-  L2 engine ─┤ Engine::step(dt, hooks)      ◀── the frame; the hook is VmHook        │
+  L2 engine ─┤ Engine::run(clock, hooks)    ◀── the frame; the hook is VmHook        │
              │                                                                       │
   L3 compat ─┤ CompatHost::install(engine)  ──▶ the script-visible surface           │
              │                                                                       │
@@ -147,9 +147,9 @@ tree depends on:
    `RuntimeConfig`; the emulator core reads no file, no environment variable
    and no platform store. See [config.md](config.md).
 2. **The core owns the frame.** Nothing above L2 owns a `dt`: the platform
-   loop measures it, the root passes it to `Engine::step`, and the engine
-   owns the clock, the timer pump, the projection and the single draw call.
-   See [`../arch/l2.md`](../../arch/l2.md) §5.
+   loop measures it, the root injects it into the engine's clock source, and
+   the engine owns the clock, the timer pump, the projection and the single
+   draw call. See [`../arch/l2.md`](../../arch/l2.md) §5.
 3. **The root owns the input mapping.** Pointer and touch positions arrive
    in device pixels; the root maps them back into VM pixels through the L2
    translation before the VM sees them, so an L3 hit-test never leaves VM

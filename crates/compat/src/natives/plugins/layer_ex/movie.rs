@@ -29,6 +29,7 @@ use tjs::{NativeObjThisMethodDef, Tjs2Engine, Value};
 use super::{VideoSource, bound, layer_from_objthis, scene_mut};
 use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_void};
+use crate::natives::system::frame_clock_f64;
 use crate::natives::video::{MovieAudio, Resync, decoded_audio, frame_resync};
 use crate::natives::visual::{ObjectKind, duplicate_object};
 use crate::storage::strip_file_media;
@@ -105,6 +106,8 @@ struct LayerExMovieState {
     source: Option<Box<dyn VideoSource>>,
     /// Layer id → playback slot.
     slots: Map<u32, MovieSlot>,
+    /// The engine clock's value at the last advance.
+    last_advance_ms: f64,
 }
 
 impl Default for LayerExMovieState {
@@ -114,6 +117,7 @@ impl Default for LayerExMovieState {
             // The slots are walked to dispatch the movie events, so the
             // table's order is fixed and the same in every run.
             slots: Map::with_hasher(crate::collections::hasher()),
+            last_advance_ms: 0.0,
         }
     }
 }
@@ -347,21 +351,22 @@ fn copy_frame(ctx: &CompatCtx, slot: &MovieSlot) {
 // Frame body
 // ---------------------------------------------------------------------------
 
-/// Advance every playing movie by `dt_ms`, present the frame at the new
-/// position, copy it into the layer, sync the movie's audio voice and
-/// dispatch the `onUpdateMovie` / `onStopMovie` callbacks.
+/// Advance every playing movie to the engine's clock, present the frame
+/// at the new position, copy it into the layer, sync the movie's audio voice
+/// and dispatch the `onUpdateMovie` / `onStopMovie` callbacks.
 ///
 /// The host calls this once per frame (reference
 /// `layerExMovie::OnContinuousCallback`). It is a free function (like
-/// `compat::video_poll`) so a host can drive it directly. The host bounds
-/// the step by the same cap its audio pump puts on one frame's playback, so
-/// the picture and the sound fall behind together.
+/// `compat::video_poll`) so a host can drive it directly. The picture's
+/// clock is the engine's; the host bounds the step by the same cap its audio
+/// pump puts on one frame's playback (`max_step_ms`), so the picture and the
+/// sound fall behind together.
 ///
 /// # Errors
 ///
 /// Returns [`CompatError::Engine`] when a movie cannot be advanced or its
 /// frame cannot be composited into the layer.
-pub fn movie_poll(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
+pub fn movie_poll(ctx: &CompatCtx, max_step_ms: f64) -> Result<(), CompatError> {
     // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `movie_poll`.
     let host = unsafe { ctx.engine() };
     // SAFETY: the caller holds a live, bound context.
@@ -370,13 +375,17 @@ pub fn movie_poll(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
         let mut state = services.state::<LayerExMovieState>();
         let mut source = state.source.take();
         let mut dispatch = Vec::new();
+        // The engine clock's elapsed time is the picture's step.
+        let now_ms = frame_clock_f64(services)?;
+        let dt = (now_ms - state.last_advance_ms).max(0.0).min(max_step_ms);
+        state.last_advance_ms = now_ms;
         for (&layer_id, slot) in state.slots.iter_mut() {
             if !slot.overlay.is_open() || !slot.playing {
                 continue;
             }
             // The clock moves first, then the frame is fetched once, so the
             // copy below shows the frame belonging to the new clock value.
-            slot.overlay.advance(dt_ms);
+            slot.overlay.advance(dt);
             slot.follow_audio(services);
             present(&mut source, slot);
             let events = slot.overlay.poll();
@@ -580,7 +589,7 @@ pub(super) fn layer_method_defs() -> Vec<NativeObjThisMethodDef> {
 mod tests {
     use super::*;
     use crate::CompatHost;
-    use crate::engine_api::Scene;
+    use crate::engine_api::{FrameClock, Scene};
     use api::media::VideoSpec;
     use std::sync::{Arc, MutexGuard};
     use tjs::TjsValue;
@@ -616,24 +625,38 @@ mod tests {
         host: CompatHost,
         engine: Box<Tjs2Engine>,
         scene: Box<Scene>,
+        /// The engine's frame clock: the movie's picture follows it.
+        clock: std::cell::RefCell<Box<FrameClock>>,
     }
 
     impl Env {
         fn new() -> Self {
             let engine = Box::new(Tjs2Engine::new().expect("create engine"));
             let mut scene = Box::new(Scene::default());
+            let mut clock = Box::new(FrameClock::new());
             let mut host = CompatHost::new();
-            // SAFETY: the boxed scene outlives the host (declared after it).
+            // SAFETY: the boxed scene and clock outlive the host (declared
+            // after it).
             unsafe {
                 host.services_mut()
                     .attach_scene(scene.as_mut() as *mut Scene);
+                host.services_mut()
+                    .attach_clock(clock.as_mut() as *mut FrameClock);
             }
             host.install(&engine).expect("install compat surface");
             Self {
                 host,
                 engine,
                 scene,
+                clock: std::cell::RefCell::new(clock),
             }
+        }
+
+        /// Move the engine's clock forward by `dt_ms` and advance the movie.
+        fn advance_movie(&self, dt_ms: f64) {
+            self.clock.borrow_mut().advance(dt_ms);
+            let ctx = self.host.ctx().expect("bound context");
+            movie_poll(&ctx, f64::MAX).expect("poll");
         }
 
         fn run(&self, script: &str) {
@@ -725,7 +748,7 @@ mod tests {
         let id = env.layer_id();
         open_movie(&ctx, id, "movie.mpg", false).expect("open");
         start_movie(&ctx, &env.engine, id, false).expect("start");
-        movie_poll(&ctx, 50.0).expect("poll");
+        env.advance_movie(50.0);
         assert_eq!(env.bitmap_color(1, 1), [255, 0, 0, 255]);
         assert!(is_playing(&ctx, id));
     }
@@ -755,7 +778,7 @@ mod tests {
         );
         env.run("l.openMovie('movie.mpg', false); l.startMovie(false);");
         assert_eq!(env.eval_int("started"), 1);
-        movie_poll(&ctx, 50.0).expect("poll");
+        env.advance_movie(50.0);
         assert_eq!(env.eval_int("updated"), 1);
         env.run("l.stopMovie();");
         assert_eq!(env.eval_int("stopped"), 1);

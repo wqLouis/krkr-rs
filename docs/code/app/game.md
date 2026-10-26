@@ -173,9 +173,11 @@ projects and draws.
 ### `before_render(now_ms, dt_ms)`
 
 * the frame's `dt` is handed to the frame body;
-* the movie's `dt` is the same `dt` bounded by the audio pump's playback
-  cap, so a long frame leaves the picture and the sound equally far behind
-  instead of pulling them apart;
+* the movie and the video step are bounded by the audio pump's playback cap,
+  so a long frame leaves the picture and the sound equally far behind instead
+  of pulling them apart. The step itself is the engine clock's elapsed time,
+  which the compatibility layer reads from the clock the composition root
+  attached;
 * the position-carrying events are **mapped from device pixels into VM
   pixels** through the L2 translation. Only the pointer position and a
   touch contact carry a coordinate; buttons, wheels, keys, text, focus and
@@ -203,7 +205,7 @@ updated by a script still advances when the projection draws it.
 ```
 drain the onTimer posts the engine already fired
   → sound_poll      → compat::sound_poll
-  → video_poll      → compat::video_advance(movie_dt)
+  → video_poll      → compat::video_advance(audio cap)
   → async_trigger_poll
   → continuous_handler_poll
   → idle compaction

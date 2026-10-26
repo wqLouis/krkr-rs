@@ -14,9 +14,10 @@
 //! root, and draw it with a single pipeline call. A size pair that cannot be
 //! fitted skips everything that draws.
 //!
-//! Nothing here reads a wall clock. [`Engine::frame`] takes the time and
-//! [`Engine::step`] adds a delta to the clock the engine already holds, so a
-//! test drives exactly the same code path as the running game.
+//! Nothing here reads a wall clock. [`Engine::run`] takes the elapsed
+//! time from the caller's clock source, [`Engine::frame`] takes the absolute
+//! time and [`Engine::step`] adds a delta to the clock the engine already
+//! holds, so a test drives exactly the same code path as the running game.
 //!
 //! The two traits are the only places where behaviour from higher layers
 //! enters: [`GameFrame`] is the per-frame upward edge implemented above this
@@ -37,7 +38,7 @@ use render::{
     resize as resize_render, upload_textures,
 };
 
-use crate::clock::FrameClock;
+use crate::clock::{FrameClock, FrameTimeSource, InjectedFrameTime};
 use crate::hasher::{Map, map};
 use crate::imagedecode::{
     DecodePool, DecodePoolConfig, DecodePoolError, DecodeStats, ImageDecoder,
@@ -46,7 +47,7 @@ use crate::projection::{ProjectionReport, project_scene_report};
 use crate::scene::{BitmapState, Scene};
 use crate::shader::{PipelineId, Program, ProgramDesc, ShaderError, ShaderId, ShaderLibrary};
 use crate::storage::{StoragePoolConfig, StoragePoolError, StorageReadPool, StorageReader};
-use crate::timer::TimerState;
+use crate::timer::{TimerState, deliver_due};
 use crate::translate::{PixelTranslation, TranslateError};
 
 /// The bottom objects and initial state [`Engine::new`] assembles into an
@@ -397,8 +398,9 @@ pub struct FrameReport {
     pub frame_index: u64,
     /// The frame clock this frame ran at, in milliseconds.
     ///
-    /// A clock advanced with [`Engine::step`] keeps its accumulated fractional
-    /// part; [`Engine::frame`] sets it to the injected whole millisecond.
+    /// A clock advanced with [`Engine::run`] or [`Engine::step`] keeps its
+    /// accumulated fractional part; [`Engine::frame`] sets it to the injected
+    /// whole millisecond.
     pub elapsed_ms: f64,
     /// Whether the frame was presented to the surface.
     ///
@@ -426,7 +428,7 @@ pub struct FrameReport {
 /// Every value is a field of this object; there are no globals, statics or
 /// hidden caches, so two engines can run in one process. Callers reach the
 /// layer system through [`Engine::scene`] / [`Engine::scene_mut`] and drive
-/// frames through [`Engine::step`] / [`Engine::frame`].
+/// frames through [`Engine::run`] / [`Engine::step`] / [`Engine::frame`].
 pub struct Engine {
     /// Stateless render service.
     pipeline: RenderPipeline,
@@ -733,6 +735,36 @@ impl Engine {
             .pipeline(&self.pipeline, &mut self.render_state, shader, blend)
     }
 
+    /// Advances the frame clock by the elapsed time `clock` reports and
+    /// draws one frame.
+    ///
+    /// This is the frame's loop-level entry point: the caller chooses where
+    /// the elapsed time comes from — the windowed loop injects the real time
+    /// the platform measured, the headless runner injects the frame period it
+    /// simulates — and every timeline the frame derives comes from that one
+    /// value.
+    ///
+    /// A negative elapsed time counts as zero. The delta is accumulated with
+    /// its fractional part, so sixty 16.6 ms frames advance the clock by
+    /// 996 ms, not 960. The `now_ms` handed to the timer, hook and overlay is
+    /// the accumulated clock's whole-millisecond part.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when the frame hook, the overlay, or a render
+    /// action fails.
+    pub fn run(
+        &mut self,
+        clock: &dyn FrameTimeSource,
+        hooks: &mut dyn GameFrame,
+    ) -> Result<FrameReport, EngineError> {
+        let dt_ms = clock.elapsed_ms().max(0.0);
+        // The clock keeps the sub-millisecond remainder, so a 60 fps frame
+        // does not lose most of a millisecond on every frame.
+        let now_ms = self.clock.advance(dt_ms);
+        self.run_frame(now_ms, dt_ms, hooks)
+    }
+
     /// Advances the frame clock by `dt_ms` and draws one frame.
     ///
     /// A negative delta counts as zero. The delta is accumulated with its
@@ -749,11 +781,8 @@ impl Engine {
         dt_ms: f32,
         hooks: &mut dyn GameFrame,
     ) -> Result<FrameReport, EngineError> {
-        let dt_ms = f64::from(dt_ms.max(0.0));
-        // The clock keeps the sub-millisecond remainder, so a 60 fps step
-        // does not lose most of a millisecond on every frame.
-        let now_ms = self.clock.advance(dt_ms);
-        self.run_frame(now_ms, dt_ms, hooks)
+        let clock = InjectedFrameTime::new(f64::from(dt_ms.max(0.0)));
+        self.run(&clock, hooks)
     }
 
     /// Draws one frame at the injected clock value `now_ms`.
@@ -796,7 +825,7 @@ impl Engine {
     ) -> Result<FrameReport, EngineError> {
         self.last_now_ms = Some(now_ms);
         self.sync_presentation();
-        self.timer.advance(now_ms);
+        deliver_due(&mut self.timer, now_ms);
         // The storage barrier: the reads the previous frame scheduled are
         // published before the hook runs, so a read the script makes now
         // finds its result ready.

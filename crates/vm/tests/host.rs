@@ -1,6 +1,7 @@
 //! Integration tests for the L4 VM host.
 
 use compat::{CompatCtx, CompatError, FrameBody};
+use engine::clock::FrameClock;
 use testkit::vm_lock;
 use tjs::TjsValue;
 use vm::{FrameCtx, VmHost};
@@ -40,7 +41,19 @@ impl FrameBody for Recorder {
 #[test]
 fn exec_eval_and_tick() {
     let _lock = vm_lock();
-    let mut vm = VmHost::with_default().expect("create vm host");
+    // The frame body the host runs reads the L2 frame clock, so the harness
+    // attaches one before the compat surface is installed. The boxed clock
+    // outlives the host: it is declared first, so it drops last.
+    let mut clock = Box::new(FrameClock::new());
+    let clock_ptr = clock.as_mut() as *mut FrameClock;
+    let mut vm = VmHost::with_default_services(move |services| {
+        // SAFETY: the boxed clock outlives the host, so the pointer stays
+        // valid for as long as the compat binding can read it.
+        unsafe {
+            services.attach_clock(clock_ptr);
+        }
+    })
+    .expect("create vm host");
 
     vm.exec("var counter = 1;", "boot").expect("exec");
     assert_eq!(

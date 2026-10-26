@@ -63,7 +63,7 @@ use crate::native_util::{
     args, report_error, services, set_bool, set_int, set_void, value_as_string, value_ref,
 };
 use crate::natives::sound::{SoundState, TVP_VOLUME_SCALE};
-use crate::natives::system::{resolve, value_as_bool, value_as_i64};
+use crate::natives::system::{frame_clock_f64, resolve, value_as_bool, value_as_i64};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 
@@ -465,6 +465,8 @@ struct VideoState {
     next_id: u32,
     /// The host-decoded source (installed by the host before `open`).
     source: Option<Box<dyn VideoSource>>,
+    /// The engine clock's value at the last advance.
+    last_advance_ms: f64,
 }
 
 impl Default for VideoState {
@@ -475,6 +477,7 @@ impl Default for VideoState {
             overlays: Map::with_hasher(crate::collections::hasher()),
             next_id: 0,
             source: None,
+            last_advance_ms: 0.0,
         }
     }
 }
@@ -2589,19 +2592,20 @@ const MODE_LAYER: i64 = 1;
 /// `vomMixer`: the frame is presented through the mixing layer.
 const MODE_MIXER: i64 = 2;
 
-/// Advance every open overlay by `dt_ms`, present the host frame at the new
-/// position, composite it into the script layers the mode selects and dispatch
-/// the queued events.
+/// Advance every open overlay to the engine's clock, present the host frame
+/// at the new position, composite it into the script layers the mode selects
+/// and dispatch the queued events.
 ///
-/// The frame body passes its own per-frame `dt`; the advance never reads wall
-/// time. The host bounds the step by the same cap its audio pump puts on one
-/// frame's playback, so the picture and the sound fall behind together.
+/// The picture's clock is the engine's: the step is the difference against the
+/// previous advance. The host bounds the step by the same cap its audio pump
+/// puts on one frame's playback (`max_step_ms`), so the picture and the sound
+/// fall behind together.
 ///
 /// # Errors
 ///
 /// Returns [`CompatError::Engine`] when an overlay cannot be advanced or
 /// its frame cannot be composited into the script layers.
-pub fn video_advance(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
+pub fn video_advance(ctx: &CompatCtx, max_step_ms: f64) -> Result<(), CompatError> {
     // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `video_advance`.
     let host = unsafe { ctx.engine() };
     // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `video_advance`.
@@ -2613,11 +2617,15 @@ pub fn video_advance(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
         let mut state = services.state::<VideoState>();
         let mut source = state.source.take();
         let mut pending = Vec::new();
+        // The engine clock's elapsed time is the picture's step.
+        let now_ms = frame_clock_f64(services)?;
+        let dt = (now_ms - state.last_advance_ms).max(0.0).min(max_step_ms);
+        state.last_advance_ms = now_ms;
         for slot in state.overlays.values_mut() {
             if !slot.overlay.is_open() {
                 continue;
             }
-            slot.overlay.advance(dt_ms);
+            slot.overlay.advance(dt);
             slot.follow_audio(services);
             // The frame is fetched once, after the clock moved, so the picture
             // belongs to the position the overlay is at.

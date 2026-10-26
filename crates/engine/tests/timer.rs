@@ -1,18 +1,19 @@
 //! Integration tests for the L2 timer registry (`engine::timer`).
 //!
 //! The registry is clock-free: time enters only through the [`TimerState::now_ms`]
-//! field (inject without delivering) and `advance` (inject and deliver), so every
+//! field (inject without delivering) and the delivery step (inject and
+//! deliver), so every
 //! test is
 //! deterministic. The contract under test: a timer repeats by construction
 //! until removed or disabled, due callbacks run in creation order exactly
-//! once per advance, callbacks may re-enter the registry (create timers,
+//! once per delivery, callbacks may re-enter the registry (create timers,
 //! change intervals, remove themselves, even panic), and every stale id or
 //! zero interval is a typed error — never a panic, never a silent success.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use engine::timer::{TimerCallback, TimerError, TimerState};
+use engine::timer::{TimerCallback, TimerError, TimerState, deliver_due};
 
 /// A callback that records the firing timer's raw id into `log`.
 fn recorder(log: &Rc<RefCell<Vec<u64>>>) -> TimerCallback {
@@ -40,19 +41,19 @@ fn create_interval_fires_one_interval_from_now_then_repeats() {
     let id = timers.create_interval(10, recorder(&log)).expect("create");
 
     // Not due before the first deadline, due exactly on it.
-    assert_eq!(timers.advance(1_009), 0);
-    assert_eq!(timers.advance(1_010), 1);
+    assert_eq!(deliver_due(&mut timers, 1_009), 0);
+    assert_eq!(deliver_due(&mut timers, 1_010), 1);
     assert_eq!(log.borrow().as_slice(), &[id.value()]);
 
     // Repeats on the interval: nothing between deadlines, one fire each.
-    assert_eq!(timers.advance(1_019), 0);
-    assert_eq!(timers.advance(1_020), 1);
+    assert_eq!(deliver_due(&mut timers, 1_019), 0);
+    assert_eq!(deliver_due(&mut timers, 1_020), 1);
 
     // A late frame fires exactly once and re-arms from `now` — no catch-up
     // burst.
-    assert_eq!(timers.advance(1_100), 1);
-    assert_eq!(timers.advance(1_101), 0);
-    assert_eq!(timers.advance(1_110), 1);
+    assert_eq!(deliver_due(&mut timers, 1_100), 1);
+    assert_eq!(deliver_due(&mut timers, 1_101), 0);
+    assert_eq!(deliver_due(&mut timers, 1_110), 1);
     assert_eq!(log.borrow().len(), 4);
 }
 
@@ -64,21 +65,25 @@ fn disabling_drops_the_deadline_and_reabling_arms_from_now() {
     // `create_interval` arms at the injected now + interval (now = 0).
     let id = timers.create_interval(10, callback).expect("create");
     timers.set_enabled(id, false).expect("disable");
-    assert_eq!(timers.advance(1_000_000), 0, "a disarmed timer never fires");
+    assert_eq!(
+        deliver_due(&mut timers, 1_000_000),
+        0,
+        "a disarmed timer never fires"
+    );
 
     // Re-enabling arms from the injected now, not from any stale deadline.
     timers.now_ms = 5_000;
     timers.set_enabled(id, true).expect("enable");
-    assert_eq!(timers.advance(5_009), 0);
-    assert_eq!(timers.advance(5_010), 1);
+    assert_eq!(deliver_due(&mut timers, 5_009), 0);
+    assert_eq!(deliver_due(&mut timers, 5_010), 1);
     assert_eq!(hits.get(), 1);
 
     // Disabling keeps the callback: a later enable fires again.
     timers.set_enabled(id, false).expect("disable");
-    assert_eq!(timers.advance(10_000), 0);
+    assert_eq!(deliver_due(&mut timers, 10_000), 0);
     timers.now_ms = 20_000;
     timers.set_enabled(id, true).expect("enable");
-    assert_eq!(timers.advance(20_010), 1);
+    assert_eq!(deliver_due(&mut timers, 20_010), 1);
     assert_eq!(hits.get(), 2);
 }
 
@@ -88,24 +93,24 @@ fn set_interval_rearms_an_armed_timer_from_now_and_stores_while_disarmed() {
     let (callback, hits) = counter();
     let id = timers.create_interval(100, callback).expect("create");
 
-    assert_eq!(timers.advance(100), 1);
+    assert_eq!(deliver_due(&mut timers, 100), 1);
 
     // The re-arm origin is the injected now (L3's property-write
     // timestamp), not the previous deadline and not the last poll.
     timers.now_ms = 200;
     timers.set_interval(id, 20).expect("set interval");
-    assert_eq!(timers.advance(219), 0);
-    assert_eq!(timers.advance(220), 1);
+    assert_eq!(deliver_due(&mut timers, 219), 0);
+    assert_eq!(deliver_due(&mut timers, 220), 1);
 
     // A disarmed timer just stores the interval; the next enable arms with
     // the new value.
     timers.set_enabled(id, false).expect("disable");
     timers.set_interval(id, 5).expect("store");
-    assert_eq!(timers.advance(10_000), 0);
+    assert_eq!(deliver_due(&mut timers, 10_000), 0);
     timers.now_ms = 300;
     timers.set_enabled(id, true).expect("enable");
-    assert_eq!(timers.advance(304), 0);
-    assert_eq!(timers.advance(305), 1);
+    assert_eq!(deliver_due(&mut timers, 304), 0);
+    assert_eq!(deliver_due(&mut timers, 305), 1);
     assert_eq!(hits.get(), 3);
 }
 
@@ -119,12 +124,17 @@ fn a_repeating_timer_fires_until_it_is_removed() {
     // itself: it fires every interval until the owner removes (cancels) or
     // disables it.
     for i in 1..=101u64 {
-        assert_eq!(timers.advance(i * 10), 1, "fire {i} at {} ms", i * 10);
+        assert_eq!(
+            deliver_due(&mut timers, i * 10),
+            1,
+            "fire {i} at {} ms",
+            i * 10
+        );
     }
     assert_eq!(log.borrow().len(), 101);
 
     timers.remove(id).expect("cancel");
-    assert_eq!(timers.advance(1_000_000), 0);
+    assert_eq!(deliver_due(&mut timers, 1_000_000), 0);
     assert_eq!(log.borrow().len(), 101, "a removed timer never fires again");
 }
 
@@ -137,7 +147,7 @@ fn due_callbacks_run_in_creation_order() {
     let second = timers.create_interval(10, recorder(&log)).expect("second");
     let third = timers.create_interval(10, recorder(&log)).expect("third");
 
-    assert_eq!(timers.advance(510), 3);
+    assert_eq!(deliver_due(&mut timers, 510), 3);
     assert_eq!(
         *log.borrow(),
         vec![first.value(), second.value(), third.value()],
@@ -154,7 +164,7 @@ fn zero_intervals_and_stale_ids_are_typed_errors() {
     let mut timers = TimerState::new();
 
     // A zero interval is not representable in L2: it would be due on every
-    // advance. L3 maps a script `interval <= 0` onto not arming instead.
+    // delivery. L3 maps a script `interval <= 0` onto not arming instead.
     assert_eq!(
         timers.create_interval(0, Box::new(|_| {})),
         Err(TimerError::InvalidInterval)
@@ -177,7 +187,7 @@ fn zero_intervals_and_stale_ids_are_typed_errors() {
         Err(TimerError::UnknownTimer(id))
     );
     assert_eq!(timers.remove(id), Err(TimerError::UnknownTimer(id)));
-    assert_eq!(timers.advance(u64::MAX), 0);
+    assert_eq!(deliver_due(&mut timers, u64::MAX), 0);
 }
 
 #[test]
@@ -187,24 +197,24 @@ fn now_ms_injects_time_without_delivering() {
     let id = timers.create_interval(10, callback).expect("create");
 
     // `now_ms` past the deadline must neither fire nor reschedule: only
-    // `advance` delivers, and the deadline is untouched.
+    // The delivery delivers, and the deadline is untouched.
     timers.now_ms = 1_000_000;
-    assert_eq!(timers.advance(9), 0);
-    assert_eq!(timers.advance(10), 1);
+    assert_eq!(deliver_due(&mut timers, 9), 0);
+    assert_eq!(deliver_due(&mut timers, 10), 1);
     assert_eq!(hits.get(), 1);
     timers.remove(id).expect("remove");
 }
 
 // ---------------------------------------------------------------------------
-// Re-entrancy: callbacks mutate the registry mid-advance
+// Re-entrancy: callbacks mutate the registry mid-delivery
 // ---------------------------------------------------------------------------
 
 #[test]
 fn a_callback_removing_itself_leaves_consistent_state() {
     let mut timers = TimerState::new();
     // SAFETY: `timers` lives on this stack frame; `registry` is only
-    // dereferenced from inside a callback that `timers.advance` invokes,
-    // strictly sequentially with `advance`'s own accesses (the documented
+    // dereferenced from inside a callback the delivery invokes,
+    // strictly sequentially with the delivery's own accesses (the documented
     // single-threaded re-entrancy contract). Borrowck accepts the raw
     // pointer because the `&mut` that produced it ends at this statement.
     let registry = &mut timers as *mut TimerState;
@@ -213,20 +223,20 @@ fn a_callback_removing_itself_leaves_consistent_state() {
         let mut callback = callback;
         Box::new(move |id| {
             callback(id);
-            // SAFETY: see above — the registry is mid-`advance`, which
+            // SAFETY: see above — the registry is mid-delivery, which
             // expects exactly this re-entrant shape.
             unsafe { (*registry).remove(id) }.expect("remove self");
         })
     };
 
     let id = timers.create_interval(10, wrapped).expect("create");
-    assert_eq!(timers.advance(10), 1);
+    assert_eq!(deliver_due(&mut timers, 10), 1);
     assert_eq!(hits.get(), 1);
 
     // The entry is gone: removing again is a typed error, and no later
     // advance can ever fire it again.
     assert_eq!(timers.remove(id), Err(TimerError::UnknownTimer(id)));
-    assert_eq!(timers.advance(10_000), 0);
+    assert_eq!(deliver_due(&mut timers, 10_000), 0);
     assert_eq!(hits.get(), 1);
 }
 
@@ -255,10 +265,10 @@ fn a_callback_creating_a_timer_joins_the_schedule() {
         .expect("create outer");
 
     // The outer fires alone; the inner timer joins at the injected now
-    // (the advance's `now_ms`), so its first deadline is one interval out.
-    assert_eq!(timers.advance(10), 1);
-    assert_eq!(timers.advance(20), 2);
-    assert_eq!(timers.advance(30), 2);
+    // (the delivery's `now_ms`), so its first deadline is one interval out.
+    assert_eq!(deliver_due(&mut timers, 10), 1);
+    assert_eq!(deliver_due(&mut timers, 20), 2);
+    assert_eq!(deliver_due(&mut timers, 30), 2);
     let log = log.borrow();
     assert_eq!(
         log[..2],
@@ -294,7 +304,7 @@ fn a_callback_changing_its_own_interval_reschedules() {
         log_out.borrow_mut().push(id.value());
         if !flag.get() {
             flag.set(true);
-            // Re-arm from the advance's `now_ms` (10): the next fire moves
+            // Re-arm from the delivery's `now_ms` (10): the next fire moves
             // from 20 to 60.
             // SAFETY: see above.
             unsafe { (*registry).set_interval(id, 50) }.expect("set interval");
@@ -302,9 +312,13 @@ fn a_callback_changing_its_own_interval_reschedules() {
     });
     let id = timers.create_interval(10, callback).expect("create");
 
-    assert_eq!(timers.advance(10), 1);
-    assert_eq!(timers.advance(20), 0, "the interval change must reschedule");
-    assert_eq!(timers.advance(60), 1);
+    assert_eq!(deliver_due(&mut timers, 10), 1);
+    assert_eq!(
+        deliver_due(&mut timers, 20),
+        0,
+        "the interval change must reschedule"
+    );
+    assert_eq!(deliver_due(&mut timers, 60), 1);
     assert_eq!(log.borrow().len(), 2);
     timers.remove(id).expect("remove");
 }
@@ -319,7 +333,7 @@ fn a_peer_disabled_from_a_callback_is_cancelled_before_it_fires() {
     let disabled_once = Rc::new(Cell::new(false));
 
     // The first timer disables the second while both are due in the same
-    // advance: the second's pending fire must be cancelled.
+    // delivery: the second's pending fire must be cancelled.
     let slot = Rc::clone(&peer_slot);
     let once = Rc::clone(&disabled_once);
     let killer_log = Rc::clone(&log);
@@ -344,17 +358,21 @@ fn a_peer_disabled_from_a_callback_is_cancelled_before_it_fires() {
     peer_slot.set(Some(peer));
     assert_ne!(killer.value(), peer.value());
 
-    assert_eq!(timers.advance(10), 1, "only the killer fires this round");
+    assert_eq!(
+        deliver_due(&mut timers, 10),
+        1,
+        "only the killer fires this round"
+    );
     assert_eq!(*log.borrow(), vec![0u64]);
 
     // The killer keeps repeating; the peer stays disarmed.
-    assert_eq!(timers.advance(20), 1);
+    assert_eq!(deliver_due(&mut timers, 20), 1);
     assert_eq!(log.borrow().len(), 2);
 
     // Re-enabling the peer brings it back into the rounds.
     timers.now_ms = 30;
     timers.set_enabled(peer, true).expect("re-enable peer");
-    assert_eq!(timers.advance(40), 2);
+    assert_eq!(deliver_due(&mut timers, 40), 2);
     assert_eq!(*log.borrow(), vec![0u64, 0u64, 0u64, 1u64]);
 }
 
@@ -386,17 +404,19 @@ fn a_panicking_callback_unwinds_over_consistent_state() {
     // immediately so parallel tests keep their output).
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| timers.advance(10)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        deliver_due(&mut timers, 10)
+    }));
     std::panic::set_hook(previous_hook);
 
-    // The panic propagates out of `advance` — L2 does not swallow it.
+    // The panic propagates out of the delivery — L2 does not swallow it.
     assert!(result.is_err(), "the callback's panic must not be caught");
 
     // ...but the registry is consistent: the callback was restored, the
     // schedule kept running, and the next deadline fires normally.
     assert_eq!(hits.get(), 1);
-    assert_eq!(timers.advance(20), 1);
-    assert_eq!(timers.advance(30), 1);
+    assert_eq!(deliver_due(&mut timers, 20), 1);
+    assert_eq!(deliver_due(&mut timers, 30), 1);
     assert_eq!(hits.get(), 3);
     timers.remove(id).expect("remove");
 }

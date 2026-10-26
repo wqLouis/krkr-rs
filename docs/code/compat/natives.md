@@ -321,7 +321,7 @@ voice; L3 dispatch state `VideoState` and the `VideoOverlayInst` payload.
 
 `CompatHost::set_video_source(spec, frames)` or
 `compat::set_video_source(ctx, Box<dyn VideoSource>)`, and
-`compat::video_advance(ctx, dt_ms)`.
+`compat::video_advance(ctx, max_step_ms)`.
 
 ### Tests
 

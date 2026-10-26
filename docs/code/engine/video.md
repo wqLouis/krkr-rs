@@ -23,9 +23,11 @@ the caller — **L1 `media` owns decoding** — and never opens a codec itself.
 
 `VideoOverlay` is a **plain, caller-owned value**: there is no process global,
 no active-instance registry and no clock. The update loop calls
-`VideoOverlay::advance` with the elapsed milliseconds each frame; the caller
-asks L1 `media` for the frame at `VideoOverlay::position_ms` and hands it back
-with `VideoOverlay::present_frame`.
+`VideoOverlay::advance` with the elapsed milliseconds each frame — the
+compatibility layer derives that step from the engine's frame clock and bounds
+it by the audio pump's playback cap — and the caller asks L1 `media` for the
+frame at `VideoOverlay::position_ms` and hands it back with
+`VideoOverlay::present_frame`.
 
 | field | meaning |
 |---|---|
@@ -132,6 +134,11 @@ the engine tick. To stay free of a global clock, this model advances a
 **relative** position by `dt * play_rate`; the two are equivalent for a
 monotonically increasing clock, and a relative step is directly testable.
 
+The step the caller hands in is the engine's own elapsed time, so the
+picture's clock is the engine's clock. The reference's movie player runs on
+its own media timeline, off the frame — that is an approximation, recorded in
+TODO.md, and not something the frame can reproduce.
+
 The position is kept with **sub-millisecond resolution**
 (`position_exact_ms`) and never rounded per step: a step of `1000/60` ms is
 `16.666…` ms, and rounding it to `17` ms would make the clock run two
@@ -191,7 +198,7 @@ VideoOverlay::complete_prepare()       → perPrepare + pause + rewind
    ▼
 bitmap marked dirty → engine::Engine::sync_dirty_bitmaps → upload_textures
 
-clock:  frame loop ──► VideoOverlay::advance(dt_ms)
+clock:  the engine's clock ──► VideoOverlay::advance(dt_ms)
 events: VideoOverlay::poll() ──► VideoEvent list ──► L3 dispatches on* members
 ```
 
@@ -236,4 +243,5 @@ it is given.
 | the L1 media engine and the decoders | [`arch/l1.md`](../../arch/l1.md) §4 |
 | the pixel operations the frame copy uses | [layer_ops.md](layer_ops.md) |
 | the frame that advances the overlay (still in the hook) | [engine.md](engine.md) |
+| the movie's media-clock approximation | TODO.md |
 | the archived protocol trail | [`docs.old/migration/14-l3-l2-protocol.md`](../../../docs.old/migration/14-l3-l2-protocol.md) §6.7 |

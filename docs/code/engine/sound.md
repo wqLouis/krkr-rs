@@ -276,8 +276,15 @@ when it is played, and there are no hardcoded chain, size or loop caps.
 ## 7. Current limits
 
 * **The mixer pump still runs inside the L3 hook**, not inside L2: the
-  composition root's frame hook advances the mixer and drains the device.
-* **`SoundState.clock`** (L3) has not been retired for an L2-owned delta.
+  composition root's frame hook renders the mixer's buffers and drains the
+  device. That is the reference's shape — the reference mixes off-frame, on
+  the device's callback (`WaveMixer.cpp:342`), and its script-visible voice
+  position follows the device's real-time consumption rather than the tick
+  count (`WaveImpl.cpp:3147`).
+* **The playback can lag the frame clock.** One frame may advance the mixer by
+  at most the audio pump's cap, so a frame longer than the cap plays that
+  much behind the wall clock. The reference has no such cap; the divergence
+  is deliberate and recorded in TODO.md.
 
 ---
 

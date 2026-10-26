@@ -19,7 +19,7 @@ use engine::Scene;
 use engine::Storage;
 use engine::clock::FrameClock;
 use engine::input::InputState;
-use engine::timer::TimerState;
+use engine::timer::{TimerState, deliver_due};
 use fs::FileSystem;
 use platform::PlatformEvent;
 use tjs::{Tjs2Engine, TjsValue};
@@ -244,15 +244,26 @@ impl Env {
         timer.now_ms = timer.now_ms.saturating_add(ms);
     }
 
-    /// One frame-body `timer_poll` step: advance the attached timer registry by
-    /// a virtual frame step, then deliver the due timers. Returns whether any
-    /// timer remains armed afterwards.
+    /// One frame-body timer step: deliver the timers due at the registry's
+    /// injected time, then hand the queued `onTimer` events to the script.
+    /// Returns whether any timer remains armed afterwards.
     pub fn poll_timer(&self) -> bool {
         // One virtual frame step at the reference's ~60 fps.
         const FRAME_STEP_MS: u64 = 16;
         self.advance_time(FRAME_STEP_MS);
+        self.deliver_due_timers();
         let mut ctx = self._host.ctx().expect("bound compat context");
         compat::timer_poll(&mut ctx).expect("timer poll")
+    }
+
+    /// Deliver the timers due at the registry's injected time.
+    ///
+    /// The registry's pump belongs to the engine; a test that owns the
+    /// registry drives it directly.
+    pub fn deliver_due_timers(&self) {
+        let mut timer = self.timer.borrow_mut();
+        let now = timer.now_ms;
+        deliver_due(timer.as_mut(), now);
     }
 
     /// One frame-body `async_trigger_poll` step.

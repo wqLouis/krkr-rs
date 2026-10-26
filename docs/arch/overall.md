@@ -149,14 +149,16 @@ pixels and reference-exact. See [`l2.md`](l2.md) §4.
 
 ## 4. The frame in one page
 
-The engine owns the frame. `engine::Engine::step(dt_ms, hooks)` and
-`Engine::frame(now_ms, hooks)` are the only frame entry points; nothing above
-L2 owns a `dt`.
+The engine owns the frame. `engine::Engine::run(clock, hooks)`,
+`Engine::step(dt_ms, hooks)` and `Engine::frame(now_ms, hooks)` are the frame
+entry points; nothing above L2 owns a `dt`. The loop-level entry point is
+`run`: the caller injects the frame's elapsed time through its clock source
+once, and every timeline the frame derives comes from that value.
 
 ```
 Engine::frame(now_ms, hooks)
   ├─ set the clock; fit the presentation (PixelTranslation)
-  ├─ advance the L2 timer registry            → callbacks post onTimer events
+  ├─ deliver the due timers                    → callbacks post onTimer events
   ├─ hooks.before_render(now_ms, dt_ms)       → L4 vm.tick + L3 event dispatch
   │                                              and the staged pumps
   ├─ fit the presentation again                → a script may have resized

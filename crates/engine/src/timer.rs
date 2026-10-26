@@ -1,8 +1,8 @@
 //! L2 timer registry — remember when to wake up, then call back.
 //!
-//! Timers are explicit L2 state driven by the L1 clock: the host passes the
-//! current time each frame to [`TimerState::advance`], which invokes the due
-//! callbacks in creation order. compat owns the script-facing `Timer` object
+//! Timers are explicit L2 state driven by the frame clock: the engine
+//! passes the current time each frame to [`deliver_due`], which invokes the
+//! due callbacks in creation order. compat owns the script-facing `Timer` object
 //! and registers its dispatch closure as the callback; whether a timer is
 //! armed *at all* is compat's decision (the reference's "armed and enabled yet never
 //! posts" shapes — a negative `Capacity`, a non-positive `interval` — are
@@ -21,8 +21,8 @@
 //! errors rather than silently substituting defaults. Two entry points
 //! inject time:
 //!
-//! * [`TimerState::advance`] takes `now_ms` from the L1 clock and *delivers*
-//!   — this is the frame's event-pump step;
+//! * [`deliver_due`] takes `now_ms` from the frame clock and *delivers* —
+//!   this is the frame's event-pump step;
 //! * assigning [`TimerState::now_ms`] injects the current time *without*
 //!   delivering.
 //!   L3's property setters write it before (re-)arming so a schedule write
@@ -35,7 +35,7 @@
 //!
 //! # Re-entrancy
 //!
-//! Callbacks run *inside* [`TimerState::advance`], yet they may re-enter the
+//! Callbacks run *inside* the delivery step, yet they may re-enter the
 //! registry — creating timers, changing intervals, removing themselves —
 //! through the same handle the host attached (L3's `attach_timer` pointer,
 //! or a test's raw pointer). The delivery is therefore structured as:
@@ -43,7 +43,7 @@
 //! 1. **Collect first.** Every due timer is collected in creation order and
 //!    re-armed from `now_ms` *before* any callback runs, so no phase iterates
 //!    a collection it is mutating, a late frame fires exactly once (no
-//!    catch-up burst), and a nested `advance` can never deliver the same
+//!    catch-up burst), and a nested delivery can never deliver the same
 //!    timer twice in one round.
 //! 2. **Then invoke.** For each collected timer the callback box is *taken
 //!    out* of the entry before the call, so the entry is plain registry
@@ -60,7 +60,7 @@
 //!
 //! The registry is single-threaded: a callback's re-entrant borrow of the
 //! registry is created and dropped entirely within one callback invocation,
-//! strictly sequential with [`TimerState::advance`]'s own accesses (the
+//! strictly sequential with the delivery step's own accesses (the
 //! documented attach-handle contract).
 
 use std::collections::BTreeMap;
@@ -113,8 +113,8 @@ struct TimerEntry {
     deadline_ms: Option<u64>,
     /// The schedule generation: bumped on every schedule mutation
     /// ([`TimerState::set_interval`], [`TimerState::set_enabled`]) *and*
-    /// when [`TimerState::advance`] collects the timer as due. A collected
-    /// timer only fires if its generation is still the collected one, so a
+    /// when the delivery step collects the timer as due. A collected timer
+    /// only fires if its generation is still the collected one, so a
     /// mutation between collection and delivery cancels the pending fire.
     generation: u64,
     /// The callback. `None` only while the callback itself is running (it
@@ -128,7 +128,7 @@ struct TimerEntry {
 /// Timers are keyed by a monotonic [`TimerId`]; iteration is ordered, so
 /// due callbacks are delivered in creation order. The registry owns no
 /// global and no clock: time enters only through
-/// [`TimerState::now_ms`] / [`TimerState::advance`].
+/// [`TimerState::now_ms`] / [`deliver_due`].
 #[derive(Default)]
 #[non_exhaustive]
 pub struct TimerState {
@@ -137,8 +137,8 @@ pub struct TimerState {
     timers: BTreeMap<TimerId, TimerEntry>,
     /// The next id to hand out.
     next_id: u64,
-    /// The most recently injected time: the last `advance(now_ms)`, or the
-    /// last write to this field. Every (re-)arm point is measured from here.
+    /// The most recently injected time: the last delivery, or the last write
+    /// to this field. Every (re-)arm point is measured from here.
     pub now_ms: u64,
 }
 
@@ -150,7 +150,7 @@ impl TimerState {
 
     /// Register `callback` to wake every `interval_ms`, first fire one
     /// interval from the injected now ([`TimerState::now_ms`] or the last
-    /// [`TimerState::advance`]).
+    /// delivery).
     ///
     /// The timer is created **armed**: it fires at `now + interval_ms` and
     /// re-arms every `interval_ms` until removed or disabled. Disarm it
@@ -227,9 +227,9 @@ impl TimerState {
     ///
     /// Enabling arms the timer at `now + interval_ms`, measured from the
     /// injected now — write [`TimerState::now_ms`] first when arming outside
-    /// [`TimerState::advance`]. Disabling drops the pending deadline, and
-    /// the next enable re-arms from then. Both cancel a fire that a running
-    /// [`TimerState::advance`] has collected but not yet delivered.
+    /// a delivery. Disabling drops the pending deadline, and the next enable
+    /// re-arms from then. Both cancel a fire that a running delivery has
+    /// collected but not yet delivered.
     ///
     /// # Errors
     ///
@@ -248,10 +248,13 @@ impl TimerState {
         Ok(())
     }
 
-    /// Advance the registry to `now_ms`, invoking every due callback once,
-    /// in creation order; returns the number of callbacks invoked.
+    /// Deliver every timer due at `now_ms`, in creation order.
     ///
-    /// A due timer fires at most once per advance and is re-armed from
+    /// This is the registry's pump and it belongs to the engine: the frame
+    /// calls it through [`deliver_due`], and no layer above the engine
+    /// advances the registry.
+    ///
+    /// A due timer fires at most once per delivery and is re-armed from
     /// `now_ms`, so a late frame does not burst catch-up fires. A timer whose
     /// schedule was mutated between collection and delivery (by a peer
     /// callback or the timer itself) is skipped — the mutation cancelled its
@@ -262,7 +265,7 @@ impl TimerState {
     /// Re-entrancy: callbacks run inside this method and may mutate the
     /// registry (see the module docs); a panicking callback propagates its
     /// panic after the registry has been restored to a consistent state.
-    pub fn advance(&mut self, now_ms: u64) -> usize {
+    pub(crate) fn advance(&mut self, now_ms: u64) -> usize {
         self.now_ms = now_ms;
         if self.timers.is_empty() {
             return 0;
@@ -310,6 +313,26 @@ impl TimerState {
         }
         invoked
     }
+}
+
+/// Delivers the timers due at `now_ms` in `registry` and returns the number
+/// of callbacks invoked.
+///
+/// This is the registry's pump. The engine's frame calls it once per frame
+/// with the frame clock's value, and a host that owns a registry and drives
+/// the frames itself calls it with its own time. The compatibility layer arms
+/// timers through the registry and never advances it: the schedule belongs to
+/// the engine, so the engine is what fires it.
+///
+/// The pump is a free function and not a method on [`TimerState`]: the
+/// compatibility layer names the registry to arm timers, and a method would
+/// hand it the pump as well.
+pub fn deliver_due(registry: &mut TimerState, now_ms: u64) -> usize {
+    let fired = registry.advance(now_ms);
+    if fired > 0 {
+        log::trace!("timer: {fired} timer(s) fired at {now_ms} ms");
+    }
+    fired
 }
 
 /// Puts a taken [`TimerEntry::callback`] back into its entry once the

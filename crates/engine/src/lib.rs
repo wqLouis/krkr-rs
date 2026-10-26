@@ -46,8 +46,9 @@ pub mod video;
 // `engine::shader`, `engine::storage`, `engine::startup`, …), so the flat
 // root never becomes an accidental copy of the crate's whole API.
 
-// The frame clock: the time base the frame advances and the script reads.
-pub use crate::clock::FrameClock;
+// The frame clock: the time base the frame advances and the script reads,
+// and the clock source the caller injects the frame's elapsed time into.
+pub use crate::clock::{FrameClock, FrameTimeSource, InjectedFrameTime};
 // The frame owner: the clock, the timer pump, the projection and the single
 // render call, plus the one upward hook the composition root implements.
 pub use crate::engine::{

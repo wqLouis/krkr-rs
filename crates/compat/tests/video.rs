@@ -9,12 +9,14 @@
 
 mod common;
 
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 use api::error::MediaError;
 use api::media::{AudioSpec, DecodedAudio, RgbaFrame, VideoSpec};
 use common::vm_lock;
 use compat::CompatHost;
+use engine::FrameClock;
 use engine::Scene;
 use tjs::{Tjs2Engine, TjsValue};
 
@@ -25,17 +27,23 @@ struct Env {
     host: CompatHost,
     engine: Box<Tjs2Engine>,
     _scene: Box<Scene>,
+    /// The engine's frame clock: the picture follows it.
+    clock: RefCell<Box<FrameClock>>,
 }
 
 impl Env {
     fn new() -> Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut scene = Box::new(Scene::default());
+        let mut clock = Box::new(FrameClock::new());
         let mut host = CompatHost::new();
-        // SAFETY: the boxed scene outlives the host (declared after it).
+        // SAFETY: the boxed scene and clock outlive the host (declared after
+        // it).
         unsafe {
             host.services_mut()
                 .attach_scene(scene.as_mut() as *mut Scene);
+            host.services_mut()
+                .attach_clock(clock.as_mut() as *mut FrameClock);
         }
         host.install(&engine).expect("install compat surface");
         common::link_all_builtins(&engine);
@@ -43,7 +51,16 @@ impl Env {
             host,
             engine,
             _scene: scene,
+            clock: RefCell::new(clock),
         }
+    }
+
+    /// Move the engine's clock forward by the given milliseconds and advance
+    /// the overlay.
+    fn advance_video(&self, dt_ms: f64) {
+        self.clock.borrow_mut().advance(dt_ms);
+        let ctx = self.host.ctx().expect("bound host");
+        compat::video_advance(&ctx, f64::MAX).expect("advance");
     }
 
     /// Install the host-decoded source: a 640x360 @ 30 fps stream with audio,
@@ -645,8 +662,7 @@ fn layer_mode_composites_the_frame_into_the_layer() {
         "var v = new VideoOverlay(new Window()); v.mode = 1; v.layer1 = l; \
          v.open('movie.mpg'); v.play();",
     );
-    let ctx = env.host.ctx().expect("bound context");
-    compat::video_advance(&ctx, 50.0).expect("advance");
+    env.advance_video(50.0);
     assert_eq!(env.bitmap_color("video", 1, 1), [255, 0, 0, 255]);
     assert_eq!(env.layer_rect("video"), (4, 4));
 }
@@ -671,8 +687,7 @@ fn overlay_mode_leaves_the_layer_untouched() {
         "var v = new VideoOverlay(new Window()); v.layer1 = l; \
          v.open('movie.mpg'); v.play();",
     );
-    let ctx = env.host.ctx().expect("bound context");
-    compat::video_advance(&ctx, 50.0).expect("advance");
+    env.advance_video(50.0);
     assert_ne!(env.bitmap_color("video", 1, 1), [255, 0, 0, 255]);
 }
 
@@ -696,8 +711,7 @@ fn mixer_mode_composites_through_the_mixing_layer() {
         "var v = new VideoOverlay(new Window()); v.mode = 2; v.setMixingLayer(l); \
          v.open('movie.mpg'); v.play();",
     );
-    let ctx = env.host.ctx().expect("bound context");
-    compat::video_advance(&ctx, 50.0).expect("advance");
+    env.advance_video(50.0);
     assert_eq!(env.bitmap_color("mix", 1, 1), [0, 255, 0, 255]);
 }
 
@@ -712,10 +726,9 @@ fn advance_uses_the_frame_body_dt() {
     env.host
         .set_video_source(movie_spec(), vec![solid_frame([255, 0, 0, 255])]);
     env.run("var v = new VideoOverlay(new Window()); v.open('movie.mpg'); v.play();");
-    let ctx = env.host.ctx().expect("bound context");
-    compat::video_advance(&ctx, 50.0).expect("advance");
+    env.advance_video(50.0);
     assert_eq!(env.eval_int("v.position"), 50);
-    compat::video_advance(&ctx, 150.0).expect("advance");
+    env.advance_video(150.0);
     assert_eq!(env.eval_int("v.position"), 200);
 }
 
@@ -774,8 +787,7 @@ fn prepare_only_acts_in_layer_mode() {
          var bp = ''; b.onPeriod = function(r) { bp += r + ','; }; \
          b.open('movie.mpg'); b.prepare();",
     );
-    let ctx = env.host.ctx().expect("bound context");
-    compat::video_advance(&ctx, 50.0).expect("advance");
+    env.advance_video(50.0);
     assert_eq!(
         env.eval_string("ap"),
         "",
@@ -817,8 +829,7 @@ fn prepare_composites_the_prepared_frame_before_pausing() {
         .set_video_source(movie_spec(), vec![solid_frame([255, 0, 0, 255]), rewound]);
     env.run("v.open('movie.mpg'); v.prepare(); log = '';");
 
-    let ctx = env.host.ctx().expect("bound context");
-    compat::video_advance(&ctx, 50.0).expect("advance");
+    env.advance_video(50.0);
     assert_eq!(
         env.bitmap_color("prep", 1, 1),
         [255, 0, 0, 255],
@@ -832,7 +843,7 @@ fn prepare_composites_the_prepared_frame_before_pausing() {
     assert_eq!(env.eval_int("v.position"), 0);
 
     // The next pump is idle: the overlay stays paused on the rewound picture.
-    compat::video_advance(&ctx, 50.0).expect("advance");
+    env.advance_video(50.0);
     assert_eq!(
         env.bitmap_color("prep", 1, 1),
         [255, 0, 0, 255],
@@ -941,8 +952,7 @@ fn mixer_mode_applies_the_layer_opacity() {
         "var v = new VideoOverlay(new Window()); v.mode = 2; v.setMixingLayer(l); \
          v.open('movie.mpg'); v.play();",
     );
-    let ctx = env.host.ctx().expect("bound context");
-    compat::video_advance(&ctx, 50.0).expect("advance");
+    env.advance_video(50.0);
     assert_eq!(env.bitmap_color("mixop", 1, 1), [0, 255, 0, 128]);
 }
 
@@ -1112,7 +1122,7 @@ fn movie_audio_reaches_the_mixer_with_volume_and_pan() {
         }),
     );
     env.run("var v = new VideoOverlay(new Window()); v.open('movie.mpg'); v.play();");
-    compat::video_advance(&ctx, 10.0).expect("advance");
+    env.advance_video(10.0);
 
     let out_spec = AudioSpec {
         sample_rate: 48_000,
@@ -1210,7 +1220,7 @@ fn the_movie_audio_stays_continuous_across_polls() {
     compat::sound_render(&ctx, &mut out, out_spec).expect("render");
     let mut previous: Option<f32> = None;
     for _ in 0..600 {
-        compat::video_advance(&ctx, 1000.0 / 60.0).expect("advance");
+        env.advance_video(1000.0 / 60.0);
         compat::sound_render(&ctx, &mut out, out_spec).expect("render");
         for sample in &out {
             if let Some(last) = previous {
@@ -1268,7 +1278,7 @@ fn the_picture_follows_the_sound() {
     };
     let mut out = vec![0.0f32; FRAMES];
     for _ in 0..10 {
-        compat::video_advance(&ctx, 1000.0 / 60.0).expect("advance");
+        env.advance_video(1000.0 / 60.0);
         compat::sound_render(&ctx, &mut out, out_spec).expect("render");
     }
 
@@ -1327,7 +1337,7 @@ fn a_playing_overlay_shares_one_frame_per_pump() {
     );
 
     for _ in 0..3 {
-        compat::video_advance(&ctx, 50.0).expect("advance");
+        env.advance_video(50.0);
     }
 
     assert_eq!(
@@ -1365,9 +1375,8 @@ fn the_overlay_fires_on_frame_update_from_the_first_pump() {
         .set_video_source(movie_spec(), vec![solid_frame([255, 0, 0, 255])]);
     env.run("v.open('movie.mpg'); v.play();");
 
-    let ctx = env.host.ctx().expect("bound context");
     for expected in 1..=3 {
-        compat::video_advance(&ctx, 100.0).expect("advance");
+        env.advance_video(100.0);
         assert_eq!(
             env.eval_int("updates"),
             expected,
@@ -1377,7 +1386,7 @@ fn the_overlay_fires_on_frame_update_from_the_first_pump() {
 
     // A pump that stays inside the same frame delivers the picture that is
     // already on screen, and that fires nothing.
-    compat::video_advance(&ctx, 50.0).expect("advance");
+    env.advance_video(50.0);
     assert_eq!(
         env.eval_int("updates"),
         3,

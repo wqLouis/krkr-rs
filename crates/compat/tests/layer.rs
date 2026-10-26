@@ -10,6 +10,7 @@ mod common;
 use common::vm_lock;
 use compat::CompatHost;
 use engine::Scene;
+use engine::clock::FrameClock;
 use engine::input::InputState;
 use engine::timer::TimerState;
 use tjs::{Tjs2Engine, TjsValue};
@@ -27,6 +28,8 @@ struct Env {
     _timer: Box<TimerState>,
     /// Kept alive for the host's raw pointer; never read directly.
     _input: Box<InputState>,
+    /// Kept alive for the host's raw pointer; never read directly.
+    _clock: Box<FrameClock>,
 }
 
 impl Env {
@@ -35,6 +38,7 @@ impl Env {
         let mut scene = Box::new(Scene::default());
         let mut timer = Box::new(TimerState::new());
         let mut input = Box::new(InputState::new());
+        let mut clock = Box::new(FrameClock::new());
         let mut host = CompatHost::new();
         // SAFETY: the boxed scene, timer registry and input state outlive the
         // host (they are declared after `_host`).
@@ -45,6 +49,8 @@ impl Env {
                 .attach_timer(timer.as_mut() as *mut TimerState);
             host.services_mut()
                 .attach_input(input.as_mut() as *mut InputState);
+            host.services_mut()
+                .attach_clock(clock.as_mut() as *mut FrameClock);
         }
         host.install(&engine).expect("install compat surface");
         common::link_all_builtins(&engine);
@@ -54,6 +60,7 @@ impl Env {
             scene,
             _timer: timer,
             _input: input,
+            _clock: clock,
         }
     }
 

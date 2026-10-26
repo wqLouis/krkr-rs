@@ -21,3 +21,8 @@ platform = { workspace = true, features = ["platform-android"] }
 
 [dev-dependencies]
 testkit = { workspace = true }
+# The frame body the VM host runs reads the L2 frame clock (the compat layer's
+# housekeeping intervals are measured against it), so the test harness has to
+# create one. The crate's own code does not depend on the engine: this edge
+# exists for the integration test only.
+engine = { workspace = true }

@@ -7,6 +7,10 @@ value the script reads through `System.getTickCount`. It is a plain object
 the engine owns — there is no process-global clock, and nothing above L2 keeps
 a second time base of its own.
 
+The module also holds the **clock source** — the seam the caller injects the
+frame's elapsed time through. The engine owns the clock it advances; the
+caller owns where the elapsed time comes from.
+
 The reference has the same shape: `System.getTickCount` returns the tick
 counter its frame pacing follows
 (`reference/cpp/core/base/impl/SystemImpl.cpp:622-629`), so the script and
@@ -50,7 +54,30 @@ impl FrameClock {
     pub fn advance(&mut self, dt_ms: f64) -> u64;
     pub fn set(&mut self, now_ms: u64);
 }
+
+/// The source of a frame's elapsed time.
+pub trait FrameTimeSource {
+    fn elapsed_ms(&self) -> f64;
+}
+
+/// A frame time the caller injects before every frame.
+pub struct InjectedFrameTime {
+    pub elapsed_ms: f64,
+}
+
+impl InjectedFrameTime {
+    pub fn new(elapsed_ms: f64) -> Self;
+}
+
+impl FrameTimeSource for InjectedFrameTime {
+    fn elapsed_ms(&self) -> f64;
+}
 ```
+
+| item | behaviour |
+|---|---|
+| `FrameTimeSource` | the trait the frame's elapsed time comes through; `elapsed_ms()` is the milliseconds since the previous frame |
+| `InjectedFrameTime` | the value the caller injects; the windowed loop writes the real time the platform measured into it, the headless runner writes the frame period it simulates |
 
 | method | behaviour |
 |---|---|
@@ -66,9 +93,10 @@ impl FrameClock {
 
 | caller | effect |
 |---|---|
+| `Engine::run(clock, …)` | `advance(clock.elapsed_ms())` — the caller's elapsed time accumulates, and the frame's `now_ms` is the clock's whole-millisecond part |
 | `Engine::step(dt_ms, …)` | `advance(dt_ms)` — the delta accumulates, and the frame's `now_ms` is the clock's whole-millisecond part |
 | `Engine::frame(now_ms, …)` | `set(now_ms)` — the clock is exactly the injected value, so a test can jump between frames |
-| the composition root | nothing; the root drives `Engine::step`, it never writes the clock |
+| the composition root | nothing; the root injects the elapsed time, it never writes the clock |
 
 The engine exposes the clock through `Engine::clock()` and
 `Engine::clock_mut()`; the composition root hands the clock's address to the
@@ -94,12 +122,12 @@ compatibility layer, where `System.getTickCount` reads it.
 ## 6. Data flow
 
 ```
-the composition root's frame delta
+the caller's clock source
    │
    ▼
-Engine::step(dt_ms) ──► FrameClock::advance(dt_ms) ──► now_ms (whole ms)
+Engine::run(clock) ──► FrameClock::advance(elapsed) ──► now_ms (whole ms)
    │                              │
-   │                              ├──► TimerState::advance(now_ms)
+   │                              ├──► timer::deliver_due(now_ms)
    │                              ├──► the upward hook's now_ms / dt_ms
    │                              └──► System.getTickCount() ──► the script
    ▼
@@ -120,7 +148,13 @@ delta counts as zero instead of rewinding.
 
 * **The clock is a plain accumulator.** It carries no wall-clock reading and
   no monotonic source, so a host that wants the real elapsed time injects it
-  as the frame delta.
+  through the clock source.
+* **The source is an elapsed time, not an absolute tick.** The reference has
+  no frame delta at all — every consumer reads an absolute clock and takes
+  the difference itself. Accumulating the caller's elapsed time is
+  observationally the same as an absolute clock as long as the caller injects
+  the real elapsed time, which the windowed loop does; the two differ only
+  for a frame that is *skipped* rather than run late.
 
 ---
 

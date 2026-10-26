@@ -26,10 +26,11 @@ use std::cell::RefCell;
 
 use common::vm_lock;
 use compat::CompatHost;
+use engine::FrameClock;
 use engine::Scene;
 use engine::Storage;
 use engine::input::InputState;
-use engine::timer::TimerState;
+use engine::timer::{TimerState, deliver_due};
 use tjs::{Tjs2Engine, TjsValue};
 
 /// A bound VM + host + attached scene, timer registry and input state.
@@ -51,6 +52,8 @@ struct Env {
     _storage: Option<Box<Storage>>,
     /// The temp game dir, removed after the storage drops.
     _game_dir: Option<std::path::PathBuf>,
+    /// The engine's frame clock: the transition's phase follows it.
+    clock: RefCell<Box<FrameClock>>,
 }
 
 impl Env {
@@ -68,9 +71,11 @@ impl Env {
         let mut scene = Box::new(Scene::default());
         let mut timer = Box::new(TimerState::new());
         let mut input = Box::new(InputState::new());
+        let mut clock = Box::new(FrameClock::new());
         let mut host = CompatHost::new();
-        // SAFETY: the boxed scene, timer registry and input state outlive the
-        // host (they are declared after `_host`), matching `attach_*`.
+        // SAFETY: the boxed scene, timer registry, input state and clock
+        // outlive the host (they are declared after `_host`), matching
+        // `attach_*`.
         unsafe {
             host.services_mut()
                 .attach_scene(scene.as_mut() as *mut Scene);
@@ -78,6 +83,8 @@ impl Env {
                 .attach_timer(timer.as_mut() as *mut TimerState);
             host.services_mut()
                 .attach_input(input.as_mut() as *mut InputState);
+            host.services_mut()
+                .attach_clock(clock.as_mut() as *mut FrameClock);
         }
         let (storage, game_dir) = if with_storage {
             let mut dir = std::env::temp_dir();
@@ -120,6 +127,7 @@ impl Env {
             _input: input,
             _storage: storage,
             _game_dir: game_dir,
+            clock: RefCell::new(clock),
         }
     }
 
@@ -154,11 +162,22 @@ impl Env {
         timer.now_ms = timer.now_ms.saturating_add(ms);
     }
 
+    /// Deliver the timers due at the registry's injected time.
+    ///
+    /// The registry's pump belongs to the engine; a test that owns the
+    /// registry drives it directly.
+    fn deliver_due(&self) {
+        let mut timer = self.timer.borrow_mut();
+        let now = timer.now_ms;
+        deliver_due(timer.as_mut(), now);
+    }
+
     /// Run one frame-body `timer_poll` step at a virtual 16 ms frame step;
     /// returns whether any timer is still enabled afterwards (the poll's own
     /// convention).
     fn poll_timer(&self) -> bool {
         self.advance_time(16);
+        self.deliver_due();
         let mut ctx = self._host.ctx().expect("bound host");
         compat::timer_poll(&mut ctx).expect("timer poll")
     }
@@ -694,8 +713,10 @@ fn layer_subclass_on_transition_completed_wins() {
          var b = new SubLayer(w, null); b.setImageSize(2, 2); \
          b.beginTransition('crossfade', true, a, %[time: 1]);",
     );
+    // The transition's phase follows the engine's clock.
+    env.clock.borrow_mut().advance(50.0);
     let ctx = env._host.ctx().expect("bound host");
-    compat::advance_transitions(&ctx, 50.0).expect("advance transitions");
+    compat::advance_transitions(&ctx).expect("advance transitions");
     assert_eq!(
         env.eval_int("hits"),
         1,

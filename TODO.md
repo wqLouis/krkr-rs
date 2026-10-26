@@ -12,13 +12,20 @@ audits are archived in `docs.old/`. Every item was verified against the tree.
 
 ## 1. Priorities
 
-1. **L2 owns the frame** (D26/D27). `Engine::step`/`frame` own the clock, timer
-   pump, projection and render; `GameFrame::before_render(now_ms, dt_ms)` is the
-   single upward hook. The VM tick and audio pump still run inside it
-   (`crates/app/src/game.rs` `VmHook::before_render`), as do the video and
-   transition pumps. Remaining: move those pumps into L2, retire
-   `SoundState.clock` for an L2-owned delta, add `Engine::run(clock, hooks)`,
-   and privatize `TimerState::advance` (`engine/src/timer.rs`).
+1. **L2 owns the frame** (D26/D27). `Engine::run(clock, hooks)`/
+   `step`/`frame` own the clock, timer pump, projection and render;
+   `GameFrame::before_render(now_ms, dt_ms)` is the single upward hook. The
+   clock's source is injected once (`Engine::run`), the registry's pump is
+   private to L2 (`engine::timer::deliver_due`), and the compatibility layer
+   keeps no clock of its own — the sound poll and the housekeeping intervals
+   read the engine's frame clock. Remaining: the video and transition pumps
+   still run inside the hook, because the reference delivers the transitions
+   and the video presentation as *continuous events*, inside the event
+   delivery; their **time** is L2's (the transition's phase is the clock's
+   tick difference, the picture's step is the clock's elapsed time). The
+   mixer's advance is off-frame by design: the reference mixes on the
+   device's callback. The TJS-visible `Timer` is a registry the frame pumps,
+   where the reference computes its deadlines on a thread of its own.
    `docs.old/migration/07` phase 9.
 2. **Deferred image decode pipeline — landed.** The L2 pending-image pool and
    the L3 load wiring are complete: loads probe synchronously, queue the
@@ -199,6 +206,30 @@ native OS popup would be a deliberate divergence, and Linux has nothing to call
   drops text input** (`crates/android/src/input.rs` ignores
   `TextEvent`/`TextAction`) and never requests the soft keyboard, so a title
   that asks the player to type a name cannot.
+* **The audio's playback cap is an explicit decision, not a side effect.** One
+  frame may advance the mixer by at most `KRKR_RS_AUDIO_MAX_CHUNK_MS` (250 ms
+  by default, `crates/app/src/audio.rs`); a longer frame leaves the playback
+  that much behind the wall clock and reports it with a `warn`. The cap
+  bounds the buffer one write produces, so a single write cannot jump the
+  device's queue past its bound, and the picture is bounded by the same cap
+  so the two fall behind together. The reference has no such cap: its mixer
+  is fed by the device's own callback (`WaveMixer.cpp:342`), so its playback
+  follows the device's real-time consumption and never lags — and its
+  script-visible voice position follows that same consumption
+  (`WaveImpl.cpp:3147`), not the tick count. The port keeps that shape (the
+  rendered position on the frame clock, the device's latency subtracted), so
+  the divergence is the *cap*: a frame longer than the cap plays behind.
+* **The video advances on the frame clock, not on a media clock.** The
+  reference's movie player runs on its own timeline, off the frame
+  (`VideoPlayer.cpp:538`, `:1813`); only its *presentation* is on-frame,
+  gated on the player's own PTS (`KRMovieLayer.cpp:45-67`). The port advances
+  the overlay by the engine clock's elapsed time, bounded by the audio cap, so
+  the picture runs at the frame rate and drifts against the media timeline
+  whenever the two rates differ. That is an approximation with a known
+  reference gap (D36): the position the script reads is the overlay's own
+  position, and the movie's own voice is resynced to it, so the picture and
+  the sound stay together — but neither follows the media clock the reference
+  uses.
 
 ## 8. File system / XP3
 

@@ -64,7 +64,6 @@
 
 use std::ffi::{c_char, c_int, c_void};
 use std::path::Path;
-use std::time::Instant;
 
 use tjs::{
     DetachedValue, Engine, NativeClassBuilder, NativeMethodDef, NativePropertyDef, RetainedValue,
@@ -111,17 +110,12 @@ struct SystemState {
     exit_on_no_window_startup: bool,
     /// `System.drawThreadNum` (stored for compatibility).
     draw_thread_num: i64,
-    /// Epoch of the rough tick the housekeeping intervals use.
-    ///
-    /// The rough tick is a wall clock of its own: it paces the periodic
-    /// object rehash and the idle compaction, not the frame.
-    rough_tick_epoch: Option<Instant>,
-    /// Rough tick of the last automatic compact, or `None` before the first
+    /// Frame clock of the last automatic compact, or `None` before the first
     /// check (the reference `LastCompactedTick`,
     /// `reference/cpp/core/environ/impl/SystemControl.cpp:52`).
-    last_compacted_ms: Option<i64>,
-    /// Rough tick of the last periodic object rehash.
-    last_rehashed_ms: i64,
+    last_compacted_ms: Option<u64>,
+    /// Frame clock of the last periodic object rehash.
+    last_rehashed_ms: u64,
     /// Counter mixed into `createUUID` seeds (keeps the UUID generator
     /// stateless without a process global).
     uuid_counter: u64,
@@ -151,7 +145,6 @@ impl Default for SystemState {
             // (`SysInitImpl.cpp:383`).
             exit_on_no_window_startup: true,
             draw_thread_num: 0,
-            rough_tick_epoch: None,
             last_compacted_ms: None,
             last_rehashed_ms: 0,
             uuid_counter: 0,
@@ -251,24 +244,24 @@ pub fn continuous_handler_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError>
 /// The idle interval after which the frame body runs the TJS collector.
 ///
 /// The reference `SystemWatchTimerTimer` delivers `TVP_COMPACT_LEVEL_IDLE`
-/// once the rough tick is more than 4000 ms past the last compact
+/// once the frame clock is more than 4000 ms past the last compact
 /// (`reference/cpp/core/environ/impl/SystemControl.cpp:174-179`), and that
 /// callback runs `tTJS::DoGarbageCollection`
 /// (`reference/cpp/core/base/ScriptMgnIntf.cpp:377-386`).
-const COMPACT_INTERVAL_MS: i64 = 4000;
+const COMPACT_INTERVAL_MS: u64 = 4000;
 
 /// The interval after which the frame body requests a TJS object rehash.
 ///
 /// The call only bumps the rebuild magic; an object rebuilds its member table
 /// on its next property access. The frame body starts from zero, so the first
 /// due tick is the one after the interval.
-const REHASH_INTERVAL_MS: i64 = 1500;
+const REHASH_INTERVAL_MS: u64 = 1500;
 
 /// Whether the periodic rehash is due at `tick`, recording it when it is.
 ///
 /// The check is strict: a tick exactly one interval past the last one is not
 /// due, matching the frame body's `tick > last + interval` rule.
-fn rehash_due(state: &mut SystemState, tick: i64) -> bool {
+fn rehash_due(state: &mut SystemState, tick: u64) -> bool {
     if tick <= state.last_rehashed_ms.saturating_add(REHASH_INTERVAL_MS) {
         return false;
     }
@@ -283,21 +276,59 @@ fn rehash_due(state: &mut SystemState, tick: i64) -> bool {
 /// can run against it. The call is cheap; the actual rebuild is deferred to
 /// the next property access on each object. Returns whether the rehash was
 /// requested this frame.
-pub fn rehash_poll(ctx: &mut CompatCtx) -> bool {
+///
+/// # Errors
+///
+/// Returns [`CompatError::Engine`] when the host attached no frame clock: the
+/// interval is measured against the engine's clock, and a rehash paced by no
+/// clock would fire at no defined rate.
+pub fn rehash_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let engine = unsafe { ctx.engine() };
     // SAFETY: see above.
     let services = unsafe { ctx.services() };
+    let tick = frame_clock_ms(services)?;
     let due = {
         let mut state = services.state::<SystemState>();
-        let epoch = *state.rough_tick_epoch.get_or_insert_with(Instant::now);
-        let tick = epoch.elapsed().as_millis() as i64;
         rehash_due(&mut state, tick)
     };
     if due {
         engine.do_rehash();
     }
-    due
+    Ok(due)
+}
+
+/// The engine frame clock's millisecond value.
+///
+/// The housekeeping intervals are paced by the engine's clock, the same time
+/// base the script's tick count reads.
+///
+/// # Errors
+///
+/// Returns [`CompatError::Engine`] when the host attached no frame clock.
+pub(crate) fn frame_clock_ms(services: &CompatServices) -> Result<u64, CompatError> {
+    let Some(clock) = services.clock() else {
+        return Err(CompatError::Engine(
+            "the frame clock is not attached".into(),
+        ));
+    };
+    // SAFETY: `attach_clock` guarantees the pointer stays valid.
+    Ok(unsafe { &*clock }.now_ms())
+}
+
+/// The engine frame clock's millisecond value, with its fractional part.
+///
+/// # Errors
+///
+/// Returns [`CompatError::Engine`] when the host attached no frame clock.
+pub(crate) fn frame_clock_f64(services: &CompatServices) -> Result<f64, CompatError> {
+    let Some(clock) = services.clock() else {
+        return Err(CompatError::Engine(
+            "the frame clock is not attached".into(),
+        ));
+    };
+    // SAFETY: `attach_clock` guarantees the pointer stays valid.
+    Ok(unsafe { &*clock }.now_f64())
 }
 
 /// Run the TJS collector when the idle interval has elapsed.
@@ -307,23 +338,27 @@ pub fn rehash_poll(ctx: &mut CompatCtx) -> bool {
 /// without it a long run never compacts the VM at all. Returns whether the
 /// collector ran this frame. On the first call the interval starts, matching
 /// the reference's `LastCompactedTick = 0` initial state, so the first pass is
-/// one interval after the rough clock's epoch.
+/// one interval after the frame clock's zero.
 ///
 /// The collector compacts the variant stack and the string heap. The
 /// vendored VM leaves `TJSVariantArrayStackCompactNow` empty, so
 /// `tTJS::DoGarbageCollection` is paired with an explicit stack compact on
 /// the FFI side (see `tjs2_do_gc`).
-pub fn compact_poll(ctx: &mut CompatCtx) -> bool {
+///
+/// # Errors
+///
+/// Returns [`CompatError::Engine`] when the host attached no frame clock: the
+/// interval is measured against the engine's clock.
+pub fn compact_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let engine = unsafe { ctx.engine() };
     // SAFETY: see above.
     let services = unsafe { ctx.services() };
+    let tick = frame_clock_ms(services)?;
     let due = {
         let mut state = services.state::<SystemState>();
-        let epoch = *state.rough_tick_epoch.get_or_insert_with(Instant::now);
-        let tick = epoch.elapsed().as_millis() as i64;
         match state.last_compacted_ms {
-            Some(last) if tick - last <= COMPACT_INTERVAL_MS => false,
+            Some(last) if tick.saturating_sub(last) <= COMPACT_INTERVAL_MS => false,
             Some(_) => {
                 state.last_compacted_ms = Some(tick);
                 true
@@ -335,12 +370,12 @@ pub fn compact_poll(ctx: &mut CompatCtx) -> bool {
         }
     };
     if !due {
-        return false;
+        return Ok(false);
     }
     if let Err(error) = engine.do_gc() {
         log::warn!("idle compact: TJS garbage collection failed: {error}");
     }
-    true
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------

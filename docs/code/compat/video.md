@@ -85,12 +85,14 @@ Without a source, `open` raises
 `VideoOverlay.open: no decoded source for "<path>"` rather than fabricating
 metadata.
 
-The frame step is `compat::video_advance(ctx, dt_ms)`, the frame body's
-`video_poll` step. It advances each open overlay by the **caller's**
-per-frame `dt` — never by wall time — presents the host frame once, composites
-it, completes a pending prepare, syncs the audio and dispatches the queued
-events. The composite precedes the prepare pause/rewind so the prepared picture
-is visible when `perPrepare` fires.
+The frame step is `compat::video_advance(ctx, max_step_ms)`, the frame
+body's `video_poll` step. It advances each open overlay by the **engine
+clock's** elapsed time since the previous advance — never by wall time —
+bounded by the caller's `max_step_ms`, the audio pump's playback cap, so the
+picture and the sound fall behind together. It then presents the host frame
+once, composites it, completes a pending prepare, syncs the audio and
+dispatches the queued events. The composite precedes the prepare pause/rewind
+so the prepared picture is visible when `perPrepare` fires.
 
 ---
 
@@ -175,7 +177,7 @@ the segment loop and the play rate (any value is accepted), the layer
 references and their validation, the mixing-layer selection, the passthrough
 members and their closed/open sentinels, the stubbed colour adjustment (all
 20 members read `-1.0`), the reachability of every member, the three
-compositing modes, the advance using the frame body's `dt`, the synchronous
+compositing modes, the advance using the engine's clock, the synchronous
 status events, `prepare` acting only in layer mode, the frozen `mode`, the
 layer-mode geometry, the constructor's window requirement, the audio members
 before `open`, the stream counts and the default gain, the typed error for a

@@ -3,8 +3,8 @@
 Source: `crates/engine/src/timer.rs`
 
 The registry **remembers when to wake up, then calls back**. Timers are
-explicit L2 state driven by the L1 clock: the host passes the current time
-each frame to `TimerState::advance`, which invokes the due callbacks in
+explicit L2 state driven by the frame clock: the engine passes the current
+time each frame to the registry's pump, which invokes the due callbacks in
 creation order.
 
 The registry is **repeating by construction**: a timer created through
@@ -90,8 +90,10 @@ impl TimerState {
 Two entry points inject time, and both keep the registry deterministic for
 tests:
 
-* **`advance(now_ms)`** takes the time from the L1 clock and *delivers* — the
-  frame's event-pump step.
+* **`deliver_due(registry, now_ms)`** takes the time from the frame clock and
+  *delivers* — the frame's event-pump step. It is a free function and not a
+  method, because the compatibility layer names the registry to arm timers and
+  a method would hand it the pump as well.
 * **Assigning `now_ms`** injects the current time *without* delivering. L3's
   property setters write it before (re-)arming, so a schedule write between
   two polls lands on the write's own timestamp, exactly like the reference
@@ -101,7 +103,7 @@ tests:
 
 ## 5. Re-entrancy
 
-Callbacks run **inside** `advance`, yet they may re-enter the registry —
+Callbacks run **inside** the delivery, yet they may re-enter the registry —
 creating timers, changing intervals, removing themselves — through the same
 handle the host attached. The delivery is therefore structured as three
 phases:
@@ -155,7 +157,7 @@ and dropped entirely within one callback invocation, strictly sequential with
 Engine::frame(now_ms)
    │
    ▼
-TimerState::advance(now_ms)
+timer::deliver_due(&mut timer, now_ms)
    ├─ collect the due timers in creation order, re-armed from now_ms
    └─ invoke each callback with its TimerId
           │
@@ -183,8 +185,9 @@ after the registry has been restored to a consistent state.
 
 ## 9. Current limits
 
-* **`TimerState::advance` is public.** It runs only inside `Engine::frame`,
-  but the surface has not been collapsed to the four methods.
+* **`TimerState::advance` is crate-private.** The pump's public face is
+  `timer::deliver_due`, which the compatibility layer does not call: the
+  engine owns the registry's pump.
 
 ---
 

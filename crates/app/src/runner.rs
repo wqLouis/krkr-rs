@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use api::config::{CacheLimit, RuntimeConfig};
+use engine::{FrameTimeSource, InjectedFrameTime};
 use platform::{
     EventHandler, Flow, FramePacing, PlatformConfig, PlatformError, PlatformEvent, PlatformWindow,
 };
@@ -131,7 +132,10 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
         .with_debug_overlay(launch.runtime.debug_overlay)
         .with_graphic_cache_limit(launch.runtime.graphic_cache_limit);
     let mut host = Host::new(config)?;
-    let dt_ms = launch.runtime.frame_rate_limit.period_ms();
+    // The headless run has no wall clock to measure: it injects the frame
+    // period it simulates, and every timeline the frame derives comes from
+    // that one value.
+    let clock = InjectedFrameTime::new(f64::from(launch.runtime.frame_rate_limit.period_ms()));
 
     if let Some(input) = &launch.game {
         let mut game = GameHost::open_with_preload(
@@ -148,7 +152,7 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
         );
         let mut last = None;
         for _ in 0..frames {
-            last = Some(game.step(dt_ms, &[])?);
+            last = Some(game.step(&clock, &[])?);
         }
         if let Some(report) = last
             && let Some(stats) = report.stats
@@ -200,7 +204,7 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
 
     let mut last = None;
     for _ in 0..frames {
-        last = Some(host.step(dt_ms)?);
+        last = Some(host.step(&clock)?);
     }
     if let Some(report) = last
         && let Some(stats) = report.stats
@@ -252,6 +256,9 @@ struct DesktopApp {
     graphic_cache_limit: Option<CacheLimit>,
     /// Frame period the loop paces at, which bounds the presentation wait.
     frame_interval: Duration,
+    /// The frame's elapsed time: the real time the platform measured,
+    /// injected into the engine's clock every frame.
+    frame_time: InjectedFrameTime,
     /// The running host, created once the window handle exists.
     running: Option<Running>,
     /// Input and focus events received since the last frame, delivered to
@@ -337,14 +344,14 @@ impl Running {
     /// Advances and presents one frame, delivering `events` to the VM.
     fn step(
         &mut self,
-        dt_ms: f32,
+        clock: &dyn FrameTimeSource,
         events: &[PlatformEvent],
         pacing: FramePacing,
     ) -> Result<StepReport, String> {
         match self {
-            Running::Empty(host) => host.step(dt_ms).map_err(|e| e.to_string()),
+            Running::Empty(host) => host.step(clock).map_err(|e| e.to_string()),
             Running::Game(game) => game
-                .step_with_pacing(dt_ms, events, pacing)
+                .step_with_pacing(clock, events, pacing)
                 .map_err(|e| e.to_string()),
         }
     }
@@ -370,6 +377,7 @@ impl DesktopApp {
             running: None,
             pending_events: Vec::new(),
             pending_surface_size: None,
+            frame_time: InjectedFrameTime::default(),
             heartbeat_frames: 0,
             changed_frames: 0,
             last_revisions: None,
@@ -509,6 +517,9 @@ impl EventHandler for DesktopApp {
     }
 
     fn frame(&mut self, dt_ms: f32, window: &PlatformWindow, pacing: FramePacing) -> Flow {
+        // The platform measured the real time since the previous frame; that
+        // measurement is the elapsed time the engine's clock advances by.
+        self.frame_time.elapsed_ms = f64::from(dt_ms);
         let (report, revisions) = {
             let Some(running) = self.running.as_mut() else {
                 return Flow::Continue;
@@ -522,7 +533,7 @@ impl EventHandler for DesktopApp {
                 return Flow::Exit;
             }
             let events = std::mem::take(&mut self.pending_events);
-            let report = match running.step(dt_ms, &events, pacing) {
+            let report = match running.step(&self.frame_time, &events, pacing) {
                 Ok(report) => report,
                 Err(error) => {
                     eprintln!("krkr: frame failed: {error}");

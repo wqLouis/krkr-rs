@@ -12,6 +12,7 @@
 use std::time::{Duration, Instant};
 
 use compat::{CompatCtx, CompatError, FrameBody, run_frame_body};
+use engine::FrameClock;
 use engine::input::InputState;
 use engine::timer::TimerState;
 use testkit::vm_lock;
@@ -68,21 +69,23 @@ impl FrameBody for RecordingBody {
     }
 }
 
-/// Creates a VM host with the input and timer registries attached, as the
-/// running game attaches them.
-fn vm_host() -> (VmHost, Box<InputState>, Box<TimerState>) {
+/// Creates a VM host with the input state, the timer registry and the frame
+/// clock attached, as the running game attaches them.
+fn vm_host() -> (VmHost, Box<InputState>, Box<TimerState>, Box<FrameClock>) {
     let mut input = Box::new(InputState::new());
     let mut timer = Box::new(TimerState::new());
+    let mut clock = Box::new(FrameClock::new());
     let host = VmHost::with_default_services(|services| {
-        // SAFETY: both boxes outlive the host in the caller's return value, and
+        // SAFETY: every box outlives the host in the caller's return value, and
         // nothing else aliases them while the binding is installed.
         unsafe {
             services.attach_input(input.as_mut() as *mut InputState);
             services.attach_timer(timer.as_mut() as *mut TimerState);
+            services.attach_clock(clock.as_mut() as *mut FrameClock);
         }
     })
     .expect("vm host");
-    (host, input, timer)
+    (host, input, timer, clock)
 }
 
 #[test]
@@ -90,7 +93,7 @@ fn slow_phase_dominates_and_the_wall_total_contains_the_sum() {
     // The VM host binds the process-global engine, so the test serializes on
     // the same lock the other VM tests take.
     let _lock = vm_lock();
-    let (mut host, _input, _timer) = vm_host();
+    let (mut host, _input, _timer, _clock) = vm_host();
     let mut ctx = host.compat().ctx().expect("bound compat context");
     let mut body = RecordingBody {
         slow_sound: true,

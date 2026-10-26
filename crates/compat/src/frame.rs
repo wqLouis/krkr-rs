@@ -111,7 +111,7 @@ pub fn run_frame_body(body: &mut dyn FrameBody, ctx: &mut CompatCtx) -> Result<(
     // that grew past its initial bucket count rebuilds its member table on
     // the next property access, so the frame's handlers walk the rebuilt
     // table instead of the old chain.
-    crate::natives::system::rehash_poll(ctx);
+    crate::natives::system::rehash_poll(ctx)?;
 
     // L2 advanced the timer registry before the hook ran, and the registry's
     // callbacks only post, so the frame's `onTimer` events are complete now.
@@ -139,7 +139,7 @@ pub fn run_frame_body(body: &mut dyn FrameBody, ctx: &mut CompatCtx) -> Result<(
     // (`reference/cpp/core/environ/impl/SystemControl.cpp:174-179`). It runs
     // after the events and before the frame's draw, so the collector never
     // runs inside a native callback.
-    crate::natives::system::compact_poll(ctx);
+    crate::natives::system::compact_poll(ctx)?;
 
     let started = Instant::now();
     body.frame_tail(ctx)?;

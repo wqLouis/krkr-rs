@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use app::{GameHost, Host, HostConfig};
+use app::{GameHost, Host, HostConfig, InjectedFrameTime};
 
 #[test]
 #[ignore = "needs KRKR_TEST_GAME pointing at a real game"]
@@ -35,7 +35,7 @@ fn boots_the_real_game() {
     let mut game = GameHost::open(host, archives, dir.to_path_buf()).expect("open game");
 
     for _ in 0..60 {
-        game.step(1000.0 / 60.0, &[]).expect("step");
+        game.step(&InjectedFrameTime::new(1000.0 / 60.0), &[]).expect("step");
     }
     let scene = game.scene();
     assert!(

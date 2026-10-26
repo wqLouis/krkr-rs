@@ -161,10 +161,10 @@ without re-projecting the tree.
 **L2 owns the frame.** Nothing above L2 owns a `dt`.
 
 ```
-Engine::frame(now_ms, hooks) / Engine::step(dt_ms, hooks)
+Engine::run(clock, hooks) / Engine::frame(now_ms, hooks) / Engine::step(dt_ms, hooks)
   ├─ set the frame clock
   ├─ fit the presentation to the current VM/device sizes
-  ├─ advance the L2 timer registry          (the timer callbacks only post)
+  ├─ deliver the due timers                 (the timer callbacks only post)
   ├─ hooks.before_render(now_ms, dt_ms)     (the one upward hook)
   │      L4 vm.tick → the platform events → the L3 frame body → the audio drain
   ├─ fit the presentation again              (the hook may have resized a window)
@@ -179,7 +179,8 @@ Engine::frame(now_ms, hooks) / Engine::step(dt_ms, hooks)
 
 * The frame entry point is **public and deterministic**: a test drives
   `frame(now)` with a virtual clock, with no sleeps and no real time.
-* `Engine::frame(now_ms, …)` sets the clock; `Engine::step(dt_ms, …)`
+* `Engine::run(clock, …)` takes the frame's elapsed time from the caller's
+  clock source; `Engine::frame(now_ms, …)` sets the clock; `Engine::step(dt_ms, …)`
   accumulates it. The delta handed to the hook is the distance from the
   previous frame's clock, and zero on the first frame.
 * The hook is the one upward edge: `GameFrame`, declared in L2 and implemented
@@ -190,9 +191,11 @@ Engine::frame(now_ms, hooks) / Engine::step(dt_ms, hooks)
   video, async-trigger and continuous-handler polls, the idle compaction and
   the movie/transition tail. Those pumps are still staged inside the L3 hook;
   they keep deterministic test clocks.
-* `TimerState::advance` is called by the engine frame. A host or a test may
-  drive the registry through the poll entry point, which advances at the
-  registry's own timestamp and still takes no `dt`.
+* The timer registry's pump is private to L2: `TimerState::advance` is
+  crate-private and the engine frame calls it through
+  `timer::deliver_due`. A host or a test that owns a registry delivers the
+  due timers itself, through the same free function; the compatibility layer
+  never advances the registry.
 * Re-entrancy: a timer callback mutates L2 state, so a frame collects the due
   work first and then invokes it; the advance is never re-entered.
 

@@ -45,6 +45,10 @@ use render::{
 };
 
 pub(crate) use audio::install_audio_decoder_metered;
+// The clock source the composition roots inject the frame's elapsed time
+// into: the windowed loop writes the real time the platform measured, the
+// headless runner writes the frame period it simulates.
+pub use engine::{FrameTimeSource, InjectedFrameTime};
 pub use game::{GameError, GameHost};
 pub use image_codec::install_image_codec;
 pub(crate) use image_codec::{install_image_codec_metered, install_image_decoder};
@@ -284,19 +288,18 @@ impl Host {
     /// Advances the host by one frame and presents it.
     ///
     /// The engine drives the whole frame: it fits the script-visible size into
-    /// the framebuffer, advances its clock, fires due timers, runs the (here
-    /// empty) frame hook, fits the presentation again (the hook may have
-    /// changed a window size), refreshes the debug overlay, uploads dirty
-    /// bitmaps, projects the layer tree when it changed, translates it into
-    /// device pixels and renders the result. `dt_ms` advances the engine's
-    /// frame clock.
+    /// the framebuffer, advances its clock by the elapsed time `clock`
+    /// reports, fires due timers, runs the (here empty) frame hook, fits the
+    /// presentation again (the hook may have changed a window size), refreshes
+    /// the debug overlay, uploads dirty bitmaps, projects the layer tree when
+    /// it changed, translates it into device pixels and renders the result.
     ///
     /// # Errors
     ///
     /// Returns [`HostError`] when the frame hook, the overlay or a render
     /// action fails.
-    pub fn step(&mut self, dt_ms: f32) -> Result<StepReport, HostError> {
-        self.step_with_frame(dt_ms, &mut EmptyFrame)
+    pub fn step(&mut self, clock: &dyn engine::FrameTimeSource) -> Result<StepReport, HostError> {
+        self.step_with_frame(clock, &mut EmptyFrame)
     }
 
     /// Advances the host by one frame, running `hooks` before the projection.
@@ -311,10 +314,10 @@ impl Host {
     /// [`HostError::Frame`].
     pub(crate) fn step_with_frame(
         &mut self,
-        dt_ms: f32,
+        clock: &dyn engine::FrameTimeSource,
         hooks: &mut dyn engine::GameFrame,
     ) -> Result<StepReport, HostError> {
-        Ok(self.engine.step(dt_ms, hooks)?)
+        Ok(self.engine.run(clock, hooks)?)
     }
 
     /// The middle-layer engine, for the composition root's attachments and

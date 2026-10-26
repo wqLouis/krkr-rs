@@ -102,7 +102,7 @@ The families that use it:
 | State type | Family | Holds |
 |---|---|---|
 | `VisualState` | `natives/visual` | the scene-id → script-object registry, the `Window.add` vector, the `Timer` bindings, the host request queues, the string scratch |
-| `SystemState` | `natives/system` | the command line, the exit request, the title, the continuous handlers, the rough tick epoch |
+| `SystemState` | `natives/system` | the command line, the exit request, the title, the continuous handlers |
 | `StringScratch` | several | the reusable `out.string` buffer (one per family, so a re-entrant visual callback cannot clobber a `System` result mid-marshal) |
 | `SoundState` | `natives/sound` | the shared mixer, the sound objects, the decoder chain, the vis-buffer registrations |
 | `VideoState` | `natives/video` | the overlays, the installed `VideoSource` |
