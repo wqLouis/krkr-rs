@@ -3,11 +3,11 @@
 Status: **authoritative** for the architecture level. This file states the
 layer model, the dependency direction, where state lives, who owns the frame,
 and what the script can observe. It is the distilled form of the decisions in
-[`docs.old/migration/README.md`](../../docs.old/migration/README.md) §3 and of the design
-documents in [`docs/arch/`](../arch/), measured against the current tree.
+§13 below and of the design documents in [`docs/arch/`](../arch/), measured
+against the current tree.
 
-Where this file disagrees with the design record, the design record wins and
-this file is corrected. Where it disagrees with
+Where this file disagrees with the design documents in [`docs/arch/`](../arch/),
+those win and this file is corrected. Where it disagrees with
 [`AGENTS.md`](../../AGENTS.md), `AGENTS.md` wins.
 
 Related documents:
@@ -18,9 +18,9 @@ Related documents:
 | public surface, protocol, ownership | [`api_rules.md`](api_rules.md) |
 | the architecture behind the rules | [`docs/arch/`](../arch/) |
 | per-crate code maps | [`docs/code/`](../code/) |
-| the L3 ↔ L2 protocol in full | [`docs.old/migration/14-l3-l2-protocol.md`](../../docs.old/migration/14-l3-l2-protocol.md) |
-| the layer tree → frame contract | [`docs.old/migration/12-layer-tree-and-frame.md`](../../docs.old/migration/12-layer-tree-and-frame.md) |
-| the VM ↔ device pixel mapping | [`docs.old/migration/11-presentation-and-pixel-translation.md](../../docs.old/migration/11-presentation-and-pixel-translation.md) |
+| the L3 ↔ L2 protocol, in full | [`api_rules.md`](api_rules.md), [`docs/code/compat/engine_api.md`](../code/compat/engine_api.md) |
+| the layer tree → frame contract | [`docs/arch/l2.md`](../arch/l2.md) §2–§3, §9 |
+| the VM ↔ device pixel mapping | [`docs/arch/l2.md`](../arch/l2.md) §4, [`docs/code/engine/translate.md`](../code/engine/translate.md) |
 | the agent contract and the gate | [`AGENTS.md`](../../AGENTS.md) |
 | the ordered gate, the tests and the release pipeline | [`gates.md`](gates.md) |
 
@@ -299,9 +299,10 @@ behaviour. The emulation lives in L3; no real Win32 API is linked.
   only where the plugin's stem is free.
 * Where the external engine's source is unavailable, the shipped DLL build is
   the oracle and is cited **by hash**
-  (`plugins/<n>/plugin/<Name>.dll <sha256[:12]> @ <function/address>`). The
-  extracted surface or behaviour is committed as a derived fixture and the
-  test gates on the fixture; a test never loads a DLL at run time.
+  (`<Name>.dll <sha256[:12]> @ <function/address>`). The extracted surface or
+  behaviour is committed as a derived fixture and the test gates on the
+  fixture; a test never loads a DLL at run time. The game DLLs themselves are
+  not committed to this repository.
 
 ---
 
@@ -353,9 +354,9 @@ state and does not grow a second engine.
   `crate::engine_api::…`. Removing one deletes it from the engine, the seam,
   the documentation and every call site in the same change.
 * The full protocol — the items per module, their ownership, their coordinate
-  space, their error type and their lifetime — is in
-  [`docs.old/migration/14-l3-l2-protocol.md`](../../docs.old/migration/14-l3-l2-protocol.md)
-  and summarised in [`api_rules.md`](api_rules.md).
+  space, their error type and their lifetime — is summarised in
+  [`api_rules.md`](api_rules.md) and itemised per module in
+  [`docs/code/compat/engine_api.md`](../code/compat/engine_api.md).
 
 ---
 
@@ -378,8 +379,10 @@ state and does not grow a second engine.
 
 ## 13. The decisions, distilled
 
-Each row is the rule as it binds the tree today. The full record with the
-rationale is in [`docs.old/migration/README.md`](../../docs.old/migration/README.md) §3.
+Each row is the rule as it binds the tree today. The reasoning behind these
+rules was recorded in a design record that is **not part of this repository**,
+so it is not cited here: the pages that state each rule in full are in
+[`docs/arch/`](../arch/) and in this file.
 
 | # | the rule as it stands |
 |---|---|

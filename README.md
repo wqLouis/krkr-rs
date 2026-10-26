@@ -39,9 +39,14 @@ cargo build
 
 ```
 
+The build needs Rust stable, a C++17 compiler, Zig, bison and the system FFmpeg/ALSA/libc++
+development packages; [`AGENTS.md`](AGENTS.md) §1.2 lists the exact set and the environment
+variables the test suite uses.
+
 **Documentation & License**
 
-* **`docs/`** — the architecture (`docs/arch/`), the module map (`docs/code/`), the rules (`docs/rules/`), and the parity verification (`docs/native_parity.md`). The superseded design record, the audits and the reference studies are archived in `docs.old/`.
+* **`docs/`** — the architecture (`docs/arch/`), the module map (`docs/code/`), the rules (`docs/rules/`), and the parity verification (`docs/native_parity.md`).
+* **The reference engine** — the behaviour oracle every compatibility claim is measured against — is a separate checkout and is **not** part of this repository: `git clone https://github.com/2468785842/krkr2 reference`. The `reference/cpp/...:line` citations in the tests point into it.
 * **License:** GPL-3.0 (the vendored TJS2 VM retains its upstream BSD-style license).
 
 ---
