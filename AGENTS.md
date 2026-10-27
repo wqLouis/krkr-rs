@@ -666,6 +666,7 @@ in the commit that introduced the change.
 | The L2 public API: the engine crate's types, operations, error types | `docs/arch/l2-api.md` |
 | L3 — the compatibility surface, the plugins, the events | `docs/arch/l3.md` |
 | L4 — the TJS VM host | `docs/arch/l4.md` |
+| Embedding the engine and the platform services in another application | `docs/arch/embedding.md` |
 | The Vulkan pipeline and the blend mapping | `docs/arch/l1.md` §3, `docs/code/platform/render.md` |
 | The media engine | `docs/arch/l1.md` §4–§5, `docs/code/platform/media.md` |
 | The file system | `docs/code/platform/fs.md` |

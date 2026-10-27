@@ -1088,4 +1088,5 @@ those are not obvious. The itemised protocol per module is
 | the four layers, the crate map, the coordinate spaces, the frame in one page | [`overall.md`](overall.md) |
 | the platform core this layer sits on | [`l1.md`](l1.md) |
 | the compatibility surface that codes against this one | [`l3.md`](l3.md) |
+| embedding the engine and the platform services in another application | [`embedding.md`](embedding.md) |
 | the open work and the known gaps | [`../../TODO.md`](../../TODO.md) |

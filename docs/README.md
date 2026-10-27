@@ -33,6 +33,7 @@ above and adds the process rules (the gate, the roles, the release metering).
 | [`arch/l2-api.md`](arch/l2-api.md) | the L2 public API: the engine crate's types, operations, error types and stability contract |
 | [`arch/l3.md`](arch/l3.md) | L3 — the compatibility surface: the native classes, the plugins, the events, the frame body |
 | [`arch/l4.md`](arch/l4.md) | L4 — the TJS VM host: the engine wrapper, the script cache, the vendored VM |
+| [`arch/embedding.md`](arch/embedding.md) | embedding the engine and the platform services in another application: the crates, the seams, the frame contract, the script layer |
 
 ---
 
