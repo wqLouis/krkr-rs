@@ -48,7 +48,7 @@ bookkeeping see them like any other layer bitmap.
 |---|---|
 | `RectI` | a half-open pixel rectangle `[x0, x1) × [y0, y1)` |
 | `BlitSource<'a>` | a source bitmap plus the sub-rectangle a blit reads |
-| `BlitOptions` | the blend state of a blit: `mode`, `opa`, `treat_as_opaque`, `hold_alpha` |
+| `BlitOptions` | the blend state of a blit: `mode`, `opa`, `treat_as_opaque` (the source is read as an opaque image), `hold_alpha` (the destination's alpha is held) |
 | `AffineBlit` | the corner map, resampler and background of `affine_blit` |
 | `GammaAdjust` | the per-channel gamma exponents and floors/ceilings |
 | `NoiseRng` | the deterministic noise generator behind `noise` |
@@ -145,6 +145,12 @@ them:
 | the channel mix | the source's alpha mixes the colours with `d + ((f - d) * a >> 8)` and the destination's alpha is held | `reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3402-3411`, `:3474-3482` (the CPU twin is `reference/cpp/core/visual/gl/blend_functor_c.h:374-383`) |
 | the copy family | the source replaces the destination, with the destination's alpha copied, held or made opaque | `reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:2986`, `:3141-3147` (the CPU twin is `reference/cpp/core/visual/tvpgl.cpp:3326-3370`) |
 
+Below the full opacity a copy pass is a blend of its own: the opacity mixes
+the source's colour into the destination's and the destination's alpha is
+held. A pass that reads the source as an opaque image takes the
+alpha-correct source-over instead, so the destination's alpha takes part in
+the mix.
+
 The per-channel function of every Photoshop mode is the tree's CPU twin, and
 the tables the tree builds at start-up
 (`reference/cpp/core/visual/gl/blend_function.cpp:526-547`) are the exact
@@ -204,7 +210,9 @@ the floating-point shader computes.
   have the same extent and the resampler is one of the exact-at-integer kinds,
   the stretch maps each destination pixel to the matching source texel. It
   routes to the clipped copy for Copy mode and to the source-over blit for
-  SourceOver mode instead of the float resampler.
+  SourceOver mode instead of the float resampler. The copy shortcut does not
+  serve a pass that reads the source as an opaque image: it writes the
+  source's own alpha where that pass writes an opaque one.
 * The `simd-experiment` feature adds an exact source-over row fast path for
   `operateRect`: a 16-pixel block whose source alpha is all 255 copies, a
   block whose alpha is all 0 leaves the destination alone, and a row with

@@ -249,6 +249,41 @@ fn restore_alpha_in_clip(dst: &mut BitmapState, clip: RectI, alpha: &[u8]) -> Re
     Ok(())
 }
 
+/// Clip a source rectangle to the source image's bounds, moving the
+/// destination origin with it.
+///
+/// A rectangle that reaches past the source image contributes only the part
+/// that is inside it; the destination moves with the part that is left, so
+/// the pixels that are copied stay aligned with the source.
+fn clip_source_to_image(
+    dx: i32,
+    dy: i32,
+    src: RectI,
+    width: u32,
+    height: u32,
+) -> Option<(i32, i32, RectI)> {
+    let mut dx = dx;
+    let mut dy = dy;
+    let (mut left, mut top, mut right, mut bottom) = (src.0, src.1, src.2, src.3);
+    if left < 0 {
+        dx = dx.saturating_sub(left);
+        left = 0;
+    }
+    if top < 0 {
+        dy = dy.saturating_sub(top);
+        top = 0;
+    }
+    let (Ok(image_right), Ok(image_bottom)) = (i32::try_from(width), i32::try_from(height)) else {
+        return None;
+    };
+    right = right.min(image_right);
+    bottom = bottom.min(image_bottom);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some((dx, dy, (left, top, right, bottom)))
+}
+
 /// The destination bitmap + `HoldAlpha` flag of a layer, or `None` when its
 /// MainImage has been deallocated (`Layer.hasImage = false`).
 fn dest_info(scene: &mut Scene, id: u32, method: &str) -> Result<Option<(u32, bool)>, String> {
@@ -392,6 +427,98 @@ fn face_blend(mode: i64, face: i32) -> (i64, bool) {
         OM_OPAQUE if face == DF_ALPHA || face == DF_ADD_ALPHA => (OM_OPAQUE, true),
         _ => (mode, false),
     }
+}
+
+/// The blend a blit method runs on a draw face.
+///
+/// The four blends are the plain copy, the copy of an opaque source, the
+/// colour mix and the alpha-correct source-over.
+#[derive(Clone, Copy)]
+enum Blit {
+    /// The plain copy: the source's colour and alpha replace the
+    /// destination's.
+    Copy,
+    /// The copy of an opaque source: the source is read as an opaque image,
+    /// so the source's colour replaces the destination's and the
+    /// destination's alpha becomes opaque.
+    CopyOnAlpha,
+    /// The colour mix: the source's alpha mixes the colours and the
+    /// destination's alpha is held.
+    Alpha,
+    /// The alpha-correct source-over: the destination's alpha takes part in
+    /// the mix.
+    AlphaOnAlpha,
+}
+
+impl Blit {
+    /// The engine's operation mode the blend runs as.
+    fn mode(self) -> i64 {
+        match self {
+            Blit::Copy | Blit::CopyOnAlpha => OM_OPAQUE,
+            Blit::Alpha => super::blend::LT_PS_NORMAL,
+            Blit::AlphaOnAlpha => OM_ALPHA,
+        }
+    }
+
+    /// Whether the blend reads the source as an opaque image.
+    fn reads_source_as_opaque(self) -> bool {
+        matches!(self, Blit::CopyOnAlpha)
+    }
+}
+
+/// The blit families: the methods that name their blend per draw face.
+#[derive(Clone, Copy)]
+enum BlitFamily {
+    /// The pile methods: the source is mixed into the destination.
+    Pile,
+    /// The blend methods: the source is copied into the destination.
+    Blend,
+    /// The copy methods: the source is copied as it is.
+    Copy,
+}
+
+/// The blend a family runs on a draw face, and the hold argument it passes.
+///
+/// The pile mixes the source into the destination: with the source's alpha
+/// on an alpha face, and with the colour mix on an opaque face. The blend
+/// copies the source: as an opaque image on an alpha face, and with its own
+/// alpha on an opaque face. The copy copies the source as it is.
+///
+/// The copy blends take the layer's hold argument; the alpha blends ignore
+/// it. The copy methods pass the hold argument on the opaque face alone —
+/// the alpha faces copy the source's own alpha.
+fn family_blit(family: BlitFamily, face: i32, layer_hold_alpha: bool) -> FaceBlit {
+    match family {
+        BlitFamily::Pile => FaceBlit {
+            blend: if face == DF_OPAQUE {
+                Blit::Alpha
+            } else {
+                Blit::AlphaOnAlpha
+            },
+            hold: false,
+        },
+        BlitFamily::Blend => FaceBlit {
+            blend: if face == DF_OPAQUE {
+                Blit::Copy
+            } else {
+                Blit::CopyOnAlpha
+            },
+            hold: layer_hold_alpha,
+        },
+        BlitFamily::Copy => FaceBlit {
+            blend: Blit::Copy,
+            hold: face == DF_OPAQUE && layer_hold_alpha,
+        },
+    }
+}
+
+/// The blend a family runs on a draw face, and the hold argument it passes.
+#[derive(Clone, Copy)]
+struct FaceBlit {
+    /// The blend the family runs.
+    blend: Blit,
+    /// Whether the family passes the layer's hold argument to the blend.
+    hold: bool,
 }
 
 /// Whether the operation mode is one the engine accepts.
@@ -809,29 +936,28 @@ fn affine_op(
     // each face.
     let (blend_mode, treat_as_opaque, hold) = match kind {
         AffineKind::Copy => {
-            // The copy carries the source's alpha on every face, so the
-            // destination keeps its transparency where the source is
-            // transparent. The hold argument is off on the two alpha faces
-            // and the layer's own on the opaque face.
-            (OM_OPAQUE, false, face == DF_OPAQUE && layer_hold_alpha)
+            let blit = family_blit(BlitFamily::Copy, face, layer_hold_alpha);
+            (
+                blit.blend.mode(),
+                blit.blend.reads_source_as_opaque(),
+                blit.hold,
+            )
         }
         AffineKind::Pile => {
-            // The pile mixes the source into the destination with the
-            // source's alpha on an alpha face and mixes the channels on an
-            // opaque face; neither mix takes the hold argument.
-            let blend_mode = if face == DF_ALPHA {
-                OM_ALPHA
-            } else {
-                super::blend::LT_PS_NORMAL
-            };
-            (blend_mode, false, false)
+            let blit = family_blit(BlitFamily::Pile, face, layer_hold_alpha);
+            (
+                blit.blend.mode(),
+                blit.blend.reads_source_as_opaque(),
+                blit.hold,
+            )
         }
         AffineKind::Blend => {
-            // The blend copies the source as an opaque image on an alpha
-            // face and copies it with its own alpha on an opaque face. Both
-            // are copies, so both take the layer's hold argument.
-            let treat_as_opaque = face == DF_ALPHA;
-            (OM_OPAQUE, treat_as_opaque, layer_hold_alpha)
+            let blit = family_blit(BlitFamily::Blend, face, layer_hold_alpha);
+            (
+                blit.blend.mode(),
+                blit.blend.reads_source_as_opaque(),
+                blit.hold && opa == 255,
+            )
         }
         AffineKind::Operate => {
             // The operate takes its blend from the operation mode and the
@@ -992,16 +1118,12 @@ fn stretch_op(
         StretchKind::Pile | StretchKind::Blend => {
             let opa = opt_i64(a, 9, 255).clamp(0, 255) as u8;
             let stretch_type = opt_i64(a, 10, 0);
-            // `StretchBlend` on `dfOpaque` treats the source as opaque
-            // (`bmCopy`, `LayerIntf.cpp:5347-5353`); everything else piles
-            // source-over style.
-            let mode = if matches!(kind, StretchKind::Blend) && face == DF_OPAQUE {
-                OM_OPAQUE
+            let family = if matches!(kind, StretchKind::Blend) {
+                BlitFamily::Blend
             } else {
-                OM_ALPHA
+                BlitFamily::Pile
             };
-            let (mode, treat_as_opaque) = face_blend(mode, face);
-            let hold_alpha = face_hold_alpha(mode, layer_hold_alpha);
+            let blit = family_blit(family, face, layer_hold_alpha);
             with_two_bitmaps(scene, dst, src_id, |d, s| {
                 layer_ops::stretch_blit_mode(
                     d,
@@ -1012,10 +1134,10 @@ fn stretch_op(
                     },
                     stretch_type,
                     layer_ops::BlitOptions {
-                        mode,
+                        mode: blit.blend.mode(),
                         opa,
-                        hold_alpha,
-                        treat_as_opaque,
+                        hold_alpha: blit.hold && opa == 255,
+                        treat_as_opaque: blit.blend.reads_source_as_opaque(),
                     },
                 );
             })?;
@@ -1182,13 +1304,28 @@ fn rect_op(
             // (`reference/cpp/core/visual/LayerIntf.cpp:4574-4657`).
             _ => {}
         },
-        RectKind::Pile => {
+        RectKind::Pile | RectKind::Blend => {
             if face != DF_ALPHA && face != DF_OPAQUE {
                 return Err(format!("Layer.{method}: unsupported draw face {face}"));
             }
-            let treat_as_opaque = face == DF_OPAQUE;
+            let family = if matches!(kind, RectKind::Pile) {
+                BlitFamily::Pile
+            } else {
+                BlitFamily::Blend
+            };
+            let blit = family_blit(family, face, hold_alpha);
+            // The destination rectangle is clipped to the layer's clip
+            // rectangle before the source rectangle is read.
+            let Some((dx, dy, src_rect)) = clip_dest_src(dx, dy, src_rect, clip) else {
+                return Ok(());
+            };
             with_two_bitmaps(scene, dst, src_id, |d, s| {
-                layer_ops::blit_over(
+                let Some((dx, dy, src_rect)) =
+                    clip_source_to_image(dx, dy, src_rect, s.width, s.height)
+                else {
+                    return;
+                };
+                layer_ops::operate_rect(
                     d,
                     dx,
                     dy,
@@ -1196,52 +1333,14 @@ fn rect_op(
                         bitmap: s,
                         rect: src_rect,
                     },
-                    clip,
                     layer_ops::BlitOptions {
+                        mode: blit.blend.mode(),
                         opa,
-                        treat_as_opaque,
-                        hold_alpha,
-                        ..Default::default()
+                        hold_alpha: blit.hold && opa == 255,
+                        treat_as_opaque: blit.blend.reads_source_as_opaque(),
                     },
                 );
             })?;
-        }
-        RectKind::Blend => {
-            if face != DF_ALPHA && face != DF_OPAQUE {
-                return Err(format!("Layer.{method}: unsupported draw face {face}"));
-            }
-            if face == DF_OPAQUE {
-                with_two_bitmaps(scene, dst, src_id, |d, s| {
-                    layer_ops::blit_plane(
-                        d,
-                        dx,
-                        dy,
-                        s,
-                        src_rect,
-                        clip,
-                        layer_ops::COPY_MAIN | layer_ops::COPY_MASK,
-                    );
-                })?;
-            } else {
-                with_two_bitmaps(scene, dst, src_id, |d, s| {
-                    layer_ops::blit_over(
-                        d,
-                        dx,
-                        dy,
-                        layer_ops::BlitSource {
-                            bitmap: s,
-                            rect: src_rect,
-                        },
-                        clip,
-                        layer_ops::BlitOptions {
-                            opa,
-                            treat_as_opaque: true,
-                            hold_alpha,
-                            ..Default::default()
-                        },
-                    );
-                })?;
-            }
         }
     }
     mark_image_modified(scene, id);

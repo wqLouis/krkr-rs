@@ -1270,13 +1270,22 @@ Remaining:
 * The pool's counters are cumulative from pool creation; the app merges them
   before the startup snapshot, so they are a startup figure, not a live
   gauge.
-* `Layer.stretchBlend` on an alpha face still runs the source-over instead of
-  the reference's opaque-source copy: the tree's `StretchBlend` uses
-  `bmCopyOnAlpha` on `dfAlpha` and `bmCopy` on `dfOpaque`
-  (`reference/cpp/core/visual/LayerIntf.cpp:5319-5362`), while the port
-  selects `bmAlphaOnAlpha` for the alpha face. The same family as the affine
-  fix in this change, on a path the Kirikiroid2 patch wraps but does not
-  call; recorded here rather than folded into the affine commit.
+* The copy family's arithmetic **below the full opacity** is an
+  approximation. The reference's method table gives every copy method a
+  full-opacity spelling and a below-full-opacity spelling
+  (`reference/cpp/core/visual/RenderManager.cpp:2369-2399`): `bmCopy` runs
+  `Copy` / `CopyColor` / `ConstAlphaBlend` and `bmCopyOnAlpha` runs
+  `CopyOpaqueImage` / `CopyColor` / `ConstAlphaBlend_d`. The tree's own
+  `ConstAlphaBlend` bodies are not vendored (only the call sites in
+  `reference/cpp/core/visual/LayerBitmapIntf.cpp:1600-1606` are), so the
+  arithmetic below the full opacity cannot be read from the oracle. The port
+  keeps its established `ConstAlpha` kernel, which holds the destination's
+  alpha where the tree's GL spelling writes the source's. The same gap
+  covers the operate family's copy mode: the reference hands the hold flag
+  to the blend at every opacity, but its below-full-opacity spelling for the
+  copy methods is the same with and without the hold, so the flag has no
+  effect there. Recorded as an approximation with its reference gap, not as a
+  verified match.
 
 ## 19. Pixel-translation wiring decision
 

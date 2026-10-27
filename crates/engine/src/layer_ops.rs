@@ -2125,11 +2125,16 @@ fn mode_kernel(mode: i64) -> Option<ModeKernel> {
 ///
 /// The copy family has a second spelling below the full opacity: the source's
 /// colour is blended into the destination with the opacity as a constant
-/// alpha.
-fn resolve_kernel(mode: i64, opa: u8) -> Option<ModeKernel> {
+/// alpha. The copy of an opaque source takes the destination's alpha into
+/// that mix; the plain copy holds it.
+fn resolve_kernel(mode: i64, opa: u8, treat_as_opaque: bool) -> Option<ModeKernel> {
     let kernel = mode_kernel(mode)?;
     if opa != 255 && matches!(kernel, ModeKernel::Copy) {
-        return Some(ModeKernel::ConstAlpha);
+        return Some(if treat_as_opaque {
+            ModeKernel::SourceOver
+        } else {
+            ModeKernel::ConstAlpha
+        });
     }
     Some(kernel)
 }
@@ -2685,7 +2690,7 @@ pub fn operate_rect(
     }
     // The kernel is resolved once for the whole pass, so the per-pixel loop
     // never dispatches on the operation mode.
-    let Some(kernel) = resolve_kernel(mode, opa) else {
+    let Some(kernel) = resolve_kernel(mode, opa, treat_as_opaque) else {
         log::error!("engine: operateRect met the unknown operation mode {mode}");
         return;
     };
@@ -2788,7 +2793,7 @@ pub fn stretch_blit_mode(
     };
     // The kernel is resolved once for the whole pass, so the per-pixel loop
     // never dispatches on the operation mode.
-    let Some(kernel) = resolve_kernel(mode, opa) else {
+    let Some(kernel) = resolve_kernel(mode, opa, treat_as_opaque) else {
         log::error!("engine: operateStretch met the unknown operation mode {mode}");
         return;
     };
@@ -2799,7 +2804,11 @@ pub fn stretch_blit_mode(
     // avoids the per-pixel float resampler without changing any pixel.
     if let Some((dx, dy)) = stretch_exact_translation(dest, src_rect, stretch_type) {
         match kernel {
-            ModeKernel::Copy if !hold_alpha => {
+            // The shortcut copies the source's pixels verbatim, so it cannot
+            // serve a pass that reads the source as an opaque image: that
+            // pass writes an opaque alpha where the copy would write the
+            // source's own.
+            ModeKernel::Copy if !hold_alpha && !treat_as_opaque => {
                 blit_copy_clipped(
                     dst,
                     dx,
@@ -2823,7 +2832,7 @@ pub fn stretch_blit_mode(
                     BlitOptions {
                         mode: 0,
                         opa,
-                        treat_as_opaque: false,
+                        treat_as_opaque,
                         hold_alpha,
                     },
                 );
@@ -3085,7 +3094,7 @@ fn affine_blit_clipped_impl(
     } = options;
     // The kernel is resolved once for the whole pass, so the per-pixel loop
     // never dispatches on the operation mode.
-    let Some(kernel) = resolve_kernel(mode, opa) else {
+    let Some(kernel) = resolve_kernel(mode, opa, treat_as_opaque) else {
         log::error!("engine: the affine pass met the unknown operation mode {mode}");
         return;
     };
@@ -4770,7 +4779,7 @@ mod tests {
         let Some(dest_rect) = intersect(dst, affine_dest_bbox(m)) else {
             return;
         };
-        let Some(kernel) = resolve_kernel(mode, opa) else {
+        let Some(kernel) = resolve_kernel(mode, opa, false) else {
             return;
         };
         affine_blit_generic(

@@ -21,16 +21,16 @@ Every method composes the L2 `engine_api::layer_ops` and
 | `operateRect(dx, dy, src, sx, sy, sw, sh[, mode[, opa]])` | blends the source rect into the destination with the requested operation mode. `omAuto` resolves from the source layer's type. |
 | `operateStretch(dx, dy, dw, dh, src, sx, sy, sw, sh[, mode[, opa[, type]]])` | resamples the source rect into the destination rect and blends it. |
 | `operateAffine(src, sx, sy, sw, sh, affine, x1..y3[, mode[, opa[, type]]])` | affine-maps the source rect onto the three destination corners and blends it. |
-| `affineCopy(...)` | affine-maps the source onto the three corners, replacing the destination (optionally clearing it to `neutralColor` first). The replacement carries the source's alpha, so a transparent source keeps the destination transparent there. |
-| `affinePile(...)` | affine-maps and source-over composites the source onto the destination. |
-| `affineBlend(...)` | affine-maps and blends the source onto the destination: the source is read as an opaque image on `dfAlpha`, and copied with its own alpha on `dfOpaque`. |
-| `stretchCopy(dx, dy, dw, dh, src, sx, sy, sw, sh[, type])` | resamples the source rect into the destination rect, replacing the pixels (RGB, and the alpha unless `holdAlpha` on `dfOpaque`). |
-| `stretchPile(...)` | resamples and source-over composites the source rect. |
-| `stretchBlend(...)` | resamples and blends the source rect. |
-| `copyRect(dx, dy, src, sx, sy, sw, sh[, opa])` | copies the source rect to `(dx, dy)`; the plane selection depends on the destination's draw face. |
-| `pileRect(dx, dy, src, sx, sy, sw, sh[, opa])` | source-over composites the source rect at `(dx, dy)`. **Layer-only** source. |
-| `blendRect(dx, dy, src, sx, sy, sw, sh[, opa])` | blends the source rect at `(dx, dy)`. **Layer-only** source. |
-| `piledCopy(dx, dy, src, sx, sy, sw, sh[, opa])` | copies the source **layer's composited subtree** (its own image plus its visible children). **Layer-only** source. |
+| `affineCopy(...)` | affine-maps the source onto the three corners and copies it in (optionally clearing the destination to `neutralColor` first). It is the plain copy: the source's colour and alpha replace the destination's, except on `dfOpaque` with `holdAlpha`, where the destination's alpha is held. |
+| `affinePile(...)` | affine-maps the source onto the three corners and mixes it into the destination: the alpha-correct source-over on `dfAlpha` (the destination's alpha takes part in the mix) and the channel mix on `dfOpaque` (the source's alpha mixes the colours, the destination's alpha is held). |
+| `affineBlend(...)` | affine-maps the source onto the three corners and copies it into the destination: at the full opacity on `dfAlpha` the source is read as an opaque image, so the source's colour replaces the destination's and the destination's alpha becomes opaque (unless the layer holds its alpha); on `dfOpaque` it is the plain copy, so the source's alpha replaces the destination's. |
+| `stretchCopy(dx, dy, dw, dh, src, sx, sy, sw, sh[, type])` | resamples the source rect into the destination rect and copies it in: the plain copy, so the source's colour and alpha replace the destination's, except on `dfOpaque` with `holdAlpha`, where the destination's alpha is held. |
+| `stretchPile(...)` | resamples the source rect into the destination rect and mixes it in: the alpha-correct source-over on `dfAlpha` and the channel mix on `dfOpaque`. |
+| `stretchBlend(...)` | resamples the source rect into the destination rect and copies it in: at the full opacity on `dfAlpha` the source is read as an opaque image and the destination's alpha becomes opaque (unless the layer holds its alpha); on `dfOpaque` it is the plain copy. |
+| `copyRect(dx, dy, src, sx, sy, sw, sh[, opa])` | copies the source rect to `(dx, dy)`: the plain copy on `dfAlpha`/`dfAddAlpha`/`dfOpaque` — the source's colour and alpha replace the destination's, except on `dfOpaque` with `holdAlpha`, where the destination's alpha is held; the other faces copy their own plane. |
+| `pileRect(dx, dy, src, sx, sy, sw, sh[, opa])` | mixes the source rect into the destination at `(dx, dy)`: the alpha-correct source-over on `dfAlpha` (the destination's alpha takes part in the mix) and the channel mix on `dfOpaque` (the source's alpha mixes the colours, the destination's alpha is held). **Layer-only** source. |
+| `blendRect(dx, dy, src, sx, sy, sw, sh[, opa])` | copies the source rect into the destination at `(dx, dy)`: at the full opacity on `dfAlpha` the source is read as an opaque image, so the source's colour replaces the destination's and the destination's alpha becomes opaque (unless the layer holds its alpha); on `dfOpaque` it is the plain copy, so the source's alpha replaces the destination's. **Layer-only** source. |
+| `piledCopy(dx, dy, src, sx, sy, sw, sh[, opa])` | copies the source **layer's composited subtree** (its own image plus its visible children). It copies the colour and the alpha and ignores the draw face and the hold flag. **Layer-only** source. |
 | `copy9Patch(src)` | copies the 9-patch source and returns its margin `Rect`, or `void`. |
 | `copyToBitmapFromMainImage(bitmap)` | replaces the bitmap's content with the layer's main image (resizing the bitmap). The main image is **resolved first** — a pending decode is waited for — and an image that declares more pixels than its buffer holds raises. The destination's pending decode is **cancelled** and its pixels replaced, so a stale decode cannot overwrite the copy. |
 | `fillRect(x, y, w, h, color[, opa])` | fills the rect with the colour. The main image is **resolved first** — a pending decode is waited for — so the fill lands on the decoded pixels instead of being overwritten by them; an image that declares more pixels than its buffer holds raises. |
@@ -124,10 +124,13 @@ pixels than its buffer holds answers `0` like a missing one. The writes
 * **Fill** (`colorRect`): the destination is the intersection of the
   requested rect with the clip; the clip is the layer's `ClipRect`, or the
   whole image when unset.
-* **Copy / pile / blend**: the destination point is pushed up to the clip's
-  left/top edge and the source rect is shrunk from the right/bottom by the
-  same amount; the operation is skipped entirely when the source collapses to
-  zero width or height.
+* **Copy / pile / blend** (the rectangle family): the destination rectangle
+  is clipped to the layer's clip rectangle and the source rectangle to the
+  source image. The pile and blend methods trim the source rectangle to the
+  clip and move the destination with the part of the source that is left; the
+  copy methods keep the destination where it is and skip the source pixels
+  that lie outside the image. The operation is skipped entirely when the
+  source collapses to zero width or height.
 * **Stretches**: the destination rect is normalised, then intersected with
   the clip to give the visible destination. The source rect is remapped into
   that clipped window with integer truncation.
@@ -139,10 +142,10 @@ pixels than its buffer holds answers `0` like a missing one. The writes
 * The 1:1 copies are exact integer pixel transfers. Resampling happens only
   in the stretch and affine paths, which use a half-pixel-centre mapping and
   a bilinear sample respectively.
-* **The affine primitive takes no clip argument**, so the destination is
-  snapshotted before the blit and afterwards every pixel **outside** the clip
-  is restored, and the alpha **inside** the clip is restored to its
-  pre-blit value (the reference's hold-alpha behaviour for the affine).
+* **The affine primitive takes no clip argument**, so the pass writes inside
+  the clip alone and the pixels outside it keep their values. When the method
+  passes the hold argument, the alpha **inside** the clip is restored to its
+  pre-blit value.
 
 ### The clip-before-validation order
 
@@ -185,23 +188,32 @@ a type change resolves the face again.
 
 ### The destination alpha
 
-The face selects the blend method together with the operation mode, and the
-layer's `holdAlpha` property is the argument the *plain* methods take: the
-`OnAlpha`/`OnAddAlpha` methods handle the destination's alpha themselves.
-`holdAlpha` therefore reaches a face-selected blend on an opaque face only;
-the face-independent modes take it whatever the face is.
+The face selects the blend a method runs, and the layer's `holdAlpha`
+property is the argument the *copy* methods take: the methods that handle the
+destination's alpha themselves ignore it. The copy family passes it on the
+opaque face alone — the alpha faces copy the source's own alpha — and the
+blend family passes it at the full opacity only. The pile family ignores it
+at every opacity. The `operate*` methods take their blend from the operation
+mode and pass the flag when the resolved mode is the copy.
+
+### Below the full opacity
+
+The blend family's copy is a blend below the full opacity: the opacity
+covers the source's colour, so the source is mixed into the destination
+instead of replacing it. On an alpha face the source is read as an opaque
+image, so the destination's alpha takes part in the mix; on the opaque face
+the destination's alpha is held. The pile family mixes at every opacity, and
+the opacity scales the source's alpha in the mix.
 
 ### The per-method face gates
 
 | Method | Accepted faces |
 |---|---|
 | `operateRect`, `operateStretch`, `operateAffine` | the face-**sensitive** modes need `dfAlpha`/`dfOpaque`/`dfAddAlpha`; the face-independent modes accept any |
-| `affineCopy` | `dfAlpha`/`dfAddAlpha`/`dfOpaque` |
-| `affinePile`, `affineBlend` | `dfAlpha`/`dfOpaque` |
-| `stretchCopy` | `dfAlpha`/`dfAddAlpha`/`dfOpaque` |
-| `stretchPile`, `stretchBlend` | `dfAlpha`/`dfOpaque` |
-| `pileRect`, `blendRect` | `dfAlpha`/`dfOpaque` |
-| `copyRect` | dispatches per face — `dfAlpha`/`dfAddAlpha` a full copy; `dfOpaque` an RGB copy (the alpha held iff `holdAlpha`); `dfMask` the alpha only; `dfProvince` zeroes the province region; **any other face is a silent no-op**, matching the reference's missing `default:` case |
+| `copyRect` | dispatches per face — `dfAlpha`/`dfAddAlpha` the plain copy; `dfOpaque` the plain copy with the destination's alpha held iff `holdAlpha`; `dfMask` the alpha only; `dfProvince` zeroes the province region; **any other face is a silent no-op**, matching the reference's missing `default:` case |
+| the copy family (`stretchCopy`, `affineCopy`) | `dfAlpha`/`dfAddAlpha`/`dfOpaque` — the plain copy on every face; the destination's alpha is held on `dfOpaque` iff `holdAlpha` |
+| the pile family (`pileRect`, `stretchPile`, `affinePile`) | `dfAlpha`/`dfOpaque` — `dfAlpha` the alpha-correct source-over, `dfOpaque` the channel mix |
+| the blend family (`blendRect`, `stretchBlend`, `affineBlend`) | `dfAlpha`/`dfOpaque` — at the full opacity `dfAlpha` is the copy of an opaque source and `dfOpaque` the plain copy |
 | `colorRect` | `dfAlpha`, `dfAddAlpha`, `dfOpaque`, `dfMask`, `dfProvince`; **any other face is a silent no-op** |
 
 ---
@@ -278,12 +290,15 @@ A `Bitmap` passed to a Layer-only member raises
 
 * `copyRect` on `dfOpaque`: the alpha plane is **held** (RGB only) when
   `holdAlpha` is true, otherwise RGB and the alpha are copied;
-* `stretchCopy` on `dfOpaque`: the same rule;
-* `pileRect`, `blendRect`, `operateRect`, `operateStretch`, `stretchPile`,
-  `stretchBlend`: the flag is forwarded to the L2 blend, which composites
-  with the real destination alpha and then restores the old alpha byte;
-* the affine family: the method-level hold flag is ANDed with the layer's,
-  and the alpha inside the clip is restored from the pre-blit snapshot;
+* `stretchCopy` and `affineCopy` on `dfOpaque`: the same rule; on the alpha
+  faces the flag is dropped and the source's own alpha is copied;
+* `blendRect`, `stretchBlend`, `affineBlend`: the flag reaches the blend at
+  the **full opacity only**; below it the blend drops it;
+* `pileRect`, `stretchPile`, `affinePile`: the flag is **ignored** at every
+  opacity, because the pile's blends handle the destination's alpha
+  themselves;
+* `operateRect`, `operateStretch`, `operateAffine`: the flag reaches the
+  blend when the resolved operation mode is the copy;
 * `colorRect` on `dfOpaque` and `fillRect`: the same.
 
 ---
@@ -466,6 +481,8 @@ exception — they answer the out-of-range value `0`.
 | Test | What it asserts |
 |---|---|
 | `crates/compat/tests/layer.rs` | the pixel behaviour: `colorRect` and the pixel accessors, the flips, `copyRect` between layers, `operateRect` with the requested mode and with `omAuto`, the stretches and the affines, `composite` marking the layer modified, the filters, `convertType`, `copyToBitmap` and `copy9Patch`. |
+| `crates/compat/tests/rect_family.rs` | the rectangle family's per-face blends: the copy, pile and blend methods on the alpha and the opaque face, the hold argument, and the draw face `piledCopy` ignores. |
+| `crates/compat/tests/stretch_family.rs` | the stretch family's per-face blends: the copy, pile and blend methods on the alpha and the opaque face, and the hold argument. |
 | `crates/compat/tests/layer_behaviour.rs` | the reference behaviour: the pixel argument counts, the opacity defaults and the negative removal, the `gaussianBlur` sigma default distinguishing a void from a missing argument, `adjustGamma` parsing string reals and accepting no arguments, the mask alpha and the hold-mask plane, `setMaskPixel` truncating to eight bits, the Layer-only members rejecting a bitmap source, the face validations, the `dfAuto` face resolution, and the filters being silent on an imageless layer. |
 | `crates/compat/tests/image_function.rs` | the same primitives through the `ImageFunction` surface. |
 | `crates/compat/tests/bitmap.rs` | the codec seam the image path uses. |

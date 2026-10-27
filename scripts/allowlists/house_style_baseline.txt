@@ -2967,7 +2967,6 @@
 {"path": "crates/compat/src/natives/visual/layer/pixels.rs", "rule": "reference-citation", "anchor": "// (`LayerIntf.cpp:8779-8811`); `pileRect`, `blendRect` and `piledCopy`", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/layer/pixels.rs", "rule": "reference-citation", "anchor": "// (`LayerIntf.cpp:9002-9027`), `stretchPile`/`stretchBlend` only a Layer", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/layer/pixels.rs", "rule": "reference-citation", "anchor": "// (`LayerIntf.cpp:9057-9070`, `9104-9117`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/visual/layer/pixels.rs", "rule": "reference-citation", "anchor": "// (`bmCopy`, `LayerIntf.cpp:5347-5353`); everything else piles", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/layer/pixels.rs", "rule": "reference-citation", "anchor": "// (`reference/cpp/core/visual/LayerBitmapIntf.cpp:210-220`), so the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/layer/pixels.rs", "rule": "reference-citation", "anchor": "// (`reference/cpp/core/visual/LayerIntf.cpp:1006-1025`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/layer/pixels.rs", "rule": "reference-citation", "anchor": "// (`reference/cpp/core/visual/LayerIntf.cpp:4574-4657`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
