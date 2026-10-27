@@ -18,7 +18,7 @@ use super::shaders;
 use super::texture::find_memory_type;
 
 /// Number of fixed-function blend variants compiled per program.
-pub(crate) const BLEND_SLOT_COUNT: usize = 7;
+pub(crate) const BLEND_SLOT_COUNT: usize = 8;
 
 /// Which quad program a draw uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,8 +228,11 @@ pub(crate) fn create(
 /// [`PipelineSet::pipeline_for`] to report them as unsupported.
 pub(crate) fn blend_slot(mode: BlendMode) -> Option<usize> {
     match mode {
-        // Photoshop normal is the same source-over as `ltAlpha`.
-        BlendMode::SourceOver | BlendMode::PsNormal => Some(0),
+        // The source-over is the alpha-correct blend; the Photoshop normal is
+        // the channel mix with the destination's alpha held, so it needs its
+        // own slot.
+        BlendMode::SourceOver => Some(0),
+        BlendMode::PsNormal => Some(7),
         BlendMode::Replace => Some(1),
         // Slot 2 is `src·a + dst` while the reference `bmPsAdditive` is
         // `lerp(dst, min(1, dst+src), a)`; they differ only at the saturation
@@ -303,6 +306,17 @@ fn blend_state_for_slot(slot: usize) -> vk::PipelineColorBlendAttachmentState {
             .dst_color_blend_factor(vk::BlendFactor::ONE)
             .color_blend_op(vk::BlendOp::ADD)
             .src_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_DST_ALPHA)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+            .alpha_blend_op(vk::BlendOp::ADD),
+        // Slot 7: the Photoshop normal - the per-channel mix `src*a +
+        // dst*(1-a)` with the destination's alpha held: the colour factors
+        // are `SRC_ALPHA`/`ONE_MINUS_SRC_ALPHA` and the alpha factors
+        // `ZERO`/`ONE`.
+        7 => base
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ZERO)
             .dst_alpha_blend_factor(vk::BlendFactor::ONE)
             .alpha_blend_op(vk::BlendOp::ADD),
         // Slot 0: source-over.

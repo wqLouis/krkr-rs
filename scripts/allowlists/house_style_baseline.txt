@@ -3878,7 +3878,6 @@
 {"path": "crates/platform/platform/src/linux.rs", "rule": "reference-citation", "anchor": "/// kHz stereo is the KiriKiri/reference mix rate and the format every", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/platform/src/linux.rs", "rule": "reference-citation", "anchor": "/// one with no KiriKiri key code) keeps its winit discriminant as a", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/render/src/cpu.rs", "rule": "reference-citation", "anchor": "// Copy the provider reference out of `self` so the sampled", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/platform/render/src/cpu.rs", "rule": "reference-citation", "anchor": "// The reference `bmPsNormal` alpha blend is the same per-channel", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/render/src/cpu.rs", "rule": "reference-citation", "anchor": "// destination (`reference/cpp/core/visual/tvpgl.cpp:12539-12562`,", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/render/src/cpu.rs", "rule": "reference-citation", "anchor": "// reference's byte-oriented pipeline.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/render/src/cpu.rs", "rule": "reference-citation", "anchor": "//! `reference/cpp/core/visual/gl/blend_functor_c.h`.", "reason": "legacy comment, cleanup tracked in TODO §15"}

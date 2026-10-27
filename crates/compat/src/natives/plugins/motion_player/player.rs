@@ -5776,8 +5776,8 @@ mod tests {
         assert_eq!(over.rgba[3], 255);
         assert_eq!(
             &multiplied.rgba[..4],
-            &[0u8, 0, 0, 255],
-            "the multiplicative mode darkens the texel"
+            &[0u8, 0, 0, 0],
+            "the multiplicative mode darkens the texel and holds the destination's alpha"
         );
         assert_ne!(over.rgba, multiplied.rgba);
     }
@@ -5842,7 +5842,7 @@ mod tests {
     /// blend mode; the mode changes the colour channels, not the coverage
     /// (`reference/cpp/plugins/motionplayer/PlayerRenderInternal.cpp:422-446`).
     #[test]
-    fn a_half_transparent_node_keeps_its_coverage_under_a_blend_mode() {
+    fn a_blend_mode_holds_the_destination_alpha() {
         let (storage, snapshot) = icon_fixture();
         let draw_with = |blend_mode: i32, opacity: f64| {
             let mut node = MotionNode::new(0, "art".to_string());
@@ -5878,10 +5878,12 @@ mod tests {
         // the node's opacity.
         let over = draw_with(16, 0.5);
         assert_eq!(&over.rgba[..4], &[30u8, 20, 10, 128][..]);
-        // The multiplicative mode darkens the texel to black but leaves the
-        // coverage alone.
+        // The multiplicative mode darkens the texel to black and holds the
+        // destination's alpha, so the coverage is not kept
+        // (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3757-3770`:
+        // the alpha factors are `GL_ZERO` / `GL_ONE`).
         let multiplied = draw_with(3, 0.5);
-        assert_eq!(&multiplied.rgba[..4], &[0u8, 0, 0, 128][..]);
+        assert_eq!(&multiplied.rgba[..4], &[0u8, 0, 0, 0][..]);
     }
 
     /// The clear drops the decoded sources, so the next draw reads the chunk

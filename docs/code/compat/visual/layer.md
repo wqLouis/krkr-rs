@@ -281,6 +281,31 @@ canonical native encoding of an operation mode *is* its layer type.
 The `imageTagLayerType` global carries the Photoshop-ish spellings for the
 image-tag API.
 
+### The operation modes and the draw face
+
+An operation mode alone does not select the blend: the draw face does too.
+The reference maps the pair to a blend method
+(`reference/cpp/core/visual/LayerIntf.cpp:4118-4271`) and the method to a
+render method (`reference/cpp/core/visual/RenderManager.cpp:2398-2440`).
+Three modes are face-sensitive:
+
+| mode | face | reference method | blend |
+|---|---|---|---|
+| `omAlpha` | `dfAlpha` | `bmAlphaOnAlpha` | the alpha blend: the destination's alpha takes part in the mix (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3549-3556`) |
+| `omAlpha` | `dfOpaque` | `bmAlpha` | the channel mix: the source's alpha mixes the colours without an alpha correction and the destination's alpha is held (`:3402-3411`) |
+| `omOpaque` | `dfAlpha` | `bmCopyOnAlpha` | the copy of an opaque image: the source's colour replaces the destination's and the destination's alpha becomes opaque (`:3141-3147`) |
+| `omOpaque` | `dfOpaque` | `bmCopy` | the plain copy: the source's colour and alpha replace the destination's (`:2986`) |
+
+Every other mode blends the same way whatever the face is, and the whole
+Photoshop family (`omPsNormal` and up) uses the channel mix.
+
+The layer's `holdAlpha` property is the argument the copy methods take
+(`reference/cpp/core/visual/LayerIntf.cpp:5249-5251`): under it the copies
+hold the destination's alpha, and the blend methods hold it themselves. An
+operation mode the reference does not know is rejected with an error instead
+of blending with another mode
+(`reference/cpp/core/visual/LayerIntf.cpp:4236-4241`).
+
 ---
 
 ## 5. State ownership

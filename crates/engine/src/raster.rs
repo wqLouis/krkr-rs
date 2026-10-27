@@ -81,13 +81,25 @@ pub(crate) fn blend_pixel_at(pixel: &mut [u8; 4], color: [u8; 4], coverage: u8, 
     let inv = 255u32 - u32::from(alpha);
     let old_a = u32::from(pixel[3]);
     let out_a = u32::from(alpha) + old_a * inv / 255;
+    // The alpha blend mixes with the *new* alpha, `d.a = s.a + d.a - s.a * d.a`,
+    // so a channel is the convex combination
+    // `(s*s.a*255 + d*d.a*(255-s.a)) / (s.a*255 + d.a*(255-s.a))`.
+    // The denominator is that exact new alpha, not the truncated one the
+    // alpha byte carries: truncating it first can push the quotient past
+    // 255 and wrap the channel around instead of holding it at the
+    // source's value.
+    let denominator = u32::from(alpha) * 255 + old_a * inv;
     for (channel, &src_color) in color[..3].iter().enumerate() {
         let src = u32::from(src_color);
         let dst = u32::from(pixel[channel]);
         // Keep the scene buffer straight-alpha. This matters for antialiased
         // edges over transparent pixels: RGB must remain the requested color,
         // not color multiplied by coverage.
-        pixel[channel] = ((src * u32::from(alpha) * 255 + dst * old_a * inv) / (out_a * 255)) as u8;
+        let numerator = src * u32::from(alpha) * 255 + dst * old_a * inv;
+        // The blend renders into an 8-bit target, which rounds to the nearest
+        // value; the quotient is a convex combination, so the clamp only
+        // guards the rounding.
+        pixel[channel] = ((numerator + denominator / 2) / denominator).min(255) as u8;
     }
     pixel[3] = out_a as u8;
 }

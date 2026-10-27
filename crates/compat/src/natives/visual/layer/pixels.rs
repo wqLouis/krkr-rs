@@ -362,36 +362,69 @@ fn blend_is_unimplemented(mode: i64, face: i32) -> bool {
     mode == super::blend::LT_ADD_ALPHA && face == DF_ALPHA
 }
 
-/// Whether a blend the draw face selected holds the destination's alpha.
+/// Whether the blend holds the destination's alpha.
 ///
-/// The face-selected blend methods come in two spellings: the plain one on
-/// an opaque face and the `OnAlpha` / `OnAddAlpha` one on an alpha face.
-/// Only the plain spelling takes the destination's alpha-hold argument; the
-/// other spellings handle the destination's alpha themselves. The layer's
-/// `holdAlpha` property is that argument, so it reaches a blend the face
-/// selected on an opaque face only; the face-independent modes take it
-/// whatever the face is.
-fn face_hold_alpha(mode: i64, face: i32, layer_hold_alpha: bool) -> bool {
-    if FACE_SENSITIVE_MODES.contains(&mode) {
-        face == DF_OPAQUE && layer_hold_alpha
-    } else {
-        layer_hold_alpha
+/// The blend methods hold the destination's alpha themselves — the channel
+/// mix writes the destination alpha back and the copy of an opaque image
+/// makes it opaque. Only the copy methods take the layer's `HoldAlpha` as an
+/// argument.
+fn face_hold_alpha(mode: i64, layer_hold_alpha: bool) -> bool {
+    mode == OM_OPAQUE && layer_hold_alpha
+}
+
+/// The blend an operation mode and the draw face select.
+///
+/// The pair selects a blend method, and the method selects the blend. The
+/// engine carries the operation mode whose kernel applies, so the
+/// face-selected methods that differ from the mode's own kernel are named
+/// here.
+///
+/// The returned flag tells the engine to read the source as an opaque image.
+fn face_blend(mode: i64, face: i32) -> (i64, bool) {
+    match mode {
+        // `omAlpha` on an opaque face mixes the colours without an alpha
+        // correction and holds the destination's alpha. Its kernel is the one
+        // the Photoshop normal mode uses.
+        OM_ALPHA if face == DF_OPAQUE => (super::blend::LT_PS_NORMAL, false),
+        // `omOpaque` on an alpha face copies the source as an opaque image:
+        // the source's colour replaces the destination's and the
+        // destination's alpha becomes opaque.
+        OM_OPAQUE if face == DF_ALPHA || face == DF_ADD_ALPHA => (OM_OPAQUE, true),
+        _ => (mode, false),
     }
+}
+
+/// Whether the operation mode is one the engine accepts.
+///
+/// The `tTVPBlendOperationMode` enum names the modes it accepts: the
+/// Photoshop modes (13 to 28), the plain modes (1 to 5 and 8 to 12) and the
+/// automatic mode (128). Every other number is rejected; the layer-effect
+/// and layer-filter types (6 and 7) are not operation modes.
+fn is_operation_mode(mode: i64) -> bool {
+    matches!(mode, 1..=5 | 8..=28)
 }
 
 /// Resolve an `omAuto` operation mode against the source layer's blend.
 fn resolve_mode(mode: i64, src_type: Option<BlendMode>, method: &str) -> Result<i64, String> {
-    if mode != OM_AUTO {
-        return Ok(mode);
-    }
-    match src_type {
-        Some(blend) => Ok(operation_mode_from_layer_type(blend)),
-        None => {
-            // A Bitmap source has no layer blend; the reference keeps `omAlpha`.
-            let _ = method;
-            Ok(OM_ALPHA)
+    let mode = if mode != OM_AUTO {
+        mode
+    } else {
+        match src_type {
+            Some(blend) => operation_mode_from_layer_type(blend),
+            None => {
+                // A Bitmap source has no layer blend; the reference keeps `omAlpha`.
+                let _ = method;
+                OM_ALPHA
+            }
         }
+    };
+    if !is_operation_mode(mode) {
+        return Err(format!(
+            "Layer.{method}: the operation mode {mode} is not an operation mode the reference \
+             accepts"
+        ));
     }
+    Ok(mode)
 }
 
 /// Build the three destination corners for the `affine`/points argument
@@ -435,6 +468,7 @@ struct AffineRun<'a> {
     mode: i64,
     opa: u8,
     hold_alpha: bool,
+    treat_as_opaque: bool,
     clear: bool,
     neutral: [u8; 4],
     clip: RectI,
@@ -453,6 +487,7 @@ fn affine_run(run: AffineRun<'_>) -> Result<(), String> {
         mode,
         opa,
         hold_alpha,
+        treat_as_opaque,
         clear,
         neutral,
         clip,
@@ -487,6 +522,7 @@ fn affine_run(run: AffineRun<'_>) -> Result<(), String> {
             layer_ops::BlitOptions {
                 mode,
                 opa,
+                treat_as_opaque,
                 ..Default::default()
             },
             clip,
@@ -556,7 +592,8 @@ extern "C" fn layer_operate_rect(
         if blend_is_unimplemented(mode, face) {
             return Ok(());
         }
-        let hold_alpha = face_hold_alpha(mode, face, layer_hold_alpha);
+        let (mode, treat_as_opaque) = face_blend(mode, face);
+        let hold_alpha = face_hold_alpha(mode, layer_hold_alpha);
         with_two_bitmaps(scene, dst, src_id, |d, s| {
             layer_ops::operate_rect(
                 d,
@@ -570,7 +607,7 @@ extern "C" fn layer_operate_rect(
                     mode,
                     opa,
                     hold_alpha,
-                    ..Default::default()
+                    treat_as_opaque,
                 },
             );
         })?;
@@ -646,7 +683,8 @@ extern "C" fn layer_operate_stretch(
         if blend_is_unimplemented(mode, face) {
             return Ok(());
         }
-        let hold_alpha = face_hold_alpha(mode, face, layer_hold_alpha);
+        let (mode, treat_as_opaque) = face_blend(mode, face);
+        let hold_alpha = face_hold_alpha(mode, layer_hold_alpha);
         let src_rect = (sx, sy, sx.saturating_add(sw), sy.saturating_add(sh));
         let src_trimmed = scale_rect(src_rect, dst_rect, dest);
         with_two_bitmaps(scene, dst, src_id, |d, s| {
@@ -662,7 +700,7 @@ extern "C" fn layer_operate_stretch(
                     mode,
                     opa,
                     hold_alpha,
-                    ..Default::default()
+                    treat_as_opaque,
                 },
             );
         })?;
@@ -769,7 +807,8 @@ fn affine_op(
     // layer's `holdAlpha` property holds the destination alpha on top of
     // that. The copy, pile and blend methods are the face-sensitive modes
     // whatever the operation mode they run under.
-    let hold = face_hold_alpha(mode, face, layer_hold_alpha);
+    let (mode, treat_as_opaque) = face_blend(mode, face);
+    let hold = face_hold_alpha(mode, layer_hold_alpha);
     let pixel_center = affine || p0.0.fract() != 0.0 || p0.1.fract() != 0.0;
     affine_run(AffineRun {
         scene,
@@ -781,6 +820,7 @@ fn affine_op(
         mode,
         opa,
         hold_alpha: hold,
+        treat_as_opaque,
         clear,
         neutral: neutral_color,
         clip,
@@ -928,7 +968,8 @@ fn stretch_op(
             } else {
                 OM_ALPHA
             };
-            let hold_alpha = face_hold_alpha(mode, face, layer_hold_alpha);
+            let (mode, treat_as_opaque) = face_blend(mode, face);
+            let hold_alpha = face_hold_alpha(mode, layer_hold_alpha);
             with_two_bitmaps(scene, dst, src_id, |d, s| {
                 layer_ops::stretch_blit_mode(
                     d,
@@ -942,7 +983,7 @@ fn stretch_op(
                         mode,
                         opa,
                         hold_alpha,
-                        ..Default::default()
+                        treat_as_opaque,
                     },
                 );
             })?;

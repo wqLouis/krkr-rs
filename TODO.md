@@ -759,6 +759,17 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
 
 ## 11. L3 blockers
 
+* **`omAddAlpha` on the alpha face is skipped instead of blended.** The
+  compatibility layer treats the pair as unimplemented and leaves the
+  destination untouched (`crates/compat/src/natives/visual/layer/pixels.rs`,
+  `blend_is_unimplemented`), while the reference selects
+  `bmAddAlphaOnAlpha` -> "AdditiveAlphaBlend_a"
+  (`reference/cpp/core/visual/LayerIntf.cpp:4118-4271`,
+  `reference/cpp/core/visual/RenderManager.cpp:2414-2424`). The engine now
+  carries the additive-alpha kernel, so the pair only needs the reference's
+  method selected instead of the no-op.
+
+
 * **L3 behavioural audit.** L1/L2 are small, stateless abstractions that the
   static gates cover well; the compatibility emulation is L3, where a member
   can exist with the right name/arity and still lose the reference semantics.

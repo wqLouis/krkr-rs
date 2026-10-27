@@ -1978,22 +1978,23 @@ pub fn gaussian_blur(bitmap: &mut BitmapState, rect: RectI, radius: i32, sigma: 
     bitmap.mark_dirty();
 }
 
-/// Blend one source pixel onto `dst` using a numeric operation mode. The
-/// Photoshop modes (`omPs*`) apply their per-channel blend function and then
-/// the source alpha; the modes with no dedicated kernel reduce to source-over.
+/// Blend one source pixel onto `dst` with an already resolved kernel.
+///
+/// A pass resolves its kernel once and hands it to every pixel, so the
+/// per-pixel loop never dispatches on the operation mode.
 pub(crate) fn blend_pixel_mode(
     dst: &mut BitmapState,
     x: i32,
     y: i32,
     src: [u8; 4],
     opa: u8,
-    mode: i64,
+    kernel: ModeKernel,
 ) {
     if x < 0 || y < 0 || x as u32 >= dst.width || y as u32 >= dst.height {
         return;
     }
     let mut pixel = read_pixel(dst, x, y);
-    blend_pixel_mode_at(&mut pixel, src, opa, mode);
+    apply_mode_kernel(kernel, &mut pixel, src, opa);
     write_pixel(dst, x, y, pixel);
 }
 
@@ -2003,18 +2004,39 @@ pub(crate) fn blend_pixel_mode(
 /// The kernel is factored out of the bitmap accessor so a pass that owns a
 /// destination row slice (the affine nearest pass) blends with the same
 /// arithmetic.
-fn blend_pixel_mode_at(pixel: &mut [u8; 4], src: [u8; 4], opa: u8, mode: i64) {
-    apply_mode_kernel(mode_kernel(mode), pixel, src, opa);
+fn blend_pixel_mode_at(pixel: &mut [u8; 4], src: [u8; 4], opa: u8, kernel: ModeKernel) {
+    apply_mode_kernel(kernel, pixel, src, opa);
+}
+
+/// The source pixel a pass blends, with the alpha the pass asks for.
+///
+/// A pass that treats the source as an opaque image reads the source's colour
+/// with an opaque alpha.
+fn opaque_source(color: [u8; 4], treat_as_opaque: bool) -> [u8; 4] {
+    if treat_as_opaque {
+        [color[0], color[1], color[2], 255]
+    } else {
+        color
+    }
 }
 
 /// The per-channel operation a numeric blend mode applies.
 ///
-/// The mode numbers are the native layer-type numbers (`omOpaque == 1`,
-/// `ltOpaque == 1`, …). A mode without a kernel of its own is source-over.
+/// The mode numbers are the operation-mode numbers the script reads and
+/// writes. Every mode the engine knows has a kernel of its own.
 #[derive(Clone, Copy)]
-enum ModeKernel {
+pub(crate) enum ModeKernel {
     /// The source replaces the destination, including its alpha.
     Copy,
+    /// The constant-alpha blend: the opacity mixes the source's colour into
+    /// the destination's and the destination's alpha is held.
+    ConstAlpha,
+    /// The straight-alpha source-over; the destination's alpha is
+    /// recomputed from the source's alpha.
+    SourceOver,
+    /// The channel mix without an alpha correction: the source's alpha
+    /// mixes the colours and the destination's alpha is held.
+    ChannelMix,
     /// Saturating add of the source, scaled by the opacity.
     Additive,
     /// Saturating subtract of the source, scaled by the opacity.
@@ -2027,50 +2049,89 @@ enum ModeKernel {
     Lighten,
     /// Screen.
     Screen,
-    /// Hard light, alpha-composited.
-    HardLight,
-    /// Photoshop additive, alpha-composited.
+    /// Colour dodge: the destination scaled by the source's inverse.
+    Dodge,
+    /// Additive with an explicit alpha channel.
+    AddAlpha,
+    /// Photoshop additive.
     PsAdditive,
-    /// Photoshop subtractive, alpha-composited.
+    /// Photoshop subtractive.
     PsSubtractive,
-    /// Photoshop multiplicative, alpha-composited.
+    /// Photoshop multiplicative.
     PsMultiplicative,
-    /// Photoshop screen, alpha-composited.
+    /// Photoshop screen.
     PsScreen,
-    /// Photoshop color dodge, alpha-composited.
+    /// Photoshop overlay.
+    PsOverlay,
+    /// Photoshop hard light.
+    HardLight,
+    /// Photoshop soft light.
+    PsSoftLight,
+    /// Photoshop colour dodge.
     PsColorDodge,
-    /// Photoshop lighten, alpha-composited.
+    /// The legacy Photoshop 5.x colour dodge.
+    PsColorDodge5,
+    /// Photoshop colour burn.
+    PsColorBurn,
+    /// Photoshop lighten.
     PsLighten,
-    /// Photoshop darken, alpha-composited.
+    /// Photoshop darken.
     PsDarken,
-    /// Source-over.
-    SourceOver,
+    /// Photoshop difference.
+    PsDifference,
+    /// The legacy Photoshop 5.x difference.
+    PsDifference5,
+    /// Photoshop exclusion.
+    PsExclusion,
 }
 
 /// The kernel a numeric operation mode applies.
 ///
-/// The modes with a kernel of their own name it; `omPsNormal`, `omAlpha`,
-/// `omAddAlpha` and every mode without a kernel of its own reduce to
-/// source-over.
-fn mode_kernel(mode: i64) -> ModeKernel {
-    match mode {
+/// Every operation mode the engine knows has a kernel of its own; a mode
+/// it does not know has none.
+fn mode_kernel(mode: i64) -> Option<ModeKernel> {
+    Some(match mode {
         1 => ModeKernel::Copy,
+        2 => ModeKernel::SourceOver,
         3 => ModeKernel::Additive,
         4 => ModeKernel::Subtractive,
         5 => ModeKernel::Multiplicative,
+        8 => ModeKernel::Dodge,
         9 => ModeKernel::Darken,
         10 => ModeKernel::Lighten,
         11 => ModeKernel::Screen,
-        19 => ModeKernel::HardLight,
+        12 => ModeKernel::AddAlpha,
+        13 => ModeKernel::ChannelMix,
         14 => ModeKernel::PsAdditive,
         15 => ModeKernel::PsSubtractive,
         16 => ModeKernel::PsMultiplicative,
         17 => ModeKernel::PsScreen,
+        18 => ModeKernel::PsOverlay,
+        19 => ModeKernel::HardLight,
+        20 => ModeKernel::PsSoftLight,
         21 => ModeKernel::PsColorDodge,
+        22 => ModeKernel::PsColorDodge5,
+        23 => ModeKernel::PsColorBurn,
         24 => ModeKernel::PsLighten,
         25 => ModeKernel::PsDarken,
-        _ => ModeKernel::SourceOver,
+        26 => ModeKernel::PsDifference,
+        27 => ModeKernel::PsDifference5,
+        28 => ModeKernel::PsExclusion,
+        _ => return None,
+    })
+}
+
+/// The kernel a pass applies.
+///
+/// The copy family has a second spelling below the full opacity: the source's
+/// colour is blended into the destination with the opacity as a constant
+/// alpha.
+fn resolve_kernel(mode: i64, opa: u8) -> Option<ModeKernel> {
+    let kernel = mode_kernel(mode)?;
+    if opa != 255 && matches!(kernel, ModeKernel::Copy) {
+        return Some(ModeKernel::ConstAlpha);
     }
+    Some(kernel)
 }
 
 /// The blend one destination pixel of a pass receives.
@@ -2079,15 +2140,15 @@ fn mode_kernel(mode: i64) -> ModeKernel {
 /// with the resolved kernel, so the per-pixel loop does not dispatch on the
 /// mode.
 trait BandBlend {
-    /// Blends `src` into `pixel` with the operation `mode`.
-    fn blend(mode: i64, pixel: &mut [u8; 4], src: [u8; 4], opa: u8);
+    /// Blends `src` into `pixel` with the operation's kernel.
+    fn blend(kernel: ModeKernel, pixel: &mut [u8; 4], src: [u8; 4], opa: u8);
 }
 
 /// The source replaces the destination.
 struct ReplaceBlend;
 
 impl BandBlend for ReplaceBlend {
-    fn blend(_mode: i64, pixel: &mut [u8; 4], src: [u8; 4], _opa: u8) {
+    fn blend(_kernel: ModeKernel, pixel: &mut [u8; 4], src: [u8; 4], _opa: u8) {
         *pixel = src;
     }
 }
@@ -2096,7 +2157,7 @@ impl BandBlend for ReplaceBlend {
 struct SourceOverBlend;
 
 impl BandBlend for SourceOverBlend {
-    fn blend(_mode: i64, pixel: &mut [u8; 4], src: [u8; 4], opa: u8) {
+    fn blend(_kernel: ModeKernel, pixel: &mut [u8; 4], src: [u8; 4], opa: u8) {
         // An opaque source at full opacity replaces the destination, which
         // is the pixel the general blend computes for it.
         if opa == 255 && src[3] == 255 {
@@ -2111,8 +2172,8 @@ impl BandBlend for SourceOverBlend {
 struct ModeBlend;
 
 impl BandBlend for ModeBlend {
-    fn blend(mode: i64, pixel: &mut [u8; 4], src: [u8; 4], opa: u8) {
-        blend_pixel_mode_at(pixel, src, opa, mode);
+    fn blend(kernel: ModeKernel, pixel: &mut [u8; 4], src: [u8; 4], opa: u8) {
+        blend_pixel_mode_at(pixel, src, opa, kernel);
     }
 }
 
@@ -2128,8 +2189,8 @@ enum AffineBlend {
 }
 
 /// The blend an operation mode applies, resolved once per pass.
-fn affine_blend(mode: i64) -> AffineBlend {
-    match mode_kernel(mode) {
+fn affine_blend(kernel: ModeKernel) -> AffineBlend {
+    match kernel {
         ModeKernel::Copy => AffineBlend::Replace,
         ModeKernel::SourceOver => AffineBlend::SourceOver,
         ModeKernel::Additive
@@ -2138,22 +2199,167 @@ fn affine_blend(mode: i64) -> AffineBlend {
         | ModeKernel::Darken
         | ModeKernel::Lighten
         | ModeKernel::Screen
-        | ModeKernel::HardLight
+        | ModeKernel::Dodge
+        | ModeKernel::AddAlpha
+        | ModeKernel::ChannelMix
+        | ModeKernel::ConstAlpha
         | ModeKernel::PsAdditive
         | ModeKernel::PsSubtractive
         | ModeKernel::PsMultiplicative
         | ModeKernel::PsScreen
+        | ModeKernel::PsOverlay
+        | ModeKernel::HardLight
+        | ModeKernel::PsSoftLight
         | ModeKernel::PsColorDodge
+        | ModeKernel::PsColorDodge5
+        | ModeKernel::PsColorBurn
         | ModeKernel::PsLighten
-        | ModeKernel::PsDarken => AffineBlend::Mode,
+        | ModeKernel::PsDarken
+        | ModeKernel::PsDifference
+        | ModeKernel::PsDifference5
+        | ModeKernel::PsExclusion => AffineBlend::Mode,
     }
+}
+
+/// The factor the Photoshop blends mix their per-channel function with.
+///
+/// The blend functions take the source's alpha as the factor, and the opacity
+/// scales it when the opacity is not the full one.
+fn ps_mix_factor(src_alpha: u8, opa: u8) -> u8 {
+    if opa == 255 {
+        src_alpha
+    } else {
+        ((u32::from(src_alpha) * u32::from(opa)) >> 8) as u8
+    }
+}
+
+/// Mixes a per-channel blend function into the destination's channels and
+/// holds the destination's alpha.
+///
+/// The Photoshop blends write the destination back with its alpha untouched
+/// and mix the per-channel function with `d + ((f - d) * a >> 8)`.
+fn mix_channels(pixel: &mut [u8; 4], function: [u8; 3], factor: u8) {
+    for (channel, value) in pixel[..3].iter_mut().zip(function) {
+        *channel = blend_channel(*channel, value, factor);
+    }
+}
+
+/// The Photoshop product of two channels: `d * s >> 8`.
+fn ps_mul_channel(d: u8, s: u8) -> u8 {
+    ((u32::from(d) * u32::from(s)) >> 8) as u8
+}
+
+/// The Photoshop screen of two channels: `d + s - (d * s >> 8)`.
+fn ps_screen_channel(d: u8, s: u8) -> u8 {
+    let value = i32::from(d) + i32::from(s) - i32::from(ps_mul_channel(d, s));
+    value.clamp(0, 255) as u8
+}
+
+/// The Photoshop exclusion of two channels: `d + s - (d * s >> 7)`.
+fn ps_exclusion_channel(d: u8, s: u8) -> u8 {
+    let product = (i32::from(d) * i32::from(s)) >> 7;
+    let value = i32::from(d) + i32::from(s) - product;
+    value.clamp(0, 255) as u8
+}
+
+/// The Photoshop overlay of a source channel over a destination channel.
+///
+/// The overlay table is `(s * d * 2) / 255` below the midpoint and
+/// `(s + d) * 2 - (s * d * 2) / 255 - 255` above it.
+fn ps_overlay_channel(s: u8, d: u8) -> u8 {
+    let product = i32::from(s) * i32::from(d) * 2;
+    let value = if d < 128 {
+        product / 255
+    } else {
+        (i32::from(s) + i32::from(d)) * 2 - product / 255 - 255
+    };
+    value.clamp(0, 255) as u8
+}
+
+/// The Photoshop hard light of a source channel over a destination channel.
+///
+/// The hard light is the overlay with the operands swapped, so the source
+/// channel decides the branch.
+fn ps_hard_light_channel(s: u8, d: u8) -> u8 {
+    ps_overlay_channel(d, s)
+}
+
+/// The Photoshop soft light of a source channel over a destination channel.
+///
+/// The soft-light table is `pow(d / 255, 128 / s)` above the midpoint and
+/// `pow(d / 255, (1 - s / 255) / 0.5)` below it.
+fn ps_soft_light_channel(s: u8, d: u8) -> u8 {
+    let base = f64::from(d) / 255.0;
+    let value = if s >= 128 {
+        base.powf(128.0 / f64::from(s))
+    } else {
+        base.powf((1.0 - f64::from(s) / 255.0) / 0.5)
+    };
+    (value * 255.0) as u8
+}
+
+/// The Photoshop colour dodge of a source channel over a destination channel.
+///
+/// The colour-dodge table is `0xff` when the source is light enough to blow
+/// the channel out and `(d * 255) / (255 - s)` otherwise.
+fn ps_color_dodge_channel(s: u8, d: u8) -> u8 {
+    if 255 - i32::from(s) <= i32::from(d) {
+        255
+    } else {
+        ((i32::from(d) * 255) / (255 - i32::from(s))).clamp(0, 255) as u8
+    }
+}
+
+/// The Photoshop colour burn of a source channel over a destination channel.
+///
+/// The colour-burn table is `0x00` when the source is dark enough and
+/// `255 - ((255 - d) * 255) / s` otherwise.
+fn ps_color_burn_channel(s: u8, d: u8) -> u8 {
+    if i32::from(s) <= 255 - i32::from(d) {
+        0
+    } else {
+        (255 - ((255 - i32::from(d)) * 255) / i32::from(s)).clamp(0, 255) as u8
+    }
+}
+
+/// The colour dodge of the non-Photoshop mode: the destination scaled by the
+/// reciprocal of the source's complement.
+///
+/// The destination is multiplied by a 16.16 reciprocal of `255 - s` and the
+/// result is clamped to a byte.
+fn dodge_channel(d: u8, s: u8) -> u8 {
+    let reciprocal = if s == 255 {
+        65536
+    } else {
+        65536 / (255 - i32::from(s))
+    };
+    let value = (i32::from(d) * reciprocal) >> 8;
+    value.clamp(0, 255) as u8
 }
 
 /// Blends `src` into one destination pixel with the kernel of `mode`.
 fn apply_mode_kernel(kernel: ModeKernel, pixel: &mut [u8; 4], src: [u8; 4], opa: u8) {
     match kernel {
-        // omOpaque / ltOpaque: copy the source (including alpha).
+        // omOpaque / ltOpaque on an opaque face: the source replaces the
+        // destination, alpha included.
         ModeKernel::Copy => *pixel = src,
+        // The copy family below the full opacity: the opacity mixes the
+        // source's colour into the destination's and the destination's alpha
+        // is held.
+        ModeKernel::ConstAlpha => {
+            for c in 0..3 {
+                pixel[c] = blend_channel(pixel[c], src[c], opa);
+            }
+        }
+        // The alpha-correct source-over: the destination's alpha takes part
+        // in the mix.
+        ModeKernel::SourceOver => blend_pixel_at(pixel, src, 255, opa),
+        // The channel mix: the source's alpha mixes the colours and the
+        // destination's alpha is held. The mix is `d + ((f - d) * a >> 8)`.
+        ModeKernel::ChannelMix => {
+            let factor = ps_mix_factor(src[3], opa);
+            mix_channels(pixel, [src[0], src[1], src[2]], factor);
+        }
         // omAdditive / ltAdditive: saturating add, source scaled by `opa`.
         ModeKernel::Additive => {
             for c in 0..3 {
@@ -2196,96 +2402,173 @@ fn apply_mode_kernel(kernel: ModeKernel, pixel: &mut [u8; 4], src: [u8; 4], opa:
                     ((u32::from(pixel[c]) * (255 - u32::from(opa)) + blended * 255) / 255) as u8;
             }
         }
-        // ltPsHardLight (19): standard hard-light, alpha-composited.
-        ModeKernel::HardLight => {
-            let mut blended = [0u8; 4];
+        // omDodge / ltDodge: the destination scaled by the source's inverse.
+        ModeKernel::Dodge => {
             for c in 0..3 {
-                let sv = i32::from(src[c]);
-                let dv = i32::from(pixel[c]);
-                blended[c] = if sv < 128 {
-                    (2 * sv * dv / 255).clamp(0, 255) as u8
-                } else {
-                    (255 - 2 * (255 - sv) * (255 - dv) / 255).clamp(0, 255) as u8
-                };
+                let faded = ((u32::from(src[c]) * u32::from(opa)) >> 8) as u8;
+                pixel[c] = dodge_channel(pixel[c], faded);
             }
-            blended[3] = src[3];
-            blend_pixel_at(pixel, blended, 255, opa);
         }
-        // The Photoshop modes apply their per-channel blend function and then
-        // the source alpha.
-        // omPsAdditive / ltPsAdditive.
+        // omAddAlpha / ltAddAlpha: the source fades by the opacity and the
+        // destination by the source's remaining alpha.
+        ModeKernel::AddAlpha => {
+            let remaining = 255 - ((u32::from(src[3]) * u32::from(opa)) >> 8) as u8;
+            for c in 0..3 {
+                let base = ((u32::from(pixel[c]) * u32::from(remaining)) >> 8) as u8;
+                let faded = ((u32::from(src[c]) * u32::from(opa)) >> 8) as u8;
+                pixel[c] = base.saturating_add(faded);
+            }
+        }
+        // The Photoshop modes apply their per-channel blend function and mix it
+        // with the source's alpha; the destination's alpha is held.
+        // omPsAdditive / ltPsAdditive: the saturating sum.
         ModeKernel::PsAdditive => {
-            let mut blended = [0u8; 4];
-            for c in 0..3 {
-                blended[c] = pixel[c].saturating_add(src[c]);
-            }
-            blended[3] = src[3];
-            blend_pixel_at(pixel, blended, 255, opa);
+            let factor = ps_mix_factor(src[3], opa);
+            let function = [
+                pixel[0].saturating_add(src[0]),
+                pixel[1].saturating_add(src[1]),
+                pixel[2].saturating_add(src[2]),
+            ];
+            mix_channels(pixel, function, factor);
         }
-        // omPsSubtractive / ltPsSubtractive.
+        // omPsSubtractive / ltPsSubtractive: the saturating difference.
         ModeKernel::PsSubtractive => {
-            let mut blended = [0u8; 4];
-            for c in 0..3 {
-                blended[c] = pixel[c].saturating_sub(src[c]);
-            }
-            blended[3] = src[3];
-            blend_pixel_at(pixel, blended, 255, opa);
+            let factor = ps_mix_factor(src[3], opa);
+            let function = [
+                pixel[0].saturating_sub(src[0]),
+                pixel[1].saturating_sub(src[1]),
+                pixel[2].saturating_sub(src[2]),
+            ];
+            mix_channels(pixel, function, factor);
         }
-        // omPsMultiplicative / ltPsMultiplicative.
+        // omPsMultiplicative / ltPsMultiplicative: the product.
         ModeKernel::PsMultiplicative => {
-            let mut blended = [0u8; 4];
-            for c in 0..3 {
-                blended[c] = (u32::from(pixel[c]) * u32::from(src[c]) / 255) as u8;
-            }
-            blended[3] = src[3];
-            blend_pixel_at(pixel, blended, 255, opa);
+            let factor = ps_mix_factor(src[3], opa);
+            let function = [
+                ps_mul_channel(pixel[0], src[0]),
+                ps_mul_channel(pixel[1], src[1]),
+                ps_mul_channel(pixel[2], src[2]),
+            ];
+            mix_channels(pixel, function, factor);
         }
-        // omPsScreen / ltPsScreen.
+        // omPsScreen / ltPsScreen: the screen.
         ModeKernel::PsScreen => {
-            let mut blended = [0u8; 4];
-            for c in 0..3 {
-                blended[c] =
-                    (255 - (255 - u32::from(pixel[c])) * (255 - u32::from(src[c])) / 255) as u8;
-            }
-            blended[3] = src[3];
-            blend_pixel_at(pixel, blended, 255, opa);
+            let factor = ps_mix_factor(src[3], opa);
+            let function = [
+                ps_screen_channel(pixel[0], src[0]),
+                ps_screen_channel(pixel[1], src[1]),
+                ps_screen_channel(pixel[2], src[2]),
+            ];
+            mix_channels(pixel, function, factor);
         }
-        // omPsColorDodge / ltPsColorDodge.
+        // omPsOverlay / ltPsOverlay: the overlay.
+        ModeKernel::PsOverlay => {
+            let factor = ps_mix_factor(src[3], opa);
+            let function = [
+                ps_overlay_channel(src[0], pixel[0]),
+                ps_overlay_channel(src[1], pixel[1]),
+                ps_overlay_channel(src[2], pixel[2]),
+            ];
+            mix_channels(pixel, function, factor);
+        }
+        // ltPsHardLight (19): the hard light.
+        ModeKernel::HardLight => {
+            let factor = ps_mix_factor(src[3], opa);
+            let function = [
+                ps_hard_light_channel(src[0], pixel[0]),
+                ps_hard_light_channel(src[1], pixel[1]),
+                ps_hard_light_channel(src[2], pixel[2]),
+            ];
+            mix_channels(pixel, function, factor);
+        }
+        // ltPsSoftLight (20): the soft light.
+        ModeKernel::PsSoftLight => {
+            let factor = ps_mix_factor(src[3], opa);
+            let function = [
+                ps_soft_light_channel(src[0], pixel[0]),
+                ps_soft_light_channel(src[1], pixel[1]),
+                ps_soft_light_channel(src[2], pixel[2]),
+            ];
+            mix_channels(pixel, function, factor);
+        }
+        // ltPsColorDodge (21): the colour dodge.
         ModeKernel::PsColorDodge => {
-            let mut blended = [0u8; 4];
-            for c in 0..3 {
-                let dv = i32::from(pixel[c]);
-                let sv = i32::from(src[c]);
-                blended[c] = if sv >= 255 {
-                    255
-                } else {
-                    ((dv * 255) / (255 - sv)).min(255) as u8
-                };
-            }
-            blended[3] = src[3];
-            blend_pixel_at(pixel, blended, 255, opa);
+            let factor = ps_mix_factor(src[3], opa);
+            let function = [
+                ps_color_dodge_channel(src[0], pixel[0]),
+                ps_color_dodge_channel(src[1], pixel[1]),
+                ps_color_dodge_channel(src[2], pixel[2]),
+            ];
+            mix_channels(pixel, function, factor);
         }
-        // omPsLighten / ltPsLighten.
+        // ltPsColorDodge5 (22): the source fades first and the colour-dodge
+        // function replaces the channel; the mix does not apply.
+        ModeKernel::PsColorDodge5 => {
+            let factor = ps_mix_factor(src[3], opa);
+            for c in 0..3 {
+                let faded = ((u32::from(src[c]) * u32::from(factor)) >> 8) as u8;
+                pixel[c] = ps_color_dodge_channel(faded, pixel[c]);
+            }
+        }
+        // ltPsColorBurn (23): the colour burn.
+        ModeKernel::PsColorBurn => {
+            let factor = ps_mix_factor(src[3], opa);
+            let function = [
+                ps_color_burn_channel(src[0], pixel[0]),
+                ps_color_burn_channel(src[1], pixel[1]),
+                ps_color_burn_channel(src[2], pixel[2]),
+            ];
+            mix_channels(pixel, function, factor);
+        }
+        // ltPsLighten (24): the lighter channel.
         ModeKernel::PsLighten => {
-            let mut blended = [0u8; 4];
-            for c in 0..3 {
-                blended[c] = pixel[c].max(src[c]);
-            }
-            blended[3] = src[3];
-            blend_pixel_at(pixel, blended, 255, opa);
+            let factor = ps_mix_factor(src[3], opa);
+            let function = [
+                pixel[0].max(src[0]),
+                pixel[1].max(src[1]),
+                pixel[2].max(src[2]),
+            ];
+            mix_channels(pixel, function, factor);
         }
-        // omPsDarken / ltPsDarken.
+        // ltPsDarken (25): the darker channel.
         ModeKernel::PsDarken => {
-            let mut blended = [0u8; 4];
-            for c in 0..3 {
-                blended[c] = pixel[c].min(src[c]);
-            }
-            blended[3] = src[3];
-            blend_pixel_at(pixel, blended, 255, opa);
+            let factor = ps_mix_factor(src[3], opa);
+            let function = [
+                pixel[0].min(src[0]),
+                pixel[1].min(src[1]),
+                pixel[2].min(src[2]),
+            ];
+            mix_channels(pixel, function, factor);
         }
-        // omPsNormal / ltPsNormal, omAlpha, omAddAlpha and every mode
-        // without a kernel of its own: source-over.
-        ModeKernel::SourceOver => blend_pixel_at(pixel, src, 255, opa),
+        // ltPsDifference (26): the absolute difference.
+        ModeKernel::PsDifference => {
+            let factor = ps_mix_factor(src[3], opa);
+            let function = [
+                src[0].abs_diff(pixel[0]),
+                src[1].abs_diff(pixel[1]),
+                src[2].abs_diff(pixel[2]),
+            ];
+            mix_channels(pixel, function, factor);
+        }
+        // ltPsDifference5 (27): the source fades first and the difference
+        // replaces the channel; the mix does not apply.
+        ModeKernel::PsDifference5 => {
+            let factor = ps_mix_factor(src[3], opa);
+            for c in 0..3 {
+                let faded = ((u32::from(src[c]) * u32::from(factor)) >> 8) as u8;
+                pixel[c] = faded.abs_diff(pixel[c]);
+            }
+        }
+        // ltPsExclusion (28): the exclusion.
+        ModeKernel::PsExclusion => {
+            let factor = ps_mix_factor(src[3], opa);
+            let function = [
+                ps_exclusion_channel(pixel[0], src[0]),
+                ps_exclusion_channel(pixel[1], src[1]),
+                ps_exclusion_channel(pixel[2], src[2]),
+            ];
+            mix_channels(pixel, function, factor);
+        }
     }
 }
 
@@ -2389,6 +2672,7 @@ pub fn operate_rect(
         mode,
         opa,
         hold_alpha,
+        treat_as_opaque,
         ..
     } = options;
     let sw = src_rect.2.saturating_sub(src_rect.0);
@@ -2399,6 +2683,12 @@ pub fn operate_rect(
     if !pixels_usable(dst, "operateRect") || !pixels_usable(src, "operateRect") {
         return;
     }
+    // The kernel is resolved once for the whole pass, so the per-pixel loop
+    // never dispatches on the operation mode.
+    let Some(kernel) = resolve_kernel(mode, opa) else {
+        log::error!("engine: operateRect met the unknown operation mode {mode}");
+        return;
+    };
     let Some(dc) = intersect(dst, (dx, dy, dx.saturating_add(sw), dy.saturating_add(sh))) else {
         return;
     };
@@ -2409,7 +2699,7 @@ pub fn operate_rect(
     #[cfg(feature = "simd-experiment")]
     if opa == 255
         && !hold_alpha
-        && matches!(mode_kernel(mode), ModeKernel::SourceOver)
+        && matches!(kernel, ModeKernel::SourceOver)
         && let Some(simd_rows) = source_over_row_slices(dst, src, dc, dx, dy, src_rect)
     {
         let mut handled = true;
@@ -2450,8 +2740,9 @@ pub fn operate_rect(
     for y in dc.1..dc.3 {
         for x in dc.0..dc.2 {
             let color = read_pixel(src, src_rect.0 + (x - dx), src_rect.1 + (y - dy));
+            let color = opaque_source(color, treat_as_opaque);
             let old_alpha = read_pixel(dst, x, y)[3];
-            blend_pixel_mode(dst, x, y, color, opa, mode);
+            blend_pixel_mode(dst, x, y, color, opa, kernel);
             if hold_alpha {
                 let mut d = read_pixel(dst, x, y);
                 d[3] = old_alpha;
@@ -2481,6 +2772,7 @@ pub fn stretch_blit_mode(
         mode,
         opa,
         hold_alpha,
+        treat_as_opaque,
         ..
     } = options;
     let dw = dest.2 - dest.0;
@@ -2494,13 +2786,19 @@ pub fn stretch_blit_mode(
     let Some(dc) = intersect(dst, dest) else {
         return;
     };
+    // The kernel is resolved once for the whole pass, so the per-pixel loop
+    // never dispatches on the operation mode.
+    let Some(kernel) = resolve_kernel(mode, opa) else {
+        log::error!("engine: operateStretch met the unknown operation mode {mode}");
+        return;
+    };
     // The measured stage/UI stretches are one-to-one rectangles: the source
     // and destination have the same extent and only their origins differ.
     // At integer source centres every supported resampler returns the source
     // texel, so the pass is a copy (Copy mode) or a source-over blit. This
     // avoids the per-pixel float resampler without changing any pixel.
     if let Some((dx, dy)) = stretch_exact_translation(dest, src_rect, stretch_type) {
-        match mode_kernel(mode) {
+        match kernel {
             ModeKernel::Copy if !hold_alpha => {
                 blit_copy_clipped(
                     dst,
@@ -2553,6 +2851,12 @@ pub fn stretch_blit_mode(
         return;
     };
     let area = StretchArea { dest, clip: dc };
+    let blend = StretchBlend {
+        opa,
+        hold_alpha,
+        treat_as_opaque,
+        kernel,
+    };
     if threads <= 1 {
         stretch_blit_mode_band(
             band,
@@ -2564,7 +2868,7 @@ pub fn stretch_blit_mode(
                 rect: src_rect,
             },
             stretch_type,
-            options,
+            blend,
         );
     } else {
         let rows_per_band = rows.div_ceil(threads);
@@ -2585,7 +2889,7 @@ pub fn stretch_blit_mode(
                             rect: src_rect,
                         },
                         stretch_type,
-                        options,
+                        blend,
                     );
                 });
             }
@@ -2624,6 +2928,19 @@ struct StretchArea {
     clip: RectI,
 }
 
+/// The blend a stretch band applies.
+#[derive(Clone, Copy)]
+struct StretchBlend {
+    /// The source opacity.
+    opa: u8,
+    /// Whether the destination alpha is held.
+    hold_alpha: bool,
+    /// Whether the source is read as an opaque image.
+    treat_as_opaque: bool,
+    /// The resolved kernel.
+    kernel: ModeKernel,
+}
+
 /// One contiguous band of destination rows for [`stretch_blit_mode`].
 fn stretch_blit_mode_band(
     band: &mut [u8],
@@ -2632,18 +2949,18 @@ fn stretch_blit_mode_band(
     area: StretchArea,
     source: BlitSource<'_>,
     stretch_type: i64,
-    options: BlitOptions,
+    blend: StretchBlend,
 ) {
     let BlitSource {
         bitmap: src,
         rect: src_rect,
     } = source;
-    let BlitOptions {
-        mode,
+    let StretchBlend {
         opa,
         hold_alpha,
-        ..
-    } = options;
+        treat_as_opaque,
+        kernel,
+    } = blend;
     let Ok(dst_width) = usize::try_from(dst_width) else {
         return;
     };
@@ -2658,6 +2975,7 @@ fn stretch_blit_mode_band(
         let y = first_row.saturating_add(row_index);
         for x in x0..x1 {
             let color = stretch_sample(src, src_rect, area.dest, x, y, stretch_type);
+            let color = opaque_source(color, treat_as_opaque);
             let Ok(x) = usize::try_from(x) else {
                 continue;
             };
@@ -2674,7 +2992,7 @@ fn stretch_blit_mode_band(
                 destination[2],
                 destination[3],
             ];
-            blend_pixel_mode_at(&mut pixel, color, opa, mode);
+            blend_pixel_mode_at(&mut pixel, color, opa, kernel);
             if hold_alpha {
                 pixel[3] = old_alpha;
             }
@@ -2759,7 +3077,18 @@ fn affine_blit_clipped_impl(
         bitmap: src,
         rect: src_rect,
     } = source;
-    let BlitOptions { mode, opa, .. } = options;
+    let BlitOptions {
+        mode,
+        opa,
+        treat_as_opaque,
+        ..
+    } = options;
+    // The kernel is resolved once for the whole pass, so the per-pixel loop
+    // never dispatches on the operation mode.
+    let Some(kernel) = resolve_kernel(mode, opa) else {
+        log::error!("engine: the affine pass met the unknown operation mode {mode}");
+        return;
+    };
     let m = affine_forward(p0, p1, p2);
     let det = m[1] * m[5] - m[2] * m[4];
     if det.abs() < 1e-12 {
@@ -2792,7 +3121,7 @@ fn affine_blit_clipped_impl(
     // map and float kernel. A pixel-centre origin at half a pixel denotes the
     // boundary, so the caller's convention decides whether the half offset is
     // applied; a fractional boundary still stays on the resampler.
-    if matches!(affine_blend(mode), AffineBlend::Replace)
+    if matches!(affine_blend(kernel), AffineBlend::Replace)
         && let Some((dx, dy)) = affine_unit_copy(m, src_rect, src, stretch_type, pixel_center)
     {
         blit_copy_clipped(dst, dx, dy, src, src_rect, clip);
@@ -2811,13 +3140,14 @@ fn affine_blit_clipped_impl(
         source_rect: src_rect,
         dest_rect: dc,
         stretch_type: stretch_type & 0xffff,
-        mode,
+        kernel,
         opa,
+        treat_as_opaque,
     };
     // A bilinear copy of an axis-aligned quad resolves its taps once per
     // column and row instead of once per pixel. The pass writes the generic
     // pass's pixels, so a blend other than copy keeps the generic path.
-    let separable = if matches!(affine_blend(mode), AffineBlend::Replace) {
+    let separable = if !treat_as_opaque && matches!(affine_blend(kernel), AffineBlend::Replace) {
         AffineAxisAlignedBilinear::new(&pass)
     } else {
         None
@@ -2886,7 +3216,7 @@ fn affine_dest_bbox(m: [f64; 6]) -> RectI {
 /// The generic affine pass: every destination pixel is inverse-mapped through
 /// the 2x2 matrix and the source is sampled with the requested resampler.
 fn affine_blit_generic(dst: &mut BitmapState, pass: AffinePass<'_>) {
-    match affine_blend(pass.mode) {
+    match affine_blend(pass.kernel) {
         AffineBlend::Replace => affine_blit_generic_with::<ReplaceBlend>(dst, pass),
         AffineBlend::SourceOver => affine_blit_generic_with::<SourceOverBlend>(dst, pass),
         AffineBlend::Mode => affine_blit_generic_with::<ModeBlend>(dst, pass),
@@ -2902,8 +3232,9 @@ fn affine_blit_generic_with<B: BandBlend>(dst: &mut BitmapState, pass: AffinePas
         source_rect: src_rect,
         dest_rect: dc,
         stretch_type,
-        mode,
+        kernel,
         opa,
+        treat_as_opaque,
     } = pass;
     let sw = (src_rect.2 - src_rect.0) as f64;
     let sh = (src_rect.3 - src_rect.1) as f64;
@@ -2928,6 +3259,7 @@ fn affine_blit_generic_with<B: BandBlend>(dst: &mut BitmapState, pass: AffinePas
             // same resampler set as `stretch*`.
             let rect = (0, 0, dim_i32(src.width), dim_i32(src.height));
             let color = sample_kind(src, rect, fx, fy, stretch_type);
+            let color = opaque_source(color, treat_as_opaque);
             let offset = x as usize * 4;
             let mut destination = [
                 row[offset],
@@ -2935,7 +3267,7 @@ fn affine_blit_generic_with<B: BandBlend>(dst: &mut BitmapState, pass: AffinePas
                 row[offset + 2],
                 row[offset + 3],
             ];
-            B::blend(mode, &mut destination, color, opa);
+            B::blend(kernel, &mut destination, color, opa);
             row[offset..offset + 4].copy_from_slice(&destination);
         }
     }
@@ -3103,10 +3435,12 @@ struct AffinePass<'a> {
     dest_rect: RectI,
     /// The resampler.
     stretch_type: i64,
-    /// The blend mode.
-    mode: i64,
+    /// The resolved blend kernel.
+    kernel: ModeKernel,
     /// The source opacity.
     opa: u8,
+    /// Whether the source is read as an opaque image.
+    treat_as_opaque: bool,
 }
 
 /// One destination column or row of a separable bilinear affine pass.
@@ -3419,7 +3753,7 @@ fn axis_tap(
 ///
 /// `band` holds the destination rows from `first_row`, in order.
 fn affine_nearest_band(band: &mut [u8], first_row: i32, dst_width: i32, pass: AffinePass<'_>) {
-    match affine_blend(pass.mode) {
+    match affine_blend(pass.kernel) {
         AffineBlend::Replace => {
             affine_nearest_band_with::<ReplaceBlend>(band, first_row, dst_width, pass);
         }
@@ -3446,8 +3780,9 @@ fn affine_nearest_band_with<B: BandBlend>(
         source: src,
         source_rect: src_rect,
         dest_rect: dc,
-        mode,
+        kernel,
         opa,
+        treat_as_opaque,
         ..
     } = pass;
     let sw = (src_rect.2 - src_rect.0) as f64;
@@ -3499,6 +3834,7 @@ fn affine_nearest_band_with<B: BandBlend>(
                 source_row[source_offset + 2],
                 source_row[source_offset + 3],
             ];
+            let color = opaque_source(color, treat_as_opaque);
             let offset = column * 4;
             let mut destination = [
                 row[offset],
@@ -3506,7 +3842,7 @@ fn affine_nearest_band_with<B: BandBlend>(
                 row[offset + 2],
                 row[offset + 3],
             ];
-            B::blend(mode, &mut destination, color, opa);
+            B::blend(kernel, &mut destination, color, opa);
             row[offset..offset + 4].copy_from_slice(&destination);
         }
     }
@@ -4164,7 +4500,7 @@ fn composite_subtree_draw(target: &mut BitmapState, draw: &SubtreeDraw, src: &Bi
             1 if draw.opa == 255 => {
                 blit_copy_clipped(target, draw.dx, draw.dy, src, draw.src, FULL);
             }
-            1 | 2 | 13 => blit_over(
+            1 | 2 => blit_over(
                 target,
                 draw.dx,
                 draw.dy,
@@ -4429,6 +4765,9 @@ mod tests {
         let Some(dest_rect) = intersect(dst, affine_dest_bbox(m)) else {
             return;
         };
+        let Some(kernel) = resolve_kernel(mode, opa) else {
+            return;
+        };
         affine_blit_generic(
             dst,
             AffinePass {
@@ -4438,8 +4777,9 @@ mod tests {
                 source_rect: src_rect,
                 dest_rect,
                 stretch_type,
-                mode,
+                kernel,
                 opa,
+                treat_as_opaque: false,
             },
         );
     }
@@ -4584,8 +4924,9 @@ mod tests {
                 source_rect: src_rect,
                 dest_rect,
                 stretch_type: 1,
-                mode: 1,
+                kernel: ModeKernel::Copy,
                 opa: 255,
+                treat_as_opaque: false,
             };
             let separable = AffineAxisAlignedBilinear::new(&pass)
                 .expect("an axis-aligned bilinear map takes the separable pass");
@@ -4646,8 +4987,9 @@ mod tests {
             source_rect: src_rect,
             dest_rect,
             stretch_type: 1,
-            mode: 1,
+            kernel: ModeKernel::Copy,
             opa: 255,
+            treat_as_opaque: false,
         };
         let plan = AffineAxisAlignedBilinear::new(&pass).expect("a separable pass");
         plan.run(&mut whole, &pass);

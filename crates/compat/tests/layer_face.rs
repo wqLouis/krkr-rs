@@ -159,12 +159,17 @@ fn the_operate_path_rejects_a_face_the_reference_rejects() {
 
 /// Reference: the operation mode and the draw face select the blend method
 /// together (`reference/cpp/core/visual/LayerIntf.cpp:4118-4271`). The
-/// `omOpaque` mode copies onto an opaque face and copies the source as an
-/// opaque image onto an alpha face
-/// (`reference/cpp/core/visual/LayerBitmapIntf.cpp:1589-1622`). The layer's
-/// `holdAlpha` property is the argument the plain method takes
-/// (`reference/cpp/core/visual/LayerIntf.cpp:5249-5251`): the opaque face
-/// keeps the destination's alpha, the alpha face writes it.
+/// `omOpaque` mode copies onto an opaque face (`bmCopy`) and copies the
+/// source as an opaque image onto an alpha face (`bmCopyOnAlpha`,
+/// `reference/cpp/core/visual/LayerIntf.cpp:4247-4258`).
+///
+/// The layer's `holdAlpha` property is the argument the copy methods take
+/// (`reference/cpp/core/visual/LayerIntf.cpp:5249-5251`), and the method
+/// cache answers it with the `hda` spelling of each copy method
+/// (`reference/cpp/core/visual/RenderManager.cpp:2398-2399`): both copies
+/// hold the destination's alpha under `holdAlpha`, and the alpha face's
+/// copy writes an opaque alpha without it
+/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3141-3147`).
 #[test]
 fn the_operate_path_holds_the_destination_alpha_on_an_opaque_face() {
     let _lock = vm_lock();
@@ -187,7 +192,40 @@ fn the_operate_path_holds_the_destination_alpha_on_an_opaque_face() {
     );
     // The opaque face keeps the destination's alpha ...
     assert_eq!(layer_alpha(&env, 0, 0, 0), 0);
-    // ... the alpha face writes it.
+    // ... and so does the alpha face, whose hold-alpha spelling is the
+    // tree's "CopyColor".
+    assert_eq!(layer_alpha(&env, 1, 0, 0), 0);
+}
+
+/// Reference: without `holdAlpha` the alpha face's `omOpaque` copy is the
+/// tree's "CopyOpaqueImage": the source's colour replaces the destination's
+/// and the destination's alpha becomes opaque
+/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3141-3147`; the CPU
+/// twin writes `dest = src | 0xff000000`,
+/// `reference/cpp/core/visual/tvpgl.cpp:3326-3370`). The opaque face's copy
+/// is the tree's "Copy", which copies the source's alpha as well
+/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:2986`).
+#[test]
+fn the_operate_path_writes_an_opaque_alpha_on_an_alpha_face() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var bmp = new Bitmap(1, 1); \
+         bmp.setPixel(0, 0, 0x0000ff); \
+         bmp.setMaskPixel(0, 0, 128); \
+         var opaque = new Layer(w, null); \
+         opaque.setImageSize(4, 4); \
+         opaque.type = ltOpaque; \
+         opaque.operateRect(0, 0, bmp, 0, 0, 1, 1, omOpaque); \
+         var alpha = new Layer(w, null); \
+         alpha.setImageSize(4, 4); \
+         alpha.type = ltAlpha; \
+         alpha.operateRect(0, 0, bmp, 0, 0, 1, 1, omOpaque);",
+    );
+    // The opaque face copies the source's alpha.
+    assert_eq!(layer_alpha(&env, 0, 0, 0), 128);
+    // The alpha face writes an opaque alpha.
     assert_eq!(layer_alpha(&env, 1, 0, 0), 0xff);
 }
 

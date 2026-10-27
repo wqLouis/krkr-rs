@@ -123,6 +123,57 @@ projection draws the two sources, so nothing is written to a bitmap per tick
 
 * **Straight alpha everywhere.** The operations run on the straight-alpha
   channels; the additive-alpha variants convert explicitly.
+* **The blend of a pass is resolved once.** The operation mode selects the
+  kernel, the compatibility layer resolves the draw face's variant of the
+  face-sensitive modes, and the per-pixel loop only applies the resolved
+  kernel. The kernels follow the reference's blend methods
+  (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3402-3411`,
+  `:3474-3482`, `:3549-3556`): the alpha blend takes the destination's
+  alpha into the mix, the channel mix (the Photoshop modes and the opaque
+  face's alpha blend) does not and holds the destination's alpha, and the
+  per-channel Photoshop functions are the tree's CPU twins
+  (`reference/cpp/core/visual/gl/blend_functor_c.h:374-660`).
+
+### The blend family and where each formula comes from
+
+The reference has three blend shapes, and every operation mode names one of
+them:
+
+| shape | what it does | the reference |
+|---|---|---|
+| the alpha-correct source-over | the destination's alpha takes part in the mix and is recomputed from the source's alpha; a channel is `(s*sa*255 + d*da*(255-sa)) / (sa*255 + da*(255-sa))`, divided by that **exact** new alpha and rounded to the nearest 8-bit value | `reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3549-3556` (the CPU twin is `reference/cpp/core/visual/tvpgl.cpp:582-700`) |
+| the channel mix | the source's alpha mixes the colours with `d + ((f - d) * a >> 8)` and the destination's alpha is held | `reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3402-3411`, `:3474-3482` (the CPU twin is `reference/cpp/core/visual/gl/blend_functor_c.h:374-383`) |
+| the copy family | the source replaces the destination, with the destination's alpha copied, held or made opaque | `reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:2986`, `:3141-3147` (the CPU twin is `reference/cpp/core/visual/tvpgl.cpp:3326-3370`) |
+
+The per-channel function of every Photoshop mode is the tree's CPU twin, and
+the tables the tree builds at start-up
+(`reference/cpp/core/visual/gl/blend_function.cpp:526-547`) are the exact
+formulas:
+
+| mode | per-channel function `f(s, d)` | the reference |
+|---|---|---|
+| `omPsNormal` | `s` | `reference/cpp/core/visual/gl/blend_functor_c.h:374-383` |
+| `omPsAdditive` | the saturating sum | `reference/cpp/core/visual/gl/blend_functor_c.h:386-397` |
+| `omPsSubtractive` | the saturating difference | `reference/cpp/core/visual/gl/blend_functor_c.h:401-412` |
+| `omPsMultiplicative` | `d * s >> 8` | `reference/cpp/core/visual/gl/blend_functor_c.h:416-426` |
+| `omPsScreen` | `d + s - (d * s >> 8)` | `reference/cpp/core/visual/gl/blend_functor_c.h:430-445` |
+| `omPsOverlay` | `(s * d * 2) / 255` below the midpoint, `(s + d) * 2 - (s * d * 2) / 255 - 255` above it | `reference/cpp/core/visual/gl/blend_functor_c.h:512-533`, the table at `reference/cpp/core/visual/gl/blend_function.cpp:539-542` |
+| `omPsHardLight` | the overlay with the operands swapped | `reference/cpp/core/visual/gl/blend_functor_c.h:537-564` |
+| `omPsSoftLight` | `pow(d / 255, 128 / s)` above the midpoint, `pow(d / 255, (1 - s / 255) / 0.5)` below it | `reference/cpp/core/visual/gl/blend_functor_c.h:486-488`, the table at `reference/cpp/core/visual/gl/blend_function.cpp:532-534` |
+| `omPsColorDodge` | `0xff` when the source is light enough, `(d * 255) / (255 - s)` otherwise | `reference/cpp/core/visual/gl/blend_functor_c.h:494-496`, the table at `reference/cpp/core/visual/gl/blend_function.cpp:535-536` |
+| `omPsColorDodge5` | the colour dodge of the faded source; the channel is replaced, not mixed | `reference/cpp/core/visual/gl/blend_functor_c.h:568-581` |
+| `omPsColorBurn` | `0x00` when the source is dark enough, `255 - ((255 - d) * 255) / s` otherwise | `reference/cpp/core/visual/gl/blend_functor_c.h:502-504`, the table at `reference/cpp/core/visual/gl/blend_function.cpp:537-538` |
+| `omPsLighten` | the lighter channel | `reference/cpp/core/visual/gl/blend_functor_c.h:585-596` |
+| `omPsDarken` | the darker channel | `reference/cpp/core/visual/gl/blend_functor_c.h:600-611` |
+| `omPsDifference` | the absolute difference | `reference/cpp/core/visual/gl/blend_functor_c.h:615-626` |
+| `omPsDifference5` | the absolute difference of the faded source; the channel is replaced, not mixed | `reference/cpp/core/visual/gl/blend_functor_c.h:630-642` |
+| `omPsExclusion` | `d + s - (d * s >> 7)` | `reference/cpp/core/visual/gl/blend_functor_c.h:646-660` |
+
+The mix factor is the source's alpha, scaled by the opacity when the opacity
+is not the full one
+(`reference/cpp/core/visual/tvpps.inc:16-24`). The integer twins truncate
+the product by eight bits, so a channel can land one unit below the value
+the floating-point shader computes.
 * **Every write is clipped** to the destination bitmap's bounds and to the
   supplied clip rectangle. A write outside the clip is dropped, not clamped.
 * **A write marks the bitmap dirty**, so the engine re-uploads it on the next
@@ -221,8 +272,13 @@ render_layer_subtree(scene, root)
   real failure.
 * **`copy_9patch` returns `None`** when the source is smaller than 11×11 or
   the destination is smaller than the source minus the margins.
-* **A Photoshop-specific blend mode reduces to source-over** in
-  `fill_operate_rect`; the common modes are real.
+* **Every operation mode has a kernel of its own.** The mode's kernel
+  follows the reference's blend method
+  (`reference/cpp/core/visual/LayerIntf.cpp:4118-4271`): the alpha blend
+  that takes the destination's alpha into the mix, the channel mix that does
+  not (the Photoshop modes and the opaque face's alpha blend), and the
+  per-channel Photoshop functions. An operation mode the reference does not
+  know is rejected by the compatibility layer before the pass runs.
 * **`do_blur_light` uses the hard-light blend only for `ltPsHardLight`
   (= 19)**; every other light type composites source-over.
 

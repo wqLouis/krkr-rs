@@ -396,11 +396,17 @@ fn composite(mode: BlendMode, dst: [f32; 4], src: [f32; 4]) -> ([f32; 3], f32) {
             ];
             (rgb, dst[3])
         }
-        BlendMode::SourceOver | BlendMode::PsNormal => {
-            // The reference `bmPsNormal` alpha blend is the same per-channel
-            // lerp as the non-Photoshop `bmAlpha`.
+        BlendMode::SourceOver => {
             let rgb = lerp3(d, s, a);
             (rgb, over_alpha(dst[3], a))
+        }
+        BlendMode::PsNormal => {
+            // The Photoshop normal is the per-channel mix with the
+            // destination's alpha held: the colour is `src*a + dst*(1-a)`
+            // with no alpha correction, and the destination's alpha is written
+            // back unchanged.
+            let rgb = lerp3(d, s, a);
+            (rgb, dst[3])
         }
         BlendMode::Multiply
         | BlendMode::Screen
