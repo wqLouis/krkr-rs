@@ -463,32 +463,3 @@ fn a_loop_restart_is_reported() {
     assert!(v.restarted_at_loop(), "the loop restart is reported");
     assert_eq!(v.position_ms(), 0);
 }
-
-/// The clock can be put on an absolute position without a seek.
-///
-/// The reference resynchronizes the player's clock from the audio device
-/// without a seek (`reference/cpp/core/movie/ffmpeg/VideoPlayerAudio.cpp:256-267`),
-/// so the picture can follow the sound.
-#[test]
-fn the_clock_can_be_moved_without_a_seek() {
-    let mut v = VideoOverlay::new();
-    v.open(spec(30.0, 300)).unwrap();
-    v.play().unwrap();
-    v.poll();
-
-    v.sync_clock(1500.0);
-    assert_eq!(v.position_ms(), 1500);
-    assert_eq!(v.frame(), 45);
-    assert!(
-        v.poll().is_empty(),
-        "moving the clock produces no seek and no period event"
-    );
-
-    // A negative position is clamped, and a position that is not a number is
-    // ignored.
-    v.sync_clock(-10.0);
-    assert_eq!(v.position_ms(), 0);
-    v.sync_clock(1200.0);
-    v.sync_clock(f64::NAN);
-    assert_eq!(v.position_ms(), 1200);
-}

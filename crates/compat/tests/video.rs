@@ -1236,14 +1236,18 @@ fn the_movie_audio_stays_continuous_across_polls() {
     }
 }
 
-/// The picture follows the sound: the overlay's position is the position the
-/// voice reached at the listener, not the wall clock.
+/// The picture runs on the frame's clock and the sound follows it.
 ///
-/// The reference schedules the picture against the audio device's clock
-/// (`reference/cpp/core/movie/ffmpeg/VideoPlayerAudio.cpp:264`), so the
-/// sound drives the picture and not the other way round.
+/// The reference presents a picture when the player's own clock has reached
+/// the picture's timestamp
+/// (`reference/cpp/core/movie/ffmpeg/KRMovieLayer.cpp:45-55`), and that clock
+/// is the wall clock (`reference/cpp/core/movie/ffmpeg/VideoReferenceClock.cpp:224`).
+/// The sound is the other way round: the reference's audio clock is the
+/// player's clock plus the audio device's delay
+/// (`reference/cpp/core/movie/ffmpeg/VideoPlayerAudio.cpp:257-268`), so the
+/// voice is corrected against the picture, never the other way round.
 #[test]
-fn the_picture_follows_the_sound() {
+fn the_picture_runs_on_the_frames_clock() {
     /// The output rate, and the sound's rate.
     const RATE: u32 = 48_000;
     /// One 60 Hz frame at 48 kHz.
@@ -1282,11 +1286,87 @@ fn the_picture_follows_the_sound() {
         compat::sound_render(&ctx, &mut out, out_spec).expect("render");
     }
 
-    // The sound has rendered ten chunks of 800 frames, so it has reached
-    // 8000 frames (166.667 ms). The picture follows the sound one frame
-    // behind it: the sound of the frame being rendered has not reached the
-    // mixer yet.
-    assert_eq!(env.eval_int("v.position"), 150);
+    // The frame body advanced the picture by ten frames of 1000/60 ms, so
+    // the picture is at 166.667 ms: the frame's clock, not the sound's.
+    assert_eq!(env.eval_int("v.position"), 167);
+}
+
+/// The picture keeps advancing when the audio device's queue is deeper than
+/// the drift threshold.
+///
+/// The voice's played position trails its rendered position by the device's
+/// queue depth, and a voice that has drifted from the picture is put back
+/// onto it. A picture that took the sound's position instead of its own
+/// would be dragged back by the queue depth on every frame, and the movie
+/// would loop the first fraction of itself instead of playing.
+///
+/// Reference: the reference presents a picture when the player's own clock
+/// has reached the picture's timestamp
+/// (`reference/cpp/core/movie/ffmpeg/KRMovieLayer.cpp:45-55`), and that clock
+/// is the wall clock
+/// (`reference/cpp/core/movie/ffmpeg/VideoReferenceClock.cpp:224`): no audio
+/// state can hold the picture back.
+#[test]
+fn the_picture_keeps_advancing_with_a_deep_audio_queue() {
+    /// The output rate, and the sound's rate.
+    const RATE: u32 = 48_000;
+    /// One 60 Hz frame at 48 kHz.
+    const FRAMES: usize = 800;
+    /// The queue depth the device reports, deeper than the drift threshold.
+    const QUEUE_SECONDS: f64 = 0.5;
+    /// The cap the composition root puts on one frame's playback.
+    const MAX_STEP_MS: f64 = 250.0;
+    /// The number of frames the loop runs.
+    const FRAME_COUNT: usize = 300;
+
+    let _lock = vm_lock();
+    let env = Env::new();
+    let ctx = env.host.ctx().expect("bound context");
+    // The host mixes on the frame loop, so the mixer advances by the frames
+    // it renders.
+    compat::set_sound_render_driven(env.host.services(), true);
+    // The device holds a deep queue: the voice's played position trails its
+    // rendered position by the whole queue.
+    compat::set_output_latency(&ctx, QUEUE_SECONDS);
+    compat::set_video_source(
+        &ctx,
+        Box::new(AudioSource {
+            spec: VideoSpec {
+                sample_rate: RATE,
+                channels: 1,
+                total_frames: Some(3000),
+                ..default_spec()
+            },
+            frames: default_frames(),
+            audio: ramp_audio(RATE, 12.0, 1.0 / 576_000.0),
+        }),
+    );
+    env.run("var v = new VideoOverlay(new Window()); v.open('movie.mpg'); v.play();");
+
+    let out_spec = AudioSpec {
+        sample_rate: RATE,
+        channels: 1,
+        total_frames: None,
+    };
+    let mut out = vec![0.0f32; FRAMES];
+    let mut previous = env.eval_int("v.position");
+    for frame in 0..FRAME_COUNT {
+        env.clock.borrow_mut().advance(1000.0 / 60.0);
+        compat::video_advance(&ctx, MAX_STEP_MS).expect("advance");
+        compat::sound_render(&ctx, &mut out, out_spec).expect("render");
+        let position = env.eval_int("v.position");
+        assert!(
+            position >= previous,
+            "frame {frame}: the picture went back from {previous} ms to {position} ms"
+        );
+        previous = position;
+    }
+    // Three hundred frames of 1000/60 ms are five seconds; the picture has
+    // to have played all of them.
+    assert!(
+        previous > 4_900,
+        "the picture stopped at {previous} ms instead of playing"
+    );
 }
 
 /// A playing overlay asks the host for one frame per pump and shares that

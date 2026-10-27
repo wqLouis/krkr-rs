@@ -648,7 +648,7 @@ Code map: [`../code/engine/sound.md`](../code/engine/sound.md).
 The operations: `new`, `open(spec)`, `close`, `is_open`, `spec`,
 `status`, `is_playing`, `play`, `pause`, `stop`, `rewind`,
 `prepare`, `position_ms`, `position_exact_ms`, `frame`,
-`sync_clock`, `restarted_at_loop`, `duration_ms`, `total_frames`,
+`restarted_at_loop`, `duration_ms`, `total_frames`,
 `fps`, `seek_ms`, `seek_frame`, `segment_loop`, `set_segment_loop`,
 `cancel_segment_loop`, `period_event`, `set_period_event`,
 `cancel_period_event`, `visible`, `set_visible`, `set_position`,
@@ -669,7 +669,8 @@ frame; a segment loop wraps before the whole-stream end; a non-looping
 stream that crosses its end stops and rewinds to frame 0; the position is
 kept with sub-millisecond resolution and never rounded per step; the bounds,
 the frame size and the blit rectangles are VM pixels; the current frame is
-shared, not copied.
+shared, not copied; the overlay's clock advances by the injected delta, and
+nothing moves it onto the sound's position.
 
 **Error type:** `VideoError` — `InvalidSpec`, `NotOpen`,
 `InconsistentFrame`. The two blit functions return `false` for a frame

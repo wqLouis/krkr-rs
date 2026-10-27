@@ -481,19 +481,6 @@ impl VideoOverlay {
         ms_to_frame(self.fps(), self.position_ms())
     }
 
-    /// Put the clock on an absolute position without a seek.
-    ///
-    /// The position moves, but no seek and no period event is produced: the
-    /// picture follows the sound, and the sound's clock moves on its own.
-    ///
-    /// The value is clamped at `>= 0`.
-    pub fn sync_clock(&mut self, milliseconds: f64) {
-        if !milliseconds.is_finite() {
-            return;
-        }
-        self.position_exact_ms = milliseconds.max(0.0);
-    }
-
     /// Whether the last [`Self::advance`] put the clock back to a loop
     /// boundary.
     ///

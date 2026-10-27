@@ -26,9 +26,9 @@
 //! decoder-backed source opened per path). `open(path)` asks that source for
 //! the spec and, for the decoded audio track, raises a TJS error when the host
 //! has none; it never fabricates metadata. The frame body's [`video_advance`]
-//! step advances every open overlay by its own per-frame `dt`, presents the
-//! host frame at the current position and syncs the decoded audio's mixer
-//! voice with the overlay's position and transport state.
+//! step advances every open overlay by the engine clock's elapsed time,
+//! presents the host frame at the current position and syncs the decoded
+//! audio's mixer voice with the overlay's position and transport state.
 //!
 //! # Events
 //!
@@ -252,12 +252,12 @@ impl VideoSlot {
         }
     }
 
-    /// Put the picture on the sound's position.
-    fn follow_audio(&mut self, services: &CompatServices) {
-        let Some(audio) = self.movie_audio.as_mut() else {
-            return;
-        };
-        audio.follow_picture(services, &mut self.overlay);
+    /// Put the voice on the picture's position when the two have drifted
+    /// apart.
+    fn follow_audio(&self, services: &CompatServices) {
+        if let Some(audio) = &self.movie_audio {
+            audio.follow_picture(services, &self.overlay);
+        }
     }
 
     /// Drop the mixer voice, if any.
@@ -289,9 +289,6 @@ impl VideoSlot {
 pub(crate) struct MovieAudio {
     source: Arc<SoundSource>,
     channel: u64,
-    /// The position the voice reached at the last poll, so a sound that did
-    /// not move can be told from one that did.
-    last_played_ms: Option<f64>,
 }
 
 /// When a movie's mixer voice is put back onto the picture's position.
@@ -300,8 +297,8 @@ pub(crate) enum Resync {
     /// Reposition the voice now: a transport command (open, play, pause,
     /// stop, rewind, seek, prepare) or a loop restart.
     Force,
-    /// Reposition the voice only when it has drifted further than
-    /// [`MOVIE_DRIFT_SECS`] from the picture's position.
+    /// Leave the voice where it is: the per-frame poll corrects a voice that
+    /// has drifted from the picture ([`MovieAudio::follow_picture`]).
     OnDrift,
 }
 
@@ -309,11 +306,11 @@ pub(crate) enum Resync {
 /// per-frame poll corrects it, in seconds.
 ///
 /// The drift is the difference between the position the audio device has
-/// rendered and the picture's position. The device's pre-fill keeps the
-/// rendered position ahead of the audible one by a fixed amount, so the
-/// threshold sits well above it: a threshold the pre-fill could reach would
-/// correct the voice on every frame, which is the cut this policy exists to
-/// avoid.
+/// rendered and the picture's position. Both advance with the frame, so the
+/// drift stays near zero; the threshold only catches a real divergence (a
+/// seek the voice did not follow, a frame the mixer did not render). A
+/// threshold the drift could reach would correct the voice on every frame,
+/// which is the cut this policy exists to avoid.
 const MOVIE_DRIFT_SECS: f64 = 0.25;
 
 impl MovieAudio {
@@ -326,11 +323,7 @@ impl MovieAudio {
         let source = Arc::new(SoundSource::new(decoded)?);
         let mut sound = services.state::<SoundState>();
         let channel = sound.add_foreign_voice(source.clone())?;
-        Ok(Self {
-            source,
-            channel,
-            last_played_ms: None,
-        })
+        Ok(Self { source, channel })
     }
 
     /// Remove the mixer voice.
@@ -394,55 +387,34 @@ impl MovieAudio {
             }
             return;
         }
-        let drift = channel.position_seconds() - target;
-        let reposition = match resync {
-            Resync::Force => true,
-            Resync::OnDrift => drift.abs() > MOVIE_DRIFT_SECS,
-        };
-        if reposition {
+        // The voice is put back onto the picture's position on an explicit
+        // transport command or a loop restart; the per-frame drift correction
+        // is `follow_picture`'s job.
+        if resync == Resync::Force {
             channel.set_position(target);
         }
     }
 
-    /// The position the voice has reached at the listener, in milliseconds,
-    /// when the voice is playing.
-    fn played_position_ms(&self, services: &CompatServices) -> Option<f64> {
+    /// Put the voice on the picture's position when the two have drifted
+    /// apart.
+    ///
+    /// The sound follows the picture: the picture runs on the player's own
+    /// clock and the voice is corrected against it. The voice's rendered
+    /// position advances with the frame, so this only has to correct a voice
+    /// that has really diverged from the picture.
+    pub(crate) fn follow_picture(&self, services: &CompatServices, overlay: &VideoOverlay) {
         let mut sound = services.state::<SoundState>();
-        let channel = sound.foreign_voice_mut(self.channel)?;
-        if !channel.is_playing() {
-            return None;
-        }
-        Some(channel.played_position_seconds() * 1000.0)
-    }
-
-    /// Put the picture on the sound's position.
-    ///
-    /// The picture is scheduled against the audio device's clock: the
-    /// player's clock is the audio clock plus the sound's delay, so the
-    /// picture follows the sound instead of the sound following the picture.
-    ///
-    /// A sound that did not move — no device pumping it, a paused voice —
-    /// leaves the picture on its own clock, and a loop restart leaves the
-    /// sound on the picture's.
-    pub(crate) fn follow_picture(&mut self, services: &CompatServices, overlay: &mut VideoOverlay) {
-        let Some(played_ms) = self.played_position_ms(services) else {
+        let Some(channel) = sound.foreign_voice_mut(self.channel) else {
             return;
         };
-        let previous = self.last_played_ms.replace(played_ms);
-        // The first poll only records where the sound is.
-        let Some(previous) = previous else {
-            return;
-        };
-        if played_ms == previous {
-            // The sound did not move: the picture keeps its own clock.
+        if !channel.is_playing() || channel.is_done() {
             return;
         }
-        if overlay.restarted_at_loop() {
-            // A loop restart puts the sound back onto the picture's
-            // position instead.
-            return;
+        let target = overlay.position_exact_ms() / 1000.0;
+        let drift = channel.position_seconds() - target;
+        if drift.abs() > MOVIE_DRIFT_SECS {
+            channel.set_position(target);
         }
-        overlay.sync_clock(played_ms);
     }
 }
 
@@ -2626,6 +2598,8 @@ pub fn video_advance(ctx: &CompatCtx, max_step_ms: f64) -> Result<(), CompatErro
                 continue;
             }
             slot.overlay.advance(dt);
+            // The voice is corrected against the picture's new position; the
+            // picture's own clock is the frame's clock.
             slot.follow_audio(services);
             // The frame is fetched once, after the clock moved, so the picture
             // belongs to the position the overlay is at.

@@ -520,6 +520,46 @@ native OS popup would be a deliberate divergence, and Linux has nothing to call
   position, and the movie's own voice is resynced to it, so the picture and
   the sound stay together — but neither follows the media clock the reference
   uses.
+* **The picture runs on the frame clock and the sound follows it.** The
+  reference presents a picture when the player's own clock has reached the
+  picture's timestamp
+  (`reference/cpp/core/movie/ffmpeg/KRMovieLayer.cpp:45-55`), and the sound
+  is placed against the picture
+  (`reference/cpp/core/movie/ffmpeg/VideoPlayerAudio.cpp:257-268`): the
+  sound follows the picture, never the other way round. The port had the two
+  inverted - the picture took the audio device's voice position while the
+  voice was pushed back onto the picture - so with an audio queue deeper than
+  the 0.25 s drift threshold the two dragged each other back to zero every
+  frame, and the movie looped its first fraction instead of playing
+  (`crates/compat/tests/video.rs`,
+  `the_picture_keeps_advancing_with_a_deep_audio_queue`).
+* **The movie's sound is heard behind the picture by the device's queue.**
+  The reference's audio clock is the picture's position plus the audio
+  device's delay (`reference/cpp/core/movie/ffmpeg/VideoPlayerAudio.cpp:264`),
+  so the sound is heard when the picture is shown. The port schedules the
+  voice at the picture's position and the voice's rendered position runs
+  ahead of the audible one by the device's queue depth
+  (`crates/engine/src/sound.rs`, `SoundChannel::output_latency`), so the sound
+  is heard that much later than the picture. A fixed latency, not a drift:
+  the voice is corrected against the picture whenever the two differ by more
+  than the drift threshold. Recorded as an approximation with its reference
+  gap (D36).
+* **The movie's picture is copied into the layer instead of being assigned
+  as its image.** The reference hands the decoded picture to the layer as its
+  main image (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:553-610`), so
+  a picture that does not change costs nothing. The port copies the pixels
+  into the layer's bitmap every frame
+  (`crates/engine/src/video.rs`, `present_frame`), which is a full-frame copy
+  for a 1280x720 picture: the cost driver of the looping effect clips, and
+  the reason the frame time grows with the picture's size. Recorded as an
+  approximation with its reference gap (D36).
+* **A failing audio track fails the video open.** The video open decodes the
+  whole audio track (`crates/platform/media/src/video/ffmpeg.rs`), so a
+  container whose audio track cannot be decoded cannot be opened at all,
+  while the reference opens the picture and the sound independently
+  (`reference/cpp/core/movie/ffmpeg/VideoPlayer.cpp:2633-2669`). The error
+  contract for a broken audio track needs its own decision: the picture
+  should open, and the sound should report the failure.
 
 ## 8. File system / XP3
 

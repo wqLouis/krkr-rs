@@ -109,8 +109,10 @@ constant.
 The L1 device pre-fills its queue with roughly 150 ms before it starts and
 fades the last per-channel sample to silence over a few milliseconds on a
 real underrun. The device's latency is read back after each write and
-published to the mixer, which is how a picture that follows the sound is
-placed correctly.
+published to the mixer: it tells the mixer how far a voice's rendered
+position runs ahead of the position the listener has heard. The movie's
+picture runs on the frame's own clock, and its voice is corrected against
+that picture rather than the other way round.
 
 ### The playback cap
 

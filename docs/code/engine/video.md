@@ -69,7 +69,6 @@ impl VideoOverlay {
     pub fn position_ms(&self) -> i64;
     pub fn position_exact_ms(&self) -> f64;
     pub fn frame(&self) -> i64;
-    pub fn sync_clock(&mut self, milliseconds: f64);
     pub fn restarted_at_loop(&self) -> bool;
     pub fn duration_ms(&self) -> i64;
     pub fn total_frames(&self) -> i64;
@@ -135,9 +134,12 @@ the engine tick. To stay free of a global clock, this model advances a
 monotonically increasing clock, and a relative step is directly testable.
 
 The step the caller hands in is the engine's own elapsed time, so the
-picture's clock is the engine's clock. The reference's movie player runs on
-its own media timeline, off the frame — that is an approximation, recorded in
-TODO.md, and not something the frame can reproduce.
+picture's clock is the engine's clock — the player's own clock. The sound
+never moves it: the movie's voice is corrected against this clock when the
+two have drifted apart, and a transport command or a loop restart puts the
+voice back onto the picture's position. The reference's movie player runs
+on its own media timeline, off the frame — that is an approximation,
+recorded in TODO.md, and not something the frame can reproduce.
 
 The position is kept with **sub-millisecond resolution**
 (`position_exact_ms`) and never rounded per step: a step of `1000/60` ms is
@@ -170,6 +172,9 @@ percent fast and skip a frame's worth of audio on every step.
   `Stop()`, which rewinds before reporting the status.
 * **A configured period event fires once per arming.**
 * **The bounds, the frame size and the blit rects are VM pixels.**
+* **The picture's clock is the player's own.** The sound never sets it: the
+  movie's voice is corrected against the picture's position, so the two are
+  not pulled back and forth over every frame.
 * **The frame copy resolves its destination.** A destination image whose
   decode is still running is waited for, and the copy writes into the pixels
   that resolution installed. A destination that declares more pixels than its

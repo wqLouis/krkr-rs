@@ -39,12 +39,18 @@
 //! Only the state type and, on the MediaCodec build, the standalone audio
 //! path are re-exported, because the crate root publishes them.
 //!
-//! # Backward-seek contract
+//! # The picture the clock has reached
 //!
-//! [`present_video`] returns the frame at (or after) the requested time. A
-//! request behind the current frame is served from the current frame; a
-//! request more than `SEEK_TOLERANCE_MS` behind it causes a demuxer seek,
-//! and any other request decodes forward.
+//! [`present_video`] returns the picture whose timestamp the clock has
+//! reached: the latest picture at or before the requested time. The stream is
+//! read forward until a picture after the requested time turns up, and the
+//! picture before it is the one presented.
+//!
+//! A request behind the picture on screen is served from that picture when
+//! the difference is smaller than `SEEK_TOLERANCE_MS`; a request further
+//! behind it reads the stream from the requested time again. A stream that
+//! cannot be read from an earlier time — a raw elementary stream has no
+//! index to seek in — keeps the picture on screen and is read forward only.
 
 use std::sync::Arc;
 
@@ -89,8 +95,8 @@ pub use backend::VideoDecoderState;
 #[cfg(feature = "video-mediacodec")]
 pub use backend::decode_audio as decode_audio_mediacodec;
 
-/// How far a backwards request may lag the current frame before the decoder
-/// seeks instead of reusing it. Mirrors the reference `SEEK_TOLERANCE_MS`.
+/// How far a backwards request may lag the picture on screen before the
+/// decoder reads the stream from the requested time instead of reusing it.
 #[cfg(any(target_os = "android", feature = "video-ffmpeg"))]
 pub(crate) const SEEK_TOLERANCE_MS: u64 = 500;
 
@@ -143,13 +149,15 @@ pub fn open_video(
     backend::open(m, bytes, hint)
 }
 
-/// Presents the frame at (or after) `at_ms`.
+/// Presents the picture whose timestamp the clock has reached at `at_ms`.
 ///
-/// If the request is within `SEEK_TOLERANCE_MS` behind the current frame
-/// the current frame is returned; further back triggers a demuxer seek;
-/// otherwise the decoder decodes forward to the first frame at/after
-/// `at_ms`. Returns a tightly packed RGBA8 [`RgbaFrame`], shared with the
-/// decoder so that handing the frame on copies no pixels.
+/// The picture is the latest one at or before the requested time. A request
+/// within `SEEK_TOLERANCE_MS` behind the picture on screen is served from
+/// that picture; a request further back reads the stream from the requested
+/// time again, and a stream that cannot be read from an earlier time keeps
+/// the picture on screen. Any other request reads the stream forward.
+/// Returns a tightly packed RGBA8 [`RgbaFrame`], shared with the decoder so
+/// that handing the frame on copies no pixels.
 ///
 /// # Errors
 ///

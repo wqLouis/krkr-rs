@@ -28,6 +28,11 @@ use crate::hint::display_name;
 /// Number of bytes per RGBA8 pixel.
 const RGBA_BYTES_PER_PIXEL: usize = 4;
 
+/// The length of a picture of a stream without a frame rate, in
+/// milliseconds: the twenty-five pictures per second the movie player
+/// assumes.
+const DEFAULT_FRAME_MS: u64 = 40;
+
 /// Bottom-defined state for an incremental video decode.
 ///
 /// Holds the demuxer/codec context, the SwScale converter, the current frame
@@ -52,13 +57,20 @@ pub struct VideoDecoderState {
     video_stream_index: usize,
     /// Video stream time base, used to convert frame timestamps to ms.
     time_base: Rational,
+    /// Whether the demuxer can read the stream from an earlier time. A
+    /// stream without an index cannot, and it is read forward only.
+    seekable: bool,
+    /// The clock the pictures without a timestamp are stamped with.
+    picture_clock_ms: u64,
     /// SwScale context, built lazily from the first decoded frame so a
     /// mid-stream format change can rebuild it.
     scaler: Option<scaling::Context>,
     /// Scratch RGBA output frame reused across `present_video` calls.
     rgba: VideoFrame,
-    /// The frame most recently returned by `present_video`, shared.
+    /// The picture most recently returned by `present_video`, shared.
     current: Option<Arc<RgbaFrame>>,
+    /// The first picture after the last request, shared.
+    pending: Option<Arc<RgbaFrame>>,
     /// The fully decoded audio track (if the container has one), shared with
     /// whoever plays it.
     audio: Option<Arc<DecodedAudio>>,
@@ -224,16 +236,24 @@ pub(crate) fn open(
         decoder,
         video_stream_index,
         time_base,
+        seekable: true,
+        picture_clock_ms: 0,
         scaler: None,
         rgba: VideoFrame::empty(),
         current: None,
+        pending: None,
         audio: audio.map(Arc::new),
         eof: false,
     };
     Ok((spec, state))
 }
 
-/// Presents the frame at (or after) `at_ms`.
+/// Presents the picture the clock has reached at `at_ms`.
+///
+/// The picture is the latest one at or before the requested time: the
+/// timestamp the clock has reached. The stream is read forward until a
+/// picture after the requested time is found, and the picture before it is
+/// the one presented.
 pub(crate) fn present(
     m: &Media,
     state: &mut VideoDecoderState,
@@ -241,36 +261,56 @@ pub(crate) fn present(
 ) -> Result<Arc<RgbaFrame>, MediaError> {
     let _ = m;
 
-    // A request just behind the current frame is served by that frame rather
-    // than seeking backwards for a negligible time difference.
+    // A request behind the picture on screen is served by that picture when
+    // the difference is negligible; a request further back reads the stream
+    // from the requested time again.
     if let Some(current) = &state.current
-        && at_ms <= current.pts_ms
-        && at_ms.saturating_add(SEEK_TOLERANCE_MS) >= current.pts_ms
+        && at_ms < current.pts_ms
     {
+        let gap = current.pts_ms - at_ms;
+        let current = Arc::clone(current);
+        if gap <= SEEK_TOLERANCE_MS || !state.seekable {
+            return Ok(current);
+        }
+        if let Err(error) = seek_to(state, at_ms) {
+            // The stream cannot be read from an earlier time: the picture on
+            // screen is kept and the refusal is reported.
+            log::warn!("{error}");
+            state.seekable = false;
+            return Ok(current);
+        }
+    }
+
+    // The picture after the last request may have become due.
+    if let Some(pending) = state.pending.take() {
+        if pending.pts_ms <= at_ms {
+            state.current = Some(Arc::clone(&pending));
+        } else {
+            state.pending = Some(pending);
+        }
+    }
+
+    // The stream is read forward until a picture after the requested time
+    // turns up: the picture before it is the one the clock has reached.
+    while state.pending.is_none() {
+        let Some(frame) = decode_next(state)? else {
+            break;
+        };
+        if frame.pts_ms <= at_ms {
+            state.current = Some(frame);
+        } else {
+            state.pending = Some(frame);
+        }
+    }
+
+    if let Some(current) = &state.current {
         return Ok(Arc::clone(current));
     }
-
-    let need_seek = match &state.current {
-        Some(current) => at_ms.saturating_add(SEEK_TOLERANCE_MS) < current.pts_ms,
-        None => true,
-    };
-    if need_seek {
-        seek_to(state, at_ms)?;
-    }
-
-    loop {
-        match decode_next(state)? {
-            Some(frame) => {
-                if frame.pts_ms >= at_ms {
-                    state.current = Some(Arc::clone(&frame));
-                    return Ok(frame);
-                }
-                state.current = Some(frame);
-            }
-            None => {
-                return state.current.clone().ok_or(MediaError::EndOfStream);
-            }
-        }
+    // The clock is before every picture of the stream: the first picture of
+    // the stream is the one presented.
+    match &state.pending {
+        Some(first) => Ok(Arc::clone(first)),
+        None => Err(MediaError::EndOfStream),
     }
 }
 
@@ -303,7 +343,9 @@ fn seek_to(state: &mut VideoDecoderState, at_ms: u64) -> Result<(), MediaError> 
         })?;
     state.decoder.flush();
     state.current = None;
+    state.pending = None;
     state.eof = false;
+    state.picture_clock_ms = at_ms;
     Ok(())
 }
 
@@ -415,35 +457,112 @@ fn convert_frame(
         rgba.extend_from_slice(&data[start..end]);
     }
 
-    let pts_ms = frame_pts_ms(state.time_base, frame, &state.name)?;
+    let pts_ms = picture_timestamp_ms(
+        &mut state.picture_clock_ms,
+        state.time_base,
+        state.spec.fps,
+        frame,
+        &state.name,
+    )?;
     Ok(Arc::new(RgbaFrame::new(width, height, pts_ms, rgba)))
+}
+
+/// The picture's timestamp in milliseconds, and the clock it leaves behind.
+///
+/// A picture that carries a timestamp keeps it and moves the clock to it; a
+/// picture without one takes the clock's value. The clock then moves on by
+/// the picture's duration, so a stream that carries no timestamp at all is
+/// stamped picture by picture.
+fn picture_timestamp_ms(
+    clock_ms: &mut u64,
+    time_base: Rational,
+    fps: f32,
+    frame: &VideoFrame,
+    name: &str,
+) -> Result<u64, MediaError> {
+    let duration_ms = picture_duration_ms(time_base, fps, frame, name)?;
+    let pts_ms = match frame_timestamp_ms(time_base, frame, name)? {
+        Some(pts_ms) => {
+            *clock_ms = pts_ms;
+            pts_ms
+        }
+        None => *clock_ms,
+    };
+    *clock_ms = pts_ms.saturating_add(duration_ms);
+    Ok(pts_ms)
 }
 
 /// Converts a frame timestamp in stream time-base units to milliseconds.
 ///
-/// A missing or non-positive timestamp is presented at time 0, matching the
-/// reference, which substitutes 0 for an unusable PTS
-/// (`reference/cpp/core/movie/ffmpeg/VideoPlayer.cpp:815-819`).
-fn frame_pts_ms(time_base: Rational, frame: &VideoFrame, name: &str) -> Result<u64, MediaError> {
+/// A frame without a usable timestamp has none: the picture clock stamps it.
+fn frame_timestamp_ms(
+    time_base: Rational,
+    frame: &VideoFrame,
+    name: &str,
+) -> Result<Option<u64>, MediaError> {
     let Some(timestamp) = frame.timestamp().or_else(|| frame.pts()) else {
-        return Ok(0);
+        return Ok(None);
     };
     let numerator = i128::from(time_base.numerator());
     let denominator = i128::from(time_base.denominator());
-    if timestamp <= 0 || numerator <= 0 || denominator <= 0 {
-        return Ok(0);
+    if timestamp < 0 || numerator <= 0 || denominator <= 0 {
+        return Ok(None);
     }
     let ms = i128::from(timestamp) * numerator * 1000 / denominator;
-    u64::try_from(ms).map_err(|_| MediaError::InvalidData {
-        message: format!("{name}: frame timestamp {ms} ms is out of range"),
-    })
+    u64::try_from(ms)
+        .map(Some)
+        .map_err(|_| MediaError::InvalidData {
+            message: format!("{name}: frame timestamp {ms} ms is out of range"),
+        })
+}
+
+/// The picture's length in milliseconds: the frame's own length, or the
+/// nominal length of a picture of the stream.
+fn picture_duration_ms(
+    time_base: Rational,
+    fps: f32,
+    frame: &VideoFrame,
+    name: &str,
+) -> Result<u64, MediaError> {
+    let duration = frame.packet().duration;
+    if duration > 0 {
+        let numerator = i128::from(time_base.numerator());
+        let denominator = i128::from(time_base.denominator());
+        if numerator > 0 && denominator > 0 {
+            let ms = i128::from(duration) * numerator * 1000 / denominator;
+            let ms = u64::try_from(ms).map_err(|_| MediaError::InvalidData {
+                message: format!("{name}: picture length {ms} ms is out of range"),
+            })?;
+            if ms > 0 {
+                return Ok(ms);
+            }
+        }
+    }
+    Ok(nominal_frame_ms(fps))
+}
+
+/// The nominal length of a picture of the stream, in milliseconds.
+///
+/// The stream's own frame rate gives it; a stream without one falls back to
+/// the twenty-five pictures per second the movie player assumes.
+fn nominal_frame_ms(fps: f32) -> u64 {
+    if fps >= 1.0 {
+        let rate = f64::from(fps).round();
+        if (1.0..=1000.0).contains(&rate) {
+            let ms = (1000.0 / rate).round();
+            if (1.0..=1000.0).contains(&ms) {
+                return ms as u64;
+            }
+        }
+    }
+    DEFAULT_FRAME_MS
 }
 
 #[cfg(test)]
 mod tests {
     use ffmpeg_next::ChannelLayout;
 
-    use super::{Rational, VideoFrame, frame_pts_ms};
+    use super::{Rational, VideoFrame, frame_timestamp_ms, picture_timestamp_ms};
     use crate::audio_ffmpeg::{channel_count, resolve_layout};
 
     /// A non-negative channel count is stored as reported; the reference keeps
@@ -513,20 +632,58 @@ mod tests {
 
     /// A frame PTS is rescaled from the stream time base to milliseconds.
     #[test]
-    fn frame_pts_ms_rescales_a_positive_timestamp() {
+    fn a_frame_timestamp_is_rescaled_to_milliseconds() {
         let mut frame = VideoFrame::empty();
         frame.set_pts(Some(15));
         assert_eq!(
-            frame_pts_ms(Rational::new(1, 30), &frame, "<video>"),
-            Ok(500)
+            frame_timestamp_ms(Rational::new(1, 30), &frame, "<video>"),
+            Ok(Some(500))
         );
     }
 
-    /// A frame with no usable PTS is presented at time 0, matching the
-    /// reference (`reference/cpp/core/movie/ffmpeg/VideoPlayer.cpp:815-819`).
+    /// A frame with no usable PTS carries no timestamp: the picture clock
+    /// stamps it.
+    ///
+    /// The reference substitutes the clock's value for a picture without a
+    /// timestamp
+    /// (`reference/cpp/core/movie/ffmpeg/VideoPlayerVideo.cpp:539-547`).
     #[test]
-    fn frame_pts_ms_treats_a_missing_timestamp_as_zero() {
+    fn a_frame_without_a_timestamp_carries_none() {
         let frame = VideoFrame::empty();
-        assert_eq!(frame_pts_ms(Rational::new(1, 30), &frame, "<video>"), Ok(0));
+        assert_eq!(
+            frame_timestamp_ms(Rational::new(1, 30), &frame, "<video>"),
+            Ok(None)
+        );
+    }
+
+    /// A picture without a timestamp takes the clock's value, and the clock
+    /// moves on by the picture's length.
+    ///
+    /// The reference guesses the next picture's timestamp from the picture's
+    /// own length
+    /// (`reference/cpp/core/movie/ffmpeg/VideoPlayerVideo.cpp:600-601`).
+    #[test]
+    fn a_picture_without_a_timestamp_takes_the_clock() {
+        let mut clock = 0u64;
+        let frame = VideoFrame::empty();
+        let pts = picture_timestamp_ms(&mut clock, Rational::new(1, 30), 10.0, &frame, "<video>")
+            .expect("timestamp");
+        assert_eq!(pts, 0, "the first picture takes the clock's value");
+        assert_eq!(
+            clock, 100,
+            "the clock moves on by the nominal picture length"
+        );
+    }
+
+    /// A picture with a timestamp keeps it, and the clock moves on from it.
+    #[test]
+    fn a_picture_with_a_timestamp_keeps_it() {
+        let mut clock = 0u64;
+        let mut frame = VideoFrame::empty();
+        frame.set_pts(Some(30));
+        let pts = picture_timestamp_ms(&mut clock, Rational::new(1, 30), 10.0, &frame, "<video>")
+            .expect("timestamp");
+        assert_eq!(pts, 1000, "the picture keeps its own timestamp");
+        assert_eq!(clock, 1100, "the clock moves on from the picture");
     }
 }

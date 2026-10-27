@@ -246,8 +246,9 @@ decides whether to arm at all; the engine decides when the fire happens.
 device-driven one: the audio device's callback consumes the samples and
 moves the playback positions, so the mixer's time is the device's time and
 not the frame's. The video overlay's clock advances by an injected delta and
-is compared against the sound's clock, so the picture follows the sound.
-Both are L2 state with their own time base; neither reads a wall clock.
+is the picture's own clock; the movie's voice is corrected against the
+picture's position, so the sound follows the picture. Both are L2 state
+with their own time base; neither reads a wall clock.
 
 **How to tell.** Search the engine for a call that reads the system time.
 Each hit is a violation unless it measures how long a phase took — the

@@ -149,11 +149,15 @@ pub fn present_video(m: &Media, state: &mut VideoDecoderState, at_ms: u64) -> Re
 pub fn video_audio(m: &Media, state: &VideoDecoderState) -> Result<Arc<DecodedAudio>, MediaError>;
 ```
 
-`present_video` returns the frame at (or after) the requested time. A request
-behind the current frame is served from the current frame; a request more than
-`SEEK_TOLERANCE_MS` (500 ms) behind it causes a demuxer seek, and any other
-request decodes forward. The frame is shared with the decoder, so handing it
-on copies no pixels.
+`present_video` returns the picture whose timestamp the clock has reached:
+the latest picture at or before the requested time. The stream is read forward
+until a picture after the requested time turns up, and the picture before it
+is the one presented. A request behind the picture on screen is served from
+that picture when the difference is smaller than `SEEK_TOLERANCE_MS` (500 ms);
+a request further behind it reads the stream from the requested time again,
+and a stream that cannot be read from an earlier time - a raw elementary stream
+has no index to seek in - keeps the picture on screen and is read forward only.
+The picture is shared with the decoder, so handing it on copies no pixels.
 
 `video_audio` hands out the shared decoded track, so a caller that plays it
 does not copy the whole track.

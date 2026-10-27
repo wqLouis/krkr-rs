@@ -84,12 +84,13 @@ impl MovieSlot {
         }
     }
 
-    /// Put the picture on the sound's position.
-    fn follow_audio(&mut self, services: &CompatServices) {
-        let Some(audio) = self.movie_audio.as_mut() else {
+    /// Put the voice on the picture's position when the two have drifted
+    /// apart.
+    fn follow_audio(&self, services: &CompatServices) {
+        let Some(audio) = &self.movie_audio else {
             return;
         };
-        audio.follow_picture(services, &mut self.overlay);
+        audio.follow_picture(services, &self.overlay);
     }
 
     /// Drop the mixer voice, if any.
