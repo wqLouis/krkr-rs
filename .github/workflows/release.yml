@@ -74,8 +74,16 @@ jobs:
       # Zig-fetched dependencies.
       - name: Install the Linux build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          # apt must not wait for an answer that never comes on a runner:
+          # the frontend must not prompt, needrestart must not offer to
+          # restart services (it does on Ubuntu 24.04 and later, and it
+          # waits), and Dpkg::Use-Pty=0 keeps dpkg off a pty so it cannot
+          # ask. `sudo` resets the environment, so the variables are
+          # passed on the command line rather than in the step's env.
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+            apt-get -o Dpkg::Use-Pty=0 update
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+            apt-get -o Dpkg::Use-Pty=0 install -y --no-install-recommends \
             bison build-essential clang cmake libclang-dev \
             libavcodec-dev libavformat-dev libavutil-dev \
             libswresample-dev libswscale-dev \
@@ -166,8 +174,24 @@ jobs:
       # needs python3, which the runner image already provides.
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bison
+          # apt must not wait for an answer that never comes on a runner:
+          # the frontend must not prompt, needrestart must not offer to
+          # restart services (it does on Ubuntu 24.04 and later, and it
+          # waits), and Dpkg::Use-Pty=0 keeps dpkg off a pty so it cannot
+          # ask. `sudo` resets the environment, so the variables are
+          # passed on the command line rather than in the step's env.
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+            apt-get -o Dpkg::Use-Pty=0 update
+          # apt must not wait for an answer that never comes on a runner:
+          # the frontend must not prompt, needrestart must not offer to
+          # restart services (it does on Ubuntu 24.04 and later, and it
+          # waits), and Dpkg::Use-Pty=0 keeps dpkg off a pty so it cannot
+          # ask. `sudo` resets the environment, so the variables are
+          # passed on the command line rather than in the step's env.
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+            apt-get -o Dpkg::Use-Pty=0 update
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+            apt-get -o Dpkg::Use-Pty=0 install -y --no-install-recommends bison
 
       # JDK 21, the current LTS: Gradle 9.x and AGP 9.x both support it.
       - name: Set up JDK 21
