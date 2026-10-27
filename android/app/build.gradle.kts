@@ -25,6 +25,13 @@ android {
     // `compileSdkMinor` picks the QPR, and the package must be installed from
     // that same line (see .github/workflows/android.yml).
     compileSdk = 37
+    // The minor version matters: the SDK names its platform packages with one
+    // (`platforms;android-37.2`), and the constants this module uses from
+    // `ApplicationExitInfo` - `REASON_MEMORY_LIMITER` and `REASON_ANOMALY` -
+    // were added in 37.1, so compiling against `platforms;android-37.0`
+    // fails with an unresolved reference. The release workflow installs
+    // `platforms;android-37.2`; this line makes AGP resolve that package.
+    compileSdkMinor = 2
 
     defaultConfig {
         applicationId = "dev.krkr.rs"
