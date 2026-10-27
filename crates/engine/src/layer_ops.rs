@@ -3121,7 +3121,12 @@ fn affine_blit_clipped_impl(
     // map and float kernel. A pixel-centre origin at half a pixel denotes the
     // boundary, so the caller's convention decides whether the half offset is
     // applied; a fractional boundary still stays on the resampler.
-    if matches!(affine_blend(kernel), AffineBlend::Replace)
+    //
+    // The shortcut copies the source's pixels verbatim, so it cannot serve a
+    // pass that reads the source as an opaque image: that pass writes an
+    // opaque alpha where the copy would write the source's own.
+    if !treat_as_opaque
+        && matches!(affine_blend(kernel), AffineBlend::Replace)
         && let Some((dx, dy)) = affine_unit_copy(m, src_rect, src, stretch_type, pixel_center)
     {
         blit_copy_clipped(dst, dx, dy, src, src_rect, clip);

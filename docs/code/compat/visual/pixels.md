@@ -21,9 +21,9 @@ Every method composes the L2 `engine_api::layer_ops` and
 | `operateRect(dx, dy, src, sx, sy, sw, sh[, mode[, opa]])` | blends the source rect into the destination with the requested operation mode. `omAuto` resolves from the source layer's type. |
 | `operateStretch(dx, dy, dw, dh, src, sx, sy, sw, sh[, mode[, opa[, type]]])` | resamples the source rect into the destination rect and blends it. |
 | `operateAffine(src, sx, sy, sw, sh, affine, x1..y3[, mode[, opa[, type]]])` | affine-maps the source rect onto the three destination corners and blends it. |
-| `affineCopy(...)` | affine-maps the source onto the three corners, replacing the destination (optionally clearing it to `neutralColor` first). |
+| `affineCopy(...)` | affine-maps the source onto the three corners, replacing the destination (optionally clearing it to `neutralColor` first). The replacement carries the source's alpha, so a transparent source keeps the destination transparent there. |
 | `affinePile(...)` | affine-maps and source-over composites the source onto the destination. |
-| `affineBlend(...)` | affine-maps and blends the source onto the destination (an opaque copy on `dfOpaque`). |
+| `affineBlend(...)` | affine-maps and blends the source onto the destination: the source is read as an opaque image on `dfAlpha`, and copied with its own alpha on `dfOpaque`. |
 | `stretchCopy(dx, dy, dw, dh, src, sx, sy, sw, sh[, type])` | resamples the source rect into the destination rect, replacing the pixels (RGB, and the alpha unless `holdAlpha` on `dfOpaque`). |
 | `stretchPile(...)` | resamples and source-over composites the source rect. |
 | `stretchBlend(...)` | resamples and blends the source rect. |

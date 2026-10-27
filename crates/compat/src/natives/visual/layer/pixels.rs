@@ -803,12 +803,44 @@ fn affine_op(
         let color = scene.layer(id).map_or(0, |l| l.neutral_color);
         argb_to_rgba(color)
     };
-    // The blend comes from the operation mode and the draw face; the
-    // layer's `holdAlpha` property holds the destination alpha on top of
-    // that. The copy, pile and blend methods are the face-sensitive modes
-    // whatever the operation mode they run under.
-    let (mode, treat_as_opaque) = face_blend(mode, face);
-    let hold = face_hold_alpha(mode, layer_hold_alpha);
+    // The blend an affine method runs is named by the method and the draw
+    // face. The affine methods do not share the operation-mode table the
+    // layer's draw path uses; each of them names its own blend method for
+    // each face.
+    let (blend_mode, treat_as_opaque, hold) = match kind {
+        AffineKind::Copy => {
+            // The copy carries the source's alpha on every face, so the
+            // destination keeps its transparency where the source is
+            // transparent. The hold argument is off on the two alpha faces
+            // and the layer's own on the opaque face.
+            (OM_OPAQUE, false, face == DF_OPAQUE && layer_hold_alpha)
+        }
+        AffineKind::Pile => {
+            // The pile mixes the source into the destination with the
+            // source's alpha on an alpha face and mixes the channels on an
+            // opaque face; neither mix takes the hold argument.
+            let blend_mode = if face == DF_ALPHA {
+                OM_ALPHA
+            } else {
+                super::blend::LT_PS_NORMAL
+            };
+            (blend_mode, false, false)
+        }
+        AffineKind::Blend => {
+            // The blend copies the source as an opaque image on an alpha
+            // face and copies it with its own alpha on an opaque face. Both
+            // are copies, so both take the layer's hold argument.
+            let treat_as_opaque = face == DF_ALPHA;
+            (OM_OPAQUE, treat_as_opaque, layer_hold_alpha)
+        }
+        AffineKind::Operate => {
+            // The operate takes its blend from the operation mode and the
+            // draw face, and passes the layer's hold argument.
+            let (blend_mode, treat_as_opaque) = face_blend(mode, face);
+            let hold = face_hold_alpha(blend_mode, layer_hold_alpha);
+            (blend_mode, treat_as_opaque, hold)
+        }
+    };
     let pixel_center = affine || p0.0.fract() != 0.0 || p0.1.fract() != 0.0;
     affine_run(AffineRun {
         scene,
@@ -817,7 +849,7 @@ fn affine_op(
         corners: [p0, p1, p2],
         src_rect,
         stretch_type,
-        mode,
+        mode: blend_mode,
         opa,
         hold_alpha: hold,
         treat_as_opaque,

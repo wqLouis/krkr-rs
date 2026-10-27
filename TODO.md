@@ -1270,6 +1270,13 @@ Remaining:
 * The pool's counters are cumulative from pool creation; the app merges them
   before the startup snapshot, so they are a startup figure, not a live
   gauge.
+* `Layer.stretchBlend` on an alpha face still runs the source-over instead of
+  the reference's opaque-source copy: the tree's `StretchBlend` uses
+  `bmCopyOnAlpha` on `dfAlpha` and `bmCopy` on `dfOpaque`
+  (`reference/cpp/core/visual/LayerIntf.cpp:5319-5362`), while the port
+  selects `bmAlphaOnAlpha` for the alpha face. The same family as the affine
+  fix in this change, on a path the Kirikiroid2 patch wraps but does not
+  call; recorded here rather than folded into the affine commit.
 
 ## 19. Pixel-translation wiring decision
 
