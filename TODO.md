@@ -553,6 +553,30 @@ native OS popup would be a deliberate divergence, and Linux has nothing to call
   for a 1280x720 picture: the cost driver of the looping effect clips, and
   the reason the frame time grows with the picture's size. Recorded as an
   approximation with its reference gap (D36).
+* **The hit test is quadratic when the candidates decline it.** The reference walks
+  the layer tree once (`reference/cpp/core/visual/LayerIntf.cpp:3311-3361`),
+  while the port calls `Scene::layer_hit_next` once per candidate and each call
+  rebuilds the whole window layer order and re-walks it from the front
+  (`crates/compat/src/event.rs`, `crates/engine/src/scene.rs`). Measured: 30,
+  194, 1724, 6025 and 22257 us per move for 1, 8, 32, 64 and 128 declining
+  layers - 22 ms for one mouse move at 128 layers. A game has to decline the
+  hit test explicitly to reach it, so it is not the common path, but it is a
+  cliff. The fix is a search that keeps the order and advances through it, so
+  it changes the engine's hit-test contract and belongs in its own change.
+* **The deferred input queue grows without bound.** The dispatch budget is
+  wall-clock time (4 ms) and the queue replays in arrival order and never
+  drops an event, so arrivals that outpace the budget accumulate; the queue's
+  own per-frame cost is linear in its length. A storm of 1000 moves takes 26
+  frames to drain at the default budget.
+* **The move event's discardable mechanics are not readable in the vendored
+  tree.** The reference marks the window's move event discardable
+  (`reference/cpp/core/visual/WindowIntf.cpp:361-372`) and the tree's own
+  backend posts the move input event with the same flag
+  (`reference/cpp/core/environ/impl/TVPWindow.cpp:287-292`), but the queue
+  code that replaces a pending event is not in the tree. The port keeps at
+  most one pending move per batch and delivers the newest, which is the
+  documented meaning of the flag; the exact replacement mechanics are
+  recorded here rather than claimed as verified.
 * **A failing audio track fails the video open.** The video open decodes the
   whole audio track (`crates/platform/media/src/video/ffmpeg.rs`), so a
   container whose audio track cannot be decoded cannot be opened at all,

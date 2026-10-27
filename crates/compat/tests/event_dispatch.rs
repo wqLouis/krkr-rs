@@ -208,8 +208,12 @@ fn dispatch_honours_mouse_capture() {
         pressed: false,
     })]);
     assert_eq!(env.eval_int("aUps"), 1);
+    // The move reaches another position: the reference fires the layer's
+    // move event only when the position changed
+    // (reference/cpp/core/visual/LayerManager.cpp:426,
+    // reference/cpp/core/visual/LayerManager.cpp:507).
     env.dispatch_events(&[PlatformEvent::Input(InputEvent::PointerMoved {
-        x: 70.0,
+        x: 80.0,
         y: 10.0,
     })]);
     assert_eq!(env.eval_int("bMoves"), 1);

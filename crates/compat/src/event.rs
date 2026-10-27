@@ -282,21 +282,46 @@ impl EventAdapter {
         let started = Instant::now();
         // The events the last frame did not dispatch come first.
         let mut deferred = std::mem::take(&mut self.deferred);
+        let deferred_len = deferred.len();
+        // The window's move event is discardable: the pending move event is
+        // dropped when a newer one arrives, so only the newest move of the
+        // frame reaches the window. The position of that move in the frame's
+        // batch is the one the window sees.
+        let last_move = events
+            .iter()
+            .rposition(is_move_event)
+            .map(|index| deferred_len + index)
+            .or_else(|| deferred.iter().rposition(is_move_event));
         let mut queued = 0;
         let mut index = 0;
         loop {
-            let event = if queued < deferred.len() {
+            let event = if queued < deferred_len {
                 &deferred[queued]
             } else if let Some(event) = events.get(index) {
                 event
             } else {
                 break;
             };
+            // The event's position in the frame's batch.
+            let position = if queued < deferred_len {
+                queued
+            } else {
+                deferred_len + index
+            };
             self.apply_input_event(ctx, event);
             if let Some(mapped) = self.map(event) {
-                self.dispatch(ctx, &mapped)?;
+                // The layer's move event fires only when the pointer position
+                // changed since the last move event.
+                let deliver_layer_move =
+                    mapped.name != "onMouseMove" || pointer_moved(ctx, &mapped);
+                self.dispatch_event(
+                    ctx,
+                    &mapped,
+                    Some(position) == last_move,
+                    deliver_layer_move,
+                )?;
             }
-            if queued < deferred.len() {
+            if queued < deferred_len {
                 queued += 1;
             } else {
                 index += 1;
@@ -337,6 +362,23 @@ impl EventAdapter {
     /// A missing handler is a no-op; a throwing handler is logged and never
     /// aborts the frame.
     pub fn dispatch(&self, ctx: &mut CompatCtx, event: &TjsEvent) -> Result<(), CompatError> {
+        self.dispatch_event(ctx, event, true, true)
+    }
+
+    /// Deliver a mapped event, leaving the move events out when the frame's
+    /// batch says so.
+    ///
+    /// The window's move event is discardable, so a frame that collected a
+    /// burst of moves delivers one move event to the window: the newest one.
+    /// The layer's move event fires only when the pointer position changed.
+    /// A single event is delivered whole.
+    fn dispatch_event(
+        &self,
+        ctx: &mut CompatCtx,
+        event: &TjsEvent,
+        deliver_window_move: bool,
+        deliver_layer_move: bool,
+    ) -> Result<(), CompatError> {
         // A committed multi-character string is one `onKeyPress` per
         // character, matching the reference platform's per-`tjs_char`
         // post (`reference/cpp/core/environ/impl/TVPWindow.cpp:909-919`).
@@ -349,7 +391,7 @@ impl EventAdapter {
                     name: "onKeyPress",
                     args: vec![EventValue::Str(character.to_string()), EventValue::Int(1)],
                 };
-                self.dispatch(ctx, &single)?;
+                self.dispatch_event(ctx, &single, deliver_window_move, deliver_layer_move)?;
             }
             return Ok(());
         }
@@ -368,8 +410,12 @@ impl EventAdapter {
         // go to the same window.
         let window = first_window(ctx);
 
-        // The window receives every mapped event.
-        if let Some(id) = window {
+        // The window receives every mapped event but its move event, which
+        // is discardable: the pending move event is dropped when a newer one
+        // arrives.
+        if let Some(id) = window
+            && (event.name != "onMouseMove" || deliver_window_move)
+        {
             deliver_checked(ctx, event.name, &event.window_args(), Target::Window(id));
         }
 
@@ -391,7 +437,9 @@ impl EventAdapter {
             set_pointer_inside(ctx, false);
         }
 
-        if let Some(id) = layer {
+        if let Some(id) = layer
+            && deliver_layer_move
+        {
             let args = self.layer_args(ctx, event, id);
             deliver_checked(ctx, event.name, &args, Target::Layer(id));
         }
@@ -575,11 +623,35 @@ struct InputDispatchState {
     /// Whether the pointer is currently inside the window (the window-level
     /// enter/leave transition).
     pointer_inside: bool,
+    /// The pointer position of the last move event, in window pixels.
+    last_move_position: Option<(i64, i64)>,
 }
 
 /// Whether the event is a pointer event that hit-tests the layer tree.
 fn is_pointer_event(name: &str) -> bool {
     matches!(name, "onMouseMove" | "onMouseDown" | "onMouseUp")
+}
+
+/// Whether a platform event is a pointer move.
+fn is_move_event(event: &PlatformEvent) -> bool {
+    matches!(event, PlatformEvent::Input(InputEvent::PointerMoved { .. }))
+}
+
+/// Whether the pointer position changed since the last move event.
+///
+/// The position of every move event is recorded, so a move that repeats the
+/// previous position reports no change.
+fn pointer_moved(ctx: &CompatCtx, event: &TjsEvent) -> bool {
+    let position = match (event.args.first(), event.args.get(1)) {
+        (Some(EventValue::Int(x)), Some(EventValue::Int(y))) => Some((*x, *y)),
+        _ => None,
+    };
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let services = unsafe { ctx.services() };
+    let mut state = services.state::<InputDispatchState>();
+    let previous = state.last_move_position;
+    state.last_move_position = position;
+    previous != position
 }
 
 /// Resolve a pointer event's layer, honouring the mouse capture.
