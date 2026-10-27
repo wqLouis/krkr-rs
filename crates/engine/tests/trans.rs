@@ -369,3 +369,50 @@ fn per_pixel_kinds_have_no_composited_frame() {
     let cross_fade = Trans::cross_fade(10.0).unwrap();
     assert!(cross_fade.transition_frame(1, 2, (0, 2), true).is_none());
 }
+
+/// The clock-driven path is the one the engine uses in production: the
+/// transition is started at a clock tick and advanced to the clock's later
+/// ticks. The reference measures the transition with the tick difference, so
+/// the phase is a function of the elapsed time and not of the number of
+/// advances: `StartProcess` computes `(tick - StartTick) * PhaseMax / Time`
+/// from the tick the layer's continuous hook delivered
+/// (`reference/cpp/core/visual/TransIntf.cpp:528-538`), and that tick is the
+/// wall clock's millisecond count (`reference/cpp/core/utils/TickCount.cpp:112-118`,
+/// delivered as a continuous event by
+/// `reference/cpp/core/base/EventIntf.cpp:782-786`).
+#[test]
+fn the_clock_difference_drives_the_phase_and_not_the_number_of_advances() {
+    let mut one_step = Trans::cross_fade(500.0).unwrap();
+    one_step.start_at(1_000);
+    one_step.advance_to(1_250);
+
+    let mut two_steps = Trans::cross_fade(500.0).unwrap();
+    two_steps.start_at(1_000);
+    two_steps.advance_to(1_125);
+    two_steps.advance_to(1_250);
+
+    assert_eq!(one_step.phase(), two_steps.phase());
+    // 250 ms of a 500 ms transition is `250 * 255 / 500 = 127.5`, truncated.
+    assert_eq!(one_step.phase(), 127);
+    assert!(!one_step.is_complete());
+    assert!((one_step.progress() - 0.5).abs() < 1e-6);
+}
+
+/// The transition ends on the tick that reaches its duration, and a tick
+/// before the one it started at is no elapsed time at all: the reference's
+/// phase is `(tick - StartTick) * PhaseMax / Time`, and the tick difference
+/// is never negative
+/// (`reference/cpp/core/visual/TransIntf.cpp:528-538`).
+#[test]
+fn a_clock_before_the_start_is_no_elapsed_time() {
+    let mut trans = Trans::cross_fade(500.0).unwrap();
+    trans.start_at(1_000);
+    trans.advance_to(900);
+    assert_eq!(trans.phase(), 0);
+    assert_eq!(trans.elapsed_ms(), 0.0);
+    assert!(!trans.is_complete());
+
+    trans.advance_to(1_500);
+    assert!(trans.is_complete());
+    assert_eq!(trans.phase(), PHASE_MAX);
+}
