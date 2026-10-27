@@ -23,11 +23,11 @@
 //!   Golomb → per-line block decode with the color filter chain and the
 //!   MED/average predictors (this also performs the zigzag de-interleave).
 //!
-//! Pixel byte order: the reference decodes straight into KiriKiri's 32bpp
-//! scanline format (0xAARRGGBB in memory R,G,B,A), so the final RGBA8
-//! output here is `[R, G, B, A]` with the file's channel 2 holding the
-//! red-related residual plane (this matches how the real game files encode
-//! their color channels — verified against actual assets).
+//! Pixel byte order: the decoder produces the engine's 32bpp scanline
+//! word, `0xAARRGGBB`, whose bytes in memory are blue, green, red and
+//! alpha. The RGBA8 output here is `[R, G, B, A]`, so the word's byte 0
+//! (the file's first residual lane, the blue one) becomes the blue channel
+//! and its byte 2 (the file's third lane, the red one) the red channel.
 
 use image::RgbaImage;
 
@@ -450,12 +450,13 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
                 )?;
             }
             let row_pixels = &mut img[yy * width * 4..(yy + 1) * width * 4];
-            for (x, &px) in curline.iter().enumerate() {
-                let b = px.to_le_bytes();
-                row_pixels[x * 4] = b[0];
-                row_pixels[x * 4 + 1] = b[1];
-                row_pixels[x * 4 + 2] = b[2];
-                row_pixels[x * 4 + 3] = b[3];
+            for (pixel, &px) in row_pixels
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(curline.iter())
+            {
+                write_word_pixel(px, pixel);
             }
             prevline.copy_from_slice(&curline);
         }
@@ -464,16 +465,31 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
     if colors == 1 {
         // Grayscale TLG6: the reference stores the luminance in the first
         // byte lane. Present it as proper grayscale with opaque alpha.
+        // The first lane is the word's blue byte, so the luminance sits in
+        // the pixel's third channel and is copied into the other two.
         for px in img.as_chunks_mut::<4>().0.iter_mut() {
-            let v = px[0];
+            let v = px[2];
+            px[0] = v;
             px[1] = v;
-            px[2] = v;
             px[3] = 0xff;
         }
     }
 
     RgbaImage::from_raw(width as u32, height as u32, img)
         .ok_or("TLG6: invalid image dimensions".into())
+}
+
+/// Write one decoded scanline word into an RGBA8 pixel.
+///
+/// The word is `0xAARRGGBB`: byte 0 is blue, byte 1 green, byte 2 red and
+/// byte 3 alpha. The word's blue byte therefore lands in the pixel's third
+/// channel and its red byte in the first.
+fn write_word_pixel(word: u32, out: &mut [u8]) {
+    let bytes = word.to_le_bytes();
+    out[0] = bytes[2]; // red
+    out[1] = bytes[1]; // green
+    out[2] = bytes[0]; // blue
+    out[3] = bytes[3]; // alpha
 }
 
 /// Per-block-row decode state shared by every scanline of the row.
@@ -513,8 +529,8 @@ struct LinePass {
 /// Decode one scanline's worth of 8-wide blocks (reference
 /// `TVPTLG6DecodeLineGeneric`): reads the residual lanes out of `pixelbuf`
 /// in the encoder's zigzag order and runs the color filter + MED/average
-/// predictor chain, writing RGBA pixels (in memory order R,G,B,A — byte 0
-/// of each `u32` is the red-related plane).
+/// predictor chain, writing `0xAARRGGBB` words (byte 0 is the blue plane,
+/// byte 2 the red one).
 fn decode_line(row: &mut BlockRow<'_>, pass: LinePass) -> Result<(), String> {
     let BlockRow {
         prevline,
@@ -582,10 +598,10 @@ fn decode_line(row: &mut BlockRow<'_>, pass: LinePass) -> Result<(), String> {
             let ub = u.to_le_bytes();
             let upb = up.to_le_bytes();
             let mut ob = [0u8; 4];
-            // Byte order of the packed pixel is [R, G, B, A] (memory
-            // order), matching the reference's `0xff0000 & (B << 16) |
-            // 0xff00 & (G << 8) | R | (A << 24)` packed value.
-            let errb = [er as u8, eg as u8, eb as u8, ea as u8];
+            // The packed pixel is a 0xAARRGGBB word: byte 0 is blue, byte 1
+            // green, byte 2 red and byte 3 alpha, so the filter's blue
+            // correction goes to byte 0 and its red correction to byte 2.
+            let errb = [eb as u8, eg as u8, er as u8, ea as u8];
             for c in 0..4 {
                 let pred = if avg_mode {
                     avg_byte(pb[c], ub[c])
@@ -980,4 +996,19 @@ const fn build_golomb_bit_length_table() -> [[u8; 4]; TLG6_GOLOMB_TABLE_LEN] {
         n += 1;
     }
     table
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_word_pixel;
+
+    /// The decoded scanline word is `0xAARRGGBB`: byte 0 is blue, byte 1
+    /// green, byte 2 red and byte 3 alpha
+    /// (`krkrz/krkrz@fd5c4baa visual/gl/tlg_sse2.cpp:413-415`).
+    #[test]
+    fn word_bytes_land_in_the_named_channels() {
+        let mut pixel = [0u8; 4];
+        write_word_pixel(0x1122_3344, &mut pixel);
+        assert_eq!(pixel, [0x22, 0x33, 0x44, 0x11]);
+    }
 }

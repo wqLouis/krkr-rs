@@ -3836,12 +3836,10 @@
 {"path": "crates/platform/media/src/tlg.rs", "rule": "reference-citation", "anchor": "// Modified-LZSS (reference `TVPTLG5DecompressSlide`)", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/tlg.rs", "rule": "reference-citation", "anchor": "// Per-line block decode (reference `TVPTLG6DecodeLineGeneric`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/tlg.rs", "rule": "reference-citation", "anchor": "// dictionary (32×16 pattern, reference `TLG6InitializeColorFilterCompressor`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/platform/media/src/tlg.rs", "rule": "reference-citation", "anchor": "// order), matching the reference's `0xff0000 & (B << 16) |", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/tlg.rs", "rule": "reference-citation", "anchor": "// reference; we read bit pools per chunk instead.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/tlg.rs", "rule": "reference-citation", "anchor": "//! (`reference/cpp/core/visual/LoadTLG.cpp` plus the TLG routines in", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/tlg.rs", "rule": "reference-citation", "anchor": "//! Faithful port of the reference implementation", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/tlg.rs", "rule": "reference-citation", "anchor": "//! KiriKiri TLG5/TLG6 image decoders.", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/platform/media/src/tlg.rs", "rule": "reference-citation", "anchor": "//! Pixel byte order: the reference decodes straight into KiriKiri's 32bpp", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/tlg.rs", "rule": "reference-citation", "anchor": "//! `reference/cpp/core/visual/tvpgl.cpp` and `SaveTLG6.cpp`, which", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/tlg.rs", "rule": "reference-citation", "anchor": "/// (reference `TVP_TLG6_DO_CHROMA_DECODE*`; all arithmetic is wrapping 8-bit", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/platform/media/src/tlg.rs", "rule": "reference-citation", "anchor": "/// Bit-level reader over a (zero-padded) byte pool. Mirrors the reference's", "reason": "legacy comment, cleanup tracked in TODO §15"}

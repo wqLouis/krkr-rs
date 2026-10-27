@@ -163,6 +163,138 @@ fn tlg5_rgb_roundtrip() {
 }
 
 // ------------------------------------------------------------------
+// Channel order: the decoded scanline word is 0xAARRGGBB, so byte 0 is
+// blue and byte 2 is red.
+// ------------------------------------------------------------------
+
+/// Reads the little-endian `i32` at `at`.
+fn read_i32(bytes: &[u8], at: usize) -> i32 {
+    i32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+/// Builds a single-lane (grayscale) TLG6 file out of a four-lane one.
+///
+/// A file with a single colour channel stores one residual lane, the
+/// luminance, and every block of it uses the identity colour filter
+/// (`krkrz/krkrz@fd5c4baa visual/SaveTLG6.cpp:1237-1243`); the loader
+/// decodes that one lane only and leaves the other three bytes of the
+/// scanline word undefined
+/// (`krkrz/krkrz@fd5c4baa visual/LoadTLG.cpp:318-350`).
+///
+/// The four-lane file must hold a single block, so that its first block
+/// uses the identity filter and its first lane is the whole image.
+fn grayscale_tlg6(four_lane: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&four_lane[..11]); // the magic
+    out.push(1); // one colour channel: the luminance
+    out.extend_from_slice(&four_lane[12..15]); // data flag, colour type, golomb table
+    out.extend_from_slice(&(w as i32).to_le_bytes());
+    out.extend_from_slice(&(h as i32).to_le_bytes());
+    out.extend_from_slice(&four_lane[23..27]); // the maximum bit length
+
+    // The filter-type map: one identity filter per block. The LZSS stream
+    // copies eight raw bytes per flag byte, so one flag byte covers the
+    // single block of this image.
+    let blocks = ((w - 1) / 8 + 1) * ((h - 1) / 8 + 1);
+    assert!(
+        blocks <= 8,
+        "the raw LZSS copy writes eight bytes at a time"
+    );
+    let filter_stream = [0u8; 9];
+    out.extend_from_slice(&(filter_stream.len() as i32).to_le_bytes());
+    out.extend_from_slice(&filter_stream);
+
+    // The residual lane: the first lane of the first block row.
+    let mut at = 27;
+    let filter_size = read_i32(four_lane, at);
+    assert!(
+        filter_size >= 0,
+        "the filter-type size must not be negative"
+    );
+    at += 4 + filter_size as usize;
+    let bit_length = read_i32(four_lane, at) as u32;
+    let pool = (bit_length & 0x3fff_ffff).div_ceil(8) as usize;
+    out.extend_from_slice(&four_lane[at..at + 4 + pool]);
+    out
+}
+
+/// The colour channels of a decoded TLG6 image keep their places: the
+/// word's byte 2 is the red one, its byte 1 the green and its byte 0 the
+/// blue (`krkrz/krkrz@fd5c4baa visual/gl/tlg_sse2.cpp:413-415`).
+#[test]
+fn tlg6_channels_land_in_the_named_channels() {
+    let (w, h) = (8usize, 8usize);
+    let mut img = vec![0u8; w * h * 4];
+    for (i, px) in img.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        px[0] = 10 + (i % 7) as u8; // red
+        px[1] = 90 + (i % 5) as u8; // green
+        px[2] = 170 + (i % 3) as u8; // blue
+        px[3] = 200 + (i % 11) as u8; // alpha
+    }
+    let encoded = encode_tlg6(&img, w, h, 4);
+    let media = Media::new();
+    let decoded = decode_image(&media, &encoded, None).expect("a synthetic TLG6 should decode");
+    for (x, (pixel, source)) in decoded
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(img.as_chunks::<4>().0.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            pixel[0], source[0],
+            "pixel {x}: the red stays in the red channel"
+        );
+        assert_eq!(
+            pixel[1], source[1],
+            "pixel {x}: the green stays in the green channel"
+        );
+        assert_eq!(
+            pixel[2], source[2],
+            "pixel {x}: the blue stays in the blue channel"
+        );
+        assert_eq!(
+            pixel[3], source[3],
+            "pixel {x}: the alpha stays in the alpha channel"
+        );
+    }
+}
+
+/// A one-channel TLG6 file stores the luminance in its single lane, which
+/// the decoder keeps in the word's first byte
+/// (`krkrz/krkrz@fd5c4baa visual/LoadTLG.cpp:318-350`: only the first lane
+/// is decoded, and the zero line of a one-channel file is transparent black,
+/// `:276`). The decoder presents it as a gray pixel with an opaque alpha.
+#[test]
+fn tlg6_grayscale_expands_the_single_lane() {
+    let (w, h) = (8usize, 8usize);
+    let img = test_image(w, h);
+    let four_lane = encode_tlg6(&img, w, h, 4);
+    let gray = grayscale_tlg6(&four_lane, w, h);
+    let media = Media::new();
+    let decoded = decode_image(&media, &gray, None).expect("a one-lane TLG6 should decode");
+    assert_eq!((decoded.width as usize, decoded.height as usize), (w, h));
+    for (x, (pixel, source)) in decoded
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(img.as_chunks::<4>().0.iter())
+        .enumerate()
+    {
+        // The four-lane file keeps the blue channel in its first lane; that
+        // lane is the luminance of the gray image.
+        let luminance = source[2];
+        assert_eq!(
+            pixel,
+            &[luminance, luminance, luminance, 0xff],
+            "pixel {x} must be the gray expansion of the single lane"
+        );
+    }
+}
+
+// ------------------------------------------------------------------
 // Error handling: garbage must return Err, never panic
 // ------------------------------------------------------------------
 
