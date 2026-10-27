@@ -746,7 +746,16 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
     The shipped build's `align` and `valign` are stored but never read by
     its layout, so the port's ignoring them is equivalent.
 
-## 11. L3 blockers
+* **`Layer.copyBlueToAlpha` is absent from the port and from the reference
+  alike, and that is not a divergence.** The game post-processes every UI
+  sprite's mask layer with it (`system/psdlayer.tjs`, ctx 17 `getDispLayer`:
+  `lay.copyRect(left, top, maskLayer, 0,0,w,h); lay.copyBlueToAlpha();`), but
+  the member exists neither in the port nor in the reference tree, so the
+  game must guard the call and both engines skip it. The port therefore
+  matches the reference here. It is recorded only because the member is part
+  of the plugin family the game ships (the psd/psbfile DLLs): if that family
+  is ever ported and brings the member with it, the surface lock changes
+  (D29) and the sprite mask handling has to be re-derived.
 
 ## 11. L3 blockers
 
@@ -1080,6 +1089,46 @@ an allowlist exemption.
 
 ## 16. Deferred design work
 
+* **The vendored reference tree and the classic engine disagree about the
+  script-visible colour. The tree is the oracle; the classic is a recorded
+  difference.** The tree in `reference/` is the **KrKr2 Emulator**
+  (`github.com/2468785842/krkr2`), the cross-platform emulator with the
+  Android build that this port is measured against; the classic engine
+  (`krkrz/krkrz` @ `fd5c4baa6a2ef5978db1bd043634351f48667daf`) is the
+  original KiriKiri2 the games were made for, and it differs from the tree
+  in the colour domain:
+  * the tree's internal pixel memory is RGBA bytes and every write path
+    applies `TVP_REVRGB`
+    (`reference/cpp/core/visual/LayerBitmapIntf.cpp:205` `SetPointMain`,
+    `:236` `Fill`, `:385` `FillColor`), so a plain script colour is **drawn
+    as named**; the classic's memory word is `0xAARRGGBB`
+    (`visual/LayerBitmapIntf.cpp:218-223`) and it draws the same way.
+  * the tree's *readback* returns the raw GL bytes
+    (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:1079-1087`), so its
+    `getPixel` reports `0x00BBGGRR`; the classic masks the alpha off its
+    `0xAARRGGBB` word (`visual/BitmapIntf.cpp:49-54`) and reports
+    `0x00RRGGBB`. The port follows the tree.
+  * the tree's `drawGlyph`
+    (`reference/cpp/core/visual/LayerIntf.cpp:4513`) and its image
+    function's text and glyph paths
+    (`reference/cpp/core/visual/ImageFunction.cpp:1058`, `:1160`) do **not**
+    apply `TVP_REVRGB`, so they draw the red and the blue exchanged; the
+    classic has no `TVP_REVRGB` at all and draws every path as named. The
+    port follows the tree.
+  * the tree resolves a system colour through a table keyed by the whole
+    word, with the fallback that keeps the low 24 bits
+    (`reference/cpp/core/environ/Application.cpp:874-940`); the classic
+    resolves it through the OS, indexed by the low byte, and an index the OS
+    does not know paints black (`visual/win32/TVPColor.h:37-42`). The port
+    follows the tree.
+  * the tree's grey ramp weighs the channels by byte position on its word
+    (`reference/cpp/core/visual/tvpgl.cpp:10350-10390`); the classic's
+    weighs them by byte position on the other word, so the red and the blue
+    swap places (`visual/gl/blend_functor_c.h:883-891`). The port follows
+    the tree.
+  A game made for the classic may observe the classic's behaviour where the
+  two differ; the port implements the tree, and each difference is recorded
+  here so the choice is visible rather than accidental.
 * **TJS VM in Rust** (`docs.old/migration/08` §10.7) **and `streams.cpp` as a thin
   C++ adapter over it** — both deferred. `streams.cpp` is the only port-authored
   C++ besides the ABI boundary, and every save-path memory-safety defect was in
