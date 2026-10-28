@@ -745,7 +745,9 @@ pub(crate) fn hit_test(
         deliver_hit_test(ctx, &candidate);
         let accepted = {
             let scene = scene(ctx)?;
-            scene.hit_test_accepted(candidate.layer)
+            scene
+                .layer(candidate.layer)
+                .map(|layer| layer.hit_test_accepted)
         };
         match accepted {
             Some(true) => {

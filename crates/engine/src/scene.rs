@@ -2337,13 +2337,6 @@ impl Scene {
         Some(id)
     }
 
-    /// Whether the layer accepts the hit test running on it.
-    ///
-    /// `None` when the layer does not exist.
-    pub fn hit_test_accepted(&self, id: u32) -> Option<bool> {
-        self.layer(id).map(|layer| layer.hit_test_accepted)
-    }
-
     /// Set whether the layer accepts the hit test running on it.
     ///
     /// A layer that does not exist has no flag to set. The flag is neither

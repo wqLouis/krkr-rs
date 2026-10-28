@@ -110,6 +110,16 @@ int tjs2_read_text_stream_n(const char *path_utf8, const char *mode_utf8,
                              unsigned int size, char **out_utf8);
 
 /*
+ * Read a whole text stream and return its text as a malloc'd UTF-8 string.
+ *
+ * The same conventions as tjs2_read_text_stream_n without the size cap: the
+ * whole stream is read, and the returned buffer belongs to the caller, who
+ * releases it with tjs2_free_string.
+ */
+int tjs2_read_text_stream_all(const char *path_utf8, const char *mode_utf8,
+                               char **out_utf8);
+
+/*
  * Storage seam for the text/binary stream factories.
  *
  * The reference wires TJSCreate{Text,Binary}StreamFor{Read,Write} to the

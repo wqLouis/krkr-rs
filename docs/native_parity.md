@@ -11,6 +11,7 @@ uv run --project scripts krkr-gate native-parity                 # check + regen
 uv run --project scripts krkr-gate native-parity --no-doc        # check only
 uv run --project scripts krkr-gate native-parity --update-allow  # accept current gaps after review
 uv run --project scripts krkr-gate native-parity --update-props-allow  # accept accessor mismatches
+uv run --project scripts krkr-gate native-parity --update-static-allow  # accept static/instance kind mismatches
 uv run --project scripts krkr-gate native-parity --self-test     # extractor fixture self-test
 ```
 
@@ -137,7 +138,7 @@ _None._
 
 ## Static/instance kind parity
 
-A reference member that lives on the class object (`TJS_STATICMEMBER`) must be registered by Rust on the class object, and an instance member on the instance; the reverse dispatches the wrong native callback shape (the `Window.mainWindow` crash). `scripts/allowlists/native_parity_static_allow.txt` records accepted exceptions.
+A reference member that lives on the class object (`TJS_STATICMEMBER`) must be registered by Rust on the class object, and an instance member on the instance; the reverse dispatches the wrong native callback shape (the `Window.mainWindow` crash). Accepted exceptions live in the static-kind allowlist the check reads, `scripts/allowlists/native_parity_static_allow.txt`. The check writes that file when `--update-static-allow` accepts an exception, so the file is absent while no exception is accepted.
 
 - mismatches: 0
 

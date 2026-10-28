@@ -50,9 +50,10 @@ members (one ``Class.member`` per line);
 ``scripts/allowlists/native_parity_props_allow.txt`` lists the currently accepted
 accessor mismatches (one ``Class.property`` per line);
 ``scripts/allowlists/native_parity_static_allow.txt`` lists the currently
-accepted static/instance kind mismatches (one ``Class.member`` per line).  The
-checker fails when a *new* one appears, and reports an allowlisted entry that
-no longer applies as stale so the list can shrink.
+accepted static/instance kind mismatches (one ``Class.member`` per line); the
+file is written by ``--update-static-allow`` and is absent while no exception
+is accepted.  The checker fails when a *new* one appears, and reports an
+allowlisted entry that no longer applies as stale so the list can shrink.
 
 Usage
 -----
@@ -1700,6 +1701,10 @@ def build_report(
         "uv run --project scripts krkr-gate native-parity --update-props-allow  "
         "# accept accessor mismatches"
     )
+    lines.append(
+        "uv run --project scripts krkr-gate native-parity --update-static-allow  "
+        "# accept static/instance kind mismatches"
+    )
     lines.append("uv run --project scripts krkr-gate native-parity --self-test     # extractor fixture self-test")
     lines.append("```")
     lines.append("")
@@ -1954,9 +1959,11 @@ def build_report(
         "A reference member that lives on the class object (`TJS_STATICMEMBER`) "
         "must be registered by Rust on the class object, and an instance member "
         "on the instance; the reverse dispatches the wrong native callback "
-        "shape (the `Window.mainWindow` crash). "
-        "`scripts/allowlists/native_parity_static_allow.txt` records accepted "
-        "exceptions."
+        "shape (the `Window.mainWindow` crash). Accepted exceptions live in "
+        "the static-kind allowlist the check reads, "
+        "`scripts/allowlists/native_parity_static_allow.txt`. The check writes "
+        "that file when `--update-static-allow` accepts an exception, so the "
+        "file is absent while no exception is accepted."
     )
     lines.append("")
     lines.append(f"- mismatches: {len(static_mismatches)}")
