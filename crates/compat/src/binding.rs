@@ -273,8 +273,12 @@ extern "C" fn text_decode(
         *out_units = ptr::null_mut();
         *out_len = 0;
     }
-    // SAFETY: the ABI passes a readable byte range for the call.
-    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    let bytes: &[u8] = if len == 0 {
+        &[]
+    } else {
+        // SAFETY: the ABI passes a readable byte range for the call.
+        unsafe { std::slice::from_raw_parts(data, len) }
+    };
     let units = match crate::text::decode_text_units(bytes, crate::text::TextEncoding::Detect) {
         Ok(units) => units,
         Err(message) => return text_decode_failure(out_error, &message),
