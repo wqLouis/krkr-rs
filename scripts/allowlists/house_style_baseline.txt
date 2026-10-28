@@ -3383,4 +3383,3 @@
 {"path": "crates/testkit/src/media_fixtures.rs", "rule": "reference-citation", "anchor": "/// Compressed run-length form of the Golomb bit-length table (reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/testkit/src/media_fixtures.rs", "rule": "reference-citation", "anchor": "/// Golomb adaptation window (reference `TVP_TLG6_GOLOMB_N_COUNT`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/testkit/src/media_fixtures.rs", "rule": "reference-citation", "anchor": "/// Golomb-Rice + run-length entropy coder (reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/engine/src/trans/extrans_wave.rs", "rule": "reference-citation", "anchor": "//! # Not ported", "reason": "legacy comment, cleanup tracked in TODO §15"}

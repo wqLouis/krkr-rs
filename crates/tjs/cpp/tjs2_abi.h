@@ -92,6 +92,24 @@ void tjs2_wire_stream_factories(void);
 void tjs2_set_data_dir(const char *dir);
 
 /*
+ * Read a text stream and return its first `size` units (0 = all of them) as
+ * a malloc'd NUL-terminated UTF-8 string.
+ *
+ * `path_utf8` names the member to read and `mode_utf8` the access mode; both
+ * are NUL-terminated UTF-8, and `mode_utf8` may be NULL, which reads the
+ * member as it is. `size` counts the characters the read returns: 0 reads
+ * the whole stream, any other value reads at most that many characters and
+ * stops at the end of the stream.
+ *
+ * On success the function returns 0 and stores the string in *out_utf8; the
+ * caller owns that string and frees it with tjs2_free_string. On failure the
+ * function returns non-zero and leaves *out_utf8 NULL; the reason is not
+ * reported.
+ */
+int tjs2_read_text_stream_n(const char *path_utf8, const char *mode_utf8,
+                             unsigned int size, char **out_utf8);
+
+/*
  * Storage seam for the text/binary stream factories.
  *
  * The reference wires TJSCreate{Text,Binary}StreamFor{Read,Write} to the

@@ -10,6 +10,13 @@
 //! integer per-channel functions are the tree's CPU twins
 //! (`reference/cpp/core/visual/gl/blend_functor_c.h:386-660`,
 //! `reference/cpp/core/visual/gl/blend_function.cpp:526-547`).
+//!
+//! The modes below the Photoshop family are per-channel functions of their
+//! own (`reference/cpp/core/visual/gl/blend_functor_c.h:182-349`); the
+//! software renderer's method table names one per mode
+//! (`reference/cpp/core/visual/RenderManager.cpp:2403-2415`), and at the full
+//! opacity the method runs the plain functor
+//! (`reference/cpp/core/visual/RenderManager.cpp:1802-1824`).
 
 use api::blend::BlendMode;
 use engine::layer_ops::{BlitOptions, BlitSource, operate_rect, render_layer_subtree};
@@ -258,4 +265,170 @@ fn a_photoshop_normal_layer_is_composited_without_an_alpha_correction() {
     // `0 + ((255 - 0) * 128 >> 8) = 127`. The alpha-correct source-over
     // would have given `(85, 170, 0, 191)`.
     assert_eq!(&bitmap.rgba[..4], &[127, 127, 0, 128]);
+}
+
+// ---------------------------------------------------------------------------
+// The operation modes below the Photoshop family
+// ---------------------------------------------------------------------------
+
+/// Reference: the additive blend is the saturating sum of the destination and
+/// the source (`reference/cpp/core/visual/gl/blend_functor_c.h:182-188`), the
+/// functor the software renderer's "AddBlend" method runs
+/// (`reference/cpp/core/visual/RenderManager.cpp:2867`). At the full opacity
+/// the method runs the plain functor, which adds the source unscaled
+/// (`reference/cpp/core/visual/RenderManager.cpp:1802-1810`), and the
+/// destination's alpha is held
+/// (`reference/cpp/core/visual/gl/blend_variation.h:74-84`).
+#[test]
+fn the_additive_mode_saturates_the_sum_of_the_channels() {
+    // `200 + 60` and `100 + 180` both run past 255 and saturate, `50 + 90` is
+    // 140, and the destination's alpha stays at 128.
+    assert_eq!(
+        blend(3, [200, 100, 50, 128], [60, 180, 90, 192], 255),
+        [255, 255, 140, 128]
+    );
+}
+
+/// Reference: the subtractive blend is the saturating difference of the
+/// destination and the source
+/// (`reference/cpp/core/visual/gl/blend_functor_c.h:202-208`), the functor
+/// the software renderer's "SubBlend" method runs
+/// (`reference/cpp/core/visual/RenderManager.cpp:2868`). At the full opacity
+/// the method runs the plain functor, which subtracts the source unscaled
+/// (`reference/cpp/core/visual/RenderManager.cpp:1802-1810`).
+#[test]
+fn the_subtractive_mode_saturates_the_difference_of_the_channels() {
+    // `200 - 60` is 140; `100 - 180` and `50 - 90` run below zero and
+    // saturate.
+    assert_eq!(
+        blend(4, [200, 100, 50, 128], [60, 180, 90, 192], 255),
+        [140, 0, 0, 128]
+    );
+}
+
+/// Reference: the multiplicative blend is the product of the two channels
+/// truncated by eight bits (`reference/cpp/core/visual/gl/blend_functor_c.h:222-229`),
+/// the functor the software renderer's "MulBlend" method runs
+/// (`reference/cpp/core/visual/RenderManager.cpp:2869-2870`). At the full
+/// opacity the method runs the plain functor, which multiplies by the source
+/// unscaled (`reference/cpp/core/visual/RenderManager.cpp:1802-1810`). The
+/// blend reads the colours only; the source's alpha does not take part in it.
+#[test]
+fn the_multiplicative_mode_multiplies_the_channels() {
+    // `200 * 64 >> 8` is `12800 >> 8` = 50, `100 * 128 >> 8` is 50 and
+    // `50 * 192 >> 8` is `9600 >> 8` = 37.
+    assert_eq!(
+        blend(5, [200, 100, 50, 128], [64, 128, 192, 255], 255),
+        [50, 50, 37, 128]
+    );
+}
+
+/// Reference: the colour dodge scales the destination by the reciprocal of
+/// the source's complement (`reference/cpp/core/visual/gl/blend_functor_c.h:243-255`),
+/// the functor the software renderer's "ColorDodgeBlend" method runs
+/// (`reference/cpp/core/visual/RenderManager.cpp:2871`). The reciprocal table
+/// holds `65536 / i` and `65536` for the zero index
+/// (`reference/cpp/core/visual/tvpgl.cpp:213-218`). At the full opacity the
+/// method runs the plain functor, which dodges with the source unscaled
+/// (`reference/cpp/core/visual/RenderManager.cpp:1802-1810`); below the full
+/// opacity it runs the one that fades the source by the opacity first
+/// (`reference/cpp/core/visual/gl/blend_functor_c.h:256-263`).
+#[test]
+fn the_dodge_mode_scales_the_destination_by_the_source_inverse() {
+    // At the full opacity the source is not faded: `65536 / (255 - 32)` is
+    // 293, so the red channel is `200 * 293 >> 8` = 228; the green channel
+    // is `100 * (65536 / 231) >> 8` = `100 * 283 >> 8` = 110 and the blue
+    // channel `50 * (65536 / 239) >> 8` = `50 * 274 >> 8` = 53.
+    assert_eq!(
+        blend(8, [200, 100, 50, 128], [32, 24, 16, 192], 255),
+        [228, 110, 53, 128]
+    );
+    // Below the full opacity the source fades first: `(60 * 128) >> 8` is 30,
+    // so the red channel is `200 * (65536 / 225) >> 8` = `200 * 291 >> 8` =
+    // 227; the green channel fades to 90 and the blue one to 45.
+    assert_eq!(
+        blend(8, [200, 100, 50, 128], [60, 180, 90, 192], 128),
+        [227, 155, 60, 128]
+    );
+}
+
+/// Reference: the darken blend is the smaller of the two channels
+/// (`reference/cpp/core/visual/gl/blend_functor_c.h:268-277`), the functor
+/// the software renderer's "DarkenBlend" method runs
+/// (`reference/cpp/core/visual/RenderManager.cpp:2872`). At the full opacity
+/// the method runs the plain functor, which takes the smaller channel
+/// (`reference/cpp/core/visual/RenderManager.cpp:1802-1810`).
+#[test]
+fn the_darken_mode_takes_the_smaller_channel() {
+    // The red channel is the source's 60, the green channel the
+    // destination's 100 and the blue channel the destination's 50.
+    assert_eq!(
+        blend(9, [200, 100, 50, 128], [60, 180, 90, 192], 255),
+        [60, 100, 50, 128]
+    );
+}
+
+/// Reference: the lighten blend is the larger of the two channels
+/// (`reference/cpp/core/visual/gl/blend_functor_c.h:297-306`), the functor
+/// the software renderer's "LightenBlend" method runs
+/// (`reference/cpp/core/visual/RenderManager.cpp:2876`). At the full opacity
+/// the method runs the plain functor, which takes the larger channel
+/// (`reference/cpp/core/visual/RenderManager.cpp:1802-1810`).
+#[test]
+fn the_lighten_mode_takes_the_larger_channel() {
+    // The red channel is the destination's 200, the green channel the
+    // source's 180 and the blue channel the source's 90.
+    assert_eq!(
+        blend(10, [200, 100, 50, 128], [60, 180, 90, 192], 255),
+        [200, 180, 90, 128]
+    );
+}
+
+/// Reference: the screen blend is the complement of the product of the two
+/// complements, truncated by eight bits
+/// (`reference/cpp/core/visual/gl/blend_functor_c.h:326-336`), the functor the
+/// software renderer's "ScreenBlend" method runs
+/// (`reference/cpp/core/visual/RenderManager.cpp:2877`). At the full opacity
+/// the method runs the plain functor
+/// (`reference/cpp/core/visual/RenderManager.cpp:1802-1810`). The blend reads
+/// the colours only; the source's alpha does not take part in it.
+#[test]
+fn the_screen_mode_is_the_complement_of_the_product() {
+    // `255 - ((255 - 200) * (255 - 16) >> 8)` is `255 - (55 * 239 >> 8)` =
+    // `255 - 51` = 204; the green channel is `255 - (155 * 223 >> 8)` = 120
+    // and the blue one `255 - (205 * 215 >> 8)` = 83.
+    assert_eq!(
+        blend(11, [200, 100, 50, 128], [16, 32, 40, 192], 255),
+        [204, 120, 83, 128]
+    );
+}
+
+/// Reference: the additive-alpha blend scales the destination by the source's
+/// remaining alpha and adds the source
+/// (`reference/cpp/core/visual/gl/blend_util_func.h:35-43`), the functor the
+/// software renderer's "AdditiveAlphaBlend" method runs
+/// (`reference/cpp/core/visual/RenderManager.cpp:2878`). Below the full
+/// opacity the method runs the one that fades the source by the opacity
+/// first (`reference/cpp/core/visual/gl/blend_functor_c.h:132-146`), and the
+/// destination's alpha is held in both
+/// (`reference/cpp/core/visual/gl/blend_variation.h:74-84`).
+#[test]
+fn the_add_alpha_mode_scales_the_destination_by_the_remaining_alpha() {
+    // Below the full opacity the source fades to `(60 * 128) >> 8` = 30 and
+    // its alpha to `(192 * 128) >> 8` = 96, so the destination scales by
+    // `255 - 96` = 159: the red channel is `200 * 159 >> 8` = 124 and the
+    // source adds 30, which is 154; the green channel is `100 * 159 >> 8` =
+    // 62 and the source adds 90, which is 152; the blue channel is
+    // `50 * 159 >> 8` = 31 and the source adds 45, which is 76.
+    assert_eq!(
+        blend(12, [200, 100, 50, 128], [60, 180, 90, 192], 128),
+        [154, 152, 76, 128]
+    );
+    // At the full opacity the source is not faded and the destination scales
+    // by the source's remaining alpha `255 - 192` = 63: the red channel is
+    // `128 * 63 >> 8` = 31 and the source adds 16, which is 47.
+    assert_eq!(
+        blend(12, [128, 64, 32, 128], [16, 24, 48, 192], 255),
+        [47, 39, 55, 128]
+    );
 }

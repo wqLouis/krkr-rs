@@ -65,15 +65,14 @@
 //! * `wavetype` outside `0..=2` — the `switch` has no `default`
 //!   and would read an uninitialized (stale) `CurOmega`; rejected here.
 //!
-//! # Not ported
+//! # The blend
 //!
-//! `Process` dispatches on the destination layer type between
-//! `TVPConstAlphaBlend_SD`, `_a` (additive alpha) and `_d` (alpha-vs-alpha).
-//! The cross-fade mixes by the destination's alpha handling
-//! ([`DestAlpha`](super::DestAlpha)), but the wave names the straight-alpha
-//! type alone, which the generic handling does not single out, so the wave
-//! keeps [`blend_level`], the shared `TVPConstAlphaBlend_SD` arithmetic of
-//! the parent module.
+//! `Process` dispatches on the destination layer type between the plain
+//! blend, the additive-alpha blend and the alpha-vs-alpha blend. The wave
+//! applies the plain blend to every destination, so the destination's alpha
+//! handling ([`DestAlpha`](super::DestAlpha)) does not change the wave's
+//! mix: it keeps [`blend_level`], the four-channel arithmetic of the parent
+//! module.
 
 use super::{PI_TRUNCATED, Trans, TransError, argb_to_rgba, blend_level, read_pixel, write_pixel};
 use crate::layer_ops::{RectI, intersect};
