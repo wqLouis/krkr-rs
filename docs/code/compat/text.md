@@ -7,8 +7,10 @@ it recognises the KiriKiri `FE FE` container, byte-order marks, an explicit
 `Scripts.textEncoding` override, and — failing all of those — detects the
 charset.
 
-The same handling applies to the TJS native text streams
-(`crates/tjs/cpp/streams.cpp`).
+The TJS native text streams (`crates/tjs/cpp/streams.cpp`) use the same
+handling: the stream layer owns the `FE FE` container and the
+byte-order-mark branches, and it asks this module for the charset of a
+BOM-less payload (the text decode seam, [`binding.md`](binding.md) §4).
 
 ---
 
@@ -172,6 +174,7 @@ that was actually used.
 | `Scripts.execStorage` / `evalStorage` | the storage bytes are offered to the TJS2 **bytecode loader first**; only when the loader reports the input is not bytecode is it decoded as text |
 | `Scripts.compileStorage` | the same order |
 | the plugin text paths | `TextEncoding::Named` for a plugin that names a fixed encoding |
+| the TJS text read stream (`Array.load`) | the stream layer keeps the container and the byte-order-mark branches; a BOM-less payload is decoded here, through the text decode seam ([`binding.md`](binding.md) §4) |
 
 An undecodable script raises a typed error instead of producing mojibake.
 
@@ -212,6 +215,8 @@ loader as well.
 | `reported_decoding_names_the_encoding_path` | the label table |
 | `unsupported_charset_name_raises_a_typed_error` | only an unsupported *explicit* name is an error |
 | `crates/compat/tests/scripts.rs` | the loader order: bytecode first, then text; a corrupt script is a typed error |
+| `crates/compat/tests/streams.rs::array_load_decodes_a_shift_jis_storage_member` | the text read stream decodes a BOM-less Shift-JIS member as Japanese |
+| `crates/compat/tests/streams.rs::array_load_decodes_a_utf8_storage_member` | a BOM-less UTF-8 member still decodes as UTF-8 |
 
 ---
 

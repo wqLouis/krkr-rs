@@ -705,6 +705,24 @@ void tjs2_free_storage_bytes(void *data) {
     std::free(data);
 }
 
+// ---------------------------------------------------------------------------
+// Text decode seam
+//
+// The charset of a BOM-less text payload is the host's decision: the host
+// owns the detector, and the reference picks the charset from the bytes with
+// uchardet and remaps `SHIFT_JIS` to `cp932`
+// (`reference/cpp/core/base/TextStream.cpp:47-57`). One process-wide
+// registration, like the storage read seam above.
+// ---------------------------------------------------------------------------
+
+static tjs2_text_decode_fn g_text_decode = nullptr;
+static void *g_text_decode_user = nullptr;
+
+void tjs2_set_text_decode_callback(tjs2_text_decode_fn decode, void *user) {
+    g_text_decode = decode;
+    g_text_decode_user = user;
+}
+
 // The reference `TVPCannotOpenStorage`
 // (`reference/cpp/core/base/MsgIntfInc.h:22`).
 [[noreturn]] static void throw_cannot_open(const ttstr &name) {
@@ -933,8 +951,10 @@ class TextReadStream : public TJS::iTJSTextReadStream {
         }
 
         // Plain text: a byte-order mark selects UTF-16LE/BE or UTF-8. A
-        // BOM-less payload decodes as UTF-8, the default read encoding; the
-        // script decoder applies charset detection for legacy encodings.
+        // BOM-less payload takes the charset the host decides
+        // (`reference/cpp/core/base/TextStream.cpp:47-57`): the host owns the
+        // detector, so the stream asks for the decoding instead of assuming
+        // UTF-8.
         size_t off = 0;
         if(raw.size() >= 2 && raw[0] == 0xFF && raw[1] == 0xFE) {
             off = 2; // UTF-16LE BOM
@@ -950,7 +970,39 @@ class TextReadStream : public TJS::iTJSTextReadStream {
             text = utf8_to_utf16((const char *)raw.data() + off,
                                  raw.size() - off);
         } else if(!raw.empty()) {
-            text = utf8_to_utf16((const char *)raw.data(), raw.size());
+            decode_plain(raw);
+        }
+    }
+
+    // Decode a BOM-less payload with the host's charset decision.
+    //
+    // The reference picks the charset from the bytes and remaps `SHIFT_JIS`
+    // to `cp932` (`reference/cpp/core/base/TextStream.cpp:47-57`); the host
+    // owns that detector, so the stream asks for the decoding. Without a
+    // decoder the payload cannot be read, and the read raises instead of
+    // guessing an encoding.
+    void decode_plain(const std::vector<uint8_t> &raw) {
+        if(!g_text_decode) {
+            throw TJS::eTJSError(ttstr_from_utf8(
+                "no text decoder is installed for a BOM-less text stream"));
+        }
+        unsigned short *units = nullptr;
+        size_t count = 0;
+        char *message = nullptr;
+        int rc = g_text_decode(g_text_decode_user, raw.data(), raw.size(),
+                               &units, &count, &message);
+        if(rc != TJS2_TEXT_DECODE_OK) {
+            std::string reason = message ? std::string(message)
+                                         : std::string("text decode failed");
+            if(message)
+                tjs2_free_string(message);
+            throw TJS::eTJSError(ttstr_from_utf8(reason));
+        }
+        if(units) {
+            text.resize(count);
+            for(size_t i = 0; i < count; i++)
+                text[i] = (char16_t)units[i];
+            tjs2_free_storage_bytes(units);
         }
     }
 

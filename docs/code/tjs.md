@@ -83,6 +83,7 @@ the Rust side — no bindgen.
 | execution | `tjs2_exec_script`, `tjs2_eval`, and their UTF-16 (`_wide`) counterparts, `tjs2_load_bytecode`, `tjs2_compile_script` |
 | logging | `tjs2_set_log_cb` with the `LOG_DEBUG`/`LOG_INFO`/`LOG_WARN`/`LOG_ERROR` levels |
 | storage | `tjs2_set_storage_read_callback` — the process-wide read hook the text and binary stream factories use |
+| text decode | `tjs2_set_text_decode_callback` — the process-wide hook that decodes a BOM-less text payload into UTF-16 code units |
 | natives | `tjs2_register_native_class`, `…_class_ex`, `…_class_instance`, `…_native_static_members`, `…_native_instance_members` |
 | values | `tjs2_retain_value`, `tjs2_release_value`, `tjs2_invalidate_retained`, `tjs2_retain_object`, `tjs2_retain_retained_id`, `tjs2_find_retained_id` |
 | members | `tjs2_prop_get`, `tjs2_prop_set`, `tjs2_prop_delete`, `tjs2_prop_set_default`, `tjs2_call_value`, `tjs2_call_value_with_objthis`, `tjs2_call_member`, `tjs2_set_arg`, `tjs2_result_needed` |
@@ -161,6 +162,9 @@ when it is dropped, so a forgotten id (for example through
 * **The storage read callback is process-wide**, like the stream factories
   themselves: it must be installed before the scripts run and cleared before
   its user pointer dies.
+* **The text decode callback is process-wide** for the same reason: the text
+  read stream asks the host for the charset of a BOM-less payload, and the
+  host owns the detector.
 * **Every `unsafe` block carries a `SAFETY:` note**, and the crate is
   `deny(unsafe_code)` except where the FFI genuinely lives.
 

@@ -220,6 +220,43 @@ fn array_load_reads_a_storage_member() {
     assert_eq!(env.string("lines[2]"), "@clip left=0 top=60");
 }
 
+// reference/cpp/core/base/TextStream.cpp:47-57 — a BOM-less text payload takes
+// the charset the detector reports, and `SHIFT_JIS` maps to `cp932`; the
+// port's text read stream must decode a Shift-JIS member the way the script
+// loader decodes it, so the Japanese names survive
+// (reference/cpp/core/tjs2/tjsArray.cpp:254-345).
+#[test]
+fn array_load_decodes_a_shift_jis_storage_member() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    // The committed fixture holds real Shift-JIS bytes; reading it as UTF-8
+    // drops the Japanese name and leaves the first field empty.
+    let csv = include_bytes!("fixtures/charvoice_shiftjis.csv");
+    env.mount_xp3(&[("charvoice.csv", csv, false)]);
+
+    env.run("var lines = []; lines.load('data.xp3>charvoice.csv');");
+
+    assert_eq!(env.int("lines.length"), 3);
+    assert_eq!(env.string("lines[0]"), "七緒,nan%s_%03d,七緒,100");
+    assert_eq!(env.string("lines[1]"), "寧々,nen%s_%03d,寧々,100");
+    assert_eq!(env.string("lines[2]"), "めぐる,meg%s_%03d,めぐる,100");
+}
+
+// reference/cpp/core/base/TextStream.cpp:47-57 — a BOM-less payload takes the
+// charset the detector reports; a UTF-8 payload stays UTF-8, so the decode
+// of a UTF-8 member does not change.
+#[test]
+fn array_load_decodes_a_utf8_storage_member() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    let text = "寧々,nen%s_%03d,寧々,100\n";
+    env.mount_xp3(&[("charvoice.csv", text.as_bytes(), false)]);
+
+    env.run("var lines = []; lines.load('data.xp3>charvoice.csv');");
+
+    assert_eq!(env.string("lines[0]"), "寧々,nen%s_%03d,寧々,100");
+}
+
 // reference/cpp/core/base/StorageIntf.cpp:1131-1148 raises
 // `TVPCannotOpenStorage` when the storage cannot place the name, so the
 // factory never returns an empty stream (reference/cpp/core/tjs2/tjsArray.cpp:254-345).

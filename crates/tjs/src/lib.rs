@@ -87,6 +87,31 @@ pub type StorageReadFn = extern "C" fn(
     out_error: *mut *mut c_char,
 ) -> c_int;
 
+/// Text decode status: the payload was decoded and `out_units`/`out_len` are
+/// set.
+pub const TEXT_DECODE_OK: c_int = 0;
+/// Text decode status: the payload could not be decoded; `out_error` names
+/// why.
+pub const TEXT_DECODE_ERROR: c_int = 1;
+
+/// Decodes a BOM-less text payload into UTF-16 code units (the C ABI type in
+/// `cpp/tjs2_abi.h`).
+///
+/// `data`/`len` are the raw payload (not NUL-terminated). On
+/// [`TEXT_DECODE_OK`] the callback stores a malloc'd buffer of UTF-16 code
+/// units in *out_units (the stream layer frees it with
+/// `tjs2_free_storage_bytes`) and the unit count in *out_len. On
+/// [`TEXT_DECODE_ERROR`] it may store a malloc'd UTF-8 message in *out_error
+/// (freed with `tjs2_free_string`).
+pub type TextDecodeFn = extern "C" fn(
+    user: *mut c_void,
+    data: *const u8,
+    len: usize,
+    out_units: *mut *mut u16,
+    out_len: *mut usize,
+    out_error: *mut *mut c_char,
+) -> c_int;
+
 /// Callback for console output / logs from the VM. `msg` is UTF-8 and only
 /// valid for the duration of the call.
 pub type LogCb = extern "C" fn(level: c_int, msg: *const c_char, user: *mut c_void);
@@ -375,6 +400,7 @@ unsafe extern "C" {
     fn tjs2_create() -> *mut Engine;
     fn tjs2_set_data_dir_checked(dir: *const c_char, out_error: *mut *mut c_char) -> c_int;
     fn tjs2_set_storage_read_callback(read: Option<StorageReadFn>, user: *mut c_void);
+    fn tjs2_set_text_decode_callback(decode: Option<TextDecodeFn>, user: *mut c_void);
     fn tjs2_destroy(e: *mut Engine);
     fn tjs2_set_log_cb(e: *mut Engine, cb: LogCb, user: *mut c_void);
     fn tjs2_exec_script(
@@ -1034,6 +1060,22 @@ pub struct NativeInstanceMembers<'a> {
 pub unsafe fn set_storage_read_callback(read: Option<StorageReadFn>, user: *mut c_void) {
     // SAFETY: the caller upholds the user-pointer contract above.
     unsafe { tjs2_set_storage_read_callback(read, user) }
+}
+
+/// Install (or clear) the text decode callback the text read factory uses.
+///
+/// A BOM-less text payload takes the charset the host decides, because the
+/// host owns the detector; the stream layer owns the container and the
+/// byte-order-mark branches. The registration is process-wide, like the
+/// factories themselves: install it before scripts run and clear it before
+/// `user` dies.
+///
+/// # Safety
+/// `user` must stay valid for every VM call until the callback is cleared with
+/// `None`, and `decode` must follow the `cpp/tjs2_abi.h` contract.
+pub unsafe fn set_text_decode_callback(decode: Option<TextDecodeFn>, user: *mut c_void) {
+    // SAFETY: the caller upholds the user-pointer contract above.
+    unsafe { tjs2_set_text_decode_callback(decode, user) }
 }
 
 impl Tjs2Engine {

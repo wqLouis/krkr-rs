@@ -127,6 +127,38 @@ void tjs2_set_storage_read_callback(tjs2_storage_read_fn read, void *user);
 
 /* Free a buffer a storage read callback returned. */
 void tjs2_free_storage_bytes(void *data);
+
+/*
+ * Text decode seam for the text read factory.
+ *
+ * The stream layer owns the `FE FE` container and the byte-order-mark
+ * branches of a text payload; the charset of a BOM-less payload is the
+ * host's decision, because the host owns the detector. The reference picks
+ * the charset from the bytes with uchardet and remaps `SHIFT_JIS` to
+ * `cp932` (reference/cpp/core/base/TextStream.cpp:47-57), so a BOM-less
+ * Shift-JIS member reads as Japanese instead of as mojibake.
+ *
+ * `data`/`len` are the raw payload (not NUL-terminated). On
+ * TJS2_TEXT_DECODE_OK the callback stores a malloc'd buffer of UTF-16 code
+ * units in *out_units (freed by the stream layer with
+ * tjs2_free_storage_bytes) and the unit count in *out_len. On
+ * TJS2_TEXT_DECODE_ERROR it may store a malloc'd UTF-8 message in *out_error
+ * (freed with tjs2_free_string).
+ */
+#define TJS2_TEXT_DECODE_OK 0
+#define TJS2_TEXT_DECODE_ERROR 1
+
+typedef int (*tjs2_text_decode_fn)(void *user,
+                                   const unsigned char *data, size_t len,
+                                   unsigned short **out_units, size_t *out_len,
+                                   char **out_error);
+
+/*
+ * Install (or, with a NULL callback, clear) the text decode callback. One
+ * process-wide registration; `user` is owned by the installer and must
+ * outlive the registration.
+ */
+void tjs2_set_text_decode_callback(tjs2_text_decode_fn decode, void *user);
 void tjs2_destroy(tjs2_engine *e);
 
 /* Set the console output / log callback (may be NULL). */

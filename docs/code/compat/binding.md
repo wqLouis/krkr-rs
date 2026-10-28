@@ -64,9 +64,10 @@ outlive the binding.
    process, so a second install is a bug, not a re-binding:
    `CompatError::Register("compat binding already installed")`.
 2. Stores the four addresses.
-3. Installs the **storage read seam** into the VM (see §3).
+3. Installs the **storage read seam** into the VM (see §3) and the **text
+   decode seam** (see §4).
 
-`uninstall()` clears the storage seam first (passing no user pointer) and then
+`uninstall()` clears both seams first (passing no user pointer) and then
 empties the table. `CompatHost::Drop` calls it, and `CompatHost::uninstall`
 calls it explicitly, so a host that re-installs against a different engine
 starts from a clean table.
@@ -109,7 +110,36 @@ still reports the error status.
 
 ---
 
-## 4. Why the addresses are stable
+## 4. The text decode seam
+
+The VM's text read stream — the one `Array.load` opens — owns the `FE FE`
+container and the byte-order-mark branches of a payload, but the **charset
+of a BOM-less payload is the host's decision**, because the host owns the
+detector ([`text.md`](text.md)):
+
+```rust
+tjs::set_text_decode_callback(Some(text_decode), ptr::null_mut());
+```
+
+`text_decode` decodes the raw payload with `crate::text`'s detector and hands
+the stream UTF-16 code units:
+
+| Situation | Result |
+|---|---|
+| the payload decodes | `TEXT_DECODE_OK` with a malloc'd buffer of UTF-16 code units and their count |
+| the payload cannot be decoded | `TEXT_DECODE_ERROR` with the error message |
+| a null result slot | `TEXT_DECODE_ERROR` |
+| the allocation fails | `TEXT_DECODE_ERROR` |
+
+The reference picks the charset of a BOM-less payload from the bytes with
+uchardet and remaps `SHIFT_JIS` to `cp932`
+(`reference/cpp/core/base/TextStream.cpp:47-57`), so a BOM-less Shift-JIS
+member reads as Japanese instead of as mojibake. The seam carries no user
+pointer: the detector is a pure function of the bytes.
+
+---
+
+## 5. Why the addresses are stable
 
 The binding stores the **address** of the engine and of the services, so both
 must stay at a stable address for as long as the binding is installed. Two
@@ -124,7 +154,7 @@ things guarantee that:
 
 ---
 
-## 5. Tests
+## 6. Tests
 
 The binding is not directly testable — it is process-global and single. It is
 covered **indirectly** by every test that installs a compat host, and

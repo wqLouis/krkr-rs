@@ -99,6 +99,10 @@ pub(crate) fn install(
     // through this seam. SAFETY: `services` is the boxed host state recorded
     // by the binding and outlives it; `uninstall` clears the seam first.
     unsafe { tjs::set_storage_read_callback(Some(storage_read), services as *mut c_void) };
+    // The VM's text read stream asks the host for the charset of a BOM-less
+    // payload; the host owns the detector. SAFETY: the callback carries no
+    // user pointer, and `uninstall` clears the seam first.
+    unsafe { tjs::set_text_decode_callback(Some(text_decode), ptr::null_mut()) };
     Ok(())
 }
 
@@ -106,6 +110,8 @@ pub(crate) fn install(
 pub(crate) fn uninstall() {
     // SAFETY: clearing the seam passes no user pointer.
     unsafe { tjs::set_storage_read_callback(None, ptr::null_mut()) };
+    // SAFETY: clearing the seam passes no user pointer.
+    unsafe { tjs::set_text_decode_callback(None, ptr::null_mut()) };
     *lock() = None;
 }
 
@@ -219,4 +225,76 @@ extern "C" fn storage_read(
         Err(StorageReadError::NotFound(_)) => tjs::STORAGE_READ_NOT_FOUND,
         Err(error) => storage_failure(out_error, &error.to_string()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Text decode seam for the TJS text read stream
+// ---------------------------------------------------------------------------
+
+/// Stores a malloc'd UTF-8 message in `out_error` and returns the decode
+/// failure status.
+fn text_decode_failure(out_error: *mut *mut c_char, message: &str) -> c_int {
+    if !out_error.is_null() {
+        let bytes = message.as_bytes();
+        // SAFETY: tjs2_malloc is malloc-compatible; the stream layer frees
+        // the NUL-terminated copy with tjs2_free_string.
+        unsafe {
+            let buf = tjs::tjs2_malloc(bytes.len() + 1) as *mut u8;
+            if !buf.is_null() {
+                ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+                *buf.add(bytes.len()) = 0;
+                *out_error = buf as *mut c_char;
+            }
+        }
+    }
+    tjs::TEXT_DECODE_ERROR
+}
+
+/// The text decoding the VM's text read stream asks for a BOM-less payload.
+///
+/// The stream layer owns the `FE FE` container and the byte-order-mark
+/// branches; the charset of a BOM-less payload is the host's decision,
+/// because the host owns the detector ([`crate::text`]). A BOM-less
+/// Shift-JIS payload therefore decodes as Japanese, exactly as the script
+/// loader decodes it.
+extern "C" fn text_decode(
+    _user: *mut c_void,
+    data: *const u8,
+    len: usize,
+    out_units: *mut *mut u16,
+    out_len: *mut usize,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if out_units.is_null() || out_len.is_null() {
+        return text_decode_failure(out_error, "text decode: null result slot");
+    }
+    // SAFETY: the ABI passes both result slots writable for the call.
+    unsafe {
+        *out_units = ptr::null_mut();
+        *out_len = 0;
+    }
+    // SAFETY: the ABI passes a readable byte range for the call.
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    let units = match crate::text::decode_text_units(bytes, crate::text::TextEncoding::Detect) {
+        Ok(units) => units,
+        Err(message) => return text_decode_failure(out_error, &message),
+    };
+    if units.is_empty() {
+        return tjs::TEXT_DECODE_OK;
+    }
+    let byte_len = units.len() * std::mem::size_of::<u16>();
+    // SAFETY: tjs2_malloc is malloc-compatible; the stream layer frees the
+    // buffer with tjs2_free_storage_bytes.
+    let buffer = unsafe { tjs::tjs2_malloc(byte_len) } as *mut u16;
+    if buffer.is_null() {
+        return text_decode_failure(out_error, "text decode: out of memory");
+    }
+    // SAFETY: the allocation holds `units.len()` code units.
+    unsafe { ptr::copy_nonoverlapping(units.as_ptr(), buffer, units.len()) };
+    // SAFETY: the ABI passes both result slots writable for the call.
+    unsafe {
+        *out_units = buffer;
+        *out_len = units.len();
+    }
+    tjs::TEXT_DECODE_OK
 }
