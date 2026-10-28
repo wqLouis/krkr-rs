@@ -88,8 +88,8 @@ whether it is an archive or a folder. The root reconstructs it:
 
 | launch | project path |
 |---|---|
-| directory (D35 scan, loose or archive-only) | the conventional `data.xp3` when it mounted, else the scanned archive with the boot scripts, else the directory (folder project) |
-| an explicit `--archive` list | the named archive with the boot scripts, else the first named archive (archive project) |
+| directory (D35 scan, loose or archive-only) | the conventional `data.xp3` when it mounted, else the scanned archive with the boot scripts and the most entries, else the directory (folder project) |
+| an explicit `--archive` list | the named archive with the boot scripts and the most entries, else the first named archive (archive project) |
 
 The "boot scripts" are `startup.tjs` and `system/Initialize.tjs` (an archive
 entry lookup is case-insensitive, so either spelling finds the same entry).
@@ -99,6 +99,20 @@ a project candidate; the app cannot use it as the project archive, and the
 next candidate is used. The project archive is searched first, so a later
 `patch.xp3` overrides an earlier `data.xp3` only when `data.xp3` is not the
 project.
+
+Several archives can hold the boot scripts: a game ships the archive it is
+played from and a patch archive, and the patch carries a copy of
+`startup.tjs`. The reference takes the project from its launcher — the
+command-line archive, or the archive the file selector picks
+(`reference/cpp/core/environ/win32/Platform.cpp:89-104`,
+`reference/cpp/core/environ/ui/MainFileSelectorForm.cpp:135-145`); a
+directory launch has no user, so the root picks the data archive — the
+boot-script archive with the most entries. The patch holds the changed files
+only and the game registers it itself as an auto path
+(`Storages.addAutoPath("patch.xp3>")`), so the patch's files are reached
+through the auto path and not through the project, while the data archive's
+folders (`system/`, `scenario/`, `rule/`, …) are the ones the game's relative
+auto paths name.
 
 A relative `Storages.addAutoPath("system/")` resolves against the project
 path, so it scopes to the project archive when the launch names one and to
@@ -269,15 +283,17 @@ and balances the gap, and a later frame replaces the attribution), the
 order, with a missing directory tolerated), the project-path choice (the
 `directory_project` and `explicit_project` cases: the conventional `data.xp3`,
 its case-insensitive spelling, an unmounted `data.xp3` skipped for the
-boot-script archive, the boot-script archive, the folder fallback, an
+boot-script archive, the boot-script archive, the data archive over a
+patch archive, the folder fallback, an
 unmounted `data.xp3` leaving the folder as the project, the explicit named
-archive, the explicit boot-script archive, and the explicit first named
+archive, the explicit boot-script archive, the explicit data archive over a
+patch archive, and the explicit first named
 archive), the input mapping (a pointer and a touch mapped into VM pixels, a
 key passed through), and the service-attachment order (the `xp3filter` seam is
 installed by `GameHost::open`).
 
 The project-path tests that drive a real launch live in
-`crates/app/src/game.rs`: `storage_has_boot_scripts_reads_the_mounted_archives`
+`crates/app/src/game.rs`: `boot_script_entries_reads_the_mounted_archives`
 mounts real XP3 bytes and reads the boot scripts out of them (`startup.tjs`,
 `system/Initialize.tjs`, neither, and a relative archive path);
 `directory_launch_skips_an_unmountable_data_archive` opens a game whose

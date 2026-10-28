@@ -353,8 +353,9 @@ locations, and the complete list at `trace`.
 * **The project path of a directory launch is reconstructed.** The D35 scan
   mounts the discovered archives, and the root rebuilds the project from what
   the scanned folder holds: the conventional `data.xp3` when it mounted, else
-  the archive with the boot scripts, else the folder. An explicit archive list
-  takes the archive with the boot scripts, else the first named one. A
+  the boot-script archive with the most entries, else the folder. An explicit
+  archive list takes the archive with the boot scripts and the most entries,
+  else the first named one. A
   relative `Storages.addAutoPath("system/")` resolves against that project, so
   it scopes to the project archive; a folder project resolves it against the
   app directory.
