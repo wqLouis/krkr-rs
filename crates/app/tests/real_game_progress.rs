@@ -102,7 +102,12 @@ impl log::Log for CaptureLogger {
 fn install_capture() {
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| {
-        let _ = log::set_boxed_logger(Box::new(CaptureLogger));
+        // The logger is process-global: a logger another test installed is
+        // not an error here, and the check below says whether the capturing
+        // sink is the one that records.
+        if let Err(error) = log::set_boxed_logger(Box::new(CaptureLogger)) {
+            eprintln!("the log sink is already taken: {error}");
+        }
         log::set_max_level(log::LevelFilter::Debug);
     });
     log::info!("kag progress capture probe");

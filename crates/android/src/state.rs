@@ -106,7 +106,7 @@ impl FailureKind {
 fn default_kind(state: State) -> Option<FailureKind> {
     match state {
         State::Failed => Some(FailureKind::Reported),
-        _ => None,
+        State::Starting | State::Running | State::Stopped => None,
     }
 }
 

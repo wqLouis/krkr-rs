@@ -174,12 +174,11 @@ fn read_i32(bytes: &[u8], at: usize) -> i32 {
 
 /// Builds a single-lane (grayscale) TLG6 file out of a four-lane one.
 ///
-/// A file with a single colour channel stores one residual lane, the
-/// luminance, and every block of it uses the identity colour filter
-/// (`krkrz/krkrz@fd5c4baa visual/SaveTLG6.cpp:1237-1243`); the loader
-/// decodes that one lane only and leaves the other three bytes of the
-/// scanline word undefined
-/// (`krkrz/krkrz@fd5c4baa visual/LoadTLG.cpp:318-350`).
+/// A file with fewer than three colour channels uses the identity colour
+/// filter (`reference/cpp/core/visual/SaveTLG6.cpp:1185-1191`); the loader
+/// decodes the single lane only and leaves the other three bytes of the
+/// scanline word undefined (`reference/cpp/core/visual/LoadTLG.cpp:268-276`,
+/// `:315-350`).
 ///
 /// The four-lane file must hold a single block, so that its first block
 /// uses the identity filter and its first lane is the whole image.
@@ -218,9 +217,12 @@ fn grayscale_tlg6(four_lane: &[u8], w: usize, h: usize) -> Vec<u8> {
     out
 }
 
-/// The colour channels of a decoded TLG6 image keep their places: the
-/// word's byte 2 is the red one, its byte 1 the green and its byte 0 the
-/// blue (`krkrz/krkrz@fd5c4baa visual/gl/tlg_sse2.cpp:413-415`).
+/// The colour channels of a decoded TLG6 image keep their places: the file's
+/// first residual lane is the blue one and its third lane the red one
+/// (`reference/cpp/core/visual/tvpgl.cpp:12431-12434` names the lanes of
+/// the packed residual, `:12362-12368` places them in the scanline word, and
+/// `reference/cpp/core/visual/LayerBitmapIntf.h:20-22` gives the scanline's
+/// byte order).
 #[test]
 fn tlg6_channels_land_in_the_named_channels() {
     let (w, h) = (8usize, 8usize);
@@ -262,9 +264,9 @@ fn tlg6_channels_land_in_the_named_channels() {
 }
 
 /// A one-channel TLG6 file stores the luminance in its single lane, which
-/// the decoder keeps in the word's first byte
-/// (`krkrz/krkrz@fd5c4baa visual/LoadTLG.cpp:318-350`: only the first lane
-/// is decoded, and the zero line of a one-channel file is transparent black,
+/// the decoder reads as the image's blue byte
+/// (`reference/cpp/core/visual/LoadTLG.cpp:315-350`: only the first lane is
+/// decoded, and the zero line of a one-channel file is transparent black,
 /// `:276`). The decoder presents it as a gray pixel with an opaque alpha.
 #[test]
 fn tlg6_grayscale_expands_the_single_lane() {

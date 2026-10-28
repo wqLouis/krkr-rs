@@ -8,17 +8,18 @@
 //! interval replays the intervals it missed, so the script sees one fire per
 //! elapsed interval however the frames are spread.
 //!
-//! reference/cpp/core/utils/impl/TimerImpl.cpp:118-148 — the timer thread
-//! computes n = (curtick - NextTick) / Interval, increments it and triggers
-//! the timer n times, re-arming from the deadline it missed. Our registry
+//! The timer thread computes n = (curtick - NextTick) / Interval, increments
+//! it and triggers the timer n times, re-arming from the deadline it missed
+//! (`reference/cpp/core/utils/impl/TimerImpl.cpp:118-148`). Our registry
 //! replays the same n intervals in the frame that covered them.
 //!
 //! The continuous handler follows the *frames*: it runs once per frame.
 //!
-//! reference/cpp/core/base/EventIntf.cpp:868 — the continuous events are
-//! delivered in the event-delivery phase, and the frame's draw flags that
-//! phase for the next idle (reference/cpp/core/visual/impl/
-//! VSyncTimingThread.cpp:141-142), so the handler runs once per frame.
+//! The continuous events are delivered in the event-delivery phase, and the
+//! frame's draw flags that phase for the next idle
+//! (`reference/cpp/core/base/EventIntf.cpp:868`,
+//! `reference/cpp/core/visual/impl/VSyncTimingThread.cpp:141-142`), so the
+//! handler runs once per frame.
 //!
 //! The test drives a real game host over a temporary directory, so the
 //! counters come from the same path a game runs: the L4 VM host, the L3
@@ -58,10 +59,10 @@ const FRAME_MS: f32 = 1000.0 / 60.0;
 /// value is 999. The deadlines 10, 20, ... 990 are therefore due and the one
 /// at 1000 ms is not: ninety-nine fires.
 ///
-/// reference/cpp/core/utils/impl/TimerImpl.cpp:118-148 — the timer fires once
-/// per elapsed interval, so the count follows the clock and not the frame
-/// count.
-const FIRES_PER_SECOND: i64 = 99;
+/// The timer fires once per elapsed interval, so the count follows the clock
+/// and not the frame count
+/// (`reference/cpp/core/utils/impl/TimerImpl.cpp:118-148`).
+const FIRES_PER_RUN: i64 = 99;
 
 /// A unique temporary directory, removed by the caller.
 fn unique_temp_dir(tag: &str) -> PathBuf {
@@ -121,15 +122,15 @@ fn run_frames(tag: &str, frames: i64, frame_ms: f32) -> (i64, i64) {
 /// The same elapsed second is run twice: once in 60 frames and once in 30.
 ///
 /// The timer fires once per elapsed 10 ms interval: its first deadline is
-/// one interval out and the clock reaches 1000 ms, so a hundred deadlines
-/// are due and the timer fires a hundred times — in both runs, because the
+/// one interval out and the clock reaches 999 ms, so ninety-nine deadlines
+/// are due and the timer fires ninety-nine times — in both runs, because the
 /// registry replays the intervals a frame covered. A frame covers one or two
 /// intervals in the fine split and three or four in the coarse one, so no
 /// frame's backlog reaches the capacity of six postings and none is
 /// dropped.
 ///
-/// reference/cpp/core/utils/TimerIntf.cpp:69-111 — the capacity bounds the
-/// `onTimer` postings still outstanding for a timer.
+/// The capacity bounds the `onTimer` postings still outstanding for a timer
+/// (`reference/cpp/core/utils/TimerIntf.cpp:69-111`).
 ///
 /// The continuous handler runs once per frame, so its count is the frame
 /// count.
@@ -160,13 +161,13 @@ fn a_script_timer_follows_the_clock_and_a_continuous_handler_follows_the_frames(
     );
 
     assert_eq!(
-        fires_fine, FIRES_PER_SECOND,
+        fires_fine, FIRES_PER_RUN,
         "the timer must fire once per elapsed interval: {fires_fine} fires over \
          {FRAMES} frames"
     );
     assert_eq!(
         fires_coarse,
-        FIRES_PER_SECOND,
+        FIRES_PER_RUN,
         "the timer must fire once per elapsed interval: {fires_coarse} fires over \
          {} frames",
         FRAMES / 2

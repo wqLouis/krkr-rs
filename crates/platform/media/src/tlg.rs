@@ -20,11 +20,11 @@
 //!   Golomb → per-line block decode with the color filter chain and the
 //!   MED/average predictors (this also performs the zigzag de-interleave).
 //!
-//! Pixel byte order: the decoder produces the engine's 32bpp scanline
-//! word, `0xAARRGGBB`, whose bytes in memory are blue, green, red and
-//! alpha. The RGBA8 output here is `[R, G, B, A]`, so the word's byte 0
-//! (the file's first residual lane, the blue one) becomes the blue channel
-//! and its byte 2 (the file's third lane, the red one) the red channel.
+//! Pixel byte order: the decoder works on 32bpp scanline words,
+//! `0xAARRGGBB`, whose bytes in memory are blue, green, red and alpha.
+//! The RGBA8 output here is `[R, G, B, A]`, so the word's byte 0 (the
+//! file's first residual lane, the blue one) becomes the blue channel and
+//! its byte 2 (the file's third lane, the red one) the red channel.
 
 use image::RgbaImage;
 
@@ -995,8 +995,9 @@ const fn build_golomb_bit_length_table() -> [[u8; 4]; TLG6_GOLOMB_TABLE_LEN] {
 mod tests {
     use super::write_word_pixel;
 
-    /// The decoded scanline word is `0xAARRGGBB`: byte 0 is blue, byte 1
-    /// green, byte 2 red and byte 3 alpha
+    /// The decoder's intermediate word is `0xAARRGGBB`: byte 0 is blue,
+    /// byte 1 green, byte 2 red and byte 3 alpha, so the word's byte 0
+    /// carries the file's first residual lane and its byte 2 the file's third
     /// (`krkrz/krkrz@fd5c4baa visual/gl/tlg_sse2.cpp:413-415`).
     #[test]
     fn word_bytes_land_in_the_named_channels() {

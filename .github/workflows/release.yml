@@ -182,14 +182,6 @@ jobs:
           # passed on the command line rather than in the step's env.
           sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
             apt-get -o Dpkg::Use-Pty=0 update
-          # apt must not wait for an answer that never comes on a runner:
-          # the frontend must not prompt, needrestart must not offer to
-          # restart services (it does on Ubuntu 24.04 and later, and it
-          # waits), and Dpkg::Use-Pty=0 keeps dpkg off a pty so it cannot
-          # ask. `sudo` resets the environment, so the variables are
-          # passed on the command line rather than in the step's env.
-          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
-            apt-get -o Dpkg::Use-Pty=0 update
           sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
             apt-get -o Dpkg::Use-Pty=0 install -y --no-install-recommends bison
 
