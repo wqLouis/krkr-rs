@@ -1,15 +1,10 @@
 //! L2 transition state machine.
 //!
-//! Models the TVP `Trans` machine (universal/uni, slide, cross-fade, mask,
-//! …) as explicit L2 state over the [`crate::layer_ops`] primitives. L3
-//! exposes the script `Trans` object.
+//! Models the script `Trans` machine (universal/uni, slide, cross-fade,
+//! mask, …) as explicit L2 state over the [`crate::layer_ops`] primitives.
+//! L3 exposes the script `Trans` object.
 //!
-//! Behavioral reference: the reference transition handlers in
-//! `reference/cpp/core/visual/TransIntf.cpp` (`tTVPCrossFadeTransHandler`,
-//! `tTVPUniversalTransHandler`, `tTVPScrollTransHandler`) and their providers
-//! (`TVPRegisterDefaultTransHandlerProvider`). `main`'s
-//! `crates/tvp-natives/src/extrans.rs` only classifies the names; the
-//! interpolation lives here.
+//! The names are classified by L3; the interpolation lives here.
 //!
 //! # The state machine
 //!
@@ -20,13 +15,13 @@
 //! [`Trans::step`] with the elapsed milliseconds each frame and
 //! [`Trans::apply`] once per frame to render.
 //!
-//! The reference advances a `phase` from `0` to `PhaseMax`; this model keeps
+//! A transition advances a `phase` from `0` to `PhaseMax`; this model keeps
 //! both the normalized [`Trans::progress`] (`0.0..=1.0`) and the integer
-//! [`Trans::phase`] so the ports of the reference blend tables stay exact.
+//! [`Trans::phase`] so the blend tables stay exact.
 //!
 //! # Kinds
 //!
-//! | kind | reference provider | options |
+//! | kind | provider | options |
 //! |---|---|---|
 //! | [`TransKind::CrossFade`] | `crossfade` | blend src1 → src2 |
 //! | [`TransKind::Universal`] | `universal` | `vague`, rule image |
@@ -34,8 +29,7 @@
 //! | [`TransKind::Scroll`] | `scroll` | `from`, `stay` |
 //!
 //! All of them are `ttExchange` (two sources). A rule image is a
-//! [`RuleMask`] tiled over the source, exactly like
-//! `iTVPSimpleImageProvider::LoadImage` tiles a smaller rule graphic.
+//! [`RuleMask`] tiled over the source.
 //!
 //! # The mix
 //!
@@ -129,13 +123,11 @@ pub enum DestAlpha {
 /// The transition algorithm and its parameters.
 ///
 /// The `crossfade`/`universal`/`mask`/`scroll` kinds are the engine's own
-/// providers (`TVPRegisterDefaultTransHandlerProvider`); the remaining seven
-/// are the `extrans.dll` providers (`ttExchange`/`tutDivisible`), ported from
-/// the plugin sources in `sample/extrans` (`wave.cpp`, `mosaic.cpp`,
-/// `turn.cpp`, `rotatetrans.cpp`, `ripple.cpp`).
+/// providers; the remaining seven are the `extrans` plugin's providers
+/// (`ttExchange`/`tutDivisible`).
 ///
-/// Their real-valued options are kept as the reference reads them (`double`),
-/// so this enum is `PartialEq` but not `Eq`.
+/// Their real-valued options are kept as the script reads them (`double`), so
+/// this enum is `PartialEq` but not `Eq`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum TransKind {
@@ -144,13 +136,13 @@ pub enum TransKind {
     /// ([`DestAlpha`]).
     CrossFade,
     /// `universal`: a rule-image blend whose soft edge is `vague` pixels
-    /// wide (the reference's `vague` option, default 64).
+    /// wide (the `vague` option, default 64).
     Universal {
         /// Soft-transition width in phase units.
         vague: i32,
     },
-    /// A hard-edged rule-image transition (the reference `universal` with
-    /// `vague = 0`): the rule's grayscale value selects the source per pixel.
+    /// A hard-edged rule-image transition (`universal` with `vague = 0`): the
+    /// rule's grayscale value selects the source per pixel.
     Mask,
     /// `scroll`: translate both sources across the destination.
     Scroll {
@@ -160,7 +152,7 @@ pub enum TransKind {
         stay: ScrollStay,
     },
     /// `wave`: a travelling sine-wave displacement between the sources, over
-    /// a two-colour background (`wave.cpp`).
+    /// a two-colour background.
     Wave {
         /// Peak displacement in pixels (`maxh`, default 50).
         max_height: i32,
@@ -173,19 +165,19 @@ pub enum TransKind {
         /// Wave shape selector (`wavetype`, default 0).
         wave_type: i32,
     },
-    /// `mosaic`: a blocky dissolve into the second source (`mosaic.cpp`).
+    /// `mosaic`: a blocky dissolve into the second source.
     Mosaic {
         /// Peak block size in pixels (`maxsize`, default 30).
         max_size: i32,
     },
     /// `turn`: a diamond warp between the sources over a flat background
-    /// (`turn.cpp`).
+    /// over a flat background.
     Turn {
         /// Colour revealed by the warp (`bgcolor`, ARGB).
         background: i64,
     },
     /// `rotatezoom`: rotate and zoom out with an optional twist
-    /// (`rotatetrans.cpp`).
+    /// with an optional twist.
     RotateZoom {
         /// Initial zoom factor (`factor`, default 1).
         factor: f64,
@@ -195,11 +187,11 @@ pub enum TransKind {
         twist: f64,
         /// Twist acceleration in turns (`twistaccel`, default -2).
         twist_accel: f64,
-        /// Rotation centre; the reference defaults it to the image centre.
+        /// Rotation centre; it defaults to the image centre.
         center: Option<(i32, i32)>,
     },
     /// `rotatevanish`: rotate with an accelerating twist while shrinking to a
-    /// point (`rotatetrans.cpp`).
+    /// point.
     RotateVanish {
         /// Shrink acceleration (`accel`, default 2).
         accel: f64,
@@ -207,26 +199,26 @@ pub enum TransKind {
         twist: f64,
         /// Twist acceleration in turns (`twistaccel`, default 2).
         twist_accel: f64,
-        /// Rotation centre; the reference defaults it to the image centre.
+        /// Rotation centre; it defaults to the image centre.
         center: Option<(i32, i32)>,
     },
     /// `rotateswap`: a rotating, shrinking swap to the second source over a
-    /// flat background (`rotatetrans.cpp`).
+    /// flat background.
     RotateSwap {
         /// Colour revealed by the rotation (`bgcolor`, ARGB).
         background: i64,
         /// Twist in turns (`twist`, default 1).
         twist: f64,
-        /// Rotation centre; the reference defaults it to the image centre.
+        /// Rotation centre; it defaults to the image centre.
         center: Option<(i32, i32)>,
     },
-    /// `ripple`: a radial ripple expanding from a centre (`ripple.cpp`).
+    /// `ripple`: a radial ripple expanding from a centre.
     Ripple {
-        /// Ripple centre; the reference defaults it to the image centre and
-        /// rejects a centre outside the image.
+        /// Ripple centre; it defaults to the image centre and a centre outside
+        /// the image is rejected.
         center: Option<(i32, i32)>,
-        /// Ripple map size (`rwidth`, default 128; the reference accepts only
-        /// 16, 32, 64 or 128).
+        /// Ripple map size (`rwidth`, default 128; only 16, 32, 64 or 128 are
+        /// accepted).
         map_width: i32,
         /// Wave roundness (`roundness`, default 1.0; must be positive).
         roundness: f32,
@@ -240,8 +232,8 @@ pub enum TransKind {
 
 /// A grayscale rule image for [`TransKind::Universal`] / [`TransKind::Mask`].
 ///
-/// The reference's image provider decodes the rule to 8bpp and tiles it when
-/// it is smaller than the source; [`RuleMask::at`] does the same.
+/// The rule is decoded to 8bpp and tiled when it is smaller than the
+/// source; [`RuleMask::at`] does the same.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RuleMask {
@@ -323,7 +315,7 @@ impl RuleMask {
     }
 
     /// The grayscale value at `(x, y)`, tiling the rule when it is smaller
-    /// than the source (reference `LoadImage` tiling).
+    /// than the source.
     pub fn at(&self, x: i32, y: i32) -> u8 {
         let w = self.width as i32;
         let h = self.height as i32;
@@ -375,8 +367,7 @@ pub enum TransError {
         /// Source 2 `(width, height)`.
         src2: (u32, u32),
     },
-    /// An `extrans` option is outside the range the reference accepts (its
-    /// `TVPThrowExceptionMessage` in `StartTransition`).
+    /// An `extrans` option is outside the range the script accepts.
     #[error("invalid transition option {option}: {reason}")]
     InvalidOption {
         /// The option name as the script spells it.
@@ -662,8 +653,7 @@ impl Trans {
     // -- rendering ---------------------------------------------------------
 
     /// Composite `src1`/`src2` into `dst` at the current phase, restricted to
-    /// `region` (half-open `[x0, y0, x1, y1)`, the reference processing
-    /// rectangle).
+    /// `region` (half-open `[x0, y0, x1, y1)`).
     ///
     /// Endpoints are exact: at `phase == 0` the destination is a copy of
     /// `src1`, at `phase == phase_max` a copy of `src2`.
@@ -688,7 +678,7 @@ impl Trans {
             return Ok(());
         }
         // Every `ttExchange` provider is `tutDivisible`/`tutDivisibleFade`:
-        // the reference short-circuits the two endpoints, so the result at
+        // the two endpoints are short-circuited, so the result at
         // `phase == 0` is source 1 verbatim and at `phase == phase_max`
         // source 2 verbatim. `scroll` is positional and does its own
         // clipping, so it stays outside this.
@@ -1042,8 +1032,7 @@ fn scroll_placements(
     let mut rs1 = (s1l, s1t, w + s1l, h + s1t);
     let mut rs2 = (s2l, s2t, w + s2l, h + s2t);
 
-    // Priority resolution: exactly the reference `Blend` ordering, where each
-    // adjustment sees the previous one.
+    // Priority resolution: each adjustment sees the previous one.
     if stay == StayDest {
         if horizontal {
             if rs2.2 >= rs1.0 && rs2.2 < rs1.2 {
@@ -1106,9 +1095,9 @@ fn scroll_source_rects(frame: RectI, placement: ScrollPlacement) -> Option<(Rect
 
 /// Validate the `extrans` options that do not depend on the source size.
 ///
-/// The reference rejects bad options in `StartTransition` — that is, while
-/// the script is calling `Layer.beginTransition` — so the size-independent
-/// half of each provider's checks runs here, at construction. The rest (a
+/// Bad options are rejected while the script is calling
+/// `Layer.beginTransition`, so the size-independent half of each provider's
+/// checks runs here, at construction. The rest (a
 /// centre inside the image, `maxdrift` below both dimensions) can only be
 /// checked once the sources are known and stays in the provider's `apply`.
 fn validate_options(kind: TransKind) -> Result<(), TransError> {
@@ -1180,9 +1169,8 @@ pub(crate) fn argb_to_rgba(color: i64) -> [u8; 4] {
     ]
 }
 
-/// Per-channel `src1 + (src2 - src1) * opa / 256`, the reference
-/// `TVPConstAlphaBlend_SD`/`TVPUnivTransBlend` arithmetic for straight-alpha
-/// RGBA. `opa` is `0..=256`.
+/// Per-channel `src1 + (src2 - src1) * opa / 256`, the constant-alpha
+/// blend arithmetic for straight-alpha RGBA. `opa` is `0..=256`.
 ///
 /// The `extrans` providers blend with the same arithmetic (their
 /// `TVP_RIPPLE_BLEND`/`TVPLinTransBlend` macros are the same expression).
@@ -1548,8 +1536,8 @@ fn blend_rule_pixels_sparse(
     }
 }
 
-/// `TVPInitUnivTransBlendTable_c` (`tvpgl.cpp:4576`): map a rule grayscale
-/// value to the source-2 blend opacity for the current `phase`/`vague`.
+/// Map a rule grayscale value to the source-2 blend opacity for the current
+/// `phase`/`vague`.
 ///
 /// `phase` is `0..=255 + vague`; `vague == 0` is the hard threshold used by
 /// [`TransKind::Mask`].

@@ -2,7 +2,7 @@
 //! body.
 //!
 //! The engine, its scene, its frame clock and its input and timer state are L2
-//! state. The host owns only the C++ engine and the L3 surface; the
+//! state. The host owns only the script engine and the L3 surface; the
 //! composition root attaches the L2 service handles through
 //! [`VmHost::with_default_services`] before the surface is installed.
 #![allow(unsafe_code)]
@@ -45,7 +45,7 @@ pub struct FrameCtx<'a> {
 
 /// The TJS VM host (L4).
 ///
-/// Owns the C++ engine (boxed so its address is stable for the L3 binding)
+/// Owns the script engine (boxed so its address is stable for the L3 binding)
 /// and the L3 [`CompatHost`] that holds the native surface state. The fields
 /// are ordered so the engine is dropped last: the dispatch state retains
 /// values whose `Drop` releases an id on the engine.
@@ -57,7 +57,7 @@ pub struct VmHost {
     /// The per-host VM log deduplicator. The engine's log callback points at
     /// this boxed value, so its address stays stable while the host moves.
     log_dedup: Box<LogDedup>,
-    /// The C++ engine. Declared last so it outlives every value the native
+    /// The script engine. Declared last so it outlives every value the native
     /// state retains.
     engine: Box<Tjs2Engine>,
 }

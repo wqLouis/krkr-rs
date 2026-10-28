@@ -2,7 +2,7 @@
 //!
 //! The VM is compiled by `build.rs` (bison + clang/gcc, no cmake) and
 //! statically linked. This crate exposes a small, hand-written safe wrapper
-//! over the C ABI defined in `cpp/tjs2_abi.h`.
+//! over the C ABI the VM's glue exports.
 //!
 //! # The surface
 //!
@@ -22,7 +22,7 @@ use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::ptr;
 
 // ---------------------------------------------------------------------------
-// C ABI mirror of cpp/tjs2_abi.h
+// C ABI mirror of the VM's exported entry points
 // ---------------------------------------------------------------------------
 
 /// The log level of a debug record.
@@ -48,7 +48,7 @@ pub const VAL_OBJECT: c_int = 4;
 pub const VAL_ARRAY: c_int = 5;
 /// The value type of a retained-value result.
 pub const VAL_RETAINED: c_int = 6;
-/// Raw binary data (C++ `tvtOctet`). For values produced by the engine the
+/// Raw binary data. For values produced by the engine the
 /// bytes live in `string` and the length in `array_count`; native callbacks
 /// read them with [`Value::octet_bytes`].
 pub const VAL_OCTET: c_int = 7;
@@ -70,7 +70,7 @@ pub const STORAGE_READ_NOT_FOUND: c_int = 1;
 pub const STORAGE_READ_ERROR: c_int = 2;
 
 /// Reads a whole storage entry for the text/binary stream factories (the C
-/// ABI type in `cpp/tjs2_abi.h`).
+/// ABI type the VM's glue exports).
 ///
 /// `name`/`name_len` are UTF-8 and may carry the `archive.xp3>member` form.
 /// On [`STORAGE_READ_OK`] the callback stores a malloc'd buffer in `out_data`
@@ -95,7 +95,7 @@ pub const TEXT_DECODE_OK: c_int = 0;
 pub const TEXT_DECODE_ERROR: c_int = 1;
 
 /// Decodes a BOM-less text payload into UTF-16 code units (the C ABI type in
-/// `cpp/tjs2_abi.h`).
+/// the C ABI).
 ///
 /// `data`/`len` are the raw payload (not NUL-terminated). On
 /// [`TEXT_DECODE_OK`] the callback stores a malloc'd buffer of UTF-16 code
@@ -121,15 +121,15 @@ pub type LogCb = extern "C" fn(level: c_int, msg: *const c_char, user: *mut c_vo
 ///
 /// Returns 0 on success (and fills `out`); on error returns non-zero and
 /// should set `*out_error` to a malloc'd NUL-terminated UTF-8 message
-/// (allocate with the C-side `tjs2_malloc` helper exposed in the `unsafe
-/// extern` block; the C++ side frees it with `tjs2_free_string`). Setting
+/// (allocate with the `tjs2_malloc` helper exposed in the `unsafe
+/// extern` block; the VM frees it with `tjs2_free_string`). Setting
 /// `*out_error` is optional — a generic message is used when it is left
 /// null.
 ///
 /// `argv` points to `argc` [`Value`] entries and is only valid during the
 /// call. `out` receives the return value; strings written there (as
-/// `out.string`) must stay valid until the callback returns and the C++
-/// side copies them — use a static/thread-local buffer, or storage that
+/// `out.string`) must stay valid until the callback returns and the VM
+/// copies them — use a static/thread-local buffer, or storage that
 /// outlives the call. `engine` is the opaque engine handle the method was
 /// registered on (unused for static methods).
 ///
@@ -143,7 +143,7 @@ pub type NativeMethodFn = extern "C" fn(
     out_error: *mut *mut c_char,
 ) -> c_int;
 
-/// C-side mirror of `tjs2_native_method` (cpp/tjs2_abi.h).
+/// Mirrors the `tjs2_native_method` C ABI entry.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct NativeMethod {
@@ -154,7 +154,7 @@ pub struct NativeMethod {
 }
 
 /// A native property accessor pair implemented in Rust (see
-/// [`NativePropertyDef`]). Mirrors `tjs2_native_property` (cpp/tjs2_abi.h).
+/// [`NativePropertyDef`]). Mirrors the `tjs2_native_property` C ABI entry.
 pub type NativePropertyGetFn =
     extern "C" fn(engine: *mut c_void, out: *mut Value, out_error: *mut *mut c_char) -> c_int;
 
@@ -162,7 +162,7 @@ pub type NativePropertyGetFn =
 pub type NativePropertySetFn =
     extern "C" fn(engine: *mut c_void, value: *const Value, out_error: *mut *mut c_char) -> c_int;
 
-/// C-side mirror of `tjs2_native_property` (cpp/tjs2_abi.h). `get`/`set` are
+/// Mirrors the `tjs2_native_property` C ABI entry. `get`/`set` are
 /// null when the property is write-only/read-only respectively.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -183,9 +183,9 @@ pub type NativeCreateInstanceFn = extern "C" fn(engine: *mut c_void) -> *mut c_v
 /// when the TJS object is destroyed.
 pub type NativeDestroyInstanceFn = extern "C" fn(engine: *mut c_void, instance: *mut c_void);
 
-/// Tear down a payload's native resources when the TJS object is invalidated
-/// (reference `iTJSNativeInstance::Invalidate`). Optional: `None` means the
-/// payload is only released by [`NativeDestroyInstanceFn`]. The payload must
+/// Tear down a payload's native resources when the TJS object is invalidated.
+/// Optional: `None` means the payload is only released by
+/// [`NativeDestroyInstanceFn`]. The payload must
 /// stay valid after this call — the destroy callback still runs later.
 pub type NativeInvalidateInstanceFn = extern "C" fn(engine: *mut c_void, instance: *mut c_void);
 
@@ -201,7 +201,7 @@ pub type NativeInstanceMethodFn = extern "C" fn(
     objthis: *mut c_void,
 ) -> c_int;
 
-/// C-side mirror of `tjs2_native_instance_method` (cpp/tjs2_abi.h).
+/// Mirrors the `tjs2_native_instance_method` C ABI entry.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct NativeInstanceMethod {
@@ -232,7 +232,7 @@ pub type NativeInstancePropertySetFn = extern "C" fn(
     objthis: *mut c_void,
 ) -> c_int;
 
-/// C-side mirror of `tjs2_native_instance_property` (cpp/tjs2_abi.h).
+/// Mirrors the `tjs2_native_instance_property` C ABI entry.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct NativeInstanceProperty {
@@ -249,7 +249,7 @@ pub struct NativeInstanceProperty {
 /// was invoked on. Used by
 /// [`Tjs2Engine::register_native_instance_members`] to attach members to an
 /// already-existing class, including a TJS2 builtin such as `Array` /
-/// `Dictionary` (reference `NCB_ATTACH_CLASS` / `NCB_ATTACH_FUNCTION`).
+/// `Dictionary`.
 ///
 /// `objthis` is owned by the VM and only valid for the duration of the call;
 /// unlike [`NativeInstanceMethodFn`] there is no per-class opaque payload.
@@ -262,7 +262,7 @@ pub type NativeObjThisMethodFn = extern "C" fn(
     out_error: *mut *mut c_char,
 ) -> c_int;
 
-/// C-side mirror of `tjs2_native_objthis_method` (cpp/tjs2_abi.h).
+/// Mirrors the `tjs2_native_objthis_method` C ABI entry.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct NativeObjThisMethod {
@@ -289,7 +289,7 @@ pub type NativeObjThisPropertySetFn = extern "C" fn(
     out_error: *mut *mut c_char,
 ) -> c_int;
 
-/// C-side mirror of `tjs2_native_objthis_property` (cpp/tjs2_abi.h).
+/// Mirrors the `tjs2_native_objthis_property` C ABI entry.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct NativeObjThisProperty {
@@ -303,7 +303,7 @@ pub struct NativeObjThisProperty {
 
 /// A value that crossed the C ABI.
 ///
-/// The layout mirrors the `tjs2_value` struct of `cpp/tjs2_abi.h`. A
+/// The layout mirrors the `tjs2_value` struct the VM's glue exports. A
 /// value carries one payload, selected by `ty`; the other fields are zero.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -332,7 +332,7 @@ impl Value {
     /// Raw TJS object pointer carried by a `VAL_OBJECT` argument, or null
     /// for any other value type.
     ///
-    /// C++ `variant_to_value_one` records the raw `iTJSDispatch2*` of every
+    /// The VM records the raw object pointer of every
     /// object argument in the `retained` slot, so a native that receives
     /// several object arguments can address each one individually (e.g.
     /// `Layer.drawPolygon(app, points)`). The pointer is owned by the VM and
@@ -349,11 +349,11 @@ impl Value {
     /// The raw closure receiver (`objthis`) carried by a `VAL_OBJECT`, or
     /// null for a plain object.
     ///
-    /// The C++ side stores a method/closure reference's receiver in the
+    /// The VM stores a method closure's receiver in the
     /// otherwise-unused `array` slot of the object value (see
     /// `object_handle`). Retaining the value through [`Tjs2Engine::retain_object_arg`]
     /// / [`retain_object_arg_raw`] then preserves the correct `this`, so a
-    /// native that holds a method reference and calls it later (e.g. the
+    /// native that holds a method closure and calls it later (e.g. the
     /// game's `new AsyncTrigger(onCleaning, "")`) runs it on the right
     /// object. The pointer is owned by the VM and valid only for the call.
     pub fn object_objthis(&self) -> *mut c_void {
@@ -448,22 +448,21 @@ unsafe extern "C" {
         out_result: *mut Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
-    /// Replace the text of a registered TJS message (reference
-    /// `TJS::TJSAssignMessage`). Returns 1 when the message exists, 0 when it
-    /// does not, and -1 on a C++ error (reported through `out_error`).
+    /// Replace the text of a registered TJS message. Returns 1 when the
+    /// message exists, 0 when it does not, and -1 on a VM-side error
+    /// (reported through `out_error`).
     fn tjs2_assign_message_checked(
         name: *const c_char,
         message: *const c_char,
         out_error: *mut *mut c_char,
     ) -> c_int;
-    /// The vendored TJS2 engine version as a static `major.minor.release`
-    /// string (reference `TJSVersionMajor`/`Minor`/`Release`).
+    /// The TJS2 engine version as a static `major.minor.release` string.
     fn tjs2_tjs_version_string() -> *const c_char;
-    /// The C++ compile date/time (`__DATE__`/`__TIME__`).
+    /// The compile date and time of the VM translation unit
+    /// (`__DATE__`/`__TIME__`).
     fn tjs2_compile_date() -> *const c_char;
     fn tjs2_compile_time() -> *const c_char;
-    /// Compile a UTF-8 script to a binary bytecode file (reference
-    /// `tTJS::CompileScript` / `TVPCompileStorage`).
+    /// Compile a UTF-8 script to a binary bytecode file.
     fn tjs2_compile_script(
         e: *mut Engine,
         script: *const c_char,
@@ -476,9 +475,8 @@ unsafe extern "C" {
         lineofs: c_int,
         out_error: *mut *mut c_char,
     ) -> c_int;
-    /// Load and execute TJS2 precompiled bytecode from an in-memory buffer
-    /// (reference `tTJS::LoadByteCode(tTJSBinaryStream*, ...)`, the bytecode
-    /// branch of `TVPExecuteStorage`). Writes the `out_is_bytecode` flag and a
+    /// Load and execute TJS2 precompiled bytecode from an in-memory buffer.
+    /// Writes the `out_is_bytecode` flag and a
     /// `TJS2_VAL_*` result; returns 0 on success and non-zero with a malloc'd
     /// message in `out_error` on a genuine loader failure.
     fn tjs2_load_bytecode(
@@ -498,33 +496,30 @@ unsafe extern "C" {
     fn tjs2_do_gc(e: *mut Engine, out_error: *mut *mut c_char) -> c_int;
     /// Request a member-table rebuild for every live object.
     fn tjs2_do_rehash();
-    /// Class names of a retained object, as a retained TJS Array (reference
-    /// `Scripts.getClassNames`).
+    /// Class names of a retained object, as a retained TJS Array.
     fn tjs2_get_class_names(
         e: *mut Engine,
         obj: Tjs2ValueId,
         out: *mut Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
-    /// Member names of a retained object, as a retained TJS Array of strings
-    /// (reference `Scripts.getObjectKeys` / `ScriptsAdd::_getKeys`).
+    /// Member names of a retained object, as a retained TJS Array of strings.
     fn tjs2_enum_members(
         e: *mut Engine,
         obj: Tjs2ValueId,
         out: *mut Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
-    /// Enable the `missing` member handler on a retained object (reference
-    /// `Scripts.setCallMissing`).
+    /// Enable the `missing` member handler on a retained object.
     fn tjs2_set_call_missing(
         e: *mut Engine,
         obj: Tjs2ValueId,
         out_error: *mut *mut c_char,
     ) -> c_int;
     /// Resolve a retained object to the Rust payload of an instance-based
-    /// native class (NativeInstanceSupport(TJS_NIS_GETINSTANCE) +
-    /// GetNativePtr()). Returns null when there is none — see
-    /// cpp/tjs2_abi.h for the full NULL/validity contract.
+    /// native class (the VM's native-instance lookup).
+    /// Returns null when there is none — the VM's glue states the full
+    /// NULL/validity contract.
     fn tjs2_get_native_instance(
         e: *mut Engine,
         obj: Tjs2ValueId,
@@ -553,8 +548,7 @@ unsafe extern "C" {
         invalidate_instance: Option<NativeInvalidateInstanceFn>,
     ) -> c_int;
     /// Attach static (class-level) members to an already-registered native
-    /// class (reference `TJS_END_NATIVE_STATIC_METHOD_DECL` /
-    /// `TJS_END_NATIVE_STATIC_PROP_DECL_OUTER`).
+    /// class.
     fn tjs2_register_native_static_members(
         e: *mut Engine,
         class_name: *const c_char,
@@ -564,8 +558,7 @@ unsafe extern "C" {
         prop_count: c_int,
     ) -> c_int;
     /// Attach instance members (no native payload) to an already-existing
-    /// class, including a TJS2 builtin such as `Array` / `Dictionary`
-    /// (reference `NCB_ATTACH_CLASS` / `NCB_ATTACH_FUNCTION`).
+    /// class, including a TJS2 builtin such as `Array` / `Dictionary`.
     fn tjs2_register_native_instance_members(
         e: *mut Engine,
         class_name: *const c_char,
@@ -574,19 +567,19 @@ unsafe extern "C" {
         properties: *const NativeObjThisProperty,
         prop_count: c_int,
     ) -> c_int;
-    /// Opaque, per-engine id of a retained script value (mirror of
-    /// `tjs2_value_id` in cpp/tjs2_abi.h).
+    /// Opaque, per-engine id of a retained script value (the `tjs2_value_id`
+    /// type of the C ABI).
     fn tjs2_retain_value(engine: *mut Engine, v: *const Value) -> Tjs2ValueId;
-    /// Retain a raw TJS object (see the C++ side). Returns a per-engine id
+    /// Retain a raw TJS object. Returns a per-engine id
     /// or 0 on failure.
     fn tjs2_retain_object(engine: *mut Engine, obj: *mut c_void) -> Tjs2ValueId;
     /// Duplicate an existing retained id into a fresh id (the original stays
-    /// live). Used to return a cached object without consuming the cache.
+    /// live). A duplicate lets a cached object be handed out again.
     fn tjs2_retain_retained_id(engine: *mut Engine, id: Tjs2ValueId) -> Tjs2ValueId;
     /// Stack trace string (Scripts.getTraceString); malloc'd, free with
     /// `tjs2_free_string`.
     pub fn tjs2_get_stack_trace_string(engine: *mut Engine, limit: c_int) -> *mut c_char;
-    /// Release a retained value. Idempotent on the C++ side.
+    /// Release a retained value. Idempotent on the VM side.
     fn tjs2_release_value(engine: *mut Engine, id: Tjs2ValueId);
     /// Invalidate a retained object value (runs its script `finalize`).
     fn tjs2_invalidate_retained(engine: *mut Engine, id: Tjs2ValueId) -> c_int;
@@ -639,8 +632,7 @@ unsafe extern "C" {
         value: *const Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
-    /// Delete a named property from a retained object value (`DeleteMember`,
-    /// reference `iTJSDispatch2::DeleteMember`, `tjsObject.h:472`).
+    /// Delete a named property from a retained object value (`DeleteMember`).
     fn tjs2_prop_delete(
         engine: *mut Engine,
         id: Tjs2ValueId,
@@ -656,9 +648,9 @@ unsafe extern "C" {
         value: *const Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
-    /// Write a value back into a by-reference argument of the native method
-    /// call currently executing on this engine (reference native methods do
-    /// `(*param[index]) = value`).
+    /// Write a value back into an out-parameter argument of the native method
+    /// call currently executing on this engine (the caller's own argument
+    /// slot).
     fn tjs2_set_arg(
         engine: *mut Engine,
         index: c_int,
@@ -666,7 +658,7 @@ unsafe extern "C" {
         out_error: *mut *mut c_char,
     ) -> c_int;
     /// Whether the VM asked for the return value of the native method call
-    /// currently executing on this engine. Reference native methods receive
+    /// currently executing on this engine. A native method receives
     /// a null `result` pointer when the caller discards the value; see
     /// [`Tjs2Engine::result_needed`].
     fn tjs2_result_needed(engine: *mut Engine) -> c_int;
@@ -687,13 +679,13 @@ unsafe extern "C" {
     pub fn tjs2_malloc(size: usize) -> *mut c_void;
 }
 
-// The C++ stream layer (cpp/streams.cpp) inflates/deflates the `FE FE 02`
-// save container with zlib. Linking it here keeps the build.rs C++ compile
+// The VM's stream layer inflates/deflates the `FE FE 02`
+// save container with zlib. Linking it here keeps the build.rs compile
 // flags untouched.
 #[link(name = "z")]
 unsafe extern "C" {}
 
-// Diagnostic helper implemented in cpp/streams.cpp: decode a whole text
+// Diagnostic helper implemented in the VM's stream layer: decode a whole text
 // stream (honoring the mode's `oN` offset and the `FE FE` crypt container)
 // into a malloc'd UTF-8 string (free with [`tjs2_free_string`]). Returns 0
 // on success and non-zero when the file or container cannot be read. Used
@@ -808,7 +800,7 @@ pub struct Tjs2Engine {
 ///
 /// # Release
 ///
-/// Dropping a `ValueId` releases the retained value on the C++ side. The
+/// Dropping a `ValueId` releases the retained value on the VM side. The
 /// release is idempotent (releasing an already-released id is a safe
 /// no-op), so dropping an id after an explicit
 /// [`Tjs2Engine::release_value`] is harmless. Retained values hold their
@@ -847,7 +839,7 @@ impl DetachedValue {
 
 impl Drop for DetachedValue {
     fn drop(&mut self) {
-        // SAFETY: the C++ side's release is idempotent. The release drops the
+        // SAFETY: the VM's release is idempotent. The release drops the
         // retained object's ownership, which can run the object's destructor
         // and therefore release further retained values.
         unsafe { tjs2_release_value(self.engine, self.id) }
@@ -882,9 +874,9 @@ pub enum TjsValue {
     Object,
     /// A retained value id (from [`Tjs2Engine::retain_value_detached`] /
     /// [`Tjs2Engine::retain_object_detached`]) passed as an argument. The
-    /// C++ side copies the retained variant into the argument slot, so
+    /// VM copies the retained variant into the argument slot, so
     /// object/dict values that cannot otherwise cross the ABI can be
-    /// passed to a member call (e.g. a KiriKiri event dictionary to an
+    /// passed to a member call (e.g. an event dictionary to an
     /// owner's `action(ev)` method). The retention is consumed by the
     /// copy (the Rust side's `DetachedValue` drop is then a safe no-op).
     Retained(u64),
@@ -896,9 +888,9 @@ pub enum TjsValue {
 /// Scalars cross the ABI directly, but an object/function result cannot be
 /// represented by a [`TjsValue`] (no object handle crosses the boundary).
 /// Those are retained on the engine and returned as an RAII
-/// [`DetachedValue`]: pass its [`DetachedValue::raw_id`] to the C++ side as
+/// [`DetachedValue`]: pass its [`DetachedValue::raw_id`] to the VM as
 /// `VAL_RETAINED` (which consumes the retention), or drop it to release the
-/// reference.
+/// retention.
 pub enum RetainedValue {
     /// A void/integer/real/string result, usable directly.
     Value(TjsValue),
@@ -977,8 +969,8 @@ pub struct NativeInstanceBuilder<'a> {
     pub create: NativeCreateInstanceFn,
     /// Frees the payload when the object is destroyed.
     pub destroy: NativeDestroyInstanceFn,
-    /// Optional native teardown hook (reference `Invalidate`). `None` keeps
-    /// the previous behaviour: the payload is released only at destroy.
+    /// Optional native teardown hook. `None` means the payload is released
+    /// only at destroy.
     pub invalidate: Option<NativeInvalidateInstanceFn>,
     /// The instance methods the class carries.
     pub methods: Vec<NativeInstanceMethodDef>,
@@ -990,7 +982,7 @@ pub struct NativeInstanceBuilder<'a> {
 /// registered through [`Tjs2Engine::register_native_class`] or
 /// [`Tjs2Engine::register_native_class_instance`].
 ///
-/// The reference declares these with `TJS_STATICMEMBER` (e.g.
+/// Some members are class-level (e.g.
 /// `Bitmap.loadHeader` / `Bitmap.getSaveOption` and
 /// `MenuItem.textToKeycode` / `MenuItem.keycodeToText`): they live on the
 /// class object, are reachable without an instance, and are not copied onto
@@ -1030,8 +1022,8 @@ pub struct NativeObjThisPropertyDef {
 }
 
 /// Instance members (no native payload) to attach to an already-existing
-/// class, including a TJS2 builtin such as `Array` / `Dictionary` (reference
-/// `NCB_ATTACH_CLASS` / `NCB_ATTACH_FUNCTION`). The members receive `objthis`
+/// class, including a TJS2 builtin such as `Array` / `Dictionary`. The
+/// members receive `objthis`
 /// — the object they were invoked on — but no per-class opaque payload, so
 /// they can be added to a builtin class object that the VM created itself.
 ///
@@ -1056,7 +1048,7 @@ pub struct NativeInstanceMembers<'a> {
 ///
 /// # Safety
 /// `user` must stay valid for every VM call until the callback is cleared with
-/// `None`, and `read` must follow the `cpp/tjs2_abi.h` contract.
+/// `None`, and `read` must follow the C ABI contract.
 pub unsafe fn set_storage_read_callback(read: Option<StorageReadFn>, user: *mut c_void) {
     // SAFETY: the caller upholds the user-pointer contract above.
     unsafe { tjs2_set_storage_read_callback(read, user) }
@@ -1072,7 +1064,7 @@ pub unsafe fn set_storage_read_callback(read: Option<StorageReadFn>, user: *mut 
 ///
 /// # Safety
 /// `user` must stay valid for every VM call until the callback is cleared with
-/// `None`, and `decode` must follow the `cpp/tjs2_abi.h` contract.
+/// `None`, and `decode` must follow the C ABI contract.
 pub unsafe fn set_text_decode_callback(decode: Option<TextDecodeFn>, user: *mut c_void) {
     // SAFETY: the caller upholds the user-pointer contract above.
     unsafe { tjs2_set_text_decode_callback(decode, user) }
@@ -1085,7 +1077,7 @@ impl Tjs2Engine {
     }
 
     /// Whether the VM asked for the return value of the native method call
-    /// currently executing. A reference native method receives a null
+    /// currently executing. A native method receives a null
     /// `result` pointer when the caller discards the value (a bare method
     /// call statement), and expression-mode evaluation must then compile
     /// without requiring a result. Reads as `true` outside a native callback.
@@ -1094,18 +1086,18 @@ impl Tjs2Engine {
         unsafe { tjs2_result_needed(self.inner) != 0 }
     }
 
-    /// Point the C++ stream factories at a directory for relative save/load
+    /// Point the VM's stream factories at a directory for relative save/load
     /// paths (the game's DATA_PATH is absolute, but some code passes plain
     /// names).
     ///
-    /// Returns [`TjsError`] when `dir` contains a NUL byte or the C++ side
+    /// Returns [`TjsError`] when `dir` contains a NUL byte or the VM
     /// reports a failure.
     pub fn set_data_dir(&self, dir: &str) -> Result<(), TjsError> {
         let c =
             std::ffi::CString::new(dir).map_err(|_| TjsError("data dir contains NUL".into()))?;
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: `c` is a valid NUL-terminated string for the call; on
-        // failure the C++ side stores an owned error string in `error`.
+        // failure the VM stores an owned error string in `error`.
         let rc = unsafe { tjs2_set_data_dir_checked(c.as_ptr(), &mut error) };
         if rc != 0 {
             return Err(take_error(error));
@@ -1182,11 +1174,10 @@ impl Tjs2Engine {
     }
 
     /// Execute a TJS script with an explicit `this` (`context`) and a reported
-    /// line-number offset (`lineofs`), matching the reference
-    /// `TJS::tTJS::ExecScript(content, result, context, name, lineofs)`.
+    /// line-number offset (`lineofs`).
     ///
-    /// `context` is a raw `iTJSDispatch2*` obtained from an object argument's
-    /// [`Value::object_handle`]; it is only dereferenced on the C++ side while
+    /// `context` is a raw object pointer obtained from an object argument's
+    /// [`Value::object_handle`]; it is only dereferenced on the VM side while
     /// the argument is alive.
     fn exec_script_with_context(
         &self,
@@ -1236,8 +1227,7 @@ impl Tjs2Engine {
     }
 
     /// Evaluate a TJS expression with an explicit `this` (`context`) and a
-    /// reported line-number offset (`lineofs`), matching the reference
-    /// `TJS::tTJS::EvalExpression(content, result, context, name, lineofs)`.
+    /// reported line-number offset (`lineofs`).
     fn eval_with_context(
         &self,
         expression: &str,
@@ -1252,7 +1242,7 @@ impl Tjs2Engine {
     /// [`Self::eval_with_context`] with an explicit result-needed flag.
     ///
     /// When `need_result` is false the expression is compiled without a
-    /// result slot, matching a reference native method that received a null
+    /// result slot, matching a native method that received a null
     /// `result` pointer: an expression that produces no value (a `swap`, for
     /// instance) then compiles, and the discarded value comes back as
     /// [`TjsValue::Void`].
@@ -1302,9 +1292,9 @@ impl Tjs2Engine {
         Ok(take_value(&result))
     }
 
-    /// Replace the text of the registered TJS message `name` with `message`
-    /// (reference `TJS::TJSAssignMessage`). Returns whether a message by that
-    /// name exists; a C++ failure is a [`TjsError`].
+    /// Replace the text of the registered TJS message `name` with `message`.
+    /// Returns whether a message by that
+    /// name exists; a VM-side failure is a [`TjsError`].
     pub fn assign_message(&self, name: &str, message: &str) -> Result<bool, TjsError> {
         let name = CString::new(name).map_err(|_| TjsError("message name contains NUL".into()))?;
         let message =
@@ -1335,8 +1325,8 @@ impl Tjs2Engine {
             .into_owned()
     }
 
-    /// The C++ translation unit's compile date and time (`__DATE__`/`__TIME__`),
-    /// the counterpart of the reference `TVPCompileDate`/`TVPCompileTime`.
+    /// The VM translation unit's compile date and time
+    /// (`__DATE__`/`__TIME__`).
     pub fn compile_date_time(&self) -> (String, String) {
         // SAFETY: the ABI returns static NUL-terminated strings.
         let (date, time) = unsafe { (tjs2_compile_date(), tjs2_compile_time()) };
@@ -1353,8 +1343,7 @@ impl Tjs2Engine {
         (read(date), read(time))
     }
 
-    /// Compile a UTF-8 script to a binary bytecode file (reference
-    /// `TVPCompileStorage` / `tTJS::CompileScript`).
+    /// Compile a UTF-8 script to a binary bytecode file.
     ///
     /// `output_path` is a plain filesystem path (the wired stream factory is
     /// file-backed) or a data-dir-relative name. `isresult` selects whether
@@ -1375,7 +1364,7 @@ impl Tjs2Engine {
             CString::new(output_path).map_err(|_| TjsError("output path contains NUL".into()))?;
         let name = CString::new(options.name).map_err(|_| TjsError("name contains NUL".into()))?;
         let mut error: *mut c_char = ptr::null_mut();
-        // SAFETY: all pointers are valid for the call; the C++ side copies
+        // SAFETY: all pointers are valid for the call; the VM copies
         // the UTF-8 strings and writes the output file.
         let rc = unsafe {
             tjs2_compile_script(
@@ -1397,10 +1386,7 @@ impl Tjs2Engine {
         Ok(())
     }
 
-    /// Load and execute TJS2 precompiled bytecode from an in-memory buffer
-    /// (reference `TVPExecuteStorage`'s bytecode branch,
-    /// `reference/cpp/core/base/ScriptMgnIntf.cpp:713-727`, which calls the
-    /// VM's stream-based `tTJS::LoadByteCode`).
+    /// Load and execute TJS2 precompiled bytecode from an in-memory buffer.
     ///
     /// Returns `Ok(Some(result))` when the loader recognized and consumed
     /// `bytes` (TJS2 bytecode, or the binary-serialized data the same loader
@@ -1453,7 +1439,7 @@ impl Tjs2Engine {
     }
 
     /// Dump all live script blocks through the log callback installed with
-    /// [`Self::set_log_cb`] (reference `TVPDumpScriptEngine` / `tTJS::Dump`).
+    /// [`Self::set_log_cb`].
     pub fn dump(&self) -> Result<(), TjsError> {
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: self.inner is a live engine.
@@ -1477,10 +1463,9 @@ impl Tjs2Engine {
         unsafe { tjs2_do_rehash() };
     }
 
-    /// Run the TJS2 garbage collector (reference `tTJS::DoGarbageCollection`,
-    /// `tjs.cpp:495`). This is the `clIdle` half of `System.doCompact`: the
-    /// reference's compact-event hook invokes it whenever the compact level
-    /// reaches `TVP_COMPACT_LEVEL_IDLE`.
+    /// Run the TJS2 garbage collector. This is the `clIdle` half of
+    /// `System.doCompact`: the compact-event hook invokes it whenever the
+    /// compact level reaches the idle level.
     pub fn do_gc(&self) -> Result<(), TjsError> {
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: self.inner is a live engine.
@@ -1494,7 +1479,7 @@ impl Tjs2Engine {
     /// Execute a script like [`Self::exec_script`], but retain an object
     /// result instead of losing it across the ABI.
     ///
-    /// The C++ side records the most recent object-valued result when
+    /// The VM records the most recent object-valued result when
     /// `tjs2_exec_script` returns, so [`Self::retain_value_detached`] can
     /// resolve an [`TjsValue::Object`] to the freshly produced object. Only
     /// the object arm is retained; void/integer/real/string results are
@@ -1538,7 +1523,7 @@ impl Tjs2Engine {
 
     /// [`Self::eval_retained_with_context`] with an explicit result-needed
     /// flag. When `need_result` is false the expression compiles without a
-    /// result slot (reference: a native method whose caller discarded the
+    /// result slot (a native method whose caller discarded the
     /// result) and the discarded value is returned as [`TjsValue::Void`];
     /// nothing is retained.
     pub fn eval_retained_with_context_result(
@@ -1601,7 +1586,7 @@ impl Tjs2Engine {
     }
 
     /// Execute a TJS script given as UTF-16 code units, keeping every unit
-    /// exactly as the reference text stream does.
+    /// exactly as the text stream does.
     ///
     /// This is the lossless counterpart of [`Self::exec_script`]:
     /// `script` is a code-unit slice, so an unpaired surrogate survives the
@@ -1715,7 +1700,7 @@ impl Tjs2Engine {
     }
 
     /// Wrap a successful eval/exec result: retain objects, pass scalars
-    /// through. The C++ `variant_to_value` overwrites `last_object` with the
+    /// through. The VM overwrites `last_object` with the
     /// final result when it is an object, so the retention always resolves
     /// to the value that was just produced (never a nested object).
     fn retain_object_result(&self, v: TjsValue) -> Result<RetainedValue, TjsError> {
@@ -1776,7 +1761,7 @@ impl Tjs2Engine {
             })
             .collect();
         // SAFETY: self.inner is a valid engine; the names and arrays are
-        // valid for the call. The C++ side copies everything it needs
+        // valid for the call. The VM copies everything it needs
         // (names and callbacks) during registration.
         let rc = unsafe {
             tjs2_register_native_class_ex(
@@ -1854,7 +1839,7 @@ impl Tjs2Engine {
             })
             .collect();
         // SAFETY: self.inner is a valid engine; the names and arrays are
-        // valid for the call. The C++ side copies everything it needs
+        // valid for the call. The VM copies everything it needs
         // (names and callbacks) during registration.
         let rc = unsafe {
             tjs2_register_native_class_instance(
@@ -1887,11 +1872,10 @@ impl Tjs2Engine {
     }
 
     /// Attach static (class-level) members to an already-registered native
-    /// class (reference `TJS_END_NATIVE_STATIC_METHOD_DECL` /
-    /// `TJS_END_NATIVE_STATIC_PROP_DECL_OUTER`).
+    /// class.
     ///
-    /// Instance-capable classes put every member on their instances; the
-    /// reference instead declares some members with `TJS_STATICMEMBER`
+    /// Instance-capable classes put every member on their instances; some
+    /// members are class-level instead
     /// (`Bitmap.loadHeader` / `Bitmap.getSaveOption`,
     /// `MenuItem.textToKeycode` / `MenuItem.keycodeToText`), which live on
     /// the class object, are reachable without an instance, and stay
@@ -1941,7 +1925,7 @@ impl Tjs2Engine {
             })
             .collect();
         // SAFETY: self.inner is a valid engine; the names and arrays are
-        // valid for the call. The C++ side copies what it needs during
+        // valid for the call. The VM copies what it needs during
         // registration.
         let rc = unsafe {
             tjs2_register_native_static_members(
@@ -1972,7 +1956,7 @@ impl Tjs2Engine {
 
     /// Attach instance members (without a native payload) to an
     /// already-existing class, including a TJS2 builtin such as `Array` /
-    /// `Dictionary` (reference `NCB_ATTACH_CLASS` / `NCB_ATTACH_FUNCTION`).
+    /// `Dictionary`.
     ///
     /// A class registered through [`Self::register_native_class`] /
     /// [`Self::register_native_class_instance`] receives the members as
@@ -2027,7 +2011,7 @@ impl Tjs2Engine {
             })
             .collect();
         // SAFETY: self.inner is a valid engine; the names and arrays are
-        // valid for the call. The C++ side copies what it needs during
+        // valid for the call. The VM copies what it needs during
         // registration.
         let rc = unsafe {
             tjs2_register_native_instance_members(
@@ -2067,7 +2051,7 @@ impl Tjs2Engine {
     pub fn retain_value(&self, v: &TjsValue) -> Result<ValueId<'_>, String> {
         let mut strings = Vec::new();
         let ffi = match v {
-            // The C++ side resolves OBJECT-typed values against the
+            // The VM resolves OBJECT-typed values against the
             // engine's most recent object result (no handle crosses the
             // ABI).
             TjsValue::Object => Value {
@@ -2142,14 +2126,14 @@ name), and none was available"
         if rc != 0 {
             return Err(take_error_string(error));
         }
-        // SAFETY: `out` was filled by the C++ side on success.
+        // SAFETY: `out` was filled by the VM on success.
         Ok(take_value(&out))
     }
 
     /// Release a retained value immediately (the id is also released when
     /// dropped; call this only to free it earlier). The second release of
     /// the same id is an error: the id is no longer registered on this
-    /// engine. (The C++-level release itself is idempotent — a safe no-op
+    /// engine. (The VM-level release itself is idempotent — a safe no-op
     /// for unknown ids — so dropping the id afterwards is harmless.)
     pub fn release_value(&self, id: &ValueId<'_>) -> Result<(), String> {
         if !std::ptr::eq(id.engine, self) {
@@ -2167,12 +2151,12 @@ name), and none was available"
 
     /// FFI-release one raw retained id and drop it from the registry (used
     /// by both [`ValueId`]'s Drop and engine drop). Releasing an id that is
-    /// not in the registry is still safe: the C++ side's erase of an
+    /// not in the registry is still safe: the VM's erase of an
     /// unknown id is a no-op.
     fn release_retained(&self, id: Tjs2ValueId) {
         self.retained.borrow_mut().retain(|i| *i != id);
         // SAFETY: self.inner is a live engine while a ValueId (or the
-        // engine itself) holds a reference; release is idempotent.
+        // engine itself) keeps it alive; release is idempotent.
         unsafe { tjs2_release_value(self.inner, id) };
     }
 
@@ -2213,7 +2197,7 @@ name), and none was available"
     }
 
     /// Retain the object carried by a native callback argument (`argv[i]`),
-    /// using the per-argument handle recorded by the C++ side. Unlike
+    /// using the per-argument handle recorded by the VM. Unlike
     /// [`Self::retain_value_detached`] with [`TjsValue::Object`], this does
     /// not depend on the engine's "most recent object" slot, so it is correct
     /// when the call passes more than one object (e.g.
@@ -2231,10 +2215,10 @@ name), and none was available"
     /// lifetime detached from the engine borrow, like
     /// [`Self::retain_value_detached`] but for a raw object pointer. The
     /// returned handle releases the retention when dropped.
-    /// The raw `objthis` pointer comes from the C++ dispatch which holds the
+    /// The raw `objthis` pointer comes from the VM dispatch, which holds the
     /// object alive for the duration of the call (the native-callback
-    /// trampoline guarantees validity; the retained reference keeps it alive
-    /// afterward). Dereferencing happens only on the C++ side.
+    /// trampoline guarantees validity; the retention keeps it alive
+    /// afterward). Dereferencing happens only on the VM side.
     pub fn retain_object_detached(
         &self,
         obj: impl Into<Tjs2ValueId>,
@@ -2255,9 +2239,9 @@ name), and none was available"
     }
 
     /// Duplicate an existing retained id into a fresh id, leaving the
-    /// original live (C++ `tjs2_retain_retained_id`).
+    /// original live (`tjs2_retain_retained_id`).
     ///
-    /// Used to hand a cached object to a consuming call (e.g. the null
+    /// Hands a cached object to a consuming call (e.g. the null
     /// plugin's default-member write) without invalidating the cache. The
     /// returned [`DetachedValue`] releases the duplicate when dropped; if the
     /// consuming call already consumed it, that release is a safe no-op.
@@ -2279,9 +2263,9 @@ name), and none was available"
         })
     }
 
-    /// Invalidate a retained object value (the reference `invalidate obj;`
-    /// statement): invokes the object's `iTJSDispatch2::Invalidate`, running
-    /// its script `finalize`. Returns an error string on an unknown id or a
+    /// Invalidate a retained object value (the script's `invalidate obj;`
+    /// statement): invalidates the object and runs its script `finalize`.
+    /// Returns an error string on an unknown id or a
     /// script exception; the error carries the failing script's own message,
     /// so a caller that logs it names the real cause. The retention is **not**
     /// released; the owning [`DetachedValue`] still releases it when dropped.
@@ -2311,7 +2295,7 @@ name), and none was available"
     /// `OnceTimer`) runs its override.
     /// `id` is a retained value whose validity is owned by the
     /// `DetachedValue`/`ValueId` handles (which keep the engine alive via
-    /// the borrow checker); the C++ side dereferences it within the call.
+    /// the borrow checker); the VM dereferences it within the call.
     pub fn call_member(
         &self,
         id: Tjs2ValueId,
@@ -2339,7 +2323,7 @@ name), and none was available"
         // name/argv/out follow the ABI contract for the duration of the call.
         // (The retained id's validity is owned by DetachedValue/ValueId,
         // which keep the engine alive via the borrow checker; call_member
-        // itself does not dereference the pointer — the C++ side does.)
+        // itself does not dereference the pointer — the VM does.)
         let rc = unsafe {
             tjs2_call_member(
                 self.inner,
@@ -2358,7 +2342,7 @@ name), and none was available"
         if rc != 0 {
             return Err(take_error_string(error));
         }
-        // SAFETY: `out` was filled by the C++ side on success.
+        // SAFETY: `out` was filled by the VM on success.
         Ok(take_value(&out))
     }
 
@@ -2413,7 +2397,7 @@ name), and none was available"
         if rc != 0 {
             return Err(take_error_string(error));
         }
-        // SAFETY: `out` was filled by the C++ side on success.
+        // SAFETY: `out` was filled by the VM on success.
         Ok(take_value(&out))
     }
 
@@ -2491,23 +2475,19 @@ name), and none was available"
     }
 
     /// Delete a named property from a retained object value
-    /// (`iTJSDispatch2::DeleteMember`, reference `tjsObject.h:472`;
-    /// `tTJSCustomObject::DeleteMember`, `tjsObject.cpp:1537-1552`, over
-    /// `DeleteByName`, `tjsObject.cpp:759`).
+    /// (`DeleteMember`).
     ///
     /// This is the removal path for members [`Self::set_member`] created and
     /// for the class-name globals the native registration entry points publish.
-    /// The reference reaches the same VM operation through its `delete`
-    /// operator, which passes flag 0 and the dispatch object itself
-    /// (`tjsInterCodeExec.cpp:1826`); only the object's own member table is
-    /// affected.
+    /// The script's `delete` operator reaches the same VM operation: it
+    /// passes flag 0 and the dispatch object itself, so only the object's own
+    /// member table is affected.
     ///
     /// An absent member is reported here as a typed error: the VM returns
-    /// `TJS_E_MEMBERNOTFOUND` (`tjsObject.cpp:1546`), which the `delete`
-    /// operator turns into the boolean `false` rather than an exception
-    /// (`tjsInterCodeExec.cpp:1829-1833`). A [`Tjs2ValueId`] that is not a
-    /// live object (null, released, or a non-object value such as TJS `null`)
-    /// is likewise a typed error.
+    /// `TJS_E_MEMBERNOTFOUND`, which the `delete` operator turns into the
+    /// boolean `false` rather than an exception. A [`Tjs2ValueId`] that is not
+    /// a live object (null, released, or a non-object value such as TJS
+    /// `null`) is likewise a typed error.
     pub fn delete_member(&self, id: Tjs2ValueId, membername: &str) -> Result<(), String> {
         let name = std::ffi::CString::new(membername)
             .map_err(|_| "member name contains a NUL byte".to_string())?;
@@ -2547,15 +2527,15 @@ name), and none was available"
         Ok(())
     }
 
-    /// Write a value back into a by-reference argument of the native method
+    /// Write a value back into an out-parameter argument of the native method
     /// call currently executing on this engine.
     ///
     /// The C ABI snapshots every native-method argument into a [`Value`]
     /// copy, so a Rust callback cannot modify the caller's variable by
     /// writing through `argv`. This entry point (backed by
     /// `tjs2_set_arg`) reaches the caller's original `tTJSVariant` slot and
-    /// therefore implements the reference's `(*param[index]) = value`
-    /// out-parameter pattern (e.g. `Window.getMouseVelocity`).
+    /// therefore implements the out-parameter pattern
+    /// `(*param[index]) = value` (e.g. `Window.getMouseVelocity`).
     ///
     /// Only valid while a native method callback is running on `self`; the
     /// call frame is pushed around the callback and popped afterwards. An
@@ -2575,12 +2555,12 @@ name), and none was available"
     }
 
     /// Class names of a retained object, most-derived first, as a new TJS
-    /// Array (reference `Scripts.getClassNames`).
+    /// Array.
     ///
     /// The array is retained on the engine and returned as a
     /// [`DetachedValue`]; hand its [`DetachedValue::raw_id`] back as a
     /// `VAL_RETAINED` native result (the trampoline consumes it), or drop it
-    /// to release the reference. `obj` must be a live retained object id.
+    /// to release the retention. `obj` must be a live retained object id.
     pub fn class_names(&self, obj: Tjs2ValueId) -> Result<DetachedValue, String> {
         let mut out = Value {
             ty: VAL_VOID,
@@ -2607,8 +2587,7 @@ name), and none was available"
         })
     }
 
-    /// Member names of a retained object, sorted and de-duplicated
-    /// (reference `Scripts.getObjectKeys` / `ScriptsAdd::_getKeys`).
+    /// Member names of a retained object, sorted and de-duplicated.
     ///
     /// Uses the VM's `EnumMembers` with `TJS_IGNOREPROP | TJS_ENUM_NO_VALUE`
     /// and skips hidden members, so the result is the object's observable
@@ -2667,13 +2646,13 @@ name), and none was available"
         Ok(members)
     }
 
-    /// Enable the `missing` member handler on a retained object (reference
-    /// `Scripts.setCallMissing`): after this call an access to an absent
+    /// Enable the `missing` member handler on a retained object: after this
+    /// call an access to an absent
     /// member invokes the object's `missing` method.
     pub fn set_call_missing(&self, obj: Tjs2ValueId) -> Result<(), String> {
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: self.inner is a live engine and obj is a retained id; the
-        // C++ side dereferences it through its retained-value map.
+        // VM dereferences it through its retained-value map.
         let rc = unsafe { tjs2_set_call_missing(self.inner, obj, &mut error) };
         if rc != 0 {
             return Err(take_error_string(error));
@@ -2682,10 +2661,8 @@ name), and none was available"
     }
 
     /// Resolve a retained script object to the payload pointer of an
-    /// instance-based native class (reference
-    /// `iTJSDispatch2::NativeInstanceSupport(TJS_NIS_GETINSTANCE, classid)`
-    /// — the lookup behind TJS_GET_NATIVE_INSTANCE in native method bodies
-    /// and argument adaptors).
+    /// instance-based native class (the lookup a native method body and its
+    /// argument adaptors perform to reach the class instance).
     ///
     /// `class_name` must be the name the class was registered with via
     /// [`Self::register_native_class_instance`]; `obj` is a live retained
@@ -2693,8 +2670,8 @@ name), and none was available"
     /// [`Self::retain_object_arg`], [`Self::eval_retained`], …).
     ///
     /// Returns `Ok(Some(payload))` when `obj` is a live instance of that
-    /// class, including an instance whose `Invalidate` has run:
-    /// `NativeInstanceSupport(TJS_NIS_GETINSTANCE, classid)` keeps finding
+    /// class, including an instance whose `Invalidate` has run: the
+    /// instance lookup keeps finding
     /// the instance until the object is destructed, so an argument lookup
     /// must keep recognizing its class. Returns `Ok(None)` — an
     /// ordinary miss, never an error — when the object is TJS `null`, a
@@ -2729,8 +2706,8 @@ name), and none was available"
             .map_err(|_| "native_instance_payload: class name contains a NUL byte".to_string())?;
         // SAFETY: self.inner is a live engine, obj is a live retained id
         // (its validity is owned by the caller's ValueId/DetachedValue),
-        // and name is a valid NUL-terminated string for the call. The C++
-        // side only reads the payload pointer; it never hands out ownership.
+        // and name is a valid NUL-terminated string for the call. The VM
+        // only reads the payload pointer; it never hands out ownership.
         let payload = unsafe { tjs2_get_native_instance(self.inner, obj, name.as_ptr()) };
         Ok(ptr::NonNull::new(payload))
     }
@@ -2745,9 +2722,8 @@ name), and none was available"
 
     /// Like [`Self::call_detached`], but supplies a fallback receiver: the
     /// callable value's own `ObjThis` wins, then `objthis`, then the function
-    /// object itself (`tTJSVariantClosure::FuncCall`). A helper that invokes
-    /// an anonymous callback passes the helper's calling context as `objthis`
-    /// (reference `ScriptsAdd::foreach`, `scriptsEx.cpp:690-693`).
+    /// object itself. A helper that invokes
+    /// an anonymous callback passes the helper's calling context as `objthis`.
     ///
     /// # Safety
     ///
@@ -2797,7 +2773,7 @@ name), and none was available"
         if rc != 0 {
             return Err(take_error_string(error));
         }
-        // SAFETY: `out` was filled by the C++ side on success.
+        // SAFETY: `out` was filled by the VM on success.
         Ok(take_value(&out))
     }
 }
@@ -2816,8 +2792,8 @@ pub unsafe fn retain_object_arg_raw(
     if v.ty != VAL_OBJECT {
         return Err("retain_object_arg: value is not an object".into());
     }
-    // SAFETY: caller guarantees `engine` is live and `v` is valid; the C++
-    // side AddRefs the object into the engine's retained map.
+    // SAFETY: caller guarantees `engine` is live and `v` is valid; the VM
+    // AddRefs the object into the engine's retained map.
     let id = unsafe { tjs2_retain_value(engine, v) };
     if id.is_null() {
         return Err("failed to retain object argument".into());
@@ -2828,7 +2804,7 @@ pub unsafe fn retain_object_arg_raw(
 impl Drop for Tjs2Engine {
     fn drop(&mut self) {
         // Release every still-retained value first (this covers ids whose
-        // ValueId was forgotten via std::mem::forget). The C++ side's
+        // ValueId was forgotten via std::mem::forget). The VM's
         // release is idempotent, and its retained-value map also dies with
         // the engine struct below, so there is no double release.
         for &id in self.retained.get_mut().iter() {
@@ -2866,8 +2842,7 @@ fn take_value(v: &Value) -> TjsValue {
         // The safe `TjsValue` surface has no octet variant (adding one would
         // be a breaking API change for the whole workspace). Raw native
         // callbacks read octet arguments through `Value::octet_bytes`; an
-        // octet returned by eval/exec is surfaced as an opaque Object, like
-        // before this type existed.
+        // octet returned by eval/exec is surfaced as an opaque Object.
         VAL_OCTET => TjsValue::Object,
         // TJS `null` is still an object to the safe wrapper (its `object_handle`
         // is null).
@@ -2937,7 +2912,7 @@ fn value_to_ffi(v: &TjsValue, strings: &mut Vec<CString>) -> Result<Value, Strin
             );
         }
         TjsValue::Retained(id) => {
-            // Pass a retained value id; the C++ side copies the retained
+            // Pass a retained value id; the VM copies the retained
             // variant into the argument slot (VAL_RETAINED path in
             // `value_to_variant`), consuming the retention. Checked so a
             // 64-bit id cannot silently truncate on a 32-bit target (Android

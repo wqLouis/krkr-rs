@@ -1,8 +1,6 @@
 //! Audio decoding for the stateless [`Media`] engine.
 //!
-//! This is the `media` replacement for `tvp-sound/src/decode.rs`. It
-//! keeps the reference's two decode shapes but expresses them through the
-//! final middle-layer API:
+//! The decoder offers two decode shapes through the final middle-layer API:
 //!
 //! * [`probe_audio`] reads only the container header (sample rate, channels,
 //!   frame count) so the middle layer can answer duration queries promptly.
@@ -272,7 +270,7 @@ where
 
 /// Probes an audio stream for its [spec](AudioSpec) without decoding samples.
 ///
-/// `hint` is the storage name or extension the caller used to find `bytes`;
+/// `hint` is the storage name or extension the caller matched `bytes` by;
 /// it only steers backend selection and is never trusted over the content.
 ///
 /// # Errors
@@ -673,10 +671,9 @@ fn decode_packet_into(
 
 /// Seeks the stream so the next [`read_audio`] starts at `frame`.
 ///
-/// The reader is reopened from the retained compressed bytes (the reference
-/// `StreamDecoder` behaviour on seek/loop wrap), then decoded frames are
-/// discarded until `frame` is reached. The decode position is updated
-/// immediately.
+/// The reader is reopened from the retained compressed bytes, then decoded
+/// frames are discarded until `frame` is reached. The decode position is
+/// updated immediately.
 ///
 /// # Errors
 ///

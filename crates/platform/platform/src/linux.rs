@@ -515,7 +515,7 @@ fn physical_key(physical: WinitPhysicalKey) -> PhysicalKey {
 /// Maps a winit `KeyCode` to the platform-neutral key.
 ///
 /// winit's enum is non-exhaustive; a code with no named value (a future key, or
-/// one with no KiriKiri key code) keeps its winit discriminant as a
+/// one with no virtual-key code) keeps its winit discriminant as a
 /// [`PhysicalKey::Native`] identity.
 fn map_winit_key(code: WinitKeyCode) -> PhysicalKey {
     match code {
@@ -723,9 +723,9 @@ pub(crate) mod audio {
     ///
     /// This is a last resort, not the normal path: [`default_spec`] picks the
     /// best 1–2 channel format the device supports. 44.1
-    /// kHz stereo is the KiriKiri/reference mix rate and the format every
-    /// output device we target can render, so it is the safest thing to try
-    /// when the device tells us nothing.
+    /// kHz stereo is the mix rate games expect and the format every output
+    /// device we target can render, so it is the safest thing to try when the
+    /// device tells us nothing.
     const FALLBACK_SPEC: AudioSpec = AudioSpec {
         sample_rate: 44_100,
         channels: 2,

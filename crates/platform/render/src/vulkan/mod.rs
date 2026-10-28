@@ -1044,7 +1044,7 @@ impl VulkanPipeline {
             }
 
             // The frame samples textures uploaded since the previous frame.
-            // Wait for those uploads before this submit so no draw observes a
+            // Wait for those uploads ahead of this submit so no draw observes a
             // stale image; an upload recorded in the frame's own command buffer
             // would not need this, but the upload API is called outside the
             // frame (see the module's upload ring).
@@ -1173,7 +1173,7 @@ pub(crate) struct VulkanSurface {
 
 /// Command and synchronisation objects for one frame in flight.
 pub(crate) struct VulkanFrame {
-    /// Command pool used to allocate `command_buffer`.
+    /// Command pool that allocates `command_buffer`.
     pub(crate) command_pool: vk::CommandPool,
     /// Primary command buffer recorded each frame.
     pub(crate) command_buffer: vk::CommandBuffer,

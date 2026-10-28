@@ -251,9 +251,9 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
             );
         }
         let scene = game.scene();
-        // Layers the window's root list can actually reach — the reference
-        // draws exactly that tree (`tTVPLayerManager::RecreateOverallOrderIndex`),
-        // so a scene with many unreached layers renders as an empty window.
+        // Layers the window's root list can actually reach: the window draws
+        // exactly that tree, so a scene with many unreached layers renders as an
+        // empty window.
         let reachable: Vec<String> = scene
             .windows
             .iter()
@@ -503,7 +503,7 @@ impl DesktopApp {
 
 impl EventHandler for DesktopApp {
     fn resumed(&mut self, window: &PlatformWindow) -> Flow {
-        // A missing handle is fatal, never replaced by a synthetic one.
+        // A missing handle is fatal; no synthetic one stands in for it.
         let window_handle = match window.raw_window_handle() {
             Ok(handle) => handle,
             Err(error) => {

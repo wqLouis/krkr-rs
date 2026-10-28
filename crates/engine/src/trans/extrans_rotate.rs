@@ -1,13 +1,10 @@
 //! `rotatezoom`, `rotatevanish` and `rotateswap` — the rotation family of
-//! `extrans.dll` (`sample/extrans/rotatebase.cpp` and
-//! `sample/extrans/rotatetrans.cpp`).
+//! the `extrans` plugin.
 //!
 //! All three are `ttExchange` / `tutDivisible` providers built on one
-//! shared base class, [`tTVPBaseRotateTransHandler`][base] in the reference,
-//! and this module mirrors that split: [`base_apply`] is the base class and
-//! [`zoom_quads`] / [`swap_quads`] are its `CalcPosition` overrides.
-//!
-//! [base]: sample/extrans/rotatebase.cpp
+//! shared base class, and this module mirrors that split: [`base_apply`]
+//! is the base class and [`zoom_quads`] / [`swap_quads`] are its
+//! `CalcPosition` overrides.
 //!
 //! # What the base does each frame
 //!
@@ -23,48 +20,48 @@
 //! `AddSource` calls overwrite earlier ones, so the *last* source placed
 //! wins where the two quadrilaterals overlap.
 //!
-//! Each `AddSource` issues at most **one** span per scanline, so this port
-//! stores the frame as at most two spans per line ([`LinePlan`]) instead of
-//! the reference's region list with its splitting `AddLine`; overlap
+//! Each `AddSource` issues at most **one** span per scanline, so the frame
+//! is stored as at most two spans per line ([`LinePlan`]) instead of a
+//! region list with its splitting `AddLine`; overlap
 //! resolution by placement order is preserved through [`Quads::top`]. That
 //! is the only structural simplification — the scanline geometry itself
 //! (the edge walk over the vertex ring, the `65536 * dx / (dy + 1)` edge
 //! steps, the `(ax - dx + 1) / (adx - ddx + 1)` in-span step and the
-//! `>> 16` truncation) is ported statement for statement.
+//! `>> 16` truncation) follows statement for statement.
 //!
 //! # Timing
 //!
-//! The reference drives the animation from elapsed milliseconds
+//! The animation is driven from elapsed milliseconds
 //! (`CurTime / Time`, a division of two `tjs_int`s in a `float`), not from
 //! the 0..255 phase; [`Frame`] reproduces those two values from
 //! [`Trans::elapsed_ms`](super::Trans::elapsed_ms) and
 //! [`Trans::duration_ms`](super::Trans::duration_ms), truncated to `i32`
-//! exactly like the reference's `(tjs_int)` casts, and applies the
+//! exactly like the `(tjs_int)` casts, and applies the
 //! provider's own `if(time < 2) time = 2;` guard. Every `float` intermediate
-//! of the reference (`zm`, `tm`, `rad`, `s`, `c`) stays an `f32` here while
+//! (`zm`, `tm`, `rad`, `s`, `c`) stays an `f32` here while
 //! `double` expressions such as `pow(...)` and `2 * 3.14159265368979 *
 //! Twist * tm` stay `f64` and are narrowed on assignment, so the
-//! angle/zoom evolution follows the reference's own rounding.
+//! angle/zoom evolution keeps its own rounding.
 //!
 //! # Arithmetic
 //!
-//! `tjs_int` arithmetic in the reference runs on 32-bit wrapping integer
-//! maths (MSVC), so every fixed-point computation here uses
+//! `tjs_int` arithmetic runs on 32-bit wrapping integer
+//! maths, so every fixed-point computation here uses
 //! `wrapping_mul`/`wrapping_div`/`wrapping_add` with truncating division —
 //! identical results on overflow instead of a debug-build panic. Float →
-//! `i32` conversions truncate toward zero like C++ (Rust saturates only
-//! where the C++ would be undefined).
+//! `i32` conversions truncate toward zero, as the script's casts do (Rust
+//! saturates only where the cast would be undefined).
 //!
-//! The reference's three blit branches (`memcpy` for `stepx == 65536 &&
+//! The three blit branches (`memcpy` for `stepx == 65536 &&
 //! stepy == 0`, `TVPStretchCopy` for `stepy == 0`, `TVPLinTransCopy`
 //! otherwise) are the same nearest-neighbour walk with the same `>> 16`
 //! truncation, so [`sample`] serves all three; a sample outside the source
-//! comes back transparent through `read_pixel` where the reference's
-//! `memcpy` would read past its buffer.
+//! comes back transparent through `read_pixel` where a `memcpy`
+//! would read past its buffer.
 //!
 //! # Errors
 //!
-//! The reference's `StartTransition` rejects only a missing/void `time`
+//! `StartTransition` rejects only a missing/void `time`
 //! (validated up front by [`Trans::new`](super::Trans::new) as
 //! [`TransError::InvalidDuration`](super::TransError::InvalidDuration)),
 //! a source-size mismatch (as
@@ -89,11 +86,11 @@ pub(crate) struct ZoomParams {
     pub twist: f64,
     /// Twist acceleration in turns (`twistaccel`, default -2).
     pub twist_accel: f64,
-    /// Rotation centre; the reference defaults it to the image centre.
+    /// Rotation centre; it defaults to the image centre.
     pub center: Option<(i32, i32)>,
 }
 
-/// `rotatevanish` options (`tTVPRotateVanishTransHandlerProvider`).
+/// `rotatevanish` options.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct VanishParams {
     /// Shrink acceleration (`accel`, default 2).
@@ -102,18 +99,18 @@ pub(crate) struct VanishParams {
     pub twist: f64,
     /// Twist acceleration in turns (`twistaccel`, default 2).
     pub twist_accel: f64,
-    /// Rotation centre; the reference defaults it to the image centre.
+    /// Rotation centre; it defaults to the image centre.
     pub center: Option<(i32, i32)>,
 }
 
-/// `rotateswap` options (`tTVPRotateSwapTransHandlerProvider`).
+/// `rotateswap` options.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SwapParams {
     /// Colour revealed by the rotation (`bgcolor`, `0xAARRGGBB`).
     pub background: i64,
     /// Twist in turns (`twist`, default 1).
     pub twist: f64,
-    /// Rotation centre; the reference defaults it to the image centre.
+    /// Rotation centre; it defaults to the image centre.
     pub center: Option<(i32, i32)>,
 }
 
@@ -203,7 +200,7 @@ struct Frame {
     /// (`(tjs_int)CurTime`).
     cur: i32,
     /// Total milliseconds truncated to `tjs_int`, at least 2 like the
-    /// reference's `if(time < 2) time = 2;` guard (`(tjs_int)Time`).
+    /// `if(time < 2) time = 2;` guard (`(tjs_int)Time`).
     time: i32,
     /// Whether the frame is the last one (`CurTime == Time`), which pins
     /// `rad` to zero in `CalcPosition`.
@@ -211,7 +208,7 @@ struct Frame {
 }
 
 impl Frame {
-    /// Derive the reference's `CurTime`/`Time` from the transition clock.
+    /// Derive `CurTime`/`Time` from the transition clock.
     fn new(trans: &Trans, width: i32, height: i32) -> Self {
         let cur = trans.elapsed_ms() as i32;
         let time = (trans.duration_ms() as i32).max(2);
@@ -255,15 +252,15 @@ struct ZoomState {
     fix_src1: bool,
 }
 
-/// `65536 * num / den` with the reference's `tjs_int` arithmetic: the
-/// multiply wraps first and the division truncates toward zero.
+/// `65536 * num / den` with `tjs_int` arithmetic: the multiply wraps first
+/// and the division truncates toward zero.
 fn fixed_step(num: i32, den: i32) -> i32 {
     (65536i32).wrapping_mul(num).wrapping_div(den)
 }
 
 /// The source span a *descent* edge (ring index `0..=3`, walked backward)
 /// traverses per its whole destination length: `Height`, `-Width`,
-/// `-Height`, `Width` — the reference's `sdstep` switch.
+/// `-Height`, `Width` — the `sdstep` switch.
 fn descent_span(edge: usize, width: i32, height: i32) -> i32 {
     match edge {
         0 => height,
@@ -275,7 +272,7 @@ fn descent_span(edge: usize, width: i32, height: i32) -> i32 {
 
 /// The source span an *ascent* edge (ring index `0..=3`, walked forward)
 /// traverses per its whole destination length: `Width`, `Height`,
-/// `-Width`, `-Height` — the reference's `sastep` switch.
+/// `-Width`, `-Height` — the `sastep` switch.
 fn ascent_span(edge: usize, width: i32, height: i32) -> i32 {
     match edge {
         0 => width,
@@ -574,7 +571,7 @@ fn add_source(lines: &mut [LinePlan], points: [Point; 3], source: Source, width:
             (65536, 65536)
         };
 
-        // add line — the reference keeps `start` unclipped so a span cut
+        // add line — `start` is kept unclipped so a span cut
         // by the screen edge keeps extrapolating its walk.
         add_line(
             &mut lines[y as usize],
@@ -848,15 +845,15 @@ fn zoom_quads(frame: &Frame, state: &ZoomState) -> Quads {
 /// toward one corner while source 2 grows out of the opposite one, over
 /// `bgcolor`.
 ///
-/// The reference's `cnt`-driven `switch` always computes both
+/// The `cnt`-driven `switch` always computes both
 /// quadrilaterals but enters at `case 0` (source 1 first) once
 /// `CurTime >= Time / 2` and at `case 1` before that, so the source placed
 /// last — [`Quads::top`] — flips at the midpoint.
 ///
-/// The reference's `rotateswap` does not read `centerx`/`centery`; its
+/// `rotateswap` does not read `centerx`/`centery`; its
 /// formulas pivot on the image centre `Width/2`, `Height/2`, which is what
 /// `center` defaults to here, and a supplied centre replaces that pivot
-/// everywhere the reference spells `scx`/`scy`.
+/// everywhere `scx`/`scy` is spelled.
 fn swap_quads(frame: &Frame, twist: f64, center: (i32, i32)) -> Quads {
     let width = frame.width;
     let height = frame.height;
@@ -1023,7 +1020,7 @@ pub(crate) fn apply_swap(
     params: SwapParams,
 ) -> Result<(), TransError> {
     base_apply(trans, dst, src1, src2, region, params.background, |frame| {
-        // The reference's `rotateswap` pivots on `Width/2`, `Height/2`
+        // `rotateswap` pivots on `Width/2`, `Height/2`
         // and reads no centre option; that is the default here.
         let center = params.center.unwrap_or((frame.width / 2, frame.height / 2));
         swap_quads(frame, params.twist, center)

@@ -13,11 +13,9 @@
 //! The stream is opened but **not started** until the queue holds
 //! [`PREFILL_MS`] worth of audio. Starting against an empty queue makes the
 //! first callbacks drain nothing, so normal frame jitter (a slow frame, a
-//! lock) is immediately audible; a modest pre-fill absorbs it. This mirrors
-//! the reference's own `tTJSNI_WaveSoundBuffer::Play`, which fills several
-//! buffer units before `SoundBuffer->Play(...)` (`reference/cpp/core/sound/
-//! win32/WaveImpl.cpp:2911-2921`, "fill sound buffer with some first
-//! samples").
+//! lock) is immediately audible; a modest pre-fill absorbs it. The sound
+//! buffer fills several buffer units before playback starts ("fill sound
+//! buffer with some first samples").
 //!
 //! # Overrun
 //!
@@ -34,12 +32,12 @@
 //! leaves a constant DC plateau; when the next chunk arrives — after a long
 //! frame stall the mixer cursor has already skipped ahead — the output steps
 //! from the held level to an unrelated waveform sample, a hard discontinuity
-//! (the audible pop). The reference mixer `memset`s its callback buffer to
-//! silence before mixing (`reference/cpp/core/sound/win32/WaveMixer.cpp:424`),
-//! so its own underrun is silence reached without a step; here the fade takes
-//! the already-mixed held plateau through `0.0` and brings the resumed content
-//! up from `0.0`, so both sides of the seam pass through zero. The gain is a
-//! single scalar shared by every channel and advanced once per frame, so a
+//! (the audible pop). The mixer `memset`s its callback buffer to silence
+//! before mixing, so its own underrun is silence reached without a step; here
+//! the fade takes the already-mixed held plateau through `0.0` and brings the
+//! resumed content up from `0.0`, so both sides of the seam pass through zero.
+//! The gain is a single scalar shared by every channel and advanced once per
+//! frame, so a
 //! stereo underrun cannot shift the stereo image. Pre-fill keeps underruns
 //! rare; this only softens the one after a long stall.
 //!
@@ -375,8 +373,7 @@ mod tests {
 
     #[test]
     fn an_underrun_fades_the_held_sample_without_a_step() {
-        // The reference mixer feeds the callback silence before mixing
-        // (`reference/cpp/core/sound/win32/WaveMixer.cpp:424`); the queue's
+        // The mixer feeds the callback silence before mixing; the queue's
         // held plateau must reach that same silence without a step.
         //
         // A held plateau is the source of the pop: without the fade the output
@@ -406,9 +403,8 @@ mod tests {
 
     #[test]
     fn the_underrun_fade_reaches_exactly_silence() {
-        // The reference mixer's underrun output is silence
-        // (`reference/cpp/core/sound/win32/WaveMixer.cpp:424`); the fade must
-        // land on exactly that, not a rounded near-zero.
+        // The mixer's underrun output is silence; the fade must land on
+        // exactly that, not a rounded near-zero.
         let mut queue = queue();
         queue.push(&[1.0]);
         let mut out = [0.0; 64];
@@ -426,8 +422,7 @@ mod tests {
     #[test]
     fn playback_fades_back_in_and_recovers_the_exact_sample() {
         // The seam out of the held/silent state must pass through zero for the
-        // same reason the reference silences the callback before mixing
-        // (`reference/cpp/core/sound/win32/WaveMixer.cpp:424`).
+        // same reason the mixer silences the callback before mixing.
         let mut queue = queue();
         // Establish silence: one real sample, then a long underrun.
         queue.push(&[1.0]);

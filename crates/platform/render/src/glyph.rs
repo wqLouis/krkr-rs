@@ -5,13 +5,12 @@
 //! [`font_metrics`] are pure functions over them. The glyph atlas, layout and
 //! every cache are middle-layer state and deliberately absent here.
 //!
-//! The rasterization core is adapted from `crates/tvp-text` (read-only
-//! reference): [`px_scale_for_height`] preserves the reference height-to-scale
-//! convention, and the rasterizer reproduces the atlas' missing-glyph fallback,
-//! the synthetic bold (a 1 px right dilation of the drawn coverage, which
-//! leaves the measured advance alone) and the synthetic oblique slant. Unlike
-//! the old atlas, this API returns per-glyph coverage positioned by its
-//! bearings instead of packing pixels into a shared RGBA cell.
+//! The rasterization core: [`px_scale_for_height`] keeps the height-to-scale
+//! convention, and the rasterizer provides the missing-glyph fallback, the
+//! synthetic bold (a 1 px right dilation of the drawn coverage, which leaves
+//! the measured advance alone) and the synthetic oblique slant. This API
+//! returns per-glyph coverage positioned by its bearings instead of packing
+//! pixels into a shared RGBA cell.
 
 use std::fmt;
 
@@ -22,14 +21,14 @@ use api::glyph::{FontMetrics, GlyphBitmap, GlyphStyle};
 
 /// Synthetic oblique slant applied when [`GlyphStyle::italic`] is set.
 ///
-/// `0.25` is the conventional ~14° oblique the middle layer previously applied
-/// at paint time (`crates/tvp-visual/src/natives/layer.rs`).
+/// `0.25` is the conventional ~14° oblique the middle layer applies at paint
+/// time.
 const ITALIC_SLANT: f32 = 0.25;
 
 /// Stateless font service.
 ///
 /// Created by [`create_font_system`]. It owns no mutable state and may be
-/// shared by reference; the [`FontSystem`] argument is threaded through every
+/// shared between callers; the [`FontSystem`] argument is threaded through every
 /// function so a future rasterizer backend can carry immutable configuration
 /// here without changing the API.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -124,13 +123,11 @@ pub fn load_font(fs: &FontSystem, bytes: &[u8], index: u32) -> Result<Font, Glyp
 /// Rasterizes `glyph` at `size_px` into an 8-bit coverage bitmap.
 ///
 /// `size_px` is the *em size*: [`px_scale_for_height`] rescales it so a
-/// full-width CJK glyph is exactly `size_px` pixels wide, matching the
-/// reference measurement contract.
+/// full-width CJK glyph is exactly `size_px` pixels wide.
 ///
 /// # Behavior
 ///
-/// * Control characters produce an empty bitmap with zero advance, as in the
-///   reference atlas.
+/// * Control characters produce an empty bitmap with zero advance.
 /// * A character the face does not map falls back to U+FFFD and then to
 ///   `.notdef` (glyph 0); [`GlyphError::MissingGlyph`] is returned only when
 ///   the face cannot even outline `.notdef`.
@@ -290,10 +287,9 @@ pub fn font_metrics(fs: &FontSystem, font: &Font, size_px: f32) -> FontMetrics {
 /// Converts an em size in pixels into an `ab_glyph` [`PxScale`].
 ///
 /// `ab_glyph` treats `PxScale.y` as the font's line height (`ascent −
-/// descent`), whereas the reference treats a font height as the em size.
-/// Rescaling by `height / units_per_em` makes a full-width CJK glyph exactly
-/// `size_px` pixels wide. This is a direct adaptation of `tvp-text`'s
-/// `px_scale_for_height`.
+/// descent`), whereas a font height here is the em size. Rescaling by
+/// `height / units_per_em` makes a full-width CJK glyph exactly `size_px`
+/// pixels wide.
 fn px_scale_for_height(font: &FontVec, size_px: f32) -> PxScale {
     // `rasterize_glyph`, `glyph_advance` and `font_metrics` all reject a
     // non-positive or non-finite `size_px` before they call this, so the scale
@@ -305,15 +301,15 @@ fn px_scale_for_height(font: &FontVec, size_px: f32) -> PxScale {
     PxScale::from(size_px * extent / units_per_em)
 }
 
-/// Rounds a pixel-space advance the way the reference `FT_PosToInt` does:
-/// round-half-up for positive values (`((x + 32) >> 6)` on 26.6 fixed point).
+/// Rounds a pixel-space advance: round-half-up for positive values
+/// (`((x + 32) >> 6)` on 26.6 fixed point).
 fn round_advance(advance: f32) -> i32 {
     (advance + 0.5).floor() as i32
 }
 
 /// Resolves `c` to a glyph id, preferring the face's U+FFFD replacement glyph
-/// and then `.notdef` (glyph 0) exactly as the reference atlas does. Shared by
-/// rasterization and advance lookup so both agree.
+/// and then `.notdef` (glyph 0). Shared by rasterization and advance lookup so
+/// both agree.
 fn glyph_id_with_fallback(c: char, scaled: &ab_glyph::PxScaleFont<&FontVec>) -> GlyphId {
     let id = scaled.glyph_id(c);
     if id == GlyphId(0) && c != '\0' {

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Monotonic source of [`Texture`] identities.
 ///
 /// Using a counter instead of the backing allocation address removes the ABA
-/// hazard where a dropped-and-freed handle could be replaced by a new one at
+/// hazard where a dropped-and-freed handle could be swapped for a new one at
 /// the same address and silently reuse a stale GPU texture.
 static NEXT_TEXTURE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -45,7 +45,7 @@ impl TextureFormat {
     }
 }
 
-/// Description used to create a [`Texture`].
+/// Description for creating a [`Texture`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TextureDesc {
     /// Width in pixels; must be non-zero.

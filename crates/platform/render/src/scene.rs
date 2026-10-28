@@ -2,7 +2,7 @@
 //!
 //! The tree is defined here (L1) so the pipeline can traverse it, but it is
 //! owned by the middle layer (L2). It carries drawable structure and blend
-//! semantics only: no TVP properties, no engine state.
+//! semantics only: no layer properties, no engine state.
 
 use api::blend::BlendMode;
 use api::geometry::{Affine2, PixelRegion, RectF, Transform2D};
@@ -240,7 +240,7 @@ impl RenderScene {
     }
 }
 
-/// Sort key used to order siblings for drawing: lower `z` draws first.
+/// Sort key that orders siblings for drawing: lower `z` draws first.
 ///
 /// Kept here so the null and Vulkan backends cannot drift in ordering
 /// semantics.

@@ -15,14 +15,14 @@
 //!   both the windowed event loop and the headless step.
 //! * `--archive XP3` (repeatable, order-significant, later wins) mounts the
 //!   explicit game archives and runs the L2 startup sequence through the L4
-//!   VM host. One positional path is also accepted, mirroring the reference
-//!   `TVPCheckStartupArg`: a directory becomes the app path (its loose
-//!   `startup.tjs` decides bootability), a file is mounted as an archive.
+//!   VM host. One positional path is also accepted: a directory becomes the app
+//!   path (its loose `startup.tjs` decides bootability), a file is mounted as
+//!   an archive.
 //!   `--base-dir DIR` sets the app path; it defaults to the first archive's
 //!   parent and every relative archive path resolves against it. With no
 //!   `--archive` and a directory app path, every `*.xp3` under it mounts
-//!   recursively; an explicit archive list suppresses that, and the reference
-//!   has no such scan.
+//!   recursively; an explicit archive list suppresses that, and no directory
+//!   is scanned for it.
 //! * `--preload-archives` reads each mounted archive into memory in the
 //!   background, trading the archive's size in resident memory for never
 //!   reading it back from storage. Off by default; entries return the same
@@ -33,8 +33,8 @@
 //!   default.
 //! * `--graphic-cache-limit LIMIT` sets the decoded-image cache policy:
 //!   `none` disables it, `0`/`unlimited` keeps every decoded image, and a
-//!   positive integer is a byte cap. Without the option the reference default
-//!   (disabled) applies, and a startup script may still change it through
+//!   positive integer is a byte cap. Without the option the cache stays
+//!   disabled, and a startup script may still change it through
 //!   `System.graphicCacheLimit`.
 //! * `--backend vulkan` requests the Vulkan pipeline. It needs a real
 //!   window with a display connection (Wayland/X11/XCB); the windowed host
@@ -168,8 +168,7 @@ struct Cli {
     archives: Vec<PathBuf>,
     /// App path override (`--base-dir`); defaults to the current directory.
     base_dir: Option<PathBuf>,
-    /// The first positional argument (reference `argv[1]`): a game directory
-    /// or an archive file.
+    /// The first positional argument: a game directory or an archive file.
     positional: Option<PathBuf>,
     /// Whether `-h`/`--help` was requested.
     help: bool,
@@ -399,17 +398,15 @@ fn main() -> ExitCode {
 /// Resolves the command line into the game to load, or `None` when no game
 /// input was given (the empty-scene run).
 ///
-/// The reference discovers the game from its first command-line argument
-/// (`TVPCheckStartupArg`): a directory is the app path whose loose
-/// `startup.tjs` decides bootability, a file is opened as an archive. There is
-/// no default folder scan for `*.xp3`. `--archive` stays authoritative and is
-/// mounted in addition to a positional archive.
+/// The game is discovered from the first command-line argument: a directory is
+/// the app path whose loose `startup.tjs` decides bootability, a file is opened
+/// as an archive. There is no default folder scan for `*.xp3`. `--archive`
+/// stays authoritative and is mounted in addition to a positional archive.
 ///
 /// The app path is `--base-dir` (or a positional directory) when given;
-/// otherwise it is the first archive's parent (the reference `TVPGetAppPath`
-/// convention), falling back to the working directory. Relative archive paths
-/// resolve against the app path, so it is the single root for archives and
-/// loose files.
+/// otherwise it is the first archive's parent, falling back to the working
+/// directory. Relative archive paths resolve against the app path, so it is
+/// the single root for archives and loose files.
 fn resolve_game(cli: &Cli) -> Result<Option<GameInput>, String> {
     let mut raw_archives = cli.archives.clone();
     let mut positional_dir = None;

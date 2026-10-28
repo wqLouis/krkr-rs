@@ -16,7 +16,7 @@
 //! Script-visible text is drawn by compositing per-character coverage into the
 //! layer's [`BitmapState`] ([`rasterize_text_coverage`] +
 //! [`compose_text_into`]), so `getPixel` and every other readback observe the
-//! same pixels the reference produces. The [`GlyphAtlas`] path rasterizes the
+//! same composited pixels. The [`GlyphAtlas`] path rasterizes the
 //! same coverage once, packs it into a texture, and [`project_text`] emits
 //! textured quads for the L1 pipeline; it needs a live [`RenderPipeline`].
 //!
@@ -258,7 +258,7 @@ impl TextLayout {
 /// `coverage` holds exactly `width * height` row-major bytes, where `0` is
 /// fully transparent and `255` fully covered. The constructor enforces that
 /// invariant, so a mask is always internally consistent. The coverage buffer is
-/// reference-counted so placing the same mask at a different pen position is a
+/// shared (refcounted) so placing the same mask at a different pen position is a
 /// cheap handle copy, not a pixel copy.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -398,7 +398,7 @@ pub struct TextEngine {
     /// logged. The record is emitted once per engine, not once per name.
     default_fallback_logged: bool,
     /// Memoized shaped layouts, keyed by shaping inputs only. Bounded at the
-    /// reference limit with least-recently-used eviction.
+    /// cache limit with least-recently-used eviction.
     layout_cache: LruCache<LayoutKey, TextLayout>,
     /// Memoized per-character advances, keyed by face, character, size and
     /// synthetic style. Bounded at [`MAX_TEXT_CACHE_ENTRIES`] with
@@ -439,7 +439,7 @@ impl TextEngine {
     ///
     /// The directories are scanned lazily, the first time a face is resolved
     /// from the host, together with `fontdb`'s default system locations. A
-    /// database built before this call is discarded so the new list takes
+    /// database built earlier is discarded so the new list takes
     /// effect; call it before any face has been resolved to avoid the rescan.
     ///
     /// The missing-family memo is dropped with the database it describes: a
@@ -1055,7 +1055,7 @@ pub struct GlyphAtlas {
     /// Tallest glyph in the current shelf.
     row_height: u32,
     /// Rasterized glyphs, keyed by face/codepoint/size/style and evicted least
-    /// recently used at the reference limit.
+    /// recently used at the cache limit.
     entries: LruCache<GlyphKey, AtlasGlyph>,
     /// Regions written to the CPU mirror but not yet copied to the GPU.
     pending: Vec<PendingGlyphUpload>,
@@ -1421,7 +1421,7 @@ pub fn project_text(
 /// [`GlyphAtlas`] coverage, tints it with each glyph's colour and applies
 /// straight-alpha source-over with the glyph's opacity. It is not the
 /// production text path — the emulator composites coverage straight into the
-/// layer bitmap with [`compose_text_into`] — but it is the reference for a
+/// layer bitmap with [`compose_text_into`] — but it is the model for a
 /// test that compares the projected atlas pixels with a CPU composite. The
 /// returned buffer starts fully transparent.
 pub fn compose_text_cpu(
@@ -1492,7 +1492,7 @@ struct CoverageKey {
     /// Coverage antialiasing.
     antialias: bool,
     /// `None` for the sharp character; `Some((blur_level, blur_width))` for
-    /// the blurred shadow (the reference `Blured` plus its blur parameters).
+    /// the blurred shadow (the `Blured` variant plus its blur parameters).
     blur: Option<(u8, i32)>,
 }
 
@@ -1704,7 +1704,7 @@ impl<K: Eq + std::hash::Hash + Clone, V> LruCache<K, V> {
 /// later draw. Eviction is least-recently-used. The type is explicit
 /// caller-owned state; there is no global cache.
 pub struct TextCoverageCache {
-    /// Cached masks, evicted least-recently-used at the reference limit.
+    /// Cached masks, evicted least-recently-used at the cache limit.
     entries: LruCache<CoverageKey, CoverageMask>,
     /// Number of masks produced by rasterization; a diagnostic for tests.
     rasterizations: u64,
@@ -1747,7 +1747,7 @@ impl TextCoverageCache {
     }
 
     /// Inserts `mask` under `key`, evicting the least recently used entry at
-    /// the reference limit.
+    /// the cache limit.
     fn insert(&mut self, key: CoverageKey, mask: CoverageMask) {
         self.entries.insert(key, mask);
     }
@@ -1989,7 +1989,7 @@ fn requires_ink(codepoint: char) -> bool {
     !codepoint.is_whitespace() && !codepoint.is_control()
 }
 
-/// Blurs a positioned 8-bit coverage mask with the reference character-blur
+/// Blurs a positioned 8-bit coverage mask with the character-blur
 /// kernel.
 ///
 /// `blur_width == 0` keeps the mask's size and scales every byte by

@@ -121,7 +121,7 @@ pub struct HostConfig {
     ///
     /// [`window_handle`]: HostConfig::window_handle
     pub headless: bool,
-    /// Window handle used to create the surface.
+    /// Window handle that creates the surface.
     ///
     /// Required unless [`HostConfig::headless`] is set. The windowed host
     /// passes the real platform window handle here so a Vulkan surface can
@@ -141,7 +141,7 @@ pub struct HostConfig {
     /// or bitmap, so it cannot change the scene a script observes.
     pub debug_overlay: bool,
     /// The decoded-image cache policy, or `None` to keep the engine default
-    /// (disabled, as in the reference). See [`CacheLimit`].
+    /// (disabled). See [`CacheLimit`].
     pub graphic_cache_limit: Option<CacheLimit>,
     /// Frame period the caller paces its loop at.
     ///

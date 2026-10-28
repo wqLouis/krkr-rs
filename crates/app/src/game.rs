@@ -158,8 +158,7 @@ impl FrameBody for Polls {
     #[allow(unsafe_code)]
     fn frame_tail(&mut self, ctx: &mut CompatCtx) -> Result<(), CompatError> {
         // The movie frame body advances its overlays and copies the current
-        // frame into the layer before the transition step composites it
-        // (reference `layerExMovie::OnContinuousCallback`).
+        // frame into the layer before the transition step composites it.
         compat::movie_poll(ctx, self.max_step_ms)?;
         // The frame body owns the per-frame transition step; the remaining
         // hand-offs are host drains the engine frame consumes after this poll
@@ -391,7 +390,7 @@ struct VmHook<'a> {
     audio: &'a mut AudioOutput,
     /// Platform events delivered to script this frame.
     events: &'a [PlatformEvent],
-    /// The presentation the frame started with, used to map input positions
+    /// The presentation the frame started with, which maps input positions
     /// from device pixels into VM pixels.
     translation: Option<PixelTranslation>,
     /// The ordered frame body and its per-frame cost record.
@@ -641,20 +640,16 @@ impl GameHost {
         unsafe { crate::install_video_source_metered(vm.compat(), &media, &storage, &stats) }
             .map_err(vm::VmError::from)?;
         crate::install_window_ex_facts(vm.compat(), host.surface_size());
-        // The reference clipboard is inert
-        // (`reference/cpp/core/utils/impl/ClipboardImpl.cpp:5-19`):
-        // `hasFormat` is false, `asText` reads void, and a write is a no-op.
-        // Installing the emulated backend keeps every `Clipboard` member from
-        // raising the missing-backend error in production.
+        // The clipboard is inert: `hasFormat` is false, `asText` reads void,
+        // and a write is a no-op. Installing the emulated backend keeps every
+        // `Clipboard` member from raising the missing-backend error in
+        // production.
         vm.compat()
             .set_clipboard_backend((|_format| false, || None, |_text| {}));
 
-        // The reference auto-loads `.tpm` plugins from the exe/system/plugin
-        // folders before the startup scripts run
-        // (`reference/cpp/core/plugin/PluginImpl.cpp:148-177`, called from
-        // `reference/cpp/core/environ/Application.cpp:342`). The composition
-        // root enumerates with the L1 file system and compat links the ordered
-        // names.
+        // `.tpm` plugins in the exe/system/plugin folders are loaded before the
+        // startup scripts run. The composition root enumerates with the L1 file
+        // system and compat links the ordered names.
         let tpm_plugins = discover_tpm_plugins(&FileSystem::host(base_dir.clone()), &base_dir)?;
         if !tpm_plugins.is_empty() {
             let mut ctx = vm.compat().ctx()?;
@@ -707,7 +702,7 @@ impl GameHost {
         &self.storage
     }
 
-    /// The TVP layer system the VM mutates.
+    /// The layer system the VM mutates.
     pub fn scene(&self) -> &engine::Scene {
         self.host.scene()
     }
@@ -764,8 +759,8 @@ impl GameHost {
         pacing: FramePacing,
     ) -> Result<StepReport, GameError> {
         let dt = clock.elapsed_ms().max(0.0);
-        // The gap spans the previous frame, so attribute it before this step
-        // overwrites the stored frame.
+        // The gap spans the last frame; attribute it before the step overwrites
+        // the stored frame.
         if let Some(line) = self.last_frame.slow_frame_line(dt, pacing) {
             log::warn!("{line}");
         }
@@ -988,16 +983,13 @@ fn explicit_project(
         .unwrap_or_else(|| base_dir.to_path_buf())
 }
 
-/// The `.tpm` plugin files the reference auto-loads, in ASCII filename order.
+/// The `.tpm` plugin files loaded at startup, in ASCII filename order.
 ///
-/// The reference `TVPSearchPluginsAt` keeps regular files whose name ends in
-/// `.tpm` (case-insensitive) and `tvpLoadPlugins` scans the exe directory,
-/// `<exe>/system` and `<exe>/plugin`, sorts the combined list by file name and
-/// loads each (`reference/cpp/core/plugin/PluginImpl.cpp:76-88`, `:148-177`,
-/// called from `reference/cpp/core/environ/Application.cpp:342`). The scan is
-/// the composition root's job: compat owns no file-system access. A missing or
-/// non-directory entry contributes nothing; any other listing error
-/// propagates.
+/// The scan keeps regular files whose name ends in `.tpm` (case-insensitive)
+/// in the exe directory, `<exe>/system` and `<exe>/plugin`, sorts the
+/// combined list by file name and loads each. The scan is the composition
+/// root's job: compat owns no file-system access. A missing or non-directory
+/// entry contributes nothing; any other listing error propagates.
 fn discover_tpm_plugins(fs: &FileSystem, base_dir: &Path) -> Result<Vec<String>, GameError> {
     let mut found = Vec::new();
     for dir in [
@@ -1016,15 +1008,14 @@ fn discover_tpm_plugins(fs: &FileSystem, base_dir: &Path) -> Result<Vec<String>,
             }
         }
     }
-    // ASCII filename order, the reference's sort key (`PluginImpl.cpp:168`).
+    // ASCII filename order.
     found.sort();
     Ok(found)
 }
 
 /// Whether `name` ends in `.tpm`, case-insensitively.
 ///
-/// The reference matches the suffix without regard to case
-/// (`reference/cpp/core/plugin/PluginImpl.cpp:76-88`).
+/// The suffix is matched without regard to case.
 fn has_tpm_extension(name: &str) -> bool {
     name.len() >= 4 && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".tpm")
 }
@@ -1042,7 +1033,7 @@ fn run_startup_script(
     result
 }
 
-/// Runs the resolved startup sequence (reference `TVPExecuteStartupScript`).
+/// Runs the resolved startup sequence.
 ///
 /// `patch.tjs` and `AfterStartup.tjs` are app-path only and non-fatal (their
 /// errors are reported but do not stop startup); `startup.tjs` is searched and

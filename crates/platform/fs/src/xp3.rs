@@ -1,10 +1,9 @@
 //! XP3 archive reader — L1 stateless container parsing.
 //!
-//! This is a port of the standalone `xp3` crate reader onto the L1
-//! [`FileState`] surface: instead of owning a live `std::fs::File`, the
-//! parser reads through a small [`FileReader`] adapter that turns positional
-//! [`read_at`] calls into the `Read + Seek` interface the original parser
-//! logic expects. The on-disk format behaviour — magic, index chaining, raw
+//! The reader works on the L1 [`FileState`] surface: instead of owning a
+//! live `std::fs::File`, it reads through a small [`FileReader`] adapter that
+//! turns positional [`read_at`] calls into the `Read + Seek` interface the
+//! parser logic expects. The on-disk format behaviour — magic, index chaining, raw
 //! and zlib index/segment encodings, name normalization, EXE-embedded search
 //! — is preserved.
 //!
@@ -113,10 +112,8 @@ pub type Result<T> = std::result::Result<T, Xp3Error>;
 ///
 /// The L1 reader owns no filter: the caller passes one in and it is invoked
 /// once per segment on the bytes that are about to be appended to the entry
-/// output — the same point the reference engine calls
-/// `TVPXP3ArchiveExtractionFilter` (`XP3Archive.cpp:998`), i.e. after a
-/// compressed segment has been inflated and before the bytes are returned to
-/// the reader. The filter may rewrite `buffer` in place.
+/// output — after a compressed segment has been inflated and before the bytes
+/// are returned to the reader. The filter may rewrite `buffer` in place.
 ///
 /// Arguments: `(file_hash, offset, buffer, file_name, archive_name,
 /// file_size)`.
@@ -124,9 +121,8 @@ pub type Result<T> = std::result::Result<T, Xp3Error>;
 /// * `file_hash` — the Adler32 name hash from the entry's `adlr` chunk;
 /// * `offset` — uncompressed offset of `buffer[0]` within the entry;
 /// * `buffer` — the segment's decoded bytes, rewritten in place;
-/// * `file_name` — the entry's normalized in-archive name (the reference
-///   passes `Owner->GetName`, which is normalized because gameplay archives
-///   are opened with `normalizeName=true`);
+/// * `file_name` — the entry's normalized in-archive name (gameplay archives
+///   are opened with name normalization on);
 /// * `archive_name` — the logical archive name the caller mounted
 ///   (empty when the caller does not know it);
 /// * `file_size` — the entry's total uncompressed size.
@@ -178,19 +174,18 @@ pub struct Entry {
 /// How one index block stores its payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexEncode {
-    /// `TVP_XP3_INDEX_ENCODE_RAW` — the block's bytes are the index data.
+    /// The block's bytes are the index data.
     Raw,
-    /// `TVP_XP3_INDEX_ENCODE_ZLIB` — the block is a zlib stream.
+    /// The block is a zlib stream.
     Zlib,
 }
 
 /// What one index block contributed while the archive was parsed.
 ///
-/// The reference reads every block an `INDEX_CONTINUE` chain links together
-/// and appends each `File` chunk to one item vector
-/// (`reference/cpp/core/archive/xp3/XP3Archive.cpp:348-505`); this records the
-/// same blocks so a lookup miss can say how many were read and how many names
-/// each supplied.
+/// Every block an `INDEX_CONTINUE` chain links together is read, and each
+/// `File` chunk is appended to one item vector; this records the same blocks
+/// so a lookup miss can say how many were read and how many names each
+/// supplied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexSection {
     /// Absolute offset of the block in the archive file.
@@ -332,13 +327,13 @@ impl Xp3Archive {
         &self.sections
     }
 
-    /// Names that resemble `request` under the reference's in-archive lookup
-    /// rules, bounded to `cap` names plus the total match count.
+    /// Names that resemble `request` under the in-archive lookup rules,
+    /// bounded to `cap` names plus the total match count.
     ///
-    /// A name is a near miss when, after the same normalization the reference
-    /// applies to a stored name, it either equals the request modulo a leading
-    /// path, shares the request's base name, or contains the request's stem.
-    /// The strongest matches (path and base name) come first.
+    /// A name is a near miss when, after the same normalization applied to a
+    /// stored name, it either equals the request modulo a leading path, shares
+    /// the request's base name, or contains the request's stem. The strongest
+    /// matches (path and base name) come first.
     pub fn near_misses(&self, request: &str, cap: usize) -> NearMisses {
         let request = normalize_in_archive_name(request);
         if request.is_empty() {
@@ -425,9 +420,9 @@ impl Xp3Archive {
     /// Read the full contents of an entry, applying `filter` to each decoded
     /// segment in place before it is appended.
     ///
-    /// The filter is invoked with the running uncompressed offset, matching
-    /// the reference's `tTVPXP3ArchiveStream::Read`, so a whole-entry read
-    /// sees the same `(offset, buffer)` sequence a streaming read would.
+    /// The filter is invoked with the running uncompressed offset, so a
+    /// whole-entry read sees the same `(offset, buffer)` sequence a streaming
+    /// read would.
     ///
     /// # Errors
     ///
@@ -494,14 +489,12 @@ impl Xp3Archive {
     /// inflated only as far as the requested bytes need, so a header probe
     /// never inflates the whole entry. It concatenates across segments until
     /// `max_len` is reached; trailing segments are not read or decoded. This
-    /// is our own API, not a reference-parity claim: the reference exposes a
-    /// seekable per-member stream (`tTVPXP3ArchiveStream`) but on this path
-    /// reads whole files, so the reference does not do partial reads here.
+    /// is this crate's own API: no seekable per-member stream is exposed here,
+    /// because this path reads whole files and does not do partial reads.
     /// Segment order and concatenation are the same as [`Self::read`], and a
     /// genuine decode or I/O failure is the same typed error. A shorter entry
     /// returns short; the caller decides whether a short result is an error
-    /// (the middle-layer wrapper treats a short header as the reference's own
-    /// short-read case).
+    /// (the middle-layer wrapper treats a short header as a short read).
     ///
     /// # Errors
     ///
@@ -608,9 +601,9 @@ impl Xp3Archive {
                 }
                 other => return Err(Xp3Error::UnknownSegmentMethod(other, seg.flags)),
             };
-            // The reference applies the extraction filter to the decoded
-            // segment with the uncompressed offset and the normalized
-            // in-archive name; a prefix is the same transform on fewer bytes.
+            // The extraction filter runs on the decoded segment with the
+            // uncompressed offset and the normalized in-archive name; a prefix
+            // is the same transform on fewer bytes.
             if let Some(filter) = filter {
                 filter(
                     entry.file_hash,
@@ -637,8 +630,8 @@ impl Xp3Archive {
         archive_name: &str,
         filter: Option<&Xp3ExtractionFilter<'_>>,
     ) -> Result<Vec<u8>> {
-        // Note: `protected` (DRM bit) files are read normally, matching the
-        // reference emulator, which allows extracting protected storage.
+        // Note: `protected` (DRM bit) files are read normally, so extracting a
+        // protected storage is allowed.
         // Size the output from the segments' own declared sizes rather than
         // the entry header. The sum is checked for overflow and the
         // allocation is fallible, so a structurally invalid size is an error
@@ -684,10 +677,9 @@ impl Xp3Archive {
                 }
                 other => return Err(Xp3Error::UnknownSegmentMethod(other, seg.flags)),
             };
-            // The reference applies the extraction filter to the decoded
-            // segment (after any inflation) with the uncompressed offset and
-            // the normalized in-archive name (`Owner->GetName` returns the
-            // name `Init` normalized under `normalizeName=true`).
+            // The extraction filter runs on the decoded segment (after any
+            // inflation) with the uncompressed offset and the normalized
+            // in-archive name.
             if let Some(filter) = filter {
                 filter(
                     entry.file_hash,
@@ -706,7 +698,7 @@ impl Xp3Archive {
         // The entry header's `org_size` must agree with what the segments
         // actually compose; otherwise `stat` would report one size and `read`
         // return another. This is a real check, not a debug assertion. (The
-        // filter runs before this check but must preserve the byte count.)
+        // filter runs ahead of this check but must preserve the byte count.)
         if out.len() as u64 != entry.org_size {
             return Err(Xp3Error::CorruptIndex(
                 "segment sizes disagree with info.org_size",
@@ -717,10 +709,9 @@ impl Xp3Archive {
 
     // -- internals ----------------------------------------------------------
 
-    /// Read the (possibly chained) index blocks, replicating the reference
-    /// engine's loop: the first index offset is read from offset 11, and after
-    /// a block with `INDEX_CONTINUE` the next offset is read from the current
-    /// position (immediately after that block's data).
+    /// Read the (possibly chained) index blocks: the first index offset is read
+    /// from offset 11, and after a block with `INDEX_CONTINUE` the next offset
+    /// is read from the current position (immediately after that block's data).
     fn read_index<R: Read + Seek>(&mut self, reader: &mut R) -> Result<()> {
         let start = self
             .base
@@ -928,12 +919,10 @@ impl Xp3Archive {
     }
 }
 
-/// Normalize an in-archive storage name the way the reference engine does:
-/// lowercase, `\` → `/`, collapse runs of `/`, and **drop leading slashes**.
+/// Normalize an in-archive storage name: lowercase, `\` → `/`, collapse runs
+/// of `/`, and **drop leading slashes**.
 ///
-/// This mirrors `tTVPArchive::NormalizeInArchiveStorageName`
-/// (`reference/cpp/core/base/StorageIntf.cpp`): the very first `/` is skipped
-/// together with any following ones.
+/// The very first `/` is skipped together with any following ones.
 pub fn normalize_in_archive_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut started = false;

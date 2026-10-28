@@ -17,9 +17,9 @@
 //!
 //! Decoding and layer compositing need no display, so the source is installed
 //! for headless and windowed hosts alike. The one video mode with no
-//! display-independent meaning is `vomOverlay`, whose frames the reference
-//! presents through an OS overlay window; leaving it alone is the faithful
-//! behaviour rather than fabricating a surface.
+//! display-independent meaning is `vomOverlay`, whose frames are presented
+//! through an OS overlay window; leaving it alone is the faithful behaviour
+//! rather than fabricating a surface.
 //!
 //! # Storage lifetime
 //!

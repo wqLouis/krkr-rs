@@ -1,6 +1,6 @@
 //! krkr-rs **L4 TJS VM host**.
 //!
-//! Wraps `tjs` (the C++ VM): lifecycle, the log callback, bytecode
+//! Wraps `tjs` (the TJS2 VM): lifecycle, the log callback, bytecode
 //! compilation, the script cache and the per-frame body. It drives the L3
 //! compatibility surface and uses the L1 platform abstraction; it is the
 //! topmost layer.

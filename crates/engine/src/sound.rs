@@ -1,7 +1,6 @@
 //! L2 sound model and software mixer.
 //!
-//! Behavioral reference: `main`'s
-//! `crates/tvp-sound/src/{mixer,source,wavesound,waveflags}.rs`. This is
+//! This is
 //! the **state** half of sound, re-expressed as explicit L2 values:
 //!
 //! * [`SoundSource`] — a playable PCM source: either caller-supplied
@@ -99,23 +98,23 @@ pub enum SoundError {
 // Generic loop information
 // ---------------------------------------------------------------------------
 
-/// How a loop link's condition compares a flag against a reference value.
+/// How a loop link's condition compares a flag against a stored value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LoopCondition {
     /// Always taken.
     None,
-    /// Taken when the flag equals the reference value.
+    /// Taken when the flag equals the stored value.
     Equal,
-    /// Taken when the flag differs from the reference value.
+    /// Taken when the flag differs from the stored value.
     NotEqual,
-    /// Taken when the flag is greater than the reference value.
+    /// Taken when the flag is greater than the stored value.
     Greater,
-    /// Taken when the flag is greater than or equal to the reference value.
+    /// Taken when the flag is greater than or equal to the stored value.
     GreaterOrEqual,
-    /// Taken when the flag is less than the reference value.
+    /// Taken when the flag is less than the stored value.
     Lesser,
-    /// Taken when the flag is less than or equal to the reference value.
+    /// Taken when the flag is less than or equal to the stored value.
     LesserOrEqual,
 }
 
@@ -558,7 +557,7 @@ impl StreamSource {
     /// wait on the decoder.
     fn new(stream: Box<dyn AudioStream>, rate: u32, channels: u32) -> Result<Self, SoundError> {
         // Decode a quarter second per pull and keep one second decoded ahead
-        // of the cursor, mirroring the reference's decode-ahead buffer length.
+        // of the cursor, matching the decode-ahead buffer length.
         let rate = rate.max(1);
         let channels = usize::try_from(channels).map_err(|_| SoundError::InvalidSpec {
             message: format!("channel count {channels} does not fit in memory"),
@@ -1193,7 +1192,7 @@ impl SoundSource {
     }
 
     /// Whether playback at `seconds` is strictly past the end (the
-    /// reference's whole-file "done" rule: exactly at the end still plays).
+    /// whole-file "done" rule: exactly at the end still plays).
     pub fn playback_ended(&self, seconds: f64) -> bool {
         seconds > self.duration_seconds()
     }
@@ -1203,8 +1202,8 @@ impl SoundSource {
 // Fades
 // ---------------------------------------------------------------------------
 
-/// A linear volume fade (`SoundBufferBaseIntf.cpp` `Fade`): ramp from
-/// `from` to `to` over `duration` seconds, after an optional `delay`.
+/// A linear volume fade: ramp from `from` to `to` over `duration` seconds,
+/// after an optional `delay`.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct Fade {
@@ -1214,7 +1213,7 @@ pub struct Fade {
     pub to: f32,
     /// Ramp duration in seconds.
     pub duration: f64,
-    /// Delay before the ramp starts, in seconds (reference `blanktime`).
+    /// Delay before the ramp starts, in seconds (the `blanktime` option).
     pub delay: f64,
     /// Seconds since the fade started.
     pub elapsed: f64,
@@ -1274,7 +1273,7 @@ pub enum Status {
 }
 
 impl Status {
-    /// The reference status string.
+    /// The status string.
     pub const fn as_str(self) -> &'static str {
         match self {
             Status::Unload => "unload",
@@ -1386,7 +1385,7 @@ impl SoundChannel {
     }
 
     /// Install `source` on the channel without starting playback (the
-    /// reference's post-`Open` state: loaded, `stop`).
+    /// post-`Open` state: loaded, `stop`).
     pub fn load(&mut self, source: Arc<SoundSource>) {
         self.source = Some(source);
         self.playing = false;
@@ -1530,7 +1529,7 @@ impl SoundChannel {
     }
 
     /// The per-buffer volume: the fade's ramped value while a fade is active,
-    /// else the base volume (reference `GetVolume`; excludes `volume2` and
+    /// else the base volume (excludes `volume2` and
     /// the global volume).
     pub fn effective_volume(&self) -> f32 {
         match &self.fade {
@@ -2001,7 +2000,7 @@ impl Mixer {
     }
 
     /// Render one device chunk and advance the mixer by the chunk's
-    /// duration (the reference `render_mix_advancing`).
+    /// duration.
     ///
     /// This is the device-driven clock: the L1 `AudioDevice` callback calls
     /// it, and each rendered chunk moves the play positions so the next

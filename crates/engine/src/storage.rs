@@ -33,7 +33,7 @@
 //! layer's own state — it is installed on the storage and drained by the
 //! engine every frame — and there is no process-global registry.
 //!
-//! Resolution order mirrors the reference engine:
+//! Resolution order:
 //!
 //! 1. explicit `arc.xp3>path` addressing,
 //! 2. the current project storage: the project archive for an archive
@@ -279,8 +279,8 @@ pub struct Storage {
     auto_paths: Vec<String>,
     /// Whether an archive's whole image is read into memory in the background.
     preload_archives: bool,
-    /// The project storage path (the reference's current directory), supplied
-    /// by the composition root via [`Self::set_project`]. `Some` when the
+    /// The project storage path (the current directory), supplied by the
+    /// composition root via [`Self::set_project`]. `Some` when the
     /// project is an archive; a relative auto path is then normalized against
     /// it. `None` for a folder project (disk-relative auto paths).
     project: Option<PathBuf>,
@@ -336,7 +336,7 @@ pub struct ProbeCounts {
     pub list: u64,
     /// Single-path stat calls (`fs::stat`).
     pub stat: u64,
-    /// Lookups that resolved to nothing (the reference's empty placed path).
+    /// Lookups that resolved to nothing (an empty placed path).
     pub misses: u64,
 }
 
@@ -406,8 +406,8 @@ impl AutoPathTable {
 struct ResolutionCache {
     /// Candidate tables keyed by the auto-path entry string.
     auto_paths: crate::hasher::Map<String, Rc<AutoPathTable>>,
-    /// Resolved hits keyed by the requested storage name (the reference's
-    /// `TVPAutoPathCache`: a hit is cached, a miss is not).
+    /// Resolved hits keyed by the requested storage name: a hit is cached, a
+    /// miss is not.
     placed: crate::hasher::Map<String, Location>,
     /// Bottom file-system probes issued while resolving.
     probes: ProbeCounts,
@@ -427,7 +427,7 @@ impl Default for ResolutionCache {
 }
 
 /// The number of leading characters kept in the bounded `debug` storage-miss
-/// line; the rest is replaced by an elision marker naming the dropped count.
+/// line; the rest is elided behind a marker naming the dropped count.
 const MISS_LOG_HEAD_CHARS: usize = 200;
 
 /// The locations a failed storage lookup searched.
@@ -684,8 +684,7 @@ pub enum StorageReadError {
     #[error("storage not found: {0}")]
     NotFound(String),
     /// The storage name is malformed: a `..` component escapes the mount (or
-    /// crosses the archive delimiter) and the reference raises
-    /// `TVPInvalidPathName` (`reference/cpp/core/base/StorageIntf.cpp:400`).
+    /// crosses the archive delimiter).
     #[error("Invalid path name {0}")]
     InvalidPathName(String),
     /// A bottom file-system operation failed.
@@ -1510,18 +1509,16 @@ fn read_worker_loop(reader: Arc<dyn StorageReader>, shared: Arc<PoolShared>) {
     }
 }
 
-/// The searched startup script (reference `TVPStartupScriptName`).
+/// The searched startup script.
 pub(crate) const STARTUP_SCRIPT: &str = "startup.tjs";
-/// The compatibility fallback run when `startup.tjs` is absent or fails
-/// (reference `system/Initialize.tjs`).
+/// The compatibility fallback run when `startup.tjs` is absent or fails.
 pub(crate) const INITIALIZE_SCRIPT: &str = "system/Initialize.tjs";
-/// `patch.tjs`, app-path only (reference `TVPExecuteStartupScript`).
+/// `patch.tjs`, app-path only.
 pub(crate) const PATCH_SCRIPT: &str = "patch.tjs";
-/// `AfterStartup.tjs`, app-path only (reference `TVPExecuteStartupScript`).
+/// `AfterStartup.tjs`, app-path only.
 pub(crate) const AFTER_STARTUP_SCRIPT: &str = "AfterStartup.tjs";
 
-/// The startup scripts resolved against a [`Storage`] (reference
-/// `TVPExecuteStartupScript`).
+/// The startup scripts resolved against a [`Storage`].
 ///
 /// `patch.tjs` and `AfterStartup.tjs` are **app-path only** (disk, no archive
 /// search); `startup.tjs` and the `system/Initialize.tjs` fallback are
@@ -1597,10 +1594,8 @@ impl Storage {
     /// be read or parsed and reporting it through `warn!`.
     ///
     /// A scan mounts whatever the folder holds, so one stray or corrupt
-    /// archive must not abort an otherwise playable mount — the reference
-    /// `TVPCheckArchive` catch-and-log
-    /// (`reference/cpp/core/base/impl/StorageImpl.cpp:562-587`). Use
-    /// [`Self::mount_archives`] for a caller-supplied list.
+    /// archive must not abort an otherwise playable mount: it is caught and
+    /// logged. Use [`Self::mount_archives`] for a caller-supplied list.
     ///
     /// # Errors
     ///
@@ -1647,12 +1642,11 @@ impl Storage {
 
     /// Sets the project path a relative auto path is resolved against.
     ///
-    /// The reference's launcher supplies `TVPProjectDir` and the engine only
-    /// decides whether that path is a storage (an archive, so the current
-    /// directory gets the archive delimiter) or a folder
-    /// (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`). An archive
-    /// project prefixes a relative auto path (`data.xp3>system/`); a folder
-    /// project leaves it disk-relative.
+    /// The launcher supplies the project path and the engine only decides
+    /// whether that path is a storage (an archive, so the current directory
+    /// gets the archive delimiter) or a folder. An archive project prefixes a
+    /// relative auto path (`data.xp3>system/`); a folder project leaves it
+    /// disk-relative.
     ///
     /// Call after the archives are mounted, so the project archive is known,
     /// and before any startup script runs. A relative path is resolved against
@@ -1829,15 +1823,14 @@ impl Storage {
     /// Appends an auto search path (the `Storages.addAutoPath` semantics).
     /// Duplicates are ignored. A relative path is resolved against the current
     /// storage path first (the project archive when the project is
-    /// archive-backed), mirroring `TVPAddAutoPath`'s normalization against
-    /// `CurrentPath` (`reference/cpp/core/base/StorageIntf.cpp:921-937`).
+    /// archive-backed).
     pub fn add_auto_path(&mut self, path: impl Into<String>) {
         let path = self.current_storage_path(path.into());
         if !self.auto_paths.contains(&path) {
             self.auto_paths.push(path);
         }
-        // The reference clears its auto-path cache whenever the list changes
-        // (`TVPClearAutoPathCache`), which also covers the added path itself.
+        // The auto-path cache is cleared whenever the list changes, which
+        // also covers the added path itself.
         self.clear_resolution_cache();
     }
 
@@ -1850,12 +1843,9 @@ impl Storage {
 
     /// Resolves an auto path against the current storage path.
     ///
-    /// `TVPAddAutoPath` normalizes a relative path against the current
-    /// directory (`TVPNormalizeStorageName` prepends `CurrentPath`,
-    /// `reference/cpp/core/base/StorageIntf.cpp:347-425`), and the current
-    /// directory is the project — the archive the reference appends `>` to
-    /// (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`). An absolute
-    /// path, or one that already names an archive, is used as given.
+    /// A relative path is normalized against the current directory, which is
+    /// the project — the archive gets a `>` delimiter. An absolute path, or
+    /// one that already names an archive, is used as given.
     fn current_storage_path(&self, path: String) -> String {
         if path.contains('>') || Path::new(&path).is_absolute() {
             return path;
@@ -2089,8 +2079,8 @@ impl Storage {
         }
     }
 
-    /// Resolves a storage name to a location, mirroring the reference search
-    /// order: explicit `arc.xp3>path` → the current project storage → the
+    /// Resolves a storage name to a location, in this search order: explicit
+    /// `arc.xp3>path` → the current project storage → the
     /// auto search paths in "later added wins" order → the remaining mounted
     /// archives, later mounts first → the app directory as the loose-file
     /// fallback for an archive project. The project storage is the project
@@ -2127,9 +2117,7 @@ impl Storage {
     /// mount, and a file-system error when the probe itself fails. A name that
     /// does not resolve is `Ok(None)`.
     pub fn find(&self, name: &str) -> Result<Option<Location>, StorageReadError> {
-        // The reference caches a resolved hit and never a miss
-        // (`TVPAutoPathCache`; a miss is not cached,
-        // `reference/cpp/core/base/StorageIntf.cpp:1101`).
+        // A resolved hit is cached and a miss is not.
         if let Some(hit) = self.resolution_cache.borrow().placed.get(name).cloned() {
             return Ok(Some(hit));
         }
@@ -2175,7 +2163,7 @@ impl Storage {
         }
 
         // Resolve the storage-relative part. Absolute names must point inside
-        // the mount; a `..` that escapes it is the reference's invalid name.
+        // the mount; a `..` that escapes it is an invalid name.
         let Some(relative) = self.relative_disk_name_checked(name)? else {
             trace.attempt(|| format!("name {name:?} is outside {}", self.game_dir.display()));
             return Ok(None);
@@ -2202,7 +2190,7 @@ impl Storage {
             }
         }
 
-        // Auto paths, last added first (the reference's "later added wins").
+        // Auto paths, last added first ("later added wins").
         // Each auto path's candidate table is built once and cached, so the
         // lookup is an in-memory hit rather than a directory probe. Archive
         // prefixes are opened on demand when the table is built. The trace
@@ -2319,11 +2307,11 @@ impl Storage {
 
     /// The live listing of `dir`, enumerating it on every call.
     ///
-    /// The reference's case-insensitive lookup and `GetLocallyAccessibleName`
-    /// both walk the real directory with a live `opendir`/`readdir` on every
-    /// call (`reference/cpp/core/base/impl/StorageImpl.cpp:339-407`), so the
-    /// listing is never cached: a script that creates a directory and then
-    /// resolves it case-insensitively must see it. The auto-path candidate
+    /// The case-insensitive lookup and the case-corrected host path both
+    /// walk the real directory with a live `opendir`/`readdir` on every call,
+    /// so the listing is never cached: a script that creates a directory and
+    /// then resolves it case-insensitively must see it. The auto-path
+    /// candidate
     /// table is cached separately, so a repeat auto-path lookup still lists
     /// nothing.
     fn directory_listing(&self, dir: &Path) -> Result<Vec<(String, bool)>, StorageReadError> {
@@ -2534,9 +2522,9 @@ impl Storage {
 
     /// The storage-relative part of `name` (using `/` separators), or `None`
     /// when the name is absolute and does not point inside the mount. `.`
-    /// components are dropped and `..` removes the preceding component,
-    /// matching the reference storage name normalizer. A `..` that escapes
-    /// the mount is mapped to `None` by this lenient accessor;
+    /// components are dropped and `..` removes the preceding component. A
+    /// `..` that escapes the mount is mapped to `None` by this lenient
+    /// accessor;
     /// [`Self::relative_disk_name_checked`] raises instead.
     pub fn relative_disk_name(&self, name: &str) -> Option<String> {
         fold_dot_components(&self.raw_relative_disk_name(name)?)
@@ -2574,15 +2562,12 @@ impl Storage {
         })
     }
 
-    /// The case-corrected host path for a storage name below the mount — the
-    /// reference `tTVPFileMedia::GetLocallyAccessibleName`
-    /// (`reference/cpp/core/base/impl/StorageImpl.cpp:339-407`).
+    /// The case-corrected host path for a storage name below the mount.
     ///
     /// Every path component is matched against the real directory entries
     /// ASCII-case-insensitively and the real on-disk spelling is returned; from
     /// the first component that does not exist, the requested spelling is kept
-    /// for it and the remaining components, like the reference's
-    /// `newname += ptr_cur; break;`. Unlike [`Self::find`] this matches
+    /// for it and the remaining components. Unlike [`Self::find`] this matches
     /// directories too and does not require the final component to exist.
     ///
     /// `Ok(None)` means `name` is not below the mount (including an in-archive
@@ -2634,8 +2619,8 @@ impl Storage {
         if relative.is_empty() {
             return Ok(None);
         }
-        // Reference semantics: storage names are normalized to lowercase
-        // before lookup, so the lowercase spelling wins when both a lowercase
+        // Storage names are normalized to lowercase before lookup, so the
+        // lowercase spelling wins when both a lowercase
         // and a mixed-case file exist.
         let normalized = normalize_in_archive_name(relative);
         let candidate = root.join(&normalized);
@@ -2755,7 +2740,7 @@ impl Storage {
 
     /// Registers a virtual media entry under its full storage name.
     ///
-    /// L3 uses this for TVP storage-media providers (`psb://…`, `psd://…`):
+    /// L3 uses this for storage-media providers (`psb://…`, `psd://…`):
     /// the bytes are served by [`Self::read`]/[`Self::read_prefix`] and
     /// reported by [`Self::exists`] before disk and archive resolution. A
     /// later registration for the same name replaces the earlier bytes.
@@ -2796,9 +2781,7 @@ impl Storage {
     /// shorter than `max_len` is returned short; the caller decides whether
     /// that is an error.
     ///
-    /// This is our own API: the reference exposes a seekable per-member stream
-    /// (`tTVPXP3ArchiveStream`) instead. Resolution and filter semantics are
-    /// [`Self::read`]'s.
+    /// Resolution and filter semantics are [`Self::read`]'s.
     ///
     /// # Errors
     ///
@@ -2958,9 +2941,8 @@ impl Storage {
 
     /// True if a storage name resolves to a file or a directory.
     ///
-    /// This matches `TVPIsExistentStorage`, which reports directories as
-    /// existing; [`Self::find`] itself is file-only. A file-system failure
-    /// while probing propagates.
+    /// Directories count as existing; [`Self::find`] itself is file-only. A
+    /// file-system failure while probing propagates.
     ///
     /// # Errors
     ///
@@ -2980,12 +2962,11 @@ impl Storage {
         Ok(self.find_disk_dir(&relative)?.is_some())
     }
 
-    /// Resolve the startup script sequence against this storage (reference
-    /// `TVPExecuteStartupScript`).
+    /// Resolve the startup script sequence against this storage.
     ///
     /// Pure storage lookups: `patch.tjs` and `AfterStartup.tjs` are app-path
-    /// only (disk, no archive search, matching `TVPIsExistentStorageNoSearch`),
-    /// while `startup.tjs` and the `system/Initialize.tjs` fallback are
+    /// only (disk, no archive search), while `startup.tjs` and the
+    /// `system/Initialize.tjs` fallback are
     /// searched across disk and archives.
     ///
     /// # Errors
@@ -3004,8 +2985,7 @@ impl Storage {
         })
     }
 
-    /// The app-path-only file `name` when it exists on disk (reference
-    /// `TVPIsExistentStorageNoSearch`).
+    /// The app-path-only file `name` when it exists on disk.
     fn app_path_file(&self, name: &str) -> Result<Option<String>, StorageReadError> {
         Ok(self.find_disk(name)?.map(|_| name.to_owned()))
     }
@@ -3013,7 +2993,7 @@ impl Storage {
     /// Lists the immediate children of storage directory `dir`, merging disk
     /// entries with archive entries. Names are normalized (`/` separators,
     /// lowercase); directory children carry a trailing `/`. Results are sorted
-    /// and deduplicated. This is an internal enumeration helper; no reference
+    /// and deduplicated. This is an internal enumeration helper; no script
     /// member is bound to it.
     ///
     /// A missing or non-directory `dir` lists nothing (it does not error);
@@ -3073,7 +3053,7 @@ impl Storage {
 
     /// Lists storage names matching a wildcard mask, merged across the disk
     /// root and every mounted archive. This is an internal enumeration helper;
-    /// no reference member is bound to it.
+    /// no script member is bound to it.
     ///
     /// * The mask is normalized (lowercased, `\` → `/`).
     /// * If it contains `>` it addresses archives: `arcmask>inarcmask`, where
@@ -3187,8 +3167,8 @@ impl Storage {
 
 /// Recursively discovers every `*.xp3` under `base_dir`, in mount order.
 ///
-/// The reference never scans a folder, but a game directory is the ergonomic
-/// input for both the desktop CLI and the Android launcher. The order is
+/// A game directory is the ergonomic input for both the desktop CLI and
+/// the Android launcher. The order is
 /// deterministic — file name in natural order (embedded decimal runs are
 /// compared by value, so `patch@r1071` overrides `patch@r996` and
 /// `patch_append10` overrides `patch_append5`), then a shallower directory
@@ -3309,8 +3289,8 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 /// The mount-relative part of a storage `name`, or `None` when it is an
 /// absolute path outside `game_dir`.
 fn raw_relative_disk_name(game_dir: &Path, name: &str) -> Option<String> {
-    // Fold Windows separators so a `\`-separated storage name behaves like
-    // the reference on any host.
+    // Fold Windows separators so a `\`-separated storage name behaves the same
+    // on any host.
     let separators = name.replace('\\', "/");
     let path = Path::new(&separators);
     let relative = if path.is_absolute() {
@@ -3384,8 +3364,7 @@ fn case_correct_path(
             Some(real) => host.push(real),
             None => {
                 // The requested spelling of this component and every
-                // remaining one is appended, then correcting stops
-                // (`reference/cpp/core/base/impl/StorageImpl.cpp:373-377`).
+                // remaining one is appended, then correcting stops.
                 host.push(part);
                 for rest in parts {
                     host.push(rest);
@@ -3418,11 +3397,10 @@ fn case_correct_component(
 
 /// Strips `prefix` from the leading components of `path`, comparing each
 /// component ASCII-case-insensitively. Returns the remaining path, or `None`
-/// when `path` does not start with `prefix`. The reference resolves an
-/// absolute name by walking its components against the real directory
-/// entries, so an absolute path that differs from the mount point only in
-/// case still points inside the mount
-/// (`reference/cpp/core/base/impl/StorageImpl.cpp:301-407`).
+/// when `path` does not start with `prefix`. An absolute name is
+/// resolved by walking its components against the real directory entries, so
+/// an absolute path that differs from the mount point only in case still
+/// points inside the mount.
 fn strip_prefix_ignore_ascii_case(path: &Path, prefix: &Path) -> Option<PathBuf> {
     let mut remaining = path.components();
     for expected in prefix.components() {
@@ -3436,10 +3414,9 @@ fn strip_prefix_ignore_ascii_case(path: &Path, prefix: &Path) -> Option<PathBuf>
     Some(remaining.as_path().to_path_buf())
 }
 
-/// Folds `.` and `..` components the way the reference storage-name normalizer
-/// does: `.` is dropped, `..` removes the preceding component, and a `..`
-/// that would escape the root is rejected with `None`. The input is already
-/// `/`-separated.
+/// Folds `.` and `..` components: `.` is dropped, `..` removes the
+/// preceding component, and a `..` that would escape the root is rejected
+/// with `None`. The input is already `/`-separated.
 fn fold_dot_components(relative: &str) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
     for component in relative.split('/') {
@@ -3456,7 +3433,7 @@ fn fold_dot_components(relative: &str) -> Option<String> {
 
 /// Normalizes an in-archive name (lowercase, `\` to `/`, duplicate-slash
 /// collapse) and then folds `.`/`..`. `None` means a `..` crossed the archive
-/// boundary, which the reference raises as `TVPInvalidPathName`.
+/// boundary, which is an invalid path name.
 fn normalize_in_archive_path(name: &str) -> Option<String> {
     fold_dot_components(&normalize_in_archive_name(name))
 }

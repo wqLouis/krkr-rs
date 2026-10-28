@@ -203,7 +203,7 @@ pub struct RuntimeConfig {
     /// or bitmap, so enabling it cannot change what a script observes.
     pub debug_overlay: bool,
     /// The decoded-image cache policy, or `None` to leave the engine's
-    /// reference default (disabled) in place. `Some(CacheLimit::Disabled)`
+    /// default (disabled) in place. `Some(CacheLimit::Disabled)`
     /// clears and disables the cache, `Some(CacheLimit::Unlimited)` keeps
     /// every entry, and `Some(CacheLimit::Bytes(n))` caps the cached bytes.
     /// A startup script can still change it through `System.graphicCacheLimit`.

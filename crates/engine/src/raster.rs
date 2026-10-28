@@ -106,8 +106,8 @@ pub(crate) fn blend_pixel_at(pixel: &mut [u8; 4], color: [u8; 4], coverage: u8, 
 
 /// Replace a rectangle's pixels with a straight-alpha color.
 ///
-/// This is the reference `Layer.fillRect` semantics: `tTVPBaseBitmap::Fill`
-/// maps to the `FillARGB` render method, a color **copy** (not a source-over
+/// This is the `Layer.fillRect` semantics: the fill maps to the `FillARGB`
+/// render method, a color **copy** (not a source-over
 /// blend), so the requested ARGB value — including its alpha — becomes the
 /// pixel. That is what lets `fillRect(0, 0, w, h, RGB(0, 0, 0, 0))` clear an
 /// existing message image (`MessageArea.clear()`). The rectangle is clipped
@@ -277,10 +277,10 @@ const HATCH_TILE: i32 = 8;
 
 /// Whether pixel `(x, y)` is foreground for the given GDI+ hatch style.
 ///
-/// The reference builds an 8×8 tile from integer rectangles and diagonal
+/// The 8×8 tile is built from integer rectangles and diagonal
 /// bands; this reproduces the named cases with integer tests so the CPU
 /// sampler stays allocation-free and a future GPU path can evaluate the same
-/// cell. Styles the reference leaves to its forward-diagonal `default` arm
+/// cell. Styles left to the forward-diagonal `default` arm
 /// share that pattern; `HatchStyleDiagonalBrick` (38) gets a distinct brick
 /// because the Windows engine gives it its own brush and the game uses it.
 /// Coordinates are layer-local pixels and may be negative.
@@ -319,7 +319,7 @@ pub fn hatch_foreground(style: i32, x: i32, y: i32) -> bool {
         43 => px % 4 == 0 && py % 4 == 0,
         // Small grid: a line every two pixels in both directions.
         48 => px % 2 == 0 || py % 2 == 0,
-        // The reference forward-diagonal default, and every other style.
+        // The forward-diagonal default, and every other style.
         _ => diag == 0,
     }
 }

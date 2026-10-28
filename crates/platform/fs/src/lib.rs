@@ -148,7 +148,7 @@ impl FileSystem {
 /// ([`read_at`] / [`write_at`]) do not move the cursor; [`read_seq`] does.
 #[derive(Debug)]
 pub struct FileState {
-    /// Concrete handle: a host file or an in-memory key reference.
+    /// Concrete handle: a host file or an in-memory key.
     pub(crate) handle: FileHandle,
     /// Access mode requested at open time.
     pub(crate) mode: OpenMode,

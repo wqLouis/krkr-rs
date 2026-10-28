@@ -39,7 +39,7 @@ pub enum SurfaceEvent {
     Resized(u32, u32),
     /// The surface was lost and must be recreated.
     Lost,
-    /// A previously lost surface was restored.
+    /// The surface was restored after a loss.
     Restored,
     /// The surface is out of date and should be recreated.
     OutOfDate,

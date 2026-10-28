@@ -29,7 +29,7 @@
 //!
 //! The pipeline keeps no mutable state: every call takes the evolving
 //! [`RenderState`] as an explicit `&mut` parameter, and the scene is
-//! consumed by reference. Two independent pipelines can therefore run in one
+//! consumed by the caller. Two independent pipelines can therefore run in one
 //! process.
 
 #![warn(missing_docs)]
@@ -194,7 +194,7 @@ pub struct GpuCapabilities {
 
 /// Stateless render service.
 ///
-/// Created once through [`create_render_pipeline`] and shared by reference.
+/// Created once through [`create_render_pipeline`] and shared by callers.
 /// Every render action takes the caller-owned [`RenderState`] as a `&mut`
 /// parameter, so the pipeline itself never remembers anything between calls.
 pub struct RenderPipeline {

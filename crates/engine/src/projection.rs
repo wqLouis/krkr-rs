@@ -1,7 +1,7 @@
-//! Projection of the L2 TVP layer tree into the L1 [`RenderScene`] tree.
+//! Projection of the L2 layer tree into the L1 [`RenderScene`] tree.
 //!
 //! The middle layer owns the logical [`Scene`] (windows, layers, bitmaps)
-//! and every TVP property. The bottom [`render::RenderPipeline`]
+//! and every layer property. The bottom [`render::RenderPipeline`]
 //! consumes an abstract [`RenderScene`] tree and owns traversal, batching and
 //! drawing. This module is the single seam between the two: it is a **pure
 //! field copy** that turns one window (or a whole scene) into a
@@ -13,7 +13,7 @@
 //! through a lookup closure (typically `|id| textures.get(&id).cloned()`),
 //! so the same function works for a test double and a live pipeline.
 //!
-//! Semantics are ported from the old Bevy `render/src/sync.rs` path:
+//! The projection's semantics:
 //!
 //! * [`compose_layer`] accumulates ancestor position, opacity and visibility;
 //! * [`visible_image_region`] resolves `Layer.rect` + `ImageLeft/Top/Width/
@@ -40,8 +40,7 @@ pub(crate) const BACKGROUND_CLEAR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
 /// Clamp an opacity to `[0, 1]`, mapping NaN to `0`.
 ///
-/// Ported from the old `sync::clamp_opacity` so window and layer opacities
-/// compose identically.
+/// The clamp keeps window and layer opacities composing identically.
 pub(crate) fn clamp_opacity(opacity: f32) -> f32 {
     if opacity.is_nan() {
         0.0
@@ -91,7 +90,7 @@ pub struct ComposedLayer {
 /// relative to its parent but owns its size. Invalid links stop the chain and
 /// cycles are ignored after the first visit.
 ///
-/// Ported from the old `sync::compose_layer`.
+/// The ancestor chain is accumulated here.
 pub fn compose_layer(scene: &Scene, layer_id: u32) -> Option<ComposedLayer> {
     let mut chain = Vec::new();
     let mut current = Some(layer_id);
@@ -187,7 +186,7 @@ fn composed_clip(composed: &ComposedLayer) -> Option<Clip> {
 /// select a sprite-sheet frame by passing a negative `image_left`; this is the
 /// same routine the old sync used (`setImagePos(-frame_w * n, 0)`).
 ///
-/// Ported from the old `sync::visible_image_region`.
+/// The image placement is resolved here.
 pub(crate) fn visible_image_region(
     layer_rect: Rect,
     image: Rect,
@@ -431,8 +430,8 @@ fn append_window<F>(
         };
 
         // A cached ancestor already contains this layer's pixels in its
-        // rendered bitmap (`InternalComplete2` draws the subtree into
-        // `CacheBitmap`, `LayerIntf.cpp:7156-7226`), so it contributes no
+        // rendered bitmap (the subtree is drawn into the cache bitmap), so
+        // it contributes no
         // node of its own. The flag propagates so the whole subtree is
         // skipped.
         let ancestor_cached = layer
@@ -703,8 +702,8 @@ fn append_window<F>(
                 RenderContent::Texture(_) => {
                     // The cache is the layer's own rendered content: it draws
                     // over the whole layer rect with no image placement of its
-                    // own (the reference hands `CacheBitmap` to the parent at
-                    // the layer's rect, `LayerIntf.cpp:7221-7226`).
+                    // own (the cache bitmap is handed to the parent at
+                    // the layer's rect).
                     let (bmp_w, bmp_h) = bitmap_dims(scene, drawn_bitmap);
                     let (image_left, image_top, img_w, img_h) = match cached_bitmap {
                         Some(_) => (0, 0, bmp_w, bmp_h),

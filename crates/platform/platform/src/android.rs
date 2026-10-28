@@ -4,7 +4,7 @@
 //! build unchanged. Three pieces are real:
 //!
 //! * the **audio output** backend (AAudio on Android, a typed stub elsewhere);
-//! * the **window** on Android: [`PlatformWindow`] owns the [`ANativeWindow`]
+//! * the **window** on Android: [`PlatformWindow`] owns the `ANativeWindow`
 //!   the activity acquired and projects it to `raw-window-handle`, so the
 //!   renderer can create and recreate its Vulkan surface. Its size is the
 //!   surface's physical pixel size and its scale factor is the display's
@@ -26,7 +26,6 @@
 //! `cargo check` green. The real link (`libaaudio.so`, `libandroid.so`)
 //! happens only in an Android build.
 //!
-//! [`ANativeWindow`]: https://developer.android.com/ndk/reference/group/a-native-window
 
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
@@ -40,8 +39,8 @@ const MOTION_ACTION_MASK: i32 = 0xFF;
 
 /// The platform window handle on Android.
 ///
-/// Owns a reference to the `ANativeWindow` the activity handed over:
-/// constructing the type does not acquire a second reference, and dropping it
+/// Owns a handle to the `ANativeWindow` the activity handed over:
+/// constructing the type does not acquire a second handle, and dropping it
 /// releases exactly one (the `ndk` wrapper's contract). The renderer obtains a
 /// [`RawWindowHandle::AndroidNdk`] from [`PlatformWindow::raw_window_handle`]
 /// and binds its Vulkan surface to that window.
@@ -179,11 +178,11 @@ impl PlatformWindow {
 /// These are associated functions on [`PlatformWindow`] because the event loop
 /// owns the window, and they name no Android type, so they compile and are
 /// tested on the host. The TJS virtual-key codes are **not** assigned here: the
-/// compatibility layer maps [`PhysicalKey`] onto the reference `VK_*` table.
+/// compatibility layer maps [`PhysicalKey`] onto the virtual-key table.
 impl PlatformWindow {
     /// Maps an Android `AKEYCODE_*` value to the platform-neutral physical key.
     ///
-    /// The table covers the keys the reference engine's key conversion names;
+    /// The table covers the keys the compatibility layer's key conversion names;
     /// any other code keeps its raw identity as [`PhysicalKey::Native`], which
     /// the compatibility layer maps to no virtual-key code.
     pub fn physical_key_from_android(code: i32) -> PhysicalKey {
@@ -233,7 +232,7 @@ impl PlatformWindow {
 /// Android `AKEYCODE_*` -> platform-neutral physical key.
 ///
 /// The values are the stable AOSP `android/keycodes.h` constants. The mapping
-/// stops at the physical key; the reference virtual-key code is chosen by the
+/// stops at the physical key; the virtual-key code is chosen by the
 /// compatibility layer. `AKEYCODE_BACK` is `Escape`, so the Android back key
 /// reaches the engine as Escape.
 const ANDROID_KEY_TABLE: &[(i32, PhysicalKey)] = &[
@@ -503,8 +502,8 @@ pub(crate) mod audio {
     pub(crate) struct Backend;
 
     /// The output format used only when the device reports no usable format of
-    /// its own (see [`default_spec`]). 44.1 kHz stereo is the KiriKiri/reference
-    /// mix rate and the format every device we target can render.
+    /// its own (see [`default_spec`]). 44.1 kHz stereo is the mix rate games
+    /// expect and the format every device we target can render.
     const FALLBACK_SPEC: AudioSpec = AudioSpec {
         sample_rate: 44_100,
         channels: 2,

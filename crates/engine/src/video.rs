@@ -1,13 +1,9 @@
 //! L2 video-overlay playback state.
 //!
-//! Models the TVP `VideoOverlay` playback machine (open/play/stop/pause/seek,
-//! position/duration, visible, loop, segment loops, overlay binding) as
-//! explicit L2 state. It consumes frames and positions supplied by the
-//! caller — L1 `media` owns decoding — and never opens a codec itself.
-//!
-//! Behavioral reference: `main`'s `crates/tvp-natives/src/video_overlay.rs`
-//! (the `VideoOverlayInst` state machine) and the reference
-//! `tTJSNI_VideoOverlay` (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp`).
+//! Models the script's `VideoOverlay` playback machine (open/play/stop/
+//! pause/seek, position/duration, visible, loop, segment loops, overlay
+//! binding) as explicit L2 state. It consumes frames and positions supplied by
+//! the caller — L1 `media` owns decoding — and never opens a codec itself.
 //!
 //! # What this module is
 //!
@@ -21,8 +17,9 @@
 //!
 //! # The clock
 //!
-//! The reference stores an absolute `play_anchor_ms` and derives the position
-//! from the engine tick. To stay free of a global clock, this model advances
+//! The playback state stores an absolute `play_anchor_ms` and derives the
+//! position from the engine tick. To stay free of a global clock, this model
+//! advances
 //! a relative position by `dt * play_rate`: the two are equivalent for a
 //! monotonically increasing clock, and a relative step is directly testable.
 //!
@@ -45,7 +42,7 @@
 //! An unusable [`VideoSpec`] (non-positive/NaN `fps`, missing frame count),
 //! a playback command on a closed overlay and an inconsistent decoded frame
 //! are typed [`VideoError`]s instead of silent no-ops. Script-visible values
-//! are not validated here: the reference stores whatever it is given.
+//! are not validated here: whatever is given is stored.
 
 use std::sync::Arc;
 
@@ -54,10 +51,10 @@ use api::media::{RgbaFrame, VideoSpec};
 use crate::layer_ops::{BlitOptions, BlitSource, blit_copy_clipped, blit_over, clip_rect};
 use crate::scene::{BitmapState, Scene, bitmap_holds_pixels};
 
-/// Playback status (`tTVPStatus` for the video overlay).
+/// Playback status of the video overlay.
 ///
 /// `Pause` is a distinct status here (unlike the audio `Status`), matching
-/// the reference `ssPlay`/`ssStop`/`ssPause`/`ssUnload`.
+/// the script's `play`/`stop`/`pause`/`unload` states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum PlayStatus {
@@ -73,7 +70,7 @@ pub enum PlayStatus {
 }
 
 impl PlayStatus {
-    /// The reference status string (`onStatusChanged` argument).
+    /// The status string (`onStatusChanged` argument).
     pub const fn as_str(self) -> &'static str {
         match self {
             PlayStatus::Unload => "unload",
@@ -100,7 +97,7 @@ pub enum PeriodReason {
 }
 
 impl PeriodReason {
-    /// The TVP integer code the script `onPeriod(reason)` receives.
+    /// The integer code the script `onPeriod(reason)` receives.
     pub const fn code(self) -> i64 {
         match self {
             PeriodReason::Loop => 0,
@@ -125,7 +122,7 @@ pub enum VideoEvent {
     TransitionComplete,
 }
 
-/// The overlay rectangle in window coordinates (reference `tTVPRect`).
+/// The overlay rectangle in window coordinates.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct VideoBounds {
@@ -151,12 +148,12 @@ impl VideoBounds {
     }
 }
 
-/// How the overlay is bound into the scene (reference `layer1`/`layer2` and
-/// `setMixingLayer`).
+/// How the overlay is bound into the scene (the script's `layer1`/`layer2`
+/// and `setMixingLayer`).
 ///
 /// The binding is plain data: L3 resolves the script `Layer`/`Window` objects
 /// to engine ids, and the render side later consumes the ids. `alpha` is the
-/// mixing-layer opacity in `0.0..=1.0` (reference `opacity / 255`).
+/// mixing-layer opacity in `0.0..=1.0`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct OverlayBinding {
@@ -208,7 +205,7 @@ pub enum VideoError {
     },
 }
 
-/// Frame-to-milliseconds conversion at `fps` (reference `frame_to_ms`).
+/// Frame-to-milliseconds conversion at `fps`.
 fn frame_to_ms(fps: f64, frame: i64) -> i64 {
     if fps > 0.0 {
         (frame as f64 * 1000.0 / fps).round() as i64
@@ -217,7 +214,7 @@ fn frame_to_ms(fps: f64, frame: i64) -> i64 {
     }
 }
 
-/// Milliseconds-to-frame conversion at `fps` (reference `ms_to_frame`).
+/// Milliseconds-to-frame conversion at `fps`.
 fn ms_to_frame(fps: f64, ms: i64) -> i64 {
     if fps > 0.0 {
         (ms.max(0) as f64 * fps / 1000.0) as i64
@@ -226,7 +223,7 @@ fn ms_to_frame(fps: f64, ms: i64) -> i64 {
     }
 }
 
-/// A caller-owned TVP `VideoOverlay` playback machine.
+/// A caller-owned `VideoOverlay` playback machine.
 ///
 /// See the [module docs](self) for the clock and event model.
 #[derive(Debug)]
@@ -301,8 +298,7 @@ impl VideoOverlay {
 
     /// Open a stream from its decoded [`VideoSpec`] and enter the `stop`
     /// state. Playback state (position, period event, segment loop, current
-    /// frame) is reset; the rectangle and binding are retained, mirroring the
-    /// reference `apply_open`.
+    /// frame) is reset; the rectangle and binding are retained.
     ///
     /// # Errors
     ///
@@ -340,8 +336,8 @@ impl VideoOverlay {
         self.period_event_frame = -1;
         self.frame = None;
         self.rearm_frame_update();
-        // The reference `Open` closes any previous backend (firing `unload`)
-        // and then enters the `stop` state.
+        // Opening closes any previous backend (firing `unload`) and then
+        // enters the `stop` state.
         if was_open {
             self.set_status(PlayStatus::Unload);
         }
@@ -349,8 +345,8 @@ impl VideoOverlay {
         Ok(())
     }
 
-    /// Drop the media and return to `unload`, like the reference
-    /// `apply_close`. The rectangle and binding are retained.
+    /// Drop the media and return to `unload`. The rectangle and binding are
+    /// retained.
     pub fn close(&mut self) {
         self.spec = None;
         self.playing = false;
@@ -386,8 +382,7 @@ impl VideoOverlay {
     // -- playback ----------------------------------------------------------
 
     /// Start (or resume) playback, firing `onStatusChanged("play")` only on a
-    /// real status change. A paused backend resumes at normal speed
-    /// (reference `vo_play`).
+    /// real status change. A paused backend resumes at normal speed.
     ///
     /// # Errors
     ///
@@ -402,9 +397,8 @@ impl VideoOverlay {
         Ok(())
     }
 
-    /// Freeze playback at the current position and enter the `pause` state
-    /// (reference `vo_pause`). A paused backend reports a playback rate of
-    /// `0`.
+    /// Freeze playback at the current position and enter the `pause` state. A
+    /// paused backend reports a playback rate of `0`.
     ///
     /// # Errors
     ///
@@ -417,8 +411,7 @@ impl VideoOverlay {
         Ok(())
     }
 
-    /// Stop playback, rewind to frame 0 and enter the `stop` state
-    /// (reference `vo_stop`).
+    /// Stop playback, rewind to frame 0 and enter the `stop` state.
     ///
     /// # Errors
     ///
@@ -433,7 +426,7 @@ impl VideoOverlay {
     }
 
     /// Rewind to frame 0 without changing the playing/paused state, re-arming
-    /// a period event that had already passed (reference `vo_rewind`).
+    /// a period event that had already passed.
     pub fn rewind(&mut self) {
         self.position_exact_ms = 0.0;
         if self.period_event_frame >= 0 && self.period_past {
@@ -510,16 +503,15 @@ impl VideoOverlay {
         self.spec.map(|s| f64::from(s.fps)).unwrap_or(0.0)
     }
 
-    /// Seek to `milliseconds` (clamped to `>= 0`). The reference `position`
-    /// setter does not touch the period event.
+    /// Seek to `milliseconds` (clamped to `>= 0`). The period event is not
+    /// touched.
     pub fn seek_ms(&mut self, milliseconds: i64) {
         self.position_exact_ms = milliseconds.max(0) as f64;
         self.rearm_frame_update();
     }
 
     /// Seek to `frame` (clamped to `>= 0`). A period event whose frame is at
-    /// or after the new position is re-armed when it had already passed
-    /// (reference `frame` setter).
+    /// or after the new position is re-armed when it had already passed.
     pub fn seek_frame(&mut self, frame: i64) {
         self.position_exact_ms = frame_to_ms(self.fps(), frame.max(0)) as f64;
         if self.period_event_frame >= frame && self.period_past {
@@ -540,9 +532,9 @@ impl VideoOverlay {
         }
     }
 
-    /// Configure a segment loop (`setSegmentLoop`). The reference stores both
-    /// frames verbatim, without validating the range; `-1` is a valid value
-    /// that cancels the segment.
+    /// Configure a segment loop (`setSegmentLoop`). Both frames are stored
+    /// verbatim, without validating the range; `-1` is a valid value that
+    /// cancels the segment.
     pub fn set_segment_loop(&mut self, start: i64, end: i64) {
         self.segment_start = start;
         self.segment_end = end;
@@ -581,7 +573,7 @@ impl VideoOverlay {
         self.visible
     }
 
-    /// Show or hide the overlay (reference `SetVisible`).
+    /// Show or hide the overlay.
     pub fn set_visible(&mut self, visible: bool) {
         self.visible = visible;
         self.binding.visible = visible;
@@ -606,7 +598,7 @@ impl VideoOverlay {
         self.binding
     }
 
-    /// Bind the overlay to a layer (reference `setMixingLayer`/`layer1`).
+    /// Bind the overlay to a layer (`setMixingLayer`/`layer1`).
     pub fn bind_layer(&mut self, layer: u32) {
         self.binding.layer = Some(layer);
     }
@@ -708,9 +700,8 @@ impl VideoOverlay {
     }
 
     /// Remove and return the queued status changes, leaving every other event
-    /// queued. Callers that must fire `onStatusChanged` synchronously (the
-    /// reference posts it with `TVP_EPT_IMMEDIATE`) use this instead of
-    /// [`Self::poll`].
+    /// queued. Callers that must fire `onStatusChanged` synchronously use
+    /// this instead of [`Self::poll`].
     pub fn take_status_events(&mut self) -> Vec<PlayStatus> {
         let mut statuses = Vec::new();
         self.pending.retain(|event| match event {
@@ -783,8 +774,8 @@ impl VideoOverlay {
                 self.restarted_at_loop = true;
                 self.pending.push(VideoEvent::Period(PeriodReason::Loop));
             } else {
-                // The reference `EC_COMPLETE` handler calls `Stop()`, which
-                // rewinds to the start, before reporting the stop status.
+                // Completion stops the playback, which rewinds to the start,
+                // before reporting the stop status.
                 self.position_exact_ms = 0.0;
                 self.playing = false;
                 self.set_status(PlayStatus::Stop);
@@ -801,8 +792,7 @@ impl VideoOverlay {
 
     // -- internals ---------------------------------------------------------
 
-    /// Set the status, queueing `StatusChanged` only on a real change
-    /// (reference `set_status`).
+    /// Set the status, queueing `StatusChanged` only on a real change.
     fn set_status(&mut self, status: PlayStatus) {
         if self.status != status {
             self.status = status;
@@ -863,8 +853,8 @@ pub fn blit_frame_to_layer(
 ///
 /// `source_over` selects the alpha-compositing copy (a half-width alpha
 /// stream) over the straight replacement (an opaque stream); `opacity` is the
-/// compositing opacity applied in that path (reference `SetMixingBitmap(dest,
-/// alpha)`). The layer must already own a MainImage; `false` is returned when
+/// compositing opacity applied in that path. The layer must already own a
+/// MainImage; `false` is returned when
 /// it has none, the frame has no pixels, or the image does not hold the pixels
 /// its size declares. This is the shared primitive behind the movie layer copy
 /// and the layer-mode video overlay composite.

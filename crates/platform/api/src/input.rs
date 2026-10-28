@@ -41,7 +41,7 @@ macro_rules! define_physical_keys {
         }
 
         impl PhysicalKey {
-            /// Returns the stable numeric identity used to key engine input
+            /// Returns the stable numeric identity that keys engine input
             /// state.
             ///
             /// Named keys return their declared id; [`PhysicalKey::Native`]

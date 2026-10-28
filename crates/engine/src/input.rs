@@ -3,11 +3,9 @@
 //! L1 (`platform`) emits input events; L2 folds them into an explicit state
 //! value ([`InputState`]) that the rest of the engine and L3 read. The state
 //! is generic — pointer position, buttons, wheel, key edges and multi-touch
-//! contacts — with no TVP/VK semantics; the TVP `Mouse`/`Key` surface (VK
-//! codes, click-sequence constants, shift flags) belongs to L3.
-//!
-//! Behavioral reference: the L3 port in `compat/src/natives/input.rs` and
-//! `main`'s `crates/tvp-input`.
+//! contacts — with no script-level semantics; the script's `Mouse`/`Key`
+//! surface (virtual-key codes, click-sequence constants, shift flags)
+//! belongs to L3.
 //!
 //! # Frame protocol
 //!
@@ -30,7 +28,7 @@ use crate::hasher::{Map, map};
 /// Default number of frames a follow-up press stays in the same click
 /// sequence.
 ///
-/// L3 overrides this with its TVP-specific value through
+/// L3 overrides this with its own value through
 /// [`InputState::set_click_sequence`].
 pub const DEFAULT_CLICK_SEQUENCE_FRAMES: u64 = 30;
 /// Default maximum pointer movement for a press to continue a click sequence.
@@ -97,8 +95,8 @@ pub struct TouchContact {
 /// The generic input state fed by [`api::input::InputEvent`].
 ///
 /// See the module docs for the frame protocol. The state is intentionally
-/// TVP-free: L3 owns the virtual-key table, the click-sequence constants and
-/// the `TVP_SS_*` flags.
+/// script-free: L3 owns the virtual-key table, the click-sequence constants
+/// and the shift-state flags.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct InputState {
@@ -195,8 +193,8 @@ impl InputState {
 
     /// Configure the click-sequence window used by [`Self::set_button`].
     ///
-    /// L3 calls this with its TVP constants so the generic mechanism executes
-    /// the TVP-specific policy.
+    /// L3 calls this with its own constants so the generic mechanism executes
+    /// the script-specific policy.
     pub fn set_click_sequence(&mut self, frames: u64, max_move: f32) {
         self.click_sequence_frames = frames;
         self.click_max_move = max_move;

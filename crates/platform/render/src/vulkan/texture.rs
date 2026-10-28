@@ -174,7 +174,7 @@ struct UploadSlot {
     fence: vk::Fence,
     /// Whether [`Self::fence`] still guards unfinished GPU work.
     in_flight: bool,
-    /// Textures touched by the in-flight batch; used to serialise two batches
+    /// Textures touched by the in-flight batch; they serialise two batches
     /// that would otherwise transition the same image at the same time.
     keys: Vec<u64>,
     /// Number of batches submitted from this slot; a diagnostic counter.

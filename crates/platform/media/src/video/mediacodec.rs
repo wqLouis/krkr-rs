@@ -367,7 +367,7 @@ mod android {
     /// An `ndk` [`MediaCodec`] that stops itself on drop.
     ///
     /// `MediaCodec::drop` only calls `AMediaCodec_delete`; stopping first (when
-    /// the codec was started) mirrors the reference backend's teardown.
+    /// the codec was started) mirrors the backend's teardown.
     struct Codec {
         codec: MediaCodec,
         started: bool,
@@ -1269,10 +1269,9 @@ mod android {
 
     /// Converts a decoder channel count to the `AudioSpec::channels` field.
     ///
-    /// The reference keeps the count in a 32-bit `tTVPWaveFormat::Channels`
-    /// (`reference/cpp/core/sound/WaveIntf.h:47`); only a negative count cannot
-    /// be represented and is reported rather than clamped. This Android path is
-    /// compile-checked but has not run on a device.
+    /// The count is kept in a 32-bit unsigned field; only a negative count
+    /// cannot be represented and is reported rather than clamped. This Android
+    /// path is compile-checked but has not run on a device.
     fn channel_count(name: &str, channels: i32) -> Result<u32, MediaError> {
         u32::try_from(channels).map_err(|_| MediaError::InvalidData {
             message: format!("{name}: audio channel count {channels} is negative"),

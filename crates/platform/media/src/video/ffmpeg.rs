@@ -55,7 +55,7 @@ pub struct VideoDecoderState {
     decoder: ffmpeg::codec::decoder::Video,
     /// Demuxer stream index of the video track.
     video_stream_index: usize,
-    /// Video stream time base, used to convert frame timestamps to ms.
+    /// Video stream time base, which converts frame timestamps to ms.
     time_base: Rational,
     /// Whether the demuxer can read the stream from an earlier time. A
     /// stream without an index cannot, and it is read forward only.

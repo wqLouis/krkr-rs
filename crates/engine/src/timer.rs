@@ -4,7 +4,7 @@
 //! passes the current time each frame to [`deliver_due`], which invokes the
 //! due callbacks in creation order. compat owns the script-facing `Timer` object
 //! and registers its dispatch closure as the callback; whether a timer is
-//! armed *at all* is compat's decision (the reference's "armed and enabled yet never
+//! armed *at all* is compat's decision (the "armed and enabled yet never
 //! posts" shapes — a negative `Capacity`, a non-positive `interval` — are
 //! expressed by L3 simply not arming the timer).
 //!
@@ -27,7 +27,7 @@
 //!   delivering.
 //!   L3's property setters write it before (re-)arming so a schedule write
 //!   between two polls lands on the write's own timestamp, exactly like the
-//!   reference deriving `NextTick` from `GetTickCount()` at
+//!   deriving `NextTick` from the tick count at
 //!   `SetEnabled`/`SetInterval` time.
 //!
 //! Both keep the registry fully deterministic for tests: time only ever
@@ -51,10 +51,10 @@
 //!    out* of the entry before the call, so the entry is plain registry
 //!    state while the callback runs. A collected timer fires only if its
 //!    schedule is untouched since collection: any [`TimerState::set_interval`]
-//!    or [`TimerState::set_enabled`] (the reference's `CancelEvents`) bumps
+//!    or [`TimerState::set_enabled`] (the `CancelEvents` step) bumps
 //!    the entry's schedule generation, and a removed timer simply has no
-//!    entry left — both cancel the pending fire, like the reference cancels
-//!    an already-queued `onTimer`.
+//!    entry left — both cancel the pending fire, like an already-queued
+//!    `onTimer` is cancelled.
 //! 3. **Restore afterwards.** The taken callback is put back once the call
 //!    returns — including when the callback *panics*: unwinding runs the
 //!    restore guard, so the registry is left consistent (the timer keeps
@@ -206,7 +206,7 @@ impl TimerState {
     /// Set `id`'s interval in milliseconds (at least 1).
     ///
     /// On an armed timer this re-arms it from the injected now — a pending
-    /// fire is cancelled, matching the reference's `SetInterval`, which
+    /// fire is cancelled, matching `SetInterval`, which
     /// cancels the queued events and re-derives `NextTick`. A disarmed timer
     /// just stores the interval for the next enable; L3 pushes its current
     /// interval again on every arming, so the stored value only matters

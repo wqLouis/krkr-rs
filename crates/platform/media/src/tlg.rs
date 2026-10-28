@@ -1,9 +1,6 @@
-//! KiriKiri TLG5/TLG6 image decoders.
+//! TLG5/TLG6 image decoders.
 //!
-//! Faithful port of the reference implementation
-//! (`reference/cpp/core/visual/LoadTLG.cpp` plus the TLG routines in
-//! `reference/cpp/core/visual/tvpgl.cpp` and `SaveTLG6.cpp`, which
-//! documents the compression pipeline). The formats:
+//! The formats:
 //!
 //! * **TLG5** — "TLG5.0\0raw\x1a" — four (or three) per-channel planes of
 //!   prediction residuals, each block of `blockheight` rows compressed
@@ -31,7 +28,7 @@
 
 use image::RgbaImage;
 
-/// TLG5/6 raw-data magic. The reference memcmp's 11 bytes
+/// TLG5/6 raw-data magic: 11 bytes are compared
 /// (`"TLG5.0\x00raw\x1a\x00"` — the trailing NUL of the string literal is
 /// not part of the comparison).
 const TLG5_MAGIC: [u8; 11] = *b"TLG5.0\x00raw\x1a";
@@ -40,10 +37,10 @@ const TLG6_MAGIC: [u8; 11] = *b"TLG6.0\x00raw\x1a";
 /// length + optional `tags` chunk).
 const SDS_MAGIC: [u8; 11] = *b"TLG0.0\x00sds\x1a";
 
-/// TLG6 block size (reference `TVP_TLG6_W/H_BLOCK_SIZE`).
+/// TLG6 block size.
 const TLG6_W_BLOCK_SIZE: usize = 8;
 const TLG6_H_BLOCK_SIZE: usize = 8;
-/// Golomb adaptation window (reference `TVP_TLG6_GOLOMB_N_COUNT`).
+/// Golomb adaptation window.
 const TLG6_GOLOMB_N_COUNT: usize = 4;
 /// Number of entries in the Golomb bit-length table (4 × 2 × 128).
 const TLG6_GOLOMB_TABLE_LEN: usize = 1024;
@@ -246,7 +243,7 @@ fn decode_tlg5(raw: &[u8]) -> Result<RgbaImage, String> {
                 out[..elems].copy_from_slice(&data[..elems]);
             }
         }
-        // Compose rows. Residual chain (reference `TVPTLG5ComposeColors*`):
+        // Compose rows. Residual chain:
         //   R = Σ(plane2 + plane1) + upperR, G = Σ(plane1) + upperG,
         //   B = Σ(plane0 + plane1) + upperB, A = Σ(plane3) + upperA.
         for y in y_blk..y_lim {
@@ -288,8 +285,8 @@ fn decode_tlg5(raw: &[u8]) -> Result<RgbaImage, String> {
                         acc[3] = (acc[3] + p3[x] as u32) & 0xff;
                         d[3] = ((acc[3] + u[3] as u32) & 0xff) as u8;
                     }
-                    // 24-bit TLG5 has no alpha plane: opaque (reference
-                    // writes the 0xff000000 constant).
+                    // 24-bit TLG5 has no alpha plane: opaque (the 0xff000000
+                    // constant).
                     None => d[3] = 0xff,
                 }
             }
@@ -316,8 +313,8 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
         }
     }
     let (width, height) = read_dims(raw, 15, 19)?;
-    // max_bit_length (offset 23) is only used for allocation in the
-    // reference; we read bit pools per chunk instead.
+    // max_bit_length (offset 23) is only an allocation hint; the bit pools
+    // are read per chunk instead.
 
     let x_block_count = (width - 1) / TLG6_W_BLOCK_SIZE + 1;
     let y_block_count = (height - 1) / TLG6_H_BLOCK_SIZE + 1;
@@ -325,7 +322,7 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
     let fraction = width - main_count * TLG6_W_BLOCK_SIZE;
 
     // Per-block filter/method map, LZSS-compressed with a fixed initial
-    // dictionary (32×16 pattern, reference `TLG6InitializeColorFilterCompressor`).
+    // dictionary (32×16 pattern).
     let mut pos = 27usize;
     let ft_size = read_i32(raw, pos)?;
     pos += 4;
@@ -406,7 +403,7 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
             }
         }
 
-        // Per-line block decode (reference `TVPTLG6DecodeLineGeneric`).
+        // Per-line block decode.
         let ft_base = (y / TLG6_H_BLOCK_SIZE) * x_block_count;
         let initialp = if colors == 3 { 0xff00_0000 } else { 0 };
         for yy in y..ylim {
@@ -463,8 +460,8 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
     }
 
     if colors == 1 {
-        // Grayscale TLG6: the reference stores the luminance in the first
-        // byte lane. Present it as proper grayscale with opaque alpha.
+        // Grayscale TLG6: the luminance is stored in the first byte lane.
+        // Present it as proper grayscale with opaque alpha.
         // The first lane is the word's blue byte, so the luminance sits in
         // the pixel's third channel and is copied into the other two.
         for px in img.as_chunks_mut::<4>().0.iter_mut() {
@@ -526,11 +523,10 @@ struct LinePass {
     dir: usize,
 }
 
-/// Decode one scanline's worth of 8-wide blocks (reference
-/// `TVPTLG6DecodeLineGeneric`): reads the residual lanes out of `pixelbuf`
-/// in the encoder's zigzag order and runs the color filter + MED/average
-/// predictor chain, writing `0xAARRGGBB` words (byte 0 is the blue plane,
-/// byte 2 the red one).
+/// Decode one scanline's worth of 8-wide blocks: reads the residual lanes out
+/// of `pixelbuf` in the encoder's zigzag order and runs the color filter +
+/// MED/average predictor chain, writing `0xAARRGGBB` words (byte 0 is the blue
+/// plane, byte 2 the red one).
 fn decode_line(row: &mut BlockRow<'_>, pass: LinePass) -> Result<(), String> {
     let BlockRow {
         prevline,
@@ -627,9 +623,8 @@ fn decode_line(row: &mut BlockRow<'_>, pass: LinePass) -> Result<(), String> {
     Ok(())
 }
 
-/// Apply one of the 16 color-correlation filters to the residual bytes
-/// (reference `TVP_TLG6_DO_CHROMA_DECODE*`; all arithmetic is wrapping 8-bit
-/// signed). Returns the (B, G, R) corrections.
+/// Apply one of the 16 color-correlation filters to the residual bytes (all
+/// arithmetic is wrapping 8-bit signed). Returns the (B, G, R) corrections.
 fn color_filter(code: u8, ib: i8, ig: i8, ir: i8) -> (i8, i8, i8) {
     let a = |x: i8, y: i8| x.wrapping_add(y);
     match code {
@@ -671,7 +666,7 @@ fn avg_byte(a: u8, b: u8) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
-// Modified-LZSS (reference `TVPTLG5DecompressSlide`)
+// Modified-LZSS
 // ---------------------------------------------------------------------------
 
 /// Decompress a modified-LZSS stream into `out`, writing at most
@@ -679,7 +674,7 @@ fn avg_byte(a: u8, b: u8) -> u8 {
 /// not an error here: the caller compares the returned count against the
 /// number of bytes it needs.
 /// `text` (4096-byte window) and `r` (write position) carry state across
-/// calls, exactly like the reference's per-image TLG5 state.
+/// calls, exactly like the per-image TLG5 state.
 fn lzss_decompress(
     inp: &[u8],
     text: &mut [u8; 4096],
@@ -760,8 +755,8 @@ fn lzss_decompress(
 // TLG6 Golomb-Rice entropy decoding
 // ---------------------------------------------------------------------------
 
-/// Bit-level reader over a (zero-padded) byte pool. Mirrors the reference's
-/// `bit_pool` byte pointer + `bit_pos` (LSB-first).
+/// Bit-level reader over a (zero-padded) byte pool: a `bit_pool` byte pointer
+/// plus a `bit_pos` (LSB-first).
 struct GolombBits<'a> {
     pool: &'a [u8],
     pos: usize,
@@ -790,11 +785,10 @@ impl GolombBits<'_> {
     }
 }
 
-/// Decode one channel's residual lane (reference
-/// `TVPTLG6DecodeGolombValues[ForFirst]`). The stream alternates zero/nonzero
-/// run lengths (Elias-gamma coded), non-zero values use Golomb-Rice coding
-/// with an adaptive `k` from the precomputed table. Writes the channel's byte
-/// into `out`, whose first `pixel_count * 4` bytes hold the lane.
+/// Decode one channel's residual lane. The stream alternates zero/nonzero run
+/// lengths (Elias-gamma coded), non-zero values use Golomb-Rice coding with an
+/// adaptive `k` from the precomputed table. Writes the channel's byte into
+/// `out`, whose first `pixel_count * 4` bytes hold the lane.
 fn decode_golomb_lane(
     pool: &[u8],
     pixel_count: usize,
@@ -916,8 +910,8 @@ fn read_golomb_value(bs: &mut GolombBits, k: u32, lzt: &[u8; 4096]) -> (i8, u32)
         }
         bit_count -= 1;
     } else {
-        // Long unary run: the reference re-syncs to a byte-aligned escape
-        // (used when the encoder's 4-byte "give up" limit was hit).
+        // Long unary run: re-sync to a byte-aligned escape (used when the
+        // encoder's 4-byte "give up" limit was hit).
         bs.pos = bs.pos.saturating_add(5);
         bit_count = u32::from(*bs.pool.get(bs.pos.wrapping_sub(1)).unwrap_or(&0));
         bs.bit = 0;
@@ -937,8 +931,8 @@ fn read_golomb_value(bs: &mut GolombBits, k: u32, lzt: &[u8; 4096]) -> (i8, u32)
 // Tables
 // ---------------------------------------------------------------------------
 
-/// Expanded leading-zero table (reference `TVPTLG6LeadingZeroTable`): for the
-/// low 12 bits, position of the lowest set bit + 1, or 0 if all zero.
+/// Expanded leading-zero table: for the low 12 bits, position of the lowest set
+/// bit + 1, or 0 if all zero.
 ///
 /// Computed at compile time as a `const`, so the decoder needs no lazy
 /// initialization and no process-global mutable state.
@@ -964,8 +958,7 @@ const fn build_leading_zero_table() -> [u8; 4096] {
     table
 }
 
-/// Compressed run-length form of the Golomb bit-length table (reference
-/// `TVPTLG6GolombBitLengthTable`).
+/// Compressed run-length form of the Golomb bit-length table.
 const GOLOMB_COMPRESSED: [[u16; 9]; 4] = [
     [3, 7, 15, 27, 63, 108, 223, 448, 130],
     [3, 5, 13, 24, 51, 95, 192, 384, 257],

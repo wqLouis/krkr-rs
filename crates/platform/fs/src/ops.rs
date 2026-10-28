@@ -645,8 +645,8 @@ fn system_time_millis(time: std::time::SystemTime) -> Option<i64> {
 ///
 /// A stat failure is a typed error; the bottom layer keeps a permission or I/O
 /// failure distinguishable from “not a directory”. A caller that needs the
-/// reference's “missing or unreadable is `false`” convenience decides so at
-/// its own boundary.
+/// “missing or unreadable is `false`” convenience decides so at its own
+/// boundary.
 ///
 /// # Errors
 ///
@@ -660,8 +660,8 @@ pub fn is_dir(fs: &FileSystem, path: &FsPath) -> Result<bool, FsError> {
 ///
 /// A stat failure is a typed error; the bottom layer keeps a permission or I/O
 /// failure distinguishable from “not a regular file”. A caller that needs the
-/// reference's “missing or unreadable is `false`” convenience decides so at
-/// its own boundary.
+/// “missing or unreadable is `false`” convenience decides so at its own
+/// boundary.
 ///
 /// # Errors
 ///

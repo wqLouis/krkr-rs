@@ -234,19 +234,18 @@ pub(crate) fn blend_slot(mode: BlendMode) -> Option<usize> {
         BlendMode::SourceOver => Some(0),
         BlendMode::PsNormal => Some(7),
         BlendMode::Replace => Some(1),
-        // Slot 2 is `src·a + dst` while the reference `bmPsAdditive` is
+        // Slot 2 is `src·a + dst` while the Photoshop additive blend is
         // `lerp(dst, min(1, dst+src), a)`; they differ only at the saturation
-        // boundary (slot 3 likewise at the clamp boundary for
-        // `bmPsSubtractive`). Reusing the slots is the same near-identical
+        // boundary (slot 3 likewise at the clamp boundary for the Photoshop
+        // subtractive blend). Reusing the slots is the same near-identical
         // approximation the multiplicative/screen arms make, and it keeps a
-        // layer that previously rendered from failing the frame.
+        // layer that rendered before from failing the frame.
         BlendMode::Additive | BlendMode::PsAdditive => Some(2),
         BlendMode::Subtractive | BlendMode::PsSubtractive => Some(3),
         BlendMode::AddAlpha => Some(4),
         // The Photoshop multiplicative/screen fixed-function slots carry the
-        // same per-channel blend function; the source-alpha weighting the
-        // reference applies around it is the approximation the non-Photoshop
-        // slots already make.
+        // same per-channel blend function; the source-alpha weighting applied
+        // around it is the approximation the non-Photoshop slots already make.
         BlendMode::Multiply | BlendMode::PsMultiplicative => Some(5),
         BlendMode::Screen | BlendMode::PsScreen => Some(6),
         // The destination-dependent modes must read the destination color and
@@ -259,7 +258,7 @@ pub(crate) fn blend_slot(mode: BlendMode) -> Option<usize> {
 ///
 /// `AddAlpha` uses an additive color
 /// path with the source alpha replacing the destination alpha, an
-/// approximation of the legacy KiriKiri rule.
+/// approximation of the engine's legacy rule.
 fn blend_state_for_slot(slot: usize) -> vk::PipelineColorBlendAttachmentState {
     let base = vk::PipelineColorBlendAttachmentState::default()
         .blend_enable(true)

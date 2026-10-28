@@ -7,8 +7,8 @@
 //! [`MediaError`], never a fabricated result.
 //!
 //! PNG and JPEG delegate to the `image` crate. BMP is written by hand with
-//! the `TVPSaveTextureAsBMP` layout: a 14-byte `TVP_WIN_BITMAPFILEHEADER`, a
-//! 40-byte `TVP_WIN_BITMAPINFOHEADER` (`biSize = 40`), an optional 1024-byte
+//! the layout games expect: a 14-byte file header, a 40-byte info header
+//! (`biSize = 40`), an optional 1024-byte
 //! palette for 8 bpp, then the bottom-up (positive `biHeight`) scanlines with
 //! their 4-byte pitch padding. The `bmp`/`bmp32` mode is 32 bpp (BGRA),
 //! `bmp24` is 24 bpp (BGR) and `bmp8` is 8 bpp with the 252-colour ordered
@@ -20,7 +20,7 @@ use image::{ExtendedColorType, ImageEncoder};
 use crate::Media;
 use crate::hint::extension_of;
 
-/// BMP byte depth, matching `TVPSaveTextureAsBMP`'s `pixelbytes`.
+/// BMP byte depth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BmpMode {
     /// 32 bpp BGRA (the `bmp`/`bmp32` default).
@@ -32,7 +32,7 @@ enum BmpMode {
 }
 
 impl BmpMode {
-    /// Bytes stored per pixel (`pixelbytes` in the reference).
+    /// Bytes stored per pixel.
     fn pixel_bytes(self) -> usize {
         match self {
             BmpMode::Bpp32 => 4,
@@ -73,7 +73,7 @@ impl EncodeTarget {
 /// Resolves an encode hint to a destination.
 ///
 /// Accepts a bare format name (`"png"`), a leading-dot spelling (`".bmp"`), a
-/// full storage name (`"out/shot.jpg"`) or a reference BMP mode
+/// full storage name (`"out/shot.jpg"`) or a BMP mode
 /// (`"bmp32"`/`"bmp24"`/`"bmp8"`), matching the decode router's extension
 /// handling. An unknown hint returns `None` so the caller can raise
 /// [`MediaError::Unsupported`].
@@ -136,35 +136,33 @@ fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
     rgb
 }
 
-/// The 14-byte `TVP_WIN_BITMAPFILEHEADER` and the 40-byte
-/// `TVP_WIN_BITMAPINFOHEADER`.
+/// The 14-byte file header and the 40-byte info header.
 const BMP_FILE_HEADER_SIZE: usize = 14;
-/// Size of the packed `TVP_WIN_BITMAPINFOHEADER` written as `biSize`.
+/// Size of the packed info header written as `biSize`.
 const BMP_INFO_HEADER_SIZE: usize = 40;
 /// Combined fixed header prefix.
 const BMP_HEADERS_SIZE: usize = BMP_FILE_HEADER_SIZE + BMP_INFO_HEADER_SIZE;
 /// The 8 bpp palette is 256 BGRA quads (`pixelbytes == 1 ? 1024 : 0`).
 const BMP_PALETTE_SIZE: usize = 1024;
 
-/// The reference's 4x4 ordered dither matrix (`TVPDither4x4`).
+/// The 4x4 ordered dither matrix.
 const DITHER_4X4: [[u8; 4]; 4] = [[0, 12, 2, 14], [8, 4, 10, 6], [3, 15, 1, 13], [11, 7, 9, 5]];
 
-/// Appends a little-endian 16-bit value (`TVPWriteLE16`).
+/// Appends a little-endian 16-bit value.
 fn push_le16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-/// Appends a little-endian 32-bit value (`TVPWriteLE32`).
+/// Appends a little-endian 32-bit value.
 fn push_le32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-/// The ordered-dither tables (`TVPDitherTable_676`).
+/// The ordered-dither tables.
 ///
-/// Indexed `[channel][row][column][level]`, exactly as the reference builds
-/// them: channel 0 maps the level to the palette's low coordinate (no
-/// multiplier), channel 1 to the middle coordinate (`* 6`) and channel 2 to
-/// the high coordinate (`* 42`).
+/// Indexed `[channel][row][column][level]`: channel 0 maps the level to
+/// the palette's low coordinate (no multiplier), channel 1 to the middle
+/// coordinate (`* 6`) and channel 2 to the high coordinate (`* 42`).
 fn dither_table() -> [[[[u8; 256]; 4]; 4]; 3] {
     let mut table = [[[[0u8; 256]; 4]; 4]; 3];
     let [low, mid, high] = &mut table;
@@ -212,10 +210,10 @@ fn dither_palette() -> [[u8; 256]; 3] {
     palette
 }
 
-/// Encodes an RGBA8 buffer as a reference-layout BMP.
+/// Encodes an RGBA8 buffer as a BMP.
 ///
-/// This mirrors `TVPSaveTextureAsBMP`: a packed file header + info header,
-/// an optional palette, and bottom-up rows. `bmp`/`bmp32` store BGRA,
+/// The layout is the one games expect: a packed file header + info header, an
+/// optional palette, and bottom-up rows. `bmp`/`bmp32` store BGRA,
 /// `bmp24` stores BGR and `bmp8` stores dithered palette indices. The 32 bpp
 /// output is exactly `width * height * 4 + 54` bytes.
 fn encode_bmp(mode: BmpMode, width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, MediaError> {
@@ -235,8 +233,8 @@ fn encode_bmp(mode: BmpMode, width: u32, height: u32, rgba: &[u8]) -> Result<Vec
     let row_bytes = (width as usize)
         .checked_mul(pixel_bytes)
         .ok_or_else(|| invalid(format!("bmp row for width {width} overflows")))?;
-    // Rows pad up to the next 4-byte boundary; the reference computes the
-    // same value as (((row_bytes - 1) >> 2) + 1) << 2.
+    // Rows pad up to the next 4-byte boundary; the value is
+    // (((row_bytes - 1) >> 2) + 1) << 2.
     let pitch = row_bytes
         .checked_next_multiple_of(4)
         .ok_or_else(|| invalid(format!("bmp pitch for width {width} overflows")))?;
@@ -260,14 +258,14 @@ fn encode_bmp(mode: BmpMode, width: u32, height: u32, rgba: &[u8]) -> Result<Vec
 
     let mut out = Vec::with_capacity(file_size);
 
-    // TVP_WIN_BITMAPFILEHEADER.
+    // The BMP file header.
     push_le16(&mut out, 0x4d42); /* bfType */
     push_le32(&mut out, file_size_u32); /* bfSize */
     push_le16(&mut out, 0); /* bfReserved1 */
     push_le16(&mut out, 0); /* bfReserved2 */
     push_le32(&mut out, offset_u32); /* bfOffBits */
 
-    // TVP_WIN_BITMAPINFOHEADER.
+    // The BMP info header.
     push_le32(&mut out, BMP_INFO_HEADER_SIZE as u32); /* biSize */
     push_le32(&mut out, width_i32 as u32); /* biWidth */
     push_le32(&mut out, height_i32 as u32); /* biHeight (positive: bottom-up) */
@@ -350,7 +348,7 @@ fn encode_bmp(mode: BmpMode, width: u32, height: u32, rgba: &[u8]) -> Result<Vec
 /// `width * height * 4` bytes; anything else is [`MediaError::InvalidData`].
 /// An unknown target is [`MediaError::Unsupported`], and a failure inside the
 /// underlying codec is [`MediaError::Encode`]. JPEG drops the alpha channel;
-/// BMP matches the reference byte for byte.
+/// BMP matches the expected layout byte for byte.
 ///
 /// # Errors
 ///

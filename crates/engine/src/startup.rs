@@ -2,12 +2,12 @@
 //!
 //! Pure storage discovery. This
 //! module locates the scripts but never executes them, so it is testable
-//! without the TJS VM. The reference order is:
+//! without the TJS VM. The order is:
 //!
 //! 1. `patch.tjs` — app path only, no search;
 //! 2. `startup.tjs` — searched across the storage (disk + mounted archives);
 //! 3. `AfterStartup.tjs` — app path only, no search;
-//! 4. `system/Initialize.tjs` — the reference compatibility fallback when
+//! 4. `system/Initialize.tjs` — the compatibility fallback when
 //!    `startup.tjs` is not found.
 //!
 //! Discovering none of `startup.tjs` / `system/Initialize.tjs` is a typed

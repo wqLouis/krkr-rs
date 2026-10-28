@@ -21,11 +21,11 @@ use crate::texture::TextureFormat;
 /// Monotonic source of [`RenderTarget`] identities.
 ///
 /// A counter, rather than the backing allocation address, removes the ABA
-/// hazard where a dropped-and-freed handle could be replaced by a new one at
+/// hazard where a dropped-and-freed handle could be swapped for a new one at
 /// the same address and silently reuse a stale target.
 static NEXT_TARGET_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Description used to create a [`RenderTarget`].
+/// Description for creating a [`RenderTarget`].
 ///
 /// Offscreen targets are always 8-bit RGBA; [`TextureFormat::R8Unorm`] is
 /// rejected because a colour target needs an alpha-capable format.

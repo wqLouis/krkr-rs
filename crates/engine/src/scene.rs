@@ -50,13 +50,11 @@ pub struct WindowState {
     pub focused_layer: Option<u32>,
     /// Focus domain ids in registration order: one per parentless root
     /// layer, in the order the roots were created. Index 0 is the window's
-    /// input domain (`reference/cpp/core/visual/LayerTreeOwnerImpl.h:21`
-    /// `PrimaryLayerManagerIndex`, pushed in creation order by
-    /// `RegisterLayerManager`, `reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:93-98`).
+    /// input domain; every further domain is pushed in creation order, one
+    /// per parentless root.
     pub focus_domains: Vec<u32>,
     /// The focused layer of each registered domain, when one is set. A
-    /// domain absent from the map has no focus, exactly like a manager whose
-    /// `FocusedLayer` is null (`reference/cpp/core/visual/LayerManager.h:483-490`).
+    /// domain absent from the map has no focus.
     pub domain_focus: Map<u32, u32>,
     /// Render order, back -> front.
     pub layers: Vec<u32>,
@@ -65,8 +63,7 @@ pub struct WindowState {
 impl WindowState {
     /// The domain the window's input and `focusedLayer` reads/writes bind
     /// to: the first-registered root's domain. `None` while the window has
-    /// no parentless layer, like the reference's null `GetLayerManagerAt(0)`
-    /// (`reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:24-28`).
+    /// no parentless layer.
     fn input_domain(&self) -> Option<u32> {
         self.focus_domains.first().copied()
     }
@@ -110,11 +107,9 @@ pub struct LayerState {
     pub parent: Option<u32>,
     /// Focus domain id: the id of the parentless root whose focus manager
     /// this layer belongs to. A parentless layer founds its own domain (its
-    /// own id); a child inherits its parent's. Fixed at creation, because
-    /// the reference assigns the manager once and never reassigns it
-    /// (`reference/cpp/core/visual/LayerIntf.cpp:449-473`); all focus moves
-    /// and searches stay inside one domain
-    /// (`reference/cpp/core/visual/LayerManager.h:483-490`).
+    /// own id); a child inherits its parent's. Fixed at creation: the domain
+    /// is assigned once and never reassigned, so all focus moves and searches
+    /// stay inside one domain.
     pub domain: u32,
     /// Direct child layer ids in maintained (back → front sibling) order.
     pub children: Vec<u32>,
@@ -134,24 +129,23 @@ pub struct LayerState {
     /// Sibling sort key: the sibling position in relative order mode, or the
     /// stored absolute index while the parent is in absolute order mode.
     pub z_order: i32,
-    /// Image placement inside the layer (reference `ImageLeft`/`ImageTop`,
-    /// typically ≤ 0) and the drawn image size (`ImageWidth`/`ImageHeight`,
-    /// may exceed the layer rect — the layer clips it). The game's buttons
+    /// Image placement inside the layer (script `layer.imageLeft`/
+    /// `layer.imageTop`, typically ≤ 0) and the drawn image size
+    /// (`layer.imageWidth`/`layer.imageHeight`, may exceed the layer rect —
+    /// the layer clips it). The game's buttons
     /// use a sprite sheet here: `setImagePos(-frameW*n, 0)` selects a frame.
     pub image_left: i32,
-    /// Reference `ImageTop`; see `image_left`.
+    /// Script `layer.imageTop`; see `image_left`.
     pub image_top: i32,
-    /// Reference `ImageWidth` (drawn image width; may exceed the layer rect).
+    /// Script `layer.imageWidth` (drawn image width; may exceed the layer rect).
     pub image_width: u32,
-    /// Reference `ImageHeight` (drawn image height).
+    /// Script `layer.imageHeight` (drawn image height).
     pub image_height: u32,
-    /// Reference `ProvinceImage` (`LayerIntf.cpp:2359` `AllocateProvinceImage`):
-    /// an 8-bit plane (`province_width * province_height` bytes, one byte per
-    /// pixel) backing `getProvincePixel`/`setProvincePixel` and the
-    /// `provinceImageBuffer*` properties. `None` until `setProvincePixel` or a
-    /// `provinceImageBufferForWrite` read allocates it. The plane is layer
-    /// owned (the reference allocates a fresh `tTVPBaseBitmap(..., 8)`), so it
-    /// is not shared through `bitmap`.
+    /// The province plane: an 8-bit plane (`province_width * province_height`
+    /// bytes, one byte per pixel) backing `getProvincePixel`/`setProvincePixel`
+    /// and the `provinceImageBuffer*` properties. `None` until
+    /// `setProvincePixel` or a `provinceImageBufferForWrite` read allocates
+    /// it. The plane is layer owned, so it is not shared through `bitmap`.
     pub province: Option<Box<[u8]>>,
     /// Province plane width in pixels (0 when absent).
     pub province_width: u32,
@@ -162,8 +156,8 @@ pub struct LayerState {
     /// A layer starts at the constructor's threshold; the window's screen
     /// root starts at zero, so it takes every pixel of its area.
     pub hit_threshold: i32,
-    /// Hit-test mode (reference `tTVPHitType`): `htMask=0` (per-pixel
-    /// threshold) or `htProvince=1` (non-transparent province). Stored so
+    /// Hit-test mode: `htMask=0` (per-pixel threshold) or `htProvince=1`
+    /// (non-transparent province). Stored so
     /// `SelectItemBase` can set it; the render input bridge and
     /// [`Scene::layer_hit_next`] read it during hit-testing.
     pub hit_type: i32,
@@ -172,8 +166,8 @@ pub struct LayerState {
     /// A hit test starts accepted and the caller may clear the flag while
     /// the test runs; the flag after the test is the test's verdict.
     pub hit_test_accepted: bool,
-    /// Mouse-cursor id (reference `tTVPCursorType`, e.g. `crDefault=0`,
-    /// `crHandPoint=-21`). Stored; the desktop cursor is not yet driven.
+    /// Mouse-cursor id (e.g. `crDefault=0`, `crHandPoint=-21`). Stored;
+    /// the desktop cursor is not yet driven.
     pub cursor: i32,
     /// Outward draw face: the value the script reads and writes. `128` means
     /// "resolve the face from the layer's type"; the concrete faces are `0`
@@ -181,39 +175,37 @@ pub struct LayerState {
     /// alpha). The compat layer owns the vocabulary and the resolution; the
     /// projection always draws the main image.
     pub face: i32,
-    /// Reference `ClipRect` set by `Layer.setClip(left, top, width, height)`:
-    /// a half-open `[x, x+w) x [y, y+h)` region in image pixels. `None` means
-    /// the whole main image (the reference resets/initializes it to the image
-    /// size). Pixel operations (`colorRect`, `colorize`, `noise`, ...) clip
-    /// against it exactly like the reference.
+    /// Clip rect set by `Layer.setClip(left, top, width, height)`: a
+    /// half-open `[x, x+w) x [y, y+h)` region in image pixels. `None` means
+    /// the whole main image (it is initialized to the image size). Pixel
+    /// operations (`colorRect`, `colorize`, `noise`, ...) clip against it.
     pub clip: Option<Rect>,
     /// `holdAlpha` — keep the alpha when drawing. Stored only for now.
     pub hold_alpha: bool,
-    /// Reference `Focusable`: whether the layer may receive focus.
+    /// Whether the layer may receive focus (script `layer.focusable`).
     pub focusable: bool,
-    /// Reference `JoinFocusChain` (`LayerIntf.h:527`, default true): whether
-    /// the layer joins the window's focus chain (`nextFocusable`/
-    /// `prevFocusable`).
+    /// Whether the layer joins the window's focus chain (`nextFocusable`/
+    /// `prevFocusable`); default true.
     pub join_focus_chain: bool,
-    /// Reference `FocusWork` (`LayerIntf.h:528`): the transient layer selected
-    /// by the last `nextFocusable`/`prevFocusable` search. The native
-    /// `onSearch*Focusable`/`onBeforeFocus` handlers may redirect it.
+    /// The transient layer selected by the last `nextFocusable`/
+    /// `prevFocusable` search. The native `onSearch*Focusable`/
+    /// `onBeforeFocus` handlers may redirect it.
     pub focus_work: Option<u32>,
-    /// Reference `Enabled`: whether the layer's input/attention is active.
+    /// Whether the layer's input/attention is active (script `layer.enabled`).
     pub enabled: bool,
-    /// Reference `Name` (script `layer.name`).
+    /// The layer's name (script `layer.name`).
     pub name: String,
-    /// Reference `AttentionLeft`/`AttentionTop` (attention anchor point).
+    /// The attention anchor point (script `layer.attentionLeft`).
     pub attention_left: i32,
-    /// Reference `AttentionTop`; see `attention_left`.
+    /// Script `layer.attentionTop`; see `attention_left`.
     pub attention_top: i32,
-    /// Reference `UseAttention`: whether the layer participates in the
-    /// attention/hint system.
+    /// Whether the layer participates in the attention/hint system (script
+    /// `layer.useAttention`).
     pub use_attention: bool,
-    /// Reference `Cached`: request the layer be rendered to a cache.
+    /// Request the layer be rendered to a cache (script `layer.cached`).
     pub cached: bool,
-    /// Reference `CacheEnabledCount` (`LayerIntf.h:722`): the number of
-    /// active consumers that require this layer's whole subtree rendered
+    /// The number of active consumers that require this layer's whole
+    /// subtree rendered
     /// into [`Self::cache_bitmap`]. Nonzero makes the projection draw the
     /// cache in place of the layer's own image and descendants.
     pub cache_enabled_count: u32,
@@ -223,8 +215,8 @@ pub struct LayerState {
     /// [`Self::cache_content`] so the blend never overwrites the content it
     /// reads.
     pub cache_bitmap: Option<u32>,
-    /// The composited subtree content while `cache_enabled_count` is nonzero
-    /// (the reference `CacheBitmap` returned by `Complete`). `None` until
+    /// The composited subtree content while `cache_enabled_count` is nonzero.
+    /// `None` until
     /// the layer first needs one; freed with the last
     /// [`Scene::dec_cache_enabled_count`].
     pub cache_content: Option<u32>,
@@ -248,8 +240,8 @@ pub struct LayerState {
     /// the transition costs no per-tick pixel work. `None` while no such
     /// transition runs ([`Scene::set_effect`]).
     pub effect: Option<EffectDraw>,
-    /// Reference `CacheRecalcRegion`: the subtree content must be
-    /// recomposited before it is used again. Set for this layer and every
+    /// The subtree content must be recomposited before it is used again.
+    /// Set for this layer and every
     /// caching ancestor whenever the layer changes, and cleared when the
     /// content is recomposited.
     pub cache_recalc: bool,
@@ -258,23 +250,23 @@ pub struct LayerState {
     /// image that did not go through a layer accessor is detected by
     /// comparing this value with the current sum.
     pub cache_source_generation: u64,
-    /// Reference `Hint` (script `layer.hint`) and the hint-system flags.
+    /// The layer's hint (script `layer.hint`) and the hint-system flags.
     pub hint: String,
-    /// Reference `ShowParentHint`: inherit the parent's hint.
+    /// Whether the layer inherits the parent's hint.
     pub show_parent_hint: bool,
-    /// Reference `IgnoreHintSensing`: opt out of hint sensing.
+    /// Whether the layer opts out of hint sensing.
     pub ignore_hint_sensing: bool,
-    /// Reference `ImeMode` (stored) and `NeutralColor` (ARGB, stored).
+    /// The stored IME mode and the stored neutral colour (ARGB).
     pub ime_mode: i32,
-    /// Reference `NeutralColor` (ARGB, stored).
+    /// The stored neutral colour (ARGB).
     pub neutral_color: i64,
     /// Whether this layer orders its children by their stored absolute index
     /// (`absolute`) instead of their maintained sibling position.
     pub absolute_order_mode: bool,
-    /// Reference `CallOnPaint`; see `pending_paint`.
+    /// See `pending_paint`.
     pub call_on_paint: bool,
-    /// Reference `HoldAlpha`-adjacent `ImageModified` flag: set by pixel
-    /// operations, clearable by script.
+    /// The layer's image-modified flag: set by pixel operations, clearable by
+    /// script.
     pub image_modified: bool,
     /// Font id (into [`Scene::fonts`]) backing `layer.font`, or `None` until
     /// the script reads `layer.font` (which lazily allocates one). `drawText`
@@ -282,15 +274,15 @@ pub struct LayerState {
     pub font_id: Option<u32>,
     /// Whether this layer is its window's `primary_layer`.
     pub is_primary: bool,
-    /// Reference `tTJSNI_BaseLayer::CallOnPaint`: set by the script-visible
-    /// `update()` (and `loadImages`/`setSize*`, which call it) and cleared by
+    /// Set by the script-visible `update()` (and `loadImages`/`setSize*`, which
+    /// call it) and cleared by
     /// the engine once it dispatches the layer's `onPaint` handler. The
     /// game's `AffineLayer.onPaint` copies its hidden inner `_image` layer's
     /// bitmap onto the visible outer layer, so this flag is what makes the
     /// intro logo and every `Sprite`/`AffineLayer` render.
     pub pending_paint: bool,
-    /// Reference `tTJSNI_BaseLayer::Shutdown` (`LayerIntf.cpp:516`). A shut-down
-    /// layer is inert — hit-testing, input dispatch, `onPaint` polling and
+    /// A shut-down layer is inert — hit-testing, input dispatch, `onPaint`
+    /// polling and
     /// rendering must not touch it.
     ///
     /// [`Scene::invalidate_layer`] marks the layer here **before** unregistering
@@ -416,7 +408,7 @@ pub struct BitmapState {
     /// dirty.
     pub dirty_region: Option<PixelRegion>,
     /// True when a script `Bitmap` object owns this id (created through the
-    /// `Bitmap` natives). A layer's MainImage can reference such a bitmap, so
+    /// `Bitmap` natives). A layer's MainImage can point at such a bitmap, so
     /// destroying the layer must not free it while the script object can
     /// still read it.
     pub script_owned: bool,
@@ -583,8 +575,7 @@ pub struct FontState {
     pub strikeout: bool,
     /// Underline style flag.
     pub underline: bool,
-    /// Rotation in the reference's tenths-of-a-degree units (game code does
-    /// `font.angle \ 10`).
+    /// Rotation in tenths of a degree (game code does `font.angle \ 10`).
     pub angle: f64,
 }
 
@@ -611,9 +602,8 @@ impl Rect {
 
 /// The image-load variant a [`DecodedImageKey`] identifies.
 ///
-/// The reference's `tTVPGraphicsSearchData` carries a `tTVPGraphicLoadMode`
-/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1257-1264`); the port
-/// performs two of them.
+/// The image load has two variants: a full-colour load and a province
+/// plane read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DecodedImageMode {
     /// A full-colour RGBA load.
@@ -624,10 +614,9 @@ pub enum DecodedImageMode {
 
 /// The key identifying one entry in the scene's decoded-image cache.
 ///
-/// Mirrors the reference `tTVPGraphicsSearchData {Name, KeyIdx, Mode, DesW,
-/// DesH}` (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1257-1264`); the
-/// name is normalized by [`DecodedImageKey::new`] the same way the storage
-/// layer normalizes it.
+/// The key carries the normalized name, the colour-key index, the load
+/// variant and the desired size; the name is normalized by
+/// [`DecodedImageKey::new`] the same way the storage layer normalizes it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DecodedImageKey {
     /// Normalized storage name.
@@ -665,17 +654,14 @@ impl DecodedImageKey {
 /// The scene's decoded-image cache: the entries, the byte accounting, the
 /// least-recently-used order and the byte limit.
 ///
-/// The limit counts the decoded bytes (`Width * Height * PixelSize`,
-/// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1305-1310`). The cache is
-/// disabled by default, matching the reference's default
-/// (`:1433-1434`).
+/// The limit counts the decoded bytes (`Width * Height * PixelSize`).
+/// The cache is disabled by default.
 #[derive(Debug)]
 struct DecodedImageCache {
     /// Cached images by key.
     entries: crate::hasher::Map<DecodedImageKey, DecodedImage>,
     /// Recency order: index 0 is the least recently used, the back is the
-    /// most recently used (the reference's additional order, whose `NFirst`
-    /// is most recent: `reference/cpp/core/tjs2/tjsHashSearch.h:513-527`).
+    /// most recently used.
     order: Vec<DecodedImageKey>,
     /// Sum of the cached images' `rgba` byte counts.
     total_bytes: u64,
@@ -709,9 +695,7 @@ impl DecodedImageCache {
         Some(image)
     }
 
-    /// Drop least-recently-used entries until the total is within the limit
-    /// (the reference `TVPCheckGraphicCacheLimit`,
-    /// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1441-1454`).
+    /// Drop least-recently-used entries until the total is within the limit.
     fn evict_to_limit(&mut self) {
         let Some(limit) = self.limit.option() else {
             return;
@@ -731,9 +715,7 @@ impl DecodedImageCache {
     }
 
     /// Store `image` under `key`. The limit is checked before the insert, so
-    /// the total may exceed it by the new entry's size (the reference
-    /// `TVPCheckGraphicCacheLimit` call order,
-    /// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1952-1960`).
+    /// the total may exceed it by the new entry's size.
     fn insert(&mut self, key: DecodedImageKey, image: DecodedImage) {
         self.evict_to_limit();
         if let Some(previous) = self.entries.remove(&key) {
@@ -788,7 +770,7 @@ pub struct Scene {
     /// programs it ships; a table without an entry means the backend cannot
     /// run effect pipelines, and a transition that needs one blends on the CPU.
     pub effect_pipelines: EffectPipelines,
-    /// Decoded-image cache (the reference graphic cache).
+    /// Decoded-image cache.
     image_cache: DecodedImageCache,
     /// Monotonic counter bumped by every change to the tree's structure (see
     /// [`Scene::structure_revision`]).
@@ -980,8 +962,8 @@ impl Scene {
         id
     }
 
-    /// Allocate a layer with the reference `CreateNativeInstance` defaults
-    /// (default rect, no owner, manager or parent) but leave it detached from
+    /// Allocate a layer with the default state (default rect, no owner,
+    /// manager or parent) but leave it detached from
     /// every window, parent and focus domain. [`Scene::attach_layer`] is the
     /// later `Construct` join.
     ///
@@ -1053,8 +1035,8 @@ impl Scene {
             show_parent_hint: false,
             ignore_hint_sensing: false,
             ime_mode: 0,
-            // Transparent white, the reference `NeutralColor`/`TransparentColor`
-            // initializer (`LayerIntf.cpp:334`), encoded `0xAARRGGBB`.
+            // Transparent white, the neutral/transparent colour initializer,
+            // encoded `0xAARRGGBB`.
             neutral_color: 0x00ff_ffff,
             absolute_order_mode: false,
             call_on_paint: false,
@@ -1067,8 +1049,8 @@ impl Scene {
     }
 
     /// Attach a layer allocated by [`Scene::add_detached_layer`] to `window`
-    /// and `parent`, assigning its focus domain and primary slot — the
-    /// reference `Construct` join. An unknown id is ignored.
+    /// and `parent`, assigning its focus domain and primary slot. An unknown
+    /// id is ignored.
     pub fn attach_layer(&mut self, id: u32, window: u32, parent: Option<u32>) {
         if self.layer(id).is_none() {
             return;
@@ -1092,9 +1074,8 @@ impl Scene {
             layer.parent = parent;
             layer.domain = domain;
         }
-        // First layer of a window becomes its primary layer, which the
-        // reference `tTVPLayerManager::AttachPrimary` forces visible (a new
-        // layer otherwise defaults to hidden).
+        // First layer of a window becomes its primary layer, which is forced
+        // visible (a new layer otherwise defaults to hidden).
         if primary {
             if let Some(w) = self.window_mut(window) {
                 w.primary_layer = Some(id);
@@ -1377,7 +1358,7 @@ impl Scene {
     }
 
     /// Whether `id` is the primary layer of its window (the root layer the
-    /// reference exposes as `window.primaryLayer` and whose MainImage is the
+    /// script sees as `window.primaryLayer` and whose MainImage is the
     /// window's screen buffer).
     pub fn is_primary_layer(&self, id: u32) -> bool {
         let Some(layer) = self.layer(id) else {
@@ -1396,9 +1377,8 @@ impl Scene {
         }
     }
 
-    /// Reference `tTJSNI_BaseLayer::UpdateChildRegion`
-    /// (`LayerIntf.cpp:6236-6258`): mark `id`'s subtree cache and every
-    /// caching ancestor's as stale because this layer changed. A malformed
+    /// Mark `id`'s subtree cache and every caching ancestor's as stale
+    /// because this layer changed. A malformed
     /// parent cycle terminates after the pool of layers is exhausted.
     fn invalidate_layer_cache(&mut self, id: u32) {
         if let Some(layer) = self.layer_mut_untracked(id) {
@@ -1445,8 +1425,7 @@ impl Scene {
     }
 
     /// Mutably look up a layer by id, bumping [`Scene::structure_revision`].
-    /// The layer's subtree cache and every caching ancestor's are marked stale
-    /// (`tTJSNI_BaseLayer::Update`, `LayerIntf.cpp:6305-6335`).
+    /// The layer's subtree cache and every caching ancestor's are marked stale.
     pub fn layer_mut(&mut self, id: u32) -> Option<&mut LayerState> {
         self.invalidate_layer_cache(id);
         self.touch_structure();
@@ -1474,9 +1453,8 @@ impl Scene {
     /// Returns `None` when the layer is absent, which lets a caller
     /// distinguish a missing layer from a no-op write.
     ///
-    /// The reference guards a property write the same way, comparing the
-    /// requested value with the stored one before it invalidates
-    /// (`tTJSNI_BaseLayer::SetVisible`, `LayerIntf.cpp:1183`).
+    /// The property write is guarded by comparing the requested value with
+    /// the stored one before it invalidates.
     pub fn update_layer(
         &mut self,
         id: u32,
@@ -1507,19 +1485,17 @@ impl Scene {
     // ------------------------------------------------------------------
     // Layer MainImage / ProvinceImage raw-pixel access
     //
-    // The reference exposes the underlying `tTVPBaseBitmap` scan-line
-    // pointers (`GetMainImagePixelBuffer*` / `GetProvinceImagePixelBuffer*`,
-    // `LayerIntf.cpp:3005-3044`) as `tTVInteger` addresses. The buffers are
-    // heap allocations replaced wholesale on a resize, so a returned address
-    // stays valid until the next resize of the same image (or until the
-    // layer/bitmap is dropped). The VM is single-threaded, matching the
-    // reference's raw-pointer contract. All access goes through the safe
-    // slice closures below; producing the address is the single boundary.
+    // The layer's MainImage and ProvinceImage scan-line pointers are exposed
+    // as `tTVInteger` addresses. The buffers are heap allocations replaced
+    // wholesale on a resize, so a returned address stays valid until the
+    // next resize of the same image (or until the layer/bitmap is dropped).
+    // The VM is single-threaded, so a raw pointer stays usable for that
+    // time. All access goes through the safe slice closures below;
+    // producing the address is the single boundary.
     // ------------------------------------------------------------------
 
     /// Bytes per row of the layer's MainImage (RGBA8 → `width * 4`), or 0
-    /// when the layer has no image. Reference `GetMainImagePixelBufferPitch`
-    /// (`LayerIntf.cpp:3020`).
+    /// when the layer has no image.
     pub fn main_image_pitch(&self, layer_id: u32) -> u32 {
         let Some(bitmap_id) = self.layer(layer_id).and_then(|l| l.bitmap) else {
             return 0;
@@ -1529,8 +1505,7 @@ impl Scene {
     }
 
     /// Bytes per row of the layer's ProvinceImage (`width` bytes, 8bpp), or 0
-    /// when absent. Reference `GetProvinceImagePixelBufferPitch`
-    /// (`LayerIntf.cpp:3042`).
+    /// when absent.
     pub fn province_image_pitch(&self, layer_id: u32) -> u32 {
         let Some(layer) = self.layer(layer_id) else {
             return 0;
@@ -1543,7 +1518,6 @@ impl Scene {
 
     /// Address of the layer's MainImage pixel buffer, or 0 when absent or
     /// when the bitmap declares pixels it does not hold.
-    /// Reference `GetMainImagePixelBuffer` (`LayerIntf.cpp:3005`).
     pub fn main_image_pixel_buffer(&self, layer_id: u32) -> usize {
         let Some(bitmap_id) = self.layer(layer_id).and_then(|l| l.bitmap) else {
             return 0;
@@ -1558,9 +1532,8 @@ impl Scene {
     }
 
     /// Address of the layer's MainImage pixel buffer for writing, marking the
-    /// bitmap dirty (the reference `GetMainImagePixelBufferForWrite` sets
-    /// `ImageModified` and calls `GetScanLineForWrite`). 0 when absent or when
-    /// the bitmap declares pixels it does not hold.
+    /// bitmap dirty (the layer's `imageModified` flag is set). 0 when absent
+    /// or when the bitmap declares pixels it does not hold.
     pub fn main_image_pixel_buffer_for_write(&mut self, layer_id: u32) -> usize {
         let Some(bitmap_id) = self.layer(layer_id).and_then(|l| l.bitmap) else {
             return 0;
@@ -1576,7 +1549,6 @@ impl Scene {
     }
 
     /// Address of the layer's ProvinceImage pixel buffer, or 0 when absent.
-    /// Reference `GetProvinceImagePixelBuffer` (`LayerIntf.cpp:3027`).
     pub fn province_image_pixel_buffer(&self, layer_id: u32) -> usize {
         self.layer(layer_id)
             .and_then(|l| l.province.as_deref())
@@ -1585,9 +1557,7 @@ impl Scene {
     }
 
     /// Address of the layer's ProvinceImage pixel buffer for writing,
-    /// allocating the plane first (the reference `AllocateProvinceImage`).
-    /// Marks the image modified. Reference `GetProvinceImagePixelBufferForWrite`
-    /// (`LayerIntf.cpp:3034`).
+    /// allocating the plane first. Marks the image modified.
     pub fn province_image_pixel_buffer_for_write(&mut self, layer_id: u32) -> usize {
         self.allocate_province_image(layer_id);
         let Some(layer) = self.layer_mut(layer_id) else {
@@ -1648,9 +1618,8 @@ impl Scene {
         layer.province.as_deref_mut().map(f)
     }
 
-    /// Reference `AllocateProvinceImage` (`LayerIntf.cpp:2359`): size the
-    /// province plane from the MainImage (or the layer rect when there is no
-    /// MainImage) and fill the new area with 0.
+    /// Size the province plane from the MainImage (or the layer rect when
+    /// there is no MainImage) and fill the new area with 0.
     pub fn allocate_province_image(&mut self, layer_id: u32) {
         let (w, h) = {
             let Some(layer) = self.layer(layer_id) else {
@@ -1664,10 +1633,8 @@ impl Scene {
         self.resize_province_image(layer_id, w, h);
     }
 
-    /// Reference `ProvinceImage->SetSizeWithFill(w, h, 0)`: resize the province
-    /// plane, preserving the overlapping top-left region and filling the
-    /// expansion with 0. A 0-sized province is clamped to 1x1 (the reference
-    /// `tTVPBaseBitmap` constructor does the same).
+    /// Resize the province plane, preserving the overlapping top-left region
+    /// and filling the expansion with 0. A 0-sized province is clamped to 1x1.
     pub fn resize_province_image(&mut self, layer_id: u32, w: u32, h: u32) {
         let w = w.max(1);
         let h = h.max(1);
@@ -1705,8 +1672,7 @@ impl Scene {
         layer.image_modified = true;
     }
 
-    /// Reference `DeallocateProvinceImage` (`LayerIntf.cpp:2374`): drop the
-    /// province plane.
+    /// Drop the province plane.
     pub fn deallocate_province_image(&mut self, layer_id: u32) {
         if let Some(layer) = self.layer_mut(layer_id)
             && layer.province.take().is_some()
@@ -1717,8 +1683,7 @@ impl Scene {
         }
     }
 
-    /// Reference `GetProvincePixel` (`LayerIntf.cpp:2973`): 0 when the plane is
-    /// absent or the coordinate is outside it.
+    /// 0 when the plane is absent or the coordinate is outside it.
     ///
     /// A plane shorter than the size it declares reads as 0 and reports the
     /// inconsistency.
@@ -1753,9 +1718,8 @@ impl Scene {
         }
     }
 
-    /// Reference `SetProvincePixel` (`LayerIntf.cpp:2985`): allocate the plane
-    /// when absent, clip against `ClipRect` (and the plane bounds), store the
-    /// low byte and mark the image modified.
+    /// Allocate the plane when absent, clip against the clip rect (and the
+    /// plane bounds), store the low byte and mark the image modified.
     ///
     /// A plane shorter than the size it declares is a no-op that reports the
     /// inconsistency.
@@ -1807,11 +1771,10 @@ impl Scene {
         }
     }
 
-    /// Detach one layer — the reference `tTJSNI_BaseLayer::Part()`
-    /// (`LayerIntf.cpp:624`). The layer is severed from its parent (or the
+    /// Detach one layer. The layer is severed from its parent (or the
     /// window root list) and removed from the scene. Direct children are
     /// detached too, but their records stay alive until their own script
-    /// objects are finalized (`LayerIntf.cpp:535-549`).
+    /// objects are finalized.
     ///
     /// This is *detachment*, not destruction: use [`Scene::destroy_layer`] to
     /// remove a native instance and its whole subtree.
@@ -1851,15 +1814,12 @@ impl Scene {
         } else if let Some(w) = self.window_mut(win) {
             w.layers.retain(|&x| x != id);
         }
-        // Sever the direct children too — reference `tTJSNI_BaseLayer::Invalidate`
-        // calls `child->Part()` for each of them (`LayerIntf.cpp:535`), and
-        // `Part()` is exactly `Parent->SeverChild(this); Parent = nullptr;`
-        // (`LayerIntf.cpp:624`).
+        // Sever the direct children too: each of them is parted in the same
+        // way, which is exactly `Parent->SeverChild(this); Parent = nullptr;`.
         //
-        // They must **not** be promoted to window-level layers. The reference
-        // draws precisely the tree reachable from the window's `Primary` layer
-        // (`tTVPLayerManager::RecreateOverallOrderIndex`, `LayerManager.cpp:208`),
-        // and `NotifyPart` invalidates that index — so a parted layer stops
+        // They must **not** be promoted to window-level layers. The window
+        // draws precisely the tree reachable from its primary layer, and
+        // parting invalidates that reachability — so a parted layer stops
         // being drawn *and* hit-tested. A script that wants such a layer back
         // re-parents it explicitly, which restores it.
         for child in &children {
@@ -1909,12 +1869,10 @@ impl Scene {
         for (index, layer) in self.layers.iter().enumerate() {
             self.layer_index.insert(layer.id, index);
         }
-        // The reference `DetachPrimary` leaves the window without a primary,
-        // and `SeverChild` blurs a removed focus holder. A removed parentless
-        // root also unregisters its manager (`UnregisterSelfFromWindow`,
-        // `reference/cpp/core/visual/LayerIntf.cpp:533-535`;
-        // `reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:99-108`), so the
-        // next root becomes the window's input domain.
+        // Detaching the primary leaves the window without a primary, and
+        // severing a child blurs a removed focus holder. A removed parentless
+        // root also unregisters its focus domain, so the next root becomes the
+        // window's input domain.
         if let Some(w) = self.window_mut(win) {
             if w.primary_layer == Some(id) {
                 w.primary_layer = None;
@@ -1929,11 +1887,10 @@ impl Scene {
         self.touch_structure();
     }
 
-    /// Reference `tTJSNI_BaseLayer::Invalidate` (`LayerIntf.cpp:515`): the
-    /// explicit native teardown the script triggers with `invalidate layer`.
+    /// The explicit native teardown the script triggers with `invalidate layer`.
     /// The invalidated layer is removed from the scene and its direct
-    /// children are severed (`Part`, `LayerIntf.cpp:535-549`), but each
-    /// child's record remains until that child's own script object is
+    /// children are severed, but each child's record remains until that
+    /// child's own script object is
     /// finalized. The compat layer finalizes the children before calling this
     /// so their finalizers still see a live layer.
     pub fn invalidate_layer(&mut self, id: u32) {
@@ -1956,13 +1913,11 @@ impl Scene {
         }
     }
 
-    /// Destroy a layer and its **entire** child subtree — the reference
-    /// `tTJSNI_BaseLayer::Invalidate` (`LayerIntf.cpp:535`) followed by the
-    /// TJS GC cascade. `Invalidate` severs each direct child (`child->Part()`)
-    /// and releases the `Children` array; once the parent no longer holds the
-    /// children the whole subtree is destroyed with it. This is the function
-    /// `layer_destroy` must use. [`Scene::remove_layer`] remains the explicit
-    /// `Part()` detach that *keeps* the children.
+    /// Destroy a layer and its **entire** child subtree. The teardown severs
+    /// each direct child and releases the `Children` array; once the parent
+    /// no longer holds the children the whole subtree is destroyed with it.
+    /// This is the function `layer_destroy` must use. [`Scene::remove_layer`]
+    /// remains the explicit detach that *keeps* the children.
     ///
     /// The subtree is collected through both the maintained `parent` links and
     /// the `children` vectors, so a stale link cannot leave an orphan behind.
@@ -2061,7 +2016,7 @@ impl Scene {
         for (index, font) in self.fonts.iter().enumerate() {
             self.font_index.insert(font.id, index);
         }
-        // The reference `DetachPrimary` leaves the window without a primary,
+        // Destroying the primary leaves the window without a primary,
         // and `SeverChild`/`BlurTree` clears a removed focus holder.
         if let Some(window) = window
             && let Some(w) = self.window_mut(window)
@@ -2080,17 +2035,16 @@ impl Scene {
         self.touch_structure();
     }
 
-    /// Reference `tTVPLayerManager::SetFocusTo`: give keyboard focus to
-    /// `id` in the window's **input domain** — the first-registered root's
+    /// Give keyboard focus to `id` in the window's **input domain** — the
+    /// first-registered root's
     /// domain, the one `Window.focusedLayer` and all input bind to —
     /// clearing the previous holder. Returns `(previous, new)`. An invalid
     /// `id` returns `(None, None)` and leaves the current holder unchanged;
     /// use [`Scene::clear_focus`] to blur it.
     ///
-    /// The layer's own domain is irrelevant, matching the reference setter,
-    /// which moves the window's first manager regardless of the layer's
-    /// membership (`reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:385-389`).
-    /// Use [`Scene::set_domain_focus`] to move focus in a specific domain.
+    /// The layer's own domain is irrelevant: the window's first domain takes
+    /// the focus regardless of the layer's membership. Use
+    /// [`Scene::set_domain_focus`] to move focus in a specific domain.
     pub fn set_focus(&mut self, id: u32) -> (Option<u32>, Option<u32>) {
         let Some(layer) = self.layer(id) else {
             return (None, None);
@@ -2108,8 +2062,7 @@ impl Scene {
     }
 
     /// Clear the input-domain focus of `window`, returning the previous
-    /// holder. This is the `Window.focusedLayer = null` shape
-    /// (`reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:385-389`).
+    /// holder. This is the `Window.focusedLayer = null` shape.
     pub fn clear_focus(&mut self, window: u32) -> Option<u32> {
         let domain = self.window(window).and_then(|w| w.input_domain())?;
         let prev = self.focused_in(window, domain);
@@ -2120,17 +2073,14 @@ impl Scene {
     }
 
     /// The focused layer of `window`'s `domain`, or `None` when that domain
-    /// holds no focus. A domain is one parentless root's manager
-    /// (`reference/cpp/core/visual/LayerIntf.cpp:461-473`); every focus
-    /// read/write stays inside one domain
-    /// (`reference/cpp/core/visual/LayerManager.h:483-490`).
+    /// holds no focus. A domain is one parentless root's focus manager;
+    /// every focus read/write stays inside one domain.
     pub fn focused_in(&self, window: u32, domain: u32) -> Option<u32> {
         self.window(window)
             .and_then(|w| w.domain_focus.get(&domain).copied())
     }
 
-    /// Move `window`'s `domain` focus to `target` (`None` clears it) — the
-    /// `tTVPLayerManager::FocusedLayer` assignment (`LayerTreeOwnerImpl.h:483-490`).
+    /// Move `window`'s `domain` focus to `target` (`None` clears it).
     /// Moving a domain other than the input domain leaves the window-level
     /// `focused_layer` untouched.
     pub fn set_domain_focus(&mut self, window: u32, domain: u32, target: Option<u32>) {
@@ -2155,14 +2105,13 @@ impl Scene {
 
     /// The domain a window's input events and `focusedLayer` property bind
     /// to: the first-registered parentless root's domain, or `None` while
-    /// the window has no such root (`PrimaryLayerManagerIndex` is 0 and
-    /// never reassigned, `reference/cpp/core/visual/LayerTreeOwnerImpl.h:21`,
-    /// `reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:20`).
+    /// the window has no such root: the first domain is the window's own and
+    /// is never reassigned.
     pub fn window_input_root(&self, window: u32) -> Option<u32> {
         self.window(window).and_then(|w| w.input_domain())
     }
 
-    /// Reference `GetNodeVisible`: `visible` and every ancestor visible.
+    /// `visible` and every ancestor visible.
     /// A [`LayerState::shutdown`] layer is inert and reports `false`.
     ///
     /// A missing id or a corrupted/cyclic parent chain is a typed miss
@@ -2191,7 +2140,7 @@ impl Scene {
         }
     }
 
-    /// Reference `GetNodeEnabled`: `enabled` and every ancestor enabled.
+    /// `enabled` and every ancestor enabled.
     /// A [`LayerState::shutdown`] layer is inert and reports `false`.
     ///
     /// Bounded like [`Scene::node_visible`]: a corrupted parent chain reports
@@ -2219,17 +2168,15 @@ impl Scene {
         }
     }
 
-    /// Reference `GetNodeFocusable` (`LayerIntf.h:665`): `focusable` plus
-    /// node visible/enabled at every ancestor. Manager `Mode` layers are not
-    /// modelled.
+    /// `focusable` plus node visible/enabled at every ancestor. Manager
+    /// `Mode` layers are not modelled.
     pub fn node_focusable(&self, id: u32) -> bool {
         self.layer(id)
             .is_some_and(|l| self.node_visible(id) && self.node_enabled(id) && l.focusable)
     }
 
     /// The layer's direct children in maintained sibling order — the order
-    /// `GetChildrenArrayObjectNoAddRef` (`LayerIntf.cpp:669`) builds the
-    /// `children` array in.
+    /// the script's `children` array is built in.
     pub fn ordered_children(&self, layer_id: u32) -> Vec<u32> {
         let Some(layer) = self.layer(layer_id) else {
             return Vec::new();
@@ -2240,19 +2187,16 @@ impl Scene {
         ids
     }
 
-    /// Reference `_GetNextFocusable`/`GetNextFocusable`
-    /// (`LayerIntf.cpp:3631`): the next `JoinFocusChain` focusable layer in
-    /// the window's paint order, wrapping, never returning `id` itself. Only
-    /// layers of `id`'s own focus domain are considered; the reference walks
-    /// the receiver's manager node list, which reaches no other root
-    /// (`reference/cpp/core/visual/LayerIntf.cpp:1260-1283`).
+    /// The next `joinFocusChain` focusable layer in the window's paint
+    /// order, wrapping, never returning `id` itself. Only layers of `id`'s own
+    /// focus domain are considered: the search walks the receiver's domain
+    /// node list, which reaches no other root.
     pub fn next_focusable(&self, id: u32) -> Option<u32> {
         self.focusable_neighbor(id, true)
     }
 
-    /// Reference `_GetPrevFocusable`/`GetPrevFocusable`
-    /// (`LayerIntf.cpp:3595`): the previous focusable layer, wrapping, scoped
-    /// to `id`'s focus domain like [`Scene::next_focusable`].
+    /// The previous focusable layer, wrapping, scoped to `id`'s focus domain
+    /// like [`Scene::next_focusable`].
     pub fn prev_focusable(&self, id: u32) -> Option<u32> {
         self.focusable_neighbor(id, false)
     }
@@ -2463,9 +2407,9 @@ impl Scene {
         Some((x, y))
     }
 
-    /// Reference `_HitTestNoVisibleCheck` (`LayerIntf.cpp:3229`). `htMask`
-    /// compares the main-image alpha against `hit_threshold` (&#8804;0 accepts
-    /// any pixel; 256 rejects everything); `htProvince` treats a non-zero
+    /// `htMask` compares the main-image alpha against `hit_threshold`
+    /// (&#8804;0 accepts any pixel; 256 rejects everything); `htProvince`
+    /// treats a non-zero
     /// province byte as a hit. Whether the hit stands is the caller's
     /// decision; see [`Scene::layer_hit_next`].
     fn hit_test_layer(&self, layer: &LayerState, x: i32, y: i32) -> bool {
@@ -2527,7 +2471,7 @@ impl Scene {
                 }
                 None => layer.hit_threshold <= 0,
             },
-            // Unknown hit types hit (the reference falls through to true).
+            // Unknown hit types hit.
             _ => true,
         }
     }
@@ -2840,10 +2784,8 @@ impl Scene {
     }
 
     /// Resize a bitmap in place, preserving the overlapping top-left region
-    /// and filling any expansion with `fill` (RGBA) — the reference
-    /// `iTVPBaseBitmap::SetSizeWithFill` (`LayerBitmapIntf.cpp:122`).
-    /// Dimensions are clamped to at least 1, matching the reference
-    /// `tTVPBaseTexture` constructor. Only the rows the source buffer
+    /// and filling any expansion with `fill` (RGBA). Dimensions are
+    /// clamped to at least 1. Only the rows the source buffer
     /// actually holds are preserved: a bitmap that declares a size without
     /// holding its pixels keeps the fill, and the missing rows are reported
     /// in the log rather than read out of bounds. Marks the bitmap dirty and
@@ -3029,9 +2971,6 @@ impl Scene {
     /// size is refreshed and the clip rectangle reset to the whole image, and
     /// a province plane is resized to match. Returns false when the layer is
     /// missing or the size cannot be represented.
-    ///
-    /// Reference `AllocateImage` and `ChangeImageSize` (`LayerIntf.cpp:2326`,
-    /// `:2307`).
     pub fn ensure_layer_image(&mut self, layer_id: u32, min_w: u32, min_h: u32) -> bool {
         let min_w = min_w.max(1);
         let min_h = min_h.max(1);
@@ -3072,8 +3011,6 @@ impl Scene {
     /// the clip reset to the whole image, and a province plane is resized to
     /// match. Returns false when the layer is missing or the size cannot be
     /// represented.
-    ///
-    /// Reference `ChangeImageSize` (`LayerIntf.cpp:2307`).
     pub fn set_layer_image_size(&mut self, layer_id: u32, width: u32, height: u32) -> bool {
         let width = width.max(1);
         let height = height.max(1);
@@ -3128,8 +3065,7 @@ impl Scene {
     }
 
     /// Grow a layer's MainImage so it covers the layer rectangle and clamp
-    /// `ImageLeft`/`ImageTop`, the reference `ImageLayerSizeChanged`
-    /// (`LayerIntf.cpp:2656`). A layer with no MainImage is left untouched.
+    /// `imageLeft`/`imageTop`. A layer with no MainImage is left untouched.
     pub fn layer_size_changed(&mut self, layer_id: u32) {
         let (rect_w, rect_h) = match self.layer(layer_id) {
             Some(layer) if layer.bitmap.is_some() => (layer.rect.w, layer.rect.h),
@@ -3185,8 +3121,7 @@ impl Scene {
     }
 
     /// Refresh a layer's tracked image size and clip after its MainImage
-    /// changed, and resize its province plane to match. Reference `ResetClip`
-    /// and the province resize in `AllocateImage`/`ChangeImageSize`.
+    /// changed, and resize its province plane to match.
     fn sync_layer_image(&mut self, layer_id: u32) {
         let Some((w, h)) = self
             .layer(layer_id)
@@ -3263,9 +3198,8 @@ impl Scene {
         })
     }
 
-    /// Reference `tTJSNI_BaseLayer::IncCacheEnabledCount`
-    /// (`LayerIntf.cpp:3996`): register one consumer that needs this layer's
-    /// subtree rendered into its cache. The composited content and the
+    /// Register one consumer that needs this layer's subtree rendered into
+    /// its cache. The composited content and the
     /// transition frame are allocated by
     /// [`crate::layer_ops::render_layer_subtree`] on the first render and by
     /// [`crate::layer_ops::ensure_transition_display`]. Returns the new count
@@ -3279,9 +3213,8 @@ impl Scene {
         layer.cache_enabled_count
     }
 
-    /// Reference `tTJSNI_BaseLayer::DecCacheEnabledCount`
-    /// (`LayerIntf.cpp:4008`): release one cache consumer. The composited
-    /// content and the transition frame are freed with the last one. Returns
+    /// Release one cache consumer. The composited content and the transition
+    /// frame are freed with the last one. Returns
     /// the new count (`0` for an unknown layer).
     pub fn dec_cache_enabled_count(&mut self, id: u32) -> u32 {
         self.touch_structure();
@@ -3311,10 +3244,10 @@ impl Scene {
 
     /// Release a bitmap when the last holder is gone.
     ///
-    /// Reference semantics: a layer's MainImage is a **reference-counted**
-    /// `tTVPBaseBitmap`; destroying the layer drops only its own reference.
-    /// In this port a bitmap id can be held by more than one owner, so
-    /// freeing is conservative — the bitmap is removed only when
+    /// A layer's MainImage is a **refcounted** bitmap; destroying the layer
+    /// drops only its own count. A bitmap id can be held by more than one
+    /// owner, so freeing is conservative — the bitmap is removed
+    /// only when
     /// * no live layer references it (MainImage, subtree cache or transition
     ///   self image), and
     /// * it is not owned by a script `Bitmap` object
@@ -3363,8 +3296,8 @@ impl Scene {
     }
 
     /// The decoded-image cache byte limit (`0` when the cache is disabled or
-    /// unlimited). The script-visible property uses the reference's numeric
-    /// encoding; [`Self::decoded_image_cache_limit`] exposes the typed value.
+    /// unlimited). The script-visible property uses a numeric encoding;
+    /// [`Self::decoded_image_cache_limit`] exposes the typed value.
     pub fn graphic_cache_limit(&self) -> u64 {
         self.image_cache.limit.option().unwrap_or(0)
     }
@@ -3385,18 +3318,14 @@ impl Scene {
         }
     }
 
-    /// Set the decoded-image cache byte limit, mirroring
-    /// `TVPSetGraphicCacheLimit` (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:2423-2441`):
-    /// `0` disables the cache; `-1` selects the system limit; every other
-    /// value — including a negative one below `-1`, which the reference's
-    /// `tjs_uint64` parameter converts to a huge unsigned quantity — is
-    /// clamped to the system limit. Entries are then evicted down to the new
-    /// limit.
+    /// Set the decoded-image cache byte limit: `0` disables the cache;
+    /// `-1` selects the system limit; every other value — including a
+    /// negative one below `-1`, which the script's unsigned parameter
+    /// converts to a huge unsigned quantity — is clamped to the system limit.
+    /// Entries are then evicted down to the new limit.
     ///
-    /// The reference derives its system limit from physical memory at startup
-    /// and caps it at 512 MiB
-    /// (`reference/cpp/core/base/impl/SysInitImpl.cpp:235-277`); the port has
-    /// no memory probe, so the cap is the system limit.
+    /// The system limit is a fixed 512 MiB: there is no physical-memory
+    /// probe, so the cap is the whole limit.
     pub fn set_graphic_cache_limit(&mut self, limit: i64) {
         const SYSTEM_LIMIT: u64 = 512 * 1024 * 1024;
         self.set_decoded_image_cache_limit(match limit {
@@ -3406,9 +3335,7 @@ impl Scene {
         });
     }
 
-    /// Drop every decoded-image cache entry (the reference
-    /// `TVPClearGraphicCache`,
-    /// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1456-1459`).
+    /// Drop every decoded-image cache entry.
     pub fn clear_decoded_image_cache(&mut self) {
         self.image_cache.entries.clear();
         self.image_cache.order.clear();
@@ -3419,11 +3346,10 @@ impl Scene {
     /// result and return it.
     ///
     /// A caller receives an owned copy, so mutating the returned pixels
-    /// cannot corrupt a later cache hit. The reference shares a refcounted
-    /// bitmap and copies on write
-    /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:641-664`), which
-    /// is observably the same. When the cache is disabled the decode always
-    /// runs and nothing is stored.
+    /// cannot corrupt a later cache hit: the cache's shared entry is copied on
+    /// write, which is observably the same. When the cache is disabled the
+    /// decode
+    /// always runs and nothing is stored.
     ///
     /// # Errors
     ///
@@ -3869,10 +3795,8 @@ impl Scene {
     }
 
     /// Reset a scene font in place to the default style with the given face,
-    /// height and color. The reference `tTJSNI_Font::Construct` with no layer
-    /// argument replaces the native font with the default font, so the style
-    /// fields reset rather than preserving a pre-constructor write. Returns
-    /// `false` when the font is gone.
+    /// height and color: the style fields reset rather than preserving an
+    /// earlier write. Returns `false` when the font is gone.
     pub fn reset_font(&mut self, id: u32, face: String, height: i32, color: [u8; 4]) -> bool {
         let Some(font) = self.fonts.iter_mut().find(|font| font.id == id) else {
             return false;
@@ -3904,7 +3828,7 @@ impl Scene {
     /// All layers of a window flattened back -> front.
     ///
     /// A parent's complete subtree is emitted before the next sibling. This
-    /// is important for TVP's layer tree: a parent is a backdrop/container,
+    /// is important for the layer tree: a parent is a backdrop/container,
     /// while its children are composited in front of it. Sibling `z_order`
     /// remains the primary key and the maintained sibling vectors provide the
     /// stable tie-breaker (including `bringToFront`). Invalid or cyclic links

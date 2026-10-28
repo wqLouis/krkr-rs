@@ -1,8 +1,8 @@
 //! Blend modes for the render tree.
 //!
 //! This is the closed set of composition modes the bottom render pipeline
-//! must implement. The middle layer maps its own TVP `Layer.type` numbering
-//! onto these values; the pipeline never learns about TVP numbering. Most
+//! must implement. The middle layer maps its own layer-type numbering
+//! onto these values; the pipeline never learns about that numbering. Most
 //! modes map directly to fixed-function blend state; the
 //! [`BlendMode::DestinationDependent`] variants and the Photoshop
 //! additive/subtractive modes require reading the destination.
@@ -19,7 +19,7 @@ pub enum DstBlend {
     ColorDodge,
     /// Photoshop `Color Dodge` under the `ltPsColorDodge` spelling.
     PsColorDodge,
-    /// The legacy `ColorDodge5` approximation used by KiriKiri.
+    /// The `ColorDodge5` approximation of `Color Dodge`.
     ColorDodge5,
     /// Photoshop `Color Burn`: `1 - (1 - dst) / src`.
     ColorBurn,
@@ -33,7 +33,7 @@ pub enum DstBlend {
     PsLighten,
     /// Absolute per-channel difference.
     Difference,
-    /// The legacy `Difference5` approximation used by KiriKiri.
+    /// The `Difference5` approximation of `Difference`.
     Difference5,
     /// Photoshop `Exclusion`: `src + dst - 2·src·dst`.
     Exclusion,

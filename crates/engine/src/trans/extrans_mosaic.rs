@@ -1,8 +1,6 @@
 //! `mosaic` — the `extrans.dll` rectangular-mosaic dissolve.
 //!
-//! Port of `tTVPMosaicTransHandler` and
-//! `tTVPMosaicTransHandlerProvider` (`sample/extrans/mosaic.cpp`). The
-//! frame is cut into a square block grid; every block is painted with one
+//! The frame is cut into a square block grid; every block is painted with one
 //! colour sampled from the block centre of both sources and blended from
 //! source 1 to source 2 as the phase advances. The block size follows a
 //! triangle wave between 2 pixels and `max_size`: it peaks at `max_size`
@@ -12,36 +10,33 @@
 //!
 //! # Mapping decisions
 //!
-//! * **Clock.** The reference drives the handler from a millisecond tick
-//!   (`StartProcess(tick)`, `Time`, `HalfTime = Time / 2`); this port runs
+//! * **Clock.** The handler is driven from a millisecond tick
+//!   (`StartProcess(tick)`, `Time`, `HalfTime = Time / 2`); this model runs
 //!   the same integer formulas on the L2 phase clock: `Time` is
 //!   [`Trans::phase_max`] and `CurTime` is [`Trans::phase`]. `mosaic` is
 //!   never `universal`, so [`Trans::new`] pins `phase_max` to
 //!   [`PHASE_MAX`](super::PHASE_MAX) (`255`) and `HalfTime` is
 //!   `255 / 2 = 127` — never zero.
 //!   `BlendRatio = CurTime * 255 / Time` therefore collapses to `phase`
-//!   exactly, and `CurBlockSize` keeps the reference's truncating integer
+//!   exactly, and `CurBlockSize` keeps the truncating integer
 //!   division, quantised to the `1/255` phase steps instead of
 //!   milliseconds.
-//! * **Destination offset.** The reference's `destxofs = DestLeft - Left`
+//! * **Destination offset.** The `destxofs = DestLeft - Left` offset
 //!   shifts the painting into a separate destination scan line provider;
 //!   L2 composites `dst`, `src1` and `src2` in one coordinate space, so
 //!   the offset is zero and the processing rectangle is `region` clipped
-//!   to `dst` (exactly the `data->Left/Top/Width/Height` rectangle the
-//!   reference clips `FILL_ONE` against).
+//!   to `dst` (the rectangle `FILL_ONE` is clipped against).
 //! * **Colour.** Each block takes the colour of a *single* sample at the
 //!   unclipped block centre (`mx = l + (bs >> 1)`, clamped to the image) —
-//!   the reference deliberately does not average the block (see the note
-//!   under `FILL_ONE`). The blend is the reference `Blend` arithmetic,
-//!   [`blend_level`], on the straight-alpha RGBA buffer; the reference's
-//!   caveat that the handler mishandles an alpha-carrying destination
-//!   applies verbatim.
+//!   the block is deliberately not averaged (see the note
+//!   under `FILL_ONE`). The blend is the `Blend` arithmetic,
+//!   [`blend_level`], on the straight-alpha RGBA buffer; the caveat that the
+//!   handler mishandles an alpha-carrying destination applies verbatim.
 //!
 //! # Errors
 //!
-//! [`TransError::InvalidOption`] for a `max_size` the reference grid
-//! arithmetic cannot run with (see [`MosaicGrid::new`]); nothing is
-//! clamped silently.
+//! [`TransError::InvalidOption`] for a `max_size` the grid arithmetic
+//! cannot run with (see [`MosaicGrid::new`]); nothing is clamped silently.
 
 use super::{Trans, TransError, blend_level, read_pixel, write_pixel};
 use crate::layer_ops::{RectI, intersect};
@@ -56,18 +51,18 @@ use crate::scene::BitmapState;
 /// # Parameters
 ///
 /// * `trans` — the transition state; only [`Trans::phase`] and
-///   [`Trans::phase_max`] are read, the L2 equivalent of the reference
+///   [`Trans::phase_max`] are read, the L2 equivalent of the
 ///   `StartProcess(tick)` clock (`CurTime`/`Time`).
 /// * `dst` — destination bitmap, written block by block and marked dirty
 ///   afterwards; only the intersection of `region` with its bounds is
-///   painted, the reference's `DestLeft`/`DestTop` offset is zero here.
+///   painted; the `DestLeft`/`DestTop` offset is zero here.
 /// * `src1` — first source (the image the transition starts from); its
-///   dimensions define the block grid (`Width`/`Height` of the reference
-///   handler) and clamp the block-centre sample.
+///   dimensions define the block grid (the handler's `Width`/`Height`) and
+///   clamp the block-centre sample.
 /// * `src2` — second source (the image the transition dissolves into),
 ///   same size as `src1` (checked by [`Trans::apply`]).
 /// * `region` — half-open processing rectangle `[x0, y0, x1, y1)` the
-///   reference `Process` receives as `data->Left/Top/Width/Height`.
+///   `Process` call receives as `data->Left/Top/Width/Height`.
 /// * `max_size` — `maxsize` option: the peak block size in pixels
 ///   (default 30), reached at the middle of the transition.
 ///
@@ -75,7 +70,7 @@ use crate::scene::BitmapState;
 ///
 /// [`TransError::InvalidOption`] for a `max_size` below one pixel (the
 /// grid math divides by the current block size) or one whose peak block
-/// size does not fit the reference's 32-bit `tjs_int` grid arithmetic.
+/// size does not fit the 32-bit `tjs_int` grid arithmetic.
 pub(crate) fn apply(
     trans: &Trans,
     dst: &mut BitmapState,
@@ -87,7 +82,7 @@ pub(crate) fn apply(
     let grid = MosaicGrid::new(trans, src1, max_size)?;
 
     // The rectangle to paint: `region` clipped to `dst` plays the role of
-    // the reference `data->Left/Top/Width/Height` (its `destxofs`/`destyofs`
+    // `data->Left/Top/Width/Height` (its `destxofs`/`destyofs`
     // cancel in L2's single coordinate space). An empty rectangle means
     // nothing to paint, exactly as a `Process` call with an empty region.
     let Some(rect @ (left, top, right, bottom)) = intersect(dst, region) else {
@@ -121,7 +116,7 @@ pub(crate) fn apply(
         y += 1;
     }
 
-    // Bottom row: the middle loop stops at `y == endy`, so the reference's
+    // Bottom row: the middle loop stops at `y == endy`, so the
     // `if(y <= endy)` paints exactly that row — and only for a single-row
     // rectangle (`starty == endy`) does it skip the extra pass.
     if y <= endy {
@@ -134,8 +129,8 @@ pub(crate) fn apply(
     Ok(())
 }
 
-/// The per-frame mosaic parameters `StartProcess` computes in the
-/// reference (`mosaic.cpp`), plus the two block-fill paths of `Process`.
+/// The per-frame mosaic parameters `StartProcess` computes, plus the two
+/// block-fill paths of `Process`.
 #[derive(Clone, Copy)]
 struct MosaicGrid {
     /// `CurBlockSize`: the current square block size in pixels, `>= 1`.
@@ -151,19 +146,19 @@ struct MosaicGrid {
 }
 
 impl MosaicGrid {
-    /// The reference `StartProcess` parameter computation, driven by the
+    /// The `StartProcess` parameter computation, driven by the
     /// phase clock instead of `tick`:
     ///
     /// * `t` is the triangle wave of the elapsed time (`phase` below the
     ///   halfway point, `phase_max - phase` above it, i.e. `Time - t`),
-    ///   which the reference clamps at `0` — here `0 <= phase <=
+    ///   which is clamped at `0` — here `0 <= phase <=
     ///   phase_max` is an invariant of `Trans`, so both of its clamps
     ///   (`CurTime > Time`, `t < 0`) cannot trigger.
     /// * `block = (max_size - 2) * t / HalfTime + 2`, computed in 64-bit
-    ///   like the reference's `tjs_int64 t` and truncated towards zero.
+    ///   like the `tjs_int64 t` and truncated towards zero.
     /// * `ratio = CurTime * 255 / Time`, `<= 255` because `phase <=
-    ///   phase_max` (the reference's own `> 255` clamp never fires once
-    ///   `CurTime` is capped).
+    ///   phase_max` (the `> 255` clamp never fires once `CurTime` is
+    ///   capped).
     /// * the offsets centre a block on the image, matching
     ///   `CurOfsX = (Width - bs) / 2 - (Width / 2 / bs * bs)` followed by
     ///   `if(CurOfsX > 0) CurOfsX -= bs`.
@@ -177,12 +172,12 @@ impl MosaicGrid {
     /// # Errors
     ///
     /// [`TransError::InvalidOption`] (`option: "maxsize"`) when
-    /// `max_size < 1` would make the reference divide by a non-positive
+    /// `max_size < 1` would make the grid divide by a non-positive
     /// `CurBlockSize`, or when the peak block size of the triangle wave
-    /// overflows the reference's 32-bit `tjs_int` grid arithmetic.
+    /// overflows the 32-bit `tjs_int` grid arithmetic.
     fn new(trans: &Trans, src1: &BitmapState, max_size: i32) -> Result<Self, TransError> {
         if max_size < 1 {
-            // The reference reads `maxsize` unchecked and later evaluates
+            // `maxsize` is read unchecked and later evaluated as
             // `(MaxBlockSize-2) * t / HalfTime + 2` and `x /= CurBlockSize`;
             // a value below 1 yields a block size of 0 or less (division by
             // zero / inverted grid), so there is no runnable configuration
@@ -210,7 +205,7 @@ impl MosaicGrid {
             });
         }
 
-        // `t`: the reference triangle `if(t >= HalfTime) t = Time - t;`.
+        // `t`: the triangle `if(t >= HalfTime) t = Time - t;`.
         let t = if phase >= half {
             phase_max - phase
         } else {
@@ -246,7 +241,7 @@ impl MosaicGrid {
 
     /// The shared block sample: blend both sources at the block centre
     /// `(l + (bs >> 1), t + (bs >> 1))`, clamped to the image bounds like
-    /// the reference's `mx`/`my`. The centre is taken from the
+    /// `mx`/`my`. The centre is taken from the
     /// *unclipped* block corner, so a partially visible border block keeps
     /// the colour of its true centre.
     ///
@@ -280,7 +275,7 @@ impl MosaicGrid {
     }
 
     /// `FILL_ONE`: fill the intersection of block `(x, y)` with `rect`
-    /// (the reference `Clip(l, r, …) && Clip(t, b, …)` guard) with the
+    /// (the `Clip(l, r, …) && Clip(t, b, …)` guard) with the
     /// block's centre sample. Used for the border rows/columns, where a
     /// block may stick out of the rectangle.
     ///

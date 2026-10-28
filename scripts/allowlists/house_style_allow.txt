@@ -57,7 +57,6 @@ crates/compat/src/natives/visual/common.rs:46:reference count zero and run its i
 crates/compat/src/natives/visual/layer/mod.rs:113:object must be able to reach reference count zero so its native — our own refcount, not a citation
 crates/compat/src/natives/visual/layer/mod.rs:1018:Install the fresh copy, then release the layer's reference to the — our own refcount, not a citation
 crates/compat/src/natives/visual/window.rs:143:without a reference, so a window the script drops reaches reference count — our own refcount, not a citation
-crates/platform/platform/src/android.rs:43:the activity handed over — Rust reference to the `ANativeWindow`, not a citation
 crates/platform/render/src/scene.rs:208:Returns a mutable reference to the node for — Rust mutable borrow, not a citation
 crates/platform/render/src/vulkan/mod.rs:962:beyond the reference count). Kept solely so the instance outlives every — our own refcount, not a citation
 crates/platform/render/src/vulkan/mod.rs:1398:no GPU work may reference the old surface while it is replaced. — English verb, not a citation

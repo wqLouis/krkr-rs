@@ -1,8 +1,6 @@
 //! Image format dispatch and header probing.
 //!
-//! This is the `media` replacement for
-//! `tvp-visual/src/bitmap.rs::decode_image`. It keeps the reference router's
-//! effective order:
+//! The dispatcher keeps this effective order:
 //!
 //! 1. an explicit TLG spelling (`.tlg`/`.tlg5`/`.tlg6`) → the native TLG
 //!    decoder; a corrupt real TLG reports its decode error, a *mislabeled*
@@ -18,8 +16,7 @@
 //!
 //! Supported `image`-crate formats are the crate's enabled feature list
 //! (png, jpeg, webp, bmp, gif, tiff, tga, dds, pnm, ico, qoi, hdr, exr,
-//! ff). AVIF/pvr/jxr are deliberately absent, matching the reference
-//! migration note.
+//! ff). AVIF/pvr/jxr are deliberately absent.
 
 use std::io::Cursor;
 
@@ -31,7 +28,7 @@ use crate::Media;
 use crate::hint::extension_of;
 use crate::tlg;
 
-/// TLG spellings the reference registers (extension without the dot).
+/// TLG spellings the router recognizes (extension without the dot).
 const TLG_EXTENSIONS: [&str; 3] = ["tlg", "tlg5", "tlg6"];
 
 /// Image format names advertised by [`crate::capabilities`].
@@ -52,9 +49,9 @@ fn is_tlg_hint(hint: Option<&str>) -> bool {
     })
 }
 
-/// The `image` crate format implied by an extension hint, mapping the
-/// reference's extra spellings (`.jif` → JPEG, `.dib` → BMP) onto their
-/// decoders. TLG spellings return `None` because they are routed separately.
+/// The `image` crate format implied by an extension hint, mapping the extra
+/// spellings (`.jif` → JPEG, `.dib` → BMP) onto their decoders. TLG
+/// spellings return `None` because they are routed separately.
 fn format_for_hint(hint: Option<&str>) -> Option<ImageFormat> {
     let ext = extension_of(hint?)?;
     if ext.eq_ignore_ascii_case("jif") {
@@ -108,9 +105,8 @@ fn decoded_from_dynamic(image: DynamicImage) -> DecodedImage {
 /// Probes an image header for its dimensions, alpha presence and format
 /// without decoding the pixel data.
 ///
-/// `hint` is the storage name or extension the caller used to find the
-/// bytes; it only steers format selection and is never trusted over the
-/// content.
+/// `hint` is the storage name or extension the caller matched the bytes by;
+/// it only steers format selection and is never trusted over the content.
 ///
 /// # Errors
 ///
@@ -188,9 +184,9 @@ fn decode_with_format(bytes: &[u8], format: ImageFormat) -> Result<DynamicImage,
 
 /// Decodes image bytes into tightly packed RGBA8.
 ///
-/// Dispatch matches the reference [[`format_for_hint`]] router (see the
-/// module docs). `hint` is the storage name or extension the caller used and
-/// only steers format selection; content always wins when the hint is
+/// Dispatch follows the [[`format_for_hint`]] router (see the module docs).
+/// `hint` is the storage name or extension the caller matched the bytes by
+/// and only steers format selection; content always wins when the hint is
 /// wrong.
 ///
 /// # Errors

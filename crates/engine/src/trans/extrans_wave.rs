@@ -1,6 +1,6 @@
-//! The `wave` transition of `extrans.dll` (`sample/extrans/wave.cpp`).
+//! The `wave` transition of the `extrans` plugin.
 //!
-//! The reference (`tTVPWaveTransHandler`) slides every scanline of the two
+//! The handler slides every scanline of the two
 //! sources horizontally under a travelling sine: row `y` is sampled at
 //! `x - d(y)` with `d(y) = trunc(sin(rad) · CurH)` and
 //! `rad = y · CurOmega + CurRadStart`, the two sources are cross-faded at
@@ -13,7 +13,7 @@
 //! # The wave schedule (`StartProcess`)
 //!
 //! Let `Time` be the transition duration and `HalfTime = Time / 2` —
-//! integer division in the reference (`tjs_uint64 HalfTime = time / 2`).
+//! integer division (`tjs_uint64 HalfTime = time / 2`).
 //! The elapsed time is folded around the midpoint (`t >= HalfTime` →
 //! `t = Time - t`, negative → `0`), then raised through a quarter sine:
 //!
@@ -27,42 +27,42 @@
 //! BlendRatio  = trunc(CurTime · 255 / Time), capped at 255
 //! ```
 //!
-//! The transition clock is the millisecond clock of the reference
-//! (`TVPGetTickCount`); L2 hands it over as [`Trans::elapsed_ms`] and
+//! The transition clock is a millisecond clock; L2 hands it over as
+//! [`Trans::elapsed_ms`] and
 //! [`Trans::duration_ms`] and the formulas above consume it directly —
-//! every *integer* operation of the C code (`HalfTime = time / 2`, the
+//! every *integer* operation (`HalfTime = time / 2`, the
 //! `tjs_int` casts of `CurH`/`BlendRatio`/`d`) stays an integer operation
 //! through `as` casts, while the `double` maths stays `f64`.
 //!
 //! # Rendering (`Process`)
 //!
-//! Per row the reference clips three spans: the background strip `[0, d)`
+//! Per row three spans are clipped: the background strip `[0, d)`
 //! for `d > 0`, the background strip `[Width + d, Width)` for `d < 0`, and
 //! the blend span `[d, d + Width)` (samples `[0, Width)`, always in range).
-//! This port instead tests `0 <= x - d < Width` per pixel, which is the
+//! The implementation instead tests `0 <= x - d < Width` per pixel, which is the
 //! same partition of `[0, Width)`: exactly where `x - d` falls outside the
 //! source rows, the background colour is written; everywhere else the
 //! displaced row is blended. That also covers a destination wider (or
-//! taller) than the sources, where the reference's buffers never differ.
+//! taller) than the sources, where the buffers never differ.
 //!
 //! The caller ([`Trans::apply`](super::Trans::apply)) already copies
 //! source 1 at `phase <= 0` and source 2 at `phase >= phase_max`, so this
-//! module only ever runs mid-flight — the same place the reference's
+//! module only ever runs mid-flight — the same place the
 //! `EndProcess` keeps running until `BlendRatio == 255`.
 //!
 //! # Errors
 //!
-//! The reference's `StartTransition` rejects only a missing/void `time`
+//! `StartTransition` rejects only a missing/void `time`
 //! (validated up front by [`Trans::new`](super::Trans::new)) and sources of
 //! different sizes (checked by the caller as
 //! [`TransError::SizeMismatch`](super::TransError::SizeMismatch)). Two of
 //! its silent guards become typed errors here, because L2 never clamps
 //! silently:
 //!
-//! * `time < 2` — the reference raises short times to `2` so `HalfTime`,
-//!   its sine divisor, cannot be zero; this port returns
-//!   [`TransError::InvalidOption`] instead.
-//! * `wavetype` outside `0..=2` — the reference's `switch` has no `default`
+//! * `time < 2` — short times are raised to `2` so `HalfTime`,
+//!   the sine divisor, cannot be zero; [`TransError::InvalidOption`] is
+//!   returned instead.
+//! * `wavetype` outside `0..=2` — the `switch` has no `default`
 //!   and would read an uninitialized (stale) `CurOmega`; rejected here.
 //!
 //! # Not ported
@@ -98,15 +98,15 @@ pub(crate) struct Params {
 /// Render one `wave` frame of `trans` into `dst`, restricted to `region`.
 ///
 /// This is `tTVPWaveTransHandler::StartProcess` + `Process`: the wave
-/// parameters are recomputed from the elapsed time exactly like the
-/// reference recomputes them from its tick, then every row of `region` is
+/// parameters are recomputed from the elapsed time, then every row of
+/// `region` is
 /// displaced, blended and backed with the background colour.
 ///
 /// # Errors
 ///
 /// Returns [`TransError::InvalidOption`] rather than a silent clamp:
-/// `time < 2` ms (the reference raises it to 2 so `HalfTime = time / 2`
-/// is non-zero) or a `wavetype` outside `0..=2` (the reference's `switch`
+/// `time < 2` ms (a short time is raised to 2 so `HalfTime = time / 2`
+/// is non-zero) or a `wavetype` outside `0..=2` (the `switch`
 /// has no `default` and would read a stale `CurOmega`).
 // The truncated π literal (`PI_TRUNCATED`) keeps the `sin` arguments at the
 // exact values the boundary pixels were tuned for; `f64::consts::PI` differs
@@ -128,8 +128,8 @@ pub(crate) fn apply(
     } = params;
 
     // -- StartTransition guards ----------------------------------------
-    // `Time`: whole milliseconds from the script. The reference clamps
-    // `time < 2` up to 2 (comment: "小さい数値を指定すると問題が発生する");
+    // `Time`: whole milliseconds from the script. A `time < 2` would be
+    // clamped up to 2 (a small value causes trouble);
     // L2 reports it instead. `HalfTime` below would be zero otherwise.
     let time = trans.duration_ms();
     if time < 2.0 {
@@ -180,11 +180,11 @@ pub(crate) fn apply(
 
     // `CurRadStart = -CurOmega * (Height / 2)` — integer division over the
     // full source height, kept as a separate term so the rounding of the
-    // sum matches the reference.
+    // sum matches the scheduled value.
     let rad_start = -cur_omega * ((height / 2) as f64);
 
-    // `BlendRatio = CurTime * 255 / Time` (integer division in the C),
-    // then the reference's `if(BlendRatio > 255) BlendRatio = 255;` —
+    // `BlendRatio = CurTime * 255 / Time` (integer division),
+    // then the `if(BlendRatio > 255) BlendRatio = 255;` —
     // unreachable because `CurTime <= Time`, kept for parity.
     let mut blend_ratio = ((cur_time * 255.0) / time) as i32;
     if blend_ratio > 255 {
@@ -205,7 +205,7 @@ pub(crate) fn apply(
     };
 
     // `rad = data->Top * CurOmega + CurRadStart`, advanced by one
-    // `CurOmega` per scanline (the reference accumulates it the same way).
+    // `CurOmega` per scanline (accumulated the same way).
     let mut rad = (y0 as f64) * cur_omega + rad_start;
     for y in y0..y1 {
         // `d = (tjs_int)(sin(rad) * CurH)` — truncation toward zero.
@@ -214,7 +214,7 @@ pub(crate) fn apply(
         for x in x0..x1 {
             let sx = i64::from(x) - i64::from(d);
             let pixel = if (0..i64::from(width)).contains(&sx) && y < height {
-                // The reference's blend span `[d, d + Width)`: both sources
+                // The blend span `[d, d + Width)`: both sources
                 // sampled at `x - d`, cross-faded at `BlendRatio`.
                 let sx = sx as i32;
                 blend_level(
@@ -223,7 +223,7 @@ pub(crate) fn apply(
                     blend_ratio,
                 )
             } else {
-                // The strips `[0, d)` / `[Width + d, Width)` the reference
+                // The strips `[0, d)` / `[Width + d, Width)` are
                 // fills with `TVPFillARGB`, i.e. a source sample out of
                 // bounds.
                 background

@@ -3,8 +3,7 @@
 //! This is the correctness baseline: it composites a
 //! [`RenderScene`] into a caller-owned RGBA8 buffer using the same traversal
 //! rules as the Vulkan backend (parent transforms, opacity, sibling `z`
-//! ordering, rectangle clips) and the Photoshop/KiriKiri blend formulas from
-//! `reference/cpp/core/visual/gl/blend_functor_c.h`.
+//! ordering, rectangle clips) and the Photoshop blend formulas.
 //!
 //! Unlike the GPU path, a CPU compositor naturally *samples the destination*
 //! for every pixel, so the destination-dependent [`BlendMode`]s are evaluated
@@ -195,7 +194,7 @@ impl<P: TextureProvider> Canvas<'_, P> {
             RenderContent::Solid(color) => {
                 let corners = quad_corners(world);
                 // Quantize to 8 bits to match the destination and the
-                // reference's byte-oriented pipeline.
+                // byte-oriented pipeline.
                 let src = [
                     to_u8(color[0]) as f32 / 255.0,
                     to_u8(color[1]) as f32 / 255.0,
@@ -207,8 +206,8 @@ impl<P: TextureProvider> Canvas<'_, P> {
                 Ok(())
             }
             RenderContent::Texture(texture) => {
-                // Copy the provider reference out of `self` so the sampled
-                // view does not borrow `self` while the canvas is mutated.
+                // Copy the provider handle out of `self` so the sampled view does
+                // not borrow `self` while the canvas is mutated.
                 let textures = self.textures;
                 let Some(view) = textures.texture(texture.key()) else {
                     return Ok(());
@@ -442,10 +441,8 @@ fn lerp3(from: [f32; 3], to: [f32; 3], t: f32) -> [f32; 3] {
 
 /// Evaluates the per-channel blend function `f(dst, src)` in `[0, 1]`.
 ///
-/// The formulas follow the Photoshop/KiriKiri definitions in
-/// `reference/cpp/core/visual/gl/blend_functor_c.h` (including the
-/// `ColorDodge5`/`Difference5` legacy variants, which share the modern path
-/// here).
+/// The formulas follow the Photoshop definitions (including the
+/// `ColorDodge5`/`Difference5` variants, which share the modern path here).
 fn blend_channel(mode: BlendMode, d: f32, s: f32) -> f32 {
     let d = d.clamp(0.0, 1.0);
     let s = s.clamp(0.0, 1.0);
@@ -454,8 +451,7 @@ fn blend_channel(mode: BlendMode, d: f32, s: f32) -> f32 {
         BlendMode::Screen => d + s - d * s,
         // Photoshop additive/subtractive saturate the per-channel sum or
         // difference before the source alpha blends the result over the
-        // destination (`reference/cpp/core/visual/tvpgl.cpp:12539-12562`,
-        // `TVPPsOperationAddBlend`/`TVPPsOperationSubBlend`).
+        // destination.
         BlendMode::PsAdditive => (d + s).min(1.0),
         BlendMode::PsSubtractive => (d - s).max(0.0),
         // Photoshop multiplicative/screen share the per-channel blend
@@ -518,12 +514,10 @@ fn soft_light(d: f32, s: f32) -> f32 {
 /// Samples a texture at texel coordinates `(u, v)` with point (nearest)
 /// filtering.
 ///
-/// This is the reference's default layer blit sampling: the software
-/// renderer starts at `StretchType(stNearest)` and selects the point
-/// `TVPStretchCopy` for anything below `stFastLinear`
-/// (`reference/cpp/core/visual/RenderManager.cpp:2902,3191-3226`). The GPU
-/// backend uses the same rule, so a magnified layer is point-scaled rather
-/// than interpolated.
+/// This is the default layer blit sampling: the software renderer starts at
+/// the nearest-neighbour stretch type and selects the point copy for anything
+/// below the fast-linear threshold. The GPU backend uses the same rule, so a
+/// magnified layer is point-scaled rather than interpolated.
 fn sample_texture(view: &CpuTexture<'_>, u: f64, v: f64, tint: [f32; 4]) -> [f32; 4] {
     let format = view.format;
     let width = view.width as i64;
