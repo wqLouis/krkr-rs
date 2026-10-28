@@ -182,9 +182,9 @@ renderer and the scenario engine are reimplemented in Rust.
 
 The toolchain is Rust stable (edition 2024), a C++17 compiler, Zig 0.17
 (`crates/tjs/build.rs` fetches the C++ dependencies with it), bison, Python 3
-and the system development packages for FFmpeg, ALSA and libc++. The Linux CI
-job installs exactly that list: `bison build-essential clang cmake
-libclang-dev`, `libavcodec-dev libavformat-dev libavutil-dev
+and the system development packages for FFmpeg, ALSA and libc++. The release
+workflow's Linux job installs exactly that list: `bison build-essential clang
+cmake libclang-dev`, `libavcodec-dev libavformat-dev libavutil-dev
 libswresample-dev libswscale-dev`, `libasound2-dev libc++-dev libc++abi-dev
 pkg-config python3`.
 
@@ -318,10 +318,10 @@ counts its `src/lib.rs` and its `build.rs`):
 
 | layer | crates | total |
 |---|---|---|
-| L1 | api 2 924 · fs 2 906 · media 5 405 · psd 4 113 · render 10 836 · platform 3 831 | 30 015 |
-| L2 | engine | 30 357 |
-| L3 | compat | 98 740 |
-| L4 | tjs 7 128 · vm 868 | 7 996 |
+| L1 | api 2 924 · fs 2 906 · media 5 601 · psd 4 113 · render 10 854 · platform 3 831 | 30 229 |
+| L2 | engine | 31 208 |
+| L3 | compat | 99 718 |
+| L4 | tjs 7 204 · vm 868 | 8 072 |
 
 L3 is more than three times L2. **That is correct and intended.** L2 is a
 small, generic, backend-agnostic engine — the layer tree, the mixer, the

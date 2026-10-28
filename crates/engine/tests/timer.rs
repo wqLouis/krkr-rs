@@ -199,7 +199,7 @@ fn now_ms_injects_time_without_delivering() {
     let id = timers.create_interval(10, callback).expect("create");
 
     // `now_ms` past the deadline must neither fire nor reschedule: only
-    // The delivery delivers, and the deadline is untouched.
+    // the delivery fires, and the deadline is untouched.
     timers.now_ms = 1_000_000;
     assert_eq!(deliver_due(&mut timers, 9), 0);
     assert_eq!(deliver_due(&mut timers, 10), 1);

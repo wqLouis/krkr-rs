@@ -133,10 +133,8 @@ void tjs2_free_storage_bytes(void *data);
  *
  * The stream layer owns the `FE FE` container and the byte-order-mark
  * branches of a text payload; the charset of a BOM-less payload is the
- * host's decision, because the host owns the detector. The reference picks
- * the charset from the bytes with uchardet and remaps `SHIFT_JIS` to
- * `cp932` (reference/cpp/core/base/TextStream.cpp:47-57), so a BOM-less
- * Shift-JIS member reads as Japanese instead of as mojibake.
+ * host's decision, because the host owns the detector. The host therefore
+ * reads a BOM-less Shift-JIS member as Japanese instead of as mojibake.
  *
  * `data`/`len` are the raw payload (not NUL-terminated). On
  * TJS2_TEXT_DECODE_OK the callback stores a malloc'd buffer of UTF-16 code

@@ -709,10 +709,9 @@ void tjs2_free_storage_bytes(void *data) {
 // Text decode seam
 //
 // The charset of a BOM-less text payload is the host's decision: the host
-// owns the detector, and the reference picks the charset from the bytes with
-// uchardet and remaps `SHIFT_JIS` to `cp932`
-// (`reference/cpp/core/base/TextStream.cpp:47-57`). One process-wide
-// registration, like the storage read seam above.
+// owns the detector, so the stream asks for the decoding instead of
+// assuming UTF-8. One process-wide registration, like the storage read seam
+// above.
 // ---------------------------------------------------------------------------
 
 static tjs2_text_decode_fn g_text_decode = nullptr;
@@ -951,10 +950,9 @@ class TextReadStream : public TJS::iTJSTextReadStream {
         }
 
         // Plain text: a byte-order mark selects UTF-16LE/BE or UTF-8. A
-        // BOM-less payload takes the charset the host decides
-        // (`reference/cpp/core/base/TextStream.cpp:47-57`): the host owns the
-        // detector, so the stream asks for the decoding instead of assuming
-        // UTF-8.
+        // BOM-less payload takes the charset the host decides: the host owns
+        // the detector, so the stream asks for the decoding instead of
+        // assuming UTF-8.
         size_t off = 0;
         if(raw.size() >= 2 && raw[0] == 0xFF && raw[1] == 0xFE) {
             off = 2; // UTF-16LE BOM
@@ -976,11 +974,9 @@ class TextReadStream : public TJS::iTJSTextReadStream {
 
     // Decode a BOM-less payload with the host's charset decision.
     //
-    // The reference picks the charset from the bytes and remaps `SHIFT_JIS`
-    // to `cp932` (`reference/cpp/core/base/TextStream.cpp:47-57`); the host
-    // owns that detector, so the stream asks for the decoding. Without a
-    // decoder the payload cannot be read, and the read raises instead of
-    // guessing an encoding.
+    // The host owns the charset detector, so the stream asks for the
+    // decoding instead of guessing an encoding. Without a decoder the
+    // payload cannot be read, and the read raises.
     void decode_plain(const std::vector<uint8_t> &raw) {
         if(!g_text_decode) {
             throw TJS::eTJSError(ttstr_from_utf8(
@@ -1030,11 +1026,11 @@ public:
             targ.Clear();
             return 0;
         }
-        // The reference copies the requested units into a buffer it allocates
-        // and terminates itself (`reference/cpp/core/base/TextStream.cpp:197-216`).
-        // Handing the source pointer and a length to the string constructor
-        // instead makes the constructor scan for a terminator, which reads past
-        // the last unit of the source when it holds no terminator.
+        // The requested units are copied into a buffer this method allocates
+        // and terminates itself. Handing the source pointer and a length to
+        // the string constructor instead makes the constructor scan for a
+        // terminator, which reads past the last unit of the source when it
+        // holds no terminator.
         tjs_char *buf = targ.AllocBuffer((tjs_uint)n);
         std::copy_n(text.data() + pos, n, buf);
         buf[n] = 0;

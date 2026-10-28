@@ -8,7 +8,8 @@ is deleted from it and history is read with `git log`. The current contract
 lives in `docs/arch/**` and `docs/rules/**`, the working rules in `AGENTS.md`
 and `scripts/README.md`, behaviour found correct in §17, and topic-to-doc
 pointers in `AGENTS.md` §11. The superseded design record and the read-only
-audits are archived in `docs.old/`. Every item was verified against the tree.
+audits are **not part of this repository**. Every item was verified against
+the tree.
 
 ## 1. Priorities
 
@@ -183,11 +184,10 @@ residuals:
   premultiplied or absent — which is graphics vocabulary and belongs in the
   `api` crate next to `BlendMode`, re-exported through
   `engine_api.rs`, keying the engine's `mode_kernel` table as
-  `(mode, dst_alpha)`. The kernel is then resolved once per pass instead
-  of once per pixel (the current code re-resolves `mode_kernel(mode)` for
-  every pixel, `engine/src/layer_ops.rs:2006`), and the same resolver can
-  serve the affine path's own dispatch
-  (`engine/src/layer_ops.rs:2133-2151`); a kernel function pointer in
+  `(mode, dst_alpha)`. The kernel is resolved once per pass: `resolve_kernel`
+  (`engine/src/layer_ops.rs:2130`) picks it and the per-pixel loop blends with
+  the resolved kernel, and the affine path resolves it the same way
+  (`engine/src/layer_ops.rs:3097`); a kernel function pointer in
   `BlitOptions` would have to be re-derived for the affine and stretch
   paths, and a new engine entry point per blend would duplicate the
   operate, stretch and affine loops.
@@ -206,57 +206,14 @@ residuals:
   with the hold set and full opacity the operation does nothing
   (`RenderManager.cpp:2423`, `LayerBitmapIntf.cpp:1483-1485`). The compat
   derives the hold from the face instead
-  (`natives/visual/layer/pixels.rs:365-380`), which is a different rule;
+  (`natives/visual/layer/pixels.rs:400-408`, `face_hold_alpha`), which is a
+  different rule;
   whether to replace it is separate from the kernel table and still open.
   The `ImageFunction`'s mapping (`natives/image_function.rs`,
   `blit_method`) follows the face-derived rule too; the text members'
   `hda` argument and the layer's `holdAlpha` do not reach the text
   rasterizer (`ImageFunction.cpp:1024-1025`, `LayerIntf.cpp:4444-4468`),
   and the face's method selection for the text is the same arithmetic gap.
-* **The transition's mix methods: what landed, and the alpha byte the
-  reference's two paths disagree on.** The cross-fade's blend is chosen by
-  the destination layer's type (`reference/cpp/core/visual/TransIntf.cpp:664-686`):
-  a type that uses its alpha channel (`drawable.h:53-61`) gets the
-  alpha-vs-alpha mix, the additive-alpha type (`drawable.h:63-65`) gets the
-  four-channel mix, and every other type the plain one. The three mixes are
-  `reference/cpp/core/visual/gl/blend_functor_c.h:662-672` (plain), `:673-680`
-  (additive) and `:689-707` (alpha-vs-alpha), and the opacity table the last
-  one reads is `reference/cpp/core/visual/tvpgl.cpp:224-251`. The reference's
-  *software* path writes the plain mix's alpha byte as zero — the blend masks
-  the green byte away and the alpha byte with it (`blend_functor_c.h:668-670`)
-  — while its *graphics* path mixes the alpha with the phase
-  (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3265-3268`, whose script
-  the plain and the additive type share, `:3274`); the reference's own two
-  paths therefore disagree, and its shader comparison says so
-  (`TEST_SHADER_IGNORE_ALPHA`, `:3270`). This port follows the graphics path
-  on **both** of its paths — the CPU blend (`engine/src/trans/mod.rs`) and the
-  cross-fade program (`engine/shaders/crossfade.frag`, which takes the mix
-  from the uniform the transition's effect draw writes) — so the headless
-  result and the desktop show the same transition. The residual is the
-  software path's zeroed alpha byte: it is not observable in the drawn result
-  (a destination that ignores its alpha is drawn opaque) and observable only
-  in the alpha byte of the transition frame the CPU blend writes. The
-  alpha-vs-alpha mix differs by at most one 8-bit level between the port's two
-  paths, because the CPU path reads the byte-exact opacity table and the
-  program computes the share in floating point — the same difference the
-  reference's own two paths have.
-* **The `wave` provider still mixes the four channels alike.** The
-  reference's `wave` plugin picks its blend by the destination's type too,
-  but it names the straight-alpha type alone (`reference/cpp/plugins/wave.cpp:238-246`,
-  `LayerType == ltAlpha`), not the whole set of alpha-using types the core
-  handlers name (`drawable.h:53-61`), so the generic handling the engine has
-  does not single it out. The core cross-fade and universal handlers use the
-  same three-way selection (`TransIntf.cpp:664-686` and `:737-761`) and are
-  implemented; the `wave` provider keeps the four-channel mix.
-* **The composited frame is the GPU path's remaining gap.** A host that
-  cannot run the cross-fade program falls back to the composited frame, which
-  draws the two sources with the phase as their weights and therefore mixes
-  the four channels alike whatever the destination's type is
-  (`engine/src/trans/mod.rs` `Trans::transition_frame`,
-  `engine/src/projection.rs`). The rule-based kinds have no program at all and
-  are blended on the CPU on every host, with the mix the destination's alpha
-  handling selects.
-
 * **The transition's mix methods: what landed, and the alpha byte the
   reference's two paths disagree on.** The cross-fade's blend is chosen by
   the destination layer's type (`reference/cpp/core/visual/TransIntf.cpp:664-686`):
@@ -1171,10 +1128,10 @@ an allowlist exemption.
 
 * **Citation and history baseline.** Pre-existing findings live in
   `scripts/allowlists/house_style_baseline.txt` — JSON Lines keyed to the
-  normalized comment line, **4076 entries over 168 files** (4352 finding sites).
+  normalized comment line, **4044 entries over 166 files** (4321 finding sites).
   The baseline is **debt**: burn it down in file batches, largest first
-  (`compat/src/natives/sound.rs` 247, `engine/src/scene.rs` 153,
-  `compat/.../player_members.rs` 150, `system.rs` 131), deleting each entry as
+  (`compat/src/natives/sound.rs` 247, `compat/.../player_members.rs` 150,
+  `engine/src/scene.rs` 145, `system.rs` 127), deleting each entry as
   its comment is rewritten.
 * **`unsafe` blocks with no `// SAFETY:` note.**
   `scripts/allowlists/layering_allow.txt` now baselines four files; each still
@@ -1312,8 +1269,9 @@ new evidence.
   TLG is entropy-coded with serial dependencies, the pixels must return to CPU
   memory for `getPixel` (D34), and the renderer has no compute pipeline. The
   lever is scheduling (§1.2).
-* **Parity is 100% with empty allowlists** — 0 missing and 3 intentional extras
-  (`KAGParser.multiLineTagEnabled`, `paramMacros`,
+* **Parity is 100% with empty allowlists** — 0 missing and 5 extras
+  (`Layer.getTextHeight`, `Layer.getTextWidth`,
+  `KAGParser.multiLineTagEnabled`, `KAGParser.paramMacros`,
   `PhaseVocoder.__TvpPhaseVocoder`; `docs/native_parity.md`) — but 100% parity
   is not behaviour coverage (§6 C14, §9 PN8).
 * **`VideoOverlay` frames** composite into `layer1`/`layer2`; start-up cost is

@@ -248,7 +248,7 @@ alone: `bigfontsize`, `smallfontsize`, `shadowdiff`, `align` and `valign`.
 The shipped build is wamsoft's `textrend` 1.0.0.1 (2014), sha256[:12]
 `0a014cc2b581`; its state deserializer reads the members in the order the
 committed fixture
-[`tests/fixtures/textrender_dll_state.txt`](../../../crates/compat/tests/fixtures/textrender_dll_state.txt)
+[`tests/fixtures/textrender_dll_state.txt`](../../../../crates/compat/tests/fixtures/textrender_dll_state.txt)
 lists them, and the fixture names each member's wide string in the binary's
 `.rdata` and the state field the deserializer stores it in.
 

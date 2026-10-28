@@ -1221,7 +1221,7 @@ fn mix_colour_only(s1: [u8; 4], s2: [u8; 4], opa: i32) -> [u8; 4] {
 ///
 /// The source covers the destination with the share the two alphas give it,
 /// and the result's own alpha is the two alphas mixed by the ratio. `opa` is
-/// the source's share of the range and `iopa` the destination's.
+/// the source's share of the range and `iopa` the destination's share of it.
 fn mix_coverage(s1: [u8; 4], s2: [u8; 4], opa: i32, iopa: i32) -> [u8; 4] {
     let a1 = i32::from(s1[3]);
     let a2 = i32::from(s2[3]);
@@ -1268,8 +1268,7 @@ fn rule_mix(s1: [u8; 4], s2: [u8; 4], opa: i32, dest_alpha: DestAlpha) -> [u8; 4
 /// share of the destination the source covers.
 ///
 /// The table is built once and shared: the alpha-vs-alpha mix reads one
-/// entry per pixel. Its values are the share the graphics path computes, so
-/// the two paths of this port agree.
+/// entry per pixel.
 fn opacity_table() -> &'static [u8] {
     static TABLE: OnceLock<Box<[u8]>> = OnceLock::new();
     TABLE.get_or_init(build_opacity_table)
@@ -1277,9 +1276,9 @@ fn opacity_table() -> &'static [u8] {
 
 /// Builds the opacity table.
 ///
-/// A transparent destination is covered completely; otherwise the source's
-/// share of the destination is the ratio of the source's opacity to the sum
-/// of it and the destination's opacity the source does not hide.
+/// Every entry is the source's share of the destination: the ratio of the
+/// source's opacity to the sum of it and the destination's opacity the source
+/// does not hide. A transparent source covers nothing, so its share is zero.
 fn build_opacity_table() -> Box<[u8]> {
     let mut table = vec![0u8; 256 * 256].into_boxed_slice();
     for destination in 0..256u32 {
@@ -1403,8 +1402,7 @@ fn blend_row(
 ///
 /// The rows hold whole pixels, so every pixel of the row is blended. Each
 /// mix has its own loop: the row is the hot path of a full-screen
-/// transition, and the alpha-vs-alpha mix reads the opacity table once per
-/// row.
+/// transition.
 fn blend_pixels(dst: &mut [u8], src1: &[u8], src2: &[u8], opa: i32, dest_alpha: DestAlpha) {
     match dest_alpha {
         DestAlpha::Opaque | DestAlpha::Additive => {
