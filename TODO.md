@@ -623,7 +623,27 @@ native OS popup would be a deliberate divergence, and Linux has nothing to call
 
 ## 10. Native plugins
 
-35 of the 53 plugin names games ship have no emulation — the `**no**` rows of
+* **The engine's own plugins are not registered at startup.** The reference
+  registers the built-in plugin modules when the application starts
+  (`reference/cpp/core/plugin/PluginImpl.cpp:90-93`, `TVPLoadInternalPlugins()`),
+  so a script sees `Scripts.getObjectKeys` and its siblings from the first
+  line. The port installs a built-in plugin only when a script calls
+  `Plugins.link("<name>.dll")`, so before that a script that touches a
+  plugin member finds nothing. This changes the script-visible surface, so it
+  needs a reviewed surface-lock baseline update.
+* **`Scripts.propGet` ignores the caller's flag for the read.** The reference
+  passes the flag to `PropGet` (`reference/cpp/plugins/scriptsEx.cpp:890-905`),
+  so `Scripts.propGet(obj, key, Scripts.pfIgnoreProp)` returns the raw member;
+  the port calls the default member instead
+  (`crates/compat/src/natives/plugins/scripts_ex/mod.rs`).
+* **A script window starts visible; the reference starts it hidden.** The
+  reference creates every script window hidden
+  (`reference/cpp/core/environ/impl/TVPWindow.cpp:58-63`) and shows it on
+  demand, so a window that is not shown delivers no event
+  (`reference/cpp/core/visual/impl/WindowImpl.cpp:1154-1158`). The port's
+  `Scene::add_window` starts a window visible, which is used by the engine,
+  the app and every compat test, so the change is port-wide.
+* 35 of the 53 plugin names games ship have no emulation — the `**no**` rows of
 `plugins/INVENTORY.md`, the DLLs being gitignored — so each takes the
 null-plugin path (D14): every member accepted, every call void, one warning.
 Per plugin: recover the surface from the DLL with the `plugins/analysis/`
@@ -1204,6 +1224,36 @@ an allowlist exemption.
   A game made for the classic may observe the classic's behaviour where the
   two differ; the port implements the tree, and each difference is recorded
   here so the choice is visible rather than accidental.
+* **The tree in `reference/` is the only reference; the classic engine tree is
+  not a reference at all.** The tree is Kirikiroid2 - the classic
+  KiriKiri2 engine built for Android and then carried to the other
+  platforms - which is the engine this port is measured against; the tree
+  says so itself (`reference/cpp/core/environ/android/AndroidUtils.cpp:38`,
+  `org/tvp/kirikiri2/Kirikiroid2`;
+  `reference/cpp/core/environ/ConfigManager/IndividualConfigManager.cpp:6`,
+  `Kirikiroid2Preference.xml`;
+  `reference/docs/KRKR_PLUGINS.md:30`). It is the whole classic engine,
+  modernised: its own TJS2 (`reference/cpp/core/tjs2`) and its own plugin
+  set. A difference from the classic engine source
+  (`krkrz/krkrz` @ `fd5c4baa6a2ef5978db1bd043634351f48667daf`) is a recorded
+  observation about the classic, never a deciding source: when the two
+  disagree, the tree decides, and the port implements the tree. The
+  comparison in the entry above is kept for that purpose only.
+* **The tree resolves a relative storage name against the media's current
+  path; the port does not.** The tree keeps a current path per media
+  (`reference/cpp/core/base/StorageIntf.cpp:134`), resolves a relative name
+  against it (`reference/cpp/core/base/StorageIntf.cpp:367`, `path =
+  mediarec->CurrentPath + path;`), and sets it through `SetCurrentDirectory`
+  (`reference/cpp/core/base/StorageIntf.cpp:443-453`, exposed as
+  `TVPSetCurrentDirectory` at `:535-538`). At startup the tree sets it to
+  the project directory
+  (`reference/cpp/core/base/impl/SysInitImpl.cpp:165`, `TVPSetCurrentDirectory(TVPProjectDir);`)
+  and to the executable's directory
+  (`reference/cpp/core/base/impl/SysInitImpl.cpp:131`). The port has no
+  current-path notion: a relative name is resolved against the auto-path
+  table and then every mounted archive, in a different order
+  (§5 F3/F4). A relative name that the tree finds under the current path
+  is therefore missed by the port.
 * **TJS VM in Rust** (`docs.old/migration/08` §10.7) **and `streams.cpp` as a thin
   C++ adapter over it** — both deferred. `streams.cpp` is the only port-authored
   C++ besides the ABI boundary, and every save-path memory-safety defect was in
