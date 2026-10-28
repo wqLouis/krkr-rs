@@ -1196,6 +1196,23 @@ an allowlist exemption.
   observation about the classic, never a deciding source: when the two
   disagree, the tree decides, and the port implements the tree. The
   comparison in the entry above is kept for that purpose only.
+* **The TLG6 decoder's intermediate word uses the classic engine's layout.**
+  The port's TLG5 decoder uses the tree's word layout and its TLG6 decoder uses
+  the classic engine's, so the two decoders disagree with each other even
+  though the decoded image is bit-identical either way. The tree decides
+  (this section), and the classic engine is never a deciding source, so the
+  TLG6 decoder should use the tree's layout. What the tree's own TLG6 path
+  does has to be established first; the classic layout was taken from a
+  matching recipe, and the port's TLG5 decoder is the reference for the
+  word shape.
+* **The references into `docs.old/` are known-unreachable and stay.** The
+  superseded design record and the read-only audits are not part of this
+  repository, so every reference to that directory resolves to nothing: 141
+  mentions across 59 tracked Markdown files, and 32 more in production
+  comments (Rust, Kotlin, Gradle, the manifest, CI). That is accepted: the
+  directory is obsolete and untracked, and the references are the record of
+  where a statement came from. Do not spend an audit on them, and do not
+  reword a production comment because of one.
 * **L2's blend kernels are keyed by the script's operation-mode numbers.**
   `crates/engine/src/layer_ops.rs` holds a `ModeKernel` per mode whose
   discriminants are the numbers the script reads and writes, and the mapping
