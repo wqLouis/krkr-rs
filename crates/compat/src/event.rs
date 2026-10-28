@@ -407,8 +407,11 @@ impl EventAdapter {
 
         // The window that receives the event is resolved once: the window
         // delivery, the enter a move posts and the click a release posts all
-        // go to the same window.
-        let window = first_window(ctx);
+        // go to the same window. The pointer belongs to the window that owns
+        // the layer it hit; without a hit it belongs to the topmost window.
+        let window = pointer_layer
+            .and_then(|id| layer_window(ctx, id))
+            .or_else(|| top_window(ctx));
 
         // The window receives every mapped event but its move event, which
         // is discardable: the pending move event is dropped when a newer one
@@ -679,11 +682,15 @@ fn resolve_pointer(ctx: &CompatCtx, name: &str) -> Option<u32> {
     hit
 }
 
-/// The layer under a window-space point in the first visible window.
+/// The layer under a window-space point, in the topmost window that has one.
 ///
 /// The hit test reads a layer's main image, so the images of the window it
 /// tests are waited for first: a load whose decode is still running leaves the
 /// bitmap with the probed size and no pixels.
+///
+/// The windows are drawn in the order the scene holds them, so the last
+/// visible window is the one on top: the pointer belongs to it, and a window
+/// below is only searched when the window on top has no layer at the point.
 fn hit_layer(ctx: &CompatCtx, x: i32, y: i32) -> Option<u32> {
     let roots: Vec<(u32, u32)> = {
         let scene = scene_mut(ctx)?;
@@ -694,7 +701,7 @@ fn hit_layer(ctx: &CompatCtx, x: i32, y: i32) -> Option<u32> {
             .filter_map(|window| window.primary_layer.map(|primary| (window.id, primary)))
             .collect()
     };
-    for (window, primary) in roots {
+    for (window, primary) in roots.into_iter().rev() {
         {
             let scene = scene_mut(ctx)?;
             resolve_layer_images(scene, window);
@@ -812,10 +819,19 @@ fn focused_layer(ctx: &CompatCtx) -> Option<u32> {
     window.focused_layer
 }
 
-/// The first window's id.
-fn first_window(ctx: &CompatCtx) -> Option<u32> {
-    let window = scene(ctx)?.windows.first()?;
+/// The topmost visible window's id.
+///
+/// The scene draws its windows in order, so the last visible window is the
+/// one on top and owns the pointer.
+fn top_window(ctx: &CompatCtx) -> Option<u32> {
+    let window = scene(ctx)?.windows.iter().rev().find(|w| w.visible)?;
     Some(window.id)
+}
+
+/// The window a layer belongs to.
+fn layer_window(ctx: &CompatCtx, layer_id: u32) -> Option<u32> {
+    let layer = scene(ctx)?.layer(layer_id)?;
+    Some(layer.window)
 }
 
 /// The attached scene, or `None` when the host did not attach one.
