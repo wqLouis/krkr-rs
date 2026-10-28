@@ -18,7 +18,7 @@
 
 #![warn(missing_docs)]
 
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::ptr;
 
 // ---------------------------------------------------------------------------
@@ -56,6 +56,10 @@ pub const VAL_OCTET: c_int = 7;
 /// `Object == nullptr`), distinct from [`VAL_VOID`] and from [`VAL_OBJECT`]
 /// with a zero handle.
 pub const VAL_NULL: c_int = 8;
+
+/// The TJS `PropGet` flag that reads a member's own value without
+/// calling the object's default member.
+pub const TJS_IGNOREPROP: c_uint = 0x0000_0800;
 
 /// Storage read status: the entry was read and `out_data`/`out_len` are set.
 pub const STORAGE_READ_OK: c_int = 0;
@@ -589,11 +593,13 @@ unsafe extern "C" {
         out_error: *mut *mut c_char,
     ) -> c_int;
     /// Read a named property from a retained object value through its class
-    /// chain (`PropGet`).
+    /// chain (`PropGet`). `flags` is the TJS PropGet flag set: 0 calls the
+    /// object's default member, TJS_IGNOREPROP reads the member's own value.
     fn tjs2_prop_get(
         engine: *mut Engine,
         id: Tjs2ValueId,
         membername: *const c_char,
+        flags: c_uint,
         out: *mut Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
@@ -2319,6 +2325,31 @@ name), and none was available"
     /// one of its script-visible properties — e.g. `Layer.parent = <Layer>`
     /// reads the right-hand object's `id`.
     pub fn member(&self, id: Tjs2ValueId, membername: &str) -> Result<TjsValue, String> {
+        self.member_with_flags(id, membername, 0)
+    }
+
+    /// Read a named property with `TJS_IGNOREPROP`, which returns the
+    /// member's own value without calling the object's default member.
+    ///
+    /// A member that is a TJS `property` holds the property object itself,
+    /// and reading it the ordinary way calls its default member, which is
+    /// the property's getter. Walking an object's members wants those raw
+    /// values, so the walk reads them with this flag.
+    pub fn member_ignore_prop(
+        &self,
+        id: Tjs2ValueId,
+        membername: &str,
+    ) -> Result<TjsValue, String> {
+        self.member_with_flags(id, membername, TJS_IGNOREPROP)
+    }
+
+    /// Read a named property through `PropGet` with the given flag set.
+    fn member_with_flags(
+        &self,
+        id: Tjs2ValueId,
+        membername: &str,
+        flags: c_uint,
+    ) -> Result<TjsValue, String> {
         let name = std::ffi::CString::new(membername)
             .map_err(|_| "member name contains a NUL byte".to_string())?;
         let mut out = Value {
@@ -2331,9 +2362,12 @@ name), and none was available"
             retained: 0,
         };
         let mut error: *mut c_char = ptr::null_mut();
+        let name_ptr = name.as_ptr();
+        let out_ptr = &mut out;
+        let error_ptr = &mut error;
         // SAFETY: self.inner is a live engine and id is a live retained id;
         // name/out follow the ABI contract for the duration of the call.
-        let rc = unsafe { tjs2_prop_get(self.inner, id, name.as_ptr(), &mut out, &mut error) };
+        let rc = unsafe { tjs2_prop_get(self.inner, id, name_ptr, flags, out_ptr, error_ptr) };
         if rc != 0 {
             return Err(take_error_string(error));
         }

@@ -3447,8 +3447,14 @@ int tjs2_call_member(void *engine, tjs2_value_id id, const char *membername,
 // chain (PropGet). Used by natives that must resolve an object argument to
 // one of its script-visible properties (e.g. Layer.parent = <Layer object>
 // -> the parent's `id`). Same error convention as tjs2_call_member.
+//
+// `flags` is the TJS PropGet flag set: 0 calls the object's default member
+// while reading the member, TJS_IGNOREPROP (0x800) reads the member's own
+// value without calling it. The member walks of ScriptsAdd::_getKeys and
+// ScriptsAdd::foreach pass TJS_IGNOREPROP, so a member that is a TJS
+// `property` yields the property object and its getter never runs.
 int tjs2_prop_get(void *engine, tjs2_value_id id, const char *membername,
-                  tjs2_value *out, char **out_error) {
+                  unsigned int flags, tjs2_value *out, char **out_error) {
     tjs2_engine *e = (tjs2_engine *)engine;
     if(!e || !id || !membername) {
         if(out_error)
@@ -3475,7 +3481,7 @@ int tjs2_prop_get(void *engine, tjs2_value_id id, const char *membername,
         TJS::tTJSVariant result;
         TJS::tTJSVariantClosure clo =
             it->second.AsObjectClosureNoAddRef(); // throws if not an object
-        tjs_error hr = clo.PropGet(0, member16.c_str(), nullptr, &result,
+        tjs_error hr = clo.PropGet(flags, member16.c_str(), nullptr, &result,
                                    nullptr);
         if(TJS_FAILED(hr))
             TJSThrowFrom_tjs_error(hr, member16.c_str()); // -> catch below

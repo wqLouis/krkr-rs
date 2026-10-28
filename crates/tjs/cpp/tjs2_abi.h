@@ -449,9 +449,15 @@ int tjs2_call_value_with_objthis(void *engine, tjs2_value_id id, int argc,
  * object's class chain). Same conventions as tjs2_call_value: returns 0 on
  * success and fills out; on failure returns non-zero with a malloc'd UTF-8
  * message in out_error.
+ *
+ * `flags` is the TJS PropGet flag set: 0 reads the member and calls the
+ * object's default member, TJS_IGNOREPROP (0x800) reads the member's own
+ * value without calling it. The member walks of ScriptsAdd::_getKeys and
+ * ScriptsAdd::foreach pass TJS_IGNOREPROP, so a member that is a TJS
+ * `property` yields the property object and its getter never runs.
  */
 int tjs2_prop_get(void *engine, tjs2_value_id id, const char *membername,
-                  tjs2_value *out, char **out_error);
+                  unsigned int flags, tjs2_value *out, char **out_error);
 
 /*
  * Write a named property on a retained object value (PropSet through the

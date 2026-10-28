@@ -418,7 +418,11 @@ fn enumerate_entries(
     let mut index = 0;
     while index + 1 < count {
         let key = read_key(engine, &flat, index)?;
-        let value = engine.member(flat.raw_id(), &(index + 1).to_string())?;
+        // The flattened array holds the members' raw values, but reading
+        // one back calls the default member of an object value — the getter
+        // of a TJS `property`. The walk wants those raw values, so it reads
+        // them with the ignore-property flag.
+        let value = engine.member_ignore_prop(flat.raw_id(), &(index + 1).to_string())?;
         entries.push((key, owned_from_tjs(engine, value)?));
         index += 2;
     }

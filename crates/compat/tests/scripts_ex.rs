@@ -196,6 +196,51 @@ fn object_keys_and_count_for_arrays_follow_the_reference() {
     assert_eq!(env.int("prop"), 3);
 }
 
+/// The reference walks an object's members with `TJS_IGNOREPROP`
+/// (`reference/cpp/plugins/scriptsEx.cpp:443-445` for the key list, `:577`,
+/// `:661`, `:738` and `:846` for the value-carrying walks), so a member
+/// that is a TJS `property` yields the property object and its getter never
+/// runs. The port flattens the object with `Array.assign` and reads the
+/// values back out of that array; an array read calls the default member of
+/// an object value (`reference/cpp/core/tjs2/tjsArray.cpp:1590-1599` ->
+/// `TJSDefaultPropGet`, `reference/cpp/core/tjs2/tjsObject.cpp:1233-1274`),
+/// which for a `property` is its getter
+/// (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:2824-2846`).
+///
+/// A getter that reads a missing member therefore raises in the port and
+/// must not raise in the reference.
+#[test]
+fn object_keys_do_not_run_a_property_getter() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "class Probe { property broken { getter() { return this.missingMember; } } } \
+         var keys = Scripts.getObjectKeys(Probe);",
+    );
+    assert_eq!(env.int("keys.count"), 1);
+    assert_eq!(env.string("keys[0]"), "broken");
+}
+
+/// `Scripts.foreach` hands the callback the member's own value
+/// (`reference/cpp/plugins/scriptsEx.cpp:738`, the `TJS_IGNOREPROP` walk),
+/// so a `property` member reaches the callback as the property object and
+/// its getter never runs.
+#[test]
+fn foreach_does_not_run_a_property_getter() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "class Probe { property broken { getter() { return this.missingMember; } } } \
+         var seenKey = ''; \
+         var seenType = ''; \
+         Scripts.foreach(Probe, function(key, value) { seenKey = key; seenType = typeof value; }); \
+         var gotKey = seenKey; \
+         var gotType = seenType;",
+    );
+    assert_eq!(env.string("gotKey"), "broken");
+    assert_eq!(env.string("gotType"), "Object");
+}
+
 // ---------------------------------------------------------------------------
 // getObjectContext / isNullContext
 // ---------------------------------------------------------------------------
