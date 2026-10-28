@@ -1196,6 +1196,15 @@ an allowlist exemption.
   observation about the classic, never a deciding source: when the two
   disagree, the tree decides, and the port implements the tree. The
   comparison in the entry above is kept for that purpose only.
+* **L2's blend kernels are keyed by the script's operation-mode numbers.**
+  `crates/engine/src/layer_ops.rs` holds a `ModeKernel` per mode whose
+  discriminants are the numbers the script reads and writes, and the mapping
+  from a script mode to a kernel lives in L2 as well. The names are generic,
+  but the numbering is the script's, so the coupling is in the wrong layer:
+  the script's vocabulary belongs to L3, and L3 reaches L2 only through
+  `crates/compat/src/engine_api.rs`. Moving the mapping means an L2 API change
+  with a surface impact, so it is a design change of its own and not a
+  cleanup.
 * **The tree resolves a relative storage name against the media's current
   path; the port does not.** The tree keeps a current path per media
   (`reference/cpp/core/base/StorageIntf.cpp:134`), resolves a relative name
