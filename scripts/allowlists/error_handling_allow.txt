@@ -67,7 +67,7 @@ crates/platform/media/src/video/mediacodec.rs:387:let-underscore — codec.stop(
 # --- debug_assert backed by adjacent validation (audit §8) ----------------
 crates/compat/src/natives/plugins/wutcwf/mod.rs:305:debug-assert — TcwfHeader::parse rejects bytes_per_block < 32; the equal assert is redundant
 crates/compat/src/natives/plugins/wutcwf/mod.rs:306:debug-assert — decode_tcwf allocates exactly samples_per_block*channels; the equal assert is redundant
-crates/platform/render/src/glyph.rs:223:debug-assert — internal rasterizer invariant; no unsafe/indexing depends on it in release
+crates/platform/render/src/glyph.rs:220:debug-assert — internal rasterizer invariant; no unsafe/indexing depends on it in release
 
 # --- pub(crate) thiserror error enums, never matched variant-by-variant
 #     (audit §7) -----------------------------------------------------------
@@ -113,7 +113,7 @@ crates/compat/src/resource.rs:225:let _ = self.resolve_face(ctx, DEFAULT_FACE); 
 crates/compat/src/resource.rs:233:let _ = self.resolve_face(ctx, DEFAULT_FACE); — Font.getList/defaultFaceName have no reference error path; an unresolved default yields the empty list/name (LayerIntf.cpp:11777-11786, 12177)
 
 # --- rasterizer invariants no malformed input can reach ---------------------
-crates/platform/render/src/glyph.rs:303:debug_assert!(size_px > 0.0 — px_scale_for_height is private; its three callers reject a non-positive or non-finite size first
+crates/platform/render/src/glyph.rs:297:debug_assert!(size_px > 0.0 — px_scale_for_height is private; its three callers reject a non-positive or non-finite size first
 
 # --- pointer/address values cast to a signed integer or sign-checked
 #     (D37; the `pointer-sign` rule). -------------------------------------
