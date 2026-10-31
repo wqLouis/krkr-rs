@@ -412,23 +412,24 @@ Code map: [`../code/engine/clock.md`](../code/engine/clock.md).
 | item | what it is |
 |---|---|
 | `TimerId` | the monotonic id of a registered timer; it equals the creation order |
-| `TimerCallback` | the stored callback shape: `Box<dyn FnMut(TimerId) + 'static>` |
+| `TimerCallback` | the stored callback shape: `Box<dyn FnMut(TimerId, u64) + 'static>`, the second argument being the fires this delivery replays |
 | `TimerState` | the registry: the timers, the next id and the injected `now_ms` |
 | `TimerError` | the registry's failures |
 
 Operations: `TimerState::new()`, `create_interval(interval_ms, callback) ->
 Result<TimerId, TimerError>`, `remove(id)`, `set_interval(id, interval_ms)`,
-`set_enabled(id, enabled)`, and `TimerState::advance(now_ms) -> usize`
-(returns the number of callbacks invoked; crate-private — the pump's public
-face is the free function `timer::deliver_due(registry, now_ms) -> usize`).
+`set_enabled(id, enabled)`, and `TimerState::advance(now_ms) -> u64`
+(returns the number of fires handed to the callbacks; crate-private — the pump's public
+face is the free function `timer::deliver_due(registry, now_ms) -> u64`).
 Assigning the registry's public `now_ms` field injects the current time
 **without** delivering.
 
 Invariants: a timer fires once per elapsed interval — a timer whose
-deadline passed by `n` intervals fires `n + 1` times in that advance and is
-re-armed from the deadline it missed, so the schedule does not drift, and a
-backlog of more than 40 intervals is discarded (one fire, re-armed from the
-injected now) (`reference/cpp/core/utils/impl/TimerImpl.cpp:118-148`); a
+deadline passed by `n` intervals reports `n + 1` fires in that advance and is
+re-armed from the deadline it missed, so the schedule does not drift
+(`reference/cpp/core/utils/impl/TimerImpl.cpp:118-148`) — and the whole
+replay is one callback invocation carrying the count, so the registry has no
+backlog cap: the delivery above it decides how many postings the run makes; a
 timer whose schedule was mutated between collection and delivery is skipped;
 the interval is at least 1 ms; enabling arms at `now + interval_ms`; delivery
 order is creation order; the delivery collects the due timers before it

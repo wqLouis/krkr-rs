@@ -114,10 +114,16 @@ The vector lives in the per-engine dispatch state, not in a process global.
 
 ### The clock
 
-`getTickCount` returns the engine's **frame clock** in whole milliseconds:
-the value the frame advances and the timer registry is fired against, so the
-script and the game measure the same time. The clock is attached by the
-composition root; a host that attached none raises
+`getTickCount` returns the **clock source** the composition root paces the
+frames from, read when the script asks, in whole milliseconds. The source is
+the one clock: the frame samples it at each boundary and accumulates that into
+the frame clock (which the timers, the sound poll and the transitions read),
+and this member samples it live. A source that measures real time therefore
+moves the tick count inside a frame — a script that waits on it makes progress
+while no frame is running. The reading is never behind the frame clock, so a
+host with no source, or an injected fixed frame time, reports the frame clock.
+
+A host that attached no frame *clock* raises
 `System.getTickCount: clock is not attached` rather than reporting a time
 the game never reached.
 
@@ -191,7 +197,7 @@ process.
 | state | owner |
 |---|---|
 | the command-line vector, the exit request, `title`, `eventDisabled`, `exitOnWindowClose`, `exitOnNoWindowStartup`, `drawThreadNum`, the compaction tick, the rehash tick, the UUID counter, the continuous handlers, the key-query edges | the **per-engine dispatch state** (`CompatServices::state::<SystemState>()`) |
-| the tick count (`getTickCount`) | the **L2 frame clock** (`engine_api::FrameClock`) |
+| the tick count (`getTickCount`) | the **clock source** (`engine_api::FrameTimeSource`), sampled live; the frame clock (`engine_api::FrameClock`) is the same source sampled at the frame boundary |
 | the string scratch buffer for returned strings | the **per-engine dispatch state** |
 | the screen size, the graphic cache, the graphic-cache limit | the **L2 scene** |
 | the key state | the **L2 input state** |

@@ -173,7 +173,7 @@ let (surface, render_state) = render::begin_render_state(&pipeline, &handle)?;
 
 | what | where it goes |
 |---|---|
-| the frame's elapsed time | the `FrameTimeSource` the host passes to `Engine::run` |
+| the frame's elapsed time, and the script's tick count | the `FrameTimeSource` the host passes to `Engine::run` and attaches to the compatibility layer |
 | input events | `engine::InputState::apply`, one event at a time |
 | the decoded pixels of a loaded image | an `Arc<dyn ImageDecoder>` the host installs with `Engine::install_decoder` |
 | the bytes of a storage read | an `Arc<dyn StorageReader>` the host installs with `Engine::install_storage_reader` |
@@ -188,13 +188,20 @@ comes from. The contract is one trait:
 ```rust
 pub trait FrameTimeSource {
     fn elapsed_ms(&self) -> f64;
+    fn now_ms(&self) -> f64;
 }
 ```
 
-`engine::InjectedFrameTime` is the built-in implementation: a public
-`elapsed_ms` field the host writes before every frame. The windowed loop in
-this repository writes the real time the platform measured; the headless
-runner writes the time it measured between its frames.
+`Engine::run` adds `elapsed_ms()` to the frame clock at each boundary;
+`now_ms()` is the same source's reading *now*, which the compatibility layer
+reads on demand for `System.getTickCount`. A host that measures real time owns
+its own implementation (the two in this repository are
+`app::PlatformFrameTime` and the headless runner's clock); a host that
+simulates frames can use `engine::InjectedFrameTime`, whose `now_ms()` answers
+with the injected frame time so the script's clock stays the frame clock and
+the run stays deterministic. The host attaches its source's address with
+`Host::with_frame_time_source` so the script's reading is the one the frames
+are paced from.
 
 ### What this repository's own platform crate does
 

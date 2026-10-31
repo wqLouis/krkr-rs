@@ -8,6 +8,7 @@
 //! - [`archives`]: the in-memory XP3 archive builders.
 //! - [`game`]: the real-game directory helpers.
 //! - [`media_fixtures`]: synthetic image, audio, and TLG byte builders.
+//! - the fixture path resolver for the checkout cloned beside this repository.
 //! - [`render`]: a headless window handle for the null render backend.
 //! - [`vm`]: a process-global lock serializing TJS VM tests.
 //!
@@ -20,6 +21,7 @@
 pub mod archives;
 pub mod game;
 pub mod media_fixtures;
+pub mod reference;
 pub mod render;
 pub mod vm;
 
@@ -28,6 +30,9 @@ pub use game::game_archives;
 pub use media_fixtures::{
     SDS_MAGIC, TLG5_MAGIC, TLG6_MAGIC, encode_png, encode_tlg5, encode_tlg6, pattern, test_image,
     tiny_wav_mono,
+};
+pub use reference::{
+    REFERENCE_ENV, ReferenceFixtureError, reference_fixture, reference_fixture_or_skip,
 };
 pub use render::headless_window;
 pub use vm::vm_lock;

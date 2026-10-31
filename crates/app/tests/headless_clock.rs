@@ -188,14 +188,22 @@ fn the_headless_script_clock_tracks_the_wall_clock() {
         "the script's clock read {script_ms} ms after {wall_at_last} ms of wall clock"
     );
 
-    // The engine's clock is the clock the script read.
+    // The engine's clock and the script's reading are one source sampled at two
+    // moments: the frame boundary (the engine's clock) and the script's own
+    // call, which is later in the same frame and therefore never behind it. The
+    // gap is that frame's own work up to the report, not a second clock.
     let engine_ms = report
         .last_frame
         .expect("the run stepped its frames")
         .elapsed_ms;
     assert!(
-        (engine_ms - script_ms).abs() <= 1.5,
-        "the engine's clock read {engine_ms} ms while the script read {script_ms} ms"
+        script_ms >= engine_ms - 1.0,
+        "the script's clock read {script_ms} ms behind the frame's {engine_ms} ms"
+    );
+    assert!(
+        script_ms - engine_ms <= 100.0,
+        "the script's clock read {script_ms} ms while the frame's boundary was \
+         {engine_ms} ms"
     );
 
     let _ = std::fs::remove_dir_all(&base);

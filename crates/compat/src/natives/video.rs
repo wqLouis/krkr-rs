@@ -306,11 +306,13 @@ pub(crate) enum Resync {
 /// per-frame poll corrects it, in seconds.
 ///
 /// The drift is the difference between the position the audio device has
-/// rendered and the picture's position. Both advance with the frame, so the
-/// drift stays near zero; the threshold only catches a real divergence (a
-/// seek the voice did not follow, a frame the mixer did not render). A
-/// threshold the drift could reach would correct the voice on every frame,
-/// which is the cut this policy exists to avoid.
+/// *rendered* and the picture's position, and the device's queue keeps the
+/// rendered position ahead of the audible one by a fixed amount — roughly the
+/// L1 pre-fill (`crates/app/src/audio.rs`), about 150 ms. The threshold sits
+/// well above that constant: a threshold the pre-fill could reach would
+/// correct the voice on every frame, which is the cut this policy exists to
+/// avoid. The margin above it is what catches a real divergence: a seek the
+/// voice did not follow, or a frame the mixer did not render.
 const MOVIE_DRIFT_SECS: f64 = 0.25;
 
 impl MovieAudio {

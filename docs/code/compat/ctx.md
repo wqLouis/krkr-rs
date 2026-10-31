@@ -22,14 +22,15 @@ pub struct CompatServices {
     storage: Option<*mut Storage>,
     input:  Option<*mut InputState>,
     timer:  Option<*mut TimerState>,
-    clock:  Option<*mut FrameClock>,
+    clock:      Option<*mut FrameClock>,
+    frame_time: Option<*const (dyn FrameTimeSource + 'static)>,
     linked_array: RefCell<(Vec<*const c_char>, Vec<Vec<u8>>)>,
     noop_closure: Cell<Tjs2ValueId>,
     states: StateMap,
 }
 ```
 
-### The five handles
+### The six handles
 
 | Handle | Attached by | Used by |
 |---|---|---|
@@ -37,7 +38,8 @@ pub struct CompatServices {
 | `storage: *mut Storage` | `attach_storage` | `Storages`, `Scripts`, `WaveSoundBuffer.open`, `Bitmap.load`, the pre-rendered font map |
 | `input: *mut InputState` | `attach_input` | `Mouse`, `Key`, the event adapter, the touch getters, `Layer.setCursorPos` |
 | `timer: *mut TimerState` | `attach_timer` | the `Timer` class and the frame body's timer drain |
-| `clock: *mut FrameClock` | `attach_clock` | `System.getTickCount`, the script's tick count |
+| `clock: *mut FrameClock` | `attach_clock` | the timer registry's pump, `sound_poll`, the transitions, the video and movie steps, the housekeeping intervals |
+| `frame_time: *const dyn FrameTimeSource` | `attach_frame_time` | `System.getTickCount`, the script's live tick count |
 
 The handles are **raw pointers**, not borrows, because the process-wide
 binding is lifetime-free: the host owns the services for the lifetime of the

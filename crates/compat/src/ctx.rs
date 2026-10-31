@@ -5,10 +5,10 @@ use std::cell::{Cell, RefCell};
 use std::ffi::c_char;
 use std::marker::PhantomData;
 
-use crate::engine_api::FrameClock;
 use crate::engine_api::InputState;
 use crate::engine_api::TimerState;
 use crate::engine_api::{DecodePool, Scene, Storage};
+use crate::engine_api::{FrameClock, FrameTimeSource};
 use tjs::{
     NativeClassBuilder, NativeInstanceBuilder, NativeInstanceMembers, NativeStaticMembers,
     RetainedValue, Tjs2Engine, Tjs2ValueId,
@@ -45,11 +45,18 @@ pub struct CompatServices {
     storage: Option<*mut Storage>,
     input: Option<*mut InputState>,
     timer: Option<*mut TimerState>,
-    /// The L2 frame clock the `System` native reads.
+    /// The L2 frame clock the timers, the sound poll and the transitions read.
     ///
-    /// `None` when the host attached no clock: the tick count then raises
-    /// instead of reporting a time the game never reached.
+    /// `None` when the host attached no clock: those steps raise instead of
+    /// pacing themselves against no time at all.
     clock: Option<*mut FrameClock>,
+    /// The clock source the script's tick count reads on demand.
+    ///
+    /// It is the same source the engine paces the frames from, so the script's
+    /// clock and the frame's clock are one base read at two moments. `None`
+    /// when the host attached none: the tick count then reads the frame clock,
+    /// which is the whole time such a host has.
+    frame_time: Option<*const (dyn FrameTimeSource + 'static)>,
     /// The L2 image decode pool the visual natives submit decodes to.
     ///
     /// `None` when the host attached no pool: the loads then decode
@@ -162,6 +169,32 @@ impl CompatServices {
     /// See [`Self::scene`] for why this returns a raw pointer.
     pub fn clock(&self) -> Option<*mut FrameClock> {
         self.clock
+    }
+
+    /// Attach the clock source the composition root paces the frames from.
+    ///
+    /// This is the same source the engine reads the frame's elapsed time from;
+    /// the `System.getTickCount` native reads it on demand so the script's
+    /// clock moves inside a frame, where the frame clock only moves at a frame
+    /// boundary.
+    ///
+    /// # Safety
+    /// `source` must stay valid for as long as the binding is installed, and it
+    /// must be the source the host is stepped with: a different one would make
+    /// the script's time and the frame's time two bases.
+    pub unsafe fn attach_frame_time(&mut self, source: *const (dyn FrameTimeSource + 'static)) {
+        if source.is_null() {
+            self.frame_time = None;
+        } else {
+            self.frame_time = Some(source);
+        }
+    }
+
+    /// The attached frame-time source, if any.
+    ///
+    /// See [`Self::scene`] for why this returns a raw pointer.
+    pub fn frame_time(&self) -> Option<*const (dyn FrameTimeSource + 'static)> {
+        self.frame_time
     }
 
     /// Attach the L2 image decode pool the visual natives submit decodes to.

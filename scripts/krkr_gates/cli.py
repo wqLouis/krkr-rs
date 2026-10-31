@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import subprocess
 import sys
 from collections.abc import Callable
+from pathlib import Path
 
 from .checks import (
     android_target,
@@ -41,7 +43,7 @@ from .checks import (
     surface_lock,
     void_getter,
 )
-from .common import REPO_ROOT
+from .common import REFERENCE_ENV, REFERENCE_FLAG, REPO_ROOT
 
 # Check subcommands that run without a compiler. ``android-target`` shells out
 # to ``cargo tree`` (not a build); the rest are pure file scans.
@@ -159,6 +161,8 @@ Checks:
 Global options:
   --quiet          only print failing checks
   --verbose        print all check output (default)
+  --reference PATH the reference checkout the parity checks read (default:
+                   <repo>/reference, or $KRKR_REFERENCE)
 """
 
 
@@ -172,6 +176,8 @@ def _run_callable(
             code = func(list(argv))
         except SystemExit as exc:
             code = exc.code if isinstance(exc.code, int) else 1
+            if isinstance(exc.code, str):
+                print(exc.code, file=sys.stderr)
     return code, out.getvalue() + err.getvalue()
 
 
@@ -203,6 +209,33 @@ def _run_cargo(argv: list[str], quiet: bool) -> int:
             sys.stderr.write(result.stderr)
         return result.returncode
     return subprocess.run(argv, cwd=REPO_ROOT).returncode
+
+
+def _split_reference(args: list[str]) -> tuple[Path | None, list[str]]:
+    """Pull ``--reference PATH`` out of ``argv`` and publish it for the checks.
+
+    Every check runs in this process, so the resolved checkout reaches them
+    through ``KRKR_REFERENCE``: one option covers ``gate``, a single check,
+    and the checks the gate dispatches.
+    """
+    rest: list[str] = []
+    reference: Path | None = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == REFERENCE_FLAG:
+            if index + 1 == len(args):
+                raise SystemExit(f"krkr-gate: {REFERENCE_FLAG} needs a path")
+            reference = Path(args[index + 1])
+            index += 2
+            continue
+        if arg.startswith(f"{REFERENCE_FLAG}="):
+            reference = Path(arg.split("=", 1)[1])
+            index += 1
+            continue
+        rest.append(arg)
+        index += 1
+    return reference, rest
 
 
 def run_gate(
@@ -262,6 +295,9 @@ def main(argv: list[str] | None = None) -> int:
     quiet = "--quiet" in args
     verbose = "--verbose" in args
     args = [a for a in args if a not in ("--quiet", "--verbose")]
+    reference, args = _split_reference(args)
+    if reference is not None:
+        os.environ[REFERENCE_ENV] = str(reference)
 
     if not args or args[0] in ("-h", "--help", "help"):
         print(USAGE)

@@ -144,8 +144,6 @@ fn slow_phase_dominates_and_the_wall_total_contains_the_sum() {
     body.phases.clear();
     body.slow_sound = false;
     let frame = FrameCtx {
-        now_ms: 16,
-        dt_ms: 16,
         body: &mut body,
         events: &[],
     };

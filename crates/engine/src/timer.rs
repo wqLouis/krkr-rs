@@ -43,15 +43,15 @@
 //! 1. **Collect first.** Every due timer is collected in creation order and
 //!    re-armed *before* any callback runs, so no phase iterates a collection
 //!    it is mutating, and a nested delivery can never deliver the same timer
-//!    twice in one round. A timer that missed intervals fires once per missed
-//!    interval (see [`MAX_CATCH_UP_FIRES`] for the cap), and its next deadline
+//!    twice in one round. A timer that missed intervals reports one fire per
+//!    missed interval to a single callback invocation, and its next deadline
 //!    is derived from the deadline it missed, so a late frame does not make
 //!    the schedule drift.
 //! 2. **Then invoke.** For each collected timer the callback box is *taken
 //!    out* of the entry before the call, so the entry is plain registry
 //!    state while the callback runs. A collected timer fires only if its
 //!    schedule is untouched since collection: any [`TimerState::set_interval`]
-//!    or [`TimerState::set_enabled`] (the `CancelEvents` step) bumps
+//!    or [`TimerState::set_enabled`] (the cancel-events step) bumps
 //!    the entry's schedule generation, and a removed timer simply has no
 //!    entry left — both cancel the pending fire, like an already-queued
 //!    `onTimer` is cancelled.
@@ -83,17 +83,17 @@ impl TimerId {
 
 /// The callback a registered timer invokes when it fires.
 ///
-/// It receives the firing timer's own [`TimerId`] and may re-enter the
-/// registry (see the module docs): create timers, change intervals, remove
-/// itself — all through the handle the host attached.
-pub type TimerCallback = Box<dyn FnMut(TimerId) + 'static>;
-
-/// The largest number of fires one delivery hands to a single timer.
+/// It receives the firing timer's own [`TimerId`] and the number of fires this
+/// delivery replays: one for an ordinary frame, more when the timer's deadline
+/// passed several intervals ago. The count arrives in **one** call, so a long
+/// stall costs one invocation per timer rather than one per missed interval,
+/// and the callback bounds what it delivers — the compat timer clamps the
+/// count to the timer's capacity.
 ///
-/// A timer that missed more intervals than this has its backlog discarded:
-/// it fires once and re-arms from the current time. The bound keeps a long
-/// stall from turning into an unbounded burst of callbacks.
-const MAX_CATCH_UP_FIRES: u64 = 40;
+/// The callback may re-enter the registry (see the module docs): create
+/// timers, change intervals, remove itself — all through the handle the host
+/// attached.
+pub type TimerCallback = Box<dyn FnMut(TimerId, u64) + 'static>;
 
 /// Typed timer-registry failures (no silent fallbacks).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -205,9 +205,10 @@ impl TimerState {
 
     /// Set `id`'s interval in milliseconds (at least 1).
     ///
-    /// On an armed timer this re-arms it from the injected now — a pending
-    /// fire is cancelled, matching `SetInterval`, which
-    /// cancels the queued events and re-derives `NextTick`. A disarmed timer
+    /// On an armed timer this re-arms it from the injected now: a pending
+    /// fire is cancelled and the next deadline is derived from the new
+    /// interval, the way a queued fire is dropped and the schedule re-derived
+    /// when a script writes the interval. A disarmed timer
     /// just stores the interval for the next enable; L3 pushes its current
     /// interval again on every arming, so the stored value only matters
     /// while the timer is armed.
@@ -263,25 +264,29 @@ impl TimerState {
     /// calls it through [`deliver_due`], and no layer above the engine
     /// advances the registry.
     ///
-    /// A due timer fires once for every interval it missed: a timer with a
-    /// 10 ms interval whose deadline passed 35 ms ago fires four times, and
+    /// A due timer replays one fire for every interval it missed: a timer with
+    /// a 10 ms interval whose deadline passed 35 ms ago reports four fires, and
     /// its next deadline is the deadline it missed plus four intervals, so a
-    /// late frame replays the intervals it lost instead of making the
-    /// schedule drift. A timer that missed more than
-    /// [`MAX_CATCH_UP_FIRES`] intervals has its backlog discarded: it fires
-    /// once and re-arms from `now_ms`.
+    /// late frame replays the intervals it lost instead of making the schedule
+    /// drift. The whole replay is **one** callback invocation carrying the
+    /// count, so a frame that covered thousands of intervals costs one call
+    /// per timer; the count itself is not bounded here, because the bound that
+    /// decides how many fires become visible belongs to the delivery above
+    /// this layer.
     ///
     /// A timer whose schedule was mutated between collection and delivery
     /// (by a peer callback or the timer itself) is skipped — the mutation
     /// cancelled its pending fire — and a timer removed mid-round has no
-    /// entry left to invoke. A schedule write during one of a timer's fires
-    /// cancels that timer's remaining fires. Early-returns `0` when nothing
-    /// is registered or nothing is armed.
+    /// entry left to invoke. Early-returns `0` when nothing is registered or
+    /// nothing is armed.
+    ///
+    /// Returns the number of fires handed to the callbacks, which is the sum
+    /// of the per-delivery counts and not the number of invocations.
     ///
     /// Re-entrancy: callbacks run inside this method and may mutate the
     /// registry (see the module docs); a panicking callback propagates its
     /// panic after the registry has been restored to a consistent state.
-    pub(crate) fn advance(&mut self, now_ms: u64) -> usize {
+    pub(crate) fn advance(&mut self, now_ms: u64) -> u64 {
         self.now_ms = now_ms;
         if self.timers.is_empty() {
             return 0;
@@ -301,26 +306,21 @@ impl TimerState {
             let missed = (now_ms - deadline) / entry.interval_ms;
             let fires = missed.saturating_add(1);
             entry.generation = entry.generation.wrapping_add(1);
-            if fires > MAX_CATCH_UP_FIRES {
-                // The backlog is too large to replay: fire once and let the
-                // next round start from now.
-                entry.deadline_ms = Some(now_ms.saturating_add(entry.interval_ms));
-                due.push((id, entry.generation, 1));
-            } else {
-                // The next deadline continues the schedule that was missed,
-                // so the timer keeps its place in time.
-                entry.deadline_ms =
-                    Some(deadline.saturating_add(fires.saturating_mul(entry.interval_ms)));
-                due.push((id, entry.generation, fires));
-            }
+            // The next deadline continues the schedule that was missed, so
+            // the timer keeps its place in time however far behind the frame
+            // is.
+            entry.deadline_ms =
+                Some(deadline.saturating_add(fires.saturating_mul(entry.interval_ms)));
+            due.push((id, entry.generation, fires));
         }
         if due.is_empty() {
             return 0;
         }
         // Phase 2 — invoke. The callback is taken out of its entry for the
         // call, so the callback may freely mutate the registry; the guard
-        // puts it back afterwards (also on unwind).
-        let mut invoked = 0usize;
+        // puts it back afterwards (also on unwind). The replay count goes
+        // with the one call.
+        let mut fired: u64 = 0;
         for (id, generation, fires) in due {
             let callback = match self.timers.get_mut(&id) {
                 Some(entry) if entry.generation == generation => entry.callback.take(),
@@ -336,30 +336,21 @@ impl TimerState {
                 id,
                 callback: Some(callback),
             };
-            for _ in 0..fires {
-                // A schedule write during an earlier fire cancels the
-                // timer's remaining fires, the way a cancelled pending event
-                // is dropped.
-                let scheduled = matches!(
-                    restore.state.timers.get(&id),
-                    Some(entry) if entry.generation == generation
-                );
-                if !scheduled {
-                    break;
-                }
-                let Some(callback) = restore.callback.as_mut() else {
-                    break;
-                };
-                callback(id);
-                invoked += 1;
-            }
+            let Some(callback) = restore.callback.as_mut() else {
+                continue;
+            };
+            callback(id, fires);
+            fired = fired.saturating_add(fires);
         }
-        invoked
+        // The count is what the trace line and the tests report, in the
+        // registry's own width, so no host truncates it.
+        fired
     }
 }
 
 /// Delivers the timers due at `now_ms` in `registry` and returns the number
-/// of callbacks invoked.
+/// of fires handed to the callbacks (the sum of the per-delivery replay
+/// counts, not the number of invocations).
 ///
 /// This is the registry's pump. The engine's frame calls it once per frame
 /// with the frame clock's value, and a host that owns a registry and drives
@@ -370,10 +361,10 @@ impl TimerState {
 /// The pump is a free function and not a method on [`TimerState`]: the
 /// compatibility layer names the registry to arm timers, and a method would
 /// hand it the pump as well.
-pub fn deliver_due(registry: &mut TimerState, now_ms: u64) -> usize {
+pub fn deliver_due(registry: &mut TimerState, now_ms: u64) -> u64 {
     let fired = registry.advance(now_ms);
     if fired > 0 {
-        log::trace!("timer: {fired} timer(s) fired at {now_ms} ms");
+        log::trace!("timer: {fired} fire(s) at {now_ms} ms");
     }
     fired
 }

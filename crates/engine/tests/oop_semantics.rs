@@ -31,10 +31,10 @@ use engine::{BitmapState, Scene};
 fn once_timer_family_is_stopped_by_cancellation_not_by_a_budget() {
     let mut timers = TimerState::new();
     let cancelled = timers
-        .create_interval(1_000, Box::new(|_| {}))
+        .create_interval(1_000, Box::new(|_, _| {}))
         .expect("create");
     let survivor = timers
-        .create_interval(1_000, Box::new(|_| {}))
+        .create_interval(1_000, Box::new(|_, _| {}))
         .expect("create");
 
     for now in [1_000u64, 2_000, 3_000] {
@@ -86,7 +86,7 @@ fn disarming_mid_flight_gates_delivery_and_rearming_starts_fresh() {
     let hits = Rc::new(RefCell::new(0u64));
     let inner = Rc::clone(&hits);
     let id = timers
-        .create_interval(10, Box::new(move |_| *inner.borrow_mut() += 1))
+        .create_interval(10, Box::new(move |_, _| *inner.borrow_mut() += 1))
         .expect("create");
 
     assert_eq!(deliver_due(&mut timers, 10), 1);
@@ -124,10 +124,10 @@ fn disarming_mid_flight_gates_delivery_and_rearming_starts_fresh() {
 fn timer_removed_mid_flight_is_a_typed_miss_never_a_fire() {
     let mut timers = TimerState::new();
     let doomed = timers
-        .create_interval(10, Box::new(|_| {}))
+        .create_interval(10, Box::new(|_, _| {}))
         .expect("create");
     let survivor = timers
-        .create_interval(10, Box::new(|_| {}))
+        .create_interval(10, Box::new(|_, _| {}))
         .expect("create");
 
     // Remove before the first due tick: only the survivor fires.

@@ -1093,6 +1093,11 @@ extern "C" fn window_visible_set(
     if let Some(window) = scene.window_mut(id) {
         window.visible = visible;
     }
+    // Showing a window brings it to the front: the scene draws its windows in
+    // the order it holds them, so the last one is on top and owns the pointer.
+    if visible {
+        scene.bring_window_to_front(id);
+    }
     0
 }
 

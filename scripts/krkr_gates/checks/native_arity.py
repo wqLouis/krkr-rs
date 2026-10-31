@@ -36,13 +36,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import glob
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..common import ALLOWLISTS_DIR, FIXTURES_DIR, REPO_ROOT
+from ..common import (
+    ALLOWLISTS_DIR,
+    FIXTURES_DIR,
+    REPO_ROOT,
+    reference_core_sources,
+    reference_source_label,
+)
 from ..framework import match_delimiter, read_allowlist_entries
 from . import native_parity as parity
 
@@ -175,19 +180,12 @@ def parse_reference_methods(
 ) -> list[ReferenceMethod]:
     """Reference zero-argument methods from the core sources (or ``files``)."""
     if files is None:
-        files = sorted(
-            Path(p)
-            for p in glob.glob(str(ROOT / parity.REFERENCE_GLOB), recursive=True)
-        )
+        files = reference_core_sources()
     methods: list[ReferenceMethod] = []
     for path in files:
         raw = path.read_text(encoding="utf-8", errors="replace")
         src = parity._mask_cpp_source(raw)
-        try:
-            rel = path.relative_to(ROOT).as_posix()
-        except ValueError:
-            rel = path.as_posix()
-        methods.extend(reference_methods_in(src, rel))
+        methods.extend(reference_methods_in(src, reference_source_label(path)))
     return methods
 
 

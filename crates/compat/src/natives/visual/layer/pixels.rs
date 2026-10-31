@@ -15,7 +15,7 @@
 use std::ffi::{c_char, c_int, c_void};
 
 use crate::engine_api::layer_ops::{self, GammaAdjust, RectI};
-use crate::engine_api::{BitmapState, DecodedImageKey, DecodedImageMode, Scene};
+use crate::engine_api::{BitmapState, DecodedImageKey, DecodedImageMode, DestAlpha, Scene};
 use api::blend::{BlendMode, DstBlend};
 use api::media::DecodedImage;
 use tjs::{NativeInstanceMethodDef, Tjs2Engine, Value};
@@ -372,12 +372,10 @@ const fn blend_face(blend: BlendMode) -> i32 {
 /// `dfAddAlpha` and `dfOpaque` faces — any other destination face makes the
 /// reference raise `TVPNotDrawableFaceType`. The face-independent modes
 /// (additive, subtractive, … , every `omPs*`) accept any face.
-fn check_operate_face(mode: i64, face: i32) -> Result<(), String> {
+fn check_operate_face(mode: i64, face: i32, method: &str) -> Result<(), String> {
     if FACE_SENSITIVE_MODES.contains(&mode) && !matches!(face, DF_ALPHA | DF_OPAQUE | DF_ADD_ALPHA)
     {
-        return Err(format!(
-            "Layer: the operation mode {mode} cannot draw on draw face {face}"
-        ));
+        return Err(unsupported_face(method));
     }
     Ok(())
 }
@@ -387,45 +385,119 @@ fn check_operate_face(mode: i64, face: i32) -> Result<(), String> {
 /// the same way whatever the face is.
 const FACE_SENSITIVE_MODES: [i64; 3] = [OM_ALPHA, OM_OPAQUE, super::blend::LT_ADD_ALPHA];
 
-/// Whether the operation mode and the draw face select a blend that is
-/// not implemented.
+/// The destination's stored alpha handling a draw face names.
 ///
-/// The additive-alpha-on-alpha blend is not implemented: the operation leaves
-/// the destination untouched. The engine's blend table has no additive-alpha
-/// kernel, so the operation does nothing here either.
-fn blend_is_unimplemented(mode: i64, face: i32) -> bool {
-    mode == super::blend::LT_ADD_ALPHA && face == DF_ALPHA
+/// `dfAddAlpha` is the face of a layer that stores an additive (premultiplied)
+/// alpha, `dfOpaque` the face that ignores its alpha, and every other face
+/// stores a straight alpha.
+const fn face_dst_alpha(face: i32) -> DestAlpha {
+    match face {
+        DF_ADD_ALPHA => DestAlpha::Additive,
+        DF_OPAQUE => DestAlpha::Opaque,
+        _ => DestAlpha::Straight,
+    }
 }
 
-/// Whether the blend holds the destination's alpha.
+/// The blend one (operation mode, draw face) pair selects, and what the pass
+/// takes from the layer.
 ///
-/// The blend methods hold the destination's alpha themselves — the channel
-/// mix writes the destination alpha back and the copy of an opaque image
-/// makes it opaque. Only the copy methods take the layer's `HoldAlpha` as an
-/// argument.
-fn face_hold_alpha(mode: i64, layer_hold_alpha: bool) -> bool {
-    mode == OM_OPAQUE && layer_hold_alpha
+/// The pair names a blend method. The engine carries the operation mode whose
+/// kernel applies, the destination's stored alpha handling selects the
+/// method's "on an additive alpha" spelling where it has one, and the two
+/// flags say what the layer contributes: whether the source is read as an
+/// opaque image and whether the pass holds the destination's alpha.
+#[derive(Clone, Copy)]
+struct FaceBlend {
+    /// The engine's operation mode the method runs as.
+    mode: i64,
+    /// Whether the source is read as an opaque image.
+    treat_as_opaque: bool,
+    /// Whether the pass holds the destination's alpha.
+    hold_alpha: bool,
+    /// The destination's stored alpha handling the method runs against.
+    dst_alpha: DestAlpha,
 }
 
-/// The blend an operation mode and the draw face select.
+impl FaceBlend {
+    /// A method that blends `mode` and takes nothing else from the layer.
+    const fn new(mode: i64, dst_alpha: DestAlpha) -> FaceBlend {
+        FaceBlend {
+            mode,
+            treat_as_opaque: false,
+            hold_alpha: false,
+            dst_alpha,
+        }
+    }
+
+    /// The same, with the destination's alpha held.
+    const fn holding(mode: i64, dst_alpha: DestAlpha) -> FaceBlend {
+        FaceBlend {
+            mode,
+            treat_as_opaque: false,
+            hold_alpha: true,
+            dst_alpha,
+        }
+    }
+
+    /// A method that reads the source as an opaque image and holds the
+    /// destination's alpha with `hold`.
+    const fn opaque_source(mode: i64, dst_alpha: DestAlpha, hold: bool) -> FaceBlend {
+        FaceBlend {
+            mode,
+            treat_as_opaque: true,
+            hold_alpha: hold,
+            dst_alpha,
+        }
+    }
+}
+
+/// The blend one (operation mode, draw face) pair selects.
 ///
-/// The pair selects a blend method, and the method selects the blend. The
-/// engine carries the operation mode whose kernel applies, so the
-/// face-selected methods that differ from the mode's own kernel are named
-/// here.
-///
-/// The returned flag tells the engine to read the source as an opaque image.
-fn face_blend(mode: i64, face: i32) -> (i64, bool) {
+/// `check_operate_face` has already rejected every face these modes do not
+/// know, so each arm below names an existing method for the pair. A pair whose
+/// method has no implementation yields `None`: the pass leaves the
+/// destination untouched.
+fn face_blend(mode: i64, face: i32, layer_hold_alpha: bool, opa: u8) -> Option<FaceBlend> {
+    let dst_alpha = face_dst_alpha(face);
+    // The copy methods' hold spelling exists at the full opacity alone: the
+    // below-full-opacity spelling is the same with and without the flag.
+    let hold = layer_hold_alpha && opa == 255;
     match mode {
-        // `omAlpha` on an opaque face mixes the colours without an alpha
-        // correction and holds the destination's alpha. Its kernel is the one
-        // the Photoshop normal mode uses.
-        OM_ALPHA if face == DF_OPAQUE => (super::blend::LT_PS_NORMAL, false),
-        // `omOpaque` on an alpha face copies the source as an opaque image:
-        // the source's colour replaces the destination's and the
-        // destination's alpha becomes opaque.
-        OM_OPAQUE if face == DF_ALPHA || face == DF_ADD_ALPHA => (OM_OPAQUE, true),
-        _ => (mode, false),
+        // `omAlpha`: the source's alpha against the destination's.
+        OM_ALPHA => Some(match face {
+            // `bmAlpha` on an opaque face mixes the colours without an alpha
+            // correction and holds the destination's alpha. Its kernel is the
+            // one the Photoshop normal mode uses.
+            DF_OPAQUE => FaceBlend::new(super::blend::LT_PS_NORMAL, dst_alpha),
+            // `bmAlphaOnAlpha` and `bmAlphaOnAddAlpha`.
+            _ => FaceBlend::new(OM_ALPHA, dst_alpha),
+        }),
+        // `omAddAlpha`: the additive-alpha blend.
+        super::blend::LT_ADD_ALPHA => match face {
+            // `bmAddAlphaOnAlpha` is the one method that is not implemented:
+            // the operation leaves the destination untouched.
+            DF_ALPHA => None,
+            // `bmAddAlpha` and `bmAddAlphaOnAddAlpha`.
+            _ => Some(FaceBlend::new(super::blend::LT_ADD_ALPHA, dst_alpha)),
+        },
+        // `omOpaque`: the copy of the source.
+        OM_OPAQUE => match face {
+            // `bmCopyOnAddAlpha` has no hold spelling at the full opacity, so
+            // there is nothing to draw with.
+            DF_ADD_ALPHA if hold => None,
+            // `bmCopy`: the plain copy, with its hold spelling above.
+            DF_OPAQUE => Some(if hold {
+                FaceBlend::holding(OM_OPAQUE, dst_alpha)
+            } else {
+                FaceBlend::new(OM_OPAQUE, dst_alpha)
+            }),
+            // `bmCopyOnAlpha` and `bmCopyOnAddAlpha` copy the source as an
+            // opaque image.
+            _ => Some(FaceBlend::opaque_source(OM_OPAQUE, dst_alpha, hold)),
+        },
+        // Every other mode is face-independent: one method whatever the face,
+        // and the destination's alpha handling is all it takes.
+        _ => Some(FaceBlend::new(mode, dst_alpha)),
     }
 }
 
@@ -486,8 +558,12 @@ enum BlitFamily {
 ///
 /// The copy blends take the layer's hold argument; the alpha blends ignore
 /// it. The copy methods pass the hold argument on the opaque face alone —
-/// the alpha faces copy the source's own alpha.
-fn family_blit(family: BlitFamily, face: i32, layer_hold_alpha: bool) -> FaceBlit {
+/// the alpha faces copy the source's own alpha — and at the full opacity
+/// alone, because the below-full-opacity spelling is the same with and
+/// without the flag.
+fn family_blit(family: BlitFamily, face: i32, layer_hold_alpha: bool, opa: u8) -> FaceBlit {
+    let dst_alpha = face_dst_alpha(face);
+    let hold = layer_hold_alpha && opa == 255;
     match family {
         BlitFamily::Pile => FaceBlit {
             blend: if face == DF_OPAQUE {
@@ -496,6 +572,7 @@ fn family_blit(family: BlitFamily, face: i32, layer_hold_alpha: bool) -> FaceBli
                 Blit::AlphaOnAlpha
             },
             hold: false,
+            dst_alpha,
         },
         BlitFamily::Blend => FaceBlit {
             blend: if face == DF_OPAQUE {
@@ -503,11 +580,13 @@ fn family_blit(family: BlitFamily, face: i32, layer_hold_alpha: bool) -> FaceBli
             } else {
                 Blit::CopyOnAlpha
             },
-            hold: layer_hold_alpha,
+            hold,
+            dst_alpha,
         },
         BlitFamily::Copy => FaceBlit {
             blend: Blit::Copy,
-            hold: face == DF_OPAQUE && layer_hold_alpha,
+            hold: face == DF_OPAQUE && hold,
+            dst_alpha,
         },
     }
 }
@@ -519,6 +598,8 @@ struct FaceBlit {
     blend: Blit,
     /// Whether the family passes the layer's hold argument to the blend.
     hold: bool,
+    /// The destination's stored alpha handling the blend runs against.
+    dst_alpha: DestAlpha,
 }
 
 /// Whether the operation mode is one the engine accepts.
@@ -531,6 +612,15 @@ fn is_operation_mode(mode: i64) -> bool {
     matches!(mode, 1..=5 | 8..=28)
 }
 
+/// The raise an operation carries when the mode and the face name no blend
+/// method.
+///
+/// A mode the layer does not know and a face the mode does not know raise the
+/// same text, which names the member and keeps the established spelling.
+fn unsupported_face(method: &str) -> String {
+    format!("Not drawble face type {method}")
+}
+
 /// Resolve an `omAuto` operation mode against the source layer's blend.
 fn resolve_mode(mode: i64, src_type: Option<BlendMode>, method: &str) -> Result<i64, String> {
     let mode = if mode != OM_AUTO {
@@ -540,16 +630,12 @@ fn resolve_mode(mode: i64, src_type: Option<BlendMode>, method: &str) -> Result<
             Some(blend) => operation_mode_from_layer_type(blend),
             None => {
                 // A Bitmap source has no layer blend; the reference keeps `omAlpha`.
-                let _ = method;
                 OM_ALPHA
             }
         }
     };
     if !is_operation_mode(mode) {
-        return Err(format!(
-            "Layer.{method}: the operation mode {mode} is not an operation mode the reference \
-             accepts"
-        ));
+        return Err(unsupported_face(method));
     }
     Ok(mode)
 }
@@ -596,6 +682,7 @@ struct AffineRun<'a> {
     opa: u8,
     hold_alpha: bool,
     treat_as_opaque: bool,
+    dst_alpha: DestAlpha,
     clear: bool,
     neutral: [u8; 4],
     clip: RectI,
@@ -615,6 +702,7 @@ fn affine_run(run: AffineRun<'_>) -> Result<(), String> {
         opa,
         hold_alpha,
         treat_as_opaque,
+        dst_alpha,
         clear,
         neutral,
         clip,
@@ -629,31 +717,30 @@ fn affine_run(run: AffineRun<'_>) -> Result<(), String> {
         } else {
             None
         };
-        let blit = if pixel_center {
-            layer_ops::affine_blit_clipped_pixel_center
-        } else {
-            layer_ops::affine_blit_clipped
+        // The two entries differ in the corner convention alone.
+        let affine = layer_ops::AffineBlit {
+            corners: [p0, p1, p2],
+            stretch_type,
+            clear,
+            clear_color: neutral,
         };
-        blit(
-            dst,
-            layer_ops::AffineBlit {
-                corners: [p0, p1, p2],
-                stretch_type,
-                clear,
-                clear_color: neutral,
-            },
-            layer_ops::BlitSource {
-                bitmap: src,
-                rect: src_rect,
-            },
-            layer_ops::BlitOptions {
-                mode,
-                opa,
-                treat_as_opaque,
-                ..Default::default()
-            },
-            clip,
-        );
+        let source = layer_ops::BlitSource {
+            bitmap: src,
+            rect: src_rect,
+        };
+        let options = layer_ops::BlitOptions {
+            mode,
+            opa,
+            treat_as_opaque,
+            ..Default::default()
+        };
+        if pixel_center {
+            layer_ops::affine_blit_clipped_pixel_center_on(
+                dst_alpha, dst, affine, source, options, clip,
+            );
+        } else {
+            layer_ops::affine_blit_clipped_on(dst_alpha, dst, affine, source, options, clip);
+        }
         if let Some(alpha) = alpha {
             restore_alpha_in_clip(dst, clip, &alpha)?;
         }
@@ -715,14 +802,17 @@ extern "C" fn layer_operate_rect(
         };
         // Reference order: clip first (`LayerIntf.cpp:5232-5234`), then the
         // mode/face validation (`LayerIntf.cpp:5235-5242`).
-        check_operate_face(mode, face)?;
-        if blend_is_unimplemented(mode, face) {
+        check_operate_face(mode, face, "operateRect")?;
+        let Some(blit) = face_blend(mode, face, layer_hold_alpha, opa) else {
+            return Ok(());
+        };
+        // A zero opacity draws nothing.
+        if opa == 0 {
             return Ok(());
         }
-        let (mode, treat_as_opaque) = face_blend(mode, face);
-        let hold_alpha = face_hold_alpha(mode, layer_hold_alpha);
         with_two_bitmaps(scene, dst, src_id, |d, s| {
-            layer_ops::operate_rect(
+            layer_ops::operate_rect_on(
+                blit.dst_alpha,
                 d,
                 dx,
                 dy,
@@ -731,10 +821,10 @@ extern "C" fn layer_operate_rect(
                     rect: src_rect,
                 },
                 layer_ops::BlitOptions {
-                    mode,
+                    mode: blit.mode,
                     opa,
-                    hold_alpha,
-                    treat_as_opaque,
+                    hold_alpha: blit.hold_alpha,
+                    treat_as_opaque: blit.treat_as_opaque,
                 },
             );
         })?;
@@ -806,16 +896,15 @@ extern "C" fn layer_operate_stretch(
         };
         // Reference order: clip first (`LayerIntf.cpp:5387-5390`), then the
         // mode/face validation (`LayerIntf.cpp:5392-5399`).
-        check_operate_face(mode, face)?;
-        if blend_is_unimplemented(mode, face) {
+        check_operate_face(mode, face, "operateStretch")?;
+        let Some(blit) = face_blend(mode, face, layer_hold_alpha, opa) else {
             return Ok(());
-        }
-        let (mode, treat_as_opaque) = face_blend(mode, face);
-        let hold_alpha = face_hold_alpha(mode, layer_hold_alpha);
+        };
         let src_rect = (sx, sy, sx.saturating_add(sw), sy.saturating_add(sh));
         let src_trimmed = scale_rect(src_rect, dst_rect, dest);
         with_two_bitmaps(scene, dst, src_id, |d, s| {
-            layer_ops::stretch_blit_mode(
+            layer_ops::stretch_blit_on(
+                blit.dst_alpha,
                 d,
                 dest,
                 layer_ops::BlitSource {
@@ -824,10 +913,10 @@ extern "C" fn layer_operate_stretch(
                 },
                 stretch_type,
                 layer_ops::BlitOptions {
-                    mode,
+                    mode: blit.mode,
                     opa,
-                    hold_alpha,
-                    treat_as_opaque,
+                    hold_alpha: blit.hold_alpha,
+                    treat_as_opaque: blit.treat_as_opaque,
                 },
             );
         })?;
@@ -919,10 +1008,7 @@ fn affine_op(
             }
         }
         AffineKind::Operate => {
-            check_operate_face(mode, face)?;
-            if blend_is_unimplemented(mode, face) {
-                return Ok(());
-            }
+            check_operate_face(mode, face, method)?;
         }
     }
     let clip = layer_clip(scene, id);
@@ -934,38 +1020,38 @@ fn affine_op(
     // face. The affine methods do not share the operation-mode table the
     // layer's draw path uses; each of them names its own blend method for
     // each face.
-    let (blend_mode, treat_as_opaque, hold) = match kind {
+    let blit = match kind {
         AffineKind::Copy => {
-            let blit = family_blit(BlitFamily::Copy, face, layer_hold_alpha);
-            (
-                blit.blend.mode(),
-                blit.blend.reads_source_as_opaque(),
-                blit.hold,
-            )
+            let blit = family_blit(BlitFamily::Copy, face, layer_hold_alpha, opa);
+            Some(FaceBlend {
+                mode: blit.blend.mode(),
+                treat_as_opaque: blit.blend.reads_source_as_opaque(),
+                hold_alpha: blit.hold,
+                dst_alpha: blit.dst_alpha,
+            })
         }
         AffineKind::Pile => {
-            let blit = family_blit(BlitFamily::Pile, face, layer_hold_alpha);
-            (
-                blit.blend.mode(),
-                blit.blend.reads_source_as_opaque(),
-                blit.hold,
-            )
+            let blit = family_blit(BlitFamily::Pile, face, layer_hold_alpha, opa);
+            Some(FaceBlend {
+                mode: blit.blend.mode(),
+                treat_as_opaque: blit.blend.reads_source_as_opaque(),
+                hold_alpha: blit.hold,
+                dst_alpha: blit.dst_alpha,
+            })
         }
         AffineKind::Blend => {
-            let blit = family_blit(BlitFamily::Blend, face, layer_hold_alpha);
-            (
-                blit.blend.mode(),
-                blit.blend.reads_source_as_opaque(),
-                blit.hold && opa == 255,
-            )
+            let blit = family_blit(BlitFamily::Blend, face, layer_hold_alpha, opa);
+            Some(FaceBlend {
+                mode: blit.blend.mode(),
+                treat_as_opaque: blit.blend.reads_source_as_opaque(),
+                hold_alpha: blit.hold,
+                dst_alpha: blit.dst_alpha,
+            })
         }
-        AffineKind::Operate => {
-            // The operate takes its blend from the operation mode and the
-            // draw face, and passes the layer's hold argument.
-            let (blend_mode, treat_as_opaque) = face_blend(mode, face);
-            let hold = face_hold_alpha(blend_mode, layer_hold_alpha);
-            (blend_mode, treat_as_opaque, hold)
-        }
+        AffineKind::Operate => face_blend(mode, face, layer_hold_alpha, opa),
+    };
+    let Some(blit) = blit else {
+        return Ok(());
     };
     let pixel_center = affine || p0.0.fract() != 0.0 || p0.1.fract() != 0.0;
     affine_run(AffineRun {
@@ -975,10 +1061,11 @@ fn affine_op(
         corners: [p0, p1, p2],
         src_rect,
         stretch_type,
-        mode: blend_mode,
+        mode: blit.mode,
         opa,
-        hold_alpha: hold,
-        treat_as_opaque,
+        hold_alpha: blit.hold_alpha,
+        treat_as_opaque: blit.treat_as_opaque,
+        dst_alpha: blit.dst_alpha,
         clear,
         neutral: neutral_color,
         clip,
@@ -1123,9 +1210,10 @@ fn stretch_op(
             } else {
                 BlitFamily::Pile
             };
-            let blit = family_blit(family, face, layer_hold_alpha);
+            let blit = family_blit(family, face, layer_hold_alpha, opa);
             with_two_bitmaps(scene, dst, src_id, |d, s| {
-                layer_ops::stretch_blit_mode(
+                layer_ops::stretch_blit_on(
+                    blit.dst_alpha,
                     d,
                     dest,
                     layer_ops::BlitSource {
@@ -1136,7 +1224,7 @@ fn stretch_op(
                     layer_ops::BlitOptions {
                         mode: blit.blend.mode(),
                         opa,
-                        hold_alpha: blit.hold && opa == 255,
+                        hold_alpha: blit.hold,
                         treat_as_opaque: blit.blend.reads_source_as_opaque(),
                     },
                 );
@@ -1313,7 +1401,11 @@ fn rect_op(
             } else {
                 BlitFamily::Blend
             };
-            let blit = family_blit(family, face, hold_alpha);
+            let blit = family_blit(family, face, hold_alpha, opa);
+            // A zero opacity draws nothing.
+            if opa == 0 {
+                return Ok(());
+            }
             // The destination rectangle is clipped to the layer's clip
             // rectangle before the source rectangle is read.
             let Some((dx, dy, src_rect)) = clip_dest_src(dx, dy, src_rect, clip) else {
@@ -1325,7 +1417,8 @@ fn rect_op(
                 else {
                     return;
                 };
-                layer_ops::operate_rect(
+                layer_ops::operate_rect_on(
+                    blit.dst_alpha,
                     d,
                     dx,
                     dy,
@@ -1336,7 +1429,7 @@ fn rect_op(
                     layer_ops::BlitOptions {
                         mode: blit.blend.mode(),
                         opa,
-                        hold_alpha: blit.hold && opa == 255,
+                        hold_alpha: blit.hold,
                         treat_as_opaque: blit.blend.reads_source_as_opaque(),
                     },
                 );
@@ -3044,7 +3137,7 @@ fn layer_draw_text_common(
             }
             if text_face == DF_ADD_ALPHA && opacity < 0 {
                 return Err(format!(
-                    "Layer.{method}: negative opacity is not supported on the add-alpha face"
+                    "Layer.{method}: Negative opacity not supported on this face"
                 ));
             }
         }

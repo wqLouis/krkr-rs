@@ -6,7 +6,7 @@
 //! test is
 //! deterministic. The contract under test: a timer repeats by construction
 //! until removed or disabled, a late frame replays the intervals the timer
-//! missed (bounded, and without letting the schedule drift), due callbacks
+//! missed (one call per timer, without letting the schedule drift), due callbacks
 //! run in creation order, callbacks may re-enter the registry (create timers,
 //! change intervals, remove themselves, even panic), and every stale id or
 //! zero interval is a typed error — never a panic, never a silent success.
@@ -19,14 +19,20 @@ use engine::timer::{TimerCallback, TimerError, TimerState, deliver_due};
 /// A callback that records the firing timer's raw id into `log`.
 fn recorder(log: &Rc<RefCell<Vec<u64>>>) -> TimerCallback {
     let log = Rc::clone(log);
-    Box::new(move |id| log.borrow_mut().push(id.value()))
+    Box::new(move |id, _| log.borrow_mut().push(id.value()))
 }
 
-/// A callback that counts its invocations and never fails.
+/// A callback that counts the fires it is handed and never fails.
+///
+/// A delivery replays every interval the timer missed in one call, so the
+/// count is the fires and not the invocations.
 fn counter() -> (TimerCallback, Rc<Cell<u64>>) {
     let hits = Rc::new(Cell::new(0u64));
     let inner = Rc::clone(&hits);
-    (Box::new(move |_| inner.set(inner.get() + 1)), hits)
+    (
+        Box::new(move |_, fires| inner.set(inner.get() + fires)),
+        hits,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -51,12 +57,13 @@ fn create_interval_fires_one_interval_from_now_then_repeats() {
     assert_eq!(deliver_due(&mut timers, 1_020), 1);
 
     // A late frame replays the intervals it missed: the deadline was 1_030
-    // and the frame landed at 1_100, so the timer fires eight times and
-    // keeps its place in the schedule.
+    // and the frame landed at 1_100, so the delivery reports eight fires in
+    // one call — the recorder sees one invocation per delivery, not per fire
+    // — and the timer keeps its place in the schedule.
     assert_eq!(deliver_due(&mut timers, 1_100), 8);
     assert_eq!(deliver_due(&mut timers, 1_101), 0);
     assert_eq!(deliver_due(&mut timers, 1_110), 1);
-    assert_eq!(log.borrow().len(), 11);
+    assert_eq!(log.borrow().len(), 4, "one invocation per delivery");
 }
 
 #[test]
@@ -168,12 +175,12 @@ fn zero_intervals_and_stale_ids_are_typed_errors() {
     // A zero interval is not representable in L2: it would be due on every
     // delivery. L3 maps a script `interval <= 0` onto not arming instead.
     assert_eq!(
-        timers.create_interval(0, Box::new(|_| {})),
+        timers.create_interval(0, Box::new(|_, _| {})),
         Err(TimerError::InvalidInterval)
     );
 
     let id = timers
-        .create_interval(10, Box::new(|_| {}))
+        .create_interval(10, Box::new(|_, _| {}))
         .expect("create");
     assert_eq!(timers.set_interval(id, 0), Err(TimerError::InvalidInterval));
 
@@ -223,8 +230,8 @@ fn a_callback_removing_itself_leaves_consistent_state() {
     let (callback, hits) = counter();
     let wrapped: TimerCallback = {
         let mut callback = callback;
-        Box::new(move |id| {
-            callback(id);
+        Box::new(move |id, fires| {
+            callback(id, fires);
             // SAFETY: see above — the registry is mid-delivery, which
             // expects exactly this re-entrant shape.
             unsafe { (*registry).remove(id) }.expect("remove self");
@@ -252,7 +259,7 @@ fn a_callback_creating_a_timer_joins_the_schedule() {
 
     let outer_log = Rc::clone(&log);
     let created_flag = Rc::clone(&created);
-    let outer_callback: TimerCallback = Box::new(move |id| {
+    let outer_callback: TimerCallback = Box::new(move |id, _| {
         outer_log.borrow_mut().push(id.value());
         if !created_flag.get() {
             created_flag.set(true);
@@ -302,7 +309,7 @@ fn a_callback_changing_its_own_interval_reschedules() {
     let rescheduled = Rc::new(Cell::new(false));
     let flag = Rc::clone(&rescheduled);
     let log_out = Rc::clone(&log);
-    let callback: TimerCallback = Box::new(move |id| {
+    let callback: TimerCallback = Box::new(move |id, _| {
         log_out.borrow_mut().push(id.value());
         if !flag.get() {
             flag.set(true);
@@ -342,7 +349,7 @@ fn a_peer_disabled_from_a_callback_is_cancelled_before_it_fires() {
     let killer = timers
         .create_interval(
             10,
-            Box::new(move |_| {
+            Box::new(move |_, _| {
                 killer_log.borrow_mut().push(0u64);
                 if !once.get() {
                     once.set(true);
@@ -375,15 +382,16 @@ fn a_peer_disabled_from_a_callback_is_cancelled_before_it_fires() {
     timers.now_ms = 30;
     timers.set_enabled(peer, true).expect("re-enable peer");
     // The killer's deadline was 30 and the frame landed at 40, so the killer
-    // replays the interval it missed and fires twice; the peer fires once.
+    // replays the interval it missed: two fires in one invocation, so it
+    // records one marker for them; the peer fires once.
     assert_eq!(deliver_due(&mut timers, 40), 3);
-    assert_eq!(*log.borrow(), vec![0u64, 0u64, 0u64, 0u64, 1u64]);
+    assert_eq!(*log.borrow(), vec![0u64, 0u64, 0u64, 1u64]);
 }
 
 /// A callback that records a fixed `1` marker (the peer's tag).
 fn recorder_marker(log: &Rc<RefCell<Vec<u64>>>) -> TimerCallback {
     let log = Rc::clone(log);
-    Box::new(move |_| log.borrow_mut().push(1u64))
+    Box::new(move |_, _| log.borrow_mut().push(1u64))
 }
 
 #[test]
@@ -394,8 +402,8 @@ fn a_panicking_callback_unwinds_over_consistent_state() {
     let should_panic = Rc::clone(&panic_next);
     let wrapped: TimerCallback = {
         let mut callback = callback;
-        Box::new(move |id| {
-            callback(id);
+        Box::new(move |id, fires| {
+            callback(id, fires);
             if should_panic.get() {
                 should_panic.set(false);
                 panic!("boom");
@@ -456,41 +464,60 @@ fn a_late_frame_replays_the_missed_intervals_without_drift() {
     assert_eq!(hits.get(), 5);
 }
 
+/// A replay longer than the reference's thread-starvation window is still a
+/// replay: the whole backlog is reported and the schedule keeps its place.
+///
+/// The reference's timer thread wakes at the next deadline, so its catch-up
+/// count `n` is one; the `n > 40` branch in its loop is the guard for a thread
+/// that was starved, not a rule for a late frame
+/// (`reference/cpp/core/utils/impl/TimerImpl.cpp:112-148`). This registry is
+/// pumped by the frame, so a late frame *is* the starvation case: collapsing
+/// the backlog would drop the fires a slow frame covered, which is why the
+/// count is handed on whole and the delivery above this layer bounds what it
+/// queues (`reference/cpp/core/utils/TimerIntf.cpp:69-111`).
 #[test]
-fn a_backlog_beyond_the_cap_fires_once_and_rearms_from_now() {
+fn a_replay_longer_than_forty_intervals_still_reports_the_whole_backlog() {
     let mut timers = TimerState::new();
     let (callback, hits) = counter();
     timers.create_interval(10, callback).expect("create");
 
-    // Forty missed intervals are still replayed: the deadline was 10 ms,
-    // the frame lands at 400 ms, so n = (400 - 10) / 10 + 1 = 40 fires, and
-    // the next deadline is the old one plus forty intervals.
-    //
-    // reference/cpp/core/utils/impl/TimerImpl.cpp:118-148 — the catch-up
-    // count is n = (curtick - NextTick) / Interval + 1.
-    assert_eq!(deliver_due(&mut timers, 400), 40);
-    assert_eq!(hits.get(), 40);
-    assert_eq!(deliver_due(&mut timers, 409), 0);
-    assert_eq!(deliver_due(&mut timers, 410), 1);
-    assert_eq!(hits.get(), 41);
+    // The deadline was 10 ms and the frame lands at 410 ms: forty intervals
+    // were missed, and the fire that was due at 10 ms is the forty-first, so
+    // the delivery reports forty-one fires and the next deadline is the old
+    // one plus forty-one intervals (420).
+    assert_eq!(deliver_due(&mut timers, 410), 41);
+    assert_eq!(hits.get(), 41, "one call carries the whole replay");
+    assert_eq!(
+        deliver_due(&mut timers, 419),
+        0,
+        "the schedule kept its place: nothing is due before 420"
+    );
+    assert_eq!(deliver_due(&mut timers, 420), 1);
+    assert_eq!(hits.get(), 42);
 
-    // One interval more is past the cap: the backlog is discarded, the
-    // timer fires once and the next deadline starts from now.
-    //
-    // reference/cpp/core/utils/impl/TimerImpl.cpp:118-148 — n > 40 discards
-    // the rest: Trigger(1) and SetNextTick(curtick + Interval).
-    let (callback, hits) = counter();
+    // A backlog of days is still one call, and the count is the elapsed
+    // intervals rather than a cap.
+    let fires = Rc::new(Cell::new(0u64));
+    let calls = Rc::new(Cell::new(0u64));
+    let (inner_fires, inner_calls) = (Rc::clone(&fires), Rc::clone(&calls));
     let mut timers = TimerState::new();
-    timers.create_interval(10, callback).expect("create");
-    assert_eq!(deliver_due(&mut timers, 411), 1);
-    assert_eq!(hits.get(), 1);
-    assert_eq!(deliver_due(&mut timers, 420), 0);
-    assert_eq!(deliver_due(&mut timers, 421), 1);
-    assert_eq!(hits.get(), 2);
+    timers
+        .create_interval(
+            1,
+            Box::new(move |_, fires_this_call| {
+                inner_calls.set(inner_calls.get() + 1);
+                inner_fires.set(inner_fires.get() + fires_this_call);
+            }),
+        )
+        .expect("create");
+    assert_eq!(deliver_due(&mut timers, 600_000), 600_000);
+    assert_eq!(fires.get(), 600_000, "every missed interval is reported");
+    assert_eq!(calls.get(), 1, "and they arrive as one invocation");
+    assert_eq!(deliver_due(&mut timers, 600_000), 0);
 }
 
 #[test]
-fn a_schedule_write_during_a_catch_up_cancels_the_remaining_fires() {
+fn a_schedule_write_during_a_replay_rearms_from_the_delivery() {
     let mut timers = TimerState::new();
     // SAFETY: see `a_callback_removing_itself_leaves_consistent_state`.
     let registry = &mut timers as *mut TimerState;
@@ -498,16 +525,17 @@ fn a_schedule_write_during_a_catch_up_cancels_the_remaining_fires() {
     let once = Rc::new(Cell::new(false));
     let hits_ref = Rc::clone(&hits);
     let flag = Rc::clone(&once);
-    let callback: TimerCallback = Box::new(move |id| {
+    let callback: TimerCallback = Box::new(move |id, _| {
         hits_ref.set(hits_ref.get() + 1);
         if !flag.get() {
             flag.set(true);
-            // The reschedule cancels the timer's remaining fires, the way a
-            // cancelled pending event is dropped.
+            // A schedule write re-arms the timer from the delivery's now and
+            // cancels the fires still queued for it; the replay count of the
+            // delivery it interrupted belongs to the delivery above this
+            // layer, which drops the postings (`cancel_pending`).
             //
-            // reference/cpp/core/utils/impl/TimerImpl.cpp:73-120 — a
-            // schedule write cancels the queued events and re-derives the
-            // next tick.
+            // reference/cpp/core/utils/impl/TimerImpl.cpp:73-120 — a schedule
+            // write cancels the queued events and re-derives the next tick.
             //
             // SAFETY: see above.
             unsafe { (*registry).set_interval(id, 100) }.expect("set interval");
@@ -515,9 +543,9 @@ fn a_schedule_write_during_a_catch_up_cancels_the_remaining_fires() {
     });
     timers.create_interval(10, callback).expect("create");
 
-    // The frame lands at 45 ms: four fires are due, and the first one
-    // reschedules the timer, so only the first fire happens.
-    assert_eq!(deliver_due(&mut timers, 45), 1);
+    // The frame lands at 45 ms: four fires are due, and the one invocation
+    // that carries them reschedules the timer.
+    assert_eq!(deliver_due(&mut timers, 45), 4);
     assert_eq!(hits.get(), 1);
 
     // The reschedule re-armed the timer at the delivery's now (45) plus

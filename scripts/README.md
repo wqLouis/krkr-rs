@@ -96,12 +96,19 @@ fire.
 - `KRKR_TEST_SAVE` — a real KAG save BMP for the save-fixture test.
 - `KRKR_REPO` — the checkout root; docs use it where a command starts outside
   the repository.
+- `KRKR_REFERENCE` — the reference checkout the parity checks read (a clone
+  with a `cpp/` directory). Defaults to `<repo>/reference`;
+  `krkr-gate --reference PATH <check>` sets it for that run, and
+  `krkr-gate --reference PATH gate` hands it to every check the gate runs.
+  Without it, a clone at another path makes `native-parity` and
+  `plugin-parity` fail with the paths they tried instead of scanning nothing.
 
 ## Notes
 
 - No third-party runtime dependencies; the build backend is hatchling.
 - `native-parity` and `plugin-parity` regenerate their reports under `docs/`
-  unless `--no-doc` is given.
+  unless `--no-doc` is given; the reports cite reference files as
+  `reference/cpp/...` whatever path the checkout actually lives at.
 - `surface-lock` regenerates the VM dispatch dump by running the compat
   surface test unless `--no-regen` is given; `--update` rewrites the committed
   baseline and is main-agent only.

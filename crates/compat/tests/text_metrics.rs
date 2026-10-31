@@ -336,16 +336,17 @@ fn the_drawn_text_carries_the_requested_colour() {
     }
 }
 
-/// Reference: the rasterizer measures a character with the glyph metrics the
-/// face carries, and the synthetic bold widens the loaded glyph and its drawn
-/// advance without touching those metrics
-/// (reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:139-152 and
-/// reference/cpp/core/visual/FreeType.cpp:640-680). A bold text therefore
-/// measures exactly as the plain text does, and the measured width is the
-/// sum of the plain per-character advances
-/// (reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473).
+/// Reference: the rasterizer loads the glyph with the synthetic bold applied
+/// and then reads the loaded slot's `horiAdvance`, so the embolden widens the
+/// measured advance as well as the drawn one
+/// (reference/cpp/core/visual/FreeType.cpp:675-677 emboldens inside
+/// `LoadGlyphSlotFromCharcode`, and `:620-627` reads
+/// `glyph->metrics.horiAdvance`; `reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:139-152`
+/// reports it as the width). The measured width is the sum of the per-character
+/// advances (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473`),
+/// so a bold string measures wider than the same plain string.
 #[test]
-fn a_bold_font_measures_the_same_width_as_the_plain_font() {
+fn a_bold_font_measures_wider_than_the_plain_font() {
     let _lock = vm_lock();
     let Some((font_dir, font_name)) = test_font() else {
         return;
@@ -357,13 +358,25 @@ fn a_bold_font_measures_the_same_width_as_the_plain_font() {
         .expect("register the face");
     let mut style = TextStyle::new(12.0);
     style.color = [255, 255, 255, 255];
-    let mut expected = 0i64;
+    let mut plain_expected = 0i64;
     for ch in "AB".chars() {
         let advance = text_engine
             .glyph_advance(face, ch, &style)
             .expect("the rasterizer advance");
-        expected += advance.round() as i64;
+        plain_expected += advance.round() as i64;
     }
+    style.bold = true;
+    let mut bold_expected = 0i64;
+    for ch in "AB".chars() {
+        let advance = text_engine
+            .glyph_advance(face, ch, &style)
+            .expect("the rasterizer bold advance");
+        bold_expected += advance.round() as i64;
+    }
+    assert!(
+        bold_expected > plain_expected,
+        "the embolden widens the measured advance"
+    );
 
     let env = common::Env::with_storage();
     let game_dir = env.game_dir().expect("game dir").clone();
@@ -375,12 +388,12 @@ fn a_bold_font_measures_the_same_width_as_the_plain_font() {
     );
     assert_eq!(
         env.eval_int("plain.getTextWidth('AB')"),
-        expected,
+        plain_expected,
         "the plain width is the rasterizer advance sum"
     );
     assert_eq!(
         env.eval_int("bold.getTextWidth('AB')"),
-        expected,
-        "the synthetic bold does not change the measured width"
+        bold_expected,
+        "the bold width is the rasterizer bold advance sum"
     );
 }

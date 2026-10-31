@@ -171,6 +171,24 @@ layer cannot reach it. A host or a test that owns a registry delivers the due
 timers itself through `engine::timer::deliver_due`, and the callbacks enqueue
 the posts this poll drains.
 
+### The replay and the capacity
+
+A delivery whose deadline passed `n` intervals hands the callback the whole
+count in **one** call, and the callback queues `min(n, cap − queued)` posts —
+the reference's own bound (`more = cap − count`, then
+`min(n, more)`: `reference/cpp/core/utils/TimerIntf.cpp:69-111`). The clamp is
+one step, so a process suspended for hours queues at most `cap` postings
+rather than one per interval.
+
+This is the one place the port's bound differs from the reference's: the
+reference's timer thread wakes every interval, so its `n > 40`
+starvation branch is never reached by a slow frame, and it delivers the
+capacity. A frame here *is* the thread, so a frame longer than forty
+intervals delivers the capacity where the reference's starvation guard
+delivers one (`reference/cpp/core/utils/impl/TimerImpl.cpp:112-148`). The
+divergence is recorded in [`engine/timer.md`](../../engine/timer.md) and in
+`TODO.md`.
+
 ---
 
 ## 5. The `onTimer` dispatch
@@ -272,6 +290,7 @@ only delivers what the advance produced.
 | `crates/compat/tests/timer_behavior.rs` | the constructor arity error and the action-name shapes; the interval default, the real type, the zero interval, the wrapped negative and the re-arm from now; the enabled arming and the cancellation; the capacity default, the verbatim values and the "bounds queued events, not fires" rule; the mode as a priority and not a one-shot switch; the absence of the `count`/`action`/`id` members; the dispatch to the constructor callback, the subclass override winning, a self-disabling override, a re-entrant creation, a self-invalidating callback and a failing callback keeping the timer enabled; the teardown and the creation-order firing. |
 | `crates/compat/tests/oop.rs` | `script_override_wins_over_native_on_timer`, `super_native_constructor_produces_a_fully_usable_instance`. |
 | `crates/compat/tests/extend_dispatch.rs` | the subclass override and the capacity rules through the real dispatch path. |
+| `crates/compat/tests/vk_timing.rs` | the delivery a slow frame produces: one `onTimer` per replayed interval, the capacity bounding the postings, a stall past forty intervals still posting the capacity, and a per-timer capacity budget. |
 | `crates/compat/tests/visual.rs` | `timer_properties_round_trip`. |
 | `crates/compat/tests/dispatch_visual.rs` | the receiver routing. |
 | `crates/compat/tests/timer_behavior.rs::the_registry_pump_delivers_the_timer_to_the_script` | the registry's pump delivers the timer to the script. |

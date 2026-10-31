@@ -10,14 +10,16 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use api::config::{CacheLimit, RuntimeConfig};
-use engine::{FrameTimeSource, InjectedFrameTime};
+use engine::FrameTimeSource;
 use platform::{
     EventHandler, Flow, FramePacing, PlatformConfig, PlatformError, PlatformEvent, PlatformWindow,
     Ticker,
 };
 use render::FrameStats;
 
-use crate::{BackendKind, GameError, GameHost, Host, HostConfig, HostError, StepReport};
+use crate::{
+    BackendKind, GameError, GameHost, Host, HostConfig, HostError, PlatformFrameTime, StepReport,
+};
 
 /// The game a launcher asks the emulator to open.
 ///
@@ -168,8 +170,10 @@ impl HeadlessPacer {
 /// nominal period would leave the script's clock behind the wall clock by the
 /// accumulated cost of the frames themselves.
 struct HeadlessClock {
-    /// The frame time the loop injects into the engine.
-    time: InjectedFrameTime,
+    /// The instant the run started: the origin the reading counts from.
+    started: Instant,
+    /// The milliseconds elapsed since the previous frame.
+    elapsed_ms: f64,
     /// The instant the previous frame started.
     ///
     /// The first frame measures from the run's start, the way the windowed
@@ -183,7 +187,8 @@ impl HeadlessClock {
     /// A clock whose first frame measures from `started`.
     fn new(started: Instant) -> Self {
         Self {
-            time: InjectedFrameTime::default(),
+            started,
+            elapsed_ms: 0.0,
             previous_at: started,
         }
     }
@@ -193,24 +198,46 @@ impl HeadlessClock {
     /// The measurement happens where the frame starts, like the platform's
     /// own measurement in the windowed loop, so a frame's own cost is part of
     /// the next frame's elapsed time.
-    fn advance(&mut self, now: Instant) -> &InjectedFrameTime {
-        self.time.elapsed_ms = now
+    fn advance(&mut self, now: Instant) -> &Self {
+        self.elapsed_ms = now
             .saturating_duration_since(self.previous_at)
             .as_secs_f64()
             * 1000.0;
         self.previous_at = now;
-        &self.time
+        self
+    }
+}
+
+impl FrameTimeSource for HeadlessClock {
+    fn elapsed_ms(&self) -> f64 {
+        self.elapsed_ms
+    }
+
+    /// The run's real elapsed time, read when the script asks for a tick.
+    ///
+    /// It is the same clock the frame deltas are measured from, so the script's
+    /// tick count moves inside a frame and the headless run's clock is the wall
+    /// clock.
+    fn now_ms(&self) -> f64 {
+        self.started.elapsed().as_secs_f64() * 1000.0
     }
 }
 
 /// Runs offscreen and prints the final frame stats (or the game's scene size).
 fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
     let started = Instant::now();
+    // Boxed: the script's tick count reads this source, so its address is
+    // handed to the game and must stay stable for the whole run.
+    let mut clock = Box::new(HeadlessClock::new(started));
     let config = HostConfig::headless()
         .with_backend(launch.backend)
         .with_debug_overlay(launch.runtime.debug_overlay)
         .with_graphic_cache_limit(launch.runtime.graphic_cache_limit);
-    let mut host = Host::new(config)?;
+    // The source is boxed before the host, so the address the game attaches is
+    // stable for the whole run; the host is stepped with the same source.
+    let source: &(dyn FrameTimeSource + 'static) = clock.as_ref();
+    let source = source as *const (dyn FrameTimeSource + 'static);
+    let mut host = Host::new(config)?.with_frame_time_source(source);
     // The headless step is paced by the frame-rate limit, like the windowed
     // loop, and the engine's clock advances by the time the loop measured
     // since the previous frame: the script's tick count is the wall clock, so
@@ -219,7 +246,6 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
     // counts the time that actually passed, which is that period plus the
     // frame's own cost.
     let mut pacer = HeadlessPacer::new(launch.runtime.frame_rate_limit.period_secs());
-    let mut clock = HeadlessClock::new(started);
 
     if let Some(input) = &launch.game {
         let mut game = GameHost::open_with_preload(
@@ -344,9 +370,12 @@ struct DesktopApp {
     graphic_cache_limit: Option<CacheLimit>,
     /// Frame period the loop paces at, which bounds the presentation wait.
     frame_interval: Duration,
-    /// The frame's elapsed time: the real time the platform measured,
-    /// injected into the engine's clock every frame.
-    frame_time: InjectedFrameTime,
+    /// The frame's clock source: the real time the platform measured, and the
+    /// reading the script's tick count takes on demand.
+    ///
+    /// Boxed so the address the game attaches with `Host::with_frame_time_source`
+    /// stays stable when the handler moves.
+    frame_time: Box<PlatformFrameTime>,
     /// The running host, created once the window handle exists.
     running: Option<Running>,
     /// Input and focus events received since the last frame, delivered to
@@ -465,7 +494,7 @@ impl DesktopApp {
             running: None,
             pending_events: Vec::new(),
             pending_surface_size: None,
-            frame_time: InjectedFrameTime::default(),
+            frame_time: Box::new(PlatformFrameTime::new()),
             heartbeat_frames: 0,
             changed_frames: 0,
             last_revisions: None,
@@ -530,8 +559,14 @@ impl EventHandler for DesktopApp {
             frame_interval: self.frame_interval,
             ..Default::default()
         };
+        let source: &(dyn FrameTimeSource + 'static) = self.frame_time.as_ref();
         match Host::new(config) {
             Ok(host) => {
+                // The source is a field of this handler, so it outlives the
+                // game the host is opened over, and it is the source every frame
+                // is stepped with.
+                let source = source as *const (dyn FrameTimeSource + 'static);
+                let host = host.with_frame_time_source(source);
                 let running = match &self.game {
                     Some(input) => {
                         match GameHost::open_with_preload(
@@ -621,7 +656,7 @@ impl EventHandler for DesktopApp {
                 return Flow::Exit;
             }
             let events = std::mem::take(&mut self.pending_events);
-            let report = match running.step(&self.frame_time, &events, pacing) {
+            let report = match running.step(self.frame_time.as_ref(), &events, pacing) {
                 Ok(report) => report,
                 Err(error) => {
                     eprintln!("krkr: frame failed: {error}");

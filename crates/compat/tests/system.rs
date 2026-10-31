@@ -851,43 +851,65 @@ fn decode_count(hints: &Arc<Mutex<Vec<String>>>) -> usize {
     hints.lock().expect("decode lock").len()
 }
 
-/// The tick count is the engine's frame clock.
+/// The tick count is the clock source, read when the script asks — not the
+/// frame boundary.
 ///
-/// The reference's `System.getTickCount` returns the tick counter its frame
-/// pacing follows, so the script and the frame share one clock
-/// (`reference/cpp/core/base/impl/SystemImpl.cpp:622-629`). A second,
-/// wall-clock counter would starve every timer the script arms.
+/// The reference reads its tick counter on every call
+/// (`reference/cpp/core/base/impl/SystemImpl.cpp:622-629`,
+/// `reference/cpp/core/utils/TickCount.cpp:112-118`), so two reads inside one
+/// frame may differ. The harness's source has a reading of its own, so this
+/// moves it *without* moving the frame clock: a tick count taken from the frame
+/// boundary would answer zero at every step below.
 #[test]
-fn get_tick_count_reads_the_engine_frame_clock() {
+fn get_tick_count_reads_the_clock_source_when_it_is_asked() {
     let _lock = vm_lock();
     let env = Env::new();
     assert_eq!(
         env.eval_int("System.getTickCount()"),
         0,
-        "the frame clock starts at zero"
+        "the source starts at zero"
     );
 
+    // The source moves on its own; no frame ran, so the frame clock is still at
+    // zero (advancing it by zero reports that value without moving it).
+    env.advance_tick_source(250.0);
+    assert_eq!(env.advance_clock(0.0), 0, "the frame clock did not move");
+    assert_eq!(
+        env.eval_int("System.getTickCount()"),
+        250,
+        "the tick count samples the source, not the frame boundary"
+    );
+
+    // A second read inside the same frame sees the source's newer value.
+    env.advance_tick_source(250.0);
+    assert_eq!(
+        env.eval_int("System.getTickCount()"),
+        500,
+        "each read takes a fresh sample"
+    );
+
+    // The frame clock is whole milliseconds: past the source's reading, the
+    // tick count is the clock (1000), and its fractional part is truncated.
     env.advance_clock(1000.0);
     assert_eq!(
         env.eval_int("System.getTickCount()"),
         1000,
-        "the tick count is the clock the frame advances"
+        "the frame clock leads the source, so the tick count is the clock"
     );
-    // A wall clock keeps counting between two reads; the frame clock only
-    // moves when the frame advances it.
-    assert_eq!(
-        env.eval_int("System.getTickCount()"),
-        1000,
-        "the tick count does not follow the wall clock"
-    );
-
-    // The clock keeps its fractional part, and the tick count is the whole
-    // milliseconds of it.
     env.advance_clock(16.5);
     assert_eq!(
         env.eval_int("System.getTickCount()"),
         1016,
         "the fractional part is kept, and the tick count is whole milliseconds"
+    );
+
+    // A source that moves backwards must not move the tick count back: the
+    // reading is floored by the frame clock.
+    env.advance_tick_source(-900.0);
+    assert_eq!(
+        env.eval_int("System.getTickCount()"),
+        1016,
+        "a source behind the frame clock must not rewind the tick count"
     );
 }
 

@@ -2373,6 +2373,48 @@ mod tests {
         );
     }
 
+    /// Reference: the width a text measurement sums is the rasterizer's
+    /// `CellIncX`, and the rasterizer reports it from the same glyph slot it
+    /// draws after emboldening that slot
+    /// (`reference/cpp/core/visual/FreeType.cpp:620-627` reads
+    /// `glyph->metrics.horiAdvance` after `:675-677` emboldened it, and
+    /// `reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473` sums it).
+    /// A bold run therefore measures the advance it draws.
+    #[test]
+    fn a_bold_glyph_measures_the_advance_it_draws() {
+        let Some(bytes) = load_test_font() else {
+            return;
+        };
+        let mut engine = TextEngine::new();
+        let font = engine.add_font(&bytes, 0).expect("register font");
+        let bold = TextStyle {
+            bold: true,
+            ..TextStyle::new(24.0)
+        };
+        for codepoint in ['A', 'g', ' '] {
+            let drawn = engine
+                .rasterize_glyph(font, codepoint, &bold)
+                .expect("rasterize the glyph")
+                .advance;
+            let measured = engine
+                .glyph_advance(font, codepoint, &bold)
+                .expect("measure the advance");
+            assert_eq!(
+                measured.to_bits(),
+                drawn.to_bits(),
+                "the measured advance of {codepoint:?} must be the drawn one"
+            );
+            let plain = engine
+                .rasterize_glyph(font, codepoint, &TextStyle::new(24.0))
+                .expect("rasterize the plain glyph")
+                .advance;
+            assert!(
+                drawn >= plain,
+                "the bold advance of {codepoint:?} must not be narrower"
+            );
+        }
+    }
+
     /// Reference: the rasterizer's extent depends on the face, the character,
     /// the pixel size and the synthetic bold/italic
     /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473`), so

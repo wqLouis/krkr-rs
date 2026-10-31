@@ -75,7 +75,7 @@ the graphic cache.
 | screen | `screenWidth`, `screenHeight` | the **logical screen** — the first window's primary layer, else the window client size, else `(0, 0)`. |
 | desktop | `desktopLeft`, `desktopTop`, `desktopWidth`, `desktopHeight` | the installed host rectangle. Without the host fact the member **raises** rather than returning a fabricated value. |
 | command line | `getArgument`, `setArgument` | `getArgument` prefix-matches (the next character must be `=` or the end of the string) and returns `"yes"` for a value-less entry, or **void** on a miss — the reference has no default parameter. `setArgument` rewrites the first prefix match or inserts `name=value` at the front. |
-| clock | `getTickCount` | the engine's **frame clock** in whole milliseconds — the value the frame advances and the timer registry is fired against. Without an attached clock the member **raises**. |
+| clock | `getTickCount` | the attached **clock source** read on demand, in whole milliseconds — the same source the frame clock accumulates at the boundary, so the script's reading moves inside a frame. Without an attached clock the member **raises**. |
 | exit | `exit`, `terminate` | record a one-shot exit request; the host drains it with `take_exit_request`. |
 | UI | `inform`, `inputString`, `showVersion`, `dumpHeap`, `nullpo` | no GUI: `inform` logs at info and returns void (no buttons) or `0` (one or two buttons) / `-1` (an unsupported button set); `inputString` logs and returns the initial value; `dumpHeap` is a no-op; `nullpo` logs an error instead of crashing. |
 | colour / identity | `toActualColor`, `createUUID`, `createAppLock`, `assignMessage` | `toActualColor` maps a TVP system colour (high byte set) to `0xRRGGBB`; `createUUID` returns an RFC-4122 v4 string; `createAppLock` always returns `true`; `assignMessage` reports whether a message by that name exists. |
@@ -91,9 +91,9 @@ the graphic cache.
 
 | Layer | Item |
 |---|---|
-| L2 | `Storage` (the paths), `InputState` (the key state), `Scene` (the screen size, the graphic cache), `FrameClock` (the tick count) |
+| L2 | `Storage` (the paths), `InputState` (the key state), `Scene` (the screen size, the graphic cache), `FrameClock` and `FrameTimeSource` (the tick count) |
 | L3 payload | none — `System` is a static class |
-| L3 dispatch state | `SystemState { arguments, exit_request, title, event_disabled, exit_on_window_close, exit_on_no_window_startup, draw_thread_num, rough_tick_epoch, last_compacted_ms, uuid_counter, continuous, current_continuous, remove_current_continuous, key_query_seen }`, plus the `HostFacts` desktop provider |
+| L3 dispatch state | `SystemState { arguments, exit_request, title, event_disabled, exit_on_window_close, exit_on_no_window_startup, draw_thread_num, last_compacted_ms, uuid_counter, continuous, current_continuous, remove_current_continuous, key_query_seen }`, plus the `HostFacts` desktop provider |
 
 ### Invariants
 

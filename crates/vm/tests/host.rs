@@ -63,8 +63,6 @@ fn exec_eval_and_tick() {
 
     let mut recorder = Recorder::default();
     let frame = FrameCtx {
-        now_ms: 0,
-        dt_ms: 16,
         body: &mut recorder,
         events: &[],
     };

@@ -67,7 +67,7 @@ crates/platform/media/src/video/mediacodec.rs:387:let-underscore — codec.stop(
 # --- debug_assert backed by adjacent validation (audit §8) ----------------
 crates/compat/src/natives/plugins/wutcwf/mod.rs:305:debug-assert — TcwfHeader::parse rejects bytes_per_block < 32; the equal assert is redundant
 crates/compat/src/natives/plugins/wutcwf/mod.rs:306:debug-assert — decode_tcwf allocates exactly samples_per_block*channels; the equal assert is redundant
-crates/platform/render/src/glyph.rs:220:debug-assert — internal rasterizer invariant; no unsafe/indexing depends on it in release
+crates/platform/render/src/glyph.rs:233:debug_assert_eq!(coverage.len(), width as usize * height as usize) — internal rasterizer invariant; no unsafe/indexing depends on it in release
 
 # --- pub(crate) thiserror error enums, never matched variant-by-variant
 #     (audit §7) -----------------------------------------------------------

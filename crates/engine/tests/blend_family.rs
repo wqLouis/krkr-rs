@@ -19,7 +19,9 @@
 //! (`reference/cpp/core/visual/RenderManager.cpp:1802-1824`).
 
 use api::blend::BlendMode;
-use engine::layer_ops::{BlitOptions, BlitSource, operate_rect, render_layer_subtree};
+use engine::layer_ops::{
+    BlitOptions, BlitSource, operate_rect, render_layer_subtree, stretch_blit_mode,
+};
 use engine::scene::Rect;
 use engine::{BitmapState, Scene};
 
@@ -64,6 +66,71 @@ fn blend_with(
         },
     );
     [dst.rgba[0], dst.rgba[1], dst.rgba[2], dst.rgba[3]]
+}
+
+/// The bytes of a row of pixels, row-major.
+fn flatten(row: &[[u8; 4]]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(row.len() * 4);
+    for pixel in row {
+        bytes.extend_from_slice(pixel);
+    }
+    bytes
+}
+
+/// The pixels of the first row of `bitmap`.
+fn read_row(bitmap: &BitmapState) -> Vec<[u8; 4]> {
+    bitmap
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| [chunk[0], chunk[1], chunk[2], chunk[3]])
+        .collect()
+}
+
+/// Runs one `operateRect` pass of a whole row and returns the destination row.
+fn operate_row(mode: i64, opa: u8, dest: &[[u8; 4]], source: &[[u8; 4]]) -> Vec<[u8; 4]> {
+    let width = u32::try_from(dest.len()).expect("a row that fits a bitmap");
+    let right = i32::try_from(width).expect("a row that fits a bitmap");
+    let rect = (0, 0, right, 1);
+    let mut dst = BitmapState::new(width, 1, flatten(dest));
+    let src = BitmapState::new(width, 1, flatten(source));
+    operate_rect(
+        &mut dst,
+        0,
+        0,
+        BlitSource { bitmap: &src, rect },
+        BlitOptions {
+            mode,
+            opa,
+            treat_as_opaque: false,
+            hold_alpha: false,
+        },
+    );
+    read_row(&dst)
+}
+
+/// Runs one `operateStretch` pass at the source's own size — so the resampler
+/// is exact — and returns the destination row.
+fn stretch_row(mode: i64, opa: u8, dest: &[[u8; 4]], source: &[[u8; 4]]) -> Vec<[u8; 4]> {
+    let width = u32::try_from(dest.len()).expect("a row that fits a bitmap");
+    let right = i32::try_from(width).expect("a row that fits a bitmap");
+    let rect = (0, 0, right, 1);
+    let mut dst = BitmapState::new(width, 1, flatten(dest));
+    let src = BitmapState::new(width, 1, flatten(source));
+    stretch_blit_mode(
+        &mut dst,
+        rect,
+        BlitSource { bitmap: &src, rect },
+        1, // stFastLinear
+        BlitOptions {
+            mode,
+            opa,
+            treat_as_opaque: false,
+            hold_alpha: false,
+        },
+    );
+    read_row(&dst)
 }
 
 /// Reference: the Photoshop normal blend is the tree's "PsAlphaBlend": the
@@ -289,20 +356,78 @@ fn the_additive_mode_saturates_the_sum_of_the_channels() {
     );
 }
 
-/// Reference: the subtractive blend is the saturating difference of the
-/// destination and the source
-/// (`reference/cpp/core/visual/gl/blend_functor_c.h:202-208`), the functor
-/// the software renderer's "SubBlend" method runs
-/// (`reference/cpp/core/visual/RenderManager.cpp:2868`). At the full opacity
-/// the method runs the plain functor, which subtracts the source unscaled
-/// (`reference/cpp/core/visual/RenderManager.cpp:1802-1810`).
+/// Reference: below the full opacity "AddBlend" runs `add_blend_func`, which
+/// fades the source by the opacity with the eight-bit truncation
+/// (`reference/cpp/core/visual/gl/blend_functor_c.h:190-197`) before
+/// `add_blend_functor`'s saturating sum (`:182-189`); the destination's alpha
+/// is held by the HDA wrapper
+/// (`reference/cpp/core/visual/gl/blend_variation.h:84-92`). The graphics
+/// path's `AddBlend` (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3586-3591`)
+/// adds the constant-weighted source, the same curve within one level.
 #[test]
-fn the_subtractive_mode_saturates_the_difference_of_the_channels() {
-    // `200 - 60` is 140; `100 - 180` and `50 - 90` run below zero and
-    // saturate.
+fn the_additive_mode_fades_the_source_by_the_opacity() {
+    // `faded = (s * opa) >> 8` then a saturating add, through
+    // `operateStretch`:
+    //   ( 60 * 128) >> 8 = 30  -> 200 +  30 = 230
+    //   (180 * 128) >> 8 = 90  -> 100 +  90 = 190
+    //   (255 * 128) >> 8 = 127 ->  50 + 127 = 177   (a /255 fade would give 128)
+    //   (250 * 128) >> 8 = 125 ->  10 + 125 = 135
+    //   ( 20 * 128) >> 8 = 10  -> 240 +  10 = 250
+    //   (200 * 128) >> 8 = 100 ->   5 + 100 = 105
+    // and the destinations' alphas of 128 and 200 are held.
+    assert_eq!(
+        stretch_row(
+            3,
+            128,
+            &[[200, 100, 50, 128], [10, 240, 5, 200]],
+            &[[60, 180, 255, 192], [250, 20, 200, 64]],
+        ),
+        [[230, 190, 177, 128], [135, 250, 105, 200]]
+    );
+}
+
+/// Reference: "SubBlend" is `tTVPRenderMethod_BltAndOpa<…, TVPSubBlend_HDA,
+/// TVPSubBlend_HDA_o>` (`reference/cpp/core/visual/RenderManager.cpp:2831-2837`,
+/// registered at `:2867`), so the full opacity runs `sub_blend_functor` and a
+/// lower one `sub_blend_func`
+/// (`reference/cpp/core/visual/RenderManager.cpp:1802-1819`). The faded
+/// functor complements the source, fades it by `a >> 8` and complements back
+/// (`reference/cpp/core/visual/gl/blend_functor_c.h:209-217`), and the plain
+/// one is the byte-wise `max(0, d + s - 255)` (`:202-208`). Both are therefore
+/// `max(0, d - subtractend)`, with `subtractend` the whole complement
+/// `255 - s` at the full opacity and its eight-bit truncation
+/// `(255 - s) * opa >> 8` below it. The HDA wrapper holds the destination's
+/// alpha (`reference/cpp/core/visual/gl/blend_variation.h:84-92`).
+///
+/// The graphics path's "SubBlend" program
+/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3593-3602`) computes
+/// the same curve in floating point (`d - (1 - s) * opa`), so the two reference
+/// backends agree at the full opacity and can differ by up to two levels below
+/// it.
+#[test]
+fn the_subtractive_mode_subtracts_the_faded_complement() {
+    // Full opacity: `max(0, d + s - 255)` is `max(0, d - (255 - s))`, so
+    // `200 - 195` = 5, `100 - 75` = 25 and `50 - 165` saturates at 0.
     assert_eq!(
         blend(4, [200, 100, 50, 128], [60, 180, 90, 192], 255),
-        [140, 0, 0, 128]
+        [5, 25, 0, 128]
+    );
+    // Below it the subtractend is the truncated `(255 - s) * opa >> 8`:
+    //   (255 - 60) * 128 >> 8  = 24960 >> 8 = 97   -> 200 - 97  = 103
+    //   (255 - 180) * 128 >> 8 =  9600 >> 8 = 37   -> 100 - 37  =  63
+    //   (255 - 90) * 128 >> 8  = 21120 >> 8 = 82   ->  50 - 82  ->   0
+    //   (255 - 250) * 128 >> 8 =   640 >> 8 =  2   ->  10 - 2   =   8
+    //   (255 - 20) * 128 >> 8  = 30080 >> 8 = 117  -> 240 - 117 = 123
+    //   (255 - 200) * 128 >> 8 =  7040 >> 8 = 27   ->   5 - 27  ->   0
+    // and the destinations' alphas of 128 and 200 are held.
+    assert_eq!(
+        operate_row(
+            4,
+            128,
+            &[[200, 100, 50, 128], [10, 240, 5, 200]],
+            &[[60, 180, 90, 192], [250, 20, 200, 64]],
+        ),
+        [[103, 63, 0, 128], [8, 123, 0, 200]]
     );
 }
 
@@ -320,6 +445,34 @@ fn the_multiplicative_mode_multiplies_the_channels() {
     assert_eq!(
         blend(5, [200, 100, 50, 128], [64, 128, 192, 255], 255),
         [50, 50, 37, 128]
+    );
+}
+
+/// Reference: below the full opacity `MulBlend_HDA_o` runs `mul_blend_func`,
+/// which fades the source towards white — `s = ~s`, the eight-bit fade, `~`
+/// again (`reference/cpp/core/visual/gl/blend_functor_c.h:230-240`) — and then
+/// `mul_blend_functor`'s `d * s >> 8` (`:222-229`), with the destination's
+/// alpha held (`reference/cpp/core/visual/gl/blend_variation.h:84-92`). The
+/// graphics path's `MulBlend` (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3605-3615`)
+/// is the same fade by `1 - (1 - s) * opa`, so the two agree within two levels.
+#[test]
+fn the_multiplicative_mode_fades_the_source_towards_white() {
+    // `faded = 255 - ((255 - s) * opa >> 8)`, then `d * faded >> 8`:
+    //   faded(60)  = 255 - 97  = 158 -> 200 * 158 >> 8 = 31600 >> 8 = 123
+    //   faded(180) = 255 - 37  = 218 -> 100 * 218 >> 8 = 21800 >> 8 =  85
+    //   faded(90)  = 255 - 82  = 173 ->  50 * 173 >> 8 =  8650 >> 8 =  33
+    //   faded(250) = 255 - 2   = 253 ->  10 * 253 >> 8 =  2530 >> 8 =   9
+    //   faded(20)  = 255 - 117 = 138 -> 240 * 138 >> 8 = 33120 >> 8 = 129
+    //   faded(200) = 255 - 27  = 228 ->   5 * 228 >> 8 =  1140 >> 8 =   4
+    // and the destinations' alphas of 128 and 200 are held.
+    assert_eq!(
+        operate_row(
+            5,
+            128,
+            &[[200, 100, 50, 128], [10, 240, 5, 200]],
+            &[[60, 180, 90, 192], [250, 20, 200, 64]],
+        ),
+        [[123, 85, 33, 128], [9, 129, 4, 200]]
     );
 }
 
@@ -352,6 +505,28 @@ fn the_dodge_mode_scales_the_destination_by_the_source_inverse() {
     );
 }
 
+/// Reference: at the full opacity "ColorDodgeBlend" runs
+/// `color_dodge_blend_functor`, which dodges with the source itself — the
+/// destination scaled by `TVPRecipTable256[255 - s]` and truncated by eight
+/// bits, clamped to a byte (`reference/cpp/core/visual/gl/blend_functor_c.h:243-255`);
+/// the table holds `65536 / i` and 65536 at index zero
+/// (`reference/cpp/core/visual/tvpgl.cpp:213-217`). The faded form is the
+/// test above. The graphics path's `ColorDodgeBlend` divides by `1 - s * opa`
+/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3653-3665`), so the
+/// two agree within a level away from a source of 255.
+#[test]
+fn the_dodge_mode_dodges_with_the_unfaded_source_at_full_opacity() {
+    // `d * (65536 / (255 - s)) >> 8`, clamped to 255:
+    //   65536 / (255 -  60) = 336 -> 100 * 336 >> 8 = 131
+    //   65536 / (255 -  80) = 374 -> 100 * 374 >> 8 = 146
+    //   65536 / (255 - 100) = 422 -> 100 * 422 >> 8 = 164
+    // and the destination's alpha of 128 is held.
+    assert_eq!(
+        blend(8, [100, 100, 100, 128], [60, 80, 100, 192], 255),
+        [131, 146, 164, 128]
+    );
+}
+
 /// Reference: the darken blend is the smaller of the two channels
 /// (`reference/cpp/core/visual/gl/blend_functor_c.h:268-277`), the functor
 /// the software renderer's "DarkenBlend" method runs
@@ -365,6 +540,35 @@ fn the_darken_mode_takes_the_smaller_channel() {
     assert_eq!(
         blend(9, [200, 100, 50, 128], [60, 180, 90, 192], 255),
         [60, 100, 50, 128]
+    );
+}
+
+/// Reference: below the full opacity "DarkenBlend" runs `darken_blend_func`,
+/// which mixes the darker channel into the destination by the opacity with
+/// `d + ((f - d) * a >> 8)`
+/// (`reference/cpp/core/visual/gl/blend_functor_c.h:278-292`); the graphics
+/// path's `DarkenBlend` is `mix(d.rgb, min(s.rgb, d.rgb), opacity)`
+/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3667-3671`). The
+/// destination's alpha is held by the HDA wrapper
+/// (`reference/cpp/core/visual/gl/blend_variation.h:84-92`).
+#[test]
+fn the_darken_mode_mixes_the_darker_channel_by_the_opacity() {
+    // `min` then `d + ((min - d) * 128 >> 8)`:
+    //   min(200, 60)  =  60 -> 200 + (-140 * 128 >> 8) = 200 - 70  = 130
+    //   min(100, 180) = 100 -> 100 + (   0 * 128 >> 8) = 100 +  0  = 100
+    //   min(50, 90)   =  50 ->  50 + (   0 * 128 >> 8) =  50 +  0  =  50
+    //   min(10, 250)  =  10 ->  10 + (   0 * 128 >> 8) =  10 +  0  =  10
+    //   min(240, 20)  =  20 -> 240 + (-220 * 128 >> 8) = 240 - 110 = 130
+    //   min(5, 200)   =   5 ->   5 + (   0 * 128 >> 8) =   5 +  0  =   5
+    // and the destinations' alphas of 128 and 200 are held.
+    assert_eq!(
+        operate_row(
+            9,
+            128,
+            &[[200, 100, 50, 128], [10, 240, 5, 200]],
+            &[[60, 180, 90, 192], [250, 20, 200, 64]],
+        ),
+        [[130, 100, 50, 128], [10, 130, 5, 200]]
     );
 }
 
@@ -384,6 +588,34 @@ fn the_lighten_mode_takes_the_larger_channel() {
     );
 }
 
+/// Reference: below the full opacity "LightenBlend" runs `lighten_blend_func`,
+/// which mixes the lighter channel into the destination by the opacity with
+/// `d + ((f - d) * a >> 8)`
+/// (`reference/cpp/core/visual/gl/blend_functor_c.h:307-322`); the graphics
+/// path's `LightenBlend` is `mix(d.rgb, max(s.rgb, d.rgb), opacity)`
+/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3674-3678`). This one
+/// runs through `operateStretch`, which shares the kernel.
+#[test]
+fn the_lighten_mode_mixes_the_lighter_channel_by_the_opacity() {
+    // `max` then `d + ((max - d) * 128 >> 8)`:
+    //   max(200, 60)  = 200 -> 200 + (  0 * 128 >> 8) = 200 +   0 = 200
+    //   max(100, 180) = 180 -> 100 + ( 80 * 128 >> 8) = 100 +  40 = 140
+    //   max(50, 90)   =  90 ->  50 + ( 40 * 128 >> 8) =  50 +  20 =  70
+    //   max(10, 250)  = 250 ->  10 + (240 * 128 >> 8) =  10 + 120 = 130
+    //   max(240, 20)  = 240 -> 240 + (  0 * 128 >> 8) = 240 +   0 = 240
+    //   max(5, 200)   = 200 ->   5 + (195 * 128 >> 8) =   5 +  97 = 102
+    // and the destinations' alphas of 128 and 200 are held.
+    assert_eq!(
+        stretch_row(
+            10,
+            128,
+            &[[200, 100, 50, 128], [10, 240, 5, 200]],
+            &[[60, 180, 90, 192], [250, 20, 200, 64]],
+        ),
+        [[200, 140, 70, 128], [130, 240, 102, 200]]
+    );
+}
+
 /// Reference: the screen blend is the complement of the product of the two
 /// complements, truncated by eight bits
 /// (`reference/cpp/core/visual/gl/blend_functor_c.h:326-336`), the functor the
@@ -400,6 +632,34 @@ fn the_screen_mode_is_the_complement_of_the_product() {
     assert_eq!(
         blend(11, [200, 100, 50, 128], [16, 32, 40, 192], 255),
         [204, 120, 83, 128]
+    );
+}
+
+/// Reference: below the full opacity "ScreenBlend" runs
+/// `screen_blend_HDA_o_func`, which fades the source with `s = ~((s * a) >> 8)`
+/// and screens the complement of the destination with it, so a channel is
+/// `255 - (((255 - d) * (255 - ((s * opa) >> 8))) >> 8)`
+/// (`reference/cpp/core/visual/gl/blend_functor_c.h:350-362`). The graphics
+/// path's `ScreenBlend` (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3683-3692`)
+/// is the same curve in floating point, within two levels.
+#[test]
+fn the_screen_mode_fades_the_source_before_screening() {
+    // `s2 = 255 - ((s * opa) >> 8)`, then `255 - (((255 - d) * s2) >> 8)`:
+    //   s2(60)  = 255 - 30  = 225 -> 255 - ( 55 * 225 = 12375 >> 8) = 255 -  48 = 207
+    //   s2(180) = 255 - 90  = 165 -> 255 - (155 * 165 = 25575 >> 8) = 255 -  99 = 156
+    //   s2(90)  = 255 - 45  = 210 -> 255 - (205 * 210 = 43050 >> 8) = 255 - 168 =  87
+    //   s2(250) = 255 - 125 = 130 -> 255 - (245 * 130 = 31850 >> 8) = 255 - 124 = 131
+    //   s2(20)  = 255 - 10  = 245 -> 255 - ( 15 * 245 =  3675 >> 8) = 255 -  14 = 241
+    //   s2(200) = 255 - 100 = 155 -> 255 - (250 * 155 = 38750 >> 8) = 255 - 151 = 104
+    // and the destinations' alphas of 128 and 200 are held.
+    assert_eq!(
+        operate_row(
+            11,
+            128,
+            &[[200, 100, 50, 128], [10, 240, 5, 200]],
+            &[[60, 180, 90, 192], [250, 20, 200, 64]],
+        ),
+        [[207, 156, 87, 128], [131, 241, 104, 200]]
     );
 }
 
@@ -430,5 +690,27 @@ fn the_add_alpha_mode_scales_the_destination_by_the_remaining_alpha() {
     assert_eq!(
         blend(12, [128, 64, 32, 128], [16, 24, 48, 192], 255),
         [47, 39, 55, 128]
+    );
+}
+
+/// Reference: at the full opacity "AdditiveAlphaBlend" runs
+/// `premulalpha_blend_n_a_func`, which adds the source to the destination
+/// scaled by `(~s) >> 24` — the whole remaining alpha of the unfaded source
+/// (`reference/cpp/core/visual/gl/blend_util_func.h:35-43`); the faded wrapper
+/// is the test above (`reference/cpp/core/visual/gl/blend_functor_c.h:132-147`).
+/// The destination's alpha is held
+/// (`reference/cpp/core/visual/gl/blend_variation.h:84-92`), and the graphics
+/// path's `AdditiveAlphaBlend` (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3629-3638`)
+/// is the same sum within a level.
+#[test]
+fn the_add_alpha_mode_takes_the_whole_remaining_alpha_at_full_opacity() {
+    // `(d * (255 - sa)) >> 8 + s` with the unfaded source:
+    //   (200 * (255 - 100)) >> 8 = 200 * 155 >> 8 = 121 -> 121 +  60 = 181
+    //   (100 * (255 - 100)) >> 8 = 100 * 155 >> 8 =  60 ->  60 + 180 = 240
+    //   ( 50 * (255 - 100)) >> 8 =  50 * 155 >> 8 =  30 ->  30 +  90 = 120
+    // and the destination's alpha of 128 is held.
+    assert_eq!(
+        blend(12, [200, 100, 50, 128], [60, 180, 90, 100], 255),
+        [181, 240, 120, 128]
     );
 }

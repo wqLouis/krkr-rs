@@ -103,9 +103,11 @@ fn the_timeline_information_carries_the_reference_members() {
     // a game script links it.
     env.link_plugin("motionplayer.dll");
     let dir = env.game_dir().expect("the temp game directory").clone();
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../reference/tests/test_files/emote")
-        .join(MOTION_FIXTURE);
+    let Some(fixture) =
+        testkit::reference_fixture_or_skip(std::path::Path::new("emote").join(MOTION_FIXTURE))
+    else {
+        return;
+    };
     std::fs::copy(&fixture, dir.join(MOTION_FIXTURE)).expect("copy the motion fixture");
     env.run(&format!(
         "Motion.ResourceManager.setEmotePSBDecryptSeed({MOTION_SEED});\

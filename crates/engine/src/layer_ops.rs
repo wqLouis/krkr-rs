@@ -29,6 +29,7 @@ use api::geometry::PixelRegion;
 use crate::hasher::Map;
 use crate::raster::blend_pixel_at;
 use crate::scene::{BitmapState, Rect, Scene};
+use crate::trans::DestAlpha;
 
 /// Half-open pixel rectangle `[x0, x1) x [y0, y1)`.
 pub type RectI = (i32, i32, i32, i32);
@@ -2083,6 +2084,15 @@ pub(crate) enum ModeKernel {
     PsDifference5,
     /// Photoshop exclusion.
     PsExclusion,
+    /// The alpha blend onto an additive-alpha destination: the source's
+    /// colour is premultiplied by its alpha, and the destination is faded by
+    /// the same alpha, so the stored colour stays premultiplied.
+    AlphaOnAddAlpha,
+    /// The additive-alpha blend onto an additive-alpha destination.
+    AddAlphaOnAddAlpha,
+    /// The constant-alpha blend onto an additive-alpha destination: the
+    /// source's colour is added and the destination faded by the opacity.
+    ConstAlphaOnAddAlpha,
 }
 
 /// The kernel a numeric operation mode applies.
@@ -2121,14 +2131,36 @@ fn mode_kernel(mode: i64) -> Option<ModeKernel> {
     })
 }
 
-/// The kernel a pass applies.
+/// The kernel a pass applies, from the operation mode and the destination's
+/// stored alpha handling.
 ///
 /// The copy family has a second spelling below the full opacity: the source's
 /// colour is blended into the destination with the opacity as a constant
 /// alpha. The copy of an opaque source takes the destination's alpha into
 /// that mix; the plain copy holds it.
-fn resolve_kernel(mode: i64, opa: u8, treat_as_opaque: bool) -> Option<ModeKernel> {
+///
+/// A destination that stores an additive alpha selects the operation's "on an
+/// additive alpha" spelling: the alpha blend, the additive-alpha blend and
+/// the copy of an opaque source below the full opacity each have one. Every
+/// other method reads the stored colour as it is, so its kernel is the same
+/// whatever the destination stores.
+fn resolve_kernel_on(
+    mode: i64,
+    opa: u8,
+    treat_as_opaque: bool,
+    dst_alpha: DestAlpha,
+) -> Option<ModeKernel> {
     let kernel = mode_kernel(mode)?;
+    if matches!(dst_alpha, DestAlpha::Additive) {
+        match kernel {
+            ModeKernel::SourceOver => return Some(ModeKernel::AlphaOnAddAlpha),
+            ModeKernel::AddAlpha => return Some(ModeKernel::AddAlphaOnAddAlpha),
+            ModeKernel::Copy if treat_as_opaque && opa != 255 => {
+                return Some(ModeKernel::ConstAlphaOnAddAlpha);
+            }
+            _ => {}
+        }
+    }
     if opa != 255 && matches!(kernel, ModeKernel::Copy) {
         return Some(if treat_as_opaque {
             ModeKernel::SourceOver
@@ -2222,8 +2254,25 @@ fn affine_blend(kernel: ModeKernel) -> AffineBlend {
         | ModeKernel::PsDarken
         | ModeKernel::PsDifference
         | ModeKernel::PsDifference5
-        | ModeKernel::PsExclusion => AffineBlend::Mode,
+        | ModeKernel::PsExclusion
+        | ModeKernel::AlphaOnAddAlpha
+        | ModeKernel::AddAlphaOnAddAlpha
+        | ModeKernel::ConstAlphaOnAddAlpha => AffineBlend::Mode,
     }
+}
+
+/// Mixes a per-channel blend result into the destination by the opacity.
+///
+/// The full opacity reports the blend result itself, the way the blend's
+/// method dispatches it there; below it the blend function mixes that result
+/// into the channel with `d + ((f - d) * opa >> 8)` and the destination's
+/// alpha is left alone.
+fn blend_by_opacity(d: u8, f: u8, opa: u8) -> u8 {
+    if opa == 255 {
+        return f;
+    }
+    let shifted = ((i32::from(f) - i32::from(d)) * i32::from(opa)) >> 8;
+    (i32::from(d) + shifted).clamp(0, 255) as u8
 }
 
 /// The factor the Photoshop blends mix their per-channel function with.
@@ -2342,6 +2391,42 @@ fn dodge_channel(d: u8, s: u8) -> u8 {
     value.clamp(0, 255) as u8
 }
 
+/// The alpha a pass blends with.
+///
+/// A face-selected method has two spellings: the full-opacity one reads the
+/// source's alpha as it is, and the partial one scales it by the opacity.
+fn scaled_alpha(src: u8, opa: u8) -> u8 {
+    if opa == 255 {
+        src
+    } else {
+        ((u32::from(src) * u32::from(opa)) >> 8) as u8
+    }
+}
+
+/// A source channel scaled by the opacity, exactly at the full opacity.
+fn scaled_channel(src: u8, opa: u8) -> u32 {
+    if opa == 255 {
+        u32::from(src)
+    } else {
+        (u32::from(src) * u32::from(opa)) >> 8
+    }
+}
+
+/// The byte-wise saturating sum of two channel values.
+fn saturated_byte_add(a: u32, b: u32) -> u8 {
+    a.saturating_add(b).min(255) as u8
+}
+
+/// The alpha a source-over leaves on an additive-alpha destination.
+///
+/// The two alphas compose, and the result is scaled down by its own high byte
+/// so the full case lands on 255 instead of wrapping.
+fn add_alpha_over(dst: u8, src: u8) -> u8 {
+    let mut out = u32::from(dst) + u32::from(src) - ((u32::from(dst) * u32::from(src)) >> 8);
+    out -= out >> 8;
+    out.min(255) as u8
+}
+
 /// Blends `src` into one destination pixel with the kernel of `mode`.
 fn apply_mode_kernel(kernel: ModeKernel, pixel: &mut [u8; 4], src: [u8; 4], opa: u8) {
     match kernel {
@@ -2365,62 +2450,153 @@ fn apply_mode_kernel(kernel: ModeKernel, pixel: &mut [u8; 4], src: [u8; 4], opa:
             let factor = ps_mix_factor(src[3], opa);
             mix_channels(pixel, [src[0], src[1], src[2]], factor);
         }
-        // omAdditive / ltAdditive: saturating add, source scaled by `opa`.
+        // The alpha blend onto an additive-alpha destination: the source's
+        // colour is premultiplied by its alpha and the destination faded by
+        // the same alpha, so the pass leaves a premultiplied colour behind.
+        ModeKernel::AlphaOnAddAlpha => {
+            let alpha = scaled_alpha(src[3], opa);
+            let inverse = 255 - u32::from(alpha);
+            for c in 0..3 {
+                pixel[c] = saturated_byte_add(
+                    (u32::from(src[c]) * u32::from(alpha)) >> 8,
+                    (u32::from(pixel[c]) * inverse) >> 8,
+                );
+            }
+            pixel[3] = add_alpha_over(pixel[3], alpha);
+        }
+        // The additive-alpha blend onto an additive-alpha destination: the
+        // opacity-scaled source is added and the destination faded by the
+        // source's alpha.
+        ModeKernel::AddAlphaOnAddAlpha => {
+            let alpha = scaled_alpha(src[3], opa);
+            let inverse = 255 - u32::from(alpha);
+            for c in 0..3 {
+                pixel[c] = saturated_byte_add(
+                    scaled_channel(src[c], opa),
+                    (u32::from(pixel[c]) * inverse) >> 8,
+                );
+            }
+            pixel[3] = add_alpha_over(pixel[3], alpha);
+        }
+        // The constant-alpha blend onto an additive-alpha destination: the
+        // source's colour is added unscaled, the destination is faded by the
+        // opacity, and the opacity is the alpha the pass leaves.
+        ModeKernel::ConstAlphaOnAddAlpha => {
+            let inverse = 255 - u32::from(opa);
+            for c in 0..3 {
+                pixel[c] =
+                    saturated_byte_add(u32::from(src[c]), (u32::from(pixel[c]) * inverse) >> 8);
+            }
+            pixel[3] = add_alpha_over(pixel[3], opa);
+        }
+        // omAdditive / ltAdditive: the saturating sum with the source unscaled
+        // at the full opacity, and the saturating sum of the eight-bit-faded
+        // source below it. The destination's alpha is held.
         ModeKernel::Additive => {
             for c in 0..3 {
-                pixel[c] =
-                    pixel[c].saturating_add(((u32::from(src[c]) * u32::from(opa)) / 255) as u8);
+                let faded = if opa == 255 {
+                    src[c]
+                } else {
+                    ((u16::from(src[c]) * u16::from(opa)) >> 8) as u8
+                };
+                pixel[c] = pixel[c].saturating_add(faded);
             }
         }
-        // omSubtractive / ltSubtractive.
+        // omSubtractive / ltSubtractive: the "SubBlend" method runs the plain
+        // functor at the full opacity and the faded one below it, so a channel
+        // is `max(0, d - subtractend)` with the whole complement at the full
+        // opacity and the eight-bit-truncated `(255 - s) * opa` below. The
+        // destination's alpha is held.
         ModeKernel::Subtractive => {
             for c in 0..3 {
-                pixel[c] =
-                    pixel[c].saturating_sub(((u32::from(src[c]) * u32::from(opa)) / 255) as u8);
+                let complement = 255 - src[c];
+                let subtractend = if opa == 255 {
+                    complement
+                } else {
+                    ((u16::from(complement) * u16::from(opa)) >> 8) as u8
+                };
+                pixel[c] = pixel[c].saturating_sub(subtractend);
             }
         }
-        // omMultiplicative / ltMultiplicative.
+        // omMultiplicative / ltMultiplicative: the source fades towards white
+        // by the opacity and the destination takes the product, truncated by
+        // eight bits. The full opacity multiplies by the source itself. The
+        // destination's alpha is held.
         ModeKernel::Multiplicative => {
-            let opa = u32::from(opa);
             for c in 0..3 {
-                let s = u32::from(src[c]) * opa / 255;
-                pixel[c] = (u32::from(pixel[c]) * s / 255) as u8;
+                let faded = if opa == 255 {
+                    src[c]
+                } else {
+                    let complement = 255 - src[c];
+                    255 - (((u16::from(complement) * u16::from(opa)) >> 8) as u8)
+                };
+                pixel[c] = ((u16::from(pixel[c]) * u16::from(faded)) >> 8) as u8;
             }
         }
-        // omDarken / ltDarken.
+        // omDarken / ltDarken: the darker channel at the full opacity, and the
+        // channel mixed into the destination by the opacity below it.
         ModeKernel::Darken => {
             for c in 0..3 {
-                pixel[c] = pixel[c].min(src[c]);
+                let blended = pixel[c].min(src[c]);
+                pixel[c] = blend_by_opacity(pixel[c], blended, opa);
             }
         }
-        // omLighten / ltLighten.
+        // omLighten / ltLighten: the lighter channel, with the same dispatch.
         ModeKernel::Lighten => {
             for c in 0..3 {
-                pixel[c] = pixel[c].max(src[c]);
+                let blended = pixel[c].max(src[c]);
+                pixel[c] = blend_by_opacity(pixel[c], blended, opa);
             }
         }
-        // omScreen / ltScreen.
+        // omScreen / ltScreen: the screen at the full opacity, and the screen
+        // of the source faded by the opacity below it. The fade complements the
+        // faded source once more, so it runs from the destination at zero
+        // opacity to the screen at the full one. The destination's alpha is
+        // held.
         ModeKernel::Screen => {
             for c in 0..3 {
-                let blended = 255 - (255 - u32::from(pixel[c])) * (255 - u32::from(src[c])) / 255;
-                pixel[c] =
-                    ((u32::from(pixel[c]) * (255 - u32::from(opa)) + blended * 255) / 255) as u8;
+                let faded = if opa == 255 {
+                    255 - src[c]
+                } else {
+                    255 - (((u16::from(src[c]) * u16::from(opa)) >> 8) as u8)
+                };
+                let screen = 255 - (((u16::from(255 - pixel[c]) * u16::from(faded)) >> 8) as u8);
+                pixel[c] = screen;
             }
         }
-        // omDodge / ltDodge: the destination scaled by the source's inverse.
+        // omDodge / ltDodge: the destination scaled by the reciprocal of the
+        // source's complement, the source faded by the opacity first. The full
+        // opacity dodges with the source itself. The destination's alpha is
+        // held.
         ModeKernel::Dodge => {
             for c in 0..3 {
-                let faded = ((u32::from(src[c]) * u32::from(opa)) >> 8) as u8;
+                let faded = if opa == 255 {
+                    src[c]
+                } else {
+                    ((u16::from(src[c]) * u16::from(opa)) >> 8) as u8
+                };
                 pixel[c] = dodge_channel(pixel[c], faded);
             }
         }
-        // omAddAlpha / ltAddAlpha: the source fades by the opacity and the
-        // destination by the source's remaining alpha.
+        // omAddAlpha / ltAddAlpha: the source is added to the destination
+        // scaled by the source's remaining alpha. The full opacity adds the
+        // unfaded source against the whole remaining alpha; below it the
+        // source fades by the opacity and the remaining alpha is the faded
+        // source's. The destination's alpha is held.
         ModeKernel::AddAlpha => {
-            let remaining = 255 - ((u32::from(src[3]) * u32::from(opa)) >> 8) as u8;
+            let full = opa == 255;
+            let remaining = if full {
+                255 - src[3]
+            } else {
+                255 - (((u16::from(src[3]) * u16::from(opa)) >> 8) as u8)
+            };
             for c in 0..3 {
-                let base = ((u32::from(pixel[c]) * u32::from(remaining)) >> 8) as u8;
-                let faded = ((u32::from(src[c]) * u32::from(opa)) >> 8) as u8;
+                let faded = if full {
+                    src[c]
+                } else {
+                    ((u16::from(src[c]) * u16::from(opa)) >> 8) as u8
+                };
+                let base = ((u16::from(pixel[c]) * u16::from(remaining)) >> 8) as u8;
                 pixel[c] = base.saturating_add(faded);
             }
         }
@@ -2669,6 +2845,23 @@ pub fn operate_rect(
     source: BlitSource<'_>,
     options: BlitOptions,
 ) {
+    operate_rect_on(DestAlpha::Straight, dst, dx, dy, source, options);
+}
+
+/// [`operate_rect`] onto a destination whose stored alpha follows
+/// `dst_alpha`.
+///
+/// An additive-alpha destination selects the operation's "on an additive
+/// alpha" spelling of the face-selected methods; a straight or an opaque
+/// destination selects the same kernel as [`operate_rect`] for every mode.
+pub fn operate_rect_on(
+    dst_alpha: DestAlpha,
+    dst: &mut BitmapState,
+    dx: i32,
+    dy: i32,
+    source: BlitSource<'_>,
+    options: BlitOptions,
+) {
     let BlitSource {
         bitmap: src,
         rect: src_rect,
@@ -2690,7 +2883,7 @@ pub fn operate_rect(
     }
     // The kernel is resolved once for the whole pass, so the per-pixel loop
     // never dispatches on the operation mode.
-    let Some(kernel) = resolve_kernel(mode, opa, treat_as_opaque) else {
+    let Some(kernel) = resolve_kernel_on(mode, opa, treat_as_opaque, dst_alpha) else {
         log::error!("engine: operateRect met the unknown operation mode {mode}");
         return;
     };
@@ -2769,6 +2962,26 @@ pub fn stretch_blit_mode(
     stretch_type: i64,
     options: BlitOptions,
 ) {
+    stretch_blit_on(
+        DestAlpha::Straight,
+        dst,
+        dest,
+        source,
+        stretch_type,
+        options,
+    );
+}
+
+/// [`stretch_blit_mode`] onto a destination whose stored alpha follows
+/// `dst_alpha`.
+pub fn stretch_blit_on(
+    dst_alpha: DestAlpha,
+    dst: &mut BitmapState,
+    dest: RectI,
+    source: BlitSource<'_>,
+    stretch_type: i64,
+    options: BlitOptions,
+) {
     let BlitSource {
         bitmap: src,
         rect: src_rect,
@@ -2793,7 +3006,7 @@ pub fn stretch_blit_mode(
     };
     // The kernel is resolved once for the whole pass, so the per-pixel loop
     // never dispatches on the operation mode.
-    let Some(kernel) = resolve_kernel(mode, opa, treat_as_opaque) else {
+    let Some(kernel) = resolve_kernel_on(mode, opa, treat_as_opaque, dst_alpha) else {
         log::error!("engine: operateStretch met the unknown operation mode {mode}");
         return;
     };
@@ -2803,6 +3016,11 @@ pub fn stretch_blit_mode(
     // texel, so the pass is a copy (Copy mode) or a source-over blit. This
     // avoids the per-pixel float resampler without changing any pixel.
     if let Some((dx, dy)) = stretch_exact_translation(dest, src_rect, stretch_type) {
+        // A one-to-one transfer is the plain blit, and the plain blit draws
+        // nothing at a zero opacity.
+        if opa == 0 {
+            return;
+        }
         match kernel {
             // The shortcut copies the source's pixels verbatim, so it cannot
             // serve a pass that reads the source as an opaque image: that
@@ -3051,7 +3269,28 @@ pub fn affine_blit_clipped(
     options: BlitOptions,
     clip: RectI,
 ) {
-    affine_blit_clipped_impl(dst, affine, source, options, clip, false);
+    affine_blit_clipped_impl(
+        DestAlpha::Straight,
+        dst,
+        affine,
+        source,
+        options,
+        clip,
+        false,
+    );
+}
+
+/// [`affine_blit_clipped`] onto a destination whose stored alpha follows
+/// `dst_alpha`.
+pub fn affine_blit_clipped_on(
+    dst_alpha: DestAlpha,
+    dst: &mut BitmapState,
+    affine: AffineBlit,
+    source: BlitSource<'_>,
+    options: BlitOptions,
+    clip: RectI,
+) {
+    affine_blit_clipped_impl(dst_alpha, dst, affine, source, options, clip, false);
 }
 
 /// [`affine_blit_clipped`] for corners expressed in the pixel-centre
@@ -3064,10 +3303,32 @@ pub fn affine_blit_clipped_pixel_center(
     options: BlitOptions,
     clip: RectI,
 ) {
-    affine_blit_clipped_impl(dst, affine, source, options, clip, true);
+    affine_blit_clipped_impl(
+        DestAlpha::Straight,
+        dst,
+        affine,
+        source,
+        options,
+        clip,
+        true,
+    );
+}
+
+/// [`affine_blit_clipped_pixel_center`] onto a destination whose stored alpha
+/// follows `dst_alpha`.
+pub fn affine_blit_clipped_pixel_center_on(
+    dst_alpha: DestAlpha,
+    dst: &mut BitmapState,
+    affine: AffineBlit,
+    source: BlitSource<'_>,
+    options: BlitOptions,
+    clip: RectI,
+) {
+    affine_blit_clipped_impl(dst_alpha, dst, affine, source, options, clip, true);
 }
 
 fn affine_blit_clipped_impl(
+    dst_alpha: DestAlpha,
     dst: &mut BitmapState,
     affine: AffineBlit,
     source: BlitSource<'_>,
@@ -3094,7 +3355,7 @@ fn affine_blit_clipped_impl(
     } = options;
     // The kernel is resolved once for the whole pass, so the per-pixel loop
     // never dispatches on the operation mode.
-    let Some(kernel) = resolve_kernel(mode, opa, treat_as_opaque) else {
+    let Some(kernel) = resolve_kernel_on(mode, opa, treat_as_opaque, dst_alpha) else {
         log::error!("engine: the affine pass met the unknown operation mode {mode}");
         return;
     };
@@ -4779,7 +5040,7 @@ mod tests {
         let Some(dest_rect) = intersect(dst, affine_dest_bbox(m)) else {
             return;
         };
-        let Some(kernel) = resolve_kernel(mode, opa, false) else {
+        let Some(kernel) = resolve_kernel_on(mode, opa, false, DestAlpha::Straight) else {
             return;
         };
         affine_blit_generic(

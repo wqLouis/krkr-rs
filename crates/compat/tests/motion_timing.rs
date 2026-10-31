@@ -42,10 +42,10 @@ struct Env {
 }
 
 impl Env {
-    /// A VM whose storage is the reference `emote` fixture directory.
-    fn new() -> Env {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../reference/tests/test_files/emote");
+    /// A VM whose storage is the reference `emote` fixture directory, or
+    /// `None` when the reference checkout is not available.
+    fn with_reference_storage() -> Option<Env> {
+        let dir = testkit::reference_fixture_or_skip("emote")?;
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut scene = Box::new(Scene::default());
         let mut storage = Box::new(
@@ -67,12 +67,12 @@ impl Env {
         }
         host.install(&engine).expect("install compat surface");
         common::link_all_builtins(&engine);
-        Env {
+        Some(Env {
             _host: host,
             engine,
             _scene: scene,
             _storage: storage,
-        }
+        })
     }
 
     fn run(&self, script: &str) {
@@ -134,7 +134,9 @@ impl Env {
 #[test]
 fn a_delta_counts_at_sixty_frames_a_second() {
     let _lock = vm_lock();
-    let env = Env::new();
+    let Some(env) = Env::with_reference_storage() else {
+        return;
+    };
     env.start("p1");
     // The tick that follows the play is swallowed by the frame gate
     // (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:819-826`).
@@ -162,7 +164,9 @@ fn a_delta_counts_at_sixty_frames_a_second() {
 #[test]
 fn one_update_advances_the_clock_by_the_whole_delta() {
     let _lock = vm_lock();
-    let env = Env::new();
+    let Some(env) = Env::with_reference_storage() else {
+        return;
+    };
     env.start("p1");
     env.run("p1.progress(0);");
     env.run("p1.progress(100);");
@@ -188,7 +192,9 @@ fn one_update_advances_the_clock_by_the_whole_delta() {
 #[test]
 fn six_updates_end_at_the_same_clock_as_one() {
     let _lock = vm_lock();
-    let env = Env::new();
+    let Some(env) = Env::with_reference_storage() else {
+        return;
+    };
     env.start("p1");
     env.run("p1.progress(0);");
     env.run("p1.progress(100);");
@@ -214,7 +220,9 @@ fn six_updates_end_at_the_same_clock_as_one() {
 #[test]
 fn a_one_shot_clip_stops_at_its_last_frame() {
     let _lock = vm_lock();
-    let env = Env::new();
+    let Some(env) = Env::with_reference_storage() else {
+        return;
+    };
     env.start("p1");
     env.run("p1.progress(0);");
     env.run("var before = p1.getPlayingTimelineInfoList();");

@@ -265,8 +265,15 @@ impl EventAdapter {
     ///
     /// This is the batch entry point the VM host's frame body uses: every
     /// event is applied to the L2 input state, mapped and delivered, in the
-    /// order the platform produced it. No event is merged with another and
-    /// none is dropped.
+    /// order the platform produced it. Two of the deliveries are narrowed:
+    ///
+    /// * the window's `onMouseMove` is posted discardable, so a newer move of
+    ///   the batch replaces the pending one and the window's handler runs once,
+    ///   with the newest position;
+    /// * the layer's `onMouseMove` fires only when the pointer position changed
+    ///   since the previous move; the hit test still runs on every move.
+    ///
+    /// Every other event is delivered as it arrived.
     ///
     /// The frame stops dispatching when its dispatch time reaches the
     /// budget (see [`EventAdapter::with_dispatch_budget`]). The events that

@@ -52,6 +52,13 @@ compiler-free check but may not run the build gate. `gate --no-cargo` runs the
 checks only, and `gate --keep-going` reports every failure instead of stopping
 at the first one.
 
+Steps 11, 19 and 20 read the reference checkout, which is not part of this
+repository. It is `<repo>/reference` unless the run names another one:
+`krkr-gate --reference PATH <check>` sets `KRKR_REFERENCE` for the run, and
+`krkr-gate --reference PATH gate` hands it to every step. Those three checks
+fail with the paths they tried rather than scanning nothing, so a clone kept
+somewhere else needs the option (or the variable) on every run.
+
 The gate does **not** run the test suites. A change is done only when both the
 static gate and the tests are green.
 

@@ -236,7 +236,7 @@ four operations — create an interval, set an interval, arm or disarm,
 remove — and its pump is a free function the engine's frame calls:
 
 ```rust
-pub fn deliver_due(registry: &mut TimerState, now_ms: u64) -> usize;
+pub fn deliver_due(registry: &mut TimerState, now_ms: u64) -> u64;
 ```
 
 The compatibility layer arms timers and never advances them. The layer above

@@ -208,10 +208,23 @@ pub fn font_metrics(fs: &FontSystem, font: &Font, size_px: f32) -> FontMetrics;
 ```
 
 The rasterization core reproduces the reference's missing-glyph fallback, the
-synthetic bold (1 px right dilation plus an advance bump) and the synthetic
-oblique slant (0.25, the conventional ~14°). Unlike the old atlas, the API
-returns **per-glyph coverage positioned by its bearings** instead of packing
-pixels into a shared RGBA cell.
+synthetic bold (1 px right dilation plus the same pixel in the advance) and the
+synthetic oblique slant (0.25, the conventional ~14°). Unlike the old atlas,
+the API returns **per-glyph coverage positioned by its bearings** instead of
+packing pixels into a shared RGBA cell.
+
+The bold advance is the same for a measurement and a drawing: `glyph_advance`
+and the `advance` field of `rasterize_glyph` both report the face's advance
+plus one pixel, so a run that is measured and then drawn lays out the same
+way. **Approximation:** the reference draws through FreeType's
+`FT_GlyphSlot_Embolden` and measures the emboldened slot afterwards
+(`reference/krkr2/cpp/core/visual/FreeType.cpp:675-677` emboldens inside
+`LoadGlyphSlotFromCharcode`, and `:620-627` reads
+`glyph->metrics.horiAdvance` from it, which is what
+`reference/krkr2/cpp/core/visual/FreeTypeFontRasterizer.cpp:139-152` reports as
+the width). That embolden grows the advance by `em / 24`, so the port's fixed
+one pixel matches a 24 px em exactly and understates the advance for larger
+sizes (two pixels at 48 px, three at 72 px).
 
 A non-positive or non-finite `size_px` is `GlyphError::Rasterize` from
 `rasterize_glyph` and the default metrics from `font_metrics`; a control

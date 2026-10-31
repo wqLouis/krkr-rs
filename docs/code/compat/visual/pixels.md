@@ -191,10 +191,36 @@ a type change resolves the face again.
 The face selects the blend a method runs, and the layer's `holdAlpha`
 property is the argument the *copy* methods take: the methods that handle the
 destination's alpha themselves ignore it. The copy family passes it on the
-opaque face alone — the alpha faces copy the source's own alpha — and the
-blend family passes it at the full opacity only. The pile family ignores it
-at every opacity. The `operate*` methods take their blend from the operation
-mode and pass the flag when the resolved mode is the copy.
+opaque face alone — the alpha faces copy the source's own alpha — and at the
+full opacity alone, because the below-full-opacity spelling is the same with
+and without it. The blend family passes it at the full opacity only. The pile
+family ignores it at every opacity. The `operate*` methods take their blend
+from the operation mode and pass the flag when the resolved mode is the copy,
+at the full opacity.
+
+The face also names the destination's **stored alpha handling**, and that
+reaches the engine as the generic `DestAlpha`: `dfAlpha` is a straight alpha,
+`dfOpaque` is none, and `dfAddAlpha` is an additive (premultiplied) alpha.
+Three of the nine operation-mode/face pairs have their own additive-alpha
+spelling, and the facet must use it — the additive-alpha destination's
+stored colour is premultiplied, so the straight-alpha kernel would leave a
+different pixel behind:
+
+| Pair | Method | Blend |
+|---|---|---|
+| `omAlpha` + `dfAlpha` | `bmAlphaOnAlpha` | the alpha-correct source-over |
+| `omAlpha` + `dfOpaque` | `bmAlpha` | the channel mix, the alpha held |
+| `omAlpha` + `dfAddAlpha` | `bmAlphaOnAddAlpha` | the premultiplied source-over |
+| `omAddAlpha` + `dfAlpha` | `bmAddAlphaOnAlpha` | **no implementation: the pass draws nothing** |
+| `omAddAlpha` + `dfOpaque` | `bmAddAlpha` | the additive-alpha blend, the alpha held |
+| `omAddAlpha` + `dfAddAlpha` | `bmAddAlphaOnAddAlpha` | the additive blend |
+| `omOpaque` + `dfAlpha` | `bmCopyOnAlpha` | the copy of an opaque source |
+| `omOpaque` + `dfOpaque` | `bmCopy` | the plain copy, holdable |
+| `omOpaque` + `dfAddAlpha` | `bmCopyOnAddAlpha` | the copy of an opaque source; **nothing at the full opacity when the layer holds its alpha**, because the method has no hold spelling |
+
+Every other operation mode names one method whatever the face, and its kernel
+is the same on an additive-alpha destination. See
+[`layer_ops.md`](../../engine/layer_ops.md) §4 for the kernels.
 
 ### Below the full opacity
 
@@ -209,7 +235,7 @@ the opacity scales the source's alpha in the mix.
 
 | Method | Accepted faces |
 |---|---|
-| `operateRect`, `operateStretch`, `operateAffine` | the face-**sensitive** modes need `dfAlpha`/`dfOpaque`/`dfAddAlpha`; the face-independent modes accept any |
+| `operateRect`, `operateStretch`, `operateAffine` | the face-**sensitive** modes need `dfAlpha`/`dfOpaque`/`dfAddAlpha` and select the method from the pair (see *The destination alpha*); the face-independent modes accept any |
 | `copyRect` | dispatches per face — `dfAlpha`/`dfAddAlpha` the plain copy; `dfOpaque` the plain copy with the destination's alpha held iff `holdAlpha`; `dfMask` the alpha only; `dfProvince` zeroes the province region; **any other face is a silent no-op**, matching the reference's missing `default:` case |
 | the copy family (`stretchCopy`, `affineCopy`) | `dfAlpha`/`dfAddAlpha`/`dfOpaque` — the plain copy on every face; the destination's alpha is held on `dfOpaque` iff `holdAlpha` |
 | the pile family (`pileRect`, `stretchPile`, `affinePile`) | `dfAlpha`/`dfOpaque` — `dfAlpha` the alpha-correct source-over, `dfOpaque` the channel mix |
@@ -430,14 +456,14 @@ as the layer-bound `Font` wrapper.
 | `"Layer.<method>: Layer: the main-image image {id} does not hold its pixels"` | the main image declares more pixels than its buffer holds |
 | `"Layer.<method> requires N argument(s)"` | the arity checks |
 | `"Layer.<method>: unsupported draw face {face}"` | a rejected face |
-| `"Layer: the operation mode {mode} cannot draw on draw face {face}"` | a face-sensitive mode on an incompatible face |
+| `"Not drawble face type {method}"` | a face-sensitive mode on a face it does not know, or an operation mode the layer does not know (the raise's text, spelling included) |
 | `"Layer: the source must be a Layer object"` | a `Bitmap` passed to a Layer-only member |
 | `"Layer: the source is not a Layer or Bitmap object"` | an unresolvable source |
 | `"Layer: the source layer has no main image"` | the source layer is imageless |
 | `"Layer: the layer image {id} does not hold its pixels"` | the text path's main image declares more pixels than its buffer holds |
 | `"Layer: the destination image {id} does not hold its pixels"`, `"Layer: the source image {id} does not hold its pixels"` | a blit copies between images that declare more pixels than their buffers hold |
 | `"Layer: the destination bitmap {id} does not exist"`, `"Layer: the source bitmap {id} does not exist"` | the blit's image is gone |
-| `"Layer.colorRect: negative opacity is not supported on dfAddAlpha"` | a negative opacity on the add-alpha face |
+| `"Layer.colorRect: Negative opacity not supported on this face"` | a negative opacity on the add-alpha face (the `drawText`/`drawGlyph` path raises the same text, without the `Layer.colorRect: ` prefix) |
 | `"Layer.convertType: cannot convert the layer type in the given direction"` | an unsupported conversion direction |
 | `"Layer.gaussianBlur: radius must be positive"`, `"Layer.gaussianBlur: sigma must be positive"` | a non-positive radius or sigma |
 | `"Layer.loadImages: storage not found: {name}"` | the image does not resolve |
@@ -465,6 +491,9 @@ These are **not** errors — they match the reference:
   logs and returns);
 * `copyRect` and `colorRect` on an out-of-vocabulary face fall through
   silently;
+* `operateRect`, `pileRect` and `blendRect` with a zero opacity leave the
+  destination untouched, and so do the two pairs above whose method has no
+  implementation or no hold spelling;
 * `adjustGamma` with zero arguments is a valid no-op;
 * `doBoxBlur` with `xblur == 0 && yblur == 0` returns without touching the
   image.

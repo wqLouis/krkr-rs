@@ -924,6 +924,30 @@ impl Scene {
         }
     }
 
+    /// Move a window to the front of the draw order.
+    ///
+    /// The scene draws its windows in the order it holds them and the last
+    /// one is the front-most, so showing a window moves it to the end: the
+    /// front window both draws on top and owns the pointer.
+    ///
+    /// Returns true when the window was present.
+    pub fn bring_window_to_front(&mut self, id: u32) -> bool {
+        let Some(index) = self.windows.iter().position(|window| window.id == id) else {
+            return false;
+        };
+        if index + 1 == self.windows.len() {
+            return true;
+        }
+        let window = self.windows.remove(index);
+        self.windows.push(window);
+        self.window_index.clear();
+        for (index, window) in self.windows.iter().enumerate() {
+            self.window_index.insert(window.id, index);
+        }
+        self.touch_structure();
+        true
+    }
+
     /// Remove a window record; the window's layers survive until their own
     /// script objects are finalized.
     ///

@@ -121,23 +121,32 @@ projection draws the two sources, so nothing is written to a bitmap per tick
 
 ## 4. Invariants
 
-* **Straight alpha everywhere.** The operations run on the straight-alpha
-  channels; the additive-alpha variants convert explicitly.
-* **The blend of a pass is resolved once.** The operation mode selects the
-  kernel, the compatibility layer resolves the draw face's variant of the
-  face-sensitive modes, and the per-pixel loop only applies the resolved
-  kernel. The kernels follow the reference's blend methods
-  (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3402-3411`,
-  `:3474-3482`, `:3549-3556`): the alpha blend takes the destination's
+* **The pixel arithmetic follows the destination's stored alpha.** The layer
+  bitmaps are straight-alpha RGBA8, and a pass whose destination stores an
+  additive (premultiplied) alpha reads and writes that model through its own
+  kernels; the additive-alpha conversions otherwise remain explicit
+  (`convert_alpha_to_add_alpha`, `convert_add_alpha_to_alpha`).
+* **The blend of a pass is resolved once.** The operation mode and the
+  destination's stored alpha select the kernel, the compatibility layer
+  resolves the draw face's variant of the face-sensitive modes, and the
+  per-pixel loop only applies the resolved kernel. The three face-sensitive
+  modes and the Photoshop family follow the reference's blend shapes
+  (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3401-3410`,
+  `:3499-3507`, `:3555-3558`): the alpha blend takes the destination's
   alpha into the mix, the channel mix (the Photoshop modes and the opaque
-  face's alpha blend) does not and holds the destination's alpha, and the
-  per-channel Photoshop functions are the tree's CPU twins
-  (`reference/cpp/core/visual/gl/blend_functor_c.h:374-660`).
+  face's alpha blend) does not and holds the destination's alpha, the
+  premultiplied over (`AlphaOnAddAlpha`) and the additive-alpha blend
+  (`AddAlphaOnAddAlpha`, `AddAlpha`) follow the additive-alpha destination's
+  model, and the per-channel Photoshop functions are the tree's CPU twins
+  (`reference/cpp/core/visual/gl/blend_functor_c.h:374-660`). The eight modes
+  below the Photoshop family have a kernel each that ports the software
+  renderer's functor for that mode (§[The non-Photoshop operation
+  modes](#the-non-photoshop-operation-modes)).
 
 ### The blend family and where each formula comes from
 
-The reference has three blend shapes, and every operation mode names one of
-them:
+The reference has three blend shapes, and the alpha and Photoshop operation
+modes name one of them:
 
 | shape | what it does | the reference |
 |---|---|---|
@@ -180,6 +189,50 @@ is not the full one
 (`reference/cpp/core/visual/tvpps.inc:16-24`). The integer twins truncate
 the product by eight bits, so a channel can land one unit below the value
 the floating-point shader computes.
+
+### The non-Photoshop operation modes
+
+`AddBlend`, `SubBlend`, `MulBlend_HDA`, `ColorDodgeBlend`, `DarkenBlend`,
+`LightenBlend`, `ScreenBlend` and `AdditiveAlphaBlend` are
+`tTVPRenderMethod_BltAndOpa` methods
+(`reference/cpp/core/visual/RenderManager.cpp:2831-2890`): at the full
+opacity each runs its mode's plain functor, below it the `_o` functor, whose
+fade or mix truncates by eight bits. A kernel is those two expressions with the
+dispatch on the opacity kept:
+
+| mode | kernel | the functor it ports |
+|---|---|---|
+| `omAdditive` | the saturating `d + s` at the full opacity, the saturating `d + ((s * opa) >> 8)` below it | `add_blend_functor` / `add_blend_func` (`reference/cpp/core/visual/gl/blend_functor_c.h:182-198`) |
+| `omSubtractive` | `max(0, d - (255 - s))` at the full opacity, `max(0, d - (((255 - s) * opa) >> 8))` below it | `sub_blend_functor` / `sub_blend_func` (`:202-217`) |
+| `omMultiplicative` | `(d * s) >> 8` at the full opacity, `(d * (255 - (((255 - s) * opa) >> 8))) >> 8` below it | `mul_blend_functor` / `mul_blend_func` (`:222-240`) |
+| `omDodge` | `(d * 65536 / (255 - s')) >> 8` with the reciprocal 65536 at `s' = 255`, where `s' = s` at the full opacity and `s' = (s * opa) >> 8` below it | `color_dodge_blend_functor` / `color_dodge_blend_func` (`:243-263`) |
+| `omDarken` | `min(d, s)` at the full opacity, `d + (((min(d, s) - d) * opa) >> 8)` below it | `darken_blend_functor` / `darken_blend_func` (`:268-292`) |
+| `omLighten` | `max(d, s)` at the full opacity, `d + (((max(d, s) - d) * opa) >> 8)` below it | `lighten_blend_functor` / `lighten_blend_func` (`:297-322`) |
+| `omScreen` | `255 - (((255 - d) * (255 - s)) >> 8)` at the full opacity, `255 - (((255 - d) * (255 - ((s * opa) >> 8))) >> 8)` below it | `screen_blend_functor` (`:326-336`) / `screen_blend_HDA_o_func` (`:350-362`) |
+| `omAddAlpha` | `((d * (255 - sa)) >> 8) + s` at the full opacity, `((d * (255 - ((sa * opa) >> 8))) >> 8) + ((s * opa) >> 8)` below it, saturated | `premulalpha_blend_n_a_func` (`reference/cpp/core/visual/gl/blend_util_func.h:35-43`) and its faded HDA wrapper (`reference/cpp/core/visual/gl/blend_functor_c.h:132-147`) |
+
+Every one of the eight kernels evaluates its functor's integer expressions
+exactly, including the dispatch between the plain and the faded variant at the
+full opacity, and every one holds the destination's alpha, because the
+registered methods are the HDA variants
+(`reference/cpp/core/visual/gl/blend_variation.h:84-105`).
+
+**The graphics path is an approximation of the same curves.** Its programs
+(`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3586-3692`) mix in
+floating point over `opa / 255` where the software functors truncate by eight
+bits, so the two agree at the full and the zero opacity and can land one or
+two levels apart in between: measured over every destination and source byte
+and eight opacities, the largest gap is two levels for the multiplicative and
+screen kernels, one for additive, subtractive, darken and lighten, and three
+for add-alpha; the dodge is worse near a source of 255, where its reciprocal
+amplifies the fade's one-level difference (85 levels at `s = 254` with
+`opa = 254` in that sweep). The subtractive mode shows the shape of the
+difference — its shader is `d - (1 - s) * opa` (`:3593-3602`) against the
+functor's
+`max(0, d + s' - 255)` (`reference/cpp/core/visual/gl/blend_functor_c.h:202-217`).
+The port follows the software functor, the path a script's pixels came from on
+the reference platform, and `crates/engine/tests/blend_family.rs` derives its
+values from it.
 * **Every write is clipped** to the destination bitmap's bounds and to the
   supplied clip rectangle. A write outside the clip is dropped, not clamped.
 * **A write marks the bitmap dirty**, so the engine re-uploads it on the next
@@ -284,9 +337,11 @@ render_layer_subtree(scene, root)
   follows the reference's blend method
   (`reference/cpp/core/visual/LayerIntf.cpp:4118-4271`): the alpha blend
   that takes the destination's alpha into the mix, the channel mix that does
-  not (the Photoshop modes and the opaque face's alpha blend), and the
-  per-channel Photoshop functions. An operation mode the reference does not
-  know is rejected by the compatibility layer before the pass runs.
+  not (the Photoshop modes and the opaque face's alpha blend), the
+  premultiplied over and additive blends an additive-alpha destination
+  takes, and the per-channel Photoshop functions. An operation mode the
+  reference does not know is rejected by the compatibility layer before the
+  pass runs.
 * **`do_blur_light` uses the hard-light blend only for `ltPsHardLight`
   (= 19)**; every other light type composites source-over.
 
@@ -296,6 +351,8 @@ render_layer_subtree(scene, root)
 
 * `crates/engine/tests/layer_ops.rs` — the fills, the blits, the clip
   behaviour, the colour conversions, the blur and the transition slots.
+* `crates/engine/tests/blend_family.rs` — the operation-mode blend family,
+  one kernel per mode, at a full and at a partial opacity.
 * `crates/engine/src/layer_ops.rs` `mod tests` — the unit-level invariants.
 
 ---

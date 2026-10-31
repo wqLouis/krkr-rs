@@ -14,7 +14,7 @@ There is no one-shot mode, no fire budget and no suppression flag — L2's only
 job is "wait, then call".
 
 A frame that took longer than the timer's interval **replays the intervals it
-missed**: the timer fires once per elapsed interval and its next deadline
+missed**: the timer reports one fire per elapsed interval and its next deadline
 continues the schedule it missed, so the timer keeps its place in the
 schedule instead of drifting with the frame rate
 (`reference/cpp/core/utils/impl/TimerImpl.cpp:118-148`).
@@ -85,7 +85,7 @@ impl TimerState {
     pub fn remove(&mut self, id: TimerId) -> Result<(), TimerError>;
     pub fn set_interval(&mut self, id: TimerId, interval_ms: u64) -> Result<(), TimerError>;
     pub fn set_enabled(&mut self, id: TimerId, enabled: bool) -> Result<(), TimerError>;
-    pub fn advance(&mut self, now_ms: u64) -> usize;
+    pub fn advance(&mut self, now_ms: u64) -> u64;
 }
 ```
 
@@ -117,9 +117,9 @@ phases:
 1. **Collect first.** Every due timer is collected in creation order and
    re-armed *before* any callback runs. No phase iterates a collection it is
    mutating, and a nested `advance` can never deliver the same timer twice
-   in one round. A timer that missed intervals fires once per missed interval
-   and is re-armed from the deadline it missed, so a late frame replays the
-   intervals it lost instead of making the schedule drift.
+   in one round. A timer that missed intervals reports the whole count in one
+   call and is re-armed from the deadline it missed, so a late frame replays
+   the intervals it lost instead of making the schedule drift.
 2. **Then invoke.** The callback box is *taken out* of the entry before the
    call, so the entry is plain registry state while the callback runs. A
    collected timer fires only if its schedule is untouched since collection:
@@ -140,12 +140,25 @@ and dropped entirely within one callback invocation, strictly sequential with
 ## 6. Invariants
 
 * **A timer fires once per elapsed interval.** A timer whose deadline
-  passed by `n` intervals fires `n + 1` times in that advance — the missed
+  passed by `n` intervals reports `n + 1` fires in that advance — the missed
   intervals are replayed — and its next deadline is the deadline it missed
-  plus the intervals it fired, so the schedule does not drift. A backlog of
-  more than 40 intervals is discarded: the timer fires once and re-arms from
-  the injected now
+  plus the intervals it fired, so the schedule does not drift
   (`reference/cpp/core/utils/impl/TimerImpl.cpp:118-148`).
+* **The replay is one call, not one call per interval.** The count is handed
+  to the callback in a single invocation, so a frame that covered a million
+  intervals costs one call per timer; deciding how many fires become visible
+  is the delivery's job (L3 clamps to the timer's capacity), not the
+  registry's. See [`../compat/visual/timer.md`](../compat/visual/timer.md).
+* **The registry has no backlog cap, and that is a recorded approximation.**
+  The reference's timer thread wakes at the next deadline, so it never
+  accumulates a backlog, and its `n > 40` branch exists for a thread that was
+  starved: it delivers one event (`reference/cpp/core/utils/impl/TimerImpl.cpp:112-148`).
+  This registry is pumped by the frame, so a frame longer than forty intervals
+  *is* that case, and replaying it delivers the timer's capacity (six by
+  default) where the reference's starvation guard delivers one
+  (`reference/cpp/core/utils/TimerIntf.cpp:69-111`). Collapsing the replay to
+  one fire would be the wrong model — it would drop the intervals the frame
+  covered — so the divergence is kept and recorded here and in `TODO.md`.
 * **A timer whose schedule was mutated between collection and delivery is
   skipped** — the mutation cancelled its pending fire. A timer removed
   mid-round has no entry left to invoke.
@@ -159,7 +172,9 @@ and dropped entirely within one callback invocation, strictly sequential with
   cancels the pending fire. A disarmed timer only stores the interval.
 * **Delivery order is creation order**, because the id is monotonic and the
   registry is an ordered map.
-* **`advance` returns the number of callbacks invoked.**
+* **`advance` returns the number of fires handed to the callbacks** — the
+  sum of the per-delivery replay counts, which equals the invocations only
+  when every timer is an interval late or less.
 
 ---
 
@@ -171,8 +186,8 @@ Engine::frame(now_ms)
    ▼
 timer::deliver_due(&mut timer, now_ms)
    ├─ collect the due timers in creation order, re-armed from the deadline
-   │  they missed (one fire per missed interval, up to the cap)
-   └─ invoke each callback with its TimerId
+   │  they missed (the replay count goes with the call)
+   └─ invoke each callback once with its TimerId and the count
           │
           ▼
       L3's dispatch closure ──► the VM posts the script's onTimer event

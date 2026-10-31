@@ -177,7 +177,12 @@ fn step_keeps_the_fractional_millisecond_across_frames() {
         .timer_mut()
         .create_interval(
             16,
-            Box::new(move |_id| counter.set(counter.get().saturating_add(1))),
+            // The callback receives the replay count, so the counter is the
+            // number of fires, not of invocations.
+            Box::new(move |_id, fires| {
+                let fires = u32::try_from(fires).expect("a replay count that fits");
+                counter.set(counter.get().saturating_add(fires))
+            }),
         )
         .expect("timer");
     let mut hooks = Recorder::default();
@@ -308,7 +313,12 @@ fn timer_callback_fires_inside_step() {
         .timer_mut()
         .create_interval(
             10,
-            Box::new(move |_id| counter.set(counter.get().saturating_add(1))),
+            // The callback receives the replay count, so the counter is the
+            // number of fires, not of invocations.
+            Box::new(move |_id, fires| {
+                let fires = u32::try_from(fires).expect("a replay count that fits");
+                counter.set(counter.get().saturating_add(fires))
+            }),
         )
         .expect("timer");
 
@@ -663,8 +673,10 @@ fn a_skipped_frame_still_runs_the_hook_and_its_due_timers() {
     engine.scene_mut().layer_mut(primary).expect("primary").rect = Rect::new(0, 0, 0, 0);
     let fired = Rc::new(Cell::new(0u32));
     let hits = Rc::clone(&fired);
-    let callback: engine::timer::TimerCallback =
-        Box::new(move |_| hits.set(hits.get().saturating_add(1)));
+    let callback: engine::timer::TimerCallback = Box::new(move |_, fires| {
+        let fires = u32::try_from(fires).expect("a replay count that fits");
+        hits.set(hits.get().saturating_add(fires));
+    });
     engine
         .timer_mut()
         .create_interval(10, callback)

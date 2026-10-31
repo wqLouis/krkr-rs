@@ -364,7 +364,8 @@ pub struct GameHost {
     vm: VmHost,
     /// The mounted game archives, read by the `Storages` natives.
     storage: Box<Storage>,
-    /// The L2 engine host, boxed for a stable scene/timer/input address.
+    /// The L2 engine host, boxed so the scene, timer, input and clock
+    /// addresses the compatibility layer holds stay stable.
     host: Box<Host>,
     /// The ordered frame body.
     polls: Polls,
@@ -380,7 +381,7 @@ pub struct GameHost {
 /// The engine's frame hook for a running game: the VM tick, the audio drain it
 /// feeds, and the ordered polls.
 ///
-/// [`Engine::step`](engine::Engine::step) calls it after firing the due timers
+/// [`Engine::run`](engine::Engine::run) calls it after firing the due timers
 /// and before projecting and drawing, so the scene the VM left behind is the
 /// one the frame presents.
 struct VmHook<'a> {
@@ -402,7 +403,10 @@ struct VmHook<'a> {
 }
 
 impl GameFrame for VmHook<'_> {
-    fn before_render(&mut self, now_ms: u64, dt_ms: f64) -> Result<(), String> {
+    // The frame's clock and delta are L2's: the polls that need the time read
+    // the attached clock, so this hook takes only the delta its audio pump
+    // needs.
+    fn before_render(&mut self, _now_ms: u64, dt_ms: f64) -> Result<(), String> {
         let hook_started = Instant::now();
         // A movie's picture advances by the same bound the audio pump puts on
         // one frame's playback, so a long frame leaves the picture and the
@@ -424,8 +428,6 @@ impl GameFrame for VmHook<'_> {
         });
         let events: &[PlatformEvent] = translated.as_deref().unwrap_or(source);
         let frame = FrameCtx {
-            now_ms,
-            dt_ms: dt_ms as u32,
             body: &mut *self.polls,
             events,
         };
@@ -609,6 +611,10 @@ impl GameHost {
             .engine_mut()
             .decode_pool_mut()
             .map_or(std::ptr::null_mut(), |pool| pool as *mut engine::DecodePool);
+        // The clock source the caller paces the frames from: the tick count
+        // reads it on demand, so a script sees the time move inside a frame.
+        // A host that attached none reports the frame clock.
+        let frame_time_ptr = host.frame_time_source();
         // SAFETY: `storage` and `host` are declared after `vm` in the returned
         // struct and therefore outlive it; the boxed `host` keeps the engine's
         // scene, timer, input and clock addresses stable, and nothing else
@@ -623,6 +629,9 @@ impl GameHost {
             services.attach_input(input_ptr);
             services.attach_clock(clock_ptr);
             services.attach_decode_pool(pool_ptr);
+            if let Some(source) = frame_time_ptr {
+                services.attach_frame_time(source);
+            }
         })?;
 
         // Install the seams the compat natives compose: the L1 codecs and the
@@ -947,10 +956,10 @@ fn directory_project(
 /// holds the boot scripts.
 ///
 /// The first candidate wins a tie, so the discovery order decides.
-fn data_archive<'a>(
-    candidates: &'a [PathBuf],
+fn data_archive(
+    candidates: &[PathBuf],
     boot_script_count: impl Fn(&Path) -> Option<usize>,
-) -> Option<&'a Path> {
+) -> Option<&Path> {
     let mut best: Option<(&Path, usize)> = None;
     for path in candidates {
         let Some(entries) = boot_script_count(path) else {

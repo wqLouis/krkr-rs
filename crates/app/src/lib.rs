@@ -45,10 +45,51 @@ use render::{
 };
 
 pub(crate) use audio::install_audio_decoder_metered;
-// The clock source the composition roots inject the frame's elapsed time
-// into: the windowed loop writes the real time the platform measured, the
-// headless runner writes the time it measured between its frames.
+// The clock source seam, and the source the windowed loops use: the platform
+// measures the elapsed time between frames and the source reports the real
+// clock that measurement comes from, so the script's tick count moves inside a
+// frame.
 pub use engine::{FrameTimeSource, InjectedFrameTime};
+
+/// The windowed loop's clock source.
+///
+/// The platform measures the elapsed time between frames and the loop writes it
+/// into [`Self::elapsed_ms`] before the frame; the source's reading is the real
+/// clock that measurement comes from. A source's address is handed to the
+/// compatibility layer once, so a host owns one of these in a `Box`.
+pub struct PlatformFrameTime {
+    /// The instant the frames' time is measured from.
+    started: std::time::Instant,
+    /// The milliseconds the platform measured since the previous frame.
+    pub elapsed_ms: f64,
+}
+
+impl PlatformFrameTime {
+    /// A source whose reading starts at zero now.
+    pub fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            elapsed_ms: 0.0,
+        }
+    }
+}
+
+impl Default for PlatformFrameTime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameTimeSource for PlatformFrameTime {
+    fn elapsed_ms(&self) -> f64 {
+        self.elapsed_ms
+    }
+
+    fn now_ms(&self) -> f64 {
+        self.started.elapsed().as_secs_f64() * 1000.0
+    }
+}
+
 pub use game::{GameError, GameHost};
 pub use image_codec::install_image_codec;
 pub(crate) use image_codec::{install_image_codec_metered, install_image_decoder};
@@ -207,6 +248,14 @@ pub struct Host {
     /// The middle-layer engine: scene, projection, textures, timers, input
     /// and the frame clock.
     engine: engine::Engine,
+    /// The clock source the composition root paces the frames from, when it
+    /// attached one.
+    ///
+    /// [`GameHost::open`](crate::GameHost::open) hands it to the compatibility layer,
+    /// where `System.getTickCount` reads it on demand. The pointer is the
+    /// caller's: it must be the source every [`Host::step`] is given, and it
+    /// must outlive the game that reads it.
+    frame_time: Option<*const (dyn FrameTimeSource + 'static)>,
 }
 
 /// A frame hook that does nothing, for a host with no game above it.
@@ -282,7 +331,40 @@ impl Host {
             engine.scene_mut().set_decoded_image_cache_limit(limit);
         }
 
-        Ok(Self { engine })
+        Ok(Self {
+            engine,
+            frame_time: None,
+        })
+    }
+
+    /// Points the script's tick count at the clock source the frames are paced
+    /// from.
+    ///
+    /// This is the source every [`Host::step`] must be given, and it must
+    /// outlive the game opened over this host: `System.getTickCount` reads it on
+    /// demand, so the tick count moves inside a frame instead of only at a
+    /// frame boundary. A host with no source reports the frame clock as its
+    /// tick count.
+    ///
+    /// The pointer is the caller's promise, the same shape the compatibility
+    /// layer's `attach_*` takes: the source must stay alive, and must be the one
+    /// the host is stepped with, for as long as the game reads it. A composition
+    /// root owns its source in a `Box`, so the address does not move.
+    pub fn with_frame_time_source(
+        mut self,
+        source: *const (dyn FrameTimeSource + 'static),
+    ) -> Self {
+        if source.is_null() {
+            self.frame_time = None;
+        } else {
+            self.frame_time = Some(source);
+        }
+        self
+    }
+
+    /// The clock source the composition root attached, if any.
+    pub(crate) fn frame_time_source(&self) -> Option<*const (dyn FrameTimeSource + 'static)> {
+        self.frame_time
     }
 
     /// Advances the host by one frame and presents it.
@@ -298,7 +380,7 @@ impl Host {
     ///
     /// Returns [`HostError`] when the frame hook, the overlay or a render
     /// action fails.
-    pub fn step(&mut self, clock: &dyn engine::FrameTimeSource) -> Result<StepReport, HostError> {
+    pub fn step(&mut self, clock: &dyn FrameTimeSource) -> Result<StepReport, HostError> {
         self.step_with_frame(clock, &mut EmptyFrame)
     }
 
@@ -314,7 +396,7 @@ impl Host {
     /// [`HostError::Frame`].
     pub(crate) fn step_with_frame(
         &mut self,
-        clock: &dyn engine::FrameTimeSource,
+        clock: &dyn FrameTimeSource,
         hooks: &mut dyn engine::GameFrame,
     ) -> Result<StepReport, HostError> {
         Ok(self.engine.run(clock, hooks)?)

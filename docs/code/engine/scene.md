@@ -78,7 +78,8 @@ re-projecting.
 
 ### Windows
 
-`add_window`, `window`, `window_mut`, `remove_window`.
+`add_window`, `window`, `window_mut`, `remove_window`,
+`bring_window_to_front`.
 
 `remove_window` drops **only** the window record. Its layers keep their
 records: a layer's native state belongs to the layer's **script object**, so

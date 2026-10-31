@@ -283,7 +283,7 @@ process-wide binding between the engine and the context.
 
 * `CompatServices` holds explicit handles to the L2 services the natives
   compose: `attach_scene`, `attach_storage`, `attach_input`, `attach_timer`,
-  `attach_clock`.
+  `attach_clock`, `attach_frame_time`.
 * The attachment is `unsafe`, and the invariant is: **the pointed-to value must
   stay alive for as long as the binding is installed** (the VM's lifetime).
   Detaching and teardown happen before the L2 owner is dropped. A value that

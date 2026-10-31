@@ -5,23 +5,44 @@
 //! wall clock is read here, and nothing above this layer keeps a second time
 //! base of its own.
 
-/// The source of a frame's elapsed time.
+/// The source of the frame's time.
 ///
-/// The engine owns the clock it advances; the caller owns where the elapsed
-/// time comes from. The windowed loop injects the real time the platform
-/// measured, the headless runner injects the time it measured between its
-/// frames, and a test injects whatever it needs. One source per run: every
-/// timeline the frame derives comes from the value this reports.
+/// The engine owns the clock it advances; the caller owns where the time comes
+/// from. The windowed loop injects the real time the platform measured, the
+/// headless runner injects the time it measured between its frames, and a test
+/// injects whatever it needs. One source per run: every timeline the frame
+/// derives comes from the value this reports.
+///
+/// The source is read at **two** moments, and both readings are the same base:
+/// the frame reads [`FrameTimeSource::elapsed_ms`] at each boundary and adds it
+/// to the clock, and the script's tick count reads
+/// [`FrameTimeSource::now_ms`] when the script asks. A source that measures
+/// real time therefore moves the script's clock inside a frame; a source that
+/// injects a fixed frame time has no reading of its own, and the tick count
+/// stays the frame clock.
 pub trait FrameTimeSource {
     /// The milliseconds elapsed since the previous frame.
+    ///
+    /// The engine adds this to its clock when the frame starts.
     fn elapsed_ms(&self) -> f64;
+
+    /// The source's current reading, in milliseconds on the same base as
+    /// [`FrameTimeSource::elapsed_ms`].
+    ///
+    /// This is read on demand — once per `System.getTickCount` call and nowhere
+    /// else — so it must answer with the clock's value *now* and not with a
+    /// cached frame boundary. A source that measures real time answers with the
+    /// time elapsed since the run started; [`InjectedFrameTime`] answers with
+    /// the frame time it was given, because a simulated frame has no clock
+    /// behind it.
+    fn now_ms(&self) -> f64;
 }
 
 /// A frame time the caller injects before every frame.
 ///
-/// The value is written from outside the engine: the windowed loop writes
-/// the real elapsed time the platform measured, the headless runner writes
-/// the time it measured between its frames.
+/// The value is written from outside the engine: a test injects the frame
+/// period it simulates. A host that measures real time owns its own source
+/// instead, so that its reading can move inside a frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct InjectedFrameTime {
     /// The milliseconds elapsed since the previous frame.
@@ -37,6 +58,17 @@ impl InjectedFrameTime {
 
 impl FrameTimeSource for InjectedFrameTime {
     fn elapsed_ms(&self) -> f64 {
+        self.elapsed_ms
+    }
+
+    /// The injected frame time itself.
+    ///
+    /// A simulated frame has no clock of its own: there is no moment between
+    /// two reads, so the reading is the frame time the caller injected. A
+    /// reader that has the frame clock takes the later of the two, so an
+    /// injected run's tick count stays the frame clock and a test remains
+    /// deterministic.
+    fn now_ms(&self) -> f64 {
         self.elapsed_ms
     }
 }

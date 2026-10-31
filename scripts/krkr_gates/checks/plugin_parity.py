@@ -90,7 +90,14 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..common import ALLOWLISTS_DIR, REPO_ROOT
+from ..common import (
+    ALLOWLISTS_DIR,
+    REPO_ROOT,
+    reference_citation,
+    reference_defined_macros,
+    reference_root,
+    reference_source_label,
+)
 from ..framework import (
     load_keyed_allowlist,
     strip_cpp_comments,
@@ -99,7 +106,8 @@ from ..framework import (
 
 from . import native_parity as np
 
-REFERENCE_DIR = REPO_ROOT / "reference" / "cpp" / "plugins"
+#: Where the reference's plugin sources live, under the resolved checkout.
+REFERENCE_SUBDIR = ("cpp", "plugins")
 RUST_PLUGINS_DIR = REPO_ROOT / "crates" / "compat" / "src" / "natives" / "plugins"
 # Core native classes (``Storages``, ``System``, ``Layer`` ...) live outside the
 # plugin tree; reference plugins attach members to them, so the whole natives
@@ -579,25 +587,27 @@ def _canon_class(name: str) -> str:
     return name[:1].upper() + name[1:] if name else name
 
 
-def _iter_reference_files() -> list[Path]:
-    if not REFERENCE_DIR.is_dir():
+def _iter_reference_files(root: Path) -> list[Path]:
+    directory = root.joinpath(*REFERENCE_SUBDIR)
+    if not directory.is_dir():
         raise SystemExit(
             "plugin_parity: reference plugins directory not found: "
-            f"{REFERENCE_DIR.relative_to(REPO_ROOT)}"
+            f"{reference_citation(directory, root)}"
         )
     files: list[Path] = []
     seen: set[str] = set()
     for pat in REFERENCE_GLOBS:
-        for fp in sorted(glob.glob(str(REFERENCE_DIR / pat), recursive=True)):
+        for fp in sorted(glob.glob(str(directory / pat), recursive=True)):
             if fp not in seen:
                 seen.add(fp)
                 files.append(Path(fp))
     if not files:
         raise SystemExit(
             f"plugin_parity: no reference plugin sources under "
-            f"{REFERENCE_DIR.relative_to(REPO_ROOT)} — update REFERENCE_GLOBS."
+            f"{reference_citation(directory, root)} — update REFERENCE_GLOBS."
         )
     return files
+
 
 
 def parse_reference(sources: "list[Path] | None" = None) -> ReferenceModel:
@@ -622,10 +632,12 @@ def parse_reference(sources: "list[Path] | None" = None) -> ReferenceModel:
     global_members: set[str] = set()
     propset_members: dict[str, set[str]] = {}
 
+    root = reference_root() if sources is None else None
+    defines = reference_defined_macros(root) if root is not None else frozenset()
     files: list[tuple[Path, str, list[tuple[int, int, str, "str | None", str]]]] = []
-    for fp in (sources if sources is not None else _iter_reference_files()):
+    for fp in (sources if sources is not None else _iter_reference_files(root)):
         raw = fp.read_text(encoding="utf-8", errors="replace")
-        src = _blank_directives(strip_cpp_comments(np._preprocess_cpp(raw)))
+        src = _blank_directives(strip_cpp_comments(np._preprocess_cpp(raw, defines)))
         files.append((fp, src, _collect_class_spans(src)))
 
     # Namespace nesting first: a namespace may attach a nested class defined
@@ -653,7 +665,7 @@ def parse_reference(sources: "list[Path] | None" = None) -> ReferenceModel:
         for var, method, flag, name_expr in _plugin_propset_sites(src):
             target = bindings.get(var)
             name = np._cpp_string_literal(name_expr)
-            rel = str(fp.relative_to(REPO_ROOT))
+            rel = reference_source_label(fp, root)
             if target == GLOBAL_CLASS:
                 if name:
                     global_members.add(name)

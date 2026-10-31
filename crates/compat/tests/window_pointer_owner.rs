@@ -105,3 +105,64 @@ fn a_hidden_window_takes_no_input() {
     ]);
     assert_eq!(env.eval_int("clicks"), 1);
 }
+
+/// Showing a window brings it to the front.
+///
+/// Reference: `SetVisible(true)` calls `BringToFront`, which makes the window
+/// the one the pointer belongs to
+/// (`reference/cpp/core/environ/impl/TVPWindow.cpp:405-414`), and a window
+/// that is not shown delivers nothing
+/// (`reference/cpp/core/visual/impl/WindowImpl.cpp:1154-1158`).
+///
+/// The front window is the last one the scene holds, so re-showing a window
+/// has to move it there; creation order alone is not the reference's rule.
+#[test]
+fn showing_a_window_again_brings_it_to_the_front() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var first = new Window(); \
+         first.visible = true; \
+         var firstLayer = new Layer(first, null); \
+         firstLayer.setImageSize(64, 64); \
+         var firstClicks = 0; \
+         first.onMouseUp = function(x, y, btn, shift) { firstClicks = firstClicks + 1; }; \
+         var second = new Window(); \
+         second.visible = true; \
+         var secondLayer = new Layer(second, null); \
+         secondLayer.setImageSize(64, 64); \
+         var secondClicks = 0; \
+         second.onMouseUp = function(x, y, btn, shift) { secondClicks = secondClicks + 1; };",
+    );
+
+    // The second window was shown last, so it is on top.
+    env.dispatch_events(&[
+        PlatformEvent::Input(InputEvent::PointerMoved { x: 10.0, y: 10.0 }),
+        PlatformEvent::Input(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: true,
+        }),
+        PlatformEvent::Input(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: false,
+        }),
+    ]);
+    assert_eq!(env.eval_int("secondClicks"), 1);
+    assert_eq!(env.eval_int("firstClicks"), 0);
+
+    // Showing the first window again brings it to the front.
+    env.run("first.visible = false; first.visible = true;");
+    env.dispatch_events(&[
+        PlatformEvent::Input(InputEvent::PointerMoved { x: 10.0, y: 10.0 }),
+        PlatformEvent::Input(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: true,
+        }),
+        PlatformEvent::Input(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: false,
+        }),
+    ]);
+    assert_eq!(env.eval_int("firstClicks"), 1);
+    assert_eq!(env.eval_int("secondClicks"), 1);
+}

@@ -74,7 +74,6 @@ from __future__ import annotations
 
 import argparse
 import datetime
-import glob
 import json
 import os
 import re
@@ -83,14 +82,20 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..common import ALLOWLISTS_DIR, REPO_ROOT
+from ..common import (
+    ALLOWLISTS_DIR,
+    REPO_ROOT,
+    reference_citation,
+    reference_core_sources,
+    reference_defined_macros,
+    reference_root,
+)
 from ..framework import (
     load_keyed_allowlist,
     strip_cpp_comments,
     write_keyed_allowlist,
 )
 
-REFERENCE_GLOB = "reference/cpp/core/**/*.cpp"
 ALLOWLIST_PATH = ALLOWLISTS_DIR / "native_parity_allow.txt"
 PROPS_ALLOWLIST_PATH = ALLOWLISTS_DIR / "native_parity_props_allow.txt"
 STATIC_ALLOWLIST_PATH = ALLOWLISTS_DIR / "native_parity_static_allow.txt"
@@ -207,41 +212,6 @@ RUST_ONLY_CLASS_MAP: "OrderedDict[str, list[tuple[str, str | None]]]" = OrderedD
     ]
 )
 
-def _reference_defined_macros() -> set[str]:
-    """Flags the reference source both gates code on and defines itself.
-
-    A member behind ``#ifdef FLAG`` is part of the shipped surface when the
-    reference defines ``FLAG`` — ``USE_OBSOLETE_FUNCTIONS`` is defined in
-    ``reference/cpp/core/visual/WindowIntf.h:23`` — while a flag it never
-    defines is a build option and its members are not part of the surface.
-    Collect the identifiers used in preprocessor conditions and keep the ones
-    some ``#define`` names, so an unrelated internal macro is ignored.
-    """
-    define_re = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)")
-    cond_re = re.compile(r"^\s*#\s*(?:if|ifdef|ifndef|elif)\b(.*)$")
-    ident_re = re.compile(r"[A-Za-z_]\w*")
-    defined_any: set[str] = set()
-    used_in_condition: set[str] = set()
-    patterns = ("reference/cpp/**/*.h", "reference/cpp/**/*.hpp", "reference/cpp/**/*.cpp")
-    paths: list[str] = []
-    for pattern in patterns:
-        paths.extend(glob.glob(str(REPO_ROOT / pattern), recursive=True))
-    for path in sorted(set(paths)):
-        for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
-            match = define_re.match(line)
-            if match:
-                defined_any.add(match.group(1))
-            condition = cond_re.match(line)
-            if condition:
-                used_in_condition.update(ident_re.findall(condition.group(1)))
-    return defined_any & used_in_condition
-
-
-# Macros considered *defined* while walking the C++ preprocessor: the flags the
-# reference source both gates code on and defines itself.  A flag it never
-# defines is a build option, and members behind it are not part of the surface.
-CPP_ASSUMED_DEFINED: set[str] = _reference_defined_macros()
-
 # Lifecycle hooks that are not part of the script-visible surface games call.
 IGNORED_REFERENCE_MEMBERS = {"finalize"}
 
@@ -326,17 +296,20 @@ _CPP_DEFINE_RE = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)")
 _CPP_UNDEF_RE = re.compile(r"^\s*#\s*undef\s+([A-Za-z_]\w*)")
 
 
-def _preprocess_cpp(src: str) -> str:
+def _preprocess_cpp(src: str, reference_defines: frozenset[str] = frozenset()) -> str:
     """Blank out lines that a normal build would not compile.
 
     Only the handful of flags that actually guard native member declarations
     matter here, but the walk handles nesting, ``#else`` and ``#elif``.
+    ``reference_defines`` carries the flags the reference itself defines; a
+    fixture that only exercises the walk passes none and lets its own
+    ``#define`` decide.
     """
     lines = src.split("\n")
     active = True
     # Flags the source itself defines (in addition to the reference-wide set),
     # so a fixture or a same-file ``#define`` is honoured.
-    defined = set(CPP_ASSUMED_DEFINED)
+    defined = set(reference_defines)
     # stack entries: [parent_active, this_branch_active, any_branch_taken]
     stack: list[list[bool]] = []
     out: list[str] = []
@@ -417,9 +390,11 @@ def _normalize_static_decl_comments(src: str) -> str:
     return _CPP_STATIC_DECL_COMMENT_RE.sub(repl, src)
 
 
-def _mask_cpp_source(raw: str) -> str:
+def _mask_cpp_source(raw: str, reference_defines: frozenset[str] = frozenset()) -> str:
     """Preprocess, normalize the static-comment form, then strip comments."""
-    return strip_cpp_comments(_normalize_static_decl_comments(_preprocess_cpp(raw)))
+    return strip_cpp_comments(
+        _normalize_static_decl_comments(_preprocess_cpp(raw, reference_defines))
+    )
 
 
 def _cpp_end_is_static(src: str, m: re.Match) -> bool:
@@ -674,18 +649,20 @@ def parse_cpp_source_surface(
 
 def parse_reference_surface() -> tuple[dict[str, dict[str, MemberInfo]], list[str]]:
     """Return ``({class: {member: MemberInfo}}, unrecoverable_sites)``."""
+    root = reference_root()
+    defines = reference_defined_macros(root)
     surface: dict[str, dict[str, MemberInfo]] = {}
     unrecoverable: list[str] = []
-    files = sorted(glob.glob(str(REPO_ROOT / REFERENCE_GLOB), recursive=True))
+    files = reference_core_sources(root)
     for fp in files:
         raw = Path(fp).read_text(encoding="utf-8", errors="replace")
-        src = _mask_cpp_source(raw)
+        src = _mask_cpp_source(raw, defines)
         file_surface, file_unrecoverable = parse_cpp_source_surface(src)
         for cls, entries in file_surface.items():
             for name, info in entries.items():
                 _set_member(surface, cls, name, info)
         unrecoverable.extend(
-            f"{Path(fp).relative_to(REPO_ROOT)}: {site}" for site in file_unrecoverable
+            f"{reference_citation(Path(fp), root)}: {site}" for site in file_unrecoverable
         )
     return surface, unrecoverable
 
@@ -2090,6 +2067,11 @@ def self_test(verbose: bool = True) -> int:
     the extractor claims, plus a runtime-built name that must be reported as
     unrecoverable.  A regex that silently stops matching fails here rather than
     quietly shrinking the covered surface.
+
+    The fixtures are self-contained: a guarded member sits behind a flag the
+    fixture defines itself and another behind one it does not, so this test
+    needs no reference checkout.  The reference-wide flags are asserted by the
+    run itself, in :func:`main`.
     """
     fixture = FIXTURES_DIR / "native_core.cpp"
     expected_path = FIXTURES_DIR / "native_core.expected.json"
@@ -2105,12 +2087,6 @@ def self_test(verbose: bool = True) -> int:
     want = expected["members"]
 
     problems: list[str] = []
-    if "USE_OBSOLETE_FUNCTIONS" not in CPP_ASSUMED_DEFINED:
-        problems.append(
-            "the reference defines USE_OBSOLETE_FUNCTIONS "
-            "(reference/cpp/core/visual/WindowIntf.h:23); the preprocessor "
-            "walk must treat it as active"
-        )
     for cls in sorted(set(got) | set(want)):
         got_members = set(got.get(cls, []))
         want_members = set(want.get(cls, []))
@@ -2232,6 +2208,21 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.runtime:
         return _check_runtime(args)
+
+    # A member behind ``#ifdef USE_OBSOLETE_FUNCTIONS`` is part of the surface:
+    # the reference's own window interface header defines the flag.  A checkout
+    # whose walk does not see it would drop those members from the compared
+    # surface silently, so stop instead.
+    root = reference_root()
+    if "USE_OBSOLETE_FUNCTIONS" not in reference_defined_macros(root):
+        print(
+            f"native_parity: USE_OBSOLETE_FUNCTIONS is not among the flags the "
+            f"reference at {root} defines and gates on; its window interface "
+            "header defines it and the members behind it are part of the "
+            "surface, so the walk would drop them. Check that --reference "
+            "points at the clone root."
+        )
+        return 1
 
     ref_surface, unrecoverable = parse_reference_surface()
     ref = {cls: set(entries) for cls, entries in ref_surface.items()}

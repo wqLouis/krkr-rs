@@ -125,3 +125,44 @@ fn two_timers_have_separate_capacity_budgets() {
         "the second timer posts its own budget"
     );
 }
+
+/// A stall longer than the reference's starvation window still delivers the
+/// capacity, not one event.
+///
+/// The reference's timer thread wakes at the next deadline, so its catch-up
+/// count `n` is one and its `n > 40` branch is the guard for a thread that was
+/// starved rather than a rule for a late frame
+/// (`reference/cpp/core/utils/impl/TimerImpl.cpp:112-148`). This registry is
+/// pumped by the frame, so a long frame *is* the late case: the whole replay
+/// reaches `Fire`, which posts `min(n, cap - count)` events.
+///
+/// Seventy-six 1 ms intervals pass before the frame lands (sixty of stall plus
+/// the harness's own 16 ms poll), well past the forty intervals the reference's
+/// starvation guard collapses: the default capacity of six is what the script
+/// sees.
+///
+/// reference/cpp/core/utils/TimerIntf.cpp:17,32,69-111 — the default capacity
+/// is `TVP_DEFAULT_TIMER_CAPACITY` = 6, and `Fire(n)` posts
+/// `min(n, cap - count)` events.
+#[test]
+fn a_stall_past_forty_intervals_still_posts_the_capacity() {
+    let _lock = vm_lock();
+    let env = common::Env::new();
+
+    env.run(
+        "var hits = 0; \
+         var t = new Timer(function(){ hits++; }, ''); \
+         t.interval = 1; \
+         t.enabled = true;",
+    );
+
+    // Sixty milliseconds of stall: more than forty 1 ms intervals, and the
+    // poll's own 16 ms makes it seventy-six.
+    env.advance_time(60);
+    env.poll_timer();
+    assert_eq!(
+        env.eval_int("hits"),
+        6,
+        "a stall past the starvation window posts the capacity's six events"
+    );
+}

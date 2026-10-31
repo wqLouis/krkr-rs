@@ -112,8 +112,9 @@ residuals:
   '/', '\\' or '>'; got …"`; the reference raises
   `TVPMissingPathDelimiterAtLast` = `"Use path delimiter '>' or '/'"`
   (`MsgIntfInc.h:32`) — script-observable.
-* **The face selects the blend *method*, and the engine's blend table has
-  no per-method kernels.** The layer keeps the reference's two faces: the
+* **The face selects the blend *method*, and the engine carries one kernel
+  per (operation mode, destination alpha).** The layer keeps the reference's
+  two faces: the
   outward face the script reads and writes (defaulting to `dfAuto` = `128`)
   and the actual draw face the operations use, resolved from the layer's
   display type (`LayerIntf.h:738-750`, `LayerIntf.cpp:371-372`,
@@ -127,90 +128,61 @@ residuals:
   `:2472-2565`, `:2854-2884`), and the per-method switch in
   `LayerBitmapIntf.cpp:1527-1826` sits inside `#if 0` — it states the same
   mapping but runs nowhere. The engine's table is keyed by the operation
-  mode alone (`engine/src/layer_ops.rs`, `mode_kernel`), so three of the
-  nine combinations still differ:
-  * `omAlpha`/`dfAddAlpha` (`bmAlphaOnAddAlpha`, `LayerIntf.cpp:4224`)
-    is the premultiplied over: the straight source is premultiplied
-    (`TVPAlphaToAdditiveAlpha`, `tvpgl.h:169-174`) and
-    `TVPAddAlphaBlend_a_a` (`tvpgl.h:116-137`) gives, per channel,
-    `out = sat((dest * (255 - sa) >> 8) + src)` and
-    `out_a = dopa - (dopa >> 8)` with `dopa = da + sa - (da * sa >> 8)`
-    (`tvpgl.cpp:708-736`). The engine's source-over composites the
-    straight source instead, so the destination's RGB differs by up to
-    212/255. The other half, `omAlpha`/`dfAlpha` (`bmAlphaOnAlpha`), is
-    the destination-alpha blend `TVPAlphaBlend_d` (`tvpgl.cpp:582-704`):
-    with `addr = (sa << 8) | da`, `w = TVPOpacityOnOpacityTable[addr]` and
-    `out_a = TVPNegativeMulTable[addr]`, per channel
-    `out = dest + ((src - dest) * w >> 8)`, the two 64 KiB tables built in
-    `f32` at `tvpgl.cpp:224-251`. The engine's straight source-over
-    (`engine/src/raster.rs:70`) is that formula without the tables and
-    differs by at most 6/255 on a channel (mean 0.5/255 over a 16×16 grid
-    of source and destination alphas and five colours), and the reference's
-    own OpenGL path (`ogl/RenderManager_ogl.cpp:3549-3557`) is the same
-    formula in float, so this half is a rounding gap, not a structural one.
-  * `omAddAlpha`/`dfAddAlpha` (`bmAddAlphaOnAddAlpha`, `:4239`) and
-    `omAddAlpha`/`dfOpaque` (`bmAddAlpha`, `:4243`) are the
-    additive-alpha blends: `TVPAddAlphaBlend_a_a` (`tvpgl.cpp:1058-1085`)
-    for the first, and `TVPAddAlphaBlend_HDA_n_a` (`tvpgl.cpp:944-971`,
-    `tvpgl.h:88-99`) for the second, which also holds the destination's
-    alpha. The engine has no additive-alpha kernel and blends them
-    source-over instead, which differs from the reference by up to 225/255
-    on a channel. The third combination, `omAddAlpha`/`dfAlpha`
-    (`bmAddAlphaOnAlpha`), is not implemented in the reference at all
-    (`RenderManager.cpp:2557-2561`), and the operation now leaves the
+  mode and the destination's stored alpha (`engine/src/layer_ops.rs`,
+  `mode_kernel`/`resolve_kernel_on`), and all nine combinations of the three
+  face-sensitive modes now name the reference's method:
+  * `omAlpha`/`dfAlpha` is the destination-alpha blend `TVPAlphaBlend_d`
+    (`tvpgl.cpp:582-704`), which the engine's straight source-over
+    (`engine/src/raster.rs:70`) computes without the reference's 64 KiB
+    tables (`tvpgl.cpp:224-251`); the reference's own OpenGL path
+    (`ogl/RenderManager_ogl.cpp:3555-3558`) is the same formula in float, so
+    this is a rounding gap of at most 6/255 on a channel, not a structural
+    one.
+  * `omAlpha`/`dfAddAlpha` is the premultiplied over `TVPAddAlphaBlend_a_a`
+    (`gl/blend_util_func.h:70-83`): per channel
+    `out = sat((dest * (255 - sa) >> 8) + src)`, with
+    `out_a = dopa - (dopa >> 8)` and `dopa = da + sa - (da * sa >> 8)`.
+    The engine's `ModeKernel::AlphaOnAddAlpha` applies that byte arithmetic.
+  * `omAddAlpha`/`dfAddAlpha` is `TVPAddAlphaBlend_a_a` fed the straight
+    source (`AdditiveAlphaBlend_a`, `ogl/RenderManager_ogl.cpp:3640-3649`),
+    and `omAddAlpha`/`dfOpaque` is `TVPAddAlphaBlend_n_a`
+    (`AdditiveAlphaBlend`, `:3629-3637`, which holds the destination's
+    alpha). Both are kernel variants (`AddAlphaOnAddAlpha`, `AddAlpha`) and
+    use the same byte arithmetic.
+  * `omOpaque`/`dfAlpha` and `omOpaque`/`dfAddAlpha` copy the source as an
+    *opaque* image — `CopyOpaqueImage`, `ogl/RenderManager_ogl.cpp:3141-3147`
+    — and below the full opacity the copy blends instead
+    (`ConstAlphaBlend_d`, `ogl/RenderManager_ogl.cpp:3184-3193`;
+    `ConstAlphaBlend_a`, `:3171-3179`). The opaque copy is the engine's copy
+    kernel with the source read opaque, and the additive-alpha spelling is
+    `ModeKernel::ConstAlphaOnAddAlpha`.
+  * `omAddAlpha`/`dfAlpha` is not implemented in the reference at all
+    (`RenderManager.cpp:2557-2560`), and the operation leaves the
     destination untouched here too.
-  * `omOpaque`/`dfAlpha` (`bmCopyOnAlpha`, `:4250`) and
-    `omOpaque`/`dfAddAlpha` (`bmCopyOnAddAlpha`, `:4254`) copy the
-    source as an *opaque* image: `TVPCopyOpaqueImage`
-    (`tvpgl.cpp:3326-3375`) copies the source's RGB and forces the
-    destination's alpha to 255 (`src | 0xff000000`); below full opacity the
-    reference blends instead (`TVPConstAlphaBlend_d`,
-    `tvpgl.cpp:3506-3581`, and `TVPConstAlphaBlend_a`, `:3583-3613`).
-    The engine's copy keeps the source's alpha, so the destination's alpha
-    differs by up to 255/255, and only where the source carries a
-    translucent pixel.
-  The three formulas cost less per pixel than the source-over they would
-  replace. Measured on the development host as the arithmetic alone (one
-  thread, a 1920×1080 surface): the engine's straight source-over is
-  11.0 ms/frame, the table-driven blend 5.1 ms/frame, the additive-alpha
-  blend 6.4 ms/frame and the opaque copy 1.7 ms/frame — 0.2 ms/frame with
-  AVX2, at the 0.18 ms/frame memory floor. An AVX2 gather over 32-bit
-  tables is slower than the scalar byte-table lookup (6.8 against
-  5.1 ms/frame) and the same formula without the tables is slower still
-  (8.8 ms/frame), so the two lookups are a win, not a cost; the price of
-  carrying the face is the dispatch, not the pixels.
-  The face must not reach the engine as a face. What the engine needs is
-  one generic fact — whether the destination's alpha is straight,
-  premultiplied or absent — which is graphics vocabulary and belongs in the
-  `api` crate next to `BlendMode`, re-exported through
-  `engine_api.rs`, keying the engine's `mode_kernel` table as
-  `(mode, dst_alpha)`. The kernel is resolved once per pass: `resolve_kernel`
-  (`engine/src/layer_ops.rs:2130`) picks it and the per-pixel loop blends with
-  the resolved kernel, and the affine path resolves it the same way
-  (`engine/src/layer_ops.rs:3097`); a kernel function pointer in
-  `BlitOptions` would have to be re-derived for the affine and stretch
-  paths, and a new engine entry point per blend would duplicate the
-  operate, stretch and affine loops.
-  The differences are observable only where the additive-alpha type is in
-  play: `omAlpha`/`dfAddAlpha` and both `omAddAlpha` combinations need a
-  `dfAddAlpha` destination or an `ltAddAlpha` source, and `omOpaque`
-  differs only in the destination's alpha and only for a translucent
-  source. The common case, `omAlpha` onto the default `dfAlpha` face, is
-  already within 6/255 of the reference.
-  What is still open is the alpha-hold argument. The reference passes the
-  layer's `holdAlpha` to every method (`LayerIntf.cpp:5250`) and the
-  render-method cache is what honours it (`RenderManager.cpp:2396-2424`):
-  only the copy methods have a second, hold-aware spelling
-  (`CopyColor`), the plain alpha methods hold the destination's alpha
-  unconditionally, and `bmCopyOnAddAlpha` has no hold spelling at all, so
-  with the hold set and full opacity the operation does nothing
-  (`RenderManager.cpp:2423`, `LayerBitmapIntf.cpp:1483-1485`). The compat
-  derives the hold from the face instead
-  (`natives/visual/layer/pixels.rs:400-408`, `face_hold_alpha`), which is a
-  different rule;
-  whether to replace it is separate from the kernel table and still open.
-  The `ImageFunction`'s mapping (`natives/image_function.rs`,
-  `blit_method`) follows the face-derived rule too; the text members'
+  The kernels are the reference's CPU twins, which scale by `>> 8` where the
+  shaders scale by the exact fraction, so a full-alpha channel can land one
+  step low (254 instead of 255); the port's other kernels already do this.
+  The face does not reach the engine as a face. It reaches it as the one
+  generic fact the kernels need — `DestAlpha`
+  ([`trans.md`](docs/code/engine/trans.md) §2) — and `resolve_kernel_on`
+  (`engine/src/layer_ops.rs`) keys the kernel table by `(mode, dst_alpha)`.
+  The operate, stretch and affine entries take it as a parameter
+  (`operate_rect_on`, `stretch_blit_on`, `affine_blit_clipped_on`,
+  `affine_blit_clipped_pixel_center_on`) and the face-blind entries pass
+  `DestAlpha::Straight`, so a kernel is never re-derived per pass and no loop
+  is duplicated.
+  What still differs from the reference is the rounding above and the copy
+  family below the full opacity (the next bullet).
+  The alpha-hold argument follows the cache: only the copy methods have a
+  hold-aware spelling (`CopyColor`), and only at the full opacity
+  (`RenderManager.cpp:2396-2424`), so the compat passes the hold flag for the
+  copy modes at `opa == 255` alone. `bmCopyOnAddAlpha` has no hold spelling
+  at all, so that pair draws nothing (`RenderManager.cpp:2423-2424`,
+  `LayerBitmapIntf.cpp:1483-1484`).
+  The `ImageFunction`'s own mapping (`natives/image_function.rs`,
+  `blit_method`) has no destination-alpha spelling yet, so its
+  `ImageFunction.operateRect` still answers the straight-alpha kernel on a
+  `dfAddAlpha` destination; the text members'
   `hda` argument and the layer's `holdAlpha` do not reach the text
   rasterizer (`ImageFunction.cpp:1024-1025`, `LayerIntf.cpp:4444-4468`),
   and the face's method selection for the text is the same arithmetic gap.
@@ -466,6 +438,27 @@ native OS popup would be a deliberate divergence, and Linux has nothing to call
   (`WaveImpl.cpp:3147`), not the tick count. The port keeps that shape (the
   rendered position on the frame clock, the device's latency subtracted), so
   the divergence is the *cap*: a frame longer than the cap plays behind.
+* **The timer's replay is bounded by the capacity, not by the reference's
+  starvation guard.** The reference's timer thread wakes at the next deadline,
+  so a slow frame never reaches its `n > 40` branch, and it posts
+  `min(n, cap - count)` events (six by default,
+  `reference/cpp/core/utils/TimerIntf.cpp:69-111`,
+  `reference/cpp/core/utils/impl/TimerImpl.cpp:112-148`). The port's registry
+  is pumped by the frame, so a frame longer than forty intervals *is* the
+  starved-thread case: it replays the whole backlog in one call and the
+  delivery queues the capacity's worth, where the reference's guard would
+  deliver one event. The divergence is the port's model of a thread (D36):
+  closing it means a timer thread in L2 plus a cross-thread post queue, which
+  is the same gap as the entry above.
+* **The script's tick count samples the clock source live, but its epoch is
+  local.** `System.getTickCount` reads the source the frames are paced from, so
+  it moves inside a frame and a script that waits on it terminates. The
+  reference's counter counts from the platform's monotonic origin
+  (`reference/cpp/core/utils/TickCount.cpp:112-118`,
+  `reference/cpp/core/environ/linux/Platform.cpp:271-276`), while this one
+  counts from the run's start, so a script that treats the value as an absolute
+  (rather than a difference) sees a different base. No shipped title was seen
+  to depend on the base.
 * **The video advances on the frame clock, not on a media clock.** The
   reference's movie player runs on its own timeline, off the frame
   (`VideoPlayer.cpp:538`, `:1813`); only its *presentation* is on-frame,
@@ -1371,19 +1364,21 @@ Remaining:
 * The copy family's arithmetic **below the full opacity** is an
   approximation. The reference's method table gives every copy method a
   full-opacity spelling and a below-full-opacity spelling
-  (`reference/cpp/core/visual/RenderManager.cpp:2369-2399`): `bmCopy` runs
+  (`reference/cpp/core/visual/RenderManager.cpp:2396-2400`): `bmCopy` runs
   `Copy` / `CopyColor` / `ConstAlphaBlend` and `bmCopyOnAlpha` runs
-  `CopyOpaqueImage` / `CopyColor` / `ConstAlphaBlend_d`. The tree's own
-  `ConstAlphaBlend` bodies are not vendored (only the call sites in
-  `reference/cpp/core/visual/LayerBitmapIntf.cpp:1600-1606` are), so the
-  arithmetic below the full opacity cannot be read from the oracle. The port
-  keeps its established `ConstAlpha` kernel, which holds the destination's
-  alpha where the tree's GL spelling writes the source's. The same gap
-  covers the operate family's copy mode: the reference hands the hold flag
-  to the blend at every opacity, but its below-full-opacity spelling for the
-  copy methods is the same with and without the hold, so the flag has no
-  effect there. Recorded as an approximation with its reference gap, not as a
-  verified match.
+  `CopyOpaqueImage` / `CopyColor` / `ConstAlphaBlend_d`. The two paths of the
+  tree disagree on the alpha below the full opacity: the GL method's alpha
+  blend function holds the destination's alpha
+  (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3162-3168`) while the
+  CPU twin `TVP_const_alpha_blend` drops it
+  (`reference/cpp/core/visual/gl/blend_function.cpp:347`,
+  `reference/cpp/core/visual/gl/blend_functor_c.h:662-672`). The port keeps
+  its established `ConstAlpha` kernel, which follows the GL spelling and
+  holds the destination's alpha. Recorded as an approximation with its
+  reference gap, not as a verified match: it is the alpha byte alone, and the
+  GL path is the tree's live one. The hold flag has no effect below the full
+  opacity, because the cache's below-full-opacity spelling is the same with
+  and without it; the compat passes it at the full opacity alone.
 
 ## 19. Pixel-translation wiring decision
 

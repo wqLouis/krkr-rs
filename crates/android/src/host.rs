@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use android_activity::{AndroidApp, MainEvent, PollEvent};
-use app::{BackendKind, GameHost, Host, HostConfig, InjectedFrameTime};
+use app::{BackendKind, FrameTimeSource, GameHost, Host, HostConfig, PlatformFrameTime};
 use platform::{
     EventHandler, Flow, FramePacing, PlatformError, PlatformEvent, PlatformWindow, Ticker,
 };
@@ -42,9 +42,12 @@ pub(crate) struct AndroidHost {
     frame_interval: Duration,
     /// The running game, created by [`EventHandler::resumed`].
     running: Option<GameHost>,
-    /// The frame's elapsed time: the real time the platform measured,
-    /// injected into the engine's clock every frame.
-    frame_time: InjectedFrameTime,
+    /// The frame's clock source: the real time the platform measured, and the
+    /// reading the script's tick count takes on demand.
+    ///
+    /// Boxed so the address the game attaches stays stable when the handler
+    /// moves.
+    frame_time: Box<PlatformFrameTime>,
     /// Input and focus events received since the last frame.
     pending_events: Vec<PlatformEvent>,
     /// Touch -> mouse synthesizer, kept across input batches because a tap or
@@ -73,7 +76,7 @@ impl AndroidHost {
             debug_overlay,
             frame_interval,
             running: None,
-            frame_time: InjectedFrameTime::default(),
+            frame_time: Box::new(PlatformFrameTime::new()),
             pending_events: Vec::new(),
             gestures: GestureSynthesizer::default(),
             gesture_clock: Instant::now(),
@@ -175,8 +178,15 @@ impl EventHandler for AndroidHost {
         config.window_handle = Some(window_handle);
         config.display_handle = Some(display_handle);
         config.frame_interval = self.frame_interval;
+        let source: &(dyn FrameTimeSource + 'static) = self.frame_time.as_ref();
         let host = match Host::new(config) {
-            Ok(host) => host,
+            // The source is a field of this handler, so it outlives the game the
+            // host is opened over, and it is the source every frame is stepped
+            // with.
+            Ok(host) => {
+                let source = source as *const (dyn FrameTimeSource + 'static);
+                host.with_frame_time_source(source)
+            }
             Err(error) => {
                 return self.fail(format!("cannot create the render host: {error}"));
             }
@@ -229,7 +239,7 @@ impl EventHandler for AndroidHost {
         // measurement is the elapsed time the engine's clock advances by.
         self.frame_time.elapsed_ms = f64::from(dt_ms);
         let events = std::mem::take(&mut self.pending_events);
-        let result = game.step_with_pacing(&self.frame_time, &events, pacing);
+        let result = game.step_with_pacing(self.frame_time.as_ref(), &events, pacing);
         match result {
             Ok(_) => Flow::Continue,
             Err(error) => self.fail(format!("frame failed: {error}")),

@@ -1633,10 +1633,10 @@ extern "C" fn layer_get_layer_at(
     };
     // The hit test reads a layer's main image: an image whose decode has
     // not landed yet is waited for first.
-    let window = scene_ref(&ctx)
-        .ok()
-        .and_then(|scene| scene.layer(id))
-        .map(|layer| layer.window);
+    let window = match scene_ref(&ctx) {
+        Ok(scene) => scene.layer(id).map(|layer| layer.window),
+        Err(error) => return report_error(out_error, &error),
+    };
     if let Some(window) = window {
         let scene = match scene_mut(&ctx) {
             Ok(scene) => scene,

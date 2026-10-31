@@ -998,7 +998,9 @@ mod tests {
     /// The decoder's intermediate word is `0xAARRGGBB`: byte 0 is blue,
     /// byte 1 green, byte 2 red and byte 3 alpha, so the word's byte 0
     /// carries the file's first residual lane and its byte 2 the file's third
-    /// (`krkrz/krkrz@fd5c4baa visual/gl/tlg_sse2.cpp:413-415`).
+    /// (`reference/cpp/core/visual/tvpgl.cpp:12431-12434` names the four
+    /// lanes, and `reference/cpp/core/visual/LoadTLG.cpp:404` reads a
+    /// grayscale file's luminance from the first lane).
     #[test]
     fn word_bytes_land_in_the_named_channels() {
         let mut pixel = [0u8; 4];

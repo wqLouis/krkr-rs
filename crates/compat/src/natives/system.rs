@@ -644,23 +644,41 @@ fn set_retained_value_out(ctx: &CompatCtx, out: *mut Value, value: RetainedValue
     }
 }
 
-/// The frame clock's tick count in milliseconds.
+/// The script's tick count in milliseconds: the clock source, read now.
 ///
-/// The tick count is the engine's frame clock: the value the frame advances,
-/// so the script's clock and the game's timers are the same clock.
+/// The tick count and the frame clock are one base read at two moments: the
+/// frame clock is the source sampled at each frame boundary, and this is the
+/// source sampled when the script asks. A host that attached a source which
+/// measures real time therefore hands the script a clock that moves inside a
+/// frame — a script that waits on the tick count makes progress even though no
+/// frame is running, and a frame that takes a second does not hide that second
+/// from the script.
+///
+/// The reading is never behind the frame clock: a source whose origin is later
+/// than the frame's (or a source that injected a fixed frame time) cannot report
+/// a time the frame has already passed, so the later of the two is the tick
+/// count.
 ///
 /// # Errors
 ///
-/// Returns the message for a host that attached no clock: a tick count
-/// without a frame clock would be a time the game never reached.
+/// Returns the message for a host that attached no clock: a tick count without
+/// a frame clock would be a time the game never reached.
 fn tick_count_ms(services: &CompatServices) -> Result<i64, String> {
     let Some(clock) = services.clock() else {
         return Err("System.getTickCount: clock is not attached".to_owned());
     };
     // SAFETY: `attach_clock` guarantees the pointer stays valid.
-    let now_ms = unsafe { &*clock }.now_ms();
-    i64::try_from(now_ms)
-        .map_err(|_| "System.getTickCount: the frame clock is out of tick range".to_owned())
+    let frame_ms = unsafe { &*clock }.now_f64();
+    let now_ms = match services.frame_time() {
+        // SAFETY: `attach_frame_time` guarantees the pointer stays valid, and
+        // it is the same source the engine paces the frames from.
+        Some(source) => unsafe { &*source }.now_ms().max(frame_ms),
+        // No source: the frame clock is the whole time this host has.
+        None => frame_ms,
+    };
+    // A negative reading counts as zero; the clock never runs backwards.
+    i64::try_from(now_ms.max(0.0) as u64)
+        .map_err(|_| "System.getTickCount: the clock is out of tick range".to_owned())
 }
 
 // ---------------------------------------------------------------------------

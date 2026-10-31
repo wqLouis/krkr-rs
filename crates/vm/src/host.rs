@@ -19,17 +19,6 @@ use crate::VmError;
 
 /// The per-frame inputs handed to [`VmHost::tick`].
 pub struct FrameCtx<'a> {
-    /// The engine's frame clock for this frame, in milliseconds.
-    ///
-    /// The engine owns the clock; the host does not read this value. A
-    /// composition root hands the per-frame delta to the polls it owns
-    /// through the frame body.
-    pub now_ms: u64,
-    /// The elapsed milliseconds since the previous frame.
-    ///
-    /// The host does not read this value either: the polls receive their
-    /// own per-frame delta through the frame body.
-    pub dt_ms: u32,
     /// The ordered frame-body polls.
     ///
     /// The host runs them in the order the L3 frame body defines, and each

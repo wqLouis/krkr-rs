@@ -14,8 +14,8 @@
 //!
 //! [`CompatServices`](crate::CompatServices) attaches raw pointers to the
 //! stateful handles ([`Scene`], [`Storage`], [`InputState`], [`TimerState`],
-//! [`FrameClock`]); each pointer must stay valid for as long as the binding is
-//! installed.
+//! [`FrameClock`], [`FrameTimeSource`]); each pointer must stay valid for as
+//! long as the binding is installed.
 
 // The logical scene: layers, bitmaps, fonts, windows, and decoded-image keys.
 // The layer geometry operations L3 drives (`internal_set_image_size`,
@@ -44,10 +44,11 @@ pub(crate) use engine::input::InputState;
 // The timer registry, its ids and the stored callback shape.
 pub(crate) use engine::timer::{TimerCallback, TimerId, TimerState};
 
-// The frame clock: the time base the frame advances. The `System` native
-// reads it for the script's tick count, so the script and the frame share
-// one clock.
-pub(crate) use engine::clock::FrameClock;
+// The frame clock the timers, the sound poll and the transitions read, and the
+// clock source `System.getTickCount` reads on demand. The source is the same
+// one the engine paces the frames from, so the script's clock and the frame's
+// clock are one base read at two moments.
+pub(crate) use engine::clock::{FrameClock, FrameTimeSource};
 
 // Text shaping, coverage rasterization, the glyph cache and font identity.
 pub(crate) use engine::text::{
@@ -88,12 +89,13 @@ pub(crate) mod raster {
 pub(crate) mod layer_ops {
     pub(crate) use engine::layer_ops::{
         AffineBlit, BlitOptions, BlitSource, COPY_MAIN, COPY_MASK, GammaAdjust, RectI,
-        adjust_gamma, affine_blit, affine_blit_clipped, affine_blit_clipped_pixel_center,
-        blit_copy, blit_over, blit_plane, blur_bitmap_in_place, clip_rect,
-        convert_add_alpha_to_alpha, convert_alpha_to_add_alpha, copy_9patch, do_gray_scale,
-        ensure_transition_display, ensure_transition_self_image, fill_color_hold_alpha,
-        fill_color_on_add_alpha, fill_color_on_alpha, fill_mask, flip_lr, flip_ud, gaussian_blur,
-        intersect, intersect_rect, light_contrast, operate_rect, remove_const_opacity,
-        render_layer_subtree, stretch_blit_mode, stretch_blit_plane,
+        adjust_gamma, affine_blit, affine_blit_clipped, affine_blit_clipped_on,
+        affine_blit_clipped_pixel_center_on, blit_copy, blit_over, blit_plane,
+        blur_bitmap_in_place, clip_rect, convert_add_alpha_to_alpha, convert_alpha_to_add_alpha,
+        copy_9patch, do_gray_scale, ensure_transition_display, ensure_transition_self_image,
+        fill_color_hold_alpha, fill_color_on_add_alpha, fill_color_on_alpha, fill_mask, flip_lr,
+        flip_ud, gaussian_blur, intersect, intersect_rect, light_contrast, operate_rect,
+        operate_rect_on, remove_const_opacity, render_layer_subtree, stretch_blit_mode,
+        stretch_blit_on, stretch_blit_plane,
     };
 }

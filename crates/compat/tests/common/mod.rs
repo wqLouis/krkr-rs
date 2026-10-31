@@ -17,12 +17,36 @@ use api::media::{DecodedImage, ImageInfo};
 use compat::CompatHost;
 use engine::Scene;
 use engine::Storage;
-use engine::clock::FrameClock;
+use engine::clock::{FrameClock, FrameTimeSource};
 use engine::input::InputState;
 use engine::timer::{TimerState, deliver_due};
 use fs::FileSystem;
 use platform::PlatformEvent;
 use tjs::{Tjs2Engine, TjsValue};
+
+/// The frame-time source the harness attaches.
+///
+/// The reading is the harness's own, not the frame clock's, so a test can move
+/// it on its own: that is the only way to tell a tick count sampled from the
+/// source apart from one read off the frame boundary. The `System` native takes
+/// the later of this reading and the frame clock, so a source left behind the
+/// clock (the harness's default, at zero) never changes what a test reads.
+struct HarnessFrameTime {
+    /// The source's own reading, in milliseconds.
+    now_ms: std::cell::Cell<f64>,
+}
+
+impl FrameTimeSource for HarnessFrameTime {
+    /// Zero: the harness steps the frame clock directly and never paces a
+    /// frame through this trait, so it has no frame delta to report.
+    fn elapsed_ms(&self) -> f64 {
+        0.0
+    }
+
+    fn now_ms(&self) -> f64 {
+        self.now_ms.get()
+    }
+}
 
 fn lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -53,6 +77,12 @@ pub struct Env {
     /// The attached frame clock; tests advance it directly so a tick count
     /// never depends on the wall clock.
     clock: RefCell<Box<FrameClock>>,
+    /// The attached clock source: an independent reading a test can move with
+    /// `advance_tick_source`. The `System` native takes the later of this and
+    /// the frame clock, so a source left at zero never changes what a test
+    /// reads. Boxed so the address the host holds stays stable when `Env`
+    /// moves.
+    frame_time: Box<HarnessFrameTime>,
     _input: Box<InputState>,
     _storage: Option<Box<Storage>>,
     _game_dir: Option<PathBuf>,
@@ -94,6 +124,20 @@ impl Env {
             host.services_mut()
                 .attach_clock(clock.as_mut() as *mut FrameClock);
         }
+        // The source's reading starts at zero (so the frame clock leads it and
+        // the script's tick count is the frame clock, as it is for a host that
+        // attached no source); a test moves it on its own with
+        // `advance_tick_source`.
+        let frame_time = Box::new(HarnessFrameTime {
+            now_ms: std::cell::Cell::new(0.0),
+        });
+        let source: &(dyn FrameTimeSource + 'static) = frame_time.as_ref();
+        // SAFETY: the source is boxed inside `Env`, which outlives the host
+        // (its fields are declared after `_host`), so its pointer stays valid.
+        unsafe {
+            host.services_mut()
+                .attach_frame_time(source as *const (dyn FrameTimeSource + 'static));
+        }
         let (storage, game_dir) = if with_storage {
             let dir = unique_dir("krkr-compat-test");
             std::fs::create_dir_all(&dir).expect("create temp game dir");
@@ -128,6 +172,7 @@ impl Env {
             scene,
             timer: RefCell::new(timer),
             clock: RefCell::new(clock),
+            frame_time,
             _input: input,
             _storage: storage,
             _game_dir: game_dir,
@@ -235,6 +280,18 @@ impl Env {
     pub fn advance_clock(&self, dt_ms: f64) -> u64 {
         let mut clock = self.clock.borrow_mut();
         clock.advance(dt_ms)
+    }
+
+    /// Move the attached clock source's own reading by `ms`, leaving the frame
+    /// clock where it is.
+    ///
+    /// This is what a source that measures real time does between two frames: a
+    /// script's tick count samples the source when it asks, so the reading moves
+    /// while no frame runs and the frame clock does not move. A negative value
+    /// moves the reading backwards, which the tick count must not follow.
+    pub fn advance_tick_source(&self, ms: f64) {
+        let source = &self.frame_time;
+        source.now_ms.set(source.now_ms.get() + ms);
     }
 
     /// Move the attached timer registry's injected time forward by `ms`

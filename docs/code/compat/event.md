@@ -80,8 +80,15 @@ state-free and still needs the position to build the positional arguments.
 
 `dispatch_frame(ctx, events)` is what the VM host's frame body runs
 (`crates/vm/src/host.rs`). It applies every event to the L2 input state,
-maps it and delivers it, in the order the platform produced the events. No
-event is merged with another and none is dropped.
+maps it and delivers it, in the order the platform produced the events. Two
+deliveries are narrowed by the reference's own rules, and only those two:
+
+| Rule | Effect |
+|---|---|
+| the window's move is **discardable** | a newer move replaces the pending one, so the window's `onMouseMove` runs once per frame, with the newest position (`reference/cpp/core/visual/WindowIntf.cpp:361-372`) |
+| the layer's move needs a **changed position** | the layer's `onMouseMove` fires only when the position differs from the previous move's; the hit test still runs on every move (`reference/cpp/core/visual/LayerManager.cpp:426`, `:433`, `:507`) |
+
+Every other event is delivered as it arrived.
 
 ### The dispatch budget
 
@@ -94,7 +101,7 @@ defers the rest to the next frame:
 | the budget | the wall-clock time one frame may spend dispatching events — 4 ms by default (`EventAdapter::DEFAULT_DISPATCH_BUDGET`) |
 | the check | after an event was dispatched, so **every frame delivers at least one event** |
 | the deferred events | stay queued in the adapter, in arrival order, and the next `dispatch_frame` delivers them **first** |
-| the order | the delivery order is the arrival order; nothing is dropped or reordered |
+| the order | the delivery order is the arrival order; no event is reordered, and only the window's superseded move is dropped (the discardable rule above) |
 
 The budget is a **presentation policy**, not a compatibility rule: it bounds
 how long one frame may spend in the event loop, so a flood cannot spend
@@ -119,11 +126,18 @@ applied to the state of that frame.
 
 ### The events are not merged
 
-The pointer move, the wheel, the key, the text and the touch events are each
-delivered on their own, in arrival order. The reference posts every one of
-them as an ordinary event (`reference/cpp/core/visual/LayerIntf.cpp:3438-3447`,
-`:3506-3513`, `:3882-3889`, `:3844-3877`), so their count and their order
-are script-observable.
+The wheel, the key, the text and the touch events are each delivered on their
+own, in arrival order, and so is every pointer move to the **layer** that
+changed position. The reference posts every one of them as an ordinary event
+(`reference/cpp/core/visual/LayerIntf.cpp:3438-3447`, `:3506-3513`,
+`:3882-3889`, `:3844-3877`), and the layer's move is gated by `poschanged`
+there too (`reference/cpp/core/visual/LayerManager.cpp:426`, `:507`), so the
+count and the order are script-observable — one layer delivery per changed
+position.
+
+Only the window's move is not: it is posted discardable
+(`reference/cpp/core/visual/WindowIntf.cpp:361-372`), so one frame's burst
+leaves one event and the handler runs once.
 
 ---
 
@@ -145,7 +159,9 @@ owns it.
 
 3. The **enter/leave transition** is checked before the move/press delivery,
    exactly like the reference's `PrimaryMouseMove`.
-4. The layer handler is delivered.
+4. The layer handler is delivered — for a move, only when the position
+   changed since the previous move (`poschanged`,
+   `reference/cpp/core/visual/LayerManager.cpp:426`, `:507`).
 5. A pointer move that **re-enters** the window posts the window-level
    `onMouseEnter`.
 6. A mouse **release** that completes a click posts `onClick` /
@@ -258,6 +274,7 @@ translation lives in L2 and is not repeated here.
 |---|---|
 | `crates/compat/tests/event.rs` | the platform → TJS mapping table, the argument lists, the wheel scale, the shift mask, the touch family |
 | `crates/compat/tests/event_dispatch.rs` | the delivery order: the window first, then the layer; the enter/leave transition; the click/double-click synthesis |
+| `crates/compat/tests/input_move.rs` | the two move rules: one frame of moves runs the window's handler once at the newest position, and the layer's handler once per changed position |
 | `crates/compat/tests/event_batch.rs` | the batch path: a burst of pointer moves is delivered across the frames in order, a deferred wheel reaches the focused layer in the next frame, the wheel/key/text events are all delivered, a target without a handler is a no-op and a throwing handler is reported |
 | `crates/compat/tests/input.rs` | the input state the adapter feeds |
 | `crates/compat/tests/focus_behaviour.rs` | the focused layer receives the key and wheel events |

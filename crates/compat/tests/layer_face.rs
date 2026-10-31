@@ -40,6 +40,20 @@ fn layer_alpha(env: &Env, index: usize, x: usize, y: usize) -> u8 {
     (layer_pixel(env, index, x, y) >> 24) as u8
 }
 
+/// The four planes of the pixel at `(x, y)` of the layer's main image, in the
+/// order the image stores them: red, green, blue, alpha.
+fn layer_rgba(env: &Env, index: usize, x: usize, y: usize) -> [u8; 4] {
+    let layer = env.scene.layers.get(index).expect("the layer");
+    let bitmap_id = layer.bitmap.expect("the layer has a main image");
+    let bitmap = env.scene.bitmap(bitmap_id).expect("the main image");
+    let offset = (y * bitmap.width as usize + x) * 4;
+    let rgba = bitmap
+        .rgba
+        .get(offset..offset + 4)
+        .expect("the pixel is inside the image");
+    [rgba[0], rgba[1], rgba[2], rgba[3]]
+}
+
 /// Reference: the layer constructor stores `Face = dfAuto` and resolves the
 /// draw face from it (`reference/cpp/core/visual/LayerIntf.cpp:371-372`), and
 /// the enum value of `dfAuto` is 128
@@ -333,4 +347,136 @@ fn the_add_alpha_face_rejects_a_negative_opacity() {
     let error =
         env.error("ImageFunction.drawText(b, f, 0, 0, 'A', 0xff0000ff, -1, true, dfAddAlpha);");
     assert!(error.contains("opacity"), "unexpected error: {error}");
+}
+
+/// The operation mode and the draw face select the blend method together
+/// (`reference/cpp/core/visual/LayerIntf.cpp:4217-4262`), and the render
+/// method cache names each method's implementation
+/// (`reference/cpp/core/visual/RenderManager.cpp:2416-2424`): `omAlpha` is
+/// the plain alpha blend on `dfAlpha` (`AlphaBlend_d`,
+/// `reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3555-3558`), the
+/// channel mix on `dfOpaque` (`AlphaBlend`, `:3401-3410`, which holds the
+/// destination's alpha) and the premultiplied over on `dfAddAlpha`
+/// (`AlphaBlend_a`, `:3499-3507`).
+///
+/// A destination that stores an additive alpha therefore cannot answer with
+/// the plain alpha blend: its stored colour is premultiplied, so the pass
+/// premultiplies the source and fades the destination by the source's alpha
+/// (`reference/cpp/core/visual/gl/blend_util_func.h:70-83`, the CPU twin the
+/// shader matches).
+#[test]
+fn the_operate_path_blends_onto_every_face_the_mode_accepts() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var src = new Layer(w, null); \
+         src.setImageSize(1, 1); \
+         src.fillRect(0, 0, 1, 1, 0xffff0000); \
+         var alpha = new Layer(w, null); \
+         alpha.setImageSize(1, 1); \
+         alpha.type = ltAlpha; \
+         alpha.fillRect(0, 0, 1, 1, 0x400000ff); \
+         var add = new Layer(w, null); \
+         add.setImageSize(1, 1); \
+         add.type = ltAddAlpha; \
+         add.fillRect(0, 0, 1, 1, 0x400000ff); \
+         var opaque = new Layer(w, null); \
+         opaque.setImageSize(1, 1); \
+         opaque.type = ltOpaque; \
+         opaque.fillRect(0, 0, 1, 1, 0x400000ff);",
+    );
+    // The alpha face runs the alpha-correct source-over: an opaque source
+    // replaces the destination, alpha included.
+    env.run("alpha.operateRect(0, 0, src, 0, 0, 1, 1, omAlpha);");
+    assert_eq!(layer_rgba(&env, 1, 0, 0), [255, 0, 0, 255]);
+    // The additive-alpha face premultiplies the source's colour and fades the
+    // destination by its alpha: at the full source alpha that is the source's
+    // colour and the source-over alpha, not the destination's colour.
+    env.run("add.operateRect(0, 0, src, 0, 0, 1, 1, omAlpha);");
+    assert_eq!(layer_rgba(&env, 2, 0, 0), [254, 0, 0, 255]);
+    // The opaque face runs the channel mix: the colours are mixed by the
+    // source's alpha and the destination's alpha is held.
+    env.run("opaque.operateRect(0, 0, src, 0, 0, 1, 1, omAlpha);");
+    assert_eq!(layer_rgba(&env, 3, 0, 0), [254, 0, 0, 0x40]);
+}
+
+/// `omAddAlpha` on an additive-alpha destination adds the opacity-scaled
+/// source and fades the destination by the source's alpha
+/// (`AdditiveAlphaBlend_a`, `reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3640-3649`;
+/// the CPU twin is the premultiplied blend,
+/// `reference/cpp/core/visual/gl/blend_util_func.h:70-83`), the alpha
+/// composing (`AdditiveAlphaBlend`, `:3629-3637`, holds the destination's
+/// alpha instead).
+#[test]
+fn the_operate_path_adds_onto_an_additive_alpha_destination() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var src = new Layer(w, null); \
+         src.setImageSize(1, 1); \
+         src.fillRect(0, 0, 1, 1, 0xffff0000); \
+         var add = new Layer(w, null); \
+         add.setImageSize(1, 1); \
+         add.type = ltAddAlpha; \
+         add.fillRect(0, 0, 1, 1, 0x400000ff); \
+         var opaque = new Layer(w, null); \
+         opaque.setImageSize(1, 1); \
+         opaque.type = ltOpaque; \
+         opaque.fillRect(0, 0, 1, 1, 0x400000ff);",
+    );
+    // The additive-alpha destination adds the whole source and composes the
+    // alphas.
+    env.run("add.operateRect(0, 0, src, 0, 0, 1, 1, omAddAlpha);");
+    assert_eq!(layer_rgba(&env, 1, 0, 0), [255, 0, 0, 255]);
+    // The opaque destination adds the opacity-scaled source to the faded
+    // destination and holds its alpha; at the full opacity that is the whole
+    // source colour.
+    env.run("opaque.operateRect(0, 0, src, 0, 0, 1, 1, omAddAlpha);");
+    assert_eq!(layer_rgba(&env, 2, 0, 0), [255, 0, 0, 0x40]);
+}
+
+/// `omOpaque` on an additive-alpha destination copies the source as an
+/// opaque image at the full opacity (`CopyOpaqueImage`,
+/// `reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3141-3147`), and
+/// below it the constant-alpha blend adds the source's colour and leaves the
+/// opacity as the alpha (`ConstAlphaBlend_a`, `:3171-3179`).
+///
+/// The hold spelling of that method does not exist: the cache registers no
+/// hold variant (`reference/cpp/core/visual/RenderManager.cpp:2423-2424`), so
+/// the full-opacity pass with the hold set draws nothing
+/// (`reference/cpp/core/visual/LayerBitmapIntf.cpp:1483-1484`).
+#[test]
+fn the_operate_path_draws_nothing_for_the_unholdable_copy() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var src = new Layer(w, null); \
+         src.setImageSize(1, 1); \
+         src.fillRect(0, 0, 1, 1, 0xffff0000); \
+         var add = new Layer(w, null); \
+         add.setImageSize(1, 1); \
+         add.type = ltAddAlpha; \
+         add.holdAlpha = true; \
+         add.fillRect(0, 0, 1, 1, 0x400000ff);",
+    );
+    // The hold has no spelling at the full opacity: the destination keeps
+    // every plane.
+    env.run("add.operateRect(0, 0, src, 0, 0, 1, 1, omOpaque);");
+    assert_eq!(layer_rgba(&env, 1, 0, 0), [0, 0, 255, 0x40]);
+    // Without the hold the source is copied as an opaque image.
+    env.run("add.holdAlpha = false; add.operateRect(0, 0, src, 0, 0, 1, 1, omOpaque);");
+    assert_eq!(layer_rgba(&env, 1, 0, 0), [255, 0, 0, 255]);
+    // Below the full opacity the method has one spelling, which draws.
+    env.run(
+        "var dst = new Layer(w, null); \
+         dst.setImageSize(1, 1); \
+         dst.type = ltAddAlpha; \
+         dst.holdAlpha = true; \
+         dst.fillRect(0, 0, 1, 1, 0x400000ff); \
+         dst.operateRect(0, 0, src, 0, 0, 1, 1, omOpaque, 128);",
+    );
+    assert_eq!(layer_rgba(&env, 2, 0, 0), [255, 0, 126, 160]);
 }

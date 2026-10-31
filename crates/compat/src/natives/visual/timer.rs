@@ -110,20 +110,17 @@ fn mode_priority(mode: i64) -> u8 {
     }
 }
 
-/// Queue one fire of `id` — the L3 half of the reference's
-/// `tTJSNI_BaseTimer::Fire` posting (`TimerIntf.cpp:69-111`).
+/// Queue the `onTimer` postings for the fires of `id` a delivery replays.
 ///
-/// The reference computes `cap = TVPLimitTimerCapacity ? 1 : (Capacity == 0 ?
-/// 65535 : Capacity)` and posts only while `cap - <queued> > 0`
-/// (`TimerIntf.cpp:71-93`); a non-positive capacity posts nothing. The L2
-/// registry hands the L3 one fire per interval the timer missed, and this
-/// function queues one `onTimer` posting per fire: the room left in the
-/// capacity is counted again for every fire, so a catch-up of `n` fires
-/// queues the same `min(n, cap - <already queued>)` postings a single
-/// clamped call queues, and a backlog that does not fit is dropped. A
-/// negative capacity is already expressed by not arming the L2 timer
-/// (`sync_schedule`). The check is kept so the mapping stays explicit.
-fn post_on_timer(services: &CompatServices, id: TimerId) {
+/// The effective capacity is 65535 for the no-limit sentinel (`0`) and the
+/// binding's capacity otherwise; a non-positive capacity posts nothing. The
+/// engine hands this function the whole replay count in one call, so it clamps
+/// once and queues at most the room the capacity leaves: a backlog that does
+/// not fit is dropped. The clamp is O(1) in the replay length — a process
+/// suspended for an hour queues at most `cap` postings, not one per interval.
+/// A negative capacity is already expressed by not arming the engine timer
+/// (`sync_schedule`).
+fn post_on_timer(services: &CompatServices, id: TimerId, fires: u64) {
     let mut posts = services.state::<TimerPosts>();
     let (mode, capacity) = {
         let state = services.state::<VisualState>();
@@ -137,16 +134,22 @@ fn post_on_timer(services: &CompatServices, id: TimerId) {
     if cap <= 0 {
         return;
     }
-    let queued = posts.pending.iter().filter(|post| post.id == id).count() as i64;
-    if queued >= cap {
+    // `cap` is positive here, so its magnitude is its value and the
+    // conversion is total for every capacity that reaches this point.
+    let cap = cap.unsigned_abs();
+    let queued = posts.pending.iter().filter(|post| post.id == id).count() as u64;
+    let count = fires.min(cap.saturating_sub(queued));
+    if count == 0 {
         return;
     }
     let generation = posts.generation.get(&id).copied().unwrap_or(0);
-    posts.pending.push(TimerPost {
-        id,
-        mode,
-        generation,
-    });
+    for _ in 0..count {
+        posts.pending.push(TimerPost {
+            id,
+            mode,
+            generation,
+        });
+    }
 }
 
 /// Bump `id`'s cancellation generation, invalidating every entry already
@@ -364,22 +367,23 @@ extern "C" fn timer_invalidate(engine: *mut c_void, instance: *mut c_void) {
 ///
 /// The closure captures only the engine pointer the ABI handed the
 /// constructor: the binding key is the [`TimerId`] it receives on every
-/// fire, and the retained owner / action live in the [`TimerBinding`],
+/// delivery, the replay count is how many `onTimer` postings that delivery
+/// stands for, and the retained owner / action live in the [`TimerBinding`],
 /// resolved through `bound(engine)` at fire time — so a timer invalidated
 /// or destroyed after collection finds no binding and dispatches nothing.
 fn timer_callback(engine: *mut c_void) -> TimerCallback {
-    Box::new(move |id| {
+    Box::new(move |id, fires| {
         // SAFETY: `engine` is the live pointer the native ABI passed to this
-        // timer's constructor; L2 only invokes callbacks from `timer_poll`,
-        // which requires the same bound context, so `bound` resolves it the
-        // same way every other native does.
+        // timer's constructor; L2 only invokes callbacks from the frame's
+        // timer delivery, which requires the same bound context, so `bound`
+        // resolves it the same way every other native does.
         let Ok((_resolved, ctx)) = bound(engine) else {
             log::warn!("Timer {id:?}: compat context is not bound; fire dropped");
             return;
         };
         // SAFETY: the caller resolved `ctx` from the installed binding.
         let services = unsafe { ctx.services() };
-        post_on_timer(services, id);
+        post_on_timer(services, id, fires);
     })
 }
 

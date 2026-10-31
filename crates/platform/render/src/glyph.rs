@@ -7,10 +7,10 @@
 //!
 //! The rasterization core: [`px_scale_for_height`] keeps the height-to-scale
 //! convention, and the rasterizer provides the missing-glyph fallback, the
-//! synthetic bold (a 1 px right dilation of the drawn coverage, which leaves
-//! the measured advance alone) and the synthetic oblique slant. This API
-//! returns per-glyph coverage positioned by its bearings instead of packing
-//! pixels into a shared RGBA cell.
+//! synthetic bold (a 1 px right dilation of the drawn coverage plus the same
+//! pixel in the drawn and the measured advance) and the synthetic oblique
+//! slant. This API returns per-glyph coverage positioned by its bearings
+//! instead of packing pixels into a shared RGBA cell.
 
 use std::fmt;
 
@@ -24,6 +24,15 @@ use api::glyph::{FontMetrics, GlyphBitmap, GlyphStyle};
 /// `0.25` is the conventional ~14° oblique the middle layer applies at paint
 /// time.
 const ITALIC_SLANT: f32 = 0.25;
+
+/// The pixel the synthetic bold adds to a glyph.
+///
+/// The coverage is dilated one pixel to the right and the advance grows by the
+/// same pixel, so the drawn pen advance and the measured advance agree. A face
+/// that emboldens a glyph for real grows the advance by about a twenty-fourth of
+/// the em; one pixel is this backend's stand-in for that amount, and
+/// `docs/code/platform/render.md` records the gap.
+const BOLD_ADVANCE: f32 = 1.0;
 
 /// Stateless font service.
 ///
@@ -134,8 +143,8 @@ pub fn load_font(fs: &FontSystem, bytes: &[u8], index: u32) -> Result<Font, Glyp
 /// * A glyph the face maps but does not outline (a space, a combining mark)
 ///   produces an empty bitmap carrying that glyph's advance.
 /// * [`GlyphStyle::bold`] applies a 1 px rightward coverage dilation and adds
-///   1 px to the drawn advance. The measured advance ([`glyph_advance`]) is
-///   the face's own and does not change.
+///   [`BOLD_ADVANCE`] to the drawn advance; [`glyph_advance`] reports the same
+///   advance, so a layout that measures and a layout that draws agree.
 /// * [`GlyphStyle::italic`] applies a synthetic oblique shear about the
 ///   glyph's vertical center without changing the advance.
 ///
@@ -164,6 +173,11 @@ pub fn rasterize_glyph(
     let scaled = font.face().as_scaled(scale);
     let id = glyph_id_with_fallback(glyph, &scaled);
     let mut advance = round_advance(scaled.h_advance(id)) as f32;
+    // The bold pixel is part of the advance whatever the glyph outlines, so the
+    // no-outline and empty-bitmap returns below report it too.
+    if style.bold {
+        advance += BOLD_ADVANCE;
+    }
 
     let positioned = id.with_scale_and_position(scale, ab_glyph::point(0.0, 0.0));
     let Some(outline) = scaled.outline_glyph(positioned) else {
@@ -208,7 +222,6 @@ pub fn rasterize_glyph(
     if style.bold {
         coverage = dilate_right(&coverage, w, h);
         width += 1;
-        advance += 1.0;
     }
     if style.italic {
         let (sheared, sheared_width, bearing_delta) = shear_coverage(&coverage, width, height);
@@ -225,17 +238,17 @@ pub fn rasterize_glyph(
 
 /// Returns the horizontal pen advance for `glyph`.
 ///
-/// The result is the glyph's rounded advance, the extent a text measurement
-/// sums. The synthetic style does not change it: the bold widens the drawn
-/// coverage and the drawn advance ([`rasterize_glyph`]), while the measured
-/// advance stays the face's own. Control characters advance by `0`. A
-/// non-positive or non-finite `size_px` also returns `0`.
+/// The result is the glyph's rounded advance plus [`BOLD_ADVANCE`] when the
+/// style is bold, i.e. exactly the `advance` [`rasterize_glyph`] reports for the
+/// same arguments: a measurement and a drawing of the same run advance alike.
+/// Control characters advance by `0`. A non-positive or non-finite `size_px`
+/// also returns `0`.
 pub fn glyph_advance(
     fs: &FontSystem,
     font: &Font,
     glyph: char,
     size_px: f32,
-    _style: GlyphStyle,
+    style: GlyphStyle,
 ) -> f32 {
     let _ = fs;
     if size_px <= 0.0 || !size_px.is_finite() || glyph.is_control() {
@@ -244,7 +257,11 @@ pub fn glyph_advance(
     let scale = px_scale_for_height(font.face(), size_px);
     let scaled = font.face().as_scaled(scale);
     let id = glyph_id_with_fallback(glyph, &scaled);
-    round_advance(scaled.h_advance(id)) as f32
+    let mut advance = round_advance(scaled.h_advance(id)) as f32;
+    if style.bold {
+        advance += BOLD_ADVANCE;
+    }
+    advance
 }
 
 /// Returns the scaled metrics of `font` at `size_px`.
