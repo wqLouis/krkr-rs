@@ -26,8 +26,7 @@ function, so a script sees the decoder only through
 
 `wutcwf.dll` is a name in the built-in table
 (`crates/compat/src/natives/plugins/mod.rs`), so `Plugins.link("wutcwf.dll")`
-resolves to the built-in and succeeds; a game that links the DLL is not
-routed to the null plugin object.
+resolves to the built-in and succeeds; the DLL is not absent.
 
 ### Where the decoder lives
 

@@ -61,7 +61,7 @@ Two static methods, registered in
 
 ### `Window` members
 
-Seventeen instance methods, three instance properties and twenty-four class
+Seventeen instance methods, five instance properties and twenty-four class
 constants, registered in
 `crates/compat/src/natives/plugins/window_ex/window.rs`, plus the
 `Window._Notifications` dictionary.
@@ -88,6 +88,8 @@ constants, registered in
 | `disableResize` | instance property (read/write) | the disable-resize flag |
 | `enableNCMouseEvent` | instance property (read/write) | the non-client mouse-event flag |
 | `exSystemMenu` | instance property (read/write) | the extended system menu object, `null` when unset |
+| `maximized` | instance property (read/write) | whether the window is zoomed; `false` — the setter is inert |
+| `minimized` | instance property (read/write) | whether the window is iconic; `false` — the setter is inert |
 | `_Notifications` | static property | the two-way notification name/value dictionary |
 
 The class constants are the Win32 non-client hit-test codes
@@ -112,8 +114,18 @@ The class constants are the Win32 non-client hit-test codes
 Members the reference *could* have registered are deliberately absent,
 because the reference's own registrations are commented out
 (`reference/cpp/plugins/windowEx.cpp:962-967`, `:976-977`, `:981-982`):
-`Window.disableMove`, `Window.resetExSystemMenu`, `Window.maximized` /
-`Window.minimized` and `Window.maximizeBox` / `Window.minimizeBox`.
+`Window.disableMove`, `Window.resetExSystemMenu` and `Window.maximizeBox` /
+`Window.minimizeBox`.
+
+`Window.maximized` and `Window.minimized` are the exception: the **shipped**
+`windowEx.dll` registers them, and a game depends on them. The DLL build is
+the oracle here (`windowEx.dll`, sha256[:12] `124d2d426204`): it imports
+`IsZoomed` and `IsIconic` from `USER32.dll` and answers the getter with
+them (the calls are at `0x10015049` and `0x100150f9`), so a window that is
+neither zoomed nor iconic answers `false`. This host has no zoomed or iconic
+window, so both properties answer `false`; the setters are inert, because
+the DLL's only `ShowWindow` calls pass `SW_HIDE` and `SW_SHOWNORMAL` and
+never change the window state from the property.
 
 ### `MenuItem` members
 
@@ -409,7 +421,7 @@ logging: an evaluation error raises in both states.
 
 | file | what it pins |
 |---|---|
-| `crates/compat/tests/window_ex.rs` | the whole plugin surface: the `System` members and their argument validation, the `System.metrics` lookup, the host seam before and after a provider is installed, the `getMonitorInfo` calling convention, the `Window` rectangles and flags, the `exSystemMenu` object lifecycle, `setOverlayBitmap`, the message-hook flag, the notification table and its two lookups, the `MenuItem` members, the `Console` members, the `Pad` member and the `Scripts.eval` override |
+| `crates/compat/tests/window_ex.rs` | the whole plugin surface: the `System` members and their argument validation, the `System.metrics` lookup, the host seam before and after a provider is installed, the `getMonitorInfo` calling convention, the `Window` rectangles and flags, the zoomed/iconic states and their inert setters, the `exSystemMenu` object lifecycle, `setOverlayBitmap`, the message-hook flag, the notification table and its two lookups, the `MenuItem` members, the `Console` members, the `Pad` member and the `Scripts.eval` override |
 | `crates/compat/tests/dispatch_ui.rs` | that the objthis-keyed flag maps reach the right receiver — `window_ex_window_flags_reach_the_target` and `window_ex_menu_item_flags_reach_the_target` — and that `System.getDoubleClickTime` is the static `-1` literal |
 | `crates/compat/tests/menu_dll_surface.rs` | that the `MenuItem` members the `windowEx` port adds are exactly the `bi*` constants, the four instance properties and `popupEx`, and that they are the only members outside the `menu.dll` fixture |
 | `crates/compat/tests/get_about.rs` | that `System.getAboutString` — owned by this port — is attached to the `System` class |
@@ -417,9 +429,11 @@ logging: an evaluation error raises in both states.
 
 The plugin-parity report
 ([`docs/plugin_parity.md`](../../../plugin_parity.md)) lists every class this
-plugin touches at full coverage, with no missing and no extra member. The
-`Window` (44), `MenuItem` (15), `Console` (7) and `Pad` (1) figures are
-exactly the members listed above; the `System` figure (16) adds the
+plugin touches at full coverage, with no missing member. The `Window` (46),
+`MenuItem` (15), `Console` (7) and `Pad` (1) figures are exactly the members
+listed above; the two `Window` extras are `maximized` and `minimized`, which
+the shipped DLL registers and the reference source leaves commented out. The
+`System` figure (16) adds the
 `clearGraphicCache` the reference's `windowEx` also attaches — the core
 `System` class owns that member in the port — and the `addFont` member of
 the `addFont` port. The `Scripts` row also covers the `ScriptsEx` port.
@@ -433,6 +447,11 @@ the `addFont` port. The `Scripts` row also covers the `ScriptsEx` port.
   (`reference/cpp/plugins/windowEx.cpp:364-397`, `:623-649`), so the
   observable result matches, but a game written for Windows gets no window
   management from them.
+* **The zoomed and iconic states are always false.** `Window.maximized` and
+  `Window.minimized` answer the state the shipped DLL reads from the native
+  window handle (`IsZoomed` / `IsIconic`), but this host has no zoomed or
+  iconic window, so both answer `false` and their setters are inert. A
+  window the user never maximises sees the same answer the DLL gives.
 * **No window message dispatch.** `setMessageHook` arms the all-messages
   flag, but nothing ever delivers a Win32 message to the script, so
   `onWindowsMessageHook` and the `EXEV_*` handlers never fire. The

@@ -188,4 +188,4 @@ non-object-raises / null-accepted rule, the property round trips, the
 |---|---|
 | the L3 layer | [`../../arch/l3.md`](../../arch/l3.md) |
 | the error contract and the host environment | [`../../rules/arch_rules.md`](../../rules/arch_rules.md) §6, §7 |
-| the plugin model and the null plugin | [`../../arch/l3.md`](../../arch/l3.md) §5 |
+| the plugin model and an unported plugin | [`../../arch/l3.md`](../../arch/l3.md) §5 |

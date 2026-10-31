@@ -62,19 +62,6 @@ so the buffers must outlive the call. They live here rather than in a
 thread-local so that the **only** process-wide state stays the documented
 binding.
 
-### The no-op closure
-
-The null plugin hands a no-op callable back for an absent member read or
-call. The closure is created **once** at install time and *duplicated* per
-access, so a member read never re-enters the VM and never clobbers the
-engine's "last object" slot.
-
-It is stored as a raw `Tjs2ValueId` rather than a `DetachedValue`, and the
-Rust handle is deliberately leaked (`mem::forget`): the engine owns the C++
-retention and frees it at destruction, so dropping the host can never touch
-the engine. `clear_noop_closure` forgets the id without touching the engine,
-which makes it safe to call during teardown.
-
 ---
 
 ## 2. The per-family state map
@@ -149,7 +136,7 @@ It is **not** a safe value handle:
 | Method | Registers |
 |---|---|
 | `register_class(builder)` | a static native class (`System`, `Storages`, `Plugins`, …) |
-| `register_instance(builder)` | an instance native class (`Window`, `Layer`, `Bitmap`, `Font`, `Timer`, `AsyncTrigger`, `MenuItem`, `VideoOverlay`, `BitmapLayerTreeOwner`, `KAGParser`, `NullPlugin`, the draw devices) |
+| `register_instance(builder)` | an instance native class (`Window`, `Layer`, `Bitmap`, `Font`, `Timer`, `AsyncTrigger`, `MenuItem`, `VideoOverlay`, `BitmapLayerTreeOwner`, `KAGParser`, the draw devices) |
 | `register_static_members(members)` | static members on an already-registered class |
 | `register_instance_members(members)` | instance members on an already-registered class, including a TJS2 builtin such as `Array`/`Dictionary` |
 | `delete_member(id, name)` | removes a member from a retained object |

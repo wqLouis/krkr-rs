@@ -35,8 +35,8 @@ function:
 ## Behaviour
 
 `Plugins.link("wuvorbis.dll")` resolves to the built-in table and succeeds, so
-the game is not routed to the null plugin object. The entry carries no
-members of its own, so the link changes nothing else either.
+the DLL is not absent. The entry carries no members of its own, so the link
+changes nothing else either.
 
 The compat layer never links a codec: it exposes the host decoder seam
 `compat::add_audio_decoder`
@@ -68,10 +68,9 @@ belongs to the engine's mixer.
 
 | file | what it pins |
 |---|---|
-| `crates/compat/tests/wuvorbis.rs` | that the link resolves to the built-in table and is idempotent (no `wuvorbis` null global, no TJS class); that a `WaveSoundBuffer` over the committed 0.2 s / 44.1 kHz fixture decodes through the host chain installed the way the composition root installs it; that running without the host decoder is a typed error; and that a corrupt `.ogg` reports the decoder's typed error |
+| `crates/compat/tests/wuvorbis.rs` | that the link resolves to the built-in table and is idempotent (no `wuvorbis` global, no TJS class); that a `WaveSoundBuffer` over the committed 0.2 s / 44.1 kHz fixture decodes through the host chain installed the way the composition root installs it; that running without the host decoder is a typed error; and that a corrupt `.ogg` reports the decoder's typed error |
 | `crates/platform/media/tests/audio.rs` | that the same fixture probes and decodes with the `.ogg` name, the bare extension and no hints; that a stream decodes frame-identically to the whole-file decode; and that a truncated stream is a typed `MediaError` |
 | `crates/compat/tests/plugin.rs` | that `wuvorbis.dll` — one of the DLLs the shipped game links — resolves to the built-in table |
-| `crates/compat/tests/null_plugin.rs` | that linking `wuvorbis.dll` installs no null plugin object under the DLL's stem |
 
 ## Known gaps
 

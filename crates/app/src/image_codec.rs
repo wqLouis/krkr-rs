@@ -60,7 +60,7 @@ pub(crate) fn install_image_codec_metered(
     stats: &Rc<StartupStats>,
 ) {
     let fs = storage.file_system().clone();
-    let base = storage.game_dir().to_path_buf();
+    let base = storage.app_dir().to_path_buf();
     install_image_codec_on_metered(host, media, fs, base, stats);
 }
 

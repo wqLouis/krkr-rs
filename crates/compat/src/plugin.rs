@@ -6,7 +6,6 @@ use std::sync::Mutex;
 
 use crate::CompatCtx;
 use crate::CompatError;
-use crate::null_plugin;
 
 /// A statically built-in native plugin emulation.
 ///
@@ -97,43 +96,35 @@ impl NativePlugin for BuiltinPluginDef {
 pub enum PluginOutcome {
     /// A built-in emulation was registered.
     Builtin,
-    /// The plugin is not emulated; the null-plugin path was taken. The null
-    /// object becomes `global[stem]` only when that name is not already
-    /// bound — an existing binding is kept, never clobbered.
-    Null,
+    /// The plugin has no emulation: the link is recorded and one warning
+    /// names the plugin, and nothing is registered for it — an absent plugin
+    /// reads as absent.
+    Unported,
 }
 
 /// What a linked name resolves to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LinkedKind {
     Builtin,
-    Null,
+    Unported,
 }
 
 /// One entry of the `Plugins.getList` list.
 #[derive(Clone, Debug)]
 struct LinkedEntry {
-    /// The name the script passed, case preserved (`getList` and the null
-    /// global both use it).
+    /// The name the script passed, case preserved (`getList` uses it).
     name: String,
     /// The normalized base name used for built-in lookup.
     key: String,
     kind: LinkedKind,
-    /// For a null link: whether *this* link installed `global[stem]`. An
-    /// existing global is never clobbered, so a link whose stem was already
-    /// taken must not clear it on `unlink` — only the owner does.
-    installed_global: bool,
 }
 
 /// Holds the built-in plugins and activates them by name.
 ///
 /// `link` is idempotent: a name that was already activated is not registered
 /// twice (the C++ side rejects duplicate class names). A name with no
-/// built-in emulation installs the null plugin object instead — the single
-/// documented exception, and it is not silent
-/// (every member access logs a warning). The null global is installed only
-/// where the stem is free: a `global[stem]` that already holds a native
-/// class or script value is kept, and `unlink` then leaves it alone.
+/// built-in emulation is recorded and warned about, and nothing is
+/// registered for it: the absent plugin reads as absent.
 pub struct PluginRegistry {
     plugins: Vec<Box<dyn NativePlugin>>,
     /// The linked names in insertion order, so `Plugins.getList` preserves
@@ -177,8 +168,8 @@ impl PluginRegistry {
     /// available before any script runs (today `xp3filter.dll`) is marked
     /// registered by [`Self::new`]; a later `Plugins.link` of any
     /// other built-in activates it and registers its classes. A name that is
-    /// not in the table falls back to the null plugin object — installed only
-    /// where the stem is free.
+    /// not in the table is recorded and warned about, and nothing is
+    /// registered for it.
     pub fn builtin() -> Self {
         let mut registry = Self::new();
         for def in crate::natives::plugins::BUILTIN_PLUGINS {
@@ -224,41 +215,35 @@ impl PluginRegistry {
             .collect()
     }
 
-    /// Activate a plugin name: register the built-in emulation, or install
-    /// the null plugin object when none exists — never over a `global[stem]`
-    /// that is already bound (that binding wins and is preserved on
-    /// [`Self::unlink`]).
+    /// Activate a plugin name: register the built-in emulation, or record the
+    /// link and warn when the name has no emulation.
     ///
-    /// The null hook class must already be registered (the host does this
-    /// when it installs the compatibility surface).
+    /// An unported name registers nothing: no global under the plugin's stem
+    /// and no object that swallows member accesses. The link is recorded, so
+    /// `Plugins.getList` reports it, and one warning names the plugin.
     ///
     /// # Errors
     ///
     /// Returns [`CompatError::Register`] when the plugin's own registration
-    /// fails, or when the null-plugin object cannot be created or installed as
-    /// a script global.
+    /// fails.
     pub fn activate(&self, name: &str, ctx: &mut CompatCtx) -> Result<PluginOutcome, CompatError> {
         let key = normalize_plugin_name(name);
         if let Some(kind) = self.linked_kind(&key) {
             return Ok(match kind {
                 LinkedKind::Builtin => PluginOutcome::Builtin,
-                LinkedKind::Null => PluginOutcome::Null,
+                LinkedKind::Unported => PluginOutcome::Unported,
             });
         }
         if let Some(plugin) = self.plugin(&key) {
             // Track the canonical name so aliases sharing one `register`
             // (e.g. `layerExDraw.dll` / `perspective.dll`) register once.
             self.ensure_registered(plugin, ctx)?;
-            self.push_linked(name, &key, LinkedKind::Builtin, false);
+            self.push_linked(name, &key, LinkedKind::Builtin);
             Ok(PluginOutcome::Builtin)
         } else {
-            // Install the null object under the script's original name (the
-            // stem is derived inside `null_plugin::install`). A global that
-            // already exists is kept, not replaced; record whether this link
-            // owns the binding so `unlink` only clears what it installed.
-            let installed_global = null_plugin::install(ctx, name)?;
-            self.push_linked(name, &key, LinkedKind::Null, installed_global);
-            Ok(PluginOutcome::Null)
+            log::warn!("plugin {name:?}: no built-in emulation; the plugin is not available");
+            self.push_linked(name, &key, LinkedKind::Unported);
+            Ok(PluginOutcome::Unported)
         }
     }
 
@@ -266,11 +251,9 @@ impl PluginRegistry {
     ///
     /// Built-in classes stay registered on the VM (the ABI cannot remove
     /// them); only the `getList` entry is dropped, and a later `link` is
-    /// idempotent. A null plugin's script global is cleared best-effort —
-    /// and only when this link installed it and it still holds the null
-    /// object (a binding the link kept, or one a script wrote over, is
-    /// preserved).
-    pub fn unlink(&self, name: &str, ctx: &mut CompatCtx) -> bool {
+    /// idempotent. An unported link owns no global, so there is nothing to
+    /// clear.
+    pub fn unlink(&self, name: &str) -> bool {
         let key = normalize_plugin_name(name);
         let mut linked = self
             .linked
@@ -279,14 +262,7 @@ impl PluginRegistry {
         let Some(pos) = linked.iter().position(|entry| entry.key == key) else {
             return false;
         };
-        let entry = linked.remove(pos);
-        drop(linked);
-        if entry.kind == LinkedKind::Null && entry.installed_global {
-            // Best-effort: a failure only leaves the harmless global behind.
-            // A link that kept a pre-existing binding installed no global,
-            // so it must not delete one here.
-            let _ = null_plugin::remove(ctx, &entry.name);
-        }
+        linked.remove(pos);
         true
     }
 
@@ -328,9 +304,9 @@ impl PluginRegistry {
     /// with the reference's `(info) Loading <name>` line (`:173-174`).
     ///
     /// Linking goes through the same path as `Plugins.link`: a ported name
-    /// activates its built-in emulation, an unported name gets the null-plugin
-    /// object and one warning (the reference tries to load the DLL and creates
-    /// no global when it fails).
+    /// activates its built-in emulation, an unported name is recorded and
+    /// warned about, and nothing is registered for it (a DLL that cannot be
+    /// loaded creates no global).
     ///
     /// # Errors
     ///
@@ -341,16 +317,11 @@ impl PluginRegistry {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        // One null-plugin warning per distinct unported name, even when the
-        // same file is found in more than one scanned directory.
-        let mut warned: BTreeSet<String> = BTreeSet::new();
         for name in names {
             let name = name.as_ref();
             log::info!("(info) Loading {name}");
             let dll = tpm_to_dll_name(name);
-            if self.activate(&dll, ctx)? == PluginOutcome::Null && warned.insert(dll) {
-                log::warn!("Plugins auto-load {name:?}: no built-in emulation; null plugin path");
-            }
+            self.activate(&dll, ctx)?;
         }
         Ok(())
     }
@@ -402,7 +373,7 @@ impl PluginRegistry {
         Ok(())
     }
 
-    fn push_linked(&self, name: &str, key: &str, kind: LinkedKind, installed_global: bool) {
+    fn push_linked(&self, name: &str, key: &str, kind: LinkedKind) {
         self.linked
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -410,7 +381,6 @@ impl PluginRegistry {
                 name: name.to_string(),
                 key: key.to_string(),
                 kind,
-                installed_global,
             });
     }
 }
@@ -439,16 +409,4 @@ fn tpm_to_dll_name(name: &str) -> String {
     let mut out = name[..stem.len()].to_string();
     out.push_str(".dll");
     out
-}
-
-/// The base name of a plugin with its extension removed, preserving case.
-///
-/// Used as the script-global name the null plugin object is installed under
-/// (`windowEx.dll` → `windowEx`).
-pub fn plugin_stem(name: &str) -> String {
-    let base = name.rsplit(['/', '\\', '>']).next().unwrap_or(name);
-    match base.rsplit_once('.') {
-        Some((stem, _)) if !stem.is_empty() => stem.to_string(),
-        _ => base.to_string(),
-    }
 }

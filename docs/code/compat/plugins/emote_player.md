@@ -72,7 +72,7 @@ None. `register` always succeeds.
 
 | file | what it pins |
 |---|---|
-| `crates/compat/tests/emote_player.rs` | that the loader defines no global of its own; that the link is idempotent, installs no null plugin object, and brings in the `Motion` namespace with its classes and the top-level `D3DEmotePlayer` / `D3DEmoteModule` |
+| `crates/compat/tests/emote_player.rs` | that the loader defines no global of its own; that the link is idempotent, publishes nothing under the DLL's stem, and brings in the `Motion` namespace with its classes and the top-level `D3DEmotePlayer` / `D3DEmoteModule` |
 | `crates/compat/tests/motion_player.rs` | that the namespace-only classes are **not** published as top-level globals, stay reachable under `Motion`, and that `Player`, `D3DEmotePlayer` and `D3DEmoteModule` stay top-level |
 
 ## Known gaps

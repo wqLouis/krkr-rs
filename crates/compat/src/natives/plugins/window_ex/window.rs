@@ -14,6 +14,12 @@
 //! `maximize`, `showRestore`, the window icon, `focusMenuByKey`, `bringTo`,
 //! `sendToBack`) are accepted; host facts (the cursor and system metrics)
 //! live on `System` and raise a typed error until installed.
+//!
+//! The `maximized` and `minimized` properties answer the window's zoomed and
+//! iconic state. The shipped `windowEx.dll` (sha256[:12] `124d2d426204`)
+//! reads that state from the native window handle (`IsZoomed` and `IsIconic`
+//! in `USER32.dll`); this host has no zoomed or iconic window, so both
+//! properties answer `false` and their setters are inert.
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
@@ -302,6 +308,84 @@ extern "C" fn window_inert(
     }
     WindowEx::inert();
     set_void(out);
+    0
+}
+
+// ---------------------------------------------------------------------------
+// maximized / minimized
+// ---------------------------------------------------------------------------
+
+/// `Window.maximized` — whether the window is in the zoomed state.
+///
+/// The shipped `windowEx.dll` (sha256[:12] `124d2d426204`) answers the
+/// getter with `IsZoomed` on the native window handle (the `USER32.dll`
+/// import at `0x10015049`), so a window that is neither zoomed nor iconic
+/// answers `false`. This host has no zoomed window state, so every window
+/// answers `false`.
+extern "C" fn window_maximized_get(
+    engine: *mut c_void,
+    _objthis: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if resolve(engine).is_none() {
+        return report_error(out_error, "Window.maximized: compat context is not bound");
+    }
+    set_bool(out, false);
+    0
+}
+
+/// `Window.minimized` — whether the window is in the iconic state.
+///
+/// The shipped `windowEx.dll` (sha256[:12] `124d2d426204`) answers the
+/// getter with `IsIconic` on the native window handle (the `USER32.dll`
+/// import at `0x100150f9`), so a window that is neither zoomed nor iconic
+/// answers `false`. This host has no iconic window state, so every window
+/// answers `false`.
+extern "C" fn window_minimized_get(
+    engine: *mut c_void,
+    _objthis: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if resolve(engine).is_none() {
+        return report_error(out_error, "Window.minimized: compat context is not bound");
+    }
+    set_bool(out, false);
+    0
+}
+
+/// `Window.maximized = value` — accepted and inert.
+///
+/// The shipped `windowEx.dll` does not change the window state from the
+/// property: its only `ShowWindow` calls pass `SW_HIDE` and
+/// `SW_SHOWNORMAL`, never `SW_MAXIMIZE`.
+extern "C" fn window_maximized_set(
+    engine: *mut c_void,
+    _objthis: *mut c_void,
+    _value: *const Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if resolve(engine).is_none() {
+        return report_error(out_error, "Window.maximized: compat context is not bound");
+    }
+    0
+}
+
+/// `Window.minimized = value` — accepted and inert.
+///
+/// The shipped `windowEx.dll` does not change the window state from the
+/// property: its only `ShowWindow` calls pass `SW_HIDE` and
+/// `SW_SHOWNORMAL`, never `SW_MINIMIZE`.
+extern "C" fn window_minimized_set(
+    engine: *mut c_void,
+    _objthis: *mut c_void,
+    _value: *const Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if resolve(engine).is_none() {
+        return report_error(out_error, "Window.minimized: compat context is not bound");
+    }
     0
 }
 
@@ -918,6 +1002,16 @@ pub(super) fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
                 name: "exSystemMenu",
                 get: Some(window_ex_system_menu_get),
                 set: Some(window_ex_system_menu_set),
+            },
+            NativeObjThisPropertyDef {
+                name: "maximized",
+                get: Some(window_maximized_get),
+                set: Some(window_maximized_set),
+            },
+            NativeObjThisPropertyDef {
+                name: "minimized",
+                get: Some(window_minimized_get),
+                set: Some(window_minimized_set),
             },
         ],
     })?;

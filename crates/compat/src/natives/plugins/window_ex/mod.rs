@@ -32,7 +32,7 @@
 //! * `Window` instance members: `minimize`, `maximize`, `showRestore`,
 //!   `focusMenuByKey`, `resetWindowIcon`, `setWindowIcon`, `getWindowRect`,
 //!   `getClientRect`, `getNormalRect`, `disableResize`,
-//!   `setOverlayBitmap`, `exSystemMenu`,
+//!   `setOverlayBitmap`, `exSystemMenu`, `maximized`, `minimized`,
 //!   `enableNCMouseEvent`, `ncHitTest`, `setMessageHook`, `bringTo`,
 //!   `sendToBack`, `registerExEvent`, `getNotificationNum`,
 //!   `getNotificationName`, and the static constants `nchtError` …

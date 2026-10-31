@@ -722,12 +722,17 @@ fn set_command_line(services: &CompatServices, name: &str, value: &str) {
 // L2 service helpers (Storage / Scene)
 // ---------------------------------------------------------------------------
 
-/// The game directory of the attached L2 storage, if any.
+/// The project directory of the attached L2 storage, if any.
+///
+/// The project directory is the root of the storage's disk namespace and the
+/// application path the script-visible system paths report, so it is the
+/// folder the project archive lives in — not necessarily the launch
+/// directory.
 fn project_dir(ctx: &CompatCtx) -> Option<std::path::PathBuf> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine, and the
     // host keeps the attached storage alive for the binding's lifetime.
     let ptr = unsafe { ctx.services() }.storage()?;
-    Some(host_ref(ptr).game_dir().to_path_buf())
+    Some(host_ref(ptr).app_dir().to_path_buf())
 }
 
 /// The reference storage-name form of a native host path:
@@ -1484,8 +1489,7 @@ extern "C" fn native_get_key_state(
 ///
 /// The reference `TVPShellExecute` returns `true` without launching anything
 /// (the `ShellExecute` call is disabled, `SystemImpl.cpp:77-88`); the port
-/// reproduces that inert value (the null-plugin precedent, doc 08 §4.2) rather
-/// than raising.
+/// reproduces that inert value rather than raising.
 extern "C" fn native_shell_execute(
     _engine: *mut c_void,
     argc: c_int,
@@ -1674,11 +1678,11 @@ const FALLBACK_EXE_NAME: &str = "krkr-rs/";
 /// The reference returns `TVPNormalizeStorageName(ExePath())`
 /// (`reference/cpp/core/base/impl/SystemImpl.cpp:838-847`), where `ExePath()`
 /// is the application path (`reference/cpp/core/environ/Application.cpp:92`).
-/// The application path here is the L2 storage root ([`project_dir`], the
-/// launcher's `--base-dir` / first archive's parent / default working
-/// directory). When no storage is attached the app path is unknown, so the
-/// getter reports the normalized working directory instead of raising: a
-/// Windows application always has an executable path.
+/// The application path here is the L2 storage's project directory
+/// ([`project_dir`], the folder the project archive lives in). When no
+/// storage is attached the app path is unknown, so the getter reports the
+/// normalized working directory instead of raising: a Windows application
+/// always has an executable path.
 extern "C" fn prop_exe_name(
     engine: *mut c_void,
     out: *mut Value,

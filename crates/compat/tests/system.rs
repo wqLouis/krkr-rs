@@ -502,6 +502,49 @@ fn storage_backed_paths_match_the_reference() {
     );
 }
 
+/// The system paths follow the *project directory*, not the mount root: a
+/// launch whose base directory is the parent of the game folder still reports
+/// the game folder as the application path.
+///
+/// The reference's app path is the project directory
+/// (`reference/cpp/core/base/impl/StorageImpl.cpp:503-509`), and the project
+/// directory is the launch path
+/// (`reference/cpp/core/environ/Application.cpp:319`,
+/// `reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`).
+#[test]
+fn the_system_paths_follow_the_project_directory() {
+    let _lock = vm_lock();
+    let mount_root = common::unique_dir("krkr-compat-mount");
+    let app_dir = common::unique_dir("krkr-compat-project");
+    let env = Env::with_storage_dirs(mount_root, app_dir.clone());
+    let app = normalized_app_dir(&app_dir);
+
+    assert_eq!(
+        env.eval("System.exePath").unwrap(),
+        TjsValue::String(app.clone())
+    );
+    assert_eq!(
+        env.eval("System.appDataPath").unwrap(),
+        TjsValue::String(app.clone())
+    );
+    assert_eq!(
+        env.eval("System.exeName").unwrap(),
+        TjsValue::String(app.clone())
+    );
+    assert_eq!(
+        env.eval("System.personalPath").unwrap(),
+        TjsValue::String(app.clone())
+    );
+    assert_eq!(
+        env.eval("System.savedGamesPath").unwrap(),
+        TjsValue::String(app.clone())
+    );
+    assert_eq!(
+        env.eval("System.dataPath").unwrap(),
+        TjsValue::String(format!("{app}savedata/"))
+    );
+}
+
 #[test]
 fn screen_size_reads_the_l2_scene() {
     let _lock = vm_lock();

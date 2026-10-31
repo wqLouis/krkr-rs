@@ -198,7 +198,7 @@ channel `1`), the new-style path four (the fourth is `sampleAhead`).
 | `crates/compat/tests/sound.rs` | the core `getVisBuffer` the plugin drives — its argument count, the `0` on an idle buffer, and the live peak while playing, where `sampleValue` reads the fixture tone's `(16384/32768)²` |
 | `crates/compat/tests/timer_behavior.rs` | the link-time publication: the members are absent before `Plugins.link("getSample.dll")`, the shipped `voice.tjs` publishes `WaveSoundBuffer.enableGetSample` after the link, and its `onFlip` action reads the flag and the plugin's `sampleValue` without raising |
 | `crates/compat/tests/dispatch_fmt.rs` | the receiver-sensitive dispatch of the objthis members: `with(target) { .sampleCount }` reads the target's per-object state |
-| `crates/compat/tests/plugin.rs` | that `getSample.dll` resolves to the built-in table and not to the null plugin |
+| `crates/compat/tests/plugin.rs` | that `getSample.dll` resolves to the built-in table |
 | `crates/compat/src/natives/plugins/get_sample/mod.rs` (unit tests) | the two reference reductions over synthetic buffers: the mean that skips negative samples, and the squared normalized peak |
 
 ## Known gaps

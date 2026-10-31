@@ -190,7 +190,7 @@ fn compute_placed_path(storage: &Storage, name: &str) -> Result<String, String> 
     match storage.find(name) {
         Ok(Some(Location::Disk(path))) => {
             let relative = path
-                .strip_prefix(storage.game_dir())
+                .strip_prefix(storage.app_dir())
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_else(|_| normalize_storage_name(name));
             Ok(normalize_storage_name(&relative))

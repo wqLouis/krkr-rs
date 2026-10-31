@@ -227,10 +227,10 @@ fn fixture_has_the_recovered_menu_item_surface() {
     }
 }
 
-/// `menu.dll` must resolve to the built-in table: linking it installs no
-/// null global, and the core `MenuItem` class stays available.
+/// `menu.dll` must resolve to the built-in table: the link registers the
+/// built-in's own surface, and the core `MenuItem` class stays available.
 #[test]
-fn menu_dll_links_as_a_builtin_without_a_null_global() {
+fn menu_dll_links_as_a_builtin() {
     let _lock = vm_lock();
     let engine = Box::new(Tjs2Engine::new().expect("create engine"));
     let mut host = CompatHost::new();
@@ -244,14 +244,14 @@ fn menu_dll_links_as_a_builtin_without_a_null_global() {
         vec!["menu.dll".to_string()],
         "the link must be recorded"
     );
-    // The null path would have created `global['menu']`; the built-in must
-    // not (the stem was free).
+    // The plugin's own surface is on the core class; nothing is published
+    // under the plugin's stem.
     assert_eq!(
         engine
             .eval("typeof global['menu']", "menu_dll_surface")
             .expect("probe the stem"),
         TjsValue::String("undefined".into()),
-        "a built-in link must not install the null plugin object"
+        "a built-in link must not publish a global under the stem"
     );
     // The core class is present and constructible through the link.
     assert!(

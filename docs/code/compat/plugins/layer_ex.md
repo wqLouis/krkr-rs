@@ -527,9 +527,8 @@ wrapper classes, which the reference registers through
 ## See also
 
 * [`../plugins.md`](../plugins.md) — the plugin index and the built-in table
-* [`../plugin.md`](../plugin.md) — the registry that decides built-in vs null
+* [`../plugin.md`](../plugin.md) — the registry that decides built-in vs absent
 * [`../plugins_native.md`](../plugins_native.md) — the `Plugins` class
-* [`../null_plugin.md`](../null_plugin.md) — the null plugin object
 * [`../README.md`](../README.md) — the compatibility layer index
 * [`../../../../docs.old/gdiplus.md`](../../../../docs.old/gdiplus.md) — the archived GDI+ notes (history, not contract)
 * [`../../../plugin_parity.md`](../../../plugin_parity.md) — the plugin parity report

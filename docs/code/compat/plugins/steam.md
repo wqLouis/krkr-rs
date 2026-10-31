@@ -9,8 +9,8 @@ The three DLL names are one port: the built-in table entry
 (`crates/compat/src/natives/plugins/mod.rs`) lists `krkrsteam.dll` with
 `steam_api.dll` and `DrawDeviceForSteam.dll` as aliases, and the one
 `register` installs all three classes. Linking any of the three names
-resolves to the built-in, so none of them falls through to the null plugin
-object. The table and the linking rules are on the
+resolves to the built-in, so none of them is absent. The table and the
+linking rules are on the
 [plugin index](../plugins.md); the member counts are in the
 [parity report](../../../plugin_parity.md).
 

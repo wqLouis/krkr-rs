@@ -5,8 +5,8 @@
 Native plugins are **statically built into L3**. One table,
 `natives::plugins::BUILTIN_PLUGINS`, maps a canonical DLL name (plus its
 aliases) to that module's `register` function. `Plugins.link(name)`
-recognizes every ported DLL; a name with no port takes the
-[null plugin object](null_plugin.md).
+recognizes every ported DLL; a name with no port is **absent** — the link is
+recorded, one warning names the plugin, and nothing is registered for it.
 
 **Registration happens at link time.** Only the startup surface
 (`natives::plugins::STARTUP_PLUGINS` — today `xp3filter.dll`) is on the VM
@@ -155,11 +155,11 @@ it**, so `Plugins.link` activates it and registers its classes then.
 2. If a built-in emulation exists, register it (unless the canonical name is
    already in `registered`) and record the link as `Builtin`. The canonical
    name is tracked, so aliases sharing one `register` register **once**.
-3. Otherwise install the null plugin object and record the link as `Null`.
-
-The null path is entered only where the plugin's **stem is free**: an
-existing `global[stem]` is kept, never clobbered, and the link records
-whether *this* link installed the global.
+3. Otherwise log one warning that names the plugin and record the link as
+   `Unported`. **Nothing is registered**: no global under the plugin's stem
+   and no object that swallows member accesses, so a script that probes for
+   the class (`typeof global[name] == 'Object'`) sees it missing and takes
+   its own "class not found" path.
 
 ### The lookups
 
@@ -191,15 +191,13 @@ plugin no script has linked has no script-visible surface and owns no
 per-frame hook, so its `poll` does not run: the `registered` set is the same
 one `ensure_registered` fills on the first link.
 
-### `unlink(name, ctx) -> bool`
+### `unlink(name) -> bool`
 
 Drops the `getList` entry and reports whether the name had been linked.
 
 * The built-in classes **stay** on the VM; only the list entry goes, and a
   later `link` is idempotent.
-* A null plugin's script global is cleared **best-effort**, and only when
-  this link installed it and it still holds the null object. A binding the
-  link kept, or one a script wrote over, is preserved.
+* An unported link owns no global, so there is nothing to clear.
 
 ### `autoload(names, ctx)`
 
@@ -214,9 +212,9 @@ access); this receives the ordered file names and links each.
   resolves the same built-in as `Plugins.link("foo.dll")`.
 * Each is logged with the reference's `(info) Loading <name>` line.
 * Linking goes through the same path as `Plugins.link`: a ported name
-  activates its built-in emulation, an unported name takes the null-plugin
-  path and **one** warning — even when the same file was found in more than
-  one scanned directory.
+  activates its built-in emulation, an unported name is recorded and warned
+  about — **one** warning, even when the same file was found in more than one
+  scanned directory.
 
 ---
 
@@ -224,16 +222,11 @@ access); this receives the ordered file names and links each.
 
 ```rust
 pub fn normalize_plugin_name(name: &str) -> String;
-pub fn plugin_stem(name: &str) -> String;
 ```
 
 `normalize_plugin_name` takes the base file name (splitting on `/`, `\` and
 `>`), trims it and lowercases it, so `C:\game\plugin\extrans.dll`,
 `extrans.tpm` and `Extrans.DLL` compare equal.
-
-`plugin_stem` returns the base name with its extension removed, **preserving
-case**: `windowEx.dll` → `windowEx`. It is the script-global name the null
-plugin object is installed under.
 
 `tpm_to_dll_name` replaces a trailing `.tpm` with `.dll`, case-insensitively,
 preserving the stem's original casing.
@@ -244,8 +237,9 @@ preserving the stem's original casing.
 
 ```rust
 pub enum PluginOutcome {
-    Builtin,  // a built-in emulation was registered
-    Null,     // the plugin is not emulated; the null-plugin path was taken
+    Builtin,   // a built-in emulation was registered
+    Unported,  // the plugin has no emulation: the link is recorded, one
+               // warning names it, and nothing is registered for it
 }
 ```
 
@@ -256,10 +250,8 @@ pub enum PluginOutcome {
 | Error | Raised when |
 |---|---|
 | `CompatError::Register(...)` | the built-in's `register` failed |
-| `CompatError::Register(...)` | the null-plugin install failed (for example the `typeof` probe did not yield a type name) |
 
-`unlink` never fails: the null-global removal is best-effort, because a
-failure only leaves the harmless global behind.
+`unlink` never fails: it only drops a list entry.
 
 ---
 
@@ -267,10 +259,9 @@ failure only leaves the harmless global behind.
 
 | Test | What it asserts |
 |---|---|
-| `crates/compat/tests/plugin.rs` | `link` activates a built-in, `unlink` reports whether the name had been linked, `getList` preserves the order and the casing, `link` is idempotent |
+| `crates/compat/tests/plugin.rs` | `link` activates a built-in, `unlink` reports whether the name had been linked, `getList` preserves the order and the casing, `link` is idempotent; an unported plugin registers nothing and the game's class probe fails |
 | `crates/compat/tests/plugin_autoload.rs` | the `.tpm` autoload: the name conversion, the order, the single warning per distinct unported name |
-| `crates/compat/tests/null_plugin.rs` | the null path (see [`null_plugin.md`](null_plugin.md)) |
-| `crates/compat/tests/menu_dll_surface.rs` | `menu.dll` links as a built-in without a null global |
+| `crates/compat/tests/menu_dll_surface.rs` | `menu.dll` links as a built-in |
 | `crates/compat/tests/misc_plugins.rs` | the plugin classes are registered |
 | `crates/compat/tests/get_sample.rs` | a built-in's members appear only after its `Plugins.link` |
 | `crates/compat/tests/timer_behavior.rs` | the `getSample` members' timing, through the shipped game's `voice.tjs` path |
@@ -282,7 +273,6 @@ failure only leaves the harmless global behind.
 
 ## See also
 
-* [`null_plugin.md`](null_plugin.md) — the object an unported DLL resolves to
 * [`plugins_native.md`](plugins_native.md) — the `Plugins` class scripts call
 * [`host.md`](host.md) — who owns the registry
 * [`../../arch/l3.md`](../../arch/l3.md) §5 — plugins at the layer level

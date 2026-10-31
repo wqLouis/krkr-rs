@@ -8,7 +8,7 @@
 //! which in krkr-rs is the `motion_player` plugin the compat aggregator
 //! installs right after `emote_player::register`. These tests check the
 //! end-to-end loader story with citations: no surface of its own, the link
-//! resolves to the built-in (no null object), and the reference
+//! resolves to the built-in (nothing published under its stem), and the reference
 //! `Motion.EmotePlayer` entry point is reachable through the loaded
 //! dependency.
 
@@ -133,7 +133,7 @@ fn loader_defines_no_globals_of_its_own() {
 /// Reference: loading `emoteplayer.dll` pulls in `motionplayer.dll`
 /// (`reference/cpp/plugins/EmotePlayer.cpp:7`), so the `Motion` namespace is
 /// present the moment the plugin is linked — and the link itself resolves to
-/// a built-in (no null-plugin global under the DLL's stem). This checks the
+/// a built-in (nothing published under the DLL's stem). This checks the
 /// end-to-end story: installing the compat surface wires the family and the
 /// reference `Motion.EmotePlayer` entry point is reachable.
 #[test]
@@ -151,11 +151,11 @@ fn loader_exposes_the_motionplayer_classes() {
         1,
         "the link must be idempotent"
     );
-    // A built-in link installs no null plugin object under the stem.
+    // A built-in link publishes nothing under the stem.
     assert_eq!(
         env.int("(typeof global.emoteplayer !== 'undefined')"),
         0,
-        "builtin link must not install a null global"
+        "builtin link must not publish a global under the stem"
     );
 
     // `emote_player::register` is a no-op, so every class below is provided by

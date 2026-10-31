@@ -1,11 +1,9 @@
-//! Integration tests for the native-plugin architecture and the null plugin.
+//! Integration tests for the native-plugin architecture.
 
 mod common;
 
 use common::vm_lock;
-use compat::{
-    CompatCtx, CompatError, NativePlugin, PluginRegistry, normalize_plugin_name, plugin_stem,
-};
+use compat::{CompatCtx, CompatError, NativePlugin, PluginRegistry, normalize_plugin_name};
 use tjs::{NativeClassBuilder, Tjs2Engine, TjsValue};
 
 /// Top-level classes the reference registers as core natives before any game
@@ -66,14 +64,11 @@ impl NativePlugin for RegisteringPlugin {
 }
 
 #[test]
-fn normalize_and_stem() {
+fn normalize_folds_the_base_name_and_the_case() {
     assert_eq!(
         normalize_plugin_name(r"C:\game\Plugin\Extrans.DLL"),
         "extrans.dll"
     );
-    assert_eq!(plugin_stem(r"C:\game\Plugin\Extrans.DLL"), "Extrans");
-    assert_eq!(plugin_stem("noext"), "noext");
-    assert_eq!(plugin_stem("arc.xp3>plug.dll"), "plug");
 }
 
 #[test]
@@ -129,19 +124,29 @@ fn linked_list_preserves_insertion_order_and_case() {
             "Plugins.link('First.dll'); Plugins.link('second.dll');",
             "test",
         )
-        .expect("link two null plugins");
+        .expect("link two unported plugins");
     assert_eq!(
         host.registry().linked(),
         vec!["First.dll".to_string(), "second.dll".to_string()]
     );
-    // The null global keeps the caller's casing.
-    engine
-        .eval("First.someMember", "test")
-        .expect("original-case global exists");
+    // An unported plugin registers nothing, so its stem stays absent.
+    assert_eq!(
+        engine.eval("typeof global['First']", "test").unwrap(),
+        TjsValue::String("undefined".into())
+    );
 }
 
+/// A plugin we have no emulation for is absent: the link is recorded, one
+/// warning names the plugin, and nothing is registered under the plugin's
+/// stem — no global, no object that swallows member accesses.
+///
+/// The reference's `Plugins.link` calls `TVPLoadPlugin(name)`
+/// (`reference/cpp/core/plugin/PluginImpl.cpp:294-312`), which loads the
+/// module and registers its classes; an unknown module is an error log and
+/// nothing else (`reference/cpp/core/plugin/ncbind.cpp:12-29`), so no global
+/// exists for it.
 #[test]
-fn link_installs_null_object_for_unknown_plugin() {
+fn an_unported_plugin_registers_nothing() {
     let _lock = vm_lock();
     let engine = Tjs2Engine::new().expect("create engine");
     let mut host = compat::CompatHost::new();
@@ -151,23 +156,20 @@ fn link_installs_null_object_for_unknown_plugin() {
         .exec_script("Plugins.link('totally_unknown.dll');", "test")
         .expect("link unknown plugin");
 
-    // A call to an absent member is accepted and does nothing.
-    engine
-        .exec_script("totally_unknown.someMethod(1, 2, 3);", "test")
-        .expect("null plugin accepts calls");
-    // Reading a member does not throw either.
-    engine
-        .eval("totally_unknown.someMember", "test")
-        .expect("null plugin accepts reads");
-    // Reading a member and then calling it also works.
-    engine
-        .exec_script("var m = totally_unknown.otherMethod; m(9);", "test")
-        .expect("null plugin accepts a read-then-call");
-    // Writing an absent member is also accepted.
-    engine
-        .eval("totally_unknown.someMember = 3", "test")
-        .expect("null plugin accepts writes");
-    // `getList` reports the linked (normalized) name.
+    // Nothing is published under the plugin's stem.
+    assert_eq!(
+        engine
+            .eval("typeof global['totally_unknown']", "test")
+            .unwrap(),
+        TjsValue::String("undefined".into())
+    );
+    // A member access on the absent name raises, as it does for any absent
+    // global.
+    assert!(
+        engine.eval("totally_unknown.someMember", "test").is_err(),
+        "an absent plugin must not answer member accesses"
+    );
+    // `getList` reports the linked name.
     assert_eq!(
         engine.eval("Plugins.getList()[0]", "test").unwrap(),
         TjsValue::String("totally_unknown.dll".into())
@@ -185,10 +187,68 @@ fn link_installs_null_object_for_unknown_plugin() {
     assert!(host.registry().linked().is_empty());
 }
 
+/// The game probes an unported plugin with `typeof` before it uses it, and
+/// takes its own "class not found" path when the probe fails. The probe must
+/// see an absent class, so the game's own error handling runs.
+///
+/// The shipped `DrawDeviceD2D.dll` is loaded by `main/used2d.tjs`, whose
+/// `link()` requires `typeof global['DrawDeviceD2D']=='Object'`; the
+/// reference registers no class for a module it cannot load
+/// (`reference/cpp/core/plugin/ncbind.cpp:12-29`).
+#[test]
+fn an_unported_plugin_leaves_the_games_probe_failing() {
+    let _lock = vm_lock();
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut host = compat::CompatHost::new();
+    host.install(&engine).expect("install compat surface");
+
+    engine
+        .exec_script(
+            "Plugins.link('DrawDeviceD2D.dll'); \
+             global['drawDeviceProbe'] = typeof global['DrawDeviceD2D'] == 'Object';",
+            "test",
+        )
+        .expect("link the unported plugin");
+    assert_eq!(
+        engine
+            .eval("typeof global['DrawDeviceD2D']", "test")
+            .unwrap(),
+        TjsValue::String("undefined".into())
+    );
+    assert_eq!(
+        engine.eval("global['drawDeviceProbe']", "test").unwrap(),
+        TjsValue::Integer(0),
+        "the game's own class-not-found path must run"
+    );
+}
+
+/// A ported plugin still publishes its class: the link is what makes the
+/// emulated surface visible.
+#[test]
+fn a_ported_plugin_publishes_its_class() {
+    let _lock = vm_lock();
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut host = compat::CompatHost::new();
+    host.install(&engine).expect("install compat surface");
+
+    assert_eq!(
+        engine.eval("typeof global['CSVParser']", "test").unwrap(),
+        TjsValue::String("undefined".into()),
+        "the class is absent before the link"
+    );
+    engine
+        .exec_script("Plugins.link('csvParser.dll');", "test")
+        .expect("link the ported plugin");
+    assert_eq!(
+        engine.eval("typeof global['CSVParser']", "test").unwrap(),
+        TjsValue::String("Object".into())
+    );
+}
+
 /// Table completeness: every DLL the shipped game links
 /// plus the reference `NCB_MODULE_NAME` aliases of ported plugins must
-/// resolve to a built-in — anything else would take the null path and
-/// shadow the real emulation.
+/// resolve to a built-in — anything else would be absent and shadow the
+/// real emulation.
 ///
 /// Verified against `reference/cpp/plugins/**` (`NCB_MODULE_NAME` and the
 /// `CMakeLists.txt` source list): `layerExMovie.cpp` → `layerExMovie.dll`,

@@ -510,11 +510,12 @@ order:
 
 1. **Explicit archive addressing** — `foo.xp3>data/script.ks`.
 2. **The project storage** — the project archive for an archive project, the
-   app directory for a folder project.
+   project directory for a folder project.
 3. **The auto paths** — last added first.
 4. **The remaining mounted archives** — later mounts first, so the archive
    mounted last wins.
-5. **The app directory as a loose-file fallback** — archive projects only.
+5. **The project directory as a loose-file fallback** — archive projects
+   only.
 
 A hit is cached; a miss is not. A `..` component that escapes the mount is
 `StorageReadError::InvalidPathName`, not a miss.

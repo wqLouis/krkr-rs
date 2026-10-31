@@ -209,6 +209,43 @@ fn disk_resolves_when_no_archive_or_auto_path_holds_the_name() {
     assert_eq!(storage.read("loose.txt").unwrap(), b"from disk");
 }
 
+/// The app path resolves against the project directory, not against the mount
+/// root: a launch whose base directory is the *parent* of the game folder
+/// still finds the game's own `patch.tjs`.
+///
+/// The reference's app path is the project directory
+/// (`reference/cpp/core/base/impl/StorageImpl.cpp:503-509`), and the app-path
+/// scripts are read from it
+/// (`reference/cpp/core/base/ScriptMgnIntf.cpp:903`, `:970`).
+#[test]
+fn the_app_path_resolves_against_the_project_directory() {
+    let xp3 = build_xp3(&[("startup.tjs", b"// startup", false)]);
+    let fs = memory_with(&[
+        ("parent/game/data.xp3", &xp3),
+        ("parent/game/patch.tjs", b"// patch"),
+    ]);
+    let mut storage = Storage::mount_archives(fs, "/parent", ["game/data.xp3"]).expect("mount");
+
+    // The mount root is the launch directory; the project directory is the
+    // folder the project archive lives in.
+    assert_eq!(storage.game_dir(), Path::new("/parent"));
+    assert_eq!(storage.app_dir(), Path::new("/parent"));
+    assert!(
+        storage.startup_plan().unwrap().patch.is_none(),
+        "the patch script is not below the mount root"
+    );
+
+    storage.set_app_dir("/parent/game");
+    let plan = storage.startup_plan().expect("startup plan");
+    assert_eq!(plan.patch.as_deref(), Some("patch.tjs"));
+    assert_eq!(plan.startup.as_deref(), Some("startup.tjs"));
+    assert_eq!(
+        storage.read("patch.tjs").unwrap(),
+        b"// patch",
+        "the loose file is read below the project directory"
+    );
+}
+
 #[test]
 fn archive_is_used_when_no_disk_file() {
     let xp3 = build_xp3(&[

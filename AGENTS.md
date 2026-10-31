@@ -364,15 +364,15 @@ file §9.
   behaviour cannot be performed — unsupported feature, malformed or
   overflowing data, unrepresentable size — return a **typed error**. No
   degraded substitutes, no arbitrary size caps, no "guess and continue", no
-  `unwrap_or`/`_ =>` that hides a failure. The **one** documented exception
-  is the null-plugin object (D14), which logs a warning on every call.
+  `unwrap_or`/`_ =>` that hides a failure.
 - **D13 — the platform and the media backend are chosen at compile time.**
   Exactly one of `platform-linux` / `platform-android`; the media backend
   follows it: `video-ffmpeg` on Linux, `video-mediacodec` on Android.
 - **D14 — native plugins are static, built into L3.** One `BUILTIN_PLUGINS`
   table; `Plugins.link(name)` recognizes every ported DLL. A DLL we have
-  **not** ported gets the null-plugin object: it accepts every member/call,
-  returns void, logs `warn!` per call and never throws. This is not silent.
+  **not** ported registers nothing: the link is recorded, one `warn!` names
+  the plugin, and the script sees the plugin as absent — no class, no object
+  that swallows member accesses. A ported DLL keeps publishing its class.
 - **D15 — loading is explicit.** The archive list comes from the command line
   (repeatable, later archives win); the startup script is found inside the
   mounted archives, and a missing startup is a typed error. D35 adds the one
@@ -677,7 +677,7 @@ in the commit that introduced the change.
 | The ordered gate, the test suites, the release pipeline | `docs/rules/gates.md` |
 | The module map (one page per module) | `docs/code/README.md` |
 | The gate checks and the environment variables | `scripts/README.md` |
-| The L3 plugins and the null plugin | `docs/code/compat/plugin.md` |
+| The L3 plugins and unported DLLs | `docs/code/compat/plugin.md` |
 | Game loading, precedence, startup order | `docs/code/engine/storage.md`, `docs/code/app/game.md` |
 | The Android backends (AAudio, MediaCodec) | `docs/code/android/README.md` |
 | Presentation (Fit only) and the VM↔device translation | `docs/arch/l2.md` §4, `docs/code/engine/translate.md` |

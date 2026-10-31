@@ -21,8 +21,8 @@ constants → system → debug → storages → scripts → visual → input →
 → clipboard → plugins → tree_owner
 ```
 
-The crate-internal `install` registers the null-plugin hook first, then
-`register_all`, then the `Plugins` class.
+The crate-internal `install` registers `register_all` first, then the
+`Plugins` class.
 
 The order matters in two places:
 
@@ -70,7 +70,7 @@ the graphic cache.
 
 | Group | Members | Behaviour |
 |---|---|---|
-| paths | `exePath`, `dataPath`, `personalPath`, `savedGamesPath`, `appDataPath`, `exeName` | the app directory (with a trailing `/`), `savedata/` under it, and the normalized app path. The reference's `TVPGetAppDataPath()` returns the app path, so `personalPath` and `savedGamesPath` are the same directory. |
+| paths | `exePath`, `dataPath`, `personalPath`, `savedGamesPath`, `appDataPath`, `exeName` | the project directory (with a trailing `/`), `savedata/` under it, and the normalized app path. The reference's `TVPGetAppDataPath()` returns the app path, so `personalPath` and `savedGamesPath` are the same directory. |
 | identity | `versionString`, `versionInformation`, `platformName`, `osName`, `processorNum`, `exeBits`, `osBits` | `versionString` is `"2.32.2.426"`; `platformName` and `osName` are the same value (`Win32`, `MacOS`, `Android`, `iPhone`, `Linux`); `processorNum` is the available parallelism; the bit counts are the pointer width. |
 | screen | `screenWidth`, `screenHeight` | the **logical screen** — the first window's primary layer, else the window client size, else `(0, 0)`. |
 | desktop | `desktopLeft`, `desktopTop`, `desktopWidth`, `desktopHeight` | the installed host rectangle. Without the host fact the member **raises** rather than returning a fabricated value. |

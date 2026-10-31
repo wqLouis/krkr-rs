@@ -56,8 +56,13 @@ ordered, and every step of it matters:
    list means a **directory launch**, and the root then discovers every
    `*.xp3` under the base directory and mounts the discovered list. The
    discovered order and the precedence are L2's contract.
-3. **The project path.** `storage.set_project(...)` records the project path
-   chosen from the mount input — see §3.
+3. **The project path and the project directory.**
+   `storage.set_project(...)` records the project path chosen from the mount
+   input, and `storage.set_app_dir(...)` records the **project directory** —
+   the folder the project archive lives in. The disk namespace and the
+   app-path scripts are rooted there, so a launch whose base directory is the
+   *parent* of the game folder still reaches the game's own loose files —
+   see §3.
 4. **The L2 service attachment.** The scene, the storage, the timer registry
    and the input state are handed to the compat surface *before* the
    surface is installed. The order is not cosmetic: a plugin may read a
@@ -116,7 +121,25 @@ auto paths name.
 
 A relative `Storages.addAutoPath("system/")` resolves against the project
 path, so it scopes to the project archive when the launch names one and to
-the app directory when the project is the folder.
+the project directory when the project is the folder.
+
+### The project directory
+
+The project directory is the folder the project archive lives in; the base
+directory stays the mount root the archives are discovered under.
+
+| launch | project directory |
+|---|---|
+| directory (D35 scan) | the parent of the project archive — the game folder, even when the base directory is its parent; the base directory itself when the project is the folder |
+| an explicit `--archive` list | the base directory: the command line named it, and it is the parent of the first named archive when the command line named none |
+
+The reference's application path is the project directory
+(`reference/cpp/core/base/impl/StorageImpl.cpp:503-509`), and the project
+directory is the launch path
+(`reference/cpp/core/environ/Application.cpp:319`,
+`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`). The script-visible
+system paths (`System.exePath`, `System.dataPath`, `System.appDataPath`,
+`System.personalPath`, `System.savedGamesPath`) follow it.
 
 ---
 
@@ -159,14 +182,14 @@ behaviour it follows is recorded in the
 The plan is resolved by L2 (`storage.startup_plan()`) and executed here, in
 the reference order:
 
-1. **`patch.tjs`** — app path only, no search. A failure is reported and
-   startup continues.
+1. **`patch.tjs`** — project directory only, no search. A failure is
+   reported and startup continues.
 2. **`startup.tjs`** — searched across the storage. When it fails and the
    plan carries a `system/Initialize.tjs` fallback, the fallback runs; when
    it fails and there is no fallback, the open fails with
    `GameError::Startup`.
-3. **`AfterStartup.tjs`** — app path only. A failure is reported and startup
-   continues.
+3. **`AfterStartup.tjs`** — project directory only. A failure is reported
+   and startup continues.
 
 When neither a startup script nor a fallback exists, the open fails with
 `GameError::NoStartup`. There is no warn-and-continue path: a game that

@@ -1,6 +1,6 @@
 # Plugin surface parity
 
-> **Generated** by `krkr-gate plugin-parity` on 2026-10-21 — do not edit by hand.
+> **Generated** by `krkr-gate plugin-parity` on 2026-11-01 — do not edit by hand.
 
 Machine-diff of the reference KiriKiri plugin surface (`reference/cpp/plugins/**`) against the plugin classes the Rust engine registers (`crates/compat/src/natives/plugins/**`). A *missing* member exists in the reference but is not registered by Rust. An *extra* is a genuine plugin-surface addition: a member registered by a plugin file that the reference class does not have. Core natives (`natives/*.rs`) and members inherited from a shared registration table are counted separately.
 
@@ -23,7 +23,7 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/a
 | reference members | 974 |
 | matched | 974 |
 | **missing** | **0** |
-| extra (genuine plugin additions) | 0 |
+| extra (genuine plugin additions) | 2 |
 | core members (not plugin extras) | 336 |
 | coverage | **100.0%** |
 
@@ -99,7 +99,7 @@ Class and global members the reference installs after construction with ``PropSe
 | `VideoOverlay` | 0 | 69 | 0 | 0 | 0 | n/a |
 | `WIN32Dialog` | 1 | 1 | 1 | 0 | 0 | 100.0% |
 | `WaveSoundBuffer` | 6 | 38 | 6 | 0 | 0 | 100.0% |
-| `Window` | 44 | 44 | 44 | 0 | 0 | 100.0% |
+| `Window` | 44 | 46 | 44 | 0 | 2 | 100.0% |
 | `__global__` | 2 | 2 | 2 | 0 | 0 | 100.0% |
 | `open` | 0 | 13 | 0 | 0 | 0 | n/a |
 | `steam_api` | 0 | 0 | 0 | 0 | 0 | n/a |
@@ -123,7 +123,10 @@ _None for tracked classes._
 
 Genuine plugin-surface additions: members registered in a plugin file that the reference class does not have. Core natives and members inherited from a shared registration table (``EmotePlayer`` gets ``Player``'s table) are excluded.
 
-_None for tracked classes._
+### `Window` — 2 extra
+
+`maximized`, `minimized`
+
 ## Core members by class (excluded from extras)
 
 Members registered by a core file (``crates/compat/src/natives/*.rs``) with no reference-plugin counterpart. These are not plugin-surface additions.

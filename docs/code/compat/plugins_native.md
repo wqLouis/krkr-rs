@@ -3,8 +3,7 @@
 **Source:** `crates/compat/src/plugins_native.rs`
 
 `Plugins` is the script-facing plugin-linking class. It has **static members
-only** — no instance, no payload — and mirrors the reference `Plugins` class
-with the null-plugin behaviour wired in.
+only** — no instance, no payload — and mirrors the reference `Plugins` class.
 
 ```
 Plugins.link(name)    → void
@@ -21,7 +20,7 @@ Activates a plugin name:
 | Outcome | Behaviour |
 |---|---|
 | a built-in emulation exists | its classes are registered (once) and the link is recorded |
-| no built-in emulation | the [null plugin object](null_plugin.md) is installed under the plugin's stem, or an existing global at that stem is kept |
+| no built-in emulation | the link is recorded, one warning names the plugin, and **nothing** is registered for it |
 
 The call returns **void** in both cases — exactly as the reference does. The
 outcome is reported through the log:
@@ -29,10 +28,11 @@ outcome is reported through the log:
 | Level | Message |
 |---|---|
 | `info` | `Plugins.link({name:?}): built-in emulation activated` |
-| `warn` | `Plugins.link({name:?}): no built-in emulation; null plugin path (doc 08 §4.2)` |
+| `warn` | `plugin {name:?}: no built-in emulation; the plugin is not available` |
 
-The null path logs its own warning inside `null_plugin::install` as well, so
-the "kept an existing global" case is visible too.
+An unported plugin publishes nothing under its stem, so a script that probes
+for the class (`typeof global[name] == 'Object'`) sees it missing and takes
+its own "class not found" path.
 
 `link` requires **one argument**: `"Plugins.link requires 1 argument"`.
 
@@ -44,8 +44,7 @@ Forgets a linked name and reports whether it had been linked:
 
 * the built-in classes **stay** on the VM — the ABI cannot remove them; only
   the `getList` entry goes, and a later `link` is idempotent;
-* a null plugin's script global is cleared **best-effort**, and only when
-  this link installed it and it still holds the null object.
+* an unported link owns no global, so there is nothing to clear.
 
 The result is logged at info: `Plugins.unlink({name:?}) -> {removed}`.
 
@@ -103,7 +102,7 @@ buffers are owned by the same services the callback was resolved against.
 | `"Plugins.link: compat context is not bound"` | the binding is not installed |
 | `"Plugins.unlink: compat context is not bound"` | the binding is not installed |
 | `"Plugins.getList: compat context is not bound"` | the binding is not installed |
-| `err.to_string()` | the registry returned an error (a failed registration or a failed null-plugin install) |
+| `err.to_string()` | the registry returned an error (a failed registration) |
 
 ---
 
@@ -111,15 +110,13 @@ buffers are owned by the same services the callback was resolved against.
 
 | Test | What it asserts |
 |---|---|
-| `crates/compat/tests/plugin.rs` | `link` on a built-in activates it; `link` on an unported name takes the null path; `unlink` reports the outcome; `getList` preserves the order and the casing |
+| `crates/compat/tests/plugin.rs` | `link` on a built-in activates it; `link` on an unported name registers nothing; `unlink` reports the outcome; `getList` preserves the order and the casing |
 | `crates/compat/tests/plugin_autoload.rs` | the autoload path links through the same registry |
-| `crates/compat/tests/null_plugin.rs` | the null global the link installs |
-| `crates/compat/tests/menu_dll_surface.rs` | `menu.dll` links as a built-in **without** a null global |
+| `crates/compat/tests/menu_dll_surface.rs` | `menu.dll` links as a built-in |
 
 ---
 
 ## See also
 
 * [`plugin.md`](plugin.md) — the registry behind `link`
-* [`null_plugin.md`](null_plugin.md) — the object an unported DLL resolves to
 * [`binding.md`](binding.md) — how the callback finds its context

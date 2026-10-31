@@ -101,12 +101,12 @@ fn autoload_resolves_tpm_as_dll_builtin() {
     );
 }
 
-// An unported `.tpm` takes the null-plugin path and warns exactly once (the
-// documented D14 divergence: the reference tries to load the DLL and creates
-// no global on failure). The reference's `(info) Loading <name>` line is
+// An unported `.tpm` is recorded and warned about exactly once, and nothing
+// is registered for it (the reference tries to load the DLL and creates no
+// global on failure). The reference's `(info) Loading <name>` line is
 // emitted first (`reference/cpp/core/plugin/PluginImpl.cpp:173-174`).
 #[test]
-fn autoload_installs_null_for_unported_and_warns_once() {
+fn autoload_warns_once_for_an_unported_plugin_and_registers_nothing() {
     let _lock = vm_lock();
     let engine = Box::new(Tjs2Engine::new().expect("create engine"));
     let mut host = compat::CompatHost::new();
@@ -123,11 +123,11 @@ fn autoload_installs_null_for_unported_and_warns_once() {
             .expect("autoload");
     });
 
-    // The null object is `global.Missing` (the `.tpm` name with the extension
-    // replaced by `.dll`); the script sees an object, not `undefined`.
+    // Nothing is published under the plugin's stem, so the script sees an
+    // absent name.
     assert_eq!(
         engine.eval("typeof global.Missing", "test").expect("probe"),
-        TjsValue::String("Object".into())
+        TjsValue::String("undefined".into())
     );
     assert!(
         host.registry()
@@ -153,22 +153,22 @@ fn autoload_installs_null_for_unported_and_warns_once() {
         "exactly one warning for one unported plugin: {warnings:?}"
     );
     assert!(
-        warnings[0].contains("null plugin path"),
+        warnings[0].contains("no built-in emulation"),
         "warning was: {}",
         warnings[0]
     );
 }
 
 // The native `Plugins.link` path is unchanged: it still resolves a built-in by
-// its DLL name and still takes the null path for an unknown name. `autoload`
-// reuses the same registry activation, so the native surface gains no member.
+// its DLL name, and an unknown name is recorded without registering anything.
+// `autoload` reuses the same registry activation, so the native surface gains
+// no member.
 //
 // Reference: `Plugins.link` calls `TVPLoadPlugin(name)`
 // (`reference/cpp/core/plugin/PluginImpl.cpp:294-307`), which loads a built-in
 // and registers its classes. An unported name has no reference success path —
 // `TVPLoadPlugin` logs a failure and creates no global (`:48-56`) — so
-// `global.nope` here is the port's null plugin choice, not a reference
-// behaviour.
+// `global.nope` is absent here, as it is there.
 #[test]
 fn plugins_link_path_is_unchanged() {
     let _lock = vm_lock();
@@ -194,6 +194,6 @@ fn plugins_link_path_is_unchanged() {
     );
     assert_eq!(
         engine.eval("typeof global.nope", "test").expect("probe"),
-        TjsValue::String("Object".into())
+        TjsValue::String("undefined".into())
     );
 }

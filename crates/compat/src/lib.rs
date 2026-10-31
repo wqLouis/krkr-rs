@@ -9,8 +9,6 @@
 //!
 //! * [`NativePlugin`] / [`PluginRegistry`] — the statically built-in plugin
 //!   set and activation by name;
-//! * the **null plugin object** (the `null_plugin` module) for DLLs we
-//!   cannot load;
 //! * [`CompatCtx`] / [`CompatServices`] — the explicit L2 service handles
 //!   natives register against;
 //! * [`CompatHost`] — owns the dispatch state and installs the one
@@ -33,7 +31,7 @@
 //! | the host seams | [`VideoSource`], [`set_video_source`], [`set_movie_source`], [`AudioDecoder`], [`add_audio_decoder`], [`set_output_latency`], [`set_sound_render_driven`] |
 //! | the request drains | [`take_exit_request`], [`take_bring_to_front_requests`], [`take_update_requests`], [`take_capture_releases`] |
 //! | the startup script | [`exec_storage`] |
-//! | the plugin architecture | [`NativePlugin`], [`PluginOutcome`], [`PluginRegistry`], [`normalize_plugin_name`], [`plugin_stem`], [`builtin_plugin_names`] |
+//! | the plugin architecture | [`NativePlugin`], [`PluginOutcome`], [`PluginRegistry`], [`normalize_plugin_name`], [`builtin_plugin_names`] |
 //!
 //! Every item above states its ownership, its error contract and its panic
 //! and FFI-safety rules in its own documentation. The L2 seam
@@ -62,7 +60,6 @@ mod frame;
 mod host;
 mod native_util;
 mod natives;
-mod null_plugin;
 mod plugin;
 mod plugins_native;
 mod resource;
@@ -109,7 +106,7 @@ pub use natives::visual::{
 // movie step here, and `set_movie_source` installs the host's decoded source
 // (the analogue of the reference `TVPAddContinuousEventHook`).
 pub use natives::plugins::layer_ex::{movie_poll, set_movie_source};
-pub use plugin::{NativePlugin, PluginOutcome, PluginRegistry, normalize_plugin_name, plugin_stem};
+pub use plugin::{NativePlugin, PluginOutcome, PluginRegistry, normalize_plugin_name};
 
 /// The DLL names of every ported plugin (the `Plugins.link` targets).
 ///
@@ -137,9 +134,8 @@ pub enum CompatError {
 }
 
 /// Register the built-in compatibility surface on the VM: the core native
-/// classes, the `Plugins` class, the null-plugin hook, and the one plugin
-/// module available before any script runs
-/// ([`natives::plugins::STARTUP_PLUGINS`]).
+/// classes, the `Plugins` class, and the one plugin module available before
+/// any script runs ([`natives::plugins::STARTUP_PLUGINS`]).
 ///
 /// Every other built-in plugin's members appear on the first `Plugins.link`.
 /// Called by [`CompatHost::install`]; idempotence is the caller's
@@ -147,12 +143,11 @@ pub enum CompatError {
 ///
 /// # Errors
 ///
-/// Returns [`CompatError::Register`] when a class, a member or the null-plugin
-/// hook cannot be registered on the VM. A failure leaves the VM without the
-/// compatibility surface; the caller must not retry against the same engine,
-/// because class registration rejects duplicates.
+/// Returns [`CompatError::Register`] when a class or a member cannot be
+/// registered on the VM. A failure leaves the VM without the compatibility
+/// surface; the caller must not retry against the same engine, because class
+/// registration rejects duplicates.
 pub(crate) fn install(ctx: &mut CompatCtx) -> Result<(), CompatError> {
-    null_plugin::register_hook(ctx)?;
     natives::register_all(ctx)?;
     plugins_native::register(ctx)
 }

@@ -532,19 +532,19 @@ Code map: [`../code/engine/input.md`](../code/engine/input.md).
 The mounting operations: `Storage::mount_archives(fs, base_dir, archives)`,
 `mount_archives_with`, `mount_discovered_archives`,
 `mount_discovered_archives_with`, `mount_archive(path)`,
-`unmount_archive(path)`, `set_project(path)`.
+`unmount_archive(path)`, `set_project(path)`, `set_app_dir(path)`.
 
 The namespace operations: `add_auto_path`, `remove_auto_path`,
 `find(name)`, `read(name)`, `read_prefix(name, max_len)`, `stat(name)`,
 `exists(name)`, `list(dir)`, `file_list(mask, attr)`, `startup_plan()`,
 `register_media(name, bytes)`, `relative_disk_name`, `find_disk`,
 `local_name`, `clear_resolution_cache`, `probe_counts`, `read_bytes`,
-`game_dir`, `file_system`, `archive_count`, `archive_paths`,
+`game_dir`, `app_dir`, `file_system`, `archive_count`, `archive_paths`,
 `for_each_archive`, `lookup(name)`.
 
 The free functions: `storage::discover_archives(file_system, base_dir)` —
 the opt-in recursive scan for `*.xp3` — and `storage::local_name_in(fs,
-game_dir, name)`, which returns the real on-disk spelling of a storage name.
+app_dir, name)`, which returns the real on-disk spelling of a storage name.
 
 The resolution order `find` follows: the explicit archive addressing; the
 current project storage; the auto paths, last added first; the remaining

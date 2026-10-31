@@ -2504,10 +2504,10 @@ name), and none was available"
     /// Write the **default member** of a retained object value (`PropSet`
     /// with a NULL member name).
     ///
-    /// Used by the null-plugin `missing` handler: the VM passes a
-    /// `tTJSSimpleGetSetProperty` as the handler's third argument and reads
-    /// its default member back, so setting it is what lets an absent member
-    /// be *called*. Same value/error conventions as [`Self::set_member`].
+    /// A native `missing` handler receives a `tTJSSimpleGetSetProperty` as
+    /// its third argument and reads its default member back, so setting it is
+    /// what lets an absent member be *called*. Same value/error conventions
+    /// as [`Self::set_member`].
     ///
     /// **Consumption contract:** like [`Self::set_member`], a
     /// [`TjsValue::Retained`] id is consumed by the conversion before the

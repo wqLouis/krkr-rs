@@ -8,7 +8,6 @@ place where a plugin's script-visible surface is registered.
 * Source: `crates/compat/src/natives/plugins/`
 * Registry: `crates/compat/src/plugin.rs` (`PluginRegistry`, `BuiltinPluginDef`)
 * Script-facing class: `crates/compat/src/plugins_native.rs` (`Plugins`)
-* Null plugin: `crates/compat/src/null_plugin.rs`
 * Parity report: [`docs/plugin_parity.md`](../../plugin_parity.md)
 * Design background: [`docs.old/migration/08-tjs-vm-and-native-plugins.md`](../../../docs.old/migration/08-tjs-vm-and-native-plugins.md)
 
@@ -18,17 +17,18 @@ place where a plugin's script-visible surface is registered.
 
 | member | returns | behaviour |
 |---|---|---|
-| `Plugins.link(name)` | `void` | activates the built-in emulation for `name`, or installs the null plugin object when the name is not ported |
+| `Plugins.link(name)` | `void` | activates the built-in emulation for `name`, or records the link and warns when the name is not ported |
 | `Plugins.unlink(name)` | `bool` | forgets a linked name; returns whether it had been linked |
 | `Plugins.getList()` | `Array` | the linked names, in insertion order and with the script's original casing |
 
 `link` never throws for an unknown DLL. A name that resolves to a ported
-plugin resolves to the built-in table; any other name installs the **null
-plugin object**: a script global under the DLL's stem that accepts every
-member read and every call, returns `void`, logs a warning per call and never
-raises. This is the one documented exception to the "no silent fallback" rule,
-and it is not silent. The null object never replaces an existing binding at
-that stem — a real class or script value already there is kept.
+plugin resolves to the built-in table; any other name is **absent**: the link
+is recorded, one warning names the plugin, and nothing is registered for it
+— no script global under the DLL's stem and no object that accepts every
+member read and every call. A game that probes for the class
+(`typeof global[name] == 'Object'`) therefore sees it missing and takes its
+own "class not found" path, exactly as it does against an engine that could
+not load the DLL.
 
 A `.tpm` file in the executable directory, `<exe>/system` or `<exe>/plugin` is
 auto-loaded at startup: the trailing `.tpm` becomes `.dll` and the name is

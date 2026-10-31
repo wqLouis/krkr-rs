@@ -42,8 +42,8 @@ that hides no new behaviour, so the module registers nothing.
 
 There is no `Plugins.link` name for this helper, because the reference ships
 no DLL for it: it is not an entry in the built-in table, so a script that
-links `simplebinder.dll` takes the null-plugin path described in the
-[plugin index](../plugins.md).
+links `simplebinder.dll` finds it absent, as the
+[plugin index](../plugins.md) describes.
 
 ## State and lifetime
 

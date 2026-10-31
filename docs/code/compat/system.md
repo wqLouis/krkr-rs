@@ -69,7 +69,7 @@ the windowEx plugin adds `getDisplayMonitors`, `getMonitorInfo`,
 
 | member | value |
 |---|---|
-| `exePath` | the normalized app path with a trailing `/` |
+| `exePath` | the normalized project directory (the app path) with a trailing `/` |
 | `appDataPath` | **the same value** — the reference's `TVPGetAppDataPath()` returns `TVPGetAppPath()` unconditionally |
 | `personalPath` | the app path |
 | `savedGamesPath` | the app path |

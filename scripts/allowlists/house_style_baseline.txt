@@ -35,16 +35,13 @@
 {"path": "crates/compat/src/binding.rs", "rule": "reference-citation", "anchor": "//! The C++ ABI hands native callbacks only the raw `tjs2_engine*`, and", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/binding.rs", "rule": "reference-citation", "anchor": "/// Resolve the binding for the C++ engine pointer a callback received.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/binding.rs", "rule": "reference-citation", "anchor": "/// The C++ engine pointer native callbacks receive (`Tjs2Engine::raw`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/ctx.rs", "rule": "reference-citation", "anchor": "// The engine owns the C++ retention and frees it at destruction;", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/ctx.rs", "rule": "reference-citation", "anchor": "/// (reference `NCB_ATTACH_CLASS` / `NCB_ATTACH_FUNCTION`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/ctx.rs", "rule": "reference-citation", "anchor": "/// **script** members as own properties (reference `VM_REGMEMBER`,", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/ctx.rs", "rule": "reference-citation", "anchor": "/// Scratch buffers for `Plugins.getList` (see `plugins_native`): the C++", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/ctx.rs", "rule": "reference-citation", "anchor": "/// `cpp/core/plugin/ncbind.hpp:1963-1970`). An absent member and a", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/ctx.rs", "rule": "reference-citation", "anchor": "/// `tjsInterCodeGen.cpp:704-715`) *after* the extends chain is wired,", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/ctx.rs", "rule": "reference-citation", "anchor": "/// engine owns the C++ retention and frees it at destruction, so this is", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/ctx.rs", "rule": "reference-citation", "anchor": "/// for the duration of the delay (reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/ctx.rs", "rule": "reference-citation", "anchor": "/// member write; this is the removal path for the reference's", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/ctx.rs", "rule": "reference-citation", "anchor": "/// never dereferences the engine: the engine owns the C++ retention and", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/ctx.rs", "rule": "reference-citation", "anchor": "/// own property (reference `tjsNative.cpp:305-375`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/ctx.rs", "rule": "reference-citation", "anchor": "/// reference `TJS_BEGIN_NATIVE_MEMBERS` shape) — this call never copies", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/event.rs", "rule": "reference-citation", "anchor": "// (`reference/cpp/core/visual/LayerManager.cpp:374-399`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3313,9 +3310,6 @@
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "/// writes (`reference/cpp/core/environ/impl/TVPWindow.h:178-179`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "/// writes (`reference/cpp/core/environ/impl/TVPWindow.h:180-181`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/window.rs", "rule": "reference-citation", "anchor": "/// writes (`reference/cpp/core/environ/impl/TVPWindow.h:183-184`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/null_plugin.rs", "rule": "reference-citation", "anchor": "// `instanceof` takes a class-name string (reference `IsInstanceOf`) and", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/null_plugin.rs", "rule": "reference-citation", "anchor": "// function the script put where our instance was, where the reference's", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/null_plugin.rs", "rule": "history-comment", "anchor": "/// a real binding must not be silently replaced by the null path. The link", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// (`reference/cpp/core/plugin/PluginImpl.cpp:113-133`), so an auto-loaded", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// Linking goes through the same path as `Plugins.link`: a ported name", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// The reference `tvpLoadPlugins` scans the exe directory,", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -3323,7 +3317,6 @@
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// `TVPLoadInternalPlugin` (`PluginImpl.cpp:113-133`), and each is logged", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// and loads each in turn (`reference/cpp/core/plugin/PluginImpl.cpp:148-177`,", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// called from `reference/cpp/core/environ/Application.cpp:342`). The scan", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// object and one warning (the reference tries to load the DLL and creates", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// twice (the C++ side rejects duplicate class names). A name with no", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// with the reference's `(info) Loading <name>` line (`:173-174`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugins_native.rs", "rule": "reference-citation", "anchor": "//! `getList()` returns the linked names. This mirrors the reference", "reason": "legacy comment, cleanup tracked in TODO §15"}

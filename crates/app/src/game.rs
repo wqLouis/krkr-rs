@@ -484,8 +484,12 @@ impl GameHost {
     /// engine's scene and timer, to the L2 input state and to the storage,
     /// installs the L1 codec seams, and runs the L2 startup sequence.
     ///
-    /// `base_dir` is the app path (loose files, `patch.tjs`,
-    /// `AfterStartup.tjs`). Every mounted archive keeps its file open and is
+    /// `base_dir` is the mount root: the archives are discovered under it and
+    /// a relative archive path resolves against it. The disk namespace and
+    /// the app-path scripts (`patch.tjs`, `AfterStartup.tjs`) are rooted at
+    /// the *project directory*: for a directory launch the folder the project
+    /// archive lives in, for an explicit list the base directory itself.
+    /// Every mounted archive keeps its file open and is
     /// read positionally per entry; use [`Self::open_with_preload`] to hold
     /// the archives in memory instead.
     ///
@@ -564,6 +568,12 @@ impl GameHost {
                 },
             );
             storage.set_project(&project);
+            // The project directory is the folder the project archive lives
+            // in: the disk namespace and the app-path scripts (`patch.tjs`,
+            // `AfterStartup.tjs`) are rooted there, so a launch whose base
+            // directory is the *parent* of the game folder still reaches the
+            // game's own loose files.
+            storage.set_app_dir(project_app_dir(&base_dir, &project));
             storage
         } else {
             let mut storage = Storage::mount_archives_with(
@@ -579,6 +589,10 @@ impl GameHost {
                 boot_script_count(&storage, path)
             });
             storage.set_project(&project);
+            // The launcher's own directory is the project directory: the
+            // command line named it, and it is the parent of the first named
+            // archive when the command line named none.
+            storage.set_app_dir(&base_dir);
             storage
         });
         let mount_time = mount_started.elapsed();
@@ -878,7 +892,7 @@ fn log_startup(
 
 /// The path an archive is mounted under.
 ///
-/// A relative path is resolved against the app directory, the same way the
+/// A relative path is resolved against the mount root, the same way the
 /// mount resolves it; an absolute path is used as given.
 fn resolved_archive_path(storage: &Storage, path: &Path) -> PathBuf {
     if path.is_absolute() {
@@ -893,7 +907,7 @@ fn resolved_archive_path(storage: &Storage, path: &Path) -> PathBuf {
 /// it holds neither.
 ///
 /// The archive entry lookup is case-insensitive, so either spelling finds the
-/// same entry. A relative `path` is resolved against the app directory, the
+/// same entry. A relative `path` is resolved against the mount root, the
 /// same way the mount resolves it; a path that is not one of the mounted
 /// archives holds no boot scripts.
 fn boot_script_count(storage: &Storage, path: &Path) -> Option<usize> {
@@ -950,6 +964,24 @@ fn directory_project(
         return archive.to_path_buf();
     }
     base_dir.to_path_buf()
+}
+
+/// The project directory of a project selection: the folder the project
+/// archive lives in, or the base directory when the project is the folder
+/// itself.
+///
+/// The project directory is where the disk namespace and the app-path
+/// scripts live, so it is the game folder even when the launch named its
+/// parent as the base directory.
+fn project_app_dir(base_dir: &Path, project: &Path) -> PathBuf {
+    if project == base_dir {
+        return base_dir.to_path_buf();
+    }
+    project
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| base_dir.to_path_buf())
 }
 
 /// The boot-script archive with the most entries, `None` when no candidate
@@ -1487,6 +1519,40 @@ mod tests {
             directory_project(base, &discovered, |_| None, |_| true),
             PathBuf::from("/game/data.xp3")
         );
+    }
+
+    /// The project directory is the folder the project archive lives in, so a
+    /// launch whose base directory is the *parent* of the game folder still
+    /// roots the disk namespace and the app-path scripts in the game folder.
+    ///
+    /// The reference's project directory is the launch path, and the app path
+    /// the scripts see is that directory
+    /// (`reference/cpp/core/base/impl/StorageImpl.cpp:503-509`,
+    /// `reference/cpp/core/environ/Application.cpp:319`,
+    /// `reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`).
+    #[test]
+    fn the_project_directory_is_the_project_archives_folder() {
+        let base = Path::new("/games");
+        let project = directory_project(
+            base,
+            &[PathBuf::from("/games/LimeLight/data.xp3")],
+            |_| None,
+            |_| true,
+        );
+        assert_eq!(
+            project_app_dir(base, &project),
+            PathBuf::from("/games/LimeLight")
+        );
+    }
+
+    /// A folder project (no archive at all) keeps the base directory as the
+    /// project directory.
+    #[test]
+    fn a_folder_project_keeps_the_base_directory() {
+        let base = Path::new("/games/LimeLight");
+        let project = directory_project(base, &[], |_| None, |_| true);
+        assert_eq!(project, base);
+        assert_eq!(project_app_dir(base, &project), base);
     }
 
     /// The conventional name is matched without regard to case.

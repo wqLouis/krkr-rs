@@ -31,7 +31,8 @@ only the namespace.
 | field | meaning |
 |---|---|
 | `fs: FileSystem` | the immutable L1 file-system object |
-| `game_dir: PathBuf` | the app path used for disk assets |
+| `game_dir: PathBuf` | the mount root: where the archives are discovered and what a relative archive path resolves against |
+| `app_dir: PathBuf` | the project directory: the root of the disk namespace and where the app-path scripts are looked up |
 | `archives: Vec<MountedArchive>` | the mounted archives in mount order; later entries take precedence |
 | `auto_paths: Vec<String>` | the auto search-path prefixes (a plain directory or an `arc.xp3>` prefix) |
 | `preload_archives: bool` | whether an archive's whole image is read into memory in the background |
@@ -69,6 +70,7 @@ impl Storage {
     pub fn mount_archive(&mut self, path: impl AsRef<Path>) -> Result<(), MountError>;
     pub fn unmount_archive(&mut self, path: impl AsRef<Path>) -> bool;
     pub fn set_project(&mut self, path: impl AsRef<Path>);
+    pub fn set_app_dir(&mut self, path: impl AsRef<Path>);
 }
 ```
 
@@ -76,9 +78,15 @@ Loading is **explicit**: the caller supplies the archive list and the loader
 never scans the folder. `mount_discovered_archives` is the one opt-in
 exception — the caller asked for a directory instead of a list.
 
-`mount_archive` and `set_project` resolve a **relative** path against the app
-directory, the same way, so `--archive data.xp3` and a project path of
+`mount_archive` and `set_project` resolve a **relative** path against the
+mount root, the same way, so `--archive data.xp3` and a project path of
 `data.xp3` name the same file.
+
+`set_app_dir` names the **project directory**: the folder the project archive
+lives in. The disk namespace and the app-path scripts (`patch.tjs`,
+`AfterStartup.tjs`) are rooted there, so a launch whose base directory is the
+*parent* of the game folder still reaches the game's own loose files. Until
+it is called the project directory is the mount root.
 
 `set_project` decides whether the project is an **archive project** or a
 **folder project**: a path that is one of the mounted archives, or that stats
@@ -109,6 +117,7 @@ impl Storage {
     pub fn probe_counts(&self) -> ProbeCounts;
     pub fn read_bytes(&self) -> u64;
     pub fn game_dir(&self) -> &Path;
+    pub fn app_dir(&self) -> &Path;
     pub fn file_system(&self) -> &FileSystem;
     pub fn archive_count(&self) -> usize;
     pub fn archive_paths(&self) -> impl Iterator<Item = &Path>;
@@ -124,13 +133,13 @@ pool there, and the engine drains the same pool every frame.
 
 ```rust
 pub fn discover_archives(file_system: &FileSystem, base_dir: &Path) -> Result<Vec<PathBuf>, StorageReadError>;
-pub fn local_name_in(fs: &FileSystem, game_dir: &Path, name: &str)
+pub fn local_name_in(fs: &FileSystem, app_dir: &Path, name: &str)
     -> Result<Option<PathBuf>, StorageReadError>;
 ```
 
 `discover_archives` is the opt-in recursive scan for `*.xp3` under a directory.
 `local_name_in` returns the **real on-disk spelling** of a storage name: it
-walks the path below the game directory and replaces each existing component
+walks the path below the project directory and replaces each existing component
 with its actual name, so a script that asked for `System/Initialize.tjs` gets
 the file's true casing back. A name containing the archive delimiter has no
 local name.

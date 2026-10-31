@@ -78,7 +78,6 @@ error during `Layer.beginTransition`.
 | `crates/compat/tests/transitions.rs` | each provider's output, the reference option defaults, that the options reach the handlers, and that an invalid option is a typed error |
 | `crates/compat/tests/layer.rs` | that every `extrans` provider name starts and stops a real transition, and that an unknown name or an invalid option raises a typed error |
 | `crates/compat/tests/plugin.rs` | that `extrans.dll` — one of the DLLs the shipped game links — resolves to the built-in table |
-| `crates/compat/tests/null_plugin.rs` | that linking `extrans.dll` installs no null plugin object under the DLL's stem |
 
 ## Known gaps
 

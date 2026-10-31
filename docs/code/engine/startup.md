@@ -7,10 +7,10 @@ executes them, so it is testable without the TJS VM.
 
 The reference order is:
 
-1. `patch.tjs` — app path only, no search;
+1. `patch.tjs` — project directory only, no search;
 2. `startup.tjs` — searched through `Storage::find` (project storage first,
    then the auto paths, the remaining mounts and the loose app-dir fallback);
-3. `AfterStartup.tjs` — app path only, no search;
+3. `AfterStartup.tjs` — project directory only, no search;
 4. `system/Initialize.tjs` — the reference compatibility fallback when
    `startup.tjs` is not found.
 
@@ -63,13 +63,13 @@ pub fn discover_startup(storage: &Storage) -> Result<StartupScripts, StartupErro
 
 ## 4. Invariants
 
-* **`patch.tjs` and `AfterStartup.tjs` are resolved at the app path only**
-  (`storage.game_dir()`), with no search and no archive lookup. A missing
-  (or directory) entry is `Ok(None)`.
+* **`patch.tjs` and `AfterStartup.tjs` are resolved at the project directory
+  only** (`storage.app_dir()`), with no search and no archive lookup. A
+  missing (or directory) entry is `Ok(None)`.
 * **`startup.tjs` is searched through `Storage::find`**: the current project
-  storage first (the project archive for an archive project, the app directory
-  for a folder project), then the auto paths, the remaining mounted archives
-  and finally the loose app-directory fallback.
+  storage first (the project archive for an archive project, the project
+  directory for a folder project), then the auto paths, the remaining mounted
+  archives and finally the loose project-directory fallback.
 * **`system/Initialize.tjs` is the fallback** when `startup.tjs` is absent.
   The caller decides whether to run the fallback from
   `StartupScript::is_initialize_fallback`.
@@ -81,10 +81,10 @@ pub fn discover_startup(storage: &Storage) -> Result<StartupScripts, StartupErro
 ## 5. Data flow
 
 ```
-Storage (game dir + mounted archives)
+Storage (project dir + mounted archives)
    │
-   ├─ app path only ──► fs::stat(game_dir/"patch.tjs")        ──► Option<Location>
-   ├─ app path only ──► fs::stat(game_dir/"AfterStartup.tjs") ──► Option<Location>
+   ├─ project dir only ──► fs::stat(app_dir/"patch.tjs")        ──► Option<Location>
+   ├─ project dir only ──► fs::stat(app_dir/"AfterStartup.tjs") ──► Option<Location>
    ├─ searched      ──► Storage::find("startup.tjs")          ──► Startup(Location)
    └─ searched      ──► Storage::find("system/Initialize.tjs") ──► Initialize(Location)
                                                        │
@@ -99,7 +99,7 @@ Storage (game dir + mounted archives)
 | failure | behaviour |
 |---|---|
 | neither `startup.tjs` nor `system/Initialize.tjs` exists | `StartupError::NoStartupScript` |
-| a file-system operation failed while probing the app path | `StartupError::Fs` |
+| a file-system operation failed while probing the project directory | `StartupError::Fs` |
 | the storage resolution failed (a permission or I/O error) | `StartupError::Storage` |
 
 A plain miss is `NoStartupScript`, never the storage variant: the absence of
@@ -109,8 +109,8 @@ a script and a failure to look are different outcomes.
 
 ## 7. Tests
 
-* `crates/engine/tests/startup.rs` — the discovery order, the app-path-only
-  lookups, the fallback and the errors.
+* `crates/engine/tests/startup.rs` — the discovery order, the
+  project-directory-only lookups, the fallback and the errors.
 
 ---
 

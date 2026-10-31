@@ -90,7 +90,6 @@ the composition root above everything. No layer may call up.
 | [`compat/engine_api.md`](compat/engine_api.md) | the single L3 ↔ L2 seam |
 | [`compat/plugin.md`](compat/plugin.md) | `NativePlugin`, `PluginRegistry`, the built-in table |
 | [`compat/plugins.md`](compat/plugins.md) | the plugin architecture and the whole ported set |
-| [`compat/null_plugin.md`](compat/null_plugin.md) | the null plugin object for a DLL that is not ported |
 | [`compat/plugins_native.md`](compat/plugins_native.md) | the `Plugins` native class |
 | [`compat/natives.md`](compat/natives.md) | the non-visual native families |
 | [`compat/visual.md`](compat/visual.md) | the visual native families and the scene they compose |

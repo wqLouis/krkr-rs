@@ -112,7 +112,7 @@ abstraction is leaking and the generic behaviour moves down.
 | `crates/platform/render` | L1 | stateless `RenderPipeline`/`FontSystem` + Vulkan | `RenderPipeline`, `RenderState`, `RenderScene`, `Texture`, `NullRenderPipeline`, `render::scene::node_spaces` |
 | `crates/platform/platform` | L1 | window/surface, event loop, input, clock, threads | `PlatformWindow`, `PlatformEvent`, `InputEvent`, `AudioDevice`, `Clock`/`Ticker`, `FramePacing` |
 | `crates/engine` | L2 | the generic game engine; owns engine state | `Engine`, `Scene`, `projection`, `translate::PixelTranslation`, `storage::Storage`, `sound::Mixer`, `text::TextEngine`, `timer::TimerState`, `video::VideoOverlay`, `trans::Trans` |
-| `crates/compat` | L3 | native classes + KAG + event adapter + plugins | `CompatHost`, `CompatCtx`/`CompatServices`, `engine_api` (the seam), `natives::*`, `null_plugin` |
+| `crates/compat` | L3 | native classes + KAG + event adapter + plugins | `CompatHost`, `CompatCtx`/`CompatServices`, `engine_api` (the seam), `natives::*` |
 | `crates/vm` | L4 | TJS VM host over `tjs` | `VmHost`, `FrameCtx` |
 | `crates/tjs` | vendored | the C++ TJS2 VM, all-FFI | `Tjs2Engine`, the native-class builder, the `tjs2_*` C surface |
 | `crates/app` | root | the desktop composition root | `Host`, `GameHost`, `VmHook`, `run` |
@@ -243,7 +243,7 @@ See [`l3.md`](l3.md) §7.
 | the render pipeline, blend slots, the CPU baseline | [`l1.md`](l1.md) §3 |
 | media backends (FFmpeg / MediaCodec), the PSB/PSD reader | [`l1.md`](l1.md) §4–§5 |
 | the VM/compat protocol, the engine seam | [`l3.md`](l3.md) §2 |
-| plugins, the null plugin, the DLL-surface pipeline | [`l3.md`](l3.md) §5 |
+| plugins, an unported plugin, the DLL-surface pipeline | [`l3.md`](l3.md) §5 |
 | the VM host, script loading, the Rust-port audit | [`l4.md`](l4.md) |
 | Android backends (AAudio, MediaCodec, `AHardwareBuffer`) | [`../android.md`](../../docs.old/android.md), [`l1.md`](l1.md) §6 |
 | open work | [`../../TODO.md`](../../TODO.md) |

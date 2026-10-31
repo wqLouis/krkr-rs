@@ -2,8 +2,8 @@
 //!
 //! Discovery is pure storage semantics, so these tests exercise it without
 //! the TJS VM. Order per `docs.old/migration/09-game-loading.md` §5:
-//! `patch.tjs` (app path) → `startup.tjs` (search) → `AfterStartup.tjs`
-//! (app path) → `system/Initialize.tjs` fallback.
+//! `patch.tjs` (project directory) → `startup.tjs` (search) →
+//! `AfterStartup.tjs` (project directory) → `system/Initialize.tjs` fallback.
 
 use engine::startup::StartupScript;
 use engine::{Location, StartupError, discover_startup};

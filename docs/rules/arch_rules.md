@@ -294,12 +294,14 @@ behaviour. The emulation lives in L3; no real Win32 API is linked.
 * Native plugins are **static and built into L3**: one `BUILTIN_PLUGINS`
   table, and `Plugins.link(name)` recognizes every ported DLL (and its
   aliases).
-* A DLL that is **not** ported gets the **null plugin object**: it accepts
-  every member access and every call, returns void, logs a warning on every
-  call, and never throws. This is the single documented exception to the
-  no-silent-fallback rule — and it is not silent.
-* The null object never replaces an existing global binding; it is installed
-  only where the plugin's stem is free.
+* A DLL that is **not** ported is **absent**: `Plugins.link(name)` records the
+  link, logs one warning that names the plugin, and registers nothing — no
+  global under the plugin's stem and no object that swallows member accesses.
+  A script that probes for the class (`typeof global[name] == 'Object'`) sees
+  it missing and takes its own "class not found" path, exactly as it does
+  against the engine that could not load the DLL.
+* `Plugins.link` returns **void**, like the engine it emulates; the game's own
+  `link()` helper derives its 0/1 result from the class probe.
 * Where the external engine's source is unavailable, the shipped DLL build is
   the oracle and is cited **by hash**
   (`<Name>.dll <sha256[:12]> @ <function/address>`). The extracted surface or
@@ -393,7 +395,7 @@ so it is not cited here: the pages that state each rule in full are in
 | D10 | L1 owns the traversal, the composition, the batching and the draw; L2 keeps the tree current and never builds a draw list |
 | D11 | No silent fallback and no hardcoded limit: a failure that cannot be performed is a typed error |
 | D13 | The platform and the media backend are chosen at compile time, not bundled at run time |
-| D14 | Native plugins are static and built into L3; an unported DLL gets the null plugin object, which logs and never throws |
+| D14 | Native plugins are static and built into L3; an unported DLL is absent — the link is recorded, one warning names it, and nothing is registered |
 | D15 | Loading takes an explicit archive list; the startup is found inside the mounted archives; a missing startup is a typed error |
 | D16 | L2 stays generic and L3 stays thin: an L3 member reduces to marshal → one L2 call → marshal |
 | D18 | The Win32 environment is emulated: handles, devices, the registry, the shell and the metrics return emulated values, never errors |

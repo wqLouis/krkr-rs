@@ -886,7 +886,7 @@ fn output_path(ctx: &CompatCtx, filename: &str) -> PathBuf {
     let services = unsafe { ctx.services() };
     if let Some(pointer) = services.storage() {
         // SAFETY: the host keeps the attached storage alive for the binding.
-        return unsafe { &*pointer }.game_dir().join(path);
+        return unsafe { &*pointer }.app_dir().join(path);
     }
     path.to_path_buf()
 }

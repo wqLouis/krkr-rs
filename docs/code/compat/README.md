@@ -45,7 +45,6 @@ you need the *why*, not the *what*.
 | Page | Module | One line |
 |---|---|---|
 | [`plugin.md`](plugin.md) | `plugin.rs` | `NativePlugin`, `PluginRegistry`, the built-in table |
-| [`null_plugin.md`](null_plugin.md) | `null_plugin.rs` | the null plugin object for a DLL that is not ported |
 | [`plugins_native.md`](plugins_native.md) | `plugins_native.rs` | the `Plugins` native class — `link` / `unlink` / `getList` |
 
 ### The native classes
@@ -175,8 +174,8 @@ Behaviour is constrained separately: every semantic is cited to
 * **Names the engine only through `crate::engine_api`.** The `layering` gate
   check rejects `engine::` anywhere else under `compat/src`.
 * **Raises a typed TJS error where the reference raises.** There is no
-  fabricated default on a fallible path. The single documented exception is
-  the null plugin object ([`null_plugin.md`](null_plugin.md)).
+  fabricated default on a fallible path, and there is no catch-all object
+  either: a plugin that has no emulation is absent.
 * **Resolves event members on the object**, so a script subclass override
   wins over the native default (`tests/extend_dispatch.rs`).
 * **Holds no platform code**: no `#[cfg(target_os = …)]`, no `std::fs`, no

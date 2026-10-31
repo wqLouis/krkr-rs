@@ -17,8 +17,8 @@ The class is registered on the first `Plugins.link("psbfile.dll")` — the
 built-in table entry registers it, exactly as the reference's `V2Link` does.
 Only `xp3filter.dll` is a startup module, so a script that reads
 `PSBFile` before it links the DLL does not see the class yet. See the
-[plugin index](../plugins.md) for the table, the null plugin and the
-conventions the plugin pages follow.
+[plugin index](../plugins.md) for the table and the conventions the plugin
+pages follow.
 
 The same container parser serves the [`motion_player`](motion_player.md)
 port, which reads the PSB data of an emote and draws it.

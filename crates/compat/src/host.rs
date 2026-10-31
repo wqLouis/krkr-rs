@@ -191,7 +191,7 @@ impl CompatHost {
         crate::natives::plugins::activate_deferred(engine, self.services.as_ref())
     }
 
-    /// Points the VM's stream factories at the attached storage's game
+    /// Points the VM's stream factories at the attached storage's project
     /// directory, so a relative save name resolves under the game path rather
     /// than at the process working directory. No-op when no storage is
     /// attached.
@@ -200,14 +200,14 @@ impl CompatHost {
             return Ok(());
         };
         // SAFETY: `attach_storage` requires the owner to outlive the binding.
-        let game_dir = unsafe { &*storage }.game_dir();
-        let Some(game_dir) = game_dir.to_str() else {
+        let app_dir = unsafe { &*storage }.app_dir();
+        let Some(app_dir) = app_dir.to_str() else {
             return Err(CompatError::Engine(
                 "stream data dir is not valid UTF-8".to_string(),
             ));
         };
         engine
-            .set_data_dir(game_dir)
+            .set_data_dir(app_dir)
             .map_err(|error| CompatError::Engine(error.to_string()))
     }
 
@@ -284,9 +284,6 @@ impl CompatHost {
             binding::uninstall();
             return Err(error);
         }
-        // Create the null-plugin no-op closure once, before any native
-        // callback can run, so the `missing` handler never re-enters the VM.
-        self.services.ensure_noop_closure(engine);
         self.engine = engine_addr;
         self.services_ptr = services_ptr;
         self.bound = true;
@@ -304,9 +301,6 @@ impl CompatHost {
             binding::uninstall();
             self.bound = false;
         }
-        // Drop the per-install no-op cache id so a later re-install against a
-        // different engine creates a fresh one.
-        self.services.clear_noop_closure();
     }
 
     /// Drop every value the native dispatch state retains, then remove the

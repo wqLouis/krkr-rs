@@ -33,8 +33,8 @@ krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan]
 | `--debug-overlay` | — | off | draw the debug panel in the top-left corner |
 | `--graphic-cache-limit` | `none`, `unlimited`, `0`, bytes | the reference default (disabled) | the decoded-image cache policy |
 | `--archive XP3` | path | — | mount an archive; repeatable, order-significant, later wins |
-| `--base-dir DIR` | path | the first archive's parent | the app path; every relative archive path resolves against it |
-| `GAME` | path | — | a game directory (becomes the app path) or an XP3 file (is mounted) |
+| `--base-dir DIR` | path | the first archive's parent | the mount root; every relative archive path resolves against it |
+| `GAME` | path | — | a game directory (becomes the mount root) or an XP3 file (is mounted) |
 
 `-h` / `--help` prints the usage table. The table is generated from the same
 `OPTIONS` constant the parser uses, and a test walks it, so an option cannot
@@ -57,13 +57,13 @@ therefore uses the null backend.
 `resolve_game` mirrors the reference's discovery from its first command-line
 argument:
 
-* a **positional directory** becomes the app path;
+* a **positional directory** becomes the mount root;
 * a **positional file** is mounted as an archive;
 * `--base-dir` and a positional directory are mutually exclusive;
-* the app path is `--base-dir` (or the positional directory) when given,
+* the mount root is `--base-dir` (or the positional directory) when given,
   otherwise the parent of the first archive, otherwise the working
   directory;
-* every relative archive path resolves against the app path, so
+* every relative archive path resolves against the mount root, so
   `--base-dir /game --archive data.xp3` mounts `/game/data.xp3`;
 * no game input at all is not an error: it is the empty-scene run.
 

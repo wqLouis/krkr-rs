@@ -183,8 +183,8 @@ fn plugins_link_wuvorbis_resolves_to_the_builtin_without_a_null_object() {
     assert_eq!(env.eval_int("Plugins.getList().length"), 1);
     assert_eq!(env.eval_str("Plugins.getList()[0]"), "wuvorbis.dll");
 
-    // Built-in resolution installs no null plugin object (that would define
-    // a `wuvorbis` global), and the reference plugin registers no TJS class:
+    // Built-in resolution publishes nothing under the stem, and the
+    // reference plugin registers no TJS class:
     // its `OggVorbis`/`wuvorbis` wide strings are TSS module metadata, so
     // neither name exists on the VM.
     for name in ["wuvorbis", "Wuvorbis", "OggVorbis"] {

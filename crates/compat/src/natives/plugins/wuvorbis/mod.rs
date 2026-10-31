@@ -26,13 +26,12 @@
 //! `crates/app/src/audio.rs`). The reference's decoder *creator* maps to
 //! that seam: [`register`] installs nothing of its own because `.ogg`
 //! decoding is the host's job — the plugin entry exists so
-//! `Plugins.link("wuvorbis.dll")` resolves to the built-in table (and is
-//! not routed to the null plugin object).
+//! `Plugins.link("wuvorbis.dll")` resolves to the built-in table.
 //!
 //! # Proven, not asserted
 //!
 //! * `crates/compat/tests/wuvorbis.rs` — the link resolves builtin and is
-//!   idempotent (no `wuvorbis` null global, no TJS class); a
+//!   idempotent (no `wuvorbis` global, no TJS class); a
 //!   `WaveSoundBuffer` opened over the committed 0.2 s / 44.1 kHz fixture
 //!   decodes through the host chain installed exactly the way the
 //!   composition root does; running without the host decoder, or with a

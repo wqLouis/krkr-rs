@@ -1,5 +1,5 @@
 //! Integration tests for `tjs2_prop_set_default` — the `Tjs2Engine::set_default_member`
-//! ABI used by the null plugin.
+//! ABI a native `missing` handler uses to make an absent member callable.
 //!
 //! The exhaustive unit tests live in `src/lib.rs`; this covers the
 //! default-member path and, importantly, the retention-consumption contract

@@ -44,8 +44,7 @@ mod md5;
 /// [`BuiltinPluginDef`] per entry. The list of startup modules is
 /// [`STARTUP_PLUGINS`]; every other entry registers its native
 /// classes on the first `Plugins.link` that names it. A name that is not in
-/// this table installs the null plugin object (doc 08 §4.2) — but only where
-/// the plugin's stem does not already name a global.
+/// this table is recorded and warned about, and nothing is registered for it.
 ///
 /// `aliases` are additional DLL names whose classes the same `register`
 /// installs (`layerExDraw.dll`, `layerExMovie.dll` and `perspective.dll` are

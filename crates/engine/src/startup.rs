@@ -4,9 +4,9 @@
 //! module locates the scripts but never executes them, so it is testable
 //! without the TJS VM. The order is:
 //!
-//! 1. `patch.tjs` — app path only, no search;
+//! 1. `patch.tjs` — project directory only, no search;
 //! 2. `startup.tjs` — searched across the storage (disk + mounted archives);
-//! 3. `AfterStartup.tjs` — app path only, no search;
+//! 3. `AfterStartup.tjs` — project directory only, no search;
 //! 4. `system/Initialize.tjs` — the compatibility fallback when
 //!    `startup.tjs` is not found.
 //!
@@ -24,17 +24,17 @@ use crate::storage::{
 
 /// The resolved sequence of startup scripts.
 ///
-/// `patch` and `after_startup` are resolved at the app path only;
+/// `patch` and `after_startup` are resolved at the project directory only;
 /// `startup` is the searched bootstrap script (or the fallback).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StartupScripts {
-    /// `patch.tjs` next to the archives, when it exists (app path only).
+    /// `patch.tjs` next to the archives, when it exists (project directory only).
     pub patch: Option<Location>,
     /// The bootstrap script the engine should execute.
     pub startup: StartupScript,
-    /// `AfterStartup.tjs` next to the archives, when it exists (app path
-    /// only).
+    /// `AfterStartup.tjs` next to the archives, when it exists (project
+    /// directory only).
     pub after_startup: Option<Location>,
 }
 
@@ -70,7 +70,8 @@ pub enum StartupError {
     #[error("no startup script: neither startup.tjs nor system/Initialize.tjs was found")]
     NoStartupScript,
 
-    /// A bottom file-system operation failed while probing the app path.
+    /// A bottom file-system operation failed while probing the project
+    /// directory.
     #[error(transparent)]
     Fs(#[from] FsError),
 
@@ -83,8 +84,8 @@ pub enum StartupError {
 
 /// Discovers the startup scripts for `storage` without executing anything.
 ///
-/// * `patch.tjs` and `AfterStartup.tjs` are looked up at the app path
-///   (`storage.game_dir()`) only.
+/// * `patch.tjs` and `AfterStartup.tjs` are looked up at the project
+///   directory (`storage.app_dir()`) only.
 /// * `startup.tjs` is searched across the storage (disk + mounted archives)
 ///   through [`Storage::find`].
 /// * When `startup.tjs` is absent, `system/Initialize.tjs` is the fallback;
@@ -93,10 +94,10 @@ pub enum StartupError {
 /// # Errors
 ///
 /// [`StartupError::NoStartupScript`] when neither `startup.tjs` nor
-/// `system/Initialize.tjs` exists, [`StartupError::Fs`] when the app-path
-/// probe fails, and [`StartupError::Storage`] when a storage lookup fails.
-/// A plain miss on the app path is not an error: the optional scripts are
-/// reported as absent.
+/// `system/Initialize.tjs` exists, [`StartupError::Fs`] when the
+/// project-directory probe fails, and [`StartupError::Storage`] when a
+/// storage lookup fails. A plain miss on the project directory is not an
+/// error: the optional scripts are reported as absent.
 pub fn discover_startup(storage: &Storage) -> Result<StartupScripts, StartupError> {
     let patch = app_path_file(storage, PATCH_SCRIPT)?;
     let after_startup = app_path_file(storage, AFTER_STARTUP_SCRIPT)?;
@@ -116,10 +117,10 @@ pub fn discover_startup(storage: &Storage) -> Result<StartupScripts, StartupErro
     })
 }
 
-/// Resolves `name` at the app path exactly: no search and no archive lookup.
-/// A missing (or directory) entry is `Ok(None)`.
+/// Resolves `name` at the project directory exactly: no search and no archive
+/// lookup. A missing (or directory) entry is `Ok(None)`.
 fn app_path_file(storage: &Storage, name: &str) -> Result<Option<Location>, StartupError> {
-    let candidate = storage.game_dir().join(name);
+    let candidate = storage.app_dir().join(name);
     match fs::stat(storage.file_system(), &FsPath::host(&candidate)) {
         Ok(meta) if !meta.is_dir => Ok(Some(Location::Disk(candidate))),
         Ok(_) => Ok(None),

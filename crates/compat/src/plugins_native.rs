@@ -1,10 +1,9 @@
 //! The `Plugins` native class: script-facing plugin linking.
 //!
-//! `link(name)` activates a built-in plugin emulation or installs the [null
-//! plugin object](crate::null_plugin); `unlink(name)` forgets a linked name;
+//! `link(name)` activates a built-in plugin emulation or records the link of
+//! a plugin that has none; `unlink(name)` forgets a linked name;
 //! `getList()` returns the linked names. This mirrors the reference
-//! `Plugins` class (static members only) with the null-plugin behavior wired
-//! in.
+//! `Plugins` class (static members only).
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
@@ -74,13 +73,9 @@ extern "C" fn native_link(
             set_void(out);
             0
         }
-        Ok(PluginOutcome::Null) => {
-            // `null_plugin::install` has already logged the outcome: the
-            // null object was installed as `global[stem]`, or an existing
-            // binding at that stem was kept (never clobbered).
-            log::warn!(
-                "Plugins.link({name:?}): no built-in emulation; null plugin path (doc 08 §4.2)"
-            );
+        Ok(PluginOutcome::Unported) => {
+            // The registry logged the outcome: the link is recorded, one
+            // warning names the plugin, and nothing is registered for it.
             set_void(out);
             0
         }
@@ -104,8 +99,7 @@ extern "C" fn native_unlink(
     let Some(resolved) = binding::resolve(engine as *mut Engine) else {
         return report_error(out_error, "Plugins.unlink: compat context is not bound");
     };
-    let mut ctx = resolved.ctx();
-    let removed = resolved.registry().unlink(&name, &mut ctx);
+    let removed = resolved.registry().unlink(&name);
     log::info!("Plugins.unlink({name:?}) -> {removed}");
     set_int(out, i64::from(removed));
     0

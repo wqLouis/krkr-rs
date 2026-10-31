@@ -36,19 +36,16 @@ is moved — the binding stores raw addresses and relies on that stability.
 
 1. **Refuses a second install** — `CompatError::Register("compat host is already installed")`.
 2. Builds a `CompatCtx` from the engine and services addresses.
-3. Calls the crate-internal `install(&mut ctx)`, which registers the
-   null-plugin hook, then every native family, then the `Plugins` class.
-   **Registration happens before the binding**, so a registration failure
-   leaves no half-installed table.
+3. Calls the crate-internal `install(&mut ctx)`, which registers every
+   native family, then the `Plugins` class. **Registration happens before the
+   binding**, so a registration failure leaves no half-installed table.
 4. Installs the process-wide binding ([`binding.md`](binding.md)). A failure
    here means a binding was already present.
-5. Points the VM's stream factories at the attached storage's game directory,
-   so a relative save name resolves under the game path rather than at the
-   process working directory. **If the directory cannot be represented, the
-   binding is rolled back** and the error is returned.
-6. Creates the null plugin's no-op closure **once**, before any native
-   callback can run, so the `missing` handler never re-enters the VM.
-7. Records the addresses and sets `bound`.
+5. Points the VM's stream factories at the attached storage's project
+   directory, so a relative save name resolves under the game path rather than
+   at the process working directory. **If the directory cannot be represented,
+   the binding is rolled back** and the error is returned.
+6. Records the addresses and sets `bound`.
 
 The `engine` argument must stay at a **stable address** for as long as the
 binding is installed — keep it behind a `Box` and do not move it afterwards.

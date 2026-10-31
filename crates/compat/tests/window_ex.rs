@@ -711,6 +711,52 @@ fn every_window_instance_method_is_registered() {
     );
 }
 
+/// The `maximized` and `minimized` properties answer the window's zoomed and
+/// iconic state.
+///
+/// The shipped `windowEx.dll` (sha256[:12] `124d2d426204`) answers the
+/// getter with `IsZoomed` and `IsIconic` on the native window handle (the
+/// `USER32.dll` imports at `0x10015049` and `0x100150f9`), so a window that
+/// is neither zoomed nor iconic answers `false`. The property setters do not
+/// change the state: the DLL's only `ShowWindow` calls pass `SW_HIDE` and
+/// `SW_SHOWNORMAL`, never `SW_MAXIMIZE` or `SW_MINIMIZE`.
+///
+/// The vendored `reference/cpp/plugins/windowEx.cpp:965-967` leaves the
+/// `maximized` / `minimized` registrations commented out, so the shipped DLL
+/// is the oracle for these two members.
+#[test]
+fn the_zoomed_and_iconic_states_are_false_and_the_setters_are_inert() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window();");
+    assert_eq!(env.eval_int("w.maximized"), 0, "a window is not zoomed");
+    assert_eq!(env.eval_int("w.minimized"), 0, "a window is not iconic");
+    // The setters are accepted and change nothing.
+    env.run("w.maximized = true; w.minimized = true;");
+    assert_eq!(env.eval_int("w.maximized"), 0, "the setter is inert");
+    assert_eq!(env.eval_int("w.minimized"), 0, "the setter is inert");
+}
+
+/// The KAG window idiom: a script subclass reads `this.maximized` without
+/// guarding the read, so the member must exist on the `Window` class the
+/// subclass inherits.
+#[test]
+fn the_kag_window_idiom_reads_the_member_without_raising() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "class KAGWindow extends Window { \
+             function resetWindowMaxSize() { \
+                 if (this.maximized) return 'zoomed'; \
+                 return 'normal'; \
+             } \
+         } \
+         var w = new KAGWindow(); \
+         global['kagResult'] = w.resetWindowMaxSize();",
+    );
+    assert_eq!(env.eval_str("global['kagResult']"), "normal");
+}
+
 // ---------------------------------------------------------------------------
 // MenuItemEx
 // ---------------------------------------------------------------------------
@@ -1233,7 +1279,7 @@ fn get_monitor_info_uses_the_flag_and_window_calling_convention() {
 /// (`k2compat/k2compat.tjs:243-248`); the Ex plugin is built from the base
 /// parser sources (`reference/cpp/plugins/KAGParser/readme.txt:1,117-127`).
 /// Both names must therefore resolve to the built-in emulation rather than
-/// falling through to the null-plugin object.
+/// falling through to the absent-plugin path.
 #[test]
 fn kagparser_dll_aliases_the_kagparser_ex_builtin() {
     let registry = compat::PluginRegistry::builtin();

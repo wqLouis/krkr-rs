@@ -20,8 +20,8 @@ on the core `Storages` class come from the `fstat` plugin and are owned by
 
 ## Behaviour
 
-`Plugins.link("varfile.dll")` resolves to the built-in table and succeeds, so a
-game that links the DLL is not routed to the null plugin object. No `var://`
+`Plugins.link("varfile.dll")` resolves to the built-in table and succeeds, so
+the DLL is not absent. No `var://`
 storage is served: a name with that scheme reaches the storage namespace like
 any other name it cannot place, so reading or writing it raises the
 `TVPCannotOpenStorage` error (`Cannot open storage %1`,

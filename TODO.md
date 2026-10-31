@@ -594,8 +594,9 @@ native OS popup would be a deliberate divergence, and Linux has nothing to call
   `Scene::add_window` starts a window visible, which is used by the engine,
   the app and every compat test, so the change is port-wide.
 * 35 of the 53 plugin names games ship have no emulation — the `**no**` rows of
-`plugins/INVENTORY.md`, the DLLs being gitignored — so each takes the
-null-plugin path (D14): every member accepted, every call void, one warning.
+`plugins/INVENTORY.md`, the DLLs being gitignored — so each is absent
+(D14): the link is recorded, one warning names the plugin, and nothing is
+registered for it.
 Per plugin: recover the surface from the DLL with the `plugins/analysis/`
 pipeline, emulate in `crates/compat/src/natives/plugins/<name>/`, register the
 DLL name in `BUILTIN_PLUGINS`, add behaviour tests citing the DLL by path, hash

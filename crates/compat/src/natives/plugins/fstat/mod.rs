@@ -185,7 +185,7 @@ fn placed_local(storage: &Storage, name: &str) -> Option<PathBuf> {
     }
 }
 
-/// Resolve a name against the game directory after normalization (`to` /
+/// Resolve a name against the project directory after normalization (`to` /
 /// `copyFile` semantics). A name that names an in-archive member has no
 /// locally accessible form, so it yields `None`
 /// (`reference/cpp/core/base/StorageIntf.cpp:554-559`).
@@ -196,20 +196,20 @@ fn normalized_local(storage: &Storage, name: &str) -> Option<PathBuf> {
     let normalized = normalize_name(strip_file_media(name));
     storage
         .relative_disk_name(&normalized)
-        .map(|relative| storage.game_dir().join(relative))
+        .map(|relative| storage.app_dir().join(relative))
 }
 
-/// Resolve a name against the game directory without normalization
+/// Resolve a name against the project directory without normalization
 /// (`copyFileNoNormalize` semantics).
 fn raw_local(storage: &Storage, name: &str) -> Option<PathBuf> {
     storage
         .relative_disk_name(strip_file_media(name))
-        .map(|relative| storage.game_dir().join(relative))
+        .map(|relative| storage.app_dir().join(relative))
 }
 
 /// The reference `TVPGetLocalName` without the storage search: reject an
-/// in-archive name and otherwise resolve against the game directory without
-/// consulting mounted archives (`copyFileNoNormalize` semantics,
+/// in-archive name and otherwise resolve against the project directory
+/// without consulting mounted archives (`copyFileNoNormalize` semantics,
 /// `reference/cpp/plugins/fstat/main.cpp:800-810`).
 fn local_name_no_search(storage: &Storage, name: &str) -> Result<PathBuf, String> {
     if name.contains(TVP_ARCHIVE_DELIMITER) {
@@ -1521,7 +1521,7 @@ extern "C" fn storages_is_existent_storage_no_search_no_normalize(
         let candidate = if Path::new(name).is_absolute() {
             PathBuf::from(name)
         } else {
-            storage.game_dir().join(name)
+            storage.app_dir().join(name)
         };
         fs::exists(&host_file_system(), &FsPath::host(&candidate))
     };
@@ -1677,7 +1677,7 @@ extern "C" fn storages_get_temporary_name(
     let storage = require_storage!(services, out_error, "getTemporaryName");
     // SAFETY: the host keeps the attached storage alive for the VM lifetime.
     let storage = unsafe { &*storage };
-    let app_path = storage.game_dir().to_string_lossy().into_owned();
+    let app_path = storage.app_dir().to_string_lossy().into_owned();
     let separator = if app_path.ends_with('/') || app_path.ends_with('\\') {
         ""
     } else {
@@ -1721,7 +1721,7 @@ extern "C" fn storages_current_path_get(
     let storage = require_storage!(services, out_error, "currentPath");
     // SAFETY: the host keeps the attached storage alive for the VM lifetime.
     let storage = unsafe { &*storage };
-    let mut path = normalize_name(&storage.game_dir().to_string_lossy());
+    let mut path = normalize_name(&storage.app_dir().to_string_lossy());
     if !path.ends_with('/') {
         path.push('/');
     }

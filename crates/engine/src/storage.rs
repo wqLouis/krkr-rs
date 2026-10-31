@@ -265,14 +265,28 @@ pub struct MountOptions {
     pub preload_archives: bool,
 }
 
-/// A mounted game storage: one base directory plus the explicitly mounted
+/// A mounted game storage: one mount root plus the explicitly mounted
 /// `.xp3` archives.
+///
+/// The mount root is where the archives are discovered; the project
+/// directory ([`Self::app_dir`]) is the root of the disk namespace and where
+/// the app-path scripts are looked up. The two are the same directory unless
+/// the composition root names a project directory of its own.
 #[non_exhaustive]
 pub struct Storage {
     /// Immutable bottom file-system object.
     fs: FileSystem,
-    /// Base (app) directory used for disk assets.
+    /// The mount root: the directory the archives are discovered under and
+    /// that a relative archive path resolves against.
     game_dir: PathBuf,
+    /// The project directory: the root of the disk namespace and the place
+    /// the app-path scripts (`patch.tjs`, `AfterStartup.tjs`) are looked up.
+    ///
+    /// It is the folder the project archive lives in, so a launch whose base
+    /// directory is the *parent* of the game folder still finds the game's
+    /// own loose files. A storage that was not told otherwise uses the mount
+    /// root.
+    app_dir: PathBuf,
     /// Mounted archives in mount order; later entries take precedence.
     archives: Vec<MountedArchive>,
     /// Auto search-path prefixes (plain dirs or `arc.xp3>` prefixes).
@@ -1548,9 +1562,12 @@ impl Storage {
     /// override `data.xp3`. An archive project checks its project archive
     /// before the other mounts.
     ///
-    /// `fs` is the bottom file-system object; `base_dir` is the app path used
-    /// for disk assets. An archive that cannot be opened or parsed is a typed
-    /// error, because the caller asked for it.
+    /// `fs` is the bottom file-system object; `base_dir` is the mount root the
+    /// archives are discovered under and that a relative archive path
+    /// resolves against. The disk namespace is rooted at the same directory
+    /// until [`Self::set_app_dir`] names the project directory. An archive
+    /// that cannot be opened or parsed is a typed error, because the caller
+    /// asked for it.
     ///
     /// # Errors
     ///
@@ -1650,7 +1667,7 @@ impl Storage {
     ///
     /// Call after the archives are mounted, so the project archive is known,
     /// and before any startup script runs. A relative path is resolved against
-    /// the app directory, the same way [`Self::mount_archive`] resolves it.
+    /// the mount root, the same way [`Self::mount_archive`] resolves it.
     pub fn set_project(&mut self, path: impl AsRef<Path>) {
         let raw = path.as_ref();
         let path = if raw.is_absolute() {
@@ -1681,7 +1698,8 @@ impl Storage {
         }
         Ok(Storage {
             fs,
-            game_dir: base_dir,
+            game_dir: base_dir.clone(),
+            app_dir: base_dir,
             archives: Vec::new(),
             auto_paths: Vec::new(),
             preload_archives,
@@ -1699,9 +1717,33 @@ impl Storage {
         &self.fs
     }
 
-    /// The game directory path.
+    /// The mount root: the directory the archives are discovered under and
+    /// that a relative archive path resolves against.
     pub fn game_dir(&self) -> &Path {
         &self.game_dir
+    }
+
+    /// The project directory: the root of the disk namespace.
+    ///
+    /// A storage name that names a file on disk resolves below this
+    /// directory, and the app-path scripts (`patch.tjs`, `AfterStartup.tjs`)
+    /// are looked up here. It is the folder the project archive lives in,
+    /// which is not necessarily the mount root: a launch whose base
+    /// directory is the parent of the game folder keeps the game's own loose
+    /// files reachable through the project directory.
+    pub fn app_dir(&self) -> &Path {
+        &self.app_dir
+    }
+
+    /// Sets the project directory.
+    ///
+    /// The disk namespace moves with it: a name that resolved to a loose file
+    /// below the old directory resolves below the new one. The resolution
+    /// cache is dropped, so a lookup made against the old directory is never
+    /// served from it.
+    pub fn set_app_dir(&mut self, path: impl AsRef<Path>) {
+        self.app_dir = path.as_ref().to_path_buf();
+        self.clear_resolution_cache();
     }
 
     /// Number of mounted archives.
@@ -2165,7 +2207,7 @@ impl Storage {
         // Resolve the storage-relative part. Absolute names must point inside
         // the mount; a `..` that escapes it is an invalid name.
         let Some(relative) = self.relative_disk_name_checked(name)? else {
-            trace.attempt(|| format!("name {name:?} is outside {}", self.game_dir.display()));
+            trace.attempt(|| format!("name {name:?} is outside {}", self.app_dir.display()));
             return Ok(None);
         };
 
@@ -2371,7 +2413,7 @@ impl Storage {
         let root = if Path::new(dir).is_absolute() {
             PathBuf::from(dir)
         } else {
-            self.game_dir.join(dir)
+            self.app_dir.join(dir)
         };
         let listing = self.directory_listing(&root)?;
         let mut exact = crate::hasher::map();
@@ -2504,7 +2546,7 @@ impl Storage {
 
     /// The on-disk path of the archive named by `arc`: an absolute path is
     /// used as given, a relative one is resolved case-insensitively under the
-    /// game directory.
+    /// project directory.
     fn archive_disk_path(&self, arc: &str) -> Result<Option<PathBuf>, StorageReadError> {
         let mut trace = SearchTrace::default();
         if let Some(relative) = self.relative_disk_name_checked(arc)?
@@ -2533,13 +2575,13 @@ impl Storage {
     /// The mount-relative part of `name` with `.`/`..` still present: `None`
     /// when the name is absolute and outside the mount.
     fn raw_relative_disk_name(&self, name: &str) -> Option<String> {
-        raw_relative_disk_name(&self.game_dir, name)
+        raw_relative_disk_name(&self.app_dir, name)
     }
 
     /// [`Self::relative_disk_name`] with a `..` that escapes the mount
     /// reported as [`StorageReadError::InvalidPathName`] instead of `None`.
     fn relative_disk_name_checked(&self, name: &str) -> Result<Option<String>, StorageReadError> {
-        relative_disk_name_checked(&self.game_dir, name)
+        relative_disk_name_checked(&self.app_dir, name)
     }
 
     /// Resolves an existing disk file for a storage name, case-insensitively.
@@ -2562,7 +2604,8 @@ impl Storage {
         })
     }
 
-    /// The case-corrected host path for a storage name below the mount.
+    /// The case-corrected host path for a storage name below the project
+    /// directory.
     ///
     /// Every path component is matched against the real directory entries
     /// ASCII-case-insensitively and the real on-disk spelling is returned; from
@@ -2570,8 +2613,8 @@ impl Storage {
     /// for it and the remaining components. Unlike [`Self::find`] this matches
     /// directories too and does not require the final component to exist.
     ///
-    /// `Ok(None)` means `name` is not below the mount (including an in-archive
-    /// name); a `..` that escapes the mount is
+    /// `Ok(None)` means `name` is not below the project directory (including
+    /// an in-archive name); a `..` that escapes it is
     /// [`StorageReadError::InvalidPathName`].
     ///
     /// # Errors
@@ -2579,22 +2622,22 @@ impl Storage {
     /// [`StorageReadError::InvalidPathName`] for a name that escapes the
     /// mount, and a file-system error when the directory listing fails.
     pub fn local_name(&self, name: &str) -> Result<Option<PathBuf>, StorageReadError> {
-        local_name_in(&self.fs, &self.game_dir, name)
+        local_name_in(&self.fs, &self.app_dir, name)
     }
 
     /// Disk branch of [`Self::find`], given an already-resolved relative name
-    /// below the game directory.
+    /// below the project directory.
     fn find_disk_relative(
         &self,
         relative: &str,
         trace: &mut SearchTrace,
     ) -> Result<Option<Location>, StorageReadError> {
-        self.find_disk_relative_at(&self.game_dir, relative, trace)
+        self.find_disk_relative_at(&self.app_dir, relative, trace)
     }
 
     /// Disk branch of [`Self::find`] below an explicit root directory. An
     /// absolute plain-directory auto path resolves below that host directory;
-    /// every other caller passes the game directory.
+    /// every other caller passes the project directory.
     fn find_disk_relative_at(
         &self,
         root: &Path,
@@ -2650,7 +2693,7 @@ impl Storage {
     fn find_disk_dir(&self, relative: &str) -> Result<Option<PathBuf>, StorageReadError> {
         let mut trace = SearchTrace::default();
         Ok(self
-            .resolve_disk(&self.game_dir, relative, &mut trace)?
+            .resolve_disk(&self.app_dir, relative, &mut trace)?
             .and_then(|(path, is_dir)| is_dir.then_some(path)))
     }
 
@@ -2964,10 +3007,10 @@ impl Storage {
 
     /// Resolve the startup script sequence against this storage.
     ///
-    /// Pure storage lookups: `patch.tjs` and `AfterStartup.tjs` are app-path
-    /// only (disk, no archive search), while `startup.tjs` and the
-    /// `system/Initialize.tjs` fallback are
-    /// searched across disk and archives.
+    /// Pure storage lookups: `patch.tjs` and `AfterStartup.tjs` are
+    /// project-directory only (disk, no archive search), while `startup.tjs`
+    /// and the `system/Initialize.tjs` fallback are searched across disk and
+    /// archives.
     ///
     /// # Errors
     ///
@@ -2985,7 +3028,7 @@ impl Storage {
         })
     }
 
-    /// The app-path-only file `name` when it exists on disk.
+    /// The project-directory-only file `name` when it exists on disk.
     fn app_path_file(&self, name: &str) -> Result<Option<String>, StorageReadError> {
         Ok(self.find_disk(name)?.map(|_| name.to_owned()))
     }
@@ -3009,9 +3052,9 @@ impl Storage {
         let mut found = BTreeSet::new();
 
         let disk_dir = if normalized.is_empty() {
-            self.game_dir.clone()
+            self.app_dir.clone()
         } else {
-            self.game_dir.join(&normalized)
+            self.app_dir.join(&normalized)
         };
         match fs::list(&self.fs, &FsPath::host(&disk_dir)) {
             Ok(entries) => {
@@ -3098,9 +3141,9 @@ impl Storage {
 
         let mut found = BTreeSet::new();
 
-        // Disk entries under the game directory, recursively.
+        // Disk entries under the project directory, recursively.
         let mut disk = Vec::new();
-        self.collect_disk_entries(&self.game_dir, "", &mut disk)?;
+        self.collect_disk_entries(&self.app_dir, "", &mut disk)?;
         for (name, is_dir) in disk {
             let base = name.rsplit('/').next().unwrap_or(&name);
             let prefix_ok = dir_prefix.is_empty() || name.starts_with(&dir_prefix);
@@ -3287,17 +3330,17 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 /// The mount-relative part of a storage `name`, or `None` when it is an
-/// absolute path outside `game_dir`.
-fn raw_relative_disk_name(game_dir: &Path, name: &str) -> Option<String> {
+/// absolute path outside the project directory.
+fn raw_relative_disk_name(app_dir: &Path, name: &str) -> Option<String> {
     // Fold Windows separators so a `\`-separated storage name behaves the same
     // on any host.
     let separators = name.replace('\\', "/");
     let path = Path::new(&separators);
     let relative = if path.is_absolute() {
-        if game_dir.as_os_str().is_empty() {
+        if app_dir.as_os_str().is_empty() {
             path.to_path_buf()
         } else {
-            strip_prefix_ignore_ascii_case(path, game_dir)?
+            strip_prefix_ignore_ascii_case(path, app_dir)?
         }
     } else {
         path.to_path_buf()
@@ -3308,10 +3351,10 @@ fn raw_relative_disk_name(game_dir: &Path, name: &str) -> Option<String> {
 /// [`raw_relative_disk_name`] with a `..` that escapes the mount reported as
 /// [`StorageReadError::InvalidPathName`] instead of `None`.
 fn relative_disk_name_checked(
-    game_dir: &Path,
+    app_dir: &Path,
     name: &str,
 ) -> Result<Option<String>, StorageReadError> {
-    let Some(relative) = raw_relative_disk_name(game_dir, name) else {
+    let Some(relative) = raw_relative_disk_name(app_dir, name) else {
         return Ok(None);
     };
     match fold_dot_components(&relative) {
@@ -3320,9 +3363,10 @@ fn relative_disk_name_checked(
     }
 }
 
-/// The case-corrected host path for a storage `name` below `game_dir` — the
-/// same resolution as [`Storage::local_name`], usable where only the
-/// stateless file-system handle and the base directory are available.
+/// The case-corrected host path for a storage `name` below the project
+/// directory — the same resolution as [`Storage::local_name`], usable where
+/// only the stateless file-system handle and the base directory are
+/// available.
 ///
 /// This is the writer-facing form: a `name` that is an absolute, fully
 /// lowercased form of a mixed-case on-disk path (the shape
@@ -3331,33 +3375,34 @@ fn relative_disk_name_checked(
 ///
 /// # Errors
 ///
-/// [`StorageReadError::InvalidPathName`] for a name that escapes `game_dir`,
-/// and a file-system error when the directory listing fails. A name that is
-/// not below `game_dir` (including an in-archive name) is `Ok(None)`.
+/// [`StorageReadError::InvalidPathName`] for a name that escapes the project
+/// directory, and a file-system error when the directory listing fails. A
+/// name that is not below the project directory (including an in-archive
+/// name) is `Ok(None)`.
 pub fn local_name_in(
     fs: &FileSystem,
-    game_dir: &Path,
+    app_dir: &Path,
     name: &str,
 ) -> Result<Option<PathBuf>, StorageReadError> {
     if name.contains('>') {
         return Ok(None);
     }
-    let Some(relative) = relative_disk_name_checked(game_dir, name)? else {
+    let Some(relative) = relative_disk_name_checked(app_dir, name)? else {
         return Ok(None);
     };
-    Ok(Some(case_correct_path(fs, game_dir, &relative)?))
+    Ok(Some(case_correct_path(fs, app_dir, &relative)?))
 }
 
-/// Walks `relative` (already folded and `/`-separated) below `game_dir`,
-/// replacing each existing component with its real on-disk spelling. From the
-/// first component that does not exist, the requested spelling of every
-/// remaining component is appended unchanged.
+/// Walks `relative` (already folded and `/`-separated) below the project
+/// directory, replacing each existing component with its real on-disk
+/// spelling. From the first component that does not exist, the requested
+/// spelling of every remaining component is appended unchanged.
 fn case_correct_path(
     fs: &FileSystem,
-    game_dir: &Path,
+    app_dir: &Path,
     relative: &str,
 ) -> Result<PathBuf, StorageReadError> {
-    let mut host = game_dir.to_path_buf();
+    let mut host = app_dir.to_path_buf();
     let mut parts = relative.split('/').filter(|part| !part.is_empty());
     while let Some(part) = parts.next() {
         match case_correct_component(fs, &host, part)? {

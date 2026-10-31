@@ -1,7 +1,7 @@
 //! The L3 registration/dispatch context and its explicit L2 service handles.
 #![allow(unsafe_code)]
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::ffi::c_char;
 use std::marker::PhantomData;
 
@@ -11,7 +11,7 @@ use crate::engine_api::{DecodePool, Scene, Storage};
 use crate::engine_api::{FrameClock, FrameTimeSource};
 use tjs::{
     NativeClassBuilder, NativeInstanceBuilder, NativeInstanceMembers, NativeStaticMembers,
-    RetainedValue, Tjs2Engine, Tjs2ValueId,
+    Tjs2Engine, Tjs2ValueId,
 };
 
 use crate::CompatError;
@@ -68,14 +68,6 @@ pub struct CompatServices {
     /// in a thread-local so the only process-wide state stays the documented
     /// binding.
     linked_array: RefCell<(Vec<*const c_char>, Vec<Vec<u8>>)>,
-    /// The cached no-op closure the null-plugin `missing` handler installs as
-    /// a property default. It is created once at install time and *duplicated*
-    /// per access, so a member read never re-enters the VM.
-    ///
-    /// Stored as a raw id (rather than a `DetachedValue`) so dropping the host
-    /// never dereferences the engine: the engine owns the C++ retention and
-    /// frees it when it is destroyed.
-    noop_closure: Cell<Tjs2ValueId>,
     /// Per-family L3 dispatch state, keyed by type. Natives that need state
     /// that outlives a callback (the `System` command line, the `Debug` log
     /// ring, timer/sound/input registries, ...) stash it here instead of in a
@@ -219,38 +211,6 @@ impl CompatServices {
         &self,
     ) -> std::cell::RefMut<'_, (Vec<*const c_char>, Vec<Vec<u8>>)> {
         self.linked_array.borrow_mut()
-    }
-
-    /// Create and cache the no-op closure the null plugin hands back for
-    /// absent member reads/calls. Idempotent; call once the engine is bound.
-    pub(crate) fn ensure_noop_closure(&self, engine: &Tjs2Engine) {
-        if !self.noop_closure.get().is_null() {
-            return;
-        }
-        if let Ok(RetainedValue::Object(object)) =
-            engine.eval_retained("(function(){})", "null_plugin")
-        {
-            let id = object.raw_id();
-            // The engine owns the C++ retention and frees it at destruction;
-            // deliberately leak the Rust handle so dropping the host can never
-            // touch the engine.
-            std::mem::forget(object);
-            self.noop_closure.set(id);
-        }
-    }
-
-    /// The cached no-op closure id, if [`Self::ensure_noop_closure`] created
-    /// one.
-    pub(crate) fn noop_closure_id(&self) -> Option<Tjs2ValueId> {
-        let id = self.noop_closure.get();
-        if id.is_null() { None } else { Some(id) }
-    }
-
-    /// Forget the cached no-op closure id. Does not touch the engine: the
-    /// engine owns the C++ retention and frees it at destruction, so this is
-    /// safe to call during teardown even if the engine is already gone.
-    pub(crate) fn clear_noop_closure(&self) {
-        self.noop_closure.set(tjs::Tjs2ValueId::null());
     }
 
     /// Borrow (creating if absent) the per-family dispatch state of type `T`.

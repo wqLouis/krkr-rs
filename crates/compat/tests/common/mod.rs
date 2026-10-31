@@ -92,19 +92,43 @@ pub struct Env {
     adapter: RefCell<compat::EventAdapter>,
 }
 
+/// The storage layout an `Env` is built with.
+enum StorageDirs {
+    /// No storage is attached.
+    None,
+    /// A temporary mount root that is also the project directory.
+    Temp,
+    /// An explicit mount root and project directory.
+    Explicit {
+        mount_root: PathBuf,
+        app_dir: PathBuf,
+    },
+}
+
 impl Env {
     /// A bound Env with a scene, timer registry and input state attached.
     pub fn new() -> Env {
-        Env::build(false)
+        Env::build(StorageDirs::None)
     }
 
     /// A bound Env with a mounted L2 storage (the caller writes game files
     /// into its `game_dir`).
     pub fn with_storage() -> Env {
-        Env::build(true)
+        Env::build(StorageDirs::Temp)
     }
 
-    fn build(with_storage: bool) -> Env {
+    /// A bound Env with a mounted L2 storage whose mount root and project
+    /// directory differ: the archives are mounted under `mount_root`, while
+    /// the disk namespace and the script-visible system paths are rooted at
+    /// `app_dir`.
+    pub fn with_storage_dirs(mount_root: PathBuf, app_dir: PathBuf) -> Env {
+        Env::build(StorageDirs::Explicit {
+            mount_root,
+            app_dir,
+        })
+    }
+
+    fn build(layout: StorageDirs) -> Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut scene = Box::new(Scene::default());
         let mut timer = Box::new(TimerState::new());
@@ -138,21 +162,34 @@ impl Env {
             host.services_mut()
                 .attach_frame_time(source as *const (dyn FrameTimeSource + 'static));
         }
-        let (storage, game_dir) = if with_storage {
-            let dir = unique_dir("krkr-compat-test");
-            std::fs::create_dir_all(&dir).expect("create temp game dir");
+        let dirs = match layout {
+            StorageDirs::None => None,
+            StorageDirs::Temp => {
+                let dir = unique_dir("krkr-compat-test");
+                std::fs::create_dir_all(&dir).expect("create temp game dir");
+                Some((dir.clone(), dir))
+            }
+            StorageDirs::Explicit {
+                mount_root,
+                app_dir,
+            } => Some((mount_root, app_dir)),
+        };
+        let (storage, game_dir) = if let Some((mount_root, app_dir)) = dirs {
+            std::fs::create_dir_all(&mount_root).expect("create temp mount root");
+            std::fs::create_dir_all(&app_dir).expect("create temp project dir");
             let mut storage = Box::new(
                 Storage::mount_archives(
-                    FileSystem::host(&dir),
-                    dir.clone(),
+                    FileSystem::host(&mount_root),
+                    mount_root.clone(),
                     std::iter::empty::<&str>(),
                 )
                 .expect("mount storage"),
             );
+            storage.set_app_dir(&app_dir);
             // SAFETY: boxed and declared after `_host`, so it outlives the
             // binding (same contract as the other attachments).
             unsafe { host.services_mut().attach_storage(&mut *storage) };
-            (Some(storage), Some(dir))
+            (Some(storage), Some(app_dir))
         } else {
             (None, None)
         };
@@ -186,7 +223,11 @@ impl Env {
         }
     }
 
-    /// The temp game directory of [`Env::with_storage`], when one is mounted.
+    /// The project directory of the mounted storage, when one is mounted.
+    ///
+    /// For [`Env::with_storage`] it is the temp directory the caller writes
+    /// game files into; for [`Env::with_storage_dirs`] it is the project
+    /// directory the storage was given.
     pub fn game_dir(&self) -> Option<&PathBuf> {
         self._game_dir.as_ref()
     }

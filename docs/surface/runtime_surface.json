@@ -1754,11 +1754,6 @@
       "setCursorPos",
       "setVisible"
     ],
-    "NullPlugin": [
-      "NullPlugin",
-      "finalize",
-      "missing"
-    ],
     "PSBFile": [
       "PSBFile",
       "finalize",
@@ -2512,10 +2507,12 @@
       "maxHeight",
       "maxWidth",
       "maximize",
+      "maximized",
       "menu",
       "minHeight",
       "minWidth",
       "minimize",
+      "minimized",
       "mouseCursorState",
       "ncHitTest",
       "nchtBorder",

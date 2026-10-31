@@ -278,7 +278,7 @@ fn output_path(ctx: &CompatCtx, filename: &str) -> Result<PathBuf, String> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
     }
-    Ok(storage.game_dir().join(path))
+    Ok(storage.app_dir().join(path))
 }
 
 /// Write the serialized text as the raw `tjs_char` stream the reference's

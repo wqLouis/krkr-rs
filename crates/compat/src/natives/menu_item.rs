@@ -1857,7 +1857,7 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
 /// `reference/cpp/core/base/ScriptMgnIntf.cpp:542`, and [`register`] already
 /// ran from the core native pass — so the plugin adds no TJS surface of its
 /// own and this entry only marks the name as a built-in. `Plugins.link`
-/// therefore resolves `menu.dll` without installing the null plugin object.
+/// therefore resolves `menu.dll` to the built-in table.
 ///
 /// The DLL also attaches a read-only `menu` property to `Window`. That is a
 /// **core** member, not a plugin member: the reference engine attaches it in
