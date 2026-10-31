@@ -35,6 +35,11 @@
 //!
 //! Resolution order:
 //!
+//! 0. a name that carries a scheme (`<scheme>://…`) belongs to the
+//!    storage media that registered the scheme: the provider answers for it
+//!    before the namespace looks at the disk or an archive, and it runs on
+//!    the thread that asked for the bytes. A scheme no provider registered
+//!    is an error — the namespace does not resolve a name it cannot place.
 //! 1. explicit `arc.xp3>path` addressing,
 //! 2. the current project storage: the project archive for an archive
 //!    project, the app directory for a folder project,
@@ -56,6 +61,10 @@ use api::error::FsError;
 use api::fs::{FsPath, OpenMode};
 use fs::xp3::{self, Entry, Xp3Archive, Xp3ExtractionFilter, normalize_in_archive_name};
 use fs::{FileState, FileSystem};
+
+mod media;
+
+pub use media::StorageMedia;
 
 /// Windows `FILE_ATTRIBUTE_DIRECTORY` (0x10).
 pub const ATTR_DIRECTORY: i64 = 0x10;
@@ -306,11 +315,12 @@ pub struct Storage {
     /// `(file_hash, offset, buffer, file_name, archive_name, file_size)` and
     /// may rewrite `buffer` in place.
     pub xp3_extraction_filter: Option<Box<Xp3ExtractionFilter<'static>>>,
-    /// Virtual media entries registered by L3 storage-media providers, keyed
-    /// by the full storage name (e.g. `psb://quickmenu.pimg/11632.tlg`).
-    /// [`Self::read`]/[`Self::read_prefix`]/[`Self::exists`] serve these
-    /// before disk and archive resolution; L2 only stores the bytes.
-    media: RefCell<crate::hasher::Map<String, Vec<u8>>>,
+    /// The registered storage-media providers, one per scheme.
+    ///
+    /// A storage name that carries a registered scheme is served by that
+    /// provider, before the disk and archive resolution; every other name
+    /// belongs to the default media and is resolved by the namespace itself.
+    media: RefCell<Vec<Rc<dyn StorageMedia>>>,
     /// Lazily built resolver tables, invalidated when the auto-path list or
     /// the mounted archives change.
     resolution_cache: RefCell<ResolutionCache>,
@@ -717,6 +727,18 @@ pub enum StorageReadError {
         /// What the pool reported.
         message: String,
     },
+    /// A storage-media provider reported a failure.
+    ///
+    /// The message is the provider's own and travels to the caller
+    /// unchanged: a domain that answers with its own wording (a missing
+    /// file, an unsupported domain) must not be reworded by the namespace.
+    #[error("{message}")]
+    Media {
+        /// The scheme of the media that reported the failure.
+        media: String,
+        /// The provider's message.
+        message: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -909,6 +931,27 @@ fn outcome_to_bytes(outcome: StorageOutcome, name: &str) -> Result<Vec<u8>, Stor
 /// a synchronous read would have produced.
 fn xp3_error(error: xp3::Xp3Error) -> StorageReadError {
     StorageReadError::Xp3(error.to_string())
+}
+
+/// Splits a storage name into its media scheme and the path that follows.
+///
+/// The scheme is the text before the first `://`, and it counts as a scheme
+/// only when it starts with a letter and carries nothing but the scheme
+/// characters (a letter, a digit, `+`, `-` or `.`). A name without a scheme
+/// belongs to the default media.
+fn split_media_scheme(name: &str) -> Option<(&str, &str)> {
+    let (scheme, path) = name.split_once("://")?;
+    let mut characters = scheme.chars();
+    let first = characters.next()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    if !characters
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.'))
+    {
+        return None;
+    }
+    Some((scheme, path))
 }
 
 /// The result of a scheduled read.
@@ -1705,7 +1748,7 @@ impl Storage {
             preload_archives,
             project: None,
             xp3_extraction_filter: None,
-            media: RefCell::new(crate::hasher::map()),
+            media: RefCell::new(Vec::new()),
             resolution_cache: RefCell::new(ResolutionCache::default()),
             read_pool: None,
             generation: 0,
@@ -1951,7 +1994,11 @@ impl Storage {
     /// the mount) or when a file-system failure occurs while probing. A name
     /// that does not resolve is `Ok(None)`, never an error.
     pub fn lookup(&self, name: &str) -> Result<Option<PendingStorage>, StorageReadError> {
-        if let Some(bytes) = self.media.borrow().get(name).cloned() {
+        if let Some((provider, path)) = self.media_provider(name)? {
+            if !provider.exists(path)? {
+                return Ok(None);
+            }
+            let bytes = provider.read(path)?;
             let size = bytes.len() as u64;
             return Ok(Some(PendingStorage::ready(bytes, Some(size))));
         }
@@ -2781,14 +2828,48 @@ impl Storage {
         f(&archive, &file_name)
     }
 
-    /// Registers a virtual media entry under its full storage name.
+    /// Registers a storage-media provider under its own domain.
     ///
-    /// L3 uses this for storage-media providers (`psb://…`, `psd://…`):
-    /// the bytes are served by [`Self::read`]/[`Self::read_prefix`] and
-    /// reported by [`Self::exists`] before disk and archive resolution. A
-    /// later registration for the same name replaces the earlier bytes.
-    pub fn register_media(&self, name: String, bytes: Vec<u8>) {
-        self.media.borrow_mut().insert(name, bytes);
+    /// A provider serves every storage name that carries its scheme
+    /// (`<scheme>://…`): [`Self::read`], [`Self::read_prefix`],
+    /// [`Self::exists`] and [`Self::lookup`] hand such a name to the
+    /// provider before the disk and archive resolution, and the provider
+    /// runs on the calling thread — a media name never becomes a read-pool
+    /// job. A later registration for the same domain replaces the earlier
+    /// provider.
+    pub fn register_media(&self, media: Box<dyn StorageMedia>) {
+        let media: Rc<dyn StorageMedia> = Rc::from(media);
+        let mut providers = self.media.borrow_mut();
+        providers.retain(|provider| !provider.domain().eq_ignore_ascii_case(media.domain()));
+        providers.push(media);
+    }
+
+    /// The provider that serves the scheme `name` carries, with the path
+    /// that follows the scheme.
+    ///
+    /// `Ok(None)` when the name carries no scheme. A scheme that no
+    /// provider registered is an error: the namespace does not resolve a
+    /// name it cannot place.
+    fn media_provider<'a>(
+        &self,
+        name: &'a str,
+    ) -> Result<Option<(Rc<dyn StorageMedia>, &'a str)>, StorageReadError> {
+        let Some((scheme, path)) = split_media_scheme(name) else {
+            return Ok(None);
+        };
+        let provider = self
+            .media
+            .borrow()
+            .iter()
+            .find(|provider| provider.domain().eq_ignore_ascii_case(scheme))
+            .cloned();
+        match provider {
+            Some(provider) => Ok(Some((provider, path))),
+            None => Err(StorageReadError::Media {
+                media: scheme.to_string(),
+                message: format!("Not supported media type \"{scheme}\""),
+            }),
+        }
     }
 
     /// Reads a storage entry to bytes (disk file or archive member).
@@ -2799,7 +2880,8 @@ impl Storage {
     /// file-system or archive error when the entry cannot be read. A failed
     /// read never yields an empty buffer.
     pub fn read(&self, name: &str) -> Result<Vec<u8>, StorageReadError> {
-        if let Some(bytes) = self.media.borrow().get(name).cloned() {
+        if let Some((provider, path)) = self.media_provider(name)? {
+            let bytes = provider.read(path)?;
             self.count_read_bytes(bytes.len());
             return Ok(bytes);
         }
@@ -2831,7 +2913,8 @@ impl Storage {
     /// [`StorageReadError::NotFound`] when the name does not resolve, and a
     /// file-system or archive error when the entry cannot be read.
     pub fn read_prefix(&self, name: &str, max_len: usize) -> Result<Vec<u8>, StorageReadError> {
-        if let Some(mut bytes) = self.media.borrow().get(name).cloned() {
+        if let Some((provider, path)) = self.media_provider(name)? {
+            let mut bytes = provider.read(path)?;
             bytes.truncate(max_len);
             self.count_read_bytes(bytes.len());
             return Ok(bytes);
@@ -2993,8 +3076,8 @@ impl Storage {
     /// [`StorageReadError::InvalidPathName`] for a name that escapes the
     /// mount. A name that does not resolve is `Ok(false)`.
     pub fn exists(&self, name: &str) -> Result<bool, StorageReadError> {
-        if self.media.borrow().contains_key(name) {
-            return Ok(true);
+        if let Some((provider, path)) = self.media_provider(name)? {
+            return provider.exists(path);
         }
         if self.find(name)?.is_some() {
             return Ok(true);

@@ -459,40 +459,44 @@ mod parser_tests {
         assert_eq!(events(" ;spaced"), vec![text(" ;spaced", 1)]);
     }
 
-    // --- directives -------------------------------------------------------
+    // --- percent lines ---------------------------------------------------
 
     #[test]
-    fn directives() {
+    fn percent_initial_lines_are_text() {
+        // The reference's line dispatch recognises only `@` (line command)
+        // and `[` (tag); every other line is text, so a `%` line is data and
+        // is delivered to the script as text
+        // (`reference/cpp/core/base/KAGParser.cpp:1456-1470`). The `%` prefix
+        // is a macro-argument marker only inside an attribute value
+        // (`reference/cpp/core/base/KAGParser.cpp:2143-2167`).
         let ev = events("%macro mymacro\n%call *start 10\n%if (x)\n%");
         assert_eq!(
             ev,
             vec![
-                Event::Directive {
-                    name: "macro".into(),
-                    args: vec!["mymacro".into()],
-                    raw: "%macro mymacro".into(),
-                    line: 1,
-                },
-                Event::Directive {
-                    name: "call".into(),
-                    args: vec!["*start".into(), "10".into()],
-                    raw: "%call *start 10".into(),
-                    line: 2,
-                },
-                Event::Directive {
-                    name: "if".into(),
-                    args: vec!["(x)".into()],
-                    raw: "%if (x)".into(),
-                    line: 3,
-                },
-                Event::Directive {
-                    name: "".into(),
-                    args: vec![],
-                    raw: "%".into(),
-                    line: 4,
-                },
+                text("%macro mymacro", 1),
+                text("%call *start 10", 2),
+                text("%if (x)", 3),
+                text("%", 4),
             ]
         );
+    }
+
+    #[test]
+    fn percent_line_is_scanned_for_inline_tags() {
+        // A `%` line is an ordinary text line: the inline `[tag]`s are split
+        // out of it, `[[` is the escape for a literal `[` and a mid-line tab
+        // is dropped (`reference/cpp/core/base/KAGParser.cpp:1456-1470`).
+        assert_eq!(
+            events("%foo [b]bar[/b]"),
+            vec![
+                text("%foo ", 1),
+                tag("b", &[], Bracket::Square, 1),
+                text("bar", 1),
+                tag("/b", &[], Bracket::Square, 1),
+            ]
+        );
+        assert_eq!(events("%a[[b"), vec![text("%a[b", 1)]);
+        assert_eq!(events("%a\tb"), vec![text("%ab", 1)]);
     }
 
     #[test]
@@ -614,12 +618,7 @@ mod parser_tests {
                 text("!", 3),
                 tag("wait", &[("1000", "true")], Bracket::At, 4),
                 tag("bg", &[("storage", "bg01.jpg")], Bracket::Square, 5),
-                Event::Directive {
-                    name: "note".into(),
-                    args: vec!["extra".into()],
-                    raw: "%note extra".into(),
-                    line: 6,
-                },
+                text("%note extra", 6),
             ]
         );
         assert_eq!(scenario.labels.get("*start"), Some(&1));
@@ -1089,8 +1088,9 @@ fn cur_line_and_cur_pos_are_zero_based() {
 
 #[test]
 fn percent_line_is_walked_as_text() {
-    // The base reference has no `%` handling at all, so a `%` line is
-    // ordinary text (`reference/cpp/core/base/KAGParser.cpp:1464-1512`).
+    // The reference's line dispatch recognises only `@` (line command) and
+    // `[` (tag); a `%` line is ordinary text and its characters are delivered
+    // one by one (`reference/cpp/core/base/KAGParser.cpp:1456-1470`).
     let mut state = KagParserState::default();
     state
         .load_scenario_text("t.ks", "%macro mymacro\n")
@@ -1098,6 +1098,74 @@ fn percent_line_is_walked_as_text() {
     let mut eval = |_e: &str| Ok(EvalResult::Void);
     let tags = collect(&mut state, &mut eval);
     assert_eq!(ch_text(&tags), "%macro mymacro");
+}
+
+#[test]
+fn percent_line_reaches_the_text_sink() {
+    // A `%`-initial line is not dropped: every character of it arrives as a
+    // `ch` tag, next to the tags of the `@` and `[` lines around it
+    // (`reference/cpp/core/base/KAGParser.cpp:1456-1470`). The `%` prefix is
+    // a macro-argument marker only inside an attribute value, so the line's
+    // `%` stays literal text (`reference/cpp/core/base/KAGParser.cpp:2143-2167`).
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text(
+            "t.ks",
+            "*start\n%foo bar\n@wait 100\n[bg storage=\"a.jpg\"]\n",
+        )
+        .unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let tags = collect(&mut state, &mut eval);
+    assert_eq!(ch_text(&tags), "%foo bar");
+    // The `@` line command and the `[...]` tag still dispatch as tags.
+    assert!(tags.contains(&(
+        "wait".to_string(),
+        vec![("100".to_string(), "true".to_string())]
+    )));
+    assert!(tags.contains(&(
+        "bg".to_string(),
+        vec![("storage".to_string(), "a.jpg".to_string())]
+    )));
+}
+
+#[test]
+fn percent_line_keeps_the_line_accounting() {
+    // The line a `%` line sits on is reported like any other text line, so a
+    // syntax error after it still names the right line
+    // (`reference/cpp/core/base/KAGParser.cpp:1456-1470`).
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text("t.ks", "%foo bar\nok\n[unterminated\n")
+        .unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let mut load = |_name: &str| Err("unexpected storage load".to_string());
+    let mut env = Environ {
+        eval: &mut eval,
+        load_storage: &mut load,
+        fire_label: None,
+        fire_script: None,
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
+    };
+    let mut error = None;
+    loop {
+        match state.next_tag(&mut env) {
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(e) => {
+                error = Some(e);
+                break;
+            }
+        }
+    }
+    let error = error.expect("the unterminated tag must raise");
+    assert!(
+        error.contains("line 3"),
+        "the error must name the third line: {error}"
+    );
 }
 
 #[test]

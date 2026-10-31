@@ -28,7 +28,7 @@ or `FontSystem` — it reaches the platform only through L2.
 | Group | Items | What L3 uses them for |
 |---|---|---|
 | the logical scene | `Scene`, `LayerState`, `BitmapState`, `FontState`, `Rect`, `DecodedImageKey`, `DecodedImageMode`, `TransitionFrame`, `HitCandidate` | the layer tree, the bitmap store, the font store, the decoded-image cache, the frame a composited transition draws |
-| the storage namespace | `Storage`, `Location`, `StorageReadError`, `normalize_in_archive_name` | mounting, resolving and reading a script storage name |
+| the storage namespace | `Storage`, `Location`, `StorageReadError`, `StorageMedia`, `normalize_in_archive_name` | mounting, resolving and reading a script storage name, and serving the names a storage media owns |
 | input | `InputState` | the generic pointer, key, button and touch state |
 | timers | `TimerState`, `TimerId`, `TimerCallback` | the L2 timer registry L3 arms and disarms |
 | the frame clock | `FrameClock` | the engine's time base: the value the timers, the sound poll and the transitions read |
@@ -61,6 +61,13 @@ The `raster` and `layer_ops` groups are nested modules so a call site reads
 * **TVP vocabulary stays out of L2.** The native blend numbering (`lt*`),
   the `0..100000` volume scale, the `.sli` grammar and the KAG tags are L3;
   L2 keeps `BlendMode`, a normalised gain and an opaque key code.
+* **A storage media is L3's own.** `StorageMedia` is the provider contract L2
+  dispatches a `<scheme>://…` name to. L3 implements it — the `var://` media
+  walks the script object graph, the `psb://` media resolves a member path
+  against a parsed container — and L2 holds the registered providers without
+  knowing what a scheme's domain is made of. A provider's message crosses the
+  seam unchanged (`StorageReadError::Media`): the domain's own wording is
+  what the script sees.
 
 ---
 

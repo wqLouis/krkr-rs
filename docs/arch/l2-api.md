@@ -537,10 +537,14 @@ The mounting operations: `Storage::mount_archives(fs, base_dir, archives)`,
 The namespace operations: `add_auto_path`, `remove_auto_path`,
 `find(name)`, `read(name)`, `read_prefix(name, max_len)`, `stat(name)`,
 `exists(name)`, `list(dir)`, `file_list(mask, attr)`, `startup_plan()`,
-`register_media(name, bytes)`, `relative_disk_name`, `find_disk`,
+`register_media(provider)`, `relative_disk_name`, `find_disk`,
 `local_name`, `clear_resolution_cache`, `probe_counts`, `read_bytes`,
 `game_dir`, `app_dir`, `file_system`, `archive_count`, `archive_paths`,
 `for_each_archive`, `lookup(name)`.
+
+A name that carries a scheme (`<scheme>://…`) is dispatched to the
+`StorageMedia` provider that registered the scheme, before the resolution
+below; a scheme no provider registered is a `StorageReadError::Media`.
 
 The free functions: `storage::discover_archives(file_system, base_dir)` —
 the opt-in recursive scan for `*.xp3` — and `storage::local_name_in(fs,

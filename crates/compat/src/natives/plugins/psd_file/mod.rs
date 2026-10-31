@@ -17,11 +17,11 @@
 //! * the static `color_mode_*`, `blend_mode_*`, `layer_type_*` constants and
 //!   `clearStorageCache`.
 //!
-//! The reference also registers a `psd://` storage media so a layer image can
-//! be opened as `psd://file.psd/root/folder/layer.bmp`; the compat storage
-//! namespace has no media-provider seam, so that part is not ported (the PSD
-//! class surface is complete). The reference's `loadMemory`/`loadStream` are
-//! plain C++ helpers rather than TJS members, so they are not registered.
+//! A `psd://` storage media would let a layer image be opened as
+//! `psd://file.psd/root/folder/layer.bmp`; no `psd://` provider is
+//! registered, so that part is missing (the PSD class surface is complete).
+//! The `loadMemory`/`loadStream` helpers are native helpers rather than TJS
+//! members, so they are not registered.
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};

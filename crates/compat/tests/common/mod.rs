@@ -245,7 +245,8 @@ impl Env {
 
     pub fn run(&self, script: &str) {
         self.engine
-            .exec_script_discard(script, "compat-test")
+            .exec_script(script, "compat-test")
+            .map(|_| ())
             .unwrap_or_else(|error| panic!("exec {script:?} failed: {error}"));
     }
 

@@ -242,9 +242,7 @@ index it belongs to — so the tags before it are still delivered.
 4. **Macro recording reconstructs the body** from the parsed events; the `*`
    macro-entity marker is lost in the recorded body (it survives in the
    expansion path), and `&`/`%` prefixes survive in the values.
-5. **A `%`-directive line is walked as ordinary text** — the base reference
-   has no `%` handling at all, so the script-visible behaviour matches.
-6. **`assign` does not copy `process_special_tags` or `interrupted`**, which
+5. **`assign` does not copy `process_special_tags` or `interrupted`**, which
    is what the reference's copy leaves with the destination.
 
 ---

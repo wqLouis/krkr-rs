@@ -504,8 +504,12 @@ pub(crate) struct MotionSnapshot {
 
 impl MotionSnapshot {
     /// Parse a snapshot from a parsed PSB container loaded from `container`.
-    pub(crate) fn from_psb(document: PsbDocument, container: &str) -> Self {
-        let PsbDocument { root, .. } = document;
+    ///
+    /// The snapshot keeps its own copy of the container's root value; the
+    /// `psb://` media serves the container's resources from the parsed
+    /// document itself.
+    pub(crate) fn from_psb(document: &PsbDocument, container: &str) -> Self {
+        let root = document.root.clone();
         // `metadata.base` holds only the default character and action
         // (`chara`/`motion`); the variable, controller, selector and timeline
         // lists are direct children of `metadata`
@@ -2124,7 +2128,7 @@ mod tests {
         )]);
         let root = dict(vec![("object", object), ("source", source)]);
         MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root,
                 resources: Vec::new(),
             },
@@ -2211,7 +2215,7 @@ mod tests {
         )]);
         let root = dict(vec![("object", object), ("source", source)]);
         MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root,
                 resources: Vec::new(),
             },
@@ -2300,7 +2304,7 @@ mod tests {
             dict(vec![("motion", dict(vec![("self", clip)]))]),
         )]);
         let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root: dict(vec![("object", object)]),
                 resources: Vec::new(),
             },
@@ -2539,7 +2543,7 @@ mod tests {
             )]),
         )]);
         let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root,
                 resources: Vec::new(),
             },
@@ -2638,7 +2642,7 @@ mod tests {
             )]),
         )]);
         let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root,
                 resources: Vec::new(),
             },
@@ -2733,7 +2737,7 @@ mod tests {
             )]),
         )]);
         let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root,
                 resources: Vec::new(),
             },
@@ -2792,7 +2796,7 @@ mod tests {
             )]),
         )]);
         let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root,
                 resources: Vec::new(),
             },
@@ -2823,7 +2827,7 @@ mod tests {
             )]),
         )]);
         let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root,
                 resources: Vec::new(),
             },
@@ -2901,7 +2905,7 @@ mod tests {
             )]),
         )]);
         let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root: dict(vec![("object", object)]),
                 resources: Vec::new(),
             },
@@ -3004,7 +3008,7 @@ mod tests {
             )]),
         )]);
         let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root: dict(vec![("object", object)]),
                 resources: Vec::new(),
             },

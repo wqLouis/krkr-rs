@@ -74,8 +74,8 @@ pub use projection::{
     ComposedLayer, compose_layer, project_scene, project_window, project_window_report,
     resolve_blend,
 };
-// The storage namespace: the mounts, the resolved locations and the typed
-// read errors.
-pub use storage::{Location, Storage, StorageReadError};
+// The storage namespace: the mounts, the resolved locations, the
+// storage-media providers and the typed read errors.
+pub use storage::{Location, Storage, StorageMedia, StorageReadError};
 // The startup-script discovery.
 pub use startup::{StartupError, discover_startup};

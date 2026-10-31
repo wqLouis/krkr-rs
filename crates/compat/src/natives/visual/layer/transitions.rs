@@ -533,7 +533,8 @@ fn rule_mask(
     })?;
     // The rule graphic goes through the same decoded-image cache as every
     // other load, so a repeated transition does not decode it again.
-    let image = load_cached_storage_image(ctx, &name, COLOR_KEY_NONE, DecodedImageMode::Full)?;
+    let image = load_cached_storage_image(ctx, &name, COLOR_KEY_NONE, DecodedImageMode::Full)
+        .map_err(|error| error.message())?;
     RuleMask::from_rgba(image.width, image.height, &image.rgba).map_err(|error| error.to_string())
 }
 

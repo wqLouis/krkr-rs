@@ -1,0 +1,29 @@
+[package]
+name = "devtools"
+description = "krkr-rs developer tools: the XP3 archive inspector and the TJS bytecode disassembler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "krkr-devtools"
+path = "src/main.rs"
+
+[features]
+default = ["xp3", "tjsb"]
+# The XP3 archive family: it reads archives through the L1 container parser.
+xp3 = ["dep:fs", "dep:api"]
+# The TJS bytecode family: it reads bytecode files on its own.
+tjsb = []
+# The script compiler: it links the vendored VM, so it is off by default.
+tjs-compile = ["dep:tjs"]
+
+[dependencies]
+api = { workspace = true, optional = true }
+fs = { workspace = true, optional = true }
+tjs = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The in-memory archive builder: the XP3 tests need a real archive image.
+testkit = { workspace = true }

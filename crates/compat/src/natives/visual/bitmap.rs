@@ -3,6 +3,7 @@
 
 use std::ffi::{c_char, c_int, c_void};
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::engine_api::{
@@ -48,6 +49,56 @@ const IMAGE_EXTENSION_PROBE: [&str; 21] = [
     ".tif", ".tiff", ".tga", ".dds", ".pnm", ".ico", ".qoi", ".hdr", ".exr", ".ff",
 ];
 
+/// Why an image could not be loaded.
+///
+/// A storage failure keeps the storage's own message, so it must not be
+/// reworded by the caller: the words the storage raised are the words the
+/// script sees.
+#[derive(Debug, Clone)]
+pub(crate) enum ImageLoadError {
+    /// The storage could not deliver the bytes.
+    Storage(StorageReadError),
+    /// The image could not be decoded or installed.
+    Message(String),
+}
+
+impl ImageLoadError {
+    /// The message the script sees.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Storage(error) => error.to_string(),
+            Self::Message(message) => message.clone(),
+        }
+    }
+
+    /// The message the script sees, with `prefix` in front of a failure that
+    /// is not the storage's own.
+    pub(crate) fn message_with(&self, prefix: &str) -> String {
+        match self {
+            Self::Storage(error) => error.to_string(),
+            Self::Message(message) => format!("{prefix}{message}"),
+        }
+    }
+}
+
+impl std::fmt::Display for ImageLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+impl From<StorageReadError> for ImageLoadError {
+    fn from(error: StorageReadError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl From<String> for ImageLoadError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
 /// Read `name` through the attached L2 [`Storage`], probing the common image
 /// extensions when the name itself does not resolve.
 ///
@@ -56,23 +107,25 @@ const IMAGE_EXTENSION_PROBE: [&str; 21] = [
 pub(crate) fn read_image_from_storage(
     storage: &Storage,
     name: &str,
-) -> Result<(String, Vec<u8>), String> {
+) -> Result<(String, Vec<u8>), ImageLoadError> {
     // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
     let lookup = strip_file_media(name);
     match storage.read(lookup) {
         Ok(bytes) => return Ok((name.to_string(), bytes)),
         Err(StorageReadError::NotFound(_)) => {}
-        Err(error) => return Err(error.to_string()),
+        Err(error) => return Err(ImageLoadError::Storage(error)),
     }
     for extension in IMAGE_EXTENSION_PROBE {
         let candidate = format!("{lookup}{extension}");
         match storage.read(&candidate) {
             Ok(bytes) => return Ok((candidate, bytes)),
             Err(StorageReadError::NotFound(_)) => {}
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(ImageLoadError::Storage(error)),
         }
     }
-    Err(format!("storage not found: {name}"))
+    Err(ImageLoadError::Storage(StorageReadError::NotFound(
+        name.to_string(),
+    )))
 }
 
 /// Decode image bytes through the installed host decoder.
@@ -84,6 +137,46 @@ pub(crate) fn decode_image(
     services
         .state::<ResourceResolver>()
         .decode(bytes, Some(name))
+}
+
+/// The host decoder that reads an image's 8-bit index plane.
+///
+/// The plane is the image's own 8-bit sample — the palette index of a
+/// palettized image, the gray level of a grayscale one — and it travels as a
+/// gray image: every pixel's red, green and blue channels carry the plane
+/// value.
+pub(crate) type IndexPlaneDecodeFn = dyn Fn(&[u8], Option<&str>) -> Result<DecodedImage, String>;
+
+/// The installed index-plane decoder.
+#[derive(Default)]
+pub(crate) struct IndexPlaneDecoder {
+    /// The decoder, absent until the host installs one.
+    decoder: Option<Rc<IndexPlaneDecodeFn>>,
+}
+
+/// Install the index-plane decoder the province load composes.
+pub(crate) fn set_index_plane_decoder(
+    services: &CompatServices,
+    decoder: impl Fn(&[u8], Option<&str>) -> Result<DecodedImage, String> + 'static,
+) {
+    services.state::<IndexPlaneDecoder>().decoder = Some(Rc::new(decoder));
+}
+
+/// Decode the 8-bit index plane of `bytes` through the installed decoder.
+///
+/// A host that installed no decoder gets a typed error instead of a colour
+/// image: the plane is not the image's colour.
+fn decode_index_plane(
+    services: &CompatServices,
+    name: &str,
+    bytes: &[u8],
+) -> Result<DecodedImage, String> {
+    let decoder = {
+        let state = services.state::<IndexPlaneDecoder>();
+        state.decoder.clone()
+    };
+    let decoder = decoder.ok_or_else(|| "no index-plane decoder is installed".to_string())?;
+    decoder(bytes, Some(name))
 }
 
 /// Probe image bytes through the installed host prober.
@@ -197,14 +290,20 @@ fn save_option_expression(type_name: &str) -> Option<&'static str> {
     }
 }
 
-/// Read `name` through the attached storage, decode it and apply the color
-/// key. This is the uncached decode body the scene's decoded-image cache
-/// wraps.
+/// Read `name` through the attached storage and decode it. This is the
+/// uncached decode body the scene's decoded-image cache wraps.
+///
+/// The `mode` picks the decode: a full-colour load reads the image's pixels
+/// and applies the color key, a province load reads the image's 8-bit index
+/// plane — the palette index of a palettized image, not the colour the
+/// palette maps it to. The plane travels as a gray image, so its red channel
+/// is the plane value.
 pub(crate) fn decode_storage_image_uncached(
     ctx: &CompatCtx,
     name: &str,
     colorkey: u32,
-) -> Result<DecodedImage, String> {
+    mode: DecodedImageMode,
+) -> Result<DecodedImage, ImageLoadError> {
     // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `decode_storage_image_uncached`.
     let services = unsafe { ctx.services() };
     let storage = services
@@ -212,14 +311,32 @@ pub(crate) fn decode_storage_image_uncached(
         .ok_or_else(|| "no storage attached".to_string())?;
     // SAFETY: `attach_storage` guarantees the pointer stays valid.
     let (resolved, bytes) = read_image_from_storage(unsafe { &*storage }, name)?;
-    let image = decode_image(services, &resolved, &bytes)?;
-    if !image.is_consistent() {
-        return Err("the decoded image is malformed".to_string());
-    }
-    let (width, height) = (image.width, image.height);
-    let mut rgba = image.rgba;
-    apply_color_key(&mut rgba, width, colorkey);
-    Ok(DecodedImage::new(width, height, rgba))
+    let image = match mode {
+        DecodedImageMode::Full => {
+            let image = decode_image(services, &resolved, &bytes)?;
+            if !image.is_consistent() {
+                return Err(ImageLoadError::Message(
+                    "the decoded image is malformed".to_string(),
+                ));
+            }
+            let (width, height) = (image.width, image.height);
+            let mut rgba = image.rgba;
+            apply_color_key(&mut rgba, width, colorkey);
+            DecodedImage::new(width, height, rgba)
+        }
+        DecodedImageMode::Province => {
+            // The province plane is the image's own 8-bit sample; the color
+            // key does not apply to it.
+            let image = decode_index_plane(services, &resolved, &bytes)?;
+            if !image.is_consistent() {
+                return Err(ImageLoadError::Message(
+                    "the decoded image is malformed".to_string(),
+                ));
+            }
+            image
+        }
+    };
+    Ok(image)
 }
 
 /// Load `name` through the scene's decoded-image cache (the reference
@@ -232,10 +349,12 @@ pub(crate) fn load_cached_storage_image(
     name: &str,
     colorkey: u32,
     mode: DecodedImageMode,
-) -> Result<DecodedImage, String> {
+) -> Result<DecodedImage, ImageLoadError> {
     let key = DecodedImageKey::new(name, colorkey, mode, 0, 0);
     let scene = scene_mut(ctx)?;
-    scene.cached_decoded_image(key, || decode_storage_image_uncached(ctx, name, colorkey))
+    scene.cached_decoded_image(key, || {
+        decode_storage_image_uncached(ctx, name, colorkey, mode)
+    })
 }
 
 /// Decode the storage image `name` into RGBA8, applying the color key, through
@@ -244,7 +363,7 @@ fn decode_storage_image(
     ctx: &CompatCtx,
     name: &str,
     colorkey: u32,
-) -> Result<DecodedImage, String> {
+) -> Result<DecodedImage, ImageLoadError> {
     load_cached_storage_image(ctx, name, colorkey, DecodedImageMode::Full)
 }
 
@@ -262,7 +381,7 @@ fn load_into_bitmap(
     name: &str,
     colorkey: u32,
     defer: bool,
-) -> Result<(u32, u32, u32), String> {
+) -> Result<(u32, u32, u32), ImageLoadError> {
     // The decoded-image cache comes first: a hit is installed synchronously,
     // exactly as a cached graphic is installed.
     let key = DecodedImageKey::new(name, colorkey, DecodedImageMode::Full, 0, 0);
@@ -290,11 +409,15 @@ fn load_into_bitmap(
 }
 
 /// Installs a decoded image as the image of `id`, or of a new bitmap.
+///
+/// The failure is the scene's own: no scene attached, or the bitmap that is
+/// gone. It is a message, not a storage failure, so the caller keeps its own
+/// prefix.
 fn install_decoded_image(
     ctx: &CompatCtx,
     id: Option<u32>,
     image: DecodedImage,
-) -> Result<(u32, u32, u32), String> {
+) -> Result<(u32, u32, u32), ImageLoadError> {
     let (width, height) = (image.width, image.height);
     let rgba = image.rgba;
     let scene = scene_mut(ctx)?;
@@ -334,7 +457,7 @@ pub(crate) fn start_pending_decode(
     name: &str,
     colorkey: u32,
     mode: DecodedImageMode,
-) -> Result<Option<(u32, u32, PendingImage)>, String> {
+) -> Result<Option<(u32, u32, PendingImage)>, ImageLoadError> {
     // The province plane is a separate target whose reads cannot wait for a
     // decode, so only a full-colour image is deferred.
     if mode != DecodedImageMode::Full {
@@ -503,7 +626,7 @@ extern "C" fn bitmap_ctor(
             .map_or(COLOR_KEY_NONE, |value| value_as_i64(value) as u32);
         match load_into_bitmap(&ctx, None, &name, colorkey, true) {
             Ok((id, _width, _height)) => id,
-            Err(error) => return report_error(out_error, &format!("Bitmap: {error}")),
+            Err(error) => return report_error(out_error, &error.message_with("Bitmap: ")),
         }
     } else if a.len() > 1 {
         let Some(width) = bitmap_dimension(&a[0]) else {
@@ -1067,7 +1190,7 @@ extern "C" fn bitmap_load(
     let had_image = id.is_some();
     let (id, width, height) = match load_into_bitmap(&ctx, id, &name, colorkey, true) {
         Ok(size) => size,
-        Err(error) => return report_error(out_error, &format!("Bitmap.load: {error}")),
+        Err(error) => return report_error(out_error, &error.message_with("Bitmap.load: ")),
     };
     if !had_image {
         // SAFETY: the payload is owned by the VM for the duration of the call.
@@ -1138,7 +1261,7 @@ extern "C" fn bitmap_load_async(
             Ok(object) => (Some(object), 0, String::new()),
             Err(error) => (None, 1, error),
         },
-        Err(error) => (None, 1, error),
+        Err(error) => (None, 1, error.message()),
     };
     if let Ok(owner) = host.retain_object_detached(objthis) {
         let meta_arg = match meta {
@@ -1192,7 +1315,9 @@ extern "C" fn bitmap_load_header(
     // SAFETY: `storage` is the attached L2 storage the host keeps alive for the VM lifetime.
     let (resolved_name, bytes) = match read_image_from_storage(unsafe { &*storage }, &name) {
         Ok(found) => found,
-        Err(error) => return report_error(out_error, &format!("Bitmap.loadHeader: {error}")),
+        Err(error) => {
+            return report_error(out_error, &error.message_with("Bitmap.loadHeader: "));
+        }
     };
     let info = match probe_image(services, &resolved_name, &bytes) {
         Ok(info) => info,

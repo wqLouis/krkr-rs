@@ -125,22 +125,27 @@ member as `Octet`, with `.length` and index access
 
 ### The `psb://` media
 
-A successful `load` registers every resource of the container in the `psb://`
-storage media, so a script can open `psb://…` paths afterwards
+A successful `load` registers the container's **root-level** resources in the
+`psb://` storage media, so a script can open `psb://…` paths afterwards
 (`reference/cpp/plugins/psbfile/main.cpp:60-68`,
-`reference/cpp/plugins/psbfile/PSBMedia.cpp:14-36`).
+`reference/cpp/plugins/psbfile/PSBMedia.cpp:14-36`). A resource directly
+under the root keeps its own key: `psb://<container>/<key>`.
 
-The whole value tree is walked, so a resource nested in a dictionary or a
-list is registered under its `/`-joined member path, with a list index
-contributing a path segment
-(`reference/cpp/plugins/psbfile/PSBMediaRegistry.cpp:16-77`). A resource
-directly under the root keeps its own key: `psb://<container>/<key>`.
+The reference's tree walk — a resource nested in a dictionary or a list is
+reachable under its `/`-joined member path, with a list index contributing a
+path segment — lives in a separate helper
+(`reference/cpp/plugins/psbfile/PSBMediaRegistry.cpp:16-77`) that the
+plugin's own `load` does not call; only the motion player uses it
+(`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1395,1431`). The port
+keeps the two apart: `load` registers the root-level resources, and the
+motion player registers the whole tree.
 
-The registration goes through the engine's storage media table, which
-serves those names before disk and archive resolution. The container name
-is lower-cased from its first `.`
-(`reference/cpp/plugins/psbfile/PSBMedia.cpp:14-20`), so `a.psb` and
-`a.PSB` share one name.
+The media is served by a storage-media provider: a `psb://…` name is
+dispatched to it before the disk and archive resolution, and the member path
+is resolved against the parsed document when the entry is read, so the bytes
+are not copied into a table. The container name is lower-cased from its
+first `.` (`reference/cpp/plugins/psbfile/PSBMedia.cpp:14-20`), so `a.psb`
+and `a.PSB` share one name.
 
 ## State and lifetime
 
@@ -150,9 +155,8 @@ is lower-cased from its first `.`
   through the engine, so a game script sees the same shapes as the
   reference's `toTJSVal` conversions.
 * The document is dropped when the instance is invalidated or destroyed.
-* The `psb://` registrations live in the engine's storage media table, so
-  they outlive the instance — as in the reference, where the media is
-  registered globally.
+* The `psb://` registrations live in the storage media, so they outlive the
+  instance — as in the reference, where the media is registered globally.
 
 ## Errors
 
@@ -172,23 +176,13 @@ is lower-cased from its first `.`
 
 | file | what it pins |
 |---|---|
-| `crates/compat/tests/psb_file.rs` | the container fixture and the header layout, the constructor forms, `load`'s argument handling and its `true` / `false` results, the raising storage failure, the `root` dictionary and the value shapes, the octet resource member (its bytes and its installation without a script round trip), the `psb://` registration of the root-level and the nested resources, and a parse failure keeping the previous document |
+| `crates/compat/tests/psb_file.rs` | the container fixture and the header layout, the constructor forms, `load`'s argument handling and its `true` / `false` results, the raising storage failure, the `root` dictionary and the value shapes, the octet resource member (its bytes and its installation without a script round trip), the `psb://` registration of the root-level resources (and the absence of the nested ones), the title's route through the `var://` media, and a parse failure keeping the previous document |
 
 ## Known gaps
 
-* The port's `load` registers the **whole** value tree in the `psb://`
-  media, while the reference's `load` registers only the resources that sit
-  directly under the root (`reference/cpp/plugins/psbfile/main.cpp:60-68`).
-  The reference's tree walk lives in a separate helper
-  (`reference/cpp/plugins/psbfile/PSBMediaRegistry.cpp:16-77`) that the
-  plugin's own `load` does not call, so a nested resource is reachable in
-  the port where the reference's `load` leaves it unregistered.
 * The reference's `load` continues into the resource-registration loop
   after a failed parse (`reference/cpp/plugins/psbfile/main.cpp:56-69`); the
   port answers `false` and registers nothing.
-* The `psb://` media is registered in the engine's storage media table
-  rather than through a `TVPRegisterStorageMedia` call. A script that
-  opens a `psb://` path sees the same resource bytes.
 * `root` is a `Dictionary`; the reference builds a custom object
   (`reference/cpp/plugins/psbfile/main.cpp:32`). A script that reads a
   missing key sees void in the port and an error in the reference, and

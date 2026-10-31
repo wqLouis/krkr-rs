@@ -172,6 +172,9 @@ fn attached_storage(services: &CompatServices) -> Option<*mut Storage> {
 fn storage_error_message(member: &str, error: &StorageReadError) -> String {
     match error {
         StorageReadError::InvalidPathName(_) => error.to_string(),
+        // A media's own message travels unchanged: the domain raises it as
+        // it is, and the script sees those words.
+        StorageReadError::Media { .. } => error.to_string(),
         _ => format!("Storages.{member}: {error}"),
     }
 }

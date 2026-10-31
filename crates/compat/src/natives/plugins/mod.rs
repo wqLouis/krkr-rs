@@ -58,8 +58,10 @@ mod md5;
 ///
 /// An entry whose reference registers no TJS surface — or shares it with a
 /// sibling port — carries a documented no-op [`BuiltinPluginDef::register`]
-/// (`emote_player`, `extrans`, `KAGParserEx`, `wuvorbis`, `var_file`,
-/// `get_about`; see each module's documentation for the reason).
+/// (`emote_player`, `extrans`, `KAGParserEx`, `wuvorbis`, `get_about`; see
+/// each module's documentation for the reason). `var_file` registers no TJS
+/// surface either, but it registers the `var://` storage media with the
+/// storage namespace.
 pub const BUILTIN_PLUGINS: &[BuiltinPluginDef] = &[
     BuiltinPluginDef {
         name: "addFont.dll",

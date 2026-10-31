@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use api::fs::FsPath;
 use engine::storage::{ATTR_DIRECTORY, ATTR_NORMAL, MountOptions};
-use engine::{Location, Storage, normalize_in_archive_name};
+use engine::{Location, Storage, StorageMedia, StorageReadError, normalize_in_archive_name};
 use testkit::build_xp3;
 
 mod common;
@@ -269,14 +269,14 @@ fn archive_is_used_when_no_disk_file() {
     assert_eq!(storage.stat("data/inside.txt").unwrap().unwrap().size, 18);
 }
 
-// L3 registers a TVP storage-media entry (`psb://…`, `psd://…`) with
-// `register_media`; L2 serves it before disk and archive resolution so a
-// script can open the registered name (reference `TVPRegisterStorageMedia`
-// feeding `PSBMedia::CheckExistentStorage`/`Open`, `PSBMedia.cpp:24-46`).
+// A storage-media provider serves the names that carry its scheme, before
+// the disk and archive resolution (reference `TVPRegisterStorageMedia`
+// feeding `iTVPStorageMedia::CheckExistentStorage`/`Open`,
+// `reference/cpp/core/base/StorageIntf.cpp:514`).
 #[test]
-fn registered_media_is_served_before_disk_and_archive() {
+fn a_registered_media_serves_the_names_that_carry_its_scheme() {
     let storage = mount_memory(&[]);
-    storage.register_media("psb://fixture.psb/res".into(), b"resource bytes".to_vec());
+    storage.register_media(Box::new(FixtureMedia));
 
     assert!(storage.exists("psb://fixture.psb/res").unwrap());
     assert_eq!(
@@ -289,6 +289,47 @@ fn registered_media_is_served_before_disk_and_archive() {
     );
     assert!(!storage.exists("psb://fixture.psb/other").unwrap());
     assert!(storage.read("psb://fixture.psb/other").is_err());
+}
+
+// A scheme no provider registered is not a storage the namespace can place:
+// the reference raises `Not supported media type "%1"`
+// (`reference/cpp/core/base/StorageIntf.cpp:201`,
+// `reference/cpp/core/base/MsgIntfInc.h:29`).
+#[test]
+fn an_unregistered_scheme_is_an_error() {
+    let storage = mount_memory(&[]);
+
+    let error = storage.read("bogus://fixture.psb/res").unwrap_err();
+    assert!(
+        matches!(error, StorageReadError::Media { .. }),
+        "unexpected error: {error}"
+    );
+    assert_eq!(error.to_string(), "Not supported media type \"bogus\"");
+    assert!(storage.exists("bogus://fixture.psb/res").is_err());
+}
+
+/// The provider the media tests serve one path with.
+struct FixtureMedia;
+
+impl StorageMedia for FixtureMedia {
+    fn domain(&self) -> &str {
+        "psb"
+    }
+
+    fn exists(&self, path: &str) -> Result<bool, StorageReadError> {
+        Ok(path == "fixture.psb/res")
+    }
+
+    fn read(&self, path: &str) -> Result<Vec<u8>, StorageReadError> {
+        if path == "fixture.psb/res" {
+            Ok(b"resource bytes".to_vec())
+        } else {
+            Err(StorageReadError::Media {
+                media: "psb".to_string(),
+                message: format!("Cannot open storage psb://{path}"),
+            })
+        }
+    }
 }
 
 #[test]

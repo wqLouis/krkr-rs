@@ -714,6 +714,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "devtools"
+version = "1.0.0"
+dependencies = [
+ "api",
+ "fs",
+ "testkit",
+ "tjs",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

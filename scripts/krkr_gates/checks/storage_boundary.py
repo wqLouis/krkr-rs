@@ -7,6 +7,12 @@ L3 owns the TVP storage-name grammar. A script-visible name may carry the local
 that hands a script name across that boundary must first route it through
 ``crate::storage::strip_file_media``.
 
+A name that carries **another** scheme (``var://…``, ``psb://…``) crosses the
+boundary unchanged: the namespace dispatches a registered scheme to the
+provider that serves it, and the provider owns the scheme's own path grammar.
+Such a name needs no stripping, so a binding that is known to carry a scheme
+is not a finding.
+
 This check scans ``crates/compat/src/**`` for calls that carry a script name to
 the namespace, the host filesystem, or the decoded-video seam:
 
@@ -33,6 +39,10 @@ not already known to be stripped. The check knows a name is stripped when it is
   ``strip_file_media`` (directly or transitively), so a helper such as a
   ``local_path`` / ``output_path`` wrapper is recognized — across files, so a
   shared helper such as the image ``save_image`` seam counts at its callers;
+
+* bound from a name that carries a media scheme (``"var://…"``,
+  ``"psb://…"``): such a name crosses the boundary unchanged and the
+  namespace routes it to the provider that registered the scheme;
 
 * the callee of a save seam (``save_image`` / ``save``) when its own body
   routes through ``strip_file_media``; a seam that strips is safe at every
@@ -102,6 +112,10 @@ _SEAM_CALL = re.compile(
     r"(?P<recv>[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(?P<method>frame_at|spec|audio)\s*\("
 )
 _DECODED_AUDIO = re.compile(r"\bdecoded_audio\s*\(")
+# A string literal that carries a media scheme ("var://…", "psb://…"): such a
+# name crosses the boundary unchanged and the namespace routes it to the
+# provider that registered the scheme.
+_MEDIA_QUALIFIED = re.compile(r'"[A-Za-z][A-Za-z0-9+.\-]*://')
 _SAVE_CALL = re.compile(r"\.\s*(?P<method>save_image_on|save_image|save)\s*\(")
 _HOST_WRITE = re.compile(
     r"\bfs\s*::\s*(?P<method>write|open|create_dir_all|remove_file|remove_dir|remove_dir_all)\s*\("
@@ -273,6 +287,8 @@ def _stripping_functions(functions, raw: str) -> set[str]:
 
 def _rhs_is_stripped(rhs: str, stripped: set[str], stripping_fns: set[str]) -> bool:
     if "strip_file_media" in rhs:
+        return True
+    if _MEDIA_QUALIFIED.search(rhs):
         return True
     if any(re.search(rf"\b{re.escape(fn)}\s*\(", rhs) for fn in stripping_fns):
         return True
@@ -505,7 +521,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
             print(
                 "\n  Route the name through crate::storage::strip_file_media at the "
-                "call site, or record a reviewed exception in "
+                "call site (a name that already carries a media scheme needs no "
+                "stripping), or record a reviewed exception in "
                 "scripts/allowlists/storage_boundary_allow.txt."
             )
         if stale:

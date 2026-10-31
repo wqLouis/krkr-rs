@@ -22,7 +22,7 @@ pub fn parse_with_options(source: &str, options: ParseOptions) -> Result<Scenari
 pub fn parse_recovering(source: &str, options: ParseOptions) -> Result<Recovered>;
 
 pub enum Bracket { At, Square }
-pub enum Event { Label, Text, Tag, Directive, Comment, Script }
+pub enum Event { Label, Text, Tag, Comment, Script }
 pub struct Scenario { pub events: Vec<Event>, pub labels: BTreeMap<String, usize>, pub cols: Vec<usize> }
 pub struct Recovered { pub events, pub labels, pub cols, pub pending_errors: Vec<PendingError>, pub label_error: bool }
 pub struct ParseOptions { pub multiline_tags: bool }
@@ -51,9 +51,11 @@ its first character:
 | `;` | `Comment` |
 | `*` | `Label` |
 | `@` | `Tag` with `Bracket::At` |
-| `%` | `Directive` |
 | `[` | `Tag` with `Bracket::Square` (or a `Script` block) |
 | anything else | `Text` |
+
+Only `@` and `[` open a tag, so a line that starts with `%` is ordinary
+text: it is scanned for inline `[...]` tags like any other text line.
 
 An empty line produces **no event** (the reference emits a line-end tag
 there; the state machine reconstructs those).
@@ -173,8 +175,8 @@ These are the differences a reader of the reference C++ will notice:
 3. **`[iscript]`/`@iscript` blocks are collected** into one `Script` event
    rather than being walked character by character.
 4. **Control tags are parsed, not executed.** `cond`, `if`/`elsif`/`else`,
-   `emb`, `macro`, `jump`/`call`/`return` and `%`-directives are recognised
-   but nothing is evaluated here.
+   `emb`, `macro`, `jump`/`call`/`return` are recognised but nothing is
+   evaluated here.
 5. **Line numbers are 1-based** in the events; the reference's `curLine` is
    0-based and the state machine keeps that distinction.
 6. **Syntax and first-label errors are deferred** to the walk.
@@ -185,6 +187,6 @@ These are the differences a reader of the reference C++ will notice:
 
 `crates/compat/tests/kag.rs` compiles this module directly and asserts the
 line model, the tag syntax, the quoting and escaping rules, the label rules,
-the directive and comment handling, the inline-script collection, every
+the comment handling, the inline-script collection, every
 syntax error (with the reported line), and the multi-line extension in both
 modes.

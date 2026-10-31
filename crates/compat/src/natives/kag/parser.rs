@@ -22,9 +22,11 @@
 //! | `;` | comment line → [`Event::Comment`] (the reference *skips* it) |
 //! | `*` | label → [`Event::Label`], `*name` or `*name|macro` |
 //! | `@` | line-command tag → [`Event::Tag`] with [`Bracket::At`] |
-//! | `%` | directive → [`Event::Directive`] |
 //! | `[` | square-bracket tag → [`Event::Tag`] with [`Bracket::Square`] |
 //! | anything else | plain text → [`Event::Text`] (inline tags split out) |
+//!
+//! Only `@` and `[` open a tag, so a line that starts with `%` is ordinary
+//! text: it is scanned for inline `[...]` tags like any other text line.
 //!
 //! # Tag syntax (as in the reference `_GetNextTag`)
 //!
@@ -71,8 +73,8 @@
 //!   state walk when it reaches them; [`parse`]/[`parse_with_options`] surface
 //!   the first one immediately for direct callers.
 //! * `cond`, `if`/`elsif`/`else`, `emb`, `macro`, `jump`/`call`/`return`
-//!   and `%`-directives are all *parsed* but not *executed*: no expression
-//!   evaluation, macro expansion or control flow happens here.
+//!   are all *parsed* but not *executed*: no expression evaluation, macro
+//!   expansion or control flow happens here.
 //! * Label names keep their leading `*` (the reference's label cache is
 //!   keyed by `*name`, and `GoToLabel`/`CallLabel` receive `*`-prefixed
 //!   names). Duplicate labels are suffixed `:2`, `:3`, …, and an empty
@@ -131,15 +133,6 @@ pub enum Event {
         /// into the result at this position.
         macro_entity: Option<usize>,
         bracket: Bracket,
-        /// 1-based source line.
-        line: usize,
-    },
-    /// `%directive ...` line. `raw` is the full line (leading tabs already
-    /// stripped).
-    Directive {
-        name: String,
-        args: Vec<String>,
-        raw: String,
         /// 1-based source line.
         line: usize,
     },
@@ -442,16 +435,6 @@ pub fn parse_recovering(source: &str, options: ParseOptions) -> Result<Recovered
                     cols.push(0);
                 }
             }
-            Some('%') => {
-                let (name, args) = parse_directive(content);
-                events.push(Event::Directive {
-                    raw: content.to_owned(),
-                    name,
-                    args,
-                    line: lineno,
-                });
-                cols.push(0);
-            }
             _ => {
                 if let Err(error) = parse_line(content, lineno, &mut events, &mut cols) {
                     // The reference throws while scanning the line, after any
@@ -667,23 +650,8 @@ fn split_label(line: &str) -> (String, Option<String>) {
     }
 }
 
-/// Parse a `%directive ...` line into `(name, args)`. The name runs to the
-/// first space or tab; the remainder is split on whitespace. The reference
-/// C++ KAGParser has no `%` handling at all (in its output a leading `%`
-/// would be ordinary text), so this follows the task spec: name and
-/// arguments are preserved verbatim (not lower-cased).
-fn parse_directive(line: &str) -> (String, Vec<String>) {
-    let body = &line[1..];
-    let name_end = body.find([' ', '\t']).unwrap_or(body.len());
-    let name = body[..name_end].to_owned();
-    let rest = body[name_end..].trim();
-    let args = rest.split_whitespace().map(str::to_owned).collect();
-    (name, args)
-}
-
-/// Parse the content of a non-comment, non-label, non-directive line:
-/// either a single `@tag` line command, or a mix of text runs and inline
-/// `[tag]`s.
+/// Parse the content of a non-comment, non-label line: either a single
+/// `@tag` line command, or a mix of text runs and inline `[tag]`s.
 fn parse_line(
     line: &str,
     lineno: usize,

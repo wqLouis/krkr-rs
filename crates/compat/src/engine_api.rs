@@ -30,8 +30,11 @@ pub(crate) use engine::{
 // coordinates.
 pub(crate) use engine::scene::HitCandidate;
 
-// The storage namespace: mounts, archive names, locations and typed read errors.
-pub(crate) use engine::{Location, Storage, StorageReadError, normalize_in_archive_name};
+// The storage namespace: mounts, archive names, locations, the storage-media
+// providers and typed read errors.
+pub(crate) use engine::{
+    Location, Storage, StorageMedia, StorageReadError, normalize_in_archive_name,
+};
 
 // The image decode pool, the pending-image future and the pass a worker runs
 // over decoded pixels: the visual natives submit decodes, wait for them and

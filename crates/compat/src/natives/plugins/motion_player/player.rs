@@ -4147,9 +4147,10 @@ mod tests {
     use crate::engine_api::Storage;
     use crate::engine_api::layer_ops::{AffineBlit, BlitOptions, BlitSource, affine_blit};
     use crate::natives::plugins::psb_file::container::{PsbDocument, PsbValue};
+    use crate::natives::plugins::psb_file::media::fixture::{chunk, container, media_storage};
     use crate::{CompatCtx, CompatServices};
     use engine::Scene;
-    use fs::FileSystem;
+    use std::rc::Rc;
     use tjs::Tjs2Engine;
 
     fn dict(entries: Vec<(&str, PsbValue)>) -> PsbValue {
@@ -4209,7 +4210,7 @@ mod tests {
         let object = dict(vec![("test", dict(vec![("motion", motions)]))]);
         let root = dict(vec![("object", object)]);
         MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root,
                 resources: Vec::new(),
             },
@@ -4252,7 +4253,7 @@ mod tests {
         let object = dict(vec![("test", dict(vec![("motion", motions)]))]);
         let root = dict(vec![("object", object)]);
         MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root,
                 resources: Vec::new(),
             },
@@ -4631,7 +4632,7 @@ mod tests {
             )]),
         )]);
         let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root: dict(vec![("object", object)]),
                 resources: Vec::new(),
             },
@@ -4738,7 +4739,7 @@ mod tests {
             )]),
         )]);
         let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root: dict(vec![("object", object)]),
                 resources: Vec::new(),
             },
@@ -4842,7 +4843,7 @@ mod tests {
             )]),
         )]);
         let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root: dict(vec![("object", object)]),
                 resources: Vec::new(),
             },
@@ -4939,7 +4940,7 @@ mod tests {
             )]),
         )]);
         let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root: dict(vec![("object", object)]),
                 resources: Vec::new(),
             },
@@ -5201,7 +5202,7 @@ mod tests {
             )]),
         )]);
         MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root,
                 resources: Vec::new(),
             },
@@ -5445,7 +5446,7 @@ mod tests {
             )]),
         )]);
         let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root,
                 resources: Vec::new(),
             },
@@ -5707,27 +5708,16 @@ mod tests {
 
     /// A storage with one opaque texel and the snapshot that names it.
     fn icon_fixture() -> (Storage, MotionSnapshot) {
-        let dir = std::env::temp_dir();
-        let storage = Storage::mount_archives(
-            FileSystem::host(dir.clone()),
-            dir.clone(),
-            std::iter::empty::<&str>(),
-        )
-        .expect("mount storage");
-        storage.register_media(
-            "psb://cache.psb/source/group/icon/art/pixel".to_string(),
-            vec![10, 20, 30, 255],
-        );
-        let icon = dict(vec![("width", num(1)), ("height", num(1))]);
+        let icon = dict(vec![
+            ("width", num(1)),
+            ("height", num(1)),
+            ("pixel", PsbValue::Resource(chunk(0))),
+        ]);
         let group = dict(vec![("icon", dict(vec![("art", icon)]))]);
         let root = dict(vec![("source", dict(vec![("group", group)]))]);
-        let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
-                root,
-                resources: Vec::new(),
-            },
-            "cache.psb",
-        );
+        let document = Rc::new(container(root, vec![vec![10, 20, 30, 255]]));
+        let storage = media_storage("cache.psb", Rc::clone(&document));
+        let snapshot = MotionSnapshot::from_psb(&document, "cache.psb");
         (storage, snapshot)
     }
 
@@ -5891,27 +5881,16 @@ mod tests {
     /// `SourceCache.cpp:610-622`).
     #[test]
     fn clearing_the_cache_reads_the_chunk_again() {
-        let dir = std::env::temp_dir();
-        let storage = Storage::mount_archives(
-            FileSystem::host(dir.clone()),
-            dir.clone(),
-            std::iter::empty::<&str>(),
-        )
-        .expect("mount storage");
-        storage.register_media(
-            "psb://cache.psb/source/group/icon/art/pixel".to_string(),
-            vec![10, 20, 30, 255],
-        );
-        let icon = dict(vec![("width", num(2)), ("height", num(2))]);
+        let icon = dict(vec![
+            ("width", num(2)),
+            ("height", num(2)),
+            ("pixel", PsbValue::Resource(chunk(0))),
+        ]);
         let group = dict(vec![("icon", dict(vec![("art", icon)]))]);
         let root = dict(vec![("source", dict(vec![("group", group)]))]);
-        let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
-                root,
-                resources: Vec::new(),
-            },
-            "cache.psb",
-        );
+        let document = Rc::new(container(root, vec![vec![10, 20, 30, 255]]));
+        let storage = media_storage("cache.psb", Rc::clone(&document));
+        let snapshot = MotionSnapshot::from_psb(&document, "cache.psb");
         let mut node = MotionNode::new(0, "art".to_string());
         node.draw_flag = true;
         node.local.src = "src/group/art".to_string();
@@ -5960,27 +5939,16 @@ mod tests {
         // reuses it until the cache is cleared
         // (`reference/cpp/plugins/motionplayer/SourceCache.cpp:497-552`,
         // `:644-735`).
-        let dir = std::env::temp_dir();
-        let storage = Storage::mount_archives(
-            FileSystem::host(dir.clone()),
-            dir.clone(),
-            std::iter::empty::<&str>(),
-        )
-        .expect("mount storage");
-        storage.register_media(
-            "psb://cache.psb/source/group/icon/art/pixel".to_string(),
-            vec![10, 20, 30, 255],
-        );
-        let icon = dict(vec![("width", num(2)), ("height", num(2))]);
+        let icon = dict(vec![
+            ("width", num(2)),
+            ("height", num(2)),
+            ("pixel", PsbValue::Resource(chunk(0))),
+        ]);
         let group = dict(vec![("icon", dict(vec![("art", icon)]))]);
         let root = dict(vec![("source", dict(vec![("group", group)]))]);
-        let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
-                root,
-                resources: Vec::new(),
-            },
-            "cache.psb",
-        );
+        let document = Rc::new(container(root, vec![vec![10, 20, 30, 255]]));
+        let storage = media_storage("cache.psb", Rc::clone(&document));
+        let snapshot = MotionSnapshot::from_psb(&document, "cache.psb");
         let mut node = MotionNode::new(0, "art".to_string());
         node.draw_flag = true;
         node.local.src = "src/group/art".to_string();
@@ -6151,7 +6119,7 @@ mod tests {
         }
         let object = dict(vec![("chara", dict(vec![("motion", dict(motions))]))]);
         MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root: dict(vec![("object", object)]),
                 resources: Vec::new(),
             },
@@ -6264,7 +6232,7 @@ mod tests {
             )]),
         )]);
         let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root: dict(vec![("object", object)]),
                 resources: Vec::new(),
             },
@@ -6340,7 +6308,7 @@ mod tests {
             dict(vec![("motion", dict(vec![("main", clip)]))]),
         )]);
         MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root: dict(vec![("object", object)]),
                 resources: Vec::new(),
             },
@@ -6452,7 +6420,7 @@ mod tests {
             dict(vec![("motion", dict(vec![("main", clip)]))]),
         )]);
         let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root: dict(vec![("object", object)]),
                 resources: Vec::new(),
             },
@@ -6528,7 +6496,7 @@ mod tests {
             dict(vec![("motion", dict(vec![("main", clip)]))]),
         )]);
         MotionSnapshot::from_psb(
-            PsbDocument {
+            &PsbDocument {
                 root: dict(vec![
                     ("source", dict(vec![("g", group)])),
                     ("object", object),
@@ -6594,25 +6562,22 @@ mod tests {
     /// `PlayerRenderInternal.cpp:623-750`).
     #[test]
     fn a_stencil_group_applies_its_mask_layers() {
-        let dir = std::env::temp_dir();
-        let storage = Storage::mount_archives(
-            FileSystem::host(dir.clone()),
-            dir.clone(),
-            std::iter::empty::<&str>(),
-        )
-        .expect("mount storage");
-        storage.register_media(
-            "psb://mask.psb/source/content/icon/art/pixel".to_string(),
-            [200, 100, 50, 128].repeat(4),
-        );
-        storage.register_media(
-            "psb://mask.psb/source/mask/icon/art/pixel".to_string(),
-            [0, 0, 0, 128].repeat(4),
-        );
-        let icon = || dict(vec![("width", num(2)), ("height", num(2))]);
+        let content_icon = dict(vec![
+            ("width", num(2)),
+            ("height", num(2)),
+            ("pixel", PsbValue::Resource(chunk(0))),
+        ]);
+        let mask_icon = dict(vec![
+            ("width", num(2)),
+            ("height", num(2)),
+            ("pixel", PsbValue::Resource(chunk(1))),
+        ]);
         let source = dict(vec![
-            ("content", dict(vec![("icon", dict(vec![("art", icon())]))])),
-            ("mask", dict(vec![("icon", dict(vec![("art", icon())]))])),
+            (
+                "content",
+                dict(vec![("icon", dict(vec![("art", content_icon)]))]),
+            ),
+            ("mask", dict(vec![("icon", dict(vec![("art", mask_icon)]))])),
         ]);
         let content_layer = dict(vec![
             ("label", text("content")),
@@ -6677,13 +6642,13 @@ mod tests {
             "chara",
             dict(vec![("motion", dict(vec![("main", clip)]))]),
         )]);
-        let snapshot = MotionSnapshot::from_psb(
-            PsbDocument {
-                root: dict(vec![("source", source), ("object", object)]),
-                resources: Vec::new(),
-            },
-            "mask.psb",
-        );
+        let root = dict(vec![("source", source), ("object", object)]);
+        let document = Rc::new(container(
+            root,
+            vec![[200, 100, 50, 128].repeat(4), [0, 0, 0, 128].repeat(4)],
+        ));
+        let storage = media_storage("mask.psb", Rc::clone(&document));
+        let snapshot = MotionSnapshot::from_psb(&document, "mask.psb");
         let draw = |mask_mode: i32| -> u8 {
             let mut player = PlayerInst {
                 snapshot: Some(std::sync::Arc::new(snapshot.clone())),
@@ -6717,5 +6682,35 @@ mod tests {
         // threshold stencil forces the covered alpha to 255.
         assert_eq!(draw(1), 191, "the alpha mask blends the group alpha once");
         assert_eq!(draw(0), 255, "the threshold mask forces the covered alpha");
+    }
+
+    /// The motion player registers the whole value tree, so a resource nested
+    /// below the root is reachable under its member path
+    /// (`reference/cpp/plugins/psbfile/PSBMediaRegistry.cpp:16-77`,
+    /// `reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1395,1431`).
+    #[test]
+    fn the_motion_media_serves_the_whole_tree() {
+        let root = dict(vec![
+            ("res", PsbValue::Resource(chunk(0))),
+            (
+                "nested",
+                dict(vec![("chunk", PsbValue::Resource(chunk(1)))]),
+            ),
+        ]);
+        let document = Rc::new(container(root, vec![vec![7, 8, 9], vec![1, 2]]));
+        let storage = media_storage("motion.psb", Rc::clone(&document));
+
+        assert_eq!(
+            storage
+                .read("psb://motion.psb/res")
+                .expect("the root chunk resolves"),
+            vec![7, 8, 9]
+        );
+        assert_eq!(
+            storage
+                .read("psb://motion.psb/nested/chunk")
+                .expect("the nested chunk resolves"),
+            vec![1, 2]
+        );
     }
 }

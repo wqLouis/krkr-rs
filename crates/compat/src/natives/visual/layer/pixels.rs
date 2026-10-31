@@ -21,7 +21,8 @@ use api::media::DecodedImage;
 use tjs::{NativeInstanceMethodDef, Tjs2Engine, Value};
 
 use super::super::bitmap::{
-    COLOR_KEY_NONE, install_pending_image, load_cached_storage_image, start_pending_decode,
+    COLOR_KEY_NONE, ImageLoadError, install_pending_image, load_cached_storage_image,
+    start_pending_decode,
 };
 use super::super::common::scene_mut;
 use super::super::common::{
@@ -2612,7 +2613,7 @@ extern "C" fn layer_load_images(
             set_null_out(host.engine(), out);
             0
         }
-        Err(error) => report_error(out_error, &format!("Layer.loadImages: {error}")),
+        Err(error) => report_error(out_error, &error.message_with("Layer.loadImages: ")),
     }
 }
 
@@ -2626,7 +2627,7 @@ fn load_layer_image(
     layer_id: u32,
     name: &str,
     colorkey: u32,
-) -> Result<(), String> {
+) -> Result<(), ImageLoadError> {
     log::debug!("load_layer_image: layer {layer_id} <- {name:?}");
     // The decoded-image cache comes first: a hit is installed synchronously,
     // exactly as a cached graphic is installed.
@@ -2636,7 +2637,8 @@ fn load_layer_image(
         scene.lookup_decoded_image(&key)
     };
     if let Some(image) = cached {
-        return install_layer_image(ctx, layer_id, image.width, image.height, image.rgba);
+        return install_layer_image(ctx, layer_id, image.width, image.height, image.rgba)
+            .map_err(ImageLoadError::Message);
     }
     // The pool takes the decode when it can: the layer's image size is
     // known now, from the header probe, and its pixels land later.
@@ -2653,13 +2655,16 @@ fn load_layer_image(
             layer.bitmap = Some(id);
         }
         if !scene.internal_set_image_size(layer_id, width, height) {
-            return Err("the layer image could not be sized".to_string());
+            return Err(ImageLoadError::Message(
+                "the layer image could not be sized".to_string(),
+            ));
         }
         return Ok(());
     }
     // The synchronous path: the decode runs here and the cache keeps it.
     let image = load_cached_storage_image(ctx, name, colorkey, DecodedImageMode::Full)?;
     install_layer_image(ctx, layer_id, image.width, image.height, image.rgba)
+        .map_err(ImageLoadError::Message)
 }
 
 /// Installs a decoded image as the layer's main image.
@@ -2736,7 +2741,9 @@ extern "C" fn layer_load_province_image(
 
 /// Reads and installs `name` as the layer's province plane. The decoded image
 /// must not be larger than the main image; a smaller image is tiled up to the
-/// main size. Its red channel becomes the 8-bit province value.
+/// main size. The image is the 8-bit index plane — the palette index of a
+/// palettized image, not the colour the palette maps it to — and its red
+/// channel becomes the 8-bit province value.
 fn load_layer_province(ctx: &CompatCtx, layer_id: u32, name: &str) -> Result<(), String> {
     let (main_w, main_h) = {
         let scene = scene_mut(ctx)?;
@@ -2754,7 +2761,9 @@ fn load_layer_province(ctx: &CompatCtx, layer_id: u32, name: &str) -> Result<(),
     let image =
         match load_cached_storage_image(ctx, name, COLOR_KEY_NONE, DecodedImageMode::Province) {
             Ok(image) => image,
-            Err(error) => return Err(discard_province_plane(ctx, layer_id, error)),
+            Err(error) => {
+                return Err(discard_province_plane(ctx, layer_id, error.message()));
+            }
         };
     let plane = match province_plane(&image, main_w, main_h) {
         Ok(plane) => plane,
@@ -2797,8 +2806,11 @@ fn discard_province_plane(ctx: &CompatCtx, layer_id: u32, error: String) -> Stri
     error
 }
 
-/// Extracts the red channel of `image` into a province plane of `width` x
+/// Extracts the plane values of `image` into a province plane of `width` x
 /// `height`, tiling a smaller image to the destination size.
+///
+/// `image` is the decoded 8-bit index plane, carried as a gray image: its
+/// red channel is the plane value.
 fn province_plane(image: &DecodedImage, width: u32, height: u32) -> Result<Vec<u8>, String> {
     if image.width > width || image.height > height {
         return Err(format!(

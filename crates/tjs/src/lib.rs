@@ -882,6 +882,35 @@ pub enum TjsValue {
     Retained(u64),
 }
 
+/// The result of reading a member through `PropGet`.
+///
+/// The safe [`TjsValue`] surface has no octet variant, so it cannot tell a
+/// member that holds binary data from one that holds an object. A caller
+/// that has to tell them apart reads through
+/// [`Tjs2Engine::member_read`].
+pub enum MemberRead {
+    /// The member is absent, `void`, or `null`.
+    Void,
+    /// The member holds an object; the handle is released when the read is
+    /// dropped.
+    Object(DetachedValue),
+    /// The member holds an octet; the bytes are a copy of the variant's.
+    Octet(Vec<u8>),
+    /// The member holds an integer, a real or a string.
+    Scalar(TjsValue),
+}
+
+impl std::fmt::Debug for MemberRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Void => f.write_str("Void"),
+            Self::Object(_) => f.write_str("Object"),
+            Self::Octet(bytes) => write!(f, "Octet({bytes:?})"),
+            Self::Scalar(value) => write!(f, "Scalar({value:?})"),
+        }
+    }
+}
+
 /// Result of [`Tjs2Engine::eval_retained`] /
 /// [`Tjs2Engine::exec_script_retained_with_context`].
 ///
@@ -2376,6 +2405,22 @@ name), and none was available"
         membername: &str,
         flags: c_uint,
     ) -> Result<TjsValue, String> {
+        // SAFETY: `out` was filled by the VM on success.
+        Ok(take_value(&self.member_raw(id, membername, flags)?))
+    }
+
+    /// Read a named property through `PropGet` with the given flag set, with
+    /// the raw value.
+    ///
+    /// The raw value carries what the safe [`TjsValue`] surface cannot
+    /// express — the octet bytes and the object slot — so the caller copies
+    /// what it needs before the next engine call.
+    fn member_raw(
+        &self,
+        id: Tjs2ValueId,
+        membername: &str,
+        flags: c_uint,
+    ) -> Result<Value, String> {
         let name = std::ffi::CString::new(membername)
             .map_err(|_| "member name contains a NUL byte".to_string())?;
         let mut out = Value {
@@ -2397,8 +2442,70 @@ name), and none was available"
         if rc != 0 {
             return Err(take_error_string(error));
         }
-        // SAFETY: `out` was filled by the VM on success.
-        Ok(take_value(&out))
+        Ok(out)
+    }
+
+    /// Read a named property and tell the shapes apart that the safe
+    /// [`TjsValue`] surface collapses.
+    ///
+    /// The member is read through `PropGet` with the ordinary flags, so a
+    /// property's getter runs and an array's numeric member is the element
+    /// it names.
+    ///
+    /// # Errors
+    ///
+    /// The VM's own error when the read raises, and a message when the
+    /// member holds an object that cannot be retained.
+    pub fn member_read(&self, id: Tjs2ValueId, membername: &str) -> Result<MemberRead, String> {
+        let raw = match self.member_raw(id, membername, 0) {
+            Ok(raw) => raw,
+            // A member that does not exist reads as void, the way a script
+            // read of an absent member does: the VM raises
+            // `Member "%1" does not exist`.
+            Err(error) if is_missing_member(&error) => return Ok(MemberRead::Void),
+            Err(error) => return Err(error),
+        };
+        match raw.ty {
+            VAL_VOID | VAL_NULL => Ok(MemberRead::Void),
+            VAL_OBJECT => {
+                // The VM keeps the object it produced in the engine's
+                // most-recent-object slot, and the retention resolves
+                // against that slot.
+                // SAFETY: self.inner is a live engine and the value came
+                // from a call on it.
+                let id = unsafe { tjs2_retain_value(self.inner, &raw) };
+                if id.is_null() {
+                    return Err("member read: the object could not be retained".into());
+                }
+                Ok(MemberRead::Object(DetachedValue {
+                    engine: self.inner,
+                    id,
+                }))
+            }
+            VAL_OCTET => {
+                // A zero-length octet is an empty file: it carries no bytes
+                // and is not a failure.
+                if raw.array_count == 0 && !raw.string.is_null() {
+                    return Ok(MemberRead::Octet(Vec::new()));
+                }
+                // The octet's bytes live in the engine's last-string buffer
+                // and are valid until the next engine call, so they are
+                // copied now.
+                // SAFETY: the value came from a call on this engine and no
+                // engine call runs between the read and the copy.
+                let bytes = match unsafe { raw.octet_bytes() } {
+                    Some(bytes) => bytes.to_vec(),
+                    // A variant that carries no byte payload is not an empty
+                    // octet: the read fails instead of answering with bytes
+                    // the value does not hold.
+                    None => {
+                        return Err("member read: the octet value has no bytes".into());
+                    }
+                };
+                Ok(MemberRead::Octet(bytes))
+            }
+            _ => Ok(MemberRead::Scalar(take_value(&raw))),
+        }
     }
 
     /// Write a named property on a retained object value through its class
@@ -2858,6 +2965,15 @@ fn take_value(v: &Value) -> TjsValue {
 /// than a caller obligation; the one `unsafe` deref and free live here.
 fn take_error(e: *mut c_char) -> TjsError {
     TjsError(take_error_string(e))
+}
+
+/// Whether a member read failed because the member does not exist.
+///
+/// The VM's own message names it: `Member "%1" does not exist`. Only that
+/// shape is an absent member: an error of the script's own that happens to
+/// carry the same words travels as the error it is.
+fn is_missing_member(error: &str) -> bool {
+    error.starts_with("Member \"") && error.ends_with("\" does not exist")
 }
 
 /// As [`take_error`], as a plain `String`.

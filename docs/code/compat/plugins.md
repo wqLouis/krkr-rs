@@ -81,7 +81,7 @@ the port registers.
 | `ScriptsEx.dll` | — | `scripts_ex` | the `Scripts.*` helpers, `Scripts.rehash` | [scripts_ex](plugins/scripts_ex.md) |
 | `krkrsteam.dll` | `steam_api.dll`, `DrawDeviceForSteam.dll` | `steam` | `Steam`, `steam_api`, `DrawDeviceForSteam` | [steam](plugins/steam.md) |
 | `TextRender.dll` | — | `text_render` | `TextRenderBase` | [text_render](plugins/text_render.md) |
-| `varfile.dll` | — | `var_file` | none (the `var://` media lives in the storage layer) | [var_file](plugins/var_file.md) |
+| `varfile.dll` | — | `var_file` | the `var://` storage media | [var_file](plugins/var_file.md) |
 | `win32dialog.dll` | — | `win32_dialog` | `WIN32Dialog` | [win32_dialog](plugins/win32_dialog.md) |
 | `windowEx.dll` | — | `window_ex` | members on `System`, `Scripts`, `Window`, `MenuItem`, `Console` and `Pad` | [window_ex](plugins/window_ex.md) |
 | `wutcwf.dll` | — | `wutcwf` | none (it installs a `TCWF` wave decoder into the audio chain) | [wutcwf](plugins/wutcwf.md) |

@@ -179,6 +179,15 @@ overlay, the transitions, the raster primitives and the layer/bitmap
 operations. The short doc comments in the seam are the in-tree summary; the
 protocol document is the contract.
 
+The storage group carries one protocol item beyond the namespace's own types:
+`StorageMedia`, the provider that serves one storage scheme. L3 implements it
+(the `var://` and `psb://` providers), L2 holds the registered providers and
+dispatches a name that carries a scheme to them. The provider owns whatever
+its domain is made of — a parsed container, a script object graph — and L2
+knows nothing about it. A provider's failure message crosses the seam
+unchanged (`StorageReadError::Media`), so the domain's own wording reaches
+the script.
+
 ### 4.2 Adding an item
 
 1. Add or reuse the item in `engine`, with an L2-generic name and contract.

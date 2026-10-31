@@ -9,6 +9,7 @@
 #![allow(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use tjs::{DetachedValue, RetainedValue, TjsValue, VAL_OBJECT, Value};
@@ -17,10 +18,10 @@ use super::StoredValue;
 use super::emote::ModuleSettings;
 use super::helpers::{eval_object, inst_mut, set_retained};
 use super::model::MotionSnapshot;
-use crate::engine_api::Storage;
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
 use crate::natives::plugins::psb_file::container::{PsbDocument, PsbValue, parse_stream};
-use crate::natives::plugins::psb_file::{normalize_psb_domain, register_psb_resource};
+use crate::natives::plugins::psb_file::media::{PsbMedia, media as psb_media};
+use crate::natives::plugins::psb_file::normalize_psb_domain;
 use crate::natives::storages::extract_storage_name;
 use crate::natives::system::{resolve, value_as_i64};
 use crate::storage::strip_file_media;
@@ -263,15 +264,14 @@ extern "C" fn resource_ctor(
 ///
 /// A motion container is registered under both the name it was loaded by and
 /// its final path component, so a game can resolve its icon textures either
-/// way.
-fn register_motion_media(storage: &Storage, document: &PsbDocument, container: &str) {
+/// way. The whole value tree is served, the way the separate registry of
+/// the container resources serves it.
+fn register_motion_media(media: &PsbMedia, document: Rc<PsbDocument>, container: &str) {
     let alias = normalize_psb_domain(&extract_storage_name(container));
-    document.visit_resources(&mut |member, bytes| {
-        register_psb_resource(storage, container, member, bytes);
-        if alias != container {
-            register_psb_resource(storage, &alias, member, bytes);
-        }
-    });
+    media.register_whole_tree(container, Rc::clone(&document));
+    if alias != container {
+        media.register_whole_tree(&alias, document);
+    }
 }
 
 /// Read and parse the PSB at `path`, register the snapshot and its module
@@ -298,10 +298,10 @@ pub(crate) fn read_motion_module(
         Err(error) => return Err(error.to_string()),
     }
     let bytes = storage.read(name).map_err(|error| error.to_string())?;
-    let document = parse_stream(&bytes, seed).map_err(|error| error.to_string())?;
+    let document = Rc::new(parse_stream(&bytes, seed).map_err(|error| error.to_string())?);
     let container = normalize_psb_domain(path);
-    register_motion_media(storage, &document, &container);
-    let snapshot = MotionSnapshot::from_psb(document, &container);
+    register_motion_media(&psb_media(services), Rc::clone(&document), &container);
+    let snapshot = MotionSnapshot::from_psb(&document, &container);
     let id = services.state::<MotionStore>().insert(snapshot);
     let registered = {
         let store = services.state::<MotionStore>();

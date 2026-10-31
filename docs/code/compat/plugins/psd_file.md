@@ -247,9 +247,9 @@ The messages mirror the reference's own wording — `no data`,
   `psd://file.psd/root/folder/layer.bmp`
   (`reference/cpp/plugins/psdfile/main.cpp:15-125`,
   `reference/cpp/plugins/psdfile/psdclass.cpp:744-799`). The `PSD` class
-  surface itself is complete. The engine's storage media table can serve
-  such a name (`crates/engine/src/storage.rs`), but the plugin registers
-  none.
+  surface itself is complete. The storage namespace can serve such a name
+  through a media provider (`crates/engine/src/storage.rs`), but the plugin
+  registers none.
 * The reference's `loadMemory` and `loadStream` are plain C++ helpers rather
   than TJS members (`reference/cpp/plugins/psdfile/psdclass.h:150-167`), so
   neither they nor the port registers them.

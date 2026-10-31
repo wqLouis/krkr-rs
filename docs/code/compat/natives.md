@@ -614,7 +614,6 @@ Lines are split on `\r`, `\n`, `\r\n` and the leading tabs are stripped.
 | `;` | a comment |
 | `*name` or `*name\|macro` | a label |
 | `@` | a line-command tag |
-| `%` | a directive |
 | `[` | a square-bracket tag |
 | anything else | plain text |
 

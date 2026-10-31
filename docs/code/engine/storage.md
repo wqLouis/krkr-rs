@@ -9,7 +9,7 @@ A `Storage` value owns everything needed to resolve a storage name:
 * the parsed `fs::xp3::Xp3Archive` values explicitly mounted by the caller,
   each with its L2-owned `FileState`;
 * the auto search-path list;
-* the registered media table and the resolution cache.
+* the registered storage-media providers and the resolution cache.
 
 The XP3 container read and parse itself is **L1** (`fs::xp3`); this layer owns
 only the namespace.
@@ -38,7 +38,7 @@ only the namespace.
 | `preload_archives: bool` | whether an archive's whole image is read into memory in the background |
 | `project: Option<PathBuf>` | the project storage path (the reference's current directory); `None` means a folder project, `Some` an archive project |
 | `xp3_extraction_filter: Option<Box<Xp3ExtractionFilter<'static>>>` | the per-segment XP3 extraction filter (the `xp3filter` seam) |
-| `media: RefCell<Map<String, Vec<u8>>>` | the virtual media entries registered by L3 storage-media providers |
+| `media: RefCell<Vec<Rc<dyn StorageMedia>>>` | the storage-media providers, one per registered scheme |
 | `resolution_cache: RefCell<ResolutionCache>` | the lazily built resolver tables and the placed-hit cache |
 | `read_pool: Option<Arc<StorageReadPool>>` | the worker pool the entry reads run on; `None` reads on the calling thread |
 | `generation: u64` | the resolution generation the scheduled reads were made against |
@@ -109,7 +109,7 @@ impl Storage {
     pub fn list(&self, dir: &str) -> Result<Vec<String>, StorageReadError>;
     pub fn file_list(&self, mask: &str, attr: i64) -> Result<Vec<String>, StorageReadError>;
     pub fn startup_plan(&self) -> Result<StartupPlan, StorageReadError>;
-    pub fn register_media(&self, name: String, bytes: Vec<u8>);
+    pub fn register_media(&self, media: Box<dyn StorageMedia>);
     pub fn relative_disk_name(&self, name: &str) -> Option<String>;
     pub fn find_disk(&self, name: &str) -> Result<Option<PathBuf>, StorageReadError>;
     pub fn local_name(&self, name: &str) -> Result<Option<PathBuf>, StorageReadError>;
@@ -128,6 +128,22 @@ impl Storage {
 
 The storage's `read_pool` field is public: the composition root installs the
 pool there, and the engine drains the same pool every frame.
+
+### Storage media
+
+```rust
+pub trait StorageMedia {
+    fn domain(&self) -> &str;
+    fn exists(&self, path: &str) -> Result<bool, StorageReadError>;
+    fn read(&self, path: &str) -> Result<Vec<u8>, StorageReadError>;
+}
+```
+
+A provider serves the names that carry its scheme. The `path` it receives is
+the storage name with the scheme removed; the domain's own path grammar
+belongs to the provider. The provider answers on the thread that asked for the
+bytes, so a media name is never scheduled on the read pool, and its failure
+message reaches the caller unchanged (`StorageReadError::Media`).
 
 ### Free functions
 
@@ -153,6 +169,7 @@ local name.
 | `MountError` | the mounting failures |
 | `PreloadError` | the failures of a preloaded archive's image load |
 | `StorageReadError` | the read/lookup failures |
+| `StorageMedia` | the provider that serves one storage scheme |
 | `StartupPlan` | the four startup script names, resolved |
 | `ProbeCounts` | the number of `list`/`stat` probes and misses — a diagnostic |
 | `ATTR_DIRECTORY`, `ATTR_NORMAL` | the Windows file attribute bits the listing understands |
@@ -199,6 +216,13 @@ global — two pools in one process do not interact.
 ---
 
 ## 4. Resolution order
+
+`Storage::read`, `Storage::read_prefix`, `Storage::exists` and
+`Storage::lookup` dispatch a name that carries a scheme (`<scheme>://…`) to
+the provider that registered the scheme, before the resolution below; a
+scheme no provider registered is a typed error
+(`StorageReadError::Media`). The provider runs on the calling thread, so a
+media name never becomes a read-pool job.
 
 `Storage::find` resolves a name in this order:
 
@@ -280,10 +304,14 @@ A `..` component that escapes the mount is the reference's invalid path name
   streaming path.
 * **The extraction filter is L2 state.** The stateless L1 reader receives the
   closure as a borrow on every read; it is never stored in L1.
-* **The media table is served first**: `read`, `read_prefix` and `exists`
-  return a registered virtual entry before the disk and archive resolution, so
-  a `psb://…` / `psd://…` provider wins over a file of the same name. A later
-  registration for the same name replaces the earlier bytes.
+* **A storage media is served first**: a name that carries a registered
+  scheme (`<scheme>://…`) belongs to the provider that registered the scheme,
+  so `read`, `read_prefix`, `exists` and `lookup` hand it to that provider
+  before the disk and archive resolution and a `psb://…` / `var://…` provider
+  wins over a file of the same name. The provider runs on the calling thread:
+  a media name never becomes a read-pool job. A later registration for the
+  same scheme replaces the earlier provider, and a scheme no provider
+  registered is a typed error.
 * **A read is scheduled, not cached.** `lookup` answers the entry's
   existence and its size and schedules the read; `read` and `read_prefix`
   wait for that read. The bytes are never served from a cache: a read that

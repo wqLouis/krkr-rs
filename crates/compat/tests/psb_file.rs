@@ -471,12 +471,13 @@ fn load_registers_psb_resources_in_the_psb_media() {
     );
 }
 
-// `PSB::registerRootResources` walks the whole value tree, so a resource
-// nested below the root is registered under its `/`-joined member path and a
-// list entry contributes its index as a path segment
-// (`reference/cpp/plugins/psbfile/PSBMediaRegistry.cpp:16-77`).
+// `PSBFile.load` registers the resources that sit directly under the root
+// (`reference/cpp/plugins/psbfile/main.cpp:58-68`), so a resource nested
+// below the root stays unreachable: the reference's tree walk belongs to the
+// motion player (`reference/cpp/plugins/psbfile/PSBMediaRegistry.cpp:16-77`),
+// which registers the whole tree itself.
 #[test]
-fn nested_psb_resources_are_registered_under_their_member_path() {
+fn load_registers_only_the_root_level_resources() {
     let _lock = vm_lock();
     let env = Env::new();
     env.write_fixture("fixture.psb", &build_fixture());
@@ -486,22 +487,42 @@ fn nested_psb_resources_are_registered_under_their_member_path() {
     assert_eq!(env.int("ok"), 1);
     assert_eq!(
         env._storage
-            .read("psb://fixture.psb/nested/a")
-            .expect("the dictionary-nested chunk resolves"),
-        b"FAKEIMAGE".to_vec()
-    );
-    assert_eq!(
-        env._storage
-            .read("psb://fixture.psb/nested/b/0")
-            .expect("the list-nested chunk resolves"),
-        b"FAKEIMAGE".to_vec()
-    );
-    // The top-level resource stays reachable too.
-    assert_eq!(
-        env._storage
             .read("psb://fixture.psb/res")
             .expect("the root chunk resolves"),
         b"FAKEIMAGE".to_vec()
+    );
+    assert!(
+        env._storage.read("psb://fixture.psb/nested/a").is_err(),
+        "a dictionary-nested chunk is not registered by `load`"
+    );
+    assert!(
+        env._storage.read("psb://fixture.psb/nested/b/0").is_err(),
+        "a list-nested chunk is not registered by `load`"
+    );
+}
+
+// The title's own route: the packed image is a `PSBFile` in a global
+// dictionary and the layer's pixels are read through the `var://` media
+// (`reference/cpp/plugins/varfile.cpp:291-346` walks the members of the
+// script object graph; `reference/cpp/plugins/psbfile/main.cpp:58-68`
+// registers the container's root resources).
+#[test]
+fn a_packed_image_is_read_through_the_var_media() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.write_fixture("fixture.psb", &build_fixture());
+
+    env.run(
+        "var packImageMap = %[]; \
+         packImageMap[\"fixture.psb\"] = new PSBFile(\"fixture.psb\"); \
+         var lines = []; \
+         lines.load('var://./packImageMap/fixture.psb/root/res');",
+    );
+
+    assert_eq!(
+        env.string("lines[0]"),
+        "FAKEIMAGE",
+        "the container's root resource must be read through the media"
     );
 }
 

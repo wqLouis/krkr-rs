@@ -291,7 +291,7 @@ directly into the test binary, so the pure state machine is tested without a
 VM. It covers:
 
 * the parser's line model, tag syntax, quoting, escapes, labels,
-  directives, comments, inline scripts and every syntax error;
+  comments, inline scripts and every syntax error;
 * the multi-line tag extension (on and off);
 * the walk: text/line-end tags, `curLine`/`curPos`, `ignoreCR`, the `if` /
   `elsif` / `else` / `endif` machinery, `ignore` regions, macro recording
@@ -312,13 +312,9 @@ VM. It covers:
    of copying the raw source text. The recorded body re-parses to the same
    events, which is what the expansion path needs, but the `*` macro-entity
    marker is lost in the recorded body (it survives in the expansion path).
-2. **`%`-directive lines are walked as ordinary text.** The base reference
-   has no `%` handling at all, so the script-visible behaviour matches.
-3. **A `%` line is grouped into one `Directive` event** by the parser, and
-   the walk emits its characters as text.
-4. **The reference's `curLine` is 0-based** and so is this port's; the
+2. **The reference's `curLine` is 0-based** and so is this port's; the
    parser's own event line numbers are 1-based.
-5. **The KAGParserEx extensions are opt-in**: `multiLineTagEnabled` is off by
+3. **The KAGParserEx extensions are opt-in**: `multiLineTagEnabled` is off by
    default and `paramMacros` starts empty, matching the base parser. Both are
    additions to the reference surface, not replacements.
 

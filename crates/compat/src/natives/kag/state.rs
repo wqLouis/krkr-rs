@@ -27,10 +27,9 @@
 //!   events, which is all the expansion path needs. The `*` macro-entity
 //!   marker is lost (the parser consumes it) and `&`/`%` value prefixes
 //!   survive in values.
-//! * The `parser` module groups a `%` line into [`Event::Directive`];
-//!   the walk emits its characters as ordinary text. The base reference has
-//!   no `%` handling at all, so the script-visible behaviour matches
-//!   (`reference/cpp/core/base/KAGParser.cpp:1464-1512`).
+//! * A `%`-initial line is ordinary text: the `parser` module scans it for
+//!   inline tags like any other text line, and the walk emits its
+//!   characters one by one.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -405,7 +404,6 @@ fn line_of(e: &Event) -> usize {
         Event::Label { line, .. }
         | Event::Text { line, .. }
         | Event::Tag { line, .. }
-        | Event::Directive { line, .. }
         | Event::Comment { line, .. }
         | Event::Script { line, .. } => *line,
     }
@@ -721,7 +719,6 @@ impl KagParserState {
                     Event::Text { line, .. }
                     | Event::Tag { line, .. }
                     | Event::Label { line, .. }
-                    | Event::Directive { line, .. }
                     | Event::Script { line, .. } => {
                         self.cur_line = line.saturating_sub(1);
                     }
@@ -730,7 +727,7 @@ impl KagParserState {
             }
 
             match &ev {
-                Event::Text { text, .. } | Event::Directive { raw: text, .. } => {
+                Event::Text { text, .. } => {
                     if self.recording_macro {
                         self.record_text(text);
                         self.advance_current();
@@ -925,7 +922,7 @@ impl KagParserState {
                 bracket: Bracket::At,
                 ..
             } => false,
-            Event::Tag { .. } | Event::Text { .. } | Event::Directive { .. } => {
+            Event::Tag { .. } | Event::Text { .. } => {
                 next_line != line && !self.line_continues(&ev, line)
             }
             _ => false,
@@ -958,12 +955,7 @@ impl KagParserState {
         if raw.ends_with("[p]") {
             return true;
         }
-        raw.ends_with('\\')
-            && matches!(
-                ev,
-                Event::Text { text, .. } | Event::Directive { raw: text, .. }
-                    if text.ends_with('\\')
-            )
+        raw.ends_with('\\') && matches!(ev, Event::Text { text, .. } if text.ends_with('\\'))
     }
 
     /// One `r eol=true`: queued as output (the recording-vs-output decision
@@ -2262,7 +2254,6 @@ fn parse_inline_events(text: &str, line: usize) -> Result<(Vec<Event>, Vec<usize
             Event::Label { line: l, .. }
             | Event::Text { line: l, .. }
             | Event::Tag { line: l, .. }
-            | Event::Directive { line: l, .. }
             | Event::Comment { line: l, .. }
             | Event::Script { line: l, .. } => *l = line,
         }
@@ -2368,7 +2359,7 @@ fn escape_event_field(s: &str) -> String {
 
 /// Encode a list of events compactly: `T:<text>`, `G:<name>:<n>:<br>;k=v;...`
 /// (fields escaped with [`escape_event_field`]), `L:<name>[:<page>]`,
-/// `C:<text>`, `D:<raw>`.
+/// `C:<text>`.
 fn encode_events(events: &[Event]) -> String {
     let mut out = String::new();
     for (i, e) in events.iter().enumerate() {
@@ -2422,11 +2413,6 @@ fn encode_events(events: &[Event]) -> String {
                 out.push('C');
                 out.push(':');
                 out.push_str(&escape_event_field(text));
-            }
-            Event::Directive { raw, .. } => {
-                out.push('D');
-                out.push(':');
-                out.push_str(&escape_event_field(raw));
             }
             Event::Script {
                 text, start_line, ..
@@ -2500,12 +2486,6 @@ fn decode_events(s: &str) -> Result<Vec<Event>, String> {
             }),
             'C' => events.push(Event::Comment {
                 text: field,
-                line: 0,
-            }),
-            'D' => events.push(Event::Directive {
-                name: String::new(),
-                args: Vec::new(),
-                raw: field,
                 line: 0,
             }),
             'X' => {

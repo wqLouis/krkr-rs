@@ -21,6 +21,8 @@ members = [
     "crates/android",
     # dev-only shared test helper (not part of the runtime architecture)
     "crates/testkit",
+    # dev-only developer tool: the XP3 inspector and the bytecode disassembler
+    "crates/devtools",
 ]
 default-members = ["crates/app"]
 

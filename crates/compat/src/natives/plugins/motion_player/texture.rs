@@ -244,10 +244,12 @@ fn rl_decode(bytes: &[u8], elements: usize, align: usize) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
     use std::sync::Arc;
 
     use super::{PixelCache, TextureError, decode_pixels, rl_decode};
-    use crate::engine_api::Storage;
+    use crate::natives::plugins::psb_file::container::PsbValue;
+    use crate::natives::plugins::psb_file::media::fixture::{chunk, container, media_storage};
 
     #[test]
     fn an_rl_stream_mixes_literals_and_runs() {
@@ -328,16 +330,26 @@ mod tests {
         // The source cache keeps a decoded entry and only a clear drops it
         // (`reference/cpp/plugins/motionplayer/SourceCache.cpp:497-552`,
         // `:610-620`).
-        let dir = std::env::temp_dir();
-        let storage = Storage::mount_archives(
-            fs::FileSystem::host(dir.clone()),
-            dir.clone(),
-            std::iter::empty::<&str>(),
-        )
-        .expect("mount storage");
         let path = "psb://cache.psb/source/group/icon/art/pixel";
         let palette = "psb://cache.psb/source/group/icon/art/pal";
-        storage.register_media(path.to_string(), vec![1, 2, 3, 4]);
+        let root = PsbValue::Dictionary(vec![(
+            "source".to_string(),
+            PsbValue::Dictionary(vec![(
+                "group".to_string(),
+                PsbValue::Dictionary(vec![(
+                    "icon".to_string(),
+                    PsbValue::Dictionary(vec![(
+                        "art".to_string(),
+                        PsbValue::Dictionary(vec![
+                            ("pixel".to_string(), PsbValue::Resource(chunk(0))),
+                            ("pal".to_string(), PsbValue::Resource(chunk(1))),
+                        ]),
+                    )]),
+                )]),
+            )]),
+        )]);
+        let document = Rc::new(container(root, vec![vec![1, 2, 3, 4], Vec::new()]));
+        let storage = media_storage("cache.psb", Rc::clone(&document));
         let cache = PixelCache::default();
         let first = cache
             .get_or_decode(&storage, path, palette, 1, 1, false)

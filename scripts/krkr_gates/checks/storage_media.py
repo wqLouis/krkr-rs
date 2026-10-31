@@ -22,9 +22,11 @@ This check derives the reference domains from the ``iTVPStorageMedia``
 subclasses' ``GetName`` bodies (resolving the ``#define BASENAME`` indirection)
 and requires each one to be either
 
-* **served** — a scheme-keyed ``register_media("scheme://…")`` site in a crate
-  ``src`` tree (``engine::Storage::register_media`` and its compat callers), or
-  the core ``file://`` handling in ``crates/compat/src/storage.rs``; or
+* **served** — a storage-media provider that registers the scheme: a
+  ``register_media("scheme://…")`` call, or a provider whose ``domain()``
+  names the scheme, in a crate ``src`` tree (``engine::Storage::register_media``
+  and its compat callers); or the core ``file://`` handling in
+  ``crates/compat/src/storage.rs``; or
 * **documented** — a plugin module under
   ``crates/compat/src/natives/plugins`` that names both the scheme and the
   missing L2 media-provider seam (an explicit no-op rather than a silent
@@ -101,6 +103,11 @@ _ASSIGN = re.compile(r"\b(?P<lhs>\w+)\s*=\s*(?P<rhs>\w+)\s*;")
 # ``register_media("psb://…")`` / ``register_media(format!("psb://…"))``.
 _REGISTER_MEDIA = re.compile(
     r"\bregister_media\s*\(\s*(?:format!\s*\(\s*)?" r'"(?P<name>[^"]*)"'
+)
+
+# ``fn domain(&self) -> &str { "var" }`` — the scheme a media provider serves.
+_MEDIA_DOMAIN = re.compile(
+    r"fn\s+domain\s*\(\s*&self\s*\)\s*->\s*&\s*str\s*\{\s*\"(?P<domain>[^\"]+)\"\s*\}"
 )
 
 # A string literal that opens a ``scheme://`` name (the core ``file`` media).
@@ -186,6 +193,8 @@ def served_domains(root: Path) -> set[str]:
                 scheme = re.match(rf"({SCHEME})://", match.group("name"))
                 if scheme:
                     served.add(scheme.group(1).lower())
+            for match in _MEDIA_DOMAIN.finditer(text):
+                served.add(match.group("domain").lower())
     core = root / "crates" / "compat" / "src" / "storage.rs"
     if core.is_file():
         text = core.read_text(encoding="utf-8", errors="replace")
@@ -316,9 +325,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
             print(
                 "\n  Serve the domain through engine::Storage::register_media "
-                "(a scheme-keyed registration), or document the missing L2 "
-                "media-provider seam in the plugin module, or record a reviewed "
-                "exception in scripts/allowlists/storage_media_allow.txt."
+                "(a provider whose domain() names the scheme), or document the "
+                "missing L2 media-provider seam in the plugin module, or record "
+                "a reviewed exception in "
+                "scripts/allowlists/storage_media_allow.txt."
             )
         if stale:
             print(

@@ -140,6 +140,7 @@ per-plugin pages are indexed in [`compat/README.md`](compat/README.md).
 | Page | Crate | Covers |
 |---|---|---|
 | [`testkit.md`](testkit.md) | `testkit` | the shared test helpers (a dev-dependency only) |
+| [`devtools.md`](devtools.md) | `devtools` | the developer tools: the XP3 inspector and the TJS bytecode disassembler |
 
 ---
 

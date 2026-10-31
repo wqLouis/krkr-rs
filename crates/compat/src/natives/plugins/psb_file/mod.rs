@@ -43,17 +43,18 @@
 //!   setter (see [`set_built`]);
 //! * nested lists/dictionaries → real TJS `Array`/`Dictionary` objects.
 //!
-//! # `psb://` media
+//! # The `psb://` media
 //!
-//! `load` registers every resource of the container in the `psb://` storage
-//! media (`PSBMedia`, `main.cpp:60-67` + `PSBMedia.h:6-45`) so scripts can
-//! open `psb://…` paths afterwards. The whole value tree is walked, so a
-//! resource nested in a dictionary or a list is registered under its
-//! `/`-joined member path with list indices as path segments. The registration
-//! goes through the L2 `engine_api::Storage::register_media` table, which
-//! serves those names before disk and archive resolution; the container name
-//! is lower-cased from its first `.`, so `.psb` and `.PSB` containers share
-//! one name.
+//! A successful `load` registers the container's **root-level** resources in
+//! the `psb://` storage media, so a script can open `psb://…` paths
+//! afterwards. Only the resources that sit directly under the root are
+//! registered; the tree walk that reaches a nested resource belongs to the
+//! motion player, which registers the whole tree itself.
+//!
+//! The media is served by the provider in [`media`]: it resolves a member
+//! path against the parsed document when the entry is read, so the bytes are
+//! not copied into a table. The container name is lower-cased from its first
+//! `.`, so `a.psb` and `a.PSB` share one name.
 //!
 //! # Architecture
 //!
@@ -65,9 +66,12 @@
 
 pub(crate) use psd::container;
 
+pub(crate) mod media;
+
 use psd::error::PsbError;
 
 use std::ffi::{c_char, c_int, c_void};
+use std::rc::Rc;
 
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
@@ -76,7 +80,6 @@ use tjs::{
 
 use psd::container::{PsbDocument, PsbValue};
 
-use crate::engine_api::Storage;
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
 use crate::natives::system::resolve;
 use crate::storage::strip_file_media;
@@ -89,7 +92,7 @@ use crate::{CompatCtx, CompatError};
 /// The parsed document and the path it was loaded from.
 #[derive(Default)]
 struct PsbFileInst {
-    document: Option<PsbDocument>,
+    document: Option<Rc<PsbDocument>>,
     path: Option<String>,
 }
 
@@ -296,9 +299,12 @@ fn load_document(ctx: &CompatCtx, inst: &mut PsbFileInst, path: &str) -> Result<
         .map_err(|error| error.to_string())?;
     match container::parse_stream(&bytes, 0) {
         Ok(document) => {
-            inst.document = Some(document);
+            let document = Rc::new(document);
+            inst.document = Some(Rc::clone(&document));
             inst.path = Some(path.to_string());
-            register_media(storage, path, inst.document.as_ref().expect("just stored"));
+            // A `load` registers the resources that sit directly under the
+            // root.
+            media::media(services).register_root_resources(&normalize_psb_domain(path), document);
             Ok(true)
         }
         Err(error @ (PsbError::BadSignature(_) | PsbError::ArchiveNotPsb)) => {
@@ -311,32 +317,6 @@ fn load_document(ctx: &CompatCtx, inst: &mut PsbFileInst, path: &str) -> Result<
             Ok(false)
         }
     }
-}
-
-/// Registers every resource of a loaded PSB under
-/// `psb://<normalized path>/<member path>` in the L2 storage media table.
-///
-/// A resource is reachable under the `/`-joined path of the dictionaries and
-/// lists that contain it, and the container's extension is lower-cased, so
-/// scripts open resources as `psb://<container>/<member path>`.
-fn register_media(storage: *mut Storage, path: &str, document: &PsbDocument) {
-    let container = normalize_psb_domain(path);
-    // SAFETY: the caller holds the live storage pointer for the call and the
-    // registration only touches its interior-mutable media table.
-    let storage = unsafe { &*storage };
-    document.visit_resources(&mut |member: &str, bytes| {
-        register_psb_resource(storage, &container, member, bytes);
-    });
-}
-
-/// Registers one resource of a container under its `psb://` name.
-pub(crate) fn register_psb_resource(
-    storage: &Storage,
-    container: &str,
-    member: &str,
-    bytes: &[u8],
-) {
-    storage.register_media(format!("psb://{container}/{member}"), bytes.to_vec());
 }
 
 /// Reference `PSBMedia::NormalizeDomainName` (`PSBMedia.cpp:16-22`):
@@ -448,7 +428,7 @@ extern "C" fn psb_root_get(
         return report_error(out_error, "PSBFile: compat context is not bound");
     };
     let host = resolved.engine();
-    let built = match instance_ref(instance).document.as_ref() {
+    let built = match instance_ref(instance).document.as_deref() {
         Some(document) => build_root(host, document),
         None => dictionary_new(host),
     };
@@ -465,6 +445,9 @@ extern "C" fn psb_root_get(
 
 /// Register the `PSBFile` native class on the VM.
 pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
+    // SAFETY: the caller resolves `ctx` from the installed binding.
+    let services = unsafe { ctx.services() };
+    media::install_provider(services)?;
     ctx.register_instance(&NativeInstanceBuilder {
         name: "PSBFile",
         create: psb_create,
