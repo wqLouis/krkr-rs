@@ -586,7 +586,7 @@ seam's sufficiency.
 | `bitmap.rs`, `image_function.rs`, `pending_image.rs`, `pixel_semantics.rs` | the bitmaps, the image functions, the pending-image path, the pixel semantics |
 | `storages.rs`, `storages_io.rs`, `storage_media_prefix.rs` | the storage namespace through the seam |
 | `timer_behavior.rs` | the timers: the compatibility layer arms them and the engine fires them |
-| `input.rs`, `event.rs`, `event_dispatch.rs`, `event_batch.rs` | the input state and the event adapter |
+| `input.rs`, `event.rs`, `event_dispatch.rs`, `event_batch.rs`, `event_kag_button_click.rs` | the input state and the event adapter |
 | `sound.rs`, `dispatch_sound.rs`, `audio_render.rs` | the mixer through the seam |
 | `video.rs` | the video overlay through the seam |
 | `text.rs`, `font.rs`, `text_render.rs` | the text engine through the seam |

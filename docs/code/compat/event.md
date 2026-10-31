@@ -276,6 +276,7 @@ translation lives in L2 and is not repeated here.
 | `crates/compat/tests/event_dispatch.rs` | the delivery order: the window first, then the layer; the enter/leave transition; the click/double-click synthesis |
 | `crates/compat/tests/input_move.rs` | the two move rules: one frame of moves runs the window's handler once at the newest position, and the layer's handler once per changed position |
 | `crates/compat/tests/event_batch.rs` | the batch path: a burst of pointer moves is delivered across the frames in order, a deferred wheel reaches the focused layer in the next frame, the wheel/key/text events are all delivered, a target without a handler is a no-op and a throwing handler is reported |
+| `crates/compat/tests/event_kag_button_click.rs` | the full KAG button click: hit test, the message layer's `onHitTest`, capture, `onMouseUp` and the action through the adapter, plus the transparent fall-through |
 | `crates/compat/tests/input.rs` | the input state the adapter feeds |
 | `crates/compat/tests/focus_behaviour.rs` | the focused layer receives the key and wheel events |
 | `crates/compat/tests/layer_behaviour.rs` | the layer-local coordinate conversion |

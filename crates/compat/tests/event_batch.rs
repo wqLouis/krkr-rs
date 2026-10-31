@@ -233,7 +233,9 @@ fn a_target_without_a_handler_is_a_no_op() {
     // reaches the layer.
     assert_eq!(env.eval_int("downs"), 1);
     assert!(
-        !logs.iter().any(|line| line.contains("event adapter")),
+        !logs
+            .iter()
+            .any(|line| line.contains("has no handler") || line.contains("dispatch failed")),
         "a target without a handler is not reported: {logs:?}"
     );
 }

@@ -437,6 +437,29 @@ impl EventAdapter {
             _ => None,
         };
 
+        // The targets this event is delivered to, for the input trace: the
+        // window first, then the layer. A target the event is not delivered
+        // to (a discarded window move, a move that did not change the
+        // pointer position) is not a target.
+        if log::log_enabled!(log::Level::Debug) {
+            let name = event.name;
+            let window_target =
+                window.filter(|_| event.name != "onMouseMove" || deliver_window_move);
+            let layer_target = layer.filter(|_| deliver_layer_move);
+            match (window_target, layer_target) {
+                (Some(window), Some(layer)) => {
+                    log::debug!("event adapter: {name} -> window {window} and layer {layer}");
+                }
+                (Some(window), None) => {
+                    log::debug!("event adapter: {name} -> window {window}");
+                }
+                (None, Some(layer)) => {
+                    log::debug!("event adapter: {name} -> layer {layer}");
+                }
+                (None, None) => log::debug!("event adapter: {name} -> no target"),
+            }
+        }
+
         // Layer enter/leave is the manager's hit-test transition, checked
         // before the move/press delivery, exactly like `PrimaryMouseMove`
         // (`reference/cpp/core/visual/LayerManager.cpp:437-457`).
