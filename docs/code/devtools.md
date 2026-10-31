@@ -56,6 +56,10 @@ Every command prints its result on stdout. A failure prints one message on
 stderr and exits with a non-zero status: **2** for a command-line failure, **1**
 for every other failure.
 
+A closed pipe is not a failure: the reader may stop reading at any time
+(`krkr-devtools xp3 list game.xp3 | head`), and the tool then stops writing
+and exits with status **0**.
+
 ### XP3 archives
 
 | Command | What it does |
@@ -154,9 +158,12 @@ u32               the object's count
 
 The pool holds, in this order, the byte, short, integer, long-integer and real
 arrays, then the strings and then the octets. Every array starts with its own
-count; the byte array is padded to a four-byte boundary, the short array to a
-two-byte boundary, every string to a two-byte boundary and every octet to a
-four-byte boundary.
+count, and every array is padded to a four-byte boundary. The byte array and
+the octets hold one byte per element; the short array, the strings and the
+object's code hold two bytes per element, so an odd count of those is followed
+by **two** padding bytes — one byte would leave the reader half an element
+into the next value, and every value after it would be read from the wrong
+place.
 
 Every object starts with the `"TJS2"` tag and its own size, and holds the
 twelve context fields (the parent, the name, the context kind, the two
@@ -215,13 +222,16 @@ object 1: name="onMouseUp" ctx=ctFunction parent=0 maxvar=2 varreserve=0 maxfram
 | File | What it pins |
 |---|---|
 | `src/cli.rs` | the command line: the positionals, the options, the `--` marker and the usage failures |
+| `src/out.rs` | the output writers: a closed pipe ends the command cleanly, every other write failure does not |
 | `src/xp3.rs` | the name normalization, the line range, the text decoding and the output path's boundary |
-| `src/tjsb/format.rs` | the container reader, on a file the test assembles field by field |
+| `src/tjsb/format.rs` | the container reader, on a file the test assembles field by field, and the arrays' padding |
 | `src/tjsb/opcode.rs` | the opcode table's numbering and its four-way groups |
 | `src/tjsb/disasm.rs` | the listing of the assembled file |
 
 The archive tests use the workspace's in-memory archive builder, so the tree
-holds no game data.
+holds no game data. The bytecode fixture is a byte array the test assembles:
+every array in it has an odd count, so the test tells the one-byte padding and
+the two-byte padding apart.
 
 ---
 

@@ -45,11 +45,7 @@ pub fn disassemble(
         if size == 0 {
             return Err(BytecodeError::Invalid("an instruction has no length"));
         }
-        instructions.push(Instruction {
-            address: at,
-            name,
-            operands,
-        });
+        instructions.push(Instruction { at, name, operands });
         at += size;
     }
     Ok(instructions)
@@ -372,13 +368,13 @@ fn value_text(constants: &Constants, kind: i16, index: i16) -> String {
 }
 
 /// The string at an index of the string table.
-fn string_at<'a>(constants: &'a Constants, index: i16) -> Option<&'a str> {
+fn string_at(constants: &Constants, index: i16) -> Option<&str> {
     let index = usize::try_from(index).ok()?;
     constants.strings.get(index).map(String::as_str)
 }
 
 /// The octet at an index of the octet table.
-fn octet_at<'a>(constants: &'a Constants, index: i16) -> Option<&'a [u8]> {
+fn octet_at(constants: &Constants, index: i16) -> Option<&[u8]> {
     let index = usize::try_from(index).ok()?;
     constants.octets.get(index).map(Vec::as_slice)
 }
@@ -445,13 +441,16 @@ mod tests {
         let file = format::parse(&bytes).expect("the fixture parses");
         let instructions =
             disassemble(&file.objects[0], &file.constants).expect("the object disassembles");
-        assert_eq!(instructions.len(), 2);
-        assert_eq!(instructions[0].address, 0);
+        assert_eq!(instructions.len(), 3);
+        assert_eq!(instructions[0].at, 0);
         assert_eq!(instructions[0].name, "const");
         assert_eq!(instructions[0].operands, "%1, *0 = \"hello\"");
-        assert_eq!(instructions[1].address, 3);
+        assert_eq!(instructions[1].at, 3);
         assert_eq!(instructions[1].name, "ret");
         assert_eq!(instructions[1].operands, "");
+        assert_eq!(instructions[2].at, 4);
+        assert_eq!(instructions[2].name, "nop");
+        assert_eq!(instructions[2].operands, "");
     }
 
     /// A string is shown with its quotes and its escapes.

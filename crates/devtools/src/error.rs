@@ -12,6 +12,11 @@ use std::path::PathBuf;
 pub enum ToolError {
     /// The command line does not match the command's contract.
     Usage(String),
+    /// The reader closed the output pipe.
+    ///
+    /// The command has nothing left to say, and its end is clean: the tool
+    /// stops writing and exits with status `0`.
+    PipeClosed,
     /// A host file operation failed.
     Host {
         /// The path the operation was working on.
@@ -41,9 +46,11 @@ pub enum ToolError {
 impl ToolError {
     /// The process exit status the failure maps to.
     ///
-    /// A usage failure exits with `2`; every other failure exits with `1`.
+    /// A closed pipe exits with `0`, a usage failure with `2`, and every other
+    /// failure with `1`.
     pub fn exit_code(&self) -> i32 {
         match self {
+            Self::PipeClosed => 0,
             Self::Usage(_) => 2,
             _ => 1,
         }
@@ -54,6 +61,7 @@ impl fmt::Display for ToolError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Usage(message) => formatter.write_str(message),
+            Self::PipeClosed => formatter.write_str("the reader closed the output pipe"),
             Self::Host { path, source } => {
                 let path = path.display();
                 write!(formatter, "{path}: {source}")
@@ -77,6 +85,7 @@ impl std::error::Error for ToolError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Usage(_) => None,
+            Self::PipeClosed => None,
             Self::Host { source, .. } => Some(source),
             #[cfg(feature = "xp3")]
             Self::Service { source, .. } => Some(source),

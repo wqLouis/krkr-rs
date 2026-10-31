@@ -35,8 +35,6 @@ pub struct OptionSpec {
     pub key: &'static str,
     /// Every spelling the option answers to, the dashes included.
     pub spellings: &'static [&'static str],
-    /// Whether the option takes a value.
-    pub takes_value: bool,
 }
 
 /// What a command accepts on the command line.
@@ -50,10 +48,10 @@ pub struct CommandSpec {
 }
 
 /// The parsed command line of one command.
+#[derive(Debug)]
 pub struct Invocation {
     positionals: Vec<String>,
     values: Vec<(String, String)>,
-    flags: Vec<String>,
 }
 
 impl Invocation {
@@ -68,11 +66,6 @@ impl Invocation {
             .iter()
             .find(|(name, _)| name == key)
             .map(|(_, value)| value.as_str())
-    }
-
-    /// Whether the flag named `key` was given.
-    pub fn has_flag(&self, key: &str) -> bool {
-        self.flags.iter().any(|name| name == key)
     }
 }
 
@@ -91,7 +84,6 @@ pub fn positional(invocation: &Invocation, index: usize) -> Result<&str, ToolErr
 pub fn parse(argv: &[String], spec: &CommandSpec) -> Result<Invocation, ToolError> {
     let mut positionals: Vec<String> = Vec::new();
     let mut values: Vec<(String, String)> = Vec::new();
-    let mut flags: Vec<String> = Vec::new();
     let mut only_positionals = false;
     let mut index = 0usize;
     while index < argv.len() {
@@ -121,36 +113,22 @@ pub fn parse(argv: &[String], spec: &CommandSpec) -> Result<Invocation, ToolErro
         else {
             return Err(ToolError::Usage(format!("unknown option `{spelling}`")));
         };
-        if option.takes_value {
-            let value = match inline {
-                Some(value) => value,
-                None => {
-                    let value = argv.get(index).cloned().ok_or_else(|| {
-                        ToolError::Usage(format!("option `{spelling}` needs a value"))
-                    })?;
-                    index += 1;
-                    value
-                }
-            };
-            if values.iter().any(|(name, _)| name == option.key) {
-                return Err(ToolError::Usage(format!(
-                    "option `{spelling}` was given twice"
-                )));
+        let value = match inline {
+            Some(value) => value,
+            None => {
+                let value = argv.get(index).cloned().ok_or_else(|| {
+                    ToolError::Usage(format!("option `{spelling}` needs a value"))
+                })?;
+                index += 1;
+                value
             }
-            values.push((option.key.to_string(), value));
-        } else {
-            if inline.is_some() {
-                return Err(ToolError::Usage(format!(
-                    "option `{spelling}` does not take a value"
-                )));
-            }
-            if flags.iter().any(|name| name == option.key) {
-                return Err(ToolError::Usage(format!(
-                    "option `{spelling}` was given twice"
-                )));
-            }
-            flags.push(option.key.to_string());
+        };
+        if values.iter().any(|(name, _)| name == option.key) {
+            return Err(ToolError::Usage(format!(
+                "option `{spelling}` was given twice"
+            )));
         }
+        values.push((option.key.to_string(), value));
     }
     if positionals.len() < spec.min_positionals || positionals.len() > spec.max_positionals {
         return Err(ToolError::Usage(format!(
@@ -163,18 +141,19 @@ pub fn parse(argv: &[String], spec: &CommandSpec) -> Result<Invocation, ToolErro
     Ok(Invocation {
         positionals,
         values,
-        flags,
     })
 }
 
 /// Run the command line.
 pub fn run(argv: &[String]) -> Result<(), ToolError> {
     let Some(family) = argv.first() else {
-        print!("{USAGE}");
+        let mut out = crate::out::Out::standard();
+        out.text(USAGE)?;
         return Err(ToolError::Usage("a command family is required".to_string()));
     };
     if family == "--help" || family == "-h" || family == "help" {
-        print!("{USAGE}");
+        let mut out = crate::out::Out::standard();
+        out.text(USAGE)?;
         return Ok(());
     }
     let rest = &argv[1..];
@@ -207,23 +186,14 @@ pub fn run(argv: &[String]) -> Result<(), ToolError> {
 mod tests {
     use super::*;
 
-    /// A command that takes one or two positional values, an output path and
-    /// a flag.
+    /// A command that takes one or two positional values and an output path.
     const SPEC: CommandSpec = CommandSpec {
         min_positionals: 1,
         max_positionals: 2,
-        options: &[
-            OptionSpec {
-                key: "output",
-                spellings: &["-o", "--output"],
-                takes_value: true,
-            },
-            OptionSpec {
-                key: "verbose",
-                spellings: &["--verbose"],
-                takes_value: false,
-            },
-        ],
+        options: &[OptionSpec {
+            key: "output",
+            spellings: &["-o", "--output"],
+        }],
     };
 
     /// The command line of a successful call.
@@ -233,17 +203,12 @@ mod tests {
 
     #[test]
     fn a_command_line_yields_its_positionals_and_options() {
-        let invocation = parse(
-            &argv(&["archive.xp3", "name", "-o", "out.bin", "--verbose"]),
-            &SPEC,
-        )
-        .expect("the command line parses");
+        let invocation = parse(&argv(&["archive.xp3", "name", "-o", "out.bin"]), &SPEC)
+            .expect("the command line parses");
         assert_eq!(invocation.positional(0), Some("archive.xp3"));
         assert_eq!(invocation.positional(1), Some("name"));
         assert_eq!(invocation.positional(2), None);
         assert_eq!(invocation.value("output"), Some("out.bin"));
-        assert!(invocation.has_flag("verbose"));
-        assert!(!invocation.has_flag("output"));
     }
 
     #[test]

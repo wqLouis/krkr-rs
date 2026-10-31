@@ -284,6 +284,23 @@ fn counted(reader: &Reader<'_>, count: u32, what: &'static str) -> Result<usize,
     Ok(count)
 }
 
+/// The padding that follows an array of one-byte elements.
+///
+/// The loader pads such an array to a four-byte boundary.
+fn pad_bytes(count: usize) -> usize {
+    count.next_multiple_of(4) - count
+}
+
+/// The padding that follows an array of two-byte elements.
+///
+/// The loader pads such an array to a four-byte boundary as well, so an odd
+/// count is followed by **two** padding bytes. One byte would leave the
+/// reader one byte short of the next element, and every value after it would
+/// be read from the wrong place.
+fn pad_words(count: usize) -> usize {
+    if count.is_multiple_of(2) { 0 } else { 2 }
+}
+
 /// Parse a bytecode file.
 pub fn parse(bytes: &[u8]) -> Result<BytecodeFile, BytecodeError> {
     let mut reader = Reader::new(bytes);
@@ -360,16 +377,14 @@ fn read_constants(reader: &mut Reader<'_>) -> Result<Constants, BytecodeError> {
     for _ in 0..count {
         constants.bytes.push(reader.i8()?);
     }
-    let padded = count.next_multiple_of(4);
-    reader.skip(padded - count, "the byte array's padding")?;
+    reader.skip(pad_bytes(count), "the byte array's padding")?;
 
     let size = reader.u32()?;
     let count = counted(reader, size, "the short array")?;
     for _ in 0..count {
         constants.shorts.push(reader.i16()?);
     }
-    let padded = count.next_multiple_of(2);
-    reader.skip(padded - count, "the short array's padding")?;
+    reader.skip(pad_words(count), "the short array's padding")?;
 
     let size = reader.u32()?;
     let count = counted(reader, size, "the integer array")?;
@@ -404,8 +419,7 @@ fn read_constants(reader: &mut Reader<'_>) -> Result<Constants, BytecodeError> {
         for _ in 0..length {
             units.push(reader.u16()?);
         }
-        let padded = length.next_multiple_of(2);
-        reader.skip(padded - length, "a string's padding")?;
+        reader.skip(pad_words(length), "a string's padding")?;
         constants.strings.push(String::from_utf16_lossy(&units));
     }
 
@@ -421,8 +435,7 @@ fn read_constants(reader: &mut Reader<'_>) -> Result<Constants, BytecodeError> {
             });
         }
         let bytes = reader.take(length, "an octet's bytes")?;
-        let padded = length.next_multiple_of(4);
-        reader.skip(padded - length, "an octet's padding")?;
+        reader.skip(pad_bytes(length), "an octet's padding")?;
         constants.octets.push(bytes.to_vec());
     }
 
@@ -468,8 +481,7 @@ fn read_object(reader: &mut Reader<'_>) -> Result<Object, BytecodeError> {
     for _ in 0..count {
         code.push(reader.i16()?);
     }
-    let padded = count.next_multiple_of(2);
-    reader.skip(padded - count, "the code array's padding")?;
+    reader.skip(pad_words(count), "the code array's padding")?;
 
     let size = reader.u32()?;
     let count = counted(reader, size, "the constant slots")?;
@@ -520,31 +532,72 @@ fn read_object(reader: &mut Reader<'_>) -> Result<Object, BytecodeError> {
 
 /// A minimal bytecode file, assembled field by field.
 ///
-/// The file holds two strings and one object whose code loads the first
-/// string into a register and returns. Every field is written in the order
-/// the layout lists: the magic, the version, the file's own size, the
-/// constant pool's tag and size, the pool itself, the object section's tag
-/// and size, the top-level index, the object's count and the object.
+/// The file holds the seven constant arrays, four strings and one object
+/// whose code loads the first string into a register and returns. Every field
+/// is written in the order the layout lists: the magic, the version, the
+/// file's own size, the constant pool's tag and size, the pool itself, the
+/// object section's tag and size, the top-level index, the object's count and
+/// the object.
+///
+/// Every array is given an odd count on purpose: the loader pads the arrays
+/// of one-byte and of two-byte elements to a four-byte boundary, and the
+/// padding of a two-byte array is two bytes, not one. A file whose arrays are
+/// all even would not tell the two paddings apart.
 #[cfg(test)]
 pub(super) fn fixture() -> Vec<u8> {
     let mut pool = Vec::new();
     // The pool holds the byte, short, integer, long-integer and real arrays,
-    // then the strings, then the octets. Every array starts with its count.
-    for _ in 0..5 {
-        pool.extend_from_slice(&0u32.to_le_bytes());
+    // then the strings, then the octets. Every array starts with its own
+    // count.
+    //
+    // The byte array holds three bytes, so it is padded to four with one
+    // byte; the short array holds three shorts, so it is padded to four
+    // bytes with two bytes; the string array holds four strings of five,
+    // four, one and nine characters, so both the padded and the unpadded
+    // string occur; the octet array holds one octet of five bytes, so it is
+    // padded to eight with three bytes.
+    pool.extend_from_slice(&3u32.to_le_bytes());
+    pool.extend_from_slice(&[1u8, 2, 3]);
+    pool.push(0);
+
+    pool.extend_from_slice(&3u32.to_le_bytes());
+    for value in [10i16, 20, 30] {
+        pool.extend_from_slice(&value.to_le_bytes());
     }
+    pool.extend_from_slice(&[0u8, 0]);
+
     pool.extend_from_slice(&2u32.to_le_bytes());
-    for text in ["hello", "onMouseUp"] {
+    for value in [100i32, 200] {
+        pool.extend_from_slice(&value.to_le_bytes());
+    }
+
+    pool.extend_from_slice(&1u32.to_le_bytes());
+    pool.extend_from_slice(&1_000_000i64.to_le_bytes());
+
+    pool.extend_from_slice(&2u32.to_le_bytes());
+    for value in [1.5f64, -2.5] {
+        pool.extend_from_slice(&value.to_le_bytes());
+    }
+
+    pool.extend_from_slice(&4u32.to_le_bytes());
+    for text in ["hello", "kagu", "x", "onMouseUp"] {
         let units: Vec<u16> = text.encode_utf16().collect();
         pool.extend_from_slice(&(units.len() as u32).to_le_bytes());
         for unit in &units {
             pool.extend_from_slice(&unit.to_le_bytes());
         }
+        // A string of an odd number of characters is followed by two padding
+        // bytes: the characters take two bytes each, so one byte would leave
+        // the reader half a character into the next string.
         if !units.len().is_multiple_of(2) {
-            pool.push(0);
+            pool.extend_from_slice(&[0u8, 0]);
         }
     }
-    pool.extend_from_slice(&0u32.to_le_bytes());
+
+    pool.extend_from_slice(&1u32.to_le_bytes());
+    pool.extend_from_slice(&5u32.to_le_bytes());
+    pool.extend_from_slice(&[9u8, 8, 7, 6, 5]);
+    pool.extend_from_slice(&[0u8, 0, 0]);
 
     let mut object = Vec::new();
     // The parent, the name, the context kind, the variable counts, the frame
@@ -554,11 +607,14 @@ pub(super) fn fixture() -> Vec<u8> {
         object.extend_from_slice(&field.to_le_bytes());
     }
     object.extend_from_slice(&0u32.to_le_bytes());
-    object.extend_from_slice(&4u32.to_le_bytes());
-    // A constant load into register 1 from the constant slot 0, then a return.
-    for value in [1i16, 1, 0, 119] {
+    // The code holds five words — a constant load into register 1 from the
+    // constant slot 0, a return and a no-op — so the code array is padded by
+    // two bytes as well.
+    object.extend_from_slice(&5u32.to_le_bytes());
+    for value in [1i16, 1, 0, 119, 0] {
         object.extend_from_slice(&value.to_le_bytes());
     }
+    object.extend_from_slice(&[0u8, 0]);
     object.extend_from_slice(&1u32.to_le_bytes());
     object.extend_from_slice(&3i16.to_le_bytes());
     object.extend_from_slice(&0i16.to_le_bytes());
@@ -595,20 +651,47 @@ mod tests {
         let file = parse(&bytes).expect("the fixture parses");
         assert_eq!(file.toplevel, 0);
         assert_eq!(file.objects.len(), 1);
+        assert_eq!(file.constants.bytes, vec![1i8, 2, 3]);
+        assert_eq!(file.constants.shorts, vec![10i16, 20, 30]);
+        assert_eq!(file.constants.longs, vec![100i32, 200]);
+        assert_eq!(file.constants.longlongs, vec![1_000_000i64]);
+        assert_eq!(file.constants.doubles, vec![1.5f64, -2.5]);
         assert_eq!(
             file.constants.strings,
-            vec!["hello".to_string(), "onMouseUp".to_string()]
+            vec![
+                "hello".to_string(),
+                "kagu".to_string(),
+                "x".to_string(),
+                "onMouseUp".to_string()
+            ]
         );
+        assert_eq!(file.constants.octets, vec![vec![9u8, 8, 7, 6, 5]]);
         let object = &file.objects[0];
         assert_eq!(object.name, 0);
         assert_eq!(object.context_type, 1);
         assert_eq!(object.max_variable_count, 4);
         assert_eq!(object.max_frame_count, 8);
         assert_eq!(object.argument_count, 1);
-        assert_eq!(object.code, vec![1i16, 1, 0, 119]);
+        assert_eq!(object.code, vec![1i16, 1, 0, 119, 0]);
         assert_eq!(object.data, vec![(3i16, 0i16)]);
         assert!(object.properties.is_empty());
         assert!(object.source_positions.is_empty());
+    }
+
+    /// The loader pads an array of two-byte elements by two bytes, and an
+    /// array of one-byte elements to a four-byte boundary.
+    #[test]
+    fn the_arrays_are_padded_to_a_four_byte_boundary() {
+        assert_eq!(pad_words(0), 0);
+        assert_eq!(pad_words(1), 2);
+        assert_eq!(pad_words(2), 0);
+        assert_eq!(pad_words(3), 2);
+        assert_eq!(pad_words(4), 0);
+        assert_eq!(pad_bytes(0), 0);
+        assert_eq!(pad_bytes(1), 3);
+        assert_eq!(pad_bytes(2), 2);
+        assert_eq!(pad_bytes(3), 1);
+        assert_eq!(pad_bytes(4), 0);
     }
 
     #[test]

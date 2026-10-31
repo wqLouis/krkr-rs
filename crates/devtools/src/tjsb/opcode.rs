@@ -172,7 +172,7 @@ const fn name_eq(left: &str, right: &str) -> bool {
 
 /// The name of an opcode, when the table has one.
 pub fn name_of(value: u16) -> Option<&'static str> {
-    let index = usize::try_from(value).ok()?;
+    let index = usize::from(value);
     NAMES.get(index).copied()
 }
 
@@ -223,10 +223,6 @@ pub const JF: u16 = opcode("jf");
 pub const JNF: u16 = opcode("jnf");
 /// The unconditional jump.
 pub const JMP: u16 = opcode("jmp");
-/// The increment group.
-pub const INC: u16 = opcode("inc");
-/// The decrement group.
-pub const DEC: u16 = opcode("dec");
 /// The bitwise not.
 pub const BNOT: u16 = opcode("bnot");
 /// The type name.

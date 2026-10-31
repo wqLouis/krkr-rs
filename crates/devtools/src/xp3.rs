@@ -1,7 +1,6 @@
 //! The XP3 command family: list, inspect and extract an archive's entries.
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::cli::{self, CommandSpec, OptionSpec};
 use crate::error::ToolError;
@@ -39,7 +38,6 @@ const LIST: CommandSpec = CommandSpec {
     options: &[OptionSpec {
         key: "filter",
         spellings: &["--filter"],
-        takes_value: true,
     }],
 };
 
@@ -50,7 +48,6 @@ const CAT: CommandSpec = CommandSpec {
     options: &[OptionSpec {
         key: "lines",
         spellings: &["--lines"],
-        takes_value: true,
     }],
 };
 
@@ -61,7 +58,6 @@ const EXTRACT: CommandSpec = CommandSpec {
     options: &[OptionSpec {
         key: "output",
         spellings: &["-o", "--output"],
-        takes_value: true,
     }],
 };
 
@@ -73,12 +69,10 @@ const EXTRACT_ALL: CommandSpec = CommandSpec {
         OptionSpec {
             key: "output",
             spellings: &["-o", "--output"],
-            takes_value: true,
         },
         OptionSpec {
             key: "filter",
             spellings: &["--filter"],
-            takes_value: true,
         },
     ],
 };
@@ -86,7 +80,7 @@ const EXTRACT_ALL: CommandSpec = CommandSpec {
 /// Run the family.
 pub fn run(argv: &[String]) -> Result<(), ToolError> {
     let Some(command) = argv.first() else {
-        eprintln!("{USAGE}");
+        crate::out::write_line(&mut std::io::stderr().lock(), "<stderr>", USAGE)?;
         return Err(ToolError::Usage("a command is required".to_string()));
     };
     let rest = &argv[1..];
@@ -97,7 +91,8 @@ pub fn run(argv: &[String]) -> Result<(), ToolError> {
         "extract" => extract(rest),
         "extract-all" => extract_all(rest),
         "--help" | "-h" | "help" => {
-            print!("{USAGE}");
+            let mut out = crate::out::Out::standard();
+            out.text(USAGE)?;
             Ok(())
         }
         other => Err(ToolError::Usage(format!("unknown xp3 command `{other}`"))),
@@ -160,31 +155,32 @@ fn info(argv: &[String]) -> Result<(), ToolError> {
     let invocation = cli::parse(argv, &INFO)?;
     let path = cli::positional(&invocation, 0)?;
     let archive = Archive::open(Path::new(path))?;
-    println!("archive: {path}");
-    println!("entries: {}", archive.index.len());
+    let mut out = crate::out::Out::standard();
+    out.line(&format!("archive: {path}"))?;
+    out.line(&format!("entries: {}", archive.index.len()))?;
     for (number, section) in archive.index.index_sections().iter().enumerate() {
         let encode = match section.encode {
             fs::xp3::IndexEncode::Raw => "raw",
             fs::xp3::IndexEncode::Zlib => "zlib",
         };
-        println!(
+        out.line(&format!(
             "index block {number}: offset={} encode={encode} file-chunks={} new-names={}",
             section.offset, section.file_chunks, section.new_names
-        );
+        ))?;
     }
-    println!();
-    println!(
+    out.line("")?;
+    out.line(&format!(
         "{:<48} {:>12} {:>12} {:>8}",
         "name", "size", "stored", "segments"
-    );
+    ))?;
     for entry in archive.entries() {
-        println!(
+        out.line(&format!(
             "{:<48} {:>12} {:>12} {:>8}",
             entry.name,
             entry.org_size,
             entry.arc_size,
             entry.segments.len()
-        );
+        ))?;
     }
     Ok(())
 }
@@ -195,13 +191,14 @@ fn list(argv: &[String]) -> Result<(), ToolError> {
     let path = cli::positional(&invocation, 0)?;
     let archive = Archive::open(Path::new(path))?;
     let filter = invocation.value("filter").map(str::to_lowercase);
+    let mut out = crate::out::Out::standard();
     for entry in archive.entries() {
         if let Some(filter) = &filter
             && !entry.name.to_lowercase().contains(filter.as_str())
         {
             continue;
         }
-        println!("{}", entry.name);
+        out.line(&entry.name)?;
     }
     Ok(())
 }
@@ -219,10 +216,11 @@ fn cat(argv: &[String]) -> Result<(), ToolError> {
         Some(range) => {
             let (first, last) = parse_line_range(range)?;
             let text = decode_text(&bytes)?;
+            let mut out = crate::out::Out::standard();
             for (number, line) in text.lines().enumerate() {
                 let number = number + 1;
                 if number >= first && number <= last {
-                    println!("{number}: {line}");
+                    out.line(&format!("{number}: {line}"))?;
                 }
             }
         }
@@ -243,7 +241,8 @@ fn extract(argv: &[String]) -> Result<(), ToolError> {
     let bytes = archive.read(entry)?;
     let target = PathBuf::from(output);
     write_file(&target, &bytes)?;
-    println!("wrote {} bytes to {output}", bytes.len());
+    let mut out = crate::out::Out::standard();
+    out.line(&format!("wrote {} bytes to {output}", bytes.len()))?;
     Ok(())
 }
 
@@ -273,7 +272,8 @@ fn extract_all(argv: &[String]) -> Result<(), ToolError> {
         write_file(&target, &bytes)?;
         written += 1;
     }
-    println!("wrote {written} entries to {output}");
+    let mut out = crate::out::Out::standard();
+    out.line(&format!("wrote {written} entries to {output}"))?;
     Ok(())
 }
 
@@ -282,13 +282,24 @@ fn extract_all(argv: &[String]) -> Result<(), ToolError> {
 /// A name that would leave the root is refused: an archive is data, and its
 /// names must not decide where the tool writes.
 fn entry_target(root: &Path, name: &str) -> Result<PathBuf, ToolError> {
-    let target = root.join(name);
-    if !target.starts_with(root) {
+    let mut relative = PathBuf::new();
+    for component in Path::new(name).components() {
+        match component {
+            Component::Normal(part) => relative.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ToolError::Usage(format!(
+                    "the entry name `{name}` leaves the output directory"
+                )));
+            }
+        }
+    }
+    if relative.as_os_str().is_empty() {
         return Err(ToolError::Usage(format!(
-            "the entry name `{name}` leaves the output directory"
+            "the entry name `{name}` does not name a file"
         )));
     }
-    Ok(target)
+    Ok(root.join(relative))
 }
 
 /// Write bytes to a file, creating the parent directories.
@@ -311,14 +322,8 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
 fn write_stdout(bytes: &[u8]) -> Result<(), ToolError> {
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    handle.write_all(bytes).map_err(|source| ToolError::Host {
-        path: PathBuf::from("<stdout>"),
-        source,
-    })?;
-    handle.flush().map_err(|source| ToolError::Host {
-        path: PathBuf::from("<stdout>"),
-        source,
-    })
+    crate::out::write_bytes(&mut handle, "<stdout>", bytes)?;
+    crate::out::flush(&mut handle, "<stdout>")
 }
 
 /// The 1-based, inclusive line range of a `--lines` argument.
@@ -384,8 +389,10 @@ fn decode_utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> Result<String, ToolEr
         ));
     }
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| unit([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| unit(*pair))
         .collect();
     String::from_utf16(&units)
         .map_err(|_| ToolError::Usage("the entry is not valid UTF-16 text".to_string()))
@@ -486,5 +493,8 @@ mod tests {
             PathBuf::from("/tmp/krkr-devtools-out/data/foo.txt")
         );
         assert!(entry_target(root, "../escape.txt").is_err());
+        assert!(entry_target(root, "data/../../escape.txt").is_err());
+        assert!(entry_target(root, "/etc/passwd").is_err());
+        assert!(entry_target(root, ".").is_err());
     }
 }

@@ -25,21 +25,21 @@ const COMPILE: CommandSpec = CommandSpec {
     options: &[OptionSpec {
         key: "output",
         spellings: &["-o", "--output"],
-        takes_value: true,
     }],
 };
 
 /// Run the family.
 pub fn run(argv: &[String]) -> Result<(), ToolError> {
     let Some(command) = argv.first() else {
-        eprintln!("{USAGE}");
+        crate::out::write_line(&mut std::io::stderr().lock(), "<stderr>", USAGE)?;
         return Err(ToolError::Usage("a command is required".to_string()));
     };
     let rest = &argv[1..];
     match command.as_str() {
         "compile" => compile(rest),
         "--help" | "-h" | "help" => {
-            print!("{USAGE}");
+            let mut out = crate::out::Out::standard();
+            out.text(USAGE)?;
             Ok(())
         }
         other => Err(ToolError::Usage(format!("unknown tjs command `{other}`"))),
@@ -88,6 +88,7 @@ fn compile(argv: &[String]) -> Result<(), ToolError> {
             },
         )
         .map_err(|error| ToolError::Compile(error.to_string()))?;
-    println!("wrote {output}");
+    let mut out = crate::out::Out::standard();
+    out.line(&format!("wrote {output}"))?;
     Ok(())
 }

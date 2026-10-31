@@ -43,7 +43,6 @@ const STRINGS: CommandSpec = CommandSpec {
     options: &[OptionSpec {
         key: "min-len",
         spellings: &["--min-len"],
-        takes_value: true,
     }],
 };
 
@@ -55,12 +54,10 @@ const DISASM: CommandSpec = CommandSpec {
         OptionSpec {
             key: "object",
             spellings: &["--object"],
-            takes_value: true,
         },
         OptionSpec {
             key: "grep",
             spellings: &["--grep"],
-            takes_value: true,
         },
     ],
 };
@@ -68,7 +65,7 @@ const DISASM: CommandSpec = CommandSpec {
 /// Run the family.
 pub fn run(argv: &[String]) -> Result<(), ToolError> {
     let Some(command) = argv.first() else {
-        eprintln!("{USAGE}");
+        crate::out::write_line(&mut std::io::stderr().lock(), "<stderr>", USAGE)?;
         return Err(ToolError::Usage("a command is required".to_string()));
     };
     let rest = &argv[1..];
@@ -77,7 +74,8 @@ pub fn run(argv: &[String]) -> Result<(), ToolError> {
         "strings" => strings(rest),
         "disasm" => listing(rest),
         "--help" | "-h" | "help" => {
-            print!("{USAGE}");
+            let mut out = crate::out::Out::standard();
+            out.text(USAGE)?;
             Ok(())
         }
         other => Err(ToolError::Usage(format!("unknown tjsb command `{other}`"))),
@@ -90,11 +88,12 @@ fn info(argv: &[String]) -> Result<(), ToolError> {
     let path = cli::positional(&invocation, 0)?;
     let bytes = read_file(Path::new(path))?;
     let file = format::parse(&bytes).map_err(ToolError::Bytecode)?;
-    println!("file: {path}");
-    println!("size: {} bytes", bytes.len());
-    println!("toplevel: {}", file.toplevel);
-    println!("objects: {}", file.objects.len());
-    println!(
+    let mut out = crate::out::Out::standard();
+    out.line(&format!("file: {path}"))?;
+    out.line(&format!("size: {} bytes", bytes.len()))?;
+    out.line(&format!("toplevel: {}", file.toplevel))?;
+    out.line(&format!("objects: {}", file.objects.len()))?;
+    out.line(&format!(
         "constants: bytes={} shorts={} longs={} longlongs={} doubles={} strings={} octets={}",
         file.constants.bytes.len(),
         file.constants.shorts.len(),
@@ -103,12 +102,12 @@ fn info(argv: &[String]) -> Result<(), ToolError> {
         file.constants.doubles.len(),
         file.constants.strings.len(),
         file.constants.octets.len()
-    );
+    ))?;
     for (index, object) in file.objects.iter().enumerate() {
-        println!(
+        out.line(&format!(
             "object {index}: {}",
             describe_object(object, &file.constants)
-        );
+        ))?;
     }
     Ok(())
 }
@@ -125,12 +124,13 @@ fn strings(argv: &[String]) -> Result<(), ToolError> {
     };
     let bytes = read_file(Path::new(path))?;
     let file = format::parse(&bytes).map_err(ToolError::Bytecode)?;
+    let mut out = crate::out::Out::standard();
     for (index, text) in file.constants.strings.iter().enumerate() {
         if text.chars().count() < minimum {
             continue;
         }
         let escaped = disasm::escape(text);
-        println!("[{index}] \"{escaped}\"");
+        out.line(&format!("[{index}] \"{escaped}\""))?;
     }
     Ok(())
 }
@@ -156,6 +156,7 @@ fn listing(argv: &[String]) -> Result<(), ToolError> {
             "the file has no object {selected}"
         )));
     }
+    let mut out = crate::out::Out::standard();
     for (index, object) in file.objects.iter().enumerate() {
         if let Some(selected) = selected
             && selected != index
@@ -164,18 +165,18 @@ fn listing(argv: &[String]) -> Result<(), ToolError> {
         }
         let header = describe_object(object, &file.constants);
         if needle.is_none_or(|needle| header.contains(needle)) {
-            println!("object {index}: {header}");
+            out.line(&format!("object {index}: {header}"))?;
         }
         let instructions =
             disasm::disassemble(object, &file.constants).map_err(ToolError::Bytecode)?;
         for instruction in instructions {
             let line = format!(
                 "  {:04}  {:<12} {}",
-                instruction.address, instruction.name, instruction.operands
+                instruction.at, instruction.name, instruction.operands
             );
             let line = line.trim_end();
             if needle.is_none_or(|needle| line.contains(needle)) {
-                println!("{line}");
+                out.line(line)?;
             }
         }
     }
@@ -212,7 +213,7 @@ fn object_name(object: &format::Object, constants: &format::Constants) -> String
 fn describe_object(object: &format::Object, constants: &format::Constants) -> String {
     let name = object_name(object, constants);
     format!(
-        "name={name} ctx={} parent={} maxvar={} varreserve={} maxframe={} args={} code={} vars={} props={}",
+        "name={name} ctx={} parent={} maxvar={} varreserve={} maxframe={} args={} code={} vars={} props={} unnamed_arg={} collapse={} setter={} getter={} super_getter={} super_positions={} declared={} source_positions={}",
         context_name(object.context_type),
         object.parent,
         object.max_variable_count,
@@ -221,7 +222,15 @@ fn describe_object(object: &format::Object, constants: &format::Constants) -> St
         object.argument_count,
         object.code.len(),
         object.data.len(),
-        object.properties.len()
+        object.properties.len(),
+        object.unnamed_argument_base,
+        object.collapse_base,
+        object.property_setter,
+        object.property_getter,
+        object.super_class_getter,
+        object.super_class_getter_positions.len(),
+        object.declared_size,
+        object.source_positions.len()
     )
 }
 

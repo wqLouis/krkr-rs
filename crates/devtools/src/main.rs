@@ -19,6 +19,7 @@ compile_error!("krkr-devtools is a Linux-only development tool");
 
 mod cli;
 mod error;
+mod out;
 
 #[cfg(feature = "tjsb")]
 mod tjsb;
@@ -31,8 +32,18 @@ fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match cli::run(&argv) {
         Ok(()) => {}
+        // The reader closed the pipe (`| head`): the command has nothing
+        // left to say, and its end is clean.
+        Err(error::ToolError::PipeClosed) => {}
         Err(error) => {
-            eprintln!("krkr-devtools: {error}");
+            let message = format!("krkr-devtools: {error}");
+            // The error output may be gone too; the status still says what
+            // happened.
+            drop(crate::out::write_line(
+                &mut std::io::stderr().lock(),
+                "<stderr>",
+                &message,
+            ));
             std::process::exit(error.exit_code());
         }
     }
