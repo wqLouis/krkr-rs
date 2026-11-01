@@ -1929,6 +1929,10 @@ extern "C" fn prop_processor_num(
     0
 }
 
+/// `System.exeBits` answers the bitness of the engine this surface emulates,
+/// and that engine is a 32-bit build: the titles it runs are 32-bit and ship
+/// 32-bit plugin modules, and a game reads the bitness to pick the plugin
+/// directory it searches. The host process width is `System.osBits`.
 extern "C" fn prop_exe_bits(
     engine: *mut c_void,
     out: *mut Value,
@@ -1937,10 +1941,12 @@ extern "C" fn prop_exe_bits(
     let Some(_resolved) = resolve(engine) else {
         return report_error(out_error, "System.exeBits: compat context is not bound");
     };
-    set_int(out, (std::mem::size_of::<usize>() * 8) as i64);
+    set_int(out, 32);
     0
 }
 
+/// `System.osBits` answers the bitness of the host operating system the
+/// engine runs on, not the width of the emulated engine.
 extern "C" fn prop_os_bits(
     engine: *mut c_void,
     out: *mut Value,

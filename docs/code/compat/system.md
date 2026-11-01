@@ -49,6 +49,15 @@ Read-only: `exePath`, `dataPath`, `personalPath`, `savedGamesPath`, `exeName`,
 `platformName`, `osName`, `processorNum`, `exeBits`, `osBits`, `appDataPath`,
 `desktopLeft`, `desktopTop`, `desktopWidth`, `desktopHeight`, `touchDevice`.
 
+`exeBits` is the bitness of the **emulated engine**, which is a 32-bit build:
+the reference answers `TJS_64BIT_OS ? 64 : 32`
+(`reference/cpp/core/base/SystemIntf.cpp:430-438`) and the titles the engine
+runs are 32-bit games that ship 32-bit plugin modules — a game reads the
+bitness to choose the plugin directory it searches (`plugin/` or
+`plugin64/`). `osBits` is the bitness of the **host operating system** the
+engine runs on (`TVPGetOSBits()`), so it follows the process, not the emulated
+engine.
+
 Three further members are **default data members** on the class object rather
 than native properties: `System.exceptionHandler`, `System.onActivate` and
 `System.onDeactivate` each read `null` until a script assigns one. They exist

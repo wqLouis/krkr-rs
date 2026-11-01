@@ -384,9 +384,26 @@ fn version_and_environment_properties() {
             TjsValue::Integer(n) => assert!(n >= 1),
             other => panic!("processorNum: {other:?}"),
         }
+    });
+}
+
+/// `System.exeBits` is the bitness of the **emulated engine**, and that
+/// engine is a 32-bit build: the reference answers `TJS_64BIT_OS ? 64 : 32`
+/// (`reference/cpp/core/base/SystemIntf.cpp:430-438`). The titles in this
+/// corpus are 32-bit games that ship 32-bit plugin modules, and a game reads
+/// the bitness to choose the plugin directory it searches (`plugin/` or
+/// `plugin64/`), so a script must see the emulated engine's width — not the
+/// width of the process that runs it.
+///
+/// `System.osBits` is the host operating system's bitness (`TVPGetOSBits()`),
+/// so it follows the process the engine runs on.
+#[test]
+fn exe_bits_is_the_engine_width_and_os_bits_the_host_width() {
+    let _lock = vm_lock();
+    with_vm(|e| {
         assert_eq!(
             e.eval("System.exeBits", "t").unwrap(),
-            TjsValue::Integer((std::mem::size_of::<usize>() * 8) as i64)
+            TjsValue::Integer(32)
         );
         assert_eq!(
             e.eval("System.osBits", "t").unwrap(),

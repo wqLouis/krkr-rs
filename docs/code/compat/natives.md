@@ -71,7 +71,7 @@ the graphic cache.
 | Group | Members | Behaviour |
 |---|---|---|
 | paths | `exePath`, `dataPath`, `personalPath`, `savedGamesPath`, `appDataPath`, `exeName` | the project directory (with a trailing `/`), `savedata/` under it, and the normalized app path. The reference's `TVPGetAppDataPath()` returns the app path, so `personalPath` and `savedGamesPath` are the same directory. |
-| identity | `versionString`, `versionInformation`, `platformName`, `osName`, `processorNum`, `exeBits`, `osBits` | `versionString` is `"2.32.2.426"`; `platformName` and `osName` are the same value (`Win32`, `MacOS`, `Android`, `iPhone`, `Linux`); `processorNum` is the available parallelism; the bit counts are the pointer width. |
+| identity | `versionString`, `versionInformation`, `platformName`, `osName`, `processorNum`, `exeBits`, `osBits` | `versionString` is `"2.32.2.426"`; `platformName` and `osName` are the same value (`Win32`, `MacOS`, `Android`, `iPhone`, `Linux`); `processorNum` is the available parallelism; `exeBits` is the emulated engine's bitness and `osBits` the host operating system's. |
 | screen | `screenWidth`, `screenHeight` | the **logical screen** — the first window's primary layer, else the window client size, else `(0, 0)`. |
 | desktop | `desktopLeft`, `desktopTop`, `desktopWidth`, `desktopHeight` | the installed host rectangle. Without the host fact the member **raises** rather than returning a fabricated value. |
 | command line | `getArgument`, `setArgument` | `getArgument` prefix-matches (the next character must be `=` or the end of the string) and returns `"yes"` for a value-less entry, or **void** on a miss — the reference has no default parameter. `setArgument` rewrites the first prefix match or inserts `name=value` at the front. |
