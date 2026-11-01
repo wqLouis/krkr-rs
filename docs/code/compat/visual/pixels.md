@@ -379,6 +379,9 @@ The plane comes from the host's index-plane decoder
 (`CompatHost::set_index_plane_decoder`); without one the load raises
 `"no index-plane decoder is installed"`.
 
+The plane is what a KAG map addresses its regions by: the map's tags, the
+action table and the click are in [`../kag/map.md`](../kag/map.md).
+
 ### `saveLayerImage(name[, type])`
 
 `type` defaults to `"bmp"`; an empty string also becomes `"bmp"`. The layer's

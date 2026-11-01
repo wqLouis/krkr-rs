@@ -329,5 +329,6 @@ VM. It covers:
 | layer boundaries, the frame contract | [`../../rules/arch_rules.md`](../../rules/arch_rules.md) |
 | the storage namespace and the naming grammar | [`storages.md`](storages.md) |
 | the script execution surface | [`scripts.md`](scripts.md) |
+| the clickable province map | [`kag/map.md`](kag/map.md) |
 | the native/VM architecture and the plugin ABI | [`../../../docs.old/migration/08-tjs-vm-and-native-plugins.md`](../../../docs.old/migration/08-tjs-vm-and-native-plugins.md) |
 | the L3 ↔ L2 protocol in full | [`../../../docs.old/migration/14-l3-l2-protocol.md`](../../../docs.old/migration/14-l3-l2-protocol.md) |

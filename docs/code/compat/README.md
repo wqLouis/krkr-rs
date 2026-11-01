@@ -76,7 +76,7 @@ the family's own state ownership:
 | [`clipboard.md`](clipboard.md) | `Clipboard` |
 | [`tree_owner.md`](tree_owner.md) | `BitmapLayerTreeOwner` |
 | [`tjsnum.md`](tjsnum.md) | the `string → integer` coercion |
-| [`kag.md`](kag.md) | `KAGParser` — with [`kag/parser.md`](kag/parser.md), [`kag/state.md`](kag/state.md) and [`kag/kvp.md`](kag/kvp.md) |
+| [`kag.md`](kag.md) | `KAGParser` — with [`kag/parser.md`](kag/parser.md), [`kag/state.md`](kag/state.md), [`kag/kvp.md`](kag/kvp.md) and [`kag/map.md`](kag/map.md) |
 
 ### The plugin pages
 

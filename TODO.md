@@ -372,6 +372,18 @@ residuals:
   province image is a truecolour PNG fails the load where the reference
   produces a plane. The palettized and grayscale cases — the ones a map
   image uses — are exact.
+* **The `<image>_p` province convention is not implemented.** The reference's
+  `LoadImages` computes a province name from the image's name — the name
+  without its extension, plus `_p`, plus the extension of the file it found
+  — and loads that file as the layer's province plane when it exists
+  (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1662-1680`,
+  `reference/cpp/core/visual/LayerIntf.cpp:2847-2875`). The port's
+  `loadImages` does not: only an explicit `loadProvinceImage` loads a plane
+  (`crates/compat/src/natives/visual/layer/pixels.rs`). The convention is the
+  KAG map's own naming — a map image `title_bg_main` and its plane
+  `title_bg_main_p` — so a title that arms its map with the convention alone
+  has no clickable region. The map's own tag (`[mapimage]`) names the plane
+  explicitly and is unaffected; see `docs/code/compat/kag/map.md`.
 
 ## 5. Dialogs and popups
 

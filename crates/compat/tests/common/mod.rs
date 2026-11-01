@@ -8,6 +8,8 @@
 
 #![allow(dead_code)]
 
+pub mod map;
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
