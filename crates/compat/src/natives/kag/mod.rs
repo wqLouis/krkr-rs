@@ -563,6 +563,12 @@ fn build_tag_dict(
         &TjsValue::String(name.to_string()),
     )?;
     for (key, value) in params {
+        // An attribute whose name is empty (a tag written `[x =v]`) has no
+        // member in the dictionary: the write that would create it is
+        // rejected, and the name stays in `taglist` only.
+        if key.is_empty() {
+            continue;
+        }
         engine.set_member(dict.raw_id(), key, &TjsValue::String(value.clone()))?;
     }
     let mut names: Vec<String> = Vec::with_capacity(params.len() + 1);

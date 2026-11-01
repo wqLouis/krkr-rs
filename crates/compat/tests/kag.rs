@@ -1874,6 +1874,42 @@ fn native_tag_dictionary_exposes_taglist() {
 }
 
 #[test]
+fn native_tag_dictionary_keeps_an_empty_attribute_name() {
+    // The reference reads an empty attribute name when the '=' follows the
+    // tag name (`reference/cpp/core/base/KAGParser.cpp:2037-2046`) and writes
+    // the tag dictionary through `PropSetByVS`, ignoring the result
+    // (`KAGParser.cpp:2176-2179`); an empty member name is rejected there
+    // (`reference/cpp/core/tjs2/tjsObject.cpp:1460-1464`), so the attribute
+    // is not stored and the tag still parses. The name stays in `taglist`.
+    let _lock = common::vm_lock();
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut host = compat::CompatHost::new();
+    host.install(&engine).expect("install compat surface");
+    engine
+        .exec_script_discard(
+            "class EmptyAttributeParser extends KAGParser { \
+               function onScenarioLoad(name) { \
+                 return \"[layopt layer = message7page = fore visible = true]\"; \
+               } \
+             }",
+            "kag_test",
+        )
+        .expect("the subclass declaration must evaluate");
+    let value = engine
+        .eval(
+            "(function(){ var p = new EmptyAttributeParser(); p.loadScenario('scenario'); \
+             var t = p.getNextTag(); \
+             return t.tagname + ':' + t.layer + ':' + t.visible + ':' + t.taglist[2]; })()",
+            "kag_test",
+        )
+        .expect("script");
+    assert_eq!(
+        value,
+        TjsValue::String("layopt:message7page:true:".to_string())
+    );
+}
+
+#[test]
 fn native_properties_and_void_end() {
     let _lock = common::vm_lock();
     let engine = Tjs2Engine::new().expect("create engine");

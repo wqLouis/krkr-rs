@@ -85,6 +85,12 @@ retain an object and the C++ trampoline consumes a `VAL_RETAINED` result:
   source order, and `taglist` — an array of the member names in insertion
   order (`tagname` first). The array literal is built from escaped attribute
   names, so **no scenario text is ever evaluated as TJS**.
+* An attribute whose name is empty — a tag written `[x =v]`, which the
+  reference reads as an empty attribute name (`KAGParser.cpp:2037-2046`) — is
+  dropped from the dictionary: the reference writes the tag dictionary
+  through `PropSetByVS` and ignores the result (`KAGParser.cpp:2176-2179`),
+  and an empty member name is rejected there (`tjsObject.cpp:1460-1464`).
+  The name stays in `taglist`.
 * `macros` returns a Dictionary of macro name → body.
 * `macroParams` / `mp` return the innermost macro-argument level as a
   Dictionary, or `null` when the stack is empty.
