@@ -243,6 +243,9 @@ pub enum PluginOutcome {
 }
 ```
 
+`Plugins.link` answers the outcome to the script: `1` for `Builtin`, `0` for
+`Unported` (see [`plugins_native.md`](plugins_native.md) §1).
+
 ---
 
 ## 6. Errors

@@ -152,9 +152,15 @@ fn an_unported_plugin_registers_nothing() {
     let mut host = compat::CompatHost::new();
     host.install(&engine).expect("install compat surface");
 
-    engine
-        .exec_script("Plugins.link('totally_unknown.dll');", "test")
-        .expect("link unknown plugin");
+    // The link answers the outcome: a name with no emulation answers `0`,
+    // so a script that tests the result takes its "not available" path.
+    assert_eq!(
+        engine
+            .eval("Plugins.link('totally_unknown.dll')", "test")
+            .unwrap(),
+        TjsValue::Integer(0),
+        "a plugin with no emulation answers 0"
+    );
 
     // Nothing is published under the plugin's stem.
     assert_eq!(
@@ -242,6 +248,15 @@ fn a_ported_plugin_publishes_its_class() {
     assert_eq!(
         engine.eval("typeof global['CSVParser']", "test").unwrap(),
         TjsValue::String("Object".into())
+    );
+    // The link answers the outcome: a linked plugin answers `1`, so a
+    // script that tests the result sees the surface as there.
+    assert_eq!(
+        engine
+            .eval("Plugins.link('csvParser.dll')", "test")
+            .unwrap(),
+        TjsValue::Integer(1),
+        "a linked plugin answers 1"
     );
 }
 

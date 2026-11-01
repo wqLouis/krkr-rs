@@ -17,7 +17,7 @@ place where a plugin's script-visible surface is registered.
 
 | member | returns | behaviour |
 |---|---|---|
-| `Plugins.link(name)` | `void` | activates the built-in emulation for `name`, or records the link and warns when the name is not ported |
+| `Plugins.link(name)` | `int` | activates the built-in emulation for `name` and answers `1`, or records the link, warns and answers `0` when the name is not ported |
 | `Plugins.unlink(name)` | `bool` | forgets a linked name; returns whether it had been linked |
 | `Plugins.getList()` | `Array` | the linked names, in insertion order and with the script's original casing |
 

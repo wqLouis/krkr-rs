@@ -1,7 +1,8 @@
 //! The `Plugins` native class: script-facing plugin linking.
 //!
 //! `link(name)` activates a built-in plugin emulation or records the link of
-//! a plugin that has none; `unlink(name)` forgets a linked name;
+//! a plugin that has none and answers `1` for the linked plugin and `0` for
+//! a name with no emulation; `unlink(name)` forgets a linked name;
 //! `getList()` returns the linked names. This mirrors the reference
 //! `Plugins` class (static members only).
 #![allow(unsafe_code)]
@@ -11,7 +12,7 @@ use std::ffi::{c_char, c_int, c_void};
 use tjs::{Engine, NativeClassBuilder, NativeMethodDef, VAL_ARRAY, Value};
 
 use crate::binding;
-use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
+use crate::native_util::{args, report_error, set_int, value_as_string};
 use crate::{CompatCtx, CompatError, PluginOutcome};
 
 /// Write the linked-name array into `out`.
@@ -50,7 +51,8 @@ fn set_array_out(out: *mut Value, ctx: &CompatCtx, values: &[String]) {
     }
 }
 
-/// `Plugins.link(name)` → void.
+/// `Plugins.link(name)` → int (`1` when the plugin is linked, `0` when the
+/// name has no emulation).
 extern "C" fn native_link(
     engine: *mut c_void,
     argc: c_int,
@@ -70,13 +72,13 @@ extern "C" fn native_link(
     match resolved.registry().activate(&name, &mut ctx) {
         Ok(PluginOutcome::Builtin) => {
             log::info!("Plugins.link({name:?}): built-in emulation activated");
-            set_void(out);
+            set_int(out, 1);
             0
         }
         Ok(PluginOutcome::Unported) => {
             // The registry logged the outcome: the link is recorded, one
             // warning names the plugin, and nothing is registered for it.
-            set_void(out);
+            set_int(out, 0);
             0
         }
         Err(err) => report_error(out_error, &err.to_string()),

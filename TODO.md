@@ -604,6 +604,17 @@ native OS popup would be a deliberate divergence, and Linux has nothing to call
 
 ## 10. Native plugins
 
+* **`Plugins.link` answers the outcome instead of `void`.** The reference's
+  `Plugins.link` calls `TVPLoadPlugin(name)` and returns without setting a
+  result (`reference/cpp/core/plugin/PluginImpl.cpp:300-311`), and
+  `TVPLoadPlugin` only loads the module and logs success or failure
+  (`reference/cpp/core/plugin/PluginImpl.cpp:48-56`), so the call is `void`
+  there. A script that tests the result cannot learn from it whether the
+  plugin's surface is there, so the port answers `1` for a linked plugin and
+  `0` for a name with no emulation — an unported link stays falsy and absent,
+  and a ported one is truthy. Scope: the script-observable return value of
+  `Plugins.link`; the member list is unchanged. Recorded as an approximation
+  with its reference gap (D36).
 * **The engine's own plugins are not registered at startup.** The reference
   registers the built-in plugin modules when the application starts
   (`reference/cpp/core/plugin/PluginImpl.cpp:90-93`, `TVPLoadInternalPlugins()`),
@@ -723,7 +734,8 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   top-level object disassembles to `const %1, *3`, `spds %-1.*'TextRender',
   %1`, `cl %1`, `const %1, *0` (`textrender.dll`), `gpd %2, %-2.*'Plugins'`,
   `calld %0, %2.*'link'(%1)`, `srv %0`, `ret`. Nothing checks the result: the
-  tree's `link` returns void and reports nothing
+  tree's `link` answers `1`/`0` while the engine it emulates returns void and
+  reports nothing
   (`reference/cpp/core/plugin/PluginImpl.cpp:299-311`), and a failed link
   surfaces later as a missing `TextRenderBase`.
   The shipped DLL is the oracle for this plugin's behaviour (the rule for an

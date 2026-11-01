@@ -300,8 +300,13 @@ behaviour. The emulation lives in L3; no real Win32 API is linked.
   A script that probes for the class (`typeof global[name] == 'Object'`) sees
   it missing and takes its own "class not found" path, exactly as it does
   against the engine that could not load the DLL.
-* `Plugins.link` returns **void**, like the engine it emulates; the game's own
-  `link()` helper derives its 0/1 result from the class probe.
+* `Plugins.link` answers the outcome: `1` when the plugin is linked, `0` when
+  the name has no emulation. The engine it emulates returns void for both —
+  the link only loads the module and logs the result — so this is a
+  deliberate divergence: a script that tests the result learns whether the
+  plugin's surface is there. An unported link stays falsy and absent, and the
+  game's own `link()` helper still derives its 0/1 result from the class
+  probe.
 * Where the external engine's source is unavailable, the shipped DLL build is
   the oracle and is cited **by hash**
   (`<Name>.dll <sha256[:12]> @ <function/address>`). The extracted surface or

@@ -6,7 +6,7 @@
 only** — no instance, no payload — and mirrors the reference `Plugins` class.
 
 ```
-Plugins.link(name)    → void
+Plugins.link(name)    → int (1 when the plugin is linked, 0 when the name has no emulation)
 Plugins.unlink(name)  → bool
 Plugins.getList()     → array of the linked names
 ```
@@ -17,13 +17,20 @@ Plugins.getList()     → array of the linked names
 
 Activates a plugin name:
 
-| Outcome | Behaviour |
-|---|---|
-| a built-in emulation exists | its classes are registered (once) and the link is recorded |
-| no built-in emulation | the link is recorded, one warning names the plugin, and **nothing** is registered for it |
+| Outcome | Behaviour | Result |
+|---|---|---|
+| a built-in emulation exists | its classes are registered (once) and the link is recorded | `1` |
+| no built-in emulation | the link is recorded, one warning names the plugin, and **nothing** is registered for it | `0` |
 
-The call returns **void** in both cases — exactly as the reference does. The
-outcome is reported through the log:
+The call answers the outcome, so a script can test it to learn whether the
+plugin's surface is there. This is a deliberate divergence: the reference's
+`Plugins.link` calls `TVPLoadPlugin(name)` and returns without setting a
+result (`reference/cpp/core/plugin/PluginImpl.cpp:300-311`), and
+`TVPLoadPlugin` only loads the module and logs the outcome
+(`reference/cpp/core/plugin/PluginImpl.cpp:48-56`), so the call is `void`
+there. The approximation is recorded in `TODO.md` §10.
+
+The outcome is also reported through the log:
 
 | Level | Message |
 |---|---|
