@@ -66,6 +66,9 @@ mod media;
 
 pub use media::StorageMedia;
 
+/// A registered media provider and the path that follows its scheme.
+type MediaProvider<'a> = (Rc<dyn StorageMedia>, &'a str);
+
 /// Windows `FILE_ATTRIBUTE_DIRECTORY` (0x10).
 pub const ATTR_DIRECTORY: i64 = 0x10;
 /// Windows `FILE_ATTRIBUTE_ARCHIVE` (0x20) — the "normal file" bit.
@@ -2853,7 +2856,7 @@ impl Storage {
     fn media_provider<'a>(
         &self,
         name: &'a str,
-    ) -> Result<Option<(Rc<dyn StorageMedia>, &'a str)>, StorageReadError> {
+    ) -> Result<Option<MediaProvider<'a>>, StorageReadError> {
         let Some((scheme, path)) = split_media_scheme(name) else {
             return Ok(None);
         };
