@@ -319,6 +319,7 @@ fn vulkan_target_capabilities_or_skip() {
     };
     let caps = capabilities(&pipeline);
     assert!(caps.supports_offscreen_targets);
-    // The GPU path still defers destination-dependent blends.
-    assert!(!caps.supports_destination_dependent_blend);
+    // The GPU path draws the destination-dependent blends with the
+    // destination-blend program.
+    assert!(caps.supports_destination_dependent_blend);
 }

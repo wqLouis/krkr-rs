@@ -6,9 +6,16 @@
 //! asks the middle layer for a draw list.
 //!
 //! There are no silent fallbacks: a node whose composition needs a
-//! feature this backend does not implement (a mask clip, a GPU glyph run or a
-//! destination-dependent blend mode) makes the frame fail with a typed
+//! feature this backend does not implement (a mask clip or a GPU glyph run)
+//! makes the frame fail with a typed
 //! [`RenderError::Unsupported`](api::error::RenderError::Unsupported).
+//!
+//! A destination-dependent blend reads the destination the node is composed
+//! over. The recorder takes that destination the way the engine's blend
+//! shaders take it: the target is copied into a separate image, and the
+//! program mixes the source over that copy. The copy happens outside the
+//! render pass — a colour attachment cannot be a copy's source — so the pass
+//! ends, copies and begins again.
 #![allow(unsafe_code)]
 
 use ash::vk;
@@ -16,7 +23,8 @@ use ash::vk;
 use api::error::RenderError;
 use api::geometry::{Affine2, RectF};
 
-use super::pipelines::{PipelineSet, Program};
+use super::pipelines::{PipelineResources, PipelineSet, Program, dst_blend_mode};
+use super::target::DestinationSnapshot;
 use super::texture::VulkanTexture;
 use crate::MAX_TRAVERSAL_DEPTH;
 use crate::collections::Map;
@@ -25,7 +33,7 @@ use crate::scene::{
     children_are_sorted, node_spaces,
 };
 
-/// Push-constant block shared with the shaders (96 bytes).
+/// Push-constant block shared with the shaders (112 bytes).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PushConstants {
@@ -35,29 +43,87 @@ struct PushConstants {
     tint: [f32; 4],
     /// `(u, v, width, height)` source rectangle inside the texture.
     uv_rect: [f32; 4],
+    /// The destination-dependent blend's mode index.
+    mode: u32,
+    /// The composed opacity of the node being drawn.
+    opacity: f32,
+    /// The size of the target the scene is composed into, in device pixels.
+    target_size: [f32; 2],
 }
 
 /// The push-constant block shared with the shaders must match the size the
 /// pipeline layout reserves.
 const _: () = assert!(std::mem::size_of::<PushConstants>() as u32 == super::PUSH_CONSTANT_SIZE);
 
-/// The frame-wide resources one scene traversal records with.
-pub(crate) struct SceneDraw<'a> {
+/// The render pass a scene is composed into.
+///
+/// The recorder owns the pass's lifetime because the destination-dependent
+/// route ends the pass around the copy of the destination and begins it
+/// again.
+pub(crate) struct ScenePass<'a> {
     /// Logical device the command buffer belongs to.
     pub(crate) device: &'a ash::Device,
-    /// Command buffer the scene is recorded into.
+    /// Command buffer the pass is recorded into.
     pub(crate) command: vk::CommandBuffer,
-    /// Pipelines and the shared unit-quad vertex buffer.
+    /// The render pass.
+    pub(crate) render_pass: vk::RenderPass,
+    /// The framebuffer the pass renders into.
+    pub(crate) framebuffer: vk::Framebuffer,
+    /// The colour image the pass renders into.
+    pub(crate) image: vk::Image,
+    /// The clear colour the target starts from.
+    pub(crate) clear: [f32; 4],
+    /// Target extent in device pixels.
+    pub(crate) extent: vk::Extent2D,
+}
+
+impl ScenePass<'_> {
+    /// Begins the pass.
+    fn begin(&self) {
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: self.extent,
+        };
+        let render_pass_begin = vk::RenderPassBeginInfo::default()
+            .render_pass(self.render_pass)
+            .framebuffer(self.framebuffer)
+            .render_area(render_area);
+        // SAFETY: the command buffer is recording; the render pass and
+        // framebuffer are compatible and live.
+        unsafe {
+            self.device.cmd_begin_render_pass(
+                self.command,
+                &render_pass_begin,
+                vk::SubpassContents::INLINE,
+            );
+        }
+    }
+
+    /// Ends the pass.
+    fn end(&self) {
+        // SAFETY: the render pass and command buffer are recording.
+        unsafe {
+            self.device.cmd_end_render_pass(self.command);
+        }
+    }
+}
+
+/// The frame-wide resources one scene traversal records with.
+pub(crate) struct SceneDraw<'a> {
+    /// The pass the scene is composed into.
+    pub(crate) pass: ScenePass<'a>,
+    /// Pipelines and the shared descriptor resources.
     pub(crate) pipelines: &'a PipelineSet,
+    /// The descriptor and layout resources every pipeline set shares.
+    pub(crate) resources: &'a PipelineResources,
     /// Uploaded textures keyed by texture identity.
     pub(crate) textures: &'a Map<u64, VulkanTexture>,
     /// Custom effect pipelines and the frame's uniform ring, when the caller
     /// has one. A scene with an effect draw and no state here is an error, not
     /// a skipped draw.
     pub(crate) effects: Option<&'a mut super::effect::EffectState>,
-    /// Render pass the command buffer is inside: an effect pipeline is built
-    /// per pass.
-    pub(crate) render_pass: vk::RenderPass,
+    /// The copy of the destination the destination-dependent blend reads.
+    pub(crate) snapshot: Option<&'a mut DestinationSnapshot>,
     /// Target extent in device pixels.
     pub(crate) extent: vk::Extent2D,
     /// Whether the target format is an sRGB surface.
@@ -66,54 +132,126 @@ pub(crate) struct SceneDraw<'a> {
 
 /// Records all visible content of `scene` into the draw's command buffer.
 ///
-/// The caller has already begun the render pass and set the viewport.
-/// `root` is the transform applied around the scene root. The live frame path
-/// passes the identity and offscreen targets pass the identity as well.
+/// The pass is begun and ended here, because the destination-dependent route
+/// restarts it around the copy of the destination. `root` is the transform
+/// applied around the scene root. The live frame path passes the identity and
+/// offscreen targets pass the identity as well.
 ///
 /// # Errors
 ///
 /// Returns [`RenderError::Unsupported`] when the scene uses a feature the
-/// Vulkan backend does not implement (mask clips, GPU glyph runs or
-/// destination-dependent blend modes).
+/// Vulkan backend does not implement (mask clips or GPU glyph runs).
 pub(crate) fn record_scene(
     draw: SceneDraw<'_>,
     scene: &RenderScene,
     root: &Affine2,
 ) -> Result<(), RenderError> {
     let SceneDraw {
-        device,
-        command,
+        pass,
         pipelines,
+        resources,
         textures,
         effects,
-        render_pass,
+        snapshot,
         extent,
         srgb,
     } = draw;
     let mut recorder = Recorder {
-        device,
-        command,
+        pass,
         pipelines,
+        resources,
         textures,
         effects,
-        render_pass,
-        scene,
+        snapshot,
         extent,
         srgb,
+        scene,
         cache: BindCache::default(),
     };
 
     // SAFETY: the command buffer is recording; the vertex buffer is owned by
-    // `pipelines` and stays alive for the traversal.
+    // `resources` and stays alive for the traversal.
     unsafe {
-        device.cmd_bind_vertex_buffers(command, 0, &[pipelines.vertex_buffer], &[0]);
+        recorder.pass.device.cmd_bind_vertex_buffers(
+            recorder.pass.command,
+            0,
+            &[resources.vertex_buffer],
+            &[0],
+        );
     }
 
     let full_scissor = vk::Rect2D {
         offset: vk::Offset2D { x: 0, y: 0 },
         extent,
     };
-    recorder.visit(scene.root, root, 1.0, full_scissor, 0)
+    recorder.pass.begin();
+    let result = match recorder.clear_target() {
+        Ok(()) => recorder.visit(scene.root, root, 1.0, full_scissor, 0),
+        Err(error) => Err(error),
+    };
+    recorder.pass.end();
+    result
+}
+
+/// Records the draw that presents a composed target over the surface.
+///
+/// The draw is a full-screen quad that samples the target the scene was
+/// composed into, so the surface shows the composed frame.
+///
+/// # Errors
+///
+/// Returns [`RenderError::Unsupported`] when the pipeline for the draw cannot
+/// be selected.
+pub(crate) fn record_present(
+    device: &ash::Device,
+    command: vk::CommandBuffer,
+    pipelines: &PipelineSet,
+    resources: &PipelineResources,
+    target: vk::DescriptorSet,
+    extent: vk::Extent2D,
+) -> Result<(), RenderError> {
+    let pipeline = pipelines.pipeline_for(Program::Textured, api::blend::BlendMode::SourceOver)?;
+    let scissor = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent,
+    };
+    let constants = PushConstants {
+        mvp: to_ndc(&Affine2::IDENTITY, extent),
+        tint: [1.0, 1.0, 1.0, 1.0],
+        uv_rect: [0.0, 0.0, 1.0, 1.0],
+        mode: 0,
+        opacity: 1.0,
+        target_size: [extent.width as f32, extent.height as f32],
+    };
+    // SAFETY: `constants` is a live, fully initialized push-constant block.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&constants as *const PushConstants).cast::<u8>(),
+            std::mem::size_of::<PushConstants>(),
+        )
+    };
+    // SAFETY: the command buffer is recording and every handle is live.
+    unsafe {
+        device.cmd_bind_pipeline(command, vk::PipelineBindPoint::GRAPHICS, pipeline);
+        device.cmd_bind_descriptor_sets(
+            command,
+            vk::PipelineBindPoint::GRAPHICS,
+            resources.pipeline_layout,
+            0,
+            &[target],
+            &[],
+        );
+        device.cmd_push_constants(
+            command,
+            resources.pipeline_layout,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            0,
+            bytes,
+        );
+        device.cmd_set_scissor(command, 0, &[scissor]);
+        device.cmd_draw(command, 4, 1, 0, 0);
+    }
+    Ok(())
 }
 
 /// One unit-quad draw request: the pipeline it selects and the shader inputs
@@ -159,12 +297,12 @@ impl BindCache {
         self.descriptor != Some(set)
     }
 
-    /// Records the bound pipeline.
+    /// Records the pipeline that was bound.
     fn bind_pipeline(&mut self, pipeline: vk::Pipeline) {
         self.pipeline = Some(pipeline);
     }
 
-    /// Records the bound descriptor set.
+    /// Records the descriptor set that was bound.
     fn bind_descriptor(&mut self, set: vk::DescriptorSet) {
         self.descriptor = Some(set);
     }
@@ -178,20 +316,50 @@ impl BindCache {
 
 /// Command-recording traversal state.
 struct Recorder<'a> {
-    device: &'a ash::Device,
-    command: vk::CommandBuffer,
+    /// The pass the scene is composed into.
+    pass: ScenePass<'a>,
+    /// Pipelines for the pass's render pass.
     pipelines: &'a PipelineSet,
+    /// The descriptor and layout resources every pipeline set shares.
+    resources: &'a PipelineResources,
+    /// Uploaded textures keyed by texture identity.
     textures: &'a Map<u64, VulkanTexture>,
+    /// Custom effect pipelines and the frame's uniform ring.
     effects: Option<&'a mut super::effect::EffectState>,
-    render_pass: vk::RenderPass,
+    /// The copy of the destination the destination-dependent blend reads.
+    snapshot: Option<&'a mut DestinationSnapshot>,
+    /// The scene being traversed.
     scene: &'a RenderScene,
+    /// Target extent in device pixels.
     extent: vk::Extent2D,
+    /// Whether the target format is an sRGB surface.
     srgb: bool,
     /// The pipeline and descriptor set the command buffer has bound.
     cache: BindCache,
 }
 
 impl Recorder<'_> {
+    /// Clears the target the scene is composed into.
+    ///
+    /// The render pass loads the attachment, so a render that follows another
+    /// one keeps the earlier content; the target is cleared with a full-screen
+    /// draw that replaces the colour instead.
+    fn clear_target(&mut self) -> Result<(), RenderError> {
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: self.extent,
+        };
+        self.draw_quad(QuadDraw {
+            program: Program::Solid,
+            blend: api::blend::BlendMode::Replace,
+            world: &Affine2::IDENTITY,
+            tint: self.pass.clear,
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            descriptor: None,
+            scissor,
+        })
+    }
+
     /// Visits one node and its subtree.
     fn visit(
         &mut self,
@@ -265,7 +433,7 @@ impl Recorder<'_> {
             }
             None => return Ok(current),
         };
-        let clip = rect_to_scissor(bounds, self.extent);
+        let clip = rect_to_scissor(&bounds, self.extent);
         Ok(intersect_scissor(current, clip))
     }
 
@@ -273,8 +441,7 @@ impl Recorder<'_> {
     ///
     /// # Errors
     ///
-    /// Returns [`RenderError::Unsupported`] for a GPU glyph run or a
-    /// destination-dependent blend mode.
+    /// Returns [`RenderError::Unsupported`] for a GPU glyph run.
     fn draw(
         &mut self,
         node: &RenderNode,
@@ -304,19 +471,35 @@ impl Recorder<'_> {
                     return Ok(());
                 }
                 let uv = uv_rect(texture.width(), texture.height(), node.src);
-                // The per-node tint carries the text colour (linearised for an
-                // sRGB target); the alpha is the composed opacity. Ordinary
-                // textures keep the default `[1, 1, 1, 1]`.
-                let tint = self.color_tint(node.color, opacity);
-                self.draw_quad(QuadDraw {
-                    program: Program::Textured,
-                    blend: node.blend,
-                    world,
-                    tint,
-                    uv_rect: uv,
-                    descriptor: Some(gpu.descriptor_set),
-                    scissor,
-                })
+                if let Some(kind) = node.blend.dst_blend() {
+                    // The destination-dependent route: the source is blended
+                    // over a copy of the destination in the program's shader.
+                    let tint = self.source_tint(node.color);
+                    self.draw_dst_blend(DstBlendDraw {
+                        node,
+                        world,
+                        source: gpu.descriptor_set,
+                        uv,
+                        tint,
+                        opacity,
+                        kind,
+                        scissor,
+                    })
+                } else {
+                    // The per-node tint carries the text colour (linearised
+                    // for an sRGB target); the alpha is the composed opacity.
+                    // Ordinary textures keep the default `[1, 1, 1, 1]`.
+                    let tint = self.color_tint(node.color, opacity);
+                    self.draw_quad(QuadDraw {
+                        program: Program::Textured,
+                        blend: node.blend,
+                        world,
+                        tint,
+                        uv_rect: uv,
+                        descriptor: Some(gpu.descriptor_set),
+                        scissor,
+                    })
+                }
             }
             RenderContent::Glyphs(_) => Err(RenderError::Unsupported {
                 message: "GPU glyph runs are not implemented by the Vulkan backend".to_owned(),
@@ -324,9 +507,9 @@ impl Recorder<'_> {
             RenderContent::Effect(effect) => {
                 // Copy the borrowed fields out before the mutable borrow of the
                 // effect state below.
-                let device = self.device;
-                let command = self.command;
-                let render_pass = self.render_pass;
+                let device = self.pass.device;
+                let command = self.pass.command;
+                let render_pass = self.pass.render_pass;
                 let textures = self.textures;
                 let mvp = to_ndc(world, self.extent);
                 let Some(effects) = self.effects.as_deref_mut() else {
@@ -370,8 +553,8 @@ impl Recorder<'_> {
         // SAFETY: the command buffer is recording and every handle is live.
         unsafe {
             if self.cache.needs_pipeline(pipeline) {
-                self.device.cmd_bind_pipeline(
-                    self.command,
+                self.pass.device.cmd_bind_pipeline(
+                    self.pass.command,
                     vk::PipelineBindPoint::GRAPHICS,
                     pipeline,
                 );
@@ -380,10 +563,10 @@ impl Recorder<'_> {
             if let Some(set) = descriptor
                 && self.cache.needs_descriptor(set)
             {
-                self.device.cmd_bind_descriptor_sets(
-                    self.command,
+                self.pass.device.cmd_bind_descriptor_sets(
+                    self.pass.command,
                     vk::PipelineBindPoint::GRAPHICS,
-                    self.pipelines.pipeline_layout,
+                    self.resources.pipeline_layout,
                     0,
                     &[set],
                     &[],
@@ -395,21 +578,98 @@ impl Recorder<'_> {
                 mvp: to_ndc(world, self.extent),
                 tint,
                 uv_rect,
+                mode: 0,
+                opacity: 1.0,
+                target_size: target_size(self.extent),
             };
-            let bytes = std::slice::from_raw_parts(
-                (&constants as *const PushConstants).cast::<u8>(),
-                std::mem::size_of::<PushConstants>(),
+            push_constants(
+                self.pass.device,
+                self.pass.command,
+                self.resources.pipeline_layout,
+                &constants,
             );
-            self.device.cmd_push_constants(
-                self.command,
-                self.pipelines.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                0,
-                bytes,
-            );
-            self.device.cmd_set_scissor(self.command, 0, &[scissor]);
-            self.device.cmd_draw(self.command, 4, 1, 0, 0);
+            self.pass
+                .device
+                .cmd_set_scissor(self.pass.command, 0, &[scissor]);
+            self.pass.device.cmd_draw(self.pass.command, 4, 1, 0, 0);
         }
+        Ok(())
+    }
+
+    /// Emits the draw that mixes a source over a copy of the destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::Unsupported`] when the target has no copy of the
+    /// destination to read.
+    fn draw_dst_blend(&mut self, draw: DstBlendDraw<'_>) -> Result<(), RenderError> {
+        let DstBlendDraw {
+            node,
+            world,
+            source,
+            uv,
+            tint,
+            opacity,
+            kind,
+            scissor,
+        } = draw;
+        let Some(snapshot) = self.snapshot.as_deref_mut() else {
+            return Err(RenderError::Unsupported {
+                message: "a destination-dependent blend needs a copy of the destination, which \
+                          this target does not provide"
+                    .to_owned(),
+            });
+        };
+        // The destination is the target's content under the node, so the copy
+        // takes the node's scissor rectangle. The copy's source is the
+        // target, which is the pass's colour attachment, so the pass ends
+        // around it and begins again afterwards.
+        self.pass.end();
+        snapshot.copy_region(
+            self.pass.device,
+            self.pass.command,
+            self.pass.image,
+            scissor,
+        )?;
+        self.pass.begin();
+        let pipeline = self.pipelines.pipeline_for(Program::DstBlend, node.blend)?;
+        let constants = PushConstants {
+            mvp: to_ndc(world, self.extent),
+            tint,
+            uv_rect: uv,
+            mode: dst_blend_mode(kind),
+            opacity,
+            target_size: target_size(self.extent),
+        };
+        // SAFETY: the command buffer is recording and every handle is live.
+        unsafe {
+            self.pass.device.cmd_bind_pipeline(
+                self.pass.command,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline,
+            );
+            self.pass.device.cmd_bind_descriptor_sets(
+                self.pass.command,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.resources.dst_pipeline_layout,
+                0,
+                &[source, snapshot.descriptor_set],
+                &[],
+            );
+            push_constants(
+                self.pass.device,
+                self.pass.command,
+                self.resources.dst_pipeline_layout,
+                &constants,
+            );
+            self.pass
+                .device
+                .cmd_set_scissor(self.pass.command, 0, &[scissor]);
+            self.pass.device.cmd_draw(self.pass.command, 4, 1, 0, 0);
+        }
+        // The destination-dependent program binds its own sets, so the cache
+        // no longer says what is bound.
+        self.cache.invalidate();
         Ok(())
     }
 
@@ -423,6 +683,20 @@ impl Recorder<'_> {
             self.linearize(color[1]),
             self.linearize(color[2]),
             color[3] * opacity,
+        ]
+    }
+
+    /// Converts a straight-alpha node colour into the source tint of a
+    /// destination-dependent draw.
+    ///
+    /// The composed opacity travels in its own push constant, because the
+    /// blend functions mix the source's alpha with the opacity separately.
+    fn source_tint(&self, color: [f32; 4]) -> [f32; 4] {
+        [
+            self.linearize(color[0]),
+            self.linearize(color[1]),
+            self.linearize(color[2]),
+            color[3],
         ]
     }
 
@@ -458,7 +732,7 @@ fn world_bounds(affine: &Affine2, rect: &RectF) -> RectF {
 }
 
 /// Converts a world rect into a clamped integer scissor.
-fn rect_to_scissor(rect: RectF, extent: vk::Extent2D) -> vk::Rect2D {
+fn rect_to_scissor(rect: &RectF, extent: vk::Extent2D) -> vk::Rect2D {
     if rect.is_empty() {
         return vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
@@ -552,7 +826,62 @@ fn to_ndc(affine: &Affine2, extent: vk::Extent2D) -> [f32; 16] {
     ]
 }
 
-/// Clamps an opacity to `[0, 1]`, mapping NaN to `0`.
+/// The inputs of a destination-dependent draw.
+struct DstBlendDraw<'a> {
+    /// The node being drawn.
+    node: &'a RenderNode,
+    /// The node's world transform.
+    world: &'a Affine2,
+    /// The descriptor set of the node's source texture.
+    source: vk::DescriptorSet,
+    /// The source's UV rectangle.
+    uv: [f32; 4],
+    /// The source tint, including the node's alpha.
+    tint: [f32; 4],
+    /// The composed opacity.
+    opacity: f32,
+    /// The destination-dependent blend function.
+    kind: api::blend::DstBlend,
+    /// The node's scissor rectangle.
+    scissor: vk::Rect2D,
+}
+
+/// Records the push constants of one draw.
+///
+/// `layout` must be the layout of the pipeline that is bound, so the
+/// destination-dependent program receives its own layout.
+fn push_constants(
+    device: &ash::Device,
+    command: vk::CommandBuffer,
+    layout: vk::PipelineLayout,
+    constants: &PushConstants,
+) {
+    // SAFETY: `constants` is a live, fully initialized push-constant block.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (constants as *const PushConstants).cast::<u8>(),
+            std::mem::size_of::<PushConstants>(),
+        )
+    };
+    // SAFETY: the command buffer is recording and the bytes are the
+    // push-constant block the pipeline layout reserves.
+    unsafe {
+        device.cmd_push_constants(
+            command,
+            layout,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            0,
+            bytes,
+        );
+    }
+}
+
+/// The size of the target in device pixels.
+fn target_size(extent: vk::Extent2D) -> [f32; 2] {
+    [extent.width as f32, extent.height as f32]
+}
+
+/// Clamps an opacity to `[0, 1]`.
 fn clamp_opacity(opacity: f32) -> f32 {
     if opacity.is_nan() {
         0.0
@@ -607,7 +936,7 @@ mod tests {
         assert!(cache.needs_descriptor(textured_set));
     }
 
-    /// Two textured draws over the same set bind once.
+    /// Two textured draws over one set bind once.
     #[test]
     fn two_textured_draws_over_one_set_bind_once() {
         let textured = vk::Pipeline::from_raw(1);

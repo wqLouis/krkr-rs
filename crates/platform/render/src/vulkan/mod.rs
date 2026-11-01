@@ -18,13 +18,15 @@
 //!   sub-rectangle (`PixelRegion`) copies;
 //! * textured and solid pipelines with per-blend fixed-function state, a
 //!   host-visible unit-quad vertex buffer and per-texture descriptor sets;
+//! * a destination-dependent blend program that mixes a source over a copy of
+//!   the destination, so the modes that fixed-function state cannot express
+//!   are drawn instead of refused;
 //! * a per-frame command buffer and sync objects, and full scene traversal
 //!   with transforms, opacity, scissor clipping and `z` ordering.
 //!
 //! Deferred (reported as [`RenderError::Unsupported`], never silently
 //! degraded):
 //!
-//! * destination-dependent blend modes;
 //! * mask clips (a rectangular clip uses the scissor);
 //! * GPU glyph runs (per-glyph placement is not implemented);
 //! * only mip level 0 is uploaded (no mip generation).
@@ -71,7 +73,7 @@ use crate::{BackendKind, FrameTimings, GpuCapabilities, TextureFormat};
 pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 /// Size of the push-constant block shared with the shaders.
-pub(crate) const PUSH_CONSTANT_SIZE: u32 = 96;
+pub(crate) const PUSH_CONSTANT_SIZE: u32 = 112;
 
 /// Immutable Vulkan mechanism held by [`crate::RenderPipeline`].
 ///
@@ -170,7 +172,7 @@ impl VulkanPipeline {
             backend: BackendKind::Vulkan,
             max_texture_dimension: self.max_texture_dimension,
             preferred_format: self.preferred_format,
-            supports_destination_dependent_blend: false,
+            supports_destination_dependent_blend: true,
             // Offscreen targets are a real GPU path: colour-only render pass,
             // per-format pipelines and `vkCmdCopyImageToBuffer` readback.
             supports_offscreen_targets: true,
@@ -280,12 +282,11 @@ impl VulkanPipeline {
             }
         };
 
-        let pipelines = match pipelines::create(
+        let resources = match pipelines::PipelineResources::create(
             &device_bundle.device,
             &self.memory_properties,
-            swapchain.render_pass,
         ) {
-            Ok(pipelines) => pipelines,
+            Ok(resources) => resources,
             Err(error) => {
                 // SAFETY: tear down everything created above.
                 unsafe {
@@ -298,6 +299,22 @@ impl VulkanPipeline {
             }
         };
 
+        let pipelines =
+            match pipelines::create(&device_bundle.device, swapchain.render_pass, &resources) {
+                Ok(pipelines) => pipelines,
+                Err(error) => {
+                    // SAFETY: tear down everything created above.
+                    unsafe {
+                        resources.destroy(&device_bundle.device);
+                        swapchain.destroy(&device_bundle.device, &swapchain_loader);
+                        swapchain.destroy_render_pass(&device_bundle.device);
+                        device_bundle.device.destroy_device(None);
+                        surface_loader.destroy_surface(surface, None);
+                    }
+                    return Err(error);
+                }
+            };
+
         // From here on the guard owns teardown: any `?` below destroys the
         // device, surface, swapchain, pipelines and whatever else was built.
         let mut teardown = BeginTeardown {
@@ -307,6 +324,7 @@ impl VulkanPipeline {
             surface,
             swapchain: &swapchain,
             pipelines: &pipelines,
+            resources: &resources,
             frames: Vec::new(),
             render_finished: Vec::new(),
             upload: None,
@@ -372,7 +390,10 @@ impl VulkanPipeline {
             window_handle: *window,
             preferred_format: self.preferred_format,
             swapchain,
+            resources,
             pipelines,
+            frame_pass: None,
+            frame_targets: (0..MAX_FRAMES_IN_FLIGHT).map(|_| None).collect(),
             frames,
             fences,
             images_in_flight: vec![vk::Fence::null(); image_count],
@@ -501,7 +522,7 @@ impl VulkanPipeline {
         unsafe {
             let _ = device.device_wait_idle();
         }
-        texture.destroy(&device, vstate.pipelines.descriptor_pool);
+        texture.destroy(&device, vstate.resources.descriptor_pool);
     }
 
     /// Copies a sub-rectangle of `pixels` into `tex`.
@@ -524,9 +545,9 @@ impl VulkanPipeline {
             let gpu = texture::create_texture(
                 &vstate.device,
                 &self.memory_properties,
-                vstate.pipelines.descriptor_set_layout,
-                vstate.pipelines.descriptor_pool,
-                vstate.pipelines.sampler,
+                vstate.resources.descriptor_set_layout,
+                vstate.resources.descriptor_pool,
+                vstate.resources.sampler,
                 *tex.desc(),
             )?;
             vstate.textures.insert(key, gpu);
@@ -684,15 +705,12 @@ impl VulkanPipeline {
             render_targets,
             textures,
             effect,
+            resources,
             ..
         } = vstate;
 
         if let hashbrown::hash_map::Entry::Vacant(entry) = offscreen.entry(format) {
-            entry.insert(target::OffscreenPass::create(
-                device,
-                &self.memory_properties,
-                format,
-            )?);
+            entry.insert(target::OffscreenPass::create(device, format, resources)?);
         }
         let pass = offscreen
             .get(&format)
@@ -708,7 +726,7 @@ impl VulkanPipeline {
             )?);
         }
         let gpu = render_targets
-            .get(&key)
+            .get_mut(&key)
             .ok_or_else(|| RenderError::Framebuffer {
                 message: "render-target state disappeared".to_owned(),
             })?;
@@ -725,7 +743,15 @@ impl VulkanPipeline {
         if let Some(effects) = effect.as_mut() {
             effects.begin_offscreen_frame();
         }
-        let result = target::render(&submit, gpu, pass, textures, effect.as_mut(), scene);
+        let result = target::render(
+            &submit,
+            gpu,
+            pass,
+            resources,
+            textures,
+            effect.as_mut(),
+            scene,
+        );
         if result.is_ok()
             && let Some(effects) = effect.as_mut()
         {
@@ -982,34 +1008,12 @@ impl VulkanPipeline {
             };
             let srgb = format_is_srgb(format);
             let clear = clear_value(scene.background, srgb);
-            let clear_values = [vk::ClearValue {
-                color: vk::ClearColorValue { float32: clear },
-            }];
-            let framebuffer = framebuffers_for(vstate, image_index)?;
-            let render_pass_begin = vk::RenderPassBeginInfo::default()
-                .render_pass(render_pass)
-                .framebuffer(framebuffer)
-                .render_area(render_area)
-                .clear_values(&clear_values);
 
-            // SAFETY: the command buffer is recording; the render pass and
-            // framebuffer are compatible and live.
-            unsafe {
-                device.cmd_begin_render_pass(
-                    command_buffer,
-                    &render_pass_begin,
-                    vk::SubpassContents::INLINE,
-                );
-                let viewport = vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: extent.width as f32,
-                    height: extent.height as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                };
-                device.cmd_set_viewport(command_buffer, 0, &[viewport]);
-            }
+            // The frame is composed into a target of its own and then
+            // presented with a quad, because a destination-dependent blend
+            // needs a copy of the destination and a colour attachment cannot
+            // be a copy's source.
+            ensure_frame_targets(vstate, &self.memory_properties, format, extent)?;
 
             // The frame fence for this slot was waited above when it had work
             // in flight, so the frame that owned the slot has completed: its
@@ -1020,19 +1024,92 @@ impl VulkanPipeline {
                 effects.begin_live_frame(&device, frame_index);
             }
             let effects = vstate.effect.as_mut();
-            draw::record_scene(
-                draw::SceneDraw {
-                    device: &device,
-                    command: command_buffer,
-                    pipelines: &vstate.pipelines,
-                    textures: &vstate.textures,
-                    effects,
-                    render_pass,
-                    extent,
-                    srgb,
-                },
-                scene,
-                &Affine2::IDENTITY,
+            {
+                let Some(pass) = vstate.frame_pass.as_ref() else {
+                    return Err(RenderError::Framebuffer {
+                        message: "the frame target disappeared".to_owned(),
+                    });
+                };
+                let Some(frame) = vstate.frame_targets[frame_index].as_mut() else {
+                    return Err(RenderError::Framebuffer {
+                        message: "the frame target disappeared".to_owned(),
+                    });
+                };
+                // SAFETY: the command buffer is recording.
+                unsafe {
+                    let viewport = vk::Viewport {
+                        x: 0.0,
+                        y: 0.0,
+                        width: extent.width as f32,
+                        height: extent.height as f32,
+                        min_depth: 0.0,
+                        max_depth: 1.0,
+                    };
+                    device.cmd_set_viewport(command_buffer, 0, &[viewport]);
+                }
+                frame.prepare(&device, command_buffer);
+                let render_pass = pass.render_pass;
+                let framebuffer = frame.framebuffer();
+                let image = frame.image();
+                let pipelines = &pass.pipelines;
+                let snapshot = Some(&mut frame.snapshot);
+                draw::record_scene(
+                    draw::SceneDraw {
+                        pass: draw::ScenePass {
+                            device: &device,
+                            command: command_buffer,
+                            render_pass,
+                            framebuffer,
+                            image,
+                            clear,
+                            extent,
+                        },
+                        pipelines,
+                        resources: &vstate.resources,
+                        textures: &vstate.textures,
+                        effects,
+                        snapshot,
+                        extent,
+                        srgb,
+                    },
+                    scene,
+                    &Affine2::IDENTITY,
+                )?;
+                frame.prepare_for_present(&device, command_buffer);
+            }
+
+            // The composed frame is presented with a quad over the swapchain
+            // image.
+            let framebuffer = framebuffers_for(vstate, image_index)?;
+            let clear_values = [vk::ClearValue {
+                color: vk::ClearColorValue { float32: clear },
+            }];
+            let render_pass_begin = vk::RenderPassBeginInfo::default()
+                .render_pass(render_pass)
+                .framebuffer(framebuffer)
+                .render_area(render_area)
+                .clear_values(&clear_values);
+            let Some(frame) = vstate.frame_targets[frame_index].as_ref() else {
+                return Err(RenderError::Framebuffer {
+                    message: "the frame target disappeared".to_owned(),
+                });
+            };
+            // SAFETY: the command buffer is recording; the render pass and
+            // framebuffer are compatible and live.
+            unsafe {
+                device.cmd_begin_render_pass(
+                    command_buffer,
+                    &render_pass_begin,
+                    vk::SubpassContents::INLINE,
+                );
+            }
+            draw::record_present(
+                &device,
+                command_buffer,
+                &vstate.pipelines,
+                &vstate.resources,
+                frame.descriptor_set,
+                extent,
             )?;
 
             // SAFETY: the render pass and command buffer are recording.
@@ -1165,6 +1242,69 @@ impl VulkanPipeline {
     }
 }
 
+/// Makes sure the live frame's targets match the swapchain's extent.
+///
+/// The pass, the pipelines and the targets are created on the first frame and
+/// rebuilt when the swapchain's extent changes. The old ones are freed once
+/// the device is idle, because a frame may still be reading them.
+///
+/// # Errors
+///
+/// Returns [`RenderError::OutOfMemory`] when a resource cannot be created.
+fn ensure_frame_targets(
+    vstate: &mut VulkanState,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    format: vk::Format,
+    extent: vk::Extent2D,
+) -> Result<(), RenderError> {
+    let matches = vstate
+        .frame_targets
+        .first()
+        .and_then(|target| target.as_ref())
+        .is_some_and(|target| target.extent == extent);
+    if matches {
+        return Ok(());
+    }
+    let device = vstate.device.clone();
+    // SAFETY: the device is idle after the wait, so nothing reads the old
+    // targets' resources.
+    unsafe {
+        let _ = device.device_wait_idle();
+    }
+    for slot in vstate.frame_targets.iter_mut() {
+        if let Some(old) = slot.take() {
+            old.destroy(&device, &vstate.resources);
+        }
+    }
+    if let Some(old) = vstate.frame_pass.take() {
+        old.destroy(&device);
+    }
+    let pass = target::FramePass::create(&device, format, &vstate.resources)?;
+    for index in 0..MAX_FRAMES_IN_FLIGHT {
+        match target::FrameTarget::create(
+            &device,
+            memory_properties,
+            format,
+            extent,
+            &vstate.resources,
+            &pass,
+        ) {
+            Ok(target) => vstate.frame_targets[index] = Some(target),
+            Err(error) => {
+                for slot in vstate.frame_targets.iter_mut() {
+                    if let Some(old) = slot.take() {
+                        old.destroy(&device, &vstate.resources);
+                    }
+                }
+                pass.destroy(&device);
+                return Err(error);
+            }
+        }
+    }
+    vstate.frame_pass = Some(pass);
+    Ok(())
+}
+
 /// Immutable surface handle stored in [`Surface`].
 pub(crate) struct VulkanSurface {
     /// Presented Vulkan surface.
@@ -1285,8 +1425,20 @@ pub(crate) struct VulkanState {
     /// only after a frame of the replacement has been presented, or at
     /// teardown.
     retired_swapchain: Option<swapchain::SwapchainState>,
-    /// Compiled pipelines and descriptor resources.
+    /// The descriptor and layout resources every pipeline set shares.
+    pub(crate) resources: pipelines::PipelineResources,
+    /// Compiled pipelines for the swapchain's render pass.
     pub(crate) pipelines: pipelines::PipelineSet,
+    /// The render pass and the pipelines the live frame is composed into.
+    ///
+    /// They are created on the first frame and rebuilt when the swapchain's
+    /// extent changes.
+    pub(crate) frame_pass: Option<target::FramePass>,
+    /// The live frame's targets, one per frame slot.
+    ///
+    /// Every slot has a target of its own, because two frames can be in
+    /// flight and a frame must not write the target the other one presents.
+    pub(crate) frame_targets: Vec<Option<target::FrameTarget>>,
     /// Per-frame command buffers and sync objects.
     pub(crate) frames: Vec<VulkanFrame>,
     /// The frame slots' fences and whether their submissions may still be
@@ -1377,7 +1529,7 @@ impl Drop for VulkanState {
         // the surface before the device.
         unsafe {
             let _ = self.device.device_wait_idle();
-            let descriptor_pool = self.pipelines.descriptor_pool;
+            let descriptor_pool = self.resources.descriptor_pool;
             for texture in self.textures.values() {
                 texture.destroy(&self.device, descriptor_pool);
             }
@@ -1387,10 +1539,17 @@ impl Drop for VulkanState {
             for pass in self.offscreen.values() {
                 pass.destroy(&self.device);
             }
+            for target in self.frame_targets.iter_mut().flatten() {
+                target.destroy(&self.device, &self.resources);
+            }
+            if let Some(pass) = self.frame_pass.take() {
+                pass.destroy(&self.device);
+            }
             if let Some(mut effects) = self.effect.take() {
                 effects.destroy(&self.device);
             }
             self.pipelines.destroy(&self.device);
+            self.resources.destroy(&self.device);
             if let Some(retired) = self.retired_swapchain.take() {
                 // The render pass is shared with the current swapchain.
                 retired.destroy(&self.device, &self.swapchain_loader);
@@ -1426,6 +1585,7 @@ struct BeginTeardown<'a> {
     surface: vk::SurfaceKHR,
     swapchain: &'a swapchain::SwapchainState,
     pipelines: &'a pipelines::PipelineSet,
+    resources: &'a pipelines::PipelineResources,
     frames: Vec<VulkanFrame>,
     render_finished: Vec<vk::Semaphore>,
     upload: Option<texture::UploadRing>,
@@ -1457,6 +1617,7 @@ impl Drop for BeginTeardown<'_> {
                 self.device.destroy_semaphore(*semaphore, None);
             }
             self.pipelines.destroy(self.device);
+            self.resources.destroy(self.device);
             self.swapchain.destroy(self.device, self.swapchain_loader);
             self.swapchain.destroy_render_pass(self.device);
             self.surface_loader.destroy_surface(self.surface, None);

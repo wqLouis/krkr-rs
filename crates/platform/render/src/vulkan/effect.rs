@@ -367,8 +367,8 @@ impl EffectState {
         let blend_slot =
             pipelines::blend_slot(desc.blend).ok_or_else(|| RenderError::Unsupported {
                 message: format!(
-                    "blend mode {:?} requires destination sampling, which the Vulkan backend \
-                     does not implement",
+                    "blend mode {:?} reads the destination, and an effect program is drawn \
+                     with fixed-function blending only",
                     desc.blend
                 ),
             })?;

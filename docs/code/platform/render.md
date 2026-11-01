@@ -262,8 +262,9 @@ An **effect pipeline** is a custom-shader program built for one fixed-function
 blend. `create_effect_pipeline` validates the descriptor here and in the
 backend: the stage code must be SPIR-V this backend accepts, the texture
 bindings must fit the API budget, and the blend must be one the backend can
-build — a destination-dependent blend needs a destination-sampling shader and
-is reported as `RenderError::Unsupported` rather than substituted.
+build — an effect program is drawn with fixed-function blending, so a
+destination-dependent blend is reported as `RenderError::Unsupported` rather
+than substituted.
 
 The handle is immutable and backend-agnostic, like a texture handle: the GPU
 resource lives in the L2-owned `RenderState`. The handle may still be
@@ -370,17 +371,25 @@ Blend state is not a shader concern; it is a per-pipeline
 | `Multiply` | `DST_COLOR` / `ZERO` / `ADD` |
 | `Screen` | `ONE_MINUS_DST_COLOR` / `ONE` / `ADD` |
 
-The eleven destination-dependent modes need to read the destination colour,
-which fixed-function blend state cannot express, so they are **CPU-only
-today**: the Vulkan backend reports `RenderError::Unsupported` rather than
-substituting source-over. The design for the GPU path is the
-offscreen-compositing route — render to a target, copy the target content for
-the quad's `dst` region into a sampled image, and draw with a shader variant
-selected by the `DstBlend` — which is also the mechanism a future GPU
-transition would use.
+The fourteen destination-dependent modes need to read the destination colour,
+which fixed-function blend state cannot express. The Vulkan backend draws them
+with a third program, the **destination blend**: it samples the source and a
+copy of the destination and mixes them itself, so its fixed-function blending
+is disabled and the destination's alpha is held.
 
-Two base programs are prebuilt (a textured quad and a solid quad), so a frame
-never builds pipeline state.
+The copy is the offscreen-compositing route — render to a target, copy the
+target content for the quad's `dst` region into a sampled image, and draw with
+a shader variant selected by the `DstBlend` — which is also the mechanism a
+future GPU transition would use. The live frame therefore composes into a
+target of its own and presents it with a quad: a colour attachment cannot be a
+copy's source, so the copy happens between two render passes over the target,
+and the pass loads the attachment instead of clearing it.
+
+Every frame slot has a target of its own, because two frames can be in flight
+and a frame must not write the target the other one is presenting.
+
+Three base programs are prebuilt (a textured quad, a solid quad and the
+destination blend), so a frame never builds pipeline state.
 
 ### Textures and uploads
 
@@ -464,8 +473,10 @@ A **lost surface is not an error**: it is an event, and `recover_surface`
 rebuilds the surface and the swapchain while everything else in the state is
 untouched, so the caller keeps the game and the VM alive across the recovery.
 
-Nothing degrades silently: a mask clip, a glyph run or a destination-dependent
-blend on the Vulkan backend is `Unsupported`, not source-over.
+Nothing degrades silently: a mask clip or a glyph run on the Vulkan backend is
+`Unsupported`, not source-over. A destination-dependent blend is drawn by the
+destination-blend program; the offscreen-target path, which has no copy of the
+destination to read, refuses it with `Unsupported`.
 
 **Nothing in L2 emits an effect draw yet.** The backend can build an effect
 pipeline and draw `RenderContent::Effect`, but the projection emits
@@ -502,6 +513,9 @@ L2-side registry is documented in [`../engine/shader.md`](../engine/shader.md).
   validation, and the rejected invalid descriptors.
 * `crates/platform/render/src/lib.rs` `mod tests` — the batch upload applying
   every region, and the null frame timings recorded as zero.
+* `crates/platform/render/src/vulkan/pipelines.rs` `mod tests` — every
+  destination-dependent blend having a mode index of its own, so the
+  destination-blend program cannot draw one mode's function for another.
 * `crates/platform/render/src/vulkan/mod.rs` `mod tests` — the Vulkan upload
   batch being **one** submit (or a skip on a machine with no surface). The
   assertion lives inside the crate because the submit counter is a

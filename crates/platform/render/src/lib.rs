@@ -459,9 +459,9 @@ pub fn upload_textures(
 ///
 /// The descriptor is validated here and by the backend: the stage code must be
 /// SPIR-V this backend accepts, the texture bindings must fit the API budget,
-/// and the blend must be one the backend can build (a destination-dependent
-/// blend needs a destination-sampling shader, which is reported as
-/// [`RenderError::Unsupported`] rather than substituted).
+/// and the blend must be one the backend can build (an effect program is drawn
+/// with fixed-function blending, so a destination-dependent mode is reported
+/// as [`RenderError::Unsupported`] rather than substituted).
 ///
 /// # Errors
 ///
@@ -500,8 +500,8 @@ pub fn destroy_effect_pipeline(
 /// Creates an offscreen RGBA8 render target whose resource will live in
 /// `state`.
 ///
-/// Offscreen targets are the primitive behind destination-dependent blends
-/// and pixel readback ([`read_render_target`]).
+/// Offscreen targets are the primitive behind pixel readback
+/// ([`read_render_target`]).
 ///
 /// # Errors
 ///

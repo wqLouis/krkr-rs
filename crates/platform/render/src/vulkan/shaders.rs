@@ -12,6 +12,9 @@
 //! | 0      | `mat4 mvp`| 64    |
 //! | 64     | `vec4 tint`| 16   |
 //! | 80     | `vec4 uv_rect`| 16 |
+//! | 96     | `uint mode`| 4    |
+//! | 100    | `float opacity`| 4 |
+//! | 104    | `vec2 target_size`| 8 |
 
 /// Vertex stage for the unit quad.
 pub(crate) const QUAD_VERT: &[u8] = include_bytes!("../../shaders/quad.vert.spv");
@@ -19,6 +22,8 @@ pub(crate) const QUAD_VERT: &[u8] = include_bytes!("../../shaders/quad.vert.spv"
 pub(crate) const TEXTURED_FRAG: &[u8] = include_bytes!("../../shaders/textured.frag.spv");
 /// Fragment stage that outputs the tint directly.
 pub(crate) const SOLID_FRAG: &[u8] = include_bytes!("../../shaders/solid.frag.spv");
+/// Fragment stage that blends a source over a copy of the destination.
+pub(crate) const DST_BLEND_FRAG: &[u8] = include_bytes!("../../shaders/dst_blend.frag.spv");
 
 /// Converts a little-endian SPIR-V byte blob into 32-bit words.
 pub(crate) fn to_words(bytes: &[u8]) -> Vec<u32> {

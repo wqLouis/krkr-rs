@@ -951,9 +951,9 @@ impl VulkanPipeline {
                 let gpu = create_texture(
                     &vstate.device,
                     &self.memory_properties,
-                    vstate.pipelines.descriptor_set_layout,
-                    vstate.pipelines.descriptor_pool,
-                    vstate.pipelines.sampler,
+                    vstate.resources.descriptor_set_layout,
+                    vstate.resources.descriptor_pool,
+                    vstate.resources.sampler,
                     *upload.texture.desc(),
                 )?;
                 vstate.textures.insert(key, gpu);
