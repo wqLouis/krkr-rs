@@ -593,6 +593,58 @@ fn layer_draws_other_shapes() {
     assert_eq!(env.pixel(dst, 2, 2), [255, 0, 0, 255]);
 }
 
+/// The reference builds a path gradient brush from the path points, the
+/// centre colour, the centre point and the surround colours, and paints it
+/// (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:667-710`).
+/// The port paints the same gradient: the centre colour at the centre point,
+/// the surround colour of the closest path point at the path.
+#[test]
+fn path_gradient_brush_paints_the_centre_and_the_surround_colors() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var pg = new Layer(w, null); \
+         pg.name = 'pg'; \
+         pg.setImageSize(16, 16); \
+         var app = new GdiPlus.Appearance(); \
+         app.addBrush(%[ type: GdiPlus.BrushTypePathGradient, \
+                        points: [[0,0],[16,0],[16,16],[0,16]], \
+                        surroundColors: [0xFFFF0000,0xFFFF0000,0xFFFF0000,0xFFFF0000], \
+                        centerPoint: [8,8], \
+                        centerColor: 0xFF0000FF ], 0, 0); \
+         pg.drawRectangle(app, 0, 0, 16, 16);",
+    );
+    let pg = env.layer_id("pg");
+    // The middle of the gradient carries the centre colour ...
+    let center = env.pixel(pg, 8, 8);
+    assert!(
+        center[2] > 200 && center[0] < 100,
+        "the centre must carry the centre colour, got {center:?}"
+    );
+    // ... and the rim the surround colour of the closest path point.
+    let rim = env.pixel(pg, 0, 0);
+    assert!(
+        rim[0] > 200 && rim[2] < 100,
+        "the rim must carry the surround colour, got {rim:?}"
+    );
+}
+
+/// The reference raises when the path gradient carries no path
+/// (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:671-672`).
+#[test]
+fn path_gradient_without_points_raises() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let error = env
+        .eval("(new GdiPlus.Appearance()).addBrush(%[type: GdiPlus.BrushTypePathGradient], 0, 0)")
+        .expect_err("a path gradient without points must raise");
+    assert!(
+        error.contains("must set poins"),
+        "unexpected message: {error}"
+    );
+}
+
 /// The reference `drawPolygon` resolves its paint source through the
 /// native-instance lookup (`ncbInstanceAdaptor<Appearance>::GetNativeInstance`,
 /// the `NativeInstanceSupport(TJS_NIS_GETINSTANCE, classid)` behind

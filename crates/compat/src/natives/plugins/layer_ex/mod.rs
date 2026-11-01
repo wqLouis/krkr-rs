@@ -467,6 +467,41 @@ pub(super) fn read_points(
     Ok(out)
 }
 
+/// Read an object member as a list of points.
+pub(super) fn read_points_member(
+    host: &Tjs2Engine,
+    id: Tjs2ValueId,
+    name: &str,
+) -> Result<Vec<(f64, f64)>, String> {
+    let array = match host.member(id, name) {
+        Ok(TjsValue::Object) => host
+            .retain_value_detached(&TjsValue::Object)
+            .map_err(|error| format!("LayerEx: {name}: {error}"))?,
+        _ => return Ok(Vec::new()),
+    };
+    let count = match host.member(array.raw_id(), "count") {
+        Ok(TjsValue::Integer(count)) if count >= 0 => count as usize,
+        Ok(TjsValue::Real(count)) if count >= 0.0 => count as usize,
+        _ => return Ok(Vec::new()),
+    };
+    let mut out = Vec::with_capacity(count.min(1 << 20));
+    for index in 0..count {
+        let element = host
+            .member(array.raw_id(), &index.to_string())
+            .map_err(|error| format!("LayerEx: {name}: {error}"))?;
+        match element {
+            TjsValue::Object => {
+                let object = host
+                    .retain_value_detached(&TjsValue::Object)
+                    .map_err(|error| format!("LayerEx: {name}: {error}"))?;
+                out.push(read_point_object(host, &object, name)?);
+            }
+            _ => return Err(format!("LayerEx: {name} element {index} is not a point")),
+        }
+    }
+    Ok(out)
+}
+
 /// Read an array argument as a list of rectangles.
 pub(super) fn read_rects(
     engine: *mut c_void,

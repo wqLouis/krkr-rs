@@ -303,12 +303,19 @@ walk the list in insertion order
 (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:422,767,778,1150`).
 A brush fills the path, a pen strokes it.
 
-The paint kinds the port rasterizes are solid, hatch and linear gradient.
-Texture and path-gradient brushes raise a typed error rather than drawing
+The paint kinds the port rasterizes are solid, hatch, linear gradient and
+path gradient. A texture brush raises a typed error rather than drawing
 nothing. A colour argument is either a number/string (the reference
 `AsInteger` conversion: `void` is 0, strings parse, objects and octets
 raise) or a brush dictionary whose `type` selects the kind
 (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:626-756`).
+
+A path gradient paints the centre colour at the brush's centre point and the
+surround colour of the closest path point at the path; the blend factor is
+the ratio of the distance to the centre point over the distance to the path
+(`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:667-710`). A
+brush without path points raises the reference's `must set poins`, and the
+surround colour count must match the path point count.
 
 ### `Path` keeps one current figure
 
@@ -436,7 +443,8 @@ that raises them.
 | wrong argument type | `Layer.drawPolygon: the argument is not of the Appearance type`, `Layer.drawPath: the argument is not of the Path type`, `Layer.perspectiveCopy: the source is not a Layer` | the native-instance lookup finds no payload of the expected class |
 | numeric conversion | `PointF: x and y must be numbers`, `the argument is not a number`, `GdiPlus.Matrix.Rotate: the argument is not a number` | an object or an octet is passed where the reference `AsReal` / `AsInteger` conversion raises |
 | a shape or a list | `Layer.drawBeziers requires a point array`, `Path.drawRectangles: invalid rectangles` | the point/rectangle array is malformed |
-| unsupported paint | `Appearance.addBrush: texture brushes are not supported by the CPU layer rasterizer`, `Appearance.addPen: path-gradient brushes are not supported by the CPU layer rasterizer`, `Appearance.addBrush: unknown brush type 9` | the brush kind the CPU rasterizer does not implement |
+| unsupported paint | `Appearance.addBrush: texture brushes are not supported by the CPU layer rasterizer`, `Appearance.addBrush: unknown brush type 9` | the brush kind the CPU rasterizer does not implement |
+| a malformed path gradient | `Appearance.addBrush: must set poins`, `Appearance.addBrush: the surround colour count must match the path point count` | the path gradient carries no path, or its surround colours do not match the path |
 | a missing file | `cannot open:<name>`, `blend2d cannot load:<name>` | a font or an image the storage cannot supply |
 | a malformed recording | `record: not a layerExDraw recording`, `record: unsupported version 2`, `record: truncated data`, `record: unknown op tag 7` | a file that is not one of this plugin's recordings |
 | a missing movie | `Layer.openMovie: no movie source installed`, `Layer.openMovie: no video metadata for "movie.mpg"`, `Layer.startMovie: no movie opened` | the host installed no decoded source, the stream has no metadata, or playback was asked for without an open movie |
@@ -451,7 +459,7 @@ missing file.
 
 | file | what it pins |
 |---|---|
-| `crates/compat/tests/layer_ex.rs` | the end-to-end surface: `perspectiveCopy` (identity, a smaller quad, the argument count), the movie surface and its error paths, the movie callbacks as layer members, a movie layer released when the script drops it, the `PointF`/`RectF` value types, `Appearance` with solid and hatch brushes, `Path` construction and drawing, `Layer.clear` and the strokes, the shape draws, the native-instance lookup (no `__handle` member), the game's `ResizeButton` shape, the rejection of a non-`Appearance` argument, the transforms, the image draws, the record round-trip, the `FontInfo` properties and metrics, the text measurement and drawing, the movie audio at the device gain, the audio decode failure, and the `file:` media prefix |
+| `crates/compat/tests/layer_ex.rs` | the end-to-end surface: `perspectiveCopy` (identity, a smaller quad, the argument count), the movie surface and its error paths, the movie callbacks as layer members, a movie layer released when the script drops it, the `PointF`/`RectF` value types, `Appearance` with solid and hatch brushes, the path gradient brush, `Path` construction and drawing, `Layer.clear` and the strokes, the shape draws, the native-instance lookup (no `__handle` member), the game's `ResizeButton` shape, the rejection of a non-`Appearance` argument, the transforms, the image draws, the record round-trip, the `FontInfo` properties and metrics, the text measurement and drawing, the movie audio at the device gain, the audio decode failure, and the `file:` media prefix |
 | `crates/compat/tests/layer_ex_behaviour.rs` | the reference-behaviour parity of the value types: the `GdiPlus` namespace shape and its enum constants, the `PointF`/`RectF` constructor arities, components, derived edges, `Clone`, `Equals`, `Inflate`, `Offset`, `IntersectsWith`, `IsEmptyArea` and the static `Union`, the `FontInfo` arity, property types and metrics, the `Appearance` arities, `clear` and the dictionary defaults, the `Path` arities, the closed areas and an invalid Bézier chain, the `Matrix` arities, `SetElements`, `Invert`, `Multiply`, `Translate` and the array/object conversions, the `Image` factory, accessors, `Clone`, `RotateFlip` and the name-resolution rules, the private-font registration and listing, `perspectiveCopy`, the movie arities, and the record lifecycle |
 | `crates/compat/src/natives/plugins/layer_ex/movie.rs` (unit tests) | the movie playback itself: the layer is sized to the movie and the frames are copied, the callbacks fire through the layer object, and `openMovie` without a host source raises |
 | `crates/compat/tests/runtime_surface.rs` | the live surface: the members `CompatHost::install` registered, frozen by `docs/surface/runtime_surface.json` |
@@ -499,6 +507,14 @@ wrapper classes, which the reference registers through
   reference builds a GDI+ brush from the rectangle and the angle
   (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:725-731`); the
   port's two-colour interpolation is an approximation of it, not a clone.
+* **A path-gradient brush is interpolated from the centre colour to the
+  surround colour of the closest path point.** The reference builds a GDI+
+  `PathGradientBrush` and lets it paint
+  (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:667-710`); the
+  port's ratio of the distance to the centre point over the distance to the
+  path is an approximation of it, not a clone. The focus scales and the wrap
+  mode are not applied, and a surround colour count that does not match the
+  path point count raises instead of painting.
 * **`openMovie` raises where the reference logs.** The reference logs the
   file name followed by `:ファイルが開けません` and returns
   (`reference/cpp/plugins/layerExMovie.cpp:160-166`); the port reports the

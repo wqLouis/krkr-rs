@@ -192,6 +192,22 @@ fn write_paint(writer: &mut Writer, paint: &Paint) {
             writer.f64(p2.0);
             writer.f64(p2.1);
         }
+        Paint::PathGradient {
+            center,
+            center_color,
+            ring,
+        } => {
+            writer.u8(3);
+            writer.bytes(center_color);
+            writer.f64(center.0);
+            writer.f64(center.1);
+            writer.u32(ring.len() as u32);
+            for (point, color) in ring {
+                writer.f64(point.0);
+                writer.f64(point.1);
+                writer.bytes(color);
+            }
+        }
     }
 }
 
@@ -219,6 +235,28 @@ fn read_paint(reader: &mut Reader<'_>) -> Result<Paint, String> {
                 color2: [color2[0], color2[1], color2[2], color2[3]],
                 p1: (reader.f64()?, reader.f64()?),
                 p2: (reader.f64()?, reader.f64()?),
+            })
+        }
+        3 => {
+            let center_color = reader.bytes_vec(4)?;
+            let center = (reader.f64()?, reader.f64()?);
+            let count = reader.u32()? as usize;
+            let mut ring = Vec::with_capacity(count.min(1 << 16));
+            for _ in 0..count {
+                let x = reader.f64()?;
+                let y = reader.f64()?;
+                let color = reader.bytes_vec(4)?;
+                ring.push(((x, y), [color[0], color[1], color[2], color[3]]));
+            }
+            Ok(Paint::PathGradient {
+                center,
+                center_color: [
+                    center_color[0],
+                    center_color[1],
+                    center_color[2],
+                    center_color[3],
+                ],
+                ring,
             })
         }
         other => Err(format!("record: unknown paint tag {other}")),

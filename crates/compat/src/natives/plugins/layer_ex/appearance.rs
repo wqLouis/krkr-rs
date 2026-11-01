@@ -5,8 +5,8 @@
 //! `blend2d/LayerExDraw.hpp` (`class Appearance`). An `Appearance` is *not*
 //! a single brush: every entry is drawn in insertion order, brushes fill and
 //! pens stroke. The port keeps that model and rasterizes the supported paint
-//! kinds (solid, hatch, linear gradient); texture and path-gradient brushes
-//! raise a typed error instead of silently drawing nothing.
+//! kinds (solid, hatch, linear gradient, path gradient); a texture brush
+//! raises a typed error instead of silently drawing nothing.
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
@@ -35,6 +35,16 @@ pub(super) enum Paint {
         color2: [u8; 4],
         p1: (f64, f64),
         p2: (f64, f64),
+    },
+    /// A path gradient: the centre colour at the centre point, fading out to
+    /// the surround colours along the path.
+    PathGradient {
+        /// The brush's centre point.
+        center: (f64, f64),
+        /// The colour at the centre point.
+        center_color: [u8; 4],
+        /// The path: every point with the surround colour at that point.
+        ring: Vec<((f64, f64), [u8; 4])>,
     },
 }
 
@@ -92,7 +102,89 @@ pub(super) fn paint_color_at(paint: &Paint, x: f64, y: f64) -> [u8; 4] {
                 lerp_channel(color1[3], color2[3], t),
             ]
         }
+        Paint::PathGradient {
+            center,
+            center_color,
+            ring,
+        } => {
+            // The path gradient: the colour of a point is the surround
+            // colour of the point of the path closest to it, blended from
+            // the centre colour by the ratio of the distance to the centre
+            // point over the distance to the path.
+            let (distance, color) = nearest_ring_point(ring, x, y);
+            let focus = ((x - center.0).powi(2) + (y - center.1).powi(2)).sqrt();
+            let t = if distance > f64::EPSILON {
+                (focus / distance).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            [
+                lerp_channel(center_color[0], color[0], t),
+                lerp_channel(center_color[1], color[1], t),
+                lerp_channel(center_color[2], color[2], t),
+                lerp_channel(center_color[3], color[3], t),
+            ]
+        }
     }
+}
+
+/// The distance to the closest point of a segment and the parameter of that
+/// point on the segment.
+fn closest_on_segment(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    let (vx, vy) = (b.0 - a.0, b.1 - a.1);
+    let (wx, wy) = (p.0 - a.0, p.1 - a.1);
+    let len2 = vx * vx + vy * vy;
+    let t = if len2 <= f64::EPSILON {
+        0.0
+    } else {
+        ((wx * vx + wy * vy) / len2).clamp(0.0, 1.0)
+    };
+    let dx = p.0 - (a.0 + t * vx);
+    let dy = p.1 - (a.1 + t * vy);
+    ((dx * dx + dy * dy).sqrt(), t)
+}
+
+/// The distance to the closest point of the path and the surround colour
+/// there.
+fn nearest_ring_point(ring: &[((f64, f64), [u8; 4])], x: f64, y: f64) -> (f64, [u8; 4]) {
+    let count = ring.len();
+    let mut best = (f64::MAX, [0u8; 4]);
+    if count == 0 {
+        return best;
+    }
+    for index in 0..count {
+        let (a, a_color) = ring[index];
+        let (b, b_color) = ring[(index + 1) % count];
+        let (distance, t) = closest_on_segment((x, y), a, b);
+        if distance < best.0 {
+            best = (
+                distance,
+                [
+                    lerp_channel(a_color[0], b_color[0], t),
+                    lerp_channel(a_color[1], b_color[1], t),
+                    lerp_channel(a_color[2], b_color[2], t),
+                    lerp_channel(a_color[3], b_color[3], t),
+                ],
+            );
+        }
+    }
+    best
+}
+
+/// The centre of the path's bounding box: the centre point the brush uses
+/// when its dictionary carries none.
+fn path_center(ring: &[((f64, f64), [u8; 4])]) -> (f64, f64) {
+    let mut min_x = f64::MAX;
+    let mut min_y = f64::MAX;
+    let mut max_x = f64::MIN;
+    let mut max_y = f64::MIN;
+    for (point, _) in ring {
+        min_x = min_x.min(point.0);
+        min_y = min_y.min(point.1);
+        max_x = max_x.max(point.0);
+        max_y = max_y.max(point.1);
+    }
+    ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0)
 }
 
 /// Resolve `value` to a solid ARGB color with the reference `AsInteger`
@@ -141,6 +233,31 @@ fn member_f64(host: &Tjs2Engine, id: tjs::Tjs2ValueId, name: &str, default: f64)
         Ok(TjsValue::Real(value)) => value,
         _ => default,
     }
+}
+
+/// Read an object member as a list of colours: the ARGB integers the brush
+/// dictionary's `surroundColors` member holds.
+fn read_colors_member(
+    host: &Tjs2Engine,
+    id: tjs::Tjs2ValueId,
+    name: &str,
+) -> Result<Vec<i64>, String> {
+    let array = match host.member(id, name) {
+        Ok(TjsValue::Object) => host
+            .retain_value_detached(&TjsValue::Object)
+            .map_err(|error| format!("LayerEx: {name}: {error}"))?,
+        _ => return Ok(Vec::new()),
+    };
+    let count = match host.member(array.raw_id(), "count") {
+        Ok(TjsValue::Integer(count)) if count >= 0 => count as usize,
+        Ok(TjsValue::Real(count)) if count >= 0.0 => count as usize,
+        _ => return Ok(Vec::new()),
+    };
+    let mut out = Vec::with_capacity(count.min(1 << 16));
+    for index in 0..count {
+        out.push(member_i64(host, array.raw_id(), &index.to_string(), 0));
+    }
+    Ok(out)
 }
 
 /// The gradient line of the reference `LinearGradientBrush(rect, color1,
@@ -274,9 +391,48 @@ pub(super) fn parse_paint(engine: *mut c_void, value: &Value, what: &str) -> Res
                 2 => Err(format!(
                     "{what}: texture brushes are not supported by the CPU layer rasterizer"
                 )),
-                3 => Err(format!(
-                    "{what}: path-gradient brushes are not supported by the CPU layer rasterizer"
-                )),
+                3 => {
+                    // The path gradient: the brush dictionary's `points`
+                    // member carries the path, `surroundColors` the colour
+                    // at each path point, `centerPoint` the focus and
+                    // `centerColor` the colour there. A brush without a path
+                    // raises the plugin's own `must set poins`.
+                    let points =
+                        super::read_points_member(host.engine(), object.raw_id(), "points")
+                            .map_err(|error| format!("{what}: {error}"))?;
+                    if points.is_empty() {
+                        return Err(format!("{what}: must set poins"));
+                    }
+                    let colors =
+                        read_colors_member(host.engine(), object.raw_id(), "surroundColors")
+                            .map_err(|error| format!("{what}: {error}"))?;
+                    if colors.len() != points.len() {
+                        return Err(format!(
+                            "{what}: the surround colour count must match the path point count"
+                        ));
+                    }
+                    let ring: Vec<((f64, f64), [u8; 4])> = points
+                        .into_iter()
+                        .zip(colors)
+                        .map(|((x, y), color)| ((x, y), argb_to_rgba(color)))
+                        .collect();
+                    let center = match super::read_point_member(
+                        host.engine(),
+                        object.raw_id(),
+                        "centerPoint",
+                    ) {
+                        Ok(Some(center)) => center,
+                        Ok(None) => path_center(&ring),
+                        Err(error) => return Err(format!("{what}: {error}")),
+                    };
+                    let center_color =
+                        argb_to_rgba(member_i64(host.engine(), object.raw_id(), "centerColor", 0));
+                    Ok(Paint::PathGradient {
+                        center,
+                        center_color,
+                        ring,
+                    })
+                }
                 other => Err(format!("{what}: unknown brush type {other}")),
             }
         }
