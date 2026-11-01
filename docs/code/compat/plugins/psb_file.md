@@ -147,6 +147,11 @@ are not copied into a table. The container name is lower-cased from its
 first `.` (`reference/cpp/plugins/psbfile/PSBMedia.cpp:14-20`), so `a.psb`
 and `a.PSB` share one name.
 
+The provider is installed when a container is registered: the `psbfile`
+plugin installs it when it is linked, and the motion player installs it when
+it registers a motion container, because the player reads that container's
+pixel chunks through the media.
+
 ## State and lifetime
 
 * The parsed document lives in the native instance payload; nothing lives in

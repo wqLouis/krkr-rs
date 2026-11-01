@@ -488,7 +488,10 @@ Loading a motion registers the container's resources in the `psb://` storage
 media under the container's name and under its final path component, so a
 nested chunk is reachable by its `/`-joined member path
 (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1425-1432`,
-`reference/cpp/plugins/psbfile/PSBMediaRegistry.cpp:16-77`).
+`reference/cpp/plugins/psbfile/PSBMediaRegistry.cpp:16-77`). The player reads
+the container's pixel chunks through that media, so it installs the media's
+provider with the storage the container was read from — a game that plays a
+motion without linking `psbfile.dll` still gets its textures.
 
 ### The draw pipeline
 

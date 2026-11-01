@@ -180,12 +180,13 @@ pub(crate) fn media(services: &CompatServices) -> Rc<PsbMedia> {
 
 /// Register the `psb://` provider with the attached storage.
 ///
-/// The media is registered when the plugin is linked, because the media needs
-/// the storage namespace it serves. Registering it again replaces the
-/// provider and keeps the containers the media already holds.
+/// The provider is installed when the plugin is linked and when the motion
+/// player registers a container, because the media needs the storage
+/// namespace it serves. Registering it again replaces the provider and keeps
+/// the containers the media already holds.
 pub(crate) fn install_provider(services: &CompatServices) -> Result<(), crate::CompatError> {
     let Some(storage) = services.storage() else {
-        log::warn!("psbfile: no storage is attached; the psb:// media is not served");
+        log::warn!("psb: no storage is attached; the psb:// media is not served");
         return Ok(());
     };
     let media = media(services);

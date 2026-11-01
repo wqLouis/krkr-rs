@@ -20,7 +20,9 @@ use super::helpers::{eval_object, inst_mut, set_retained};
 use super::model::MotionSnapshot;
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
 use crate::natives::plugins::psb_file::container::{PsbDocument, PsbValue, parse_stream};
-use crate::natives::plugins::psb_file::media::{PsbMedia, media as psb_media};
+use crate::natives::plugins::psb_file::media::{
+    PsbMedia, install_provider as install_psb_provider, media as psb_media,
+};
 use crate::natives::plugins::psb_file::normalize_psb_domain;
 use crate::natives::storages::extract_storage_name;
 use crate::natives::system::{resolve, value_as_i64};
@@ -301,6 +303,11 @@ pub(crate) fn read_motion_module(
     let document = Rc::new(parse_stream(&bytes, seed).map_err(|error| error.to_string())?);
     let container = normalize_psb_domain(path);
     register_motion_media(&psb_media(services), Rc::clone(&document), &container);
+    // The player reads the container's pixel chunks through the `psb://`
+    // media, so the media must be served: install its provider with the
+    // storage the container was read from. The media is shared with the
+    // `psbfile` plugin, and both install the provider that serves it.
+    install_psb_provider(services).map_err(|error| error.to_string())?;
     let snapshot = MotionSnapshot::from_psb(&document, &container);
     let id = services.state::<MotionStore>().insert(snapshot);
     let registered = {

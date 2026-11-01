@@ -54,7 +54,23 @@ impl Env {
         Some(Env::build(Some(dir)))
     }
 
+    /// A VM whose storage is the reference `emote` fixture directory and
+    /// whose only linked plugin is the motion player, the way a game that
+    /// plays a motion links it. `None` when the reference checkout is not
+    /// available.
+    fn with_motion_player_only() -> Option<Env> {
+        let dir = testkit::reference_fixture_or_skip("emote")?;
+        Some(Env::build_with_plugins(Some(dir), false))
+    }
+
     fn build(storage_dir: Option<std::path::PathBuf>) -> Env {
+        Env::build_with_plugins(storage_dir, true)
+    }
+
+    /// A VM with the given storage. Without `link_builtins` only the motion
+    /// player is linked, so the `psb://` media it registers is served by the
+    /// motion player alone.
+    fn build_with_plugins(storage_dir: Option<std::path::PathBuf>, link_builtins: bool) -> Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut scene = Box::new(Scene::default());
         let mut storage = storage_dir.map(|dir| {
@@ -76,7 +92,11 @@ impl Env {
             }
         }
         host.install(&engine).expect("install compat surface");
-        common::link_all_builtins(&engine);
+        if link_builtins {
+            common::link_all_builtins(&engine);
+        } else {
+            common::link_plugin(&engine, "motionplayer.dll");
+        }
         Env {
             _host: host,
             engine,
@@ -623,6 +643,33 @@ fn motion_load_registers_nested_psb_resources() {
         .read("psb://e-mote3.0バニラパジャマa.psb/source/body_parts/icon/腕r00/pixel")
         .expect("the per-icon chunk resolves through psb://");
     assert_eq!(icon.len(), 270_140);
+}
+
+/// The motion player serves the `psb://` media it registers.
+///
+/// The player reads a motion container's pixel chunks through the `psb://`
+/// media (`reference/cpp/plugins/motionplayer/RuntimeSupport.cpp:1425-1432`),
+/// so the media's provider is installed with the storage the container was
+/// read from. A game that plays a motion without linking `psbfile.dll` still
+/// gets its textures.
+#[test]
+fn the_motion_player_serves_the_psb_media_it_registers() {
+    let _lock = vm_lock();
+    let Some(env) = Env::with_motion_player_only() else {
+        return;
+    };
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\";"
+    ));
+    let storage = env._storage.as_ref().expect("the fixture storage");
+    let bytes = storage
+        .read("psb://e-mote3.0バニラパジャマa.psb/source/#custom/icon/7/pixel")
+        .expect("the nested icon chunk resolves through psb://");
+    assert_eq!(bytes.len(), 35085);
 }
 
 #[test]
