@@ -581,6 +581,44 @@ fn a_packed_image_is_read_through_the_var_media() {
     );
 }
 
+// The title's route for a graphic whose container holds no province member:
+// the province lookup must not fail the load.
+//
+// The reference finds the province image with an existence check
+// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1662-1682`): a
+// container that does not hold the province member leaves the province name
+// empty, and the load itself succeeds
+// (`reference/cpp/core/visual/LayerIntf.cpp:2847-2875`). The member the
+// container does not hold is a missing storage — the media answers the
+// existence check with the member's kind
+// (`reference/cpp/plugins/varfile.cpp:237-239`) — so the province load
+// leaves the plane empty instead of failing the load. The container's root
+// resource is the chunk's bytes
+// (`reference/cpp/plugins/psbfile/PSBFile.cpp:557-570`).
+#[test]
+fn a_packed_image_without_a_province_member_loads_through_the_var_media() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.install_image_codec();
+    // The container holds the graphic and no province graphic.
+    let image = encode_png(4, 4, &pattern(4, 4));
+    env.write_fixture("packed.psb", &build_fixture_with_chunk(&image));
+
+    env.run(
+        "var packImageMap = %[]; \
+         packImageMap[\"packed.psb\"] = new PSBFile(\"packed.psb\"); \
+         var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.loadImages('var://./packImageMap/packed.psb/root/res');",
+    );
+
+    assert_eq!(
+        env.int("l.provinceImageBufferPitch"),
+        0,
+        "a container without the province member leaves the plane empty"
+    );
+}
+
 // A missing storage raises: the reference's `loadPSBFile` calls
 // `TVPCreateStream`, which throws out of the call
 // (`reference/cpp/plugins/psbfile/PSBFile.cpp:529-534`,

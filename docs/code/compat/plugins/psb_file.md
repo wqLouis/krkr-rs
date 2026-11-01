@@ -192,7 +192,7 @@ stream open raises.
 
 | file | what it pins |
 |---|---|
-| `crates/compat/tests/psb_file.rs` | the container fixture and the header layout, the constructor forms, `load`'s argument handling and its `true` / `false` results, the raising storage failure, the `root` dictionary and the value shapes, the octet resource member (its bytes and its installation without a script round trip), the `psb://` registration of the root-level resources (and the absence of the nested ones), a packed graphic whose province member the container does not hold, the title's route through the `var://` media, and a parse failure keeping the previous document |
+| `crates/compat/tests/psb_file.rs` | the container fixture and the header layout, the constructor forms, `load`'s argument handling and its `true` / `false` results, the raising storage failure, the `root` dictionary and the value shapes, the octet resource member (its bytes and its installation without a script round trip), the `psb://` registration of the root-level resources (and the absence of the nested ones), a packed graphic whose province member the container does not hold, the title's route through the `var://` media (and a packed graphic without a province member read through it), and a parse failure keeping the previous document |
 
 ## Known gaps
 
