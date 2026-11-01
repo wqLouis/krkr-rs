@@ -45,7 +45,10 @@ reference behaviour is the oracle, what is in flight, and where the risk is.
 
 1. **Set direction.** Name the module, the exact files, the reference lines
    and the outcome. The brief says *what* and *where*; the worker works out
-   the *how*.
+   the *how*. If the cause is the **shape** of the code — a duplicated table,
+   an owner in the wrong layer, a seam only one caller uses, a special case —
+   the direction is the shape refactor, not the failing case; the brief's
+   **Shape** line carries it.
 2. **Dispatch disjoint workers.** One coherent change per worker, and no two
    workers writing the same file in one wave. Work is produced in an isolated
    `/tmp/<task>-work` copy or worktree and delivered as `/tmp/<task>.patch`:
@@ -61,7 +64,9 @@ reference behaviour is the oracle, what is in flight, and where the risk is.
    performance claim is only done after a symbol-rich release measurement.
 6. **Integrate.** Delete the superseded path or doc, update the design record
    and commit only after the gate and the tests are green. A worker's report
-   is a proposal, not a completed change.
+   is a proposal, not a completed change. The integrated change leaves the
+   shape that makes the next case natural: one table, one owner, one seam; a
+   patch that makes only the reported case pass is rejected.
 
 **Deletion is part of the change.** When a patch replaces an implementation,
 test, allowlist entry or doc, the superseded one is deleted in the same patch:
@@ -72,17 +77,20 @@ section instead of replacing it.
 
 ### 0.3 A worker's brief
 
-Every worker brief states five things, and is short enough to paste:
+Every worker brief states these things, and is short enough to paste:
 
 ```text
 Goal:        one behavior or cleanup, with the evidence that proves it
+Shape:       the current shape, why the bug is a consequence of it, and the
+             shape the fix must leave behind
 Write:       exact files/directories inside the isolated copy; no other writes
 Work:        /tmp/<task>-work; deliver /tmp/<task>.patch; no repo commit
 Read:        the module, its callers, and the cited reference lines
 Must hold:   invariants, public/script surface, layer boundary
 Do not:      unrelated fixes, new deps, public renames, commits
 Verify:      rustfmt + compiler-free guards only; main runs the gate
-Report:      files, patterns, risk, left alone, blockers
+Report:      files, patterns, the shape problem and the refactor proposal,
+             risk, left alone, blockers
 ```
 
 Parallel workers only run on **disjoint write scopes**; two workers never edit
@@ -96,7 +104,9 @@ When a result arrives, the integrator reads the patch, not only the report: it
 checks the layer boundary, the reference behaviour, the surface lock and the
 task's non-goals, and rejects silent fallbacks, unrelated refactors, new
 dependencies, unreviewed public/script changes, an added path that leaves the
-superseded one in place, and a doc that appends a superseded section. The
+superseded one in place, and a doc that appends a superseded section. A shape
+refactor the brief's **Shape** line called for is in scope; an unrelated
+refactor is not. The
 patch is applied with `git apply --check` and then `git apply --3way`; a patch
 with conflict markers is never accepted.
 
@@ -497,6 +507,13 @@ silent fallback?** Block and fix any of these:
   `house-style` gate has no allowlist exemption for one.
 - A stub `todo!`/`unimplemented!`/approximation in L3 (D32). Android-only stubs
   are the sole exception.
+- **A symptom patch for a shape bug** — a special case for one title, archive,
+  member or game; a second copy of a list or table the owning crate already
+  has; a bypass around the layer that owns the data; an `if` the reference does
+  not have. The change reports the shape problem and lands the refactor that
+  makes the behaviour fall out of the shape: one table, one owner, one seam. A
+  local fix is valid only when the cause is local (a typo, a wrong constant, an
+  off-by-one) and the same shape will express the next case correctly.
 
 Typed errors: one `#[non_exhaustive]` error enum per domain
 (`FsError`, `MediaError`, `RenderError`, `GlyphError`, `AudioError`,
@@ -645,7 +662,13 @@ Two-sided tests:
 6. Superseded code, tests, allowlist entries and docs are deleted in the same
    change; nothing is left as a compatibility shim, a dead branch or a stale
    section.
-7. The integrator's full gate is green.
+7. If the cause is the shape of the code — a missing abstraction, a duplicated
+   table or list, an owner in the wrong layer, a seam only one caller uses —
+   the change reports the shape problem and lands the refactor that makes the
+   behaviour natural; a symptom-only patch is not done. A refactor too large
+   for one change lands its first coherent step (no shim, no special case) and
+   records the rest.
+8. The integrator's full gate is green.
 
 ---
 

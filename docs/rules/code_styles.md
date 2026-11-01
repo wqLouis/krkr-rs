@@ -158,6 +158,15 @@ Accept owned or borrowed input generically where it removes caller noise:
   `Eq` requires no floats.
 * A generic is justified when it removes a real allocation, a conversion or
   duplication at the call site — not to show off.
+* **A shape bug is fixed by the shape, not by a case.** When the divergence is
+  the consequence of a duplicated table or list, an owner in the wrong layer, a
+  seam with one caller, or a special case the reference does not have, the
+  change reports the shape problem and lands the refactor that makes the
+  behaviour fall out of the shape — one table, one owner, one seam. A local fix
+  stays valid only when the cause is local (a typo, a wrong constant, an
+  off-by-one) and the same shape will express the next case correctly. A
+  refactor too large for one change lands its first coherent step, never a shim
+  or a special case.
 
 ### 3.5 Macros and traits
 
