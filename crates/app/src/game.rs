@@ -49,8 +49,7 @@ pub enum GameError {
     /// A storage probe failed while resolving the startup sequence.
     #[error("game: {0}")]
     Storage(#[from] engine::storage::StorageReadError),
-    /// The searched `startup.tjs` failed and no `system/Initialize.tjs`
-    /// fallback exists.
+    /// The searched `startup.tjs` failed.
     #[error("startup: {script}: {error}")]
     Startup {
         /// The startup script that failed.
@@ -1092,8 +1091,9 @@ fn run_startup_script(
 /// Runs the resolved startup sequence.
 ///
 /// `patch.tjs` and `AfterStartup.tjs` are app-path only and non-fatal (their
-/// errors are reported but do not stop startup); `startup.tjs` is searched and
-/// falls back to `system/Initialize.tjs` when it is absent or fails.
+/// errors are reported but do not stop startup); `startup.tjs` is searched and,
+/// when it is absent, `system/Initialize.tjs` is the boot script. A startup
+/// script that is present and fails is reported, never retried.
 fn run_startup(
     vm: &VmHost,
     storage: &Storage,
@@ -1109,23 +1109,10 @@ fn run_startup(
     match &plan.startup {
         Some(startup) => {
             if let Err(error) = run_startup_script(vm, storage, startup, stats) {
-                match &plan.fallback {
-                    Some(fallback) => {
-                        log::warn!("startup: {startup} failed ({error}); running {fallback}");
-                        run_startup_script(vm, storage, fallback, stats).map_err(|error| {
-                            GameError::Startup {
-                                script: fallback.clone(),
-                                error,
-                            }
-                        })?;
-                    }
-                    None => {
-                        return Err(GameError::Startup {
-                            script: startup.clone(),
-                            error,
-                        });
-                    }
-                }
+                return Err(GameError::Startup {
+                    script: startup.clone(),
+                    error,
+                });
             }
         }
         None => match &plan.fallback {
@@ -1783,6 +1770,34 @@ mod tests {
             "an archive that is not mounted holds no boot script"
         );
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A present `startup.tjs` that fails is reported with its own error,
+    /// never retried through the `system/Initialize.tjs` boot script.
+    ///
+    /// The reference runs `system/Initialize.tjs` when `startup.tjs` is
+    /// absent (`reference/cpp/core/base/ScriptMgnIntf.cpp:958-965`); a
+    /// startup script that exists and fails is the error.
+    #[test]
+    fn a_failing_startup_is_reported_not_retried() {
+        let _lock = vm_lock();
+        let base = unique_temp_dir("startup-failure");
+        std::fs::create_dir_all(base.join("system")).expect("game dir");
+        std::fs::write(base.join("startup.tjs"), b"@@@ not a TJS statement @@@\n")
+            .expect("write the startup script");
+        std::fs::write(base.join("system/Initialize.tjs"), "// the boot script\n")
+            .expect("write the boot script");
+        let host = crate::Host::new(crate::HostConfig::headless()).expect("headless host");
+        let error = GameHost::open(host, Vec::new(), base.clone())
+            .err()
+            .expect("a failing startup script is an error");
+        match error {
+            GameError::Startup { script, .. } => {
+                assert_eq!(script, "startup.tjs", "the failing script is reported");
+            }
+            other => panic!("expected a startup error, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -1591,7 +1591,7 @@ pub struct StartupPlan {
     pub patch: Option<String>,
     /// `startup.tjs`, the main searched startup script.
     pub startup: Option<String>,
-    /// `system/Initialize.tjs`, run when `startup.tjs` is absent or fails.
+    /// `system/Initialize.tjs`, run when `startup.tjs` is absent.
     pub fallback: Option<String>,
     /// `AfterStartup.tjs`, executed last when present (app-path only).
     pub after: Option<String>,
@@ -3095,8 +3095,8 @@ impl Storage {
     ///
     /// Pure storage lookups: `patch.tjs` and `AfterStartup.tjs` are
     /// project-directory only (disk, no archive search), while `startup.tjs`
-    /// and the `system/Initialize.tjs` fallback are searched across disk and
-    /// archives.
+    /// and the `system/Initialize.tjs` boot script (run when `startup.tjs`
+    /// is absent) are searched across disk and archives.
     ///
     /// # Errors
     ///

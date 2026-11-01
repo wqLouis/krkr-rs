@@ -187,10 +187,11 @@ the reference order:
 
 1. **`patch.tjs`** — project directory only, no search. A failure is
    reported and startup continues.
-2. **`startup.tjs`** — searched across the storage. When it fails and the
-   plan carries a `system/Initialize.tjs` fallback, the fallback runs; when
-   it fails and there is no fallback, the open fails with
-   `GameError::Startup`.
+2. **`startup.tjs`** — searched across the storage. When it is absent,
+   `system/Initialize.tjs` is the boot script in its place
+   (`reference/cpp/core/base/ScriptMgnIntf.cpp:958-965`). A
+   `startup.tjs` that is present and fails is never retried: the open fails
+   with `GameError::Startup` and the startup script's own error.
 3. **`AfterStartup.tjs`** — project directory only. A failure is reported
    and startup continues.
 
@@ -287,7 +288,7 @@ is no predecessor to attribute.
 |---|---|
 | `GameError::Mount` | an explicitly named archive could not be mounted |
 | `GameError::Storage` | a storage probe failed while resolving the startup sequence |
-| `GameError::Startup { script, error }` | the startup script failed and no fallback exists |
+| `GameError::Startup { script, error }` | the searched startup script failed; the boot script runs only when `startup.tjs` is absent |
 | `GameError::NoStartup` | no `startup.tjs` and no `system/Initialize.tjs` fallback were found |
 | `GameError::Host` | a render action failed |
 | `GameError::Audio` | the L1 audio device could not be opened or written |
