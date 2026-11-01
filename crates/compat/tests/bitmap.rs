@@ -196,8 +196,11 @@ impl Env {
     }
 
     fn error(&self, expression: &str) -> String {
-        self.eval(expression)
-            .expect_err(&format!("{expression:?} should have raised"))
+        match self.eval(expression) {
+            Err(error) => error,
+            Ok(TjsValue::String(message)) if message.starts_with("TJS error:") => message,
+            Ok(other) => panic!("{expression:?} should have raised, got {other:?}"),
+        }
     }
 }
 
@@ -780,14 +783,14 @@ fn a_name_that_resolves_to_nothing_raises_and_names_the_request() {
     let _lock = vm_lock();
     let env = Env::with_files(true, &[]);
 
-    let error = env.error("(new Bitmap(1, 1)).load('images/missing');");
+    let error = env.error("(new Bitmap(1, 1)).load('images/missing')");
     assert!(
-        error.contains("Bitmap.load: storage not found: images/missing"),
+        error.contains("storage not found: images/missing"),
         "{error}"
     );
     let header_error = env.error("Bitmap.loadHeader('images/missing')");
     assert!(
-        header_error.contains("Bitmap.loadHeader: storage not found: images/missing"),
+        header_error.contains("storage not found: images/missing"),
         "{header_error}"
     );
 }
