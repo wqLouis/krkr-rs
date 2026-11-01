@@ -176,7 +176,9 @@ failure raises there.
 The load decodes on the calling thread when:
 
 * **no pool is attached** — the host installed no decode pool;
-* the load is a **province** load (`DecodedImageMode::Province`);
+* the load is a **province** load (`DecodedImageMode::Province`) — the
+  province plane is the image's own 8-bit sample, so it is decoded apart from
+  the colour image, through the host's index-plane decoder;
 * the **pool refused the job** — the queue was full, the memory limit would
   be exceeded, or the size accounting did not fit. The refusal is logged with
   the limit it refused the job against, and the load decodes synchronously.

@@ -162,21 +162,18 @@ pub(crate) fn set_index_plane_decoder(
     services.state::<IndexPlaneDecoder>().decoder = Some(Rc::new(decoder));
 }
 
-/// Decode the 8-bit index plane of `bytes` through the installed decoder.
+/// The installed index-plane decoder, if the host installed one.
 ///
 /// A host that installed no decoder gets a typed error instead of a colour
 /// image: the plane is not the image's colour.
-fn decode_index_plane(
+fn installed_index_plane_decoder(
     services: &CompatServices,
-    name: &str,
-    bytes: &[u8],
-) -> Result<DecodedImage, String> {
+) -> Result<Rc<IndexPlaneDecodeFn>, String> {
     let decoder = {
         let state = services.state::<IndexPlaneDecoder>();
         state.decoder.clone()
     };
-    let decoder = decoder.ok_or_else(|| "no index-plane decoder is installed".to_string())?;
-    decoder(bytes, Some(name))
+    decoder.ok_or_else(|| "no index-plane decoder is installed".to_string())
 }
 
 /// Probe image bytes through the installed host prober.
@@ -327,7 +324,8 @@ pub(crate) fn decode_storage_image_uncached(
         DecodedImageMode::Province => {
             // The province plane is the image's own 8-bit sample; the color
             // key does not apply to it.
-            let image = decode_index_plane(services, &resolved, &bytes)?;
+            let decoder = installed_index_plane_decoder(services)?;
+            let image = decoder(&bytes, Some(resolved.as_str()))?;
             if !image.is_consistent() {
                 return Err(ImageLoadError::Message(
                     "the decoded image is malformed".to_string(),

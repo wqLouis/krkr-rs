@@ -105,7 +105,7 @@ pixels than its buffer holds answers `0` like a missing one. The writes
 |---|---|
 | `independProvinceImage([copy])` | allocates the layer's 8-bit province plane; the default keeps the existing content, `copy = false` clears it. |
 | `loadImages(name[, key])` | reads and probes the storage image, queues the decode in the L2 pool when possible, and installs it as the layer's main image (a pending bitmap until the pixels land). Returns `null` — the reference's absent metainfo. |
-| `loadProvinceImage(name)` | loads an 8-bit province plane sized to the main image. A smaller image is tiled up to that size; a larger one is a size mismatch. The **red channel** of every pixel becomes the province value. |
+| `loadProvinceImage(name)` | loads an 8-bit province plane sized to the main image. A smaller image is tiled up to that size; a larger one is a size mismatch. The plane is the image's own 8-bit sample — the **palette index** of a palettized image, not the colour the palette maps it to — and its value becomes the province value. |
 | `saveLayerImage(name[, type])` | encodes the main image through the host encoder and writes it through the storage. `type` defaults to `"bmp"`. The main image is **resolved first** — a pending decode is waited for — and an image that declares more pixels than its buffer holds raises instead of encoding an empty image. |
 | `drawText(x, y, text, color[, opacity[, antialias[, shadowLevel[, shadowColor[, shadowWidth[, shadowOffsetX[, shadowOffsetY]]]]]]])` | rasterizes a text run into the layer's main image. The main image is **resolved first** and validated, so the text lands on the decoded pixels; an image that declares more pixels than its buffer holds raises. |
 | `drawGlyph(x, y, glyph, color[, …same optionals…])` | the same, but the text comes from the glyph object's `text`/`char`/`character` member. |
@@ -366,9 +366,18 @@ tiled to the main size, so the resulting plane always matches it. A larger
 image raises
 `"the province image is {w}x{h} but the main image is {mw}x{mh}"`. The layer's
 plane is allocated before the load and dropped when the load or the size check
-fails, so a previous plane never survives a failed load. The **red channel** of
-every pixel becomes the province value. A layer with no main image raises
-`"the layer has no main image"`.
+fails, so a previous plane never survives a failed load. A layer with no main
+image raises `"the layer has no main image"`.
+
+The load reads the image's **8-bit index plane**, not its colour: the palette
+index of a palettized image, the gray level of a grayscale one. The plane
+travels as a gray image, so its **red channel** is the province value. A map
+region is therefore addressed by its index, and an image whose colours carry no
+such plane (a truecolour image) raises instead of answering a colour.
+
+The plane comes from the host's index-plane decoder
+(`CompatHost::set_index_plane_decoder`); without one the load raises
+`"no index-plane decoder is installed"`.
 
 ### `saveLayerImage(name[, type])`
 
@@ -436,7 +445,7 @@ as the layer-bound `Font` wrapper.
 | State | Owner |
 |---|---|
 | the pixel data (the main image) | L2 `Scene` → `BitmapState` (straight-alpha RGBA8) |
-| the province plane | L2 `Scene`, per layer — an 8-bit plane separate from the RGBA bitmap |
+| the province plane | L2 `Scene`, per layer — an 8-bit plane separate from the RGBA bitmap, filled from the image's index plane |
 | the geometry, the clip, the face, `holdAlpha`, the blend, `neutralColor`, `imageModified` | L2 `Scene` → `LayerState` |
 | the decoded-image cache | L2 `Scene`, keyed by (name, colour key, mode, width, height) |
 | the layer's `Font` object | the L3 `LayerInst` payload |

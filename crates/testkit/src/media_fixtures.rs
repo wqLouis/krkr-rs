@@ -31,6 +31,19 @@ pub fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Encodes an 8-bit gray buffer as PNG in memory.
+///
+/// A grayscale PNG carries an 8-bit plane of its own — the gray level of
+/// every pixel — which is what a province image reads.
+pub fn encode_gray_png(width: u32, height: u32, gray: &[u8]) -> Vec<u8> {
+    use image::ImageEncoder;
+    let mut out = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut out)
+        .write_image(gray, width, height, image::ExtendedColorType::L8)
+        .expect("gray png encode");
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic audio fixture (minimal valid PCM WAV)
 // ---------------------------------------------------------------------------

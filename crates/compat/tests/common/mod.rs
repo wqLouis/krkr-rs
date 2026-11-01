@@ -283,6 +283,20 @@ impl Env {
             .expect_err(&format!("{expression:?} should have raised"))
     }
 
+    /// Install the index-plane decoder the province load composes.
+    ///
+    /// The province plane is the image's own 8-bit sample — the palette
+    /// index of a palettized image, the gray level of a grayscale one — so it
+    /// is decoded apart from the colour image. The closure is the host's: a
+    /// test that drives the real L1 decoder passes it in, and the harness
+    /// keeps no codec of its own.
+    pub fn install_index_plane_decoder(
+        &self,
+        decode: impl Fn(&[u8], Option<&str>) -> Result<DecodedImage, String> + 'static,
+    ) {
+        self._host.set_index_plane_decoder(decode);
+    }
+
     /// Install a synthetic image codec whose decode closure appends the
     /// resolved storage name to `hints` and returns a fixed 2x2 straight-
     /// alpha RGBA test image, replacing any codec installed earlier.

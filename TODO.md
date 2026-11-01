@@ -354,6 +354,25 @@ residuals:
   (`natives/image_function.rs`). Closing this needs the reference's kernel
   to be settled first.
 
+* **A province image with no 8-bit index plane raises instead of producing
+  one.** The province plane is the image's own 8-bit sample — the palette
+  index of a palettized image, the gray level of a grayscale one — and the
+  port reads it through the L1 index-plane decode
+  (`crates/platform/media/src/image_decode.rs`, `decode_index_plane`), which
+  raises `MediaError::Unsupported` for a truecolour image, for an image with
+  an alpha channel and for every non-PNG format. The reference loads the
+  province image as a palettized bitmap whose plane keeps the palette
+  indexes (`reference/cpp/core/visual/LayerIntf.cpp:2893-2914`,
+  `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1709,1838`) and the PNG
+  loader leaves the 8-bit plane alone
+  (`reference/cpp/core/visual/LoadPNG.cpp:278-290,1092-1116`); what the
+  reference does with a 24-bit province image could not be read here, so the
+  port does not guess a conversion and does not read a colour as a plane.
+  Recorded as an approximation with its reference gap (D36): a game whose
+  province image is a truecolour PNG fails the load where the reference
+  produces a plane. The palettized and grayscale cases — the ones a map
+  image uses — are exact.
+
 ## 5. Dialogs and popups
 
 The reference draws its own popup: `MenuItem.popup` calls `TVPShowPopMenu` and

@@ -52,6 +52,16 @@ The crate type is `cdylib` and the library name is `krkr_android`, which must
 match `android.app.lib_name` in the manifest — that is how the AGDK
 `GameActivity` finds the native entry point.
 
+The compatibility seams the natives compose — the image codec with its
+index-plane decoder, the audio decoder, the video source and the font
+directories — are installed by the shared `app` composition path
+(`app::GameHost::open_with_preload`, `crates/app/src/game.rs`), which this
+root drives. The compatibility host itself is created inside `GameHost`, so
+the root installs no seam of its own; the index-plane decoder the province
+load reads comes from the shared installer. The `media` backend is the same
+crate with the Android video feature selected, so the image decode is the
+same code on both platforms.
+
 Everything that touches Android is target-scoped, so on a desktop host the
 crate compiles to just the (host-tested) state, log-file, config, gesture and
 JNI-field modules, and the desktop dependency graph is unchanged.

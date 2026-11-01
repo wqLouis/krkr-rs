@@ -69,6 +69,7 @@ pub fn game_archives(dir: &Path) -> io::Result<Vec<PathBuf>>;
 // media fixtures
 pub fn pattern(width: u32, height: u32) -> Vec<u8>;
 pub fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8>;
+pub fn encode_gray_png(width: u32, height: u32, gray: &[u8]) -> Vec<u8>;
 pub fn tiny_wav_mono(samples: &[i16], sample_rate: u32) -> Vec<u8>;
 pub fn test_image(w: usize, h: usize) -> Vec<u8>;
 pub fn encode_tlg5(img: &[u8], w: usize, h: usize, colors: usize, blockheight: usize) -> Vec<u8>;

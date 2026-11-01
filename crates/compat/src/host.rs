@@ -106,6 +106,23 @@ impl CompatHost {
             .set_codec(decode, probe, save);
     }
 
+    /// Install the host decoder that reads an image's 8-bit index plane.
+    ///
+    /// The province plane is the image's own 8-bit sample — the palette index
+    /// of a palettized image, the gray level of a grayscale one — and not the
+    /// colour the palette maps it to, so it needs its own decode. The plane
+    /// travels as a gray image: every pixel's red, green and blue channels
+    /// carry the plane value.
+    ///
+    /// A host that installed no decoder makes a province load raise a typed
+    /// error instead of reading the image's colour.
+    pub fn set_index_plane_decoder(
+        &self,
+        decode: impl Fn(&[u8], Option<&str>) -> Result<api::media::DecodedImage, String> + 'static,
+    ) {
+        crate::natives::visual::set_index_plane_decoder(self.services(), decode);
+    }
+
     /// Install the host's system-font directories on the shared text engine.
     ///
     /// The directories are scanned lazily, the first time a face is resolved

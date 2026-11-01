@@ -1426,6 +1426,7 @@ dependencies = [
  "image",
  "log",
  "ndk",
+ "png",
  "symphonia",
  "symphonia-adapter-libopus",
  "testkit",

@@ -29,7 +29,7 @@ use engine::Storage;
 use engine::imagedecode::{ImageDecodeError, ImageDecoder};
 use engine::storage::local_name_in;
 use fs::FileSystem;
-use media::{Media, decode_image, encode_image, probe_image};
+use media::{Media, decode_image, decode_index_plane, encode_image, probe_image};
 
 use crate::startup::StartupStats;
 
@@ -37,6 +37,8 @@ use crate::startup::StartupStats;
 ///
 /// * `Bitmap.load`/`loadAsync` decode through [`media::decode_image`];
 /// * `Bitmap.loadHeader` probes through [`media::probe_image`];
+/// * `Layer.loadProvinceImage` reads the 8-bit index plane through
+///   [`media::decode_index_plane`];
 /// * `Bitmap.save` encodes through [`media::encode_image`] and writes the
 ///   bytes under `storage`'s game directory, so `Storage::read` (and thus a
 ///   later `load`) can read the saved image back.
@@ -50,6 +52,21 @@ use crate::startup::StartupStats;
 pub fn install_image_codec(host: &CompatHost, media: &Media, storage: &Storage) {
     let stats = StartupStats::new();
     install_image_codec_metered(host, media, storage, &stats);
+}
+
+/// The host decoder that reads an image's 8-bit index plane.
+///
+/// The province plane is the image's own 8-bit sample — the palette index of
+/// a palettized image, the gray level of a grayscale one — and not the colour
+/// the palette maps it to, so it is decoded apart from the colour image. The
+/// plane travels as a gray image: every pixel's red, green and blue channels
+/// carry the plane value.
+///
+/// The closure owns a stateless media backend, so it is safe to install on
+/// any host and from any thread that owns the compatibility host.
+fn index_plane_decoder() -> impl Fn(&[u8], Option<&str>) -> Result<DecodedImage, String> + 'static {
+    let media = Media::new();
+    move |bytes, hint| decode_index_plane(&media, bytes, hint).map_err(|error| error.to_string())
 }
 
 /// Installs the image codec with the shared [`StartupStats`] counter set.
@@ -98,6 +115,9 @@ fn install_image_codec_on_metered(
             write_storage_file(&fs, &base, name, &bytes)
         },
     );
+    // The province plane is the image's own 8-bit sample, so it is decoded
+    // apart from the colour image.
+    host.set_index_plane_decoder(index_plane_decoder());
 }
 
 /// The image codec the L2 decode pool drives.

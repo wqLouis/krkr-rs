@@ -1,7 +1,7 @@
 //! Integration tests for the image format router (`probe_image`/`decode_image`).
 
 use api::error::MediaError;
-use media::{Media, decode_image, encode_image, probe_image};
+use media::{Media, decode_image, decode_index_plane, encode_image, probe_image};
 use testkit::{encode_png, encode_tlg6, pattern, test_image};
 
 /// Encodes an RGBA8 buffer as JPEG in memory.
@@ -195,4 +195,64 @@ fn large_images_decode_without_a_configured_size_cap() {
     let media = Media::new();
     let decoded = decode_image(&media, &png, Some("wide.png")).expect("large PNG must decode");
     assert_eq!((decoded.width, decoded.height), (width, 1));
+}
+
+/// Encodes an indexed (palettized) PNG in memory.
+///
+/// The palette maps every index to a gray ramp, so no channel of the colour
+/// equals its index: a decode that applied the palette (or that read the red
+/// channel of the expanded image) would answer something else than the index.
+fn encode_indexed_png(width: u32, height: u32, indices: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Indexed);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut palette = Vec::new();
+        for index in 0..=255u8 {
+            palette.extend_from_slice(&[255 - index, 255 - index, 255 - index]);
+        }
+        encoder.set_palette(palette);
+        let mut writer = encoder.write_header().expect("png header");
+        writer.write_image_data(indices).expect("png data");
+        writer.finish().expect("png finish");
+    }
+    out
+}
+
+/// The index plane of a palettized PNG is the palette index, not the colour
+/// the palette maps it to.
+#[test]
+fn the_index_plane_keeps_the_palette_index() {
+    let media = Media::new();
+    let png = encode_indexed_png(3, 1, &[16, 17, 18]);
+    let plane = decode_index_plane(&media, &png, Some("map.png")).expect("index plane");
+    assert_eq!((plane.width, plane.height), (3, 1));
+    // The plane travels as a gray image: every channel carries the value.
+    assert_eq!(plane.rgba[0], 16);
+    assert_eq!(plane.rgba[1], 16);
+    assert_eq!(plane.rgba[2], 16);
+    assert_eq!(plane.rgba[3], 255);
+    assert_eq!(plane.rgba[4], 17);
+    assert_eq!(plane.rgba[8], 18);
+    // The palette's red channel for index 16 is 239: a decode that applied the
+    // palette would answer that instead of the index.
+    assert_ne!(plane.rgba[0], 239);
+}
+
+/// A colour image has no index plane, so the decode raises instead of
+/// answering a colour.
+#[test]
+fn an_image_without_an_index_plane_is_unsupported() {
+    let media = Media::new();
+    let png = encode_png(2, 2, &pattern(2, 2));
+    assert!(matches!(
+        decode_index_plane(&media, &png, Some("map.png")),
+        Err(MediaError::Unsupported { .. })
+    ));
+    // A file that is not a PNG carries no plane either.
+    assert!(matches!(
+        decode_index_plane(&media, b"not an image", None),
+        Err(MediaError::Unsupported { .. })
+    ));
 }

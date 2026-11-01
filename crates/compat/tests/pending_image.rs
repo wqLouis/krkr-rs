@@ -30,6 +30,19 @@ fn image() -> DecodedImage {
     )
 }
 
+/// The image the synthetic index-plane decoder produces.
+///
+/// The province plane is the image's own 8-bit sample, and it travels as a
+/// gray image: every channel carries the plane value. The values are the red
+/// channel of [`image`], so the plane reads 1, 4, 7 and 10.
+fn plane_image() -> DecodedImage {
+    DecodedImage::new(
+        2,
+        2,
+        vec![1, 1, 1, 255, 4, 4, 4, 255, 7, 7, 7, 255, 10, 10, 10, 255],
+    )
+}
+
 /// The packed word of the first pixel of [`image`], as `Bitmap.getPixel` and
 /// `Layer.getMainPixel` report it: both members mask the alpha away and hand
 /// back the word of the RGBA planes, read little-endian, so the red is in the
@@ -145,6 +158,7 @@ impl Env {
             },
             |_name, _type, _width, _height, _rgba| Ok(()),
         );
+        host.set_index_plane_decoder(|_bytes, _hint| Ok(plane_image()));
         let mut pool = pool.map(|config| {
             Box::new(
                 DecodePool::new(Arc::new(FixedDecoder), config).expect("start the decode pool"),
@@ -726,9 +740,9 @@ fn a_smaller_province_image_is_tiled_to_the_main_image() {
     );
     // The plane is the main size, not the 2x2 image's.
     assert_eq!(env.eval_int("l.provinceImageBufferPitch"), 5);
-    // The red channel of the 2x2 image (1 4 / 7 10) repeats across both axes;
-    // the last column and row are the partial tile, which the reference fills
-    // from the start of the source.
+    // The plane values of the 2x2 image (1 4 / 7 10) repeat across both
+    // axes; the last column and row are the partial tile, which the
+    // reference fills from the start of the source.
     assert_eq!(env.eval_int("l.getProvincePixel(0, 0)"), 1);
     assert_eq!(env.eval_int("l.getProvincePixel(1, 0)"), 4);
     assert_eq!(env.eval_int("l.getProvincePixel(2, 0)"), 1);

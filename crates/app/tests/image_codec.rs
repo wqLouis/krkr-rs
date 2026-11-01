@@ -15,7 +15,7 @@ use compat::CompatHost;
 use engine::{Scene, Storage};
 use fs::FileSystem;
 use media::{Media, decode_image, encode_image};
-use testkit::vm_lock;
+use testkit::{encode_gray_png, vm_lock};
 use tjs::Tjs2Engine;
 
 /// Deterministic RGBA8 pattern used as the source image.
@@ -150,4 +150,64 @@ fn bitmap_save_resolves_a_lowercased_absolute_name_to_the_real_path() {
     );
 
     std::fs::remove_dir_all(root.parent().expect("temporary root")).expect("remove temp game");
+}
+
+/// The composition root's codec installation provides the **index-plane**
+/// decoder, which the province load composes.
+///
+/// The province plane is the image's own 8-bit sample — the palette index of a
+/// palettized image, the gray level of a grayscale one — so it is decoded
+/// apart from the colour image. A host that installed only the colour codec
+/// would make every province load raise
+/// `"no index-plane decoder is installed"`.
+///
+/// The Android root installs the same decoder on the game's compatibility
+/// host (`app::index_plane_decoder`), so a province load there reads the
+/// same plane.
+#[test]
+fn the_installed_codec_provides_the_index_plane_decoder() {
+    let _lock = vm_lock();
+
+    // A grayscale PNG: its plane is the gray level of every pixel.
+    let gray = [16u8, 32, 48, 64];
+    let plane = encode_gray_png(2, 2, &gray);
+
+    let fs = FileSystem::memory();
+    write_memory_file(&fs, "/plane.png", &plane);
+    let mut storage = Box::new(
+        Storage::mount_archives(fs, "/", std::iter::empty::<&str>()).expect("mount storage"),
+    );
+
+    let engine = Box::new(Tjs2Engine::new().expect("create engine"));
+    let mut scene = Box::new(Scene::default());
+    let mut host = CompatHost::new();
+    install_image_codec(&host, &Media::new(), &storage);
+    // SAFETY: the boxed scene/storage outlive `host` (they are declared after
+    // it and drop later), and `host.install` only stores their addresses.
+    unsafe {
+        host.services_mut()
+            .attach_scene(scene.as_mut() as *mut Scene);
+        host.services_mut()
+            .attach_storage(storage.as_mut() as *mut Storage);
+    }
+    host.install(&engine).expect("install compat surface");
+
+    engine
+        .exec_script(
+            "var w = new Window(); \
+             var l = new Layer(w, null); \
+             l.setImageSize(2, 2); \
+             l.loadProvinceImage('plane.png');",
+            "image-codec-test",
+        )
+        .expect("run the province script");
+
+    let value = engine
+        .eval("l.getProvincePixel(1, 1)", "image-codec-test")
+        .expect("read the province pixel");
+    assert_eq!(
+        value,
+        tjs::TjsValue::Integer(64),
+        "the province plane holds the image's own 8-bit sample"
+    );
 }

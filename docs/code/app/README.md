@@ -52,7 +52,7 @@ therefore contains no `#[cfg(target_os = …)]` of its own.
 | `audio` | `src/audio.rs` | the L1 decoder seam and the L1 output device the frame drains | [audio.md](audio.md) |
 | `video` | `src/video.rs` | the L1-backed video source installed on the `VideoOverlay` and movie seams | [video.md](video.md) |
 | `overlay` | `src/overlay.rs` | the render-only debug panel (FPS, CPU, I/O, memory, object counts) | [overlay.md](overlay.md) |
-| `image_codec` | `src/image_codec.rs` | the L1 image codec installed on `Bitmap.load` / `loadHeader` / `save` | [game.md](game.md) §4 |
+| `image_codec` | `src/image_codec.rs` | the L1 image codec installed on `Bitmap.load` / `loadHeader` / `save`, and the index plane the province load reads | [game.md](game.md) §4 |
 | `window_ex` | `src/window_ex.rs` | the emulated Windows host facts (monitors, metrics, environment) | [game.md](game.md) §4 |
 | `startup` | `src/startup.rs` | the start-up cost counters the installed seams record | [game.md](game.md) §2 |
 
@@ -190,7 +190,7 @@ a game folder cannot stop an otherwise playable mount), and a `patch.tjs` or
 | `tests/host.rs` | the empty-scene host: the cache policy, the texture upload, the resize, the projection cadence, the window-resize request, the desktop rectangle, the inert clipboard, a self-updating transition |
 | `tests/debug_overlay.rs` | the overlay node: present only when enabled, uploaded before it is drawn |
 | `tests/frame_timing.rs` | the slow-frame attribution: the phase that dominates, and the wall-clock total that contains the sum |
-| `tests/image_codec.rs` | `Bitmap.save` through the installed codec, and the resolution of a lowercased absolute name to the real path |
+| `tests/image_codec.rs` | `Bitmap.save` through the installed codec, the resolution of a lowercased absolute name to the real path, and the index-plane decoder the province load composes |
 | `tests/script_timing.rs` | the script-observable frame timing: the script timer is delivered once per elapsed interval (a slow frame replays the intervals it covered) and the continuous handler once per frame |
 | `tests/headless_clock.rs` | the headless run's script clock: the tick count is the wall clock the run really took, not the nominal frame period |
 | `tests/real_game_progress.rs` | a real title keeps moving: the scenario position advances across the boot flow and reaches the title — **ignored**; it needs `KRKR_TEST_GAME` |

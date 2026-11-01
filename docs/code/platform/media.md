@@ -87,6 +87,7 @@ backend-specific `#[cfg]` branch.
 ```rust
 pub fn probe_image(m: &Media, bytes: &[u8], hint: Option<&str>) -> Result<ImageInfo, MediaError>;
 pub fn decode_image(m: &Media, bytes: &[u8], hint: Option<&str>) -> Result<DecodedImage, MediaError>;
+pub fn decode_index_plane(m: &Media, bytes: &[u8], hint: Option<&str>) -> Result<DecodedImage, MediaError>;
 pub fn encode_image(m: &Media, width: u32, height: u32, rgba: &[u8], hint: &str) -> Result<Vec<u8>, MediaError>;
 ```
 
@@ -113,6 +114,18 @@ scanlines with their 4-byte pitch padding. PNG and JPEG delegate to the
 Supported decode formats are the `image` crate's enabled feature list: png,
 jpeg, webp, bmp, gif, tiff, tga, dds, pnm, ico, qoi, hdr, exr, ff — plus
 tlg5/tlg6. AVIF/pvr/jxr are deliberately absent.
+
+`decode_index_plane` is the **8-bit index plane** of an image: the palette
+index of a palettized image, the gray level of a grayscale one. It reads the
+PNG through the `png` crate with no transformation, because the `image` crate
+expands every palette to RGB before it hands the pixels over — the index
+would be gone by then. A 1-, 2- or 4-bit sample is expanded to the full 8-bit
+range, a 16-bit sample keeps its high byte. The plane travels as a **gray
+image**: every pixel's red, green and blue channels carry the plane value.
+
+Only a PNG carries such a plane. A truecolour image, an image with an alpha
+channel and every other format raise `MediaError::Unsupported` — the decode
+never reinterprets a colour as a plane.
 
 ### Audio
 
@@ -368,7 +381,9 @@ overflowing, unsupported) is an error, not a truncated result.
   the encode round trip for the supported formats, the rejected encode
   target and buffer, the TLG hint routing, the magic-based decode with a
   missing or wrong extension, the mislabeled TLG, the garbage input and the
-  large image with no configured size cap.
+  large image with no configured size cap; the index plane keeping the
+  palette index of a palettized image, and an image without a plane (a
+  truecolour image, a file that is not a PNG) raising `Unsupported`.
 * `crates/platform/media/tests/media.rs` — the advertised capabilities, the
   preserved config and the stateless `Media`, and the rejected video open.
 * `crates/platform/media/tests/tlg.rs` — the TLG6 header probe, the `sds`

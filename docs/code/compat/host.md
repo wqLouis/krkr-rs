@@ -89,6 +89,7 @@ destruction, which is safe but leaks the retention bookkeeping until then.
 | `set_clipboard_backend(backend)` | install the platform clipboard |
 | `set_desktop_rect(f)` | install the virtual-desktop rectangle (`System.desktop*`) |
 | `set_image_codec(decode, probe, save)` | install the host image codec (defined in `host.rs`) |
+| `set_index_plane_decoder(decode)` | install the host decoder that reads an image's 8-bit index plane, which the province plane is built from (defined in `host.rs`) |
 | `set_system_font_dirs(dirs)` | install the host's system-font directories (defined in `host.rs`) |
 | `set_window_ex_*` | install the `windowEx.dll` host facts (defined in `natives/plugins/window_ex/host.rs`) |
 

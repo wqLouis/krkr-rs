@@ -28,8 +28,8 @@ pub mod vm;
 pub use archives::{build_xp3, build_xp3_compressed_index};
 pub use game::game_archives;
 pub use media_fixtures::{
-    SDS_MAGIC, TLG5_MAGIC, TLG6_MAGIC, encode_png, encode_tlg5, encode_tlg6, pattern, test_image,
-    tiny_wav_mono,
+    SDS_MAGIC, TLG5_MAGIC, TLG6_MAGIC, encode_gray_png, encode_png, encode_tlg5, encode_tlg6,
+    pattern, test_image, tiny_wav_mono,
 };
 pub use reference::{
     REFERENCE_ENV, ReferenceFixtureError, reference_fixture, reference_fixture_or_skip,

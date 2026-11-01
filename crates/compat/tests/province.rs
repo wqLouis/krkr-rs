@@ -10,23 +10,15 @@
 //! table does not know is not a region at all.
 //!
 //! The tests install the real L1 `media` decoder through the host's codec
-//! seam, so the committed fixture is decoded by the code the game runs.
+//! seam, so the committed fixture is decoded by the code the game runs. The
+//! environment is the shared harness's: it mounts the storage, runs the
+//! script and delivers the events.
 
 mod common;
 
-use std::cell::RefCell;
-use std::path::Path;
-use std::time::Duration;
-
-use api::fs::{FsPath, OpenMode};
-use common::vm_lock;
-use compat::CompatHost;
-use engine::input::InputState;
-use engine::{Scene, Storage};
-use fs::FileSystem;
-use media::{Media, decode_image, decode_index_plane, probe_image};
+use common::{Env, vm_lock};
+use media::{Media, decode_index_plane};
 use platform::{InputEvent, MouseButton, PlatformEvent};
-use tjs::{Tjs2Engine, TjsValue};
 
 /// The committed fixture: a 4x4 palettized PNG whose palette index is the
 /// region id.
@@ -37,119 +29,20 @@ use tjs::{Tjs2Engine, TjsValue};
 /// every region (index 0).
 const FIXTURE: &[u8] = include_bytes!("fixtures/province.png");
 
-/// Writes `data` to `path` in an in-memory file system, creating parents.
-fn write_memory_file(fs: &FileSystem, path: &str, data: &[u8]) {
-    if let Some(parent) = Path::new(path).parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(fs, &FsPath::host(parent)).expect("create parent dirs");
-    }
-    let file = fs::open(fs, &FsPath::host(path), OpenMode::Write).expect("open memory file");
-    fs::write_at(fs, &file, 0, data).expect("write memory file");
-    fs::flush(fs, &file).expect("flush memory file");
-}
+/// The fixture's name in the mounted storage.
+const FIXTURE_NAME: &str = "province.png";
 
-/// A bound VM + host + scene + input state, plus an in-memory storage holding
-/// the fixture.
-///
-/// The boxed engine, scene, input state and storage are declared **after**
-/// `host` so the host (which stores their raw addresses) is dropped first.
-struct Env {
-    /// Kept alive for the host's raw pointer; never read directly.
-    _host: CompatHost,
-    engine: Box<Tjs2Engine>,
-    /// Kept alive for the host's raw pointer; never read directly.
-    _scene: Box<Scene>,
-    /// Kept alive for the host's raw pointer; never read directly.
-    _input: Box<InputState>,
-    /// Kept alive for the host's raw pointer; never read directly.
-    _storage: Box<Storage>,
-    /// The adapter the events are delivered through. It outlives one call
-    /// because it keeps the events a frame deferred.
-    adapter: RefCell<compat::EventAdapter>,
-}
-
-impl Env {
-    /// Builds an environment whose codec is the real L1 `media` decoder.
-    fn new() -> Env {
-        let fs = FileSystem::memory();
-        write_memory_file(&fs, "/province.png", FIXTURE);
-        let storage =
-            Storage::mount_archives(fs, "/", std::iter::empty::<&str>()).expect("mount storage");
-
-        let engine = Box::new(Tjs2Engine::new().expect("create engine"));
-        let mut scene = Box::new(Scene::default());
-        let mut input = Box::new(InputState::new());
-        let mut storage = Box::new(storage);
-        let mut host = CompatHost::new();
-        let media = Media::new();
-        host.set_image_codec(
-            move |bytes, hint| decode_image(&media, bytes, hint).map_err(|error| error.to_string()),
-            move |bytes, hint| probe_image(&media, bytes, hint).map_err(|error| error.to_string()),
-            |_name, _type, _width, _height, _rgba| Ok(()),
-        );
-        host.set_index_plane_decoder(move |bytes, hint| {
-            decode_index_plane(&media, bytes, hint).map_err(|error| error.to_string())
-        });
-        // SAFETY: the boxed scene, input state and storage outlive the host.
-        unsafe {
-            host.services_mut()
-                .attach_scene(scene.as_mut() as *mut Scene);
-            host.services_mut()
-                .attach_input(input.as_mut() as *mut InputState);
-            host.services_mut()
-                .attach_storage(storage.as_mut() as *mut Storage);
-        }
-        host.install(&engine).expect("install compat surface");
-        Env {
-            _host: host,
-            engine,
-            _scene: scene,
-            _input: input,
-            _storage: storage,
-            // The adapter's default budget is a wall-clock slice, so on a
-            // loaded machine it can cut a test's event sequence short. This
-            // one delivers every event it is given.
-            adapter: RefCell::new(compat::EventAdapter::with_dispatch_budget(Duration::MAX)),
-        }
-    }
-
-    /// Feed one frame's platform events through the adapter.
-    fn dispatch_events(&self, events: &[PlatformEvent]) {
-        let mut adapter = self.adapter.borrow_mut();
-        let mut ctx = self._host.ctx().expect("bound compat context");
-        adapter.begin_input_frame(&mut ctx);
-        adapter
-            .dispatch_frame(&mut ctx, events)
-            .expect("dispatch events");
-        adapter.end_input_frame(&mut ctx);
-    }
-
-    fn run(&self, script: &str) {
-        self.engine
-            .exec_script(script, "province-test")
-            .unwrap_or_else(|error| panic!("exec {script:?} failed: {error}"));
-    }
-
-    fn eval(&self, expression: &str) -> Result<TjsValue, String> {
-        self.engine
-            .eval(expression, "province-test")
-            .map_err(|error| error.to_string())
-    }
-
-    fn eval_int(&self, expression: &str) -> i64 {
-        match self.eval(expression) {
-            Ok(TjsValue::Integer(value)) => value,
-            Ok(other) => panic!("{expression:?} returned {other:?}, expected an integer"),
-            Err(error) => panic!("eval {expression:?} failed: {error}"),
-        }
-    }
-
-    /// Evaluate an expression that must raise, returning the message.
-    fn error(&self, expression: &str) -> String {
-        self.eval(expression)
-            .expect_err(&format!("{expression:?} should have raised"))
-    }
+/// A bound environment with the fixture mounted and the real L1 index-plane
+/// decoder installed.
+fn province_env() -> Env {
+    let env = Env::with_storage();
+    let dir = env.game_dir().expect("the temp game directory");
+    std::fs::write(dir.join(FIXTURE_NAME), FIXTURE).expect("write the province image");
+    let media = Media::new();
+    env.install_index_plane_decoder(move |bytes, hint| {
+        decode_index_plane(&media, bytes, hint).map_err(|error| error.to_string())
+    });
+    env
 }
 
 /// The province plane holds the palette index of the image, not the colour
@@ -166,7 +59,7 @@ impl Env {
 #[test]
 fn the_province_plane_holds_the_palette_index() {
     let _lock = vm_lock();
-    let env = Env::new();
+    let env = province_env();
     env.run(
         "var w = new Window(); \
          var l = new Layer(w, null); \
@@ -198,10 +91,14 @@ fn the_province_plane_holds_the_palette_index() {
 /// The hit test reads the same plane, so the region outside every id is not
 /// a hit at all (`reference/cpp/core/visual/LayerIntf.cpp:2893-2914` sizes
 /// the plane, and the province hit test takes a non-zero plane byte).
+///
+/// The table holds the region's **action id** (a number), which is what a
+/// truthiness test reads: a TJS2 string is truthy only when it converts to a
+/// non-zero number, so a named action would read as absent.
 #[test]
 fn a_click_on_a_region_runs_the_region_action() {
     let _lock = vm_lock();
-    let env = Env::new();
+    let env = province_env();
     env.run(
         "var w = new Window(); \
          w.setSize(320, 240); \
@@ -210,7 +107,7 @@ fn a_click_on_a_region_runs_the_region_action() {
          map.setImageSize(4, 4); \
          map.hitType = 1; \
          map.loadProvinceImage('province.png'); \
-         var actions = %[16 => 'start']; \
+         var actions = %[16 => 1]; \
          var fired = 0; \
          function processProvince(x, y) { \
              var region = map.getProvincePixel(x, y); \
@@ -268,13 +165,13 @@ fn a_click_on_a_region_runs_the_region_action() {
 #[test]
 fn a_region_the_action_table_does_not_know_runs_no_action() {
     let _lock = vm_lock();
-    let env = Env::new();
+    let env = province_env();
     env.run(
         "var w = new Window(); \
          var map = new Layer(w, null); \
          map.setImageSize(4, 4); \
          map.loadProvinceImage('province.png'); \
-         var actions = %[16 => 'start']; \
+         var actions = %[16 => 1]; \
          var fired = 0; \
          function processProvince(x, y) { \
              var region = map.getProvincePixel(x, y); \
@@ -302,7 +199,7 @@ fn a_region_the_action_table_does_not_know_runs_no_action() {
 #[test]
 fn a_missing_province_image_raises() {
     let _lock = vm_lock();
-    let env = Env::new();
+    let env = province_env();
     env.run(
         "var w = new Window(); \
          var l = new Layer(w, null); \

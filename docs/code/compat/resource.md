@@ -80,13 +80,29 @@ host.set_image_codec(decode, probe, save);
 
 | Closure | Signature | Backs |
 |---|---|---|
-| `decode` | `Fn(&[u8], Option<&str>) -> Result<DecodedImage, String>` | `Bitmap.load`, `Bitmap.loadAsync`, `Layer.loadImages`, `Layer.loadProvinceImage` |
+| `decode` | `Fn(&[u8], Option<&str>) -> Result<DecodedImage, String>` | `Bitmap.load`, `Bitmap.loadAsync`, `Layer.loadImages` |
 | `probe` | `Fn(&[u8], Option<&str>) -> Result<ImageInfo, String>` | `Bitmap.loadHeader` |
 | `save` | `Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String>` | `Bitmap.save`, `Layer.saveLayerImage` |
 
+The province plane is the image's own **8-bit sample** — the palette index of
+a palettized image, the gray level of a grayscale one — so it is decoded
+apart from the colour image, through its own closure:
+
+```rust
+host.set_index_plane_decoder(decode);
+```
+
+| Closure | Signature | Backs |
+|---|---|---|
+| `decode` | `Fn(&[u8], Option<&str>) -> Result<DecodedImage, String>` | `Layer.loadProvinceImage` |
+
+The plane travels as a gray image: every pixel's red, green and blue channels
+carry the plane value, and the red channel is what the province plane reads.
+
 **A missing closure raises a typed error** — `"no image decoder is
 installed"`, `"no image header prober is installed"`, `"no image encoder is
-installed"` — instead of fabricating a result.
+installed"`, `"no index-plane decoder is installed"` — instead of fabricating
+a result.
 
 The save path strips the media prefix before handing the name to the host
 writer, exactly as the read path does on the decode side.

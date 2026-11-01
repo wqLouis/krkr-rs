@@ -60,7 +60,7 @@ pub mod yuv;
 pub use audio::{AudioDecoderState, decode_audio, open_audio, probe_audio, read_audio, seek_audio};
 #[cfg(feature = "video-ffmpeg")]
 pub use audio_ffmpeg::decode_audio_ffmpeg;
-pub use image_decode::{decode_image, probe_image};
+pub use image_decode::{decode_image, decode_index_plane, probe_image};
 pub use image_encode::encode_image;
 #[cfg(feature = "video-mediacodec")]
 pub use video::decode_audio_mediacodec;

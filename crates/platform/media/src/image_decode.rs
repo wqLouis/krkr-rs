@@ -14,6 +14,11 @@
 //! Neither [`probe_image`] nor [`decode_image`] touches any global state;
 //! they depend only on their arguments.
 //!
+//! [`decode_index_plane`] is the third entry: it reads the 8-bit index plane
+//! of a palettized or grayscale PNG — the palette index, not the colour the
+//! palette maps it to. The palette is never applied, so the value the plane
+//! carries is the image's own sample.
+//!
 //! Supported `image`-crate formats are the crate's enabled feature list
 //! (png, jpeg, webp, bmp, gif, tiff, tga, dds, pnm, ico, qoi, hdr, exr,
 //! ff). AVIF/pvr/jxr are deliberately absent.
@@ -23,6 +28,7 @@ use std::io::Cursor;
 use api::error::MediaError;
 use api::media::{DecodedImage, ImageInfo};
 use image::{DynamicImage, ImageDecoder, ImageFormat};
+use png::{BitDepth, ColorType as PngColorType, OutputInfo};
 
 use crate::Media;
 use crate::hint::extension_of;
@@ -30,6 +36,9 @@ use crate::tlg;
 
 /// TLG spellings the router recognizes (extension without the dot).
 const TLG_EXTENSIONS: [&str; 3] = ["tlg", "tlg5", "tlg6"];
+
+/// The PNG file signature.
+const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 
 /// Image format names advertised by [`crate::capabilities`].
 pub(crate) const IMAGE_FORMATS: [&str; 16] = [
@@ -180,6 +189,226 @@ fn probe_with_format(bytes: &[u8], format: ImageFormat) -> Result<ImageInfo, Str
 /// Decodes a specific `image`-crate format.
 fn decode_with_format(bytes: &[u8], format: ImageFormat) -> Result<DynamicImage, String> {
     image::load_from_memory_with_format(bytes, format).map_err(|error| error.to_string())
+}
+
+/// Decodes the 8-bit index plane of a palettized or grayscale PNG.
+///
+/// The plane is the image's own 8-bit sample: the palette index of a
+/// palettized image, the gray level of a grayscale image. A 1-, 2- or 4-bit
+/// sample is expanded to the full 8-bit range, a 16-bit sample keeps its high
+/// byte. The palette itself is never applied — the index is the value.
+///
+/// The plane travels as a gray image: every pixel's red, green and blue
+/// channels carry the plane value and the alpha is opaque. A consumer that
+/// reads the red channel therefore reads the plane.
+///
+/// # Errors
+///
+/// [`MediaError::Unsupported`] when the bytes are not a PNG, or when the PNG
+/// carries colours that have no 8-bit plane (a truecolour image, an image
+/// with an alpha channel), and [`MediaError::Decode`] when the PNG is
+/// malformed.
+pub fn decode_index_plane(
+    m: &Media,
+    bytes: &[u8],
+    hint: Option<&str>,
+) -> Result<DecodedImage, MediaError> {
+    let _ = m;
+
+    if !bytes.starts_with(&PNG_SIGNATURE) {
+        return Err(MediaError::Unsupported {
+            message: match hint {
+                Some(name) => format!(
+                    "{name} is not a PNG; only a palettized or a grayscale PNG carries an 8-bit index plane"
+                ),
+                None => {
+                    "only a palettized or a grayscale PNG carries an 8-bit index plane".to_string()
+                }
+            },
+        });
+    }
+
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    // No transformation may run: expanding the palette to RGB would throw
+    // the index away, and the index is the plane.
+    decoder.set_transformations(png::Transformations::IDENTITY);
+    let mut reader = decoder.read_info().map_err(png_decode_error)?;
+    let size = reader
+        .output_buffer_size()
+        .ok_or_else(|| MediaError::Decode {
+            format: "png".to_string(),
+            message: "the image is too large to decode".to_string(),
+        })?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(size)
+        .map_err(|_| MediaError::Decode {
+            format: "png".to_string(),
+            message: "the image is too large to decode".to_string(),
+        })?;
+    buffer.resize(size, 0);
+    let output = reader.next_frame(&mut buffer).map_err(png_decode_error)?;
+    let plane = expand_plane(&output, &buffer)?;
+
+    let (width, height) = (output.width, output.height);
+    let rgba_len = plane
+        .len()
+        .checked_mul(4)
+        .ok_or_else(|| MediaError::Decode {
+            format: "png".to_string(),
+            message: "the image size is not representable".to_string(),
+        })?;
+    let mut rgba = Vec::new();
+    rgba.try_reserve_exact(rgba_len)
+        .map_err(|_| MediaError::Decode {
+            format: "png".to_string(),
+            message: "the image is too large to decode".to_string(),
+        })?;
+    for value in plane {
+        rgba.extend_from_slice(&[value, value, value, 255]);
+    }
+    Ok(DecodedImage::new(width, height, rgba))
+}
+
+/// The typed decode error of a PNG failure.
+fn png_decode_error(error: png::DecodingError) -> MediaError {
+    MediaError::Decode {
+        format: "png".to_string(),
+        message: error.to_string(),
+    }
+}
+
+/// Expands the decoded rows of a palettized or grayscale PNG into one 8-bit
+/// plane value per pixel.
+///
+/// A sub-byte sample is packed most significant first: the first sample of a
+/// byte sits in its high bits. A grayscale sample is scaled to the full
+/// 8-bit range, a palette index is not.
+fn expand_plane(output: &OutputInfo, buffer: &[u8]) -> Result<Vec<u8>, MediaError> {
+    let width = usize::try_from(output.width).map_err(|_| MediaError::Decode {
+        format: "png".to_string(),
+        message: "the image width is not representable".to_string(),
+    })?;
+    let height = usize::try_from(output.height).map_err(|_| MediaError::Decode {
+        format: "png".to_string(),
+        message: "the image height is not representable".to_string(),
+    })?;
+    let count = width
+        .checked_mul(height)
+        .ok_or_else(|| MediaError::Decode {
+            format: "png".to_string(),
+            message: "the image size is not representable".to_string(),
+        })?;
+    let mut plane = Vec::new();
+    plane
+        .try_reserve_exact(count)
+        .map_err(|_| MediaError::Decode {
+            format: "png".to_string(),
+            message: "the image is too large to decode".to_string(),
+        })?;
+    plane.resize(count, 0);
+
+    let line_size = output.line_size;
+    if !matches!(
+        output.color_type,
+        PngColorType::Indexed | PngColorType::Grayscale
+    ) {
+        return Err(no_index_plane());
+    }
+    for y in 0..height {
+        let row = buffer
+            .get(y * line_size..(y + 1) * line_size)
+            .ok_or_else(|| MediaError::Decode {
+                format: "png".to_string(),
+                message: "the image rows are shorter than its size".to_string(),
+            })?;
+        let start = y * width;
+        match output.color_type {
+            PngColorType::Indexed => match output.bit_depth {
+                BitDepth::Eight => {
+                    for x in 0..width {
+                        plane[start + x] = row_byte(row, x)?;
+                    }
+                }
+                BitDepth::One | BitDepth::Two | BitDepth::Four => {
+                    let bits = packed_bits(output.bit_depth);
+                    let per_byte = 8 / bits;
+                    let mask = ((1u32 << bits) - 1) as u8;
+                    for x in 0..width {
+                        let byte = row_byte(row, x / per_byte)?;
+                        let shift = 8 - bits * (x % per_byte + 1);
+                        plane[start + x] = (byte >> shift) & mask;
+                    }
+                }
+                BitDepth::Sixteen => {
+                    return Err(MediaError::Unsupported {
+                        message: "a 16-bit palette index is not a PNG".to_string(),
+                    });
+                }
+            },
+            PngColorType::Grayscale => match output.bit_depth {
+                BitDepth::Eight => {
+                    for x in 0..width {
+                        plane[start + x] = row_byte(row, x)?;
+                    }
+                }
+                BitDepth::Sixteen => {
+                    for x in 0..width {
+                        let pair = row.get(x * 2..x * 2 + 2).ok_or_else(row_too_short)?;
+                        plane[start + x] = pair[0];
+                    }
+                }
+                BitDepth::One | BitDepth::Two | BitDepth::Four => {
+                    let bits = packed_bits(output.bit_depth);
+                    let per_byte = 8 / bits;
+                    let max = (1u32 << bits) - 1;
+                    for x in 0..width {
+                        let byte = row_byte(row, x / per_byte)?;
+                        let shift = 8 - bits * (x % per_byte + 1);
+                        let value = u32::from(byte >> shift) & max;
+                        plane[start + x] = ((value * 255) / max) as u8;
+                    }
+                }
+            },
+            _ => {
+                return Err(no_index_plane());
+            }
+        }
+    }
+    Ok(plane)
+}
+
+/// The typed error of an image that has no 8-bit index plane.
+fn no_index_plane() -> MediaError {
+    MediaError::Unsupported {
+        message:
+            "the image has no 8-bit index plane: only a palettized or a grayscale image carries one"
+                .to_string(),
+    }
+}
+
+/// The number of bits one packed sample holds.
+fn packed_bits(depth: BitDepth) -> usize {
+    match depth {
+        BitDepth::One => 1,
+        BitDepth::Two => 2,
+        BitDepth::Four => 4,
+        BitDepth::Eight => 8,
+        BitDepth::Sixteen => 16,
+    }
+}
+
+/// Reads one byte of a scanline.
+fn row_byte(row: &[u8], index: usize) -> Result<u8, MediaError> {
+    row.get(index).copied().ok_or_else(row_too_short)
+}
+
+/// The typed error of a scanline that is shorter than the image's size.
+fn row_too_short() -> MediaError {
+    MediaError::Decode {
+        format: "png".to_string(),
+        message: "the image rows are shorter than its size".to_string(),
+    }
 }
 
 /// Decodes image bytes into tightly packed RGBA8.

@@ -51,6 +51,13 @@ image = { version = "0.25", default-features = false, features = [
     "exr",
     "ff",
 ] }
+# The PNG reader behind the 8-bit index-plane decode. The `image` crate
+# expands every palette to RGB before it hands the pixels over, so the
+# palette index — the value a province plane carries — is only readable
+# through the PNG reader itself. The crate is already in the dependency
+# graph through `image`; naming it directly is what makes the index plane
+# reachable.
+png = "0.18"
 # The MediaCodec backend logs a decoder that cannot be created, configured or
 # started; the failure is also reported as a typed error.
 log = { workspace = true }

@@ -150,7 +150,7 @@ the seams and expects the composition root to fill them:
 
 | seam | installed by | what it provides |
 |---|---|---|
-| image codec | `image_codec.rs` | `Bitmap.load` / `loadAsync` / `loadHeader` / `save` |
+| image codec | `image_codec.rs` | `Bitmap.load` / `loadAsync` / `loadHeader` / `save`, and the index plane the province load reads |
 | audio decoder | `audio.rs` | the `add_audio_decoder` chain, so a sound buffer can decode and play |
 | video source | `video.rs` | the `VideoOverlay` and `LayerExMovie` seams, over the L1 decoder and the L2 storage |
 | system font directories | `platform::system_font_dirs()` | the host's font directories, supplied before a startup script can resolve a face |
@@ -160,7 +160,10 @@ the seams and expects the composition root to fill them:
 The **image codec** decodes and probes through the stateless L1 backend. The
 save path encodes through the same backend and writes the bytes through the
 storage's file system at the storage's game directory, so a later read sees
-the file. A saved name may contain sub-directories; missing parents are
+the file. The province plane — the image's own 8-bit sample, the palette
+index of a palettized image — is decoded apart from the colour image, through
+the same backend's index-plane decode, which the shared image-codec
+installer installs on the host. A saved name may contain sub-directories; missing parents are
 created. The write resolves the name through the storage's case-correcting
 helper, so the fully lowercased absolute form `System.dataPath` produces
 lands on the real mixed-case path instead of creating a second lowercase
