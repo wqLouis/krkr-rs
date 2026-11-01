@@ -249,18 +249,23 @@ fn motion_properties() -> Vec<NativePropertyDef> {
 fn global_exists(ctx: &CompatCtx, name: &str) -> bool {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let engine = unsafe { ctx.engine() };
-    match engine.eval(&format!("typeof {name}"), "motion_player") {
+    // `typeof global.<name>` reports an absent member as `"undefined"`; the
+    // bare `typeof <name>` spelling reads the name as an ordinary variable,
+    // and an unknown global raises instead of answering.
+    match engine.eval(&format!("typeof global.{name}"), "motion_player") {
         Ok(TjsValue::String(kind)) => kind != "undefined",
         Ok(_) => true,
         Err(_) => false,
     }
 }
 
-/// Whether `object.member` is already defined.
+/// Whether the global `object`'s `member` is already defined.
 fn member_exists(ctx: &CompatCtx, object: &str, member: &str) -> bool {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let engine = unsafe { ctx.engine() };
-    let expression = format!("typeof {object}.{member}");
+    // The last member of the chain is read with the must-exist semantics,
+    // so an absent member answers `"undefined"` instead of raising.
+    let expression = format!("typeof global.{object}.{member}");
     match engine.eval(&expression, "motion_player") {
         Ok(TjsValue::String(kind)) => kind != "undefined",
         _ => false,
