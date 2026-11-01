@@ -215,8 +215,13 @@ pub(crate) fn record_present(
         offset: vk::Offset2D { x: 0, y: 0 },
         extent,
     };
+    // The unit quad spans 0..1, so the transform maps it onto the whole
+    // target: the scene draws carry device-pixel transforms of the same kind.
     let constants = PushConstants {
-        mvp: to_ndc(&Affine2::IDENTITY, extent),
+        mvp: to_ndc(
+            &Affine2::scale(extent.width as f32, extent.height as f32),
+            extent,
+        ),
         tint: [1.0, 1.0, 1.0, 1.0],
         uv_rect: [0.0, 0.0, 1.0, 1.0],
         mode: 0,
