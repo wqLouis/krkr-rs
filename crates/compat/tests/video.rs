@@ -1473,3 +1473,71 @@ fn the_overlay_fires_on_frame_update_from_the_first_pump() {
         "a pump inside one frame must fire no frame update"
     );
 }
+
+/// Invalidating the overlay stops the picture and the event delivery.
+///
+/// The reference closes the overlay and cuts the event receiver when the
+/// script object goes away: `tTJSNI_BaseVideoOverlay::Invalidate` clears the
+/// `Owner` and releases the `ActionOwner`
+/// (`reference/cpp/core/visual/VideoOvlIntf.cpp:58-64`), and
+/// `tTJSNI_VideoOverlay::Invalidate` closes the overlay and releases the
+/// cached one (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:121-130`).
+/// The closed overlay is not driven any more, so the picture stops and no
+/// `onFrameUpdate` reaches the dead object.
+///
+/// The port kept the overlay in the dispatch state after the script
+/// invalidated the object: the pump kept asking the host for frames and kept
+/// delivering the event to the dead object, which it logged as a failure on
+/// every frame.
+#[test]
+fn invalidating_the_overlay_stops_the_picture() {
+    struct CountingSource {
+        spec: VideoSpec,
+        frame: Arc<RgbaFrame>,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl compat::VideoSource for CountingSource {
+        fn spec(&self, _path: &str) -> Option<VideoSpec> {
+            Some(self.spec)
+        }
+
+        fn frame_at(&mut self, _path: &str, _at_ms: i64) -> Option<Arc<RgbaFrame>> {
+            *self.calls.lock().expect("the counter is not poisoned") += 1;
+            Some(Arc::clone(&self.frame))
+        }
+    }
+
+    let _lock = vm_lock();
+    let env = Env::new();
+    let asked = Arc::new(Mutex::new(0usize));
+    let ctx = env.host.ctx().expect("bound context");
+    compat::set_video_source(
+        &ctx,
+        Box::new(CountingSource {
+            spec: movie_spec(),
+            frame: Arc::new(solid_frame([255, 0, 0, 255])),
+            calls: Arc::clone(&asked),
+        }),
+    );
+    env.run(
+        "var w = new Window(); \
+         var v = new VideoOverlay(w); \
+         v.open('movie.mpg'); v.play();",
+    );
+
+    env.advance_video(50.0);
+    let asked_while_playing = *asked.lock().expect("the counter is not poisoned");
+    assert!(
+        asked_while_playing > 0,
+        "the pump must ask the host for frames while the overlay plays"
+    );
+
+    env.run("invalidate v;");
+    env.advance_video(50.0);
+    assert_eq!(
+        *asked.lock().expect("the counter is not poisoned"),
+        asked_while_playing,
+        "the invalidated overlay must not ask the host for frames any more"
+    );
+}

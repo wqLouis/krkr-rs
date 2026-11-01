@@ -39,6 +39,10 @@
 //! `setTransitionCompleteCall` is not part of the 70-member surface), so it is
 //! dropped.
 //!
+//! The events are delivered to the script object that owns the overlay.
+//! Invalidating that object closes the overlay and cuts the delivery, so a
+//! dead object is never called back and the picture stops with it.
+//!
 //! [`CompatServices::state`]: crate::CompatServices::state
 #![allow(unsafe_code)]
 
@@ -909,14 +913,57 @@ extern "C" fn video_destroy(engine: *mut c_void, instance: *mut c_void) {
         // movie-audio mixer voice.
         // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `video_destroy`.
         let services = unsafe { ctx.services() };
-        let mut state = services.state::<VideoState>();
-        if let Some(mut slot) = state.overlays.remove(&id) {
-            slot.release_audio(services);
-        }
+        forget_overlay(services, id);
     }
     // SAFETY: instance came from `video_create`'s `Box::into_raw` and is freed
     // exactly once by the VM.
     drop(unsafe { Box::from_raw(instance as *mut VideoOverlayInst) });
+}
+
+/// The invalidate hook: the script object is going away, so the overlay it
+/// backs goes with it.
+///
+/// The overlay is closed and its event receiver is cut, so the dead object is
+/// never called back and the picture stops. The payload itself is freed by
+/// [`video_destroy`], exactly like the native instance stays alive across
+/// `invalidate`.
+extern "C" fn video_invalidate(engine: *mut c_void, instance: *mut c_void) {
+    if instance.is_null() {
+        return;
+    }
+    // SAFETY: `instance` is the payload created by `video_create`.
+    let inst = unsafe { &mut *(instance as *mut VideoOverlayInst) };
+    let Some(id) = inst.id.take() else {
+        return;
+    };
+    let Some(resolved) = resolve(engine) else {
+        // The binding is removed before the engine is destroyed, in which
+        // case the state is dropped with the services anyway.
+        return;
+    };
+    let ctx = resolved.ctx();
+    // SAFETY: the resolved context is bound and alive.
+    let services = unsafe { ctx.services() };
+    forget_overlay(services, id);
+}
+
+/// Drop the overlay state bound to `id`.
+///
+/// The invalidate and destroy hooks call this. The slot owns the playback
+/// machine, the mixer voice and the retained `layer1`/`layer2` objects, so
+/// dropping it releases all three — and dropping it is what stops the event
+/// delivery: the closed overlay is not driven any more, and the dead script
+/// object is never called back.
+///
+/// Returns whether an overlay was dropped.
+fn forget_overlay(services: &CompatServices, id: u32) -> bool {
+    let mut state = services.state::<VideoState>();
+    let Some(mut slot) = state.overlays.remove(&id) else {
+        return false;
+    };
+    slot.overlay.close();
+    slot.release_audio(services);
+    true
 }
 
 /// `VideoOverlay(win)` — the constructor hook. The reference `Construct`
@@ -2745,7 +2792,7 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         name: "VideoOverlay",
         create: video_create,
         destroy: video_destroy,
-        invalidate: None,
+        invalidate: Some(video_invalidate),
         methods: vec![
             NativeInstanceMethodDef {
                 name: "VideoOverlay",

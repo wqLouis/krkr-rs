@@ -115,6 +115,11 @@ The status sequence for a full transport run is exactly
 Dispatch goes through the object's class chain, so a script override wins
 over the native hook. Handler failures are **logged, never raised**.
 
+The events are delivered to the script object that owns the overlay.
+**Invalidating that object stops the delivery**: the overlay is closed and
+its slot is dropped, so the picture stops and no `onFrameUpdate` reaches the
+dead object.
+
 `prepare()` in `vomLayer` mode ends **paused at frame 0** and fires
 `onPeriod(2)` on the first decoded frame. The frame is composited first; then
 `complete_prepare()` queues `onFrameUpdate`, `onPeriod(2)`, the pause and the
@@ -144,7 +149,7 @@ position only on an explicit transport command, or when the drift exceeds
 
 | state | owner |
 |---|---|
-| the slots, the next id, the installed `VideoSource` | the **per-engine dispatch state** (`CompatServices::state::<VideoState>()`) |
+| the slots, the next id, the installed `VideoSource` | the **per-engine dispatch state** (`CompatServices::state::<VideoState>()`) — a slot is dropped when its script object is invalidated or destroyed |
 | the L2 overlay, the opened path, the raw owner handle, the layer references, the mixing layer, the mode, the audio balance and volume, the stream selectors and counts, the decoded track and its mixer voice | the **per-object payload** |
 | the spec, the status, the position clock, the frame index, the segment loop, the period event, the visibility, the bounds, the binding, the play rate, the loop flag, the event queue, the presented frame | the **L2 video model** |
 
@@ -182,7 +187,7 @@ status events, `prepare` acting only in layer mode, the frozen `mode`, the
 layer-mode geometry, the constructor's window requirement, the audio members
 before `open`, the stream counts and the default gain, the typed error for a
 second audio stream, and the movie audio reaching the mixer with its volume
-and pan.
+and pan, and the invalidation stopping the picture and the event delivery.
 
 Unit tests inside the module cover the event→script-member mapping and the
 frame selection of the buffered source.
@@ -215,6 +220,12 @@ frame selection of the buffered source.
     `SoundBuffer`.
 11. **`setPeriodEvent` with two or more arguments is ignored**, matching the
     reference.
+12. **The native event hooks are no-ops.** The reference's native
+    `onStatusChanged` / `onPeriod` / `onFrameUpdate` / `onCallbackCommand`
+    forward the event to the *action owner* — the object the constructor was
+    given — by calling its `action` method with an event dictionary. The port
+    keeps no action owner, so a script that only implements `action` sees no
+    video event.
 
 ---
 
