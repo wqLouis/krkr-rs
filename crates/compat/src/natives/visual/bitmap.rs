@@ -44,7 +44,12 @@ pub(super) fn bitmap_payload_id(payload: *mut c_void) -> Option<u32> {
 
 /// Common image extensions probed when the requested storage name does not
 /// resolve, mirroring the reference `TVPFindGraphicLoadHandler` order.
-const IMAGE_EXTENSION_PROBE: [&str; 21] = [
+///
+/// The one list every L3 image path probes with: the `Bitmap` path, the
+/// `Layer` path and the layerEx image path. The graphic loader registers one
+/// handler per extension and suggests the first one whose file exists, so the
+/// list is the handler table.
+pub(crate) const IMAGE_EXTENSION_PROBE: [&str; 21] = [
     ".webp", ".bmp", ".dib", ".jpeg", ".jpg", ".jif", ".png", ".tlg", ".tlg5", ".tlg6", ".gif",
     ".tif", ".tiff", ".tga", ".dds", ".pnm", ".ico", ".qoi", ".hdr", ".exr", ".ff",
 ];

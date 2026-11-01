@@ -2573,7 +2573,7 @@ extern "C" fn layer_dump(
 
 /// `loadImages(name [, key])` — load the layer's main image (reference
 /// `tTJSNI_BaseLayer::LoadImages`). The bytes are read through the attached
-/// storage (probing image extensions), decoded by the host image codec, and
+/// storage (probing the shared extension list), decoded by the host image codec, and
 /// installed as the layer's bitmap with the image size set. Returns void:
 /// the codec reports no per-format metainfo, so the reference's optional
 /// metainfo dictionary is absent.
@@ -2619,6 +2619,12 @@ extern "C" fn layer_load_images(
 
 /// Reads, decodes and installs `name` as the layer's main image, reusing the
 /// layer's existing bitmap so repeated loads do not leak scene bitmaps.
+///
+/// The name is resolved through the shared image-extension list: the plain
+/// name first, then each extension of the list, and the first that resolves
+/// wins. The resolved name is what the decoder is handed, so its extension
+/// selects the decoder.
+///
 /// Installing the image is followed by the image-size adjustment, which shrinks
 /// the layer rectangle to a smaller image, clamps the image offsets and resets
 /// the clip.

@@ -18,7 +18,7 @@ use tjs::{DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, Tjs2Eng
 
 use super::{scene_mut, set_real};
 use crate::native_util::{args, report_error, set_int, set_void};
-use crate::natives::visual::COLOR_KEY_NONE;
+use crate::natives::visual::{COLOR_KEY_NONE, IMAGE_EXTENSION_PROBE};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
@@ -48,13 +48,6 @@ const IMAGE_TYPE_METAFILE: i64 = 2;
 
 /// `InvalidParameter` in the `GdiPlus.Status` table.
 const INVALID_PARAMETER: i64 = 2;
-
-/// Common image extensions probed when the requested storage name does not
-/// resolve, mirroring the reference `TVPGetPlacedPath` extension search.
-const IMAGE_EXTENSION_PROBE: [&str; 21] = [
-    ".webp", ".bmp", ".dib", ".jpeg", ".jpg", ".jif", ".png", ".tlg", ".tlg5", ".tlg6", ".gif",
-    ".tif", ".tiff", ".tga", ".dds", ".pnm", ".ico", ".qoi", ".hdr", ".exr", ".ff",
-];
 
 /// The reference `GdipImage` payload (`reference/cpp/plugins/layerex_draw/
 /// blend2d/LayerExDraw.hpp:630-773`): a bitmap image plus the rotate/flip
