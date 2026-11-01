@@ -17,6 +17,7 @@
 mod common;
 
 use common::{Env, vm_lock};
+use engine::{StorageMedia, StorageReadError};
 use media::{Media, decode_image, decode_index_plane, probe_image};
 use platform::{InputEvent, MouseButton, PlatformEvent};
 use testkit::{encode_png, pattern};
@@ -59,6 +60,36 @@ fn province_env() -> Env {
 fn write_game_file(env: &Env, name: &str, bytes: &[u8]) {
     let dir = env.game_dir().expect("the temp game directory");
     std::fs::write(dir.join(name), bytes).expect("write the game file");
+}
+
+/// A media that serves the graphic and fails on the province name.
+///
+/// The failure is a genuine media error and not a missing member, so the
+/// province load must raise instead of quietly loading the graphic without a
+/// plane.
+struct FailingProvinceMedia {
+    /// The bytes the media serves for every name but the province one.
+    graphic: Vec<u8>,
+}
+
+impl StorageMedia for FailingProvinceMedia {
+    fn domain(&self) -> &str {
+        "boom"
+    }
+
+    fn exists(&self, path: &str) -> Result<bool, StorageReadError> {
+        Ok(path != "pack/27_p.png")
+    }
+
+    fn read(&self, path: &str) -> Result<Vec<u8>, StorageReadError> {
+        if path == "pack/27_p.png" {
+            return Err(StorageReadError::Media {
+                media: "boom".to_string(),
+                message: "the packed province could not be read".to_string(),
+            });
+        }
+        Ok(self.graphic.clone())
+    }
 }
 
 /// The province plane holds the palette index of the image, not the colour
@@ -284,4 +315,31 @@ fn a_graphic_without_a_province_image_loads_without_a_plane() {
         "a graphic without a province image leaves the plane empty"
     );
     assert_eq!(env.eval_int("l.getProvincePixel(0, 1)"), 0);
+}
+
+/// A province lookup that fails for a reason other than a missing member
+/// fails the load.
+///
+/// The reference's province load reports the storage failure unchanged
+/// (`reference/cpp/core/visual/LayerIntf.cpp:2847-2875`), so a media that
+/// cannot read the province member raises instead of loading the graphic
+/// without a plane.
+#[test]
+fn a_media_failure_in_the_province_lookup_raises() {
+    let _lock = vm_lock();
+    let env = media_env();
+    let graphic = encode_png(4, 4, &pattern(4, 4));
+    env.storage()
+        .expect("the mounted storage")
+        .register_media(Box::new(FailingProvinceMedia { graphic }));
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null);",
+    );
+
+    let message = env.error("l.loadImages('boom://pack/27.png');");
+    assert!(
+        message.contains("the packed province could not be read"),
+        "the media failure must reach the script: {message}"
+    );
 }

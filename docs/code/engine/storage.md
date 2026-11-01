@@ -145,6 +145,11 @@ belongs to the provider. The provider answers on the thread that asked for the
 bytes, so a media name is never scheduled on the read pool, and its failure
 message reaches the caller unchanged (`StorageReadError::Media`).
 
+A member that is not there is a **missing storage**, not a failure of the
+provider: `exists` answers `Ok(false)` and `read` answers
+`StorageReadError::NotFound`, and the caller decides what a missing member
+means.
+
 ### Free functions
 
 ```rust

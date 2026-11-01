@@ -142,8 +142,13 @@ fn a_var_path_without_a_member_separator_raises() {
     assert!(message.contains("invalid path:foo"), "{message}");
 }
 
-/// A member that is not a file cannot be opened
-/// (`reference/cpp/plugins/varfile.cpp:257`).
+/// A member that is not a file is a missing storage.
+///
+/// The reference's media answers the existence check with the member's kind
+/// (`reference/cpp/plugins/varfile.cpp:237-239`), so a member that is not
+/// an octet is not there — and the storage manager raises "Cannot open
+/// storage" for a name it cannot place
+/// (`reference/cpp/core/base/StorageIntf.cpp:1145`).
 #[test]
 fn a_missing_var_member_raises_when_it_is_read() {
     let _lock = vm_lock();
@@ -159,7 +164,7 @@ fn a_missing_var_member_raises_when_it_is_read() {
         )
         .expect_err("a missing member must raise");
     let message = error.to_string();
-    assert!(message.contains("cannot open memfile:"), "{message}");
+    assert!(message.contains("Cannot open storage"), "{message}");
 }
 
 /// A scheme that no media registered is not a storage the namespace can

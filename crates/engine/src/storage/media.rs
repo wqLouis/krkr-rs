@@ -49,8 +49,11 @@ pub trait StorageMedia {
     ///
     /// # Errors
     ///
-    /// A provider that cannot read the entry reports it as
-    /// [`StorageReadError::Media`], carrying the message its own domain
-    /// raises. The message travels to the caller unchanged.
+    /// An entry that does not exist is [`StorageReadError::NotFound`]: a
+    /// member that is absent is a missing storage, and the caller decides
+    /// what a missing member means. A provider that cannot read an entry
+    /// that is there reports it as [`StorageReadError::Media`], carrying the
+    /// message its own domain raises. The message travels to the caller
+    /// unchanged.
     fn read(&self, path: &str) -> Result<Vec<u8>, StorageReadError>;
 }

@@ -16,9 +16,10 @@
 //! through `PropGet`, so a property's getter runs and an array's numeric
 //! member is the element it names.
 //!
-//! The three failures keep their own wording: `no such domain:%1` for a
-//! domain that is not `.`, `invalid path:%1` for a path without a member
-//! separator and `cannot open memfile:%1` for an entry that is not a file.
+//! The two failures keep their own wording: `no such domain:%1` for a
+//! domain that is not `.` and `invalid path:%1` for a path without a member
+//! separator. An entry that is not a file is a missing storage: the member
+//! is not there, so the caller decides what a missing member means.
 #![allow(unsafe_code)]
 
 use std::thread::ThreadId;
@@ -131,7 +132,9 @@ impl StorageMedia for VarMedia {
     fn read(&self, path: &str) -> Result<Vec<u8>, StorageReadError> {
         match self.resolve(path)? {
             Some(bytes) => Ok(bytes),
-            None => Err(self.error(format!("cannot open memfile:var://{path}"))),
+            // An entry that is not a file is a missing storage, not a
+            // failure: the caller decides what a missing member means.
+            None => Err(StorageReadError::NotFound(path.to_string())),
         }
     }
 }

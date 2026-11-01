@@ -152,6 +152,17 @@ plugin installs it when it is linked, and the motion player installs it when
 it registers a motion container, because the player reads that container's
 pixel chunks through the media.
 
+A member the container does not hold is a **missing storage**, not a failure
+of the media: the reference answers the existence check with the container's
+resource table (`reference/cpp/plugins/psbfile/PSBMedia.cpp:24-27`), so such a
+member is not there, and the storage manager raises `Cannot open storage
+<name>` for a name it cannot place
+(`reference/cpp/core/base/StorageIntf.cpp:1145`). The port's provider reports
+the absent member as a typed not-found, and the caller decides what a missing
+member means — the province load of a graphic ignores it
+(`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1662-1682`), while a
+stream open raises.
+
 ## State and lifetime
 
 * The parsed document lives in the native instance payload; nothing lives in
@@ -181,7 +192,7 @@ pixel chunks through the media.
 
 | file | what it pins |
 |---|---|
-| `crates/compat/tests/psb_file.rs` | the container fixture and the header layout, the constructor forms, `load`'s argument handling and its `true` / `false` results, the raising storage failure, the `root` dictionary and the value shapes, the octet resource member (its bytes and its installation without a script round trip), the `psb://` registration of the root-level resources (and the absence of the nested ones), the title's route through the `var://` media, and a parse failure keeping the previous document |
+| `crates/compat/tests/psb_file.rs` | the container fixture and the header layout, the constructor forms, `load`'s argument handling and its `true` / `false` results, the raising storage failure, the `root` dictionary and the value shapes, the octet resource member (its bytes and its installation without a script round trip), the `psb://` registration of the root-level resources (and the absence of the nested ones), a packed graphic whose province member the container does not hold, the title's route through the `var://` media, and a parse failure keeping the previous document |
 
 ## Known gaps
 

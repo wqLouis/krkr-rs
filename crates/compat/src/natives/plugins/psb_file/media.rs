@@ -118,16 +118,17 @@ impl PsbMedia {
             .insert(container.to_string(), PsbContainer { document, scope });
     }
 
-    /// The bytes of the entry `path` names.
+    /// The container and the resource the entry `path` names.
     ///
     /// `path` is the storage name with its scheme removed:
-    /// `<container>/<member path>`.
-    fn lookup(&self, path: &str) -> Option<Vec<u8>> {
+    /// `<container>/<member path>`. `None` when the media holds no container
+    /// under that name, or the container holds no member under that path.
+    fn lookup(&self, path: &str) -> Option<(Rc<PsbDocument>, ResourceRef)> {
         let (container, member) = path.split_once('/')?;
         let containers = self.containers.borrow();
         let entry = containers.get(&normalize_psb_domain(container))?;
         let reference = entry.resource(member)?;
-        entry.document.resource_bytes(reference).map(<[u8]>::to_vec)
+        Some((Rc::clone(&entry.document), reference))
     }
 }
 
@@ -152,13 +153,17 @@ impl StorageMedia for PsbProvider {
     }
 
     fn read(&self, path: &str) -> Result<Vec<u8>, StorageReadError> {
-        self.media
-            .lookup(path)
+        let Some((document, reference)) = self.media.lookup(path) else {
+            // A member the container does not hold is a missing storage, not
+            // a failure: the caller decides what a missing member means.
+            return Err(StorageReadError::NotFound(path.to_string()));
+        };
+        document
+            .resource_bytes(reference)
+            .map(<[u8]>::to_vec)
             .ok_or_else(|| StorageReadError::Media {
                 media: "psb".to_string(),
-                // The storage manager raises this when a media hands back no
-                // stream.
-                message: format!("Cannot open storage psb://{path}"),
+                message: format!("the container carries no bytes for psb://{path}"),
             })
     }
 }

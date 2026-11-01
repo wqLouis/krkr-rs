@@ -6,8 +6,8 @@
 //! (`reference/cpp/plugins/psbfile/PSBHeader.h:8-40`,
 //! `parsePSBHeader` at `:54-85`). The tests drive the class through TJS
 //! against a bound [`CompatHost`] with a host-backed storage (so the
-//! embedded-image bridge can stage its temporary file) and a synthetic
-//! `media` codec installed through the `Bitmap` seam.
+//! embedded-image bridge can stage its temporary file). The test that loads
+//! a graphic installs the real L1 `media` codec through the `Bitmap` seam.
 
 mod common;
 
@@ -17,6 +17,8 @@ use common::vm_lock;
 use compat::CompatHost;
 use engine::{Scene, Storage};
 use fs::FileSystem;
+use media::{Media, decode_image, probe_image};
+use testkit::{encode_png, pattern};
 use tjs::{Tjs2Engine, TjsValue};
 
 // ---------------------------------------------------------------------------
@@ -234,6 +236,14 @@ fn objects_v2(entries: &[(u32, Vec<u8>)]) -> Vec<u8> {
 /// data and finally the root `Objects` value
 /// (`reference/cpp/plugins/psbfile/PSBFile.cpp:328-527`).
 fn build_fixture() -> Vec<u8> {
+    build_fixture_with_chunk(b"FAKEIMAGE")
+}
+
+/// The same fixture, with the given bytes as the container's one chunk.
+///
+/// The chunk is the resource the root's `res` member names, so a test that
+/// loads an image stores the image's bytes here.
+fn build_fixture_with_chunk(chunk: &[u8]) -> Vec<u8> {
     let names = [
         "id", "num", "str", "arr", "res", "flag", "nothing", "spec", "a", "b", "sub", "realv",
         "big", "nested",
@@ -253,7 +263,7 @@ fn build_fixture() -> Vec<u8> {
     let string_offsets = vec![0u32, 6, 12, 19];
     let strings_section = psb_list(&string_offsets, 4);
 
-    let resource = b"FAKEIMAGE".to_vec();
+    let resource = chunk.to_vec();
     let chunk_offsets = vec![0u32];
     let chunk_lengths = vec![resource.len() as u32];
 
@@ -372,6 +382,17 @@ impl Env {
         std::fs::write(self._dir.path().join(name), bytes).expect("write fixture");
     }
 
+    /// Install the real L1 image codec, so a graphic the container holds
+    /// decodes the way the game decodes it.
+    fn install_image_codec(&self) {
+        let media = Media::new();
+        self._host.set_image_codec(
+            move |bytes, hint| decode_image(&media, bytes, hint).map_err(|error| error.to_string()),
+            move |bytes, hint| probe_image(&media, bytes, hint).map_err(|error| error.to_string()),
+            |_name, _type, _width, _height, _rgba| Ok(()),
+        );
+    }
+
     fn run(&self, script: &str) {
         self.engine
             .exec_script(script, "psb-file-test")
@@ -468,6 +489,40 @@ fn load_registers_psb_resources_in_the_psb_media() {
         env.int("missing"),
         0,
         "an unregistered key must not resolve"
+    );
+}
+
+/// A packed graphic whose province image the container does not hold loads
+/// without a plane.
+///
+/// The reference finds the province image with an existence check
+/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1662-1682`): a
+/// container that does not hold the province member leaves the province name
+/// empty, and the load itself succeeds
+/// (`reference/cpp/core/visual/LayerIntf.cpp:2847-2875`). The member the
+/// container does not hold is a missing storage, so the province load leaves
+/// the plane empty instead of failing the load.
+#[test]
+fn a_graphic_without_a_province_image_loads_from_a_packed_container() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.install_image_codec();
+    // The container holds the graphic and no province graphic.
+    let image = encode_png(4, 4, &pattern(4, 4));
+    env.write_fixture("packed.psb", &build_fixture_with_chunk(&image));
+
+    env.run(
+        "var f = new PSBFile(); \
+         f.load('packed.psb'); \
+         var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.loadImages('psb://packed.psb/res');",
+    );
+
+    assert_eq!(
+        env.int("l.provinceImageBufferPitch"),
+        0,
+        "a container without the province member leaves the plane empty"
     );
 }
 
