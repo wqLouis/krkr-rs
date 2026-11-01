@@ -384,6 +384,29 @@ residuals:
   `title_bg_main_p` — so a title that arms its map with the convention alone
   has no clickable region. The map's own tag (`[mapimage]`) names the plane
   explicitly and is unaffected; see `docs/code/compat/kag/map.md`.
+* **The text layout breaks the line on `%n` and on `newline()`, where the
+  tree build does neither.** The tree build's `%` switch knows no `n` escape
+  (`reference/cpp/plugins/TextRender.cpp:483-688`) and raises
+  `expected any of 'fbiseBSrCRLpdwD0123456789'` on it, and its `newline()`
+  is a stub that only logs a warning (`:310`, registered at `:1076`). The
+  shipped build breaks the line on both: its `%` dispatch selects the `n`
+  case (`textrender.dll`, wamsoft `textrend` 1.0.0.1, sha256[:12]
+  `44d7b0566c2f`, the case at `0x1000c42e`) and breaks the line through the
+  same routine as its `\n` escape (`0x10007440`), and its `newline` method
+  (at `0x1000a0e0`) does the same. A game needs it: the scenario text of the
+  title under test carries `%n;` as its own newline markup — 835 times over
+  29 PSB scenario files — and it uses the count in front of the `;` as well
+  (`%n2;`, `%n5;`, `%n6;`), so the escape is the paragraph break of that
+  game. The port therefore breaks the line on `%n` (with the count the
+  shipped build reads) and on `newline()`
+  (`crates/compat/src/natives/plugins/text_render/layout.rs`,
+  `crates/compat/src/natives/plugins/text_render/mod.rs`). Scope: the text
+  layout's newline handling; the surface is unchanged (`newline` was already
+  registered). Recorded as an approximation with its reference gap (D36); the
+  shipped build is the oracle (D38). Two of the four shipped builds carry the
+  escape (`44d7b0566c2f` and `da1c09f846aa`) and two do not
+  (`0a014cc2b581` and `f180790ea6d1`), so the escape is a per-build
+  extension: the games whose scenarios use it ship a build that has it.
 
 ## 5. Dialogs and popups
 

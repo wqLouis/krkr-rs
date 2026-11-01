@@ -360,19 +360,37 @@ extern "C" fn text_render_done(
     }
 }
 
-/// `newline()` — the reference logs a warning and does nothing.
+/// `newline()` — break the line: the pending characters are flushed and the
+/// next line starts below the current one.
 extern "C" fn text_render_newline(
-    _engine: *mut c_void,
-    _instance: *mut c_void,
+    engine: *mut c_void,
+    instance: *mut c_void,
     _argc: c_int,
     _argv: *const Value,
     out: *mut Value,
-    _out_error: *mut *mut c_char,
+    out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    log::warn!("TextRenderBase.newline: no support newline");
-    set_void(out);
-    0
+    let Some(resolved) = resolve(engine) else {
+        return report_error(
+            out_error,
+            "TextRenderBase.newline: compat context is not bound",
+        );
+    };
+    let ctx = resolved.ctx();
+    let service = match crate::resource::text_service(&ctx) {
+        Ok(service) => service,
+        Err(error) => return report_error(out_error, &error),
+    };
+    // SAFETY: `instance` is the live payload for the call.
+    let inst = unsafe { &mut *(instance as *mut TextRenderInst) };
+    match inst.break_line(&ctx, service) {
+        Ok(()) => {
+            set_void(out);
+            0
+        }
+        Err(error) => report_error(out_error, &error),
+    }
 }
 
 /// `resetFont()` — restore the default style.

@@ -44,16 +44,13 @@ impl TextRenderInst {
                 '%' => {
                     let format = read_char(&chars, &mut i)
                         .ok_or_else(|| parse_error("expected character, found EOF"))?;
-                    self.handle_percent(&chars, &mut i, format)?;
+                    self.handle_percent(ctx, engine, &chars, &mut i, format)?;
                 }
                 '\\' => {
                     let escaped = read_char(&chars, &mut i)
                         .ok_or_else(|| parse_error("expected character, found EOF"))?;
                     match escaped {
-                        'n' => {
-                            self.flush(ctx, engine, false)?;
-                            self.perform_linebreak(ctx, engine)?;
-                        }
+                        'n' => self.break_line(ctx, engine)?,
                         't' => self.push_character(ctx, engine, '\t')?,
                         'i' => self.indent = self.x,
                         'r' => self.indent = 0,
@@ -85,6 +82,8 @@ impl TextRenderInst {
     /// The body of a `%` escape (reference `switch(ch)` after `readchar`).
     fn handle_percent(
         &mut self,
+        ctx: &CompatCtx,
+        engine: &mut TextEngine,
         chars: &[char],
         i: &mut usize,
         format: char,
@@ -118,6 +117,15 @@ impl TextRenderInst {
             'r' => self.reset_font(),
             'l' => {
                 let _ = read_until(chars, i, ';')?;
+            }
+            // The `%n` escape breaks the line: the pending run is flushed and
+            // the text after the escape continues on the next line. Its
+            // parameter is the number of breaks; an absent parameter is one.
+            'n' => {
+                let count = read_break_count(chars, i);
+                for _ in 0..count {
+                    self.break_line(ctx, engine)?;
+                }
             }
             'p' => self.state.pitch = read_integer(chars, i, 0)?,
             'd' | 'w' => {
@@ -227,6 +235,20 @@ impl TextRenderInst {
 
     /// Reference `pushGraphicalCharacter`: an empty stub in the reference.
     fn push_graphical_character(&mut self, _graph: &str) {}
+
+    /// Break the line: flush the pending characters and start the next line
+    /// below the current one.
+    ///
+    /// The `\n` escape, the `%n` escape and the `newline` member all break
+    /// the line this way.
+    pub(super) fn break_line(
+        &mut self,
+        ctx: &CompatCtx,
+        engine: &mut TextEngine,
+    ) -> Result<(), String> {
+        self.flush(ctx, engine, false)?;
+        self.perform_linebreak(ctx, engine)
+    }
 
     /// Reference `performLinebreak`.
     fn perform_linebreak(
@@ -390,6 +412,48 @@ fn read_integer(chars: &[char], i: &mut usize, mut value: i32) -> Result<i32, St
         return Err(parse_error(&format!(
             "expected either integer or ';', found '{c}'"
         )));
+    }
+}
+
+/// The `%n` escape's parameter: the number of line breaks.
+///
+/// The count is an optional signed integer. It ends at the `;`, which is
+/// consumed, or at any other character, which is left unread. An absent
+/// count is one break.
+fn read_break_count(chars: &[char], i: &mut usize) -> i32 {
+    let mut run = String::new();
+    while let Some(c) = read_char(chars, i) {
+        match c {
+            '0'..='9' | '-' => run.push(c),
+            ';' => break,
+            _ => {
+                // The character is not part of the count: leave it unread.
+                *i -= 1;
+                break;
+            }
+        }
+    }
+    if run.is_empty() {
+        return 1;
+    }
+
+    let (negative, digits) = match run.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, run.as_str()),
+    };
+    let mut value: i32 = 0;
+    for c in digits.chars() {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        value = value
+            .wrapping_mul(10)
+            .wrapping_add(i32::from(c as u8 - b'0'));
+    }
+    if negative {
+        value.wrapping_neg()
+    } else {
+        value
     }
 }
 

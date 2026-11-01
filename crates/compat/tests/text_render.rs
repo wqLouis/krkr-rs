@@ -555,6 +555,99 @@ fn text_render_parser_handles_the_kag_markup() {
     assert_eq!(env.eval_string("t.renderText"), "AB");
 }
 
+/// The `%n` escape breaks the line: the pending run is flushed and the text
+/// after the escape continues on the next line. Its parameter is the number
+/// of breaks; an absent parameter is one break.
+///
+/// The reference's `%` switch has no `n` case
+/// (`reference/cpp/plugins/TextRender.cpp:483-688`) and its `newline()` is a
+/// stub that only logs a warning (`:310`, registered at `:1076`), so the
+/// escape is the shipped build's: `textrender.dll` (wamsoft `textrend`
+/// 1.0.0.1), sha256[:12] `44d7b0566c2f`, whose `%` dispatch selects the `n`
+/// case at `0x1000c42e` and breaks the line through the same routine as its
+/// `\n` escape (`0x10007440`). The shipped build reads the count before the
+/// `;` and breaks the line that often; the game's own scenario text uses
+/// `%n;`, `%n2;`, `%n5;` and `%n6;`.
+#[test]
+fn text_render_percent_n_escape_breaks_the_line() {
+    let _lock = vm_lock();
+    let Some((env, name)) = Env::with_font() else {
+        return;
+    };
+    env.run(&format!(
+        "var t = new TextRenderBase(); t.defaultFace = '{name}'; t.setRenderSize(1000, 1000);"
+    ));
+
+    // `%n;` breaks the line: the character after the escape is on the next
+    // line and the `;` is consumed.
+    env.run("t.render('A%n;B', 0, 0, 0, false); t.done();");
+    assert_eq!(env.eval_int("t.calcShowCount()"), 2);
+    assert_eq!(env.eval_string("t.renderText"), "AB");
+    let first_y = env.eval_int("t.getCharacters(0, 0)[0].y");
+    let second_y = env.eval_int("t.getCharacters(0, 0)[1].y");
+    assert_eq!(first_y, 0);
+    assert!(
+        second_y > first_y,
+        "the escape should break the line (first y {first_y}, second y {second_y})"
+    );
+
+    // The parameter is the number of breaks, so `%n2;` leaves a blank line.
+    env.run("t.clear(); t.render('A%n2;B', 0, 0, 0, false); t.done();");
+    assert_eq!(env.eval_int("t.calcShowCount()"), 2);
+    assert_eq!(env.eval_string("t.renderText"), "AB");
+    let third_y = env.eval_int("t.getCharacters(0, 0)[1].y");
+    assert_eq!(
+        third_y - second_y,
+        second_y - first_y,
+        "every break advances the line by the ascent plus the line spacing"
+    );
+
+    // An escape without its `;` breaks the line once and leaves the rest of
+    // the text alone.
+    env.run("t.clear(); t.render('A%nB', 0, 0, 0, false); t.done();");
+    assert_eq!(env.eval_string("t.renderText"), "AB");
+    assert_eq!(env.eval_int("t.calcShowCount()"), 2);
+
+    // A `%` that does not start `%n;` keeps the parser's own behaviour.
+    assert!(
+        env.error("t.render('A%z', 0, 0, 0, false)")
+            .contains("expected any of")
+    );
+}
+
+/// `newline()` breaks the line: the pending characters are flushed and the
+/// next line starts below the current one.
+///
+/// The reference's `newline()` is a stub that only logs a warning
+/// (`reference/cpp/plugins/TextRender.cpp:310`, registered at `:1076`); the
+/// shipped build's `newline` method (`textrender.dll`, sha256[:12]
+/// `44d7b0566c2f`, at `0x1000a0e0`) breaks the line through the same
+/// routine as its `\n` escape, and the game's own language renderer calls
+/// the member when it switches the language.
+#[test]
+fn text_render_newline_breaks_the_line() {
+    let _lock = vm_lock();
+    let Some((env, name)) = Env::with_font() else {
+        return;
+    };
+    env.run(&format!(
+        "var t = new TextRenderBase(); t.defaultFace = '{name}'; t.setRenderSize(1000, 1000);"
+    ));
+
+    env.run("t.render('A', 0, 0, 0, false); t.done();");
+    env.run("t.newline();");
+    env.run("t.render('B', 0, 0, 0, false); t.done();");
+    assert_eq!(env.eval_int("t.calcShowCount()"), 2);
+    assert_eq!(env.eval_string("t.renderText"), "AB");
+    let first_y = env.eval_int("t.getCharacters(0, 0)[0].y");
+    let second_y = env.eval_int("t.getCharacters(0, 0)[1].y");
+    assert_eq!(first_y, 0);
+    assert!(
+        second_y > first_y,
+        "the member should break the line (first y {first_y}, second y {second_y})"
+    );
+}
+
 /// Every parse failure is thrown as a typed message: EOF right after `%`
 /// (`reference/cpp/plugins/TextRender.cpp:463-468`), the integer reader
 /// (`TextRender.cpp:423-451`), an unknown `%` escape
@@ -684,9 +777,8 @@ fn text_render_set_render_size_clears_state() {
 }
 
 /// `renderCount` and `keyWait` are one-way: their setters throw the
-/// reference's messages (`reference/cpp/plugins/TextRender.cpp:315,346`),
-/// `getKeyWait`/`keyWait` return an empty array (`TextRender.cpp:1056-1061`)
-/// and `newline` only logs (`TextRender.cpp:310`).
+/// reference's messages (`reference/cpp/plugins/TextRender.cpp:315,346`) and
+/// `getKeyWait`/`keyWait` return an empty array (`TextRender.cpp:1056-1061`).
 #[test]
 fn text_render_refused_setters_and_key_wait() {
     let _lock = vm_lock();
@@ -698,9 +790,6 @@ fn text_render_refused_setters_and_key_wait() {
     // Both the method and the property return an empty array.
     assert_eq!(env.eval_int("t.getKeyWait().count"), 0);
     assert_eq!(env.eval_int("t.keyWait.count"), 0);
-
-    // `newline` is the reference's no-op.
-    env.run("t.newline();");
 }
 
 /// `TextRenderOptions::deserialize` checks for an object and does nothing

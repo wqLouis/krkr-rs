@@ -31,7 +31,7 @@ and reports the result to the script.
 | `getCharacters(start, end)` | method | the positioned characters as a TJS `Array` of dictionaries |
 | `clear()` | method | drops the placed characters and restores the default style |
 | `done()` | method | flushes the pending character buffer |
-| `newline()` | method | logs a warning and changes nothing |
+| `newline()` | method | breaks the line: the pending characters are flushed and the next line starts below the current one |
 | `resetFont()` | method | restores the default style |
 | `resetStyle()` | method | restores the default style |
 | `getKeyWait()` | method | an empty `Array` |
@@ -125,6 +125,7 @@ The escapes the parser understands:
 | `%p<n>;` | sets the character pitch |
 | `%d<n>;`, `%w<n>;`, `%D<n>;` | the integer is read and discarded |
 | `%l…;` | the text up to `;` is read and discarded |
+| `%n…;` | breaks the line; the number in front of the `;` is the number of breaks, and an absent number is one break |
 | `%B`, `%S` | the font size becomes the big or the small size of the default style |
 | `%C`, `%R`, `%L` | logged and ignored |
 | `%<n>;` | the font size becomes `defaultFontSize * n / 100` |
@@ -343,7 +344,7 @@ raises the same message.
 |---|---|
 | `crates/compat/tests/textrender.rs` | the style dictionary's two spellings — the lower-case names the shipped `textrender.dll` reads, the camel-case names the class properties use, the lower-case name winning when a dictionary carries both — and the drawn characters carrying the dictionary's colour, shadow colour, edge colour and size |
 | `crates/compat/tests/fixtures/textrender_dll_state.txt` | every style member the shipped build reads, in the order its deserializer reads them, with the offset of each member's wide string in the binary, the state field it fills, the class property that shows it and the value the test drives it with |
-| `crates/compat/tests/text_render.rs` | the defaults and the style round-trip, the derived `renderRight` / `renderBottom`, the layout against the engine's text engine, the line break at the box width, the KAG markup parser, the typed parse errors, the unknown-face fallback, the `"user"` face through the scene font, `setDefault` / `clear` / `resetFont` / `resetStyle`, `setRenderSize`, the refused setters and `keyWait`, the ignored `setOption`, the argument counts, the flag escapes at the end of the text, the surrogate-pair rejection and the `getCharacters` ranges |
+| `crates/compat/tests/text_render.rs` | the defaults and the style round-trip, the derived `renderRight` / `renderBottom`, the layout against the engine's text engine, the line break at the box width, the KAG markup parser, the `%n` escape and the `newline` member breaking the line, the typed parse errors, the unknown-face fallback, the `"user"` face through the scene font, `setDefault` / `clear` / `resetFont` / `resetStyle`, `setRenderSize`, the refused setters and `keyWait`, the ignored `setOption`, the argument counts, the flag escapes at the end of the text, the surrogate-pair rejection and the `getCharacters` ranges |
 | `crates/compat/src/natives/plugins/text_render/mod.rs` (the `tests` module) | that the class registers and that a fresh instance carries the reference's defaults |
 | `crates/compat/tests/add_font.rs` | the `System.addFont` registry the plugin consults for a face; the plugin itself is not exercised there |
 | `crates/compat/tests/text.rs` | the decoding of the script text a game hands to `render` (the `FE FE` cipher, the zlib container, the BOMs and CP932); the plugin itself is not exercised there |
@@ -419,3 +420,19 @@ the error cases assert a typed error rather than a fabricated metric.
   the reference's defaults and reads a colour as the number the dictionary
   carries, so the alpha byte of the shipped build's defaults does not reach
   the port.
+* The tree build's parser knows no `%n` escape — it raises `expected any of
+  'fbiseBSrCRLpdwD0123456789'` on it
+  (`reference/cpp/plugins/TextRender.cpp:483-688`) — and its `newline()`
+  only logs a warning (`:310`, registered at `:1076`). The shipped build
+  breaks the line on both: its `%` dispatch selects the `n` case and breaks
+  the line through the same routine as its `\n` escape (`textrender.dll`,
+  sha256[:12] `44d7b0566c2f`, the case at `0x1000c42e`, the routine at
+  `0x10007440`), and its `newline` method does the same (`0x1000a0e0`). The
+  escape's parameter is the number of breaks and an absent parameter is one
+  break. A game needs it: the scenario text of the title under test carries
+  `%n;` 835 times over 29 PSB scenario files and uses the count as well
+  (`%n2;`, `%n5;`, `%n6;`). The port follows the shipped build. The escape
+  is a per-build extension — the builds `44d7b0566c2f` and `da1c09f846aa`
+  carry it, the build `0a014cc2b581` this page cites elsewhere does not. The
+  parser's error message keeps the tree build's escape set, so it does not
+  name `n`.
