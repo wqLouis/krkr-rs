@@ -5,6 +5,8 @@
 //! The storage-backed members (`execStorage` / `evalStorage` /
 //! `compileStorage`) are verified to require an attached L2 storage; their
 //! end-to-end resolution is covered by the L2 `engine` tests.
+//! `evalStorage` is also exercised against a mounted L2 storage: it
+//! evaluates an expression-shaped storage and runs a script-shaped one.
 
 mod common;
 
@@ -673,6 +675,46 @@ fn storage_backed_members_require_an_attached_storage() {
             "{expression:?} should report the missing storage, got: {message}"
         );
     }
+}
+
+#[test]
+fn eval_storage_evaluates_an_expression_shaped_storage() {
+    let _lock = vm_lock();
+    let env = common::Env::with_storage();
+    let dir = env.game_dir().expect("the temp game directory");
+    // The KAG's save data is a `(const) %[...]` literal and the KAG reads it
+    // back through `Scripts.evalStorage`
+    // (`reference/cpp/core/base/ScriptMngIntf.cpp:1348-1350`).
+    std::fs::write(dir.join("datasc.ksd"), "(const) %[\"chSpeed\" => 30]\n")
+        .expect("write the storage");
+    let value = env.eval_ok("Scripts.evalStorage('datasc.ksd')");
+    assert!(
+        matches!(value, TjsValue::Object),
+        "the evaluated storage should be the dictionary, got {value:?}"
+    );
+}
+
+#[test]
+fn eval_storage_runs_a_script_shaped_storage() {
+    let _lock = vm_lock();
+    let env = common::Env::with_storage();
+    let dir = env.game_dir().expect("the temp game directory");
+    // A game loads its own class definitions through the same member
+    // (`reference/cpp/core/base/ScriptMngIntf.cpp:713-729`). The TJS2's
+    // expression mode compiles the text as `return <text>;`
+    // (`crates/tjs/cpp/tjs2/tjsLex.cpp:1676-1681`), so a script-shaped
+    // storage — a class or a function definition — is a grammar error there
+    // and has to run as a script.
+    std::fs::write(
+        dir.join("macro_SliderLayer.tjs"),
+        "class SKN_Slider { var value; }\n",
+    )
+    .expect("write the storage");
+    env.eval_ok("Scripts.evalStorage('macro_SliderLayer.tjs')");
+    assert_eq!(
+        env.eval_ok("typeof SKN_Slider"),
+        TjsValue::String("Object".into())
+    );
 }
 
 #[test]

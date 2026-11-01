@@ -626,6 +626,17 @@ native OS popup would be a deliberate divergence, and Linux has nothing to call
 * **`Scripts.propGet` ignores the caller's flag for the read.** The reference
   passes the flag to `PropGet` (`reference/cpp/plugins/scriptsEx.cpp:890-905`),
   so `Scripts.propGet(obj, key, Scripts.pfIgnoreProp)` returns the raw member;
+* **`Scripts.evalStorage` runs a script-shaped storage.** The reference
+  evaluates it as an expression: `evalStorage` passes `isexpression = true`
+  (`reference/cpp/core/base/ScriptMgnIntf.cpp:1335-1354`) and
+  `TVPExecuteStorage` selects the expression compiler
+  (`reference/cpp/core/base/ScriptMgnIntf.cpp:805-808`), so a storage whose
+  text is a class or function definition is a grammar error there. The port
+  evaluates first and, when the evaluation fails, runs the same text as a
+  script, so a game that loads its own class definitions through this member
+  works. Scope: the member's expression-versus-script handling; a storage
+  that is an expression and raises at run time is evaluated twice. Recorded
+  as an approximation with its reference gap (D36).
   the port calls the default member instead
   (`crates/compat/src/natives/plugins/scripts_ex/mod.rs`).
 * **A script window starts visible; the reference starts it hidden.** The

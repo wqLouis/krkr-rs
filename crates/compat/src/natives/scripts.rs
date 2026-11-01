@@ -10,7 +10,7 @@
 //! | member | behavior |
 //! |---|---|
 //! | `execStorage(name[, mode[, context]])` | read `name` through the L2 storage and execute it as a script; an explicit top-level `return` is the result |
-//! | `evalStorage(name[, mode[, context]])` | read `name` and evaluate it as an expression |
+//! | `evalStorage(name[, mode[, context]])` | read `name` and evaluate it: an expression-shaped storage yields its value, a script-shaped storage runs as a script |
 //! | `exec(script[, name[, lineofs[, context]]])` | execute a raw script string |
 //! | `eval(expression[, name[, lineofs[, context]]])` | evaluate a raw expression |
 //! | `compileStorage(name, output[, isresult[, outputdebug[, isexpression]]])` | compile a storage script to a bytecode file |
@@ -614,15 +614,59 @@ fn execute_storage(
     }
     let units = decode_storage_units(name, &bytes, encoding)?;
     let result = if expression {
-        engine.eval_retained_wide_with_context(&units, block_name, context, 0)
+        evaluate_storage(engine, &units, block_name, context)
     } else {
-        engine.exec_script_retained_wide_with_context(&units, block_name, context, 0)
+        engine
+            .exec_script_retained_wide_with_context(&units, block_name, context, 0)
+            .map_err(|error| error.to_string())
     };
-    result.map_err(|error| {
-        let error = error.to_string();
-        log_script_failure(name, &String::from_utf16_lossy(&units), &error);
-        error
+    result.inspect_err(|error| {
+        log_script_failure(name, &String::from_utf16_lossy(&units), error);
     })
+}
+
+/// Evaluate a storage's text for `Scripts.evalStorage`.
+///
+/// The member evaluates the storage, so a storage that is an expression
+/// yields its value — the KAG reads its save data back through it, and that
+/// data is a `(const) %[...]` literal — and a storage that is a script runs:
+/// a game loads its own class definitions that way.
+///
+/// The VM's expression mode compiles the text as `return <text>;`, so a
+/// script-shaped storage — a class or a function definition — is a grammar
+/// error there. The script mode compiles the same text as statements and
+/// runs it, which is what such a storage needs.
+///
+/// The evaluation runs first, so a storage that is an expression runs once,
+/// and a storage that is not one never ran, so the script mode runs it once.
+/// A storage that is an expression and raises at run time is evaluated
+/// twice: the evaluation raises and the script mode runs the same text
+/// again.
+///
+/// # Errors
+///
+/// Returns the storage's own error: the script mode's when it fails, and for
+/// a storage that is neither an expression nor a script that is the same
+/// grammar error the evaluation reports.
+fn evaluate_storage(
+    engine: &Tjs2Engine,
+    units: &[u16],
+    block_name: &str,
+    context: *mut c_void,
+) -> Result<RetainedValue, String> {
+    match engine.eval_retained_wide_with_context(units, block_name, context, 0) {
+        Ok(value) => Ok(value),
+        Err(evaluation) => {
+            // The storage is not an expression: run it as a script. The
+            // script mode's error is the storage's own error, and for a
+            // storage that is neither an expression nor a script it is the
+            // same grammar error the evaluation reports.
+            log::debug!("the storage is not an expression: {evaluation}");
+            engine
+                .exec_script_retained_wide_with_context(units, block_name, context, 0)
+                .map_err(|error| error.to_string())
+        }
+    }
 }
 
 /// Execute storage `name` as a script through `engine`: the core of

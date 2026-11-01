@@ -171,7 +171,7 @@ L2 `Storage` (the mounts, the auto paths, `find`, `exists`, `read`,
 
 | Member | Behaviour |
 |---|---|
-| `execStorage(name[, mode[, context]])`, `evalStorage(...)` | read the storage and run it as a script / expression; an explicit top-level `return` is the result. The `mode` honours the reference's `oN` byte offset; `context` is the script's `this`. |
+| `execStorage(name[, mode[, context]])`, `evalStorage(...)` | read the storage and run it as a script / evaluate it: an expression-shaped storage yields its value, a script-shaped storage runs as a script. An explicit top-level `return` is the result of `execStorage`. The `mode` honours the reference's `oN` byte offset; `context` is the script's `this`. |
 | `exec(script[, name[, lineofs[, context]]])`, `eval(...)` | run a string. |
 | `compileStorage(name, output[, isresult[, outputdebug[, isexpression]]])` | compile to a bytecode file. A storage script is offered to the TJS2 **bytecode loader first** and decoded as text only when the loader rejects it. |
 | `setCallMissing(obj)` | installs the `missing` handler. |

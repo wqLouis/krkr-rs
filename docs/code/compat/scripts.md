@@ -15,7 +15,7 @@ All members are static.
 | member | behaviour |
 |---|---|
 | `execStorage(name[, mode[, context]])` | runs a storage file as a script |
-| `evalStorage(name[, mode[, context]])` | evaluates a storage file as an expression |
+| `evalStorage(name[, mode[, context]])` | evaluates a storage file: an expression-shaped file yields its value, a script-shaped file runs as a script |
 | `exec(script[, name[, lineofs[, context]]])` | runs a script string |
 | `eval(expression[, name[, lineofs[, context]]])` | evaluates an expression string |
 | `compileStorage(name, output[, isresult[, outputdebug[, isexpression]]])` | writes a storage file's bytecode to `output` |
@@ -48,7 +48,11 @@ The order matters: a file with the bytecode magic that fails to load is a
 typed error, not a fall-through to the text path.
 
 `execStorage` runs the script and an explicit top-level `return` is the
-result; `evalStorage` evaluates the storage as an expression.
+result; `evalStorage` evaluates the storage: an expression-shaped storage
+yields its value, and a script-shaped storage — a class or a function
+definition — runs as a script. The TJS2's expression mode compiles the text
+as `return <text>;`, so a script-shaped storage is a grammar error there;
+`evalStorage` runs it as a script instead.
 
 The block name is the **basename** of the requested storage, not the full
 name.
@@ -168,7 +172,9 @@ and its alias normalization, `context` as `this` and `lineofs`, the storage
 basename as the block name, the debug failure excerpt, the
 `compileStorage` → `execStorage` bytecode round trip, the bytecode magic
 being rejected by the loader rather than run as text, a corrupt or truncated
-bytecode being a typed error, the "no storage" errors and the arity errors.
+bytecode being a typed error, the "no storage" errors and the arity errors,
+and `evalStorage` evaluating an expression-shaped storage and running a
+script-shaped one.
 
 ---
 
