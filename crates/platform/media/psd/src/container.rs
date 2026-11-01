@@ -4,6 +4,10 @@
 //! The container is parsed eagerly into a [`PsbValue`] tree; the raw
 //! decompressed bytes stay available so chunk reads and string lookups can be
 //! answered from the same document.
+//!
+//! A version-4 container carries a second pair of chunk tables: the chunks
+//! the extra-chunk value types name live in their own tables and their own
+//! data base, and both tables join the document's resources.
 
 use crate::decompress::{EmoteCtx, open_decompressed_stream};
 use crate::error::{PsbError, PsbResult};
@@ -122,6 +126,9 @@ struct PsbHeader {
     offset_chunk_data: u32,
     offset_entries: u32,
     checksum: u32,
+    offset_extra_chunk_offsets: u32,
+    offset_extra_chunk_lengths: u32,
+    offset_extra_chunk_data: u32,
 }
 
 impl PsbHeader {
@@ -155,10 +162,11 @@ impl PsbHeader {
                 header.checksum = reader.u32()?;
             }
             if header.version > 3 {
-                // The extra chunk tables belong to version 4, which the reader
-                // rejects; their offsets are consumed so that a short header
-                // is still a truncation.
-                reader.bytes(12)?;
+                // Version 4 adds a second pair of chunk tables and a second
+                // chunk data base for the extra chunks.
+                header.offset_extra_chunk_offsets = reader.u32()?;
+                header.offset_extra_chunk_lengths = reader.u32()?;
+                header.offset_extra_chunk_data = reader.u32()?;
             }
         }
         Ok(header)
@@ -685,6 +693,11 @@ fn apply_seed_decrypt(header: &mut PsbHeader, data: &mut [u8], seed: u32) {
         if header.version > 2 {
             decrypt_u32(&mut ctx, &mut header.checksum);
         }
+        if header.version > 3 {
+            decrypt_u32(&mut ctx, &mut header.offset_extra_chunk_offsets);
+            decrypt_u32(&mut ctx, &mut header.offset_extra_chunk_lengths);
+            decrypt_u32(&mut ctx, &mut header.offset_extra_chunk_data);
+        }
     }
     if header.version == 2 {
         let start = header.offset_encrypt as usize;
@@ -711,7 +724,7 @@ fn decrypt_u32(ctx: &mut EmoteCtx, value: &mut u32) {
 ///
 /// [`PsbError::BadSignature`] when the header is not `PSB\0`,
 /// [`PsbError::ArchiveNotPsb`] when the bytes are an MDF/MFL archive,
-/// [`PsbError::UnsupportedVersion`] for a version outside 1..=3,
+/// [`PsbError::UnsupportedVersion`] for a version outside 1..=4,
 /// [`PsbError::Encrypted`] when the container is encrypted and no seed was
 /// supplied, [`PsbError::Truncated`] when the stream ends early, and
 /// [`PsbError::Format`] when the structure is invalid.
@@ -731,7 +744,7 @@ pub fn parse(mut data: Vec<u8>, seed: i64) -> PsbResult<PsbDocument> {
     if header.is_encrypted() && header.header_length() as usize > data.len() && seed == 0 {
         return Err(PsbError::Encrypted);
     }
-    if header.version > 3 {
+    if header.version > 4 {
         return Err(PsbError::UnsupportedVersion(header.version));
     }
 
@@ -785,6 +798,23 @@ pub fn parse(mut data: Vec<u8>, seed: i64) -> PsbResult<PsbDocument> {
         let count_size = read_count_size(reader.u8()?)?;
         read_list_body(&mut reader, count_size)?
     };
+    // Version 4 keeps a second pair of chunk tables and a second chunk data
+    // base for the extra chunks.
+    let (extra_chunk_offsets, extra_chunk_lengths) = if header.version >= 4 {
+        let offsets = {
+            let mut reader = Reader::at(&data, header.offset_extra_chunk_offsets as usize);
+            let count_size = read_count_size(reader.u8()?)?;
+            read_list_body(&mut reader, count_size)?
+        };
+        let lengths = {
+            let mut reader = Reader::at(&data, header.offset_extra_chunk_lengths as usize);
+            let count_size = read_count_size(reader.u8()?)?;
+            read_list_body(&mut reader, count_size)?
+        };
+        (offsets, lengths)
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     let root = {
         let mut reader = Reader::at(&data, header.offset_entries as usize);
@@ -802,15 +832,24 @@ pub fn parse(mut data: Vec<u8>, seed: i64) -> PsbResult<PsbDocument> {
         &parser.resources,
         &mut resources,
     )?;
-    // The extra chunk table belongs to version 4, which the reader rejects, so
-    // a resource that points into it cannot be resolved.
-    if let Some(reference) = parser.extra_resources.first() {
+    if header.version >= 4 {
+        load_chunks(
+            &data,
+            header.offset_extra_chunk_data,
+            &extra_chunk_offsets,
+            &extra_chunk_lengths,
+            &parser.extra_resources,
+            &mut resources,
+        )?;
+    } else if let Some(reference) = parser.extra_resources.first() {
+        // A container without the extra chunk tables cannot resolve a chunk
+        // that names one.
         return Err(PsbError::Format(format!(
-            "chunk index {} out of range",
+            "extra chunk index {} has no chunk table",
             reference.index
         )));
     }
-    resources.sort_by_key(|(reference, _)| reference.index);
+    resources.sort_by_key(|(reference, _)| (reference.extra, reference.index));
 
     Ok(PsbDocument { root, resources })
 }
@@ -989,5 +1028,236 @@ mod tests {
             read_list_body(&mut reader, 1).unwrap(),
             vec![0x0102, 0x0304]
         );
+    }
+
+    /// A list body: a count-size byte, the count, the entry-width byte and
+    /// the little-endian entries
+    /// (`reference/cpp/plugins/psbfile/PSBFile.cpp:248-256`).
+    fn psb_list(values: &[u32], entry_width: usize) -> Vec<u8> {
+        let count = values.len() as u32;
+        let count_width = if count <= u8::MAX as u32 { 1 } else { 4 };
+        let mut out = vec![0x0D + (count_width - 1) as u8];
+        out.extend_from_slice(&count.to_le_bytes()[..count_width]);
+        out.push(0x0C + entry_width as u8);
+        for value in values {
+            out.extend_from_slice(&value.to_le_bytes()[..entry_width]);
+        }
+        out
+    }
+
+    /// The chunk table of a chunk list: the offset of every chunk from the
+    /// data base and its length.
+    fn chunk_table(chunks: &[&[u8]]) -> (Vec<u32>, Vec<u32>) {
+        let mut offsets = Vec::with_capacity(chunks.len());
+        let mut lengths = Vec::with_capacity(chunks.len());
+        let mut position = 0u32;
+        for chunk in chunks {
+            offsets.push(position);
+            lengths.push(chunk.len() as u32);
+            position += chunk.len() as u32;
+        }
+        (offsets, lengths)
+    }
+
+    /// Build a PSB container.
+    ///
+    /// The layout follows the reference header: the fixed header, the name
+    /// trie, the string offset table, the string data, the chunk offset and
+    /// length tables, the chunk data, the extra chunk tables (version 4 and
+    /// later) and the root `Objects` value
+    /// (`reference/cpp/plugins/psbfile/PSBHeader.h:54-85`,
+    /// `reference/cpp/plugins/psbfile/PSBFile.cpp:446-527`).
+    ///
+    /// `entries` are the root dictionary's members as `(name ordinal, raw
+    /// value bytes)`; the ordinal indexes `names`. `chunks` and
+    /// `extra_chunks` hold the bytes of the normal and the extra chunk
+    /// tables.
+    fn build_psb(
+        version: u16,
+        names: &[&str],
+        entries: &[(usize, Vec<u8>)],
+        chunks: &[&[u8]],
+        extra_chunks: &[&[u8]],
+    ) -> Vec<u8> {
+        let (charset, names_data, name_indexes) = encode_names(names);
+        let names_section = [
+            psb_list(&charset, 4),
+            psb_list(&names_data, 4),
+            psb_list(&name_indexes, 2),
+        ]
+        .concat();
+
+        let mut entry_offsets = Vec::with_capacity(entries.len());
+        let mut position = 0u32;
+        for (_, value) in entries {
+            entry_offsets.push(position);
+            position += value.len() as u32;
+        }
+        let name_ordinals: Vec<u32> = entries.iter().map(|(ordinal, _)| *ordinal as u32).collect();
+        let mut root = vec![0x21];
+        root.extend(psb_list(&name_ordinals, 2));
+        root.extend(psb_list(&entry_offsets, 4));
+        for (_, value) in entries {
+            root.extend(value);
+        }
+
+        let (chunk_offsets, chunk_lengths) = chunk_table(chunks);
+        let (extra_chunk_offsets, extra_chunk_lengths) = chunk_table(extra_chunks);
+
+        let header_length = match version {
+            0..=2 => 40,
+            3 => 44,
+            _ => 56,
+        };
+        let mut out = vec![0u8; header_length];
+        let offset_names = out.len() as u32;
+        out.extend_from_slice(&names_section);
+        let offset_strings = out.len() as u32;
+        out.extend_from_slice(&psb_list(&[], 4));
+        let offset_strings_data = out.len() as u32;
+        let offset_chunk_offsets = out.len() as u32;
+        out.extend_from_slice(&psb_list(&chunk_offsets, 4));
+        let offset_chunk_lengths = out.len() as u32;
+        out.extend_from_slice(&psb_list(&chunk_lengths, 4));
+        let offset_chunk_data = out.len() as u32;
+        for chunk in chunks {
+            out.extend_from_slice(chunk);
+        }
+        let (offset_extra_chunk_offsets, offset_extra_chunk_lengths, offset_extra_chunk_data) =
+            if version > 3 {
+                let offsets_at = out.len() as u32;
+                out.extend_from_slice(&psb_list(&extra_chunk_offsets, 4));
+                let lengths_at = out.len() as u32;
+                out.extend_from_slice(&psb_list(&extra_chunk_lengths, 4));
+                let data_at = out.len() as u32;
+                for chunk in extra_chunks {
+                    out.extend_from_slice(chunk);
+                }
+                (offsets_at, lengths_at, data_at)
+            } else {
+                (0, 0, 0)
+            };
+        let offset_entries = out.len() as u32;
+        out.extend_from_slice(&root);
+
+        out[0..4].copy_from_slice(b"PSB\0");
+        out[4..6].copy_from_slice(&version.to_le_bytes());
+        out[6..8].copy_from_slice(&0u16.to_le_bytes());
+        // The encryption offset equals the name offset, so the header does
+        // not read as encrypted (`reference/cpp/plugins/psbfile/PSBHeader.h:22-26`).
+        out[8..12].copy_from_slice(&offset_names.to_le_bytes());
+        out[12..16].copy_from_slice(&offset_names.to_le_bytes());
+        out[16..20].copy_from_slice(&offset_strings.to_le_bytes());
+        out[20..24].copy_from_slice(&offset_strings_data.to_le_bytes());
+        out[24..28].copy_from_slice(&offset_chunk_offsets.to_le_bytes());
+        out[28..32].copy_from_slice(&offset_chunk_lengths.to_le_bytes());
+        out[32..36].copy_from_slice(&offset_chunk_data.to_le_bytes());
+        out[36..40].copy_from_slice(&offset_entries.to_le_bytes());
+        if version > 2 {
+            out[40..44].copy_from_slice(&0u32.to_le_bytes());
+        }
+        if version > 3 {
+            out[44..48].copy_from_slice(&offset_extra_chunk_offsets.to_le_bytes());
+            out[48..52].copy_from_slice(&offset_extra_chunk_lengths.to_le_bytes());
+            out[52..56].copy_from_slice(&offset_extra_chunk_data.to_le_bytes());
+        }
+        out
+    }
+
+    /// The resource a dictionary member names.
+    fn resource_of(value: &PsbValue) -> ResourceRef {
+        match value {
+            PsbValue::Resource(reference) => *reference,
+            other => panic!("expected a resource, got {other:?}"),
+        }
+    }
+
+    /// A version-4 container with empty extra chunk tables parses: the root
+    /// dictionary resolves and the normal chunk carries its bytes
+    /// (`reference/cpp/plugins/psbfile/PSBFile.cpp:492-505`,
+    /// `reference/cpp/plugins/psbfile/PSBFile.cpp:557-570`).
+    #[test]
+    fn version_four_with_empty_extra_tables_parses() {
+        let data = build_psb(
+            4,
+            &["res"],
+            &[(0, vec![0x19, 0])],
+            &[b"chunk".as_slice()],
+            &[],
+        );
+        let document = parse(data, 0).expect("the version-4 container parses");
+        let root = document.root.as_dict().expect("the root is a dictionary");
+        let reference = resource_of(&root[0].1);
+        assert_eq!(
+            reference,
+            ResourceRef {
+                index: 0,
+                extra: false
+            }
+        );
+        assert_eq!(document.resource_bytes(reference), Some(&b"chunk"[..]));
+        assert_eq!(document.resources.len(), 1);
+    }
+
+    /// A version-4 container resolves an extra chunk from the extra chunk
+    /// tables, not from the normal ones
+    /// (`reference/cpp/plugins/psbfile/PSBFile.cpp:557-586`).
+    #[test]
+    fn version_four_extra_chunk_resolves_from_the_extra_table() {
+        let data = build_psb(
+            4,
+            &["normal", "extra"],
+            &[(0, vec![0x19, 0]), (1, vec![0x22, 0])],
+            &[b"normal-chunk".as_slice()],
+            &[b"extra-chunk".as_slice()],
+        );
+        let document = parse(data, 0).expect("the version-4 container parses");
+        let root = document.root.as_dict().expect("the root is a dictionary");
+        let normal = resource_of(&root[0].1);
+        let extra = resource_of(&root[1].1);
+        assert_eq!(
+            normal,
+            ResourceRef {
+                index: 0,
+                extra: false
+            }
+        );
+        assert_eq!(
+            extra,
+            ResourceRef {
+                index: 0,
+                extra: true
+            }
+        );
+        assert_eq!(document.resource_bytes(normal), Some(&b"normal-chunk"[..]));
+        assert_eq!(document.resource_bytes(extra), Some(&b"extra-chunk"[..]));
+        // The normal chunk comes first, the extra chunk second.
+        assert_eq!(document.resources[0].0, normal);
+        assert_eq!(document.resources[1].0, extra);
+    }
+
+    /// A version-3 container keeps its own header shape and resolves its
+    /// chunk as before (`reference/cpp/plugins/psbfile/PSBHeader.h:31-37`).
+    #[test]
+    fn version_three_keeps_its_header_shape() {
+        let data = build_psb(
+            3,
+            &["res"],
+            &[(0, vec![0x19, 0])],
+            &[b"chunk".as_slice()],
+            &[],
+        );
+        let header_length = {
+            let mut reader = Reader::at(&data, 0);
+            PsbHeader::parse(&mut reader)
+                .expect("the header parses")
+                .header_length()
+        };
+        assert_eq!(header_length, 44);
+        let document = parse(data, 0).expect("the version-3 container parses");
+        let root = document.root.as_dict().expect("the root is a dictionary");
+        let reference = resource_of(&root[0].1);
+        assert_eq!(document.resource_bytes(reference), Some(&b"chunk"[..]));
+        assert_eq!(document.resources.len(), 1);
     }
 }

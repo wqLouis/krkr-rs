@@ -800,24 +800,27 @@ fn parse_failure_returns_false_and_keeps_the_previous_document() {
     assert_eq!(env.int("num"), 1234);
 }
 
-// A version > 3 container is rejected with `false`
-// (`reference/cpp/plugins/psbfile/PSBFile.cpp:446-450`:
-// "not support psb file format version > 3" → return false).
+// A version above the supported window is rejected with `false`.
+// The reference refuses a format above version 3 with
+// "not support psb file format version > 3" → return false
+// (`reference/cpp/plugins/psbfile/PSBFile.cpp:440-442`); this port reads the
+// version-4 container the shipped motion player carries, so the refusal starts
+// above 4 and a version-5 stream does not load.
 #[test]
-fn version_above_three_returns_false() {
+fn version_above_four_returns_false() {
     let _lock = vm_lock();
     let env = Env::new();
 
-    // A v4-sized header (56 bytes) with `offsetEncrypt == offsetNames`
-    // (so it does not read as encrypted) and version 4.
-    let mut v4 = vec![0u8; 56];
-    v4[0..4].copy_from_slice(b"PSB\0");
-    v4[4..6].copy_from_slice(&4u16.to_le_bytes());
-    v4[8..12].copy_from_slice(&40u32.to_le_bytes());
-    v4[12..16].copy_from_slice(&40u32.to_le_bytes());
-    env.write_fixture("v4.psb", &v4);
+    // A version-5 header (56 bytes, the version-4 shape) with
+    // `offsetEncrypt == offsetNames` (so it does not read as encrypted).
+    let mut v5 = vec![0u8; 56];
+    v5[0..4].copy_from_slice(b"PSB\0");
+    v5[4..6].copy_from_slice(&5u16.to_le_bytes());
+    v5[8..12].copy_from_slice(&40u32.to_le_bytes());
+    v5[12..16].copy_from_slice(&40u32.to_le_bytes());
+    env.write_fixture("v5.psb", &v5);
 
-    env.run("var f = new PSBFile(); var ok = f.load('v4.psb');");
+    env.run("var f = new PSBFile(); var ok = f.load('v5.psb');");
     assert_eq!(env.int("ok"), 0);
 }
 

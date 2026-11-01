@@ -16,7 +16,7 @@ pub enum PsbError {
     /// The stream starts with the `MDF`/`MFL` archive magic.
     #[error("this looks like an MDF/MFL archive, not a PSB file")]
     ArchiveNotPsb,
-    /// The format version is outside the supported 1..=3 range.
+    /// The format version is outside the supported 1..=4 range.
     #[error("unsupported PSB version {0}")]
     UnsupportedVersion(u16),
     /// The header advertises an encrypted file and no seed was supplied.

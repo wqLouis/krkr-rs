@@ -102,20 +102,22 @@ fn psb_archive_magic_is_rejected() {
     ));
 }
 
-/// A PSB header that claims an unsupported version is rejected with the
-/// version it carries (`reference/cpp/plugins/psbfile/PSBFile.cpp:440-441`).
+/// A PSB header that claims a version outside the supported `1..=4` range is
+/// rejected with the version it carries. The reference stops at version 3
+/// (`reference/cpp/plugins/psbfile/PSBFile.cpp:440-442`); the port also
+/// reads the version-4 container, so its window ends at 4.
 #[test]
 fn unsupported_psb_version_is_reported() {
     let mut data = Vec::new();
     data.extend_from_slice(b"PSB\0");
-    data.extend_from_slice(&4u16.to_le_bytes());
+    data.extend_from_slice(&5u16.to_le_bytes());
     data.extend_from_slice(&0u16.to_le_bytes());
     data.extend_from_slice(&40u32.to_le_bytes());
     data.extend_from_slice(&40u32.to_le_bytes());
     data.extend_from_slice(&[0u8; 40]);
     assert!(matches!(
         container::parse(data, 0),
-        Err(PsbError::UnsupportedVersion(4))
+        Err(PsbError::UnsupportedVersion(5))
     ));
 }
 

@@ -66,6 +66,11 @@ stream and handles the `MDF`/`MFL` archive wrapper itself. `seed` is the
 Emote decryption seed; an encrypted file with no seed is
 `PsbError::Encrypted`.
 
+A **version-4** container carries a second pair of chunk tables and a second
+chunk data base: the chunks the extra-chunk value types name live in those
+tables, and they join the document's resources next to the normal chunks.
+The document's `resources` are ordered by `(extra, index)`.
+
 The document is parsed eagerly into the `PsbValue` tree, and the raw
 decompressed bytes stay available so the chunk reads and the string lookups
 are answered from the same document.
@@ -165,7 +170,7 @@ Two typed enums, both `#[non_exhaustive]`.
 |---|---|
 | `BadSignature([u8; 4])` | the four-byte magic was not `PSB\0` |
 | `ArchiveNotPsb` | the stream starts with the `MDF`/`MFL` archive magic |
-| `UnsupportedVersion(u16)` | the format version is outside the supported `1..=3` range |
+| `UnsupportedVersion(u16)` | the format version is outside the supported `1..=4` range |
 | `Encrypted` | the header advertises an encrypted file and no seed was supplied |
 | `Truncated(&'static str)` | the stream ended before the requested field could be read |
 | `Format(String)` | the stream is structurally invalid (bad type byte, bad index, …) |
