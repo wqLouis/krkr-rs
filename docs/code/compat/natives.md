@@ -686,6 +686,7 @@ reference. Each one is a deliberate, recorded divergence:
 |---|---|---|
 | `Storages.getPlacedPath` | a game-relative disk path or `archive>path` | an absolute `file://domain/path` |
 | `WaveSoundBuffer.bits` | always `32` | the source's bit depth |
+| `Font.defaultFaceName` | the host's default user-interface font | the last font the platform enumerated |
 | `System.touchDevice` | the constant `0x300` | the detected device class |
 | `System.createAppLock` | always `true` | a real lock |
 | `System.shellExecute`, `System.system` | inert values with a warning | the Win32 calls |

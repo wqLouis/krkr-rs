@@ -31,10 +31,10 @@ use tjs::{Tjs2Engine, TjsValue, Value};
 use crate::CompatCtx;
 use crate::storage::strip_file_media;
 
-/// The character the host's default font has to provide.
+/// The character the host's coverage face has to provide.
 ///
-/// The default font is the system's Japanese font, so the default face is
-/// the first installed face that covers a Japanese ideograph.
+/// The coverage face draws a character the requested face does not carry, so
+/// it is the first installed face that covers a Japanese ideograph.
 const DEFAULT_FALLBACK_CODEPOINT: char = '\u{4E00}';
 
 /// Host-supplied image decoder: the L1 `media::decode_image` call behind
@@ -263,8 +263,8 @@ impl ResourceResolver {
 /// faces, the attached storage, then the host's installed system fonts.
 ///
 /// When no candidate resolves, the engine's default face is used: the oldest
-/// registered face, which is the face the per-character fallback reaches for
-/// as well. Only an engine with no registered face at all raises.
+/// registered face, which supplies the metrics of the text. Only an engine
+/// with no registered face at all raises.
 ///
 /// A candidate that resolves is recorded under the requested name, so the next
 /// lookup finds the same face. The default-face fallback is not recorded: a
@@ -288,12 +288,12 @@ pub(crate) fn resolve_face(
         }
     }
     // No candidate resolved: the default face draws the text. A registry
-    // that holds no face yet gets the host's default font first, so a face
+    // that holds no face yet gets the host's coverage face first, so a face
     // the host provides is never lost to an empty registry.
     match service.default_face() {
         Some(default) => Ok(default),
         None => service
-            .install_default_face(DEFAULT_FALLBACK_CODEPOINT)
+            .install_coverage_face(DEFAULT_FALLBACK_CODEPOINT)
             .map_err(|error| format!("no font is available for face '{face}': {error}")),
     }
 }
@@ -631,7 +631,7 @@ fn draw_prerendered_text(
             let ch = char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}');
             // The character the pre-rendered font does not carry is drawn by
             // the face that maps it: the requested face first, then the
-            // default face.
+            // coverage face.
             let provider = service
                 .provider_for(font, ch)
                 .map_err(|error| format!("text rasterization failed: {error}"))?;

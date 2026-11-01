@@ -73,7 +73,7 @@ pub enum TextError {
     /// No registered face provides the character, so there is no glyph to
     /// draw and no extent to measure.
     ///
-    /// The per-character fallback reaches for the default face; when that
+    /// The per-character fallback reaches for the coverage face; when that
     /// face does not provide the character either, the character cannot be
     /// rendered at all.
     #[error("no registered face provides the character U+{codepoint:04X}")]
@@ -312,11 +312,11 @@ impl CoverageMask {
 struct LayoutKey {
     /// Registered face index.
     font: FontId,
-    /// The default face the per-character fallback reaches for.
+    /// The coverage face the per-character fallback reaches for.
     ///
-    /// The fallback decides which face draws a character, so the default face
-    /// is part of the shaping inputs.
-    default_face: Option<FontId>,
+    /// The fallback decides which face draws a character, so the coverage
+    /// face is part of the shaping inputs.
+    coverage_face: Option<FontId>,
     /// Source text.
     text: String,
     /// `size_px.to_bits()` (so the key stays `Eq`).
@@ -358,7 +358,8 @@ pub struct TextEngine {
     render_system: FontSystem,
     /// `cosmic-text` shaping/layout system (stateless service).
     cosmic: CosmicFontSystem,
-    /// The registered faces, the names they answer to and the default face.
+    /// The registered faces, the names they answer to and the two roles a
+    /// face can hold.
     registry: FontRegistry,
     /// Lazily built host font database used by [`TextEngine::load_system_font`].
     /// It is kept separate from the shaping database so that only explicitly
@@ -474,15 +475,43 @@ impl TextEngine {
         self.registry.alias(name, id);
     }
 
-    /// The font registry: the registered faces, the names they answer to and
-    /// the default face.
+    /// The font registry: the registered faces, the names they answer to, the
+    /// default face and the coverage face.
     pub fn registry(&self) -> &FontRegistry {
         &self.registry
     }
 
     /// The default face: the face registered under the oldest name.
+    ///
+    /// The default face supplies the metrics of a face name that resolves to
+    /// nothing.
     pub fn default_face(&self) -> Option<FontId> {
         self.registry.default_face()
+    }
+
+    /// The face the per-character fallback reaches for.
+    ///
+    /// The face the host designated for the role, or the default face when
+    /// the host designated none.
+    pub fn coverage_face(&self) -> Option<FontId> {
+        self.registry.coverage_face()
+    }
+
+    /// Designates an already registered face as the face the per-character
+    /// fallback reaches for.
+    ///
+    /// The per-character fallback draws a character the requested face does
+    /// not carry with this face.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TextError::UnknownFont`] when `id` is not registered.
+    pub fn designate_coverage_face(&mut self, id: FontId) -> Result<(), TextError> {
+        if self.registry.face(id).is_none() {
+            return Err(TextError::UnknownFont(id.index()));
+        }
+        self.registry.designate_coverage_face(id);
+        Ok(())
     }
 
     /// Resolves `family` against the host's installed fonts, registers the
@@ -587,7 +616,7 @@ impl TextEngine {
     /// The face that draws `codepoint` for a request for `id`.
     ///
     /// The requested face draws the character when it maps it. Otherwise the
-    /// default face draws it, when the default face maps it. A character no
+    /// coverage face draws it, when the coverage face maps it. A character no
     /// face maps has no glyph at all, and the caller is told so instead of
     /// getting another character's shape.
     ///
@@ -603,22 +632,22 @@ impl TextEngine {
         if render::has_glyph(&self.render_system, &face.render, codepoint) {
             return Ok(id);
         }
-        let Some(default) = self.registry.default_face() else {
+        let Some(coverage) = self.registry.coverage_face() else {
             return Err(TextError::MissingGlyph {
                 codepoint: codepoint as u32,
             });
         };
-        if default == id {
+        if coverage == id {
             return Err(TextError::MissingGlyph {
                 codepoint: codepoint as u32,
             });
         }
-        let default_face = self
+        let coverage_face = self
             .registry
-            .face(default)
-            .ok_or(TextError::UnknownFont(default.index()))?;
-        if render::has_glyph(&self.render_system, &default_face.render, codepoint) {
-            return Ok(default);
+            .face(coverage)
+            .ok_or(TextError::UnknownFont(coverage.index()))?;
+        if render::has_glyph(&self.render_system, &coverage_face.render, codepoint) {
+            return Ok(coverage);
         }
         Err(TextError::MissingGlyph {
             codepoint: codepoint as u32,
@@ -654,24 +683,56 @@ impl TextEngine {
         self.glyph_advance(id, codepoint, style)
     }
 
-    /// Registers the engine's default face.
+    /// Registers the engine's default face: the first of `families` the host
+    /// provides.
     ///
-    /// The default face is the oldest registered face: the face the
-    /// per-character fallback reaches for. The composition root calls this
-    /// before any script runs, so the host's own face is the default; a
-    /// registry that already holds a face keeps it.
+    /// The default face is the oldest registered face, so it is the face a
+    /// face name that resolves to nothing takes its metrics from. The
+    /// composition root calls this before any script runs, so the host's own
+    /// default font is the default face; a registry that already holds a
+    /// face keeps it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TextError::FontNotFound`] when the host provides none of the
+    /// families, and propagates the registration errors of
+    /// [`TextEngine::add_font`].
+    pub fn install_default_face(&mut self, families: &[&str]) -> Result<FontId, TextError> {
+        if let Some(default) = self.registry.default_face() {
+            return Ok(default);
+        }
+        for family in families {
+            match self.load_system_font(family) {
+                Ok(id) => return Ok(id),
+                Err(TextError::FontNotFound { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(TextError::FontNotFound {
+            family: families.join(", "),
+        })
+    }
+
+    /// Registers the face the per-character fallback reaches for: the first
+    /// installed face that maps `codepoint`.
+    ///
+    /// The per-character fallback draws a character the requested face does
+    /// not carry with this face. A registry that already designated a
+    /// coverage face keeps it.
     ///
     /// # Errors
     ///
     /// Returns [`TextError::FontNotFound`] when no installed system face
     /// provides `codepoint`, and propagates the registration errors of
     /// [`TextEngine::add_font`].
-    pub fn install_default_face(&mut self, codepoint: char) -> Result<FontId, TextError> {
-        if let Some(default) = self.registry.default_face() {
-            return Ok(default);
+    pub fn install_coverage_face(&mut self, codepoint: char) -> Result<FontId, TextError> {
+        if let Some(coverage) = self.registry.designated_coverage_face() {
+            return Ok(coverage);
         }
         let (bytes, index) = self.system_face_with_glyph(codepoint)?;
-        self.add_font(&bytes, index)
+        let id = self.add_font(&bytes, index)?;
+        self.registry.designate_coverage_face(id);
+        Ok(id)
     }
 
     /// Reads the bytes and collection index of the first installed system
@@ -745,7 +806,7 @@ impl TextEngine {
         let wrap = wrap_width.filter(|w| w.is_finite() && *w > 0.0);
         let key = LayoutKey {
             font,
-            default_face: self.registry.default_face(),
+            coverage_face: self.registry.coverage_face(),
             text: text.to_owned(),
             size_bits: style.size_px.to_bits(),
             bold: style.bold,
@@ -3198,13 +3259,13 @@ mod tests {
         let Ok(font) = engine.add_font(&bytes, 0) else {
             return;
         };
-        let default_face = engine.default_face();
+        let coverage_face = engine.coverage_face();
         let style = TextStyle::new(16.0);
         let wrap: Option<f32> = None;
 
         let key_for = |text: &str| LayoutKey {
             font,
-            default_face,
+            coverage_face,
             text: text.to_owned(),
             size_bits: style.size_px.to_bits(),
             bold: style.bold,

@@ -64,8 +64,11 @@ impl TextEngine {
     pub fn alias(&mut self, name: &str, id: FontId);
     pub fn registry(&self) -> &FontRegistry;
     pub fn default_face(&self) -> Option<FontId>;
+    pub fn coverage_face(&self) -> Option<FontId>;
+    pub fn designate_coverage_face(&mut self, id: FontId) -> Result<(), TextError>;
     pub fn load_system_font(&mut self, family: &str) -> Result<FontId, TextError>;
-    pub fn install_default_face(&mut self, codepoint: char) -> Result<FontId, TextError>;
+    pub fn install_default_face(&mut self, families: &[&str]) -> Result<FontId, TextError>;
+    pub fn install_coverage_face(&mut self, codepoint: char) -> Result<FontId, TextError>;
     pub fn face(&self, id: FontId) -> Option<&Font>;
     pub fn family_name(&self, id: FontId) -> Option<&str>;
     pub fn has_glyph(&self, id: FontId, codepoint: char) -> bool;
@@ -98,6 +101,9 @@ impl FontRegistry {
     pub fn list_names(&self) -> Vec<String>;
     pub fn default_name(&self) -> Option<&str>;
     pub fn default_face(&self) -> Option<FontId>;
+    pub fn designate_coverage_face(&mut self, id: FontId);
+    pub fn designated_coverage_face(&self) -> Option<FontId>;
+    pub fn coverage_face(&self) -> Option<FontId>;
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
 }
@@ -111,6 +117,13 @@ The registry is the **one** place that knows which faces exist:
   case-insensitively.
 * The **default face** is the face registered under the **oldest** name — the
   first entry the registry ever got. A later registration does not move it.
+  The default face supplies the metrics of a face name that resolves to
+  nothing, so the composition root installs the host's own default font
+  there.
+* The **coverage face** is the face the host designated for the per-character
+  fallback. A registry that designated none reaches for the default face, so a
+  host whose default font carries the characters keeps one face in both
+  roles.
 * The **registered-name list** is newest first and leaves the oldest name
   out, so a registry that holds a single name reports an empty list. The
   reference's font list stops at the map's oldest entry for the same reason
@@ -122,7 +135,7 @@ The registry is the **one** place that knows which faces exist:
 ### The per-character fallback
 
 `provider_for` answers the face that draws one character: the requested face
-when it maps the character, otherwise the default face when it maps it, and
+when it maps the character, otherwise the coverage face when it maps it, and
 otherwise `TextError::MissingGlyph` — a character no face carries has no
 glyph, and the rasterizer is told so instead of drawing another character's
 shape. `layout` records that face in every `LaidOutGlyph`, so the drawing
@@ -152,11 +165,17 @@ query, a face registered afterwards is found by `font_id` before the memo is
 consulted, and the memo is dropped when `set_system_font_dirs` rebuilds the
 font database.
 
-`install_default_face` registers the engine's default face: the first
-installed face that maps `codepoint`. The composition root calls it before
-any script runs, so the host's own face is the default and the per-character
-fallback has a face to reach for. A registry that already holds a face keeps
-it.
+`install_default_face` registers the engine's default face: the first of the
+families the host provides. The composition root calls it before any script
+runs, so the host's own default user-interface font is the default face and
+supplies the metrics of a face name that resolves to nothing. A registry that
+already holds a face keeps it.
+
+`install_coverage_face` registers the face the per-character fallback reaches
+for: the first installed face that maps `codepoint`, and designates it. The
+composition root calls it after the default face, so the coverage face is a
+second face and not the default one. A registry that already designated a
+coverage face keeps it.
 
 ### The glyph atlas
 

@@ -181,8 +181,10 @@ protocol document is the contract.
 
 The text group carries the **font registry** group beside the text engine:
 `FontRegistry`, `FontFace` and `FontId`. The registry is the one place that
-knows which faces exist, what they are called and which of them is the
-default face. L3 reads it through the attached text handle
+knows which faces exist, what they are called and which of them holds which
+role: the default face supplies the metrics of a face name that resolves to
+nothing, and the coverage face draws a character the requested face does not
+carry. L3 reads it through the attached text handle
 (`CompatServices::attach_text`), which carries the engine's own text service —
 the same handle every text consumer uses, so there is no second face table in
 L3. The registry's names are the faces' own family names; a name L3 resolved

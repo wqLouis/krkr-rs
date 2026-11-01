@@ -48,6 +48,88 @@ fn engine_with_wide_default() -> (TextEngine, FontId, FontId) {
     (engine, wide, narrow)
 }
 
+/// An engine with the two roles the host fills: the narrow face is the
+/// default face (it supplies the metrics of a face name that resolves to
+/// nothing) and the wide face is the coverage face (it draws a character the
+/// requested face does not carry).
+fn engine_with_two_roles() -> (TextEngine, FontId, FontId) {
+    let mut engine = TextEngine::new();
+    let narrow = engine
+        .add_font(&narrow_face(), 0)
+        .expect("register the narrow face");
+    let wide = engine
+        .add_font(&wide_face(), 0)
+        .expect("register the wide face");
+    engine
+        .designate_coverage_face(wide)
+        .expect("designate the coverage face");
+    (engine, narrow, wide)
+}
+
+/// The two roles are two faces: the default face supplies the metrics of a
+/// face name that resolves to nothing, and the coverage face draws the
+/// characters the requested face does not carry.
+///
+/// Reference: a face name that resolves to nothing takes the default font's
+/// metrics (`reference/cpp/core/visual/FontSystem.cpp:53-102`), and the
+/// rasterizer falls back to the default font for a character the requested
+/// face does not carry
+/// (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:165-195`).
+#[test]
+fn the_coverage_face_draws_the_characters_the_default_face_lacks() {
+    let (engine, narrow, wide) = engine_with_two_roles();
+    assert_eq!(
+        engine.default_face(),
+        Some(narrow),
+        "the default face is the oldest registered entry"
+    );
+    assert_eq!(
+        engine.coverage_face(),
+        Some(wide),
+        "the coverage face is the face the host designated"
+    );
+    assert!(
+        !engine.has_glyph(narrow, WIDE_ONLY_CODEPOINT),
+        "the default face must not carry the CJK glyph"
+    );
+    assert_eq!(
+        engine
+            .provider_for(narrow, WIDE_ONLY_CODEPOINT)
+            .expect("the provider"),
+        wide,
+        "a character the requested face lacks is drawn by the coverage face"
+    );
+    assert_eq!(
+        engine.provider_for(narrow, 'A').expect("the provider"),
+        narrow,
+        "a character the requested face carries is drawn by it"
+    );
+}
+
+/// A registry that designated no coverage face reaches for the default face,
+/// so a host whose default font carries the characters keeps one face in both
+/// roles.
+///
+/// Reference: the rasterizer falls back to the default font for a character
+/// the requested face does not carry
+/// (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:165-195`).
+#[test]
+fn a_registry_without_a_coverage_face_reaches_for_the_default_face() {
+    let (engine, wide, narrow) = engine_with_wide_default();
+    assert_eq!(
+        engine.coverage_face(),
+        Some(wide),
+        "the default face fills the coverage role"
+    );
+    assert_eq!(
+        engine
+            .provider_for(narrow, WIDE_ONLY_CODEPOINT)
+            .expect("the provider"),
+        wide,
+        "a character the requested face lacks is drawn by the default face"
+    );
+}
+
 /// The default face is the oldest registered entry: the face registered
 /// first stays the default, and a later registration does not move it.
 ///

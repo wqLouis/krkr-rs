@@ -34,7 +34,7 @@ or `FontSystem` — it reaches the platform only through L2.
 | the frame clock | `FrameClock` | the engine's time base: the value the timers, the sound poll and the transitions read |
 | the clock source | `FrameTimeSource` | the one time base: the frame samples it at each boundary, `System.getTickCount` samples it live |
 | text | `TextEngine`, `TextStyle`, `TextError`, `TextCoverageCache`, `CoverageMask`, `rasterize_text_coverage`, `blit_coverage_into`, `blur_coverage`, `blurred_text_coverage`, `compose_text_into` | shaping, coverage rasterization, the glyph cache |
-| the font registry | `FontRegistry`, `FontFace`, `FontId` | the faces the engine registered, the names they answer to and the default face the per-character fallback reaches for |
+| the font registry | `FontRegistry`, `FontFace`, `FontId` | the faces the engine registered, the names they answer to, the default face and the coverage face the per-character fallback reaches for |
 | sound | `Mixer`, `SoundBuffer`, `SoundChannel`, `SoundSource`, `SoundEvent`, `SoundLabel`, `SoundError`, `LoopInfo`, `LoopLink`, `LoopCondition`, `Status`, `AudioStream`, `LOOP_FLAG_COUNT` | the shared mixer and its channels, buffers and sources |
 | video | `VideoOverlay`, `VideoBounds`, `VideoEvent`, `PlayStatus`, `blit_frame_to_layer`, `blit_frame_to_layer_opacity` | the playback machine and the frame blits |
 | transitions | `Trans`, `TransKind`, `TransError`, `RuleMask`, `ScrollFrom`, `ScrollStay`, `DestAlpha` | the transition state machine, its typed errors, the rule/scroll vocabulary and the destination surface's alpha handling: the transition mix and the blit kernels are keyed by it |

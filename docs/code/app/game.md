@@ -154,6 +154,7 @@ the seams and expects the composition root to fill them:
 | audio decoder | `audio.rs` | the `add_audio_decoder` chain, so a sound buffer can decode and play |
 | video source | `video.rs` | the `VideoOverlay` and `LayerExMovie` seams, over the L1 decoder and the L2 storage |
 | system font directories | `platform::system_font_dirs()` | the host's font directories, supplied before a startup script can resolve a face |
+| default font families | `platform::default_font_families()` | the host's default user-interface font, installed as the engine's default face before any script runs |
 | Windows host facts | `window_ex.rs` | the monitors, the desktop rectangle, the system metrics, the cursor, the environment |
 | clipboard | an inert backend | `hasFormat` is false, `asText` reads void, a write is a no-op — the reference clipboard does nothing |
 

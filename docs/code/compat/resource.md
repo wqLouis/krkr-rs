@@ -126,8 +126,10 @@ Resolution order:
      draw;
    * the host's installed system fonts (exact family only);
 2. the registry's **default face** — the face registered under the oldest
-   name. A registry that holds no face yet gets the host's default font
-   first, so a face the host provides is never lost to an empty registry;
+   name. It supplies the metrics of the text, so a face name that resolves to
+   nothing is drawn with the host's default font. A registry that holds no
+   face yet gets the host's coverage face first, so a face the host provides
+   is never lost to an empty registry;
 3. otherwise the typed error `"no font is available for face '{face}'"`.
 
 A candidate is tried like any other name: the reference's font map is keyed
@@ -148,6 +150,32 @@ shadowed by a stale fallback entry.
 `Font.getList` reports the registry's registered names and
 `Font.defaultFaceName` its oldest name — the name the default face is
 registered under.
+
+### The two font roles
+
+The registry holds two roles, and the host fills both before any script runs:
+
+| role | the face | what it does |
+|---|---|---|
+| the default face | the oldest registered name — the host's own default user-interface font | supplies the metrics of a face name that resolves to nothing |
+| the coverage face | the face the host designates — the first installed face that carries a Japanese ideograph | draws a character the requested face does not carry |
+
+The two roles want different faces on a desktop: the default font is a Latin
+user-interface face and carries no ideograph, while the coverage face has to
+carry one. The reference uses one face for both roles, because its default
+font is a Japanese system font; the port's default face is the host's
+default font, so the coverage face is a second face.
+
+**Documented approximation:** the default face's *name* and its metrics are
+the host's, not the reference platform's. The reference's default font is the
+last font its platform enumerated (a Japanese Windows reports `ＭＳ
+ゴシック`); the port's is the host's default user-interface font (a Linux
+desktop reports `DejaVu Sans`). A face name that resolves to nothing
+therefore takes the ascent of a different font, and the vertical placement
+of a pre-rendered glyph drawn under such a name differs from the reference's
+by the difference between the two ascents. The registered-name list follows
+the default face: it now carries the coverage face's names as well, where the
+reference enumerates every installed font anyway.
 
 ---
 

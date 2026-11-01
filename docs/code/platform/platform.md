@@ -18,7 +18,7 @@ It is the only L1 crate with a `#[cfg(target_os)]`.
 | input devices | `InputEvent`, `MouseButton`, `PhysicalKey` |
 | clock | `Clock`, `Ticker`, `FramePacing` |
 | audio output | `AudioDevice`, `AudioOutputState`, `AudioQueue` |
-| fonts | `system_font_dirs` |
+| fonts | `system_font_dirs`, `default_font_families` |
 | metrics | `memory_usage`, `process_cpu_ns`, `process_io` |
 
 ---
@@ -284,6 +284,8 @@ documented 44.1 kHz stereo spec with a logged warning.
 ```rust
 pub fn system_font_dirs() -> Vec<PathBuf>;
 
+pub fn default_font_families() -> &'static [&'static str];
+
 pub fn memory_usage() -> Option<u64>;
 pub fn process_cpu_ns() -> Option<u64>;
 pub fn process_io() -> Option<ProcessIo>;
@@ -296,6 +298,15 @@ Android list itself is crate-private: the function is the only way to reach
 it. A returned directory may not exist; the caller treats
 a missing entry as an absent source rather than an error. The engine (L2) may
 not name a platform path, so the composition root supplies this list.
+
+`default_font_families` names the families the host installs as its own
+default user-interface font, in the order the engine tries them: the first
+family the host provides is the engine's default face, the face whose metrics
+a face name that resolves to nothing takes. The desktop list starts with the
+desktop's own default font and names the metric-compatible faces a
+distribution ships instead; the Android list names the platform's font and the
+vendor faces an image carries instead. The engine (L2) may not name a
+platform font, so the composition root supplies this list.
 
 The metrics readers are **stateless free functions**: each reads the host
 interface on every call and holds no cache, so the caller's refresh cadence

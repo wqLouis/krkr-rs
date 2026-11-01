@@ -92,12 +92,19 @@ colour (set only by the constructor).
 1. for each candidate of the comma-separated list (with an optional leading
    `@` for vertical writing): the registry's registered faces, the attached
    storage (only for a file-shaped name), the host's installed system fonts;
-2. the registry's default face — the face registered under the oldest name;
+2. the registry's default face — the face registered under the oldest name,
+   the host's own default font, which supplies the metrics of the text;
 3. otherwise `"no font is available for face '{face}'"`.
 
 A candidate that resolves is recorded as an alias under the requested name.
 `Font.getList` reports the registry's registered names and
 `Font.defaultFaceName` its oldest name.
+
+`Font.defaultFaceName` names the host's default user-interface font, where
+the reference names the last font its platform enumerated. The two are
+different faces, so the metrics of a face name that resolves to nothing
+differ from the reference's by the difference between the two ascents; the
+divergence is recorded in [`../resource.md`](../resource.md) §4.
 
 ---
 

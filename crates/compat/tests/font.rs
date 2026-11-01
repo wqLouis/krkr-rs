@@ -848,6 +848,84 @@ fn a_prerendered_fallback_glyph_sits_on_the_truncated_ascent() {
     );
 }
 
+/// A face name that resolves to nothing takes the default face's metrics: the
+/// pre-rendered glyph is drawn one ascent of the default face below the draw
+/// position.
+///
+/// Reference: a face name that resolves to nothing takes the default font's
+/// metrics (`reference/cpp/core/visual/FontSystem.cpp:53-102`), and a
+/// pre-rendered glyph is drawn at `y + ascent - originY`
+/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:282,907-918`).
+#[test]
+fn an_unresolvable_face_name_draws_at_the_default_faces_ascent() {
+    let _lock = vm_lock();
+    let Some((font_dir, font_name)) = test_font() else {
+        return;
+    };
+    let font_bytes = std::fs::read(font_dir.join(&font_name)).expect("read test font");
+    let dir = common::unique_dir("krkr-compat-font-metrics");
+    std::fs::create_dir_all(&dir).expect("create the game dir");
+    std::fs::write(dir.join("gamefont.ttf"), &font_bytes).expect("write the face");
+    // The `.tft` carries only 'A', and its descriptor has `origin_y == 0`, so
+    // the ink starts one ascent below the draw position.
+    std::fs::write(dir.join("sample.tft"), build_tft(&[b'A' as u16], 3)).expect("write tft");
+    let storage = Storage::mount_archives(
+        FileSystem::host(&dir),
+        dir.clone(),
+        std::iter::empty::<&str>(),
+    )
+    .expect("mount the game dir");
+    let env = Env::new(Some(storage));
+
+    // The mounted face is registered first, so it is the default face.
+    env.run("var mounted = new Font('gamefont.ttf', 12, 0xffffffff);");
+    assert!(env.eval_int("mounted.getTextWidth('A')") > 0);
+    let default = env._text.default_face().expect("the default face");
+    let ascent = env
+        ._text
+        .font_metrics(default, 12.0)
+        .expect("the default face's metrics")
+        .ascent
+        .floor() as i32;
+
+    // The face name resolves to nothing, so the default face supplies the
+    // metrics of the pre-rendered glyph.
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); \
+         var l = new Layer(w, base); \
+         l.setImageSize(64, 64); \
+         var f = new Font('this-family-is-not-installed', 12, 0); \
+         f.mapPrerenderedFont('sample.tft'); \
+         l.font.face = 'this-family-is-not-installed'; \
+         l.font.height = 12; \
+         l.font.bold = false; \
+         l.font.italic = false; \
+         l.font.angle = 0; \
+         l.drawText(4, 4, 'A', 0x00ffffff, 255);",
+    );
+    let layer = env.scene.layers.last().expect("the layer exists");
+    let bitmap = env
+        .scene
+        .bitmap(layer.bitmap.expect("the layer has a main image"))
+        .expect("the bitmap exists");
+    let ink_top = (0..bitmap.height)
+        .position(|row| {
+            (0..bitmap.width).any(|column| {
+                let at = ((row * bitmap.width + column) * 4) as usize;
+                bitmap.rgba[at + 3] != 0
+            })
+        })
+        .map(|row| row as i32)
+        .expect("the glyph has ink");
+    assert_eq!(
+        ink_top,
+        4 + ascent,
+        "the glyph must start one ascent of the default face below the draw position"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_prerendered_glyph_is_drawn_at_the_ascent_minus_its_origin() {
     let _lock = vm_lock();

@@ -662,16 +662,10 @@ impl GameHost {
         // face.
         vm.compat()
             .set_system_font_dirs(platform::system_font_dirs());
-        // The engine's default face is the oldest registered face: the face
-        // the per-character fallback reaches for. The host's own face is
-        // installed before any script runs, so it is the default.
-        if let Err(error) = host
-            .engine_mut()
-            .text_mut()
-            .install_default_face('\u{4E00}')
-        {
-            log::warn!("system fonts: no installed face provides a CJK glyph: {error}");
-        }
+        // The host's faces are installed before any script runs, so the
+        // engine's two font roles are filled before a script can ask for a
+        // face.
+        install_host_faces(host.engine_mut().text_mut());
         // SAFETY: `storage` is declared after `vm` in the returned struct, so
         // it outlives the compat host that holds the installed source.
         unsafe { crate::install_video_source_metered(vm.compat(), &media, &storage, &stats) }
@@ -848,6 +842,29 @@ impl GameHost {
             );
         }
         Ok(report)
+    }
+}
+
+/// Installs the host's faces on the text service.
+///
+/// The two roles the engine keeps are filled here:
+///
+/// * the **default face** is the oldest registered face, so it supplies the
+///   metrics of a face name that resolves to nothing. The host's own default
+///   user-interface font is installed there, before any script runs.
+/// * the **coverage face** is the face the per-character fallback reaches
+///   for: it draws a character the requested face does not carry. The first
+///   installed face that carries a Japanese ideograph fills the role.
+///
+/// A host that provides neither font keeps the faces it has: the missing
+/// role is reported in the log and the engine falls back to the face it
+/// holds.
+fn install_host_faces(text: &mut engine::text::TextEngine) {
+    if let Err(error) = text.install_default_face(platform::default_font_families()) {
+        log::warn!("system fonts: no installed face provides the host's default font: {error}");
+    }
+    if let Err(error) = text.install_coverage_face('\u{4E00}') {
+        log::warn!("system fonts: no installed face provides a CJK glyph: {error}");
     }
 }
 
@@ -1902,6 +1919,45 @@ mod tests {
         assert_eq!(
             explicit_project(base, &archives, |_| None),
             PathBuf::from("/game/data.xp3")
+        );
+    }
+
+    /// The host fills the engine's two font roles with two faces: the default
+    /// face is the host's own default font and supplies the metrics of a face
+    /// name that resolves to nothing, and the coverage face carries a
+    /// Japanese ideograph and draws the characters the requested face lacks.
+    ///
+    /// A host that provides no face with a Japanese ideograph has no coverage
+    /// face to install, and a host that provides none of its default font
+    /// families has no default face to install; the test stops in either
+    /// case.
+    #[test]
+    fn the_host_installs_the_default_font_and_the_coverage_face() {
+        let mut text = engine::text::TextEngine::new();
+        install_host_faces(&mut text);
+        let coverage = text
+            .coverage_face()
+            .expect("the host installed a coverage face");
+        if !text.has_glyph(coverage, '\u{4E00}') {
+            return;
+        }
+        let default = text
+            .default_face()
+            .expect("the host installed a default face");
+        let expected = platform::default_font_families()
+            .iter()
+            .filter_map(|family| text.load_system_font(family).ok())
+            .next();
+        let Some(expected) = expected else {
+            return;
+        };
+        assert_eq!(
+            default, expected,
+            "the default face must be the host's own default font"
+        );
+        assert_ne!(
+            default, coverage,
+            "the metrics role and the coverage role must be two faces"
         );
     }
 }

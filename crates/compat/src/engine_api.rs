@@ -53,8 +53,8 @@ pub(crate) use engine::timer::{TimerCallback, TimerId, TimerState};
 // clock are one base read at two moments.
 pub(crate) use engine::clock::{FrameClock, FrameTimeSource};
 
-// The font registry: the registered faces, the names they answer to and the
-// default face the per-character fallback reaches for.
+// The font registry: the registered faces, the names they answer to, the
+// default face and the coverage face the per-character fallback reaches for.
 pub(crate) use engine::font::{FontId, FontRegistry};
 
 // Text shaping, coverage rasterization, the glyph cache and font identity.

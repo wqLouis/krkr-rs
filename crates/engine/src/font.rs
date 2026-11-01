@@ -1,14 +1,23 @@
 //! The font registry: the faces an engine registered, the names they answer
-//! to, and the default face the per-character fallback uses.
+//! to, and the two roles a face can hold.
 //!
 //! One registry holds every face the engine knows: the faces a script
-//! resolved, the faces `System.addFont` registered and the face the
-//! composition root installed as the engine's default. The registry keeps
-//! the registration order, because the order decides two script-visible
-//! things:
+//! resolved, the faces `System.addFont` registered and the faces the
+//! composition root installed. The registry keeps the registration order,
+//! because the order decides two script-visible things:
 //!
 //! * the default face is the oldest registered entry, and
 //! * the registered-name list is newest first and leaves the oldest name out.
+//!
+//! The registry holds the two roles a face can hold:
+//!
+//! * the **default face** is the oldest registered entry. It supplies the
+//!   metrics of a face name that resolves to nothing, so the composition
+//!   root installs the host's own default font there.
+//! * the **coverage face** is the face the per-character fallback reaches
+//!   for: it draws a character the requested face does not carry. The host
+//!   designates it; a registry that designates none reaches for the default
+//!   face.
 //!
 //! The names a face answers to are the family names its name table carries,
 //! so a face is found under each of them. A name that only a caller knows
@@ -67,6 +76,11 @@ pub struct FontRegistry {
     /// A name that is registered again moves to the front, so the last entry
     /// is the oldest name and the face it resolves is the default face.
     order: Vec<String>,
+    /// The face the host designated for the per-character fallback.
+    ///
+    /// `None` when the host designated none; the per-character fallback then
+    /// reaches for the default face.
+    coverage: Option<FontId>,
 }
 
 impl Default for FontRegistry {
@@ -75,6 +89,7 @@ impl Default for FontRegistry {
             faces: Vec::new(),
             by_name: map(),
             order: Vec::new(),
+            coverage: None,
         }
     }
 }
@@ -143,8 +158,36 @@ impl FontRegistry {
     }
 
     /// The default face: the face registered under the oldest name.
+    ///
+    /// The default face supplies the metrics of a face name that resolves to
+    /// nothing, so the composition root installs the host's own default font
+    /// before any script runs.
     pub fn default_face(&self) -> Option<FontId> {
         self.default_name().and_then(|name| self.by_name(name))
+    }
+
+    /// Designates the face the per-character fallback reaches for.
+    ///
+    /// The per-character fallback draws a character the requested face does
+    /// not carry with this face.
+    pub fn designate_coverage_face(&mut self, id: FontId) {
+        self.coverage = Some(id);
+    }
+
+    /// The face the host designated for the per-character fallback.
+    ///
+    /// `None` when the host designated none.
+    pub fn designated_coverage_face(&self) -> Option<FontId> {
+        self.coverage
+    }
+
+    /// The face the per-character fallback reaches for.
+    ///
+    /// The designated face, or the default face when the host designated
+    /// none: a registry whose default face carries the characters keeps the
+    /// single default face in both roles.
+    pub fn coverage_face(&self) -> Option<FontId> {
+        self.coverage.or_else(|| self.default_face())
     }
 
     /// The number of registered faces.
