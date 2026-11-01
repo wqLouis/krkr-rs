@@ -435,6 +435,14 @@ impl TextEngine {
     /// collection.
     pub fn add_font(&mut self, bytes: &[u8], index: u32) -> Result<FontId, TextError> {
         let face = render::load_font(&self.render_system, bytes, index)?;
+        self.register_face(bytes, index, face)
+    }
+
+    /// Registers a face the rasterizer parsed, under the same bytes.
+    ///
+    /// The face enters the shaping database from the bytes it was parsed
+    /// from, so the layout and the rasterization agree on it.
+    fn register_face(&mut self, bytes: &[u8], index: u32, face: Font) -> Result<FontId, TextError> {
         let source = cosmic_text::fontdb::Source::Binary(Arc::new(bytes.to_vec()));
         let ids = self.cosmic.db_mut().load_font_source(source);
         let cosmic = *ids
@@ -714,42 +722,71 @@ impl TextEngine {
     }
 
     /// Registers the face the per-character fallback reaches for: the first
-    /// installed face that maps `codepoint`.
+    /// installed face that maps `codepoint` and can draw it.
     ///
     /// The per-character fallback draws a character the requested face does
     /// not carry with this face. A registry that already designated a
     /// coverage face keeps it.
     ///
+    /// A face the scan finds is not taken on its word: the face the
+    /// rasterizer loaded must map the character too, and the face must
+    /// register. A face that fails either test is passed over, so a host
+    /// that carries one unusable face still gets a coverage face from the
+    /// next face that carries the character.
+    ///
     /// # Errors
     ///
     /// Returns [`TextError::FontNotFound`] when no installed system face
-    /// provides `codepoint`, and propagates the registration errors of
-    /// [`TextEngine::add_font`].
+    /// provides `codepoint`, and the failure of the last face that carried
+    /// the character but could not be used.
     pub fn install_coverage_face(&mut self, codepoint: char) -> Result<FontId, TextError> {
         if let Some(coverage) = self.registry.designated_coverage_face() {
             return Ok(coverage);
         }
-        let (bytes, index) = self.system_face_with_glyph(codepoint)?;
-        let id = self.add_font(&bytes, index)?;
-        self.registry.designate_coverage_face(id);
-        Ok(id)
+        let mut failure: Option<TextError> = None;
+        let mut seen = 0usize;
+        while let Some((bytes, index)) = self.next_face_with_glyph(codepoint, seen) {
+            seen += 1;
+            let face = match render::load_font(&self.render_system, &bytes, index) {
+                Ok(face) => face,
+                Err(error) => {
+                    failure = Some(TextError::from(error));
+                    continue;
+                }
+            };
+            if !render::has_glyph(&self.render_system, &face, codepoint) {
+                continue;
+            }
+            match self.register_face(&bytes, index, face) {
+                Ok(id) => {
+                    self.registry.designate_coverage_face(id);
+                    return Ok(id);
+                }
+                Err(error) => failure = Some(error),
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Err(TextError::FontNotFound {
+                family: codepoint.to_string(),
+            }),
+        }
     }
 
-    /// Reads the bytes and collection index of the first installed system
-    /// face that maps `codepoint` to a glyph.
-    fn system_face_with_glyph(&mut self, codepoint: char) -> Result<(Vec<u8>, u32), TextError> {
+    /// Reads the bytes and collection index of the installed system face that
+    /// maps `codepoint` to a glyph, skipping the first `seen` faces that did.
+    ///
+    /// The scan reads one font file at a time and stops at the face the
+    /// caller asked for, so a host with many faces does not read them all.
+    fn next_face_with_glyph(&mut self, codepoint: char, seen: usize) -> Option<(Vec<u8>, u32)> {
         if self.system_fonts.is_none() {
             self.system_fonts = Some(load_system_database(&self.system_font_dirs));
         }
         // The rasterizer service is copied out of the engine so the scan does
         // not borrow the engine while the font database is borrowed.
         let render_system = self.render_system;
-        let system = self
-            .system_fonts
-            .as_mut()
-            .ok_or_else(|| TextError::FontNotFound {
-                family: codepoint.to_string(),
-            })?;
+        let system = self.system_fonts.as_mut()?;
+        let mut matched = 0usize;
         for face in system.faces() {
             let found = system
                 .with_face_data(face.id, |data, index| {
@@ -757,13 +794,14 @@ impl TextEngine {
                         .then(|| (data.to_vec(), index))
                 })
                 .flatten();
-            if let Some(found) = found {
-                return Ok(found);
+            let Some(found) = found else { continue };
+            if matched < seen {
+                matched += 1;
+                continue;
             }
+            return Some(found);
         }
-        Err(TextError::FontNotFound {
-            family: codepoint.to_string(),
-        })
+        None
     }
 
     /// Returns the L1 metrics of `id` at `size_px`.

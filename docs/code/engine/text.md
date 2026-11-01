@@ -172,10 +172,13 @@ supplies the metrics of a face name that resolves to nothing. A registry that
 already holds a face keeps it.
 
 `install_coverage_face` registers the face the per-character fallback reaches
-for: the first installed face that maps `codepoint`, and designates it. The
-composition root calls it after the default face, so the coverage face is a
-second face and not the default one. A registry that already designated a
-coverage face keeps it.
+for: the first installed face that maps `codepoint` **and can draw it**, and
+designates it. A face the rasterizer cannot load, or that the shaping
+database cannot register, is passed over, so a host that carries one unusable
+face still gets a coverage face from the next face that carries the
+character. The composition root calls it after the default face, so the
+coverage face is a second face and not the default one. A registry that
+already designated a coverage face keeps it.
 
 ### The glyph atlas
 

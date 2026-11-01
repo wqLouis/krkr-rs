@@ -866,6 +866,20 @@ fn install_host_faces(text: &mut engine::text::TextEngine) {
     if let Err(error) = text.install_coverage_face('\u{4E00}') {
         log::warn!("system fonts: no installed face provides a CJK glyph: {error}");
     }
+    // The two roles are named so the host log says which face fills which
+    // role: a host with no coverage face draws every character its default
+    // face lacks with an error, and the log is where that shows.
+    let default_name = match text.default_face() {
+        Some(id) => text.family_name(id).unwrap_or("none"),
+        None => "none",
+    };
+    let coverage_name = match text.registry().designated_coverage_face() {
+        Some(id) => text.family_name(id).unwrap_or("none"),
+        None => "none",
+    };
+    log::info!(
+        "system fonts: the default face is {default_name}, the coverage face is {coverage_name}"
+    );
 }
 
 /// Logs the start-up phase aggregates once, at `info`.
