@@ -89,18 +89,15 @@ colour (set only by the constructor).
 `Font.face` is resolved through the per-engine `ResourceResolver` — see
 [`../resource.md`](../resource.md) §4 for the full order:
 
-1. a cached resolution for the exact face string;
-2. for each candidate of the comma-separated list (with an optional leading
-   `@` for vertical writing): the engine's registered families, the
-   `System.addFont` registry, the attached storage (only for a file-shaped
-   name), the host's installed system fonts;
-3. the host's default face, loaded under the fixed name
-   `__krkr_default_face__`;
-4. the engine's first registered face;
-5. otherwise `"no font is available for face '{face}'"`.
+1. for each candidate of the comma-separated list (with an optional leading
+   `@` for vertical writing): the registry's registered faces, the attached
+   storage (only for a file-shaped name), the host's installed system fonts;
+2. the registry's default face — the face registered under the oldest name;
+3. otherwise `"no font is available for face '{face}'"`.
 
-The resolved family name is recorded in registration order, which is what
-`Font.getList` reports and what `Font.defaultFaceName` returns.
+A candidate that resolves is recorded as an alias under the requested name.
+`Font.getList` reports the registry's registered names and
+`Font.defaultFaceName` its oldest name.
 
 ---
 
@@ -111,7 +108,8 @@ The resolved family name is recorded in registration order, which is what
 | the face, the height, the colour, the style flags, the angle | L2 `Scene` / `FontState` |
 | the scene font id, `attached`, `owns_state` | the L3 `FontInst` payload |
 | `faceIsFileName` (per font id), the active rasterizer index | the L3 `FontMetricsState` |
-| the text engine, the face cache, the registered family names, the default face, the pre-rendered font maps | the L3 `ResourceResolver` |
+| the pre-rendered font maps | the L3 `ResourceResolver` |
+| the registered faces, their names, the default face, the shaping system | the L2 text service the engine owns |
 
 ---
 

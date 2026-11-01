@@ -7,10 +7,10 @@
 //! `FontRasterizer` for `GetTextExtent`/`GetAscentHeight`, while this port asks
 //! the L2 `engine_api::TextEngine` (see [`super::metrics`]).
 
-use crate::engine_api::TextStyle;
+use crate::engine_api::{TextEngine, TextStyle};
 
 use super::TextRenderInst;
-use super::metrics::{self, TextRenderEngine};
+use super::metrics;
 use super::state::{CharacterInfo, TextRenderState};
 use crate::CompatCtx;
 
@@ -32,7 +32,7 @@ impl TextRenderInst {
     pub(super) fn render(
         &mut self,
         ctx: &CompatCtx,
-        engine: &mut TextRenderEngine,
+        engine: &mut TextEngine,
         text: &str,
     ) -> Result<bool, String> {
         let chars: Vec<char> = text.chars().collect();
@@ -148,7 +148,7 @@ impl TextRenderInst {
     fn push_character(
         &mut self,
         ctx: &CompatCtx,
-        engine: &mut TextRenderEngine,
+        engine: &mut TextEngine,
         ch: char,
     ) -> Result<(), String> {
         if (ch as u32) > 0xFFFF {
@@ -232,7 +232,7 @@ impl TextRenderInst {
     fn perform_linebreak(
         &mut self,
         ctx: &CompatCtx,
-        engine: &mut TextRenderEngine,
+        engine: &mut TextEngine,
     ) -> Result<(), String> {
         let font = metrics::resolve_face(ctx, engine, &self.state.face)?;
         let size = font_size(&self.state);
@@ -250,7 +250,7 @@ impl TextRenderInst {
     pub(super) fn flush(
         &mut self,
         ctx: &CompatCtx,
-        engine: &mut TextRenderEngine,
+        engine: &mut TextEngine,
         force: bool,
     ) -> Result<(), String> {
         if self.buffer.is_empty() {

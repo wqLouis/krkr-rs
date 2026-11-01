@@ -128,11 +128,20 @@ impl CompatHost {
     /// The directories are scanned lazily, the first time a face is resolved
     /// from the host; install them before the game's startup script runs so
     /// no face has been resolved yet.
+    ///
+    /// A host that attached no text service keeps its directories to itself:
+    /// there is no text service to scan them with.
     pub fn set_system_font_dirs(&self, dirs: Vec<std::path::PathBuf>) {
-        self.services()
-            .state::<crate::resource::ResourceResolver>()
-            .engine
-            .set_system_font_dirs(dirs);
+        let Some(ptr) = self.services().text() else {
+            log::warn!(
+                "system fonts: no text service is attached; the host's font directories are ignored"
+            );
+            return;
+        };
+        // SAFETY: the host keeps the attached text service alive for the
+        // binding's lifetime (the `attach_text` contract), so the pointer
+        // stays valid.
+        unsafe { &mut *ptr }.set_system_font_dirs(dirs);
     }
 
     /// The plugin registry.

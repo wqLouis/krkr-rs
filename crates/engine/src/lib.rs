@@ -23,6 +23,7 @@ mod simd;
 
 pub mod clock;
 pub mod engine;
+pub mod font;
 pub mod imagedecode;
 pub mod input;
 pub mod layer_ops;
@@ -56,6 +57,8 @@ pub use crate::engine::{
 };
 // The fixed-seed lookup map the engine keys its per-bitmap tables with.
 pub use crate::hasher::Map;
+// The font registry: the registered faces, their names and the default face.
+pub use crate::font::{FontFace, FontId, FontRegistry};
 // The image decode pool the engine owns and drains every frame.
 pub use crate::imagedecode::DecodePool;
 // The VM-to-device pixel mapping the engine applies when it projects.

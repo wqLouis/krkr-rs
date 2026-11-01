@@ -77,6 +77,9 @@ struct Env {
     engine: Box<Tjs2Engine>,
     /// Kept alive for the host's raw pointer; never read directly.
     _scene: Box<Scene>,
+    /// The attached text service: the registered faces and the shaping
+    /// state. Boxed so the address the host holds stays stable.
+    _text: Box<TextEngine>,
     /// Kept alive for the host's raw pointer; `None` means no font source.
     _storage: Option<Box<Storage>>,
 }
@@ -85,6 +88,7 @@ impl Env {
     fn new(storage: Option<Storage>) -> Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut scene = Box::new(Scene::default());
+        let mut text = Box::new(TextEngine::new());
         let mut storage = storage.map(Box::new);
         let mut host = CompatHost::new();
         // SAFETY: the boxed scene and storage outlive the host (they are
@@ -93,6 +97,8 @@ impl Env {
         unsafe {
             host.services_mut()
                 .attach_scene(scene.as_mut() as *mut Scene);
+            host.services_mut()
+                .attach_text(text.as_mut() as *mut TextEngine);
             if let Some(storage) = storage.as_mut() {
                 host.services_mut()
                     .attach_storage(storage.as_mut() as *mut Storage);
@@ -104,6 +110,7 @@ impl Env {
             _host: host,
             engine,
             _scene: scene,
+            _text: text,
             _storage: storage,
         }
     }

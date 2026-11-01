@@ -179,6 +179,16 @@ overlay, the transitions, the raster primitives and the layer/bitmap
 operations. The short doc comments in the seam are the in-tree summary; the
 protocol document is the contract.
 
+The text group carries the **font registry** group beside the text engine:
+`FontRegistry`, `FontFace` and `FontId`. The registry is the one place that
+knows which faces exist, what they are called and which of them is the
+default face. L3 reads it through the attached text handle
+(`CompatServices::attach_text`), which carries the engine's own text service —
+the same handle every text consumer uses, so there is no second face table in
+L3. The registry's names are the faces' own family names; a name L3 resolved
+(a storage path, a candidate list) is an alias on that registry and stays out
+of the registered-name list.
+
 The storage group carries one protocol item beyond the namespace's own types:
 `StorageMedia`, the provider that serves one storage scheme. L3 implements it
 (the `var://` and `psb://` providers), L2 holds the registered providers and

@@ -33,7 +33,8 @@ or `FontSystem` — it reaches the platform only through L2.
 | timers | `TimerState`, `TimerId`, `TimerCallback` | the L2 timer registry L3 arms and disarms |
 | the frame clock | `FrameClock` | the engine's time base: the value the timers, the sound poll and the transitions read |
 | the clock source | `FrameTimeSource` | the one time base: the frame samples it at each boundary, `System.getTickCount` samples it live |
-| text | `TextEngine`, `TextStyle`, `TextError`, `FontId`, `TextCoverageCache`, `CoverageMask`, `rasterize_text_coverage`, `blit_coverage_into`, `blur_coverage`, `blurred_text_coverage`, `compose_text_into` | shaping, coverage rasterization, the glyph cache |
+| text | `TextEngine`, `TextStyle`, `TextError`, `TextCoverageCache`, `CoverageMask`, `rasterize_text_coverage`, `blit_coverage_into`, `blur_coverage`, `blurred_text_coverage`, `compose_text_into` | shaping, coverage rasterization, the glyph cache |
+| the font registry | `FontRegistry`, `FontFace`, `FontId` | the faces the engine registered, the names they answer to and the default face the per-character fallback reaches for |
 | sound | `Mixer`, `SoundBuffer`, `SoundChannel`, `SoundSource`, `SoundEvent`, `SoundLabel`, `SoundError`, `LoopInfo`, `LoopLink`, `LoopCondition`, `Status`, `AudioStream`, `LOOP_FLAG_COUNT` | the shared mixer and its channels, buffers and sources |
 | video | `VideoOverlay`, `VideoBounds`, `VideoEvent`, `PlayStatus`, `blit_frame_to_layer`, `blit_frame_to_layer_opacity` | the playback machine and the frame blits |
 | transitions | `Trans`, `TransKind`, `TransError`, `RuleMask`, `ScrollFrom`, `ScrollStay`, `DestAlpha` | the transition state machine, its typed errors, the rule/scroll vocabulary and the destination surface's alpha handling: the transition mix and the blit kernels are keyed by it |
@@ -61,6 +62,10 @@ The `raster` and `layer_ops` groups are nested modules so a call site reads
 * **TVP vocabulary stays out of L2.** The native blend numbering (`lt*`),
   the `0..100000` volume scale, the `.sli` grammar and the KAG tags are L3;
   L2 keeps `BlendMode`, a normalised gain and an opaque key code.
+* **One registry, one owner.** The faces live in the L2 text service the
+  engine owns; L3 reaches them through the attached handle and never keeps a
+  face table of its own. A name L3 resolves is an *alias* on that registry,
+  not a second entry in a private map.
 * **A storage media is L3's own.** `StorageMedia` is the provider contract L2
   dispatches a `<scheme>://…` name to. L3 implements it — the `var://` media
   walks the script object graph, the `psb://` media resolves a member path
@@ -95,10 +100,17 @@ host attaches to `CompatServices` ([`ctx.md`](ctx.md)):
 | timer | `*mut TimerState` | `CompatServices::attach_timer` |
 | clock | `*mut FrameClock` | `CompatServices::attach_clock` |
 | clock source | `*const dyn FrameTimeSource` | `CompatServices::attach_frame_time` |
+| text | `*mut TextEngine` | `CompatServices::attach_text` |
 
 A native that needs the scene takes the raw pointer from the services and
 dereferences it under its own `unsafe` contract — see
 [`visual/common.md`](visual/common.md) for the pattern the visual family uses.
+
+The text handle carries the **one** text service: the registered faces, the
+shaping database and the per-character caches. The engine owns it, so the
+visual `Font` native, the `TextRenderBase` plugin, the layer-ex draw plugin
+and `System.addFont` all reach the same registry — there is no second face
+table anywhere in L3.
 
 ---
 

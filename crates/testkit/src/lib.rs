@@ -6,6 +6,7 @@
 //!
 //! The modules are:
 //! - [`archives`]: the in-memory XP3 archive builders.
+//! - [`font_fixtures`]: the synthetic narrow and wide font faces.
 //! - [`game`]: the real-game directory helpers.
 //! - [`media_fixtures`]: synthetic image, audio, and TLG byte builders.
 //! - the fixture path resolver for the checkout cloned beside this repository.
@@ -19,6 +20,7 @@
 #![warn(missing_docs)]
 
 pub mod archives;
+pub mod font_fixtures;
 pub mod game;
 pub mod media_fixtures;
 pub mod reference;
@@ -26,6 +28,7 @@ pub mod render;
 pub mod vm;
 
 pub use archives::{build_xp3, build_xp3_compressed_index};
+pub use font_fixtures::{NARROW_NAMES, WIDE_NAMES, WIDE_ONLY_CODEPOINT, narrow_face, wide_face};
 pub use game::game_archives;
 pub use media_fixtures::{
     SDS_MAGIC, TLG5_MAGIC, TLG6_MAGIC, encode_gray_png, encode_png, encode_tlg5, encode_tlg6,

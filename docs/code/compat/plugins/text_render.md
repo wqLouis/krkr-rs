@@ -299,17 +299,16 @@ the reference returns from its own unknown-behaviour branch
   flag, the vertical flag, the placed characters, the pending buffer and the
   line mode. The payload is created by the native instance's create hook and
   released by its destroy hook.
-* The shared shaping engine and the requested-face cache live in the
-  per-engine dispatch state
-  (`CompatServices::state::<TextRenderEngine>()`), created on first use and
-  released with the host. Nothing is kept in a process global.
-* The cache maps a requested face name to the loaded face. A resolution found
-  through a candidate is cached under that name; the default-face fallback is
-  resolved under a fixed name and never shadows a face that is registered
-  later (`crates/compat/src/resource.rs:254-300`).
-* The `"user"` placeholder is not cached under its own name: it is resolved
-  through the scene on every lookup, and the scene's face name is what the
-  cache holds (`crates/compat/src/natives/plugins/text_render/metrics.rs:49-87`).
+* The shaping engine and the registered faces live in the L2 text service the
+  engine owns, which the host attaches to the services container. Nothing is
+  kept in a process global, and the plugin keeps no face table of its own.
+* A requested face name is recorded as an alias in that registry, so the next
+  lookup finds the same face. The default-face fallback is not recorded, so a
+  face that is registered later is found instead of being shadowed by a stale
+  fallback entry (`crates/compat/src/resource.rs`).
+* The `"user"` placeholder is resolved through the scene on every lookup; it
+  is not recorded under its own name
+  (`crates/compat/src/natives/plugins/text_render/metrics.rs`).
 
 ## Errors
 

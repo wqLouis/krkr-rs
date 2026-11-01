@@ -19,6 +19,7 @@ a runtime dependency**: the crates that need it pull it in under
 | module | source | what it holds |
 |---|---|---|
 | `archives` | `src/archives.rs` | the in-memory XP3 archive builders |
+| `font_fixtures` | `src/font_fixtures.rs` | the synthetic narrow and wide font faces |
 | `game` | `src/game.rs` | the real-game directory helpers |
 | `media_fixtures` | `src/media_fixtures.rs` | synthetic image, audio and TLG byte builders |
 | `render` | `src/render.rs` | a headless window handle for the null render backend |
@@ -63,6 +64,13 @@ themselves hold no process-global state.
 pub fn build_xp3(entries: &[(&str, &[u8], bool)]) -> Vec<u8>;
 pub fn build_xp3_compressed_index(entries: &[(&str, &[u8], bool)]) -> Vec<u8>;
 
+// font fixtures
+pub fn narrow_face() -> Vec<u8>;
+pub fn wide_face() -> Vec<u8>;
+pub const NARROW_NAMES: [&str; 2];
+pub const WIDE_NAMES: [&str; 2];
+pub const WIDE_ONLY_CODEPOINT: char;
+
 // game
 pub fn game_archives(dir: &Path) -> io::Result<Vec<PathBuf>>;
 
@@ -88,6 +96,14 @@ pub fn vm_lock() -> MutexGuard<'static, ()>;
 `headless_window` builds a zeroed Xlib window identifier: the null pipeline
 ignores the handle's contents, so it exercises every public entry point
 without a display server.
+
+`narrow_face` and `wide_face` build two TrueType faces byte by byte: every
+table (`head`, `hhea`, `maxp`, `hmtx`, `cmap`, `glyf`, `loca`, `name`,
+`OS/2`, `post`) is written in the fixture, so a test has a face without any
+host font and without any game data. The narrow face carries Latin glyphs
+only; the wide face carries one CJK glyph the narrow face does not have, and
+its Latin glyphs are wider. Each face answers to two family names, one in
+English and one in Japanese, so a lookup by either name finds it.
 
 `game_archives` lists the `*.xp3` files of a game directory, sorted by
 name. The product takes an explicit archive list and never scans a folder,

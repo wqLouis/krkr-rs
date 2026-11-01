@@ -18,6 +18,7 @@ use common::{unique_dir, vm_lock};
 use compat::CompatHost;
 use engine::Scene;
 use engine::Storage;
+use engine::text::TextEngine;
 use fs::FileSystem;
 use tjs::{Tjs2Engine, TjsValue};
 
@@ -55,6 +56,9 @@ struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
     scene: Box<Scene>,
+    /// The attached text service: the registered faces and the shaping
+    /// state. Boxed so the address the host holds stays stable.
+    _text: Box<TextEngine>,
     storage: Box<Storage>,
     /// Temp game directory (also the save target of the synthetic codec).
     _game_dir: PathBuf,
@@ -74,6 +78,7 @@ impl Env {
 
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut scene = Box::new(Scene::default());
+        let mut text = Box::new(TextEngine::new());
         let mut storage = Box::new(storage);
         let mut host = CompatHost::new();
         let save_dir = game_dir.clone();
@@ -97,6 +102,8 @@ impl Env {
             host.services_mut()
                 .attach_scene(scene.as_mut() as *mut Scene);
             host.services_mut()
+                .attach_text(text.as_mut() as *mut TextEngine);
+            host.services_mut()
                 .attach_storage(storage.as_mut() as *mut Storage);
         }
         host.install(&engine).expect("install compat surface");
@@ -105,6 +112,7 @@ impl Env {
             _host: host,
             engine,
             scene,
+            _text: text,
             storage,
             _game_dir: game_dir,
         }
@@ -170,24 +178,6 @@ fn unknown_face_resolves_to_the_registered_default() {
     );
     // Falling back must not change the already-registered default.
     assert_eq!(env.eval_string("Font.defaultFaceName"), default_before);
-}
-
-/// Reference: `Font.getList` builds a TJS array of the enumerated face names
-/// (`reference/cpp/core/visual/LayerIntf.cpp:11958-11985`).
-#[test]
-fn font_get_list_is_non_empty_after_a_face_is_registered() {
-    let Some(font) = find_test_font() else {
-        return;
-    };
-    let _lock = vm_lock();
-    let env = Env::new(&font);
-    env.run("var f = new Font('gamefont.ttf', 24, 0xffffffff);");
-    assert!(env.eval_int("f.getTextWidth('A')") > 0);
-
-    assert!(
-        env.eval_int("f.getList(0).length") > 0,
-        "getList should report at least the registered face"
-    );
 }
 
 /// Reference: `Font.getGlyphDrawRect` returns the rasterized glyphs' bounding

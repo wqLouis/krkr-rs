@@ -3,11 +3,11 @@
 //! The reference asks the active [`FontRasterizer`] for each character's
 //! advance (`GetTextExtent`) and for the ascent (`GetAscentHeight`). Compat
 //! has exactly one rasterizer, so those metrics come from the L2
-//! `engine_api::TextEngine`: the advance from the rasterizer's memoized
-//! per-character measurement and the ascent from the face's own metrics. A
-//! face is resolved through the `System.addFont` registry, the attached
-//! `engine_api::Storage`, then the host's installed system fonts, exactly
-//! like the visual `Font` native.
+//! `engine_api::TextEngine` the engine owns: the advance from the
+//! rasterizer's memoized per-character measurement and the ascent from the
+//! face's own metrics. A face is resolved through the registered faces, the
+//! attached `engine_api::Storage`, then the host's installed system fonts,
+//! exactly like the visual `Font` native.
 //!
 //! [`FontRasterizer`]: https://github.com/khronos/kirikiri
 #![allow(unsafe_code)]
@@ -15,35 +15,18 @@
 use crate::engine_api::{FontId, TextEngine, TextStyle};
 
 use crate::CompatCtx;
-use crate::collections::Map;
-
-/// Shared shaping/metrics state: one L2 [`TextEngine`] plus the
-/// requested-face cache. The reference has a single process-wide rasterizer;
-/// this is the compat equivalent and is created lazily inside
-/// [`CompatServices::state`](crate::CompatServices::state).
-#[derive(Default)]
-pub(super) struct TextRenderEngine {
-    pub(super) engine: TextEngine,
-    pub(super) faces: Map<String, FontId>,
-}
-
-/// Borrow the plugin's shared text-engine state.
-pub(super) fn text_engine(ctx: &CompatCtx) -> std::cell::RefMut<'_, TextRenderEngine> {
-    // SAFETY: `ctx` was resolved from the installed binding.
-    unsafe { ctx.services() }.state::<TextRenderEngine>()
-}
 
 /// Resolve `face` to an L2 [`FontId`], registering it on first use.
 ///
 /// The resolution logic is shared with the visual `Font` native through
-/// [`crate::resource::resolve_face`] (`System.addFont` registry, attached
-/// storage, installed system fonts, then the default-face fallback).
+/// [`crate::resource::resolve_face`] (the registered faces, the attached
+/// storage, the installed system fonts, then the default face).
 pub(super) fn ensure_face(
     ctx: &CompatCtx,
-    state: &mut TextRenderEngine,
+    service: &mut TextEngine,
     face: &str,
 ) -> Result<FontId, String> {
-    crate::resource::resolve_face(ctx, &mut state.engine, &mut state.faces, face)
+    crate::resource::resolve_face(ctx, service, face)
 }
 
 /// The face the reference's `"user"` placeholder resolves to: the newest font
@@ -67,23 +50,16 @@ fn scene_face(ctx: &CompatCtx) -> Option<String> {
 /// through the scene font and then the storage-backed face cache.
 pub(super) fn resolve_face(
     ctx: &CompatCtx,
-    state: &mut TextRenderEngine,
+    service: &mut TextEngine,
     face: &str,
 ) -> Result<FontId, String> {
-    if let Some(id) = state.faces.get(face).copied() {
-        return Ok(id);
-    }
     if face == "user"
         && let Some(candidate) = scene_face(ctx)
+        && let Ok(id) = ensure_face(ctx, service, &candidate)
     {
-        if let Some(id) = state.faces.get(&candidate).copied() {
-            return Ok(id);
-        }
-        if let Ok(id) = ensure_face(ctx, state, &candidate) {
-            return Ok(id);
-        }
+        return Ok(id);
     }
-    ensure_face(ctx, state, face)
+    ensure_face(ctx, service, face)
 }
 
 /// The reference `GetTextExtent(ch, w, h).w`: the shaped advance of `ch` in
@@ -91,29 +67,28 @@ pub(super) fn resolve_face(
 /// per-character extent (no cross-character kerning).
 ///
 /// The advance is the L2 engine's memoized per-character advance, which is
-/// the rasterizer's own measurement of that character. Two cases are not
-/// that value and keep the shaped layout: a bold character, whose advance
-/// the rasterizer widens by the synthetic bold bump while the shaper
-/// measures the face's normal weight, and a control character, which the
-/// shaper expands to the next tab stop while the rasterizer reports no
-/// advance at all.
+/// the rasterizer's own measurement of that character in the requested face.
+/// A character the requested face does not map measures the face's em box,
+/// never the advance of the face that would draw it. Two cases are not that
+/// value and keep the shaped layout: a bold character, whose advance the
+/// rasterizer widens by the synthetic bold bump while the shaper measures the
+/// face's normal weight, and a control character, which the shaper expands to
+/// the next tab stop while the rasterizer reports no advance at all.
 pub(super) fn advance(
-    state: &mut TextRenderEngine,
+    service: &mut TextEngine,
     font: FontId,
     style: &TextStyle,
     ch: char,
 ) -> Result<i32, String> {
     if style.bold || ch.is_control() {
         let text = ch.to_string();
-        let layout = state
-            .engine
+        let layout = service
             .layout(font, &text, style, None)
             .map_err(|error| format!("TextRender: text layout failed: {error}"))?;
         return Ok(layout.width.round() as i32);
     }
-    let advance = state
-        .engine
-        .glyph_advance(font, ch, style)
+    let advance = service
+        .measure_code_unit(font, ch, style)
         .map_err(|error| format!("TextRender: text layout failed: {error}"))?;
     Ok(advance.round() as i32)
 }
@@ -124,9 +99,8 @@ pub(super) fn advance(
 /// and cut at the integer boundary, so a face whose ascender is 1160 units
 /// at 48 pixels per em reports 55 and not 56. The layout's line step and the
 /// `size` a script reads back are measured against that value.
-pub(super) fn ascent(state: &TextRenderEngine, font: FontId, size_px: f32) -> Result<i32, String> {
-    let metrics = state
-        .engine
+pub(super) fn ascent(service: &TextEngine, font: FontId, size_px: f32) -> Result<i32, String> {
+    let metrics = service
         .font_metrics(font, size_px)
         .map_err(|error| format!("TextRender: font metrics failed: {error}"))?;
     // The engine reports the ascent as a scaled float and the cut happens at

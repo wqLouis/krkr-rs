@@ -688,7 +688,8 @@ Code map: [`../code/engine/video.md`](../code/engine/video.md).
 
 | item | what it is |
 |---|---|
-| `TextEngine` | the registered faces, the shaping system, the layout memo, the per-character advance memo and the missing-family memo |
+| `TextEngine` | the font registry, the shaping system, the layout memo, the per-character advance memo and the missing-family memo |
+| `FontRegistry` / `FontFace` | the registered faces, the names they answer to and the default face |
 | `FontId` | the identity of a registered face |
 | `TextStyle` / `TextLayout` / `LaidOutGlyph` | the style, the laid-out text and its positioned glyphs |
 | `CoverageMask` | a rasterized character mask; its length always equals `width * height` |
@@ -699,10 +700,13 @@ Code map: [`../code/engine/video.md`](../code/engine/video.md).
 | `TextError` | the text engine's failures |
 
 The engine's operations: `new`, `set_system_font_dirs`, `add_font`,
-`font_id`, `load_system_font`, `load_system_font_exact`, `face`,
-`family_name`, `default_font_for`, `font_metrics`, `layout`,
-`cached_layouts`, `rasterize_glyph`, `glyph_advance`,
-`glyph_draw_rect`.
+`font_id`, `alias`, `registry`, `default_face`, `load_system_font`,
+`install_default_face`, `face`, `family_name`, `has_glyph`, `provider_for`,
+`measure_code_unit`, `font_metrics`, `layout`, `cached_layouts`,
+`rasterize_glyph`, `glyph_advance`, `glyph_draw_rect`.
+
+The registry's operations: `new`, `register`, `alias`, `by_name`, `face`,
+`names`, `list_names`, `default_name`, `default_face`, `len`, `is_empty`.
 
 The atlas's operations: `GlyphAtlas::new(pipeline, size)`, `clear`,
 `texture`, `pixels`, `len`, `is_empty`, `pending_len`, `glyph`,

@@ -6,6 +6,7 @@ use std::ffi::c_char;
 use std::marker::PhantomData;
 
 use crate::engine_api::InputState;
+use crate::engine_api::TextEngine;
 use crate::engine_api::TimerState;
 use crate::engine_api::{DecodePool, Scene, Storage};
 use crate::engine_api::{FrameClock, FrameTimeSource};
@@ -43,6 +44,13 @@ type StateMap = RefCell<crate::collections::Map<std::any::TypeId, Box<StateCell>
 pub struct CompatServices {
     scene: Option<*mut Scene>,
     storage: Option<*mut Storage>,
+    /// The L2 text service: the registered faces, the shaping database and
+    /// the per-character caches.
+    ///
+    /// One text service is attached per host, so every text consumer (the
+    /// visual `Font` native, the `TextRenderBase` plugin, the layer-ex draw
+    /// plugin) reaches the same faces through the same registry.
+    text: Option<*mut TextEngine>,
     input: Option<*mut InputState>,
     timer: Option<*mut TimerState>,
     /// The L2 frame clock the timers, the sound poll and the transitions read.
@@ -115,6 +123,22 @@ impl CompatServices {
     /// See [`Self::scene`] for why this returns a raw pointer.
     pub fn storage(&self) -> Option<*mut Storage> {
         self.storage
+    }
+
+    /// Attach the L2 text service the text natives compose.
+    ///
+    /// # Safety
+    ///
+    /// `text` must stay valid for as long as the binding is installed.
+    pub unsafe fn attach_text(&mut self, text: *mut TextEngine) {
+        self.text = Some(text);
+    }
+
+    /// The attached text service pointer, if any.
+    ///
+    /// See [`Self::scene`] for why this returns a raw pointer.
+    pub fn text(&self) -> Option<*mut TextEngine> {
+        self.text
     }
 
     /// Attach the L2 generic input state the input natives will read.

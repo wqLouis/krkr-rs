@@ -32,6 +32,9 @@ use tjs::{Tjs2Engine, TjsValue};
 struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
+    /// The attached text service: the registered faces and the shaping
+    /// state. Boxed so the address the host holds stays stable.
+    _text: Box<TextEngine>,
     scene: Box<Scene>,
     /// The engine's frame clock: the movie's picture follows it.
     clock: RefCell<Box<FrameClock>>,
@@ -41,6 +44,7 @@ impl Env {
     fn new() -> Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut scene = Box::new(Scene::default());
+        let mut text = Box::new(TextEngine::new());
         let mut clock = Box::new(FrameClock::new());
         let mut host = CompatHost::new();
         // SAFETY: the boxed scene and clock outlive the host (declared after
@@ -48,6 +52,8 @@ impl Env {
         unsafe {
             host.services_mut()
                 .attach_scene(scene.as_mut() as *mut Scene);
+            host.services_mut()
+                .attach_text(text.as_mut() as *mut TextEngine);
             host.services_mut()
                 .attach_clock(clock.as_mut() as *mut FrameClock);
         }
@@ -57,6 +63,7 @@ impl Env {
             _host: host,
             engine,
             scene,
+            _text: text,
             clock: RefCell::new(clock),
         }
     }
@@ -316,6 +323,7 @@ fn a_movie_layer_is_released_when_the_script_drops_it() {
 use std::path::{Path, PathBuf};
 
 use engine::Storage;
+use engine::text::TextEngine;
 use fs::FileSystem;
 
 /// System fonts tried by the text tests; a missing/unusable font skips the
@@ -347,6 +355,9 @@ fn test_font() -> Option<(PathBuf, String)> {
 struct FontEnv {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
+    /// The attached text service: the registered faces and the shaping
+    /// state. Boxed so the address the host holds stays stable.
+    _text: Box<TextEngine>,
     scene: Box<Scene>,
     _storage: Option<Box<Storage>>,
 }
@@ -355,12 +366,15 @@ impl FontEnv {
     fn new(storage: Option<Storage>) -> FontEnv {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut scene = Box::new(Scene::default());
+        let mut text = Box::new(TextEngine::new());
         let mut storage = storage.map(Box::new);
         let mut host = CompatHost::new();
         // SAFETY: the boxed scene/storage outlive the host (declared after it).
         unsafe {
             host.services_mut()
                 .attach_scene(scene.as_mut() as *mut Scene);
+            host.services_mut()
+                .attach_text(text.as_mut() as *mut TextEngine);
             if let Some(storage) = storage.as_mut() {
                 host.services_mut()
                     .attach_storage(storage.as_mut() as *mut Storage);
@@ -372,6 +386,7 @@ impl FontEnv {
             _host: host,
             engine,
             scene,
+            _text: text,
             _storage: storage,
         }
     }

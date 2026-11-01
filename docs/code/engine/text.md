@@ -1,6 +1,6 @@
 # `engine::text` — shaping, coverage, atlas and text projection
 
-Source: `crates/engine/src/text.rs`
+Source: `crates/engine/src/text.rs`, `crates/engine/src/font.rs`
 
 The module delegates the hard parts:
 
@@ -40,7 +40,8 @@ statics and no hidden caches.
 
 | value | state |
 |---|---|
-| `TextEngine` | the L1 `FontSystem`, the `cosmic-text` shaping system, the registered faces, the name→face index, the lazily built host font database, the memoized shaped layouts, the memoized per-character advances and the memoized missing system families |
+| `TextEngine` | the L1 `FontSystem`, the `cosmic-text` shaping system, the font registry, the lazily built host font database, the memoized shaped layouts, the memoized per-character advances and the memoized missing system families |
+| `FontRegistry` | the registered faces, the names they answer to, the registered-name order and the default face |
 | `GlyphAtlas` | the atlas texture, its CPU mirror, the shelf packer, the glyph entry map and the pending GPU uploads |
 | `TextCoverageCache` | the rasterized character masks and their blurred shadows |
 
@@ -60,11 +61,17 @@ impl TextEngine {
     pub fn set_system_font_dirs(&mut self, dirs: Vec<PathBuf>);
     pub fn add_font(&mut self, bytes: &[u8], index: u32) -> Result<FontId, TextError>;
     pub fn font_id(&self, family: &str) -> Option<FontId>;
+    pub fn alias(&mut self, name: &str, id: FontId);
+    pub fn registry(&self) -> &FontRegistry;
+    pub fn default_face(&self) -> Option<FontId>;
     pub fn load_system_font(&mut self, family: &str) -> Result<FontId, TextError>;
-    pub fn load_system_font_exact(&mut self, family: &str) -> Result<FontId, TextError>;
+    pub fn install_default_face(&mut self, codepoint: char) -> Result<FontId, TextError>;
     pub fn face(&self, id: FontId) -> Option<&Font>;
     pub fn family_name(&self, id: FontId) -> Option<&str>;
-    pub fn default_font_for(&self, family: &str) -> Option<FontId>;
+    pub fn has_glyph(&self, id: FontId, codepoint: char) -> bool;
+    pub fn provider_for(&self, id: FontId, codepoint: char) -> Result<FontId, TextError>;
+    pub fn measure_code_unit(&mut self, id: FontId, codepoint: char, style: &TextStyle)
+        -> Result<f32, TextError>;
     pub fn font_metrics(&self, id: FontId, size_px: f32) -> Result<FontMetrics, TextError>;
     pub fn layout(&mut self, font: FontId, text: &str, style: &TextStyle,
                   wrap_width: Option<f32>) -> Result<TextLayout, TextError>;
@@ -78,22 +85,78 @@ impl TextEngine {
 }
 ```
 
-`add_font` loads the same bytes into the L1 rasterizer **and** the shaping
-database, so layout and rasterization agree on the face. `load_system_font`
-resolves a family against the host's installed fonts (case-insensitively,
-including the localized family names in the name table), then tries the
-CJK fallback families, then the well-known Noto CJK collection paths; only
-the resolved face enters the shaping database.
+### The font registry
 
-`load_system_font_exact` resolves a family **without** the CJK fallback: it
-is the query a comma-separated candidate list needs, because a candidate that
-is not installed must not silently resolve to the Japanese fallback before
-the next candidate is tried. A family the host does not provide is memoized,
-so a repeated query reports the same `TextError::FontNotFound` without
-scanning the host font database again. The memo holds misses only: a family
-the host does provide resolves on the first query, a face registered
-afterwards is found by `font_id` before the memo is consulted, and the memo
-is dropped when `set_system_font_dirs` rebuilds the font database.
+```rust
+impl FontRegistry {
+    pub fn new() -> Self;
+    pub fn register(&mut self, face: FontFace) -> FontId;
+    pub fn alias(&mut self, name: &str, id: FontId);
+    pub fn by_name(&self, name: &str) -> Option<FontId>;
+    pub fn face(&self, id: FontId) -> Option<&FontFace>;
+    pub fn names(&self) -> &[String];
+    pub fn list_names(&self) -> Vec<String>;
+    pub fn default_name(&self) -> Option<&str>;
+    pub fn default_face(&self) -> Option<FontId>;
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+}
+```
+
+The registry is the **one** place that knows which faces exist:
+
+* A face is registered under **every** family name its name table carries
+  (the typographic family first, then the plain family, in every language the
+  face declares), so a lookup by any of them finds it. The names are matched
+  case-insensitively.
+* The **default face** is the face registered under the **oldest** name — the
+  first entry the registry ever got. A later registration does not move it.
+* The **registered-name list** is newest first and leaves the oldest name
+  out, so a registry that holds a single name reports an empty list. The
+  reference's font list stops at the map's oldest entry for the same reason
+  (`reference/cpp/core/visual/FontImpl.cpp:242-245`).
+* An **alias** is a name a caller asked for (a storage path, a
+  comma-separated candidate list). It resolves the face but stays out of the
+  registered-name list.
+
+### The per-character fallback
+
+`provider_for` answers the face that draws one character: the requested face
+when it maps the character, otherwise the default face when it maps it, and
+otherwise `TextError::MissingGlyph` — a character no face carries has no
+glyph, and the rasterizer is told so instead of drawing another character's
+shape. `layout` records that face in every `LaidOutGlyph`, so the drawing
+path draws each character with the face that carries it.
+
+The **measurement** and the **drawing** follow different rules on purpose:
+
+* `measure_code_unit` measures the **requested** face: a character the face
+  maps measures the rasterizer's advance for it, and a character the face
+  does not map measures the face's em box (the requested size in pixels). The
+  face that would draw the character never contributes to a measurement
+  (`reference/cpp/core/visual/LayerIntf.cpp:11702-11713`).
+* The drawn advance is the drawn glyph's own advance, so it is the provider's
+  (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1367`).
+
+`add_font` loads the same bytes into the L1 rasterizer **and** the shaping
+database, so layout and rasterization agree on the face, and registers the
+face under every family name its name table carries.
+
+`load_system_font` resolves a family against the host's installed fonts
+(case-insensitively, including the localized family names in the name table);
+only the resolved face enters the shaping database. A family the host does
+not provide is memoized, so a repeated query reports the same
+`TextError::FontNotFound` without scanning the host font database again. The
+memo holds misses only: a family the host does provide resolves on the first
+query, a face registered afterwards is found by `font_id` before the memo is
+consulted, and the memo is dropped when `set_system_font_dirs` rebuilds the
+font database.
+
+`install_default_face` registers the engine's default face: the first
+installed face that maps `codepoint`. The composition root calls it before
+any script runs, so the host's own face is the default and the per-character
+fallback has a face to reach for. A registry that already holds a face keeps
+it.
 
 ### The glyph atlas
 

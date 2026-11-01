@@ -145,10 +145,13 @@ extern "C" fn text_render_render(
         return report_error(out_error, "TextRenderBase.render requires 5 arguments");
     }
     let text = a.first().map(value_as_string).unwrap_or_default();
-    let mut text_engine = metrics::text_engine(&ctx);
+    let service = match crate::resource::text_service(&ctx) {
+        Ok(service) => service,
+        Err(error) => return report_error(out_error, &error),
+    };
     // SAFETY: `instance` is the live payload for the call.
     let inst = unsafe { &mut *(instance as *mut TextRenderInst) };
-    match inst.render(&ctx, &mut text_engine, &text) {
+    match inst.render(&ctx, service, &text) {
         Ok(result) => {
             set_bool(out, result);
             0
@@ -342,10 +345,13 @@ extern "C" fn text_render_done(
         );
     };
     let ctx = resolved.ctx();
-    let mut text_engine = metrics::text_engine(&ctx);
+    let service = match crate::resource::text_service(&ctx) {
+        Ok(service) => service,
+        Err(error) => return report_error(out_error, &error),
+    };
     // SAFETY: `instance` is the live payload for the call.
     let inst = unsafe { &mut *(instance as *mut TextRenderInst) };
-    match inst.flush(&ctx, &mut text_engine, false) {
+    match inst.flush(&ctx, service, false) {
         Ok(()) => {
             set_void(out);
             0

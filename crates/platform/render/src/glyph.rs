@@ -6,11 +6,17 @@
 //! every cache are middle-layer state and deliberately absent here.
 //!
 //! The rasterization core: [`px_scale_for_height`] keeps the height-to-scale
-//! convention, and the rasterizer provides the missing-glyph fallback, the
-//! synthetic bold (a 1 px right dilation of the drawn coverage plus the same
-//! pixel in the drawn and the measured advance) and the synthetic oblique
-//! slant. This API returns per-glyph coverage positioned by its bearings
-//! instead of packing pixels into a shared RGBA cell.
+//! convention, and the rasterizer provides the synthetic bold (a 1 px right
+//! dilation of the drawn coverage plus the same pixel in the drawn and the
+//! measured advance) and the synthetic oblique slant. This API returns
+//! per-glyph coverage positioned by its bearings instead of packing pixels
+//! into a shared RGBA cell.
+//!
+//! A face that does not map a character has no glyph for it: [`has_glyph`]
+//! reports that, and [`rasterize_glyph`] and [`glyph_advance`] raise
+//! [`GlyphError::MissingGlyph`] instead of substituting another character.
+//! Choosing the face that does map the character is the middle layer's job
+//! (the per-character fallback), not the rasterizer's.
 
 use std::fmt;
 
@@ -58,6 +64,7 @@ pub struct Font {
     face: FontVec,
     collection_index: u32,
     os2: Option<Os2Metrics>,
+    names: Vec<String>,
 }
 
 /// The OS/2 metrics the outline-text-metric interface reads, in design units.
@@ -86,12 +93,22 @@ impl Font {
     fn face(&self) -> &FontVec {
         &self.face
     }
+
+    /// Returns the family names the face's name table carries.
+    ///
+    /// The names are the family records of the name table (the typographic
+    /// family first, then the plain family), decoded and deduplicated. A face
+    /// without a name table carries no name.
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
 }
 
 impl fmt::Debug for Font {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Font")
             .field("collection_index", &self.collection_index)
+            .field("names", &self.names)
             .finish_non_exhaustive()
     }
 }
@@ -117,6 +134,7 @@ pub fn load_font(fs: &FontSystem, bytes: &[u8], index: u32) -> Result<Font, Glyp
         typo_ascent: table.typographic_ascender(),
         typo_descent: table.typographic_descender(),
     });
+    let names = family_names(&parsed);
     let face = FontVec::try_from_vec_and_index(bytes.to_vec(), index).map_err(|error| {
         GlyphError::InvalidFont {
             message: error.to_string(),
@@ -126,7 +144,61 @@ pub fn load_font(fs: &FontSystem, bytes: &[u8], index: u32) -> Result<Font, Glyp
         face,
         collection_index: index,
         os2,
+        names,
     })
+}
+
+/// Collects the family names of a parsed face.
+///
+/// The typographic family (name id 16) comes first, then the plain family
+/// (name id 1); every record of both is kept, so a face that names itself
+/// differently per platform is registered under each of its names. The names
+/// are decoded per platform: the Unicode and Windows platforms store UTF-16BE,
+/// the Macintosh platform stores single-byte text.
+fn family_names(face: &ttf_parser::Face<'_>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for id in [16u16, 1u16] {
+        for name in face.names() {
+            if name.name_id != id {
+                continue;
+            }
+            let Some(decoded) = decode_name(name.platform_id, name.name) else {
+                continue;
+            };
+            let decoded = decoded.trim().to_string();
+            if decoded.is_empty() || names.iter().any(|known| known == &decoded) {
+                continue;
+            }
+            names.push(decoded);
+        }
+    }
+    names
+}
+
+/// Decodes a name record's bytes for its platform.
+///
+/// The Unicode and Windows platforms store UTF-16BE; the Macintosh platform
+/// stores single-byte text, which is read as Latin-1. A record that is not
+/// valid text in its encoding is skipped.
+fn decode_name(platform_id: ttf_parser::PlatformId, bytes: &[u8]) -> Option<String> {
+    match platform_id {
+        ttf_parser::PlatformId::Unicode | ttf_parser::PlatformId::Windows => {
+            if !bytes.len().is_multiple_of(2) {
+                return None;
+            }
+            let units: Vec<u16> = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_be_bytes(*pair))
+                .collect();
+            String::from_utf16(&units).ok()
+        }
+        ttf_parser::PlatformId::Macintosh => {
+            Some(bytes.iter().map(|byte| char::from(*byte)).collect())
+        }
+        ttf_parser::PlatformId::Iso | ttf_parser::PlatformId::Custom => None,
+    }
 }
 
 /// Rasterizes `glyph` at `size_px` into an 8-bit coverage bitmap.
@@ -137,9 +209,9 @@ pub fn load_font(fs: &FontSystem, bytes: &[u8], index: u32) -> Result<Font, Glyp
 /// # Behavior
 ///
 /// * Control characters produce an empty bitmap with zero advance.
-/// * A character the face does not map falls back to U+FFFD and then to
-///   `.notdef` (glyph 0); [`GlyphError::MissingGlyph`] is returned only when
-///   the face cannot even outline `.notdef`.
+/// * A character the face does not map has no glyph: [`GlyphError::MissingGlyph`]
+///   is returned. The face that does map the character is chosen by the
+///   middle layer (the per-character fallback), never substituted here.
 /// * A glyph the face maps but does not outline (a space, a combining mark)
 ///   produces an empty bitmap carrying that glyph's advance.
 /// * [`GlyphStyle::bold`] applies a 1 px rightward coverage dilation and adds
@@ -151,7 +223,7 @@ pub fn load_font(fs: &FontSystem, bytes: &[u8], index: u32) -> Result<Font, Glyp
 /// # Errors
 ///
 /// Returns [`GlyphError::Rasterize`] for a non-positive/non-finite `size_px`,
-/// and [`GlyphError::MissingGlyph`] for a truly missing glyph.
+/// and [`GlyphError::MissingGlyph`] for a character the face does not map.
 pub fn rasterize_glyph(
     fs: &FontSystem,
     font: &Font,
@@ -171,7 +243,12 @@ pub fn rasterize_glyph(
 
     let scale = px_scale_for_height(font.face(), size_px);
     let scaled = font.face().as_scaled(scale);
-    let id = glyph_id_with_fallback(glyph, &scaled);
+    let id = scaled.glyph_id(glyph);
+    if id == GlyphId(0) {
+        return Err(GlyphError::MissingGlyph {
+            codepoint: glyph as u32,
+        });
+    }
     let mut advance = round_advance(scaled.h_advance(id)) as f32;
     // The bold pixel is part of the advance whatever the glyph outlines, so the
     // no-outline and empty-bitmap returns below report it too.
@@ -181,11 +258,6 @@ pub fn rasterize_glyph(
 
     let positioned = id.with_scale_and_position(scale, ab_glyph::point(0.0, 0.0));
     let Some(outline) = scaled.outline_glyph(positioned) else {
-        if id == GlyphId(0) {
-            return Err(GlyphError::MissingGlyph {
-                codepoint: glyph as u32,
-            });
-        }
         // The face maps this glyph but it has no outline; keep its advance so
         // the pen still moves.
         return Ok(GlyphBitmap::new(0, 0, Vec::new(), 0.0, 0.0, advance));
@@ -236,32 +308,74 @@ pub fn rasterize_glyph(
     ))
 }
 
+/// Returns whether the face maps `glyph` to a glyph of its own.
+///
+/// A control character has no glyph but needs none: the rasterizer draws it as
+/// an empty bitmap, so it counts as present.
+pub fn has_glyph(fs: &FontSystem, font: &Font, glyph: char) -> bool {
+    let _ = fs;
+    if glyph.is_control() {
+        return true;
+    }
+    font.face().glyph_id(glyph) != GlyphId(0)
+}
+
+/// Returns whether the face at `index` in `bytes` maps `glyph` to a glyph.
+///
+/// This is the cheap form of [`has_glyph`]: it reads the character map of the
+/// data without parsing the outlines, so a scan over the host's fonts stays
+/// cheap.
+pub fn font_data_has_glyph(fs: &FontSystem, bytes: &[u8], index: u32, glyph: char) -> bool {
+    let _ = fs;
+    if glyph.is_control() {
+        return true;
+    }
+    let Ok(face) = ttf_parser::Face::parse(bytes, index) else {
+        return false;
+    };
+    face.glyph_index(glyph).is_some_and(|id| id.0 != 0)
+}
+
 /// Returns the horizontal pen advance for `glyph`.
 ///
 /// The result is the glyph's rounded advance plus [`BOLD_ADVANCE`] when the
 /// style is bold, i.e. exactly the `advance` [`rasterize_glyph`] reports for the
 /// same arguments: a measurement and a drawing of the same run advance alike.
-/// Control characters advance by `0`. A non-positive or non-finite `size_px`
-/// also returns `0`.
+/// Control characters advance by `0`.
+///
+/// # Errors
+///
+/// Returns [`GlyphError::Rasterize`] for a non-positive/non-finite `size_px`,
+/// and [`GlyphError::MissingGlyph`] for a character the face does not map.
 pub fn glyph_advance(
     fs: &FontSystem,
     font: &Font,
     glyph: char,
     size_px: f32,
     style: GlyphStyle,
-) -> f32 {
+) -> Result<f32, GlyphError> {
     let _ = fs;
-    if size_px <= 0.0 || !size_px.is_finite() || glyph.is_control() {
-        return 0.0;
+    if size_px <= 0.0 || !size_px.is_finite() {
+        return Err(GlyphError::Rasterize {
+            message: format!("invalid glyph size {size_px}"),
+        });
+    }
+    if glyph.is_control() {
+        return Ok(0.0);
     }
     let scale = px_scale_for_height(font.face(), size_px);
     let scaled = font.face().as_scaled(scale);
-    let id = glyph_id_with_fallback(glyph, &scaled);
+    let id = scaled.glyph_id(glyph);
+    if id == GlyphId(0) {
+        return Err(GlyphError::MissingGlyph {
+            codepoint: glyph as u32,
+        });
+    }
     let mut advance = round_advance(scaled.h_advance(id)) as f32;
     if style.bold {
         advance += BOLD_ADVANCE;
     }
-    advance
+    Ok(advance)
 }
 
 /// Returns the scaled metrics of `font` at `size_px`.
@@ -322,20 +436,6 @@ fn px_scale_for_height(font: &FontVec, size_px: f32) -> PxScale {
 /// (`((x + 32) >> 6)` on 26.6 fixed point).
 fn round_advance(advance: f32) -> i32 {
     (advance + 0.5).floor() as i32
-}
-
-/// Resolves `c` to a glyph id, preferring the face's U+FFFD replacement glyph
-/// and then `.notdef` (glyph 0). Shared by rasterization and advance lookup so
-/// both agree.
-fn glyph_id_with_fallback(c: char, scaled: &ab_glyph::PxScaleFont<&FontVec>) -> GlyphId {
-    let id = scaled.glyph_id(c);
-    if id == GlyphId(0) && c != '\0' {
-        let replacement = scaled.glyph_id('\u{FFFD}');
-        if replacement != GlyphId(0) {
-            return replacement;
-        }
-    }
-    id
 }
 
 /// Dilates `coverage` one pixel to the right (synthetic bold).

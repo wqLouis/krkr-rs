@@ -39,6 +39,7 @@ use render::{
 };
 
 use crate::BitmapState;
+use crate::font::{FontFace, FontId, FontRegistry};
 use crate::hasher::{Map, map};
 use crate::layer_ops::{RectI, intersect_rect};
 
@@ -52,25 +53,6 @@ use cosmic_text::{Attrs, Buffer, Family, FontSystem as CosmicFontSystem, Metrics
 /// missing-family memo ([`TextEngine`]) and the glyph atlas' entry map
 /// ([`GlyphAtlas`]).
 pub const MAX_TEXT_CACHE_ENTRIES: usize = 1300;
-
-/// Japanese/Chinese/Korean-capable fallback families, tried in order when a
-/// requested family is not installed on the host.
-///
-/// The families are reached by name when the host's system fonts carry them.
-const CJK_FALLBACK_FAMILIES: &[&str] = &[
-    "Noto Sans CJK JP",
-    "Noto Sans CJK SC",
-    "Noto Sans CJK TC",
-    "Noto Sans CJK KR",
-    "Droid Sans Fallback",
-];
-
-/// Well-known Noto CJK collection paths, tried when the family query misses.
-const KNOWN_JP_PATHS: &[&str] = &[
-    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/local/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-];
 
 /// Errors produced by text layout, atlas composition and projection.
 #[derive(Debug, thiserror::Error)]
@@ -88,8 +70,18 @@ pub enum TextError {
         /// Human-readable description of the failure.
         message: String,
     },
-    /// No installed system font provides the requested family and no
-    /// Japanese-capable CJK fallback is available either.
+    /// No registered face provides the character, so there is no glyph to
+    /// draw and no extent to measure.
+    ///
+    /// The per-character fallback reaches for the default face; when that
+    /// face does not provide the character either, the character cannot be
+    /// rendered at all.
+    #[error("no registered face provides the character U+{codepoint:04X}")]
+    MissingGlyph {
+        /// The code point no face provides.
+        codepoint: u32,
+    },
+    /// No installed system font provides the requested family.
     #[error("no system font provides family '{family}'")]
     FontNotFound {
         /// Requested family name.
@@ -128,27 +120,6 @@ pub enum TextError {
     /// An L1 render action (texture creation/upload) failed.
     #[error(transparent)]
     Render(#[from] api::error::RenderError),
-}
-
-/// A registered font face.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[non_exhaustive]
-pub struct FontId(usize);
-
-impl FontId {
-    /// Returns the registration index of this face.
-    pub const fn index(self) -> usize {
-        self.0
-    }
-}
-
-/// A registered font face: the L1 rasterizer face plus the shaping id and
-/// family name `cosmic-text` uses to select it.
-struct Face {
-    /// L1 parsed face used for rasterization.
-    render: Font,
-    /// Family name used in [`Attrs`] so shaping picks this face.
-    family: String,
 }
 
 /// Style of a run of text.
@@ -341,6 +312,11 @@ impl CoverageMask {
 struct LayoutKey {
     /// Registered face index.
     font: FontId,
+    /// The default face the per-character fallback reaches for.
+    ///
+    /// The fallback decides which face draws a character, so the default face
+    /// is part of the shaping inputs.
+    default_face: Option<FontId>,
     /// Source text.
     text: String,
     /// `size_px.to_bits()` (so the key stays `Eq`).
@@ -382,10 +358,8 @@ pub struct TextEngine {
     render_system: FontSystem,
     /// `cosmic-text` shaping/layout system (stateless service).
     cosmic: CosmicFontSystem,
-    /// Registered faces, indexed by [`FontId`].
-    faces: Vec<Face>,
-    /// Lowercased family name → face id, for name-based lookup.
-    by_name: Map<String, FontId>,
+    /// The registered faces, the names they answer to and the default face.
+    registry: FontRegistry,
     /// Lazily built host font database used by [`TextEngine::load_system_font`].
     /// It is kept separate from the shaping database so that only explicitly
     /// resolved faces participate in layout.
@@ -394,9 +368,6 @@ pub struct TextEngine {
     /// [`TextEngine::set_system_font_dirs`]. They are scanned, in addition to
     /// `fontdb`'s default locations, when the system database is first built.
     system_font_dirs: Vec<PathBuf>,
-    /// Whether the "resolved to the engine default face" fallback has been
-    /// logged. The record is emitted once per engine, not once per name.
-    default_fallback_logged: bool,
     /// Memoized shaped layouts, keyed by shaping inputs only. Bounded at the
     /// cache limit with least-recently-used eviction.
     layout_cache: LruCache<LayoutKey, TextLayout>,
@@ -415,8 +386,8 @@ impl TextEngine {
     ///
     /// The shaping database starts empty: only faces added with
     /// [`TextEngine::add_font`] or resolved with
-    /// [`TextEngine::load_system_font`] are available, which keeps rendering
-    /// deterministic and free of unrelated host font state.
+    /// [`TextEngine::load_system_font`] are available, which keeps
+    /// rendering deterministic and free of unrelated host font state.
     pub fn new() -> Self {
         Self {
             render_system: render::create_font_system(),
@@ -424,11 +395,9 @@ impl TextEngine {
                 String::new(),
                 cosmic_text::fontdb::Database::new(),
             ),
-            faces: Vec::new(),
-            by_name: map(),
+            registry: FontRegistry::new(),
             system_fonts: None,
             system_font_dirs: Vec::new(),
-            default_fallback_logged: false,
             layout_cache: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
             advance_cache: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
             missing_system_families: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
@@ -455,7 +424,8 @@ impl TextEngine {
     ///
     /// The same bytes are loaded into both the L1 rasterizer and the
     /// `cosmic-text` shaping database so layout and rasterization agree on the
-    /// face.
+    /// face. The face is registered under every family name its name table
+    /// carries, so it is found under each of them.
     ///
     /// # Errors
     ///
@@ -478,52 +448,50 @@ impl TextEngine {
             .and_then(|info| info.families.first())
             .map(|(name, _)| name.clone())
             .unwrap_or_default();
-        let id = FontId(self.faces.len());
-        if !family.is_empty() {
-            self.by_name.entry(family.to_lowercase()).or_insert(id);
+        let mut names = face.names().to_vec();
+        if !family.is_empty() && !names.iter().any(|name| name == &family) {
+            names.push(family.clone());
         }
-        self.faces.push(Face {
-            render: face,
+        Ok(self.registry.register(FontFace {
+            names,
             family,
-        });
-        Ok(id)
+            render: face,
+        }))
     }
 
     /// Looks up a face registered under `family` (case-insensitive).
     pub fn font_id(&self, family: &str) -> Option<FontId> {
-        self.by_name.get(&family.to_lowercase()).copied()
+        self.registry.by_name(family)
+    }
+
+    /// Records `name` as resolving to `id`.
+    ///
+    /// An alias is the name a caller asked for (a face name with a
+    /// comma-separated candidate list, a storage path): it resolves the same
+    /// face on the next lookup, but it is not a name the face itself carries,
+    /// so it stays out of the registered-name list.
+    pub fn alias(&mut self, name: &str, id: FontId) {
+        self.registry.alias(name, id);
+    }
+
+    /// The font registry: the registered faces, the names they answer to and
+    /// the default face.
+    pub fn registry(&self) -> &FontRegistry {
+        &self.registry
+    }
+
+    /// The default face: the face registered under the oldest name.
+    pub fn default_face(&self) -> Option<FontId> {
+        self.registry.default_face()
     }
 
     /// Resolves `family` against the host's installed fonts, registers the
     /// matched face and returns its id.
     ///
     /// The family is matched case-insensitively, including the localized
-    /// family names in the font's name table. When nothing matches, the
-    /// Japanese/CJK fallback families are tried (`Noto Sans CJK JP` and the
-    /// other `Noto Sans CJK` regions, then `Droid Sans Fallback`), then the
-    /// well-known Noto CJK collection paths. Only the resolved face is
+    /// family names in the font's name table. Only the resolved face is
     /// loaded into the shaping database, so layout never picks up an
     /// unrelated system font.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TextError::FontNotFound`] when neither `family` nor the CJK
-    /// fallback is installed, and propagates [`TextError::Glyph`] /
-    /// [`TextError::InvalidFont`] when the matched data cannot be registered.
-    pub fn load_system_font(&mut self, family: &str) -> Result<FontId, TextError> {
-        if let Some(id) = self.font_id(family) {
-            return Ok(id);
-        }
-        let (bytes, index) = self.system_face_bytes(family, true)?;
-        self.finish_system_face(family, &bytes, index)
-    }
-
-    /// Resolves `family` against the host's installed fonts without the CJK
-    /// fallback, registers the matched face and returns its id.
-    ///
-    /// This is the exact-family query a comma-separated candidate list needs:
-    /// a candidate that is not installed must not silently resolve to the
-    /// Japanese fallback before the next candidate is tried.
     ///
     /// A family the host does not provide is memoized, so a repeated query
     /// reports the same [`TextError::FontNotFound`] without scanning the host
@@ -538,7 +506,7 @@ impl TextEngine {
     /// Returns [`TextError::FontNotFound`] when no installed face carries
     /// `family`, and propagates the registration errors of
     /// [`TextEngine::add_font`].
-    pub fn load_system_font_exact(&mut self, family: &str) -> Result<FontId, TextError> {
+    pub fn load_system_font(&mut self, family: &str) -> Result<FontId, TextError> {
         let key = family.to_lowercase();
         // A face registered on this engine resolves by name, so a family added
         // after a failed lookup is not shadowed by the memoized miss.
@@ -551,7 +519,7 @@ impl TextEngine {
                 family: family.to_string(),
             });
         }
-        let (bytes, index) = match self.system_face_bytes(family, false) {
+        let (bytes, index) = match self.system_face_bytes(family) {
             Ok(found) => found,
             Err(error) => {
                 if matches!(error, TextError::FontNotFound { .. }) {
@@ -565,13 +533,8 @@ impl TextEngine {
     }
 
     /// Reads the bytes and collection index of the system face matching
-    /// `family`. With `fallback`, a missing family falls back through
-    /// [`CJK_FALLBACK_FAMILIES`] and the well-known Noto CJK paths.
-    fn system_face_bytes(
-        &mut self,
-        family: &str,
-        fallback: bool,
-    ) -> Result<(Vec<u8>, u32), TextError> {
+    /// `family`.
+    fn system_face_bytes(&mut self, family: &str) -> Result<(Vec<u8>, u32), TextError> {
         if self.system_fonts.is_none() {
             self.system_fonts = Some(load_system_database(&self.system_font_dirs));
         }
@@ -581,17 +544,7 @@ impl TextEngine {
             .ok_or_else(|| TextError::FontNotFound {
                 family: family.to_string(),
             })?;
-        let matched = if fallback {
-            let named = find_family(system, family).or_else(|| {
-                CJK_FALLBACK_FAMILIES
-                    .iter()
-                    .find_map(|candidate| find_family(system, candidate))
-            });
-            named.or_else(|| load_known_jp_path(system))
-        } else {
-            find_family(system, family)
-        };
-        matched
+        find_family(system, family)
             .and_then(|id| system.with_face_data(id, |data, index| (data.to_vec(), index)))
             .ok_or_else(|| TextError::FontNotFound {
                 family: family.to_string(),
@@ -607,37 +560,149 @@ impl TextEngine {
         index: u32,
     ) -> Result<FontId, TextError> {
         let id = self.add_font(bytes, index)?;
-        self.by_name.entry(family.to_lowercase()).or_insert(id);
+        self.registry.alias(family, id);
         Ok(id)
     }
 
     /// Returns the L1 face for `id`, if registered.
     pub fn face(&self, id: FontId) -> Option<&Font> {
-        self.faces.get(id.0).map(|face| &face.render)
+        self.registry.face(id).map(|face| &face.render)
     }
 
     /// Returns the family name registered for `id`, if the face has one.
     pub fn family_name(&self, id: FontId) -> Option<&str> {
-        self.faces
-            .get(id.0)
+        self.registry
+            .face(id)
             .map(|face| face.family.as_str())
             .filter(|family| !family.is_empty())
     }
 
-    /// Returns the first registered face, the fallback for a face that cannot
-    /// be resolved, and notes that `family` used it.
+    /// Returns whether the face `id` maps `codepoint` to a glyph of its own.
+    pub fn has_glyph(&self, id: FontId, codepoint: char) -> bool {
+        self.registry
+            .face(id)
+            .is_some_and(|face| render::has_glyph(&self.render_system, &face.render, codepoint))
+    }
+
+    /// The face that draws `codepoint` for a request for `id`.
     ///
-    /// The first such fallback is logged once per engine rather than once per
-    /// name.
-    pub fn default_font_for(&mut self, family: &str) -> Option<FontId> {
-        if self.faces.is_empty() {
-            return None;
+    /// The requested face draws the character when it maps it. Otherwise the
+    /// default face draws it, when the default face maps it. A character no
+    /// face maps has no glyph at all, and the caller is told so instead of
+    /// getting another character's shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TextError::UnknownFont`] when `id` is not registered, and
+    /// [`TextError::MissingGlyph`] when no registered face maps `codepoint`.
+    pub fn provider_for(&self, id: FontId, codepoint: char) -> Result<FontId, TextError> {
+        let face = self
+            .registry
+            .face(id)
+            .ok_or(TextError::UnknownFont(id.index()))?;
+        if render::has_glyph(&self.render_system, &face.render, codepoint) {
+            return Ok(id);
         }
-        if !self.default_fallback_logged {
-            self.default_fallback_logged = true;
-            log::info!("system fonts: face '{family}' resolved to the engine default face");
+        let Some(default) = self.registry.default_face() else {
+            return Err(TextError::MissingGlyph {
+                codepoint: codepoint as u32,
+            });
+        };
+        if default == id {
+            return Err(TextError::MissingGlyph {
+                codepoint: codepoint as u32,
+            });
         }
-        Some(FontId(0))
+        let default_face = self
+            .registry
+            .face(default)
+            .ok_or(TextError::UnknownFont(default.index()))?;
+        if render::has_glyph(&self.render_system, &default_face.render, codepoint) {
+            return Ok(default);
+        }
+        Err(TextError::MissingGlyph {
+            codepoint: codepoint as u32,
+        })
+    }
+
+    /// The measured extent of one character in the face `id`.
+    ///
+    /// The measurement follows the requested face: a character the face maps
+    /// measures the advance the rasterizer reports for it, and a character the
+    /// face does not map measures the face's em box (the requested size in
+    /// pixels). The face that would draw the character never contributes to a
+    /// measurement, so a measurement and a drawing of the same character can
+    /// differ.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TextError::UnknownFont`] when `id` is not registered, and
+    /// [`TextError::InvalidSize`] for a bad size.
+    pub fn measure_code_unit(
+        &mut self,
+        id: FontId,
+        codepoint: char,
+        style: &TextStyle,
+    ) -> Result<f32, TextError> {
+        validate_size(style.size_px)?;
+        if codepoint.is_control() {
+            return Ok(0.0);
+        }
+        if !self.has_glyph(id, codepoint) {
+            return Ok(style.size_px);
+        }
+        self.glyph_advance(id, codepoint, style)
+    }
+
+    /// Registers the engine's default face.
+    ///
+    /// The default face is the oldest registered face: the face the
+    /// per-character fallback reaches for. The composition root calls this
+    /// before any script runs, so the host's own face is the default; a
+    /// registry that already holds a face keeps it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TextError::FontNotFound`] when no installed system face
+    /// provides `codepoint`, and propagates the registration errors of
+    /// [`TextEngine::add_font`].
+    pub fn install_default_face(&mut self, codepoint: char) -> Result<FontId, TextError> {
+        if let Some(default) = self.registry.default_face() {
+            return Ok(default);
+        }
+        let (bytes, index) = self.system_face_with_glyph(codepoint)?;
+        self.add_font(&bytes, index)
+    }
+
+    /// Reads the bytes and collection index of the first installed system
+    /// face that maps `codepoint` to a glyph.
+    fn system_face_with_glyph(&mut self, codepoint: char) -> Result<(Vec<u8>, u32), TextError> {
+        if self.system_fonts.is_none() {
+            self.system_fonts = Some(load_system_database(&self.system_font_dirs));
+        }
+        // The rasterizer service is copied out of the engine so the scan does
+        // not borrow the engine while the font database is borrowed.
+        let render_system = self.render_system;
+        let system = self
+            .system_fonts
+            .as_mut()
+            .ok_or_else(|| TextError::FontNotFound {
+                family: codepoint.to_string(),
+            })?;
+        for face in system.faces() {
+            let found = system
+                .with_face_data(face.id, |data, index| {
+                    render::font_data_has_glyph(&render_system, data, index, codepoint)
+                        .then(|| (data.to_vec(), index))
+                })
+                .flatten();
+            if let Some(found) = found {
+                return Ok(found);
+            }
+        }
+        Err(TextError::FontNotFound {
+            family: codepoint.to_string(),
+        })
     }
 
     /// Returns the L1 metrics of `id` at `size_px`.
@@ -646,7 +711,10 @@ impl TextEngine {
     ///
     /// Returns [`TextError::UnknownFont`] when `id` is not registered.
     pub fn font_metrics(&self, id: FontId, size_px: f32) -> Result<FontMetrics, TextError> {
-        let face = self.faces.get(id.0).ok_or(TextError::UnknownFont(id.0))?;
+        let face = self
+            .registry
+            .face(id)
+            .ok_or(TextError::UnknownFont(id.index()))?;
         Ok(render::font_metrics(
             &self.render_system,
             &face.render,
@@ -677,6 +745,7 @@ impl TextEngine {
         let wrap = wrap_width.filter(|w| w.is_finite() && *w > 0.0);
         let key = LayoutKey {
             font,
+            default_face: self.registry.default_face(),
             text: text.to_owned(),
             size_bits: style.size_px.to_bits(),
             bold: style.bold,
@@ -687,16 +756,18 @@ impl TextEngine {
             return Ok(cached.clone());
         }
 
-        let layout = {
-            // Split the borrow so `cosmic` can be borrowed mutably while
-            // `faces` (and the immutable `render_system`) stay borrowed.
+        let mut layout = {
+            // Split the borrow so `cosmic` can be borrowed mutably while the
+            // registry (and the immutable `render_system`) stay borrowed.
             let Self {
                 render_system,
                 cosmic,
-                faces,
+                registry,
                 ..
             } = &mut *self;
-            let face = faces.get(font.0).ok_or(TextError::UnknownFont(font.0))?;
+            let face = registry
+                .face(font)
+                .ok_or(TextError::UnknownFont(font.index()))?;
 
             let metrics = render::font_metrics(render_system, &face.render, style.size_px);
             let measured = metrics.line_height();
@@ -754,6 +825,15 @@ impl TextEngine {
             }
         };
 
+        // The fallback is per character: a character the requested face does
+        // not map is drawn by the face that does map it, so every glyph names
+        // the face it is drawn with.
+        for glyph in &mut layout.glyphs {
+            if let Ok(provider) = self.provider_for(font, glyph.codepoint) {
+                glyph.font = provider;
+            }
+        }
+
         self.layout_cache.insert(key, layout.clone());
         Ok(layout)
     }
@@ -785,9 +865,9 @@ impl TextEngine {
     ) -> Result<GlyphBitmap, TextError> {
         validate_size(style.size_px)?;
         let face = self
-            .faces
-            .get(font.0)
-            .ok_or(TextError::UnknownFont(font.0))?;
+            .registry
+            .face(font)
+            .ok_or(TextError::UnknownFont(font.index()))?;
         Ok(render::rasterize_glyph(
             &self.render_system,
             &face.render,
@@ -812,13 +892,16 @@ impl TextEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`TextError::UnknownFont`] when `font` is not registered.
+    /// Returns [`TextError::UnknownFont`] when `font` is not registered,
+    /// [`TextError::InvalidSize`] for a bad size, and
+    /// [`TextError::Glyph`] when the face does not map the character.
     pub fn glyph_advance(
         &mut self,
         font: FontId,
         codepoint: char,
         style: &TextStyle,
     ) -> Result<f32, TextError> {
+        validate_size(style.size_px)?;
         let key = AdvanceKey {
             font,
             codepoint,
@@ -830,16 +913,16 @@ impl TextEngine {
             return Ok(*cached);
         }
         let face = self
-            .faces
-            .get(font.0)
-            .ok_or(TextError::UnknownFont(font.0))?;
+            .registry
+            .face(font)
+            .ok_or(TextError::UnknownFont(font.index()))?;
         let advance = render::glyph_advance(
             &self.render_system,
             &face.render,
             codepoint,
             style.size_px,
             style.glyph_style(),
-        );
+        )?;
         self.advance_cache.insert(key, advance);
         Ok(advance)
     }
@@ -961,25 +1044,6 @@ fn find_family(db: &fontdb::Database, family: &str) -> Option<fontdb::ID> {
             .any(|(name, _)| name.to_lowercase() == wanted)
             .then_some(face.id)
     })
-}
-
-/// Loads the well-known Noto CJK collections and returns the first face whose
-/// family name contains `JP` (the matching face inside a shared `.ttc`).
-fn load_known_jp_path(db: &mut fontdb::Database) -> Option<fontdb::ID> {
-    for path in KNOWN_JP_PATHS {
-        if !std::path::Path::new(path).is_file() {
-            continue;
-        }
-        let ids = db.load_font_source(fontdb::Source::File(std::path::PathBuf::from(*path)));
-        let matched = ids.into_iter().find(|id| {
-            db.face(*id)
-                .is_some_and(|face| face.families.iter().any(|(name, _)| name.contains("JP")))
-        });
-        if let Some(id) = matched {
-            return Some(id);
-        }
-    }
-    None
 }
 
 /// Cache key for one rasterized glyph in the atlas.
@@ -1166,7 +1230,7 @@ impl GlyphAtlas {
     ) -> Result<AtlasGlyph, TextError> {
         validate_size(style.size_px)?;
         let key = GlyphKey {
-            font: font.0,
+            font: font.index(),
             codepoint,
             size_bits: style.size_px.to_bits(),
             bold: style.bold,
@@ -1177,9 +1241,9 @@ impl GlyphAtlas {
         }
 
         let face = engine
-            .faces
-            .get(font.0)
-            .ok_or(TextError::UnknownFont(font.0))?;
+            .registry
+            .face(font)
+            .ok_or(TextError::UnknownFont(font.index()))?;
         let bitmap = render::rasterize_glyph(
             &engine.render_system,
             &face.render,
@@ -1500,7 +1564,7 @@ impl CoverageKey {
     /// The key of the sharp, unblurred character.
     fn sharp(font: FontId, codepoint: char, style: &TextStyle, antialias: bool) -> Self {
         Self {
-            font: font.0,
+            font: font.index(),
             codepoint,
             size_bits: style.size_px.to_bits(),
             bold: style.bold,
@@ -2506,22 +2570,17 @@ mod tests {
     /// Reference: `TVPFindFont` returns the matching face from the enumerated
     /// font map, and `TVPCreateFontStream` falls back to the default face when
     /// the requested name is absent (`reference/cpp/core/visual/FontImpl.cpp:
-    /// 159-164,277-285`). `load_system_font` therefore resolves an unknown
-    /// family to the Japanese-capable fallback when the host has one, and
-    /// reports [`TextError::FontNotFound`] when it has none.
+    /// 159-164,277-285`). The default face is the engine's own default, not a
+    /// substitute family: an unknown family is reported as
+    /// [`TextError::FontNotFound`], and the caller falls back to the default
+    /// face itself.
     #[test]
-    fn load_system_font_resolves_unknown_family_or_reports_absence() {
+    fn load_system_font_reports_an_unknown_family() {
         let mut engine = TextEngine::new();
-        match engine.load_system_font("this-family-is-not-installed") {
-            Ok(id) => {
-                let layout = engine
-                    .layout(id, "A", &TextStyle::new(24.0), None)
-                    .expect("the fallback face must shape");
-                assert!(!layout.is_empty());
-            }
-            Err(TextError::FontNotFound { .. }) => {}
-            Err(error) => panic!("unexpected error: {error}"),
-        }
+        assert!(matches!(
+            engine.load_system_font("this-family-is-not-installed"),
+            Err(TextError::FontNotFound { .. })
+        ));
     }
 
     /// Copies the first available test font into a fresh temporary directory
@@ -2570,7 +2629,7 @@ mod tests {
         let mut engine = TextEngine::new();
         engine.set_system_font_dirs(vec![dir.clone()]);
         let id = engine
-            .load_system_font_exact(&family)
+            .load_system_font(&family)
             .expect("a supplied directory must resolve its family");
         assert!(
             engine.layout(id, "A", &TextStyle::new(24.0), None).is_ok(),
@@ -2588,7 +2647,7 @@ mod tests {
     fn an_absent_exact_family_reports_a_typed_error() {
         let mut engine = TextEngine::new();
         let error = engine
-            .load_system_font_exact("this-family-is-not-installed")
+            .load_system_font("this-family-is-not-installed")
             .expect_err("an absent exact family must not resolve");
         assert!(matches!(error, TextError::FontNotFound { .. }));
     }
@@ -2606,10 +2665,10 @@ mod tests {
         let mut engine = TextEngine::new();
         let family = "this-family-is-not-installed";
         let first = engine
-            .load_system_font_exact(family)
+            .load_system_font(family)
             .expect_err("an absent exact family must not resolve");
         let second = engine
-            .load_system_font_exact(family)
+            .load_system_font(family)
             .expect_err("an absent exact family must not resolve");
         assert!(matches!(first, TextError::FontNotFound { .. }));
         assert!(matches!(second, TextError::FontNotFound { .. }));
@@ -2640,7 +2699,7 @@ mod tests {
             .missing_system_families
             .insert(family.to_lowercase(), ());
         let resolved = engine
-            .load_system_font_exact(&family)
+            .load_system_font(&family)
             .expect("the registered family must resolve");
         assert_eq!(resolved, id, "the registered face must answer the lookup");
         assert!(
@@ -2666,9 +2725,9 @@ mod tests {
         };
         let mut engine = TextEngine::new();
         let id = engine.add_font(&bytes, 0).expect("register the face");
-        engine.by_name.insert("*pseudo".to_string(), id);
+        engine.alias("*pseudo", id);
         let resolved = engine
-            .load_system_font_exact("*pseudo")
+            .load_system_font("*pseudo")
             .expect("the registered pseudo family must resolve");
         assert_eq!(resolved, id);
     }
@@ -2681,7 +2740,7 @@ mod tests {
         let mut engine = TextEngine::new();
         let family = "this-family-is-not-installed";
         assert!(matches!(
-            engine.load_system_font_exact(family),
+            engine.load_system_font(family),
             Err(TextError::FontNotFound { .. })
         ));
         assert!(
@@ -2990,7 +3049,7 @@ mod tests {
         let synthetic = |index: usize| {
             let codepoint =
                 char::from_u32(u32::try_from(index).expect("small index")).expect("codepoint");
-            CoverageKey::sharp(FontId(usize::MAX), codepoint, &style, true)
+            CoverageKey::sharp(FontId::test_key(usize::MAX), codepoint, &style, true)
         };
         let mask = || CoverageMask::new(0.0, 0.0, 1, 1, vec![128]).expect("1x1 mask");
 
@@ -3139,11 +3198,13 @@ mod tests {
         let Ok(font) = engine.add_font(&bytes, 0) else {
             return;
         };
+        let default_face = engine.default_face();
         let style = TextStyle::new(16.0);
         let wrap: Option<f32> = None;
 
         let key_for = |text: &str| LayoutKey {
             font,
+            default_face,
             text: text.to_owned(),
             size_bits: style.size_px.to_bits(),
             bold: style.bold,

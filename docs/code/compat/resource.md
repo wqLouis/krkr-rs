@@ -48,11 +48,7 @@ global) that owns:
 
 | Field | Purpose |
 |---|---|
-| `engine: TextEngine` | the shared shaping/layout engine |
 | `coverage_cache: TextCoverageCache` | the rasterized character masks and their blurred shadows, keyed like the reference font cache |
-| `faces: HashMap<String, FontId>` | requested face string → registered face id |
-| `registered: Vec<String>` | the registered family names in registration order (`Font.getList`) |
-| `default_face: Option<String>` | the first registered family (`Font.defaultFaceName`) |
 | `decode` / `probe` / `save` | the host image codec closures |
 | `prerendered_storage: HashMap<String, Rc<PrerenderedFont>>` | the loaded pre-rendered fonts, keyed by the resolved placed path |
 | `prerendered: Vec<(PrerenderedKey, Rc<PrerenderedFont>)>` | the font-value → pre-rendered font mappings, in registration order |
@@ -64,9 +60,13 @@ pub(crate) fn resource_state(ctx: &CompatCtx) -> RefMut<'_, ResourceResolver>;
 ```
 
 The consumers are the visual `Font` native, `Layer.drawText`/`drawGlyph`,
-`ImageFunction.drawText`/`drawGlyph` and `Layer.saveLayerImage`. The
-`TextRenderBase` and `LayerExDraw` plugin metrics keep their own shaping
-state but resolve faces through the same function.
+`ImageFunction.drawText`/`drawGlyph` and `Layer.saveLayerImage`.
+
+The **faces** are not in this state: they live in the L2 text service the
+engine owns, which the host attaches to the services container. Every text
+consumer — the visual `Font` native, the `TextRenderBase` plugin, the
+layer-ex draw plugin and `System.addFont` — reaches that one registry
+through `text_service(ctx)`, so there is no second face table in L3.
 
 ---
 
@@ -111,27 +111,24 @@ writer, exactly as the read path does on the decode side.
 
 ## 4. Face resolution
 
-`resolve_face(ctx, engine, cache, face)` resolves a face string to a
-`FontId`. The face may be a **comma-separated candidate list** with an
-optional leading `@` (vertical writing).
+`resolve_face(ctx, service, face)` resolves a face string to a `FontId` in
+the shared text service. The face may be a **comma-separated candidate list**
+with an optional leading `@` (vertical writing).
 
 Resolution order:
 
-1. a cached resolution for the exact face string;
-2. for each candidate, in order:
-   * the engine's own registered families;
-   * the `System.addFont` registry (`plugins/add_font/registry.rs`);
+1. for each candidate, in order:
+   * the registry's registered faces;
    * the attached storage — **only** when the candidate is spelled like a font
      *file* (`.ttf`, `.ttc`, `.otf`, `.otc`, `.tte`, `.dfont`), because the
      reference resolves a face only through its registered font names, and
      probing the storage for a bare family name would miss on every text
      draw;
    * the host's installed system fonts (exact family only);
-3. the last family registered by `System.addFont`;
-4. the host's **default face**, loaded under the fixed name
-   `__krkr_default_face__`;
-5. the engine's first registered face for that face;
-6. otherwise the typed error `"no font is available for face '{face}'"`.
+2. the registry's **default face** — the face registered under the oldest
+   name. A registry that holds no face yet gets the host's default font
+   first, so a face the host provides is never lost to an empty registry;
+3. otherwise the typed error `"no font is available for face '{face}'"`.
 
 A candidate is tried like any other name: the reference's font map is keyed
 by family name, so a family the host or the game provides under a `*` name
@@ -142,14 +139,15 @@ so a candidate no source knows is not scanned against the host's font
 database again on the next draw. The memo holds misses only, so a family
 that resolves later is not shadowed by it.
 
-The fixed fallback name is load-bearing: it keeps the *requested* family free
-so a face registered later for that family (`System.addFont`,
-`GdiPlus.addPrivateFont`) is not shadowed by the fallback's own name-map
-entry. Only a resolution found through a candidate is cached under the
-requested name.
+A candidate that resolves is recorded as an **alias** under the requested
+name, so the next lookup finds the same face. The default-face fallback is
+not recorded: a face registered later for that name (`System.addFont`,
+`GdiPlus.addPrivateFont`) is found on the next lookup instead of being
+shadowed by a stale fallback entry.
 
-A resolved family name is recorded in registration order, which is what
-`Font.getList` reports and what `Font.defaultFaceName` returns.
+`Font.getList` reports the registry's registered names and
+`Font.defaultFaceName` its oldest name — the name the default face is
+registered under.
 
 ---
 
@@ -215,10 +213,10 @@ string, or an object's `text`, `char` or `character` member.
 | Seam | Installed by | Purpose |
 |---|---|---|
 | `set_image_codec(decode, probe, save)` | `CompatHost` (defined in `host.rs`) | the L1 `media` image codec |
-| `set_system_font_dirs(dirs)` | the composition root, on the L2 `TextEngine` | where the host's system fonts live |
+| `set_system_font_dirs(dirs)` | the composition root, on the attached L2 text service | where the host's system fonts live |
 
-The L2 `TextEngine` itself, the `System.addFont` registry and the attached
-storage are the other face sources.
+The attached L2 text service and the attached storage are the other face
+sources.
 
 ---
 
@@ -229,7 +227,7 @@ storage are the other face sources.
 | `"no image decoder is installed"` | a decode was requested and no decoder is installed |
 | `"no image header prober is installed"` | a header probe was requested and no prober is installed |
 | `"no image encoder is installed"` | a save was requested and no encoder is installed |
-| `"no font is available for face '{face}'"` | no candidate, no default face and no registered face at all |
+| `"no font is available for face '{face}'"` | no candidate resolved and the registry holds no face at all |
 | `"Cannot find storage {storage}"` | the pre-rendered font's storage does not resolve |
 | `"Prerendered font mapping failed : {sub}"` | the `.tft` header is invalid |
 | `"text layout failed: {error}"` | the L2 text engine rejected the layout |
@@ -244,6 +242,7 @@ storage are the other face sources.
 |---|---|
 | `crates/compat/tests/resource.rs` | the resolver: face resolution, the registered family list, the pre-rendered map/unmap, the codec seam |
 | `crates/compat/tests/font.rs` | the face metrics, `getList`, `defaultFaceName`, the pre-rendered measurements and the reference header errors |
+| `crates/compat/tests/font_registry.rs` | the registered name list, the default face name, `System.addFont`'s results, the per-character measurement and the KAG-shaped text render |
 | `crates/compat/tests/bitmap.rs` | the codec seam: the load/save/probe round-trips and the missing-codec errors |
 | `crates/compat/tests/layer_behaviour.rs::layer_draw_text_prerendered_pixels_match_the_coverage` | a pre-rendered font's pixels match the rasterizer's coverage |
 | `crates/compat/tests/storage_media_prefix.rs` | the `file://` prefix on the storage-backed members |

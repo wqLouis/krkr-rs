@@ -629,6 +629,10 @@ impl GameHost {
         // reads it on demand, so a script sees the time move inside a frame.
         // A host that attached none reports the frame clock.
         let frame_time_ptr = host.frame_time_source();
+        // The text service: the registered faces, the shaping database and
+        // the per-character caches. The engine owns it, so every text
+        // consumer reaches the same faces.
+        let text_ptr = host.engine_mut().text_mut() as *mut engine::text::TextEngine;
         // SAFETY: `storage` and `host` are declared after `vm` in the returned
         // struct and therefore outlive it; the boxed `host` keeps the engine's
         // scene, timer, input and clock addresses stable, and nothing else
@@ -643,6 +647,7 @@ impl GameHost {
             services.attach_input(input_ptr);
             services.attach_clock(clock_ptr);
             services.attach_decode_pool(pool_ptr);
+            services.attach_text(text_ptr);
             if let Some(source) = frame_time_ptr {
                 services.attach_frame_time(source);
             }
@@ -658,6 +663,16 @@ impl GameHost {
         // face.
         vm.compat()
             .set_system_font_dirs(platform::system_font_dirs());
+        // The engine's default face is the oldest registered face: the face
+        // the per-character fallback reaches for. The host's own face is
+        // installed before any script runs, so it is the default.
+        if let Err(error) = host
+            .engine_mut()
+            .text_mut()
+            .install_default_face('\u{4E00}')
+        {
+            log::warn!("system fonts: no installed face provides a CJK glyph: {error}");
+        }
         // SAFETY: `storage` is declared after `vm` in the returned struct, so
         // it outlives the compat host that holds the installed source.
         unsafe { crate::install_video_source_metered(vm.compat(), &media, &storage, &stats) }

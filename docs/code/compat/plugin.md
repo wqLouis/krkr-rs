@@ -50,7 +50,7 @@ trait impl.
 
 | Canonical name | Aliases | Dependencies | Registers |
 |---|---|---|---|
-| `addFont.dll` | — | — | the `System.addFont` registry |
+| `addFont.dll` | — | — | the `System.addFont` member, which registers the file's faces in the shared font registry |
 | `csvParser.dll` | — | — | `CSVParser` |
 | `dirlist.dll` | — | — | the `Storages` directory members |
 | `emoteplayer.dll` | — | `motionplayer.dll` | nothing of its own — it is the loader shim for `motionplayer.dll` |

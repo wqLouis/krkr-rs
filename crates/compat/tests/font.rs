@@ -92,6 +92,9 @@ struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
     scene: Box<Scene>,
+    /// The attached text service: the registered faces and the shaping
+    /// state. Boxed so the address the host holds stays stable.
+    _text: Box<TextEngine>,
     /// Kept alive for the host's raw pointer; `None` means no font source.
     _storage: Option<Box<Storage>>,
 }
@@ -100,6 +103,7 @@ impl Env {
     fn new(storage: Option<Storage>) -> Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut scene = Box::new(Scene::default());
+        let mut text = Box::new(TextEngine::new());
         let mut storage = storage.map(Box::new);
         let mut host = CompatHost::new();
         // SAFETY: the boxed scene and storage outlive the host (they are
@@ -108,6 +112,8 @@ impl Env {
         unsafe {
             host.services_mut()
                 .attach_scene(scene.as_mut() as *mut Scene);
+            host.services_mut()
+                .attach_text(text.as_mut() as *mut TextEngine);
             if let Some(storage) = storage.as_mut() {
                 host.services_mut()
                     .attach_storage(storage.as_mut() as *mut Storage);
@@ -119,6 +125,7 @@ impl Env {
             _host: host,
             engine,
             scene,
+            _text: text,
             _storage: storage,
         }
     }
@@ -319,11 +326,14 @@ fn font_text_width_sums_the_per_character_advances() {
     assert!(parts > 0, "the characters must have a positive advance");
 }
 
-/// The last face registered by `System.addFont` is the default font, so a
-/// face no source knows — a pre-rendered `*name`, for example — falls back to
-/// it rather than to the host's default family.
+/// The oldest registered face is the default font, so a face no source knows
+/// — a pre-rendered `*name`, for example — falls back to it rather than to
+/// the host's default family.
+///
+/// Reference: the font map's oldest entry is the default font
+/// (`reference/cpp/core/visual/FontImpl.cpp:242-245`).
 #[test]
-fn an_unknown_face_falls_back_to_the_last_registered_font() {
+fn an_unknown_face_falls_back_to_the_default_registered_font() {
     let _lock = vm_lock();
     let Some((font_dir, font_name)) = test_font() else {
         return;
@@ -343,7 +353,7 @@ fn an_unknown_face_falls_back_to_the_last_registered_font() {
     match env.eval_ok("Font.defaultFaceName") {
         TjsValue::String(value) => assert_eq!(
             value, family,
-            "the default must be the last registered face, not the host fallback"
+            "the default must be the registered face, not the host fallback"
         ),
         other => panic!("Font.defaultFaceName returned {other:?}"),
     }
@@ -488,19 +498,25 @@ fn font_get_list_and_default_face_name_report_the_registered_face() {
     assert!(env.eval_int("f.getTextWidth('A')") > 0);
 
     // Reference: `Font.getList` returns the enumerated face names as a TJS
-    // array (`reference/cpp/core/visual/LayerIntf.cpp:11958-11985`).
-    assert!(
-        env.eval_int("f.getList(0).length") > 0,
-        "getList should report the registered face"
-    );
-    // Reference: `Font.defaultFaceName` returns the default face
-    // (`reference/cpp/core/visual/LayerIntf.cpp:12177`).
-    match env.eval("Font.defaultFaceName") {
+    // array (`reference/cpp/core/visual/LayerIntf.cpp:11958-11985`); the list
+    // stops at the map's oldest entry, so the default face's name is not in
+    // it (`reference/cpp/core/visual/FontImpl.cpp:242-245`).
+    let default_name = match env.eval("Font.defaultFaceName") {
         Ok(TjsValue::String(name)) => {
-            assert!(!name.is_empty(), "default face name should be set")
+            assert!(!name.is_empty(), "default face name should be set");
+            name
         }
         other => panic!("expected a string default face name, got {other:?}"),
-    }
+    };
+    let listed = env.eval_int(&format!(
+        "(function(){{ var l = f.getList(0); \
+         for (var i = 0; i < l.length; i++) {{ if (l[i] == '{default_name}') return 1; }} \
+         return 0; }})()"
+    ));
+    assert_eq!(
+        listed, 0,
+        "the default face's name must not be in the font list"
+    );
 }
 
 /// The reference reads the four arguments, disables the host font-selection

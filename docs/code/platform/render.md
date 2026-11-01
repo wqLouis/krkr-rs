@@ -203,15 +203,23 @@ pub fn load_font(fs: &FontSystem, bytes: &[u8], index: u32) -> Result<Font, Glyp
 pub fn rasterize_glyph(fs: &FontSystem, font: &Font, glyph: char, size_px: f32,
                         style: GlyphStyle) -> Result<GlyphBitmap, GlyphError>;
 pub fn glyph_advance(fs: &FontSystem, font: &Font, glyph: char, size_px: f32,
-                      style: GlyphStyle) -> f32;
+                      style: GlyphStyle) -> Result<f32, GlyphError>;
+pub fn has_glyph(fs: &FontSystem, font: &Font, glyph: char) -> bool;
+pub fn font_data_has_glyph(fs: &FontSystem, bytes: &[u8], index: u32, glyph: char) -> bool;
 pub fn font_metrics(fs: &FontSystem, font: &Font, size_px: f32) -> FontMetrics;
 ```
 
-The rasterization core reproduces the reference's missing-glyph fallback, the
-synthetic bold (1 px right dilation plus the same pixel in the advance) and the
-synthetic oblique slant (0.25, the conventional ~14°). Unlike the old atlas,
-the API returns **per-glyph coverage positioned by its bearings** instead of
-packing pixels into a shared RGBA cell.
+The rasterization core reproduces the synthetic bold (1 px right dilation plus
+the same pixel in the advance) and the synthetic oblique slant (0.25, the
+conventional ~14°). Unlike the old atlas, the API returns **per-glyph
+coverage positioned by its bearings** instead of packing pixels into a shared
+RGBA cell.
+
+A face that does not map a character has no glyph for it: `has_glyph` reports
+that, and `rasterize_glyph` and `glyph_advance` raise
+`GlyphError::MissingGlyph` instead of substituting another character. Choosing
+the face that does map the character is the middle layer's job — the
+per-character fallback — and not the rasterizer's.
 
 The bold advance is the same for a measurement and a drawing: `glyph_advance`
 and the `advance` field of `rasterize_glyph` both report the face's advance
@@ -227,8 +235,16 @@ one pixel matches a 24 px em exactly and understates the advance for larger
 sizes (two pixels at 48 px, three at 72 px).
 
 A non-positive or non-finite `size_px` is `GlyphError::Rasterize` from
-`rasterize_glyph` and the default metrics from `font_metrics`; a control
-character advances by `0`; a truly missing glyph is `GlyphError::MissingGlyph`.
+`rasterize_glyph` and `glyph_advance`, and the default metrics from
+`font_metrics`; a control character advances by `0`; a character the face does
+not map is `GlyphError::MissingGlyph`.
+
+`load_font` reads the face's name table as well: `Font::names` returns the
+family names the face carries (the typographic family first, then the plain
+family, in every language the face declares), decoded per name-table
+platform. `font_data_has_glyph` answers the same question as `has_glyph`
+straight from the bytes, without parsing the outlines, so a scan over the
+host's fonts stays cheap.
 
 The glyph atlas, the layout and every cache are middle-layer state and
 deliberately absent here.

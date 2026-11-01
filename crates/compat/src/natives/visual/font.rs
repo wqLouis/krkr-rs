@@ -155,8 +155,9 @@ fn measure_text_with(
     error_prefix: &str,
 ) -> Result<(f64, i32), String> {
     let (_resolved, ctx) = bound(engine)?;
-    let mut resolver = crate::resource::resource_state(&ctx);
-    let id = resolver.resolve_face(&ctx, &font.face)?;
+    let resolver = crate::resource::resource_state(&ctx);
+    let service = crate::resource::text_service(&ctx)?;
+    let id = crate::resource::resolve_face(&ctx, service, &font.face)?;
     let mut style = TextStyle::new(font.size_px);
     style.bold = font.bold;
     style.italic = font.italic;
@@ -169,18 +170,17 @@ fn measure_text_with(
     };
     if use_prerendered && let Some(prerendered) = resolver.prerendered_for(&key) {
         let body = prerendered.ensure_body(&ctx)?;
-        let width = prerendered_text_width(&mut resolver.engine, id, &body, text, &style)
+        let width = prerendered_text_width(service, id, &body, text, &style)
             .map_err(|error| format!("{error_prefix}: text layout failed: {error}"))?;
         return Ok((width, font.height));
     }
     // An empty run resolves the face and the size, so an unusable one is
     // still reported, but the text itself is never shaped: the width is
     // measured one character at a time.
-    resolver
-        .engine
+    service
         .layout(id, "", &style, None)
         .map_err(|error| format!("{error_prefix}: text layout failed: {error}"))?;
-    let width = measured_text_width(&mut resolver.engine, id, text, &style)
+    let width = measured_text_width(service, id, text, &style)
         .map_err(|error| format!("{error_prefix}: text measurement failed: {error}"))?;
     Ok((width, font.height))
 }
@@ -204,9 +204,13 @@ pub(crate) fn measure_layer_text(
 /// The measured text width: the sum of every character's rounded advance.
 ///
 /// A run is measured one character at a time: each character's advance comes
-/// from the rasterizer and is rounded to whole pixels. A shaped run's width
-/// applies kerning and rounds once, so a kerned pair measures narrower than
-/// the sum of its two characters.
+/// from the requested face and is rounded to whole pixels. A shaped run's
+/// width applies kerning and rounds once, so a kerned pair measures narrower
+/// than the sum of its two characters.
+///
+/// The measurement follows the requested face: a character the face does not
+/// map measures the face's em box, never the advance of the face that would
+/// draw it.
 fn measured_text_width(
     engine: &mut TextEngine,
     font: FontId,
@@ -218,7 +222,7 @@ fn measured_text_width(
     // value) contributes an advance; a surrogate pair contributes two.
     for unit in text.encode_utf16() {
         let ch = char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}');
-        width = width.saturating_add(engine.glyph_advance(font, ch, style)?.round() as i64);
+        width = width.saturating_add(engine.measure_code_unit(font, ch, style)?.round() as i64);
     }
     Ok(width as f64)
 }
@@ -238,7 +242,7 @@ fn prerendered_text_width(
         if let Some(item) = body.find_code_unit(unit) {
             width = width.saturating_add(i64::from(item.inc));
         } else if let Some(ch) = char::from_u32(u32::from(unit)) {
-            width = width.saturating_add(engine.glyph_advance(font, ch, style)?.round() as i64);
+            width = width.saturating_add(engine.measure_code_unit(font, ch, style)?.round() as i64);
         }
     }
     Ok(width as f64)
@@ -811,15 +815,18 @@ extern "C" fn font_get_glyph_draw_rect(
         );
     };
     let result = {
-        let mut resolver = crate::resource::resource_state(&ctx);
-        let id = match resolver.resolve_face(&ctx, &font.face) {
+        let service = match crate::resource::text_service(&ctx) {
+            Ok(service) => service,
+            Err(error) => return report_error(out_error, &error),
+        };
+        let id = match crate::resource::resolve_face(&ctx, service, &font.face) {
             Ok(id) => id,
             Err(error) => return report_error(out_error, &error),
         };
         let mut style = TextStyle::new(font.size_px);
         style.bold = font.bold;
         style.italic = font.italic;
-        resolver.engine.glyph_draw_rect(id, &text, &style, None)
+        service.glyph_draw_rect(id, &text, &style, None)
     };
     match result {
         Ok(rect) => {

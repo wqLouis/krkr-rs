@@ -14,27 +14,21 @@
 //! # Registration seam
 //!
 //! The reference stores the faces in the process-wide `TVPFontNames` map the
-//! renderer consults when a `Font.face` is set. Compat has no process global
-//! so the map is the per-engine [`registry::FontRegistry`] dispatch
-//! state. It keeps the L2 `engine_api::TextEngine` each file was parsed
-//! with, so any in-crate text consumer can resolve a face with
-//! [`registry::FontRegistry::lookup`] and load the returned bytes/collection
-//! index into its own engine.
+//! renderer consults when a `Font.face` is set. The faces live in the L2
+//! text service the engine owns, so every text consumer (the visual `Font`
+//! native, the `TextRenderBase` plugin, the layer-ex draw plugin) reaches the
+//! same registry: a face registered by `System.addFont` resolves by family
+//! name and by the storage name it was read from.
 //!
-//! The visual `Font` native (`natives/visual/font.rs`) and the
-//! `TextRenderBase` plugin (`plugins/text_render/metrics.rs`) consult
-//! [`registry::FontRegistry::lookup`] before falling back to reading the face
-//! string as a storage name, so a face registered by `System.addFont`
-//! resolves by family name or by the storage name it was read from.
+//! The font map is keyed by name and a name that is registered again
+//! replaces the face behind it, so the newest registration of a name wins.
 #![allow(unsafe_code)]
-
-/// The face registry shared with in-crate text consumers.
-pub(crate) mod registry;
 
 use std::ffi::{c_char, c_int, c_void};
 
 use tjs::{NativeMethodDef, NativeStaticMembers, Value};
 
+use crate::engine_api::TextEngine;
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
 use crate::natives::system::resolve;
 use crate::storage::strip_file_media;
@@ -97,8 +91,46 @@ extern "C" fn system_add_font(
             return 0;
         }
     };
-    set_int(out, registry::register(services, &name, &bytes));
+    let service = match crate::resource::text_service(&ctx) {
+        Ok(service) => service,
+        Err(error) => return report_error(out_error, &error),
+    };
+    set_int(out, register_faces(service, &name, &bytes));
     0
+}
+
+/// Register every usable face in `bytes` under `source`.
+///
+/// Returns the number of faces (`0` when the data is not a usable font, the
+/// the "font registration failed" result). The storage name resolves
+/// the file's first face, so a script that asks for the file by name gets a
+/// face to draw with.
+///
+/// Every face of the file is enumerated into the font map.
+fn register_faces(service: &mut TextEngine, source: &str, bytes: &[u8]) -> i64 {
+    let mut count: u32 = 0;
+    let mut first = None;
+    loop {
+        match service.add_font(bytes, count) {
+            Ok(id) => {
+                first.get_or_insert(id);
+                count += 1;
+            }
+            Err(error) => {
+                if count == 0 {
+                    log::debug!("System.addFont({source:?}): not a usable font: {error}");
+                }
+                break;
+            }
+        }
+    }
+    if count == 0 {
+        return 0;
+    }
+    if let Some(id) = first {
+        service.alias(source, id);
+    }
+    i64::from(count)
 }
 
 /// Register the `System.addFont` static member added by `addFont.dll`.

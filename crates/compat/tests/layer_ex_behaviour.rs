@@ -42,6 +42,7 @@ use api::fs::{FsPath, OpenMode};
 use api::media::{DecodedImage, ImageInfo};
 use common::vm_lock;
 use compat::CompatHost;
+use engine::text::TextEngine;
 use engine::{Scene, Storage};
 use fs::FileSystem;
 use testkit::build_xp3;
@@ -57,6 +58,9 @@ const SCRIPT: &str = "layer-ex-behaviour";
 struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
+    /// The attached text service: the registered faces and the shaping
+    /// state. Boxed so the address the host holds stays stable.
+    _text: Box<TextEngine>,
     scene: Box<Scene>,
     /// Kept alive for the host's raw pointer; `None` means no storage.
     _storage: Option<Box<Storage>>,
@@ -72,6 +76,7 @@ impl Env {
     fn build(storage: Option<Storage>, codec: bool) -> Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut scene = Box::new(Scene::default());
+        let mut text = Box::new(TextEngine::new());
         let mut storage = storage.map(Box::new);
         let mut host = CompatHost::new();
         if codec {
@@ -93,6 +98,8 @@ impl Env {
         unsafe {
             host.services_mut()
                 .attach_scene(scene.as_mut() as *mut Scene);
+            host.services_mut()
+                .attach_text(text.as_mut() as *mut TextEngine);
             if let Some(storage) = storage.as_mut() {
                 host.services_mut()
                     .attach_storage(storage.as_mut() as *mut Storage);
@@ -104,6 +111,7 @@ impl Env {
             _host: host,
             engine,
             scene,
+            _text: text,
             _storage: storage,
         }
     }

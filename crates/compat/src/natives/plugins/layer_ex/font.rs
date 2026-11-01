@@ -3,10 +3,10 @@
 //!
 //! Reference: `reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp`
 //! (`class FontInfo`, `drawString`, `measureString`) and the blend2d build.
-//! The port resolves the family through the L2 `engine_api::TextEngine`
-//! (the same shaping service the visual `Font` native uses) and rasterizes
-//! glyphs with the L1 glyph rasterizer exposed by the text engine. A face
-//! that cannot be loaded is a typed error, never a fabricated metric.
+//! The port resolves the family through the L2 `engine_api::TextEngine` (the
+//! same text service the visual `Font` native uses) and rasterizes glyphs
+//! with the L1 glyph rasterizer exposed by the text engine. A face that
+//! cannot be loaded is a typed error, never a fabricated metric.
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
@@ -20,7 +20,6 @@ use tjs::{
 
 use super::appearance::{Paint, paint_color_at};
 use super::{set_real, value_as_f64};
-use crate::collections::Map;
 use crate::native_util::{args, report_error, set_void};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
@@ -44,12 +43,10 @@ impl FontData {
     }
 }
 
-/// Shared text shaping/rasterization state, keyed in
+/// The layer-ex private-font state, keyed in
 /// [`CompatServices::state`](crate::CompatServices::state).
 #[derive(Default)]
 pub(super) struct TextState {
-    pub(super) engine: TextEngine,
-    pub(super) faces: Map<String, FontId>,
     /// Family names of the faces added by `GdiPlus.addPrivateFont`, in
     /// registration order (the reference `bl_font_face_name`).
     pub(super) private_fonts: Vec<String>,
@@ -64,17 +61,17 @@ pub(super) fn text_state(ctx: &CompatCtx) -> std::cell::RefMut<'_, TextState> {
 /// Resolve `family` to an L2 [`FontId`], loading it on first use.
 ///
 /// The resolution logic is shared with the visual `Font` native through
-/// [`crate::resource::resolve_face`] (`System.addFont` registry, attached
-/// storage, installed system fonts, then the default-face fallback).
+/// [`crate::resource::resolve_face`] (the registered faces, the attached
+/// storage, the installed system fonts, then the default face).
 pub(super) fn ensure_face(
     ctx: &CompatCtx,
-    state: &mut TextState,
+    service: &mut TextEngine,
     family: &str,
 ) -> Result<FontId, String> {
     if family.is_empty() {
         return Err("FontInfo: the family name is empty".to_string());
     }
-    crate::resource::resolve_face(ctx, &mut state.engine, &mut state.faces, family)
+    crate::resource::resolve_face(ctx, service, family)
 }
 
 /// Read a `FontInfo` argument's public properties.
@@ -128,14 +125,13 @@ pub(super) fn render_text(
     text: &str,
     paint: &Paint,
 ) -> Result<TextBitmap, String> {
-    let mut state = text_state(ctx);
-    let face = ensure_face(ctx, &mut state, &font.family)?;
+    let service = crate::resource::text_service(ctx)?;
+    let face = ensure_face(ctx, service, &font.family)?;
     let mut style = TextStyle::new(font.em_size as f32);
     style.bold = font.bold();
     style.italic = font.italic();
     style.color = [255, 255, 255, 255];
-    let layout = state
-        .engine
+    let layout = service
         .layout(face, text, &style, None)
         .map_err(|error| format!("Layer.drawString: text layout failed: {error}"))?;
     let width = layout.width.max(1.0).ceil() as u32;
@@ -143,9 +139,8 @@ pub(super) fn render_text(
     let mut coverage = vec![0u8; width as usize * height as usize];
     let mut ink: Option<(f64, f64, f64, f64)> = None;
     for glyph in &layout.glyphs {
-        let mask = state
-            .engine
-            .rasterize_glyph(face, glyph.codepoint, &style)
+        let mask = service
+            .rasterize_glyph(glyph.font, glyph.codepoint, &style)
             .map_err(|error| format!("Layer.drawString: glyph rasterization failed: {error}"))?;
         if mask.is_empty() {
             continue;
@@ -311,11 +306,13 @@ fn metrics(ctx: &CompatCtx, data: &FontData) -> Metrics {
         descent_leading: 0.0,
         line_spacing: 0.0,
     };
-    let mut state = text_state(ctx);
-    let Ok(face) = ensure_face(ctx, &mut state, &data.family) else {
+    let Ok(service) = crate::resource::text_service(ctx) else {
         return zero;
     };
-    let Ok(font_metrics) = state.engine.font_metrics(face, data.em_size as f32) else {
+    let Ok(face) = ensure_face(ctx, service, &data.family) else {
+        return zero;
+    };
+    let Ok(font_metrics) = service.font_metrics(face, data.em_size as f32) else {
         return zero;
     };
     // Reference `FontInfo::updateSizeParams`
@@ -601,12 +598,13 @@ fn read_font_file(ctx: &CompatCtx, name: &str) -> Result<Vec<u8>, String> {
 fn register_private_font(ctx: &CompatCtx, name: &str) -> Result<(), String> {
     let bytes = read_font_file(ctx, name)?;
     let mut state = text_state(ctx);
+    let service = crate::resource::text_service(ctx)?;
     let mut names = Vec::new();
     let mut index = 0u32;
     loop {
-        match state.engine.add_font(&bytes, index) {
+        match service.add_font(&bytes, index) {
             Ok(id) => {
-                if let Some(family) = state.engine.family_name(id)
+                if let Some(family) = service.family_name(id)
                     && !family.is_empty()
                 {
                     names.push(family.to_string());

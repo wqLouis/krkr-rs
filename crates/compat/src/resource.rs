@@ -2,11 +2,15 @@
 //! host image codec.
 //!
 //! [`ResourceResolver`] is the per-engine dispatch state (never a process
-//! global) that owns the L2 [`TextEngine`], the requested-face cache, the
-//! registered-face order, the host image codec and the pre-rendered-font map. The visual `Font` native,
-//! `Layer.drawText`/`drawGlyph`, `ImageFunction.drawText`/`drawGlyph` and
-//! `Layer.saveLayerImage` compose it. The `TextRenderBase` and `LayerExDraw`
-//! plugin metrics keep their own shaping state but resolve faces through
+//! global) that owns the rasterized character masks, the host image codec and
+//! the pre-rendered-font map. The visual `Font` native, `Layer.drawText`/
+//! `drawGlyph`, `ImageFunction.drawText`/`drawGlyph` and
+//! `Layer.saveLayerImage` compose it.
+//!
+//! The faces themselves live in the L2 text service the engine owns, so every
+//! text consumer (the visual `Font` native, the `TextRenderBase` plugin, the
+//! layer-ex draw plugin and `System.addFont`) reaches the same registry
+//! through [`text_service`]. The face resolution itself is shared through
 //! [`resolve_face`].
 #![allow(unsafe_code)]
 
@@ -17,28 +21,21 @@ use crate::collections::Map;
 use crate::engine_api::layer_ops::RectI;
 use crate::engine_api::{BitmapState, Location, Storage, StorageReadError};
 use crate::engine_api::{
-    CoverageMask, FontId, TextCoverageCache, TextEngine, TextStyle, blit_coverage_into,
-    blur_coverage, blurred_text_coverage, compose_text_into, rasterize_text_coverage,
+    CoverageMask, FontId, FontRegistry, TextCoverageCache, TextEngine, TextStyle,
+    blit_coverage_into, blur_coverage, blurred_text_coverage, compose_text_into,
+    rasterize_text_coverage,
 };
 use api::media::{DecodedImage, ImageInfo};
 use tjs::{Tjs2Engine, TjsValue, Value};
 
 use crate::CompatCtx;
-use crate::natives::plugins::add_font::registry::FontRegistry;
 use crate::storage::strip_file_media;
 
-/// Default face requested when `Font.getList`/`Font.defaultFaceName` need to
-/// establish a platform face (the reference `TVPDefaultFontFaceName`).
-const DEFAULT_FACE: &str = "MS Gothic";
-
-/// The name the default-face fallback is resolved under.
+/// The character the host's default font has to provide.
 ///
-/// A fixed name keeps the requested family free, so a face registered later
-/// for that family (`System.addFont`, `GdiPlus.addPrivateFont`) is not shadowed
-/// by the fallback's own name-map entry. The reference resolves an unknown name
-/// to its default face without recording the requested name in its font map
-/// (`reference/cpp/core/visual/FontImpl.cpp:159-168`).
-const FALLBACK_FACE: &str = "__krkr_default_face__";
+/// The default font is the system's Japanese font, so the default face is
+/// the first installed face that covers a Japanese ideograph.
+const DEFAULT_FALLBACK_CODEPOINT: char = '\u{4E00}';
 
 /// Host-supplied image decoder: the L1 `media::decode_image` call behind
 /// `Bitmap.load`.
@@ -51,17 +48,9 @@ type SaveFn = dyn Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String>;
 /// The per-engine L3 resource resolver.
 #[derive(Default)]
 pub(crate) struct ResourceResolver {
-    /// Shared text shaping/layout engine.
-    pub(crate) engine: TextEngine,
     /// Rasterized character masks and their blurred shadows, keyed like the
     /// reference `tTVPFontCache`.
     pub(crate) coverage_cache: TextCoverageCache,
-    /// Requested face string → registered face id.
-    pub(crate) faces: Map<String, FontId>,
-    /// Registered family names in registration order (`Font.getList`).
-    registered: Vec<String>,
-    /// First registered family name (`Font.defaultFaceName`).
-    default_face: Option<String>,
     /// Host image decoder.
     decode: Option<Rc<DecodeFn>>,
     /// Host image header prober.
@@ -72,6 +61,38 @@ pub(crate) struct ResourceResolver {
     prerendered_storage: Map<String, Rc<PrerenderedFont>>,
     /// Font-value → pre-rendered font mappings, in registration order.
     prerendered: Vec<(PrerenderedKey, Rc<PrerenderedFont>)>,
+}
+
+/// The shared L2 text service, mutably.
+///
+/// The engine owns the text service and the host attaches it, so every text
+/// consumer reaches the same faces through the same registry.
+pub(crate) fn text_service<'a>(ctx: &CompatCtx) -> Result<&'a mut TextEngine, String> {
+    // SAFETY: the host keeps the attached text service alive for the
+    // binding's lifetime and the VM is single-threaded (the documented
+    // `attach_text` contract), so this borrow is sound within the
+    // callback.
+    let ptr = unsafe { ctx.services() }
+        .text()
+        .ok_or_else(|| "text: no text service attached".to_string())?;
+    // SAFETY: see above.
+    Ok(unsafe { &mut *ptr })
+}
+
+/// The L2 font registry the text service owns.
+///
+/// The registry is the one place that knows which faces exist, what they are
+/// called and which of them is the default face.
+pub(crate) fn font_registry<'a>(ctx: &CompatCtx) -> Result<&'a FontRegistry, String> {
+    // SAFETY: the host keeps the attached text service alive for the
+    // binding's lifetime and the VM is single-threaded (the documented
+    // `attach_text` contract), so this borrow is sound within the
+    // callback.
+    let ptr = unsafe { ctx.services() }
+        .text()
+        .ok_or_else(|| "text: no text service attached".to_string())?;
+    // SAFETY: see above.
+    Ok(unsafe { (*ptr).registry() })
 }
 
 /// Borrow the per-engine [`ResourceResolver`].
@@ -213,108 +234,72 @@ impl ResourceResolver {
         Ok(font)
     }
 
-    /// Resolve `face`, recording the registered family name for
-    /// `Font.getList`/`Font.defaultFaceName`.
+    /// Resolve `face` to a face of the shared text service.
     pub(crate) fn resolve_face(&mut self, ctx: &CompatCtx, face: &str) -> Result<FontId, String> {
-        let id = resolve_face(ctx, &mut self.engine, &mut self.faces, face)?;
-        self.record(id);
-        Ok(id)
+        let service = text_service(ctx)?;
+        resolve_face(ctx, service, face)
     }
 
-    /// Record the family name behind `id` in registration order.
-    fn record(&mut self, id: FontId) {
-        let Some(name) = self.engine.family_name(id).map(str::to_owned) else {
-            return;
-        };
-        if !self.registered.iter().any(|entry| entry == &name) {
-            self.registered.push(name.clone());
-        }
-        if self.default_face.is_none() {
-            self.default_face = Some(name);
-        }
-    }
-
-    /// The registered face family names, establishing the platform default on
-    /// first use.
+    /// The registered face names, newest first, without the oldest name.
     pub(crate) fn face_names(&mut self, ctx: &CompatCtx) -> Vec<String> {
-        if self.registered.is_empty() {
-            let _ = self.resolve_face(ctx, DEFAULT_FACE);
-        }
-        self.registered.clone()
+        font_registry(ctx)
+            .map(|registry| registry.list_names())
+            .unwrap_or_default()
     }
 
     /// The default face name, or the empty string when no face is registered.
     pub(crate) fn default_face_name(&mut self, ctx: &CompatCtx) -> String {
-        if self.default_face.is_none() {
-            let _ = self.resolve_face(ctx, DEFAULT_FACE);
-        }
-        self.default_face.clone().unwrap_or_default()
+        font_registry(ctx)
+            .ok()
+            .and_then(|registry| registry.default_name().map(str::to_owned))
+            .unwrap_or_default()
     }
 }
 
-/// Resolve `face` to a face registered on `engine`.
+/// Resolve `face` to a face of the shared text service.
 ///
 /// The face may be a comma-separated candidate list with an optional leading
-/// `@` (vertical writing). Each candidate is tried through the
-/// `System.addFont` registry, the attached storage, then the host's installed
-/// system fonts.
+/// `@` (vertical writing). Each candidate is tried through the registered
+/// faces, the attached storage, then the host's installed system fonts.
 ///
-/// When no candidate resolves, the last family registered by `System.addFont`
-/// is tried. Then the host's default face is tried
-/// (the reference `TVPCreateFontStream` default,
-/// `reference/cpp/core/visual/FontImpl.cpp:159-168`), then the engine's first
-/// registered face; only an engine with no registered face at all raises.
+/// When no candidate resolves, the engine's default face is used: the oldest
+/// registered face, which is the face the per-character fallback reaches for
+/// as well. Only an engine with no registered face at all raises.
 ///
-/// Only a resolution found through a candidate is cached. A default-face
-/// fallback is resolved under [`FALLBACK_FACE`] and is never cached under
-/// `face`, so a face registered later for `face` (`System.addFont`,
+/// A candidate that resolves is recorded under the requested name, so the next
+/// lookup finds the same face. The default-face fallback is not recorded: a
+/// face registered later for that name (`System.addFont`,
 /// `GdiPlus.addPrivateFont`) is found on the next lookup instead of being
 /// shadowed by a stale fallback entry.
 pub(crate) fn resolve_face(
     ctx: &CompatCtx,
-    engine: &mut TextEngine,
-    cache: &mut Map<String, FontId>,
+    service: &mut TextEngine,
     face: &str,
 ) -> Result<FontId, String> {
-    if let Some(id) = cache.get(face).copied() {
-        return Ok(id);
-    }
     let candidates = face.strip_prefix('@').unwrap_or(face);
     for candidate in candidates.split(',') {
         let candidate = candidate.trim();
         if candidate.is_empty() {
             continue;
         }
-        if let Ok(id) = try_face(ctx, engine, candidate) {
-            cache.insert(face.to_string(), id);
+        if let Ok(id) = try_face(ctx, service, candidate) {
+            service.alias(face, id);
             return Ok(id);
         }
     }
-    // The default face is the last face added to the registered font map, so
-    // it is tried before the host's default family.
-    let registered_default = {
-        // SAFETY: the caller resolved `ctx` from the installed binding.
-        let registry = unsafe { ctx.services() }.state::<FontRegistry>();
-        registry.last_family()
-    };
-    if let Some(family) = registered_default
-        && let Ok(id) = try_face(ctx, engine, &family)
-    {
-        return Ok(id);
+    // No candidate resolved: the default face draws the text. A registry
+    // that holds no face yet gets the host's default font first, so a face
+    // the host provides is never lost to an empty registry.
+    match service.default_face() {
+        Some(default) => Ok(default),
+        None => service
+            .install_default_face(DEFAULT_FALLBACK_CODEPOINT)
+            .map_err(|error| format!("no font is available for face '{face}': {error}")),
     }
-    // No registered game face: fall back to the host's default face. Loading
-    // it under a fixed name keeps `face` free for a later registration.
-    if let Ok(id) = engine.load_system_font(FALLBACK_FACE) {
-        return Ok(id);
-    }
-    if let Some(id) = engine.default_font_for(face) {
-        return Ok(id);
-    }
-    Err(format!("no font is available for face '{face}'"))
 }
 
-/// Try one face candidate through the `System.addFont` registry, the attached
-/// storage and the host's installed system fonts (exact family only).
+/// Try one face candidate through the registered faces, the attached storage
+/// and the host's installed system fonts (exact family only).
 ///
 /// A face spelled as a family name is never tried as a storage path: the
 /// reference resolves a face only through its registered font names
@@ -322,18 +307,9 @@ pub(crate) fn resolve_face(
 /// family name misses on every text draw (a full storage search each time).
 /// A file-shaped face (`somefont.ttf`) is still tried, which is how a script
 /// loads a font file named directly as its face.
-fn try_face(ctx: &CompatCtx, engine: &mut TextEngine, face: &str) -> Result<FontId, String> {
-    if let Some(id) = engine.font_id(face) {
+fn try_face(ctx: &CompatCtx, service: &mut TextEngine, face: &str) -> Result<FontId, String> {
+    if let Some(id) = service.font_id(face) {
         return Ok(id);
-    }
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    let registered = unsafe { ctx.services() }
-        .state::<crate::natives::plugins::add_font::registry::FontRegistry>()
-        .lookup(face);
-    if let Some((bytes, index, _)) = registered {
-        return engine
-            .add_font(&bytes, index)
-            .map_err(|error| format!("face '{face}' is not a usable font: {error}"));
     }
     if is_font_file_name(face) {
         // SAFETY: the caller resolved `ctx` from the installed binding.
@@ -345,7 +321,7 @@ fn try_face(ctx: &CompatCtx, engine: &mut TextEngine, face: &str) -> Result<Font
             // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
             match storage.read(strip_file_media(face)) {
                 Ok(bytes) => {
-                    return engine
+                    return service
                         .add_font(&bytes, 0)
                         .map_err(|error| format!("face '{face}' is not a usable font: {error}"));
                 }
@@ -354,8 +330,8 @@ fn try_face(ctx: &CompatCtx, engine: &mut TextEngine, face: &str) -> Result<Font
             }
         }
     }
-    engine
-        .load_system_font_exact(face)
+    service
+        .load_system_font(face)
         .map_err(|error| error.to_string())
 }
 
@@ -445,7 +421,8 @@ pub(crate) fn draw_text_into_bitmap(
         italic,
         angle_tenths,
     } = face;
-    let font = resolver.resolve_face(ctx, face)?;
+    let service = text_service(ctx)?;
+    let font = resolve_face(ctx, service, face)?;
     let mut style = TextStyle::new(size_px);
     style.bold = bold;
     style.italic = italic;
@@ -460,7 +437,7 @@ pub(crate) fn draw_text_into_bitmap(
     if let Some(prerendered) = resolver.prerendered_for(&key) {
         let body = prerendered.ensure_body(ctx)?;
         return draw_prerendered_text(
-            resolver,
+            service,
             bitmap,
             PrerenderedRun {
                 font,
@@ -473,8 +450,7 @@ pub(crate) fn draw_text_into_bitmap(
             params,
         );
     }
-    let layout = resolver
-        .engine
+    let layout = service
         .layout(font, params.text, &style, None)
         .map_err(|error| format!("text layout failed: {error}"))?;
     let angle = (angle_tenths * std::f64::consts::PI / 1800.0) as f32;
@@ -484,7 +460,7 @@ pub(crate) fn draw_text_into_bitmap(
     // shadow and the main pass (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:244-320`).
     let masks = rasterize_text_coverage(
         &mut resolver.coverage_cache,
-        &resolver.engine,
+        service,
         &layout,
         &style,
         params.antialias,
@@ -504,7 +480,7 @@ pub(crate) fn draw_text_into_bitmap(
             let level = params.shadow_level.clamp(0, 255) as u8;
             blurred_text_coverage(
                 &mut resolver.coverage_cache,
-                &resolver.engine,
+                service,
                 &layout,
                 &style,
                 params.antialias,
@@ -590,7 +566,7 @@ struct PrerenderedRun<'a> {
 /// The pen advances by the descriptor's `IncX`/`IncY`, and the glyph origin
 /// includes the ascent offset.
 fn draw_prerendered_text(
-    resolver: &ResourceResolver,
+    service: &mut TextEngine,
     bitmap: &mut BitmapState,
     run: PrerenderedRun<'_>,
     clip: RectI,
@@ -606,8 +582,7 @@ fn draw_prerendered_text(
     // The ascent is the face's ascender scaled to the pixel size and
     // truncated to whole pixels; the ascent offset is that integer projected
     // onto the rotation axes.
-    let ascent = resolver
-        .engine
+    let ascent = service
         .font_metrics(font, size_px)
         .map_err(|error| format!("text metrics failed: {error}"))?
         .ascent
@@ -654,9 +629,14 @@ fn draw_prerendered_text(
             }
         } else {
             let ch = char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}');
-            let glyph = resolver
-                .engine
-                .rasterize_glyph(font, ch, style)
+            // The character the pre-rendered font does not carry is drawn by
+            // the face that maps it: the requested face first, then the
+            // default face.
+            let provider = service
+                .provider_for(font, ch)
+                .map_err(|error| format!("text rasterization failed: {error}"))?;
+            let glyph = service
+                .rasterize_glyph(provider, ch, style)
                 .map_err(|error| format!("text rasterization failed: {error}"))?;
             if glyph.width != 0 && glyph.height != 0 {
                 let mask =

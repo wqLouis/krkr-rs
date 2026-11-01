@@ -21,6 +21,7 @@ use engine::Scene;
 use engine::Storage;
 use engine::clock::{FrameClock, FrameTimeSource};
 use engine::input::InputState;
+use engine::text::TextEngine;
 use engine::timer::{TimerState, deliver_due};
 use fs::FileSystem;
 use platform::PlatformEvent;
@@ -86,6 +87,9 @@ pub struct Env {
     /// moves.
     frame_time: Box<HarnessFrameTime>,
     _input: Box<InputState>,
+    /// The attached text service: the registered faces and the shaping state.
+    /// Boxed so the address the host holds stays stable when `Env` moves.
+    _text: Box<TextEngine>,
     _storage: Option<Box<Storage>>,
     _game_dir: Option<PathBuf>,
     /// The adapter the events are delivered through. It outlives one call
@@ -136,6 +140,7 @@ impl Env {
         let mut timer = Box::new(TimerState::new());
         let mut input = Box::new(InputState::new());
         let mut clock = Box::new(FrameClock::new());
+        let mut text = Box::new(TextEngine::new());
         let mut host = CompatHost::new();
         // SAFETY: the boxed scene, timer registry, input state and frame clock
         // outlive the host (they are declared after `_host`), matching
@@ -149,6 +154,8 @@ impl Env {
                 .attach_input(input.as_mut() as *mut InputState);
             host.services_mut()
                 .attach_clock(clock.as_mut() as *mut FrameClock);
+            host.services_mut()
+                .attach_text(text.as_mut() as *mut TextEngine);
         }
         // The source's reading starts at zero (so the frame clock leads it and
         // the script's tick count is the frame clock, as it is for a host that
@@ -213,6 +220,7 @@ impl Env {
             clock: RefCell::new(clock),
             frame_time,
             _input: input,
+            _text: text,
             _storage: storage,
             _game_dir: game_dir,
             // The adapter's default budget is a wall-clock slice, so on a

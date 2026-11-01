@@ -11,7 +11,7 @@ use api::error::GlyphError;
 use api::geometry::PixelRegion;
 use render::{
     Font, FontMetrics, FontSystem, GlyphPlacement, GlyphRun, GlyphStyle, RenderContent, RenderNode,
-    create_font_system, font_metrics, glyph_advance, load_font, rasterize_glyph,
+    create_font_system, font_metrics, glyph_advance, has_glyph, load_font, rasterize_glyph,
 };
 
 /// System fonts tried by the rasterization tests. A missing font skips the
@@ -56,7 +56,10 @@ fn rasterizes_a_latin_glyph_consistently() {
     assert!(!bitmap.is_empty(), "'A' must have ink");
     assert!(bitmap.advance > 0.0);
     assert!(bitmap.coverage.iter().any(|&coverage| coverage > 0));
-    assert_eq!(bitmap.advance, glyph_advance(&fs, &font, 'A', 32.0, style));
+    assert_eq!(
+        bitmap.advance,
+        glyph_advance(&fs, &font, 'A', 32.0, style).expect("advance")
+    );
 }
 
 #[test]
@@ -149,7 +152,7 @@ fn control_characters_and_bad_sizes_are_handled() {
     assert!(control.is_empty());
     assert_eq!(control.advance, 0.0);
     assert_eq!(
-        glyph_advance(&fs, &font, '\n', 32.0, GlyphStyle::default()),
+        glyph_advance(&fs, &font, '\n', 32.0, GlyphStyle::default()).expect("control advance"),
         0.0
     );
 
@@ -157,10 +160,33 @@ fn control_characters_and_bad_sizes_are_handled() {
         rasterize_glyph(&fs, &font, 'A', 0.0, GlyphStyle::default()),
         Err(GlyphError::Rasterize { .. })
     ));
-    assert_eq!(
+    assert!(matches!(
         glyph_advance(&fs, &font, 'A', -1.0, GlyphStyle::default()),
-        0.0
-    );
+        Err(GlyphError::Rasterize { .. })
+    ));
+}
+
+/// A character the face does not map has no glyph: the rasterizer reports it
+/// instead of drawing another character's shape.
+#[test]
+fn a_character_the_face_lacks_has_no_glyph() {
+    let fs = create_font_system();
+    let Some(font) = load_test_font(&fs) else {
+        return;
+    };
+    // A private-use code point is in no font.
+    let missing = '\u{10FFFD}';
+    assert!(!has_glyph(&fs, &font, missing));
+    assert!(matches!(
+        rasterize_glyph(&fs, &font, missing, 32.0, GlyphStyle::default()),
+        Err(GlyphError::MissingGlyph { .. })
+    ));
+    assert!(matches!(
+        glyph_advance(&fs, &font, missing, 32.0, GlyphStyle::default()),
+        Err(GlyphError::MissingGlyph { .. })
+    ));
+    assert!(has_glyph(&fs, &font, 'A'));
+    assert!(has_glyph(&fs, &font, '\n'));
 }
 
 #[test]
@@ -176,7 +202,7 @@ fn a_mapped_glyph_without_an_outline_keeps_its_advance() {
     assert!(space.is_empty(), "a space has no ink");
     assert_eq!(
         space.advance,
-        glyph_advance(&fs, &font, ' ', 32.0, GlyphStyle::default())
+        glyph_advance(&fs, &font, ' ', 32.0, GlyphStyle::default()).expect("space advance")
     );
     assert!(space.advance > 0.0, "a space always advances");
 }

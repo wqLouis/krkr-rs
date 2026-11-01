@@ -473,6 +473,13 @@ pub struct Engine {
     storage_pool: Option<Arc<StorageReadPool>>,
     /// Latest script-visible input state.
     input: crate::input::InputState,
+    /// The text service: the registered faces, the shaping database and the
+    /// per-character caches.
+    ///
+    /// The engine owns it, so every text consumer (the compatibility layer,
+    /// a host that draws text itself) reaches the same faces through the same
+    /// registry.
+    text: crate::text::TextEngine,
     /// Current surface size in pixels.
     surface_size: (u32, u32),
     /// The frame clock of the previous frame, or `None` before the first one.
@@ -546,6 +553,7 @@ impl Engine {
             decode_pool: None,
             storage_pool: None,
             input: crate::input::InputState::default(),
+            text: crate::text::TextEngine::new(),
             surface_size,
             last_now_ms: None,
             frame_index: 0,
@@ -1239,6 +1247,16 @@ impl Engine {
     /// Returns the timer registry for arming, rescheduling and removal.
     pub fn timer_mut(&mut self) -> &mut TimerState {
         &mut self.timer
+    }
+
+    /// Returns the text service: the registered faces and the shaping state.
+    pub fn text(&self) -> &crate::text::TextEngine {
+        &self.text
+    }
+
+    /// Returns the text service for registration and shaping.
+    pub fn text_mut(&mut self) -> &mut crate::text::TextEngine {
+        &mut self.text
     }
 
     /// Whether the engine runs offscreen with no window.

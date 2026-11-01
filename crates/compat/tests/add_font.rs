@@ -100,6 +100,9 @@ impl Drop for GameDir {
 struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
+    /// The attached text service: the registered faces and the shaping
+    /// state. Boxed so the address the host holds stays stable.
+    _text: Box<TextEngine>,
     /// Kept alive for the host's raw pointer; `None` means no font source.
     _storage: Option<Box<Storage>>,
     /// The temp dir backing `_storage`, if any; removed on drop.
@@ -110,6 +113,7 @@ impl Env {
     fn new(storage: Option<Storage>, dir: Option<GameDir>) -> Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut storage = storage.map(Box::new);
+        let mut text = Box::new(TextEngine::new());
         let mut host = CompatHost::new();
         // SAFETY: the boxed storage outlives the host (it is declared after
         // `_host`, so it drops later), matching the `attach_storage` contract.
@@ -118,12 +122,15 @@ impl Env {
                 host.services_mut()
                     .attach_storage(storage.as_mut() as *mut Storage);
             }
+            host.services_mut()
+                .attach_text(text.as_mut() as *mut TextEngine);
         }
         host.install(&engine).expect("install compat surface");
         common::link_all_builtins(&engine);
         Env {
             _host: host,
             engine,
+            _text: text,
             _storage: storage,
             _dir: dir,
         }

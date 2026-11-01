@@ -55,38 +55,33 @@ same `0` in that case.
 The reference stores the faces in the process-wide `TVPFontNames` map the
 renderer consults when a `Font.face` is set
 (`reference/cpp/core/visual/FontImpl.cpp:114-128`). The port keeps the same
-information in the per-engine `FontRegistry` dispatch state
-(`crates/compat/src/natives/plugins/add_font/registry.rs`). For each
-registered file it holds:
+information in the **one** L2 font registry the engine owns
+(`crates/engine/src/font.rs`): the file's faces are registered under every
+family name their name table carries, and the storage name the file was read
+from is registered as an alias of the file's first face.
 
-* the file bytes, shared by every face of that file;
-* the L2 `TextEngine` the faces were parsed into;
-* the face ids in collection order.
-
-A lookup resolves either a **family name** (through that engine's face
-database) or the **storage name** the file was read from, and the most recent
-registration wins. The reference's hash-table `Add` replaces the entry for the
-same family (`reference/cpp/core/visual/FontImpl.cpp:118,127`), and re-adding
-the same source in the port replaces its previous registration.
+A name that is registered again replaces the face behind it, so the newest
+registration of a name wins. The reference's hash-table `Add` replaces the
+entry for the same family (`reference/cpp/core/visual/FontImpl.cpp:118,127`).
 
 The shared face resolver `crates/compat/src/resource.rs` consults the registry
 first, then the attached storage, then the host's installed system fonts. A
 face no source knows — a pre-rendered `*name`, for example — falls back to the
-**last registered face**, which the reference makes the default font
-(`reference/cpp/core/visual/FontImpl.cpp:243-244`, `:159-168`). Both the visual
-`Font` native
-(`crates/compat/src/natives/visual/font.rs`) and the `TextRenderBase` plugin
-(`crates/compat/src/natives/plugins/text_render/metrics.rs`) resolve their
-faces through it, so a face registered by `System.addFont` is found by family
-name or by the storage name it was read from.
+**default face**, the face registered under the registry's oldest name, which
+the reference makes the default font
+(`reference/cpp/core/visual/FontImpl.cpp:243-244`, `:159-168`). The visual
+`Font` native (`crates/compat/src/natives/visual/font.rs`), the `TextRenderBase`
+plugin (`crates/compat/src/natives/plugins/text_render/metrics.rs`) and the
+layer-ex draw plugin resolve their faces through it, so a face registered by
+`System.addFont` is found by family name or by the storage name it was read
+from.
 
 ## State and lifetime
 
-* The registry lives in the per-engine dispatch state
-  (`CompatServices::state::<FontRegistry>()`), created lazily on first use and
-  released with the engine.
-* The bytes and the parsing engine are held per source file, so the memory
-  goes away when the engine drops.
+* The registry lives in the L2 text service the engine owns; the host
+  attaches it to the services container (`CompatServices::attach_text`).
+* The faces are parsed once: a consumer that needs a face registered by
+  `System.addFont` reuses it instead of parsing the file again.
 * The registry holds no process-wide state: two engines never see each other's
   faces.
 
@@ -119,3 +114,7 @@ name or by the storage name it was read from.
   registry also answers to the storage name the file was read from, so a
   script that uses that name as a `Font.face` resolves a face the reference
   would not find.
+* The reference enumerates the host's installed fonts into the font map when
+  the engine starts, so its font list holds every installed face. The port's
+  registry holds the faces the engine loaded, so `Font.getList` reports those
+  rather than the host's whole font directory.

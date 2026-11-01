@@ -12,6 +12,7 @@ use compat::CompatHost;
 use engine::Scene;
 use engine::clock::FrameClock;
 use engine::input::InputState;
+use engine::text::TextEngine;
 use engine::timer::TimerState;
 use tjs::{Tjs2Engine, TjsValue};
 
@@ -23,6 +24,9 @@ use tjs::{Tjs2Engine, TjsValue};
 struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
+    /// The attached text service: the registered faces and the shaping
+    /// state. Boxed so the address the host holds stays stable.
+    _text: Box<TextEngine>,
     scene: Box<Scene>,
     /// Kept alive for the host's raw pointer; never read directly.
     _timer: Box<TimerState>,
@@ -36,6 +40,7 @@ impl Env {
     fn new() -> Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut scene = Box::new(Scene::default());
+        let mut text = Box::new(TextEngine::new());
         let mut timer = Box::new(TimerState::new());
         let mut input = Box::new(InputState::new());
         let mut clock = Box::new(FrameClock::new());
@@ -45,6 +50,8 @@ impl Env {
         unsafe {
             host.services_mut()
                 .attach_scene(scene.as_mut() as *mut Scene);
+            host.services_mut()
+                .attach_text(text.as_mut() as *mut TextEngine);
             host.services_mut()
                 .attach_timer(timer.as_mut() as *mut TimerState);
             host.services_mut()
@@ -57,6 +64,7 @@ impl Env {
         Env {
             _host: host,
             engine,
+            _text: text,
             scene,
             _timer: timer,
             _input: input,

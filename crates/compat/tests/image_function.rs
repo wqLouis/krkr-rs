@@ -18,6 +18,7 @@ mod common;
 use common::vm_lock;
 use compat::CompatHost;
 use engine::Scene;
+use engine::text::TextEngine;
 use tjs::{Tjs2Engine, TjsValue};
 
 /// A bound VM + host + attached scene.
@@ -27,6 +28,9 @@ use tjs::{Tjs2Engine, TjsValue};
 struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
+    /// The attached text service: the registered faces and the shaping
+    /// state. Boxed so the address the host holds stays stable.
+    _text: Box<TextEngine>,
     /// Kept alive for the host's raw pointer; never read directly.
     _scene: Box<Scene>,
 }
@@ -35,17 +39,21 @@ impl Env {
     fn new() -> Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut scene = Box::new(Scene::default());
+        let mut text = Box::new(TextEngine::new());
         let mut host = CompatHost::new();
         // SAFETY: the boxed scene outlives the host.
         unsafe {
             host.services_mut()
                 .attach_scene(scene.as_mut() as *mut Scene);
+            host.services_mut()
+                .attach_text(text.as_mut() as *mut TextEngine);
         }
         host.install(&engine).expect("install compat surface");
         common::link_all_builtins(&engine);
         Env {
             _host: host,
             engine,
+            _text: text,
             _scene: scene,
         }
     }
