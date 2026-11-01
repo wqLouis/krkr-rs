@@ -167,9 +167,15 @@ struct Splice {
     event_pos: usize,
     char_pos: usize,
     /// Whether the tag that started this splice was the last thing on its
-    /// line in its own stream and was a `[...]` tag — an `r eol=true`
-    /// fires when the outermost expansion is exhausted.
+    /// line in its own stream and was a `[...]` tag — a trailing `\` at the
+    /// end of the expansion buffer is a line continuation then
+    /// (`reference/cpp/core/base/KAGParser.cpp:1415-1428`).
     line_r_after: bool,
+    /// The line ends the expanded tag's line still owes: an expansion is
+    /// spliced into the line at the tag's position, so the line ends of that
+    /// line are produced after the expansion and the line counter stays on
+    /// the tag's line while the expansion is scanned.
+    deferred_line_ends: usize,
 }
 
 /// The reference `tCallStackData` fields the native `store()` dictionary
@@ -794,10 +800,22 @@ impl KagParserState {
                     // The tag's column is the position just past its
                     // closing delimiter (a line command ends its line).
                     let tag_col = self.current_col();
+                    let splices = self.splice_stack.len();
                     self.advance_current();
-                    if let Some(out) =
-                        self.process_tag(name, params, *macro_entity, *bracket, *line, env)?
-                    {
+                    let out =
+                        self.process_tag(name, params, *macro_entity, *bracket, *line, env)?;
+                    if self.splice_stack.len() > splices {
+                        // The expansion is spliced into the line at the tag's
+                        // position, so the line end of that line belongs
+                        // after the expansion: hand the line ends the tag's
+                        // consumption queued to the expansion instead of
+                        // emitting them before it.
+                        let deferred = std::mem::take(&mut self.pending_rs);
+                        if let Some(splice) = self.splice_stack.last_mut() {
+                            splice.deferred_line_ends = deferred;
+                        }
+                    }
+                    if let Some(out) = out {
                         if *bracket == Bracket::At {
                             // A line command advances to the next line
                             // (`TVP_KAG_STEP_NEXT`).
@@ -972,13 +990,16 @@ impl KagParserState {
     /// continuation `\` or a `[p]` marker
     /// (`reference/cpp/core/base/KAGParser.cpp:1415-1428`).
     fn pop_splice(&mut self) {
-        if let Some(splice) = self.splice_stack.pop()
-            && self.splice_stack.is_empty()
-            && splice.line_r_after
-            && !splice.buffer.ends_with("[p]")
-            && !splice.buffer.ends_with('\\')
-        {
-            self.end_of_line_r();
+        if let Some(splice) = self.splice_stack.pop() {
+            // The expansion carried the line ends of the line it was spliced
+            // into; they fire now, after the expansion.
+            if self.splice_stack.is_empty()
+                && splice.deferred_line_ends > 0
+                && !splice.buffer.ends_with("[p]")
+                && !splice.buffer.ends_with('\\')
+            {
+                self.pending_rs += splice.deferred_line_ends;
+            }
         }
     }
 
@@ -1179,6 +1200,7 @@ impl KagParserState {
                         event_pos: 0,
                         char_pos: 0,
                         line_r_after,
+                        deferred_line_ends: 0,
                     });
                 } else {
                     let exp = self.exp_attr(&resolved)?;
@@ -1206,6 +1228,7 @@ impl KagParserState {
                         event_pos: 0,
                         char_pos: 0,
                         line_r_after,
+                        deferred_line_ends: 0,
                     });
                 }
                 return Ok(None);
@@ -1896,6 +1919,7 @@ impl KagParserState {
                         event_pos: 0,
                         char_pos: 0,
                         line_r_after: false,
+                        deferred_line_ends: 0,
                     });
                 }
                 self.call_stack.push(e);
@@ -2325,7 +2349,8 @@ fn decode_bool_stack(s: &str) -> Vec<bool> {
     s.chars().map(|c| c == '1').collect()
 }
 
-/// Serialize one splice as `K:0,char_pos,line_r_after:<remaining events>`.
+/// Serialize one splice as
+/// `K:0,char_pos,line_r_after,deferred_line_ends:<remaining events>`.
 /// The remaining events are serialized directly (event_pos is slice-
 /// relative, so it is always 0 here; char_pos applies to the first event
 /// when it is a partially-emitted text run).
@@ -2335,6 +2360,8 @@ fn encode_splice(s: &Splice) -> String {
     out.push_str(&s.char_pos.to_string());
     out.push(',');
     out.push_str(if s.line_r_after { "1" } else { "0" });
+    out.push(',');
+    out.push_str(&s.deferred_line_ends.to_string());
     out.push(':');
     out.push_str(&encode_events(&s.events[s.event_pos..]));
     out
@@ -2452,6 +2479,14 @@ fn decode_splice(s: &str) -> Result<Splice, String> {
         .parse()
         .map_err(|_| "splice: invalid char position".to_string())?;
     let line_r_after = nums.next() == Some("1");
+    // The deferred line ends came with the expansion; a snapshot written
+    // before they existed carries none.
+    let deferred_line_ends = match nums.next() {
+        Some(value) => value
+            .parse()
+            .map_err(|_| "splice: invalid deferred line ends".to_string())?,
+        None => 0,
+    };
     let events = decode_events(content)?;
     let cols = vec![0; events.len()];
     Ok(Splice {
@@ -2461,6 +2496,7 @@ fn decode_splice(s: &str) -> Result<Splice, String> {
         event_pos,
         char_pos,
         line_r_after,
+        deferred_line_ends,
     })
 }
 

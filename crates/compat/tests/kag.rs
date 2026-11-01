@@ -1011,6 +1011,40 @@ fn collect(
     tags
 }
 
+/// Drain `next_tag` into an ordered list, recording the parser's zero-based
+/// `curLine` after every tag (the reference's `CurLine`).
+fn collect_with_lines(
+    state: &mut KagParserState,
+    eval: &mut dyn FnMut(&str) -> Result<EvalResult, String>,
+) -> (ParsedTags, Vec<usize>) {
+    let mut load =
+        |_name: &str| -> Result<String, String> { Err("unexpected storage load".to_string()) };
+    let mut env = Environ {
+        eval,
+        load_storage: &mut load,
+        fire_label: None,
+        fire_script: None,
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
+    };
+    let mut tags = Vec::new();
+    let mut lines = Vec::new();
+    loop {
+        match state.next_tag(&mut env) {
+            Ok(Some(tag)) => {
+                tags.push(tag);
+                lines.push(state.cur_line());
+            }
+            Ok(None) => break,
+            Err(e) => panic!("next_tag error: {e}"),
+        }
+    }
+    (tags, lines)
+}
+
 fn ch_text(tags: &[(String, Vec<(String, String)>)]) -> String {
     tags.iter()
         .filter(|(name, _)| name == "ch")
@@ -1494,6 +1528,76 @@ fn records_and_expands_a_macro() {
             .iter()
             .any(|(name, _)| name == "greet")
     );
+}
+
+#[test]
+fn a_macro_expansion_keeps_the_line_end_after_the_expansion() {
+    // The reference splices the macro body into the line buffer at the macro
+    // tag's position (`reference/cpp/core/base/KAGParser.cpp:1843-1881`), so
+    // the line end of the macro call's line is produced after the expansion
+    // and `CurLine` stays on the macro call's line while the expansion is
+    // scanned (`KAGParser.cpp:1430-1451`).
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text(
+            "t.ks",
+            "*start\n[macro name=m]\n[x]\n[endmacro]\n[m]\n[next]\n",
+        )
+        .unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let (tags, lines) = collect_with_lines(&mut state, &mut eval);
+    // The macro body (its own line end, the `x` tag, its line end) comes
+    // first, then the line end of the macro call's line, then the next
+    // line's tag.
+    assert_eq!(
+        tag_names(&tags),
+        vec![
+            "r".to_string(),
+            "r".to_string(),
+            "x".to_string(),
+            "r".to_string(),
+            "r".to_string(),
+            "next".to_string(),
+            "r".to_string(),
+        ]
+    );
+    assert_eq!(lines, vec![4, 4, 4, 4, 5, 5, 6]);
+}
+
+#[test]
+fn a_nested_macro_expansion_keeps_the_line_end_after_the_expansion() {
+    // A macro that expands a macro is still one line: every tag of both
+    // bodies is scanned inside the line the outer macro tag closed, so the
+    // line end comes after both bodies and `CurLine` names the outer macro
+    // call's line throughout
+    // (`reference/cpp/core/base/KAGParser.cpp:1843-1881`, `:1430-1451`).
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text(
+            "t.ks",
+            "*start\n[macro name=a]\n[wq canskip = true]\n[b]\n[endmacro]\n\
+             [macro name=b]\n[layopt layer = message7page = fore visible = true]\n\
+             [endmacro]\n[a]\n",
+        )
+        .unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let (tags, lines) = collect_with_lines(&mut state, &mut eval);
+    assert_eq!(
+        tag_names(&tags),
+        vec![
+            "r".to_string(),
+            "r".to_string(),
+            "r".to_string(),
+            "wq".to_string(),
+            "r".to_string(),
+            "r".to_string(),
+            "layopt".to_string(),
+            "r".to_string(),
+            "r".to_string(),
+            "r".to_string(),
+        ]
+    );
+    assert_eq!(lines, vec![5, 8, 8, 8, 8, 8, 8, 8, 8, 9]);
 }
 
 #[test]
