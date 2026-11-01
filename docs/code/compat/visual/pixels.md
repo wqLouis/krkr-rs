@@ -104,7 +104,7 @@ pixels than its buffer holds answers `0` like a missing one. The writes
 | Member | Behaviour |
 |---|---|
 | `independProvinceImage([copy])` | allocates the layer's 8-bit province plane; the default keeps the existing content, `copy = false` clears it. |
-| `loadImages(name[, key])` | reads and probes the storage image, queues the decode in the L2 pool when possible, and installs it as the layer's main image (a pending bitmap until the pixels land). Returns `null` — the reference's absent metainfo. |
+| `loadImages(name[, key])` | reads and probes the storage image, queues the decode in the L2 pool when possible, and installs it as the layer's main image (a pending bitmap until the pixels land). It also takes the graphic's **province image** when the storage holds one — the graphic whose name carries `_p` before the extension (`map.png` → `map_p.png`). Returns `null` — the reference's absent metainfo. |
 | `loadProvinceImage(name)` | loads an 8-bit province plane sized to the main image. A smaller image is tiled up to that size; a larger one is a size mismatch. The plane is the image's own 8-bit sample — the **palette index** of a palettized image, not the colour the palette maps it to — and its value becomes the province value. |
 | `saveLayerImage(name[, type])` | encodes the main image through the host encoder and writes it through the storage. `type` defaults to `"bmp"`. The main image is **resolved first** — a pending decode is waited for — and an image that declares more pixels than its buffer holds raises instead of encoding an empty image. |
 | `drawText(x, y, text, color[, opacity[, antialias[, shadowLevel[, shadowColor[, shadowWidth[, shadowOffsetX[, shadowOffsetY]]]]]]])` | rasterizes a text run into the layer's main image. The main image is **resolved first** and validated, so the text lands on the decoded pixels; an image that declares more pixels than its buffer holds raises. |
@@ -354,7 +354,15 @@ A `Bitmap` passed to a Layer-only member raises
 6. The reference image-size adjustment runs — the layer rect shrinks to a
    smaller image, the image offsets are clamped and the clip is reset. A
    failure raises `"the layer image could not be sized"`.
-7. The return value is **`null`** — the reference returns the graphic
+7. The graphic's **province image** is loaded with it, when the storage holds
+   one: the province graphic of a graphic is the graphic whose name carries
+   `_p` before the extension (`map.png` → `map_p.png`, `map` → `map_p`), and
+   the name is resolved exactly as an image name is. The plane is the
+   **index plane** of that file (see below), and it is sized to the main
+   image. A storage without that file leaves the plane empty — the load
+   itself succeeds — while a file that is there and cannot be read fails the
+   load.
+8. The return value is **`null`** — the reference returns the graphic
    metainfo, which is `null` when the format carries none. Returning `void`
    would make a game's `ret != null` guard pass and then fault on
    `ret.mode`.
@@ -481,6 +489,8 @@ as the layer-bound `Font` wrapper.
 | `"Layer.loadImages: storage not found: {name}"` | the image does not resolve |
 | `"Layer.loadImages: the decoded image is malformed"` | the decoded image is inconsistent |
 | `"Layer.loadImages: the layer image could not be sized"` | the reference size adjustment failed |
+| `"Layer.loadImages: the province image is {w}x{h} but the main image is {mw}x{mh}"` | the graphic's province image is larger than the main image |
+| `"Layer.loadImages: no index-plane decoder is installed"` | the host installed no index-plane decoder, so the graphic's province image cannot be read |
 | `"Layer.loadProvinceImage: the province image is {w}x{h} but the main image is {mw}x{mh}"` | the province image is larger than the main image |
 | `"Layer.loadProvinceImage: the province image has an empty dimension"` | the decoded image has a zero axis |
 | `"Layer.loadProvinceImage: the decoded image is malformed"` | the decoded pixel buffer is inconsistent |

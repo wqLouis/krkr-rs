@@ -299,6 +299,20 @@ impl Env {
         self._host.set_index_plane_decoder(decode);
     }
 
+    /// Install the host's image codec: the colour decode, the header probe
+    /// and the save writer.
+    ///
+    /// The closures are the host's: a test that drives the real L1 decoder
+    /// passes them in, and the harness keeps no codec of its own.
+    pub fn install_image_codec(
+        &self,
+        decode: impl Fn(&[u8], Option<&str>) -> Result<DecodedImage, String> + 'static,
+        probe: impl Fn(&[u8], Option<&str>) -> Result<ImageInfo, String> + 'static,
+        save: impl Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String> + 'static,
+    ) {
+        self._host.set_image_codec(decode, probe, save);
+    }
+
     /// Install a synthetic image codec whose decode closure appends the
     /// resolved storage name to `hints` and returns a fixed 2x2 straight-
     /// alpha RGBA test image, replacing any codec installed earlier.

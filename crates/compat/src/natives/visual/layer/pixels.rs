@@ -22,7 +22,7 @@ use tjs::{NativeInstanceMethodDef, Tjs2Engine, Value};
 
 use super::super::bitmap::{
     COLOR_KEY_NONE, ImageLoadError, install_pending_image, load_cached_storage_image,
-    start_pending_decode,
+    resolve_province_image, start_pending_decode,
 };
 use super::super::common::scene_mut;
 use super::super::common::{
@@ -2606,6 +2606,10 @@ extern "C" fn layer_load_images(
         .map_or(COLOR_KEY_NONE, |value| value_as_i64(value) as u32);
     match load_layer_image(&ctx, id, &name, colorkey) {
         Ok(()) => {
+            // The graphic's province image, when the storage holds it.
+            if let Err(error) = load_auto_province(&ctx, id, &name) {
+                return report_error(out_error, &error.message_with("Layer.loadImages: "));
+            }
             // The reference returns the graphic metainfo, which is `null`
             // when the format carries none (the common case). Returning
             // `void` would make the game's `ret != null` guard pass and then
@@ -2615,6 +2619,27 @@ extern "C" fn layer_load_images(
         }
         Err(error) => report_error(out_error, &error.message_with("Layer.loadImages: ")),
     }
+}
+
+/// Loads the province image that belongs to a loaded graphic, when the
+/// storage holds it.
+///
+/// The province image of a graphic is the graphic whose name carries `_p`
+/// before the extension (`foo.png` → `foo_p.png`), and a load takes it when
+/// the storage has it. A storage without that file leaves the layer's plane
+/// empty; a file that is there but cannot be read is a failure of the load.
+fn load_auto_province(ctx: &CompatCtx, layer_id: u32, name: &str) -> Result<(), ImageLoadError> {
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `load_auto_province`.
+    let services = unsafe { ctx.services() };
+    let Some(storage) = services.storage() else {
+        // The main image could not have been loaded either.
+        return Ok(());
+    };
+    // SAFETY: `attach_storage` guarantees the pointer stays valid.
+    let Some(province_name) = resolve_province_image(unsafe { &*storage }, name)? else {
+        return Ok(());
+    };
+    load_layer_province(ctx, layer_id, &province_name)
 }
 
 /// Reads, decodes and installs `name` as the layer's main image, reusing the
@@ -2741,7 +2766,10 @@ extern "C" fn layer_load_province_image(
             set_void(out);
             0
         }
-        Err(error) => report_error(out_error, &format!("Layer.loadProvinceImage: {error}")),
+        Err(error) => report_error(
+            out_error,
+            &format!("Layer.loadProvinceImage: {}", error.message()),
+        ),
     }
 }
 
@@ -2750,7 +2778,7 @@ extern "C" fn layer_load_province_image(
 /// main size. The image is the 8-bit index plane — the palette index of a
 /// palettized image, not the colour the palette maps it to — and its red
 /// channel becomes the 8-bit province value.
-fn load_layer_province(ctx: &CompatCtx, layer_id: u32, name: &str) -> Result<(), String> {
+fn load_layer_province(ctx: &CompatCtx, layer_id: u32, name: &str) -> Result<(), ImageLoadError> {
     let (main_w, main_h) = {
         let scene = scene_mut(ctx)?;
         let dimensions = scene
@@ -2758,7 +2786,7 @@ fn load_layer_province(ctx: &CompatCtx, layer_id: u32, name: &str) -> Result<(),
             .and_then(|layer| layer.bitmap)
             .and_then(|id| scene.bitmap(id))
             .map(|bitmap| (bitmap.width, bitmap.height))
-            .ok_or_else(|| "the layer has no main image".to_string())?;
+            .ok_or_else(|| ImageLoadError::Message("the layer has no main image".to_string()))?;
         // The plane is allocated before the load and dropped when the load
         // fails.
         scene.resize_province_image(layer_id, dimensions.0, dimensions.1);
@@ -2768,12 +2796,18 @@ fn load_layer_province(ctx: &CompatCtx, layer_id: u32, name: &str) -> Result<(),
         match load_cached_storage_image(ctx, name, COLOR_KEY_NONE, DecodedImageMode::Province) {
             Ok(image) => image,
             Err(error) => {
-                return Err(discard_province_plane(ctx, layer_id, error.message()));
+                return Err(discard_province_plane(ctx, layer_id, error));
             }
         };
     let plane = match province_plane(&image, main_w, main_h) {
         Ok(plane) => plane,
-        Err(error) => return Err(discard_province_plane(ctx, layer_id, error)),
+        Err(error) => {
+            return Err(discard_province_plane(
+                ctx,
+                layer_id,
+                ImageLoadError::Message(error),
+            ));
+        }
     };
     let scene = scene_mut(ctx)?;
     let sized = scene.layer(layer_id).is_some_and(|layer| {
@@ -2786,13 +2820,19 @@ fn load_layer_province(ctx: &CompatCtx, layer_id: u32, name: &str) -> Result<(),
     });
     if !sized {
         scene.deallocate_province_image(layer_id);
-        return Err("the province plane could not be sized to the main image".to_string());
+        return Err(ImageLoadError::Message(
+            "the province plane could not be sized to the main image".to_string(),
+        ));
     }
     let Some(layer) = scene.layer_mut(layer_id) else {
-        return Err("the layer has no main image".to_string());
+        return Err(ImageLoadError::Message(
+            "the layer has no main image".to_string(),
+        ));
     };
     let Some(province) = layer.province.as_mut() else {
-        return Err("the province plane is missing".to_string());
+        return Err(ImageLoadError::Message(
+            "the province plane is missing".to_string(),
+        ));
     };
     province.copy_from_slice(&plane);
     layer.image_modified = true;
@@ -2802,7 +2842,7 @@ fn load_layer_province(ctx: &CompatCtx, layer_id: u32, name: &str) -> Result<(),
 /// Drops the layer's province plane after a failed load and returns `error`
 /// for the caller to raise. A plane that cannot be dropped is reported; it
 /// does not replace the load's failure.
-fn discard_province_plane(ctx: &CompatCtx, layer_id: u32, error: String) -> String {
+fn discard_province_plane(ctx: &CompatCtx, layer_id: u32, error: ImageLoadError) -> ImageLoadError {
     match scene_mut(ctx) {
         Ok(scene) => scene.deallocate_province_image(layer_id),
         Err(drop_error) => log::error!(

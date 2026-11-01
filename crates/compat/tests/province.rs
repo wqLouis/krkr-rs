@@ -17,8 +17,9 @@
 mod common;
 
 use common::{Env, vm_lock};
-use media::{Media, decode_index_plane};
+use media::{Media, decode_image, decode_index_plane, probe_image};
 use platform::{InputEvent, MouseButton, PlatformEvent};
+use testkit::{encode_png, pattern};
 
 /// The committed fixture: a 4x4 palettized PNG whose palette index is the
 /// region id.
@@ -32,17 +33,32 @@ const FIXTURE: &[u8] = include_bytes!("fixtures/province.png");
 /// The fixture's name in the mounted storage.
 const FIXTURE_NAME: &str = "province.png";
 
-/// A bound environment with the fixture mounted and the real L1 index-plane
-/// decoder installed.
-fn province_env() -> Env {
+/// A bound environment with the real L1 decoders installed.
+fn media_env() -> Env {
     let env = Env::with_storage();
-    let dir = env.game_dir().expect("the temp game directory");
-    std::fs::write(dir.join(FIXTURE_NAME), FIXTURE).expect("write the province image");
     let media = Media::new();
+    env.install_image_codec(
+        move |bytes, hint| decode_image(&media, bytes, hint).map_err(|error| error.to_string()),
+        move |bytes, hint| probe_image(&media, bytes, hint).map_err(|error| error.to_string()),
+        |_name, _type, _width, _height, _rgba| Ok(()),
+    );
     env.install_index_plane_decoder(move |bytes, hint| {
         decode_index_plane(&media, bytes, hint).map_err(|error| error.to_string())
     });
     env
+}
+
+/// A bound environment with the province fixture mounted.
+fn province_env() -> Env {
+    let env = media_env();
+    write_game_file(&env, FIXTURE_NAME, FIXTURE);
+    env
+}
+
+/// Writes `bytes` into the mounted game directory under `name`.
+fn write_game_file(env: &Env, name: &str, bytes: &[u8]) {
+    let dir = env.game_dir().expect("the temp game directory");
+    std::fs::write(dir.join(name), bytes).expect("write the game file");
 }
 
 /// The province plane holds the palette index of the image, not the colour
@@ -211,4 +227,61 @@ fn a_missing_province_image_raises() {
         message.contains("not found"),
         "the missing province image raises: {message}"
     );
+}
+
+/// A loaded graphic takes its province image, when the storage holds it.
+///
+/// The province graphic of a graphic is the graphic whose name carries `_p`
+/// before the extension (`map.png` → `map_p.png`), and a load takes it when
+/// the storage has one (`reference/cpp/core/visual/LayerIntf.cpp:2847-2875`,
+/// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1662-1680`). The plane
+/// is the index plane of that file, so it holds the region ids.
+#[test]
+fn a_loaded_graphic_takes_its_province_image() {
+    let _lock = vm_lock();
+    let env = media_env();
+    // The graphic and the province image that belongs to it.
+    let main = encode_png(4, 4, &pattern(4, 4));
+    write_game_file(&env, "map.png", &main);
+    write_game_file(&env, "map_p.png", FIXTURE);
+
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.loadImages('map.png');",
+    );
+
+    assert_eq!(
+        env.eval_int("l.getProvincePixel(0, 1)"),
+        16,
+        "the loaded graphic's province image is its plane"
+    );
+    assert_eq!(env.eval_int("l.provinceImageBufferPitch"), 4);
+}
+
+/// A graphic whose province image the storage does not hold leaves the plane
+/// empty — the load itself succeeds.
+///
+/// Reference: the province image is optional
+/// (`reference/cpp/core/visual/LayerIntf.cpp:2847-2875`), so a storage
+/// without `map_p.png` loads the graphic and no plane.
+#[test]
+fn a_graphic_without_a_province_image_loads_without_a_plane() {
+    let _lock = vm_lock();
+    let env = media_env();
+    let main = encode_png(4, 4, &pattern(4, 4));
+    write_game_file(&env, "plain.png", &main);
+
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.loadImages('plain.png');",
+    );
+
+    assert_eq!(
+        env.eval_int("l.provinceImageBufferPitch"),
+        0,
+        "a graphic without a province image leaves the plane empty"
+    );
+    assert_eq!(env.eval_int("l.getProvincePixel(0, 1)"), 0);
 }

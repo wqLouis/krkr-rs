@@ -133,6 +133,42 @@ pub(crate) fn read_image_from_storage(
     )))
 }
 
+/// The province image's name for a graphic: `_p` before the extension.
+///
+/// `foo.png` → `foo_p.png`, `foo` → `foo_p`, `dir/foo.png` → `dir/foo_p.png`.
+/// The media prefix is part of the path and is kept.
+fn province_image_name(name: &str) -> String {
+    // The extension starts after the last path separator: the media prefix
+    // (`file://.`) carries a dot of its own.
+    let path = name.rfind('/').map_or(0, |at| at + 1);
+    match name[path..].rfind('.') {
+        Some(at) => {
+            let at = path + at;
+            format!("{}_p{}", &name[..at], &name[at..])
+        }
+        None => format!("{name}_p"),
+    }
+}
+
+/// The province image's storage name for a graphic, when the storage holds
+/// it.
+///
+/// The name carries `_p` before the extension and is resolved exactly as an
+/// image name is: the plain name first, then each extension. A storage
+/// without that image has no province image.
+pub(crate) fn resolve_province_image(
+    storage: &Storage,
+    name: &str,
+) -> Result<Option<String>, ImageLoadError> {
+    let province_name = province_image_name(name);
+    match read_image_from_storage(storage, &province_name) {
+        Ok((resolved, _bytes)) => Ok(Some(resolved)),
+        // The storage holds no province image for this graphic.
+        Err(ImageLoadError::Storage(StorageReadError::NotFound(_))) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Decode image bytes through the installed host decoder.
 pub(crate) fn decode_image(
     services: &CompatServices,
