@@ -1930,6 +1930,52 @@ fn native_go_to_label_error_and_macros_object() {
     assert_eq!(value, TjsValue::String(String::new()));
 }
 
+/// A condition inside a macro body reads the macro parameters through `mp`.
+///
+/// `mp` is the parser's macro-parameter property
+/// (`reference/cpp/core/base/KAGParser.cpp:2497`; `GetMacroTopNoAddRef` at
+/// `:2191-2196`), so the condition is evaluated with the parser as its
+/// context: the free name resolves on the parser and on the global after it.
+/// A shipped KAG scenario uses this form — `@stopbgm cond=!mp.nostopbgm` in
+/// `data.xp3:scenario/macro.ks:6`.
+#[test]
+fn a_macro_condition_resolves_mp_on_the_parser() {
+    let _lock = common::vm_lock();
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut host = compat::CompatHost::new();
+    host.install(&engine).expect("install compat surface");
+
+    engine
+        .exec_script_discard(
+            "class MpParser extends KAGParser { \
+               function onScenarioLoad(name) { \
+                 return \"[macro name=m][x cond=!mp.nostopbgm][endmacro][m]\"; \
+               } \
+             }",
+            "kag_test",
+        )
+        .expect("the subclass declaration must evaluate");
+
+    // The macro body carries the condition; the call expands it, and the
+    // condition reads the macro parameters of the expansion. The parser
+    // also emits its macro-boundary markers, so what the condition decides
+    // is whether the expanded `x` tag appears.
+    let tags = engine
+        .eval(
+            "(function(){ var p = new MpParser(); p.loadScenario('scenario'); \
+             var s = ''; var t; while ((t = p.getNextTag()) !== void) { s += t.tagname + ','; } return s; })()",
+            "kag_test",
+        )
+        .expect("the macro condition must resolve `mp` on the parser");
+    let TjsValue::String(tags) = tags else {
+        panic!("the parser must return the tag names as a string, got {tags:?}");
+    };
+    assert!(
+        tags.split(',').any(|tag| tag == "x"),
+        "the macro condition must admit the `x` tag: {tags}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // reference surface: store / restore / assign / property semantics
 // (reference/cpp/core/base/KAGParser.cpp:2213-2560)

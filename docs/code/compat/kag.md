@@ -130,7 +130,9 @@ itself and returns nothing for them:
 `call`, `return`.
 
 Conditions and `emb` expressions are evaluated by calling back into the VM
-through the environment hook — **globally**, not in the owner's context.
+through the environment hook, with the **parser** as the evaluation context:
+a free name resolves on the parser first (`mp` is the macro parameters) and
+on the global after it.
 `jump` / `call` / `return` ask the owner first; the owner may veto the
 transition.
 

@@ -201,12 +201,16 @@ fn object_to_string(engine: &Tjs2Engine, object: &DetachedValue) -> Result<Strin
 
 impl KagEnv {
     fn new(engine: &'static Tjs2Engine, storage: Option<*mut Storage>, owner: *mut c_void) -> Self {
+        // The expression is evaluated with the parser as its context: a free
+        // name resolves on the parser first (`mp` is the macro parameters)
+        // and on the global after it.
+        let context = Tjs2ValueId::from_raw(owner);
         let eval: EvalFn = Box::new(move |exp: &str| -> Result<EvalResult, String> {
             // Evaluate the expression exactly once; the object arm carries
             // everything later consumers need, so a side effect cannot run
             // twice.
             let value = engine
-                .eval_retained(exp, "KAGParser")
+                .eval_retained_with_context(exp, "KAGParser", context, 0)
                 .map_err(|error| error.to_string())?;
             match value {
                 RetainedValue::Value(TjsValue::Void) => Ok(EvalResult::Void),

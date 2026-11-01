@@ -19,8 +19,9 @@
 //!   error leaves the tag processed, matching the reference's default.
 //! * `if`/`elsif`/`ignore` conditions, `emb` expressions, `&entity` values
 //!   and `cond` attributes are evaluated by calling back into the TJS VM
-//!   through the [`Environ`] `eval` hook (globally, not in the owner's
-//!   context).
+//!   through the [`Environ`] `eval` hook, with the parser as the evaluation
+//!   context: a free name resolves on the parser (`mp` is the macro
+//!   parameters) and on the global after it.
 //! * Macro *recording* reconstructs tag text from parsed events
 //!   (`[name key=value ...]`, values re-quoted when needed) instead of
 //!   copying raw source text; the recorded body re-parses to the same
