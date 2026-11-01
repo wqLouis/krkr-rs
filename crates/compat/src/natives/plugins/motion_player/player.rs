@@ -19,7 +19,7 @@ use std::sync::Arc;
 use tjs::{DetachedValue, RetainedValue, TjsValue, VAL_OBJECT, Value};
 
 use super::StoredValue;
-use super::adaptors::{LayerGetterInst, SeparateInst, populate_layer_getter};
+use super::adaptors::{D3DInst, LayerGetterInst, SeparateInst, populate_layer_getter};
 use super::animator::{Animator, ColorAnimator, ease_weight};
 use super::helpers::{eval_object, inst_mut, inst_ref, set_real, set_string, value_as_f64};
 use super::model::{
@@ -160,6 +160,9 @@ pub(crate) struct PlayerInst {
     /// The `src` keys already reported as having no readable texture, so a
     /// missing icon is reported once instead of on every frame.
     pub(crate) missing_textures: BTreeSet<String>,
+    /// Whether a draw target that names no layer was already reported, so
+    /// the divergence is named once instead of on every frame.
+    pub(crate) warned_draw_target: bool,
 
     // Emote transform state.
     pub(crate) coord: CoordState,
@@ -264,6 +267,7 @@ impl Default for PlayerInst {
             pending_events: Vec::new(),
             tinted: Map::default(),
             missing_textures: BTreeSet::new(),
+            warned_draw_target: false,
             coord: CoordState::default(),
             scale: Animator::at(1.0),
             rotate: Animator::at(0.0),
@@ -1572,17 +1576,20 @@ impl PlayerInst {
         };
         // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `draw`.
         let engine = unsafe { ctx.engine() };
-        // A draw target is a `SeparateLayerAdaptor`, which draws into the layer
-        // its live `targetLayer` names, or a `Layer` itself. A target that
-        // names no layer leaves nothing to draw into and is a no-op. The D3D
-        // adaptor route is not wired.
-        let layer_id = match resolve_draw_target(engine, target_id)? {
-            Some(id) => id,
-            None => return Ok(()),
+        // The target is resolved to the surface the pose is painted into. The
+        // resolution reads the VM only; the scene is borrowed afterwards.
+        let Some(surface) = resolve_draw_target(engine, target_id)? else {
+            // A target that names no layer leaves nothing to draw into. The
+            // failure is reported once, so the hole is never silent.
+            if !self.warned_draw_target {
+                self.warned_draw_target = true;
+                log::warn!("Motion.Player.draw: the target names no layer; the pose is not drawn");
+            }
+            return Ok(());
         };
         // SAFETY: the host keeps the attached scene alive for the binding.
         let Some(scene) = unsafe { ctx.services() }.scene() else {
-            return Ok(());
+            return Err("Motion.Player.draw: no scene is attached to the compat host".to_string());
         };
         // SAFETY: the host keeps the attached scene alive for the binding.
         let scene = unsafe { &mut *scene };
@@ -1590,12 +1597,42 @@ impl PlayerInst {
         let storage = unsafe { ctx.services() }.storage();
         // SAFETY: the host keeps the attached storage alive for the binding.
         let storage = storage.map(|storage| unsafe { &*storage });
-        self.draw_into_scene(scene, layer_id, storage);
+        match surface {
+            DrawSurface::Layer(layer_id) => {
+                // The ordinary route clears the target when the player asks
+                // for it.
+                let clear = self.clear_enabled.then(|| clear_fill(self.clear_color));
+                self.draw_into_scene(scene, layer_id, storage, clear);
+            }
+            DrawSurface::D3DAdaptor(payload) => {
+                // The D3D route paints into the adaptor's own render target,
+                // which the capture copies into a layer.
+                // SAFETY: the payload is the adaptor's live native instance;
+                // the script's target argument keeps it alive for the call.
+                let Some(adaptor) = (unsafe { inst_mut::<D3DInst>(payload) }) else {
+                    return Err("Motion.Player.draw: the D3D adaptor has no instance".to_string());
+                };
+                // The canvas-capture gate: an adaptor that does not capture
+                // the canvas renders nothing.
+                if !adaptor.captures_canvas() {
+                    return Ok(());
+                }
+                let clear = adaptor.clear_fill();
+                let layer = super::adaptors::d3d_render_target(adaptor, scene)?;
+                self.draw_into_scene(scene, layer, storage, clear);
+            }
+        }
         Ok(())
     }
 
     /// Clear the target image and composite the current pose into it in place.
-    fn draw_into_scene(&mut self, scene: &mut Scene, layer_id: u32, storage: Option<&Storage>) {
+    fn draw_into_scene(
+        &mut self,
+        scene: &mut Scene,
+        layer_id: u32,
+        storage: Option<&Storage>,
+        clear: Option<[u8; 4]>,
+    ) {
         let Some(bitmap_id) = scene.layer(layer_id).and_then(|layer| layer.bitmap) else {
             return;
         };
@@ -1655,10 +1692,9 @@ impl PlayerInst {
         let affine = self.affine;
         let nodes = &self.nodes;
         let mut tinted = std::mem::take(&mut self.tinted);
-        // A draw leaves the target image in place unless the player enables an
-        // explicit clear; the pixels outside the drawn items survive.
-        if self.clear_enabled {
-            let clear = clear_fill(self.clear_enabled, self.clear_color);
+        // A draw leaves the target image in place unless the caller asked for
+        // a clear; the pixels outside the drawn items survive.
+        if let Some(clear) = clear {
             for pixel in bitmap.rgba.as_chunks_mut::<4>().0.iter_mut() {
                 pixel.copy_from_slice(&clear);
             }
@@ -1796,12 +1832,11 @@ fn composite_pose(
     std::mem::take(&mut frame.missing)
 }
 
-/// The target fill: transparent unless the player enables an explicit clear
-/// color, which is stored as `0xAARRGGBB`.
-fn clear_fill(clear_enabled: bool, color: i32) -> [u8; 4] {
-    if !clear_enabled {
-        return [0, 0, 0, 0];
-    }
+/// The fill a target is cleared with: the colour stored as `0xAARRGGBB`.
+///
+/// The player's own clear colour and the adaptor's clear colour are both
+/// packed that way.
+pub(crate) fn clear_fill(color: i32) -> [u8; 4] {
     let value = color as u32;
     [
         (value >> 16) as u8,
@@ -3285,23 +3320,43 @@ fn refresh_shape_bounds(nodes: &mut [MotionNode], index: usize, z_factor: f64) {
     nodes[index].parent_clip = Some(index);
 }
 
-/// The layer a `Player.draw` target draws into.
+/// The surface a `Player.draw` target paints into.
+enum DrawSurface {
+    /// A layer in the L2 scene: the pose is composited into its image.
+    Layer(u32),
+    /// A `Motion.D3DAdaptor`: the pose is composited into the adaptor's own
+    /// render target, which the capture copies into a layer.
+    ///
+    /// The payload is the adaptor's native instance. The script's target
+    /// argument keeps the adaptor alive for the whole call, so the payload
+    /// stays alive.
+    D3DAdaptor(*mut std::ffi::c_void),
+}
+
+/// The surface a `Player.draw` target paints into.
 ///
-/// A `SeparateLayerAdaptor` draws into the layer its live `targetLayer` names;
-/// any other object is resolved as a `Layer` directly. `None` means the target
-/// names no layer, which `draw` treats as a no-op.
-fn resolve_draw_target(engine: &tjs::Tjs2Engine, target_id: usize) -> Result<Option<u32>, String> {
-    let payload = match engine.native_instance_payload(
-        tjs::Tjs2ValueId::from_raw(target_id as *mut std::ffi::c_void),
-        "SeparateLayerAdaptor",
-    ) {
+/// A `D3DAdaptor` draws into its own render target, a `SeparateLayerAdaptor`
+/// draws into the layer its live `targetLayer` names, and any other object is
+/// resolved as a `Layer` directly. `None` means the target names no layer,
+/// which `draw` treats as a no-op.
+///
+/// The dispatch checks the D3D adaptor first, then the separate-layer
+/// adaptor, then the ordinary layer path.
+fn resolve_draw_target(
+    engine: &tjs::Tjs2Engine,
+    target_id: usize,
+) -> Result<Option<DrawSurface>, String> {
+    let target = tjs::Tjs2ValueId::from_raw(target_id as *mut std::ffi::c_void);
+    match engine.native_instance_payload(target, "D3DAdaptor") {
+        Ok(Some(payload)) => return Ok(Some(DrawSurface::D3DAdaptor(payload.as_ptr()))),
+        Ok(None) => {}
+        Err(error) => return Err(error),
+    }
+    let payload = match engine.native_instance_payload(target, "SeparateLayerAdaptor") {
         Ok(Some(payload)) => payload,
         Ok(None) => {
-            return crate::CompatCtx::native_instance_id(
-                engine,
-                tjs::Tjs2ValueId::from_raw(target_id as *mut std::ffi::c_void),
-                &["Layer"],
-            );
+            return crate::CompatCtx::native_instance_id(engine, target, &["Layer"])
+                .map(|id| id.map(DrawSurface::Layer));
         }
         Err(error) => return Err(error),
     };
@@ -3318,6 +3373,7 @@ fn resolve_draw_target(engine: &tjs::Tjs2Engine, target_id: usize) -> Result<Opt
         tjs::Tjs2ValueId::from_raw(target as *mut std::ffi::c_void),
         &["Layer"],
     )
+    .map(|id| id.map(DrawSurface::Layer))
 }
 
 /// Install an object member by retaining it.
@@ -6045,7 +6101,7 @@ mod tests {
         let bitmap = scene.add_bitmap(800, 1080, vec![0u8; 800 * 1080 * 4]);
         scene.layer_mut(layer).expect("target layer").bitmap = Some(bitmap);
         let allocated = scene.bitmap(bitmap).expect("target bitmap").rgba.as_ptr() as usize;
-        player.draw_into_scene(&mut scene, layer, None);
+        player.draw_into_scene(&mut scene, layer, None, None);
         assert_eq!(
             scene.bitmap(bitmap).expect("target bitmap").rgba.as_ptr() as usize,
             allocated,
@@ -6056,7 +6112,7 @@ mod tests {
             255
         );
         assert!(scene.layer(layer).expect("target layer").image_modified);
-        player.draw_into_scene(&mut scene, layer, None);
+        player.draw_into_scene(&mut scene, layer, None, None);
         assert_eq!(
             scene.bitmap(bitmap).expect("target bitmap").rgba.as_ptr() as usize,
             allocated

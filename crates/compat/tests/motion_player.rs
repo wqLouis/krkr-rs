@@ -742,6 +742,129 @@ fn player_draw_routes_a_separate_layer_adaptor_to_its_target_layer() {
     );
 }
 
+/// The layer of the scene a script owns, or `None` for the adaptor's
+/// detached render target.
+fn script_layer(env: &Env, width: u32, height: u32) -> Option<u32> {
+    env._scene
+        .layers
+        .iter()
+        .find(|layer| layer.window != u32::MAX && layer.rect.w == width && layer.rect.h == height)
+        .and_then(|layer| layer.bitmap)
+}
+
+/// The pixels of the scene's bitmap with the given id.
+fn bitmap_pixels(env: &Env, bitmap: u32) -> Vec<u8> {
+    env._scene
+        .bitmap(bitmap)
+        .expect("the layer's bitmap")
+        .rgba
+        .clone()
+}
+
+/// Whether the bitmap holds a pixel that is not fully transparent.
+fn has_ink(pixels: &[u8]) -> bool {
+    pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0)
+}
+
+#[test]
+fn player_draw_routes_a_d3d_adaptor_to_its_render_target() {
+    let _lock = vm_lock();
+    let Some(env) = Env::with_reference_storage() else {
+        return;
+    };
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    // The reference's draw dispatch routes a D3D adaptor to the render target
+    // the adaptor owns (`reference/cpp/plugins/motionplayer/PlayerDrawDispatch.cpp:157-176`),
+    // and `captureCanvas` copies that target into the layer it is given
+    // (`reference/cpp/plugins/motionplayer/D3DAdaptor.cpp:82-102`).
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var w = new Window(); \
+         var screen = new Layer(w, null); \
+         var work = new Layer(w, screen); \
+         work.setSize(800, 1080); \
+         var adaptor = new Motion.D3DAdaptor(w, 800, 1080, 400, 540); \
+         adaptor.canvasCaptureEnabled = 1; \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\"; \
+         p.draw(adaptor);"
+    ));
+    // The pose is composited into the adaptor's own render target, which is a
+    // detached layer: no window draws it.
+    let targets: Vec<u32> = env
+        ._scene
+        .layers
+        .iter()
+        .filter(|layer| layer.window == u32::MAX)
+        .map(|layer| layer.id)
+        .collect();
+    assert_eq!(
+        targets.len(),
+        1,
+        "the adaptor owns exactly one render target, got {targets:?}"
+    );
+    let target_bitmap = env
+        ._scene
+        .layer(targets[0])
+        .and_then(|layer| layer.bitmap)
+        .expect("the render target's image");
+    assert!(
+        has_ink(&bitmap_pixels(&env, target_bitmap)),
+        "the pose must be composited into the render target"
+    );
+    // The work layer is still empty: the pose only reaches it through the
+    // adaptor's capture.
+    let work_bitmap = script_layer(&env, 800, 1080).expect("the work layer's image");
+    assert!(
+        !has_ink(&bitmap_pixels(&env, work_bitmap)),
+        "the capture has not run yet"
+    );
+    // `captureCanvas` copies the render target into the layer
+    // (`reference/cpp/plugins/motionplayer/D3DAdaptor.cpp:82-102`).
+    env.run("adaptor.captureCanvas(work);");
+    let captured = bitmap_pixels(&env, work_bitmap);
+    assert!(
+        has_ink(&captured),
+        "the capture must copy the pose into the work layer"
+    );
+    assert_eq!(
+        captured,
+        bitmap_pixels(&env, target_bitmap),
+        "the capture copies the render target row by row"
+    );
+}
+
+#[test]
+fn d3d_adaptor_without_canvas_capture_renders_nothing() {
+    let _lock = vm_lock();
+    let Some(env) = Env::with_reference_storage() else {
+        return;
+    };
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    // The reference gates the whole D3D route on the canvas-capture flag: an
+    // adaptor that does not capture the canvas renders nothing
+    // (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:981-987`).
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var w = new Window(); \
+         var screen = new Layer(w, null); \
+         var work = new Layer(w, screen); \
+         work.setSize(800, 1080); \
+         var adaptor = new Motion.D3DAdaptor(w, 800, 1080, 400, 540); \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\"; \
+         p.draw(adaptor); \
+         adaptor.captureCanvas(work);"
+    ));
+    let work_bitmap = script_layer(&env, 800, 1080).expect("the work layer's image");
+    assert!(
+        !has_ink(&bitmap_pixels(&env, work_bitmap)),
+        "an adaptor that does not capture the canvas stays empty"
+    );
+}
+
 #[test]
 fn resource_manager_allocates_and_releases_layer_ids() {
     let _lock = vm_lock();

@@ -890,13 +890,14 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   remains open for the remaining motion GPU/L1 resource path, the visual
   layer/window pixel paths, KAG, each native class and plugin port, and
   audio/video/focus event dispatch. The motion GPU path is the sharpest
-  case: the reference renders a motion into a texture and copies it into the
-  target layer, while the port's `Motion.D3DAdaptor.captureCanvas` copies
-  nothing and `Motion.Player.draw` with such a target draws nothing at all,
-  silently. Closing it needs a layer-tree primitive for a batch of textured
-  quads, an L1 draw for that batch and the render-target plumbing in
-  `engine` — the geometry is per-node affine, so neither the effect draw
-  (one axis-aligned rectangle per pass) nor a layer node covers it. Audit L3
+  case: the reference renders a motion into a Direct3D texture and copies it
+  into the target layer. The port's route is wired — a `Motion.D3DAdaptor`
+  owns a render target the pose is painted into and `captureCanvas` copies it
+  into the layer — but that render target is the engine's own rasterization,
+  not a GPU texture. Closing the GPU path needs a layer-tree primitive for a
+  batch of textured quads and an L1 draw for that batch; the geometry is
+  per-node affine, so neither the effect draw (one axis-aligned rectangle per
+  pass) nor a layer node covers it. Audit L3
   by subsystem against the reference oracle:
   motion player (timeline/eval/child motion/events/draw), visual layer and
   window, KAG, each native class and plugin port, audio/video/focus event
@@ -1049,6 +1050,23 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
     game's `custom.ks:*title_start` has two branches — the last `.mtn` frame
     and the `title_bg.png` stage image — and which one the reference shows is
     not yet established.
+  * **The title's motion was drawn through the Direct3D route, and the port's
+    route was unwired.** The game's `system/affinesourcemotion.tjs` reads
+    `Motion.enableD3D` and the window's `d3dMotion` setting, so `drawAffine`
+    picks `window.motionD3DAdaptor` as its draw target and the pose reaches
+    the title layer through `D3DAdaptor.captureCanvas(window.motionWorkLayer)`.
+    The port resolved no layer for such a target and copied nothing into the
+    capture, so the pose never reached the title layer: the title stayed
+    black, silently, with a clean log.
+    **Fixed:** a `Motion.D3DAdaptor` owns a render target in the engine's
+    scene, `Player.draw` paints the pose into it and `captureCanvas` copies
+    it into the layer the script names
+    (`reference/cpp/plugins/motionplayer/D3DAdaptor.cpp:82-102`,
+    `PlayerRenderTargets.cpp:931-970`); the behaviour test
+    (`crates/compat/tests/motion_player.rs`) pins that the capture copies the
+    pose into the layer. The remaining divergence is the backend: the render
+    target is the engine's rasterization of the same data, not a Direct3D
+    texture.
   * **The world's per-frame env update: there is none, and ours is not
     short.** An earlier reading took `world.updateAll`, `world.updateSource`
     and `world.refresh` never being called for a missing per-frame world

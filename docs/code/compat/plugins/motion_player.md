@@ -297,7 +297,7 @@ and duplicates it on every read, so its identity is stable.
 | `registerBg(value)` | method | registers a background |
 | `registerCaption(value)` | method | registers a caption |
 | `unloadUnusedTextures()` | method | drops the textures no node references |
-| `captureCanvas()` | method | captures the canvas; it raises unless the argument is a `Layer` |
+| `captureCanvas(layer)` | method | copies the adaptor's render target into the layer's image; the layer's image takes the adaptor's canvas size and the rows are copied one to one. It raises unless the argument is a `Layer` (`reference/cpp/plugins/motionplayer/D3DAdaptor.cpp:82-102`) |
 | `visible` | property (read/write) | the canvas visibility |
 | `alphaOpAdd` | property (read/write) | the alpha-add amount |
 | `canvasCaptureEnabled` | property (read/write) | the canvas-capture flag |
@@ -558,10 +558,36 @@ layer's image through the engine's layer system:
   (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:1094-1135`,
   `PlayerDrawDispatch.cpp:236-285`).
 
-A draw target is a `Motion.SeparateLayerAdaptor`, which paints into the layer
-its live `targetLayer` names, or a `Layer` itself. A target that names no
-layer leaves nothing to draw into and the call returns void without raising
-(`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:1228-1252`).
+A draw target is a `Motion.D3DAdaptor`, which paints into the render target
+the adaptor owns, a `Motion.SeparateLayerAdaptor`, which paints into the
+layer its live `targetLayer` names, or a `Layer` itself. A target that names
+no layer leaves nothing to draw into and the call returns void without raising
+(`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:1228-1252`); the
+port reports that case once per player in the log, so the hole is never
+silent.
+
+### The D3D adaptor route
+
+A `Motion.D3DAdaptor` owns a **render target**: a layer in the engine's scene,
+sized like the adaptor and kept out of every window's draw order, so it is
+never rendered on its own. The reference's render target is a texture the
+adaptor owns
+(`reference/cpp/plugins/motionplayer/D3DAdaptor.cpp:120-133`); the port's
+counterpart is a layer, because the engine's layer system is what the port
+composes with.
+
+* `Player.draw(adaptor)` paints the pose into that render target, and the
+  adaptor's own `clearEnabled` and clear colour decide whether the target is
+  cleared first. The route is gated on the adaptor's `canvasCaptureEnabled`:
+  an adaptor that does not capture the canvas renders nothing
+  (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:981-990`).
+* `adaptor.captureCanvas(layer)` copies the render target into the layer's
+  image: the layer's image takes the adaptor's canvas size and the rows are
+  copied one to one
+  (`reference/cpp/plugins/motionplayer/D3DAdaptor.cpp:82-102`).
+* `adaptor.setSize(w, h)` drops the render target, so the next draw starts
+  from an empty canvas
+  (`reference/cpp/plugins/motionplayer/D3DAdaptor.cpp:52-61`).
 
 ### The playback model
 
@@ -677,6 +703,9 @@ linked.
 * The `Motion.Player.useD3D` probe marker is created once at registration
   and duplicated on every read, so its identity is stable across reads
   (`crates/compat/src/natives/plugins/motion_player/mod.rs`).
+* A `Motion.D3DAdaptor`'s render target is a layer in the engine's scene that
+  the adaptor owns: it is released with the adaptor, and a new canvas size
+  drops it.
 * The instance payload is released when the native instance is destroyed.
 
 ## Errors
@@ -690,6 +719,8 @@ linked.
 | `Motion.ResourceManager.setEmotePSBDecryptSeed` with a non-integer | `invalid parameter` (`reference/cpp/plugins/motionplayer/ResourceManager.cpp:112-121`) |
 | `new Motion.D3DAdaptor(...)` with fewer than five arguments or a first argument that is not a `Window` | `must set Window object` (`reference/cpp/plugins/motionplayer/D3DAdaptor.cpp:19-27`) |
 | `Motion.D3DAdaptor.captureCanvas` with an argument that is not a `Layer` | `D3DAdaptor.captureCanvas expects a Layer` |
+| `Motion.D3DAdaptor.captureCanvas` without a scene on the compat host | `D3DAdaptor.captureCanvas: no scene is attached to the compat host` |
+| a draw into a `Motion.D3DAdaptor` whose canvas has no size | `Motion.D3DAdaptor: the canvas has no size` |
 | the compat context is not bound | `motionplayer: compat context is not bound` |
 | an icon whose texture cannot be decoded | a warning per missing source, once per source per motion, and the icon is skipped (`crates/compat/src/natives/plugins/motion_player/texture.rs`) |
 
@@ -701,7 +732,7 @@ A draw target that names no layer, a `Point` or `Quad` hit test and a
 
 | file | what it pins |
 |---|---|
-| `crates/compat/tests/motion_player.rs` | the namespace constants and the subclass placement (top-level versus `Motion.*`), the geometry hit-test classes, the `LayerGetter` defaults and its array identity, the resource manager's layer-id allocator and the decrypt seed, the `D3DEmoteModule` class statics, the player's property surface, the variable and timeline queries, the arity gates, the `onFindMotion` override, the emote shell, the PSB module load and unload, the `motionKey` candidate list, the `ShortCutInitial*` globals, the `SeparateLayerAdaptor` owner, the layer getter, the colour-weight channel order, the progress gate and the dropped delta, the image-wait/movie-wait `canSync` split, and the draw path (texture sampling, the draw affine, the node colour tint, the uncleared target, the untouched target geometry, the reused allocation, the `psb://` media registration) |
+| `crates/compat/tests/motion_player.rs` | the namespace constants and the subclass placement (top-level versus `Motion.*`), the geometry hit-test classes, the `LayerGetter` defaults and its array identity, the resource manager's layer-id allocator and the decrypt seed, the `D3DEmoteModule` class statics, the player's property surface, the variable and timeline queries, the arity gates, the `onFindMotion` override, the emote shell, the PSB module load and unload, the `motionKey` candidate list, the `ShortCutInitial*` globals, the `SeparateLayerAdaptor` owner, the layer getter, the colour-weight channel order, the progress gate and the dropped delta, the image-wait/movie-wait `canSync` split, and the draw path (texture sampling, the draw affine, the node colour tint, the uncleared target, the untouched target geometry, the reused allocation, the `psb://` media registration, the D3D adaptor's render target and its capture) |
 | `crates/compat/tests/emote_player.rs` | the loader shim defines no globals of its own and the `motionplayer.dll` classes are reachable through it |
 | `crates/compat/src/natives/plugins/motion_player/model.rs` unit tests | the icon canvas geometry, the child motion expansion and its clock, the frame evaluation by time, the visibility of a contentless frame, the origin interpolation, the action/sync keyframe scan (the container's layer list before the clips' layer arrays, the doubled top layer, the nested layer and the sync marker types) and the frame curves |
 | `crates/compat/src/natives/plugins/motion_player/player.rs` unit tests | the replay of a short clip after a long one, the queuing gate and the dropped delta, the canSync loop-time gate before the first full frame, the `inheritMask` root/parent matrix split, the reset of the evaluation time on replay, the nearest-texel sampling of a scaled placement, the child motion's start at its parent keyframe, the action and sync dispatch, the packed colour order, the shape hit test, the logo's held corner and transition, the inherited parent matrix, the node matrix order, the draw affine, the shared label and the layer getter list, and the node blend mode |
@@ -721,16 +752,20 @@ A draw target that names no layer, a `Point` or `Quad` hit test and a
   one affine blit per grid quad, and the sampling is nearest-texel
   (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:455-456`); the
   reference's `BezierPatchCopy`/`MeshCopy` interpolates each cell per pixel.
-* **The D3D adaptor route is not wired.** `Motion.D3DAdaptor` registers its
-  whole surface and validates its constructor arguments, but the draw path
-  only resolves a `Motion.SeparateLayerAdaptor` or a `Layer`; a D3D adaptor
-  is not a draw target.
+* **The D3D route renders through the engine's layer system.** A
+  `Motion.D3DAdaptor` is a draw target again and owns a render target the
+  pose is painted into, which `captureCanvas` copies into a layer, exactly as
+  the reference's render-target texture works
+  (`reference/cpp/plugins/motionplayer/D3DAdaptor.cpp:82-102`,
+  `PlayerRenderTargets.cpp:931-970`). The render target is the engine's own
+  rasterization, not a Direct3D texture, so the pixels are the port's
+  rendering of the same data.
 * `Player.useD3D` is a script-settable flag that the draw path does not
-  consult: the port always draws through the engine's layer system. The
-  reference on Windows switches to the D3D backend when the flag is set and
-  the target is a D3D adaptor
-  (`reference/cpp/plugins/motionplayer/PlayerDrawDispatch.cpp:157-173`,
-  `:246-248`).
+  consult. The reference's draw dispatch routes a draw to the D3D backend by
+  the *target's* class, not by the flag
+  (`reference/cpp/plugins/motionplayer/PlayerDrawDispatch.cpp:157-176`), and
+  the port follows that routing; the flag itself only tells a script that the
+  plugin supports the D3D classes.
 * `content.mesh.bp` is not read. The reference warps a child through the
   parent's grid, which is what the port does; the authored patch the field
   declares has no reader in the reference either.

@@ -18,6 +18,8 @@ use tjs::{
 use super::StoredValue;
 use super::helpers::{eval_array, inst_mut, set_retained, value_as_f64};
 use super::model::MotionNode;
+use crate::engine_api::Scene;
+use crate::engine_api::layer_ops::blit_copy;
 use crate::native_util::{args, report_error, set_void};
 use crate::natives::system::{resolve, try_value_as_i64, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
@@ -625,6 +627,11 @@ pub(crate) struct D3DInst {
     size: (i32, i32),
     clear_color: i32,
     resizable: bool,
+    /// The scene layer the adaptor's render target lives in.
+    ///
+    /// The render target is the surface the pose is painted into and the
+    /// capture copies out of.
+    render_target: Option<u32>,
 }
 
 impl Default for D3DInst {
@@ -640,20 +647,162 @@ impl Default for D3DInst {
             size: (0, 0),
             clear_color: 0,
             resizable: false,
+            render_target: None,
         }
     }
+}
+
+impl D3DInst {
+    /// The canvas size the render target is sized like, when it is a usable
+    /// one.
+    fn canvas_size(&self) -> Option<(u32, u32)> {
+        let (Ok(width), Ok(height)) = (u32::try_from(self.size.0), u32::try_from(self.size.1))
+        else {
+            return None;
+        };
+        (width > 0 && height > 0).then_some((width, height))
+    }
+
+    /// Whether the adaptor renders into its render target at all: a capture
+    /// that is switched off leaves the target empty.
+    pub(crate) fn captures_canvas(&self) -> bool {
+        self.canvas_capture
+    }
+
+    /// The fill the render target is cleared with before the pose, when the
+    /// adaptor clears it.
+    pub(crate) fn clear_fill(&self) -> Option<[u8; 4]> {
+        self.clear
+            .then(|| super::player::clear_fill(self.clear_color))
+    }
+}
+
+/// The `Motion.D3DAdaptor`'s render target: the layer the pose is composited
+/// into and `captureCanvas` copies out.
+///
+/// The target is sized like the adaptor and allocated detached, so it is in no
+/// window's draw order: it is never rendered on its own, and only the capture
+/// reads it.
+pub(crate) fn d3d_render_target(adaptor: &mut D3DInst, scene: &mut Scene) -> Result<u32, String> {
+    let Some((width, height)) = adaptor.canvas_size() else {
+        return Err("Motion.D3DAdaptor: the canvas has no size".to_string());
+    };
+    if let Some(layer) = adaptor.render_target
+        && scene
+            .layer(layer)
+            .is_some_and(|layer| layer.rect.w == width && layer.rect.h == height)
+    {
+        return Ok(layer);
+    }
+    // A target that no longer matches the canvas — the adaptor was resized,
+    // or the scene dropped the layer — is released before a new one is
+    // allocated.
+    if let Some(layer) = adaptor.render_target.take() {
+        scene.remove_layer(layer);
+    }
+    let id = scene.add_detached_layer();
+    if let Some(layer) = scene.layer_mut(id) {
+        layer.rect.w = width;
+        layer.rect.h = height;
+        layer.visible = false;
+    }
+    if !scene.ensure_layer_image(id, width, height) {
+        scene.remove_layer(id);
+        return Err("Motion.D3DAdaptor: the render target could not be allocated".to_string());
+    }
+    adaptor.render_target = Some(id);
+    Ok(id)
+}
+
+/// Copy the adaptor's render target into the destination layer's image.
+///
+/// The destination's image takes the adaptor's canvas size, and the rows are
+/// copied one to one.
+fn capture_render_target(
+    adaptor: &mut D3DInst,
+    scene: &mut Scene,
+    destination: u32,
+) -> Result<(), String> {
+    let Some((width, height)) = adaptor.canvas_size() else {
+        return Err("Motion.D3DAdaptor: the canvas has no size".to_string());
+    };
+    // The destination's image takes the adaptor's canvas size.
+    if !scene.internal_set_image_size(destination, width, height) {
+        return Err(
+            "Motion.D3DAdaptor.captureCanvas: the destination layer has no image".to_string(),
+        );
+    }
+    let source = d3d_render_target(adaptor, scene)?;
+    let Some(source_bitmap) = scene.layer(source).and_then(|layer| layer.bitmap) else {
+        return Err("Motion.D3DAdaptor.captureCanvas: the render target has no image".to_string());
+    };
+    let Some(destination_bitmap) = scene.layer(destination).and_then(|layer| layer.bitmap) else {
+        return Err(
+            "Motion.D3DAdaptor.captureCanvas: the destination layer has no image".to_string(),
+        );
+    };
+    {
+        let Some((target, origin)) =
+            scene.bitmap_mut_with_source(destination_bitmap, source_bitmap)
+        else {
+            return Err(
+                "Motion.D3DAdaptor.captureCanvas: the destination and the render target are one \
+                 image"
+                    .to_string(),
+            );
+        };
+        // The rows are copied one to one: the render-target rows land in the
+        // layer's pixel buffer.
+        blit_copy(
+            target,
+            0,
+            0,
+            origin,
+            (
+                0,
+                0,
+                origin.width.min(i32::MAX as u32) as i32,
+                origin.height.min(i32::MAX as u32) as i32,
+            ),
+        );
+    }
+    scene.mark_layer_image_modified(destination);
+    Ok(())
+}
+
+/// Release the adaptor's render target, so the next draw allocates a fresh
+/// one.
+///
+/// A new canvas size starts from an empty target: the old one is released
+/// with the adaptor's canvas.
+fn release_render_target(adaptor: &mut D3DInst, ctx: &CompatCtx) {
+    let Some(layer) = adaptor.render_target.take() else {
+        return;
+    };
+    // SAFETY: the host keeps the attached scene alive for the binding.
+    let Some(scene) = (unsafe { ctx.services() }).scene() else {
+        return;
+    };
+    // SAFETY: the host keeps the attached scene alive for the binding.
+    let scene = unsafe { &mut *scene };
+    scene.remove_layer(layer);
 }
 
 extern "C" fn d3d_create(_engine: *mut c_void) -> *mut c_void {
     Box::into_raw(Box::new(D3DInst::default())) as *mut c_void
 }
 
-extern "C" fn d3d_destroy(_engine: *mut c_void, instance: *mut c_void) {
+extern "C" fn d3d_destroy(engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
     }
     // SAFETY: `instance` came from `d3d_create` and is released once.
-    drop(unsafe { Box::from_raw(instance as *mut D3DInst) });
+    let mut adaptor = unsafe { Box::from_raw(instance as *mut D3DInst) };
+    // The render target is a scene layer; it goes with the adaptor.
+    if let Some(res) = resolve(engine) {
+        let ctx = res.ctx();
+        release_render_target(&mut adaptor, &ctx);
+    }
 }
 
 extern "C" fn d3d_ctor(
@@ -726,10 +875,13 @@ mp_method_void!(
 mp_method_void!(
     d3d_set_size,
     D3DInst,
-    |p: &mut D3DInst, args: &[Value], _ctx: &CompatCtx| {
+    |p: &mut D3DInst, args: &[Value], ctx: &CompatCtx| {
         // `void setSize(int w, int h)` (`D3DAdaptor.h:40`) — ncbind arity 2.
         super::helpers::require_args(args, 2, "D3DAdaptor.setSize")?;
         p.size = (value_as_i64(&args[0]) as i32, value_as_i64(&args[1]) as i32);
+        // The old render target goes with the old canvas size, so the next
+        // draw starts from an empty target.
+        release_render_target(p, ctx);
         Ok(())
     }
 );
@@ -812,30 +964,42 @@ extern "C" fn d3d_capture_canvas(
     };
     // `layerObj->NativeInstanceSupport(..., tTJSNC_Layer::ClassID, ...)`;
     // failure is `TJS_E_INVALIDPARAM` (`D3DAdaptor.cpp:69-76`).
-    match crate::CompatCtx::native_instance_id(res.engine(), layer.raw_id(), &["Layer"]) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return report_error(
-                out_error,
-                "D3DAdaptor.captureCanvas expects a native Layer object",
-            );
-        }
-        Err(error) => {
-            return report_error(out_error, &format!("D3DAdaptor.captureCanvas: {error}"));
-        }
-    }
+    let destination =
+        match crate::CompatCtx::native_instance_id(res.engine(), layer.raw_id(), &["Layer"]) {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                return report_error(
+                    out_error,
+                    "D3DAdaptor.captureCanvas expects a native Layer object",
+                );
+            }
+            Err(error) => {
+                return report_error(out_error, &format!("D3DAdaptor.captureCanvas: {error}"));
+            }
+        };
     // `if(_width <= 0 || _height <= 0) return TJS_S_OK;` — the result stays
     // void (`D3DAdaptor.cpp:78-80`).
     if inst.size.0 <= 0 || inst.size.1 <= 0 {
         set_void(out);
         return 0;
     }
-    // The remaining reference work copies the adaptor's render-target texture
-    // into the layer (`D3DAdaptor.cpp:82-102`). The port has no L3 render
-    // target: the texture is populated by `Player.draw(d3dAdaptor)`
-    // (`PlayerRenderTargets.cpp:931-1070`), which is not wired. The reference
-    // return value (the Layer argument) is preserved; no pixels are
-    // fabricated.
+    // The remaining work copies the adaptor's render target into the layer.
+    // The render target is a layer in the scene, sized like the adaptor, that
+    // `Player.draw` composites the pose into.
+    let ctx = res.ctx();
+    // SAFETY: the host keeps the attached scene alive for the binding.
+    let Some(scene) = (unsafe { ctx.services() }).scene() else {
+        return report_error(
+            out_error,
+            "D3DAdaptor.captureCanvas: no scene is attached to the compat host",
+        );
+    };
+    // SAFETY: the host keeps the attached scene alive for the binding.
+    let scene = unsafe { &mut *scene };
+    if let Err(error) = capture_render_target(inst, scene, destination) {
+        return report_error(out_error, &error);
+    }
+    // The capture hands the layer back to the script.
     set_retained(out, layer);
     0
 }
