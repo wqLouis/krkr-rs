@@ -130,6 +130,12 @@ pub(crate) struct PlayerInst {
     pub(crate) camera_fov: f64,
     pub(crate) camera_alive: bool,
     pub(crate) canvas_capture_enabled: bool,
+    /// The script-visible `clearEnabled` flag.
+    ///
+    /// The flag belongs to the render path, not to the target layer: the pose
+    /// is composited over the pixels the target holds, so the target's alpha
+    /// accumulates from frame to frame, and nothing clears the target. Every
+    /// item is drawn straight onto the target, so the flag changes no pixel.
     pub(crate) clear_enabled: bool,
     pub(crate) hit_threshold: f64,
     pub(crate) preview: bool,
@@ -199,7 +205,6 @@ pub(crate) struct PlayerInst {
     pub(crate) flip: bool,
     pub(crate) slant: f64,
     pub(crate) zoom: f64,
-    pub(crate) clear_color: i32,
     pub(crate) resizable: bool,
     pub(crate) size: (i32, i32),
     pub(crate) backgrounds: Vec<StoredValue>,
@@ -299,7 +304,6 @@ impl Default for PlayerInst {
             flip: false,
             slant: 0.0,
             zoom: 1.0,
-            clear_color: 0,
             resizable: false,
             size: (0, 0),
             backgrounds: Vec::new(),
@@ -1606,10 +1610,11 @@ impl PlayerInst {
         let pool = pool.map(|pool| unsafe { &mut *pool });
         match surface {
             DrawSurface::Layer(layer_id) => {
-                // The ordinary route clears the target when the player asks
-                // for it.
-                let clear = self.clear_enabled.then(|| clear_fill(self.clear_color));
-                self.draw_into_scene(scene, layer_id, storage, pool, clear);
+                // The ordinary route paints over the target: the pose is
+                // composited onto the pixels the target already holds, so the
+                // target's alpha accumulates from frame to frame. Nothing
+                // clears the target.
+                self.draw_into_scene(scene, layer_id, storage, pool, None);
             }
             DrawSurface::D3DAdaptor(payload) => {
                 // The D3D route paints into the adaptor's own render target,
@@ -1632,7 +1637,12 @@ impl PlayerInst {
         Ok(())
     }
 
-    /// Clear the target image and composite the current pose into it in place.
+    /// Composite the current pose into the target image in place.
+    ///
+    /// `clear` is the fill the destination is cleared with before the pose.
+    /// Only the D3D adaptor route asks for one: the adaptor owns its render
+    /// target and fills it before every pose. The ordinary route leaves the
+    /// destination's pixels alone.
     fn draw_into_scene(
         &mut self,
         scene: &mut Scene,
@@ -1700,8 +1710,8 @@ impl PlayerInst {
         let affine = self.affine;
         let nodes = &self.nodes;
         let mut tinted = std::mem::take(&mut self.tinted);
-        // A draw leaves the target image in place unless the caller asked for
-        // a clear; the pixels outside the drawn items survive.
+        // A draw leaves the destination's image in place unless the route
+        // asked for a clear; the pixels outside the drawn items survive.
         if let Some(clear) = clear {
             for pixel in bitmap.rgba.as_chunks_mut::<4>().0.iter_mut() {
                 pixel.copy_from_slice(&clear);
@@ -1841,20 +1851,6 @@ fn composite_pose(
         }
     }
     std::mem::take(&mut frame.missing)
-}
-
-/// The fill a target is cleared with: the colour stored as `0xAARRGGBB`.
-///
-/// The player's own clear colour and the adaptor's clear colour are both
-/// packed that way.
-pub(crate) fn clear_fill(color: i32) -> [u8; 4] {
-    let value = color as u32;
-    [
-        (value >> 16) as u8,
-        (value >> 8) as u8,
-        value as u8,
-        (value >> 24) as u8,
-    ]
 }
 
 /// The operation mode a node's blend mode resolves to.

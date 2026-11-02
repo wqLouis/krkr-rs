@@ -397,6 +397,8 @@ mp_set_bool!(
 );
 mp_get_bool!(player_get_clear_enabled, PlayerInst, |p: &PlayerInst| p
     .clear_enabled);
+// The flag belongs to the render path; it never clears the target layer,
+// whose pixels the pose is composited over.
 mp_set_bool!(
     player_set_clear_enabled,
     PlayerInst,
@@ -938,11 +940,12 @@ mp_method_void!(
 mp_method_void!(
     player_set_clear_color,
     PlayerInst,
-    |p: &mut PlayerInst, args: &[Value], _ctx: &CompatCtx| {
+    |_p: &mut PlayerInst, args: &[Value], _ctx: &CompatCtx| {
         // `void setClearColor(tjs_int color)` — ncbind arity 1
         // (`reference/cpp/plugins/motionplayer/Player.h:306`).
+        // The colour is not kept: no draw reads it, and the target layer is
+        // composited over rather than cleared.
         super::helpers::require_args(args, 1, "setClearColor")?;
-        p.clear_color = value_as_i64(&args[0]) as i32;
         Ok(())
     }
 );

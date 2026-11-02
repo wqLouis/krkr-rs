@@ -672,9 +672,20 @@ impl D3DInst {
     /// The fill the render target is cleared with before the pose, when the
     /// adaptor clears it.
     pub(crate) fn clear_fill(&self) -> Option<[u8; 4]> {
-        self.clear
-            .then(|| super::player::clear_fill(self.clear_color))
+        self.clear.then(|| argb_fill(self.clear_color))
     }
+}
+
+/// The fill the adaptor's render target is cleared with: the colour stored
+/// as `0xAARRGGBB`.
+fn argb_fill(color: i32) -> [u8; 4] {
+    let value = color as u32;
+    [
+        (value >> 16) as u8,
+        (value >> 8) as u8,
+        value as u8,
+        (value >> 24) as u8,
+    ]
 }
 
 /// The `Motion.D3DAdaptor`'s render target: the layer the pose is composited

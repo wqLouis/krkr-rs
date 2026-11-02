@@ -509,6 +509,141 @@ fn player_draw_leaves_the_target_uncleared_by_default() {
 }
 
 #[test]
+fn player_draw_does_not_clear_the_target_when_clear_is_enabled() {
+    let _lock = vm_lock();
+    let Some(env) = Env::with_reference_storage() else {
+        return;
+    };
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    // The ordinary draw path only resizes the target layer: it never clears
+    // the target's pixels, whatever `clearEnabled` says
+    // (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:1125-1134`).
+    // The flag steers the render path — the reference renders an item
+    // through a scratch surface of its own instead of drawing it straight
+    // onto the target (`reference/cpp/plugins/motionplayer/PlayerRenderInternal.cpp:443-451`)
+    // — and the clear colour is stored and never read
+    // (`reference/cpp/plugins/motionplayer/PlayerRender.cpp:11`,
+    // `reference/cpp/plugins/motionplayer/RuntimeSupport.h:271`).
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var w = new Window(); \
+         var target = new Layer(w, null); \
+         target.setSize(800, 1080); \
+         target.fillRect(0, 0, 800, 1080, 0xFFFF0000); \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\"; \
+         p.clearEnabled = true; \
+         p.setClearColor(0xFF00FF00); \
+         p.setOpacity(0); \
+         p.draw(new Motion.SeparateLayerAdaptor(target));"
+    ));
+    let pixels = env.pixels_of(800, 1080);
+    for (x, y) in [(10usize, 10usize), (400, 540), (790, 1070)] {
+        let offset = (y * 800 + x) * 4;
+        assert_eq!(
+            &pixels[offset..offset + 4],
+            &[255, 0, 0, 255],
+            "pixel ({x},{y}) keeps the prefilled red pose: the draw clears nothing"
+        );
+    }
+}
+
+#[test]
+fn player_draw_accumulates_the_target_alpha_across_frames() {
+    let _lock = vm_lock();
+    let Some(env) = Env::with_reference_storage() else {
+        return;
+    };
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    // The pose is composited over the target with the source-over blend,
+    // whose destination alpha is recomputed from the source's and the
+    // destination's alpha, so the target's alpha accumulates instead of
+    // being reset (`reference/cpp/core/visual/tvpgl.cpp:602-616`); the draw
+    // path clears nothing
+    // (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:1125-1134`).
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var w = new Window(); \
+         var target = new Layer(w, null); \
+         target.setSize(800, 1080); \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\"; \
+         p.setOpacity(0.5); \
+         p.draw(new Motion.SeparateLayerAdaptor(target));"
+    ));
+    let first = env.pixels_of(800, 1080).to_vec();
+    env.run("p.draw(new Motion.SeparateLayerAdaptor(target));");
+    let second = env.pixels_of(800, 1080).to_vec();
+    // The pose is drawn at half opacity, so the pixels it covers hold a
+    // partial alpha; the second draw adds the source-over factor to the
+    // alpha the first draw left.
+    let covered: Vec<usize> = (0..first.len() / 4)
+        .filter(|index| (32..=254).contains(&first[index * 4 + 3]))
+        .collect();
+    assert!(
+        !covered.is_empty(),
+        "the pose must cover pixels with a partial alpha"
+    );
+    let mut accumulated = false;
+    for index in covered {
+        let first_alpha = first[index * 4 + 3];
+        let second_alpha = second[index * 4 + 3];
+        assert!(
+            second_alpha >= first_alpha,
+            "the target's alpha is never reset: {first_alpha} became {second_alpha}"
+        );
+        accumulated |= second_alpha > first_alpha;
+    }
+    assert!(
+        accumulated,
+        "the source-over blend accumulates the target's alpha"
+    );
+}
+
+#[test]
+fn d3d_adaptor_clears_its_render_target_before_the_pose() {
+    let _lock = vm_lock();
+    let Some(env) = Env::with_reference_storage() else {
+        return;
+    };
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    // The adaptor owns its render target and clears it before every pose
+    // (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:969-972`,
+    // `reference/cpp/plugins/motionplayer/D3DAdaptor.cpp:135-152`), so the
+    // pixels the pose does not cover hold the adaptor's own clear colour.
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var w = new Window(); \
+         var adaptor = new Motion.D3DAdaptor(w, 800, 1080, 400, 540); \
+         adaptor.canvasCaptureEnabled = 1; \
+         adaptor.setClearColor(0xFFFF0000); \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\"; \
+         p.draw(adaptor);"
+    ));
+    // The adaptor's render target is a detached layer: no window draws it.
+    let target = env
+        ._scene
+        .layers
+        .iter()
+        .find(|layer| layer.window == u32::MAX)
+        .expect("the adaptor's render target");
+    let bitmap = target.bitmap.expect("the render target's image");
+    let pixels = bitmap_pixels(&env, bitmap);
+    assert!(
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| (pixel[0], pixel[1], pixel[2], pixel[3]) == (255, 0, 0, 255)),
+        "the adaptor's render target is cleared with the adaptor's clear colour"
+    );
+}
+
+#[test]
 fn player_draw_leaves_the_target_layer_geometry_and_visibility_alone() {
     let _lock = vm_lock();
     let Some(env) = Env::with_reference_storage() else {

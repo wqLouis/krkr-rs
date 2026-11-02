@@ -122,7 +122,7 @@ The namespace also holds the aliased class objects: `Motion.Player`,
 | `findMotion(name)` | method | resolves the motion, binds it and returns the module object; a miss returns void (`reference/cpp/plugins/motionplayer/Player.h:301`, `PlayerResource.cpp:68-79`) |
 | `requireLayerId(name)` | method | leases a layer id; arity 1 (`reference/cpp/plugins/motionplayer/Player.h:302`) |
 | `releaseLayerId(id)` | method | releases a leased layer id; arity 1 (`reference/cpp/plugins/motionplayer/Player.h:303`) |
-| `setClearColor(color)` | method | the clear colour; arity 1 (`reference/cpp/plugins/motionplayer/Player.h:306`) |
+| `setClearColor(color)` | method | the clear colour; arity 1 (`reference/cpp/plugins/motionplayer/Player.h:306`). The colour changes no pixel: the reference stores it and never reads it (`reference/cpp/plugins/motionplayer/PlayerRender.cpp:11`, `reference/cpp/plugins/motionplayer/RuntimeSupport.h:271`) |
 | `setResizable(flag)` | method | the resizable flag; arity 1 (`reference/cpp/plugins/motionplayer/Player.h:307`) |
 | `removeAllTextures()` | method | drops the registered textures (`reference/cpp/plugins/motionplayer/Player.h:308`) |
 | `removeAllBg()` | method | drops the registered backgrounds (`reference/cpp/plugins/motionplayer/Player.h:309`) |
@@ -234,7 +234,7 @@ The namespace also holds the aliased class objects: `Motion.Player`,
 | `cameraFOV` | property (read/write) | the camera field of view |
 | `cameraAlive` | property (read/write) | the camera-alive flag |
 | `canvasCaptureEnabled` | property (read/write) | the canvas-capture flag |
-| `clearEnabled` | property (read/write) | whether the draw clears the target before compositing |
+| `clearEnabled` | property (read/write) | the render-path flag: the reference selects with it whether an item is drawn through a scratch surface of its own (`reference/cpp/plugins/motionplayer/PlayerRenderInternal.cpp:443-451`). It never clears the target layer (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:1125-1134`), and the port draws every item straight onto the target, so the flag changes no pixel |
 | `hitThreshold` | property (read/write) | the hit-test threshold |
 | `preview` | property (read/write) | the preview flag; preview playback does not splice the child motions |
 | `outsideFactor` | property (read/write) | the outside force factor |
@@ -500,9 +500,17 @@ layer's image through the engine's layer system:
 
 * the target image is **not cleared** by the ordinary draw path: the pose is
   painted over whatever the target already holds, so pixels the pose does not
-  cover survive (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:1127-1131`,
-  `PlayerRenderInternal.cpp:444-451`). The port clears the target only when
-  `Player.clearEnabled` is set, using the clear colour.
+  cover survive and the target's alpha accumulates from frame to frame
+  (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:1125-1134`,
+  `reference/cpp/core/visual/tvpgl.cpp:602-616`). `Player.clearEnabled`
+  selects the render path — an item is drawn through a scratch surface of its
+  own instead of straight onto the target
+  (`reference/cpp/plugins/motionplayer/PlayerRenderInternal.cpp:443-451`) —
+  and `Player.setClearColor` writes a colour nothing reads
+  (`reference/cpp/plugins/motionplayer/PlayerRender.cpp:11`,
+  `reference/cpp/plugins/motionplayer/RuntimeSupport.h:271`). The port draws
+  every item straight onto the target, so neither the flag nor the colour
+  changes a pixel.
 * each icon source is multiplied by the node's four packed vertex colours,
   bilinearly interpolated across the source. The reference's default
   half-gray and opaque-white sets are neutral and leave the source untouched
@@ -578,7 +586,10 @@ composes with.
 
 * `Player.draw(adaptor)` paints the pose into that render target, and the
   adaptor's own `clearEnabled` and clear colour decide whether the target is
-  cleared first. The route is gated on the adaptor's `canvasCaptureEnabled`:
+  cleared first: the adaptor fills its render texture before every pose
+  (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:969-972`,
+  `reference/cpp/plugins/motionplayer/D3DAdaptor.cpp:135-152`). The route is
+  gated on the adaptor's `canvasCaptureEnabled`:
   an adaptor that does not capture the canvas renders nothing
   (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:981-990`).
 * `adaptor.captureCanvas(layer)` copies the render target into the layer's
@@ -732,7 +743,7 @@ A draw target that names no layer, a `Point` or `Quad` hit test and a
 
 | file | what it pins |
 |---|---|
-| `crates/compat/tests/motion_player.rs` | the namespace constants and the subclass placement (top-level versus `Motion.*`), the geometry hit-test classes, the `LayerGetter` defaults and its array identity, the resource manager's layer-id allocator and the decrypt seed, the `D3DEmoteModule` class statics, the player's property surface, the variable and timeline queries, the arity gates, the `onFindMotion` override, the emote shell, the PSB module load and unload, the `motionKey` candidate list, the `ShortCutInitial*` globals, the `SeparateLayerAdaptor` owner, the layer getter, the colour-weight channel order, the progress gate and the dropped delta, the image-wait/movie-wait `canSync` split, and the draw path (texture sampling, the draw affine, the node colour tint, the uncleared target, the untouched target geometry, the reused allocation, the `psb://` media registration, the D3D adaptor's render target and its capture) |
+| `crates/compat/tests/motion_player.rs` | the namespace constants and the subclass placement (top-level versus `Motion.*`), the geometry hit-test classes, the `LayerGetter` defaults and its array identity, the resource manager's layer-id allocator and the decrypt seed, the `D3DEmoteModule` class statics, the player's property surface, the variable and timeline queries, the arity gates, the `onFindMotion` override, the emote shell, the PSB module load and unload, the `motionKey` candidate list, the `ShortCutInitial*` globals, the `SeparateLayerAdaptor` owner, the layer getter, the colour-weight channel order, the progress gate and the dropped delta, the image-wait/movie-wait `canSync` split, and the draw path (texture sampling, the draw affine, the node colour tint, the uncleared target, the target that `clearEnabled` leaves alone, the alpha that accumulates across frames, the untouched target geometry, the reused allocation, the `psb://` media registration, the D3D adaptor's render target, its clear and its capture) |
 | `crates/compat/tests/emote_player.rs` | the loader shim defines no globals of its own and the `motionplayer.dll` classes are reachable through it |
 | `crates/compat/src/natives/plugins/motion_player/model.rs` unit tests | the icon canvas geometry, the child motion expansion and its clock, the frame evaluation by time, the visibility of a contentless frame, the origin interpolation, the action/sync keyframe scan (the container's layer list before the clips' layer arrays, the doubled top layer, the nested layer and the sync marker types) and the frame curves |
 | `crates/compat/src/natives/plugins/motion_player/player.rs` unit tests | the replay of a short clip after a long one, the queuing gate and the dropped delta, the canSync loop-time gate before the first full frame, the `inheritMask` root/parent matrix split, the reset of the evaluation time on replay, the nearest-texel sampling of a scaled placement, the child motion's start at its parent keyframe, the action and sync dispatch, the packed colour order, the shape hit test, the logo's held corner and transition, the inherited parent matrix, the node matrix order, the draw affine, the shared label and the layer getter list, and the node blend mode |
