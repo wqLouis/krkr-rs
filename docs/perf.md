@@ -4,7 +4,7 @@
 the **engine load** (process start → the first frame) and the **scene load**
 (a scenario's assets → the objects a script sees) — with the profile that
 names the hotspot in each, and the changes that took the scene load from
-~370 ms to ~80 ms and a packed image's tiles from ~3 s to ~84 ms.
+~370 ms to ~80 ms and a packed image's tiles from ~955 ms to ~3 ms.
 
 It is a **measurement record**, not a contract: the numbers are one host,
 one game and one build (see §1), and they are here so the next change can be
@@ -316,37 +316,56 @@ shared class members) from ~160 ms to ~80 ms.
 
 ### 3.7 The packed image's tiles
 
-The scene change's heaviest asset is a packed image: a `.pimg` file that is
-a PSB container, read through the `var://` media. The game's own
+A scene change's heaviest asset is a packed image: a `.pimg` file that is a
+PSB container, read through the `var://` media. The game's own
 `system/packimage.tjs` holds each container in a `PackImageInfo`, and the
 script reads a tile through `var://./packImageMap/<name>/root/<tile>`.
 
-The reference's `var://` media walks the script object graph to reach that
-member (`reference/cpp/plugins/varfile.cpp:291-346`), and the graph's
-`root` member is the `PSBFile.root` property, which rebuilds the
-container's whole root dictionary and copies every resource of the container
-into a fresh octet (`reference/cpp/plugins/psbfile/PSBValue.cpp:201-204`).
-So **a tile read cost the whole container**, and a packed image with N
+The `var://` media has no storage of its own — its whole state is a
+refcount (`reference/cpp/plugins/varfile.cpp:364-365`) — so it answers a
+read by **walking the script object graph**: from the global object, every
+path segment is a member of the object the previous segment named
+(`reference/cpp/plugins/varfile.cpp:291-340`). Nothing caches the walk, so
+every read walks again.
+
+The segment that costs is `root`. It is `PSBFile.root`, a native property
+read, so the VM invokes its getter on every read
+(`reference/cpp/plugins/psbfile/main.cpp:137`, `main.cpp:29-44`): it builds
+a **fresh** object from the container's whole parsed tree, and every
+resource in it is **copied** into a fresh octet
+(`reference/cpp/plugins/psbfile/PSBValue.cpp:201-204`; the copy itself at
+`reference/cpp/core/tjs2/tjsVariant.cpp:27-28`). The parse is not repeated
+— the reference caches it in the `PSBFile` instance
+(`reference/cpp/plugins/psbfile/PSBFile.h:132,31-33`) — but the projection
+is, so **one tile read cost the whole container**, and a packed image with N
 visible layers paid that N times over.
 
-The media now answers a tile from the container itself: a container that a
-load publishes is looked up by the path the script reads it under, and the
-tile's bytes are copied out of it — the container's own resource, not the
-container.
+The media now answers a tile from the container itself: a load publishes the
+container under the path the script reads it through, and the media looks
+the path up there first — a name lookup, a chunk lookup, and a copy of that
+one resource's bytes. The graph walk stays as the fallback for anything
+that is not published.
 
 Measured on the game's largest packed image (`ev122a.pimg`, 12 558 815
-bytes, 147 members):
+bytes, 147 members), through the storage's media API:
 
 | | cost |
 |---|---|
-| the container rebuild — the old cost of every tile | 20.6 ms |
-| the load (the parse) | 9.7 ms |
-| one tile read | 2.3 ms |
-| **all 147 tiles, the old path** | **3.03 s** |
-| **all 147 tiles, the new path** | **83.9 ms** |
+| the load (the parse), once per container | 8.7 ms |
+| the projection of the whole container — the old cost of every tile | 6.5 ms |
+| one tile read through the media | 4.9 µs |
+| **all 147 tiles, the old path** | **955 ms** |
+| **all 147 tiles, the new path** | **3.0 ms** |
 
-**The same work is 36× faster**, and the whole packed image now costs
-about the time one of its tiles used to.
+**~320×, and the whole packed image now costs about the time one of its
+tiles used to.** The old path copied the container 147 times — about 1.8 GB
+of memcpy and 21 609 VM objects — to deliver 12.5 MB of tiles; the new path
+copies each tile's own bytes once and builds no VM objects at all.
+
+What is left of the quadratic is the two lookups a tile read still does — a
+linear scan of the container's members and of its chunk table — 0.24 µs and
+0.03 µs per tile. Replacing them with hash maps would buy 0.3 µs per tile;
+it is not worth the shape.
 
 This is a performance divergence and not a behaviour change: the bytes, the
 names, the path grammar and the failures are the same, and the reference
@@ -354,4 +373,5 @@ still pays the quadratic. The reference's own async graphic loader does the
 read and the decode on a worker, so its tile reads overlap where ours now
 do too.
 
+---
 ---

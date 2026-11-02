@@ -218,12 +218,16 @@ fn build_value(
         PsbValue::Float(value) => Ok(Built::Scalar(TjsValue::Real(f64::from(*value)))),
         PsbValue::Double(value) => Ok(Built::Scalar(TjsValue::Real(*value))),
         PsbValue::String(value) => Ok(Built::Scalar(TjsValue::String(value.clone()))),
-        PsbValue::Resource(reference) => Ok(Built::Octet(
-            document
-                .resource_bytes(*reference)
-                .unwrap_or_default()
-                .to_vec(),
-        )),
+        PsbValue::Resource(reference) => {
+            let Some(bytes) = document.resource_bytes(*reference) else {
+                let table = if reference.extra { "extra" } else { "normal" };
+                return Err(format!(
+                    "the container carries no bytes for the resource {} of the {table} chunk table",
+                    reference.index
+                ));
+            };
+            Ok(Built::Octet(bytes.to_vec()))
+        }
         PsbValue::Array(values) => {
             let array = array_new(host)?;
             for value in values {
