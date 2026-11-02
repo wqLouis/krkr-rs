@@ -112,7 +112,7 @@ fire.
 - `surface-lock` regenerates the VM dispatch dump by running the compat
   surface test unless `--no-regen` is given; `--update` rewrites the committed
   baseline and is main-agent only.
-- `vendor-tjs2.sh` re-vendors the C++ TJS2 core and re-applies
-  `patches/tjs2-krkr-rs.patch`. Every edit under `crates/tjs/cpp/tjs2/**` must
-  be recorded in that patch, or the next re-vendor drops it; see
+- `tjs2-diff.sh` prints the difference between the C++ TJS2 tree under
+  `crates/tjs/cpp/tjs2/` and the reference checkout. The tree is edited in
+  place and never regenerated from the reference; see
   [`../docs/rules/gates.md`](../docs/rules/gates.md) §7.

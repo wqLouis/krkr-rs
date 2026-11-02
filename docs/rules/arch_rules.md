@@ -45,7 +45,7 @@ app          the composition root: choose the platform, wire L1..L4, run the
 
 | crate | layer | role |
 |---|---|---|
-| `tjs` | vendored | the C++ TJS2 VM behind an FFI; unchanged, all-FFI |
+| `tjs` | vendored | the C++ TJS2 VM behind an FFI; maintained in place, all-FFI |
 | `api` | L1 | shared DTOs and the typed `*Error` enums; no implementations |
 | `fs` | L1 | the stateless `FileSystem`/`FileState` and the XP3 read/parse |
 | `media` | L1 | the stateless `Media` and the image/audio/video decode |

@@ -114,7 +114,7 @@ abstraction is leaking and the generic behaviour moves down.
 | `crates/engine` | L2 | the generic game engine; owns engine state | `Engine`, `Scene`, `projection`, `translate::PixelTranslation`, `storage::Storage`, `sound::Mixer`, `text::TextEngine`, `timer::TimerState`, `video::VideoOverlay`, `trans::Trans` |
 | `crates/compat` | L3 | native classes + KAG + event adapter + plugins | `CompatHost`, `CompatCtx`/`CompatServices`, `engine_api` (the seam), `natives::*` |
 | `crates/vm` | L4 | TJS VM host over `tjs` | `VmHost`, `FrameCtx` |
-| `crates/tjs` | vendored | the C++ TJS2 VM, all-FFI | `Tjs2Engine`, the native-class builder, the `tjs2_*` C surface |
+| `crates/tjs` | vendored | the C++ TJS2 VM, maintained in place, all-FFI | `Tjs2Engine`, the native-class builder, the `tjs2_*` C surface |
 | `crates/app` | root | the desktop composition root | `Host`, `GameHost`, `VmHook`, `run` |
 | `crates/android` | root | the Android composition root | `android-activity` `GameActivity` loop, JNI wiring, `krkr.log`, `krkr_state.json` |
 | `crates/testkit` | dev | shared test helpers (dev-dependencies only) | — |

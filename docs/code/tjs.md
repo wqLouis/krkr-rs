@@ -25,11 +25,12 @@ instance and drives it; see [vm.md](vm.md) and
 | the Rust binding | `crates/tjs/src/lib.rs` — the `tjs2_*` `extern "C"` surface and the safe wrapper |
 | the build script | `crates/tjs/build.rs` |
 
-The vendored tree is the authority on what TJS means, and the behaviour it
-defines is the behaviour the compatibility layer must reproduce. A change
-to it is a patch on the reference's tree: `scripts/patches/tjs2-krkr-rs.patch`
-holds every krkr-rs change, and `scripts/vendor-tjs2.sh` re-applies them
-when the tree is re-vendored.
+The tree is the authority on what TJS means, and the behaviour it defines is
+the behaviour the compatibility layer must reproduce. It is maintained in
+place: the VM is edited there directly and is never regenerated from the
+reference. The reference checkout is read-only material — the behaviour
+oracle — and `scripts/tjs2-diff.sh` prints what the tree has changed against
+it.
 
 ---
 

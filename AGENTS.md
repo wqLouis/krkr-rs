@@ -218,10 +218,10 @@ The test suite and the benchmarks use three environment variables —
 [`scripts/README.md`](scripts/README.md).
 
 A plain build does **not** need the reference checkout (§1.3): the C++ VM is
-vendored under `crates/tjs/cpp/tjs2/`. `scripts/vendor-tjs2.sh` does need it,
-and it re-applies `scripts/patches/tjs2-krkr-rs.patch` — every change under
-`crates/tjs/cpp/tjs2/` must be recorded in that patch, or the next re-vendor
-drops it.
+vendored under `crates/tjs/cpp/tjs2/`, and that tree is maintained in place
+— the VM is edited there directly and is never regenerated from the
+reference. `scripts/tjs2-diff.sh` reads the reference checkout and prints
+what the tree has changed, when that difference has to be reviewed.
 
 ### 1.3 Get the reference
 
@@ -303,7 +303,7 @@ Crate roles:
 
 | crate | path | layer | role |
 |---|---|---|---|
-| `tjs` | `crates/tjs` | vendored | C++ TJS2 VM FFI (unchanged, all-FFI) |
+| `tjs` | `crates/tjs` | vendored | C++ TJS2 VM FFI (maintained in place, all-FFI) |
 | `api` | `crates/platform/api` | L1 | shared DTOs + typed `*Error` enums, no impls |
 | `fs` | `crates/platform/fs` | L1 | stateless `FileSystem`/`FileState` + XP3 read/parse |
 | `media` | `crates/platform/media` | L1 | stateless `Media` + image/audio/video decode |

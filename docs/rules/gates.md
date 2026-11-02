@@ -211,21 +211,15 @@ tag, not a file: there is no separate version bump step.
 
 ---
 
-## 7. Vendored TJS2 and the patch file
+## 7. The TJS2 tree
 
-`crates/tjs/cpp/tjs2/` is a vendored copy of the reference C++ TJS2 VM. The
-krkr-rs edits to it — including the undefined-behaviour fixes the compiler
-would otherwise exploit at `-O1` and above — live in
-`scripts/patches/tjs2-krkr-rs.patch`, a unified diff against the reference
-tree.
-
-`scripts/vendor-tjs2.sh` re-copies the reference sources, applies that patch
-with `patch -p1 --fuzz=0`, and then fails if a patch marker is missing. This
-is deliberate: a re-vendor that silently drops a fix is the failure mode the
-script exists to prevent. **Any new change under `crates/tjs/cpp/tjs2/` must
-be added to the patch file**, or the next re-vendor will remove it. The script
-header explains how to regenerate the patch from a diff of the reference and
-the vendored tree.
+`crates/tjs/cpp/tjs2/` is the C++ TJS2 VM, maintained in this repository and
+edited in place — including the undefined-behaviour fixes the compiler would
+otherwise exploit at `-O1` and above. The tree is never regenerated from the
+reference checkout, so a change to it is an ordinary change here and needs
+no separate record. The reference checkout (§1.3 of `AGENTS.md`) is read-only
+material — the behaviour oracle — and `scripts/tjs2-diff.sh` prints the
+difference between the tree and it.
 
 ---
 

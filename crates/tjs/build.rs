@@ -1,23 +1,20 @@
 //! build.rs for tjs.
 //!
-//! Compiles the C++ TJS2 scripting VM from the krkr2 reference checkout
-//! directly with a C++ compiler (default: `zig c++`, no cmake), plus the C ABI
-//! shim in `cpp/tjs2_abi.cpp`, and statically links the result into the Rust
-//! binary.
+//! Compiles the C++ TJS2 scripting VM in this repository directly with a C++
+//! compiler (default: `zig c++`, no cmake), plus the C ABI shim in
+//! `cpp/tjs2_abi.cpp`, and statically links the result into the Rust binary.
 //!
 //! Pipeline:
 //!   1. run `zig build` in `../../deps` (fetches fmt/spdlog/boost/oniguruma
 //!      via the zig package manager and stages headers + libonig.a into
 //!      `$OUT_DIR/zig-out`)
-//!   2. locate the reference checkout (env `KRKR2_REFERENCE` or
-//!      `../../reference` relative to this crate)
-//!   3. run `bison` on `bison/tjs.y`, `bison/tjsdate.y`, `bison/tjspp.y`
+//!   2. run `bison` on `bison/tjs.y`, `bison/tjsdate.y`, `bison/tjspp.y`
 //!      into `$OUT_DIR/gen`
-//!   4. run `python3 script/create_world_map.py` to generate
+//!   3. run `python3 script/create_world_map.py` to generate
 //!      `tjsDateWordMap.inc`
-//!   5. compile all tjs2 `.cpp` sources + the shim with the C++ compiler
+//!   4. compile all tjs2 `.cpp` sources + the shim with the C++ compiler
 //!      (`-std=c++17 -fPIC`, defines matching the upstream CMake)
-//!   6. archive into `libtjs2_core.a` and emit `cargo:rustc-link-*` for
+//!   5. archive into `libtjs2_core.a` and emit `cargo:rustc-link-*` for
 //!      libonig.a and the C++ runtime (libc++).
 //!
 //! Cross-compilation
@@ -442,11 +439,11 @@ fn main() {
         build_onig_direct(cc, &ar, &onig_src, &deps_out, &profile)
     });
 
-    // -- locate the tjs2 sources (vendored copy, patched for krkr-rs) -------
+    // -- locate the tjs2 sources (the VM's C++ tree) ------------------------
     let tjs2_dir = manifest_dir.join("cpp/tjs2");
     if !tjs2_dir.join("tjs.cpp").is_file() {
         fail(&format!(
-            "vendored tjs2 sources not found at {} — run `./scripts/vendor-tjs2.sh` to (re)vendor from the reference checkout",
+            "tjs2 sources not found at {} — the VM's C++ tree belongs in crates/tjs/cpp/tjs2",
             tjs2_dir.display()
         ));
     }
