@@ -374,4 +374,48 @@ read and the decode on a worker, so its tile reads overlap where ours now
 do too.
 
 ---
+
+## 4. The reports that name a slow step
+
+Two reports name where a slow step went. Both are **observations**: neither
+changes what a load, a decode, a container or a frame does.
+
+### 4.1 The slow frame
+
+A frame whose gap reaches 250 ms (`SLOW_FRAME_MS`) logs one line that
+attributes the gap. The line names the **previous** frame's phases (the
+five polls), the VM tick's segments, the host's costs and the GPU's costs.
+
+The line also names the **decode pool's own work** over that frame:
+
+| field | meaning |
+|---|---|
+| `pool_jobs` | the number of jobs the decode pool completed during the frame |
+| `pool_ms` | the time the pool spent running them |
+
+The pool's counters are cumulative for the pool's whole life, so the report
+takes the difference between the counters at the end of the frame and the
+counters at its start: a frame that waited for decodes is told apart from a
+frame that ran script. A frame in which the pool ran nothing reports zero. A
+job is counted when it **completes**, so a decode that finishes during the
+next frame is counted there — the numbers name the pool's work, not the frame
+that waited for it.
+
+### 4.2 The slow load
+
+A single step that took longer than 50 ms is reported with its phase times:
+
+| report | phases |
+|---|---|
+| the image load (the deferred path) | `resolve` (the name lookup and the scheduling of the read), `storage_read` (the bytes the scheduled read produced), `header_probe` (the decoder's look at the header, which yields the size) |
+| the image load (the synchronous path) | `storage_read`, `decode` — the decode runs on the calling thread on that path |
+| the container load | `storage_read`, `parse` — the container's parse |
+| the root dictionary's build | the build's own duration |
+| the `psb://` read | `lookup`, `copy` |
+
+Every report is bounded: a step below the threshold is never reported, and a
+step above it is reported at most once every five seconds, so a step that is
+slow in every frame does not report in every frame.
+
+---
 ---

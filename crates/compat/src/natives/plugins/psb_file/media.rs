@@ -19,8 +19,11 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
+use super::SlowReporter;
 use super::container::{PsbDocument, PsbValue, ResourceRef};
+use super::is_slow;
 use super::normalize_psb_domain;
 use crate::CompatServices;
 use crate::collections::Map;
@@ -99,6 +102,8 @@ impl PsbContainer {
 pub(crate) struct PsbMedia {
     /// The registered containers, by their normalized name.
     containers: RefCell<Map<String, Rc<PsbContainer>>>,
+    /// The reporter that keeps the slow-read report bounded.
+    reporter: RefCell<SlowReporter>,
 }
 
 impl PsbMedia {
@@ -146,6 +151,26 @@ impl PsbMedia {
         let reference = entry.resource(member)?;
         Some((Rc::clone(&entry.document), reference))
     }
+
+    /// Reports a read that took longer than the threshold.
+    ///
+    /// The line names the phases: the lookup and the copy of the resource's
+    /// bytes. The report is bounded: the reporter keeps the interval
+    /// between two reports, so a read that is slow in every frame does not
+    /// report in every frame.
+    fn report_slow_read(&self, path: &str, elapsed: Duration, lookup_ms: f64, copy_ms: f64) {
+        if !is_slow(elapsed) {
+            return;
+        }
+        let mut reporter = self.reporter.borrow_mut();
+        if !reporter.is_due() {
+            return;
+        }
+        log::warn!(
+            "psb: the read of psb://{path} took {:.1} ms (lookup={lookup_ms:.1} copy={copy_ms:.1})",
+            elapsed.as_secs_f64() * 1000.0,
+        );
+    }
 }
 
 impl VarContainer for PsbContainer {
@@ -183,18 +208,28 @@ impl StorageMedia for PsbProvider {
     }
 
     fn read(&self, path: &str) -> Result<Vec<u8>, StorageReadError> {
+        let started = Instant::now();
         let Some((document, reference)) = self.media.lookup(path) else {
             // A member the container does not hold is a missing storage, not
             // a failure: the caller decides what a missing member means.
             return Err(StorageReadError::NotFound(path.to_string()));
         };
-        document
+        let lookup_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let copy_started = Instant::now();
+        let bytes = document
             .resource_bytes(reference)
             .map(<[u8]>::to_vec)
             .ok_or_else(|| StorageReadError::Media {
                 media: "psb".to_string(),
                 message: format!("the container carries no bytes for psb://{path}"),
-            })
+            })?;
+        self.media.report_slow_read(
+            path,
+            started.elapsed(),
+            lookup_ms,
+            copy_started.elapsed().as_secs_f64() * 1000.0,
+        );
+        Ok(bytes)
     }
 }
 

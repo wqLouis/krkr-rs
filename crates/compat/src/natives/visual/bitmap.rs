@@ -5,6 +5,7 @@ use std::ffi::{c_char, c_int, c_void};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::engine_api::{
     BitmapState, DecodePass, DecodedImageKey, DecodedImageMode, PendingImage, Scene, Storage,
@@ -462,8 +463,11 @@ pub(crate) fn decode_storage_image_uncached(
     let storage = services
         .storage()
         .ok_or_else(|| "no storage attached".to_string())?;
+    let started = Instant::now();
     // SAFETY: `attach_storage` guarantees the pointer stays valid.
     let (resolved, bytes) = read_image_from_storage(unsafe { &*storage }, name)?;
+    let read_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let decode_started = Instant::now();
     let image = match mode {
         DecodedImageMode::Full => {
             let image = decode_image(services, &resolved, &bytes)?;
@@ -490,6 +494,13 @@ pub(crate) fn decode_storage_image_uncached(
             image
         }
     };
+    report_slow_sync_load(
+        services,
+        name,
+        started.elapsed(),
+        read_ms,
+        decode_started.elapsed().as_secs_f64() * 1000.0,
+    );
     Ok(image)
 }
 
@@ -588,6 +599,117 @@ fn install_decoded_image(
     Ok((id, width, height))
 }
 
+/// A load that took longer than this many milliseconds is reported in the
+/// log.
+///
+/// The threshold is a few tens of milliseconds: a faster load is a normal
+/// one, and only the slow ones are reported.
+const SLOW_LOAD_MS: f64 = 50.0;
+
+/// The minimum interval between two reports of a slow load.
+///
+/// A load that runs in every frame would report in every frame; the
+/// interval keeps the log readable while the problem stays visible.
+const SLOW_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The reporter that keeps the slow-load report bounded.
+///
+/// The reporter holds the time of its last report, so a load that is slow
+/// in every frame is reported once per interval instead of once per frame.
+#[derive(Default)]
+struct SlowLoadReporter {
+    /// The time of the last report.
+    last: Option<Instant>,
+}
+
+impl SlowLoadReporter {
+    /// Whether a report is due: the last one is at least the interval old.
+    ///
+    /// The check is what keeps the report bounded: a load that is slow in
+    /// every frame is reported once per interval instead of once per frame.
+    fn is_due(&mut self) -> bool {
+        let now = Instant::now();
+        let due = self
+            .last
+            .is_none_or(|last| now.duration_since(last) >= SLOW_REPORT_INTERVAL);
+        if due {
+            self.last = Some(now);
+        }
+        due
+    }
+}
+
+/// Whether a load that took `elapsed` is slow enough to report.
+///
+/// The threshold is what keeps the report quiet: a faster load is a normal
+/// one.
+fn is_slow(elapsed: Duration) -> bool {
+    elapsed.as_secs_f64() * 1000.0 >= SLOW_LOAD_MS
+}
+
+/// The phases of one image load.
+///
+/// The load is timed as a whole and in its phases: the name resolution (the
+/// lookup and the scheduling of the read), the storage read (the bytes the
+/// scheduled read produces) and the header probe (the decoder's look at the
+/// header, which yields the image's size).
+#[derive(Clone, Copy, Default)]
+struct LoadPhases {
+    /// The time the name resolution took.
+    resolve_ms: f64,
+    /// The time the storage read took.
+    read_ms: f64,
+    /// The time the header probe took.
+    probe_ms: f64,
+}
+
+/// Reports a load that took longer than the threshold.
+///
+/// The line names the phases, so a reader can see which one cost what. The
+/// report is bounded: the reporter keeps the interval between two reports,
+/// so a load that is slow in every frame does not report in every frame.
+fn report_slow_load(services: &CompatServices, name: &str, elapsed: Duration, phases: LoadPhases) {
+    if !is_slow(elapsed) {
+        return;
+    }
+    let mut reporter = services.state::<SlowLoadReporter>();
+    if !reporter.is_due() {
+        return;
+    }
+    log::warn!(
+        "image: the load of {name:?} took {:.1} ms (resolve={:.1} storage_read={:.1} header_probe={:.1})",
+        elapsed.as_secs_f64() * 1000.0,
+        phases.resolve_ms,
+        phases.read_ms,
+        phases.probe_ms,
+    );
+}
+
+/// Reports a synchronous load that took longer than the threshold.
+///
+/// The line names the phases: the storage read (the name resolution and the
+/// bytes it produced) and the decode, which runs on the calling thread on
+/// this path. The report is bounded like the deferred one.
+fn report_slow_sync_load(
+    services: &CompatServices,
+    name: &str,
+    elapsed: Duration,
+    read_ms: f64,
+    decode_ms: f64,
+) {
+    if !is_slow(elapsed) {
+        return;
+    }
+    let mut reporter = services.state::<SlowLoadReporter>();
+    if !reporter.is_due() {
+        return;
+    }
+    log::warn!(
+        "image: the synchronous load of {name:?} took {:.1} ms (storage_read={read_ms:.1} decode={decode_ms:.1})",
+        elapsed.as_secs_f64() * 1000.0,
+    );
+}
+
 /// A pending image load: the decode that is already running for the image,
 /// or the entry the load reads.
 ///
@@ -604,6 +726,9 @@ pub(crate) enum PendingLoad {
         name: String,
         /// The entry the load reads.
         entry: ResolvedImage,
+        /// The time the name resolution took: the lookup and the scheduling
+        /// of the read.
+        resolve: Duration,
     },
 }
 
@@ -660,11 +785,13 @@ pub(crate) fn resolve_pending_load(
     let storage = services
         .storage()
         .ok_or_else(|| "no storage attached".to_string())?;
+    let started = Instant::now();
     // SAFETY: `attach_storage` guarantees the pointer stays valid.
     let entry = resolve_image(unsafe { &*storage }, name)?;
     Ok(Some(PendingLoad::Entry {
         name: name.to_string(),
         entry,
+        resolve: started.elapsed(),
     }))
 }
 
@@ -673,6 +800,9 @@ pub(crate) fn resolve_pending_load(
 /// The probe runs on the calling thread: the load's size is known before the
 /// call returns, and the probe's failure is raised at the call, the way a
 /// load failure is raised there.
+///
+/// The load is timed as a whole and in its phases, and a load that took
+/// longer than the threshold is reported with the phase times.
 ///
 /// Returns the probed size and the future the result lands in, or `None` when
 /// the deferred path does not apply: the pool refused the job. The caller
@@ -691,21 +821,66 @@ pub(crate) fn submit_pending_load(
     colorkey: u32,
     mode: DecodedImageMode,
 ) -> Result<Option<(u32, u32, PendingImage)>, ImageLoadError> {
-    let (name, entry) = match load {
+    let started = Instant::now();
+    let (name, entry, resolve) = match load {
         // A decode that is already running for this image: the load shares
         // it.
         PendingLoad::Running(width, height, pending) => {
             return Ok(Some((width, height, pending)));
         }
-        PendingLoad::Entry { name, entry } => (name, entry),
+        PendingLoad::Entry {
+            name,
+            entry,
+            resolve,
+        } => (name, entry, resolve),
     };
+    let mut phases = LoadPhases {
+        resolve_ms: resolve.as_secs_f64() * 1000.0,
+        ..LoadPhases::default()
+    };
+    let result = submit_resolved_load(ctx, &name, entry, colorkey, mode, &mut phases);
     // SAFETY: `ctx` is only created for a bound, live engine, so its service
     // pointer is valid for `submit_pending_load`.
+    let services = unsafe { ctx.services() };
+    report_slow_load(services, &name, resolve + started.elapsed(), phases);
+    result
+}
+
+/// Submits the decode of a resolved load, probing its header first.
+///
+/// The probe runs on the calling thread: the load's size is known before the
+/// call returns, and the probe's failure is raised at the call, the way a
+/// load failure is raised there.
+///
+/// The phases the load went through are recorded in `phases`: the storage
+/// read and the header probe.
+///
+/// Returns the probed size and the future the result lands in, or `None` when
+/// the deferred path does not apply: the pool refused the job. The caller
+/// then decodes synchronously. A colour key does not keep the load
+/// synchronous: the key is a pass over the decoded pixels, and the pool runs
+/// it on the worker.
+///
+/// # Errors
+///
+/// Returns the read or the probe failure. Both are raised at the call, the
+/// way a load failure is raised there: a name that does not resolve and an
+/// image the codec does not recognise never reach the pool.
+fn submit_resolved_load(
+    ctx: &CompatCtx,
+    name: &str,
+    entry: ResolvedImage,
+    colorkey: u32,
+    mode: DecodedImageMode,
+    phases: &mut LoadPhases,
+) -> Result<Option<(u32, u32, PendingImage)>, ImageLoadError> {
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service
+    // pointer is valid for `submit_resolved_load`.
     let services = unsafe { ctx.services() };
     let Some(pool) = decode_pool_mut(ctx) else {
         return Ok(None);
     };
-    let key = DecodedImageKey::new(&name, colorkey, mode, 0, 0);
+    let key = DecodedImageKey::new(name, colorkey, mode, 0, 0);
     // The name the image resolved under: the decoder picks its format from
     // it.
     let resolved_name = entry.name().to_string();
@@ -715,10 +890,14 @@ pub(crate) fn submit_pending_load(
     };
     // SAFETY: `attach_storage` guarantees the pointer stays valid.
     let storage = unsafe { &*storage_ptr };
+    let read_started = Instant::now();
     let bytes = entry.bytes(storage)?;
+    phases.read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
     // The header probe gives the dimensions the image is sized from, and it
     // rejects an image the load would have rejected at the call.
+    let probe_started = Instant::now();
     let info = probe_image(services, &resolved_name, &bytes)?;
+    phases.probe_ms = probe_started.elapsed().as_secs_f64() * 1000.0;
     let Some(expected) = decoded_size_bytes(info.width, info.height) else {
         return Ok(None);
     };
@@ -1996,4 +2175,25 @@ pub(super) fn register_bitmap_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
         ],
         properties: vec![],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A load below the threshold is never reported, a load above it is
+    /// reported once, and the next one is held back until the interval has
+    /// passed: the report stays bounded.
+    #[test]
+    fn the_slow_load_report_is_bounded() {
+        assert!(!is_slow(Duration::from_millis(10)), "a fast load");
+        assert!(is_slow(Duration::from_millis(80)), "a slow load");
+
+        let mut reporter = SlowLoadReporter::default();
+        assert!(reporter.is_due(), "the first slow load is reported");
+        assert!(
+            !reporter.is_due(),
+            "a second slow load inside the interval is held back"
+        );
+    }
 }

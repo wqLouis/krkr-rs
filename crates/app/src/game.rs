@@ -232,6 +232,41 @@ struct FrameCosts {
     total_ms: f64,
 }
 
+/// The decode pool's work over one frame.
+///
+/// The pool's counters are cumulative for the pool's whole life, so a
+/// frame's work is the difference between the counters at the end of the
+/// frame and the counters at its start. A frame in which the pool ran
+/// nothing reports zero.
+///
+/// A job is counted when it **completes**, so a decode that finishes during
+/// the next frame is counted there: the numbers name the pool's own work,
+/// not the frame that waited for it.
+#[derive(Clone, Copy, Default)]
+struct PoolWork {
+    /// The number of jobs the pool completed during the frame.
+    jobs: u64,
+    /// The time the pool spent running them, in milliseconds.
+    elapsed_ms: f64,
+}
+
+impl PoolWork {
+    /// The pool's work over the frame: the difference between the counters
+    /// at the end of the frame and the counters at its start.
+    ///
+    /// The counters are cumulative, so the difference is the frame's own
+    /// work. A host with no pool attached reports nothing.
+    fn between(before: Option<JobStats>, after: Option<JobStats>) -> Self {
+        let (Some(before), Some(after)) = (before, after) else {
+            return Self::default();
+        };
+        Self {
+            jobs: after.jobs.saturating_sub(before.jobs),
+            elapsed_ms: after.elapsed.saturating_sub(before.elapsed).as_secs_f64() * 1000.0,
+        }
+    }
+}
+
 /// The previous frame's measured attribution, kept so a slow gap names the
 /// frame it actually spans.
 ///
@@ -249,6 +284,8 @@ struct FrameAttribution {
     report: StepReport,
     /// The previous frame's GPU call costs, when the backend reports them.
     timings: Option<render::FrameTimings>,
+    /// The previous frame's decode-pool work.
+    pool: PoolWork,
     /// The previous frame's audio drain cost.
     audio_ms: f64,
     /// The previous frame's engine frame cost, excluding the frame hook.
@@ -267,12 +304,14 @@ impl FrameAttribution {
         tick: TickPhases,
         report: StepReport,
         timings: Option<render::FrameTimings>,
+        pool: PoolWork,
         costs: FrameCosts,
     ) {
         self.phases = phases;
         self.tick = tick;
         self.report = report;
         self.timings = timings;
+        self.pool = pool;
         self.audio_ms = costs.audio_ms;
         self.host_ms = costs.host_ms;
         self.total_ms = costs.total_ms;
@@ -290,7 +329,10 @@ impl FrameAttribution {
     /// so a non-zero value is loop overhead or a stall outside both the
     /// frame and the event poll. `tick_residual` is the VM tick not covered
     /// by the input segments and the five polls; `host_residual` is the
-    /// engine frame not covered by sync/project/render.
+    /// engine frame not covered by sync/project/render. `pool_jobs` and
+    /// `pool_ms` are the decode pool's own work over the frame: the jobs it
+    /// completed and the time they took, so a frame that waited for decodes
+    /// is told apart from a frame that ran script.
     fn slow_frame_line(&self, gap_ms: f64, pacing: FramePacing) -> Option<String> {
         if !self.valid || gap_ms < SLOW_FRAME_MS {
             return None;
@@ -308,7 +350,8 @@ impl FrameAttribution {
              sound={:.1} video={:.1} async={:.1} continuous={:.1} \
              frame_tail={:.1} body={:.1}; its vm: tick={:.1} \
              input_begin={:.1} input_events={:.1} input_end={:.1} \
-             tick_residual={tick_residual:.1}; its host: host_total={:.1} \
+             tick_residual={tick_residual:.1}; its pool: pool_jobs={} \
+             pool_ms={:.1}; its host: host_total={:.1} \
              audio={:.1} host_sync={:.1} sync_upload={:.1} sync_prune={:.1} \
              host_project={:.1} host_render={:.1} submit={:.1} \
              host_residual={host_residual:.1} total={:.1}; its gpu: acquire={:.1} \
@@ -326,6 +369,8 @@ impl FrameAttribution {
             tick.input_begin_ms,
             tick.input_events_ms,
             tick.input_end_ms,
+            self.pool.jobs,
+            self.pool.elapsed_ms,
             self.host_ms,
             self.audio_ms,
             report.sync_ms,
@@ -803,6 +848,11 @@ impl GameHost {
         // frame's input.
         let translation = self.host.engine().translation();
 
+        // The decode pool's counters are cumulative for the pool's whole
+        // life, so the frame's own work is the difference between the
+        // counters at its start and at its end.
+        let pool_before = self.host.engine().job_stats();
+
         let step_started = Instant::now();
         let (report, hook_ms, audio_ms) = {
             let mut hook = VmHook {
@@ -827,6 +877,7 @@ impl GameHost {
             self.polls.tick,
             report,
             self.host.last_frame_timings(),
+            PoolWork::between(pool_before, self.host.engine().job_stats()),
             FrameCosts {
                 audio_ms,
                 host_ms,
@@ -1226,6 +1277,10 @@ mod tests {
                 recreate_ms: 0.0,
                 fence_wait_ms: 0.5,
             }),
+            PoolWork {
+                jobs: 2,
+                elapsed_ms: 12.0,
+            },
             FrameCosts {
                 audio_ms: 3.0,
                 host_ms: host_render_ms + 1.0,
@@ -1233,6 +1288,37 @@ mod tests {
             },
         );
         attribution
+    }
+
+    /// The pool's counters are cumulative for the pool's whole life, so a
+    /// frame's work is the difference between the counters at the end of the
+    /// frame and the counters at its start. A frame in which the pool ran
+    /// nothing reports zero, and a host with no pool reports nothing.
+    #[test]
+    fn the_pool_work_is_the_delta_over_the_frame() {
+        let before = JobStats {
+            jobs: 7,
+            elapsed: Duration::from_millis(120),
+        };
+        let after = JobStats {
+            jobs: 9,
+            elapsed: Duration::from_millis(170),
+        };
+        let work = PoolWork::between(Some(before), Some(after));
+        assert_eq!(work.jobs, 2, "the frame's own jobs");
+        assert!(
+            (work.elapsed_ms - 50.0).abs() < 1e-9,
+            "the frame's own pool time was {}",
+            work.elapsed_ms
+        );
+
+        let idle = PoolWork::between(Some(after), Some(after));
+        assert_eq!(idle.jobs, 0, "a frame with no decode work");
+        assert_eq!(idle.elapsed_ms, 0.0, "a frame with no decode work");
+
+        let detached = PoolWork::between(None, None);
+        assert_eq!(detached.jobs, 0, "a host with no pool attached");
+        assert_eq!(detached.elapsed_ms, 0.0, "a host with no pool attached");
     }
 
     /// A fast frame emits nothing, even from a frame that was itself slow.
@@ -1286,6 +1372,8 @@ mod tests {
         assert!(line.contains("input_events=2.0"), "line was: {line}");
         assert!(line.contains("input_end=0.5"), "line was: {line}");
         assert!(line.contains("tick_residual=4.0"), "line was: {line}");
+        assert!(line.contains("pool_jobs=2"), "line was: {line}");
+        assert!(line.contains("pool_ms=12.0"), "line was: {line}");
         assert!(line.contains("host_total=11.0"), "line was: {line}");
         assert!(line.contains("host_render=10.0"), "line was: {line}");
         assert!(line.contains("host_sync=0.5"), "line was: {line}");
@@ -1330,6 +1418,7 @@ mod tests {
                 ..StepReport::default()
             },
             None,
+            PoolWork::default(),
             FrameCosts {
                 audio_ms: 0.0,
                 host_ms: 0.0,

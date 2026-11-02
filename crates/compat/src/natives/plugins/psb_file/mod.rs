@@ -84,6 +84,7 @@ use psd::error::PsbError;
 
 use std::ffi::{c_char, c_int, c_void};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
@@ -276,6 +277,113 @@ fn build_root(host: &Tjs2Engine, document: &PsbDocument) -> Result<DetachedValue
 }
 
 // ---------------------------------------------------------------------------
+// Slow-step reports
+// ---------------------------------------------------------------------------
+
+/// A step that took longer than this many milliseconds is reported in the
+/// log.
+///
+/// The threshold is a few tens of milliseconds: a faster step is a normal
+/// one, and only the slow ones are reported.
+const SLOW_STEP_MS: f64 = 50.0;
+
+/// The minimum interval between two reports of a slow step.
+///
+/// A step that runs in every frame would report in every frame; the
+/// interval keeps the log readable while the problem stays visible.
+const SLOW_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The reporter that keeps a slow-step report bounded.
+///
+/// The reporter holds the time of its last report, so a step that is slow
+/// in every frame is reported once per interval instead of once per frame.
+#[derive(Default)]
+struct SlowReporter {
+    /// The time of the last report.
+    last: Option<Instant>,
+}
+
+impl SlowReporter {
+    /// Whether a report is due: the last one is at least the interval old.
+    ///
+    /// The check is what keeps the report bounded: a step that is slow in
+    /// every frame is reported once per interval instead of once per frame.
+    fn is_due(&mut self) -> bool {
+        let now = Instant::now();
+        let due = self
+            .last
+            .is_none_or(|last| now.duration_since(last) >= SLOW_REPORT_INTERVAL);
+        if due {
+            self.last = Some(now);
+        }
+        due
+    }
+}
+
+/// Whether a step that took `elapsed` is slow enough to report.
+///
+/// The threshold is what keeps the report quiet: a faster step is a normal
+/// one.
+fn is_slow(elapsed: Duration) -> bool {
+    elapsed.as_secs_f64() * 1000.0 >= SLOW_STEP_MS
+}
+
+/// The reporters that keep the slow-step reports bounded.
+///
+/// The reporters live in the per-engine services, so every container of the
+/// engine shares one report interval.
+#[derive(Default)]
+struct PsbReporters {
+    /// The reporter of the container load.
+    load: SlowReporter,
+    /// The reporter of the root dictionary's build.
+    root: SlowReporter,
+}
+
+/// Reports a container load that took longer than the threshold.
+///
+/// The line names the phases: the storage read and the container's parse.
+/// The report is bounded: the reporter keeps the interval between two
+/// reports, so a load that is slow in every frame does not report in every
+/// frame.
+fn report_slow_load(
+    services: &CompatServices,
+    path: &str,
+    elapsed: Duration,
+    read_ms: f64,
+    parse_ms: f64,
+) {
+    if !is_slow(elapsed) {
+        return;
+    }
+    let mut reporters = services.state::<PsbReporters>();
+    if !reporters.load.is_due() {
+        return;
+    }
+    log::warn!(
+        "psb: the load of {path:?} took {:.1} ms (storage_read={read_ms:.1} parse={parse_ms:.1})",
+        elapsed.as_secs_f64() * 1000.0,
+    );
+}
+
+/// Reports a root dictionary's build that took longer than the threshold.
+///
+/// The report is bounded like the load's.
+fn report_slow_root(services: &CompatServices, path: &str, elapsed: Duration) {
+    if !is_slow(elapsed) {
+        return;
+    }
+    let mut reporters = services.state::<PsbReporters>();
+    if !reporters.root.is_due() {
+        return;
+    }
+    log::warn!(
+        "psb: the root dictionary of {path:?} took {:.1} ms",
+        elapsed.as_secs_f64() * 1000.0,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
@@ -320,11 +428,17 @@ fn load_document(ctx: &CompatCtx, inst: &mut PsbFileInst, path: &str) -> Result<
     let Some(storage) = services.storage() else {
         return Err("PSBFile: no storage is attached".into());
     };
+    let started = Instant::now();
     // SAFETY: the host keeps the attached storage alive for the binding.
     let bytes = unsafe { &*storage }
         .read(strip_file_media(path))
         .map_err(|error| error.to_string())?;
-    match container::parse_stream(&bytes, 0) {
+    let read_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let parse_started = Instant::now();
+    let parsed = container::parse_stream(&bytes, 0);
+    let parse_ms = parse_started.elapsed().as_secs_f64() * 1000.0;
+    report_slow_load(services, path, started.elapsed(), read_ms, parse_ms);
+    match parsed {
         Ok(document) => {
             let document = Rc::new(document);
             inst.document = Some(Rc::clone(&document));
@@ -474,10 +588,17 @@ extern "C" fn psb_root_get(
         return report_error(out_error, "PSBFile: compat context is not bound");
     };
     let host = resolved.engine();
-    let built = match instance_ref(instance).document.as_deref() {
+    let ctx = resolved.ctx();
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let services = unsafe { ctx.services() };
+    let inst = instance_ref(instance);
+    let path = inst.path.as_deref().unwrap_or("<no container>");
+    let started = Instant::now();
+    let built = match inst.document.as_deref() {
         Some(document) => build_root(host, document),
         None => dictionary_new(host),
     };
+    report_slow_root(services, path, started.elapsed());
     match built {
         Ok(object) => set_retained_out(out, object),
         Err(error) => return report_error(out_error, &format!("PSBFile.root: {error}")),
@@ -515,4 +636,25 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             set: None,
         }],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A step below the threshold is never reported, a step above it is
+    /// reported once, and the next one is held back until the interval has
+    /// passed: the report stays bounded.
+    #[test]
+    fn the_slow_step_report_is_bounded() {
+        assert!(!is_slow(Duration::from_millis(10)), "a fast step");
+        assert!(is_slow(Duration::from_millis(80)), "a slow step");
+
+        let mut reporter = SlowReporter::default();
+        assert!(reporter.is_due(), "the first slow step is reported");
+        assert!(
+            !reporter.is_due(),
+            "a second slow step inside the interval is held back"
+        );
+    }
 }
