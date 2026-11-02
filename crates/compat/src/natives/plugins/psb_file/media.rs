@@ -25,6 +25,7 @@ use super::normalize_psb_domain;
 use crate::CompatServices;
 use crate::collections::Map;
 use crate::engine_api::{StorageMedia, StorageReadError};
+use crate::natives::plugins::var_file::VarContainer;
 
 /// Which resources of a container the media serves.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -36,7 +37,7 @@ pub(crate) enum PsbScope {
 }
 
 /// One container the media serves.
-struct PsbContainer {
+pub(crate) struct PsbContainer {
     /// The parsed document the resources are read from.
     document: Rc<PsbDocument>,
     /// Which of its resources the media serves.
@@ -97,13 +98,27 @@ impl PsbContainer {
 #[derive(Default)]
 pub(crate) struct PsbMedia {
     /// The registered containers, by their normalized name.
-    containers: RefCell<Map<String, PsbContainer>>,
+    containers: RefCell<Map<String, Rc<PsbContainer>>>,
 }
 
 impl PsbMedia {
     /// Register a container whose resources sit directly under its root.
-    pub(crate) fn register_root_resources(&self, container: &str, document: Rc<PsbDocument>) {
-        self.register(container, document, PsbScope::RootResources);
+    ///
+    /// The container is returned, so that the caller can publish the same
+    /// one to another namespace.
+    pub(crate) fn register_root_resources(
+        &self,
+        container: &str,
+        document: Rc<PsbDocument>,
+    ) -> Rc<PsbContainer> {
+        let entry = Rc::new(PsbContainer {
+            document,
+            scope: PsbScope::RootResources,
+        });
+        self.containers
+            .borrow_mut()
+            .insert(container.to_string(), Rc::clone(&entry));
+        entry
     }
 
     /// Register a container whose whole value tree is served.
@@ -113,9 +128,10 @@ impl PsbMedia {
 
     /// Register a container under `container`, replacing an earlier one.
     fn register(&self, container: &str, document: Rc<PsbDocument>, scope: PsbScope) {
-        self.containers
-            .borrow_mut()
-            .insert(container.to_string(), PsbContainer { document, scope });
+        self.containers.borrow_mut().insert(
+            container.to_string(),
+            Rc::new(PsbContainer { document, scope }),
+        );
     }
 
     /// The container and the resource the entry `path` names.
@@ -129,6 +145,20 @@ impl PsbMedia {
         let entry = containers.get(&normalize_psb_domain(container))?;
         let reference = entry.resource(member)?;
         Some((Rc::clone(&entry.document), reference))
+    }
+}
+
+impl VarContainer for PsbContainer {
+    fn file(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
+        let Some(reference) = self.resource(name) else {
+            return Ok(None);
+        };
+        match self.document.resource_bytes(reference) {
+            Some(bytes) => Ok(Some(bytes.to_vec())),
+            None => Err(format!(
+                "the container carries no bytes for the member {name}"
+            )),
+        }
     }
 }
 

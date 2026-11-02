@@ -581,6 +581,143 @@ fn a_packed_image_is_read_through_the_var_media() {
     );
 }
 
+// A tile read is answered by the container the script loaded, and not by the
+// script object graph.
+//
+// The reference's `var://` media walks the script object graph
+// (`reference/cpp/plugins/varfile.cpp:291-346`), so the tile's bytes are
+// reached through the container's `root` member — and the reference's
+// `getRoot` copies every resource of the container into a fresh octet
+// (`reference/cpp/plugins/psbfile/main.cpp:29-42`,
+// `reference/cpp/plugins/psbfile/PSBValue.cpp:201-204`). The published
+// container answers the tile's bytes alone, so the read does not reach the
+// script object graph: the container is still read after the graph has
+// dropped it.
+//
+// This is the one place the port answers where the reference does not: the
+// reference's media finds the container in the script object graph, and
+// answers "not a file" for a graph that does not hold it.
+#[test]
+fn a_tile_read_is_answered_by_the_loaded_container() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.write_fixture("fixture.psb", &build_fixture());
+
+    env.run(
+        "var packImageMap = %[]; \
+         packImageMap[\"fixture.psb\"] = new PSBFile(\"fixture.psb\"); \
+         delete packImageMap[\"fixture.psb\"]; \
+         var lines = []; \
+         lines.load('var://./packImageMap/fixture.psb/root/res');",
+    );
+
+    assert_eq!(
+        env.string("lines[0]"),
+        "FAKEIMAGE",
+        "the tile's bytes must not depend on the script object graph"
+    );
+}
+
+// A container is published under the name the script holds it under — the
+// storage's base name, lower-cased — so the media finds it where the script
+// looks for it.
+//
+// The game's `addPackImageInfo` (system/packimage.tjs:20-47) names a
+// container `Storages.extractStorageName(storage).toLowerCase()`, and the
+// script reads the container's tiles through
+// `var://./packImageMap/<name>/root/`. A container in a subdirectory is named
+// by its base name alone, so the published path is the base name and not
+// the storage path.
+#[test]
+fn a_container_is_published_under_its_base_name() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    std::fs::create_dir_all(env._dir.path().join("sub")).expect("the fixture directory");
+    env.write_fixture("sub/Fixture.PSB", &build_fixture());
+
+    env.run(
+        "var packImageMap = %[]; \
+         packImageMap[\"fixture.psb\"] = new PSBFile(\"sub/Fixture.PSB\"); \
+         delete packImageMap[\"fixture.psb\"]; \
+         var lines = []; \
+         lines.load('var://./packImageMap/fixture.psb/root/res');",
+    );
+
+    assert_eq!(
+        env.string("lines[0]"),
+        "FAKEIMAGE",
+        "the container must be published under the name the script holds it under"
+    );
+}
+
+// The `var://` media and the `psb://` media serve the same bytes.
+//
+// The reference registers the container's root resources with the `psb://`
+// media (`reference/cpp/plugins/psbfile/main.cpp:57-68`) and reaches the
+// packed image's tiles through the `var://` media
+// (`reference/cpp/plugins/varfile.cpp:291-346`); both name the same
+// resource of the same container.
+#[test]
+fn the_var_media_and_the_psb_media_serve_the_same_bytes() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.write_fixture("fixture.psb", &build_fixture());
+
+    env.run(
+        "var packImageMap = %[]; \
+         packImageMap[\"fixture.psb\"] = new PSBFile(\"fixture.psb\");",
+    );
+
+    let psb = env
+        ._storage
+        .read("psb://fixture.psb/res")
+        .expect("the psb media serves the resource");
+    let var = env
+        ._storage
+        .read("var://./packImageMap/fixture.psb/root/res")
+        .expect("the var media serves the tile");
+    assert_eq!(psb, var, "both medias must serve the same bytes");
+    assert_eq!(var, b"FAKEIMAGE".to_vec());
+}
+
+// A member the container does not hold is not a file.
+//
+// The reference's media answers the existence check with the member's kind
+// (`reference/cpp/plugins/varfile.cpp:237-239`), so a member that is not an
+// octet is not there — and the storage manager raises "Cannot open
+// storage" for a name it cannot place
+// (`reference/cpp/core/base/StorageIntf.cpp:1145`).
+#[test]
+fn a_member_the_container_does_not_hold_is_not_a_file() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.write_fixture("fixture.psb", &build_fixture());
+
+    env.run(
+        "var packImageMap = %[]; \
+         packImageMap[\"fixture.psb\"] = new PSBFile(\"fixture.psb\");",
+    );
+
+    assert!(
+        env._storage
+            .read("var://./packImageMap/fixture.psb/root/missing")
+            .is_err(),
+        "a member the container does not hold is not a file"
+    );
+    assert!(
+        env._storage
+            .read("var://./packImageMap/fixture.psb/root/num")
+            .is_err(),
+        "a member that is not a resource is not a file"
+    );
+    assert!(
+        env._storage
+            .read("var://./packImageMap/fixture.psb/root/sub")
+            .is_err(),
+        "a nested container is not a file"
+    );
+}
+
 // The title's route for a graphic whose container holds no province member:
 // the province lookup must not fail the load.
 //

@@ -51,6 +51,18 @@
 //! registered; the tree walk that reaches a nested resource belongs to the
 //! motion player, which registers the whole tree itself.
 //!
+//! # The `var://` media
+//!
+//! A successful `load` publishes the container's **root-level** resources to
+//! the `var://` storage media as well, under the name the script reads them
+//! through (`<name>/root`, the container's `root` member).
+//!
+//! The `psb://` media serves the resources under the container's normalized
+//! storage name. The `var://` media is the other way to the same resources: a
+//! path below the script's global object names them. The media answers a read
+//! of a published container from the container itself, so the read costs the
+//! resource and not the container.
+//!
 //! The media is served by the provider in [`media`]: it resolves a member
 //! path against the parsed document when the entry is read, so the bytes are
 //! not copied into a table. The container name is lower-cased from its first
@@ -81,9 +93,11 @@ use tjs::{
 use psd::container::{PsbDocument, PsbValue};
 
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
+use crate::natives::plugins::var_file;
+use crate::natives::storages::extract_storage_name;
 use crate::natives::system::resolve;
 use crate::storage::strip_file_media;
-use crate::{CompatCtx, CompatError};
+use crate::{CompatCtx, CompatError, CompatServices};
 
 // ---------------------------------------------------------------------------
 // Instance payload
@@ -312,8 +326,12 @@ fn load_document(ctx: &CompatCtx, inst: &mut PsbFileInst, path: &str) -> Result<
             inst.document = Some(Rc::clone(&document));
             inst.path = Some(path.to_string());
             // A `load` registers the resources that sit directly under the
-            // root.
-            media::media(services).register_root_resources(&normalize_psb_domain(path), document);
+            // root: the `psb://` media serves them under the container's
+            // normalized name, and the `var://` media serves them under the
+            // name the script reads them through.
+            let container = media::media(services)
+                .register_root_resources(&normalize_psb_domain(path), Rc::clone(&document));
+            publish_to_var_media(services, path, container);
             Ok(true)
         }
         Err(error @ (PsbError::BadSignature(_) | PsbError::ArchiveNotPsb)) => {
@@ -335,6 +353,21 @@ pub(crate) fn normalize_psb_domain(path: &str) -> String {
         Some(dot) => format!("{}{}", &path[..dot], path[dot..].to_lowercase()),
         None => path.to_string(),
     }
+}
+
+/// Publish the container's root resources to the `var://` media.
+///
+/// The script reads a container's resources through the container's `root`
+/// member, so the container is published under the path that member gives
+/// it: `<name>/root`. The name is the one the script holds the container
+/// under — the storage's base name, lower-cased
+/// (`Storages.extractStorageName(storage).toLowerCase()`, the game's
+/// `addPackImageInfo`) — so the media looks the container up where the
+/// script looks for it. The `psb://` media names a container by its
+/// normalized storage name instead.
+fn publish_to_var_media(services: &CompatServices, path: &str, container: Rc<media::PsbContainer>) {
+    let name = extract_storage_name(path).to_lowercase();
+    var_file::publish(services, &format!("{name}/root"), container);
 }
 
 // ---------------------------------------------------------------------------
