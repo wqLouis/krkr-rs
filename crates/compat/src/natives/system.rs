@@ -1308,11 +1308,17 @@ fn collect_storage_names(host: &Tjs2Engine, list: &Value) -> Result<Vec<String>,
 /// bound on the wait, in milliseconds; a zero timeout means no bound.
 fn touch_images(ctx: &CompatCtx, names: &[String], limit: i64, timeout: i64) -> Result<(), String> {
     // The graphic cache the preload fills is the scene's decoded-image
-    // cache; a disabled cache leaves the call with nothing to do.
+    // cache; a disabled cache leaves the call with nothing to do. A host
+    // that attached no scene has no cache and no layer to draw on, so the
+    // preload has nowhere to put the images and returns without loading
+    // anything.
     let cache_limit = {
+        let Some(scene_ptr) = scene_ptr(ctx).ok() else {
+            return Ok(());
+        };
         // SAFETY: the host keeps the attached scene alive for the binding's
         // lifetime and the VM is single-threaded.
-        let scene = unsafe { &mut *scene_ptr(ctx)? };
+        let scene = unsafe { &mut *scene_ptr };
         match scene.decoded_image_cache_limit() {
             CacheLimit::Disabled => return Ok(()),
             CacheLimit::Unlimited => u64::MAX,
