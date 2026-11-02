@@ -3,8 +3,8 @@
 **What this page is:** the measured cost of the two loads a game performs —
 the **engine load** (process start → the first frame) and the **scene load**
 (a scenario's assets → the objects a script sees) — with the profile that
-names the hotspot in each, and the two changes that took the scene load
-from ~370 ms to ~80 ms.
+names the hotspot in each, and the changes that took the scene load from
+~370 ms to ~80 ms and a packed image's tiles from ~3 s to ~84 ms.
 
 It is a **measurement record**, not a contract: the numbers are one host,
 one game and one build (see §1), and they are here so the next change can be
@@ -123,8 +123,6 @@ is dominated by compiling and running its scripts.
 | the allocator (`mimalloc`) | measured and rejected (`TODO.md` §17) |
 | the zlib inflate | `flate2` currently inflates with the pure-Rust `miniz_oxide`; the system zlib is typically 1.5–2× faster, and `flate2`'s `zlib` feature would do it — but the feature links the C library, which the Android target would then need |
 | the font registry scan | ~30 ms; a lazy registry would move it out of the startup, at the cost of a script-visible change |
-
----
 
 ## 3. The scene load
 
@@ -315,3 +313,45 @@ its own object as the "objthis" — the VM's own test suite and the
 ~2 ms of archive read. The two changes together took it from ~370 ms: the
 first (the native constructors) from ~370 ms to ~160 ms, the second (the
 shared class members) from ~160 ms to ~80 ms.
+
+### 3.7 The packed image's tiles
+
+The scene change's heaviest asset is a packed image: a `.pimg` file that is
+a PSB container, read through the `var://` media. The game's own
+`system/packimage.tjs` holds each container in a `PackImageInfo`, and the
+script reads a tile through `var://./packImageMap/<name>/root/<tile>`.
+
+The reference's `var://` media walks the script object graph to reach that
+member (`reference/cpp/plugins/varfile.cpp:291-346`), and the graph's
+`root` member is the `PSBFile.root` property, which rebuilds the
+container's whole root dictionary and copies every resource of the container
+into a fresh octet (`reference/cpp/plugins/psbfile/PSBValue.cpp:201-204`).
+So **a tile read cost the whole container**, and a packed image with N
+visible layers paid that N times over.
+
+The media now answers a tile from the container itself: a container that a
+load publishes is looked up by the path the script reads it under, and the
+tile's bytes are copied out of it — the container's own resource, not the
+container.
+
+Measured on the game's largest packed image (`ev122a.pimg`, 12 558 815
+bytes, 147 members):
+
+| | cost |
+|---|---|
+| the container rebuild — the old cost of every tile | 20.6 ms |
+| the load (the parse) | 9.7 ms |
+| one tile read | 2.3 ms |
+| **all 147 tiles, the old path** | **3.03 s** |
+| **all 147 tiles, the new path** | **83.9 ms** |
+
+**The same work is 36× faster**, and the whole packed image now costs
+about the time one of its tiles used to.
+
+This is a performance divergence and not a behaviour change: the bytes, the
+names, the path grammar and the failures are the same, and the reference
+still pays the quadratic. The reference's own async graphic loader does the
+read and the decode on a worker, so its tile reads overlap where ours now
+do too.
+
+---
