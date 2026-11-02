@@ -64,11 +64,8 @@
 
 use std::ffi::{c_char, c_int, c_void};
 use std::path::Path;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use api::config::CacheLimit;
-use api::media::DecodedImage;
 use tjs::{
     DetachedValue, Engine, MemberRead, NativeClassBuilder, NativeMethodDef, NativePropertyDef,
     RetainedValue, Tjs2Engine, TjsValue, VAL_ARRAY, VAL_INTEGER, VAL_NULL, VAL_OBJECT, VAL_OCTET,
@@ -77,7 +74,7 @@ use tjs::{
 
 use crate::binding;
 use crate::collections::Set;
-use crate::engine_api::{DecodedImageKey, DecodedImageMode, ImageOutcome, PendingImage};
+use crate::engine_api::{DecodedImageKey, DecodedImageMode};
 use crate::host::host_desktop_rect;
 use crate::native_util::{
     args, host_ref, report_error, services, set_bool, set_int, set_void, value_as_string,
@@ -1177,18 +1174,16 @@ extern "C" fn native_assign_message(
 /// priority in the cache order.
 ///
 /// The graphic cache is the scene's decoded-image cache and the queued loads
-/// run on the decode pool: every name is resolved and its decode submitted
-/// before any of them is waited for, so the pool runs them concurrently and
-/// the wait is the time the last decode needs rather than the sum of them.
-/// The decoded images land in the decoded-image cache, so a later
-/// `Layer.loadImages` of the same image is a cache hit instead of a second
-/// decode.
+/// run on the decode pool. The call does **not** wait for them: the scene
+/// holds the decodes, the frame boundary takes their pixels into the cache
+/// when they land, and the script continues while the images are still
+/// decoding. A later load of an image whose preload is still running shares
+/// that decode instead of decoding the same bytes a second time.
 ///
-/// The `limit` is the byte budget the preload may use: the cache's own limit
-/// bounds it, a limit of zero means the whole cache, and a negative limit is
-/// the number of bytes that must stay free — a negative limit that leaves no
-/// room ends the call without loading anything. The `timeout` bounds the
-/// wait, in milliseconds; zero means no bound.
+/// The `limit` is the number of bytes that must stay free in the cache: a
+/// negative limit that leaves no room ends the call without loading
+/// anything, and every other limit is not consulted. The `timeout` is
+/// converted but never consulted: the pre-load never waits.
 extern "C" fn native_touch_images(
     engine: *mut c_void,
     argc: c_int,
@@ -1220,7 +1215,6 @@ extern "C" fn native_touch_images(
         Err(error) => return report_error(out_error, &format!("System.touchImages: {error}")),
     };
     let mut limit = 0i64;
-    let mut timeout = 0i64;
     for (index, name) in [(1, "limit"), (2, "timeout")] {
         if let Some(value) = a.get(index)
             && value.ty != VAL_VOID
@@ -1229,10 +1223,11 @@ extern "C" fn native_touch_images(
             // conversion, which raises on objects.
             match try_value_as_i64(value) {
                 Ok(number) => {
+                    // Only the limit is consulted: the timeout is converted
+                    // but never used, because the pre-load never waits for
+                    // the decodes it queues.
                     if index == 1 {
                         limit = number;
-                    } else {
-                        timeout = number;
                     }
                 }
                 Err(error) => {
@@ -1241,7 +1236,7 @@ extern "C" fn native_touch_images(
             }
         }
     }
-    if let Err(error) = touch_images(&ctx, &names, limit, timeout) {
+    if let Err(error) = touch_images(&ctx, &names, limit) {
         return report_error(out_error, &format!("System.touchImages: {error}"));
     }
     set_void(out);
@@ -1301,15 +1296,16 @@ fn collect_storage_names(host: &Tjs2Engine, list: &Value) -> Result<Vec<String>,
 
 /// Pre-loads the named graphics into the scene's decoded-image cache.
 ///
-/// The names are resolved and their decodes submitted as one burst, and the
-/// wait for the results is the time the last decode needs rather than the
-/// sum of them. Every decoded image lands in the decoded-image cache, under
-/// the key the load path uses, so a later load of the same image is a cache
-/// hit instead of a second decode.
+/// The names are resolved and their decodes are queued on the decode pool,
+/// and the call returns without waiting for them: the scene holds the
+/// decodes and the frame boundary takes their pixels into the cache when
+/// they land. A later load of an image whose preload is still running
+/// shares that decode instead of decoding the same bytes a second time.
 ///
-/// The `limit` is the byte budget the preload may use and the `timeout` the
-/// bound on the wait, in milliseconds; a zero timeout means no bound.
-fn touch_images(ctx: &CompatCtx, names: &[String], limit: i64, timeout: i64) -> Result<(), String> {
+/// The `limit` is the number of bytes that must stay free in the cache: a
+/// negative limit that leaves no room ends the call without loading
+/// anything, and every other limit is not consulted.
+fn touch_images(ctx: &CompatCtx, names: &[String], limit: i64) -> Result<(), String> {
     // The graphic cache the preload fills is the scene's decoded-image
     // cache; a disabled cache leaves the call with nothing to do. A host
     // that attached no scene has no cache and no layer to draw on, so the
@@ -1328,34 +1324,21 @@ fn touch_images(ctx: &CompatCtx, names: &[String], limit: i64, timeout: i64) -> 
             CacheLimit::Bytes(bytes) => bytes.get(),
         }
     };
-    // The byte budget: a limit of zero means the whole cache, a limit above
-    // the cache's limit is clamped to it, and a negative limit is the number
-    // of bytes that must stay free — a negative limit that leaves no room
-    // ends the call without loading anything.
-    let budget = if limit >= 0 {
-        let limit = u64::try_from(limit).map_err(|error| error.to_string())?;
-        if limit == 0 || limit > cache_limit {
-            cache_limit
-        } else {
-            limit
-        }
-    } else {
-        let free = limit.unsigned_abs();
-        if free >= cache_limit {
-            return Ok(());
-        }
-        cache_limit - free
-    };
-    // The burst: every name is resolved and its decode submitted before any
-    // of them is waited for. The resolution comes first for the whole list,
-    // so the storage schedules every read before the first one is waited
-    // for: the reads of the burst then run concurrently on the storage's
-    // read pool.
-    let mut decodes: Vec<(DecodedImageKey, PendingImage)> = Vec::new();
+    // A negative limit is the number of bytes that must stay free: a
+    // negative limit that leaves no room ends the call without loading
+    // anything. Every other limit is not consulted: the pre-load spends no
+    // byte budget of its own.
+    if limit < 0 && limit.unsigned_abs() >= cache_limit {
+        return Ok(());
+    }
+    // The names are queued one after the other, and the call returns without
+    // waiting for the decodes: the scene holds them until the frame boundary
+    // takes their pixels into the cache.
     let mut keys: Vec<DecodedImageKey> = Vec::new();
     let mut queued: Set<DecodedImageKey> = Set::default();
-    let mut bytes = 0u64;
-    // The resolved loads, in the order the names were given.
+    // The resolution comes first for the whole list, so the storage schedules
+    // every read before the first one is waited for: the reads of the burst
+    // then run concurrently on the storage's read pool.
     let mut loads: Vec<(String, DecodedImageKey, Option<PendingLoad>)> = Vec::new();
     for name in names {
         let key = DecodedImageKey::new(name, COLOR_KEY_NONE, DecodedImageMode::Full, 0, 0);
@@ -1365,9 +1348,9 @@ fn touch_images(ctx: &CompatCtx, names: &[String], limit: i64, timeout: i64) -> 
             // SAFETY: the host keeps the attached scene alive for the
             // binding's lifetime and the VM is single-threaded.
             let scene = unsafe { &mut *scene_ptr(ctx)? };
-            scene.lookup_decoded_image(&key)
+            scene.touch_decoded_image(&key)
         };
-        if cached.is_some() {
+        if cached {
             continue;
         }
         // A name the burst already holds is loaded once.
@@ -1378,9 +1361,7 @@ fn touch_images(ctx: &CompatCtx, names: &[String], limit: i64, timeout: i64) -> 
         // A name that resolves to nothing fails the load, and the preload
         // carries on.
         let load = match resolve_pending_load(ctx, name, COLOR_KEY_NONE, DecodedImageMode::Full) {
-            Ok(Some(load)) => Some(load),
-            // No pool: the image is decoded on this thread.
-            Ok(None) => None,
+            Ok(load) => load,
             Err(error) => {
                 log::warn!("System.touchImages: {name}: {}", error.message());
                 continue;
@@ -1388,11 +1369,10 @@ fn touch_images(ctx: &CompatCtx, names: &[String], limit: i64, timeout: i64) -> 
         };
         loads.push((name.clone(), key, load));
     }
+    // The decodes are queued on the pool and the scene holds them: the frame
+    // boundary takes their pixels into the decoded-image cache when they
+    // land. The call does not wait for them.
     for (name, key, load) in loads {
-        // The preload stops once the loaded images reach the budget.
-        if bytes >= budget {
-            break;
-        }
         let submitted = match load {
             Some(load) => submit_pending_load(ctx, load, COLOR_KEY_NONE, DecodedImageMode::Full),
             // No pool: the image is decoded on this thread.
@@ -1400,18 +1380,18 @@ fn touch_images(ctx: &CompatCtx, names: &[String], limit: i64, timeout: i64) -> 
         };
         match submitted {
             Ok(Some((width, height, pending))) => {
-                bytes = bytes.saturating_add(decoded_bytes(width, height));
-                decodes.push((key, pending));
+                // SAFETY: the host keeps the attached scene alive for the
+                // binding's lifetime and the VM is single-threaded.
+                let scene = unsafe { &mut *scene_ptr(ctx)? };
+                scene.add_preload_decode(key, width, height, pending);
             }
             Ok(None) => {
                 // No pool, or the pool refused the job: the image is decoded
                 // on this thread, and the cache keeps it.
                 match load_cached_storage_image(ctx, &name, COLOR_KEY_NONE, DecodedImageMode::Full)
                 {
-                    Ok(image) => bytes = bytes.saturating_add(image.rgba.len() as u64),
-                    Err(error) => {
-                        log::warn!("System.touchImages: {name}: {}", error.message());
-                    }
+                    Ok(_) => {}
+                    Err(error) => log::warn!("System.touchImages: {name}: {}", error.message()),
                 }
             }
             Err(error) => {
@@ -1421,55 +1401,13 @@ fn touch_images(ctx: &CompatCtx, names: &[String], limit: i64, timeout: i64) -> 
             }
         }
     }
-    // The wait: the decodes run concurrently, so the wait is the time the
-    // last one needs rather than the sum of them.
-    let deadline = preload_deadline(timeout);
-    for (_key, pending) in &decodes {
-        // A caller waits for the decode, so the job is demanded and a worker
-        // prefers it over the normal jobs in the queue.
-        pending.demand();
-    }
-    for (key, pending) in decodes {
-        match await_decode(&pending, deadline) {
-            Some(ImageOutcome::Ready(image)) => {
-                let decoded = match Arc::try_unwrap(image) {
-                    Ok(decoded) => decoded,
-                    Err(shared) => (*shared).clone(),
-                };
-                if !decoded.is_consistent() {
-                    log::warn!("System.touchImages: the decoded image is malformed");
-                    continue;
-                }
-                // The pixels take the cache entry the load path uses, so a
-                // later load of the same image is a cache hit.
-                // SAFETY: the host keeps the attached scene alive for the
-                // binding's lifetime and the VM is single-threaded.
-                let scene = unsafe { &mut *scene_ptr(ctx)? };
-                match scene.cached_decoded_image(key, || Ok::<DecodedImage, String>(decoded)) {
-                    Ok(_) => {}
-                    Err(error) => log::warn!("System.touchImages: {error}"),
-                }
-            }
-            Some(ImageOutcome::Failed(message)) => {
-                log::warn!("System.touchImages: an image decode failed: {message}");
-            }
-            Some(ImageOutcome::Cancelled) => {
-                log::warn!("System.touchImages: an image decode was cancelled");
-            }
-            None => {
-                // The timeout expired: the decode keeps running and its
-                // pixels are dropped.
-                log::warn!("System.touchImages: the preload timed out");
-            }
-        }
-    }
     // The cache order: the earlier names keep their priority, so the entries
     // are touched from the last to the first.
     for key in keys.iter().rev() {
         // SAFETY: the host keeps the attached scene alive for the binding's
         // lifetime and the VM is single-threaded.
         let scene = unsafe { &mut *scene_ptr(ctx)? };
-        scene.lookup_decoded_image(key);
+        scene.touch_decoded_image(key);
     }
     Ok(())
 }
@@ -1482,43 +1420,6 @@ fn scene_ptr(ctx: &CompatCtx) -> Result<*mut crate::engine_api::Scene, String> {
     services
         .scene()
         .ok_or_else(|| "no scene is attached".to_string())
-}
-
-/// The bytes a decoded image of the given size holds.
-fn decoded_bytes(width: u32, height: u32) -> u64 {
-    u64::from(width)
-        .saturating_mul(u64::from(height))
-        .saturating_mul(4)
-}
-
-/// The moment the preload gives up, or `None` when it does not give up.
-///
-/// A timeout of zero never expires, and a timeout so large that the moment
-/// cannot be represented never expires either.
-fn preload_deadline(timeout: i64) -> Option<Instant> {
-    if timeout <= 0 {
-        return None;
-    }
-    let millis = u64::try_from(timeout).ok()?;
-    Instant::now().checked_add(Duration::from_millis(millis))
-}
-
-/// Waits for a decode, giving up at the deadline.
-///
-/// The wait is on the decode alone. A deadline that passes before the decode
-/// produced its pixels ends the wait: the decode keeps running and its
-/// pixels are dropped.
-fn await_decode(pending: &PendingImage, deadline: Option<Instant>) -> Option<ImageOutcome> {
-    let Some(deadline) = deadline else {
-        return Some(pending.await_ready());
-    };
-    while !pending.is_ready() {
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    Some(pending.await_ready())
 }
 
 /// `System.doCompact([level])` → void

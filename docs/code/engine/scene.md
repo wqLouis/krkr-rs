@@ -13,7 +13,8 @@ maintain the id → index lookup tables, the sibling ordering, the focus domains
 and the subtree-cache bookkeeping; keep two monotonic revisions so a consumer
 can tell a structural change from a content change; own the decoded-image
 cache (the reference's graphic cache) and the pending images — the bitmaps
-whose pixels are still being decoded.
+whose pixels are still being decoded — and the pre-loads, the decodes that
+will fill the cache when they land.
 
 The module is backend-free: it knows nothing about rendering, script objects
 or native registration. The field-level description of the tree and the draw
@@ -33,6 +34,7 @@ pub struct Scene {
     next_window / next_layer / next_bitmap / next_font: u32,
     window_index / layer_index / bitmap_index / font_index: Map<u32, usize>,
     image_cache: DecodedImageCache,
+    preloads: Vec<PreloadDecode>,
     structure_revision: u64,
     content_revision: u64,
 }
@@ -119,9 +121,9 @@ A bitmap whose pixels are still being decoded carries the decode future in
 | `add_pending_bitmap(width, height, pending)` | adds a bitmap with the probed size and no pixels, and returns its id. `ImageSizeError::TooLarge` when the pixel count is not representable. |
 | `set_pending_image(id, width, height, pending)` | puts a pending decode on an existing bitmap and cancels the one it carried. |
 | `pending_image(id)` | the bitmap's pending future, or `None` when it holds its pixels. |
-| `pending_decode_for(key)` | the decode already running for the key: the probed size and a clone of the shared future, or `None` when no bitmap carries that decode. |
+| `pending_decode_for(key)` | the decode already running for the key: the probed size and a clone of the shared future, or `None` when neither a bitmap nor a pre-load carries that decode. |
 | `resolve_bitmap(id)` | waits for one bitmap's pending image and installs its pixels; a successful decode is also stored in the decoded-image cache under the key the load named. |
-| `resolve_pending_images()` | waits for every pending image and installs the pixels; returns how many it resolved. |
+| `resolve_pending_images()` | waits for every pending image and installs the pixels, and takes the landed pre-loads into the decoded-image cache; returns how many bitmaps it resolved. |
 
 `resolve_bitmap` **waits on that image alone**, never on the pool. It marks
 the image *demanded* first, so a worker takes it before the ordinary jobs in
@@ -135,20 +137,42 @@ the queue. The outcome decides what lands:
 
 None of the three raises: the load that queued the decode already returned.
 
+### The pre-load
+
+A pre-load is a decode that was queued for the decoded-image cache without a
+bitmap to hold it: the caller queues the decode and continues, and the pixels
+reach the cache later, when they land.
+
+| method | what it does |
+|---|---|
+| `add_preload_decode(key, width, height, pending)` | registers a decode that fills the cache entry `key`; a pre-load under a key the scene already holds is replaced. |
+| `harvest_preload_decodes()` | takes the pixels of the pre-loads whose decode has landed into the decoded-image cache; returns how many it took. |
+| `pending_decode_for(key)` | a pre-load holds a decode for its cache entry too, so a load of an image whose pre-load is still running shares that decode. |
+
+The harvest **waits on no decode**: a pre-load that is still running stays
+registered and a later frame takes its pixels. A decode that failed or was
+cancelled is dropped and logged; a decode that produced an image that does
+not match the probed size caches nothing.
+
 ### Fonts
 
 `add_font`, `reset_font`, `font`.
 
 ### The decoded-image cache
 
-`cached_decoded_image`, `lookup_decoded_image`, `graphic_cache_limit`,
-`decoded_image_cache_limit`, `set_graphic_cache_limit`,
+`cached_decoded_image`, `lookup_decoded_image`, `touch_decoded_image`,
+`graphic_cache_limit`, `decoded_image_cache_limit`, `set_graphic_cache_limit`,
 `set_decoded_image_cache_limit`, `clear_decoded_image_cache`.
 
 `lookup_decoded_image` is the cache lookup a caller that may **defer** the
 decode uses: it looks the entry up, marks it most recently used and returns
 an **owned copy** of the pixels, exactly as `cached_decoded_image` does on a
 hit. The caller decodes only on a miss.
+
+`touch_decoded_image` marks an entry most recently used and reports whether
+the cache holds it, **without copying the pixels**: a caller that only wants
+the entry's recency — a pre-load that touches the graphics it already holds
+— pays nothing for the touch.
 
 ---
 

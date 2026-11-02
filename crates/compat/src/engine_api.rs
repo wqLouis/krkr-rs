@@ -40,10 +40,11 @@ pub(crate) use engine::{
 // entry holds the read, and the storage reads it.
 pub(crate) use engine::storage::StorageEntry;
 
-// The image decode pool, the pending-image future, the outcome a pending
-// image produced and the pass a worker runs over decoded pixels: the visual
-// natives submit decodes, wait for them and name their pass through these.
-pub(crate) use engine::imagedecode::{DecodePass, DecodePool, ImageOutcome, PendingImage};
+// The image decode pool and the pending-image future the visual natives
+// submit decodes through and wait for: the pool the workers decode on, the
+// handle a decode's result lands in, and the pass a worker runs over the
+// decoded pixels.
+pub(crate) use engine::imagedecode::{DecodePass, DecodePool, PendingImage};
 
 // The general job pool the engine runs its CPU work on: the handle a
 // submitted job's result lands in, the closure a job performs, the value it

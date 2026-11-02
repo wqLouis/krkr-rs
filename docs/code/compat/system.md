@@ -31,7 +31,7 @@ engine has no other way to know.
 | `assignMessage(id, message)` | overrides a TJS message; returns whether one existed |
 | `doCompact([level])` | garbage-collects and/or clears the graphic cache |
 | `readRegValue(key)` | reads a key out of `RegisterData.tjs`; void on a miss |
-| `touchImages(storages[, limit[, timeout]])` | validates its arguments; the pre-caching itself is not done |
+| `touchImages(storages[, limit[, timeout]])` | queues the named graphics for a load; the call does not wait for them |
 | `addContinuousHandler(fn)` | registers a per-frame callback |
 | `removeContinuousHandler(fn)` | removes it |
 | `getKeyState(code[, getcurrent])` | the state of a virtual key |
@@ -183,16 +183,31 @@ the scene's limit: `0` disables caching, `-1` means "the system limit", and
 the value is capped at 512 MiB. The setter truncates to a 32-bit integer,
 like the reference's `(tjs_int)` cast.
 
+### The pre-load
+
+`touchImages` queues the named graphics: the list is walked by index, every
+name the graphic cache does not hold yet is resolved and its decode queued on
+the decode pool, and the names the cache holds are touched, so that the
+earlier ones keep their priority in the cache order.
+
+The call **does not wait** for the decodes it queues. The scene holds them,
+and the frame boundary (`Scene::resolve_pending_images`) takes the pixels of
+the decodes that have landed into the decoded-image cache, so the script
+continues while the images are still decoding. A later load of an image whose
+pre-load is still running shares that decode instead of decoding the same
+bytes a second time.
+
+The `limit` is the number of bytes that must stay free in the cache: a
+negative limit that leaves no room ends the call without loading anything,
+and every other limit is not consulted. The `timeout` is converted (an object
+raises) but never consulted: the pre-load never waits.
+
 ### The inert members
 
 `shellExecute` returns **true** and `system` returns **0** without doing
 anything — the reference's own values on a build with no shell. Both log a
 warning. `system` additionally clears the graphic cache, which is what the
 reference's max-level compact event does.
-
-`touchImages` reproduces the reference's **argument validation** only; the
-pre-caching itself is not performed, because the port caches per layer on
-demand.
 
 `nullpo` logs an error and continues where the reference crashes the
 process.
@@ -265,11 +280,21 @@ consumed edge), the constant `touchDevice`, `clearGraphicCache`, the
 graphic-cache limit's edges and truncation, and the tick count: it reads the
 L2 frame clock and raises when no clock is attached.
 
+`crates/compat/tests/touch_images.rs` covers the pre-load: the call does not
+wait for the decodes it queues, the pixels reach the decoded-image cache at
+the frame boundary, a later load shares the running pre-load's decode, the
+timeout is not consulted, the names the cache holds are touched instead of
+decoded again, a name that resolves to nothing is carried over, and the
+argument validation.
+
 ---
 
 ## 6. Known gaps
 
-1. **`touchImages` does not pre-cache** anything.
+1. **`touchImages` does not pre-cache** anything *before* the frame boundary:
+   the pixels reach the decoded-image cache when the frame boundary takes
+   them there, so a script that reads the cache in the same frame sees
+   nothing yet.
 2. **`inform` and `inputString` are headless**: they log and return the
    reference's inert values instead of opening a dialog.
 3. **`nullpo` does not crash** the process.

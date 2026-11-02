@@ -82,7 +82,7 @@ the graphic cache.
 | inert Win32 | `shellExecute`, `system` | `shellExecute` returns `true` and logs a warning; `system` clears the graphic cache, logs a warning and returns `0`. |
 | GC / cache | `doCompact`, `clearGraphicCache`, `graphicCacheLimit` | `doCompact(level = 100)` runs the TJS collector at level ≥ 5 and clears the graphic cache at level ≥ 15; `graphicCacheLimit` reads and writes the L2 scene's cache bound (`0` disables it). |
 | registry | `readRegValue` | evaluates `RegisterData.tjs` from the attached storage and walks the `/`-separated key in-script; a miss is **void**. |
-| images | `touchImages` | validates the argument shapes only. |
+| images | `touchImages` | queues the named images on the decode pool and returns; the pixels reach the decoded-image cache at the frame boundary. |
 | continuous handlers | `addContinuousHandler`, `removeContinuousHandler` | a per-frame callback, identity-deduplicated; `null` is an accepted empty closure; a handler may remove itself. |
 | input | `getKeyState` | reads the attached `InputState` through the same VK mapping as `Key` (the mouse-button VKs and `VK_PADANY` included). `getcurrent = false` reports "went down since the previous query for this code". |
 | data members | `exceptionHandler`, `onActivate`, `onDeactivate` | registered as `null`. |

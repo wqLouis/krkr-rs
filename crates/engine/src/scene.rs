@@ -22,7 +22,7 @@ use api::geometry::PixelRegion;
 use api::media::DecodedImage;
 
 use crate::hasher::{Map, Set, map, set};
-use crate::imagedecode::{ImageOutcome, ImageSizeError, PendingImage};
+use crate::imagedecode::{ImageOutcome, ImageSizeError, ImageState, PendingImage};
 use crate::shader::{EffectDraw, EffectPipelines};
 use crate::trans::Trans;
 
@@ -695,6 +695,19 @@ impl DecodedImageCache {
         Some(image)
     }
 
+    /// Mark `key` most recently used and report whether the cache holds it.
+    ///
+    /// The pixels are not copied: a caller that only wants the entry's
+    /// recency pays nothing for it.
+    fn touch(&mut self, key: &DecodedImageKey) -> bool {
+        if !self.entries.contains_key(key) {
+            return false;
+        }
+        self.order.retain(|entry| entry != key);
+        self.order.push(key.clone());
+        true
+    }
+
     /// Drop least-recently-used entries until the total is within the limit.
     fn evict_to_limit(&mut self) {
         let Some(limit) = self.limit.option() else {
@@ -726,6 +739,23 @@ impl DecodedImageCache {
         self.entries.insert(key.clone(), image);
         self.order.push(key);
     }
+}
+
+/// A decode the scene is holding for the decoded-image cache.
+///
+/// A preload is a decode that was queued for the cache without a bitmap to
+/// hold it: the pixels land in the cache when the decode has produced them,
+/// and the frame boundary takes them there.
+#[derive(Debug)]
+struct PreloadDecode {
+    /// The cache entry the pixels take.
+    key: DecodedImageKey,
+    /// The probed width of the image.
+    width: u32,
+    /// The probed height of the image.
+    height: u32,
+    /// The decode that produces the pixels.
+    pending: PendingImage,
 }
 
 /// The whole logical scene.
@@ -772,6 +802,13 @@ pub struct Scene {
     pub effect_pipelines: EffectPipelines,
     /// Decoded-image cache.
     image_cache: DecodedImageCache,
+    /// The decodes that will fill the decoded-image cache when they land.
+    ///
+    /// A preload is a decode that was queued for the cache without a bitmap
+    /// to hold it: the caller queues the decode and continues, and the frame
+    /// boundary takes the pixels of the decodes that have landed into the
+    /// cache.
+    preloads: Vec<PreloadDecode>,
     /// Monotonic counter bumped by every change to the tree's structure (see
     /// [`Scene::structure_revision`]).
     structure_revision: u64,
@@ -805,6 +842,7 @@ impl Default for Scene {
             composite_transition_frames: false,
             effect_pipelines: EffectPipelines::new(),
             image_cache: DecodedImageCache::default(),
+            preloads: Vec::new(),
             structure_revision: 0,
             content_revision: 0,
             dirty: false,
@@ -2604,6 +2642,99 @@ impl Scene {
         self.image_cache.take_copy(key)
     }
 
+    /// Marks the cached decoded image for `key` most recently used and
+    /// reports whether the cache holds it.
+    ///
+    /// The pixels are not copied: a caller that only wants the entry's
+    /// recency — a pre-load that touches the graphics it already holds —
+    /// pays nothing for the touch.
+    pub fn touch_decoded_image(&mut self, key: &DecodedImageKey) -> bool {
+        if !self.image_cache.enabled() {
+            return false;
+        }
+        self.image_cache.touch(key)
+    }
+
+    /// Registers a decode that fills the decoded-image cache entry `key`.
+    ///
+    /// The scene holds the decode until the frame boundary takes its pixels
+    /// into the cache; the decode is never waited for here. The caller
+    /// queues the decode and continues, and the pixels land when they land.
+    ///
+    /// A preload under a key the scene already holds is replaced: the two
+    /// decodes would fill the same entry, and the newer one supersedes the
+    /// older.
+    pub fn add_preload_decode(
+        &mut self,
+        key: DecodedImageKey,
+        width: u32,
+        height: u32,
+        pending: PendingImage,
+    ) {
+        self.preloads.retain(|preload| preload.key != key);
+        self.preloads.push(PreloadDecode {
+            key,
+            width,
+            height,
+            pending,
+        });
+    }
+
+    /// Takes the pixels of the preloads whose decode has landed into the
+    /// decoded-image cache.
+    ///
+    /// The wait is on no decode: a preload that is still running stays
+    /// registered and a later frame takes its pixels. A decode that failed
+    /// or was cancelled is dropped and reported in the log; a decode that
+    /// produced an image that does not match the probed size caches
+    /// nothing.
+    ///
+    /// Returns the number of preloads that were taken into the cache.
+    pub fn harvest_preload_decodes(&mut self) -> usize {
+        let preloads = std::mem::take(&mut self.preloads);
+        let mut harvested = 0;
+        let mut running = Vec::new();
+        for preload in preloads {
+            let outcome = match preload.pending.state() {
+                // The decode is still running: the preload waits for a
+                // later frame.
+                ImageState::Pending => {
+                    running.push(preload);
+                    continue;
+                }
+                ImageState::Done(outcome) => outcome,
+            };
+            harvested += 1;
+            match outcome {
+                ImageOutcome::Ready(image) => {
+                    let decoded = match Arc::try_unwrap(image) {
+                        Ok(decoded) => decoded,
+                        Err(shared) => (*shared).clone(),
+                    };
+                    let expected = (preload.width as usize)
+                        .checked_mul(preload.height as usize)
+                        .and_then(|pixels| pixels.checked_mul(4));
+                    if !decoded.is_consistent() || expected != Some(decoded.rgba.len()) {
+                        log::warn!(
+                            "engine: the preloaded image {} does not match its probed size",
+                            preload.key.name
+                        );
+                        continue;
+                    }
+                    self.cache_decoded_image(preload.key, decoded);
+                }
+                ImageOutcome::Failed(message) => {
+                    log::warn!("engine: a preloaded image failed to decode: {message}");
+                }
+                ImageOutcome::Cancelled => {
+                    log::warn!("engine: a preloaded image was cancelled before it decoded");
+                }
+            }
+        }
+        self.preloads = running;
+        harvested
+    }
+
     /// Puts a pending decode on an existing bitmap.
     ///
     /// The bitmap takes the probed `width` x `height` and no pixels: the
@@ -2664,19 +2795,29 @@ impl Scene {
 
     /// The decode already running for `key`, when the scene holds one.
     ///
-    /// The lookup covers every bitmap that still carries a pending decode, so
-    /// a load of an image whose decode has not finished shares that decode
-    /// instead of reading and decoding the same bytes a second time. The
-    /// size is the probed size of the image and the pending image is a clone
-    /// of the shared future: every holder waits for the same decode and sees
-    /// the same pixels.
+    /// The lookup covers every bitmap that still carries a pending decode
+    /// and every preload the scene holds, so a load of an image whose decode
+    /// has not finished shares that decode instead of reading and decoding
+    /// the same bytes a second time. The size is the probed size of the
+    /// image and the pending image is a clone of the shared future: every
+    /// holder waits for the same decode and sees the same pixels.
     pub fn pending_decode_for(&self, key: &DecodedImageKey) -> Option<(u32, u32, PendingImage)> {
-        self.bitmaps.iter().find_map(|bitmap| {
+        if let Some(found) = self.bitmaps.iter().find_map(|bitmap| {
             let pending = bitmap.pending.as_ref()?;
             if !pending.fills_cache_entry(key) {
                 return None;
             }
             Some((bitmap.width, bitmap.height, pending.clone()))
+        }) {
+            return Some(found);
+        }
+        // A preload holds a decode for the cache entry as well: a load of an
+        // image whose preload is still running shares that decode.
+        self.preloads.iter().find_map(|preload| {
+            if preload.key != *key {
+                return None;
+            }
+            Some((preload.width, preload.height, preload.pending.clone()))
         })
     }
 
@@ -2782,8 +2923,11 @@ impl Scene {
     /// Waits for every pending image and installs the pixels.
     ///
     /// The decodes run concurrently, so the wait is the time the last one
-    /// needs rather than the sum of them. Returns the number of images that
-    /// were resolved.
+    /// needs rather than the sum of them. The preloads take their pixels
+    /// into the decoded-image cache here: the frame boundary is where the
+    /// loaded images reach the cache, and a preload that is still decoding
+    /// waits for a later frame. Returns the number of images that were
+    /// resolved.
     pub fn resolve_pending_images(&mut self) -> usize {
         let ids: Vec<u32> = self
             .bitmaps
@@ -2797,6 +2941,7 @@ impl Scene {
                 resolved += 1;
             }
         }
+        self.harvest_preload_decodes();
         resolved
     }
 

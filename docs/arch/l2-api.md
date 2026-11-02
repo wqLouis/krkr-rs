@@ -898,6 +898,12 @@ The scene's side: `Scene::add_pending_bitmap`,
 `Scene::pending_decode_for`, `Scene::resolve_bitmap` and
 `Scene::resolve_pending_images`.
 
+The scene's pre-load: `Scene::add_preload_decode` registers a decode that
+fills a decoded-image cache entry without a bitmap to hold it,
+`Scene::harvest_preload_decodes` takes the pixels of the pre-loads whose
+decode has landed into the cache, and `Scene::touch_decoded_image` marks a
+cached entry most recently used without copying its pixels.
+
 Invariants: the pool is the engine's own state and two pools in one process
 do not interact; a job is charged the size of its bytes plus the size of the
 pixels it will produce, so the memory limit bounds the pool's footprint; a
