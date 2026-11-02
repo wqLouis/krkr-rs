@@ -3,7 +3,8 @@
 **What this page is:** the measured cost of the two loads a game performs —
 the **engine load** (process start → the first frame) and the **scene load**
 (a scenario's assets → the objects a script sees) — with the profile that
-names the hotspot in each, and the change that moved the scene load.
+names the hotspot in each, and the two changes that took the scene load
+from ~370 ms to ~80 ms.
 
 It is a **measurement record**, not a contract: the numbers are one host,
 one game and one build (see §1), and they are here so the next change can be
@@ -30,15 +31,13 @@ says how long the paths take and where the time goes.
   per-script timer (`compat::natives::scripts`, at `debug` log level) and
   the per-native timer (`compat::natives`). They answer *where the wall
   time goes*, with the nesting the script tree has.
-* **A CPU profile** — `perf` is unavailable on this host
-  (`kernel.perf_event_paranoid=2` refuses every event, and
-  `ptrace_scope=1` refuses a profiler that is not the process's parent), so
-  the profile is an **in-process sampler**: a `SIGPROF` handler behind
-  `ITIMER_PROF` records the instruction pointer of every CPU-time tick,
-  and the addresses are symbolised afterwards with `addr2line`. The sampler
-  is a measurement tool, not part of the tree: it was added for this page
-  and removed again.
-
+* **A CPU profile** — `perf record -F 999 -g --call-graph=dwarf`, on a
+  build with symbols and line tables
+  (`CARGO_PROFILE_RELEASE_STRIP=none CARGO_PROFILE_RELEASE_DEBUG=1
+  TJS2_EXTRA_CXXFLAGS=-g cargo build --release`). The host refused every
+  event until `kernel.perf_event_paranoid` was lowered to 1; with that,
+  `perf` gives the self time *and* the call chain. The profiles in this
+  page were taken that way.
 * **A call-stack profile** — `gprofng collect app` (Oracle's profiler,
   which samples on its own signal and needs neither `perf_event` nor
   `ptrace`). It samples coarser than the in-process timer — about one
@@ -46,11 +45,12 @@ says how long the paths take and where the time goes.
   sample (the conversion, §3.5) and where the *inclusive* time is the
   answer.
 
-**What the profiles can and cannot say.** The in-process sampler records the
-instruction pointer only, so it answers *self time* (*where the CPU is*)
-and not the call chain; addresses outside the binary are the C library —
-almost all of them `malloc`/`free` — and are reported as "C library"
-rather than as an unknown. `gprofng` answers both, but with fewer samples.
+**What the profiles can and cannot say.** `perf` answers both the self
+time and the call chain; the addresses outside the binary are the C
+library — almost all of them `malloc`/`free` — and are reported as
+"C library" rather than as an unknown. `gprofng` answers the same
+questions, but with fewer samples (about one per 20 ms of CPU), so it is
+used where there is enough CPU to sample (the conversion, §3.5).
 
 ---
 
@@ -150,18 +150,18 @@ TJS `Array`/`Dictionary` objects.
 One scene (`001.共通－オナニーマスター.ks.scn`, 1 023 542 bytes), through
 the engine's own code path, release build:
 
-| step | before | after |
-|---|---|---|
-| the XP3 index | 0.65 ms | 0.67 ms |
-| the member read | 1.72 ms | 2.21 ms |
-| the PSB parse | 22.9 ms | 24.7 ms |
-| **the conversion** | **403.3 ms** (cold) / **340.6 ms** (warm) | **209.9 ms** (cold) / **134.0 ms** (warm) |
-| **the scene load** | **~428 ms** (cold) / **~367 ms** (warm) | **~237 ms** (cold) / **~162 ms** (warm) |
+| step | the script-built containers | the native constructors | the shared class members |
+|---|---|---|---|
+| the XP3 index | 0.65 ms | 0.67 ms | — |
+| the member read | 1.72 ms | 2.21 ms | — |
+| the PSB parse | 22.9 ms | 24.7 ms | — |
+| **the conversion** | **403.3 ms** (cold) / **340.6 ms** (warm) | **209.9 ms** (cold) / **134.0 ms** (warm) | **~52 ms** (warm) |
+| **the scene load** | **~428 ms** (cold) / **~367 ms** (warm) | **~237 ms** (cold) / **~162 ms** (warm) | **~79 ms** (warm) |
 
 "Cold" is the first conversion in the process (the allocator has not grown
 its arenas yet); "warm" is the second and third. The read and the parse are
-the same code in both columns — the difference between them is the
-measurement noise.
+the same code in every column — the difference between them is the
+measurement noise. The three columns are the three steps of §3.4 and §3.6.
 
 The tree the conversion walks:
 
@@ -230,10 +230,10 @@ own array and dictionary classes), the values are the same, and the
 `psb_file` tests — which pin the value shapes, the octet members and the
 `psb://` registrations — pass unchanged.
 
-### 3.5 What the conversion costs now
+### 3.5 The next hotspot: the VM copies the class members into every instance
 
-The profile of the conversion after the change (3 895 samples) is the VM's
-object machinery, not the port's:
+With the conversion at 134 ms, the profile no longer shows the script
+compiler: the time is in the VM's object machinery.
 
 | self time | what |
 |---|---|
@@ -255,17 +255,63 @@ where the *inclusive* time goes:
 | ↳ 21.9 % | the dictionary member writes (`PropSetByVS`) |
 | the rest | the teardown of the tree and the walk |
 
-So **creating the arrays is the cost**: 45.9 % of the whole conversion, and
-63 % of the conversion proper. The reason is in the VM: creating an
-instance copies the class's native methods into it
-(`tTJSNativeClass::FuncCall` → `InternalEnumMembers`, 45.3 % inclusive),
-and the `Array` class has more members than the `Dictionary` class. The
-measured cost inside the C++ VM is **2.55 µs per array** and **0.31 µs per
-dictionary**; 37 506 arrays are therefore ~96 ms of the 135 ms, and the rest
-of the conversion is ~40 ms.
+**Creating the arrays is the cost**: 45.9 % of the whole conversion, and
+63 % of the conversion proper. The measured cost of one container
+creation (a standalone driver over the vendored VM):
 
-The reference pays the same: it creates the same arrays with the same call
-(`TJSCreateArrayObject()`). **The port is now at the reference's own cost
-for this step.** What is left would need a change inside the vendored VM —
-the copy of the native methods into every instance — and that is the
-reference's own VM.
+| | time | allocations | bytes |
+|---|---|---|---|
+| `TJSCreateArrayObject()` | 2.61 µs | 20 | 3 520 |
+| `TJSCreateDictionaryObject()` | 0.32 µs | 4 | 568 |
+
+**The reason is the VM's object model**: `tTJSNativeClass::FuncCall` copies
+the class's native methods and properties into every instance it creates —
+one member at a time, into a hash table that starts with eight buckets and
+grows to 32 as the members go in. The `Array` class has 24 instance
+members; the `Dictionary` class has none (all eight of its members are
+static), which is why a dictionary is eight times cheaper than an array.
+
+The reference's VM does the same: the vendored `tjsObject.cpp` and
+`tjsNative.cpp` are identical to the reference's. So this cost is the
+reference's own cost, and the scene load pays it 63 879 times.
+
+### 3.6 The change: the instances share the class members
+
+The VM now keeps the class's instance members in one place — the class's
+*template* — and the instances share it:
+
+* `tTJSNativeClass` builds the template once (the first time an instance
+  is created) and hands it to every instance it creates;
+* an instance looks a member up in its own table first and in the template
+  second, and copies the template's members into its own table when it
+  modifies its own members (`Add`, `PropSet`, `DeleteMember`);
+* a shared member is handed out with **the object that uses it** as its
+  "objthis", the way the per-instance copies had it: the call and the
+  property read pass the object, and a value the script keeps carries it;
+* an object's member table is created with its first member, so an object
+  that only shares its class's members has no table of its own.
+
+The result, measured with the same driver:
+
+| | before | after |
+|---|---|---|
+| the array creation | 2.61 µs, 20 allocations, 3 520 B | **0.13 µs, 3 allocations, 216 B** |
+| the dictionary creation | 0.32 µs, 4 allocations, 568 B | **0.12 µs, 3 allocations, 200 B** |
+
+and on the real scene (the same machine, back to back; the host was
+busy during this A/B, so both numbers are above the idle ones):
+
+| | before | after |
+|---|---|---|
+| the conversion | 239 ms | **73 ms** (3.2×) |
+| the allocations per scene | 1.44 M / 169 MB | **0.80 M / 46 MB** |
+
+The script-visible behaviour is unchanged: the same classes, the same
+members, the same values, and a member a script reads or calls still sees
+its own object as the "objthis" — the VM's own test suite and the
+`psb_file` tests pass unchanged.
+
+**The scene load is now ~80 ms**: ~54 ms of conversion, ~25 ms of parse and
+~2 ms of archive read. The two changes together took it from ~370 ms: the
+first (the native constructors) from ~370 ms to ~160 ms, the second (the
+shared class members) from ~160 ms to ~80 ms.

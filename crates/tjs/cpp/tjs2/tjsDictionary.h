@@ -37,7 +37,7 @@ namespace TJS {
     protected:
         tTJSNativeInstance *CreateNativeInstance() override;
 
-        iTJSDispatch2 *CreateBaseTJSObject() override;
+        tTJSCustomObject *CreateBaseTJSObject() override;
 
         static tjs_uint32 ClassID;
 

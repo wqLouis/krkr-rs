@@ -1044,7 +1044,7 @@ tTJSNativeInstance *tTJSArrayClass::CreateNativeInstance() {
 }
 
 //---------------------------------------------------------------------------
-iTJSDispatch2 *tTJSArrayClass::CreateBaseTJSObject() {
+tTJSCustomObject *tTJSArrayClass::CreateBaseTJSObject() {
     return new tTJSArrayObject();
 }
 //---------------------------------------------------------------------------

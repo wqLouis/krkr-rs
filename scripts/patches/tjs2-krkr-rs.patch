@@ -18,6 +18,27 @@ diff -ruN a/tjsArray.cpp b/tjsArray.cpp
                          tTJSBinarySerializer binload(
                              (tTJSArrayObject *)objthis);
                          tTJSVariant *var = binload.Read(stream);
+@@ -1038,7 +1044,7 @@
+ }
+ 
+ //---------------------------------------------------------------------------
+-iTJSDispatch2 *tTJSArrayClass::CreateBaseTJSObject() {
++tTJSCustomObject *tTJSArrayClass::CreateBaseTJSObject() {
+     return new tTJSArrayObject();
+ }
+ //---------------------------------------------------------------------------
+diff -ruN a/tjsArray.h b/tjsArray.h
+--- a/tjsArray.h
++++ b/tjsArray.h
+@@ -75,7 +75,7 @@
+     protected:
+         tTJSNativeInstance *CreateNativeInstance() override;
+ 
+-        iTJSDispatch2 *CreateBaseTJSObject() override;
++        tTJSCustomObject *CreateBaseTJSObject() override;
+ 
+     private:
+         static tjs_uint32 ClassID;
 diff -ruN a/tjsDictionary.cpp b/tjsDictionary.cpp
 --- a/tjsDictionary.cpp
 +++ b/tjsDictionary.cpp
@@ -38,6 +59,50 @@ diff -ruN a/tjsDictionary.cpp b/tjsDictionary.cpp
                          if(!dic)
                              dic = (tTJSDictionaryObject *)
                                  TJSCreateDictionaryObject();
+@@ -255,7 +261,7 @@
+         return new tTJSDictionaryNI();
+     }
+     //---------------------------------------------------------------------------
+-    iTJSDispatch2 *tTJSDictionaryClass::CreateBaseTJSObject() {
++    tTJSCustomObject *tTJSDictionaryClass::CreateBaseTJSObject() {
+         return new tTJSDictionaryObject();
+     }
+     //---------------------------------------------------------------------------
+@@ -282,7 +288,7 @@
+             r += 4, v >>= 4;
+         v <<= 1;
+         tjs_int hashbits = r + ((0xffffaa50 >> v) & 0x03) + 2;
+-        iTJSDispatch2 *dsp = new tTJSDictionaryObject(hashbits);
++        tTJSDictionaryObject *dsp = new tTJSDictionaryObject(hashbits);
+ 
+         // same as tTJSNativeClass
+         tjs_error hr;
+@@ -292,6 +298,13 @@
+                 TJSObjectHashSetType(dsp,
+                                      TJS_W("instance of class ") + ClassName);
+ 
++            // The instance members: shared with the other instances of the
++            // class. The class keeps them in its template; an instance
++            // copies them when it modifies its own members.
++            tTJSCustomObject *template_members = GetInstanceMemberTemplate();
++            if(template_members && template_members->Count > 0)
++                dsp->SetMemberTemplate(template_members);
++
+             // instance initialization
+             hr = FuncCall(0, nullptr, nullptr, nullptr, 0, nullptr,
+                           dsp); // add member to dsp
+diff -ruN a/tjsDictionary.h b/tjsDictionary.h
+--- a/tjsDictionary.h
++++ b/tjsDictionary.h
+@@ -37,7 +37,7 @@
+     protected:
+         tTJSNativeInstance *CreateNativeInstance() override;
+ 
+-        iTJSDispatch2 *CreateBaseTJSObject() override;
++        tTJSCustomObject *CreateBaseTJSObject() override;
+ 
+         static tjs_uint32 ClassID;
+ 
 diff -ruN a/tjsInterCodeExec.cpp b/tjsInterCodeExec.cpp
 --- a/tjsInterCodeExec.cpp
 +++ b/tjsInterCodeExec.cpp
@@ -189,10 +254,341 @@ diff -ruN a/tjsInterCodeGen.cpp b/tjsInterCodeGen.cpp
      }
  
      //---------------------------------------------------------------------------
+diff -ruN a/tjsNative.cpp b/tjsNative.cpp
+--- a/tjsNative.cpp
++++ b/tjsNative.cpp
+@@ -235,6 +235,7 @@
+     tTJSNativeClass::tTJSNativeClass(const ttstr &name) {
+         CallFinalize = false;
+         ClassName = TJSMapGlobalStringMap(name);
++        InstanceMemberTemplate = nullptr;
+ 
+         if(TJSObjectHashMapEnabled())
+             TJSObjectHashSetType(this,
+@@ -242,7 +243,9 @@
+     }
+ 
+     //---------------------------------------------------------------------------
+-    tTJSNativeClass::~tTJSNativeClass() {}
++    tTJSNativeClass::~tTJSNativeClass() {
++        InvalidateInstanceMemberTemplate();
++    }
+ 
+     //---------------------------------------------------------------------------
+     void tTJSNativeClass::RegisterNCM(const tjs_char *name, iTJSDispatch2 *dsp,
+@@ -293,7 +296,7 @@
+     void tTJSNativeClass::Finalize() { tTJSCustomObject::Finalize(); }
+ 
+     //---------------------------------------------------------------------------
+-    iTJSDispatch2 *tTJSNativeClass::CreateBaseTJSObject() {
++    tTJSCustomObject *tTJSNativeClass::CreateBaseTJSObject() {
+         if(SuperClass) {
+             return new tTJSExtendableObject;
+         } else {
+@@ -301,58 +304,30 @@
+         }
+     }
+ 
+-    //---------------------------------------------------------------------------
+-    tjs_error tTJSNativeClass::FuncCall(tjs_uint32 flag,
+-                                        const tjs_char *membername,
+-                                        tjs_uint32 *hint, tTJSVariant *result,
+-                                        tjs_int numparams, tTJSVariant **param,
+-                                        iTJSDispatch2 *objthis) {
+-        if(!GetValidity())
+-            return TJS_E_INVALIDOBJECT;
+-
+-        if(membername) {
+-            tjs_error hr = tTJSCustomObject::FuncCall(
+-                flag, membername, hint, result, numparams, param, objthis);
+-            if(hr == TJS_E_MEMBERNOTFOUND && SuperClass != nullptr) {
+-                hr = SuperClass->FuncCall(flag, membername, hint, result,
+-                                          numparams, param, objthis);
+-            }
+-            return hr;
+-        }
+-
+-        tTJSVariant name(ClassName);
+-        objthis->ClassInstanceInfo(TJS_CII_ADD, 0,
+-                                   &name); // add class name
+-
+-        // create base native object
+-        iTJSNativeInstance *nativeptr = CreateNativeInstance();
+-
+-        // register native instance information to the object;
+-        // even if "nativeptr" is nullptr
+-        objthis->NativeInstanceSupport(TJS_NIS_REGISTER, _ClassID, &nativeptr);
+-
+-        // register members to "objthis"
+-
+-        // a class to receive member callback from class
+-        class tCallback : public tTJSDispatch {
++    namespace {
++        // Receives a class's members and copies them into an object: the
++        // members a native class hands to the objects it creates.
++        class tClassMemberCopy : public tTJSDispatch {
+         public:
+             iTJSDispatch2 *Dest; // destination object
++            // Whether the copied member keeps the destination as its
++            // "objthis". The template leaves it unset: the instance that
++            // copies the template gives its own object to its members.
++            bool SetObjThis;
+             tjs_error FuncCall(tjs_uint32 flag, const tjs_char *membername,
+                                tjs_uint32 *hint, tTJSVariant *result,
+                                tjs_int numparams, tTJSVariant **param,
+                                iTJSDispatch2 *objthis) override {
+-                // *param[0] = name   *param[1] = flags   *param[2] =
+-                // value
++                // *param[0] = name   *param[1] = flags   *param[2] = value
+                 tjs_uint32 flags = (tjs_int)*param[1];
+                 if(!(flags & TJS_STATICMEMBER)) {
+                     tTJSVariant val = *param[2];
+-                    if(val.Type() == tvtObject) {
++                    if(SetObjThis && val.Type() == tvtObject) {
+                         // change object's objthis if the object's
+                         // objthis is nullptr
+                         if(val.AsObjectThisNoAddRef() == nullptr)
+                             val.ChangeClosureObjThis(Dest);
+                     }
+-
+                     if(Dest->PropSetByVS(TJS_MEMBERENSURE | TJS_IGNOREPROP |
+                                              flags,
+                                          param[0]->AsStringNoAddRef(), &val,
+@@ -367,17 +342,115 @@
+             }
+         };
+ 
+-        tCallback callback;
+-        callback.Dest = objthis;
++        // Copy the class's instance members into `dest`.
++        void CopyClassInstanceMembers(tTJSNativeClass *cls, iTJSDispatch2 *dest,
++                                      bool set_objthis) {
++            tClassMemberCopy callback;
++            callback.Dest = dest;
++            callback.SetObjThis = set_objthis;
++            tTJSVariantClosure clo(&callback, (iTJSDispatch2 *)nullptr);
++            cls->EnumMembers(TJS_IGNOREPROP, &clo, cls);
++        }
++    } // namespace
++
++    //---------------------------------------------------------------------------
++    void tTJSNativeClass::InvalidateInstanceMemberTemplate() {
++        if(!InstanceMemberTemplate)
++            return;
++        InstanceMemberTemplate->Release();
++        InstanceMemberTemplate = nullptr;
++    }
+ 
+-        // enumerate members
+-        tTJSVariantClosure clo(&callback, (iTJSDispatch2 *)nullptr);
+-        EnumMembers(TJS_IGNOREPROP, &clo, this);
++    //---------------------------------------------------------------------------
++    tTJSCustomObject *tTJSNativeClass::GetInstanceMemberTemplate() {
++        // The members every instance of this class gets.
++        //
++        // The template is built once, from the class's own instance members,
++        // and every instance copies it. The member values keep their
++        // "objthis" unset here: an instance gives its own object to the
++        // members it copies.
++        if(!InstanceMemberTemplate) {
++            tTJSCustomObject *tpl =
++                new tTJSCustomObject(TJS_NAMESPACE_DEFAULT_HASH_BITS);
++            // The template is not a script object: it does not call the
++            // class's "finalize" member when it is dropped.
++            tpl->SetCallFinalize(false);
++            try {
++                CopyClassInstanceMembers(this, tpl, false);
++            } catch(...) {
++                tpl->Release();
++                throw;
++            }
++            InstanceMemberTemplate = tpl;
++        }
++        return InstanceMemberTemplate;
++    }
++
++    //---------------------------------------------------------------------------
++    tjs_error tTJSNativeClass::FuncCall(tjs_uint32 flag,
++                                        const tjs_char *membername,
++                                        tjs_uint32 *hint, tTJSVariant *result,
++                                        tjs_int numparams, tTJSVariant **param,
++                                        iTJSDispatch2 *objthis) {
++        if(!GetValidity())
++            return TJS_E_INVALIDOBJECT;
++
++        if(membername) {
++            tjs_error hr = tTJSCustomObject::FuncCall(
++                flag, membername, hint, result, numparams, param, objthis);
++            if(hr == TJS_E_MEMBERNOTFOUND && SuperClass != nullptr) {
++                hr = SuperClass->FuncCall(flag, membername, hint, result,
++                                          numparams, param, objthis);
++            }
++            return hr;
++        }
++
++        InitializeInstance(objthis);
++
++        // register members to "objthis"
++        CopyClassInstanceMembers(this, objthis, true);
+ 
+         return TJS_S_OK;
+     }
+ 
+     //---------------------------------------------------------------------------
++    void tTJSNativeClass::InitializeInstance(iTJSDispatch2 *objthis) {
++        // Register the class name and the native instance on a new instance
++        // of this class.
++        tTJSVariant name(ClassName);
++        objthis->ClassInstanceInfo(TJS_CII_ADD, 0,
++                                   &name); // add class name
++
++        // create base native object
++        iTJSNativeInstance *nativeptr = CreateNativeInstance();
++
++        // register native instance information to the object;
++        // even if "nativeptr" is nullptr
++        objthis->NativeInstanceSupport(TJS_NIS_REGISTER, _ClassID, &nativeptr);
++    }
++
++    //---------------------------------------------------------------------------
++    tjs_error tTJSNativeClass::PropSet(tjs_uint32 flag,
++                                        const tjs_char *membername,
++                                        tjs_uint32 *hint,
++                                        const tTJSVariant *param,
++                                        iTJSDispatch2 *objthis) {
++        // the class changed: the next instance gets the new members
++        InvalidateInstanceMemberTemplate();
++        return inherited::PropSet(flag, membername, hint, param, objthis);
++    }
++
++    //---------------------------------------------------------------------------
++    tjs_error tTJSNativeClass::PropSetByVS(tjs_uint32 flag,
++                                            tTJSVariantString *membername,
++                                            const tTJSVariant *param,
++                                            iTJSDispatch2 *objthis) {
++        // the class changed: the next instance gets the new members
++        InvalidateInstanceMemberTemplate();
++        return inherited::PropSetByVS(flag, membername, param, objthis);
++    }
++
++    //---------------------------------------------------------------------------
+     tjs_error tTJSNativeClass::CreateNew(tjs_uint32 flag,
+                                          const tjs_char *membername,
+                                          tjs_uint32 *hint,
+@@ -394,7 +467,7 @@
+             }
+         }
+ 
+-        iTJSDispatch2 *dsp = CreateBaseTJSObject();
++        tTJSCustomObject *dsp = CreateBaseTJSObject();
+ 
+         tjs_error hr;
+         try {
+@@ -403,9 +476,16 @@
+                 TJSObjectHashSetType(dsp,
+                                      TJS_W("instance of class ") + ClassName);
+ 
+-            // instance initialization
+-            hr = FuncCall(0, nullptr, nullptr, nullptr, 0, nullptr,
+-                          dsp); // add member to dsp
++            // instance initialization: the class name and the native
++            // instance
++            InitializeInstance(dsp);
++
++            // The instance members: shared with the other instances of the
++            // class. The class keeps them in its template; an instance
++            // copies them when it modifies its own members.
++            tTJSCustomObject *template_members = GetInstanceMemberTemplate();
++            if(template_members && template_members->Count > 0)
++                dsp->SetMemberTemplate(template_members);
+ 
+             if(TJS_FAILED(hr))
+                 return hr;
+diff -ruN a/tjsNative.h b/tjsNative.h
+--- a/tjsNative.h
++++ b/tjsNative.h
+@@ -191,11 +191,25 @@
+         tjs_int32 _ClassID;
+         ttstr ClassName;
+ 
++        // The instance members of this class, built once and copied by every
++        // instance the class creates.
++        tTJSCustomObject *InstanceMemberTemplate;
++
++        tTJSCustomObject *GetInstanceMemberTemplate();
++        // The template, built on the first use.
++
++        void InitializeInstance(iTJSDispatch2 *objthis);
++        // Registers the class name and the native instance on a new
++        // instance of this class.
++
++        void InvalidateInstanceMemberTemplate();
++        // Drops the template: the next instance builds it again.
++
+         void Finalize() override;
+ 
+         virtual iTJSNativeInstance *CreateNativeInstance() { return nullptr; }
+ 
+-        virtual iTJSDispatch2 *CreateBaseTJSObject();
++        virtual tTJSCustomObject *CreateBaseTJSObject();
+ 
+     public:
+         tjs_error FuncCall(tjs_uint32 flag, const tjs_char *membername,
+@@ -203,6 +217,14 @@
+                            tjs_int numparams, tTJSVariant **param,
+                            iTJSDispatch2 *objthis) override;
+ 
++        tjs_error PropSet(tjs_uint32 flag, const tjs_char *membername,
++                          tjs_uint32 *hint, const tTJSVariant *param,
++                          iTJSDispatch2 *objthis) override;
++
++        tjs_error PropSetByVS(tjs_uint32 flag, tTJSVariantString *membername,
++                               const tTJSVariant *param,
++                               iTJSDispatch2 *objthis) override;
++
+         tjs_error CreateNew(tjs_uint32 flag, const tjs_char *membername,
+                             tjs_uint32 *hint, iTJSDispatch2 **result,
+                             tjs_int numparams, tTJSVariant **param,
 diff -ruN a/tjsObject.cpp b/tjsObject.cpp
 --- a/tjsObject.cpp
 +++ b/tjsObject.cpp
-@@ -506,6 +506,14 @@
+@@ -334,8 +334,11 @@
+             hashbits = TJSObjectHashBitsLimit;
+         HashSize = (1 << hashbits);
+         HashMask = HashSize - 1;
+-        Symbols = new tTJSSymbolData[HashSize];
+-        memset(Symbols, 0, sizeof(tTJSSymbolData) * HashSize);
++        // The member table is made with the first member: an object that
++        // only shares its class's members needs no table of its own.
++        Symbols = nullptr;
++        MemberTemplate = nullptr;
++        MemberFoundInTemplate = false;
+         IsInvalidated = false;
+         IsInvalidating = false;
+         CallFinalize = true;
+@@ -364,6 +367,8 @@
+             }
+         }
+         delete[] Symbols;
++        if(MemberTemplate)
++            MemberTemplate->Release();
+         if(TJSObjectHashMapEnabled())
+             TJSRemoveObjectHashRecord(this);
+     }
+@@ -499,6 +504,12 @@
+             return nullptr;
+         }
+ 
++        // The shared class members are copied into this object's table
++        // before it is modified, and the table is made with the first
++        // member.
++        MaterializeMemberTemplate();
++        AllocateSymbolTable();
++
+         tTJSSymbolData *data;
+         data = Find(name, hint);
+         if(data) {
+@@ -506,6 +517,14 @@
              return data;
          }
  
@@ -207,7 +603,20 @@ diff -ruN a/tjsObject.cpp b/tjsObject.cpp
          tjs_uint32 hash;
          if(hint && *hint)
              hash = *hint; // hint must be hash because of previous
-@@ -560,6 +568,11 @@
+@@ -553,6 +572,12 @@
+             return nullptr;
+         }
+ 
++        // The shared class members are copied into this object's table
++        // before it is modified, and the table is made with the first
++        // member.
++        MaterializeMemberTemplate();
++        AllocateSymbolTable();
++
+         tTJSSymbolData *data;
+         data = Find((const tjs_char *)(*name), name->GetHint());
+         if(data) {
+@@ -560,6 +585,11 @@
              return data;
          }
  
@@ -219,6 +628,378 @@ diff -ruN a/tjsObject.cpp b/tjsObject.cpp
          tjs_uint32 hash;
          if(*(name->GetHint()))
              hash = *(name->GetHint()); // hint must be hash because of
+@@ -655,6 +685,9 @@
+         // rebuild hash table
+         RebuildHashMagic = TJSGlobalRebuildHashMagic;
+ 
++        if(!Symbols)
++            return;
++
+         // decide new hash table size
+ 
+         tjs_int r, v = requestcount;
+@@ -760,6 +793,18 @@
+                                         tjs_uint32 *hint) {
+         // TODO: utilize hint
+         // find an element named "name" and deletes it
++        if(name == nullptr)
++            return false;
++
++        // A shared class member is copied into this object's table before
++        // it is deleted: the class keeps the member for the other
++        // instances.
++        if(MemberTemplate && MemberTemplate->Find(name, nullptr))
++            MaterializeMemberTemplate();
++
++        if(!Symbols)
++            return false;
++
+         tjs_uint32 hash = tTJSHashFunc<tjs_char *>::Make(name);
+         tTJSSymbolData *lv1 = Symbols + (hash & HashMask);
+ 
+@@ -800,6 +845,16 @@
+ 
+     //---------------------------------------------------------------------------
+     void tTJSCustomObject::DeleteAllMembers() {
++        // the shared class members are dropped with the object: the class
++        // keeps them for the other instances
++        if(MemberTemplate) {
++            MemberTemplate->Release();
++            MemberTemplate = nullptr;
++        }
++
++        if(!Symbols)
++            return;
++
+         // delete all members
+         if(Count <= 10)
+             return _DeleteAllMembers();
+@@ -980,14 +1035,155 @@
+     }
+ 
+     //---------------------------------------------------------------------------
++    void tTJSCustomObject::CopySymbol(const tTJSSymbolData *src,
++                                      tTJSSymbolData *dst) {
++        // copy one member: the name, the flags and the value
++        dst->SelfClear();
++        dst->SetName(src->Name, src->Hash);
++        dst->SymFlags |= TJS_SYMBOL_USING;
++        dst->SymFlags |=
++            src->SymFlags & (TJS_SYMBOL_HIDDEN | TJS_SYMBOL_STATIC);
++
++        GetValue(dst).CopyRef(*(tTJSVariant *)(&(src->Value)));
++
++        // the member value gets this object as its "objthis"
++        tTJSVariant *value = &GetValue(dst);
++        if(value->Type() == tvtObject)
++            value->ChangeClosureObjThis(this);
++        CheckObjectClosureAdd(GetValue(dst));
++    }
++
++    //---------------------------------------------------------------------------
++    bool tTJSCustomObject::CopyMemberTableFrom(tTJSCustomObject *src) {
++        // Copy the member table of another object into this object's table.
++        //
++        // The layout is kept: the same buckets, the same chain order and the
++        // same member values. This is how a native class hands its instance
++        // members to an instance: the class builds the table once and every
++        // instance copies it, instead of reading the class member by member.
++        if(src == nullptr)
++            return false;
++
++        if(src->Count == 0)
++            return true; // nothing to copy
++
++        // the old members are released first: the new table replaces them
++        if(Count > 0)
++            DeleteAllMembers();
++
++        tjs_int newsize = src->HashSize;
++        tTJSSymbolData *newsymbols = new tTJSSymbolData[newsize];
++        memset(newsymbols, 0, sizeof(tTJSSymbolData) * newsize);
++
++        tjs_int newcount = 0;
++        std::vector<tTJSSymbolData *> chain;
++        try {
++            const tTJSSymbolData *lv1 = src->Symbols;
++            const tTJSSymbolData *lv1lim = lv1 + src->HashSize;
++            for(; lv1 < lv1lim; lv1++) {
++                tTJSSymbolData *newslot = newsymbols + (lv1 - src->Symbols);
++                tTJSSymbolData *newtail = nullptr;
++
++                if(lv1->SymFlags & TJS_SYMBOL_USING) {
++                    CopySymbol(lv1, newslot);
++                    newcount++;
++                }
++
++                for(const tTJSSymbolData *d = lv1->Next; d; d = d->Next) {
++                    tTJSSymbolData *nd = new tTJSSymbolData;
++                    nd->SelfClear();
++                    chain.push_back(nd);
++                    CopySymbol(d, nd);
++                    newcount++;
++                    if(newtail)
++                        newtail->Next = nd;
++                    else
++                        newslot->Next = nd;
++                    newtail = nd;
++                }
++            }
++        } catch(...) {
++            for(tTJSSymbolData *nd : chain)
++                delete nd;
++            delete[] newsymbols;
++            throw;
++        }
++
++        delete[] Symbols;
++        Symbols = newsymbols;
++        HashSize = newsize;
++        HashMask = src->HashMask;
++        Count = newcount;
++        return true;
++    }
++
++    //---------------------------------------------------------------------------
++    void tTJSCustomObject::SetMemberTemplate(tTJSCustomObject *tpl) {
++        // Share the class members with this object.
++        if(MemberTemplate == tpl)
++            return;
++        if(MemberTemplate) {
++            MemberTemplate->Release();
++            MemberTemplate = nullptr;
++        }
++        MemberTemplate = tpl;
++        if(tpl)
++            tpl->AddRef();
++    }
++
++    //---------------------------------------------------------------------------
++    void tTJSCustomObject::MaterializeMemberTemplate() {
++        // Copy the shared class members into this object's own table and
++        // detach the template: from now on the object owns its members.
++        if(!MemberTemplate)
++            return;
++        tTJSCustomObject *tpl = MemberTemplate;
++        MemberTemplate = nullptr;
++        try {
++            CopyMemberTableFrom(tpl);
++        } catch(...) {
++            tpl->Release();
++            throw;
++        }
++        tpl->Release();
++    }
++
++    //---------------------------------------------------------------------------
++    void tTJSCustomObject::AllocateSymbolTable() {
++        // Create the member table; it is made with the first member.
++        if(Symbols)
++            return;
++        Symbols = new tTJSSymbolData[HashSize];
++        memset(Symbols, 0, sizeof(tTJSSymbolData) * HashSize);
++    }
++
++    //---------------------------------------------------------------------------
+     tTJSCustomObject::tTJSSymbolData *
+     tTJSCustomObject::Find(const tjs_char *name, tjs_uint32 *hint) {
+-        // searche an element named "name" and return its
+-        // "SymbolData". return nullptr if the element is not found.
++        // Search an element named "name" and return its "SymbolData".
++        // Return nullptr if the element is not found.
++        //
++        // The shared class members are searched when this object's own table
++        // does not hold the member.
++        tTJSSymbolData *data = FindOwn(name, hint);
++        MemberFoundInTemplate = false;
++        if(!data && MemberTemplate) {
++            data = MemberTemplate->Find(name, hint);
++            MemberFoundInTemplate = data != nullptr;
++        }
++        return data;
++    }
+ 
++    //---------------------------------------------------------------------------
++    tTJSCustomObject::tTJSSymbolData *
++    tTJSCustomObject::FindOwn(const tjs_char *name, tjs_uint32 *hint) {
++        // Search an element named "name" in this object's own table.
+         if(!name)
+             return nullptr;
+ 
++        if(!Symbols)
++            return nullptr; // the object holds no member of its own
++
+         if(hint && *hint) {
+             // try finding via hint
+             // search over the chain
+@@ -1028,6 +1224,9 @@
+         if(hint)
+             *hint = hash;
+ 
++        if(!Symbols)
++            return nullptr;
++
+         tTJSSymbolData *lv1 = Symbols + (hash & HashMask);
+ 
+         if(!(lv1->SymFlags & TJS_SYMBOL_USING) && lv1->Next == nullptr)
+@@ -1100,6 +1299,13 @@
+         if(!callback)
+             return;
+ 
++        // the shared class members come first
++        if(MemberTemplate)
++            MemberTemplate->InternalEnumMembers(flags, callback, objthis);
++
++        if(!Symbols)
++            return;
++
+         tTJSVariant name;
+         tTJSVariant newflags;
+         tTJSVariant value;
+@@ -1225,6 +1431,13 @@
+             return TJS_E_MEMBERNOTFOUND; // member not found
+         }
+ 
++        // A shared class member belongs to this object: it is called with
++        // this object as its "objthis", the way the members a class copies
++        // into its instances do.
++        if(MemberFoundInTemplate) {
++            return TJSDefaultFuncCall(flag, GetValue(data), result, numparams,
++                                      param, this);
++        }
+         return TJSDefaultFuncCall(flag, GetValue(data), result, numparams,
+                                   param, objthis);
+     }
+@@ -1308,6 +1521,16 @@
+         if(!data)
+             return TJS_E_MEMBERNOTFOUND; // not found
+ 
++        // A shared class member belongs to this object: it is handed out
++        // with this object as its "objthis", the way the members a class
++        // copies into its instances do.
++        if(MemberFoundInTemplate) {
++            tTJSVariant value = GetValue(data);
++            if(value.Type() == tvtObject &&
++               value.AsObjectThisNoAddRef() == nullptr)
++                value.ChangeClosureObjThis(this);
++            return TJSDefaultPropGet(flag, value, result, this);
++        }
+         return TJSDefaultPropGet(flag, GetValue(data), result, objthis);
+     }
+ 
+@@ -1382,6 +1605,15 @@
+         if(!data)
+             return TJS_E_MEMBERNOTFOUND; // not found
+ 
++        if(MemberTemplate) {
++            // The shared class members are copied into this object's table
++            // before it is modified.
++            MaterializeMemberTemplate();
++            data = Find(membername, hint);
++            if(!data)
++                return TJS_E_MEMBERNOTFOUND; // not found
++        }
++
+         if(flag & TJS_HIDDENMEMBER)
+             data->SymFlags |= TJS_SYMBOL_HIDDEN;
+         else
+@@ -1438,7 +1670,7 @@
+         if(!result)
+             return TJS_E_INVALIDPARAM;
+ 
+-        *result = Count;
++        *result = Count + (MemberTemplate ? MemberTemplate->Count : 0);
+ 
+         return TJS_S_OK;
+     }
+@@ -1475,6 +1707,16 @@
+         if(!data)
+             return TJS_E_MEMBERNOTFOUND; // not found
+ 
++        if(MemberTemplate) {
++            // The shared class members are copied into this object's table
++            // before it is modified.
++            MaterializeMemberTemplate();
++            data = Find((const tjs_char *)(*membername),
++                        membername->GetHint());
++            if(!data)
++                return TJS_E_MEMBERNOTFOUND; // not found
++        }
++
+         if(flag & TJS_HIDDENMEMBER)
+             data->SymFlags |= TJS_SYMBOL_HIDDEN;
+         else
+diff -ruN a/tjsObject.h b/tjsObject.h
+--- a/tjsObject.h
++++ b/tjsObject.h
+@@ -343,6 +343,12 @@
+         tjs_int HashMask;
+         tjs_int HashSize;
+         tTJSSymbolData *Symbols;
++        // The class members this object shares with the other instances of
++        // its class. The members live in the template's table; the object
++        // copies them into its own table before it modifies them.
++        tTJSCustomObject *MemberTemplate;
++        // Whether the last member lookup found a shared class member.
++        bool MemberFoundInTemplate;
+         tjs_uint RebuildHashMagic;
+         bool IsInvalidated;
+         bool IsInvalidating;
+@@ -421,7 +427,22 @@
+         // Deletes all members ( not to use std::vector )
+ 
+         tTJSSymbolData *Find(const tjs_char *name, tjs_uint32 *hint);
+-        // Finds Name, returns its data; if not found, returns nullptr
++        // Finds Name, returns its data; if not found, returns nullptr.
++        // The shared class members are searched when this object's own table
++        // does not hold the member.
++
++        tTJSSymbolData *FindOwn(const tjs_char *name, tjs_uint32 *hint);
++        // Finds Name in this object's own table only.
++
++        void MaterializeMemberTemplate();
++        // Copies the shared class members into this object's own table and
++        // detaches the template.
++
++        void AllocateSymbolTable();
++        // Creates the member table; it is made with the first member.
++
++        void CopySymbol(const tTJSSymbolData *src, tTJSSymbolData *dst);
++        // Copies one member (the name, the flags and the value) into another
+ 
+         static bool CallEnumCallbackForData(tjs_uint32 flags,
+                                             tTJSVariant **params,
+@@ -435,6 +456,30 @@
+     public:
+         void Clear() { DeleteAllMembers(); }
+ 
++        void SetCallFinalize(bool call_finalize) {
++            CallFinalize = call_finalize;
++        }
++        // Whether the object calls its "finalize" member when it is
++        // destroyed.
++
++        /**
++         * Share the class members with this object.
++         *
++         * The members are looked up in the template until the object
++         * modifies its own member table; then it copies them.
++         */
++        void SetMemberTemplate(tTJSCustomObject *tpl);
++
++        /**
++         * Copy the member table of another object into this object's table.
++         *
++         * The layout is kept: the same buckets, the same chain order and the
++         * same member values. A member value that is an object gets this
++         * object as its "objthis", the way the members a class hands to the
++         * instances it creates do.
++         */
++        bool CopyMemberTableFrom(tTJSCustomObject *src);
++
+         /**
+          * rebuild hash table
+          */
 diff -ruN a/tjsString.cpp b/tjsString.cpp
 --- a/tjsString.cpp
 +++ b/tjsString.cpp

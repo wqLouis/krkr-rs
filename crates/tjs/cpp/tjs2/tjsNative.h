@@ -191,17 +191,39 @@ namespace TJS {
         tjs_int32 _ClassID;
         ttstr ClassName;
 
+        // The instance members of this class, built once and copied by every
+        // instance the class creates.
+        tTJSCustomObject *InstanceMemberTemplate;
+
+        tTJSCustomObject *GetInstanceMemberTemplate();
+        // The template, built on the first use.
+
+        void InitializeInstance(iTJSDispatch2 *objthis);
+        // Registers the class name and the native instance on a new
+        // instance of this class.
+
+        void InvalidateInstanceMemberTemplate();
+        // Drops the template: the next instance builds it again.
+
         void Finalize() override;
 
         virtual iTJSNativeInstance *CreateNativeInstance() { return nullptr; }
 
-        virtual iTJSDispatch2 *CreateBaseTJSObject();
+        virtual tTJSCustomObject *CreateBaseTJSObject();
 
     public:
         tjs_error FuncCall(tjs_uint32 flag, const tjs_char *membername,
                            tjs_uint32 *hint, tTJSVariant *result,
                            tjs_int numparams, tTJSVariant **param,
                            iTJSDispatch2 *objthis) override;
+
+        tjs_error PropSet(tjs_uint32 flag, const tjs_char *membername,
+                          tjs_uint32 *hint, const tTJSVariant *param,
+                          iTJSDispatch2 *objthis) override;
+
+        tjs_error PropSetByVS(tjs_uint32 flag, tTJSVariantString *membername,
+                               const tTJSVariant *param,
+                               iTJSDispatch2 *objthis) override;
 
         tjs_error CreateNew(tjs_uint32 flag, const tjs_char *membername,
                             tjs_uint32 *hint, iTJSDispatch2 **result,

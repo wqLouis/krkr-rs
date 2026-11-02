@@ -235,6 +235,7 @@ namespace TJS {
     tTJSNativeClass::tTJSNativeClass(const ttstr &name) {
         CallFinalize = false;
         ClassName = TJSMapGlobalStringMap(name);
+        InstanceMemberTemplate = nullptr;
 
         if(TJSObjectHashMapEnabled())
             TJSObjectHashSetType(this,
@@ -242,7 +243,9 @@ namespace TJS {
     }
 
     //---------------------------------------------------------------------------
-    tTJSNativeClass::~tTJSNativeClass() {}
+    tTJSNativeClass::~tTJSNativeClass() {
+        InvalidateInstanceMemberTemplate();
+    }
 
     //---------------------------------------------------------------------------
     void tTJSNativeClass::RegisterNCM(const tjs_char *name, iTJSDispatch2 *dsp,
@@ -293,12 +296,94 @@ namespace TJS {
     void tTJSNativeClass::Finalize() { tTJSCustomObject::Finalize(); }
 
     //---------------------------------------------------------------------------
-    iTJSDispatch2 *tTJSNativeClass::CreateBaseTJSObject() {
+    tTJSCustomObject *tTJSNativeClass::CreateBaseTJSObject() {
         if(SuperClass) {
             return new tTJSExtendableObject;
         } else {
             return new tTJSCustomObject;
         }
+    }
+
+    namespace {
+        // Receives a class's members and copies them into an object: the
+        // members a native class hands to the objects it creates.
+        class tClassMemberCopy : public tTJSDispatch {
+        public:
+            iTJSDispatch2 *Dest; // destination object
+            // Whether the copied member keeps the destination as its
+            // "objthis". The template leaves it unset: the instance that
+            // copies the template gives its own object to its members.
+            bool SetObjThis;
+            tjs_error FuncCall(tjs_uint32 flag, const tjs_char *membername,
+                               tjs_uint32 *hint, tTJSVariant *result,
+                               tjs_int numparams, tTJSVariant **param,
+                               iTJSDispatch2 *objthis) override {
+                // *param[0] = name   *param[1] = flags   *param[2] = value
+                tjs_uint32 flags = (tjs_int)*param[1];
+                if(!(flags & TJS_STATICMEMBER)) {
+                    tTJSVariant val = *param[2];
+                    if(SetObjThis && val.Type() == tvtObject) {
+                        // change object's objthis if the object's
+                        // objthis is nullptr
+                        if(val.AsObjectThisNoAddRef() == nullptr)
+                            val.ChangeClosureObjThis(Dest);
+                    }
+                    if(Dest->PropSetByVS(TJS_MEMBERENSURE | TJS_IGNOREPROP |
+                                             flags,
+                                         param[0]->AsStringNoAddRef(), &val,
+                                         Dest) == TJS_E_NOTIMPL)
+                        Dest->PropSet(TJS_MEMBERENSURE | TJS_IGNOREPROP | flags,
+                                      param[0]->GetString(), nullptr, &val,
+                                      Dest);
+                }
+                if(result)
+                    *result = (tjs_int)(1); // returns true
+                return TJS_S_OK;
+            }
+        };
+
+        // Copy the class's instance members into `dest`.
+        void CopyClassInstanceMembers(tTJSNativeClass *cls, iTJSDispatch2 *dest,
+                                      bool set_objthis) {
+            tClassMemberCopy callback;
+            callback.Dest = dest;
+            callback.SetObjThis = set_objthis;
+            tTJSVariantClosure clo(&callback, (iTJSDispatch2 *)nullptr);
+            cls->EnumMembers(TJS_IGNOREPROP, &clo, cls);
+        }
+    } // namespace
+
+    //---------------------------------------------------------------------------
+    void tTJSNativeClass::InvalidateInstanceMemberTemplate() {
+        if(!InstanceMemberTemplate)
+            return;
+        InstanceMemberTemplate->Release();
+        InstanceMemberTemplate = nullptr;
+    }
+
+    //---------------------------------------------------------------------------
+    tTJSCustomObject *tTJSNativeClass::GetInstanceMemberTemplate() {
+        // The members every instance of this class gets.
+        //
+        // The template is built once, from the class's own instance members,
+        // and every instance copies it. The member values keep their
+        // "objthis" unset here: an instance gives its own object to the
+        // members it copies.
+        if(!InstanceMemberTemplate) {
+            tTJSCustomObject *tpl =
+                new tTJSCustomObject(TJS_NAMESPACE_DEFAULT_HASH_BITS);
+            // The template is not a script object: it does not call the
+            // class's "finalize" member when it is dropped.
+            tpl->SetCallFinalize(false);
+            try {
+                CopyClassInstanceMembers(this, tpl, false);
+            } catch(...) {
+                tpl->Release();
+                throw;
+            }
+            InstanceMemberTemplate = tpl;
+        }
+        return InstanceMemberTemplate;
     }
 
     //---------------------------------------------------------------------------
@@ -320,6 +405,18 @@ namespace TJS {
             return hr;
         }
 
+        InitializeInstance(objthis);
+
+        // register members to "objthis"
+        CopyClassInstanceMembers(this, objthis, true);
+
+        return TJS_S_OK;
+    }
+
+    //---------------------------------------------------------------------------
+    void tTJSNativeClass::InitializeInstance(iTJSDispatch2 *objthis) {
+        // Register the class name and the native instance on a new instance
+        // of this class.
         tTJSVariant name(ClassName);
         objthis->ClassInstanceInfo(TJS_CII_ADD, 0,
                                    &name); // add class name
@@ -330,51 +427,27 @@ namespace TJS {
         // register native instance information to the object;
         // even if "nativeptr" is nullptr
         objthis->NativeInstanceSupport(TJS_NIS_REGISTER, _ClassID, &nativeptr);
+    }
 
-        // register members to "objthis"
+    //---------------------------------------------------------------------------
+    tjs_error tTJSNativeClass::PropSet(tjs_uint32 flag,
+                                        const tjs_char *membername,
+                                        tjs_uint32 *hint,
+                                        const tTJSVariant *param,
+                                        iTJSDispatch2 *objthis) {
+        // the class changed: the next instance gets the new members
+        InvalidateInstanceMemberTemplate();
+        return inherited::PropSet(flag, membername, hint, param, objthis);
+    }
 
-        // a class to receive member callback from class
-        class tCallback : public tTJSDispatch {
-        public:
-            iTJSDispatch2 *Dest; // destination object
-            tjs_error FuncCall(tjs_uint32 flag, const tjs_char *membername,
-                               tjs_uint32 *hint, tTJSVariant *result,
-                               tjs_int numparams, tTJSVariant **param,
-                               iTJSDispatch2 *objthis) override {
-                // *param[0] = name   *param[1] = flags   *param[2] =
-                // value
-                tjs_uint32 flags = (tjs_int)*param[1];
-                if(!(flags & TJS_STATICMEMBER)) {
-                    tTJSVariant val = *param[2];
-                    if(val.Type() == tvtObject) {
-                        // change object's objthis if the object's
-                        // objthis is nullptr
-                        if(val.AsObjectThisNoAddRef() == nullptr)
-                            val.ChangeClosureObjThis(Dest);
-                    }
-
-                    if(Dest->PropSetByVS(TJS_MEMBERENSURE | TJS_IGNOREPROP |
-                                             flags,
-                                         param[0]->AsStringNoAddRef(), &val,
-                                         Dest) == TJS_E_NOTIMPL)
-                        Dest->PropSet(TJS_MEMBERENSURE | TJS_IGNOREPROP | flags,
-                                      param[0]->GetString(), nullptr, &val,
-                                      Dest);
-                }
-                if(result)
-                    *result = (tjs_int)(1); // returns true
-                return TJS_S_OK;
-            }
-        };
-
-        tCallback callback;
-        callback.Dest = objthis;
-
-        // enumerate members
-        tTJSVariantClosure clo(&callback, (iTJSDispatch2 *)nullptr);
-        EnumMembers(TJS_IGNOREPROP, &clo, this);
-
-        return TJS_S_OK;
+    //---------------------------------------------------------------------------
+    tjs_error tTJSNativeClass::PropSetByVS(tjs_uint32 flag,
+                                            tTJSVariantString *membername,
+                                            const tTJSVariant *param,
+                                            iTJSDispatch2 *objthis) {
+        // the class changed: the next instance gets the new members
+        InvalidateInstanceMemberTemplate();
+        return inherited::PropSetByVS(flag, membername, param, objthis);
     }
 
     //---------------------------------------------------------------------------
@@ -394,7 +467,7 @@ namespace TJS {
             }
         }
 
-        iTJSDispatch2 *dsp = CreateBaseTJSObject();
+        tTJSCustomObject *dsp = CreateBaseTJSObject();
 
         tjs_error hr;
         try {
@@ -403,9 +476,16 @@ namespace TJS {
                 TJSObjectHashSetType(dsp,
                                      TJS_W("instance of class ") + ClassName);
 
-            // instance initialization
-            hr = FuncCall(0, nullptr, nullptr, nullptr, 0, nullptr,
-                          dsp); // add member to dsp
+            // instance initialization: the class name and the native
+            // instance
+            InitializeInstance(dsp);
+
+            // The instance members: shared with the other instances of the
+            // class. The class keeps them in its template; an instance
+            // copies them when it modifies its own members.
+            tTJSCustomObject *template_members = GetInstanceMemberTemplate();
+            if(template_members && template_members->Count > 0)
+                dsp->SetMemberTemplate(template_members);
 
             if(TJS_FAILED(hr))
                 return hr;

@@ -334,8 +334,11 @@ namespace TJS {
             hashbits = TJSObjectHashBitsLimit;
         HashSize = (1 << hashbits);
         HashMask = HashSize - 1;
-        Symbols = new tTJSSymbolData[HashSize];
-        memset(Symbols, 0, sizeof(tTJSSymbolData) * HashSize);
+        // The member table is made with the first member: an object that
+        // only shares its class's members needs no table of its own.
+        Symbols = nullptr;
+        MemberTemplate = nullptr;
+        MemberFoundInTemplate = false;
         IsInvalidated = false;
         IsInvalidating = false;
         CallFinalize = true;
@@ -364,6 +367,8 @@ namespace TJS {
             }
         }
         delete[] Symbols;
+        if(MemberTemplate)
+            MemberTemplate->Release();
         if(TJSObjectHashMapEnabled())
             TJSRemoveObjectHashRecord(this);
     }
@@ -499,6 +504,12 @@ namespace TJS {
             return nullptr;
         }
 
+        // The shared class members are copied into this object's table
+        // before it is modified, and the table is made with the first
+        // member.
+        MaterializeMemberTemplate();
+        AllocateSymbolTable();
+
         tTJSSymbolData *data;
         data = Find(name, hint);
         if(data) {
@@ -560,6 +571,12 @@ namespace TJS {
         if(name == nullptr) {
             return nullptr;
         }
+
+        // The shared class members are copied into this object's table
+        // before it is modified, and the table is made with the first
+        // member.
+        MaterializeMemberTemplate();
+        AllocateSymbolTable();
 
         tTJSSymbolData *data;
         data = Find((const tjs_char *)(*name), name->GetHint());
@@ -668,6 +685,9 @@ namespace TJS {
         // rebuild hash table
         RebuildHashMagic = TJSGlobalRebuildHashMagic;
 
+        if(!Symbols)
+            return;
+
         // decide new hash table size
 
         tjs_int r, v = requestcount;
@@ -773,6 +793,18 @@ namespace TJS {
                                         tjs_uint32 *hint) {
         // TODO: utilize hint
         // find an element named "name" and deletes it
+        if(name == nullptr)
+            return false;
+
+        // A shared class member is copied into this object's table before
+        // it is deleted: the class keeps the member for the other
+        // instances.
+        if(MemberTemplate && MemberTemplate->Find(name, nullptr))
+            MaterializeMemberTemplate();
+
+        if(!Symbols)
+            return false;
+
         tjs_uint32 hash = tTJSHashFunc<tjs_char *>::Make(name);
         tTJSSymbolData *lv1 = Symbols + (hash & HashMask);
 
@@ -813,6 +845,16 @@ namespace TJS {
 
     //---------------------------------------------------------------------------
     void tTJSCustomObject::DeleteAllMembers() {
+        // the shared class members are dropped with the object: the class
+        // keeps them for the other instances
+        if(MemberTemplate) {
+            MemberTemplate->Release();
+            MemberTemplate = nullptr;
+        }
+
+        if(!Symbols)
+            return;
+
         // delete all members
         if(Count <= 10)
             return _DeleteAllMembers();
@@ -993,13 +1035,154 @@ namespace TJS {
     }
 
     //---------------------------------------------------------------------------
+    void tTJSCustomObject::CopySymbol(const tTJSSymbolData *src,
+                                      tTJSSymbolData *dst) {
+        // copy one member: the name, the flags and the value
+        dst->SelfClear();
+        dst->SetName(src->Name, src->Hash);
+        dst->SymFlags |= TJS_SYMBOL_USING;
+        dst->SymFlags |=
+            src->SymFlags & (TJS_SYMBOL_HIDDEN | TJS_SYMBOL_STATIC);
+
+        GetValue(dst).CopyRef(*(tTJSVariant *)(&(src->Value)));
+
+        // the member value gets this object as its "objthis"
+        tTJSVariant *value = &GetValue(dst);
+        if(value->Type() == tvtObject)
+            value->ChangeClosureObjThis(this);
+        CheckObjectClosureAdd(GetValue(dst));
+    }
+
+    //---------------------------------------------------------------------------
+    bool tTJSCustomObject::CopyMemberTableFrom(tTJSCustomObject *src) {
+        // Copy the member table of another object into this object's table.
+        //
+        // The layout is kept: the same buckets, the same chain order and the
+        // same member values. This is how a native class hands its instance
+        // members to an instance: the class builds the table once and every
+        // instance copies it, instead of reading the class member by member.
+        if(src == nullptr)
+            return false;
+
+        if(src->Count == 0)
+            return true; // nothing to copy
+
+        // the old members are released first: the new table replaces them
+        if(Count > 0)
+            DeleteAllMembers();
+
+        tjs_int newsize = src->HashSize;
+        tTJSSymbolData *newsymbols = new tTJSSymbolData[newsize];
+        memset(newsymbols, 0, sizeof(tTJSSymbolData) * newsize);
+
+        tjs_int newcount = 0;
+        std::vector<tTJSSymbolData *> chain;
+        try {
+            const tTJSSymbolData *lv1 = src->Symbols;
+            const tTJSSymbolData *lv1lim = lv1 + src->HashSize;
+            for(; lv1 < lv1lim; lv1++) {
+                tTJSSymbolData *newslot = newsymbols + (lv1 - src->Symbols);
+                tTJSSymbolData *newtail = nullptr;
+
+                if(lv1->SymFlags & TJS_SYMBOL_USING) {
+                    CopySymbol(lv1, newslot);
+                    newcount++;
+                }
+
+                for(const tTJSSymbolData *d = lv1->Next; d; d = d->Next) {
+                    tTJSSymbolData *nd = new tTJSSymbolData;
+                    nd->SelfClear();
+                    chain.push_back(nd);
+                    CopySymbol(d, nd);
+                    newcount++;
+                    if(newtail)
+                        newtail->Next = nd;
+                    else
+                        newslot->Next = nd;
+                    newtail = nd;
+                }
+            }
+        } catch(...) {
+            for(tTJSSymbolData *nd : chain)
+                delete nd;
+            delete[] newsymbols;
+            throw;
+        }
+
+        delete[] Symbols;
+        Symbols = newsymbols;
+        HashSize = newsize;
+        HashMask = src->HashMask;
+        Count = newcount;
+        return true;
+    }
+
+    //---------------------------------------------------------------------------
+    void tTJSCustomObject::SetMemberTemplate(tTJSCustomObject *tpl) {
+        // Share the class members with this object.
+        if(MemberTemplate == tpl)
+            return;
+        if(MemberTemplate) {
+            MemberTemplate->Release();
+            MemberTemplate = nullptr;
+        }
+        MemberTemplate = tpl;
+        if(tpl)
+            tpl->AddRef();
+    }
+
+    //---------------------------------------------------------------------------
+    void tTJSCustomObject::MaterializeMemberTemplate() {
+        // Copy the shared class members into this object's own table and
+        // detach the template: from now on the object owns its members.
+        if(!MemberTemplate)
+            return;
+        tTJSCustomObject *tpl = MemberTemplate;
+        MemberTemplate = nullptr;
+        try {
+            CopyMemberTableFrom(tpl);
+        } catch(...) {
+            tpl->Release();
+            throw;
+        }
+        tpl->Release();
+    }
+
+    //---------------------------------------------------------------------------
+    void tTJSCustomObject::AllocateSymbolTable() {
+        // Create the member table; it is made with the first member.
+        if(Symbols)
+            return;
+        Symbols = new tTJSSymbolData[HashSize];
+        memset(Symbols, 0, sizeof(tTJSSymbolData) * HashSize);
+    }
+
+    //---------------------------------------------------------------------------
     tTJSCustomObject::tTJSSymbolData *
     tTJSCustomObject::Find(const tjs_char *name, tjs_uint32 *hint) {
-        // searche an element named "name" and return its
-        // "SymbolData". return nullptr if the element is not found.
+        // Search an element named "name" and return its "SymbolData".
+        // Return nullptr if the element is not found.
+        //
+        // The shared class members are searched when this object's own table
+        // does not hold the member.
+        tTJSSymbolData *data = FindOwn(name, hint);
+        MemberFoundInTemplate = false;
+        if(!data && MemberTemplate) {
+            data = MemberTemplate->Find(name, hint);
+            MemberFoundInTemplate = data != nullptr;
+        }
+        return data;
+    }
 
+    //---------------------------------------------------------------------------
+    tTJSCustomObject::tTJSSymbolData *
+    tTJSCustomObject::FindOwn(const tjs_char *name, tjs_uint32 *hint) {
+        // Search an element named "name" in this object's own table.
         if(!name)
             return nullptr;
+
+        if(!Symbols)
+            return nullptr; // the object holds no member of its own
 
         if(hint && *hint) {
             // try finding via hint
@@ -1040,6 +1223,9 @@ namespace TJS {
 
         if(hint)
             *hint = hash;
+
+        if(!Symbols)
+            return nullptr;
 
         tTJSSymbolData *lv1 = Symbols + (hash & HashMask);
 
@@ -1111,6 +1297,13 @@ namespace TJS {
         // note that member changes(delete or insert) through this
         // function is not guaranteed.
         if(!callback)
+            return;
+
+        // the shared class members come first
+        if(MemberTemplate)
+            MemberTemplate->InternalEnumMembers(flags, callback, objthis);
+
+        if(!Symbols)
             return;
 
         tTJSVariant name;
@@ -1238,6 +1431,13 @@ namespace TJS {
             return TJS_E_MEMBERNOTFOUND; // member not found
         }
 
+        // A shared class member belongs to this object: it is called with
+        // this object as its "objthis", the way the members a class copies
+        // into its instances do.
+        if(MemberFoundInTemplate) {
+            return TJSDefaultFuncCall(flag, GetValue(data), result, numparams,
+                                      param, this);
+        }
         return TJSDefaultFuncCall(flag, GetValue(data), result, numparams,
                                   param, objthis);
     }
@@ -1321,6 +1521,16 @@ namespace TJS {
         if(!data)
             return TJS_E_MEMBERNOTFOUND; // not found
 
+        // A shared class member belongs to this object: it is handed out
+        // with this object as its "objthis", the way the members a class
+        // copies into its instances do.
+        if(MemberFoundInTemplate) {
+            tTJSVariant value = GetValue(data);
+            if(value.Type() == tvtObject &&
+               value.AsObjectThisNoAddRef() == nullptr)
+                value.ChangeClosureObjThis(this);
+            return TJSDefaultPropGet(flag, value, result, this);
+        }
         return TJSDefaultPropGet(flag, GetValue(data), result, objthis);
     }
 
@@ -1395,6 +1605,15 @@ namespace TJS {
         if(!data)
             return TJS_E_MEMBERNOTFOUND; // not found
 
+        if(MemberTemplate) {
+            // The shared class members are copied into this object's table
+            // before it is modified.
+            MaterializeMemberTemplate();
+            data = Find(membername, hint);
+            if(!data)
+                return TJS_E_MEMBERNOTFOUND; // not found
+        }
+
         if(flag & TJS_HIDDENMEMBER)
             data->SymFlags |= TJS_SYMBOL_HIDDEN;
         else
@@ -1451,7 +1670,7 @@ namespace TJS {
         if(!result)
             return TJS_E_INVALIDPARAM;
 
-        *result = Count;
+        *result = Count + (MemberTemplate ? MemberTemplate->Count : 0);
 
         return TJS_S_OK;
     }
@@ -1487,6 +1706,16 @@ namespace TJS {
 
         if(!data)
             return TJS_E_MEMBERNOTFOUND; // not found
+
+        if(MemberTemplate) {
+            // The shared class members are copied into this object's table
+            // before it is modified.
+            MaterializeMemberTemplate();
+            data = Find((const tjs_char *)(*membername),
+                        membername->GetHint());
+            if(!data)
+                return TJS_E_MEMBERNOTFOUND; // not found
+        }
 
         if(flag & TJS_HIDDENMEMBER)
             data->SymFlags |= TJS_SYMBOL_HIDDEN;

@@ -343,6 +343,12 @@ namespace TJS {
         tjs_int HashMask;
         tjs_int HashSize;
         tTJSSymbolData *Symbols;
+        // The class members this object shares with the other instances of
+        // its class. The members live in the template's table; the object
+        // copies them into its own table before it modifies them.
+        tTJSCustomObject *MemberTemplate;
+        // Whether the last member lookup found a shared class member.
+        bool MemberFoundInTemplate;
         tjs_uint RebuildHashMagic;
         bool IsInvalidated;
         bool IsInvalidating;
@@ -421,7 +427,22 @@ namespace TJS {
         // Deletes all members ( not to use std::vector )
 
         tTJSSymbolData *Find(const tjs_char *name, tjs_uint32 *hint);
-        // Finds Name, returns its data; if not found, returns nullptr
+        // Finds Name, returns its data; if not found, returns nullptr.
+        // The shared class members are searched when this object's own table
+        // does not hold the member.
+
+        tTJSSymbolData *FindOwn(const tjs_char *name, tjs_uint32 *hint);
+        // Finds Name in this object's own table only.
+
+        void MaterializeMemberTemplate();
+        // Copies the shared class members into this object's own table and
+        // detaches the template.
+
+        void AllocateSymbolTable();
+        // Creates the member table; it is made with the first member.
+
+        void CopySymbol(const tTJSSymbolData *src, tTJSSymbolData *dst);
+        // Copies one member (the name, the flags and the value) into another
 
         static bool CallEnumCallbackForData(tjs_uint32 flags,
                                             tTJSVariant **params,
@@ -434,6 +455,30 @@ namespace TJS {
         //---------------------------------------------------------------------
     public:
         void Clear() { DeleteAllMembers(); }
+
+        void SetCallFinalize(bool call_finalize) {
+            CallFinalize = call_finalize;
+        }
+        // Whether the object calls its "finalize" member when it is
+        // destroyed.
+
+        /**
+         * Share the class members with this object.
+         *
+         * The members are looked up in the template until the object
+         * modifies its own member table; then it copies them.
+         */
+        void SetMemberTemplate(tTJSCustomObject *tpl);
+
+        /**
+         * Copy the member table of another object into this object's table.
+         *
+         * The layout is kept: the same buckets, the same chain order and the
+         * same member values. A member value that is an object gets this
+         * object as its "objthis", the way the members a class hands to the
+         * instances it creates do.
+         */
+        bool CopyMemberTableFrom(tTJSCustomObject *src);
 
         /**
          * rebuild hash table

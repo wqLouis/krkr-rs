@@ -5142,6 +5142,90 @@ var ra = a.get(); var rb = b.get();",
         }
     }
 
+    /// `SharedNatives` — a native class whose instance members the VM shares
+    /// between its instances.
+    extern "C" fn shared_create(_engine: *mut c_void) -> *mut c_void {
+        static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::into_raw(Box::new(id)) as *mut c_void
+    }
+
+    extern "C" fn shared_destroy(_engine: *mut c_void, instance: *mut c_void) {
+        // SAFETY: instance came from shared_create.
+        unsafe { drop(Box::from_raw(instance as *mut u32)) };
+    }
+
+    /// `SharedNatives.who` — the instance's own id. The VM looks the payload
+    /// up through the member's "objthis", so the value tells which instance
+    /// the member was read from.
+    extern "C" fn shared_who_get(
+        _engine: *mut c_void,
+        instance: *mut c_void,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+        _objthis: *mut c_void,
+    ) -> c_int {
+        // SAFETY: instance is the live payload the VM allocated for the object.
+        let id = unsafe { *(instance as *const u32) };
+        set_string_out(out, &format!("instance-{id}"));
+        0
+    }
+
+    fn shared_builder() -> NativeInstanceBuilder<'static> {
+        NativeInstanceBuilder {
+            name: "SharedNatives",
+            create: shared_create,
+            destroy: shared_destroy,
+            invalidate: None,
+            methods: vec![NativeInstanceMethodDef {
+                name: "list",
+                f: array_list,
+            }],
+            properties: vec![NativeInstancePropertyDef {
+                name: "who",
+                get: Some(shared_who_get),
+                set: None,
+            }],
+        }
+    }
+
+    /// The class's instance members are shared by its instances: every
+    /// instance sees them, a member read from an object sees that object,
+    /// and a member written on one instance stays on that instance.
+    #[test]
+    fn a_class_shares_its_instance_members() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class_instance(&shared_builder()).unwrap();
+        e.exec_script(
+            "var a = new SharedNatives(); \
+             var b = new SharedNatives(); \
+             a.own = 'a';",
+            "test",
+        )
+        .unwrap();
+        // every instance sees the class's members
+        assert_eq!(
+            e.eval("typeof a.list", "test").unwrap(),
+            TjsValue::String("Object".into())
+        );
+        assert_eq!(
+            e.eval("typeof b.list", "test").unwrap(),
+            TjsValue::String("Object".into())
+        );
+        // a member read from an object sees that object
+        let a_who = e.eval("a.who", "test").unwrap();
+        let b_who = e.eval("b.who", "test").unwrap();
+        assert_ne!(a_who, b_who);
+        assert_eq!(a_who, e.eval("a.who", "test").unwrap());
+        // a member written on one instance stays on that instance
+        assert_eq!(
+            e.eval("a.own", "test").unwrap(),
+            TjsValue::String("a".into())
+        );
+        assert!(e.eval("b.own", "test").is_err());
+    }
+
     #[test]
     fn static_native_returns_retained_object_usable_from_script() {
         let _vm_lock = vm_lock();

@@ -25,9 +25,11 @@ instance and drives it; see [vm.md](vm.md) and
 | the Rust binding | `crates/tjs/src/lib.rs` — the `tjs2_*` `extern "C"` surface and the safe wrapper |
 | the build script | `crates/tjs/build.rs` |
 
-The vendored tree is read-only for the port: it is the authority on what
-TJS means, and the behaviour it defines is the behaviour the compatibility
-layer must reproduce.
+The vendored tree is the authority on what TJS means, and the behaviour it
+defines is the behaviour the compatibility layer must reproduce. A change
+to it is a patch on the reference's tree: `scripts/patches/tjs2-krkr-rs.patch`
+holds every krkr-rs change, and `scripts/vendor-tjs2.sh` re-applies them
+when the tree is re-vendored.
 
 ---
 
@@ -158,7 +160,34 @@ when it is dropped, so a forgotten id (for example through
 
 ---
 
-## 5. State, lifetimes and threading
+## 5. The member model
+
+The VM keeps a class's instance members in one place and shares them with
+the instances:
+
+* `tTJSNativeClass` builds a **template** — the class's instance members —
+  the first time an instance is created, and every instance it creates
+  shares that template;
+* an instance looks a member up in its own table first and in the template
+  second, and copies the template's members into its own table when it
+  modifies its own members (`Add`, `PropSet`, `DeleteMember`);
+* a shared member is handed out with **the object that uses it** as its
+  "objthis", the way the per-instance copies of the members did: the
+  call and the property read pass the object, and a value the script keeps
+  carries it;
+* an object's member table is created with its first member, so an object
+  that only shares its class's members has no table of its own.
+
+The reference copies the class's members into every instance instead, one
+member at a time. Copying them costs **2.61 µs and 3.5 kB per array** — the
+`Array` class has 24 instance members — and a scene load pays it 63 879
+times. Sharing them costs **0.13 µs and 216 B**, and the scene load drops
+from ~162 ms to ~86 ms; the measurement is in
+[`../../perf.md`](../../perf.md) §3.6.
+
+---
+
+## 6. State, lifetimes and threading
 
 * **The engine is single-threaded.** The TJS2 VM keeps process-global state
   (the script cache, string interning), so two engines must never run
@@ -175,7 +204,7 @@ when it is dropped, so a forgotten id (for example through
 
 ---
 
-## 6. Failure modes
+## 7. Failure modes
 
 | failure | how it surfaces |
 |---|---|
@@ -191,7 +220,7 @@ than only the raw message.
 
 ---
 
-## 7. Tests
+## 8. Tests
 
 The crate carries **81 unit tests** inside `src/lib.rs` and **10 integration
 test files** under `crates/tjs/tests/`.
@@ -220,7 +249,7 @@ state makes concurrent engines unsafe.
 
 ---
 
-## 8. Known gaps
+## 9. Known gaps
 
 * **`unsafe impl Send + Sync for Tjs2Engine` is unsound as a public API** —
   two engines would race the process-global VM state — and nothing requires
@@ -235,7 +264,7 @@ state makes concurrent engines unsafe.
 
 ---
 
-## 9. Related documents
+## 10. Related documents
 
 | topic | document |
 |---|---|

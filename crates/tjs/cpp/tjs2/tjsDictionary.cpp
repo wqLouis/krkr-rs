@@ -261,7 +261,7 @@ namespace TJS {
         return new tTJSDictionaryNI();
     }
     //---------------------------------------------------------------------------
-    iTJSDispatch2 *tTJSDictionaryClass::CreateBaseTJSObject() {
+    tTJSCustomObject *tTJSDictionaryClass::CreateBaseTJSObject() {
         return new tTJSDictionaryObject();
     }
     //---------------------------------------------------------------------------
@@ -288,7 +288,7 @@ namespace TJS {
             r += 4, v >>= 4;
         v <<= 1;
         tjs_int hashbits = r + ((0xffffaa50 >> v) & 0x03) + 2;
-        iTJSDispatch2 *dsp = new tTJSDictionaryObject(hashbits);
+        tTJSDictionaryObject *dsp = new tTJSDictionaryObject(hashbits);
 
         // same as tTJSNativeClass
         tjs_error hr;
@@ -297,6 +297,13 @@ namespace TJS {
             if(TJSObjectHashMapEnabled())
                 TJSObjectHashSetType(dsp,
                                      TJS_W("instance of class ") + ClassName);
+
+            // The instance members: shared with the other instances of the
+            // class. The class keeps them in its template; an instance
+            // copies them when it modifies its own members.
+            tTJSCustomObject *template_members = GetInstanceMemberTemplate();
+            if(template_members && template_members->Count > 0)
+                dsp->SetMemberTemplate(template_members);
 
             // instance initialization
             hr = FuncCall(0, nullptr, nullptr, nullptr, 0, nullptr,
