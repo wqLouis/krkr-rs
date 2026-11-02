@@ -64,20 +64,26 @@
 
 use std::ffi::{c_char, c_int, c_void};
 use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use api::config::CacheLimit;
+use api::media::DecodedImage;
 use tjs::{
-    DetachedValue, Engine, NativeClassBuilder, NativeMethodDef, NativePropertyDef, RetainedValue,
-    TjsValue, VAL_ARRAY, VAL_INTEGER, VAL_NULL, VAL_OBJECT, VAL_OCTET, VAL_REAL, VAL_RETAINED,
-    VAL_STRING, VAL_VOID, Value,
+    DetachedValue, Engine, MemberRead, NativeClassBuilder, NativeMethodDef, NativePropertyDef,
+    RetainedValue, Tjs2Engine, TjsValue, VAL_ARRAY, VAL_INTEGER, VAL_NULL, VAL_OBJECT, VAL_OCTET,
+    VAL_REAL, VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
 };
 
 use crate::binding;
 use crate::collections::Set;
+use crate::engine_api::{DecodedImageKey, DecodedImageMode, ImageOutcome, PendingImage};
 use crate::host::host_desktop_rect;
 use crate::native_util::{
     args, host_ref, report_error, services, set_bool, set_int, set_void, value_as_string,
 };
 use crate::natives::input::vk_pressed;
+use crate::natives::visual::{COLOR_KEY_NONE, load_cached_storage_image, start_pending_decode};
 use crate::{CompatCtx, CompatError, CompatServices};
 
 // ---------------------------------------------------------------------------
@@ -1162,14 +1168,26 @@ extern "C" fn native_assign_message(
 
 /// `System.touchImages(storages[, limit[, timeout]])` → void
 ///
-/// `System.touchImages(storages[, limit[, timeout]])` → void
+/// Pre-loads the named graphics into the graphic cache. The list is walked by
+/// index, every name the cache does not hold yet is queued for a load, and
+/// the names the cache holds are touched, so that the earlier ones keep their
+/// priority in the cache order.
 ///
-/// The reference requires an object first argument and converts the optional
-/// `limit`/`timeout` (`SystemIntf.cpp:224-256`); the pre-caching itself has no
-/// L2 counterpart (the port caches per layer on demand), so only the
-/// reference's argument validation is reproduced.
+/// The graphic cache is the scene's decoded-image cache and the queued loads
+/// run on the decode pool: every name is resolved and its decode submitted
+/// before any of them is waited for, so the pool runs them concurrently and
+/// the wait is the time the last decode needs rather than the sum of them.
+/// The decoded images land in the decoded-image cache, so a later
+/// `Layer.loadImages` of the same image is a cache hit instead of a second
+/// decode.
+///
+/// The `limit` is the byte budget the preload may use: the cache's own limit
+/// bounds it, a limit of zero means the whole cache, and a negative limit is
+/// the number of bytes that must stay free — a negative limit that leaves no
+/// room ends the call without loading anything. The `timeout` bounds the
+/// wait, in milliseconds; zero means no bound.
 extern "C" fn native_touch_images(
-    _engine: *mut c_void,
+    engine: *mut c_void,
     argc: c_int,
     argv: *const Value,
     out: *mut Value,
@@ -1180,29 +1198,292 @@ extern "C" fn native_touch_images(
     }
     // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
-    // The reference requires an array object (`AsObjectClosureNoAddRef` +
-    // `PropGetByNum` walk, `SystemIntf.cpp:224-245` — a non-object raises the
-    // conversion error) and converts the optional `limit`/`timeout` with
-    // `(tjs_int64)*param[i]` when present and non-void, which raises on
-    // objects. The image pre-caching itself has no L2 counterpart (the port
-    // caches per layer on demand), so only the reference's argument
-    // validation is reproduced.
-    if a[0].ty == VAL_NULL || a[0].ty != VAL_OBJECT {
+    // The list must be an object: the walk reads its members by index, and a
+    // non-object raises the conversion error.
+    if a[0].ty != VAL_OBJECT {
         return report_error(
             out_error,
             "System.touchImages: the first argument must be an array",
         );
     }
+    let Some(resolved) = resolve(engine) else {
+        return report_error(out_error, "System.touchImages: compat context is not bound");
+    };
+    let ctx = resolved.ctx();
+    let host = resolved.engine();
+    // The list is walked before the optional arguments are converted.
+    let names = match collect_storage_names(host, &a[0]) {
+        Ok(names) => names,
+        Err(error) => return report_error(out_error, &format!("System.touchImages: {error}")),
+    };
+    let mut limit = 0i64;
+    let mut timeout = 0i64;
     for (index, name) in [(1, "limit"), (2, "timeout")] {
         if let Some(value) = a.get(index)
             && value.ty != VAL_VOID
-            && let Err(error) = try_value_as_i64(value)
         {
-            return report_error(out_error, &format!("System.touchImages {name}: {error}"));
+            // The optional arguments convert with the strict integer
+            // conversion, which raises on objects.
+            match try_value_as_i64(value) {
+                Ok(number) => {
+                    if index == 1 {
+                        limit = number;
+                    } else {
+                        timeout = number;
+                    }
+                }
+                Err(error) => {
+                    return report_error(out_error, &format!("System.touchImages {name}: {error}"));
+                }
+            }
         }
+    }
+    if let Err(error) = touch_images(&ctx, &names, limit, timeout) {
+        return report_error(out_error, &format!("System.touchImages: {error}"));
     }
     set_void(out);
     0
+}
+
+/// The name an object element of the list takes.
+///
+/// An object element converts to a pointer string, which names no storage:
+/// the load of that name fails and the preload carries on.
+const OBJECT_ELEMENT_NAME: &str = "(object)";
+
+/// The storage names the list holds.
+///
+/// The list is walked by index: the walk ends at the first element that is
+/// void and at the first member the list does not hold. Every element is
+/// converted to a string; an octet element raises the conversion error.
+fn collect_storage_names(host: &Tjs2Engine, list: &Value) -> Result<Vec<String>, String> {
+    let retained = host
+        .retain_object_arg(list)
+        .map_err(|error| format!("the list could not be read: {error}"))?;
+    let mut names = Vec::new();
+    let mut index = 0usize;
+    loop {
+        let member = index.to_string();
+        let element = match host.member(retained.raw_id(), &member) {
+            Ok(element) => element,
+            Err(error) => {
+                // A member the list does not hold ends the walk.
+                log::debug!("System.touchImages: the list ends at index {index}: {error}");
+                break;
+            }
+        };
+        match element {
+            TjsValue::Void => break,
+            TjsValue::String(text) => names.push(text),
+            TjsValue::Integer(number) => names.push(number.to_string()),
+            TjsValue::Real(number) => names.push(number.to_string()),
+            TjsValue::Object | TjsValue::Retained(_) => {
+                // An octet element raises the conversion error; an object
+                // element becomes a name that names no storage.
+                match host.member_read(retained.raw_id(), &member) {
+                    Ok(MemberRead::Octet(_)) => {
+                        return Err(format!("the storage name at index {index} is an octet"));
+                    }
+                    Ok(_) => names.push(OBJECT_ELEMENT_NAME.to_string()),
+                    Err(error) => {
+                        return Err(format!("the storage name at index {index}: {error}"));
+                    }
+                }
+            }
+        }
+        index += 1;
+    }
+    Ok(names)
+}
+
+/// Pre-loads the named graphics into the scene's decoded-image cache.
+///
+/// The names are resolved and their decodes submitted as one burst, and the
+/// wait for the results is the time the last decode needs rather than the
+/// sum of them. Every decoded image lands in the decoded-image cache, under
+/// the key the load path uses, so a later load of the same image is a cache
+/// hit instead of a second decode.
+///
+/// The `limit` is the byte budget the preload may use and the `timeout` the
+/// bound on the wait, in milliseconds; a zero timeout means no bound.
+fn touch_images(ctx: &CompatCtx, names: &[String], limit: i64, timeout: i64) -> Result<(), String> {
+    // The graphic cache the preload fills is the scene's decoded-image
+    // cache; a disabled cache leaves the call with nothing to do.
+    let cache_limit = {
+        // SAFETY: the host keeps the attached scene alive for the binding's
+        // lifetime and the VM is single-threaded.
+        let scene = unsafe { &mut *scene_ptr(ctx)? };
+        match scene.decoded_image_cache_limit() {
+            CacheLimit::Disabled => return Ok(()),
+            CacheLimit::Unlimited => u64::MAX,
+            CacheLimit::Bytes(bytes) => bytes.get(),
+        }
+    };
+    // The byte budget: a limit of zero means the whole cache, a limit above
+    // the cache's limit is clamped to it, and a negative limit is the number
+    // of bytes that must stay free — a negative limit that leaves no room
+    // ends the call without loading anything.
+    let budget = if limit >= 0 {
+        let limit = u64::try_from(limit).map_err(|error| error.to_string())?;
+        if limit == 0 || limit > cache_limit {
+            cache_limit
+        } else {
+            limit
+        }
+    } else {
+        let free = limit.unsigned_abs();
+        if free >= cache_limit {
+            return Ok(());
+        }
+        cache_limit - free
+    };
+    // The burst: every name is resolved and its decode submitted before any
+    // of them is waited for.
+    let mut decodes: Vec<(DecodedImageKey, PendingImage)> = Vec::new();
+    let mut keys: Vec<DecodedImageKey> = Vec::new();
+    let mut queued: Set<DecodedImageKey> = Set::default();
+    let mut bytes = 0u64;
+    for name in names {
+        let key = DecodedImageKey::new(name, COLOR_KEY_NONE, DecodedImageMode::Full, 0, 0);
+        keys.push(key.clone());
+        // A name the cache holds is touched, not loaded again.
+        let cached = {
+            // SAFETY: the host keeps the attached scene alive for the
+            // binding's lifetime and the VM is single-threaded.
+            let scene = unsafe { &mut *scene_ptr(ctx)? };
+            scene.lookup_decoded_image(&key)
+        };
+        if cached.is_some() {
+            continue;
+        }
+        // A name the burst already holds is loaded once.
+        if !queued.insert(key.clone()) {
+            continue;
+        }
+        // The preload stops once the loaded images reach the budget.
+        if bytes >= budget {
+            break;
+        }
+        match start_pending_decode(ctx, name, COLOR_KEY_NONE, DecodedImageMode::Full) {
+            Ok(Some((width, height, pending))) => {
+                bytes = bytes.saturating_add(decoded_bytes(width, height));
+                decodes.push((key, pending));
+            }
+            Ok(None) => {
+                // No pool, or the pool refused the job: the image is decoded
+                // on this thread, and the cache keeps it.
+                match load_cached_storage_image(ctx, name, COLOR_KEY_NONE, DecodedImageMode::Full) {
+                    Ok(image) => bytes = bytes.saturating_add(image.rgba.len() as u64),
+                    Err(error) => {
+                        log::warn!("System.touchImages: {name}: {}", error.message());
+                    }
+                }
+            }
+            Err(error) => {
+                // A name that resolves to nothing, or an image the codec does
+                // not recognise: the load fails and the preload carries on.
+                log::warn!("System.touchImages: {name}: {}", error.message());
+            }
+        }
+    }
+    // The wait: the decodes run concurrently, so the wait is the time the
+    // last one needs rather than the sum of them.
+    let deadline = preload_deadline(timeout);
+    for (_key, pending) in &decodes {
+        // A caller waits for the decode, so the job is demanded and a worker
+        // prefers it over the normal jobs in the queue.
+        pending.demand();
+    }
+    for (key, pending) in decodes {
+        match await_decode(&pending, deadline) {
+            Some(ImageOutcome::Ready(image)) => {
+                let decoded = match Arc::try_unwrap(image) {
+                    Ok(decoded) => decoded,
+                    Err(shared) => (*shared).clone(),
+                };
+                if !decoded.is_consistent() {
+                    log::warn!("System.touchImages: the decoded image is malformed");
+                    continue;
+                }
+                // The pixels take the cache entry the load path uses, so a
+                // later load of the same image is a cache hit.
+                // SAFETY: the host keeps the attached scene alive for the
+                // binding's lifetime and the VM is single-threaded.
+                let scene = unsafe { &mut *scene_ptr(ctx)? };
+                match scene.cached_decoded_image(key, || Ok::<DecodedImage, String>(decoded)) {
+                    Ok(_) => {}
+                    Err(error) => log::warn!("System.touchImages: {error}"),
+                }
+            }
+            Some(ImageOutcome::Failed(message)) => {
+                log::warn!("System.touchImages: an image decode failed: {message}");
+            }
+            Some(ImageOutcome::Cancelled) => {
+                log::warn!("System.touchImages: an image decode was cancelled");
+            }
+            None => {
+                // The timeout expired: the decode keeps running and its
+                // pixels are dropped.
+                log::warn!("System.touchImages: the preload timed out");
+            }
+        }
+    }
+    // The cache order: the earlier names keep their priority, so the entries
+    // are touched from the last to the first.
+    for key in keys.iter().rev() {
+        // SAFETY: the host keeps the attached scene alive for the binding's
+        // lifetime and the VM is single-threaded.
+        let scene = unsafe { &mut *scene_ptr(ctx)? };
+        scene.lookup_decoded_image(key);
+    }
+    Ok(())
+}
+
+/// The scene the preload fills, or the error that no scene is attached.
+fn scene_ptr(ctx: &CompatCtx) -> Result<*mut crate::engine_api::Scene, String> {
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine, so its
+    // service pointer is valid for `scene_ptr`.
+    let services = unsafe { ctx.services() };
+    services
+        .scene()
+        .ok_or_else(|| "no scene is attached".to_string())
+}
+
+/// The bytes a decoded image of the given size holds.
+fn decoded_bytes(width: u32, height: u32) -> u64 {
+    u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(4)
+}
+
+/// The moment the preload gives up, or `None` when it does not give up.
+///
+/// A timeout of zero never expires, and a timeout so large that the moment
+/// cannot be represented never expires either.
+fn preload_deadline(timeout: i64) -> Option<Instant> {
+    if timeout <= 0 {
+        return None;
+    }
+    let millis = u64::try_from(timeout).ok()?;
+    Instant::now().checked_add(Duration::from_millis(millis))
+}
+
+/// Waits for a decode, giving up at the deadline.
+///
+/// The wait is on the decode alone. A deadline that passes before the decode
+/// produced its pixels ends the wait: the decode keeps running and its
+/// pixels are dropped.
+fn await_decode(pending: &PendingImage, deadline: Option<Instant>) -> Option<ImageOutcome> {
+    let Some(deadline) = deadline else {
+        return Some(pending.await_ready());
+    };
+    while !pending.is_ready() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Some(pending.await_ready())
 }
 
 /// `System.doCompact([level])` → void

@@ -36,10 +36,10 @@ pub(crate) use engine::{
     Location, Storage, StorageMedia, StorageReadError, normalize_in_archive_name,
 };
 
-// The image decode pool, the pending-image future and the pass a worker runs
-// over decoded pixels: the visual natives submit decodes, wait for them and
-// name their pass through these.
-pub(crate) use engine::imagedecode::{DecodePass, DecodePool, PendingImage};
+// The image decode pool, the pending-image future, the outcome a pending
+// image produced and the pass a worker runs over decoded pixels: the visual
+// natives submit decodes, wait for them and name their pass through these.
+pub(crate) use engine::imagedecode::{DecodePass, DecodePool, ImageOutcome, PendingImage};
 
 // The generic input state the platform events are accumulated into.
 pub(crate) use engine::input::InputState;
