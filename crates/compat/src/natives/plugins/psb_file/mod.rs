@@ -75,7 +75,7 @@ use std::rc::Rc;
 
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
-    RetainedValue, Tjs2Engine, TjsValue, VAL_STRING, Value,
+    Tjs2Engine, TjsValue, VAL_STRING, Value,
 };
 
 use psd::container::{PsbDocument, PsbValue};
@@ -139,22 +139,35 @@ enum Built {
     Octet(Vec<u8>),
 }
 
-fn eval_object(host: &Tjs2Engine, expression: &str, name: &str) -> Result<DetachedValue, String> {
-    match host.eval_retained(expression, name) {
-        Ok(RetainedValue::Object(object)) => Ok(object),
-        Ok(RetainedValue::Value(value)) => Err(format!(
-            "`{expression}` did not return an object ({value:?})"
-        )),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
+/// A fresh TJS array: the VM's own array class, the object an array
+/// literal produces.
+///
+/// It is created through the engine's constructor. A script literal (`[]`)
+/// would compile and run one script per container, and a scene file holds
+/// tens of thousands of them.
 fn array_new(host: &Tjs2Engine) -> Result<DetachedValue, String> {
-    eval_object(host, "[]", "PSBFile.array")
+    host.new_array()
 }
 
+/// A fresh TJS dictionary: the VM's own dictionary class, the object a
+/// dictionary literal produces.
 fn dictionary_new(host: &Tjs2Engine) -> Result<DetachedValue, String> {
-    eval_object(host, "%[]", "PSBFile.dictionary")
+    host.new_dictionary()
+}
+
+/// Append `built` to `array`: the VM's `add`, the method a script
+/// calls to grow an array.
+fn add_built(host: &Tjs2Engine, array: tjs::Tjs2ValueId, built: Built) -> Result<(), String> {
+    match built {
+        Built::Scalar(value) => host.array_add(array, &value),
+        Built::Object(object) => {
+            let id = object.raw_id().as_ptr() as usize as u64;
+            host.array_add(array, &TjsValue::Retained(id))?;
+            drop(object);
+            Ok(())
+        }
+        Built::Octet(bytes) => host.array_add_octet(array, &bytes),
+    }
 }
 
 /// Install `built` as `key` on `parent`.
@@ -199,23 +212,19 @@ fn build_value(
         )),
         PsbValue::Array(values) => {
             let array = array_new(host)?;
-            for (index, value) in values.iter().enumerate() {
+            for value in values {
                 // Reference `PSBArray::toTJSVal` narrows to `tjs_int32`
                 // (`PSBValue.cpp:188`), so entries above `i32::MAX` wrap
                 // negative.
-                host.set_member(
-                    array.raw_id(),
-                    &index.to_string(),
-                    &TjsValue::Integer(i64::from(*value as i32)),
-                )?;
+                host.array_add(array.raw_id(), &TjsValue::Integer(i64::from(*value as i32)))?;
             }
             Ok(Built::Object(array))
         }
         PsbValue::List(items) => {
             let array = array_new(host)?;
-            for (index, item) in items.iter().enumerate() {
+            for item in items {
                 let built = build_value(host, document, item)?;
-                set_built(host, array.raw_id(), &index.to_string(), built)?;
+                add_built(host, array.raw_id(), built)?;
             }
             Ok(Built::Object(array))
         }

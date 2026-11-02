@@ -169,7 +169,12 @@ stream open raises.
   a process global.
 * Building a value for TJS creates real TJS `Dictionary` / `Array` objects
   through the engine, so a game script sees the same shapes as the
-  reference's `toTJSVal` conversions.
+  reference's `toTJSVal` conversions. The containers come from the VM's
+  own array and dictionary classes (`Tjs2Engine::new_array`,
+  `new_dictionary`, `array_add`), not from an evaluated literal: a scene
+  file holds tens of thousands of containers, and one script compile per
+  container cost more than the whole conversion. See
+  [`../../../perf.md`](../../../perf.md) §3 for the measurement.
 * The document is dropped when the instance is invalidated or destroyed.
 * The `psb://` registrations live in the storage media, so they outlive the
   instance — as in the reference, where the media is registered globally.

@@ -693,6 +693,7 @@ in the commit that introduced the change.
 | The Vulkan pipeline and the blend mapping | `docs/arch/l1.md` §3, `docs/code/platform/render.md` |
 | The media engine | `docs/arch/l1.md` §4–§5, `docs/code/platform/media.md` |
 | The file system | `docs/code/platform/fs.md` |
+| The load times: the engine load (the startup), the scene load, their profiles | `docs/perf.md` |
 | Layers, state, frame, coordinate spaces, errors, the decisions | `docs/rules/arch_rules.md` |
 | Public surfaces, the L3↔L2 protocol, ownership, error enums | `docs/rules/api_rules.md` |
 | The L3 ↔ L2 protocol, itemised per module | `docs/code/compat/engine_api.md` |

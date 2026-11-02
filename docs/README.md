@@ -65,7 +65,15 @@ crate:
 
 ---
 
-## 4. The generated reports
+## 4. The measurements
+
+| Page | Covers |
+|---|---|
+| [`perf.md`](perf.md) | the measured load times: the engine load (the startup) and the scene load, the CPU profile of each, and the change that moved the scene load |
+
+---
+
+## 5. The generated reports
 
 These three files are **generated** or **machine-read**; their paths are
 hard-coded in the gate scripts, so they stay at the top level of `docs/`.
@@ -82,7 +90,7 @@ and reviewed.
 
 ---
 
-## 5. The archive
+## 6. The archive
 
 [`../docs.old/`](../docs.old/) is the **superseded** tree: the previous
 top-level pages, the design record and the read-only audits. Nothing there is

@@ -16,6 +16,7 @@
 
 #include "tjs.h"
 #include "tjsArray.h"
+#include "tjsDictionary.h"
 #include "tjsString.h"
 #include "tjsError.h"
 #include "tjsVariant.h"
@@ -3566,6 +3567,155 @@ int tjs2_prop_set(void *engine, tjs2_value_id id, const char *membername,
     } catch(...) {
         if(out_error)
             *out_error = make_error_string("prop_set failed");
+        return 1;
+    }
+}
+
+// Create a fresh TJS Array object and retain it for the caller.
+//
+// The reference's value conversion builds its arrays with the VM's own
+// array class (reference/cpp/plugins/psbfile/PSBValue.cpp:186), so the
+// object this hands out is the same kind of object a script sees there. The
+// reference builds it in C++ because the conversion runs inside the plugin;
+// a host that converts a data tree into script objects needs the same
+// constructor without going through the script compiler.
+tjs2_value_id tjs2_new_array(void *engine, char **out_error) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e) {
+        if(out_error)
+            *out_error = make_error_string("no engine");
+        return nullptr;
+    }
+    try {
+        TJS::iTJSDispatch2 *array = TJS::TJSCreateArrayObject();
+        if(!array) {
+            if(out_error)
+                *out_error = make_error_string("the array object could not be created");
+            return nullptr;
+        }
+        tjs2_value_id id = tjs2_retain_object(e, array);
+        array->Release();
+        if(!id) {
+            if(out_error)
+                *out_error = make_error_string("the array object could not be retained");
+            return nullptr;
+        }
+        if(out_error)
+            *out_error = nullptr;
+        return id;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return nullptr;
+    } catch(...) {
+        if(out_error)
+            *out_error = make_error_string("the array object could not be created");
+        return nullptr;
+    }
+}
+
+// Create a fresh TJS Dictionary object and retain it for the caller.
+//
+// The reference's value conversion builds its dictionaries with the VM's own
+// dictionary class (reference/cpp/plugins/psbfile/PSBValue.cpp:212).
+tjs2_value_id tjs2_new_dictionary(void *engine, char **out_error) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e) {
+        if(out_error)
+            *out_error = make_error_string("no engine");
+        return nullptr;
+    }
+    try {
+        TJS::iTJSDispatch2 *dictionary = TJS::TJSCreateDictionaryObject();
+        if(!dictionary) {
+            if(out_error)
+                *out_error = make_error_string("the dictionary object could not be created");
+            return nullptr;
+        }
+        tjs2_value_id id = tjs2_retain_object(e, dictionary);
+        dictionary->Release();
+        if(!id) {
+            if(out_error)
+                *out_error =
+                    make_error_string("the dictionary object could not be retained");
+            return nullptr;
+        }
+        if(out_error)
+            *out_error = nullptr;
+        return id;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return nullptr;
+    } catch(...) {
+        if(out_error)
+            *out_error = make_error_string("the dictionary object could not be created");
+        return nullptr;
+    }
+}
+
+// Append a value to an Array object: the VM's `add` method.
+//
+// The reference's value conversion calls the same method
+// (reference/cpp/plugins/psbfile/PSBValue.cpp:189, :215), so the array the
+// script sees holds its items in the same order and with the same count.
+int tjs2_array_add(void *engine, tjs2_value_id id, const tjs2_value *value,
+                   char **out_error) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e || !id || !value) {
+        if(out_error)
+            *out_error = make_error_string("invalid retained value");
+        return 1;
+    }
+    try {
+        auto it = e->retained.find((uintptr_t)id);
+        if(it == e->retained.end()) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained value");
+            return 1;
+        }
+        TJS::tTJSVariant var;
+        // The conversion can consume a retained value (possibly the array
+        // itself), so the array is resolved again afterwards.
+        value_to_variant(e, value, &var);
+        it = e->retained.find((uintptr_t)id);
+        if(it == e->retained.end()) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained value");
+            return 1;
+        }
+        TJS::tTJSVariantClosure clo = it->second.AsObjectClosureNoAddRef();
+        TJS::iTJSDispatch2 *array = clo.SelectObjectNoAddRef();
+        if(!array) {
+            if(out_error)
+                *out_error = make_error_string("the value is not an object");
+            return 1;
+        }
+        TJS::tTJSVariant *args[] = { &var };
+        static tjs_uint addHint = 0;
+        tjs_error hr = array->FuncCall(0, TJS_W("add"), &addHint, nullptr, 1,
+                                       args, array);
+        if(TJS_FAILED(hr))
+            TJSThrowFrom_tjs_error(hr, TJS_W("add"));
+        if(out_error)
+            *out_error = nullptr;
+        return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return 1;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return 1;
+    } catch(...) {
+        if(out_error)
+            *out_error = make_error_string("array add failed");
         return 1;
     }
 }

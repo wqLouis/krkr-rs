@@ -87,6 +87,7 @@ the Rust side — no bindgen.
 | natives | `tjs2_register_native_class`, `…_class_ex`, `…_class_instance`, `…_native_static_members`, `…_native_instance_members` |
 | values | `tjs2_retain_value`, `tjs2_release_value`, `tjs2_invalidate_retained`, `tjs2_retain_object`, `tjs2_retain_retained_id`, `tjs2_find_retained_id` |
 | members | `tjs2_prop_get`, `tjs2_prop_set`, `tjs2_prop_delete`, `tjs2_prop_set_default`, `tjs2_call_value`, `tjs2_call_value_with_objthis`, `tjs2_call_member`, `tjs2_set_arg`, `tjs2_result_needed` |
+| containers | `tjs2_new_array`, `tjs2_new_dictionary`, `tjs2_array_add` — the VM's own array and dictionary classes, and the array's `add` |
 | introspection | `tjs2_get_class_names`, `tjs2_enum_members`, `tjs2_set_call_missing`, `tjs2_get_native_instance`, `tjs2_get_stack_trace_string`, `tjs2_dump`, `tjs2_do_gc` |
 
 **The ABI constraint that shapes L3:** a native callback receives only the
@@ -111,6 +112,10 @@ impl Tjs2Engine {
     pub fn register_native_class_instance(&self, builder: &NativeInstanceBuilder) -> Result<(), String>;
     pub fn register_native_static_members(&self, members: &NativeStaticMembers) -> Result<(), String>;
     pub fn register_native_instance_members(&self, members: &NativeInstanceMembers) -> Result<(), String>;
+    pub fn new_array(&self) -> Result<DetachedValue, String>;
+    pub fn new_dictionary(&self) -> Result<DetachedValue, String>;
+    pub fn array_add(&self, id: Tjs2ValueId, value: &TjsValue) -> Result<(), String>;
+    pub fn array_add_octet(&self, id: Tjs2ValueId, bytes: &[u8]) -> Result<(), String>;
     // … retained values, member access, bytecode, GC, introspection
 }
 ```
@@ -188,10 +193,12 @@ than only the raw message.
 
 ## 7. Tests
 
-The crate carries **76 unit tests** inside `src/lib.rs` and **10 integration
+The crate carries **81 unit tests** inside `src/lib.rs` and **10 integration
 test files** under `crates/tjs/tests/`.
 
 The unit tests cover the engine lifecycle, the value marshalling, the
+container constructors (a fresh array is empty and `add` appends to it, a
+fresh dictionary holds no member, an octet item keeps its bytes), the
 interior-NUL representation limit, the native registration and the error
 paths of every native shape (a method that fails, a property setter that
 fails, an instance method called on the wrong object), the retention

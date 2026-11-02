@@ -534,6 +534,46 @@ int tjs2_prop_set(void *engine, tjs2_value_id id, const char *membername,
                   const tjs2_value *value, char **out_error);
 
 /*
+ * Create a fresh TJS Array object and retain it for the caller.
+ *
+ * The object is the VM's own array class (the reference's
+ * `TJSCreateArrayObject()`, reference/cpp/plugins/psbfile/PSBValue.cpp:186),
+ * so a script sees the same object kind the reference's value conversion
+ * builds. A host that turns a data tree into script objects needs that
+ * constructor directly: reaching it through the script compiler would compile
+ * and run one script per node.
+ *
+ * The returned id is a retained value the caller owns (release it with
+ * tjs2_release_value). A null id is a failure; the reason is a malloc'd
+ * UTF-8 message in out_error (the caller may pass a NULL out_error).
+ */
+tjs2_value_id tjs2_new_array(void *engine, char **out_error);
+
+/*
+ * Create a fresh TJS Dictionary object and retain it for the caller.
+ *
+ * The object is the VM's own dictionary class (the reference's
+ * `TJSCreateDictionaryObject()`, reference/cpp/plugins/psbfile/PSBValue.cpp:212).
+ * Same ownership and error conventions as tjs2_new_array.
+ */
+tjs2_value_id tjs2_new_dictionary(void *engine, char **out_error);
+
+/*
+ * Append a value to an Array object: the VM's `add` method, which is what
+ * the reference's value conversion calls
+ * (reference/cpp/plugins/psbfile/PSBValue.cpp:189, :215).
+ *
+ * `value` is a tjs2_value produced by the Rust side; a TJS2_VAL_RETAINED id
+ * is consumed, like everywhere else in this ABI. The array must be a live
+ * retained array object.
+ *
+ * Same error convention as tjs2_prop_set: returns 0 on success; on failure
+ * returns non-zero with a malloc'd UTF-8 message in out_error.
+ */
+int tjs2_array_add(void *engine, tjs2_value_id id, const tjs2_value *value,
+                   char **out_error);
+
+/*
  * Delete a named property from a retained object value (reference
  * `iTJSDispatch2::DeleteMember`, tjsObject.h:472; the `tTJSCustomObject`
  * implementation is tjsObject.cpp:1537-1552 over `DeleteByName`,

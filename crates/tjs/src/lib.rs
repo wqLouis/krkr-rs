@@ -632,6 +632,20 @@ unsafe extern "C" {
         value: *const Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
+    /// Create a fresh TJS Array object and retain it for the caller.
+    /// Returns a null id on failure; the reason is a malloc'd UTF-8 message
+    /// in `out_error`.
+    fn tjs2_new_array(engine: *mut Engine, out_error: *mut *mut c_char) -> Tjs2ValueId;
+    /// Create a fresh TJS Dictionary object and retain it for the caller.
+    /// Same conventions as `tjs2_new_array`.
+    fn tjs2_new_dictionary(engine: *mut Engine, out_error: *mut *mut c_char) -> Tjs2ValueId;
+    /// Append a value to an Array object: the VM's `add` method.
+    fn tjs2_array_add(
+        engine: *mut Engine,
+        id: Tjs2ValueId,
+        value: *const Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
     /// Delete a named property from a retained object value (`DeleteMember`).
     fn tjs2_prop_delete(
         engine: *mut Engine,
@@ -2581,6 +2595,97 @@ name), and none was available"
         Ok(())
     }
 
+    /// Create a fresh TJS Array object.
+    ///
+    /// The array is the VM's own array class — the object an array literal
+    /// produces — so a script sees the same object kind. A host that turns
+    /// a data tree into script objects builds its arrays here instead of
+    /// evaluating a literal: the literal path compiles and runs one script
+    /// per node, and a scene file holds tens of thousands of them.
+    pub fn new_array(&self) -> Result<DetachedValue, String> {
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine; the ABI returns a retained id
+        // the caller owns (released when the value is dropped).
+        let id = unsafe { tjs2_new_array(self.inner, &mut error) };
+        if id.is_null() {
+            return Err(take_error_string(error));
+        }
+        Ok(DetachedValue {
+            engine: self.inner,
+            id,
+        })
+    }
+
+    /// Create a fresh TJS Dictionary object.
+    ///
+    /// The dictionary is the VM's own dictionary class — the object a
+    /// dictionary literal produces.
+    pub fn new_dictionary(&self) -> Result<DetachedValue, String> {
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine; the ABI returns a retained id
+        // the caller owns (released when the value is dropped).
+        let id = unsafe { tjs2_new_dictionary(self.inner, &mut error) };
+        if id.is_null() {
+            return Err(take_error_string(error));
+        }
+        Ok(DetachedValue {
+            engine: self.inner,
+            id,
+        })
+    }
+
+    /// Append a value to an Array object: the VM's `add` method, the one
+    /// a script calls to grow an array.
+    ///
+    /// **Consumption contract:** a retained id is consumed by the
+    /// conversion, exactly as in [Self::set_member].
+    pub fn array_add(&self, id: Tjs2ValueId, value: &TjsValue) -> Result<(), String> {
+        let mut strings = Vec::new();
+        let ffi = value_to_ffi(value, &mut strings)?;
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and id is a live retained id;
+        // value (including any string storage in `strings`) follows the ABI
+        // contract for the duration of the call.
+        let rc = unsafe { tjs2_array_add(self.inner, id, &ffi, &mut error) };
+        if rc != 0 {
+            return Err(take_error_string(error));
+        }
+        Ok(())
+    }
+
+    /// Append octet bytes to an Array object: the VM's `add` with an
+    /// octet item.
+    ///
+    /// An octet is the VM's byte-string variant: a script reads the item as
+    /// `Octet` (`typeof`), with `.length` and index access. The safe
+    /// [`TjsValue`] surface carries no octet variant, so the bytes travel
+    /// through this dedicated entry point.
+    ///
+    /// The VM copies the bytes into the item while the call runs, so
+    /// `bytes` only has to outlive it.
+    pub fn array_add_octet(&self, id: Tjs2ValueId, bytes: &[u8]) -> Result<(), String> {
+        let length = c_int::try_from(bytes.len())
+            .map_err(|_| format!("octet item is too long: {} bytes", bytes.len()))?;
+        let ffi = Value {
+            ty: VAL_OCTET,
+            integer: 0,
+            real: 0.0,
+            string: bytes.as_ptr() as *const c_char,
+            array: ptr::null(),
+            array_count: length,
+            retained: 0,
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and id is a live retained id;
+        // bytes outlive the call — the VM copies them into the item before
+        // it returns.
+        let rc = unsafe { tjs2_array_add(self.inner, id, &ffi, &mut error) };
+        if rc != 0 {
+            return Err(take_error_string(error));
+        }
+        Ok(())
+    }
+
     /// Delete a named property from a retained object value
     /// (`DeleteMember`).
     ///
@@ -3066,6 +3171,75 @@ mod tests {
         let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().expect("create engine");
         drop(e);
+    }
+
+    // The VM's own array class: a fresh array is empty, and the add method
+    // appends to its end (the reference's tTJSArrayObject::Add,
+    // reference/cpp/core/tjs2/tjsArray.cpp:1449-1452).
+    #[test]
+    fn a_new_array_is_empty_and_add_appends() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        let array = e.new_array().expect("array");
+        assert_eq!(
+            e.member(array.raw_id(), "count").expect("count"),
+            TjsValue::Integer(0)
+        );
+        e.array_add(array.raw_id(), &TjsValue::Integer(7))
+            .expect("add");
+        e.array_add(array.raw_id(), &TjsValue::String("text".to_string()))
+            .expect("add");
+        assert_eq!(
+            e.member(array.raw_id(), "count").expect("count"),
+            TjsValue::Integer(2)
+        );
+        assert_eq!(
+            e.member(array.raw_id(), "0").expect("first item"),
+            TjsValue::Integer(7)
+        );
+        assert_eq!(
+            e.member(array.raw_id(), "1").expect("second item"),
+            TjsValue::String("text".to_string())
+        );
+    }
+
+    // The VM's own dictionary class: a fresh dictionary is empty, and a
+    // named member lands in it.
+    #[test]
+    fn a_new_dictionary_is_empty_and_holds_named_members() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        let dictionary = e.new_dictionary().expect("dictionary");
+        assert!(
+            e.enum_members(dictionary.raw_id())
+                .expect("members")
+                .is_empty(),
+            "a fresh dictionary holds no member"
+        );
+        e.set_member(dictionary.raw_id(), "key", &TjsValue::Integer(3))
+            .expect("set");
+        assert_eq!(
+            e.member(dictionary.raw_id(), "key").expect("member"),
+            TjsValue::Integer(3)
+        );
+        assert_eq!(
+            e.enum_members(dictionary.raw_id()).expect("members"),
+            vec!["key".to_string()]
+        );
+    }
+
+    // An octet item keeps its bytes: the array holds the VM's octet
+    // variant, which a script reads with length and index access.
+    #[test]
+    fn an_octet_item_keeps_its_bytes() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        let array = e.new_array().expect("array");
+        e.array_add_octet(array.raw_id(), b"bytes").expect("add");
+        match e.member_read(array.raw_id(), "0").expect("first item") {
+            MemberRead::Octet(bytes) => assert_eq!(bytes, b"bytes"),
+            other => panic!("the item must be an octet, got {other:?}"),
+        }
     }
 
     #[test]
