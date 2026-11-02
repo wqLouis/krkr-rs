@@ -123,11 +123,21 @@ impl Storage {
     pub fn archive_paths(&self) -> impl Iterator<Item = &Path>;
     pub fn for_each_archive(&self, f: impl FnMut(&Path, &Xp3Archive));
     pub fn lookup(&self, name: &str) -> Result<Option<PendingStorage>, StorageReadError>;
+    pub fn resolve_entry(&self, name: &str) -> Result<Option<StorageEntry>, StorageReadError>;
+    pub fn read_entry(&self, entry: &StorageEntry) -> Result<Vec<u8>, StorageReadError>;
 }
 ```
 
 The storage's `read_pool` field is public: the composition root installs the
 pool there, and the engine drains the same pool every frame.
+
+`resolve_entry` is the **lookup** a caller resolves a name with: it answers
+with the entry the name names and schedules the default media's read on the
+read pool, so the bytes are produced off the thread that resolved the name.
+A media's entry is not read there — its provider reads it, on the thread that
+asks for the bytes. `read_entry` is the other half: it waits for the
+scheduled read (or asks the provider) and counts the bytes the read
+produced.
 
 ### Storage media
 

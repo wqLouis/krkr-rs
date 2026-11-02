@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::engine_api::{
     BitmapState, DecodePass, DecodedImageKey, DecodedImageMode, PendingImage, Scene, Storage,
-    StorageReadError,
+    StorageEntry, StorageReadError,
 };
 use api::media::{DecodedImage, ImageInfo};
 use tjs::{
@@ -113,24 +113,139 @@ pub(crate) fn read_image_from_storage(
     storage: &Storage,
     name: &str,
 ) -> Result<(String, Vec<u8>), ImageLoadError> {
+    let resolved = resolve_image(storage, name)?;
+    let resolved_name = resolved.name().to_string();
+    let bytes = resolved.bytes(storage)?;
+    Ok((resolved_name, bytes))
+}
+
+/// A resolved image: the name it resolved under and the entry that holds it.
+///
+/// The entry of the default media is a **scheduled read**: the bytes are
+/// produced by the storage's read pool, off the thread that resolved the
+/// name, and the caller waits for them when it needs them. The entry of a
+/// storage media is read by its provider, on the thread that asks for the
+/// bytes: a provider owns state that belongs to that thread — the `var://`
+/// media walks the script object graph, and that walk may not run on a
+/// worker.
+pub(crate) enum ResolvedImage {
+    /// A file of the default media; its read is scheduled.
+    File {
+        /// The name the image resolved under.
+        name: String,
+        /// The entry the image resolved to.
+        entry: StorageEntry,
+    },
+    /// An entry a storage media serves; the provider answered with the bytes.
+    Media {
+        /// The name the image resolved under.
+        name: String,
+        /// The bytes the provider answered with.
+        bytes: Vec<u8>,
+    },
+}
+
+impl ResolvedImage {
+    /// The name the image resolved under.
+    ///
+    /// A name that resolves as given keeps the spelling the script gave it;
+    /// a name that resolves through an extension carries the extension, so
+    /// the decoder picks its format from it.
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::File { name, .. } | Self::Media { name, .. } => name,
+        }
+    }
+
+    /// The bytes of the entry, waiting for the scheduled read.
+    ///
+    /// # Errors
+    ///
+    /// The storage's own error: a read that failed, or one that was
+    /// cancelled before it produced a result.
+    pub(crate) fn bytes(self, storage: &Storage) -> Result<Vec<u8>, ImageLoadError> {
+        match self {
+            Self::File { entry, .. } => storage.read_entry(&entry).map_err(ImageLoadError::Storage),
+            Self::Media { bytes, .. } => Ok(bytes),
+        }
+    }
+}
+
+/// Resolves an image name into the entry that holds it.
+///
+/// The plain name is tried first and each extension is composed only after the
+/// earlier candidates miss, so a name that resolves as given composes none.
+///
+/// A candidate is **resolved**, never read: the default media's entry is
+/// looked up and its read is scheduled, and a media's entry is read by its
+/// provider. A candidate that does not resolve costs a lookup and no read at
+/// all.
+pub(crate) fn resolve_image(
+    storage: &Storage,
+    name: &str,
+) -> Result<ResolvedImage, ImageLoadError> {
     // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
     let lookup = strip_file_media(name);
-    match storage.read(lookup) {
-        Ok(bytes) => return Ok((name.to_string(), bytes)),
-        Err(StorageReadError::NotFound(_)) => {}
-        Err(error) => return Err(ImageLoadError::Storage(error)),
-    }
-    for extension in IMAGE_EXTENSION_PROBE {
-        let candidate = format!("{lookup}{extension}");
-        match storage.read(&candidate) {
-            Ok(bytes) => return Ok((candidate, bytes)),
-            Err(StorageReadError::NotFound(_)) => {}
-            Err(error) => return Err(ImageLoadError::Storage(error)),
+    // The plain name first, then each extension of the probe list.
+    let mut candidates = Vec::with_capacity(IMAGE_EXTENSION_PROBE.len() + 1);
+    candidates.push(lookup.to_string());
+    candidates.extend(
+        IMAGE_EXTENSION_PROBE
+            .iter()
+            .map(|extension| format!("{lookup}{extension}")),
+    );
+    for candidate in candidates {
+        match storage.resolve_entry(&candidate)? {
+            Some(StorageEntry::File {
+                name: entry_name,
+                pending,
+            }) => {
+                return Ok(ResolvedImage::File {
+                    name: resolved_image_name(name, &candidate, lookup),
+                    entry: StorageEntry::File {
+                        name: entry_name,
+                        pending,
+                    },
+                });
+            }
+            Some(StorageEntry::Media { provider, path }) => {
+                // A media's entry is read by its provider, here: the
+                // provider owns state that belongs to this thread, and the
+                // `var://` media's script-graph walk may not run on a
+                // worker.
+                let media = StorageEntry::Media { provider, path };
+                match storage.read_entry(&media) {
+                    Ok(bytes) => {
+                        return Ok(ResolvedImage::Media {
+                            name: resolved_image_name(name, &candidate, lookup),
+                            bytes,
+                        });
+                    }
+                    // The media holds no such entry: the next candidate is
+                    // tried.
+                    Err(StorageReadError::NotFound(_)) => {}
+                    Err(error) => return Err(ImageLoadError::Storage(error)),
+                }
+            }
+            // The storage holds no such entry: the next candidate is tried.
+            None => {}
         }
     }
     Err(ImageLoadError::Storage(StorageReadError::NotFound(
         name.to_string(),
     )))
+}
+
+/// The name a resolved image is decoded under.
+///
+/// A name that resolves as given keeps the spelling the script gave it; a
+/// name that resolves through an extension carries the extension.
+fn resolved_image_name(requested: &str, candidate: &str, lookup: &str) -> String {
+    if candidate == lookup {
+        requested.to_string()
+    } else {
+        candidate.to_string()
+    }
 }
 
 /// The province image's name for a graphic: `_p` before the extension.
@@ -161,8 +276,8 @@ pub(crate) fn resolve_province_image(
     name: &str,
 ) -> Result<Option<String>, ImageLoadError> {
     let province_name = province_image_name(name);
-    match read_image_from_storage(storage, &province_name) {
-        Ok((resolved, _bytes)) => Ok(Some(resolved)),
+    match resolve_image(storage, &province_name) {
+        Ok(resolved) => Ok(Some(resolved.name().to_string())),
         // The storage holds no province image for this graphic.
         Err(ImageLoadError::Storage(StorageReadError::NotFound(_))) => Ok(None),
         Err(error) => Err(error),
@@ -473,6 +588,160 @@ fn install_decoded_image(
     Ok((id, width, height))
 }
 
+/// A pending image load: the decode that is already running for the image,
+/// or the entry the load reads.
+///
+/// The load is resolved and submitted in two steps, so a caller that loads a
+/// burst of images can resolve them all before it submits any of them: the
+/// resolution schedules the reads, and the storage's read pool runs them
+/// concurrently.
+pub(crate) enum PendingLoad {
+    /// A decode that is already running for this image: the load shares it.
+    Running(u32, u32, PendingImage),
+    /// The entry the load reads and decodes.
+    Entry {
+        /// The name the script asked for; the cache key is built from it.
+        name: String,
+        /// The entry the load reads.
+        entry: ResolvedImage,
+    },
+}
+
+/// Resolves an image load into the decode that is already running for it, or
+/// the entry it reads.
+///
+/// The resolution is a **lookup**: the name is resolved against the storage
+/// namespace and the entry's read is scheduled on the storage's read pool,
+/// so the bytes are produced off the thread that resolved the name. The
+/// storage namespace is not shared with the workers.
+///
+/// Returns `None` when the deferred path does not apply: no pool is
+/// attached, or the load is a province load. The caller then decodes
+/// synchronously.
+///
+/// # Errors
+///
+/// Returns the resolution failure. It is raised at the call, the way a load
+/// failure is raised there: a name that does not resolve never reaches the
+/// pool.
+pub(crate) fn resolve_pending_load(
+    ctx: &CompatCtx,
+    name: &str,
+    colorkey: u32,
+    mode: DecodedImageMode,
+) -> Result<Option<PendingLoad>, ImageLoadError> {
+    // The province plane is a separate target whose reads cannot wait for a
+    // decode, so only a full-colour image is deferred.
+    if mode != DecodedImageMode::Full {
+        return Ok(None);
+    }
+    // Without a pool the load decodes synchronously.
+    if decode_pool_mut(ctx).is_none() {
+        return Ok(None);
+    }
+    // The key depends on the load's inputs alone, so it is known before the
+    // bytes are read.
+    let key = DecodedImageKey::new(name, colorkey, mode, 0, 0);
+    // A decode that is already running for the same image is shared: the
+    // load reads no bytes, probes no header and submits no second job. Every
+    // holder of the shared decode waits for the same pixels.
+    let running = {
+        let scene = scene_ref(ctx)?;
+        scene.pending_decode_for(&key)
+    };
+    if let Some((width, height, pending)) = running {
+        return Ok(Some(PendingLoad::Running(width, height, pending)));
+    }
+    // The resolution and the extension resolution stay on this thread: the
+    // storage namespace is not shared with the workers.
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service
+    // pointer is valid for `resolve_pending_load`.
+    let services = unsafe { ctx.services() };
+    let storage = services
+        .storage()
+        .ok_or_else(|| "no storage attached".to_string())?;
+    // SAFETY: `attach_storage` guarantees the pointer stays valid.
+    let entry = resolve_image(unsafe { &*storage }, name)?;
+    Ok(Some(PendingLoad::Entry {
+        name: name.to_string(),
+        entry,
+    }))
+}
+
+/// Submits the decode of a resolved load, probing its header first.
+///
+/// The probe runs on the calling thread: the load's size is known before the
+/// call returns, and the probe's failure is raised at the call, the way a
+/// load failure is raised there.
+///
+/// Returns the probed size and the future the result lands in, or `None` when
+/// the deferred path does not apply: the pool refused the job. The caller
+/// then decodes synchronously. A colour key does not keep the load
+/// synchronous: the key is a pass over the decoded pixels, and the pool runs
+/// it on the worker.
+///
+/// # Errors
+///
+/// Returns the read or the probe failure. Both are raised at the call, the
+/// way a load failure is raised there: a name that does not resolve and an
+/// image the codec does not recognise never reach the pool.
+pub(crate) fn submit_pending_load(
+    ctx: &CompatCtx,
+    load: PendingLoad,
+    colorkey: u32,
+    mode: DecodedImageMode,
+) -> Result<Option<(u32, u32, PendingImage)>, ImageLoadError> {
+    let (name, entry) = match load {
+        // A decode that is already running for this image: the load shares
+        // it.
+        PendingLoad::Running(width, height, pending) => {
+            return Ok(Some((width, height, pending)));
+        }
+        PendingLoad::Entry { name, entry } => (name, entry),
+    };
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service
+    // pointer is valid for `submit_pending_load`.
+    let services = unsafe { ctx.services() };
+    let Some(pool) = decode_pool_mut(ctx) else {
+        return Ok(None);
+    };
+    let key = DecodedImageKey::new(&name, colorkey, mode, 0, 0);
+    // The name the image resolved under: the decoder picks its format from
+    // it.
+    let resolved_name = entry.name().to_string();
+    // The bytes the scheduled read produced.
+    let Some(storage_ptr) = services.storage() else {
+        return Err(ImageLoadError::Message("no storage attached".to_string()));
+    };
+    // SAFETY: `attach_storage` guarantees the pointer stays valid.
+    let storage = unsafe { &*storage_ptr };
+    let bytes = entry.bytes(storage)?;
+    // The header probe gives the dimensions the image is sized from, and it
+    // rejects an image the load would have rejected at the call.
+    let info = probe_image(services, &resolved_name, &bytes)?;
+    let Some(expected) = decoded_size_bytes(info.width, info.height) else {
+        return Ok(None);
+    };
+    let bytes: Arc<[u8]> = Arc::from(bytes);
+    let hint = Some(resolved_name);
+    // A colour key is a pass over the decoded pixels: the worker applies it,
+    // so the frame thread never sees the unkeyed image and never runs the
+    // pass.
+    let pass = color_key_pass(colorkey);
+    match pool.submit_cached(key, bytes, hint, expected, pass) {
+        Ok((_id, pending)) => Ok(Some((info.width, info.height, pending))),
+        Err(error) => {
+            // The pool refused the job: the load decodes synchronously, and
+            // the refusal is reported rather than swallowed. The error names
+            // the limit the pool refused the job against.
+            log::warn!(
+                "image: the decode pool refused {name:?} ({error}); the load decodes synchronously on the calling thread"
+            );
+            Ok(None)
+        }
+    }
+}
+
 /// Starts a pending decode for `name`, when the pool can take it.
 ///
 /// Returns the probed size and the future the result lands in, or `None` when
@@ -497,62 +766,10 @@ pub(crate) fn start_pending_decode(
     colorkey: u32,
     mode: DecodedImageMode,
 ) -> Result<Option<(u32, u32, PendingImage)>, ImageLoadError> {
-    // The province plane is a separate target whose reads cannot wait for a
-    // decode, so only a full-colour image is deferred.
-    if mode != DecodedImageMode::Full {
-        return Ok(None);
-    }
-    // Without a pool the load decodes synchronously.
-    let Some(pool) = decode_pool_mut(ctx) else {
+    let Some(load) = resolve_pending_load(ctx, name, colorkey, mode)? else {
         return Ok(None);
     };
-    // The key depends on the load's inputs alone, so it is known before the
-    // bytes are read.
-    let key = DecodedImageKey::new(name, colorkey, mode, 0, 0);
-    // A decode that is already running for the same image is shared: the
-    // load reads no bytes, probes no header and submits no second job. Every
-    // holder of the shared decode waits for the same pixels.
-    let running = {
-        let scene = scene_ref(ctx)?;
-        scene.pending_decode_for(&key)
-    };
-    if let Some((width, height, pending)) = running {
-        return Ok(Some((width, height, pending)));
-    }
-    // The read and the extension resolution stay on this thread: the storage
-    // namespace is not shared with the workers.
-    // SAFETY: `ctx` is only created for a bound, live engine, so its service
-    // pointer is valid for `start_pending_decode`.
-    let services = unsafe { ctx.services() };
-    let storage = services
-        .storage()
-        .ok_or_else(|| "no storage attached".to_string())?;
-    // SAFETY: `attach_storage` guarantees the pointer stays valid.
-    let (resolved, bytes) = read_image_from_storage(unsafe { &*storage }, name)?;
-    // The header probe gives the dimensions the image is sized from, and it
-    // rejects an image the load would have rejected at the call.
-    let info = probe_image(services, &resolved, &bytes)?;
-    let Some(expected) = decoded_size_bytes(info.width, info.height) else {
-        return Ok(None);
-    };
-    let bytes: Arc<[u8]> = Arc::from(bytes);
-    let hint = Some(resolved);
-    // A colour key is a pass over the decoded pixels: the worker applies it,
-    // so the frame thread never sees the unkeyed image and never runs the
-    // pass.
-    let pass = color_key_pass(colorkey);
-    match pool.submit_cached(key, bytes, hint, expected, pass) {
-        Ok((_id, pending)) => Ok(Some((info.width, info.height, pending))),
-        Err(error) => {
-            // The pool refused the job: the load decodes synchronously, and
-            // the refusal is reported rather than swallowed. The error names
-            // the limit the pool refused the job against.
-            log::warn!(
-                "image: the decode pool refused {name:?} ({error}); the load decodes synchronously on the calling thread"
-            );
-            Ok(None)
-        }
-    }
+    submit_pending_load(ctx, load, colorkey, mode)
 }
 
 /// Installs a pending decode as the image of `id`, or of a new bitmap.

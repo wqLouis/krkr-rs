@@ -83,7 +83,10 @@ use crate::native_util::{
     args, host_ref, report_error, services, set_bool, set_int, set_void, value_as_string,
 };
 use crate::natives::input::vk_pressed;
-use crate::natives::visual::{COLOR_KEY_NONE, load_cached_storage_image, start_pending_decode};
+use crate::natives::visual::{
+    COLOR_KEY_NONE, PendingLoad, load_cached_storage_image, resolve_pending_load,
+    submit_pending_load,
+};
 use crate::{CompatCtx, CompatError, CompatServices};
 
 // ---------------------------------------------------------------------------
@@ -1344,11 +1347,16 @@ fn touch_images(ctx: &CompatCtx, names: &[String], limit: i64, timeout: i64) -> 
         cache_limit - free
     };
     // The burst: every name is resolved and its decode submitted before any
-    // of them is waited for.
+    // of them is waited for. The resolution comes first for the whole list,
+    // so the storage schedules every read before the first one is waited
+    // for: the reads of the burst then run concurrently on the storage's
+    // read pool.
     let mut decodes: Vec<(DecodedImageKey, PendingImage)> = Vec::new();
     let mut keys: Vec<DecodedImageKey> = Vec::new();
     let mut queued: Set<DecodedImageKey> = Set::default();
     let mut bytes = 0u64;
+    // The resolved loads, in the order the names were given.
+    let mut loads: Vec<(String, DecodedImageKey, Option<PendingLoad>)> = Vec::new();
     for name in names {
         let key = DecodedImageKey::new(name, COLOR_KEY_NONE, DecodedImageMode::Full, 0, 0);
         keys.push(key.clone());
@@ -1366,11 +1374,31 @@ fn touch_images(ctx: &CompatCtx, names: &[String], limit: i64, timeout: i64) -> 
         if !queued.insert(key.clone()) {
             continue;
         }
+        // The resolution: the entry is looked up and its read is scheduled.
+        // A name that resolves to nothing fails the load, and the preload
+        // carries on.
+        let load = match resolve_pending_load(ctx, name, COLOR_KEY_NONE, DecodedImageMode::Full) {
+            Ok(Some(load)) => Some(load),
+            // No pool: the image is decoded on this thread.
+            Ok(None) => None,
+            Err(error) => {
+                log::warn!("System.touchImages: {name}: {}", error.message());
+                continue;
+            }
+        };
+        loads.push((name.clone(), key, load));
+    }
+    for (name, key, load) in loads {
         // The preload stops once the loaded images reach the budget.
         if bytes >= budget {
             break;
         }
-        match start_pending_decode(ctx, name, COLOR_KEY_NONE, DecodedImageMode::Full) {
+        let submitted = match load {
+            Some(load) => submit_pending_load(ctx, load, COLOR_KEY_NONE, DecodedImageMode::Full),
+            // No pool: the image is decoded on this thread.
+            None => Ok(None),
+        };
+        match submitted {
             Ok(Some((width, height, pending))) => {
                 bytes = bytes.saturating_add(decoded_bytes(width, height));
                 decodes.push((key, pending));
@@ -1378,7 +1406,8 @@ fn touch_images(ctx: &CompatCtx, names: &[String], limit: i64, timeout: i64) -> 
             Ok(None) => {
                 // No pool, or the pool refused the job: the image is decoded
                 // on this thread, and the cache keeps it.
-                match load_cached_storage_image(ctx, name, COLOR_KEY_NONE, DecodedImageMode::Full) {
+                match load_cached_storage_image(ctx, &name, COLOR_KEY_NONE, DecodedImageMode::Full)
+                {
                     Ok(image) => bytes = bytes.saturating_add(image.rgba.len() as u64),
                     Err(error) => {
                         log::warn!("System.touchImages: {name}: {}", error.message());

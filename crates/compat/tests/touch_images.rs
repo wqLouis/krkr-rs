@@ -434,3 +434,40 @@ fn touch_images_runs_its_decodes_on_the_pool() {
         "no decode is running"
     );
 }
+
+/// The resolution of a name costs no read.
+///
+/// The reference's graphic resolution asks whether the file exists
+/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:301-318`), so a name
+/// that resolves to nothing is never read.
+#[test]
+fn a_name_that_resolves_to_nothing_costs_no_read() {
+    let _lock = common::vm_lock();
+    let env = Env::new();
+    let before = env._storage.read_bytes();
+    env.run("try { System.touchImages(['missing.png']); } catch (e) {}");
+    assert_eq!(
+        env._storage.read_bytes(),
+        before,
+        "a name that resolves to nothing must not be read"
+    );
+}
+
+/// The pre-load reads the names it decodes.
+///
+/// The bytes come from the storage's read pool, so the reads of a burst
+/// overlap; the storage counts the bytes it handed out. The reference queues
+/// its pre-load the same way
+/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:2233-2262`).
+#[test]
+fn the_preload_reads_every_name_it_decodes() {
+    let _lock = common::vm_lock();
+    let env = Env::new();
+    let before = env._storage.read_bytes();
+    env.run("System.touchImages(['a.png', 'b.png']);");
+    assert_eq!(
+        env._storage.read_bytes() - before,
+        2 * PICTURE.len() as u64,
+        "both names were read"
+    );
+}

@@ -69,6 +69,35 @@ pub use media::StorageMedia;
 /// A registered media provider and the path that follows its scheme.
 type MediaProvider<'a> = (Rc<dyn StorageMedia>, &'a str);
 
+/// A resolved storage entry.
+///
+/// The entry is what a storage name resolves to: a file of the default
+/// media, or an entry a storage media serves.
+///
+/// A file's read is scheduled on the storage's read pool, so the bytes are
+/// produced off the thread that resolved the name; the caller waits for
+/// them when it needs them. A media's entry is not read here: the provider
+/// reads it, on the thread that asks for the bytes, because a provider owns
+/// state that belongs to that thread — the `var://` media walks the script
+/// object graph, and that walk may not run on a worker.
+pub enum StorageEntry {
+    /// A file of the default media: the read is scheduled on the read pool.
+    File {
+        /// The name the entry was resolved under. A read that failed because
+        /// the file is gone reports it.
+        name: String,
+        /// The scheduled read of the entry.
+        pending: PendingStorage,
+    },
+    /// An entry a storage media serves: the provider reads it.
+    Media {
+        /// The provider that serves the entry.
+        provider: Rc<dyn StorageMedia>,
+        /// The path the entry has under the provider's domain.
+        path: String,
+    },
+}
+
 /// Windows `FILE_ATTRIBUTE_DIRECTORY` (0x10).
 pub const ATTR_DIRECTORY: i64 = 0x10;
 /// Windows `FILE_ATTRIBUTE_ARCHIVE` (0x20) — the "normal file" bit.
@@ -1974,6 +2003,110 @@ impl Storage {
         self.generation = self.generation.saturating_add(1);
     }
 
+    /// Resolves a storage name into the entry it names, without reading it.
+    ///
+    /// The resolution is a **lookup**: the default media's entry is found
+    /// through the namespace's own search order and its read is scheduled
+    /// on the storage's read pool, so the bytes are produced off the thread
+    /// that resolved the name. A name that does not resolve is `Ok(None)`.
+    ///
+    /// A name that carries a registered scheme belongs to the media that
+    /// registered it, and its entry is not read here: the provider reads it,
+    /// on the thread that asks for the bytes, because a provider owns state
+    /// that belongs to that thread.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageReadError`] when the name is malformed (a `..` that escapes
+    /// the mount), when the scheme names no registered media, or when a
+    /// file-system failure occurs while probing. A name that does not
+    /// resolve is `Ok(None)`, never an error.
+    pub fn resolve_entry(&self, name: &str) -> Result<Option<StorageEntry>, StorageReadError> {
+        if let Some((provider, path)) = self.media_provider(name)? {
+            return Ok(Some(StorageEntry::Media {
+                provider,
+                path: path.to_string(),
+            }));
+        }
+        let Some(plan) = self.plan_read(name, None)? else {
+            return Ok(None);
+        };
+        let Some(pool) = self.read_pool.as_ref() else {
+            // Without a pool the entry is read on the calling thread.
+            let bytes = FileSystemReader.read(&plan.work)?;
+            return Ok(Some(StorageEntry::File {
+                name: name.to_string(),
+                pending: PendingStorage::ready(bytes, plan.size),
+            }));
+        };
+        let key = StorageKey::new(name, None, self.generation);
+        // A read the frame already published is answered with its result.
+        if let Some(outcome) = pool.peek_completed(&key) {
+            let bytes = outcome_to_bytes(outcome, name)?;
+            return Ok(Some(StorageEntry::File {
+                name: name.to_string(),
+                pending: PendingStorage::ready(bytes, plan.size),
+            }));
+        }
+        // A read that is already in flight is the read this resolution names.
+        let pending = match pool.pending(&key) {
+            Some(pending) => pending,
+            None => {
+                let work = plan.work.clone();
+                match pool.submit(key, work, plan.size, plan.charge) {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        // The pool refused the read: the entry is read on the
+                        // calling thread, and the refusal is reported.
+                        log::warn!(
+                            "storage: the read pool refused {name:?} ({error}); the entry is read on the calling thread"
+                        );
+                        let bytes = FileSystemReader.read(&plan.work)?;
+                        return Ok(Some(StorageEntry::File {
+                            name: name.to_string(),
+                            pending: PendingStorage::ready(bytes, plan.size),
+                        }));
+                    }
+                }
+            }
+        };
+        Ok(Some(StorageEntry::File {
+            name: name.to_string(),
+            pending,
+        }))
+    }
+
+    /// The bytes of a resolved entry, waiting for the read the resolution
+    /// scheduled.
+    ///
+    /// The wait counts the bytes the read produced, so the storage's read
+    /// accounting covers every read — the scheduled ones included. A media's
+    /// entry is read by its provider, here, and counted the same way.
+    ///
+    /// # Errors
+    ///
+    /// The storage's own error: a read that failed, or one that was
+    /// cancelled before it produced a result.
+    pub fn read_entry(&self, entry: &StorageEntry) -> Result<Vec<u8>, StorageReadError> {
+        let bytes = match entry {
+            StorageEntry::File { name, pending } => match pending.await_outcome() {
+                StorageOutcome::Ready(bytes) => bytes.as_ref().clone(),
+                StorageOutcome::Failed(StorageReadError::Fs(FsError::NotFound { .. })) => {
+                    return Err(StorageReadError::NotFound(name.clone()));
+                }
+                StorageOutcome::Failed(error) => return Err(error),
+                StorageOutcome::Cancelled => {
+                    return Err(StorageReadError::NoResult {
+                        message: "the read was cancelled before it produced a result".to_string(),
+                    });
+                }
+            },
+            StorageEntry::Media { provider, path } => provider.read(path)?,
+        };
+        self.count_read_bytes(bytes.len());
+        Ok(bytes)
+    }
+
     /// Looks a storage name up optimistically.
     ///
     /// The lookup resolves the name through the namespace's own search order
@@ -1997,48 +2130,18 @@ impl Storage {
     /// the mount) or when a file-system failure occurs while probing. A name
     /// that does not resolve is `Ok(None)`, never an error.
     pub fn lookup(&self, name: &str) -> Result<Option<PendingStorage>, StorageReadError> {
-        if let Some((provider, path)) = self.media_provider(name)? {
-            if !provider.exists(path)? {
-                return Ok(None);
-            }
-            let bytes = provider.read(path)?;
-            let size = bytes.len() as u64;
-            return Ok(Some(PendingStorage::ready(bytes, Some(size))));
-        }
-        let Some(plan) = self.plan_read(name, None)? else {
-            return Ok(None);
-        };
-        let Some(pool) = self.read_pool.as_ref() else {
-            // Without a pool the entry is read on the calling thread.
-            let bytes = FileSystemReader.read(&plan.work)?;
-            return Ok(Some(PendingStorage::ready(bytes, plan.size)));
-        };
-        let key = StorageKey::new(name, None, self.generation);
-        // A read the frame already published is answered with its result.
-        if let Some(outcome) = pool.peek_completed(&key) {
-            let bytes = outcome_to_bytes(outcome, name)?;
-            return Ok(Some(PendingStorage::ready(bytes, plan.size)));
-        }
-        // A read that is already in flight is the read this lookup names.
-        let pending = match pool.pending(&key) {
-            Some(pending) => pending,
-            None => {
-                let work = plan.work.clone();
-                match pool.submit(key, work, plan.size, plan.charge) {
-                    Ok(pending) => pending,
-                    Err(error) => {
-                        // The pool refused the read: the entry is read on the
-                        // calling thread, and the refusal is reported.
-                        log::warn!(
-                            "storage: the read pool refused {name:?} ({error}); the entry is read on the calling thread"
-                        );
-                        let bytes = FileSystemReader.read(&plan.work)?;
-                        return Ok(Some(PendingStorage::ready(bytes, plan.size)));
-                    }
+        match self.resolve_entry(name)? {
+            Some(StorageEntry::File { pending, .. }) => Ok(Some(pending)),
+            Some(StorageEntry::Media { provider, path }) => {
+                if !provider.exists(&path)? {
+                    return Ok(None);
                 }
+                let bytes = provider.read(&path)?;
+                let size = bytes.len() as u64;
+                Ok(Some(PendingStorage::ready(bytes, Some(size))))
             }
-        };
-        Ok(Some(pending))
+            None => Ok(None),
+        }
     }
 
     /// Reads a storage entry through the read pool.

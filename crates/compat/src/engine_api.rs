@@ -36,6 +36,10 @@ pub(crate) use engine::{
     Location, Storage, StorageMedia, StorageReadError, normalize_in_archive_name,
 };
 
+// The resolved entries the compatibility layer resolves a name into: the
+// entry holds the read, and the storage reads it.
+pub(crate) use engine::storage::StorageEntry;
+
 // The image decode pool, the pending-image future, the outcome a pending
 // image produced and the pass a worker runs over decoded pixels: the visual
 // natives submit decodes, wait for them and name their pass through these.

@@ -148,10 +148,26 @@ pixels become alpha `0`; every other pixel becomes alpha `255`.
 
 1. The **decoded-image cache** is consulted first. A hit is installed
    synchronously, exactly as a cached graphic is installed (§6).
-2. Without a hit, the load reads the bytes through the attached storage and
-   **probes the header**, both on the calling thread.
+2. Without a hit, the load **resolves** the name through the attached
+   storage and **probes the header**, both on the calling thread.
 3. The decode is then either **deferred** to the L2 decode pool or run
    **synchronously** on the calling thread.
+
+### The resolution
+
+The name is resolved by the L2 storage namespace, and the resolution is a
+**lookup**: the plain name first, then each extension of the shared
+extension list, and the first candidate that resolves wins. The reference
+resolves a graphic name the same way — it asks the storage whether the file
+exists (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:301-318`) and never
+reads a candidate it does not need.
+
+The default media's entry is looked up and its **read is scheduled** on the
+storage's read pool, so the bytes are produced off the thread that resolved
+the name. A name that belongs to a **storage media** (`var://`, `psb://`) is
+read by its provider, on the calling thread: a provider owns state that
+belongs to that thread, and the `var://` media's script-graph walk may not
+run on a worker.
 
 ### The deferred path
 
@@ -170,6 +186,15 @@ probed size and logs the failure. It does **not** raise: the load already
 returned, so there is no call to fail. A **probe** failure is different — the
 probe runs on the calling thread, so it raises at the load, the way a load
 failure raises there.
+
+### The burst
+
+`System.touchImages` loads a list of graphics, and its loads are resolved
+**all at once** before the first one is waited for: the storage schedules
+every read of the burst, so the reads run concurrently on its read pool, and
+the decodes are submitted as one burst as well. The reference's preload
+queues its loads the same way
+(`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:2233-2262`).
 
 ### When the load is synchronous
 
