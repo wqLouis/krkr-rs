@@ -739,7 +739,7 @@ The other domains have their own enums: `engine::TranslateError`,
 `engine::sound::SoundError`, `engine::video::VideoError`,
 `engine::trans::TransError`, `engine::shader::ShaderError`,
 `engine::storage::MountError`, `engine::storage::StorageReadError`,
-`engine::storage::StoragePoolError`, `engine::imagedecode::DecodePoolError`,
+`engine::storage::StoragePoolError`, `engine::jobpool::JobPoolError`,
 `engine::startup::StartupError`, and in L1 `api::error::RenderError`,
 `api::error::FsError`, `api::error::MediaError`, `api::error::AudioError`,
 `api::error::GlyphError`. The full list with their variants is in

@@ -26,6 +26,7 @@ pub mod engine;
 pub mod font;
 pub mod imagedecode;
 pub mod input;
+pub mod jobpool;
 pub mod layer_ops;
 pub mod projection;
 pub mod raster;

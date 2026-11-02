@@ -1,25 +1,30 @@
-//! The image decode pool and the pending-image future.
+//! The image decode path on the engine's job pool.
 //!
 //! The pool decodes images on worker threads while the frame thread keeps
 //! working. A decode that has not produced its pixels yet is a
 //! [`PendingImage`]: the bitmap that will hold those pixels carries the
-//! future, and every read of the pixels waits for it.
+//! handle, and every read of the pixels waits for it.
 //!
-//! The pool owns the workers, the queue, the byte accounting and the decode
-//! accounting ([`DecodeStats`]). The codec it calls is supplied by the
+//! The pool itself is general: it runs the CPU-bound jobs the engine
+//! submits, and a job is a closure over a value the caller casts back (see
+//! [`crate::jobpool`]). This module is the image decode path on top of it:
+//! the codec the workers decode with, the pass a load runs over the decoded
+//! pixels, and the typed handle a pending bitmap carries.
+//!
+//! The pool owns the workers, the queue, the byte accounting and the job
+//! accounting ([`JobStats`]). The codec it calls is supplied by the
 //! composition root, because the concrete decoder lives in the bottom media
 //! layer. Nothing here is a process global: two pools in one process do not
 //! interact.
 
-use std::collections::VecDeque;
-use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use api::media::{DecodedImage, ImageInfo};
 
+use crate::jobpool::{
+    JobId, JobOutcome, JobPool, JobPoolConfig, JobPoolError, JobState, JobStats, JobValue, JobWork,
+    PendingJob,
+};
 use crate::scene::DecodedImageKey;
 
 /// The failure of an image decode.
@@ -90,46 +95,9 @@ pub enum ImageState {
     Done(ImageOutcome),
 }
 
-/// The result slot and the wake-up a pending image shares with its waiters.
-#[derive(Debug)]
-struct PendingShared {
-    /// The result slot.
-    state: Mutex<ImageState>,
-    /// Signalled when the state leaves [`ImageState::Pending`].
-    ready: Condvar,
-    /// Whether a caller is waiting for the result.
-    demanded: AtomicBool,
-    /// The decoded-image cache entry this decode fills, when the caller named
-    /// one.
-    cache_key: Mutex<Option<DecodedImageKey>>,
-}
-
-impl PendingShared {
-    /// Publishes `outcome` when the image has not produced one yet.
-    ///
-    /// Returns whether the outcome was published; a cancelled image already
-    /// holds one and keeps it.
-    fn complete(&self, outcome: ImageOutcome) -> bool {
-        let mut state = lock(&self.state);
-        if matches!(&*state, ImageState::Pending) {
-            *state = ImageState::Done(outcome);
-            self.ready.notify_all();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Whether the image already holds a result.
-    fn is_finished(&self) -> bool {
-        let state = lock(&self.state);
-        matches!(&*state, ImageState::Done(_))
-    }
-}
-
 /// A decode that has not produced its pixels yet.
 ///
-/// The future is created by [`DecodePool::submit`] or
+/// The handle is created by [`DecodePool::submit`] or
 /// [`DecodePool::submit_cached`] and handed to the bitmap that will hold the
 /// pixels. Every read of those pixels waits for it: the wait is on this
 /// image alone, never on the pool.
@@ -138,24 +106,20 @@ impl PendingShared {
 /// a worker that finishes a cancelled job discards its result.
 #[derive(Clone, Debug)]
 pub struct PendingImage {
-    /// The shared result slot and the wake-up.
-    shared: Arc<PendingShared>,
+    /// The handle the decode's result lands in.
+    job: PendingJob,
+    /// The decoded-image cache entry this decode fills, when the caller
+    /// named one.
+    cache_key: Option<DecodedImageKey>,
 }
 
 impl PendingImage {
-    /// Creates a pending image with no result yet.
+    /// Creates a pending image over the job its result lands in.
     ///
     /// `cache_key` names the decoded-image cache entry the result fills,
     /// when there is one.
-    fn new(cache_key: Option<DecodedImageKey>) -> Self {
-        Self {
-            shared: Arc::new(PendingShared {
-                state: Mutex::new(ImageState::Pending),
-                ready: Condvar::new(),
-                demanded: AtomicBool::new(false),
-                cache_key: Mutex::new(cache_key),
-            }),
-        }
+    fn new(job: PendingJob, cache_key: Option<DecodedImageKey>) -> Self {
+        Self { job, cache_key }
     }
 
     /// The decoded-image cache entry this decode fills, when the caller named
@@ -165,15 +129,12 @@ impl PendingImage {
     /// image resolves, so a later load of the same image is a cache hit
     /// instead of a second decode.
     pub fn cache_key(&self) -> Option<DecodedImageKey> {
-        lock(&self.shared.cache_key).clone()
+        self.cache_key.clone()
     }
 
     /// Whether this decode fills the decoded-image cache entry `key`.
-    ///
-    /// The key is compared under the lock, so the lookup allocates nothing.
     pub fn fills_cache_entry(&self, key: &DecodedImageKey) -> bool {
-        let cache_key = lock(&self.shared.cache_key);
-        cache_key.as_ref() == Some(key)
+        self.cache_key.as_ref() == Some(key)
     }
 
     /// Whether `other` waits for the same decode as this one.
@@ -181,31 +142,30 @@ impl PendingImage {
     /// Two clones of one pending image share the result slot: the pixels
     /// land in every holder, and cancelling the decode takes them all.
     pub fn same_decode(&self, other: &PendingImage) -> bool {
-        Arc::ptr_eq(&self.shared, &other.shared)
+        self.job.same_job(&other.job)
     }
 
     /// Marks the image demanded: a worker prefers a demanded job over a
     /// normal one.
     pub fn demand(&self) {
-        self.shared.demanded.store(true, Ordering::SeqCst);
+        self.job.demand();
     }
 
     /// Whether a caller is waiting for the image.
     pub fn is_demanded(&self) -> bool {
-        self.shared.demanded.load(Ordering::SeqCst)
+        self.job.is_demanded()
     }
 
     /// Whether the decode has produced a result.
     pub fn is_ready(&self) -> bool {
-        self.shared.is_finished()
+        self.job.is_ready()
     }
 
     /// The current state, without waiting.
     pub fn state(&self) -> ImageState {
-        let state = lock(&self.shared.state);
-        match &*state {
-            ImageState::Pending => ImageState::Pending,
-            ImageState::Done(outcome) => ImageState::Done(outcome.clone()),
+        match self.job.state() {
+            JobState::Pending => ImageState::Pending,
+            JobState::Done(outcome) => ImageState::Done(image_outcome(outcome)),
         }
     }
 
@@ -214,17 +174,7 @@ impl PendingImage {
     /// The wait releases the lock while it sleeps, and a result published
     /// between the check and the sleep is not missed.
     pub fn await_ready(&self) -> ImageOutcome {
-        let mut state = lock(&self.shared.state);
-        loop {
-            match &*state {
-                ImageState::Done(outcome) => return outcome.clone(),
-                ImageState::Pending => {}
-            }
-            state = match self.shared.ready.wait(state) {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-        }
+        image_outcome(self.job.await_ready())
     }
 
     /// Cancels the image.
@@ -233,122 +183,24 @@ impl PendingImage {
     /// result it would have published. Returns whether the image was still
     /// waiting.
     pub fn cancel(&self) -> bool {
-        self.shared.complete(ImageOutcome::Cancelled)
-    }
-
-    /// Publishes `outcome` when the image has not produced one yet.
-    fn complete(&self, outcome: ImageOutcome) -> bool {
-        self.shared.complete(outcome)
+        self.job.cancel()
     }
 }
 
-/// The decode accounting the pool keeps.
+/// Turns the outcome of a decode job into the outcome of the image.
 ///
-/// The counters are the number of image decodes the pool ran and the time
-/// they took. A worker updates them under the pool's own lock, so a counter
-/// never crosses a thread boundary: the thread that owns the pool reads the
-/// totals whenever it wants them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DecodeStats {
-    /// The number of decodes the pool ran.
-    pub decodes: u64,
-    /// The accumulated time the pool spent decoding.
-    pub elapsed: Duration,
-}
-
-/// The pool's configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DecodePoolConfig {
-    /// The number of worker threads.
-    pub workers: usize,
-    /// The maximum number of queued jobs.
-    pub queue_limit: usize,
-    /// The maximum number of bytes the pool may hold for the queued and the
-    /// in-flight decodes.
-    ///
-    /// A job is charged the size of its bytes plus the size of the pixels it
-    /// will produce, so the limit bounds the pool's footprint. A job that
-    /// does not fit is refused with [`DecodePoolError::MemoryLimit`], and the
-    /// caller decodes it synchronously.
-    ///
-    /// The default is [`DEFAULT_MEMORY_LIMIT`].
-    pub memory_limit: u64,
-}
-
-impl Default for DecodePoolConfig {
-    fn default() -> Self {
-        Self {
-            workers: default_worker_count(),
-            queue_limit: 64,
-            memory_limit: DEFAULT_MEMORY_LIMIT,
-        }
+/// A decode that produced a value of another type is a failed decode: the
+/// message names the type the job produced and the type the image needs.
+fn image_outcome(outcome: JobOutcome) -> ImageOutcome {
+    match outcome {
+        JobOutcome::Ready(value) => match value.downcast::<DecodedImage>() {
+            Ok(image) => ImageOutcome::Ready(image),
+            Err(error) => ImageOutcome::Failed(error.to_string()),
+        },
+        JobOutcome::Failed(message) => ImageOutcome::Failed(message),
+        JobOutcome::Cancelled => ImageOutcome::Cancelled,
     }
 }
-
-/// The default byte limit of the decode pool.
-///
-/// The limit bounds the bytes the queued and the in-flight decodes hold: a
-/// job is charged the size of its bytes plus the size of the pixels it will
-/// produce, so the limit bounds the pool's footprint.
-///
-/// The default is 256 MiB. A full-resolution character part is a 1445x3304
-/// WebP that charges the pool about 19.6 MB - the compressed bytes plus the
-/// 19 112 720 bytes of RGBA pixels it decodes into - so the limit holds the
-/// four character parts of an avatar switch at once, with room for the rest
-/// of the frame's images.
-pub const DEFAULT_MEMORY_LIMIT: u64 = 256 * 1024 * 1024;
-
-/// The worker count the pool uses when nothing else is configured.
-///
-/// Two cores are left to the frame thread and the host, so the pool never
-/// competes with the renderer for them.
-fn default_worker_count() -> usize {
-    std::thread::available_parallelism()
-        .map_or(1, |count| count.get().saturating_sub(2))
-        .max(1)
-}
-
-/// The pool's failures.
-#[derive(Debug, thiserror::Error)]
-pub enum DecodePoolError {
-    /// A worker thread could not be started.
-    #[error("could not start an image decode worker: {message}")]
-    Worker {
-        /// The platform's message.
-        message: String,
-    },
-    /// The configuration is not usable.
-    #[error("the image decode pool configuration is invalid: {message}")]
-    Config {
-        /// What is wrong with the configuration.
-        message: String,
-    },
-    /// The queue is full.
-    #[error("the image decode pool queue holds its {limit} jobs")]
-    QueueFull {
-        /// The configured queue limit.
-        limit: usize,
-    },
-    /// The memory limit would be exceeded.
-    #[error(
-        "the memory limit of {limit} bytes ({} MiB) would be exceeded",
-        *limit / (1024u64 * 1024)
-    )]
-    MemoryLimit {
-        /// The configured limit.
-        limit: u64,
-    },
-    /// The job's byte accounting does not fit.
-    #[error("the image decode job's size does not fit in the pool's accounting")]
-    SizeOverflow,
-    /// The pool has no more job identities to hand out.
-    #[error("the image decode pool has no more job identities")]
-    IdExhausted,
-}
-
-/// The identity of one submitted decode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct JobId(u64);
 
 /// A pass over decoded pixels that a worker runs before it publishes the
 /// result.
@@ -361,64 +213,25 @@ pub struct JobId(u64);
 /// to raise at.
 pub type DecodePass = dyn Fn(DecodedImage) -> Result<DecodedImage, String> + Send + Sync;
 
-/// One queued decode.
-struct Job {
-    /// The job's identity.
-    id: JobId,
-    /// The future the result is published into.
-    pending: PendingImage,
-    /// The bytes to decode.
-    bytes: Arc<[u8]>,
-    /// The storage name the bytes came from.
-    hint: Option<String>,
-    /// The pass the load wants run over the decoded pixels, when it wants
-    /// one.
-    pass: Option<Arc<DecodePass>>,
-    /// The bytes this job holds against the pool's memory limit.
-    charged: u64,
-}
-
-/// The queue and the byte accounting the workers and the frame thread share.
-struct PoolState {
-    /// The jobs waiting for a worker.
-    queue: VecDeque<Job>,
-    /// The bytes the queued and the in-flight jobs hold.
-    bytes: u64,
-    /// Whether the pool is shutting down.
-    stopping: bool,
-    /// The number of decodes the workers ran.
-    decodes: u64,
-    /// The accumulated time the workers spent decoding.
-    decode_time: Duration,
-}
-
-/// The queue and the wake-up the workers and the frame thread share.
-struct PoolShared {
-    /// The pool's only lock.
-    state: Mutex<PoolState>,
-    /// Signalled when a job is queued or the pool stops.
-    wake: Condvar,
-}
-
-/// The decode pool.
+/// The engine's decode pool: the job pool and the codec its workers decode
+/// with.
 ///
-/// The pool owns its worker threads, its queue and its byte accounting. It is
-/// middle-layer state: the engine owns it, the composition root installs the
-/// decoder, and the compatibility layer submits and awaits jobs through it.
+/// The pool owns the worker threads, the queue and the byte accounting. It
+/// is middle-layer state: the engine owns it, the composition root installs
+/// the codec, and the compatibility layer submits decodes through it.
 ///
-/// A job nobody waits for is *normal*; a job a caller or the frame barrier
-/// waits for is *demanded*. A worker takes a demanded job first, so a
-/// script's load is never delayed behind a prefetch backlog.
+/// A decode nobody waits for is *normal*; a decode a caller or the frame
+/// barrier waits for is *demanded*. A worker takes a demanded job first, so
+/// a script's load is never delayed behind a prefetch backlog.
+///
+/// The pool also carries the jobs that are not decodes: a caller submits
+/// them with [`DecodePool::submit_job`], and casts the value back when the
+/// job lands.
 pub struct DecodePool {
-    /// The queue and the byte accounting the workers and the frame thread
-    /// share.
-    shared: Arc<PoolShared>,
-    /// The worker threads, joined when the pool drops.
-    workers: Vec<JoinHandle<()>>,
-    /// The configuration the pool was started with.
-    config: DecodePoolConfig,
-    /// The identity of the next submitted job.
-    next_id: u64,
+    /// The pool the jobs run on.
+    jobs: JobPool,
+    /// The codec the workers decode with.
+    decoder: Arc<dyn ImageDecoder>,
 }
 
 impl DecodePool {
@@ -426,62 +239,20 @@ impl DecodePool {
     ///
     /// # Errors
     ///
-    /// Returns [`DecodePoolError::Config`] when the configuration asks for no
-    /// worker or no queue, and [`DecodePoolError::Worker`] when a thread
+    /// Returns [`JobPoolError::Config`] when the configuration asks for no
+    /// worker or no queue, and [`JobPoolError::Worker`] when a thread
     /// cannot be started.
     pub fn new(
         decoder: Arc<dyn ImageDecoder>,
-        config: DecodePoolConfig,
-    ) -> Result<Self, DecodePoolError> {
-        if config.workers == 0 {
-            return Err(DecodePoolError::Config {
-                message: "the pool needs at least one worker".to_string(),
-            });
-        }
-        if config.queue_limit == 0 {
-            return Err(DecodePoolError::Config {
-                message: "the pool needs a queue of at least one job".to_string(),
-            });
-        }
-        let shared = Arc::new(PoolShared {
-            state: Mutex::new(PoolState {
-                queue: VecDeque::new(),
-                bytes: 0,
-                stopping: false,
-                decodes: 0,
-                decode_time: Duration::ZERO,
-            }),
-            wake: Condvar::new(),
-        });
-        let mut workers = Vec::with_capacity(config.workers);
-        for index in 0..config.workers {
-            let worker_shared = Arc::clone(&shared);
-            let worker_decoder = Arc::clone(&decoder);
-            let handle = std::thread::Builder::new()
-                .name(format!("krkr-image-decode-{index}"))
-                .spawn(move || worker_loop(worker_decoder, worker_shared));
-            match handle {
-                Ok(handle) => workers.push(handle),
-                Err(error) => {
-                    // The workers that already started must not outlive the
-                    // pool: they are stopped and joined before the error
-                    // goes out.
-                    stop_workers(&shared, workers);
-                    return Err(DecodePoolError::Worker {
-                        message: error.to_string(),
-                    });
-                }
-            }
-        }
+        config: JobPoolConfig,
+    ) -> Result<Self, JobPoolError> {
         Ok(Self {
-            shared,
-            workers,
-            config,
-            next_id: 0,
+            jobs: JobPool::new(config)?,
+            decoder,
         })
     }
 
-    /// Submits a decode and returns the future its result lands in.
+    /// Submits a decode and returns the handle its result lands in.
     ///
     /// `expected_bytes` is the size of the pixels the decode will produce; it
     /// is what the job is charged against the memory limit. `hint` is the
@@ -491,10 +262,10 @@ impl DecodePool {
     ///
     /// # Errors
     ///
-    /// Returns [`DecodePoolError::QueueFull`] when the queue is full,
-    /// [`DecodePoolError::MemoryLimit`] when the job would push the pool past
-    /// its limit, [`DecodePoolError::SizeOverflow`] when the job's byte
-    /// accounting does not fit and [`DecodePoolError::IdExhausted`] when the
+    /// Returns [`JobPoolError::QueueFull`] when the queue is full,
+    /// [`JobPoolError::MemoryLimit`] when the job would push the pool past
+    /// its limit, [`JobPoolError::SizeOverflow`] when the job's byte
+    /// accounting does not fit and [`JobPoolError::IdExhausted`] when the
     /// pool has no more job identities. The caller then decodes
     /// synchronously; the pool never drops a job silently.
     pub fn submit(
@@ -503,7 +274,7 @@ impl DecodePool {
         hint: Option<String>,
         expected_bytes: u64,
         pass: Option<Arc<DecodePass>>,
-    ) -> Result<(JobId, PendingImage), DecodePoolError> {
+    ) -> Result<(JobId, PendingImage), JobPoolError> {
         self.enqueue(None, bytes, hint, expected_bytes, pass)
     }
 
@@ -526,15 +297,34 @@ impl DecodePool {
         hint: Option<String>,
         expected_bytes: u64,
         pass: Option<Arc<DecodePass>>,
-    ) -> Result<(JobId, PendingImage), DecodePoolError> {
+    ) -> Result<(JobId, PendingImage), JobPoolError> {
         self.enqueue(Some(key), bytes, hint, expected_bytes, pass)
     }
 
-    /// Queues a decode and returns the future its result lands in.
+    /// Submits a job that is not an image decode.
+    ///
+    /// `work` is the CPU-bound work the worker performs and `charge` is the
+    /// number of bytes the job holds against the memory limit. The value the
+    /// job produces is cast back by the caller, with
+    /// [`JobValue::downcast`].
+    ///
+    /// # Errors
+    ///
+    /// The same as [`DecodePool::submit`], without the byte accounting of a
+    /// decode: the charge is the number the caller computed.
+    pub fn submit_job(
+        &mut self,
+        work: Arc<JobWork>,
+        charge: u64,
+    ) -> Result<(JobId, PendingJob), JobPoolError> {
+        self.jobs.submit(work, charge)
+    }
+
+    /// Queues a decode and returns the handle its result lands in.
     ///
     /// `cache_key` names the decoded-image cache entry the result fills, when
-    /// the caller wants the scene's cache to keep it; `pass` is the post-decode
-    /// pass the worker runs, when the load needs one.
+    /// the caller wants the scene's cache to keep it; `pass` is the
+    /// post-decode pass the worker runs, when the load needs one.
     fn enqueue(
         &mut self,
         cache_key: Option<DecodedImageKey>,
@@ -542,46 +332,24 @@ impl DecodePool {
         hint: Option<String>,
         expected_bytes: u64,
         pass: Option<Arc<DecodePass>>,
-    ) -> Result<(JobId, PendingImage), DecodePoolError> {
-        let byte_len = u64::try_from(bytes.len()).map_err(|_| DecodePoolError::SizeOverflow)?;
-        let charged = byte_len
+    ) -> Result<(JobId, PendingImage), JobPoolError> {
+        let byte_len = u64::try_from(bytes.len()).map_err(|_| JobPoolError::SizeOverflow)?;
+        let charge = byte_len
             .checked_add(expected_bytes)
-            .ok_or(DecodePoolError::SizeOverflow)?;
-        let pending = PendingImage::new(cache_key);
-        let id = JobId(self.next_id);
-        let Some(next_id) = self.next_id.checked_add(1) else {
-            return Err(DecodePoolError::IdExhausted);
-        };
-        self.next_id = next_id;
-        {
-            let mut state = lock(&self.shared.state);
-            if state.stopping {
-                return Err(DecodePoolError::Config {
-                    message: "the image decode pool is stopping".to_string(),
-                });
-            }
-            if state.queue.len() >= self.config.queue_limit {
-                return Err(DecodePoolError::QueueFull {
-                    limit: self.config.queue_limit,
-                });
-            }
-            if state.bytes.saturating_add(charged) > self.config.memory_limit {
-                return Err(DecodePoolError::MemoryLimit {
-                    limit: self.config.memory_limit,
-                });
-            }
-            state.bytes = state.bytes.saturating_add(charged);
-            state.queue.push_back(Job {
-                id,
-                pending: pending.clone(),
-                bytes,
-                hint,
-                pass,
-                charged,
-            });
-        }
-        self.shared.wake.notify_one();
-        Ok((id, pending))
+            .ok_or(JobPoolError::SizeOverflow)?;
+        let decoder = Arc::clone(&self.decoder);
+        let work: Arc<JobWork> = Arc::new(move || {
+            let image = decoder
+                .decode(&bytes, hint.as_deref())
+                .map_err(|error| error.to_string())?;
+            let image = match pass.as_deref() {
+                Some(pass) => pass(image)?,
+                None => image,
+            };
+            Ok(JobValue::new(image))
+        });
+        let (id, job) = self.jobs.submit(work, charge)?;
+        Ok((id, PendingImage::new(job, cache_key)))
     }
 
     /// Cancels a queued job.
@@ -589,198 +357,25 @@ impl DecodePool {
     /// A running job is not preempted; its worker discards the result when
     /// it lands. Returns whether the job was still queued.
     pub fn cancel(&mut self, id: JobId) -> bool {
-        let removed = {
-            let mut state = lock(&self.shared.state);
-            let index = state.queue.iter().position(|job| job.id == id);
-            match index {
-                Some(index) => {
-                    let job = state.queue.remove(index);
-                    if let Some(job) = &job {
-                        state.bytes = state.bytes.saturating_sub(job.charged);
-                    }
-                    job
-                }
-                None => None,
-            }
-        };
-        match removed {
-            Some(job) => {
-                job.pending.complete(ImageOutcome::Cancelled);
-                true
-            }
-            None => false,
-        }
+        self.jobs.cancel(id)
     }
 
     /// The number of jobs waiting for a worker.
     pub fn queued(&self) -> usize {
-        lock(&self.shared.state).queue.len()
+        self.jobs.queued()
     }
 
     /// The number of bytes the pool currently holds.
     pub fn held_bytes(&self) -> u64 {
-        lock(&self.shared.state).bytes
+        self.jobs.held_bytes()
     }
 
-    /// The decode accounting: how many decodes the pool ran and how long they
+    /// The job accounting: how many jobs the pool ran and how long they
     /// took.
     ///
-    /// The counters cover every decode the pool performed, the successful
-    /// ones and the failed ones alike.
-    pub fn stats(&self) -> DecodeStats {
-        let state = lock(&self.shared.state);
-        DecodeStats {
-            decodes: state.decodes,
-            elapsed: state.decode_time,
-        }
-    }
-}
-
-impl Drop for DecodePool {
-    fn drop(&mut self) {
-        stop_workers(&self.shared, std::mem::take(&mut self.workers));
-    }
-}
-
-/// Stops the pool's workers and joins them.
-///
-/// The queued jobs are cancelled, so a waiter on one of them wakes instead of
-/// waiting for a decode that will never run. A running decode is not
-/// preempted: the join waits for it, and it publishes its own result.
-fn stop_workers(shared: &PoolShared, workers: Vec<JoinHandle<()>>) {
-    {
-        let mut state = lock(&shared.state);
-        state.stopping = true;
-        while let Some(job) = state.queue.pop_front() {
-            state.bytes = state.bytes.saturating_sub(job.charged);
-            job.pending.complete(ImageOutcome::Cancelled);
-        }
-    }
-    shared.wake.notify_all();
-    for worker in workers {
-        if worker.join().is_err() {
-            log::warn!("engine: an image decode worker stopped with a panic");
-        }
-    }
-}
-
-/// Locks a mutex, recovering from a poisoned lock.
-///
-/// No code path panics while the lock is held, so the recovery cannot expose
-/// a half-updated state.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-/// Takes the next job: a demanded one when the queue holds one, else the
-/// oldest.
-fn take_next_job(state: &mut PoolState) -> Option<Job> {
-    if let Some(index) = state.queue.iter().position(|job| job.pending.is_demanded()) {
-        return state.queue.remove(index);
-    }
-    state.queue.pop_front()
-}
-
-/// Returns a job's bytes to the pool's accounting.
-fn release_bytes(shared: &PoolShared, charged: u64) {
-    let mut state = lock(&shared.state);
-    state.bytes = state.bytes.saturating_sub(charged);
-}
-
-/// Records the decode a worker ran: the count and the time it took.
-///
-/// The counters live in the pool's own state, so a worker updates them under
-/// the pool's lock and the thread that owns the pool reads the totals. No
-/// counter crosses a thread boundary.
-fn record_decode(shared: &PoolShared, elapsed: Duration) {
-    let mut state = lock(&shared.state);
-    state.decodes = state.decodes.saturating_add(1);
-    state.decode_time = state.decode_time.saturating_add(elapsed);
-}
-
-/// Publishes a failure for a job whose worker stops before it does.
-///
-/// The guard holds the future of the job a worker is running. Its drop
-/// publishes a failure when the job has not produced a result, so a waiter
-/// wakes with a failure instead of waiting for a worker that is gone.
-struct JobGuard {
-    /// The future the result is published into.
-    pending: PendingImage,
-}
-
-impl Drop for JobGuard {
-    fn drop(&mut self) {
-        self.pending.complete(ImageOutcome::Failed(
-            "the image decode worker stopped before it published a result".to_string(),
-        ));
-    }
-}
-
-/// The message of a panic payload.
-///
-/// The payload is a `Box<dyn Any + Send>`: a string payload carries the
-/// message the panicking code wrote, and anything else is reported as an
-/// unnamed panic. The panic is never silenced: it becomes the job's failed
-/// outcome, and the waiter sees it.
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        return (*message).to_string();
-    }
-    if let Some(message) = payload.downcast_ref::<String>() {
-        return (*message).clone();
-    }
-    "the image decoder panicked".to_string()
-}
-
-/// The worker loop: take a job, decode it and run its pass outside the lock,
-/// then publish the result.
-fn worker_loop(decoder: Arc<dyn ImageDecoder>, shared: Arc<PoolShared>) {
-    loop {
-        let job = {
-            let mut state = lock(&shared.state);
-            loop {
-                if state.stopping {
-                    return;
-                }
-                if let Some(job) = take_next_job(&mut state) {
-                    break job;
-                }
-                state = match shared.wake.wait(state) {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-            }
-        };
-        // The guard covers every path out of this iteration: a worker that
-        // stops for any reason leaves the waiter with a result.
-        let _guard = JobGuard {
-            pending: job.pending.clone(),
-        };
-        // A job that was cancelled before it ran is dropped without
-        // decoding.
-        if job.pending.is_ready() {
-            release_bytes(&shared, job.charged);
-            continue;
-        }
-        let started = Instant::now();
-        let outcome = match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let image = decoder
-                .decode(&job.bytes, job.hint.as_deref())
-                .map_err(|error| error.to_string())?;
-            match job.pass.as_deref() {
-                Some(pass) => pass(image),
-                None => Ok(image),
-            }
-        })) {
-            Ok(Ok(image)) => ImageOutcome::Ready(Arc::new(image)),
-            Ok(Err(message)) => ImageOutcome::Failed(message),
-            Err(payload) => ImageOutcome::Failed(panic_message(payload.as_ref())),
-        };
-        record_decode(&shared, started.elapsed());
-        release_bytes(&shared, job.charged);
-        job.pending.complete(outcome);
+    /// The counters cover every job the pool performed, the decodes and the
+    /// other work alike.
+    pub fn stats(&self) -> JobStats {
+        self.jobs.stats()
     }
 }

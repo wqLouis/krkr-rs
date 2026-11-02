@@ -294,13 +294,13 @@ as long as one of them waits for it.
 The pool bounds the bytes the queued and the in-flight decodes hold: a job is
 charged the size of its bytes plus the size of the pixels it will produce, so
 the limit bounds the pool's footprint. The default is **256 MiB**
-(`engine::imagedecode::DEFAULT_MEMORY_LIMIT`).
+(`engine::jobpool::DEFAULT_MEMORY_LIMIT`).
 
 A full-resolution character part is a 1445×3304 WebP that charges the pool
 about 19.6 MB — the compressed bytes plus the 19 112 720 bytes of RGBA pixels
 it decodes into — so the default holds the four character parts of an avatar
 switch at once. A job that does not fit is refused with
-`DecodePoolError::MemoryLimit`, and the load decodes synchronously on the
+`JobPoolError::MemoryLimit`, and the load decodes synchronously on the
 calling thread instead.
 
 ---
@@ -375,9 +375,9 @@ calling thread instead.
   pixels than its buffer holds has no main-image address.
 * `crates/engine/tests/bitmap.rs` — the bitmap lifetime and the pixel
   buffers.
-* `crates/engine/tests/imagedecode.rs` — the decode pool: the workers, the
-  queue, the byte accounting, the demanded-job order and the outcomes a
-  waiter sees.
+* `crates/engine/tests/imagedecode.rs` — the decode pool and the job pool
+  under it: the workers, the queue, the byte accounting, the demanded-job
+  order, the outcomes a waiter sees and the cast of a job's value.
 * `crates/engine/tests/oop_semantics.rs` — the value semantics of the state
   types.
 * `crates/engine/src/scene.rs` `mod tests` — the unit-level invariants.

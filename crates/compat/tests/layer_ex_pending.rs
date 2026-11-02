@@ -18,8 +18,9 @@ use std::sync::Arc;
 
 use api::media::{DecodedImage, ImageInfo};
 use compat::CompatHost;
-use engine::imagedecode::{DecodePool, DecodePoolConfig, ImageDecodeError, ImageDecoder};
+use engine::imagedecode::{DecodePool, ImageDecodeError, ImageDecoder};
 use engine::input::InputState;
+use engine::jobpool::JobPoolConfig;
 use engine::timer::TimerState;
 use engine::{BitmapState, Scene, Storage};
 use fs::FileSystem;
@@ -258,8 +259,8 @@ fn unique_dir(tag: &str) -> PathBuf {
 }
 
 /// A pool configuration with one worker.
-fn config() -> DecodePoolConfig {
-    DecodePoolConfig {
+fn config() -> JobPoolConfig {
+    JobPoolConfig {
         workers: 1,
         queue_limit: 8,
         memory_limit: 1024 * 1024,

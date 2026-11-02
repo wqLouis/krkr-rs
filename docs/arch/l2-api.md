@@ -35,7 +35,8 @@ render or media backend, no platform crate and no script VM. It is
 | `engine` | `crates/engine/src/engine.rs` | the frame-owning object: the scene, the projection, the textures, the timers, the presentation |
 | `clock` | `crates/engine/src/clock.rs` | the frame clock: the time base the frame advances and the script reads |
 | `scene` | `crates/engine/src/scene.rs` | the logical layer tree: windows, layers, bitmaps, fonts, focus domains |
-| `imagedecode` | `crates/engine/src/imagedecode.rs` | the deferred image decode pool and the pending-image future |
+| `imagedecode` | `crates/engine/src/imagedecode.rs` | the deferred image decode path: the codec, the pass and the pending-image future |
+| `jobpool` | `crates/engine/src/jobpool.rs` | the CPU-job pool: the worker threads, the queue, the byte accounting and the pending-job handle |
 | `projection` | `crates/engine/src/projection.rs` | the pure field copy from the logical tree to the render tree |
 | `translate` | `crates/engine/src/translate.rs` | the VM-pixel ↔ device-pixel mapping |
 | `layer_ops` | `crates/engine/src/layer_ops.rs` | in-place CPU pixel operations on bitmaps: fills, blits, blur, subtree compositing |
@@ -876,20 +877,18 @@ Code map: [`../code/engine/translate.md`](../code/engine/translate.md).
 
 | item | what it is |
 |---|---|
-| `DecodePool` | the pool: the worker threads, the queue, the byte accounting and the reads in flight |
-| `DecodePoolConfig` | the configuration: the worker count, the queue limit and the memory limit. `DEFAULT_MEMORY_LIMIT` is 256 MiB |
-| `DecodeStats` | the counters: the number of decodes and the accumulated time |
+| `DecodePool` | the engine's decode pool: the job pool it runs on and the codec its workers decode with |
 | `ImageDecoder` | the codec the pool drives: `probe(bytes, hint)` and `decode(bytes, hint)` |
 | `PendingImage` | the future a pending bitmap carries, with the cache key it fills |
 | `ImageOutcome` / `ImageState` | what a pending image produced: `Ready`, `Failed` or `Cancelled`; and whether it is still pending |
 | `DecodePass` | the pass a worker runs over the decoded pixels |
-| `DecodePoolError` / `ImageDecodeError` / `ImageSizeError` | the failures |
+| `ImageDecodeError` / `ImageSizeError` | the failures of one decode and of a probed size |
 
 The engine's operations: `Engine::install_decoder(decoder, config)`,
 `Engine::decode_pool()`, `Engine::decode_pool_mut()`,
-`Engine::decode_stats()`. The pool's own operations:
+`Engine::job_stats()`. The pool's own operations:
 `DecodePool::new(decoder, config)`, `submit`, `submit_cached`,
-`cancel`, `queued`, `held_bytes`, `stats`. The pending image's
+`submit_job`, `cancel`, `queued`, `held_bytes`, `stats`. The pending image's
 operations: `cache_key`, `fills_cache_entry`, `same_decode`,
 `demand`, `is_demanded`, `is_ready`, `state`, `await_ready`,
 `cancel`.
@@ -908,13 +907,43 @@ cancelled when it is superseded; a failed, cancelled or mismatched decode
 installs a transparent blank and logs the cause — it never raises and never
 leaves a bitmap without pixels.
 
-**Error types:** `DecodePoolError` — `Worker`, `Config`,
-`QueueFull`, `MemoryLimit`, `SizeOverflow`, `IdExhausted`;
-`ImageDecodeError` — `Failed { message }`; `ImageSizeError` —
-`TooLarge { width, height }`.
+**Error types:** `ImageDecodeError` — `Failed { message }`;
+`ImageSizeError` — `TooLarge { width, height }`. The pool's own refusals
+are `JobPoolError` (§5.15).
 
 Code map: [`../code/engine/scene.md`](../code/engine/scene.md#the-pending-image)
 — the pending image, the pool's byte limit and the failures.
+
+### 5.15 jobpool — `engine::jobpool`
+
+| item | what it is |
+|---|---|
+| `JobPool` | the pool: the worker threads, the queue, the byte accounting and the jobs in flight |
+| `JobPoolConfig` | the configuration: the worker count, the queue limit and the memory limit. `DEFAULT_MEMORY_LIMIT` is 256 MiB |
+| `JobStats` | the counters: the number of jobs and the accumulated time |
+| `JobWork` | the work one job performs: a closure that returns the value it produced |
+| `JobValue` | the value a job produced; the caller casts it back with `downcast` |
+| `JobOutcome` / `JobState` | what a pending job produced: `Ready`, `Failed` or `Cancelled`; and whether it is still pending |
+| `PendingJob` | the handle a caller carries until the job lands |
+| `JobId` | the identity of one submitted job |
+
+The pool's own operations: `JobPool::new(config)`, `submit`, `cancel`,
+`queued`, `held_bytes`, `stats`. The pending job's operations: `demand`,
+`is_demanded`, `is_ready`, `state`, `await_ready`, `cancel`.
+
+Invariants: the pool is the engine's own state and two pools in one process
+do not interact; a job is a closure over a value the caller casts back, so
+the pool knows nothing about what the job computes; a cast that does not
+match is a typed error, never a panic and never a substitute value; a job
+nobody waits for is normal and a job a caller waits for is demanded, and a
+worker takes a demanded job first.
+
+**Error types:** `JobPoolError` — `Worker`, `Config`, `QueueFull`,
+`MemoryLimit`, `SizeOverflow`, `IdExhausted`; `JobCastError` —
+`TypeMismatch { expected, actual }`.
+
+Code map: [`../code/engine/scene.md`](../code/engine/scene.md#the-pending-image)
+— the pool the decode path runs on.
 
 ---
 
@@ -989,13 +1018,14 @@ value, a wildcard arm or a substitute on the calling side.
 | `MountError` | the mounting | the mount path is not a directory, a file-system failure, an archive that cannot be opened or parsed, or an archive too large to address in one buffer | yes |
 | `PreloadError` | a preloaded archive's image | the image is shorter than its reported size, the buffer cannot be allocated, or the read failed | yes |
 | `StorageReadError` | the reads and the lookups | the name did not resolve, a path component escaped the mount, a file-system failure, an archive read failure, a preload failure, or no result | yes |
-| `DecodePoolError` | the image decode pool | a worker could not start, the configuration is unusable, the queue is full, the memory limit would be exceeded, a size overflowed, or the ids are exhausted | no |
+| `JobPoolError` | the job pool | a worker could not start, the configuration is unusable, the queue is full, the memory limit would be exceeded, a size overflowed, or the ids are exhausted | no |
+| `JobCastError` | a job's value | the job produced a value of another type than the caller asked for | no |
 | `StoragePoolError` | the storage read pool | a worker could not start, the configuration is unusable, the queue is full, or the memory limit would be exceeded | no |
 | `ImageDecodeError` | one image decode | the decode failed; the message is the codec's own | no |
 | `ImageSizeError` | a probed image size | the pixel count does not fit in memory | no |
 
 The enums marked `#[non_exhaustive]` may grow a variant without a breaking
-change, so a caller that matches them needs a catch-all arm. The four that
+change, so a caller that matches them needs a catch-all arm. The five that
 are not marked are closed: they are the small, leaf-level errors whose
 variants are stable.
 

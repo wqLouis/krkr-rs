@@ -17,8 +17,8 @@ use api::error::FsError;
 use api::fs::FsPath;
 use api::input::InputEvent;
 use compat::{CompatCtx, CompatError, FrameBody};
-use engine::imagedecode::DecodeStats;
 use engine::input::InputState;
+use engine::jobpool::JobStats;
 use engine::storage::{MountOptions, StartupPlan, StorageReadError};
 use engine::timer::TimerState;
 use engine::{FrameTimeSource, GameFrame, PixelTranslation, Storage};
@@ -65,7 +65,7 @@ pub enum GameError {
     Host(#[from] HostError),
     /// The image decode pool could not be started.
     #[error(transparent)]
-    DecodePool(#[from] engine::imagedecode::DecodePoolError),
+    DecodePool(#[from] engine::jobpool::JobPoolError),
     /// The storage read pool could not be started.
     #[error(transparent)]
     StoragePool(#[from] engine::storage::StoragePoolError),
@@ -701,7 +701,7 @@ impl GameHost {
         log_startup(
             &storage,
             &stats,
-            host.engine().decode_stats(),
+            host.engine().job_stats(),
             mount_time,
             startup_time,
         );
@@ -892,7 +892,7 @@ fn install_host_faces(text: &mut engine::text::TextEngine) {
 fn log_startup(
     storage: &Storage,
     stats: &StartupStats,
-    deferred: Option<DecodeStats>,
+    deferred: Option<JobStats>,
     mount_time: Duration,
     startup_time: Duration,
 ) {
@@ -909,7 +909,9 @@ fn log_startup(
     });
     let mut snapshot: StartupSnapshot = stats.snapshot();
     if let Some(deferred) = deferred {
-        snapshot.images_decoded = snapshot.images_decoded.saturating_add(deferred.decodes);
+        // The pool's jobs are the deferred decodes; the startup's own
+        // counter holds the synchronous ones.
+        snapshot.images_decoded = snapshot.images_decoded.saturating_add(deferred.jobs);
         snapshot.image_decode = snapshot.image_decode.saturating_add(deferred.elapsed);
     }
     log::info!(

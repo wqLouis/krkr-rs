@@ -973,7 +973,7 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   limit of 67108864 bytes); the load decodes synchronously`. The avatar
   switch loads several character parts, so it hit the refusal.
   **Landed:** the decode pool's default byte limit is now **256 MiB**
-  (`engine::imagedecode::DEFAULT_MEMORY_LIMIT`), which holds the four
+  (`engine::jobpool::DEFAULT_MEMORY_LIMIT`), which holds the four
   character parts of an avatar switch at once (78.4 MB of charge) with room
   to spare; the refusal and its synchronous fallback are unchanged, and the
   refusal log now names the limit it refused the job against.

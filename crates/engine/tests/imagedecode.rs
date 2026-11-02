@@ -4,6 +4,9 @@
 //! it started and then blocks until the test opens that decode's gate. The
 //! tests therefore observe *which* decode ran and *when*, without a timing
 //! assumption.
+//!
+//! The pool under the decodes is a general job pool: the tests that submit
+//! a job that is not a decode cover that path too.
 
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
@@ -11,8 +14,11 @@ use std::time::Duration;
 
 use api::media::{DecodedImage, ImageInfo};
 use engine::imagedecode::{
-    DecodePool, DecodePoolConfig, DecodePoolError, ImageDecodeError, ImageDecoder, ImageOutcome,
-    ImageSizeError, ImageState, JobId, PendingImage,
+    DecodePool, ImageDecodeError, ImageDecoder, ImageOutcome, ImageSizeError, ImageState,
+    PendingImage,
+};
+use engine::jobpool::{
+    JobCastError, JobId, JobOutcome, JobPoolConfig, JobPoolError, JobValue, JobWork,
 };
 use engine::{DecodedImageKey, DecodedImageMode, Engine, EngineParts, GameFrame, Map, Scene};
 use render::{PipelineConfig, begin_render_state, create_render_pipeline};
@@ -194,8 +200,8 @@ impl ImageDecoder for GatedDecoder {
 }
 
 /// A pool configuration with `workers` workers and a generous limit.
-fn config(workers: usize) -> DecodePoolConfig {
-    DecodePoolConfig {
+fn config(workers: usize) -> JobPoolConfig {
+    JobPoolConfig {
         workers,
         queue_limit: 64,
         memory_limit: 1024 * 1024,
@@ -221,7 +227,7 @@ fn submit(pool: &mut DecodePool, hint: &str) -> (JobId, PendingImage) {
 fn submit_character_part(
     pool: &mut DecodePool,
     hint: &str,
-) -> Result<(JobId, PendingImage), DecodePoolError> {
+) -> Result<(JobId, PendingImage), JobPoolError> {
     let pixels =
         CHARACTER_PART_CHARGE - u64::try_from(CHARACTER_PART_BYTES.len()).expect("the length fits");
     pool.submit(
@@ -265,7 +271,7 @@ fn a_batch_of_decodes_runs_in_parallel() {
 /// fourth part of an avatar switch is not refused.
 #[test]
 fn the_default_limit_holds_four_character_parts() {
-    let config = DecodePoolConfig::default();
+    let config = JobPoolConfig::default();
     assert!(
         config.memory_limit >= 4 * CHARACTER_PART_CHARGE,
         "the default limit of {} bytes holds four character parts of {CHARACTER_PART_CHARGE} bytes",
@@ -301,7 +307,7 @@ fn the_default_limit_holds_four_character_parts() {
         None,
     );
     match refused {
-        Err(DecodePoolError::MemoryLimit { limit }) => {
+        Err(JobPoolError::MemoryLimit { limit }) => {
             assert_eq!(limit, config.memory_limit, "the refusal names the limit");
         }
         other => panic!("the oversized job is refused, got {other:?}"),
@@ -316,9 +322,9 @@ fn the_default_limit_holds_four_character_parts() {
 #[test]
 fn four_character_parts_decode_at_the_same_time() {
     let decoder = Arc::new(GatedDecoder::new());
-    let config = DecodePoolConfig {
+    let config = JobPoolConfig {
         workers: 4,
-        ..DecodePoolConfig::default()
+        ..JobPoolConfig::default()
     };
     let mut pool = DecodePool::new(decoder.clone(), config).expect("pool");
     // The gates open when the test leaves, so a refused part cannot leave a
@@ -707,7 +713,7 @@ fn a_job_whose_size_does_not_fit_is_refused() {
         None,
     );
     assert!(
-        matches!(&refused, Err(DecodePoolError::SizeOverflow)),
+        matches!(&refused, Err(JobPoolError::SizeOverflow)),
         "the job is refused: {refused:?}"
     );
     // The pool still accepts a job that fits.
@@ -1035,7 +1041,7 @@ fn a_resolved_pass_is_the_cached_image() {
 fn a_deferred_decode_counts_once_in_the_pool_accounting() {
     let decoder = Arc::new(GatedDecoder::new());
     let mut pool = DecodePool::new(decoder.clone(), config(1)).expect("pool");
-    assert_eq!(pool.stats().decodes, 0, "no decode ran yet");
+    assert_eq!(pool.stats().jobs, 0, "no decode ran yet");
     let gate = decoder.gate("counted");
     let (_, pending) = pool
         .submit_cached(
@@ -1050,7 +1056,7 @@ fn a_deferred_decode_counts_once_in_the_pool_accounting() {
     gate.open();
     assert!(matches!(pending.await_ready(), ImageOutcome::Ready(_)));
     let stats = pool.stats();
-    assert_eq!(stats.decodes, 1, "the deferred decode counted once");
+    assert_eq!(stats.jobs, 1, "the deferred decode counted once");
     assert!(
         stats.elapsed > Duration::ZERO,
         "the decode time was accumulated"
@@ -1064,7 +1070,7 @@ fn a_deferred_decode_counts_once_in_the_pool_accounting() {
     assert!(scene.resolve_bitmap(id));
     assert!(scene.resolve_bitmap(id));
     assert_eq!(
-        pool.stats().decodes,
+        pool.stats().jobs,
         1,
         "the image was decoded once, however often it resolved"
     );
@@ -1154,5 +1160,189 @@ fn removing_one_holder_of_a_shared_decode_keeps_the_decode() {
         bitmap.rgba,
         PIXELS.to_vec(),
         "the shared decode landed in the bitmap that stayed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The general job path
+// ---------------------------------------------------------------------------
+
+/// A job that is not a decode runs on the pool's worker, and the caller
+/// casts the value the job produced back.
+///
+/// The pool knows nothing about the work: the job is a closure, and the
+/// value it produced is the caller's to cast.
+#[test]
+fn a_general_job_runs_on_a_worker_and_the_caller_casts_the_result_back() {
+    let decoder = Arc::new(GatedDecoder::new());
+    let mut pool = DecodePool::new(decoder, config(1)).expect("pool");
+    let ran_on = Arc::new(Mutex::new(None));
+    let work: Arc<JobWork> = {
+        let ran_on = Arc::clone(&ran_on);
+        Arc::new(move || {
+            *ran_on.lock().unwrap_or_else(PoisonError::into_inner) = Some(thread::current().id());
+            Ok(JobValue::new(String::from("parsed")))
+        })
+    };
+    let (_id, pending) = pool.submit_job(work, 64).expect("the job is accepted");
+    let value = match pending.await_ready() {
+        JobOutcome::Ready(value) => value,
+        other => panic!("the job produced a value, got {other:?}"),
+    };
+    let text = value
+        .downcast::<String>()
+        .expect("the value is the string the job produced");
+    assert_eq!(&*text, "parsed", "the caller cast the value back");
+    let worker = ran_on
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .expect("the job ran");
+    assert_ne!(
+        worker,
+        thread::current().id(),
+        "the job ran on the pool's worker"
+    );
+}
+
+/// A cast that does not match the value the job produced is a typed error.
+///
+/// The caller asked for another type, so the value is refused: it is never
+/// handed out as a substitute, and the cast never panics.
+#[test]
+fn a_cast_that_does_not_match_is_a_typed_error() {
+    let decoder = Arc::new(GatedDecoder::new());
+    let mut pool = DecodePool::new(decoder, config(1)).expect("pool");
+    let work: Arc<JobWork> = Arc::new(|| Ok(JobValue::new(7u32)));
+    let (_id, pending) = pool.submit_job(work, 64).expect("the job is accepted");
+    let value = match pending.await_ready() {
+        JobOutcome::Ready(value) => value,
+        other => panic!("the job produced a value, got {other:?}"),
+    };
+    let refused = value.downcast::<String>();
+    match &refused {
+        Err(JobCastError::TypeMismatch { expected, actual }) => {
+            assert!(
+                expected.contains("String"),
+                "the refusal names the type the caller asked for: {expected}"
+            );
+            assert!(
+                actual.contains("u32"),
+                "the refusal names the type the job produced: {actual}"
+            );
+        }
+        other => panic!("the cast is refused with a typed error, got {other:?}"),
+    }
+}
+
+/// A job that fails publishes its message, and a cancelled job publishes the
+/// cancellation.
+#[test]
+fn a_failed_job_publishes_its_message_and_a_cancelled_one_the_cancellation() {
+    let decoder = Arc::new(GatedDecoder::new());
+    let mut pool = DecodePool::new(decoder.clone(), config(1)).expect("pool");
+    let work: Arc<JobWork> = Arc::new(|| Err(String::from("the container is broken")));
+    let (_id, pending) = pool.submit_job(work, 64).expect("the job is accepted");
+    match pending.await_ready() {
+        JobOutcome::Failed(message) => {
+            assert_eq!(message, "the container is broken", "the job's own message");
+        }
+        other => panic!("the job failed as expected, got {other:?}"),
+    }
+
+    // The worker is busy with the decode, so the job below stays queued and
+    // the cancellation reaches it.
+    let gate = decoder.gate("running");
+    let (_, running) = submit(&mut pool, "running");
+    decoder.wait_for_started(1);
+    let work: Arc<JobWork> = Arc::new(|| Ok(JobValue::new(1u32)));
+    let (id, pending) = pool.submit_job(work, 64).expect("the job is accepted");
+    assert!(pool.cancel(id), "the queued job was cancelled");
+    assert!(matches!(pending.await_ready(), JobOutcome::Cancelled));
+    gate.open();
+    assert!(matches!(running.await_ready(), ImageOutcome::Ready(_)));
+}
+
+/// A job that does not fit the memory limit is refused with a typed error,
+/// and the pool keeps working.
+#[test]
+fn a_job_that_does_not_fit_the_memory_limit_is_refused() {
+    let decoder = Arc::new(GatedDecoder::new());
+    let limit = 128;
+    let mut pool = DecodePool::new(
+        decoder,
+        JobPoolConfig {
+            workers: 1,
+            queue_limit: 4,
+            memory_limit: limit,
+        },
+    )
+    .expect("pool");
+    let work: Arc<JobWork> = Arc::new(|| Ok(JobValue::new(1u32)));
+    let refused = pool.submit_job(work, 4096);
+    match refused {
+        Err(JobPoolError::MemoryLimit {
+            limit: refused_limit,
+        }) => {
+            assert_eq!(refused_limit, limit, "the refusal names the limit");
+        }
+        other => panic!("the oversized job is refused, got {other:?}"),
+    }
+    // The pool still accepts a job that fits.
+    let work: Arc<JobWork> = Arc::new(|| Ok(JobValue::new(1u32)));
+    let (_id, pending) = pool.submit_job(work, 64).expect("the job is accepted");
+    assert!(matches!(pending.await_ready(), JobOutcome::Ready(_)));
+}
+
+/// A demanded job is taken before the normal jobs queued behind it, and the
+/// rule is the pool's: it holds for the jobs that are not decodes too.
+#[test]
+fn a_demanded_job_is_taken_before_the_queued_ones() {
+    let decoder = Arc::new(GatedDecoder::new());
+    let mut pool = DecodePool::new(decoder.clone(), config(1)).expect("pool");
+    let gate = decoder.gate("running");
+    let (_, running) = submit(&mut pool, "running");
+    decoder.wait_for_started(1);
+
+    // The order the jobs ran in is what the rule is about.
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let work: Arc<JobWork> = {
+        let order = Arc::clone(&order);
+        Arc::new(move || {
+            order
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push("normal");
+            Ok(JobValue::new(1u32))
+        })
+    };
+    let (_id, normal) = pool.submit_job(work, 64).expect("the job is accepted");
+    let work: Arc<JobWork> = {
+        let order = Arc::clone(&order);
+        Arc::new(move || {
+            order
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push("demanded");
+            Ok(JobValue::new(2u32))
+        })
+    };
+    let (_id, demanded) = pool.submit_job(work, 64).expect("the job is accepted");
+    demanded.demand();
+
+    gate.open();
+    assert!(matches!(running.await_ready(), ImageOutcome::Ready(_)));
+    assert!(
+        matches!(demanded.await_ready(), JobOutcome::Ready(_)),
+        "the demanded job ran"
+    );
+    assert!(
+        matches!(normal.await_ready(), JobOutcome::Ready(_)),
+        "the normal job ran after it"
+    );
+    let ran = order.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    assert_eq!(
+        ran,
+        vec!["demanded".to_string(), "normal".to_string()],
+        "the demanded job ran before the normal one"
     );
 }

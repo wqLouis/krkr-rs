@@ -763,14 +763,14 @@ no panic on malformed input, no silent fallback, and no substituted default.
 | `engine::text::TextError` | the text engine | `UnknownFont`, `InvalidSize`, `InvalidFont`, `FontNotFound`, `AtlasFull`, `InvalidCoverage`, `MaskTooLarge`, `Glyph`, `Render` |
 | `engine::video::VideoError` | the video overlay | `InvalidSpec`, `NotOpen`, `InconsistentFrame` |
 | `engine::trans::TransError` | the transition machine | `InvalidDuration`, `InvalidVague`, `MissingRule`, `UnexpectedRule`, `InconsistentRule`, `SizeMismatch`, `InvalidOption` |
-| `engine::imagedecode::DecodePoolError` | the decode pool | `Worker`, `Config`, `QueueFull`, `MemoryLimit`, `SizeOverflow`, `IdExhausted` |
+| `engine::jobpool::JobPoolError` | the job pool | `Worker`, `Config`, `QueueFull`, `MemoryLimit`, `SizeOverflow`, `IdExhausted` |
 | `api::error::RenderError` | the render service | `Unsupported`, `DeviceUnavailable`, `DeviceLost`, `SurfaceLost`, `SurfaceOutOfDate`, `OutOfMemory`, `InvalidArgument`, `Shader`, `Upload`, `Framebuffer` |
 | `api::error::FsError` | the file system | `Io`, `InvalidState`, `NotFound`, `InvalidPath`, `Unsupported`, `PermissionDenied`, `AlreadyExists`, `NotADirectory`, `IsADirectory` |
 | `api::error::MediaError` | the codecs | `Io`, `NotFound`, `Decode`, `Encode`, `Unsupported`, `InvalidData`, `InvalidState`, `EndOfStream` |
 | `api::error::AudioError` | the audio device | `Unsupported`, `DeviceUnavailable`, `Open`, `Stream`, `InvalidSpec`, `AlreadyRunning`, `NotRunning` |
 | `api::error::GlyphError` | the font system | `Decode`, `Unsupported`, `InvalidFont`, `MissingGlyph`, `Rasterize` |
 
-All of these are `#[non_exhaustive]` except `DecodePoolError` and
+All of these are `#[non_exhaustive]` except `JobPoolError` and
 `StoragePoolError`, which name every variant they have. A host that matches
 on one of the non-exhaustive enums needs a wildcard arm:
 

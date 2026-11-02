@@ -568,7 +568,8 @@ layer above can drive the replacement through the seam.
 | `trans.rs`, `trans_blend.rs`, `trans_effect.rs`, `trans_effect_gpu.rs`, `extrans_mosaic.rs`, `extrans_ripple.rs`, `extrans_rotate.rs`, `extrans_turn.rs`, `extrans_wave.rs` | the transition machine, its composition kinds and the effect draws |
 | `text.rs`, `text_render.rs` | the shaping, the coverage, the atlas, the projection |
 | `layer_ops.rs`, `raster.rs` | the pixel operations |
-| `imagedecode.rs` | the decode pool: the parallelism, the byte limit, the pending image, the frame barrier |
+| `imagedecode.rs` | the decode path: the codec, the pass, the pending image, the frame barrier |
+| `jobpool.rs` | the job pool: the parallelism, the byte limit, the pending job |
 | `pending_safety.rs` | the pending bitmap's pixel access and the province plane |
 | `dirty.rs` | the scene's change tracking and the frame cadence it drives |
 | `shader_library.rs`, `shader_assets.rs` | the shader-program registry and the shipped programs |

@@ -40,9 +40,8 @@ use render::{
 
 use crate::clock::{FrameClock, FrameTimeSource, InjectedFrameTime};
 use crate::hasher::{Map, map};
-use crate::imagedecode::{
-    DecodePool, DecodePoolConfig, DecodePoolError, DecodeStats, ImageDecoder,
-};
+use crate::imagedecode::{DecodePool, ImageDecoder};
+use crate::jobpool::{JobPoolConfig, JobPoolError, JobStats};
 use crate::projection::{ProjectionReport, project_scene_report};
 use crate::scene::{BitmapState, Scene};
 use crate::shader::{PipelineId, Program, ProgramDesc, ShaderError, ShaderId, ShaderLibrary};
@@ -651,12 +650,12 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Returns [`DecodePoolError`] when the pool cannot be started.
+    /// Returns [`JobPoolError`] when the pool cannot be started.
     pub fn install_decoder(
         &mut self,
         decoder: Arc<dyn ImageDecoder>,
-        config: DecodePoolConfig,
-    ) -> Result<(), DecodePoolError> {
+        config: JobPoolConfig,
+    ) -> Result<(), JobPoolError> {
         self.decode_pool = Some(DecodePool::new(decoder, config)?);
         Ok(())
     }
@@ -676,13 +675,13 @@ impl Engine {
         self.decode_pool.as_mut()
     }
 
-    /// The decode accounting of the image decode pool, or `None` when no
-    /// decoder is installed.
+    /// The job accounting of the decode pool, or `None` when no decoder is
+    /// installed.
     ///
-    /// The counters are the number of image decodes the pool ran and the time
-    /// they took. A worker updates them under the pool's own lock, so the
-    /// totals are read here on the thread that owns the engine.
-    pub fn decode_stats(&self) -> Option<DecodeStats> {
+    /// The counters are the number of jobs the pool ran and the time they
+    /// took. A worker updates them under the pool's own lock, so the totals
+    /// are read here on the thread that owns the engine.
+    pub fn job_stats(&self) -> Option<JobStats> {
         self.decode_pool.as_ref().map(DecodePool::stats)
     }
 

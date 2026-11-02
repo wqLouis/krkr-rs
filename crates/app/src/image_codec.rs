@@ -155,14 +155,14 @@ impl ImageDecoder for MediaImageDecoder {
 ///
 /// # Errors
 ///
-/// Returns [`engine::imagedecode::DecodePoolError`] when the pool cannot be
+/// Returns [`engine::jobpool::JobPoolError`] when the pool cannot be
 /// started.
 pub(crate) fn install_image_decoder(
     engine: &mut engine::Engine,
     media: &Media,
-) -> Result<(), engine::imagedecode::DecodePoolError> {
+) -> Result<(), engine::jobpool::JobPoolError> {
     let decoder: Arc<dyn ImageDecoder> = Arc::new(MediaImageDecoder { media: *media });
-    engine.install_decoder(decoder, engine::imagedecode::DecodePoolConfig::default())
+    engine.install_decoder(decoder, engine::jobpool::JobPoolConfig::default())
 }
 
 /// Writes `bytes` to `name` under `base` in `fs`, creating missing parents.

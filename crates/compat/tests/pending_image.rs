@@ -13,8 +13,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use api::media::{DecodedImage, ImageInfo};
 use compat::CompatHost;
-use engine::imagedecode::{DecodePool, DecodePoolConfig, ImageDecodeError, ImageDecoder};
+use engine::imagedecode::{DecodePool, ImageDecodeError, ImageDecoder};
 use engine::input::InputState;
+use engine::jobpool::JobPoolConfig;
 use engine::timer::TimerState;
 use engine::{DecodedImageKey, DecodedImageMode, Scene, Storage};
 use fs::FileSystem;
@@ -106,7 +107,7 @@ impl Env {
     }
 
     /// An environment with a decode pool of the given configuration.
-    fn with_pool(config: DecodePoolConfig) -> Env {
+    fn with_pool(config: JobPoolConfig) -> Env {
         Self::build(Some(config))
     }
 
@@ -118,11 +119,11 @@ impl Env {
         Self::build_with_probe(Some(config()), true)
     }
 
-    fn build(pool: Option<DecodePoolConfig>) -> Env {
+    fn build(pool: Option<JobPoolConfig>) -> Env {
         Self::build_with_probe(pool, false)
     }
 
-    fn build_with_probe(pool: Option<DecodePoolConfig>, probe_fails: bool) -> Env {
+    fn build_with_probe(pool: Option<JobPoolConfig>, probe_fails: bool) -> Env {
         let game_dir = unique_dir("krkr-pending-test");
         std::fs::create_dir_all(&game_dir).expect("create temp game dir");
         std::fs::write(game_dir.join("picture.png"), PICTURE).expect("write the picture");
@@ -275,8 +276,8 @@ fn unique_dir(tag: &str) -> PathBuf {
 }
 
 /// A pool configuration with one worker.
-fn config() -> DecodePoolConfig {
-    DecodePoolConfig {
+fn config() -> JobPoolConfig {
+    JobPoolConfig {
         workers: 1,
         queue_limit: 8,
         memory_limit: 1024 * 1024,
@@ -408,7 +409,7 @@ fn a_resolved_deferred_load_is_a_cache_hit_next_time() {
         .as_ref()
         .expect("the pool is attached")
         .stats()
-        .decodes;
+        .jobs;
     assert_eq!(decodes, 1, "the first load decoded once");
 
     env.run("var b2 = new Bitmap('picture.png');");
@@ -422,7 +423,7 @@ fn a_resolved_deferred_load_is_a_cache_hit_next_time() {
             .as_ref()
             .expect("the pool is attached")
             .stats()
-            .decodes,
+            .jobs,
         1,
         "the cache hit did not decode the image again"
     );
@@ -495,7 +496,7 @@ fn two_loads_of_the_same_image_in_one_frame_share_one_decode() {
             .as_ref()
             .expect("the pool is attached")
             .stats()
-            .decodes,
+            .jobs,
         1,
         "the pool ran one decode"
     );
@@ -630,7 +631,7 @@ fn a_deferred_colour_keyed_bitmap_load_applies_the_key_on_the_worker() {
             .as_ref()
             .expect("the pool is attached")
             .stats()
-            .decodes,
+            .jobs,
         1,
         "the pool ran the keyed decode"
     );
@@ -657,7 +658,7 @@ fn a_deferred_colour_keyed_bitmap_load_applies_the_key_on_the_worker() {
             .as_ref()
             .expect("the pool is attached")
             .stats()
-            .decodes,
+            .jobs,
         1,
         "the repeated keyed load did not decode the image again"
     );
