@@ -13,7 +13,9 @@
 //! composes the L2 `engine_api::Scene` layer system for drawing instead of
 //! re-implementing the D3D rasterizer. PSB data is parsed by the shared
 //! `psb_file` container parser, mapped to the runtime model in [`model`], and
-//! its pixel chunks are decoded by [`texture`].
+//! its pixel chunks are decoded by [`texture`] on the engine's job pool: the
+//! chunks of one pose are independent, so they are decoded in parallel and
+//! the draw waits for the pixels it needs.
 //!
 //! # Coordination note
 //!

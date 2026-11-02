@@ -10,7 +10,8 @@
 //! evaluation reads the selected clip's timeline time; drawing composes the
 //! L2 `engine_api::Scene` layer system: [`PlayerInst::draw`] maps each node's
 //! icon pixels onto its transformed quad with `engine_api::layer_ops`,
-//! decoding the container's `RL`/palettized pixel chunks itself.
+//! decoding the container's `RL`/palettized pixel chunks on the engine's job
+//! pool.
 #![allow(unsafe_code)]
 
 use std::collections::BTreeSet;
@@ -28,13 +29,13 @@ use super::model::{
     evaluate_frames, names_first_child, prime_timelines, scan_frame_events, step_timelines,
 };
 use super::resource::{MotionStore, ResourceInst};
-use super::texture::Pixels;
+use super::texture::{ChunkRequest, IconChunks, Pixels, pixel_offset, pixel_size};
 use crate::collections::Map;
 use crate::engine_api::layer_ops::{
     AffineBlit, BlitOptions, BlitSource, RectI, affine_blit, fill_mask, intersect_rect,
     operate_rect,
 };
-use crate::engine_api::{BitmapState, Scene, Storage};
+use crate::engine_api::{BitmapState, DecodePool, Scene, Storage};
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
 use crate::natives::system::{resolve, value_as_bool, value_as_i64};
 use crate::storage::strip_file_media;
@@ -1597,12 +1598,18 @@ impl PlayerInst {
         let storage = unsafe { ctx.services() }.storage();
         // SAFETY: the host keeps the attached storage alive for the binding.
         let storage = storage.map(|storage| unsafe { &*storage });
+        // The job pool the pixel chunks are decoded on. `None` when the host
+        // attached no pool: the chunks are then decoded on the drawing thread.
+        // SAFETY: the host keeps the attached pool alive for the binding.
+        let pool = unsafe { ctx.services() }.decode_pool();
+        // SAFETY: the host keeps the attached pool alive for the binding.
+        let pool = pool.map(|pool| unsafe { &mut *pool });
         match surface {
             DrawSurface::Layer(layer_id) => {
                 // The ordinary route clears the target when the player asks
                 // for it.
                 let clear = self.clear_enabled.then(|| clear_fill(self.clear_color));
-                self.draw_into_scene(scene, layer_id, storage, clear);
+                self.draw_into_scene(scene, layer_id, storage, pool, clear);
             }
             DrawSurface::D3DAdaptor(payload) => {
                 // The D3D route paints into the adaptor's own render target,
@@ -1619,7 +1626,7 @@ impl PlayerInst {
                 }
                 let clear = adaptor.clear_fill();
                 let layer = super::adaptors::d3d_render_target(adaptor, scene)?;
-                self.draw_into_scene(scene, layer, storage, clear);
+                self.draw_into_scene(scene, layer, storage, pool, clear);
             }
         }
         Ok(())
@@ -1631,6 +1638,7 @@ impl PlayerInst {
         scene: &mut Scene,
         layer_id: u32,
         storage: Option<&Storage>,
+        pool: Option<&mut DecodePool>,
         clear: Option<[u8; 4]>,
     ) {
         let Some(bitmap_id) = scene.layer(layer_id).and_then(|layer| layer.bitmap) else {
@@ -1702,15 +1710,19 @@ impl PlayerInst {
         let missing = composite_pose(
             bitmap,
             nodes,
-            snapshot.as_deref(),
-            storage,
-            DrawSettings {
-                color,
-                affine,
-                preview: self.preview,
-                mask_mode: self.mask_mode,
+            DrawFrame {
+                snapshot: snapshot.as_deref(),
+                storage,
+                settings: DrawSettings {
+                    color,
+                    affine,
+                    preview: self.preview,
+                    mask_mode: self.mask_mode,
+                },
+                tinted: &mut tinted,
+                missing: Vec::new(),
+                pool,
             },
-            &mut tinted,
             bounds,
         );
         self.tinted = tinted;
@@ -1792,6 +1804,11 @@ struct DrawFrame<'a> {
     settings: DrawSettings,
     tinted: &'a mut TintedSources,
     missing: Vec<String>,
+    /// The job pool the pixel chunks are decoded on.
+    ///
+    /// `None` when the host attached no pool: the chunks are then decoded on
+    /// the drawing thread, exactly as they were before the pool existed.
+    pool: Option<&'a mut DecodePool>,
 }
 
 /// Paint the pose over `bitmap` in node order, returning the icon sources
@@ -1799,21 +1816,15 @@ struct DrawFrame<'a> {
 fn composite_pose(
     bitmap: &mut BitmapState,
     nodes: &[MotionNode],
-    snapshot: Option<&MotionSnapshot>,
-    storage: Option<&Storage>,
-    settings: DrawSettings,
-    tinted: &mut TintedSources,
+    mut frame: DrawFrame<'_>,
     bounds: (i32, i32, i32, i32),
 ) -> Vec<String> {
-    let mut frame = DrawFrame {
-        snapshot,
-        storage,
-        settings,
-        tinted,
-        missing: Vec::new(),
-    };
+    // The chunks the pose draws from are decoded before it is painted: they
+    // are independent of each other, so the pool decodes them in parallel and
+    // the painters wait for the pixels of the chunk they need.
+    prefetch_chunks(&mut frame, nodes);
     for index in 1..nodes.len() {
-        if settings.preview && nodes[index].child_owner.is_some() {
+        if frame.settings.preview && nodes[index].child_owner.is_some() {
             continue;
         }
         if nearest_group(nodes, index).is_some() {
@@ -2441,7 +2452,7 @@ fn draw_node(
     let icon = frame
         .snapshot
         .and_then(|snapshot| snapshot.icons.get(&node.local.src));
-    let (Some(snapshot), Some(icon), Some(storage)) = (frame.snapshot, icon, frame.storage) else {
+    let (Some(icon), Some(_)) = (icon, frame.storage) else {
         if node.shape > 0 {
             fill_placeholder_quad_offset(
                 bitmap,
@@ -2458,7 +2469,7 @@ fn draw_node(
         }
         return;
     };
-    let Some((pixels, crop)) = icon_pixels(snapshot, storage, icon) else {
+    let Some((pixels, crop)) = icon_pixels(frame, icon) else {
         frame.missing.push(node.local.src.clone());
         return;
     };
@@ -2790,82 +2801,83 @@ fn fill_placeholder_quad_offset(
 /// it occupies.
 ///
 /// The icon is cropped from its group's `texture` atlas when the atlas and the
-/// crop are usable, and from its own `pixel` chunk otherwise.
-fn icon_pixels(
-    snapshot: &MotionSnapshot,
-    storage: &Storage,
-    icon: &IconInfo,
-) -> Option<(Arc<Pixels>, RectI)> {
+/// crop are usable, and from its own `pixel` chunk otherwise. The chunks are
+/// decoded on the job pool: the draw waits for the pixels it needs and never
+/// decodes them itself.
+fn icon_pixels(frame: &mut DrawFrame<'_>, icon: &IconInfo) -> Option<(Arc<Pixels>, RectI)> {
+    let snapshot = frame.snapshot?;
     let width = pixel_size(icon.width)?;
     let height = pixel_size(icon.height)?;
-    if let Some(texture) = snapshot.textures.get(&icon.group) {
-        let atlas_path = format!(
-            "psb://{}/source/{}/texture/pixel",
-            snapshot.container, icon.group
+    let chunks = IconChunks::new(snapshot, icon, width, height);
+    if let Some(atlas) = &chunks.atlas
+        && let Some(atlas) = frame.pixels(atlas)
+        && let (Some(left), Some(top)) = (pixel_offset(icon.left), pixel_offset(icon.top))
+        && left + width <= atlas.width
+        && top + height <= atlas.height
+    {
+        let crop = (
+            left as i32,
+            top as i32,
+            (left + width) as i32,
+            (top + height) as i32,
         );
-        let palette_path = format!(
-            "psb://{}/source/{}/texture/pal",
-            snapshot.container, icon.group
-        );
-        if let (Some(atlas_width), Some(atlas_height)) =
-            (pixel_size(texture.width), pixel_size(texture.height))
-            && let Some(atlas) = snapshot.pixels.get_or_decode(
-                storage,
-                &atlas_path,
-                &palette_path,
-                atlas_width,
-                atlas_height,
-                texture.compressed,
-            )
-            && let (Some(left), Some(top)) = (pixel_offset(icon.left), pixel_offset(icon.top))
-            && left + width <= atlas.width
-            && top + height <= atlas.height
-        {
-            let crop = (
-                left as i32,
-                top as i32,
-                (left + width) as i32,
-                (top + height) as i32,
-            );
-            return Some((atlas, crop));
-        }
+        return Some((atlas, crop));
     }
-    let icon_path = format!(
-        "psb://{}/source/{}/icon/{}/pixel",
-        snapshot.container, icon.group, icon.name
-    );
-    let palette_path = format!(
-        "psb://{}/source/{}/icon/{}/pal",
-        snapshot.container, icon.group, icon.name
-    );
-    let pixels = snapshot.pixels.get_or_decode(
-        storage,
-        &icon_path,
-        &palette_path,
-        width,
-        height,
-        icon.compressed,
-    )?;
+    let pixels = frame.pixels(&chunks.own)?;
     Some((pixels, (0, 0, width as i32, height as i32)))
 }
 
-/// An image dimension rounded to whole pixels, or `None` when it carries no
-/// usable size.
-fn pixel_size(value: f64) -> Option<u32> {
-    let rounded = value.round();
-    if !rounded.is_finite() || rounded < 1.0 || rounded > f64::from(u32::MAX) {
-        return None;
+impl DrawFrame<'_> {
+    /// The decoded pixels of the chunk `request` names.
+    ///
+    /// The chunk is decoded on the job pool when it is not decoded yet, and
+    /// the draw waits for the decode.
+    fn pixels(&mut self, request: &ChunkRequest) -> Option<Arc<Pixels>> {
+        let snapshot = self.snapshot?;
+        let storage = self.storage?;
+        let pool = self.pool.as_deref_mut();
+        snapshot.pixels.get_or_decode(pool, storage, request)
     }
-    Some(rounded as u32)
 }
 
-/// A whole-pixel offset into an atlas, or `None` when it is negative.
-fn pixel_offset(value: f64) -> Option<u32> {
-    let rounded = value.round();
-    if !rounded.is_finite() || rounded < 0.0 || rounded > f64::from(u32::MAX) {
-        return None;
+/// Submit the decodes of the chunks the pose draws from.
+///
+/// The chunks are independent of each other, so the pool decodes them in
+/// parallel: the painters wait for the pixels of the chunk they need. A chunk
+/// the pose does not draw from is decoded when it is needed, not before.
+fn prefetch_chunks(frame: &mut DrawFrame<'_>, nodes: &[MotionNode]) {
+    let Some(snapshot) = frame.snapshot else {
+        return;
+    };
+    let Some(storage) = frame.storage else {
+        return;
+    };
+    let Some(pool) = frame.pool.as_deref_mut() else {
+        return;
+    };
+    let mut requests: Vec<ChunkRequest> = Vec::new();
+    for node in nodes {
+        if frame.settings.preview && node.child_owner.is_some() {
+            continue;
+        }
+        if !node_drawable(node) {
+            continue;
+        }
+        let Some(icon) = snapshot.icons.get(&node.local.src) else {
+            continue;
+        };
+        let (Some(width), Some(height)) = (pixel_size(icon.width), pixel_size(icon.height)) else {
+            continue;
+        };
+        let chunks = IconChunks::new(snapshot, icon, width, height);
+        match &chunks.atlas {
+            // The atlas serves the icon; its own chunk is the fallback for an
+            // atlas that does not decode or does not hold the crop.
+            Some(atlas) => requests.push(atlas.clone()),
+            None => requests.push(chunks.own.clone()),
+        }
     }
-    Some(rounded as u32)
+    snapshot.pixels.prefetch(pool, storage, &requests);
 }
 
 /// The node's local 2x2 transform as `[m11, m12, m21, m22]`, composed from the
@@ -4195,10 +4207,10 @@ mod tests {
     use super::color_bytes;
     use super::local_matrix;
     use super::{
-        BitmapState, DEFAULT_NODE_COLORS, DrawSettings, MotionNode, MotionSnapshot, PlayerInst,
-        RetainedValue, TimelineState, TjsValue, build_node_tree, composite_pose, draw_icon,
-        draw_point, evaluate_frames, inherited_parent, inherited_transform, node_drawable,
-        prime_timelines, unit_axis_aligned_origin,
+        BitmapState, DEFAULT_NODE_COLORS, DrawFrame, DrawSettings, MotionNode, MotionSnapshot,
+        PlayerInst, RetainedValue, TimelineState, TjsValue, build_node_tree, composite_pose,
+        draw_icon, draw_point, evaluate_frames, inherited_parent, inherited_transform,
+        node_drawable, prime_timelines, unit_axis_aligned_origin,
     };
     use crate::engine_api::Storage;
     use crate::engine_api::layer_ops::{AffineBlit, BlitOptions, BlitSource, affine_blit};
@@ -4346,15 +4358,19 @@ mod tests {
         let missing = composite_pose(
             &mut bitmap,
             &player.nodes,
-            snapshot.as_deref(),
-            None,
-            DrawSettings {
-                color,
-                affine,
-                preview: player.preview,
-                mask_mode: player.mask_mode,
+            DrawFrame {
+                snapshot: snapshot.as_deref(),
+                storage: None,
+                settings: DrawSettings {
+                    color,
+                    affine,
+                    preview: player.preview,
+                    mask_mode: player.mask_mode,
+                },
+                tinted: &mut player.tinted,
+                missing: Vec::new(),
+                pool: None,
             },
-            &mut player.tinted,
             (0, 0, 800, 1080),
         );
         assert!(missing.is_empty(), "synthetic shapes need no texture");
@@ -5799,15 +5815,19 @@ mod tests {
             let missing = composite_pose(
                 &mut bitmap,
                 &player.nodes,
-                Some(&snapshot),
-                Some(&storage),
-                DrawSettings {
-                    color,
-                    affine,
-                    preview: player.preview,
-                    mask_mode: player.mask_mode,
+                DrawFrame {
+                    snapshot: Some(&snapshot),
+                    storage: Some(&storage),
+                    settings: DrawSettings {
+                        color,
+                        affine,
+                        preview: player.preview,
+                        mask_mode: player.mask_mode,
+                    },
+                    tinted: &mut player.tinted,
+                    missing: Vec::new(),
+                    pool: None,
                 },
-                &mut player.tinted,
                 (0, 0, 4, 4),
             );
             assert!(missing.is_empty());
@@ -5853,15 +5873,19 @@ mod tests {
             let missing = composite_pose(
                 &mut bitmap,
                 &player.nodes,
-                Some(&snapshot),
-                Some(&storage),
-                DrawSettings {
-                    color,
-                    affine,
-                    preview: player.preview,
-                    mask_mode: player.mask_mode,
+                DrawFrame {
+                    snapshot: Some(&snapshot),
+                    storage: Some(&storage),
+                    settings: DrawSettings {
+                        color,
+                        affine,
+                        preview: player.preview,
+                        mask_mode: player.mask_mode,
+                    },
+                    tinted: &mut player.tinted,
+                    missing: Vec::new(),
+                    pool: None,
                 },
-                &mut player.tinted,
                 (0, 0, 4, 4),
             );
             assert!(missing.is_empty());
@@ -5906,15 +5930,19 @@ mod tests {
             let missing = composite_pose(
                 &mut bitmap,
                 &player.nodes,
-                Some(&snapshot),
-                Some(&storage),
-                DrawSettings {
-                    color,
-                    affine,
-                    preview: player.preview,
-                    mask_mode: player.mask_mode,
+                DrawFrame {
+                    snapshot: Some(&snapshot),
+                    storage: Some(&storage),
+                    settings: DrawSettings {
+                        color,
+                        affine,
+                        preview: player.preview,
+                        mask_mode: player.mask_mode,
+                    },
+                    tinted: &mut player.tinted,
+                    missing: Vec::new(),
+                    pool: None,
                 },
-                &mut player.tinted,
                 (0, 0, 4, 4),
             );
             assert!(missing.is_empty());
@@ -5964,15 +5992,19 @@ mod tests {
             composite_pose(
                 bitmap,
                 &player.nodes,
-                snapshot.as_deref(),
-                Some(&storage),
-                DrawSettings {
-                    color,
-                    affine,
-                    preview: player.preview,
-                    mask_mode: player.mask_mode,
+                DrawFrame {
+                    snapshot: snapshot.as_deref(),
+                    storage: Some(&storage),
+                    settings: DrawSettings {
+                        color,
+                        affine,
+                        preview: player.preview,
+                        mask_mode: player.mask_mode,
+                    },
+                    tinted: &mut player.tinted,
+                    missing: Vec::new(),
+                    pool: None,
                 },
-                &mut player.tinted,
                 (0, 0, 4, 4),
             )
         };
@@ -6019,15 +6051,19 @@ mod tests {
         let missing = composite_pose(
             &mut bitmap,
             &player.nodes,
-            Some(&snapshot),
-            Some(&storage),
-            DrawSettings {
-                color,
-                affine: player.affine,
-                preview: player.preview,
-                mask_mode: player.mask_mode,
+            DrawFrame {
+                snapshot: Some(&snapshot),
+                storage: Some(&storage),
+                settings: DrawSettings {
+                    color,
+                    affine: player.affine,
+                    preview: player.preview,
+                    mask_mode: player.mask_mode,
+                },
+                tinted: &mut player.tinted,
+                missing: Vec::new(),
+                pool: None,
             },
-            &mut player.tinted,
             (0, 0, 4, 4),
         );
         assert!(missing.is_empty());
@@ -6042,15 +6078,19 @@ mod tests {
         let missing = composite_pose(
             &mut bitmap,
             &player.nodes,
-            Some(&snapshot),
-            Some(&storage),
-            DrawSettings {
-                color,
-                affine: player.affine,
-                preview: player.preview,
-                mask_mode: player.mask_mode,
+            DrawFrame {
+                snapshot: Some(&snapshot),
+                storage: Some(&storage),
+                settings: DrawSettings {
+                    color,
+                    affine: player.affine,
+                    preview: player.preview,
+                    mask_mode: player.mask_mode,
+                },
+                tinted: &mut player.tinted,
+                missing: Vec::new(),
+                pool: None,
             },
-            &mut player.tinted,
             (0, 0, 4, 4),
         );
         assert!(missing.is_empty());
@@ -6101,7 +6141,7 @@ mod tests {
         let bitmap = scene.add_bitmap(800, 1080, vec![0u8; 800 * 1080 * 4]);
         scene.layer_mut(layer).expect("target layer").bitmap = Some(bitmap);
         let allocated = scene.bitmap(bitmap).expect("target bitmap").rgba.as_ptr() as usize;
-        player.draw_into_scene(&mut scene, layer, None, None);
+        player.draw_into_scene(&mut scene, layer, None, None, None);
         assert_eq!(
             scene.bitmap(bitmap).expect("target bitmap").rgba.as_ptr() as usize,
             allocated,
@@ -6112,7 +6152,7 @@ mod tests {
             255
         );
         assert!(scene.layer(layer).expect("target layer").image_modified);
-        player.draw_into_scene(&mut scene, layer, None, None);
+        player.draw_into_scene(&mut scene, layer, None, None, None);
         assert_eq!(
             scene.bitmap(bitmap).expect("target bitmap").rgba.as_ptr() as usize,
             allocated
@@ -6720,15 +6760,19 @@ mod tests {
             let missing = composite_pose(
                 &mut bitmap,
                 &player.nodes,
-                player.snapshot.as_deref(),
-                Some(&storage),
-                DrawSettings {
-                    color,
-                    affine: player.affine,
-                    preview: player.preview,
-                    mask_mode,
+                DrawFrame {
+                    snapshot: player.snapshot.as_deref(),
+                    storage: Some(&storage),
+                    settings: DrawSettings {
+                        color,
+                        affine: player.affine,
+                        preview: player.preview,
+                        mask_mode,
+                    },
+                    tinted: &mut player.tinted,
+                    missing: Vec::new(),
+                    pool: None,
                 },
-                &mut player.tinted,
                 (0, 0, 800, 1080),
             );
             assert!(missing.is_empty());

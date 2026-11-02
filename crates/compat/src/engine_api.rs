@@ -41,6 +41,12 @@ pub(crate) use engine::{
 // natives submit decodes, wait for them and name their pass through these.
 pub(crate) use engine::imagedecode::{DecodePass, DecodePool, ImageOutcome, PendingImage};
 
+// The general job pool the engine runs its CPU work on: the handle a
+// submitted job's result lands in, the closure a job performs, the value it
+// produces and the outcome a waiter reads. The motion player's pixel chunks
+// are decoded as jobs on the same pool.
+pub(crate) use engine::jobpool::{JobOutcome, JobValue, JobWork, PendingJob};
+
 // The generic input state the platform events are accumulated into.
 pub(crate) use engine::input::InputState;
 
