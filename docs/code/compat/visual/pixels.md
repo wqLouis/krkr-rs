@@ -22,13 +22,13 @@ Every method composes the L2 `engine_api::layer_ops` and
 | `operateStretch(dx, dy, dw, dh, src, sx, sy, sw, sh[, mode[, opa[, type]]])` | resamples the source rect into the destination rect and blends it. |
 | `operateAffine(src, sx, sy, sw, sh, affine, x1..y3[, mode[, opa[, type]]])` | affine-maps the source rect onto the three destination corners and blends it. |
 | `affineCopy(...)` | affine-maps the source onto the three corners and copies it in (optionally clearing the destination to `neutralColor` first). It is the plain copy: the source's colour and alpha replace the destination's, except on `dfOpaque` with `holdAlpha`, where the destination's alpha is held. |
-| `affinePile(...)` | affine-maps the source onto the three corners and mixes it into the destination: the alpha-correct source-over on `dfAlpha` (the destination's alpha takes part in the mix) and the channel mix on `dfOpaque` (the source's alpha mixes the colours, the destination's alpha is held). |
+| `affinePile(...)` | affine-maps the source onto the three corners and mixes it into the destination: the alpha blend on an alpha destination on `dfAlpha` (the destination's alpha takes part in the mix) and the channel mix on `dfOpaque` (the source's alpha mixes the colours, the destination's alpha is held). |
 | `affineBlend(...)` | affine-maps the source onto the three corners and copies it into the destination: at the full opacity on `dfAlpha` the source is read as an opaque image, so the source's colour replaces the destination's and the destination's alpha becomes opaque (unless the layer holds its alpha); on `dfOpaque` it is the plain copy, so the source's alpha replaces the destination's. |
 | `stretchCopy(dx, dy, dw, dh, src, sx, sy, sw, sh[, type])` | resamples the source rect into the destination rect and copies it in: the plain copy, so the source's colour and alpha replace the destination's, except on `dfOpaque` with `holdAlpha`, where the destination's alpha is held. |
-| `stretchPile(...)` | resamples the source rect into the destination rect and mixes it in: the alpha-correct source-over on `dfAlpha` and the channel mix on `dfOpaque`. |
+| `stretchPile(...)` | resamples the source rect into the destination rect and mixes it in: the alpha blend on an alpha destination on `dfAlpha` and the channel mix on `dfOpaque`. |
 | `stretchBlend(...)` | resamples the source rect into the destination rect and copies it in: at the full opacity on `dfAlpha` the source is read as an opaque image and the destination's alpha becomes opaque (unless the layer holds its alpha); on `dfOpaque` it is the plain copy. |
 | `copyRect(dx, dy, src, sx, sy, sw, sh[, opa])` | copies the source rect to `(dx, dy)`: the plain copy on `dfAlpha`/`dfAddAlpha`/`dfOpaque` — the source's colour and alpha replace the destination's, except on `dfOpaque` with `holdAlpha`, where the destination's alpha is held; the other faces copy their own plane. |
-| `pileRect(dx, dy, src, sx, sy, sw, sh[, opa])` | mixes the source rect into the destination at `(dx, dy)`: the alpha-correct source-over on `dfAlpha` (the destination's alpha takes part in the mix) and the channel mix on `dfOpaque` (the source's alpha mixes the colours, the destination's alpha is held). **Layer-only** source. |
+| `pileRect(dx, dy, src, sx, sy, sw, sh[, opa])` | mixes the source rect into the destination at `(dx, dy)`: the alpha blend on an alpha destination on `dfAlpha` (the destination's alpha takes part in the mix) and the channel mix on `dfOpaque` (the source's alpha mixes the colours, the destination's alpha is held). **Layer-only** source. |
 | `blendRect(dx, dy, src, sx, sy, sw, sh[, opa])` | copies the source rect into the destination at `(dx, dy)`: at the full opacity on `dfAlpha` the source is read as an opaque image, so the source's colour replaces the destination's and the destination's alpha becomes opaque (unless the layer holds its alpha); on `dfOpaque` it is the plain copy, so the source's alpha replaces the destination's. **Layer-only** source. |
 | `piledCopy(dx, dy, src, sx, sy, sw, sh[, opa])` | copies the source **layer's composited subtree** (its own image plus its visible children). It copies the colour and the alpha and ignores the draw face and the hold flag. **Layer-only** source. |
 | `copy9Patch(src)` | copies the 9-patch source and returns its margin `Rect`, or `void`. |
@@ -184,19 +184,19 @@ a type change resolves the face again.
 | `ltAlpha` | `dfAlpha` |
 | `ltAdditive`, `ltSubtractive`, `ltMultiplicative`, `ltScreen`, `ltDodge`, `ltDarken`, `ltLighten` | `dfOpaque` |
 | `ltAddAlpha` | `dfAddAlpha` |
+| `ltBinder`, `ltEffect`, `ltFilter` | `dfOpaque` |
 | every Photoshop type | `dfAlpha` |
 
 ### The destination alpha
 
 The face selects the blend a method runs, and the layer's `holdAlpha`
-property is the argument the *copy* methods take: the methods that handle the
-destination's alpha themselves ignore it. The copy family passes it on the
-opaque face alone — the alpha faces copy the source's own alpha — and at the
-full opacity alone, because the below-full-opacity spelling is the same with
-and without it. The blend family passes it at the full opacity only. The pile
-family ignores it at every opacity. The `operate*` methods take their blend
-from the operation mode and pass the flag when the resolved mode is the copy,
-at the full opacity.
+property is the method's hold-destination-alpha flag: the flag reaches the
+method, and the method table picks the spelling that honours it. The copy
+family passes it on the opaque face alone — the alpha faces copy the source's
+own alpha — and the blend family passes it on every face. The pile family
+ignores it at every opacity, because the method it names has no hold
+spelling. Below the full opacity the copy spellings ignore the flag: the
+method table registers the same method with and without it.
 
 The face also names the destination's **stored alpha handling**, and that
 reaches the engine as the generic `DestAlpha`: `dfAlpha` is a straight alpha,
@@ -208,9 +208,9 @@ different pixel behind:
 
 | Pair | Method | Blend |
 |---|---|---|
-| `omAlpha` + `dfAlpha` | `bmAlphaOnAlpha` | the alpha-correct source-over |
+| `omAlpha` + `dfAlpha` | `bmAlphaOnAlpha` | the alpha blend on an alpha destination: the destination's alpha takes part in the mix |
 | `omAlpha` + `dfOpaque` | `bmAlpha` | the channel mix, the alpha held |
-| `omAlpha` + `dfAddAlpha` | `bmAlphaOnAddAlpha` | the premultiplied source-over |
+| `omAlpha` + `dfAddAlpha` | `bmAlphaOnAddAlpha` | the premultiplied over |
 | `omAddAlpha` + `dfAlpha` | `bmAddAlphaOnAlpha` | **no implementation: the pass draws nothing** |
 | `omAddAlpha` + `dfOpaque` | `bmAddAlpha` | the additive-alpha blend, the alpha held |
 | `omAddAlpha` + `dfAddAlpha` | `bmAddAlphaOnAddAlpha` | the additive blend |
@@ -226,10 +226,10 @@ is the same on an additive-alpha destination. See
 
 The blend family's copy is a blend below the full opacity: the opacity
 covers the source's colour, so the source is mixed into the destination
-instead of replacing it. On an alpha face the source is read as an opaque
-image, so the destination's alpha takes part in the mix; on the opaque face
-the destination's alpha is held. The pile family mixes at every opacity, and
-the opacity scales the source's alpha in the mix.
+instead of replacing it. The plain copy drops the destination's alpha; the
+copy of an opaque source reads the destination's alpha and rewrites it. The
+pile family mixes at every opacity, and the opacity scales the source's
+alpha in the mix.
 
 ### The per-method face gates
 
@@ -238,7 +238,7 @@ the opacity scales the source's alpha in the mix.
 | `operateRect`, `operateStretch`, `operateAffine` | the face-**sensitive** modes need `dfAlpha`/`dfOpaque`/`dfAddAlpha` and select the method from the pair (see *The destination alpha*); the face-independent modes accept any |
 | `copyRect` | dispatches per face — `dfAlpha`/`dfAddAlpha` the plain copy; `dfOpaque` the plain copy with the destination's alpha held iff `holdAlpha`; `dfMask` the alpha only; `dfProvince` zeroes the province region; **any other face is a silent no-op**, matching the reference's missing `default:` case |
 | the copy family (`stretchCopy`, `affineCopy`) | `dfAlpha`/`dfAddAlpha`/`dfOpaque` — the plain copy on every face; the destination's alpha is held on `dfOpaque` iff `holdAlpha` |
-| the pile family (`pileRect`, `stretchPile`, `affinePile`) | `dfAlpha`/`dfOpaque` — `dfAlpha` the alpha-correct source-over, `dfOpaque` the channel mix |
+| the pile family (`pileRect`, `stretchPile`, `affinePile`) | `dfAlpha`/`dfOpaque` — `dfAlpha` the alpha blend on an alpha destination, `dfOpaque` the channel mix |
 | the blend family (`blendRect`, `stretchBlend`, `affineBlend`) | `dfAlpha`/`dfOpaque` — at the full opacity `dfAlpha` is the copy of an opaque source and `dfOpaque` the plain copy |
 | `colorRect` | `dfAlpha`, `dfAddAlpha`, `dfOpaque`, `dfMask`, `dfProvince`; **any other face is a silent no-op** |
 

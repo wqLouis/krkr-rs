@@ -536,8 +536,10 @@ pub(super) fn blit_with_transform(
             rect: src_rect,
         },
         layer_ops::BlitOptions {
-            mode: 2,
             opa: 255,
+            // The GDI+ drawing path composites the drawn image over the
+            // destination with a source-over.
+            source_over: true,
             ..Default::default()
         },
         clip,
@@ -611,8 +613,10 @@ pub(super) fn blit_parallelogram(
             rect: src_rect,
         },
         layer_ops::BlitOptions {
-            mode: 2,
             opa: 255,
+            // The GDI+ drawing path composites the drawn image over the
+            // destination with a source-over.
+            source_over: true,
             ..Default::default()
         },
         clip,

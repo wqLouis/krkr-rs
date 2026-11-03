@@ -216,9 +216,14 @@ fn render_layer_subtree_applies_image_placement() {
     }
     let cache = render_layer_subtree(&mut scene, parent).expect("cache bitmap");
     let bitmap = scene.bitmap(cache).unwrap();
+    // The composited child blends with the alpha blend of an alpha
+    // destination: the source's alpha of 255 mixes the colour with the
+    // destination's alpha of zero, so the blue channel is the source's blue
+    // truncated by eight bits (`255 * 255 >> 8 = 254`,
+    // `reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:67-76`).
     assert_eq!(
         &bitmap.rgba[..4],
-        &[0, 0, 255, 255],
+        &[0, 0, 254, 255],
         "the right frame is drawn"
     );
 }
@@ -294,7 +299,10 @@ fn render_layer_subtree_reuses_the_cache_until_the_subtree_changes() {
     let bitmap = scene.bitmap(content).unwrap();
     assert!(bitmap.dirty, "a moved child recomposites the cache");
     assert_eq!(&bitmap.rgba[0..4], &[0, 0, 0, 0], "the vacated pixel");
-    assert_eq!(&bitmap.rgba[4..8], &[10, 20, 30, 255], "the moved child");
+    // The composited child blends with the alpha blend of an alpha
+    // destination, so its colours are the source's truncated by eight bits
+    // (`10 * 255 >> 8 = 9`, `reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:67-76`).
+    assert_eq!(&bitmap.rgba[4..8], &[9, 19, 29, 255], "the moved child");
 }
 
 /// Reusing the composited subtree content does not mutate the scene graph:
@@ -661,6 +669,7 @@ fn a_bitmap_declaring_pixels_it_does_not_hold_is_left_alone() {
         opa: 255,
         treat_as_opaque: false,
         hold_alpha: false,
+        source_over: false,
     };
 
     // A source with a declared size but no pixel bytes contributes nothing.
@@ -841,6 +850,7 @@ fn an_affine_blit_marks_only_the_rectangle_it_wrote() {
             opa: 255,
             treat_as_opaque: false,
             hold_alpha: false,
+            source_over: false,
         },
     );
     assert!(destination.dirty, "the blit marks the bitmap dirty");
@@ -870,6 +880,7 @@ fn a_clipped_affine_blit_writes_inside_the_clip_alone() {
         opa: 255,
         treat_as_opaque: false,
         hold_alpha: false,
+        source_over: false,
     };
     let mut unclipped = bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
     let mut clipped = bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
@@ -980,6 +991,7 @@ fn a_pixel_center_one_to_one_affine_copy_is_exact() {
             opa: 255,
             treat_as_opaque: false,
             hold_alpha: false,
+            source_over: false,
         },
         (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
     );
@@ -1033,6 +1045,7 @@ fn a_large_opaque_source_over_row_copies_exactly() {
             opa: 255,
             treat_as_opaque: false,
             hold_alpha: false,
+            source_over: false,
         },
     );
     assert_eq!(destination.rgba, source.rgba);
@@ -1058,6 +1071,7 @@ fn a_large_blit_over_matches_the_single_pixel_path() {
             opa: 255,
             treat_as_opaque: false,
             hold_alpha: false,
+            source_over: false,
         },
     );
     assert!(
@@ -1083,6 +1097,7 @@ fn an_operate_rect_marks_only_the_rectangle_it_wrote() {
         opa: 255,
         treat_as_opaque: false,
         hold_alpha: false,
+        source_over: false,
     };
 
     let mut destination = bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
@@ -1188,6 +1203,7 @@ fn a_blt_marks_only_the_rectangle_it_wrote() {
         opa: 255,
         treat_as_opaque: false,
         hold_alpha: false,
+        source_over: false,
     };
     let mut destination = bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
     blit_over(

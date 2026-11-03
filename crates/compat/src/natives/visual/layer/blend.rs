@@ -76,13 +76,13 @@ pub(super) const LT_PS_EXCLUSION: i64 = 28;
 ///
 /// Every documented blend type maps to its own behaviour, and the core and
 /// Photoshop spellings map to distinct variants so the encoder can reproduce
-/// the exact script value. `ltBinder` is a container and `ltEffect`/`ltFilter`
-/// are layer-effect callbacks, not bitmap blends; none of the three has a
-/// generic equivalent, so they degrade to [`BlendMode::SourceOver`] — a binder
-/// has no image in the reference anyway. Unknown / out-of-range values degrade
-/// safely to source-over.
-pub(crate) const fn from_native(value: i64) -> BlendMode {
-    match value {
+/// the exact script value. The three types that name no bitmap blend — the
+/// binder, the effect and the filter types — display as an opaque layer,
+/// which is the face and the operation mode their display type resolves to.
+/// A value that names no type at all yields `None`: the layer keeps the
+/// blend it has, and the type reads back as the value that was written.
+pub(crate) const fn from_native(value: i64) -> Option<BlendMode> {
+    Some(match value {
         LT_OPAQUE => BlendMode::Replace,
         LT_ALPHA => BlendMode::SourceOver,
         LT_PS_NORMAL => BlendMode::PsNormal,
@@ -109,9 +109,9 @@ pub(crate) const fn from_native(value: i64) -> BlendMode {
         LT_PS_OVERLAY => BlendMode::DestinationDependent(DstBlend::Overlay),
         LT_PS_HARD_LIGHT => BlendMode::DestinationDependent(DstBlend::HardLight),
         LT_PS_SOFT_LIGHT => BlendMode::DestinationDependent(DstBlend::SoftLight),
-        LT_BINDER | LT_EFFECT | LT_FILTER => BlendMode::SourceOver,
-        _ => BlendMode::SourceOver,
-    }
+        LT_BINDER | LT_EFFECT | LT_FILTER => BlendMode::Replace,
+        _ => return None,
+    })
 }
 
 /// The destination alpha handling a transition's mix is chosen by.
@@ -120,9 +120,9 @@ pub(crate) const fn from_native(value: i64) -> BlendMode {
 /// channel gets the alpha-vs-alpha mix, the additive-alpha type gets the
 /// additive mix, and every other type gets the plain mix.
 ///
-/// The three types that have no generic equivalent — the binder, the effect
-/// and the filter types — are read as the straight-alpha one, because the
-/// generic blend they carry is the straight source-over.
+/// The three types that name no bitmap blend — the binder, the effect and the
+/// filter types — are read as the opaque one, because their display type
+/// resolves to the opaque face.
 pub(crate) const fn dest_alpha(blend: BlendMode) -> DestAlpha {
     match to_native(blend) {
         LT_ALPHA | LT_PS_NORMAL | LT_PS_ADDITIVE | LT_PS_SUBTRACTIVE | LT_PS_MULTIPLICATIVE

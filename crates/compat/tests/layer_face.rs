@@ -4,8 +4,8 @@
 //! writes, and the actual one the drawing and the pixel operations use. The
 //! outward face defaults to `dfAuto` (128) and the actual face is resolved
 //! from the layer's type whenever the outward face is `dfAuto`
-//! (`reference/cpp/core/visual/LayerIntf.h:738-750`,
-//! `reference/cpp/core/visual/LayerIntf.cpp:371-372`, `:1525-1618`).
+//! (`reference/krkr2/cpp/core/visual/LayerIntf.h:738-750`,
+//! `reference/krkr2/cpp/core/visual/LayerIntf.cpp:371-372`, `:1525-1618`).
 //!
 //! The tests drive the real script surface: they create layers through the
 //! VM, read the face the script sees and read the pixels the operations
@@ -55,9 +55,9 @@ fn layer_rgba(env: &Env, index: usize, x: usize, y: usize) -> [u8; 4] {
 }
 
 /// Reference: the layer constructor stores `Face = dfAuto` and resolves the
-/// draw face from it (`reference/cpp/core/visual/LayerIntf.cpp:371-372`), and
+/// draw face from it (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:371-372`), and
 /// the enum value of `dfAuto` is 128
-/// (`reference/cpp/core/visual/LayerIntf.h:59-70`).
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.h:59-70`).
 #[test]
 fn a_fresh_layer_face_is_df_auto() {
     let _lock = vm_lock();
@@ -67,7 +67,7 @@ fn a_fresh_layer_face_is_df_auto() {
 }
 
 /// Reference: `SetFace` stores the face the script set and `GetFace` returns
-/// that stored value (`reference/cpp/core/visual/LayerIntf.h:745-749`), so
+/// that stored value (`reference/krkr2/cpp/core/visual/LayerIntf.h:745-749`), so
 /// the script reads the outward face and not the resolved one.
 #[test]
 fn setting_the_face_stores_the_outward_value() {
@@ -85,12 +85,12 @@ fn setting_the_face_stores_the_outward_value() {
 }
 
 /// Reference: with an outward face of `dfAuto` the actual face is resolved
-/// from the layer's display type (`reference/cpp/core/visual/LayerIntf.cpp:1525-1618`):
+/// from the layer's display type (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:1525-1618`):
 /// an opaque type resolves to `dfOpaque` and an alpha type to `dfAlpha`.
 /// The two differ in what a fill does with the destination's alpha: the
 /// opaque face fills the colour alone and keeps the alpha, the alpha face
 /// fills the colour and the alpha
-/// (`reference/cpp/core/visual/LayerIntf.cpp:4280-4292`).
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4280-4292`).
 #[test]
 fn the_resolved_face_follows_the_layer_type() {
     let _lock = vm_lock();
@@ -115,7 +115,7 @@ fn the_resolved_face_follows_the_layer_type() {
 }
 
 /// Reference: `SetType` calls `NotifyLayerTypeChange`, which resolves the
-/// draw face again (`reference/cpp/core/visual/LayerIntf.cpp:1910`,
+/// draw face again (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:1910`,
 /// `:1517-1518`), so the face follows the new type.
 #[test]
 fn changing_the_type_resolves_the_face_again() {
@@ -140,7 +140,7 @@ fn changing_the_type_resolves_the_face_again() {
 /// Reference: the face-sensitive operation modes accept the `dfAlpha`,
 /// `dfAddAlpha` and `dfOpaque` faces and reject every other face with
 /// `TVPNotDrawableFaceType`
-/// (`reference/cpp/core/visual/LayerIntf.cpp:4118-4271`, `:5239-5242`).
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4118-4271`, `:5239-5242`).
 #[test]
 fn the_operate_path_rejects_a_face_the_reference_rejects() {
     let _lock = vm_lock();
@@ -172,18 +172,18 @@ fn the_operate_path_rejects_a_face_the_reference_rejects() {
 }
 
 /// Reference: the operation mode and the draw face select the blend method
-/// together (`reference/cpp/core/visual/LayerIntf.cpp:4118-4271`). The
+/// together (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4118-4271`). The
 /// `omOpaque` mode copies onto an opaque face (`bmCopy`) and copies the
 /// source as an opaque image onto an alpha face (`bmCopyOnAlpha`,
-/// `reference/cpp/core/visual/LayerIntf.cpp:4247-4258`).
+/// `reference/krkr2/cpp/core/visual/LayerIntf.cpp:4247-4258`).
 ///
 /// The layer's `holdAlpha` property is the argument the copy methods take
-/// (`reference/cpp/core/visual/LayerIntf.cpp:5249-5251`), and the method
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:5249-5251`), and the method
 /// cache answers it with the `hda` spelling of each copy method
-/// (`reference/cpp/core/visual/RenderManager.cpp:2398-2399`): both copies
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2398-2399`): both copies
 /// hold the destination's alpha under `holdAlpha`, and the alpha face's
 /// copy writes an opaque alpha without it
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3141-3147`).
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:174-178`).
 #[test]
 fn the_operate_path_holds_the_destination_alpha_on_an_opaque_face() {
     let _lock = vm_lock();
@@ -214,11 +214,10 @@ fn the_operate_path_holds_the_destination_alpha_on_an_opaque_face() {
 /// Reference: without `holdAlpha` the alpha face's `omOpaque` copy is the
 /// tree's "CopyOpaqueImage": the source's colour replaces the destination's
 /// and the destination's alpha becomes opaque
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3141-3147`; the CPU
-/// twin writes `dest = src | 0xff000000`,
-/// `reference/cpp/core/visual/tvpgl.cpp:3326-3370`). The opaque face's copy
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:174-178`: the CPU
+/// kernel writes `dest = src | 0xff000000`). The opaque face's copy
 /// is the tree's "Copy", which copies the source's alpha as well
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:2986`).
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:158-160`).
 #[test]
 fn the_operate_path_writes_an_opaque_alpha_on_an_alpha_face() {
     let _lock = vm_lock();
@@ -245,8 +244,8 @@ fn the_operate_path_writes_an_opaque_alpha_on_an_alpha_face() {
 
 /// Reference: the additive-alpha-on-alpha blend is not implemented: the
 /// operation leaves the destination untouched
-/// (`reference/cpp/core/visual/LayerBitmapIntf.cpp:1705-1708`,
-/// `reference/cpp/core/visual/RenderManager.cpp:2557-2561`).
+/// (`reference/krkr2/cpp/core/visual/LayerBitmapIntf.cpp:1705-1708`,
+/// `reference/krkr2/cpp/core/visual/RenderManager.cpp:2557-2561`).
 #[test]
 fn the_operate_path_does_nothing_for_the_unimplemented_blend() {
     let _lock = vm_lock();
@@ -271,8 +270,8 @@ fn the_operate_path_does_nothing_for_the_unimplemented_blend() {
 
 /// Reference: the additive-alpha-on-alpha blend is not implemented, so the
 /// `ImageFunction` leaves the destination untouched as well
-/// (`reference/cpp/core/visual/LayerBitmapIntf.cpp:1705-1708`,
-/// `reference/cpp/core/visual/ImageFunction.cpp:78-130`).
+/// (`reference/krkr2/cpp/core/visual/LayerBitmapIntf.cpp:1705-1708`,
+/// `reference/krkr2/cpp/core/visual/ImageFunction.cpp:78-130`).
 #[test]
 fn the_image_function_does_nothing_for_the_unimplemented_blend() {
     let _lock = vm_lock();
@@ -294,13 +293,16 @@ fn the_image_function_does_nothing_for_the_unimplemented_blend() {
 }
 
 /// Reference: the operation mode and the draw face select the blend method
-/// (`reference/cpp/core/visual/ImageFunction.cpp:78-130`), and the `hda`
-/// argument is that method's hold-destination-alpha flag, which only the
-/// plain methods take (`reference/cpp/core/visual/LayerBitmapIntf.cpp:1589-1622`):
-/// an alpha face selects the plain-on-alpha method, which ignores the flag,
-/// while an opaque face selects the plain method, which takes it.
+/// (`reference/krkr2/cpp/core/visual/ImageFunction.cpp:78-130`), and the `hda`
+/// argument is that method's hold-destination-alpha flag
+/// (`reference/krkr2/cpp/core/visual/ImageFunction.cpp:380-383`). The flag
+/// selects the hold spelling of the copy method the face names: the alpha
+/// face names "CopyOpaqueImage" and the opaque face "Copy"
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2397-2405`), and both
+/// hold the destination's alpha under the flag
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:162-166`).
 #[test]
-fn the_image_function_holds_the_alpha_only_on_an_opaque_face() {
+fn the_image_function_holds_the_alpha_on_every_face() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
@@ -314,13 +316,12 @@ fn the_image_function_holds_the_alpha_only_on_an_opaque_face() {
          src.setPixel(0, 0, 0x0000ff); \
          src.setMaskPixel(0, 0, 0xff);",
     );
-    // The alpha face ignores the hold argument: the destination's alpha is
-    // written.
+    // The alpha face holds the destination's alpha.
     env.run(
         "ImageFunction.operateRect(alpha, 0, 0, src, null, null, omOpaque, dfAlpha, 255, true);",
     );
-    assert_eq!(env.eval_int("alpha.getMaskPixel(0, 0)"), 0xff);
-    // The opaque face takes it: the destination's alpha is held.
+    assert_eq!(env.eval_int("alpha.getMaskPixel(0, 0)"), 0x40);
+    // The opaque face holds it too.
     env.run(
         "ImageFunction.operateRect(opaque, 0, 0, src, null, null, omOpaque, dfOpaque, 255, true);",
     );
@@ -328,8 +329,8 @@ fn the_image_function_holds_the_alpha_only_on_an_opaque_face() {
 }
 
 /// Reference: the add-alpha face cannot take a negative opacity
-/// (`reference/cpp/core/visual/LayerIntf.cpp:4448-4452`,
-/// `reference/cpp/core/visual/ImageFunction.cpp:1046-1049`).
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4448-4452`,
+/// `reference/krkr2/cpp/core/visual/ImageFunction.cpp:1046-1049`).
 #[test]
 fn the_add_alpha_face_rejects_a_negative_opacity() {
     let _lock = vm_lock();
@@ -350,11 +351,11 @@ fn the_add_alpha_face_rejects_a_negative_opacity() {
 }
 
 /// The operation mode and the draw face select the blend method together
-/// (`reference/cpp/core/visual/LayerIntf.cpp:4217-4262`), and the render
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4217-4262`), and the render
 /// method cache names each method's implementation
-/// (`reference/cpp/core/visual/RenderManager.cpp:2416-2424`): `omAlpha` is
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2416-2424`): `omAlpha` is
 /// the plain alpha blend on `dfAlpha` (`AlphaBlend_d`,
-/// `reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3555-3558`), the
+/// `reference/krkr2/cpp/core/visual/gl/blend_variation.h:109-149`), the
 /// channel mix on `dfOpaque` (`AlphaBlend`, `:3401-3410`, which holds the
 /// destination's alpha) and the premultiplied over on `dfAddAlpha`
 /// (`AlphaBlend_a`, `:3499-3507`).
@@ -362,7 +363,7 @@ fn the_add_alpha_face_rejects_a_negative_opacity() {
 /// A destination that stores an additive alpha therefore cannot answer with
 /// the plain alpha blend: its stored colour is premultiplied, so the pass
 /// premultiplies the source and fades the destination by the source's alpha
-/// (`reference/cpp/core/visual/gl/blend_util_func.h:70-83`, the CPU twin the
+/// (`reference/krkr2/cpp/core/visual/gl/blend_util_func.h:70-83`, the CPU twin the
 /// shader matches).
 #[test]
 fn the_operate_path_blends_onto_every_face_the_mode_accepts() {
@@ -386,10 +387,14 @@ fn the_operate_path_blends_onto_every_face_the_mode_accepts() {
          opaque.type = ltOpaque; \
          opaque.fillRect(0, 0, 1, 1, 0x400000ff);",
     );
-    // The alpha face runs the alpha-correct source-over: an opaque source
-    // replaces the destination, alpha included.
+    // The alpha face runs the alpha blend of an alpha destination: the
+    // destination's alpha takes part in the mix and the weight comes from the
+    // opacity-on-opacity table, so the mix truncates by eight bits and an
+    // opaque source lands on 254 rather than 255
+    // (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:109-149`,
+    // `reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:67-76`).
     env.run("alpha.operateRect(0, 0, src, 0, 0, 1, 1, omAlpha);");
-    assert_eq!(layer_rgba(&env, 1, 0, 0), [255, 0, 0, 255]);
+    assert_eq!(layer_rgba(&env, 1, 0, 0), [254, 0, 0, 255]);
     // The additive-alpha face premultiplies the source's colour and fades the
     // destination by its alpha: at the full source alpha that is the source's
     // colour and the source-over alpha, not the destination's colour.
@@ -403,9 +408,9 @@ fn the_operate_path_blends_onto_every_face_the_mode_accepts() {
 
 /// `omAddAlpha` on an additive-alpha destination adds the opacity-scaled
 /// source and fades the destination by the source's alpha
-/// (`AdditiveAlphaBlend_a`, `reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3640-3649`;
+/// (`AdditiveAlphaBlend_a`, `reference/krkr2/cpp/core/visual/gl/blend_util_func.h:70-83`;
 /// the CPU twin is the premultiplied blend,
-/// `reference/cpp/core/visual/gl/blend_util_func.h:70-83`), the alpha
+/// `reference/krkr2/cpp/core/visual/gl/blend_util_func.h:70-83`), the alpha
 /// composing (`AdditiveAlphaBlend`, `:3629-3637`, holds the destination's
 /// alpha instead).
 #[test]
@@ -439,14 +444,14 @@ fn the_operate_path_adds_onto_an_additive_alpha_destination() {
 
 /// `omOpaque` on an additive-alpha destination copies the source as an
 /// opaque image at the full opacity (`CopyOpaqueImage`,
-/// `reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3141-3147`), and
+/// `reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:174-178`), and
 /// below it the constant-alpha blend adds the source's colour and leaves the
 /// opacity as the alpha (`ConstAlphaBlend_a`, `:3171-3179`).
 ///
 /// The hold spelling of that method does not exist: the cache registers no
-/// hold variant (`reference/cpp/core/visual/RenderManager.cpp:2423-2424`), so
+/// hold variant (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2423-2424`), so
 /// the full-opacity pass with the hold set draws nothing
-/// (`reference/cpp/core/visual/LayerBitmapIntf.cpp:1483-1484`).
+/// (`reference/krkr2/cpp/core/visual/LayerBitmapIntf.cpp:1483-1484`).
 #[test]
 fn the_operate_path_draws_nothing_for_the_unholdable_copy() {
     let _lock = vm_lock();

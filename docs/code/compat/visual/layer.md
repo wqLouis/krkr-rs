@@ -270,10 +270,15 @@ value to a `BlendMode` and `blend::to_native` is the exact inverse — every
 distinct spelling round-trips, including the Photoshop spellings that share
 a formula with a non-Photoshop type.
 
-`ltBinder` (0), `ltEffect` (6) and `ltFilter` (7) have no generic
-equivalent and **degrade to source-over** (a binder has no image in the
-reference either). An **unknown or out-of-range value also degrades to
-source-over** rather than raising.
+`ltBinder` (0), `ltEffect` (6) and `ltFilter` (7) name no bitmap blend: the
+reference displays them as the binder type, whose draw face is the opaque one
+and whose operation mode is the opaque one
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:1524-1618`, `:1621-1683`), so
+they carry the opaque blend. An **unknown or out-of-range value names no
+type**: the layer keeps the blend it had, and the property reads back the
+number that was written, because the reference stores the number it is given
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:1687-1700`,
+`:10832-10838`).
 
 The `tTVPBlendOperationMode` shares the `tTVPLayerType` numbering, so the
 canonical native encoding of an operation mode *is* its layer type.

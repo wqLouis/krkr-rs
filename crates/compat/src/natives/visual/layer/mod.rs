@@ -5,6 +5,7 @@ use std::ffi::{c_char, c_int, c_void};
 
 use crate::engine_api::InputState;
 use crate::engine_api::{LayerState, Rect, Scene};
+use api::blend::BlendMode;
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
     RetainedValue, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_OBJECT, VAL_REAL, VAL_VOID, Value,
@@ -249,6 +250,11 @@ struct LayerInst {
     /// Reference `tTJSNI_BaseLayer::CursorX_Work` (`LayerIntf.cpp:347`): the
     /// pending X `SetCursorX` stores for the next `SetCursorY`.
     cursor_x_work: i32,
+    /// The type number the script wrote into `layer.type`.
+    ///
+    /// The number is the layer's own: a value that names no type reads back
+    /// as it was written, and the layer keeps the blend it had.
+    type_value: i64,
 }
 
 /// The scene id a `Layer` payload carries — the reader behind the VM's
@@ -333,7 +339,12 @@ extern "C" fn layer_create(engine: *mut c_void) -> *mut c_void {
     // deferred to `Construct`. A script subclass touches members from its
     // class prelude or before `super.Layer(...)`, so the scene record must
     // exist from creation, detached until the join.
-    let mut inst = LayerInst::default();
+    // A fresh layer carries the alpha type, which is the blend the scene
+    // record starts with.
+    let mut inst = LayerInst {
+        type_value: blend::LT_ALPHA,
+        ..Default::default()
+    };
     if let Ok((_resolved, ctx)) = bound(engine)
         && let Ok(scene) = scene_mut(&ctx)
     {
@@ -566,11 +577,12 @@ extern "C" fn layer_ctor(
     // type, so its image is copied over the window surface instead of being
     // blended into it, and its neutral colour is opaque white, so the region
     // its image grows into is an opaque backdrop.
-    if scene.is_primary_layer(id)
-        && let Some(layer) = scene.layer_mut(id)
-    {
-        layer.blend = blend::from_native(blend::LT_OPAQUE);
-        layer.neutral_color = PRIMARY_NEUTRAL_COLOR;
+    if scene.is_primary_layer(id) {
+        if let Some(layer) = scene.layer_mut(id) {
+            layer.blend = blend::from_native(blend::LT_OPAQUE).unwrap_or(BlendMode::Replace);
+            layer.neutral_color = PRIMARY_NEUTRAL_COLOR;
+        }
+        inst.type_value = blend::LT_OPAQUE;
     }
     inst.attached = true;
     log::trace!("Layer created: id={id} parent={parent:?}");
@@ -2056,19 +2068,76 @@ layer_blur_off_prop!(
     },
     |l: &LayerState| !l.visible
 );
-layer_int_prop!(
-    layer_type_get,
-    layer_type_set,
-    |l: &LayerState| blend::to_native(l.blend),
-    |l: &mut LayerState, v: &Value| {
-        let new_blend = blend::from_native(value_as_i64(v));
-        if l.blend == new_blend {
+/// The `Layer.type` property: the type number the script wrote.
+///
+/// The number is the layer's own, so a value that names no type reads back as
+/// it was written; the layer keeps the blend it had. A named type carries the
+/// blend the engine resolves into the draw face and the operation mode.
+extern "C" fn layer_type_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: the trampoline passes the live `LayerInst` payload the VM allocated for this script object.
+    let inst = unsafe { &*(instance as *const LayerInst) };
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return report_error(out_error, "Layer: compat context is not bound");
+    };
+    let Ok(scene) = scene_ref(&ctx) else {
+        return report_error(out_error, "Layer: compat context is not bound");
+    };
+    let Some(layer) = inst.id.and_then(|id| scene.layer(id)) else {
+        return report_error(out_error, "Layer: this layer is not constructed");
+    };
+    // The number the script wrote. A blend that names another type replaced
+    // the layer's blend without the property knowing, and the number follows
+    // it; a type that names no blend keeps the blend the layer had and still
+    // reads back as it was written.
+    let stored = inst.type_value;
+    let number = match blend::from_native(stored) {
+        None => stored,
+        Some(blend) if blend == layer.blend => stored,
+        Some(_) => blend::to_native(layer.blend),
+    };
+    set_int(out, number);
+    0
+}
+
+/// The `Layer.type` setter: the number is stored on the layer, and a type
+/// that names a blend replaces the layer's blend.
+extern "C" fn layer_type_set(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: the trampoline passes a valid value slot.
+    let value = unsafe { &*value };
+    let number = value_as_i64(value);
+    let result = with_layer_write(engine, instance, value, |layer, value| {
+        let Some(new_blend) = blend::from_native(value_as_i64(value)) else {
+            // A type that names no blend leaves the layer's blend alone.
+            return false;
+        };
+        if layer.blend == new_blend {
             return false;
         }
-        l.blend = new_blend;
+        layer.blend = new_blend;
         true
+    });
+    if result.is_ok() {
+        // SAFETY: the trampoline passes the live `LayerInst` payload the VM allocated for this script object.
+        let inst = unsafe { &mut *(instance as *mut LayerInst) };
+        inst.type_value = number;
     }
-);
+    match result {
+        Ok(()) => 0,
+        Err(error) => report_error(out_error, &error),
+    }
+}
 layer_int_prop_scene!(
     layer_left_get,
     layer_left_set,

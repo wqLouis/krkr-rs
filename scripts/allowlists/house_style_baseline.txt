@@ -2433,7 +2433,6 @@
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// The reference converts both arguments (`ttstr`), so a conversion error", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// The reference ignores a handler that is already registered (identity).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// The reference passes `(tjs_int)*param` to `TVPSetGraphicCacheLimit`", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// The reference requires an array object (`AsObjectClosureNoAddRef` +", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// The reference's GTK dialog returns 0 for one or two buttons (the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// The reference's `EXIT_ON_WINDOW_CLOSE` defaults to true.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// The reference's `TVPTerminateOnNoWindowStartup` defaults to true", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -2445,11 +2444,9 @@
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// `0 != (tjs_int)*param[1]` (`SystemImpl.cpp:644-646`) — void is 0", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// `0 != (tjs_int)*param` (`SystemIntf.cpp:399-402`) — the strict", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// `0 != (tjs_int)*param` (`SystemIntf.cpp:457-460`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// `PropGetByNum` walk, `SystemIntf.cpp:224-245` — a non-object raises the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// `TVPDrawThreadNum = (tjs_int)*param` (`SystemIntf.cpp:413-416`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// `base/SystemIntf.cpp:477-484`), so `System.onActivate` reads as `null`", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// `numparams > 0 ? param[0]->AsInteger() : 0` (`SystemIntf.cpp:111`,", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// caches per layer on demand), so only the reference's argument", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// delivery loop skips (`EventIntf.cpp:816`) — a silent success — while", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// result on a miss (`SystemImpl.cpp:709-726`) — there is no default", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// the default `TVPVersionInformation` template (`base/MsgIntfInc.h:5-9`):", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -2489,7 +2486,6 @@
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// The reference defaults `level` to `TVP_COMPACT_LEVEL_MAX` (100) and runs", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// The reference deliberately crashes; krkr-rs logs an error and continues.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// The reference delivers a maximum-level compact event (which clears the", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// The reference requires an object first argument and converts the optional", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// The reference returns `TVPNormalizeStorageName(ExePath())`", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// The reference shows a modal input box; the headless path logs the prompt", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// The reference shows a modal message box and returns the clicked button's", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -2503,7 +2499,6 @@
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// `SystemImpl.cpp:570-620`). krkr-rs has no GUI, so the text is logged at", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// `TJSParseDecimalReal`, `tjsLex.cpp:447-509`): digits with at most one `.`", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// `TVPGetAppPath()` (`reference/cpp/core/base/impl/SystemImpl.cpp:341-359`,", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// `limit`/`timeout` (`SystemIntf.cpp:224-256`); the pre-caching itself has no", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// `null` — a `tvtObject` with a null pointer (`tjs2_abi.cpp:525-527`) — is", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// `reference/cpp/core/base/StorageIntf.cpp:362-369`). A non-absolute path is", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// `reference/cpp/core/base/impl/StorageImpl.cpp:422-467`) and the file media", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -2523,7 +2518,6 @@
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// reference — use [`try_value_as_i64`] where that error must surface. The", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// reference's `AsReal()` does for an integer variant. Anything unparsable", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// reference's `TVPClearGraphicCache`. With no scene attached there is no", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// reference's argument validation is reproduced.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// reference's wrapping integer value; an unparsable prefix is `0.0`.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// release and build (`reference/cpp/core/base/impl/MsgImpl.cpp:20-30`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "/// removed (as in the reference); a callback may register or remove handlers,", "reason": "legacy comment, cleanup tracked in TODO §15"}

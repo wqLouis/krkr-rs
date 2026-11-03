@@ -3,9 +3,9 @@
 //! The four affine methods — `affineCopy`, `affinePile`, `affineBlend`
 //! and `operateAffine` — do **not** take their blend method from the
 //! operation-mode table the layer's draw path uses
-//! (`reference/cpp/core/visual/LayerIntf.cpp:4118-4271`): each of them
+//! (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4118-4271`): each of them
 //! names its own blend method for each draw face
-//! (`reference/cpp/core/visual/LayerIntf.cpp:4722-4802`, `:5419-5466`,
+//! (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4722-4802`, `:5419-5466`,
 //! `:5517-5566`, `:5617-5680`).
 //!
 //! The tests drive the real script surface: they create the layers through
@@ -39,9 +39,9 @@ fn layer_alpha(env: &Env, index: usize, x: usize, y: usize) -> u8 {
 
 /// Reference: `AffineCopy` copies with `bmCopy` on the `dfAlpha` and
 /// `dfAddAlpha` faces and passes `false` as the hold argument
-/// (`reference/cpp/core/visual/LayerIntf.cpp:4735-4741`); the copy writes
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4735-4741`); the copy writes
 /// the source's own alpha — the tree's "Copy"
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:2986`).
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:158-160`).
 ///
 /// A sprite whose transparent pixels carry a colour of their own therefore
 /// stays transparent on an alpha face: the hidden colour is written, but the
@@ -90,7 +90,7 @@ fn the_affine_copy_carries_the_source_alpha_on_an_alpha_face() {
 }
 
 /// Reference: the alpha faces pass `false` as the hold argument
-/// (`reference/cpp/core/visual/LayerIntf.cpp:4735-4741`), so the layer's
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4735-4741`), so the layer's
 /// `holdAlpha` does not hold the destination's alpha there: the copy writes
 /// the source's alpha whatever `holdAlpha` says.
 #[test]
@@ -117,9 +117,9 @@ fn the_affine_copy_on_an_alpha_face_ignores_the_hold_argument() {
 
 /// Reference: `AffineCopy` on the `dfOpaque` face passes the layer's
 /// `HoldAlpha` as the hold argument
-/// (`reference/cpp/core/visual/LayerIntf.cpp:4743-4750`). Without
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4743-4750`). Without
 /// `holdAlpha` the copy is the tree's "Copy"
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:2986`): the
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:158-160`): the
 /// source's alpha is written.
 #[test]
 fn the_affine_copy_on_an_opaque_face_copies_the_source_alpha() {
@@ -142,9 +142,9 @@ fn the_affine_copy_on_an_opaque_face_copies_the_source_alpha() {
 
 /// Reference: `AffineCopy` on the `dfOpaque` face passes the layer's
 /// `HoldAlpha` as the hold argument
-/// (`reference/cpp/core/visual/LayerIntf.cpp:4743-4750`), and the hold
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4743-4750`), and the hold
 /// spelling of the copy is the tree's "CopyColor"
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3150-3152`): the
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:162-166`): the
 /// source's colour replaces the destination's and the destination's alpha is
 /// held.
 #[test]
@@ -173,11 +173,11 @@ fn the_affine_copy_on_an_opaque_face_holds_the_destination_alpha() {
 
 /// Reference: `AffinePile` piles with `bmAlphaOnAlpha` on an alpha face
 /// and with `bmAlpha` on an opaque face
-/// (`reference/cpp/core/visual/LayerIntf.cpp:5437-5456`). The alpha method
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:5437-5456`). The alpha method
 /// is the tree's "AlphaBlend_d"
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3549-3556`): the
-/// destination's alpha takes part in the mix and the result's alpha is the
-/// source-over alpha.
+/// (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:109-149`): the
+/// destination's alpha takes part in the mix and the result's alpha comes
+/// from the negative-multiply table.
 #[test]
 fn the_affine_pile_on_an_alpha_face_is_the_alpha_correct_source_over() {
     let _lock = vm_lock();
@@ -195,15 +195,15 @@ fn the_affine_pile_on_an_alpha_face_is_the_alpha_correct_source_over() {
          dst.affinePile(src, 0, 0, 1, 1, true, 1, 0, 0, 1, 0, 0, 255, 0);",
     );
     // The destination's alpha (0x40) and the source's (0x80) give the
-    // source-over alpha 0x80 + 0x40 * (1 - 0x80) = 0x9f, and the colour is
-    // the mix by the source's share of the new alpha.
-    assert_eq!(layer_rgba(&env, 1, 0, 0), [204, 0, 51, 159]);
+    // weight `255 * 128 / 191 = 170`, and the destination's alpha becomes
+    // `255 - (255 - 64) * (255 - 128) / 255 = 160`.
+    assert_eq!(layer_rgba(&env, 1, 0, 0), [203, 0, 51, 160]);
 }
 
 /// Reference: `AffinePile` piles with `bmAlpha` on an opaque face
-/// (`reference/cpp/core/visual/LayerIntf.cpp:5445-5455`), the tree's
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:5445-5455`), the tree's
 /// "AlphaBlend"
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3402-3411`): the
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:67-76`): the
 /// colour is mixed by the source's alpha and the destination's alpha is
 /// held.
 #[test]
@@ -223,18 +223,18 @@ fn the_affine_pile_on_an_opaque_face_holds_the_destination_alpha() {
          dst.type = ltOpaque; \
          dst.affinePile(src, 0, 0, 1, 1, true, 1, 0, 0, 1, 0, 0, 255, 0);",
     );
-    // The colour is mixed by the source's alpha (the tree's CPU twin,
+    // The colour is mixed by the source's alpha (the CPU kernel,
     // `d + ((f - d) * a >> 8)`,
-    // `reference/cpp/core/visual/gl/blend_functor_c.h:374-383`) and the
+    // `reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:374-383`) and the
     // destination's alpha (0x40) is held.
     assert_eq!(layer_rgba(&env, 1, 0, 0), [127, 0, 127, 0x40]);
 }
 
 /// Reference: `AffineBlend` copies the source as an opaque image with
 /// `bmCopyOnAlpha` on an alpha face
-/// (`reference/cpp/core/visual/LayerIntf.cpp:5535-5543`), the tree's
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:5535-5543`), the tree's
 /// "CopyOpaqueImage"
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3141-3147`): the
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:174-178`): the
 /// source's colour replaces the destination's and the destination's alpha
 /// becomes opaque.
 #[test]
@@ -259,8 +259,8 @@ fn the_affine_blend_on_an_alpha_face_copies_the_source_as_an_opaque_image() {
 }
 
 /// Reference: `AffineBlend` copies with `bmCopy` on an opaque face
-/// (`reference/cpp/core/visual/LayerIntf.cpp:5545-5556`), the tree's
-/// "Copy" (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:2986`):
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:5545-5556`), the tree's
+/// "Copy" (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:158-160`):
 /// the source's colour and its alpha replace the destination's.
 #[test]
 fn the_affine_blend_on_an_opaque_face_copies_the_source_alpha() {
@@ -285,11 +285,11 @@ fn the_affine_blend_on_an_opaque_face_copies_the_source_alpha() {
 
 /// Reference: `OperateAffine` takes its blend method from the operation
 /// mode and the draw face
-/// (`reference/cpp/core/visual/LayerIntf.cpp:5626-5638`, the table at
-/// `:4118-4271`): `omOpaque` on an alpha face is the tree's
-/// "CopyOpaqueImage" (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3141-3147`)
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:5626-5638`, the table at
+/// `:4118-4252`): `omOpaque` on an alpha face is the tree's
+/// "CopyOpaqueImage" (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:174-178`)
 /// and `omAlpha` on an alpha face is the tree's "AlphaBlend_d"
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3549-3556`).
+/// (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:109-149`).
 #[test]
 fn the_operate_affine_keeps_the_mode_and_face_table() {
     let _lock = vm_lock();
@@ -308,8 +308,9 @@ fn the_operate_affine_keeps_the_mode_and_face_table() {
     );
     // The alpha face's `omOpaque` copy writes an opaque alpha.
     assert_eq!(layer_rgba(&env, 1, 0, 0), [255, 0, 0, 255]);
-    // The alpha face's `omAlpha` is the alpha-correct source-over.
+    // The alpha face's `omAlpha` is the alpha blend that reads the
+    // destination's alpha.
     env.run("dst.fillRect(0, 0, 1, 1, 0x400000ff);");
     env.run("dst.operateAffine(src, 0, 0, 1, 1, true, 1, 0, 0, 1, 0, 0, omAlpha, 255, 0);");
-    assert_eq!(layer_rgba(&env, 1, 0, 0), [204, 0, 51, 159]);
+    assert_eq!(layer_rgba(&env, 1, 0, 0), [203, 0, 51, 160]);
 }

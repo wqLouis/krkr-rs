@@ -1846,25 +1846,60 @@ fn composite_pose(
         }
         if node_drawable(&nodes[index]) {
             let opacity = nodes[index].accumulated.opacity;
-            let mode = blend_operation_mode(nodes[index].accumulated.blend_mode);
-            draw_clipped_item(bitmap, (0, 0), nodes, index, &mut frame, opacity, mode);
+            let blend = node_blend(nodes[index].accumulated.blend_mode);
+            draw_clipped_item(bitmap, (0, 0), nodes, index, &mut frame, opacity, blend);
         }
     }
     std::mem::take(&mut frame.missing)
 }
 
-/// The operation mode a node's blend mode resolves to.
+/// The blend a node's pixels are composited with.
 ///
 /// The low four bits of the node's blend mode select the operation: `1` is
 /// additive, `2` and `5` are subtractive, `3` is multiplicative, `4` is
 /// screen, and every other value composites source-over.
-fn blend_operation_mode(raw: i32) -> i64 {
+#[derive(Clone, Copy)]
+struct NodeBlend {
+    /// The operation mode of the layer blends.
+    mode: i64,
+    /// Whether the composite is the plain source-over.
+    ///
+    /// The default blend composites the icon over the target with its own
+    /// alpha. That composite is not one of the operation-mode blends: the
+    /// operation-mode alpha blend reads the destination's alpha and loses a
+    /// level on an opaque source.
+    source_over: bool,
+}
+
+/// The plain source-over the plugin's own offscreen draws use.
+const SOURCE_OVER: NodeBlend = NodeBlend {
+    mode: 2,
+    source_over: true,
+};
+
+/// The blend a node's blend mode resolves to.
+fn node_blend(raw: i32) -> NodeBlend {
     match raw & 0x0F {
-        1 => 14,
-        2 | 5 => 15,
-        3 => 16,
-        4 => 17,
-        _ => 2,
+        1 => NodeBlend {
+            mode: 14,
+            source_over: false,
+        },
+        2 | 5 => NodeBlend {
+            mode: 15,
+            source_over: false,
+        },
+        3 => NodeBlend {
+            mode: 16,
+            source_over: false,
+        },
+        4 => NodeBlend {
+            mode: 17,
+            source_over: false,
+        },
+        _ => NodeBlend {
+            mode: 2,
+            source_over: true,
+        },
     }
 }
 
@@ -2120,7 +2155,15 @@ fn draw_group(
     if node_drawable(&nodes[group]) {
         // The group's own source is painted source-over; the group's blend
         // mode is applied when the completed group is composited.
-        draw_node(&mut offscreen, nodes, group, frame, 1.0, 2, offset);
+        draw_node(
+            &mut offscreen,
+            nodes,
+            group,
+            frame,
+            1.0,
+            SOURCE_OVER,
+            offset,
+        );
     }
     for index in 0..nodes.len() {
         if index == group || nearest_group(nodes, index) != Some(group) {
@@ -2157,7 +2200,7 @@ fn draw_group(
             index,
             frame,
             ratio.clamp(0.0, 1.0),
-            blend_operation_mode(node.accumulated.blend_mode),
+            node_blend(node.accumulated.blend_mode),
         );
     }
     // A stencil group's mask layers change the composed group's alpha in the
@@ -2178,7 +2221,15 @@ fn draw_group(
                 height,
                 vec![0u8; width as usize * height as usize * 4],
             );
-            draw_node(&mut mask_bitmap, nodes, mask_index, frame, 1.0, 2, offset);
+            draw_node(
+                &mut mask_bitmap,
+                nodes,
+                mask_index,
+                frame,
+                1.0,
+                SOURCE_OVER,
+                offset,
+            );
             let rect = (
                 mask_box.0 as i32 - origin.0,
                 mask_box.1 as i32 - origin.1,
@@ -2201,7 +2252,7 @@ fn draw_group(
     if opa == 0 {
         return;
     }
-    let mode = blend_operation_mode(nodes[group].accumulated.blend_mode);
+    let blend = node_blend(nodes[group].accumulated.blend_mode);
     operate_rect(
         target,
         origin.0 - target_origin.0,
@@ -2211,10 +2262,11 @@ fn draw_group(
             rect: (0, 0, right - left, bottom - top),
         },
         BlitOptions {
-            mode,
+            mode: blend.mode,
             opa,
             treat_as_opaque: false,
             hold_alpha: false,
+            source_over: blend.source_over,
         },
     );
 }
@@ -2304,12 +2356,12 @@ fn draw_clipped_item(
     index: usize,
     frame: &mut DrawFrame<'_>,
     opacity: f64,
-    mode: i64,
+    blend: NodeBlend,
 ) {
     let offset = (-out_origin.0, -out_origin.1);
     let node = &nodes[index];
     let Some(viewport) = node_viewport(nodes, node, frame) else {
-        draw_node(out, nodes, index, frame, opacity, mode, offset);
+        draw_node(out, nodes, index, frame, opacity, blend, offset);
         return;
     };
     let Some(paint) = node_paint_box(node, frame) else {
@@ -2329,7 +2381,7 @@ fn draw_clipped_item(
         return;
     }
     if paint.0 >= clip.0 && paint.1 >= clip.1 && paint.2 <= clip.2 && paint.3 <= clip.3 {
-        draw_node(out, nodes, index, frame, opacity, mode, offset);
+        draw_node(out, nodes, index, frame, opacity, blend, offset);
         return;
     }
     let Ok(width) = u32::try_from(right - left) else {
@@ -2347,7 +2399,15 @@ fn draw_clipped_item(
         height,
         vec![0u8; width as usize * height as usize * 4],
     );
-    draw_node(&mut offscreen, nodes, index, frame, 1.0, 2, (-left, -top));
+    draw_node(
+        &mut offscreen,
+        nodes,
+        index,
+        frame,
+        1.0,
+        SOURCE_OVER,
+        (-left, -top),
+    );
     operate_rect(
         out,
         left - out_origin.0,
@@ -2357,10 +2417,11 @@ fn draw_clipped_item(
             rect: (0, 0, right - left, bottom - top),
         },
         BlitOptions {
-            mode,
+            mode: blend.mode,
             opa,
             treat_as_opaque: false,
             hold_alpha: false,
+            source_over: blend.source_over,
         },
     );
 }
@@ -2441,7 +2502,7 @@ fn draw_node(
     index: usize,
     frame: &mut DrawFrame<'_>,
     opacity: f64,
-    mode: i64,
+    blend: NodeBlend,
     offset: (i32, i32),
 ) {
     let node = &nodes[index];
@@ -2539,10 +2600,11 @@ fn draw_node(
                         rect: (left, top, right.min(width), bottom.min(height)),
                     },
                     BlitOptions {
-                        mode,
+                        mode: blend.mode,
                         opa,
                         treat_as_opaque: false,
                         hold_alpha: false,
+                        source_over: blend.source_over,
                     },
                 );
             }
@@ -2554,7 +2616,7 @@ fn draw_node(
         corner(f64::from(width), 0.0),
         corner(0.0, f64::from(height)),
     ];
-    draw_icon(bitmap, &source, width, height, corners, opa, mode);
+    draw_icon(bitmap, &source, width, height, corners, opa, blend);
 }
 
 /// The node's four vertex colours composed with the player's diffuse colour.
@@ -2681,7 +2743,7 @@ fn draw_icon(
     height: i32,
     corners: [(f64, f64); 3],
     opa: u8,
-    mode: i64,
+    blend: NodeBlend,
 ) {
     let rect = (0, 0, width, height);
     if let Some((x, y)) = unit_axis_aligned_origin(corners, width, height) {
@@ -2696,10 +2758,11 @@ fn draw_icon(
                 rect,
             },
             BlitOptions {
-                mode,
+                mode: blend.mode,
                 opa,
                 treat_as_opaque: false,
                 hold_alpha: false,
+                source_over: blend.source_over,
             },
         );
         return;
@@ -2718,10 +2781,11 @@ fn draw_icon(
             rect,
         },
         BlitOptions {
-            mode,
+            mode: blend.mode,
             opa,
             treat_as_opaque: false,
             hold_alpha: false,
+            source_over: blend.source_over,
         },
     );
 }
@@ -4204,9 +4268,9 @@ mod tests {
     use super::local_matrix;
     use super::{
         BitmapState, DEFAULT_NODE_COLORS, DrawFrame, DrawSettings, MotionNode, MotionSnapshot,
-        PlayerInst, RetainedValue, TimelineState, TjsValue, build_node_tree, composite_pose,
-        draw_icon, draw_point, evaluate_frames, inherited_parent, inherited_transform,
-        node_drawable, prime_timelines, unit_axis_aligned_origin,
+        NodeBlend, PlayerInst, RetainedValue, SOURCE_OVER, TimelineState, TjsValue,
+        build_node_tree, composite_pose, draw_icon, draw_point, evaluate_frames, inherited_parent,
+        inherited_transform, node_drawable, prime_timelines, unit_axis_aligned_origin,
     };
     use crate::engine_api::Storage;
     use crate::engine_api::layer_ops::{AffineBlit, BlitOptions, BlitSource, affine_blit};
@@ -4638,7 +4702,7 @@ mod tests {
         // texel covers a 2x2 block of the destination.
         let corners = [(1.0, 1.0), (5.0, 1.0), (1.0, 5.0)];
         let mut bitmap = BitmapState::new(8, 8, vec![0u8; 8 * 8 * 4]);
-        draw_icon(&mut bitmap, &source, 2, 2, corners, 255, 2);
+        draw_icon(&mut bitmap, &source, 2, 2, corners, 255, SOURCE_OVER);
         let texel = |x: usize, y: usize| {
             let offset = (y * 8 + x) * 4;
             [
@@ -5687,7 +5751,18 @@ mod tests {
         assert_eq!(unit_axis_aligned_origin(corners, 2, 2), Some((2, 3)));
         let mut fast = BitmapState::new(6, 6, vec![0u8; 6 * 6 * 4]);
         let mut affine = BitmapState::new(6, 6, vec![0u8; 6 * 6 * 4]);
-        draw_icon(&mut fast, &source, 2, 2, corners, 255, 2);
+        draw_icon(
+            &mut fast,
+            &source,
+            2,
+            2,
+            corners,
+            255,
+            NodeBlend {
+                mode: 2,
+                source_over: true,
+            },
+        );
         affine_blit(
             &mut affine,
             AffineBlit {
@@ -5705,6 +5780,7 @@ mod tests {
                 opa: 255,
                 treat_as_opaque: false,
                 hold_alpha: false,
+                source_over: true,
             },
         );
         assert_eq!(fast.rgba, affine.rgba);

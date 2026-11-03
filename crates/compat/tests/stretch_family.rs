@@ -2,7 +2,7 @@
 //!
 //! `stretchCopy`, `stretchPile` and `stretchBlend` each name their blend
 //! per draw face
-//! (`reference/cpp/core/visual/LayerIntf.cpp:4672-4716` for `stretchCopy`,
+//! (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4672-4716` for `stretchCopy`,
 //! `:5264-5317` for `stretchPile` and `:5319-5372` for `stretchBlend`).
 //!
 //! The tests drive the real script surface: they create the layers through
@@ -50,7 +50,7 @@ fn script(method: &str) -> String {
 
 /// Reference: `StretchCopy` copies with `bmCopy` on the alpha faces and
 /// passes `false` as the hold argument
-/// (`reference/cpp/core/visual/LayerIntf.cpp:4685-4695`): the copy writes
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4685-4695`): the copy writes
 /// the source's own alpha.
 #[test]
 fn the_stretch_copy_on_an_alpha_face_copies_the_source_alpha() {
@@ -62,9 +62,9 @@ fn the_stretch_copy_on_an_alpha_face_copies_the_source_alpha() {
 
 /// Reference: `StretchCopy` on an opaque face passes the layer's hold
 /// argument to `bmCopy`
-/// (`reference/cpp/core/visual/LayerIntf.cpp:4697-4706`), and the hold
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4697-4706`), and the hold
 /// spelling of the copy is the tree's "CopyColor"
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3150-3152`): the
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:162-166`): the
 /// source's colour replaces the destination's and the destination's alpha is
 /// held.
 #[test]
@@ -80,26 +80,26 @@ fn the_stretch_copy_on_an_opaque_face_holds_the_destination_alpha() {
 }
 
 /// Reference: `StretchPile` piles with `bmAlphaOnAlpha` on an alpha face
-/// (`reference/cpp/core/visual/LayerIntf.cpp:5284-5294`), the tree's
-/// "AlphaBlend_d" (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3555-3559`):
-/// the destination's alpha takes part in the mix and the result's alpha is
-/// the source-over alpha.
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:5284-5294`), the tree's
+/// "AlphaBlend_d" (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:109-149`):
+/// the destination's alpha takes part in the mix and the result's alpha comes
+/// from the negative-multiply table.
 #[test]
-fn the_stretch_pile_on_an_alpha_face_is_the_alpha_correct_source_over() {
+fn the_stretch_pile_on_an_alpha_face_reads_the_destination_alpha() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(&script(
         "dst.stretchPile(0, 0, 1, 1, src, 0, 0, 1, 1, 255);",
     ));
-    assert_eq!(layer_pixel(&env, 1, 0, 0), [204, 0, 51, 159]);
+    assert_eq!(layer_pixel(&env, 1, 0, 0), [203, 0, 51, 160]);
 }
 
 /// Reference: `StretchPile` piles with `bmAlpha` on an opaque face
-/// (`reference/cpp/core/visual/LayerIntf.cpp:5295-5304`), the tree's
-/// "AlphaBlend" (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3402-3411`):
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:5295-5304`), the tree's
+/// "AlphaBlend" (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:67-76`):
 /// the colour is mixed by the source's alpha and the destination's alpha is
 /// held (the CPU twin is `d + ((f - d) * a >> 8)`,
-/// `reference/cpp/core/visual/gl/blend_functor_c.h:374-383`).
+/// `reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:374-383`).
 #[test]
 fn the_stretch_pile_on_an_opaque_face_mixes_by_the_source_alpha() {
     let _lock = vm_lock();
@@ -112,9 +112,9 @@ fn the_stretch_pile_on_an_opaque_face_mixes_by_the_source_alpha() {
 }
 
 /// Reference: `StretchBlend` blends with `bmCopyOnAlpha` on an alpha face
-/// (`reference/cpp/core/visual/LayerIntf.cpp:5339-5349`); at the full
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:5339-5349`); at the full
 /// opacity that is the tree's "CopyOpaqueImage"
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3141-3147`): the
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:174-178`): the
 /// source is read as an opaque image, so the source's colour replaces the
 /// destination's and the destination's alpha becomes opaque.
 #[test]
@@ -129,9 +129,9 @@ fn the_stretch_blend_on_an_alpha_face_copies_the_source_as_an_opaque_image() {
 
 /// Reference: `StretchBlend` on an alpha face passes the layer's hold
 /// argument to `bmCopyOnAlpha`
-/// (`reference/cpp/core/visual/LayerIntf.cpp:5339-5349`), and the hold
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:5339-5349`), and the hold
 /// spelling of that copy is the tree's "CopyColor"
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3150-3152`): the
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:162-166`): the
 /// source's colour replaces the destination's and the destination's alpha is
 /// held.
 #[test]
@@ -146,9 +146,9 @@ fn the_stretch_blend_on_an_alpha_face_holds_the_destination_alpha() {
 }
 
 /// Reference: `StretchBlend` blends with `bmCopy` on an opaque face
-/// (`reference/cpp/core/visual/LayerIntf.cpp:5350-5359`); at the full
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:5350-5359`); at the full
 /// opacity that is the tree's "Copy"
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:2986`): the
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:158-160`): the
 /// source's colour and its alpha replace the destination's.
 #[test]
 fn the_stretch_blend_on_an_opaque_face_copies_the_source_alpha() {

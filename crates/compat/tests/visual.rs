@@ -158,15 +158,23 @@ fn layer_type_maps_every_native_blend_to_its_behaviour() {
     let env = Env::new();
     env.run("var w = new Window(); var l = new Layer(w, null);");
     // (native `lt*`, decoded behaviour, native it encodes back to)
+    //
+    // The binder, the effect and the filter types name no bitmap blend: the
+    // reference displays them as the binder type, whose draw face is the
+    // opaque one and whose operation mode is the opaque one
+    // (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:1524-1618`,
+    // `:1621-1683`). The property reads the number the script wrote back
+    // (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:1687-1700`,
+    // `:10832-10838`).
     let cases: &[(i64, BlendMode, i64)] = &[
-        (0, BlendMode::SourceOver, 2),  // ltBinder (container, no blend)
+        (0, BlendMode::Replace, 0),     // ltBinder (container)
         (1, BlendMode::Replace, 1),     // ltOpaque
         (2, BlendMode::SourceOver, 2),  // ltAlpha
         (3, BlendMode::Additive, 3),    // ltAdditive
         (4, BlendMode::Subtractive, 4), // ltSubtractive
         (5, BlendMode::Multiply, 5),    // ltMultiplicative
-        (6, BlendMode::SourceOver, 2),  // ltEffect (callback)
-        (7, BlendMode::SourceOver, 2),  // ltFilter (callback)
+        (6, BlendMode::Replace, 6),     // ltEffect (callback)
+        (7, BlendMode::Replace, 7),     // ltFilter (callback)
         (8, BlendMode::DestinationDependent(DstBlend::ColorDodge), 8),
         (9, BlendMode::DestinationDependent(DstBlend::Darken), 9),
         (10, BlendMode::DestinationDependent(DstBlend::Lighten), 10),
@@ -204,7 +212,14 @@ fn layer_type_maps_every_native_blend_to_its_behaviour() {
             27,
         ),
         (28, BlendMode::DestinationDependent(DstBlend::Exclusion), 28),
-        (9999, BlendMode::SourceOver, 2), // unknown degrades safely
+        // A type that names no blend leaves the layer's blend alone, and the
+        // property reads the number back
+        // (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:1687-1700`).
+        (
+            9999,
+            BlendMode::DestinationDependent(DstBlend::Exclusion),
+            9999,
+        ),
     ];
     for &(native, expected, canonical) in cases {
         env.run(&format!("l.type = {native};"));

@@ -269,7 +269,9 @@ fn argb_to_rgba(color: i64) -> [u8; 4] {
 
 /// The scene blend for a PSD blend mode.
 fn psd_blend_to_scene(blend: BlendMode) -> SceneBlend {
-    from_native(i64::from(tvp_layer_type(blend)))
+    // Every type the mapping names is a type the layer knows, so the
+    // fallback is the normal type the unsupported modes report.
+    from_native(i64::from(tvp_layer_type(blend))).unwrap_or(SceneBlend::PsNormal)
 }
 
 /// The `tTVPLayerType` a PSD blend mode maps onto.

@@ -1,28 +1,28 @@
 //! Integration tests for the operation-mode blend family.
 //!
-//! The reference has two blend shapes: the alpha blend that takes the
-//! destination's alpha into the mix
-//! (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3549-3556`) and
-//! the channel mix that does not
-//! (`:3402-3411`, `:3474-3482`). The Photoshop modes are the channel mix
-//! around a per-channel function
-//! (`reference/cpp/core/visual/gl/blend_functor_c.h:374-383`), and the
-//! integer per-channel functions are the tree's CPU twins
-//! (`reference/cpp/core/visual/gl/blend_functor_c.h:386-660`,
-//! `reference/cpp/core/visual/gl/blend_function.cpp:526-547`).
+//! The live per-pixel path of the reference is the C++ functor set that
+//! `TVPGL_C_Init` installs
+//! (`reference/krkr2/cpp/core/visual/gl/blend_function.cpp:590-684`): the
+//! kernels live in `gl/blend_functor_c.h`, the alpha-variation wrappers in
+//! `gl/blend_variation.h` and the premultiplied helpers in
+//! `gl/blend_util_func.h`. The legacy `_c` kernels in `tvpgl.cpp` are dead
+//! in that tree — their registration blocks are `#if 0`
+//! (`reference/krkr2/cpp/core/visual/tvpgl.cpp:13847-13882`) — so the
+//! functors are the oracle.
 //!
-//! The modes below the Photoshop family are per-channel functions of their
-//! own (`reference/cpp/core/visual/gl/blend_functor_c.h:182-349`); the
-//! software renderer's method table names one per mode
-//! (`reference/cpp/core/visual/RenderManager.cpp:2403-2415`), and at the full
-//! opacity the method runs the plain functor
-//! (`reference/cpp/core/visual/RenderManager.cpp:1802-1824`).
+//! The software renderer's method table picks the kernel of a blt method
+//! (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2396-2459`) and the
+//! table the operation mode and the draw face select the method from
+//! (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4118-4252`). The tests
+//! drive the engine's own blend entry points, so every expected value is a
+//! pixel the reference's kernel produces.
 
 use api::blend::BlendMode;
 use engine::layer_ops::{
-    BlitOptions, BlitSource, operate_rect, render_layer_subtree, stretch_blit_mode,
+    BlitOptions, BlitSource, operate_rect, operate_rect_on, render_layer_subtree, stretch_blit_mode,
 };
 use engine::scene::Rect;
+use engine::trans::DestAlpha;
 use engine::{BitmapState, Scene};
 
 /// A `width` x `height` bitmap filled with one straight-alpha colour.
@@ -63,6 +63,39 @@ fn blend_with(
             opa,
             treat_as_opaque,
             hold_alpha: false,
+            source_over: false,
+        },
+    );
+    [dst.rgba[0], dst.rgba[1], dst.rgba[2], dst.rgba[3]]
+}
+
+/// The colour the destination holds after the pass blended `source` into it
+/// on a destination whose stored alpha follows `dst_alpha`.
+fn blend_on(
+    mode: i64,
+    dst_alpha: DestAlpha,
+    dest: [u8; 4],
+    source: [u8; 4],
+    opa: u8,
+    hold_alpha: bool,
+) -> [u8; 4] {
+    let mut dst = BitmapState::new(1, 1, dest.to_vec());
+    let src = BitmapState::new(1, 1, source.to_vec());
+    operate_rect_on(
+        dst_alpha,
+        &mut dst,
+        0,
+        0,
+        BlitSource {
+            bitmap: &src,
+            rect: (0, 0, 1, 1),
+        },
+        BlitOptions {
+            mode,
+            opa,
+            treat_as_opaque: false,
+            hold_alpha,
+            source_over: false,
         },
     );
     [dst.rgba[0], dst.rgba[1], dst.rgba[2], dst.rgba[3]]
@@ -105,6 +138,7 @@ fn operate_row(mode: i64, opa: u8, dest: &[[u8; 4]], source: &[[u8; 4]]) -> Vec<
             opa,
             treat_as_opaque: false,
             hold_alpha: false,
+            source_over: false,
         },
     );
     read_row(&dst)
@@ -128,17 +162,18 @@ fn stretch_row(mode: i64, opa: u8, dest: &[[u8; 4]], source: &[[u8; 4]]) -> Vec<
             opa,
             treat_as_opaque: false,
             hold_alpha: false,
+            source_over: false,
         },
     );
     read_row(&dst)
 }
 
-/// Reference: the Photoshop normal blend is the tree's "PsAlphaBlend": the
-/// source's alpha mixes the colours, the destination's alpha is held and the
-/// mix carries no alpha correction
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3474-3482`; the CPU
-/// twin is `d + ((s - d) * a >> 8)`,
-/// `reference/cpp/core/visual/gl/blend_functor_c.h:374-383`).
+/// Reference: the Photoshop normal blend is the "PsAlphaBlend" method
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2425-2426`), whose
+/// kernel is `ps_alpha_blend_func`
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:374-383`): the
+/// source's alpha mixes the colours, the destination's alpha is kept and the
+/// mix carries no alpha correction.
 #[test]
 fn the_photoshop_normal_blend_mixes_without_an_alpha_correction() {
     // The destination's red and the source's green mix by the source's alpha
@@ -151,9 +186,9 @@ fn the_photoshop_normal_blend_mixes_without_an_alpha_correction() {
 }
 
 /// Reference: with an opaque destination the channel mix replaces the
-/// destination's colours (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3474-3482`;
-/// the CPU twin truncates the product by eight bits, so the green channel
-/// lands on `255 * 255 >> 8 = 254`).
+/// destination's colours (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:374-383`);
+/// the CPU kernel truncates the product by eight bits, so the green channel
+/// lands on `255 * 255 >> 8 = 254`.
 #[test]
 fn the_channel_mix_replaces_the_colours_of_an_opaque_destination() {
     assert_eq!(
@@ -162,36 +197,65 @@ fn the_channel_mix_replaces_the_colours_of_an_opaque_destination() {
     );
 }
 
-/// Reference: the alpha-correct source-over takes the destination's alpha
-/// into the mix, so the same operands give a different colour and a
-/// recomputed alpha (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3549-3556`).
+/// Reference: the alpha blend on an alpha destination is the "AlphaBlend_d"
+/// method (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2401-2402`),
+/// whose kernel is `dest_alpha_op`
+/// (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:109-149`): the
+/// effective source weight comes from the opacity-on-opacity table
+/// (`reference/krkr2/cpp/core/visual/tvpgl.cpp:224-301`) and the destination's
+/// alpha is rewritten with the negative-multiply table.
+///
+/// The source's alpha of 128 and the destination's of 128 give the weight
+/// `128 / 128` folded into `255 * 128 / (128 + 128) = 127`, and the
+/// destination's alpha becomes `255 - (255 - 128) * (255 - 128) / 255 = 192`.
 #[test]
-fn the_source_over_computes_the_destination_alpha() {
-    // `d.a = 128 + 128 - 128 * 128 / 255 = 191` and the green channel
-    // becomes `255 * 128 / 191 = 170`.
+fn the_alpha_blend_reads_the_destination_alpha() {
+    // The green channel is `255 + ((0 - 255) * 127 >> 8) = 128` and the red
+    // channel `0 + ((255 - 0) * 127 >> 8) = 126`; the mix truncates.
     assert_eq!(
         blend(2, [255, 0, 0, 128], [0, 255, 0, 128], 255),
-        [85, 170, 0, 191]
+        [85, 169, 0, 192]
     );
 }
 
 /// Reference: the alpha blend mixes with the *new* alpha, so a translucent
 /// source over an identically translucent destination keeps the colour both
-/// operands share (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3549-3556`).
+/// operands share (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:109-149`;
+/// the destination's alpha becomes `255 - (255 - 26) * (255 - 26) / 255 = 50`).
 #[test]
 fn the_alpha_blend_keeps_the_colour_of_a_translucent_destination() {
-    // `d.a = 26 + 26 - 26 * 26 / 255 = 49` and the mix factor is
-    // `26 / 49.35`, so every channel keeps the value both operands share.
+    // The weight of the two alphas of 26 is `255 * 26 / 52 = 127`, and the
+    // colour both operands share does not move.
     assert_eq!(
         blend(2, [255, 204, 204, 26], [255, 204, 204, 26], 255),
-        [255, 204, 204, 49]
+        [255, 204, 204, 50]
+    );
+}
+
+/// Reference: the alpha blend on an opaque destination is the "AlphaBlend"
+/// method (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2400-2401`),
+/// whose kernel is `alpha_blend_func`
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:67-76`): the
+/// destination's alpha is not read and the destination's alpha is kept.
+#[test]
+fn the_alpha_blend_on_an_opaque_destination_keeps_its_alpha() {
+    assert_eq!(
+        blend_on(
+            2,
+            DestAlpha::Opaque,
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            255,
+            false
+        ),
+        [0, 254, 0, 255]
     );
 }
 
 /// Reference: every Photoshop mode has its own per-channel function, and the
-/// tree's CPU twins give the integer arithmetic
-/// (`reference/cpp/core/visual/gl/blend_functor_c.h:386-660`,
-/// `reference/cpp/core/visual/gl/blend_function.cpp:526-547`). The
+/// tree's CPU kernels give the integer arithmetic
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:386-660`,
+/// `reference/krkr2/cpp/core/visual/gl/blend_function.cpp:526-547`). The
 /// destination is `(200, 100, 50, 128)` and the source `(60, 180, 90, 192)`,
 /// so the mix factor is the source's alpha of 192.
 #[test]
@@ -199,11 +263,11 @@ fn the_photoshop_modes_have_their_own_per_channel_functions() {
     let dest = [200, 100, 50, 128];
     let source = [60, 180, 90, 192];
     // The mode numbers are the operation modes
-    // (`reference/cpp/core/visual/LayerIntf.h:76-105`).
+    // (`reference/krkr2/cpp/core/visual/LayerIntf.h:76-105`).
     let cases: [(i64, [u8; 3]); 14] = [
         (13, [95, 160, 80]),   // omPsNormal
         (14, [241, 216, 117]), // omPsAdditive: the saturating sum
-        (15, [155, 25, 12]),   // omPsSubtractive: the saturating difference
+        (15, [53, 43, 12]),    // omPsSubtractive: the linear burn
         (16, [84, 77, 25]),    // omPsMultiplicative: the product
         (17, [210, 182, 104]), // omPsScreen
         (18, [178, 130, 38]),  // omPsOverlay
@@ -225,9 +289,23 @@ fn the_photoshop_modes_have_their_own_per_channel_functions() {
     }
 }
 
+/// Reference: the Photoshop subtractive blend is the linear burn: the source
+/// is inverted and the difference saturates, so the channel is
+/// `max(0, d + s - 255)`
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:401-412`).
+#[test]
+fn the_photoshop_subtractive_blend_is_a_linear_burn() {
+    // The red channel is `max(0, 200 + 60 - 255) = 5`, mixed by the
+    // source's alpha of 192: `200 + ((5 - 200) * 192 >> 8) = 53`.
+    assert_eq!(
+        blend(15, [200, 100, 50, 128], [60, 180, 90, 192], 255),
+        [53, 43, 12, 128]
+    );
+}
+
 /// Reference: the legacy Photoshop 5.x modes fade the source first and
 /// replace the channel; they do not mix
-/// (`reference/cpp/core/visual/gl/blend_functor_c.h:568-581`, `:630-642`).
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:568-581`, `:630-642`).
 #[test]
 fn the_legacy_photoshop_modes_replace_the_channel() {
     let dest = [200, 100, 50, 128];
@@ -247,7 +325,7 @@ fn the_legacy_photoshop_modes_replace_the_channel() {
 }
 
 /// Reference: the overlay is the tree's overlay table
-/// (`reference/cpp/core/visual/gl/blend_function.cpp:539-542`): below the
+/// (`reference/krkr2/cpp/core/visual/gl/blend_function.cpp:539-542`): below the
 /// midpoint `(s * d * 2) / 255` and above it
 /// `(s + d) * 2 - (s * d * 2) / 255 - 255`.
 #[test]
@@ -272,7 +350,7 @@ fn the_overlay_follows_the_reference_table() {
 /// Reference: the overlay of a colour over a white destination is the
 /// destination: the table's upper branch is `(s + d) * 2 - (s * d * 2) / 255
 /// - 255 = 255` for every channel
-/// (`reference/cpp/core/visual/gl/blend_function.cpp:539-542`).
+/// (`reference/krkr2/cpp/core/visual/gl/blend_function.cpp:539-542`).
 #[test]
 fn the_overlay_over_a_white_destination_keeps_the_destination() {
     assert_eq!(
@@ -281,11 +359,24 @@ fn the_overlay_over_a_white_destination_keeps_the_destination() {
     );
 }
 
-/// Reference: the copy-on-alpha blend reads the source as an opaque image, so
-/// the destination's alpha becomes opaque
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3141-3147`; the CPU
-/// twin writes `dest = src | 0xff000000`,
-/// `reference/cpp/core/visual/tvpgl.cpp:3326-3370`).
+/// Reference: the exclusion blend is `src + dst - 2 * src * dst / 255`
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:646-659`), whose
+/// product is taken with a seven-bit shift.
+#[test]
+fn the_exclusion_blend_follows_the_reference_product() {
+    // The red channel's product is `200 * 60 >> 7 = 93`, so the blend is
+    // `200 + 60 - 93 = 167`, mixed by the source's alpha of 192:
+    // `200 + ((167 - 200) * 192 >> 8) = 175`.
+    assert_eq!(
+        blend(28, [200, 100, 50, 128], [60, 180, 90, 192], 255),
+        [175, 130, 91, 128]
+    );
+}
+
+/// Reference: the copy of an opaque source is the "CopyOpaqueImage" method
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2404-2405`), whose
+/// kernel forces the source's alpha to opaque
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:174-178`).
 #[test]
 fn an_opaque_source_makes_the_destination_alpha_opaque() {
     assert_eq!(
@@ -299,11 +390,64 @@ fn an_opaque_source_makes_the_destination_alpha_opaque() {
     );
 }
 
+/// Reference: the copy below the full opacity is the "ConstAlphaBlend"
+/// method (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2397-2399`),
+/// whose kernel returns a 24-bit word
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:662-671`): the
+/// destination's alpha byte becomes zero.
+#[test]
+fn the_constant_alpha_blend_drops_the_destination_alpha() {
+    // The colour is mixed by the opacity: `10 + ((60 - 10) * 128 >> 8) = 35`,
+    // `20 + ((70 - 20) * 128 >> 8) = 45` and `30 + ((80 - 30) * 128 >> 8) = 55`.
+    assert_eq!(
+        blend_with(1, [10, 20, 30, 128], [60, 70, 80, 90], 128, false),
+        [35, 45, 55, 0]
+    );
+}
+
+/// Reference: the copy of an opaque source below the full opacity is the
+/// "ConstAlphaBlend_d" method
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2400-2401`), whose
+/// kernel reads the destination's alpha
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:708-720`): the
+/// source is treated as an opaque image at the opacity, and the
+/// destination's alpha is rewritten with the negative-multiply table.
+#[test]
+fn the_constant_alpha_blend_of_an_opaque_source_reads_the_destination_alpha() {
+    // The destination's alpha of 128 and the opacity of 128 give the weight
+    // `255 * 128 / 255 = 128`, so the colour is `10 + ((60 - 10) * 128 >> 8)
+    // = 35` and the destination's alpha becomes `255 - (255 - 128) * (255 -
+    // 128) / 255 = 192`.
+    assert_eq!(
+        blend_with(1, [10, 20, 30, 128], [60, 70, 80, 90], 128, true),
+        [43, 53, 63, 192]
+    );
+}
+
+/// Reference: the copy with the hold-alpha flag is the "CopyColor" method
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2397-2399`), whose
+/// kernel copies the colour and keeps the destination's alpha
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:162-166`).
+#[test]
+fn the_copy_with_the_hold_flag_keeps_the_destination_alpha() {
+    assert_eq!(
+        blend_on(
+            1,
+            DestAlpha::Straight,
+            [10, 20, 30, 128],
+            [60, 70, 80, 90],
+            255,
+            true
+        ),
+        [60, 70, 80, 128]
+    );
+}
+
 /// Reference: the tree composites a layer with the blend its type selects, and
 /// the Photoshop normal type is the tree's "PsAlphaBlend"
-/// (`reference/cpp/core/visual/RenderManager.cpp:2425-2426`), whose kernel
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2425-2426`), whose kernel
 /// mixes the colours without an alpha correction and holds the destination's
-/// alpha (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3474-3482`).
+/// alpha (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:374-383`).
 #[test]
 fn a_photoshop_normal_layer_is_composited_without_an_alpha_correction() {
     let mut scene = Scene::default();
@@ -329,8 +473,7 @@ fn a_photoshop_normal_layer_is_composited_without_an_alpha_correction() {
     let bitmap = scene.bitmap(cache).expect("the cache bitmap");
     // The source's alpha of 128 mixes the colours and the destination's alpha
     // is held: `255 + ((0 - 255) * 128 >> 8) = 127` and
-    // `0 + ((255 - 0) * 128 >> 8) = 127`. The alpha-correct source-over
-    // would have given `(85, 170, 0, 191)`.
+    // `0 + ((255 - 0) * 128 >> 8) = 127`.
     assert_eq!(&bitmap.rgba[..4], &[127, 127, 0, 128]);
 }
 
@@ -339,13 +482,13 @@ fn a_photoshop_normal_layer_is_composited_without_an_alpha_correction() {
 // ---------------------------------------------------------------------------
 
 /// Reference: the additive blend is the saturating sum of the destination and
-/// the source (`reference/cpp/core/visual/gl/blend_functor_c.h:182-188`), the
-/// functor the software renderer's "AddBlend" method runs
-/// (`reference/cpp/core/visual/RenderManager.cpp:2867`). At the full opacity
-/// the method runs the plain functor, which adds the source unscaled
-/// (`reference/cpp/core/visual/RenderManager.cpp:1802-1810`), and the
+/// the source (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:182-188`),
+/// the functor the software renderer's "AddBlend" method runs
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2867`). At the full
+/// opacity the method runs the plain functor, which adds the source unscaled
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:1802-1810`), and the
 /// destination's alpha is held
-/// (`reference/cpp/core/visual/gl/blend_variation.h:74-84`).
+/// (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:74-84`).
 #[test]
 fn the_additive_mode_saturates_the_sum_of_the_channels() {
     // `200 + 60` and `100 + 180` both run past 255 and saturate, `50 + 90` is
@@ -358,19 +501,17 @@ fn the_additive_mode_saturates_the_sum_of_the_channels() {
 
 /// Reference: below the full opacity "AddBlend" runs `add_blend_func`, which
 /// fades the source by the opacity with the eight-bit truncation
-/// (`reference/cpp/core/visual/gl/blend_functor_c.h:190-197`) before
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:190-197`) before
 /// `add_blend_functor`'s saturating sum (`:182-189`); the destination's alpha
 /// is held by the HDA wrapper
-/// (`reference/cpp/core/visual/gl/blend_variation.h:84-92`). The graphics
-/// path's `AddBlend` (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3586-3591`)
-/// adds the constant-weighted source, the same curve within one level.
+/// (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:84-92`).
 #[test]
 fn the_additive_mode_fades_the_source_by_the_opacity() {
     // `faded = (s * opa) >> 8` then a saturating add, through
     // `operateStretch`:
     //   ( 60 * 128) >> 8 = 30  -> 200 +  30 = 230
     //   (180 * 128) >> 8 = 90  -> 100 +  90 = 190
-    //   (255 * 128) >> 8 = 127 ->  50 + 127 = 177   (a /255 fade would give 128)
+    //   ( 90 * 128) >> 8 = 45  ->  50 +  45 =  95
     //   (250 * 128) >> 8 = 125 ->  10 + 125 = 135
     //   ( 20 * 128) >> 8 = 10  -> 240 +  10 = 250
     //   (200 * 128) >> 8 = 100 ->   5 + 100 = 105
@@ -380,30 +521,24 @@ fn the_additive_mode_fades_the_source_by_the_opacity() {
             3,
             128,
             &[[200, 100, 50, 128], [10, 240, 5, 200]],
-            &[[60, 180, 255, 192], [250, 20, 200, 64]],
+            &[[60, 180, 90, 192], [250, 20, 200, 64]],
         ),
-        [[230, 190, 177, 128], [135, 250, 105, 200]]
+        [[230, 190, 95, 128], [135, 250, 105, 200]]
     );
 }
 
 /// Reference: "SubBlend" is `tTVPRenderMethod_BltAndOpa<…, TVPSubBlend_HDA,
-/// TVPSubBlend_HDA_o>` (`reference/cpp/core/visual/RenderManager.cpp:2831-2837`,
+/// TVPSubBlend_HDA_o>` (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2831-2837`,
 /// registered at `:2867`), so the full opacity runs `sub_blend_functor` and a
 /// lower one `sub_blend_func`
-/// (`reference/cpp/core/visual/RenderManager.cpp:1802-1819`). The faded
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:1802-1819`). The faded
 /// functor complements the source, fades it by `a >> 8` and complements back
-/// (`reference/cpp/core/visual/gl/blend_functor_c.h:209-217`), and the plain
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:209-217`), and the plain
 /// one is the byte-wise `max(0, d + s - 255)` (`:202-208`). Both are therefore
 /// `max(0, d - subtractend)`, with `subtractend` the whole complement
 /// `255 - s` at the full opacity and its eight-bit truncation
 /// `(255 - s) * opa >> 8` below it. The HDA wrapper holds the destination's
-/// alpha (`reference/cpp/core/visual/gl/blend_variation.h:84-92`).
-///
-/// The graphics path's "SubBlend" program
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3593-3602`) computes
-/// the same curve in floating point (`d - (1 - s) * opa`), so the two reference
-/// backends agree at the full opacity and can differ by up to two levels below
-/// it.
+/// alpha (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:84-92`).
 #[test]
 fn the_subtractive_mode_subtracts_the_faded_complement() {
     // Full opacity: `max(0, d + s - 255)` is `max(0, d - (255 - s))`, so
@@ -432,11 +567,11 @@ fn the_subtractive_mode_subtracts_the_faded_complement() {
 }
 
 /// Reference: the multiplicative blend is the product of the two channels
-/// truncated by eight bits (`reference/cpp/core/visual/gl/blend_functor_c.h:222-229`),
+/// truncated by eight bits (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:222-229`),
 /// the functor the software renderer's "MulBlend" method runs
-/// (`reference/cpp/core/visual/RenderManager.cpp:2869-2870`). At the full
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2869-2870`). At the full
 /// opacity the method runs the plain functor, which multiplies by the source
-/// unscaled (`reference/cpp/core/visual/RenderManager.cpp:1802-1810`). The
+/// unscaled (`reference/krkr2/cpp/core/visual/RenderManager.cpp:1802-1810`). The
 /// blend reads the colours only; the source's alpha does not take part in it.
 #[test]
 fn the_multiplicative_mode_multiplies_the_channels() {
@@ -444,17 +579,42 @@ fn the_multiplicative_mode_multiplies_the_channels() {
     // `50 * 192 >> 8` is `9600 >> 8` = 37.
     assert_eq!(
         blend(5, [200, 100, 50, 128], [64, 128, 192, 255], 255),
+        [50, 50, 37, 0]
+    );
+}
+
+/// Reference: the multiplicative blend without the hold-alpha flag runs the
+/// non-HDA "MulBlend" method
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2405`), whose kernel
+/// returns a 24-bit word
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:222-229`): the
+/// destination's alpha byte becomes zero.
+#[test]
+fn the_multiplicative_mode_drops_the_destination_alpha() {
+    assert_eq!(
+        blend(5, [200, 100, 50, 128], [64, 128, 192, 255], 255),
+        [50, 50, 37, 0]
+    );
+    // The hold-alpha flag selects the "MulBlend_HDA" method
+    // (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2405`), whose kernel
+    // keeps the destination's alpha.
+    assert_eq!(
+        blend_on(
+            5,
+            DestAlpha::Straight,
+            [200, 100, 50, 128],
+            [64, 128, 192, 255],
+            255,
+            true
+        ),
         [50, 50, 37, 128]
     );
 }
 
-/// Reference: below the full opacity `MulBlend_HDA_o` runs `mul_blend_func`,
+/// Reference: below the full opacity `MulBlend` runs `mul_blend_func`,
 /// which fades the source towards white — `s = ~s`, the eight-bit fade, `~`
-/// again (`reference/cpp/core/visual/gl/blend_functor_c.h:230-240`) — and then
-/// `mul_blend_functor`'s `d * s >> 8` (`:222-229`), with the destination's
-/// alpha held (`reference/cpp/core/visual/gl/blend_variation.h:84-92`). The
-/// graphics path's `MulBlend` (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3605-3615`)
-/// is the same fade by `1 - (1 - s) * opa`, so the two agree within two levels.
+/// again (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:230-240`) — and then
+/// `mul_blend_functor`'s `d * s >> 8` (`:222-229`).
 #[test]
 fn the_multiplicative_mode_fades_the_source_towards_white() {
     // `faded = 255 - ((255 - s) * opa >> 8)`, then `d * faded >> 8`:
@@ -464,7 +624,8 @@ fn the_multiplicative_mode_fades_the_source_towards_white() {
     //   faded(250) = 255 - 2   = 253 ->  10 * 253 >> 8 =  2530 >> 8 =   9
     //   faded(20)  = 255 - 117 = 138 -> 240 * 138 >> 8 = 33120 >> 8 = 129
     //   faded(200) = 255 - 27  = 228 ->   5 * 228 >> 8 =  1140 >> 8 =   4
-    // and the destinations' alphas of 128 and 200 are held.
+    // and the destination's alpha is dropped, because the non-HDA method
+    // returns a 24-bit word.
     assert_eq!(
         operate_row(
             5,
@@ -472,20 +633,20 @@ fn the_multiplicative_mode_fades_the_source_towards_white() {
             &[[200, 100, 50, 128], [10, 240, 5, 200]],
             &[[60, 180, 90, 192], [250, 20, 200, 64]],
         ),
-        [[123, 85, 33, 128], [9, 129, 4, 200]]
+        [[123, 85, 33, 0], [9, 129, 4, 0]]
     );
 }
 
 /// Reference: the colour dodge scales the destination by the reciprocal of
-/// the source's complement (`reference/cpp/core/visual/gl/blend_functor_c.h:243-255`),
+/// the source's complement (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:243-255`),
 /// the functor the software renderer's "ColorDodgeBlend" method runs
-/// (`reference/cpp/core/visual/RenderManager.cpp:2871`). The reciprocal table
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2871`). The reciprocal table
 /// holds `65536 / i` and `65536` for the zero index
-/// (`reference/cpp/core/visual/tvpgl.cpp:213-218`). At the full opacity the
+/// (`reference/krkr2/cpp/core/visual/tvpgl.cpp:213-218`). At the full opacity the
 /// method runs the plain functor, which dodges with the source unscaled
-/// (`reference/cpp/core/visual/RenderManager.cpp:1802-1810`); below the full
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:1802-1810`); below the full
 /// opacity it runs the one that fades the source by the opacity first
-/// (`reference/cpp/core/visual/gl/blend_functor_c.h:256-263`).
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:256-263`).
 #[test]
 fn the_dodge_mode_scales_the_destination_by_the_source_inverse() {
     // At the full opacity the source is not faded: `65536 / (255 - 32)` is
@@ -508,12 +669,10 @@ fn the_dodge_mode_scales_the_destination_by_the_source_inverse() {
 /// Reference: at the full opacity "ColorDodgeBlend" runs
 /// `color_dodge_blend_functor`, which dodges with the source itself — the
 /// destination scaled by `TVPRecipTable256[255 - s]` and truncated by eight
-/// bits, clamped to a byte (`reference/cpp/core/visual/gl/blend_functor_c.h:243-255`);
+/// bits, clamped to a byte (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:243-255`);
 /// the table holds `65536 / i` and 65536 at index zero
-/// (`reference/cpp/core/visual/tvpgl.cpp:213-217`). The faded form is the
-/// test above. The graphics path's `ColorDodgeBlend` divides by `1 - s * opa`
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3653-3665`), so the
-/// two agree within a level away from a source of 255.
+/// (`reference/krkr2/cpp/core/visual/tvpgl.cpp:213-217`). The faded form is the
+/// test above.
 #[test]
 fn the_dodge_mode_dodges_with_the_unfaded_source_at_full_opacity() {
     // `d * (65536 / (255 - s)) >> 8`, clamped to 255:
@@ -528,11 +687,11 @@ fn the_dodge_mode_dodges_with_the_unfaded_source_at_full_opacity() {
 }
 
 /// Reference: the darken blend is the smaller of the two channels
-/// (`reference/cpp/core/visual/gl/blend_functor_c.h:268-277`), the functor
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:268-277`), the functor
 /// the software renderer's "DarkenBlend" method runs
-/// (`reference/cpp/core/visual/RenderManager.cpp:2872`). At the full opacity
-/// the method runs the plain functor, which takes the smaller channel
-/// (`reference/cpp/core/visual/RenderManager.cpp:1802-1810`).
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2872`). At the full opacity the
+/// method runs the plain functor, which takes the smaller channel
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:1802-1810`).
 #[test]
 fn the_darken_mode_takes_the_smaller_channel() {
     // The red channel is the source's 60, the green channel the
@@ -546,11 +705,9 @@ fn the_darken_mode_takes_the_smaller_channel() {
 /// Reference: below the full opacity "DarkenBlend" runs `darken_blend_func`,
 /// which mixes the darker channel into the destination by the opacity with
 /// `d + ((f - d) * a >> 8)`
-/// (`reference/cpp/core/visual/gl/blend_functor_c.h:278-292`); the graphics
-/// path's `DarkenBlend` is `mix(d.rgb, min(s.rgb, d.rgb), opacity)`
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3667-3671`). The
-/// destination's alpha is held by the HDA wrapper
-/// (`reference/cpp/core/visual/gl/blend_variation.h:84-92`).
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:278-292`); the destination's
+/// alpha is held by the HDA wrapper
+/// (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:84-92`).
 #[test]
 fn the_darken_mode_mixes_the_darker_channel_by_the_opacity() {
     // `min` then `d + ((min - d) * 128 >> 8)`:
@@ -573,11 +730,11 @@ fn the_darken_mode_mixes_the_darker_channel_by_the_opacity() {
 }
 
 /// Reference: the lighten blend is the larger of the two channels
-/// (`reference/cpp/core/visual/gl/blend_functor_c.h:297-306`), the functor
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:297-306`), the functor
 /// the software renderer's "LightenBlend" method runs
-/// (`reference/cpp/core/visual/RenderManager.cpp:2876`). At the full opacity
-/// the method runs the plain functor, which takes the larger channel
-/// (`reference/cpp/core/visual/RenderManager.cpp:1802-1810`).
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2876`). At the full opacity the
+/// method runs the plain functor, which takes the larger channel
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:1802-1810`).
 #[test]
 fn the_lighten_mode_takes_the_larger_channel() {
     // The red channel is the destination's 200, the green channel the
@@ -591,10 +748,9 @@ fn the_lighten_mode_takes_the_larger_channel() {
 /// Reference: below the full opacity "LightenBlend" runs `lighten_blend_func`,
 /// which mixes the lighter channel into the destination by the opacity with
 /// `d + ((f - d) * a >> 8)`
-/// (`reference/cpp/core/visual/gl/blend_functor_c.h:307-322`); the graphics
-/// path's `LightenBlend` is `mix(d.rgb, max(s.rgb, d.rgb), opacity)`
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3674-3678`). This one
-/// runs through `operateStretch`, which shares the kernel.
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:307-322`); the destination's
+/// alpha is held by the HDA wrapper
+/// (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:84-92`).
 #[test]
 fn the_lighten_mode_mixes_the_lighter_channel_by_the_opacity() {
     // `max` then `d + ((max - d) * 128 >> 8)`:
@@ -618,11 +774,11 @@ fn the_lighten_mode_mixes_the_lighter_channel_by_the_opacity() {
 
 /// Reference: the screen blend is the complement of the product of the two
 /// complements, truncated by eight bits
-/// (`reference/cpp/core/visual/gl/blend_functor_c.h:326-336`), the functor the
-/// software renderer's "ScreenBlend" method runs
-/// (`reference/cpp/core/visual/RenderManager.cpp:2877`). At the full opacity
-/// the method runs the plain functor
-/// (`reference/cpp/core/visual/RenderManager.cpp:1802-1810`). The blend reads
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:326-336`), the functor
+/// the software renderer's "ScreenBlend" method runs
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2877`). At the full opacity the
+/// method runs the plain functor
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:1802-1810`). The blend reads
 /// the colours only; the source's alpha does not take part in it.
 #[test]
 fn the_screen_mode_is_the_complement_of_the_product() {
@@ -639,9 +795,7 @@ fn the_screen_mode_is_the_complement_of_the_product() {
 /// `screen_blend_HDA_o_func`, which fades the source with `s = ~((s * a) >> 8)`
 /// and screens the complement of the destination with it, so a channel is
 /// `255 - (((255 - d) * (255 - ((s * opa) >> 8))) >> 8)`
-/// (`reference/cpp/core/visual/gl/blend_functor_c.h:350-362`). The graphics
-/// path's `ScreenBlend` (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3683-3692`)
-/// is the same curve in floating point, within two levels.
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:350-362`).
 #[test]
 fn the_screen_mode_fades_the_source_before_screening() {
     // `s2 = 255 - ((s * opa) >> 8)`, then `255 - (((255 - d) * s2) >> 8)`:
@@ -663,54 +817,67 @@ fn the_screen_mode_fades_the_source_before_screening() {
     );
 }
 
-/// Reference: the additive-alpha blend scales the destination by the source's
-/// remaining alpha and adds the source
-/// (`reference/cpp/core/visual/gl/blend_util_func.h:35-43`), the functor the
-/// software renderer's "AdditiveAlphaBlend" method runs
-/// (`reference/cpp/core/visual/RenderManager.cpp:2878`). Below the full
-/// opacity the method runs the one that fades the source by the opacity
-/// first (`reference/cpp/core/visual/gl/blend_functor_c.h:132-146`), and the
-/// destination's alpha is held in both
-/// (`reference/cpp/core/visual/gl/blend_variation.h:74-84`).
+/// Reference: the additive-alpha blend on an opaque destination is the
+/// "AdditiveAlphaBlend" method
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2413-2414`), whose kernel
+/// scales the destination by the source's remaining alpha and adds the source
+/// (`reference/krkr2/cpp/core/visual/gl/blend_util_func.h:35-43`); the
+/// destination's alpha is held
+/// (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:74-84`).
 #[test]
 fn the_add_alpha_mode_scales_the_destination_by_the_remaining_alpha() {
-    // Below the full opacity the source fades to `(60 * 128) >> 8` = 30 and
-    // its alpha to `(192 * 128) >> 8` = 96, so the destination scales by
-    // `255 - 96` = 159: the red channel is `200 * 159 >> 8` = 124 and the
-    // source adds 30, which is 154; the green channel is `100 * 159 >> 8` =
-    // 62 and the source adds 90, which is 152; the blue channel is
-    // `50 * 159 >> 8` = 31 and the source adds 45, which is 76.
-    assert_eq!(
-        blend(12, [200, 100, 50, 128], [60, 180, 90, 192], 128),
-        [154, 152, 76, 128]
-    );
     // At the full opacity the source is not faded and the destination scales
     // by the source's remaining alpha `255 - 192` = 63: the red channel is
-    // `128 * 63 >> 8` = 31 and the source adds 16, which is 47.
+    // `200 * 63 >> 8` = 49 and the source adds 60, which is 109; the green
+    // channel is `100 * 63 >> 8` = 24 and the source adds 180, which is 204;
+    // the blue channel is `50 * 63 >> 8` = 12 and the source adds 90, which
+    // is 102.
     assert_eq!(
-        blend(12, [128, 64, 32, 128], [16, 24, 48, 192], 255),
-        [47, 39, 55, 128]
+        blend_on(
+            12,
+            DestAlpha::Opaque,
+            [200, 100, 50, 128],
+            [60, 180, 90, 192],
+            255,
+            false
+        ),
+        [109, 204, 102, 128]
     );
 }
 
-/// Reference: at the full opacity "AdditiveAlphaBlend" runs
-/// `premulalpha_blend_n_a_func`, which adds the source to the destination
-/// scaled by `(~s) >> 24` — the whole remaining alpha of the unfaded source
-/// (`reference/cpp/core/visual/gl/blend_util_func.h:35-43`); the faded wrapper
-/// is the test above (`reference/cpp/core/visual/gl/blend_functor_c.h:132-147`).
-/// The destination's alpha is held
-/// (`reference/cpp/core/visual/gl/blend_variation.h:84-92`), and the graphics
-/// path's `AdditiveAlphaBlend` (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3629-3638`)
-/// is the same sum within a level.
+/// Reference: below the full opacity "AdditiveAlphaBlend" runs
+/// `premulalpha_blend_HDA_o_functor`
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:132-152`), which fades
+/// the source and its alpha by the opacity and then scales the destination by
+/// the source's remaining alpha.
 #[test]
-fn the_add_alpha_mode_takes_the_whole_remaining_alpha_at_full_opacity() {
-    // `(d * (255 - sa)) >> 8 + s` with the unfaded source:
-    //   (200 * (255 - 100)) >> 8 = 200 * 155 >> 8 = 121 -> 121 +  60 = 181
-    //   (100 * (255 - 100)) >> 8 = 100 * 155 >> 8 =  60 ->  60 + 180 = 240
-    //   ( 50 * (255 - 100)) >> 8 =  50 * 155 >> 8 =  30 ->  30 +  90 = 120
-    // and the destination's alpha of 128 is held.
+fn the_add_alpha_mode_fades_the_source_by_the_opacity() {
+    // The source fades to `(60 * 128) >> 8` = 30 and its alpha to
+    // `(192 * 128) >> 8` = 96, so the destination scales by `255 - 96` = 159:
+    // the red channel is `200 * 159 >> 8` = 124 and the source adds 30, which
+    // is 154; the green channel is `100 * 159 >> 8` = 62 and the source adds
+    // 90, which is 152; the blue channel is `50 * 159 >> 8` = 31 and the
+    // source adds 45, which is 76.
     assert_eq!(
-        blend(12, [200, 100, 50, 128], [60, 180, 90, 100], 255),
-        [181, 240, 120, 128]
+        blend_on(
+            12,
+            DestAlpha::Opaque,
+            [200, 100, 50, 128],
+            [60, 180, 90, 192],
+            128,
+            false
+        ),
+        [154, 152, 76, 128]
+    );
+}
+
+/// Reference: the additive-alpha blend onto an alpha destination has no
+/// implementation (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2419-2420`),
+/// so the pass leaves the destination untouched.
+#[test]
+fn the_add_alpha_mode_does_nothing_on_an_alpha_destination() {
+    assert_eq!(
+        blend(12, [200, 100, 50, 128], [60, 180, 90, 192], 255),
+        [200, 100, 50, 128]
     );
 }

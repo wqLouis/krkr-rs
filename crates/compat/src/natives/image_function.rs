@@ -43,7 +43,7 @@
 use std::ffi::{c_char, c_int, c_void};
 
 use crate::engine_api::layer_ops::{self, GammaAdjust, RectI};
-use crate::engine_api::{BitmapState, Scene, raster};
+use crate::engine_api::{BitmapState, DestAlpha, Scene, raster};
 use tjs::{
     NativeInstanceBuilder, NativeInstanceMethodDef, NativeMethodDef, NativeStaticMembers,
     RetainedValue, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_NULL, VAL_OBJECT, VAL_REAL, VAL_STRING,
@@ -402,34 +402,32 @@ fn normalize_color_face(face: i64) -> i64 {
     }
 }
 
-/// Map the reference `tTVPBlendOperationMode` + `tTVPDrawFace` to the
-/// operation mode `engine_api::layer_ops` takes, plus whether the
-/// destination alpha plane may be held.
+/// The destination's stored alpha a draw face names.
 ///
-/// The reference maps through `GetBltMethodFromOperationMode`; for `omOpaque`
-/// the `OnAlpha`/`OnAddAlpha` methods ignore the hold argument and the plain
-/// method takes it, so the argument reaches the blend on an opaque face only.
-/// The face-independent modes always pick a plain method. The engine's blend
-/// table is keyed by the operation mode alone, so the method's own arithmetic
-/// is not expressible here.
-fn blit_method(mode: i64, face: i64) -> (i64, bool) {
-    // The auto mode is the alpha mode before the face is applied, so the
-    // face still selects the method and the hold argument reaches a
-    // face-selected blend on an opaque face.
-    let mode = if mode == OM_AUTO { OM_ALPHA } else { mode };
-    let face = normalize_draw_face(face);
-    let plain = if FACE_SENSITIVE_MODES.contains(&mode) {
-        face == DF_OPAQUE
-    } else {
-        true
-    };
-    (mode, plain)
+/// The face selects the blend method: the alpha face reads the destination's
+/// alpha, the opaque face ignores it, and the additive-alpha face stores a
+/// premultiplied one.
+fn face_dest_alpha(face: i64) -> DestAlpha {
+    match face {
+        DF_ADD_ALPHA => DestAlpha::Additive,
+        DF_OPAQUE => DestAlpha::Opaque,
+        _ => DestAlpha::Straight,
+    }
 }
 
-/// The operation modes whose blend method the draw face selects: the
-/// `omAlpha`, `omAddAlpha` and `omOpaque` modes. Every other mode blends
-/// the same way whatever the face is.
-const FACE_SENSITIVE_MODES: [i64; 3] = [OM_ALPHA, OM_ADD_ALPHA, OM_OPAQUE];
+/// The blend the operation mode and the draw face select.
+///
+/// The mode is the one the engine's blend table takes; the face selects the
+/// method through the destination's stored alpha, and the copy of an opaque
+/// source reads the source as an opaque image.
+fn blit_method(mode: i64, face: i64) -> (i64, DestAlpha, bool) {
+    // The auto mode is the alpha mode before the face is applied, so the
+    // face still selects the method.
+    let mode = if mode == OM_AUTO { OM_ALPHA } else { mode };
+    let face = normalize_draw_face(face);
+    let treat_as_opaque = mode == OM_OPAQUE && face != DF_OPAQUE;
+    (mode, face_dest_alpha(face), treat_as_opaque)
+}
 
 /// Whether the operation mode and the draw face select a blend that is
 /// not implemented.
@@ -609,41 +607,6 @@ fn restore_region_alpha(src: &BitmapState, dst: &mut BitmapState, rect: RectI) {
     }
 }
 
-/// Snapshot the alpha plane of `rect` (used to emulate the reference
-/// `hold_alpha`/`bmCopyOnAlpha` for operations whose L2 primitive has no
-/// `hold_alpha` argument).
-fn snapshot_alpha(bitmap: &BitmapState, rect: RectI) -> Vec<u8> {
-    let Some(r) = layer_ops::intersect(bitmap, rect) else {
-        return Vec::new();
-    };
-    let width = bitmap.width as usize;
-    let mut out = Vec::with_capacity(((r.2 - r.0) * (r.3 - r.1)) as usize);
-    for y in r.1..r.3 {
-        for x in r.0..r.2 {
-            out.push(bitmap.rgba[(y as usize * width + x as usize) * 4 + 3]);
-        }
-    }
-    out
-}
-
-/// Restore an alpha snapshot taken by [`snapshot_alpha`].
-fn restore_alpha(bitmap: &mut BitmapState, rect: RectI, saved: &[u8]) {
-    let Some(r) = layer_ops::intersect(bitmap, rect) else {
-        return;
-    };
-    let width = bitmap.width as usize;
-    let mut index = 0;
-    for y in r.1..r.3 {
-        for x in r.0..r.2 {
-            if let Some(&alpha) = saved.get(index) {
-                bitmap.rgba[(y as usize * width + x as usize) * 4 + 3] = alpha;
-            }
-            index += 1;
-        }
-    }
-    bitmap.mark_dirty();
-}
-
 // ---------------------------------------------------------------------------
 // Static methods
 // ---------------------------------------------------------------------------
@@ -697,9 +660,10 @@ extern "C" fn image_operate_rect(
         if blend_is_unimplemented(mode, face) {
             return Ok(None);
         }
-        let (mode, face_hold) = blit_method(mode, face);
+        let (mode, dst_alpha, treat_as_opaque) = blit_method(mode, face);
         with_two_bitmaps(scene, dst_id, src_id, |dst, src| {
-            layer_ops::operate_rect(
+            layer_ops::operate_rect_on(
+                dst_alpha,
                 dst,
                 dx,
                 dy,
@@ -710,8 +674,9 @@ extern "C" fn image_operate_rect(
                 layer_ops::BlitOptions {
                     mode,
                     opa,
-                    hold_alpha: hda && face_hold,
-                    ..Default::default()
+                    hold_alpha: hda,
+                    treat_as_opaque,
+                    source_over: false,
                 },
             );
         })?;
@@ -781,9 +746,10 @@ extern "C" fn image_operate_stretch(
         if blend_is_unimplemented(mode, face) {
             return Ok(None);
         }
-        let (mode, face_hold) = blit_method(mode, face);
+        let (mode, dst_alpha, treat_as_opaque) = blit_method(mode, face);
         with_two_bitmaps(scene, dst_id, src_id, |dst, src| {
-            layer_ops::stretch_blit_mode(
+            layer_ops::stretch_blit_on(
+                dst_alpha,
                 dst,
                 dest,
                 layer_ops::BlitSource {
@@ -794,8 +760,9 @@ extern "C" fn image_operate_stretch(
                 layer_ops::BlitOptions {
                     mode,
                     opa,
-                    hold_alpha: hda && face_hold,
-                    ..Default::default()
+                    hold_alpha: hda,
+                    treat_as_opaque,
+                    source_over: false,
                 },
             );
         })?;
@@ -878,14 +845,10 @@ extern "C" fn image_operate_affine(
         if blend_is_unimplemented(mode, face) {
             return Ok(None);
         }
-        let (mode, face_hold) = blit_method(mode, face);
-        let hold_alpha = hda && face_hold;
+        let (mode, dst_alpha, treat_as_opaque) = blit_method(mode, face);
         with_two_bitmaps(scene, dst_id, src_id, |dst, src| {
-            // The L2 affine primitive has no `hold_alpha` argument; snapshot
-            // and restore the result region's alpha to emulate the reference
-            // `bmCopyOnAlpha`/`hda` handling.
-            let saved = hold_alpha.then(|| snapshot_alpha(dst, result));
-            layer_ops::affine_blit_clipped(
+            layer_ops::affine_blit_clipped_on(
+                dst_alpha,
                 dst,
                 layer_ops::AffineBlit {
                     corners: [p0, p1, p2],
@@ -900,13 +863,12 @@ extern "C" fn image_operate_affine(
                 layer_ops::BlitOptions {
                     mode,
                     opa,
-                    ..Default::default()
+                    hold_alpha: hda,
+                    treat_as_opaque,
+                    source_over: false,
                 },
                 clip,
             );
-            if let Some(saved) = saved {
-                restore_alpha(dst, result, &saved);
-            }
         })?;
         // The reference `AffineBlt` reports the *clamped clip* as the update
         // rectangle whenever the operation is drawable.

@@ -48,7 +48,7 @@ bookkeeping see them like any other layer bitmap.
 |---|---|
 | `RectI` | a half-open pixel rectangle `[x0, x1) × [y0, y1)` |
 | `BlitSource<'a>` | a source bitmap plus the sub-rectangle a blit reads |
-| `BlitOptions` | the blend state of a blit: `mode`, `opa`, `treat_as_opaque` (the source is read as an opaque image), `hold_alpha` (the destination's alpha is held) |
+| `BlitOptions` | the blend state of a blit: `mode`, `opa`, `treat_as_opaque` (the source is read as an opaque image), `hold_alpha` (the destination's alpha is held), `source_over` (the plain source-over, for the callers that composite rather than blend) |
 | `AffineBlit` | the corner map, resampler and background of `affine_blit` |
 | `GammaAdjust` | the per-channel gamma exponents and floors/ceilings |
 | `NoiseRng` | the deterministic noise generator behind `noise` |
@@ -127,38 +127,51 @@ projection draws the two sources, so nothing is written to a bitmap per tick
   kernels; the additive-alpha conversions otherwise remain explicit
   (`convert_alpha_to_add_alpha`, `convert_add_alpha_to_alpha`).
 * **The blend of a pass is resolved once.** The operation mode and the
-  destination's stored alpha select the kernel, the compatibility layer
-  resolves the draw face's variant of the face-sensitive modes, and the
-  per-pixel loop only applies the resolved kernel. The three face-sensitive
-  modes and the Photoshop family follow the reference's blend shapes
-  (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3401-3410`,
-  `:3499-3507`, `:3555-3558`): the alpha blend takes the destination's
-  alpha into the mix, the channel mix (the Photoshop modes and the opaque
-  face's alpha blend) does not and holds the destination's alpha, the
-  premultiplied over (`AlphaOnAddAlpha`) and the additive-alpha blend
-  (`AddAlphaOnAddAlpha`, `AddAlpha`) follow the additive-alpha destination's
-  model, and the per-channel Photoshop functions are the tree's CPU twins
-  (`reference/cpp/core/visual/gl/blend_functor_c.h:374-660`). The eight modes
-  below the Photoshop family have a kernel each that ports the software
+  destination's stored alpha select the blt method, the method and the
+  opacity select the kernel, and the per-pixel loop only applies the resolved
+  kernel. The resolution follows the reference's two tables: the operation
+  mode and the draw face select the method
+  (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4118-4252`) and the method,
+  the opacity and the hold-alpha flag select the render method
+  (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2396-2459`). The live
+  per-pixel path is the C++ functor set `TVPGL_C_Init` installs
+  (`reference/krkr2/cpp/core/visual/gl/blend_function.cpp:590-684`); the legacy
+  `_c` kernels in `tvpgl.cpp` are dead in that tree — their registration
+  blocks are `#if 0`
+  (`reference/krkr2/cpp/core/visual/tvpgl.cpp:13847-13882`) — so the functors
+  are the oracle. The alpha blend on an alpha destination takes the
+  destination's alpha into the mix through the opacity-on-opacity table, the
+  channel mix (the Photoshop family and the opaque face's alpha blend) does
+  not and holds the destination's alpha, the premultiplied over
+  (`AlphaOnAddAlpha`) and the additive-alpha blend (`AddAlphaOnAddAlpha`,
+  `AddAlpha`) follow the additive-alpha destination's model, and the
+  per-channel Photoshop functions are the tree's CPU twins
+  (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:374-660`). The eight
+  modes below the Photoshop family have a kernel each that ports the software
   renderer's functor for that mode (§[The non-Photoshop operation
   modes](#the-non-photoshop-operation-modes)).
+* **The kernels run on the 32-bit ARGB word with unsigned arithmetic.** A
+  channel mix borrows across the red and blue lanes and every shift is
+  logical, so the port keeps the reference's word arithmetic instead of
+  computing the channels one by one: a per-lane formula can differ from the
+  reference by more than one level, because the borrow changes the neighbouring
+  lane.
 
 ### The blend family and where each formula comes from
 
-The reference has three blend shapes, and the alpha and Photoshop operation
-modes name one of them:
+The reference has four blend shapes, and the operation mode and the draw face
+name one of them:
 
 | shape | what it does | the reference |
 |---|---|---|
-| the alpha-correct source-over | the destination's alpha takes part in the mix and is recomputed from the source's alpha; a channel is `(s*sa*255 + d*da*(255-sa)) / (sa*255 + da*(255-sa))`, divided by that **exact** new alpha and rounded to the nearest 8-bit value | `reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3549-3556` (the CPU twin is `reference/cpp/core/visual/tvpgl.cpp:582-700`) |
-| the channel mix | the source's alpha mixes the colours with `d + ((f - d) * a >> 8)` and the destination's alpha is held | `reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3402-3411`, `:3474-3482` (the CPU twin is `reference/cpp/core/visual/gl/blend_functor_c.h:374-383`) |
-| the copy family | the source replaces the destination, with the destination's alpha copied, held or made opaque | `reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:2986`, `:3141-3147` (the CPU twin is `reference/cpp/core/visual/tvpgl.cpp:3326-3370`) |
+| the alpha blend on an alpha destination | the destination's alpha takes part in the mix: the effective source weight is the opacity-on-opacity table's entry for the source and destination alpha, and the destination's alpha is rewritten with the negative-multiply table | `dest_alpha_op` (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:109-149`), the tables at `reference/krkr2/cpp/core/visual/tvpgl.cpp:224-301` |
+| the channel mix | the source's alpha mixes the colours with `d + ((f - d) * a >> 8)` and the destination's alpha is held | `alpha_blend_func` (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:67-76`), `ps_alpha_blend_func` (`:374-383`) |
+| the copy family | the source replaces the destination, with the destination's alpha copied, held or made opaque | `const_copy_functor`, `color_copy_functor`, `color_opaque_functor` (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:158-178`) |
+| the constant-alpha blend | the opacity mixes the source's colour into the destination's; the destination's alpha is dropped, or — on an alpha destination — rewritten with the negative-multiply table | `const_alpha_blend_functor` (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:662-671`), `const_alpha_blend_d_functor` (`:708-720`) |
 
-Below the full opacity a copy pass is a blend of its own: the opacity mixes
-the source's colour into the destination's and the destination's alpha is
-held. A pass that reads the source as an opaque image takes the
-alpha-correct source-over instead, so the destination's alpha takes part in
-the mix.
+Below the full opacity a copy pass is the constant-alpha blend, and the
+pass that reads the source as an opaque image takes the constant-alpha blend
+of the alpha destination, so the destination's alpha takes part in the mix.
 
 The per-channel function of every Photoshop mode is the tree's CPU twin, and
 the tables the tree builds at start-up
@@ -169,7 +182,7 @@ formulas:
 |---|---|---|
 | `omPsNormal` | `s` | `reference/cpp/core/visual/gl/blend_functor_c.h:374-383` |
 | `omPsAdditive` | the saturating sum | `reference/cpp/core/visual/gl/blend_functor_c.h:386-397` |
-| `omPsSubtractive` | the saturating difference | `reference/cpp/core/visual/gl/blend_functor_c.h:401-412` |
+| `omPsSubtractive` | the linear burn `max(0, d + s - 255)`: the source is inverted and the difference saturates | `reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:401-412` |
 | `omPsMultiplicative` | `d * s >> 8` | `reference/cpp/core/visual/gl/blend_functor_c.h:416-426` |
 | `omPsScreen` | `d + s - (d * s >> 8)` | `reference/cpp/core/visual/gl/blend_functor_c.h:430-445` |
 | `omPsOverlay` | `(s * d * 2) / 255` below the midpoint, `(s + d) * 2 - (s * d * 2) / 255 - 255` above it | `reference/cpp/core/visual/gl/blend_functor_c.h:512-533`, the table at `reference/cpp/core/visual/gl/blend_function.cpp:539-542` |
@@ -204,7 +217,7 @@ dispatch on the opacity kept:
 |---|---|---|
 | `omAdditive` | the saturating `d + s` at the full opacity, the saturating `d + ((s * opa) >> 8)` below it | `add_blend_functor` / `add_blend_func` (`reference/cpp/core/visual/gl/blend_functor_c.h:182-198`) |
 | `omSubtractive` | `max(0, d - (255 - s))` at the full opacity, `max(0, d - (((255 - s) * opa) >> 8))` below it | `sub_blend_functor` / `sub_blend_func` (`:202-217`) |
-| `omMultiplicative` | `(d * s) >> 8` at the full opacity, `(d * (255 - (((255 - s) * opa) >> 8))) >> 8` below it | `mul_blend_functor` / `mul_blend_func` (`:222-240`) |
+| `omMultiplicative` | `(d * s) >> 8` at the full opacity, `(d * (255 - (((255 - s) * opa) >> 8))) >> 8` below it; without the hold-alpha flag the kernel returns a 24-bit word, so the destination's alpha becomes zero | `mul_blend_functor` / `mul_blend_func` (`:222-240`), the method table at `reference/krkr2/cpp/core/visual/RenderManager.cpp:2405` |
 | `omDodge` | `(d * 65536 / (255 - s')) >> 8` with the reciprocal 65536 at `s' = 255`, where `s' = s` at the full opacity and `s' = (s * opa) >> 8` below it | `color_dodge_blend_functor` / `color_dodge_blend_func` (`:243-263`) |
 | `omDarken` | `min(d, s)` at the full opacity, `d + (((min(d, s) - d) * opa) >> 8)` below it | `darken_blend_functor` / `darken_blend_func` (`:268-292`) |
 | `omLighten` | `max(d, s)` at the full opacity, `d + (((max(d, s) - d) * opa) >> 8)` below it | `lighten_blend_functor` / `lighten_blend_func` (`:297-322`) |
@@ -213,9 +226,13 @@ dispatch on the opacity kept:
 
 Every one of the eight kernels evaluates its functor's integer expressions
 exactly, including the dispatch between the plain and the faded variant at the
-full opacity, and every one holds the destination's alpha, because the
-registered methods are the HDA variants
-(`reference/cpp/core/visual/gl/blend_variation.h:84-105`).
+full opacity, and every one but the multiplicative holds the destination's
+alpha, because the registered methods are the HDA variants
+(`reference/krkr2/cpp/core/visual/gl/blend_variation.h:84-105`). The
+multiplicative is the exception: the method table registers the non-HDA
+kernel for the plain hold argument and the HDA one for the hold argument
+(`reference/krkr2/cpp/core/visual/RenderManager.cpp:2405`), and the non-HDA
+kernel returns a 24-bit word.
 
 **The graphics path is an approximation of the same curves.** Its programs
 (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3586-3692`) mix in
@@ -262,17 +279,17 @@ values from it.
 * **A one-to-one stretch is a blit.** When the source and destination rects
   have the same extent and the resampler is one of the exact-at-integer kinds,
   the stretch maps each destination pixel to the matching source texel. It
-  routes to the clipped copy for Copy mode and to the source-over blit for
-  SourceOver mode instead of the float resampler. The copy shortcut does not
-  serve a pass that reads the source as an opaque image: it writes the
-  source's own alpha where that pass writes an opaque one.
+  routes to the clipped copy for the copy mode instead of the float
+  resampler. The copy shortcut does not serve a pass that reads the source as
+  an opaque image: it writes the source's own alpha where that pass writes an
+  opaque one.
 * The `simd-experiment` feature adds an exact source-over row fast path for
-  `operateRect`: a 16-pixel block whose source alpha is all 255 copies, a
-  block whose alpha is all 0 leaves the destination alone, and a row with
-  partial alpha is split into exact runs and only its partial pixels take the
-  scalar blend. The pass only applies at `opa == 255`, without `hold_alpha`,
-  and when the source rectangle is fully in bounds. It is enabled by default
-  in the app build; the scalar loop is the A/B baseline.
+  the source-over blit: a 16-pixel block whose source alpha is all 255
+  copies, a block whose alpha is all 0 leaves the destination alone, and a
+  row with partial alpha is split into exact runs and only its partial pixels
+  take the scalar blend. The pass only applies at `opa == 255`, without
+  `hold_alpha`, and when the source rectangle is fully in bounds. It is
+  enabled by default in the app build; the scalar loop is the A/B baseline.
 * **The source rectangle is half-open**, and a source region that leaves the
   source bitmap contributes nothing rather than a repeated edge pixel.
 * **`blit_plane` with both plane bits is a straight copy**, not a blend: the

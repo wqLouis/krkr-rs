@@ -1,12 +1,19 @@
 //! Reference-behaviour tests for the layer's operation-mode blends.
 //!
-//! The reference has two blend shapes: the alpha blend that takes the
-//! destination's alpha into the mix
-//! (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3549-3556`) and the
-//! channel mix that does not
-//! (`:3402-3411`, `:3474-3482`). The operation mode and the draw face
-//! select between them
-//! (`reference/cpp/core/visual/LayerIntf.cpp:4118-4271`).
+//! The live per-pixel path of the reference is the C++ functor set that
+//! `TVPGL_C_Init` installs
+//! (`reference/krkr2/cpp/core/visual/gl/blend_function.cpp:590-684`): the
+//! kernels live in `gl/blend_functor_c.h`, the alpha-variation wrappers in
+//! `gl/blend_variation.h` and the premultiplied helpers in
+//! `gl/blend_util_func.h`. The legacy `_c` kernels in `tvpgl.cpp` are dead
+//! in that tree — their registration blocks are `#if 0`
+//! (`reference/krkr2/cpp/core/visual/tvpgl.cpp:13847-13882`) — so the
+//! functors are the oracle.
+//!
+//! The operation mode and the draw face select the blend method
+//! (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4118-4252`), and the
+//! software renderer's method table picks the kernel of that method
+//! (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2396-2459`).
 //!
 //! The tests drive the real script surface: they create layers through the
 //! VM, run `operateRect` and read the pixels the operation leaves behind.
@@ -35,9 +42,9 @@ fn layer_pixel(env: &Env, index: usize, x: usize, y: usize) -> [u8; 4] {
 /// Reference: the Photoshop normal blend is the tree's "PsAlphaBlend": the
 /// source's alpha mixes the colours, the destination's alpha is held and the
 /// mix carries no alpha correction
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3474-3482`; the CPU
-/// twin is `d + ((s - d) * a >> 8)`,
-/// `reference/cpp/core/visual/gl/blend_functor_c.h:374-383`).
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2425-2426`; the CPU
+/// kernel is `ps_alpha_blend_func`,
+/// `reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:374-383`).
 #[test]
 fn the_photoshop_normal_blend_mixes_without_an_alpha_correction() {
     let _lock = vm_lock();
@@ -60,9 +67,11 @@ fn the_photoshop_normal_blend_mixes_without_an_alpha_correction() {
 
 /// Reference: the opaque face's alpha blend is the tree's "AlphaBlend", whose
 /// kernel is the one the Photoshop normal blend uses
-/// (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3402-3411`); the
-/// alpha face's is the tree's "AlphaBlend_d", which takes the destination's
-/// alpha into the mix (`:3549-3556`).
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:67-76`); the
+/// alpha face's is the tree's "AlphaBlend_d", whose kernel reads the
+/// destination's alpha through the opacity-on-opacity table
+/// (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:109-149`,
+/// `reference/krkr2/cpp/core/visual/tvpgl.cpp:224-301`).
 #[test]
 fn the_draw_face_selects_the_blend_of_the_alpha_mode() {
     let _lock = vm_lock();
@@ -85,15 +94,17 @@ fn the_draw_face_selects_the_blend_of_the_alpha_mode() {
     // The opaque face mixes without an alpha correction and holds the
     // destination's alpha.
     assert_eq!(layer_pixel(&env, 1, 0, 0), [127, 127, 0, 128]);
-    // The alpha face takes the destination's alpha into the mix:
-    // `d.a = 128 + 128 - 128 * 128 / 255 = 191` and the green channel
-    // becomes `255 * 128 / 191 = 170`.
-    assert_eq!(layer_pixel(&env, 2, 0, 0), [85, 170, 0, 191]);
+    // The alpha face reads the destination's alpha: the weight of the two
+    // alphas of 128 is `255 * 128 / 255 = 127`, so the red channel is
+    // `0 + ((255 - 0) * 127 >> 8) = 126` and the green channel
+    // `255 + ((0 - 255) * 127 >> 8) = 128`; the destination's alpha becomes
+    // `255 - (255 - 128) * (255 - 128) / 255 = 192`.
+    assert_eq!(layer_pixel(&env, 2, 0, 0), [85, 169, 0, 192]);
 }
 
 /// Reference: the alpha blend mixes with the *new* alpha, so a translucent
 /// source over an identically translucent destination keeps the colour both
-/// operands share (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3549-3556`).
+/// operands share (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:109-149`).
 #[test]
 fn the_alpha_blend_keeps_the_colour_of_a_translucent_destination() {
     let _lock = vm_lock();
@@ -108,13 +119,14 @@ fn the_alpha_blend_keeps_the_colour_of_a_translucent_destination() {
          dst.fillRect(0, 0, 4, 4, 0x1affcccc); \
          dst.operateRect(0, 0, src, 0, 0, 1, 1, omAlpha);",
     );
-    // `d.a = 26 + 26 - 26 * 26 / 255 = 49` and the mix factor is
-    // `26 / 49.35`, so every channel keeps the value both operands share.
-    assert_eq!(layer_pixel(&env, 1, 0, 0), [255, 204, 204, 49]);
+    // The weight of the two alphas of 26 is `255 * 26 / 52 = 127`, and the
+    // destination's alpha becomes `255 - (255 - 26) * (255 - 26) / 255 = 50`,
+    // so every channel keeps the value both operands share.
+    assert_eq!(layer_pixel(&env, 1, 0, 0), [255, 204, 204, 50]);
 }
 
 /// Reference: the overlay is the tree's overlay table
-/// (`reference/cpp/core/visual/gl/blend_function.cpp:539-542`): below the
+/// (`reference/krkr2/cpp/core/visual/gl/blend_function.cpp:539-542`): below the
 /// midpoint `(s * d * 2) / 255` and above it
 /// `(s + d) * 2 - (s * d * 2) / 255 - 255`.
 #[test]
@@ -140,7 +152,7 @@ fn the_overlay_blend_applies_the_reference_table() {
 }
 
 /// Reference: the tree rejects an operation mode it does not know
-/// (`reference/cpp/core/visual/LayerIntf.cpp:4236-4241`), so the operation
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:4236-4241`), so the operation
 /// raises instead of blending with another mode.
 #[test]
 fn an_unknown_operation_mode_is_rejected() {

@@ -11,11 +11,6 @@
 //!
 //! Known reference divergences that **cannot** be fixed inside the audited
 //! files (documented here so the exclusions are visible):
-//! * `Layer.type` round-trips the raw `tTVPLayerType` for every bitmap blend
-//!   (1-5, 8-28) through the generic `BlendMode`
-//!   (`LayerIntf.cpp:10832-10846`); only `ltBinder` (0), `ltEffect` (6) and
-//!   `ltFilter` (7), container/callback types with no generic bitmap blend,
-//!   read back as `ltAlpha` (2). The round-trip is pinned below.
 //! * The reference `dtNone` … `dtDBD3D` members are reachable through an
 //!   *instance* as well (`tTJSNativeClass` member fallback); the port
 //!   registers them as class (static) members only, because adding
@@ -370,9 +365,7 @@ fn lock_touch_size_requires_two_arguments() {
 /// `SetType` `LayerIntf.cpp:1687-1700`) and the getter writes a
 /// `tjs_int` — an **Integer**, never a real. Every blend spelling
 /// round-trips, including the Photoshop spellings that share a formula with a
-/// non-Photoshop type; `ltBinder`/`ltEffect`/`ltFilter` are containers and
-/// callbacks rather than bitmap blends and read back as `ltAlpha`. See the
-/// file header.
+/// non-Photoshop type.
 #[test]
 fn layer_type_round_trips_every_blend_spelling_as_an_integer() {
     let _lock = vm_lock();
@@ -391,6 +384,74 @@ fn layer_type_round_trips_every_blend_spelling_as_an_integer() {
             "layer type {value} must round-trip as an Integer"
         );
     }
+}
+
+/// Reference: `SetType` stores the number the script wrote
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:1687-1700`) and the
+/// getter writes that number back
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:10832-10838`), so a value
+/// that names no type reads back as it was written. The display type — the
+/// one the draw face and the operation mode follow — only changes for the
+/// types the setter knows: `ltEffect` and `ltFilter` display as the binder
+/// type (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:1738-1752`), whose
+/// operation mode is the opaque one
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:1621-1683`).
+#[test]
+fn layer_type_reads_back_the_number_the_script_wrote() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    layer_with_image(&env, 1, 1);
+    // A value that names no type is stored and read back unchanged.
+    env.run("l.type = 99;");
+    assert_eq!(
+        env.eval("l.type").expect("type read"),
+        TjsValue::Integer(99)
+    );
+    // The container and callback types keep their own number.
+    for value in [0, 6, 7] {
+        env.run(&format!("l.type = {value};"));
+        assert_eq!(
+            env.eval("l.type").expect("type read"),
+            TjsValue::Integer(value),
+            "layer type {value} must read back as itself"
+        );
+    }
+}
+
+/// Reference: the automatic operation mode follows the source layer's
+/// display type (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:1621-1683`,
+/// `reference/krkr2/cpp/core/visual/LayerIntf.cpp:8963-8991`): the binder,
+/// the effect and the filter types display as the binder, whose operation
+/// mode is the opaque one. The opaque mode copies the source as an opaque
+/// image (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:174-178`),
+/// so the destination's alpha becomes opaque; the alpha mode reads the
+/// destination's alpha instead
+/// (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:109-149`).
+#[test]
+fn the_automatic_mode_follows_the_source_layers_display_type() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var src = new Layer(w, null); \
+         src.setImageSize(1, 1); \
+         src.fillRect(0, 0, 1, 1, 0x80ff0000); \
+         var dst = new Layer(w, null); \
+         dst.setImageSize(1, 1); \
+         dst.fillRect(0, 0, 1, 1, 0x400000ff);",
+    );
+    // The alpha type's mode reads the destination's alpha: it becomes
+    // `255 - (255 - 64) * (255 - 128) / 255 = 160`.
+    env.run("src.type = ltAlpha;");
+    env.run("dst.operateRect(0, 0, src, 0, 0, 1, 1, omAuto);");
+    assert_eq!(env.eval_int("dst.getMaskPixel(0, 0)"), 160);
+    // The effect type displays as the binder, whose mode is the opaque one:
+    // the source is copied as an opaque image and the destination's alpha
+    // becomes opaque.
+    env.run("src.type = ltEffect;");
+    env.run("dst.fillRect(0, 0, 1, 1, 0x400000ff);");
+    env.run("dst.operateRect(0, 0, src, 0, 0, 1, 1, omAuto);");
+    assert_eq!(env.eval_int("dst.getMaskPixel(0, 0)"), 255);
 }
 
 // ---------------------------------------------------------------------------

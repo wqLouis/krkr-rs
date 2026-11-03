@@ -113,7 +113,7 @@ pub(crate) mod layer_ops {
         copy_9patch, do_gray_scale, ensure_transition_display, ensure_transition_self_image,
         fill_color_hold_alpha, fill_color_on_add_alpha, fill_color_on_alpha, fill_mask, flip_lr,
         flip_ud, gaussian_blur, intersect, intersect_rect, light_contrast, operate_rect,
-        operate_rect_on, remove_const_opacity, render_layer_subtree, stretch_blit_mode,
-        stretch_blit_on, stretch_blit_plane,
+        operate_rect_on, remove_const_opacity, render_layer_subtree, stretch_blit_on,
+        stretch_blit_plane,
     };
 }

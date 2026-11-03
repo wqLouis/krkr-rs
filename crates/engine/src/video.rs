@@ -929,6 +929,7 @@ pub fn blit_frame_to_layer_opacity(
                 opa: opacity,
                 treat_as_opaque: false,
                 hold_alpha: false,
+                source_over: false,
             },
         );
     } else {
