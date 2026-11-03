@@ -2626,7 +2626,7 @@ fn draw_node(
 /// interpolated corner colour.
 ///
 /// The corner colours keep the channel order their packed word stores them in,
-/// and the scene's channels take them in the order the reference multiplies
+/// and the scene's channels take them in the order the multiplication pairs
 /// them: the scene's red channel takes the word's third byte, its green the
 /// second, its blue the first and its alpha the high byte.
 fn compose_tint(node: [[u8; 4]; 4], diffuse: [u8; 4]) -> [[u8; 4]; 4] {
