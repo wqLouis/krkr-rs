@@ -434,6 +434,11 @@ namespace TJS {
         tTJSSymbolData *FindOwn(const tjs_char *name, tjs_uint32 *hint);
         // Finds Name in this object's own table only.
 
+        iTJSDispatch2 *MemberObjThis(iTJSDispatch2 *objthis);
+        // The object a member of this object belongs to: a shared class
+        // member belongs to this object, the way the members a class copies
+        // into its instances do.
+
         void MaterializeMemberTemplate();
         // Copies the shared class members into this object's own table and
         // detaches the template.

@@ -469,7 +469,7 @@ namespace TJS {
 
         tTJSCustomObject *dsp = CreateBaseTJSObject();
 
-        tjs_error hr;
+        tjs_error hr = TJS_S_OK;
         try {
             // set object type for debugging
             if(TJSObjectHashMapEnabled())
@@ -486,9 +486,6 @@ namespace TJS {
             tTJSCustomObject *template_members = GetInstanceMemberTemplate();
             if(template_members && template_members->Count > 0)
                 dsp->SetMemberTemplate(template_members);
-
-            if(TJS_FAILED(hr))
-                return hr;
 
             if(superinst != nullptr) {
                 tTJSVariant param(superinst, superinst);

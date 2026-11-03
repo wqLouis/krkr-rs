@@ -1175,6 +1175,16 @@ namespace TJS {
     }
 
     //---------------------------------------------------------------------------
+    iTJSDispatch2 *tTJSCustomObject::MemberObjThis(iTJSDispatch2 *objthis) {
+        // The object a member of this object belongs to.
+        //
+        // A shared class member belongs to the object that holds it: it is
+        // used with this object as its "objthis", the way the members a
+        // class copies into its instances do.
+        return MemberFoundInTemplate ? this : objthis;
+    }
+
+    //---------------------------------------------------------------------------
     tTJSCustomObject::tTJSSymbolData *
     tTJSCustomObject::FindOwn(const tjs_char *name, tjs_uint32 *hint) {
         // Search an element named "name" in this object's own table.
@@ -1839,7 +1849,7 @@ namespace TJS {
         if(!data)
             return TJS_E_MEMBERNOTFOUND; // not found
 
-        return TJSDefaultInvalidate(flag, GetValue(data), objthis);
+        return TJSDefaultInvalidate(flag, GetValue(data), MemberObjThis(objthis));
     }
 
     //---------------------------------------------------------------------------
@@ -1884,7 +1894,7 @@ namespace TJS {
         if(!data)
             return TJS_E_MEMBERNOTFOUND; // not found
 
-        return TJSDefaultIsValid(flag, GetValue(data), objthis);
+        return TJSDefaultIsValid(flag, GetValue(data), MemberObjThis(objthis));
     }
 
     //---------------------------------------------------------------------------
@@ -1935,7 +1945,7 @@ namespace TJS {
             return TJS_E_MEMBERNOTFOUND; // not found
 
         return TJSDefaultCreateNew(flag, GetValue(data), result, numparams,
-                                   param, objthis);
+                                   param, MemberObjThis(objthis));
     }
     //---------------------------------------------------------------------------
     /*
@@ -2037,7 +2047,8 @@ namespace TJS {
         if(!data)
             return TJS_E_MEMBERNOTFOUND; // not found
 
-        return TJSDefaultIsInstanceOf(flag, GetValue(data), classname, objthis);
+        return TJSDefaultIsInstanceOf(flag, GetValue(data), classname,
+                                      MemberObjThis(objthis));
     }
 
     //---------------------------------------------------------------------------
@@ -2130,6 +2141,16 @@ namespace TJS {
 
         if(!data)
             return TJS_E_MEMBERNOTFOUND; // not found
+
+        if(MemberFoundInTemplate) {
+            // The shared class member is copied into this object's table
+            // before it is operated on: the operation acts on this object's
+            // own member, with this object as its "objthis".
+            MaterializeMemberTemplate();
+            data = Find(membername, hint);
+            if(!data)
+                return TJS_E_MEMBERNOTFOUND; // not found
+        }
 
         if(GetValue(data).Type() == tvtObject) {
             tjs_error hr;
