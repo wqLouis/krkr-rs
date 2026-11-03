@@ -16,6 +16,7 @@
 //   4  darken               11  overlay
 //   5  darken (Photoshop)   12  hard light
 //   6  lighten              13  soft light
+//  14  Photoshop subtractive (the linear burn)
 //
 // The source tint carries the node's colour only; the composed opacity
 // travels in its own push constant, because the blend functions mix the
@@ -92,11 +93,15 @@ void main() {
         vec3 sd = source.rgb * d;
         vec3 k = step(0.5, source.rgb) * ((source.rgb + d) * 2.0 - sd * 4.0 - 1.0) + sd * 2.0;
         rgb = mix(d, k, factor);
-    } else {
+    } else if (pc.mode == 13u) {
         // Soft light.
         vec3 t = 0.5 / (source.rgb + 0.001);
         vec3 k = pow(d, (1.0 - step(0.5, source.rgb)) * ((1.0 - source.rgb) * 2.0 - t) + t);
         rgb = mix(d, k, factor);
+    } else {
+        // Photoshop subtractive: the linear burn. The source is inverted and
+        // the difference saturates, so the channel is `max(0, dst + src - 1)`.
+        rgb = mix(d, clamp(d + source.rgb - 1.0, 0.0, 1.0), factor);
     }
 
     out_color = vec4(rgb, destination.a);

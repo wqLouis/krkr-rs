@@ -15,3 +15,10 @@ fn destination_dependent_wraps_dst_blend() {
     assert!(!BlendMode::Multiply.is_destination_dependent());
     assert_eq!(BlendMode::Multiply.dst_blend(), None);
 }
+
+/// The Photoshop subtractive blend is the linear burn, so it reads the
+/// destination as the destination-dependent modes do.
+#[test]
+fn the_photoshop_subtractive_blend_reads_the_destination() {
+    assert!(BlendMode::PsSubtractive.is_destination_dependent());
+}

@@ -73,8 +73,10 @@ pub enum BlendMode {
     /// Photoshop additive: the per-channel sum is saturated before the source
     /// alpha blends it over the destination.
     PsAdditive,
-    /// Photoshop subtractive: the per-channel difference is clamped before the
-    /// source alpha blends it over the destination.
+    /// Photoshop subtractive: the linear burn `max(0, dst + src - 1)`, clamped
+    /// before the source alpha blends it over the destination. The source is
+    /// inverted and the difference saturates, so the mode reads the
+    /// destination.
     PsSubtractive,
     /// Photoshop multiplicative: `src·dst`, then source-alpha blended.
     PsMultiplicative,
@@ -87,12 +89,16 @@ pub enum BlendMode {
 impl BlendMode {
     /// Returns `true` if this mode needs to read the destination and
     /// therefore requires the destination-dependent shader path.
+    ///
+    /// The Photoshop subtractive blend is a linear burn, so it reads the
+    /// destination as the [`DestinationDependent`](Self::DestinationDependent)
+    /// modes do.
     pub const fn is_destination_dependent(&self) -> bool {
-        matches!(self, Self::DestinationDependent(_))
+        matches!(self, Self::DestinationDependent(_) | Self::PsSubtractive)
     }
 
     /// Returns the wrapped [`DstBlend`] when this is a
-    /// destination-dependent mode.
+    /// [`DestinationDependent`](Self::DestinationDependent) mode.
     pub const fn dst_blend(&self) -> Option<DstBlend> {
         match self {
             Self::DestinationDependent(mode) => Some(*mode),

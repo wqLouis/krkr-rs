@@ -338,12 +338,16 @@ pub(crate) fn blend_slot(mode: BlendMode) -> Option<usize> {
         BlendMode::Replace => Some(1),
         // Slot 2 is `src·a + dst` while the Photoshop additive blend is
         // `lerp(dst, min(1, dst+src), a)`; they differ only at the saturation
-        // boundary (slot 3 likewise at the clamp boundary for the Photoshop
-        // subtractive blend). Reusing the slots is the same near-identical
+        // boundary. Reusing the slot is the same near-identical
         // approximation the multiplicative/screen arms make, and it keeps a
         // layer that rendered before from failing the frame.
         BlendMode::Additive | BlendMode::PsAdditive => Some(2),
-        BlendMode::Subtractive | BlendMode::PsSubtractive => Some(3),
+        // The subtractive blend is the saturating difference `dst - src·a`.
+        // The Photoshop subtractive blend is the linear burn, which no
+        // fixed-function blend state expresses: the destination-dependent
+        // program computes it from the destination it samples.
+        BlendMode::Subtractive => Some(3),
+        BlendMode::PsSubtractive => None,
         BlendMode::AddAlpha => Some(4),
         // The Photoshop multiplicative/screen fixed-function slots carry the
         // same per-channel blend function; the source-alpha weighting applied
@@ -361,22 +365,42 @@ pub(crate) fn blend_slot(mode: BlendMode) -> Option<usize> {
 /// The program's switch implements the same set; every mode has an index of
 /// its own, and the index travels in the push constants. The order matches
 /// the shader's `shaders/dst_blend.frag`.
-pub(crate) const fn dst_blend_mode(kind: DstBlend) -> u32 {
-    match kind {
-        DstBlend::ColorDodge => 0,
-        DstBlend::PsColorDodge => 1,
-        DstBlend::ColorDodge5 => 2,
-        DstBlend::ColorBurn => 3,
-        DstBlend::Darken => 4,
-        DstBlend::PsDarken => 5,
-        DstBlend::Lighten => 6,
-        DstBlend::PsLighten => 7,
-        DstBlend::Difference => 8,
-        DstBlend::Difference5 => 9,
-        DstBlend::Exclusion => 10,
-        DstBlend::Overlay => 11,
-        DstBlend::HardLight => 12,
-        DstBlend::SoftLight => 13,
+///
+/// `None` means the mode has a fixed-function slot and never reaches the
+/// destination-dependent program.
+pub(crate) const fn dst_blend_mode(mode: BlendMode) -> Option<u32> {
+    match mode {
+        BlendMode::DestinationDependent(kind) => Some(match kind {
+            DstBlend::ColorDodge => 0,
+            DstBlend::PsColorDodge => 1,
+            DstBlend::ColorDodge5 => 2,
+            DstBlend::ColorBurn => 3,
+            DstBlend::Darken => 4,
+            DstBlend::PsDarken => 5,
+            DstBlend::Lighten => 6,
+            DstBlend::PsLighten => 7,
+            DstBlend::Difference => 8,
+            DstBlend::Difference5 => 9,
+            DstBlend::Exclusion => 10,
+            DstBlend::Overlay => 11,
+            DstBlend::HardLight => 12,
+            DstBlend::SoftLight => 13,
+        }),
+        // The Photoshop subtractive blend is the linear burn, which no
+        // fixed-function blend state expresses, so the program computes it
+        // from the destination it samples.
+        BlendMode::PsSubtractive => Some(14),
+        BlendMode::SourceOver
+        | BlendMode::Replace
+        | BlendMode::Additive
+        | BlendMode::Subtractive
+        | BlendMode::AddAlpha
+        | BlendMode::Multiply
+        | BlendMode::Screen
+        | BlendMode::PsNormal
+        | BlendMode::PsAdditive
+        | BlendMode::PsMultiplicative
+        | BlendMode::PsScreen => None,
     }
 }
 
@@ -902,30 +926,44 @@ mod tests {
     /// two modes sharing an index would draw the same function.
     #[test]
     fn every_destination_dependent_blend_has_a_mode_of_its_own() {
-        let kinds = [
-            DstBlend::ColorDodge,
-            DstBlend::PsColorDodge,
-            DstBlend::ColorDodge5,
-            DstBlend::ColorBurn,
-            DstBlend::Darken,
-            DstBlend::PsDarken,
-            DstBlend::Lighten,
-            DstBlend::PsLighten,
-            DstBlend::Difference,
-            DstBlend::Difference5,
-            DstBlend::Exclusion,
-            DstBlend::Overlay,
-            DstBlend::HardLight,
-            DstBlend::SoftLight,
+        let blends = [
+            BlendMode::DestinationDependent(DstBlend::ColorDodge),
+            BlendMode::DestinationDependent(DstBlend::PsColorDodge),
+            BlendMode::DestinationDependent(DstBlend::ColorDodge5),
+            BlendMode::DestinationDependent(DstBlend::ColorBurn),
+            BlendMode::DestinationDependent(DstBlend::Darken),
+            BlendMode::DestinationDependent(DstBlend::PsDarken),
+            BlendMode::DestinationDependent(DstBlend::Lighten),
+            BlendMode::DestinationDependent(DstBlend::PsLighten),
+            BlendMode::DestinationDependent(DstBlend::Difference),
+            BlendMode::DestinationDependent(DstBlend::Difference5),
+            BlendMode::DestinationDependent(DstBlend::Exclusion),
+            BlendMode::DestinationDependent(DstBlend::Overlay),
+            BlendMode::DestinationDependent(DstBlend::HardLight),
+            BlendMode::DestinationDependent(DstBlend::SoftLight),
+            // The Photoshop subtractive blend is the linear burn, so it reads
+            // the destination like the destination-dependent modes do.
+            BlendMode::PsSubtractive,
         ];
         let mut modes: Set<u32> = Set::default();
-        for kind in kinds {
-            let mode = dst_blend_mode(kind);
+        for blend in blends {
+            let mode = dst_blend_mode(blend).expect("a destination-dependent blend has a mode");
             assert!(
                 modes.insert(mode),
-                "the mode {kind:?} reuses the index {mode}"
+                "the blend {blend:?} reuses the index {mode}"
             );
         }
-        assert_eq!(modes.len(), kinds.len());
+        assert_eq!(modes.len(), blends.len());
+    }
+
+    /// The Photoshop subtractive blend has no fixed-function slot.
+    ///
+    /// The linear burn reads the destination, so the destination-dependent
+    /// program draws it; the non-Photoshop subtractive blend keeps the
+    /// fixed-function subtract slot.
+    #[test]
+    fn the_photoshop_subtractive_blend_has_no_fixed_function_slot() {
+        assert_eq!(blend_slot(BlendMode::PsSubtractive), None);
+        assert_eq!(blend_slot(BlendMode::Subtractive), Some(3));
     }
 }

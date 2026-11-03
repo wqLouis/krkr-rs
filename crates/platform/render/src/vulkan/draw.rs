@@ -476,7 +476,7 @@ impl Recorder<'_> {
                     return Ok(());
                 }
                 let uv = uv_rect(texture.width(), texture.height(), node.src);
-                if let Some(kind) = node.blend.dst_blend() {
+                if node.blend.is_destination_dependent() {
                     // The destination-dependent route: the source is blended
                     // over a copy of the destination in the program's shader.
                     let tint = self.source_tint(node.color);
@@ -487,7 +487,6 @@ impl Recorder<'_> {
                         uv,
                         tint,
                         opacity,
-                        kind,
                         scissor,
                     })
                 } else {
@@ -615,9 +614,16 @@ impl Recorder<'_> {
             uv,
             tint,
             opacity,
-            kind,
             scissor,
         } = draw;
+        let Some(mode) = dst_blend_mode(node.blend) else {
+            return Err(RenderError::Unsupported {
+                message: format!(
+                    "the blend mode {:?} does not read the destination",
+                    node.blend
+                ),
+            });
+        };
         let Some(snapshot) = self.snapshot.as_deref_mut() else {
             return Err(RenderError::Unsupported {
                 message: "a destination-dependent blend needs a copy of the destination, which \
@@ -642,7 +648,7 @@ impl Recorder<'_> {
             mvp: to_ndc(world, self.extent),
             tint,
             uv_rect: uv,
-            mode: dst_blend_mode(kind),
+            mode,
             opacity,
             target_size: target_size(self.extent),
         };
@@ -845,8 +851,6 @@ struct DstBlendDraw<'a> {
     tint: [f32; 4],
     /// The composed opacity.
     opacity: f32,
-    /// The destination-dependent blend function.
-    kind: api::blend::DstBlend,
     /// The node's scissor rectangle.
     scissor: vk::Rect2D,
 }

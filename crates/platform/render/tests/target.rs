@@ -233,6 +233,26 @@ fn fixed_function_blends_match_the_baseline() {
     }
 }
 
+/// Reference: the Photoshop subtractive blend is the linear burn: the source
+/// is inverted and the difference saturates, so the channel is
+/// `max(0, d + s - 255)`
+/// (`reference/krkr2/cpp/core/visual/tvpgl.cpp:12565-12572`,
+/// `reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:401-412`). The
+/// GPU's shader computes the same formula
+/// (`reference/krkr2/cpp/core/visual/ogl/RenderManager_ogl.cpp:3723-3727`).
+#[test]
+fn the_photoshop_subtractive_blend_is_a_linear_burn() {
+    // The destination is 204 and the source 102 with an alpha of 128: the
+    // burn is `max(0, 204 + 102 - 255) = 51`, and the source's alpha mixes
+    // it over the destination: `204 + ((51 - 204) * 128 >> 8) = 127`.
+    let out = composite_one_pixel(
+        BlendMode::PsSubtractive,
+        [204.0 / 255.0, 204.0 / 255.0, 204.0 / 255.0, 1.0],
+        [102.0 / 255.0, 102.0 / 255.0, 102.0 / 255.0, 128.0 / 255.0],
+    );
+    assert_eq!(out, [127, 127, 127, 255]);
+}
+
 #[test]
 fn null_capabilities_advertise_the_cpu_target_path() {
     let pipeline = RenderPipeline::null();

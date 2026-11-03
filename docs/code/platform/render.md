@@ -371,11 +371,12 @@ Blend state is not a shader concern; it is a per-pipeline
 | `Multiply` | `DST_COLOR` / `ZERO` / `ADD` |
 | `Screen` | `ONE_MINUS_DST_COLOR` / `ONE` / `ADD` |
 
-The fourteen destination-dependent modes need to read the destination colour,
-which fixed-function blend state cannot express. The Vulkan backend draws them
-with a third program, the **destination blend**: it samples the source and a
-copy of the destination and mixes them itself, so its fixed-function blending
-is disabled and the destination's alpha is held.
+The fifteen destination-dependent modes — the fourteen `DstBlend` functions and
+the Photoshop subtractive blend, which is the linear burn — need to read the
+destination colour, which fixed-function blend state cannot express. The Vulkan
+backend draws them with a third program, the **destination blend**: it samples
+the source and a copy of the destination and mixes them itself, so its
+fixed-function blending is disabled and the destination's alpha is held.
 
 The copy is the offscreen-compositing route — render to a target, copy the
 target content for the quad's `dst` region into a sampled image, and draw with

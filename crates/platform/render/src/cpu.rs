@@ -449,11 +449,12 @@ fn blend_channel(mode: BlendMode, d: f32, s: f32) -> f32 {
     let value = match mode {
         BlendMode::Multiply => d * s,
         BlendMode::Screen => d + s - d * s,
-        // Photoshop additive/subtractive saturate the per-channel sum or
-        // difference before the source alpha blends the result over the
-        // destination.
+        // Photoshop additive saturates the per-channel sum before the source
+        // alpha blends the result over the destination. The Photoshop
+        // subtractive blend is the linear burn: the source is inverted and
+        // the difference saturates, so the channel is `max(0, d + s - 1)`.
         BlendMode::PsAdditive => (d + s).min(1.0),
-        BlendMode::PsSubtractive => (d - s).max(0.0),
+        BlendMode::PsSubtractive => (d + s - 1.0).max(0.0),
         // Photoshop multiplicative/screen share the per-channel blend
         // function of the non-Photoshop modes; only the alpha blend around it
         // differs, and this backend alpha-blends both.
@@ -690,13 +691,17 @@ mod tests {
     }
 
     /// Reference: the Photoshop layer types keep their own compositing
-    /// formula (`reference/cpp/core/visual/tvpgl.cpp:12537-12593`,
+    /// formula (`reference/krkr2/cpp/core/visual/tvpgl.cpp:12537-12593`,
     /// `LayerBitmapIntf.cpp:1740-1763`). `bmPsNormal` is the same alpha blend
-    /// as `bmAlpha`; `bmPsAdditive`/`bmPsSubtractive` saturate the per-channel
-    /// sum/difference **before** the source alpha blends the result over the
-    /// destination; `bmPsMultiplicative`/`bmPsScreen` apply the blend function
-    /// and then the alpha blend. An opaque source isolates the blend function;
-    /// a half-transparent source shows the pre-blend saturation.
+    /// as `bmAlpha`; `bmPsAdditive` saturates the per-channel sum and
+    /// `bmPsSubtractive` is the linear burn — the source is inverted and the
+    /// difference saturates, so the channel is `max(0, d + s - 255)`
+    /// (`reference/krkr2/cpp/core/visual/tvpgl.cpp:12565-12572`,
+    /// `reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:401-412`) — both
+    /// **before** the source alpha blends the result over the destination;
+    /// `bmPsMultiplicative`/`bmPsScreen` apply the blend function and then the
+    /// alpha blend. An opaque source isolates the blend function; a
+    /// half-transparent source shows the pre-blend saturation.
     #[test]
     fn photoshop_blends_match_the_reference_formula() {
         let dst = [0.25, 0.5, 0.75, 1.0];
@@ -707,7 +712,7 @@ mod tests {
         let opaque: &[(BlendMode, [u8; 4])] = &[
             (BlendMode::PsNormal, [191, 128, 77, 255]),
             (BlendMode::PsAdditive, [255, 255, 255, 255]),
-            (BlendMode::PsSubtractive, [0, 0, 115, 255]),
+            (BlendMode::PsSubtractive, [0, 0, 13, 255]),
             (BlendMode::PsMultiplicative, [48, 64, 57, 255]),
             (BlendMode::PsScreen, [207, 191, 210, 255]),
             (
@@ -736,7 +741,7 @@ mod tests {
         let half: &[(BlendMode, [u8; 4])] = &[
             (BlendMode::PsNormal, [140, 140, 140, 255]),
             (BlendMode::PsAdditive, [153, 153, 153, 255]),
-            (BlendMode::PsSubtractive, [26, 26, 26, 255]),
+            (BlendMode::PsSubtractive, [38, 38, 38, 255]),
             (BlendMode::PsMultiplicative, [48, 48, 48, 255]),
             (BlendMode::PsScreen, [143, 143, 143, 255]),
         ];
@@ -753,6 +758,13 @@ mod tests {
         assert_ne!(
             blend_u8(BlendMode::Additive, half_dst, half_src),
             [153, 153, 153, 255]
+        );
+
+        // The Photoshop subtractive blend is the linear burn, so it is not
+        // the non-Photoshop subtractive blend either.
+        assert_ne!(
+            blend_u8(BlendMode::Subtractive, half_dst, half_src),
+            blend_u8(BlendMode::PsSubtractive, half_dst, half_src)
         );
     }
 }
