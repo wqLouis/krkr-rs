@@ -503,6 +503,59 @@ fn exec_storage_executes_compiled_bytecode() {
     assert_eq!(env.eval_ok("bytecode_ran"), TjsValue::Integer(42));
 }
 
+/// A bytecode storage runs **one** script: the reference's loader reads a
+/// single block per file and executes that block. `ReadByteCode` returns one
+/// `tTJSScriptBlock` (`reference/cpp/core/tjs2/tjsByteCodeLoader.cpp:30-73`)
+/// and `LoadByteCode` runs it with `ExecuteTopLevel`
+/// (`reference/cpp/core/tjs2/tjsScriptCache.cpp:199-214`).
+///
+/// The DATA area of such a file holds the compiled script's **constant
+/// pools** — the byte, short, int, int64, double, string and octet arrays
+/// (`reference/cpp/core/tjs2/tjsByteCodeLoader.cpp:75-152`). Its strings are
+/// constants of that one script, not a list of scripts to run: a shipped
+/// title's `patch.tjs` keeps its whole script manifest there, as UTF-16
+/// constants, and the title's runtime loads those scripts one storage at a
+/// time. The fixture names two other storages; running the compiled storage
+/// must define its own variable and leave the named storages alone.
+#[test]
+fn a_bytecode_storage_runs_only_its_own_script() {
+    let _lock = vm_lock();
+    let env = common::Env::with_storage();
+    let other = compile_fixture(
+        &env,
+        "var other_ran = 1;",
+        "data/other_src.tjs",
+        "data/other.tjsb",
+    );
+    let named = compile_fixture(
+        &env,
+        "var named_ran = 1;",
+        "data/named_src.tjs",
+        "data/named.tjsb",
+    );
+    let compiled = compile_fixture(
+        &env,
+        &format!("var manifest = [{other:?}, {named:?}];"),
+        "data/manifest_src.tjs",
+        "data/manifest.tjsb",
+    );
+
+    env.run(&format!("Scripts.execStorage({compiled:?});"));
+
+    // The compiled storage ran its own top level: the array literal with the
+    // two names sits in its DATA area.
+    assert_eq!(env.eval_ok("manifest[0]"), TjsValue::String(other));
+    // The names are constants: the storages they name did not run.
+    assert_eq!(
+        env.eval_ok("typeof global.other_ran"),
+        TjsValue::String("undefined".to_string())
+    );
+    assert_eq!(
+        env.eval_ok("typeof global.named_ran"),
+        TjsValue::String("undefined".to_string())
+    );
+}
+
 /// A precompiled script that fails at run time has no text source to reprint:
 /// the diagnostic names the bytecode path instead of dumping decoded
 /// nonsense. `execStorage` offers the bytes to the loader

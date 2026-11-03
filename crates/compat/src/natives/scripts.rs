@@ -31,6 +31,13 @@
 //! instead of producing mojibake. The `context` argument is the script's
 //! `this`, and `lineofs` the reported line-number offset, both forwarded to
 //! the VM.
+//!
+//! A bytecode storage carries **one** script. The loader reads a single
+//! block per file and executes that block; the file's data area holds the
+//! compiled script's constant pools, and the strings in it are constants of
+//! that one script, not a list of scripts to run: a shipped title's compiled
+//! patch script keeps its whole script manifest there, as UTF-16 constants,
+//! and the title's runtime loads those scripts one storage at a time.
 #![allow(unsafe_code)]
 
 use std::cell::Cell;

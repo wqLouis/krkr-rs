@@ -54,6 +54,13 @@ definition — runs as a script. The TJS2's expression mode compiles the text
 as `return <text>;`, so a script-shaped storage is a grammar error there;
 `evalStorage` runs it as a script instead.
 
+A bytecode storage carries **one** script. The loader reads a single block
+per file and executes that block; the file's data area holds the compiled
+script's **constant pools** — the byte, short, int, int64, double, string and
+octet arrays (`reference/cpp/core/tjs2/tjsByteCodeLoader.cpp:75-152`). Its
+strings are constants of that one script, not a list of scripts to run: a
+shipped title's `patch.tjs` keeps its whole script manifest there, as UTF-16
+constants, and the title's runtime loads those scripts one storage at a time.
 The block name is the **basename** of the requested storage, not the full
 name.
 
