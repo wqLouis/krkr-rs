@@ -29,8 +29,7 @@ The tree is the authority on what TJS means, and the behaviour it defines is
 the behaviour the compatibility layer must reproduce. It is maintained in
 place: the VM is edited there directly and is never regenerated from the
 reference. The reference checkout is read-only material — the behaviour
-oracle — and `scripts/tjs2-diff.sh` prints what the tree has changed against
-it.
+oracle.
 
 ---
 

@@ -1348,8 +1348,7 @@ an allowlist exemption.
   `docs.old/optimization.md`.
 * **Zero-copy image presentation** — uploads use a host-visible staging buffer;
   the surface path needs `AMediaCodec_getOutputImage`, which `ndk` lacks.
-* **C++ `-O2 -flto`** — 89.5% compile / 92.5% exec of `-O2` on the
-  `scripts/perf/` harness, but the objects become LLVM bitcode and only the
+* **C++ `-O2 -flto`** — the objects become LLVM bitcode and only the
   Android link validates it, so it needs a device A/B. `-O3`,
   `-fvisibility=hidden` and `mimalloc` were measured and rejected
   (`docs.old/performance.md` §7).

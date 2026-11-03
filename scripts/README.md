@@ -32,9 +32,31 @@ suites and the CI release pipeline are documented in
 
 - `krkr_gates/` — the package; `cli.py` is the entry point.
 - `krkr_gates/checks/` — one module per check, each exposing `run(argv) -> int`.
-- `fixtures/` — the self-test inputs.
+- `fixtures/` — the checks' own test corpus; see below.
 - `allowlists/` — the reviewed exceptions, one file per check.
 - `pyproject.toml` / `uv.lock` — the project metadata.
+
+### The fixtures are the checks' own tests
+
+Every check carries a `--self-test` that runs it against a small corpus of
+deliberately broken and deliberately clean inputs, so a check that stops
+detecting anything fails the gate instead of passing it silently. The corpus
+lives in `fixtures/`, one directory per check:
+
+- a `bad_*` file is a case the check **must** report — a pointer cast without
+  a safety note, an error swallowed by `unwrap_or`, a layer that reaches into
+  another layer's engine state;
+- a `good_*` file is a case the check **must not** report — the same code with
+  the problem fixed;
+- three checks (`storage-boundary`, `storage-media`, `host-facts`) scan a whole
+  miniature source tree under `fixtures/<check>/tree/` and compare what they
+  find against an `expected.json`, so a file there is a *sample* of the code
+  the check reads, not a file it names individually.
+
+They are therefore not a reference copy of anything: they are the inputs of
+the checks' self-tests, and the gate exercises them on every run
+(`check-host-facts: self-test ok (4 seam(s), 2 unwired in the fixture)`).
+Deleting one makes that check's self-test fail.
 
 ## Checks
 
@@ -91,8 +113,7 @@ fire.
 
 ## Environment
 
-- `KRKR_TEST_GAME` — a game directory for the `real_game`/`boot_game` tests
-  and `scripts/perf/bench-tjs-opt.sh` (the script also takes `--game`).
+- `KRKR_TEST_GAME` — a game directory for the `real_game`/`boot_game` tests.
 - `KRKR_TEST_SAVE` — a real KAG save BMP for the save-fixture test.
 - `KRKR_REPO` — the checkout root; docs use it where a command starts outside
   the repository.
@@ -112,7 +133,3 @@ fire.
 - `surface-lock` regenerates the VM dispatch dump by running the compat
   surface test unless `--no-regen` is given; `--update` rewrites the committed
   baseline and is main-agent only.
-- `tjs2-diff.sh` prints the difference between the C++ TJS2 tree under
-  `crates/tjs/cpp/tjs2/` and the reference checkout. The tree is edited in
-  place and never regenerated from the reference; see
-  [`../docs/rules/gates.md`](../docs/rules/gates.md) §7.

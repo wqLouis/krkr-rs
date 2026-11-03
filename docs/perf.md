@@ -119,7 +119,7 @@ is dominated by compiling and running its scripts.
 
 | lever | state |
 |---|---|
-| the TJS2 C++ flags (`-O3`, `-O2 -flto`) | measured with `scripts/perf/bench-tjs-opt.sh`; the objects become LLVM bitcode and only the Android link validates them, so it needs a device A/B (`TODO.md` §17) |
+| the TJS2 C++ flags (`-O3`, `-O2 -flto`) | the objects become LLVM bitcode and only the Android link validates them, so it needs a device A/B (`TODO.md` §17) |
 | the allocator (`mimalloc`) | measured and rejected (`TODO.md` §17) |
 | the zlib inflate | `flate2` currently inflates with the pure-Rust `miniz_oxide`; the system zlib is typically 1.5–2× faster, and `flate2`'s `zlib` feature would do it — but the feature links the C library, which the Android target would then need |
 | the font registry scan | ~30 ms; a lazy registry would move it out of the startup, at the cost of a script-visible change |

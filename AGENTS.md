@@ -220,8 +220,8 @@ The test suite and the benchmarks use three environment variables —
 A plain build does **not** need the reference checkout (§1.3): the C++ VM is
 vendored under `crates/tjs/cpp/tjs2/`, and that tree is maintained in place
 — the VM is edited there directly and is never regenerated from the
-reference. `scripts/tjs2-diff.sh` reads the reference checkout and prints
-what the tree has changed, when that difference has to be reviewed.
+reference. The reference checkout is read-only material — the
+behaviour oracle — and a change to the tree is an ordinary change here.
 
 ### 1.3 Get the reference
 
