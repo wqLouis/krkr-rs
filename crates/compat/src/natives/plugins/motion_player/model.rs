@@ -119,8 +119,8 @@ pub(crate) struct Frame {
     pub(crate) child_motion: Option<String>,
     /// The blend mode (`bm`).
     pub(crate) blend_mode: i32,
-    /// The four packed vertex colours, each as red, green, blue and alpha
-    /// bytes.
+    /// The four packed vertex colours, each as the four bytes its packed word
+    /// stores, in the word's order.
     pub(crate) colors: [[u8; 4]; 4],
     /// Offset x (`ox`).
     pub(crate) ox: f64,
@@ -251,8 +251,8 @@ pub(crate) struct FrameState {
     pub(crate) opacity: f64,
     /// Blend mode.
     pub(crate) blend_mode: i32,
-    /// The four packed vertex colours, each as red, green, blue and alpha
-    /// bytes.
+    /// The four packed vertex colours, each as the four bytes its packed word
+    /// stores, in the word's order.
     pub(crate) colors: [[u8; 4]; 4],
     /// Source reference.
     pub(crate) src: String,
@@ -1485,9 +1485,9 @@ pub(crate) fn names_first_child(frames: &[Frame], slot: &ChildSlot) -> bool {
 ///
 /// The member is either a dictionary of four packed colours — one per vertex,
 /// keyed `"0"` through `"3"` — or a single packed colour broadcast to all of
-/// them. The packed value carries the red channel in its low byte, the green
-/// channel in the second, the blue channel in the third and the alpha in the
-/// high byte.
+/// them. The packed value keeps the channel order its word stores them in: the
+/// red channel is the third byte, the green the second, the blue the first and
+/// the alpha the high byte.
 fn parse_node_colors(content: &PsbValue) -> [[u8; 4]; 4] {
     let Some(color) = content.get("color") else {
         return DEFAULT_NODE_COLORS;
@@ -1504,7 +1504,10 @@ fn parse_node_colors(content: &PsbValue) -> [[u8; 4]; 4] {
     colors
 }
 
-/// Unpack a `0xAABBGGRR` colour into red, green, blue and alpha bytes.
+/// Unpack a packed colour into the four bytes its word stores.
+///
+/// The bytes keep the word's order: the first, the second, the third and the
+/// high byte. The render maps them onto the scene's channels.
 fn unpack_color(packed: f64) -> [u8; 4] {
     let packed = packed as i64 as u32;
     [
@@ -3128,5 +3131,34 @@ mod tests {
 
     fn node_labels(nodes: &[MotionNode]) -> Vec<&str> {
         nodes.iter().map(|node| node.label.as_str()).collect()
+    }
+
+    /// A node's packed colour keeps the channel order its word stores them in:
+    /// the red channel is the third byte, the green the second, the blue the
+    /// first and the alpha the high byte
+    /// (`reference/cpp/plugins/motionplayer/PlayerInternal.h:1104-1121`).
+    ///
+    /// The default is the word `0xFF808080`, whose bytes are the half-gray
+    /// with an opaque alpha (`reference/cpp/plugins/motionplayer/SourceCache.cpp:50-52`).
+    #[test]
+    fn a_node_colour_keeps_the_word_byte_order() {
+        let red = dict(vec![("color", num(0xFFFF_0000))]);
+        assert_eq!(
+            parse_node_colors(&red),
+            [[0x00, 0x00, 0xFF, 0xFF]; 4],
+            "the packed colour's bytes are the word's own order"
+        );
+        // A colour that is not a member leaves the default alone.
+        let none = dict(vec![]);
+        assert_eq!(
+            parse_node_colors(&none),
+            DEFAULT_NODE_COLORS,
+            "a content without a colour keeps the default"
+        );
+        assert_eq!(
+            DEFAULT_NODE_COLORS,
+            [[0x80, 0x80, 0x80, 0xFF]; 4],
+            "the default is the word 0xFF808080's own bytes"
+        );
     }
 }

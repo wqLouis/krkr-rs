@@ -29,7 +29,7 @@ use super::model::{
     evaluate_frames, names_first_child, prime_timelines, scan_frame_events, step_timelines,
 };
 use super::resource::{MotionStore, ResourceInst};
-use super::texture::{ChunkRequest, IconChunks, Pixels, pixel_offset, pixel_size};
+use super::texture::{ChannelOrder, ChunkRequest, IconChunks, Pixels, pixel_offset, pixel_size};
 use crate::collections::Map;
 use crate::engine_api::layer_ops::{
     AffineBlit, BlitOptions, BlitSource, RectI, affine_blit, fill_mask, intersect_rect,
@@ -2624,9 +2624,18 @@ fn draw_node(
 /// The default half-gray and an opaque-white set mean "no tint" and leave the
 /// source untouched; every other set multiplies the source by the
 /// interpolated corner colour.
+///
+/// The corner colours keep the channel order their packed word stores them in,
+/// and the scene's channels take them in the order the reference multiplies
+/// them: the scene's red channel takes the word's third byte, its green the
+/// second, its blue the first and its alpha the high byte.
 fn compose_tint(node: [[u8; 4]; 4], diffuse: [u8; 4]) -> [[u8; 4]; 4] {
     let neutral = node == DEFAULT_NODE_COLORS || node.iter().all(|corner| *corner == [0xFF; 4]);
-    let mut colors = if neutral { [[0xFF; 4]; 4] } else { node };
+    let mut colors = if neutral {
+        [[0xFF; 4]; 4]
+    } else {
+        node.map(scene_color)
+    };
     if diffuse != [0xFF; 4] {
         for corner in &mut colors {
             for (channel, scale) in corner.iter_mut().zip(diffuse) {
@@ -2635,6 +2644,15 @@ fn compose_tint(node: [[u8; 4]; 4], diffuse: [u8; 4]) -> [[u8; 4]; 4] {
         }
     }
     colors
+}
+
+/// The corner colour in the scene's channel order.
+///
+/// The packed colour holds its channels in the order the word stores them: the
+/// scene's red channel is the word's third byte, its green the second, its
+/// blue the first and its alpha the high byte.
+fn scene_color(color: [u8; 4]) -> [u8; 4] {
+    [color[2], color[1], color[0], color[3]]
 }
 
 /// The cropped icon source tinted by the node colours, from the cache or
@@ -2712,15 +2730,20 @@ fn tint_crop(
         ];
         for (index, pixel) in row.as_chunks::<4>().0.iter().enumerate() {
             let column = i32::try_from(index).ok()?;
+            // A chunk that keeps the order the file stores has its red and
+            // blue channels exchanged when it is copied into a bitmap; a
+            // chunk that already carries the scene's order is copied as it
+            // is. The alpha is the chunk's fourth byte in every case.
+            let (red, green, blue) = match pixels.order {
+                ChannelOrder::File => (pixel[2], pixel[1], pixel[0]),
+                ChannelOrder::Scene => (pixel[0], pixel[1], pixel[2]),
+            };
             rgba.extend_from_slice(&[
-                ((u32::from(pixel[0]) * lerp(left[0] as u8, right[0] as u8, column, span_x))
-                    / divisor)
+                ((u32::from(red) * lerp(left[0] as u8, right[0] as u8, column, span_x)) / divisor)
                     .min(255) as u8,
-                ((u32::from(pixel[1]) * lerp(left[1] as u8, right[1] as u8, column, span_x))
-                    / divisor)
+                ((u32::from(green) * lerp(left[1] as u8, right[1] as u8, column, span_x)) / divisor)
                     .min(255) as u8,
-                ((u32::from(pixel[2]) * lerp(left[2] as u8, right[2] as u8, column, span_x))
-                    / divisor)
+                ((u32::from(blue) * lerp(left[2] as u8, right[2] as u8, column, span_x)) / divisor)
                     .min(255) as u8,
                 ((u32::from(pixel[3]) * lerp(left[3] as u8, right[3] as u8, column, span_x))
                     / divisor)
@@ -4441,6 +4464,117 @@ mod tests {
         bitmap.rgba[(y * 800 + x) * 4 + 3]
     }
 
+    /// The pose of `player` composited into a fresh target, with the storage
+    /// that serves the icon chunks.
+    fn composite_with_storage(player: &mut PlayerInst, storage: &Storage) -> BitmapState {
+        let mut bitmap = BitmapState::new(800, 1080, vec![0u8; 800 * 1080 * 4]);
+        let snapshot = player.snapshot.clone();
+        let color = color_bytes(player.color.bytes);
+        let affine = player.affine;
+        let missing = composite_pose(
+            &mut bitmap,
+            &player.nodes,
+            DrawFrame {
+                snapshot: snapshot.as_deref(),
+                storage: Some(storage),
+                settings: DrawSettings {
+                    color,
+                    affine,
+                    preview: player.preview,
+                    mask_mode: player.mask_mode,
+                },
+                tinted: &mut player.tinted,
+                missing: Vec::new(),
+                pool: None,
+            },
+            (0, 0, 800, 1080),
+        );
+        assert!(missing.is_empty(), "the synthetic icon needs no texture");
+        bitmap
+    }
+
+    /// A node that draws the icon `src/group/art` at (100,100) with the given
+    /// packed vertex colour.
+    ///
+    /// The content's mask carries the colour bit, so the packed colour is
+    /// read, and the blend-mode bit with a `bm` of zero, so the tint uses the
+    /// 255 divisor (`reference/cpp/plugins/motionplayer/PlayerInternal.h:1104-1121`,
+    /// `SourceCache.cpp:719`).
+    fn icon_node(color: i64) -> PsbValue {
+        let content = dict(vec![
+            ("src", text("src/group/art")),
+            ("coord", PsbValue::List(vec![num(100), num(100)])),
+            ("opa", num(255)),
+            ("mask", num(0x200 | 0x20000)),
+            ("bm", num(0)),
+            ("color", num(color)),
+        ]);
+        dict(vec![
+            ("label", text("art")),
+            ("type", num(0)),
+            (
+                "frameList",
+                PsbValue::List(vec![
+                    frame(0, 2, Some(content)),
+                    dict(vec![("time", num(10)), ("type", num(0))]),
+                ]),
+            ),
+        ])
+    }
+
+    /// A motion with one icon node, and the storage that serves the icon's
+    /// pixel chunk.
+    ///
+    /// The chunk holds sixteen pixels whose file bytes are (30,20,10,200):
+    /// the file stores the blue channel first and the red one third, and the
+    /// alpha is the fourth byte
+    /// (`reference/cpp/plugins/motionplayer/SourceCache.cpp:296-305`).
+    fn icon_snapshot(color: i64) -> (MotionSnapshot, Storage) {
+        let mut bytes = Vec::new();
+        for _ in 0..16 {
+            bytes.extend_from_slice(&[30, 20, 10, 200]);
+        }
+        let root = dict(vec![
+            (
+                "source",
+                dict(vec![(
+                    "group",
+                    dict(vec![(
+                        "icon",
+                        dict(vec![(
+                            "art",
+                            dict(vec![
+                                ("width", num(4)),
+                                ("height", num(4)),
+                                ("pixel", PsbValue::Resource(chunk(0))),
+                            ]),
+                        )]),
+                    )]),
+                )]),
+            ),
+            (
+                "object",
+                dict(vec![(
+                    "test",
+                    dict(vec![(
+                        "motion",
+                        dict(vec![(
+                            "intro",
+                            dict(vec![
+                                ("lastTime", num(10)),
+                                ("layer", PsbValue::List(vec![icon_node(color)])),
+                            ]),
+                        )]),
+                    )]),
+                )]),
+            ),
+        ]);
+        let document = Rc::new(container(root, vec![bytes]));
+        let storage = media_storage("test.psb", Rc::clone(&document));
+        let snapshot = MotionSnapshot::from_psb(&document, "test.psb");
+        (snapshot, storage)
+    }
+
     /// Start a clip and run the gated first tick, which presents the pose
     /// without advancing any clock
     /// (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:637-642`).
@@ -5236,9 +5370,30 @@ mod tests {
             width: 1,
             height: 1,
             rgba: vec![10, 20, 30, 255],
+            order: super::ChannelOrder::Scene,
         };
         let tinted = super::tint_crop(&pixels, (0, 0, 1, 1), [[255, 0, 0, 255]; 4], false)
             .expect("the tint covers the texel");
+        assert_eq!(tinted.rgba, vec![10, 0, 0, 255]);
+    }
+
+    /// A chunk that keeps the order the file stores has its red and blue
+    /// channels exchanged when it is copied into a bitmap
+    /// (`reference/cpp/plugins/motionplayer/SourceCache.cpp:296-305`), so the
+    /// tint multiplies the scene's channels and not the file's.
+    #[test]
+    fn the_tint_multiplies_the_scene_channels_of_a_file_order_chunk() {
+        let pixels = super::Pixels {
+            width: 1,
+            height: 1,
+            // The file stores the blue channel first and the red one third.
+            rgba: vec![30, 20, 10, 255],
+            order: super::ChannelOrder::File,
+        };
+        let tinted = super::tint_crop(&pixels, (0, 0, 1, 1), [[255, 0, 0, 255]; 4], false)
+            .expect("the tint covers the texel");
+        // The scene's red channel is the file's third byte, so the red tint
+        // keeps it and drops the other two.
         assert_eq!(tinted.rgba, vec![10, 0, 0, 255]);
     }
 
@@ -5925,6 +6080,12 @@ mod tests {
     /// opaque-white set (`reference/cpp/plugins/motionplayer/SourceCache.cpp:44-55`,
     /// `:82-150`). The `0x10` blend bit divides by 128 instead of 255
     /// (`SourceCache.cpp:719-729`).
+    ///
+    /// The colours keep the channel order their packed word stores them in,
+    /// and the scene's channels take them in the order the reference
+    /// multiplies them (`SourceCache.cpp:140-147`): a packed red — the word
+    /// `0xFFFF0000`, whose third byte is the red one — tints the red channel
+    /// alone.
     #[test]
     fn a_node_colour_tints_its_own_icon() {
         let (storage, snapshot) = icon_fixture();
@@ -5970,7 +6131,7 @@ mod tests {
         };
         // The decoded texel is (30, 20, 10, 255): a red node colour keeps
         // only red.
-        assert_eq!(draw_with([[255, 0, 0, 255]; 4], 0), [30, 0, 0, 255]);
+        assert_eq!(draw_with([[0, 0, 255, 255]; 4], 0), [30, 0, 0, 255]);
         // The default half-gray and opaque white mean "no tint".
         assert_eq!(draw_with(DEFAULT_NODE_COLORS, 0), [30, 20, 10, 255]);
         assert_eq!(draw_with(DEFAULT_NODE_COLORS, 16), [30, 20, 10, 255]);
@@ -6883,6 +7044,92 @@ mod tests {
                 .read("psb://motion.psb/nested/chunk")
                 .expect("the nested chunk resolves"),
             vec![1, 2]
+        );
+    }
+
+    /// The alpha of a decoded chunk reaches the target bitmap.
+    ///
+    /// The chunk holds pixels whose alpha is 200, and the node's vertex
+    /// colour is opaque white, which the reference leaves untinted
+    /// (`reference/cpp/plugins/motionplayer/SourceCache.cpp:50-56`); the tint
+    /// multiplies the chunk's alpha by the colour's alpha
+    /// (`reference/cpp/plugins/motionplayer/SourceCache.cpp:129-149`) and the
+    /// composite adds it to the destination's
+    /// (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:1100-1102`).
+    #[test]
+    fn a_chunk_alpha_reaches_the_target() {
+        let (snapshot, storage) = icon_snapshot(0xFFFF_FFFF);
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "intro".to_string(),
+            ..PlayerInst::default()
+        };
+        prime_timelines(&snapshot, &mut player.timelines);
+        player.nodes = build_node_tree(&snapshot, snapshot.clip("intro"));
+        player.update_layers();
+        let bitmap = composite_with_storage(&mut player, &storage);
+        let offset = (100 * 800 + 100) * 4;
+        assert_eq!(
+            &bitmap.rgba[offset..offset + 4],
+            &[10, 20, 30, 200],
+            "the drawn texel carries the chunk's alpha and the scene's channels"
+        );
+    }
+
+    /// A node's packed colour multiplies the scene's channels in the order
+    /// the reference multiplies them: the scene's red channel takes the word's
+    /// third byte, its green the second and its blue the first
+    /// (`reference/cpp/plugins/motionplayer/SourceCache.cpp:140-147`).
+    ///
+    /// The packed colour reaches the render as the word's four bytes
+    /// (`reference/cpp/plugins/motionplayer/PlayerUpdateLayersInternal.h:21-32`),
+    /// so a packed red — the word `0xFFFF0000`, whose third byte is the red
+    /// one — tints the red channel alone.
+    #[test]
+    fn a_packed_node_colour_tints_the_scene_channels() {
+        let (snapshot, storage) = icon_snapshot(0xFFFF_0000);
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "intro".to_string(),
+            ..PlayerInst::default()
+        };
+        prime_timelines(&snapshot, &mut player.timelines);
+        player.nodes = build_node_tree(&snapshot, snapshot.clip("intro"));
+        player.update_layers();
+        let bitmap = composite_with_storage(&mut player, &storage);
+        let offset = (100 * 800 + 100) * 4;
+        assert_eq!(
+            &bitmap.rgba[offset..offset + 4],
+            &[10, 0, 0, 200],
+            "the packed red tints the red channel alone"
+        );
+    }
+
+    /// A node colour with a transparent alpha takes the chunk's alpha away.
+    ///
+    /// The tint multiplies every channel by the interpolated corner colour,
+    /// the alpha among them
+    /// (`reference/cpp/plugins/motionplayer/SourceCache.cpp:129-149`), so a
+    /// colour whose alpha is zero leaves the drawn pixels transparent.
+    #[test]
+    fn the_tint_multiplies_the_alpha_by_the_corner_colour() {
+        let pixels = super::Pixels {
+            width: 1,
+            height: 1,
+            rgba: vec![10, 20, 30, 200],
+            order: super::ChannelOrder::Scene,
+        };
+        let tinted = super::tint_crop(&pixels, (0, 0, 1, 1), [[255, 255, 255, 128]; 4], false)
+            .expect("the tint covers the texel");
+        assert_eq!(
+            tinted.rgba[3], 100,
+            "the corner colour's alpha scales the chunk's alpha"
+        );
+        let transparent = super::tint_crop(&pixels, (0, 0, 1, 1), [[255, 255, 255, 0]; 4], false)
+            .expect("the tint covers the texel");
+        assert_eq!(
+            transparent.rgba[3], 0,
+            "a transparent corner colour takes the chunk's alpha away"
         );
     }
 }

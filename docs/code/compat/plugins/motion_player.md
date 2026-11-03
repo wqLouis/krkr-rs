@@ -493,6 +493,32 @@ the container's pixel chunks through that media, so it installs the media's
 provider with the storage the container was read from — a game that plays a
 motion without linking `psbfile.dll` still gets its textures.
 
+### The pixel chunks and the node colours
+
+A pixel chunk carries its colour channels in the order the file stores, and
+the alpha is the chunk's fourth byte in every case. A chunk with a sibling
+`pal` chunk has the palette's red and blue channels reversed before the
+palette is expanded, so its pixels already carry the scene's order
+(`reference/cpp/plugins/motionplayer/PlayerInternal.h:132-165`); a chunk
+without a palette keeps the file's order, and its red and blue channels are
+exchanged when the chunk is copied into a bitmap
+(`reference/cpp/plugins/motionplayer/SourceCache.cpp:264-311`).
+
+A node's four vertex colours are packed words whose byte 2 is red, byte 1
+green, byte 0 blue and byte 3 alpha, so the word is `0xAARRGGBB` — the
+reference's D3D vertex colour is built from the same word and a D3DCOLOR's
+high byte is red
+(`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:153-159`). The
+default half-gray set is the word `0xFF808080` and the opaque-white set is
+every byte `0xFF`; both are neutral and leave the source untouched
+(`reference/cpp/plugins/motionplayer/SourceCache.cpp:50-56`). The software
+tint multiplies the scene's red by the word's byte 2 and the scene's blue by
+its byte 0 (`reference/cpp/plugins/motionplayer/SourceCache.cpp:58-66`,
+`:140-147`), so the port pairs the scene's channels with the word's in the
+same way when it renders.
+
+---
+
 ### The draw pipeline
 
 `Player.draw(target)` evaluates the node tree and paints it into the target

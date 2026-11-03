@@ -2,9 +2,14 @@
 //!
 //! A group's icons live either in the group's `texture` atlas, which each
 //! icon crops with its `left`/`top`/`width`/`height`, or in a per-icon `pixel`
-//! chunk. Either chunk is raw 32-bit RGBA, `RL` run-length compressed, or
-//! 8-bit index data resolved through the sibling `pal` chunk. Decoding yields
-//! straight-alpha RGBA8 in the scene's pixel layout.
+//! chunk. Either chunk is raw 32-bit data, `RL` run-length compressed, or
+//! 8-bit index data resolved through the sibling `pal` chunk. The decoded
+//! bytes keep the channel order the chunk stores, and the alpha is the
+//! chunk's fourth byte in every case. A chunk that carries a palette has the
+//! palette's red and blue channels reversed before the palette is expanded,
+//! so its pixels already carry the scene's order; the red and blue channels
+//! of a chunk without a palette are exchanged when the chunk is copied into
+//! a bitmap.
 //!
 //! The chunks are decoded on the engine's job pool. The chunks of one pose
 //! are independent of each other, so they are decoded in parallel and the
@@ -461,7 +466,23 @@ pub(crate) fn pixel_offset(value: f64) -> Option<u32> {
     Some(rounded as u32)
 }
 
-/// Decoded straight-alpha RGBA8 pixels of one pixel chunk.
+/// The channel order the decoded bytes of a chunk carry.
+///
+/// A chunk that carries a palette has the palette's red and blue channels
+/// reversed before the palette is expanded, so its pixels already carry the
+/// scene's order. A chunk without a palette keeps the order the file stores,
+/// and its red and blue channels are exchanged when the chunk is copied into
+/// a bitmap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChannelOrder {
+    /// The order the file stores: the red and blue channels are exchanged
+    /// when the chunk is copied into a bitmap.
+    File,
+    /// The scene's order: the chunk's bytes are copied as they are.
+    Scene,
+}
+
+/// Decoded straight-alpha pixels of one pixel chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Pixels {
     /// The image width in pixels.
@@ -470,6 +491,8 @@ pub(crate) struct Pixels {
     pub(crate) height: u32,
     /// `width * height * 4` bytes.
     pub(crate) rgba: Vec<u8>,
+    /// The channel order the bytes carry.
+    pub(crate) order: ChannelOrder,
 }
 
 /// Why a pixel chunk could not be decoded.
@@ -519,28 +542,23 @@ pub(crate) fn decode_pixels(
     if count.checked_mul(4).is_none() {
         return Err(TextureError::TooLarge);
     }
-    let rgba = match palette.filter(|palette| !palette.is_empty()) {
-        Some(palette) => expand_palette(bytes, palette, count, compressed)?,
-        None if compressed => swap_red_blue(rl_decode(bytes, count, 4)),
-        None => swap_red_blue(raw(bytes, count)),
+    let (rgba, order) = match palette.filter(|palette| !palette.is_empty()) {
+        // The palette's red and blue channels are reversed before the palette
+        // is expanded, so the expanded pixels carry the scene's order.
+        Some(palette) => (
+            expand_palette(bytes, palette, count, compressed)?,
+            ChannelOrder::Scene,
+        ),
+        // A chunk without a palette keeps the order the file stores.
+        None if compressed => (rl_decode(bytes, count, 4), ChannelOrder::File),
+        None => (raw(bytes, count), ChannelOrder::File),
     };
     Ok(Pixels {
         width,
         height,
         rgba,
+        order,
     })
-}
-
-/// Swap the red and blue channels of straight-alpha RGBA pixels.
-///
-/// The PSB raw/RL pixel chunks store their colour channels in B,G,R,A order;
-/// the scene bitmap stores R,G,B,A, so the two channels are exchanged once
-/// after decoding. The palette path already writes the scene order.
-fn swap_red_blue(mut rgba: Vec<u8>) -> Vec<u8> {
-    for pixel in rgba.as_chunks_mut::<4>().0.iter_mut() {
-        pixel.swap(0, 2);
-    }
-    rgba
 }
 
 /// Copy `count` RGBA pixels from a raw chunk, zero-filling what is short.
@@ -551,7 +569,12 @@ fn raw(bytes: &[u8], count: usize) -> Vec<u8> {
     out
 }
 
-/// Resolve 8-bit indices through a `pal` chunk, whose entries are RGBA quads.
+/// Resolve 8-bit indices through a `pal` chunk, whose entries are colour
+/// quads.
+///
+/// The palette's red and blue channels are reversed before the indices are
+/// expanded, so the expanded pixels carry the scene's channel order. The
+/// alpha is the quad's fourth byte in every case.
 fn expand_palette(
     bytes: &[u8],
     palette: &[u8],
@@ -576,7 +599,8 @@ fn expand_palette(
         if entry >= entries {
             return Err(TextureError::PaletteIndex { index, entries });
         }
-        out.extend_from_slice(&palette[entry * 4..entry * 4 + 4]);
+        let quad = &palette[entry * 4..entry * 4 + 4];
+        out.extend_from_slice(&[quad[2], quad[1], quad[0], quad[3]]);
     }
     Ok(out)
 }
@@ -629,7 +653,7 @@ mod tests {
     use engine::imagedecode::{DecodePool, ImageDecodeError, ImageDecoder};
     use engine::jobpool::JobPoolConfig;
 
-    use super::{ChunkRequest, PixelCache, TextureError, decode_pixels, rl_decode};
+    use super::{ChannelOrder, ChunkRequest, PixelCache, TextureError, decode_pixels, rl_decode};
     use crate::natives::plugins::psb_file::container::PsbValue;
     use crate::natives::plugins::psb_file::media::fixture::{chunk, container, media_storage};
 
@@ -669,21 +693,53 @@ mod tests {
     }
 
     #[test]
-    fn a_raw_chunk_decodes_as_rgba() {
+    fn a_raw_chunk_keeps_the_order_the_file_stores() {
+        // A chunk without a palette keeps the channel order it stores; the
+        // red and blue channels are exchanged when the chunk is copied into
+        // a bitmap (`reference/cpp/plugins/motionplayer/SourceCache.cpp:296-305`).
         let out = decode_pixels(&[1, 2, 3, 4, 5, 6, 7, 8], None, 2, 1, false)
             .expect("a raw chunk decodes");
         assert_eq!((out.width, out.height), (2, 1));
-        assert_eq!(out.rgba, vec![3, 2, 1, 4, 7, 6, 5, 8]);
+        assert_eq!(out.order, ChannelOrder::File);
+        assert_eq!(out.rgba, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
-    fn a_palette_chunk_resolves_each_index() {
-        // Palette entries are RGBA quads; the indices are one byte per pixel
-        // (`reference/cpp/plugins/motionplayer/PlayerInternal.h:132-165`).
+    fn a_run_length_chunk_keeps_the_order_the_file_stores() {
+        // The run-length stream is decoded into the same channel order the
+        // file stores (`reference/cpp/plugins/motionplayer/PlayerInternal.h:163-167`).
+        let out = decode_pixels(&[0x00, 1, 2, 3, 4], None, 1, 1, true)
+            .expect("a run-length chunk decodes");
+        assert_eq!(out.order, ChannelOrder::File);
+        assert_eq!(out.rgba, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_palette_chunk_resolves_each_index_with_its_red_and_blue_reversed() {
+        // The palette's red and blue channels are reversed before the indices
+        // are expanded, so the expanded pixels carry the scene's order
+        // (`reference/cpp/plugins/motionplayer/PlayerInternal.h:144-160`).
         let palette = [10, 20, 30, 40, 50, 60, 70, 80];
         let out = decode_pixels(&[1, 0], Some(palette.as_slice()), 2, 1, false)
             .expect("a palettized chunk decodes");
-        assert_eq!(out.rgba, vec![50, 60, 70, 80, 10, 20, 30, 40]);
+        assert_eq!(out.order, ChannelOrder::Scene);
+        assert_eq!(out.rgba, vec![70, 60, 50, 80, 30, 20, 10, 40]);
+    }
+
+    #[test]
+    fn the_alpha_is_the_fourth_byte_of_every_path() {
+        // The alpha is the chunk's fourth byte in every case: the raw chunk,
+        // the run-length chunk and the expanded palette alike
+        // (`reference/cpp/plugins/motionplayer/PlayerInternal.h:132-165`).
+        let raw = decode_pixels(&[1, 2, 3, 200], None, 1, 1, false).expect("a raw chunk decodes");
+        assert_eq!(raw.rgba[3], 200, "the raw chunk's alpha");
+        let run = decode_pixels(&[0x00, 1, 2, 3, 200], None, 1, 1, true)
+            .expect("a run-length chunk decodes");
+        assert_eq!(run.rgba[3], 200, "the run-length chunk's alpha");
+        let palette = [10, 20, 30, 200];
+        let indexed =
+            decode_pixels(&[0], Some(palette.as_slice()), 1, 1, false).expect("a palette decodes");
+        assert_eq!(indexed.rgba[3], 200, "the expanded palette's alpha");
     }
 
     #[test]
@@ -710,7 +766,8 @@ mod tests {
         let empty: &[u8] = &[];
         let raw = decode_pixels(&[1, 2, 3, 4], Some(empty), 1, 1, false)
             .expect("an empty palette falls back to the raw chunk");
-        assert_eq!(raw.rgba, vec![3, 2, 1, 4]);
+        assert_eq!(raw.order, ChannelOrder::File);
+        assert_eq!(raw.rgba, vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -837,7 +894,7 @@ mod tests {
         let pixels = cache
             .get_or_decode(Some(&mut pool), &storage, &request(PIXEL, PALETTE, 1, 1))
             .expect("the chunk decodes");
-        assert_eq!(pixels.rgba, vec![3, 2, 1, 4], "the chunk's pixels");
+        assert_eq!(pixels.rgba, vec![1, 2, 3, 4], "the chunk's pixels");
         assert_eq!(pool.stats().jobs, 1, "the pool ran the chunk's decode");
     }
 
