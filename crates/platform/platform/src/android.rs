@@ -114,6 +114,39 @@ impl PlatformWindow {
     /// No-op: the Android frame loop is ticker-driven, so a redraw request does
     /// not need to wake a waiting event loop.
     pub fn request_redraw(&self) {}
+
+    /// Creates the presenter that copies a CPU frame into this window.
+    ///
+    /// # Errors
+    ///
+    /// Always [`PlatformError::NotImplemented`]: the Android backend has no
+    /// software surface.
+    pub fn software_surface(&self) -> Result<SoftwareSurface, PlatformError> {
+        Err(PlatformError::NotImplemented(
+            "android software surface".to_owned(),
+        ))
+    }
+}
+
+/// A software presenter that copies a CPU frame into the window.
+///
+/// The Android backend presents through the Vulkan swapchain and the
+/// platform offers no software surface, so the presenter reports a typed
+/// error instead of drawing nothing.
+pub struct SoftwareSurface;
+
+impl SoftwareSurface {
+    /// Presents an RGBA8 frame to the window.
+    ///
+    /// # Errors
+    ///
+    /// Always [`PlatformError::NotImplemented`]: the Android backend has no
+    /// software surface.
+    pub fn present(&mut self, _pixels: &[u8], _size: (u32, u32)) -> Result<(), PlatformError> {
+        Err(PlatformError::NotImplemented(
+            "android software surface".to_owned(),
+        ))
+    }
 }
 
 /// The platform window handle (non-Android placeholder).
@@ -171,6 +204,18 @@ impl PlatformWindow {
 
     /// Requests a redraw (no-op in the stub).
     pub fn request_redraw(&self) {}
+
+    /// Creates the presenter that copies a CPU frame into this window.
+    ///
+    /// # Errors
+    ///
+    /// Always [`PlatformError::NotImplemented`]: the Android backend has no
+    /// software surface.
+    pub fn software_surface(&self) -> Result<SoftwareSurface, PlatformError> {
+        Err(PlatformError::NotImplemented(
+            "android software surface".to_owned(),
+        ))
+    }
 }
 
 /// Android code -> platform-neutral value translation.

@@ -23,6 +23,7 @@
 #![warn(missing_docs)]
 
 mod audio;
+mod frame_dump;
 mod game;
 mod image_codec;
 mod overlay;
@@ -40,8 +41,9 @@ use engine::Scene;
 use overlay::Overlay;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use render::{
-    FrameTimings, PipelineConfig, RenderScene, RenderState, Surface, Texture, TextureFormat,
-    begin_render_state, begin_render_state_with_display, create_render_pipeline,
+    FrameTimings, PipelineConfig, PresentedFrame, PresentedFrameSlot, RenderScene, RenderState,
+    Surface, Texture, TextureFormat, begin_render_state, begin_render_state_with_display,
+    create_render_pipeline, install_presented_frame_slot,
 };
 
 pub(crate) use audio::install_audio_decoder_metered;
@@ -189,6 +191,13 @@ pub struct HostConfig {
     /// It sets the presentation budget a frame may spend waiting for the
     /// display, so the wait is bounded by the loop's own cadence.
     pub frame_interval: Duration,
+    /// Whether the host composites the presented frame on the CPU.
+    ///
+    /// The null backend composites every presented frame with the software
+    /// rasterizer and hands it to the host, so a window can show it and a
+    /// file can hold it. The compositing costs a full-frame rasterization,
+    /// so it is off by default.
+    pub cpu_presentation: bool,
 }
 
 impl Default for HostConfig {
@@ -204,6 +213,7 @@ impl Default for HostConfig {
             debug_overlay: false,
             graphic_cache_limit: None,
             frame_interval: Duration::from_secs_f64(FrameRateLimit::DEFAULT.period_secs()),
+            cpu_presentation: false,
         }
     }
 }
@@ -237,6 +247,12 @@ impl HostConfig {
         self.graphic_cache_limit = limit;
         self
     }
+
+    /// Returns this configuration with the CPU presentation on or off.
+    pub fn with_cpu_presentation(mut self, enabled: bool) -> Self {
+        self.cpu_presentation = enabled;
+        self
+    }
 }
 
 /// The assembled host: the middle-layer engine and the frame it owns.
@@ -256,6 +272,13 @@ pub struct Host {
     /// caller's: it must be the source every [`Host::step`] is given, and it
     /// must outlive the game that reads it.
     frame_time: Option<*const (dyn FrameTimeSource + 'static)>,
+    /// The slot the CPU-presented frame is composited into, when the host
+    /// composites on the CPU.
+    ///
+    /// The slot is installed into the render state before the state is handed
+    /// to the engine, so the engine's frames reach it without the engine
+    /// knowing about it.
+    presented_slot: Option<PresentedFrameSlot>,
 }
 
 /// A frame hook that does nothing, for a host with no game above it.
@@ -309,9 +332,19 @@ impl Host {
                 )
             })?
         };
-        let (surface, render_state): (Surface, RenderState) = match &config.display_handle {
+        let (surface, mut render_state): (Surface, RenderState) = match &config.display_handle {
             Some(display) => begin_render_state_with_display(&pipeline, display, handle)?,
             None => begin_render_state(&pipeline, handle)?,
+        };
+        // The CPU presentation is installed into the render state before the
+        // state is handed to the engine: the engine presents every frame
+        // through that state, and the frame lands in the slot.
+        let presented_slot = if config.cpu_presentation {
+            let slot = PresentedFrameSlot::new();
+            install_presented_frame_slot(&pipeline, &mut render_state, slot.clone())?;
+            Some(slot)
+        } else {
+            None
         };
         let overlay = if config.debug_overlay {
             Some(Overlay::new(&pipeline).map_err(|error| HostError::Overlay(error.to_string()))?)
@@ -334,6 +367,7 @@ impl Host {
         Ok(Self {
             engine,
             frame_time: None,
+            presented_slot,
         })
     }
 
@@ -518,5 +552,16 @@ impl Host {
     /// been presented through this state yet.
     pub fn last_frame_timings(&self) -> Option<FrameTimings> {
         self.engine.last_frame_timings()
+    }
+
+    /// Calls `visit` with the CPU-presented frame, if the host composites on
+    /// the CPU and a frame has been presented.
+    ///
+    /// The frame is RGBA8 and holds the composed picture in device pixels:
+    /// it is what the window shows when the null backend presents it.
+    pub fn with_presented_frame<R>(&self, visit: impl FnOnce(&PresentedFrame) -> R) -> Option<R> {
+        self.presented_slot
+            .as_ref()
+            .and_then(|slot| slot.with_frame(visit))
     }
 }

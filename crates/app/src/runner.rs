@@ -6,17 +6,19 @@
 //! launcher reads platform storage, and both hand the finished value to the
 //! same function so the core never learns where configuration comes from.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use api::config::{CacheLimit, RuntimeConfig};
 use engine::FrameTimeSource;
+use media::Media;
 use platform::{
     EventHandler, Flow, FramePacing, PlatformConfig, PlatformError, PlatformEvent, PlatformWindow,
-    Ticker,
+    SoftwareSurface, Ticker,
 };
-use render::FrameStats;
+use render::{FrameStats, PresentedFrame};
 
+use crate::frame_dump::write_frame;
 use crate::{
     BackendKind, GameError, GameHost, Host, HostConfig, HostError, PlatformFrameTime, StepReport,
 };
@@ -64,6 +66,12 @@ pub struct Launch {
     pub game: Option<GameInput>,
     /// Whether to run offscreen or in a window.
     pub mode: RunMode,
+    /// Where the presented frame is written as a PNG, or `None` to write
+    /// nothing.
+    ///
+    /// The file holds the most recent presented frame, so a run that ends on
+    /// the picture leaves that picture behind.
+    pub dump_frame: Option<PathBuf>,
 }
 
 /// What a completed [`run`] produced.
@@ -92,6 +100,9 @@ pub enum RunError {
     /// The platform window or its event loop failed.
     #[error(transparent)]
     Platform(#[from] PlatformError),
+    /// The presented frame could not be written to a file.
+    #[error("frame dump: {0}")]
+    Dump(String),
 }
 
 /// Runs the emulator with a launcher-resolved [`Launch`].
@@ -232,7 +243,11 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
     let config = HostConfig::headless()
         .with_backend(launch.backend)
         .with_debug_overlay(launch.runtime.debug_overlay)
-        .with_graphic_cache_limit(launch.runtime.graphic_cache_limit);
+        .with_graphic_cache_limit(launch.runtime.graphic_cache_limit)
+        // The dump reads the frame the CPU rasterizer composited, so the
+        // host has to composite it.
+        .with_cpu_presentation(launch.dump_frame.is_some());
+    let media = Media::new();
     // The source is boxed before the host, so the address the game attaches is
     // stable for the whole run; the host is stepped with the same source.
     let source: &(dyn FrameTimeSource + 'static) = clock.as_ref();
@@ -261,10 +276,20 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
             input.archives.len(),
         );
         let mut last = None;
+        let mut dumped: Option<SceneRevisions> = None;
         for _ in 0..frames {
             pacer.wait();
             let frame_time = clock.advance(Instant::now());
             last = Some(game.step(frame_time, &[])?);
+            if let Some(path) = &launch.dump_frame {
+                // The file follows the picture: a frame that drew the same
+                // image as the frame before it is not written again.
+                let revisions = SceneRevisions::of(game.scene());
+                if dumped != Some(revisions) {
+                    dumped = Some(revisions);
+                    dump_presented_frame(&media, path, game.host())?;
+                }
+            }
         }
         if let Some(report) = last
             && let Some(stats) = report.stats
@@ -315,10 +340,20 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
     );
 
     let mut last = None;
+    let mut dumped: Option<SceneRevisions> = None;
     for _ in 0..frames {
         pacer.wait();
         let frame_time = clock.advance(Instant::now());
         last = Some(host.step(frame_time)?);
+        if let Some(path) = &launch.dump_frame {
+            // The file follows the picture: a frame that drew the same image
+            // as the frame before it is not written again.
+            let revisions = SceneRevisions::of(host.scene());
+            if dumped != Some(revisions) {
+                dumped = Some(revisions);
+                dump_presented_frame(&media, path, &host)?;
+            }
+        }
     }
     if let Some(report) = last
         && let Some(stats) = report.stats
@@ -330,6 +365,22 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
         );
     }
     Ok(RunReport { last_frame: last })
+}
+
+/// Writes the host's CPU-presented frame to `path`.
+///
+/// A host that has not presented a frame yet leaves the file alone.
+///
+/// # Errors
+///
+/// Returns [`RunError::Dump`] when the frame cannot be written.
+fn dump_presented_frame(media: &Media, path: &Path, host: &Host) -> Result<(), RunError> {
+    let written = host.with_presented_frame(|frame| write_frame(media, path, frame));
+    match written {
+        Some(Ok(())) => Ok(()),
+        Some(Err(message)) => Err(RunError::Dump(message)),
+        None => Ok(()),
+    }
 }
 
 /// Opens a window through the L1 platform and drives [`Host::step`].
@@ -346,6 +397,7 @@ fn run_windowed(launch: &Launch) -> Result<(), RunError> {
             launch.runtime.preload_archives,
             launch.runtime.debug_overlay,
             launch.runtime.graphic_cache_limit,
+            launch.dump_frame.clone(),
             frame_interval,
         ),
     )?)
@@ -378,6 +430,14 @@ struct DesktopApp {
     frame_time: Box<PlatformFrameTime>,
     /// The running host, created once the window handle exists.
     running: Option<Running>,
+    /// The software presenter that puts a CPU-composited frame on the screen,
+    /// when the backend is the null one and the platform offers a surface.
+    software: Option<SoftwareSurface>,
+    /// Where the presented frame is written as a PNG, or `None` to write
+    /// nothing.
+    dump_frame: Option<PathBuf>,
+    /// The image encoder the frame dump writes through.
+    media: Media,
     /// Input and focus events received since the last frame, delivered to
     /// the VM.
     pending_events: Vec<PlatformEvent>,
@@ -415,6 +475,16 @@ struct SceneRevisions {
     content: u64,
 }
 
+impl SceneRevisions {
+    /// Reads the revisions of `scene`.
+    fn of(scene: &engine::Scene) -> Self {
+        Self {
+            structure: scene.structure_revision(),
+            content: scene.content_revision(),
+        }
+    }
+}
+
 /// What the windowed loop is driving.
 enum Running {
     /// An empty scene (no game).
@@ -430,9 +500,17 @@ impl Running {
             Running::Empty(host) => host.scene(),
             Running::Game(game) => game.scene(),
         };
-        SceneRevisions {
-            structure: scene.structure_revision(),
-            content: scene.content_revision(),
+        SceneRevisions::of(scene)
+    }
+
+    /// Visits the CPU-presented frame, when the host has composited one.
+    ///
+    /// The null backend composites the scene with the CPU rasterizer; the
+    /// frame it produced is the picture the window shows.
+    fn with_presented_frame<R>(&self, visit: impl FnOnce(&PresentedFrame) -> R) -> Option<R> {
+        match self {
+            Running::Empty(host) => host.with_presented_frame(visit),
+            Running::Game(game) => game.host().with_presented_frame(visit),
         }
     }
 
@@ -482,6 +560,7 @@ impl DesktopApp {
         preload_archives: bool,
         debug_overlay: bool,
         graphic_cache_limit: Option<CacheLimit>,
+        dump_frame: Option<PathBuf>,
         frame_interval: Duration,
     ) -> Self {
         Self {
@@ -499,6 +578,9 @@ impl DesktopApp {
             changed_frames: 0,
             last_revisions: None,
             heartbeat_at: Instant::now(),
+            software: None,
+            dump_frame,
+            media: Media::new(),
         }
     }
 
@@ -557,8 +639,23 @@ impl EventHandler for DesktopApp {
             debug_overlay: self.debug_overlay,
             graphic_cache_limit: self.graphic_cache_limit,
             frame_interval: self.frame_interval,
+            // The null backend composites the frame on the CPU, and the
+            // window shows that frame; the dump reads the same frame.
+            cpu_presentation: self.backend == BackendKind::Null || self.dump_frame.is_some(),
             ..Default::default()
         };
+        // The null backend has no swapchain: its frame reaches the window
+        // through the software presenter, which copies the CPU frame into the
+        // window's pixels.
+        if self.backend == BackendKind::Null {
+            match window.software_surface() {
+                Ok(surface) => self.software = Some(surface),
+                Err(error) => {
+                    eprintln!("krkr: cannot present into the window: {error}");
+                    return Flow::Exit;
+                }
+            }
+        }
         let source: &(dyn FrameTimeSource + 'static) = self.frame_time.as_ref();
         match Host::new(config) {
             Ok(host) => {
@@ -681,15 +778,42 @@ impl EventHandler for DesktopApp {
                 eprintln!("krkr: frame resize failed: {error}");
                 return Flow::Exit;
             }
+            // The CPU-presented frame is the picture the window shows: the
+            // null backend composited it, and the presenter copies it into
+            // the window's pixels.
+            if let Some(software) = self.software.as_mut() {
+                let presented = running.with_presented_frame(|frame| {
+                    software.present(&frame.pixels, (frame.width, frame.height))
+                });
+                if let Some(Err(error)) = presented {
+                    eprintln!("krkr: cannot present the frame: {error}");
+                    return Flow::Exit;
+                }
+            }
             (report, running.scene_revisions())
         };
         // A frame that moves neither revision drew the same image as the
         // frame before it. The count is a measurement, not a decision: the
         // frame still ran, and the script still saw the same clock.
-        if self.last_revisions != Some(revisions) {
+        let changed = self.last_revisions != Some(revisions);
+        if changed {
             self.changed_frames = self.changed_frames.saturating_add(1);
         }
         self.last_revisions = Some(revisions);
+        // The dump follows the picture: a frame that drew the same image as
+        // the frame before it is not written again, so the file holds the
+        // most recent picture and the run does not pay for an encode per
+        // frame.
+        if changed && let Some(path) = &self.dump_frame {
+            let media = &self.media;
+            let written = self.running.as_ref().and_then(|running| {
+                running.with_presented_frame(|frame| write_frame(media, path, frame))
+            });
+            if let Some(Err(message)) = written {
+                eprintln!("krkr: cannot write the frame: {message}");
+                return Flow::Exit;
+            }
+        }
         self.log_heartbeat(&report, dt_ms, Instant::now());
         Flow::Continue
     }
@@ -714,6 +838,7 @@ mod tests {
             backend: BackendKind::Null,
             game: None,
             mode: RunMode::Headless { frames: 2 },
+            dump_frame: None,
         })
         .expect("headless run");
         let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -752,6 +877,7 @@ mod tests {
             backend: BackendKind::Null,
             game: None,
             mode: RunMode::Headless { frames: 5 },
+            dump_frame: None,
         })
         .expect("headless run");
         let elapsed = started.elapsed();

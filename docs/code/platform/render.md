@@ -340,13 +340,19 @@ because its introspection — `NullRenderPipeline::last_frame`,
 `texture_pixels`, `texture_uploaded_bytes` — and its
 `NULL_MAX_TEXTURE_DIMENSION` cap are part of the headless contract.
 
-The **null** backend has two jobs: for the framebuffer it only *counts* the
-draws (there is no window to show); for an **offscreen target** it runs the
-real software rasterizer, which clears to `background`, walks the tree with
-the same rules and samples each quad with nearest-texel filtering. Because a
-CPU compositor naturally reads the destination, it evaluates the
-destination-dependent `BlendMode`s exactly, using the reference's
-Photoshop/KiriKiri formulas.
+The **null** backend has two jobs: it *counts* the draws, and it composes the
+scene with the real software rasterizer, which clears to `background`, walks
+the tree with the same rules and samples each quad with nearest-texel
+filtering. Because a CPU compositor naturally reads the destination, it
+evaluates the destination-dependent `BlendMode`s exactly, using the
+reference's Photoshop/KiriKiri formulas.
+
+The composed frame is the **presented frame**: the null backend hands it to
+the caller through the presented-frame slot, and a windowed run copies it into
+the window's pixels with the platform's software presenter. That presenter
+talks to the display server directly, so the null backend can show a game
+without a GPU. A headless run can write the same frame to a PNG file
+(`--dump-frame`), which is how a picture is inspected without a display.
 
 The **Vulkan** backend creates the instance with `VK_KHR_surface` and the
 available platform surface extensions (plus the optional validation layer),

@@ -36,6 +36,11 @@
 //!   positive integer is a byte cap. Without the option the cache stays
 //!   disabled, and a startup script may still change it through
 //!   `System.graphicCacheLimit`.
+//! * `--dump-frame PATH` writes the presented frame to `PATH` as a PNG. The
+//!   frame is the one the CPU rasterizer composited, so the file holds the
+//!   picture the window shows; it is written again whenever a frame is
+//!   presented, and the file therefore holds the most recent one. The frame
+//!   comes from the null backend, so the option needs `--backend null`.
 //! * `--backend vulkan` requests the Vulkan pipeline. It needs a real
 //!   window with a display connection (Wayland/X11/XCB); the windowed host
 //!   passes both the window and display handle so a surface can be created.
@@ -110,6 +115,11 @@ const OPTIONS: &[OptionDoc] = &[
         help: "Decoded-image cache: none, 0/unlimited, or bytes (default: reference default).",
     },
     OptionDoc {
+        flag: "--dump-frame",
+        value: "PATH",
+        help: "Write the presented frame to PATH as a PNG (the most recent frame; the null backend).",
+    },
+    OptionDoc {
         flag: "--archive",
         value: "XP3",
         help: "Mount an XP3 archive (repeatable, later wins); with none, every *.xp3 under the base directory mounts.",
@@ -164,6 +174,8 @@ struct Cli {
     debug_overlay: Option<bool>,
     /// Decoded-image cache policy from `--graphic-cache-limit`, if given.
     graphic_cache_limit: Option<CacheLimit>,
+    /// Where the presented frame is written as a PNG, if given.
+    dump_frame: Option<PathBuf>,
     /// Explicit `--archive` list, in mount order (later wins).
     archives: Vec<PathBuf>,
     /// App path override (`--base-dir`); defaults to the current directory.
@@ -199,6 +211,7 @@ impl Cli {
             preload_archives: None,
             debug_overlay: None,
             graphic_cache_limit: None,
+            dump_frame: None,
             archives: Vec::new(),
             base_dir: None,
             positional: None,
@@ -237,6 +250,12 @@ impl Cli {
                     cli.graphic_cache_limit =
                         Some(CacheLimit::parse("--graphic-cache-limit", &value)?);
                 }
+                "--dump-frame" => {
+                    let value = args.next().ok_or_else(|| {
+                        CliError::Usage("--dump-frame requires a path".to_owned())
+                    })?;
+                    cli.dump_frame = Some(PathBuf::from(value));
+                }
                 "--archive" => {
                     let value = args
                         .next()
@@ -274,6 +293,21 @@ fn parse_backend(value: &str) -> Result<BackendKind, String> {
             "unknown backend '{other}' (expected 'null' or 'vulkan')"
         )),
     }
+}
+
+/// Checks that the requested frame dump has a backend that can produce one.
+///
+/// The dumped frame is the one the CPU rasterizer composited, and only the
+/// null backend composites one.
+///
+/// # Errors
+///
+/// Returns the message when the backend cannot produce a CPU frame.
+fn check_dump_backend(cli: &Cli) -> Result<(), String> {
+    if cli.dump_frame.is_some() && cli.backend != BackendKind::Null {
+        return Err("--dump-frame needs the null backend (--backend null)".to_owned());
+    }
+    Ok(())
 }
 
 /// Environment variable naming the desktop configuration file.
@@ -375,6 +409,13 @@ fn main() -> ExitCode {
         }
     };
 
+    // The dumped frame is the one the CPU rasterizer composited, and only
+    // the null backend composites one.
+    if let Err(message) = check_dump_backend(&cli) {
+        eprintln!("krkr: {message}");
+        return ExitCode::from(2);
+    }
+
     let launch = Launch {
         runtime,
         backend: cli.backend,
@@ -384,6 +425,7 @@ fn main() -> ExitCode {
         } else {
             RunMode::Windowed
         },
+        dump_frame: cli.dump_frame,
     };
 
     match app::run(launch) {
@@ -535,6 +577,18 @@ mod tests {
 
         let cli = parse(&["--headless", "--graphic-cache-limit", "1048576"]).expect("parse");
         assert_eq!(cli.graphic_cache_limit, Some(CacheLimit::bytes(1_048_576)));
+    }
+
+    #[test]
+    fn parse_dump_frame() {
+        let cli = parse(&["--headless", "--dump-frame", "frame.png"]).expect("parse");
+        assert_eq!(cli.dump_frame, Some(PathBuf::from("frame.png")));
+        assert!(check_dump_backend(&cli).is_ok());
+
+        // The dumped frame comes from the CPU rasterizer, so a backend that
+        // presents to a swapchain cannot produce one.
+        let cli = parse(&["--backend", "vulkan", "--dump-frame", "frame.png"]).expect("parse");
+        assert!(check_dump_backend(&cli).is_err());
     }
 
     #[test]

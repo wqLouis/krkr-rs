@@ -54,6 +54,8 @@ mod fonts;
 mod input;
 mod memory;
 mod metrics;
+#[cfg(all(feature = "platform-linux", not(feature = "platform-android")))]
+mod software;
 mod window;
 
 // A feature/target mismatch is the bug this guards against: the winit desktop
@@ -77,9 +79,9 @@ mod android;
 mod linux;
 
 #[cfg(all(feature = "platform-android", not(feature = "platform-linux")))]
-pub use crate::android::{PlatformWindow, run};
+pub use crate::android::{PlatformWindow, SoftwareSurface, run};
 #[cfg(all(feature = "platform-linux", not(feature = "platform-android")))]
-pub use crate::linux::{PlatformWindow, run};
+pub use crate::linux::{PlatformWindow, SoftwareSurface, run};
 
 pub use crate::audio::{AudioDevice, AudioHealth, AudioOutputState};
 pub use crate::clock::{Clock, Ticker};

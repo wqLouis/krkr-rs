@@ -11,6 +11,16 @@ raw-window-handle = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 winit = { workspace = true, optional = true }
+# The software presenter: the platform's own way to put a CPU frame on the
+# screen without a GPU. It talks to the display server directly (X11 through
+# `tiny-xlib`, Wayland through `wayland-client`) and loads the display
+# libraries at run time, so the build needs no extra system package.
+softbuffer = { version = "0.4", optional = true, default-features = false, features = [
+    "x11",
+    "x11-dlopen",
+    "wayland",
+    "wayland-dlopen",
+] }
 # cpal is the `platform-linux` audio output backend. It is optional so the
 # Android AAudio backend (the `ndk` crate) never pulls in ALSA, and so headless
 # hosts can use the null device instead.
@@ -35,5 +45,5 @@ default = []
 # the real winit 0.30 backend and the cpal audio backend; `platform-android`
 # compiles the real AAudio audio backend (via `ndk`) and window/event-loop
 # stubs on Android, and a typed audio stub elsewhere.
-platform-linux = ["dep:winit", "dep:cpal"]
+platform-linux = ["dep:winit", "dep:cpal", "dep:softbuffer"]
 platform-android = []

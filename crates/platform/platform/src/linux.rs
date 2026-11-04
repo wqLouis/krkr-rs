@@ -5,6 +5,7 @@
 //! window, the frame pacer and the dt computation.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
@@ -22,6 +23,8 @@ use crate::clock::Ticker;
 use crate::event::PlatformEvent;
 use crate::input::{InputEvent, MouseButton, PhysicalKey};
 use crate::{EventHandler, Flow, FramePacing, PlatformConfig, PlatformError};
+
+pub use crate::software::SoftwareSurface;
 
 /// How long a requested redraw may wait for `RedrawRequested` before the
 /// watchdog reports a stall, i.e. the `N` frame intervals of the watchdog
@@ -140,7 +143,7 @@ impl RedrawWatchdog {
 /// backend binds to, to query the surface size, and to request a redraw.
 /// Platform details stay behind this type; the winit `Window` never leaks.
 pub struct PlatformWindow {
-    window: Window,
+    window: Arc<Window>,
 }
 
 impl PlatformWindow {
@@ -201,6 +204,19 @@ impl PlatformWindow {
     /// Requests that the window redraw its contents.
     pub fn request_redraw(&self) {
         self.window.request_redraw();
+    }
+
+    /// Creates the presenter that copies a CPU frame into this window.
+    ///
+    /// The presenter binds to the window's display connection, so a frame the
+    /// CPU rasterizer composited can be shown without a GPU.
+    ///
+    /// # Errors
+    ///
+    /// [`PlatformError::Window`] when the display server offers no software
+    /// surface for the window.
+    pub fn software_surface(&self) -> Result<SoftwareSurface, PlatformError> {
+        SoftwareSurface::new(Arc::clone(&self.window))
     }
 }
 
@@ -346,7 +362,9 @@ impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
             self.watchdog.reset();
             self.heartbeat_at = now;
             self.heartbeat_frames = 0;
-            self.window = Some(PlatformWindow { window });
+            self.window = Some(PlatformWindow {
+                window: Arc::new(window),
+            });
         }
 
         let window = self.window.as_ref().expect("window exists after creation");

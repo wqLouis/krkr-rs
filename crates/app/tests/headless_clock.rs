@@ -155,6 +155,7 @@ fn the_headless_script_clock_tracks_the_wall_clock() {
             archives: Vec::new(),
         }),
         mode: RunMode::Headless { frames: FRAMES },
+        dump_frame: None,
     })
     .expect("headless run");
 

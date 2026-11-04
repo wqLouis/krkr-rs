@@ -20,7 +20,7 @@ its own configuration and calls the same `app::run`.
 ```
 krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan]
      [--preload-archives] [--debug-overlay] [--graphic-cache-limit LIMIT]
-     [--archive XP3 ...] [--base-dir DIR] [GAME]
+     [--dump-frame PATH] [--archive XP3 ...] [--base-dir DIR] [GAME]
 ```
 
 | option | value | default | effect |
@@ -32,6 +32,7 @@ krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan]
 | `--preload-archives` | — | off | read every mounted archive into memory in the background |
 | `--debug-overlay` | — | off | draw the debug panel in the top-left corner |
 | `--graphic-cache-limit` | `none`, `unlimited`, `0`, bytes | the reference default (disabled) | the decoded-image cache policy |
+| `--dump-frame PATH` | path | — | write the presented frame as a PNG; needs the null backend |
 | `--archive XP3` | path | — | mount an archive; repeatable, order-significant, later wins |
 | `--base-dir DIR` | path | the first archive's parent | the mount root; every relative archive path resolves against it |
 | `GAME` | path | — | a game directory (becomes the mount root) or an XP3 file (is mounted) |
@@ -49,6 +50,12 @@ configuration failure prints the message plus the usage and exits with code
 X11 / XCB); the windowed host passes both the window and the display handle
 so a Vulkan surface can be created. The headless path has no display and
 therefore uses the null backend.
+
+`--backend null` needs no GPU: the scene is composited by the CPU software
+rasterizer, and a windowed run shows that frame through the platform's
+software presenter. `--dump-frame PATH` writes the presented frame as a PNG
+(it needs the null backend), so a run's picture can be inspected without a
+display.
 
 ---
 

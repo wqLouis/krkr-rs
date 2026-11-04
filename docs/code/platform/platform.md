@@ -28,7 +28,7 @@ It is the only L1 crate with a `#[cfg(target_os)]`.
 | | |
 |---|---|
 | Layer | L1 (bottom core) |
-| Depends on | `api` (L1 DTOs + error enums), `raw-window-handle`, `thiserror`, `log`; `winit` and `cpal` are Linux-only and optional; `ndk` is Android-only and target-gated |
+| Depends on | `api` (L1 DTOs + error enums), `raw-window-handle`, `thiserror`, `log`; `winit`, `cpal` and `softbuffer` are Linux-only and optional; `ndk` is Android-only and target-gated |
 | Must not depend on | `engine` (L2), `compat` (L3), `vm`/`tjs` (L4), a composition root, `android-activity` |
 | Forbidden | process-global state, a `&mut self` method on a service, a fallback handle where an error is owed |
 | Lint | `#![deny(unsafe_code)]`, `#![warn(missing_docs)]` |
@@ -137,8 +137,16 @@ impl PlatformWindow {
     pub fn scale_factor(&self) -> f64;
     pub fn set_size(&self, size: (u32, u32)) -> Option<(u32, u32)>;
     pub fn request_redraw(&self);
+    pub fn software_surface(&self) -> Result<SoftwareSurface, PlatformError>;
 }
 ```
+
+The **software surface** copies an RGBA8 frame into the window's pixels
+without a GPU, so the null render backend can show a game. It talks to the
+display server directly — X11 through `tiny-xlib`, Wayland through
+`wayland-client` — and loads the display libraries at run time, so the
+build needs no extra system package. It is Linux-only; on Android the call
+is a typed `NotImplemented`.
 
 On Android the window owns the `ANativeWindow` the activity acquired and
 projects it to `RawWindowHandle::AndroidNdk`, so the renderer can create and
