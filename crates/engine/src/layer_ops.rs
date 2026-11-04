@@ -5305,7 +5305,9 @@ pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
         // is what an opaque layer's children are composited over, so the
         // colour mix holds an alpha of 255 there.
         let backdrop = if opaque { OPAQUE_BACKDROP } else { [0; 4] };
-        for pixel in scene.bitmap_mut(content)?.rgba.chunks_exact_mut(4) {            pixel.copy_from_slice(&backdrop);        }
+        for pixel in scene.bitmap_mut(content)?.rgba.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&backdrop);
+        }
         for draw in &draws {
             match &draw.source {
                 SubtreeSource::Cache(id) | SubtreeSource::Bitmap(id) => {
