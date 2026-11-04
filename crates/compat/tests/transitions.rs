@@ -66,6 +66,17 @@ const BLUE_WORD: i64 = 0xFF0000;
 /// end (`reference/cpp/core/visual/RenderManager.cpp:346-350`,
 /// `reference/cpp/core/visual/LayerIntf.cpp:2917-2923`).
 const GREEN_WORD: i64 = 0x0000FF00;
+/// `0xRRGGBB` of a composited subtree whose child is the opaque red: the
+/// child is blended onto the parent's content, and the blend truncates the
+/// colour by eight bits (`255 * 255 >> 8 = 254`,
+/// `reference/cpp/core/visual/gl/blend_functor_c.h:67-76`).
+const RED_COMPOSITED: i64 = 0xFE0000;
+/// `0xRRGGBB` of a composited subtree whose child is the opaque blue,
+/// truncated the same way.
+const BLUE_COMPOSITED: i64 = 0x0000FE;
+/// `0xRRGGBB` of a composited subtree whose child is the opaque green,
+/// truncated the same way.
+const GREEN_COMPOSITED: i64 = 0x00FE00;
 
 /// The bytes stored as `rule.img`; the synthetic decoder below recognises
 /// them and returns [`RULE_RGBA`].
@@ -1043,8 +1054,19 @@ fn with_children_blends_the_layer_subtrees() {
     env.advance(50.0);
     let cache = cache_bitmap_of(&env, "dest").expect("destination cache");
     assert!(cache_bitmap_of(&env, "src").is_some(), "source cache");
-    // 50 ms into a 100 ms cross-fade truncates to phase 127.
-    assert_2x2(&env, cache, blend_rgb(RED, BLUE, 127), "destination cache");
+    // 50 ms into a 100 ms cross-fade truncates to phase 127. The frame is
+    // the cross-fade of the two composited subtrees: the destination's
+    // content is its opaque red child over the parent and the source's is
+    // its opaque blue child over the parent, and each child is blended onto
+    // the parent's content, which truncates the colour by eight bits
+    // (`255 * 255 >> 8 = 254`,
+    // `reference/cpp/core/visual/gl/blend_functor_c.h:67-76`).
+    assert_2x2(
+        &env,
+        cache,
+        blend_rgb(RED_COMPOSITED, BLUE_COMPOSITED, 127),
+        "destination cache",
+    );
     // The children keep their own pixels: only the cache holds the blend.
     assert_eq!(env.eval_int("bc.getMainPixel(0, 0)"), RED_WORD);
     assert_eq!(env.eval_int("ac.getMainPixel(0, 0)"), BLUE_WORD);
@@ -1093,11 +1115,16 @@ fn with_children_reuses_the_subtree_content_between_frames() {
         "the source subtree content is reused, not recomposited"
     );
     // The blend still advances: 50 ms into a 100 ms cross-fade truncates to
-    // phase 127.
+    // phase 127. The frame is the cross-fade of the two composited subtrees,
+    // whose colours the blend onto the parent's content has truncated by
+    // eight bits.
     let display = named_layer(&env, "dest")
         .cache_bitmap
         .expect("destination frame");
-    assert_eq!(scene_pixel(&env, display, 0, 0), blend_rgb(RED, BLUE, 127));
+    assert_eq!(
+        scene_pixel(&env, display, 0, 0),
+        blend_rgb(RED_COMPOSITED, BLUE_COMPOSITED, 127)
+    );
 }
 
 /// The composited-frame host records a new frame every tick, but the frame's
@@ -1161,12 +1188,16 @@ fn with_children_rebuilds_when_a_drawn_child_changes() {
     let dest_content = named_layer(&env, "dest")
         .cache_content
         .expect("destination content");
-    assert_eq!(scene_pixel(&env, dest_content, 0, 0), RED);
+    // The content is the opaque red child blended onto the parent's content,
+    // and the blend truncates the colour by eight bits
+    // (`255 * 255 >> 8 = 254`,
+    // `reference/cpp/core/visual/gl/blend_functor_c.h:67-76`).
+    assert_eq!(scene_pixel(&env, dest_content, 0, 0), RED_COMPOSITED);
     env.run("bc.setMainPixel(0, 0, 0x0000ff00);");
     env.advance(25.0);
     assert_eq!(
         scene_pixel(&env, dest_content, 0, 0),
-        0x00ff00,
+        GREEN_COMPOSITED,
         "the changed child is recomposited"
     );
     let display = named_layer(&env, "dest")
@@ -1174,7 +1205,7 @@ fn with_children_rebuilds_when_a_drawn_child_changes() {
         .expect("destination frame");
     assert_eq!(
         scene_pixel(&env, display, 0, 0),
-        blend_rgb(0x00ff00, BLUE, 127)
+        blend_rgb(GREEN_COMPOSITED, BLUE_COMPOSITED, 127)
     );
 }
 
@@ -1216,12 +1247,15 @@ fn a_destination_that_shows_a_hidden_control_mid_transition_ends_clean() {
     );
 
     // The control appears: the next frame recomposites the subtree, so the
-    // control is part of the blend rather than missing from it.
+    // control is part of the blend rather than missing from it. The control
+    // is blended onto the destination's own image, and the blend truncates
+    // its green by eight bits (`255 * 255 >> 8 = 254`,
+    // `reference/cpp/core/visual/gl/blend_functor_c.h:67-76`).
     env.run("bc.visible = true;");
     env.advance(25.0);
     assert_eq!(
         frame_pixel(&env, "dest", 0, 0),
-        blend_rgb(0x00ff00, BLUE, 127),
+        blend_rgb(GREEN_COMPOSITED, BLUE, 127),
         "the control recomposited under the blend"
     );
     assert_eq!(
@@ -1282,11 +1316,17 @@ fn container_source_without_image_transitions_its_children() {
     // the destination with the share its two alphas give it
     // (reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3278-3291). The
     // destination content is its child opaque blue and the source content its
-    // child opaque red, so at phase 127 the source covers
-    // 0.49609375 / (0.50390625 * 0.50390625 + 0.49609375) = 0.661357 of the
-    // destination, and the byte-space mix writes 0xA70057 (the graphics path
-    // mixes in floating point, so its channels are within one level of that).
-    assert_2x2(&env, cache, 0xA70057, "destination cache");
+    // child opaque red, each blended onto the parent's own content, so each
+    // colour is truncated by eight bits (`255 * 255 >> 8 = 254`,
+    // reference/cpp/core/visual/gl/blend_functor_c.h:67-76). The source is
+    // the window's primary layer, so it is an opaque one and its content is
+    // opaque: the source's alpha is 255 and the destination's is 255, and the
+    // source covers the destination. At phase 127 the source covers
+    // 0.49609375 / (0.50390625 * 0.50390625 + 0.49609375) = 0.661357 of
+    // the destination, and the byte-space mix writes 0xA60057 (the graphics
+    // path mixes in floating point, so its channels are within one level of
+    // that).
+    assert_2x2(&env, cache, 0xA60057, "destination cache");
 }
 
 /// The `ttExchange` teardown runs `Exchange` (`LayerIntf.cpp:754-979`),

@@ -329,7 +329,11 @@ fn render_layer_subtree_selects_the_blend_by_the_destination_face() {
     );
 
     // The opaque face: the channel mix weights the colours with the
-    // source's alpha alone and holds the destination's alpha.
+    // source's alpha alone and holds the destination's alpha. The
+    // destination is an opaque layer, so its content starts from the opaque
+    // backdrop the reference fills the cache with
+    // (`reference/cpp/core/visual/LayerIntf.cpp:7703-7707`), and the held
+    // alpha is that backdrop's 255.
     let mut scene = Scene::default();
     let win = scene.add_window("t", (2, 2));
     let parent = scene.add_layer(win, None);
@@ -350,12 +354,14 @@ fn render_layer_subtree_selects_the_blend_by_the_destination_face() {
     let bitmap = scene.bitmap(cache).unwrap();
     assert_eq!(
         &bitmap.rgba[..4],
-        &[5, 10, 15, 0],
+        &[5, 10, 15, 255],
         "the opaque face holds the destination's alpha"
     );
 
     // The `face` member wins over the type: a layer whose face was set
-    // explicitly composites with that face's blend.
+    // explicitly composites with that face's blend. The backdrop belongs to
+    // the type, so a layer that is not an opaque one starts transparent and
+    // the held alpha is that transparent zero.
     let mut scene = Scene::default();
     let win = scene.add_window("t", (2, 2));
     let parent = scene.add_layer(win, None);

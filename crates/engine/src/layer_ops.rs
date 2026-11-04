@@ -4408,6 +4408,11 @@ const FACE_PROVINCE: i32 = 3;
 /// (premultiplied) alpha.
 const FACE_ADD_ALPHA: i32 = 4;
 
+/// The backdrop an opaque layer's composited content starts from: opaque
+/// black, so the layer's own image and its children are composited over an
+/// opaque surface and the content's alpha is 255 wherever they do not reach.
+const OPAQUE_BACKDROP: [u8; 4] = [0, 0, 0, 255];
+
 /// The stored alpha handling a layer's draw face names.
 ///
 /// The face is resolved from the layer's type when it is `dfAuto`, and the
@@ -5245,7 +5250,8 @@ fn composite_subtree_draw(target: &mut BitmapState, draw: &SubtreeDraw, src: &Bi
 ///   changed.
 ///
 /// A layer with no main image is not a special case: the fill is transparent
-/// wherever no child drew, which the transparent clear reproduces. A
+/// wherever no child drew, which the transparent clear reproduces — unless the
+/// layer is an opaque one, whose content starts from the opaque backdrop. A
 /// descendant whose own subtree cache is current is composited through that
 /// cache bitmap, and its descendants are covered by it; otherwise the
 /// descendant contributes its live image. Returns `None` for an unknown layer
@@ -5255,7 +5261,7 @@ fn composite_subtree_draw(target: &mut BitmapState, draw: &SubtreeDraw, src: &Bi
 /// registry, and the caller owns its lifetime through
 /// [`Scene::inc_cache_enabled_count`] / [`Scene::dec_cache_enabled_count`].
 pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
-    let (bitmap, w, h, trivial) = {
+    let (bitmap, w, h, trivial, opaque) = {
         let layer = scene.layer(root)?;
         let clip = scene.clipping_rect(root).unwrap_or(layer.rect);
         let w = clip.w.max(1);
@@ -5268,7 +5274,13 @@ pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
             && layer.image_left == 0
             && layer.image_top == 0
             && main_image_matches_rect;
-        (layer.bitmap, w, h, trivial)
+        (
+            layer.bitmap,
+            w,
+            h,
+            trivial,
+            layer.blend == BlendMode::Replace,
+        )
     };
     if trivial {
         // The trivial path returns the main image, so any content composited
@@ -5288,7 +5300,12 @@ pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
     };
     if recalc || current_generation != recorded {
         let draws = collect_subtree_draws(scene, root, w, h);
-        scene.bitmap_mut(content)?.rgba.fill(0);
+        // The content starts from the layer's backdrop: an opaque layer's
+        // content is opaque, every other type's is transparent. The backdrop
+        // is what an opaque layer's children are composited over, so the
+        // colour mix holds an alpha of 255 there.
+        let backdrop = if opaque { OPAQUE_BACKDROP } else { [0; 4] };
+        for pixel in scene.bitmap_mut(content)?.rgba.chunks_exact_mut(4) {            pixel.copy_from_slice(&backdrop);        }
         for draw in &draws {
             match &draw.source {
                 SubtreeSource::Cache(id) | SubtreeSource::Bitmap(id) => {

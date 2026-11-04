@@ -881,3 +881,99 @@ fn the_add_alpha_mode_does_nothing_on_an_alpha_destination() {
         [200, 100, 50, 128]
     );
 }
+
+/// Reference: the additive-alpha blend onto an additive-alpha destination is
+/// the "AdditiveAlphaBlend_a" method
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2416-2417`), whose
+/// kernel is `TVPAddAlphaBlend_a_a`
+/// (`reference/krkr2/cpp/core/visual/tvpgl.h:116-133`,
+/// `reference/krkr2/cpp/core/visual/gl/blend_util_func.h:70-84`): the two
+/// alphas compose as `Da = Sa + Da - SaDa`, the destination's colour is
+/// scaled by the source's remaining alpha and the source's colour is added.
+///
+/// The destination's alpha of 128 and the source's of 192 compose to
+/// `128 + 192 - (128 * 192 >> 8) = 224`, and the destination's colour is
+/// scaled by `255 - 192 = 63`: the red channel is `200 * 63 >> 8 = 49` and
+/// the source adds 60, which is 109; the green channel is `100 * 63 >> 8` =
+/// 24 and the source adds 180, which is 204; the blue channel is
+/// `50 * 63 >> 8 = 12` and the source adds 90, which is 102.
+#[test]
+fn the_add_alpha_mode_composes_the_alphas_on_an_additive_alpha_destination() {
+    assert_eq!(
+        blend_on(
+            12,
+            DestAlpha::Additive,
+            [200, 100, 50, 128],
+            [60, 180, 90, 192],
+            255,
+            false
+        ),
+        [109, 204, 102, 224]
+    );
+    // An opaque destination keeps its alpha: the composed alpha is
+    // `255 + 64 - (255 * 64 >> 8) = 256`, and the adjustment of the alpha by
+    // its own eighth brings it back to 255. The destination's colour is
+    // scaled by `255 - 64 = 191`: the red channel is `10 * 191 >> 8 = 7`
+    // and the source adds 200, which is 207; the green channel is
+    // `20 * 191 >> 8 = 14` and the source adds 150, which is 164; the blue
+    // channel is `30 * 191 >> 8 = 22` and the source adds 100, which is 122.
+    assert_eq!(
+        blend_on(
+            12,
+            DestAlpha::Additive,
+            [10, 20, 30, 255],
+            [200, 150, 100, 64],
+            255,
+            false
+        ),
+        [207, 164, 122, 255]
+    );
+}
+
+/// Reference: below the full opacity the additive-alpha blend onto an
+/// additive-alpha destination is the "AdditiveAlphaBlend_ao" method
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2416-2417`), whose
+/// kernel is `TVPAddAlphaBlend_a_a_o`
+/// (`reference/krkr2/cpp/core/visual/tvpgl.h:153-159`,
+/// `reference/krkr2/cpp/core/visual/gl/blend_util_func.h:85-93`): the source
+/// and its alpha are faded by the opacity before the blend runs.
+#[test]
+fn the_add_alpha_mode_fades_the_source_on_an_additive_alpha_destination() {
+    // The source fades to `(60 * 128) >> 8` = 30, `(180 * 128) >> 8` = 90 and
+    // `(90 * 128) >> 8` = 45, and its alpha to `(192 * 128) >> 8` = 96. The
+    // alphas compose to `128 + 96 - (128 * 96 >> 8) = 176`, and the
+    // destination's colour is scaled by `255 - 96 = 159`: the red channel is
+    // `200 * 159 >> 8` = 124 and the source adds 30, which is 154; the green
+    // channel is `100 * 159 >> 8` = 62 and the source adds 90, which is 152;
+    // the blue channel is `50 * 159 >> 8` = 31 and the source adds 45, which
+    // is 76.
+    assert_eq!(
+        blend_on(
+            12,
+            DestAlpha::Additive,
+            [200, 100, 50, 128],
+            [60, 180, 90, 192],
+            128,
+            false
+        ),
+        [154, 152, 76, 176]
+    );
+    // The source fades to `(200 * 64) >> 8` = 50, `(150 * 64) >> 8` = 37 and
+    // `(100 * 64) >> 8` = 25, and its alpha to `(64 * 64) >> 8` = 16. The
+    // destination's colour is scaled by `255 - 16 = 239`: the red channel is
+    // `10 * 239 >> 8` = 9 and the source adds 50, which is 59; the green
+    // channel is `20 * 239 >> 8` = 18 and the source adds 37, which is 55;
+    // the blue channel is `30 * 239 >> 8` = 28 and the source adds 25, which
+    // is 53.
+    assert_eq!(
+        blend_on(
+            12,
+            DestAlpha::Additive,
+            [10, 20, 30, 255],
+            [200, 150, 100, 64],
+            64,
+            false
+        ),
+        [59, 55, 53, 255]
+    );
+}
