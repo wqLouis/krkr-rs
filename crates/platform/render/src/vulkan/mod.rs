@@ -1110,7 +1110,7 @@ impl VulkanPipeline {
                 &vstate.resources,
                 frame.descriptor_set,
                 extent,
-            )?;
+            );
 
             // SAFETY: the render pass and command buffer are recording.
             unsafe {

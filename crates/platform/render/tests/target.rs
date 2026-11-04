@@ -197,6 +197,160 @@ fn source_over_honours_source_alpha() {
     assert_eq!(out, [128, 128, 128, 255]);
 }
 
+/// The decisive experiment for the title screen's background layer: one
+/// opaque layer over the cleared background.
+///
+/// The scene's background is the projection's opaque black
+/// (`crates/engine/src/projection.rs`, `BACKGROUND_CLEAR = [0, 0, 0, 1]`), and
+/// the layer's own bitmap is fully opaque: the first pixel of the title
+/// screen's background layer is `[242, 243, 224, 255]`. The reference's plain
+/// alpha blend mixes the colours by the source's alpha and leaves the
+/// destination's alpha byte alone
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:67-75`: the masks
+/// `0xff00ff` and `0xff00` cover the red/blue and green lanes, and the alpha
+/// byte is in neither), so the composited frame carries the picture and an
+/// opaque alpha byte.
+///
+/// The port composites in `f32`, so a channel that lands on an eight-bit
+/// boundary can differ from the reference's integer path by one level (D34);
+/// the values below stay off that boundary.
+#[test]
+fn an_opaque_layer_over_the_cleared_background_is_opaque() {
+    let out = composite_one_pixel(
+        BlendMode::SourceOver,
+        [0.0, 0.0, 0.0, 1.0],
+        [242.0 / 255.0, 243.0 / 255.0, 224.0 / 255.0, 1.0],
+    );
+    assert_eq!(out, [242, 243, 224, 255]);
+}
+
+/// A blend that holds the destination's alpha leaves the frame's alpha where
+/// the destination had it, and the frame keeps the picture's colour.
+///
+/// This is the state the title screen's background layer leaves the composed
+/// frame in when the frame's alpha is zero: the picture is in the frame, and
+/// the frame's alpha is zero. The window shows the frame's colour — the
+/// reference's window surface is presented as the window's image — so the
+/// present must copy that colour rather than scale it by the frame's alpha
+/// (the Vulkan present's blend state, `crates/platform/render/src/vulkan/
+/// pipelines.rs`, `KEEP_ALPHA_COPY_SLOT`).
+#[test]
+fn a_blend_that_holds_the_destination_alpha_keeps_the_colour() {
+    let out = composite_one_pixel(
+        BlendMode::PsNormal,
+        [0.0, 0.0, 0.0, 0.0],
+        [242.0 / 255.0, 243.0 / 255.0, 224.0 / 255.0, 1.0],
+    );
+    assert_eq!(out, [242, 243, 224, 0]);
+}
+
+/// Composites two solid layers over a 1×1 background, in order, and returns
+/// the resulting RGBA8 pixel.
+///
+/// The layers are drawn in the order they are given, so the second one is
+/// composited over the first one's result.
+fn composite_two_layers(
+    background: [f32; 4],
+    first: (BlendMode, [f32; 4]),
+    second: (BlendMode, [f32; 4]),
+) -> [u8; 4] {
+    let pipeline = RenderPipeline::null();
+    let (_surface, mut state) = begin_render_state(&pipeline, &headless_window()).expect("begin");
+    let target = create_render_target(&pipeline, RenderTargetDesc::new(1, 1)).expect("target");
+
+    let mut scene = RenderScene::with_root_node();
+    let root = scene.root;
+    let mut children = Vec::new();
+    for (mode, colour) in [first, second] {
+        let child = scene.push(RenderNode {
+            parent: Some(root),
+            content: RenderContent::Solid(colour),
+            dst: RectF::new(0.0, 0.0, 1.0, 1.0),
+            blend: mode,
+            ..RenderNode::default()
+        });
+        children.push(child);
+    }
+    scene.node_mut(root).expect("root").children = children;
+    scene.background = Some(background);
+
+    render_to_target(&pipeline, &mut state, &target, &scene).expect("render");
+    let mut out = [0u8; 4];
+    read_render_target(
+        &pipeline,
+        &state,
+        &target,
+        PixelRegion::new(0, 0, 1, 1),
+        &mut out,
+    )
+    .expect("read");
+    out
+}
+
+/// A full-screen transparent additive-alpha layer over an opaque layer must
+/// not change the destination's alpha.
+///
+/// This is the title screen: the background layer is fully opaque, and a
+/// transparent additive-alpha layer covers the whole screen. The
+/// additive-alpha blend is colour-only — it adds the source's colour to the
+/// destination and leaves the destination's alpha alone
+/// (`reference/krkr2/cpp/core/visual/gl/blend_util_func.h:35-43`: the masks
+/// `0xff00ff` and `0xff00` cover the red/blue and green lanes, and the alpha
+/// byte is in neither) — so the picture and the opaque alpha byte both
+/// survive.
+#[test]
+fn a_transparent_additive_alpha_layer_keeps_the_destination_alpha() {
+    let out = composite_two_layers(
+        [0.0, 0.0, 0.0, 1.0],
+        (
+            BlendMode::SourceOver,
+            [242.0 / 255.0, 243.0 / 255.0, 224.0 / 255.0, 1.0],
+        ),
+        (BlendMode::AddAlpha, [0.0, 0.0, 0.0, 0.0]),
+    );
+    assert_eq!(out, [242, 243, 224, 255]);
+}
+
+/// The alpha each blend leaves on the destination.
+///
+/// The destination's alpha is 128 and the source's alpha is 128, so a blend
+/// that keeps the destination's alpha leaves 128, the plain copy takes the
+/// source's 128, and the source-over writes the mix of the two.
+///
+/// The colour-only blends are the additive, the subtractive, the
+/// additive-alpha, the multiplicative, the screen and the Photoshop family
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:190-197`, `:209-217`,
+/// `:222-229`, `:337-348`, `:374-381` and
+/// `reference/krkr2/cpp/core/visual/gl/blend_util_func.h:35-43`): their masks
+/// exclude the alpha byte, so they cannot change it.
+#[test]
+fn every_blend_leaves_the_alpha_its_face_names() {
+    let dst = [0.25, 0.5, 0.75, 128.0 / 255.0];
+    let src = [0.75, 0.5, 0.25, 128.0 / 255.0];
+    let cases: &[(BlendMode, u8)] = &[
+        // The source-over writes the source's alpha: the mix of the two.
+        (BlendMode::SourceOver, 192),
+        // The plain copy takes the source's alpha.
+        (BlendMode::Replace, 128),
+        // Every other blend keeps the destination's alpha.
+        (BlendMode::Additive, 128),
+        (BlendMode::Subtractive, 128),
+        (BlendMode::AddAlpha, 128),
+        (BlendMode::Multiply, 128),
+        (BlendMode::Screen, 128),
+        (BlendMode::PsNormal, 128),
+        (BlendMode::PsAdditive, 128),
+        (BlendMode::PsSubtractive, 128),
+        (BlendMode::PsMultiplicative, 128),
+        (BlendMode::PsScreen, 128),
+        (BlendMode::DestinationDependent(DstBlend::ColorDodge), 128),
+    ];
+    for (mode, expected) in cases {
+        let out = composite_one_pixel(*mode, dst, src);
+        assert_eq!(out[3], *expected, "the mode {mode:?}");
+    }
+}
+
 #[test]
 fn destination_dependent_blends_sample_the_destination() {
     // Destination `[0.25, 0.5, 0.75]`, source `[0.75, 0.5, 0.25]`, both

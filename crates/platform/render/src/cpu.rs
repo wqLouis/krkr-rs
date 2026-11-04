@@ -373,20 +373,30 @@ impl<P: TextureProvider> Canvas<'_, P> {
 }
 
 /// Composites `src` over `dst` using `mode`, returning straight-alpha RGBA.
+///
+/// The alpha a blend leaves is the blend's alpha face. The source-over writes
+/// the source's alpha, the plain copy takes the source's alpha, and every
+/// other blend is colour-only: it keeps the destination's alpha.
 fn composite(mode: BlendMode, dst: [f32; 4], src: [f32; 4]) -> ([f32; 3], f32) {
     let a = src[3].clamp(0.0, 1.0);
     let d = [dst[0], dst[1], dst[2]];
     let s = [src[0], src[1], src[2]];
     match mode {
+        // The plain copy: the source's colour and the source's alpha replace
+        // the destination's.
         BlendMode::Replace => (s, a),
+        // The additive blend and the additive-alpha blend: the colour is
+        // `src·a + dst` and the blend keeps the destination's alpha.
         BlendMode::Additive | BlendMode::AddAlpha => {
             let rgb = [
                 (d[0] + s[0] * a).clamp(0.0, 1.0),
                 (d[1] + s[1] * a).clamp(0.0, 1.0),
                 (d[2] + s[2] * a).clamp(0.0, 1.0),
             ];
-            (rgb, (dst[3] + a).clamp(0.0, 1.0))
+            (rgb, dst[3])
         }
+        // The subtractive blend: the colour is the saturating difference
+        // `dst - src·a` and the blend keeps the destination's alpha.
         BlendMode::Subtractive => {
             let rgb = [
                 (d[0] - s[0] * a).clamp(0.0, 1.0),
@@ -395,21 +405,33 @@ fn composite(mode: BlendMode, dst: [f32; 4], src: [f32; 4]) -> ([f32; 3], f32) {
             ];
             (rgb, dst[3])
         }
+        // The source-over: the colour is `src·a + dst·(1 - a)` and the
+        // result's alpha is the same mix.
         BlendMode::SourceOver => {
             let rgb = lerp3(d, s, a);
             (rgb, over_alpha(dst[3], a))
         }
+        // The Photoshop normal: the same colour mix with the destination's
+        // alpha held.
         BlendMode::PsNormal => {
-            // The Photoshop normal is the per-channel mix with the
-            // destination's alpha held: the colour is `src*a + dst*(1-a)`
-            // with no alpha correction, and the destination's alpha is written
-            // back unchanged.
             let rgb = lerp3(d, s, a);
             (rgb, dst[3])
         }
-        BlendMode::Multiply
-        | BlendMode::Screen
-        | BlendMode::PsAdditive
+        // The multiplicative and the screen blend: the colour is the
+        // per-channel product or the screen blend, the source's alpha does
+        // not weigh in, and the destination's alpha is kept.
+        BlendMode::Multiply | BlendMode::Screen => {
+            let rgb = [
+                blend_channel(mode, d[0], s[0]),
+                blend_channel(mode, d[1], s[1]),
+                blend_channel(mode, d[2], s[2]),
+            ];
+            (rgb, dst[3])
+        }
+        // The Photoshop family and the destination-dependent blends: the
+        // per-channel blend is mixed into the destination by the source's
+        // alpha, and the destination's alpha is kept.
+        BlendMode::PsAdditive
         | BlendMode::PsSubtractive
         | BlendMode::PsMultiplicative
         | BlendMode::PsScreen
@@ -420,7 +442,7 @@ fn composite(mode: BlendMode, dst: [f32; 4], src: [f32; 4]) -> ([f32; 3], f32) {
                 blend_channel(mode, d[2], s[2]),
             ];
             let rgb = lerp3(d, blended, a);
-            (rgb, over_alpha(dst[3], a))
+            (rgb, dst[3])
         }
     }
 }
@@ -457,7 +479,7 @@ fn blend_channel(mode: BlendMode, d: f32, s: f32) -> f32 {
         BlendMode::PsSubtractive => (d + s - 1.0).max(0.0),
         // Photoshop multiplicative/screen share the per-channel blend
         // function of the non-Photoshop modes; only the alpha blend around it
-        // differs, and this backend alpha-blends both.
+        // differs, and the Photoshop pair is alpha-blended.
         BlendMode::PsMultiplicative => d * s,
         BlendMode::PsScreen => d + s - d * s,
         BlendMode::DestinationDependent(kind) => match kind {

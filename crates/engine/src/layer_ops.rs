@@ -4396,6 +4396,64 @@ fn affine_nearest_band_with<B: BandBlend>(
     }
 }
 
+/// The draw face `dfAuto` — the face is resolved from the layer's type.
+const FACE_AUTO: i32 = 128;
+/// The draw face `dfOpaque` — the surface ignores its alpha.
+const FACE_OPAQUE: i32 = 1;
+/// The draw face `dfMask` — the layer draws its mask plane.
+const FACE_MASK: i32 = 2;
+/// The draw face `dfProvince` — the layer draws its province plane.
+const FACE_PROVINCE: i32 = 3;
+/// The draw face `dfAddAlpha` — the surface stores an additive
+/// (premultiplied) alpha.
+const FACE_ADD_ALPHA: i32 = 4;
+
+/// The stored alpha handling a layer's draw face names.
+///
+/// The face is resolved from the layer's type when it is `dfAuto`, and the
+/// face names the stored alpha of the surface the layer is drawn onto: the
+/// alpha face stores a straight alpha, the additive-alpha face a
+/// premultiplied one, and the opaque face none.
+fn dest_alpha_for_face(layer: &crate::scene::LayerState) -> DestAlpha {
+    match layer.face {
+        FACE_OPAQUE => DestAlpha::Opaque,
+        FACE_ADD_ALPHA => DestAlpha::Additive,
+        FACE_AUTO => dest_alpha_for_blend(layer.blend),
+        _ => DestAlpha::Straight,
+    }
+}
+
+/// The stored alpha handling a blend mode's face names.
+///
+/// The types that use their alpha channel get the alpha face, the
+/// additive-alpha type gets the additive-alpha face, and every other type
+/// gets the opaque face.
+fn dest_alpha_for_blend(blend: BlendMode) -> DestAlpha {
+    match blend {
+        BlendMode::SourceOver
+        | BlendMode::PsNormal
+        | BlendMode::PsAdditive
+        | BlendMode::PsSubtractive
+        | BlendMode::PsMultiplicative
+        | BlendMode::PsScreen
+        | BlendMode::DestinationDependent(
+            DstBlend::ColorDodge5
+            | DstBlend::ColorBurn
+            | DstBlend::Difference
+            | DstBlend::Difference5
+            | DstBlend::Exclusion
+            | DstBlend::Overlay
+            | DstBlend::HardLight
+            | DstBlend::SoftLight
+            | DstBlend::PsColorDodge
+            | DstBlend::PsDarken
+            | DstBlend::PsLighten,
+        ) => DestAlpha::Straight,
+        BlendMode::AddAlpha => DestAlpha::Additive,
+        _ => DestAlpha::Opaque,
+    }
+}
+
 /// The operation-mode number [`blend_pixel_mode`] uses for the generic
 /// [`BlendMode`] stored on a layer.
 ///
@@ -4694,6 +4752,24 @@ fn live_subtree_cache(
     (subtree_source_generation(scene, layer.id, depth + 1) == recorded).then_some(cache)
 }
 
+/// What a subtree draw draws.
+///
+/// The content of a layer is its own image with the descendants composited
+/// on top of it. The own image is the base of the content and a coverage
+/// plane — the mask or the province face — is not the layer's image at all:
+/// both are drawn over the destination as they are. Every other image is
+/// composited with the method its type names and the destination's face
+/// selects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubtreeKind {
+    /// The content's base or a coverage plane: drawn over the destination as
+    /// it is.
+    Plain,
+    /// The layer's image: composited with the method its type names and the
+    /// destination's face selects.
+    Image,
+}
+
 /// One resolved draw for the subtree cache: the source, its placement in the
 /// cache, and the draw face.
 struct SubtreeDraw {
@@ -4709,12 +4785,19 @@ struct SubtreeDraw {
     mode: i64,
     opa: u8,
     hold_alpha: bool,
-    /// Whether the composite is the plain source-over.
+    /// What the draw draws.
+    kind: SubtreeKind,
+    /// The stored alpha handling the draw's blend runs against.
     ///
-    /// The layer tree is drawn by the renderer, which composites the layers
-    /// with a source-over; the operation-mode alpha blend reads the
-    /// destination's alpha and loses a level on an opaque source.
-    source_over: bool,
+    /// Every draw lands in the root's cache, so the root's face names it:
+    /// the alpha face stores a straight alpha, the additive-alpha face a
+    /// premultiplied one, and the opaque face none.
+    dst_alpha: DestAlpha,
+    /// Whether the source is read as an opaque image.
+    ///
+    /// The copy method reads the source as an opaque image on every face but
+    /// the opaque one, so the source's alpha becomes the destination's.
+    treat_as_opaque: bool,
 }
 
 /// A `width` x `height` grayscale image (the `dfMask`/`dfProvince` face).
@@ -4750,7 +4833,7 @@ fn grayscale_bitmap(
 /// image or the province buffer, so they keep the main image.
 fn subtree_drawn_image(layer: &crate::scene::LayerState) -> Option<u32> {
     match layer.face {
-        2 | 3 => layer.bitmap,
+        FACE_MASK | FACE_PROVINCE => layer.bitmap,
         _ => layer.drawn_image(),
     }
 }
@@ -4768,7 +4851,7 @@ fn subtree_source(
         return Some(SubtreeSource::Cache(cache));
     }
     match layer.face {
-        2 => {
+        FACE_MASK => {
             let main = layer.bitmap.and_then(|id| scene.bitmap(id))?;
             if !pixels_usable(main, "renderLayerSubtree") {
                 return None;
@@ -4780,7 +4863,7 @@ fn subtree_source(
             })
             .map(SubtreeSource::Derived)
         }
-        3 => {
+        FACE_PROVINCE => {
             let province = layer.province.as_deref()?;
             let width = layer.province_width;
             let height = layer.province_height;
@@ -4921,6 +5004,11 @@ fn collect_subtree_draws(scene: &Scene, root: u32, w: u32, h: u32) -> Vec<Subtre
         return Vec::new();
     };
     let mut draws = Vec::new();
+    // The composite writes every draw into the root's cache, so the root's
+    // face names the stored alpha of that surface: the alpha face stores a
+    // straight alpha, the additive-alpha face a premultiplied one, and the
+    // opaque face none.
+    let dst_alpha = dest_alpha_for_face(root_layer);
     // Layer id -> the live cache bitmap whose pixels already cover it.
     let mut covered: Map<u32, u32> = crate::hasher::map();
     // Layer id -> the absolute intersection of its rect and every ancestor
@@ -5029,6 +5117,18 @@ fn collect_subtree_draws(scene: &Scene, root: u32, w: u32, h: u32) -> Vec<Subtre
         ) else {
             continue;
         };
+        let mode = blend_operation_mode(layer.blend);
+        // The copy method reads the source as an opaque image on every face
+        // but the opaque one, so the source's alpha becomes the
+        // destination's.
+        let treat_as_opaque = mode == 1 && dst_alpha != DestAlpha::Opaque;
+        // The content's base and the coverage planes are drawn as they are;
+        // every other image is composited with the layer's blend.
+        let kind = if id == root || matches!(&source, SubtreeSource::Derived(_)) {
+            SubtreeKind::Plain
+        } else {
+            SubtreeKind::Image
+        };
         draws.push(SubtreeDraw {
             source,
             dx: dest.0,
@@ -5036,10 +5136,12 @@ fn collect_subtree_draws(scene: &Scene, root: u32, w: u32, h: u32) -> Vec<Subtre
             dw: dest.2 - dest.0,
             dh: dest.3 - dest.1,
             src,
-            mode: blend_operation_mode(layer.blend),
+            mode,
             opa,
             hold_alpha: layer.hold_alpha,
-            source_over: layer.blend == BlendMode::SourceOver,
+            kind,
+            dst_alpha,
+            treat_as_opaque,
         });
     }
     draws
@@ -5047,50 +5149,66 @@ fn collect_subtree_draws(scene: &Scene, root: u32, w: u32, h: u32) -> Vec<Subtre
 
 /// Composite one resolved draw into the cache. The source is borrowed for the
 /// draw only; the cache stays zero wherever no draw reaches.
+///
+/// A layer's image is composited with the method its type names and the
+/// destination's face selects: the alpha blend on the alpha face takes the
+/// destination's alpha into the mix through the opacity-on-opacity table and
+/// rewrites it, so a colour lands one level below the source's. The content's
+/// base and the coverage planes are drawn over the destination as they are.
 fn composite_subtree_draw(target: &mut BitmapState, draw: &SubtreeDraw, src: &BitmapState) {
     const FULL: RectI = (i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+    // The content's base and the coverage planes are drawn over the
+    // destination as they are; every other image is composited with the
+    // method its type names and the destination's face selects.
+    let plain = draw.kind == SubtreeKind::Plain;
     if draw.dw == src.width as i32 && draw.dh == src.height as i32 {
         match draw.mode {
             0 => {}
-            1 if draw.opa == 255 => {
+            1 if draw.opa == 255 && !draw.treat_as_opaque && !draw.hold_alpha => {
                 blit_copy_clipped(target, draw.dx, draw.dy, src, draw.src, FULL);
             }
-            1 | 2 => blit_over(
-                target,
-                draw.dx,
-                draw.dy,
-                BlitSource {
-                    bitmap: src,
-                    rect: draw.src,
-                },
-                FULL,
-                BlitOptions {
-                    mode: 0,
-                    opa: draw.opa,
-                    treat_as_opaque: false,
-                    hold_alpha: draw.hold_alpha,
-                    source_over: false,
-                },
-            ),
-            mode => operate_rect(
-                target,
-                draw.dx,
-                draw.dy,
-                BlitSource {
-                    bitmap: src,
-                    rect: draw.src,
-                },
-                BlitOptions {
-                    mode,
-                    opa: draw.opa,
-                    treat_as_opaque: false,
-                    hold_alpha: draw.hold_alpha,
-                    source_over: draw.source_over,
-                },
-            ),
+            1 | 2 if plain => {
+                blit_over(
+                    target,
+                    draw.dx,
+                    draw.dy,
+                    BlitSource {
+                        bitmap: src,
+                        rect: draw.src,
+                    },
+                    FULL,
+                    BlitOptions {
+                        mode: 0,
+                        opa: draw.opa,
+                        treat_as_opaque: false,
+                        hold_alpha: draw.hold_alpha,
+                        source_over: false,
+                    },
+                );
+            }
+            mode => {
+                operate_rect_on(
+                    draw.dst_alpha,
+                    target,
+                    draw.dx,
+                    draw.dy,
+                    BlitSource {
+                        bitmap: src,
+                        rect: draw.src,
+                    },
+                    BlitOptions {
+                        mode,
+                        opa: draw.opa,
+                        treat_as_opaque: draw.treat_as_opaque,
+                        hold_alpha: draw.hold_alpha,
+                        source_over: false,
+                    },
+                );
+            }
         }
     } else {
-        stretch_blit_mode(
+        stretch_blit_on(
+            draw.dst_alpha,
             target,
             (
                 draw.dx,
@@ -5106,9 +5224,11 @@ fn composite_subtree_draw(target: &mut BitmapState, draw: &SubtreeDraw, src: &Bi
             BlitOptions {
                 mode: draw.mode,
                 opa: draw.opa,
-                treat_as_opaque: false,
+                treat_as_opaque: draw.treat_as_opaque,
                 hold_alpha: draw.hold_alpha,
-                source_over: draw.source_over,
+                // The base and the coverage planes are drawn over the
+                // destination as they are.
+                source_over: plain && draw.mode == 2,
             },
         );
     }

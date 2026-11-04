@@ -41,6 +41,7 @@ mod cpu;
 mod effect;
 pub mod glyph;
 mod null;
+mod presented;
 pub mod render_target;
 pub mod scene;
 mod state;
@@ -61,6 +62,7 @@ pub use crate::glyph::{
     has_glyph, load_font, rasterize_glyph,
 };
 pub use crate::null::{FrameStats, NULL_MAX_TEXTURE_DIMENSION, NullRenderPipeline};
+pub use crate::presented::{PresentedFrame, PresentedFrameSlot};
 pub use crate::render_target::{RenderTarget, RenderTargetDesc};
 pub use crate::scene::{
     Clip, GlyphPlacement, GlyphRun, RenderContent, RenderNode, RenderNodeId, RenderScene,
@@ -630,6 +632,35 @@ pub fn last_frame_timings(state: &RenderState) -> Option<FrameTimings> {
     match &state.kind {
         StateKind::Null(null) => null.last_timings,
         StateKind::Vulkan(vulkan) => vulkan.last_timings,
+    }
+}
+
+/// Installs the slot the presented frames are composited into.
+///
+/// The null backend composites every presented frame on the CPU with the
+/// software rasterizer and stores it in the slot, so the caller can show it
+/// in a window or write it to a file. The compositing costs a full-frame
+/// rasterization, so a backend without a slot composites nothing.
+///
+/// The slot is installed into the render state, so it has to be installed
+/// before the state is handed to the middle layer; the caller keeps its own
+/// handle to the same slot.
+///
+/// # Errors
+///
+/// [`RenderError::Unsupported`] on a backend that presents to a swapchain,
+/// and [`RenderError::InvalidArgument`] when the state does not belong to
+/// the backend.
+pub fn install_presented_frame_slot(
+    p: &RenderPipeline,
+    state: &mut RenderState,
+    slot: PresentedFrameSlot,
+) -> Result<(), RenderError> {
+    match &p.kind {
+        PipelineKind::Null(backend) => backend.install_presented_frame_slot(state, slot),
+        PipelineKind::Vulkan(_) => Err(RenderError::Unsupported {
+            message: "the Vulkan backend presents to its swapchain and has no CPU frame".to_owned(),
+        }),
     }
 }
 

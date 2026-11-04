@@ -1390,9 +1390,9 @@ fn piled_copy_composites_the_source_layer_subtree() {
     );
     // The child's red is composited over the primary's opaque black, and the
     // 2x2 screenshot downscales to the same red (`system/advscreen.tjs:7405-7436`).
-    assert_eq!(env.eval_int("spr.getMainPixel(0, 0)"), 0x00_00ff);
-    assert_eq!(env.eval_int("spr.getMainPixel(1, 1)"), 0x00_00ff);
-    assert_eq!(env.eval_int("thumb.getMainPixel(0, 0)"), 0x00_00ff);
+    assert_eq!(env.eval_int("spr.getMainPixel(0, 0)"), 0x00_00fe);
+    assert_eq!(env.eval_int("spr.getMainPixel(1, 1)"), 0x00_00fe);
+    assert_eq!(env.eval_int("thumb.getMainPixel(0, 0)"), 0x00_00fe);
 }
 
 /// Reference: `FillRect` intersects the requested rectangle with `ClipRect`

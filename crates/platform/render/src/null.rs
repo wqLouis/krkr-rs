@@ -1,11 +1,12 @@
 //! Headless (`Null`) render backend.
 //!
 //! The null backend accepts the entire render API and tracks scene traversal
-//! and texture uploads in [`RenderState`], but never touches a GPU or a
-//! window. It exists so the middle layer and the test suite can run without
-//! a device. It also ships a real CPU software rasterizer for offscreen
-//! render targets, which is the correctness baseline for
-//! destination-dependent blends and pixel readback.
+//! and texture uploads in [`RenderState`], but never touches a GPU. It exists
+//! so the middle layer and the test suite can run without a device. It also
+//! ships a real CPU software rasterizer, which is the correctness baseline for
+//! destination-dependent blends and pixel readback: the rasterizer serves the
+//! offscreen render targets, and — when the caller asks for it — the
+//! presented frame, which a window or a file can show.
 
 use api::error::RenderError;
 use api::geometry::PixelRegion;
@@ -15,6 +16,7 @@ use raw_window_handle::RawWindowHandle;
 use crate::collections::Map;
 use crate::cpu::{CpuTexture, TextureProvider};
 use crate::effect::EffectPipeline;
+use crate::presented::{PresentedFrame, PresentedFrameSlot, frame_too_large};
 use crate::render_target::{RenderTarget, RenderTargetDesc};
 use crate::scene::{
     RenderContent, RenderNode, RenderNodeId, RenderScene, child_sort_key, children_are_sorted,
@@ -308,15 +310,38 @@ impl NullRenderPipeline {
         read_region(&image.desc, &image.pixels, region, out)
     }
 
+    /// Installs the slot the presented frames are composited into.
+    ///
+    /// Every frame the backend presents is composited on the CPU and stored
+    /// in the slot, so the caller can show it in a window or write it to a
+    /// file. The compositing costs a full-frame rasterization, so a backend
+    /// without a slot does not composite at all.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::InvalidArgument`] when the state does not belong to
+    /// this backend.
+    pub fn install_presented_frame_slot(
+        &self,
+        state: &mut RenderState,
+        slot: PresentedFrameSlot,
+    ) -> Result<(), RenderError> {
+        let null = null_state_mut(state)?;
+        null.presented_slot = Some(slot);
+        Ok(())
+    }
+
     /// Traverses `scene` and records per-frame counters.
     ///
     /// The frame is always reported as presented: the null backend has no
-    /// display to present to.
+    /// display to present to. With a frame slot installed, the scene is also
+    /// composited on the CPU and stored in the slot.
     ///
     /// # Errors
     ///
     /// [`RenderError::InvalidArgument`] when the surface or the state does
-    /// not belong to this backend.
+    /// not belong to this backend, and the rasterizer's own error when the
+    /// scene carries a draw the software path does not rasterize.
     pub fn render(
         &self,
         surface: &Surface,
@@ -329,6 +354,9 @@ impl NullRenderPipeline {
         null.frame_index = null.frame_index.wrapping_add(1);
         null.last_frame = Some(stats);
         null.last_timings = Some(FrameTimings::default());
+        if let Some(slot) = &null.presented_slot {
+            composite_presented(slot, &null.textures, scene, null.surface_size)?;
+        }
         Ok(Presentation {
             presented: true,
             surface_event: None,
@@ -378,6 +406,11 @@ pub(crate) struct NullState {
     pub(crate) surface_size: (u32, u32),
     /// Number of frames rendered through this state.
     pub(crate) frame_index: u64,
+    /// The slot the presented frames are composited into.
+    ///
+    /// The slot is `None` until a caller installs one: without it the
+    /// backend composites nothing.
+    pub(crate) presented_slot: Option<PresentedFrameSlot>,
     /// CPU storage per texture identity.
     pub(crate) textures: Map<u64, NullImage>,
     /// CPU storage per offscreen render-target identity.
@@ -595,6 +628,53 @@ fn upload_into(
     image.uploads = image.uploads.saturating_add(1);
     image.bytes_uploaded = image.bytes_uploaded.saturating_add(pixels.len() as u64);
     Ok(())
+}
+
+/// Composites the presented scene into `slot`.
+///
+/// The frame is the size of the surface, so it holds the frame in device
+/// pixels: the projected tree carries the presentation transform, and the
+/// software rasterizer applies it the way the GPU path does.
+fn composite_presented(
+    slot: &PresentedFrameSlot,
+    textures: &Map<u64, NullImage>,
+    scene: &RenderScene,
+    size: (u32, u32),
+) -> Result<(), RenderError> {
+    let (width, height) = size;
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+    let total = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(frame_too_large)?;
+    let mut guard = slot.frame_mut();
+    let frame = guard.get_or_insert_with(|| PresentedFrame {
+        width,
+        height,
+        pixels: Vec::new(),
+    });
+    if frame.width != width || frame.height != height {
+        frame.width = width;
+        frame.height = height;
+        frame.pixels.clear();
+    }
+    if frame.pixels.len() != total {
+        frame
+            .pixels
+            .try_reserve(total.saturating_sub(frame.pixels.len()))
+            .map_err(|_| frame_too_large())?;
+        frame.pixels.resize(total, 0);
+    }
+    crate::cpu::render_scene(
+        width,
+        height,
+        &mut frame.pixels,
+        scene.background,
+        scene,
+        textures,
+    )
 }
 
 /// Visits the tree and returns traversal counters.

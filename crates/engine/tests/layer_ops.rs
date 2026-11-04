@@ -3,6 +3,7 @@
 //! These lock in the behaviour of the separable running-sum box blur
 //! (`blur_bitmap_in_place`) against the original 2-D summation it replaced.
 
+use api::blend::BlendMode;
 use api::geometry::PixelRegion;
 use engine::BitmapState;
 use engine::Scene;
@@ -130,7 +131,12 @@ fn render_layer_subtree_composites_children_into_a_cache() {
     {
         let bitmap = scene.bitmap(cache).unwrap();
         assert_eq!((bitmap.width, bitmap.height), (2, 2));
-        assert_eq!(&bitmap.rgba[..4], &[10, 20, 30, 255]);
+        // The child is composited with the alpha blend of an alpha
+        // destination: the source's alpha of 255 mixes the colour with the
+        // destination's alpha of zero, so the colours are the source's
+        // truncated by eight bits (`10 * 255 >> 8 = 9`,
+        // `reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:67-76`).
+        assert_eq!(&bitmap.rgba[..4], &[9, 19, 29, 255]);
     }
 
     // A trivial subtree returns the layer's MainImage and allocates no cache.
@@ -259,6 +265,122 @@ fn render_layer_subtree_selects_the_layer_face() {
     );
 }
 
+/// The destination's draw face selects the blend a layer's image is
+/// composited with: the alpha face composites with the alpha blend of an
+/// alpha destination — the destination's alpha takes part in the mix and is
+/// rewritten — while the opaque face composites with the channel mix, which
+/// holds the destination's alpha and weights the mix with the source's alpha
+/// alone.
+///
+/// The face comes from the destination layer: its `face` member when the
+/// script set one, and otherwise the face its type resolves to.
+///
+/// `reference/krkr2/cpp/core/visual/gl/blend_variation.h:109-141` (the
+/// destination-alpha variant) and
+/// `reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:67-76` (the channel
+/// mix).
+#[test]
+fn render_layer_subtree_selects_the_blend_by_the_destination_face() {
+    // The alpha face and an opaque source: the destination's alpha of zero
+    // takes part in the mix, so the colours are the source's truncated by
+    // eight bits, and the destination's alpha is rewritten to the source's
+    // coverage.
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (2, 2));
+    let parent = scene.add_layer(win, None);
+    scene.layer_mut(parent).unwrap().rect = Rect::new(0, 0, 2, 2);
+    let child = scene.add_layer(win, Some(parent));
+    let child_bitmap = solid_bitmap(&mut scene, 2, 2, [10, 20, 30, 255]);
+    {
+        let l = scene.layer_mut(child).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.visible = true;
+        l.bitmap = Some(child_bitmap);
+    }
+    let cache = render_layer_subtree(&mut scene, parent).expect("cache bitmap");
+    let bitmap = scene.bitmap(cache).unwrap();
+    assert_eq!(
+        &bitmap.rgba[..4],
+        &[9, 19, 29, 255],
+        "the alpha face composites with the destination's alpha"
+    );
+
+    // The alpha face and a half-transparent source: the destination is
+    // transparent, so the source's colour shows whole and the destination's
+    // alpha becomes the source's coverage.
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (2, 2));
+    let parent = scene.add_layer(win, None);
+    scene.layer_mut(parent).unwrap().rect = Rect::new(0, 0, 2, 2);
+    let child = scene.add_layer(win, Some(parent));
+    let child_bitmap = solid_bitmap(&mut scene, 2, 2, [10, 20, 30, 128]);
+    {
+        let l = scene.layer_mut(child).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.visible = true;
+        l.bitmap = Some(child_bitmap);
+    }
+    let cache = render_layer_subtree(&mut scene, parent).expect("cache bitmap");
+    let bitmap = scene.bitmap(cache).unwrap();
+    assert_eq!(
+        &bitmap.rgba[..4],
+        &[9, 19, 29, 128],
+        "a transparent destination takes the source's coverage"
+    );
+
+    // The opaque face: the channel mix weights the colours with the
+    // source's alpha alone and holds the destination's alpha.
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (2, 2));
+    let parent = scene.add_layer(win, None);
+    {
+        let l = scene.layer_mut(parent).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.blend = BlendMode::Replace;
+    }
+    let child = scene.add_layer(win, Some(parent));
+    let child_bitmap = solid_bitmap(&mut scene, 2, 2, [10, 20, 30, 128]);
+    {
+        let l = scene.layer_mut(child).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.visible = true;
+        l.bitmap = Some(child_bitmap);
+    }
+    let cache = render_layer_subtree(&mut scene, parent).expect("cache bitmap");
+    let bitmap = scene.bitmap(cache).unwrap();
+    assert_eq!(
+        &bitmap.rgba[..4],
+        &[5, 10, 15, 0],
+        "the opaque face holds the destination's alpha"
+    );
+
+    // The `face` member wins over the type: a layer whose face was set
+    // explicitly composites with that face's blend.
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (2, 2));
+    let parent = scene.add_layer(win, None);
+    {
+        let l = scene.layer_mut(parent).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.face = 1; // dfOpaque
+    }
+    let child = scene.add_layer(win, Some(parent));
+    let child_bitmap = solid_bitmap(&mut scene, 2, 2, [10, 20, 30, 128]);
+    {
+        let l = scene.layer_mut(child).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.visible = true;
+        l.bitmap = Some(child_bitmap);
+    }
+    let cache = render_layer_subtree(&mut scene, parent).expect("cache bitmap");
+    let bitmap = scene.bitmap(cache).unwrap();
+    assert_eq!(
+        &bitmap.rgba[..4],
+        &[5, 10, 15, 0],
+        "the stored face wins over the type"
+    );
+}
+
 /// `Complete` returns the existing `CacheBitmap` while `CacheRecalcRegion` is
 /// empty (`CacheRecalcRegion.GetCount() == 0`), so an unchanged subtree is
 /// not recomposited.
@@ -376,7 +498,11 @@ fn render_layer_subtree_rebuilds_when_a_drawn_image_changes() {
         bitmap.dirty,
         "a changed source image recomposites the cache"
     );
-    assert_eq!(&bitmap.rgba[..4], &[200, 100, 50, 255]);
+    // The composited child blends with the alpha blend of an alpha
+    // destination, so its colours are the source's truncated by eight bits
+    // (`200 * 255 >> 8 = 199`,
+    // `reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:67-76`).
+    assert_eq!(&bitmap.rgba[..4], &[199, 99, 49, 255]);
 }
 
 /// A change to a hidden layer does not invalidate the cache, matching
@@ -479,12 +605,12 @@ fn render_layer_subtree_uses_a_live_nested_cache() {
     let bitmap = scene.bitmap(outer_content).unwrap();
     assert_eq!(
         &bitmap.rgba[..4],
-        &[200, 100, 50, 255],
+        &[199, 99, 49, 255],
         "the outer cache holds the child's cached content"
     );
     assert_eq!(
         &bitmap.rgba[4..8],
-        &[200, 100, 50, 255],
+        &[199, 99, 49, 255],
         "the grandchild covered by the cache is not drawn on top of it"
     );
 }
@@ -505,7 +631,7 @@ fn render_layer_subtree_falls_back_from_a_stale_nested_cache() {
     let outer_content = render_layer_subtree(&mut scene, outer).expect("outer content");
     assert_eq!(
         &scene.bitmap(outer_content).unwrap().rgba[..4],
-        &[200, 100, 50, 255]
+        &[199, 99, 49, 255]
     );
 
     // The grandchild's pixels change without a layer accessor: the inner
@@ -514,7 +640,7 @@ fn render_layer_subtree_falls_back_from_a_stale_nested_cache() {
     let outer_content = render_layer_subtree(&mut scene, outer).expect("outer content");
     assert_eq!(
         &scene.bitmap(outer_content).unwrap().rgba[..4],
-        &[0, 255, 0, 255],
+        &[0, 254, 0, 255],
         "a stale cache is not sampled"
     );
 
@@ -527,7 +653,7 @@ fn render_layer_subtree_falls_back_from_a_stale_nested_cache() {
     let outer_content = render_layer_subtree(&mut scene, outer).expect("outer content");
     assert_eq!(
         &scene.bitmap(outer_content).unwrap().rgba[..4],
-        &[50, 100, 200, 255],
+        &[49, 99, 199, 255],
         "the refreshed cache is sampled"
     );
     assert!(
@@ -541,7 +667,7 @@ fn render_layer_subtree_falls_back_from_a_stale_nested_cache() {
     let outer_content = render_layer_subtree(&mut scene, outer).expect("outer content");
     assert_eq!(
         &scene.bitmap(outer_content).unwrap().rgba[..4],
-        &[0, 255, 0, 255],
+        &[0, 254, 0, 255],
         "a pending recomposite is not sampled"
     );
     let refreshed = render_layer_subtree(&mut scene, inner).expect("inner content");
@@ -550,7 +676,7 @@ fn render_layer_subtree_falls_back_from_a_stale_nested_cache() {
     let outer_content = render_layer_subtree(&mut scene, outer).expect("outer content");
     assert_eq!(
         &scene.bitmap(outer_content).unwrap().rgba[..4],
-        &[5, 6, 7, 255],
+        &[4, 5, 6, 255],
         "the rebuilt cache is sampled"
     );
 }

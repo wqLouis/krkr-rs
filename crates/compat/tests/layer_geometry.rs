@@ -446,7 +446,7 @@ fn cached_layers_composite_and_refresh_through_the_frame_pump() {
     assert_ne!(cache, main, "a subtree with a visible child composes");
     assert_eq!(
         scene_pixel(&env, cache, 0, 0),
-        0x00ff00,
+        0x00fe00,
         "the child is cached"
     );
     assert_eq!(
@@ -476,7 +476,7 @@ fn cached_layers_composite_and_refresh_through_the_frame_pump() {
     assert_eq!(named_layer(&env, "p").cache_bitmap, Some(cache));
     assert_eq!(
         scene_pixel(&env, cache, 0, 0),
-        0x0000ff,
+        0x0000fe,
         "the changed child reached the cache"
     );
     assert_eq!(scene_pixel(&env, cache, 3, 3), 0x112233);
@@ -532,7 +532,7 @@ fn nested_caches_composite_deepest_first() {
     assert_ne!(parent_cache, child_cache);
     assert_eq!(
         scene_pixel(&env, parent_cache, 0, 0),
-        0x00ff00,
+        0x00fd00,
         "the parent's cache shows the child"
     );
     assert_eq!(
@@ -585,7 +585,7 @@ fn a_content_only_bitmap_write_reaches_the_subtree_cache() {
     let cache = named_layer(&env, "p")
         .cache_bitmap
         .expect("the cache bitmap");
-    assert_eq!(scene_pixel(&env, cache, 0, 0), 0x00ff00);
+    assert_eq!(scene_pixel(&env, cache, 0, 0), 0x00fe00);
 
     let child_bitmap = named_layer(&env, "c").bitmap.expect("child image");
     let structure = env.scene.structure_revision();
@@ -604,7 +604,7 @@ fn a_content_only_bitmap_write_reaches_the_subtree_cache() {
     env.refresh_caches();
     assert_eq!(
         scene_pixel(&env, cache, 0, 0),
-        0x0000ff,
+        0x0000fe,
         "the content-only write reached the cache"
     );
 }

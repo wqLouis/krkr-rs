@@ -26,7 +26,22 @@ use super::shaders;
 use super::texture::find_memory_type;
 
 /// Number of fixed-function blend variants compiled per program.
-pub(crate) const BLEND_SLOT_COUNT: usize = 8;
+pub(crate) const BLEND_SLOT_COUNT: usize = 9;
+
+/// The blend slot that copies the source's colour and keeps the destination's
+/// alpha.
+///
+/// The present draws the composed frame into the surface with it: the frame is
+/// the window's image, so the window shows the frame's colour and the
+/// surface's own alpha survives. A source-over present would multiply the
+/// frame's colour by the frame's alpha and drop whatever the surface held, so
+/// a frame that carries colour with a reduced alpha would lose that colour to
+/// the surface's cleared background.
+///
+/// A copy that holds the destination's alpha uses the same state: the
+/// source's colour replaces the destination's and the destination's alpha
+/// stays.
+pub(crate) const KEEP_ALPHA_COPY_SLOT: usize = 8;
 
 /// Which quad program a draw uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +95,9 @@ pub(crate) struct PipelineSet {
 impl PipelineSet {
     /// Returns the pipeline for `program` and `mode`.
     ///
+    /// `hold_alpha` is the node's hold-alpha flag: a blend that holds the
+    /// destination's alpha runs its held face.
+    ///
     /// # Errors
     ///
     /// Returns [`RenderError::Unsupported`] for a destination-dependent mode
@@ -88,11 +106,12 @@ impl PipelineSet {
         &self,
         program: Program,
         mode: BlendMode,
+        hold_alpha: bool,
     ) -> Result<vk::Pipeline, RenderError> {
         if matches!(program, Program::DstBlend) {
             return Ok(self.dst_blend);
         }
-        let slot = blend_slot(mode).ok_or_else(|| RenderError::Unsupported {
+        let slot = blend_slot_for(mode, hold_alpha).ok_or_else(|| RenderError::Unsupported {
             message: format!(
                 "blend mode {mode:?} reads the destination, which the {program:?} program does \
                  not sample"
@@ -103,6 +122,19 @@ impl PipelineSet {
             Program::Solid => self.solid[slot],
             Program::DstBlend => self.dst_blend,
         })
+    }
+
+    /// Returns the pipeline the present draw uses.
+    ///
+    /// The present has a blend state of its own: it copies the composed
+    /// frame's colour into the surface and keeps the surface's alpha, so it
+    /// is not one of the scene's blend slots.
+    pub(crate) fn present_pipeline(&self, program: Program) -> vk::Pipeline {
+        match program {
+            Program::Textured => self.textured[KEEP_ALPHA_COPY_SLOT],
+            Program::Solid => self.solid[KEEP_ALPHA_COPY_SLOT],
+            Program::DstBlend => self.dst_blend,
+        }
     }
 
     /// Destroys every pipeline owned by the set.
@@ -406,15 +438,23 @@ pub(crate) const fn dst_blend_mode(mode: BlendMode) -> Option<u32> {
 
 /// Returns the fixed-function blend state for a pipeline slot.
 ///
-/// `AddAlpha` uses an additive color
-/// path with the source alpha replacing the destination alpha, an
-/// approximation of the engine's legacy rule.
+/// The alpha factors carry the blend's alpha face. A colour-only blend keeps
+/// the destination's alpha, which the fixed-function state spells `ZERO` for
+/// the source and `ONE` for the destination. The two blends that write an
+/// alpha name the source's: the source-over writes `src·a + dst·(1 - a)` and
+/// the plain copy writes the source's alpha outright.
+///
+/// The keep-alpha copy's slot copies the composed frame's colour and keeps the
+/// surface's alpha: the frame is the window's image, so its colour is what
+/// the window shows, whatever alpha its pixels carry.
 fn blend_state_for_slot(slot: usize) -> vk::PipelineColorBlendAttachmentState {
     let base = vk::PipelineColorBlendAttachmentState::default()
         .blend_enable(true)
         .color_write_mask(vk::ColorComponentFlags::RGBA);
 
     match slot {
+        // The plain copy: the source's colour and the source's alpha replace
+        // the destination's.
         1 => base
             .src_color_blend_factor(vk::BlendFactor::ONE)
             .dst_color_blend_factor(vk::BlendFactor::ZERO)
@@ -422,45 +462,62 @@ fn blend_state_for_slot(slot: usize) -> vk::PipelineColorBlendAttachmentState {
             .src_alpha_blend_factor(vk::BlendFactor::ONE)
             .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
             .alpha_blend_op(vk::BlendOp::ADD),
+        // The additive blend: the colour is `src·a + dst` and the blend is
+        // colour-only, so the destination's alpha is kept.
         2 => base
             .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
             .dst_color_blend_factor(vk::BlendFactor::ONE)
             .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .src_alpha_blend_factor(vk::BlendFactor::ZERO)
             .dst_alpha_blend_factor(vk::BlendFactor::ONE)
             .alpha_blend_op(vk::BlendOp::ADD),
+        // The subtractive blend: the colour is the saturating difference
+        // `dst - src·a` and the blend is colour-only, so the destination's
+        // alpha is kept.
         3 => base
             .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
             .dst_color_blend_factor(vk::BlendFactor::ONE)
             .color_blend_op(vk::BlendOp::REVERSE_SUBTRACT)
-            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .src_alpha_blend_factor(vk::BlendFactor::ZERO)
             .dst_alpha_blend_factor(vk::BlendFactor::ONE)
-            .alpha_blend_op(vk::BlendOp::REVERSE_SUBTRACT),
+            .alpha_blend_op(vk::BlendOp::ADD),
+        // The additive-alpha blend: the colour is `src·a + dst` and the blend
+        // is colour-only, so the destination's alpha is kept. The blend adds
+        // the source's colour to the destination and never touches the
+        // destination's alpha.
         4 => base
             .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
             .dst_color_blend_factor(vk::BlendFactor::ONE)
             .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(vk::BlendFactor::ONE)
-            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .src_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE)
             .alpha_blend_op(vk::BlendOp::ADD),
+        // The multiplicative blend: the colour is the per-channel product
+        // `dst·src` and the blend is colour-only, so the destination's alpha
+        // is kept.
         5 => base
             .src_color_blend_factor(vk::BlendFactor::DST_COLOR)
             .dst_color_blend_factor(vk::BlendFactor::ZERO)
             .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(vk::BlendFactor::DST_ALPHA)
-            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .src_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE)
             .alpha_blend_op(vk::BlendOp::ADD),
+        // The screen blend: the colour is `dst + src - dst·src` and the blend
+        // is colour-only, so the destination's alpha is kept.
         6 => base
             .src_color_blend_factor(vk::BlendFactor::ONE_MINUS_DST_COLOR)
             .dst_color_blend_factor(vk::BlendFactor::ONE)
             .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_DST_ALPHA)
+            .src_alpha_blend_factor(vk::BlendFactor::ZERO)
             .dst_alpha_blend_factor(vk::BlendFactor::ONE)
             .alpha_blend_op(vk::BlendOp::ADD),
         // Slot 7: the Photoshop normal - the per-channel mix `src*a +
         // dst*(1-a)` with the destination's alpha held: the colour factors
         // are `SRC_ALPHA`/`ONE_MINUS_SRC_ALPHA` and the alpha factors
         // `ZERO`/`ONE`.
+        //
+        // The slot is also the held face of the source-over: the same
+        // colour mix with the destination's alpha kept.
         7 => base
             .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
             .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
@@ -468,7 +525,19 @@ fn blend_state_for_slot(slot: usize) -> vk::PipelineColorBlendAttachmentState {
             .src_alpha_blend_factor(vk::BlendFactor::ZERO)
             .dst_alpha_blend_factor(vk::BlendFactor::ONE)
             .alpha_blend_op(vk::BlendOp::ADD),
-        // Slot 0: source-over.
+        // The keep-alpha copy: the source's colour replaces the destination's
+        // and the destination's alpha is kept. The present uses it to copy the
+        // composed frame's colour into the surface, so the window shows the
+        // frame's colour and stays opaque.
+        KEEP_ALPHA_COPY_SLOT => base
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::ZERO)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+            .alpha_blend_op(vk::BlendOp::ADD),
+        // Slot 0: the source-over. The only blend that writes the source's
+        // alpha: the result's alpha is `src·a + dst·(1 - a)`.
         _ => base
             .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
             .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
@@ -476,6 +545,23 @@ fn blend_state_for_slot(slot: usize) -> vk::PipelineColorBlendAttachmentState {
             .src_alpha_blend_factor(vk::BlendFactor::ONE)
             .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
             .alpha_blend_op(vk::BlendOp::ADD),
+    }
+}
+
+/// The slot a mode's draw uses.
+///
+/// A draw that holds the destination's alpha runs the blend's held face: the
+/// copy keeps the destination's alpha and the source-over mixes the colours
+/// without writing an alpha. Every other blend keeps the destination's alpha
+/// on its own, so the flag changes nothing for them.
+fn blend_slot_for(mode: BlendMode, hold_alpha: bool) -> Option<usize> {
+    match (mode, hold_alpha) {
+        // The held copy: the source's colour and the destination's alpha.
+        (BlendMode::Replace, true) => Some(KEEP_ALPHA_COPY_SLOT),
+        // The held source-over: the Photoshop normal's colour mix with the
+        // destination's alpha kept.
+        (BlendMode::SourceOver, true) => Some(7),
+        _ => blend_slot(mode),
     }
 }
 
@@ -965,5 +1051,220 @@ mod tests {
     fn the_photoshop_subtractive_blend_has_no_fixed_function_slot() {
         assert_eq!(blend_slot(BlendMode::PsSubtractive), None);
         assert_eq!(blend_slot(BlendMode::Subtractive), Some(3));
+    }
+
+    /// The fixed-function composite of a copy that keeps the destination's
+    /// alpha: the source's colour and the destination's alpha.
+    fn copy_colour_keep_alpha(src: [u8; 4], dst: [u8; 4]) -> [u8; 4] {
+        [src[0], src[1], src[2], dst[3]]
+    }
+
+    /// The fixed-function composite of a source-over: the colour and the
+    /// alpha are the source scaled by the source's alpha plus the
+    /// destination scaled by its complement.
+    fn source_over(src: [u8; 4], dst: [u8; 4]) -> [u8; 4] {
+        let alpha = u32::from(src[3]);
+        let inverse = 255 - alpha;
+        let mut out = [0u8; 4];
+        for (channel, value) in out.iter_mut().enumerate() {
+            *value =
+                ((u32::from(src[channel]) * alpha + u32::from(dst[channel]) * inverse) / 255) as u8;
+        }
+        out
+    }
+
+    /// The present copies the composed frame's colour and keeps the surface's
+    /// alpha.
+    ///
+    /// The composed frame is the window's image: the reference's window
+    /// surface is presented as the window's image and the window's own face
+    /// is the opaque one, so the window shows the surface's colour whatever
+    /// alpha the surface's pixels carry
+    /// (`reference/krkr2/cpp/core/visual/BitmapLayerTreeOwner.cpp:73-107`:
+    /// the primary layer's pixels are copied into the window's bitmap with a
+    /// raw `memcpy`, with no blending).
+    ///
+    /// A source-over present multiplies the frame's colour by the frame's
+    /// alpha. A layer whose blend holds the destination's alpha leaves the
+    /// frame's alpha at zero, so the whole picture would be presented as the
+    /// surface's cleared black while the frame still held the picture's
+    /// colour. The vectors are that frame: the title screen's background
+    /// layer's pixel `[242, 243, 224, 255]` in a frame whose alpha the blend
+    /// held at zero, over the surface cleared to opaque black.
+    #[test]
+    fn the_present_copies_the_frame_colour_and_keeps_the_surface_alpha() {
+        let state = blend_state_for_slot(KEEP_ALPHA_COPY_SLOT);
+        assert_eq!(state.src_color_blend_factor, vk::BlendFactor::ONE);
+        assert_eq!(state.dst_color_blend_factor, vk::BlendFactor::ZERO);
+        assert_eq!(state.src_alpha_blend_factor, vk::BlendFactor::ZERO);
+        assert_eq!(state.dst_alpha_blend_factor, vk::BlendFactor::ONE);
+
+        // The frame holds the picture; its alpha is zero where the layer's
+        // blend held the destination's alpha.
+        let frame = [242u8, 243, 224, 0];
+        // The surface was cleared to the scene's background: opaque black.
+        let surface = [0u8, 0, 0, 255];
+        // The present shows the picture and leaves the window opaque.
+        assert_eq!(copy_colour_keep_alpha(frame, surface), [242, 243, 224, 255]);
+        // The source-over present the slot replaced loses the picture: the
+        // frame's colour is scaled by the frame's zero alpha and the
+        // surface's black shows.
+        assert_eq!(source_over(frame, surface), [0, 0, 0, 255]);
+    }
+
+    /// Every colour-only blend keeps the destination's alpha.
+    ///
+    /// A kernel whose masks exclude the alpha byte cannot change it, and the
+    /// held face of such a kernel restores the destination's alpha outright:
+    ///
+    /// * the additive blend masks the source with `0x00ff00` and `0xff00ff`
+    ///   (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:190-197`), so
+    ///   the alpha byte is in neither mask;
+    /// * the subtractive blend masks the same two lanes
+    ///   (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:209-217`);
+    /// * the multiplicative blend multiplies the blue, green and red lanes
+    ///   only (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:222-228`),
+    ///   and its held face adds the destination's alpha back
+    ///   (`reference/krkr2/cpp/core/visual/tvpgl.cpp:7181-7196`);
+    /// * the screen blend masks the same two lanes
+    ///   (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:337-347`);
+    /// * the additive-alpha blend masks the same two lanes
+    ///   (`reference/krkr2/cpp/core/visual/gl/blend_util_func.h:35-43`), and
+    ///   its held face restores the destination's alpha
+    ///   (`reference/krkr2/cpp/core/visual/tvpgl.cpp:944-971`);
+    /// * the Photoshop normal mixes the red/blue and the green lanes
+    ///   (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:374-384`), so
+    ///   the alpha byte is in neither mask.
+    ///
+    /// The fixed-function spelling of "keep the destination's alpha" is the
+    /// source factor `ZERO` and the destination factor `ONE`.
+    #[test]
+    fn every_colour_only_blend_keeps_the_destination_alpha() {
+        for (mode, slot) in [
+            (BlendMode::Additive, 2usize),
+            (BlendMode::Subtractive, 3),
+            (BlendMode::AddAlpha, 4),
+            (BlendMode::Multiply, 5),
+            (BlendMode::Screen, 6),
+            (BlendMode::PsNormal, 7),
+        ] {
+            assert_eq!(blend_slot(mode), Some(slot), "the mode {mode:?}");
+            let state = blend_state_for_slot(slot);
+            assert_eq!(
+                state.src_alpha_blend_factor,
+                vk::BlendFactor::ZERO,
+                "the mode {mode:?} writes the source's alpha"
+            );
+            assert_eq!(
+                state.dst_alpha_blend_factor,
+                vk::BlendFactor::ONE,
+                "the mode {mode:?} does not keep the destination's alpha"
+            );
+        }
+    }
+
+    /// The additive-alpha blend leaves an opaque destination alone.
+    ///
+    /// The blend adds the source's colour to the destination and never
+    /// touches the destination's alpha
+    /// (`reference/krkr2/cpp/core/visual/gl/blend_util_func.h:35-43`), so a
+    /// fully transparent source leaves the destination's pixel as it was. The
+    /// vector is the title screen's background layer's pixel
+    /// `[242, 243, 224, 255]` with the transparent layer that covers it.
+    #[test]
+    fn the_additive_alpha_blend_leaves_the_destination_alpha_alone() {
+        let state = blend_state_for_slot(4);
+        assert_eq!(state.src_alpha_blend_factor, vk::BlendFactor::ZERO);
+        assert_eq!(state.dst_alpha_blend_factor, vk::BlendFactor::ONE);
+
+        // The source is fully transparent: the colour adds nothing and the
+        // destination's alpha is kept.
+        let source = [0u8, 0, 0, 0];
+        let destination = [242u8, 243, 224, 255];
+        // The colour factors are `SRC_ALPHA`/`ONE`: the source's colour is
+        // scaled by the source's alpha and added to the destination's.
+        let alpha = u32::from(source[3]);
+        let mut colour = [0u8; 3];
+        for (channel, value) in colour.iter_mut().enumerate() {
+            *value =
+                (u32::from(destination[channel]) + u32::from(source[channel]) * alpha / 255) as u8;
+        }
+        assert_eq!(
+            [colour[0], colour[1], colour[2], destination[3]],
+            destination
+        );
+    }
+
+    /// The source-over is the one blend that writes the source's alpha.
+    ///
+    /// The engine's plain source-over writes the source's alpha
+    /// (`crates/engine/src/layer_ops.rs:2969-2975`), and the reference's
+    /// destination-alpha face writes the same value: `255 - (255-da)(255-sa)/255`
+    /// (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:109-141` with
+    /// `reference/krkr2/cpp/core/visual/tvpgl.cpp:582-620`), which is the
+    /// source-over's `src·a + dst·(1 - a)`.
+    #[test]
+    fn the_source_over_writes_the_source_alpha() {
+        let state = blend_state_for_slot(0);
+        assert_eq!(state.src_alpha_blend_factor, vk::BlendFactor::ONE);
+        assert_eq!(
+            state.dst_alpha_blend_factor,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA
+        );
+
+        // The source-over's alpha: the source's alpha plus the destination's
+        // alpha scaled by the source's complement.
+        let source = [10u8, 20, 30, 128];
+        let destination = [200u8, 100, 50, 255];
+        let alpha = u32::from(source[3]);
+        let over = alpha + u32::from(destination[3]) * (255 - alpha) / 255;
+        assert_eq!(over, 255);
+    }
+
+    /// The plain copy takes the source's alpha.
+    ///
+    /// The copy replaces the destination's pixel with the source's
+    /// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:158-160`), so
+    /// the source's alpha is the result's alpha.
+    #[test]
+    fn the_plain_copy_takes_the_source_alpha() {
+        let state = blend_state_for_slot(1);
+        assert_eq!(state.src_alpha_blend_factor, vk::BlendFactor::ONE);
+        assert_eq!(state.dst_alpha_blend_factor, vk::BlendFactor::ZERO);
+    }
+
+    /// A draw that holds the destination's alpha runs the blend's held face.
+    ///
+    /// The copy's held face keeps the destination's alpha
+    /// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:162-167`), and
+    /// the source-over's held face mixes the colours without writing an alpha
+    /// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:67-75` with
+    /// `reference/krkr2/cpp/core/visual/gl/blend_variation.h:63-73`).
+    #[test]
+    fn a_held_draw_runs_the_blends_held_face() {
+        // The held copy: the source's colour and the destination's alpha.
+        assert_eq!(
+            blend_slot_for(BlendMode::Replace, true),
+            Some(KEEP_ALPHA_COPY_SLOT)
+        );
+        // The held source-over: the Photoshop normal's colour mix with the
+        // destination's alpha kept.
+        assert_eq!(blend_slot_for(BlendMode::SourceOver, true), Some(7));
+        // Every other blend keeps the destination's alpha on its own, so the
+        // flag selects the same slot.
+        for mode in [
+            BlendMode::Additive,
+            BlendMode::Subtractive,
+            BlendMode::AddAlpha,
+            BlendMode::Multiply,
+            BlendMode::Screen,
+            BlendMode::PsNormal,
+        ] {
+            assert_eq!(
+                blend_slot_for(mode, true),
+                blend_slot(mode),
+                "the mode {mode:?}"
+            );
+        }
     }
 }

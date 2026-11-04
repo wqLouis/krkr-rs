@@ -198,10 +198,11 @@ pub(crate) fn record_scene(
 /// The draw is a full-screen quad that samples the target the scene was
 /// composed into, so the surface shows the composed frame.
 ///
-/// # Errors
-///
-/// Returns [`RenderError::Unsupported`] when the pipeline for the draw cannot
-/// be selected.
+/// The composed frame is the window's image: the present copies its colour
+/// into the surface and leaves the surface's alpha alone. A source-over
+/// present would multiply the frame's colour by the frame's alpha, so a frame
+/// that carries colour with a reduced alpha would lose that colour to the
+/// surface's cleared background.
 pub(crate) fn record_present(
     device: &ash::Device,
     command: vk::CommandBuffer,
@@ -209,8 +210,8 @@ pub(crate) fn record_present(
     resources: &PipelineResources,
     target: vk::DescriptorSet,
     extent: vk::Extent2D,
-) -> Result<(), RenderError> {
-    let pipeline = pipelines.pipeline_for(Program::Textured, api::blend::BlendMode::SourceOver)?;
+) {
+    let pipeline = pipelines.present_pipeline(Program::Textured);
     let scissor = vk::Rect2D {
         offset: vk::Offset2D { x: 0, y: 0 },
         extent,
@@ -256,7 +257,6 @@ pub(crate) fn record_present(
         device.cmd_set_scissor(command, 0, &[scissor]);
         device.cmd_draw(command, 4, 1, 0, 0);
     }
-    Ok(())
 }
 
 /// One unit-quad draw request: the pipeline it selects and the shader inputs
@@ -266,6 +266,8 @@ struct QuadDraw<'a> {
     program: Program,
     /// Blend mode selecting the pipeline variant.
     blend: api::blend::BlendMode,
+    /// Whether the draw holds the destination's alpha.
+    hold_alpha: bool,
     /// Transform from the node's local space to device pixels.
     world: &'a Affine2,
     /// RGBA tint; alpha carries the composed opacity.
@@ -357,6 +359,7 @@ impl Recorder<'_> {
         self.draw_quad(QuadDraw {
             program: Program::Solid,
             blend: api::blend::BlendMode::Replace,
+            hold_alpha: false,
             world: &Affine2::IDENTITY,
             tint: self.pass.clear,
             uv_rect: [0.0, 0.0, 1.0, 1.0],
@@ -461,6 +464,7 @@ impl Recorder<'_> {
                 self.draw_quad(QuadDraw {
                     program: Program::Solid,
                     blend: node.blend,
+                    hold_alpha: node.hold_alpha,
                     world,
                     tint,
                     uv_rect: [0.0, 0.0, 1.0, 1.0],
@@ -497,6 +501,7 @@ impl Recorder<'_> {
                     self.draw_quad(QuadDraw {
                         program: Program::Textured,
                         blend: node.blend,
+                        hold_alpha: node.hold_alpha,
                         world,
                         tint,
                         uv_rect: uv,
@@ -547,13 +552,14 @@ impl Recorder<'_> {
         let QuadDraw {
             program,
             blend,
+            hold_alpha,
             world,
             tint,
             uv_rect,
             descriptor,
             scissor,
         } = quad;
-        let pipeline = self.pipelines.pipeline_for(program, blend)?;
+        let pipeline = self.pipelines.pipeline_for(program, blend, hold_alpha)?;
         // SAFETY: the command buffer is recording and every handle is live.
         unsafe {
             if self.cache.needs_pipeline(pipeline) {
@@ -643,7 +649,11 @@ impl Recorder<'_> {
             scissor,
         )?;
         self.pass.begin();
-        let pipeline = self.pipelines.pipeline_for(Program::DstBlend, node.blend)?;
+        // The destination-dependent program keeps the destination's alpha on
+        // its own, so the hold flag selects no other pipeline here.
+        let pipeline = self
+            .pipelines
+            .pipeline_for(Program::DstBlend, node.blend, false)?;
         let constants = PushConstants {
             mvp: to_ndc(world, self.extent),
             tint,
