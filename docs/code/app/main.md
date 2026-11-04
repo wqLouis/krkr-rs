@@ -20,7 +20,8 @@ its own configuration and calls the same `app::run`.
 ```
 krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan]
      [--preload-archives] [--debug-overlay] [--graphic-cache-limit LIMIT]
-     [--dump-frame PATH] [--archive XP3 ...] [--base-dir DIR] [GAME]
+     [--dump-frame PATH] [--slow-report-ms N] [--archive XP3 ...]
+     [--base-dir DIR] [GAME]
 ```
 
 | option | value | default | effect |
@@ -33,6 +34,7 @@ krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan]
 | `--debug-overlay` | — | off | draw the debug panel in the top-left corner |
 | `--graphic-cache-limit` | `none`, `unlimited`, `0`, bytes | the reference default (disabled) | the decoded-image cache policy |
 | `--dump-frame PATH` | path | — | write the presented frame as a PNG; needs the null backend |
+| `--slow-report-ms` | `0..` | unbounded | the total time the run may spend producing slow-frame reports; `0` reports none |
 | `--archive XP3` | path | — | mount an archive; repeatable, order-significant, later wins |
 | `--base-dir DIR` | path | the first archive's parent | the mount root; every relative archive path resolves against it |
 | `GAME` | path | — | a game directory (becomes the mount root) or an XP3 file (is mounted) |
@@ -56,6 +58,14 @@ rasterizer, and a windowed run shows that frame through the platform's
 software presenter. `--dump-frame PATH` writes the presented frame as a PNG
 (it needs the null backend), so a run's picture can be inspected without a
 display.
+
+`--slow-report-ms N` sets the **report budget**: the total wall-clock time
+the run may spend producing slow-frame reports. The budget measures the
+time spent producing the reports themselves — the one-line summary and the
+detailed report alike. The option is absent by default, which leaves the
+reporting unbounded, and `0` reports none. When the budget is spent the run
+stops reporting and logs one note that names the budget and the number of
+reports it had already emitted.
 
 ---
 
@@ -101,6 +111,19 @@ merge cannot fail. The value types and the file grammar are in
 a `log` backend is installed — with `RUST_LOG` selecting the filter and
 `info` as the default. A second installation is a no-op, so an embedding
 launcher may install its own logger first.
+
+The **slow-frame reports** come in two forms. The summary is one `warn`
+line per slow frame. The **detailed report** is logged at `debug` level, so
+it appears only when `RUST_LOG` selects `debug`, and it is emitted beside
+the summary rather than instead of it. It lists every measured cost of the
+frame **ranked largest first**, each entry labelled with the section it
+belongs to (`phases`, `vm`, `pool`, `host`, `gpu`, `wait`), and it adds the
+residuals and the decode pool's job count. The ranking holds the parts that
+do not overlap each other, and the totals they add up to are in the report's
+own totals line, so the largest entry names a cause rather than a sum. Its first line names the frame,
+the gap and the dominant cost; the ranked entries below it are the detail
+behind that line. Both forms are produced within the report budget
+(`--slow-report-ms`).
 
 ---
 

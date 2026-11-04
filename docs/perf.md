@@ -377,8 +377,10 @@ do too.
 
 ## 4. The reports that name a slow step
 
-Two reports name where a slow step went. Both are **observations**: neither
-changes what a load, a decode, a container or a frame does.
+Two reports name where a slow step went: the slow frame and the slow load.
+The slow frame has two forms — a one-line summary and, at `debug` level, a
+detailed report. Both are **observations**: neither changes what a load, a
+decode, a container or a frame does.
 
 ### 4.1 The slow frame
 
@@ -400,6 +402,46 @@ frame that ran script. A frame in which the pool ran nothing reports zero. A
 job is counted when it **completes**, so a decode that finishes during the
 next frame is counted there — the numbers name the pool's work, not the frame
 that waited for it.
+
+#### The detailed report
+
+The summary is one line, and it is the same line every time. A second form
+answers the question the line leaves open — **which single cost dominates
+the frame** — and it is logged at `debug` level (`RUST_LOG=debug`), beside
+the summary and not instead of it. The threshold is the same 250 ms: a
+frame whose gap reaches it produces both forms.
+
+The detailed report lists **every measured cost of the frame, ranked largest
+first**. Each entry names its cost and the section it was measured in —
+`phases`, `vm`, `pool`, `host`, `gpu` or `wait` — so the ranking stays
+readable as the breakdown it came from. The ranking holds the parts that do
+not overlap each other; the totals those parts add up to are in the report's
+own totals line, so the largest entry names a cause rather than a sum. The residuals (the part of the VM
+tick no segment covers, the part of the engine frame no stage covers, and
+the part of the gap neither the frame nor the event poll covers) are in the
+report as well, and so is the decode pool's job count.
+
+Its first line names the frame, the gap and the dominant cost; the ranked
+entries below it are the detail behind that one line.
+
+#### The report budget
+
+Reporting is not free: the summary is a formatted line and the detailed
+report is a formatted list, and both are produced while the frame loop
+runs. `--slow-report-ms N` bounds that — **N is the total wall-clock time
+the run may spend producing slow-frame reports**, the one-line summary and
+the detailed report alike.
+
+| value | the run's reporting |
+|---|---|
+| the option is absent | unbounded — every slow frame is reported |
+| `0` | none — no slow frame is reported |
+| `N > 0` | the run reports until the budget is spent |
+
+When the budget is spent the run stops reporting, and it says so once: a
+single note names the budget and the number of reports it had already
+emitted, so a run whose reporting was cut short is told apart from a run in
+which no frame was slow.
 
 ### 4.2 The slow load
 

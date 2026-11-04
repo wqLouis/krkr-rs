@@ -276,10 +276,31 @@ tick residual; the engine frame's sync, upload, prune, project and render
 costs, the GPU acquire/present/submit/fence costs, and the host residual; the
 audio drain; and the total. The current step's `platform_wait` and `input`
 come from the platform loop's own pacing measurement, and `unaccounted`
-closes the budget.
+closes the accounting.
 
 A fast frame emits nothing, and the very first frame emits nothing: there
 is no predecessor to attribute.
+
+### The detailed report
+
+At `debug` log level (`RUST_LOG=debug`) a **detailed report** is emitted
+beside the one-line summary, not instead of it. It lists every measured cost
+of the frame **ranked largest first**, each entry labelled with the section
+it was measured in — `phases`, `vm`, `pool`, `host`, `gpu` or `wait` — and it
+adds the residuals and the decode pool's job count. The ranking holds the
+parts that do not overlap each other, and the totals they add up to are in
+the report's own totals line, so the largest entry names a cause rather
+than a sum. The report's first line names the frame, the gap and the
+dominant cost.
+
+### The report budget
+
+`--slow-report-ms N` bounds the wall-clock time the run may spend producing
+the reports — the summary and the detailed report alike. The option is
+absent by default, which leaves the reporting unbounded, and `0` reports
+none. A run that has spent its budget stops reporting and says so once: a
+single note names the budget and the number of reports it had already
+emitted.
 
 ---
 

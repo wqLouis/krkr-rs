@@ -267,6 +267,75 @@ impl PoolWork {
     }
 }
 
+/// The run's slow-frame reporting budget and what it has spent.
+///
+/// The budget is a whole-run budget: it is spent by the time the reports
+/// take, and a run that has spent it stops reporting and says so once.
+#[derive(Clone, Copy, Debug, Default)]
+struct SlowReporting {
+    /// The wall-clock time the run may spend reporting, or `None` for no
+    /// bound.
+    budget: Option<Duration>,
+    /// The wall-clock time the reports have taken so far.
+    spent: Duration,
+    /// The number of reports emitted so far.
+    reports: u64,
+    /// Whether the exhaustion note was emitted.
+    noted: bool,
+}
+
+impl SlowReporting {
+    /// Whether the run may still produce a report.
+    ///
+    /// An unbounded budget always allows a report; a bounded one allows it
+    /// while the reports have taken less than the budget.
+    fn allows_report(&self) -> bool {
+        match self.budget {
+            None => true,
+            Some(limit) => self.spent < limit,
+        }
+    }
+
+    /// Charges the time a report took to the budget.
+    fn charge(&mut self, elapsed: Duration) {
+        self.spent = self.spent.saturating_add(elapsed);
+        self.reports = self.reports.saturating_add(1);
+    }
+
+    /// The note that says the budget is spent, once.
+    ///
+    /// The first call returns the note and every call after it returns
+    /// `None`, so the run says it once. An unbounded budget has nothing to
+    /// say and returns `None` as well.
+    fn exhaustion_note(&mut self) -> Option<String> {
+        let limit = self.budget?;
+        if self.noted {
+            return None;
+        }
+        self.noted = true;
+        Some(format!(
+            "slow-frame reporting stopped: the {} ms reporting budget is spent after {} reports",
+            limit.as_millis(),
+            self.reports
+        ))
+    }
+}
+
+/// One measured cost of a frame, with the section it belongs to.
+///
+/// The sections are the ones the frame's measurements come from: the frame
+/// body's polls (`phases`), the VM tick (`vm`), the decode pool (`pool`), the
+/// engine frame (`host`), the GPU (`gpu`) and the platform's wait (`wait`).
+#[derive(Clone, Copy)]
+struct MeasuredCost {
+    /// The section the cost belongs to.
+    section: &'static str,
+    /// The cost's name inside its section.
+    name: &'static str,
+    /// The cost in milliseconds.
+    ms: f64,
+}
+
 /// The previous frame's measured attribution, kept so a slow gap names the
 /// frame it actually spans.
 ///
@@ -318,8 +387,28 @@ impl FrameAttribution {
         self.valid = true;
     }
 
-    /// Formats the single slow-frame line for `gap_ms`, or `None` when the
-    /// gap is below the threshold or no previous frame exists yet.
+    /// Whether the gap reaches the slow-frame threshold and a previous frame
+    /// exists to explain it.
+    fn is_slow(&self, gap_ms: f64) -> bool {
+        self.valid && gap_ms >= SLOW_FRAME_MS
+    }
+
+    /// The VM tick the polls and the input segments do not cover.
+    fn tick_residual(&self) -> f64 {
+        self.tick.tick_ms - self.tick.input_ms() - self.phases.body_ms
+    }
+
+    /// The engine frame the sync, the project and the render do not cover.
+    fn host_residual(&self) -> f64 {
+        self.host_ms - self.report.sync_ms - self.report.project_ms - self.report.render_ms
+    }
+
+    /// The gap neither the frame nor the platform's wait covers.
+    fn unaccounted(&self, gap_ms: f64, pacing: FramePacing) -> f64 {
+        gap_ms - self.total_ms - pacing.poll_ms
+    }
+
+    /// Formats the single slow-frame line for `gap_ms`.
     ///
     /// The named phases and host/GPU costs are the previous frame's, because
     /// the gap spans it, and `presented` says whether that frame reached the
@@ -333,18 +422,15 @@ impl FrameAttribution {
     /// `pool_ms` are the decode pool's own work over the frame: the jobs it
     /// completed and the time they took, so a frame that waited for decodes
     /// is told apart from a frame that ran script.
-    fn slow_frame_line(&self, gap_ms: f64, pacing: FramePacing) -> Option<String> {
-        if !self.valid || gap_ms < SLOW_FRAME_MS {
-            return None;
-        }
+    fn slow_frame_line(&self, gap_ms: f64, pacing: FramePacing) -> String {
         let phases = &self.phases;
         let tick = &self.tick;
         let report = &self.report;
         let timings = self.timings.unwrap_or_default();
-        let unaccounted = gap_ms - self.total_ms - pacing.poll_ms;
-        let tick_residual = tick.tick_ms - tick.input_ms() - phases.body_ms;
-        let host_residual = self.host_ms - report.sync_ms - report.project_ms - report.render_ms;
-        Some(format!(
+        let unaccounted = self.unaccounted(gap_ms, pacing);
+        let tick_residual = self.tick_residual();
+        let host_residual = self.host_residual();
+        format!(
             "frame {} slow: presented={}, gap={gap_ms:.1} ms since the previous frame; \
              the gap spans the previous frame, so these are its phases: \
              sound={:.1} video={:.1} async={:.1} continuous={:.1} \
@@ -386,7 +472,187 @@ impl FrameAttribution {
             timings.fence_wait_ms,
             pacing.poll_ms,
             pacing.input_ms,
-        ))
+        )
+    }
+
+    /// Formats the detailed slow-frame report for `gap_ms`.
+    ///
+    /// The report answers what caused the slow frame: every measured cost
+    /// of the frame, ranked largest first and labelled with the section it
+    /// belongs to, so the dominant cost is the first entry instead of one
+    /// number among many. The residuals and the decode pool's job count
+    /// follow, and the totals close the report.
+    ///
+    /// The costs are the parts that do not overlap: the five polls, the
+    /// input segments, the tick's residual, the pool's own work, the engine
+    /// frame's parts, the GPU calls, the input dispatch and the gap the
+    /// frame and the wait leave unaccounted. The totals name the sums those
+    /// parts add up to.
+    ///
+    /// The report is one string, and the log carries it as one entry.
+    fn slow_frame_detail(&self, gap_ms: f64, pacing: FramePacing) -> String {
+        let timings = self.timings.unwrap_or_default();
+        let mut costs = [
+            MeasuredCost {
+                section: "phases",
+                name: "sound",
+                ms: self.phases.sound_ms,
+            },
+            MeasuredCost {
+                section: "phases",
+                name: "video",
+                ms: self.phases.video_ms,
+            },
+            MeasuredCost {
+                section: "phases",
+                name: "async",
+                ms: self.phases.async_trigger_ms,
+            },
+            MeasuredCost {
+                section: "phases",
+                name: "continuous",
+                ms: self.phases.continuous_handler_ms,
+            },
+            MeasuredCost {
+                section: "phases",
+                name: "frame_tail",
+                ms: self.phases.frame_tail_ms,
+            },
+            MeasuredCost {
+                section: "vm",
+                name: "input_begin",
+                ms: self.tick.input_begin_ms,
+            },
+            MeasuredCost {
+                section: "vm",
+                name: "input_events",
+                ms: self.tick.input_events_ms,
+            },
+            MeasuredCost {
+                section: "vm",
+                name: "input_end",
+                ms: self.tick.input_end_ms,
+            },
+            MeasuredCost {
+                section: "vm",
+                name: "tick_residual",
+                ms: self.tick_residual(),
+            },
+            MeasuredCost {
+                section: "pool",
+                name: "elapsed",
+                ms: self.pool.elapsed_ms,
+            },
+            MeasuredCost {
+                section: "host",
+                name: "audio",
+                ms: self.audio_ms,
+            },
+            MeasuredCost {
+                section: "host",
+                name: "sync_upload",
+                ms: self.report.upload_ms,
+            },
+            MeasuredCost {
+                section: "host",
+                name: "sync_prune",
+                ms: self.report.prune_ms,
+            },
+            MeasuredCost {
+                section: "host",
+                name: "project",
+                ms: self.report.project_ms,
+            },
+            MeasuredCost {
+                section: "host",
+                name: "render",
+                ms: self.report.render_ms,
+            },
+            MeasuredCost {
+                section: "host",
+                name: "host_residual",
+                ms: self.host_residual(),
+            },
+            MeasuredCost {
+                section: "gpu",
+                name: "acquire",
+                ms: timings.acquire_ms,
+            },
+            MeasuredCost {
+                section: "gpu",
+                name: "present",
+                ms: timings.present_ms,
+            },
+            MeasuredCost {
+                section: "gpu",
+                name: "submit",
+                ms: timings.submit_ms,
+            },
+            MeasuredCost {
+                section: "gpu",
+                name: "recreate",
+                ms: timings.recreate_ms,
+            },
+            MeasuredCost {
+                section: "gpu",
+                name: "fence_wait",
+                ms: timings.fence_wait_ms,
+            },
+            MeasuredCost {
+                section: "wait",
+                name: "input",
+                ms: pacing.input_ms,
+            },
+            MeasuredCost {
+                section: "wait",
+                name: "unaccounted",
+                ms: self.unaccounted(gap_ms, pacing),
+            },
+        ];
+        // The largest cost leads, so the report names the dominant cost
+        // without the reader comparing the numbers.
+        costs.sort_by(|left, right| right.ms.total_cmp(&left.ms));
+        let mut out = String::new();
+        out.push_str(&format!(
+            "frame {} slow: presented={}, gap={gap_ms:.1} ms since the previous frame;",
+            self.report.frame_index, self.report.presented
+        ));
+        if let Some(dominant) = costs.first() {
+            out.push_str(&format!(
+                " dominant cost: {}.{} = {:.1} ms",
+                dominant.section, dominant.name, dominant.ms
+            ));
+        }
+        out.push('\n');
+        out.push_str("costs, largest first:\n");
+        for (index, cost) in costs.iter().enumerate() {
+            out.push_str(&format!(
+                "  {}. {}.{} = {:.1} ms\n",
+                index + 1,
+                cost.section,
+                cost.name,
+                cost.ms
+            ));
+        }
+        out.push_str(&format!(
+            "residuals: tick_residual = {:.1} ms, host_residual = {:.1} ms, \
+             unaccounted = {:.1} ms; pool jobs = {}\n",
+            self.tick_residual(),
+            self.host_residual(),
+            self.unaccounted(gap_ms, pacing),
+            self.pool.jobs
+        ));
+        out.push_str(&format!(
+            "totals: body = {:.1} ms, tick = {:.1} ms, host_sync = {:.1} ms, \
+             host_total = {:.1} ms, total = {:.1} ms, platform_wait = {:.1} ms",
+            self.phases.body_ms,
+            self.tick.tick_ms,
+            self.report.sync_ms,
+            self.host_ms,
+            self.total_ms,
+            pacing.poll_ms
+        ));
+        out
     }
 }
 
@@ -418,6 +684,8 @@ pub struct GameHost {
     /// The previous frame's measured attribution, reported when the next gap
     /// is slow.
     last_frame: FrameAttribution,
+    /// The run's slow-frame reporting budget and what it has spent.
+    reporting: SlowReporting,
     /// Whether the first frame's timing has been logged.
     first_frame_logged: bool,
 }
@@ -758,8 +1026,21 @@ impl GameHost {
             polls: Polls::default(),
             open_start,
             last_frame: FrameAttribution::default(),
+            reporting: SlowReporting::default(),
             first_frame_logged: false,
         })
+    }
+
+    /// Bounds the wall-clock time the run may spend producing slow-frame
+    /// reports.
+    ///
+    /// The budget is a whole-run budget: it is spent by the time the reports
+    /// take, and a run that has spent it stops reporting and says so once. A
+    /// budget of zero reports no slow frame at all, and `None` leaves the
+    /// reports unbounded.
+    pub fn with_slow_report_budget(mut self, budget: Option<Duration>) -> Self {
+        self.reporting.budget = budget;
+        self
     }
 
     /// The L2 engine host.
@@ -825,6 +1106,11 @@ impl GameHost {
     /// costs are reported by the next slow line. `platform_wait` and `input`
     /// are this step's wait, and `unaccounted` closes the budget.
     ///
+    /// A slow gap is reported twice: once as a `warn` summary, and once as a
+    /// `debug` entry that breaks the frame's costs down, ranked, so the
+    /// dominant cost is named. Both are charged to the run's reporting
+    /// budget.
+    ///
     /// # Errors
     ///
     /// As [`Self::step`].
@@ -837,9 +1123,7 @@ impl GameHost {
         let dt = clock.elapsed_ms().max(0.0);
         // The gap spans the last frame; attribute it before the step overwrites
         // the stored frame.
-        if let Some(line) = self.last_frame.slow_frame_line(dt, pacing) {
-            log::warn!("{line}");
-        }
+        self.report_slow_frame(dt, pacing);
         self.polls.phases = FramePhases::default();
         self.polls.tick = TickPhases::default();
         // Input is mapped with the presentation captured as the frame starts;
@@ -893,6 +1177,32 @@ impl GameHost {
             );
         }
         Ok(report)
+    }
+
+    /// Reports the slow gap the previous frame explains.
+    ///
+    /// The gap spans the previous frame, so the report names that frame's
+    /// costs; `platform_wait` and `input` are this step's own.
+    ///
+    /// The summary is one `warn` line and the breakdown beside it is one
+    /// `debug` entry. Both are charged to the run's reporting budget: the
+    /// budget is spent by the time the reporting takes, and a run that has
+    /// spent it stops reporting and says so once. The note is emitted after
+    /// the budget is spent and is not charged to it.
+    fn report_slow_frame(&mut self, gap_ms: f64, pacing: FramePacing) {
+        if !self.last_frame.is_slow(gap_ms) {
+            return;
+        }
+        if !self.reporting.allows_report() {
+            if let Some(note) = self.reporting.exhaustion_note() {
+                log::warn!("{note}");
+            }
+            return;
+        }
+        let started = Instant::now();
+        log::warn!("{}", self.last_frame.slow_frame_line(gap_ms, pacing));
+        log::debug!("{}", self.last_frame.slow_frame_detail(gap_ms, pacing));
+        self.reporting.charge(started.elapsed());
     }
 }
 
@@ -1325,11 +1635,7 @@ mod tests {
     #[test]
     fn fast_gap_emits_nothing() {
         let attribution = attribution_for(7, 480.0, 10.0);
-        assert!(
-            attribution
-                .slow_frame_line(16.0, FramePacing::default())
-                .is_none()
-        );
+        assert!(!attribution.is_slow(16.0));
     }
 
     /// The first frame has no predecessor, so a large gap for it emits
@@ -1337,11 +1643,7 @@ mod tests {
     #[test]
     fn first_frame_emits_nothing() {
         let attribution = FrameAttribution::default();
-        assert!(
-            attribution
-                .slow_frame_line(900.0, FramePacing::default())
-                .is_none()
-        );
+        assert!(!attribution.is_slow(900.0));
     }
 
     /// The slow line names the **previous** frame and accounts the gap as
@@ -1350,15 +1652,13 @@ mod tests {
     fn slow_line_names_the_previous_frame_and_balances_the_gap() {
         let attribution = attribution_for(7, 480.0, 10.0);
         let timings = attribution.timings.expect("timings recorded");
-        let line = attribution
-            .slow_frame_line(
-                520.0,
-                FramePacing {
-                    poll_ms: 15.0,
-                    input_ms: 4.0,
-                },
-            )
-            .expect("slow gap emits a line");
+        let line = attribution.slow_frame_line(
+            520.0,
+            FramePacing {
+                poll_ms: 15.0,
+                input_ms: 4.0,
+            },
+        );
 
         assert!(line.contains("frame 7 slow"), "line was: {line}");
         assert!(
@@ -1398,9 +1698,7 @@ mod tests {
     #[test]
     fn slow_line_follows_the_most_recent_frame() {
         let mut attribution = attribution_for(7, 480.0, 10.0);
-        let first = attribution
-            .slow_frame_line(520.0, FramePacing::default())
-            .expect("first slow line");
+        let first = attribution.slow_frame_line(520.0, FramePacing::default());
         assert!(first.contains("frame 7 slow"), "line was: {first}");
 
         attribution.record(
@@ -1425,12 +1723,145 @@ mod tests {
                 total_ms: 300.0,
             },
         );
-        let second = attribution
-            .slow_frame_line(320.0, FramePacing::default())
-            .expect("second slow line");
+        let second = attribution.slow_frame_line(320.0, FramePacing::default());
         assert!(second.contains("frame 8 slow"), "line was: {second}");
         assert!(second.contains("frame_tail=250.0"), "line was: {second}");
         assert!(!second.contains("frame 7"), "line was: {second}");
+    }
+
+    /// The ranked cost entries of a detailed report: the label and the
+    /// milliseconds.
+    fn ranked_costs(detail: &str) -> Vec<(String, f64)> {
+        let mut costs = Vec::new();
+        for line in detail.lines() {
+            let trimmed = line.trim();
+            let Some((index, rest)) = trimmed.split_once(". ") else {
+                continue;
+            };
+            if index.parse::<usize>().is_err() {
+                continue;
+            }
+            let Some((label, value)) = rest.split_once(" = ") else {
+                continue;
+            };
+            let Some(ms) = value
+                .strip_suffix(" ms")
+                .and_then(|ms| ms.parse::<f64>().ok())
+            else {
+                continue;
+            };
+            costs.push((label.to_owned(), ms));
+        }
+        costs
+    }
+
+    /// The detailed report breaks the frame down: every measured cost is
+    /// listed, largest first, and the first line names the dominant one.
+    #[test]
+    fn the_detailed_report_ranks_the_costs_and_names_the_cause() {
+        let attribution = attribution_for(7, 480.0, 10.0);
+        let detail = attribution.slow_frame_detail(
+            520.0,
+            FramePacing {
+                poll_ms: 15.0,
+                input_ms: 4.0,
+            },
+        );
+
+        let first = detail.lines().next().expect("the report has a first line");
+        assert!(first.contains("frame 7 slow"), "first line was: {first}");
+        assert!(first.contains("gap=520.0 ms"), "first line was: {first}");
+        assert!(
+            first.contains("dominant cost: phases.frame_tail = 480.0 ms"),
+            "first line was: {first}"
+        );
+
+        let costs = ranked_costs(&detail);
+        assert_eq!(costs.len(), 23, "every measured cost is listed: {detail}");
+        assert_eq!(costs[0].0, "phases.frame_tail");
+        assert_eq!(costs[1].0, "pool.elapsed");
+        assert_eq!(costs[2].0, "host.render");
+        for pair in costs.windows(2) {
+            assert!(
+                pair[0].1 >= pair[1].1,
+                "the costs are ranked largest first: {detail}"
+            );
+        }
+        // Every section the frame's measurements come from is named.
+        for section in ["phases.", "vm.", "pool.", "host.", "gpu.", "wait."] {
+            assert!(
+                detail.contains(section),
+                "the report names no {section} cost: {detail}"
+            );
+        }
+
+        assert!(
+            detail.contains(
+                "residuals: tick_residual = 4.0 ms, host_residual = 0.3 ms, \
+             unaccounted = 3.5 ms; pool jobs = 2"
+            ),
+            "the report names the residuals and the pool's jobs: {detail}"
+        );
+        assert!(
+            detail.contains(
+                "totals: body = 480.0 ms, tick = 487.5 ms, host_sync = 0.5 ms, \
+             host_total = 11.0 ms, total = 501.5 ms, platform_wait = 15.0 ms"
+            ),
+            "the report names the totals: {detail}"
+        );
+    }
+
+    /// A run that has spent its reporting budget stops reporting and says so
+    /// once.
+    #[test]
+    fn the_reporting_budget_stops_the_reports_and_says_so_once() {
+        let mut reporting = SlowReporting {
+            budget: Some(Duration::from_millis(10)),
+            ..SlowReporting::default()
+        };
+        assert!(reporting.allows_report(), "the budget is not spent yet");
+
+        reporting.charge(Duration::from_millis(4));
+        assert!(reporting.allows_report(), "the budget is not spent yet");
+        assert_eq!(reporting.reports, 1, "the charged report is counted");
+
+        reporting.charge(Duration::from_millis(7));
+        assert!(!reporting.allows_report(), "the budget is spent");
+
+        let note = reporting
+            .exhaustion_note()
+            .expect("the note names the budget");
+        assert!(note.contains("10 ms"), "note was: {note}");
+        assert!(note.contains("2 reports"), "note was: {note}");
+        assert!(
+            reporting.exhaustion_note().is_none(),
+            "the note is said once"
+        );
+    }
+
+    /// A budget of zero reports no slow frame at all.
+    #[test]
+    fn a_zero_budget_reports_no_slow_frame() {
+        let mut reporting = SlowReporting {
+            budget: Some(Duration::ZERO),
+            ..SlowReporting::default()
+        };
+        assert!(!reporting.allows_report(), "no report fits in no budget");
+        let note = reporting
+            .exhaustion_note()
+            .expect("the note names the budget");
+        assert!(note.contains("0 ms"), "note was: {note}");
+        assert!(note.contains("0 reports"), "note was: {note}");
+    }
+
+    /// An unbounded budget always allows a report.
+    #[test]
+    fn an_unbounded_budget_always_allows_a_report() {
+        let mut reporting = SlowReporting::default();
+        assert!(reporting.allows_report());
+        reporting.charge(Duration::from_secs(30));
+        assert!(reporting.allows_report());
+        assert!(reporting.exhaustion_note().is_none());
     }
 
     /// The reference auto-load scan: regular `*.tpm` files only, from the exe

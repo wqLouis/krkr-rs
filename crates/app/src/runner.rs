@@ -72,6 +72,13 @@ pub struct Launch {
     /// The file holds the most recent presented frame, so a run that ends on
     /// the picture leaves that picture behind.
     pub dump_frame: Option<PathBuf>,
+    /// The wall-clock time the run may spend producing slow-frame reports, or
+    /// `None` to leave the reports unbounded.
+    ///
+    /// The budget is spent by the time the reports take, and a run that has
+    /// spent it stops reporting and says so once. A budget of zero reports no
+    /// slow frame at all.
+    pub slow_report_budget: Option<Duration>,
 }
 
 /// What a completed [`run`] produced.
@@ -268,7 +275,8 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
             input.archives.clone(),
             input.base_dir.clone(),
             launch.runtime.preload_archives,
-        )?;
+        )?
+        .with_slow_report_budget(launch.slow_report_budget);
         println!(
             "krkr headless game: backend={} frames={} archives={}",
             game.host().backend().name(),
@@ -391,15 +399,7 @@ fn run_windowed(launch: &Launch) -> Result<(), RunError> {
     config.frame_interval = frame_interval;
     Ok(platform::run(
         config,
-        DesktopApp::new(
-            launch.backend,
-            launch.game.clone(),
-            launch.runtime.preload_archives,
-            launch.runtime.debug_overlay,
-            launch.runtime.graphic_cache_limit,
-            launch.dump_frame.clone(),
-            frame_interval,
-        ),
+        DesktopApp::new(launch, frame_interval),
     )?)
 }
 
@@ -436,6 +436,9 @@ struct DesktopApp {
     /// Where the presented frame is written as a PNG, or `None` to write
     /// nothing.
     dump_frame: Option<PathBuf>,
+    /// The wall-clock time the run may spend producing slow-frame reports, or
+    /// `None` to leave the reports unbounded.
+    slow_report_budget: Option<Duration>,
     /// The image encoder the frame dump writes through.
     media: Media,
     /// Input and focus events received since the last frame, delivered to
@@ -554,21 +557,17 @@ impl Running {
 
 impl DesktopApp {
     /// Creates a handler that has not yet received `resumed`.
-    fn new(
-        backend: BackendKind,
-        game: Option<GameInput>,
-        preload_archives: bool,
-        debug_overlay: bool,
-        graphic_cache_limit: Option<CacheLimit>,
-        dump_frame: Option<PathBuf>,
-        frame_interval: Duration,
-    ) -> Self {
+    ///
+    /// The handler keeps what it needs of the launch request: the backend,
+    /// the game, the configuration the engine reads and the budget the
+    /// slow-frame reports may spend.
+    fn new(launch: &Launch, frame_interval: Duration) -> Self {
         Self {
-            backend,
-            game,
-            preload_archives,
-            debug_overlay,
-            graphic_cache_limit,
+            backend: launch.backend,
+            game: launch.game.clone(),
+            preload_archives: launch.runtime.preload_archives,
+            debug_overlay: launch.runtime.debug_overlay,
+            graphic_cache_limit: launch.runtime.graphic_cache_limit,
             frame_interval,
             running: None,
             pending_events: Vec::new(),
@@ -579,7 +578,8 @@ impl DesktopApp {
             last_revisions: None,
             heartbeat_at: Instant::now(),
             software: None,
-            dump_frame,
+            dump_frame: launch.dump_frame.clone(),
+            slow_report_budget: launch.slow_report_budget,
             media: Media::new(),
         }
     }
@@ -671,7 +671,9 @@ impl EventHandler for DesktopApp {
                             input.archives.clone(),
                             input.base_dir.clone(),
                             self.preload_archives,
-                        ) {
+                        )
+                        .map(|game| game.with_slow_report_budget(self.slow_report_budget))
+                        {
                             Ok(game) => Running::Game(Box::new(game)),
                             Err(error) => {
                                 eprintln!("krkr: failed to open game: {error}");
@@ -839,6 +841,7 @@ mod tests {
             game: None,
             mode: RunMode::Headless { frames: 2 },
             dump_frame: None,
+            slow_report_budget: None,
         })
         .expect("headless run");
         let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -878,6 +881,7 @@ mod tests {
             game: None,
             mode: RunMode::Headless { frames: 5 },
             dump_frame: None,
+            slow_report_budget: None,
         })
         .expect("headless run");
         let elapsed = started.elapsed();

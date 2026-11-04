@@ -1,7 +1,7 @@
 //! `krkr` CLI: headless frame runner and windowed desktop frontend.
 //!
 //! ```text
-//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--preload-archives] [--graphic-cache-limit LIMIT] [--archive XP3 ...] [--base-dir DIR] [GAME]
+//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--preload-archives] [--graphic-cache-limit LIMIT] [--slow-report-ms N] [--archive XP3 ...] [--base-dir DIR] [GAME]
 //! ```
 //!
 //! * `--headless` runs an empty scene for `N` frames (default 120) through
@@ -45,6 +45,11 @@
 //!   window with a display connection (Wayland/X11/XCB); the windowed host
 //!   passes both the window and display handle so a surface can be created.
 //!   The headless path has no display and uses `--backend null`.
+//! * `--slow-report-ms N` bounds the wall-clock time the run may spend
+//!   reporting slow frames. The option is absent by default, which leaves the
+//!   reports unbounded, and `0` reports no slow frame at all. The budget is
+//!   spent by the time the reports take: a run that has spent it stops
+//!   reporting and says so once.
 //! * Configuration is resolved **by this launcher** and handed to
 //!   [`app::run`] as an already-loaded value: the `key=value` file named by
 //!   the `KRKR_CONFIG` environment variable supplies overrides, the launch
@@ -58,6 +63,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use api::config::{
     CacheLimit, ConfigError, FrameRateLimit, RuntimeConfig, RuntimeConfigOverrides, parse_overrides,
@@ -120,6 +126,11 @@ const OPTIONS: &[OptionDoc] = &[
         help: "Write the presented frame to PATH as a PNG (the most recent frame; the null backend).",
     },
     OptionDoc {
+        flag: "--slow-report-ms",
+        value: "N",
+        help: "Bound the wall-clock time the run spends reporting slow frames (default: unbounded; 0 reports no slow frame).",
+    },
+    OptionDoc {
         flag: "--archive",
         value: "XP3",
         help: "Mount an XP3 archive (repeatable, later wins); with none, every *.xp3 under the base directory mounts.",
@@ -176,6 +187,9 @@ struct Cli {
     graphic_cache_limit: Option<CacheLimit>,
     /// Where the presented frame is written as a PNG, if given.
     dump_frame: Option<PathBuf>,
+    /// The whole-run budget for the slow-frame reports, in milliseconds, or
+    /// `None` when the option was absent.
+    slow_report_ms: Option<u64>,
     /// Explicit `--archive` list, in mount order (later wins).
     archives: Vec<PathBuf>,
     /// App path override (`--base-dir`); defaults to the current directory.
@@ -212,6 +226,7 @@ impl Cli {
             debug_overlay: None,
             graphic_cache_limit: None,
             dump_frame: None,
+            slow_report_ms: None,
             archives: Vec::new(),
             base_dir: None,
             positional: None,
@@ -255,6 +270,18 @@ impl Cli {
                         CliError::Usage("--dump-frame requires a path".to_owned())
                     })?;
                     cli.dump_frame = Some(PathBuf::from(value));
+                }
+                "--slow-report-ms" => {
+                    let value = args.next().ok_or_else(|| {
+                        CliError::Usage("--slow-report-ms requires a value".to_owned())
+                    })?;
+                    cli.slow_report_ms = Some(value.parse().map_err(|_| {
+                        ConfigError::invalid(
+                            "--slow-report-ms",
+                            value.clone(),
+                            "a non-negative integer",
+                        )
+                    })?);
                 }
                 "--archive" => {
                     let value = args
@@ -308,6 +335,14 @@ fn check_dump_backend(cli: &Cli) -> Result<(), String> {
         return Err("--dump-frame needs the null backend (--backend null)".to_owned());
     }
     Ok(())
+}
+
+/// The slow-frame reporting budget the command line asks for.
+///
+/// The option is absent by default, and an absent option leaves the reports
+/// unbounded. A budget of zero reports no slow frame at all.
+fn slow_report_budget(cli: &Cli) -> Option<Duration> {
+    cli.slow_report_ms.map(Duration::from_millis)
 }
 
 /// Environment variable naming the desktop configuration file.
@@ -416,6 +451,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    let slow_report_budget = slow_report_budget(&cli);
     let launch = Launch {
         runtime,
         backend: cli.backend,
@@ -426,6 +462,7 @@ fn main() -> ExitCode {
             RunMode::Windowed
         },
         dump_frame: cli.dump_frame,
+        slow_report_budget,
     };
 
     match app::run(launch) {
@@ -604,6 +641,68 @@ mod tests {
         ] {
             assert!(parse(args).is_err(), "accepted {args:?}");
         }
+    }
+
+    /// The slow-frame budget is absent by default, and the option takes a
+    /// whole number of milliseconds.
+    #[test]
+    fn parse_slow_report_ms() {
+        assert_eq!(parse(&["--headless"]).expect("parse").slow_report_ms, None);
+        assert_eq!(
+            parse(&["--headless", "--slow-report-ms", "250"])
+                .expect("parse")
+                .slow_report_ms,
+            Some(250)
+        );
+        assert_eq!(
+            parse(&["--headless", "--slow-report-ms", "0"])
+                .expect("parse")
+                .slow_report_ms,
+            Some(0)
+        );
+    }
+
+    /// A budget that is not a whole number of milliseconds is a usage error,
+    /// and the message names the option.
+    #[test]
+    fn parse_rejects_a_bad_slow_report_ms() {
+        for args in [
+            &["--slow-report-ms"][..],
+            &["--slow-report-ms", "-1"],
+            &["--slow-report-ms", "fast"],
+            &["--slow-report-ms", "1.5"],
+        ] {
+            assert!(parse(args).is_err(), "accepted {args:?}");
+        }
+        let error = parse(&["--slow-report-ms", "-1"])
+            .expect_err("must fail")
+            .to_string();
+        assert!(error.contains("--slow-report-ms"), "{error}");
+    }
+
+    /// The option's value is the run's budget: an absent option leaves the
+    /// reports unbounded, and a budget of zero reports no slow frame.
+    #[test]
+    fn the_slow_report_budget_follows_the_option() {
+        let unbounded = slow_report_budget(&parse(&["--headless"]).expect("parse"));
+        assert_eq!(unbounded, None);
+
+        let bounded =
+            slow_report_budget(&parse(&["--headless", "--slow-report-ms", "250"]).expect("parse"));
+        assert_eq!(bounded, Some(Duration::from_millis(250)));
+
+        let silent =
+            slow_report_budget(&parse(&["--headless", "--slow-report-ms", "0"]).expect("parse"));
+        assert_eq!(silent, Some(Duration::ZERO));
+    }
+
+    /// The help names the option and its default, so a run that asks for a
+    /// budget is told what the absent option means.
+    #[test]
+    fn the_help_documents_the_slow_report_budget() {
+        let text = usage();
+        assert!(text.contains("--slow-report-ms N"), "{text}");
+        assert!(text.contains("default: unbounded"), "{text}");
     }
 
     #[test]
