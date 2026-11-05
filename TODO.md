@@ -186,6 +186,62 @@ residuals:
   `hda` argument and the layer's `holdAlpha` do not reach the text
   rasterizer (`ImageFunction.cpp:1024-1025`, `LayerIntf.cpp:4444-4468`),
   and the face's method selection for the text is the same arithmetic gap.
+* **The ordinary blend modes are not the reference's live kernels.** The
+  Photoshop family in the L1 software renderer matches the reference (max
+  difference 0); the ordinary modes do not. The reference selects a blend
+  method per draw (`reference/cpp/core/visual/RenderManager.cpp:2425-2459`,
+  `:2857-2924`), and the ordinary additive, subtractive, darken and lighten
+  methods run the live kernels in
+  `reference/cpp/core/visual/gl/blend_functor_c.h:374-660`. The L1 software
+  renderer composites them in float on the source's alpha
+  (`crates/platform/render/src/cpu.rs`, `composite`), and each differs:
+  * **Additive** (`omAdditive`). The reference's `add_blend_functor` adds the
+    source as it stands; the port fades the source by its alpha. Worst
+    difference **175 levels**; on the destination [200,100,50,255] with the
+    source [100,50,25,128] the reference gives [255,150,75] and the port
+    [250,125,63].
+  * **Subtractive** (`omSubtractive`). The reference's `sub_blend_functor` is
+    the linear burn `max(0, dst + src - 255)`; the port computes the
+    saturating difference of the destination and the source scaled by the
+    source's alpha. Worst difference **243 levels**; on the same vector the
+    reference gives [45,0,0] and the port [150,75,37].
+  * **Darken** (`omDarken`). The reference's live darken with a fully
+    transparent source gives [0,0,0]; the port's L1 path gives the
+    destination. Worst difference **243 levels**.
+  * **Lighten** (`omLighten`). The reference adds the source as it stands.
+    Worst difference **160 levels**.
+  * **Colour dodge.** The L1 software renderer's colour dodge adds an alpha
+    tail the reference's live kernel has not
+    (`reference/cpp/core/visual/gl/blend_functor_c.h:374-660`; the Photoshop
+    spelling is in `reference/cpp/core/visual/gl/blend_variation.h:63-106`).
+    The renderer gives the ordinary dodge (`omDodge`) and the Photoshop dodge
+    (`omPsColorDodge`) the same kernel (`crates/platform/render/src/cpu.rs`,
+    `composite`). Worst difference **111 levels**.
+* **The GPU blend path is not the reference's arithmetic.** The reference
+  selects a blend method per draw
+  (`reference/cpp/core/visual/RenderManager.cpp:2425-2459`, `:2857-2924`) and
+  blends the sRGB-encoded bytes with its live kernels
+  (`reference/cpp/core/visual/gl/blend_functor_c.h:374-660`); the Photoshop
+  family is spelled out as tables and variations
+  (`reference/cpp/core/visual/gl/blend_function.cpp:526-547`,
+  `reference/cpp/core/visual/gl/blend_variation.h:63-106`). The Vulkan backend
+  blends in linear light, re-derives the reference's functions in float
+  (`crates/platform/render/shaders/dst_blend.frag`) and leaves four Photoshop
+  modes to the Vulkan fixed function, which cannot express the reference's
+  shape. Worst differences: **PsColorDodge 254**, **PsMultiplicative 200**,
+  **PsScreen 164**, **PsAdditive 23**. A change to this path is in flight;
+  the entry states the divergence it has to close.
+* **The GPU samples bilinearly and the L1 software renderer point-samples.**
+  This is the CPU-vs-GPU sampling difference: the Vulkan backend's sampler
+  interpolates between source texels
+  (`crates/platform/render/src/vulkan/pipelines.rs`, `create_sampler`), while
+  the software renderer takes the nearest source texel
+  (`crates/platform/render/src/cpu.rs`, `sample_texture`). The reference's
+  blended draw goes through the method dispatch
+  (`reference/cpp/core/visual/RenderManager.cpp:2425-2459`, `:2857-2924`),
+  and the L1 renderer is the GPU path's stated behavioural baseline
+  (`crates/platform/render/src/cpu.rs`), so the GPU program is the one that
+  has to match the software renderer.
 * **The transition's mix methods: what landed, and the alpha byte the
   reference's two paths disagree on.** The cross-fade's blend is chosen by
   the destination layer's type (`reference/cpp/core/visual/TransIntf.cpp:664-686`):
@@ -1311,6 +1367,18 @@ an allowlist exemption.
   `crates/compat/src/engine_api.rs`. Moving the mapping means an L2 API change
   with a surface impact, so it is a design change of its own and not a
   cleanup.
+* **The same Photoshop kernels live in three places.** The family is written
+  out in the L2 path (`crates/engine/src/layer_ops.rs`), in the L1 software
+  renderer (`crates/platform/render/src/cpu.rs`) and in the GPU program
+  (`crates/platform/render/shaders/dst_blend.frag`). The layers forbid the L1
+  renderer from calling L2 — the dependency direction runs the other way — so
+  the duplication is forced; but three copies of one kernel family are free to
+  drift apart, and the L1 renderer matches the reference for the whole family
+  (max difference 0) while the GPU path does not (§4). The reference has one
+  spelling of the family
+  (`reference/cpp/core/visual/gl/blend_function.cpp:526-547`,
+  `reference/cpp/core/visual/gl/blend_variation.h:63-106`), and a change to
+  the family has to be made in all three copies.
 * **The tree resolves a relative storage name against the media's current
   path; the port does not.** The tree keeps a current path per media
   (`reference/cpp/core/base/StorageIntf.cpp:134`), resolves a relative name
