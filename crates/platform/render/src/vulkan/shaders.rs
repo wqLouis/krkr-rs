@@ -56,6 +56,13 @@ pub(crate) const SOURCE_DESCRIPTOR: Descriptor = Descriptor { set: 0, binding: 0
 /// binding 0.
 pub(crate) const DESTINATION_DESCRIPTOR: Descriptor = Descriptor { set: 1, binding: 0 };
 
+/// The descriptor the destination-dependent program binds the blend tables
+/// through.
+///
+/// The tables are the third descriptor set's only descriptor, so the set
+/// holds one binding and the shader reads the table at binding 0.
+pub(crate) const TABLES_DESCRIPTOR: Descriptor = Descriptor { set: 2, binding: 0 };
+
 /// Converts a little-endian SPIR-V byte blob into 32-bit words.
 pub(crate) fn to_words(bytes: &[u8]) -> Vec<u32> {
     bytes
@@ -68,7 +75,9 @@ pub(crate) fn to_words(bytes: &[u8]) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DESTINATION_DESCRIPTOR, Descriptor, SOURCE_DESCRIPTOR, to_words};
+    use super::{
+        DESTINATION_DESCRIPTOR, Descriptor, SOURCE_DESCRIPTOR, TABLES_DESCRIPTOR, to_words,
+    };
     use crate::collections::Map;
 
     /// The opcode of the `OpDecorate` instruction.
@@ -119,6 +128,7 @@ mod tests {
         ("textured.frag", "u_texture", SOURCE_DESCRIPTOR),
         ("dst_blend.frag", "u_source", SOURCE_DESCRIPTOR),
         ("dst_blend.frag", "u_destination", DESTINATION_DESCRIPTOR),
+        ("dst_blend.frag", "blend_tables", TABLES_DESCRIPTOR),
     ];
 
     /// Every shader's source, compiled module and layout name the same
@@ -217,10 +227,13 @@ mod tests {
     /// The descriptors a GLSL source declares.
     ///
     /// A declaration names the set and the binding in its `layout` qualifier
-    /// and the sampler in the declaration itself.
+    /// and the sampler in the declaration itself. A buffer block names its
+    /// variable after the block's closing brace, so the block's lines are
+    /// read as well.
     fn glsl_descriptors(source: &str) -> Vec<(&str, u32, u32)> {
         let mut descriptors = Vec::new();
-        for line in source.lines() {
+        let mut lines = source.lines();
+        while let Some(line) = lines.next() {
             if !line.contains("layout(set") {
                 continue;
             }
@@ -230,13 +243,33 @@ mod tests {
             let Some(binding) = number_after(line, "binding =") else {
                 continue;
             };
-            let Some(declaration) = line.split(';').next() else {
-                continue;
-            };
-            let Some(variable) = declaration.split_whitespace().next_back() else {
-                continue;
-            };
-            descriptors.push((variable, set, binding));
+            // A buffer block names its variable after the block's closing
+            // brace; every other declaration names it before the semicolon.
+            if line.contains("buffer") {
+                let mut variable = None;
+                for next in lines.by_ref() {
+                    if let Some(tail) = next.split_once('}') {
+                        variable = tail
+                            .1
+                            .split_whitespace()
+                            .next()
+                            .map(|name| name.trim_end_matches(';'));
+                        break;
+                    }
+                }
+                let Some(variable) = variable else {
+                    continue;
+                };
+                descriptors.push((variable, set, binding));
+            } else {
+                let Some(declaration) = line.split(';').next() else {
+                    continue;
+                };
+                let Some(variable) = declaration.split_whitespace().next_back() else {
+                    continue;
+                };
+                descriptors.push((variable, set, binding));
+            }
         }
         descriptors
     }

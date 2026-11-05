@@ -6,6 +6,8 @@
 //!   keeps current;
 //! * the stateless [`RenderPipeline`] service, created by
 //!   [`create_render_pipeline`];
+//! * the [`blend`] table of the Photoshop family's per-channel functions and
+//!   the [`blend_shader`] program generated from it;
 //! * the explicit [`RenderState`] value and [`Surface`] handle, created by
 //!   [`begin_render_state`] and stored by the middle layer;
 //! * the [`Texture`] object and its upload/drop actions;
@@ -36,6 +38,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(unsafe_code)]
 
+pub mod blend;
+pub mod blend_shader;
 mod collections;
 mod cpu;
 mod effect;

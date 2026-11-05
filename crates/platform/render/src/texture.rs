@@ -20,11 +20,16 @@ static NEXT_TEXTURE_ID: AtomicU64 = AtomicU64::new(1);
 /// Storage format of a [`Texture`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum TextureFormat {
-    /// 8-bit RGBA with sRGB transfer characteristics; the canonical image
-    /// format of the pipeline.
+    /// 8-bit RGBA whose colour channels carry sRGB-encoded values; the
+    /// canonical image format of the pipeline.
+    ///
+    /// The pipeline composites in the encoded space: the bytes the engine
+    /// stores are the bytes the blend reads, so the backend samples and
+    /// writes them without a transfer function.
     #[default]
     Rgba8Srgb,
-    /// 8-bit RGBA, linear; used for masks and raw data textures.
+    /// 8-bit RGBA whose colour channels carry linear values; used for masks
+    /// and raw data textures.
     Rgba8Unorm,
     /// 8-bit single-channel coverage; used for glyph atlases.
     R8Unorm,

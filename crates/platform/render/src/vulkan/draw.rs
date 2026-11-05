@@ -24,7 +24,7 @@ use api::error::RenderError;
 use api::geometry::{Affine2, RectF};
 
 use super::pipelines::{PipelineResources, PipelineSet, Program, dst_blend_mode};
-use super::shaders::{DESTINATION_DESCRIPTOR, SOURCE_DESCRIPTOR};
+use super::shaders::{DESTINATION_DESCRIPTOR, SOURCE_DESCRIPTOR, TABLES_DESCRIPTOR};
 use super::target::DestinationSnapshot;
 use super::texture::VulkanTexture;
 use crate::MAX_TRAVERSAL_DEPTH;
@@ -127,8 +127,6 @@ pub(crate) struct SceneDraw<'a> {
     pub(crate) snapshot: Option<&'a mut DestinationSnapshot>,
     /// Target extent in device pixels.
     pub(crate) extent: vk::Extent2D,
-    /// Whether the target format is an sRGB surface.
-    pub(crate) srgb: bool,
 }
 
 /// Records all visible content of `scene` into the draw's command buffer.
@@ -155,7 +153,6 @@ pub(crate) fn record_scene(
         effects,
         snapshot,
         extent,
-        srgb,
     } = draw;
     let mut recorder = Recorder {
         pass,
@@ -165,7 +162,6 @@ pub(crate) fn record_scene(
         effects,
         snapshot,
         extent,
-        srgb,
         scene,
         cache: BindCache::default(),
     };
@@ -340,8 +336,6 @@ struct Recorder<'a> {
     scene: &'a RenderScene,
     /// Target extent in device pixels.
     extent: vk::Extent2D,
-    /// Whether the target format is an sRGB surface.
-    srgb: bool,
     /// The pipeline and descriptor set the command buffer has bound.
     cache: BindCache,
 }
@@ -461,7 +455,9 @@ impl Recorder<'_> {
         match &node.content {
             RenderContent::None => Ok(()),
             RenderContent::Solid(color) => {
-                let tint = self.color_tint(*color, opacity);
+                // The pipeline composites in the encoded space, so the node's
+                // colour reaches the shader as it is.
+                let tint = [color[0], color[1], color[2], color[3] * opacity];
                 self.draw_quad(QuadDraw {
                     program: Program::Solid,
                     blend: node.blend,
@@ -481,10 +477,10 @@ impl Recorder<'_> {
                     return Ok(());
                 }
                 let uv = uv_rect(texture.width(), texture.height(), node.src);
-                if node.blend.is_destination_dependent() {
+                if dst_blend_mode(node.blend).is_some() {
                     // The destination-dependent route: the source is blended
                     // over a copy of the destination in the program's shader.
-                    let tint = self.source_tint(node.color);
+                    let tint = [node.color[0], node.color[1], node.color[2], node.color[3]];
                     self.draw_dst_blend(DstBlendDraw {
                         node,
                         world,
@@ -495,10 +491,15 @@ impl Recorder<'_> {
                         scissor,
                     })
                 } else {
-                    // The per-node tint carries the text colour (linearised
-                    // for an sRGB target); the alpha is the composed opacity.
-                    // Ordinary textures keep the default `[1, 1, 1, 1]`.
-                    let tint = self.color_tint(node.color, opacity);
+                    // The per-node tint carries the text colour; the alpha is
+                    // the composed opacity. Ordinary textures keep the
+                    // default `[1, 1, 1, 1]`.
+                    let tint = [
+                        node.color[0],
+                        node.color[1],
+                        node.color[2],
+                        node.color[3] * opacity,
+                    ];
                     self.draw_quad(QuadDraw {
                         program: Program::Textured,
                         blend: node.blend,
@@ -686,6 +687,14 @@ impl Recorder<'_> {
                 &[snapshot.descriptor_set],
                 &[],
             );
+            self.pass.device.cmd_bind_descriptor_sets(
+                self.pass.command,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.resources.dst_pipeline_layout,
+                TABLES_DESCRIPTOR.set,
+                &[self.resources.tables_descriptor_set],
+                &[],
+            );
             push_constants(
                 self.pass.device,
                 self.pass.command,
@@ -701,42 +710,6 @@ impl Recorder<'_> {
         // no longer says what is bound.
         self.cache.invalidate();
         Ok(())
-    }
-
-    /// Converts a straight-alpha node colour into a shader tint.
-    ///
-    /// The RGB channels are linearised when the target is an sRGB surface;
-    /// the alpha carries the composed opacity.
-    fn color_tint(&self, color: [f32; 4], opacity: f32) -> [f32; 4] {
-        [
-            self.linearize(color[0]),
-            self.linearize(color[1]),
-            self.linearize(color[2]),
-            color[3] * opacity,
-        ]
-    }
-
-    /// Converts a straight-alpha node colour into the source tint of a
-    /// destination-dependent draw.
-    ///
-    /// The composed opacity travels in its own push constant, because the
-    /// blend functions mix the source's alpha with the opacity separately.
-    fn source_tint(&self, color: [f32; 4]) -> [f32; 4] {
-        [
-            self.linearize(color[0]),
-            self.linearize(color[1]),
-            self.linearize(color[2]),
-            color[3],
-        ]
-    }
-
-    /// Encodes an sRGB channel as linear when the target is an sRGB surface.
-    fn linearize(&self, channel: f32) -> f32 {
-        if self.srgb {
-            srgb_to_linear(channel)
-        } else {
-            channel
-        }
     }
 }
 
@@ -915,16 +888,6 @@ fn clamp_opacity(opacity: f32) -> f32 {
         0.0
     } else {
         opacity.clamp(0.0, 1.0)
-    }
-}
-
-/// Converts one sRGB channel to linear.
-pub(crate) fn srgb_to_linear(channel: f32) -> f32 {
-    let channel = channel.clamp(0.0, 1.0);
-    if channel <= 0.04045 {
-        channel / 12.92
-    } else {
-        ((channel + 0.055) / 1.055).powf(2.4)
     }
 }
 

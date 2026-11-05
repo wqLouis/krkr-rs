@@ -385,10 +385,13 @@ fn staging_capacity(required: vk::DeviceSize) -> Result<vk::DeviceSize, RenderEr
 }
 
 /// Returns the Vulkan format used for a [`TextureFormat`].
+///
+/// The pipeline composites in the encoded space, so the colour channels are
+/// stored and sampled without a transfer function: the bytes the engine
+/// writes are the bytes the blend reads.
 pub(crate) fn image_format(format: TextureFormat) -> vk::Format {
     match format {
-        TextureFormat::Rgba8Srgb => vk::Format::R8G8B8A8_SRGB,
-        TextureFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
+        TextureFormat::Rgba8Srgb | TextureFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
         TextureFormat::R8Unorm => vk::Format::R8_UNORM,
     }
 }

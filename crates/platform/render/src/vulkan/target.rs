@@ -621,9 +621,7 @@ pub(crate) fn render(
         width: target.desc.width,
         height: target.desc.height,
     };
-    let format = image_format(target.desc.format);
-    let srgb = super::format_is_srgb(format);
-    let clear = super::clear_value(scene.background, srgb);
+    let clear = super::clear_value(scene.background);
 
     record_and_submit(submit, |command_buffer| {
         // SAFETY: the command buffer is recording and every handle is live.
@@ -656,7 +654,6 @@ pub(crate) fn render(
                 effects,
                 snapshot: None,
                 extent,
-                srgb,
             },
             scene,
             &Affine2::IDENTITY,

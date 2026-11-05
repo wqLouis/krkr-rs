@@ -512,7 +512,11 @@ fn photoshop(
 ) -> [u8; 4] {
     let destination = argb_word(dst);
     let source = argb_word([to_u8(src[0]), to_u8(src[1]), to_u8(src[2]), to_u8(src[3])]);
-    let word = kernel(destination, source, ps_factor(source, u32::from(to_u8(opacity))));
+    let word = kernel(
+        destination,
+        source,
+        ps_factor(source, u32::from(to_u8(opacity))),
+    );
     [(word >> 16) as u8, (word >> 8) as u8, word as u8, dst[3]]
 }
 

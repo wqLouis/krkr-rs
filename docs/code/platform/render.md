@@ -22,6 +22,7 @@ trail: [`docs.old/migration/04-renderer-vulkan.md`](../../../docs.old/migration/
 | the headless backend and the CPU software rasterizer | `null.rs`, `cpu.rs` |
 | the Vulkan backend | `vulkan/{device,draw,pipelines,shaders,swapchain,target,texture}.rs` |
 | texture handles and descriptors | `texture.rs` |
+| the Photoshop family's per-channel functions and the program generated from them | `blend.rs`, `blend_shader.rs` |
 | offscreen target handles and descriptors | `render_target.rs` |
 | glyph rasterization | `glyph.rs` |
 
@@ -377,12 +378,35 @@ Blend state is not a shader concern; it is a per-pipeline
 | `Multiply` | `DST_COLOR` / `ZERO` / `ADD` |
 | `Screen` | `ONE_MINUS_DST_COLOR` / `ONE` / `ADD` |
 
-The fifteen destination-dependent modes — the fourteen `DstBlend` functions and
-the Photoshop subtractive blend, which is the linear burn — need to read the
-destination colour, which fixed-function blend state cannot express. The Vulkan
-backend draws them with a third program, the **destination blend**: it samples
-the source and a copy of the destination and mixes them itself, so its
-fixed-function blending is disabled and the destination's alpha is held.
+The destination-dependent modes need to read the destination colour, which
+fixed-function blend state cannot express. The Vulkan backend draws them with
+a third program, the **destination blend**: it samples the source and a copy of
+the destination and mixes them itself, so its fixed-function blending is
+disabled and the destination's alpha is held.
+
+The sixteen modes of the **Photoshop family** — the normal, the additive, the
+subtractive, the multiplicative, the screen, the overlay, the hard light, the
+soft light, the colour dodge, the legacy colour dodge, the colour burn, the
+lighten, the darken, the difference, the legacy difference and the exclusion —
+run in that program too: their per-channel function reads the destination's
+channel, and the family is registered as the HDA variant, so the destination's
+alpha is held.
+
+One table of per-channel functions owns the family: `render::blend` holds a
+per-channel function and the way its result combines with the source's alpha
+for every mode, and both the engine's bitmap path and the GPU's program come
+from it. The program's GLSL is **generated** from that table
+(`render::blend_shader::dst_blend_shader`, written into `shaders/dst_blend.frag`
+by `cargo run -p render --bin write_dst_blend_shader`), so the shader and the
+table cannot disagree; a test compares the committed shader with the generated
+one.
+
+The functions are whole-byte arithmetic, not floating-point math: the mix's
+difference is signed and its shift rounds towards negative infinity, so a
+channel below the destination's darkens it. The soft light is the one mode
+whose entries cannot be computed in a shader — they are the truncated values
+of a double-precision power — so the program reads them from the table the
+pipeline uploads as a storage buffer.
 
 The copy is the offscreen-compositing route — render to a target, copy the
 target content for the quad's `dst` region into a sampled image, and draw with
@@ -411,12 +435,14 @@ and the shader, the layouts and the draw all use them.
 |---|---|---|
 | the source texture (`u_texture` in the textured program, `u_source` in the destination blend) | 0 | 0 |
 | the copy of the destination (`u_destination` in the destination blend) | 1 | 0 |
+| the blend tables (`blend_tables` in the destination blend) | 2 | 0 |
 
-The destination-dependent program binds two sets: the source's set and the
-destination's set, each with one combined image sampler. A shader that named
-a set and a binding no layout provides would read a descriptor that does not
-exist: the pipeline creation fails on a strict driver, and the draw reads
-unbound data on a lenient one.
+The destination-dependent program binds three sets: the source's set, the
+destination's set and the tables' set. The first two hold one combined image
+sampler each and the third one storage buffer. A shader that named a set and
+a binding no layout provides would read a descriptor that does not exist: the
+pipeline creation fails on a strict driver, and the draw reads unbound data on
+a lenient one.
 
 ### Textures and uploads
 
@@ -427,9 +453,14 @@ unbound data on a lenient one.
   dirty bitmaps pay a single submit rather than one per texture.
 * Sub-rectangle uploads are supported: only part of a bitmap is touched by a
   text draw or a raster operation.
-* sRGB: the images are `Rgba8Srgb` and the colours are linearised in the
-  shader. One format plus linear shader math, applied consistently across
-  both backends.
+* The colour space is the **encoded** one: the bytes the engine stores are
+  the bytes the blend reads, and the result is written back as encoded
+  bytes. The images are `Rgba8Srgb` and the backend stores and samples them
+  without a transfer function, so the shader blends the encoded values. The
+  node's colours, the scene's background and the swapchain take the same
+  space, so nothing is linearised on the way in or on the way out. This is
+  the space the engine's blends are defined in, so the CPU and the GPU blend
+  the same values.
 * `drop_texture` is called when L2 drops a bitmap, so the bitmap→texture
   lifetime is explicit L2 state. A handle may still be referenced by a
   `RenderScene`; such a draw is simply skipped.
@@ -503,7 +534,9 @@ untouched, so the caller keeps the game and the VM alive across the recovery.
 Nothing degrades silently: a mask clip or a glyph run on the Vulkan backend is
 `Unsupported`, not source-over. A destination-dependent blend is drawn by the
 destination-blend program; the offscreen-target path, which has no copy of the
-destination to read, refuses it with `Unsupported`.
+destination to read, refuses it with `Unsupported`. Every mode of the
+Photoshop family is one of those modes, so the offscreen-target path refuses
+them as well.
 
 **Nothing in L2 emits an effect draw yet.** The backend can build an effect
 pipeline and draw `RenderContent::Effect`, but the projection emits
@@ -520,6 +553,11 @@ L2-side registry is documented in [`../engine/shader.md`](../engine/shader.md).
   control characters and the bad sizes, the mapped glyph without an outline
   keeping its advance, and the glyph-scene construction. A missing system
   font **skips** the test rather than failing.
+* `crates/platform/render/tests/blend.rs` — the committed shader being the
+  one the table generates, every mode of the Photoshop family blending the
+  reference's vectors exactly, every mode having an index of its own, the
+  two legacy modes replacing the channel, the hard light being the swapped
+  overlay table, and the soft-light table holding every entry.
 * `crates/platform/render/tests/null.rs` — the null pipeline round trip
   counting the draws, and the partial upload touching only its region.
 * `crates/platform/render/tests/pipeline.rs` — the default headless

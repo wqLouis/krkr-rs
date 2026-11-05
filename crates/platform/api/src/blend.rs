@@ -90,11 +90,20 @@ impl BlendMode {
     /// Returns `true` if this mode needs to read the destination and
     /// therefore requires the destination-dependent shader path.
     ///
-    /// The Photoshop subtractive blend is a linear burn, so it reads the
-    /// destination as the [`DestinationDependent`](Self::DestinationDependent)
-    /// modes do.
+    /// Every mode of the Photoshop family reads the destination: their
+    /// per-channel function takes the destination's channel, so they run in
+    /// the destination-dependent program as the
+    /// [`DestinationDependent`](Self::DestinationDependent) modes do.
     pub const fn is_destination_dependent(&self) -> bool {
-        matches!(self, Self::DestinationDependent(_) | Self::PsSubtractive)
+        matches!(
+            self,
+            Self::DestinationDependent(_)
+                | Self::PsNormal
+                | Self::PsAdditive
+                | Self::PsSubtractive
+                | Self::PsMultiplicative
+                | Self::PsScreen
+        )
     }
 
     /// Returns the wrapped [`DstBlend`] when this is a

@@ -373,27 +373,21 @@ fn create_image_view(
 /// Picks an 8-bit surface format, preferring the requested [`TextureFormat`]
 /// when the surface advertises it.
 ///
-/// `Rgba8Srgb` (the default) prefers BGRA (the common desktop layout), while
-/// `Rgba8Unorm` prefers the closest linear layout. `R8Unorm` has no colour
-/// surface equivalent and falls back to the sRGB order. Falls back to the
-/// first advertised format when none of the preferred layouts is available.
+/// The pipeline composites in the encoded space, so the surface takes the
+/// encoded bytes as they are: `Rgba8Srgb` (the default) prefers BGRA (the
+/// common desktop layout), while `Rgba8Unorm` prefers the closest layout.
+/// `R8Unorm` has no colour surface equivalent and falls back to the sRGB
+/// order. Falls back to the first advertised format when none of the
+/// preferred layouts is available.
 fn choose_surface_format(
     formats: &[vk::SurfaceFormatKHR],
     preferred: TextureFormat,
 ) -> Option<vk::SurfaceFormatKHR> {
     let order = match preferred {
-        TextureFormat::Rgba8Unorm => [
-            vk::Format::R8G8B8A8_UNORM,
-            vk::Format::B8G8R8A8_UNORM,
-            vk::Format::R8G8B8A8_SRGB,
-            vk::Format::B8G8R8A8_SRGB,
-        ],
-        TextureFormat::Rgba8Srgb | TextureFormat::R8Unorm => [
-            vk::Format::B8G8R8A8_SRGB,
-            vk::Format::R8G8B8A8_SRGB,
-            vk::Format::B8G8R8A8_UNORM,
-            vk::Format::R8G8B8A8_UNORM,
-        ],
+        TextureFormat::Rgba8Unorm => [vk::Format::R8G8B8A8_UNORM, vk::Format::B8G8R8A8_UNORM],
+        TextureFormat::Rgba8Srgb | TextureFormat::R8Unorm => {
+            [vk::Format::B8G8R8A8_UNORM, vk::Format::R8G8B8A8_UNORM]
+        }
     };
     for format in order {
         if let Some(found) = formats.iter().find(|candidate| candidate.format == format) {

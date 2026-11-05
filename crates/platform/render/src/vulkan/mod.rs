@@ -1006,8 +1006,7 @@ impl VulkanPipeline {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent,
             };
-            let srgb = format_is_srgb(format);
-            let clear = clear_value(scene.background, srgb);
+            let clear = clear_value(scene.background);
 
             // The frame is composed into a target of its own and then
             // presented with a quad, because a destination-dependent blend
@@ -1070,7 +1069,6 @@ impl VulkanPipeline {
                         effects,
                         snapshot,
                         extent,
-                        srgb,
                     },
                     scene,
                     &Affine2::IDENTITY,
@@ -2176,31 +2174,12 @@ fn display_for_window(window: &RawWindowHandle) -> Option<RawDisplayHandle> {
     }
 }
 
-/// Returns `true` when `format` applies the sRGB transfer function on write.
-pub(crate) fn format_is_srgb(format: vk::Format) -> bool {
-    matches!(
-        format,
-        vk::Format::B8G8R8A8_SRGB
-            | vk::Format::R8G8B8A8_SRGB
-            | vk::Format::A8B8G8R8_SRGB_PACK32
-            | vk::Format::B8G8R8_SRGB
-            | vk::Format::R8G8B8_SRGB
-    )
-}
-
 /// Converts the scene background into a render-pass clear color.
-pub(crate) fn clear_value(background: Option<[f32; 4]>, srgb: bool) -> [f32; 4] {
-    let [r, g, b, a] = background.unwrap_or([0.0, 0.0, 0.0, 1.0]);
-    if srgb {
-        [
-            draw::srgb_to_linear(r),
-            draw::srgb_to_linear(g),
-            draw::srgb_to_linear(b),
-            a,
-        ]
-    } else {
-        [r, g, b, a]
-    }
+///
+/// The pipeline composites in the encoded space, so the background's colour
+/// reaches the target as it is.
+pub(crate) fn clear_value(background: Option<[f32; 4]>) -> [f32; 4] {
+    background.unwrap_or([0.0, 0.0, 0.0, 1.0])
 }
 
 /// Validates an offscreen render-target descriptor against the device limit.

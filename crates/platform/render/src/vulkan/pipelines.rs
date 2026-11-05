@@ -22,8 +22,9 @@ use api::blend::{BlendMode, DstBlend};
 use api::error::RenderError;
 
 use super::device;
-use super::shaders::{self, DESTINATION_DESCRIPTOR, SOURCE_DESCRIPTOR};
+use super::shaders::{self, DESTINATION_DESCRIPTOR, SOURCE_DESCRIPTOR, TABLES_DESCRIPTOR};
 use super::texture::find_memory_type;
+use crate::blend_shader::{PLAIN_COLOR_DODGE, PLAIN_DARKEN, PLAIN_LIGHTEN};
 
 /// Number of fixed-function blend variants compiled per program.
 pub(crate) const BLEND_SLOT_COUNT: usize = 9;
@@ -92,11 +93,13 @@ pub(crate) struct PipelineResources {
     pub(crate) descriptor_set_layout: vk::DescriptorSetLayout,
     /// Descriptor set layout for the destination copy's sampler.
     pub(crate) dst_descriptor_set_layout: vk::DescriptorSetLayout,
+    /// Descriptor set layout for the blend tables' storage buffer.
+    pub(crate) tables_descriptor_set_layout: vk::DescriptorSetLayout,
     /// Pipeline layout (one descriptor set + push constants).
     pub(crate) pipeline_layout: vk::PipelineLayout,
     /// Pipeline layout for the destination-dependent program: the source's
-    /// descriptor set, the destination copy's descriptor set and the push
-    /// constants.
+    /// descriptor set, the destination copy's descriptor set, the blend
+    /// tables' descriptor set and the push constants.
     pub(crate) dst_pipeline_layout: vk::PipelineLayout,
     /// Pool that backs one descriptor set per texture.
     pub(crate) descriptor_pool: vk::DescriptorPool,
@@ -106,6 +109,12 @@ pub(crate) struct PipelineResources {
     pub(crate) vertex_buffer: vk::Buffer,
     /// Backing memory of [`Self::vertex_buffer`].
     pub(crate) vertex_memory: vk::DeviceMemory,
+    /// Host-visible buffer the blend tables live in.
+    pub(crate) tables_buffer: vk::Buffer,
+    /// Backing memory of [`Self::tables_buffer`].
+    pub(crate) tables_memory: vk::DeviceMemory,
+    /// Descriptor set the blend tables are bound through.
+    pub(crate) tables_descriptor_set: vk::DescriptorSet,
 }
 
 /// Compiled pipelines for one render pass.
@@ -179,6 +188,60 @@ impl PipelineSet {
     }
 }
 
+/// The blend tables' resources.
+///
+/// The destination-dependent program reads the soft-light table from a
+/// storage buffer: the table's entries are the truncated values of a
+/// double-precision power, and a shader's floating-point power cannot
+/// reproduce them. The buffer holds the table the shared table of per-channel
+/// functions owns, so the shader and the CPU path blend the same entries.
+struct BlendTables {
+    /// Descriptor set layout for the tables' storage buffer.
+    layout: vk::DescriptorSetLayout,
+    /// Host-visible buffer the tables live in.
+    buffer: vk::Buffer,
+    /// Backing memory of [`Self::buffer`].
+    memory: vk::DeviceMemory,
+    /// Descriptor set the tables are bound through.
+    descriptor_set: vk::DescriptorSet,
+}
+
+impl BlendTables {
+    /// Creates the buffer and the descriptor set.
+    ///
+    /// The layout belongs to the caller, which destroys it whether this
+    /// succeeds or not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::OutOfMemory`] when a resource cannot be created.
+    fn create(
+        device: &ash::Device,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        descriptor_pool: vk::DescriptorPool,
+        layout: vk::DescriptorSetLayout,
+    ) -> Result<Self, RenderError> {
+        let (buffer, memory) = create_tables_buffer(device, memory_properties)?;
+        let descriptor_set = match allocate_tables_set(device, layout, descriptor_pool, buffer) {
+            Ok(set) => set,
+            Err(error) => {
+                // SAFETY: the buffer was created here.
+                unsafe {
+                    device.destroy_buffer(buffer, None);
+                    device.free_memory(memory, None);
+                }
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            layout,
+            buffer,
+            memory,
+            descriptor_set,
+        })
+    }
+}
+
 impl PipelineResources {
     /// Builds the descriptor layouts, the pool, the sampler and the unit quad.
     ///
@@ -198,7 +261,7 @@ impl PipelineResources {
                 return Err(error);
             }
         };
-        let pipeline_layout = match create_pipeline_layout(device, descriptor_set_layout) {
+        let tables_descriptor_set_layout = match create_tables_layout(device) {
             Ok(layout) => layout,
             Err(error) => {
                 // SAFETY: the layouts were created here and nothing else uses them.
@@ -209,16 +272,30 @@ impl PipelineResources {
                 return Err(error);
             }
         };
+        let pipeline_layout = match create_pipeline_layout(device, descriptor_set_layout) {
+            Ok(layout) => layout,
+            Err(error) => {
+                // SAFETY: the layouts were created here and nothing else uses them.
+                unsafe {
+                    device.destroy_descriptor_set_layout(tables_descriptor_set_layout, None);
+                    device.destroy_descriptor_set_layout(dst_descriptor_set_layout, None);
+                    device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+                }
+                return Err(error);
+            }
+        };
         let dst_pipeline_layout = match create_dst_pipeline_layout(
             device,
             descriptor_set_layout,
             dst_descriptor_set_layout,
+            tables_descriptor_set_layout,
         ) {
             Ok(layout) => layout,
             Err(error) => {
                 // SAFETY: the layouts were created here and nothing else uses them.
                 unsafe {
                     device.destroy_pipeline_layout(pipeline_layout, None);
+                    device.destroy_descriptor_set_layout(tables_descriptor_set_layout, None);
                     device.destroy_descriptor_set_layout(dst_descriptor_set_layout, None);
                     device.destroy_descriptor_set_layout(descriptor_set_layout, None);
                 }
@@ -232,6 +309,7 @@ impl PipelineResources {
                 unsafe {
                     device.destroy_pipeline_layout(dst_pipeline_layout, None);
                     device.destroy_pipeline_layout(pipeline_layout, None);
+                    device.destroy_descriptor_set_layout(tables_descriptor_set_layout, None);
                     device.destroy_descriptor_set_layout(dst_descriptor_set_layout, None);
                     device.destroy_descriptor_set_layout(descriptor_set_layout, None);
                 }
@@ -246,6 +324,7 @@ impl PipelineResources {
                     device.destroy_descriptor_pool(descriptor_pool, None);
                     device.destroy_pipeline_layout(dst_pipeline_layout, None);
                     device.destroy_pipeline_layout(pipeline_layout, None);
+                    device.destroy_descriptor_set_layout(tables_descriptor_set_layout, None);
                     device.destroy_descriptor_set_layout(dst_descriptor_set_layout, None);
                     device.destroy_descriptor_set_layout(descriptor_set_layout, None);
                 }
@@ -261,6 +340,30 @@ impl PipelineResources {
                     device.destroy_descriptor_pool(descriptor_pool, None);
                     device.destroy_pipeline_layout(dst_pipeline_layout, None);
                     device.destroy_pipeline_layout(pipeline_layout, None);
+                    device.destroy_descriptor_set_layout(tables_descriptor_set_layout, None);
+                    device.destroy_descriptor_set_layout(dst_descriptor_set_layout, None);
+                    device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+                }
+                return Err(error);
+            }
+        };
+        let tables = match BlendTables::create(
+            device,
+            memory_properties,
+            descriptor_pool,
+            tables_descriptor_set_layout,
+        ) {
+            Ok(tables) => tables,
+            Err(error) => {
+                // SAFETY: all five handles were created here and are unused.
+                unsafe {
+                    device.destroy_buffer(vertex_buffer, None);
+                    device.free_memory(vertex_memory, None);
+                    device.destroy_sampler(sampler, None);
+                    device.destroy_descriptor_pool(descriptor_pool, None);
+                    device.destroy_pipeline_layout(dst_pipeline_layout, None);
+                    device.destroy_pipeline_layout(pipeline_layout, None);
+                    device.destroy_descriptor_set_layout(tables_descriptor_set_layout, None);
                     device.destroy_descriptor_set_layout(dst_descriptor_set_layout, None);
                     device.destroy_descriptor_set_layout(descriptor_set_layout, None);
                 }
@@ -271,12 +374,16 @@ impl PipelineResources {
         Ok(Self {
             descriptor_set_layout,
             dst_descriptor_set_layout,
+            tables_descriptor_set_layout: tables.layout,
             pipeline_layout,
             dst_pipeline_layout,
             descriptor_pool,
             sampler,
             vertex_buffer,
             vertex_memory,
+            tables_buffer: tables.buffer,
+            tables_memory: tables.memory,
+            tables_descriptor_set: tables.descriptor_set,
         })
     }
 
@@ -285,6 +392,11 @@ impl PipelineResources {
         // SAFETY: all handles were created by `device`; the caller guarantees
         // the GPU is idle.
         unsafe {
+            let _ =
+                device.free_descriptor_sets(self.descriptor_pool, &[self.tables_descriptor_set]);
+            device.destroy_buffer(self.tables_buffer, None);
+            device.free_memory(self.tables_memory, None);
+            device.destroy_descriptor_set_layout(self.tables_descriptor_set_layout, None);
             device.destroy_pipeline_layout(self.dst_pipeline_layout, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_set_layout(self.dst_descriptor_set_layout, None);
@@ -392,66 +504,52 @@ pub(crate) fn create(
 /// program serves them instead.
 pub(crate) fn blend_slot(mode: BlendMode) -> Option<usize> {
     match mode {
-        // The source-over is the alpha-correct blend; the Photoshop normal is
-        // the channel mix with the destination's alpha held, so it needs its
-        // own slot.
+        // The source-over is the alpha-correct blend.
         BlendMode::SourceOver => Some(0),
-        BlendMode::PsNormal => Some(7),
         BlendMode::Replace => Some(1),
         // Slot 2 is `src·a + dst` while the Photoshop additive blend is
         // `lerp(dst, min(1, dst+src), a)`; they differ only at the saturation
-        // boundary. Reusing the slot is the same near-identical
-        // approximation the multiplicative/screen arms make, and it keeps a
-        // layer that rendered before from failing the frame.
-        BlendMode::Additive | BlendMode::PsAdditive => Some(2),
+        // boundary. The Photoshop blend runs in the destination-dependent
+        // program, which computes the per-channel function exactly.
+        BlendMode::Additive => Some(2),
         // The subtractive blend is the saturating difference `dst - src·a`.
-        // The Photoshop subtractive blend is the linear burn, which no
-        // fixed-function blend state expresses: the destination-dependent
-        // program computes it from the destination it samples.
         BlendMode::Subtractive => Some(3),
-        BlendMode::PsSubtractive => None,
         BlendMode::AddAlpha => Some(4),
-        // The Photoshop multiplicative/screen fixed-function slots carry the
-        // same per-channel blend function; the source-alpha weighting applied
-        // around it is the approximation the non-Photoshop slots already make.
-        BlendMode::Multiply | BlendMode::PsMultiplicative => Some(5),
-        BlendMode::Screen | BlendMode::PsScreen => Some(6),
-        // The destination-dependent modes must read the destination color and
-        // have no fixed-function equivalent.
-        BlendMode::DestinationDependent(_) => None,
+        // The multiplicative and the screen blends are the fixed-function
+        // per-channel functions; the Photoshop family runs in the
+        // destination-dependent program.
+        BlendMode::Multiply => Some(5),
+        BlendMode::Screen => Some(6),
+        // Every mode of the Photoshop family reads the destination, and the
+        // destination-dependent program computes their per-channel function.
+        BlendMode::PsNormal
+        | BlendMode::PsAdditive
+        | BlendMode::PsSubtractive
+        | BlendMode::PsMultiplicative
+        | BlendMode::PsScreen
+        | BlendMode::DestinationDependent(_) => None,
     }
 }
 
 /// The mode index of a destination-dependent blend in the blend program.
 ///
 /// The program's switch implements the same set; every mode has an index of
-/// its own, and the index travels in the push constants. The order matches
-/// the shader's `shaders/dst_blend.frag`.
+/// its own, and the index travels in the push constants. The Photoshop
+/// family's indices come from the shared table of per-channel functions, so
+/// the program and the table number the modes the same way.
 ///
 /// `None` means the mode has a fixed-function slot and never reaches the
 /// destination-dependent program.
-pub(crate) const fn dst_blend_mode(mode: BlendMode) -> Option<u32> {
+pub(crate) fn dst_blend_mode(mode: BlendMode) -> Option<u32> {
+    if let Some(blend) = crate::blend::photoshop_blend(mode) {
+        return Some(blend.index());
+    }
     match mode {
-        BlendMode::DestinationDependent(kind) => Some(match kind {
-            DstBlend::ColorDodge => 0,
-            DstBlend::PsColorDodge => 1,
-            DstBlend::ColorDodge5 => 2,
-            DstBlend::ColorBurn => 3,
-            DstBlend::Darken => 4,
-            DstBlend::PsDarken => 5,
-            DstBlend::Lighten => 6,
-            DstBlend::PsLighten => 7,
-            DstBlend::Difference => 8,
-            DstBlend::Difference5 => 9,
-            DstBlend::Exclusion => 10,
-            DstBlend::Overlay => 11,
-            DstBlend::HardLight => 12,
-            DstBlend::SoftLight => 13,
-        }),
-        // The Photoshop subtractive blend is the linear burn, which no
-        // fixed-function blend state expresses, so the program computes it
-        // from the destination it samples.
-        BlendMode::PsSubtractive => Some(14),
+        // The modes outside the Photoshop family: the plain colour dodge,
+        // the plain darken and the plain lighten.
+        BlendMode::DestinationDependent(DstBlend::ColorDodge) => Some(PLAIN_COLOR_DODGE),
+        BlendMode::DestinationDependent(DstBlend::Darken) => Some(PLAIN_DARKEN),
+        BlendMode::DestinationDependent(DstBlend::Lighten) => Some(PLAIN_LIGHTEN),
         BlendMode::SourceOver
         | BlendMode::Replace
         | BlendMode::Additive
@@ -461,8 +559,10 @@ pub(crate) const fn dst_blend_mode(mode: BlendMode) -> Option<u32> {
         | BlendMode::Screen
         | BlendMode::PsNormal
         | BlendMode::PsAdditive
+        | BlendMode::PsSubtractive
         | BlendMode::PsMultiplicative
         | BlendMode::PsScreen => None,
+        BlendMode::DestinationDependent(_) => None,
     }
 }
 
@@ -540,13 +640,10 @@ fn blend_state_for_slot(slot: usize) -> vk::PipelineColorBlendAttachmentState {
             .src_alpha_blend_factor(vk::BlendFactor::ZERO)
             .dst_alpha_blend_factor(vk::BlendFactor::ONE)
             .alpha_blend_op(vk::BlendOp::ADD),
-        // Slot 7: the Photoshop normal - the per-channel mix `src*a +
+        // Slot 7: the held source-over - the per-channel mix `src*a +
         // dst*(1-a)` with the destination's alpha held: the colour factors
         // are `SRC_ALPHA`/`ONE_MINUS_SRC_ALPHA` and the alpha factors
         // `ZERO`/`ONE`.
-        //
-        // The slot is also the held face of the source-over: the same
-        // colour mix with the destination's alpha kept.
         7 => base
             .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
             .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
@@ -587,8 +684,8 @@ fn blend_slot_for(mode: BlendMode, hold_alpha: bool) -> Option<usize> {
     match (mode, hold_alpha) {
         // The held copy: the source's colour and the destination's alpha.
         (BlendMode::Replace, true) => Some(KEEP_ALPHA_COPY_SLOT),
-        // The held source-over: the Photoshop normal's colour mix with the
-        // destination's alpha kept.
+        // The held source-over: the colour mix with the destination's alpha
+        // kept.
         (BlendMode::SourceOver, true) => Some(7),
         _ => blend_slot(mode),
     }
@@ -664,18 +761,25 @@ fn create_pipeline_layout(
 // The destination-dependent program's pipeline layout binds the source's set
 // first and the destination's second, so the two descriptors must name the
 // first two sets.
-const _: () = assert!(SOURCE_DESCRIPTOR.set == 0 && DESTINATION_DESCRIPTOR.set == 1);
+const _: () = assert!(
+    SOURCE_DESCRIPTOR.set == 0 && DESTINATION_DESCRIPTOR.set == 1 && TABLES_DESCRIPTOR.set == 2
+);
 
 /// Creates the pipeline layout the destination-dependent program uses.
 ///
 /// The first set binds the source texture, the second the copy of the
-/// destination the blend reads.
+/// destination the blend reads and the third the blend tables.
 fn create_dst_pipeline_layout(
     device: &ash::Device,
     descriptor_set_layout: vk::DescriptorSetLayout,
     dst_descriptor_set_layout: vk::DescriptorSetLayout,
+    tables_descriptor_set_layout: vk::DescriptorSetLayout,
 ) -> Result<vk::PipelineLayout, RenderError> {
-    let set_layouts = [descriptor_set_layout, dst_descriptor_set_layout];
+    let set_layouts = [
+        descriptor_set_layout,
+        dst_descriptor_set_layout,
+        tables_descriptor_set_layout,
+    ];
     let push_constant = vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
         .offset(0)
@@ -692,12 +796,164 @@ fn create_dst_pipeline_layout(
     })
 }
 
+/// Creates the descriptor set layout the blend tables are bound through.
+///
+/// The layout binds the tables' storage buffer: the destination-dependent
+/// shader reads the soft-light table from it.
+fn create_tables_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout, RenderError> {
+    let binding = vk::DescriptorSetLayoutBinding::default()
+        .binding(TABLES_DESCRIPTOR.binding)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+    let bindings = [binding];
+    let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    // SAFETY: `create_info` borrows a local valid for the call.
+    unsafe { device.create_descriptor_set_layout(&create_info, None) }.map_err(|error| {
+        RenderError::Shader {
+            message: format!("failed to create the blend tables descriptor set layout: {error}"),
+        }
+    })
+}
+
+/// Creates the host-visible buffer the blend tables live in.
+///
+/// The buffer holds the soft-light table, which the shared table of
+/// per-channel functions owns: the shader reads the entries the CPU path
+/// blends with.
+fn create_tables_buffer(
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+) -> Result<(vk::Buffer, vk::DeviceMemory), RenderError> {
+    let table = crate::blend::soft_light_table();
+    let size = vk::DeviceSize::try_from(table.len()).map_err(|_| RenderError::OutOfMemory {
+        message: "the blend tables do not fit in a device buffer".to_owned(),
+    })?;
+
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    // SAFETY: `buffer_info` borrows a local valid for the call.
+    let buffer = unsafe { device.create_buffer(&buffer_info, None) }.map_err(|error| {
+        RenderError::OutOfMemory {
+            message: format!("failed to create the blend tables buffer: {error}"),
+        }
+    })?;
+
+    // SAFETY: `buffer` was just created by `device`.
+    let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let memory_type = match find_memory_type(
+        memory_properties,
+        requirements.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    ) {
+        Ok(memory_type) => memory_type,
+        Err(error) => {
+            // SAFETY: `buffer` is owned here and not used elsewhere yet.
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(error);
+        }
+    };
+
+    let allocate_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(memory_type);
+    // SAFETY: `allocate_info` is valid; the memory is freed with the buffer.
+    let memory = unsafe { device.allocate_memory(&allocate_info, None) }.map_err(|error| {
+        // SAFETY: `buffer` is owned here.
+        unsafe { device.destroy_buffer(buffer, None) };
+        RenderError::OutOfMemory {
+            message: format!("failed to allocate the blend tables memory: {error}"),
+        }
+    })?;
+
+    // SAFETY: `memory` was allocated for `buffer`.
+    if let Err(error) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+        // SAFETY: both handles are owned here and unused elsewhere yet.
+        unsafe {
+            device.destroy_buffer(buffer, None);
+            device.free_memory(memory, None);
+        }
+        return Err(RenderError::OutOfMemory {
+            message: format!("failed to bind the blend tables memory: {error}"),
+        });
+    }
+
+    // SAFETY: the memory is host-visible and not in use by the GPU.
+    let mapped = match unsafe { device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) } {
+        Ok(mapped) => mapped,
+        Err(error) => {
+            // SAFETY: both handles are owned here and unused elsewhere yet.
+            unsafe {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
+            return Err(RenderError::OutOfMemory {
+                message: format!("failed to map the blend tables memory: {error}"),
+            });
+        }
+    };
+    // SAFETY: `mapped` points at `size` writable bytes owned by `memory`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(table.as_ptr(), mapped.cast::<u8>(), table.len());
+        device.unmap_memory(memory);
+    }
+
+    Ok((buffer, memory))
+}
+
+/// Allocates the descriptor set the blend tables are bound through.
+fn allocate_tables_set(
+    device: &ash::Device,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
+    buffer: vk::Buffer,
+) -> Result<vk::DescriptorSet, RenderError> {
+    let set_layouts = [descriptor_set_layout];
+    let allocate_sets = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(descriptor_pool)
+        .set_layouts(&set_layouts);
+    // SAFETY: `allocate_sets` borrows locals valid for the call.
+    let descriptor_set = match unsafe { device.allocate_descriptor_sets(&allocate_sets) } {
+        Ok(mut sets) => match sets.pop() {
+            Some(set) => set,
+            None => {
+                return Err(RenderError::OutOfMemory {
+                    message: "the descriptor pool returned no descriptor set".to_owned(),
+                });
+            }
+        },
+        Err(error) => {
+            return Err(RenderError::OutOfMemory {
+                message: format!("failed to allocate a descriptor set: {error}"),
+            });
+        }
+    };
+    let buffer_info = vk::DescriptorBufferInfo::default()
+        .buffer(buffer)
+        .offset(0)
+        .range(vk::WHOLE_SIZE);
+    let buffer_infos = [buffer_info];
+    let write = vk::WriteDescriptorSet::default()
+        .dst_set(descriptor_set)
+        .dst_binding(TABLES_DESCRIPTOR.binding)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .buffer_info(&buffer_infos);
+    // SAFETY: the descriptor set is not in use and the buffer info is valid.
+    unsafe { device.update_descriptor_sets(&[write], &[]) };
+    Ok(descriptor_set)
+}
+
 /// Creates the descriptor pool used for per-texture descriptor sets.
 fn create_descriptor_pool(device: &ash::Device) -> Result<vk::DescriptorPool, RenderError> {
-    let pool_size = vk::DescriptorPoolSize::default()
+    let samplers = vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
         .descriptor_count(1024);
-    let pool_sizes = [pool_size];
+    let storage_buffers = vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(4);
+    let pool_sizes = [samplers, storage_buffers];
     let create_info = vk::DescriptorPoolCreateInfo::default()
         .pool_sizes(&pool_sizes)
         .max_sets(1024)
@@ -1035,9 +1291,13 @@ mod tests {
             BlendMode::DestinationDependent(DstBlend::Overlay),
             BlendMode::DestinationDependent(DstBlend::HardLight),
             BlendMode::DestinationDependent(DstBlend::SoftLight),
-            // The Photoshop subtractive blend is the linear burn, so it reads
-            // the destination like the destination-dependent modes do.
+            // Every mode of the Photoshop family reads the destination, so it
+            // runs in the destination-dependent program.
+            BlendMode::PsNormal,
+            BlendMode::PsAdditive,
             BlendMode::PsSubtractive,
+            BlendMode::PsMultiplicative,
+            BlendMode::PsScreen,
         ];
         let mut modes: Set<u32> = Set::default();
         for blend in blends {
@@ -1050,14 +1310,26 @@ mod tests {
         assert_eq!(modes.len(), blends.len());
     }
 
-    /// The Photoshop subtractive blend has no fixed-function slot.
+    /// Every mode of the Photoshop family has no fixed-function slot.
     ///
-    /// The linear burn reads the destination, so the destination-dependent
-    /// program draws it; the non-Photoshop subtractive blend keeps the
-    /// fixed-function subtract slot.
+    /// The family's per-channel function reads the destination, so the
+    /// destination-dependent program draws it; the non-Photoshop subtractive
+    /// blend keeps the fixed-function subtract slot.
     #[test]
-    fn the_photoshop_subtractive_blend_has_no_fixed_function_slot() {
-        assert_eq!(blend_slot(BlendMode::PsSubtractive), None);
+    fn the_photoshop_family_has_no_fixed_function_slot() {
+        for mode in [
+            BlendMode::PsNormal,
+            BlendMode::PsAdditive,
+            BlendMode::PsSubtractive,
+            BlendMode::PsMultiplicative,
+            BlendMode::PsScreen,
+        ] {
+            assert_eq!(blend_slot(mode), None, "the mode {mode:?}");
+            assert!(
+                dst_blend_mode(mode).is_some(),
+                "the mode {mode:?} has no mode index"
+            );
+        }
         assert_eq!(blend_slot(BlendMode::Subtractive), Some(3));
     }
 
@@ -1140,9 +1412,6 @@ mod tests {
     ///   (`reference/krkr2/cpp/core/visual/gl/blend_util_func.h:35-43`), and
     ///   its held face restores the destination's alpha
     ///   (`reference/krkr2/cpp/core/visual/tvpgl.cpp:944-971`);
-    /// * the Photoshop normal mixes the red/blue and the green lanes
-    ///   (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:374-384`), so
-    ///   the alpha byte is in neither mask.
     ///
     /// The fixed-function spelling of "keep the destination's alpha" is the
     /// source factor `ZERO` and the destination factor `ONE`.
@@ -1154,7 +1423,6 @@ mod tests {
             (BlendMode::AddAlpha, 4),
             (BlendMode::Multiply, 5),
             (BlendMode::Screen, 6),
-            (BlendMode::PsNormal, 7),
         ] {
             assert_eq!(blend_slot(mode), Some(slot), "the mode {mode:?}");
             let state = blend_state_for_slot(slot);
@@ -1330,8 +1598,8 @@ mod tests {
             blend_slot_for(BlendMode::Replace, true),
             Some(KEEP_ALPHA_COPY_SLOT)
         );
-        // The held source-over: the Photoshop normal's colour mix with the
-        // destination's alpha kept.
+        // The held source-over: the colour mix with the destination's alpha
+        // kept.
         assert_eq!(blend_slot_for(BlendMode::SourceOver, true), Some(7));
         // Every other blend keeps the destination's alpha on its own, so the
         // flag selects the same slot.
