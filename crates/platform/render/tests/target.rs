@@ -16,6 +16,10 @@ use render::{
 };
 use testkit::headless_window;
 
+/// One blend case: the mode, the source, the destination and the expected
+/// result.
+type BlendCase = (BlendMode, [u8; 4], [u8; 4], [u8; 4]);
+
 /// Renders a 1×1 target with `background` filled, then a unit solid `src`
 /// composited with `mode`, and returns the resulting RGBA8 pixel.
 fn composite_one_pixel(mode: BlendMode, background: [f32; 4], src: [f32; 4]) -> [u8; 4] {
@@ -241,7 +245,10 @@ fn a_blend_that_holds_the_destination_alpha_keeps_the_colour() {
         [0.0, 0.0, 0.0, 0.0],
         [242.0 / 255.0, 243.0 / 255.0, 224.0 / 255.0, 1.0],
     );
-    assert_eq!(out, [242, 243, 224, 0]);
+    // The Photoshop normal blend truncates its mix by eight bits
+    // (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:374-383`), so
+    // every channel lands one level below the source's.
+    assert_eq!(out, [241, 242, 223, 0]);
 }
 
 /// Composites two solid layers over a 1×1 background, in order, and returns
@@ -338,7 +345,7 @@ fn a_transparent_additive_alpha_layer_keeps_the_destination_alpha() {
 /// same side of the boundary.
 #[test]
 fn the_additive_alpha_blend_scales_the_destination_and_adds_the_source() {
-    let cases: &[(BlendMode, [u8; 4], [u8; 4], [u8; 4])] = &[
+    let cases: &[BlendCase] = &[
         // The destination is scaled by the source's remaining alpha and the
         // source's colour is added: 200·128/256 + 10 = 110, 100·128/256 + 20
         // = 70, 50·128/256 + 30 = 55.
@@ -432,17 +439,18 @@ fn every_blend_leaves_the_alpha_its_face_names() {
 #[test]
 fn destination_dependent_blends_sample_the_destination() {
     // Destination `[0.25, 0.5, 0.75]`, source `[0.75, 0.5, 0.25]`, both
-    // opaque, so the result is exactly the per-channel blend function.
+    // opaque, so the result is the per-channel blend function, truncated by
+    // eight bits (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:447-660`).
     let dst = [0.25, 0.5, 0.75, 1.0];
     let src = [0.75, 0.5, 0.25, 1.0];
     let cases: &[(DstBlend, [u8; 4])] = &[
         (DstBlend::Darken, [64, 128, 64, 255]),
-        (DstBlend::Lighten, [191, 128, 191, 255]),
-        (DstBlend::Difference, [127, 0, 127, 255]),
-        (DstBlend::Exclusion, [159, 127, 159, 255]),
-        (DstBlend::Overlay, [96, 128, 159, 255]),
-        (DstBlend::HardLight, [159, 128, 96, 255]),
-        (DstBlend::ColorDodge, [255, 255, 255, 255]),
+        (DstBlend::Lighten, [190, 128, 191, 255]),
+        (DstBlend::Difference, [126, 0, 127, 255]),
+        (DstBlend::Exclusion, [159, 128, 160, 255]),
+        (DstBlend::Overlay, [94, 128, 160, 255]),
+        (DstBlend::HardLight, [159, 128, 95, 255]),
+        (DstBlend::ColorDodge, [254, 254, 254, 255]),
         (DstBlend::ColorBurn, [0, 2, 0, 255]),
     ];
     for (mode, expected) in cases {
