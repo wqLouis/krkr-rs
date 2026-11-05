@@ -385,13 +385,24 @@ fn composite(mode: BlendMode, dst: [f32; 4], src: [f32; 4]) -> ([f32; 3], f32) {
         // The plain copy: the source's colour and the source's alpha replace
         // the destination's.
         BlendMode::Replace => (s, a),
-        // The additive blend and the additive-alpha blend: the colour is
-        // `src·a + dst` and the blend keeps the destination's alpha.
-        BlendMode::Additive | BlendMode::AddAlpha => {
+        // The additive blend: the colour is `src·a + dst` and the blend
+        // keeps the destination's alpha.
+        BlendMode::Additive => {
             let rgb = [
                 (d[0] + s[0] * a).clamp(0.0, 1.0),
                 (d[1] + s[1] * a).clamp(0.0, 1.0),
                 (d[2] + s[2] * a).clamp(0.0, 1.0),
+            ];
+            (rgb, dst[3])
+        }
+        // The additive-alpha blend: the destination is scaled by the
+        // source's remaining alpha and the source's colour is added. The
+        // blend is colour-only and keeps the destination's alpha.
+        BlendMode::AddAlpha => {
+            let rgb = [
+                (d[0] * (1.0 - a) + s[0]).clamp(0.0, 1.0),
+                (d[1] * (1.0 - a) + s[1]).clamp(0.0, 1.0),
+                (d[2] * (1.0 - a) + s[2]).clamp(0.0, 1.0),
             ];
             (rgb, dst[3])
         }

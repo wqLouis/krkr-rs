@@ -511,13 +511,12 @@ fn blend_state_for_slot(slot: usize) -> vk::PipelineColorBlendAttachmentState {
             .src_alpha_blend_factor(vk::BlendFactor::ZERO)
             .dst_alpha_blend_factor(vk::BlendFactor::ONE)
             .alpha_blend_op(vk::BlendOp::ADD),
-        // The additive-alpha blend: the colour is `src·a + dst` and the blend
-        // is colour-only, so the destination's alpha is kept. The blend adds
-        // the source's colour to the destination and never touches the
-        // destination's alpha.
+        // The additive-alpha blend: the destination is scaled by the source's
+        // remaining alpha and the source's colour is added. The blend is
+        // colour-only, so the destination's alpha is kept.
         4 => base
-            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
-            .dst_color_blend_factor(vk::BlendFactor::ONE)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
             .color_blend_op(vk::BlendOp::ADD)
             .src_alpha_blend_factor(vk::BlendFactor::ZERO)
             .dst_alpha_blend_factor(vk::BlendFactor::ONE)
@@ -1174,11 +1173,11 @@ mod tests {
 
     /// The additive-alpha blend leaves an opaque destination alone.
     ///
-    /// The blend adds the source's colour to the destination and never
-    /// touches the destination's alpha
-    /// (`reference/krkr2/cpp/core/visual/gl/blend_util_func.h:35-43`), so a
-    /// fully transparent source leaves the destination's pixel as it was. The
-    /// vector is the title screen's background layer's pixel
+    /// The blend scales the destination by the source's remaining alpha and
+    /// adds the source's colour, and it never touches the destination's
+    /// alpha (`reference/krkr2/cpp/core/visual/gl/blend_util_func.h:35-43`),
+    /// so a fully transparent source leaves the destination's pixel as it
+    /// was. The vector is the title screen's background layer's pixel
     /// `[242, 243, 224, 255]` with the transparent layer that covers it.
     #[test]
     fn the_additive_alpha_blend_leaves_the_destination_alpha_alone() {
@@ -1190,18 +1189,93 @@ mod tests {
         // destination's alpha is kept.
         let source = [0u8, 0, 0, 0];
         let destination = [242u8, 243, 224, 255];
-        // The colour factors are `SRC_ALPHA`/`ONE`: the source's colour is
-        // scaled by the source's alpha and added to the destination's.
-        let alpha = u32::from(source[3]);
-        let mut colour = [0u8; 3];
-        for (channel, value) in colour.iter_mut().enumerate() {
-            *value =
-                (u32::from(destination[channel]) + u32::from(source[channel]) * alpha / 255) as u8;
+        // The colour factors are `ONE`/`ONE_MINUS_SRC_ALPHA`: the source's
+        // colour is added and the destination is scaled by the source's
+        // remaining alpha, which is the whole destination here.
+        assert_eq!(additive_alpha(source, destination), [242, 243, 224, 255]);
+    }
+
+    /// The fixed-function composite of the additive-alpha blend: the
+    /// destination scaled by the source's remaining alpha plus the source's
+    /// colour.
+    ///
+    /// The fixed function computes in the attachment's normalised space and
+    /// saturates at the attachment's maximum, which is what the reference's
+    /// own additive-alpha method asks its blend function for
+    /// (`reference/krkr2/cpp/core/visual/ogl/RenderManager_ogl.cpp:3631-3638`:
+    /// the source factor `GL_ONE` and the destination factor
+    /// `GL_ONE_MINUS_SRC_ALPHA`).
+    fn additive_alpha(src: [u8; 4], dst: [u8; 4]) -> [u8; 4] {
+        let alpha = f32::from(src[3]) / 255.0;
+        let mut out = [0u8; 4];
+        for (channel, value) in out.iter_mut().enumerate().take(3) {
+            let destination = f32::from(dst[channel]) / 255.0;
+            let source = f32::from(src[channel]) / 255.0;
+            let blended = destination * (1.0 - alpha) + source;
+            *value = (blended.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
         }
+        out[3] = dst[3];
+        out
+    }
+
+    /// The additive-alpha blend asks the fixed function for the reference's
+    /// blend.
+    ///
+    /// Reference: the additive-alpha blend is `TVPAddAlphaBlend_n_a`
+    /// (`reference/krkr2/cpp/core/visual/tvpgl.h:88-94`): the destination's
+    /// colour is scaled by the source's remaining alpha (`sopa = (~src) >>
+    /// 24`) and the source is added to it with a saturating per-byte sum
+    /// (`TVPSaturatedAdd`, `tvpgl.h:71-81`). The fixed function that
+    /// expresses it is the source factor `ONE` and the destination factor
+    /// `ONE_MINUS_SRC_ALPHA`, and the alpha factors are `ZERO`/`ONE`,
+    /// because the blend is colour-only
+    /// (`reference/krkr2/cpp/core/visual/gl/blend_util_func.h:35-43`: the
+    /// masks `0xff00ff` and `0xff00` cover the red/blue and the green lanes
+    /// and the alpha byte is in neither).
+    ///
+    /// The expected pixels are the reference kernel's own bytes: the
+    /// reference scales a lane with `(lane * sopa) >> 8`, which divides by
+    /// 256, and the fixed function scales it exactly, so the two agree on a
+    /// lane only where the product's quotient and remainder sum to at most
+    /// 127. Every destination lane below is even, which is such a lane for a
+    /// source alpha of 127.
+    #[test]
+    fn the_additive_alpha_blend_asks_for_the_reference_blend() {
+        let state = blend_state_for_slot(4);
+        assert_eq!(state.src_color_blend_factor, vk::BlendFactor::ONE);
         assert_eq!(
-            [colour[0], colour[1], colour[2], destination[3]],
-            destination
+            state.dst_color_blend_factor,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA
         );
+        assert_eq!(state.color_blend_op, vk::BlendOp::ADD);
+        assert_eq!(state.src_alpha_blend_factor, vk::BlendFactor::ZERO);
+        assert_eq!(state.dst_alpha_blend_factor, vk::BlendFactor::ONE);
+
+        let cases: &[([u8; 4], [u8; 4], [u8; 4])] = &[
+            // 200·128/256 + 10 = 110, 100·128/256 + 20 = 70,
+            // 50·128/256 + 30 = 55.
+            ([10, 20, 30, 127], [200, 100, 50, 255], [110, 70, 55, 255]),
+            // The sum saturates per byte: 240·128/256 + 200 = 320 saturates
+            // at 255, 240·128/256 + 100 = 220, 240·128/256 + 50 = 170.
+            (
+                [200, 100, 50, 127],
+                [240, 240, 240, 255],
+                [255, 220, 170, 255],
+            ),
+            // A source alpha of 200 leaves the destination a fifth of its
+            // brightness: 98·55/256 + 5 = 26, 56·55/256 + 10 = 22,
+            // 20·55/256 + 15 = 19.
+            ([5, 10, 15, 200], [98, 56, 20, 255], [26, 22, 19, 255]),
+            // The blend is colour-only: the destination's alpha byte is kept.
+            ([10, 20, 30, 127], [100, 100, 100, 128], [60, 70, 80, 128]),
+        ];
+        for (source, destination, expected) in cases {
+            assert_eq!(
+                additive_alpha(*source, *destination),
+                *expected,
+                "the source {source:?} over the destination {destination:?}"
+            );
+        }
     }
 
     /// The source-over is the one blend that writes the source's alpha.

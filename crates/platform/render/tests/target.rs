@@ -292,12 +292,17 @@ fn composite_two_layers(
 ///
 /// This is the title screen: the background layer is fully opaque, and a
 /// transparent additive-alpha layer covers the whole screen. The
-/// additive-alpha blend is colour-only — it adds the source's colour to the
-/// destination and leaves the destination's alpha alone
+/// additive-alpha blend is colour-only — it scales the destination by the
+/// source's remaining alpha and adds the source's colour, and it leaves the
+/// destination's alpha alone
 /// (`reference/krkr2/cpp/core/visual/gl/blend_util_func.h:35-43`: the masks
 /// `0xff00ff` and `0xff00` cover the red/blue and green lanes, and the alpha
 /// byte is in neither) — so the picture and the opaque alpha byte both
 /// survive.
+///
+/// The port composites in `f32`, so it scales the destination exactly; the
+/// reference's integer kernel truncates that scale (`tvpgl.h:91-92` divides
+/// by 256) and would leave the picture a level darker in each lane.
 #[test]
 fn a_transparent_additive_alpha_layer_keeps_the_destination_alpha() {
     let out = composite_two_layers(
@@ -309,6 +314,79 @@ fn a_transparent_additive_alpha_layer_keeps_the_destination_alpha() {
         (BlendMode::AddAlpha, [0.0, 0.0, 0.0, 0.0]),
     );
     assert_eq!(out, [242, 243, 224, 255]);
+}
+
+/// The additive-alpha blend scales the destination by the source's
+/// remaining alpha and adds the source's colour.
+///
+/// Reference: the additive-alpha blend is `TVPAddAlphaBlend_n_a`
+/// (`reference/krkr2/cpp/core/visual/tvpgl.h:88-94`): the destination's
+/// colour is scaled by the source's remaining alpha (`sopa = (~src) >> 24`)
+/// and the source is added to it with a saturating per-byte sum
+/// (`TVPSaturatedAdd`, `tvpgl.h:71-81`). The blend is colour-only — the
+/// masks `0xff00ff` and `0xff00` cover the red/blue and the green lanes and
+/// the alpha byte is in neither — so the held face
+/// (`TVPAddAlphaBlend_HDA_n_a`, `tvpgl.h:96-100`) keeps the destination's
+/// alpha.
+///
+/// The expected pixels are the reference kernel's own bytes. The reference
+/// scales a lane with `(lane * sopa) >> 8`, which divides by 256, while the
+/// fixed function and this path scale it exactly; the two agree on a lane
+/// only where the product's quotient and remainder sum to at most 127. Every
+/// destination lane below is even, which is such a lane for a source alpha
+/// of 127, and the third vector's source alpha of 200 keeps its lanes on the
+/// same side of the boundary.
+#[test]
+fn the_additive_alpha_blend_scales_the_destination_and_adds_the_source() {
+    let cases: &[(BlendMode, [u8; 4], [u8; 4], [u8; 4])] = &[
+        // The destination is scaled by the source's remaining alpha and the
+        // source's colour is added: 200·128/256 + 10 = 110, 100·128/256 + 20
+        // = 70, 50·128/256 + 30 = 55.
+        (
+            BlendMode::AddAlpha,
+            [200, 100, 50, 255],
+            [10, 20, 30, 127],
+            [110, 70, 55, 255],
+        ),
+        // The sum saturates per byte: 240·128/256 + 200 = 320 saturates at
+        // 255, 240·128/256 + 100 = 220, 240·128/256 + 50 = 170.
+        (
+            BlendMode::AddAlpha,
+            [240, 240, 240, 255],
+            [200, 100, 50, 127],
+            [255, 220, 170, 255],
+        ),
+        // A source alpha of 200 leaves the destination a fifth of its
+        // brightness: 98·55/256 + 5 = 26, 56·55/256 + 10 = 22,
+        // 20·55/256 + 15 = 19.
+        (
+            BlendMode::AddAlpha,
+            [98, 56, 20, 255],
+            [5, 10, 15, 200],
+            [26, 22, 19, 255],
+        ),
+        // The blend is colour-only: the destination's alpha byte is kept.
+        (
+            BlendMode::AddAlpha,
+            [100, 100, 100, 128],
+            [10, 20, 30, 127],
+            [60, 70, 80, 128],
+        ),
+    ];
+    for (mode, destination, source, expected) in cases {
+        let out = composite_one_pixel(*mode, normalised(*destination), normalised(*source));
+        assert_eq!(out, *expected, "the blend {mode:?}");
+    }
+}
+
+/// The normalised `[0, 1]` colour of a byte pixel.
+fn normalised(pixel: [u8; 4]) -> [f32; 4] {
+    [
+        f32::from(pixel[0]) / 255.0,
+        f32::from(pixel[1]) / 255.0,
+        f32::from(pixel[2]) / 255.0,
+        f32::from(pixel[3]) / 255.0,
+    ]
 }
 
 /// The alpha each blend leaves on the destination.

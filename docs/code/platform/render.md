@@ -373,7 +373,7 @@ Blend state is not a shader concern; it is a per-pipeline
 | `Replace` | `ONE` / `ZERO` / `ADD` |
 | `Additive` | `SRC_ALPHA` / `ONE` / `ADD` |
 | `Subtractive` | `SRC_ALPHA` / `ONE` / `REVERSE_SUBTRACT` |
-| `AddAlpha` | additive colour, the source alpha replaces the destination alpha |
+| `AddAlpha` | `ONE` / `ONE_MINUS_SRC_ALPHA` / `ADD` |
 | `Multiply` | `DST_COLOR` / `ZERO` / `ADD` |
 | `Screen` | `ONE_MINUS_DST_COLOR` / `ONE` / `ADD` |
 

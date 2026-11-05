@@ -59,8 +59,8 @@ pub enum BlendMode {
     Additive,
     /// Subtractive blending: `dst - src·a`.
     Subtractive,
-    /// Additive with additional alpha-channel rules; see the current
-    /// `render/src/blend.rs` behavior.
+    /// The additive-alpha blend: `dst·(1 - a) + src`. The blend is
+    /// colour-only and keeps the destination's alpha.
     AddAlpha,
     /// Multiplicative blending.
     Multiply,
