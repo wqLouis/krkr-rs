@@ -25,8 +25,11 @@
 layout(location = 0) in vec2 in_uv;
 layout(location = 0) out vec4 out_color;
 
+// The source texture is bound in the first descriptor set, the copy of the
+// destination in the second one; the Vulkan layouts bind the two sets and
+// the interface test checks the numbers against the compiled module.
 layout(set = 0, binding = 0) uniform sampler2D u_source;
-layout(set = 0, binding = 1) uniform sampler2D u_destination;
+layout(set = 1, binding = 0) uniform sampler2D u_destination;
 
 layout(push_constant) uniform PushConstants {
     mat4 mvp;

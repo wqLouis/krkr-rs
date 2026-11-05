@@ -398,6 +398,26 @@ and a frame must not write the target the other one is presenting.
 Three base programs are prebuilt (a textured quad, a solid quad and the
 destination blend), so a frame never builds pipeline state.
 
+### Descriptor sets
+
+The shaders read their samplers through descriptor sets, and the set and the
+binding are named in three places that must agree: the GLSL source under
+`shaders/`, the compiled SPIR-V module the crate embeds, and the Vulkan
+descriptor set layouts the pipelines are built with. The numbers live in one
+place — `shaders::SOURCE_DESCRIPTOR` and `shaders::DESTINATION_DESCRIPTOR` —
+and the shader, the layouts and the draw all use them.
+
+| descriptor | set | binding |
+|---|---|---|
+| the source texture (`u_texture` in the textured program, `u_source` in the destination blend) | 0 | 0 |
+| the copy of the destination (`u_destination` in the destination blend) | 1 | 0 |
+
+The destination-dependent program binds two sets: the source's set and the
+destination's set, each with one combined image sampler. A shader that named
+a set and a binding no layout provides would read a descriptor that does not
+exist: the pipeline creation fails on a strict driver, and the draw reads
+unbound data on a lenient one.
+
 ### Textures and uploads
 
 * L2 owns the CPU bitmap and its dirty flags.
@@ -471,7 +491,7 @@ Every failure is a typed `RenderError` (the variants are listed in
 | the state/surface/target does not belong to this pipeline | `RenderError::InvalidArgument` |
 | the upload region is out of bounds or the pixel slice does not match it | `RenderError::Upload` |
 | the readback region is out of bounds or the output buffer is the wrong size | `RenderError::Framebuffer` |
-| the shader or the pipeline failed to build | `RenderError::Shader` |
+| the shader or the pipeline failed to build | `RenderError::Shader` — the message names the program and the blend slot the pipeline was for |
 | the effect pipeline's descriptor breaks the binding or uniform contract | `RenderError::InvalidArgument` |
 | the effect pipeline is requested on the headless backend | `RenderError::Unsupported` |
 | the effect pipeline's blend is destination-dependent | `RenderError::Unsupported` — a destination-sampling shader is not substituted |
@@ -523,6 +543,10 @@ L2-side registry is documented in [`../engine/shader.md`](../engine/shader.md).
 * `crates/platform/render/src/vulkan/pipelines.rs` `mod tests` — every
   destination-dependent blend having a mode index of its own, so the
   destination-blend program cannot draw one mode's function for another.
+* `crates/platform/render/src/vulkan/shaders.rs` `mod tests` — every shader's
+  GLSL source, its compiled SPIR-V module and the descriptor set layouts
+  naming the same descriptor sets and bindings, and every shader in the
+  directory being covered by that comparison.
 * `crates/platform/render/src/vulkan/mod.rs` `mod tests` — the Vulkan upload
   batch being **one** submit (or a skip on a machine with no surface). The
   assertion lives inside the crate because the submit counter is a

@@ -22,7 +22,7 @@ use api::blend::{BlendMode, DstBlend};
 use api::error::RenderError;
 
 use super::device;
-use super::shaders;
+use super::shaders::{self, DESTINATION_DESCRIPTOR, SOURCE_DESCRIPTOR};
 use super::texture::find_memory_type;
 
 /// Number of fixed-function blend variants compiled per program.
@@ -53,6 +53,32 @@ pub(crate) enum Program {
     /// Samples the source texture and a copy of the destination and computes
     /// the destination-dependent blend.
     DstBlend,
+}
+
+impl Program {
+    /// The program's name, as a failure message names it.
+    fn name(&self) -> &'static str {
+        match self {
+            Program::Textured => "textured",
+            Program::Solid => "solid",
+            Program::DstBlend => "destination blend",
+        }
+    }
+
+    /// The description a pipeline failure carries.
+    ///
+    /// A pipeline that serves a blend slot names the slot; the
+    /// destination-dependent program serves no slot, so it names the program
+    /// alone.
+    fn pipeline_description(&self, slot: Option<usize>) -> String {
+        match slot {
+            Some(slot) => format!(
+                "the {} program's pipeline for blend slot {slot}",
+                self.name()
+            ),
+            None => format!("the {} program's pipeline", self.name()),
+        }
+    }
 }
 
 /// The descriptor and layout resources every pipeline set shares.
@@ -293,31 +319,35 @@ pub(crate) fn create(
 
     let outcome = (|| -> Result<(), RenderError> {
         for slot in 0..BLEND_SLOT_COUNT {
-            textured.push(build_pipeline(
+            textured.push(build_program_pipeline(
                 device,
                 resources.pipeline_layout,
                 render_pass,
                 vertex_module,
                 textured_fragment,
-                slot,
+                blend_state_for_slot(slot),
+                Program::Textured.pipeline_description(Some(slot)),
             )?);
-            solid.push(build_pipeline(
+            solid.push(build_program_pipeline(
                 device,
                 resources.pipeline_layout,
                 render_pass,
                 vertex_module,
                 solid_fragment,
-                slot,
+                blend_state_for_slot(slot),
+                Program::Solid.pipeline_description(Some(slot)),
             )?);
         }
         // The destination-dependent program writes the blended colour itself,
         // so its fixed-function state disables blending.
-        dst_blend = build_dst_pipeline(
+        dst_blend = build_program_pipeline(
             device,
             resources.dst_pipeline_layout,
             render_pass,
             vertex_module,
             dst_fragment,
+            no_blending(),
+            Program::DstBlend.pipeline_description(None),
         )?;
         Ok(())
     })();
@@ -566,11 +596,14 @@ fn blend_slot_for(mode: BlendMode, hold_alpha: bool) -> Option<usize> {
 }
 
 /// Creates the combined-image-sampler descriptor set layout.
+///
+/// The layout binds the source texture's descriptor: the binding is the one
+/// the shaders declare for it.
 fn create_descriptor_set_layout(
     device: &ash::Device,
 ) -> Result<vk::DescriptorSetLayout, RenderError> {
     let binding = vk::DescriptorSetLayoutBinding::default()
-        .binding(0)
+        .binding(SOURCE_DESCRIPTOR.binding)
         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
         .descriptor_count(1)
         .stage_flags(vk::ShaderStageFlags::FRAGMENT);
@@ -585,11 +618,14 @@ fn create_descriptor_set_layout(
 }
 
 /// Creates the descriptor set layout the destination copy is bound through.
+///
+/// The layout binds the copy of the destination: the binding is the one the
+/// destination-dependent shader declares for it.
 fn create_dst_descriptor_set_layout(
     device: &ash::Device,
 ) -> Result<vk::DescriptorSetLayout, RenderError> {
     let binding = vk::DescriptorSetLayoutBinding::default()
-        .binding(0)
+        .binding(DESTINATION_DESCRIPTOR.binding)
         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
         .descriptor_count(1)
         .stage_flags(vk::ShaderStageFlags::FRAGMENT);
@@ -625,6 +661,11 @@ fn create_pipeline_layout(
         }
     })
 }
+
+// The destination-dependent program's pipeline layout binds the source's set
+// first and the destination's second, so the two descriptors must name the
+// first two sets.
+const _: () = assert!(SOURCE_DESCRIPTOR.set == 0 && DESTINATION_DESCRIPTOR.set == 1);
 
 /// Creates the pipeline layout the destination-dependent program uses.
 ///
@@ -799,6 +840,9 @@ pub(crate) fn create_shader_module(
 }
 
 /// Builds one graphics pipeline for a blend slot.
+///
+/// The effect programs build their pipeline through this entry point; the
+/// scene's programs name their program in the failure message.
 pub(crate) fn build_pipeline(
     device: &ash::Device,
     layout: vk::PipelineLayout,
@@ -807,79 +851,32 @@ pub(crate) fn build_pipeline(
     fragment_module: vk::ShaderModule,
     slot: usize,
 ) -> Result<vk::Pipeline, RenderError> {
-    let stages = [
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(vertex_module)
-            .name(c"main"),
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(fragment_module)
-            .name(c"main"),
-    ];
-
-    let vertex_binding = vk::VertexInputBindingDescription::default()
-        .binding(0)
-        .stride(8)
-        .input_rate(vk::VertexInputRate::VERTEX);
-    let vertex_bindings = [vertex_binding];
-    let vertex_attribute = vk::VertexInputAttributeDescription::default()
-        .location(0)
-        .binding(0)
-        .format(vk::Format::R32G32_SFLOAT)
-        .offset(0);
-    let vertex_attributes = [vertex_attribute];
-    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-        .vertex_binding_descriptions(&vertex_bindings)
-        .vertex_attribute_descriptions(&vertex_attributes);
-
-    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-        .topology(vk::PrimitiveTopology::TRIANGLE_STRIP);
-
-    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-        .viewport_count(1)
-        .scissor_count(1);
-
-    let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
-        .polygon_mode(vk::PolygonMode::FILL)
-        .cull_mode(vk::CullModeFlags::NONE)
-        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-        .line_width(1.0);
-
-    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-
-    let blend_attachment = blend_state_for_slot(slot);
-    let blend_attachments = [blend_attachment];
-    let color_blend =
-        vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
-
-    build_graphics_pipeline(
+    build_program_pipeline(
         device,
         layout,
         render_pass,
-        &stages,
-        &PipelineStates {
-            vertex_input: &vertex_input,
-            input_assembly: &input_assembly,
-            viewport_state: &viewport_state,
-            rasterization: &rasterization,
-            multisample: &multisample,
-            color_blend: &color_blend,
-        },
+        vertex_module,
+        fragment_module,
+        blend_state_for_slot(slot),
+        format!("the effect program's pipeline for blend slot {slot}"),
     )
 }
 
-/// Builds the destination-dependent program's pipeline.
+/// Builds one graphics pipeline for a program.
 ///
-/// The program writes the blended colour itself, so the fixed-function blend
-/// state is disabled: the destination copy is read and mixed in the shader.
-fn build_dst_pipeline(
+/// The fixed-function blend state is the program's own: a blend slot's state
+/// for the textured and the solid program, and no blending for the
+/// destination-dependent program, which writes the blended colour itself.
+///
+/// `description` names the program and the slot the failure message carries.
+fn build_program_pipeline(
     device: &ash::Device,
     layout: vk::PipelineLayout,
     render_pass: vk::RenderPass,
     vertex_module: vk::ShaderModule,
     fragment_module: vk::ShaderModule,
+    blend_attachment: vk::PipelineColorBlendAttachmentState,
+    description: String,
 ) -> Result<vk::Pipeline, RenderError> {
     let stages = [
         vk::PipelineShaderStageCreateInfo::default()
@@ -923,9 +920,6 @@ fn build_dst_pipeline(
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
-    let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
-        .blend_enable(false)
-        .color_write_mask(vk::ColorComponentFlags::RGBA);
     let blend_attachments = [blend_attachment];
     let color_blend =
         vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
@@ -943,7 +937,18 @@ fn build_dst_pipeline(
             multisample: &multisample,
             color_blend: &color_blend,
         },
+        &description,
     )
+}
+
+/// The fixed-function state of a program that writes its colour itself.
+///
+/// The destination-dependent program mixes the colours in the shader, so the
+/// fixed-function blending is off and every colour channel is written.
+fn no_blending() -> vk::PipelineColorBlendAttachmentState {
+    vk::PipelineColorBlendAttachmentState::default()
+        .blend_enable(false)
+        .color_write_mask(vk::ColorComponentFlags::RGBA)
 }
 
 /// The pipeline states every program shares.
@@ -963,12 +968,16 @@ struct PipelineStates<'a> {
 }
 
 /// Creates a graphics pipeline from the states every program shares.
+///
+/// `description` names the program and the blend slot the pipeline was for,
+/// so a failure says which pipeline could not be built.
 fn build_graphics_pipeline(
     device: &ash::Device,
     layout: vk::PipelineLayout,
     render_pass: vk::RenderPass,
     stages: &[vk::PipelineShaderStageCreateInfo],
     states: &PipelineStates<'_>,
+    description: &str,
 ) -> Result<vk::Pipeline, RenderError> {
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic_state =
@@ -993,7 +1002,7 @@ fn build_graphics_pipeline(
         device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_infos, None)
     }
     .map_err(|(_, error)| RenderError::Shader {
-        message: format!("failed to create a graphics pipeline: {error}"),
+        message: format!("failed to create {description}: {error}"),
     })?;
 
     pipelines.pop().ok_or_else(|| RenderError::Shader {

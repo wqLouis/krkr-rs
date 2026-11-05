@@ -15,6 +15,7 @@ use crate::collections::{Map, Set, set_with_capacity};
 use crate::state::{RenderState, StateKind};
 use crate::texture::{TextureDesc, TextureFormat};
 
+use super::shaders::SOURCE_DESCRIPTOR;
 use super::{VulkanPipeline, VulkanState};
 
 /// GPU image, view and descriptor set for one texture handle.
@@ -547,7 +548,7 @@ pub(crate) fn create_texture(
     let image_infos = [image_info];
     let write = vk::WriteDescriptorSet::default()
         .dst_set(descriptor_set)
-        .dst_binding(0)
+        .dst_binding(SOURCE_DESCRIPTOR.binding)
         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
         .image_info(&image_infos);
     // SAFETY: the descriptor set is not in use and the image info is valid.

@@ -28,6 +28,7 @@ use crate::texture::TextureFormat;
 
 use super::draw;
 use super::pipelines::{self, PipelineResources, PipelineSet};
+use super::shaders::{DESTINATION_DESCRIPTOR, SOURCE_DESCRIPTOR};
 use super::texture::{StagingBuffer, VulkanTexture, find_memory_type, image_format};
 
 /// Render pass plus pipelines compiled against it, one per target format.
@@ -201,6 +202,7 @@ impl DestinationSnapshot {
             resources.descriptor_pool,
             resources.sampler,
             view,
+            DESTINATION_DESCRIPTOR.binding,
         ) {
             Ok(set) => set,
             Err(error) => {
@@ -454,6 +456,7 @@ impl FrameTarget {
             resources.descriptor_pool,
             resources.sampler,
             view,
+            SOURCE_DESCRIPTOR.binding,
         ) {
             Ok(set) => set,
             Err(error) => {
@@ -966,6 +969,7 @@ fn allocate_sampled_set(
     descriptor_pool: vk::DescriptorPool,
     sampler: vk::Sampler,
     view: vk::ImageView,
+    binding: u32,
 ) -> Result<vk::DescriptorSet, RenderError> {
     let set_layouts = [descriptor_set_layout];
     let allocate_sets = vk::DescriptorSetAllocateInfo::default()
@@ -994,7 +998,7 @@ fn allocate_sampled_set(
     let image_infos = [image_info];
     let write = vk::WriteDescriptorSet::default()
         .dst_set(descriptor_set)
-        .dst_binding(0)
+        .dst_binding(binding)
         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
         .image_info(&image_infos);
     // SAFETY: the descriptor set is not in use and the image info is valid.

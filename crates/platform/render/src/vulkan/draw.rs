@@ -24,6 +24,7 @@ use api::error::RenderError;
 use api::geometry::{Affine2, RectF};
 
 use super::pipelines::{PipelineResources, PipelineSet, Program, dst_blend_mode};
+use super::shaders::{DESTINATION_DESCRIPTOR, SOURCE_DESCRIPTOR};
 use super::target::DestinationSnapshot;
 use super::texture::VulkanTexture;
 use crate::MAX_TRAVERSAL_DEPTH;
@@ -577,7 +578,7 @@ impl Recorder<'_> {
                     self.pass.command,
                     vk::PipelineBindPoint::GRAPHICS,
                     self.resources.pipeline_layout,
-                    0,
+                    SOURCE_DESCRIPTOR.set,
                     &[set],
                     &[],
                 );
@@ -673,8 +674,16 @@ impl Recorder<'_> {
                 self.pass.command,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.resources.dst_pipeline_layout,
-                0,
-                &[source, snapshot.descriptor_set],
+                SOURCE_DESCRIPTOR.set,
+                &[source],
+                &[],
+            );
+            self.pass.device.cmd_bind_descriptor_sets(
+                self.pass.command,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.resources.dst_pipeline_layout,
+                DESTINATION_DESCRIPTOR.set,
+                &[snapshot.descriptor_set],
                 &[],
             );
             push_constants(
