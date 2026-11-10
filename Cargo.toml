@@ -51,7 +51,12 @@ env_logger = "0.11"
 ash = "0.38"
 raw-window-handle = "0.6"
 winit = "0.30"
-flate2 = "1"
+# The DEFLATE codec for the archive members and the compressed text. The
+# backend is zlib-rs, a pure-Rust zlib: the inflate is on the startup's hot
+# path (about a tenth of the run's CPU), and the default pure-Rust backend
+# measured 1.5-2x slower than zlib. Pure Rust keeps the Android APK free of a
+# native zlib. `TJS2_OPT`-style A/B: the backend is a build-time choice.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 # Fast, non-cryptographic hashing for the storage/engine lookup maps. Used with
 # fixed seeds so iteration order stays stable across runs.
 ahash = "0.8"

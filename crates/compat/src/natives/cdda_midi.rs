@@ -26,11 +26,12 @@ use std::ffi::{c_char, c_int, c_void};
 
 use tjs::{
     DetachedValue, NativeCreateInstanceFn, NativeInstanceBuilder, NativeInstanceMembers,
-    NativeInstanceMethodDef, NativeInstancePropertyDef, NativeObjThisMethodDef, RetainedValue,
-    Tjs2Engine, TjsValue, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value,
+    NativeInstanceMethodDef, NativeInstancePropertyDef, NativeObjThisMethodDef, Tjs2Engine,
+    TjsValue, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value,
 };
 
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
+use crate::natives::event::event_object;
 use crate::natives::system::{resolve, set_string_out};
 use crate::{CompatCtx, CompatError};
 
@@ -252,21 +253,7 @@ fn disc_action_event(
     event_type: &str,
     member: Option<(&str, TjsValue)>,
 ) -> Result<DetachedValue, String> {
-    let event = match host.eval_retained("%[]", "disc sound.action") {
-        Ok(RetainedValue::Object(event)) => event,
-        Ok(RetainedValue::Value(value)) => {
-            return Err(format!("event dictionary came back as {value:?}"));
-        }
-        Err(error) => return Err(format!("event dictionary creation failed: {error}")),
-    };
-    host.set_member(event.raw_id(), "type", &TjsValue::String(event_type.into()))?;
-    if !objthis.is_null()
-        && let Ok(target) = host.retain_object_detached(objthis)
-    {
-        let target_id = target.raw_id().as_ptr() as u64;
-        let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id));
-        drop(target);
-    }
+    let event = event_object(host, event_type, objthis)?;
     if let Some((name, value)) = member {
         host.set_member(event.raw_id(), name, &value)?;
     }

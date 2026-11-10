@@ -284,9 +284,12 @@ pub(super) fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             Ok(RetainedValue::Object(object)) => Some(object),
             _ => None,
         };
-        let global = match engine.eval_retained("global", "layer_ex") {
-            Ok(RetainedValue::Object(object)) => Some(object),
-            _ => None,
+        let global = match engine.global_object() {
+            Ok(object) => Some(object),
+            Err(error) => {
+                log::warn!("layer_ex: the global object could not be reached: {error}");
+                None
+            }
         };
         (gdiplus, global)
     };

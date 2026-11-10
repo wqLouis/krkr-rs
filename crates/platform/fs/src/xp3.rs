@@ -30,6 +30,7 @@
 
 use std::collections::BTreeSet;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::sync::Arc;
 
 use api::error::FsError;
 use flate2::read::ZlibDecoder;
@@ -153,6 +154,11 @@ pub struct Segment {
 }
 
 /// A single file entry inside the archive.
+///
+/// The entry carries one name — the normalized in-archive name — and the
+/// segments that compose the file. The archive's map key is that same name
+/// allocation, and the first segment is stored inline, so an entry whose
+/// data is stored in one piece costs one allocation in total.
 #[derive(Debug, Clone)]
 pub struct Entry {
     /// Raw flags from the `info` chunk (bit 31 = protected).
@@ -161,14 +167,29 @@ pub struct Entry {
     pub org_size: u64,
     /// Total stored size (sum of segment `arc_size`).
     pub arc_size: u64,
-    /// Name as stored in the archive (not normalized).
-    pub raw_name: String,
     /// Normalized in-archive name (lowercase, `/` separators).
-    pub name: String,
-    /// Segments composing the file, in order.
-    pub segments: Vec<Segment>,
+    ///
+    /// The archive's map key is this same allocation.
+    pub name: Arc<str>,
+    /// The first segment of the file, stored inline.
+    first_segment: Segment,
+    /// The segments after the first; empty when the file is stored in one
+    /// piece.
+    extra_segments: Vec<Segment>,
     /// Adler32 hash of the name from the `adlr` chunk.
     pub file_hash: u32,
+}
+
+impl Entry {
+    /// The entry's segments, in order.
+    pub fn segments(&self) -> impl Iterator<Item = &Segment> {
+        std::iter::once(&self.first_segment).chain(self.extra_segments.iter())
+    }
+
+    /// The number of segments the entry is composed of.
+    pub fn segment_count(&self) -> usize {
+        1 + self.extra_segments.len()
+    }
 }
 
 /// How one index block stores its payload.
@@ -219,7 +240,9 @@ fn entry_hasher() -> ahash::RandomState {
 }
 
 /// Archive entries keyed by normalized name.
-type EntryMap = hashbrown::HashMap<String, Entry, ahash::RandomState>;
+///
+/// The key and the entry share one name allocation.
+type EntryMap = hashbrown::HashMap<Arc<str>, Entry, ahash::RandomState>;
 
 fn entry_map() -> EntryMap {
     EntryMap::with_hasher(entry_hasher())
@@ -350,14 +373,15 @@ impl Xp3Archive {
         let mut weak = Vec::new();
         let mut total = 0usize;
         for entry in self.entries.values() {
-            let path_match = entry.name == request || ends_with_dir(&entry.name, &request);
+            let path_match =
+                entry.name.as_ref() == request.as_str() || ends_with_dir(&entry.name, &request);
             let base_match = entry.name.rsplit('/').next() == Some(request_base);
             if path_match || base_match {
                 total += 1;
-                strong.push(entry.name.clone());
+                strong.push(entry.name.to_string());
             } else if !request_stem.is_empty() && entry.name.contains(request_stem) {
                 total += 1;
-                weak.push(entry.name.clone());
+                weak.push(entry.name.to_string());
             }
         }
         strong.sort();
@@ -368,7 +392,8 @@ impl Xp3Archive {
 
     /// Look up an entry by name (normalized before lookup).
     pub fn entry(&self, name: &str) -> Option<&Entry> {
-        self.entries.get(&normalize_in_archive_name(name))
+        let normalized = normalize_in_archive_name(name);
+        self.entries.get(normalized.as_str())
     }
 
     /// Read the full contents of an entry by name.
@@ -402,7 +427,7 @@ impl Xp3Archive {
         let normalized = normalize_in_archive_name(name);
         let entry = self
             .entries
-            .get(&normalized)
+            .get(normalized.as_str())
             .ok_or_else(|| Xp3Error::NotFound(name.to_string()))?;
         self.read_entry_with_filter(fs, file, entry, archive_name, filter)
     }
@@ -465,7 +490,7 @@ impl Xp3Archive {
     ) -> Result<Vec<u8>> {
         let len = u64::try_from(bytes.len())
             .map_err(|_| Xp3Error::CorruptIndex("archive image is too large to address"))?;
-        for seg in &entry.segments {
+        for seg in entry.segments() {
             let start = self
                 .base
                 .checked_add(seg.start)
@@ -511,7 +536,7 @@ impl Xp3Archive {
         let normalized = normalize_in_archive_name(name);
         let entry = self
             .entries
-            .get(&normalized)
+            .get(normalized.as_str())
             .ok_or_else(|| Xp3Error::NotFound(name.to_string()))?;
         let mut reader = FileReader { fs, file, pos: 0 };
         self.read_entry_prefix_from(&mut reader, entry, archive_name, max_len, filter)
@@ -533,7 +558,7 @@ impl Xp3Archive {
     ) -> Result<Vec<u8>> {
         let len = u64::try_from(bytes.len())
             .map_err(|_| Xp3Error::CorruptIndex("archive image is too large to address"))?;
-        for seg in &entry.segments {
+        for seg in entry.segments() {
             let start = self
                 .base
                 .checked_add(seg.start)
@@ -560,7 +585,7 @@ impl Xp3Archive {
     ) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         let mut offset: u64 = 0;
-        for seg in &entry.segments {
+        for seg in entry.segments() {
             if out.len() >= max_len {
                 break;
             }
@@ -596,7 +621,7 @@ impl Xp3Archive {
                     // requested output needs is read and inflated.
                     let mut dec = ZlibDecoder::new((&mut *reader).take(seg.arc_size));
                     dec.read_exact(&mut buf)
-                        .map_err(|_| Xp3Error::Inflate(entry.name.clone()))?;
+                        .map_err(|_| Xp3Error::Inflate(entry.name.to_string()))?;
                     buf
                 }
                 other => return Err(Xp3Error::UnknownSegmentMethod(other, seg.flags)),
@@ -636,7 +661,7 @@ impl Xp3Archive {
         // the entry header. The sum is checked for overflow and the
         // allocation is fallible, so a structurally invalid size is an error
         // rather than an unbounded allocation (no arbitrary maximum).
-        let expected = entry.segments.iter().try_fold(0u64, |total, seg| {
+        let expected = entry.segments().try_fold(0u64, |total, seg| {
             let size = if seg.flags & SEGM_ENCODE_METHOD_MASK == SEGM_ENCODE_ZLIB {
                 seg.org_size
             } else {
@@ -652,7 +677,7 @@ impl Xp3Archive {
         out.try_reserve_exact(expected)
             .map_err(|_| Xp3Error::CorruptIndex("entry size cannot be allocated"))?;
         let mut offset: u64 = 0;
-        for seg in &entry.segments {
+        for seg in entry.segments() {
             let arc_len = usize::try_from(seg.arc_size)
                 .map_err(|_| Xp3Error::CorruptIndex("segment too large"))?;
             let mut buf = alloc_zeroed(arc_len, "segment too large")?;
@@ -672,7 +697,7 @@ impl Xp3Archive {
                     let mut dec = ZlibDecoder::new(&buf[..]);
                     let mut chunk = alloc_zeroed(org_len, "segment too large")?;
                     dec.read_exact(&mut chunk)
-                        .map_err(|_| Xp3Error::Inflate(entry.name.clone()))?;
+                        .map_err(|_| Xp3Error::Inflate(entry.name.to_string()))?;
                     chunk
                 }
                 other => return Err(Xp3Error::UnknownSegmentMethod(other, seg.flags)),
@@ -813,12 +838,10 @@ impl Xp3Archive {
         let mut flags = 0u32;
         let mut org_size = 0u64;
         let mut arc_size = 0u64;
-        let mut raw_name = String::new();
-        let mut segments = Vec::new();
-        let mut file_hash = 0u32;
-        let mut seen_info = false;
-        let mut seen_segm = false;
-        let mut seen_adlr = false;
+        let mut name: Option<Arc<str>> = None;
+        let mut first_segment: Option<Segment> = None;
+        let mut extra_segments: Vec<Segment> = Vec::new();
+        let mut file_hash: Option<u32> = None;
 
         while let Some((header, tail)) = split_chunk_header(rest) {
             let (tag, size) = header.split_at(4);
@@ -832,10 +855,9 @@ impl Xp3Archive {
 
             match tag {
                 b"info" => {
-                    if seen_info {
+                    if name.is_some() {
                         return Err(Xp3Error::CorruptIndex("duplicate info sub-chunk"));
                     }
-                    seen_info = true;
                     if payload.len() < 22 {
                         return Err(Xp3Error::CorruptIndex("info sub-chunk too short"));
                     }
@@ -848,17 +870,12 @@ impl Xp3Archive {
                     let name_bytes = payload
                         .get(22..22 + name_len * 2)
                         .ok_or(Xp3Error::CorruptIndex("name overruns info sub-chunk"))?;
-                    let mut units = Vec::with_capacity(name_len);
-                    for c in name_bytes.as_chunks::<2>().0 {
-                        units.push(u16::from_le_bytes([c[0], c[1]]));
-                    }
-                    raw_name = String::from_utf16_lossy(&units);
+                    name = Some(Arc::<str>::from(decode_entry_name(name_bytes)));
                 }
                 b"segm" => {
-                    if seen_segm {
+                    if first_segment.is_some() {
                         return Err(Xp3Error::CorruptIndex("duplicate segm sub-chunk"));
                     }
-                    seen_segm = true;
                     if payload.is_empty() {
                         return Err(Xp3Error::CorruptIndex("empty segm sub-chunk"));
                     }
@@ -867,26 +884,25 @@ impl Xp3Archive {
                             "segm sub-chunk size not multiple of 28",
                         ));
                     }
-                    for s in payload.as_chunks::<28>().0 {
-                        let (flags, s) = s.split_at(4);
-                        let (start, s) = s.split_at(8);
-                        let (org_size, arc_size) = s.split_at(8);
-                        segments.push(Segment {
-                            flags: u32::from_le_bytes(prefix(flags)?),
-                            start: u64::from_le_bytes(prefix(start)?),
-                            org_size: u64::from_le_bytes(prefix(org_size)?),
-                            arc_size: u64::from_le_bytes(prefix(arc_size)?),
-                        });
-                    }
+                    let records = payload.as_chunks::<28>();
+                    let (first, remaining) = records
+                        .0
+                        .split_first()
+                        .ok_or(Xp3Error::CorruptIndex("empty segm sub-chunk"))?;
+                    first_segment = Some(parse_segment(first)?);
+                    extra_segments = remaining
+                        .iter()
+                        .map(|record| parse_segment(record))
+                        .collect::<Result<Vec<Segment>>>()?;
                 }
                 b"adlr" => {
-                    if seen_adlr {
+                    if file_hash.is_some() {
                         return Err(Xp3Error::CorruptIndex("duplicate adlr sub-chunk"));
                     }
-                    seen_adlr = true;
-                    if let Some(h) = payload.get(0..4) {
-                        file_hash = u32::from_le_bytes(prefix(h)?);
-                    }
+                    file_hash = Some(match payload.get(0..4) {
+                        Some(hash) => u32::from_le_bytes(prefix(hash)?),
+                        None => 0,
+                    });
                 }
                 _ => { /* unknown sub-chunk: ignore */ }
             }
@@ -898,20 +914,20 @@ impl Xp3Archive {
         if !rest.is_empty() {
             return Err(Xp3Error::CorruptIndex("trailing bytes in File chunk"));
         }
-        if !seen_info || !seen_segm || !seen_adlr {
+        let (Some(name), Some(first_segment), Some(file_hash)) = (name, first_segment, file_hash)
+        else {
             return Err(Xp3Error::CorruptIndex("File chunk missing info/segm/adlr"));
-        }
+        };
 
-        let name = normalize_in_archive_name(&raw_name);
         self.entries.insert(
-            name.clone(),
+            Arc::clone(&name),
             Entry {
                 flags,
                 org_size,
                 arc_size,
-                raw_name,
                 name,
-                segments,
+                first_segment,
+                extra_segments,
                 file_hash,
             },
         );
@@ -925,9 +941,29 @@ impl Xp3Archive {
 /// The very first `/` is skipped together with any following ones.
 pub fn normalize_in_archive_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
-    let mut started = false;
-    let mut prev_slash = false;
+    let mut fold = NameFold::default();
     for c in name.chars() {
+        fold.push(&mut out, c);
+    }
+    out
+}
+
+/// The folding state of an in-archive name.
+///
+/// A name is lowercased, `\` becomes `/`, runs of `/` collapse into one and
+/// leading slashes are dropped. The state remembers whether a name character
+/// has been written and whether the last written one was a slash.
+#[derive(Default)]
+struct NameFold {
+    /// Whether a name character has been written.
+    started: bool,
+    /// Whether the last written character was a slash.
+    prev_slash: bool,
+}
+
+impl NameFold {
+    /// Fold one character of a name into `out`.
+    fn push(&mut self, out: &mut String, c: char) {
         let c = match c {
             'A'..='Z' => c.to_ascii_lowercase(),
             '\\' => '/',
@@ -935,17 +971,56 @@ pub fn normalize_in_archive_name(name: &str) -> String {
         };
         if c == '/' {
             // Leading slashes are dropped; interior runs collapse to one.
-            if started && !prev_slash {
+            if self.started && !self.prev_slash {
                 out.push('/');
-                prev_slash = true;
+                self.prev_slash = true;
             }
         } else {
             out.push(c);
-            started = true;
-            prev_slash = false;
+            self.started = true;
+            self.prev_slash = false;
         }
     }
+}
+
+/// Decode a stored entry name and fold it into its normalized form.
+///
+/// The name is stored as UTF-16. A unit that is not a character — an unpaired
+/// surrogate — is replaced the way a lossy UTF-16 decode replaces it, and
+/// the folded name is written as the units are decoded, so no unnormalized
+/// copy of the name is made.
+fn decode_entry_name(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() / 2);
+    let mut fold = NameFold::default();
+    let units = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+    for unit in char::decode_utf16(units) {
+        let decoded = unit.unwrap_or(char::REPLACEMENT_CHARACTER);
+        fold.push(&mut out, decoded);
+    }
     out
+}
+
+/// Parse one 28-byte segment record: `flags:u32 start:u64 org:u64 arc:u64`.
+fn parse_segment(record: &[u8]) -> Result<Segment> {
+    let (flags, rest) = record
+        .split_at_checked(4)
+        .ok_or(Xp3Error::CorruptIndex("truncated segment record"))?;
+    let (start, rest) = rest
+        .split_at_checked(8)
+        .ok_or(Xp3Error::CorruptIndex("truncated segment record"))?;
+    let (org_size, arc_size) = rest
+        .split_at_checked(8)
+        .ok_or(Xp3Error::CorruptIndex("truncated segment record"))?;
+    Ok(Segment {
+        flags: u32::from_le_bytes(prefix(flags)?),
+        start: u64::from_le_bytes(prefix(start)?),
+        org_size: u64::from_le_bytes(prefix(org_size)?),
+        arc_size: u64::from_le_bytes(prefix(arc_size)?),
+    })
 }
 
 /// Whether `name` ends with `suffix` at a path-component boundary.
@@ -1148,15 +1223,14 @@ mod tests {
             flags: 0,
             org_size: (raw_a.len() + raw_b.len() + zlib_src.len()) as u64,
             arc_size: (raw_a.len() + raw_b.len() + zlib.len()) as u64,
-            raw_name: "multi.bin".to_string(),
-            name: "multi.bin".to_string(),
-            segments: vec![
-                Segment {
-                    flags: SEGM_ENCODE_RAW,
-                    start: start_a,
-                    org_size: raw_a.len() as u64,
-                    arc_size: raw_a.len() as u64,
-                },
+            name: Arc::<str>::from("multi.bin"),
+            first_segment: Segment {
+                flags: SEGM_ENCODE_RAW,
+                start: start_a,
+                org_size: raw_a.len() as u64,
+                arc_size: raw_a.len() as u64,
+            },
+            extra_segments: vec![
                 Segment {
                     flags: SEGM_ENCODE_RAW,
                     start: start_b,
@@ -1249,14 +1323,14 @@ mod tests {
             flags: 0,
             org_size: org_size as u64,
             arc_size: stored.len() as u64,
-            raw_name: name.to_string(),
-            name: name.to_string(),
-            segments: vec![Segment {
+            name: Arc::<str>::from(name),
+            first_segment: Segment {
                 flags: method,
                 start,
                 org_size: org_size as u64,
                 arc_size: stored.len() as u64,
-            }],
+            },
+            extra_segments: Vec::new(),
             file_hash: 0,
         }
     }
@@ -1385,5 +1459,25 @@ mod tests {
             .expect("zero-length prefix");
         assert!(empty.is_empty());
         assert_eq!(reader.bytes_read, 0);
+    }
+
+    /// A parsed entry keeps its name in one allocation and its first segment
+    /// inline, so a single-segment entry has no segment vector of its own.
+    ///
+    /// The name is the one the archive's map key holds
+    /// (`reference/cpp/core/archive/xp3/XP3Archive.cpp:433-437`), and the
+    /// segments are the `segm` chunk's 28-byte records
+    /// (`reference/cpp/core/archive/xp3/XP3Archive.cpp:451-479`).
+    #[test]
+    fn a_parsed_entry_keeps_one_name_and_an_inline_segment() {
+        let image = testkit::build_xp3(&[("data/first.txt", b"hello", false)]);
+        let mut reader = io::Cursor::new(image.as_slice());
+        let archive = Xp3Archive::open_reader(&mut reader).expect("the archive opens");
+        let entry = archive.entry("data/first.txt").expect("the entry is found");
+        // The name is stored once: the map key and the entry share it.
+        assert_eq!(Arc::strong_count(&entry.name), 2);
+        // The single segment is inline, so no segment vector was allocated.
+        assert_eq!(entry.extra_segments.capacity(), 0);
+        assert_eq!(entry.segment_count(), 1);
     }
 }

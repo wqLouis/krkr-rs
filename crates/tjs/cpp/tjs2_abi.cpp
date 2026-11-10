@@ -6,9 +6,11 @@
 
 #include "tjsCommHead.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <string>
 #include <unordered_map>
@@ -219,14 +221,25 @@ std::u16string utf8_to_u16(const char *s, size_t len) {
     return boost::locale::conv::utf_to_utf<char16_t>(s, s + len);
 }
 
-// Build a tjs_char string from raw UTF-16 code units. Unlike the UTF-8 path
-// this keeps an unpaired surrogate, matching the reference text stream, which
-// assigns the decrypted code units without a UTF-8 round trip
-// (`reference/cpp/core/base/TextStream.cpp`).
-std::u16string units_to_u16(const uint16_t *s, size_t len) {
-    if(!s || len == 0)
-        return std::u16string();
-    return std::u16string(reinterpret_cast<const char16_t *>(s), len);
+// Build the script text the VM runs: a `ttstr` filled in place from the
+// UTF-16 code units.
+//
+// The string allocates its own buffer, so the code units are copied once and
+// no intermediate `std::u16string` is built. This is the shape the
+// reference's text stream uses, filling the script string from its UTF-16
+// buffer (`reference/cpp/core/base/TextStream.cpp:206-210`); an unpaired
+// surrogate survives, because the code units are assigned as they are.
+static TJS::ttstr script_text_from_units(const tjs_char *s, size_t len) {
+    if(len > static_cast<size_t>(std::numeric_limits<tjs_int>::max()))
+        throw TJS::eTJSError(ttstr(TJS_W("the script is too long to run")));
+    TJS::ttstr text;
+    if(len == 0)
+        return text;
+    tjs_char *buffer = text.AllocBuffer(static_cast<tjs_uint>(len));
+    std::copy_n(s, len, buffer);
+    buffer[len] = 0;
+    text.FixLen();
+    return text;
 }
 
 // Convert tjs_char (UTF-16 code units on this build) -> UTF-8 std::string.
@@ -1896,7 +1909,7 @@ void tjs2_set_log_cb(tjs2_engine *e, tjs2_log_cb cb, void *user) {
 
 // Run an ExecScript call with an already-decoded UTF-16 payload. Shared by
 // the UTF-8 entry point and the code-unit entry point.
-static int exec_script_decoded(tjs2_engine *e, std::u16string s,
+static int exec_script_decoded(tjs2_engine *e, const tjs_char *s, size_t s_len,
                                const char *name, void *context, int lineofs,
                                tjs2_value *out_result, char **out_error) {
     // Clear the retained-object slot at entry: it exists so Rust can retain
@@ -1910,9 +1923,7 @@ static int exec_script_decoded(tjs2_engine *e, std::u16string s,
         // `last_object`.
         TJS::tTJSVariant *result_slot = out_result ? &result : nullptr;
         std::u16string n = name ? utf8_to_u16(name) : std::u16string();
-        // The length-aware ttstr form keeps an interior NUL in the payload;
-        // the VM's own text handling decides what that NUL means.
-        TJS::ttstr script_text(s.c_str(), s.size());
+        TJS::ttstr script_text = script_text_from_units(s, s_len);
         TJS::ttstr script_name(n.c_str(), n.size());
         e->inner->ExecScript(script_text, result_slot,
                              static_cast<TJS::iTJSDispatch2 *>(context),
@@ -1961,7 +1972,8 @@ int tjs2_exec_script(tjs2_engine *e, const char *script, size_t script_len,
             *out_error = nullptr;
         return -1;
     }
-    return exec_script_decoded(e, utf8_to_u16(script, script_len), name,
+    std::u16string decoded = utf8_to_u16(script, script_len);
+    return exec_script_decoded(e, decoded.c_str(), decoded.size(), name,
                                context, lineofs, out_result, out_error);
 }
 
@@ -1974,15 +1986,16 @@ int tjs2_exec_script_wide(tjs2_engine *e, const uint16_t *script,
             *out_error = nullptr;
         return -1;
     }
-    return exec_script_decoded(e, units_to_u16(script, script_len), name,
-                               context, lineofs, out_result, out_error);
+    return exec_script_decoded(e, reinterpret_cast<const tjs_char *>(script),
+                               script_len, name, context, lineofs,
+                               out_result, out_error);
 }
 
 // Run an EvalExpression call with an already-decoded UTF-16 payload. Shared
 // by the UTF-8 entry point and the code-unit entry point.
-static int eval_decoded(tjs2_engine *e, std::u16string s, const char *name,
-                        void *context, int lineofs, tjs2_value *out_result,
-                        char **out_error) {
+static int eval_decoded(tjs2_engine *e, const tjs_char *s, size_t s_len,
+                        const char *name, void *context, int lineofs,
+                        tjs2_value *out_result, char **out_error) {
     e->last_object.Clear(); // see exec_script_decoded
     try {
         TJS::tTJSVariant result;
@@ -1992,16 +2005,16 @@ static int eval_decoded(tjs2_engine *e, std::u16string s, const char *name,
         // legal and is discarded.
         TJS::tTJSVariant *result_slot = out_result ? &result : nullptr;
         std::u16string n = name ? utf8_to_u16(name) : std::u16string();
+        TJS::ttstr expression_text = script_text_from_units(s, s_len);
         if(name && n.empty()) {
             // An empty (but present) name is still a name to the reference's
             // raw entry point (`if(name)`), which selects a named block
             // rather than the expression cache; keep that path.
             e->inner->EvalExpression(
-                s.c_str(), result_slot,
+                expression_text.c_str(), result_slot,
                 static_cast<TJS::iTJSDispatch2 *>(context), n.c_str(),
                 (tjs_int)lineofs);
         } else {
-            TJS::ttstr expression_text(s.c_str(), s.size());
             TJS::ttstr expression_name(n.c_str(), n.size());
             e->inner->EvalExpression(expression_text, result_slot,
                                      static_cast<TJS::iTJSDispatch2 *>(context),
@@ -2044,8 +2057,9 @@ int tjs2_eval(tjs2_engine *e, const char *expression, size_t expression_len,
             *out_error = nullptr;
         return -1;
     }
-    return eval_decoded(e, utf8_to_u16(expression, expression_len), name,
-                        context, lineofs, out_result, out_error);
+    std::u16string decoded = utf8_to_u16(expression, expression_len);
+    return eval_decoded(e, decoded.c_str(), decoded.size(), name, context,
+                        lineofs, out_result, out_error);
 }
 
 int tjs2_eval_wide(tjs2_engine *e, const uint16_t *expression,
@@ -2056,8 +2070,9 @@ int tjs2_eval_wide(tjs2_engine *e, const uint16_t *expression,
             *out_error = nullptr;
         return -1;
     }
-    return eval_decoded(e, units_to_u16(expression, expression_len), name,
-                        context, lineofs, out_result, out_error);
+    return eval_decoded(e, reinterpret_cast<const tjs_char *>(expression),
+                        expression_len, name, context, lineofs, out_result,
+                        out_error);
 }
 
 extern "C" int tjs2_assign_message_checked(const char *name,
@@ -3159,6 +3174,24 @@ tjs2_value_id tjs2_retain_object(void *engine, void *obj) {
         return (tjs2_value_id)id;
     } catch(...) {
         // Never let a C++ exception (e.g. bad_alloc) cross the C ABI.
+        return nullptr;
+    }
+}
+
+// Retain the engine's global object: the object the `global` keyword
+// evaluates to (the VM's `VM_GLOBAL` opcode pushes `GetGlobalNoAddRef()`).
+// A native that walks the script object graph reads it here instead of
+// compiling a script to evaluate the `global` keyword.
+tjs2_value_id tjs2_get_global(void *engine) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e || !e->inner)
+        return nullptr;
+    try {
+        TJS::iTJSDispatch2 *global = e->inner->GetGlobal();
+        tjs2_value_id id = tjs2_retain_object(e, global);
+        global->Release();
+        return id;
+    } catch(...) {
         return nullptr;
     }
 }

@@ -145,10 +145,11 @@ dictionary** (`type`, `target`, and one member per positional argument) and
 calls `objthis.action(event)`. A missing `action` member is ignored; a script
 assignment (`win.onClick = function…`) shadows the native default.
 
-The event dictionary is the empty-array literal, evaluated through the
-script cache, so the literal is compiled once instead of once per event
-(`reference/cpp/core/tjs2/tjsScriptCache.cpp:135-190`). The reference builds
-the object natively (`reference/cpp/core/base/EventIntf.cpp:709-736`).
+The event dictionary is the VM's own dictionary class — the object the
+reference's `TJSCreateDictionaryObject` returns
+(`reference/cpp/core/base/EventIntf.cpp:714`) — so no script is compiled for
+an event. The reference builds the object the same way
+(`reference/cpp/core/base/EventIntf.cpp:709-736`).
 
 `onCloseQuery` is registered as a **no-op** — it does not dispatch an
 `action` event.

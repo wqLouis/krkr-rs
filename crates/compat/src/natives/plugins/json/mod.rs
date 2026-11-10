@@ -1112,19 +1112,11 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             )));
         }
     };
-    let global = match engine.eval_retained("global", "json") {
-        Ok(RetainedValue::Object(object)) => object,
-        Ok(RetainedValue::Value(value)) => {
-            return Err(CompatError::Register(format!(
-                "json: the global object is not an object ({value:?})"
-            )));
-        }
-        Err(error) => {
-            return Err(CompatError::Register(format!(
-                "json: could not resolve the global object: {error}"
-            )));
-        }
-    };
+    let global = engine.global_object().map_err(|error| {
+        CompatError::Register(format!(
+            "json: could not resolve the global object: {error}"
+        ))
+    })?;
     engine
         .delete_member(global.raw_id(), NULL_HELPER_NAME)
         .map_err(|error| {

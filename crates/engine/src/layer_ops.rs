@@ -4432,15 +4432,18 @@ pub fn ensure_transition_self_image(scene: &mut Scene, root: u32, w: u32, h: u32
 ///
 /// `depth` bounds the nested-cache walk: a parent chain cannot be deeper than
 /// the layer pool, so a malformed cycle stops instead of recursing forever.
-fn subtree_source_generation(scene: &Scene, root: u32, depth: usize) -> u64 {
-    let Some(root_layer) = scene.layer(root) else {
+///
+/// `order` is the paint order of the window the root belongs to. The caller
+/// reads it once and hands it down, so the nested walk does not rebuild it
+/// for every layer it visits.
+fn subtree_source_generation(scene: &Scene, order: &[u32], root: u32, depth: usize) -> u64 {
+    if scene.layer(root).is_none() {
         return 0;
-    };
-    let window = root_layer.window;
+    }
     let mut sum = 0u64;
     // Layer id -> the live cache bitmap whose pixels already cover it.
     let mut covered: Map<u32, u32> = crate::hasher::map();
-    for id in scene.window_layer_order(window) {
+    for &id in order {
         if id != root && !is_descendant(scene, id, root) {
             continue;
         }
@@ -4460,7 +4463,7 @@ fn subtree_source_generation(scene: &Scene, root: u32, depth: usize) -> u64 {
         if id != root && (subtree_opacity(scene, id, root) * 255.0).round() == 0.0 {
             continue;
         }
-        if let Some(cache) = live_subtree_cache(scene, layer, root, depth) {
+        if let Some(cache) = live_subtree_cache(scene, layer, root, depth, order) {
             covered.insert(id, cache);
             if let Some(bitmap) = scene.bitmap(cache) {
                 sum = sum.wrapping_add(bitmap.content_generation);
@@ -4507,11 +4510,13 @@ impl SubtreeSource {
 /// than a transition frame. The layer that owns the composite is never its
 /// own source: it is writing that cache. `depth` is the nested-cache walk
 /// depth; past the layer pool a malformed parent cycle is not trusted.
+/// `order` is the paint order of the window, handed down by the caller.
 fn live_subtree_cache(
     scene: &Scene,
     layer: &crate::scene::LayerState,
     root: u32,
     depth: usize,
+    order: &[u32],
 ) -> Option<u32> {
     if layer.id == root
         || layer.cache_enabled_count == 0
@@ -4526,7 +4531,7 @@ fn live_subtree_cache(
         return None;
     }
     let recorded = layer.cache_source_generation;
-    (subtree_source_generation(scene, layer.id, depth + 1) == recorded).then_some(cache)
+    (subtree_source_generation(scene, order, layer.id, depth + 1) == recorded).then_some(cache)
 }
 
 /// What a subtree draw draws.
@@ -4618,13 +4623,16 @@ fn subtree_drawn_image(layer: &crate::scene::LayerState) -> Option<u32> {
 /// The image a layer contributes to the composite: its live cache when one is
 /// current, otherwise its `face` — the `dfMask`/`dfProvince` plane, or the
 /// main image (or transition self image) it draws.
+///
+/// `order` is the paint order of the window, handed down by the caller.
 fn subtree_source(
     scene: &Scene,
     layer: &crate::scene::LayerState,
     root: u32,
     depth: usize,
+    order: &[u32],
 ) -> Option<SubtreeSource> {
-    if let Some(cache) = live_subtree_cache(scene, layer, root, depth) {
+    if let Some(cache) = live_subtree_cache(scene, layer, root, depth, order) {
         return Some(SubtreeSource::Cache(cache));
     }
     match layer.face {
@@ -4772,11 +4780,19 @@ fn intersect_layer_rects(a: Rect, b: Rect) -> Rect {
 /// `root`'s origin, using the same `imageLeft`/`imageTop`/`imageWidth`/
 /// `imageHeight` placement the render projection applies. A layer whose own
 /// cache is live draws that cache and covers its descendants.
-fn collect_subtree_draws(scene: &Scene, root: u32, w: u32, h: u32) -> Vec<SubtreeDraw> {
+///
+/// `order` is the paint order of the window the root belongs to; the caller
+/// reads it once and hands it down.
+fn collect_subtree_draws(
+    scene: &Scene,
+    order: &[u32],
+    root: u32,
+    w: u32,
+    h: u32,
+) -> Vec<SubtreeDraw> {
     let Some(root_layer) = scene.layer(root) else {
         return Vec::new();
     };
-    let window = root_layer.window;
     let Some((root_ax, root_ay)) = scene.absolute_offset(root) else {
         return Vec::new();
     };
@@ -4791,7 +4807,7 @@ fn collect_subtree_draws(scene: &Scene, root: u32, w: u32, h: u32) -> Vec<Subtre
     // Layer id -> the absolute intersection of its rect and every ancestor
     // rect. A texture-less container still has to clip its descendants.
     let mut subtree_clips: Map<u32, Option<Rect>> = crate::hasher::map();
-    for id in scene.window_layer_order(window) {
+    for &id in order {
         if id != root && !is_descendant(scene, id, root) {
             continue;
         }
@@ -4843,7 +4859,7 @@ fn collect_subtree_draws(scene: &Scene, root: u32, w: u32, h: u32) -> Vec<Subtre
         if opa == 0 && id != root {
             continue;
         }
-        let Some(source) = subtree_source(scene, layer, root, 0) else {
+        let Some(source) = subtree_source(scene, layer, root, 0, order) else {
             continue;
         };
         if let SubtreeSource::Cache(cache) = &source {
@@ -5033,7 +5049,7 @@ fn composite_subtree_draw(target: &mut BitmapState, draw: &SubtreeDraw, src: &Bi
 /// registry, and the caller owns its lifetime through
 /// [`Scene::inc_cache_enabled_count`] / [`Scene::dec_cache_enabled_count`].
 pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
-    let (bitmap, w, h, trivial, opaque) = {
+    let (bitmap, w, h, trivial, opaque, window) = {
         let layer = scene.layer(root)?;
         let clip = scene.clipping_rect(root).unwrap_or(layer.rect);
         let w = clip.w.max(1);
@@ -5052,6 +5068,7 @@ pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
             h,
             trivial,
             layer.blend == BlendMode::Replace,
+            layer.window,
         )
     };
     if trivial {
@@ -5065,13 +5082,16 @@ pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
     if !pixels_usable(content_bitmap, "renderLayerSubtree") {
         return None;
     }
-    let current_generation = subtree_source_generation(scene, root, 0);
+    // The window's paint order, read once: the composite and the nested
+    // cache walk share it instead of rebuilding it for every layer.
+    let order = scene.window_layer_order(window);
+    let current_generation = subtree_source_generation(scene, &order, root, 0);
     let (recalc, recorded) = {
         let layer = scene.layer(root)?;
         (layer.cache_recalc, layer.cache_source_generation)
     };
     if recalc || current_generation != recorded {
-        let draws = collect_subtree_draws(scene, root, w, h);
+        let draws = collect_subtree_draws(scene, &order, root, w, h);
         // The content starts from the layer's backdrop: an opaque layer's
         // content is opaque, every other type's is transparent. The backdrop
         // is what an opaque layer's children are composited over, so the

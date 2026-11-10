@@ -2013,6 +2013,88 @@ fn native_tag_dictionary_keeps_an_empty_attribute_name() {
     );
 }
 
+/// The tag dictionary is the reference's tag dictionary: the VM's own
+/// dictionary class — the object the reference's `TJSCreateDictionaryObject`
+/// returns (`reference/cpp/core/base/KAGParser.cpp:329`) — carrying
+/// `tagname`, every attribute in source order and `taglist`, the member
+/// names in insertion order (`KAGParser.cpp:2176-2179`,
+/// `reference/cpp/plugins/KAGParser/readme.txt:45`).
+#[test]
+fn native_tag_dictionary_is_the_reference_tag_dictionary() {
+    let _lock = common::vm_lock();
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut host = compat::CompatHost::new();
+    host.install(&engine).expect("install compat surface");
+    engine
+        .exec_script_discard(
+            "class TagDictionaryParser extends KAGParser { \
+               function onScenarioLoad(name) { \
+                 return \"[layopt layer = a visible = true]\"; \
+               } \
+             }",
+            "kag_test",
+        )
+        .expect("the subclass declaration must evaluate");
+    let value = engine
+        .eval(
+            "(function(){ var p = new TagDictionaryParser(); p.loadScenario('scenario'); \
+             var t = p.getNextTag(); \
+             return (t instanceof \"Dictionary\" ? 'dictionary' : 'other') + ':' \
+                  + t.tagname + ':' + t.layer + ':' + t.visible + ':' \
+                  + t.taglist[0] + ':' + t.taglist[1] + ':' + t.taglist.count; })()",
+            "kag_test",
+        )
+        .expect("script");
+    assert_eq!(
+        value,
+        TjsValue::String("dictionary:layopt:a:true:tagname:layer:3".to_string())
+    );
+}
+
+/// The reference keeps **one** tag dictionary per parser
+/// (`reference/cpp/core/base/KAGParser.cpp:329`) and clears it before every
+/// tag (`KAGParser.cpp:1391`), so the script sees the same dictionary object
+/// for every tag of the walk — and the object holds the members of the tag
+/// that was read last.
+#[test]
+fn native_tag_dictionary_is_the_parsers_own_dictionary() {
+    let _lock = common::vm_lock();
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut host = compat::CompatHost::new();
+    host.install(&engine).expect("install compat surface");
+    engine
+        .exec_script_discard(
+            "class ReusedTagDictionaryParser extends KAGParser { \
+               function onScenarioLoad(name) { \
+                 return \"[layopt layer = a][layopt layer = b]\"; \
+               } \
+             }",
+            "kag_test",
+        )
+        .expect("the subclass declaration must evaluate");
+    let value = engine
+        .eval(
+            "(function(){ var p = new ReusedTagDictionaryParser(); \
+             p.loadScenario('scenario'); \
+             var firstDict = null; var first = ''; var second = ''; var same = ''; \
+             while (true) { \
+               var t = p.getNextTag(); if (!t) break; \
+               if (t.tagname != 'layopt') continue; \
+               if (firstDict === null) { firstDict = t; first = t.layer; } \
+               else { second = t.layer; same = (firstDict === t) ? 'same' : 'different'; \
+                      break; } \
+             } \
+             return first + ':' + second + ':' + same; })()",
+            "kag_test",
+        )
+        .expect("script");
+    assert_eq!(
+        value,
+        TjsValue::String("a:b:same".to_string()),
+        "the reference hands the same tag dictionary to every tag"
+    );
+}
+
 #[test]
 fn native_properties_and_void_end() {
     let _lock = common::vm_lock();

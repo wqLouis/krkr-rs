@@ -27,7 +27,7 @@ use super::super::bitmap::{
 use super::super::common::scene_mut;
 use super::super::common::{
     DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, actual_color_bytes, argb_to_rgba, bound,
-    rgba_to_pixel_word, scene_ref, set_null_out, swap_red_blue,
+    rgba_to_pixel_word, scene_ref, swap_red_blue,
 };
 use super::LayerInst;
 use super::util::{
@@ -36,7 +36,7 @@ use super::util::{
     value_as_f64, with_two_bitmaps,
 };
 use crate::CompatCtx;
-use crate::native_util::{args, report_error, set_int, set_void};
+use crate::native_util::{args, report_error, set_int, set_null, set_void};
 use crate::natives::system::value_as_i64;
 use crate::resource::{TextDrawParams, draw_text_into_bitmap, glyph_text, resource_state};
 
@@ -2490,7 +2490,7 @@ extern "C" fn layer_load_images(
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.loadImages: this layer is not constructed");
     };
-    let Ok((host, ctx)) = super::bound(engine) else {
+    let Ok((_host, ctx)) = super::bound(engine) else {
         return report_error(out_error, "Layer.loadImages: compat context is not bound");
     };
     // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
@@ -2510,7 +2510,7 @@ extern "C" fn layer_load_images(
             // when the format carries none (the common case). Returning
             // `void` would make the game's `ret != null` guard pass and then
             // fault on `ret.mode`.
-            set_null_out(host.engine(), out);
+            set_null(out);
             0
         }
         Err(error) => report_error(out_error, &error.message_with("Layer.loadImages: ")),

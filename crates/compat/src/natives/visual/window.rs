@@ -11,12 +11,14 @@ use tjs::{
 
 use super::common::{
     ObjectHandle, ObjectKind, VisualState, WindowObject, bound, duplicate_object, input_ref,
-    resolve_object_id, scene_mut, scene_ref, set_null_out, set_object_out, set_real,
-    set_retained_out,
+    resolve_object_id, scene_mut, scene_ref, set_object_out, set_real, set_retained_out,
 };
 use super::{clear_layer_focus, focus_layer_in_input_domain};
 use crate::collections::Map;
-use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::native_util::{
+    args, report_error, set_bool, set_int, set_null, set_void, value_as_string,
+};
+use crate::natives::event::{event_dictionary, event_object};
 use crate::natives::system::{set_string_out, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
 use tjs::{VAL_OBJECT, VAL_VOID};
@@ -1578,7 +1580,7 @@ extern "C" fn window_focused_layer_get(
     // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
-        set_null_out(resolved.engine(), out);
+        set_null(out);
         return 0;
     };
     let scene = match scene_ref(&ctx) {
@@ -1656,7 +1658,7 @@ extern "C" fn window_primary_layer_get(
     // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
-        set_null_out(resolved.engine(), out);
+        set_null(out);
         return 0;
     };
     let scene = match scene_ref(&ctx) {
@@ -1727,12 +1729,12 @@ extern "C" fn window_get_touch_point(
         return report_error(out_error, "Window.getTouchPoint: no such touch contact");
     };
     let host = resolved.engine();
-    let dict = match host.eval_retained("%[]", "Window.getTouchPoint") {
-        Ok(RetainedValue::Object(object)) => object,
-        Ok(RetainedValue::Value(_)) | Err(_) => {
+    let dict = match event_dictionary(host) {
+        Ok(dict) => dict,
+        Err(error) => {
             return report_error(
                 out_error,
-                "Window.getTouchPoint: cannot build the result object",
+                &format!("Window.getTouchPoint: cannot build the result object: {error}"),
             );
         }
     };
@@ -1781,18 +1783,18 @@ extern "C" fn window_get_touch_velocity(
     // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let Some(id) = resolve_touch_id(input, value_as_i64(&a[0])) else {
-        set_null_out(resolved.engine(), out);
+        set_null(out);
         return 0;
     };
     let (vx, vy) = input.touch_velocity(id).unwrap_or((0.0, 0.0));
     let speed = input.touch_speed(id).unwrap_or(0.0);
     let host = resolved.engine();
-    let dict = match host.eval_retained("%[]", "Window.getTouchVelocity") {
-        Ok(RetainedValue::Object(object)) => object,
-        Ok(RetainedValue::Value(_)) | Err(_) => {
+    let dict = match event_dictionary(host) {
+        Ok(dict) => dict,
+        Err(error) => {
             return report_error(
                 out_error,
-                "Window.getTouchVelocity: cannot build the result object",
+                &format!("Window.getTouchVelocity: cannot build the result object: {error}"),
             );
         }
     };
@@ -1869,8 +1871,8 @@ fn set_event_member(
 /// member, and `TVP_ACTION_INVOKE_END` calls `action` on the action owner
 /// (`reference/cpp/core/base/EventIntf.h:208-238`). The `FuncCall` result is
 /// never inspected, so a missing `action` member is ignored.
-/// The event object is the empty-array literal, evaluated through the
-/// script cache, so the literal is compiled once instead of once per event.
+/// The event object is the VM's own dictionary class, so no script is
+/// compiled for it.
 fn dispatch_action_event(
     host: &Tjs2Engine,
     owner: &DetachedValue,
@@ -1880,21 +1882,7 @@ fn dispatch_action_event(
     argv: *const Value,
     members: &[EventMember],
 ) -> Result<(), String> {
-    let event = match host.eval_retained_cached("%[]") {
-        Ok(RetainedValue::Object(event)) => event,
-        Ok(RetainedValue::Value(value)) => {
-            return Err(format!("event dictionary came back as {value:?}"));
-        }
-        Err(error) => return Err(error.to_string()),
-    };
-    host.set_member(event.raw_id(), "type", &TjsValue::String(event_type.into()))?;
-    if !objthis.is_null()
-        && let Ok(target) = host.retain_object_detached(objthis)
-    {
-        let target_id = target.raw_id().as_ptr() as u64;
-        let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id));
-        drop(target);
-    }
+    let event = event_object(host, event_type, objthis)?;
     // SAFETY: `argv` carries `argc` live entries for this callback.
     let raw = unsafe { args(argv, argc) };
     for &(name, index) in members {
@@ -2282,7 +2270,7 @@ extern "C" fn window_draw_device_get(
     let host = resolved.engine();
     match inst.draw_device.as_ref() {
         Some(object) => set_object_out(host, out, Some(object)),
-        None => set_null_out(host, out),
+        None => set_null(out),
     }
     0
 }
@@ -2465,7 +2453,7 @@ extern "C" fn window_layer_tree_owner_interface_get(
     };
     let host = resolved.engine();
     if objthis.is_null() {
-        set_null_out(host, out);
+        set_null(out);
         return 0;
     }
     match host.retain_object_detached(objthis) {

@@ -16,7 +16,7 @@
 mod common;
 
 use common::{Env, vm_lock};
-use tjs::{RetainedValue, TjsValue};
+use tjs::TjsValue;
 
 /// Install an octet member on the global object.
 ///
@@ -25,13 +25,9 @@ use tjs::{RetainedValue, TjsValue};
 /// surface has no octet literal, so the fixture installs one directly.
 fn install_octet(env: &Env, name: &str, bytes: &[u8]) {
     let engine = env.engine();
-    let global = match engine
-        .eval_retained("global", "var-file-test")
-        .expect("the global object must resolve")
-    {
-        RetainedValue::Object(object) => object,
-        RetainedValue::Value(other) => panic!("expected an object, got {other:?}"),
-    };
+    let global = engine
+        .global_object()
+        .expect("the global object must resolve");
     engine
         .set_member_octet(global.raw_id(), name, bytes)
         .expect("the octet member must be installed");
@@ -76,6 +72,41 @@ packImageMap["ev121a.pimg"] = new PackImageInfo();
         string(&env, "lines[0]"),
         "hello var",
         "the octet behind the property must be read through the media"
+    );
+}
+
+/// The read walks the script object graph without compiling a script.
+///
+/// The reference's walk starts at the script dispatch and reads every member
+/// with `PropGet` (`reference/cpp/plugins/varfile.cpp:305-330`); the host
+/// reaches the same global object through the VM, so the count of the
+/// scripts the host pushed into the VM moves by exactly the test's own
+/// script.
+#[test]
+fn a_var_read_compiles_no_script() {
+    let _lock = vm_lock();
+    let env = Env::with_storage();
+    env.link_plugin("varfile.dll");
+    install_octet(&env, "varFileBytes", b"hello var\n");
+    env.run(
+        r#"
+class PackImageInfo {
+    property root {
+        getter() { return %["3797.tlg" => varFileBytes]; }
+    }
+}
+var packImageMap = %[];
+packImageMap["ev121a.pimg"] = new PackImageInfo();
+"#,
+    );
+
+    let before = env.engine().script_evaluation_count();
+    env.run("var lines = []; lines.load('var://./packImageMap/ev121a.pimg/root/3797.tlg');");
+    let after = env.engine().script_evaluation_count();
+    assert_eq!(
+        after - before,
+        1,
+        "the read compiled a script to reach the global object"
     );
 }
 

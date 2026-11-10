@@ -14,6 +14,8 @@
 //! binds ([`Scene::effect_pipelines`]); the handle is a value the projection
 //! passes on, not a service the scene calls.
 
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use api::blend::BlendMode;
@@ -23,6 +25,7 @@ use api::media::DecodedImage;
 
 use crate::hasher::{Map, Set, map, set};
 use crate::imagedecode::{ImageOutcome, ImageSizeError, ImageState, PendingImage};
+use crate::layer_order::LayerOrderIndex;
 use crate::shader::{EffectDraw, EffectPipelines};
 use crate::trans::Trans;
 
@@ -312,6 +315,22 @@ pub struct HitCandidate {
     pub x: i32,
     /// The point in the layer's own coordinates.
     pub y: i32,
+}
+
+/// What a hit test derives for one layer of the paint order.
+///
+/// The entry is derived from the parent's, so one pass over the order
+/// resolves the ancestors a candidate needs instead of walking them again
+/// for every candidate.
+#[derive(Debug, Clone, Copy)]
+struct HitEntry {
+    /// The layer's absolute offset in the window, or `None` when its
+    /// ancestor chain does not resolve.
+    offset: Option<(i32, i32)>,
+    /// Whether the layer and every ancestor are visible.
+    visible: bool,
+    /// Whether the point is inside every ancestor's clip rectangle.
+    inside_ancestors: bool,
 }
 
 /// One source image of a [`TransitionFrame`].
@@ -767,7 +786,14 @@ pub struct Scene {
     pub windows: Vec<WindowState>,
     /// All layers, in creation order. Callers may edit this directly.
     pub layers: Vec<LayerState>,
-    /// All bitmaps, in creation order. Callers may edit this directly.
+    /// All bitmaps, in creation order.
+    ///
+    /// The scene hands a bitmap out for mutation through
+    /// [`Scene::bitmap_mut`], [`Scene::with_two_bitmaps`] and the other
+    /// borrow methods, and it registers every bitmap it hands out; the frame
+    /// uploads the registered bitmaps whose pixels changed. A caller that
+    /// changes the pixels of a bitmap therefore takes the bitmap through one
+    /// of those methods and marks it dirty there.
     pub bitmaps: Vec<BitmapState>,
     /// All fonts, in creation order. Callers may edit this directly.
     pub fonts: Vec<FontState>,
@@ -788,6 +814,12 @@ pub struct Scene {
     bitmap_index: crate::hasher::Map<u32, usize>,
     /// `font.id` → index into `fonts`.
     font_index: crate::hasher::Map<u32, usize>,
+    /// The paint order of every window's layers.
+    ///
+    /// The index is built when a window's order is asked for and reused
+    /// until the scene's structure moves, so a frame that walks the layer
+    /// tree many times pays for one build.
+    layer_order: RefCell<LayerOrderIndex>,
     /// Whether a running transition is drawn from
     /// [`LayerState::transition_frame`] instead of a CPU-blended display
     /// bitmap. A host that draws the projected scene turns it on; the
@@ -822,6 +854,24 @@ pub struct Scene {
     /// frame that was skipped leaves the previous frame's content on screen,
     /// and the change must be drawn again.
     dirty: bool,
+    /// The bitmaps whose pixels may have changed since the last upload.
+    ///
+    /// A mutable access is a possible content change — the same contract the
+    /// content revision already has — so the scene keeps every bitmap it
+    /// handed out for mutation. The upload pass walks this set instead of
+    /// the bitmap table, and drops the bitmaps whose pixels did not change.
+    dirty_bitmaps: BTreeSet<u32>,
+    /// The bitmaps whose pixels are still being decoded.
+    ///
+    /// The set names the bitmaps that carry a pending decode; the decode
+    /// itself is the bitmap's own. The frame resolves the bitmaps in this
+    /// set instead of walking the bitmap table.
+    pending_bitmaps: BTreeSet<u32>,
+    /// The bitmaps removed since the last texture prune.
+    ///
+    /// The engine drops the texture of every bitmap named here, so the prune
+    /// does not walk the texture table to find the stale ones.
+    removed_bitmaps: BTreeSet<u32>,
 }
 
 impl Default for Scene {
@@ -839,6 +889,7 @@ impl Default for Scene {
             layer_index: crate::hasher::map(),
             bitmap_index: crate::hasher::map(),
             font_index: crate::hasher::map(),
+            layer_order: RefCell::new(LayerOrderIndex::default()),
             composite_transition_frames: false,
             effect_pipelines: EffectPipelines::new(),
             image_cache: DecodedImageCache::default(),
@@ -846,6 +897,9 @@ impl Default for Scene {
             structure_revision: 0,
             content_revision: 0,
             dirty: false,
+            dirty_bitmaps: BTreeSet::new(),
+            pending_bitmaps: BTreeSet::new(),
+            removed_bitmaps: BTreeSet::new(),
         }
     }
 }
@@ -2307,6 +2361,10 @@ impl Scene {
     ///
     /// The candidate carries the point in the candidate's own coordinates,
     /// the coordinate space a hit test reports.
+    ///
+    /// The walk over the paint order derives each layer's ancestors once,
+    /// from the entry its parent left behind, instead of walking them again
+    /// for every candidate.
     pub fn layer_hit_next(
         &self,
         layer_id: u32,
@@ -2339,9 +2397,23 @@ impl Scene {
                 None => break,
             }
         }
-        // Front-to-back over the flattened tree; an invisible parent prunes
-        // its subtree through `node_visible`.
+        // The window's paint order, back to front.
         let order = self.window_layer_order(window);
+        // What the walk derives for each layer it passes: the absolute
+        // offset, the visibility of the chain and whether the point is inside
+        // every ancestor's clip rectangle. Only the layers behind the one
+        // the caller tested last are candidates, so the walk stops there.
+        let mut entries: Map<u32, HitEntry> = map();
+        for id in order.iter().copied() {
+            if Some(id) == after {
+                break;
+            }
+            let Some(l) = self.layer(id) else {
+                continue;
+            };
+            let entry = self.hit_entry(id, l, px, py, &entries);
+            entries.insert(id, entry);
+        }
         // The search continues behind the layer the caller tested last. A
         // layer that left the order in the meantime (the caller removed it
         // while the test ran) restarts the search at the front.
@@ -2357,16 +2429,13 @@ impl Scene {
             if exclude_self && id == layer_id {
                 continue;
             }
-            let Some(l) = self.layer(id) else {
+            let Some(entry) = entries.get(&id) else {
                 continue;
             };
-            if !self.node_visible(id) {
+            if !entry.visible || !entry.inside_ancestors {
                 continue;
             }
-            if !self.ancestor_rect_contains(id, px, py) {
-                continue;
-            }
-            let Some((ax, ay)) = self.absolute_offset(id) else {
+            let Some((ax, ay)) = entry.offset else {
                 continue;
             };
             let Some(clip) = self.clipping_rect(id) else {
@@ -2377,6 +2446,9 @@ impl Scene {
             if lx < 0 || ly < 0 || lx >= clip.w as i32 || ly >= clip.h as i32 {
                 continue;
             }
+            let Some(l) = self.layer(id) else {
+                continue;
+            };
             if self.hit_test_layer(l, lx, ly) {
                 return Some(HitCandidate {
                     layer: id,
@@ -2386,6 +2458,66 @@ impl Scene {
             }
         }
         None
+    }
+
+    /// Derive what a hit test needs about one layer of the paint order.
+    ///
+    /// The parent's entry carries the ancestors' answers, so a layer that
+    /// follows its parent in the order inherits them. A parent outside this
+    /// window's tree has no entry, and its chain is walked instead.
+    fn hit_entry(
+        &self,
+        id: u32,
+        layer: &LayerState,
+        px: i32,
+        py: i32,
+        entries: &Map<u32, HitEntry>,
+    ) -> HitEntry {
+        let own_visible = layer.visible && !layer.shutdown;
+        let Some(parent) = layer.parent else {
+            // A window root: its own rectangle is the origin of the window's
+            // coordinates, and it has no ancestor to test.
+            return HitEntry {
+                offset: Some((layer.rect.x, layer.rect.y)),
+                visible: own_visible,
+                inside_ancestors: true,
+            };
+        };
+        let Some(parent_entry) = entries.get(&parent) else {
+            // The parent is not part of this window's tree: the chain is
+            // walked, and a chain that does not resolve is a miss.
+            return HitEntry {
+                offset: self.absolute_offset(id),
+                visible: self.node_visible(id),
+                inside_ancestors: self.ancestor_rect_contains(id, px, py),
+            };
+        };
+        let offset = parent_entry.offset.map(|(x, y)| {
+            (
+                x.saturating_add(layer.rect.x),
+                y.saturating_add(layer.rect.y),
+            )
+        });
+        let visible = parent_entry.visible && own_visible;
+        // The point must be inside the parent's clip rectangle as well as
+        // inside every rectangle above it.
+        let inside_ancestors = match (parent_entry.offset, self.clipping_rect(parent)) {
+            (Some((ax, ay)), Some(clip)) => {
+                let lx = px.saturating_sub(ax);
+                let ly = py.saturating_sub(ay);
+                parent_entry.inside_ancestors
+                    && lx >= 0
+                    && ly >= 0
+                    && lx < clip.w as i32
+                    && ly < clip.h as i32
+            }
+            _ => false,
+        };
+        HitEntry {
+            offset,
+            visible,
+            inside_ancestors,
+        }
     }
 
     /// The layer a hit test that accepted `id` reports.
@@ -2578,6 +2710,8 @@ impl Scene {
             content_generation: 0,
             pending: None,
         });
+        // The bitmap starts dirty, so the frame uploads it.
+        self.dirty_bitmaps.insert(id);
         self.touch_structure();
         id
     }
@@ -2623,6 +2757,10 @@ impl Scene {
             content_generation: 0,
             pending: Some(pending),
         });
+        // The bitmap starts dirty, so the frame uploads it, and its pixels
+        // are still decoding, so the frame waits for them.
+        self.dirty_bitmaps.insert(id);
+        self.pending_bitmaps.insert(id);
         self.touch_structure();
         Ok(id)
     }
@@ -2771,6 +2909,9 @@ impl Scene {
         bitmap.rgba = Vec::new();
         bitmap.pending = Some(pending);
         bitmap.mark_dirty();
+        // The bitmap waits for a decode again, and its pixels changed.
+        self.pending_bitmaps.insert(id);
+        self.dirty_bitmaps.insert(id);
         self.touch_structure();
         true
     }
@@ -2802,7 +2943,8 @@ impl Scene {
     /// image and the pending image is a clone of the shared future: every
     /// holder waits for the same decode and sees the same pixels.
     pub fn pending_decode_for(&self, key: &DecodedImageKey) -> Option<(u32, u32, PendingImage)> {
-        if let Some(found) = self.bitmaps.iter().find_map(|bitmap| {
+        if let Some(found) = self.pending_bitmaps.iter().find_map(|id| {
+            let bitmap = self.bitmap(*id)?;
             let pending = bitmap.pending.as_ref()?;
             if !pending.fills_cache_entry(key) {
                 return None;
@@ -2827,11 +2969,11 @@ impl Scene {
     /// future and the pixels land in all of them. Cancelling it while
     /// another bitmap waits would leave that bitmap without pixels.
     fn another_bitmap_waits_for(&self, pending: &PendingImage, except: u32) -> bool {
-        self.bitmaps.iter().any(|bitmap| {
-            bitmap.id != except
-                && bitmap
-                    .pending
-                    .as_ref()
+        self.pending_bitmaps.iter().any(|id| {
+            *id != except
+                && self
+                    .bitmap(*id)
+                    .and_then(|bitmap| bitmap.pending.as_ref())
                     .is_some_and(|other| other.same_decode(pending))
         })
     }
@@ -2909,6 +3051,8 @@ impl Scene {
             }
         }
         bitmap.mark_dirty();
+        // The bitmap holds its pixels now; it waits for no decode.
+        self.pending_bitmaps.remove(&id);
         // The pixels landed, so the bitmap's content changed; the structure
         // revision moves with it because the projection's texture table may
         // have skipped the bitmap while it had no pixels.
@@ -2928,13 +3072,11 @@ impl Scene {
     /// loaded images reach the cache, and a preload that is still decoding
     /// waits for a later frame. Returns the number of images that were
     /// resolved.
+    ///
+    /// The wait covers the bitmaps the scene knows to be decoding; the frame
+    /// never walks the bitmap table to find them.
     pub fn resolve_pending_images(&mut self) -> usize {
-        let ids: Vec<u32> = self
-            .bitmaps
-            .iter()
-            .filter(|bitmap| bitmap.pending.is_some())
-            .map(|bitmap| bitmap.id)
-            .collect();
+        let ids: Vec<u32> = self.pending_bitmaps.iter().copied().collect();
         let mut resolved = 0;
         for id in ids {
             if self.resolve_bitmap(id) {
@@ -3326,6 +3468,11 @@ impl Scene {
         if self.bitmaps.len() == before {
             return false;
         }
+        // The bitmap is gone: it has nothing left to upload, and the
+        // texture the engine holds for it is stale.
+        self.dirty_bitmaps.remove(&id);
+        self.pending_bitmaps.remove(&id);
+        self.removed_bitmaps.insert(id);
         if let Some(pending) = pending {
             // Another bitmap may wait for the same decode: the pixels land
             // in it too, so the decode stays alive.
@@ -3621,6 +3768,9 @@ impl Scene {
         bitmap.height = height;
         bitmap.rgba = rgba;
         bitmap.mark_dirty();
+        // The replaced image supersedes the decode: the bitmap waits for no
+        // decode now.
+        self.pending_bitmaps.remove(&id);
         if previous != (width, height) {
             self.touch_structure();
         }
@@ -3630,8 +3780,14 @@ impl Scene {
     /// Mutably look up a bitmap by id without bumping either revision or the
     /// content generation. Used by a pass that writes one bitmap many times
     /// and reports the change once.
+    ///
+    /// A mutable access is a possible content change, so the bitmap joins
+    /// [`Scene::dirty_bitmaps`]: the upload pass walks that set instead of
+    /// the bitmap table. The set is the only record of the bitmaps the
+    /// upload pass has to look at.
     pub(crate) fn bitmap_mut_untracked(&mut self, id: u32) -> Option<&mut BitmapState> {
         let index = self.bitmap_position(id)?;
+        self.dirty_bitmaps.insert(id);
         self.bitmaps.get_mut(index)
     }
 
@@ -3653,6 +3809,7 @@ impl Scene {
         if di == si {
             return None;
         }
+        self.dirty_bitmaps.insert(dst);
         let (left, right) = self.bitmaps.split_at_mut(di);
         let (dst_slice, right) = right.split_at_mut(1);
         let source = if si < di {
@@ -3683,6 +3840,7 @@ impl Scene {
         if di == a || di == b {
             return None;
         }
+        self.dirty_bitmaps.insert(dst);
         let (left, right) = self.bitmaps.split_at_mut(di);
         let (dst_slice, right) = right.split_at_mut(1);
         let a_ref: &BitmapState = if a < di { &left[a] } else { &right[a - di - 1] };
@@ -3895,12 +4053,16 @@ impl Scene {
     /// [`BitmapState::dirty_region`] without bumping either revision. Called
     /// by the projection after a texture upload; the flag is backend
     /// bookkeeping, not a scene change.
+    ///
+    /// The bitmap also leaves [`Scene::dirty_bitmaps`]: its pixels are on the
+    /// texture, so the next upload pass has nothing to do for it.
     pub fn set_bitmap_clean(&mut self, id: u32) -> bool {
         let Some(bitmap) = self.bitmap_record_mut(id) else {
             return false;
         };
         bitmap.dirty = false;
         bitmap.dirty_region = None;
+        self.dirty_bitmaps.remove(&id);
         true
     }
 
@@ -3915,7 +4077,77 @@ impl Scene {
             return false;
         };
         bitmap.dirty_region = None;
+        self.dirty_bitmaps.insert(id);
         true
+    }
+
+    /// The bitmaps whose pixels changed since the last upload, in id order.
+    ///
+    /// The scene keeps every bitmap it handed out for mutation, because a
+    /// mutable access is a possible content change. The ones whose pixels
+    /// did not change are not dirty and leave the set here, so the set holds
+    /// the bitmaps the upload pass has to look at and nothing else.
+    pub fn dirty_bitmaps_for_upload(&mut self) -> Vec<u32> {
+        let candidates: Vec<u32> = self.dirty_bitmaps.iter().copied().collect();
+        let mut dirty = Vec::with_capacity(candidates.len());
+        for id in candidates {
+            let changed = self.bitmap(id).is_some_and(|bitmap| bitmap.dirty);
+            if changed {
+                dirty.push(id);
+            } else {
+                self.dirty_bitmaps.remove(&id);
+            }
+        }
+        dirty
+    }
+
+    /// Whether any bitmap waits for a decode.
+    ///
+    /// The frame resolves the bitmaps the scene knows to be decoding; the
+    /// bitmap table is not walked to find them.
+    pub fn has_pending_images(&self) -> bool {
+        !self.pending_bitmaps.is_empty()
+    }
+
+    /// The bitmaps removed since the last prune, in id order.
+    ///
+    /// The engine drops the texture of every bitmap named here; the set is
+    /// empty afterwards.
+    pub fn take_removed_bitmaps(&mut self) -> Vec<u32> {
+        let removed: Vec<u32> = self.removed_bitmaps.iter().copied().collect();
+        self.removed_bitmaps.clear();
+        removed
+    }
+
+    /// Runs `f` on the destination and the source bitmap of an operation.
+    ///
+    /// The destination is borrowed mutably and the source immutably; the two
+    /// may be the same bitmap, in which case the source is snapshotted so
+    /// the operation reads stable pixels. The operation writes the
+    /// destination's pixels, so the destination joins
+    /// [`Scene::dirty_bitmaps`] and the frame uploads it.
+    ///
+    /// Returns `None` when a bitmap is missing.
+    pub fn with_two_bitmaps<R>(
+        &mut self,
+        dst: u32,
+        src: u32,
+        f: impl FnOnce(&mut BitmapState, &BitmapState) -> R,
+    ) -> Option<R> {
+        let di = self.bitmap_position(dst)?;
+        let si = self.bitmap_position(src)?;
+        let value = if di == si {
+            let source = self.bitmaps[si].clone();
+            f(&mut self.bitmaps[di], &source)
+        } else if di < si {
+            let (left, right) = self.bitmaps.split_at_mut(si);
+            f(&mut left[di], &right[0])
+        } else {
+            let (left, right) = self.bitmaps.split_at_mut(di);
+            f(&mut right[0], &left[si])
+        };
+        self.dirty_bitmaps.insert(dst);
+        Some(value)
     }
 
     /// The bitmap record with the given id, for mutation.
@@ -3996,7 +4228,33 @@ impl Scene {
     /// stable tie-breaker (including `bringToFront`). Invalid or cyclic links
     /// are handled defensively and cannot make a layer disappear or recurse
     /// forever.
+    ///
+    /// The order lives in the scene's paint-order index: the first read
+    /// after a change builds it, and every later read reuses it until the
+    /// scene's structure moves again.
     pub fn window_layer_order(&self, window: u32) -> Vec<u32> {
+        let revision = self.structure_revision;
+        let cached = self
+            .layer_order
+            .borrow()
+            .get(window, revision)
+            .map(|order| order.to_vec());
+        if let Some(order) = cached {
+            return order;
+        }
+        let order = self.build_window_layer_order(window);
+        self.layer_order
+            .borrow_mut()
+            .set(window, revision, order.clone());
+        order
+    }
+
+    /// Build the paint order of one window: the layers the window owns,
+    /// flattened back to front.
+    ///
+    /// This is the index's builder; [`Scene::window_layer_order`] calls it
+    /// when the cached order no longer matches the scene.
+    pub(crate) fn build_window_layer_order(&self, window: u32) -> Vec<u32> {
         let Some(window_state) = self.window(window) else {
             return Vec::new();
         };
@@ -4043,6 +4301,15 @@ impl Scene {
         // layer's own `parent` field and `append_layer_subtree` merges it into
         // the maintained list.
         order
+    }
+
+    /// How many paint orders the index has built.
+    ///
+    /// A test reads the counter to see that a repeated walk reuses the index
+    /// instead of rebuilding the order.
+    #[cfg(test)]
+    pub(crate) fn layer_order_builds(&self) -> usize {
+        self.layer_order.borrow().builds()
     }
 
     /// Stable sibling sort keyed by `(z_order, maintained position, id)`.

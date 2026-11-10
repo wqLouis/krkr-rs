@@ -30,7 +30,9 @@ use tjs::{
 };
 
 use crate::collections::Map;
-use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::native_util::{
+    args, report_error, set_bool, set_int, set_null, set_void, value_as_string,
+};
 use crate::{CompatCtx, CompatError};
 
 use super::notifications;
@@ -131,7 +133,8 @@ fn emit_stored(
     what: &str,
 ) -> c_int {
     let Some(raw) = stored else {
-        return set_null(engine, out);
+        set_null(out);
+        return 0;
     };
     match engine.duplicate_retained(raw) {
         Ok(duplicate) => {
@@ -141,23 +144,10 @@ fn emit_stored(
         }
         Err(error) => {
             log::warn!("{what}: could not duplicate the stored object: {error}");
-            set_null(engine, out)
+            set_null(out);
+            0
         }
     }
-}
-
-/// Write TJS `null` into `out`.
-fn set_null(engine: &Tjs2Engine, out: *mut Value) -> c_int {
-    if out.is_null() {
-        return 0;
-    }
-    if let Ok(RetainedValue::Object(object)) = engine.eval_retained("null", "windowEx.null") {
-        set_retained_out(out, object.raw_id());
-        std::mem::forget(object);
-        return 0;
-    }
-    set_void(out);
-    0
 }
 
 // ---------------------------------------------------------------------------

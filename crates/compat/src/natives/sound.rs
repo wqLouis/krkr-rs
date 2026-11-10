@@ -152,6 +152,7 @@ use crate::native_util::{
     callback_args, host_ref, inst_mut, inst_ref, report_error, set_int, set_void, value_as_string,
     value_ref,
 };
+use crate::natives::event::event_object;
 use crate::natives::system::{resolve, set_string_out, value_as_bool, value_as_i64};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
@@ -2051,23 +2052,7 @@ fn action_event(
     event_type: &str,
     member: Option<(&str, TjsValue)>,
 ) -> Result<DetachedValue, String> {
-    let event = match host.eval_retained("%[]", "WaveSoundBuffer.action") {
-        Ok(RetainedValue::Object(event)) => event,
-        Ok(RetainedValue::Value(value)) => {
-            return Err(format!("event dictionary came back as {value:?}"));
-        }
-        Err(error) => return Err(format!("event dictionary creation failed: {error}")),
-    };
-    host.set_member(event.raw_id(), "type", &TjsValue::String(event_type.into()))?;
-    if !objthis.is_null()
-        && let Ok(target) = host.retain_object_detached(objthis)
-    {
-        // The retention is consumed while the variant copy is built; on
-        // failure it is left to `DetachedValue`'s idempotent release.
-        let target_id = target.raw_id().as_ptr() as u64;
-        let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id));
-        drop(target);
-    }
+    let event = event_object(host, event_type, objthis)?;
     if let Some((name, value)) = member {
         host.set_member(event.raw_id(), name, &value)?;
     }

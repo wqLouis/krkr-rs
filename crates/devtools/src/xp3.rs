@@ -179,7 +179,7 @@ fn info(argv: &[String]) -> Result<(), ToolError> {
             entry.name,
             entry.org_size,
             entry.arc_size,
-            entry.segments.len()
+            entry.segment_count()
         ))?;
     }
     Ok(())
@@ -435,7 +435,7 @@ mod tests {
         let normalized =
             entry_of(&archive, "data/foo.txt").expect("the normalized name finds the entry");
         assert_eq!(raw.name, normalized.name);
-        assert_eq!(raw.name, "data/foo.txt");
+        assert_eq!(&*raw.name, "data/foo.txt");
         let bytes = archive.read(raw).expect("the entry reads");
         assert_eq!(bytes.as_slice(), b"hello\nworld\n");
         let _ = std::fs::remove_dir_all(&directory);

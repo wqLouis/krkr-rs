@@ -1346,6 +1346,10 @@ impl Engine {
 
     /// Uploads every bitmap whose dirty flag is set and clears the flag.
     ///
+    /// The scene keeps the bitmaps whose pixels may have changed, so the pass
+    /// walks that set instead of the bitmap table; a frame that changed
+    /// nothing uploads nothing.
+    ///
     /// A bitmap whose dimensions changed recreates its texture; one with an
     /// inconsistent pixel length is skipped with a warning so one bad bitmap
     /// cannot abort the frame. All dirty bitmaps are uploaded in one batch, so
@@ -1355,13 +1359,7 @@ impl Engine {
     /// A bitmap that changed in a rectangle uploads that rectangle alone;
     /// one that changed wholly uploads every pixel.
     fn sync_dirty_bitmaps(&mut self) {
-        let dirty: Vec<u32> = self
-            .scene
-            .bitmaps
-            .iter()
-            .filter(|bitmap| bitmap.dirty)
-            .map(|bitmap| bitmap.id)
-            .collect();
+        let dirty: Vec<u32> = self.scene.dirty_bitmaps_for_upload();
 
         let mut ready: Vec<u32> = Vec::with_capacity(dirty.len());
         for id in dirty {
@@ -1469,14 +1467,11 @@ impl Engine {
     }
 
     /// Drops textures whose bitmap no longer exists in the scene.
+    ///
+    /// The scene records the bitmaps it removed, so the prune drops the
+    /// textures of those bitmaps instead of walking the texture table.
     fn prune_stale_textures(&mut self) {
-        let stale: Vec<u32> = self
-            .textures
-            .keys()
-            .copied()
-            .filter(|id| self.scene.bitmap(*id).is_none())
-            .collect();
-        for id in stale {
+        for id in self.scene.take_removed_bitmaps() {
             if let Some(texture) = self.textures.remove(&id) {
                 drop_texture(&self.pipeline, &mut self.render_state, texture);
             }

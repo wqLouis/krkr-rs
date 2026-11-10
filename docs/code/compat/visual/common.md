@@ -114,11 +114,12 @@ a callback.
 | `set_visual_string_out(ctx, out, text)` | a string, through the visual family's scratch buffer |
 | `set_retained_out(host, out, id)` | a retained script object |
 | `set_object_out(host, out, object)` | a duplicated retained object, or TJS `null` |
-| `set_null_out(host, out)` | TJS `null` |
+| `set_null(out)` | TJS `null` |
 
-`set_null_out` evaluates the `null` expression and retains its object
-variant, because the C ABI has no null literal. It falls back to `void`,
-which is still falsy.
+`set_null` writes the ABI's own null value: TJS `null` is an object value
+with no object pointer, and the ABI carries it as `VAL_NULL`. No script is
+compiled to produce it, and there is no `void` fallback — the script must
+see the null.
 
 `set_visual_string_out` uses the **visual family's own** scratch buffer, not
 `System`'s: a re-entrant visual callback must not clobber a `System` result

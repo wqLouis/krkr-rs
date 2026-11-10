@@ -327,29 +327,19 @@ pub(super) fn with_two_bitmaps<R>(
     // Both images may still be decoding: a composite reads their pixels.
     scene.resolve_bitmap(dst_id);
     scene.resolve_bitmap(src_id);
-    let dst_index = scene
-        .bitmaps
-        .iter()
-        .position(|b| b.id == dst_id)
-        .ok_or_else(|| format!("Layer: the destination bitmap {dst_id} does not exist"))?;
-    let src_index = scene
-        .bitmaps
-        .iter()
-        .position(|b| b.id == src_id)
-        .ok_or_else(|| format!("Layer: the source bitmap {src_id} does not exist"))?;
-    bitmap_holds_pixels(&scene.bitmaps[dst_index], "destination")?;
-    bitmap_holds_pixels(&scene.bitmaps[src_index], "source")?;
-    if dst_index == src_index {
-        let source = scene.bitmaps[src_index].clone();
-        return Ok(f(&mut scene.bitmaps[dst_index], &source));
-    }
-    if dst_index < src_index {
-        let (left, right) = scene.bitmaps.split_at_mut(src_index);
-        Ok(f(&mut left[dst_index], &right[0]))
-    } else {
-        let (left, right) = scene.bitmaps.split_at_mut(dst_index);
-        Ok(f(&mut right[0], &left[src_index]))
-    }
+    let Some(dst) = scene.bitmap(dst_id) else {
+        return Err(format!(
+            "Layer: the destination bitmap {dst_id} does not exist"
+        ));
+    };
+    let Some(src) = scene.bitmap(src_id) else {
+        return Err(format!("Layer: the source bitmap {src_id} does not exist"));
+    };
+    bitmap_holds_pixels(dst, "destination")?;
+    bitmap_holds_pixels(src, "source")?;
+    scene
+        .with_two_bitmaps(dst_id, src_id, f)
+        .ok_or_else(|| format!("Layer: the destination bitmap {dst_id} does not exist"))
 }
 
 /// Check that a bitmap whose decode has resolved actually holds a full RGBA

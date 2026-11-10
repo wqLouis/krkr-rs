@@ -68,7 +68,8 @@ descendants raises `MenuItem: inserting here would create a cycle`.
 3. then it calls the object's `onClick` member, so a **script override wins**
    over the native default.
 
-The native default `onClick` builds a `%[]` event with `type = "onClick"` and
+The native default `onClick` builds the reference event dictionary — a
+dictionary of the VM's own dictionary class — with `type = "onClick"` and
 `target = objthis` and calls `owner.action(event)`. A missing or failing
 `action` is ignored.
 

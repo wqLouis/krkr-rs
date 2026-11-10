@@ -21,12 +21,13 @@ use std::ffi::{c_char, c_int, c_void};
 use crate::engine_api::{TimerCallback, TimerId, TimerState};
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
-    RetainedValue, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value,
+    Tjs2Engine, TjsValue, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value,
 };
 
 use super::common::{DEFAULT_TIMER_CAPACITY, TimerBinding, VisualState, bound, set_real};
 use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::natives::event::event_object;
 use crate::natives::system::{value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError, CompatServices};
 
@@ -434,24 +435,7 @@ fn dispatch_on_timer(host: &Tjs2Engine, services: &CompatServices, id: TimerId) 
 /// retained (a port-only situation; the reference always has it), in which
 /// case `target` is omitted.
 fn action_event(host: &Tjs2Engine, objthis: *mut c_void) -> Result<DetachedValue, String> {
-    let event = match host.eval_retained("%[]", "Timer.onTimer") {
-        Ok(RetainedValue::Object(event)) => event,
-        Ok(RetainedValue::Value(value)) => {
-            return Err(format!("event dictionary came back as {value:?}"));
-        }
-        Err(error) => return Err(format!("event dictionary creation failed: {error}")),
-    };
-    host.set_member(event.raw_id(), "type", &TjsValue::String("onTimer".into()))?;
-    if !objthis.is_null() {
-        // The retention is consumed while the variant copy is built; on
-        // failure it is left to `DetachedValue`'s idempotent release.
-        if let Ok(target) = host.retain_object_detached(objthis) {
-            let target_id = target.raw_id().as_ptr() as u64;
-            let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id));
-            drop(target);
-        }
-    }
-    Ok(event)
+    event_object(host, "onTimer", objthis)
 }
 
 /// Invoke the retained action for `id` exactly like the reference native

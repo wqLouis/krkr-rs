@@ -61,6 +61,11 @@ const TITLE_TAGS: &str = r#"
         }
 
         // The tags the title's scenario holds, in order.
+        //
+        // The reference hands the same tag dictionary to every tag
+        // (`reference/cpp/core/base/KAGParser.cpp:329`, `:1391`), so the
+        // runtime copies the members it keeps instead of keeping the
+        // dictionary itself.
         var titleTags = [];
         var parser = new TitleParser();
         parser.loadScenario("title.ks");
@@ -69,7 +74,12 @@ const TITLE_TAGS: &str = r#"
             var tag = parser.getNextTag();
             if(tag === void) break;
             if(tag.tagname == "ch" || tag.tagname == "r") continue;
-            titleTags.push(tag);
+            var kept = %[];
+            kept.tagname = tag.tagname;
+            kept.storage = tag.storage;
+            kept.layer = tag.layer;
+            kept.page = tag.page;
+            titleTags.push(kept);
         }
 "#;
 

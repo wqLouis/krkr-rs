@@ -59,7 +59,7 @@ use tjs::{
 };
 
 use super::input::{MB_LEFT, MOUSE_BUTTONS, mouse_button, shift_flags, vk_from_index};
-use crate::native_util::{args, report_error, set_bool, set_int, set_void};
+use crate::native_util::{args, report_error, set_bool, set_int, set_null, set_void};
 use crate::natives::system::{resolve, value_as_i64};
 use crate::natives::visual::{clear_layer_focus, focus_layer};
 use crate::{CompatCtx, CompatError};
@@ -222,21 +222,6 @@ fn emit_retained(host: &Tjs2Engine, out: *mut Value, id: Tjs2ValueId) {
             set_void(out);
         }
     }
-}
-
-/// Write TJS `null` into `out`.
-fn set_null(host: &Tjs2Engine, out: *mut Value) {
-    if out.is_null() {
-        return;
-    }
-    if let Ok(RetainedValue::Object(object)) =
-        host.eval_retained("null", "BitmapLayerTreeOwner.null")
-    {
-        write_retained(out, object.raw_id());
-        std::mem::forget(object);
-        return;
-    }
-    set_void(out);
 }
 
 /// Evaluate an expression and retain an object result.
@@ -646,7 +631,7 @@ extern "C" fn focused_layer_get(
         .map(DetachedValue::raw_id);
     match stored {
         Some(id) => emit_retained(resolved.engine(), out, id),
-        None => set_null(resolved.engine(), out),
+        None => set_null(out),
     }
     0
 }

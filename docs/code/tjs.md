@@ -87,7 +87,7 @@ the Rust side — no bindgen.
 | storage | `tjs2_set_storage_read_callback` — the process-wide read hook the text and binary stream factories use |
 | text decode | `tjs2_set_text_decode_callback` — the process-wide hook that decodes a BOM-less text payload into UTF-16 code units |
 | natives | `tjs2_register_native_class`, `…_class_ex`, `…_class_instance`, `…_native_static_members`, `…_native_instance_members` |
-| values | `tjs2_retain_value`, `tjs2_release_value`, `tjs2_invalidate_retained`, `tjs2_retain_object`, `tjs2_retain_retained_id`, `tjs2_find_retained_id` |
+| values | `tjs2_retain_value`, `tjs2_release_value`, `tjs2_invalidate_retained`, `tjs2_retain_object`, `tjs2_retain_retained_id`, `tjs2_find_retained_id`, `tjs2_get_global` |
 | members | `tjs2_prop_get`, `tjs2_prop_set`, `tjs2_prop_delete`, `tjs2_prop_set_default`, `tjs2_call_value`, `tjs2_call_value_with_objthis`, `tjs2_call_member`, `tjs2_set_arg`, `tjs2_result_needed` |
 | containers | `tjs2_new_array`, `tjs2_new_dictionary`, `tjs2_array_add` — the VM's own array and dictionary classes, and the array's `add` |
 | introspection | `tjs2_get_class_names`, `tjs2_enum_members`, `tjs2_set_call_missing`, `tjs2_get_native_instance`, `tjs2_get_stack_trace_string`, `tjs2_dump`, `tjs2_do_gc` |
@@ -118,6 +118,9 @@ impl Tjs2Engine {
     pub fn new_dictionary(&self) -> Result<DetachedValue, String>;
     pub fn array_add(&self, id: Tjs2ValueId, value: &TjsValue) -> Result<(), String>;
     pub fn array_add_octet(&self, id: Tjs2ValueId, bytes: &[u8]) -> Result<(), String>;
+    pub fn retain_null(&self) -> Result<DetachedValue, String>;
+    pub fn global_object(&self) -> Result<DetachedValue, String>;
+    pub fn script_evaluation_count(&self) -> u64;
     // … retained values, member access, bytecode, GC, introspection
 }
 ```
@@ -127,6 +130,14 @@ take: a **static** class member, a **per-instance** member with a native
 payload, a **static** member attached to a class that already exists, and
 an **objthis-only** member attached to an existing class (including a TJS2
 builtin such as `Array` or `Dictionary`).
+
+`retain_null` and `global_object` hand out values the VM already holds: TJS
+`null` (an object value with no object pointer) and the global object the
+`global` keyword names. A native that needs one of them reads it from the
+engine instead of compiling a script to evaluate `null` or `global` — a
+named evaluation compiles a fresh script block on every call, an unnamed one
+runs the cached block. `script_evaluation_count` counts the scripts the host
+pushed into the VM, so a test can see that a native reached for neither.
 
 The surface is deliberately narrow. An entry point that no caller outside
 the crate uses is private to it: the context-carrying variants of the
@@ -222,7 +233,7 @@ than only the raw message.
 
 ## 8. Tests
 
-The crate carries **81 unit tests** inside `src/lib.rs` and **10 integration
+The crate carries **85 unit tests** inside `src/lib.rs` and **16 integration
 test files** under `crates/tjs/tests/`.
 
 The unit tests cover the engine lifecycle, the value marshalling, the
@@ -235,7 +246,10 @@ semantics (a retained function called across calls, a released value, the
 engine's retained count, a discarded result that does not pin its object),
 the static and objthis member shapes, the `compileScript` and bytecode
 paths, the GC, the class-name and member enumeration, and the stream
-fixtures.
+fixtures. Three of them cover the values the VM already holds: the retained
+null is the script's `null` (and not `void`), the retained global object is
+the object the `global` keyword names, and neither costs a script
+evaluation.
 
 The integration tests pin the areas that needed their own file: member
 deletion and its absent-member status, identifier resolution inside a

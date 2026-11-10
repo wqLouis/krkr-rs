@@ -7,6 +7,11 @@ it recognises the KiriKiri `FE FE` container, byte-order marks, an explicit
 `Scripts.textEncoding` override, and — failing all of those — detects the
 charset.
 
+Every path produces **UTF-16 code units**, the form the VM takes a script
+in. The charset decoders write those code units straight out of the input
+bytes, so a script's text is materialised once on the way to the VM and never
+round-trips through UTF-8.
+
 The TJS native text streams (`crates/tjs/cpp/streams.cpp`) use the same
 handling: the stream layer owns the `FE FE` container and the
 byte-order-mark branches, and it asks this module for the charset of a
@@ -19,10 +24,17 @@ BOM-less payload (the text decode seam, [`binding.md`](binding.md) §4).
 | Function | Returns |
 |---|---|
 | `decode_text(bytes, encoding) -> Result<String, String>` | the decoded UTF-8 text |
-| `decode_text_units(bytes, encoding) -> Result<Vec<u16>, String>` | the raw UTF-16 code units |
-| `decode_text_reported(bytes, encoding) -> Result<DecodedText, String>` | the text plus a label naming the path that produced it |
+| `decode_units(bytes, encoding) -> Result<DecodedText, String>` | the decoded UTF-16 code units, plus the encoding decision that produced them |
 
-`decode_text_units` exists because a Rust `String` cannot hold an unpaired
+`DecodedText` carries three things:
+
+| Member | Meaning |
+|---|---|
+| `units` | the UTF-16 code units, the payload the VM takes a script in |
+| `encoding_label()` | a short label naming the path that produced them (§6) |
+| `text()` | the lossy UTF-8 view: a code unit that is not a character is dropped and reported |
+
+`decode_units` exists because a Rust `String` cannot hold an unpaired
 surrogate, while an `FE FE` container decrypts to code units that may contain
 one. The script loader decodes through this function and hands the VM the
 code units instead of a lossy UTF-8 string.
@@ -77,7 +89,8 @@ The payload starts at **offset 5** and is read as little-endian code units.
 | 1 | the adjacent-bit swap |
 
 The units are kept raw. The lossy string view is applied only by
-`decode_text`, so the script loader can preserve an unpaired surrogate.
+`DecodedText::text`, so the script loader can preserve an unpaired
+surrogate.
 
 ### Mode 2 — zlib
 
@@ -120,11 +133,12 @@ BOM-less KAG scenario (mostly ASCII with a few CP932 double-byte characters)
 as Latin-x and mangle every non-ASCII storage name. The port therefore tries
 CP932 first whenever the decision is single-byte:
 
-* `cp932_japanese_text` decodes **strictly** — any malformed sequence rejects
-  the bytes, so a genuine Latin-1 payload keeps the Latin-1 mapping — and the
-  result is accepted only when it contains a kana or a CJK ideograph, which
-  only a CP932 double-byte sequence produces. The single-byte half-width
-  katakana a Latin-1 payload can produce are deliberately *not* a signal.
+* `cp932_japanese_units` decodes **strictly** — any malformed sequence
+  rejects the bytes, so a genuine Latin-1 payload keeps the Latin-1 mapping —
+  and the result is accepted only when it contains a kana or a CJK ideograph,
+  which only a CP932 double-byte sequence produces. The single-byte
+  half-width katakana a Latin-1 payload can produce are deliberately *not* a
+  signal.
 * A reported `SHIFT_JIS` decodes as `cp932` (`encoding_rs`'s WHATWG
   Shift_JIS is already Windows-31J), so the reported encoding is used as-is.
 * A genuine `WINDOWS-1252` payload keeps the Latin-1 mapping; the label for
@@ -141,7 +155,7 @@ single pass over the input, and the drop is reported rather than silently
 applied.
 
 The only **typed error** from a decode is an unsupported explicit
-`Scripts.textEncoding` name, and the size overflow of the worst-case UTF-8
+`Scripts.textEncoding` name, and the size overflow of the worst-case UTF-16
 length (`"{encoding}: input is too large to decode"`).
 
 An `FE FE` payload's unpaired surrogate is dropped with one warning when the
@@ -151,8 +165,8 @@ lossy string view is taken; the code-unit view keeps it.
 
 ## 6. The reported path
 
-`decode_text_reported` returns the text plus a short label naming the path
-that produced it:
+`DecodedText::encoding_label()` returns a short label naming the path that
+produced the code units:
 
 | Label | Path |
 |---|---|
@@ -162,8 +176,10 @@ that produced it:
 | `"detected {name}"` | the detector's decision |
 | `"detected WINDOWS-1252->latin1"` | the single-byte Latin-1 special case |
 
-The label is used for the drop diagnostics, so a log line names the encoding
-that was actually used.
+The label is used for the drop diagnostics and for the script-read log
+line, so a log names the encoding that was actually used. The label is
+formatted only when a caller asks for it: the decision itself is carried as a
+copyable value, so the common decode path never builds the string.
 
 ---
 
@@ -171,8 +187,8 @@ that was actually used.
 
 | Caller | How |
 |---|---|
-| `Scripts.execStorage` / `evalStorage` | the storage bytes are offered to the TJS2 **bytecode loader first**; only when the loader reports the input is not bytecode is it decoded as text |
-| `Scripts.compileStorage` | the same order |
+| `Scripts.execStorage` / `evalStorage` | the storage bytes are offered to the TJS2 **bytecode loader first**; only when the loader reports the input is not bytecode is it decoded as text — once, into the code units the VM receives |
+| `Scripts.compileStorage` | the same order, then the lossy text view |
 | the plugin text paths | `TextEncoding::Named` for a plugin that names a fixed encoding |
 | the TJS text read stream (`Array.load`) | the stream layer keeps the container and the byte-order-mark branches; a BOM-less payload is decoded here, through the text decode seam ([`binding.md`](binding.md) §4) |
 
@@ -212,11 +228,15 @@ loader as well.
 | `detected_script_with_a_malformed_byte_is_dropped` | a malformed byte in detected text |
 | `override_cp932_drops_malformed_bytes` / `override_utf8_drops_malformed_bytes` | the same through an override |
 | `utf32_bom_drops_invalid_scalars` | an invalid UTF-32 scalar |
+| `a_charset_decode_yields_the_text_code_units` | a charset decode produces the UTF-16 form of the same text |
+| `utf32_bom_yields_the_text_code_units` | the same for a UTF-32 payload |
+| `utf32_bom_keeps_an_astral_character` | an astral character reaches the VM as its surrogate pair |
 | `reported_decoding_names_the_encoding_path` | the label table |
 | `unsupported_charset_name_raises_a_typed_error` | only an unsupported *explicit* name is an error |
 | `crates/compat/tests/scripts.rs` | the loader order: bytecode first, then text; a corrupt script is a typed error |
 | `crates/compat/tests/streams.rs::array_load_decodes_a_shift_jis_storage_member` | the text read stream decodes a BOM-less Shift-JIS member as Japanese |
 | `crates/compat/tests/streams.rs::array_load_decodes_a_utf8_storage_member` | a BOM-less UTF-8 member still decodes as UTF-8 |
+| `crates/compat/tests/text.rs` | a script in each supported encoding, decoded and executed: the UTF-8/UTF-16/UTF-32 byte-order marks, a BOM-less UTF-8 script, the detected GBK/Big5/EUC-KR/CP932 charsets, the Latin-1 override and the three `FE FE` container modes |
 
 ---
 

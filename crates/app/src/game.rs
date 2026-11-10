@@ -975,10 +975,17 @@ impl GameHost {
         // face.
         vm.compat()
             .set_system_font_dirs(platform::system_font_dirs());
-        // The host's faces are installed before any script runs, so the
-        // engine's two font roles are filled before a script can ask for a
-        // face.
-        install_host_faces(host.engine_mut().text_mut());
+        // The host's two font roles are selected, not installed: the text
+        // service resolves them on its first use, so a game that asks about
+        // no font never scans the host's faces.
+        host.engine_mut().text_mut().set_host_faces(
+            platform::default_font_families()
+                .iter()
+                .copied()
+                .map(str::to_string)
+                .collect(),
+            engine::text::DEFAULT_COVERAGE_CODEPOINT,
+        );
         // SAFETY: `storage` is declared after `vm` in the returned struct, so
         // it outlives the compat host that holds the installed source.
         unsafe { crate::install_video_source_metered(vm.compat(), &media, &storage, &stats) }
@@ -1204,43 +1211,6 @@ impl GameHost {
         log::debug!("{}", self.last_frame.slow_frame_detail(gap_ms, pacing));
         self.reporting.charge(started.elapsed());
     }
-}
-
-/// Installs the host's faces on the text service.
-///
-/// The two roles the engine keeps are filled here:
-///
-/// * the **default face** is the oldest registered face, so it supplies the
-///   metrics of a face name that resolves to nothing. The host's own default
-///   user-interface font is installed there, before any script runs.
-/// * the **coverage face** is the face the per-character fallback reaches
-///   for: it draws a character the requested face does not carry. The first
-///   installed face that carries a Japanese ideograph fills the role.
-///
-/// A host that provides neither font keeps the faces it has: the missing
-/// role is reported in the log and the engine falls back to the face it
-/// holds.
-fn install_host_faces(text: &mut engine::text::TextEngine) {
-    if let Err(error) = text.install_default_face(platform::default_font_families()) {
-        log::warn!("system fonts: no installed face provides the host's default font: {error}");
-    }
-    if let Err(error) = text.install_coverage_face('\u{4E00}') {
-        log::warn!("system fonts: no installed face provides a CJK glyph: {error}");
-    }
-    // The two roles are named so the host log says which face fills which
-    // role: a host with no coverage face draws every character its default
-    // face lacks with an error, and the log is where that shows.
-    let default_name = match text.default_face() {
-        Some(id) => text.family_name(id).unwrap_or("none"),
-        None => "none",
-    };
-    let coverage_name = match text.registry().designated_coverage_face() {
-        Some(id) => text.family_name(id).unwrap_or("none"),
-        None => "none",
-    };
-    log::info!(
-        "system fonts: the default face is {default_name}, the coverage face is {coverage_name}"
-    );
 }
 
 /// Logs the start-up phase aggregates once, at `info`.
@@ -2463,23 +2433,34 @@ mod tests {
     /// name that resolves to nothing, and the coverage face carries a
     /// Japanese ideograph and draws the characters the requested face lacks.
     ///
+    /// The roles are selected, not installed: the text service resolves them
+    /// on its first use, so the faces are there when the engine is asked for
+    /// them.
+    ///
     /// A host that provides no face with a Japanese ideograph has no coverage
-    /// face to install, and a host that provides none of its default font
-    /// families has no default face to install; the test stops in either
+    /// face to resolve, and a host that provides none of its default font
+    /// families has no default face to resolve; the test stops in either
     /// case.
     #[test]
-    fn the_host_installs_the_default_font_and_the_coverage_face() {
+    fn the_host_resolves_the_default_font_and_the_coverage_face() {
         let mut text = engine::text::TextEngine::new();
-        install_host_faces(&mut text);
+        text.set_host_faces(
+            platform::default_font_families()
+                .iter()
+                .copied()
+                .map(str::to_string)
+                .collect(),
+            engine::text::DEFAULT_COVERAGE_CODEPOINT,
+        );
         let coverage = text
             .coverage_face()
-            .expect("the host installed a coverage face");
+            .expect("the host resolved a coverage face");
         if !text.has_glyph(coverage, '\u{4E00}') {
             return;
         }
         let default = text
             .default_face()
-            .expect("the host installed a default face");
+            .expect("the host resolved a default face");
         let expected = platform::default_font_families()
             .iter()
             .filter_map(|family| text.load_system_font(family).ok())

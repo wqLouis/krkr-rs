@@ -107,14 +107,33 @@ bitmaps and fonts are released with them.
 ### Bitmaps
 
 `add_bitmap`, `bitmap`, `bitmap_mut`, `bitmap_mut_with_source`,
-`bitmap_mut_with_refs`, `resize_bitmap`, `replace_bitmap_image`,
-`remove_bitmap`, `release_bitmap`, `release_script_bitmap`,
-`collect_unused_bitmaps`, `bitmap_referenced_by_layer`, `set_bitmap_clean`.
+`bitmap_mut_with_refs`, `with_two_bitmaps`, `resize_bitmap`,
+`replace_bitmap_image`, `remove_bitmap`, `release_bitmap`,
+`release_script_bitmap`, `collect_unused_bitmaps`, `bitmap_referenced_by_layer`,
+`set_bitmap_clean`, `mark_bitmap_whole`, `dirty_bitmaps_for_upload`,
+`take_removed_bitmaps`.
+
+### The dirty set
+
+The scene keeps the bitmaps whose pixels may have changed, so the frame never
+walks the bitmap table to find the work:
+
+| method | what it does |
+|---|---|
+| `dirty_bitmaps_for_upload()` | the bitmaps whose pixels changed since the last upload, in id order. The set holds every bitmap the scene handed out for mutation — a mutable access is a possible content change — and the ones whose pixels did not change leave it here. |
+| `take_removed_bitmaps()` | the bitmaps removed since the last prune, in id order; the set is empty afterwards. The engine drops the texture of each of them. |
+
+A bitmap joins the set when the scene hands it out for mutation
+(`bitmap_mut`, `bitmap_mut_untracked`, `bitmap_mut_with_source`,
+`bitmap_mut_with_refs`, `with_two_bitmaps`), when it is created, and when its
+decode is installed. It leaves the set when it is uploaded
+(`set_bitmap_clean`) or removed.
 
 ### The pending image
 
 A bitmap whose pixels are still being decoded carries the decode future in
-`BitmapState::pending`.
+`BitmapState::pending`; the scene keeps the set of the bitmaps that carry one,
+so the frame waits for those and not for the whole table.
 
 | method | what it does |
 |---|---|
@@ -124,6 +143,7 @@ A bitmap whose pixels are still being decoded carries the decode future in
 | `pending_decode_for(key)` | the decode already running for the key: the probed size and a clone of the shared future, or `None` when neither a bitmap nor a pre-load carries that decode. |
 | `resolve_bitmap(id)` | waits for one bitmap's pending image and installs its pixels; a successful decode is also stored in the decoded-image cache under the key the load named. |
 | `resolve_pending_images()` | waits for every pending image and installs the pixels, and takes the landed pre-loads into the decoded-image cache; returns how many bitmaps it resolved. |
+| `has_pending_images()` | whether any bitmap waits for a decode. |
 
 `resolve_bitmap` **waits on that image alone**, never on the pool. It marks
 the image *demanded* first, so a worker takes it before the ordinary jobs in
@@ -238,6 +258,11 @@ the entry's recency — a pre-load that touches the graphics it already holds
   load that queued the decode already returned, so there is no call to fail.
 * **`set_bitmap_clean` does not move the structure revision.** Clearing a
   renderer-internal dirty flag is not a scene change.
+* **The frame never walks the bitmap table.** The scene keeps the bitmaps
+  whose pixels may have changed, the bitmaps that wait for a decode and the
+  bitmaps that were removed; the upload pass, the image barrier and the
+  texture prune read those sets, so their cost follows the work of the frame
+  and not the size of the scene.
 * **The decoded-image cache is disabled by default**, matching the reference's
   default (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1433-1434`). The
   limit counts decoded bytes (`Width × Height × PixelSize`,

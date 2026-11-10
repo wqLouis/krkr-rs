@@ -692,6 +692,7 @@ Code map: [`../code/engine/video.md`](../code/engine/video.md).
 | `TextEngine` | the font registry, the shaping system, the layout memo, the per-character advance memo and the missing-family memo |
 | `FontRegistry` / `FontFace` | the registered faces, the names they answer to, the default face and the coverage face |
 | `FontId` | the identity of a registered face |
+| `DEFAULT_COVERAGE_CODEPOINT` | the character the host's coverage face has to carry |
 | `TextStyle` / `TextLayout` / `LaidOutGlyph` | the style, the laid-out text and its positioned glyphs |
 | `CoverageMask` | a rasterized character mask; its length always equals `width * height` |
 | `TextCoverageCache` | the cached character masks and their blurred shadows |
@@ -700,12 +701,13 @@ Code map: [`../code/engine/video.md`](../code/engine/video.md).
 | `GlyphBackend` | the backend selector a run is rasterized for; it belongs to the shared DTO crate (`api::glyph`), and the text module takes it as it is |
 | `TextError` | the text engine's failures |
 
-The engine's operations: `new`, `set_system_font_dirs`, `add_font`,
-`font_id`, `alias`, `registry`, `default_face`, `coverage_face`,
-`designate_coverage_face`, `load_system_font`, `install_default_face`,
-`install_coverage_face`, `face`, `family_name`, `has_glyph`, `provider_for`,
-`measure_code_unit`, `font_metrics`, `layout`, `cached_layouts`,
-`rasterize_glyph`, `glyph_advance`, `glyph_draw_rect`.
+The engine's operations: `new`, `set_system_font_dirs`, `set_host_faces`,
+`add_font`, `font_id`, `alias`, `registry`, `default_face`, `coverage_face`,
+`default_face_name`, `registered_face_names`, `designate_coverage_face`,
+`load_system_font`, `install_coverage_face`, `face`, `family_name`,
+`has_glyph`, `provider_for`, `measure_code_unit`, `font_metrics`, `layout`,
+`cached_layouts`, `system_database_builds`, `rasterize_glyph`,
+`glyph_advance`, `glyph_draw_rect`.
 
 The registry's operations: `new`, `register`, `alias`, `by_name`, `face`,
 `names`, `list_names`, `default_name`, `default_face`,

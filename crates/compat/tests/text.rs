@@ -119,11 +119,30 @@ impl Env {
     }
 }
 
+/// Encode `text` with `encoding`.
+fn encoded(encoding: &'static encoding_rs::Encoding, text: &str) -> Vec<u8> {
+    let (bytes, _, had_errors) = encoding.encode(text);
+    assert!(!had_errors, "{} cannot encode {text:?}", encoding.name());
+    bytes.into_owned()
+}
+
 /// Encode `text` as CP932 (Windows-31J).
 fn cp932(text: &str) -> Vec<u8> {
-    let (bytes, _, had_errors) = encoding_rs::SHIFT_JIS.encode(text);
-    assert!(!had_errors, "CP932 cannot encode {text:?}");
-    bytes.into_owned()
+    encoded(encoding_rs::SHIFT_JIS, text)
+}
+
+/// Encode `text` as UTF-32 with the given byte order.
+fn utf32(text: &str, big_endian: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    for ch in text.chars() {
+        let code = ch as u32;
+        if big_endian {
+            out.extend_from_slice(&code.to_be_bytes());
+        } else {
+            out.extend_from_slice(&code.to_le_bytes());
+        }
+    }
+    out
 }
 
 /// Encrypt `text` as an `FE FE 00` legacy XOR container (writer side): the
@@ -177,6 +196,25 @@ fn probe_script() -> &'static str {
 /// only used on the BOM/container/override paths, which do not run detection.
 fn detectable_japanese_script() -> &'static str {
     "// これは日本語のスクリプトです。文字コードの判定を確かめるためのテストです。\nreturn \"日本語のテストに成功しました\";"
+}
+
+/// The text the Chinese script carries: long enough for charset detection to
+/// report GBK.
+const GBK_TEXT: &str = "这是一个用于测试文字编码检测的中文脚本。程序需要在没有字节顺序标记的时候，正确认出这是中文编码，并把它变成统一文字。";
+
+/// The text the Traditional Chinese script carries: long enough for charset
+/// detection to report Big5.
+const BIG5_TEXT: &str = "這是一個用於測試文字編碼檢測的中文腳本。程式需要在沒有位元組順序標記的時候，正確辨認這是中文編碼，並把它變成統一文字。";
+
+/// The text the Korean script carries: long enough for charset detection to
+/// report EUC-KR.
+const EUC_KR_TEXT: &str = "이것은 문자 인코딩 감지를 테스트하기 위한 한국어 스크립트입니다. 프로그램은 바이트 순서 표시가 없어도 올바른 한국어 인코딩을 인식하고 텍스트로 바꾸어야 합니다.";
+
+/// A script that carries `text` twice -- once in a comment and once as the
+/// value it returns -- so the charset detector sees the same distribution the
+/// fixture text has.
+fn detectable_script(text: &str) -> String {
+    format!("// {text}\nreturn \"{text}\";")
 }
 
 #[test]
@@ -275,6 +313,102 @@ fn utf8_and_utf16_boms_are_decoded() {
             "{name}"
         );
     }
+}
+
+/// A UTF-32 byte-order mark selects the UTF-32 decoder, and the script runs
+/// with the same text the other encodings carry.
+///
+/// reference/cpp/core/base/TextStream.cpp:24-45 — a BOM selects the decoder
+/// before detection runs; :174-180 — the UTF-32 branch converts to UTF-16.
+#[test]
+fn utf32_boms_are_decoded() {
+    let _lock = vm_lock();
+    let dir = GameDir::new();
+
+    let mut little_endian = vec![0xFF, 0xFE, 0x00, 0x00];
+    little_endian.extend(utf32(probe_script(), false));
+    dir.write("utf32le.tjs", &little_endian);
+
+    let mut big_endian = vec![0x00, 0x00, 0xFE, 0xFF];
+    big_endian.extend(utf32(probe_script(), true));
+    dir.write("utf32be.tjs", &big_endian);
+
+    let env = Env::new(dir);
+    for name in ["utf32le.tjs", "utf32be.tjs"] {
+        assert_eq!(
+            env.eval_ok(&format!("Scripts.execStorage('{name}')")),
+            TjsValue::String("日本語 OK".into()),
+            "{name}"
+        );
+    }
+}
+
+/// A UTF-8 script without a byte-order mark is detected as UTF-8 and runs
+/// with its text.
+///
+/// reference/cpp/core/base/TextStream.cpp:47-57 — BOM-less text is decoded
+/// from the charset the detector reports.
+#[test]
+fn bomless_utf8_script_is_detected_and_decoded() {
+    let _lock = vm_lock();
+    let dir = GameDir::new();
+    dir.write("utf8.tjs", "return \"世界 OK\";".as_bytes());
+    let env = Env::new(dir);
+    assert_eq!(
+        env.eval_ok("Scripts.execStorage('utf8.tjs')"),
+        TjsValue::String("世界 OK".into())
+    );
+}
+
+/// The legacy East-Asian charsets are detected from the bytes and the script
+/// runs with the text the charset carries.
+///
+/// reference/cpp/core/base/TextStream.cpp:47-57 — BOM-less text is decoded
+/// from the charset the detector reports; :53 — a reported `SHIFT_JIS` maps
+/// to `cp932`.
+#[test]
+fn detected_legacy_charsets_are_decoded() {
+    let _lock = vm_lock();
+    let dir = GameDir::new();
+    for (name, encoding, text) in [
+        ("gbk.tjs", encoding_rs::GBK, GBK_TEXT),
+        ("big5.tjs", encoding_rs::BIG5, BIG5_TEXT),
+        ("euckr.tjs", encoding_rs::EUC_KR, EUC_KR_TEXT),
+    ] {
+        dir.write(name, &encoded(encoding, &detectable_script(text)));
+    }
+    let env = Env::new(dir);
+    for (name, text) in [
+        ("gbk.tjs", GBK_TEXT),
+        ("big5.tjs", BIG5_TEXT),
+        ("euckr.tjs", EUC_KR_TEXT),
+    ] {
+        assert_eq!(
+            env.eval_ok(&format!("Scripts.execStorage('{name}')")),
+            TjsValue::String(text.into()),
+            "{name}"
+        );
+    }
+}
+
+/// The Latin-1 decoder maps every byte to one code point, so the script runs
+/// with the text the bytes carry.
+///
+/// reference/cpp/core/base/TextStream.cpp:418-430 — the `Scripts.textEncoding`
+/// spellings; :143-145 — the `ASCII` branch copies the bytes as code points.
+#[test]
+fn latin1_payload_is_decoded_through_the_override() {
+    let _lock = vm_lock();
+    let dir = GameDir::new();
+    let (bytes, _, had_errors) = encoding_rs::WINDOWS_1252.encode("return \"café résumé\";");
+    assert!(!had_errors, "windows-1252 can encode the fixture");
+    dir.write("latin1.tjs", &bytes);
+    let env = Env::new(dir);
+    env.eval_ok("Scripts.textEncoding = 'latin1'");
+    assert_eq!(
+        env.eval_ok("Scripts.execStorage('latin1.tjs')"),
+        TjsValue::String("café résumé".into())
+    );
 }
 
 #[test]

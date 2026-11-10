@@ -875,7 +875,7 @@ fn an_unresolvable_face_name_draws_at_the_default_faces_ascent() {
         std::iter::empty::<&str>(),
     )
     .expect("mount the game dir");
-    let env = Env::new(Some(storage));
+    let mut env = Env::new(Some(storage));
 
     // The mounted face is registered first, so it is the default face.
     env.run("var mounted = new Font('gamefont.ttf', 12, 0xffffffff);");

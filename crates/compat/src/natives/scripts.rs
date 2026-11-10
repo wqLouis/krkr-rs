@@ -25,12 +25,13 @@
 //! the loader reports it is not bytecode, which is the reference
 //! `TVPExecuteStorage` order
 //! (`reference/cpp/core/base/ScriptMgnIntf.cpp:713-760`). Script decoding
-//! goes through [`crate::text::decode_text`], which handles the `FE FE`
+//! goes through [`crate::text::decode_units`], which handles the `FE FE`
 //! cipher / zlib container, a UTF-8/UTF-16 BOM, an explicit `textEncoding`
-//! override, then UTF-8 and CP932. An undecodable script raises a typed error
-//! instead of producing mojibake. The `context` argument is the script's
-//! `this`, and `lineofs` the reported line-number offset, both forwarded to
-//! the VM.
+//! override, then UTF-8 and CP932. The decode produces the UTF-16 code units
+//! the VM takes a script in, so the script's text is materialised once. An
+//! undecodable script raises a typed error instead of producing mojibake. The
+//! `context` argument is the script's `this`, and `lineofs` the reported
+//! line-number offset, both forwarded to the VM.
 //!
 //! A bytecode storage carries **one** script. The loader reads a single
 //! block per file and executes that block; the file's data area holds the
@@ -289,21 +290,14 @@ fn configured_encoding(services: &CompatServices) -> Option<String> {
         .filter(|encoding| !encoding.is_empty())
 }
 
-/// Log one line describing a script read so a device log can identify the
-/// raw bytes without dumping the script: the storage name, the byte length,
-/// the first 32 bytes in hex, the encoding decision, the number of NUL bytes
-/// in the raw input, and whether the decoded text contains a NUL.
-fn log_script_read(name: &str, bytes: &[u8], encoding: Option<&str>, text: Option<&str>) {
-    let head = bytes
-        .iter()
-        .take(32)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let nul_bytes = bytes.iter().filter(|&&byte| byte == 0).count();
-    let decoded_has_nul = text.is_some_and(|text| text.contains('\0'));
+/// Log one line naming the script that was read.
+///
+/// The script manager names the script it loads and never logs the script's
+/// text; this line carries the storage name, the byte length and the encoding
+/// decision, so a device log identifies the payload without copying it.
+fn log_script_read(name: &str, bytes: &[u8], encoding: Option<&str>) {
     log::debug!(
-        "script read '{name}' bytes={} head32=[{head}] encoding={} nul_bytes={nul_bytes} decoded_has_nul={decoded_has_nul}",
+        "script read '{name}' bytes={} encoding={}",
         bytes.len(),
         encoding.unwrap_or("decode-error"),
     );
@@ -325,28 +319,37 @@ fn read_storage_bytes(storage: &Storage, name: &str, mode: &str) -> Result<Vec<u
     })
 }
 
-/// Decode `bytes` as text and log the `script read` diagnostic (the byte
-/// signature is only materialised when debug logging is on).
-fn decode_storage_text(name: &str, bytes: &[u8], encoding: Option<&str>) -> Result<String, String> {
+/// Decode `bytes` for a script read and log the `script read` diagnostic.
+///
+/// The decode runs once: the code units it produces are the payload the VM
+/// receives, and the diagnostic names the script and its encoding decision
+/// without decoding the text a second time.
+fn decode_storage_script<'a>(
+    name: &str,
+    bytes: &[u8],
+    encoding: Option<&'a str>,
+) -> Result<crate::text::DecodedText<'a>, String> {
     let encoding = encoding.map_or(crate::text::TextEncoding::Detect, |name| {
         crate::text::TextEncoding::Named(name)
     });
-    let decoded = if log::log_enabled!(log::Level::Debug) {
-        let reported = crate::text::decode_text_reported(bytes, encoding);
-        match &reported {
-            Ok(decoded) => log_script_read(
-                name,
-                bytes,
-                Some(decoded.encoding.as_str()),
-                Some(decoded.text.as_str()),
-            ),
-            Err(_) => log_script_read(name, bytes, None, None),
+    let decoded = match crate::text::decode_units(bytes, encoding) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            if log::log_enabled!(log::Level::Debug) {
+                log_script_read(name, bytes, None);
+            }
+            return Err(format!("Scripts: '{name}': {error}"));
         }
-        reported.map(|decoded| decoded.text)
-    } else {
-        crate::text::decode_text(bytes, encoding)
     };
-    decoded.map_err(|error| format!("Scripts: '{name}': {error}"))
+    if log::log_enabled!(log::Level::Debug) {
+        log_script_read(name, bytes, Some(&decoded.encoding_label()));
+    }
+    Ok(decoded)
+}
+
+/// Decode `bytes` as text.
+fn decode_storage_text(name: &str, bytes: &[u8], encoding: Option<&str>) -> Result<String, String> {
+    decode_storage_script(name, bytes, encoding).map(|decoded| decoded.text())
 }
 
 /// Decode `bytes` to UTF-16 code units for execution, preserving every code
@@ -359,25 +362,7 @@ fn decode_storage_units(
     bytes: &[u8],
     encoding: Option<&str>,
 ) -> Result<Vec<u16>, String> {
-    let encoding = encoding.map_or(crate::text::TextEncoding::Detect, |name| {
-        crate::text::TextEncoding::Named(name)
-    });
-    if log::log_enabled!(log::Level::Debug) {
-        // The diagnostic names the encoding decision and shows a lossy view of
-        // the text; the units below are the exact payload handed to the VM.
-        let reported = crate::text::decode_text_reported(bytes, encoding);
-        match &reported {
-            Ok(decoded) => log_script_read(
-                name,
-                bytes,
-                Some(decoded.encoding.as_str()),
-                Some(decoded.text.as_str()),
-            ),
-            Err(_) => log_script_read(name, bytes, None, None),
-        }
-    }
-    crate::text::decode_text_units(bytes, encoding)
-        .map_err(|error| format!("Scripts: '{name}': {error}"))
+    decode_storage_script(name, bytes, encoding).map(|decoded| decoded.units)
 }
 
 /// Maximum number of source bytes a failure diagnostic prints.
@@ -605,14 +590,14 @@ fn execute_storage(
     match engine.load_bytecode(&bytes, block_name, context) {
         Ok(Some(result)) => {
             if log::log_enabled!(log::Level::Debug) {
-                log_script_read(name, &bytes, Some("precompiled bytecode"), None);
+                log_script_read(name, &bytes, Some("precompiled bytecode"));
             }
             return Ok(result);
         }
         Ok(None) => {}
         Err(error) => {
             if log::log_enabled!(log::Level::Debug) {
-                log_script_read(name, &bytes, Some("precompiled bytecode"), None);
+                log_script_read(name, &bytes, Some("precompiled bytecode"));
             }
             let error = error.to_string();
             log_bytecode_failure(name, &error);

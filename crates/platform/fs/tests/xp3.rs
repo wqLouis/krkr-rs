@@ -4,11 +4,12 @@
 //! `engine/src/archive/xp3.rs`; the parser now lives in L1 `fs`.
 
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
 
 use api::error::FsError;
 use api::fs::{FsPath, OpenMode};
 use fs::xp3::{
-    IndexEncode, SEGM_ENCODE_RAW, XP3_MAGIC, Xp3Archive, Xp3Error, normalize_in_archive_name,
+    Entry, IndexEncode, SEGM_ENCODE_RAW, XP3_MAGIC, Xp3Archive, Xp3Error, normalize_in_archive_name,
 };
 use fs::{FileState, FileSystem};
 use testkit::{build_xp3, build_xp3_compressed_index};
@@ -882,60 +883,168 @@ fn extraction_filter_offset_advances_across_segments() {
 // the whole-entry read.
 // ---------------------------------------------------------------------------
 
-/// Build a raw-index XP3 archive holding one entry made of several raw
-/// segments, so a read must concatenate them in order. Layout mirrors
-/// `testkit::build_xp3`; the index is stored raw.
-fn build_xp3_raw_segments(name: &str, segments: &[&[u8]]) -> Vec<u8> {
+/// Build a raw-index XP3 archive holding several entries, each made of
+/// several raw segments, so a read must concatenate an entry's segments in
+/// order. Layout mirrors `testkit::build_xp3`; the index is stored raw.
+fn build_xp3_raw_segment_entries(entries: &[(&str, &[&[u8]])]) -> Vec<u8> {
     let mut file = Vec::new();
     file.extend_from_slice(&XP3_MAGIC);
     file.extend_from_slice(&0u64.to_le_bytes());
 
-    let mut segm = Vec::new();
-    let mut org_size = 0u64;
-    let mut arc_size = 0u64;
-    for data in segments {
-        let start = file.len() as u64;
-        file.extend_from_slice(data);
-        segm.extend_from_slice(&SEGM_ENCODE_RAW.to_le_bytes());
-        segm.extend_from_slice(&start.to_le_bytes());
-        segm.extend_from_slice(&(data.len() as u64).to_le_bytes());
-        segm.extend_from_slice(&(data.len() as u64).to_le_bytes());
-        org_size += data.len() as u64;
-        arc_size += data.len() as u64;
+    let mut chunks = Vec::new();
+    for (name, segments) in entries {
+        let mut segm = Vec::new();
+        let mut org_size = 0u64;
+        let mut arc_size = 0u64;
+        for data in segments.iter() {
+            let start = file.len() as u64;
+            file.extend_from_slice(data);
+            segm.extend_from_slice(&SEGM_ENCODE_RAW.to_le_bytes());
+            segm.extend_from_slice(&start.to_le_bytes());
+            segm.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            segm.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            org_size += data.len() as u64;
+            arc_size += data.len() as u64;
+        }
+
+        let units: Vec<u16> = name.encode_utf16().collect();
+        let mut info = Vec::new();
+        info.extend_from_slice(&0u32.to_le_bytes());
+        info.extend_from_slice(&org_size.to_le_bytes());
+        info.extend_from_slice(&arc_size.to_le_bytes());
+        info.extend_from_slice(&(units.len() as i16).to_le_bytes());
+        for unit in &units {
+            info.extend_from_slice(&unit.to_le_bytes());
+        }
+
+        let mut body = Vec::new();
+        body.extend_from_slice(b"info");
+        body.extend_from_slice(&(info.len() as u64).to_le_bytes());
+        body.extend_from_slice(&info);
+        body.extend_from_slice(b"segm");
+        body.extend_from_slice(&(segm.len() as u64).to_le_bytes());
+        body.extend_from_slice(&segm);
+        body.extend_from_slice(b"adlr");
+        body.extend_from_slice(&4u64.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(b"File");
+        chunk.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        chunk.extend_from_slice(&body);
+        chunks.push(chunk);
     }
 
-    let units: Vec<u16> = name.encode_utf16().collect();
-    let mut info = Vec::new();
-    info.extend_from_slice(&0u32.to_le_bytes());
-    info.extend_from_slice(&org_size.to_le_bytes());
-    info.extend_from_slice(&arc_size.to_le_bytes());
-    info.extend_from_slice(&(units.len() as i16).to_le_bytes());
-    for unit in &units {
-        info.extend_from_slice(&unit.to_le_bytes());
+    let mut index = Vec::new();
+    for chunk in &chunks {
+        index.extend_from_slice(chunk);
     }
-
-    let mut body = Vec::new();
-    body.extend_from_slice(b"info");
-    body.extend_from_slice(&(info.len() as u64).to_le_bytes());
-    body.extend_from_slice(&info);
-    body.extend_from_slice(b"segm");
-    body.extend_from_slice(&(segm.len() as u64).to_le_bytes());
-    body.extend_from_slice(&segm);
-    body.extend_from_slice(b"adlr");
-    body.extend_from_slice(&4u64.to_le_bytes());
-    body.extend_from_slice(&0u32.to_le_bytes());
-
-    let mut chunk = Vec::new();
-    chunk.extend_from_slice(b"File");
-    chunk.extend_from_slice(&(body.len() as u64).to_le_bytes());
-    chunk.extend_from_slice(&body);
-
     let index_ofs = file.len() as u64;
     file.push(0u8); // raw index block
-    file.extend_from_slice(&(chunk.len() as u64).to_le_bytes());
-    file.extend_from_slice(&chunk);
+    file.extend_from_slice(&(index.len() as u64).to_le_bytes());
+    file.extend_from_slice(&index);
     file[11..19].copy_from_slice(&index_ofs.to_le_bytes());
     file
+}
+
+/// Build a raw-index XP3 archive holding one entry made of several raw
+/// segments, so a read must concatenate them in order. Layout mirrors
+/// `testkit::build_xp3`; the index is stored raw.
+fn build_xp3_raw_segments(name: &str, segments: &[&[u8]]) -> Vec<u8> {
+    build_xp3_raw_segment_entries(&[(name, segments)])
+}
+
+/// An entry carries the normalized name, the segments the file is stored in,
+/// and the bytes those segments compose.
+///
+/// The format is the one the reference reader parses: the index is a run of
+/// `File` chunks, each holding an `info` chunk (the sizes and the UTF-16
+/// name), a `segm` chunk (one 28-byte record per segment) and an `adlr`
+/// chunk (the name hash)
+/// (`reference/cpp/core/archive/xp3/XP3Archive.cpp:424-489`); the stored
+/// name is normalized in place
+/// (`reference/cpp/core/archive/xp3/XP3Archive.cpp:433-437`).
+#[test]
+fn an_entry_carries_its_name_segments_and_bytes() {
+    let xp3 = build_xp3_raw_segment_entries(&[
+        ("Data\\First.TXT", &[b"hello ", b"world\n"]),
+        ("data/second.bin", &[b"\x00\x01"]),
+        ("third", &[b"a", b"b", b"c"]),
+    ]);
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open archive");
+
+    assert_eq!(archive.len(), 3);
+
+    // The stored name is normalized: lowercased, `\` → `/`.
+    let first = archive.entry("data/first.txt").expect("the entry is found");
+    assert_eq!(&*first.name, "data/first.txt");
+    assert_eq!(first.org_size, 12);
+    assert_eq!(first.arc_size, 12);
+    assert_eq!(first.segment_count(), 2);
+    let segments: Vec<_> = first.segments().collect();
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments[0].flags, SEGM_ENCODE_RAW);
+    assert_eq!(segments[0].start, 19);
+    assert_eq!(segments[0].org_size, 6);
+    assert_eq!(segments[0].arc_size, 6);
+    assert_eq!(segments[1].flags, SEGM_ENCODE_RAW);
+    assert_eq!(segments[1].start, 25);
+    assert_eq!(segments[1].org_size, 6);
+    assert_eq!(segments[1].arc_size, 6);
+    assert_eq!(
+        archive.read(&fs, &file, "data/first.txt").unwrap(),
+        b"hello world\n"
+    );
+
+    // The second entry is stored in one segment.
+    let second = archive
+        .entry("data/second.bin")
+        .expect("the entry is found");
+    assert_eq!(&*second.name, "data/second.bin");
+    assert_eq!(second.org_size, 2);
+    assert_eq!(second.segment_count(), 1);
+    let segments: Vec<_> = second.segments().collect();
+    assert_eq!(segments[0].start, 31);
+    assert_eq!(segments[0].org_size, 2);
+    assert_eq!(
+        archive.read(&fs, &file, "data/second.bin").unwrap(),
+        b"\x00\x01"
+    );
+
+    // The third entry is stored in three segments, read in order.
+    let third = archive.entry("third").expect("the entry is found");
+    assert_eq!(&*third.name, "third");
+    assert_eq!(third.org_size, 3);
+    assert_eq!(third.segment_count(), 3);
+    let segments: Vec<_> = third.segments().collect();
+    assert_eq!(segments[0].start, 33);
+    assert_eq!(segments[1].start, 34);
+    assert_eq!(segments[2].start, 35);
+    assert_eq!(archive.read(&fs, &file, "third").unwrap(), b"abc");
+}
+
+/// An entry costs one allocation: its name, which the archive's map key
+/// shares. The segments are part of the record, so a single-segment entry
+/// has no segment vector of its own.
+///
+/// The record is a name pointer, the inline first segment and the vector of
+/// the remaining segments: 96 bytes on a 64-bit target.
+#[test]
+fn an_entry_costs_one_allocation() {
+    let xp3 = build_xp3_raw_segment_entries(&[
+        ("data/first.txt", &[b"hello "]),
+        ("data/second.txt", &[b"world"]),
+    ]);
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open archive");
+
+    let entry = archive.entry("data/first.txt").expect("the entry is found");
+    // The map key and the entry hold the same name allocation: the name is
+    // stored once, not once per holder.
+    assert_eq!(Arc::strong_count(&entry.name), 2);
+    assert_eq!(entry.segment_count(), 1);
+    assert_eq!(std::mem::size_of::<Entry>(), 96);
 }
 
 /// A raw entry split across segments: the prefix is the leading bytes and the

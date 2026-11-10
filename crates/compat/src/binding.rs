@@ -279,8 +279,8 @@ extern "C" fn text_decode(
         // SAFETY: the ABI passes a readable byte range for the call.
         unsafe { std::slice::from_raw_parts(data, len) }
     };
-    let units = match crate::text::decode_text_units(bytes, crate::text::TextEncoding::Detect) {
-        Ok(units) => units,
+    let units = match crate::text::decode_units(bytes, crate::text::TextEncoding::Detect) {
+        Ok(decoded) => decoded.units,
         Err(message) => return text_decode_failure(out_error, &message),
     };
     if units.is_empty() {

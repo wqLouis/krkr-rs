@@ -817,7 +817,7 @@ fn deliver_hit_test(ctx: &CompatCtx, candidate: &HitCandidate) {
 /// stays with the frame's image barrier.
 pub(crate) fn resolve_layer_images(scene: &mut Scene, window: u32) {
     // Nothing is decoding in the steady state, and the walk below allocates.
-    if !scene.bitmaps.iter().any(|bitmap| bitmap.pending.is_some()) {
+    if !scene.has_pending_images() {
         return;
     }
     let bitmap_ids: Vec<u32> = scene

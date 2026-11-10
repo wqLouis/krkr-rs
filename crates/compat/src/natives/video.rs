@@ -58,13 +58,13 @@ use api::error::MediaError;
 use api::media::{DecodedAudio, RgbaFrame, VideoSpec};
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
-    RetainedValue, Tjs2Engine, Tjs2ValueId, TjsValue, VAL_INTEGER, VAL_OBJECT, VAL_REAL,
-    VAL_RETAINED, VAL_STRING, Value,
+    Tjs2Engine, Tjs2ValueId, TjsValue, VAL_INTEGER, VAL_OBJECT, VAL_REAL, VAL_RETAINED, VAL_STRING,
+    Value,
 };
 
 use crate::collections::Map;
 use crate::native_util::{
-    args, report_error, services, set_bool, set_int, set_void, value_as_string, value_ref,
+    args, report_error, services, set_bool, set_int, set_null, set_void, value_as_string, value_ref,
 };
 use crate::natives::sound::{SoundState, TVP_VOLUME_SCALE};
 use crate::natives::system::{frame_clock_f64, resolve, value_as_bool, value_as_i64};
@@ -527,19 +527,6 @@ fn set_retained_out(out: *mut Value, id: Tjs2ValueId) {
         (*out).array_count = 0;
         (*out).retained = id.as_ptr() as usize;
     }
-}
-
-/// Write TJS `null` into `out` (reference `layer1`/`layer2` read back null).
-fn set_null_out(host: &Tjs2Engine, out: *mut Value) {
-    if out.is_null() {
-        return;
-    }
-    if let Ok(RetainedValue::Object(object)) = host.eval_retained("null", "video.null") {
-        set_retained_out(out, object.raw_id());
-        std::mem::forget(object);
-        return;
-    }
-    set_void(out);
 }
 
 /// Resolve a script object argument to a scene id. An object argument is
@@ -2424,9 +2411,9 @@ extern "C" fn vo_layer1_get(
                 set_retained_out(out, duplicate.raw_id());
                 std::mem::forget(duplicate);
             }
-            Err(_) => set_null_out(resolved.engine(), out),
+            Err(_) => set_null(out),
         },
-        None => set_null_out(resolved.engine(), out),
+        None => set_null(out),
     }
     0
 }
@@ -2496,9 +2483,9 @@ extern "C" fn vo_layer2_get(
                 set_retained_out(out, duplicate.raw_id());
                 std::mem::forget(duplicate);
             }
-            Err(_) => set_null_out(resolved.engine(), out),
+            Err(_) => set_null(out),
         },
-        None => set_null_out(resolved.engine(), out),
+        None => set_null(out),
     }
     0
 }

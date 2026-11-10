@@ -63,7 +63,7 @@ One headless run of the game (release build):
 | phase | cost | what it is |
 |---|---|---|
 | archives mounted | 36.7 ms | 8 archives, 46 239 members, 1.16 GB — the index of each archive is parsed, the members are not read |
-| system fonts | ~30 ms | the font registry scans the host's font directories (1 800 faces) |
+| system fonts | ~30 ms, deferred to the first font use | the font registry scans the host's font directories (1 800 faces); the scan is no longer on the startup's critical path |
 | entry scripts | 677.0 ms | the startup sequence: `patch.tjs`, `startup.tjs`, `system/Initialize.tjs` |
 | images decoded | 22.2 ms | 63 images the startup reads |
 | first frame | 804.4 ms after open | the whole run, process start to the first presented frame |

@@ -70,9 +70,9 @@ ordered, and every step of it matters:
    `xp3filter.tjs` through the storage), so the handle must already be
    there when `CompatHost::install` runs.
 5. **The L1 seams.** The image codec, the audio decoder and the video
-   source are installed, the system font directories are supplied, the
-   emulated Windows host facts are installed and the inert clipboard
-   backend is set — see §4.
+   source are installed, the system font directories are supplied, the host's
+   two font roles are selected, the emulated Windows host facts are installed
+   and the inert clipboard backend is set — see §4.
 6. **The `.tpm` plugins.** The reference auto-loads the plugin manifests
    before the startup scripts run. The root enumerates them with the L1 file
    system and compat links the ordered names — see §4.
@@ -154,7 +154,7 @@ the seams and expects the composition root to fill them:
 | audio decoder | `audio.rs` | the `add_audio_decoder` chain, so a sound buffer can decode and play |
 | video source | `video.rs` | the `VideoOverlay` and `LayerExMovie` seams, over the L1 decoder and the L2 storage |
 | system font directories | `platform::system_font_dirs()` | the host's font directories, supplied before a startup script can resolve a face |
-| default font families | `platform::default_font_families()` | the host's default user-interface font, installed as the engine's default face before any script runs |
+| default font families | `platform::default_font_families()` | the host's default user-interface font, selected as the engine's default-face role and resolved on the text service's first use |
 | Windows host facts | `window_ex.rs` | the monitors, the desktop rectangle, the system metrics, the cursor, the environment |
 | clipboard | an inert backend | `hasFormat` is false, `asText` reads void, a write is a no-op — the reference clipboard does nothing |
 

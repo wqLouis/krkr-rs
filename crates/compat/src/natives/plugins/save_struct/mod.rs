@@ -543,19 +543,11 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             )));
         }
     };
-    let global = match engine.eval_retained("global", "saveStruct") {
-        Ok(RetainedValue::Object(object)) => object,
-        Ok(RetainedValue::Value(value)) => {
-            return Err(CompatError::Register(format!(
-                "saveStruct: the global object is not an object ({value:?})"
-            )));
-        }
-        Err(error) => {
-            return Err(CompatError::Register(format!(
-                "saveStruct: could not resolve the global object: {error}"
-            )));
-        }
-    };
+    let global = engine.global_object().map_err(|error| {
+        CompatError::Register(format!(
+            "saveStruct: could not resolve the global object: {error}"
+        ))
+    })?;
     // Remove the namespace global the serializer script created. Its
     // functions are namespace members, so retaining the namespace keeps them
     // alive and the reference exposes no free functions

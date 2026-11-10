@@ -243,9 +243,8 @@ fn fire_on_focus(
 
 /// The event argument for a neighbouring layer: its registered script
 /// object as a consumed retention (the `TjsValue::Retained` argument
-/// path), or TJS `null` evaluated and retained the same way the `null`
-/// result path does it (`set_null_out` in
-/// `crates/compat/src/natives/visual/common.rs`). `None` on failure, after
+/// path), or TJS `null` retained from the ABI's own null value (the
+/// `retain_null` path). `None` on failure, after
 /// logging — the reference fires these events only while the layer has an
 /// owner (`reference/cpp/core/visual/LayerIntf.cpp:3702`, `:3715`).
 fn layer_arg(ctx: &CompatCtx, host: &Tjs2Engine, layer: Option<u32>) -> Option<TjsValue> {
@@ -261,17 +260,13 @@ fn layer_arg(ctx: &CompatCtx, host: &Tjs2Engine, layer: Option<u32>) -> Option<T
             std::mem::forget(object);
             Some(TjsValue::Retained(raw))
         }
-        None => match host.eval_retained("null", "focus.null") {
-            Ok(tjs::RetainedValue::Object(object)) => {
-                let raw = object.raw_id().as_ptr() as u64;
+        None => match host.retain_null() {
+            Ok(null) => {
+                let raw = null.raw_id().as_ptr() as u64;
                 // The C++ conversion consumes the retention; the
-                // `DetachedValue` drop is a safe no-op.
-                std::mem::forget(object);
+                // `DetachedValue` drop is then a safe no-op.
+                std::mem::forget(null);
                 Some(TjsValue::Retained(raw))
-            }
-            Ok(tjs::RetainedValue::Value(_)) => {
-                log::warn!("focus: the null event argument did not retain as an object");
-                None
             }
             Err(error) => {
                 log::warn!("focus: the null event argument failed ({error})");

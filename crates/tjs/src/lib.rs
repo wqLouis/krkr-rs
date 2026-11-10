@@ -573,6 +573,9 @@ unsafe extern "C" {
     /// Retain a raw TJS object. Returns a per-engine id
     /// or 0 on failure.
     fn tjs2_retain_object(engine: *mut Engine, obj: *mut c_void) -> Tjs2ValueId;
+    /// Retain the engine's global object (the object the `global` keyword
+    /// evaluates to). Returns a per-engine id or 0 on failure.
+    fn tjs2_get_global(engine: *mut Engine) -> Tjs2ValueId;
     /// Duplicate an existing retained id into a fresh id (the original stays
     /// live). A duplicate lets a cached object be handed out again.
     fn tjs2_retain_retained_id(engine: *mut Engine, id: Tjs2ValueId) -> Tjs2ValueId;
@@ -799,6 +802,9 @@ pub struct Tjs2Engine {
     /// `std::mem::forget`) cannot leak a retained value or crash the
     /// engine drop.
     retained: std::cell::RefCell<Vec<Tjs2ValueId>>,
+    /// The number of scripts this engine has evaluated or executed (see
+    /// [`Self::script_evaluation_count`]).
+    evaluations: std::cell::Cell<u64>,
 }
 
 /// An opaque id of a script value retained on a [`Tjs2Engine`] (see
@@ -1158,6 +1164,7 @@ impl Tjs2Engine {
         Ok(Tjs2Engine {
             inner,
             retained: std::cell::RefCell::new(Vec::new()),
+            evaluations: std::cell::Cell::new(0),
         })
     }
 
@@ -1185,6 +1192,21 @@ impl Tjs2Engine {
         unsafe { tjs2_retained_count(self.inner) }
     }
 
+    /// The number of scripts this engine has evaluated or executed.
+    ///
+    /// A native that needs a value the VM already holds — TJS `null`, the
+    /// global object — must not raise this count: reaching for the script
+    /// compiler to produce such a value compiles a script block on every
+    /// call. The count is a diagnostic, not a budget.
+    pub fn script_evaluation_count(&self) -> u64 {
+        self.evaluations.get()
+    }
+
+    /// Count one script the host pushed into the VM.
+    fn note_evaluation(&self) {
+        self.evaluations.set(self.evaluations.get() + 1);
+    }
+
     /// Execute a TJS script and discard its result.
     ///
     /// The C ABI receives a null result slot, so the VM materialises no
@@ -1195,6 +1217,7 @@ impl Tjs2Engine {
     pub fn exec_script_discard(&self, script: &str, name: &str) -> Result<(), TjsError> {
         let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
         let mut error: *mut c_char = ptr::null_mut();
+        self.note_evaluation();
         // SAFETY: the script pointer/length and the name are valid for the
         // call, `self.inner` is a live engine, and a null result slot is the
         // documented "no result" form.
@@ -1244,6 +1267,7 @@ impl Tjs2Engine {
             retained: 0,
         };
         let mut error: *mut c_char = ptr::null_mut();
+        self.note_evaluation();
         // SAFETY: all pointers point to valid, live data for the call; the
         // caller guarantees `context` is a live object handle or null.
         let rc = unsafe {
@@ -1315,6 +1339,7 @@ impl Tjs2Engine {
         } else {
             ptr::null_mut()
         };
+        self.note_evaluation();
         // SAFETY: all pointers point to valid, live data for the call; the
         // caller guarantees `context` is a live object handle or null.
         let rc = unsafe {
@@ -1608,6 +1633,7 @@ impl Tjs2Engine {
             retained: 0,
         };
         let mut error: *mut c_char = ptr::null_mut();
+        self.note_evaluation();
         // SAFETY: the pointers are valid for the call; a null name is the
         // "no name" case, which selects the script cache.
         let rc = unsafe {
@@ -1653,6 +1679,7 @@ impl Tjs2Engine {
             retained: 0,
         };
         let mut error: *mut c_char = ptr::null_mut();
+        self.note_evaluation();
         // SAFETY: `script` is a live `&[u16]` and `name` a live C string; the
         // caller guarantees `context` is a live object handle or null.
         let rc = unsafe {
@@ -1709,6 +1736,7 @@ impl Tjs2Engine {
             retained: 0,
         };
         let mut error: *mut c_char = ptr::null_mut();
+        self.note_evaluation();
         // SAFETY: `expression` is a live `&[u16]` and `name` a live C string;
         // the caller guarantees `context` is a live object handle or null.
         let rc = unsafe {
@@ -2303,6 +2331,54 @@ name), and none was available"
         Ok(DetachedValue {
             engine: self.inner,
             id: duplicate,
+        })
+    }
+
+    /// Retain TJS `null` with a lifetime detached from the engine borrow.
+    ///
+    /// TJS `null` is an object value with no object pointer; the C ABI
+    /// carries it as `TJS2_VAL_NULL`, so no script has to be compiled to
+    /// produce it. The returned [`DetachedValue`] hands the value to the VM
+    /// as a `VAL_RETAINED` argument or member value; the VM consumes the
+    /// retention, so the drop is then a safe no-op.
+    pub fn retain_null(&self) -> Result<DetachedValue, String> {
+        let null = Value {
+            ty: VAL_NULL,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        // SAFETY: `null` mirrors the ABI's null value and self.inner is a
+        // live engine.
+        let id = unsafe { tjs2_retain_value(self.inner, &null) };
+        if id.is_null() {
+            return Err("failed to retain the null value".into());
+        }
+        Ok(DetachedValue {
+            engine: self.inner,
+            id,
+        })
+    }
+
+    /// The engine's global object — the object the `global` keyword
+    /// evaluates to.
+    ///
+    /// The VM's `global` keyword pushes the script engine's global object,
+    /// so a native that walks the script object graph reads the very object
+    /// the keyword names, without compiling a script to reach it. The
+    /// returned [`DetachedValue`] releases the retention when dropped.
+    pub fn global_object(&self) -> Result<DetachedValue, String> {
+        // SAFETY: self.inner is a live engine.
+        let id = unsafe { tjs2_get_global(self.inner) };
+        if id.is_null() {
+            return Err("failed to retain the global object".into());
+        }
+        Ok(DetachedValue {
+            engine: self.inner,
+            id,
         })
     }
 
@@ -4629,6 +4705,81 @@ var ra = a.get(); var rb = b.get();",
         assert_eq!(e2.call_value(&id2, &[]).unwrap(), TjsValue::Integer(7));
         drop(id2);
         drop(e2);
+    }
+
+    // -------------------------------------------------------------------
+    // values the VM already holds (null, the global object)
+    // -------------------------------------------------------------------
+
+    /// The retained null is the script's `null`: the VM hands it to a script
+    /// as an object-typed variant with a null object pointer, so it compares
+    /// equal to the `null` literal and is not `void`.
+    ///
+    /// The TJS2 `null` literal is `tTJSVariant((iTJSDispatch2 *)nullptr)`
+    /// (`reference/cpp/core/tjs2/tjsLex.cpp:1552-1554`), and the strict
+    /// comparison of two object variants compares their object pointers
+    /// (`reference/cpp/core/tjs2/tjsVariant.cpp:806-811`), so two nulls are
+    /// equal and a null is not `void`.
+    #[test]
+    fn retain_null_hands_the_script_the_null_value() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.exec_script("var isNull = function(v) { return v === null; };", "test")
+            .unwrap();
+        let null = e.retain_null().unwrap();
+        let global = e.global_object().unwrap();
+        e.set_member(
+            global.raw_id(),
+            "probe",
+            &TjsValue::Retained(null.raw_id().as_ptr() as u64),
+        )
+        .unwrap();
+        assert_eq!(
+            e.eval("isNull(probe)", "test").unwrap(),
+            TjsValue::Integer(1),
+            "the retained value is the script's null"
+        );
+        assert_eq!(
+            e.eval("probe === void", "test").unwrap(),
+            TjsValue::Integer(0),
+            "the retained value is not void"
+        );
+    }
+
+    /// The retained global object is the object the `global` keyword names:
+    /// the VM's `global` keyword pushes the script engine's global object
+    /// (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1279-1283`), so a
+    /// member written through the retained handle is the member the keyword
+    /// reads.
+    #[test]
+    fn global_object_is_the_object_the_global_keyword_names() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        let global = e.global_object().unwrap();
+        e.set_member(global.raw_id(), "probe", &TjsValue::Integer(7))
+            .unwrap();
+        assert_eq!(
+            e.eval("global.probe", "test").unwrap(),
+            TjsValue::Integer(7),
+            "the retained object is the script's global object"
+        );
+    }
+
+    /// A native that needs a value the VM already holds must not compile a
+    /// script for it: the count of the scripts the host pushed into the VM
+    /// does not move.
+    #[test]
+    fn retaining_a_null_or_the_global_object_raises_no_script_evaluation() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        let before = e.script_evaluation_count();
+        let _null = e.retain_null().unwrap();
+        let _global = e.global_object().unwrap();
+        assert_eq!(
+            e.script_evaluation_count(),
+            before,
+            "the values came from the VM, not from the script compiler"
+        );
     }
 
     // -------------------------------------------------------------------

@@ -2922,17 +2922,15 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             },
         ],
     })?;
-    // Reference: the `System` class object carries default *data* members
-    // `exceptionHandler`, `onActivate` and `onDeactivate`, all `null`
-    // (`PropSet` at the end of the class constructor,
-    // `base/SystemIntf.cpp:477-484`), so `System.onActivate` reads as `null`
-    // before a script assigns one and `MEMBERMUSTEXIST` lookups succeed
-    // (`SystemIntf.cpp:58-77`).
+    // The `System` class object carries default *data* members
+    // `exceptionHandler`, `onActivate` and `onDeactivate`, all `null`, so
+    // `System.onActivate` reads as `null` before a script assigns one and the
+    // `MEMBERMUSTEXIST` lookups succeed.
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let host = unsafe { ctx.engine() };
-    if let (Ok(RetainedValue::Object(class)), Ok(RetainedValue::Object(null))) = (
+    if let (Ok(RetainedValue::Object(class)), Ok(null)) = (
         host.eval_retained("System", "System.defaults"),
-        host.eval_retained("null", "System.defaults"),
+        host.retain_null(),
     ) {
         for name in ["exceptionHandler", "onActivate", "onDeactivate"] {
             match host.duplicate_retained(null.raw_id()) {

@@ -20,6 +20,11 @@
 //! charset detection -- drops byte sequences the charset cannot decode and
 //! logs the drop once per decode. Only an unsupported `Scripts.textEncoding`
 //! name is a typed error.
+//!
+//! A decode produces UTF-16 code units, the form the VM takes a script in.
+//! The charset decoders write those code units straight out of the input
+//! bytes, so a script's text is materialised once and not round-tripped
+//! through UTF-8.
 
 use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
 use encoding_rs::DecoderResult;
@@ -44,70 +49,70 @@ pub(crate) enum TextEncoding<'a> {
     Named(&'a str),
 }
 
-/// Decode scenario/script bytes to UTF-8 text.
-///
-/// Detection order:
-///
-/// 1. the `FE FE` container (mode 0/1 = UTF-16LE cipher, mode 2 = zlib);
-/// 2. a UTF-32 / UTF-8 / UTF-16LE / UTF-16BE byte-order mark;
-/// 3. an explicit [`TextEncoding::Named`] decoder (`Scripts.textEncoding` or a
-///    plugin that names a fixed encoding);
-/// 4. charset detection.
-///
-/// A payload the charset cannot decode is dropped and logged; an unsupported
-/// explicit `encoding` is a typed error.
-pub(crate) fn decode_text(bytes: &[u8], encoding: TextEncoding<'_>) -> Result<String, String> {
-    let (decoded, path) = decode_text_inner(bytes, encoding);
-    decoded.map(|decoded| decoded_into_string(decoded, path))
+/// The text a decode produced: the UTF-16 code units and the encoding
+/// decision that produced them.
+pub(crate) struct DecodedText<'a> {
+    /// The decoded UTF-16 code units.
+    pub units: Vec<u16>,
+    /// A byte that did not complete a code unit.
+    trailing_bytes: usize,
+    /// The encoding decision.
+    path: DecodePath<'a>,
 }
 
-/// Decode like [`decode_text`] but return UTF-16 code units.
-///
-/// An `FE FE` container decrypts to UTF-16 code units and keeps every code
-/// unit, including an unpaired surrogate. A Rust `String` cannot hold one, so
-/// the script loader decodes through this function and hands the VM the code
-/// units instead of a lossy UTF-8 string. A charset-decoded path is valid text
-/// and converts to code units without loss.
-pub(crate) fn decode_text_units(
-    bytes: &[u8],
-    encoding: TextEncoding<'_>,
-) -> Result<Vec<u16>, String> {
-    let (decoded, _) = decode_text_inner(bytes, encoding);
-    decoded.map(|decoded| match decoded {
-        Decoded::Utf8(text) => text.encode_utf16().collect(),
-        Decoded::Units { units, .. } => units,
-    })
-}
-
-/// The text a decode produced: UTF-8 text from a charset conversion, or the
-/// raw UTF-16 code units of an `FE FE` container.
-enum Decoded {
-    /// Valid UTF-8 produced by a charset decoder.
-    Utf8(String),
-    /// `FE FE` container code units, plus any byte that did not complete a
-    /// code unit.
-    Units {
-        /// The decrypted code units.
-        units: Vec<u16>,
-        /// A trailing byte that is not part of a code unit.
-        trailing_bytes: usize,
-    },
-}
-
-/// The UTF-8 text produced by a decode plus the encoding decision that
-/// produced it, for diagnostic logging.
-pub(crate) struct DecodedText {
-    /// The decoded UTF-8 text.
-    pub text: String,
+impl DecodedText<'_> {
     /// A short label naming the path taken: a byte-order mark, the `FE FE`
     /// container mode, the explicit override, or the detected charset.
-    pub encoding: String,
+    pub fn encoding_label(&self) -> String {
+        self.path.label()
+    }
+
+    /// The decoded text.
+    ///
+    /// A code unit that is not a character -- an unpaired surrogate in an
+    /// `FE FE` container -- is dropped, because a Rust `String` cannot hold
+    /// one; the drop is reported once. The code units themselves are
+    /// unaffected: a script reads them through [`Self::units`].
+    pub fn text(&self) -> String {
+        let (text, dropped) = from_utf16(self.units.iter().copied());
+        if dropped > 0 || self.trailing_bytes > 0 {
+            warn_dropped(self.drop_label(), dropped * 2 + self.trailing_bytes);
+        }
+        text
+    }
+
+    /// The label a dropped byte is reported under.
+    fn drop_label(&self) -> &str {
+        match self.path {
+            DecodePath::Container(2) => "FE FE zlib payload",
+            DecodePath::Container(_) => "FE FE cipher",
+            _ => "script decode",
+        }
+    }
+}
+
+/// The code units a decode produced.
+struct DecodedUnits {
+    /// The decoded code units.
+    units: Vec<u16>,
+    /// A byte that did not complete a code unit.
+    trailing_bytes: usize,
+}
+
+/// The code units a charset decode produced, and the bytes it could not
+/// decode.
+struct CharsetDecode {
+    /// The decoded code units.
+    units: Vec<u16>,
+    /// The number of input bytes the charset could not decode.
+    dropped: usize,
 }
 
 /// The decoding decision that produced the text.
 ///
 /// Carried as a `Copy` value so the common decode path never formats the
-/// diagnostic label; only [`decode_text_reported`] turns it into a string.
+/// diagnostic label; only [`DecodedText::encoding_label`] turns it into a
+/// string.
 #[derive(Clone, Copy)]
 enum DecodePath<'a> {
     /// The `FE FE` container's mode byte.
@@ -122,7 +127,7 @@ enum DecodePath<'a> {
 }
 
 impl DecodePath<'_> {
-    /// The label [`decode_text_reported`] reports for this decision.
+    /// The label [`DecodedText::encoding_label`] reports for this decision.
     fn label(self) -> String {
         match self {
             DecodePath::Container(mode) => format!("FE FE container mode {mode}"),
@@ -134,24 +139,45 @@ impl DecodePath<'_> {
     }
 }
 
-/// Decode like [`decode_text`], additionally returning the encoding decision.
-pub(crate) fn decode_text_reported(
+/// Decode scenario/script bytes to UTF-8 text.
+///
+/// Detection order:
+///
+/// 1. the `FE FE` container (mode 0/1 = UTF-16LE cipher, mode 2 = zlib);
+/// 2. a UTF-32 / UTF-8 / UTF-16LE / UTF-16BE byte-order mark;
+/// 3. an explicit [`TextEncoding::Named`] decoder (`Scripts.textEncoding` or a
+///    plugin that names a fixed encoding);
+/// 4. charset detection.
+///
+/// A payload the charset cannot decode is dropped and logged; an unsupported
+/// explicit `encoding` is a typed error.
+pub(crate) fn decode_text(bytes: &[u8], encoding: TextEncoding<'_>) -> Result<String, String> {
+    decode_units(bytes, encoding).map(|decoded| decoded.text())
+}
+
+/// Decode scenario/script bytes to UTF-16 code units, with the encoding
+/// decision that produced them.
+///
+/// The code units are the form the VM takes a script in, so a caller that
+/// runs a script hands these units over unchanged.
+pub(crate) fn decode_units<'a>(
     bytes: &[u8],
-    encoding: TextEncoding<'_>,
-) -> Result<DecodedText, String> {
-    let (decoded, path) = decode_text_inner(bytes, encoding);
+    encoding: TextEncoding<'a>,
+) -> Result<DecodedText<'a>, String> {
+    let (decoded, path) = decode_units_inner(bytes, encoding);
     decoded.map(|decoded| DecodedText {
-        text: decoded_into_string(decoded, path),
-        encoding: path.label(),
+        units: decoded.units,
+        trailing_bytes: decoded.trailing_bytes,
+        path,
     })
 }
 
 /// The shared decode dispatch; the decision is present even when the decode
 /// fails so a caller can report what was attempted.
-fn decode_text_inner<'a>(
+fn decode_units_inner<'a>(
     bytes: &[u8],
     encoding: TextEncoding<'a>,
-) -> (Result<Decoded, String>, DecodePath<'a>) {
+) -> (Result<DecodedUnits, String>, DecodePath<'a>) {
     // 1. `FE FE` container (never a valid UTF BOM, so it wins unambiguously).
     if bytes.len() >= 3 && bytes[0] == 0xFE && bytes[1] == 0xFE {
         return (decode_container(bytes), DecodePath::Container(bytes[2]));
@@ -161,39 +187,31 @@ fn decode_text_inner<'a>(
     //    win for UTF-32LE to be reachable.
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE, 0x00, 0x00]) {
         return (
-            Ok(Decoded::Utf8(decode_utf32(
-                rest,
-                "UTF-32LE",
-                u32::from_le_bytes,
-            ))),
+            Ok(decode_utf32(rest, "UTF-32LE", u32::from_le_bytes)),
             DecodePath::Bom("UTF-32LE BOM"),
         );
     }
     if let Some(rest) = bytes.strip_prefix(&[0x00, 0x00, 0xFE, 0xFF]) {
         return (
-            Ok(Decoded::Utf8(decode_utf32(
-                rest,
-                "UTF-32BE",
-                u32::from_be_bytes,
-            ))),
+            Ok(decode_utf32(rest, "UTF-32BE", u32::from_be_bytes)),
             DecodePath::Bom("UTF-32BE BOM"),
         );
     }
     if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         return (
-            decode_from_encoding(rest, encoding_rs::UTF_8).map(Decoded::Utf8),
+            decode_charset_logged(rest, encoding_rs::UTF_8),
             DecodePath::Bom("UTF-8 BOM"),
         );
     }
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
         return (
-            decode_from_encoding(rest, encoding_rs::UTF_16LE).map(Decoded::Utf8),
+            decode_charset_logged(rest, encoding_rs::UTF_16LE),
             DecodePath::Bom("UTF-16LE BOM"),
         );
     }
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         return (
-            decode_from_encoding(rest, encoding_rs::UTF_16BE).map(Decoded::Utf8),
+            decode_charset_logged(rest, encoding_rs::UTF_16BE),
             DecodePath::Bom("UTF-16BE BOM"),
         );
     }
@@ -201,10 +219,7 @@ fn decode_text_inner<'a>(
     if let TextEncoding::Named(name) = encoding
         && !name.is_empty()
     {
-        return (
-            decode_named(bytes, name).map(Decoded::Utf8),
-            DecodePath::Explicit(name),
-        );
+        return (decode_named(bytes, name), DecodePath::Explicit(name));
     }
     // 4. Detect the charset and decode from it.
     detect_and_decode(bytes)
@@ -217,9 +232,9 @@ fn decode_text_inner<'a>(
 /// so the decision needs the statistical model `chardetng` provides;
 /// `encoding_rs` then does the bulk decode and owns the per-charset tables.
 /// Neither crate allocates per input byte: `chardetng` scores fixed-size
-/// buffers and `encoding_rs` decodes the whole slice in one pass, allocating
-/// only the output string.
-fn detect_and_decode(bytes: &[u8]) -> (Result<Decoded, String>, DecodePath<'static>) {
+/// buffers and `encoding_rs` decodes the whole slice in one pass, writing the
+/// code units straight into the output buffer.
+fn detect_and_decode(bytes: &[u8]) -> (Result<DecodedUnits, String>, DecodePath<'static>) {
     // `Allow` keeps ISO-2022-JP in the candidate set, matching the charsets the
     // detector can report.
     let mut detector = EncodingDetector::new(Iso2022JpDetection::Allow);
@@ -234,17 +249,21 @@ fn detect_and_decode(bytes: &[u8]) -> (Result<Decoded, String>, DecodePath<'stat
     // single-byte and keep the detected mapping otherwise. A genuine
     // `WINDOWS-1252` payload keeps the Latin-1 mapping.
     if detected.is_single_byte() {
-        if let Some(text) = cp932_japanese_text(bytes) {
+        if let Some(units) = cp932_japanese_units(bytes) {
             return (
-                Ok(Decoded::Utf8(text)),
+                Ok(DecodedUnits {
+                    units,
+                    trailing_bytes: 0,
+                }),
                 DecodePath::Detected(Some(encoding_rs::SHIFT_JIS.name())),
             );
         }
         if detected.name() == encoding_rs::WINDOWS_1252.name() {
             return (
-                Ok(Decoded::Utf8(
-                    encoding_rs::mem::decode_latin1(bytes).into_owned(),
-                )),
+                Ok(DecodedUnits {
+                    units: decode_latin1_units(bytes),
+                    trailing_bytes: 0,
+                }),
                 DecodePath::Detected(None),
             );
         }
@@ -252,7 +271,7 @@ fn detect_and_decode(bytes: &[u8]) -> (Result<Decoded, String>, DecodePath<'stat
     // `SHIFT_JIS` maps to `cp932`; `encoding_rs`'s WHATWG Shift_JIS is already
     // Windows-31J (cp932), so the reported encoding is used as-is.
     (
-        decode_from_encoding(bytes, detected).map(Decoded::Utf8),
+        decode_charset_logged(bytes, detected),
         DecodePath::Detected(Some(detected.name())),
     )
 }
@@ -265,66 +284,95 @@ fn detect_and_decode(bytes: &[u8]) -> (Result<Decoded, String>, DecodePath<'stat
 /// only when it contains a kana or ideograph, which only a CP932 double-byte
 /// sequence produces; the single-byte half-width katakana a Latin-1 payload
 /// can produce are deliberately not a signal.
-fn cp932_japanese_text(bytes: &[u8]) -> Option<String> {
-    let mut decoder = encoding_rs::SHIFT_JIS.new_decoder_without_bom_handling();
-    let capacity = decoder.max_utf8_buffer_length_without_replacement(bytes.len())?;
-    let mut text = String::with_capacity(capacity);
-    let mut consumed = 0usize;
-    loop {
-        let (result, read) =
-            decoder.decode_to_string_without_replacement(&bytes[consumed..], &mut text, true);
-        consumed += read;
-        match result {
-            DecoderResult::InputEmpty => break,
-            DecoderResult::OutputFull => text.reserve(bytes.len().max(64)),
-            DecoderResult::Malformed(_, _) => return None,
-        }
+fn cp932_japanese_units(bytes: &[u8]) -> Option<Vec<u16>> {
+    let Ok(decoded) = decode_charset(bytes, encoding_rs::SHIFT_JIS) else {
+        return None;
+    };
+    if decoded.dropped != 0 {
+        return None;
     }
-    text.chars().any(is_japanese_char).then_some(text)
+    let japanese = decoded.units.iter().copied().any(is_japanese_unit);
+    japanese.then_some(decoded.units)
 }
 
-/// Whether `ch` is a kana or a CJK ideograph, the characters a CP932
+/// Whether `unit` is a kana or a CJK ideograph, the characters a CP932
 /// double-byte sequence produces.
-fn is_japanese_char(ch: char) -> bool {
-    matches!(ch,
-        '\u{3040}'..='\u{30ff}'
-            | '\u{3400}'..='\u{4dbf}'
-            | '\u{4e00}'..='\u{9fff}'
-            | '\u{f900}'..='\u{faff}'
+///
+/// Every range is in the Basic Multilingual Plane, so a CP932 character is
+/// one code unit.
+fn is_japanese_unit(unit: u16) -> bool {
+    matches!(
+        unit,
+        0x3040..=0x30ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff
     )
 }
 
-/// Decode `bytes` from `encoding`, dropping byte sequences the charset cannot
-/// decode.
+/// Decode `bytes` from `encoding` into UTF-16 code units, counting the bytes
+/// the charset cannot decode.
 ///
 /// Illegal or unconvertible bytes are dropped and the surrounding text is
 /// kept. The `encoding_rs` incremental decoder exposes malformed sequences
-/// without aborting the decode, so the drop stays a single pass over the input
-/// and is reported once per decode rather than silently. A payload whose
-/// worst-case UTF-8 length overflows `usize` is a typed error.
-fn decode_from_encoding(
+/// without aborting the decode, so the drop stays a single pass over the
+/// input and is reported once per decode rather than silently. A payload whose
+/// worst-case UTF-16 length overflows `usize` is a typed error.
+fn decode_charset(
     bytes: &[u8],
     encoding: &'static encoding_rs::Encoding,
-) -> Result<String, String> {
+) -> Result<CharsetDecode, String> {
     let mut decoder = encoding.new_decoder_without_bom_handling();
-    let capacity = decoder
-        .max_utf8_buffer_length_without_replacement(bytes.len())
+    let mut capacity = decoder
+        .max_utf16_buffer_length(bytes.len())
         .ok_or_else(|| format!("{}: input is too large to decode", encoding.name()))?;
-    let mut text = String::with_capacity(capacity);
+    let mut units: Vec<u16> = vec![0u16; capacity];
+    let mut filled = 0usize;
     let mut dropped = 0usize;
     let mut consumed = 0usize;
     loop {
-        let (result, read) =
-            decoder.decode_to_string_without_replacement(&bytes[consumed..], &mut text, true);
+        let (result, read, written) = decoder.decode_to_utf16_without_replacement(
+            &bytes[consumed..],
+            &mut units[filled..],
+            true,
+        );
         consumed += read;
+        filled += written;
         match result {
             DecoderResult::InputEmpty => break,
-            DecoderResult::OutputFull => text.reserve(bytes.len().max(64)),
+            DecoderResult::OutputFull => {
+                // The worst-case size was not enough for this payload: give
+                // the decoder a bigger buffer and continue where it stopped.
+                let grown = capacity
+                    .checked_mul(2)
+                    .filter(|grown| *grown > capacity)
+                    .ok_or_else(|| format!("{}: input is too large to decode", encoding.name()))?;
+                capacity = grown;
+                units.resize(capacity, 0);
+            }
             DecoderResult::Malformed(length, _) => dropped += usize::from(length),
         }
     }
-    warn_dropped(encoding.name(), dropped);
-    Ok(text)
+    units.truncate(filled);
+    Ok(CharsetDecode { units, dropped })
+}
+
+/// Decode `bytes` from `encoding` into UTF-16 code units and report the
+/// bytes the charset could not decode.
+fn decode_charset_logged(
+    bytes: &[u8],
+    encoding: &'static encoding_rs::Encoding,
+) -> Result<DecodedUnits, String> {
+    let decoded = decode_charset(bytes, encoding)?;
+    warn_dropped(encoding.name(), decoded.dropped);
+    Ok(DecodedUnits {
+        units: decoded.units,
+        trailing_bytes: 0,
+    })
+}
+
+/// Decode `bytes` as Latin-1: every byte is one code point.
+///
+/// Nothing is dropped, so there is nothing to report.
+fn decode_latin1_units(bytes: &[u8]) -> Vec<u16> {
+    bytes.iter().map(|&byte| u16::from(byte)).collect()
 }
 
 /// Log one warning when a decode dropped `dropped` bytes of `label`.
@@ -339,7 +387,7 @@ fn warn_dropped(label: &str, dropped: usize) {
 /// Both modes check the two bytes after the mode for the mandatory UTF-16LE
 /// byte-order mark `FF FE` and raise when it is absent, then read the payload
 /// from offset 5.
-fn decode_container(bytes: &[u8]) -> Result<Decoded, String> {
+fn decode_container(bytes: &[u8]) -> Result<DecodedUnits, String> {
     let mode = bytes[2];
     match mode {
         0 | 1 => {
@@ -371,8 +419,8 @@ fn require_container_bom(bytes: &[u8], mode: u8) -> Result<(), String> {
 /// little-endian code units; a trailing odd byte is reported. Mode 0 is the
 /// legacy per-code-unit XOR (only applied to units `>= 0x20`); mode 1 is the
 /// adjacent-bit swap. The units are kept raw; the lossy string view is applied
-/// only by [`decode_text`].
-fn decode_container_cipher(bytes: &[u8], mode: u8) -> Result<Decoded, String> {
+/// only by [`DecodedText::text`].
+fn decode_container_cipher(bytes: &[u8], mode: u8) -> Result<DecodedUnits, String> {
     let payload: &[u8] = bytes.get(5..).unwrap_or_default();
     let units = payload
         .as_chunks::<2>()
@@ -391,7 +439,7 @@ fn decode_container_cipher(bytes: &[u8], mode: u8) -> Result<Decoded, String> {
             }
         })
         .collect();
-    Ok(Decoded::Units {
+    Ok(DecodedUnits {
         units,
         trailing_bytes: payload.len() % 2,
     })
@@ -401,7 +449,7 @@ fn decode_container_cipher(bytes: &[u8], mode: u8) -> Result<Decoded, String> {
 /// code units.
 ///
 /// Layout: `FE FE 02 FF FE <compressed:u64 LE> <uncompressed:u64 LE> <zlib>`.
-fn decode_container_zlib(bytes: &[u8]) -> Result<Decoded, String> {
+fn decode_container_zlib(bytes: &[u8]) -> Result<DecodedUnits, String> {
     if bytes.len() < CONTAINER_ZLIB_HEADER {
         return Err(format!(
             "FE FE zlib container needs {CONTAINER_ZLIB_HEADER} header bytes, got {}",
@@ -437,54 +485,36 @@ fn decode_container_zlib(bytes: &[u8]) -> Result<Decoded, String> {
         .iter()
         .map(|chunk| u16::from_le_bytes(*chunk))
         .collect();
-    Ok(Decoded::Units {
+    Ok(DecodedUnits {
         units,
         trailing_bytes: out.len() % 2,
     })
 }
 
-/// Convert a decode result to UTF-8 text for the callers that need a
-/// `String`.
-///
-/// A charset-decoded path is already valid UTF-8; `FE FE` code units are
-/// decoded as UTF-16, dropping an unpaired surrogate with one warning. The
-/// script loader uses [`decode_text_units`] when it needs the raw code units.
-fn decoded_into_string(decoded: Decoded, path: DecodePath<'_>) -> String {
-    match decoded {
-        Decoded::Utf8(text) => text,
-        Decoded::Units {
-            units,
-            trailing_bytes,
-        } => {
-            let label = match path {
-                DecodePath::Container(2) => "FE FE zlib payload",
-                DecodePath::Container(_) => "FE FE cipher",
-                _ => "FE FE payload",
-            };
-            let (text, dropped_units) = from_utf16(units.into_iter());
-            warn_dropped(label, dropped_units * 2 + trailing_bytes);
-            text
-        }
-    }
-}
-
-/// Decode a UTF-32 byte payload, dropping values that are not Unicode scalar
-/// values.
+/// Decode a UTF-32 byte payload into UTF-16 code units, dropping values that
+/// are not Unicode scalar values.
 ///
 /// Decodes both byte orders and drops invalid scalar values with the same
 /// warning the charset decoder uses.
-fn decode_utf32(bytes: &[u8], label: &str, word: impl Fn([u8; 4]) -> u32) -> String {
+fn decode_utf32(bytes: &[u8], label: &str, word: impl Fn([u8; 4]) -> u32) -> DecodedUnits {
     let mut dropped = bytes.len() % 4;
-    let mut text = String::with_capacity(bytes.len() / 4);
+    let mut units: Vec<u16> = Vec::with_capacity(bytes.len() / 4);
     for chunk in bytes.as_chunks::<4>().0.iter() {
         let code = word(*chunk);
         match char::from_u32(code) {
-            Some(ch) => text.push(ch),
+            Some(ch) => {
+                let mut buffer = [0u16; 2];
+                let encoded = ch.encode_utf16(&mut buffer);
+                units.extend_from_slice(encoded);
+            }
             None => dropped += 4,
         }
     }
     warn_dropped(label, dropped);
-    text
+    DecodedUnits {
+        units,
+        trailing_bytes: 0,
+    }
 }
 
 /// Decode UTF-16 code units, returning the text and the number of unpaired
@@ -505,19 +535,20 @@ fn from_utf16(units: impl Iterator<Item = u16>) -> (String, usize) {
 }
 
 /// Decode `bytes` using an explicit `Scripts.textEncoding` name.
-fn decode_named(bytes: &[u8], name: &str) -> Result<String, String> {
+fn decode_named(bytes: &[u8], name: &str) -> Result<DecodedUnits, String> {
     let normalized = name.trim().to_ascii_lowercase().replace(['_', '-'], "");
     match normalized.as_str() {
-        "utf8" | "unicode(utf8)" | "n" => decode_from_encoding(bytes, encoding_rs::UTF_8),
-        "utf16le" | "utf16" => decode_from_encoding(bytes, encoding_rs::UTF_16LE),
-        "utf16be" => decode_from_encoding(bytes, encoding_rs::UTF_16BE),
+        "utf8" | "unicode(utf8)" | "n" => decode_charset_logged(bytes, encoding_rs::UTF_8),
+        "utf16le" | "utf16" => decode_charset_logged(bytes, encoding_rs::UTF_16LE),
+        "utf16be" => decode_charset_logged(bytes, encoding_rs::UTF_16BE),
         "cp932" | "shiftjis" | "sjis" | "ms932" | "windows31j" | "csshiftjis" | "xsjis" => {
-            decode_from_encoding(bytes, encoding_rs::SHIFT_JIS)
+            decode_charset_logged(bytes, encoding_rs::SHIFT_JIS)
         }
         // Latin-1 maps every byte to a code point, so nothing is dropped.
-        "ascii" | "usascii" | "windows1252" | "iso88591" | "latin1" => {
-            Ok(encoding_rs::mem::decode_latin1(bytes).into_owned())
-        }
+        "ascii" | "usascii" | "windows1252" | "iso88591" | "latin1" => Ok(DecodedUnits {
+            units: decode_latin1_units(bytes),
+            trailing_bytes: 0,
+        }),
         _ => Err(format!(
             "configured text encoding '{name}' is not supported by the compat surface"
         )),
@@ -526,9 +557,7 @@ fn decode_named(bytes: &[u8], name: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        TextEncoding, decode_from_encoding, decode_text, decode_text_reported, decode_text_units,
-    };
+    use super::{TextEncoding, decode_charset_logged, decode_text, decode_units};
     use encoding_rs::{BIG5, EUC_KR, GBK, SHIFT_JIS};
 
     thread_local! {
@@ -607,6 +636,11 @@ mod tests {
         bytes.into_owned()
     }
 
+    /// The UTF-16 code units of `text`.
+    fn units_of(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
     /// Encrypt code units as an `FE FE <mode>` container (writer side): the
     /// five-byte header `FE FE <mode> FF FE` then the little-endian code units
     /// (reference `reference/cpp/core/base/TextStream.cpp:82-105`). The `FF FE`
@@ -683,6 +717,20 @@ mod tests {
             decode_text(&bytes, TextEncoding::Detect).expect("Shift_JIS decodes"),
             SHIFT_JIS_TEXT
         );
+    }
+
+    // The code units a charset decode produces are the UTF-16 form of the
+    // same text, so the VM receives the script without a UTF-8 round trip.
+    //
+    // reference/cpp/core/base/TextStream.cpp:182-188 — the legacy charset
+    // branch converts the text to UTF-16 directly; :206-210 hands those code
+    // units to the script string.
+    #[test]
+    fn a_charset_decode_yields_the_text_code_units() {
+        let bytes = encoded(SHIFT_JIS, SHIFT_JIS_TEXT);
+        let decoded = decode_units(&bytes, TextEncoding::Detect).expect("Shift_JIS decodes");
+        assert_eq!(decoded.units, units_of(SHIFT_JIS_TEXT));
+        assert_eq!(decoded.text(), SHIFT_JIS_TEXT);
     }
 
     // reference/cpp/core/base/TextStream.cpp:47-57 — BOM-less text is decoded
@@ -787,6 +835,19 @@ mod tests {
         );
     }
 
+    // A UTF-32 payload reaches the VM as the UTF-16 form of the same text.
+    //
+    // reference/cpp/core/base/TextStream.cpp:174-180 — the UTF-32 branch
+    // converts the payload to UTF-16 directly.
+    #[test]
+    fn utf32_bom_yields_the_text_code_units() {
+        let text = "wide 世界";
+        let mut little_endian = vec![0xFF, 0xFE, 0x00, 0x00];
+        little_endian.extend(text.chars().flat_map(|ch| (ch as u32).to_le_bytes()));
+        let decoded = decode_units(&little_endian, TextEncoding::Detect).expect("UTF-32LE BOM");
+        assert_eq!(decoded.units, units_of(text));
+    }
+
     // reference/cpp/core/base/TextStream.cpp:140-143 — an explicit
     // `Scripts.textEncoding` overrides detection; :182-188 drops bytes the
     // charset cannot decode.
@@ -840,17 +901,19 @@ mod tests {
         // A Shift_JIS payload with text on both sides of one byte the charset
         // cannot decode (0xA0).
         let bytes = [0x41, 0x82, 0xA0, 0xA0, 0x82, 0xB1, 0x42];
-        let (text, logs) = capture_logs(|| decode_from_encoding(&bytes, SHIFT_JIS));
+        let (decoded, logs) = capture_logs(|| decode_charset_logged(&bytes, SHIFT_JIS));
         assert_eq!(
-            text.expect("Shift_JIS decodes with one dropped byte"),
-            "AあこB"
+            decoded
+                .expect("Shift_JIS decodes with one dropped byte")
+                .units,
+            units_of("AあこB")
         );
         assert_dropped_once(&logs, "Shift_JIS", 1);
     }
 
     // The reference assigns raw UTF-16 units without failing; the lossy
     // `String` view cannot hold an unpaired surrogate, so the unit is dropped
-    // and recorded. The lossless code-unit path is `decode_text_units`.
+    // and recorded. The lossless code-unit path is the units themselves.
     #[test]
     fn fefe_payload_drops_unpaired_surrogates() {
         let bytes = fefe_mode0(&[0x0041, 0xD800, 0x0042]);
@@ -861,7 +924,7 @@ mod tests {
 
     // reference/cpp/core/base/TextStream.cpp:82-135 — the reference decrypts
     // the container into UTF-16 code units and keeps every unit, including an
-    // unpaired surrogate; `decode_text_units` is that path.
+    // unpaired surrogate; the units are that path.
     #[test]
     fn fefe_containers_keep_every_code_unit() {
         let units = [0x0041, 0xD800, 0x0042];
@@ -870,9 +933,8 @@ mod tests {
             (1u8, fefe_cipher(1, &units)),
             (2u8, fefe_zlib(&units)),
         ] {
-            let decoded =
-                decode_text_units(&bytes, TextEncoding::Detect).expect("container decodes");
-            assert_eq!(decoded, units, "mode {mode}");
+            let decoded = decode_units(&bytes, TextEncoding::Detect).expect("container decodes");
+            assert_eq!(decoded.units, units, "mode {mode}");
         }
     }
 
@@ -887,10 +949,8 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0x9c, 0x73, 0x74, 0x72, 0x06, 0x00,
             0x01, 0x8d, 0x00, 0xc7,
         ];
-        assert_eq!(
-            decode_text_units(&bytes, TextEncoding::Detect).expect("zlib decodes"),
-            [0x4241]
-        );
+        let decoded = decode_units(&bytes, TextEncoding::Detect).expect("zlib decodes");
+        assert_eq!(decoded.units, [0x4241]);
         assert_eq!(
             decode_text(&bytes, TextEncoding::Detect).expect("zlib decodes"),
             "䉁"
@@ -1036,26 +1096,25 @@ mod tests {
     fn reported_decoding_names_the_encoding_path() {
         let mut utf8 = vec![0xEF, 0xBB, 0xBF];
         utf8.extend_from_slice(b"hi");
-        let reported = decode_text_reported(&utf8, TextEncoding::Detect).expect("UTF-8 BOM");
-        assert_eq!(reported.encoding, "UTF-8 BOM");
-        assert_eq!(reported.text, "hi");
+        let reported = decode_units(&utf8, TextEncoding::Detect).expect("UTF-8 BOM");
+        assert_eq!(reported.encoding_label(), "UTF-8 BOM");
+        assert_eq!(reported.text(), "hi");
 
         let container = fefe_mode0(&[0x41, 0x42]);
-        let reported =
-            decode_text_reported(&container, TextEncoding::Detect).expect("FE FE container");
-        assert_eq!(reported.encoding, "FE FE container mode 0");
-        assert_eq!(reported.text, "AB");
+        let reported = decode_units(&container, TextEncoding::Detect).expect("FE FE container");
+        assert_eq!(reported.encoding_label(), "FE FE container mode 0");
+        assert_eq!(reported.text(), "AB");
 
-        let reported = decode_text_reported(b"AB", TextEncoding::Named("cp932")).expect("explicit");
-        assert_eq!(reported.encoding, "explicit 'cp932'");
-        assert_eq!(reported.text, "AB");
+        let reported = decode_units(b"AB", TextEncoding::Named("cp932")).expect("explicit");
+        assert_eq!(reported.encoding_label(), "explicit 'cp932'");
+        assert_eq!(reported.text(), "AB");
 
         let bytes = encoded(SHIFT_JIS, SHIFT_JIS_TEXT);
-        let reported = decode_text_reported(&bytes, TextEncoding::Detect).expect("detected");
+        let reported = decode_units(&bytes, TextEncoding::Detect).expect("detected");
         assert!(
-            reported.encoding.starts_with("detected "),
+            reported.encoding_label().starts_with("detected "),
             "got: {}",
-            reported.encoding
+            reported.encoding_label()
         );
     }
 
@@ -1067,5 +1126,21 @@ mod tests {
         let message = decode_text(&bytes, TextEncoding::Named("no-such-encoding"))
             .expect_err("an unsupported charset name must fail");
         assert!(message.contains("not supported"), "got: {message}");
+    }
+
+    // A UTF-32 payload outside the Basic Multilingual Plane reaches the VM as
+    // the surrogate pair of the same character.
+    //
+    // reference/cpp/core/base/TextStream.cpp:174-180 — the UTF-32 branch
+    // converts the payload to UTF-16, so an astral character becomes its
+    // surrogate pair.
+    #[test]
+    fn utf32_bom_keeps_an_astral_character() {
+        let text = "😀";
+        let mut little_endian = vec![0xFF, 0xFE, 0x00, 0x00];
+        little_endian.extend(text.chars().flat_map(|ch| (ch as u32).to_le_bytes()));
+        let decoded = decode_units(&little_endian, TextEncoding::Detect).expect("UTF-32LE BOM");
+        assert_eq!(decoded.units, units_of(text));
+        assert_eq!(decoded.text(), text);
     }
 }

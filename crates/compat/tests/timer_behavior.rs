@@ -1903,3 +1903,34 @@ fn the_registry_pump_delivers_the_timer_to_the_script() {
     }
     assert!(env.eval_int("hits") >= 1, "the timer callback never ran");
 }
+
+/// Reference: the timer event is the dictionary `TVPCreateEventObject`
+/// builds (`reference/cpp/core/base/EventIntf.cpp:709-735`) — the VM's own
+/// dictionary class (`EventIntf.cpp:714`) — carrying `type` ("onTimer") and
+/// `target` (the timer object) (`EventIntf.cpp:716-732`,
+/// `reference/cpp/core/utils/TimerIntf.cpp:164`).
+#[test]
+fn the_timer_event_is_the_reference_event_dictionary() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var seen = null; \
+         var t = new Timer(function(e){ seen = e; }, ''); \
+         t.onTimer();",
+    );
+    assert_eq!(
+        env.eval_ok("seen.type"),
+        TjsValue::String("onTimer".to_string()),
+        "`type` is the event name (`EventIntf.cpp:716-724`)"
+    );
+    assert_eq!(
+        env.eval_int("seen.target === t"),
+        1,
+        "`target` is the object the event happened on (`EventIntf.cpp:727-732`)"
+    );
+    assert_eq!(
+        env.eval_int("seen instanceof \"Dictionary\""),
+        1,
+        "the event object is a dictionary of the VM's dictionary class (`EventIntf.cpp:714`)"
+    );
+}

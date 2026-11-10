@@ -59,15 +59,18 @@ bound `MAX_TEXT_CACHE_ENTRIES` (1300) and evict least-recently-used.
 impl TextEngine {
     pub fn new() -> Self;
     pub fn set_system_font_dirs(&mut self, dirs: Vec<PathBuf>);
+    pub fn set_host_faces(&mut self, default_families: Vec<String>,
+                          coverage_codepoint: char);
     pub fn add_font(&mut self, bytes: &[u8], index: u32) -> Result<FontId, TextError>;
     pub fn font_id(&self, family: &str) -> Option<FontId>;
     pub fn alias(&mut self, name: &str, id: FontId);
     pub fn registry(&self) -> &FontRegistry;
-    pub fn default_face(&self) -> Option<FontId>;
-    pub fn coverage_face(&self) -> Option<FontId>;
+    pub fn default_face(&mut self) -> Option<FontId>;
+    pub fn coverage_face(&mut self) -> Option<FontId>;
+    pub fn default_face_name(&mut self) -> Option<&str>;
+    pub fn registered_face_names(&mut self) -> Vec<String>;
     pub fn designate_coverage_face(&mut self, id: FontId) -> Result<(), TextError>;
     pub fn load_system_font(&mut self, family: &str) -> Result<FontId, TextError>;
-    pub fn install_default_face(&mut self, families: &[&str]) -> Result<FontId, TextError>;
     pub fn install_coverage_face(&mut self, codepoint: char) -> Result<FontId, TextError>;
     pub fn face(&self, id: FontId) -> Option<&Font>;
     pub fn family_name(&self, id: FontId) -> Option<&str>;
@@ -79,6 +82,7 @@ impl TextEngine {
     pub fn layout(&mut self, font: FontId, text: &str, style: &TextStyle,
                   wrap_width: Option<f32>) -> Result<TextLayout, TextError>;
     pub fn cached_layouts(&self) -> usize;
+    pub fn system_database_builds(&self) -> usize;
     pub fn rasterize_glyph(&self, font: FontId, codepoint: char,
                            style: &TextStyle) -> Result<GlyphBitmap, TextError>;
     pub fn glyph_advance(&mut self, font: FontId, codepoint: char, style: &TextStyle)
@@ -165,20 +169,29 @@ query, a face registered afterwards is found by `font_id` before the memo is
 consulted, and the memo is dropped when `set_system_font_dirs` rebuilds the
 font database.
 
-`install_default_face` registers the engine's default face: the first of the
-families the host provides. The composition root calls it before any script
-runs, so the host's own default user-interface font is the default face and
-supplies the metrics of a face name that resolves to nothing. A registry that
-already holds a face keeps it.
+`set_host_faces` selects the host's two font roles: the families the host
+installs as its own default font, and the character the host's coverage face
+has to carry. The roles are **resolved on the first use of the text service**,
+not when they are selected, so a game that asks about no font never pays for
+the host's font scan. The resolution is guarded by a flag that lives with the
+state it guards, the way the reference's font system keeps its initialization
+flag beside the font names it fills
+(`reference/cpp/core/visual/FontSystem.cpp:14-25`); the work happens on
+whichever thread asks first, and it happens once.
+
+The resolution registers the host's default face first — the first of the
+selected families the host provides — so it is the oldest face and therefore
+the engine's default face: the face a face name that resolves to nothing takes
+its metrics from. It then designates the coverage face, so the coverage face
+is a second face and not the default one. A registry that already holds a
+face keeps it.
 
 `install_coverage_face` registers the face the per-character fallback reaches
 for: the first installed face that maps `codepoint` **and can draw it**, and
 designates it. A face the rasterizer cannot load, or that the shaping
 database cannot register, is passed over, so a host that carries one unusable
 face still gets a coverage face from the next face that carries the
-character. The composition root calls it after the default face, so the
-coverage face is a second face and not the default one. A registry that
-already designated a coverage face keeps it.
+character. A registry that already designated a coverage face keeps it.
 
 ### The glyph atlas
 

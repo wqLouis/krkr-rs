@@ -401,7 +401,6 @@
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// Reusable `out.string` scratch. The C++ trampoline copies the string", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// The reference hands the *same* dictionary object out on every read", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// The reference keeps one `Macros` dictionary that scripts and", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// Write TJS `null` into `out` (the reference hands a null pointer through", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// Write a retained object into `out` as `VAL_RETAINED`; the C++ trampoline", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// `DicClear` from the *class object* at `KAGParser.cpp:336-344`) and the C", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// `KAGParser.cpp:2474`, `2487-2501`) — and rebuild it when the content", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -412,7 +411,6 @@
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// `store()` — serialize the parser state into a **dictionary** (reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// `tTJSNI_KAGParser::Restore(iTJSDispatch2*)`, `KAGParser.cpp:723-906`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// `tTJSNI_KAGParser::Store`, `KAGParser.cpp:469-636`): the reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// `tTJSVariant(params, params)`, `KAGParser.cpp:2499-2501`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// changed. The reference mutates its dictionary in place instead, but a TJS", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// check, `KAGParser.cpp:2273-2295`): a non-object or a non-`KAGParser`", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/kag/mod.rs", "rule": "reference-citation", "anchor": "/// dictionaries releases everything the reference releases and leaves no", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -2409,7 +2407,6 @@
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// (`SystemIntf.cpp:167-180`): TJS `null` stores an empty closure that the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// (`SystemIntf.cpp:183-197`): `null` matches an empty slot and no-ops.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// (`SystemIntf.cpp:259-286`) — extra arguments are ignored.", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// (`SystemIntf.cpp:58-77`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// (`environ/linux/Platform.cpp:140-183`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// (`reference/cpp/core/base/SystemIntf.cpp:358-361`), so the stored", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// (`reference/cpp/core/base/SystemIntf.cpp:365`), i.e. the variant cast", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -2425,7 +2422,6 @@
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// Reference `TVPGetVersionInformation` (`base/MsgIntf.cpp:158-171`) with", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// Reference `param[0]->AsObjectClosureNoAddRef()`", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// Reference algorithms (colors, UUID, RegisterData traversal)", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// Reference: the `System` class object carries default *data* members", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// The C++ side consumes the retention while copying the result.", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// The reference `createUUID` body has no `numparams` check", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -2445,7 +2441,6 @@
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// `0 != (tjs_int)*param` (`SystemIntf.cpp:399-402`) — the strict", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// `0 != (tjs_int)*param` (`SystemIntf.cpp:457-460`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// `TVPDrawThreadNum = (tjs_int)*param` (`SystemIntf.cpp:413-416`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// `base/SystemIntf.cpp:477-484`), so `System.onActivate` reads as `null`", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// `numparams > 0 ? param[0]->AsInteger() : 0` (`SystemIntf.cpp:111`,", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// delivery loop skips (`EventIntf.cpp:816`) — a silent success — while", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/system.rs", "rule": "reference-citation", "anchor": "// result on a miss (`SystemImpl.cpp:709-726`) — there is no default", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -2583,7 +2578,6 @@
 {"path": "crates/compat/src/natives/video.rs", "rule": "reference-citation", "anchor": "/// Read a boolean member, defaulting to `true` when absent (the reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/video.rs", "rule": "reference-citation", "anchor": "/// The mixing layer's opacity in `0.0..=1.0` (reference `opacity / 255`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/video.rs", "rule": "reference-citation", "anchor": "/// The reference ignores a `mode` write while a stream is open.", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/video.rs", "rule": "reference-citation", "anchor": "/// Write TJS `null` into `out` (reference `layer1`/`layer2` read back null).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/video.rs", "rule": "reference-citation", "anchor": "/// `VideoOverlay(win)` — the constructor hook. The reference `Construct`", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/video.rs", "rule": "reference-citation", "anchor": "/// `layer1`/`layer2` assignment (reference `Layer1`/`Layer2`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/video.rs", "rule": "reference-citation", "anchor": "/// `mode` (`tTVPVideoOverlayMode`; reference default `vomOverlay`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
@@ -2646,7 +2640,6 @@
 {"path": "crates/compat/src/natives/visual/common.rs", "rule": "reference-citation", "anchor": "/// `tTJSNI_BaseTimer::Owner`, `TimerIntf.cpp:52`, held with no", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/common.rs", "rule": "reference-citation", "anchor": "/// `tjs_uint64` the reference setter stores (`TimerIntf.cpp:196-197`),", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/common.rs", "rule": "reference-citation", "anchor": "/// even while L3 keeps it *unarmed* in L2, because the reference's", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/natives/visual/common.rs", "rule": "reference-citation", "anchor": "/// expression is evaluated and its object variant retained (as the reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/common.rs", "rule": "reference-citation", "anchor": "/// it (the reference getter reports what `SetEnabled` stored,", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/common.rs", "rule": "reference-citation", "anchor": "/// it defaults to `TVPActionName == \"action\"` (`EventIntf.cpp:740`) and", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/natives/visual/common.rs", "rule": "reference-citation", "anchor": "/// its \"no limit\" sentinel (`TimerIntf.cpp:77`) and any positive value", "reason": "legacy comment, cleanup tracked in TODO §15"}

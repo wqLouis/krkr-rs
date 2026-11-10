@@ -14,9 +14,12 @@
 //! `VAL_RETAINED` result, so `getNextTag` returns a **real TJS
 //! Dictionary** (`tagname` plus every attribute plus `taglist`, an array of
 //! member names in source order, matching the reference's `ArgValue`). The
-//! dictionary is created with `%[]` and populated through
-//! `Tjs2Engine::set_member`, so no scenario text is evaluated as TJS — only
-//! the `taglist` array literal is built from escaped attribute names.
+//! dictionary is the VM's own dictionary class and it is populated through
+//! `Tjs2Engine::set_member`, so no scenario text is evaluated as TJS and no
+//! script is compiled for the tag. The parser keeps **one** dictionary and
+//! clears it before every tag, so the script sees the same dictionary object
+//! for every tag, and the owner handlers (`onJump`, `onCall`, `onReturn`)
+//! receive that same object.
 //! `macros`, `macroParams` and `paramMacros` likewise return real
 //! Dictionaries.
 //!
@@ -49,7 +52,8 @@ use tjs::{
 };
 
 use crate::binding;
-use crate::native_util::{args, report_error, set_int, set_void};
+use crate::native_util::{args, report_error, set_int, set_null, set_void};
+use crate::natives::event::event_dictionary;
 use crate::natives::system::{tjs_string_to_integer, try_value_as_i64, value_as_bool};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
@@ -200,7 +204,12 @@ fn object_to_string(engine: &Tjs2Engine, object: &DetachedValue) -> Result<Strin
 }
 
 impl KagEnv {
-    fn new(engine: &'static Tjs2Engine, storage: Option<*mut Storage>, owner: *mut c_void) -> Self {
+    fn new(
+        engine: &'static Tjs2Engine,
+        storage: Option<*mut Storage>,
+        owner: *mut c_void,
+        instance: *mut KagParserInstance,
+    ) -> Self {
         // The expression is evaluated with the parser as its context: a free
         // name resolves on the parser first (`mp` is the macro parameters)
         // and on the global after it.
@@ -279,9 +288,9 @@ impl KagEnv {
                 },
             ))
         };
-        let jump = owner_tag_closure(engine, owner, "onJump");
-        let call = owner_tag_closure(engine, owner, "onCall");
-        let return_ = owner_tag_closure(engine, owner, "onReturn");
+        let jump = owner_tag_closure(engine, owner, "onJump", instance);
+        let call = owner_tag_closure(engine, owner, "onCall", instance);
+        let return_ = owner_tag_closure(engine, owner, "onReturn", instance);
         let scenario_load: Option<ScenarioLoadClosure> = if owner.is_null() {
             None
         } else {
@@ -359,10 +368,14 @@ impl KagEnv {
 /// Build an owner veto closure for `member` (`onJump`/`onCall`/`onReturn`).
 /// A missing handler or any error leaves the tag processed, matching the
 /// reference's `process = true` default.
+///
+/// The closure hands the owner the parser's own tag dictionary — the object
+/// `getNextTag` returns.
 fn owner_tag_closure(
     engine: &'static Tjs2Engine,
     owner: *mut c_void,
     member: &'static str,
+    instance: *mut KagParserInstance,
 ) -> Option<TagClosure> {
     if owner.is_null() {
         return None;
@@ -372,9 +385,13 @@ fn owner_tag_closure(
             let Ok(id) = engine.retain_object_detached(owner) else {
                 return true;
             };
-            let Ok(dict) = build_tag_dict(engine, name, params) else {
+            let Ok(dict) = tag_dictionary(engine, instance) else {
                 return true;
             };
+            if let Err(error) = fill_tag_dict(engine, &dict, name, params) {
+                log::debug!("KAGParser: the {member} tag dictionary could not be filled: {error}");
+                return true;
+            }
             match engine.call_member(
                 id.raw_id(),
                 member,
@@ -402,10 +419,14 @@ fn tjs_value_truthy(value: &TjsValue) -> bool {
 }
 
 /// Build the walk environment for a callback, resolving the VM/storage.
-fn make_env(engine: *mut c_void, owner: *mut c_void) -> Result<KagEnv, String> {
+fn make_env(
+    engine: *mut c_void,
+    instance: *mut KagParserInstance,
+    owner: *mut c_void,
+) -> Result<KagEnv, String> {
     let host = resolve_host(engine)?;
     let storage = resolve_storage(engine)?;
-    Ok(KagEnv::new(host, storage, owner))
+    Ok(KagEnv::new(host, storage, owner, instance))
 }
 
 /// Synchronize the live `macros` dictionary with the parser's macro table.
@@ -492,8 +513,8 @@ fn set_retained_object(out: *mut Value, object: DetachedValue) {
     std::mem::forget(object);
 }
 
-/// Evaluate a small object expression (`%[]`, an array literal) and retain
-/// the resulting object.
+/// Evaluate a small object expression (a TJS helper) and retain the
+/// resulting object.
 fn retained_object(engine: &Tjs2Engine, expression: &str) -> Result<DetachedValue, String> {
     match engine
         .eval_retained(expression, "KAGParser")
@@ -506,57 +527,79 @@ fn retained_object(engine: &Tjs2Engine, expression: &str) -> Result<DetachedValu
     }
 }
 
-/// Build a TJS array literal from already-decoded strings (escaped).
-fn array_literal(items: &[String]) -> String {
-    let mut literal = String::from("[");
-    for (i, item) in items.iter().enumerate() {
-        if i > 0 {
-            literal.push(',');
-        }
-        literal.push_str(&tjs_escape(item));
+/// Build a TJS array of strings.
+///
+/// The array is the VM's own array class and every item is appended with the
+/// VM's `add` method, so no script is compiled for it.
+fn string_array(engine: &Tjs2Engine, items: &[String]) -> Result<DetachedValue, String> {
+    let array = engine.new_array()?;
+    for item in items {
+        engine.array_add(array.raw_id(), &TjsValue::String(item.clone()))?;
     }
-    literal.push(']');
-    literal
-}
-
-/// Escape a string as a TJS double-quoted literal. Control characters use a
-/// fixed-width four-digit `\xHHHH` escape so a following hex digit cannot be
-/// absorbed.
-fn tjs_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+    Ok(array)
 }
 
 /// Build a real TJS Dictionary from ordered `(key, value)` entries.
 fn retain_dict(engine: &Tjs2Engine, entries: &[(String, String)]) -> Result<DetachedValue, String> {
-    let dict = retained_object(engine, "%[]")?;
+    let dict = event_dictionary(engine)?;
     for (key, value) in entries {
         engine.set_member(dict.raw_id(), key, &TjsValue::String(value.clone()))?;
     }
     Ok(dict)
 }
 
-/// Build a tag dictionary: `tagname`, every attribute in source order, and
-/// `taglist` (the member names in insertion order).
-fn build_tag_dict(
+/// The parser's tag dictionary, cleared and ready to be filled.
+///
+/// The parser keeps one dictionary and clears it before every tag, so the
+/// script sees the same dictionary object for every tag of the walk — and
+/// the owner handlers (`onJump`, `onCall`, `onReturn`) receive that same
+/// object.
+///
+/// The dictionary is created on the first tag instead of in the constructor,
+/// so a parser that never walks a scenario allocates nothing.
+fn tag_dictionary(
     engine: &Tjs2Engine,
+    instance: *mut KagParserInstance,
+) -> Result<DetachedValue, String> {
+    // SAFETY: `instance` is the live payload of the parser object the native
+    // was called on, and the VM owns it for the whole call. The borrow below
+    // covers the tag dictionary alone — the walk state the caller holds is a
+    // different field of the same payload.
+    let slot = unsafe { &mut (*instance).tag_dict };
+    if slot.is_none() {
+        *slot = Some(event_dictionary(engine)?);
+    }
+    let dict = match slot.as_ref() {
+        Some(dict) => dict,
+        // The dictionary was created just above.
+        None => return Err("KAGParser: the tag dictionary is missing".to_string()),
+    };
+    clear_dictionary(engine, dict)?;
+    // The caller gets its own handle; the instance keeps the dictionary alive
+    // for the parser's lifetime.
+    engine.duplicate_retained(dict.raw_id())
+}
+
+/// Empty a dictionary.
+///
+/// The dictionary class's `clear` is a static member, so it is not reachable
+/// through the instance's own member table; deleting every member reaches
+/// the same state the class's `clear` leaves the dictionary in.
+fn clear_dictionary(engine: &Tjs2Engine, dict: &DetachedValue) -> Result<(), String> {
+    for name in engine.enum_members(dict.raw_id())? {
+        engine.delete_member(dict.raw_id(), &name)?;
+    }
+    Ok(())
+}
+
+/// Fill a tag dictionary: `tagname`, every attribute in source order, and
+/// `taglist` (the member names in insertion order).
+fn fill_tag_dict(
+    engine: &Tjs2Engine,
+    dict: &DetachedValue,
     name: &str,
     params: &[(String, String)],
-) -> Result<DetachedValue, String> {
-    let dict = retained_object(engine, "%[]")?;
+) -> Result<(), String> {
     engine.set_member(
         dict.raw_id(),
         "tagname",
@@ -574,23 +617,25 @@ fn build_tag_dict(
     let mut names: Vec<String> = Vec::with_capacity(params.len() + 1);
     names.push("tagname".to_string());
     names.extend(params.iter().map(|(key, _)| key.clone()));
-    let taglist = retained_object(engine, &array_literal(&names))?;
+    let taglist = string_array(engine, &names)?;
     engine.set_member(
         dict.raw_id(),
         "taglist",
         &TjsValue::Retained(taglist.raw_id().as_ptr() as u64),
     )?;
-    Ok(dict)
+    Ok(())
 }
 
 /// Write a tag dictionary to a native result slot.
 fn set_tag_result(
     engine: &Tjs2Engine,
     out: *mut Value,
+    instance: *mut KagParserInstance,
     name: &str,
     params: &[(String, String)],
 ) -> Result<(), String> {
-    let dict = build_tag_dict(engine, name, params)?;
+    let dict = tag_dictionary(engine, instance)?;
+    fill_tag_dict(engine, &dict, name, params)?;
     set_retained_object(out, dict);
     Ok(())
 }
@@ -641,6 +686,8 @@ fn param_to_bool(v: &Value) -> bool {
 /// `invalidate` hook drops it.
 struct KagParserInstance {
     state: KagParserState,
+    /// The parser's one tag dictionary, cleared before every tag.
+    tag_dict: Option<DetachedValue>,
     /// The cached `macros` dictionary (identity-stable while unchanged).
     macros_dict: Option<DetachedValue>,
     /// The content last published through `macros_dict`.
@@ -656,6 +703,7 @@ impl KagParserInstance {
     fn new() -> Self {
         Self {
             state: KagParserState::default(),
+            tag_dict: None,
             macros_dict: None,
             macros_snapshot: Vec::new(),
             macro_args_dict: None,
@@ -689,9 +737,9 @@ fn instance_of(instance: *mut c_void) -> &'static mut KagParserInstance {
 }
 
 /// Reference `tTJSNI_KAGParser::Invalidate` (`KAGParser.cpp:373-391`):
-/// release the cached `Macros`/argument dictionaries, clear the macro-argument
-/// stack and the scenario buffer, and drop `Owner`. This payload retains no
-/// objects across calls, so clearing the parser state and the two cached
+/// release the tag dictionary and the cached `Macros`/argument dictionaries,
+/// clear the macro-argument stack and the scenario buffer, and drop `Owner`. The payload
+/// retains no objects across calls, so clearing the parser state and the three
 /// dictionaries releases everything the reference releases and leaves no
 /// walk state to fire callbacks from.
 extern "C" fn kagparser_invalidate(_engine: *mut c_void, instance: *mut c_void) {
@@ -699,6 +747,7 @@ extern "C" fn kagparser_invalidate(_engine: *mut c_void, instance: *mut c_void) 
         return;
     }
     let instance = instance_of(instance);
+    instance.tag_dict = None;
     instance.macros_dict = None;
     instance.macros_snapshot.clear();
     instance.macro_args_dict = None;
@@ -743,7 +792,7 @@ extern "C" fn native_load_scenario(
         Ok(name) => name,
         Err(e) => return report_error(out_error, &e),
     };
-    let mut env = match make_env(engine, objthis) {
+    let mut env = match make_env(engine, instance as *mut KagParserInstance, objthis) {
         Ok(env) => env,
         Err(e) => return report_error(out_error, &e),
     };
@@ -773,17 +822,20 @@ extern "C" fn native_get_next_tag(
         Ok(host) => host,
         Err(e) => return report_error(out_error, &e),
     };
-    let mut env = match make_env(engine, objthis) {
+    let mut env = match make_env(engine, instance as *mut KagParserInstance, objthis) {
         Ok(env) => env,
         Err(e) => return report_error(out_error, &e),
     };
     let instance = instance_of(instance);
+    // The tag dictionary lives in the parser's payload; the walk below holds
+    // the walk state, so the payload is reached through the raw pointer.
+    let parser = ptr::from_mut(instance);
     // Pick up script mutations of the live `macros` table before the walk.
     if let Err(e) = sync_macros(host, instance) {
         return report_error(out_error, &e);
     }
     match instance.state.next_tag(&mut env.environ()) {
-        Ok(Some((name, params))) => match set_tag_result(host, out, &name, &params) {
+        Ok(Some((name, params))) => match set_tag_result(host, out, parser, &name, &params) {
             Ok(()) => 0,
             Err(e) => report_error(out_error, &e),
         },
@@ -840,7 +892,7 @@ extern "C" fn native_call_label(
         Ok(name) => name,
         Err(e) => return report_error(out_error, &e),
     };
-    let mut env = match make_env(engine, objthis) {
+    let mut env = match make_env(engine, instance as *mut KagParserInstance, objthis) {
         Ok(env) => env,
         Err(e) => return report_error(out_error, &e),
     };
@@ -984,7 +1036,7 @@ extern "C" fn native_store(
 
 /// Build the reference `Store()` dictionary for the current state.
 fn build_store_dict(host: &Tjs2Engine, state: &KagParserState) -> Result<DetachedValue, String> {
-    let dict = retained_object(host, "%[]")?;
+    let dict = event_dictionary(host)?;
     let raw = dict.raw_id();
     // The emulator snapshot `restore` reads; its saved walk position is
     // ignored so the label rewind still applies.
@@ -1044,7 +1096,7 @@ fn build_store_dict(host: &Tjs2Engine, state: &KagParserState) -> Result<Detache
     )?;
     drop(macros);
     // `macroArgs`: an array of dictionaries (`KAGParser.cpp:521-544`).
-    let levels = retained_object(host, "[]")?;
+    let levels = host.new_array()?;
     for (index, level) in state.macro_args_entries().iter().enumerate() {
         let level_dict = retain_dict(host, level)?;
         host.set_member(
@@ -1061,9 +1113,9 @@ fn build_store_dict(host: &Tjs2Engine, state: &KagParserState) -> Result<Detache
     )?;
     drop(levels);
     // `callStack`: an array of dictionaries (`KAGParser.cpp:546-634`).
-    let stack = retained_object(host, "[]")?;
+    let stack = host.new_array()?;
     for (index, entry) in state.call_stack_snapshots().iter().enumerate() {
-        let entry_dict = retained_object(host, "%[]")?;
+        let entry_dict = event_dictionary(host)?;
         let entry_raw = entry_dict.raw_id();
         for (key, value) in [
             ("storage", TjsValue::String(entry.storage.clone())),
@@ -1149,7 +1201,7 @@ extern "C" fn native_restore(
         Ok(object) => object,
         Err(e) => return report_error(out_error, &e),
     };
-    let mut env = match make_env(engine, objthis) {
+    let mut env = match make_env(engine, instance as *mut KagParserInstance, objthis) {
         Ok(env) => env,
         Err(e) => return report_error(out_error, &e),
     };
@@ -1460,20 +1512,6 @@ fn publish_cached_dict(
     Ok(())
 }
 
-/// Write TJS `null` into `out` (the reference hands a null pointer through
-/// `tTJSVariant(params, params)`, `KAGParser.cpp:2499-2501`).
-fn set_null_result(host: &Tjs2Engine, out: *mut Value) {
-    if out.is_null() {
-        return;
-    }
-    match host.eval_retained("null", "KAGParser.null") {
-        Ok(RetainedValue::Object(null)) => {
-            set_retained_object(out, null);
-        }
-        _ => set_void(out),
-    }
-}
-
 /// `getMacroParams()` — the top macro-args dictionary, or `null` when the
 /// stack is empty (reference `GetMacroTopNoAddRef`, `KAGParser.cpp:2191-2196`
 /// + the null `tTJSVariant` at `2499-2501`).
@@ -1492,7 +1530,7 @@ extern "C" fn native_get_macro_params(
     };
     let instance = instance_of(instance);
     let Some(entries) = instance.state.macro_params_entries() else {
-        set_null_result(host, out);
+        set_null(out);
         return 0;
     };
     if let Err(e) = publish_cached_dict(
@@ -1563,7 +1601,7 @@ extern "C" fn prop_cur_storage_set(
         Ok(name) => name,
         Err(e) => return report_error(out_error, &e),
     };
-    let mut env = match make_env(engine, objthis) {
+    let mut env = match make_env(engine, instance as *mut KagParserInstance, objthis) {
         Ok(env) => env,
         Err(e) => return report_error(out_error, &e),
     };
@@ -1630,14 +1668,14 @@ fn retain_param_macros_dict(
     host: &Tjs2Engine,
     entries: &[(String, Vec<(String, String)>)],
 ) -> Result<DetachedValue, String> {
-    let dict = retained_object(host, "%[]")?;
+    let dict = event_dictionary(host)?;
     for (name, list) in entries {
         let mut flat: Vec<String> = Vec::with_capacity(list.len() * 2);
         for (key, value) in list {
             flat.push(key.clone());
             flat.push(value.clone());
         }
-        let array = retained_object(host, &array_literal(&flat))?;
+        let array = string_array(host, &flat)?;
         host.set_member(
             dict.raw_id(),
             name,

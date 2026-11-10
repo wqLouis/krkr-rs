@@ -11,7 +11,7 @@ use std::slice;
 
 use tjs::{
     NativeObjThisMethod, NativeObjThisMethodDef, NativeObjThisProperty, NativeObjThisPropertyDef,
-    Tjs2Engine, VAL_INTEGER, VAL_VOID, Value, tjs2_malloc,
+    Tjs2Engine, VAL_INTEGER, VAL_NULL, VAL_VOID, Value, tjs2_malloc,
 };
 
 use crate::{CompatCtx, CompatServices};
@@ -159,6 +159,27 @@ pub(crate) fn set_int(out: *mut Value, value: i64) {
 /// Write a boolean result as a TJS integer (`true` = 1, `false` = 0).
 pub(crate) fn set_bool(out: *mut Value, value: bool) {
     set_int(out, i64::from(value));
+}
+
+/// Write TJS `null` into a native callback's out slot.
+///
+/// TJS `null` is an object value with no object pointer, and the C ABI
+/// carries it as `VAL_NULL`: the VM turns it into exactly that value, so no
+/// script has to be compiled to produce it.
+pub(crate) fn set_null(out: *mut Value) {
+    if out.is_null() {
+        return;
+    }
+    // SAFETY: the trampoline passes a valid out slot for the call.
+    unsafe {
+        (*out).ty = VAL_NULL;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = ptr::null();
+        (*out).array = ptr::null();
+        (*out).array_count = 0;
+        (*out).retained = 0;
+    }
 }
 
 /// Set the native callback error slot and return the non-zero status code.

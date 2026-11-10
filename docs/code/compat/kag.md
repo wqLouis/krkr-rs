@@ -83,8 +83,16 @@ retain an object and the C++ trampoline consumes a `VAL_RETAINED` result:
 
 * `getNextTag()` returns a Dictionary with `tagname`, every attribute in
   source order, and `taglist` — an array of the member names in insertion
-  order (`tagname` first). The array literal is built from escaped attribute
-  names, so **no scenario text is ever evaluated as TJS**.
+  order (`tagname` first). The dictionary is the VM's own dictionary class
+  — the object the reference's `TJSCreateDictionaryObject` returns
+  (`reference/cpp/core/base/KAGParser.cpp:329`) — and the array is the VM's
+  own array class, so **no scenario text is ever evaluated as TJS** and no
+  script is compiled for a tag.
+* The parser keeps **one** dictionary and clears it before every tag
+  (`reference/cpp/core/base/KAGParser.cpp:1391`), so the script sees the same
+  dictionary object for every tag of the walk, and the owner handlers
+  (`onJump`, `onCall`, `onReturn`) receive that same object
+  (`reference/cpp/core/base/KAGParser.cpp:1898`, `:1929`).
 * An attribute whose name is empty — a tag written `[x =v]`, which the
   reference reads as an empty attribute name (`KAGParser.cpp:2037-2046`) — is
   dropped from the dictionary: the reference writes the tag dictionary

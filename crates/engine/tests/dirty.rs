@@ -355,3 +355,121 @@ fn a_pixel_write_arms_the_upload() {
         "the pixel write arms the upload, or the change is never presented"
     );
 }
+
+/// A scene with a few hundred bitmaps uploads only the ones whose pixels
+/// changed.
+///
+/// The reference re-uploads a bitmap's texture only when the bitmap changed:
+/// the layer keeps an `ImageModified` flag
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:373`) and the draw walk
+/// touches only the drawn nodes
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7127`).
+#[test]
+fn only_the_changed_bitmaps_are_uploaded() {
+    let mut engine = headless_engine((64, 64));
+    let mut hook = NoopFrame;
+    let ids: Vec<u32> = (0..300)
+        .map(|_| engine.scene_mut().add_bitmap(4, 4, vec![0u8; 4 * 4 * 4]))
+        .collect();
+    // A new bitmap is dirty, so it would be uploaded; the case under test is
+    // the frame that uploads only what changed, so the bitmaps start clean.
+    for id in &ids {
+        assert!(
+            engine.scene_mut().set_bitmap_clean(*id),
+            "the bitmap is clean"
+        );
+    }
+    engine.frame(0, &mut hook).expect("first frame");
+    assert!(
+        engine.textures().is_empty(),
+        "a bitmap whose pixels did not change is not uploaded"
+    );
+
+    // Three of them change; the rest stay as they are.
+    let changed = [ids[3], ids[150], ids[299]];
+    for id in changed {
+        engine
+            .scene_mut()
+            .bitmap_mut(id)
+            .expect("bitmap")
+            .mark_dirty();
+    }
+    engine.frame(16, &mut hook).expect("second frame");
+
+    assert_eq!(
+        engine.textures().len(),
+        changed.len(),
+        "only the changed bitmaps are uploaded"
+    );
+    for id in &changed {
+        assert!(
+            engine.textures().contains_key(id),
+            "the changed bitmap is uploaded"
+        );
+    }
+}
+
+/// The textures of the bitmaps that are gone are dropped, and the textures
+/// of the bitmaps that stay are kept.
+///
+/// The reference releases the image of a destroyed object
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:515` —
+/// `tTJSNI_BaseLayer::Invalidate` deallocates the image).
+#[test]
+fn the_textures_of_removed_bitmaps_are_dropped() {
+    let mut engine = headless_engine((64, 64));
+    let mut hook = NoopFrame;
+    let ids: Vec<u32> = (0..300)
+        .map(|_| engine.scene_mut().add_bitmap(4, 4, vec![0u8; 4 * 4 * 4]))
+        .collect();
+    engine.frame(0, &mut hook).expect("first frame");
+    assert_eq!(engine.textures().len(), 300, "every new bitmap is uploaded");
+
+    let removed = [ids[0], ids[7], ids[150]];
+    for id in removed {
+        assert!(
+            engine.scene_mut().remove_bitmap(id),
+            "the bitmap is removed"
+        );
+    }
+    engine.frame(16, &mut hook).expect("second frame");
+
+    for id in removed {
+        assert!(
+            !engine.textures().contains_key(&id),
+            "the texture of a removed bitmap is dropped"
+        );
+    }
+    assert_eq!(
+        engine.textures().len(),
+        300 - removed.len(),
+        "the textures of the bitmaps that stay are kept"
+    );
+}
+
+/// A frame that changes nothing leaves nothing to upload.
+///
+/// The reference's draw walk touches only the drawn nodes
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7127`): a frame with
+/// nothing new to draw reads no bitmap.
+#[test]
+fn a_frame_that_changes_nothing_leaves_nothing_to_upload() {
+    let mut engine = headless_engine((64, 64));
+    let mut hook = NoopFrame;
+    for _ in 0..300 {
+        engine.scene_mut().add_bitmap(4, 4, vec![0u8; 4 * 4 * 4]);
+    }
+    engine.frame(0, &mut hook).expect("first frame");
+    assert_eq!(engine.textures().len(), 300, "every new bitmap is uploaded");
+
+    engine.frame(16, &mut hook).expect("second frame");
+    assert!(
+        engine.scene_mut().dirty_bitmaps_for_upload().is_empty(),
+        "the dirty set is empty after a frame that changed nothing"
+    );
+    assert_eq!(
+        engine.textures().len(),
+        300,
+        "a frame that changes nothing uploads nothing"
+    );
+}

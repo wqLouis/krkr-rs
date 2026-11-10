@@ -5,6 +5,9 @@
 //! adapters: they translate TJS values to and from the L2 (`engine`) state and
 //! actions and own no engine state themselves.
 //!
+//! [`event`] holds the one event object the families hand to the script; it
+//! registers nothing.
+//!
 //! The `tvp-*` crates are the *behavioral* reference only; they are not
 //! copied.
 
@@ -13,6 +16,7 @@ pub mod cdda_midi;
 pub mod clipboard;
 pub mod constants;
 pub mod debug;
+pub mod event;
 pub mod image_function;
 pub mod input;
 pub mod kag;

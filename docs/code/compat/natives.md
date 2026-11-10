@@ -595,9 +595,17 @@ are constructed and queried, never played.
 
 `getNextTag` returns a **real TJS Dictionary** (not the reference's string
 encoding): `tagname` plus every attribute plus `taglist`, an array of the
-member names in source order. The dictionary is built with `%[]` and
-populated through the VM's `set_member` — **no scenario text is evaluated as
-TJS**.
+member names in source order. The dictionary is the VM's own dictionary class
+— the object the reference's `TJSCreateDictionaryObject` returns
+(`reference/cpp/core/base/KAGParser.cpp:329`) — and it is populated through
+the VM's `set_member` — **no scenario text is evaluated as TJS and no script
+is compiled for the tag**.
+
+The parser keeps **one** dictionary and clears it before every tag
+(`reference/cpp/core/base/KAGParser.cpp:1391`), so the script sees the same
+dictionary object for every tag — exactly as on the reference — and the owner
+handlers (`onJump`, `onCall`, `onReturn`) receive that same object
+(`reference/cpp/core/base/KAGParser.cpp:1898`, `:1929`).
 
 `macros`, `macroParams` and `paramMacros` are real TJS Dictionaries;
 `macros` is read-only and identity-stable while its content is unchanged.
@@ -653,6 +661,30 @@ the game passes as `objthis` — the host/game installs them, not the engine.
 ---
 
 ## 18. The support modules
+
+### `event.rs`
+
+The one event object every family hands to the script: a dictionary of the
+VM's own dictionary class carrying the event's `type` and the `target` it
+happened on — the reference's `TVPCreateEventObject`
+(`reference/cpp/core/base/EventIntf.cpp:709-735`).
+
+| Function | Contract |
+|---|---|
+| `event_dictionary(host)` | the VM's dictionary object — the reference's `TJSCreateDictionaryObject` (`EventIntf.cpp:714`) |
+| `event_object(host, type, target)` | the dictionary with `type` and `target` written into it |
+
+The dictionary is **allocated by the VM**, not by evaluating a script
+literal: the reference pays a constructor, and so does the port. The
+`target` is written as a variant whose `objthis` is the target object
+(`tTJSVariant val(targthis, targ)`, `EventIntf.cpp:728`), so the script reads
+the target with itself as the context.
+
+A null target leaves the member out — the reference always names the object
+the event happened on, so a null target is a port-only situation.
+
+The KAG's tag dictionary is the same kind of object: the reference creates
+it once with the same call (`reference/cpp/core/base/KAGParser.cpp:329`).
 
 ### `constants.rs`
 

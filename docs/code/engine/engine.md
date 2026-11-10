@@ -210,6 +210,8 @@ into it and `frame` put it at the injected value.
    everything that draws and return a report with no statistics;
 7. `refresh_overlay(now_ms)`;
 8. upload the dirty bitmap regions, prune the textures whose bitmap is gone;
+   both walk the scene's dirty and removal sets, not the bitmap and texture
+   tables;
 9. project the scene when `Scene::structure_revision` changed (or the
    presentation/texture table invalidated the projection);
 10. `hooks.after_project(&drawn_layers)`;

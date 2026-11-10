@@ -360,3 +360,35 @@ fn dropped_async_triggers_release_their_bindings() {
         "a dropped AsyncTrigger must release its dispatch-state binding"
     );
 }
+
+/// The fired event is the reference's event object: a dictionary of the VM's
+/// own dictionary class that carries the event's `type` and the `target` it
+/// happened on (`TVPCreateEventObject`,
+/// `reference/cpp/core/base/EventIntf.cpp:709-735`). The dictionary is
+/// allocated by the VM (`EventIntf.cpp:714`) — not by evaluating a script
+/// literal — so the object the script receives is the reference's.
+#[test]
+fn the_fired_event_is_the_reference_event_dictionary() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var seen = null; \
+         var t = new AsyncTrigger(function(e){ seen = e; }, ''); t.trigger();",
+    );
+    env.poll();
+    assert_eq!(
+        env.eval("seen.type"),
+        TjsValue::String("onFire".to_string()),
+        "`type` is the event name (`EventIntf.cpp:716-724`)"
+    );
+    assert_eq!(
+        env.eval("seen.target === t"),
+        TjsValue::Integer(1),
+        "`target` is the object the event happened on (`EventIntf.cpp:727-732`)"
+    );
+    assert_eq!(
+        env.eval("seen instanceof \"Dictionary\""),
+        TjsValue::Integer(1),
+        "the event object is a dictionary of the VM's dictionary class (`EventIntf.cpp:714`)"
+    );
+}

@@ -21,7 +21,7 @@ use crate::collections::Map;
 use crate::engine_api::layer_ops::RectI;
 use crate::engine_api::{BitmapState, Location, Storage, StorageReadError};
 use crate::engine_api::{
-    CoverageMask, FontId, FontRegistry, TextCoverageCache, TextEngine, TextStyle,
+    CoverageMask, DEFAULT_COVERAGE_CODEPOINT, FontId, TextCoverageCache, TextEngine, TextStyle,
     blit_coverage_into, blur_coverage, blurred_text_coverage, compose_text_into,
     rasterize_text_coverage,
 };
@@ -30,12 +30,6 @@ use tjs::{Tjs2Engine, TjsValue, Value};
 
 use crate::CompatCtx;
 use crate::storage::strip_file_media;
-
-/// The character the host's coverage face has to provide.
-///
-/// The coverage face draws a character the requested face does not carry, so
-/// it is the first installed face that covers a Japanese ideograph.
-const DEFAULT_FALLBACK_CODEPOINT: char = '\u{4E00}';
 
 /// Host-supplied image decoder: the L1 `media::decode_image` call behind
 /// `Bitmap.load`.
@@ -77,22 +71,6 @@ pub(crate) fn text_service<'a>(ctx: &CompatCtx) -> Result<&'a mut TextEngine, St
         .ok_or_else(|| "text: no text service attached".to_string())?;
     // SAFETY: see above.
     Ok(unsafe { &mut *ptr })
-}
-
-/// The L2 font registry the text service owns.
-///
-/// The registry is the one place that knows which faces exist, what they are
-/// called and which of them is the default face.
-pub(crate) fn font_registry<'a>(ctx: &CompatCtx) -> Result<&'a FontRegistry, String> {
-    // SAFETY: the host keeps the attached text service alive for the
-    // binding's lifetime and the VM is single-threaded (the documented
-    // `attach_text` contract), so this borrow is sound within the
-    // callback.
-    let ptr = unsafe { ctx.services() }
-        .text()
-        .ok_or_else(|| "text: no text service attached".to_string())?;
-    // SAFETY: see above.
-    Ok(unsafe { (*ptr).registry() })
 }
 
 /// Borrow the per-engine [`ResourceResolver`].
@@ -241,17 +219,26 @@ impl ResourceResolver {
     }
 
     /// The registered face names, newest first, without the oldest name.
+    ///
+    /// The text service resolves the host's two font roles before it answers,
+    /// so the list holds the faces the host provides.
     pub(crate) fn face_names(&mut self, ctx: &CompatCtx) -> Vec<String> {
-        font_registry(ctx)
-            .map(|registry| registry.list_names())
+        text_service(ctx)
+            .map(|service| service.registered_face_names())
             .unwrap_or_default()
     }
 
     /// The default face name, or the empty string when no face is registered.
+    ///
+    /// The text service resolves the host's two font roles before it answers,
+    /// so the name is the host's own default font.
     pub(crate) fn default_face_name(&mut self, ctx: &CompatCtx) -> String {
-        font_registry(ctx)
-            .ok()
-            .and_then(|registry| registry.default_name().map(str::to_owned))
+        let Ok(service) = text_service(ctx) else {
+            return String::new();
+        };
+        service
+            .default_face_name()
+            .map(str::to_owned)
             .unwrap_or_default()
     }
 }
@@ -293,7 +280,7 @@ pub(crate) fn resolve_face(
     match service.default_face() {
         Some(default) => Ok(default),
         None => service
-            .install_coverage_face(DEFAULT_FALLBACK_CODEPOINT)
+            .install_coverage_face(DEFAULT_COVERAGE_CODEPOINT)
             .map_err(|error| format!("no font is available for face '{face}': {error}")),
     }
 }

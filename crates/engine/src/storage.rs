@@ -3687,7 +3687,7 @@ fn collect_archive_children<'a>(
         if rest.is_empty() || rest.contains('/') {
             continue;
         }
-        out.insert(rest.to_string(), entry.name.clone());
+        out.insert(rest.to_string(), entry.name.to_string());
     }
 }
 

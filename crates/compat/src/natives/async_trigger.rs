@@ -52,11 +52,12 @@ use std::ffi::{c_char, c_int, c_void};
 
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
-    RetainedValue, Tjs2Engine, TjsValue, VAL_VOID, Value,
+    Tjs2Engine, TjsValue, VAL_VOID, Value,
 };
 
 use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::natives::event::event_object;
 use crate::natives::system::{resolve, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError, CompatServices};
 
@@ -295,29 +296,11 @@ fn action_event(
     host: &Tjs2Engine,
     objthis: *mut c_void,
 ) -> Result<DetachedValue, AsyncTriggerError> {
-    let event = match host.eval_retained("%[]", "AsyncTrigger.onFire") {
-        Ok(RetainedValue::Object(event)) => event,
-        Ok(RetainedValue::Value(_)) | Err(_) => {
-            return Err(AsyncTriggerError::Event(
-                "failed to create the action event dictionary".into(),
-            ));
-        }
-    };
-    if let Err(error) =
-        host.set_member(event.raw_id(), "type", &TjsValue::String(EVENT_TYPE.into()))
-    {
-        return Err(AsyncTriggerError::Event(error));
-    }
-    if !objthis.is_null()
-        && let Ok(target) = host.retain_object_detached(objthis)
-    {
-        // The retention is consumed when the variant copy is built; a failure
-        // leaves it to `DetachedValue`'s idempotent release.
-        let target_id = target.raw_id().as_ptr() as u64;
-        let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id));
-        drop(target);
-    }
-    Ok(event)
+    event_object(host, EVENT_TYPE, objthis).map_err(|error| {
+        AsyncTriggerError::Event(format!(
+            "failed to create the action event dictionary: {error}"
+        ))
+    })
 }
 
 extern "C" fn async_trigger_create(_engine: *mut c_void) -> *mut c_void {

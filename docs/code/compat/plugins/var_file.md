@@ -40,8 +40,10 @@ images in a global dictionary and reaches a layer's pixels through
 
 ## State and lifetime
 
-The media holds the VM it walks. It resolves the global object on every read,
-so it keeps no script object alive between reads.
+The media holds the VM it walks. It reads the global object from the VM on
+every read — the object the `global` keyword names, which the engine hands
+over directly — so it keeps no script object alive between reads and
+compiles no script to reach it.
 
 ## Errors
 
@@ -69,7 +71,7 @@ A scheme that no media registered is refused by the namespace itself with
 
 | file | what it pins |
 |---|---|
-| `crates/compat/tests/var_file.rs` | that a member behind a property getter is read through the media, that only an octet member is a file, that a missing member raises "Cannot open storage", that the two failure messages keep the reference's wording, and that an unknown scheme is refused |
+| `crates/compat/tests/var_file.rs` | that a member behind a property getter is read through the media, that the read compiles no script, that only an octet member is a file, that a missing member raises "Cannot open storage", that the two failure messages keep the reference's wording, and that an unknown scheme is refused |
 | `crates/compat/tests/psb_file.rs` | that the title's route — a `PSBFile` in a global dictionary — is read through the `var://` media |
 | `crates/compat/tests/streams.rs` | that a write to a `var://` name raises "Cannot open storage" and that no `var:` directory is created |
 | `crates/compat/tests/storages_io.rs` | that the file-manipulation `Storages` members belong to `fstat` alone: the `dirlist` plugin's `Storages.getDirList` is absent, and the `var://` media adds no member either |

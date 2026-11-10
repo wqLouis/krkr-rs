@@ -9,13 +9,12 @@ use crate::engine_api::InputState;
 use crate::engine_api::Scene;
 use crate::engine_api::TimerId;
 use tjs::{
-    DetachedValue, RetainedValue, Tjs2Engine, Tjs2ValueId, VAL_INTEGER, VAL_OBJECT, VAL_REAL,
-    VAL_RETAINED, Value,
+    DetachedValue, Tjs2Engine, Tjs2ValueId, VAL_INTEGER, VAL_OBJECT, VAL_REAL, VAL_RETAINED, Value,
 };
 
 use crate::CompatCtx;
 use crate::collections::Map;
-use crate::native_util::set_void;
+use crate::native_util::{set_null, set_void};
 use crate::natives::system::resolve;
 
 /// Default font face used when a `Font` is created without a face (the
@@ -258,7 +257,7 @@ pub(crate) fn set_retained_out(_host: &Tjs2Engine, out: *mut Value, id: tjs::Tjs
 /// Duplicate a registry object into `out`; `None` writes TJS `null`.
 pub(crate) fn set_object_out(host: &Tjs2Engine, out: *mut Value, object: Option<&DetachedValue>) {
     let Some(object) = object else {
-        set_null_out(host, out);
+        set_null(out);
         return;
     };
     match host.duplicate_retained(object.raw_id()) {
@@ -273,21 +272,6 @@ pub(crate) fn set_object_out(host: &Tjs2Engine, out: *mut Value, object: Option<
             set_void(out);
         }
     }
-}
-
-/// Write TJS `null` into `out`. The C ABI has no null literal, so the `null`
-/// expression is evaluated and its object variant retained (as the reference
-/// native adapter does). Falls back to `void`, which is still falsy.
-pub(crate) fn set_null_out(host: &Tjs2Engine, out: *mut Value) {
-    if out.is_null() {
-        return;
-    }
-    if let Ok(RetainedValue::Object(object)) = host.eval_retained("null", "visual.null") {
-        set_retained_out(host, out, object.raw_id());
-        std::mem::forget(object);
-        return;
-    }
-    set_void(out);
 }
 
 /// Write a real result into `out`.

@@ -475,6 +475,12 @@ char *tjs2_get_stack_trace_string(void *engine, int limit);
 /* Retain a raw TJS object (see tjs2_abi.cpp). Returns a per-engine id or NULL. */
 tjs2_value_id tjs2_retain_object(void *engine, void *obj);
 
+/* Retain the engine's global object -- the object the `global` keyword
+ * evaluates to (the VM's global dispatch). Returns a per-engine id or NULL.
+ * A native that walks the script object graph reads it here instead of
+ * compiling a script to evaluate the `global` keyword. */
+tjs2_value_id tjs2_get_global(void *engine);
+
 /* Duplicate an existing retained id into a fresh id (the original stays
  * live). Used to return a cached object without consuming the cache. */
 tjs2_value_id tjs2_retain_retained_id(void *engine, tjs2_value_id id);

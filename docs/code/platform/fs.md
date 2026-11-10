@@ -158,7 +158,7 @@ pub fn normalize_in_archive_name(name: &str) -> String;
 
 | type | contents |
 |---|---|
-| `Entry` | `flags`, `org_size`, `arc_size`, `raw_name`, the normalized `name`, `segments`, `file_hash` |
+| `Entry` | `flags`, `org_size`, `arc_size`, the normalized `name`, `file_hash`; the segments through `segments()` and `segment_count()` |
 | `Segment` | `flags`, `start` (absolute offset in the archive), `org_size`, `arc_size` |
 | `IndexSection` | one index block: `offset`, `encode` (`Raw`/`Zlib`), `file_chunks`, the names it added |
 | `NearMisses` | the near-miss diagnostic for a failed lookup |
@@ -167,6 +167,11 @@ pub fn normalize_in_archive_name(name: &str) -> String;
 An `Entry` is **metadata plus segment descriptors, not bytes**: the bytes stay
 in the archive file (or in the preloaded image L2 owns), and a read is
 positional over `Segment::start`/`arc_size`.
+
+An entry carries **one name** — the normalized in-archive name, which the
+archive's map key shares — and its first segment inline; the segments after
+the first spill into a vector. An entry whose data is stored in one piece
+costs one allocation.
 
 `read_entry_from_bytes` takes the image as an explicit `&[u8]`, so the preload
 path never hands L1 ownership of the buffer.

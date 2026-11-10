@@ -57,7 +57,10 @@ use tjs::{
 };
 
 use crate::collections::Map;
-use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::native_util::{
+    args, report_error, set_bool, set_int, set_null, set_void, value_as_string,
+};
+use crate::natives::event::event_object;
 use crate::natives::system::{resolve, set_string_out, try_value_as_i64, value_as_bool};
 use crate::{CompatCtx, CompatError, CompatServices};
 
@@ -181,25 +184,11 @@ fn set_retained_out(out: *mut Value, id: Tjs2ValueId) {
     }
 }
 
-/// Write TJS `null` into `out`. The C ABI has no null literal, so the `null`
-/// expression is evaluated and its (empty) object variant retained.
-fn set_null_out(host: &Tjs2Engine, out: *mut Value) {
-    if out.is_null() {
-        return;
-    }
-    if let Ok(RetainedValue::Object(object)) = host.eval_retained("null", "MenuItem.null") {
-        set_retained_out(out, object.raw_id());
-        std::mem::forget(object);
-        return;
-    }
-    set_void(out);
-}
-
 /// Duplicate a retained object into `out`, or write TJS `null` when there is
 /// none. `raw` is the source id while the caller still owns its retention.
 fn emit_object_out(host: &Tjs2Engine, out: *mut Value, raw: Option<Tjs2ValueId>) {
     let Some(raw) = raw else {
-        set_null_out(host, out);
+        set_null(out);
         return;
     };
     match host.duplicate_retained(raw) {
@@ -209,7 +198,7 @@ fn emit_object_out(host: &Tjs2Engine, out: *mut Value, raw: Option<Tjs2ValueId>)
         }
         Err(error) => {
             log::warn!("MenuItem: could not duplicate a retained object: {error}");
-            set_null_out(host, out);
+            set_null(out);
         }
     }
 }
@@ -994,19 +983,13 @@ extern "C" fn menu_item_on_click(
 /// only the `action` member is invoked — there are no fallback members, just
 /// the reference's unchecked `FuncCall` result.
 fn dispatch_click_action(host: &Tjs2Engine, owner: &DetachedValue, objthis: *mut c_void) {
-    let Some(event) = eval_object(host, "%[]", "MenuItem.onClickEvent") else {
-        return;
+    let event = match event_object(host, "onClick", objthis) {
+        Ok(event) => event,
+        Err(error) => {
+            log::warn!("MenuItem.onClickEvent: the event object could not be built: {error}");
+            return;
+        }
     };
-    let _ = host.set_member(event.raw_id(), "type", &TjsValue::String("onClick".into()));
-    if !objthis.is_null()
-        && let Ok(target) = host.retain_object_detached(objthis)
-    {
-        // The retention is consumed when the variant copy is built; the drop
-        // below is the idempotent release either way.
-        let target_id = target.raw_id().as_ptr() as u64;
-        let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id));
-        drop(target);
-    }
     let event_id = event.raw_id().as_ptr() as u64;
     if let Err(error) = host.call_member(owner.raw_id(), "action", &[TjsValue::Retained(event_id)])
     {

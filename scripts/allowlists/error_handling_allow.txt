@@ -74,18 +74,6 @@ crates/platform/render/src/glyph.rs:233:debug_assert_eq!(coverage.len(), width a
 crates/compat/src/natives/sound.rs:172:#[non_exhaustive] — SliError is a pub(crate) thiserror error enum, not a discriminant
 crates/compat/src/resource.rs:673:#[non_exhaustive] — PrerenderedFontError is a pub(crate) thiserror error enum, not a discriminant
 
-# --- event `type`/`target` writes: the dictionary is created immediately
-#     above and the id is just retained, so the `TJS_MEMBERENSURE` write
-#     cannot fail; the reference guards it only as an internal error
-#     (reference/cpp/core/base/EventIntf.cpp:709-736) ----------------------
-crates/compat/src/natives/async_trigger.rs:314:let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id)); — live dictionary plus live retained id; EventIntf.cpp:709-736 guards this only as an internal error
-crates/compat/src/natives/cdda_midi.rs:261:let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id)); — live dictionary plus live retained id; EventIntf.cpp:709-736 guards this only as an internal error
-crates/compat/src/natives/menu_item.rs:901:let _ = host.set_member(event.raw_id(), "type", &TjsValue::String("onClick".into())); — live dictionary plus non-NUL name; EventIntf.cpp:709-736 guards this only as an internal error
-crates/compat/src/natives/menu_item.rs:908:let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id)); — live dictionary plus live retained id; EventIntf.cpp:709-736 guards this only as an internal error
-crates/compat/src/natives/sound.rs:1974:let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id)); — live dictionary plus live retained id; EventIntf.cpp:709-736 guards this only as an internal error
-crates/compat/src/natives/visual/timer.rs:309:let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id)); — live dictionary plus live retained id; EventIntf.cpp:709-736 guards this only as an internal error
-crates/compat/src/natives/visual/window.rs:1393:let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id)); — live dictionary plus live retained id; EventIntf.cpp:709-736 guards this only as an internal error
-
 # --- reference-ignored writes / cleanup -----------------------------------
 crates/compat/src/natives/plugins/layer_ex/gdiplus.rs:324:let _ = ctx.delete_member(global_id, internal); — the class globals exist only because the registration ABI publishes one; the absent-member error means an earlier install already removed it
 crates/compat/src/natives/plugins/layer_ex/movie.rs:239:let _ = slot.overlay.stop(); — the reference stopMovie stops and releases the overlay unconditionally (layerExMovie.cpp:214-227); stop() only fails with NotOpen during teardown
@@ -172,15 +160,15 @@ crates/compat/src/natives/plugins/window_ex/system.rs:83:Err(_) => (false, None)
 crates/compat/src/natives/plugins/window_ex/system.rs:309:Ok(_) | Err(_) => 0, — the `getIntValue` default for a missing/non-numeric member
 crates/compat/src/natives/plugins/window_ex/util.rs:163:Err(_) => Ok(0), — `getIntValue` returns its default for a missing member
 crates/compat/src/natives/plugins/window_ex/util.rs:286:Err(_) => return false, — a non-retainable or class-less object argument has no matching class (both occurrences)
-crates/compat/src/natives/scripts.rs:327:Err(_) => log_script_read(name, bytes, None, None), — the undecodable read is still logged (without decoded text), not dropped
 crates/compat/src/natives/sound.rs:1968:Err(_) => (TjsValue::Void, None), — a non-retainable argument is the reference's void argument
 crates/compat/src/natives/system.rs:1467:Err(_) => FALLBACK_EXE_NAME.to_string(), — `System.exeName` falls back to the emulated executable name (D18)
 crates/compat/src/natives/system.rs:2210:Err(_) => return Ok(None), — a missing `RegisterData.tjs` clears the result, matching the reference
 crates/compat/src/natives/tree_owner.rs:332:Err(_) => false, — a failed handler call is a false callback result, as the reference treats a missing handler
-crates/compat/src/natives/video.rs:2258:Err(_) => set_null_out(resolved.engine(), out), — a non-duplicable video object yields the reference's null (both occurrences)
+crates/compat/src/natives/video.rs:2414:Err(_) => set_null(out), — a non-duplicable video object yields the reference's null (both occurrences)
 crates/compat/src/natives/visual/bitmap.rs:722:Ok(_) | Err(_) => return Ok(type_name.to_string()), — a missing `bpp` uses the handler default, as a failed `PropGet` does in the reference
 crates/compat/src/natives/visual/layer/focus.rs:200:Err(_) => false, — a scene that cannot be borrowed has no live layer, so no focus event fires
 crates/compat/src/text.rs:373:Err(_) => dropped += 1, — an unpaired UTF-16 surrogate is counted as dropped; a representation limit, not a reference path
 crates/platform/media/src/image_decode.rs:123:Err(_) => {} — a mislabeled `.tlg` falls through to content detection (both occurrences)
 crates/platform/media/src/tlg.rs:78:Err(_) => return false, — `bytes[11..15]` is exactly four bytes, so `try_into` cannot fail
 crates/platform/render/src/vulkan/device.rs:278:Err(_) => false, — a failed extension-property query means the extension is unavailable
+crates/platform/fs/src/xp3.rs:1001:.unwrap_or(char::REPLACEMENT_CHARACTER) — an unpaired surrogate in an entry name decodes to the replacement character: the lossy decode the name normalizer performs

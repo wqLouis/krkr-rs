@@ -77,7 +77,7 @@ fn engine_with_two_roles() -> (TextEngine, FontId, FontId) {
 /// (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:165-195`).
 #[test]
 fn the_coverage_face_draws_the_characters_the_default_face_lacks() {
-    let (engine, narrow, wide) = engine_with_two_roles();
+    let (mut engine, narrow, wide) = engine_with_two_roles();
     assert_eq!(
         engine.default_face(),
         Some(narrow),
@@ -115,7 +115,7 @@ fn the_coverage_face_draws_the_characters_the_default_face_lacks() {
 /// (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:165-195`).
 #[test]
 fn a_registry_without_a_coverage_face_reaches_for_the_default_face() {
-    let (engine, wide, narrow) = engine_with_wide_default();
+    let (mut engine, wide, narrow) = engine_with_wide_default();
     assert_eq!(
         engine.coverage_face(),
         Some(wide),

@@ -153,7 +153,9 @@ registered under.
 
 ### The two font roles
 
-The registry holds two roles, and the host fills both before any script runs:
+The registry holds two roles. The host selects both before any script runs,
+and the L2 text service resolves them on its first use — the scan of the
+host's faces is not on the startup's critical path:
 
 | role | the face | what it does |
 |---|---|---|
@@ -242,6 +244,7 @@ string, or an object's `text`, `char` or `character` member.
 |---|---|---|
 | `set_image_codec(decode, probe, save)` | `CompatHost` (defined in `host.rs`) | the L1 `media` image codec |
 | `set_system_font_dirs(dirs)` | the composition root, on the attached L2 text service | where the host's system fonts live |
+| the host's two font roles | the composition root, on the attached L2 text service | which faces fill the default-face and the coverage-face role |
 
 The attached L2 text service and the attached storage are the other face
 sources.

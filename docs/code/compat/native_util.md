@@ -61,12 +61,17 @@ A null `v.string` on a string value also yields the empty string.
 | `set_real(out, value)` | a TJS real (defined in `visual/common.rs`, the visual family's variant) |
 | `set_retained_out(host, out, id)` | a retained script object (in `visual/common.rs`) |
 | `set_object_out(host, out, object)` | a duplicated retained object, or TJS `null` (in `visual/common.rs`) |
-| `set_null_out(host, out)` | TJS `null` (in `visual/common.rs`) |
+| `set_null(out)` | TJS `null` |
 
 Each writes the whole `Value` struct — the type tag plus every field — so a
 stale field from a previous value cannot leak into the result. A null `out`
 slot is ignored: the trampoline always passes a valid one, and a null check
 costs nothing.
+
+TJS `null` is an object value with no object pointer, and the ABI carries it
+as `VAL_NULL`: the VM turns it into exactly that value. `set_null` writes it
+directly, so a native that has no object to return does not compile a script
+to produce the null.
 
 ---
 

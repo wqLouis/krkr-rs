@@ -46,7 +46,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::thread::ThreadId;
 
-use tjs::{MemberRead, RetainedValue, Tjs2Engine};
+use tjs::{MemberRead, Tjs2Engine};
 
 use crate::collections::Map;
 use crate::engine_api::{StorageMedia, StorageReadError};
@@ -210,7 +210,9 @@ impl VarMedia {
     /// The octet the path names in the script object graph.
     ///
     /// `path` is the storage name with its scheme removed and its domain
-    /// split off: `<member>/…`.
+    /// split off: `<member>/…`. The walk starts at the VM's global object,
+    /// which the engine hands over directly, and reads every member through
+    /// `PropGet`.
     fn walk(&self, path: &str) -> Result<Option<Vec<u8>>, StorageReadError> {
         if std::thread::current().id() != self.thread {
             return Err(self.error(
@@ -225,15 +227,9 @@ impl VarMedia {
             return Ok(None);
         }
         let engine = self.engine();
-        let global = match engine.eval_retained("global", "varfile") {
-            Ok(RetainedValue::Object(object)) => object,
-            Ok(RetainedValue::Value(value)) => {
-                return Err(self.error(format!(
-                    "varfile: the global object is not an object ({value:?})"
-                )));
-            }
-            Err(error) => return Err(self.error(format!("varfile: {error}"))),
-        };
+        let global = engine
+            .global_object()
+            .map_err(|error| self.error(format!("varfile: {error}")))?;
         let mut current = global;
         for segment in parents {
             match engine.member_read(current.raw_id(), segment) {

@@ -14,11 +14,13 @@ use tjs::{
 use super::common::{
     DEFAULT_FONT_COLOR, DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, ObjectHandle, ObjectKind,
     VisualState, actual_color_bytes, argb_to_rgba, bound, duplicate_object, input_ref,
-    reparent_layer, resolve_object_id, scene_mut, scene_ref, set_null_out, set_object_out,
-    set_retained_out, set_visual_string_out,
+    reparent_layer, resolve_object_id, scene_mut, scene_ref, set_object_out, set_retained_out,
+    set_visual_string_out,
 };
 use crate::collections::Map;
-use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::native_util::{
+    args, report_error, set_bool, set_int, set_null, set_void, value_as_string,
+};
 use crate::natives::system::{value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
 
@@ -3581,7 +3583,7 @@ extern "C" fn layer_children_get(
             set_retained_out(resolved.engine(), out, array.raw_id());
             std::mem::forget(array);
         }
-        Ok(None) => set_null_out(resolved.engine(), out),
+        Ok(None) => set_null(out),
         Err(error) => return report_error(out_error, &error),
     }
     0

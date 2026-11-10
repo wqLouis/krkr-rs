@@ -28,6 +28,7 @@ pub mod imagedecode;
 pub mod input;
 pub mod jobpool;
 pub mod layer_ops;
+mod layer_order;
 pub mod projection;
 pub mod raster;
 pub mod scene;
