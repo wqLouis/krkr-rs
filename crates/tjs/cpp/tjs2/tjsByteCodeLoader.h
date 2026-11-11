@@ -69,6 +69,8 @@ namespace TJS {
             ('O') | ('B' << 8) | ('J' << 16) | ('S' << 24);
         static const tjs_uint32 DATA_TAG_LE =
             ('D') | ('A' << 8) | ('T' << 16) | ('A' << 24);
+        static const tjs_uint32 SRC_TAG_LE =
+            ('S') | ('R' << 8) | ('C' << 16) | ('S' << 24);
 
         static const tjs_int32 TYPE_VOID = 0;
         static const tjs_int32 TYPE_OBJECT = 1;
@@ -135,7 +137,15 @@ namespace TJS {
         void ReadDataArea(const tjs_uint8 *buff, int offset, size_t size);
 
         void ReadObjects(tTJSScriptBlock *block, const tjs_uint8 *buff,
-                         int offset, int size);
+                         int offset, int size,
+                         std::vector<tTJSInterCodeContext *> &objs,
+                         tTJSInterCodeContext *&outTopLevel,
+                         int &outObjectsEnd);
+
+        bool ReadSourceSection(tTJSScriptBlock *block,
+                               std::vector<tTJSInterCodeContext *> &objs,
+                               const tjs_uint8 *buff, int offset,
+                               size_t fileSize);
 
         void TranslateCodeAddress(tTJSScriptBlock *block, tjs_int32 *code,
                                   tjs_int32 size);

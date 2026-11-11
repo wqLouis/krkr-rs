@@ -16,6 +16,7 @@
 #include <list>
 #include "tjsVariant.h"
 #include "tjsInterface.h"
+#include "tjsVMCodes.h"
 #include "tjsNamespace.h"
 #include "tjsError.h"
 #include "tjsObject.h"
@@ -31,106 +32,6 @@ namespace TJS {
     int yylex(parser::value_type *yylex, tTJSScriptBlock *ptr);
     int _yyerror(const tjs_char *msg, tTJSScriptBlock *pm, tjs_int pos = -1);
 
-#define TJS_TO_VM_CODE_ADDR(x) ((x) * (tjs_int)sizeof(tjs_uint32))
-#define TJS_TO_VM_REG_ADDR(x) ((x) * (tjs_int)sizeof(tTJSVariant))
-#define TJS_FROM_VM_CODE_ADDR(x) ((tjs_int)(x) / (tjs_int)sizeof(tjs_uint32))
-#define TJS_FROM_VM_REG_ADDR(x) ((tjs_int)(x) / (tjs_int)sizeof(tTJSVariant))
-#define TJS_ADD_VM_CODE_ADDR(dest, x) ((*(char **)&(dest)) += (x))
-#define TJS_GET_VM_REG_ADDR(base, x)                                           \
-    ((tTJSVariant *)((char *)(base) + (tjs_int)(x)))
-#define TJS_GET_VM_REG(base, x) (*(TJS_GET_VM_REG_ADDR(base, x)))
-#define TJS_NORMAL_AND_PROPERTY_ACCESSER(x) x, x##PD, x##PI, x##P
-
-    enum tTJSVMCodes {
-
-        VM_NOP,
-        VM_CONST,
-        VM_CP,
-        VM_CL,
-        VM_CCL,
-        VM_TT,
-        VM_TF,
-        VM_CEQ,
-        VM_CDEQ,
-        VM_CLT,
-        VM_CGT,
-        VM_SETF,
-        VM_SETNF,
-        VM_LNOT,
-        VM_NF,
-        VM_JF,
-        VM_JNF,
-        VM_JMP,
-
-        TJS_NORMAL_AND_PROPERTY_ACCESSER(VM_INC),
-        TJS_NORMAL_AND_PROPERTY_ACCESSER(VM_DEC),
-        TJS_NORMAL_AND_PROPERTY_ACCESSER(VM_LOR),
-        TJS_NORMAL_AND_PROPERTY_ACCESSER(VM_LAND),
-        TJS_NORMAL_AND_PROPERTY_ACCESSER(VM_BOR),
-        TJS_NORMAL_AND_PROPERTY_ACCESSER(VM_BXOR),
-        TJS_NORMAL_AND_PROPERTY_ACCESSER(VM_BAND),
-        TJS_NORMAL_AND_PROPERTY_ACCESSER(VM_SAR),
-        TJS_NORMAL_AND_PROPERTY_ACCESSER(VM_SAL),
-        TJS_NORMAL_AND_PROPERTY_ACCESSER(VM_SR),
-        TJS_NORMAL_AND_PROPERTY_ACCESSER(VM_ADD),
-        TJS_NORMAL_AND_PROPERTY_ACCESSER(VM_SUB),
-        TJS_NORMAL_AND_PROPERTY_ACCESSER(VM_MOD),
-        TJS_NORMAL_AND_PROPERTY_ACCESSER(VM_DIV),
-        TJS_NORMAL_AND_PROPERTY_ACCESSER(VM_IDIV),
-        TJS_NORMAL_AND_PROPERTY_ACCESSER(VM_MUL),
-
-        VM_BNOT,
-        VM_TYPEOF,
-        VM_TYPEOFD,
-        VM_TYPEOFI,
-        VM_EVAL,
-        VM_EEXP,
-        VM_CHKINS,
-        VM_ASC,
-        VM_CHR,
-        VM_NUM,
-        VM_CHS,
-        VM_INV,
-        VM_CHKINV,
-        VM_INT,
-        VM_REAL,
-        VM_STR,
-        VM_OCTET,
-        VM_CALL,
-        VM_CALLD,
-        VM_CALLI,
-        VM_NEW,
-        VM_GPD,
-        VM_SPD,
-        VM_SPDE,
-        VM_SPDEH,
-        VM_GPI,
-        VM_SPI,
-        VM_SPIE,
-        VM_GPDS,
-        VM_SPDS,
-        VM_GPIS,
-        VM_SPIS,
-        VM_SETP,
-        VM_GETP,
-        VM_DELD,
-        VM_DELI,
-        VM_SRV,
-        VM_RET,
-        VM_ENTRY,
-        VM_EXTRY,
-        VM_THROW,
-        VM_CHGTHIS,
-        VM_GLOBAL,
-        VM_ADDCI,
-        VM_REGMEMBER,
-        VM_DEBUGGER,
-
-        __VM_LAST /* = last mark ; this is not a real operation code
-                   */
-    };
-
-#undef TJS_NORMAL_AND_PROPERTY_ACCESSER
     //---------------------------------------------------------------------------
     enum tTJSSubType {
         stNone = VM_NOP,
@@ -160,8 +61,6 @@ namespace TJS {
         stIgnorePropSet,
         stTypeOf
     };
-    //---------------------------------------------------------------------------
-    enum tTJSFuncArgType { fatNormal, fatExpand, fatUnnamedExpand };
     //---------------------------------------------------------------------------
     enum tTJSContextType {
         ctTopLevel,
@@ -855,6 +754,31 @@ namespace TJS {
                              tjs_int colbase, bool srcsorted,
                              tSourcePos *srcPos, tjs_int srcPosSize,
                              std::vector<tjs_int> &superpointer);
+
+        // The source positions of this context: the code positions and the
+        // source positions they belong to, sorted by code position. The
+        // bytecode writer reads them to write the source section of a
+        // bytecode file.
+        [[nodiscard]] const tSourcePos *GetSourcePosArray() const {
+            const_cast<tTJSInterCodeContext *>(this)->SortSourcePos();
+            return SourcePosArray;
+        }
+
+        [[nodiscard]] tjs_int GetSourcePosArraySize() const {
+            return SourcePosArraySize;
+        }
+
+        // Replaces the source position table. The bytecode loader reads the
+        // table from the source section of the file, which carries it when
+        // the objects section does not. The context takes the table over.
+        void SetSourcePosArray(tSourcePos *srcPos, tjs_int size) {
+            if(SourcePosArray)
+                TJS_free(SourcePosArray);
+            SourcePosArray = srcPos;
+            SourcePosArraySize = size;
+            SourcePosArrayCapa = size;
+            SourcePosArraySorted = true;
+        }
 
         std::vector<tjs_uint8> *
         ExportByteCode(bool outputdebug, tTJSScriptBlock *block,

@@ -36,6 +36,7 @@ namespace TJS {
         ReadSize = (tjs_uint32)size;
 
         const tjs_uint8 *databuff = ReadBuffer;
+        const size_t fileSize = size;
 
         // TJS2
         int tag = read4byte(databuff);
@@ -66,9 +67,103 @@ namespace TJS {
         // int objsize = ibuff.get();
         int objsize = read4byte(&(databuff[offset]));
         offset += 4;
+        const int objectsOffset = offset;
+
         auto *block = new tTJSScriptBlock(owner, name, 0);
-        ReadObjects(block, databuff, offset, objsize);
+        std::vector<tTJSInterCodeContext *> objs;
+        tTJSInterCodeContext *top = nullptr;
+        int objectsEnd = objectsOffset;
+        ReadObjects(block, databuff, objectsOffset, objsize, objs, top,
+                    objectsEnd);
+
+        // The source section: the text the block was compiled from and the
+        // source positions of its contexts. It follows the objects, whose
+        // end the objects section itself tells.
+        if(!ReadSourceSection(block, objs, databuff, objectsEnd, fileSize)) {
+            // the block takes the contexts, then goes away with them
+            block->SetObjects(top, objs, (int)objs.size());
+            block->Release();
+            return nullptr;
+        }
+
+        block->SetObjects(top, objs, (int)objs.size());
         return block;
+    }
+
+    //---------------------------------------------------------------------------
+    // Reads the source section: the text the block was compiled from and the
+    // source positions of its contexts.
+    //---------------------------------------------------------------------------
+    // The section is optional: a file the original compiler wrote has none,
+    // and the block it produces then carries no line information. A section
+    // that is there but malformed rejects the file.
+    bool tTJSByteCodeLoader::ReadSourceSection(
+        tTJSScriptBlock *block,
+        std::vector<tTJSInterCodeContext *> &objs, const tjs_uint8 *buff,
+        int offset, size_t fileSize) {
+        if(offset < 0 || (size_t)offset + 8 > fileSize)
+            return true; // no source section
+        if(read4byte(&(buff[offset])) != SRC_TAG_LE)
+            return true; // no source section
+        const int payloadSize = read4byte(&(buff[offset + 4]));
+        if(payloadSize < 8 ||
+           (size_t)offset + 8 + (size_t)payloadSize > fileSize)
+            return false;
+        const int payloadEnd = offset + 8 + payloadSize;
+        int p = offset + 8;
+
+        const int flags = read4byte(&(buff[p]));
+        p += 4;
+        const int charCount = read4byte(&(buff[p]));
+        p += 4;
+        if(charCount < 0 || p + (size_t)charCount * 2 > (size_t)payloadEnd)
+            return false;
+        std::vector<tjs_char> text((size_t)charCount + 1);
+        for(int i = 0; i < charCount; i++) {
+            text[i] = (tjs_char)read2byte(&(buff[p + i * 2]));
+        }
+        text[charCount] = 0;
+        p += charCount * 2;
+        block->SetSourceText(text.data());
+
+        if(flags & 1) {
+            // the source positions of every context
+            if(p + 4 > payloadEnd)
+                return false;
+            const int contextCount = read4byte(&(buff[p]));
+            p += 4;
+            if(contextCount < 0)
+                return false;
+            for(int c = 0; c < contextCount; c++) {
+                if(p + 4 > payloadEnd)
+                    return false;
+                const int positionCount = read4byte(&(buff[p]));
+                p += 4;
+                if(positionCount < 0 ||
+                   p + (size_t)positionCount * 8 > (size_t)payloadEnd)
+                    return false;
+                if(c >= (int)objs.size() || !objs[c])
+                    return false;
+                tTJSInterCodeContext::tSourcePos *table = nullptr;
+                if(positionCount > 0) {
+                    table = (tTJSInterCodeContext::tSourcePos *)TJS_malloc(
+                        sizeof(tTJSInterCodeContext::tSourcePos) *
+                        positionCount);
+                    if(!table)
+                        TJS_eTJSScriptError(TJSInsufficientMem, block, 0);
+                    for(int i = 0; i < positionCount; i++) {
+                        table[i].CodePos = read4byte(&(buff[p]));
+                        p += 4;
+                    }
+                    for(int i = 0; i < positionCount; i++) {
+                        table[i].SourcePos = read4byte(&(buff[p]));
+                        p += 4;
+                    }
+                }
+                objs[c]->SetSourcePosArray(table, positionCount);
+            }
+        }
+        return true;
     }
 
     void tTJSByteCodeLoader::ReadDataArea(const tjs_uint8 *buff, int offset,
@@ -157,9 +252,10 @@ namespace TJS {
         }
     }
 
-    void tTJSByteCodeLoader::ReadObjects(tTJSScriptBlock *block,
-                                         const tjs_uint8 *buff, int offset,
-                                         int size) {
+    void tTJSByteCodeLoader::ReadObjects(
+        tTJSScriptBlock *block, const tjs_uint8 *buff, int offset, int size,
+        std::vector<tTJSInterCodeContext *> &objs,
+        tTJSInterCodeContext *&outTopLevel, int &outObjectsEnd) {
         int toplevel = read4byte(&(buff[offset]));
         offset += 4;
         int objcount = read4byte(&(buff[offset]));
@@ -167,7 +263,7 @@ namespace TJS {
 
         // tTJSInterCodeContext** objs = new
         // tTJSInterCodeContext*[objcount];
-        std::vector<tTJSInterCodeContext *> objs(objcount);
+        objs.resize(objcount);
         std::vector<VariantRepalace> work;
         std::vector<int> parent(objcount);
         std::vector<int> propSetter(objcount);
@@ -211,11 +307,17 @@ namespace TJS {
             int count = read4byte(&(buff[offset]));
             offset += 4;
 
-            // デバッグ用のソース位置を読み込む
+            // The source positions of this context. The objects section
+            // carries them when the debug information was asked for; the
+            // source section carries them otherwise, and replaces the ones
+            // read here.
             tTJSInterCodeContext::tSourcePos *srcPos = nullptr;
             tjs_int srcPosArraySize = 0;
             if(count > 0) {
-                srcPos = new tTJSInterCodeContext::tSourcePos[count];
+                srcPos = (tTJSInterCodeContext::tSourcePos *)TJS_malloc(
+                    sizeof(tTJSInterCodeContext::tSourcePos) * count);
+                if(!srcPos)
+                    TJS_eTJSScriptError(TJSInsufficientMem, block, 0);
                 srcPosArraySize = count;
                 for(int i = 0; i < count; i++) {
                     srcPos[i].CodePos = read4byte(&(buff[offset]));
@@ -371,368 +473,35 @@ namespace TJS {
         }
         work.clear();
         tTJSInterCodeContext *top = nullptr;
-        if(toplevel >= 0) {
+        if(toplevel >= 0 && toplevel < objcount) {
             top = objs[toplevel];
         }
-        block->SetObjects(top, objs, objcount);
+        outTopLevel = top;
+        // the source section follows the objects
+        outObjectsEnd = offset;
         // delete[] objs;
     }
 
-#define TJS_OFFSET_VM_REG_ADDR(x) ((x) = TJS_TO_VM_REG_ADDR(x))
-#define TJS_OFFSET_VM_CODE_ADDR(x) ((x) = TJS_TO_VM_CODE_ADDR(x))
-
+    //---------------------------------------------------------------------------
     /**
-     * バイトコード中のアドレスは配列のインデックスを指しているので、それをアドレスに変換する
+     * The bytecode file carries the operands of an instruction as indices;
+     * this turns them back into the VM addresses of the code.
      */
     void tTJSByteCodeLoader::TranslateCodeAddress(tTJSScriptBlock *block,
                                                   tjs_int32 *code,
                                                   const tjs_int32 codeSize) {
+        // The layout of every opcode is the one table the writer serialised
+        // the file with, so the two never disagree about how many operands
+        // an instruction has. An instruction that does not fit the code is
+        // a broken file, not a silently skipped operand.
         tjs_int i = 0;
-        for(; i < codeSize;) {
-            tjs_int size;
-            switch(code[i]) {
-                case VM_NOP:
-                    size = 1;
-                    break;
-                case VM_NF:
-                    size = 1;
-                    break;
-                case VM_CONST:
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 1]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 2]);
-                    size = 3;
-                    break;
-
-#define OP2_DISASM(c)                                                          \
-    case c:                                                                    \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 1]);                                   \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 2]);                                   \
-        size = 3;                                                              \
-        break
-
-                    OP2_DISASM(VM_CP);
-                    OP2_DISASM(VM_CEQ);
-                    OP2_DISASM(VM_CDEQ);
-                    OP2_DISASM(VM_CLT);
-                    OP2_DISASM(VM_CGT);
-                    OP2_DISASM(VM_CHKINS);
-#undef OP2_DISASM
-
-#define OP2_DISASM(c)                                                          \
-    case c:                                                                    \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 1]);                                   \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 2]);                                   \
-        size = 3;                                                              \
-        break;                                                                 \
-    case c + 1:                                                                \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 1]);                                   \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 2]);                                   \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 3]);                                   \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 4]);                                   \
-        size = 5;                                                              \
-        break;                                                                 \
-    case c + 2:                                                                \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 1]);                                   \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 2]);                                   \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 3]);                                   \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 4]);                                   \
-        size = 5;                                                              \
-        break;                                                                 \
-    case c + 3:                                                                \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 1]);                                   \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 2]);                                   \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 3]);                                   \
-        size = 4;                                                              \
-        break
-
-                    OP2_DISASM(VM_LOR);
-                    OP2_DISASM(VM_LAND);
-                    OP2_DISASM(VM_BOR);
-                    OP2_DISASM(VM_BXOR);
-                    OP2_DISASM(VM_BAND);
-                    OP2_DISASM(VM_SAR);
-                    OP2_DISASM(VM_SAL);
-                    OP2_DISASM(VM_SR);
-                    OP2_DISASM(VM_ADD);
-                    OP2_DISASM(VM_SUB);
-                    OP2_DISASM(VM_MOD);
-                    OP2_DISASM(VM_DIV);
-                    OP2_DISASM(VM_IDIV);
-                    OP2_DISASM(VM_MUL);
-#undef OP2_DISASM
-
-#define OP1_DISASM                                                             \
-    TJS_OFFSET_VM_REG_ADDR(code[i + 1]);                                       \
-    size = 2;
-                case VM_TT:
-                    OP1_DISASM
-                    break;
-                case VM_TF:
-                    OP1_DISASM
-                    break;
-                case VM_SETF:
-                    OP1_DISASM
-                    break;
-                case VM_SETNF:
-                    OP1_DISASM
-                    break;
-                case VM_LNOT:
-                    OP1_DISASM
-                    break;
-                case VM_BNOT:
-                    OP1_DISASM
-                    break;
-                case VM_ASC:
-                    OP1_DISASM
-                    break;
-                case VM_CHR:
-                    OP1_DISASM
-                    break;
-                case VM_NUM:
-                    OP1_DISASM
-                    break;
-                case VM_CHS:
-                    OP1_DISASM
-                    break;
-                case VM_CL:
-                    OP1_DISASM
-                    break;
-                case VM_INV:
-                    OP1_DISASM
-                    break;
-                case VM_CHKINV:
-                    OP1_DISASM
-                    break;
-                case VM_TYPEOF:
-                    OP1_DISASM
-                    break;
-                case VM_EVAL:
-                    OP1_DISASM
-                    break;
-                case VM_EEXP:
-                    OP1_DISASM
-                    break;
-                case VM_INT:
-                    OP1_DISASM
-                    break;
-                case VM_REAL:
-                    OP1_DISASM
-                    break;
-                case VM_STR:
-                    OP1_DISASM
-                    break;
-                case VM_OCTET:
-                    OP1_DISASM
-                    break;
-#undef OP1_DISASM
-
-                case VM_CCL:
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 1]);
-                    size = 3;
-                    break;
-
-#define OP1_DISASM(c)                                                          \
-    case c:                                                                    \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 1]);                                   \
-        size = 2;                                                              \
-        break;                                                                 \
-    case c + 1:                                                                \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 1]);                                   \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 2]);                                   \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 3]);                                   \
-        size = 4;                                                              \
-        break;                                                                 \
-    case c + 2:                                                                \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 1]);                                   \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 2]);                                   \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 3]);                                   \
-        size = 4;                                                              \
-        break;                                                                 \
-    case c + 3:                                                                \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 1]);                                   \
-        TJS_OFFSET_VM_REG_ADDR(code[i + 2]);                                   \
-        size = 3;                                                              \
-        break
-
-                    OP1_DISASM(VM_INC);
-                    OP1_DISASM(VM_DEC);
-#undef OP1_DISASM
-
-#define OP1A_DISASM                                                            \
-    TJS_OFFSET_VM_CODE_ADDR(code[i + 1]);                                      \
-    size = 2;
-                case VM_JF:
-                    OP1A_DISASM
-                    break;
-                case VM_JNF:
-                    OP1A_DISASM
-                    break;
-                case VM_JMP:
-                    OP1A_DISASM
-                    break;
-#undef OP1A_DISASM
-
-                case VM_CALL:
-                case VM_CALLD:
-                case VM_CALLI:
-                case VM_NEW: {
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 1]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 2]);
-
-                    tjs_int st; // start of arguments
-                    if(code[i] == VM_CALLD || code[i] == VM_CALLI) {
-                        TJS_OFFSET_VM_REG_ADDR(code[i + 3]);
-                        st = 5;
-                    } else {
-                        st = 4;
-                    }
-                    tjs_int num = code[i + st - 1]; // st-1 = argument count
-                    tjs_int c = 0;
-                    if(num == -1) {
-                        size = st;
-                    } else if(num == -2) {
-                        st++;
-                        num = code[i + st - 1];
-                        size = st + num * 2;
-                        for(tjs_int j = 0; j < num; j++) {
-                            switch(code[i + st + j * 2]) {
-                                case fatNormal:
-                                    TJS_OFFSET_VM_REG_ADDR(
-                                        code[i + st + j * 2 + 1]);
-                                    break;
-                                case fatExpand:
-                                    TJS_OFFSET_VM_REG_ADDR(
-                                        code[i + st + j * 2 + 1]);
-                                    break;
-                                case fatUnnamedExpand:
-                                    break;
-                            }
-                        }
-                    } else {
-                        // normal operation
-                        size = st + num;
-                        while(num--) {
-                            TJS_OFFSET_VM_REG_ADDR(code[i + c + st]);
-                            c++;
-                        }
-                    }
-                    break;
-                }
-
-                case VM_GPD:
-                case VM_GPDS:
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 1]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 2]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 3]);
-                    size = 4;
-                    break;
-
-                case VM_SPD:
-                case VM_SPDE:
-                case VM_SPDEH:
-                case VM_SPDS:
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 1]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 2]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 3]);
-                    size = 4;
-                    break;
-
-                case VM_GPI:
-                case VM_GPIS:
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 1]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 2]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 3]);
-                    size = 4;
-                    break;
-
-                case VM_SPI:
-                case VM_SPIE:
-                case VM_SPIS:
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 1]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 2]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 3]);
-                    size = 4;
-                    break;
-
-                case VM_SETP:
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 1]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 2]);
-                    size = 3;
-                    break;
-
-                case VM_GETP:
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 1]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 2]);
-                    size = 3;
-                    break;
-
-                case VM_DELD:
-                case VM_TYPEOFD:
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 1]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 2]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 3]);
-                    size = 4;
-                    break;
-
-                case VM_DELI:
-                case VM_TYPEOFI:
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 1]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 2]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 3]);
-                    size = 4;
-                    break;
-
-                case VM_SRV:
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 1]);
-                    size = 2;
-                    break;
-
-                case VM_RET:
-                    size = 1;
-                    break;
-
-                case VM_ENTRY:
-                    TJS_OFFSET_VM_CODE_ADDR(code[i + 1]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 2]);
-                    size = 3;
-                    break;
-
-                case VM_EXTRY:
-                    size = 1;
-                    break;
-
-                case VM_THROW:
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 1]);
-                    size = 2;
-                    break;
-
-                case VM_CHGTHIS:
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 1]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 2]);
-                    size = 3;
-                    break;
-
-                case VM_GLOBAL:
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 1]);
-                    size = 2;
-                    break;
-
-                case VM_ADDCI:
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 1]);
-                    TJS_OFFSET_VM_REG_ADDR(code[i + 2]);
-                    size = 3;
-                    break;
-
-                case VM_REGMEMBER:
-                    size = 1;
-                    break;
-                case VM_DEBUGGER:
-                    size = 1;
-                    break;
-                default:
-                    size = 1;
-                    break;
-            } /* switch */
+        while(i < codeSize) {
+            bool broken = false;
+            const tjs_int size = TranslateVMInstruction(
+                code, codeSize, i, tTJSVMAddrDir::ToVMAddr, &broken);
+            if(broken) {
+                TJS_eTJSScriptError(TJSByteCodeBroken, block, 0);
+            }
             i += size;
         }
         if(codeSize != i) {

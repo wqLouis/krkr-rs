@@ -195,18 +195,17 @@ namespace TJS {
     }
     //---------------------------------------------------------------------------
 
-    void tTJSScriptBlock::SetText(tTJSVariant *result, const tjs_char *text,
-                                  iTJSDispatch2 *context, bool isexpression) {
-
-        // compiles text and executes its global level scripts.
-        // the script will be compiled as an expression if isexpressn
-        // is true.
+    //---------------------------------------------------------------------------
+    // Sets the script text of this block and builds its line table from it.
+    //---------------------------------------------------------------------------
+    void tTJSScriptBlock::SetSourceText(const tjs_char *text) {
         if(!text)
             return;
-        if(!text[0])
-            return;
 
-        TJS_D((TJS_W("Counting lines ...\n")))
+        delete[] Script;
+        Script = nullptr;
+        LineVector.clear();
+        LineLengthVector.clear();
 
         Script = new tjs_char[TJS_strlen(text) + 1];
         TJS_strcpy(Script, text);
@@ -231,6 +230,23 @@ namespace TJS {
             LineVector.push_back(int(ls - Script));
             LineLengthVector.push_back(int(p - ls));
         }
+    }
+
+    //---------------------------------------------------------------------------
+    void tTJSScriptBlock::SetText(tTJSVariant *result, const tjs_char *text,
+                                  iTJSDispatch2 *context, bool isexpression) {
+
+        // compiles text and executes its global level scripts.
+        // the script will be compiled as an expression if isexpressn
+        // is true.
+        if(!text)
+            return;
+        if(!text[0])
+            return;
+
+        TJS_D((TJS_W("Counting lines ...\n")))
+
+        SetSourceText(text);
 
         try {
 
@@ -532,6 +548,9 @@ namespace TJS {
     const tjs_uint8 tTJSScriptBlock::BYTECODE_DATA_TAG[BYTECODE_TAG_SIZE] = {
         'D', 'A', 'T', 'A'
     };
+    const tjs_uint8 tTJSScriptBlock::BYTECODE_SRC_TAG[BYTECODE_TAG_SIZE] = {
+        'S', 'R', 'C', 'S'
+    };
 
     //---------------------------------------------------------------------------
     void tTJSScriptBlock::ExportByteCode(bool outputdebug,
@@ -554,7 +573,51 @@ namespace TJS {
         std::vector<tjs_uint8> *dataarea = constarray->ExportBuffer();
         int datasize = (int)dataarea->size() + BYTECODE_TAG_SIZE +
             BYTECODE_CHUNK_SIZE_LEN; // DATA tag + size
-        int filesize = objsize + datasize + BYTECODE_FILE_TAG_SIZE +
+
+        // The source section: the text this block was compiled from, and the
+        // source positions of its contexts when the objects section does not
+        // carry them. A block that is read back from it reports the same
+        // lines as the source it was compiled from.
+        const int sourceCharCount = Script ? (int)TJS_strlen(Script) : 0;
+        std::vector<tjs_uint8> sourcebuf;
+        sourcebuf.reserve(sourceCharCount * 2 + 64);
+        auto append4byte = [&sourcebuf](int value) {
+            sourcebuf.push_back((tjs_uint8)((value >> 0) & 0xff));
+            sourcebuf.push_back((tjs_uint8)((value >> 8) & 0xff));
+            sourcebuf.push_back((tjs_uint8)((value >> 16) & 0xff));
+            sourcebuf.push_back((tjs_uint8)((value >> 24) & 0xff));
+        };
+        // the flags: bit 0 tells that the source positions follow the text
+        append4byte(outputdebug ? 0 : 1);
+        append4byte(sourceCharCount);
+        for(int i = 0; i < sourceCharCount; i++) {
+            const tjs_uint16 c = (tjs_uint16)Script[i];
+            sourcebuf.push_back((tjs_uint8)((c >> 0) & 0xff));
+            sourcebuf.push_back((tjs_uint8)((c >> 8) & 0xff));
+        }
+        // The source positions: the objects section carries them when the
+        // debug information was asked for, and this section carries them
+        // otherwise. They are written once, never twice.
+        if(!outputdebug) {
+            append4byte(count);
+            for(auto obj : InterCodeContextList) {
+                const tTJSInterCodeContext::tSourcePos *positions =
+                    obj->GetSourcePosArray();
+                const tjs_int positionCount = obj->GetSourcePosArraySize();
+                append4byte((int)positionCount);
+                for(tjs_int i = 0; i < positionCount; i++) {
+                    append4byte((int)positions[i].CodePos);
+                }
+                for(tjs_int i = 0; i < positionCount; i++) {
+                    append4byte((int)positions[i].SourcePos);
+                }
+            }
+        }
+        const int sourcePayloadSize = (int)sourcebuf.size();
+        const int sourcesize =
+            BYTECODE_TAG_SIZE + BYTECODE_CHUNK_SIZE_LEN + sourcePayloadSize;
+
+        int filesize = objsize + datasize + sourcesize + BYTECODE_FILE_TAG_SIZE +
             BYTECODE_CHUNK_SIZE_LEN; // TJS2 tag + file size
         int toplevel = -1;
         if(TopLevelContext != nullptr) {
@@ -586,6 +649,13 @@ namespace TJS {
             objarray[i] = nullptr;
         }
         objarray.clear();
+
+        // the source section
+        output->Write(BYTECODE_SRC_TAG, BYTECODE_TAG_SIZE);
+        Write4Byte(tmp, sourcePayloadSize);
+        output->Write(tmp, 4);
+        output->Write(&sourcebuf[0], (tjs_uint)sourcebuf.size());
+
         delete constarray;
         delete dataarea;
     }
@@ -601,28 +671,7 @@ namespace TJS {
 
         tTJSInterCodeContext::IsBytecodeCompile = true;
         try {
-            Script = new tjs_char[TJS_strlen(text) + 1];
-            TJS_strcpy(Script, text);
-
-            // calculation of line-count
-            tjs_char *ls = Script;
-            tjs_char *p = Script;
-            while(*p) {
-                if(*p == TJS_W('\r') || *p == TJS_W('\n')) {
-                    LineVector.push_back(int(ls - Script));
-                    LineLengthVector.push_back(int(p - ls));
-                    if(*p == TJS_W('\r') && p[1] == TJS_W('\n'))
-                        p++;
-                    p++;
-                    ls = p;
-                } else {
-                    p++;
-                }
-            }
-            if(p != ls) {
-                LineVector.push_back(int(ls - Script));
-                LineLengthVector.push_back(int(p - ls));
-            }
+            SetSourceText(text);
 
             Parse(text, isexpression, isresultneeded);
 
@@ -650,270 +699,26 @@ namespace TJS {
         tTJSInterCodeContext::IsBytecodeCompile = false;
     }
 
-    inline void OffsetReg(tjs_int32 &x) { x = TJS_FROM_VM_REG_ADDR(x); }
-
-    inline void OffsetCode(tjs_int32 &x) { x = TJS_FROM_VM_CODE_ADDR(x); }
-
-    // Safe index helper: returns true if code[i + offset] is a valid access
-    // (0-based offset)
-    inline bool SafeIndex(const tjs_int i, const int offset,
-                          const int codeSize) {
-        return i + offset < codeSize;
-    }
-
-    int HandleOp2(tjs_int32 *code, const int i, const int opcode,
-                  const int codeSize) {
-        switch(code[i] - opcode) {
-            case 0: // base
-                if(!SafeIndex(i, 2, codeSize))
-                    return 1;
-                OffsetReg(code[i + 1]);
-                OffsetReg(code[i + 2]);
-                return 3;
-            case 1:
-            case 2:
-                if(!SafeIndex(i, 4, codeSize))
-                    return 1;
-                OffsetReg(code[i + 1]);
-                OffsetReg(code[i + 2]);
-                OffsetReg(code[i + 3]);
-                OffsetReg(code[i + 4]);
-                return 5;
-            case 3:
-                if(!SafeIndex(i, 3, codeSize))
-                    return 1;
-                OffsetReg(code[i + 1]);
-                OffsetReg(code[i + 2]);
-                OffsetReg(code[i + 3]);
-                return 4;
-            default:
-                return 1; // fallback
-        }
-    }
-
-    int HandleIncDec(tjs_int32 *code, const int i, const int opcode,
-                     const int codeSize) {
-        switch(code[i] - opcode) {
-            case 0:
-                if(!SafeIndex(i, 1, codeSize))
-                    return 1;
-                OffsetReg(code[i + 1]);
-                return 2;
-            case 1:
-            case 2:
-                if(!SafeIndex(i, 3, codeSize))
-                    return 1;
-                OffsetReg(code[i + 1]);
-                OffsetReg(code[i + 2]);
-                OffsetReg(code[i + 3]);
-                return 4;
-            case 3:
-                if(!SafeIndex(i, 2, codeSize))
-                    return 1;
-                OffsetReg(code[i + 1]);
-                OffsetReg(code[i + 2]);
-                return 3;
-            default:
-                return 1;
-        }
-    }
-
-    int HandleCallOp(tjs_int32 *code, const int i, const int opcode,
-                     const int codeSize) {
-        // ensure at least i+2 exists (to read code[i+1], code[i+2])
-        if(!SafeIndex(i, 2, codeSize))
-            return 1;
-        OffsetReg(code[i + 1]);
-        OffsetReg(code[i + 2]);
-
-        int st; // start of arguments
-        if(opcode == VM_CALLD || opcode == VM_CALLI) {
-            if(!SafeIndex(i, 3, codeSize))
-                return 1;
-            OffsetReg(code[i + 3]);
-            st = 5;
-        } else {
-            st = 4;
-        }
-
-        // we need code[i + st - 1] to exist to get argument count
-        if(!SafeIndex(i, st - 1, codeSize))
-            return st;
-
-        const int num = code[i + st - 1]; // argument count or special flag
-        if(num >= 0) {
-            // normal: st + num bytes (each argument is a single reg)
-            if(!SafeIndex(i, st + num - 1, codeSize))
-                return st;
-            for(int j = 0; j < num; ++j) {
-                OffsetReg(code[i + st + j]);
-            }
-            return st + num;
-        }
-        if(num == -1) {
-            // -1: no arguments, size = st
-            return st;
-        }
-        if(num == -2) {
-            // expanded args: next byte contains argCount, followed by argCount
-            // * 2 pairs
-            st++;
-            if(!SafeIndex(i, st - 1, codeSize))
-                return st;
-            const int argCount = code[i + st - 1];
-            if(!SafeIndex(i, st + argCount * 2 - 1, codeSize))
-                return st;
-            for(int j = 0; j < argCount; ++j) {
-                if(const int flag = code[i + st + j * 2];
-                   flag == fatNormal || flag == fatExpand) {
-                    OffsetReg(code[i + st + j * 2 + 1]);
-                }
-            }
-            return st + argCount * 2;
-        }
-
-        return st;
-    }
-
-    // =======================================
-    // 指令信息表
-    // =======================================
-    struct OpInfo {
-        int size; // 基本指令长度（不含可变部分）
-        int regCount; // 固定寄存器参数数
-        bool hasCodeAddr; // 是否包含 code 地址
-        std::function<int(tjs_int32 *, int, int, int)> handler; // 特殊处理函数
-    };
-
-    // ------------------ opTable construction ------------------
-    static std::unordered_map<int, OpInfo> BuildOpTable() {
-        std::unordered_map<int, OpInfo> m;
-
-        // fixed simple ops
-        m[VM_NOP] = { 1, 0, false, nullptr };
-        m[VM_NF] = { 1, 0, false, nullptr };
-        m[VM_RET] = { 1, 0, false, nullptr };
-        m[VM_EXTRY] = { 1, 0, false, nullptr };
-        m[VM_REGMEMBER] = { 1, 0, false, nullptr };
-        m[VM_DEBUGGER] = { 1, 0, false, nullptr };
-
-        // jumps (code address at i+1)
-        m[VM_JMP] = { 2, 0, true, nullptr };
-        m[VM_JF] = { 2, 0, true, nullptr };
-        m[VM_JNF] = { 2, 0, true, nullptr };
-
-        // single-reg unary ops (size=2)
-        constexpr int singleRegs[] = { VM_TT,     VM_TF,     VM_SETF,  VM_SETNF,
-                                       VM_LNOT,   VM_BNOT,   VM_ASC,   VM_CHR,
-                                       VM_NUM,    VM_CHS,    VM_CL,    VM_INV,
-                                       VM_CHKINV, VM_TYPEOF, VM_EVAL,  VM_EEXP,
-                                       VM_INT,    VM_REAL,   VM_STR,   VM_OCTET,
-                                       VM_SRV,    VM_THROW,  VM_GLOBAL };
-        for(int op : singleRegs)
-            m[op] = { 2, 1, false, nullptr };
-
-        // CCL (size=3, 1 reg)
-        m[VM_CCL] = { 3, 1, false, nullptr };
-
-        // two-reg ops (size=3)
-        constexpr int twoRegs[] = { VM_CP,   VM_CEQ,    VM_CDEQ,  VM_CLT,
-                                    VM_CGT,  VM_CHKINS, VM_CONST, VM_SETP,
-                                    VM_GETP, VM_ADDCI };
-        for(int op : twoRegs)
-            m[op] = { 3, 2, false, nullptr };
-
-        // three-reg ops (size=4)
-        constexpr int threeRegs[] = { VM_GPD,     VM_GPDS, VM_SPD,    VM_SPDE,
-                                      VM_SPDEH,   VM_SPDS, VM_GPI,    VM_GPIS,
-                                      VM_SPI,     VM_SPIE, VM_SPIS,   VM_DELD,
-                                      VM_TYPEOFD, VM_DELI, VM_TYPEOFI };
-        for(int op : threeRegs)
-            m[op] = { 4, 3, false, nullptr };
-
-        // CHGTHIS (3 bytes, 2 regs)
-        m[VM_CHGTHIS] = { 3, 2, false, nullptr };
-
-        // ENTRY: original implementation did OffsetCode(code[i+1]) then
-        // OffsetReg(code[i+2]) to preserve exact behavior we won't rely on
-        // regCount/hasCodeAddr auto handling here.
-        m[VM_ENTRY] = { 0, 0, false,
-                        [](tjs_int32 *code, const int i, int,
-                           const int codeSize) -> int {
-                            if(!SafeIndex(i, 2, codeSize))
-                                return 1;
-                            // preserve original order: first code address, then
-                            // reg
-                            OffsetCode(code[i + 1]);
-                            OffsetReg(code[i + 2]);
-                            return 3;
-                        } };
-
-        // INC/DEC family -> handler
-        m[VM_INC] = { 0, 0, false, HandleIncDec };
-        m[VM_DEC] = { 0, 0, false, HandleIncDec };
-
-        // for simplicity assume the OP2 group members are represented by
-        // distinct enum values
-        int op2_group[] = { VM_LOR, VM_LAND, VM_BOR,  VM_BXOR, VM_BAND,
-                            VM_SAR, VM_SAL,  VM_SR,   VM_ADD,  VM_SUB,
-                            VM_MOD, VM_DIV,  VM_IDIV, VM_MUL };
-        for(int op : op2_group)
-            m[op] = { 0, 0, false, HandleOp2 };
-
-        // CALL/NEW family use HandleCallOp
-        m[VM_CALL] = { 0, 0, false, HandleCallOp };
-        m[VM_CALLD] = { 0, 0, false, HandleCallOp };
-        m[VM_CALLI] = { 0, 0, false, HandleCallOp };
-        m[VM_NEW] = { 0, 0, false, HandleCallOp };
-
-        return m;
-    }
-
-    // Build table once (static)
-    static std::unordered_map<int, OpInfo> opTable = BuildOpTable();
-
-
+    //---------------------------------------------------------------------------
     void tTJSScriptBlock::TranslateCodeAddress(tjs_int32 *code,
                                                const tjs_int32 codeSize) {
+        // The bytecode writer turns the VM addresses of the code into the
+        // indices the bytecode file carries. The layout of every opcode is
+        // the one table the loader reads the file back with, so an
+        // instruction the writer did not understand is a hard error instead
+        // of a silently skipped operand.
         tjs_int i = 0;
         while(i < codeSize) {
-            int opcode = code[i];
-            auto it = opTable.find(opcode);
-            if(it == opTable.end()) {
-                // unknown opcode: behave like original default (advance by 1)
-                i += 1;
-                continue;
+            bool broken = false;
+            const tjs_int size = TranslateVMInstruction(
+                code, codeSize, i, tTJSVMAddrDir::ToIndex, &broken);
+            if(broken) {
+                TJS_eTJSScriptError(TJSInternalError, this, 0);
             }
-
-            auto &[size, regCount, hasCodeAddr, handler] = it->second;
-            if(handler) {
-                size = handler(code, i, opcode, codeSize);
-            } else {
-                // fixed-size handling: do bounds checks before touching fields
-                if(hasCodeAddr) {
-                    // need code[i+1]
-                    if(!SafeIndex(i, 1, codeSize)) {
-                        // malformed bytecode: bail out similarly to original
-                        // fallback
-                        i = codeSize;
-                        break;
-                    }
-                    OffsetCode(code[i + 1]);
-                }
-                for(int r = 0; r < regCount; ++r) {
-                    if(!SafeIndex(i, 1 + r, codeSize)) {
-                        i = codeSize;
-                        break;
-                    }
-                    OffsetReg(code[i + 1 + r]);
-                }
-            }
-
             i += size;
         }
 
         if(codeSize != i) {
-            // keep same error behavior as original
             TJS_eTJSScriptError(TJSInternalError, this, 0);
         }
     }

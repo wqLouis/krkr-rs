@@ -89,6 +89,12 @@ namespace TJS {
 
         [[nodiscard]] const tjs_char *GetScript() const { return Script; }
 
+        // Sets the script text of this block and builds its line table from
+        // it. The bytecode loader uses this to give a block that was read
+        // back from bytecode the same line information a block compiled from
+        // source has.
+        void SetSourceText(const tjs_char *text);
+
         void PushContextStack(const tjs_char *name, tTJSContextType type);
         void PopContextStack();
         void Parse(const tjs_char *script, bool isexpr, bool resultneeded);
@@ -121,6 +127,7 @@ namespace TJS {
         static const tjs_uint8 BYTECODE_CODE_TAG[BYTECODE_TAG_SIZE];
         static const tjs_uint8 BYTECODE_OBJ_TAG[BYTECODE_TAG_SIZE];
         static const tjs_uint8 BYTECODE_DATA_TAG[BYTECODE_TAG_SIZE];
+        static const tjs_uint8 BYTECODE_SRC_TAG[BYTECODE_TAG_SIZE];
 
         static inline void Write4Byte(tjs_uint8 output[4], int value) {
             output[0] = ((tjs_uint8)((value >> 0) & 0xff));
