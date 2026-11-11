@@ -4,7 +4,10 @@
 
 use api::error::RenderError;
 use api::geometry::PixelRegion;
-use render::{RenderPipeline, TextureDesc, begin_render_state, create_texture, upload_texture};
+use render::{
+    NULL_MAX_TEXTURE_DIMENSION, RenderPipeline, TextureDesc, begin_render_state, create_texture,
+    upload_texture,
+};
 use testkit::headless_window;
 
 #[test]
@@ -52,6 +55,15 @@ fn create_texture_rejects_invalid_descriptors() {
     ));
     assert!(matches!(
         create_texture(&pipeline, TextureDesc::new(u32::MAX, 1)),
+        Err(RenderError::InvalidArgument { .. })
+    ));
+    // The headless backend's own dimension limit: a descriptor wider than it
+    // is refused rather than allocated.
+    assert!(matches!(
+        create_texture(
+            &pipeline,
+            TextureDesc::new(NULL_MAX_TEXTURE_DIMENSION + 1, 1)
+        ),
         Err(RenderError::InvalidArgument { .. })
     ));
 }

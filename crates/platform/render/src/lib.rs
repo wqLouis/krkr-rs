@@ -181,29 +181,6 @@ pub struct FrameTimings {
     pub fence_wait_ms: f64,
 }
 
-/// Static capabilities reported by a [`RenderPipeline`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GpuCapabilities {
-    /// Backend these capabilities describe.
-    pub backend: BackendKind,
-    /// Maximum texture width/height in pixels.
-    pub max_texture_dimension: u32,
-    /// Preferred texture format.
-    pub preferred_format: TextureFormat,
-    /// Whether destination-dependent blend modes are supported.
-    pub supports_destination_dependent_blend: bool,
-    /// Whether offscreen compositing targets are supported.
-    pub supports_offscreen_targets: bool,
-    /// Whether GPU glyph-atlas uploads are supported.
-    pub supports_glyph_atlas: bool,
-    /// Whether custom effect pipelines ([`create_effect_pipeline`]) are
-    /// supported.
-    ///
-    /// A headless backend reports `false` and refuses to create one, so a
-    /// caller can choose its own CPU path instead of drawing nothing.
-    pub supports_effect_pipelines: bool,
-}
-
 /// Stateless render service.
 ///
 /// Created once through [`create_render_pipeline`] and shared by callers.
@@ -303,11 +280,17 @@ pub fn create_render_pipeline(config: PipelineConfig) -> Result<RenderPipeline, 
     }
 }
 
-/// Returns the static capabilities of `p`.
-pub fn capabilities(p: &RenderPipeline) -> GpuCapabilities {
+/// Reports whether the backend can run effect pipelines.
+///
+/// The headless backend has no device, so it never executes a custom-shader
+/// program; the Vulkan backend builds them from SPIR-V modules. A caller that
+/// asks the headless backend for one gets [`RenderError::Unsupported`] from
+/// [`create_effect_pipeline`], so the answer lets it choose its own CPU path
+/// instead of drawing nothing.
+pub fn supports_effect_pipelines(p: &RenderPipeline) -> bool {
     match &p.kind {
-        PipelineKind::Null(backend) => backend.capabilities(),
-        PipelineKind::Vulkan(backend) => backend.capabilities(),
+        PipelineKind::Null(backend) => backend.supports_effect_pipelines(),
+        PipelineKind::Vulkan(backend) => backend.supports_effect_pipelines(),
     }
 }
 

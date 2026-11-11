@@ -10,9 +10,9 @@ use api::error::RenderError;
 use api::geometry::{PixelRegion, RectF};
 use render::{
     PipelineConfig, RenderContent, RenderNode, RenderPipeline, RenderScene, RenderTarget,
-    RenderTargetDesc, begin_offscreen_render_state, begin_render_state, capabilities,
-    create_render_pipeline, create_render_target, create_texture, destroy_render_target,
-    read_render_target, render_to_target, upload_texture,
+    RenderTargetDesc, begin_offscreen_render_state, begin_render_state, create_render_pipeline,
+    create_render_target, create_texture, destroy_render_target, read_render_target,
+    render_to_target, upload_texture,
 };
 use testkit::headless_window;
 
@@ -499,14 +499,6 @@ fn the_photoshop_subtractive_blend_is_a_linear_burn() {
 }
 
 #[test]
-fn null_capabilities_advertise_the_cpu_target_path() {
-    let pipeline = RenderPipeline::null();
-    let caps = capabilities(&pipeline);
-    assert!(caps.supports_offscreen_targets);
-    assert!(caps.supports_destination_dependent_blend);
-}
-
-#[test]
 fn render_target_descriptor_validation() {
     let pipeline = RenderPipeline::null();
     assert!(matches!(
@@ -576,17 +568,35 @@ fn dropping_a_render_target_releases_its_pixels() {
     ));
 }
 
+/// The GPU path has no copy of the destination to sample.
+///
+/// A destination-dependent blend reads the destination, so the presented path
+/// draws it with the destination-blend program over a copy of the target. An
+/// offscreen target has no such copy, so the draw is refused with
+/// `Unsupported` rather than substituted with a source-over.
+///
+/// A machine without a Vulkan device skips the test, exactly like the other
+/// Vulkan cases here.
 #[test]
-fn vulkan_target_capabilities_or_skip() {
-    // A headless device may not exist; skip gracefully when it does not.
+fn vulkan_offscreen_target_refuses_a_destination_dependent_blend_or_skip() {
     let Ok(pipeline) = create_render_pipeline(PipelineConfig::vulkan()) else {
         return;
     };
-    let caps = capabilities(&pipeline);
-    assert!(caps.supports_offscreen_targets);
-    // The GPU path draws the destination-dependent blends with the
-    // destination-blend program.
-    assert!(caps.supports_destination_dependent_blend);
+    let Ok(mut state) = begin_offscreen_render_state(&pipeline) else {
+        return;
+    };
+    let target = create_render_target(&pipeline, RenderTargetDesc::new(1, 1)).expect("target");
+    let scene = one_pixel_scene(
+        BlendMode::DestinationDependent(DstBlend::Darken),
+        [0.0, 0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0, 1.0],
+    );
+    let error = render_to_target(&pipeline, &mut state, &target, &scene)
+        .expect_err("an offscreen target has no copy of the destination");
+    assert!(
+        matches!(error, RenderError::Unsupported { .. }),
+        "unexpected error: {error}"
+    );
 }
 
 /// The GPU path is reachable without a window.

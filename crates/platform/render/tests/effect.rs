@@ -11,9 +11,9 @@ use api::geometry::{PixelRegion, RectF};
 use api::shader::{BindingDesc, EffectUniforms, SamplerKind, ShaderModule};
 use render::{
     EffectPipelineDesc, PipelineConfig, RenderContent, RenderNode, RenderPipeline, RenderScene,
-    RenderState, Surface, Texture, TextureDesc, begin_render_state, capabilities,
-    create_effect_pipeline, create_render_pipeline, create_render_target, create_texture,
-    destroy_effect_pipeline, destroy_render_target, read_render_target, render_to_target,
+    RenderState, Surface, Texture, TextureDesc, begin_render_state, create_effect_pipeline,
+    create_render_pipeline, create_render_target, create_texture, destroy_effect_pipeline,
+    destroy_render_target, read_render_target, render_to_target, supports_effect_pipelines,
     upload_texture,
 };
 use testkit::headless_window;
@@ -76,9 +76,7 @@ fn vulkan_state() -> Option<(RenderPipeline, Surface, RenderState)> {
 #[test]
 fn the_null_backend_reports_no_effect_pipelines() {
     let pipeline = RenderPipeline::null();
-    let caps = capabilities(&pipeline);
-    assert!(!caps.supports_effect_pipelines);
-    assert_eq!(caps.backend, render::BackendKind::Null);
+    assert!(!supports_effect_pipelines(&pipeline));
 }
 
 #[test]
@@ -98,7 +96,7 @@ fn vulkan_creates_and_destroys_effect_pipelines_or_skips() {
     let Some((pipeline, _surface, mut state)) = vulkan_state() else {
         return;
     };
-    assert!(capabilities(&pipeline).supports_effect_pipelines);
+    assert!(supports_effect_pipelines(&pipeline));
 
     let crossfade = create_effect_pipeline(&pipeline, &mut state, &crossfade_desc())
         .expect("create the cross-fade pipeline");

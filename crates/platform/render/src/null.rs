@@ -23,13 +23,13 @@ use crate::scene::{
 };
 use crate::state::{RenderState, StateKind, Surface, SurfaceKind};
 use crate::texture::{Texture, TextureDesc};
-use crate::{BackendKind, FrameTimings, GpuCapabilities, MAX_TRAVERSAL_DEPTH, TextureFormat};
+use crate::{FrameTimings, MAX_TRAVERSAL_DEPTH};
 
-/// Maximum width/height advertised by null backend.
+/// Maximum width/height the null backend accepts for a texture or a render
+/// target.
 ///
-/// The limit belongs to this backend: a real device reports its own limit
-/// through
-/// [`GpuCapabilities::max_texture_dimension`](crate::GpuCapabilities::max_texture_dimension).
+/// The limit belongs to this backend; the Vulkan backend applies the selected
+/// device's own `maxImageDimension2D` to the descriptors it accepts.
 pub const NULL_MAX_TEXTURE_DIMENSION: u32 = 16384;
 
 /// Per-frame traversal counters produced by [`NullRenderPipeline::render`].
@@ -69,23 +69,13 @@ impl NullRenderPipeline {
         Self
     }
 
-    /// Returns the fixed capabilities advertised by the null backend.
-    pub fn capabilities(&self) -> GpuCapabilities {
-        GpuCapabilities {
-            backend: BackendKind::Null,
-            max_texture_dimension: NULL_MAX_TEXTURE_DIMENSION,
-            preferred_format: TextureFormat::Rgba8Srgb,
-            // The null backend ships a real CPU software rasterizer for
-            // offscreen targets, so it can evaluate destination-dependent
-            // blends (and read pixels back) without a GPU: the
-            // CPU-correctness baseline, not a silently-degraded GPU path.
-            supports_destination_dependent_blend: true,
-            supports_offscreen_targets: true,
-            supports_glyph_atlas: false,
-            // The headless backend has no device, so it never executes a
-            // custom-shader pipeline; the caller keeps its own CPU path.
-            supports_effect_pipelines: false,
-        }
+    /// Reports that the headless backend runs no effect pipeline.
+    ///
+    /// The backend has no device, so a custom-shader program has no meaning
+    /// here: [`create_effect_pipeline`](Self::create_effect_pipeline) refuses
+    /// every program with [`RenderError::Unsupported`].
+    pub fn supports_effect_pipelines(&self) -> bool {
+        false
     }
 
     /// Creates a headless surface and its state, ignoring `window`.

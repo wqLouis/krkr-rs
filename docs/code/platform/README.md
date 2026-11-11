@@ -148,12 +148,14 @@ crates documented here:
   host-visible staging copy) but neither is implemented. Today the script
   reads the CPU layer bitmap, which is already VM-exact.
 * **No GPU glyph path.** `RenderContent::Glyphs` is rejected by both backends
-  and `supports_glyph_atlas` is `false` everywhere, so text is soft at
-  `scale > 1` — a rasterization approximation, not a script-observable
-  difference.
-* **No destination-dependent blend on Vulkan.** The eleven `DstBlend` modes
-  are CPU-only; the Vulkan backend reports `RenderError::Unsupported` rather
-  than substituting source-over.
+  with `RenderError::Unsupported`, so text is soft at `scale > 1` — a
+  rasterization approximation, not a script-observable difference.
+* **No destination-dependent blend on an offscreen target.** A `DstBlend` mode
+  reads the destination. The Vulkan backend draws one in a presented frame with
+  the destination-blend program, but an offscreen target has no copy of the
+  destination to read, so it reports `RenderError::Unsupported` rather than
+  substituting source-over. The headless backend evaluates the modes on the
+  CPU.
 * **`create_render_target` / `read_render_target` are plumbed by neither
   `engine` nor `compat`**, so a capture-style API has no path to a rendered
   texture.

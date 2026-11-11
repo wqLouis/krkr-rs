@@ -32,10 +32,9 @@ use api::error::RenderError;
 use api::geometry::PixelRegion;
 use api::host::{PresentSkip, Presentation, SurfaceEvent};
 use render::{
-    BackendKind, FrameStats, FrameTimings, GpuCapabilities, RenderNode, RenderPipeline,
-    RenderScene, RenderState, Surface, Texture, TextureDesc, TextureUpload, capabilities,
-    create_texture, drop_texture, last_frame_timings, recover_surface, render,
-    resize as resize_render, upload_textures,
+    BackendKind, FrameStats, FrameTimings, RenderNode, RenderPipeline, RenderScene, RenderState,
+    Surface, Texture, TextureDesc, TextureUpload, create_texture, drop_texture, last_frame_timings,
+    recover_surface, render, resize as resize_render, supports_effect_pipelines, upload_textures,
 };
 
 use crate::clock::{FrameClock, FrameTimeSource, InjectedFrameTime};
@@ -591,7 +590,7 @@ impl Engine {
     /// back to the CPU as well; nothing is drawn with a program the driver
     /// rejected.
     fn install_effect_pipelines(&mut self) {
-        if !capabilities(&self.pipeline).supports_effect_pipelines {
+        if !supports_effect_pipelines(&self.pipeline) {
             log::info!(
                 "transitions: this backend cannot run effect pipelines; the display bitmap is \
                  blended on the CPU"
@@ -634,11 +633,6 @@ impl Engine {
             };
             self.scene.effect_pipelines.insert(program, handle);
         }
-    }
-
-    /// The backend's capabilities.
-    pub fn capabilities(&self) -> GpuCapabilities {
-        capabilities(&self.pipeline)
     }
 
     /// Installs the image decoder and starts the decode pool.

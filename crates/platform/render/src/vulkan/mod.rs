@@ -74,7 +74,7 @@ use crate::render_target::{RenderTarget, RenderTargetDesc};
 use crate::scene::RenderScene;
 use crate::state::{RenderState, StateKind, Surface, SurfaceKind};
 use crate::texture::{Texture, TextureDesc};
-use crate::{BackendKind, FrameTimings, GpuCapabilities, TextureFormat};
+use crate::{FrameTimings, TextureFormat};
 
 /// Number of frames recorded concurrently.
 pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -173,25 +173,13 @@ impl VulkanPipeline {
         })
     }
 
-    /// Returns the capabilities advertised by the selected device.
-    pub(crate) fn capabilities(&self) -> GpuCapabilities {
-        GpuCapabilities {
-            backend: BackendKind::Vulkan,
-            max_texture_dimension: self.max_texture_dimension,
-            preferred_format: self.preferred_format,
-            supports_destination_dependent_blend: true,
-            // Offscreen targets are a real GPU path: colour-only render pass,
-            // per-format pipelines and `vkCmdCopyImageToBuffer` readback.
-            supports_offscreen_targets: true,
-            // GPU glyph runs and mask clips are not implemented; a scene that
-            // uses them fails with `RenderError::Unsupported` rather than
-            // rendering incorrectly.
-            supports_glyph_atlas: false,
-            // Effect pipelines need a device, SPIR-V modules, a dynamic uniform
-            // buffer and a 64-byte push-constant block: all of them are inside
-            // what Vulkan 1.0 guarantees.
-            supports_effect_pipelines: true,
-        }
+    /// Reports that the backend can build effect pipelines.
+    ///
+    /// An effect pipeline needs a device, SPIR-V modules, a dynamic uniform
+    /// buffer and a 64-byte push-constant block: all of them are inside what
+    /// Vulkan 1.0 guarantees.
+    pub(crate) fn supports_effect_pipelines(&self) -> bool {
+        true
     }
 
     /// Creates the surface and render state for `window`.

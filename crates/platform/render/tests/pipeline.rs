@@ -6,8 +6,7 @@ use std::time::Duration;
 
 use api::error::RenderError;
 use render::{
-    BackendKind, NULL_MAX_TEXTURE_DIMENSION, PipelineConfig, TextureFormat, capabilities,
-    create_render_pipeline, presentation_budget,
+    BackendKind, PipelineConfig, TextureFormat, create_render_pipeline, presentation_budget,
 };
 
 #[test]
@@ -19,10 +18,6 @@ fn default_config_is_headless() {
     let pipeline = create_render_pipeline(config).expect("null pipeline");
     assert_eq!(pipeline.backend(), BackendKind::Null);
     assert_eq!(pipeline.backend().name(), "null");
-
-    let caps = capabilities(&pipeline);
-    assert_eq!(caps.backend, BackendKind::Null);
-    assert_eq!(caps.max_texture_dimension, NULL_MAX_TEXTURE_DIMENSION);
 }
 
 #[test]

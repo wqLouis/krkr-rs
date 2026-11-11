@@ -107,7 +107,7 @@ pub struct Surface { /* L2-owned */ }
 
 pub fn create_render_pipeline(config: PipelineConfig) -> Result<RenderPipeline, RenderError>;
 pub fn presentation_budget(frame_interval: Duration) -> Result<Duration, RenderError>;
-pub fn capabilities(p: &RenderPipeline) -> GpuCapabilities;
+pub fn supports_effect_pipelines(p: &RenderPipeline) -> bool;
 pub fn begin_render_state(p: &RenderPipeline, window: &RawWindowHandle)
     -> Result<(Surface, RenderState), RenderError>;
 pub fn begin_render_state_with_display(p: &RenderPipeline, display: &RawDisplayHandle,
@@ -294,26 +294,17 @@ and `src`/`blend` are unused — the program's own uniform rectangles select
 the texels and the pipeline carries the blend.
 
 The headless (null) backend reports `RenderError::Unsupported` for every effect
-pipeline; the Vulkan backend builds them. `GpuCapabilities::supports_effect_pipelines`
-says which.
+pipeline; the Vulkan backend builds them. `supports_effect_pipelines` says
+which.
 
 The descriptor and the data vocabulary are the shared DTO crate's
 (`api::shader`); the **policy** half — which programs exist and how long they
 live — is the middle layer's, and is documented in
 [`../engine/shader.md`](../engine/shader.md).
 
-### Capabilities and timings
+### Backend behaviour and timings
 
 ```rust
-pub struct GpuCapabilities {
-    pub backend: BackendKind,
-    pub max_texture_dimension: u32,
-    pub preferred_format: TextureFormat,
-    pub supports_destination_dependent_blend: bool,
-    pub supports_offscreen_targets: bool,
-    pub supports_glyph_atlas: bool,
-    pub supports_effect_pipelines: bool,
-}
 pub struct FrameTimings { pub acquire_ms: f64, pub present_ms: f64, pub submit_ms: f64,
                           pub recreate_ms: f64, pub fence_wait_ms: f64 }
 ```
@@ -324,6 +315,23 @@ any swapchain recreation. The null backend records an all-zero value, so a
 caller can rely on the shape without a GPU. `last_frame_timings` returns
 `None` for a state that has not presented a frame, so "no measurement yet" is
 distinguishable from a measured all-zero frame.
+
+What a backend can do is not a table of flags: a caller learns it by making
+the call and reading the typed error. The one question the crate answers
+ahead of the call is `supports_effect_pipelines` — whether the backend can run
+a custom-shader program at all.
+
+| what | headless backend | Vulkan backend |
+|---|---|---|
+| an offscreen render target and its readback | the CPU rasterizer serves it | a device image, and `vkCmdCopyImageToBuffer` for the readback |
+| a destination-dependent blend | the CPU rasterizer evaluates it | a presented frame draws it with the destination-blend program; an offscreen target has no copy of the destination and refuses it with `Unsupported` |
+| an effect pipeline | `Unsupported` — there is no device | built from the SPIR-V modules |
+| a GPU glyph run | `Unsupported` — the CPU renderer has no glyph path | `Unsupported` — the backend has no glyph path |
+
+The texture and render-target dimensions have a limit per backend: the
+headless backend accepts up to `NULL_MAX_TEXTURE_DIMENSION` pixels, and the
+Vulkan backend applies the selected device's own `maxImageDimension2D`. A
+descriptor over the limit is `RenderError::InvalidArgument`.
 
 ---
 
@@ -583,6 +591,11 @@ L2-side registry is documented in [`../engine/shader.md`](../engine/shader.md).
   reference's vectors exactly, every mode having an index of its own, the
   two legacy modes replacing the channel, the hard light being the swapped
   overlay table, and the soft-light table holding every entry.
+* `crates/platform/render/tests/effect.rs` — the headless backend reporting no
+  effect pipeline and refusing one with `Unsupported`, and the Vulkan cases
+  building and destroying one, refusing a bad module, a destination-dependent
+  blend and a broken binding set, and compositing a cross-fade (each skipping
+  on a machine with no device).
 * `crates/platform/render/tests/null.rs` — the null pipeline round trip
   counting the draws, and the partial upload touching only its region.
 * `crates/platform/render/tests/pipeline.rs` — the default headless
@@ -596,13 +609,14 @@ L2-side registry is documented in [`../engine/shader.md`](../engine/shader.md).
   reading back the clear colour, the solid fill and the partial readback, the
   textured quad, the node tint, source-over honouring the source alpha, the
   destination-dependent blends sampling the destination, the fixed-function
-  blends matching the baseline, the advertised capabilities, the descriptor
-  validation, the rejected mismatched buffer and region, the dropped target
-  releasing its pixels, the Vulkan target capabilities (or a skip), and the
-  Vulkan offscreen state compositing the CPU path's scene without a window
-  (or a skip).
+  blends matching the baseline, the descriptor validation, the rejected
+  mismatched buffer and region, the dropped target releasing its pixels, the
+  Vulkan offscreen target refusing a destination-dependent blend (or a skip),
+  and the Vulkan offscreen state compositing the CPU path's scene without a
+  window (or a skip).
 * `crates/platform/render/tests/texture.rs` — the upload region and length
-  validation, and the rejected invalid descriptors.
+  validation, and the rejected invalid descriptors, among them a descriptor
+  over the headless backend's dimension limit.
 * `crates/platform/render/src/lib.rs` `mod tests` — the batch upload applying
   every region, and the null frame timings recorded as zero.
 * `crates/platform/render/src/vulkan/pipelines.rs` `mod tests` — every
