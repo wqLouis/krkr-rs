@@ -16,8 +16,10 @@ members = [
     "crates/platform/platform",
     "crates/compat",
     "crates/vm",
-    # The script language in Rust: the lexical analyser and its C interface.
-    "crates/script",
+    # The script language in Rust: the lexical analyser, the parser and the
+    # code generator, with their C interfaces. It lives inside the tjs crate
+    # directory, beside the C++ VM it replaces.
+    "crates/tjs/rust/script",
     "crates/app",
     # Android composition root (target-gated deps; empty on the desktop host)
     "crates/android",

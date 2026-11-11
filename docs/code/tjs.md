@@ -24,6 +24,7 @@ instance and drives it; see [vm.md](vm.md) and
 | the port-authored C++ | `crates/tjs/cpp/streams.cpp` — the TJS stream IO |
 | the Rust binding | `crates/tjs/src/lib.rs` — the `tjs2_*` `extern "C"` surface and the safe wrapper |
 | the build script | `crates/tjs/build.rs` |
+| the Rust script columns | `crates/tjs/rust/script/` — the lexer, the parser and the code generator |
 
 The tree is the authority on what TJS means, and the behaviour it defines is
 the behaviour the compatibility layer must reproduce. It is maintained in

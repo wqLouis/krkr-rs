@@ -5,7 +5,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 links = "tjs2"
+# The Rust script columns are their own workspace member inside this
+# directory; keep them out of this package's file list.
+exclude = ["rust"]
 
 [dependencies]
 thiserror = "2"
-script = { path = "../script" }

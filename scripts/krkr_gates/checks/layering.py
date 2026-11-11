@@ -61,7 +61,7 @@ FFI_UNSAFE_LOCATIONS = (
     ("crates/compat/src/", "the native ABI seam: compat marshals the C ABI"),
     ("crates/platform/render/src/vulkan/", "the ash/Vulkan FFI boundary"),
     ("crates/vm/src/host.rs", "the tjs2 C ABI host (log callback, attach)"),
-    ("crates/script/src/ffi.rs", "the lexer's C ABI seam: the vendored parser calls the lexer"),
+    ("crates/tjs/rust/script/src/ffi.rs", "the lexer's C ABI seam: the vendored parser calls the lexer"),
     ("crates/app/src/video.rs", "the video-decoder seam holds a storage pointer"),
 )
 

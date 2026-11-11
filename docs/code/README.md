@@ -31,7 +31,7 @@ current contract for a topic is always a page under `arch/`, `code/` or
 | [`platform/`](platform/README.md) | `api`, `fs`, `media`, `psd`, `render`, `platform` | L1 — the stateless platform core |
 | [`engine/`](engine/README.md) | `engine` | L2 — the middle layer: all evolving state |
 | [`compat/`](compat/README.md) | `compat` | L3 — the KiriKiri compatibility surface |
-| [`vm.md`](vm.md), [`tjs.md`](tjs.md) | `vm`, `tjs` | L4 — the TJS VM host and the vendored VM |
+| [`vm.md`](vm.md), [`tjs.md`](tjs.md), [`tjs/script.md`](tjs/script.md) | `vm`, `tjs`, `script` | L4 — the TJS VM host, the vendored VM and the script language in Rust |
 | [`app/`](app/README.md) | `app` | root — the desktop composition root |
 | [`android/`](android/README.md) | `android` | root — the Android composition root |
 | [`testkit.md`](testkit.md) | `testkit` | dev-only — the shared test helpers |
@@ -111,6 +111,7 @@ per-plugin pages are indexed in [`compat/README.md`](compat/README.md).
 |---|---|---|
 | [`vm.md`](vm.md) | `vm` | the TJS VM host: the engine wrapper, the script cache, the frame body |
 | [`tjs.md`](tjs.md) | `tjs` | the vendored C++ TJS2 VM and its FFI surface |
+| [`tjs/script.md`](tjs/script.md) | `script` | the script language in Rust: the lexer, the parser and the code generator |
 
 ---
 
