@@ -3,13 +3,12 @@
 //! Every assertion below cites the place in the vendored lexer the
 //! behaviour comes from.
 
-use vm::lexer::{Lexer, Literal, PpValues, ScriptString, Token, TokenKind};
+use script::lexer::{Lexer, Literal, ScriptString, Token, TokenKind};
 
 /// The tokens of a script.
 fn lex(source: &str) -> Vec<Token> {
     let units: Vec<u16> = source.encode_utf16().collect();
-    let mut values = PpValues::new();
-    let mut lexer = Lexer::new(&units, &mut values);
+    let mut lexer = Lexer::new(&units);
     let mut tokens = Vec::new();
     while let Some(token) = lexer.next_token().expect("the script lexes") {
         tokens.push(token);
@@ -182,8 +181,7 @@ fn a_regular_expression_is_the_flags_and_the_pattern() {
     // reference/cpp/core/tjs2/tjsLex.cpp:822-880 — the internal form of a
     // regular expression is the flags and the pattern between slashes.
     let units: Vec<u16> = "/abc/g".encode_utf16().collect();
-    let mut values = PpValues::new();
-    let mut lexer = Lexer::new(&units, &mut values);
+    let mut lexer = Lexer::new(&units);
     // the parser tells the analyser that the next token is a regular
     // expression
     // reference/cpp/core/tjs2/tjsLex.cpp:1877-1884 — the notification.
@@ -227,8 +225,7 @@ fn a_position_counts_code_units() {
     // reference/cpp/core/tjs2/tjsLex.cpp:1655-1659 — the position of the
     // analyser is the number of code units it has read.
     let units: Vec<u16> = "ab日".encode_utf16().collect();
-    let mut values = PpValues::new();
-    let mut lexer = Lexer::new(&units, &mut values);
+    let mut lexer = Lexer::new(&units);
     lexer.next_token().expect("the script lexes");
     assert_eq!(lexer.current_position(), 3);
 }
@@ -239,8 +236,7 @@ fn a_newline_pair_is_one_line_break() {
     // of a newline pair becomes a marker, so the pair is one line break and
     // the positions keep counting both code units.
     let units: Vec<u16> = "a\r\nb".encode_utf16().collect();
-    let mut values = PpValues::new();
-    let mut lexer = Lexer::new(&units, &mut values);
+    let mut lexer = Lexer::new(&units);
     lexer.next_token().expect("the script lexes");
     assert_eq!(lexer.current_position(), 2);
     lexer.next_token().expect("the script lexes");
@@ -252,10 +248,9 @@ fn a_conditional_compilation_statement_hides_its_text() {
     // reference/cpp/core/tjs2/tjsLex.cpp:1123-1180 — an `@if` statement
     // keeps the text that follows when its expression is true, and the
     // `@endif` closes it.
-    let mut values = PpValues::new();
-    values.set("kept", 1);
     let units: Vec<u16> = "@if(kept) a @endif b".encode_utf16().collect();
-    let mut lexer = Lexer::new(&units, &mut values);
+    let mut lexer = Lexer::new(&units);
+    lexer.conditional_values_mut().set("kept", 1);
     let mut tokens = Vec::new();
     while let Some(token) = lexer.next_token().expect("the script lexes") {
         tokens.push(token);
@@ -272,9 +267,8 @@ fn a_conditional_compilation_statement_hides_its_text() {
 fn a_conditional_compilation_statement_hides_the_text_it_skips() {
     // reference/cpp/core/tjs2/tjsLex.cpp:1042-1121 — the text between an
     // `@if` and its `@endif` is skipped when the expression is false.
-    let mut values = PpValues::new();
     let units: Vec<u16> = "@if(missing) a @endif b".encode_utf16().collect();
-    let mut lexer = Lexer::new(&units, &mut values);
+    let mut lexer = Lexer::new(&units);
     let mut tokens = Vec::new();
     while let Some(token) = lexer.next_token().expect("the script lexes") {
         tokens.push(token);
@@ -288,8 +282,7 @@ fn an_embeddable_expression_is_read_as_code() {
     // reference/cpp/core/tjs2/tjsLex.cpp:1435-1460 — a string literal that
     // starts with `@` holds code, and the code is read as tokens.
     let units: Vec<u16> = "@\"a&b;c\"".encode_utf16().collect();
-    let mut values = PpValues::new();
-    let mut lexer = Lexer::new(&units, &mut values);
+    let mut lexer = Lexer::new(&units);
     let mut kinds = Vec::new();
     while let Some(token) = lexer.next_token().expect("the script lexes") {
         kinds.push(token.kind);
@@ -316,12 +309,11 @@ fn a_block_comment_that_is_not_terminated_is_an_error() {
     // reference/cpp/core/tjs2/tjsLex.cpp:196-211 — a block comment that
     // is not terminated is an error.
     let units: Vec<u16> = "/* abc".encode_utf16().collect();
-    let mut values = PpValues::new();
-    let mut lexer = Lexer::new(&units, &mut values);
+    let mut lexer = Lexer::new(&units);
     let error = lexer.next_token().expect_err("the script does not lex");
     assert!(matches!(
         error,
-        vm::lexer::LexError::UnterminatedComment { .. }
+        script::lexer::LexError::UnterminatedComment { .. }
     ));
 }
 
@@ -330,12 +322,11 @@ fn a_character_that_begins_no_token_is_an_error() {
     // reference/cpp/core/tjs2/tjsLex.cpp:1496-1501 — a character that
     // cannot begin a token is an error.
     let units: Vec<u16> = "`".encode_utf16().collect();
-    let mut values = PpValues::new();
-    let mut lexer = Lexer::new(&units, &mut values);
+    let mut lexer = Lexer::new(&units);
     let error = lexer.next_token().expect_err("the script does not lex");
     assert!(matches!(
         error,
-        vm::lexer::LexError::InvalidCharacter { .. }
+        script::lexer::LexError::InvalidCharacter { .. }
     ));
 }
 
@@ -344,10 +335,9 @@ fn a_number_that_cannot_be_read_is_an_error() {
     // reference/cpp/core/tjs2/tjsLex.cpp:1458-1466 — a number that cannot
     // be parsed is an error.
     let units: Vec<u16> = "0x".encode_utf16().collect();
-    let mut values = PpValues::new();
-    let mut lexer = Lexer::new(&units, &mut values);
+    let mut lexer = Lexer::new(&units);
     let error = lexer.next_token().expect_err("the script does not lex");
-    assert!(matches!(error, vm::lexer::LexError::Number { .. }));
+    assert!(matches!(error, script::lexer::LexError::Number { .. }));
 }
 
 #[test]
@@ -355,12 +345,11 @@ fn a_string_that_is_not_terminated_is_an_error() {
     // reference/cpp/core/tjs2/tjsLex.cpp:355-364 — a literal that is not
     // terminated is an error.
     let units: Vec<u16> = "\"abc".encode_utf16().collect();
-    let mut values = PpValues::new();
-    let mut lexer = Lexer::new(&units, &mut values);
+    let mut lexer = Lexer::new(&units);
     let error = lexer.next_token().expect_err("the script does not lex");
     assert!(matches!(
         error,
-        vm::lexer::LexError::UnterminatedLiteral { .. }
+        script::lexer::LexError::UnterminatedLiteral { .. }
     ));
 }
 
@@ -369,8 +358,7 @@ fn an_expression_reads_its_value() {
     // reference/cpp/core/tjs2/tjsLex.cpp:1661-1680 — an expression that
     // wants its value starts with the token that returns it.
     let units: Vec<u16> = "1+2".encode_utf16().collect();
-    let mut values = PpValues::new();
-    let mut lexer = Lexer::expression(&units, true, &mut values);
+    let mut lexer = Lexer::expression(&units, true);
     let mut kinds = Vec::new();
     while let Some(token) = lexer.next_token().expect("the script lexes") {
         kinds.push(token.kind);

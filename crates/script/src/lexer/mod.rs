@@ -16,13 +16,10 @@ mod error;
 mod literal;
 mod number;
 mod preprocess;
-mod scaffold;
 mod token;
 mod value;
 
 use std::collections::VecDeque;
-
-use logos::Logos;
 
 pub use error::LexError;
 pub use preprocess::PpValues;
@@ -30,7 +27,6 @@ pub use token::{Token, TokenKind};
 pub use value::{Literal, ScriptString};
 
 use literal::StringEnd;
-use scaffold::Scaffold;
 
 /// The code unit that stands in for the carriage return of a newline pair.
 ///
@@ -98,6 +94,11 @@ impl Cursor {
         self.current().is_some()
     }
 
+    /// Move forward by the given number of code units.
+    pub fn advance_by(&mut self, count: usize) {
+        self.position += count;
+    }
+
     /// Step over the whitespace and the newline markers.
     ///
     /// Returns whether there is a code unit left to read.
@@ -107,16 +108,16 @@ impl Cursor {
     }
 
     /// The position after the whitespace at a position.
+    ///
+    /// The scan is written as a search for the first code unit that is not
+    /// whitespace, so the compiler can vectorise it.
     pub fn skip_space_at(&self, position: usize) -> usize {
-        let mut position = position;
-        while let Some(unit) = self.unit_at(position) {
-            if unit == SKIP_CODE || is_space(unit) {
-                position += 1;
-            } else {
-                break;
-            }
-        }
-        position
+        let units = &self.text[position.min(self.text.len())..];
+        let length = units
+            .iter()
+            .position(|&unit| !is_space(unit) && unit != SKIP_CODE)
+            .unwrap_or(units.len());
+        position + length
     }
 
     /// The word at the current position, if it is there.
@@ -223,8 +224,13 @@ pub(crate) enum Comment {
 ///
 /// Only the ASCII spaces are spaces: a code unit outside the ASCII range is
 /// a character, not a space.
+///
+/// The test is written without a branch so that a loop over code units
+/// vectorises: the comparisons become lane masks.
 pub(crate) fn is_space(unit: u16) -> bool {
-    unit < 0x100 && matches!(unit, 0x20 | 0x09 | 0x0a | 0x0b | 0x0c | 0x0d)
+    let control = unit.wrapping_sub(0x09) < 5;
+    let space = unit == 0x20;
+    unit < 0x100 && (control || space)
 }
 
 /// Whether the code unit is a decimal digit.
@@ -242,8 +248,19 @@ pub(crate) fn is_letter(unit: u16) -> bool {
 }
 
 /// Whether the code unit can be part of a name.
+///
+/// A code unit outside the ASCII range is a letter: the script may hold any
+/// character, and a character that is not a digit, a space or a punctuation
+/// mark is part of a name.
+///
+/// The test is written without a branch so that a loop over code units
+/// vectorises: the comparisons become lane masks.
 pub(crate) fn is_name_unit(unit: u16) -> bool {
-    is_digit(unit) || is_letter(unit) || unit == u16::from(b'_')
+    let digit = unit.wrapping_sub(0x30) < 10;
+    let letter = (unit | 0x20).wrapping_sub(0x61) < 26;
+    let underscore = unit == 0x5f;
+    let wide = unit >= 0x100;
+    digit || letter || underscore || wide
 }
 
 /// The digit sets a number literal can use.
@@ -336,7 +353,7 @@ enum EmbeddableState {
 ///
 /// The analyser owns the script it reads and the tokens it has produced but
 /// not yet handed out.
-pub struct Lexer<'a> {
+pub struct Lexer {
     cursor: Cursor,
     /// The position the last token started at.
     previous_position: usize,
@@ -359,20 +376,16 @@ pub struct Lexer<'a> {
     /// The nesting level of the conditional-compilation statements.
     conditional_level: i32,
     /// The values the conditional-compilation statements read and write.
-    conditional_values: &'a mut PpValues,
+    conditional_values: PpValues,
 }
 
-impl<'a> Lexer<'a> {
+impl Lexer {
     /// An analyser for a script.
     ///
     /// The script is a sequence of code units; a code unit that is not a
     /// character of the text ends the script.
-    ///
-    /// The values the conditional-compilation statements read and write
-    /// outlive the analyser: a value one script sets is visible in the next
-    /// one.
-    pub fn new(script: &[u16], conditional_values: &'a mut PpValues) -> Self {
-        Self::with_text(script.to_vec(), false, false, conditional_values)
+    pub fn new(script: &[u16]) -> Self {
+        Self::with_text(script.to_vec(), false, false)
     }
 
     /// An analyser for an expression.
@@ -380,20 +393,11 @@ impl<'a> Lexer<'a> {
     /// The expression is read as a program whose last statement is
     /// terminated, and the analyser produces the token that returns the
     /// expression's value when `result_needed` is set.
-    pub fn expression(
-        script: &[u16],
-        result_needed: bool,
-        conditional_values: &'a mut PpValues,
-    ) -> Self {
-        Self::with_text(script.to_vec(), true, result_needed, conditional_values)
+    pub fn expression(script: &[u16], result_needed: bool) -> Self {
+        Self::with_text(script.to_vec(), true, result_needed)
     }
 
-    fn with_text(
-        mut text: Vec<u16>,
-        expression: bool,
-        result_needed: bool,
-        conditional_values: &'a mut PpValues,
-    ) -> Self {
+    fn with_text(mut text: Vec<u16>, expression: bool, result_needed: bool) -> Self {
         if let Some(end) = text.iter().position(|&unit| unit == 0) {
             text.truncate(end);
         }
@@ -421,8 +425,22 @@ impl<'a> Lexer<'a> {
             pending: VecDeque::new(),
             embeddable: Vec::new(),
             conditional_level: 0,
-            conditional_values,
+            conditional_values: PpValues::new(),
         }
+    }
+
+    /// The values the conditional-compilation statements read and write.
+    ///
+    /// The values outlive a script: a value one script sets is visible in
+    /// the next one, so the owner of the engine moves them from one
+    /// analyser to the next.
+    pub fn conditional_values(&self) -> &PpValues {
+        &self.conditional_values
+    }
+
+    /// The values the conditional-compilation statements read and write.
+    pub fn conditional_values_mut(&mut self) -> &mut PpValues {
+        &mut self.conditional_values
     }
 
     /// The next token, or `None` at the end of the script.
@@ -668,52 +686,84 @@ impl<'a> Lexer<'a> {
 
     /// The operator at the current position, if there is one.
     ///
-    /// The table is matched over the characters at the cursor. The newline
-    /// markers are stepped over while the text is matched, so an operator
-    /// written across a newline pair is one operator.
+    /// The table is the longest match over the text at the cursor. A
+    /// newline marker inside the operator is stepped over while the
+    /// operator is matched, so an operator written across a newline pair is
+    /// one operator.
     fn match_operator(&mut self) -> Option<TokenKind> {
-        // the table holds ASCII characters only
-        let mut text: [u8; 8] = [0; 8];
-        let mut lengths: [u32; 8] = [0; 8];
+        // The operator characters are ASCII. A code unit that is not one --
+        // a newline marker, or a character of the script -- can hide a
+        // longer operator behind it, so the window goes to the slow path.
+        let first = self.cursor.current()?;
+        let second = self.cursor.ahead(1);
+        let third = self.cursor.ahead(2);
+        let fourth = self.cursor.ahead(3);
+        let ascii = |unit: Option<u16>| unit.is_some_and(|unit| unit < 0x80);
+        if first < 0x80 && ascii(second) && ascii(third) && ascii(fourth) {
+            let window = [
+                first as u8,
+                second.unwrap_or(0) as u8,
+                third.unwrap_or(0) as u8,
+                fourth.unwrap_or(0) as u8,
+            ];
+            if let Some((kind, length)) = operator_kind(&window) {
+                if length == 4 && self.cursor.ahead(4) == Some(SKIP_CODE) {
+                    // a marker right after the operator means a longer
+                    // operator may be hidden behind it
+                    return self.match_operator_with_markers();
+                }
+                self.cursor.advance_by(length);
+                return Some(kind);
+            }
+            return None;
+        }
+        self.match_operator_with_markers()
+    }
+
+    /// The operator at the current position, when a newline marker stands
+    /// inside it.
+    ///
+    /// The window holds the characters of the operator without the markers,
+    /// and the number of code units each of them stands for.
+    fn match_operator_with_markers(&mut self) -> Option<TokenKind> {
+        // the characters of the operator, without the markers
+        let mut window = [0u8; 5];
         let mut count = 0;
         let mut position = self.cursor.position();
-        let mut markers = 0;
-        while count < text.len() {
+        while count < window.len() {
             let Some(unit) = self.cursor.unit_at(position) else {
                 break;
             };
             if unit == SKIP_CODE {
-                markers += 1;
                 position += 1;
                 continue;
             }
             if unit >= 0x80 {
                 break;
             }
-            text[count] = unit as u8;
-            lengths[count] = markers + 1;
+            window[count] = unit as u8;
             count += 1;
-            markers = 0;
             position += 1;
         }
-        if count == 0 {
-            return None;
-        }
-        let mut scanner = Scaffold::lexer(&text[..count]);
-        let Some(Ok(Scaffold::Operator(kind))) = scanner.next() else {
-            return None;
-        };
-        let matched = scanner.span().end;
+        let (kind, length) = operator_kind(&window[..count])?;
         // the matched characters, and the markers that follow the last of
         // them, are the code units the operator stands for
-        let mut units: usize = lengths[..matched]
-            .iter()
-            .map(|&length| length as usize)
-            .sum();
-        if matched < count {
-            units += (lengths[matched] - 1) as usize;
-        } else {
-            units += markers as usize;
+        let mut units = 0;
+        let mut position = self.cursor.position();
+        let mut characters = 0;
+        while characters < length {
+            let Some(unit) = self.cursor.unit_at(position) else {
+                break;
+            };
+            units += 1;
+            position += 1;
+            if unit != SKIP_CODE {
+                characters += 1;
+            }
+        }
+        while self.cursor.unit_at(position) == Some(SKIP_CODE) {
+            units += 1;
+            position += 1;
         }
         self.cursor.move_to(self.cursor.position() + units);
         Some(kind)
@@ -724,22 +774,24 @@ impl<'a> Lexer<'a> {
     /// The name is the run of code units that can be part of a name. The
     /// newline markers inside it are not part of the name.
     fn scan_name(&mut self) -> Vec<u16> {
+        let units = self.cursor.units();
         let start = self.cursor.position();
-        let mut end = start;
-        while let Some(unit) = self.cursor.unit_at(end) {
-            if is_name_unit(unit) || unit == SKIP_CODE {
-                end += 1;
-            } else {
+        let rest = &units[start..];
+        let mut length = 0;
+        let mut marked = false;
+        while length < rest.len() {
+            let unit = rest[length];
+            if !is_name_unit(unit) {
                 break;
             }
+            marked |= unit == SKIP_CODE;
+            length += 1;
         }
-        let mut name: Vec<u16> = Vec::with_capacity(end - start);
-        for unit in &self.cursor.units()[start..end] {
-            if *unit != SKIP_CODE {
-                name.push(*unit);
-            }
+        let mut name = rest[..length].to_vec();
+        if marked {
+            name.retain(|&unit| unit != SKIP_CODE);
         }
-        self.cursor.move_to(end);
+        self.cursor.move_to(start + length);
         name
     }
 
@@ -951,75 +1003,116 @@ fn single_operator(character: u16) -> Option<TokenKind> {
     })
 }
 
-/// The reserved words and the token kinds they stand for.
-const RESERVED_WORDS: &[(&str, TokenKind)] = &[
-    ("break", TokenKind::Break),
-    ("continue", TokenKind::Continue),
-    ("const", TokenKind::Const),
-    ("catch", TokenKind::Catch),
-    ("class", TokenKind::Class),
-    ("case", TokenKind::Case),
-    ("debugger", TokenKind::Debugger),
-    ("default", TokenKind::Default),
-    ("delete", TokenKind::Delete),
-    ("do", TokenKind::Do),
-    ("extends", TokenKind::Extends),
-    ("export", TokenKind::Export),
-    ("enum", TokenKind::Enum),
-    ("else", TokenKind::Else),
-    ("function", TokenKind::Function),
-    ("finally", TokenKind::Finally),
-    ("false", TokenKind::False),
-    ("for", TokenKind::For),
-    ("global", TokenKind::Global),
-    ("getter", TokenKind::Getter),
-    ("goto", TokenKind::Goto),
-    ("incontextof", TokenKind::InContextOf),
-    ("invalidate", TokenKind::Invalidate),
-    ("instanceof", TokenKind::InstanceOf),
-    ("isvalid", TokenKind::IsValid),
-    ("import", TokenKind::Import),
-    ("int", TokenKind::Int),
-    ("in", TokenKind::In),
-    ("if", TokenKind::If),
-    ("null", TokenKind::Null),
-    ("new", TokenKind::New),
-    ("octet", TokenKind::Octet),
-    ("protected", TokenKind::Protected),
-    ("property", TokenKind::Property),
-    ("private", TokenKind::Private),
-    ("public", TokenKind::Public),
-    ("return", TokenKind::Return),
-    ("real", TokenKind::Real),
-    ("synchronized", TokenKind::Synchronized),
-    ("switch", TokenKind::Switch),
-    ("static", TokenKind::Static),
-    ("setter", TokenKind::Setter),
-    ("string", TokenKind::String),
-    ("super", TokenKind::Super),
-    ("typeof", TokenKind::TypeOf),
-    ("throw", TokenKind::Throw),
-    ("this", TokenKind::This),
-    ("true", TokenKind::True),
-    ("try", TokenKind::Try),
-    ("void", TokenKind::Void),
-    ("var", TokenKind::Var),
-    ("while", TokenKind::While),
-    ("NaN", TokenKind::NaN),
-    ("Infinity", TokenKind::Infinity),
-    ("with", TokenKind::With),
-];
-
 /// The token kind a reserved word stands for.
+///
+/// The reserved words are ASCII, so a name that holds another character is
+/// not one.
 fn reserved_word(name: &[u16]) -> Option<TokenKind> {
-    RESERVED_WORDS
-        .iter()
-        .find(|(word, _)| {
-            word.len() == name.len()
-                && word
-                    .bytes()
-                    .zip(name)
-                    .all(|(expected, unit)| u16::from(expected) == *unit)
-        })
-        .map(|(_, kind)| *kind)
+    let mut bytes = [0u8; 16];
+    if name.len() > bytes.len() {
+        return None;
+    }
+    for (index, &unit) in name.iter().enumerate() {
+        if unit >= 0x80 {
+            return None;
+        }
+        bytes[index] = unit as u8;
+    }
+    Some(match &bytes[..name.len()] {
+        b"break" => TokenKind::Break,
+        b"continue" => TokenKind::Continue,
+        b"const" => TokenKind::Const,
+        b"catch" => TokenKind::Catch,
+        b"class" => TokenKind::Class,
+        b"case" => TokenKind::Case,
+        b"debugger" => TokenKind::Debugger,
+        b"default" => TokenKind::Default,
+        b"delete" => TokenKind::Delete,
+        b"do" => TokenKind::Do,
+        b"extends" => TokenKind::Extends,
+        b"export" => TokenKind::Export,
+        b"enum" => TokenKind::Enum,
+        b"else" => TokenKind::Else,
+        b"function" => TokenKind::Function,
+        b"finally" => TokenKind::Finally,
+        b"false" => TokenKind::False,
+        b"for" => TokenKind::For,
+        b"global" => TokenKind::Global,
+        b"getter" => TokenKind::Getter,
+        b"goto" => TokenKind::Goto,
+        b"incontextof" => TokenKind::InContextOf,
+        b"invalidate" => TokenKind::Invalidate,
+        b"instanceof" => TokenKind::InstanceOf,
+        b"isvalid" => TokenKind::IsValid,
+        b"import" => TokenKind::Import,
+        b"int" => TokenKind::Int,
+        b"in" => TokenKind::In,
+        b"if" => TokenKind::If,
+        b"null" => TokenKind::Null,
+        b"new" => TokenKind::New,
+        b"octet" => TokenKind::Octet,
+        b"protected" => TokenKind::Protected,
+        b"property" => TokenKind::Property,
+        b"private" => TokenKind::Private,
+        b"public" => TokenKind::Public,
+        b"return" => TokenKind::Return,
+        b"real" => TokenKind::Real,
+        b"synchronized" => TokenKind::Synchronized,
+        b"switch" => TokenKind::Switch,
+        b"static" => TokenKind::Static,
+        b"setter" => TokenKind::Setter,
+        b"string" => TokenKind::String,
+        b"super" => TokenKind::Super,
+        b"typeof" => TokenKind::TypeOf,
+        b"throw" => TokenKind::Throw,
+        b"this" => TokenKind::This,
+        b"true" => TokenKind::True,
+        b"try" => TokenKind::Try,
+        b"void" => TokenKind::Void,
+        b"var" => TokenKind::Var,
+        b"while" => TokenKind::While,
+        b"NaN" => TokenKind::NaN,
+        b"Infinity" => TokenKind::Infinity,
+        b"with" => TokenKind::With,
+        _ => return None,
+    })
+}
+
+/// The operator the text starts, and how many characters it is.
+///
+/// The table is the longest match: the longer operators come first.
+fn operator_kind(text: &[u8]) -> Option<(TokenKind, usize)> {
+    Some(match text {
+        [b'>', b'>', b'>', b'=', ..] => (TokenKind::RightBitShiftAssign, 4),
+        [b'>', b'>', b'>', ..] => (TokenKind::RightBitShift, 3),
+        [b'>', b'>', b'=', ..] => (TokenKind::RightArithmeticShiftAssign, 3),
+        [b'>', b'>', ..] => (TokenKind::RightArithmeticShift, 2),
+        [b'>', b'=', ..] => (TokenKind::GreaterOrEqual, 2),
+        [b'<', b'<', b'=', ..] => (TokenKind::LeftBitShiftAssign, 3),
+        [b'<', b'-', b'>', ..] => (TokenKind::Swap, 3),
+        [b'<', b'=', ..] => (TokenKind::LessOrEqual, 2),
+        [b'<', b'<', ..] => (TokenKind::LeftBitShift, 2),
+        [b'=', b'=', b'=', ..] => (TokenKind::DiscriminantEqual, 3),
+        [b'=', b'=', ..] => (TokenKind::EqualEqual, 2),
+        [b'=', b'>', ..] => (TokenKind::Comma, 2),
+        [b'!', b'=', b'=', ..] => (TokenKind::DiscriminantNotEqual, 3),
+        [b'!', b'=', ..] => (TokenKind::NotEqual, 2),
+        [b'&', b'&', b'=', ..] => (TokenKind::LogicalAndAssign, 3),
+        [b'&', b'&', ..] => (TokenKind::LogicalAnd, 2),
+        [b'&', b'=', ..] => (TokenKind::AmpersandAssign, 2),
+        [b'|', b'|', b'=', ..] => (TokenKind::LogicalOrAssign, 3),
+        [b'|', b'|', ..] => (TokenKind::LogicalOr, 2),
+        [b'|', b'=', ..] => (TokenKind::VerticalBarAssign, 2),
+        [b'.', b'.', b'.', ..] => (TokenKind::Omit, 3),
+        [b'+', b'+', ..] => (TokenKind::Increment, 2),
+        [b'+', b'=', ..] => (TokenKind::PlusAssign, 2),
+        [b'-', b'=', ..] => (TokenKind::MinusAssign, 2),
+        [b'-', b'-', ..] => (TokenKind::Decrement, 2),
+        [b'*', b'=', ..] => (TokenKind::AsteriskAssign, 2),
+        [b'/', b'=', ..] => (TokenKind::SlashAssign, 2),
+        [b'\\', b'=', ..] => (TokenKind::BackslashAssign, 2),
+        [b'%', b'=', ..] => (TokenKind::PercentAssign, 2),
+        [b'^', b'=', ..] => (TokenKind::ChevronAssign, 2),
+        _ => return None,
+    })
 }

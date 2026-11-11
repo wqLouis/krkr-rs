@@ -36,7 +36,7 @@ impl PpValues {
     }
 }
 
-impl super::Lexer<'_> {
+impl super::Lexer {
     /// The conditional-compilation statement at the current position.
     ///
     /// The cursor is at the `@`.
@@ -68,7 +68,7 @@ impl super::Lexer<'_> {
     fn scan_conditional_set(&mut self) -> Result<Statement, LexError> {
         self.cursor.move_to(self.cursor.position() + 3);
         let text = self.conditional_expression()?;
-        evaluate(&text, self.conditional_values).map_err(|_| self.conditional_error())?;
+        evaluate(&text, &mut self.conditional_values).map_err(|_| self.conditional_error())?;
         self.cursor.skip_space();
         if self.cursor.current().is_none() {
             return Ok(Statement::End);
@@ -81,7 +81,7 @@ impl super::Lexer<'_> {
         self.cursor.move_to(self.cursor.position() + 2);
         let text = self.conditional_expression()?;
         let value =
-            evaluate(&text, self.conditional_values).map_err(|_| self.conditional_error())?;
+            evaluate(&text, &mut self.conditional_values).map_err(|_| self.conditional_error())?;
         if value == 0 {
             return self.skip_until_endif();
         }

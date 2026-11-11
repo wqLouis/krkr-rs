@@ -8,3 +8,4 @@ links = "tjs2"
 
 [dependencies]
 thiserror = "2"
+script = { path = "../script" }
