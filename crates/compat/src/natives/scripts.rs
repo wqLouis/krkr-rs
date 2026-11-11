@@ -348,7 +348,19 @@ fn decode_storage_script<'a>(
 }
 
 /// Decode `bytes` as text.
-fn decode_storage_text(name: &str, bytes: &[u8], encoding: Option<&str>) -> Result<String, String> {
+///
+/// The decode is the storage text decoder: the `FE FE` container, a byte-order
+/// mark, an explicit encoding and charset detection, in that order. `name`
+/// names the storage in a failure message, and `encoding` overrides the
+/// decoder; `None` selects the automatic decision.
+///
+/// The text it returns is the text the engine would have run from the same
+/// bytes.
+pub fn decode_storage_text(
+    name: &str,
+    bytes: &[u8],
+    encoding: Option<&str>,
+) -> Result<String, String> {
     decode_storage_script(name, bytes, encoding).map(|decoded| decoded.text())
 }
 

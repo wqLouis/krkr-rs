@@ -47,6 +47,11 @@ Both read the storage, apply the mode's `oN` byte offset, and then:
 The order matters: a file with the bytecode magic that fails to load is a
 typed error, not a fall-through to the text path.
 
+The reference reads the storage the script named and offers what it read to
+the bytecode loader (`reference/cpp/core/base/ScriptMgnIntf.cpp:713-727`);
+it looks for no other storage. A script that wants a compiled form asks for
+that storage by name.
+
 `execStorage` runs the script and an explicit top-level `return` is the
 result; `evalStorage` evaluates the storage: an expression-shaped storage
 yields its value, and a script-shaped storage — a class or a function
@@ -68,6 +73,11 @@ The third argument is the script's `this`. It must be an **object**: a
 present non-object raises `Scripts.execStorage: the execution context is not
 an object` (the reference's `AsObjectNoAddRef` throw). An absent argument is
 fine.
+
+A script that runs with a context declares its variables in that context, not
+in the global object: at the top level of a script a `var` is a member of
+`this`, and the generator only declares a local variable at a namespace level
+of at least one (`reference/cpp/core/tjs2/tjsInterCodeGen.cpp:2845-2883`).
 
 ### `exec` / `eval`
 
@@ -143,6 +153,18 @@ pub fn exec_storage(engine: &Tjs2Engine, storage: &Storage, name: &str) -> Resul
 
 The composition root runs the startup sequence through it.
 
+The storage text decoder is public as well:
+
+```rust
+pub fn decode_storage_text(
+    name: &str,
+    bytes: &[u8],
+    encoding: Option<&str>,
+) -> Result<String, String>;
+```
+
+It decodes a storage's bytes the way the engine would have decoded them.
+
 The natives also participate in the startup timing report: the instrumented
 members record their dispatch cost, which the host prints once after startup.
 
@@ -182,6 +204,10 @@ being rejected by the loader rather than run as text, a corrupt or truncated
 bytecode being a typed error, the "no storage" errors and the arity errors,
 and `evalStorage` evaluating an expression-shaped storage and running a
 script-shaped one.
+
+The bytecode story has its own tests there: a script run from its compiled
+form leaves the same values and raises the same message as the source it was
+compiled from.
 
 ---
 
