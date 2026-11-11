@@ -15,12 +15,15 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use common::vm_lock;
 use compat::CompatHost;
 use engine::Storage;
+use engine::storage::{FileSystemReader, StoragePoolConfig, StorageReadPool};
 use engine::text::TextEngine;
 use fs::FileSystem;
+use testkit::build_xp3;
 use tjs::{Tjs2Engine, TjsValue};
 
 /// System fonts tried by the tests; a missing/unusable font skips the
@@ -112,7 +115,16 @@ struct Env {
 impl Env {
     fn new(storage: Option<Storage>, dir: Option<GameDir>) -> Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
-        let mut storage = storage.map(Box::new);
+        let mut storage = storage.map(|mut storage| {
+            // The storage read pool: the entry reads run on its workers, so a
+            // read that is shared by several files is served off the calling
+            // thread.
+            let pool =
+                StorageReadPool::new(Arc::new(FileSystemReader), StoragePoolConfig::default())
+                    .expect("start the read pool");
+            storage.read_pool = Some(Arc::new(pool));
+            Box::new(storage)
+        });
         let mut text = Box::new(TextEngine::new());
         let mut host = CompatHost::new();
         // SAFETY: the boxed storage outlives the host (it is declared after
@@ -150,6 +162,24 @@ impl Env {
             std::iter::empty::<&str>(),
         )
         .expect("mount font directory");
+        Some((Env::new(Some(storage), Some(dir)), name, count))
+    }
+
+    /// A bound env whose storage mounts the font inside an archive, so the
+    /// font file is read out of the archive's data area. Returns the font
+    /// file name and its face count.
+    fn with_archived_font() -> Option<(Env, String, i64)> {
+        let (name, bytes) = test_font()?;
+        let count = face_count(&bytes);
+        let dir = GameDir::new();
+        let archive = build_xp3(&[(&name, &bytes, true)]);
+        dir.write("data.xp3", &archive);
+        let storage = Storage::mount_archives(
+            FileSystem::host(dir.path()),
+            dir.path().to_path_buf(),
+            ["data.xp3"],
+        )
+        .expect("mount the archive");
         Some((Env::new(Some(storage), Some(dir)), name, count))
     }
 
@@ -214,6 +244,27 @@ fn add_font_registers_every_face_and_returns_the_count() {
         "Integer"
     );
     // Re-adding the same source reports the same count.
+    assert_eq!(env.eval_int(&format!("System.addFont('{name}')")), count);
+}
+
+/// The font files the script looks for are read together: the archive's
+/// data area is read once, over the range those files occupy, and every
+/// file of the range is decoded on a worker of its own. The faces that come
+/// from that read are the faces the file carries: the count is the count the
+/// individual read reports.
+#[test]
+fn add_font_registers_the_same_faces_after_a_shared_read() {
+    let _lock = vm_lock();
+    let Some((env, name, count)) = Env::with_archived_font() else {
+        return;
+    };
+    // The script looks for the font file first: the file is then read
+    // together with the other font files it looked for.
+    assert_eq!(
+        env.eval_int(&format!("Storages.isExistentStorage('{name}')")),
+        1,
+        "the font file the script looks for must resolve"
+    );
     assert_eq!(env.eval_int(&format!("System.addFont('{name}')")), count);
 }
 

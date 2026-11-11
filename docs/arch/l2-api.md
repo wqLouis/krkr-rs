@@ -526,6 +526,7 @@ Code map: [`../code/engine/input.md`](../code/engine/input.md).
 | `MountOptions` / `MountError` / `PreloadError` | the mounting options and their failures |
 | `StorageReadError` | the read and lookup failures |
 | `StorageKey` / `StorageJob` / `StorageOutcome` / `PendingStorage` | the scheduled-read identity, the work, the result and the future |
+| `StorageBytes` | what a read produced: a file's bytes, or an archive entry's decoded bytes |
 | `StorageReadPool` / `StoragePoolConfig` / `StoragePoolStats` / `StoragePoolError` | the worker pool |
 | `StartupPlan` | the four startup script names, resolved |
 | `ProbeCounts` | a diagnostic: the number of listing and stat probes and the misses |
@@ -565,6 +566,14 @@ served before the disk and the archives; a read is scheduled rather than
 cached; a scheduled read belongs to one resolution, and the generation
 changes when the mounts or the auto paths change; a failed read is the
 storage's own typed error, never a substitute value.
+
+A read is two stages: the decode — the raw read and the archive
+decompression — runs on the read pool, and the XP3 extraction filter
+transforms the decoded bytes afterwards, on the thread that asked for them.
+The filter is script code, so it may not run on a worker; the decode it
+transforms does not care which thread ran it. The reference applies the
+filter to the decoded bytes
+(`reference/krkr2/cpp/core/archive/xp3/XP3Archive.cpp:973-1004`).
 
 **Error types:** `MountError` — `NotADirectory`, `Fs`, `Xp3`,
 `ArchiveTooLarge`; `PreloadError` — `Truncated`, `Allocation`, `Io`;
@@ -734,7 +743,7 @@ with `antialias == false` the coverage is thresholded; the atlas packs
 glyphs left to right, top to bottom, one pixel apart.
 
 **Error type:** `TextError` — `UnknownFont`, `InvalidSize`,
-`InvalidFont`, `FontNotFound`, `AtlasFull`, `InvalidCoverage`,
+`InvalidFont`, `FontNotFound`, `HostFontScan`, `AtlasFull`, `InvalidCoverage`,
 `MaskTooLarge`, `Glyph`, `Render`.
 
 Code map: [`../code/engine/text.md`](../code/engine/text.md).

@@ -31,6 +31,7 @@ use tjs::{NativeMethodDef, NativeStaticMembers, Value};
 use crate::engine_api::TextEngine;
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
 use crate::natives::system::resolve;
+use crate::resource::resource_state;
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
@@ -77,6 +78,19 @@ extern "C" fn system_add_font(
             return 0;
         }
         Err(error) => return report_error(out_error, &format!("System.addFont: {error}")),
+    }
+    // The font files the script looked for are read together: they sit next
+    // to each other in the archive's data area, so one read of the range they
+    // occupy brings them in, and one decode per file, on a worker of its own,
+    // brings them back. The read that follows waits for its own file only.
+    let together = {
+        let mut state = resource_state(&ctx);
+        state.take_font_files_to_read()
+    };
+    if !together.is_empty()
+        && let Err(error) = storage.read_entries_together(&together)
+    {
+        log::debug!("System.addFont: the font files could not be read together: {error}");
     }
     // The reference runs `TVPEnumFontsProc(filename)` on *every* call
     // (`reference/cpp/plugins/addFont.cpp:22-28`) — the file is re-read and

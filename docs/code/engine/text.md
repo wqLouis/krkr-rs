@@ -40,7 +40,7 @@ statics and no hidden caches.
 
 | value | state |
 |---|---|
-| `TextEngine` | the L1 `FontSystem`, the `cosmic-text` shaping system, the font registry, the lazily built host font database, the memoized shaped layouts, the memoized per-character advances and the memoized missing system families |
+| `TextEngine` | the L1 `FontSystem`, the `cosmic-text` shaping system, the font registry, the host font database the background scan builds, the memoized shaped layouts, the memoized per-character advances and the memoized missing system families |
 | `FontRegistry` | the registered faces, the names they answer to, the registered-name order and the default face |
 | `GlyphAtlas` | the atlas texture, its CPU mirror, the shelf packer, the glyph entry map and the pending GPU uploads |
 | `TextCoverageCache` | the rasterized character masks and their blurred shadows |
@@ -172,12 +172,27 @@ font database.
 `set_host_faces` selects the host's two font roles: the families the host
 installs as its own default font, and the character the host's coverage face
 has to carry. The roles are **resolved on the first use of the text service**,
-not when they are selected, so a game that asks about no font never pays for
-the host's font scan. The resolution is guarded by a flag that lives with the
-state it guards, the way the reference's font system keeps its initialization
-flag beside the font names it fills
+not when they are selected, so a game that asks about no font never registers
+a host face. The resolution is guarded by a flag that lives with the state it
+guards, the way the reference's font system keeps its initialization flag
+beside the font names it fills
 (`reference/cpp/core/visual/FontSystem.cpp:14-25`); the work happens on
 whichever thread asks first, and it happens once.
+
+Selecting the roles also starts the **host font scan**: the host's font
+directories are read on a thread of its own, so the request that needs a host
+face does not read them on the thread that asks. The scan publishes the
+database it built, and the first use takes it — waiting for the scan if it is
+still running. The scan's report ("system fonts: N faces from M directories")
+is printed where the faces are used, so the log says the same thing at the
+same point as before.
+
+A scan reads the directories it was started with, so a new directory list
+starts a new scan. A text service whose host selected no roles has no scan:
+the request that needs a host face reads the font directories itself, on its
+own thread, and the host's own faces resolve. A scan that failed is reported
+as `TextError::HostFontScan` — the request is told that the host's faces are
+unknown instead of being given a face the host does not have.
 
 The resolution registers the host's default face first — the first of the
 selected families the host provides — so it is the oldest face and therefore

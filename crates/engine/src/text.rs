@@ -29,7 +29,8 @@
 //! no globals, no statics and no hidden caches.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::ThreadId;
 
 use api::geometry::{PixelRegion, RectF};
 use api::glyph::{GlyphBackend, GlyphBitmap, GlyphStyle};
@@ -92,6 +93,15 @@ pub enum TextError {
     FontNotFound {
         /// Requested family name.
         family: String,
+    },
+    /// The host's font directories could not be read.
+    ///
+    /// The scan that reads them failed, so the host's faces are unknown and
+    /// no face can be resolved from them.
+    #[error("the host's font scan failed: {message}")]
+    HostFontScan {
+        /// Human-readable description of the failure.
+        message: String,
     },
     /// The glyph atlas has no free cell for the requested bitmap.
     ///
@@ -357,8 +367,8 @@ struct AdvanceKey {
 /// The host's two font roles and the state of their resolution.
 ///
 /// The host selects the roles; the text service resolves them on its first
-/// use, so the host's faces are scanned then and not when they are selected.
-/// A game that asks about no font never pays for the scan.
+/// use, so the host's faces are registered then and not when they are
+/// selected. A game that asks about no font never registers a host face.
 #[derive(Debug)]
 struct HostFaces {
     /// The families the host installs as its own default font, in the order
@@ -369,6 +379,80 @@ struct HostFaces {
     coverage_codepoint: char,
     /// Whether the roles have been resolved.
     resolved: bool,
+}
+
+/// The database the host's font directories provide, and what the scan found.
+struct HostFontDatabase {
+    /// The faces the host's directories provide.
+    database: fontdb::Database,
+    /// The number of faces the scan found.
+    faces: usize,
+    /// The number of directories the scan read.
+    directories: usize,
+    /// The thread that read the directories.
+    thread: ThreadId,
+}
+
+/// The host font scan: the database the host's font directories provide.
+///
+/// The scan runs on a thread of its own, so the request that needs a host
+/// face does not read the host's font directories on the thread that asks.
+/// The scan starts when the host selects its roles, so it runs while the
+/// game starts up instead of inside the first font request, and it publishes
+/// its result when it has one. A request that arrives before the result
+/// waits for the scan.
+struct HostFontScan {
+    /// The state the scan and its waiter share.
+    shared: Arc<Mutex<HostScanState>>,
+    /// Signalled when the scan publishes its result.
+    ready: Arc<Condvar>,
+}
+
+/// The state of the host font scan.
+enum HostScanState {
+    /// The scan is running.
+    Running,
+    /// The scan produced the host's faces.
+    ///
+    /// The database is shared, not moved: the scan keeps it, so a request
+    /// that needs the host's faces again reads the same one.
+    Ready(Arc<HostFontDatabase>),
+    /// The scan failed; the failure is reported to every request that needs
+    /// the host's faces.
+    Failed(String),
+}
+
+/// Locks the host scan's state, recovering from a poisoned lock.
+fn lock_host_scan(state: &Mutex<HostScanState>) -> MutexGuard<'_, HostScanState> {
+    match state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Waits for the host scan to publish its result.
+fn wait_host_scan<'a>(
+    condvar: &Condvar,
+    state: MutexGuard<'a, HostScanState>,
+) -> MutexGuard<'a, HostScanState> {
+    match condvar.wait(state) {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// The message of the panic the host font scan caught.
+///
+/// The panic of a scan thread is reported to the request that waits for it,
+/// so the failure names itself instead of ending the process.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else {
+        "the scan panicked".to_owned()
+    }
 }
 
 /// L2 text service: shaping/layout system plus registered faces.
@@ -384,10 +468,14 @@ pub struct TextEngine {
     /// The registered faces, the names they answer to and the two roles a
     /// face can hold.
     registry: FontRegistry,
-    /// Lazily built host font database used by [`TextEngine::load_system_font`].
+    /// The host font database used by [`TextEngine::load_system_font`], once
+    /// it is built.
+    ///
     /// It is kept separate from the shaping database so that only explicitly
-    /// resolved faces participate in layout.
-    system_fonts: Option<fontdb::Database>,
+    /// resolved faces participate in layout. The database is shared with the
+    /// scan that built it, so a request that needs the host's faces again
+    /// reads the same one.
+    system_fonts: Option<Arc<HostFontDatabase>>,
     /// System-font directories the host supplied through
     /// [`TextEngine::set_system_font_dirs`]. They are scanned, in addition to
     /// `fontdb`'s default locations, when the system database is first built.
@@ -397,6 +485,18 @@ pub struct TextEngine {
     /// `None` when the host selected no roles: the text service then
     /// registers no host face, and every face comes from a script.
     host_faces: Option<HostFaces>,
+    /// The host font scan, when the host selected its roles.
+    ///
+    /// The scan runs on a thread of its own and publishes the database it
+    /// builds; the text service takes it when it first needs a host face.
+    host_scan: Option<HostFontScan>,
+    /// The thread that read the host's font directories.
+    ///
+    /// The scan runs off the thread that asks for a face, so the request
+    /// never reads the host's font directories itself. The id is kept as
+    /// the evidence of that. A text service whose host selected no roles has
+    /// no scan and reads the directories on the thread that asks.
+    host_font_thread: Option<ThreadId>,
     /// The number of times the host font database was built.
     ///
     /// The database is built once, on the first use of the text service.
@@ -432,6 +532,8 @@ impl TextEngine {
             system_fonts: None,
             system_font_dirs: Vec::new(),
             host_faces: None,
+            host_scan: None,
+            host_font_thread: None,
             system_database_builds: 0,
             layout_cache: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
             advance_cache: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
@@ -441,10 +543,11 @@ impl TextEngine {
 
     /// Selects the host's system-font directories.
     ///
-    /// The directories are scanned lazily, the first time a face is resolved
-    /// from the host, together with `fontdb`'s default system locations. A
-    /// database built earlier is discarded so the new list takes
-    /// effect; call it before any face has been resolved to avoid the rescan.
+    /// The directories are read by the host font scan, which runs on a
+    /// thread of its own when the host selects its roles. A scan reads the
+    /// directories it was started with, so a new list starts a new scan:
+    /// the thread of the old scan publishes into a state nobody reads any
+    /// more.
     ///
     /// The missing-family memo is dropped with the database it describes: a
     /// family the previous directories did not provide may be in the new ones.
@@ -452,6 +555,12 @@ impl TextEngine {
         self.system_font_dirs = dirs;
         self.system_fonts = None;
         self.missing_system_families.clear();
+        // A scan that is running reads the directories it was started with,
+        // so the new list starts a new scan.
+        if self.host_scan.is_some() {
+            self.host_scan = None;
+            self.start_host_scan();
+        }
     }
 
     /// Selects the host's two font roles.
@@ -465,15 +574,61 @@ impl TextEngine {
     /// not carry.
     ///
     /// The roles are resolved on the first use of the text service, not here:
-    /// the host's faces are scanned then, so a game that asks about no font
-    /// never pays for the scan. Select the roles before any face is
-    /// resolved.
+    /// the host's faces are registered then, so a game that asks about no font
+    /// never registers a host face. Selecting the roles starts the host font
+    /// scan, so the scan runs while the game starts up. Select the roles
+    /// before any face is resolved.
     pub fn set_host_faces(&mut self, default_families: Vec<String>, coverage_codepoint: char) {
         self.host_faces = Some(HostFaces {
             default_families,
             coverage_codepoint,
             resolved: false,
         });
+        self.start_host_scan();
+    }
+
+    /// Starts the host font scan on a thread of its own.
+    ///
+    /// The scan reads the host's font directories, which is the work the
+    /// first face request would otherwise do on the thread that asks for it.
+    /// The scan starts when the host selects its roles, so it runs while the
+    /// game starts up; the request that needs a host face waits for the scan
+    /// that is already running.
+    ///
+    /// A scan that is already running is left alone: it reads the
+    /// directories the host selected.
+    fn start_host_scan(&mut self) {
+        if self.host_scan.is_some() {
+            return;
+        }
+        let dirs = self.system_font_dirs.clone();
+        let shared = Arc::new(Mutex::new(HostScanState::Running));
+        let ready = Arc::new(Condvar::new());
+        let worker_shared = Arc::clone(&shared);
+        let worker_ready = Arc::clone(&ready);
+        let worker = std::thread::Builder::new()
+            .name("krkr-font-scan".to_owned())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    scan_host_faces(&dirs)
+                }));
+                let mut state = lock_host_scan(&worker_shared);
+                *state = match result {
+                    Ok(database) => HostScanState::Ready(Arc::new(database)),
+                    Err(payload) => HostScanState::Failed(panic_message(payload)),
+                };
+                worker_ready.notify_all();
+            });
+        match worker {
+            Ok(_) => {
+                self.host_scan = Some(HostFontScan { shared, ready });
+            }
+            Err(error) => {
+                // The scan could not start: the faces are read on the thread
+                // that asks for them, and the failure is reported.
+                log::warn!("system fonts: the host font scan could not start: {error}");
+            }
+        }
     }
 
     /// Resolves the host's two font roles, once.
@@ -485,7 +640,7 @@ impl TextEngine {
     /// default face.
     ///
     /// The roles are resolved on the first use of the text service, so a game
-    /// that asks about no font never scans the host's faces. The guard lives
+    /// that asks about no font never registers a host face. The guard lives
     /// with the state it guards, so the work happens on whichever thread asks
     /// first and it happens once: the text service is reached through an
     /// exclusive borrow, so two callers cannot ask for the roles at the same
@@ -710,17 +865,76 @@ impl TextEngine {
         self.finish_system_face(family, &bytes, index)
     }
 
-    /// The host font database, built on the first use.
+    /// The host font database, taken from the host font scan.
     ///
-    /// The database is built once: the first use scans the host's font
-    /// directories, and every later use reads the database the first use
-    /// built.
-    fn system_database(&mut self) -> Option<&mut fontdb::Database> {
-        if self.system_fonts.is_none() {
-            self.system_fonts = Some(load_system_database(&self.system_font_dirs));
-            self.system_database_builds += 1;
+    /// The database is built once, by the scan the host started when it
+    /// selected its roles: the first use waits for that scan and reads the
+    /// database it built, and every later use reads the database the first
+    /// use took. A text service whose host selected no roles has no scan:
+    /// the first use reads the host's font directories itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TextError::HostFontScan`] when the scan failed, so the
+    /// host's faces are unknown.
+    fn system_database(&mut self) -> Result<Arc<HostFontDatabase>, TextError> {
+        if let Some(scanned) = self.system_fonts.as_ref() {
+            return Ok(Arc::clone(scanned));
         }
-        self.system_fonts.as_mut()
+        let scanned = self.host_scan_database()?;
+        // The scan's own report, printed where the faces are used: the
+        // same words the scan printed when it ran on the thread that
+        // asked for a face.
+        if scanned.faces == 0 {
+            log::info!(
+                "system fonts: no fonts found in any of {} directories; \
+                 text has no face to fall back to",
+                scanned.directories
+            );
+        } else {
+            log::info!(
+                "system fonts: {} faces from {} directories",
+                scanned.faces,
+                scanned.directories
+            );
+        }
+        self.host_font_thread = Some(scanned.thread);
+        self.system_database_builds += 1;
+        self.system_fonts = Some(Arc::clone(&scanned));
+        Ok(scanned)
+    }
+
+    /// The database the host's font directories provide, waiting for the
+    /// scan that is already running.
+    ///
+    /// The wait is on the scan alone: the request that needs a host face
+    /// waits for the scan and never reads the host's font directories
+    /// itself.
+    ///
+    /// A text service whose host selected no roles has no scan: the
+    /// directories are read here, on the thread that asked for a face.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TextError::HostFontScan`] when the scan failed, so the
+    /// host's faces are unknown.
+    fn host_scan_database(&mut self) -> Result<Arc<HostFontDatabase>, TextError> {
+        let Some(scan) = self.host_scan.as_ref() else {
+            return Ok(Arc::new(scan_host_faces(&self.system_font_dirs)));
+        };
+        let mut state = lock_host_scan(&scan.shared);
+        loop {
+            if let HostScanState::Failed(message) = &*state {
+                return Err(TextError::HostFontScan {
+                    message: message.clone(),
+                });
+            }
+            if let HostScanState::Ready(database) = &*state {
+                return Ok(Arc::clone(database));
+            }
+            // The scan has not published its result: wait for it.
+            state = wait_host_scan(&scan.ready, state);
+        }
     }
 
     /// The number of times the host font database was built.
@@ -735,11 +949,8 @@ impl TextEngine {
     /// Reads the bytes and collection index of the system face matching
     /// `family`.
     fn system_face_bytes(&mut self, family: &str) -> Result<(Vec<u8>, u32), TextError> {
-        let system = self
-            .system_database()
-            .ok_or_else(|| TextError::FontNotFound {
-                family: family.to_string(),
-            })?;
+        let scanned = self.system_database()?;
+        let system = &scanned.database;
         find_family(system, family)
             .and_then(|id| system.with_face_data(id, |data, index| (data.to_vec(), index)))
             .ok_or_else(|| TextError::FontNotFound {
@@ -899,8 +1110,9 @@ impl TextEngine {
     /// # Errors
     ///
     /// Returns [`TextError::FontNotFound`] when no installed system face
-    /// provides `codepoint`, and the failure of the last face that carried
-    /// the character but could not be used.
+    /// provides `codepoint`, [`TextError::HostFontScan`] when the host's
+    /// font directories could not be read, and the failure of the last face
+    /// that carried the character but could not be used.
     pub fn install_coverage_face(&mut self, codepoint: char) -> Result<FontId, TextError> {
         self.resolve_host_faces();
         if let Some(coverage) = self.registry.designated_coverage_face() {
@@ -908,7 +1120,7 @@ impl TextEngine {
         }
         let mut failure: Option<TextError> = None;
         let mut seen = 0usize;
-        while let Some((bytes, index)) = self.next_face_with_glyph(codepoint, seen) {
+        while let Some((bytes, index)) = self.next_face_with_glyph(codepoint, seen)? {
             seen += 1;
             let face = match render::load_font(&self.render_system, &bytes, index) {
                 Ok(face) => face,
@@ -941,11 +1153,21 @@ impl TextEngine {
     ///
     /// The scan reads one font file at a time and stops at the face the
     /// caller asked for, so a host with many faces does not read them all.
-    fn next_face_with_glyph(&mut self, codepoint: char, seen: usize) -> Option<(Vec<u8>, u32)> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TextError::HostFontScan`] when the host's font directories
+    /// could not be read.
+    fn next_face_with_glyph(
+        &mut self,
+        codepoint: char,
+        seen: usize,
+    ) -> Result<Option<(Vec<u8>, u32)>, TextError> {
         // The rasterizer service is copied out of the engine so the scan does
         // not borrow the engine while the font database is borrowed.
         let render_system = self.render_system;
-        let system = self.system_database()?;
+        let scanned = self.system_database()?;
+        let system = &scanned.database;
         let mut matched = 0usize;
         for face in system.faces() {
             let found = system
@@ -959,9 +1181,9 @@ impl TextEngine {
                 matched += 1;
                 continue;
             }
-            return Some(found);
+            return Ok(Some(found));
         }
-        None
+        Ok(None)
     }
 
     /// Returns the L1 metrics of `id` at `size_px`.
@@ -1240,28 +1462,25 @@ impl Default for TextEngine {
     }
 }
 
-/// Builds the host font database used by [`TextEngine::load_system_font`].
+/// Scans the host's font directories into the database the text service uses.
 ///
 /// `fontdb`'s own scan knows the Windows, macOS and Unix font directories but
 /// excludes Android, so `dirs` (the host's system-font directories, supplied
 /// through [`TextEngine::set_system_font_dirs`]) is scanned in addition. The
-/// resulting face count and directory count are logged at `info`, once per
-/// engine, so a missing font source is visible in the log rather than only in a
-/// later failure.
-fn load_system_database(dirs: &[PathBuf]) -> fontdb::Database {
+/// resulting face count and directory count travel with the database, so the
+/// report is printed where the faces are used and a missing font source is
+/// visible in the log rather than only in a later failure.
+fn scan_host_faces(dirs: &[PathBuf]) -> HostFontDatabase {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
     let directories = load_font_directories(&mut db, dirs);
     let faces = db.len();
-    if faces == 0 {
-        log::info!(
-            "system fonts: no fonts found in any of {directories} directories; \
-             text has no face to fall back to"
-        );
-    } else {
-        log::info!("system fonts: {faces} faces from {directories} directories");
+    HostFontDatabase {
+        database: db,
+        faces,
+        directories,
+        thread: std::thread::current().id(),
     }
-    db
 }
 
 /// Scans the font files in every existing directory of `dirs` into `db` and
@@ -2828,7 +3047,11 @@ mod tests {
 
     /// The host's two font roles are resolved on the first use of the text
     /// service, not when the host selects them: a game that asks about no
-    /// font never scans the host's faces.
+    /// font never registers a host face.
+    ///
+    /// The scan that reads the host's font directories starts when the host
+    /// selects its roles, but the database it builds is taken on the first
+    /// use.
     ///
     /// Reference: `FontSystem::FontExists` calls `InitFontNames`, which
     /// enumerates the host's fonts once and is guarded by the font system's
@@ -2845,7 +3068,7 @@ mod tests {
         assert_eq!(
             engine.system_database_builds(),
             0,
-            "selecting the roles must not scan the host's faces"
+            "selecting the roles must not take the host's faces"
         );
         assert_eq!(
             engine.registry().len(),
@@ -2874,6 +3097,117 @@ mod tests {
         assert_ne!(
             default, coverage,
             "the metrics role and the coverage role must be two faces"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The host font scan runs on a thread of its own, so the request that
+    /// needs a host face does not read the host's font directories on the
+    /// thread that asks.
+    ///
+    /// The scan starts when the host selects its roles and publishes the
+    /// database it built; the request takes that database and waits for the
+    /// scan that is already running.
+    #[test]
+    fn the_host_font_scan_runs_off_the_thread_that_asks_for_a_face() {
+        let Some((dir, family)) = explicit_font_dir_fixture() else {
+            return;
+        };
+        let mut engine = TextEngine::new();
+        engine.set_system_font_dirs(vec![dir.clone()]);
+        engine.set_host_faces(vec![family.clone()], 'A');
+        let default = engine.default_face().expect("the host's default face");
+        assert!(
+            engine.registry().face(default).is_some(),
+            "the host's default face is registered"
+        );
+        let scan_thread = engine.host_font_thread.expect("the host font scan ran");
+        assert_ne!(
+            scan_thread,
+            std::thread::current().id(),
+            "the host font scan must not run on the thread that asks for a face"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A text service whose host selected no roles still reads the host's
+    /// own fonts: the request that needs a host face reads the font
+    /// directories on its own thread, and the families the host provides
+    /// resolve.
+    ///
+    /// Reference: the reference enumerates the host's fonts on the first
+    /// font query, on the thread that asked for one
+    /// (`reference/cpp/core/visual/FontImpl.cpp:277-289`), so a font query
+    /// reaches the host's fonts whether or not the host configured
+    /// anything.
+    #[test]
+    fn a_text_service_without_a_scan_reads_the_host_fonts() {
+        let Some(family) = host_font_family() else {
+            return;
+        };
+        let mut engine = TextEngine::new();
+        let resolved = engine.load_system_font(&family);
+        assert_eq!(
+            engine.system_database_builds(),
+            1,
+            "the host's fonts must be read once"
+        );
+        assert_eq!(
+            engine.host_font_thread,
+            Some(std::thread::current().id()),
+            "a text service without a scan reads the fonts on the asking thread"
+        );
+        // The family comes from the host's own fonts, so the database must
+        // hold it. A face the rasterizer cannot load is another matter: the
+        // host's fonts were read.
+        if let Err(TextError::FontNotFound { .. }) = &resolved {
+            panic!("the host's own font family must resolve: {family}");
+        }
+        if let Ok(id) = resolved {
+            assert!(
+                engine.registry().face(id).is_some(),
+                "the resolved host face must be registered"
+            );
+        }
+    }
+
+    /// A new directory list starts a new scan: the database the first scan
+    /// built is discarded, and the next request that needs a host face
+    /// reads the host's font directories again.
+    ///
+    /// Reference: the reference enumerates the host's fonts once, on the
+    /// first font query (`reference/cpp/core/visual/FontImpl.cpp:178-190`),
+    /// so the enumeration a host asks for is the one its own fonts provide.
+    #[test]
+    fn a_new_directory_list_reads_the_host_fonts_again() {
+        let Some((dir, family)) = explicit_font_dir_fixture() else {
+            return;
+        };
+        let mut engine = TextEngine::new();
+        engine.set_system_font_dirs(vec![dir.clone()]);
+        engine.set_host_faces(vec![family.clone()], 'A');
+        let default = engine.default_face().expect("the host's default face");
+        assert!(
+            engine.registry().face(default).is_some(),
+            "the host's default face is registered"
+        );
+        assert_eq!(
+            engine.system_database_builds(),
+            1,
+            "the scan reads the host's font directories once"
+        );
+        // A new list of directories starts a new scan, and the database of
+        // the first scan is discarded.
+        engine.set_system_font_dirs(Vec::new());
+        let missing = engine.load_system_font("this-family-is-not-installed");
+        assert!(
+            matches!(missing, Err(TextError::FontNotFound { .. })),
+            "an absent family must not resolve"
+        );
+        assert_eq!(
+            engine.system_database_builds(),
+            2,
+            "the new list reads the host's font directories again"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2991,6 +3325,20 @@ mod tests {
         std::fs::create_dir_all(&dir).ok()?;
         std::fs::copy(&path, dir.join(path.file_name()?)).ok()?;
         Some((dir, family))
+    }
+
+    /// The family of the first face the host's own font directories provide.
+    ///
+    /// `None` when the host carries no font at all.
+    fn host_font_family() -> Option<String> {
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        db.faces().find_map(|face| {
+            face.families
+                .first()
+                .map(|(name, _)| name.clone())
+                .filter(|name| !name.is_empty())
+        })
     }
 
     /// Reference: `TVPEnumFontsProc` enumerates a directory's fonts into the
