@@ -19,6 +19,8 @@
 
 mod host;
 
+pub mod lexer;
+
 pub use host::{FrameCtx, VmHost};
 
 /// Errors from the VM host.

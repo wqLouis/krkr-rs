@@ -7,6 +7,12 @@ license.workspace = true
 
 [dependencies]
 compat = { workspace = true }
+# The lexer's operator table is matched by a generated scanner: the table is
+# the longest match over the text at the cursor, so the patterns live in one
+# place instead of in a chain of comparisons. The crate is pure Rust and its
+# only other dependency is a procedural macro, so it adds no native library
+# to the build and nothing to the Android target.
+logos = "0.14"
 tjs = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true, features = ["std"] }
