@@ -125,8 +125,18 @@ impl Storage {
     pub fn lookup(&self, name: &str) -> Result<Option<PendingStorage>, StorageReadError>;
     pub fn resolve_entry(&self, name: &str) -> Result<Option<StorageEntry>, StorageReadError>;
     pub fn read_entry(&self, entry: &StorageEntry) -> Result<Vec<u8>, StorageReadError>;
+    pub fn read_entries_together(&self, names: &[String]) -> Result<(), StorageReadError>;
 }
 ```
+
+`read_entries_together` schedules the entries `names` for a **shared read**:
+the names that resolve to entries of one archive are read together — the
+archive's data area is read once, over the range those entries occupy, and
+every entry of the range is decoded on a worker of its own. The bytes of an
+entry land in the read table under the name it was asked for, so the read
+that follows finds them there and waits for nothing but its own entry. A
+name that does not resolve, that names a disk file or that belongs to a
+media provider is left to the caller.
 
 The storage's `read_pool` field is public: the composition root installs the
 pool there, and the engine drains the same pool every frame.
@@ -185,6 +195,7 @@ local name.
 | `PreloadError` | the failures of a preloaded archive's image load |
 | `StorageReadError` | the read/lookup failures |
 | `StorageMedia` | the provider that serves one storage scheme |
+| `StorageBytes` | what a read produced: a file's bytes, or an archive entry's decoded bytes |
 | `StartupPlan` | the four startup script names, resolved |
 | `ProbeCounts` | the number of `list`/`stat` probes and misses — a diagnostic |
 | `ATTR_DIRECTORY`, `ATTR_NORMAL` | the Windows file attribute bits the listing understands |
@@ -210,13 +221,14 @@ impl StorageReadPool {
 }
 
 pub trait StorageReader: Send + Sync {
-    fn read(&self, job: &StorageJob) -> Result<Vec<u8>, StorageReadError>;
+    fn read(&self, job: &StorageJob) -> Result<StorageBytes, StorageReadError>;
 }
 
 pub struct FileSystemReader;             // the default reader
 pub struct StorageKey;                   // the identity of one scheduled read
-pub enum StorageJob { Disk { .. }, Archive { .. } };
-pub enum StorageOutcome { Ready(Arc<Vec<u8>>), Failed(StorageReadError), Cancelled };
+pub enum StorageJob { Disk { .. }, Archive { .. }, ArchiveRange { .. } };
+pub enum StorageBytes { File(Vec<u8>), Archive { .. } };  // what a read produced
+pub enum StorageOutcome { Ready(Arc<StorageBytes>), Failed(StorageReadError), Cancelled };
 pub struct PendingStorage;               // the future a scheduled read lands in
 pub struct ArchiveBacking;               // a mounted archive's bytes
 pub struct ArchiveImage;                 // a preloaded archive's whole image
@@ -317,8 +329,16 @@ A `..` component that escapes the mount is the reference's invalid path name
   from the file until then, so the bytes are the same either way. A load
   that fails is a typed `PreloadError`, never a silent fall back to the
   streaming path.
-* **The extraction filter is L2 state.** The stateless L1 reader receives the
-  closure as a borrow on every read; it is never stored in L1.
+* **The extraction filter is L2 state.** The stateless L1 reader holds no
+  filter: the decode produces the entry's decoded segments, and the L1
+  helper applies the filter to them afterwards.
+* **A read is two stages: the decode and the filter.** The decode — the raw
+  read and the archive decompression — is the work a worker does. The
+  extraction filter transforms the decoded bytes afterwards, on the thread
+  that asked for them, because the filter is script code. The reference
+  applies the filter to the decoded bytes
+  (`reference/krkr2/cpp/core/archive/xp3/XP3Archive.cpp:973-1004`), so the
+  filter never sees the stored ones.
 * **A storage media is served first**: a name that carries a registered
   scheme (`<scheme>://…`) belongs to the provider that registered the scheme,
   so `read`, `read_prefix`, `exists` and `lookup` hand it to that provider
@@ -341,8 +361,9 @@ A `..` component that escapes the mount is the reference's invalid path name
   the failure it saw; the data access raises it. There is no substitute
   value, no empty result and no silent fall back to a miss.
 * **The extraction filter runs on the calling thread.** The filter is script
-  code, so a read that has to run it stays on the thread that asked for the
-  bytes; only the filter-free reads run on a worker.
+  code, so it runs where the bytes were asked for — never on a worker. The
+  decode it transforms may have run on one: the filter is applied to the
+  decoded segments, after the decode finished.
 
 ---
 
@@ -367,9 +388,13 @@ read:
 
 read through the pool:
    name ──► Storage::lookup ──► Location ──► StorageJob ──► StorageReadPool
-              └─► PendingStorage ──► the worker reads the entry ──► StorageOutcome
-   Storage::read ──► the pending read ──► await ──► the bytes or the typed error
+              └─► PendingStorage ──► the worker decodes the entry ──► StorageOutcome
+   Storage::read ──► the pending read ──► await ──► the decoded bytes ──► the filter
    Engine::step  ──► StorageReadPool::drain ──► the finished reads are published
+
+the two stages of an archive read:
+   decode (a worker may do it)  ──► fs::xp3 decode ──► DecodedEntry { bytes, segments }
+   filter (the caller's thread) ──► DecodedEntry::apply_extraction_filter ──► the bytes
 ```
 
 ---

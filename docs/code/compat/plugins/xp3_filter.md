@@ -106,10 +106,12 @@ function body (the name resolves neither locally nor on `global`).
 
 * The file-system crate owns the stateless per-segment hook
   (`fs::xp3::Xp3ExtractionFilter`); the filter is passed in and never stored
-  there.
-* The engine's storage namespace owns the installed filter and hands it to
-  the file-system crate on every archive read
-  (`engine_api::Storage::xp3_extraction_filter`).
+  there. It is applied to the decoded segments of an entry
+  (`fs::xp3::DecodedEntry::apply_extraction_filter`), after the decode.
+* The engine's storage namespace owns the installed filter and applies it to
+  the decoded bytes, on the thread that asked for them
+  (`engine_api::Storage::xp3_extraction_filter`). The decode it transforms
+  may have run on the read pool.
 * This module registers the `Storages` members, retains the TJS closures in
   the per-engine dispatch state, and installs a filter that marshals each
   decoded segment to the retained TJS closure.

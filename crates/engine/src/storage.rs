@@ -33,6 +33,12 @@
 //! layer's own state — it is installed on the storage and drained by the
 //! engine every frame — and there is no process-global registry.
 //!
+//! A read is two stages: the decode — the raw read and the archive
+//! decompression — is the work a worker does, and the XP3 extraction filter
+//! transforms the decoded bytes afterwards, on the thread that asked for
+//! them. The filter is script code, so it may not run on a worker; the
+//! decode it transforms does not care which thread ran it.
+//!
 //! Resolution order:
 //!
 //! 0. a name that carries a scheme (`<scheme>://…`) belongs to the
@@ -59,7 +65,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::error::FsError;
 use api::fs::{FsPath, OpenMode};
-use fs::xp3::{self, Entry, Xp3Archive, Xp3ExtractionFilter, normalize_in_archive_name};
+use fs::xp3::{
+    self, DecodedEntry, Entry, Xp3Archive, Xp3ExtractionFilter, normalize_in_archive_name,
+};
 use fs::{FileState, FileSystem};
 
 mod media;
@@ -237,44 +245,174 @@ impl ArchiveImage {
         }
     }
 
-    /// Reads the entry `entry` of `archive`, at most `limit` bytes.
+    /// The archive file the image is read from.
+    ///
+    /// The handle stays valid while the image loads: an entry read copies
+    /// from the image once it is loaded and reads the entry from the file
+    /// until then.
+    fn file(&self) -> Arc<FileState> {
+        Arc::clone(&self.file)
+    }
+
+    /// Decodes the entry `entry` of `archive`, at most `limit` bytes.
     ///
     /// The bytes come from the image once it is loaded and from the archive
-    /// file until then.
+    /// file until then. The decode is the whole work here: the extraction
+    /// filter is a separate stage, and it runs on the thread that asked for
+    /// the bytes.
     fn read_entry(
         &self,
         archive: &Xp3Archive,
         entry: &Entry,
-        archive_name: &str,
         limit: Option<usize>,
-        filter: Option<&Xp3ExtractionFilter<'_>>,
-    ) -> Result<Vec<u8>, StorageReadError> {
+    ) -> Result<DecodedEntry, StorageReadError> {
         match self.loaded()? {
             Some(image) => match limit {
                 Some(limit) => archive
-                    .read_entry_prefix_from_bytes(&image, entry, archive_name, limit, filter)
+                    .read_entry_prefix_decoded_from_bytes(&image, entry, limit)
                     .map_err(xp3_error),
                 None => archive
-                    .read_entry_from_bytes(&image, entry, archive_name, filter)
+                    .read_entry_decoded_from_bytes(&image, entry)
                     .map_err(xp3_error),
             },
             None => match limit {
                 Some(limit) => archive
-                    .read_prefix_with_filter(
-                        &self.fs,
-                        &self.file,
-                        &entry.name,
-                        archive_name,
-                        limit,
-                        filter,
-                    )
+                    .read_prefix_decoded(&self.fs, &self.file, &entry.name, limit)
                     .map_err(xp3_error),
                 None => archive
-                    .read_entry_with_filter(&self.fs, &self.file, entry, archive_name, filter)
+                    .read_entry_decoded(&self.fs, &self.file, entry)
                     .map_err(xp3_error),
             },
         }
     }
+}
+
+/// A byte range of an archive's data area, read once and shared by the
+/// entries that live in it.
+///
+/// The range is read by the first worker that needs it; the workers that
+/// arrive while it is read wait for it. The archive's data area is therefore
+/// read once, and every entry the range covers is decoded from that one read.
+pub struct ArchiveRange {
+    /// The state of the load.
+    state: Mutex<RangeState>,
+    /// Signalled when the load publishes its result.
+    ready: Condvar,
+    /// The file offset the range starts at.
+    start: u64,
+    /// The number of bytes the range holds.
+    len: usize,
+}
+
+/// The state of a range load.
+enum RangeState {
+    /// The range is being read; `true` when a caller reads it.
+    Reading {
+        /// Whether a caller is reading the range.
+        reader: bool,
+    },
+    /// The range is in memory.
+    Ready(Arc<[u8]>),
+    /// The load failed.
+    Failed(StorageReadError),
+}
+
+impl ArchiveRange {
+    /// Creates the range that starts at `start` and holds `len` bytes.
+    fn new(start: u64, len: usize) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(RangeState::Reading { reader: false }),
+            ready: Condvar::new(),
+            start,
+            len,
+        })
+    }
+
+    /// The range's bytes, reading the range when it is not loaded yet.
+    ///
+    /// The first caller reads the range; the callers that arrive while it is
+    /// read wait for it. A failed read is reported to every caller, and the
+    /// range is not read twice.
+    fn load(&self, fs: &FileSystem, file: &FileState) -> Result<Arc<[u8]>, StorageReadError> {
+        let mut state = lock(&self.state);
+        loop {
+            // Whether this caller is the one that reads the range.
+            let elect = match &*state {
+                RangeState::Ready(bytes) => return Ok(Arc::clone(bytes)),
+                RangeState::Failed(error) => return Err(error.clone()),
+                RangeState::Reading { reader } => !*reader,
+            };
+            if elect {
+                // This caller reads the range.
+                *state = RangeState::Reading { reader: true };
+                break;
+            }
+            // Another caller reads the range: wait for it.
+            state = wait(&self.ready, state);
+        }
+        // The lock is released while the range is read, so the callers that
+        // wait for it wake up when the result is published.
+        match read_range(fs, file, self.start, self.len) {
+            Ok(bytes) => {
+                let bytes: Arc<[u8]> = Arc::from(bytes);
+                let mut state = lock(&self.state);
+                *state = RangeState::Ready(Arc::clone(&bytes));
+                self.ready.notify_all();
+                Ok(bytes)
+            }
+            Err(error) => {
+                let mut state = lock(&self.state);
+                *state = RangeState::Failed(error.clone());
+                self.ready.notify_all();
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Reads the byte range that starts at `start` and holds `len` bytes.
+///
+/// A range that runs past the end of the file is an error: the file is
+/// shorter than the archive's index says, so the bytes are not the ones the
+/// index describes.
+fn read_range(
+    fs: &FileSystem,
+    file: &FileState,
+    start: u64,
+    len: usize,
+) -> Result<Vec<u8>, StorageReadError> {
+    let size = fs::file_size(fs, file).map_err(StorageReadError::Fs)?;
+    let Ok(size_of_range) = u64::try_from(len) else {
+        return Err(StorageReadError::Fs(FsError::Io {
+            message: format!("the archive range at {start} does not fit the file's addressing"),
+        }));
+    };
+    let Some(end) = start.checked_add(size_of_range) else {
+        return Err(StorageReadError::Fs(FsError::Io {
+            message: format!("the archive range at {start} does not fit the file's addressing"),
+        }));
+    };
+    if end > size {
+        return Err(StorageReadError::Fs(FsError::Io {
+            message: format!(
+                "the archive range at {start} holds {size_of_range} bytes, but the file holds {size}"
+            ),
+        }));
+    }
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(len).map_err(|_| {
+        StorageReadError::Fs(FsError::Io {
+            message: format!("the archive range at {start} cannot be allocated"),
+        })
+    })?;
+    buffer.resize(len, 0);
+    let read = fs::read_at(fs, file, start, &mut buffer).map_err(StorageReadError::Fs)?;
+    if read != len {
+        return Err(StorageReadError::Fs(FsError::Io {
+            message: format!("the archive range at {start} holds {read} bytes, not {len}"),
+        }));
+    }
+    Ok(buffer)
 }
 
 /// A mounted archive's index together with the bytes it reads from.
@@ -341,11 +479,13 @@ pub struct Storage {
     project: Option<PathBuf>,
     /// The per-segment XP3 extraction filter (the `xp3filter` seam), if any.
     ///
-    /// L2 owns the state; the stateless L1 reader receives the closure as a
-    /// borrow on every read, and it is never stored in L1. `None` means no
-    /// filter. The closure is invoked once per decoded segment with
-    /// `(file_hash, offset, buffer, file_name, archive_name, file_size)` and
-    /// may rewrite `buffer` in place.
+    /// L2 owns the state; the closure is invoked once per decoded segment
+    /// with `(file_hash, offset, buffer, file_name, archive_name, file_size)`
+    /// and may rewrite `buffer` in place. The closure is script code, so it
+    /// runs on the thread that asked for the bytes — never on a worker. The
+    /// decode it transforms is the work a worker may do: the entry is
+    /// decoded first, and the filter transforms the decoded segments
+    /// afterwards.
     pub xp3_extraction_filter: Option<Box<Xp3ExtractionFilter<'static>>>,
     /// The registered storage-media providers, one per scheme.
     ///
@@ -840,6 +980,23 @@ pub enum StorageJob {
         /// The number of bytes to read, or `None` for the whole entry.
         limit: Option<usize>,
     },
+    /// An entry of an archive, decoded from the byte range of the archive's
+    /// data area the entry lives in.
+    ArchiveRange {
+        /// The bottom file system the archive is read through.
+        fs: FileSystem,
+        /// The mounted archive's index and bytes, or `None` when the archive
+        /// is not mounted and the worker opens it.
+        source: Option<ArchiveSource>,
+        /// The archive's path on the bottom file system.
+        path: PathBuf,
+        /// The archive's logical name.
+        archive_name: String,
+        /// The range the archive's data area is read into.
+        range: Arc<ArchiveRange>,
+        /// The entry the worker decodes.
+        entry: Entry,
+    },
 }
 
 /// A resolved read: the work to perform and the sizes the resolution named.
@@ -853,6 +1010,36 @@ struct ReadPlan {
     charge: u64,
 }
 
+/// What one read produced.
+///
+/// A file on the bottom file system is read verbatim. An archive entry is
+/// decoded: its segments are inflated and assembled, and the decoded bytes
+/// keep the segment boundaries the extraction filter transforms on. The
+/// filter runs later, on the thread that asked for the bytes, because it is
+/// script code.
+#[derive(Clone, Debug)]
+pub enum StorageBytes {
+    /// A whole file, read verbatim.
+    File(Vec<u8>),
+    /// An archive entry's decoded bytes, and the archive it was read from.
+    Archive {
+        /// The decoded entry: its bytes and the segments they are made of.
+        decoded: DecodedEntry,
+        /// The logical archive name the entry was read from.
+        archive_name: String,
+    },
+}
+
+impl StorageBytes {
+    /// The number of bytes the payload holds.
+    fn byte_len(&self) -> u64 {
+        match self {
+            StorageBytes::File(bytes) => bytes.len() as u64,
+            StorageBytes::Archive { decoded, .. } => decoded.bytes.len() as u64,
+        }
+    }
+}
+
 /// The backend that performs a scheduled read.
 ///
 /// The implementation reads through the bottom file system; the middle layer
@@ -864,25 +1051,27 @@ pub trait StorageReader: Send + Sync {
     ///
     /// A failure is the storage's own typed error; there is no substitute
     /// value and no empty result.
-    fn read(&self, job: &StorageJob) -> Result<Vec<u8>, StorageReadError>;
+    fn read(&self, job: &StorageJob) -> Result<StorageBytes, StorageReadError>;
 }
 
 /// The reader that reads through the bottom file system.
 ///
 /// It is the default reader of the storage read pool: a disk file is read
-/// positionally and an archive entry through the archive's own backing.
+/// positionally and an archive entry through the archive's own backing. The
+/// archive entry is decoded, not filtered: the extraction filter is script
+/// code and runs on the thread that asked for the bytes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FileSystemReader;
 
 impl StorageReader for FileSystemReader {
-    fn read(&self, job: &StorageJob) -> Result<Vec<u8>, StorageReadError> {
+    fn read(&self, job: &StorageJob) -> Result<StorageBytes, StorageReadError> {
         match job {
             StorageJob::Disk { fs, path, limit } => {
                 let read = match limit {
                     Some(limit) => read_fs_file_prefix(fs, path, *limit),
                     None => read_fs_file(fs, path),
                 };
-                read.map_err(StorageReadError::Fs)
+                read.map(StorageBytes::File).map_err(StorageReadError::Fs)
             }
             StorageJob::Archive {
                 fs,
@@ -892,12 +1081,60 @@ impl StorageReader for FileSystemReader {
                 archive_name,
                 limit,
             } => read_archive_entry(fs, source.as_ref(), path, in_arc, archive_name, *limit),
+            StorageJob::ArchiveRange {
+                fs,
+                source,
+                path,
+                archive_name,
+                range,
+                entry,
+            } => read_archive_range_entry(fs, source.as_ref(), path, archive_name, range, entry),
         }
     }
 }
 
-/// Reads an archive entry through the mounted archive's backing, or through a
-/// transient open when the archive is not mounted.
+/// Decodes an archive entry from the byte range of the archive's data area
+/// the entry lives in.
+///
+/// The range is read once and shared: the first worker that needs it reads
+/// it, and the other workers wait for it and decode their own entry from it.
+/// The entry is decoded, not filtered: the extraction filter is script code
+/// and runs on the thread that asked for the bytes.
+fn read_archive_range_entry(
+    fs: &FileSystem,
+    source: Option<&ArchiveSource>,
+    path: &Path,
+    archive_name: &str,
+    range: &Arc<ArchiveRange>,
+    entry: &Entry,
+) -> Result<StorageBytes, StorageReadError> {
+    let (archive, file) = match source {
+        Some(source) => match &source.backing {
+            ArchiveBacking::Stream(file) => (Arc::clone(&source.archive), Arc::clone(file)),
+            ArchiveBacking::Image(image) => (Arc::clone(&source.archive), image.file()),
+        },
+        None => {
+            let file =
+                fs::open(fs, &FsPath::host(path), OpenMode::Read).map_err(StorageReadError::Fs)?;
+            let archive = Xp3Archive::open(fs, &file).map_err(xp3_error)?;
+            (Arc::new(archive), Arc::new(file))
+        }
+    };
+    let bytes = range.load(fs, &file)?;
+    let decoded = archive
+        .read_entry_decoded_from_range(range.start, &bytes, entry)
+        .map_err(xp3_error)?;
+    Ok(StorageBytes::Archive {
+        decoded,
+        archive_name: archive_name.to_string(),
+    })
+}
+
+/// Decodes an archive entry through the mounted archive's backing, or through
+/// a transient open when the archive is not mounted.
+///
+/// The entry is decoded, not filtered: the decode is the work a worker may
+/// do, and the extraction filter runs on the thread that asked for the bytes.
 fn read_archive_entry(
     fs: &FileSystem,
     source: Option<&ArchiveSource>,
@@ -905,17 +1142,17 @@ fn read_archive_entry(
     in_arc: &str,
     archive_name: &str,
     limit: Option<usize>,
-) -> Result<Vec<u8>, StorageReadError> {
-    if let Some(source) = source {
-        return match &source.backing {
+) -> Result<StorageBytes, StorageReadError> {
+    let decoded = if let Some(source) = source {
+        match &source.backing {
             ArchiveBacking::Stream(file) => match limit {
                 Some(limit) => source
                     .archive
-                    .read_prefix_with_filter(fs, file, in_arc, archive_name, limit, None)
+                    .read_prefix_decoded(fs, file, in_arc, limit)
                     .map_err(xp3_error),
                 None => source
                     .archive
-                    .read_with_filter(fs, file, in_arc, archive_name, None)
+                    .read_decoded(fs, file, in_arc)
                     .map_err(xp3_error),
             },
             ArchiveBacking::Image(image) => {
@@ -923,30 +1160,37 @@ fn read_archive_entry(
                     .archive
                     .entry(in_arc)
                     .ok_or_else(|| xp3_error(xp3::Xp3Error::NotFound(in_arc.to_string())))?;
-                image.read_entry(&source.archive, entry, archive_name, limit, None)
+                image.read_entry(&source.archive, entry, limit)
             }
-        };
-    }
-    let file = fs::open(fs, &FsPath::host(path), OpenMode::Read).map_err(StorageReadError::Fs)?;
-    let archive = Xp3Archive::open(fs, &file).map_err(xp3_error)?;
-    match limit {
-        Some(limit) => archive
-            .read_prefix_with_filter(fs, &file, in_arc, archive_name, limit, None)
-            .map_err(xp3_error),
-        None => archive
-            .read_with_filter(fs, &file, in_arc, archive_name, None)
-            .map_err(xp3_error),
-    }
+        }
+    } else {
+        let file =
+            fs::open(fs, &FsPath::host(path), OpenMode::Read).map_err(StorageReadError::Fs)?;
+        let archive = Xp3Archive::open(fs, &file).map_err(xp3_error)?;
+        match limit {
+            Some(limit) => archive
+                .read_prefix_decoded(fs, &file, in_arc, limit)
+                .map_err(xp3_error),
+            None => archive.read_decoded(fs, &file, in_arc).map_err(xp3_error),
+        }
+    }?;
+    Ok(StorageBytes::Archive {
+        decoded,
+        archive_name: archive_name.to_string(),
+    })
 }
 
-/// The bytes a read outcome holds.
+/// The bytes a read outcome holds, before the extraction filter runs.
 ///
 /// A failed or cancelled read is the storage's own typed error; there is no
 /// substitute value and no empty result. A file that vanished between the
 /// resolution and the read is the same not-found the resolution reports.
-fn outcome_to_bytes(outcome: StorageOutcome, name: &str) -> Result<Vec<u8>, StorageReadError> {
+fn outcome_to_payload(
+    outcome: StorageOutcome,
+    name: &str,
+) -> Result<StorageBytes, StorageReadError> {
     match outcome {
-        StorageOutcome::Ready(bytes) => Ok((*bytes).clone()),
+        StorageOutcome::Ready(payload) => Ok((*payload).clone()),
         StorageOutcome::Failed(StorageReadError::Fs(FsError::NotFound { .. })) => {
             Err(StorageReadError::NotFound(name.to_string()))
         }
@@ -954,6 +1198,27 @@ fn outcome_to_bytes(outcome: StorageOutcome, name: &str) -> Result<Vec<u8>, Stor
         StorageOutcome::Cancelled => Err(StorageReadError::NoResult {
             message: "the read was cancelled before it produced a result".to_string(),
         }),
+    }
+}
+
+/// Turns a read's payload into the bytes the caller reads.
+///
+/// The extraction filter runs here, on the thread that asked for the bytes:
+/// the filter is script code, and the script's thread is the only thread it
+/// may run on. The filter transforms the decoded segments — the bytes the
+/// decode produced — and never the stored ones.
+fn finalize_bytes(payload: StorageBytes, filter: Option<&Xp3ExtractionFilter<'_>>) -> Vec<u8> {
+    match payload {
+        StorageBytes::File(bytes) => bytes,
+        StorageBytes::Archive {
+            mut decoded,
+            archive_name,
+        } => {
+            if let Some(filter) = filter {
+                decoded.apply_extraction_filter(&archive_name, filter);
+            }
+            decoded.bytes
+        }
     }
 }
 
@@ -990,7 +1255,11 @@ fn split_media_scheme(name: &str) -> Option<(&str, &str)> {
 #[derive(Clone, Debug)]
 pub enum StorageOutcome {
     /// The read produced these bytes.
-    Ready(Arc<Vec<u8>>),
+    ///
+    /// The payload is the read's result before the extraction filter: an
+    /// archive entry's decoded bytes keep their segment boundaries, and the
+    /// filter transforms them when the bytes are handed to the caller.
+    Ready(Arc<StorageBytes>),
     /// The read failed; the error is the storage's own typed error.
     Failed(StorageReadError),
     /// The read was cancelled before it produced a result.
@@ -1001,7 +1270,7 @@ impl StorageOutcome {
     /// The number of bytes the outcome holds.
     fn byte_len(&self) -> u64 {
         match self {
-            StorageOutcome::Ready(bytes) => bytes.len() as u64,
+            StorageOutcome::Ready(payload) => payload.byte_len(),
             StorageOutcome::Failed(_) | StorageOutcome::Cancelled => 0,
         }
     }
@@ -1041,12 +1310,12 @@ impl PendingStorage {
         }
     }
 
-    /// Creates a handle that already holds the bytes of the entry.
-    fn ready(bytes: Vec<u8>, size: Option<u64>) -> Self {
+    /// Creates a handle that already holds the read's payload.
+    fn ready(payload: StorageBytes, size: Option<u64>) -> Self {
         let pending = Self::new(size);
         {
             let mut state = lock(&pending.shared.state);
-            *state = Some(StorageOutcome::Ready(Arc::new(bytes)));
+            *state = Some(StorageOutcome::Ready(Arc::new(payload)));
         }
         pending
     }
@@ -1501,6 +1770,17 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+/// Waits on a condition variable, recovering from a poisoned lock.
+///
+/// The wait releases the lock, so the state the caller waits for can be
+/// published by another thread while it sleeps.
+fn wait<'a, T>(condvar: &Condvar, state: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    match condvar.wait(state) {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 /// Takes the next job from the queue.
 fn take_next_read(state: &mut PoolState) -> Option<Job> {
     state.queue.pop_front()
@@ -1586,7 +1866,7 @@ fn read_worker_loop(reader: Arc<dyn StorageReader>, shared: Arc<PoolShared>) {
         let outcome =
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reader.read(&job.work)))
             {
-                Ok(Ok(bytes)) => StorageOutcome::Ready(Arc::new(bytes)),
+                Ok(Ok(payload)) => StorageOutcome::Ready(Arc::new(payload)),
                 Ok(Err(error)) => StorageOutcome::Failed(error),
                 Err(payload) => StorageOutcome::Failed(StorageReadError::NoResult {
                     message: panic_message(payload.as_ref()),
@@ -2032,20 +2312,20 @@ impl Storage {
             return Ok(None);
         };
         let Some(pool) = self.read_pool.as_ref() else {
-            // Without a pool the entry is read on the calling thread.
-            let bytes = FileSystemReader.read(&plan.work)?;
+            // Without a pool the entry is decoded on the calling thread.
+            let payload = FileSystemReader.read(&plan.work)?;
             return Ok(Some(StorageEntry::File {
                 name: name.to_string(),
-                pending: PendingStorage::ready(bytes, plan.size),
+                pending: PendingStorage::ready(payload, plan.size),
             }));
         };
         let key = StorageKey::new(name, None, self.generation);
         // A read the frame already published is answered with its result.
         if let Some(outcome) = pool.peek_completed(&key) {
-            let bytes = outcome_to_bytes(outcome, name)?;
+            let payload = outcome_to_payload(outcome, name)?;
             return Ok(Some(StorageEntry::File {
                 name: name.to_string(),
-                pending: PendingStorage::ready(bytes, plan.size),
+                pending: PendingStorage::ready(payload, plan.size),
             }));
         }
         // A read that is already in flight is the read this resolution names.
@@ -2061,10 +2341,10 @@ impl Storage {
                         log::warn!(
                             "storage: the read pool refused {name:?} ({error}); the entry is read on the calling thread"
                         );
-                        let bytes = FileSystemReader.read(&plan.work)?;
+                        let payload = FileSystemReader.read(&plan.work)?;
                         return Ok(Some(StorageEntry::File {
                             name: name.to_string(),
-                            pending: PendingStorage::ready(bytes, plan.size),
+                            pending: PendingStorage::ready(payload, plan.size),
                         }));
                     }
                 }
@@ -2083,6 +2363,10 @@ impl Storage {
     /// accounting covers every read — the scheduled ones included. A media's
     /// entry is read by its provider, here, and counted the same way.
     ///
+    /// The extraction filter runs here, on the thread that waits for the
+    /// read: the filter is script code, and the decode it transforms may
+    /// have run on a worker.
+    ///
     /// # Errors
     ///
     /// The storage's own error: a read that failed, or one that was
@@ -2090,7 +2374,10 @@ impl Storage {
     pub fn read_entry(&self, entry: &StorageEntry) -> Result<Vec<u8>, StorageReadError> {
         let bytes = match entry {
             StorageEntry::File { name, pending } => match pending.await_outcome() {
-                StorageOutcome::Ready(bytes) => bytes.as_ref().clone(),
+                StorageOutcome::Ready(payload) => finalize_bytes(
+                    payload.as_ref().clone(),
+                    self.xp3_extraction_filter.as_deref(),
+                ),
                 StorageOutcome::Failed(StorageReadError::Fs(FsError::NotFound { .. })) => {
                     return Err(StorageReadError::NotFound(name.clone()));
                 }
@@ -2138,7 +2425,10 @@ impl Storage {
                 }
                 let bytes = provider.read(&path)?;
                 let size = bytes.len() as u64;
-                Ok(Some(PendingStorage::ready(bytes, Some(size))))
+                Ok(Some(PendingStorage::ready(
+                    StorageBytes::File(bytes),
+                    Some(size),
+                )))
             }
             None => Ok(None),
         }
@@ -2147,8 +2437,11 @@ impl Storage {
     /// Reads a storage entry through the read pool.
     ///
     /// Returns `Ok(None)` when the pool does not serve this read: the
-    /// storage has no pool, or the installed extraction filter has to run on
-    /// the calling thread because it is script code.
+    /// storage has no pool, or the pool refused the read.
+    ///
+    /// The pool decodes the entry; the extraction filter runs afterwards, on
+    /// the thread that asked for the bytes. The filter is script code, and
+    /// the decode it transforms is the work a worker may do.
     fn read_scheduled(
         &self,
         name: &str,
@@ -2157,15 +2450,14 @@ impl Storage {
         let Some(pool) = self.read_pool.as_ref() else {
             return Ok(None);
         };
-        // The extraction filter is script code: it runs on the thread that
-        // asked for the bytes, never on a worker.
-        if self.xp3_extraction_filter.is_some() {
-            return Ok(None);
-        }
         let key = StorageKey::new(name, limit, self.generation);
         // A read the frame already published is served without another wait.
         if let Some(outcome) = pool.take_completed(&key) {
-            return outcome_to_bytes(outcome, name).map(Some);
+            let payload = outcome_to_payload(outcome, name)?;
+            return Ok(Some(finalize_bytes(
+                payload,
+                self.xp3_extraction_filter.as_deref(),
+            )));
         }
         let pending = match pool.take_pending(&key) {
             Some(pending) => pending,
@@ -2187,7 +2479,126 @@ impl Storage {
             }
         };
         let outcome = pending.await_outcome();
-        outcome_to_bytes(outcome, name).map(Some)
+        let payload = outcome_to_payload(outcome, name)?;
+        Ok(Some(finalize_bytes(
+            payload,
+            self.xp3_extraction_filter.as_deref(),
+        )))
+    }
+
+    /// Reads the entries `names` in one read, decoding them in parallel.
+    ///
+    /// The names that resolve to entries of one archive are read together:
+    /// the archive's data area is read once, over the range those entries
+    /// occupy, and every entry of the range is decoded on a worker of its
+    /// own. The bytes of an entry land in the read table under the name it
+    /// was asked for, so the read that follows finds them there and waits
+    /// for nothing but its own entry.
+    ///
+    /// A name that does not resolve, that names a disk file or that belongs
+    /// to a media provider is left to the caller: this schedules the reads it
+    /// can serve and never waits for them.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageReadError`] when a name cannot be resolved.
+    pub fn read_entries_together(&self, names: &[String]) -> Result<(), StorageReadError> {
+        let Some(pool) = self.read_pool.as_ref() else {
+            // Without a pool the entries are read on the calling thread.
+            return Ok(());
+        };
+        // The extraction filter is script code: it runs on the thread that
+        // asked for the bytes, never on a worker.
+        if self.xp3_extraction_filter.is_some() {
+            return Ok(());
+        }
+        // The entries of one archive, in the order they were named.
+        let mut groups: Vec<(PathBuf, Vec<(String, Entry)>)> = Vec::new();
+        for name in names {
+            let location = match self.find(name) {
+                Ok(location) => location,
+                Err(error) => {
+                    // The name does not resolve: the read that follows
+                    // reports the failure, and the shared read skips it.
+                    log::debug!(
+                        "storage: {name:?} could not be resolved for a shared read: {error}"
+                    );
+                    continue;
+                }
+            };
+            let Some(Location::Archive(arc_path, in_arc)) = location else {
+                continue;
+            };
+            let Some(mounted) = self
+                .archives
+                .iter()
+                .find(|mounted| mounted.path.as_path() == arc_path.as_path())
+            else {
+                continue;
+            };
+            let Some(entry) = mounted.archive.entry(&in_arc) else {
+                continue;
+            };
+            let entry = entry.clone();
+            let position = groups
+                .iter()
+                .position(|(path, _)| path.as_path() == arc_path.as_path());
+            match position {
+                Some(index) => groups[index].1.push((name.clone(), entry)),
+                None => groups.push((arc_path.clone(), vec![(name.clone(), entry)])),
+            }
+        }
+        for (arc_path, entries) in groups {
+            let Some(mounted) = self
+                .archives
+                .iter()
+                .find(|mounted| mounted.path.as_path() == arc_path.as_path())
+            else {
+                continue;
+            };
+            let archive = Arc::clone(&mounted.archive);
+            let named: Vec<&Entry> = entries.iter().map(|(_, entry)| entry).collect();
+            let Some((start, end)) = archive.data_range(&named) else {
+                continue;
+            };
+            let Some(len) = end.checked_sub(start) else {
+                continue;
+            };
+            let Ok(len) = usize::try_from(len) else {
+                continue;
+            };
+            let range = ArchiveRange::new(start, len);
+            let source = ArchiveSource {
+                archive: Arc::clone(&archive),
+                backing: mounted.backing.clone(),
+            };
+            let archive_name = mounted.file_name.clone();
+            for (name, entry) in entries {
+                let key = StorageKey::new(name.clone(), None, self.generation);
+                // A read that is already in flight or already published is
+                // the read this scheduling names.
+                if pool.pending(&key).is_some() || pool.peek_completed(&key).is_some() {
+                    continue;
+                }
+                let charge = entry.org_size;
+                let work = StorageJob::ArchiveRange {
+                    fs: self.fs.clone(),
+                    source: Some(source.clone()),
+                    path: arc_path.clone(),
+                    archive_name: archive_name.clone(),
+                    range: Arc::clone(&range),
+                    entry,
+                };
+                if let Err(error) = pool.submit(key, work, Some(charge), charge) {
+                    // The pool refused the read: the entry is read on the
+                    // calling thread, and the refusal is reported.
+                    log::warn!(
+                        "storage: the read pool refused {name:?} ({error}); the entry is read on the calling thread"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Resolves a storage name into the work a read performs.
@@ -2980,6 +3391,10 @@ impl Storage {
 
     /// Reads a storage entry to bytes (disk file or archive member).
     ///
+    /// The extraction filter runs on the calling thread, after the decode:
+    /// the filter is script code, and the decode it transforms may have run
+    /// on a worker.
+    ///
     /// # Errors
     ///
     /// [`StorageReadError::NotFound`] when the name does not resolve, and a
@@ -2995,13 +3410,14 @@ impl Storage {
             self.count_read_bytes(bytes.len());
             return Ok(bytes);
         }
-        let bytes = match self.find(name)? {
+        let payload = match self.find(name)? {
             Some(Location::Disk(path)) => {
-                read_fs_file(&self.fs, &path).map_err(StorageReadError::Fs)
+                StorageBytes::File(read_fs_file(&self.fs, &path).map_err(StorageReadError::Fs)?)
             }
-            Some(Location::Archive(arc_path, in_arc)) => self.read_archive(&arc_path, &in_arc),
-            None => Err(StorageReadError::NotFound(name.to_string())),
-        }?;
+            Some(Location::Archive(arc_path, in_arc)) => self.read_archive(&arc_path, &in_arc)?,
+            None => return Err(StorageReadError::NotFound(name.to_string())),
+        };
+        let bytes = finalize_bytes(payload, self.xp3_extraction_filter.as_deref());
         self.count_read_bytes(bytes.len());
         Ok(bytes)
     }
@@ -3029,15 +3445,16 @@ impl Storage {
             self.count_read_bytes(bytes.len());
             return Ok(bytes);
         }
-        let bytes = match self.find(name)? {
-            Some(Location::Disk(path)) => {
-                read_fs_file_prefix(&self.fs, &path, max_len).map_err(StorageReadError::Fs)
-            }
+        let payload = match self.find(name)? {
+            Some(Location::Disk(path)) => StorageBytes::File(
+                read_fs_file_prefix(&self.fs, &path, max_len).map_err(StorageReadError::Fs)?,
+            ),
             Some(Location::Archive(arc_path, in_arc)) => {
-                self.read_archive_prefix(&arc_path, &in_arc, max_len)
+                self.read_archive_prefix(&arc_path, &in_arc, max_len)?
             }
-            None => Err(StorageReadError::NotFound(name.to_string())),
-        }?;
+            None => return Err(StorageReadError::NotFound(name.to_string())),
+        };
+        let bytes = finalize_bytes(payload, self.xp3_extraction_filter.as_deref());
         self.count_read_bytes(bytes.len());
         Ok(bytes)
     }
@@ -3048,26 +3465,34 @@ impl Storage {
         self.resolution_cache.borrow_mut().read_bytes += len as u64;
     }
 
-    /// Reads `in_arc` from the mounted archive at `arc_path`, or from a
+    /// Decodes `in_arc` from the mounted archive at `arc_path`, or from a
     /// transient open when the archive is not in the mount list. A mounted
     /// archive reads through its own backing, so a preloaded archive never
     /// touches the file system.
-    fn read_archive(&self, arc_path: &Path, in_arc: &str) -> Result<Vec<u8>, StorageReadError> {
-        let filter = self.xp3_extraction_filter.as_deref();
+    ///
+    /// The entry is decoded, not filtered: the filter is a separate stage,
+    /// and it runs on the thread that asked for the bytes.
+    fn read_archive(
+        &self,
+        arc_path: &Path,
+        in_arc: &str,
+    ) -> Result<StorageBytes, StorageReadError> {
         if let Some(mounted) = self.archives.iter().find(|m| m.path == arc_path) {
             let entry = mounted
                 .archive
                 .entry(in_arc)
                 .ok_or_else(|| StorageReadError::NotFound(in_arc.to_string()))?;
-            return match &mounted.backing {
+            let decoded = match &mounted.backing {
                 ArchiveBacking::Stream(file) => mounted
                     .archive
-                    .read_entry_with_filter(&self.fs, file, entry, &mounted.file_name, filter)
+                    .read_entry_decoded(&self.fs, file, entry)
                     .map_err(xp3_error),
-                ArchiveBacking::Image(image) => {
-                    image.read_entry(&mounted.archive, entry, &mounted.file_name, None, filter)
-                }
-            };
+                ArchiveBacking::Image(image) => image.read_entry(&mounted.archive, entry, None),
+            }?;
+            return Ok(StorageBytes::Archive {
+                decoded,
+                archive_name: mounted.file_name.clone(),
+            });
         }
         let file = fs::open(&self.fs, &FsPath::host(arc_path), OpenMode::Read)?;
         let archive = Xp3Archive::open(&self.fs, &file).map_err(xp3_error)?;
@@ -3075,47 +3500,41 @@ impl Storage {
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default();
-        archive
-            .read_with_filter(&self.fs, &file, in_arc, &file_name, filter)
-            .map_err(xp3_error)
+        let decoded = archive
+            .read_decoded(&self.fs, &file, in_arc)
+            .map_err(xp3_error)?;
+        Ok(StorageBytes::Archive {
+            decoded,
+            archive_name: file_name,
+        })
     }
 
-    /// Prefix counterpart of [`Self::read_archive`]: the same backing and filter
+    /// Prefix counterpart of [`Self::read_archive`]: the same backing
     /// selection, decoding only the requested bytes.
     fn read_archive_prefix(
         &self,
         arc_path: &Path,
         in_arc: &str,
         max_len: usize,
-    ) -> Result<Vec<u8>, StorageReadError> {
-        let filter = self.xp3_extraction_filter.as_deref();
+    ) -> Result<StorageBytes, StorageReadError> {
         if let Some(mounted) = self.archives.iter().find(|m| m.path == arc_path) {
-            return match &mounted.backing {
+            let decoded = match &mounted.backing {
                 ArchiveBacking::Stream(file) => mounted
                     .archive
-                    .read_prefix_with_filter(
-                        &self.fs,
-                        file,
-                        in_arc,
-                        &mounted.file_name,
-                        max_len,
-                        filter,
-                    )
+                    .read_prefix_decoded(&self.fs, file, in_arc, max_len)
                     .map_err(xp3_error),
                 ArchiveBacking::Image(image) => {
                     let entry = mounted
                         .archive
                         .entry(in_arc)
                         .ok_or_else(|| StorageReadError::NotFound(in_arc.to_string()))?;
-                    image.read_entry(
-                        &mounted.archive,
-                        entry,
-                        &mounted.file_name,
-                        Some(max_len),
-                        filter,
-                    )
+                    image.read_entry(&mounted.archive, entry, Some(max_len))
                 }
-            };
+            }?;
+            return Ok(StorageBytes::Archive {
+                decoded,
+                archive_name: mounted.file_name.clone(),
+            });
         }
         let file = fs::open(&self.fs, &FsPath::host(arc_path), OpenMode::Read)?;
         let archive = Xp3Archive::open(&self.fs, &file).map_err(xp3_error)?;
@@ -3123,9 +3542,13 @@ impl Storage {
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default();
-        archive
-            .read_prefix_with_filter(&self.fs, &file, in_arc, &file_name, max_len, filter)
-            .map_err(xp3_error)
+        let decoded = archive
+            .read_prefix_decoded(&self.fs, &file, in_arc, max_len)
+            .map_err(xp3_error)?;
+        Ok(StorageBytes::Archive {
+            decoded,
+            archive_name: file_name,
+        })
     }
 
     /// Returns metadata for a resolved storage entry.
@@ -4127,9 +4550,9 @@ mod tests {
             "the image is not loaded yet"
         );
         let from_file = image
-            .read_entry(&archive, entry, "data.xp3", None, None)
+            .read_entry(&archive, entry, None)
             .expect("read from the file");
-        assert_eq!(from_file, b"payload");
+        assert_eq!(from_file.bytes, b"payload");
 
         image.publish(
             Path::new("/game/data.xp3"),
@@ -4141,9 +4564,9 @@ mod tests {
             "the image is loaded"
         );
         let from_image = image
-            .read_entry(&archive, entry, "data.xp3", None, None)
+            .read_entry(&archive, entry, None)
             .expect("read from the image");
-        assert_eq!(from_image, from_file);
+        assert_eq!(from_image.bytes, from_file.bytes);
     }
 
     /// A failed image load is a typed read error: the archive never falls
@@ -4167,7 +4590,7 @@ mod tests {
             Duration::ZERO,
         );
         let error = image
-            .read_entry(&archive, entry, "data.xp3", None, None)
+            .read_entry(&archive, entry, None)
             .expect_err("the failed image is an error");
         assert!(
             matches!(error, StorageReadError::Preload(_)),

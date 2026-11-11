@@ -138,19 +138,14 @@ impl Xp3Archive {
     pub fn near_misses(&self, request: &str, cap: usize) -> NearMisses;
     pub fn entry(&self, name: &str) -> Option<&Entry>;
 
-    pub fn read(&self, fs: &FileSystem, file: &FileState, name: &str) -> Result<Vec<u8>>;
-    pub fn read_with_filter(&self, fs: &FileSystem, file: &FileState, name: &str,
-                            archive_name: &str,
-                            filter: Option<&Xp3ExtractionFilter<'_>>) -> Result<Vec<u8>>;
-    pub fn read_entry(&self, fs: &FileSystem, file: &FileState, entry: &Entry) -> Result<Vec<u8>>;
-    pub fn read_entry_with_filter(&self, fs: &FileSystem, file: &FileState, entry: &Entry,
-                                   archive_name: &str,
-                                   filter: Option<&Xp3ExtractionFilter<'_>>) -> Result<Vec<u8>>;
-    pub fn read_entry_from_bytes(&self, bytes: &[u8], entry: &Entry, archive_name: &str,
-                                 filter: Option<&Xp3ExtractionFilter<'_>>) -> Result<Vec<u8>>;
-    pub fn read_prefix_with_filter(&self, fs: &FileSystem, file: &FileState, name: &str,
-                                    archive_name: &str, max_len: usize,
-                                    filter: Option<&Xp3ExtractionFilter<'_>>) -> Result<Vec<u8>>;
+    pub fn read_decoded(&self, fs: &FileSystem, file: &FileState, name: &str)
+                        -> Result<DecodedEntry>;
+    pub fn read_entry_decoded(&self, fs: &FileSystem, file: &FileState, entry: &Entry)
+                              -> Result<DecodedEntry>;
+    pub fn read_entry_decoded_from_bytes(&self, bytes: &[u8], entry: &Entry)
+                                        -> Result<DecodedEntry>;
+    pub fn read_prefix_decoded(&self, fs: &FileSystem, file: &FileState, name: &str,
+                               max_len: usize) -> Result<DecodedEntry>;
 }
 
 pub fn normalize_in_archive_name(name: &str) -> String;
@@ -160,6 +155,8 @@ pub fn normalize_in_archive_name(name: &str) -> String;
 |---|---|
 | `Entry` | `flags`, `org_size`, `arc_size`, the normalized `name`, `file_hash`; the segments through `segments()` and `segment_count()` |
 | `Segment` | `flags`, `start` (absolute offset in the archive), `org_size`, `arc_size` |
+| `DecodedEntry` | a decoded entry: `file_hash`, `name`, `org_size`, the assembled `bytes` and the `segments` they are made of |
+| `DecodedSegment` | one decoded segment: its `offset` within the entry and its `range` in the decoded bytes |
 | `IndexSection` | one index block: `offset`, `encode` (`Raw`/`Zlib`), `file_chunks`, the names it added |
 | `NearMisses` | the near-miss diagnostic for a failed lookup |
 | `Xp3ExtractionFilter<'a>` | the per-segment extraction hook (`xp3filter`): `(file_hash, offset, buffer, file_name, archive_name, file_size)` |
@@ -173,8 +170,8 @@ archive's map key shares — and its first segment inline; the segments after
 the first spill into a vector. An entry whose data is stored in one piece
 costs one allocation.
 
-`read_entry_from_bytes` takes the image as an explicit `&[u8]`, so the preload
-path never hands L1 ownership of the buffer.
+`read_entry_decoded_from_bytes` takes the image as an explicit `&[u8]`, so the
+preload path never hands L1 ownership of the buffer.
 
 ---
 
@@ -188,8 +185,9 @@ path never hands L1 ownership of the buffer.
 | the preloaded archive image | L2 (`ArchiveBacking::Image`) |
 
 `fs` keeps no table of open files and no cache. The extraction filter is
-L2 state: the stateless L1 reader receives the closure as a borrow on every
-read and never stores it.
+L2 state: the stateless L1 reader holds no filter, and it is applied to the
+decoded segments of an entry (`DecodedEntry::apply_extraction_filter`),
+after the decode.
 
 ---
 

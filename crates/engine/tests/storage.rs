@@ -5,9 +5,12 @@
 //! in-memory file-system helpers live in `tests/common/mod.rs`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use api::fs::FsPath;
-use engine::storage::{ATTR_DIRECTORY, ATTR_NORMAL, MountOptions};
+use engine::storage::{
+    ATTR_DIRECTORY, ATTR_NORMAL, FileSystemReader, MountOptions, StoragePoolConfig, StorageReadPool,
+};
 use engine::{Location, Storage, StorageMedia, StorageReadError, normalize_in_archive_name};
 use testkit::build_xp3;
 
@@ -1748,10 +1751,77 @@ fn reading_an_in_memory_image_rejects_an_overrunning_segment() {
     let entry = archive.entry("data/a.bin").cloned().expect("entry");
 
     let err = archive
-        .read_entry_from_bytes(&[], &entry, "data.xp3", None)
+        .read_entry_decoded_from_bytes(&[], &entry)
         .expect_err("segment overruns an empty image");
     assert!(
         matches!(err, fs::xp3::Xp3Error::CorruptIndex(_)),
         "unexpected error: {err:?}"
     );
+}
+
+/// The entries of one archive are read together: the archive's data area is
+/// read once, over the range those entries occupy, and every entry of the
+/// range is decoded on a worker of its own. The bytes a shared read serves
+/// are the bytes an individual read serves.
+#[test]
+fn a_shared_read_serves_the_same_bytes_as_an_individual_read() {
+    let xp3 = build_xp3(&[
+        ("data/one.bin", b"first entry", true),
+        ("data/two.bin", b"second entry", true),
+        ("data/three.bin", b"third entry", true),
+    ]);
+    let mut storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+    let pool = StorageReadPool::new(Arc::new(FileSystemReader), StoragePoolConfig::default())
+        .expect("start the read pool");
+    storage.read_pool = Some(Arc::new(pool));
+
+    let names = vec![
+        "data/one.bin".to_string(),
+        "data/two.bin".to_string(),
+        "data/three.bin".to_string(),
+    ];
+    storage
+        .read_entries_together(&names)
+        .expect("schedule the shared read");
+
+    assert_eq!(
+        storage.read("data/one.bin").expect("read the first entry"),
+        b"first entry"
+    );
+    assert_eq!(
+        storage.read("data/two.bin").expect("read the second entry"),
+        b"second entry"
+    );
+    assert_eq!(
+        storage
+            .read("data/three.bin")
+            .expect("read the third entry"),
+        b"third entry"
+    );
+}
+
+/// A shared read that names an entry the storage cannot resolve leaves the
+/// other entries alone: the names that resolve are read together, and the
+/// name that does not is the caller's own business.
+#[test]
+fn a_shared_read_skips_the_names_that_do_not_resolve() {
+    let xp3 = build_xp3(&[("data/one.bin", b"first entry", true)]);
+    let mut storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+    let pool = StorageReadPool::new(Arc::new(FileSystemReader), StoragePoolConfig::default())
+        .expect("start the read pool");
+    storage.read_pool = Some(Arc::new(pool));
+
+    let names = vec!["data/one.bin".to_string(), "data/missing.bin".to_string()];
+    storage
+        .read_entries_together(&names)
+        .expect("schedule the shared read");
+
+    assert_eq!(
+        storage.read("data/one.bin").expect("read the entry"),
+        b"first entry"
+    );
+    assert!(matches!(
+        storage.read("data/missing.bin"),
+        Err(StorageReadError::NotFound(_))
+    ));
 }

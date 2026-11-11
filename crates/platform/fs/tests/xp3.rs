@@ -130,7 +130,7 @@ fn oversized_index_chunk_is_rejected() {
 fn oversized_segment_read_is_rejected() {
     let (fs, file) = fs_with(&archive_with_oversized_segment());
     let archive = Xp3Archive::open(&fs, &file).expect("index itself is well-formed");
-    let err = archive.read(&fs, &file, "big.bin").unwrap_err();
+    let err = archive.read_decoded(&fs, &file, "big.bin").unwrap_err();
     assert!(
         matches!(err, Xp3Error::CorruptIndex(_)),
         "unexpected error: {err:?}"
@@ -163,7 +163,7 @@ fn adapter_read_failure_preserves_fs_error() {
     // read fail with `FsError::NotFound`.
     fs::remove_file(&fs, &FsPath::host("/bad.xp3")).expect("remove backing file");
 
-    let err = archive.read(&fs, &file, "gone.bin").unwrap_err();
+    let err = archive.read_decoded(&fs, &file, "gone.bin").unwrap_err();
     assert!(
         matches!(err, Xp3Error::Fs(FsError::NotFound { .. })),
         "typed FsError was not preserved: {err:?}"
@@ -184,13 +184,19 @@ fn parses_and_reads_valid_archive() {
     assert_eq!(archive.len(), 2);
     assert!(!archive.is_empty());
     assert_eq!(archive.entry("plain.bin").unwrap().org_size, 9);
-    assert_eq!(archive.read(&fs, &file, "plain.bin").unwrap(), b"raw bytes");
     assert_eq!(
-        archive.read(&fs, &file, r"DIR\PACKED.BIN").unwrap(),
+        archive.read_decoded(&fs, &file, "plain.bin").unwrap().bytes,
+        b"raw bytes"
+    );
+    assert_eq!(
+        archive
+            .read_decoded(&fs, &file, r"DIR\PACKED.BIN")
+            .unwrap()
+            .bytes,
         b"zlib compressed payload"
     );
     assert!(matches!(
-        archive.read(&fs, &file, "missing.bin"),
+        archive.read_decoded(&fs, &file, "missing.bin"),
         Err(Xp3Error::NotFound(_))
     ));
 }
@@ -209,9 +215,15 @@ fn parses_a_zlib_compressed_index() {
     let (fs, file) = fs_with(&xp3);
     let archive = Xp3Archive::open(&fs, &file).expect("open compressed-index archive");
     assert_eq!(archive.len(), 2);
-    assert_eq!(archive.read(&fs, &file, "plain.bin").unwrap(), b"raw bytes");
     assert_eq!(
-        archive.read(&fs, &file, "packed.bin").unwrap(),
+        archive.read_decoded(&fs, &file, "plain.bin").unwrap().bytes,
+        b"raw bytes"
+    );
+    assert_eq!(
+        archive
+            .read_decoded(&fs, &file, "packed.bin")
+            .unwrap()
+            .bytes,
         b"zlib segment payload"
     );
 }
@@ -273,7 +285,10 @@ fn plain_index_resolves_a_known_name() {
     assert_eq!(archive.len(), 1);
     assert!(archive.entry("Config.tjs").is_some());
     assert_eq!(
-        archive.read(&fs, &file, "config.tjs").unwrap(),
+        archive
+            .read_decoded(&fs, &file, "config.tjs")
+            .unwrap()
+            .bytes,
         b"plain config"
     );
     let sections = archive.index_sections();
@@ -296,7 +311,10 @@ fn zlib_index_resolves_a_known_name() {
     assert_eq!(archive.len(), 1);
     assert!(archive.entry("Config.tjs").is_some());
     assert_eq!(
-        archive.read(&fs, &file, "config.tjs").unwrap(),
+        archive
+            .read_decoded(&fs, &file, "config.tjs")
+            .unwrap()
+            .bytes,
         b"packed config"
     );
     assert_eq!(archive.index_sections().len(), 1);
@@ -332,7 +350,10 @@ fn stored_case_and_backslash_resolve() {
     assert!(archive.entry("dir/config.tjs").is_some());
     assert!(archive.entry(r"DIR\CONFIG.tjs").is_some());
     assert_eq!(
-        archive.read(&fs, &file, "Dir/Config.tjs").unwrap(),
+        archive
+            .read_decoded(&fs, &file, "Dir/Config.tjs")
+            .unwrap()
+            .bytes,
         b"mixed"
     );
 }
@@ -347,7 +368,13 @@ fn stored_leading_slash_resolves() {
     let archive = Xp3Archive::open(&fs, &file).expect("open archive");
     assert!(archive.entry("config.tjs").is_some());
     assert!(archive.entry("/Config.tjs").is_some());
-    assert_eq!(archive.read(&fs, &file, "Config.tjs").unwrap(), b"slashy");
+    assert_eq!(
+        archive
+            .read_decoded(&fs, &file, "Config.tjs")
+            .unwrap()
+            .bytes,
+        b"slashy"
+    );
 }
 
 /// A missed lookup names its near misses: an entry whose name is the request
@@ -542,8 +569,17 @@ fn chained_index_continue_blocks_are_followed() {
     let (fs, file) = fs_with(&xp3);
     let archive = Xp3Archive::open(&fs, &file).expect("open chained archive");
     assert_eq!(archive.len(), 2);
-    assert_eq!(archive.read(&fs, &file, "first.bin").unwrap(), b"first");
-    assert_eq!(archive.read(&fs, &file, "second.bin").unwrap(), b"second");
+    assert_eq!(
+        archive.read_decoded(&fs, &file, "first.bin").unwrap().bytes,
+        b"first"
+    );
+    assert_eq!(
+        archive
+            .read_decoded(&fs, &file, "second.bin")
+            .unwrap()
+            .bytes,
+        b"second"
+    );
 }
 
 /// A cyclic index chain is a typed corruption error, not an infinite loop and
@@ -619,7 +655,7 @@ fn org_size_mismatch_is_rejected_on_read() {
     let (fs, file) = fs_with(&file);
     let archive = Xp3Archive::open(&fs, &file).expect("index is structurally valid");
     assert!(matches!(
-        archive.read(&fs, &file, "a.bin"),
+        archive.read_decoded(&fs, &file, "a.bin"),
         Err(Xp3Error::CorruptIndex(_))
     ));
 }
@@ -649,7 +685,10 @@ fn exe_embedded_archive_is_found() {
     let archive = Xp3Archive::open(&fs, &file).expect("find embedded archive");
     assert_eq!(archive.base_offset(), 64);
     assert_eq!(
-        archive.read(&fs, &file, "embedded.bin").unwrap(),
+        archive
+            .read_decoded(&fs, &file, "embedded.bin")
+            .unwrap()
+            .bytes,
         b"payload"
     );
 }
@@ -707,7 +746,7 @@ fn short_read_straddle_finds_embedded_archive() {
 
 /// The stateless extraction-filter hook is invoked once per decoded segment
 /// with the entry metadata and the running uncompressed offset, and its
-/// in-place rewrite is what `read_with_filter` returns. A zlib segment is
+/// in-place rewrite is what the filtered read returns. A zlib segment is
 /// filtered after inflation, matching `tTVPXP3ArchiveStream::Read`
 /// (`XP3Archive.cpp:998`).
 #[test]
@@ -730,7 +769,10 @@ fn extraction_filter_rewrites_decoded_segments_in_place() {
     let archive = Xp3Archive::open(&fs, &file).expect("open archive");
 
     // Without a filter the stored (encrypted) bytes come back unchanged.
-    assert_eq!(archive.read(&fs, &file, "plain.bin").unwrap(), cipher_raw);
+    assert_eq!(
+        archive.read_decoded(&fs, &file, "plain.bin").unwrap().bytes,
+        cipher_raw
+    );
 
     let calls = RefCell::new(Vec::new());
     let filter = |file_hash: u32,
@@ -752,10 +794,11 @@ fn extraction_filter_rewrites_decoded_segments_in_place() {
         }
     };
 
-    let plain = archive
-        .read_with_filter(&fs, &file, "dir/packed.bin", "data.xp3", Some(&filter))
-        .expect("filtered read");
-    assert_eq!(plain, plain_zlib);
+    let mut plain = archive
+        .read_decoded(&fs, &file, "dir/packed.bin")
+        .expect("decoded read");
+    plain.apply_extraction_filter("data.xp3", &filter);
+    assert_eq!(plain.bytes, plain_zlib);
 
     let calls = calls.borrow();
     assert_eq!(calls.len(), 1);
@@ -791,10 +834,11 @@ fn extraction_filter_receives_the_normalized_name() {
         *seen.borrow_mut() = file_name.to_string();
     };
 
-    let data = archive
-        .read_with_filter(&fs, &file, r"Dir\Packed.BIN", "data.xp3", Some(&filter))
-        .expect("filtered read");
-    assert_eq!(data, b"payload");
+    let mut data = archive
+        .read_decoded(&fs, &file, r"Dir\Packed.BIN")
+        .expect("decoded read");
+    data.apply_extraction_filter("data.xp3", &filter);
+    assert_eq!(data.bytes, b"payload");
     assert_eq!(&*seen.borrow(), "dir/packed.bin");
 }
 
@@ -864,17 +908,16 @@ fn extraction_filter_offset_advances_across_segments() {
         calls.borrow_mut().push((offset, buffer.len()));
     };
 
-    assert_eq!(
-        archive
-            .read_with_filter(&fs, &file, "two.bin", "two.xp3", Some(&filter))
-            .unwrap(),
-        b"AAAABBBBBB"
-    );
+    let mut decoded = archive
+        .read_decoded(&fs, &file, "two.bin")
+        .expect("decoded read");
+    decoded.apply_extraction_filter("two.xp3", &filter);
+    assert_eq!(decoded.bytes, b"AAAABBBBBB");
     assert_eq!(*calls.borrow(), vec![(0, 4), (4, 6)]);
 }
 
 // ---------------------------------------------------------------------------
-// Prefix reads (`Xp3Archive::read_prefix_with_filter`).
+// Prefix reads (`Xp3Archive::read_prefix_decoded`).
 //
 // The prefix API is our own capability, not a reference behaviour: on this
 // path the reference reads whole files. These tests pin the properties the
@@ -993,7 +1036,10 @@ fn an_entry_carries_its_name_segments_and_bytes() {
     assert_eq!(segments[1].org_size, 6);
     assert_eq!(segments[1].arc_size, 6);
     assert_eq!(
-        archive.read(&fs, &file, "data/first.txt").unwrap(),
+        archive
+            .read_decoded(&fs, &file, "data/first.txt")
+            .unwrap()
+            .bytes,
         b"hello world\n"
     );
 
@@ -1008,7 +1054,10 @@ fn an_entry_carries_its_name_segments_and_bytes() {
     assert_eq!(segments[0].start, 31);
     assert_eq!(segments[0].org_size, 2);
     assert_eq!(
-        archive.read(&fs, &file, "data/second.bin").unwrap(),
+        archive
+            .read_decoded(&fs, &file, "data/second.bin")
+            .unwrap()
+            .bytes,
         b"\x00\x01"
     );
 
@@ -1021,7 +1070,10 @@ fn an_entry_carries_its_name_segments_and_bytes() {
     assert_eq!(segments[0].start, 33);
     assert_eq!(segments[1].start, 34);
     assert_eq!(segments[2].start, 35);
-    assert_eq!(archive.read(&fs, &file, "third").unwrap(), b"abc");
+    assert_eq!(
+        archive.read_decoded(&fs, &file, "third").unwrap().bytes,
+        b"abc"
+    );
 }
 
 /// An entry costs one allocation: its name, which the archive's map key
@@ -1057,26 +1109,30 @@ fn read_prefix_concatenates_raw_segments_in_order() {
 
     assert_eq!(
         archive
-            .read_prefix_with_filter(&fs, &file, "multi.bin", "", 4, None)
-            .unwrap(),
+            .read_prefix_decoded(&fs, &file, "multi.bin", 4)
+            .unwrap()
+            .bytes,
         b"AAAA"
     );
     assert_eq!(
         archive
-            .read_prefix_with_filter(&fs, &file, "multi.bin", "", 6, None)
-            .unwrap(),
+            .read_prefix_decoded(&fs, &file, "multi.bin", 6)
+            .unwrap()
+            .bytes,
         b"AAAABB"
     );
     assert_eq!(
         archive
-            .read_prefix_with_filter(&fs, &file, "multi.bin", "", 12, None)
-            .unwrap(),
+            .read_prefix_decoded(&fs, &file, "multi.bin", 12)
+            .unwrap()
+            .bytes,
         b"AAAABBBBBBCC"
     );
     assert_eq!(
         archive
-            .read_prefix_with_filter(&fs, &file, "multi.bin", "", 64, None)
-            .unwrap(),
+            .read_prefix_decoded(&fs, &file, "multi.bin", 64)
+            .unwrap()
+            .bytes,
         b"AAAABBBBBBCC"
     );
 }
@@ -1089,15 +1145,15 @@ fn read_prefix_matches_a_truncated_whole_read() {
     let (fs, file) = fs_with(&xp3);
     let archive = Xp3Archive::open(&fs, &file).expect("open archive");
     let entry = archive.entry("span.bin").expect("entry");
-    let whole = archive.read_entry(&fs, &file, entry).unwrap();
+    let whole = archive.read_entry_decoded(&fs, &file, entry).unwrap().bytes;
     assert_eq!(whole, b"0123456789abcdefghijXYZ");
 
     for max_len in [0usize, 1, 5, 9, 10, 11, 15, 20, 23, 24, 100] {
         let prefix = archive
-            .read_prefix_with_filter(&fs, &file, "span.bin", "", max_len, None)
+            .read_prefix_decoded(&fs, &file, "span.bin", max_len)
             .unwrap();
         assert_eq!(
-            prefix.as_slice(),
+            prefix.bytes.as_slice(),
             &whole[..max_len.min(whole.len())],
             "max_len {max_len}"
         );
@@ -1105,7 +1161,7 @@ fn read_prefix_matches_a_truncated_whole_read() {
 }
 
 /// An entry shorter than `max_len` returns short, and a zero limit returns
-/// empty. `read_prefix_with_filter` is our own API and the caller decides
+/// empty. `read_prefix_decoded` is our own API and the caller decides
 /// whether a short result is an error.
 #[test]
 fn read_prefix_returns_short_entries_short() {
@@ -1115,14 +1171,16 @@ fn read_prefix_returns_short_entries_short() {
 
     assert_eq!(
         archive
-            .read_prefix_with_filter(&fs, &file, "tiny.bin", "", 64, None)
-            .unwrap(),
+            .read_prefix_decoded(&fs, &file, "tiny.bin", 64)
+            .unwrap()
+            .bytes,
         b"hi"
     );
     assert!(
         archive
-            .read_prefix_with_filter(&fs, &file, "tiny.bin", "", 0, None)
+            .read_prefix_decoded(&fs, &file, "tiny.bin", 0)
             .unwrap()
+            .bytes
             .is_empty()
     );
 }
@@ -1136,11 +1194,15 @@ fn read_prefix_reads_a_zlib_entry() {
     let archive = Xp3Archive::open(&fs, &file).expect("open archive");
     let entry = archive.entry("packed.bin").expect("entry");
 
-    assert_eq!(archive.read_entry(&fs, &file, entry).unwrap(), payload);
+    assert_eq!(
+        archive.read_entry_decoded(&fs, &file, entry).unwrap().bytes,
+        payload
+    );
     assert_eq!(
         archive
-            .read_prefix_with_filter(&fs, &file, "packed.bin", "", 5, None)
-            .unwrap(),
+            .read_prefix_decoded(&fs, &file, "packed.bin", 5)
+            .unwrap()
+            .bytes,
         b"zlib "
     );
 }
@@ -1157,7 +1219,7 @@ fn read_prefix_reports_a_zlib_failure() {
     let archive = Xp3Archive::open(&fs, &file).expect("open archive");
 
     let err = archive
-        .read_prefix_with_filter(&fs, &file, "bad.bin", "", 64, None)
+        .read_prefix_decoded(&fs, &file, "bad.bin", 64)
         .unwrap_err();
     assert!(
         matches!(err, Xp3Error::Inflate(_)),
@@ -1175,7 +1237,7 @@ fn read_prefix_preserves_a_bottom_read_failure() {
     fs::remove_file(&fs, &FsPath::host("/bad.xp3")).expect("remove backing file");
 
     let err = archive
-        .read_prefix_with_filter(&fs, &file, "gone.bin", "", 4, None)
+        .read_prefix_decoded(&fs, &file, "gone.bin", 4)
         .unwrap_err();
     assert!(
         matches!(err, Xp3Error::Fs(FsError::NotFound { .. })),

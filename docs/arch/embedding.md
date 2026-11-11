@@ -312,14 +312,18 @@ and `media::probe_image`.
 ```rust
 // crates/engine/src/storage.rs
 pub trait StorageReader: Send + Sync {
-    fn read(&self, job: &StorageJob) -> Result<Vec<u8>, StorageReadError>;
+    fn read(&self, job: &StorageJob) -> Result<StorageBytes, StorageReadError>;
 }
 ```
 
 A read is scheduled, not cached: the reader runs on a worker and its failure
 is the storage's own typed error — there is no substitute value and no empty
-result. `engine::storage::FileSystemReader` is the default, and it reads
-through the file system above. You install your own with
+result. The reader produces the read's payload: a file's bytes, or an archive
+entry's decoded bytes (`engine::storage::StorageBytes`). The extraction filter
+that transforms an archive entry's decoded bytes is not the reader's work: it
+is script code, and it runs on the thread that asked for the bytes.
+`engine::storage::FileSystemReader` is the default, and it reads through the
+file system above. You install your own with
 `Engine::install_storage_reader(reader, config)`, which hands the pool back
 so the storage and the engine share it:
 

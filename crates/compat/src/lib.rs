@@ -31,6 +31,7 @@
 //! | the host seams | [`VideoSource`], [`set_video_source`], [`set_movie_source`], [`AudioDecoder`], [`add_audio_decoder`], [`set_output_latency`], [`set_sound_render_driven`] |
 //! | the request drains | [`take_exit_request`], [`take_bring_to_front_requests`], [`take_update_requests`], [`take_capture_releases`] |
 //! | the startup script | [`exec_storage`] |
+//! | the storage text decoder | [`decode_storage_text`] |
 //! | the plugin architecture | [`NativePlugin`], [`PluginOutcome`], [`PluginRegistry`], [`normalize_plugin_name`], [`builtin_plugin_names`] |
 //!
 //! Every item above states its ownership, its error contract and its panic
@@ -91,6 +92,9 @@ pub use natives::system::{continuous_handler_poll, take_exit_request};
 // The core of `Scripts.execStorage` without the native wrapper: the
 // composition root runs the startup sequence through this.
 pub use natives::scripts::exec_storage;
+// The storage text decoder: a host that reads a storage as text gets the
+// text the engine would have run.
+pub use natives::scripts::decode_storage_text;
 // The built-in `AsyncTrigger` poll: an L4 [`FrameBody`] forwards its
 // `async_trigger_poll` step here (deferred script callbacks).
 pub use natives::async_trigger::async_trigger_poll;

@@ -52,6 +52,8 @@ global) that owns:
 | `decode` / `probe` / `save` | the host image codec closures |
 | `prerendered_storage: HashMap<String, Rc<PrerenderedFont>>` | the loaded pre-rendered fonts, keyed by the resolved placed path |
 | `prerendered: Vec<(PrerenderedKey, Rc<PrerenderedFont>)>` | the font-value → pre-rendered font mappings, in registration order |
+| `font_files: Vec<String>` | the font files the script has looked for, in the order it looked for them |
+| `font_files_read: Vec<String>` | the font files that have been read together already |
 
 It is reached through:
 
@@ -67,6 +69,14 @@ engine owns, which the host attaches to the services container. Every text
 consumer — the visual `Font` native, the `TextRenderBase` plugin, the
 layer-ex draw plugin and `System.addFont` — reaches that one registry
 through `text_service(ctx)`, so there is no second face table in L3.
+
+The **font files** the script looks for are remembered here, and nothing
+else: `Storages.isExistentStorage` notes a name that is spelled like a font
+file, and `System.addFont` hands the noted names to the L2 storage, which
+reads them together — one read of the range the files occupy in the
+archive's data area, and one decode per file, on a worker of its own. The
+wait is at the point of use: the read of the file the script adds waits for
+its own bytes, and the other files are already on their way.
 
 ---
 

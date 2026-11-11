@@ -30,6 +30,7 @@
 
 use std::collections::BTreeSet;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::ops::Range;
 use std::sync::Arc;
 
 use api::error::FsError;
@@ -112,9 +113,14 @@ pub type Result<T> = std::result::Result<T, Xp3Error>;
 /// Stateless per-segment extraction filter (the `xp3filter` hook).
 ///
 /// The L1 reader owns no filter: the caller passes one in and it is invoked
-/// once per segment on the bytes that are about to be appended to the entry
-/// output — after a compressed segment has been inflated and before the bytes
-/// are returned to the reader. The filter may rewrite `buffer` in place.
+/// once per decoded segment, on the bytes the segment decoder produced. The
+/// filter may rewrite `buffer` in place.
+///
+/// The filter is a stage of its own: the decode produces the decoded segments
+/// ([`DecodedEntry`]) and the filter transforms them afterwards
+/// ([`DecodedEntry::apply_extraction_filter`]). The two stages can therefore
+/// run on different threads, and the filter — which is script code — runs on
+/// the thread that asked for the bytes.
 ///
 /// Arguments: `(file_hash, offset, buffer, file_name, archive_name,
 /// file_size)`.
@@ -128,6 +134,74 @@ pub type Result<T> = std::result::Result<T, Xp3Error>;
 ///   (empty when the caller does not know it);
 /// * `file_size` — the entry's total uncompressed size.
 pub type Xp3ExtractionFilter<'a> = dyn Fn(u32, u64, &mut [u8], &str, &str, u64) + 'a;
+
+/// An archive entry's decoded bytes.
+///
+/// The decode is the archive's own work: every segment is inflated and the
+/// segments are assembled in the entry's order. The segments' boundaries are
+/// kept, because the extraction filter transforms one decoded segment at a
+/// time — it sees the bytes the segment decoder produced, never the stored
+/// ones.
+#[derive(Clone, Debug)]
+pub struct DecodedEntry {
+    /// The entry's Adler32 name hash (the `adlr` chunk).
+    pub file_hash: u32,
+    /// The entry's normalized in-archive name.
+    pub name: Arc<str>,
+    /// The entry's total uncompressed size.
+    ///
+    /// A prefix read decodes only the bytes it needs; this is still the
+    /// entry's own size.
+    pub org_size: u64,
+    /// The decoded bytes, assembled in segment order.
+    pub bytes: Vec<u8>,
+    /// The decoded segments, in the order they were decoded.
+    pub segments: Vec<DecodedSegment>,
+}
+
+/// One decoded segment of an entry.
+///
+/// The segment's bytes are contiguous in the entry's decoded bytes, so the
+/// segment is the range they occupy.
+#[derive(Clone, Debug)]
+pub struct DecodedSegment {
+    /// The segment's uncompressed offset within the entry.
+    pub offset: u64,
+    /// The segment's extent in the entry's decoded bytes.
+    pub range: Range<usize>,
+}
+
+impl DecodedEntry {
+    /// Applies the extraction filter to the decoded segments, in order.
+    ///
+    /// The filter transforms the decoded bytes of one segment at a time, with
+    /// the segment's uncompressed offset: it sees the decoded segment, never
+    /// the stored one. A filter cannot change a segment's length — it
+    /// rewrites the bytes in place — so the segments keep their boundaries
+    /// and the entry's offsets stay the ones the decode recorded.
+    ///
+    /// `archive_name` is the logical name of the archive the entry was read
+    /// from; the filter is told which archive the entry came from.
+    pub fn apply_extraction_filter(
+        &mut self,
+        archive_name: &str,
+        filter: &Xp3ExtractionFilter<'_>,
+    ) {
+        let file_hash = self.file_hash;
+        let org_size = self.org_size;
+        let name: &str = &self.name;
+        for segment in &self.segments {
+            filter(
+                file_hash,
+                segment.offset,
+                &mut self.bytes[segment.range.clone()],
+                name,
+                archive_name,
+                org_size,
+            );
+        }
+    }
+}
 
 impl From<std::io::Error> for Xp3Error {
     /// Recover a [`FsError`] wrapped by [`FileReader`] before falling back to
@@ -396,75 +470,99 @@ impl Xp3Archive {
         self.entries.get(normalized.as_str())
     }
 
-    /// Read the full contents of an entry by name.
+    /// Decode the full contents of an entry by name.
+    ///
+    /// The decode is the whole read: the segments are inflated and assembled,
+    /// and the entry's decoded bytes are returned with the segment boundaries
+    /// the extraction filter transforms on. The filter is a separate stage
+    /// ([`DecodedEntry::apply_extraction_filter`]), so a caller may decode on
+    /// one thread and filter on another.
     ///
     /// # Errors
     ///
     /// [`Xp3Error::NotFound`] when the archive has no entry with that name,
     /// [`Xp3Error::Inflate`] when a compressed segment cannot be decoded, and
     /// [`Xp3Error::Io`] or [`Xp3Error::Fs`] when the read fails.
-    pub fn read(&self, fs: &FileSystem, file: &FileState, name: &str) -> Result<Vec<u8>> {
-        self.read_with_filter(fs, file, name, "", None)
-    }
-
-    /// Read the full contents of an entry by name, applying an extraction
-    /// filter to each decoded segment before it is appended.
-    ///
-    /// `archive_name` is passed through to the filter for diagnostics and
-    /// content-filter context; `filter` is never stored (L1 is stateless).
-    ///
-    /// # Errors
-    ///
-    /// The same errors as [`read`](Self::read).
-    pub fn read_with_filter(
+    pub fn read_decoded(
         &self,
         fs: &FileSystem,
         file: &FileState,
         name: &str,
-        archive_name: &str,
-        filter: Option<&Xp3ExtractionFilter<'_>>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<DecodedEntry> {
         let normalized = normalize_in_archive_name(name);
         let entry = self
             .entries
             .get(normalized.as_str())
             .ok_or_else(|| Xp3Error::NotFound(name.to_string()))?;
-        self.read_entry_with_filter(fs, file, entry, archive_name, filter)
+        self.read_entry_decoded(fs, file, entry)
     }
 
-    /// Read the full contents of an entry.
+    /// Decode the full contents of an entry.
     ///
     /// # Errors
     ///
-    /// The same errors as [`read`](Self::read), except that a missing name is
-    /// not one of them: the caller supplies the entry.
-    pub fn read_entry(&self, fs: &FileSystem, file: &FileState, entry: &Entry) -> Result<Vec<u8>> {
-        self.read_entry_with_filter(fs, file, entry, "", None)
-    }
-
-    /// Read the full contents of an entry, applying `filter` to each decoded
-    /// segment in place before it is appended.
-    ///
-    /// The filter is invoked with the running uncompressed offset, so a
-    /// whole-entry read sees the same `(offset, buffer)` sequence a streaming
-    /// read would.
-    ///
-    /// # Errors
-    ///
-    /// The same errors as [`read_entry`](Self::read_entry).
-    pub fn read_entry_with_filter(
+    /// The same errors as [`read_decoded`](Self::read_decoded), except that a
+    /// missing name is not one of them: the caller supplies the entry.
+    pub fn read_entry_decoded(
         &self,
         fs: &FileSystem,
         file: &FileState,
         entry: &Entry,
-        archive_name: &str,
-        filter: Option<&Xp3ExtractionFilter<'_>>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<DecodedEntry> {
         let mut reader = FileReader { fs, file, pos: 0 };
-        self.read_entry_from(&mut reader, entry, archive_name, filter)
+        self.read_entry_decoded_from(&mut reader, 0, entry)
     }
 
-    /// Read the full contents of an entry from an in-memory archive image.
+    /// The byte range the entries' stored data occupies in the archive file.
+    ///
+    /// The range covers every segment of every entry, so a caller that reads
+    /// it holds the stored bytes of every entry it names. The offsets are
+    /// file offsets: they include the archive's base offset, so they address
+    /// the file the archive was opened from.
+    ///
+    /// `None` when an entry has no segment or when the range does not fit the
+    /// file's addressing; an entry without a segment has no stored data.
+    pub fn data_range(&self, entries: &[&Entry]) -> Option<(u64, u64)> {
+        let mut start: Option<u64> = None;
+        let mut end = 0u64;
+        for entry in entries {
+            for segment in entry.segments() {
+                let segment_start = self.base.checked_add(segment.start)?;
+                let segment_end = segment_start.checked_add(segment.arc_size)?;
+                start = Some(match start {
+                    Some(current) => current.min(segment_start),
+                    None => segment_start,
+                });
+                end = end.max(segment_end);
+            }
+        }
+        Some((start?, end))
+    }
+
+    /// Decode the full contents of an entry from a byte range of the archive
+    /// file.
+    ///
+    /// `bytes` holds the archive's data area from the file offset `origin`,
+    /// so the segments' absolute offsets address it from there. The caller
+    /// reads the range with [`Self::data_range`] and decodes every entry the
+    /// range covers from that one read.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`read_entry_decoded`](Self::read_entry_decoded),
+    /// except that a segment outside the range is a corrupt index rather than
+    /// a read failure.
+    pub fn read_entry_decoded_from_range(
+        &self,
+        origin: u64,
+        bytes: &[u8],
+        entry: &Entry,
+    ) -> Result<DecodedEntry> {
+        let mut reader = io::Cursor::new(bytes);
+        self.read_entry_decoded_from(&mut reader, origin, entry)
+    }
+
+    /// Decode the full contents of an entry from an in-memory archive image.
     ///
     /// `bytes` is the whole archive file, including any EXE wrapper, exactly
     /// as it was read from disk; the parser's base offset and each segment's
@@ -472,22 +570,17 @@ impl Xp3Archive {
     /// against `bytes` before it is read, so a corrupt index or a truncated
     /// image is a typed error rather than a short read.
     ///
-    /// Like [`Self::read_entry_with_filter`], `filter` is applied to each
-    /// decoded segment and is never stored.
-    ///
     /// # Errors
     ///
     /// [`Xp3Error::CorruptIndex`] when a segment offset overflows or a
     /// segment runs past the end of the image, [`Xp3Error::Inflate`] when a
     /// compressed segment cannot be decoded, and [`Xp3Error::Io`] when the
     /// read fails.
-    pub fn read_entry_from_bytes(
+    pub fn read_entry_decoded_from_bytes(
         &self,
         bytes: &[u8],
         entry: &Entry,
-        archive_name: &str,
-        filter: Option<&Xp3ExtractionFilter<'_>>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<DecodedEntry> {
         let len = u64::try_from(bytes.len())
             .map_err(|_| Xp3Error::CorruptIndex("archive image is too large to address"))?;
         for seg in entry.segments() {
@@ -503,59 +596,57 @@ impl Xp3Archive {
             }
         }
         let mut reader = io::Cursor::new(bytes);
-        self.read_entry_from(&mut reader, entry, archive_name, filter)
+        self.read_entry_decoded_from(&mut reader, 0, entry)
     }
 
-    /// Read at most `max_len` bytes from the start of an entry by name,
-    /// applying an extraction filter to each decoded segment.
+    /// Decode at most `max_len` bytes from the start of an entry by name.
     ///
-    /// This is the lazy counterpart of [`Self::read_with_filter`]: a raw
-    /// segment is read positionally up to the limit, and a zlib segment is
-    /// inflated only as far as the requested bytes need, so a header probe
-    /// never inflates the whole entry. It concatenates across segments until
+    /// This is the lazy counterpart of [`Self::read_decoded`]: a raw segment
+    /// is read positionally up to the limit, and a zlib segment is inflated
+    /// only as far as the requested bytes need, so a header probe never
+    /// inflates the whole entry. It concatenates across segments until
     /// `max_len` is reached; trailing segments are not read or decoded. This
     /// is this crate's own API: no seekable per-member stream is exposed here,
     /// because this path reads whole files and does not do partial reads.
-    /// Segment order and concatenation are the same as [`Self::read`], and a
-    /// genuine decode or I/O failure is the same typed error. A shorter entry
-    /// returns short; the caller decides whether a short result is an error
-    /// (the middle-layer wrapper treats a short header as a short read).
+    /// Segment order and concatenation are the same as
+    /// [`Self::read_decoded`], and a genuine decode or I/O failure is the same
+    /// typed error. A shorter entry returns short; the caller decides whether
+    /// a short result is an error (the middle-layer wrapper treats a short
+    /// header as a short read).
     ///
     /// # Errors
     ///
-    /// The same errors as [`read_with_filter`](Self::read_with_filter).
-    pub fn read_prefix_with_filter(
+    /// The same errors as [`read_decoded`](Self::read_decoded).
+    pub fn read_prefix_decoded(
         &self,
         fs: &FileSystem,
         file: &FileState,
         name: &str,
-        archive_name: &str,
         max_len: usize,
-        filter: Option<&Xp3ExtractionFilter<'_>>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<DecodedEntry> {
         let normalized = normalize_in_archive_name(name);
         let entry = self
             .entries
             .get(normalized.as_str())
             .ok_or_else(|| Xp3Error::NotFound(name.to_string()))?;
         let mut reader = FileReader { fs, file, pos: 0 };
-        self.read_entry_prefix_from(&mut reader, entry, archive_name, max_len, filter)
+        self.read_entry_prefix_decoded_from(&mut reader, entry, max_len)
     }
 
-    /// Read at most `max_len` bytes of an entry from an in-memory archive
-    /// image, with the same bounds checks as [`Self::read_entry_from_bytes`].
+    /// Decode at most `max_len` bytes of an entry from an in-memory archive
+    /// image, with the same bounds checks as
+    /// [`Self::read_entry_decoded_from_bytes`].
     ///
     /// # Errors
     ///
-    /// The same errors as [`read_entry_from_bytes`](Self::read_entry_from_bytes).
-    pub fn read_entry_prefix_from_bytes(
+    /// The same errors as
+    /// [`read_entry_decoded_from_bytes`](Self::read_entry_decoded_from_bytes).
+    pub fn read_entry_prefix_decoded_from_bytes(
         &self,
         bytes: &[u8],
         entry: &Entry,
-        archive_name: &str,
         max_len: usize,
-        filter: Option<&Xp3ExtractionFilter<'_>>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<DecodedEntry> {
         let len = u64::try_from(bytes.len())
             .map_err(|_| Xp3Error::CorruptIndex("archive image is too large to address"))?;
         for seg in entry.segments() {
@@ -571,19 +662,18 @@ impl Xp3Archive {
             }
         }
         let mut reader = io::Cursor::new(bytes);
-        self.read_entry_prefix_from(&mut reader, entry, archive_name, max_len, filter)
+        self.read_entry_prefix_decoded_from(&mut reader, entry, max_len)
     }
 
-    /// Read a bounded prefix of an entry through any `Read + Seek` source.
-    fn read_entry_prefix_from<R: Read + Seek>(
+    /// Decode a bounded prefix of an entry through any `Read + Seek` source.
+    fn read_entry_prefix_decoded_from<R: Read + Seek>(
         &self,
         reader: &mut R,
         entry: &Entry,
-        archive_name: &str,
         max_len: usize,
-        filter: Option<&Xp3ExtractionFilter<'_>>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<DecodedEntry> {
         let mut out = Vec::new();
+        let mut segments = Vec::new();
         let mut offset: u64 = 0;
         for seg in entry.segments() {
             if out.len() >= max_len {
@@ -608,7 +698,7 @@ impl Xp3Archive {
                 .checked_add(seg.start)
                 .ok_or(Xp3Error::CorruptIndex("segment offset overflow"))?;
             reader.seek(SeekFrom::Start(start))?;
-            let mut decoded = match method {
+            let decoded = match method {
                 SEGM_ENCODE_RAW => {
                     let mut buf = alloc_zeroed(want, "segment too large")?;
                     reader.read_exact(&mut buf)?;
@@ -626,35 +716,37 @@ impl Xp3Archive {
                 }
                 other => return Err(Xp3Error::UnknownSegmentMethod(other, seg.flags)),
             };
-            // The extraction filter runs on the decoded segment with the
-            // uncompressed offset and the normalized in-archive name; a prefix
-            // is the same transform on fewer bytes.
-            if let Some(filter) = filter {
-                filter(
-                    entry.file_hash,
-                    offset,
-                    &mut decoded,
-                    &entry.name,
-                    archive_name,
-                    entry.org_size,
-                );
-            }
+            let begin = out.len();
+            out.extend_from_slice(&decoded);
+            segments.push(DecodedSegment {
+                offset,
+                range: begin..out.len(),
+            });
             offset = offset
                 .checked_add(decoded.len() as u64)
                 .ok_or(Xp3Error::CorruptIndex("entry size overflow"))?;
-            out.extend_from_slice(&decoded);
         }
-        Ok(out)
+        Ok(DecodedEntry {
+            file_hash: entry.file_hash,
+            name: Arc::clone(&entry.name),
+            org_size: entry.org_size,
+            bytes: out,
+            segments,
+        })
     }
 
-    /// Read an entry through any `Read + Seek` source.
-    fn read_entry_from<R: Read + Seek>(
+    /// Decode an entry through any `Read + Seek` source.
+    ///
+    /// `origin` is the file offset the reader's first byte stands for: the
+    /// segments' absolute offsets are addressed relative to it, so a reader
+    /// over a byte range of the archive file decodes the entries the range
+    /// covers.
+    fn read_entry_decoded_from<R: Read + Seek>(
         &self,
         reader: &mut R,
+        origin: u64,
         entry: &Entry,
-        archive_name: &str,
-        filter: Option<&Xp3ExtractionFilter<'_>>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<DecodedEntry> {
         // Note: `protected` (DRM bit) files are read normally, so extracting a
         // protected storage is allowed.
         // Size the output from the segments' own declared sizes rather than
@@ -676,6 +768,7 @@ impl Xp3Archive {
         let mut out = Vec::new();
         out.try_reserve_exact(expected)
             .map_err(|_| Xp3Error::CorruptIndex("entry size cannot be allocated"))?;
+        let mut segments = Vec::with_capacity(entry.segment_count());
         let mut offset: u64 = 0;
         for seg in entry.segments() {
             let arc_len = usize::try_from(seg.arc_size)
@@ -685,11 +778,14 @@ impl Xp3Archive {
                 .base
                 .checked_add(seg.start)
                 .ok_or(Xp3Error::CorruptIndex("segment offset overflow"))?;
+            let start = start.checked_sub(origin).ok_or(Xp3Error::CorruptIndex(
+                "segment lies outside the read range",
+            ))?;
             reader.seek(SeekFrom::Start(start))?;
             reader.read_exact(&mut buf)?;
 
             let method = seg.flags & SEGM_ENCODE_METHOD_MASK;
-            let mut decoded = match method {
+            let decoded = match method {
                 SEGM_ENCODE_RAW => buf,
                 SEGM_ENCODE_ZLIB => {
                     let org_len = usize::try_from(seg.org_size)
@@ -702,34 +798,31 @@ impl Xp3Archive {
                 }
                 other => return Err(Xp3Error::UnknownSegmentMethod(other, seg.flags)),
             };
-            // The extraction filter runs on the decoded segment (after any
-            // inflation) with the uncompressed offset and the normalized
-            // in-archive name.
-            if let Some(filter) = filter {
-                filter(
-                    entry.file_hash,
-                    offset,
-                    &mut decoded,
-                    &entry.name,
-                    archive_name,
-                    entry.org_size,
-                );
-            }
+            let begin = out.len();
+            out.extend_from_slice(&decoded);
+            segments.push(DecodedSegment {
+                offset,
+                range: begin..out.len(),
+            });
             offset = offset
                 .checked_add(decoded.len() as u64)
                 .ok_or(Xp3Error::CorruptIndex("entry size overflow"))?;
-            out.extend_from_slice(&decoded);
         }
         // The entry header's `org_size` must agree with what the segments
         // actually compose; otherwise `stat` would report one size and `read`
-        // return another. This is a real check, not a debug assertion. (The
-        // filter runs ahead of this check but must preserve the byte count.)
+        // return another. This is a real check, not a debug assertion.
         if out.len() as u64 != entry.org_size {
             return Err(Xp3Error::CorruptIndex(
                 "segment sizes disagree with info.org_size",
             ));
         }
-        Ok(out)
+        Ok(DecodedEntry {
+            file_hash: entry.file_hash,
+            name: Arc::clone(&entry.name),
+            org_size: entry.org_size,
+            bytes: out,
+            segments,
+        })
     }
 
     // -- internals ----------------------------------------------------------
@@ -1255,20 +1348,23 @@ mod tests {
         let mut reader = io::Cursor::new(image.as_slice());
         assert_eq!(
             archive
-                .read_entry_prefix_from(&mut reader, &entry, "test.xp3", 6, None)
-                .unwrap(),
+                .read_entry_prefix_decoded_from(&mut reader, &entry, 6)
+                .unwrap()
+                .bytes,
             b"AAAABB"
         );
         assert_eq!(
             archive
-                .read_entry_prefix_from(&mut reader, &entry, "test.xp3", 12, None)
-                .unwrap(),
+                .read_entry_prefix_decoded_from(&mut reader, &entry, 12)
+                .unwrap()
+                .bytes,
             b"AAAABBBBBBCC"
         );
         assert_eq!(
             archive
-                .read_entry_prefix_from(&mut reader, &entry, "test.xp3", 64, None)
-                .unwrap(),
+                .read_entry_prefix_decoded_from(&mut reader, &entry, 64)
+                .unwrap()
+                .bytes,
             b"AAAABBBBBBCCCCCCCC"
         );
     }
@@ -1384,10 +1480,11 @@ mod tests {
              _name: &str,
              _archive: &str,
              _size: u64| { prefix_decoded.set(prefix_decoded.get() + buffer.len()) };
-        let prefix = archive
-            .read_entry_prefix_from(&mut prefix_reader, &entry, "", 36, Some(&prefix_filter))
+        let mut prefix = archive
+            .read_entry_prefix_decoded_from(&mut prefix_reader, &entry, 36)
             .expect("prefix read");
-        assert_eq!(prefix, payload[..36]);
+        prefix.apply_extraction_filter("", &prefix_filter);
+        assert_eq!(prefix.bytes, payload[..36]);
         let prefix_bytes = prefix_reader.bytes_read;
         let prefix_decoded = prefix_decoded.get();
 
@@ -1404,14 +1501,19 @@ mod tests {
              _name: &str,
              _archive: &str,
              _size: u64| { whole_decoded.set(whole_decoded.get() + buffer.len()) };
-        let whole = archive
-            .read_entry_from(&mut whole_reader, &entry, "", Some(&whole_filter))
+        let mut whole = archive
+            .read_entry_decoded_from(&mut whole_reader, 0, &entry)
             .expect("whole read");
-        assert_eq!(whole, payload);
+        whole.apply_extraction_filter("", &whole_filter);
+        assert_eq!(whole.bytes, payload);
         let whole_bytes = whole_reader.bytes_read;
         let whole_decoded = whole_decoded.get();
 
-        assert_eq!(prefix.len(), 36, "decoded output must stop at max_len");
+        assert_eq!(
+            prefix.bytes.len(),
+            36,
+            "decoded output must stop at max_len"
+        );
         assert_eq!(
             prefix_decoded, 36,
             "the filter sees exactly max_len decoded bytes"
@@ -1444,9 +1546,9 @@ mod tests {
             bytes_read: 0,
         };
         let prefix = archive
-            .read_entry_prefix_from(&mut reader, &entry, "", 7, None)
+            .read_entry_prefix_decoded_from(&mut reader, &entry, 7)
             .expect("prefix read");
-        assert_eq!(prefix, &stored[..7]);
+        assert_eq!(prefix.bytes, &stored[..7]);
         assert_eq!(reader.bytes_read, 7);
 
         let mut reader = CountingReader {
@@ -1455,9 +1557,9 @@ mod tests {
             bytes_read: 0,
         };
         let empty = archive
-            .read_entry_prefix_from(&mut reader, &entry, "", 0, None)
+            .read_entry_prefix_decoded_from(&mut reader, &entry, 0)
             .expect("zero-length prefix");
-        assert!(empty.is_empty());
+        assert!(empty.bytes.is_empty());
         assert_eq!(reader.bytes_read, 0);
     }
 

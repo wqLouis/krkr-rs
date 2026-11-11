@@ -11,9 +11,12 @@
 //!
 //! * L1 (`fs::xp3`) owns the stateless per-segment hook
 //!   ([`fs::xp3::Xp3ExtractionFilter`]); the filter is passed in and never
-//!   stored there.
-//! * L2 (`engine_api::Storage`) owns the installed filter and hands it to L1 on
-//!   every archive read (`engine_api::Storage::xp3_extraction_filter`).
+//!   stored there. It is applied to the decoded segments of an entry
+//!   ([`fs::xp3::DecodedEntry::apply_extraction_filter`]), after the decode.
+//! * L2 (`engine_api::Storage`) owns the installed filter and applies it to
+//!   the decoded bytes, on the thread that asked for them
+//!   (`engine_api::Storage::xp3_extraction_filter`). The decode it transforms
+//!   may have run on the read pool.
 //! * L3 (this module) registers the `Storages` members, retains the TJS
 //!   closures in [`CompatServices::state`], and installs an L2 filter that
 //!   marshals each decoded segment to the retained TJS closure. The content

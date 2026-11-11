@@ -55,6 +55,21 @@ pub(crate) struct ResourceResolver {
     prerendered_storage: Map<String, Rc<PrerenderedFont>>,
     /// Font-value → pre-rendered font mappings, in registration order.
     prerendered: Vec<(PrerenderedKey, Rc<PrerenderedFont>)>,
+    /// The font files the script has looked for, in the order it looked for
+    /// them.
+    ///
+    /// The font files of a game sit next to each other in the archive's data
+    /// area, so they are read together: one read of the range they occupy
+    /// and one decode per file, on a worker of its own. The names are the
+    /// storage names the script asked for, so the read that follows finds
+    /// the bytes under the same name.
+    font_files: Vec<String>,
+    /// The font files that have been read together already.
+    ///
+    /// A font file is read together once: the read that follows takes the
+    /// bytes from that read, and a later read of the same file reads the
+    /// file again.
+    font_files_read: Vec<String>,
 }
 
 /// The shared L2 text service, mutably.
@@ -80,6 +95,31 @@ pub(crate) fn resource_state(ctx: &CompatCtx) -> std::cell::RefMut<'_, ResourceR
 }
 
 impl ResourceResolver {
+    /// Records a font file the script looked for.
+    ///
+    /// The file is read together with the other font files the script looked
+    /// for, when one of them is added.
+    pub(crate) fn note_font_file(&mut self, name: &str) {
+        if self.font_files_read.iter().any(|known| known == name) {
+            // The file was read together already: a later read of it reads
+            // the file again.
+            return;
+        }
+        if !self.font_files.iter().any(|known| known == name) {
+            self.font_files.push(name.to_string());
+        }
+    }
+
+    /// The font files that have not been read together yet.
+    ///
+    /// The files are taken out of the list: a font file is read together
+    /// once, and a later read of it reads the file again.
+    pub(crate) fn take_font_files_to_read(&mut self) -> Vec<String> {
+        let files = std::mem::take(&mut self.font_files);
+        self.font_files_read.extend(files.iter().cloned());
+        files
+    }
+
     /// Install (or replace) the host image codec closures.
     pub(crate) fn set_codec(
         &mut self,
@@ -327,7 +367,7 @@ fn try_face(ctx: &CompatCtx, service: &mut TextEngine, face: &str) -> Result<Fon
 /// Only a file-shaped name is worth trying as a storage path; the font
 /// extensions are the OpenType/TrueType families the reference enumerates
 /// (`FontImpl.cpp:166-183`).
-fn is_font_file_name(face: &str) -> bool {
+pub(crate) fn is_font_file_name(face: &str) -> bool {
     let face = strip_file_media(face);
     let extension = face
         .rsplit_once('.')

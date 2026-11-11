@@ -5,12 +5,15 @@
 //! therefore observe *which* read ran and *when*, without a timing
 //! assumption.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 
 use api::error::FsError;
 use engine::storage::{
-    FileSystemReader, StorageJob, StorageOutcome, StoragePoolConfig, StorageReadPool, StorageReader,
+    FileSystemReader, StorageBytes, StorageJob, StorageOutcome, StoragePoolConfig, StorageReadPool,
+    StorageReader,
 };
 use engine::{Engine, EngineParts, GameFrame, Map, Storage, StorageReadError};
 use render::{PipelineConfig, begin_render_state, create_render_pipeline};
@@ -63,6 +66,7 @@ fn job_key(job: &StorageJob) -> String {
     match job {
         StorageJob::Disk { path, .. } => path.display().to_string(),
         StorageJob::Archive { in_arc, .. } => in_arc.clone(),
+        StorageJob::ArchiveRange { archive_name, .. } => archive_name.clone(),
     }
 }
 
@@ -131,7 +135,7 @@ impl GatedReader {
 }
 
 impl StorageReader for GatedReader {
-    fn read(&self, job: &StorageJob) -> Result<Vec<u8>, StorageReadError> {
+    fn read(&self, job: &StorageJob) -> Result<StorageBytes, StorageReadError> {
         let key = job_key(job);
         {
             let mut started = self.started.lock().unwrap_or_else(PoisonError::into_inner);
@@ -215,7 +219,10 @@ fn an_optimistic_lookup_answers_the_size_and_schedules_the_read() {
 
     gate.open();
     match handle.await_outcome() {
-        StorageOutcome::Ready(bytes) => assert_eq!(&(*bytes)[..], PAYLOAD, "the bytes"),
+        StorageOutcome::Ready(payload) => match payload.as_ref() {
+            StorageBytes::File(bytes) => assert_eq!(bytes.as_slice(), PAYLOAD, "the bytes"),
+            StorageBytes::Archive { .. } => panic!("a disk file is read verbatim"),
+        },
         other => panic!("the read succeeded, got {other:?}"),
     }
 }
@@ -328,6 +335,126 @@ fn the_later_mount_wins_the_scheduled_read() {
         storage.read("shared.txt").expect("the read succeeds"),
         b"from-patch".to_vec(),
         "the archive mounted last serves the entry"
+    );
+}
+
+/// A reader that records the thread every read ran on, so a test can show
+/// which thread did the work.
+struct ThreadRecordingReader {
+    /// The reader the recording one delegates to.
+    inner: FileSystemReader,
+    /// The threads the reads ran on, in the order they ran.
+    threads: Mutex<Vec<thread::ThreadId>>,
+}
+
+impl ThreadRecordingReader {
+    /// A reader that records every read's thread.
+    fn new() -> Self {
+        Self {
+            inner: FileSystemReader,
+            threads: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The threads the reads ran on.
+    fn threads(&self) -> Vec<thread::ThreadId> {
+        self.threads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl StorageReader for ThreadRecordingReader {
+    fn read(&self, job: &StorageJob) -> Result<StorageBytes, StorageReadError> {
+        self.threads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(thread::current().id());
+        self.inner.read(job)
+    }
+}
+
+/// An extraction filter does not keep the read on the calling thread: the
+/// decode runs on the pool, and the filter transforms the decoded bytes
+/// afterwards, on the thread that asked for them.
+///
+/// The reference applies the filter to the decoded bytes — the filter runs on
+/// the bytes the segment decoder produced
+/// (`reference/krkr2/cpp/core/archive/xp3/XP3Archive.cpp:973-1004`) — so the
+/// decode and the filter are two stages, and only the filter needs the
+/// script's thread.
+#[test]
+fn a_filtered_read_decodes_on_the_pool_and_filters_on_the_calling_thread() {
+    let key = 0x5Au8;
+    let plain = b"decrypted archive payload".to_vec();
+    let cipher: Vec<u8> = plain.iter().map(|byte| byte ^ key).collect();
+    let xp3 = build_xp3(&[("secret.bin", &cipher, false)]);
+
+    // Without a pool the read is inline: the stored bytes come back
+    // unchanged, and the filter transforms them.
+    let mut inline = mount_memory_with_archives(&[("data.xp3", xp3.as_slice())], &["data.xp3"]);
+    assert_eq!(
+        inline.read("secret.bin").expect("the read succeeds"),
+        cipher,
+        "an unfiltered read returns the stored bytes"
+    );
+    inline.xp3_extraction_filter = Some(Box::new(
+        move |_hash: u32,
+              _offset: u64,
+              buffer: &mut [u8],
+              _file_name: &str,
+              _archive_name: &str,
+              _file_size: u64| {
+            for byte in buffer.iter_mut() {
+                *byte ^= key;
+            }
+        },
+    ));
+    assert_eq!(
+        inline.read("secret.bin").expect("the read succeeds"),
+        plain,
+        "the inline read filters the decoded bytes"
+    );
+
+    // With a pool the decode runs on a worker, and the filter still runs on
+    // the thread that asked for the bytes.
+    let reader = Arc::new(ThreadRecordingReader::new());
+    let pool = Arc::new(StorageReadPool::new(reader.clone(), config(1)).expect("pool"));
+    let mut storage = storage_with_pool(&pool, &[("data.xp3", xp3.as_slice())], &["data.xp3"]);
+    let filter_thread: Rc<RefCell<Option<thread::ThreadId>>> = Rc::new(RefCell::new(None));
+    let filter_thread_in_filter = Rc::clone(&filter_thread);
+    storage.xp3_extraction_filter = Some(Box::new(
+        move |_hash: u32,
+              _offset: u64,
+              buffer: &mut [u8],
+              _file_name: &str,
+              _archive_name: &str,
+              _file_size: u64| {
+            *filter_thread_in_filter.borrow_mut() = Some(thread::current().id());
+            for byte in buffer.iter_mut() {
+                *byte ^= key;
+            }
+        },
+    ));
+
+    let bytes = storage.read("secret.bin").expect("the read succeeds");
+    assert_eq!(
+        bytes, plain,
+        "the pooled read filters the decoded bytes the same way"
+    );
+    assert_eq!(pool.stats().reads, 1, "the pool ran the read");
+    let read_threads = reader.threads();
+    assert_eq!(read_threads.len(), 1, "the pool ran the read once");
+    assert_ne!(
+        read_threads[0],
+        thread::current().id(),
+        "the decode ran off the calling thread"
+    );
+    assert_eq!(
+        *filter_thread.borrow(),
+        Some(thread::current().id()),
+        "the filter ran on the thread that asked for the bytes"
     );
 }
 

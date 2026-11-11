@@ -137,7 +137,8 @@ impl Archive {
     /// Read one entry's bytes.
     fn read(&self, entry: &fs::xp3::Entry) -> Result<Vec<u8>, ToolError> {
         self.index
-            .read_entry(&self.filesystem, &self.file, entry)
+            .read_entry_decoded(&self.filesystem, &self.file, entry)
+            .map(|decoded| decoded.bytes)
             .map_err(ToolError::Archive)
     }
 }

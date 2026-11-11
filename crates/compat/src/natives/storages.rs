@@ -45,6 +45,7 @@ use tjs::{Engine, NativeClassBuilder, NativeMethodDef, VAL_OBJECT, VAL_STRING, V
 use crate::binding;
 use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
+use crate::resource::{is_font_file_name, resource_state};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 
@@ -85,16 +86,22 @@ pub(crate) fn normalize_storage_name(name: &str) -> String {
     }
 }
 
-/// `TVPExtractStorageExt`: the extension including the dot, or `""`.
-fn extract_storage_ext(name: &str) -> String {
+/// The extension of a storage name, including the dot, or `None` when the
+/// name carries none.
+///
+/// The scan stops at a path delimiter or the archive delimiter, so
+/// `a/b.c/d` has no extension. The one rule every name dissection uses: the
+/// `Storages` members and the image path's extension suggestion read the
+/// extension through it.
+pub(crate) fn extract_storage_ext(name: &str) -> Option<&str> {
     for (i, c) in name.char_indices().rev() {
         match c {
-            '\\' | '/' | '>' => return String::new(),
-            '.' => return name[i..].to_string(),
+            '\\' | '/' | '>' => return None,
+            '.' => return Some(&name[i..]),
             _ => {}
         }
     }
-    String::new()
+    None
 }
 
 /// `TVPExtractStorageName`: the final path component.
@@ -115,14 +122,10 @@ fn extract_storage_path(name: &str) -> String {
 
 /// `TVPChopStorageExt`: the name without its extension (dot removed).
 fn chop_storage_ext(name: &str) -> String {
-    for (i, c) in name.char_indices().rev() {
-        match c {
-            '\\' | '/' | '>' => return name.to_string(),
-            '.' => return name[..i].to_string(),
-            _ => {}
-        }
+    match extract_storage_ext(name) {
+        Some(extension) => name[..name.len() - extension.len()].to_string(),
+        None => name.to_string(),
     }
-    name.to_string()
 }
 
 /// Positive-result cache for `getPlacedPath` (the reference's
@@ -396,6 +399,14 @@ extern "C" fn native_is_existent_storage(
     // SAFETY: the host keeps the attached storage alive for the VM lifetime.
     match unsafe { &*storage }.exists(name) {
         Ok(exists) => {
+            if exists && is_font_file_name(name) {
+                // A font file the script looks for is read together with the
+                // other font files it looks for: they sit next to each other
+                // in the archive's data area, so one read of the range they
+                // occupy brings them in, and one decode per file, on a
+                // worker of its own, brings them back.
+                resource_state(&ctx).note_font_file(name);
+            }
             set_bool(out, exists);
             0
         }
@@ -422,7 +433,12 @@ extern "C" fn native_extract_storage_ext(
     let Some(name) = args.first() else {
         return report_error(out_error, "Storages.extractStorageExt requires 1 argument");
     };
-    set_string_out(out, services, &extract_storage_ext(&value_as_string(name)));
+    let name = value_as_string(name);
+    set_string_out(
+        out,
+        services,
+        extract_storage_ext(&name).unwrap_or_default(),
+    );
     0
 }
 
