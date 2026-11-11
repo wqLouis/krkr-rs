@@ -18,10 +18,10 @@ says how long the paths take and where the time goes.
 
 | | |
 |---|---|
-| Host | x86-64 Linux, 12 cores, 31 GB RAM; the game directory is a FUSE mount |
+| Host | x86-64 Linux, 12 cores, 31 GB RAM; the game directory is on the in-kernel NTFS driver (Linux 7.2), not a FUSE mount |
 | Game | `【KRKR】魔女的夜宴` — 8 archives, 46 239 members, 1.16 GB; the scenarios are 101 PSB containers (`*.ks.scn`, ~1 MB each) |
 | Build | `cargo build --release` (opt-level 3, thin LTO, one codegen unit); the profile binary is the same build with symbols and line tables |
-| Engine load | `krkr --headless --frames 200 --base-dir <game>` — the whole startup, then 200 frames |
+| Engine load | `krkr --headless --frames 200 --base-dir <game>` — the whole startup, then 200 frames. The headless loop paces every frame at the frame-rate limit (60 fps by default), so the frame count adds a sleep per frame: measure the startup with `--frames 1`, and read a longer run as the startup plus that sleep. |
 | Scene load | the engine's own path for one scenario: the archive member is read, the PSB container is parsed, and the value tree is converted into the TJS objects a script sees |
 
 **The three instruments.**
@@ -69,8 +69,9 @@ One headless run of the game (release build):
 | first frame | 804.4 ms after open | the whole run, process start to the first presented frame |
 
 The mount time is the one number that moves between runs (32 ms – 135 ms
-on the same build): the game directory is a FUSE mount, so the index read
-waits on the filesystem. Everything else is stable.
+on the same build): the index read waits on the filesystem. Everything else
+is stable. The same 1.16 GB read from a tmpfs saves at most 17 ms of the
+startup, so the filesystem is not the startup's cost.
 
 ### 2.2 The startup is script-bound
 
@@ -102,27 +103,45 @@ and executed by the vendored VM.**
 
 ### 2.3 The profile
 
-The profile of a whole headless run (896 CPU-time samples):
+The startup — process to first frame — is **0.70 s**. A longer run adds a paced
+sleep per frame (60 fps by default), so `--frames 30` measures 1.22–1.25 s of
+which 0.48 s is that sleep; the startup itself is the 0.70 s.
+
+The flat profile of the startup (the flat profile is the honest one: a
+call-graph profile truncates every chain inside the inflate and reports the
+inflate as far smaller than it is):
 
 | self time | what |
 |---|---|
 | 36 % | the C library — `malloc`/`free` under the VM's allocation churn |
-| 10 % | `miniz_oxide` — the zlib inflate of the archive index and of the members the startup reads |
-| ~6 % | `TJS::parser::parse` + the bison tables — the TJS **compiler** |
-| ~4 % | `TJS::tTJSLexicalAnalyzer::GetToken` — the TJS **lexer** |
+| 11.4 % | the zlib inflate — the six embedded fonts (`sysscn/sourcehansansjp-*.otf`, 27.3 MB, 98.7 ms), not the scripts |
+| ~13 % inclusive | `TJS::parser::parse` — the TJS **compiler** (6.2 % self) |
+| ~11 % inclusive | `tTJSScriptBlock::SetText` — the materialisation and the parse |
 | the rest | the interpreter, the engine's projection and the audio resampler |
 
 The shape is the same as the reference engine's: a KiriKiri game's startup
-is dominated by compiling and running its scripts.
+is dominated by compiling and running its scripts. The reference pays the
+same font cost (`reference/krkr2/cpp/core/visual/FontImpl.cpp:142-158` reads
+the whole font file).
 
 ### 2.4 What is left to win here
 
+The floor, measured: with every read and inflate free the startup is 0.57 s.
+The storage is therefore not the whole story, and prefetching the script
+reads is worth at most 8 ms of a 630 ms phase — it is not worth doing.
+
 | lever | state |
 |---|---|
-| the TJS2 C++ flags (`-O3`, `-O2 -flto`) | the objects become LLVM bitcode and only the Android link validates them, so it needs a device A/B (`TODO.md` §17) |
+| the six embedded fonts | 98.7 ms; one contiguous 23.3 MB run in the archive's data area, so they can be decoded in parallel |
+| the host font scan | 47 ms, and it runs *inside* the first `System.addFont`, so a lazy registry does not take it off the critical path |
+| the VM's page faults | 55 366 faults and 377 MB of RSS — ~50–110 ms |
+| the storage namespace | an index by the first path component would save ~20–30 ms |
+| the archive mount | eight independent index parses, ~15–18 ms, parallelisable |
+| the read pool | dead while the XP3 filter seam is installed (`crates/engine/src/storage.rs:2160-2164`), so every read runs on the calling thread; the reference filters the *decoded* bytes, so only the filter needs the script's thread |
+| the TJS2 C++ flags | **measured, no effect**: `-O2` gives 1.232–1.242 s and `-O3` gives 1.238–1.251 s on the same workload. The `-flto` arm still needs a device A/B (`TODO.md` §17) |
 | the allocator (`mimalloc`) | measured and rejected (`TODO.md` §17) |
-| the zlib inflate | `flate2` currently inflates with the pure-Rust `miniz_oxide`; the system zlib is typically 1.5–2× faster, and `flate2`'s `zlib` feature would do it — but the feature links the C library, which the Android target would then need |
-| the font registry scan | ~30 ms; a lazy registry would move it out of the startup, at the cost of a script-visible change |
+| the zlib backend | `flate2` inflates with `zlib-rs`; the system zlib measures 277 MB/s against it and would save ~45 ms, but the feature links the C library, which the Android target would then need |
+| compiling the scripts ahead of time | measured on the game's own 742 KB `mainwindow.tjs`: compile 45.4 ms, bytecode run 6.1 ms, source run 28.9 ms — so ~65–70 ms of the startup, but the bytecode round trip is broken today (`x += 2` and `x++` fail when a script comes from bytecode), and the reference's round trip is broken the same way |
 
 ## 3. The scene load
 

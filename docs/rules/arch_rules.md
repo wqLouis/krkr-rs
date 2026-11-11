@@ -420,6 +420,7 @@ so it is not cited here: the pages that state each rule in full are in
 | D39 | Presentation is one rule: Fit with letterbox. No mode enum, no scaling key |
 | D40 | The VM ↔ device translation lives in L2, at the L2 ↔ L3 boundary, and is applied when projecting and reading back |
 | D41 | The translation is embedded in L2; L3 never sees it and keeps its VM-coordinate contract |
+| D42 | The TJS VM is replaced column by column, each column verified against the reference's own C++ before it is used, and the column it replaces is deleted in the same change |
 
 ---
 
