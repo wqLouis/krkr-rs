@@ -6,6 +6,13 @@
 //! lives in the caller-owned [`VulkanState`]. No process globals, no
 //! `&mut self`, no hidden caches.
 //!
+//! The logical device is created on its own. A state that presents to a
+//! window pairs the device with a [`VulkanPresentation`] — the surface, the
+//! swapchain and the frame slots — and a state that renders offscreen pairs
+//! it with nothing. That is what makes the GPU path reachable on a machine
+//! that has a GPU but no display: the device, its queues and its
+//! swapchain-independent resources do not depend on a surface.
+//!
 //! Implemented:
 //!
 //! * instance creation with `VK_KHR_surface` and the available platform
@@ -212,6 +219,9 @@ impl VulkanPipeline {
 
     /// Creates the surface and render state from an explicit display handle.
     ///
+    /// The device is created with the surface, so the queue family it selects
+    /// supports presentation as well as graphics.
+    ///
     /// # Errors
     ///
     /// Returns [`RenderError`] when surface/device/swapchain creation fails.
@@ -244,23 +254,27 @@ impl VulkanPipeline {
             ),
         })?;
 
-        let device_bundle = device::create_device(
-            &self.instance_guard.instance,
+        let device = match VulkanDevice::create(
+            self.instance_guard.clone(),
             self.physical_device,
-            &surface_loader,
-            surface,
-        )
-        .inspect_err(|_error| {
-            // SAFETY: `surface` was created here and no swapchain uses it yet.
-            unsafe { surface_loader.destroy_surface(surface, None) };
-        })?;
+            &self.memory_properties,
+            device::PresentTarget::Surface(&surface_loader, surface),
+        ) {
+            Ok(device) => device,
+            Err(error) => {
+                // SAFETY: `surface` was created here and no swapchain uses it
+                // yet; the device state destroys the device itself.
+                unsafe { surface_loader.destroy_surface(surface, None) };
+                return Err(error);
+            }
+        };
 
         let swapchain_loader =
-            ash::khr::swapchain::Device::new(&self.instance_guard.instance, &device_bundle.device);
+            ash::khr::swapchain::Device::new(&self.instance_guard.instance, &device.device);
 
         let swapchain = match swapchain::create(
             &swapchain::SurfaceContext {
-                device: &device_bundle.device,
+                device: &device.device,
                 physical_device: self.physical_device,
                 surface_loader: &surface_loader,
                 swapchain_loader: &swapchain_loader,
@@ -272,43 +286,22 @@ impl VulkanPipeline {
         ) {
             Ok(swapchain) => swapchain,
             Err(error) => {
-                // SAFETY: partial resources are destroyed here; nothing else
-                // references them.
-                unsafe {
-                    device_bundle.device.destroy_device(None);
-                    surface_loader.destroy_surface(surface, None);
-                }
-                return Err(error);
-            }
-        };
-
-        let resources = match pipelines::PipelineResources::create(
-            &device_bundle.device,
-            &self.memory_properties,
-        ) {
-            Ok(resources) => resources,
-            Err(error) => {
-                // SAFETY: tear down everything created above.
-                unsafe {
-                    swapchain.destroy(&device_bundle.device, &swapchain_loader);
-                    swapchain.destroy_render_pass(&device_bundle.device);
-                    device_bundle.device.destroy_device(None);
-                    surface_loader.destroy_surface(surface, None);
-                }
+                // SAFETY: the surface was created here and no swapchain uses
+                // it; the device state destroys the device itself.
+                unsafe { surface_loader.destroy_surface(surface, None) };
                 return Err(error);
             }
         };
 
         let pipelines =
-            match pipelines::create(&device_bundle.device, swapchain.render_pass, &resources) {
+            match pipelines::create(&device.device, swapchain.render_pass, &device.resources) {
                 Ok(pipelines) => pipelines,
                 Err(error) => {
-                    // SAFETY: tear down everything created above.
+                    // SAFETY: the swapchain and the surface were created here
+                    // and nothing else references them.
                     unsafe {
-                        resources.destroy(&device_bundle.device);
-                        swapchain.destroy(&device_bundle.device, &swapchain_loader);
-                        swapchain.destroy_render_pass(&device_bundle.device);
-                        device_bundle.device.destroy_device(None);
+                        swapchain.destroy(&device.device, &swapchain_loader);
+                        swapchain.destroy_render_pass(&device.device);
                         surface_loader.destroy_surface(surface, None);
                     }
                     return Err(error);
@@ -316,28 +309,27 @@ impl VulkanPipeline {
             };
 
         // From here on the guard owns teardown: any `?` below destroys the
-        // device, surface, swapchain, pipelines and whatever else was built.
+        // surface, the swapchain, the pipelines and whatever else was built.
+        // The device and its own resources are destroyed with the device
+        // state, which outlives the guard.
         let mut teardown = BeginTeardown {
-            device: &device_bundle.device,
+            device: &device.device,
             surface_loader: &surface_loader,
             swapchain_loader: &swapchain_loader,
             surface,
             swapchain: &swapchain,
             pipelines: &pipelines,
-            resources: &resources,
             frames: Vec::new(),
             render_finished: Vec::new(),
-            upload: None,
-            offscreen: None,
             armed: true,
         };
 
-        teardown.frames = create_frames(&device_bundle.device, device_bundle.queue_family_index)?;
+        teardown.frames = create_frames(&device.device, device.queue_family_index)?;
         let image_count = swapchain.images.len().max(1);
         for _ in 0..image_count {
-            // SAFETY: `device_bundle.device` is live.
+            // SAFETY: `device.device` is live.
             let semaphore = unsafe {
-                device_bundle
+                device
                     .device
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
             }
@@ -350,72 +342,42 @@ impl VulkanPipeline {
             teardown.render_finished.push(semaphore);
         }
 
-        let upload = texture::UploadRing::new(
-            &device_bundle.device,
-            device_bundle.queue_family_index,
-            texture::UPLOAD_SLOTS,
-        )?;
-        teardown.upload = Some(upload);
-        let (offscreen_pool, offscreen_command, offscreen_fence) =
-            create_offscreen_resources(&device_bundle.device, device_bundle.queue_family_index)?;
-        // Copy the handles into the guard so a late failure frees them; ash
-        // handles are cheap `Copy` values.
-        teardown.offscreen = Some((offscreen_pool, offscreen_fence));
-
         // Success: transfer ownership to the state and disarm the guard.
         teardown.armed = false;
         let frames = std::mem::take(&mut teardown.frames);
         let render_finished = std::mem::take(&mut teardown.render_finished);
-        // The ring is not `Copy`, so it is taken back out of the guard before
-        // the guard is dropped.
-        let upload = teardown
-            .upload
-            .take()
-            .expect("the upload ring was created above");
         drop(teardown);
 
         let surface_size = (swapchain.extent.width, swapchain.extent.height);
         let fences = FrameFences::new(frame_slot_fences(&frames));
 
-        let state = VulkanState {
-            _instance_guard: self.instance_guard.clone(),
-            physical_device: self.physical_device,
-            device: device_bundle.device,
-            graphics_queue: device_bundle.graphics_queue,
-            present_queue: device_bundle.present_queue,
-            surface_loader,
-            swapchain_loader,
-            surface,
-            display_handle: *display,
-            window_handle: *window,
-            preferred_format: self.preferred_format,
-            swapchain,
-            resources,
-            pipelines,
-            frame_pass: None,
-            frame_targets: (0..MAX_FRAMES_IN_FLIGHT).map(|_| None).collect(),
-            frames,
-            fences,
-            images_in_flight: vec![vk::Fence::null(); image_count],
-            render_finished,
-            frame_in_flight: 0,
-            textures: Map::default(),
-            offscreen: Map::default(),
-            render_targets: Map::default(),
-            effect: None,
-            upload,
-            offscreen_pool,
-            offscreen_command,
-            offscreen_fence,
-            readback: RefCell::new(texture::StagingBuffer::default()),
-            surface_size,
-            frame_index: 0,
-            swapchain_ready: true,
-            swapchain_presented: false,
-            retired_swapchain: None,
-            present_fault: None,
-            last_timings: None,
-        };
+        let state = VulkanState::Presenting(Box::new(VulkanPresentingState {
+            device,
+            presentation: VulkanPresentation {
+                surface_loader,
+                swapchain_loader,
+                surface,
+                display_handle: *display,
+                window_handle: *window,
+                preferred_format: self.preferred_format,
+                swapchain,
+                retired_swapchain: None,
+                pipelines,
+                frame_pass: None,
+                frame_targets: (0..MAX_FRAMES_IN_FLIGHT).map(|_| None).collect(),
+                frames,
+                fences,
+                images_in_flight: vec![vk::Fence::null(); image_count],
+                render_finished,
+                frame_in_flight: 0,
+                surface_size,
+                frame_index: 0,
+                swapchain_ready: true,
+                swapchain_presented: false,
+                present_fault: None,
+                last_timings: None,
+            },
+        }));
 
         Ok((
             Surface {
@@ -425,6 +387,28 @@ impl VulkanPipeline {
                 kind: StateKind::Vulkan(Box::new(state)),
             },
         ))
+    }
+
+    /// Creates a render state that renders offscreen, without a surface.
+    ///
+    /// The logical device is created on its own: a graphics queue, no surface
+    /// and no swapchain. A scene can then be rendered into an offscreen
+    /// target and read back on a machine that has a GPU but no display.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::DeviceUnavailable`] when the logical device or
+    /// one of its resources cannot be created.
+    pub(crate) fn begin_offscreen(&self) -> Result<RenderState, RenderError> {
+        let device = VulkanDevice::create(
+            self.instance_guard.clone(),
+            self.physical_device,
+            &self.memory_properties,
+            device::PresentTarget::Offscreen,
+        )?;
+        Ok(RenderState {
+            kind: StateKind::Vulkan(Box::new(VulkanState::Offscreen(Box::new(device)))),
+        })
     }
 
     /// Recreates the swapchain after a size change.
@@ -450,29 +434,43 @@ impl VulkanPipeline {
                 });
             }
         };
+        let VulkanState::Presenting(presenting) = &mut **vstate else {
+            return Err(no_surface_error());
+        };
+        let presenting = &mut **presenting;
+        let VulkanPresentingState {
+            device: device_state,
+            presentation,
+            ..
+        } = presenting;
 
-        if surface_handle != vstate.surface {
+        if surface_handle != presentation.surface {
             return Err(RenderError::InvalidArgument {
                 message: "the surface does not belong to this render state".to_owned(),
             });
         }
 
-        let current = vstate.swapchain.extent;
+        let current = presentation.swapchain.extent;
         // A surface event that repeats the extent the swapchain already has
         // cannot change the frame the display shows, so it does not rebuild
         // one. An unusable swapchain is always rebuilt, even for the same
         // size, because the retry is what makes it usable again.
-        if vstate.swapchain_ready && (current.width, current.height) == size {
-            vstate.surface_size = size;
+        if presentation.swapchain_ready && (current.width, current.height) == size {
+            presentation.surface_size = size;
             return Ok(SurfaceEvent::Resized(current.width, current.height));
         }
-        vstate.surface_size = size;
-        let device = vstate.device.clone();
+        presentation.surface_size = size;
+        let device = device_state.device.clone();
         // `recreate_swapchain` idles the device before touching the swapchain.
-        recreate_swapchain(&device, vstate, surface_handle)?;
+        recreate_swapchain(
+            &device,
+            device_state.physical_device,
+            presentation,
+            surface_handle,
+        )?;
         Ok(SurfaceEvent::Resized(
-            vstate.swapchain.extent.width,
-            vstate.swapchain.extent.height,
+            presentation.swapchain.extent.width,
+            presentation.swapchain.extent.height,
         ))
     }
 
@@ -493,12 +491,27 @@ impl VulkanPipeline {
                 message: "the Vulkan backend received a null render state".to_owned(),
             });
         };
-        if vsurface.surface != vstate.surface {
+        let VulkanState::Presenting(presenting) = &mut **vstate else {
+            return Err(no_surface_error());
+        };
+        let presenting = &mut **presenting;
+        let VulkanPresentingState {
+            device: device_state,
+            presentation,
+            ..
+        } = presenting;
+        if vsurface.surface != presentation.surface {
             return Err(RenderError::InvalidArgument {
                 message: "the surface does not belong to this render state".to_owned(),
             });
         }
-        recreate_surface(self, vstate, vsurface)?;
+        recreate_surface(
+            self,
+            &device_state.device,
+            device_state.physical_device,
+            presentation,
+            vsurface,
+        )?;
         Ok(SurfaceEvent::Restored)
     }
 
@@ -513,16 +526,7 @@ impl VulkanPipeline {
         let StateKind::Vulkan(vstate) = &mut state.kind else {
             return;
         };
-        let Some(texture) = vstate.textures.remove(&tex.key()) else {
-            return;
-        };
-        let device = vstate.device.clone();
-        // SAFETY: wait for in-flight work before freeing the image; the device
-        // is idle afterwards.
-        unsafe {
-            let _ = device.device_wait_idle();
-        }
-        texture.destroy(&device, vstate.resources.descriptor_pool);
+        vstate.device_mut().drop_texture(tex);
     }
 
     /// Copies a sub-rectangle of `pixels` into `tex`.
@@ -540,31 +544,34 @@ impl VulkanPipeline {
             });
         };
 
-        let key = tex.key();
-        if !vstate.textures.contains_key(&key) {
-            let gpu = texture::create_texture(
-                &vstate.device,
-                &self.memory_properties,
-                vstate.resources.descriptor_set_layout,
-                vstate.resources.descriptor_pool,
-                vstate.resources.sampler,
-                *tex.desc(),
-            )?;
-            vstate.textures.insert(key, gpu);
-        }
+        vstate
+            .device_mut()
+            .upload_texture(&self.memory_properties, tex, region, pixels)
+    }
 
-        let gpu = vstate
-            .textures
-            .get_mut(&key)
-            .ok_or_else(|| RenderError::Upload {
-                message: "texture state disappeared during upload".to_owned(),
-            })?;
-        let context = texture::UploadContext {
-            device: &vstate.device,
-            memory_properties: &self.memory_properties,
-            queue: vstate.graphics_queue,
+    /// Copies every upload's sub-rectangle into its texture in one batch.
+    ///
+    /// On the Vulkan backend the batch is staged, recorded and submitted once,
+    /// so a frame's dirty bitmaps pay a single GPU wait instead of one per
+    /// texture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::Upload`] when a region is out of bounds or its
+    /// pixel slice does not match it.
+    pub(crate) fn upload_textures(
+        &self,
+        state: &mut RenderState,
+        uploads: &[crate::TextureUpload<'_>],
+    ) -> Result<(), RenderError> {
+        let StateKind::Vulkan(vstate) = &mut state.kind else {
+            return Err(RenderError::InvalidArgument {
+                message: "the Vulkan backend received a null render state".to_owned(),
+            });
         };
-        texture::upload(&context, &mut vstate.upload, gpu, key, region, pixels)
+        vstate
+            .device_mut()
+            .upload_textures(&self.memory_properties, uploads)
     }
 
     /// Creates an offscreen render-target handle after validating its
@@ -582,15 +589,7 @@ impl VulkanPipeline {
         let StateKind::Vulkan(vstate) = &mut state.kind else {
             return;
         };
-        let Some(gpu) = vstate.render_targets.remove(&target.key()) else {
-            return;
-        };
-        let device = vstate.device.clone();
-        // SAFETY: wait for in-flight work before freeing the image.
-        unsafe {
-            let _ = device.device_wait_idle();
-        }
-        gpu.destroy(&device);
+        vstate.device_mut().destroy_render_target(target);
     }
 
     /// Creates an effect pipeline whose resources live in `state`.
@@ -621,30 +620,9 @@ impl VulkanPipeline {
                 message: "the Vulkan backend received a null render state".to_owned(),
             });
         };
-        let vstate = &mut **vstate;
-        if vstate.effect.is_none() {
-            // SAFETY: `physical_device` belongs to the instance this pipeline
-            // owns and the query is read-only.
-            let limits = unsafe {
-                self.instance_guard
-                    .instance
-                    .get_physical_device_properties(vstate.physical_device)
-            }
-            .limits;
-            let created = effect::EffectState::create(
-                &vstate.device,
-                &self.memory_properties,
-                limits.min_uniform_buffer_offset_alignment,
-            )?;
-            vstate.effect = Some(created);
-        }
-        let device = vstate.device.clone();
-        let Some(effects) = vstate.effect.as_mut() else {
-            return Err(RenderError::Framebuffer {
-                message: "the effect state disappeared during creation".to_owned(),
-            });
-        };
-        effects.create_pipeline(&device, desc)
+        vstate
+            .device_mut()
+            .create_effect_pipeline(&self.memory_properties, desc)
     }
 
     /// Releases an effect pipeline, idling the device first.
@@ -656,16 +634,7 @@ impl VulkanPipeline {
         let StateKind::Vulkan(vstate) = &mut state.kind else {
             return;
         };
-        let Some(effects) = vstate.effect.as_mut() else {
-            return;
-        };
-        let device = vstate.device.clone();
-        // SAFETY: an in-flight frame may still draw with the pipeline, so the
-        // device is idled before the handles are freed.
-        unsafe {
-            let _ = device.device_wait_idle();
-        }
-        effects.destroy_pipeline(&device, pipeline.key());
+        vstate.device_mut().destroy_effect_pipeline(pipeline);
     }
 
     /// Renders `scene` into the offscreen `target`.
@@ -691,75 +660,9 @@ impl VulkanPipeline {
                 message: "the Vulkan backend received a null render state".to_owned(),
             });
         };
-        let format = target.desc().format;
-        let key = target.key();
-        let vstate = &mut **vstate;
-        let VulkanState {
-            device,
-            graphics_queue,
-            upload,
-            offscreen_pool,
-            offscreen_command,
-            offscreen_fence,
-            offscreen,
-            render_targets,
-            textures,
-            effect,
-            resources,
-            ..
-        } = vstate;
-
-        if let hashbrown::hash_map::Entry::Vacant(entry) = offscreen.entry(format) {
-            entry.insert(target::OffscreenPass::create(device, format, resources)?);
-        }
-        let pass = offscreen
-            .get(&format)
-            .ok_or_else(|| RenderError::Framebuffer {
-                message: "offscreen pipeline state disappeared".to_owned(),
-            })?;
-        if let hashbrown::hash_map::Entry::Vacant(entry) = render_targets.entry(key) {
-            entry.insert(target::VulkanRenderTarget::create(
-                device,
-                &self.memory_properties,
-                pass,
-                *target.desc(),
-            )?);
-        }
-        let gpu = render_targets
-            .get_mut(&key)
-            .ok_or_else(|| RenderError::Framebuffer {
-                message: "render-target state disappeared".to_owned(),
-            })?;
-        upload.wait_all(device)?;
-        let submit = target::OffscreenSubmit {
-            device,
-            queue: *graphics_queue,
-            command_pool: *offscreen_pool,
-            command_buffer: *offscreen_command,
-            fence: *offscreen_fence,
-        };
-        // The offscreen render owns a uniform slot of its own and runs while a
-        // live frame may still be in flight.
-        if let Some(effects) = effect.as_mut() {
-            effects.begin_offscreen_frame();
-        }
-        let result = target::render(
-            &submit,
-            gpu,
-            pass,
-            resources,
-            textures,
-            effect.as_mut(),
-            scene,
-        );
-        if result.is_ok()
-            && let Some(effects) = effect.as_mut()
-        {
-            // The offscreen submit completed only after every command buffer
-            // submitted before it, so no descriptor set is in use any more.
-            effects.end_offscreen_frame(device);
-        }
-        result
+        vstate
+            .device_mut()
+            .render_to_target(&self.memory_properties, target, scene)
     }
 
     /// Copies a sub-rectangle of an offscreen `target` into `out`.
@@ -767,8 +670,7 @@ impl VulkanPipeline {
     /// The copy is synchronous: a script observes `out` on return. The
     /// readback buffer is reused across calls rather than allocated per call;
     /// the readback API takes `&RenderState`, so the buffer sits behind a
-    /// `RefCell` in [`VulkanState`] and is borrowed for the duration of the
-    /// call.
+    /// `RefCell` in the device and is borrowed for the duration of the call.
     pub(crate) fn read_render_target(
         &self,
         state: &RenderState,
@@ -781,30 +683,9 @@ impl VulkanPipeline {
                 message: "the Vulkan backend received a null render state".to_owned(),
             });
         };
-        let gpu =
-            vstate
-                .render_targets
-                .get(&target.key())
-                .ok_or_else(|| RenderError::Framebuffer {
-                    message: "render target has not been rendered yet".to_owned(),
-                })?;
-        validate_readback(target.desc(), region, out.len())?;
-        let mut readback = vstate.readback.borrow_mut();
-        let submit = target::OffscreenSubmit {
-            device: &vstate.device,
-            queue: vstate.graphics_queue,
-            command_pool: vstate.offscreen_pool,
-            command_buffer: vstate.offscreen_command,
-            fence: vstate.offscreen_fence,
-        };
-        target::read(
-            &submit,
-            &self.memory_properties,
-            gpu,
-            &mut readback,
-            region,
-            out,
-        )
+        vstate
+            .device()
+            .read_render_target(&self.memory_properties, target, region, out)
     }
 
     /// Acquires, records, submits and presents one frame.
@@ -827,416 +708,457 @@ impl VulkanPipeline {
                 message: "the Vulkan backend received a null render state".to_owned(),
             });
         };
-
-        if surface_handle != vstate.surface {
-            return Err(RenderError::InvalidArgument {
-                message: "the surface does not belong to this render state".to_owned(),
-            });
-        }
-
-        if let Some(fault) = swapchain_fault(vstate.swapchain_ready, vstate.swapchain.images.len())
-        {
-            // After a failed rebuild the fault stays `RebuildFailed` until a
-            // frame presents, so the retry loop logs each cause once.
-            if vstate.present_fault != Some(PresentFault::RebuildFailed) {
-                vstate.report_present_fault(fault);
-            }
-            let device = vstate.device.clone();
-            if let Err(error) = recreate_swapchain(&device, vstate, surface_handle) {
-                if vstate.present_fault != Some(PresentFault::RebuildFailed) {
-                    log::error!("vulkan: rebuilding the swapchain failed: {error}");
-                    vstate.present_fault = Some(PresentFault::RebuildFailed);
-                }
-                // The next frame retries the rebuild, and the precise failure
-                // was reported above once for this cause.
-                return Err(RenderError::SurfaceOutOfDate);
-            }
-            if let Some(fault) =
-                swapchain_fault(vstate.swapchain_ready, vstate.swapchain.images.len())
-            {
-                // A rebuild that leaves the swapchain unusable is reported as
-                // out of date so the caller retries instead of treating this
-                // frame as presented.
-                vstate.report_present_fault(fault);
-                return Err(RenderError::SurfaceOutOfDate);
-            }
-        }
-
-        let device = vstate.device.clone();
-        let swapchain_loader = vstate.swapchain_loader.clone();
-        let frame_index = vstate.frame_in_flight.min(vstate.frames.len() - 1);
-        let command_pool = vstate.frames[frame_index].command_pool;
-        let command_buffer = vstate.frames[frame_index].command_buffer;
-        let in_flight = vstate.frames[frame_index].in_flight;
-        let image_available = vstate.frames[frame_index].image_available;
-        let swapchain = vstate.swapchain.swapchain;
-        let extent = vstate.swapchain.extent;
-        let render_pass = vstate.swapchain.render_pass;
-        let format = vstate.swapchain.format.format;
-        let graphics_queue = vstate.graphics_queue;
-        let present_queue = vstate.present_queue;
-
-        // Per-frame GPU call costs, written into the state before every return
-        // so a slow frame's line can name what blocked.
-        let mut fence_wait_ms = 0.0_f64;
-        let mut present_ms = 0.0_f64;
-        let mut recreate_ms = 0.0_f64;
-        let mut submit_ms = 0.0_f64;
-
-        // Wait for the frame slot's previous work, but only when the queue
-        // accepted a submission with that fence. A frame that failed leaves
-        // its fence unsignalled with nothing pending, and waiting for such a
-        // fence would never return.
-        if vstate.fences.slot_running(frame_index) {
-            let fence_started = Instant::now();
-            // SAFETY: the fence belongs to this frame slot and its submission
-            // was accepted, so it will signal.
-            unsafe { device.wait_for_fences(&[in_flight], true, u64::MAX) }.map_err(|error| {
-                device::result_error("failed to wait for the frame fence", error)
-            })?;
-            fence_wait_ms += fence_started.elapsed().as_secs_f64() * 1000.0;
-            vstate.fences.completed(frame_index);
-        }
-
-        let acquire_started = Instant::now();
-        // SAFETY: `swapchain` is valid; `image_available` must be unsignalled.
-        let acquire_result = unsafe {
-            swapchain_loader.acquire_next_image(
-                swapchain,
-                self.acquire_timeout_ns,
-                image_available,
-                vk::Fence::null(),
-            )
+        // A state that renders offscreen has no presentation, so it cannot
+        // present a frame.
+        let VulkanState::Presenting(presenting) = &mut **vstate else {
+            return Err(no_surface_error());
         };
-        let acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
-        let (image_index, suboptimal) = match acquire_outcome(acquire_result) {
-            Ok(AcquireOutcome::Image { index, suboptimal }) => (index, suboptimal),
-            Ok(AcquireOutcome::OutOfDate) => {
-                vstate.report_present_fault(PresentFault::AcquireOutOfDate);
+        let presenting = &mut **presenting;
+
+        // The frame records into the swapchain's targets and reads the
+        // device's resources. The two are separate owners, so the frame
+        // borrows the presenting state and reaches both through it.
+        (|| -> Result<Presentation, RenderError> {
+            let VulkanPresentingState {
+                device: device_state,
+                presentation,
+                ..
+            } = &mut *presenting;
+            let physical_device = device_state.physical_device;
+
+            if surface_handle != presentation.surface {
+                return Err(RenderError::InvalidArgument {
+                    message: "the surface does not belong to this render state".to_owned(),
+                });
+            }
+
+            if let Some(fault) = swapchain_fault(
+                presentation.swapchain_ready,
+                presentation.swapchain.images.len(),
+            ) {
+                // After a failed rebuild the fault stays `RebuildFailed` until a
+                // frame presents, so the retry loop logs each cause once.
+                if presentation.present_fault != Some(PresentFault::RebuildFailed) {
+                    presentation.report_present_fault(fault);
+                }
+                let device = device_state.device.clone();
+                if let Err(error) =
+                    recreate_swapchain(&device, physical_device, &mut *presentation, surface_handle)
+                {
+                    if presentation.present_fault != Some(PresentFault::RebuildFailed) {
+                        log::error!("vulkan: rebuilding the swapchain failed: {error}");
+                        presentation.present_fault = Some(PresentFault::RebuildFailed);
+                    }
+                    // The next frame retries the rebuild, and the precise failure
+                    // was reported above once for this cause.
+                    return Err(RenderError::SurfaceOutOfDate);
+                }
+                if let Some(fault) = swapchain_fault(
+                    presentation.swapchain_ready,
+                    presentation.swapchain.images.len(),
+                ) {
+                    // A rebuild that leaves the swapchain unusable is reported as
+                    // out of date so the caller retries instead of treating this
+                    // frame as presented.
+                    presentation.report_present_fault(fault);
+                    return Err(RenderError::SurfaceOutOfDate);
+                }
+            }
+
+            let device = device_state.device.clone();
+            let swapchain_loader = presentation.swapchain_loader.clone();
+            let frame_index = presentation
+                .frame_in_flight
+                .min(presentation.frames.len() - 1);
+            let command_pool = presentation.frames[frame_index].command_pool;
+            let command_buffer = presentation.frames[frame_index].command_buffer;
+            let in_flight = presentation.frames[frame_index].in_flight;
+            let image_available = presentation.frames[frame_index].image_available;
+            let swapchain = presentation.swapchain.swapchain;
+            let extent = presentation.swapchain.extent;
+            let render_pass = presentation.swapchain.render_pass;
+            let format = presentation.swapchain.format.format;
+            let graphics_queue = device_state.graphics_queue;
+            let present_queue = device_state.present_queue;
+
+            // Per-frame GPU call costs, written into the state before every return
+            // so a slow frame's line can name what blocked.
+            let mut fence_wait_ms = 0.0_f64;
+            let mut present_ms = 0.0_f64;
+            let mut recreate_ms = 0.0_f64;
+            let mut submit_ms = 0.0_f64;
+
+            // Wait for the frame slot's previous work, but only when the queue
+            // accepted a submission with that fence. A frame that failed leaves
+            // its fence unsignalled with nothing pending, and waiting for such a
+            // fence would never return.
+            if presentation.fences.slot_running(frame_index) {
+                let fence_started = Instant::now();
+                // SAFETY: the fence belongs to this frame slot and its submission
+                // was accepted, so it will signal.
+                unsafe { device.wait_for_fences(&[in_flight], true, u64::MAX) }.map_err(
+                    |error| device::result_error("failed to wait for the frame fence", error),
+                )?;
+                fence_wait_ms += fence_started.elapsed().as_secs_f64() * 1000.0;
+                presentation.fences.completed(frame_index);
+            }
+
+            let acquire_started = Instant::now();
+            // SAFETY: `swapchain` is valid; `image_available` must be unsignalled.
+            let acquire_result = unsafe {
+                swapchain_loader.acquire_next_image(
+                    swapchain,
+                    self.acquire_timeout_ns,
+                    image_available,
+                    vk::Fence::null(),
+                )
+            };
+            let acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
+            let (image_index, suboptimal) = match acquire_outcome(acquire_result) {
+                Ok(AcquireOutcome::Image { index, suboptimal }) => (index, suboptimal),
+                Ok(AcquireOutcome::OutOfDate) => {
+                    presentation.report_present_fault(PresentFault::AcquireOutOfDate);
+                    let recreate_started = Instant::now();
+                    recreate_swapchain(
+                        &device,
+                        physical_device,
+                        &mut *presentation,
+                        surface_handle,
+                    )?;
+                    recreate_ms += recreate_started.elapsed().as_secs_f64() * 1000.0;
+                    presentation.last_timings = Some(FrameTimings {
+                        acquire_ms,
+                        present_ms,
+                        submit_ms,
+                        recreate_ms,
+                        fence_wait_ms,
+                    });
+                    return Ok(Presentation {
+                        presented: false,
+                        surface_event: Some(SurfaceEvent::OutOfDate),
+                        skip: None,
+                    });
+                }
+                Ok(AcquireOutcome::SurfaceLost) => {
+                    return Ok(Presentation {
+                        presented: false,
+                        surface_event: Some(SurfaceEvent::Lost),
+                        skip: None,
+                    });
+                }
+                Ok(AcquireOutcome::TimedOut) => {
+                    // The timeout neither signalled nor consumed anything: the
+                    // semaphore, the fences, the frame slot and the swapchain stay
+                    // untouched, so the previous image stays on screen and the
+                    // next frame can acquire with the same semaphore. The frame is
+                    // reported as skipped rather than silently dropped, and the
+                    // swapchain is not rebuilt because the display is late, not
+                    // out of date.
+                    presentation.last_timings = Some(FrameTimings {
+                        acquire_ms,
+                        present_ms,
+                        submit_ms,
+                        recreate_ms,
+                        fence_wait_ms,
+                    });
+                    return Ok(Presentation {
+                        presented: false,
+                        surface_event: None,
+                        skip: Some(PresentSkip::AcquireTimeout),
+                    });
+                }
+                Err(error) => {
+                    return Err(device::result_error(
+                        "failed to acquire a swapchain image",
+                        error,
+                    ));
+                }
+            };
+
+            // `image_available` is signalled by the acquire above. Until the submit
+            // succeeds it is neither waited on nor safe to reuse, so any error in
+            // this block must recreate it (see `recreate_acquired_semaphore`).
+            let signal_semaphores = [presentation.render_finished[image_index as usize]];
+            let submit_started = Instant::now();
+            let record_result: Result<(), RenderError> = (|| {
+                let image_fence = presentation.images_in_flight[image_index as usize];
+                // The image's fence is a frame slot's fence. Wait for it only when
+                // a submission with it may still be running: a frame that failed
+                // leaves its fence unsignalled with nothing pending.
+                if presentation.fences.fence_running(image_fence) {
+                    let image_wait_started = Instant::now();
+                    // SAFETY: the fence guards this swapchain image and its
+                    // submission was accepted, so it will signal.
+                    unsafe { device.wait_for_fences(&[image_fence], true, u64::MAX) }.map_err(
+                        |error| device::result_error("failed to wait for a swapchain image", error),
+                    )?;
+                    fence_wait_ms += image_wait_started.elapsed().as_secs_f64() * 1000.0;
+                    presentation.fences.completed_fence(image_fence);
+                }
+
+                // SAFETY: the pool is not in use.
+                unsafe {
+                    device
+                        .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())
+                        .map_err(|error| {
+                            device::result_error("failed to reset the frame command pool", error)
+                        })?;
+                }
+
+                let begin_info = vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+                // SAFETY: the command buffer is reset and idle.
+                unsafe { device.begin_command_buffer(command_buffer, &begin_info) }.map_err(
+                    |error| device::result_error("failed to begin the frame command buffer", error),
+                )?;
+
+                let render_area = vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent,
+                };
+                let clear = clear_value(scene.background);
+
+                // The frame is composed into a target of its own and then
+                // presented with a quad, because a destination-dependent blend
+                // needs a copy of the destination and a colour attachment cannot
+                // be a copy's source.
+                ensure_frame_targets(
+                    &device,
+                    &self.memory_properties,
+                    &device_state.resources,
+                    &mut *presentation,
+                    format,
+                    extent,
+                )?;
+
+                // The frame fence for this slot was waited above when it had work
+                // in flight, so the frame that owned the slot has completed: its
+                // uniform bytes may be written again and the descriptor sets it
+                // bound may be freed. The slot is the frame's own, `frame_in_flight
+                // % MAX_FRAMES_IN_FLIGHT`.
+                if let Some(effects) = device_state.effect.as_mut() {
+                    effects.begin_live_frame(&device, frame_index);
+                }
+                let effects = device_state.effect.as_mut();
+                {
+                    let Some(pass) = presentation.frame_pass.as_ref() else {
+                        return Err(RenderError::Framebuffer {
+                            message: "the frame target disappeared".to_owned(),
+                        });
+                    };
+                    let Some(frame) = presentation.frame_targets[frame_index].as_mut() else {
+                        return Err(RenderError::Framebuffer {
+                            message: "the frame target disappeared".to_owned(),
+                        });
+                    };
+                    // SAFETY: the command buffer is recording.
+                    unsafe {
+                        let viewport = vk::Viewport {
+                            x: 0.0,
+                            y: 0.0,
+                            width: extent.width as f32,
+                            height: extent.height as f32,
+                            min_depth: 0.0,
+                            max_depth: 1.0,
+                        };
+                        device.cmd_set_viewport(command_buffer, 0, &[viewport]);
+                    }
+                    frame.prepare(&device, command_buffer);
+                    let render_pass = pass.render_pass;
+                    let framebuffer = frame.framebuffer();
+                    let image = frame.image();
+                    let pipelines = &pass.pipelines;
+                    let snapshot = Some(&mut frame.snapshot);
+                    draw::record_scene(
+                        draw::SceneDraw {
+                            pass: draw::ScenePass {
+                                device: &device,
+                                command: command_buffer,
+                                render_pass,
+                                framebuffer,
+                                image,
+                                clear,
+                                extent,
+                            },
+                            pipelines,
+                            resources: &device_state.resources,
+                            textures: &device_state.textures,
+                            effects,
+                            snapshot,
+                            extent,
+                        },
+                        scene,
+                        &Affine2::IDENTITY,
+                    )?;
+                    frame.prepare_for_present(&device, command_buffer);
+                }
+
+                // The composed frame is presented with a quad over the swapchain
+                // image.
+                let framebuffer = framebuffers_for(&*presentation, image_index)?;
+                let clear_values = [vk::ClearValue {
+                    color: vk::ClearColorValue { float32: clear },
+                }];
+                let render_pass_begin = vk::RenderPassBeginInfo::default()
+                    .render_pass(render_pass)
+                    .framebuffer(framebuffer)
+                    .render_area(render_area)
+                    .clear_values(&clear_values);
+                let Some(frame) = presentation.frame_targets[frame_index].as_ref() else {
+                    return Err(RenderError::Framebuffer {
+                        message: "the frame target disappeared".to_owned(),
+                    });
+                };
+                // SAFETY: the command buffer is recording; the render pass and
+                // framebuffer are compatible and live.
+                unsafe {
+                    device.cmd_begin_render_pass(
+                        command_buffer,
+                        &render_pass_begin,
+                        vk::SubpassContents::INLINE,
+                    );
+                }
+                draw::record_present(
+                    &device,
+                    command_buffer,
+                    &presentation.pipelines,
+                    &device_state.resources,
+                    frame.descriptor_set,
+                    extent,
+                );
+
+                // SAFETY: the render pass and command buffer are recording.
+                unsafe {
+                    device.cmd_end_render_pass(command_buffer);
+                    device.end_command_buffer(command_buffer).map_err(|error| {
+                        device::result_error("failed to end the frame command buffer", error)
+                    })?;
+                }
+
+                // The frame samples textures uploaded since the previous frame.
+                // Wait for those uploads ahead of this submit so no draw observes a
+                // stale image; an upload recorded in the frame's own command buffer
+                // would not need this, but the upload API is called outside the
+                // frame (see the module's upload ring).
+                device_state.upload.wait_all(&device)?;
+
+                let wait_semaphores = [image_available];
+                let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                let command_buffers = [command_buffer];
+                let submit = vk::SubmitInfo::default()
+                    .wait_semaphores(&wait_semaphores)
+                    .wait_dst_stage_mask(&wait_stages)
+                    .command_buffers(&command_buffers)
+                    .signal_semaphores(&signal_semaphores);
+
+                // SAFETY: all handles are live. The fence is reset only
+                // immediately before the submit, so a failure above leaves it
+                // signalled and the slot reusable. A failed submit leaves the
+                // fence unsignalled, but the tracker then holds no work for it, so
+                // no later wait blocks on a signal that will not come.
+                unsafe {
+                    device.reset_fences(&[in_flight]).map_err(|error| {
+                        device::result_error("failed to reset the frame fence", error)
+                    })?;
+                    device
+                        .queue_submit(graphics_queue, &[submit], in_flight)
+                        .map_err(|error| {
+                            device::result_error("failed to submit the frame", error)
+                        })?;
+                }
+                // The queue accepted the submission, so the fence will signal.
+                presentation.fences.submitted(frame_index);
+                presentation.images_in_flight[image_index as usize] = in_flight;
+                Ok(())
+            })();
+            submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
+
+            if let Err(error) = record_result {
+                // The acquire signalled the semaphore, so the slot cannot be
+                // reused until it is replaced. A failure there leaves the
+                // swapchain unusable and is reported as out of date so the next
+                // frame rebuilds it instead of silently never presenting again.
+                if let Err(semaphore_error) =
+                    recreate_acquired_semaphore(&device, &mut *presentation, frame_index)
+                {
+                    log::error!(
+                        "vulkan: the frame failed ({error}) and its image-available \
+                     semaphore could not be recreated: {semaphore_error}"
+                    );
+                    return Err(RenderError::SurfaceOutOfDate);
+                }
+                return Err(error);
+            }
+
+            let swapchains = [swapchain];
+            let image_indices = [image_index];
+            let present_info = vk::PresentInfoKHR::default()
+                .wait_semaphores(&signal_semaphores)
+                .swapchains(&swapchains)
+                .image_indices(&image_indices);
+            let present_started = Instant::now();
+            let present_result =
+            // SAFETY: the present info references live semaphores/swapchain.
+            unsafe { swapchain_loader.queue_present(present_queue, &present_info) };
+            present_ms = present_started.elapsed().as_secs_f64() * 1000.0;
+
+            presentation.frame_in_flight =
+                (presentation.frame_in_flight + 1) % MAX_FRAMES_IN_FLIGHT;
+            presentation.frame_index = presentation.frame_index.wrapping_add(1);
+
+            let mut needs_recreate = suboptimal;
+            match present_recovery(present_result)
+                .map_err(|error| device::result_error("failed to present the frame", error))?
+            {
+                SwapchainRecovery::None => {}
+                SwapchainRecovery::RebuildSwapchain => needs_recreate = true,
+                SwapchainRecovery::RecreateSurface => {
+                    return Ok(Presentation {
+                        presented: false,
+                        surface_event: Some(SurfaceEvent::Lost),
+                        skip: None,
+                    });
+                }
+            }
+
+            if needs_recreate {
                 let recreate_started = Instant::now();
-                recreate_swapchain(&device, vstate, surface_handle)?;
+                recreate_swapchain(&device, physical_device, &mut *presentation, surface_handle)?;
                 recreate_ms += recreate_started.elapsed().as_secs_f64() * 1000.0;
-                vstate.last_timings = Some(FrameTimings {
+                presentation.last_timings = Some(FrameTimings {
                     acquire_ms,
                     present_ms,
                     submit_ms,
                     recreate_ms,
                     fence_wait_ms,
                 });
+                // The frame was presented on the swapchain the recreate just
+                // replaced, so it is on screen until a frame of the replacement
+                // presents; it is retired, not destroyed.
+                presentation.clear_present_fault();
                 return Ok(Presentation {
-                    presented: false,
+                    presented: true,
                     surface_event: Some(SurfaceEvent::OutOfDate),
                     skip: None,
                 });
             }
-            Ok(AcquireOutcome::SurfaceLost) => {
-                return Ok(Presentation {
-                    presented: false,
-                    surface_event: Some(SurfaceEvent::Lost),
-                    skip: None,
-                });
-            }
-            Ok(AcquireOutcome::TimedOut) => {
-                // The timeout neither signalled nor consumed anything: the
-                // semaphore, the fences, the frame slot and the swapchain stay
-                // untouched, so the previous image stays on screen and the
-                // next frame can acquire with the same semaphore. The frame is
-                // reported as skipped rather than silently dropped, and the
-                // swapchain is not rebuilt because the display is late, not
-                // out of date.
-                vstate.last_timings = Some(FrameTimings {
-                    acquire_ms,
-                    present_ms,
-                    submit_ms,
-                    recreate_ms,
-                    fence_wait_ms,
-                });
-                return Ok(Presentation {
-                    presented: false,
-                    surface_event: None,
-                    skip: Some(PresentSkip::AcquireTimeout),
-                });
-            }
-            Err(error) => {
-                return Err(device::result_error(
-                    "failed to acquire a swapchain image",
-                    error,
-                ));
-            }
-        };
 
-        // `image_available` is signalled by the acquire above. Until the submit
-        // succeeds it is neither waited on nor safe to reuse, so any error in
-        // this block must recreate it (see `recreate_acquired_semaphore`).
-        let signal_semaphores = [vstate.render_finished[image_index as usize]];
-        let submit_started = Instant::now();
-        let record_result: Result<(), RenderError> = (|| {
-            let image_fence = vstate.images_in_flight[image_index as usize];
-            // The image's fence is a frame slot's fence. Wait for it only when
-            // a submission with it may still be running: a frame that failed
-            // leaves its fence unsignalled with nothing pending.
-            if vstate.fences.fence_running(image_fence) {
-                let image_wait_started = Instant::now();
-                // SAFETY: the fence guards this swapchain image and its
-                // submission was accepted, so it will signal.
-                unsafe { device.wait_for_fences(&[image_fence], true, u64::MAX) }.map_err(
-                    |error| device::result_error("failed to wait for a swapchain image", error),
-                )?;
-                fence_wait_ms += image_wait_started.elapsed().as_secs_f64() * 1000.0;
-                vstate.fences.completed_fence(image_fence);
-            }
-
-            // SAFETY: the pool is not in use.
-            unsafe {
-                device
-                    .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())
-                    .map_err(|error| {
-                        device::result_error("failed to reset the frame command pool", error)
-                    })?;
-            }
-
-            let begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            // SAFETY: the command buffer is reset and idle.
-            unsafe { device.begin_command_buffer(command_buffer, &begin_info) }.map_err(
-                |error| device::result_error("failed to begin the frame command buffer", error),
-            )?;
-
-            let render_area = vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent,
-            };
-            let clear = clear_value(scene.background);
-
-            // The frame is composed into a target of its own and then
-            // presented with a quad, because a destination-dependent blend
-            // needs a copy of the destination and a colour attachment cannot
-            // be a copy's source.
-            ensure_frame_targets(vstate, &self.memory_properties, format, extent)?;
-
-            // The frame fence for this slot was waited above when it had work
-            // in flight, so the frame that owned the slot has completed: its
-            // uniform bytes may be written again and the descriptor sets it
-            // bound may be freed. The slot is the frame's own, `frame_in_flight
-            // % MAX_FRAMES_IN_FLIGHT`.
-            if let Some(effects) = vstate.effect.as_mut() {
-                effects.begin_live_frame(&device, frame_index);
-            }
-            let effects = vstate.effect.as_mut();
-            {
-                let Some(pass) = vstate.frame_pass.as_ref() else {
-                    return Err(RenderError::Framebuffer {
-                        message: "the frame target disappeared".to_owned(),
-                    });
-                };
-                let Some(frame) = vstate.frame_targets[frame_index].as_mut() else {
-                    return Err(RenderError::Framebuffer {
-                        message: "the frame target disappeared".to_owned(),
-                    });
-                };
-                // SAFETY: the command buffer is recording.
-                unsafe {
-                    let viewport = vk::Viewport {
-                        x: 0.0,
-                        y: 0.0,
-                        width: extent.width as f32,
-                        height: extent.height as f32,
-                        min_depth: 0.0,
-                        max_depth: 1.0,
-                    };
-                    device.cmd_set_viewport(command_buffer, 0, &[viewport]);
-                }
-                frame.prepare(&device, command_buffer);
-                let render_pass = pass.render_pass;
-                let framebuffer = frame.framebuffer();
-                let image = frame.image();
-                let pipelines = &pass.pipelines;
-                let snapshot = Some(&mut frame.snapshot);
-                draw::record_scene(
-                    draw::SceneDraw {
-                        pass: draw::ScenePass {
-                            device: &device,
-                            command: command_buffer,
-                            render_pass,
-                            framebuffer,
-                            image,
-                            clear,
-                            extent,
-                        },
-                        pipelines,
-                        resources: &vstate.resources,
-                        textures: &vstate.textures,
-                        effects,
-                        snapshot,
-                        extent,
-                    },
-                    scene,
-                    &Affine2::IDENTITY,
-                )?;
-                frame.prepare_for_present(&device, command_buffer);
-            }
-
-            // The composed frame is presented with a quad over the swapchain
-            // image.
-            let framebuffer = framebuffers_for(vstate, image_index)?;
-            let clear_values = [vk::ClearValue {
-                color: vk::ClearColorValue { float32: clear },
-            }];
-            let render_pass_begin = vk::RenderPassBeginInfo::default()
-                .render_pass(render_pass)
-                .framebuffer(framebuffer)
-                .render_area(render_area)
-                .clear_values(&clear_values);
-            let Some(frame) = vstate.frame_targets[frame_index].as_ref() else {
-                return Err(RenderError::Framebuffer {
-                    message: "the frame target disappeared".to_owned(),
-                });
-            };
-            // SAFETY: the command buffer is recording; the render pass and
-            // framebuffer are compatible and live.
-            unsafe {
-                device.cmd_begin_render_pass(
-                    command_buffer,
-                    &render_pass_begin,
-                    vk::SubpassContents::INLINE,
-                );
-            }
-            draw::record_present(
-                &device,
-                command_buffer,
-                &vstate.pipelines,
-                &vstate.resources,
-                frame.descriptor_set,
-                extent,
-            );
-
-            // SAFETY: the render pass and command buffer are recording.
-            unsafe {
-                device.cmd_end_render_pass(command_buffer);
-                device.end_command_buffer(command_buffer).map_err(|error| {
-                    device::result_error("failed to end the frame command buffer", error)
-                })?;
-            }
-
-            // The frame samples textures uploaded since the previous frame.
-            // Wait for those uploads ahead of this submit so no draw observes a
-            // stale image; an upload recorded in the frame's own command buffer
-            // would not need this, but the upload API is called outside the
-            // frame (see the module's upload ring).
-            vstate.upload.wait_all(&device)?;
-
-            let wait_semaphores = [image_available];
-            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            let command_buffers = [command_buffer];
-            let submit = vk::SubmitInfo::default()
-                .wait_semaphores(&wait_semaphores)
-                .wait_dst_stage_mask(&wait_stages)
-                .command_buffers(&command_buffers)
-                .signal_semaphores(&signal_semaphores);
-
-            // SAFETY: all handles are live. The fence is reset only
-            // immediately before the submit, so a failure above leaves it
-            // signalled and the slot reusable. A failed submit leaves the
-            // fence unsignalled, but the tracker then holds no work for it, so
-            // no later wait blocks on a signal that will not come.
-            unsafe {
-                device.reset_fences(&[in_flight]).map_err(|error| {
-                    device::result_error("failed to reset the frame fence", error)
-                })?;
-                device
-                    .queue_submit(graphics_queue, &[submit], in_flight)
-                    .map_err(|error| device::result_error("failed to submit the frame", error))?;
-            }
-            // The queue accepted the submission, so the fence will signal.
-            vstate.fences.submitted(frame_index);
-            vstate.images_in_flight[image_index as usize] = in_flight;
-            Ok(())
-        })();
-        submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
-
-        if let Err(error) = record_result {
-            // The acquire signalled the semaphore, so the slot cannot be
-            // reused until it is replaced. A failure there leaves the
-            // swapchain unusable and is reported as out of date so the next
-            // frame rebuilds it instead of silently never presenting again.
-            if let Err(semaphore_error) = recreate_acquired_semaphore(&device, vstate, frame_index)
-            {
-                log::error!(
-                    "vulkan: the frame failed ({error}) and its image-available \
-                     semaphore could not be recreated: {semaphore_error}"
-                );
-                return Err(RenderError::SurfaceOutOfDate);
-            }
-            return Err(error);
-        }
-
-        let swapchains = [swapchain];
-        let image_indices = [image_index];
-        let present_info = vk::PresentInfoKHR::default()
-            .wait_semaphores(&signal_semaphores)
-            .swapchains(&swapchains)
-            .image_indices(&image_indices);
-        let present_started = Instant::now();
-        let present_result =
-            // SAFETY: the present info references live semaphores/swapchain.
-            unsafe { swapchain_loader.queue_present(present_queue, &present_info) };
-        present_ms = present_started.elapsed().as_secs_f64() * 1000.0;
-
-        vstate.frame_in_flight = (vstate.frame_in_flight + 1) % MAX_FRAMES_IN_FLIGHT;
-        vstate.frame_index = vstate.frame_index.wrapping_add(1);
-
-        let mut needs_recreate = suboptimal;
-        match present_recovery(present_result)
-            .map_err(|error| device::result_error("failed to present the frame", error))?
-        {
-            SwapchainRecovery::None => {}
-            SwapchainRecovery::RebuildSwapchain => needs_recreate = true,
-            SwapchainRecovery::RecreateSurface => {
-                return Ok(Presentation {
-                    presented: false,
-                    surface_event: Some(SurfaceEvent::Lost),
-                    skip: None,
-                });
-            }
-        }
-
-        if needs_recreate {
-            let recreate_started = Instant::now();
-            recreate_swapchain(&device, vstate, surface_handle)?;
-            recreate_ms += recreate_started.elapsed().as_secs_f64() * 1000.0;
-            vstate.last_timings = Some(FrameTimings {
+            presentation.last_timings = Some(FrameTimings {
                 acquire_ms,
                 present_ms,
                 submit_ms,
                 recreate_ms,
                 fence_wait_ms,
             });
-            // The frame was presented on the swapchain the recreate just
-            // replaced, so it is on screen until a frame of the replacement
-            // presents; it is retired, not destroyed.
-            vstate.clear_present_fault();
-            return Ok(Presentation {
+            presentation.clear_present_fault();
+            presentation.swapchain_presented = true;
+            presentation.dispose_retired_swapchain(&device);
+            Ok(Presentation {
                 presented: true,
-                surface_event: Some(SurfaceEvent::OutOfDate),
+                surface_event: None,
                 skip: None,
-            });
-        }
-
-        vstate.last_timings = Some(FrameTimings {
-            acquire_ms,
-            present_ms,
-            submit_ms,
-            recreate_ms,
-            fence_wait_ms,
-        });
-        vstate.clear_present_fault();
-        vstate.swapchain_presented = true;
-        vstate.dispose_retired_swapchain();
-        Ok(Presentation {
-            presented: true,
-            surface_event: None,
-            skip: None,
-        })
+            })
+        })()
     }
 }
 
@@ -1250,12 +1172,14 @@ impl VulkanPipeline {
 ///
 /// Returns [`RenderError::OutOfMemory`] when a resource cannot be created.
 fn ensure_frame_targets(
-    vstate: &mut VulkanState,
+    device: &ash::Device,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    resources: &pipelines::PipelineResources,
+    presentation: &mut VulkanPresentation,
     format: vk::Format,
     extent: vk::Extent2D,
 ) -> Result<(), RenderError> {
-    let matches = vstate
+    let matches = presentation
         .frame_targets
         .first()
         .and_then(|target| target.as_ref())
@@ -1263,43 +1187,42 @@ fn ensure_frame_targets(
     if matches {
         return Ok(());
     }
-    let device = vstate.device.clone();
     // SAFETY: the device is idle after the wait, so nothing reads the old
     // targets' resources.
     unsafe {
         let _ = device.device_wait_idle();
     }
-    for slot in vstate.frame_targets.iter_mut() {
+    for slot in presentation.frame_targets.iter_mut() {
         if let Some(old) = slot.take() {
-            old.destroy(&device, &vstate.resources);
+            old.destroy(device, resources);
         }
     }
-    if let Some(old) = vstate.frame_pass.take() {
-        old.destroy(&device);
+    if let Some(old) = presentation.frame_pass.take() {
+        old.destroy(device);
     }
-    let pass = target::FramePass::create(&device, format, &vstate.resources)?;
+    let pass = target::FramePass::create(device, format, resources)?;
     for index in 0..MAX_FRAMES_IN_FLIGHT {
         match target::FrameTarget::create(
-            &device,
+            device,
             memory_properties,
             format,
             extent,
-            &vstate.resources,
+            resources,
             &pass,
         ) {
-            Ok(target) => vstate.frame_targets[index] = Some(target),
+            Ok(target) => presentation.frame_targets[index] = Some(target),
             Err(error) => {
-                for slot in vstate.frame_targets.iter_mut() {
+                for slot in presentation.frame_targets.iter_mut() {
                     if let Some(old) = slot.take() {
-                        old.destroy(&device, &vstate.resources);
+                        old.destroy(device, resources);
                     }
                 }
-                pass.destroy(&device);
+                pass.destroy(device);
                 return Err(error);
             }
         }
     }
-    vstate.frame_pass = Some(pass);
+    presentation.frame_pass = Some(pass);
     Ok(())
 }
 
@@ -1388,20 +1311,394 @@ fn frame_slot_fences(frames: &[VulkanFrame]) -> [vk::Fence; MAX_FRAMES_IN_FLIGHT
     slot_fences
 }
 
-/// Mutable Vulkan state owned by the middle layer.
-pub(crate) struct VulkanState {
-    /// Clone of the owning instance guard (handle only, not a separate owner
-    /// beyond the reference count). Kept solely so the instance outlives every
-    /// device/surface handle in this state.
-    pub(crate) _instance_guard: Arc<InstanceGuard>,
-    /// Selected physical device.
-    pub(crate) physical_device: vk::PhysicalDevice,
-    /// Logical device.
+/// The logical device and the resources that do not depend on a surface.
+///
+/// A device is created on its own: the caller that presents to a window pairs
+/// it with a [`VulkanPresentation`], and the caller that renders offscreen
+/// pairs it with nothing. Every resource here outlives a surface and none of
+/// them is tied to one, so the same device serves both kinds of caller.
+///
+/// The device owns its own actions: a caller reaches the textures, the
+/// offscreen targets and the effect pipelines through the methods below, not
+/// through the fields.
+pub(crate) struct VulkanDevice {
+    /// The logical device.
     pub(crate) device: ash::Device,
-    /// Combined graphics+present queue.
+    /// The physical device the logical device was created from.
+    pub(crate) physical_device: vk::PhysicalDevice,
+    /// Queue used for graphics submission.
     pub(crate) graphics_queue: vk::Queue,
-    /// Queue used for presentation (same as graphics here).
+    /// Queue used for presentation.
+    ///
+    /// A null handle for a device that renders offscreen: it presents to
+    /// nothing.
     pub(crate) present_queue: vk::Queue,
+    /// Index of the queue family the device was created with.
+    pub(crate) queue_family_index: u32,
+    /// The descriptor and layout resources every pipeline set shares.
+    pub(crate) resources: pipelines::PipelineResources,
+    /// Ring of independently synchronised texture-upload slots.
+    pub(crate) upload: texture::UploadRing,
+    /// Pool used for one synchronous offscreen render or readback.
+    pub(crate) offscreen_pool: vk::CommandPool,
+    /// Command buffer used for one synchronous offscreen render or readback.
+    pub(crate) offscreen_command: vk::CommandBuffer,
+    /// Fence waited on after one synchronous offscreen render or readback
+    /// (created signalled).
+    pub(crate) offscreen_fence: vk::Fence,
+    /// GPU textures keyed by [`Texture`] identity.
+    pub(crate) textures: Map<u64, texture::VulkanTexture>,
+    /// GPU offscreen targets keyed by [`RenderTarget`] identity.
+    pub(crate) render_targets: Map<u64, target::VulkanRenderTarget>,
+    /// Per-format offscreen render passes and their pipelines.
+    pub(crate) offscreen: Map<TextureFormat, target::OffscreenPass>,
+    /// Custom effect pipelines, their samplers and the frame's uniform ring,
+    /// created on the first created effect pipeline.
+    pub(crate) effect: Option<effect::EffectState>,
+    /// Host-visible buffer reused by every readback; grown on demand. The
+    /// readback entry point takes `&RenderState`, so it is borrowed mutably
+    /// only for the duration of one synchronous copy.
+    pub(crate) readback: RefCell<texture::StagingBuffer>,
+    /// Clone of the owning instance guard (handle only, not a separate owner
+    /// beyond the reference count). Kept solely so the instance outlives the
+    /// device, and declared last so it is released after it.
+    pub(crate) _instance_guard: Arc<InstanceGuard>,
+}
+
+impl VulkanDevice {
+    /// Creates the logical device and the resources that do not depend on a
+    /// surface.
+    ///
+    /// `target` says what the device is for: a surface it presents to, or
+    /// offscreen rendering only. A device that was created and whose
+    /// resources failed is destroyed before the error returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::DeviceUnavailable`] when the device or one of
+    /// its resources cannot be created.
+    pub(crate) fn create(
+        instance_guard: Arc<InstanceGuard>,
+        physical_device: vk::PhysicalDevice,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        target: device::PresentTarget<'_>,
+    ) -> Result<Self, RenderError> {
+        let bundle = device::create_device(&instance_guard.instance, physical_device, target)?;
+        let device = bundle.device;
+
+        let resources = match pipelines::PipelineResources::create(&device, memory_properties) {
+            Ok(resources) => resources,
+            Err(error) => {
+                // SAFETY: the device was created here and nothing uses it.
+                unsafe { device.destroy_device(None) };
+                return Err(error);
+            }
+        };
+        let upload = match texture::UploadRing::new(
+            &device,
+            bundle.queue_family_index,
+            texture::UPLOAD_SLOTS,
+        ) {
+            Ok(upload) => upload,
+            Err(error) => {
+                // SAFETY: the resources were created here and the device is
+                // idle.
+                unsafe {
+                    let _ = device.device_wait_idle();
+                    resources.destroy(&device);
+                    device.destroy_device(None);
+                }
+                return Err(error);
+            }
+        };
+        let (offscreen_pool, offscreen_command, offscreen_fence) =
+            match create_offscreen_resources(&device, bundle.queue_family_index) {
+                Ok(offscreen) => offscreen,
+                Err(error) => {
+                    // SAFETY: the resources were created here and the device
+                    // is idle.
+                    unsafe {
+                        let _ = device.device_wait_idle();
+                        upload.destroy(&device);
+                        resources.destroy(&device);
+                        device.destroy_device(None);
+                    }
+                    return Err(error);
+                }
+            };
+
+        Ok(Self {
+            device,
+            physical_device,
+            graphics_queue: bundle.graphics_queue,
+            present_queue: bundle.present_queue,
+            queue_family_index: bundle.queue_family_index,
+            resources,
+            upload,
+            offscreen_pool,
+            offscreen_command,
+            offscreen_fence,
+            textures: Map::default(),
+            render_targets: Map::default(),
+            offscreen: Map::default(),
+            effect: None,
+            readback: RefCell::new(texture::StagingBuffer::default()),
+            _instance_guard: instance_guard,
+        })
+    }
+
+    /// Releases the GPU resources and the state slot for `tex`.
+    pub(crate) fn drop_texture(&mut self, tex: Texture) {
+        let Some(texture) = self.textures.remove(&tex.key()) else {
+            return;
+        };
+        let device = self.device.clone();
+        // SAFETY: wait for in-flight work before freeing the image; the device
+        // is idle afterwards.
+        unsafe {
+            let _ = device.device_wait_idle();
+        }
+        texture.destroy(&device, self.resources.descriptor_pool);
+    }
+
+    /// Releases the GPU resources and the state slot for `target`.
+    pub(crate) fn destroy_render_target(&mut self, target: RenderTarget) {
+        let Some(gpu) = self.render_targets.remove(&target.key()) else {
+            return;
+        };
+        let device = self.device.clone();
+        // SAFETY: wait for in-flight work before freeing the image.
+        unsafe {
+            let _ = device.device_wait_idle();
+        }
+        gpu.destroy(&device);
+    }
+
+    /// Creates an effect pipeline whose resources live in this device.
+    ///
+    /// The device-level resources (the uniform ring and the samplers) are
+    /// created with the first effect pipeline; the descriptor set layout, the
+    /// pipeline layout and one shader module per stage are created eagerly, so
+    /// a descriptor or a module the driver rejects fails here rather than on
+    /// the first frame that draws it. The graphics pipeline itself is built
+    /// per render pass on first use, because a pipeline is tied to the pass it
+    /// is recorded in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::InvalidArgument`] for a descriptor that breaks
+    /// the binding or uniform contract, [`RenderError::Unsupported`] for a
+    /// vertex layout or a blend this backend cannot build,
+    /// [`RenderError::Shader`] for a module or pipeline the driver rejects, and
+    /// [`RenderError::OutOfMemory`] when the ring, the pools or the descriptor
+    /// sets cannot be allocated.
+    pub(crate) fn create_effect_pipeline(
+        &mut self,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        desc: &api::shader::EffectPipelineDesc<'_>,
+    ) -> Result<crate::effect::EffectPipeline, RenderError> {
+        if self.effect.is_none() {
+            // SAFETY: `physical_device` belongs to the instance this device
+            // owns and the query is read-only.
+            let limits = unsafe {
+                self._instance_guard
+                    .instance
+                    .get_physical_device_properties(self.physical_device)
+            }
+            .limits;
+            let created = effect::EffectState::create(
+                &self.device,
+                memory_properties,
+                limits.min_uniform_buffer_offset_alignment,
+            )?;
+            self.effect = Some(created);
+        }
+        let device = self.device.clone();
+        let Some(effects) = self.effect.as_mut() else {
+            return Err(RenderError::Framebuffer {
+                message: "the effect state disappeared during creation".to_owned(),
+            });
+        };
+        effects.create_pipeline(&device, desc)
+    }
+
+    /// Releases an effect pipeline, idling the device first.
+    pub(crate) fn destroy_effect_pipeline(&mut self, pipeline: crate::effect::EffectPipeline) {
+        let Some(effects) = self.effect.as_mut() else {
+            return;
+        };
+        let device = self.device.clone();
+        // SAFETY: an in-flight frame may still draw with the pipeline, so the
+        // device is idled before the handles are freed.
+        unsafe {
+            let _ = device.device_wait_idle();
+        }
+        effects.destroy_pipeline(&device, pipeline.key());
+    }
+
+    /// Renders `scene` into the offscreen `target`.
+    ///
+    /// The offscreen render is synchronous: its pixels are read back by a
+    /// separate call, so the result must be complete when this returns. Any
+    /// texture upload that is still in flight is waited before recording, so
+    /// the pass samples the pixels it was given.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::InvalidArgument`] for a mismatched backend and
+    /// [`RenderError::Unsupported`] when the scene needs a feature the Vulkan
+    /// backend does not implement.
+    pub(crate) fn render_to_target(
+        &mut self,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        target: &RenderTarget,
+        scene: &RenderScene,
+    ) -> Result<(), RenderError> {
+        let VulkanDevice {
+            device,
+            graphics_queue,
+            upload,
+            offscreen_pool,
+            offscreen_command,
+            offscreen_fence,
+            offscreen,
+            render_targets,
+            textures,
+            effect,
+            resources,
+            ..
+        } = self;
+
+        let format = target.desc().format;
+        let key = target.key();
+
+        if let hashbrown::hash_map::Entry::Vacant(entry) = offscreen.entry(format) {
+            entry.insert(target::OffscreenPass::create(device, format, resources)?);
+        }
+        let pass = offscreen
+            .get(&format)
+            .ok_or_else(|| RenderError::Framebuffer {
+                message: "offscreen pipeline state disappeared".to_owned(),
+            })?;
+        if let hashbrown::hash_map::Entry::Vacant(entry) = render_targets.entry(key) {
+            entry.insert(target::VulkanRenderTarget::create(
+                device,
+                memory_properties,
+                pass,
+                *target.desc(),
+            )?);
+        }
+        let gpu = render_targets
+            .get_mut(&key)
+            .ok_or_else(|| RenderError::Framebuffer {
+                message: "render-target state disappeared".to_owned(),
+            })?;
+        upload.wait_all(device)?;
+        let submit = target::OffscreenSubmit {
+            device,
+            queue: *graphics_queue,
+            command_pool: *offscreen_pool,
+            command_buffer: *offscreen_command,
+            fence: *offscreen_fence,
+        };
+        // The offscreen render owns a uniform slot of its own and runs while a
+        // live frame may still be in flight.
+        if let Some(effects) = effect.as_mut() {
+            effects.begin_offscreen_frame();
+        }
+        let result = target::render(
+            &submit,
+            gpu,
+            pass,
+            resources,
+            textures,
+            effect.as_mut(),
+            scene,
+        );
+        if result.is_ok()
+            && let Some(effects) = effect.as_mut()
+        {
+            // The offscreen submit completed only after every command buffer
+            // submitted before it, so no descriptor set is in use any more.
+            effects.end_offscreen_frame(device);
+        }
+        result
+    }
+
+    /// Copies a sub-rectangle of an offscreen `target` into `out`.
+    ///
+    /// The copy is synchronous: a script observes `out` on return. The
+    /// readback buffer is reused across calls rather than allocated per call;
+    /// the readback API takes `&RenderState`, so the buffer sits behind a
+    /// `RefCell` in the device and is borrowed for the duration of the call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::Framebuffer`] when the region is out of bounds,
+    /// the output buffer is the wrong size or the target was never rendered.
+    pub(crate) fn read_render_target(
+        &self,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        target: &RenderTarget,
+        region: PixelRegion,
+        out: &mut [u8],
+    ) -> Result<(), RenderError> {
+        let gpu =
+            self.render_targets
+                .get(&target.key())
+                .ok_or_else(|| RenderError::Framebuffer {
+                    message: "render target has not been rendered yet".to_owned(),
+                })?;
+        validate_readback(target.desc(), region, out.len())?;
+        let mut readback = self.readback.borrow_mut();
+        let submit = target::OffscreenSubmit {
+            device: &self.device,
+            queue: self.graphics_queue,
+            command_pool: self.offscreen_pool,
+            command_buffer: self.offscreen_command,
+            fence: self.offscreen_fence,
+        };
+        target::read(&submit, memory_properties, gpu, &mut readback, region, out)
+    }
+}
+
+impl Drop for VulkanDevice {
+    fn drop(&mut self) {
+        // SAFETY: the caller is responsible for dropping the resources after
+        // all GPU work has finished; `device_wait_idle` makes that true here.
+        // Handles are destroyed in creation-reverse order and the device is
+        // destroyed last.
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            let descriptor_pool = self.resources.descriptor_pool;
+            for texture in self.textures.values() {
+                texture.destroy(&self.device, descriptor_pool);
+            }
+            for target in self.render_targets.values() {
+                target.destroy(&self.device);
+            }
+            for pass in self.offscreen.values() {
+                pass.destroy(&self.device);
+            }
+            if let Some(mut effects) = self.effect.take() {
+                effects.destroy(&self.device);
+            }
+            self.resources.destroy(&self.device);
+            self.upload.destroy(&self.device);
+            self.readback.get_mut().destroy(&self.device);
+            self.device.destroy_command_pool(self.offscreen_pool, None);
+            self.device.destroy_fence(self.offscreen_fence, None);
+            self.device.destroy_device(None);
+        }
+    }
+}
+
+/// The resources that present a frame to a surface.
+///
+/// A device that renders offscreen owns none of them: the surface, the
+/// swapchain, the pipelines and the frame slots belong to the presentation,
+/// not to the device.
+pub(crate) struct VulkanPresentation {
     /// Instance-level surface function pointers.
     pub(crate) surface_loader: ash::khr::surface::Instance,
     /// Device-level swapchain function pointers.
@@ -1423,8 +1720,6 @@ pub(crate) struct VulkanState {
     /// only after a frame of the replacement has been presented, or at
     /// teardown.
     retired_swapchain: Option<swapchain::SwapchainState>,
-    /// The descriptor and layout resources every pipeline set shares.
-    pub(crate) resources: pipelines::PipelineResources,
     /// Compiled pipelines for the swapchain's render pass.
     pub(crate) pipelines: pipelines::PipelineSet,
     /// The render pass and the pipelines the live frame is composed into.
@@ -1448,28 +1743,6 @@ pub(crate) struct VulkanState {
     pub(crate) render_finished: Vec<vk::Semaphore>,
     /// Index of the next frame slot.
     pub(crate) frame_in_flight: usize,
-    /// GPU textures keyed by [`Texture`] identity.
-    pub(crate) textures: Map<u64, texture::VulkanTexture>,
-    /// Per-format offscreen render passes and their pipelines.
-    pub(crate) offscreen: Map<TextureFormat, target::OffscreenPass>,
-    /// GPU offscreen targets keyed by [`RenderTarget`] identity.
-    pub(crate) render_targets: Map<u64, target::VulkanRenderTarget>,
-    /// Custom effect pipelines, their samplers and the frame's uniform ring,
-    /// created on the first created effect pipeline.
-    pub(crate) effect: Option<effect::EffectState>,
-    /// Ring of independently synchronised texture-upload slots.
-    pub(crate) upload: texture::UploadRing,
-    /// Pool used for one synchronous offscreen render or readback.
-    pub(crate) offscreen_pool: vk::CommandPool,
-    /// Command buffer used for one synchronous offscreen render or readback.
-    pub(crate) offscreen_command: vk::CommandBuffer,
-    /// Fence waited on after one synchronous offscreen render or readback
-    /// (created signalled).
-    pub(crate) offscreen_fence: vk::Fence,
-    /// Host-visible buffer reused by every readback; grown on demand. The
-    /// readback entry point takes `&RenderState`, so it is borrowed mutably
-    /// only for the duration of one synchronous copy.
-    pub(crate) readback: RefCell<texture::StagingBuffer>,
     /// Last reported surface size in physical pixels.
     pub(crate) surface_size: (u32, u32),
     /// Number of frames recorded through this state.
@@ -1489,16 +1762,51 @@ pub(crate) struct VulkanState {
     pub(crate) last_timings: Option<FrameTimings>,
 }
 
-impl VulkanState {
+impl VulkanPresentation {
+    /// Destroys the presentation resources.
+    ///
+    /// The device is not destroyed here: it belongs to the device state,
+    /// which outlives the presentation. The caller guarantees the GPU is
+    /// idle, and the surface is destroyed before the device that presents to
+    /// it.
+    fn destroy(&mut self, device: &ash::Device, resources: &pipelines::PipelineResources) {
+        // SAFETY: the caller guarantees the GPU is idle, so no handle below
+        // is in use. They are destroyed in reverse creation order.
+        unsafe {
+            for target in self.frame_targets.iter_mut().flatten() {
+                target.destroy(device, resources);
+            }
+            if let Some(pass) = self.frame_pass.take() {
+                pass.destroy(device);
+            }
+            self.pipelines.destroy(device);
+            if let Some(retired) = self.retired_swapchain.take() {
+                // The render pass is shared with the swapchain that replaced
+                // this one and is destroyed with the last swapchain that uses
+                // it.
+                retired.destroy(device, &self.swapchain_loader);
+            }
+            self.swapchain.destroy(device, &self.swapchain_loader);
+            self.swapchain.destroy_render_pass(device);
+            for frame in &self.frames {
+                destroy_frame(device, frame);
+            }
+            for semaphore in &self.render_finished {
+                device.destroy_semaphore(*semaphore, None);
+            }
+            self.surface_loader.destroy_surface(self.surface, None);
+        }
+    }
+
     /// Destroys the swapchain a recreate replaced, once a frame of its
     /// replacement has been presented.
-    fn dispose_retired_swapchain(&mut self) {
+    fn dispose_retired_swapchain(&mut self, device: &ash::Device) {
         let Some(retired) = self.retired_swapchain.take() else {
             return;
         };
         // The render pass is shared with the swapchain that replaced this one
         // and is destroyed with the last swapchain that uses it.
-        retired.destroy(&self.device, &self.swapchain_loader);
+        retired.destroy(device, &self.swapchain_loader);
     }
 
     /// Reports `fault` as a warning when it is not the fault already reported.
@@ -1519,63 +1827,83 @@ impl VulkanState {
     }
 }
 
-impl Drop for VulkanState {
-    fn drop(&mut self) {
-        // SAFETY: the caller is responsible for dropping the command buffers
-        // and state after all GPU work has finished; `device_wait_idle` makes
-        // that true here. Handles are destroyed in creation-reverse order and
-        // the surface before the device.
-        unsafe {
-            let _ = self.device.device_wait_idle();
-            let descriptor_pool = self.resources.descriptor_pool;
-            for texture in self.textures.values() {
-                texture.destroy(&self.device, descriptor_pool);
-            }
-            for target in self.render_targets.values() {
-                target.destroy(&self.device);
-            }
-            for pass in self.offscreen.values() {
-                pass.destroy(&self.device);
-            }
-            for target in self.frame_targets.iter_mut().flatten() {
-                target.destroy(&self.device, &self.resources);
-            }
-            if let Some(pass) = self.frame_pass.take() {
-                pass.destroy(&self.device);
-            }
-            if let Some(mut effects) = self.effect.take() {
-                effects.destroy(&self.device);
-            }
-            self.pipelines.destroy(&self.device);
-            self.resources.destroy(&self.device);
-            if let Some(retired) = self.retired_swapchain.take() {
-                // The render pass is shared with the current swapchain.
-                retired.destroy(&self.device, &self.swapchain_loader);
-            }
-            self.swapchain.destroy(&self.device, &self.swapchain_loader);
-            self.swapchain.destroy_render_pass(&self.device);
-            for frame in &self.frames {
-                destroy_frame(&self.device, frame);
-            }
-            for semaphore in &self.render_finished {
-                self.device.destroy_semaphore(*semaphore, None);
-            }
-            self.upload.destroy(&self.device);
-            self.readback.get_mut().destroy(&self.device);
-            self.device.destroy_command_pool(self.offscreen_pool, None);
-            self.device.destroy_fence(self.offscreen_fence, None);
-            self.surface_loader.destroy_surface(self.surface, None);
-            self.device.destroy_device(None);
+/// The state of one Vulkan render caller.
+///
+/// A caller either presents to a surface or renders offscreen, and the two
+/// need different resources: the presenting caller owns a presentation (the
+/// surface, the swapchain and the frame slots), the offscreen caller owns
+/// only the device. Both own the device, because the device does not depend
+/// on a surface.
+pub(crate) enum VulkanState {
+    /// A caller that presents to a surface.
+    Presenting(Box<VulkanPresentingState>),
+    /// A caller that renders into offscreen targets and presents to nothing.
+    Offscreen(Box<VulkanDevice>),
+}
+
+/// The state of a caller that presents to a surface.
+///
+/// The device and the presentation are separate owners: the device's
+/// resources outlive the surface, and the presentation's resources belong to
+/// the device that presents to them.
+pub(crate) struct VulkanPresentingState {
+    /// The logical device and the resources that do not depend on a surface.
+    pub(crate) device: VulkanDevice,
+    /// The surface, the swapchain and the frame slots.
+    pub(crate) presentation: VulkanPresentation,
+}
+
+impl VulkanState {
+    /// The device the state owns.
+    pub(crate) fn device(&self) -> &VulkanDevice {
+        match self {
+            Self::Presenting(presenting) => &presenting.device,
+            Self::Offscreen(device) => device,
         }
+    }
+
+    /// The device the state owns, mutably.
+    pub(crate) fn device_mut(&mut self) -> &mut VulkanDevice {
+        match self {
+            Self::Presenting(presenting) => &mut presenting.device,
+            Self::Offscreen(device) => device,
+        }
+    }
+
+    /// The timings of the most recent presented frame.
+    ///
+    /// A state that renders offscreen presents no frame, so it has no
+    /// presentation timings.
+    pub(crate) fn last_frame_timings(&self) -> Option<FrameTimings> {
+        match self {
+            Self::Presenting(presenting) => presenting.presentation.last_timings,
+            Self::Offscreen(_) => None,
+        }
+    }
+}
+
+impl Drop for VulkanPresentingState {
+    fn drop(&mut self) {
+        // SAFETY: the GPU is idle before any handle below is freed.
+        unsafe {
+            let _ = self.device.device.device_wait_idle();
+        }
+        // The presentation resources belong to the device, so they are
+        // destroyed before it.
+        self.presentation
+            .destroy(&self.device.device, &self.device.resources);
     }
 }
 
 /// RAII teardown for the resources created during `begin_with_display`.
 ///
 /// The guard borrows the swapchain and pipelines, which live in the caller's
-/// scope until ownership transfers to [`VulkanState`]. It also owns the frames
-/// and presentation semaphores created later. Disarming it before the
-/// successful return prevents double teardown on `Drop`.
+/// scope until ownership transfers to the state. It also owns the frames and
+/// presentation semaphores created later. Disarming it before the successful
+/// return prevents double teardown on `Drop`.
+///
+/// The device and its own resources are not the guard's: they belong to the
+/// device state, which outlives the guard and is destroyed after it.
 struct BeginTeardown<'a> {
     device: &'a ash::Device,
     surface_loader: &'a ash::khr::surface::Instance,
@@ -1583,11 +1911,8 @@ struct BeginTeardown<'a> {
     surface: vk::SurfaceKHR,
     swapchain: &'a swapchain::SwapchainState,
     pipelines: &'a pipelines::PipelineSet,
-    resources: &'a pipelines::PipelineResources,
     frames: Vec<VulkanFrame>,
     render_finished: Vec<vk::Semaphore>,
-    upload: Option<texture::UploadRing>,
-    offscreen: Option<(vk::CommandPool, vk::Fence)>,
     armed: bool,
 }
 
@@ -1601,13 +1926,6 @@ impl Drop for BeginTeardown<'_> {
         // surface is destroyed before the device.
         unsafe {
             let _ = self.device.device_wait_idle();
-            if let Some(upload) = self.upload.take() {
-                upload.destroy(self.device);
-            }
-            if let Some((pool, fence)) = self.offscreen.take() {
-                self.device.destroy_command_pool(pool, None);
-                self.device.destroy_fence(fence, None);
-            }
             for frame in &self.frames {
                 destroy_frame(self.device, frame);
             }
@@ -1615,18 +1933,19 @@ impl Drop for BeginTeardown<'_> {
                 self.device.destroy_semaphore(*semaphore, None);
             }
             self.pipelines.destroy(self.device);
-            self.resources.destroy(self.device);
             self.swapchain.destroy(self.device, self.swapchain_loader);
             self.swapchain.destroy_render_pass(self.device);
             self.surface_loader.destroy_surface(self.surface, None);
-            self.device.destroy_device(None);
         }
     }
 }
 
 /// Returns the framebuffer for a swapchain image, or an error if stale.
-fn framebuffers_for(state: &VulkanState, image_index: u32) -> Result<vk::Framebuffer, RenderError> {
-    state
+fn framebuffers_for(
+    presentation: &VulkanPresentation,
+    image_index: u32,
+) -> Result<vk::Framebuffer, RenderError> {
+    presentation
         .swapchain
         .framebuffers
         .get(image_index as usize)
@@ -1923,7 +2242,8 @@ fn present_recovery(result: Result<bool, vk::Result>) -> Result<SwapchainRecover
 /// losing the pinned render pass.
 fn recreate_swapchain(
     device: &ash::Device,
-    state: &mut VulkanState,
+    physical_device: vk::PhysicalDevice,
+    presentation: &mut VulkanPresentation,
     surface: vk::SurfaceKHR,
 ) -> Result<(), RenderError> {
     // SAFETY: the device is idle before any swapchain resource is touched.
@@ -1934,48 +2254,48 @@ fn recreate_swapchain(
         )
     })?;
 
-    let requested = state.surface_size;
+    let requested = presentation.surface_size;
     let new_swapchain = swapchain::create(
         &swapchain::SurfaceContext {
             device,
-            physical_device: state.physical_device,
-            surface_loader: &state.surface_loader,
-            swapchain_loader: &state.swapchain_loader,
+            physical_device,
+            surface_loader: &presentation.surface_loader,
+            swapchain_loader: &presentation.swapchain_loader,
             surface,
         },
         requested,
-        state.preferred_format,
-        Some(&state.swapchain),
+        presentation.preferred_format,
+        Some(&presentation.swapchain),
     );
 
     match new_swapchain {
         Ok(new_swapchain) => {
-            if state.swapchain_presented {
+            if presentation.swapchain_presented {
                 // The display may still be showing the last image the current
                 // swapchain presented, so it is retired and destroyed only
                 // after a frame of its replacement has been presented. A
                 // swapchain retired earlier no longer has a frame on screen.
-                state.dispose_retired_swapchain();
-                let old = std::mem::replace(&mut state.swapchain, new_swapchain);
-                state.retired_swapchain = Some(old);
+                presentation.dispose_retired_swapchain(device);
+                let old = std::mem::replace(&mut presentation.swapchain, new_swapchain);
+                presentation.retired_swapchain = Some(old);
             } else {
                 // The current swapchain never presented, so nothing of it is
                 // on screen and it is destroyed now. The swapchain retired
                 // before it may still be on screen and stays retired.
-                let unused = std::mem::replace(&mut state.swapchain, new_swapchain);
-                unused.destroy(device, &state.swapchain_loader);
+                let unused = std::mem::replace(&mut presentation.swapchain, new_swapchain);
+                unused.destroy(device, &presentation.swapchain_loader);
             }
-            state.swapchain_presented = false;
-            if let Err(error) = rebuild_image_sync(state, device) {
-                state.swapchain_ready = false;
+            presentation.swapchain_presented = false;
+            if let Err(error) = rebuild_image_sync(presentation, device) {
+                presentation.swapchain_ready = false;
                 return Err(error);
             }
-            state.swapchain_ready = true;
+            presentation.swapchain_ready = true;
             Ok(())
         }
         Err(error) => {
             // Keep the previous render pass and format for a later retry.
-            state.swapchain_ready = false;
+            presentation.swapchain_ready = false;
             Err(error)
         }
     }
@@ -1986,15 +2306,18 @@ fn recreate_swapchain(
 /// The new swapchain references the new surface, so the surface is adopted
 /// before the swapchain is swapped in and the old surface is destroyed only
 /// after its last user, the old swapchain, is gone. Neither handle is
-/// destroyed twice: the new surface replaces `state.surface` and is destroyed
-/// by [`VulkanState`]'s `Drop` exactly as the surface it replaces would be.
+/// destroyed twice: the new surface replaces the presentation's surface and
+/// is destroyed by [`VulkanPresentation`]'s teardown exactly as the surface
+/// it replaces would be.
 fn recreate_surface(
     pipeline: &VulkanPipeline,
-    state: &mut VulkanState,
+    device: &ash::Device,
+    physical_device: vk::PhysicalDevice,
+    presentation: &mut VulkanPresentation,
     surface: &mut VulkanSurface,
 ) -> Result<(), RenderError> {
     // SAFETY: no GPU work may reference the old surface while it is replaced.
-    unsafe { state.device.device_wait_idle() }.map_err(|error| {
+    unsafe { device.device_wait_idle() }.map_err(|error| {
         device::result_error(
             "failed to idle the device before recreating the surface",
             error,
@@ -2009,8 +2332,8 @@ fn recreate_surface(
         ash_window::create_surface(
             &pipeline.instance_guard.entry,
             &pipeline.instance_guard.instance,
-            state.display_handle,
-            state.window_handle,
+            presentation.display_handle,
+            presentation.window_handle,
             None,
         )
     }
@@ -2026,21 +2349,25 @@ fn recreate_surface(
     // intact, so the new surface still has no user and is destroyed here.
     let new_swapchain = swapchain::create(
         &swapchain::SurfaceContext {
-            device: &state.device,
-            physical_device: state.physical_device,
-            surface_loader: &state.surface_loader,
-            swapchain_loader: &state.swapchain_loader,
+            device,
+            physical_device,
+            surface_loader: &presentation.surface_loader,
+            swapchain_loader: &presentation.swapchain_loader,
             surface: new_surface,
         },
-        state.surface_size,
-        state.preferred_format,
-        Some(&state.swapchain),
+        presentation.surface_size,
+        presentation.preferred_format,
+        Some(&presentation.swapchain),
     );
     let new_swapchain = match new_swapchain {
         Ok(new_swapchain) => new_swapchain,
         Err(error) => {
             // SAFETY: the surface was created above and no swapchain uses it.
-            unsafe { state.surface_loader.destroy_surface(new_surface, None) };
+            unsafe {
+                presentation
+                    .surface_loader
+                    .destroy_surface(new_surface, None)
+            };
             return Err(error);
         }
     };
@@ -2051,23 +2378,26 @@ fn recreate_surface(
     // A swapchain retired by an earlier resize targets the old surface, so it
     // is destroyed before the surface goes; a lost surface has no image on
     // screen to keep it alive for.
-    state.dispose_retired_swapchain();
-    let old_surface = std::mem::replace(&mut state.surface, new_surface);
+    presentation.dispose_retired_swapchain(device);
+    let old_surface = std::mem::replace(&mut presentation.surface, new_surface);
     surface.surface = new_surface;
-    let old_swapchain = std::mem::replace(&mut state.swapchain, new_swapchain);
-    old_swapchain.destroy(&state.device, &state.swapchain_loader);
-    state.swapchain_presented = false;
+    let old_swapchain = std::mem::replace(&mut presentation.swapchain, new_swapchain);
+    old_swapchain.destroy(device, &presentation.swapchain_loader);
+    presentation.swapchain_presented = false;
     // SAFETY: the old swapchain is gone and the device is idle.
-    unsafe { state.surface_loader.destroy_surface(old_surface, None) };
+    unsafe {
+        presentation
+            .surface_loader
+            .destroy_surface(old_surface, None)
+    };
 
     // A failure here leaves the surface valid but the swapchain unusable;
     // `swapchain_ready` makes the next frame report out-of-date for a retry.
-    let device = state.device.clone();
-    if let Err(error) = rebuild_image_sync(state, &device) {
-        state.swapchain_ready = false;
+    if let Err(error) = rebuild_image_sync(presentation, device) {
+        presentation.swapchain_ready = false;
         return Err(error);
     }
-    state.swapchain_ready = true;
+    presentation.swapchain_ready = true;
     Ok(())
 }
 
@@ -2079,9 +2409,12 @@ fn recreate_surface(
 /// semaphore could not be recreated is also repaired here, because the rebuild
 /// only succeeds when every subsequent acquire has a valid semaphore. The
 /// device is idle here, so destroying and recreating them is safe.
-fn rebuild_image_sync(state: &mut VulkanState, device: &ash::Device) -> Result<(), RenderError> {
-    let image_count = state.swapchain.images.len().max(1);
-    for semaphore in state.render_finished.drain(..) {
+fn rebuild_image_sync(
+    presentation: &mut VulkanPresentation,
+    device: &ash::Device,
+) -> Result<(), RenderError> {
+    let image_count = presentation.swapchain.images.len().max(1);
+    for semaphore in presentation.render_finished.drain(..) {
         // SAFETY: owned here and the GPU is idle.
         unsafe { device.destroy_semaphore(semaphore, None) };
     }
@@ -2096,9 +2429,9 @@ fn rebuild_image_sync(state: &mut VulkanState, device: &ash::Device) -> Result<(
                     ),
                 },
             )?;
-        state.render_finished.push(semaphore);
+        presentation.render_finished.push(semaphore);
     }
-    for frame in &mut state.frames {
+    for frame in &mut presentation.frames {
         if frame.image_available != vk::Semaphore::null() {
             continue;
         }
@@ -2115,7 +2448,7 @@ fn rebuild_image_sync(state: &mut VulkanState, device: &ash::Device) -> Result<(
             )?;
         frame.image_available = semaphore;
     }
-    state.images_in_flight = vec![vk::Fence::null(); image_count];
+    presentation.images_in_flight = vec![vk::Fence::null(); image_count];
     Ok(())
 }
 
@@ -2129,16 +2462,16 @@ fn rebuild_image_sync(state: &mut VulkanState, device: &ash::Device) -> Result<(
 /// null semaphore.
 fn recreate_acquired_semaphore(
     device: &ash::Device,
-    state: &mut VulkanState,
+    presentation: &mut VulkanPresentation,
     frame_index: usize,
 ) -> Result<(), RenderError> {
-    if frame_index >= state.frames.len() {
-        state.swapchain_ready = false;
+    if frame_index >= presentation.frames.len() {
+        presentation.swapchain_ready = false;
         return Err(RenderError::Framebuffer {
             message: format!("frame slot {frame_index} does not exist"),
         });
     }
-    let frame = &mut state.frames[frame_index];
+    let frame = &mut presentation.frames[frame_index];
     // SAFETY: the acquire signalled this semaphore and nothing waits on it.
     let recreated = unsafe {
         device.destroy_semaphore(frame.image_available, None);
@@ -2146,12 +2479,12 @@ fn recreate_acquired_semaphore(
     };
     match recreated {
         Ok(semaphore) => {
-            state.frames[frame_index].image_available = semaphore;
+            presentation.frames[frame_index].image_available = semaphore;
             Ok(())
         }
         Err(error) => {
-            state.frames[frame_index].image_available = vk::Semaphore::null();
-            state.swapchain_ready = false;
+            presentation.frames[frame_index].image_available = vk::Semaphore::null();
+            presentation.swapchain_ready = false;
             Err(RenderError::DeviceUnavailable {
                 message: format!(
                     "failed to recreate the image-available semaphore: {}",
@@ -2171,6 +2504,16 @@ fn display_for_window(window: &RawWindowHandle) -> Option<RawDisplayHandle> {
         }
         RawWindowHandle::Win32(_) => Some(RawDisplayHandle::Windows(WindowsDisplayHandle::new())),
         _ => None,
+    }
+}
+
+/// The error a presentation action reports for a state that has no surface.
+///
+/// A state that renders offscreen has no surface to present to, so the
+/// action is refused instead of presenting nothing.
+fn no_surface_error() -> RenderError {
+    RenderError::InvalidArgument {
+        message: "this render state has no presentation surface; it renders offscreen".to_owned(),
     }
 }
 
@@ -2294,7 +2637,7 @@ fn validate_upload(
 #[cfg(test)]
 fn upload_submit_count(state: &RenderState) -> Option<u64> {
     match &state.kind {
-        StateKind::Vulkan(vstate) => Some(vstate.upload.submits()),
+        StateKind::Vulkan(vstate) => Some(vstate.device().upload.submits()),
         StateKind::Null(_) => None,
     }
 }

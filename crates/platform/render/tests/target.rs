@@ -10,9 +10,9 @@ use api::error::RenderError;
 use api::geometry::{PixelRegion, RectF};
 use render::{
     PipelineConfig, RenderContent, RenderNode, RenderPipeline, RenderScene, RenderTarget,
-    RenderTargetDesc, begin_render_state, capabilities, create_render_pipeline,
-    create_render_target, create_texture, destroy_render_target, read_render_target,
-    render_to_target, upload_texture,
+    RenderTargetDesc, begin_offscreen_render_state, begin_render_state, capabilities,
+    create_render_pipeline, create_render_target, create_texture, destroy_render_target,
+    read_render_target, render_to_target, upload_texture,
 };
 use testkit::headless_window;
 
@@ -20,13 +20,8 @@ use testkit::headless_window;
 /// result.
 type BlendCase = (BlendMode, [u8; 4], [u8; 4], [u8; 4]);
 
-/// Renders a 1×1 target with `background` filled, then a unit solid `src`
-/// composited with `mode`, and returns the resulting RGBA8 pixel.
-fn composite_one_pixel(mode: BlendMode, background: [f32; 4], src: [f32; 4]) -> [u8; 4] {
-    let pipeline = RenderPipeline::null();
-    let (_surface, mut state) = begin_render_state(&pipeline, &headless_window()).expect("begin");
-    let target = create_render_target(&pipeline, RenderTargetDesc::new(1, 1)).expect("target");
-
+/// The scene that composites `src` over `background` into one pixel.
+fn one_pixel_scene(mode: BlendMode, background: [f32; 4], src: [f32; 4]) -> RenderScene {
     let mut scene = RenderScene::with_root_node();
     let root = scene.root;
     let child = scene.push(RenderNode {
@@ -38,7 +33,17 @@ fn composite_one_pixel(mode: BlendMode, background: [f32; 4], src: [f32; 4]) -> 
     });
     scene.node_mut(root).expect("root").children = vec![child];
     scene.background = Some(background);
+    scene
+}
 
+/// Renders a 1×1 target with `background` filled, then a unit solid `src`
+/// composited with `mode`, and returns the resulting RGBA8 pixel.
+fn composite_one_pixel(mode: BlendMode, background: [f32; 4], src: [f32; 4]) -> [u8; 4] {
+    let pipeline = RenderPipeline::null();
+    let (_surface, mut state) = begin_render_state(&pipeline, &headless_window()).expect("begin");
+    let target = create_render_target(&pipeline, RenderTargetDesc::new(1, 1)).expect("target");
+
+    let scene = one_pixel_scene(mode, background, src);
     render_to_target(&pipeline, &mut state, &target, &scene).expect("render");
     let mut out = [0u8; 4];
     read_render_target(
@@ -582,4 +587,49 @@ fn vulkan_target_capabilities_or_skip() {
     // The GPU path draws the destination-dependent blends with the
     // destination-blend program.
     assert!(caps.supports_destination_dependent_blend);
+}
+
+/// The GPU path is reachable without a window.
+///
+/// A Vulkan state created offscreen owns a logical device and no surface, so
+/// a scene can be rendered into an offscreen target and read back on a
+/// machine that has a GPU but no display. The pixels are the CPU path's
+/// pixels: the two backends composite the same scene.
+///
+/// A machine without a Vulkan device skips the test, exactly like the other
+/// Vulkan cases here.
+#[test]
+fn vulkan_offscreen_state_composites_the_cpu_paths_scene_or_skip() {
+    let Ok(pipeline) = create_render_pipeline(PipelineConfig::vulkan()) else {
+        return;
+    };
+    let Ok(mut state) = begin_offscreen_render_state(&pipeline) else {
+        return;
+    };
+    let target = create_render_target(&pipeline, RenderTargetDesc::new(1, 1)).expect("target");
+    let scene = one_pixel_scene(
+        BlendMode::SourceOver,
+        [0.0, 0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0, 1.0],
+    );
+    render_to_target(&pipeline, &mut state, &target, &scene).expect("render");
+    let mut gpu = [0u8; 4];
+    read_render_target(
+        &pipeline,
+        &state,
+        &target,
+        PixelRegion::new(0, 0, 1, 1),
+        &mut gpu,
+    )
+    .expect("read");
+
+    let cpu = composite_one_pixel(
+        BlendMode::SourceOver,
+        [0.0, 0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0, 1.0],
+    );
+    assert_eq!(
+        gpu, cpu,
+        "the GPU and the CPU must composite the same scene: {gpu:?} vs {cpu:?}"
+    );
 }

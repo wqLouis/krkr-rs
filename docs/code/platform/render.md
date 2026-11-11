@@ -113,6 +113,8 @@ pub fn begin_render_state(p: &RenderPipeline, window: &RawWindowHandle)
 pub fn begin_render_state_with_display(p: &RenderPipeline, display: &RawDisplayHandle,
                                        window: &RawWindowHandle)
     -> Result<(Surface, RenderState), RenderError>;
+pub fn begin_offscreen_render_state(p: &RenderPipeline)
+    -> Result<RenderState, RenderError>;
 pub fn resize(p: &RenderPipeline, surface: &Surface, state: &mut RenderState,
               size: (u32, u32)) -> Result<SurfaceEvent, RenderError>;
 pub fn create_texture(p: &RenderPipeline, desc: TextureDesc) -> Result<Texture, RenderError>;
@@ -173,6 +175,20 @@ keep a compositor's layout churn from costing frames:
 `begin_render_state_with_display` is the complete entry point for X11, XCB
 and Wayland: `VK_KHR_surface` needs the platform display connection in
 addition to the window handle, and `raw-window-handle` splits the two.
+
+`begin_offscreen_render_state` brings up a **logical device without a
+surface**: a graphics queue, no `VkSurfaceKHR` and no swapchain. The state it
+returns renders into offscreen targets and reads them back, and it cannot
+present a frame — `render`, `resize` and `recover_surface` report
+`RenderError::InvalidArgument` for it. It is what makes the GPU path
+reachable on a machine that has a GPU but no display, and what lets the GPU
+path be compared with the CPU path on one scene.
+
+The Vulkan backend creates the device on its own, with the surface only when
+the caller presents to a window: the queue family is chosen for what the
+device is for (graphics and presentation for a surface, graphics alone for an
+offscreen device), and the swapchain extension is enabled only on the device
+that creates a swapchain.
 
 ### Textures and targets
 
@@ -363,6 +379,13 @@ combined graphics+present queue family, and manages the swapchain
 textured and solid pipelines with per-blend fixed-function state, and
 per-frame command buffers and fences. `MAX_FRAMES_IN_FLIGHT` is 2.
 
+The logical device and the presentation are separate owners. The device owns
+the queues, the descriptor resources, the upload ring, the texture table, the
+offscreen targets and the readback buffer — everything that does not depend on
+a surface. The presentation owns the surface, the swapchain, the swapchain
+pipelines and the frame slots, and a state that renders offscreen owns no
+presentation at all.
+
 ### Blend states
 
 Blend state is not a shader concern; it is a per-pipeline
@@ -471,8 +494,9 @@ a lenient one.
 
 | value | owner |
 |---|---|
-| the Vulkan instance, the selected physical device, the pipeline set | L1 (`RenderPipeline`) |
-| the swapchain, the staging ring, the texture table, the offscreen targets, the frame timings | L2 (`RenderState`) |
+| the Vulkan instance, the selected physical device | L1 (`RenderPipeline`) |
+| the Vulkan logical device, its queues, the descriptor resources, the staging ring, the texture table, the offscreen targets | L2 (`RenderState`) |
+| the surface, the swapchain, the swapchain pipelines, the frame slots, the frame timings | L2 (`RenderState`), only for a state that presents |
 | the presentation surface handle | L2 (`Surface`) |
 | the draw tree | L2 (`RenderScene`) |
 | the CPU bitmap contents and the dirty flags | L2 |
@@ -520,6 +544,7 @@ Every failure is a typed `RenderError` (the variants are listed in
 | a GPU allocation failed | `RenderError::OutOfMemory` |
 | the descriptor is empty, oversized or non-RGBA8 | `RenderError::InvalidArgument` |
 | the state/surface/target does not belong to this pipeline | `RenderError::InvalidArgument` |
+| a presentation action is asked of a state that has no surface | `RenderError::InvalidArgument` — the state renders offscreen and presents nothing |
 | the upload region is out of bounds or the pixel slice does not match it | `RenderError::Upload` |
 | the readback region is out of bounds or the output buffer is the wrong size | `RenderError::Framebuffer` |
 | the shader or the pipeline failed to build | `RenderError::Shader` — the message names the program and the blend slot the pipeline was for |
@@ -573,7 +598,9 @@ L2-side registry is documented in [`../engine/shader.md`](../engine/shader.md).
   destination-dependent blends sampling the destination, the fixed-function
   blends matching the baseline, the advertised capabilities, the descriptor
   validation, the rejected mismatched buffer and region, the dropped target
-  releasing its pixels, and the Vulkan target capabilities (or a skip).
+  releasing its pixels, the Vulkan target capabilities (or a skip), and the
+  Vulkan offscreen state compositing the CPU path's scene without a window
+  (or a skip).
 * `crates/platform/render/tests/texture.rs` — the upload region and length
   validation, and the rejected invalid descriptors.
 * `crates/platform/render/src/lib.rs` `mod tests` — the batch upload applying

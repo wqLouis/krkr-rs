@@ -29,6 +29,11 @@
 //! software rasterizer (the correctness baseline) and the Vulkan backend
 //! renders into a real device image and copies it back.
 //!
+//! The Vulkan device is created on its own, with a surface only when the
+//! caller presents to a window: [`begin_offscreen_render_state`] brings up a
+//! logical device that renders into offscreen targets, so the GPU path is
+//! reachable on a machine that has a GPU but no display.
+//!
 //! The pipeline keeps no mutable state: every call takes the evolving
 //! [`RenderState`] as an explicit `&mut` parameter, and the scene is
 //! consumed by the caller. Two independent pipelines can therefore run in one
@@ -352,6 +357,27 @@ pub fn begin_render_state_with_display(
     }
 }
 
+/// Creates a render state that renders offscreen, without a surface.
+///
+/// The Vulkan backend creates a logical device with a graphics queue and no
+/// surface, so a scene can be rendered into an offscreen target and read back
+/// on a machine that has a GPU but no display. The null backend returns the
+/// state that composites with the CPU rasterizer.
+///
+/// The state has no surface, so it cannot present a frame: use
+/// [`render_to_target`] and [`read_render_target`] with it.
+///
+/// # Errors
+///
+/// Returns [`RenderError::DeviceUnavailable`] when the Vulkan backend cannot
+/// bring up a logical device.
+pub fn begin_offscreen_render_state(p: &RenderPipeline) -> Result<RenderState, RenderError> {
+    match &p.kind {
+        PipelineKind::Null(backend) => backend.begin_offscreen(),
+        PipelineKind::Vulkan(backend) => backend.begin_offscreen(),
+    }
+}
+
 /// Reports a new surface size and updates `state`.
 ///
 /// # Errors
@@ -635,7 +661,9 @@ pub fn recover_surface(
 pub fn last_frame_timings(state: &RenderState) -> Option<FrameTimings> {
     match &state.kind {
         StateKind::Null(null) => null.last_timings,
-        StateKind::Vulkan(vulkan) => vulkan.last_timings,
+        // A state that renders offscreen presents no frame, so it has no
+        // presentation timings.
+        StateKind::Vulkan(vulkan) => vulkan.last_frame_timings(),
     }
 }
 

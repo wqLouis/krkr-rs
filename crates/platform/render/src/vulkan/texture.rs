@@ -1,9 +1,10 @@
 //! Texture image creation and sub-rectangle staging uploads.
 //!
-//! Because [`crate::create_texture`] has no access to a [`RenderState`], the
-//! GPU image is allocated lazily on the first upload and cached in the state's
-//! texture table. Every upload leaves the image in
-//! `SHADER_READ_ONLY_OPTIMAL`, which is the layout the pipelines sample.
+//! Because [`crate::create_texture`] has no access to a
+//! [`crate::state::RenderState`], the GPU image is allocated lazily on the
+//! first upload and cached in the state's texture table. Every upload leaves
+//! the image in `SHADER_READ_ONLY_OPTIMAL`, which is the layout the pipelines
+//! sample.
 #![allow(unsafe_code)]
 
 use ash::vk;
@@ -12,11 +13,10 @@ use api::error::RenderError;
 use api::geometry::PixelRegion;
 
 use crate::collections::{Map, Set, set_with_capacity};
-use crate::state::{RenderState, StateKind};
-use crate::texture::{TextureDesc, TextureFormat};
+use crate::texture::{Texture, TextureDesc, TextureFormat};
 
+use super::VulkanDevice;
 use super::shaders::SOURCE_DESCRIPTOR;
-use super::{VulkanPipeline, VulkanState};
 
 /// GPU image, view and descriptor set for one texture handle.
 pub(crate) struct VulkanTexture {
@@ -187,7 +187,7 @@ struct UploadSlot {
 ///
 /// Each slot stages and submits one batch independently, so a batch only waits
 /// on the GPU when its slot is reused, never right after it is submitted. The
-/// ring is caller-owned state on [`VulkanState`]; there are no globals.
+/// ring is caller-owned state on the device; there are no globals.
 pub(crate) struct UploadRing {
     slots: Vec<UploadSlot>,
     next: usize,
@@ -926,7 +926,47 @@ fn record_copy(context: &UploadContext<'_>, copy: CopyRecord<'_>) {
     }
 }
 
-impl VulkanPipeline {
+impl VulkanDevice {
+    /// Copies a sub-rectangle of `pixels` into `tex`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::Upload`] when the texture cannot be created or
+    /// the upload cannot be staged.
+    pub(crate) fn upload_texture(
+        &mut self,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        tex: &Texture,
+        region: PixelRegion,
+        pixels: &[u8],
+    ) -> Result<(), RenderError> {
+        let key = tex.key();
+        if !self.textures.contains_key(&key) {
+            let gpu = create_texture(
+                &self.device,
+                memory_properties,
+                self.resources.descriptor_set_layout,
+                self.resources.descriptor_pool,
+                self.resources.sampler,
+                *tex.desc(),
+            )?;
+            self.textures.insert(key, gpu);
+        }
+
+        let gpu = self
+            .textures
+            .get_mut(&key)
+            .ok_or_else(|| RenderError::Upload {
+                message: "texture state disappeared during upload".to_owned(),
+            })?;
+        let context = UploadContext {
+            device: &self.device,
+            memory_properties,
+            queue: self.graphics_queue,
+        };
+        upload(&context, &mut self.upload, gpu, key, region, pixels)
+    }
+
     /// Copies every upload's sub-rectangle into its texture as one batch.
     ///
     /// Every region is validated and every destination image created before
@@ -934,33 +974,32 @@ impl VulkanPipeline {
     /// call does not wait for that submit; the present path waits for the
     /// uploads it is about to sample (or a later upload to the same texture
     /// waits when it reuses an in-flight slot).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::Upload`] when a region is out of bounds, the
+    /// pixel slice does not match it or the batch cannot be staged.
     pub(crate) fn upload_textures(
-        &self,
-        state: &mut RenderState,
+        &mut self,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
         uploads: &[crate::TextureUpload<'_>],
     ) -> Result<(), RenderError> {
-        let StateKind::Vulkan(vstate) = &mut state.kind else {
-            return Err(RenderError::InvalidArgument {
-                message: "the Vulkan backend received a null render state".to_owned(),
-            });
-        };
-
         for upload in uploads {
             super::validate_upload(upload.texture.desc(), upload.region, upload.pixels)?;
         }
 
         for upload in uploads {
             let key = upload.texture.key();
-            if !vstate.textures.contains_key(&key) {
+            if !self.textures.contains_key(&key) {
                 let gpu = create_texture(
-                    &vstate.device,
-                    &self.memory_properties,
-                    vstate.resources.descriptor_set_layout,
-                    vstate.resources.descriptor_pool,
-                    vstate.resources.sampler,
+                    &self.device,
+                    memory_properties,
+                    self.resources.descriptor_set_layout,
+                    self.resources.descriptor_pool,
+                    self.resources.sampler,
                     *upload.texture.desc(),
                 )?;
-                vstate.textures.insert(key, gpu);
+                self.textures.insert(key, gpu);
             }
         }
 
@@ -973,19 +1012,12 @@ impl VulkanPipeline {
             })
             .collect();
 
-        let VulkanState {
-            device,
-            graphics_queue,
-            upload,
-            textures,
-            ..
-        } = &mut **vstate;
         let context = UploadContext {
-            device,
-            memory_properties: &self.memory_properties,
-            queue: *graphics_queue,
+            device: &self.device,
+            memory_properties,
+            queue: self.graphics_queue,
         };
-        upload_batch(&context, upload, textures, &batch)
+        upload_batch(&context, &mut self.upload, &mut self.textures, &batch)
     }
 }
 

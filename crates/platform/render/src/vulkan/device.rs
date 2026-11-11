@@ -3,9 +3,8 @@
 //! This module is private to [`crate::vulkan`]. It contains only immutable
 //! mechanism: [`VulkanPipeline`](super::VulkanPipeline) keeps the created
 //! instance and selected physical device; the logical device and its queues
-//! are created per caller in
-//! [`begin`](super::VulkanPipeline::begin_with_display), because present-queue
-//! selection needs the window surface.
+//! are created per caller, with a surface when the caller presents to a
+//! window and without one when the caller renders offscreen.
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, CString, c_char};
@@ -43,9 +42,26 @@ pub(crate) struct DeviceBundle {
     /// Queue used for graphics submission.
     pub(crate) graphics_queue: vk::Queue,
     /// Queue used for presentation (the same family as graphics here).
+    ///
+    /// A null handle for a device that renders offscreen: it presents to
+    /// nothing.
     pub(crate) present_queue: vk::Queue,
-    /// Index of the combined graphics+present queue family.
+    /// Index of the queue family the device was created with.
     pub(crate) queue_family_index: u32,
+}
+
+/// What a logical device is created for.
+///
+/// A device that presents to a window needs a queue family that supports both
+/// graphics and presentation for that surface, and the swapchain extension. A
+/// device that renders offscreen needs a graphics queue and nothing else, so
+/// it is created without a surface and without the swapchain extension.
+#[derive(Clone, Copy)]
+pub(crate) enum PresentTarget<'a> {
+    /// The device presents to this surface.
+    Surface(&'a ash::khr::surface::Instance, vk::SurfaceKHR),
+    /// The device renders into offscreen targets and presents to nothing.
+    Offscreen,
 }
 
 /// Returns the name of an extension property as a borrowed `CStr`.
@@ -279,40 +295,22 @@ fn device_has_extension(
     }
 }
 
-/// Creates a logical device with a combined graphics+present queue family.
+/// Creates a logical device for `target`.
+///
+/// The device's queue family is the one the target needs: a family that
+/// supports both graphics and presentation for a surface, or a graphics
+/// family for an offscreen device.
+///
+/// # Errors
 ///
 /// Returns [`RenderError::DeviceUnavailable`] when no queue family supports
-/// both graphics and presentation for `surface`.
+/// what the target needs, or when the driver refuses the device.
 pub(crate) fn create_device(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
-    surface_loader: &ash::khr::surface::Instance,
-    surface: vk::SurfaceKHR,
+    target: PresentTarget<'_>,
 ) -> Result<DeviceBundle, RenderError> {
-    // SAFETY: `physical_device` belongs to this `instance`; read-only.
-    let families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-    let mut chosen = None;
-    for (index, family) in families.iter().enumerate() {
-        let graphics = family.queue_flags.contains(vk::QueueFlags::GRAPHICS);
-        if !graphics || family.queue_count == 0 {
-            continue;
-        }
-        let index = index as u32;
-        // SAFETY: `physical_device` and `surface` belong to `instance`; the
-        // query is read-only.
-        let present = unsafe {
-            surface_loader.get_physical_device_surface_support(physical_device, index, surface)
-        }
-        .unwrap_or(false);
-        if present {
-            chosen = Some(index);
-            break;
-        }
-    }
-
-    let queue_family_index = chosen.ok_or_else(|| RenderError::DeviceUnavailable {
-        message: "no Vulkan queue family supports both graphics and presentation".to_owned(),
-    })?;
+    let queue_family_index = select_queue_family(instance, physical_device, target)?;
 
     let priorities = [1.0_f32];
     let queue_info = vk::DeviceQueueCreateInfo::default()
@@ -320,13 +318,18 @@ pub(crate) fn create_device(
         .queue_priorities(&priorities);
     let queue_infos = [queue_info];
 
-    let enabled_extensions = [ash::khr::swapchain::NAME.as_ptr()];
+    // The swapchain extension is only needed to create a swapchain, so a
+    // device that renders offscreen does not enable it.
+    let mut enabled_extensions: Vec<*const c_char> = Vec::new();
+    if let PresentTarget::Surface(..) = target {
+        enabled_extensions.push(ash::khr::swapchain::NAME.as_ptr());
+    }
     let device_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_infos)
         .enabled_extension_names(&enabled_extensions);
 
     // SAFETY: `device_info` borrows locals valid for the call; the device is
-    // destroyed in `VulkanState::drop`.
+    // destroyed with the state that owns it.
     let device = unsafe { instance.create_device(physical_device, &device_info, None) }.map_err(
         |error| RenderError::DeviceUnavailable {
             message: format!(
@@ -339,13 +342,64 @@ pub(crate) fn create_device(
     // SAFETY: `queue_family_index` was validated above and `queue_index` 0 is
     // below the family's queue count.
     let graphics_queue = unsafe { device.get_device_queue(queue_family_index, 0) };
-    let present_queue = graphics_queue;
+    let present_queue = match target {
+        PresentTarget::Surface(..) => graphics_queue,
+        PresentTarget::Offscreen => vk::Queue::null(),
+    };
 
     Ok(DeviceBundle {
         device,
         graphics_queue,
         present_queue,
         queue_family_index,
+    })
+}
+
+/// Selects the queue family the logical device uses.
+///
+/// A device that presents to a surface needs a family that supports both
+/// graphics and presentation for that surface; a device that renders
+/// offscreen needs a family that supports graphics. The first family that
+/// satisfies the target wins, so the choice is the driver's own ordering.
+fn select_queue_family(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    target: PresentTarget<'_>,
+) -> Result<u32, RenderError> {
+    // SAFETY: `physical_device` belongs to this `instance`; read-only.
+    let families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+    for (index, family) in families.iter().enumerate() {
+        if !family.queue_flags.contains(vk::QueueFlags::GRAPHICS) || family.queue_count == 0 {
+            continue;
+        }
+        let index = index as u32;
+        let usable = match target {
+            PresentTarget::Surface(surface_loader, surface) => {
+                // SAFETY: `physical_device` and `surface` belong to `instance`;
+                // the query is read-only.
+                unsafe {
+                    surface_loader.get_physical_device_surface_support(
+                        physical_device,
+                        index,
+                        surface,
+                    )
+                }
+                .unwrap_or(false)
+            }
+            PresentTarget::Offscreen => true,
+        };
+        if usable {
+            return Ok(index);
+        }
+    }
+
+    Err(RenderError::DeviceUnavailable {
+        message: match target {
+            PresentTarget::Surface(..) => {
+                "no Vulkan queue family supports both graphics and presentation".to_owned()
+            }
+            PresentTarget::Offscreen => "no Vulkan queue family supports graphics".to_owned(),
+        },
     })
 }
 

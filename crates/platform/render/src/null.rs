@@ -106,6 +106,21 @@ impl NullRenderPipeline {
         Ok((surface, state))
     }
 
+    /// Creates a headless state that renders offscreen.
+    ///
+    /// The null backend has no window and no surface, so the state is the one
+    /// [`begin`](Self::begin) returns; what differs is that the caller has no
+    /// surface to present to.
+    ///
+    /// # Errors
+    ///
+    /// Never: the null backend can always produce a state.
+    pub fn begin_offscreen(&self) -> Result<RenderState, RenderError> {
+        Ok(RenderState {
+            kind: StateKind::Null(Box::default()),
+        })
+    }
+
     /// Updates the tracked surface size.
     ///
     /// The size is recorded in the state; the null backend never presents it.

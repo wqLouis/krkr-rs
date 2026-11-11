@@ -12,6 +12,14 @@ compared against them. The behaviour the engine keeps is stated in
 [`arch/`](arch/overall.md) and [`code/`](code/README.md); this page only
 says how long the paths take and where the time goes.
 
+It also carries the **later measurements**: the test sweep on the committed
+tree (§5), the **script columns** — the lexer, the parser, the code
+generator (§6) — the **render path** (§7), the workload the pixel audit
+measured (§8), and the **GPU path**, one part of which has landed and one
+of which has not (§9). Each of those names its method and its date, and
+keeps what was measured apart from what was inferred. A number here is an
+observation of one build on one host; it is not a property of the engine.
+
 ---
 
 ## 1. The measurement setup
@@ -142,6 +150,47 @@ reads is worth at most 8 ms of a 630 ms phase — it is not worth doing.
 | the allocator (`mimalloc`) | measured and rejected (`TODO.md` §17) |
 | the zlib backend | `flate2` inflates with `zlib-rs`; the system zlib measures 277 MB/s against it and would save ~45 ms, but the feature links the C library, which the Android target would then need |
 | compiling the scripts ahead of time | measured on the game's own 742 KB `mainwindow.tjs`: compile 45.4 ms, bytecode run 6.1 ms, source run 28.9 ms — so ~65–70 ms of the startup, but the bytecode round trip is broken today (`x += 2` and `x++` fail when a script comes from bytecode), and the reference's round trip is broken the same way |
+
+### 2.5 The startup after the performance batch
+
+**2026-11-11.** The tree at `313ed28`, release build, the game's own
+directory.
+
+**Method.** A monotonic clock around the **whole process**: `time.monotonic()`
+→ `subprocess.run(["./target/release/krkr", "--headless", "--frames", "1",
+"--base-dir", <game>])` → the clock again, the process's own output
+discarded, three runs in a row. `--frames 1` is the frame count §1 asks
+for: the headless loop paces every frame, so one frame is the startup and
+nothing else.
+
+| run | wall |
+|---|---|
+| 1 | 1.096 s |
+| 2 | 0.816 s |
+| 3 | 0.790 s |
+
+**min 0.790 s, median 0.816 s, max 1.096 s.** The first run is the one
+directly after the build, with the archive's 1.16 GB cold in the page
+cache; the two after it are the same binary on a warm cache. The 1.096 s
+is a cold-cache outlier, not a mode of the startup.
+
+Against the baseline recorded before the performance batch — **0.763 s to
+0.799 s**, the same instrument and the same game — **the batch did not move
+the startup**. The new minimum (0.790 s) is inside the old band, the
+median (0.816 s) is 2 % above its top, and both differences are inside the
+run-to-run spread of a process that reads 1.16 GB over NTFS.
+
+This is the **process** wall time, start to exit. The phase timers of §2.1
+and the profile of §2.3 measure the interior of the same run (0.70 s from
+open to the first presented frame); the two are different instruments and
+are not comparable with each other.
+
+**Inferred, not measured.** The batch took two of the levers §2.4 names —
+the six embedded fonts and the read pool, which now read the fonts in
+parallel and inflate an archive entry on a worker — and the total did not
+move. Whether those levers won time that the script path gave back, or won
+nothing this instrument can see, the measurement does not say; the phase
+timers would name it.
 
 ## 3. The scene load
 
@@ -477,6 +526,325 @@ A single step that took longer than 50 ms is reported with its phase times:
 Every report is bounded: a step below the threshold is never reported, and a
 step above it is reported at most once every five seconds, so a step that is
 slow in every frame does not report in every frame.
+
+---
+
+## 5. The test sweep on the committed tree
+
+**2026-11-11.** The tree at `313ed28`.
+
+**Method.** One `cargo test` per crate, the counts read from the `test
+result:` lines of each run.
+
+| crate | passed | failed |
+|---|---|---|
+| api | 52 | 0 |
+| fs | 62 | 0 |
+| media | 93 | 0 |
+| psd | 27 | 0 |
+| render | 96 | 0 |
+| engine | 437 | 0 |
+| compat | 1 707 | 0 |
+| vm | 6 | 0 |
+| script | 31 | 0 |
+| tjs | 152 | 0 |
+| devtools | 25 | 0 |
+| testkit | 0 | 0 |
+| **total** | **2 688** | **0** |
+
+`testkit` is the shared test helper and carries no test of its own.
+
+Two crates reported **no result**, and the two have different causes:
+
+* **`platform`** — the crate has **no default feature** and refuses to
+  compile without exactly one of `platform-linux` / `platform-android`
+  (`crates/platform/platform/src/lib.rs:71-72` is a `compile_error!`). A
+  `cargo test -p platform` on its own is therefore a compile error, and it
+  produces no test line at all: the crate is only testable through a
+  consumer that selects the platform, which is the app.
+* **`app`** — the app's test binaries need the `render` lib, and the log's
+  only build diagnostic is a compile error in that crate — "could not
+  compile `render` (lib) due to 8 previous errors". The tree carried the
+  in-flight headless-Vulkan render change while the sweep ran — that
+  change's own gate failed on clippy, which is where the same compile
+  error in `render` shows up — so the render lib did not compile and the
+  app's tests were never built. **Inferred** from the order of the sweep:
+  `app` is the last crate in it that needs `render`, and every crate
+  before it that needs `render` passed, so the change landed between them.
+
+Neither is a failing test: nothing failed. The 2 688 that ran are the whole
+of the suite that could run, and the two crates above are the two that did
+not run.
+
+---
+
+## 6. The script columns
+
+The TJS2 VM is being reimplemented in Rust one column at a time: the
+**lexer** (C1), the **parser** (C2), the **code generator** (C3). The corpus
+is the game's own scripts — 175 `.tjs` files, 6.5 MB, 3 206 523 code units,
+628 254 tokens — extracted from the title's archives. The reports are
+`/tmp/lexer-bench/REPORT.md`, `/tmp/parser-c2/REPORT.md` and
+`/tmp/codegen-c3/REPORT.md`; the code is in the committed `crates/script`.
+
+### 6.1 The lexer (C1) — 1.53× the C++ analyser
+
+**Method.** The corpus above, the C++ `tTJSLexicalAnalyzer` and the Rust
+`Lexer` over the same flags, the unoptimised development builds on both
+sides, the two **measured alternately** in seven rounds each with the
+machine idle.
+
+| | tokens/s |
+|---|---|
+| the C++ analyser | 12 692 744 |
+| the Rust analyser | **19 356 655** |
+
+**1.53× the C++ analyser.** Two proofs of equivalence over the whole
+corpus:
+
+* 628 254 tokens compared one by one — kind, value and position — every
+  one identical to the C++ analyser's dump;
+* all 175 dumps **byte-identical through the vendored bison parser's
+  `yylex` seam**: the grammar asks the Rust analyser for its tokens
+  through the C interface and gets the byte stream the C++ one produced.
+
+The lexing is therefore no longer a factor in the script path: the corpus
+costs about a third less to lex than it does in the C++ tree.
+
+### 6.2 The parser (C2) — the trees are identical, 19.7× the grammar
+
+**Method.** The same corpus, both sides in the **parse-only** mode — the
+C++'s generator makes no code, the Rust's is not driven — the C++ with
+`-O0 -D_DEBUG` and the Rust with `rustc -O`, the two sides **measured
+alternately** in seven rounds each.
+
+**The trees are identical.** Over the 175 scripts the Rust parser built
+**341 675 nodes**, and **0 of them differ** from the grammar's node: the
+same kind, the same place in the script, the same value. 173 of the 175
+scripts compare node for node over their whole tree. The two that do not
+(`sysscn/system.tjs` and `system/UILoader.tjs`) stop the parse in the
+**code generator's** constant folding, which refuses an operation the
+reference's variant performs; the count difference (350 450 against
+341 675) is the folding's, not the parser's.
+
+**The speed.** The median of seven rounds each, both sides including the
+lexer, the parse, and the building of the expression trees with the
+folding:
+
+| | the parse |
+|---|---|
+| the C++ grammar (bison) | 1.736 s |
+| the Rust parser | **0.0880 s** |
+
+**19.7× faster than the C++'s bison parser.** The asymmetry is against the
+Rust: the C++ side also creates the script block and the code contexts,
+which the Rust's parse-only mode creates none of, so the ratio is a lower
+bound. Take each side's own lexer out and the parser's own share is about
+1.69 s against 0.058 s — **29×**.
+
+### 6.3 The code generator (C3) — not equivalent yet
+
+**Status: in progress.** The comparison machinery is in place and it finds
+the differences, which is its job; the generator itself is not yet the
+C++'s, so **the emitted code is not compared**.
+
+**Method.** The C++ grammar drives the Rust generator through the C
+interface — the proof seam — and each finished context is compared with the
+C++'s, the code area word by word and the data area value by value, over
+the whole corpus.
+
+| | |
+|---|---|
+| scripts | 175 |
+| code contexts compared | 10 355 |
+| instruction words compared | 844 066 |
+| constant values compared | 83 440 |
+| scripts that agree completely | **5** |
+| scripts that still differ | **170** |
+
+Two defects are open:
+
+* the **jump fix-up can cycle** between two jumps that point at each other,
+  and the corpus run then **hangs** — it stops on
+  `k2compat/k2compat_modeless.tjs`. The reference's fix-up has the same
+  shape and does not cycle, because the code it works on does not;
+* the **constant folding** refuses an operation the reference's variant
+  performs — the two scripts of §6.2 stop there.
+
+The generator is also **not faster** than the C++'s yet: the C++ generator
+alone measured 0.847 s (best of three) against 3.489 s for the C++ and the
+Rust together with the comparison, and that difference is an upper bound on
+the Rust's own work, not a measurement of it. The known cause is the C
+interface copying every node, at `O(subtree)` per construction.
+
+So the column's two questions are in different states: the **trees** are
+proved identical, the **code** is not.
+
+---
+
+## 7. The render path
+
+### 7.1 The dirty region: a pixel write must not re-upload the whole image
+
+**Landed** — `313ed28`, 2026-11-11.
+
+**What was wrong.** The bitmap state carried two ways to say "these pixels
+changed": the whole bitmap, and a rectangle. The writers picked the first
+one for writes that touch a known rectangle — a single-pixel write marked
+the whole image.
+
+**What it cost.** The frame's upload sends the marked region alone. With
+the whole bitmap marked, a full-screen layer written per frame sent
+**8.3 MB** where the write had changed **4 bytes**. The 8.3 MB is the
+layer's own size (1920×1080×4) and the upload volume the path would send;
+it is not a measured frame time.
+
+**What changed.** The rule is now uniform: *a write that touches a known
+rectangle marks that rectangle; a write that rewrites the whole image marks
+the whole image.* Thirty sites across the engine and the compat layer
+follow it: the four pinned pixel writes, the fill family, the tone
+operations, the blur, the polygon and stroke writers, the glyph blit, and
+the four sites that overrode a good region with a whole mark.
+
+The marked region is a **conservative bounding rectangle** — the box that
+covers the pixels written, not the set of them. Two distant pixels in one
+frame mark the box between them; that is the existing rule of
+`mark_dirty_rect`, not a new one.
+
+**The evidence.** Five tests in `crates/engine/tests/layer_ops.rs` and five
+in `crates/compat/tests/dirty_region.rs`: a fill, a clipped fill, a tone
+operation, a rectangle fill and a blur each mark exactly the rectangle they
+wrote; a single-pixel write marks one pixel; a write outside the image
+marks nothing.
+
+The report is `/tmp/dirty-region/REPORT.md`.
+
+### 7.2 Two open divergences between the CPU and the GPU
+
+Both are **open**: neither has a fix, and neither has a decision. They are
+recorded here because they decide what a GPU-vs-CPU comparison can mean.
+
+**(a) The Photoshop mix arithmetic.** The reference's Photoshop mix is a
+**word-wide** operation: the red and blue lanes share their borrows. The
+**CPU rasterizer** reproduces it exactly
+(`crates/platform/render/src/cpu.rs:534-540`). The **shared blend table**
+(`crates/platform/render/src/blend.rs:392-395`) computes a **per-lane**
+signed difference, and the **GPU program is generated from that table** —
+so the GPU follows the per-lane arithmetic.
+
+**Method.** A transcription of the reference's C++ and of the table's `mix`,
+weighted by the source's alpha scaled by the opacity, compared over 300 000
+random (source, destination, opacity) triples.
+
+**2 053 mismatches — 0.68 % of the triples** — each a **±1** difference in
+the red or the blue lane. Both models agree on the vectors the tests use,
+which is why the divergence is invisible to them today.
+
+It also means the tree's own two paths disagree: the engine's L2 pixel
+path reads the shared table, the CPU rasterizer uses the classic word
+kernels, and the reference-matching one is the rasterizer's.
+
+**(b) The sampling filter.** The reference's default stretch is the
+**nearest** copy (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2902`,
+`:3191-3226`); the **CPU rasterizer samples nearest**
+(`crates/platform/render/src/cpu.rs:781-806`); the **Vulkan scene sampler
+is `LINEAR`** (`crates/platform/render/src/vulkan/pipelines.rs:974-985`).
+A magnified or minified layer is therefore a different image on the two
+paths — not a rounding difference.
+
+The script is `/tmp/gpu-fallback-audit/blendcmp2.py`; the report is
+`/tmp/gpu-fallback-audit/REPORT.md` §4.2.
+
+### 7.3 The GPU gap inventory, and what the game's own code reaches
+
+**Method.** The inventory is a read of the render layer's own surface
+(`crates/platform/render/src/lib.rs` and the Vulkan backend): every action
+the engine can ask for, and what the Vulkan path answers. What the game
+reaches is a scan of the game's own entries: the `.tjs` entries extracted
+from the archives and converted from UTF-16LE, and the scenario entries
+scanned with token-only searches.
+
+**Twelve gaps**, of which eleven are refusals (`RenderError::Unsupported`)
+and one is a correctness gap:
+
+| | gap |
+|---|---|
+| G1 | a destination-dependent blend in an **offscreen** target — the target has no copy of the destination |
+| G2 | a destination-dependent blend with a **solid** payload or the **effect** program |
+| G3 | a **mask clip** (both backends) |
+| G4 | a **GPU glyph run** (both backends) |
+| G5 | an **effect draw** on the CPU rasterizer — the GPU is the only path |
+| G6 | an **effect pipeline** on the null backend |
+| G7 | an effect program with a **destination-dependent blend** |
+| G8 | an effect program with a **non-`UnitQuad`** vertex layout |
+| G9 | an effect sampler kind outside the three supported |
+| G10 | `install_presented_frame_slot` on Vulkan |
+| G11 | `begin_render_state` without a display handle on Linux |
+| G12 | the **arithmetic** of the destination-dependent blend (§7.2a) — the one that is not a refusal |
+
+**The game's own code reaches none of them.** The render tree the game
+builds is made of `SourceOver`, `Replace` and `AddAlpha` nodes with
+rectangle clips and ordinary textures, and every one of those has a
+fixed-function Vulkan pipeline. The game asks for no destination-dependent
+blend in the render tree — its one `operateRect(…, omPsOverlay)` is a CPU
+pixel operation — no mask clip and no glyph run, and its only transition
+kind is `crossfade`, which has a GPU program.
+
+**Inferred from that:** the gaps are the boundaries of the Vulkan path, not
+of this title's workload. A title that did use a destination-dependent blend
+would meet G1 and G2 on the first offscreen target it drew.
+
+---
+
+## 8. The workload: the pixel audit
+
+**Method.** The game's own entries — the 175 `.tjs` files and the 28 `.func`
+entries of the script corpus, and the 134 scenario entries — searched for
+`getPixel`, `setPixel`, `copyPixels` and `.pixels`.
+
+**Zero hits in the scripts. Zero in the scenarios.** The title never
+reaches a single pixel through the script API.
+
+**What that says about the workload (inferred):** it is **decode, blit and
+alpha-composite**. Nothing in the title reads or writes individual pixels,
+so the per-pixel script paths are not on its hot path, and a measurement of
+this title is a measurement of the decode and the compositing, not of the
+pixel accessors.
+
+**The caution every such audit needs.** A byte-level search for an ASCII
+identifier over this game's entries returns **zero** — not because the
+identifier is absent, but because the entries are not ASCII: they are
+**UTF-16LE, Shift-JIS or PSB containers**. An audit over this corpus must
+state its decoding step and print a **coverage figure beside its hit
+count**. A zero over the raw bytes is a statement about the encoding, not
+about the code.
+
+---
+
+## 9. The GPU path: one landed, one in flight
+
+**The GPU-first fallback policy — landed** (`86972ab`, 2026-11-11). If the
+GPU becomes the primary path and the CPU the fallback, the decision is made
+**once per subtree, in L2**, and never per node: a subtree's nodes blend
+against each other, so a subtree split between the two paths would break
+that order. The backend's capability is read once at engine construction and
+carried on the scene; a subtree the GPU cannot draw is composited on the
+CPU and handed to the GPU as **one texture** — the cache bitmap a
+whole-subtree transition already uses, so the projection needed no change.
+The rule is published under one name in the render crate and delegates to
+the blend mode's own predicate, so the modes are listed once.
+
+On this workload no subtree fallback is triggered: the game's scene is made
+of the three blend modes that have fixed-function pipelines (§7.3).
+
+**The headless Vulkan device — in flight.** The logical device's lifetime is
+being separated from the presentation surface's, so the GPU path is usable —
+and measurable — on a host with a GPU and no display: a render state without
+a surface renders into offscreen targets and reads them back, and the CPU and
+the GPU can then be compared on one scene with no window anywhere. The change
+is in the tree and has not passed the gate yet (its gate run failed on
+clippy); the worker reports it as **not compiled**
+(`/tmp/headless-vulkan/REPORT.md`). No number from it is on this page yet.
 
 ---
 ---
