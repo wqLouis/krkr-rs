@@ -85,8 +85,8 @@ use crate::{CompatCtx, CompatError};
 
 mod bitmap;
 pub(crate) use bitmap::{
-    COLOR_KEY_NONE, IMAGE_EXTENSION_PROBE, PendingLoad, load_cached_storage_image,
-    resolve_pending_load, set_index_plane_decoder, submit_pending_load,
+    COLOR_KEY_NONE, PendingLoad, image_candidates, load_cached_storage_image, resolve_pending_load,
+    resolved_image_name, set_index_plane_decoder, submit_pending_load,
 };
 mod common;
 pub(crate) use common::{ObjectKind, duplicate_object, swap_red_blue};

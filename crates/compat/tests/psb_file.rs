@@ -650,6 +650,42 @@ fn a_container_is_published_under_its_base_name() {
     );
 }
 
+// A container whose name carries a full-width uppercase letter is published
+// under the name the script holds it under.
+//
+// The game's `addPackImageInfo` names a container
+// `Storages.extractStorageName(storage).toLowerCase()`
+// (system/packimage.tjs:20-47), and the script language's `toLowerCase`
+// folds `A-Z` and nothing else
+// (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:2409-2427`): the full-width
+// `Ｈ` (U+FF28) of the name stays as it is. The media's own name fold folds
+// the same range (`reference/cpp/core/tjs2/tjsString.cpp:90-110`), so the
+// publication uses it as well: a fold over the whole Unicode range publishes
+// the container under `fixtureｈ.psb`, the script asks for `fixtureＨ.psb`,
+// and the published container is not the one the media answers for. The
+// graph entry is deleted here, so the read is a missing storage without the
+// publication.
+#[test]
+fn a_container_with_a_full_width_uppercase_letter_is_published_under_that_name() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.write_fixture("FixtureＨ.psb", &build_fixture());
+
+    env.run(
+        "var packImageMap = %[]; \
+         packImageMap[\"fixtureＨ.psb\"] = new PSBFile(\"FixtureＨ.psb\"); \
+         delete packImageMap[\"fixtureＨ.psb\"]; \
+         var lines = []; \
+         lines.load('var://./packImageMap/fixtureＨ.psb/root/res');",
+    );
+
+    assert_eq!(
+        env.string("lines[0]"),
+        "FAKEIMAGE",
+        "the container must be published under the name the script holds it under"
+    );
+}
+
 // The `var://` media and the `psb://` media serve the same bytes.
 //
 // The reference registers the container's root resources with the `psb://`

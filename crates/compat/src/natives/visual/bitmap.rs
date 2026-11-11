@@ -23,6 +23,7 @@ use super::common::{
 };
 use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::natives::storages::extract_storage_ext;
 use crate::natives::system::value_as_i64;
 use crate::resource::ResourceResolver;
 use crate::storage::strip_file_media;
@@ -43,17 +44,54 @@ pub(super) fn bitmap_payload_id(payload: *mut c_void) -> Option<u32> {
     unsafe { &*(payload as *const BitmapInst) }.id
 }
 
-/// Common image extensions probed when the requested storage name does not
-/// resolve, mirroring the reference `TVPFindGraphicLoadHandler` order.
+/// The image extensions a request that carries none is probed with.
 ///
 /// The one list every L3 image path probes with: the `Bitmap` path, the
 /// `Layer` path and the layerEx image path. The graphic loader registers one
 /// handler per extension and suggests the first one whose file exists, so the
 /// list is the handler table.
-pub(crate) const IMAGE_EXTENSION_PROBE: [&str; 21] = [
+const IMAGE_EXTENSION_PROBE: [&str; 21] = [
     ".webp", ".bmp", ".dib", ".jpeg", ".jpg", ".jif", ".png", ".tlg", ".tlg5", ".tlg6", ".gif",
     ".tif", ".tiff", ".tga", ".dds", ".pnm", ".ico", ".qoi", ".hdr", ".exr", ".ff",
 ];
+
+/// The storage names an image request is looked up under, in order.
+///
+/// A request that carries an extension is looked up under that name and under
+/// no other: the extension names the file, so no extension is suggested for
+/// it. A request that carries none is looked up as given first and then with
+/// each registered extension appended, and the first candidate that resolves
+/// wins.
+///
+/// The one rule every L3 image path resolves through: the `Bitmap` path, the
+/// `Layer` path and the layerEx image path.
+pub(crate) fn image_candidates(requested: &str) -> Vec<String> {
+    let lookup = strip_file_media(requested);
+    if extract_storage_ext(lookup).is_some() {
+        return vec![lookup.to_string()];
+    }
+    let mut candidates = Vec::with_capacity(IMAGE_EXTENSION_PROBE.len() + 1);
+    candidates.push(lookup.to_string());
+    candidates.extend(
+        IMAGE_EXTENSION_PROBE
+            .iter()
+            .map(|extension| format!("{lookup}{extension}")),
+    );
+    candidates
+}
+
+/// The name a resolved image is decoded under.
+///
+/// A name that resolves as given keeps the spelling the script gave it; a
+/// name that resolves through an extension carries the extension, so the
+/// decoder picks its format from it.
+pub(crate) fn resolved_image_name(requested: &str, candidate: &str) -> String {
+    if candidate == strip_file_media(requested) {
+        requested.to_string()
+    } else {
+        candidate.to_string()
+    }
+}
 
 /// Why an image could not be loaded.
 ///
@@ -105,11 +143,12 @@ impl From<String> for ImageLoadError {
     }
 }
 
-/// Read `name` through the attached L2 [`Storage`], probing the common image
-/// extensions when the name itself does not resolve.
+/// Read `name` through the attached L2 [`Storage`], resolving it to the
+/// storage names an image request is looked up under.
 ///
-/// The plain name is tried first and each extension is composed only after the
-/// earlier candidates miss, so a name that resolves as given composes none.
+/// A request that carries an extension is read under that name alone; a
+/// request that carries none is read as given first and then under each
+/// registered extension.
 pub(crate) fn read_image_from_storage(
     storage: &Storage,
     name: &str,
@@ -174,8 +213,10 @@ impl ResolvedImage {
 
 /// Resolves an image name into the entry that holds it.
 ///
-/// The plain name is tried first and each extension is composed only after the
-/// earlier candidates miss, so a name that resolves as given composes none.
+/// The candidates are the storage names an image request is looked up under:
+/// a request that carries an extension is resolved under that name alone, and
+/// a request that carries none is resolved as given first and then under each
+/// registered extension.
 ///
 /// A candidate is **resolved**, never read: the default media's entry is
 /// looked up and its read is scheduled, and a media's entry is read by its
@@ -185,24 +226,14 @@ pub(crate) fn resolve_image(
     storage: &Storage,
     name: &str,
 ) -> Result<ResolvedImage, ImageLoadError> {
-    // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
-    let lookup = strip_file_media(name);
-    // The plain name first, then each extension of the probe list.
-    let mut candidates = Vec::with_capacity(IMAGE_EXTENSION_PROBE.len() + 1);
-    candidates.push(lookup.to_string());
-    candidates.extend(
-        IMAGE_EXTENSION_PROBE
-            .iter()
-            .map(|extension| format!("{lookup}{extension}")),
-    );
-    for candidate in candidates {
+    for candidate in image_candidates(name) {
         match storage.resolve_entry(&candidate)? {
             Some(StorageEntry::File {
                 name: entry_name,
                 pending,
             }) => {
                 return Ok(ResolvedImage::File {
-                    name: resolved_image_name(name, &candidate, lookup),
+                    name: resolved_image_name(name, &candidate),
                     entry: StorageEntry::File {
                         name: entry_name,
                         pending,
@@ -218,7 +249,7 @@ pub(crate) fn resolve_image(
                 match storage.read_entry(&media) {
                     Ok(bytes) => {
                         return Ok(ResolvedImage::Media {
-                            name: resolved_image_name(name, &candidate, lookup),
+                            name: resolved_image_name(name, &candidate),
                             bytes,
                         });
                     }
@@ -235,18 +266,6 @@ pub(crate) fn resolve_image(
     Err(ImageLoadError::Storage(StorageReadError::NotFound(
         name.to_string(),
     )))
-}
-
-/// The name a resolved image is decoded under.
-///
-/// A name that resolves as given keeps the spelling the script gave it; a
-/// name that resolves through an extension carries the extension.
-fn resolved_image_name(requested: &str, candidate: &str, lookup: &str) -> String {
-    if candidate == lookup {
-        requested.to_string()
-    } else {
-        candidate.to_string()
-    }
 }
 
 /// The province image's name for a graphic: `_p` before the extension.
@@ -269,9 +288,9 @@ fn province_image_name(name: &str) -> String {
 /// The province image's storage name for a graphic, when the storage holds
 /// it.
 ///
-/// The name carries `_p` before the extension and is resolved exactly as an
-/// image name is: the plain name first, then each extension. A storage
-/// without that image has no province image.
+/// The name carries `_p` before the extension and is resolved as an image
+/// name is: it carries an extension of its own, so it is looked up under that
+/// name alone. A storage without that image has no province image.
 pub(crate) fn resolve_province_image(
     storage: &Storage,
     name: &str,

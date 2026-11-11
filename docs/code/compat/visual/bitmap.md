@@ -114,16 +114,18 @@ installed"` — instead of fabricating a result.
 
 ### The name resolution
 
-The literal name is tried **first**; only on a storage miss are the 21 common
-image extensions probed, in the reference's `TVPFindGraphicLoadHandler`
-order:
+An extension is **suggested only for a request that carries none**. A request
+that names an extension is looked up under that name and under no other; a
+request that names none is tried **as given first** and then with each of the
+21 common image extensions appended, in the reference's
+`TVPFindGraphicLoadHandler` order:
 
 ```
 .webp .bmp .dib .jpeg .jpg .jif .png .tlg .tlg5 .tlg6 .gif
 .tif .tiff .tga .dds .pnm .ico .qoi .hdr .exr .ff
 ```
 
-A name that resolves as given composes no extension. A miss raises
+The first candidate that resolves wins. A miss raises
 `"storage not found: {name}"`; any other storage error is surfaced, not
 swallowed.
 
@@ -156,11 +158,13 @@ pixels become alpha `0`; every other pixel becomes alpha `255`.
 ### The resolution
 
 The name is resolved by the L2 storage namespace, and the resolution is a
-**lookup**: the plain name first, then each extension of the shared
-extension list, and the first candidate that resolves wins. The reference
-resolves a graphic name the same way — it asks the storage whether the file
-exists (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:301-318`) and never
-reads a candidate it does not need.
+**lookup**: a request that carries an extension is looked up under that name
+alone, and a request that carries none is looked up as given first and then
+under each extension of the shared extension list. The first candidate that
+resolves wins. The reference resolves a graphic name the same way — it asks
+the storage whether the file exists
+(`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:301-318`) and never reads
+a candidate it does not need.
 
 The default media's entry is looked up and its **read is scheduled** on the
 storage's read pool, so the bytes are produced off the thread that resolved
@@ -326,7 +330,7 @@ The decoded-image cache lives in the L2 scene, keyed by
 
 | Test | What it asserts |
 |---|---|
-| `crates/compat/tests/bitmap.rs` | the load populates the bitmap and returns the metainfo; `id`/`nativeId` raise; `loadHeader` probes without decoding; `getSaveOption` returns real objects; the save path encodes and writes through the host seam; the media prefix is stripped; the type is passed verbatim; `meta.bpp` is read as an index; `loadAsync` dispatches `onLoaded`; the typed errors when the codec is absent; the four constructor shapes; dropping a script bitmap releases its image; a stored member result does not pin the bitmap; a single numeric argument leaves the bitmap null; the load into a resized and a same-size bitmap; the name resolution order and the extension probe; the cache limit behaviour and the pristine-pixel cache hit; an image whose pixel buffer is not the bytes its size declares answers the out-of-range pixel value, hands out no buffer address, and refuses to be saved or copied from. |
+| `crates/compat/tests/bitmap.rs` | the load populates the bitmap and returns the metainfo; `id`/`nativeId` raise; `loadHeader` probes without decoding; `getSaveOption` returns real objects; the save path encodes and writes through the host seam; the media prefix is stripped; the type is passed verbatim; `meta.bpp` is read as an index; `loadAsync` dispatches `onLoaded`; the typed errors when the codec is absent; the four constructor shapes; dropping a script bitmap releases its image; a stored member result does not pin the bitmap; a single numeric argument leaves the bitmap null; the load into a resized and a same-size bitmap; the name resolution order and the extension probe; a request that carries an extension resolves to that file alone and does not fall through to the probe list, and a request that carries none is resolved through it; the cache limit behaviour and the pristine-pixel cache hit; an image whose pixel buffer is not the bytes its size declares answers the out-of-range pixel value, hands out no buffer address, and refuses to be saved or copied from. |
 | `crates/compat/tests/visual.rs` | `bitmap_pixels_and_size`, `bitmap_copy_from_copies_pixels`. |
 | `crates/compat/tests/dispatch_visual.rs` | the receiver routing. |
 | `crates/compat/tests/layer_behaviour.rs` | the Layer-only members reject a bitmap source. |

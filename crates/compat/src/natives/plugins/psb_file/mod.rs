@@ -466,9 +466,15 @@ fn load_document(ctx: &CompatCtx, inst: &mut PsbFileInst, path: &str) -> Result<
 
 /// Reference `PSBMedia::NormalizeDomainName` (`PSBMedia.cpp:16-22`):
 /// lower-case from the first `.` onward.
+///
+/// The fold is the one the script language's `toLowerCase` applies: `A-Z`
+/// and nothing else. A name that carries a full-width uppercase letter
+/// (`Ｈ`, U+FF28) keeps that letter; a fold over the whole Unicode range
+/// would turn it into `ｈ` (U+FF48) and name the container after a letter
+/// no script asks for.
 pub(crate) fn normalize_psb_domain(path: &str) -> String {
     match path.find('.') {
-        Some(dot) => format!("{}{}", &path[..dot], path[dot..].to_lowercase()),
+        Some(dot) => format!("{}{}", &path[..dot], path[dot..].to_ascii_lowercase()),
         None => path.to_string(),
     }
 }
@@ -483,8 +489,12 @@ pub(crate) fn normalize_psb_domain(path: &str) -> String {
 /// `addPackImageInfo`) — so the media looks the container up where the
 /// script looks for it. The `psb://` media names a container by its
 /// normalized storage name instead.
+///
+/// The name is folded the way the script folds it: `A-Z` and nothing else.
+/// A name that carries a full-width uppercase letter keeps that letter, so
+/// the media finds the container where the script looks for it.
 fn publish_to_var_media(services: &CompatServices, path: &str, container: Rc<media::PsbContainer>) {
-    let name = extract_storage_name(path).to_lowercase();
+    let name = extract_storage_name(path).to_ascii_lowercase();
     var_file::publish(services, &format!("{name}/root"), container);
 }
 

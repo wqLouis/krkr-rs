@@ -343,10 +343,12 @@ A `Bitmap` passed to a Layer-only member raises
    resolves it. A colour key is a pass the worker applies to the decoded
    pixels, so it does not keep the load synchronous. A province load, a load
    with no pool and a refused job decode synchronously.
-3. The storage read tries the **plain name first**; only on a miss are the 21
-   common image extensions probed in order (`.webp .bmp .dib .jpeg .jpg .jif
-   .png .tlg .tlg5 .tlg6 .gif .tif .tiff .tga .dds .pnm .ico .qoi .hdr .exr
-   .ff`). A miss raises `"storage not found: {name}"`.
+3. The storage read looks the request up under the names an image request
+   resolves to: a request that carries an extension is read under that name
+   alone, and a request that carries none is read **as given first** and then
+   under each of the 21 common image extensions in order (`.webp .bmp .dib
+   .jpeg .jpg .jif .png .tlg .tlg5 .tlg6 .gif .tif .tiff .tga .dds .pnm .ico
+   .qoi .hdr .exr .ff`). A miss raises `"storage not found: {name}"`.
 4. The colour key is applied, and the decoded image is checked for
    consistency — `"the decoded image is malformed"`.
 5. The **existing** bitmap is reused, so repeated loads do not leak scene
@@ -357,7 +359,8 @@ A `Bitmap` passed to a Layer-only member raises
 7. The graphic's **province image** is loaded with it, when the storage holds
    one: the province graphic of a graphic is the graphic whose name carries
    `_p` before the extension (`map.png` → `map_p.png`, `map` → `map_p`), and
-   the name is resolved exactly as an image name is. The plane is the
+   the name is resolved as an image name is — it carries an extension of its
+   own, so it is looked up under that name alone. The plane is the
    **index plane** of that file (see below), and it is sized to the main
    image. A storage without that file leaves the plane empty — the load
    itself succeeds — while a file that is there and cannot be read fails the

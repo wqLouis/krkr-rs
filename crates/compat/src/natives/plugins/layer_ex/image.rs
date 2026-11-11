@@ -18,7 +18,7 @@ use tjs::{DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, Tjs2Eng
 
 use super::{scene_mut, set_real};
 use crate::native_util::{args, report_error, set_int, set_void};
-use crate::natives::visual::{COLOR_KEY_NONE, IMAGE_EXTENSION_PROBE};
+use crate::natives::visual::{COLOR_KEY_NONE, image_candidates, resolved_image_name};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
@@ -223,28 +223,20 @@ impl RotateFlip {
     }
 }
 
-/// Read `name` through the attached storage, probing the common image
-/// extensions when the name itself does not resolve.
+/// Read `name` through the attached storage, under the storage names an image
+/// request is looked up under.
 ///
-/// The plain name is tried first and each extension is composed only after the
-/// earlier candidates miss, so a name that resolves as given composes none.
-/// Only a missing entry advances to the next candidate; any other read failure
-/// is returned as itself.
+/// A request that carries an extension is read under that name alone; a
+/// request that carries none is read as given first and then under each
+/// registered extension. Only a missing entry advances to the next candidate;
+/// any other read failure is returned as itself.
 fn read_image_candidate(
     storage: &Storage,
     name: &str,
 ) -> Result<Option<(String, Vec<u8>)>, StorageReadError> {
-    // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
-    let lookup = strip_file_media(name);
-    match storage.read(lookup) {
-        Ok(bytes) => return Ok(Some((name.to_string(), bytes))),
-        Err(StorageReadError::NotFound(_)) => {}
-        Err(error) => return Err(error),
-    }
-    for extension in IMAGE_EXTENSION_PROBE {
-        let candidate = format!("{lookup}{extension}");
+    for candidate in image_candidates(name) {
         match storage.read(&candidate) {
-            Ok(bytes) => return Ok(Some((candidate, bytes))),
+            Ok(bytes) => return Ok(Some((resolved_image_name(name, &candidate), bytes))),
             Err(StorageReadError::NotFound(_)) => {}
             Err(error) => return Err(error),
         }

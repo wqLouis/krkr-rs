@@ -773,6 +773,84 @@ fn resolution_probes_extensions_when_the_plain_name_misses() {
     );
 }
 
+/// A request that carries an extension is looked up under that name alone:
+/// with both `images/dotted.png` and `images/dotted.png.jpg` present, the
+/// request for `images/dotted.png` reads `images/dotted.png`.
+///
+/// reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1587-1619: the extension
+/// is extracted from the name, and only a name that carries none is resolved
+/// through the registered extensions — a name that carries one is opened as
+/// given.
+#[test]
+fn a_request_with_an_extension_resolves_to_that_file() {
+    let _lock = vm_lock();
+    let files: &[(&str, &[u8])] = &[
+        ("/images/dotted.png", b"png"),
+        ("/images/dotted.png.jpg", b"jpg"),
+    ];
+    let env = Env::with_files(true, files);
+    let hints = Arc::new(Mutex::new(Vec::new()));
+    env.record_decodes(hints.clone());
+
+    env.run("var b = new Bitmap(); b.load('images/dotted.png');");
+
+    assert_eq!(env.eval_int("b.width"), 2);
+    assert_eq!(
+        hints.lock().expect("decode lock").clone(),
+        vec!["images/dotted.png".to_string()],
+        "the request resolves to the file its extension names"
+    );
+}
+
+/// A request that carries no extension is still resolved through the
+/// registered extensions: with both `images/dotted.png` and
+/// `images/dotted.png.jpg` present, the request for `images/dotted` finds
+/// `images/dotted.png`.
+///
+/// reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1591-1612: a name that
+/// carries no extension is resolved by appending the registered extensions
+/// until one of them exists.
+#[test]
+fn a_request_without_an_extension_is_resolved_through_the_probe_list() {
+    let _lock = vm_lock();
+    let files: &[(&str, &[u8])] = &[
+        ("/images/dotted.png", b"png"),
+        ("/images/dotted.png.jpg", b"jpg"),
+    ];
+    let env = Env::with_files(true, files);
+    let hints = Arc::new(Mutex::new(Vec::new()));
+    env.record_decodes(hints.clone());
+
+    env.run("var b = new Bitmap(); b.load('images/dotted');");
+
+    assert_eq!(env.eval_int("b.width"), 2);
+    assert_eq!(
+        hints.lock().expect("decode lock").clone(),
+        vec!["images/dotted.png".to_string()],
+        "the `.png` candidate is resolved and handed to the decoder"
+    );
+}
+
+/// A request that carries an extension does not fall through to the
+/// registered extensions: with only `images/lonely.png.jpg` present, the
+/// request for `images/lonely.png` finds nothing and raises.
+///
+/// reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1613-1619: a name that
+/// carries an extension is opened as given, so the reference never composes
+/// an extension for it.
+#[test]
+fn a_request_with_an_extension_does_not_fall_through_to_the_probe_list() {
+    let _lock = vm_lock();
+    let files: &[(&str, &[u8])] = &[("/images/lonely.png.jpg", b"jpg")];
+    let env = Env::with_files(true, files);
+
+    let error = env.error("(new Bitmap(1, 1)).load('images/lonely.png');");
+    assert!(
+        error.contains("storage not found: images/lonely.png"),
+        "{error}"
+    );
+}
+
 /// A name that resolves to no candidate keeps failing with the unresolved
 /// request in the message.
 ///
