@@ -22,7 +22,6 @@ mod hasher;
 mod simd;
 
 pub mod clock;
-pub mod draw_policy;
 pub mod engine;
 pub mod font;
 pub mod imagedecode;

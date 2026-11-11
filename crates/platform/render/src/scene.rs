@@ -60,17 +60,6 @@ pub enum Clip {
     Mask(Texture),
 }
 
-impl Clip {
-    /// Whether a backend can draw a node with this clip.
-    ///
-    /// A rectangle clip is a scissor, which every backend has. A mask clip
-    /// needs a mask image the backends do not implement, so no backend
-    /// draws one.
-    pub const fn is_drawable(&self) -> bool {
-        matches!(self, Self::Rect(_))
-    }
-}
-
 /// One positioned glyph inside a [`GlyphRun`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GlyphPlacement {

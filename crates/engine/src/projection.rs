@@ -161,11 +161,7 @@ fn intersect_rect(a: Rect, b: Rect) -> Rect {
 }
 
 /// Clip rectangle for a composed layer's render node.
-///
-/// The composed clip is the intersection of the layer's rectangle and every
-/// ancestor's, so it is a rectangle; the draw policy asks for it to learn
-/// whether the CPU can draw a subtree's clip.
-pub(crate) fn composed_clip(composed: &ComposedLayer) -> Option<Clip> {
+fn composed_clip(composed: &ComposedLayer) -> Option<Clip> {
     composed.clip.map(|clip| {
         Clip::Rect(RectF::new(
             clip.x as f32,
