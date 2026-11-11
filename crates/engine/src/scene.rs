@@ -825,6 +825,18 @@ pub struct Scene {
     /// bitmap. A host that draws the projected scene turns it on; the
     /// headless CPU path leaves it off and blends the display bitmap itself.
     pub composite_transition_frames: bool,
+    /// Whether the backend draws a blend mode that reads the destination.
+    ///
+    /// The GPU draws a layer's subtree as a whole when it can draw every
+    /// node in it. A node whose blend mode reads the destination needs a
+    /// copy of the destination's pixels; a backend that cannot supply one
+    /// has that subtree composited on the CPU, which reads the
+    /// destination for every pixel and draws the mode exactly.
+    ///
+    /// The engine fills it from the backend's capabilities; a scene that
+    /// never saw a backend leaves it on, so the subtree is drawn node by
+    /// node.
+    pub gpu_draws_destination_dependent_blends: bool,
     /// The backend handles of the programs the layers' custom-shader draws
     /// name.
     ///
@@ -891,6 +903,7 @@ impl Default for Scene {
             font_index: crate::hasher::map(),
             layer_order: RefCell::new(LayerOrderIndex::default()),
             composite_transition_frames: false,
+            gpu_draws_destination_dependent_blends: true,
             effect_pipelines: EffectPipelines::new(),
             image_cache: DecodedImageCache::default(),
             preloads: Vec::new(),

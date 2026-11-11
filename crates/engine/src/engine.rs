@@ -448,6 +448,14 @@ pub struct Engine {
     /// Layer ids the latest projection emitted, including descendants covered
     /// by a cached ancestor.
     drawn_layers: Vec<u32>,
+    /// The layers whose subtree the backend cannot draw, and whose subtree is
+    /// composited on the CPU.
+    ///
+    /// Each of them is a consumer of its own cache, so the projection draws
+    /// the composited subtree as one texture. The list holds the layers the
+    /// draw policy made consumers, so a layer that stops being a root gives
+    /// its cache up.
+    cpu_composite_layers: Vec<u32>,
     /// Presented surface for `render_state`.
     surface: Surface,
     /// GPU/staging/texture bookkeeping.
@@ -538,6 +546,11 @@ impl Engine {
         // transition's frame from the projection; the headless CPU path blends
         // the layer's display bitmap instead.
         scene.composite_transition_frames = pipeline.backend() != BackendKind::Null;
+        // A backend that can draw a blend mode that reads the destination
+        // draws every subtree node by node; a backend that cannot has those
+        // subtrees composited on the CPU.
+        scene.gpu_draws_destination_dependent_blends =
+            capabilities(&pipeline).supports_destination_dependent_blend;
         let mut engine = Self {
             pipeline,
             scene,
@@ -545,6 +558,7 @@ impl Engine {
             render_scene: RenderScene::with_root_node(),
             render_scene_revision: None,
             drawn_layers: Vec::new(),
+            cpu_composite_layers: Vec::new(),
             surface,
             render_state,
             textures: map(),
@@ -869,6 +883,10 @@ impl Engine {
 
         let sync_started = Instant::now();
         let upload_started = Instant::now();
+        // The subtrees the backend cannot draw are composited on the CPU
+        // before the upload, so their content is on the texture when the
+        // projection draws them as one texture each.
+        self.composite_cpu_subtrees();
         self.sync_dirty_bitmaps();
         let mut upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
         let prune_started = Instant::now();
@@ -1028,6 +1046,19 @@ impl Engine {
         self.surface_size = reported_surface_size(event, size);
         self.sync_presentation();
         Ok(event)
+    }
+
+    /// Composites on the CPU the subtrees the backend cannot draw.
+    ///
+    /// The GPU is the primary path: a subtree is drawn node by node on the
+    /// GPU when the backend can draw every node in it. A node whose blend
+    /// mode reads the destination needs a copy of the destination's pixels,
+    /// and a backend that cannot supply one cannot draw that node: the CPU
+    /// compositor reads the destination for every pixel, so it draws the
+    /// mode exactly, and the composited subtree is handed to the GPU as one
+    /// texture.
+    fn composite_cpu_subtrees(&mut self) {
+        crate::draw_policy::composite_cpu_subtrees(&mut self.scene, &mut self.cpu_composite_layers);
     }
 
     /// Rebuilds [`Engine::render_scene`] when the layer tree's structure or

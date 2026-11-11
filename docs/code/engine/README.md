@@ -60,6 +60,7 @@ its tests.
 | `imagedecode` | `src/imagedecode.rs` | the deferred image decode path: the codec, the pass and the pending-image future | [scene.md](scene.md#the-pending-image) |
 | `jobpool` | `src/jobpool.rs` | the CPU-job pool: the workers, the queue, the byte accounting and the pending-job handle | [scene.md](scene.md#the-pending-image) |
 | `projection` | `src/projection.rs` | the pure field copy from the logical tree to the L1 `RenderScene` | [projection.md](projection.md) |
+| `draw_policy` | `src/draw_policy.rs` | the subtree draw policy: the GPU draws a subtree as a whole when it can, and the CPU composites the subtrees it cannot | [draw_policy.md](draw_policy.md) |
 | `translate` | `src/translate.rs` | the VM-pixel ↔ device-pixel mapping (Fit with letterbox) | [translate.md](translate.md) |
 | `layer_ops` | `src/layer_ops.rs` | in-place CPU pixel operations on bitmaps (fills, blits, blur, subtree compositing) | [layer_ops.md](layer_ops.md) |
 | `raster` | `src/raster.rs` | the CPU shape rasterizer (polygons, strokes, hatches, arcs, béziers) | [raster.md](raster.md) |
@@ -187,6 +188,7 @@ rule that L2 is the only layer that names two of them are in
 | `clock.rs` | the frame clock: the fractional millisecond, the exact set, the saturation |
 | `scene.rs`, `bitmap.rs`, `oop_semantics.rs` | the layer tree, bitmaps, focus, ordering |
 | `projection.rs` | the L2 → L1 seam |
+| `draw_policy.rs` | the subtree draw policy: the CPU composite of a subtree the backend cannot draw |
 | `translate.rs` | the VM ↔ device mapping |
 | `layer_ops.rs`, `raster.rs` | the pixel operations |
 | `text.rs`, `text_render.rs` | shaping, coverage, atlas, projection |

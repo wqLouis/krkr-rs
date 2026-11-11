@@ -371,6 +371,19 @@ pub fn photoshop_blend(mode: BlendMode) -> Option<PhotoshopBlend> {
     }
 }
 
+/// Whether a draw with this blend mode reads the destination's pixels.
+///
+/// A mode that reads the destination cannot be drawn with the fixed-function
+/// blend state: the pipeline samples a copy of the destination's pixels, and
+/// a draw target that keeps no copy of it cannot draw the mode at all.
+///
+/// The per-mode rule is [`BlendMode::is_destination_dependent`]; this is the
+/// render layer's name for it, so a caller above the render layer can ask
+/// the question without knowing the modes.
+pub const fn needs_destination(mode: BlendMode) -> bool {
+    mode.is_destination_dependent()
+}
+
 /// The weight the source's alpha mixes a channel with.
 ///
 /// The full opacity mixes with the source's alpha; a lower opacity scales

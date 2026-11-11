@@ -64,6 +64,7 @@ the composition root above everything. No layer may call up.
 | [`engine/clock.md`](engine/clock.md) | `clock.rs` | the frame clock: the time base the frame advances and the script reads |
 | [`engine/scene.md`](engine/scene.md) | `scene.rs` | the logical layer tree and the per-layer state |
 | [`engine/projection.md`](engine/projection.md) | `projection.rs` | the L2 → L1 seam: the `RenderScene` the pipeline draws |
+| [`engine/draw_policy.md`](engine/draw_policy.md) | `draw_policy.rs` | the subtree draw policy: the GPU draws a subtree as a whole when it can, and the CPU composites the subtrees it cannot |
 | [`engine/layer_ops.md`](engine/layer_ops.md) | `layer_ops.rs` | the pixel primitives and the subtree compositing |
 | [`engine/raster.md`](engine/raster.md) | `raster.rs` | the CPU rasterizer: fills, gradients, hatching |
 | [`engine/storage.md`](engine/storage.md) | `storage.rs` | the storage namespace: the mounts, the precedence, the resolution order |
