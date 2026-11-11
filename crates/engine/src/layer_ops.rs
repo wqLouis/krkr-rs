@@ -225,7 +225,9 @@ pub fn fill_color_on_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 4]
                 write_pixel(bitmap, x, y, rgba);
             }
         }
-        bitmap.mark_dirty();
+        // The fill wrote the clipped rectangle alone, so the upload needs
+        // that rectangle and not the whole bitmap.
+        bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
         return;
     }
     let opa = opa as u8;
@@ -242,7 +244,7 @@ pub fn fill_color_on_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 4]
             write_pixel(bitmap, x, y, out);
         }
     }
-    bitmap.mark_dirty();
+    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
 }
 
 /// Saturating per-channel addition of packed 8-bit values (four lanes packed
@@ -299,7 +301,7 @@ pub fn fill_color_on_add_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8
             );
         }
     }
-    bitmap.mark_dirty();
+    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
 }
 
 /// `FillColor`: set the RGB to `color` while **holding the destination
@@ -333,7 +335,7 @@ pub fn fill_color_hold_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 
             write_pixel(bitmap, x, y, d);
         }
     }
-    bitmap.mark_dirty();
+    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
 }
 
 /// `FillMask`: replace the alpha channel with `value`, holding the RGB. In
@@ -352,7 +354,7 @@ pub fn fill_mask(bitmap: &mut BitmapState, rect: RectI, value: u8) {
             write_pixel(bitmap, x, y, d);
         }
     }
-    bitmap.mark_dirty();
+    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
 }
 
 /// `RemoveConstOpacity`: multiply the alpha by `1 - level / 255`
@@ -376,7 +378,7 @@ pub fn remove_const_opacity(bitmap: &mut BitmapState, rect: RectI, level: i32) {
             write_pixel(bitmap, x, y, d);
         }
     }
-    bitmap.mark_dirty();
+    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
 }
 
 /// RGB → HSL with the byte ranges used by `layerExImage` (`H`, `S`, `L`
@@ -485,7 +487,7 @@ pub fn colorize(bitmap: &mut BitmapState, rect: RectI, hue: i32, sat: i32, blend
             write_pixel(bitmap, x, y, p);
         }
     }
-    bitmap.mark_dirty();
+    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
 }
 
 /// A tiny deterministic xorshift PRNG. The caller supplies the seed and owns
@@ -540,7 +542,7 @@ pub fn noise(bitmap: &mut BitmapState, rect: RectI, level: i32, seed: u64) {
             write_pixel(bitmap, x, y, p);
         }
     }
-    bitmap.mark_dirty();
+    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
 }
 
 /// `CopyRect(dx, dy, src, sx, sy, sw, sh)` — copy a source region
@@ -1631,7 +1633,7 @@ pub fn do_gray_scale(bitmap: &mut BitmapState, rect: RectI) {
             write_pixel(bitmap, x, y, d);
         }
     }
-    bitmap.mark_dirty();
+    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
 }
 
 /// Per-channel gamma adjustment (R/G/B gamma, floor, ceil).
@@ -1711,7 +1713,7 @@ pub fn adjust_gamma(bitmap: &mut BitmapState, rect: RectI, data: GammaAdjust) {
             write_pixel(bitmap, x, y, d);
         }
     }
-    bitmap.mark_dirty();
+    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
 }
 
 // ---------------------------------------------------------------------------
@@ -1749,7 +1751,7 @@ pub fn light_contrast(bitmap: &mut BitmapState, rect: RectI, brightness: i32, co
             write_pixel(bitmap, x, y, d);
         }
     }
-    bitmap.mark_dirty();
+    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
 }
 
 /// `ConvertAlphaToAddAlpha`: premultiply RGB by alpha (`(c * a) >> 8`),
@@ -1771,7 +1773,7 @@ pub fn convert_alpha_to_add_alpha(bitmap: &mut BitmapState, rect: RectI) {
             write_pixel(bitmap, x, y, d);
         }
     }
-    bitmap.mark_dirty();
+    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
 }
 
 /// `ConvertAddAlphaToAlpha`: unpremultiply RGB (`c * 255 / a` clamped to
@@ -1802,7 +1804,7 @@ pub fn convert_add_alpha_to_alpha(bitmap: &mut BitmapState, rect: RectI) {
             write_pixel(bitmap, x, y, d);
         }
     }
-    bitmap.mark_dirty();
+    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
 }
 
 /// `Copy9Patch`: scale a source bitmap into the destination using a 9-slice
@@ -1995,7 +1997,9 @@ pub fn gaussian_blur(bitmap: &mut BitmapState, rect: RectI, radius: i32, sigma: 
             }
         }
     }
-    bitmap.mark_dirty();
+    // The pass wrote inside the clipped rectangle alone: the samples outside
+    // it clamp to the edge and are read, not written.
+    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
 }
 
 /// Blend one source pixel onto `dst` with an already resolved kernel.

@@ -2690,7 +2690,14 @@ pub fn blit_coverage_into(
             }
         }
     }
-    bitmap.mark_dirty();
+    // The ink landed inside the clipped glyph rectangle alone, so the upload
+    // needs that rectangle and not the whole bitmap.
+    bitmap.mark_dirty_rect(PixelRegion::from_min_max(
+        drawn.0 as u32,
+        drawn.1 as u32,
+        drawn.2 as u32,
+        drawn.3 as u32,
+    ));
     Some(drawn)
 }
 

@@ -17,6 +17,7 @@ use std::ffi::{c_char, c_int, c_void};
 use crate::engine_api::layer_ops::{self, GammaAdjust, RectI};
 use crate::engine_api::{BitmapState, DecodedImageKey, DecodedImageMode, DestAlpha, Scene};
 use api::blend::{BlendMode, DstBlend};
+use api::geometry::PixelRegion;
 use api::media::DecodedImage;
 use tjs::{NativeInstanceMethodDef, Tjs2Engine, Value};
 
@@ -1820,7 +1821,6 @@ extern "C" fn layer_do_box_blur(
             &scratch,
             (0, 0, width as i32, height as i32),
         );
-        bitmap.mark_dirty();
         if let Some(layer) = scene.layer_mut(id) {
             layer.image_modified = true;
         }
@@ -2180,7 +2180,9 @@ extern "C" fn layer_set_main_pixel(
         && let Some(pixel) = bitmap.rgba.get_mut(offset..offset + 3)
     {
         pixel.copy_from_slice(&color);
-        bitmap.mark_dirty();
+        // The write touched one pixel, so the upload needs that pixel and
+        // not the whole image.
+        bitmap.mark_dirty_rect(PixelRegion::new(x as u32, y as u32, 1, 1));
     }
     if let Some(layer) = scene.layer_mut(id) {
         layer.image_modified = true;
@@ -2280,7 +2282,9 @@ extern "C" fn layer_set_mask_pixel(
         && let Some(alpha) = bitmap.rgba.get_mut(offset + 3)
     {
         *alpha = mask;
-        bitmap.mark_dirty();
+        // The write touched one pixel, so the upload needs that pixel and
+        // not the whole image.
+        bitmap.mark_dirty_rect(PixelRegion::new(x as u32, y as u32, 1, 1));
     }
     if let Some(layer) = scene.layer_mut(id) {
         layer.image_modified = true;

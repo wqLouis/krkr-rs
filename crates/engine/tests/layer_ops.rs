@@ -1062,6 +1062,76 @@ fn a_clipped_affine_blit_writes_inside_the_clip_alone() {
     );
 }
 
+/// A fill marks the rectangle it wrote, not the whole bitmap.
+///
+/// The frame's upload sends only the marked region to the texture, so a fill
+/// that covered one corner of a large image does not re-upload the whole
+/// image.
+///
+/// The reference marks the rectangle a write touched
+/// (`reference/cpp/core/visual/LayerIntf.cpp:6305-6345`,
+/// `reference/cpp/core/visual/LayerIntf.cpp:6347-6358`).
+#[test]
+fn a_fill_marks_only_the_rectangle_it_wrote() {
+    let mut bmp = bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
+    fill_color_on_alpha(&mut bmp, (2, 3, 6, 7), [255, 0, 0, 255], 255);
+    assert!(bmp.dirty, "the fill marks the bitmap dirty");
+    assert_eq!(
+        bmp.dirty_region,
+        Some(PixelRegion::new(2, 3, 4, 4)),
+        "only the filled rectangle is marked"
+    );
+}
+
+/// A fill clipped by the image marks the part of it that was written.
+#[test]
+fn a_clipped_fill_marks_only_the_part_it_wrote() {
+    let mut bmp = bitmap(4, 4, vec![0u8; 4 * 4 * 4]);
+    fill_mask(&mut bmp, (2, 2, 10, 10), 255);
+    assert_eq!(
+        bmp.dirty_region,
+        Some(PixelRegion::new(2, 2, 2, 2)),
+        "only the part inside the image is marked"
+    );
+}
+
+/// A tone operation marks the rectangle it wrote.
+#[test]
+fn a_tone_operation_marks_only_the_rectangle_it_wrote() {
+    let mut bmp = bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
+    do_gray_scale(&mut bmp, (1, 1, 3, 5));
+    assert_eq!(
+        bmp.dirty_region,
+        Some(PixelRegion::new(1, 1, 2, 4)),
+        "only the tone rectangle is marked"
+    );
+}
+
+/// The rectangle fill marks the rectangle it wrote.
+#[test]
+fn a_rectangle_fill_marks_only_the_rectangle_it_wrote() {
+    let mut bmp = bitmap(8, 8, vec![0u8; 8 * 8 * 4]);
+    fill_rect_replace(&mut bmp, 1, 2, 3, 4, [255, 255, 255, 255]);
+    assert_eq!(
+        bmp.dirty_region,
+        Some(PixelRegion::new(1, 2, 3, 4)),
+        "only the filled rectangle is marked"
+    );
+}
+
+/// The blur marks the rectangle it wrote: the samples outside it are read,
+/// not written.
+#[test]
+fn a_blur_marks_only_the_rectangle_it_wrote() {
+    let mut bmp = bitmap(16, 16, vec![0u8; 16 * 16 * 4]);
+    gaussian_blur(&mut bmp, (2, 2, 6, 6), 2, 1.0);
+    assert_eq!(
+        bmp.dirty_region,
+        Some(PixelRegion::new(2, 2, 4, 4)),
+        "only the blurred rectangle is marked"
+    );
+}
+
 /// A whole-subtree transition gets a display bitmap distinct from a script
 /// cache. Reusing the cache as the blend target would overwrite pixels the
 /// script owns and make the cache stale on every transition tick.

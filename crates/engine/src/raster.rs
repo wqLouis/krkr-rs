@@ -14,6 +14,8 @@
 //! colors are straight-alpha RGBA and are composited with [`blend_pixel`],
 //! so the result matches the rest of the middle layer.
 
+use api::geometry::PixelRegion;
+
 use crate::scene::BitmapState;
 
 /// Supersample grid per axis for polygon fills (4×4 = 16 samples/pixel).
@@ -31,7 +33,9 @@ pub fn blend_pixel(
     opa: u8,
 ) {
     if blend_pixel_raw(bitmap, x, y, color, coverage, opa) {
-        bitmap.mark_dirty();
+        // The pixel was written, so the upload needs that pixel and not the
+        // whole bitmap.
+        bitmap.mark_dirty_rect(PixelRegion::new(x as u32, y as u32, 1, 1));
     }
 }
 
@@ -164,7 +168,11 @@ pub fn fill_rect_replace(bitmap: &mut BitmapState, x: i32, y: i32, w: u32, h: u3
             pixel.copy_from_slice(&color);
         }
     }
-    bitmap.mark_dirty();
+    // The fill wrote the clipped rectangle alone, so the upload needs that
+    // rectangle and not the whole bitmap.
+    bitmap.mark_dirty_rect(PixelRegion::from_min_max(
+        x0 as u32, y0 as u32, x1 as u32, y1 as u32,
+    ));
 }
 
 /// Even-odd (alternate) point-in-polygon test at a sub-pixel sample.
@@ -268,7 +276,14 @@ pub fn fill_polygon(bitmap: &mut BitmapState, pts: &[(f64, f64)], color: [u8; 4]
         }
     }
     if painted {
-        bitmap.mark_dirty();
+        // The fill wrote inside the polygon's own bounds, so the upload needs
+        // that box and not the whole bitmap.
+        bitmap.mark_dirty_rect(PixelRegion::from_min_max(
+            min_x as u32,
+            min_y as u32,
+            max_x.saturating_add(1) as u32,
+            max_y.saturating_add(1) as u32,
+        ));
     }
 }
 
@@ -380,7 +395,14 @@ pub fn fill_polygon_hatch(
         }
     }
     if painted {
-        bitmap.mark_dirty();
+        // The fill wrote inside the polygon's own bounds, so the upload needs
+        // that box and not the whole bitmap.
+        bitmap.mark_dirty_rect(PixelRegion::from_min_max(
+            min_x as u32,
+            min_y as u32,
+            max_x.saturating_add(1) as u32,
+            max_y.saturating_add(1) as u32,
+        ));
     }
 }
 
@@ -415,7 +437,8 @@ pub fn stroke_polyline(
     let half = width.max(1.0) / 2.0;
     let max_px = bitmap.width.saturating_sub(1).min(i32::MAX as u32) as i32;
     let max_py = bitmap.height.saturating_sub(1).min(i32::MAX as u32) as i32;
-    let mut painted = false;
+    // The box the stroke covered: the union of the boxes of its segments.
+    let mut covered: Option<(i32, i32, i32, i32)> = None;
     let mut segment = |a: (f64, f64), b: (f64, f64)| {
         let min_x = (a.0.min(b.0) - half - 1.0).floor() as i32;
         let min_y = (a.1.min(b.1) - half - 1.0).floor() as i32;
@@ -428,12 +451,17 @@ pub fn stroke_polyline(
         if min_x > max_x || min_y > max_y {
             return;
         }
+        let box_of = match covered {
+            Some((x0, y0, x1, y1)) => (x0.min(min_x), y0.min(min_y), x1.max(max_x), y1.max(max_y)),
+            None => (min_x, min_y, max_x, max_y),
+        };
+        covered = Some(box_of);
         for py in min_y..=max_y {
             for px in min_x..=max_x {
                 let d = dist_point_segment((px as f64 + 0.5, py as f64 + 0.5), a, b);
                 let coverage = ((half + 0.5 - d).clamp(0.0, 1.0) * 255.0) as u8;
                 if coverage > 0 {
-                    painted = blend_pixel_raw(bitmap, px, py, color, coverage, 255) || painted;
+                    blend_pixel_raw(bitmap, px, py, color, coverage, 255);
                 }
             }
         }
@@ -444,8 +472,15 @@ pub fn stroke_polyline(
     if closed && pts.len() >= 3 {
         segment(pts[pts.len() - 1], pts[0]);
     }
-    if painted {
-        bitmap.mark_dirty();
+    if let Some((x0, y0, x1, y1)) = covered {
+        // The stroke wrote inside its own box, so the upload needs that box
+        // and not the whole bitmap.
+        bitmap.mark_dirty_rect(PixelRegion::from_min_max(
+            x0 as u32,
+            y0 as u32,
+            x1.saturating_add(1) as u32,
+            y1.saturating_add(1) as u32,
+        ));
     }
 }
 

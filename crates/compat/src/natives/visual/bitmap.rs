@@ -11,6 +11,7 @@ use crate::engine_api::{
     BitmapState, DecodePass, DecodedImageKey, DecodedImageMode, PendingImage, Scene, Storage,
     StorageEntry, StorageReadError,
 };
+use api::geometry::PixelRegion;
 use api::media::{DecodedImage, ImageInfo};
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
@@ -1290,7 +1291,9 @@ extern "C" fn bitmap_set_mask_pixel(
         && let Some(range) = pixel_range(bitmap, x, y)
     {
         bitmap.rgba[range.start + 3] = alpha;
-        bitmap.mark_dirty();
+        // The write touched one pixel, so the upload needs that pixel and
+        // not the whole image.
+        bitmap.mark_dirty_rect(PixelRegion::new(x as u32, y as u32, 1, 1));
     }
     set_void(out);
     0
@@ -1382,7 +1385,9 @@ fn write_bitmap_pixel(scene: &mut Scene, id: u32, x: i32, y: i32, rgb: [u8; 3]) 
         return;
     };
     bitmap.rgba[range.start..range.start + 3].copy_from_slice(&rgb);
-    bitmap.mark_dirty();
+    // The write touched one pixel, so the upload needs that pixel and not
+    // the whole image.
+    bitmap.mark_dirty_rect(PixelRegion::new(x as u32, y as u32, 1, 1));
 }
 
 /// `Bitmap.setSize(width, height)`.

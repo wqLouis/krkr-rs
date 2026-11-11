@@ -44,6 +44,7 @@ use std::ffi::{c_char, c_int, c_void};
 
 use crate::engine_api::layer_ops::{self, GammaAdjust, RectI};
 use crate::engine_api::{BitmapState, DestAlpha, Scene, raster};
+use api::geometry::PixelRegion;
 use tjs::{
     NativeInstanceBuilder, NativeInstanceMethodDef, NativeMethodDef, NativeStaticMembers,
     RetainedValue, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_NULL, VAL_OBJECT, VAL_REAL, VAL_STRING,
@@ -507,6 +508,19 @@ fn clip_dest_src(dx: i32, dy: i32, src: RectI, clip: RectI) -> Option<(i32, i32,
     Some((dx, dy, (left, top, right, bottom)))
 }
 
+/// The pixel region a clipped rectangle covers.
+///
+/// The rectangle comes from [`layer_ops::intersect`], so it lies inside the
+/// image's own bounds.
+fn region_of(rect: RectI) -> PixelRegion {
+    PixelRegion::from_min_max(
+        rect.0.max(0) as u32,
+        rect.1.max(0) as u32,
+        rect.2.max(0) as u32,
+        rect.3.max(0) as u32,
+    )
+}
+
 /// In-place horizontal mirror of `rect`, using the whole-image primitive for
 /// the common full-bitmap case.
 ///
@@ -532,7 +546,9 @@ fn flip_lr_region(bitmap: &mut BitmapState, rect: RectI) -> Result<(), String> {
             }
         }
     }
-    bitmap.mark_dirty();
+    // The flip wrote inside the rectangle alone, so the upload needs that
+    // rectangle and not the whole image.
+    bitmap.mark_dirty_rect(region_of(r));
     Ok(())
 }
 
@@ -560,7 +576,9 @@ fn flip_ud_region(bitmap: &mut BitmapState, rect: RectI) -> Result<(), String> {
             }
         }
     }
-    bitmap.mark_dirty();
+    // The flip wrote inside the rectangle alone, so the upload needs that
+    // rectangle and not the whole image.
+    bitmap.mark_dirty_rect(region_of(r));
     Ok(())
 }
 
@@ -1045,7 +1063,6 @@ extern "C" fn image_do_box_blur(
             &scratch,
             (0, 0, width as i32, height as i32),
         );
-        dst.mark_dirty();
         Ok(Some(clip))
     })
 }
@@ -1124,7 +1141,6 @@ extern "C" fn image_fill_rect(
                 (dest.3 - dest.1) as u32,
                 color,
             );
-            dst.mark_dirty();
         } else {
             // The colour goes through the system-colour table first, then the
             // RGB replaces the pixel's and the destination alpha is held.

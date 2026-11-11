@@ -249,7 +249,6 @@ fn perspective_blit(
             crate::engine_api::raster::blend_pixel(dst, x, y, color, 255, 255);
         }
     }
-    dst.mark_dirty();
     Ok(())
 }
 

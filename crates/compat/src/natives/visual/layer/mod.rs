@@ -1765,7 +1765,8 @@ extern "C" fn layer_fill_rect(
         _ => false,
     };
     if modified {
-        bitmap.mark_dirty();
+        // The fill marked the rectangle it wrote, so the upload needs that
+        // rectangle and not the whole image.
         pixels::mark_image_modified(scene, id);
     }
     set_void(out);
