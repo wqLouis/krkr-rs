@@ -18,7 +18,7 @@
 use std::ffi::{CString, c_char, c_int};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use crate::lexer::{LexError, Lexer, Literal, TokenKind};
+use crate::lexer::{LexError, Lexer, TokenKind, ValueRef};
 
 /// The analyser read the script to its end.
 pub const TJS2_LEX_OK: c_int = 0;
@@ -85,16 +85,8 @@ pub struct tjs2_lexer {
     error: c_int,
     /// The text of the error of the last read.
     message: CString,
-    /// The kind of the value of the last token.
-    value_kind: c_int,
-    /// The integer of the last token.
-    value_integer: i64,
-    /// The real of the last token.
-    value_real: f64,
-    /// The code units of the last token.
-    value_string: Vec<u16>,
-    /// The bytes of the last token.
-    value_octet: Vec<u8>,
+    /// The index of the last token's value in the analyser's values.
+    value: Option<u32>,
 }
 
 impl tjs2_lexer {
@@ -124,34 +116,21 @@ impl tjs2_lexer {
         c_string(&text)
     }
 
-    /// Record the value of the last token.
-    fn set_value(&mut self, value: Option<&Literal>) {
-        self.value_kind = TJS2_LEX_VALUE_NONE;
-        self.value_integer = 0;
-        self.value_real = 0.0;
-        self.value_string.clear();
-        self.value_octet.clear();
-        let Some(value) = value else {
-            return;
-        };
-        match value {
-            Literal::Null => self.value_kind = TJS2_LEX_VALUE_NULL,
-            Literal::Integer(number) => {
-                self.value_kind = TJS2_LEX_VALUE_INTEGER;
-                self.value_integer = *number;
-            }
-            Literal::Real(number) => {
-                self.value_kind = TJS2_LEX_VALUE_REAL;
-                self.value_real = *number;
-            }
-            Literal::String(string) => {
-                self.value_kind = TJS2_LEX_VALUE_STRING;
-                self.value_string.extend_from_slice(string.units());
-            }
-            Literal::Octet(bytes) => {
-                self.value_kind = TJS2_LEX_VALUE_OCTET;
-                self.value_octet.extend_from_slice(bytes);
-            }
+    /// The last token's value.
+    fn value(&self) -> Option<ValueRef<'_>> {
+        let index = self.value?;
+        Some(self.lexer.as_ref()?.value_at(index))
+    }
+
+    /// The kind of the last token's value.
+    fn value_kind(&self) -> c_int {
+        match self.value() {
+            None => TJS2_LEX_VALUE_NONE,
+            Some(ValueRef::Null) => TJS2_LEX_VALUE_NULL,
+            Some(ValueRef::Integer(_)) => TJS2_LEX_VALUE_INTEGER,
+            Some(ValueRef::Real(_)) => TJS2_LEX_VALUE_REAL,
+            Some(ValueRef::String(_)) => TJS2_LEX_VALUE_STRING,
+            Some(ValueRef::Octet(_)) => TJS2_LEX_VALUE_OCTET,
         }
     }
 }
@@ -183,11 +162,7 @@ pub unsafe extern "C" fn tjs2_lexer_new(
         lexer: None,
         error: TJS2_LEX_OK,
         message: CString::default(),
-        value_kind: TJS2_LEX_VALUE_NONE,
-        value_integer: 0,
-        value_real: 0.0,
-        value_string: Vec::new(),
-        value_octet: Vec::new(),
+        value: None,
     });
     let result = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: the caller promises `length` readable code units.
@@ -255,18 +230,18 @@ pub unsafe extern "C" fn tjs2_lexer_next(lexer: *mut tjs2_lexer) -> c_int {
         match analyser.next_token() {
             Ok(Some(token)) => {
                 lexer.error = TJS2_LEX_OK;
-                lexer.set_value(token.value.as_ref());
+                lexer.value = token.value;
                 token.kind as c_int
             }
             Ok(None) => {
                 lexer.error = TJS2_LEX_OK;
-                lexer.set_value(None);
+                lexer.value = None;
                 0
             }
             Err(error) => {
                 lexer.error = tjs2_lexer::error_code(&error);
                 lexer.message = tjs2_lexer::error_message(&error);
-                lexer.set_value(None);
+                lexer.value = None;
                 -1
             }
         }
@@ -276,7 +251,7 @@ pub unsafe extern "C" fn tjs2_lexer_next(lexer: *mut tjs2_lexer) -> c_int {
         Err(payload) => {
             lexer.error = TJS2_LEX_ERROR_PANIC;
             lexer.message = tjs2_lexer::panic_message(payload);
-            lexer.set_value(None);
+            lexer.value = None;
             -1
         }
     }
@@ -291,7 +266,6 @@ pub unsafe extern "C" fn tjs2_lexer_next(lexer: *mut tjs2_lexer) -> c_int {
 /// `lexer` must be a live handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tjs2_lexer_error(lexer: *const tjs2_lexer) -> c_int {
-    // SAFETY: the caller promises the handle is live.
     // SAFETY: the caller promises the handle is live and not freed.
     unsafe { lexer.as_ref() }
         .map(|lexer| lexer.error)
@@ -309,7 +283,6 @@ pub unsafe extern "C" fn tjs2_lexer_error(lexer: *const tjs2_lexer) -> c_int {
 /// `lexer` must be a live handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tjs2_lexer_error_message(lexer: *const tjs2_lexer) -> *const c_char {
-    // SAFETY: the caller promises the handle is live.
     // SAFETY: the caller promises the handle is live and not freed.
     unsafe { lexer.as_ref() }
         .map(|lexer| lexer.message.as_ptr())
@@ -325,10 +298,9 @@ pub unsafe extern "C" fn tjs2_lexer_error_message(lexer: *const tjs2_lexer) -> *
 /// `lexer` must be a live handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tjs2_lexer_value_kind(lexer: *const tjs2_lexer) -> c_int {
-    // SAFETY: the caller promises the handle is live.
     // SAFETY: the caller promises the handle is live and not freed.
     unsafe { lexer.as_ref() }
-        .map(|lexer| lexer.value_kind)
+        .map(|lexer| lexer.value_kind())
         .unwrap_or(TJS2_LEX_VALUE_NONE)
 }
 
@@ -341,11 +313,13 @@ pub unsafe extern "C" fn tjs2_lexer_value_kind(lexer: *const tjs2_lexer) -> c_in
 /// `lexer` must be a live handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tjs2_lexer_value_integer(lexer: *const tjs2_lexer) -> i64 {
-    // SAFETY: the caller promises the handle is live.
     // SAFETY: the caller promises the handle is live and not freed.
     unsafe { lexer.as_ref() }
-        .map(|lexer| lexer.value_integer)
-        .unwrap_or(0)
+        .and_then(|lexer| lexer.value())
+        .map_or(0, |value| match value {
+            ValueRef::Integer(value) => value,
+            _ => 0,
+        })
 }
 
 /// The real of the last token.
@@ -357,11 +331,13 @@ pub unsafe extern "C" fn tjs2_lexer_value_integer(lexer: *const tjs2_lexer) -> i
 /// `lexer` must be a live handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tjs2_lexer_value_real(lexer: *const tjs2_lexer) -> f64 {
-    // SAFETY: the caller promises the handle is live.
     // SAFETY: the caller promises the handle is live and not freed.
     unsafe { lexer.as_ref() }
-        .map(|lexer| lexer.value_real)
-        .unwrap_or(0.0)
+        .and_then(|lexer| lexer.value())
+        .map_or(0.0, |value| match value {
+            ValueRef::Real(value) => value,
+            _ => 0.0,
+        })
 }
 
 /// The code units of the last token.
@@ -379,18 +355,21 @@ pub unsafe extern "C" fn tjs2_lexer_value_string(
     lexer: *const tjs2_lexer,
     length: *mut u32,
 ) -> *const u16 {
-    // SAFETY: the caller promises the handle is live.
     // SAFETY: the caller promises the handle is live and not freed.
     let Some(lexer) = (unsafe { lexer.as_ref() }) else {
         return std::ptr::null();
     };
+    let units = match lexer.value() {
+        Some(ValueRef::String(units)) => units,
+        _ => &[],
+    };
     if !length.is_null() {
         // SAFETY: the caller promises the pointer is writable.
-        unsafe { *length = lexer.value_string.len() as u32 };
+        unsafe { *length = units.len() as u32 };
     }
     // the pointer is always valid: an empty string has no code units, and
     // the length says so
-    lexer.value_string.as_ptr()
+    units.as_ptr()
 }
 
 /// The bytes of the last token.
@@ -408,18 +387,21 @@ pub unsafe extern "C" fn tjs2_lexer_value_octet(
     lexer: *const tjs2_lexer,
     length: *mut u32,
 ) -> *const u8 {
-    // SAFETY: the caller promises the handle is live.
     // SAFETY: the caller promises the handle is live and not freed.
     let Some(lexer) = (unsafe { lexer.as_ref() }) else {
         return std::ptr::null();
     };
+    let bytes = match lexer.value() {
+        Some(ValueRef::Octet(bytes)) => bytes,
+        _ => &[],
+    };
     if !length.is_null() {
         // SAFETY: the caller promises the pointer is writable.
-        unsafe { *length = lexer.value_octet.len() as u32 };
+        unsafe { *length = bytes.len() as u32 };
     }
     // the pointer is always valid: an empty buffer has no bytes, and the
     // length says so
-    lexer.value_octet.as_ptr()
+    bytes.as_ptr()
 }
 
 /// The position the analyser has read up to, counted in code units.
@@ -429,7 +411,6 @@ pub unsafe extern "C" fn tjs2_lexer_value_octet(
 /// `lexer` must be a live handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tjs2_lexer_position(lexer: *const tjs2_lexer) -> u32 {
-    // SAFETY: the caller promises the handle is live.
     // SAFETY: the caller promises the handle is live and not freed.
     unsafe { lexer.as_ref() }
         .map(|lexer| {

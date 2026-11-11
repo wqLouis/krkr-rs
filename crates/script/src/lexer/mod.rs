@@ -24,7 +24,9 @@ use std::collections::VecDeque;
 pub use error::LexError;
 pub use preprocess::PpValues;
 pub use token::{Token, TokenKind};
-pub use value::{Literal, ScriptString};
+pub use value::ValueRef;
+
+pub(crate) use value::Value;
 
 use literal::StringEnd;
 
@@ -377,6 +379,20 @@ pub struct Lexer {
     conditional_level: i32,
     /// The values the conditional-compilation statements read and write.
     conditional_values: PpValues,
+    /// The values the tokens name.
+    ///
+    /// The string and the binary data live in the two buffers below, so a
+    /// value costs one entry here and no allocation.
+    ///
+    /// The buffers are bounded by the script: every code unit of the text
+    /// is copied into the string buffer at most once, and every value is
+    /// one entry. They are released with the analyser, at the end of the
+    /// script.
+    values: Vec<Value>,
+    /// The code units of every string value.
+    strings: Vec<u16>,
+    /// The bytes of every binary value.
+    octets: Vec<u8>,
 }
 
 impl Lexer {
@@ -426,7 +442,75 @@ impl Lexer {
             embeddable: Vec::new(),
             conditional_level: 0,
             conditional_values: PpValues::new(),
+            values: Vec::new(),
+            strings: Vec::new(),
+            octets: Vec::new(),
         }
+    }
+
+    /// The value of a token.
+    ///
+    /// The value is borrowed from the analyser's buffers, so it lives as
+    /// long as the analyser does: a token names its value by its index, and
+    /// the analyser keeps the value. The tokens of a whole script therefore
+    /// cost eight bytes each, and a token that carries a name costs no
+    /// allocation.
+    pub fn value(&self, token: &Token) -> Option<ValueRef<'_>> {
+        token.value.map(|index| self.value_at(index))
+    }
+
+    /// The value at an index in the analyser's values.
+    pub(crate) fn value_at(&self, index: u32) -> ValueRef<'_> {
+        match self.values[index as usize] {
+            Value::Null => ValueRef::Null,
+            Value::Integer(value) => ValueRef::Integer(value),
+            Value::Real(value) => ValueRef::Real(value),
+            Value::String { offset, len } => {
+                let start = offset as usize;
+                ValueRef::String(&self.strings[start..start + len as usize])
+            }
+            Value::Octet { offset, len } => {
+                let start = offset as usize;
+                ValueRef::Octet(&self.octets[start..start + len as usize])
+            }
+        }
+    }
+
+    /// Keep a value and name it.
+    fn push_value(&mut self, value: Value) -> u32 {
+        self.values.push(value);
+        (self.values.len() - 1) as u32
+    }
+
+    /// Keep the code units of a string and name the value.
+    fn push_string(&mut self, units: &[u16]) -> u32 {
+        let offset = self.strings.len() as u32;
+        self.strings.extend_from_slice(units);
+        let len = units.len() as u32;
+        self.push_value(Value::String { offset, len })
+    }
+
+    /// Keep the text of a name and name the value.
+    ///
+    /// The newline markers are not part of the name, so they do not go into
+    /// the buffer.
+    fn push_name(&mut self, start: usize, end: usize) -> u32 {
+        let offset = self.strings.len() as u32;
+        for &unit in &self.cursor.units()[start..end] {
+            if unit != SKIP_CODE {
+                self.strings.push(unit);
+            }
+        }
+        let len = self.strings.len() as u32 - offset;
+        self.push_value(Value::String { offset, len })
+    }
+
+    /// Keep the bytes of a binary value and name the value.
+    fn push_octet(&mut self, bytes: &[u8]) -> u32 {
+        let offset = self.octets.len() as u32;
+        self.octets.extend_from_slice(bytes);
+        let len = bytes.len() as u32;
+        self.push_value(Value::Octet { offset, len })
     }
 
     /// The values the conditional-compilation statements read and write.
@@ -517,10 +601,8 @@ impl Lexer {
             self.cursor.move_to(self.previous_position);
             self.cursor.advance();
             let pattern = self.cursor.scan_regexp()?;
-            return Ok(Scan::Token(Token::with_value(
-                TokenKind::Regexp,
-                Literal::String(pattern),
-            )));
+            let value = self.push_string(pattern.units());
+            return Ok(Scan::Token(Token::with_value(TokenKind::Regexp, value)));
         }
 
         loop {
@@ -540,6 +622,7 @@ impl Lexer {
                 let Some(value) = self.cursor.scan_number() else {
                     return Err(self.number_error());
                 };
+                let value = self.push_value(value);
                 return Ok(Scan::Token(Token::with_value(TokenKind::ConstVal, value)));
             }
             if let Some(kind) = self.match_operator() {
@@ -553,10 +636,8 @@ impl Lexer {
                 unit if unit == u16::from(b'<') => {
                     if self.cursor.ahead(1) == Some(u16::from(b'%')) {
                         let bytes = self.cursor.scan_octet()?;
-                        return Ok(Scan::Token(Token::with_value(
-                            TokenKind::ConstVal,
-                            Literal::Octet(bytes),
-                        )));
+                        let value = self.push_octet(&bytes);
+                        return Ok(Scan::Token(Token::with_value(TokenKind::ConstVal, value)));
                     }
                     self.cursor.advance();
                     return Ok(Scan::Token(Token::new(TokenKind::LessThan)));
@@ -625,10 +706,8 @@ impl Lexer {
                 }
                 unit if unit == u16::from(b'\'') || unit == u16::from(b'"') => {
                     let scan = self.cursor.scan_string(unit, false)?;
-                    return Ok(Scan::Token(Token::with_value(
-                        TokenKind::ConstVal,
-                        Literal::String(scan.text),
-                    )));
+                    let value = self.push_string(scan.text.units());
+                    return Ok(Scan::Token(Token::with_value(TokenKind::ConstVal, value)));
                 }
                 unit if unit == u16::from(b'@') => match self.scan_at()? {
                     At::Embeddable => return Ok(Scan::Pending),
@@ -640,6 +719,7 @@ impl Lexer {
                     let Some(value) = self.cursor.scan_number() else {
                         return Err(self.number_error());
                     };
+                    let value = self.push_value(value);
                     return Ok(Scan::Token(Token::with_value(TokenKind::ConstVal, value)));
                 }
                 _ => {
@@ -650,34 +730,40 @@ impl Lexer {
                     if !is_letter(character) && character != u16::from(b'_') {
                         return Err(self.invalid_character(character));
                     }
-                    let name = self.scan_name();
+                    let start = self.cursor.position();
+                    let end = self.scan_name();
                     let kind = if self.bare_word {
                         None
                     } else {
-                        reserved_word(&name)
+                        reserved_word(&self.cursor.units()[start..end])
                     };
                     self.bare_word = false;
                     return Ok(Scan::Token(match kind {
                         Some(TokenKind::False) => {
-                            Token::with_value(TokenKind::ConstVal, Literal::Integer(0))
+                            let value = self.push_value(Value::Integer(0));
+                            Token::with_value(TokenKind::ConstVal, value)
                         }
                         Some(TokenKind::True) => {
-                            Token::with_value(TokenKind::ConstVal, Literal::Integer(1))
+                            let value = self.push_value(Value::Integer(1));
+                            Token::with_value(TokenKind::ConstVal, value)
                         }
                         Some(TokenKind::Null) => {
-                            Token::with_value(TokenKind::ConstVal, Literal::Null)
+                            let value = self.push_value(Value::Null);
+                            Token::with_value(TokenKind::ConstVal, value)
                         }
                         Some(TokenKind::NaN) => {
-                            Token::with_value(TokenKind::ConstVal, Literal::Real(f64::NAN))
+                            let value = self.push_value(Value::Real(f64::NAN));
+                            Token::with_value(TokenKind::ConstVal, value)
                         }
                         Some(TokenKind::Infinity) => {
-                            Token::with_value(TokenKind::ConstVal, Literal::Real(f64::INFINITY))
+                            let value = self.push_value(Value::Real(f64::INFINITY));
+                            Token::with_value(TokenKind::ConstVal, value)
                         }
                         Some(kind) => Token::new(kind),
-                        None => Token::with_value(
-                            TokenKind::Symbol,
-                            Literal::String(ScriptString::from_units(name)),
-                        ),
+                        None => {
+                            let value = self.push_name(start, end);
+                            Token::with_value(TokenKind::Symbol, value)
+                        }
                     }));
                 }
             }
@@ -773,26 +859,21 @@ impl Lexer {
     ///
     /// The name is the run of code units that can be part of a name. The
     /// newline markers inside it are not part of the name.
-    fn scan_name(&mut self) -> Vec<u16> {
+    fn scan_name(&mut self) -> usize {
         let units = self.cursor.units();
         let start = self.cursor.position();
         let rest = &units[start..];
         let mut length = 0;
-        let mut marked = false;
         while length < rest.len() {
             let unit = rest[length];
             if !is_name_unit(unit) {
                 break;
             }
-            marked |= unit == SKIP_CODE;
             length += 1;
         }
-        let mut name = rest[..length].to_vec();
-        if marked {
-            name.retain(|&unit| unit != SKIP_CODE);
-        }
-        self.cursor.move_to(start + length);
-        name
+        let end = start + length;
+        self.cursor.move_to(end);
+        end
     }
 
     /// What an `@` at the current position means.
@@ -856,10 +937,9 @@ impl Lexer {
                             self.pending.push_back(Token::new(TokenKind::Plus));
                         }
                         if !scan.text.is_empty() || !needs_plus {
-                            self.pending.push_back(Token::with_value(
-                                TokenKind::ConstVal,
-                                Literal::String(scan.text),
-                            ));
+                            let value = self.push_string(scan.text.units());
+                            self.pending
+                                .push_back(Token::with_value(TokenKind::ConstVal, value));
                         }
                         self.pending
                             .push_back(Token::new(TokenKind::RightParenthesis));
@@ -871,10 +951,9 @@ impl Lexer {
                             if needs_plus {
                                 self.pending.push_back(Token::new(TokenKind::Plus));
                             }
-                            self.pending.push_back(Token::with_value(
-                                TokenKind::ConstVal,
-                                Literal::String(scan.text),
-                            ));
+                            let value = self.push_string(scan.text.units());
+                            self.pending
+                                .push_back(Token::with_value(TokenKind::ConstVal, value));
                             needs_plus = true;
                         }
                         if needs_plus {
@@ -1006,19 +1085,22 @@ fn single_operator(character: u16) -> Option<TokenKind> {
 /// The token kind a reserved word stands for.
 ///
 /// The reserved words are ASCII, so a name that holds another character is
-/// not one.
+/// not one. The newline markers are not part of the name, so they are
+/// stepped over.
 fn reserved_word(name: &[u16]) -> Option<TokenKind> {
     let mut bytes = [0u8; 16];
-    if name.len() > bytes.len() {
-        return None;
-    }
-    for (index, &unit) in name.iter().enumerate() {
-        if unit >= 0x80 {
+    let mut length = 0;
+    for &unit in name {
+        if unit == SKIP_CODE {
+            continue;
+        }
+        if unit >= 0x80 || length == bytes.len() {
             return None;
         }
-        bytes[index] = unit as u8;
+        bytes[length] = unit as u8;
+        length += 1;
     }
-    Some(match &bytes[..name.len()] {
+    Some(match &bytes[..length] {
         b"break" => TokenKind::Break,
         b"continue" => TokenKind::Continue,
         b"const" => TokenKind::Const,

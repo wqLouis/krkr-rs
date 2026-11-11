@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use super::{Comment, Cursor, LexError, Literal, Statement, is_digit, is_letter, is_space};
+use super::{Comment, Cursor, LexError, Statement, Value, is_digit, is_letter, is_space};
 
 /// The values the conditional-compilation statements read and write.
 ///
@@ -361,8 +361,8 @@ impl Expression<'_> {
             };
             self.position += cursor.position();
             return match literal {
-                Literal::Integer(value) => Ok(Piece::Number(value as i32)),
-                Literal::Real(value) => Ok(Piece::Number(value as i32)),
+                Value::Integer(value) => Ok(Piece::Number(value as i32)),
+                Value::Real(value) => Ok(Piece::Number(value as i32)),
                 _ => Err(ExpressionError::Syntax),
             };
         }

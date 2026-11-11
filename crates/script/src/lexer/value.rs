@@ -1,61 +1,54 @@
 //! The values a literal token carries.
+//!
+//! The analyser keeps the values it produces in one place: the string data
+//! in one buffer, the binary data in another, and the numbers beside them.
+//! A token names its value by its index, so a token costs eight bytes and
+//! producing one costs no allocation.
 
-/// A script string: a sequence of code units.
+/// A value the analyser keeps.
+///
+/// The string and the binary data are offsets into the analyser's buffers,
+/// so the buffers hold the data once.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Value {
+    /// The null object.
+    Null,
+    /// An integer.
+    Integer(i64),
+    /// A real.
+    Real(f64),
+    /// A string: the offset and the length in the string buffer.
+    String { offset: u32, len: u32 },
+    /// A binary buffer: the offset and the length in the byte buffer.
+    Octet { offset: u32, len: u32 },
+}
+
+impl Value {
+    /// The value with its sign flipped.
+    pub fn negated(self) -> Self {
+        match self {
+            Self::Integer(value) => Self::Integer(value.wrapping_neg()),
+            Self::Real(value) => Self::Real(-value),
+            other => other,
+        }
+    }
+}
+
+/// A value the analyser produced, borrowed from its buffers.
 ///
 /// A script string is not a sequence of bytes and not a sequence of
 /// characters: it is a sequence of code units, and its length is the number
 /// of code units in it. A lone surrogate is a code unit like any other.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct ScriptString {
-    units: Vec<u16>,
-}
-
-impl ScriptString {
-    /// An empty string.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// A string holding the given code units.
-    pub fn from_units(units: Vec<u16>) -> Self {
-        Self { units }
-    }
-
-    /// Append one code unit.
-    pub fn push(&mut self, unit: u16) {
-        self.units.push(unit);
-    }
-
-    /// The code units of the string.
-    pub fn units(&self) -> &[u16] {
-        &self.units
-    }
-
-    /// The number of code units in the string.
-    pub fn len(&self) -> usize {
-        self.units.len()
-    }
-
-    /// Whether the string holds no code unit.
-    pub fn is_empty(&self) -> bool {
-        self.units.is_empty()
-    }
-}
-
-/// A literal value.
-///
-/// The kinds are the ones a literal token can carry: the `null` literal, an
-/// integer, a real, a string and a binary buffer.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Literal {
-    /// The `null` literal.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ValueRef<'a> {
+    /// The null object.
     Null,
-    /// An integer literal.
+    /// An integer.
     Integer(i64),
-    /// A real literal.
+    /// A real.
     Real(f64),
-    /// A string literal.
-    String(ScriptString),
-    /// A binary literal.
-    Octet(Vec<u8>),
+    /// A string: the code units.
+    String(&'a [u16]),
+    /// A binary buffer: the bytes.
+    Octet(&'a [u8]),
 }

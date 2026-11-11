@@ -5,14 +5,14 @@
 //! apart because the same text is read twice — once to find where the
 //! literal ends, and once to compute its value.
 
-use super::{Cursor, Digits, Literal};
+use super::{Cursor, Digits, Value};
 
 impl Cursor {
     /// The number literal at the current position.
     ///
     /// A leading sign is part of the literal. `None` means the text at the
     /// cursor is not a number.
-    pub(super) fn scan_number(&mut self) -> Option<Literal> {
+    pub(super) fn scan_number(&mut self) -> Option<Value> {
         let negative = match self.current() {
             Some(character) if character == u16::from(b'+') => {
                 if !self.advance() || !self.skip_space() {
@@ -34,24 +34,24 @@ impl Cursor {
     }
 
     /// The number literal at the current position, without a sign.
-    fn scan_number_body(&mut self) -> Option<Literal> {
+    fn scan_number_body(&mut self) -> Option<Value> {
         if self.match_word("true") {
-            return Some(Literal::Integer(1));
+            return Some(Value::Integer(1));
         }
         if self.match_word("false") {
-            return Some(Literal::Integer(0));
+            return Some(Value::Integer(0));
         }
         if self.match_word("NaN") {
-            return Some(Literal::Real(f64::NAN));
+            return Some(Value::Real(f64::NAN));
         }
         if self.match_word("Infinity") {
-            return Some(Literal::Real(f64::INFINITY));
+            return Some(Value::Real(f64::INFINITY));
         }
 
         let start = self.position();
         if self.current() == Some(u16::from(b'0')) {
             if !self.advance() {
-                return Some(Literal::Integer(0));
+                return Some(Value::Integer(0));
             }
             match self.current() {
                 Some(character) if character == u16::from(b'X') || character == u16::from(b'x') => {
@@ -86,31 +86,31 @@ impl Cursor {
     }
 
     /// A decimal number literal at the current position.
-    fn scan_decimal(&mut self) -> Option<Literal> {
+    fn scan_decimal(&mut self) -> Option<Value> {
         let (text, is_real) = self.extract_number(Digits::Decimal, *b"Ee");
         if text.is_empty() {
             return None;
         }
         if is_real {
-            return parse_decimal_real(&text).map(Literal::Real);
+            return parse_decimal_real(&text).map(Value::Real);
         }
         let mut value: i64 = 0;
         for &character in &text {
             let digit = Digits::Decimal.value(character)?;
             value = value.wrapping_mul(10).wrapping_add(i64::from(digit));
         }
-        Some(Literal::Integer(value))
+        Some(Value::Integer(value))
     }
 
     /// A hexadecimal, octal or binary number literal at the current
     /// position.
-    fn scan_non_decimal(&mut self, digits: Digits) -> Option<Literal> {
+    fn scan_non_decimal(&mut self, digits: Digits) -> Option<Value> {
         let (text, is_real) = self.extract_number(digits, *b"Pp");
         if text.is_empty() {
             return None;
         }
         if is_real {
-            return Some(Literal::Real(parse_non_decimal_real(&text, digits)));
+            return Some(Value::Real(parse_non_decimal_real(&text, digits)));
         }
         let bits = digits.bits();
         let mut value: i64 = 0;
@@ -118,7 +118,7 @@ impl Cursor {
             let digit = digits.value(character).unwrap_or(-1);
             value = value.wrapping_shl(bits).wrapping_add(i64::from(digit));
         }
-        Some(Literal::Integer(value))
+        Some(Value::Integer(value))
     }
 
     /// The text of a number literal at the current position, and whether it
@@ -178,17 +178,6 @@ impl Cursor {
             }
         }
         (text, point_found || exponent_found)
-    }
-}
-
-impl Literal {
-    /// The value with its sign flipped.
-    fn negated(self) -> Self {
-        match self {
-            Self::Integer(value) => Self::Integer(value.wrapping_neg()),
-            Self::Real(value) => Self::Real(-value),
-            other => other,
-        }
     }
 }
 

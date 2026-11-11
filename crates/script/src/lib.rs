@@ -14,4 +14,4 @@
 pub mod ffi;
 pub mod lexer;
 
-pub use lexer::{LexError, Lexer, Literal, PpValues, ScriptString, Token, TokenKind};
+pub use lexer::{LexError, Lexer, PpValues, Token, TokenKind, ValueRef};

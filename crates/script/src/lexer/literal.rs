@@ -1,6 +1,37 @@
 //! The literal forms: strings, regular expressions and binary buffers.
 
-use super::{Comment, Cursor, LexError, ScriptString};
+use super::{Comment, Cursor, LexError};
+
+/// The text a literal scan builds.
+///
+/// It is the scanner's own buffer: the analyser copies the text into its
+/// own string buffer once the literal is complete.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Text {
+    units: Vec<u16>,
+}
+
+impl Text {
+    /// An empty text.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append one code unit.
+    pub fn push(&mut self, unit: u16) {
+        self.units.push(unit);
+    }
+
+    /// The code units of the text.
+    pub fn units(&self) -> &[u16] {
+        &self.units
+    }
+
+    /// Whether the text holds no code unit.
+    pub fn is_empty(&self) -> bool {
+        self.units.is_empty()
+    }
+}
 
 /// How a string literal ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,7 +47,7 @@ pub(crate) enum StringEnd {
 /// What a string scan produced.
 pub(crate) struct StringScan {
     /// The text of the literal, with the escapes decoded.
-    pub text: ScriptString,
+    pub text: Text,
     /// How the literal ended.
     pub end: StringEnd,
 }
@@ -53,7 +84,7 @@ impl Cursor {
         delimiter: u16,
         embeddable: bool,
     ) -> Result<StringScan, LexError> {
-        let mut text = ScriptString::new();
+        let mut text = Text::new();
         loop {
             let Some(character) = self.current() else {
                 return Err(self.unterminated_literal());
@@ -170,8 +201,8 @@ impl Cursor {
     /// # Errors
     ///
     /// A literal that is not terminated is a [`LexError`].
-    pub fn scan_regexp(&mut self) -> Result<ScriptString, LexError> {
-        let mut pattern = ScriptString::new();
+    pub fn scan_regexp(&mut self) -> Result<Text, LexError> {
+        let mut pattern = Text::new();
         let mut escaped = false;
         loop {
             let Some(character) = self.current() else {
@@ -185,7 +216,7 @@ impl Cursor {
                 if !self.advance() {
                     break;
                 }
-                let mut flags = ScriptString::new();
+                let mut flags = Text::new();
                 while let Some(flag) = self.current() {
                     if flag < u16::from(b'a') || flag > u16::from(b'z') {
                         break;
@@ -195,7 +226,7 @@ impl Cursor {
                         break;
                     }
                 }
-                let mut literal = ScriptString::new();
+                let mut literal = Text::new();
                 literal.push(u16::from(b'/'));
                 literal.push(u16::from(b'/'));
                 for unit in flags.units() {
@@ -212,7 +243,7 @@ impl Cursor {
             }
             self.advance();
         }
-        Ok(ScriptString::new())
+        Ok(Text::new())
     }
 
     /// The binary literal that starts at the current position.

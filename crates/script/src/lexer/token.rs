@@ -253,12 +253,18 @@ impl TokenKind {
 }
 
 /// One token: its kind and, for the kinds that carry one, its value.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// The value is named by its index in the analyser's values, so a token
+/// costs eight bytes and producing one costs no allocation. The value
+/// itself is read through the analyser that produced the token, with
+/// [`Lexer::value`](super::Lexer::value).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Token {
     /// The token's kind.
     pub kind: TokenKind,
-    /// The literal the token carries, when it has one.
-    pub value: Option<super::Literal>,
+    /// The index of the token's value in the analyser's values, when the
+    /// token carries one.
+    pub value: Option<u32>,
 }
 
 impl Token {
@@ -267,8 +273,8 @@ impl Token {
         Self { kind, value: None }
     }
 
-    /// A token that carries a literal value.
-    pub fn with_value(kind: TokenKind, value: super::Literal) -> Self {
+    /// A token that carries a value.
+    pub fn with_value(kind: TokenKind, value: u32) -> Self {
         Self {
             kind,
             value: Some(value),
