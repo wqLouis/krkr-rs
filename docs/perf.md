@@ -933,3 +933,67 @@ clippy); the worker reports it as **not compiled**
 
 ---
 ---
+
+## 10. The per-frame work
+
+Two of the three ranked per-frame hotspots are closed. Both were the same
+shape: a count that a flat container had to be asked for by walking it.
+
+### 10.1 The timer's capacity clamp
+
+The capacity clamp on a firing timer asked how many `onTimer` posts that
+timer still had queued, and it got the answer by filtering the frame's whole
+post queue: O(P) per fire, so a frame that fires a thousand timers paid a
+million post reads.
+
+The queue keeps the count as an index now, maintained at the three points
+where the queue changes — a push, a timer's posts being dropped, the drain —
+and every mutation of the queue and the index lives inside the one type that
+owns them, so the two cannot drift.
+
+**Measured on the two shapes alone**, 200 frames per point, the same post
+layout and the same push and drain order:
+
+| timers | the scan per fire | the index per fire | |
+|---|---|---|---|
+| 1 000 | 0.151 ms/frame | 0.043 ms/frame | 3.5x |
+| 2 000 | 0.603 ms/frame | 0.121 ms/frame | 5.0x |
+| 4 000 | 2.464 ms/frame | 0.258 ms/frame | 9.6x |
+| 8 000 | 10.319 ms/frame | 0.560 ms/frame | 18.4x |
+
+The old shape grows fourfold per doubling and the new one twofold.
+
+### 10.2 The async trigger's pending fires
+
+The pending fires were held in one flat vector, and every removal walked it
+to find the fires of one trigger: O(P) per removal, so the frame's trigger
+and cleanup path was quadratic in the number of pending fires.
+
+The queue is a vector of slots now — a dropped fire leaves its slot empty,
+the tombstone idiom the compatibility layer already uses for
+`System.addContinuousHandler` — and each trigger reaches its own slots
+through a chain of slot positions.
+
+**Measured on the two shapes alone**, 100 frames per point:
+
+| triggers | the walk per removal | the chain per removal | |
+|---|---|---|---|
+| 500 | 9.413 ms/frame | 1.606 ms/frame | 5.9x |
+| 1 000 | 35.847 ms/frame | 3.251 ms/frame | 11.0x |
+| 2 000 | 146.761 ms/frame | 6.562 ms/frame | 22.4x |
+| 4 000 | 609.090 ms/frame | 15.800 ms/frame | 38.5x |
+
+### 10.3 A deadlock in the shared archive read
+
+While measuring the startup, the engine's storage suite hung: the two
+shared-read tests never finished. The shared archive range elects one reader
+and the callers that arrive while it is being read wait for it — and the
+election's lock was held across the read that follows, so the reader
+re-locked a mutex it still held in order to publish the result and deadlocked
+against itself, while every other worker blocked on that mutex.
+
+The election is taken in a scope of its own now. The two tests finish in
+0.01 s.
+
+The two measurements above are of the two shapes in isolation, not of the
+game: they say what the shape costs, and the shape is what changed.
