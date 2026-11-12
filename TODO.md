@@ -1208,6 +1208,12 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   or `++`/`--` statement. `docs.old/audits/bytecode-scripts.md` §5,
   `docs.old/vm-defects.md` BLK-3.
 
+* **The scratch space fills up.** A worker that builds the tree keeps a
+  target directory of its own, and several of them fill `/tmp` - which is a
+  tmpfs of sixteen gigabytes - until a write fails with an I/O error and the
+  turn dies. Clear the finished workers' target directories when a worker
+  delivers, and keep a worker's own build to `cargo build -p tjs` rather
+  than the whole workspace.
 * **A change to `crates/tjs/build.rs` forces a fresh staging of the C++
   dependencies, and the development host's NTFS mount can leave a poisoned
   file behind.** The staging copies the header-only dependencies into the
