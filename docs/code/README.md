@@ -116,6 +116,7 @@ per-plugin pages are indexed in [`compat/README.md`](compat/README.md).
 | [`tjs/parser.md`](tjs/parser.md) | `tjs::vm` | the parser: the token stream in, the expression tree out, and the grammar's productions |
 | [`tjs/generator.md`](tjs/generator.md) | `tjs::vm` | the code generator: the expression tree to bytecode, and the rules it implements |
 | [`tjs/seam.md`](tjs/seam.md), [`tjs/seam-fields.md`](tjs/seam-fields.md) | `tjs::vm` | the seam: the compile entry, the C ABI, and the field-by-field table of the script block image |
+| [`tjs/corpus.md`](tjs/corpus.md) | `tjs::vm` | the corpus digest: the fixture of every script's compiled block, and the check that compares the front end with it |
 
 ---
 
