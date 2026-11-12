@@ -2034,6 +2034,10 @@ impl<'a, C: Commands> Parser<'a, C> {
             }
             Some(TokenKind::LeftParenthesis) => {
                 // a nested constant array or constant dictionary
+                self.advance();
+                if self.peek_kind() != Some(TokenKind::Const) {
+                    return Err(self.syntax_error("'const'"));
+                }
                 let node = self.const_inline()?;
                 Ok(self
                     .nodes
@@ -2086,6 +2090,10 @@ impl<'a, C: Commands> Parser<'a, C> {
             }
             Some(TokenKind::LeftParenthesis) => {
                 // a nested constant array or constant dictionary
+                self.advance();
+                if self.peek_kind() != Some(TokenKind::Const) {
+                    return Err(self.syntax_error("'const'"));
+                }
                 let node = self.const_inline()?;
                 self.nodes
                     .node(node)
