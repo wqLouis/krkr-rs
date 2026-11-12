@@ -215,6 +215,57 @@ const VECTORS: &[Vector] = &[
             [128, 128, 128, 255],
         ],
     },
+    // The two vectors whose blue channel is below the destination's blue
+    // channel: the packed subtraction borrows out of the blue lane, and the
+    // packed addition carries back into the red lane. The two cancel, so
+    // the per-channel mix is the packed mix's result
+    // (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:374-383`).
+    Vector {
+        source: [32, 31, 131, 99],
+        destination: [32, 173, 185, 139],
+        opacity: 171,
+        expected: [
+            [32, 136, 171, 139],
+            [40, 180, 203, 139],
+            [23, 128, 153, 139],
+            [24, 133, 161, 139],
+            [39, 175, 194, 139],
+            [25, 157, 185, 139],
+            [25, 139, 185, 139],
+            [25, 161, 185, 139],
+            [33, 178, 203, 139],
+            [33, 177, 212, 139],
+            [23, 128, 167, 139],
+            [32, 173, 185, 139],
+            [32, 136, 171, 139],
+            [23, 165, 151, 139],
+            [24, 166, 152, 139],
+            [38, 170, 170, 139],
+        ],
+    },
+    Vector {
+        source: [250, 238, 120, 228],
+        destination: [234, 91, 242, 204],
+        opacity: 54,
+        expected: [
+            [237, 118, 219, 204],
+            [237, 121, 244, 204],
+            [233, 87, 216, 204],
+            [232, 89, 217, 204],
+            [238, 119, 243, 204],
+            [237, 105, 242, 204],
+            [237, 117, 239, 204],
+            [235, 101, 241, 204],
+            [237, 121, 244, 204],
+            [255, 109, 255, 204],
+            [234, 88, 239, 204],
+            [237, 118, 242, 204],
+            [234, 91, 219, 204],
+            [193, 101, 219, 204],
+            [188, 47, 220, 204],
+            [195, 103, 222, 204],
+        ],
+    },
 ];
 
 /// The committed shader is the program the table generates.

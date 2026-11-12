@@ -217,31 +217,37 @@ residuals:
     The renderer gives the ordinary dodge (`omDodge`) and the Photoshop dodge
     (`omPsColorDodge`) the same kernel (`crates/platform/render/src/cpu.rs`,
     `composite`). Worst difference **111 levels**.
-* **The GPU blend path is not the reference's arithmetic.** The reference
-  selects a blend method per draw
+* **The GPU's ordinary and plain blends are not the reference's arithmetic.**
+  The reference selects a blend method per draw
   (`reference/cpp/core/visual/RenderManager.cpp:2425-2459`, `:2857-2924`) and
   blends the sRGB-encoded bytes with its live kernels
   (`reference/cpp/core/visual/gl/blend_functor_c.h:374-660`); the Photoshop
   family is spelled out as tables and variations
   (`reference/cpp/core/visual/gl/blend_function.cpp:526-547`,
-  `reference/cpp/core/visual/gl/blend_variation.h:63-106`). The Vulkan backend
-  blends in linear light, re-derives the reference's functions in float
-  (`crates/platform/render/shaders/dst_blend.frag`) and leaves four Photoshop
-  modes to the Vulkan fixed function, which cannot express the reference's
-  shape. Worst differences: **PsColorDodge 254**, **PsMultiplicative 200**,
-  **PsScreen 164**, **PsAdditive 23**. A change to this path is in flight;
-  the entry states the divergence it has to close.
-* **The GPU samples bilinearly and the L1 software renderer point-samples.**
-  This is the CPU-vs-GPU sampling difference: the Vulkan backend's sampler
-  interpolates between source texels
-  (`crates/platform/render/src/vulkan/pipelines.rs`, `create_sampler`), while
-  the software renderer takes the nearest source texel
-  (`crates/platform/render/src/cpu.rs`, `sample_texture`). The reference's
-  blended draw goes through the method dispatch
-  (`reference/cpp/core/visual/RenderManager.cpp:2425-2459`, `:2857-2924`),
-  and the L1 renderer is the GPU path's stated behavioural baseline
-  (`crates/platform/render/src/cpu.rs`), so the GPU program is the one that
-  has to match the software renderer.
+  `reference/cpp/core/visual/gl/blend_variation.h:63-106`). The sixteen
+  Photoshop modes run in the destination-dependent program, from the shared
+  table of per-channel functions (`crates/platform/render/src/blend.rs`), and
+  the program's source is generated from that table
+  (`crates/platform/render/src/blend_shader.rs`), so the family is the
+  reference's arithmetic — and the point sampler
+  (`crates/platform/render/src/vulkan/pipelines.rs`, `create_sampler`) gives
+  the program the same source and destination bytes the software renderer
+  reads. Two parts are still open:
+  * the **ordinary** modes (`SourceOver`, `Replace`, `Additive`,
+    `Subtractive`, `AddAlpha`, `Multiply`, `Screen`) are the Vulkan
+    fixed-function blend state, while the reference's live kernels for them
+    are the packed word ones (`blend_functor_c.h:374-660`); the item above
+    measures the software renderer's divergence from the reference for the
+    same modes (175 to 243 levels), and the fixed-function path has not been
+    measured against the reference;
+  * the three **plain** destination-dependent modes — the plain colour dodge,
+    the plain darken and the plain lighten — are computed by the program in
+    float (`crates/platform/render/shaders/dst_blend.frag`,
+    `blend_plain_color_dodge`, `blend_plain_darken`, `blend_plain_lighten`),
+    while the software renderer maps them to the family's table and compare
+    masks (`crates/platform/render/src/cpu.rs`, `composite`). The plain
+    colour dodge differs between the two paths by up to **178** levels, the
+    plain darken by up to **2** and the plain lighten by up to **3**.
 * **The transition's mix methods: what landed, and the alpha byte the
   reference's two paths disagree on.** The cross-fade's blend is chosen by
   the destination layer's type (`reference/cpp/core/visual/TransIntf.cpp:664-686`):

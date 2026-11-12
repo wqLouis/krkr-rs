@@ -9,6 +9,11 @@
 //! destination's channel into the blended channel, and the source's alpha
 //! mixes that channel into the destination's.
 //!
+//! The classic kernels mix on the packed word: the subtraction borrows out of
+//! the blue lane into the red one, and the addition of the destination
+//! carries back into it. The two cancel, so the per-channel mix below is the
+//! packed mix's result.
+//!
 //! Every mode of the family keeps the destination's alpha.
 //!
 //! The program's source is generated from this table (see

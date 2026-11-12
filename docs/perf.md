@@ -719,41 +719,61 @@ marks nothing.
 
 The report is `/tmp/dirty-region/REPORT.md`.
 
-### 7.2 Two open divergences between the CPU and the GPU
+### 7.2 The two divergences between the CPU and the GPU, and what closed them
 
-Both are **open**: neither has a fix, and neither has a decision. They are
-recorded here because they decide what a GPU-vs-CPU comparison can mean.
+**(a) The Photoshop mix arithmetic — closed, and the old claim was wrong.**
 
-**(a) The Photoshop mix arithmetic.** The reference's Photoshop mix is a
-**word-wide** operation: the red and blue lanes share their borrows. The
-**CPU rasterizer** reproduces it exactly
-(`crates/platform/render/src/cpu.rs:534-540`). The **shared blend table**
-(`crates/platform/render/src/blend.rs:392-395`) computes a **per-lane**
-signed difference, and the **GPU program is generated from that table** —
-so the GPU follows the per-lane arithmetic.
+The reference's Photoshop mix is a **word-wide** operation: a subtraction
+borrows out of the blue lane into the red one, and the addition of the
+destination carries back into it. A per-lane formula cannot reproduce a
+borrow, so the shared blend table (`crates/platform/render/src/blend.rs`) was
+measured against the reference's own compiled kernels and reported to differ
+on 0.68 % of the vectors.
 
-**Method.** A transcription of the reference's C++ and of the table's `mix`,
-weighted by the source's alpha scaled by the opacity, compared over 300 000
-random (source, destination, opacity) triples.
+That 0.68 % was **the audit's own model**: it masked the shifted product
+before adding the destination, which drops the carry that crosses from the
+blue lane into the red one. The borrow and the carry cancel, so the
+per-channel mix *is* the packed mix's result.
 
-**2 053 mismatches — 0.68 % of the triples** — each a **±1** difference in
-the red or the blue lane. Both models agree on the vectors the tests use,
-which is why the divergence is invisible to them today.
+**Method.** The reference's own kernels, compiled from
+`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h` and called through
+their real entry points (`ps_alpha_blend_func()` and the rest), against the
+shared table, against the rasterizer's word-wide path, and against the
+audit's model — over 16 modes x 9 295 104 vectors, the red lane and the
+carrying blue lane swept over their whole ranges on both sides of the
+borrow threshold, the extremes in every lane, and the whole weight range.
 
-It also means the tree's own two paths disagree: the engine's L2 pixel
-path reads the shared table, the CPU rasterizer uses the classic word
-kernels, and the reference-matching one is the rasterizer's.
+**148 721 664 comparisons, no difference.** The audit's model reproduces its
+own 0.695 %, and the reference's kernel agrees with the table on the audit's
+two example vectors.
 
-**(b) The sampling filter.** The reference's default stretch is the
-**nearest** copy (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2902`,
-`:3191-3226`); the **CPU rasterizer samples nearest**
-(`crates/platform/render/src/cpu.rs:781-806`); the **Vulkan scene sampler
-is `LINEAR`** (`crates/platform/render/src/vulkan/pipelines.rs:974-985`).
-A magnified or minified layer is therefore a different image on the two
-paths — not a rounding difference.
+The rasterizer's duplicated word-wide kernels are therefore deleted: it
+reads the shared table now, so the two paths cannot drift. Its output does
+not change — its word-wide path and the table agree on every vector of that
+sweep.
 
-The script is `/tmp/gpu-fallback-audit/blendcmp2.py`; the report is
-`/tmp/gpu-fallback-audit/REPORT.md` §4.2.
+**(b) The sampling filter — closed.**
+
+The reference's default stretch is the **nearest** copy
+(`reference/krkr2/cpp/core/visual/RenderManager.cpp:2902`, `:3191-3226`;
+`reference/krkr2/cpp/core/visual/tvpgl.cpp:8577-8606`, the floor
+convention), and the **CPU rasterizer samples nearest**. The **Vulkan scene
+sampler was `LINEAR`**, so a magnified or minified layer was a different
+image on the two paths.
+
+The scene sampler takes the **nearest source texel** now
+(`crates/platform/render/src/vulkan/pipelines.rs`, `create_sampler`). The
+destination-dependent program blends per destination texel and reads the
+destination through the same sampler, so it cannot read an interpolation of
+the destination's bytes.
+
+**This is a visible change**: a magnified layer is blocky on the GPU, and a
+minified one aliases. It is the reference's **software-path** behaviour, and
+the port follows it because that is what a script's `getPixel` reads. The
+reference's own **OpenGL** path filters linearly
+(`reference/krkr2/cpp/core/visual/RenderManager_ogl.cpp:879-887`,
+`:1203-1204`, `:2325-2326`), so the port deliberately differs from the
+reference's graphics path and matches its software path.
 
 ### 7.3 The GPU gap inventory, and what the game's own code reaches
 

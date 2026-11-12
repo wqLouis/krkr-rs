@@ -475,6 +475,15 @@ a binding no layout provides would read a descriptor that does not exist: the
 pipeline creation fails on a strict driver, and the draw reads unbound data on
 a lenient one.
 
+The scene's sampler is a **point** sampler: it takes the nearest source
+texel, the way the classic draw copies the source texel for texel and the
+way the software rasterizer takes the nearest source texel, so a magnified
+or a minified layer is point-scaled on both. The destination blend reads the
+destination's copy through the same sampler, so its per-channel functions see
+the destination's own texels and not an interpolation of them. The effect
+pipelines choose their own sampler per binding (`SamplerKind`), because their
+programs are the transition's and not the scene's.
+
 ### Textures and uploads
 
 * L2 owns the CPU bitmap and its dirty flags.

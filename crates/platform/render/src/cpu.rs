@@ -9,10 +9,9 @@
 //! for every pixel, so the destination-dependent [`BlendMode`]s are evaluated
 //! exactly here. The Vulkan backend uses this as the behavioural baseline.
 //!
-//! The Photoshop blend family runs the classic kernels on the 32-bit ARGB
-//! word: the word's lanes share their carries, a subtraction borrows across
-//! the red and blue lanes and the mix truncates by eight bits. The result is
-//! therefore the byte-exact one, not a float approximation of it.
+//! The Photoshop blend family runs the shared table of per-channel functions
+//! on the 32-bit ARGB word: the mix truncates by eight bits, so the result is
+//! the byte-exact one, not a float approximation of it.
 //!
 //! The rasterizer is a pure function over explicit state: it reads the scene
 //! and texture pixels it is handed and writes only into `pixels`. It keeps no
@@ -23,6 +22,7 @@ use api::error::RenderError;
 use api::geometry::{Affine2, PixelRegion, RectF};
 
 use crate::MAX_TRAVERSAL_DEPTH;
+use crate::blend::PhotoshopBlend;
 use crate::scene::{
     Clip, RenderContent, RenderNode, RenderNodeId, RenderScene, child_sort_key,
     children_are_sorted, node_spaces,
@@ -455,29 +455,32 @@ fn composite(mode: BlendMode, dst: [u8; 4], src: [f32; 4], opacity: f32) -> [u8;
             ];
             [to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), dst[3]]
         }
-        // The Photoshop family: the classic kernels on the ARGB word.
-        BlendMode::PsNormal => photoshop(ps_alpha_blend, dst, src, opacity),
-        BlendMode::PsAdditive => photoshop(ps_add, dst, src, opacity),
-        BlendMode::PsSubtractive => photoshop(ps_sub, dst, src, opacity),
-        BlendMode::PsMultiplicative => photoshop(ps_mul, dst, src, opacity),
-        BlendMode::PsScreen => photoshop(ps_screen, dst, src, opacity),
+        // The Photoshop family: the shared table's modes.
+        BlendMode::PsNormal => photoshop(PhotoshopBlend::NORMAL, dst, src, opacity),
+        BlendMode::PsAdditive => photoshop(PhotoshopBlend::ADDITIVE, dst, src, opacity),
+        BlendMode::PsSubtractive => photoshop(PhotoshopBlend::SUBTRACTIVE, dst, src, opacity),
+        BlendMode::PsMultiplicative => photoshop(PhotoshopBlend::MULTIPLICATIVE, dst, src, opacity),
+        BlendMode::PsScreen => photoshop(PhotoshopBlend::SCREEN, dst, src, opacity),
         // The destination-dependent blends are the rest of the Photoshop
         // family.
         BlendMode::DestinationDependent(kind) => {
-            let kernel = match kind {
-                DstBlend::Overlay => ps_overlay,
-                DstBlend::HardLight => ps_hard_light,
-                DstBlend::SoftLight => ps_soft_light,
-                DstBlend::ColorDodge | DstBlend::PsColorDodge => ps_color_dodge,
-                DstBlend::ColorDodge5 => ps_color_dodge5,
-                DstBlend::ColorBurn => ps_color_burn,
-                DstBlend::Lighten | DstBlend::PsLighten => ps_lighten,
-                DstBlend::Darken | DstBlend::PsDarken => ps_darken,
-                DstBlend::Difference => ps_difference,
-                DstBlend::Difference5 => ps_difference5,
-                DstBlend::Exclusion => ps_exclusion,
+            let mode = match kind {
+                DstBlend::Overlay => PhotoshopBlend::OVERLAY,
+                DstBlend::HardLight => PhotoshopBlend::HARD_LIGHT,
+                DstBlend::SoftLight => PhotoshopBlend::SOFT_LIGHT,
+                // The plain colour dodge, the plain darken and the plain
+                // lighten read the family's table here; the engine's own path
+                // runs the plain kernels for them.
+                DstBlend::ColorDodge | DstBlend::PsColorDodge => PhotoshopBlend::COLOR_DODGE,
+                DstBlend::ColorDodge5 => PhotoshopBlend::COLOR_DODGE5,
+                DstBlend::ColorBurn => PhotoshopBlend::COLOR_BURN,
+                DstBlend::Lighten | DstBlend::PsLighten => PhotoshopBlend::LIGHTEN,
+                DstBlend::Darken | DstBlend::PsDarken => PhotoshopBlend::DARKEN,
+                DstBlend::Difference => PhotoshopBlend::DIFFERENCE,
+                DstBlend::Difference5 => PhotoshopBlend::DIFFERENCE5,
+                DstBlend::Exclusion => PhotoshopBlend::EXCLUSION,
             };
-            photoshop(kernel, dst, src, opacity)
+            photoshop(mode, dst, src, opacity)
         }
     }
 }
@@ -486,8 +489,8 @@ fn composite(mode: BlendMode, dst: [u8; 4], src: [f32; 4], opacity: f32) -> [u8;
 // The Photoshop blend family
 // ---------------------------------------------------------------------------
 
-/// Packs four RGBA8 bytes into the 32-bit ARGB word the Photoshop kernels
-/// work on.
+/// Packs four RGBA8 bytes into the 32-bit ARGB word the blend table works
+/// on.
 fn argb_word(pixel: [u8; 4]) -> u32 {
     (u32::from(pixel[3]) << 24)
         | (u32::from(pixel[0]) << 16)
@@ -495,254 +498,21 @@ fn argb_word(pixel: [u8; 4]) -> u32 {
         | u32::from(pixel[2])
 }
 
-/// The Photoshop blend family: the classic kernels, computed on the 32-bit
-/// ARGB word.
+/// The Photoshop blend family: the shared table's modes, computed on the
+/// 32-bit ARGB word.
 ///
-/// The word's lanes share their carries: a subtraction borrows across the
-/// red and blue lanes and a multiplication overflows the word, so a per-lane
-/// formula does not reproduce the result.
+/// The table owns the family's per-channel functions and the way the
+/// source's alpha mixes them into the destination, so this renderer, the
+/// engine's bitmap path and the destination-dependent program all run the
+/// same rules.
 ///
 /// The source's alpha, scaled by the opacity, mixes the per-channel result
 /// into the destination, and the destination's alpha is kept.
-fn photoshop(
-    kernel: fn(u32, u32, u32) -> u32,
-    dst: [u8; 4],
-    src: [f32; 4],
-    opacity: f32,
-) -> [u8; 4] {
+fn photoshop(mode: PhotoshopBlend, dst: [u8; 4], src: [f32; 4], opacity: f32) -> [u8; 4] {
     let destination = argb_word(dst);
     let source = argb_word([to_u8(src[0]), to_u8(src[1]), to_u8(src[2]), to_u8(src[3])]);
-    let word = kernel(
-        destination,
-        source,
-        ps_factor(source, u32::from(to_u8(opacity))),
-    );
+    let word = mode.blend_word(destination, source, to_u8(opacity));
     [(word >> 16) as u8, (word >> 8) as u8, word as u8, dst[3]]
-}
-
-/// The factor the Photoshop blends mix their per-channel result with: the
-/// source's alpha, scaled by the opacity.
-fn ps_factor(source: u32, opa: u32) -> u32 {
-    if opa == 255 {
-        source >> 24
-    } else {
-        ((source >> 24) * opa) >> 8
-    }
-}
-
-/// The Photoshop alpha tail: the source's alpha mixes the colours.
-fn ps_alpha_blend(destination: u32, source: u32, a: u32) -> u32 {
-    let d1 = destination & 0x00ff_00ff;
-    let d2 = destination & 0x0000_ff00;
-    let low = (source & 0x00ff_00ff).wrapping_sub(d1).wrapping_mul(a) >> 8;
-    let high = (source & 0x0000_ff00).wrapping_sub(d2).wrapping_mul(a) >> 8;
-    (low.wrapping_add(d1) & 0x00ff_00ff) | (high.wrapping_add(d2) & 0x0000_ff00)
-}
-
-/// The Photoshop additive blend: the saturating sum of the two words.
-fn ps_add(destination: u32, source: u32, a: u32) -> u32 {
-    let mut n = ((destination & source) << 1).wrapping_add((destination ^ source) & 0x00fe_fefe)
-        & 0x0101_0100;
-    n = ((n >> 8).wrapping_add(0x007f_7f7f)) ^ 0x007f_7f7f;
-    let source = destination.wrapping_add(source).wrapping_sub(n) | n;
-    ps_alpha_blend(destination, source, a)
-}
-
-/// The Photoshop subtractive blend: the source is inverted and the difference
-/// saturates.
-fn ps_sub(destination: u32, source: u32, a: u32) -> u32 {
-    let source = !source;
-    let mut n = (((!destination) & source) << 1)
-        .wrapping_add(((!destination) ^ source) & 0x00fe_fefe)
-        & 0x0101_0100;
-    n = ((n >> 8).wrapping_add(0x007f_7f7f)) ^ 0x007f_7f7f;
-    let source = (destination | n).wrapping_sub(source | n);
-    ps_alpha_blend(destination, source, a)
-}
-
-/// The Photoshop multiplicative blend: the product of the two colour lanes.
-fn ps_mul(destination: u32, source: u32, a: u32) -> u32 {
-    let source = (((((destination >> 16) & 0xff).wrapping_mul(source & 0x00ff_0000))
-        & 0xff00_0000)
-        | ((((destination >> 8) & 0xff).wrapping_mul(source & 0x0000_ff00)) & 0x00ff_0000)
-        | ((destination & 0x0000_00ff).wrapping_mul(source & 0x0000_00ff)))
-        >> 8;
-    ps_alpha_blend(destination, source, a)
-}
-
-/// The Photoshop screen blend.
-fn ps_screen(destination: u32, source: u32, a: u32) -> u32 {
-    let sd1 = (((((destination >> 16) & 0xff).wrapping_mul(source & 0x00ff_0000)) & 0xff00_0000)
-        | ((destination & 0x0000_00ff).wrapping_mul(source & 0x0000_00ff)))
-        >> 8;
-    let sd2 = ((((destination >> 8) & 0xff).wrapping_mul(source & 0x0000_ff00)) & 0x00ff_0000) >> 8;
-    let low = (source & 0x00ff_00ff).wrapping_sub(sd1).wrapping_mul(a) >> 8;
-    let high = (source & 0x0000_ff00).wrapping_sub(sd2).wrapping_mul(a) >> 8;
-    (low.wrapping_add(destination & 0x00ff_00ff) & 0x00ff_00ff)
-        | (high.wrapping_add(destination & 0x0000_ff00) & 0x0000_ff00)
-}
-
-/// The Photoshop exclusion blend.
-fn ps_exclusion(destination: u32, source: u32, a: u32) -> u32 {
-    let sd1 = ((((destination >> 16) & 0xff).wrapping_mul((source & 0x00ff_0000) >> 7))
-        & 0x01ff_0000)
-        | ((destination & 0x0000_00ff).wrapping_mul(source & 0x0000_00ff) >> 7);
-    let sd2 = ((((destination >> 8) & 0xff).wrapping_mul(source & 0x0000_ff00)) & 0x00ff_8000) >> 7;
-    let low = (source & 0x00ff_00ff).wrapping_sub(sd1).wrapping_mul(a) >> 8;
-    let high = (source & 0x0000_ff00).wrapping_sub(sd2).wrapping_mul(a) >> 8;
-    (low.wrapping_add(destination & 0x00ff_00ff) & 0x00ff_00ff)
-        | (high.wrapping_add(destination & 0x0000_ff00) & 0x0000_ff00)
-}
-
-/// The Photoshop compare blend: the mask that selects the larger lane.
-fn compare_mask(destination: u32, source: u32) -> u32 {
-    let n = (((!destination) & source) << 1).wrapping_add(((!destination) ^ source) & 0x00fe_fefe)
-        & 0x0101_0100;
-    ((n >> 8).wrapping_add(0x007f_7f7f)) ^ 0x007f_7f7f
-}
-
-/// The Photoshop lighten blend: the larger of the two colour lanes.
-fn ps_lighten(destination: u32, source: u32, a: u32) -> u32 {
-    let n = compare_mask(destination, source);
-    let source = (source & n) | (destination & !n);
-    ps_alpha_blend(destination, source, a)
-}
-
-/// The Photoshop darken blend: the smaller of the two colour lanes.
-fn ps_darken(destination: u32, source: u32, a: u32) -> u32 {
-    let n = compare_mask(destination, source);
-    let source = (destination & n) | (source & !n);
-    ps_alpha_blend(destination, source, a)
-}
-
-/// The Photoshop difference blend: the absolute difference of the two colour
-/// lanes.
-fn ps_difference_word(destination: u32, source: u32) -> u32 {
-    let n = compare_mask(destination, source);
-    (source & n).wrapping_sub(destination & n) | (destination & !n).wrapping_sub(source & !n)
-}
-
-/// The Photoshop difference blend.
-fn ps_difference(destination: u32, source: u32, a: u32) -> u32 {
-    let source = ps_difference_word(destination, source);
-    ps_alpha_blend(destination, source, a)
-}
-
-/// The legacy Photoshop 5.x difference blend: the source fades first and the
-/// difference replaces the lane.
-fn ps_difference5(destination: u32, source: u32, a: u32) -> u32 {
-    let source = fade_colour(source, a);
-    ps_difference_word(destination, source)
-}
-
-/// The legacy Photoshop 5.x colour-dodge blend: the source fades first and
-/// the table replaces the lane.
-fn ps_color_dodge5(destination: u32, source: u32, a: u32) -> u32 {
-    let source = fade_colour(source, a);
-    (u32::from(color_dodge_channel(
-        (source >> 16) as u8,
-        (destination >> 16) as u8,
-    )) << 16)
-        | (u32::from(color_dodge_channel(
-            (source >> 8) as u8,
-            (destination >> 8) as u8,
-        )) << 8)
-        | u32::from(color_dodge_channel(source as u8, destination as u8))
-}
-
-/// The Photoshop hard-light blend: the overlay table with the operands
-/// swapped.
-fn ps_hard_light(destination: u32, source: u32, a: u32) -> u32 {
-    let source = (u32::from(overlay_channel(
-        (destination >> 16) as u8,
-        (source >> 16) as u8,
-    )) << 16)
-        | (u32::from(overlay_channel(
-            (destination >> 8) as u8,
-            (source >> 8) as u8,
-        )) << 8)
-        | u32::from(overlay_channel(destination as u8, source as u8));
-    ps_alpha_blend(destination, source, a)
-}
-
-/// A Photoshop table blend: every colour lane takes the table's entry for the
-/// source and destination lane.
-fn ps_table_blend(destination: u32, source: u32, a: u32, entry: fn(u8, u8) -> u8) -> u32 {
-    let source = (u32::from(entry((source >> 16) as u8, (destination >> 16) as u8)) << 16)
-        | (u32::from(entry((source >> 8) as u8, (destination >> 8) as u8)) << 8)
-        | u32::from(entry(source as u8, destination as u8));
-    ps_alpha_blend(destination, source, a)
-}
-
-/// The Photoshop overlay blend: the overlay table.
-fn ps_overlay(destination: u32, source: u32, a: u32) -> u32 {
-    ps_table_blend(destination, source, a, overlay_channel)
-}
-
-/// The Photoshop soft-light blend: the soft-light table.
-fn ps_soft_light(destination: u32, source: u32, a: u32) -> u32 {
-    ps_table_blend(destination, source, a, soft_light_channel)
-}
-
-/// The Photoshop colour-dodge blend: the colour-dodge table.
-fn ps_color_dodge(destination: u32, source: u32, a: u32) -> u32 {
-    ps_table_blend(destination, source, a, color_dodge_channel)
-}
-
-/// The Photoshop colour-burn blend: the colour-burn table.
-fn ps_color_burn(destination: u32, source: u32, a: u32) -> u32 {
-    ps_table_blend(destination, source, a, color_burn_channel)
-}
-
-/// The overlay table entry: the overlay of a source lane over a destination
-/// lane.
-fn overlay_channel(source: u8, destination: u8) -> u8 {
-    let product = i32::from(source) * i32::from(destination) * 2;
-    let value = if destination < 128 {
-        product / 255
-    } else {
-        (i32::from(source) + i32::from(destination)) * 2 - product / 255 - 255
-    };
-    value.clamp(0, 255) as u8
-}
-
-/// The colour-dodge table entry.
-fn color_dodge_channel(source: u8, destination: u8) -> u8 {
-    if 255 - i32::from(source) <= i32::from(destination) {
-        255
-    } else {
-        ((i32::from(destination) * 255) / (255 - i32::from(source))) as u8
-    }
-}
-
-/// The colour-burn table entry.
-fn color_burn_channel(source: u8, destination: u8) -> u8 {
-    if i32::from(source) <= 255 - i32::from(destination) {
-        0
-    } else {
-        (255 - ((255 - i32::from(destination)) * 255) / i32::from(source)) as u8
-    }
-}
-
-/// The soft-light table entry.
-fn soft_light_channel(source: u8, destination: u8) -> u8 {
-    let base = f64::from(destination) / 255.0;
-    let value = if source >= 128 {
-        base.powf(128.0 / f64::from(source))
-    } else {
-        base.powf((1.0 - f64::from(source) / 255.0) / 0.5)
-    };
-    (value * 255.0) as u8
-}
-
-/// The source's colour lanes scaled by the weight.
-///
-/// The green lane and the red/blue lanes are scaled apart, so the carries of
-/// one lane cannot reach the other.
-fn fade_colour(source: u32, opa: u32) -> u32 {
-    let green = ((source & 0x0000_ff00).wrapping_mul(opa) >> 8) & 0x0000_ff00;
-    let red_blue = ((source & 0x00ff_00ff).wrapping_mul(opa) >> 8) & 0x00ff_00ff;
-    green.wrapping_add(red_blue)
 }
 
 /// Returns the destination-over source alpha `a + ad·(1 − a)`.
