@@ -866,11 +866,27 @@ form, which is the one a live object is built for. The generator cannot
 build a live object, so the image carries the kind, the element count and the
 element values, and the side that has the object builds it.
 
-The 22 that still differ do so in the code words. And one defect is not a
-behavioural one: the image's variable count leaves the frame too small, so the
-executor writes past it. That is a buffer overrun, and it is why the C++
-adapter and the switch that calls the Rust entry — both written and proved —
-cannot land until it is fixed.
+The 22 that still differ do so in the code words, and the proof's residue is
+the source positions.
+
+**The proof instrument** — the one that compares the two paths' script
+blocks in the real tree, field by field — went from **2 identical, 75
+differing and 95 failing** contexts to **2 identical, 170 differing and 0
+failing**, and the differing contexts on the scripts it could compare fell
+from 5 499 to 2 017.
+
+Three more defects came out of the same shape family. The **sub-type
+numbering**: the reference's sub-types *are* the opcodes, and the Rust had
+two conflicting numberings, so a member's compound assignment emitted the
+wrong opcode and `*=`, `||=`, `++` and `delete` were dropped entirely. The
+**image's argument count**, which was the transient call-argument count
+rather than the declared one. And the **class's super-class proxy**, which
+the class never held, so the image's `super_class_getter` was always -1 and
+the proxy was never committed.
+
+And the **buffer overrun** is gone: the namespace committed its count
+*after* popping the level, so the frame was too small; it commits before the
+pop now.
 
 **The places of the instructions.** The reference's generator passes the
 analyser's **read cursor** to every instruction it writes — the place just

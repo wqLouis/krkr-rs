@@ -151,9 +151,13 @@ impl LocalNamespace {
 
     /// Closes the top level.
     pub fn pop(&mut self) {
-        if self.levels.pop().is_some() {
-            self.commit();
+        if self.levels.is_empty() {
+            return;
         }
+        // the count is taken with the level still there: the variables of
+        // the level took their registers, so they are counted
+        self.commit();
+        self.levels.pop();
     }
 
     /// Closes every level.

@@ -62,22 +62,18 @@ extern "C" {
    reference's own bytecode format calls TYPE_INTER_OBJECT
    (reference/krkr2/cpp/core/tjs2/tjsConstArrayData.cpp:139-148). */
 #define TJS2_CG_VALUE_CONTEXT 7
-/* A constant array: the array the reference's grammar builds when it
-   reads the `(const)[...]` form
-   (reference/krkr2/cpp/core/tjs2/bison/tjs.y:796-805). The generator
-   cannot build a live object, so the image carries the elements and the
-   C++ side builds the array the way the reference's grammar does: it
-   makes the array with TJSCreateArrayObject() and adds each element
-   through the array's own `add`
-   (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:123-130). */
-#define TJS2_CG_VALUE_CONST_ARRAY 8
-/* A constant dictionary: the dictionary the reference's grammar builds
-   when it reads the `(const)%[...]` form
-   (reference/krkr2/cpp/core/tjs2/bison/tjs.y:831-839). The C++ side
-   builds it with TJSCreateDictionaryObject() and sets each entry with
-   PropSet
-   (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:132-139). */
-#define TJS2_CG_VALUE_CONST_DICTIONARY 9
+/* A constant inline array: the object the grammar builds while it parses
+   the array, one element at a time
+   (reference/krkr2/cpp/core/tjs2/bison/tjs.y:795-805). The Rust side
+   cannot build a live object, so the image carries the kind, the elements
+   and their number, and the C++ side builds the object. */
+#define TJS2_CG_VALUE_ARRAY 8
+/* A constant inline dictionary: the object the grammar builds while it
+   parses the dictionary, one member at a time
+   (reference/krkr2/cpp/core/tjs2/bison/tjs.y:831-841). The image carries
+   the kind, the members and their number, and the C++ side builds the
+   object. */
+#define TJS2_CG_VALUE_DICTIONARY 9
 
 /* The kinds of a function argument. */
 #define TJS2_CG_ARG_NORMAL         0
@@ -121,30 +117,30 @@ typedef struct tjs2_codegen_value {
     const uint8_t *octet;
     int32_t octet_length;
     uint64_t object;
-    /* The elements of a constant array, or the entries of a constant
-       dictionary; null when the value is neither. */
-    const struct tjs2_codegen_const_element *elements;
-    /* The number of elements. */
-    int32_t element_count;
 } tjs2_codegen_value;
 
-/* One element of a constant array, or one entry of a constant
-   dictionary.
+/* One constant object of the block: a constant inline array or a constant
+   inline dictionary.
 
-   The reference's grammar builds the array and the dictionary at compile
-   time and puts the elements in them through the array's own `add`
-   (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:123-130) and the
-   dictionary's PropSet (:132-139). The generator cannot build a live
-   object, so the image carries the elements and the C++ side builds the
-   object.
+   The grammar builds the object while it parses it: the array is made and
+   its elements are added one by one, and the dictionary is made and its
+   members are set one by one
+   (reference/krkr2/cpp/core/tjs2/bison/tjs.y:795-805 and :831-841). The
+   Rust side cannot build a live object, so the image carries the kind, the
+   elements and their number, and the C++ side builds the object.
 
-   The name is the name of the entry; it is null for an array's element,
-   which has none. */
-typedef struct tjs2_codegen_const_element {
-    const uint16_t *name;
-    int32_t name_length;
-    tjs2_codegen_value value;
-} tjs2_codegen_const_element;
+   A constant of the kind TJS2_CG_VALUE_ARRAY or TJS2_CG_VALUE_DICTIONARY
+   names its object with the `object` field: the index of the object within
+   the block's objects. */
+typedef struct tjs2_codegen_object {
+    /* the values of the elements */
+    const tjs2_codegen_value *values;
+    /* the number of elements */
+    int32_t element_count;
+    /* the keys of the elements: the value the member name is made of. It
+       is null for the elements of an array. */
+    const tjs2_codegen_value *keys;
+} tjs2_codegen_object;
 
 typedef struct tjs2_codegen_variable {
     const uint16_t *name;
@@ -263,6 +259,11 @@ typedef struct tjs2_codegen_block {
     int32_t line_count;
     /* the index of the top-level context; -1 when there is none */
     int32_t top_level;
+    /* the constant objects of the block: the constant inline arrays and
+       the constant inline dictionaries the constant areas hold */
+    const tjs2_codegen_object *objects;
+    /* the number of constant objects */
+    int32_t object_count;
 } tjs2_codegen_block;
 
 /*----------------------------------------------------------------------

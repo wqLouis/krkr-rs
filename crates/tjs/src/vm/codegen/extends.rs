@@ -56,7 +56,11 @@ impl crate::vm::codegen::emit::Emitter<'_> {
             None => {
                 let name = self.context().name_text().unwrap_or("").to_string();
                 let name: Vec<u16> = name.encode_utf16().collect();
-                self.push_context(Some(&name), ContextType::SuperClassGetter)
+                let getter = self.push_context(Some(&name), ContextType::SuperClassGetter);
+                // the class holds the proxy: the class makes the proxy once
+                // and keeps it
+                self.contexts[class].super_class_getter = Some(getter);
+                getter
             }
         };
 

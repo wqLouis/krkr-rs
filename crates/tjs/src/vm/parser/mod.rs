@@ -2045,7 +2045,7 @@ impl<'a, C: Commands> Parser<'a, C> {
     }
 
     /// The entries of a constant inline dictionary.
-    fn const_dic_elm_list(&mut self) -> Result<Vec<(String, Value)>, ParseError> {
+    fn const_dic_elm_list(&mut self) -> Result<Vec<(Value, Value)>, ParseError> {
         let mut entries = Vec::new();
         if self.peek_kind() == Some(TokenKind::RightBracket) {
             return Ok(entries);
@@ -2064,7 +2064,7 @@ impl<'a, C: Commands> Parser<'a, C> {
     ///
     /// The entry is the name of the member and the value it holds, and
     /// the two are told apart by the `,` that follows the name.
-    fn const_dic_elm(&mut self) -> Result<(String, Value), ParseError> {
+    fn const_dic_elm(&mut self) -> Result<(Value, Value), ParseError> {
         let name = self.const_value()?;
         self.expect(TokenKind::Comma)?;
         let value = match self.peek_kind() {
@@ -2092,10 +2092,6 @@ impl<'a, C: Commands> Parser<'a, C> {
                     .unwrap_or(Value::Void)
             }
             _ => self.const_value()?,
-        };
-        let name = match name.to_text() {
-            Some(text) => text,
-            None => return Err(self.syntax_error("a name that is text")),
         };
         Ok((name, value))
     }

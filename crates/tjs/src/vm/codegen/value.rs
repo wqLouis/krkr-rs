@@ -80,9 +80,12 @@ pub enum Value {
         /// The identity of the dictionary: two constant dictionaries are
         /// two objects, and the generator never merges them.
         identity: ObjectId,
-        /// The entries, in the order the grammar set them: the name of
-        /// the member and the value it holds.
-        entries: Vec<(String, Value)>,
+        /// The entries, in the order the grammar set them: the value the
+        /// name of the member is made of, and the value it holds.
+        ///
+        /// The name is a value and not a text, because the side that
+        /// builds the object converts it to a text itself.
+        entries: Vec<(Value, Value)>,
     },
 }
 

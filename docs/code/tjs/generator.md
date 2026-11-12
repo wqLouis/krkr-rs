@@ -144,8 +144,9 @@ that prove them cite the same lines.
 | both values are converted to a string when one of the two is a string | `reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:665` |
 | the object text holds the address of the dispatch and the address of the `objthis` | `reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:187` |
 | the real is printed with the shortest form that reads back as the same number | `reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:241` (`TJSRealToString`) |
-| a constant array: the `(const)[...]` form's array, and the elements it puts in it | `reference/krkr2/cpp/core/tjs2/bison/tjs.y:796-805` |
-| a constant dictionary: the `(const)%[...]` form's dictionary, and the entries it puts in it | `reference/krkr2/cpp/core/tjs2/bison/tjs.y:831-839` |
+| a constant array: the `(const)[...]` form's array, and the elements it puts in it | `reference/krkr2/cpp/core/tjs2/bison/tjs.y:796-806` |
+| a constant dictionary: the `(const)%[...]` form's dictionary, and the entries it puts in it | `reference/krkr2/cpp/core/tjs2/bison/tjs.y:831-841` |
+| a dictionary entry's name is a value and not a text: the side that builds the object converts it | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:132-139` (the element is added with a text for the name) |
 
 ### 2.8 The object operations — `objects.rs`
 
@@ -201,6 +202,7 @@ that prove them cite the same lines.
 | the error's detail is read separately, through `tjs2_codegen_last_error_message`, and never as a Rust type across the boundary | `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:862` (the native call site) |
 | the line table: the text is split on `\r` and `\n`, a `\r\n` counts as one break, and every line contributes its start offset and its length in code units, without the break | `reference/krkr2/cpp/core/tjs2/tjsScriptBlock.cpp:207-232` |
 | the constant array's kind and the constant dictionary's kind: the image carries the elements and the side that has the object builds it | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:123-130` (the array's `add`), `:132-139` (the dictionary's `PropSet`) |
+| the class's super-class proxy: the class makes it once and keeps it | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3626-3632` |
 
 ### 2.15 The proof instrument — `proof.rs`
 
