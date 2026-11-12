@@ -8,6 +8,8 @@
 //! handed over with. Both drive the same code, so the two can never
 //! disagree.
 
+#![deny(unsafe_code)]
+
 pub mod context;
 pub mod emit;
 pub mod extends;

@@ -10,6 +10,8 @@
 //! here are the commands the grammar drives, and they are the same
 //! commands the proof seam drives through the C interface.
 
+#![deny(unsafe_code)]
+
 use std::rc::Rc;
 
 use crate::vm::codegen::context::ContextType;

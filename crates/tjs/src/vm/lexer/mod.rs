@@ -12,6 +12,8 @@
 //! the start of the script, so a position names the same place in the text
 //! the parser and the error messages name.
 
+#![deny(unsafe_code)]
+
 mod error;
 pub mod ffi;
 mod literal;

@@ -12,7 +12,7 @@
 use std::ffi::{CStr, c_int};
 
 use tjs::vm::codegen::ffi::*;
-use tjs::vm::script::*;
+use tjs::vm::*;
 
 /// The script the test compiles.
 ///

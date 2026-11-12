@@ -31,6 +31,8 @@
 //! every time the analyser reads. The generator holds it, so it writes
 //! the place the analyser is at and not the place of the last node.
 
+#![deny(unsafe_code)]
+
 mod error;
 mod nodes;
 

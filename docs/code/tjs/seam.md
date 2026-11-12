@@ -199,7 +199,7 @@ image" code lives in the block's neighbourhood
 
 ### 1.5 The rules the entry itself implements
 
-The entry is `crates/tjs/src/vm/script.rs`.
+The entry is `crates/tjs/src/vm/mod.rs`.
 
 | rule | reference |
 |---|---|
@@ -952,11 +952,12 @@ image does not carry it.
 | `crates/tjs/cpp/tjs2/tjsLex.cpp`, `tjsLex.h` | the analyser goes. `tjsLex.h` also declares `tTJSLexicalAnalyzer`, which `tjsScriptBlock.h` includes — that include must go with it. The date literal parser (`tjsDateParser.cpp`, `bison/tjsdate.y`) and the preprocessor's expression parser (`bison/tjspp.y`, `tjsCompileControl.cpp`) are **not** part of the script front end and stay. |
 | `crates/tjs/cpp/tjs2/bison/tjs.y` | the script grammar goes. `bison/tjspp.y` and `bison/tjsdate.y` stay. |
 | `crates/tjs/cpp/tjs2_codegen.h` | the shipped seam's header: the compile entry, the extended image records (`parent`, `prop_setter`, `prop_getter`, `super_class_getter`, `super_class_getter_pointer`, `properties`, `top_level`) and the `TJS2_CG_VALUE_CONTEXT` / `TJS2_CG_VALUE_NULL` constant kinds. |
-| `crates/tjs/src/vm/codegen/ffi.rs` | the Rust side of the same seam: `tjs2_script_compile` and its accessors, and the extended image records. |
+| `crates/tjs/src/vm/mod.rs` | the Rust side of the same seam: `tjs2_script_compile` and its accessors. |
+| `crates/tjs/src/vm/codegen/ffi.rs` | the image records the same seam carries. |
 | `crates/tjs/src/vm/parser/` | the parser column (it does not exist yet; see `docs/code/tjs/columns.md` §1). |
 | `crates/tjs/build.rs` | the bison step drops `tjs.y` (`:96`, `:470-478`, `:553`); the source list drops `tjsLex.cpp` (`:62`); the Rust codegen object is linked. |
 | `crates/tjs/cpp/tjs2_abi.cpp`, `tjs2_abi.h` | unchanged — `tjs2_exec_script` and `tjs2_compile_script` reach the same `SetText` / `Compile` and inherit the new behaviour. |
-| `scripts/krkr_gates/checks/layering.py` | the reviewed FFI location list (`:64-65`) may need the new seam file if the compile entry lands in a new module. |
+| `scripts/krkr_gates/checks/layering.py` | the reviewed FFI location list names the seam file: `crates/tjs/src/vm/mod.rs`. |
 
 ### 7.3 The vendored tree and the reference differ
 

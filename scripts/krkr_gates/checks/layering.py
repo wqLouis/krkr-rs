@@ -64,7 +64,7 @@ FFI_UNSAFE_LOCATIONS = (
     ("crates/tjs/src/vm/lexer/ffi.rs", "the lexer's C ABI: the corpus comparison drives the analyser through it"),
     ("crates/tjs/src/vm/codegen/ffi.rs", "the code generator's C ABI: the C++ compile entry consumes the script block"),
     ("crates/tjs/src/vm/codegen/proof.rs", "the code generator's proof instrument: the corpus comparison drives it"),
-    ("crates/tjs/src/vm/script.rs", "the compile entry's C ABI: the C++ VM calls it to compile a script"),
+    ("crates/tjs/src/vm/mod.rs", "the compile entry's C ABI: the C++ VM calls it to compile a script"),
     ("crates/app/src/video.rs", "the video-decoder seam holds a storage pointer"),
 )
 

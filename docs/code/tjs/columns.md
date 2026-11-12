@@ -18,6 +18,7 @@ unwinding into C++.
 
 | piece | where |
 |---|---|
+| the compile entry | `crates/tjs/src/vm/mod.rs` — the front end's own door: the script text in, the image of the script block out |
 | the lexer | `crates/tjs/src/vm/lexer/` — the analyser, its token kinds and its values |
 | the lexer's C ABI | `crates/tjs/src/vm/lexer/ffi.rs` and `crates/tjs/cpp/tjs2_lexer.h` |
 | the parser | `crates/tjs/src/vm/parser/` — the recursive-descent parser and the node tree |
