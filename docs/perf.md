@@ -646,104 +646,255 @@ not run.
 ## 6. The script columns
 
 The TJS2 VM is being reimplemented in Rust one column at a time: the
-**lexer** (C1), the **parser** (C2), the **code generator** (C3). The corpus
-is the game's own scripts — 175 `.tjs` files, 6.5 MB, 3 206 523 code units,
-628 254 tokens — extracted from the title's archives. The reports are
-`/tmp/lexer-bench/REPORT.md`, `/tmp/parser-c2/REPORT.md` and
-`/tmp/codegen-c3/REPORT.md`; the code is in the committed `crates/script`.
+**lexer** (C1), the **parser** (C2) and the **code generator** (C3). The
+corpus is the game's own scripts — 175 `.tjs` files, 6.5 MB, 3 206 523 code
+units, 628 254 tokens — extracted from the title's archives. The code is in
+`crates/tjs/src/vm/`, as the module `tjs::vm`; the design record is
+[`code/tjs/columns.md`](code/tjs/columns.md).
 
-### 6.1 The lexer (C1) — 1.53× the C++ analyser
+**The order the columns are wired in.** The three are wired to each other in
+Rust first — the Rust lexer drives the Rust parser, which drives the Rust
+generator, over native calls, with no C ABI between them. The C ABI comes
+last, at the generator's end: the C++ VM calls one entry that compiles
+script text and hands back the script block the C++ executor consumes. The
+C++ grammar is replaced wholesale rather than adapted, so the C++ never
+calls the lexer or the parser separately.
 
-**Method.** The corpus above, the C++ `tTJSLexicalAnalyzer` and the Rust
-`Lexer` over the same flags, the unoptimised development builds on both
-sides, the two **measured alternately** in seven rounds each with the
-machine idle.
+**What the figures below are.** The comparisons ran in scratch harnesses
+under `/tmp`, and the environment's cleanup did not preserve them. Each
+column states whether its figures have been re-established since. A figure
+that has not is a record of the run that produced it, not a current result.
 
-| | tokens/s |
-|---|---|
-| the C++ analyser | 12 692 744 |
-| the Rust analyser | **19 356 655** |
+### 6.1 The lexer (C1) — the tokens are identical
 
-**1.53× the C++ analyser.** Two proofs of equivalence over the whole
-corpus:
+**Method.** The corpus above, the tree's own C++ `tTJSLexicalAnalyzer` and
+the tree's own Rust `Lexer`, over the same flags: every token compared one
+by one — kind, value and position — and every failure compared by its
+message and its position. The C ABI was compared against the same corpus as
+a third side, so the native API, the C interface and the C++ analyser all
+agree.
 
-* 628 254 tokens compared one by one — kind, value and position — every
-  one identical to the C++ analyser's dump;
-* all 175 dumps **byte-identical through the vendored bison parser's
-  `yylex` seam**: the grammar asks the Rust analyser for its tokens
-  through the C interface and gets the byte stream the C++ one produced.
-
-The lexing is therefore no longer a factor in the script path: the corpus
-costs about a third less to lex than it does in the C++ tree.
-
-### 6.2 The parser (C2) — the trees are identical, 19.7× the grammar
-
-**Method.** The same corpus, both sides in the **parse-only** mode — the
-C++'s generator makes no code, the Rust's is not driven — the C++ with
-`-O0 -D_DEBUG` and the Rust with `rustc -O`, the two sides **measured
-alternately** in seven rounds each.
-
-**The trees are identical.** Over the 175 scripts the Rust parser built
-**341 675 nodes**, and **0 of them differ** from the grammar's node: the
-same kind, the same place in the script, the same value. 173 of the 175
-scripts compare node for node over their whole tree. The two that do not
-(`sysscn/system.tjs` and `system/UILoader.tjs`) stop the parse in the
-**code generator's** constant folding, which refuses an operation the
-reference's variant performs; the count difference (350 450 against
-341 675) is the folding's, not the parser's.
-
-**The speed.** The median of seven rounds each, both sides including the
-lexer, the parse, and the building of the expression trees with the
-folding:
-
-| | the parse |
-|---|---|
-| the C++ grammar (bison) | 1.736 s |
-| the Rust parser | **0.0880 s** |
-
-**19.7× faster than the C++'s bison parser.** The asymmetry is against the
-Rust: the C++ side also creates the script block and the code contexts,
-which the Rust's parse-only mode creates none of, so the ratio is a lower
-bound. Take each side's own lexer out and the parser's own share is about
-1.69 s against 0.058 s — **29×**.
-
-### 6.3 The code generator (C3) — not equivalent yet
-
-**Status: in progress.** The comparison machinery is in place and it finds
-the differences, which is its job; the generator itself is not yet the
-C++'s, so **the emitted code is not compared**.
-
-**Method.** The C++ grammar drives the Rust generator through the C
-interface — the proof seam — and each finished context is compared with the
-C++'s, the code area word by word and the data area value by value, over
-the whole corpus.
+**The result: identical on every script.**
 
 | | |
 |---|---|
 | scripts | 175 |
-| code contexts compared | 10 355 |
-| instruction words compared | 844 066 |
-| constant values compared | 83 440 |
-| scripts that agree completely | **5** |
-| scripts that still differ | **170** |
+| tokens compared | **609 242** |
+| scripts that agree | **175** |
+| scripts that differ | **0** |
 
-Two defects are open:
+Six of the 175 scripts are not valid TJS, and **both** analysers stop at the
+same token with the same message at the same position — for instance
+`system/yaml.tjs` at 8871 with *"Cannot be parsed as a number"*, and
+`system/action.tjs` at 986 with *"Invalid character '@'"*. That is why the
+token count is 609 242 rather than the corpus's 628 254: the invalid scripts
+stop early, on both sides, at the same place.
 
-* the **jump fix-up can cycle** between two jumps that point at each other,
-  and the corpus run then **hangs** — it stops on
-  `k2compat/k2compat_modeless.tjs`. The reference's fix-up has the same
-  shape and does not cycle, because the code it works on does not;
-* the **constant folding** refuses an operation the reference's variant
-  performs — the two scripts of §6.2 stop there.
+**The instrument is sensitive.** A self-test proves that a changed kind, a
+changed position, a changed value and a changed failure are each caught. A
+build against a deliberately mutated analyser — `>>=` turned into `>>` —
+was caught at token 2800 of `system/world.tjs`, where the two sides
+disagreed on the kind.
 
-The generator is also **not faster** than the C++'s yet: the C++ generator
-alone measured 0.847 s (best of three) against 3.489 s for the C++ and the
-Rust together with the comparison, and that difference is an upper bound on
-the Rust's own work, not a measurement of it. The known cause is the C
-interface copying every node, at `O(subtree)` per construction.
+**The speed.** Both sides at **-O2** — the C++ archive at the tree's own
+`-O2` default, the Rust at the harness's release profile with
+`opt-level = 2` — fifteen rounds alternating, the machine idle. The timed
+region is the token-reading loop; the analyser's construction is excluded,
+because the C++ side's construction in that harness also creates the script
+engine, and its total is noisy (75–239 ms).
 
-So the column's two questions are in different states: the **trees** are
-proved identical, the **code** is not.
+| | median | range |
+|---|---|---|
+| the C++ analyser | 52.03 ms | 50.21–53.26 ms |
+| the Rust analyser | **31.40 ms** | 30.81–32.29 ms |
+
+**1.66× the C++ analyser** — 19 403 146 tokens/s against 11 708 966 — and
+three runs of the comparison gave 0.618, 0.606 and 0.603 for the C++'s
+share of the Rust's time. The lexing is therefore no longer a factor in the
+script path: the corpus costs about a third less to lex than it does in the
+C++ tree.
+
+**Two defects the corpus did not reach.**
+
+* The **escaping rule** for an invalid character was the reference's
+  one-code-unit case rather than the reference's rule. The rule carries a
+  flag: a control character with no named escape sets it and is written
+  `\xNN`, the named escapes clear it, and while the flag is set a hex
+  digit is written `\xNN` too; the text ends at the first NUL. The
+  analyser escapes one code unit at a time, so a message never holds two
+  characters and the flag branch is unreachable there — but the rule is now
+  the reference's rule, and a direct comparison of the two escape functions
+  over 97 inputs reports **0 differences with the fix and 25 without it**.
+* The **regular-expression literal lost its pattern** when the closing slash
+  ended the script. The reference keeps the pattern alone
+  (`reference/krkr2/cpp/core/tjs2/tjsLex.cpp:846-854`). The corpus never
+  saw it, because the corpus never sends the notification that starts a
+  regular expression.
+
+**The two notifications and the expression mode** are covered by twenty
+crafted scripts, driven with the grammar's own schedule — a bare word after
+a dot, a regular expression after a slash read in a factor position
+(`reference/krkr2/cpp/core/tjs2/bison/tjs.y:681`, `:688`, `:710`,
+`:713`) — and all twenty agree; the token kinds prove the notifications
+took effect. The expression mode agrees on five crafted scripts and on the
+three game expression files, 14 399 tokens, with `result_needed` both ways.
+
+### 6.2 The parser (C2) — the trees are identical, and what is left is the generator's
+
+**Status: landed.** The parser is `crates/tjs/src/vm/parser/`, and it
+drives the Rust lexer natively — no C ABI between the columns.
+
+**Method.** The corpus of 172 comparable scripts (the three expression files
+are excluded on **both** sides — the Rust parser rejects them too, at the
+same place), the C++ grammar's tree against the Rust parser's tree, compared
+node for node: the kind, the value, the place in the script, the children and
+their order. The harness is shared with the generator's column, and the C++
+side patches a copy of the vendored tree under `/tmp`.
+
+**The trees are identical in 171 of the 172 scripts** — 351 997 nodes, with
+no differing node in those scripts.
+
+The one that differs is `system/mainwindow.tjs`, and the difference is the
+**`(const)` form** — a constant inline array, which the reference builds as
+a live runtime object; see §6.3.
+
+**The comparison reached 171 only after the generator's constant folding was
+fixed.** It was 101 of 172 before, and every one of the 71 differences was the
+folding — 68 folding to `int` in the C++ and to `real` in the Rust, and 3
+folding a string concatenation in the C++ and not at all. That is the
+generator's folding, not the parser's: the parser calls the generator's
+folding rules.
+
+**The error path.** The tree comparison compares trees, and a script with a
+syntax error produces an error rather than a tree — so the error path was
+described but not proven. It is script-visible: the message, the position,
+the count, and whether the parse recovers.
+
+Crafted scripts drive both sides — the C++ against a copy of the vendored
+tree, the Rust against the repository's parser — and the comparison is against
+the reference's own behaviour, including the count the grammar's
+`CompileErrorCount>20` rule and the script block's raise require.
+
+| script | message | place | count | recovery |
+|---|---|---|---|---|
+| a missing `;` | `Syntax error (syntax error)` | 7 | 1 | skips to the `;` |
+| `x = 1 + ;` | the same | 9 | 1 | — |
+| a stray `}` | the same | 8 | 1 | no `;` → the end |
+| an error in a block | the same | 20 | 1 | resumes at 24 |
+| 25 failures | the same | 9 | **21 = 21** | aborts at more than 20 |
+| an unterminated comment | `Un-terminated comment` | 21 | 1 | — |
+| an unterminated string | `Un-terminated string/...` | 10 | 2 | — |
+
+**The error path found a defect the tree comparison could not see:** the
+`do ... while` production was missing its `)`, so every `do...while` was a
+syntax failure — and **8 of the 172 corpus scripts use one**. The trees came
+out the same length, so the comparison never saw it; only the error path did.
+Three more fixes came out of it: the message was not the reference's, the
+abort was counted as a failure when the reference's `YYABORT` is not one the
+count sees, and the program did not require the end of the script, so a
+stray `}` was accepted.
+
+Over the corpus, the reference reports no failure in any of the 172, and
+neither does the Rust — after the fix. Before it, 8 scripts failed.
+
+One script is open, with its cause: `sysscn/embfontlist.tjs` starts with
+`(const)[`, and the constant inline array and dictionary productions are the
+object model's. The Rust rejects it at 6 and the reference at 928. That is
+deliberate: a parser that accepted the production but dropped the array's
+elements would be a silent wrong value.
+
+**The speed.** One corpus, one optimisation level on both sides (`-O2`
+against `rustc -O`), the sides alternated, seven rounds.
+
+| | best | median | spread |
+|---|---|---|---|
+| the reference's whole pipeline | 0.266628 s | 0.269762 s | 1.9 % |
+| the Rust analyser | 0.027378 s | 0.027693 s | 3.5 % |
+| the Rust analyser + parser | 0.101334 s | 0.102359 s | 2.4 % |
+| the Rust analyser + parser + generator | 0.158092 s | 0.158517 s | 3.0 % |
+
+The parser's own share is **0.074666 s**, and the whole native pipeline is
+**1.70× the reference's**.
+
+**The withdrawn figure.** This section reported **19.7×** for the parse and
+**29×** for the parser's own share. Both are withdrawn. The C++ side of that
+measurement was built with `-O0 -D_DEBUG` while the Rust side was built
+with `rustc -O`, so the ratio measured the two builds rather than the
+parser.
+
+### 6.3 The code generator (C3) — the trees agree; the code does not yet
+
+**Status: in progress.** The generator is `crates/tjs/src/vm/codegen/`, and
+its C ABI is a declared module: **72 C symbols export** from the library, and
+the image builder's own tests are in the crate.
+
+**The first comparison was measuring a broken seam.** The harness's helper —
+its copy of a `tTJSVariant` in the interface's shape — ended at its
+`switch` with no `return`. A non-void function with no return is undefined
+behaviour, and clang acted on it: it deleted the **whole call** to
+`tjs2_codegen_make_const`, the call that handed each constant to the Rust
+generator. The evidence was in the object file: the undefined-symbol list
+named 41 `tjs2_codegen_*` symbols and not `make_const`, and the relocation
+table had no entry for it. So the Rust generator received **no constant
+values at all** — its area held 4 entries where the reference's held 34, and
+every constant index was wrong. **The 0-of-172 was measured through a seam
+that was not running.**
+
+The instrument was replaced rather than repaired: it now compares the two
+generators, each driven by its own front end — the reference's analyser,
+grammar and generator against the Rust's analyser, parser and generator —
+with no patching of the reference's generator and no shared state.
+
+**The trees.** The constant folding is fixed, and with it the parser's tree
+comparison moved from **101 of 172 to 171 of 172** over 351 997 nodes. The
+folding had five defects, all of them in the generator's own files: `+`,
+`-` and `*` always produced a real where the reference keeps two integers
+an integer; the unary minus always produced a real; `+` never concatenated
+strings; `===` and `!==` used the loose comparison; and the conversions did
+not match `AsInteger`, `AsReal` and `AsNumber`. The reference folds with
+its variant operators, so the folded value keeps their kind.
+
+**The code.** 21 of the 172 scripts agree, and the rest differ on one thing:
+the number of children the top level registers. The reference adds a child
+context to the parent's constant area and to the parent's declaration list
+together, so the two counts must agree — and in one script the reference holds
+thirteen context constants and builds its prologue from one declaration.
+That is the open defect.
+
+**The places of the instructions.** An end-to-end test — the lexer, the parser
+and the generator over one script, and the image read back through the
+shipped compile entry — compares the image with the reference's own output,
+and it finds that the reference gives a place to two kinds
+of instruction that the Rust leaves without one. The reference's generator
+passes the analyser's current position to every instruction it writes; the
+Rust writes "no place of its own" for a variable's assignment and for the
+epilogue a context's commit adds. The cause is the shape between the
+columns: the `Commands` contract carries no place, so the place the parser
+is at cannot reach the generator at all.
+
+The test is written against the reference's own values, and it lands with
+the generator's next change; it is red until then, and it is not weakened
+to match the Rust.
+
+**The inline array.** The reference has two forms, and the ordinary one was
+never the problem it was taken to be. An ordinary inline array `[a,b,c]`
+(`reference/krkr2/cpp/core/tjs2/bison/tjs.y:740-747`) compiles to **runtime
+code** (`reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:2553-2596`): the
+constant area gets exactly two entries whatever N is — the string `"Array"`
+and the integer `0` — and the elements live in the code stream. The Rust
+already matched that, and the 171 of 172 proves it.
+
+The **constant** inline array `(const)[a,b]`
+(`reference/krkr2/cpp/core/tjs2/bison/tjs.y:796-805`) is different: it
+creates a live runtime object and adds the elements through the runtime's
+own `add` (`reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:118-126`),
+and the node is a `T_CONSTVAL`, so the constant area holds one entry of kind
+object whose value is that live object. **That form needs the object model**,
+and it is one script of the corpus.
+
+**The speed.** The generator's own share is **0.0562 s** against the
+reference's emission budget of 0.114390 s — **49 %** of it. The whole native
+pipeline is 1.70× the reference's (§6.2).
 
 ---
 

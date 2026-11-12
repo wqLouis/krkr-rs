@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use script::lexer::Lexer;
+use tjs::vm::lexer::Lexer;
 
 /// The scripts of the corpus.
 fn scripts() -> Vec<PathBuf> {

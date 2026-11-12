@@ -1,9 +1,0 @@
-[package]
-name = "script"
-description = "krkr-rs L4 script language in Rust: the lexical analyser, the parser and the code generator, each with a native and a C ABI"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-thiserror = { workspace = true }

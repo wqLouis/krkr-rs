@@ -34,6 +34,20 @@ impl PpValues {
     pub fn set(&mut self, name: &str, value: i32) {
         self.entries.insert(name.to_string(), value);
     }
+
+    /// The values, in the order of their names.
+    ///
+    /// The compile entry hands the values back to the caller, and the
+    /// caller has to be able to read them all.
+    pub fn iter(&self) -> Vec<(&str, i32)> {
+        let mut values: Vec<(&str, i32)> = self
+            .entries
+            .iter()
+            .map(|(name, value)| (name.as_str(), *value))
+            .collect();
+        values.sort_by_key(|(name, _)| *name);
+        values
+    }
 }
 
 impl super::Lexer {

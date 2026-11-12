@@ -303,8 +303,7 @@ Crate roles:
 
 | crate | path | layer | role |
 |---|---|---|---|
-| `tjs` | `crates/tjs` | vendored | C++ TJS2 VM FFI (maintained in place, all-FFI) |
-| `script` | `crates/tjs/rust/script` | L4 | the script language in Rust: the lexer, the parser and the code generator, each with a native and a C ABI |
+| `tjs` | `crates/tjs` | vendored, L4 | the C++ TJS2 VM FFI (maintained in place, all-FFI), and `tjs::vm` — the Rust script columns that replace it (the lexer, the parser, the code generator), each with a native and a C ABI |
 | `api` | `crates/platform/api` | L1 | shared DTOs + typed `*Error` enums, no impls |
 | `fs` | `crates/platform/fs` | L1 | stateless `FileSystem`/`FileState` + XP3 read/parse |
 | `media` | `crates/platform/media` | L1 | stateless `Media` + image/audio/video decode |
@@ -319,22 +318,21 @@ Crate roles:
 | `testkit` | `crates/testkit` | dev | shared test helpers, dev-dependencies only |
 
 `psd` is a workspace member that lives inside the `media` directory, which
-excludes it; `script` is a workspace member that lives inside the `tjs`
-directory, beside the C++ VM whose columns it replaces, and `tjs` excludes
-it the same way. `app` and `android` are the two composition roots, and both
+excludes it. `app` and `android` are the two composition roots, and both
 are wiring only.
 
 ### 2.1 The sizes: L3 is the big layer, and that is the design
 
 Rust source lines per crate (`*.rs` under the crate, tests excluded; `tjs`
-counts its `src/lib.rs` and its `build.rs`):
+counts its whole `src/` — the C ABI wrapper and the Rust VM module — and its
+`build.rs`):
 
 | layer | crates | total |
 |---|---|---|
 | L1 | api 2 924 · fs 2 906 · media 5 601 · psd 4 113 · render 10 854 · platform 3 831 | 30 229 |
 | L2 | engine | 31 208 |
 | L3 | compat | 99 718 |
-| L4 | tjs 7 204 · vm 868 | 8 072 |
+| L4 | tjs 22 083 · vm 857 | 22 940 |
 
 L3 is more than three times L2. **That is correct and intended.** L2 is a
 small, generic, backend-agnostic engine — the layer tree, the mixer, the

@@ -18,6 +18,8 @@
 
 #![warn(missing_docs)]
 
+pub mod vm;
+
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::ptr;
 

@@ -1,11 +1,10 @@
 //! The C interface of the lexical analyser.
 //!
-//! The interface is what the vendored parser reaches the analyser
-//! through: a plain C representation, no Rust types across the boundary.
-//! The state of one analyser is an opaque handle, a token kind is the
-//! grammar's own number, and a value is delivered in the form the native
-//! side already uses — an integer, a real, a string of code units, a buffer of
-//! bytes, or the null object.
+//! The interface is the analyser's plain C representation: no Rust type
+//! crosses the boundary. The state of one analyser is an opaque handle, a
+//! token kind is the grammar's own number, and a value is delivered in the
+//! form the native side already uses — an integer, a real, a string of code
+//! units, a buffer of bytes, or the null object.
 //!
 //! Every entry point catches a panic and reports it as an error, so a
 //! failure never unwinds into the caller.
@@ -18,7 +17,7 @@
 use std::ffi::{CString, c_char, c_int};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use crate::lexer::{LexError, Lexer, TokenKind, ValueRef};
+use crate::vm::lexer::{LexError, Lexer, TokenKind, ValueRef};
 
 /// The analyser read the script to its end.
 pub const TJS2_LEX_OK: c_int = 0;

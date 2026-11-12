@@ -214,7 +214,9 @@ impl Cursor {
             } else if character == u16::from(b'/') && !escaped {
                 // the closing slash, then the flags
                 if !self.advance() {
-                    break;
+                    // the text ended at the closing slash: the value is the
+                    // pattern
+                    return Ok(pattern);
                 }
                 let mut flags = Text::new();
                 while let Some(flag) = self.current() {
@@ -243,7 +245,6 @@ impl Cursor {
             }
             self.advance();
         }
-        Ok(Text::new())
     }
 
     /// The binary literal that starts at the current position.

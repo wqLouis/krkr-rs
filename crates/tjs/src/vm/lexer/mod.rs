@@ -13,6 +13,7 @@
 //! the parser and the error messages name.
 
 mod error;
+pub mod ffi;
 mod literal;
 mod number;
 mod preprocess;
@@ -379,6 +380,11 @@ pub struct Lexer {
     conditional_level: i32,
     /// The values the conditional-compilation statements read and write.
     conditional_values: PpValues,
+    /// Whether the script used a conditional-compilation statement.
+    ///
+    /// The flag makes the script block non-reusable, because the values
+    /// the statement set belong to that one script.
+    using_preprocessor: bool,
     /// The values the tokens name.
     ///
     /// The string and the binary data live in the two buffers below, so a
@@ -442,6 +448,7 @@ impl Lexer {
             embeddable: Vec::new(),
             conditional_level: 0,
             conditional_values: PpValues::new(),
+            using_preprocessor: false,
             values: Vec::new(),
             strings: Vec::new(),
             octets: Vec::new(),
@@ -525,6 +532,14 @@ impl Lexer {
     /// The values the conditional-compilation statements read and write.
     pub fn conditional_values_mut(&mut self) -> &mut PpValues {
         &mut self.conditional_values
+    }
+
+    /// Whether the script used a conditional-compilation statement.
+    ///
+    /// The flag makes the script block non-reusable, because the values
+    /// the statement set belong to that one script.
+    pub fn using_preprocessor(&self) -> bool {
+        self.using_preprocessor
     }
 
     /// The next token, or `None` at the end of the script.
@@ -898,9 +913,17 @@ impl Lexer {
             return Ok(At::Embeddable);
         }
         self.cursor.move_to(start);
-        match self.scan_conditional_statement()? {
-            Statement::Continue => Ok(At::Continue),
-            Statement::End => Ok(At::End),
+        let statement = self.scan_conditional_statement()?;
+        match statement {
+            Statement::Continue => {
+                // the script used a conditional-compilation statement
+                self.using_preprocessor = true;
+                Ok(At::Continue)
+            }
+            Statement::End => {
+                self.using_preprocessor = true;
+                Ok(At::End)
+            }
             Statement::Absent => Ok(At::Invalid),
         }
     }
@@ -1004,7 +1027,7 @@ impl Lexer {
     fn invalid_character(&self, character: u16) -> LexError {
         LexError::InvalidCharacter {
             position: self.cursor.position(),
-            character: error::escape_character(character),
+            character: error::escape_characters(&[character]),
         }
     }
 

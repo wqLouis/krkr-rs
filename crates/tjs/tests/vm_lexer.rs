@@ -3,7 +3,7 @@
 //! Every assertion below cites the place in the vendored lexer the
 //! behaviour comes from.
 
-use script::lexer::{Lexer, Token, TokenKind, ValueRef};
+use tjs::vm::lexer::{Lexer, Token, TokenKind, ValueRef};
 
 /// The tokens of a script, with the analyser that produced them.
 ///
@@ -234,6 +234,21 @@ fn a_regular_expression_is_the_flags_and_the_pattern() {
 }
 
 #[test]
+fn a_regular_expression_at_the_end_of_the_script_keeps_its_pattern() {
+    // reference/cpp/core/tjs2/tjsLex.cpp:846-854 — the text ends at the
+    // closing slash, so the value is the pattern itself.
+    let units: Vec<u16> = "/abc/".encode_utf16().collect();
+    let mut lexer = Lexer::new(&units);
+    // the parser tells the analyser that the next token is a regular
+    // expression
+    // reference/cpp/core/tjs2/tjsLex.cpp:1877-1884 — the notification.
+    lexer.expect_regexp();
+    let token = lexer.next_token().expect("the script lexes").unwrap();
+    assert_eq!(token.kind, TokenKind::Regexp);
+    assert_eq!(text_of(&lexer, &token), "abc");
+}
+
+#[test]
 fn a_binary_literal_holds_its_bytes() {
     // reference/cpp/core/tjs2/tjsLex.cpp:734-820 — a binary literal is the
     // hexadecimal digits between `<%` and `%>`.
@@ -355,7 +370,7 @@ fn a_block_comment_that_is_not_terminated_is_an_error() {
     let error = lexer.next_token().expect_err("the script does not lex");
     assert!(matches!(
         error,
-        script::lexer::LexError::UnterminatedComment { .. }
+        tjs::vm::lexer::LexError::UnterminatedComment { .. }
     ));
 }
 
@@ -368,7 +383,7 @@ fn a_character_that_begins_no_token_is_an_error() {
     let error = lexer.next_token().expect_err("the script does not lex");
     assert!(matches!(
         error,
-        script::lexer::LexError::InvalidCharacter { .. }
+        tjs::vm::lexer::LexError::InvalidCharacter { .. }
     ));
 }
 
@@ -379,7 +394,7 @@ fn a_number_that_cannot_be_read_is_an_error() {
     let units: Vec<u16> = "0x".encode_utf16().collect();
     let mut lexer = Lexer::new(&units);
     let error = lexer.next_token().expect_err("the script does not lex");
-    assert!(matches!(error, script::lexer::LexError::Number { .. }));
+    assert!(matches!(error, tjs::vm::lexer::LexError::Number { .. }));
 }
 
 #[test]
@@ -391,7 +406,7 @@ fn a_string_that_is_not_terminated_is_an_error() {
     let error = lexer.next_token().expect_err("the script does not lex");
     assert!(matches!(
         error,
-        script::lexer::LexError::UnterminatedLiteral { .. }
+        tjs::vm::lexer::LexError::UnterminatedLiteral { .. }
     ));
 }
 

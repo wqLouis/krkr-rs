@@ -31,7 +31,7 @@ current contract for a topic is always a page under `arch/`, `code/` or
 | [`platform/`](platform/README.md) | `api`, `fs`, `media`, `psd`, `render`, `platform` | L1 — the stateless platform core |
 | [`engine/`](engine/README.md) | `engine` | L2 — the middle layer: all evolving state |
 | [`compat/`](compat/README.md) | `compat` | L3 — the KiriKiri compatibility surface |
-| [`vm.md`](vm.md), [`tjs.md`](tjs.md), [`tjs/script.md`](tjs/script.md) | `vm`, `tjs`, `script` | L4 — the TJS VM host, the vendored VM and the script language in Rust |
+| [`vm.md`](vm.md), [`tjs.md`](tjs.md), [`tjs/columns.md`](tjs/columns.md), [`tjs/seam.md`](tjs/seam.md) | `vm`, `tjs`, `tjs::vm` | L4 — the TJS VM host, the vendored VM, the Rust script columns and the seam between them |
 | [`app/`](app/README.md) | `app` | root — the desktop composition root |
 | [`android/`](android/README.md) | `android` | root — the Android composition root |
 | [`testkit.md`](testkit.md) | `testkit` | dev-only — the shared test helpers |
@@ -111,7 +111,11 @@ per-plugin pages are indexed in [`compat/README.md`](compat/README.md).
 |---|---|---|
 | [`vm.md`](vm.md) | `vm` | the TJS VM host: the engine wrapper, the script cache, the frame body |
 | [`tjs.md`](tjs.md) | `tjs` | the vendored C++ TJS2 VM and its FFI surface |
-| [`tjs/script.md`](tjs/script.md) | `script` | the script language in Rust: the lexer, the parser and the code generator |
+| [`tjs/columns.md`](tjs/columns.md) | `tjs::vm` | the script columns in Rust: the lexer, the parser and the code generator |
+| [`tjs/lexer.md`](tjs/lexer.md) | `tjs::vm` | the lexer: script text in, tokens out |
+| [`tjs/parser.md`](tjs/parser.md) | `tjs::vm` | the parser: the token stream in, the expression tree out, and the grammar's productions |
+| [`tjs/generator.md`](tjs/generator.md) | `tjs::vm` | the code generator: the expression tree to bytecode, and the rules it implements |
+| [`tjs/seam.md`](tjs/seam.md), [`tjs/seam-fields.md`](tjs/seam-fields.md) | `tjs::vm` | the seam: the compile entry, the C ABI, and the field-by-field table of the script block image |
 
 ---
 

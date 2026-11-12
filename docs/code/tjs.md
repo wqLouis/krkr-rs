@@ -2,11 +2,13 @@
 
 Source: `crates/tjs/` · crate `tjs` · the compatibility anchor
 
-`tjs` is the upstream C++ TJS2 scripting VM, compiled by `build.rs` and
-exposed through a thin, hand-written Rust wrapper over a C ABI. It is the
-only legacy crate the architecture still links, and it is the reason the
-whole tree is a **compatible emulator**: the script language, its semantics
-and its error behaviour are the reference's, not a re-implementation.
+`tjs` hosts the upstream C++ TJS2 scripting VM, compiled by `build.rs`
+and exposed through a thin, hand-written Rust wrapper over a C ABI, and it
+hosts the Rust script columns that are replacing that VM's front end:
+`tjs::vm`, the module in [`tjs/columns.md`](tjs/columns.md). It is the only
+legacy crate the architecture still links, and it is the reason the whole
+tree is a **compatible emulator**: the script language, its semantics and its
+error behaviour are the reference's, not a re-implementation.
 
 The crate is not a layer. It sits under L4 (`vm`), which owns the engine
 instance and drives it; see [vm.md](vm.md) and
@@ -24,7 +26,7 @@ instance and drives it; see [vm.md](vm.md) and
 | the port-authored C++ | `crates/tjs/cpp/streams.cpp` — the TJS stream IO |
 | the Rust binding | `crates/tjs/src/lib.rs` — the `tjs2_*` `extern "C"` surface and the safe wrapper |
 | the build script | `crates/tjs/build.rs` |
-| the Rust script columns | `crates/tjs/rust/script/` — the lexer, the parser and the code generator |
+| the Rust script columns | `crates/tjs/src/vm/` — the lexer, the parser and the code generator |
 
 The tree is the authority on what TJS means, and the behaviour it defines is
 the behaviour the compatibility layer must reproduce. It is maintained in
