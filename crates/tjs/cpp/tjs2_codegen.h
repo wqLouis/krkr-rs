@@ -62,6 +62,22 @@ extern "C" {
    reference's own bytecode format calls TYPE_INTER_OBJECT
    (reference/krkr2/cpp/core/tjs2/tjsConstArrayData.cpp:139-148). */
 #define TJS2_CG_VALUE_CONTEXT 7
+/* A constant array: the array the reference's grammar builds when it
+   reads the `(const)[...]` form
+   (reference/krkr2/cpp/core/tjs2/bison/tjs.y:796-805). The generator
+   cannot build a live object, so the image carries the elements and the
+   C++ side builds the array the way the reference's grammar does: it
+   makes the array with TJSCreateArrayObject() and adds each element
+   through the array's own `add`
+   (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:123-130). */
+#define TJS2_CG_VALUE_CONST_ARRAY 8
+/* A constant dictionary: the dictionary the reference's grammar builds
+   when it reads the `(const)%[...]` form
+   (reference/krkr2/cpp/core/tjs2/bison/tjs.y:831-839). The C++ side
+   builds it with TJSCreateDictionaryObject() and sets each entry with
+   PropSet
+   (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:132-139). */
+#define TJS2_CG_VALUE_CONST_DICTIONARY 9
 
 /* The kinds of a function argument. */
 #define TJS2_CG_ARG_NORMAL         0
@@ -105,7 +121,30 @@ typedef struct tjs2_codegen_value {
     const uint8_t *octet;
     int32_t octet_length;
     uint64_t object;
+    /* The elements of a constant array, or the entries of a constant
+       dictionary; null when the value is neither. */
+    const struct tjs2_codegen_const_element *elements;
+    /* The number of elements. */
+    int32_t element_count;
 } tjs2_codegen_value;
+
+/* One element of a constant array, or one entry of a constant
+   dictionary.
+
+   The reference's grammar builds the array and the dictionary at compile
+   time and puts the elements in them through the array's own `add`
+   (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:123-130) and the
+   dictionary's PropSet (:132-139). The generator cannot build a live
+   object, so the image carries the elements and the C++ side builds the
+   object.
+
+   The name is the name of the entry; it is null for an array's element,
+   which has none. */
+typedef struct tjs2_codegen_const_element {
+    const uint16_t *name;
+    int32_t name_length;
+    tjs2_codegen_value value;
+} tjs2_codegen_const_element;
 
 typedef struct tjs2_codegen_variable {
     const uint16_t *name;

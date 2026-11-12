@@ -65,8 +65,10 @@ pub enum NestKind {
     /// A block.
     #[default]
     Block,
-    /// A `while` or `do` loop.
+    /// A `while` loop.
     While,
+    /// A `do` loop.
+    DoWhile,
     /// A `for` loop.
     For,
     /// A `switch`.
@@ -100,6 +102,11 @@ pub struct NestData {
     pub continue_patches: Vec<i32>,
     /// The jumps that leave the nest.
     pub exit_patches: Vec<i32>,
+    /// The expression the loop runs after every turn.
+    ///
+    /// The expression belongs to the loop, so it is held by the nest:
+    /// two loops that are nested have two expressions.
+    pub post_loop_expr: Option<std::rc::Rc<super::node::Node>>,
     /// The first place to patch.
     pub patch1: i32,
     /// The second place to patch.
@@ -230,8 +237,6 @@ pub struct Context {
     pub namespace: LocalNamespace,
     /// The nests the context holds.
     nest: Vec<NestData>,
-    /// The expression the innermost loop runs after every turn.
-    pub post_loop_expr: Option<std::rc::Rc<super::node::Node>>,
     /// The function arguments being built.
     func_args: Vec<FuncArg>,
     /// The function argument lists being built.
@@ -293,7 +298,6 @@ impl Context {
             non_local_function_decls: Vec::new(),
             namespace: LocalNamespace::new(),
             nest: Vec::new(),
-            post_loop_expr: None,
             func_args: Vec::new(),
             func_arg_stack: Vec::new(),
             array_args: Vec::new(),
@@ -367,6 +371,7 @@ impl Context {
             loop_start_ip: 0,
             continue_patches: Vec::new(),
             exit_patches: Vec::new(),
+            post_loop_expr: None,
             patch1: 0,
             patch2: 0,
         });

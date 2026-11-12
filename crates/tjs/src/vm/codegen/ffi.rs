@@ -86,6 +86,16 @@ pub const TJS2_CG_VALUE_OBJECT: c_int = 5;
 pub const TJS2_CG_VALUE_NULL: c_int = 6;
 /// The `TJS2_CG_VALUE_CONTEXT` value of the interface.
 pub const TJS2_CG_VALUE_CONTEXT: c_int = 7;
+/// The `TJS2_CG_VALUE_CONST_ARRAY` value of the interface.
+///
+/// A constant array is the array the `(const)[...]` form builds. The
+/// generator cannot build a live object, so the image carries the
+/// elements and the side that has the object builds it.
+pub const TJS2_CG_VALUE_CONST_ARRAY: c_int = 8;
+/// The `TJS2_CG_VALUE_CONST_DICTIONARY` value of the interface.
+///
+/// A constant dictionary is the dictionary the `(const)%[...]` form builds.
+pub const TJS2_CG_VALUE_CONST_DICTIONARY: c_int = 9;
 
 /// The kinds of a function argument.
 /// The `TJS2_CG_ARG_NORMAL` value of the interface.
@@ -116,6 +126,28 @@ pub struct tjs2_codegen_value {
     pub octet_length: c_int,
     /// The identity of the value, when it is an object.
     pub object: u64,
+    /// The elements of a constant array, or the entries of a constant
+    /// dictionary.
+    pub elements: *const tjs2_codegen_const_element,
+    /// The number of elements.
+    pub element_count: c_int,
+}
+
+/// One element of a constant array, or one entry of a constant
+/// dictionary.
+///
+/// The array and the dictionary are built at compile time and the elements
+/// go into them through the array's own `add` and the dictionary's
+/// PropSet. The generator cannot build a live object, so the image carries
+/// the elements and the side that has the object builds it.
+#[repr(C)]
+pub struct tjs2_codegen_const_element {
+    /// The name of the entry; null for an array's element.
+    pub name: *const u16,
+    /// The length of the name, in code units.
+    pub name_length: c_int,
+    /// The value of the element.
+    pub value: tjs2_codegen_value,
 }
 
 /// A local variable of the variable area.
@@ -334,11 +366,13 @@ pub struct tjs2_codegen {
     /// The lines of the image.
     pub lines: Vec<tjs2_codegen_line>,
     /// The strings the image points at.
-    pub strings: Vec<Vec<u16>>,
+    pub strings: Vec<Box<[u16]>>,
     /// The byte strings the image points at.
-    pub octets: Vec<Vec<u8>>,
+    pub octets: Vec<Box<[u8]>>,
     /// The names the image points at.
-    pub names: Vec<Vec<u16>>,
+    pub names: Vec<Box<[u16]>>,
+    /// The elements of the constant objects the image points at.
+    pub elements: Vec<Box<[tjs2_codegen_const_element]>>,
     /// The member registrations of the image.
     pub properties: Vec<tjs2_codegen_property>,
     /// The conditional-compilation values the compile hands back.
@@ -362,6 +396,7 @@ impl Default for tjs2_codegen {
             strings: Vec::new(),
             octets: Vec::new(),
             names: Vec::new(),
+            elements: Vec::new(),
             properties: Vec::new(),
             pp_values: None,
         }
@@ -540,14 +575,12 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
         let mut variables: Vec<tjs2_codegen_variable> = Vec::new();
         let mut func_args: Vec<tjs2_codegen_func_arg> = Vec::new();
         let mut labels: Vec<tjs2_codegen_source_pos> = Vec::new();
-        let mut strings: Vec<Vec<u16>> = Vec::new();
-        // the place of each constant's string in the string area: a
-        // constant that is not a string has none
-        let mut string_places: Vec<Option<usize>> = Vec::new();
-        // the place of each constant's byte string in the byte area
-        let mut octet_places: Vec<Option<usize>> = Vec::new();
-        let mut octets: Vec<Vec<u8>> = Vec::new();
-        let mut names: Vec<Vec<u16>> = Vec::new();
+        let mut strings: Vec<Box<[u16]>> = Vec::new();
+        let mut octets: Vec<Box<[u8]>> = Vec::new();
+        let mut names: Vec<Box<[u16]>> = Vec::new();
+        // the elements of the constant objects: one area per object, and
+        // the area does not move when the others grow
+        let mut elements: Vec<Box<[tjs2_codegen_const_element]>> = Vec::new();
         let mut context_constants: Vec<(usize, usize)> = Vec::new();
         let mut context_variables: Vec<(usize, usize)> = Vec::new();
         let mut context_args: Vec<(usize, usize)> = Vec::new();
@@ -560,8 +593,8 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
                     value,
                     &mut strings,
                     &mut octets,
-                    &mut string_places,
-                    &mut octet_places,
+                    &mut names,
+                    &mut elements,
                 ));
             }
             context_constants.push((constant_base, constants.len() - constant_base));
@@ -570,7 +603,7 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
             for (index, name) in context.variable_names().into_iter().enumerate() {
                 let units: Vec<u16> = name.encode_utf16().collect();
                 let length = units.len() as c_int;
-                names.push(units);
+                names.push(units.into_boxed_slice());
                 variables.push(tjs2_codegen_variable {
                     name: std::ptr::null(),
                     name_length: length,
@@ -612,7 +645,7 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
             for property in context.properties() {
                 let units: Vec<u16> = property.name.encode_utf16().collect();
                 let length = units.len() as c_int;
-                names.push(units);
+                names.push(units.into_boxed_slice());
                 properties.push(tjs2_codegen_property {
                     name: std::ptr::null(),
                     name_length: length,
@@ -622,16 +655,9 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
             property_places.push((base, properties.len() - base));
         }
 
-        // the pointers of the areas are set once the areas will not move
-        // again
-        for (index, value) in constants.iter_mut().enumerate() {
-            if let Some(place) = string_places[index] {
-                value.string = strings[place].as_ptr();
-            }
-            if let Some(place) = octet_places[index] {
-                value.octet = octets[place].as_ptr();
-            }
-        }
+        // the pointers of the areas that the values hold are set when the
+        // values are made; the names of the variables and of the members
+        // are set once the areas will not move again
         for (index, variable) in variables.iter_mut().enumerate() {
             variable.name = names[index].as_ptr();
         }
@@ -649,7 +675,7 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
             let name = context.name.clone().unwrap_or_default();
             let name_units: Vec<u16> = name.encode_utf16().collect();
             let name_length = name_units.len() as c_int;
-            names.push(name_units);
+            names.push(name_units.into_boxed_slice());
             image.push(tjs2_codegen_context {
                 code: context.code().as_ptr(),
                 code_size: context.code().len() as c_int,
@@ -699,6 +725,7 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
         generator.strings = strings;
         generator.octets = octets;
         generator.names = names;
+        generator.elements = elements;
         generator.properties = properties;
 
         let top_level = generator
@@ -728,10 +755,10 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
 /// that is not a string does not shift the ones that are.
 fn build_value(
     value: &Value,
-    strings: &mut Vec<Vec<u16>>,
-    octets: &mut Vec<Vec<u8>>,
-    string_places: &mut Vec<Option<usize>>,
-    octet_places: &mut Vec<Option<usize>>,
+    strings: &mut Vec<Box<[u16]>>,
+    octets: &mut Vec<Box<[u8]>>,
+    names: &mut Vec<Box<[u16]>>,
+    elements: &mut Vec<Box<[tjs2_codegen_const_element]>>,
 ) -> tjs2_codegen_value {
     let mut image = tjs2_codegen_value {
         kind: TJS2_CG_VALUE_VOID,
@@ -742,6 +769,8 @@ fn build_value(
         octet: std::ptr::null(),
         octet_length: 0,
         object: 0,
+        elements: std::ptr::null(),
+        element_count: 0,
     };
     match value {
         Value::Void => {}
@@ -757,14 +786,16 @@ fn build_value(
             let units: Vec<u16> = text.encode_utf16().collect();
             image.kind = TJS2_CG_VALUE_STRING;
             image.string_length = units.len() as c_int;
-            string_places.push(Some(strings.len()));
+            let units = units.into_boxed_slice();
+            image.string = units.as_ptr();
             strings.push(units);
         }
         Value::Octet(bytes) => {
             image.kind = TJS2_CG_VALUE_OCTET;
             image.octet_length = bytes.len() as c_int;
-            octets.push(bytes.clone());
-            octet_places.push(Some(octets.len() - 1));
+            let bytes = bytes.clone().into_boxed_slice();
+            image.octet = bytes.as_ptr();
+            octets.push(bytes);
         }
         Value::Object(id) => {
             image.kind = TJS2_CG_VALUE_OBJECT;
@@ -776,12 +807,47 @@ fn build_value(
             image.kind = TJS2_CG_VALUE_CONTEXT;
             image.object = *index as u64;
         }
-    }
-    if image.kind != TJS2_CG_VALUE_STRING {
-        string_places.push(None);
-    }
-    if image.kind != TJS2_CG_VALUE_OCTET {
-        octet_places.push(None);
+        Value::ConstArray {
+            elements: items, ..
+        } => {
+            // the array the `(const)` form builds at compile time; the side
+            // that has the object builds it from the elements
+            image.kind = TJS2_CG_VALUE_CONST_ARRAY;
+            let mut built: Vec<tjs2_codegen_const_element> = Vec::new();
+            for item in items {
+                built.push(tjs2_codegen_const_element {
+                    name: std::ptr::null(),
+                    name_length: 0,
+                    value: build_value(item, strings, octets, names, elements),
+                });
+            }
+            image.element_count = built.len() as c_int;
+            let built = built.into_boxed_slice();
+            image.elements = built.as_ptr();
+            elements.push(built);
+        }
+        Value::ConstDictionary { entries, .. } => {
+            // the dictionary the `(const)` form builds at compile time; the
+            // side that has the object builds it from the entries
+            image.kind = TJS2_CG_VALUE_CONST_DICTIONARY;
+            let mut built: Vec<tjs2_codegen_const_element> = Vec::new();
+            for (name, item) in entries {
+                let units: Vec<u16> = name.encode_utf16().collect();
+                let length = units.len() as c_int;
+                let units = units.into_boxed_slice();
+                let name = units.as_ptr();
+                names.push(units);
+                built.push(tjs2_codegen_const_element {
+                    name,
+                    name_length: length,
+                    value: build_value(item, strings, octets, names, elements),
+                });
+            }
+            image.element_count = built.len() as c_int;
+            let built = built.into_boxed_slice();
+            image.elements = built.as_ptr();
+            elements.push(built);
+        }
     }
     image
 }

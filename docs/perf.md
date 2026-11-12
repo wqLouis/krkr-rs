@@ -856,12 +856,21 @@ strings; `===` and `!==` used the loose comparison; and the conversions did
 not match `AsInteger`, `AsReal` and `AsNumber`. The reference folds with
 its variant operators, so the folded value keeps their kind.
 
-**The code.** 21 of the 172 scripts agree, and the rest differ on one thing:
-the number of children the top level registers. The reference adds a child
-context to the parent's constant area and to the parent's declaration list
-together, so the two counts must agree — and in one script the reference holds
-thirteen context constants and builds its prologue from one declaration.
-That is the open defect.
+**The code.** **150 of the 172 scripts agree**, up from 21. Four defects
+were in the way, and all of them were in the generator's own files: the
+parser's function expression minted an object identity where the reference
+holds the context object (94 scripts by themselves); the void constants, whose
+children were in the wrong order; the parse errors the Rust reported and the
+reference did not; and the constant inline array and dictionary, the `(const)`
+form, which is the one a live object is built for. The generator cannot
+build a live object, so the image carries the kind, the element count and the
+element values, and the side that has the object builds it.
+
+The 22 that still differ do so in the code words. And one defect is not a
+behavioural one: the image's variable count leaves the frame too small, so the
+executor writes past it. That is a buffer overrun, and it is why the C++
+adapter and the switch that calls the Rust entry — both written and proved —
+cannot land until it is fixed.
 
 **The places of the instructions.** The reference's generator passes the
 analyser's **read cursor** to every instruction it writes — the place just

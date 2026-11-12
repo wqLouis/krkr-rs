@@ -7,14 +7,12 @@ use std::rc::Rc;
 
 use crate::vm::codegen::context::{ContextType, NestKind};
 use crate::vm::codegen::emit::{
-    EmitError, RT_NEEDED, SubParam, is_frame, is_modify_sub_type, sub_type,
+    EmitError, RT_NEEDED, SubParam, is_frame, is_modify_sub_type, kind,
 };
 use crate::vm::codegen::node::Node;
 use crate::vm::codegen::opcode::{self, vm};
 use crate::vm::codegen::token;
 use crate::vm::codegen::value::Value;
-
-use super::operations::kind;
 
 /// The error the generator raises when the left hand side cannot be
 /// modified.
@@ -223,7 +221,7 @@ impl crate::vm::codegen::emit::Emitter<'_> {
                 result
             }
             token::T_THIS => {
-                if param.sub_type != sub_type::NONE {
+                if param.sub_type != kind::NONE {
                     return Err(cannot_modify());
                 }
                 Ok(-1)
@@ -233,10 +231,10 @@ impl crate::vm::codegen::emit::Emitter<'_> {
                 // the dot without an object: the `with` block's object
                 let mut proxy = Node::new(token::T_DOT, node_pos);
                 let left = Node::new(token::T_WITHDOT_PROXY, node_pos);
+                crate::vm::codegen::node::add_child(&mut proxy, left.clone());
                 if let Some(child) = node.child(0) {
                     crate::vm::codegen::node::add_child(&mut proxy, child.clone());
                 }
-                crate::vm::codegen::node::add_child(&mut proxy, left.clone());
                 self.gen_node_code(frame, Some(&proxy), restype, param)
             }
             token::T_WITHDOT_PROXY => {
@@ -258,7 +256,7 @@ impl crate::vm::codegen::emit::Emitter<'_> {
             token::T_DICELM => self.gen_dic_elm_code(frame, node, node_pos),
             token::T_REGEXP => self.gen_regexp_code(frame, node, restype, node_pos),
             token::T_VOID => {
-                if param.sub_type != sub_type::NONE {
+                if param.sub_type != kind::NONE {
                     return Err(cannot_modify());
                 }
                 Ok(0)
@@ -278,7 +276,7 @@ impl crate::vm::codegen::emit::Emitter<'_> {
         param: SubParam,
         node_pos: i32,
     ) -> Result<i32, EmitError> {
-        if param.sub_type != sub_type::NONE {
+        if param.sub_type != kind::NONE {
             return Err(cannot_modify());
         }
         if restype & RT_NEEDED == 0 {
@@ -670,7 +668,7 @@ impl crate::vm::codegen::emit::Emitter<'_> {
         if ignores_property {
             // the property access is ignored
             let mut param2 = param;
-            if param2.sub_type == sub_type::NONE {
+            if param2.sub_type == kind::NONE {
                 param2.sub_type = kind::IGNORE_PROP_GET;
             } else if param2.sub_type == kind::EQUAL {
                 param2.sub_type = kind::IGNORE_PROP_SET;
@@ -800,7 +798,9 @@ impl crate::vm::codegen::emit::Emitter<'_> {
 
         self.push_array_arg(frame0, frame0 + 1);
 
-        let empty = node.len() == 1 && node.child(0).is_none();
+        // the array's one element is empty: the array holds nothing, and
+        // the element makes no code
+        let empty = node.len() == 1 && node.child(0).and_then(|child| child.child(0)).is_none();
         if !empty {
             for index in 0..node.len() {
                 self.gen_node_code(frame, node.child(index), RT_NEEDED, SubParam::default())?;

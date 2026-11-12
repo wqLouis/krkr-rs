@@ -41,33 +41,74 @@ pub struct SubParam {
     pub sub_address: i32,
 }
 
-/// The sub-types of the operations that modify their left hand side.
-pub mod sub_type {
-    /// The operation does not modify its left hand side.
-    pub const NONE: i32 = 0;
+/// The sub-types of the operations.
+///
+/// The sub-type says what an operation does with its left hand side.
+/// The sub-type of an operation on a member is the opcode of that
+/// operation, and the generator derives the opcode of the member access
+/// from it. The sub-types that have no opcode of their own start where
+/// the opcodes end.
+pub mod kind {
+    use crate::vm::codegen::opcode::vm;
+
+    /// The operation has no sub-type.
+    pub const NONE: i32 = vm::NOP;
+    /// The operation assigns.
+    pub const EQUAL: i32 = vm::CP;
+    /// The operation is a bitwise and.
+    pub const BIT_AND: i32 = vm::BAND;
+    /// The operation is a bitwise or.
+    pub const BIT_OR: i32 = vm::BOR;
+    /// The operation is a bitwise exclusive or.
+    pub const BIT_XOR: i32 = vm::BXOR;
+    /// The operation is a subtraction.
+    pub const SUB: i32 = vm::SUB;
+    /// The operation is an addition.
+    pub const ADD: i32 = vm::ADD;
+    /// The operation is a remainder.
+    pub const MOD: i32 = vm::MOD;
+    /// The operation is a division.
+    pub const DIV: i32 = vm::DIV;
+    /// The operation is an integer division.
+    pub const IDIV: i32 = vm::IDIV;
+    /// The operation is a multiplication.
+    pub const MUL: i32 = vm::MUL;
+    /// The operation is a logical or.
+    pub const LOG_OR: i32 = vm::LOR;
+    /// The operation is a logical and.
+    pub const LOG_AND: i32 = vm::LAND;
+    /// The operation is an arithmetic right shift.
+    pub const SAR: i32 = vm::SAR;
+    /// The operation is an arithmetic left shift.
+    pub const SAL: i32 = vm::SAL;
+    /// The operation is a logical right shift.
+    pub const SR: i32 = vm::SR;
     /// The operation increments before the value is read.
-    pub const PRE_INC: i32 = 1;
+    pub const PRE_INC: i32 = vm::LAST;
     /// The operation decrements before the value is read.
-    pub const PRE_DEC: i32 = 2;
+    pub const PRE_DEC: i32 = vm::LAST + 1;
     /// The operation increments after the value is read.
-    pub const POST_INC: i32 = 3;
+    pub const POST_INC: i32 = vm::LAST + 2;
     /// The operation decrements after the value is read.
-    pub const POST_DEC: i32 = 4;
+    pub const POST_DEC: i32 = vm::LAST + 3;
     /// The operation deletes the member.
-    pub const DELETE: i32 = 5;
+    pub const DELETE: i32 = vm::LAST + 4;
     /// The operation calls the member.
-    pub const FUNC_CALL: i32 = 6;
+    pub const FUNC_CALL: i32 = vm::LAST + 5;
     /// The operation reads the member without the property access.
-    pub const IGNORE_PROP_GET: i32 = 7;
+    pub const IGNORE_PROP_GET: i32 = vm::LAST + 6;
     /// The operation writes the member without the property access.
-    pub const IGNORE_PROP_SET: i32 = 8;
+    pub const IGNORE_PROP_SET: i32 = vm::LAST + 7;
     /// The operation asks for the type of the member.
-    pub const TYPEOF: i32 = 9;
+    pub const TYPEOF: i32 = vm::LAST + 8;
 }
 
 /// Whether the sub-type modifies its left hand side.
+///
+/// Every sub-type but the one that says "no sub-type" modifies the left
+/// hand side of the operation.
 pub fn is_modify_sub_type(sub_type: i32) -> bool {
-    (sub_type::PRE_INC..=sub_type::TYPEOF).contains(&sub_type)
+    sub_type != kind::NONE
 }
 
 /// The reason the emission fails.

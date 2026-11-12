@@ -46,9 +46,13 @@ impl crate::vm::codegen::emit::Emitter<'_> {
     /// A `while` loop and a `do` loop hold the same nest: the
     /// difference between them is in the place of the condition, and
     /// the condition's code reads it.
-    pub fn enter_while_code(&mut self, _do_while: bool) {
+    pub fn enter_while_code(&mut self, do_while: bool) {
         let start = self.context().code_size();
-        self.context_mut().push_nest(NestKind::While);
+        self.context_mut().push_nest(if do_while {
+            NestKind::DoWhile
+        } else {
+            NestKind::While
+        });
         let index = self.context().nest_len() - 1;
         self.context_mut().nest_data_mut(index).loop_start_ip = start;
     }
@@ -91,7 +95,8 @@ impl crate::vm::codegen::emit::Emitter<'_> {
             return Err(EmitError::Shape("the 'while' is not open".to_string()));
         }
         let index = self.context().nest_len() - 1;
-        if !nest_is(self.context(), index, NestKind::While) {
+        let kind = self.context().nest_at(index).kind;
+        if !matches!(kind, NestKind::While | NestKind::DoWhile) {
             return Err(EmitError::Shape("the 'while' is not open".to_string()));
         }
         if !do_while {
@@ -196,10 +201,11 @@ impl crate::vm::codegen::emit::Emitter<'_> {
 
     /// The code of the third clause of a `for`.
     ///
-    /// The expression is held by the context and made when the loop is
+    /// The expression is held by the loop's nest and made when the loop is
     /// left.
     pub fn set_for_third_expr_code(&mut self, node: Option<&Rc<Node>>) {
-        self.context_mut().post_loop_expr = node.cloned();
+        let index = self.context().nest_len() - 1;
+        self.context_mut().nest_data_mut(index).post_loop_expr = node.cloned();
     }
 
     /// Closes a `for`.
@@ -223,7 +229,7 @@ impl crate::vm::codegen::emit::Emitter<'_> {
         }
 
         // the third clause runs before the loop jumps back
-        if let Some(expression) = self.context().post_loop_expr.clone() {
+        if let Some(expression) = self.context().nest_at(block).post_loop_expr.clone() {
             let mut frame = self.context().frame_base;
             self.gen_node_code(&mut frame, Some(&expression), 0, SubParam::default())?;
             self.clear_frame(&mut frame, self.context().frame_base);
@@ -460,7 +466,7 @@ impl crate::vm::codegen::emit::Emitter<'_> {
         for index in (0..nests).rev() {
             let nest = self.context().nest_at(index);
             match nest.kind {
-                NestKind::Switch | NestKind::While | NestKind::For => {
+                NestKind::Switch | NestKind::While | NestKind::DoWhile | NestKind::For => {
                     // the jump leaves the statement
                     let size = self.context().code_size();
                     self.context_mut()
@@ -498,13 +504,13 @@ impl crate::vm::codegen::emit::Emitter<'_> {
                     self.context_mut().put_code(start - jump_start, -1);
                     return Ok(());
                 }
-                NestKind::For => {
+                NestKind::DoWhile | NestKind::For => {
                     // the jump goes to the end of the loop, where the
-                    // third clause is
+                    // condition or the third clause is
                     let size = self.context().code_size();
                     self.context_mut()
                         .nest_data_mut(index)
-                        .exit_patches
+                        .continue_patches
                         .push(size);
                     self.context_mut().add_jump();
                     self.context_mut().put_code(vm::JMP, -1);

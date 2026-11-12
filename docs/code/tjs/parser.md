@@ -69,6 +69,7 @@ that prove them cite the same lines.
 | the token that follows the argument is read before the argument is reduced, so the node the argument makes is placed after that token | `reference/krkr2/cpp/core/tjs2/bison/tjs.y:769-775` |
 | the token that follows the name tells the two forms of the element apart | `reference/krkr2/cpp/core/tjs2/bison/tjs.y:803-809` |
 | the name and the value of an element are told apart by the `:` that follows the name | `reference/krkr2/cpp/core/tjs2/bison/tjs.y:803-809` |
+| the constant inline array and the constant inline dictionary: the `(const)` form, which is the one a live object is built for | `reference/krkr2/cpp/core/tjs2/bison/tjs.y:796-805`, `:831-839` |
 
 ### 2.2 The tree — `parser/nodes.rs`
 

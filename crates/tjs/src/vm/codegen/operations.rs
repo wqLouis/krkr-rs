@@ -12,65 +12,11 @@ use std::rc::Rc;
 
 use crate::vm::codegen::emit::{
     EmitError, GNC_CFLAG, GNC_CFLAG_I, RT_CFLAG, RT_NEEDED, SubParam, is_cond_flag, is_frame,
-    is_modify_sub_type, sub_type,
+    is_modify_sub_type, kind,
 };
 use crate::vm::codegen::node::Node;
 use crate::vm::codegen::opcode::{self, vm};
 use crate::vm::codegen::token;
-
-/// The kinds of the operations that have one.
-pub mod kind {
-    /// The operation has no sub-type.
-    pub const NONE: i32 = 0;
-    /// The operation assigns.
-    pub const EQUAL: i32 = 1;
-    /// The operation is a bitwise and.
-    pub const BIT_AND: i32 = 2;
-    /// The operation is a bitwise or.
-    pub const BIT_OR: i32 = 3;
-    /// The operation is a bitwise exclusive or.
-    pub const BIT_XOR: i32 = 4;
-    /// The operation is a subtraction.
-    pub const SUB: i32 = 5;
-    /// The operation is an addition.
-    pub const ADD: i32 = 6;
-    /// The operation is a remainder.
-    pub const MOD: i32 = 7;
-    /// The operation is a division.
-    pub const DIV: i32 = 8;
-    /// The operation is an integer division.
-    pub const IDIV: i32 = 9;
-    /// The operation is a multiplication.
-    pub const MUL: i32 = 10;
-    /// The operation is a logical or.
-    pub const LOG_OR: i32 = 11;
-    /// The operation is a logical and.
-    pub const LOG_AND: i32 = 12;
-    /// The operation is an arithmetic right shift.
-    pub const SAR: i32 = 13;
-    /// The operation is an arithmetic left shift.
-    pub const SAL: i32 = 14;
-    /// The operation is a logical right shift.
-    pub const SR: i32 = 15;
-    /// The operation increments before the value is read.
-    pub const PRE_INC: i32 = 16;
-    /// The operation decrements before the value is read.
-    pub const PRE_DEC: i32 = 17;
-    /// The operation increments after the value is read.
-    pub const POST_INC: i32 = 18;
-    /// The operation decrements after the value is read.
-    pub const POST_DEC: i32 = 19;
-    /// The operation deletes the member.
-    pub const DELETE: i32 = 20;
-    /// The operation calls the member.
-    pub const FUNC_CALL: i32 = 21;
-    /// The operation reads the member without the property access.
-    pub const IGNORE_PROP_GET: i32 = 22;
-    /// The operation writes the member without the property access.
-    pub const IGNORE_PROP_SET: i32 = 23;
-    /// The operation asks for the type of the member.
-    pub const TYPEOF: i32 = 24;
-}
 
 /// The sub-type of an operation that assigns.
 fn assign_kind(opcode: i32) -> i32 {
@@ -207,7 +153,7 @@ impl crate::vm::codegen::emit::Emitter<'_> {
                 if restype & RT_NEEDED != 0 {
                     return Err(cannot_get_result());
                 }
-                if param.sub_type != sub_type::NONE {
+                if param.sub_type != kind::NONE {
                     return Err(cannot_modify());
                 }
                 let mut resaddr1 =
@@ -235,7 +181,7 @@ impl crate::vm::codegen::emit::Emitter<'_> {
                 Ok(0)
             }
             token::T_EQUAL => {
-                if param.sub_type != sub_type::NONE {
+                if param.sub_type != kind::NONE {
                     return Err(cannot_modify());
                 }
                 let resaddr = self.gen_node_code(frame, node.child(1), RT_NEEDED, param)?;
@@ -260,7 +206,7 @@ impl crate::vm::codegen::emit::Emitter<'_> {
             | token::T_RARITHSHIFTEQUAL
             | token::T_LARITHSHIFTEQUAL
             | token::T_RBITSHIFTEQUAL => {
-                if param.sub_type != sub_type::NONE {
+                if param.sub_type != kind::NONE {
                     return Err(cannot_modify());
                 }
                 let resaddr =
@@ -350,7 +296,7 @@ impl crate::vm::codegen::emit::Emitter<'_> {
                 Ok(resaddr2)
             }
             token::T_LOGICALOR | token::T_LOGICALAND => {
-                if param.sub_type != sub_type::NONE {
+                if param.sub_type != kind::NONE {
                     return Err(cannot_modify());
                 }
                 let resaddr1 = self.gen_node_code(

@@ -57,6 +57,33 @@ pub enum Value {
     /// names the context by its index in the block, and the side that has
     /// the object resolves the index.
     Context(usize),
+    /// A constant array: the array the `(const)[...]` form builds, and the
+    /// elements it puts in it.
+    ///
+    /// The array is built at compile time and the elements are added
+    /// through the array's own `add`. The generator cannot build a live
+    /// object, so it carries the elements and the side that has the
+    /// object builds it.
+    ConstArray {
+        /// The identity of the array: two constant arrays are two
+        /// objects, and the generator never merges them.
+        identity: ObjectId,
+        /// The elements, in the order the grammar added them.
+        elements: Vec<Value>,
+    },
+    /// A constant dictionary: the dictionary the `(const)%[...]` form builds,
+    /// and the entries it puts in it.
+    ///
+    /// The dictionary is built at compile time and the entries are set
+    /// with PropSet.
+    ConstDictionary {
+        /// The identity of the dictionary: two constant dictionaries are
+        /// two objects, and the generator never merges them.
+        identity: ObjectId,
+        /// The entries, in the order the grammar set them: the name of
+        /// the member and the value it holds.
+        entries: Vec<(String, Value)>,
+    },
 }
 
 /// The reason a value cannot be converted.
@@ -94,6 +121,8 @@ impl fmt::Display for Value {
             }
             Value::Object(id) => formatter.write_str(&object_text(*id)),
             Value::Context(index) => formatter.write_str(&context_text(*index)),
+            Value::ConstArray { identity, .. } => formatter.write_str(&object_text(*identity)),
+            Value::ConstDictionary { identity, .. } => formatter.write_str(&object_text(*identity)),
         }
     }
 }
@@ -121,7 +150,11 @@ impl Value {
                 Some(parsed) => parsed.to_real().unwrap_or(0.0),
                 None => 0.0,
             }),
-            Value::Octet(_) | Value::Object(_) | Value::Context(_) => None,
+            Value::Octet(_)
+            | Value::Object(_)
+            | Value::Context(_)
+            | Value::ConstArray { .. }
+            | Value::ConstDictionary { .. } => None,
         }
     }
 
@@ -139,7 +172,11 @@ impl Value {
                 Some(parsed) => parsed.to_integer().unwrap_or(0),
                 None => 0,
             }),
-            Value::Octet(_) | Value::Object(_) | Value::Context(_) => None,
+            Value::Octet(_)
+            | Value::Object(_)
+            | Value::Context(_)
+            | Value::ConstArray { .. }
+            | Value::ConstDictionary { .. } => None,
         }
     }
 
@@ -153,7 +190,11 @@ impl Value {
             Value::Void => Some(Value::Integer(0)),
             Value::Integer(_) | Value::Real(_) => Some(self.clone()),
             Value::String(value) => Some(parse_number(value).unwrap_or(Value::Integer(0))),
-            Value::Octet(_) | Value::Object(_) | Value::Context(_) => None,
+            Value::Octet(_)
+            | Value::Object(_)
+            | Value::Context(_)
+            | Value::ConstArray { .. }
+            | Value::ConstDictionary { .. } => None,
         }
     }
 
@@ -188,6 +229,7 @@ impl Value {
             Value::Octet(bytes) => !bytes.is_empty(),
             Value::Object(id) => !id.is_null(),
             Value::Context(_) => true,
+            Value::ConstArray { .. } | Value::ConstDictionary { .. } => true,
         }
     }
 
@@ -221,6 +263,18 @@ impl Value {
             (Value::Octet(left), Value::Octet(right)) => left == right,
             (Value::Object(left), Value::Object(right)) => left == right,
             (Value::Context(left), Value::Context(right)) => left == right,
+            (
+                Value::ConstArray { identity: left, .. },
+                Value::ConstArray {
+                    identity: right, ..
+                },
+            ) => left == right,
+            (
+                Value::ConstDictionary { identity: left, .. },
+                Value::ConstDictionary {
+                    identity: right, ..
+                },
+            ) => left == right,
             _ => false,
         }
     }
@@ -235,6 +289,10 @@ impl Value {
             (Octet(a), Octet(b)) => Ok(a == b),
             (Object(a), Object(b)) => Ok(a == b),
             (Context(a), Context(b)) => Ok(a == b),
+            (ConstArray { identity: a, .. }, ConstArray { identity: b, .. }) => Ok(a == b),
+            (ConstDictionary { identity: a, .. }, ConstDictionary { identity: b, .. }) => {
+                Ok(a == b)
+            }
             (Integer(a), Real(b)) => Ok(*a as f64 == *b),
             (Real(a), Integer(b)) => Ok(*a == *b as f64),
             (Void, Integer(b)) => Ok(*b == 0),

@@ -76,6 +76,7 @@ that prove them cite the same lines.
 | the global context cannot reach a local variable, so the name space is not consulted | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:2200-2210` |
 | the declaration of a local variable | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:2845-2884` (`AddLocalVariable`) |
 | the sub-types that modify the left hand side, from the pre-increment to the type query | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:1110-2736` (the operation switch) |
+| the sub-type of an operation on a member is the opcode of that operation, and the sub-types that have no opcode of their own start where the opcodes end | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:135-153` (the `tTJSSubType` enum) |
 
 ### 2.3 The super class — `extends.rs`
 
@@ -143,6 +144,8 @@ that prove them cite the same lines.
 | both values are converted to a string when one of the two is a string | `reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:665` |
 | the object text holds the address of the dispatch and the address of the `objthis` | `reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:187` |
 | the real is printed with the shortest form that reads back as the same number | `reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:241` (`TJSRealToString`) |
+| a constant array: the `(const)[...]` form's array, and the elements it puts in it | `reference/krkr2/cpp/core/tjs2/bison/tjs.y:796-805` |
+| a constant dictionary: the `(const)%[...]` form's dictionary, and the entries it puts in it | `reference/krkr2/cpp/core/tjs2/bison/tjs.y:831-839` |
 
 ### 2.8 The object operations — `objects.rs`
 
@@ -197,6 +200,7 @@ that prove them cite the same lines.
 | the tree has a shape the generator does not support: a typed error | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:1110-2736` |
 | the error's detail is read separately, through `tjs2_codegen_last_error_message`, and never as a Rust type across the boundary | `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:862` (the native call site) |
 | the line table: the text is split on `\r` and `\n`, a `\r\n` counts as one break, and every line contributes its start offset and its length in code units, without the break | `reference/krkr2/cpp/core/tjs2/tjsScriptBlock.cpp:207-232` |
+| the constant array's kind and the constant dictionary's kind: the image carries the elements and the side that has the object builds it | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:123-130` (the array's `add`), `:132-139` (the dictionary's `PropSet`) |
 
 ### 2.15 The proof instrument — `proof.rs`
 

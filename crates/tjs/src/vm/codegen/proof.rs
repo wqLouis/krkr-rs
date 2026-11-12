@@ -93,6 +93,14 @@ fn value_kind(kind: c_int) -> Option<Value> {
             Value::Object(crate::vm::codegen::value::ObjectId::NULL)
         }
         crate::vm::codegen::ffi::TJS2_CG_VALUE_CONTEXT => Value::Context(0),
+        crate::vm::codegen::ffi::TJS2_CG_VALUE_CONST_ARRAY => Value::ConstArray {
+            identity: crate::vm::codegen::value::ObjectId(0),
+            elements: Vec::new(),
+        },
+        crate::vm::codegen::ffi::TJS2_CG_VALUE_CONST_DICTIONARY => Value::ConstDictionary {
+            identity: crate::vm::codegen::value::ObjectId(0),
+            entries: Vec::new(),
+        },
         _ => return None,
     })
 }
@@ -362,7 +370,72 @@ fn value_from_image(value: &tjs2_codegen_value) -> Option<Value> {
         Value::Object(_) => Value::Object(crate::vm::codegen::value::ObjectId(value.object)),
         Value::Context(_) => Value::Context(value.object as usize),
         Value::Void => Value::Void,
+        Value::ConstArray { .. } => {
+            let mut elements = Vec::new();
+            for element in image_elements(value) {
+                let element = value_from_image(&element.value)?;
+                elements.push(element);
+            }
+            Value::ConstArray {
+                identity: crate::vm::codegen::value::ObjectId(value.object),
+                elements,
+            }
+        }
+        Value::ConstDictionary { .. } => {
+            let mut entries = Vec::new();
+            for element in image_elements(value) {
+                let item = value_from_image(&element.value)?;
+                let name = if element.name.is_null() {
+                    String::new()
+                } else {
+                    // SAFETY: the caller promises the name is readable.
+                    let units = unsafe {
+                        std::slice::from_raw_parts(element.name, element.name_length as usize)
+                    };
+                    String::from_utf16_lossy(units)
+                };
+                entries.push((name, item));
+            }
+            Value::ConstDictionary {
+                identity: crate::vm::codegen::value::ObjectId(value.object),
+                entries,
+            }
+        }
     })
+}
+
+/// The elements a value of the image carries.
+///
+/// The elements are read one by one, and the reader holds them, so the
+/// values they hold stay readable.
+fn image_elements(
+    value: &tjs2_codegen_value,
+) -> Vec<crate::vm::codegen::ffi::tjs2_codegen_const_element> {
+    let mut elements = Vec::new();
+    if value.elements.is_null() {
+        return elements;
+    }
+    for index in 0..value.element_count {
+        // SAFETY: the caller promises the elements are readable.
+        let element = unsafe { &*value.elements.add(index as usize) };
+        elements.push(crate::vm::codegen::ffi::tjs2_codegen_const_element {
+            name: element.name,
+            name_length: element.name_length,
+            value: crate::vm::codegen::ffi::tjs2_codegen_value {
+                kind: element.value.kind,
+                integer: element.value.integer,
+                real: element.value.real,
+                string: element.value.string,
+                string_length: element.value.string_length,
+                octet: element.value.octet,
+                octet_length: element.value.octet_length,
+                object: element.value.object,
+                elements: element.value.elements,
+                element_count: element.value.element_count,
+            },
+        });
+    }
+    elements
 }
 
 /// Sets the value of a node.
@@ -641,6 +714,40 @@ fn same_value(mine: &Value, theirs: &tjs2_codegen_value) -> bool {
         Value::Context(index) => {
             theirs.kind == crate::vm::codegen::ffi::TJS2_CG_VALUE_CONTEXT
                 && theirs.object == *index as u64
+        }
+        Value::ConstArray { elements, .. } => {
+            if theirs.kind != crate::vm::codegen::ffi::TJS2_CG_VALUE_CONST_ARRAY {
+                return false;
+            }
+            let theirs_elements = image_elements(theirs);
+            theirs_elements.len() == elements.len()
+                && elements
+                    .iter()
+                    .zip(theirs_elements.iter())
+                    .all(|(mine, theirs)| same_value(mine, &theirs.value))
+        }
+        Value::ConstDictionary { entries, .. } => {
+            if theirs.kind != crate::vm::codegen::ffi::TJS2_CG_VALUE_CONST_DICTIONARY {
+                return false;
+            }
+            let theirs_elements = image_elements(theirs);
+            theirs_elements.len() == entries.len()
+                && entries
+                    .iter()
+                    .zip(theirs_elements.iter())
+                    .all(|((name, mine), theirs)| {
+                        let units = theirs.name;
+                        let theirs_name = if units.is_null() {
+                            String::new()
+                        } else {
+                            // SAFETY: the caller promises the name is readable.
+                            let units = unsafe {
+                                std::slice::from_raw_parts(units, theirs.name_length as usize)
+                            };
+                            String::from_utf16_lossy(units)
+                        };
+                        theirs_name == *name && same_value(mine, &theirs.value)
+                    })
         }
     }
 }

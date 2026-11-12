@@ -270,12 +270,6 @@ pub struct Parser<'a, C: Commands> {
     first_error: Option<ParseError>,
     /// The parser stopped: too many failures.
     stopped: bool,
-    /// The number of the objects the parser minted.
-    ///
-    /// A function expression holds the function it made, and the object
-    /// model is not built yet, so the parser holds the object by an
-    /// identity of its own.
-    minted: u64,
 }
 
 impl<'a, C: Commands> Parser<'a, C> {
@@ -291,7 +285,6 @@ impl<'a, C: Commands> Parser<'a, C> {
             error_count: 0,
             first_error: None,
             stopped: false,
-            minted: 0,
         }
     }
 
@@ -1682,6 +1675,11 @@ impl<'a, C: Commands> Parser<'a, C> {
         match self.peek_kind() {
             Some(TokenKind::LeftParenthesis) => {
                 self.advance();
+                if self.peek_kind() == Some(TokenKind::Const) {
+                    // the `(const)` form: the constant array or the
+                    // constant dictionary
+                    return self.const_inline();
+                }
                 let node = self.expr()?;
                 self.expect(TokenKind::RightParenthesis)?;
                 Ok(self.node_index(&node))
@@ -1883,7 +1881,8 @@ impl<'a, C: Commands> Parser<'a, C> {
     fn func_expr_def(&mut self) -> Result<usize, ParseError> {
         self.advance();
         let units: Vec<u16> = "(anonymous)".encode_utf16().collect();
-        self.commands
+        let context = self
+            .commands
             .push_context(Some(&units), ContextType::ExprFunction);
         self.commands.enter_block();
         let result = (|| {
@@ -1896,12 +1895,9 @@ impl<'a, C: Commands> Parser<'a, C> {
         result?;
         let position = self.position();
         let index = self.nodes.make_np0(token::T_CONSTVAL, position);
-        // the value of the expression is the function the parser made; the
-        // object model is not built yet, so the object is held by an
-        // identity of the parser's own
-        self.minted += 1;
-        let value = Value::Object(ObjectId(self.minted));
-        self.nodes.set_value(index, value);
+        // the value of the expression is the context the function was
+        // compiled into; the context is named by its place in the block
+        self.nodes.set_value(index, Value::Context(context));
         Ok(index)
     }
 
@@ -1962,6 +1958,163 @@ impl<'a, C: Commands> Parser<'a, C> {
         self.lookahead
             .get(1)
             .is_some_and(|token| token.kind == TokenKind::Colon)
+    }
+
+    /// A constant inline array or a constant inline dictionary.
+    ///
+    /// The `(const)` form is the one a live object is built for. The
+    /// `const` is read and the `)` is expected; the array and the
+    /// dictionary follow it.
+    fn const_inline(&mut self) -> Result<usize, ParseError> {
+        self.advance();
+        self.expect(TokenKind::RightParenthesis)?;
+        let position = self.position();
+        let index = self.nodes.make_np0(token::T_CONSTVAL, position);
+        // the object the grammar builds is one object, and two constant
+        // arrays are two objects: the identity tells them apart
+        let identity = ObjectId(index as u64);
+        match self.peek_kind() {
+            Some(TokenKind::LeftBracket) => {
+                self.advance();
+                let elements = self.const_array_elm_list()?;
+                self.expect(TokenKind::RightBracket)?;
+                self.nodes
+                    .set_value(index, Value::ConstArray { identity, elements });
+            }
+            Some(TokenKind::Percent) => {
+                self.advance();
+                self.expect(TokenKind::LeftBracket)?;
+                let entries = self.const_dic_elm_list()?;
+                self.expect(TokenKind::RightBracket)?;
+                self.nodes
+                    .set_value(index, Value::ConstDictionary { identity, entries });
+            }
+            _ => return Err(self.syntax_error("'[' or '%'")),
+        }
+        Ok(index)
+    }
+
+    /// The elements of a constant inline array.
+    fn const_array_elm_list(&mut self) -> Result<Vec<Value>, ParseError> {
+        let mut elements = Vec::new();
+        if self.peek_kind() == Some(TokenKind::RightBracket) {
+            return Ok(elements);
+        }
+        loop {
+            elements.push(self.const_array_elm()?);
+            if self.peek_kind() != Some(TokenKind::Comma) {
+                break;
+            }
+            self.advance();
+        }
+        Ok(elements)
+    }
+
+    /// One element of a constant inline array.
+    ///
+    /// The element is a constant value, a sign and a constant value, a
+    /// value of no value, or a constant array or a constant dictionary.
+    fn const_array_elm(&mut self) -> Result<Value, ParseError> {
+        match self.peek_kind() {
+            Some(TokenKind::Minus) => {
+                self.advance();
+                let value = self.const_value()?;
+                self.signed_value(value, token::T_UMINUS)
+            }
+            Some(TokenKind::Plus) => {
+                self.advance();
+                let value = self.const_value()?;
+                self.signed_value(value, token::T_UPLUS)
+            }
+            Some(TokenKind::Void) => {
+                self.advance();
+                Ok(Value::Void)
+            }
+            Some(TokenKind::LeftParenthesis) => {
+                // a nested constant array or constant dictionary
+                let node = self.const_inline()?;
+                Ok(self
+                    .nodes
+                    .node(node)
+                    .value()
+                    .cloned()
+                    .unwrap_or(Value::Void))
+            }
+            _ => self.const_value(),
+        }
+    }
+
+    /// The entries of a constant inline dictionary.
+    fn const_dic_elm_list(&mut self) -> Result<Vec<(String, Value)>, ParseError> {
+        let mut entries = Vec::new();
+        if self.peek_kind() == Some(TokenKind::RightBracket) {
+            return Ok(entries);
+        }
+        loop {
+            entries.push(self.const_dic_elm()?);
+            if self.peek_kind() != Some(TokenKind::Comma) {
+                break;
+            }
+            self.advance();
+        }
+        Ok(entries)
+    }
+
+    /// One entry of a constant inline dictionary.
+    ///
+    /// The entry is the name of the member and the value it holds, and
+    /// the two are told apart by the `,` that follows the name.
+    fn const_dic_elm(&mut self) -> Result<(String, Value), ParseError> {
+        let name = self.const_value()?;
+        self.expect(TokenKind::Comma)?;
+        let value = match self.peek_kind() {
+            Some(TokenKind::Minus) => {
+                self.advance();
+                let value = self.const_value()?;
+                self.signed_value(value, token::T_UMINUS)?
+            }
+            Some(TokenKind::Plus) => {
+                self.advance();
+                let value = self.const_value()?;
+                self.signed_value(value, token::T_UPLUS)?
+            }
+            Some(TokenKind::Void) => {
+                self.advance();
+                Value::Void
+            }
+            Some(TokenKind::LeftParenthesis) => {
+                // a nested constant array or constant dictionary
+                let node = self.const_inline()?;
+                self.nodes
+                    .node(node)
+                    .value()
+                    .cloned()
+                    .unwrap_or(Value::Void)
+            }
+            _ => self.const_value()?,
+        };
+        let name = match name.to_text() {
+            Some(text) => text,
+            None => return Err(self.syntax_error("a name that is text")),
+        };
+        Ok((name, value))
+    }
+
+    /// The value of a constant token.
+    fn const_value(&mut self) -> Result<Value, ParseError> {
+        let token = self.expect(TokenKind::ConstVal)?;
+        Ok(self.value_of(&token))
+    }
+
+    /// The value with the sign the grammar puts on it.
+    ///
+    /// The sign is the variant's own: the minus changes the sign and the
+    /// plus reads the value as a number.
+    fn signed_value(&mut self, value: Value, opcode: i32) -> Result<Value, ParseError> {
+        match crate::vm::codegen::folding::fold_unary(opcode, &value) {
+            Some(folded) => Ok(folded),
+            None => Err(self.syntax_error("a value the sign can be put on")),
+        }
     }
 
     /// An inline dictionary.
