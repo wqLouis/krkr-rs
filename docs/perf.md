@@ -185,12 +185,48 @@ and the profile of §2.3 measure the interior of the same run (0.70 s from
 open to the first presented frame); the two are different instruments and
 are not comparable with each other.
 
-**Inferred, not measured.** The batch took two of the levers §2.4 names —
-the six embedded fonts and the read pool, which now read the fonts in
-parallel and inflate an archive entry on a worker — and the total did not
-move. Whether those levers won time that the script path gave back, or won
-nothing this instrument can see, the measurement does not say; the phase
-timers would name it.
+**Inferred, and partly wrong.** The batch took two of the levers §2.4 names
+— the six embedded fonts and the read pool, which were believed to read the
+fonts in parallel — and the total did not move. The fonts lever did not
+fire at all: the parallel read was blocked by a guard that §2.6 removes.
+
+### 2.6 The startup after the shared read was unblocked
+
+**2026-11-12.** The tree at `c354af0`, release build, the game's own
+directory.
+
+**Method.** The same instrument as §2.5: a monotonic clock around the whole
+process, `time.monotonic()` → `subprocess.run([...])` → the clock again,
+seven runs in a row, plus the children's user and system time and the peak
+RSS.
+
+| | before | after |
+|---|---|---|
+| wall, min | 0.771 s | **0.671 s** |
+| wall, median | 0.777 s | **0.675 s** |
+| wall, max | 0.781 s | 0.682 s |
+| CPU, median | 0.815 s | 0.857 s |
+| peak RSS | 463 MB | 461 MB |
+
+**102 ms off the startup, 13.1 % of the median**, for one deleted guard.
+
+**The cause.** `read_entries_together` returned early whenever an extraction
+filter was installed, so the shared read of the eight embedded fonts did
+nothing and each font was decoded on its own, on the thread that asked for
+it. The guard was a leftover: it belonged to a shape in which the filter was
+fused into the decode, and 2181ac5 split the read into two stages — the
+decode may run on a worker, and the filter applies to the decoded bytes on
+the caller's thread. The shared read was written in that same commit with
+the old guard copied into it.
+
+The instrument that found it was a trace line in the real game: the shared
+read was called with eight names and returned at once. The game carries an
+xp3 filter, so it always took the early return — the parallel font read was
+inert for this title, and §2.5's inference that it was parallel was wrong.
+
+The CPU time rose by 42 ms while the wall time fell by 102 ms, which is what
+eight decodes running at once on ten workers looks like: the same work, more
+of it on other cores.
 
 ## 3. The scene load
 
