@@ -275,6 +275,35 @@ The tree the conversion walks:
 | dictionary members | 91 220 |
 | list items | 106 538 |
 
+
+### 3.2a The scene load on the final tree
+
+**2026-11-12.** The tree at `c354af0`, release build, the game's own
+directory, the same scenario.
+
+**Method.** The game is opened through the app's own composition root, and
+the scenario is loaded through the plugin, so the conversion is the
+production path. The member read is timed through the engine's own storage;
+the load is the plugin's `load` (the read and the parse), and the conversion
+is the `root` getter. The plugin's own slow-step report
+(`psb: the root dictionary of ... took ...`) agrees with the timer to the
+tenth of a millisecond.
+
+| step | cold | warm |
+|---|---|---|
+| the member read | 1.15 ms | 0.51 ms |
+| the load (the read and the parse) | 23.9 ms | 24.2 ms |
+| **the conversion** | **64.6 ms** | **53.5 ms** |
+| **the scene load** | **89.7 ms** | **79.1 ms** |
+
+Two runs, the second the same within 0.5 ms. The warm scene load is 79.1 ms
+and 78.6 ms — the **79 ms** the third column of §3.2 predicted. The parse is
+24 ms, inside the 22.9 ms and 24.7 ms §3.2 recorded.
+
+**The conversion is still the hotspot**: 53.5 ms of the 79.1 ms warm scene
+load. Against the shape this section opened with, it is 53.5 ms where the
+script-built containers took 340.6 ms — a sixth of the time — and the whole
+scene load is 79 ms where it was ~367 ms.
 ### 3.3 The hotspot
 
 The call-stack profile of the conversion **before** the change (`gprofng`,
