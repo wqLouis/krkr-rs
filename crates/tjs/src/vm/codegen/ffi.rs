@@ -596,11 +596,29 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
         let mut context_args: Vec<(usize, usize)> = Vec::new();
         let mut context_labels: Vec<(usize, usize)> = Vec::new();
 
+        // the contexts that have left the block are not in the image, and
+        // the contexts after them move down
+        let mut places: Vec<Option<usize>> =
+            Vec::with_capacity(generator.generator.contexts().len());
+        let mut live = 0;
         for context in generator.generator.contexts() {
+            if context.removed {
+                places.push(None);
+            } else {
+                places.push(Some(live));
+                live += 1;
+            }
+        }
+
+        for context in generator.generator.contexts() {
+            if context.removed {
+                continue;
+            }
             let constant_base = constants.len();
             for value in context.data() {
                 constants.push(build_value(
                     value,
+                    &places,
                     &mut strings,
                     &mut octets,
                     &mut objects,
@@ -667,6 +685,9 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
         let mut properties: Vec<tjs2_codegen_property> = Vec::new();
         let mut property_places: Vec<(usize, usize)> = Vec::new();
         for context in generator.generator.contexts() {
+            if context.removed {
+                continue;
+            }
             let base = properties.len();
             for property in context.properties() {
                 let units: Vec<u16> = property.name.encode_utf16().collect();
@@ -675,7 +696,7 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
                 properties.push(tjs2_codegen_property {
                     name: std::ptr::null(),
                     name_length: length,
-                    member: property.member as c_int,
+                    member: places[property.member].unwrap_or(0) as c_int,
                 });
             }
             property_places.push((base, properties.len() - base));
@@ -694,6 +715,9 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
 
         let mut image = Vec::new();
         for (index, context) in generator.generator.contexts().iter().enumerate() {
+            if context.removed {
+                continue;
+            }
             let (constant_base, constant_count) = context_constants[index];
             let (variable_base, variable_count) = context_variables[index];
             let (arg_base, arg_count) = context_args[index];
@@ -723,17 +747,24 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
                     .map(|name| name.as_ptr())
                     .unwrap_or(std::ptr::null()),
                 name_length,
-                parent: context.parent.map(|parent| parent as c_int).unwrap_or(-1),
+                parent: context
+                    .parent
+                    .and_then(|parent| places[parent])
+                    .map(|parent| parent as c_int)
+                    .unwrap_or(-1),
                 prop_setter: context
                     .prop_setter
+                    .and_then(|setter| places[setter])
                     .map(|setter| setter as c_int)
                     .unwrap_or(-1),
                 prop_getter: context
                     .prop_getter
+                    .and_then(|getter| places[getter])
                     .map(|getter| getter as c_int)
                     .unwrap_or(-1),
                 super_class_getter: context
                     .super_class_getter
+                    .and_then(|getter| places[getter])
                     .map(|getter| getter as c_int)
                     .unwrap_or(-1),
                 super_class_getter_pointer: context.super_class_getter_pointer.as_ptr(),
@@ -787,6 +818,7 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
 /// that is not a string does not shift the ones that are.
 fn build_value(
     value: &Value,
+    places: &[Option<usize>],
     strings: &mut Vec<Box<[u16]>>,
     octets: &mut Vec<Box<[u8]>>,
     objects: &mut Vec<tjs2_codegen_object>,
@@ -836,7 +868,10 @@ fn build_value(
             // the context is named by its index in the block; the side
             // that has the object resolves the index
             image.kind = TJS2_CG_VALUE_CONTEXT;
-            image.object = *index as u64;
+            image.object = places
+                .get(*index)
+                .and_then(|place| *place)
+                .unwrap_or(*index) as u64;
         }
         Value::ConstArray {
             elements: items, ..
@@ -848,6 +883,7 @@ fn build_value(
             for item in items {
                 values.push(build_value(
                     item,
+                    places,
                     strings,
                     octets,
                     objects,
@@ -875,6 +911,7 @@ fn build_value(
             for (key, item) in entries {
                 keys.push(build_value(
                     key,
+                    places,
                     strings,
                     octets,
                     objects,
@@ -883,6 +920,7 @@ fn build_value(
                 ));
                 values.push(build_value(
                     item,
+                    places,
                     strings,
                     octets,
                     objects,

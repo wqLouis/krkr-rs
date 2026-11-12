@@ -208,7 +208,8 @@ impl<'a> Emitter<'a> {
 
     /// The code of the argument list.
     pub fn generate_func_call_arg_code(&mut self) {
-        self.context_mut().generate_func_call_arg_code();
+        let position = self.lex_position;
+        self.context_mut().generate_func_call_arg_code(position);
     }
 
     /// Opens an array argument.
@@ -241,14 +242,15 @@ impl<'a> Emitter<'a> {
             let data = context.put_data(crate::vm::codegen::value::Value::String(
                 context.name.clone().unwrap_or_default(),
             ));
-            context.put_code(vm::CONST, -1);
-            context.put_code(opcode::vm_reg_addr(1), -1);
-            context.put_code(opcode::vm_reg_addr(data), -1);
-            context.put_code(vm::ADDCI, -1);
-            context.put_code(opcode::vm_reg_addr(-1), -1);
-            context.put_code(opcode::vm_reg_addr(1), -1);
-            context.put_code(vm::CL, -1);
-            context.put_code(opcode::vm_reg_addr(1), -1);
+            let position = self.lex_position;
+            context.put_code(vm::CONST, position);
+            context.put_code(opcode::vm_reg_addr(1), position);
+            context.put_code(opcode::vm_reg_addr(data), position);
+            context.put_code(vm::ADDCI, position);
+            context.put_code(opcode::vm_reg_addr(-1), position);
+            context.put_code(opcode::vm_reg_addr(1), position);
+            context.put_code(vm::CL, position);
+            context.put_code(opcode::vm_reg_addr(1), position);
             context.function_register_code_point = context.code_size();
         }
         self.contexts.push(context);

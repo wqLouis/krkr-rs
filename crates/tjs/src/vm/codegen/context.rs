@@ -271,6 +271,13 @@ pub struct Context {
     pub super_class_getter: Option<usize>,
     /// The members the context contributes to its parent object.
     pub properties: Vec<Property>,
+    /// Whether the context has left the block.
+    ///
+    /// A member of a class that is registered again under the same name
+    /// replaces the earlier one, and the earlier context is released; it
+    /// leaves the block when nothing else holds it
+    /// (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:394).
+    pub removed: bool,
     /// The place of the jump the last closed `if` left to be patched.
     pub prev_if_exit_patch: i32,
 }
@@ -315,6 +322,7 @@ impl Context {
             prop_getter: None,
             super_class_getter: None,
             properties: Vec::new(),
+            removed: false,
             prev_if_exit_patch: 0,
         }
     }
@@ -330,6 +338,12 @@ impl Context {
     }
 
     /// The constant area of the context.
+    /// The constant area, for a change.
+    pub fn data_mut(&mut self) -> &mut Vec<Value> {
+        &mut self.data
+    }
+
+    /// The constant area, for a change.
     pub fn data(&self) -> &[Value] {
         &self.data
     }
@@ -483,6 +497,14 @@ impl Context {
         self.properties.push(Property { name, member });
     }
 
+    /// The place of the member of the given name, when the context has
+    /// one.
+    pub fn property_index(&self, name: &str) -> Option<usize> {
+        self.properties
+            .iter()
+            .position(|property| property.name == name)
+    }
+
     /// The names of the local variables, in the order the name space
     /// holds them.
     pub fn variable_names(&self) -> Vec<String> {
@@ -527,25 +549,25 @@ impl Context {
     }
 
     /// The code of the argument list.
-    pub fn generate_func_call_arg_code(&mut self) {
+    pub fn generate_func_call_arg_code(&mut self, position: i32) {
         let Some(list) = self.func_arg_stack.last().cloned() else {
             return;
         };
         if list.is_omit {
             // the arguments are omitted
-            self.put_code(-1, -1);
+            self.put_code(-1, position);
         } else if list.has_expand {
             // the arguments hold an expanding argument
-            self.put_code(-2, -1);
-            self.put_code(list.args.len() as i32, -1);
+            self.put_code(-2, position);
+            self.put_code(list.args.len() as i32, position);
             for arg in &list.args {
-                self.put_code(arg.kind as i32, -1);
-                self.put_code(opcode::vm_reg_addr(arg.register), -1);
+                self.put_code(arg.kind as i32, position);
+                self.put_code(opcode::vm_reg_addr(arg.register), position);
             }
         } else {
-            self.put_code(list.args.len() as i32, -1);
+            self.put_code(list.args.len() as i32, position);
             for arg in &list.args {
-                self.put_code(opcode::vm_reg_addr(arg.register), -1);
+                self.put_code(opcode::vm_reg_addr(arg.register), position);
             }
         }
     }

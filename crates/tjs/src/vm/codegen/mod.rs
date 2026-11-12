@@ -118,25 +118,11 @@ impl Generator {
     /// The context becomes the one the code is generated for; the context
     /// that held it becomes its parent.
     pub fn push_context(&mut self, name: Option<&[u16]>, kind: ContextType) -> usize {
-        let index = self.contexts.len();
-        let parent = if index == 0 { None } else { Some(self.current) };
-        let name = name.map(String::from_utf16_lossy);
-        let mut context = Context::new(kind, name, index, parent);
-        if kind == ContextType::Class {
-            // the class registers its members to the object it makes
-            context.max_frame_count = 1;
-            let data = context.put_data(Value::String(context.name.clone().unwrap_or_default()));
-            context.put_code(opcode::vm::CONST, -1);
-            context.put_code(opcode::vm_reg_addr(1), -1);
-            context.put_code(opcode::vm_reg_addr(data), -1);
-            context.put_code(opcode::vm::ADDCI, -1);
-            context.put_code(opcode::vm_reg_addr(-1), -1);
-            context.put_code(opcode::vm_reg_addr(1), -1);
-            context.put_code(opcode::vm::CL, -1);
-            context.put_code(opcode::vm_reg_addr(1), -1);
-            context.function_register_code_point = context.code_size();
-        }
-        self.contexts.push(context);
+        let index = {
+            let mut emitter =
+                emit::Emitter::new(&mut self.contexts, self.current, self.lex_position);
+            emitter.push_context(name, kind)
+        };
         self.current = index;
         index
     }
@@ -159,6 +145,11 @@ impl Generator {
     /// Finishes a context.
     pub fn commit(&mut self, index: usize) -> Result<(), CodegenError> {
         let kind = self.contexts[index].kind;
+        // the top level is the last context to be committed, and the
+        // block is whole when it is
+        if kind == ContextType::TopLevel {
+            self.finalize();
+        }
         // the class commits its super class proxy first
         if kind == ContextType::Class
             && let Some(getter) = self.contexts[index].super_class_getter
@@ -184,6 +175,55 @@ impl Generator {
             self.contexts[index].max_variable_count = self.contexts[index].namespace.max_count;
         }
         Ok(())
+    }
+
+    /// Finishes the block.
+    ///
+    /// A member of a class that is registered again under the same name
+    /// replaces the earlier one, and the earlier context is released; it
+    /// leaves the block when nothing else holds it
+    /// (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:394). The
+    /// contexts after it move down, and the places that name them move
+    /// with them.
+    fn finalize(&mut self) {
+        if !self.contexts.iter().any(|context| context.removed) {
+            return;
+        }
+        // the place every context moves to
+        let mut places: Vec<Option<usize>> = Vec::with_capacity(self.contexts.len());
+        let mut live = 0;
+        for context in &self.contexts {
+            if context.removed {
+                places.push(None);
+            } else {
+                places.push(Some(live));
+                live += 1;
+            }
+        }
+        // the places that name the contexts are moved
+        for context in self.contexts.iter_mut() {
+            for value in context.data_mut().iter_mut() {
+                if let Value::Context(named) = value {
+                    *named = places[*named].unwrap_or(*named);
+                }
+            }
+            context.parent = context.parent.and_then(|parent| places[parent]);
+            context.prop_setter = context.prop_setter.and_then(|setter| places[setter]);
+            context.prop_getter = context.prop_getter.and_then(|getter| places[getter]);
+            context.super_class_getter =
+                context.super_class_getter.and_then(|getter| places[getter]);
+            for property in context.properties.iter_mut() {
+                property.member = places[property.member].unwrap_or(property.member);
+            }
+        }
+        // the contexts that have left the block are dropped
+        let mut contexts: Vec<Context> = Vec::with_capacity(self.contexts.len());
+        for context in self.contexts.drain(..) {
+            if !context.removed {
+                contexts.push(context);
+            }
+        }
+        self.contexts = contexts;
     }
 
     /// The registration of a context in its parent.
@@ -246,7 +286,23 @@ impl Generator {
             self.contexts[parent].kind,
             ContextType::Function | ContextType::Class
         ) {
-            self.contexts[parent].add_property(name, index);
+            // the member replaces the one with the same name, and the
+            // earlier member's context is released; it leaves the block
+            // when nothing else holds it
+            // (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:943
+            // and :394)
+            let held_by_the_constant_area = kind == ContextType::Function
+                && self.contexts[parent].kind == ContextType::Function;
+            match self.contexts[parent].property_index(&name) {
+                Some(place) => {
+                    let earlier = self.contexts[parent].properties[place].member;
+                    if !held_by_the_constant_area {
+                        self.contexts[earlier].removed = true;
+                    }
+                    self.contexts[parent].properties[place].member = index;
+                }
+                None => self.contexts[parent].add_property(name, index),
+            }
         }
         Ok(())
     }
@@ -262,9 +318,10 @@ impl Generator {
         data: i32,
     ) -> Result<(), CodegenError> {
         let mut frame = self.contexts[parent].frame_base;
-        self.contexts[parent].put_code(opcode::vm::CONST, -1);
-        self.contexts[parent].put_code(opcode::vm_reg_addr(frame), -1);
-        self.contexts[parent].put_code(opcode::vm_reg_addr(data), -1);
+        let position = self.lex_position;
+        self.contexts[parent].put_code(opcode::vm::CONST, position);
+        self.contexts[parent].put_code(opcode::vm_reg_addr(frame), position);
+        self.contexts[parent].put_code(opcode::vm_reg_addr(data), position);
         frame += 1;
         {
             let mut emitter = emit::Emitter::new(&mut self.contexts, parent, self.lex_position);

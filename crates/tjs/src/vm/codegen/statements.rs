@@ -103,8 +103,10 @@ impl crate::vm::codegen::emit::Emitter<'_> {
             let jump_ip = self.context().code_size();
             let start = self.context().nest_at(index).loop_start_ip;
             self.context_mut().add_jump();
-            self.context_mut().put_code(vm::JMP, -1);
-            self.context_mut().put_code(start - jump_ip, -1);
+            let position = self.lex_pos();
+            self.context_mut().put_code(vm::JMP, position);
+            let position = self.lex_pos();
+            self.context_mut().put_code(start - jump_ip, position);
         }
         self.do_nest_top_exit_patch(index);
         self.context_mut().pop_nest();
@@ -153,8 +155,10 @@ impl crate::vm::codegen::emit::Emitter<'_> {
         let size = self.context().code_size();
         self.context_mut().nest_data_mut(index).patch2 = size;
         self.context_mut().add_jump();
-        self.context_mut().put_code(vm::JMP, -1);
-        self.context_mut().put_code(0, -1);
+        let position = self.lex_pos();
+        self.context_mut().put_code(vm::JMP, position);
+        let position = self.lex_pos();
+        self.context_mut().put_code(0, position);
         let previous = self.context().prev_if_exit_patch;
         let size = self.context().code_size();
         self.context_mut().code_mut()[(previous + 1) as usize] = size - previous;
@@ -239,8 +243,10 @@ impl crate::vm::codegen::emit::Emitter<'_> {
         let start = self.context().nest_at(block).loop_start_ip;
         let jump_ip = self.context().code_size();
         self.context_mut().add_jump();
-        self.context_mut().put_code(vm::JMP, -1);
-        self.context_mut().put_code(start - jump_ip, -1);
+        let position = self.lex_pos();
+        self.context_mut().put_code(vm::JMP, position);
+        let position = self.lex_pos();
+        self.context_mut().put_code(start - jump_ip, position);
 
         // the block's exit patches, then the loop's
         self.do_nest_top_exit_patch(block);
@@ -347,8 +353,10 @@ impl crate::vm::codegen::emit::Emitter<'_> {
         if !nest.is_first_case {
             patch3 = self.context().code_size();
             self.context_mut().add_jump();
-            self.context_mut().put_code(vm::JMP, -1);
-            self.context_mut().put_code(0, -1);
+            let position = self.lex_pos();
+            self.context_mut().put_code(vm::JMP, position);
+            let position = self.lex_pos();
+            self.context_mut().put_code(0, position);
         }
 
         self.exit_block();
@@ -383,8 +391,10 @@ impl crate::vm::codegen::emit::Emitter<'_> {
                 let size = self.context().code_size();
                 self.context_mut().nest_data_mut(switch).patch1 = size;
                 self.context_mut().add_jump();
-                self.context_mut().put_code(vm::JMP, -1);
-                self.context_mut().put_code(0, -1);
+                let position = self.lex_pos();
+                self.context_mut().put_code(vm::JMP, position);
+                let position = self.lex_pos();
+                self.context_mut().put_code(0, position);
                 let size = self.context().code_size();
                 self.context_mut().nest_data_mut(switch).patch2 = size;
             }
@@ -474,12 +484,15 @@ impl crate::vm::codegen::emit::Emitter<'_> {
                         .exit_patches
                         .push(size);
                     self.context_mut().add_jump();
-                    self.context_mut().put_code(vm::JMP, -1);
-                    self.context_mut().put_code(0, -1);
+                    let position = self.lex_pos();
+                    self.context_mut().put_code(vm::JMP, position);
+                    let position = self.lex_pos();
+                    self.context_mut().put_code(0, position);
                     return Ok(());
                 }
                 NestKind::Try => {
-                    self.context_mut().put_code(vm::EXTRY, -1);
+                    let position = self.lex_pos();
+                    self.context_mut().put_code(vm::EXTRY, position);
                 }
                 _ => {}
             }
@@ -500,8 +513,10 @@ impl crate::vm::codegen::emit::Emitter<'_> {
                     let jump_start = self.context().code_size();
                     let start = nest.loop_start_ip;
                     self.context_mut().add_jump();
-                    self.context_mut().put_code(vm::JMP, -1);
-                    self.context_mut().put_code(start - jump_start, -1);
+                    let position = self.lex_pos();
+                    self.context_mut().put_code(vm::JMP, position);
+                    let position = self.lex_pos();
+                    self.context_mut().put_code(start - jump_start, position);
                     return Ok(());
                 }
                 NestKind::DoWhile | NestKind::For => {
@@ -513,12 +528,15 @@ impl crate::vm::codegen::emit::Emitter<'_> {
                         .continue_patches
                         .push(size);
                     self.context_mut().add_jump();
-                    self.context_mut().put_code(vm::JMP, -1);
-                    self.context_mut().put_code(0, -1);
+                    let position = self.lex_pos();
+                    self.context_mut().put_code(vm::JMP, position);
+                    let position = self.lex_pos();
+                    self.context_mut().put_code(0, position);
                     return Ok(());
                 }
                 NestKind::Try => {
-                    self.context_mut().put_code(vm::EXTRY, -1);
+                    let position = self.lex_pos();
+                    self.context_mut().put_code(vm::EXTRY, position);
                 }
                 _ => {}
             }
@@ -530,7 +548,8 @@ impl crate::vm::codegen::emit::Emitter<'_> {
 
     /// The code of a `debugger` statement.
     pub fn do_debugger(&mut self) {
-        self.context_mut().put_code(vm::DEBUGGER, -1);
+        let position = self.lex_pos();
+        self.context_mut().put_code(vm::DEBUGGER, position);
     }
 
     /// The code of a `return`.
@@ -566,10 +585,12 @@ impl crate::vm::codegen::emit::Emitter<'_> {
         let nests = self.context().nest_len();
         for index in (0..nests).rev() {
             if self.context().nest_at(index).kind == NestKind::Try {
-                self.context_mut().put_code(vm::EXTRY, -1);
+                let position = self.lex_pos();
+                self.context_mut().put_code(vm::EXTRY, position);
             }
         }
-        self.context_mut().put_code(vm::RET, node_pos);
+        let position = self.lex_pos();
+        self.context_mut().put_code(vm::RET, position);
         Ok(())
     }
 
@@ -594,11 +615,14 @@ impl crate::vm::codegen::emit::Emitter<'_> {
         let size = self.context().code_size();
         self.context_mut().nest_data_mut(index).patch1 = size;
         self.context_mut().add_jump();
-        self.context_mut().put_code(vm::ENTRY, -1);
-        self.context_mut().put_code(0, -1);
+        let position = self.lex_pos();
+        self.context_mut().put_code(vm::ENTRY, position);
+        let position = self.lex_pos();
+        self.context_mut().put_code(0, position);
         let frame_base = self.context().frame_base;
+        let position = self.lex_pos();
         self.context_mut()
-            .put_code(opcode::vm_reg_addr(frame_base), -1);
+            .put_code(opcode::vm_reg_addr(frame_base), position);
         if frame_base > self.context().max_frame_count {
             self.context_mut().max_frame_count = frame_base;
         }
@@ -606,13 +630,16 @@ impl crate::vm::codegen::emit::Emitter<'_> {
 
     /// Opens the `catch` of a `try`.
     pub fn enter_catch_code(&mut self, name: Option<&str>) -> Result<(), EmitError> {
-        self.context_mut().put_code(vm::EXTRY, -1);
+        let position = self.lex_pos();
+        self.context_mut().put_code(vm::EXTRY, position);
         let index = self.context().nest_len() - 1;
         let size = self.context().code_size();
         self.context_mut().nest_data_mut(index).patch2 = size;
         self.context_mut().add_jump();
-        self.context_mut().put_code(vm::JMP, -1);
-        self.context_mut().put_code(0, -1);
+        let position = self.lex_pos();
+        self.context_mut().put_code(vm::JMP, position);
+        let position = self.lex_pos();
+        self.context_mut().put_code(0, position);
 
         let patch1 = self.context().nest_at(index).patch1;
         let size = self.context().code_size();
