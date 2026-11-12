@@ -334,24 +334,28 @@ impl ArchiveRange {
     /// read wait for it. A failed read is reported to every caller, and the
     /// range is not read twice.
     fn load(&self, fs: &FileSystem, file: &FileState) -> Result<Arc<[u8]>, StorageReadError> {
-        let mut state = lock(&self.state);
-        loop {
-            // Whether this caller is the one that reads the range.
-            let elect = match &*state {
-                RangeState::Ready(bytes) => return Ok(Arc::clone(bytes)),
-                RangeState::Failed(error) => return Err(error.clone()),
-                RangeState::Reading { reader } => !*reader,
-            };
-            if elect {
-                // This caller reads the range.
-                *state = RangeState::Reading { reader: true };
-                break;
+        // The election is taken in a scope of its own, so the lock is
+        // released before the range is read: the callers that wait for it
+        // wake up when the result is published, and the reader does not hold
+        // the lock the publication needs.
+        {
+            let mut state = lock(&self.state);
+            loop {
+                // Whether this caller is the one that reads the range.
+                let elect = match &*state {
+                    RangeState::Ready(bytes) => return Ok(Arc::clone(bytes)),
+                    RangeState::Failed(error) => return Err(error.clone()),
+                    RangeState::Reading { reader } => !*reader,
+                };
+                if elect {
+                    // This caller reads the range.
+                    *state = RangeState::Reading { reader: true };
+                    break;
+                }
+                // Another caller reads the range: wait for it.
+                state = wait(&self.ready, state);
             }
-            // Another caller reads the range: wait for it.
-            state = wait(&self.ready, state);
         }
-        // The lock is released while the range is read, so the callers that
-        // wait for it wake up when the result is published.
         match read_range(fs, file, self.start, self.len) {
             Ok(bytes) => {
                 let bytes: Arc<[u8]> = Arc::from(bytes);
