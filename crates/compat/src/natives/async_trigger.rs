@@ -17,6 +17,12 @@
 //! the `cached`/`mode` flags and the object itself (for `onFire` dispatch),
 //! plus a FIFO of scheduled fires. No process global is used.
 //!
+//! The FIFO is a vector of slots: a fire that was dropped leaves its slot
+//! empty, so the fires around it keep the order they were posted in. Every
+//! trigger reaches its own slots through a chain of slot positions, so
+//! dropping one trigger's fires costs what that trigger has pending, not
+//! what every trigger has pending.
+//!
 //! # Ported semantics
 //!
 //! * The constructor is `AsyncTrigger(action [, actionName])`. An empty name
@@ -94,6 +100,10 @@ struct PendingTrigger {
     id: AsyncTriggerId,
     /// A strong reference to the source object while the fire is queued.
     owner: Option<DetachedValue>,
+    /// The next pending fire of the same trigger, as a position in
+    /// [`AsyncTriggerState::pending`]. The link lets a trigger reach its own
+    /// fires without a walk over the whole queue.
+    next_same: Option<usize>,
 }
 
 /// The `AsyncTrigger` registry: one entry per live object plus the FIFO of
@@ -112,7 +122,14 @@ struct AsyncTriggerState {
     /// Scheduled fires in `trigger()` order. A `cached` object appears at
     /// most once. Each entry retains its source object until delivery, like
     /// the reference event queue.
-    pending: Vec<PendingTrigger>,
+    /// A dropped fire leaves its slot empty, so the fires around it keep the
+    /// order they were posted in.
+    pending: Vec<Option<PendingTrigger>>,
+    /// The pending fires of each trigger, chained through
+    /// [`PendingTrigger::next_same`]: the value is the position of one of
+    /// that trigger's own fires in `pending`. Only a trigger with a pending
+    /// fire is in this table.
+    chains: Map<AsyncTriggerId, usize>,
 }
 
 /// Typed `AsyncTrigger` failures.
@@ -160,9 +177,37 @@ impl AsyncTriggerState {
     /// Remove `id` and drop every scheduled fire for it.
     fn remove(&mut self, id: AsyncTriggerId) -> Result<(), AsyncTriggerError> {
         self.binding(id)?;
+        self.drop_pending(id);
         self.triggers.remove(&id);
-        self.pending.retain(|pending| pending.id != id);
         Ok(())
+    }
+
+    /// Drop the pending fires `id` scheduled.
+    ///
+    /// The chain reaches that trigger's own fires only, so the walk costs
+    /// what that trigger has pending, not what every trigger has pending.
+    /// The fires around them keep the order they were posted in.
+    fn drop_pending(&mut self, id: AsyncTriggerId) {
+        let mut cursor = self.chains.remove(&id);
+        while let Some(position) = cursor {
+            // The chain links positions this state created, so the slot is
+            // there; taking it drops the retained source object.
+            cursor = self.pending[position]
+                .take()
+                .and_then(|fire| fire.next_same);
+        }
+    }
+
+    /// Queue a fire for `id` at the end of the delivery order.
+    fn post(&mut self, id: AsyncTriggerId, owner: Option<DetachedValue>) {
+        let position = self.pending.len();
+        let next_same = self.chains.get(&id).copied();
+        self.pending.push(Some(PendingTrigger {
+            id,
+            owner,
+            next_same,
+        }));
+        self.chains.insert(id, position);
     }
 
     /// Schedule `id`'s `onFire`; returns `false` when the entry is gone (an
@@ -178,9 +223,9 @@ impl AsyncTriggerState {
             return false;
         }
         if cached {
-            self.pending.retain(|pending| pending.id != id);
+            self.drop_pending(id);
         }
-        self.pending.push(PendingTrigger { id, owner });
+        self.post(id, owner);
         true
     }
 
@@ -189,7 +234,7 @@ impl AsyncTriggerState {
     /// reference also treats as a silent no-op (`if(Owner)` guard).
     fn cancel(&mut self, id: AsyncTriggerId) -> bool {
         let known = self.triggers.contains_key(&id);
-        self.pending.retain(|pending| pending.id != id);
+        self.drop_pending(id);
         known
     }
 
@@ -197,7 +242,7 @@ impl AsyncTriggerState {
     /// `SetCached`/`SetMode` (`EventIntf.cpp:1076`, `1086`), valid for any
     /// entry state (a gone entry has no pending fires anyway).
     fn cancel_pending(&mut self, id: AsyncTriggerId) {
-        self.pending.retain(|pending| pending.id != id);
+        self.drop_pending(id);
     }
 
     /// Take the fires scheduled for this poll, leaving the queue empty.
@@ -206,7 +251,11 @@ impl AsyncTriggerState {
     /// and are therefore deferred to the next poll instead of re-entering the
     /// VM mid-dispatch.
     fn take_pending(&mut self) -> Vec<PendingTrigger> {
-        std::mem::take(&mut self.pending)
+        let slots = std::mem::take(&mut self.pending);
+        self.chains.clear();
+        let mut fires = Vec::with_capacity(slots.len());
+        fires.extend(slots.into_iter().flatten());
+        fires
     }
 }
 

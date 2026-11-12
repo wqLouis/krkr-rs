@@ -392,3 +392,134 @@ fn the_fired_event_is_the_reference_event_dictionary() {
         "the event object is a dictionary of the VM's dictionary class (`EventIntf.cpp:714`)"
     );
 }
+
+/// The reference posts a fire at the end of the event queue
+/// (`TVPPostEvent` pushes onto `TVPEventQueue`,
+/// `reference/cpp/core/base/EventIntf.cpp:255-257`) and delivers the queued
+/// events from the front of the queue (`_TVPDeliverEventByPrio`,
+/// `reference/cpp/core/base/EventIntf.cpp:396-424`). Three triggers that fire
+/// in turn are therefore delivered in that order.
+#[test]
+fn pending_fires_are_delivered_in_the_order_they_were_posted() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var order = ''; \
+         var a = new AsyncTrigger(function(){ order += 'a'; }, ''); \
+         var b = new AsyncTrigger(function(){ order += 'b'; }, ''); \
+         var c = new AsyncTrigger(function(){ order += 'c'; }, ''); \
+         a.trigger(); b.trigger(); c.trigger();",
+    );
+    env.poll();
+    assert_eq!(
+        env.eval("order"),
+        TjsValue::String("abc".to_string()),
+        "the fires are delivered in the order they were posted"
+    );
+}
+
+/// `TVPCancelSourceEvents` removes only the queued events whose source is
+/// that object (`reference/cpp/core/base/EventIntf.cpp:358-371`); the fires
+/// of the other objects keep their place in the queue.
+#[test]
+fn cancelling_one_trigger_leaves_the_other_fires_in_order() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var order = ''; \
+         var a = new AsyncTrigger(function(){ order += 'a'; }, ''); \
+         var b = new AsyncTrigger(function(){ order += 'b'; }, ''); \
+         var c = new AsyncTrigger(function(){ order += 'c'; }, ''); \
+         a.trigger(); b.trigger(); c.trigger(); b.cancel();",
+    );
+    env.poll();
+    assert_eq!(
+        env.eval("order"),
+        TjsValue::String("ac".to_string()),
+        "a cancelled fire leaves the fires around it in order"
+    );
+}
+
+/// `Trigger()` cancels the object's own undelivered events and posts a new
+/// one (`reference/cpp/core/base/EventIntf.cpp:1043-1060`), so the
+/// re-triggered fire is delivered after the fires posted in between.
+#[test]
+fn a_cached_re_trigger_moves_the_fire_to_the_end_of_the_queue() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var order = ''; \
+         var a = new AsyncTrigger(function(){ order += 'a'; }, ''); \
+         var b = new AsyncTrigger(function(){ order += 'b'; }, ''); \
+         a.trigger(); b.trigger(); a.trigger();",
+    );
+    env.poll();
+    assert_eq!(
+        env.eval("order"),
+        TjsValue::String("ba".to_string()),
+        "the re-triggered fire is delivered last"
+    );
+}
+
+/// With `cached = false` the reference posts one event per `trigger()` and
+/// cancels nothing (`reference/cpp/core/base/EventIntf.cpp:1046-1050`), so
+/// the fires of one trigger keep their place among the other fires.
+#[test]
+fn an_uncached_trigger_keeps_every_fire_in_order() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var order = ''; \
+         var a = new AsyncTrigger(function(){ order += 'a'; }, ''); \
+         var b = new AsyncTrigger(function(){ order += 'b'; }, ''); \
+         a.cached = false; a.trigger(); b.trigger(); a.trigger();",
+    );
+    env.poll();
+    assert_eq!(
+        env.eval("order"),
+        TjsValue::String("aba".to_string()),
+        "every fire of an uncached trigger is delivered, in order"
+    );
+}
+
+/// Cancelling an uncached trigger drops all of its own fires and none of the
+/// other trigger's fires (`TVPCancelSourceEvents`,
+/// `reference/cpp/core/base/EventIntf.cpp:358-371`).
+#[test]
+fn cancelling_an_uncached_trigger_drops_all_of_its_fires() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var order = ''; \
+         var a = new AsyncTrigger(function(){ order += 'a'; }, ''); \
+         var b = new AsyncTrigger(function(){ order += 'b'; }, ''); \
+         a.cached = false; a.trigger(); b.trigger(); a.trigger(); b.cancel();",
+    );
+    env.poll();
+    assert_eq!(
+        env.eval("order"),
+        TjsValue::String("aa".to_string()),
+        "the cancelled trigger's own fires are gone, the other one is not"
+    );
+}
+
+/// `Invalidate()` cancels the object's own queued events
+/// (`reference/cpp/core/base/EventIntf.cpp:1032-1039`); the fires of the
+/// other objects stay in the queue.
+#[test]
+fn invalidating_one_trigger_leaves_the_other_fires_in_order() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var order = ''; \
+         var a = new AsyncTrigger(function(){ order += 'a'; }, ''); \
+         var b = new AsyncTrigger(function(){ order += 'b'; }, ''); \
+         a.trigger(); b.trigger(); invalidate a;",
+    );
+    env.poll();
+    assert_eq!(
+        env.eval("order"),
+        TjsValue::String("b".to_string()),
+        "an invalidated trigger's fire is gone, the other one is not"
+    );
+}
