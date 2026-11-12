@@ -2499,6 +2499,11 @@ impl Storage {
     /// was asked for, so the read that follows finds them there and waits
     /// for nothing but its own entry.
     ///
+    /// Only the decode is scheduled here. The extraction filter transforms
+    /// the decoded bytes when they are handed out, on the thread that asked
+    /// for them, so an installed filter does not stop the entries from
+    /// being decoded in parallel.
+    ///
     /// A name that does not resolve, that names a disk file or that belongs
     /// to a media provider is left to the caller: this schedules the reads it
     /// can serve and never waits for them.
@@ -2511,11 +2516,6 @@ impl Storage {
             // Without a pool the entries are read on the calling thread.
             return Ok(());
         };
-        // The extraction filter is script code: it runs on the thread that
-        // asked for the bytes, never on a worker.
-        if self.xp3_extraction_filter.is_some() {
-            return Ok(());
-        }
         // The entries of one archive, in the order they were named.
         let mut groups: Vec<(PathBuf, Vec<(String, Entry)>)> = Vec::new();
         for name in names {

@@ -138,6 +138,10 @@ that follows finds them there and waits for nothing but its own entry. A
 name that does not resolve, that names a disk file or that belongs to a
 media provider is left to the caller.
 
+Only the decode is scheduled. The extraction filter transforms the decoded
+bytes when they are handed out, on the thread that asked for them, so an
+installed filter does not stop the entries from being decoded in parallel.
+
 The storage's `read_pool` field is public: the composition root installs the
 pool there, and the engine drains the same pool every frame.
 

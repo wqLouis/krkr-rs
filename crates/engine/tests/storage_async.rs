@@ -458,6 +458,105 @@ fn a_filtered_read_decodes_on_the_pool_and_filters_on_the_calling_thread() {
     );
 }
 
+/// A shared read decodes the entries of one archive in parallel, and the
+/// extraction filter still transforms the decoded bytes once per entry, on
+/// the thread that asked for them.
+///
+/// The shared read schedules the decode; the filter is the second stage, and
+/// it runs when the bytes are handed out. The reference applies the filter to
+/// the decoded bytes of an entry as it reads them
+/// (`reference/cpp/core/archive/xp3/XP3Archive.cpp:973-1004`), so the filter
+/// never sees the stored ones — the shared read hands the filter the same
+/// decoded bytes an individual read does.
+#[test]
+fn a_shared_read_filters_every_entry_on_the_calling_thread() {
+    let key = 0x5Au8;
+    let plains: [&[u8]; 3] = [b"first entry", b"second entry", b"third entry"];
+    let ciphers: Vec<Vec<u8>> = plains
+        .iter()
+        .map(|bytes| bytes.iter().map(|byte| byte ^ key).collect())
+        .collect();
+    let xp3 = build_xp3(&[
+        ("data/one.bin", &ciphers[0], false),
+        ("data/two.bin", &ciphers[1], false),
+        ("data/three.bin", &ciphers[2], false),
+    ]);
+
+    let reader = Arc::new(ThreadRecordingReader::new());
+    let pool = Arc::new(StorageReadPool::new(reader.clone(), config(3)).expect("pool"));
+    let mut storage = storage_with_pool(&pool, &[("data.xp3", xp3.as_slice())], &["data.xp3"]);
+    // The filter records the entry it transforms and the thread it ran on.
+    let calls: Rc<RefCell<Vec<(String, thread::ThreadId)>>> = Rc::new(RefCell::new(Vec::new()));
+    let calls_in_filter = Rc::clone(&calls);
+    storage.xp3_extraction_filter = Some(Box::new(
+        move |_hash: u32,
+              _offset: u64,
+              buffer: &mut [u8],
+              file_name: &str,
+              _archive_name: &str,
+              _file_size: u64| {
+            calls_in_filter
+                .borrow_mut()
+                .push((file_name.to_string(), thread::current().id()));
+            for byte in buffer.iter_mut() {
+                *byte ^= key;
+            }
+        },
+    ));
+
+    let names = vec![
+        "data/one.bin".to_string(),
+        "data/two.bin".to_string(),
+        "data/three.bin".to_string(),
+    ];
+    storage
+        .read_entries_together(&names)
+        .expect("schedule the shared read");
+    // The shared read scheduled the decode of every entry: the pool holds one
+    // read per entry, and none of them has been handed out yet.
+    assert_eq!(
+        pool.pending_count(),
+        3,
+        "the shared read scheduled every entry's decode"
+    );
+
+    for (name, plain) in names.iter().zip(plains.iter()) {
+        assert_eq!(
+            storage.read(name).expect("read the entry"),
+            *plain,
+            "the shared read hands out the filtered bytes"
+        );
+    }
+
+    // The filter ran once per entry — every entry has one segment — and it
+    // ran on the thread that asked for the bytes.
+    let recorded = calls.borrow();
+    assert_eq!(recorded.len(), 3, "the filter ran once per entry");
+    let mut filtered: Vec<&str> = recorded.iter().map(|(name, _)| name.as_str()).collect();
+    filtered.sort_unstable();
+    assert_eq!(
+        filtered,
+        ["data/one.bin", "data/three.bin", "data/two.bin"],
+        "the filter ran once for every entry"
+    );
+    assert!(
+        recorded
+            .iter()
+            .all(|(_, filter_thread)| *filter_thread == thread::current().id()),
+        "the filter ran on the thread that asked for the bytes"
+    );
+
+    // The decodes ran on the pool's workers, not on the calling thread.
+    let decode_threads = reader.threads();
+    assert_eq!(decode_threads.len(), 3, "the pool ran one decode per entry");
+    assert!(
+        decode_threads
+            .iter()
+            .all(|decode_thread| *decode_thread != thread::current().id()),
+        "the decodes ran off the calling thread"
+    );
+}
+
 /// The frame drains the finished reads: the read the previous frame
 /// scheduled is published before the next frame's script runs.
 #[test]

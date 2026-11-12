@@ -13,11 +13,13 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::vm_lock;
 use compat::CompatHost;
 use engine::Storage;
+use engine::storage::{FileSystemReader, StoragePoolConfig, StorageReadPool};
 use fs::FileSystem;
 use fs::xp3::{SEGM_ENCODE_RAW, XP3_MAGIC};
 use tjs::{Tjs2Engine, TjsValue};
@@ -388,6 +390,101 @@ fn content_filter_runs_without_an_extraction_filter() {
             .eval("global.__content_arg_types", "xp3-filter-test")
             .expect("content argument types"),
         tjs::TjsValue::String("String,String,Integer".into())
+    );
+}
+
+// A shared read decodes the entries of one archive in parallel, and the
+// plugin's filters still run once per entry.
+//
+// The reference calls the content filter once per archive entry, when the
+// entry's stream is opened
+// (`reference/cpp/core/archive/xp3/XP3Archive.cpp:563-565`), and the
+// extraction filter once per decoded chunk
+// (`reference/cpp/plugins/xp3filter.cpp:493-530`). The port runs both when
+// the decoded bytes are handed out, on the thread that asked for them, so a
+// shared read — which decodes the entries in parallel — still runs them once
+// per entry.
+#[test]
+fn a_shared_read_runs_the_filters_once_per_entry() {
+    let _lock = vm_lock();
+    let key = 0x5Au8;
+    let plains: [&[u8]; 3] = [b"first entry", b"second entry", b"third entry"];
+    let ciphers: Vec<Vec<u8>> = plains
+        .iter()
+        .map(|bytes| bytes.iter().map(|byte| byte ^ key).collect())
+        .collect();
+    let script = format!(
+        "global.__content_calls = 0;\n\
+         global.__content_names = '';\n\
+         function xp3content(filepath, archivename, filesize) {{\n\
+         \x20\x20global.__content_calls = global.__content_calls + 1;\n\
+         \x20\x20global.__content_names = global.__content_names + filepath + ';';\n\
+         \x20\x20return [0, 1];\n\
+         }}\n\
+         function xp3extract(file_hash, offset, buffer, buffer_size, file_name, ctx) {{\n\
+         \x20\x20for (var i = 0; i < buffer_size; i++) buffer[i] = buffer[i] ^ {key};\n\
+         }}\n\
+         Storages.setXP3ArchiveContentFilter(xp3content);\n\
+         Storages.setXP3ArchiveExtractionFilter(xp3extract);\n"
+    );
+
+    let mut env = Env::new(&script);
+    env.write(
+        "data.xp3",
+        &build_xp3(&[
+            ("data/one.bin", &ciphers[0]),
+            ("data/two.bin", &ciphers[1]),
+            ("data/three.bin", &ciphers[2]),
+        ]),
+    );
+    env.mount("data.xp3");
+    // The storage reads its entries on a pool, so the shared read has
+    // somewhere to schedule the decodes.
+    let pool = StorageReadPool::new(Arc::new(FileSystemReader), StoragePoolConfig::default())
+        .expect("start the read pool");
+    env.storage.read_pool = Some(Arc::new(pool));
+
+    let names = vec![
+        "data/one.bin".to_string(),
+        "data/two.bin".to_string(),
+        "data/three.bin".to_string(),
+    ];
+    env.storage
+        .read_entries_together(&names)
+        .expect("schedule the shared read");
+    // The shared read scheduled the decode of every entry: the pool holds
+    // one read per entry, and none of them has been handed out yet.
+    assert_eq!(
+        env.storage
+            .read_pool
+            .as_ref()
+            .expect("the read pool")
+            .pending_count(),
+        3,
+        "the shared read scheduled every entry's decode"
+    );
+
+    for (name, plain) in names.iter().zip(plains.iter()) {
+        assert_eq!(
+            env.storage.read(name).expect("read the entry"),
+            *plain,
+            "the shared read hands out the filtered bytes"
+        );
+    }
+
+    // The content filter ran once for every entry, and the extraction filter
+    // decrypted every entry.
+    assert_eq!(
+        env.engine
+            .eval("global.__content_calls", "xp3-filter-test")
+            .expect("content call counter"),
+        TjsValue::Integer(3)
+    );
+    assert_eq!(
+        env.engine
+            .eval("global.__content_names", "xp3-filter-test")
+            .expect("content call names"),
+        TjsValue::String("data/one.bin;data/two.bin;data/three.bin;".into())
     );
 }
 
