@@ -99,6 +99,17 @@ namespace TJS {
         void PopContextStack();
         void Parse(const tjs_char *script, bool isexpr, bool resultneeded);
 
+        // PROOF INSTRUMENT (not part of the shipped tree): the compiler's
+        // own path, for the comparison with the adapter's.
+        void ParseReference(const tjs_char *script, bool isexpr,
+                            bool resultneeded);
+
+        // PROOF INSTRUMENT (not part of the shipped tree): the contexts of
+        // the block, in the block's order.
+        const std::list<tTJSInterCodeContext *> &GetContextList() const {
+            return InterCodeContextList;
+        }
+
         void SetFirstError(const tjs_char *error, tjs_int pos);
 
         tTJSLexicalAnalyzer *GetLexicalAnalyzer() { return LexicalAnalyzer; }
@@ -119,6 +130,17 @@ namespace TJS {
 
     private:
         static void ConsoleOutput(const tjs_char *msg, void *data);
+
+        // Builds the block's contexts from the image the compiler made.
+        //
+        // The image is the compiler's description of the block: the code
+        // stream, the constant area, the source positions and the relations
+        // of every context. The contexts are built from it, their buffers are
+        // copied out of it, and the two indirections the image cannot carry
+        // are resolved: the constants that hold a context, and the members a
+        // context contributes to its parent.
+        void BuildFromRustImage(const tjs_char *script, bool isexpr,
+                                bool resultneeded);
 
         // for Bytecode
         static const int BYTECODE_TAG_SIZE = 4;

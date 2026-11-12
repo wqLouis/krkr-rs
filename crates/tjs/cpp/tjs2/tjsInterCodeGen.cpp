@@ -937,6 +937,21 @@ namespace TJS // following is in the namespace
 
         if(Parent->ContextType == ctFunction ||
            Parent->ContextType == ctClass) {
+            RegisterMember();
+        }
+    }
+
+    //---------------------------------------------------------------------------
+    void tTJSInterCodeContext::RegisterMember() {
+        // The registration of this context as a member of its parent: the
+        // list the bytecode export writes, and the member on the parent's
+        // object.
+        //
+        // The reference's RegisterFunction does this at the end of its
+        // work; the parts that generate code are the image's, so this is
+        // the part that touches the objects.
+        if(Parent->ContextType == ctFunction ||
+           Parent->ContextType == ctClass) {
             if(IsBytecodeCompile) { // for bytecode export
                 if(Properties == nullptr)
                     Properties = new std::vector<tProperty *>();

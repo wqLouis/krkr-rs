@@ -13,6 +13,7 @@
 #define tjsH
 
 #include <vector>
+#include <utility>
 #include "tjsConfig.h"
 #include "tjsVariant.h"
 #include "tjsInterface.h"
@@ -172,6 +173,11 @@ namespace TJS {
         void SetPPValue(const tjs_char *name, tjs_int32 value);
 
         tjs_int32 GetPPValue(const tjs_char *name);
+
+        // The conditional-compilation values: the names and the numbers they
+        // hold. The values outlive a script, so a compile reads them and
+        // writes back the ones it changed.
+        void GetPPValues(std::vector<std::pair<ttstr, tjs_int32>> *values) const;
 
         void DoGarbageCollection();
 

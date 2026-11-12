@@ -436,6 +436,36 @@ namespace TJS {
 
         tjs_uint GetDataSize() const { return DataAreaSize; }
 
+        // PROOF INSTRUMENT (not part of the shipped tree): the buffers and
+        // the counts the comparison reads.
+        const tjs_int32 *GetCodeArea() const { return CodeArea; }
+
+        const tTJSVariant *GetDataArea() const { return DataArea; }
+
+        tjs_int GetMaxVariableCount() const { return MaxVariableCount; }
+
+        tjs_int GetVariableReserveCount() const { return VariableReserveCount; }
+
+        tjs_int GetMaxFrameCount() const { return MaxFrameCount; }
+
+        tjs_int GetFuncDeclArgCount() const { return FuncDeclArgCount; }
+
+        tjs_int GetFuncDeclUnnamedArgArrayBase() const {
+            return FuncDeclUnnamedArgArrayBase;
+        }
+
+        tjs_int GetFuncDeclCollapseBase() const { return FuncDeclCollapseBase; }
+
+        tTJSInterCodeContext *GetParentContext() const { return Parent; }
+
+        tTJSInterCodeContext *GetPropSetterContext() const { return PropSetter; }
+
+        tTJSInterCodeContext *GetPropGetterContext() const { return PropGetter; }
+
+        tTJSInterCodeContext *GetSuperClassGetterContext() const {
+            return SuperClassGetter;
+        }
+
         tjs_int CodePosToSrcPos(tjs_int codepos) const;
 
         tjs_int FindSrcLineStartCodePos(tjs_int codepos) const;
@@ -730,8 +760,7 @@ namespace TJS {
         void SetCodeObject(tTJSInterCodeContext *parent,
                            tTJSInterCodeContext *setter,
                            tTJSInterCodeContext *getter,
-                           tTJSInterCodeContext *superclass) {
-            Parent = parent;
+                           tTJSInterCodeContext *superclass) {            Parent = parent;
             PropSetter = setter;
             if(setter)
                 setter->AddRef();
@@ -744,6 +773,15 @@ namespace TJS {
                 Parent->AddRef();
 #endif // _DEBUG
         }
+
+        // The registration of this context as a member of its parent: the
+        // list the bytecode export writes, and the member on the parent's
+        // object.
+        //
+        // The reference's RegisterFunction does this at the end of its
+        // work; the parts that generate code are the image's, so this is
+        // the part that touches the objects.
+        void RegisterMember();
 
         tTJSInterCodeContext(tTJSScriptBlock *block, const tjs_char *name,
                              tTJSContextType type, tjs_int32 *code,

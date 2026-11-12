@@ -447,6 +447,12 @@ fn main() {
         ));
     }
     println!("cargo:rerun-if-changed={}", tjs2_dir.display());
+    // The seam's header and the C ABI shim live beside the tree; a change
+    // to them must rebuild the C++.
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("cpp").display()
+    );
 
     let bison = env::var("BISON")
         .ok()
@@ -554,6 +560,7 @@ fn main() {
         sources.push(gen_dir.join(format!("{stem}.tab.cpp")));
     }
     sources.push(manifest_dir.join("cpp/tjs2_abi.cpp"));
+    sources.push(manifest_dir.join("cpp/tjs2_proof.cpp"));
     sources.push(manifest_dir.join("cpp/streams.cpp"));
 
     let failed = std::sync::Arc::new(AtomicUsize::new(0));

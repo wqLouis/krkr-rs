@@ -492,6 +492,16 @@ namespace TJS {
     }
 
     //---------------------------------------------------------------------------
+    void tTJS::GetPPValues(
+        std::vector<std::pair<ttstr, tjs_int32>> *values) const {
+        if(!values || !PPValues)
+            return;
+        for(auto it = PPValues->Values.GetFirst(); !it.IsNull(); ++it) {
+            values->push_back(std::make_pair(it.GetKey(), it.GetValue()));
+        }
+    }
+
+    //---------------------------------------------------------------------------
     void tTJS::DoGarbageCollection() {
         // do garbage collection
         TJSVariantArrayStackCompactNow();
