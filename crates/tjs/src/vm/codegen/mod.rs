@@ -181,10 +181,8 @@ impl Generator {
     ///
     /// A member of a class that is registered again under the same name
     /// replaces the earlier one, and the earlier context is released; it
-    /// leaves the block when nothing else holds it
-    /// (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:394). The
-    /// contexts after it move down, and the places that name them move
-    /// with them.
+    /// leaves the block when nothing else holds it. The contexts after it
+    /// move down, and the places that name them move with them.
     fn finalize(&mut self) {
         if !self.contexts.iter().any(|context| context.removed) {
             return;
@@ -289,8 +287,6 @@ impl Generator {
             // the member replaces the one with the same name, and the
             // earlier member's context is released; it leaves the block
             // when nothing else holds it
-            // (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:943
-            // and :394)
             let held_by_the_constant_area = kind == ContextType::Function
                 && self.contexts[parent].kind == ContextType::Function;
             match self.contexts[parent].property_index(&name) {

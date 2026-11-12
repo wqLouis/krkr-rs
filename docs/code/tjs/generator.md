@@ -229,6 +229,9 @@ that prove them cite the same lines.
 | the script columns replace the vendored ones | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp` (the generator being replaced) |
 | the columns replace the vendored tree beside them | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp` |
 | the module root is the front end's door: the compile entry lives there | `reference/krkr2/cpp/core/tjs2/tjsScriptBlock.cpp:421` (the reference's own compile entry) |
+| a member registered again under the same name replaces the earlier one, and the earlier context leaves the block | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:943` (the replacement), `:394` (the release) |
+| the object whose context is changed keeps its sub-type, so the `&` reaches the member access | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:1189-1190` |
+| the ternary's frame is the greater of the two branches' frames, and the then branch's register is returned | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3225-3227` |
 
 ## 3. The proofs the column still owes
 

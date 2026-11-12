@@ -275,8 +275,7 @@ pub struct Context {
     ///
     /// A member of a class that is registered again under the same name
     /// replaces the earlier one, and the earlier context is released; it
-    /// leaves the block when nothing else holds it
-    /// (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:394).
+    /// leaves the block when nothing else holds it.
     pub removed: bool,
     /// The place of the jump the last closed `if` left to be patched.
     pub prev_if_exit_patch: i32,

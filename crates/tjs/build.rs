@@ -77,7 +77,6 @@ const TJS2_SOURCES: &[&str] = &[
     "tjsDisassemble.cpp",
     "tjsDate.cpp",
     "tjsError.cpp",
-    "tjsInterface.cpp",
     "tjsMT19937ar-cok.cpp",
     "tjsArray.cpp",
     "tjsByteCodeLoader.cpp",

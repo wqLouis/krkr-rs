@@ -1208,6 +1208,16 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   or `++`/`--` statement. `docs.old/audits/bytecode-scripts.md` §5,
   `docs.old/vm-defects.md` BLK-3.
 
+* **A change to `crates/tjs/build.rs` forces a fresh staging of the C++
+  dependencies, and the development host's NTFS mount can leave a poisoned
+  file behind.** The staging copies the header-only dependencies into the
+  build directory; one copied file can come back as `Input/output error`,
+  which then fails the staging and cannot be removed. The build is fixed by
+  renaming the build directory aside (`target/debug/build/tjs-<hash>`) and
+  building again: the rename does not touch the entries inside it, and the
+  fresh staging lands in a new directory. The alternative is to build with a
+  target directory on a local filesystem.
+
 ## 13. GPU memory
 
 Open: the config-cycle growth is explained; the fixed descriptor pool is not.

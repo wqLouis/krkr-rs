@@ -126,7 +126,6 @@ impl crate::vm::codegen::emit::Emitter<'_> {
                     return Ok(0);
                 }
                 // the object whose context is changed keeps the sub-type
-                // (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:1189-1190)
                 let mut resaddr1 = self.gen_node_code(frame, node.child(0), RT_NEEDED, param)?;
                 let resaddr2 =
                     self.gen_node_code(frame, node.child(1), RT_NEEDED, SubParam::default())?;
@@ -296,7 +295,6 @@ impl crate::vm::codegen::emit::Emitter<'_> {
                 let size = self.context().code_size();
                 self.context_mut().code_mut()[(address2 + 1) as usize] = size - address2;
                 // the frame is the greater of the two branches'
-                // (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3225-3227)
                 *frame = frame2.max(frame1);
                 Ok(if restype & RT_CFLAG != 0 {
                     GNC_CFLAG
