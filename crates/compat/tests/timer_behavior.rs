@@ -126,6 +126,25 @@ impl Env {
         timer_poll(&mut ctx).expect("timer poll")
     }
 
+    /// Deliver the timers due at the current injected time **without**
+    /// draining the posts they queue.
+    ///
+    /// The frame body drains the queue after the registry advanced
+    /// (`crates/compat/src/frame.rs`), so a test that needs a timer's posts
+    /// to still be queued when the timer fires again drives the two halves
+    /// apart.
+    fn deliver(&self) {
+        let mut timer = self.timer.borrow_mut();
+        let now = timer.now_ms;
+        deliver_due(timer.as_mut(), now);
+    }
+
+    /// Drain the queued `onTimer` posts without delivering new fires.
+    fn drain(&self) -> bool {
+        let mut ctx = self._host.ctx().expect("bound host");
+        timer_poll(&mut ctx).expect("timer poll")
+    }
+
     /// Move the attached registry's injected time forward by `ms` without
     /// polling, so a schedule write lands on this timestamp.
     fn advance(&self, ms: u64) {
@@ -864,6 +883,81 @@ fn capacity_one_bounds_queued_events_not_fires() {
              (0 is the reference no-limit sentinel, TimerIntf.cpp:77)"
         ));
     }
+
+    assert_no_problems(problems);
+}
+
+/// Reference: `tTJSNI_BaseTimer::Fire` posts `min(n, cap - count)` events
+/// (`reference/cpp/core/utils/TimerIntf.cpp:69-92`): `count` is the number of
+/// `onTimer` events **already queued** for that timer
+/// (`TVPCountEventsInQueue`, `TimerIntf.cpp:74`), `cap` is the capacity (the
+/// `0` sentinel reads as 65535, `TimerIntf.cpp:77`), `more = cap - count`
+/// (`TimerIntf.cpp:80`) and the replay is clamped to it
+/// (`TimerIntf.cpp:83-84`).
+///
+/// The port's queue is the compat timer's post queue
+/// (`crates/compat/src/natives/visual/timer.rs`), and the count the clamp
+/// subtracts is the number of posts the timer still has in it. This test pins
+/// that count through the events the script receives:
+///
+/// * the first delivery replays three fires and the capacity (two) bounds
+///   them to two posts;
+/// * the second delivery happens while those two posts are still queued, so
+///   the queue is full (`more == 0`) and the timer posts nothing;
+/// * the drain empties the queue, so the next delivery posts again.
+///
+/// The replay count is the registry's: `n = (curtick - NextTick) / Interval + 1`
+/// (`reference/cpp/core/utils/impl/TimerImpl.cpp:128-139`).
+#[test]
+fn the_capacity_clamp_counts_the_posts_the_timer_still_has_queued() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let mut problems = Vec::new();
+
+    env.run(
+        "var hits = 0; \
+         var t = new Timer(function(){ hits++; }, ''); \
+         t.capacity = 2; \
+         t.interval = 10; \
+         t.enabled = true;",
+    );
+
+    // The first deadline is 10 ms; the frame lands 30 ms later, so the
+    // registry replays the three intervals that passed (three fires) and
+    // the capacity of two bounds them to two posts. The posts wait for the
+    // drain, so the script has seen nothing yet.
+    env.advance(30);
+    env.deliver();
+    check(
+        &mut problems,
+        "events before the drain",
+        env.eval_int("hits"),
+        0,
+    );
+
+    // The next delivery lands on the following deadline while the first
+    // delivery's two posts are still queued: `more = cap - count = 0`, so
+    // the timer posts nothing.
+    env.advance(10);
+    env.deliver();
+    env.drain();
+    check(
+        &mut problems,
+        "events delivered after the queue-full delivery",
+        env.eval_int("hits"),
+        2,
+    );
+
+    // The drain emptied the queue, so the next delivery posts again.
+    env.advance(10);
+    env.deliver();
+    env.drain();
+    check(
+        &mut problems,
+        "events delivered after the queue drained",
+        env.eval_int("hits"),
+        3,
+    );
 
     assert_no_problems(problems);
 }

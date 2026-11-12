@@ -87,6 +87,47 @@ struct TimerPosts {
     pending: Vec<TimerPost>,
     /// Cancellation generation per timer. An absent entry is generation 0.
     generation: Map<TimerId, u64>,
+    /// How many entries of `pending` belong to each timer.
+    ///
+    /// The index is what the capacity clamp asks: how many `onTimer` events
+    /// does this timer still have queued. It is maintained wherever the
+    /// queue changes — a push, a timer's posts being dropped, the drain — so
+    /// it always holds the queue's own count, and a firing timer reads it in
+    /// one lookup instead of walking the whole queue.
+    queued: Map<TimerId, u64>,
+}
+
+impl TimerPosts {
+    /// How many posts `id` has queued.
+    fn queued_for(&self, id: TimerId) -> u64 {
+        self.queued.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Queue `count` posts for `id`.
+    fn push(&mut self, id: TimerId, mode: i64, generation: u64, count: u64) {
+        for _ in 0..count {
+            self.pending.push(TimerPost {
+                id,
+                mode,
+                generation,
+            });
+        }
+        *self.queued.entry(id).or_insert(0) += count;
+    }
+
+    /// Drop every post of `id`, with the count that went with them.
+    fn forget(&mut self, id: TimerId) {
+        self.pending.retain(|post| post.id != id);
+        self.queued.remove(&id);
+    }
+
+    /// Take the whole queue out for delivery.
+    ///
+    /// Nothing is queued any more, so every timer's count starts over.
+    fn take_pending(&mut self) -> Vec<TimerPost> {
+        self.queued.clear();
+        std::mem::take(&mut self.pending)
+    }
 }
 
 /// One queued `onTimer` posting: the timer, the mode captured at fire time,
@@ -121,6 +162,12 @@ fn mode_priority(mode: i64) -> u8 {
 /// suspended for an hour queues at most `cap` postings, not one per interval.
 /// A negative capacity is already expressed by not arming the engine timer
 /// (`sync_schedule`).
+///
+/// The room the capacity leaves is the capacity minus the posts the timer
+/// still has queued, and that count comes from the queue's own index: the
+/// clamp costs one lookup, not a walk over the whole queue, so a frame that
+/// fires a thousand timers pays a thousand lookups and not a million post
+/// reads.
 fn post_on_timer(services: &CompatServices, id: TimerId, fires: u64) {
     let mut posts = services.state::<TimerPosts>();
     let (mode, capacity) = {
@@ -138,19 +185,13 @@ fn post_on_timer(services: &CompatServices, id: TimerId, fires: u64) {
     // `cap` is positive here, so its magnitude is its value and the
     // conversion is total for every capacity that reaches this point.
     let cap = cap.unsigned_abs();
-    let queued = posts.pending.iter().filter(|post| post.id == id).count() as u64;
+    let queued = posts.queued_for(id);
     let count = fires.min(cap.saturating_sub(queued));
     if count == 0 {
         return;
     }
     let generation = posts.generation.get(&id).copied().unwrap_or(0);
-    for _ in 0..count {
-        posts.pending.push(TimerPost {
-            id,
-            mode,
-            generation,
-        });
-    }
+    posts.push(id, mode, generation, count);
 }
 
 /// Bump `id`'s cancellation generation, invalidating every entry already
@@ -165,7 +206,7 @@ fn cancel_pending(services: &CompatServices, id: TimerId) {
 /// accumulate generation entries for ids that can never be reused.
 fn forget_posts(services: &CompatServices, id: TimerId) {
     let mut posts = services.state::<TimerPosts>();
-    posts.pending.retain(|post| post.id != id);
+    posts.forget(id);
     posts.generation.remove(&id);
 }
 
@@ -1074,7 +1115,7 @@ pub(crate) fn timer_posts_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError>
     let services = unsafe { ctx.services() };
     let mut posts = {
         let mut queue = services.state::<TimerPosts>();
-        std::mem::take(&mut queue.pending)
+        queue.take_pending()
     };
     if posts.is_empty() {
         return Ok(false);

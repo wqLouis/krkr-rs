@@ -99,7 +99,7 @@ The families that use it:
 | `MenuState` | `natives/menu_item` | the menu tree nodes |
 | `DebugState` | `natives/debug` | the log ring, the log file, the logging handlers, the console/controller singletons |
 | `ResourceResolver` | `resource.rs` | the text engine, the face cache, the host image codec, the pre-rendered font maps |
-| `TimerPosts` | `natives/visual/timer.rs` | the queued `onTimer` posts and the per-timer cancellation generation |
+| `TimerPosts` | `natives/visual/timer.rs` | the queued `onTimer` posts, the per-timer queued-post count and the per-timer cancellation generation |
 | `InputDispatchState` | `event.rs` | the mouse capture, the touch captures, the enter/leave tracking |
 | `FontMetricsState` | `natives/visual/font.rs` | the per-font `faceIsFileName` flag, the active rasterizer index |
 | `HostFacts` | `host.rs` | the virtual-desktop rectangle provider |

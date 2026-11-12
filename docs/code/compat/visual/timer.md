@@ -180,6 +180,12 @@ the reference's own bound (`more = cap − count`, then
 one step, so a process suspended for hours queues at most `cap` postings
 rather than one per interval.
 
+The `queued` count is the dispatch state's per-timer index: how many posts
+**that** timer still has in the queue. The index is kept where the queue
+changes — a post is queued, a timer's posts are dropped, the queue is drained
+— so a firing timer reads the count in one lookup instead of walking the
+whole queue.
+
 This is the one place the port's bound differs from the reference's: the
 reference's timer thread wakes every interval, so its `n > 40`
 starvation branch is never reached by a slow frame, and it delivers the
@@ -244,7 +250,7 @@ Consequences:
 |---|---|
 | the action owner, the owner handle, the action name, the mode, the capacity, the enabled flag, the armed flag, the interval units | the L3 `TimerBinding` in `VisualState.timers` |
 | the L2 timer id | the L3 `TimerInst` payload |
-| the delivery queue and the per-timer cancellation generation | the L3 `TimerPosts` dispatch state |
+| the delivery queue, the per-timer queued-post count and the per-timer cancellation generation | the L3 `TimerPosts` dispatch state |
 | the interval in milliseconds, the deadline, the generation, the callback, the injected `now_ms` | the L2 `TimerState` |
 
 ---
@@ -287,7 +293,7 @@ only delivers what the advance produced.
 
 | Test | What it asserts |
 |---|---|
-| `crates/compat/tests/timer_behavior.rs` | the constructor arity error and the action-name shapes; the interval default, the real type, the zero interval, the wrapped negative and the re-arm from now; the enabled arming and the cancellation; the capacity default, the verbatim values and the "bounds queued events, not fires" rule; the mode as a priority and not a one-shot switch; the absence of the `count`/`action`/`id` members; the dispatch to the constructor callback, the subclass override winning, a self-disabling override, a re-entrant creation, a self-invalidating callback and a failing callback keeping the timer enabled; the teardown and the creation-order firing. |
+| `crates/compat/tests/timer_behavior.rs` | the constructor arity error and the action-name shapes; the interval default, the real type, the zero interval, the wrapped negative and the re-arm from now; the enabled arming and the cancellation; the capacity default, the verbatim values, the "bounds queued events, not fires" rule and the clamp counting the posts the timer still has queued; the mode as a priority and not a one-shot switch; the absence of the `count`/`action`/`id` members; the dispatch to the constructor callback, the subclass override winning, a self-disabling override, a re-entrant creation, a self-invalidating callback and a failing callback keeping the timer enabled; the teardown and the creation-order firing. |
 | `crates/compat/tests/oop.rs` | `script_override_wins_over_native_on_timer`, `super_native_constructor_produces_a_fully_usable_instance`. |
 | `crates/compat/tests/extend_dispatch.rs` | the subclass override and the capacity rules through the real dispatch path. |
 | `crates/compat/tests/vk_timing.rs` | the delivery a slow frame produces: one `onTimer` per replayed interval, the capacity bounding the postings, a stall past forty intervals still posting the capacity, and a per-timer capacity budget. |
