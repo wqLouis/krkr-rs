@@ -814,7 +814,9 @@ against `rustc -O`), the sides alternated, seven rounds.
 | the Rust analyser + parser + generator | 0.158092 s | 0.158517 s | 3.0 % |
 
 The parser's own share is **0.074666 s**, and the whole native pipeline is
-**1.70× the reference's**.
+**1.70× the reference's**. §6.4 re-measures the same pipeline on the
+shipped path and finds that the absolute Rust figure does not reproduce on
+this machine: the ratio carries over, the number does not.
 
 **The withdrawn figure.** This section reported **19.7×** for the parse and
 **29×** for the parser's own share. Both are withdrawn. The C++ side of that
@@ -903,7 +905,75 @@ and it is one script of the corpus.
 
 **The speed.** The generator's own share is **0.0562 s** against the
 reference's emission budget of 0.114390 s — **49 %** of it. The whole native
-pipeline is 1.70× the reference's (§6.2).
+pipeline is 1.70× the reference's (§6.2); §6.4 measures the shipped path
+against the reference's own compile path.
+
+
+### 6.4 The shipped front end, measured against the reference's own
+
+**This is the measurement the port exists to produce**: the shipped entry
+against the reference's own compile path, over the same corpus, in one
+harness, with the two sides alternating and both at `-O2`. The measured
+state is the tree at `c600b0e`; the tree moved to `bcff290` while the run
+was in flight, and the change between them is the place fix.
+
+| | median | spread |
+|---|---|---|
+| the shipped Rust front end — `tjs2_script_compile` and `tjs2_script_free` | **0.193073 s** | 12.9 % |
+| the reference's own compile path — `tTJSScriptBlock`, `SetSourceText`, `Parse`, destruction | **0.262668 s** | 8.5 % |
+
+**1.356× — the shipped Rust front end is faster than the reference's own.**
+Two quiet ten-round runs gave 1.3563 and 1.3605, with the per-round ratios
+between 1.33 and 1.39. Two further runs were disturbed by load from another
+build on the host; their ratios (1.3525 and 1.1168) are recorded in the
+report rather than dropped.
+
+**Where the time goes on the Rust side.**
+
+| | share |
+|---|---|
+| the analyser | 14.9 % |
+| the parser | 49.2 % |
+| the generator | 31.0 % |
+| the image and the line table the shipped entry adds | **4.9 %** |
+
+The shipped entry is 1.035–1.051× the piece-wise front end, so **the work
+the shipped path adds is not worth working on** — the parser and the
+generator are. The entry's throughput is **890.9 scripts/s** and
+3 089 242 tokens/s, which is 6.7× the cost of its own lexing.
+
+**The published absolute number does not reproduce, and the record says so.**
+The corpus worker's own binary, run on this machine beside the benchmark,
+gives 0.1676–0.1849 s for the piece-wise front end, not the 0.158517 s of
+§6.2. The C++ side reproduces: 0.269762 s there, 0.262668 s here. **The
+ratio carries over; the absolute Rust number does not**, and §6.2's 1.70×
+should be read as the ratio it was, not as a number to reuse.
+
+**The controls.**
+
+* The two sides read the same text: **0 of the 172 scripts differ** in their
+  token count.
+* An A/A run of the harness against itself gives 1.001–1.011.
+* The clock costs 49 ns a reading.
+* **Sensitivity:** the same harness against the vendored C++ rebuilt at
+  `-O0` moves the ratio from 1.36 to 8.65 — the instrument would have seen a
+  large change.
+* Sampling the C++ side by `perf`: the grammar 16 %, the generator 10 %,
+  the analyser 13 %.
+
+**A trap for the integration.** The reference keeps the `@if`/`@set`
+conditional-compilation values **in the engine**. The shipped entry takes
+them and hands them back, and until the harness carried them the two sides
+compiled *different text* — 596 450 tokens against 594 782. With them
+carried, both sides read the same 596 450 tokens, script for script, which
+is the strongest control in the harness. **The host that wires the entry in
+must carry them**, or it will compile blocks the reference skips.
+
+**What the number does not say.** The generator agrees with the reference in
+only 21 of the 172 scripts, so this compares two *different* front ends'
+speed, not two front ends producing the same output. The Rust side also
+fails on `system/mainwindow.tjs`, the `(const)` form, and so does
+slightly less work there.
 
 ---
 
