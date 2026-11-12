@@ -307,8 +307,10 @@ impl crate::vm::codegen::emit::Emitter<'_> {
         if !is_first_case {
             patch3 = self.context().code_size();
             self.context_mut().add_jump();
-            self.context_mut().put_code(vm::JMP, -1);
-            self.context_mut().put_code(0, -1);
+            let position = self.lex_pos();
+            self.context_mut().put_code(vm::JMP, position);
+            let position = self.lex_pos();
+            self.context_mut().put_code(0, position);
         }
         if patch1 != -1 {
             let size = self.context().code_size();
@@ -317,8 +319,10 @@ impl crate::vm::codegen::emit::Emitter<'_> {
         if patch2 != -1 {
             self.context_mut().add_jump();
             let jump_start = self.context().code_size();
-            self.context_mut().put_code(vm::JMP, -1);
-            self.context_mut().put_code(patch2 - jump_start, -1);
+            let position = self.lex_pos();
+            self.context_mut().put_code(vm::JMP, position);
+            let position = self.lex_pos();
+            self.context_mut().put_code(patch2 - jump_start, position);
         }
         if !is_first_case {
             let size = self.context().code_size();
@@ -349,14 +353,14 @@ impl crate::vm::codegen::emit::Emitter<'_> {
         // the switch is three nests below the top
         let switch = nest_size - 3;
         let nest = self.context().nest_at(switch);
+        // the node's place is the place the grammar's rule gives it
+        let node_pos = node.map(|node| node.position).unwrap_or(-1);
         let mut patch3 = -1;
         if !nest.is_first_case {
             patch3 = self.context().code_size();
             self.context_mut().add_jump();
-            let position = self.lex_pos();
-            self.context_mut().put_code(vm::JMP, position);
-            let position = self.lex_pos();
-            self.context_mut().put_code(0, position);
+            self.context_mut().put_code(vm::JMP, node_pos);
+            self.context_mut().put_code(0, node_pos);
         }
 
         self.exit_block();
@@ -391,10 +395,8 @@ impl crate::vm::codegen::emit::Emitter<'_> {
                 let size = self.context().code_size();
                 self.context_mut().nest_data_mut(switch).patch1 = size;
                 self.context_mut().add_jump();
-                let position = self.lex_pos();
-                self.context_mut().put_code(vm::JMP, position);
-                let position = self.lex_pos();
-                self.context_mut().put_code(0, position);
+                self.context_mut().put_code(vm::JMP, node_pos);
+                self.context_mut().put_code(0, node_pos);
                 let size = self.context().code_size();
                 self.context_mut().nest_data_mut(switch).patch2 = size;
             }
@@ -491,8 +493,9 @@ impl crate::vm::codegen::emit::Emitter<'_> {
                     return Ok(());
                 }
                 NestKind::Try => {
-                    let position = self.lex_pos();
-                    self.context_mut().put_code(vm::EXTRY, position);
+                    // the break leaves the try block with an instruction
+                    // that has no place of its own
+                    self.context_mut().put_code(vm::EXTRY, -1);
                 }
                 _ => {}
             }

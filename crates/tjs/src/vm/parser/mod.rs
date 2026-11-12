@@ -1970,28 +1970,32 @@ impl<'a, C: Commands> Parser<'a, C> {
     fn const_inline(&mut self) -> Result<usize, ParseError> {
         self.advance();
         self.expect(TokenKind::RightParenthesis)?;
+        // the grammar makes the node after the bracket is read, so the
+        // node's place is the one just past the bracket
+        let dictionary = match self.peek_kind() {
+            Some(TokenKind::LeftBracket) => false,
+            Some(TokenKind::Percent) => {
+                self.advance();
+                true
+            }
+            _ => return Err(self.syntax_error("'[' or '%'")),
+        };
+        self.expect(TokenKind::LeftBracket)?;
         let position = self.position();
         let index = self.nodes.make_np0(token::T_CONSTVAL, position);
         // the object the grammar builds is one object, and two constant
         // arrays are two objects: the identity tells them apart
         let identity = ObjectId(index as u64);
-        match self.peek_kind() {
-            Some(TokenKind::LeftBracket) => {
-                self.advance();
-                let elements = self.const_array_elm_list()?;
-                self.expect(TokenKind::RightBracket)?;
-                self.nodes
-                    .set_value(index, Value::ConstArray { identity, elements });
-            }
-            Some(TokenKind::Percent) => {
-                self.advance();
-                self.expect(TokenKind::LeftBracket)?;
-                let entries = self.const_dic_elm_list()?;
-                self.expect(TokenKind::RightBracket)?;
-                self.nodes
-                    .set_value(index, Value::ConstDictionary { identity, entries });
-            }
-            _ => return Err(self.syntax_error("'[' or '%'")),
+        if dictionary {
+            let entries = self.const_dic_elm_list()?;
+            self.expect(TokenKind::RightBracket)?;
+            self.nodes
+                .set_value(index, Value::ConstDictionary { identity, entries });
+        } else {
+            let elements = self.const_array_elm_list()?;
+            self.expect(TokenKind::RightBracket)?;
+            self.nodes
+                .set_value(index, Value::ConstArray { identity, elements });
         }
         Ok(index)
     }
