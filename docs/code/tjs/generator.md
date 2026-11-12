@@ -232,9 +232,13 @@ that prove them cite the same lines.
 
 ## 3. The proofs the column still owes
 
-* The corpus comparison: the reference's instruction stream and the
-  column's, word for word, over the game's own scripts. It is not yet
-  proven — the generator's own report carries the residue.
+* The corpus comparison: the reference's image and the column's, field for
+  field, over the game's own scripts. The measure is **identical images**,
+  not equivalent behaviour: the same contexts, the same code words, the
+  same constants, the same variable and argument counts, the same labels,
+  the same source positions. The gate is 172 of the 172 comparable scripts
+  and every context of the real tree. The gate itself is written out in
+  `seam.md` §10.
 * The tests that cite the rules above: each rule in §2 wants a test that
   cites its line. The column's tests are owed; the rules are the
   specification they are written against.

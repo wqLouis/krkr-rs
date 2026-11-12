@@ -1006,3 +1006,27 @@ The differences that bear on this design (the reference wins):
 - [ ] The C++ side runs **no** part of §5.1.
 - [ ] The bytecode export path (`tjs2_compile_script`) still produces a file
       the loader can read back.
+
+## 10. The gate the switch must pass
+
+The switch replaces the reference's own front end with this one, for every
+script the game compiles. A divergence is not a rounding error: the game
+reads the compiled scripts, so a difference in the image is a difference in
+what the game does.
+
+The gate is therefore **identical images**, not equivalent behaviour:
+
+| what | the measure |
+|---|---|
+| the comparable scripts | **172 of 172** compile to the same image: the same contexts, the same code words, the same constants, the same variable and argument counts, the same labels, the same source positions |
+| the real tree | **every context of every script** matches the reference's field for field: the code, the constants, the variable and argument counts, the frame's size, the labels, the member registrations, the relations, the source positions |
+| the constant inline objects | compared on the **materialised** object: the same members, the same order, the same values, and **one shared object** per constant, because the reference builds the object once and every reference to that constant sees that same object |
+| the conditional-compilation values | they round-trip between compiles, so both paths process the same text |
+| the end-to-end test | green |
+
+Identical images give identical behaviour by construction. A field that
+differs is a defect and not a tolerance: it is closed, or the switch does
+not land.
+
+The proof instrument that measures this stays in the tree. It is the
+regression net for the front end that replaces the vendored one.
