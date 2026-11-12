@@ -2,9 +2,8 @@
 //!
 //! The **image** is the Rust side's description of a compiled script
 //! block: the code stream of every context, the constant area, the
-//! variable area, the function-argument area, the labels and the line
-//! table. The records below are its shape: every field is a plain C
-//! type, and every pointer is owned by the image.
+//! labels and the line table. The records below are its shape: every
+//! field is a plain C type, and every pointer is owned by the image.
 //!
 //! The C interface the tree ships is the compile entry, at the module
 //! root (`crate::vm`): it compiles script text and hands the image back.
@@ -71,13 +70,6 @@ pub const TJS2_CG_VALUE_ARRAY: c_int = 8;
 /// builds while it is parsed, one member at a time.
 pub const TJS2_CG_VALUE_DICTIONARY: c_int = 9;
 
-/// The image's number for an ordinary argument.
-pub const TJS2_CG_ARG_NORMAL: c_int = 0;
-/// The image's number for an expanding argument.
-pub const TJS2_CG_ARG_EXPAND: c_int = 1;
-/// The image's number for an unnamed expanding argument.
-pub const TJS2_CG_ARG_UNNAMED_EXPAND: c_int = 2;
-
 /// A value of the constant area.
 ///
 /// The kind says which of the payload fields holds the value.
@@ -116,30 +108,6 @@ pub struct tjs2_codegen_object {
     /// The keys of the elements: the value the member name is made of. It
     /// is null for the elements of an array.
     pub keys: *const tjs2_codegen_value,
-}
-
-/// A local variable of the variable area.
-#[repr(C)]
-pub struct tjs2_codegen_variable {
-    /// The name of the variable.
-    pub name: *const u16,
-    /// The length of the name, in code units.
-    pub name_length: c_int,
-    /// The register the variable holds.
-    pub register_: c_int,
-}
-
-/// One argument of the function-argument area.
-#[repr(C)]
-pub struct tjs2_codegen_func_arg {
-    /// The kind of the argument.
-    pub kind: c_int,
-    /// The register the argument holds.
-    pub register_: c_int,
-    /// The name of the argument.
-    pub name: *const u16,
-    /// The length of the name, in code units.
-    pub name_length: c_int,
 }
 
 /// A place in the script, and the place in the code it names.
@@ -212,17 +180,13 @@ pub struct tjs2_codegen_context {
     pub constants: *const tjs2_codegen_value,
     /// The number of values in the constant area.
     pub constant_count: i32,
-    /// The variable area.
-    pub variables: *const tjs2_codegen_variable,
-    /// The number of variables in the variable area.
+    /// The number of local variables the context's name space held.
     pub variable_count: i32,
     /// The number of registers the context reserves for itself.
     pub variable_reserve_count: i32,
     /// The greatest number of frames the context needs.
     pub max_frame_count: i32,
-    /// The function-argument area.
-    pub func_args: *const tjs2_codegen_func_arg,
-    /// The number of arguments in the function-argument area.
+    /// The number of arguments the context declares.
     pub func_arg_count: i32,
     /// The base of the unnamed argument array.
     pub func_unnamed_arg_base: i32,
@@ -314,10 +278,9 @@ pub struct tjs2_codegen_block {
 /// The image of a script block, and the generator that owns its code.
 ///
 /// The image holds the areas its records point at: the contexts, the
-/// constants, the variables, the arguments, the labels, the lines, the
-/// strings, the octets, the names, the constant objects and the member
-/// registrations. Every pointer in the image points into one of them, so
-/// they live as long as the image does.
+/// constants, the labels, the lines, the strings, the octets, the names,
+/// the constant objects and the member registrations. Every pointer in the
+/// image points into one of them, so they live as long as the image does.
 pub struct Image {
     /// The generator, which owns the code the image points at.
     pub generator: Generator,
@@ -327,10 +290,6 @@ pub struct Image {
     pub contexts: Vec<tjs2_codegen_context>,
     /// The constants of the image.
     pub constants: Vec<tjs2_codegen_value>,
-    /// The variables of the image.
-    pub variables: Vec<tjs2_codegen_variable>,
-    /// The arguments of the image.
-    pub func_args: Vec<tjs2_codegen_func_arg>,
     /// The labels of the image.
     pub labels: Vec<tjs2_codegen_source_pos>,
     /// The lines of the image.
@@ -358,8 +317,6 @@ impl Default for Image {
             block: None,
             contexts: Vec::new(),
             constants: Vec::new(),
-            variables: Vec::new(),
-            func_args: Vec::new(),
             labels: Vec::new(),
             lines: Vec::new(),
             strings: Vec::new(),
@@ -399,8 +356,7 @@ pub(crate) fn c_string(text: &str) -> CString {
 /// Builds the image of the script block.
 ///
 /// The image holds the code stream of every context, the constant area,
-/// the variable area, the function-argument area, the labels and the
-/// line table.
+/// the labels and the line table.
 ///
 /// A panic in the builder is caught, and the panic's text is the error.
 pub(crate) fn build_image(image: &mut Image) -> Result<(), String> {
@@ -408,8 +364,6 @@ pub(crate) fn build_image(image: &mut Image) -> Result<(), String> {
         // the areas are built first, so that the contexts can point at
         // them
         let mut constants: Vec<tjs2_codegen_value> = Vec::new();
-        let mut variables: Vec<tjs2_codegen_variable> = Vec::new();
-        let mut func_args: Vec<tjs2_codegen_func_arg> = Vec::new();
         let mut labels: Vec<tjs2_codegen_source_pos> = Vec::new();
         let mut strings: Vec<Box<[u16]>> = Vec::new();
         let mut octets: Vec<Box<[u8]>> = Vec::new();
@@ -420,8 +374,6 @@ pub(crate) fn build_image(image: &mut Image) -> Result<(), String> {
         let mut object_values: Vec<Box<[tjs2_codegen_value]>> = Vec::new();
         let mut object_keys: Vec<Box<[tjs2_codegen_value]>> = Vec::new();
         let mut context_constants: Vec<(usize, usize)> = Vec::new();
-        let mut context_variables: Vec<(usize, usize)> = Vec::new();
-        let mut context_args: Vec<(usize, usize)> = Vec::new();
         let mut context_labels: Vec<(usize, usize)> = Vec::new();
 
         // the contexts that have left the block are not in the image, and
@@ -455,49 +407,6 @@ pub(crate) fn build_image(image: &mut Image) -> Result<(), String> {
             }
             context_constants.push((constant_base, constants.len() - constant_base));
 
-            // the frame's variable slots: the count is the greatest number
-            // of local variables the context's name space held, and every
-            // slot has a name (the slots that are gone have none)
-            let variable_base = variables.len();
-            let variable_names = context.variable_names();
-            let reserve = context.kind.variable_reserve_count();
-            for index in 0..context.max_variable_count {
-                let name = variable_names
-                    .get(index as usize)
-                    .cloned()
-                    .unwrap_or_default();
-                let units: Vec<u16> = name.encode_utf16().collect();
-                let length = units.len() as c_int;
-                names.push(units.into_boxed_slice());
-                variables.push(tjs2_codegen_variable {
-                    name: std::ptr::null(),
-                    name_length: length,
-                    register_: -index - reserve - 1,
-                });
-            }
-            context_variables.push((variable_base, variables.len() - variable_base));
-
-            // the declared arguments: the count is the number of arguments
-            // the context declares, and every argument has a register
-            let arg_base = func_args.len();
-            let arg_count = context.func_decl_arg_count;
-            for index in 0..arg_count {
-                let name = variable_names
-                    .get(index as usize)
-                    .cloned()
-                    .unwrap_or_default();
-                let units: Vec<u16> = name.encode_utf16().collect();
-                let length = units.len() as c_int;
-                names.push(units.into_boxed_slice());
-                func_args.push(tjs2_codegen_func_arg {
-                    kind: TJS2_CG_ARG_NORMAL,
-                    register_: -3 - index,
-                    name: std::ptr::null(),
-                    name_length: length,
-                });
-            }
-            context_args.push((arg_base, func_args.len() - arg_base));
-
             let label_base = labels.len();
             for label in context.source_positions() {
                 labels.push(tjs2_codegen_source_pos {
@@ -530,14 +439,10 @@ pub(crate) fn build_image(image: &mut Image) -> Result<(), String> {
         }
 
         // the pointers of the areas that the values hold are set when the
-        // values are made; the names of the variables and of the members
-        // are set once the areas will not move again
-        for (index, variable) in variables.iter_mut().enumerate() {
-            variable.name = names[index].as_ptr();
-        }
-        let property_name_base = names.len() - properties.len();
+        // values are made; the names of the members are set once the
+        // names area holds them all
         for (index, property) in properties.iter_mut().enumerate() {
-            property.name = names[property_name_base + index].as_ptr();
+            property.name = names[index].as_ptr();
         }
 
         let mut contexts = Vec::new();
@@ -546,8 +451,6 @@ pub(crate) fn build_image(image: &mut Image) -> Result<(), String> {
                 continue;
             }
             let (constant_base, constant_count) = context_constants[index];
-            let (variable_base, variable_count) = context_variables[index];
-            let (arg_base, arg_count) = context_args[index];
             let (label_base, label_count) = context_labels[index];
             let name = context.name.clone().unwrap_or_default();
             let name_units: Vec<u16> = name.encode_utf16().collect();
@@ -558,12 +461,10 @@ pub(crate) fn build_image(image: &mut Image) -> Result<(), String> {
                 code_size: context.code().len() as c_int,
                 constants: constants.as_ptr().wrapping_add(constant_base),
                 constant_count: constant_count as c_int,
-                variables: variables.as_ptr().wrapping_add(variable_base),
-                variable_count: variable_count as c_int,
+                variable_count: context.max_variable_count,
                 variable_reserve_count: context.kind.variable_reserve_count(),
                 max_frame_count: context.max_frame_count,
-                func_args: func_args.as_ptr().wrapping_add(arg_base),
-                func_arg_count: arg_count as c_int,
+                func_arg_count: context.func_decl_arg_count,
                 func_unnamed_arg_base: context.func_decl_unnamed_arg_array_base,
                 func_collapse_base: context.func_decl_collapse_base,
                 labels: labels.as_ptr().wrapping_add(label_base),
@@ -603,8 +504,6 @@ pub(crate) fn build_image(image: &mut Image) -> Result<(), String> {
 
         image.contexts = contexts;
         image.constants = constants;
-        image.variables = variables;
-        image.func_args = func_args;
         image.labels = labels;
         image.strings = strings;
         image.octets = octets;

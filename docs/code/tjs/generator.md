@@ -4,8 +4,8 @@ Source: `crates/tjs/src/vm/codegen/` · module `tjs::vm::codegen` · L4
 
 The code generator turns the parser's expression tree into the
 **intermediate code** the VM executes: one code stream per context, the
-constant area, the variable area, the function-argument area, the labels
-and the line table. The generator is the third of the three Rust script
+constant area, the labels and the line table, and the variable and argument
+counts beside them. The generator is the third of the three Rust script
 columns (the lexer is the first, the parser the second); the column it
 replaces is `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp`.
 
@@ -206,7 +206,7 @@ that prove them cite the same lines.
 
 | rule | reference |
 |---|---|
-| the image builder's tests are about what the native side reads: the code stream, the constant area, the variable area, the function-argument area, the labels and the line table | `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:862` |
+| the image builder's tests are about what the native side reads: the code stream, the constant area, the variable and argument counts, the labels and the line table | `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:862` |
 | the context closes with the return sequence | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3457-3500` (`ReturnFromFunc`: `SRV`, the value, `RET`) |
 | the context's kind is the reference's number | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:166-175` |
 

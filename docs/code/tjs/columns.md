@@ -63,9 +63,9 @@ is the only thing the C++ side reads.
 
 One entry, one image. The C++ side calls something like *compile this
 script text* and gets back the script block: for every context the code
-array and its size, the constant area, the variable area, the
-function-argument area, the labels and the per-instruction source positions,
-and for the block the line table.
+array and its size, the constant area, the variable and argument counts, the
+labels and the per-instruction source positions, and for the block the line
+table.
 
 The C++ side's obligations are fixed by the reference: it must construct the
 same script block the reference's grammar constructs, and it must not repeat

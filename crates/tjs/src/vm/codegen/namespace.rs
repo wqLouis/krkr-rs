@@ -166,14 +166,4 @@ impl LocalNamespace {
             self.pop();
         }
     }
-
-    /// The names of the local variables, in the order the name space
-    /// holds them.
-    pub fn variable_names(&self) -> Vec<String> {
-        let mut names = Vec::new();
-        for level in &self.levels {
-            names.extend(level.symbols.iter().flatten().cloned());
-        }
-        names
-    }
 }

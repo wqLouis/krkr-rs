@@ -2,8 +2,8 @@
 //!
 //! The image is the shipped interface: the compile entry makes it, and
 //! the C++ side reads it. The tests below read it back the way the C++
-//! side reads it — the code stream, the constant area, the variable
-//! area, the function-argument area, the labels and the line table.
+//! side reads it — the code stream, the constant area, the variable and
+//! argument counts, the labels and the line table.
 //!
 //! The reference's own script block is the oracle for every value read
 //! here, and every assertion below cites the line that defines it.
@@ -101,37 +101,6 @@ fn constants(context: &tjs2_codegen_context) -> &[tjs2_codegen_value] {
     // SAFETY: the constants are the context's own, and they are freed
     // with the handle.
     unsafe { std::slice::from_raw_parts(context.constants, context.constant_count as usize) }
-}
-
-/// The variable area of a context: the register every slot holds.
-fn registers(context: &tjs2_codegen_context) -> Vec<c_int> {
-    if context.variable_count == 0 {
-        return Vec::new();
-    }
-    // SAFETY: the variables are the context's own, and they are freed
-    // with the handle.
-    unsafe {
-        std::slice::from_raw_parts(context.variables, context.variable_count as usize)
-            .iter()
-            .map(|variable| variable.register_)
-            .collect()
-    }
-}
-
-/// The function-argument area of a context: the register every argument
-/// holds.
-fn argument_registers(context: &tjs2_codegen_context) -> Vec<c_int> {
-    if context.func_arg_count == 0 {
-        return Vec::new();
-    }
-    // SAFETY: the arguments are the context's own, and they are freed
-    // with the handle.
-    unsafe {
-        std::slice::from_raw_parts(context.func_args, context.func_arg_count as usize)
-            .iter()
-            .map(|argument| argument.register_)
-            .collect()
-    }
 }
 
 /// The labels of a context: the place in the code and the place in the
@@ -283,22 +252,22 @@ fn the_image_holds_the_line_table() {
     assert_eq!(lines[1].length, 10);
 }
 
-/// The image holds the variable area and the function-argument area of a
+/// The image holds the variable count and the argument count of a
 /// context.
 ///
 /// The reference's context holds the name space's slots in the frame, and
-/// the declared arguments in the registers below them
-/// (`reference/cpp/core/tjs2/tjsInterCodeGen.cpp:3708-3737`,
+/// the declared arguments in the registers below them; the runtime keeps
+/// only the counts (`reference/cpp/core/tjs2/tjsInterCodeGen.cpp:3708-3737`,
 /// `reference/cpp/core/tjs2/tjsNamespace.cpp:156-170`).
 #[test]
-fn the_image_holds_the_variable_and_the_argument_areas() {
+fn the_image_holds_the_variable_and_the_argument_counts() {
     let compiled = Compiled::compile("function f(x) { var y = 1; return x; }");
     let context = context(&compiled, 1);
     assert_eq!(context.kind, TJS2_CG_CONTEXT_FUNCTION);
     // the frame holds the argument's slot and the local variable's
-    assert_eq!(registers(context), vec![-3, -4]);
-    // the argument holds the first slot of the frame
-    assert_eq!(argument_registers(context), vec![-3]);
+    assert_eq!(context.variable_count, 2);
+    // the context declares one argument
+    assert_eq!(context.func_arg_count, 1);
 }
 
 /// The failure of a script that does not compile is a value with a

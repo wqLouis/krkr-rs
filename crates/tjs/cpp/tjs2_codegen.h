@@ -5,7 +5,7 @@
     entry compiles script text and hands the C++ executor the image of a
     script block, context by context. The executor runs a context's
     code stream and its size, and reads the constant area, the variable
-    area, the function-argument area and the labels beside it
+    and argument counts and the labels beside it
     (crates/tjs/cpp/tjs2/tjsInterCodeGen.h:293-295, GetCodeSize() at :435,
     the code read at crates/tjs/cpp/tjs2/tjsInterCodeExec.cpp:862).
 
@@ -62,11 +62,6 @@ extern "C" {
    the kind, the members and their number, and the C++ side builds the
    object. */
 #define TJS2_CG_VALUE_DICTIONARY 9
-
-/* The kinds of a function argument. */
-#define TJS2_CG_ARG_NORMAL         0
-#define TJS2_CG_ARG_EXPAND         1
-#define TJS2_CG_ARG_UNNAMED_EXPAND 2
 
 /*----------------------------------------------------------------------
     The script block.
@@ -127,19 +122,6 @@ typedef struct tjs2_codegen_object {
     const tjs2_codegen_value *keys;
 } tjs2_codegen_object;
 
-typedef struct tjs2_codegen_variable {
-    const uint16_t *name;
-    int32_t name_length;
-    int32_t register_;
-} tjs2_codegen_variable;
-
-typedef struct tjs2_codegen_func_arg {
-    int32_t kind;
-    int32_t register_;
-    const uint16_t *name;
-    int32_t name_length;
-} tjs2_codegen_func_arg;
-
 /* One member registration: the name of a member and the context it
    holds.
 
@@ -174,19 +156,14 @@ typedef struct tjs2_codegen_context {
     /* the number of values in the constant area */
     int32_t constant_count;
 
-    /* the variable area: the local variables of the context, in the
-       order the name space holds them */
-    const tjs2_codegen_variable *variables;
-    /* the number of variables in the variable area */
+    /* the number of local variables the context's name space held */
     int32_t variable_count;
     /* the number of registers the context reserves for itself */
     int32_t variable_reserve_count;
     /* the greatest number of frames the context needs */
     int32_t max_frame_count;
 
-    /* the function-argument area: the arguments the context declares */
-    const tjs2_codegen_func_arg *func_args;
-    /* the number of arguments in the function-argument area */
+    /* the number of arguments the context declares */
     int32_t func_arg_count;
     /* the base of the unnamed argument array */
     int32_t func_unnamed_arg_base;
@@ -228,12 +205,6 @@ typedef struct tjs2_codegen_context {
 
 /* One value of the constant area. The kind says which of the payload
    fields holds the value. */
-
-
-/* One local variable of the variable area. */
-
-
-/* One argument of the function-argument area. */
 
 
 /* The image of a whole script block. */
@@ -353,6 +324,7 @@ const tjs2_codegen_block *tjs2_script_block_image(const tjs2_script *script);
    NULL when the handle holds none. */
 const tjs2_pp_values *tjs2_script_pp_values(const tjs2_script *script);
 
+#ifdef __cplusplus
 }
 #endif
 

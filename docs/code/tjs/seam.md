@@ -22,10 +22,10 @@ the reference, the difference is called out in §9 and the reference wins.
 This document specifies step 2.
 
 **Vocabulary.** "the image" is the Rust side's description of a compiled
-script block: the code stream, the constant area, the variable area, the
-function-argument area, the labels, the per-instruction source positions and
-the line table, for every context of the block. "the adapter" is the C++ code
-that turns the image into the reference's own `tTJSScriptBlock` /
+script block: the code stream, the constant area, the labels, the
+per-instruction source positions and the line table, for every context of the
+block, and the variable and argument counts beside them. "the adapter" is the
+C++ code that turns the image into the reference's own `tTJSScriptBlock` /
 `tTJSInterCodeContext` objects.
 
 ---
@@ -315,7 +315,7 @@ the block** in its `object` field.
 No other object can appear in a constant: the only object-valued constants
 the reference creates are the null literal and the context objects.
 
-### 2.4 The variable area
+### 2.4 The variable count
 
 The reference's "variable area" is the **local name space**
 (`tTJSLocalNamespace`, `reference/…/tjsInterCodeGen.h:404`), not an array.
@@ -323,10 +323,12 @@ Its only surviving trace at run time is `MaxVariableCount`
 (`reference/…/tjsInterCodeGen.cpp:994`), which sizes the register frame
 (`reference/…/tjsInterCodeExec.cpp:641`, `:648`).
 
-So the C++ side needs **the number, not the names**: `variable_count` in the
-image is `MaxVariableCount`, and the per-variable records (`name`,
-`register_`) exist in the image for the Rust side's own bookkeeping and for
-the debugger, and the C++ adapter may ignore them.
+So the image carries **the number and nothing else**: `variable_count` is
+`MaxVariableCount`. There is no array of variables in the image, and no
+names in it: the reference's context holds no variable names at run time
+either — the name space is cleared when the context is finalised
+(`reference/…/tjsInterCodeGen.cpp:399`), and the names live in the
+compile-time name space, which the runtime never sees.
 
 **The register numbering** (so the C++ side can check the image):
 `ra[-1]` is `objthis`, `ra[-2]` is the global/objthis proxy, `ra[-3]` and
@@ -337,7 +339,7 @@ order, `ra[0]` is the result register and `ra[1]` and above are the frame
 rule is `-(index) - VariableReserveCount - 1`,
 `reference/…/tjsInterCodeGen.cpp:2864-2865`).
 
-### 2.5 The function-argument area
+### 2.5 The function-argument counts
 
 The reference has **no array** of declared arguments. What it has is three
 numbers per context:
@@ -353,12 +355,12 @@ They are read by the executor when the context is *entered* as a callee
 (`reference/…/tjsInterCodeExec.cpp:704-741`) and when it *calls*
 (`reference/…/tjsInterCodeExec.cpp:2023`, `:2062`). The argument **names**
 live in the name space (`reference/…/tjsInterCodeGen.cpp:3714`,
-`Namespace.Add(varname)`), not in a separate array.
+`Namespace.Add(varname)`), not in a separate array — and the name space is
+cleared when the context is finalised
+(`reference/…/tjsInterCodeGen.cpp:399`), so the runtime never sees them.
 
-The image's `func_args` list (kind + register + name) is therefore
-**redundant for the C++ side**: the C++ adapter needs the three numbers and
-nothing else. The list may stay in the image for the debugger and for the
-Rust side's own checks.
+So the image carries **the three numbers and nothing else**: there is no
+argument list in it.
 
 The *call-site* argument description — how many arguments, which registers,
 whether an argument expands (`fatNormal` / `fatExpand` /
@@ -444,18 +446,18 @@ strings and octets the same way.
 
 **Consequence for the image.** The image's flat arrays with per-context bases
 (the shape the existing `tjs2_codegen_block` already has: `context_constants`,
-`context_variables`, `context_args`, `context_labels` in
-`crates/tjs/src/vm/codegen/ffi.rs`) are a **transport** choice, not the
-reference's runtime layout. They are fine, provided the adapter copies each
-context's slice into that context's own C++ array and the C++ side never
-indexes the flat array directly. The base and the count are the contract:
+`context_labels` in `crates/tjs/src/vm/codegen/ffi.rs`) are a **transport**
+choice, not the reference's runtime layout. They are fine, provided the
+adapter copies each context's slice into that context's own C++ array and the
+C++ side never indexes the flat array directly. The base and the count are the
+contract:
 
 | area | the image's shape | the reference's shape |
 |---|---|---|
 | code | `code` + `code_size`, one array per context | `CodeArea` + `CodeAreaSize`, one array per context — **identical** |
 | constants | one flat array + a per-context base and count | one array per context — the adapter copies the slice |
-| variables | one flat array + a per-context base and count | not an array at all — only `MaxVariableCount` survives |
-| arguments | one flat array + a per-context base and count | not an array at all — only three numbers survive |
+| variables | one number per context, no array | not an array at all — only `MaxVariableCount` survives |
+| arguments | three numbers per context, no array | not an array at all — only three numbers survive |
 | labels | one flat array + a per-context base and count | `SourcePosArray` + `SourcePosArraySize`, one array per context — the adapter copies the slice |
 | lines | one flat array, block-level | `LineVector` + `LineLengthVector`, block-level — **identical** |
 
@@ -522,10 +524,11 @@ indexes the flat array directly. The base and the count are the contract:
   only when the source position differs from the previous one
   (`PrevSourcePos`, `reference/…/tjsInterCodeGen.cpp:602-627`).
 
-### 3.4 The variable area
+### 3.4 The variable count
 
 * The reference has no array; only `MaxVariableCount` survives
   (`reference/…/tjsInterCodeGen.cpp:994`).
+* The image carries that one number and no array (§2.4).
 * `MaxVariableCount` is the **maximum** number of name-space entries the
   context ever had (`tTJSLocalNamespace::GetMaxCount`,
   `reference/…/tjsNamespace.h:85`; the count is maintained by
@@ -536,9 +539,10 @@ indexes the flat array directly. The base and the count are the contract:
   `ra` at `regs + MaxVariableCount + VariableReserveCount`
   (`reference/…/tjsInterCodeExec.cpp:648`).
 
-### 3.5 The function-argument area
+### 3.5 The function-argument counts
 
 * No array; three numbers (§2.5).
+* The image carries those three numbers and no array (§2.5).
 * `FuncDeclCollapseBase` is −1 when the context declares no named `*`
   argument (`reference/…/tjsInterCodeGen.cpp:199`, `:333`), and the executor
   tests `>= 0` before using it (`reference/…/tjsInterCodeExec.cpp:731`).
@@ -985,7 +989,7 @@ The differences that bear on this design (the reference wins):
 | A4 | **Whether the error is raised at the end of the parse or at the first error.** The reference's `_yyerror` **recovers**: it counts the error, keeps the first one, prints to the console, and returns 0 so the grammar continues (`reference/…/tjsInterCodeGen.cpp:52-87`); the grammar's own recovery rule aborts after more than 20 errors (`reference/krkr2/cpp/core/tjs2/bison/tjs.y:211-213`). `Parse` raises at the end (`reference/…/tjsScriptBlock.cpp:444-446`). | (a) The Rust entry must reproduce the recovery and report the first error and the count. (b) The Rust entry may fail fast and report the first error. | **(a)**, because the console output and the error count are observable: the reference prints one line per error (`reference/…/tjsInterCodeGen.cpp:82`) and the raised exception carries the **first** error's message and position. The image must therefore carry the count as well as the first message and position. |
 | A5 | **Whether the image's line table replaces the block's or is checked against it.** The reference's `SetText` builds the line table from the text it owns (`reference/…/tjsScriptBlock.cpp:207-232`); the image also carries one. | (a) The C++ keeps its own and checks the image's against it. (b) The C++ adopts the image's. | **(a)**: the block's `Script` buffer is the text `GetLine` returns (`reference/…/tjsScriptBlock.cpp:140-152`), and the reference's line table is built from **that** buffer, so the two must be the same text. Adopting the image's table would mean the block's table no longer matches the block's text. The adapter checks and fails loudly on a mismatch. |
 | A6 | **Whether the "expression mode" `;` and the `#!` rewrite are the Rust side's business.** The reference's analyser appends a `;` in expression mode and rewrites a leading `#!` to `//` (`reference/…/tjsLex.cpp:1006-1015`). | (a) They are lexer's business, so the Rust side's. (b) They are the compile entry's business, so the C++ side's. | **(a)**: they are inside `tTJSLexicalAnalyzer`'s constructor, and the Rust lexer already does both (`crates/tjs/src/vm/lexer/mod.rs:416-436`). The C++ side passes the text through unchanged. The consequence to note: in expression mode the source positions refer to the text **plus the appended `;`**, and the block's line table is built from the text **without** it — the reference has the same discrepancy, and it is harmless because the appended `;` is at the end. |
-| A7 | **Whether the variable area's names cross the ABI.** The reference throws them away (`Namespace.Clear()` in `Finalize`, `reference/…/tjsInterCodeGen.cpp:399`); only `MaxVariableCount` survives. | (a) The image carries only the count. (b) The image carries the names too, for the debugger. | **(b)**: the existing `tjs2_codegen_context` already carries them, the debugger benefits, and the C++ adapter simply ignores them. The C++ side must not treat the list as authoritative for anything but diagnostics. |
+| A7 | **Whether the variable area's names cross the ABI.** The reference throws them away (`Namespace.Clear()` in `Finalize`, `reference/…/tjsInterCodeGen.cpp:399`); only `MaxVariableCount` survives. | (a) The image carries only the count. (b) The image carries the names too, for the debugger. | **(a)**: the names are the reference's compile-time state — the name space is cleared before the runtime sees the context, and the bytecode export writes neither the variable names nor the argument names (`reference/…/tjsInterCodeGen.cpp:4095-4110`). The image carries the count and the adapter reads the count. |
 
 ---
 

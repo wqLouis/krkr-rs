@@ -504,12 +504,6 @@ impl Context {
             .position(|property| property.name == name)
     }
 
-    /// The names of the local variables, in the order the name space
-    /// holds them.
-    pub fn variable_names(&self) -> Vec<String> {
-        self.namespace.variable_names()
-    }
-
     /// The arguments of the function the context declares.
     pub fn func_arg_list(&self) -> &[FuncArg] {
         &self.func_args

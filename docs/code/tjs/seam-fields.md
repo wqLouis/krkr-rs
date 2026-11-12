@@ -48,12 +48,10 @@ The opaque handle the compile entry returns. It owns the whole image.
 | `code_size` | `int32_t` | the number of words in the code stream. The C++ puts it in `CodeAreaSize`; the executor's IP is an index into it. | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:396`, `:536`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:859` |
 | `constants` | `const tjs2_codegen_value *` | the context's constant area, in creation order. The C++ copies it into `DataArea` as `tTJSVariant`s. | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:401`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:638-681` |
 | `constant_count` | `int32_t` | the number of constants. The C++ puts it in `DataAreaSize`. | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:402`, `:538`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:865` |
-| `variables` | `const tjs2_codegen_variable *` | the context's local variables (name and register), in name-space order. **The C++ does not need it** — the reference discards the names at the end of the compile — but it carries them for the debugger. | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:404`; `reference/krkr2/cpp/core/tjs2/tjsNamespace.cpp:156-170`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:399` |
-| `variable_count` | `int32_t` | the number of name-space entries the context ever had, **including the declared arguments**. The C++ puts it in `MaxVariableCount`; the executor sizes the register frame with it. | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:438`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:994`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:641`, `:648` |
+| `variable_count` | `int32_t` | the number of name-space entries the context ever had, **including the declared arguments**. The C++ puts it in `MaxVariableCount`; the executor sizes the register frame with it. The image carries no per-variable records: the reference's names are compile-time state and the runtime never sees them. | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:438`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:994`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:641`, `:648`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:399` |
 | `variable_reserve_count` | `int32_t` | the number of registers the context reserves below `ra[0]` for itself: **2** for every context type but `ctProperty`, which reserves **0**. The C++ puts it in `VariableReserveCount`. | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:433`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:227-254`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:641` |
 | `max_frame_count` | `int32_t` | the greatest number of frame registers the context needs. The C++ puts it in `MaxFrameCount`. | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:437`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:2822-2823`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:641` |
-| `func_args` | `const tjs2_codegen_func_arg *` | the declared arguments (kind, register, name). **The C++ does not need it** — the reference keeps the names in the name space and the count in `FuncDeclArgCount`; the *call-site* description is in the code stream. | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3708-3737`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3683-3706` |
-| `func_arg_count` | `int32_t` | the number of declared arguments. The C++ puts it in `FuncDeclArgCount`; the executor uses it to lay the arguments out at `ra[-3]`, `ra[-4]`, … | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:440`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3736`, `:3761`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:704-728` |
+| `func_arg_count` | `int32_t` | the number of declared arguments. The C++ puts it in `FuncDeclArgCount`; the executor uses it to lay the arguments out at `ra[-3]`, `ra[-4]`, … The image carries no argument records: the reference keeps the argument names in the name space, which is cleared before the runtime sees the context, and the *call-site* description is in the code stream. | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:440`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3736`, `:3761`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:704-728`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:399` |
 | `func_unnamed_arg_base` | `int32_t` | the base of the unnamed `*` argument, i.e. the index of the first argument the `*` swallows. The C++ puts it in `FuncDeclUnnamedArgArrayBase`. | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:441`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3748`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:2023`, `:2062` |
 | `func_collapse_base` | `int32_t` | the base of the **named** `*` argument; **−1** when the context declares none. The C++ puts it in `FuncDeclCollapseBase`; the executor tests `>= 0` before using it. | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:442`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:199`, `:3751`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:731-741` |
 | `labels` | `const tjs2_codegen_source_pos *` | the context's per-instruction source positions: `(code position, source position)`, **sorted by code position**. The C++ copies it into `SourcePosArray`. | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:274-279`, `:427`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:602-627`, `:693-700` |
@@ -90,31 +88,7 @@ holds the value.
 
 ---
 
-## 5. The variable image — `tjs2_codegen_variable`
-
-| field | type | meaning | who fills it | reference line |
-|---|---|---|---|---|
-| `name` | `const uint16_t *` | the local variable's name, in UTF-16. Not needed by the C++ side. | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:2845-2884`; `reference/krkr2/cpp/core/tjs2/tjsNamespace.cpp:182-188` |
-| `name_length` | `int32_t` | the name's length in code units. | Rust | as above |
-| `register_` | `int32_t` | the register the variable holds: `-(name-space index) - VariableReserveCount - 1`. Not needed by the C++ side (the register is already encoded in the code stream). | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:2864-2865` |
-
----
-
-## 6. The argument image — `tjs2_codegen_func_arg`
-
-Not needed by the C++ side; kept for the debugger and for the Rust side's own
-checks.
-
-| field | type | meaning | who fills it | reference line |
-|---|---|---|---|---|
-| `kind` | `int32_t` | the argument's kind: `fatNormal`, `fatExpand` or `fatUnnamedExpand`. | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:164`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:2745-2753` |
-| `register_` | `int32_t` | the register the argument is passed in. | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:2745-2753` |
-| `name` | `const uint16_t *` | the argument's name, in UTF-16. | Rust | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3708-3715` |
-| `name_length` | `int32_t` | the name's length in code units. | Rust | as above |
-
----
-
-## 7. The source-position image — `tjs2_codegen_source_pos`
+## 5. The source-position image — `tjs2_codegen_source_pos`
 
 | field | type | meaning | who fills it | reference line |
 |---|---|---|---|---|
@@ -123,7 +97,7 @@ checks.
 
 ---
 
-## 8. The line image — `tjs2_codegen_line`
+## 6. The line image — `tjs2_codegen_line`
 
 | field | type | meaning | who fills it | reference line |
 |---|---|---|---|---|
@@ -132,7 +106,7 @@ checks.
 
 ---
 
-## 9. The member-registration image — `tjs2_codegen_property`
+## 7. The member-registration image — `tjs2_codegen_property`
 
 | field | type | meaning | who fills it | reference line |
 |---|---|---|---|---|
@@ -142,11 +116,11 @@ checks.
 
 ---
 
-## 10. Where each image field lands in the reference's own objects
+## 8. Where each image field lands in the reference's own objects
 
 The right-hand column is the reference's field; the C++ adapter writes it.
 
-### 10.1 `tTJSScriptBlock`
+### 8.1 `tTJSScriptBlock`
 
 | the reference's field | type | meaning | who fills it | reference line |
 |---|---|---|---|---|
@@ -167,7 +141,7 @@ The right-hand column is the reference's field; the C++ adapter writes it.
 | `UsingPreProcessor` | `bool` | whether the script used `@if` / `@set`. | C++ (from the handle's `using_preprocessor`) | `reference/krkr2/cpp/core/tjs2/tjsScriptBlock.h:58`, `:107`; `reference/krkr2/cpp/core/tjs2/tjsScriptBlock.h:79-82` |
 | `CompileErrorCount` | `tjs_int` | the number of compile errors. | C++ (from the handle's `error_count`) | `reference/krkr2/cpp/core/tjs2/tjsScriptBlock.h:61`; `reference/krkr2/cpp/core/tjs2/tjsScriptBlock.cpp:444-446` |
 
-### 10.2 `tTJSInterCodeContext` — the fields the C++ writes
+### 8.2 `tTJSInterCodeContext` — the fields the C++ writes
 
 | the reference's field | type | meaning | who fills it | reference line |
 |---|---|---|---|---|
@@ -195,7 +169,7 @@ The right-hand column is the reference's field; the C++ adapter writes it.
 | `SuperClassGetter` | `tTJSInterCodeContext *` | the super-class proxy. | C++ (via `SetCodeObject`) | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:452`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:842` |
 | `Properties` | `std::vector<tProperty *> *` | the members the context contributes to its parent. | C++ (a copy of the image's `properties`) — **only** when a bytecode export is being written; otherwise the C++ performs the `PropSet` directly. | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:390`; `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:935-939` |
 
-### 10.3 `tTJSInterCodeContext` — the fields that do **not** cross
+### 8.3 `tTJSInterCodeContext` — the fields that do **not** cross
 
 They are the Rust generator's private state; the reference keeps them only for
 the duration of the compile.
@@ -223,7 +197,7 @@ the duration of the compile.
 
 ---
 
-## 11. The operand encodings the C++ side must not re-encode
+## 9. The operand encodings the C++ side must not re-encode
 
 There is no field for these — they are *inside* the code stream — but they are
 part of the contract, so they are tabulated here.
