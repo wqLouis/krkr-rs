@@ -1,110 +1,81 @@
-//! The C interface of the code generator.
+//! The image of a script block: its shape, and the builder that makes it.
 //!
-//! There are two interfaces here, and they are two faces of one
-//! implementation:
+//! The **image** is the Rust side's description of a compiled script
+//! block: the code stream of every context, the constant area, the
+//! variable area, the function-argument area, the labels and the line
+//! table. The records below are its shape: every field is a plain C
+//! type, and every pointer is owned by the image.
 //!
-//! * the **script-block** interface, which is the shipped one: it hands
-//!   the native executor the image of a script block — the code stream
-//!   of every context, the constant area, the variable area, the
-//!   function-argument area, the labels and the line table;
-//! * the **node-building** interface, which is the **proof instrument**:
-//!   it lets the native grammar drive the Rust generator so that the two
-//!   code streams can be compared word for word. It is not the shipped
-//!   interface, and its marshalling cost is not a shipping number.
+//! The C interface the tree ships is the compile entry, at the module
+//! root (`crate::vm`): it compiles script text and hands the image back.
+//! This module holds the image the entry hands back — the records, and
+//! the one builder that makes it.
 //!
-//! Every entry point catches a panic and reports it as an error value —
-//! a negative code, plus the message, which the caller reads with
-//! `tjs2_codegen_last_error_message`. No entry point unwinds into the
-//! native caller.
+//! # The unsafe code
 //!
-//! The interface is safe to call from several threads as long as one handle
-//! is used by one thread at a time.
+//! The module allows `unsafe` because a C string is cut at its first
+//! zero byte, and the cut is the transformation the caller can see.
 
 #![allow(unsafe_code)]
 
-use std::ffi::{CString, c_char, c_int};
+use std::ffi::{CString, c_int};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::rc::Rc;
 
 use crate::vm::codegen::Generator;
 use crate::vm::codegen::context::ContextType;
-use crate::vm::codegen::node::Node;
-use crate::vm::codegen::value::{ObjectId, Value};
+use crate::vm::codegen::value::Value;
 
-/// The generator succeeded.
-/// The `TJS2_CG_OK` value of the interface.
-pub const TJS2_CG_OK: c_int = 0;
-
-/// The tree has a shape the generator does not support.
-/// The `TJS2_CG_ERROR_SYNTAX` value of the interface.
-pub const TJS2_CG_ERROR_SYNTAX: c_int = -1;
-
-/// The generator panicked. The message carries the panic's text.
-/// The `TJS2_CG_ERROR_PANIC` value of the interface.
-pub const TJS2_CG_ERROR_PANIC: c_int = -2;
-
-/// A value is outside the range the interface can carry.
-/// The `TJS2_CG_ERROR_RANGE` value of the interface.
-pub const TJS2_CG_ERROR_RANGE: c_int = -3;
-
-/// The handle is in a state the call does not fit.
-/// The `TJS2_CG_ERROR_STATE` value of the interface.
-pub const TJS2_CG_ERROR_STATE: c_int = -4;
-
-/// The kinds of a code context.
-/// The `TJS2_CG_CONTEXT_TOP_LEVEL` value of the interface.
+/// The image's number for the top-level context.
 pub const TJS2_CG_CONTEXT_TOP_LEVEL: c_int = 0;
-/// The `TJS2_CG_CONTEXT_FUNCTION` value of the interface.
+/// The image's number for a function's context.
 pub const TJS2_CG_CONTEXT_FUNCTION: c_int = 1;
-/// The `TJS2_CG_CONTEXT_EXPR_FUNCTION` value of the interface.
+/// The image's number for a function expression's context.
 pub const TJS2_CG_CONTEXT_EXPR_FUNCTION: c_int = 2;
-/// The `TJS2_CG_CONTEXT_PROPERTY` value of the interface.
+/// The image's number for a property's context.
 pub const TJS2_CG_CONTEXT_PROPERTY: c_int = 3;
-/// The `TJS2_CG_CONTEXT_PROPERTY_SETTER` value of the interface.
+/// The image's number for a property setter's context.
 pub const TJS2_CG_CONTEXT_PROPERTY_SETTER: c_int = 4;
-/// The `TJS2_CG_CONTEXT_PROPERTY_GETTER` value of the interface.
+/// The image's number for a property getter's context.
 pub const TJS2_CG_CONTEXT_PROPERTY_GETTER: c_int = 5;
-/// The `TJS2_CG_CONTEXT_CLASS` value of the interface.
+/// The image's number for a class's context.
 pub const TJS2_CG_CONTEXT_CLASS: c_int = 6;
-/// The `TJS2_CG_CONTEXT_SUPER_CLASS_GETTER` value of the interface.
+/// The image's number for a class's super-class proxy context.
 pub const TJS2_CG_CONTEXT_SUPER_CLASS_GETTER: c_int = 7;
 
-/// The kinds of a constant.
-/// The `TJS2_CG_VALUE_VOID` value of the interface.
+/// The image's number for the void constant.
 pub const TJS2_CG_VALUE_VOID: c_int = 0;
-/// The `TJS2_CG_VALUE_INTEGER` value of the interface.
+/// The image's number for the integer constant.
 pub const TJS2_CG_VALUE_INTEGER: c_int = 1;
-/// The `TJS2_CG_VALUE_REAL` value of the interface.
+/// The image's number for the real constant.
 pub const TJS2_CG_VALUE_REAL: c_int = 2;
-/// The `TJS2_CG_VALUE_STRING` value of the interface.
+/// The image's number for the string constant.
 pub const TJS2_CG_VALUE_STRING: c_int = 3;
-/// The `TJS2_CG_VALUE_OCTET` value of the interface.
+/// The image's number for the byte-string constant.
 pub const TJS2_CG_VALUE_OCTET: c_int = 4;
-/// The `TJS2_CG_VALUE_OBJECT` value of the interface.
+/// The image's number for the object constant.
 pub const TJS2_CG_VALUE_OBJECT: c_int = 5;
-/// The `TJS2_CG_VALUE_NULL` value of the interface.
+/// The image's number for the null constant.
 pub const TJS2_CG_VALUE_NULL: c_int = 6;
-/// The `TJS2_CG_VALUE_CONTEXT` value of the interface.
+/// The image's number for the context constant.
 pub const TJS2_CG_VALUE_CONTEXT: c_int = 7;
-/// The `TJS2_CG_VALUE_ARRAY` value of the interface.
+/// The image's number for the constant inline array.
 ///
 /// A constant inline array is the object the `(const)[...]` form builds
 /// while it is parsed, one element at a time. The generator cannot build
 /// a live object, so the image carries the elements and the side that has
 /// the object builds it.
 pub const TJS2_CG_VALUE_ARRAY: c_int = 8;
-/// The `TJS2_CG_VALUE_DICTIONARY` value of the interface.
+/// The image's number for the constant inline dictionary.
 ///
 /// A constant inline dictionary is the object the `(const)%[...]` form
 /// builds while it is parsed, one member at a time.
 pub const TJS2_CG_VALUE_DICTIONARY: c_int = 9;
 
-/// The kinds of a function argument.
-/// The `TJS2_CG_ARG_NORMAL` value of the interface.
+/// The image's number for an ordinary argument.
 pub const TJS2_CG_ARG_NORMAL: c_int = 0;
-/// The `TJS2_CG_ARG_EXPAND` value of the interface.
+/// The image's number for an expanding argument.
 pub const TJS2_CG_ARG_EXPAND: c_int = 1;
-/// The `TJS2_CG_ARG_UNNAMED_EXPAND` value of the interface.
+/// The image's number for an unnamed expanding argument.
 pub const TJS2_CG_ARG_UNNAMED_EXPAND: c_int = 2;
 
 /// A value of the constant area.
@@ -340,23 +311,20 @@ pub struct tjs2_codegen_block {
     pub object_count: i32,
 }
 
-/// The generator: it holds the contexts of one script block.
+/// The image of a script block, and the generator that owns its code.
 ///
-/// The name is the C name the header uses, so the two agree.
-#[allow(non_camel_case_types)]
-pub struct tjs2_codegen {
-    /// The generator itself.
+/// The image holds the areas its records point at: the contexts, the
+/// constants, the variables, the arguments, the labels, the lines, the
+/// strings, the octets, the names, the constant objects and the member
+/// registrations. Every pointer in the image points into one of them, so
+/// they live as long as the image does.
+pub struct Image {
+    /// The generator, which owns the code the image points at.
     pub generator: Generator,
-    /// The nodes of the tree, for the proof instrument.
-    pub nodes: Vec<Rc<Node>>,
-    /// The last error's code.
-    pub error: c_int,
-    /// The last error's message.
-    pub message: Option<CString>,
     /// The image of the script block.
     pub block: Option<tjs2_codegen_block>,
     /// The contexts of the image.
-    pub image: Vec<tjs2_codegen_context>,
+    pub contexts: Vec<tjs2_codegen_context>,
     /// The constants of the image.
     pub constants: Vec<tjs2_codegen_value>,
     /// The variables of the image.
@@ -381,19 +349,14 @@ pub struct tjs2_codegen {
     pub object_keys: Vec<Box<[tjs2_codegen_value]>>,
     /// The member registrations of the image.
     pub properties: Vec<tjs2_codegen_property>,
-    /// The conditional-compilation values the compile hands back.
-    pub pp_values: Option<tjs2_pp_values>,
 }
 
-impl Default for tjs2_codegen {
+impl Default for Image {
     fn default() -> Self {
         Self {
             generator: Generator::new(),
-            nodes: Vec::new(),
-            error: TJS2_CG_OK,
-            message: None,
             block: None,
-            image: Vec::new(),
+            contexts: Vec::new(),
             constants: Vec::new(),
             variables: Vec::new(),
             func_args: Vec::new(),
@@ -406,28 +369,18 @@ impl Default for tjs2_codegen {
             object_values: Vec::new(),
             object_keys: Vec::new(),
             properties: Vec::new(),
-            pp_values: None,
         }
     }
 }
 
-/// Runs the given work, and turns a panic into an error value.
-fn guard<T>(fallback: T, work: impl FnOnce() -> T) -> T {
-    match catch_unwind(AssertUnwindSafe(work)) {
-        Ok(value) => value,
-        Err(payload) => {
-            let message = if let Some(text) = payload.downcast_ref::<&str>() {
-                (*text).to_string()
-            } else if let Some(text) = payload.downcast_ref::<String>() {
-                text.clone()
-            } else {
-                "the generator panicked".to_string()
-            };
-            // the message is kept in a thread-local so that the caller
-            // can read it after the fact
-            PANIC_MESSAGE.with(|slot| *slot.borrow_mut() = Some(message));
-            fallback
-        }
+/// The text of a panic.
+pub(crate) fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "the front end panicked".to_string()
     }
 }
 
@@ -443,140 +396,15 @@ pub(crate) fn c_string(text: &str) -> CString {
     unsafe { CString::from_vec_unchecked(bytes) }
 }
 
-thread_local! {
-    pub(crate) static PANIC_MESSAGE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Makes a generator: an empty script block.
-#[unsafe(no_mangle)]
-pub extern "C" fn tjs2_codegen_new() -> *mut tjs2_codegen {
-    guard(std::ptr::null_mut(), || {
-        Box::into_raw(Box::new(tjs2_codegen::default()))
-    })
-}
-
-/// Frees a generator and every image it holds.
-///
-/// # Safety
-///
-/// `generator` must be a handle from [`tjs2_codegen_new`] that has not
-/// been freed.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn tjs2_codegen_free(generator: *mut tjs2_codegen) {
-    if generator.is_null() {
-        return;
-    }
-    // SAFETY: the caller promises the handle is live and not freed.
-    drop(unsafe { Box::from_raw(generator) });
-}
-
-/// The last error of the generator: a negative code, or zero.
-///
-/// # Safety
-///
-/// `generator` must be a live handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn tjs2_codegen_last_error(generator: *const tjs2_codegen) -> c_int {
-    // SAFETY: the caller promises the handle is live.
-    unsafe { generator.as_ref() }
-        .map(|generator| generator.error)
-        .unwrap_or(TJS2_CG_ERROR_PANIC)
-}
-
-/// The message of the last error.
-///
-/// The returned pointer is owned by the generator and stays valid until
-/// the next call on it.
-///
-/// # Safety
-///
-/// `generator` must be a live handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn tjs2_codegen_last_error_message(
-    generator: *const tjs2_codegen,
-) -> *const c_char {
-    // SAFETY: the caller promises the handle is live.
-    let Some(generator) = (unsafe { generator.as_ref() }) else {
-        return std::ptr::null();
-    };
-    if let Some(message) = generator.message.as_ref() {
-        return message.as_ptr().cast::<c_char>();
-    }
-    PANIC_MESSAGE.with(|slot| match slot.borrow().as_ref() {
-        Some(text) => c_string(text.as_str()).into_raw().cast::<c_char>(),
-        None => std::ptr::null::<c_char>(),
-    })
-}
-
-/// The image of the script block.
-///
-/// The returned pointer is owned by the generator and stays valid until
-/// the generator is freed.
-///
-/// # Safety
-///
-/// `generator` must be a live handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn tjs2_codegen_block_image(
-    generator: *const tjs2_codegen,
-) -> *const tjs2_codegen_block {
-    // SAFETY: the caller promises the handle is live.
-    let Some(generator) = (unsafe { generator.as_ref() }) else {
-        return std::ptr::null();
-    };
-    generator
-        .block
-        .as_ref()
-        .map(|block| block as *const tjs2_codegen_block)
-        .unwrap_or(std::ptr::null())
-}
-
-/// The image of one context.
-///
-/// # Safety
-///
-/// `generator` must be a live handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn tjs2_codegen_context_image(
-    generator: *const tjs2_codegen,
-    context: c_int,
-) -> *const tjs2_codegen_context {
-    // SAFETY: the caller promises the handle is live.
-    let Some(generator) = (unsafe { generator.as_ref() }) else {
-        return std::ptr::null();
-    };
-    generator
-        .image
-        .get(context as usize)
-        .map(|image| image as *const tjs2_codegen_context)
-        .unwrap_or(std::ptr::null())
-}
-
 /// Builds the image of the script block.
 ///
 /// The image holds the code stream of every context, the constant area,
 /// the variable area, the function-argument area, the labels and the
 /// line table.
 ///
-/// # Safety
-///
-/// `generator` must be a live handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn tjs2_codegen_build_image(generator: *mut tjs2_codegen) -> c_int {
-    // SAFETY: the caller promises the handle is live.
-    let Some(generator) = (unsafe { generator.as_mut() }) else {
-        return TJS2_CG_ERROR_PANIC;
-    };
-    build_image(generator)
-}
-
-/// Builds the image of the script block.
-///
-/// The image holds the code stream of every context, the constant area,
-/// the variable area, the function-argument area, the labels and the
-/// line table.
-pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
-    guard(TJS2_CG_ERROR_PANIC, || {
+/// A panic in the builder is caught, and the panic's text is the error.
+pub(crate) fn build_image(image: &mut Image) -> Result<(), String> {
+    match catch_unwind(AssertUnwindSafe(|| {
         // the areas are built first, so that the contexts can point at
         // them
         let mut constants: Vec<tjs2_codegen_value> = Vec::new();
@@ -598,10 +426,9 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
 
         // the contexts that have left the block are not in the image, and
         // the contexts after them move down
-        let mut places: Vec<Option<usize>> =
-            Vec::with_capacity(generator.generator.contexts().len());
+        let mut places: Vec<Option<usize>> = Vec::with_capacity(image.generator.contexts().len());
         let mut live = 0;
-        for context in generator.generator.contexts() {
+        for context in image.generator.contexts() {
             if context.removed {
                 places.push(None);
             } else {
@@ -610,7 +437,7 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
             }
         }
 
-        for context in generator.generator.contexts() {
+        for context in image.generator.contexts() {
             if context.removed {
                 continue;
             }
@@ -684,7 +511,7 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
         // the member registrations of every context
         let mut properties: Vec<tjs2_codegen_property> = Vec::new();
         let mut property_places: Vec<(usize, usize)> = Vec::new();
-        for context in generator.generator.contexts() {
+        for context in image.generator.contexts() {
             if context.removed {
                 continue;
             }
@@ -713,8 +540,8 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
             property.name = names[property_name_base + index].as_ptr();
         }
 
-        let mut image = Vec::new();
-        for (index, context) in generator.generator.contexts().iter().enumerate() {
+        let mut contexts = Vec::new();
+        for (index, context) in image.generator.contexts().iter().enumerate() {
             if context.removed {
                 continue;
             }
@@ -726,7 +553,7 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
             let name_units: Vec<u16> = name.encode_utf16().collect();
             let name_length = name_units.len() as c_int;
             names.push(name_units.into_boxed_slice());
-            image.push(tjs2_codegen_context {
+            contexts.push(tjs2_codegen_context {
                 code: context.code().as_ptr(),
                 code_size: context.code().len() as c_int,
                 constants: constants.as_ptr().wrapping_add(constant_base),
@@ -774,20 +601,20 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
             });
         }
 
-        generator.image = image;
-        generator.constants = constants;
-        generator.variables = variables;
-        generator.func_args = func_args;
-        generator.labels = labels;
-        generator.strings = strings;
-        generator.octets = octets;
-        generator.names = names;
-        generator.objects = objects;
-        generator.object_values = object_values;
-        generator.object_keys = object_keys;
-        generator.properties = properties;
+        image.contexts = contexts;
+        image.constants = constants;
+        image.variables = variables;
+        image.func_args = func_args;
+        image.labels = labels;
+        image.strings = strings;
+        image.octets = octets;
+        image.names = names;
+        image.objects = objects;
+        image.object_values = object_values;
+        image.object_keys = object_keys;
+        image.properties = properties;
 
-        let top_level = generator
+        let top_level = image
             .generator
             .contexts()
             .iter()
@@ -795,20 +622,21 @@ pub(crate) fn build_image(generator: &mut tjs2_codegen) -> c_int {
             .map(|index| index as c_int)
             .unwrap_or(-1);
         let block = tjs2_codegen_block {
-            contexts: generator.image.as_ptr(),
-            context_count: generator.image.len() as c_int,
-            lines: generator.lines.as_ptr(),
-            line_count: generator.lines.len() as c_int,
+            contexts: image.contexts.as_ptr(),
+            context_count: image.contexts.len() as c_int,
+            lines: image.lines.as_ptr(),
+            line_count: image.lines.len() as c_int,
             top_level,
             // the constant objects: the constant inline arrays and the
             // constant inline dictionaries the constant areas hold
-            objects: generator.objects.as_ptr(),
-            object_count: generator.objects.len() as c_int,
+            objects: image.objects.as_ptr(),
+            object_count: image.objects.len() as c_int,
         };
-        generator.block = Some(block);
-        generator.error = TJS2_CG_OK;
-        TJS2_CG_OK
-    })
+        image.block = Some(block);
+    })) {
+        Ok(()) => Ok(()),
+        Err(payload) => Err(panic_message(payload)),
+    }
 }
 
 /// The image of one value.
@@ -958,10 +786,4 @@ fn context_kind(kind: ContextType) -> c_int {
         ContextType::Class => TJS2_CG_CONTEXT_CLASS,
         ContextType::SuperClassGetter => TJS2_CG_CONTEXT_SUPER_CLASS_GETTER,
     }
-}
-
-/// The identity of an object, for the proof instrument.
-#[unsafe(no_mangle)]
-pub extern "C" fn tjs2_codegen_object_id(identity: u64) -> u64 {
-    ObjectId(identity).0
 }

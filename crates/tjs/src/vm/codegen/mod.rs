@@ -20,7 +20,6 @@ pub mod node;
 pub mod objects;
 pub mod opcode;
 pub mod operations;
-pub mod proof;
 pub mod statements;
 pub mod token;
 pub mod value;

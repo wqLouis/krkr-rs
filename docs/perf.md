@@ -672,7 +672,8 @@ the tree's own Rust `Lexer`, over the same flags: every token compared one
 by one — kind, value and position — and every failure compared by its
 message and its position. The C ABI was compared against the same corpus as
 a third side, so the native API, the C interface and the C++ analyser all
-agree.
+agree. The C interface is gone now — the tree ships one C ABI, the compile
+entry — and the numbers below are the ones that comparison produced.
 
 **The result: identical on every script.**
 
@@ -827,8 +828,11 @@ parser.
 ### 6.3 The code generator (C3) — the trees agree; the code does not yet
 
 **Status: in progress.** The generator is `crates/tjs/src/vm/codegen/`, and
-its C ABI is a declared module: **72 C symbols export** from the library, and
-the image builder's own tests are in the crate.
+the front end ships **one** C ABI: the compile entry's nine functions and
+the image's records. The generator's own C interface — the image builder
+and the node-building driver — is gone; nothing in the tree called it, and
+the corpus comparison drives the generator over its Rust API. The image's
+own tests are in the crate.
 
 **The first comparison was measuring a broken seam.** The harness's helper —
 its copy of a `tTJSVariant` in the interface's shape — ended at its
@@ -841,6 +845,11 @@ table had no entry for it. So the Rust generator received **no constant
 values at all** — its area held 4 entries where the reference's held 34, and
 every constant index was wrong. **The 0-of-172 was measured through a seam
 that was not running.**
+
+The instrument that seam belonged to is gone: the tree ships one C ABI,
+the compile entry, and the corpus comparison drives the generator over its
+Rust API. The paragraph above is the record of the measurement that
+followed.
 
 The instrument was replaced rather than repaired: it now compares the two
 generators, each driven by its own front end — the reference's analyser,

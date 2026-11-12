@@ -1218,6 +1218,24 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   fresh staging lands in a new directory. The alternative is to build with a
   target directory on a local filesystem.
 
+* **The image's variable and function-argument areas carry names the C++ side
+  never reads, and the two name fix-ups are wrong.** The argument area's
+  names are always null, and the variable area's names are mis-indexed as soon
+  as more than one context has arguments. The reference's context carries no
+  names at all — they live in the compile-time namespace — and the bytecode
+  export writes neither the variable names nor the argument names, so nothing
+  downstream reads them. The areas are dead weight in the transport: the
+  C++ side takes the counts, not the records. Removing the names, and
+  probably the areas themselves, is a change to the shipped ABI's shape and
+  belongs with the switch that lands it.
+* **Both proof instruments are transition-only.** The corpus comparison and
+  the adapter's proof compare the Rust path against the vendored C++ path, so
+  neither can run once the vendored front end is deleted. The net after the
+  deletion has to be something else: a committed manifest of the corpus's
+  per-script image hashes, produced once from the C++ path while it still
+  exists, and a test that compiles each script and compares the hash. Produce
+  the manifest before the deletion, or the net is gone with it.
+
 ## 13. GPU memory
 
 Open: the config-cycle growth is explained; the fixed descriptor pool is not.

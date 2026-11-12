@@ -8,9 +8,10 @@
 //!
 //! These columns replace the vendored tree beside them, in
 //! `crates/tjs/cpp/tjs2/`: the analyser, the grammar and the
-//! generator there are what this module is written against. The C interfaces
-//! the vendored tree calls during the replacement are in each column's
-//! own `ffi` module.
+//! generator there are what this module is written against. The C
+//! interface the vendored tree calls during the replacement is the
+//! compile entry at the root of this module; the image it hands back
+//! has its shape in `codegen::ffi`.
 //!
 //! The root of this module is the front end's own door: the compile entry,
 //! the shipped seam the vendored VM calls to turn script text into the image
@@ -29,8 +30,7 @@
 //!
 //! This module allows `unsafe` because the compile entry is the seam, and
 //! the seam is where the raw pointers live. Every other module of the front
-//! end denies it; the columns that carry a C interface of their own allow it
-//! in that interface alone.
+//! end denies it; the image module allows it for the one C string it cuts.
 
 #![allow(unsafe_code)]
 
@@ -51,7 +51,7 @@ use std::ffi::{CString, c_char, c_int};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use crate::vm::codegen::ffi::{
-    TJS2_CG_ERROR_PANIC, c_string, tjs2_codegen, tjs2_codegen_block, tjs2_pp_value, tjs2_pp_values,
+    Image, c_string, panic_message, tjs2_codegen_block, tjs2_pp_value, tjs2_pp_values,
 };
 
 /// The compile succeeded.
@@ -70,8 +70,8 @@ pub const TJS2_SCRIPT_ERROR_STATE: c_int = -4;
 /// The name is the C name the header uses, so the two agree.
 #[allow(non_camel_case_types)]
 pub struct tjs2_script {
-    /// The generator, which owns the image.
-    codegen: Box<tjs2_codegen>,
+    /// The image of the script block.
+    image: Box<Image>,
     /// The status of the compile.
     status: c_int,
     /// The message of the first failure.
@@ -99,31 +99,34 @@ impl Drop for tjs2_script {
     }
 }
 
-thread_local! {
-    /// The message of the last panic, for the case where the handle could
-    /// not be told about it.
-    static PANIC_MESSAGE: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
+/// Runs the given work, and turns a panic into the failure it carries.
+fn guard<T>(work: impl FnOnce() -> T) -> Result<T, String> {
+    match catch_unwind(AssertUnwindSafe(work)) {
+        Ok(value) => Ok(value),
+        Err(payload) => Err(panic_message(payload)),
+    }
 }
 
-/// Runs the given work, and turns a panic into an error value.
-fn guard<T>(fallback: T, work: impl FnOnce() -> T) -> T {
-    match catch_unwind(AssertUnwindSafe(work)) {
-        Ok(value) => value,
-        Err(payload) => {
-            let message = if let Some(text) = payload.downcast_ref::<&str>() {
-                (*text).to_string()
-            } else if let Some(text) = payload.downcast_ref::<String>() {
-                text.clone()
-            } else {
-                "the front end panicked".to_string()
-            };
-            // the message is kept in a thread-local so that the caller
-            // can read it after the fact
-            PANIC_MESSAGE.with(|slot| *slot.borrow_mut() = Some(message));
-            fallback
-        }
-    }
+/// The handle of a front end that panicked.
+///
+/// The panic happened before the handle could be made, so this one is
+/// made here: it carries the failure, and the caller reads the panic's
+/// text with `tjs2_script_error_message` instead of losing it.
+fn failed(message: &str) -> *mut tjs2_script {
+    Box::into_raw(Box::new(tjs2_script {
+        image: Box::new(Image::default()),
+        status: TJS2_SCRIPT_ERROR_PANIC,
+        message: Some(c_string(message)),
+        position: -1,
+        count: 0,
+        using_preprocessor: 0,
+        values: Vec::new(),
+        names: Vec::new(),
+        pp_values: tjs2_pp_values {
+            values: std::ptr::null(),
+            count: 0,
+        },
+    }))
 }
 
 /// Compiles script text into the image of a script block.
@@ -147,7 +150,7 @@ pub unsafe extern "C" fn tjs2_script_compile(
     result_needed: c_int,
     values: *const tjs2_pp_values,
 ) -> *mut tjs2_script {
-    guard(std::ptr::null_mut(), || {
+    match guard(|| {
         if script.is_null() {
             return std::ptr::null_mut();
         }
@@ -189,24 +192,27 @@ pub unsafe extern "C" fn tjs2_script_compile(
         let parsed = Parser::new(&mut lexer, &mut generator).parse();
 
         // the image of the script block
-        let mut codegen = Box::new(tjs2_codegen::default());
-        codegen.generator = generator;
+        let mut image = Box::new(Image::default());
+        image.generator = generator;
         // the block's line table
-        codegen.lines = crate::vm::codegen::ffi::line_table(units);
-        let image = crate::vm::codegen::ffi::build_image(&mut codegen);
-        if image != TJS2_CG_ERROR_PANIC {
-            codegen.error = image;
-        }
+        image.lines = crate::vm::codegen::ffi::line_table(units);
+        let built = crate::vm::codegen::ffi::build_image(&mut image);
 
         // the first failure and the count of the failures
-        let (status, message, position, count) = match parsed.first_error {
-            Some(error) => (
+        let (status, message, position, count) = match (parsed.first_error, built) {
+            (Some(error), _) => (
                 TJS2_SCRIPT_ERROR_SYNTAX,
                 Some(c_string(error.message())),
                 error.position(),
                 parsed.error_count as c_int,
             ),
-            None => (TJS2_SCRIPT_OK, None, -1, parsed.error_count as c_int),
+            (None, Err(panic)) => (
+                TJS2_SCRIPT_ERROR_PANIC,
+                Some(c_string(&panic)),
+                -1,
+                parsed.error_count as c_int,
+            ),
+            (None, Ok(())) => (TJS2_SCRIPT_OK, None, -1, parsed.error_count as c_int),
         };
 
         // the conditional-compilation values the script left behind
@@ -228,7 +234,7 @@ pub unsafe extern "C" fn tjs2_script_compile(
         }
 
         let handle = Box::new(tjs2_script {
-            codegen,
+            image,
             status,
             message,
             position,
@@ -249,7 +255,12 @@ pub unsafe extern "C" fn tjs2_script_compile(
             count: handle.values.len() as c_int,
         };
         handle
-    })
+    }) {
+        Ok(handle) => handle,
+        // the front end panicked: the handle carries the failure, so the
+        // panic's text is not lost
+        Err(panic) => failed(&panic),
+    }
 }
 
 /// Frees the handle and every buffer of the image it owns.
@@ -352,7 +363,7 @@ pub unsafe extern "C" fn tjs2_script_block_image(
         return std::ptr::null();
     };
     script
-        .codegen
+        .image
         .block
         .as_ref()
         .map(|block| block as *const tjs2_codegen_block)
@@ -374,4 +385,36 @@ pub unsafe extern "C" fn tjs2_script_pp_values(
         return std::ptr::null();
     };
     &script.pp_values as *const tjs2_pp_values
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CStr;
+
+    use super::*;
+
+    /// A panic in the front end is a failure the caller can read: the
+    /// handle carries the panic's text.
+    ///
+    /// The reference raises on a failure of the compile
+    /// (`reference/cpp/core/tjs2/tjsScriptBlock.cpp:444-446`), and the
+    /// message it raises with is the first failure's
+    /// (`reference/cpp/core/tjs2/tjsError.h:288`).
+    #[test]
+    fn a_panic_is_an_error_value() {
+        let message = guard(|| -> () { panic!("the front end panicked") }).unwrap_err();
+        assert_eq!(message, "the front end panicked");
+        let handle = failed(&message);
+        // SAFETY: the handle is live and not freed.
+        unsafe {
+            assert_eq!(tjs2_script_status(handle), TJS2_SCRIPT_ERROR_PANIC);
+            let text = tjs2_script_error_message(handle);
+            assert!(!text.is_null(), "the handle carries the message");
+            assert_eq!(
+                CStr::from_ptr(text).to_string_lossy(),
+                "the front end panicked"
+            );
+            tjs2_script_free(handle);
+        }
+    }
 }

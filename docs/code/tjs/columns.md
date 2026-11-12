@@ -8,8 +8,8 @@ beside the C++ tree it replaces: `tjs::vm` holds the Rust columns, and
 
 The VM is being replaced one column at a time, and this module is where the
 Rust columns live: the **lexer** (C1), the **parser** (C2) and the **code
-generator** (C3). Each column has a native Rust API and an `extern "C"` API
-over one implementation — the C ABI is a thin facade, not a second
+generator** (C3). Each column has a native Rust API over one
+implementation — the C ABI is a thin facade, not a second
 implementation. The C ABI is panic-safe and crosses as values: a status code
 plus separately retrievable detail, never a Rust type and never a panic
 unwinding into C++.
@@ -20,11 +20,9 @@ unwinding into C++.
 |---|---|
 | the compile entry | `crates/tjs/src/vm/mod.rs` — the front end's own door: the script text in, the image of the script block out |
 | the lexer | `crates/tjs/src/vm/lexer/` — the analyser, its token kinds and its values |
-| the lexer's C ABI | `crates/tjs/src/vm/lexer/ffi.rs` and `crates/tjs/cpp/tjs2_lexer.h` |
 | the parser | `crates/tjs/src/vm/parser/` — the recursive-descent parser and the node tree |
 | the code generator | `crates/tjs/src/vm/codegen/` — the node tree to bytecode |
-| the generator's shipped C ABI | `crates/tjs/src/vm/codegen/ffi.rs` and `crates/tjs/cpp/tjs2_codegen.h` |
-| the generator's proof instrument | `crates/tjs/src/vm/codegen/proof.rs` — not the shipped interface |
+| the image | `crates/tjs/src/vm/codegen/ffi.rs` and `crates/tjs/cpp/tjs2_codegen.h` — the shape the compile entry hands back, and the header the C++ side reads |
 
 The two columns that have a page of their own:
 [`parser.md`](parser.md) carries the grammar's productions, and
@@ -53,13 +51,13 @@ drives the Rust parser, which drives the Rust generator, over native Rust
 calls. No C ABI stands between them, so the node tree is never copied and
 the parser's tree type is the generator's tree type.
 
-The C ABI comes **last**, at the generator's end. The C++ VM calls one
-entry — compile this script text — and receives the script block the C++
-executor consumes. The C++ never calls the lexer or the parser separately:
-the C++ grammar is replaced wholesale, not adapted. The lexer's C ABI and
-the generator's node-builder ABI are therefore **proof instruments**: they
-exist to compare one implementation against the reference from outside, and
-they are not the shipped interface.
+The C ABI comes **last**, at the generator's end, and it is **one**: the
+C++ VM calls one entry — compile this script text — and receives the
+script block the C++ executor consumes. The C++ never calls the lexer or
+the parser separately: the C++ grammar is replaced wholesale, not
+adapted. Nothing else crosses the boundary: the lexer's and the
+generator's own C interfaces are gone, and the image the entry hands back
+is the only thing the C++ side reads.
 
 ## 3. The seam
 

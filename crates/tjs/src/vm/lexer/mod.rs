@@ -15,7 +15,6 @@
 #![deny(unsafe_code)]
 
 mod error;
-pub mod ffi;
 mod literal;
 mod number;
 mod preprocess;

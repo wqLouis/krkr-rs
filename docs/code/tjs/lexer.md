@@ -43,11 +43,11 @@ The analyser's tokens, values and positions are compared against the
 reference's own analyser over the game's scripts, and the two agree on every
 script; the measurements are in [`../../perf.md`](../../perf.md) §6.1.
 
-## 3. Its C interface
+## 3. Its interface
 
-`crates/tjs/src/vm/lexer/ffi.rs` and `crates/tjs/cpp/tjs2_lexer.h`. It is
-a proof instrument, not the shipped interface: the shipped one is the
-compile entry at the end of the pipeline. See
+The analyser has no C interface of its own. The tree ships **one** C
+ABI — the compile entry, at the root of the module — and it drives the
+analyser over the Rust API, like the parser does. See
 [`columns.md`](columns.md) §3.
 
 ---

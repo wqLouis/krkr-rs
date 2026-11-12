@@ -14,8 +14,7 @@ Two interfaces sit over one implementation:
 | interface | where | what it is |
 |---|---|---|
 | the native Rust API | `crates/tjs/src/vm/codegen/` | the tree the parser makes, in and the code out |
-| the shipped C ABI | `crates/tjs/src/vm/codegen/ffi.rs`, `crates/tjs/cpp/tjs2_codegen.h` | the image of a script block, for the C++ VM |
-| the proof instrument | `crates/tjs/src/vm/codegen/proof.rs` | node-building calls, so the two code streams can be compared word for word; **not** the shipped interface |
+| the image | `crates/tjs/src/vm/codegen/ffi.rs`, `crates/tjs/cpp/tjs2_codegen.h` | the shape of a script block, for the C++ VM: the compile entry hands it back and the C++ side reads it |
 
 ## 1. What the generator does
 
@@ -191,38 +190,27 @@ that prove them cite the same lines.
 |---|---|
 | the numbering is the grammar's: the token numbers are part of the tree the generator walks, so they must match the grammar's exactly | `reference/krkr2/cpp/core/tjs2/bison/tjs.y:44-186` (and the generated `tjs.tab.hpp`) |
 
-### 2.14 The C ABI — `ffi.rs`
+### 2.14 The image — `ffi.rs`
 
 | rule | reference |
 |---|---|
-| the script-block interface hands the native executor the image of a script block | `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:862` (the code the executor runs) |
-| the node-building interface lets the native grammar drive the Rust generator | `reference/krkr2/cpp/core/tjs2/bison/tjs.y` |
+| the script-block image hands the native executor the image of a script block | `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:862` (the code the executor runs) |
 | no entry point unwinds into the native caller | `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:862` (the native call site) |
 | the tree has a shape the generator does not support: a typed error | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:1110-2736` |
-| the error's detail is read separately, through `tjs2_codegen_last_error_message`, and never as a Rust type across the boundary | `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:862` (the native call site) |
+| the failure's detail is read separately, through the handle's message, and never as a Rust type across the boundary | `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:862` (the native call site) |
 | the line table: the text is split on `\r` and `\n`, a `\r\n` counts as one break, and every line contributes its start offset and its length in code units, without the break | `reference/krkr2/cpp/core/tjs2/tjsScriptBlock.cpp:207-232` |
 | the constant array's kind and the constant dictionary's kind: the image carries the elements and the side that has the object builds it | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:123-130` (the array's `add`), `:132-139` (the dictionary's `PropSet`) |
 | the class's super-class proxy: the class makes it once and keeps it | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3626-3632` |
 
-### 2.15 The proof instrument — `proof.rs`
-
-| rule | reference |
-|---|---|
-| the node-building interface lets the native grammar drive the Rust generator, so the two code streams can be compared word for word | `reference/krkr2/cpp/core/tjs2/bison/tjs.y` (the grammar) |
-| the native side consumes the script-block image | `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:862` |
-| no entry point unwinds into the native caller | `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:862` (the native call site) |
-| the kind of a context, from the native number | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:282` (the context's kind enum) |
-| the kind of a value, from the native number | `reference/krkr2/cpp/core/tjs2/tjsVariant.h:103` (`tTJSVariantType`) |
-| the constant expressions are folded where the node is made | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3812-3886` (`MakeNP1`) |
-
-### 2.16 The tests — `tests.rs`
+### 2.15 The tests — `crates/tjs/tests/codegen_image.rs`
 
 | rule | reference |
 |---|---|
 | the image builder's tests are about what the native side reads: the code stream, the constant area, the variable area, the function-argument area, the labels and the line table | `reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:862` |
 | the context closes with the return sequence | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3457-3500` (`ReturnFromFunc`: `SRV`, the value, `RET`) |
+| the context's kind is the reference's number | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:166-175` |
 
-### 2.17 The module root — `crates/tjs/src/vm/mod.rs`
+### 2.16 The module root — `crates/tjs/src/vm/mod.rs`
 
 | rule | reference |
 |---|---|

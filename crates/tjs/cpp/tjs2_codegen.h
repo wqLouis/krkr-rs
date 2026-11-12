@@ -1,21 +1,16 @@
 /*
     The script-block interface of the Rust code generator.
 
-    This is the SHIPPED interface: it hands the C++ executor the image of
-    a script block, context by context. The executor runs a context's
+    This is the SHIPPED interface, and it is the only one: the compile
+    entry compiles script text and hands the C++ executor the image of a
+    script block, context by context. The executor runs a context's
     code stream and its size, and reads the constant area, the variable
     area, the function-argument area and the labels beside it
     (crates/tjs/cpp/tjs2/tjsInterCodeGen.h:293-295, GetCodeSize() at :435,
     the code read at crates/tjs/cpp/tjs2/tjsInterCodeExec.cpp:862).
 
-    The node-building calls further down are the PROOF INSTRUMENT. They
-    exist only so that the C++ grammar can drive the Rust generator and
-    the two code streams can be compared word for word. They are not the
-    shipped interface, and their marshalling cost is not a shipping
-    number.
-
-    Every entry point catches a panic and reports it as an error value;
-    no entry point unwinds into the C++ caller.
+    The entry catches a panic and reports it as an error value; no entry
+    point unwinds into the C++ caller.
 */
 
 #ifndef tjs2CodegenH
@@ -27,13 +22,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/* The error codes. Zero is success; the negative codes are failures. */
-#define TJS2_CG_OK             0
-#define TJS2_CG_ERROR_SYNTAX  -1
-#define TJS2_CG_ERROR_PANIC   -2
-#define TJS2_CG_ERROR_RANGE   -3
-#define TJS2_CG_ERROR_STATE   -4
 
 /* The kinds of a code context. */
 #define TJS2_CG_CONTEXT_TOP_LEVEL          0
@@ -79,9 +67,6 @@ extern "C" {
 #define TJS2_CG_ARG_NORMAL         0
 #define TJS2_CG_ARG_EXPAND         1
 #define TJS2_CG_ARG_UNNAMED_EXPAND 2
-
-/* An opaque generator: it holds the contexts of one script block. */
-typedef struct tjs2_codegen tjs2_codegen;
 
 /*----------------------------------------------------------------------
     The script block.
@@ -368,224 +353,6 @@ const tjs2_codegen_block *tjs2_script_block_image(const tjs2_script *script);
    NULL when the handle holds none. */
 const tjs2_pp_values *tjs2_script_pp_values(const tjs2_script *script);
 
-/* Makes a generator: an empty script block. */
-tjs2_codegen *tjs2_codegen_new(void);
-
-/* Frees a generator and every image it holds. */
-void tjs2_codegen_free(tjs2_codegen *generator);
-
-/* The image of the script block.
-   The returned pointer is owned by the generator and stays valid until
-   the generator is freed. It is null when the block could not be made,
-   and the error is then read with tjs2_codegen_last_error. */
-const tjs2_codegen_block *tjs2_codegen_block_image(const tjs2_codegen *generator);
-
-
-
-
-
-
-
-/* The image of one context. */
-const tjs2_codegen_context *tjs2_codegen_context_image(const tjs2_codegen *generator,
-                                                         int32_t context);
-
-/* The last error of the generator: a negative code, or zero. */
-int32_t tjs2_codegen_last_error(const tjs2_codegen *generator);
-
-/* The message of the last error. The returned pointer is owned by the
-   generator and stays valid until the next call on it. */
-const char *tjs2_codegen_last_error_message(const tjs2_codegen *generator);
-
-/*----------------------------------------------------------------------
-    The proof instrument.
-
-    These calls build the expression tree node by node, so that the C++
-    grammar can drive the Rust generator and the two code streams can be
-    compared. They are NOT the shipped interface: the shipped path hands
-    the Rust parser's tree to the Rust generator directly, and the C++
-    side consumes the script-block image above.
-   ----------------------------------------------------------------------*/
-
-/* A node of the tree: a number that names a node in the generator's
-   own table. No subtree is copied across the boundary. */
-typedef int32_t tjs2_codegen_node;
-
-/* Adds a child to a node. */
-int32_t tjs2_codegen_node_add_child(tjs2_codegen *generator,
-                                     tjs2_codegen_node node,
-                                     tjs2_codegen_node child);
-
-/* The opcode of a node. */
-int32_t tjs2_codegen_node_kind(tjs2_codegen *generator,
-                               tjs2_codegen_node node);
-
-/* The place of a node in the script. */
-int32_t tjs2_codegen_node_position(tjs2_codegen *generator,
-                                    tjs2_codegen_node node);
-
-/* Sets the opcode of a node. */
-int32_t tjs2_codegen_node_set_opcode(tjs2_codegen *generator,
-                                      tjs2_codegen_node node,
-                                      int32_t opcode);
-
-/* The number of contexts the generator holds. */
-int32_t tjs2_codegen_context_count(const tjs2_codegen *generator);
-
-/* The number of words in the code of a context. */
-int32_t tjs2_codegen_code_size(tjs2_codegen *generator, int32_t context);
-
-/* One word of the code of a context. */
-int32_t tjs2_codegen_code_word(tjs2_codegen *generator,
-                                int32_t context,
-                                int32_t index);
-
-
-/* Makes a node with an opcode. */
-int32_t tjs2_codegen_make_np0(tjs2_codegen *generator,
-                              int32_t opcode,
-                              int32_t position);
-
-/* Makes a node with an opcode and one child. */
-int32_t tjs2_codegen_make_np1(tjs2_codegen *generator,
-                              int32_t opcode,
-                              int32_t position,
-                              tjs2_codegen_node child);
-
-/* Makes a node with an opcode and two children. */
-int32_t tjs2_codegen_make_np2(tjs2_codegen *generator,
-                              int32_t opcode,
-                              int32_t position,
-                              tjs2_codegen_node child1,
-                              tjs2_codegen_node child2);
-
-/* Makes a node with an opcode and three children. */
-int32_t tjs2_codegen_make_np3(tjs2_codegen *generator,
-                              int32_t opcode,
-                              int32_t position,
-                              tjs2_codegen_node child1,
-                              tjs2_codegen_node child2,
-                              tjs2_codegen_node child3);
-
-/* Makes a constant node. */
-int32_t tjs2_codegen_make_const(tjs2_codegen *generator,
-                                int32_t position,
-                                const tjs2_codegen_value *value);
-
-/* Sets the value of a node. */
-int32_t tjs2_codegen_node_set_value(tjs2_codegen *generator,
-                                     tjs2_codegen_node node,
-                                     const tjs2_codegen_value *value);
-
-/* The place in the script the analyser is at.
-
-   The generator writes this place into the instructions that have no place
-   of their own. The native grammar tells the generator where the analyser
-   is every time the analyser reads. */
-int32_t tjs2_codegen_at_lex_position(tjs2_codegen *generator,
-                                     int32_t position);
-
-/* Opens a code context. */
-int32_t tjs2_codegen_push_context(tjs2_codegen *generator,
-                                   const uint16_t *name,
-                                   uint32_t name_length,
-                                   int32_t kind);
-
-/* Closes the code context the code is generated for. */
-int32_t tjs2_codegen_pop_context(tjs2_codegen *generator);
-
-/* The code of an expression that stands on its own. */
-int32_t tjs2_codegen_create_expr_code(tjs2_codegen *generator,
-                                       tjs2_codegen_node node);
-
-/* A local variable of the context. */
-int32_t tjs2_codegen_add_local_variable(tjs2_codegen *generator,
-                                        const uint16_t *name,
-                                        uint32_t name_length,
-                                        int32_t init);
-
-/* A local variable of the context, with its first value. */
-int32_t tjs2_codegen_init_local_variable(tjs2_codegen *generator,
-                                         const uint16_t *name,
-                                         uint32_t name_length,
-                                         tjs2_codegen_node node);
-
-/* A declared argument of a function. */
-int32_t tjs2_codegen_add_function_decl_arg(tjs2_codegen *generator,
-                                            const uint16_t *name,
-                                            uint32_t name_length,
-                                            tjs2_codegen_node node);
-
-/* The collapsed argument of a function. */
-int32_t tjs2_codegen_add_function_decl_arg_collapse(tjs2_codegen *generator,
-                                                    const uint16_t *name,
-                                                    uint32_t name_length);
-
-/* The argument of a property setter. */
-int32_t tjs2_codegen_set_property_decl_arg(tjs2_codegen *generator,
-                                            const uint16_t *name,
-                                            uint32_t name_length);
-
-/* The commands of the grammar. */
-int32_t tjs2_codegen_enter_if_code(tjs2_codegen *generator);
-int32_t tjs2_codegen_create_if_expr_code(tjs2_codegen *generator,
-                                         tjs2_codegen_node node);
-int32_t tjs2_codegen_exit_if_code(tjs2_codegen *generator);
-int32_t tjs2_codegen_enter_else_code(tjs2_codegen *generator);
-int32_t tjs2_codegen_exit_else_code(tjs2_codegen *generator);
-int32_t tjs2_codegen_enter_while_code(tjs2_codegen *generator, int32_t do_while);
-int32_t tjs2_codegen_create_while_expr_code(tjs2_codegen *generator,
-                                            tjs2_codegen_node node,
-                                            int32_t do_while);
-int32_t tjs2_codegen_exit_while_code(tjs2_codegen *generator, int32_t do_while);
-int32_t tjs2_codegen_enter_for_code(tjs2_codegen *generator);
-int32_t tjs2_codegen_create_for_expr_code(tjs2_codegen *generator,
-                                          tjs2_codegen_node node);
-int32_t tjs2_codegen_set_for_third_expr_code(tjs2_codegen *generator,
-                                              tjs2_codegen_node node);
-int32_t tjs2_codegen_exit_for_code(tjs2_codegen *generator);
-int32_t tjs2_codegen_enter_switch_code(tjs2_codegen *generator,
-                                        tjs2_codegen_node node);
-int32_t tjs2_codegen_exit_switch_code(tjs2_codegen *generator);
-int32_t tjs2_codegen_process_case_code(tjs2_codegen *generator,
-                                        tjs2_codegen_node node);
-int32_t tjs2_codegen_enter_with_code(tjs2_codegen *generator,
-                                     tjs2_codegen_node node);
-int32_t tjs2_codegen_exit_with_code(tjs2_codegen *generator);
-int32_t tjs2_codegen_enter_try_code(tjs2_codegen *generator);
-int32_t tjs2_codegen_enter_catch_code(tjs2_codegen *generator,
-                                       const uint16_t *name,
-                                       uint32_t name_length);
-int32_t tjs2_codegen_exit_try_code(tjs2_codegen *generator);
-int32_t tjs2_codegen_process_throw_code(tjs2_codegen *generator,
-                                         tjs2_codegen_node node);
-int32_t tjs2_codegen_do_break(tjs2_codegen *generator);
-int32_t tjs2_codegen_do_continue(tjs2_codegen *generator);
-int32_t tjs2_codegen_do_debugger(tjs2_codegen *generator);
-int32_t tjs2_codegen_return_from_func(tjs2_codegen *generator,
-                                       tjs2_codegen_node node);
-int32_t tjs2_codegen_create_extends_expr_code(tjs2_codegen *generator,
-                                              tjs2_codegen_node node,
-                                              int32_t hold);
-int32_t tjs2_codegen_enter_block(tjs2_codegen *generator);
-int32_t tjs2_codegen_exit_block(tjs2_codegen *generator);
-
-/* Compares the data of a context with the data the caller holds. */
-int32_t tjs2_codegen_compare_data(const tjs2_codegen *generator,
-                                   int32_t context,
-                                   const tjs2_codegen_value *values,
-                                   int32_t count);
-
-/* Compares the code of a context with the code the caller holds.
-   The return value is zero when the two are the same, the number of the
-   first word that differs (counting from one) when they are not, and a
-   negative value when the lengths differ. */
-int32_t tjs2_codegen_compare_code(const tjs2_codegen *generator,
-                                   int32_t context,
-                                   const int32_t *code,
-                                   int32_t length);
-
-#ifdef __cplusplus
 }
 #endif
 
