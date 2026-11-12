@@ -329,12 +329,12 @@ counts its whole `src/` — the C ABI wrapper and the Rust VM module — and its
 
 | layer | crates | total |
 |---|---|---|
-| L1 | api 2 924 · fs 2 906 · media 5 601 · psd 4 113 · render 10 854 · platform 3 831 | 30 229 |
-| L2 | engine | 31 208 |
-| L3 | compat | 99 718 |
-| L4 | tjs 22 083 · vm 857 | 22 940 |
+| L1 | api 2 939 · fs 3 091 · media 5 816 · psd 4 383 · render 15 120 · platform 4 029 | 35 378 |
+| L2 | engine | 34 315 |
+| L3 | compat | 102 979 |
+| L4 | tjs 22 535 · vm 857 | 23 392 |
 
-L3 is more than three times L2. **That is correct and intended.** L2 is a
+L3 is three times the size of L2. **That is correct and intended.** L2 is a
 small, generic, backend-agnostic engine — the layer tree, the mixer, the
 timers, the VFS namespace, the projection — and keeping it small is exactly
 what lets the backend be swapped freely: the Vulkan host, the null backend
