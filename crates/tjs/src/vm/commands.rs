@@ -210,6 +210,11 @@ impl Commands for Generator {
     fn exit_block(&mut self) {
         Generator::exit_block(self);
     }
+
+    /// The place in the script the analyser is at.
+    fn at_lex_position(&mut self, position: i32) {
+        self.lex_position = position;
+    }
 }
 
 /// The generator itself is the commands the parser drives.
@@ -407,5 +412,10 @@ impl Commands for &mut Generator {
     /// Closes a block.
     fn exit_block(&mut self) {
         (**self).exit_block();
+    }
+
+    /// The place in the script the analyser is at.
+    fn at_lex_position(&mut self, position: i32) {
+        self.lex_position = position;
     }
 }

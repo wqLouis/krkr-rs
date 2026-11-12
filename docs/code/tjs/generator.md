@@ -72,6 +72,7 @@ that prove them cite the same lines.
 | the tree has a shape the generator does not support: a typed error, never a silent one | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:1110-2736` |
 | the emission and the context management are one thing | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:246-680` (one class holds both) |
 | the place of an instruction comes from the analyser, not from the node | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:25` (`LEX_POS`) |
+| the generator holds that place and the emission writes it, and the parser refreshes it where it reads a token | `reference/krkr2/cpp/core/tjs2/tjsLex.cpp:1656-1658` (`Current - Script`) |
 | the global context cannot reach a local variable, so the name space is not consulted | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:2200-2210` |
 | the declaration of a local variable | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:2845-2884` (`AddLocalVariable`) |
 | the sub-types that modify the left hand side, from the pre-increment to the type query | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:1110-2736` (the operation switch) |

@@ -25,6 +25,11 @@
 //! without a lookahead when the rule's last symbol is a token.
 //! The parser follows the same discipline: a node is made when the rule
 //! that makes it is complete.
+//!
+//! The instructions that have no place of their own take the place the
+//! analyser is at, and the parser hands that place to the generator
+//! every time the analyser reads. The generator holds it, so it writes
+//! the place the analyser is at and not the place of the last node.
 
 mod error;
 mod nodes;
@@ -198,6 +203,14 @@ pub trait Commands {
 
     /// Closes a block.
     fn exit_block(&mut self);
+
+    /// The place in the script the analyser is at.
+    ///
+    /// The generator writes this place into the instructions that have
+    /// no place of their own. The parser tells the generator where the
+    /// analyser is every time the analyser reads, so the place the
+    /// generator holds is the place the analyser is at.
+    fn at_lex_position(&mut self, position: i32);
 }
 
 /// One argument of a call.
@@ -325,6 +338,9 @@ impl<'a, C: Commands> Parser<'a, C> {
                     });
                 }
             }
+            // the analyser has read: the generator's place follows it
+            let position = self.position();
+            self.commands.at_lex_position(position);
         }
     }
 

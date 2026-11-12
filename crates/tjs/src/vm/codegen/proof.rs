@@ -645,6 +645,30 @@ fn same_value(mine: &Value, theirs: &tjs2_codegen_value) -> bool {
     }
 }
 
+/// The place in the script the analyser is at.
+///
+/// The generator writes this place into the instructions that have no
+/// place of their own. The native grammar tells the generator where the
+/// analyser is every time the analyser reads.
+///
+/// # Safety
+///
+/// `generator` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tjs2_codegen_at_lex_position(
+    generator: *mut tjs2_codegen,
+    position: c_int,
+) -> c_int {
+    // SAFETY: the caller promises the handle is live.
+    let Some(generator) = (unsafe { generator.as_mut() }) else {
+        return TJS2_CG_ERROR_PANIC;
+    };
+    guard(TJS2_CG_ERROR_PANIC, || {
+        generator.generator.lex_position = position;
+        TJS2_CG_OK
+    })
+}
+
 /// Opens a code context.
 ///
 /// # Safety

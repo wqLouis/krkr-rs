@@ -100,11 +100,11 @@ pub struct Emitter<'a> {
 
 impl<'a> Emitter<'a> {
     /// An emitter over the given contexts.
-    pub fn new(contexts: &'a mut Vec<Context>, current: usize) -> Self {
+    pub fn new(contexts: &'a mut Vec<Context>, current: usize, lex_position: i32) -> Self {
         Self {
             contexts,
             current,
-            lex_position: -1,
+            lex_position,
             as_global_context_mode: false,
         }
     }
@@ -221,6 +221,7 @@ impl<'a> Emitter<'a> {
 
     /// Adds a local variable to the context.
     pub fn add_local_variable(&mut self, name: &str, init: i32) {
+        let position = self.lex_pos();
         let base = if self.context().kind == ContextType::Class {
             2
         } else {
@@ -233,22 +234,26 @@ impl<'a> Emitter<'a> {
             let reserve = self.context().kind.variable_reserve_count();
             let register = -index - reserve - 1;
             if init != 0 {
-                self.context_mut().put_code(vm::CP, -1);
+                self.context_mut().put_code(vm::CP, position);
                 self.context_mut()
-                    .put_code(opcode::vm_reg_addr(register), -1);
-                self.context_mut().put_code(opcode::vm_reg_addr(init), -1);
+                    .put_code(opcode::vm_reg_addr(register), position);
+                self.context_mut()
+                    .put_code(opcode::vm_reg_addr(init), position);
             } else {
-                self.context_mut().put_code(vm::CL, -1);
+                self.context_mut().put_code(vm::CL, position);
                 self.context_mut()
-                    .put_code(opcode::vm_reg_addr(register), -1);
+                    .put_code(opcode::vm_reg_addr(register), position);
             }
         } else {
             // the variable is a member of `this`
             let data = self.context_mut().put_data(Value::String(name.to_string()));
-            self.context_mut().put_code(vm::SPDS, -1);
-            self.context_mut().put_code(opcode::vm_reg_addr(-1), -1);
-            self.context_mut().put_code(opcode::vm_reg_addr(data), -1);
-            self.context_mut().put_code(opcode::vm_reg_addr(init), -1);
+            self.context_mut().put_code(vm::SPDS, position);
+            self.context_mut()
+                .put_code(opcode::vm_reg_addr(-1), position);
+            self.context_mut()
+                .put_code(opcode::vm_reg_addr(data), position);
+            self.context_mut()
+                .put_code(opcode::vm_reg_addr(init), position);
         }
     }
 

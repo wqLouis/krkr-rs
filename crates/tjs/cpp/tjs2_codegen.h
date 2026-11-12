@@ -437,6 +437,14 @@ int32_t tjs2_codegen_node_set_value(tjs2_codegen *generator,
                                      tjs2_codegen_node node,
                                      const tjs2_codegen_value *value);
 
+/* The place in the script the analyser is at.
+
+   The generator writes this place into the instructions that have no place
+   of their own. The native grammar tells the generator where the analyser
+   is every time the analyser reads. */
+int32_t tjs2_codegen_at_lex_position(tjs2_codegen *generator,
+                                     int32_t position);
+
 /* Opens a code context. */
 int32_t tjs2_codegen_push_context(tjs2_codegen *generator,
                                    const uint16_t *name,

@@ -51,6 +51,7 @@ that prove them cite the same lines.
 |---|---|
 | the parser follows the grammar's productions: the same expressions, the same statements, the same commands to the generator | `reference/krkr2/cpp/core/tjs2/bison/tjs.y` (the grammar) |
 | the place of a node is the analyser's own place, counted in code units from the start of the script | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:25` (`LEX_POS`) |
+| the parser keeps the generator's place current where it reads a token, and that place is the analyser's read cursor - the place just past the last token read | `reference/krkr2/cpp/core/tjs2/tjsLex.cpp:1656-1658` (`Current - Script`) |
 | the lookahead is read before a rule whose last symbol is an expression is reduced, and not before a rule whose last symbol is a token | `reference/krkr2/cpp/core/tjs2/bison/tjs.y` (the grammar's lookahead discipline) |
 | the names of the commands are the generator's names | `reference/krkr2/cpp/core/tjs2/bison/tjs.y:216-861` (the grammar's actions) |
 | an argument is made a node only when it is an expression; the empty argument and the expanding argument are made when the list is reduced | `reference/krkr2/cpp/core/tjs2/bison/tjs.y:769-775` |

@@ -59,12 +59,30 @@ impl From<emit::EmitError> for CodegenError {
 }
 
 /// The generator: it holds the contexts of one script block.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Generator {
     /// The contexts, in the order they were made.
     contexts: Vec<Context>,
     /// The context the code is generated for.
     current: usize,
+    /// The place in the script the analyser is at.
+    ///
+    /// The instructions that have no place of their own take this one.
+    /// The parser keeps it current: it tells the generator where the
+    /// analyser is every time the analyser reads.
+    pub lex_position: i32,
+}
+
+impl Default for Generator {
+    fn default() -> Self {
+        Self {
+            contexts: Vec::new(),
+            current: 0,
+            // the analyser has not been read yet: the instructions that
+            // have no place of their own have no place
+            lex_position: -1,
+        }
+    }
 }
 
 impl Generator {
@@ -147,9 +165,10 @@ impl Generator {
         }
         // the epilogue
         if kind != ContextType::Property && kind != ContextType::SuperClassGetter {
-            self.contexts[index].put_code(opcode::vm::SRV, -1);
-            self.contexts[index].put_code(opcode::vm_reg_addr(0), -1);
-            self.contexts[index].put_code(opcode::vm::RET, -1);
+            let position = self.lex_position;
+            self.contexts[index].put_code(opcode::vm::SRV, position);
+            self.contexts[index].put_code(opcode::vm_reg_addr(0), position);
+            self.contexts[index].put_code(opcode::vm::RET, position);
         }
         // the registration of the context in its parent
         self.register_function(index)?;
@@ -246,7 +265,7 @@ impl Generator {
         self.contexts[parent].put_code(opcode::vm_reg_addr(data), -1);
         frame += 1;
         {
-            let mut emitter = emit::Emitter::new(&mut self.contexts, parent);
+            let mut emitter = emit::Emitter::new(&mut self.contexts, parent, self.lex_position);
             emitter.add_local_variable(name, frame - 1);
         }
         self.clear_frame_at(parent, &mut frame);
@@ -288,7 +307,7 @@ impl Generator {
         restype: u32,
         param: SubParam,
     ) -> Result<i32, CodegenError> {
-        let mut emitter = emit::Emitter::new(&mut self.contexts, self.current);
+        let mut emitter = emit::Emitter::new(&mut self.contexts, self.current, self.lex_position);
         let result = emitter.gen_node_code(frame, node, restype, param);
         self.current = emitter.current;
         Ok(result?)
@@ -296,7 +315,7 @@ impl Generator {
 
     /// The emitter over the generator's contexts.
     fn emitter(&mut self) -> emit::Emitter<'_> {
-        emit::Emitter::new(&mut self.contexts, self.current)
+        emit::Emitter::new(&mut self.contexts, self.current, self.lex_position)
     }
 
     /// Adds a local variable to the context.

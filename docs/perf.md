@@ -861,20 +861,29 @@ together, so the two counts must agree — and in one script the reference holds
 thirteen context constants and builds its prologue from one declaration.
 That is the open defect.
 
-**The places of the instructions.** An end-to-end test — the lexer, the parser
-and the generator over one script, and the image read back through the
-shipped compile entry — compares the image with the reference's own output,
-and it finds that the reference gives a place to two kinds
-of instruction that the Rust leaves without one. The reference's generator
-passes the analyser's current position to every instruction it writes; the
-Rust writes "no place of its own" for a variable's assignment and for the
-epilogue a context's commit adds. The cause is the shape between the
-columns: the `Commands` contract carries no place, so the place the parser
-is at cannot reach the generator at all.
+**The places of the instructions.** The reference's generator passes the
+analyser's **read cursor** to every instruction it writes — the place just
+past the last token the parser read, not the node's place. The Rust wrote
+"no place of its own" for a variable's assignment and for the epilogue a
+context's commit adds, and the cause was the shape between the columns: the
+`Commands` contract carried no place, so the place the parser was at could
+not reach the generator at all.
 
-The test is written against the reference's own values, and it lands with
-the generator's next change; it is red until then, and it is not weakened
-to match the Rust.
+The shape now: the generator holds the analyser's place as a field, and the
+`Commands` contract has one seam for it, which the parser refreshes in the
+one function that reads a token. The other direction — the trait's methods
+carrying the place — was rejected: it would thread a place through five
+calls for one site, where the reference has 61 sites, most of them inside
+generator methods, each of which is now a one-word change.
+
+**The end-to-end test.** `crates/tjs/tests/vm_pipeline.rs` runs the lexer,
+the parser and the generator over one script and reads the image back
+through the shipped compile entry, and compares it with the reference's own
+output: the code streams, the constants, the context kinds, the source
+positions, and the whole error path — the message, the place and the count
+for a missing semicolon and for an unterminated comment. **Eleven tests,
+all passing.** The expected values are the reference's, written out literally;
+when the Rust disagreed, the test was left red rather than weakened.
 
 **The inline array.** The reference has two forms, and the ordinary one was
 never the problem it was taken to be. An ordinary inline array `[a,b,c]`
