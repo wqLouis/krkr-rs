@@ -157,6 +157,7 @@ fn the_headless_script_clock_tracks_the_wall_clock() {
         mode: RunMode::Headless { frames: FRAMES },
         dump_frame: None,
         slow_report_budget: None,
+        frame_report: true,
     })
     .expect("headless run");
 

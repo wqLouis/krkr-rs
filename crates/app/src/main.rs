@@ -1,7 +1,7 @@
 //! `krkr` CLI: headless frame runner and windowed desktop frontend.
 //!
 //! ```text
-//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--preload-archives] [--graphic-cache-limit LIMIT] [--slow-report-ms N] [--vm-report] [--archive XP3 ...] [--base-dir DIR] [GAME]
+//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--preload-archives] [--graphic-cache-limit LIMIT] [--slow-report-ms N] [--no-frame-report] [--vm-report] [--archive XP3 ...] [--base-dir DIR] [GAME]
 //! ```
 //!
 //! * `--headless` runs an empty scene for `N` frames (default 120) through
@@ -50,6 +50,10 @@
 //!   reports unbounded, and `0` reports no slow frame at all. The budget is
 //!   spent by the time the reports take: a run that has spent it stops
 //!   reporting and says so once.
+//! * `--no-frame-report` skips the frame-time distribution the run prints as
+//!   its last line: the number of frames, the fastest and the slowest frame,
+//!   the percentiles and the 1% low. The report is on by default, and the
+//!   option leaves the run without it.
 //! * `--vm-report` switches the VM's own measurement of the script
 //!   compilation on and prints the analysis at the end of the run: the
 //!   number of compiles, the size of the scripts they read, and the time the
@@ -136,6 +140,11 @@ const OPTIONS: &[OptionDoc] = &[
         help: "Bound the wall-clock time the run spends reporting slow frames (default: unbounded; 0 reports no slow frame).",
     },
     OptionDoc {
+        flag: "--no-frame-report",
+        value: "",
+        help: "Skip the frame-time distribution the run prints as its last line (on by default).",
+    },
+    OptionDoc {
         flag: "--vm-report",
         value: "",
         help: "Measure the VM's script compilation and print its analysis at the end of the run.",
@@ -200,6 +209,8 @@ struct Cli {
     /// The whole-run budget for the slow-frame reports, in milliseconds, or
     /// `None` when the option was absent.
     slow_report_ms: Option<u64>,
+    /// Whether the run prints its frame-time distribution at the end.
+    frame_report: bool,
     /// Whether `--vm-report` was given.
     vm_report: bool,
     /// Explicit `--archive` list, in mount order (later wins).
@@ -239,6 +250,7 @@ impl Cli {
             graphic_cache_limit: None,
             dump_frame: None,
             slow_report_ms: None,
+            frame_report: true,
             vm_report: false,
             archives: Vec::new(),
             base_dir: None,
@@ -297,6 +309,7 @@ impl Cli {
                     })?);
                 }
                 "--vm-report" => cli.vm_report = true,
+                "--no-frame-report" => cli.frame_report = false,
                 "--archive" => {
                     let value = args
                         .next()
@@ -483,6 +496,7 @@ fn main() -> ExitCode {
         },
         dump_frame: cli.dump_frame,
         slow_report_budget,
+        frame_report: cli.frame_report,
     };
 
     let outcome = app::run(launch);

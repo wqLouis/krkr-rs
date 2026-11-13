@@ -36,6 +36,7 @@ fn the_dump_holds_the_presented_frame() {
         mode: RunMode::Headless { frames: 2 },
         dump_frame: Some(path.clone()),
         slow_report_budget: None,
+        frame_report: true,
     };
     app::run(launch).expect("headless run");
 
@@ -62,6 +63,7 @@ fn a_run_without_a_dump_writes_no_file() {
         mode: RunMode::Headless { frames: 1 },
         dump_frame: None,
         slow_report_budget: None,
+        frame_report: true,
     };
     app::run(launch).expect("headless run");
     assert!(

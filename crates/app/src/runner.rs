@@ -6,7 +6,9 @@
 //! launcher reads platform storage, and both hand the finished value to the
 //! same function so the core never learns where configuration comes from.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use api::config::{CacheLimit, RuntimeConfig};
@@ -19,6 +21,7 @@ use platform::{
 use render::{FrameStats, PresentedFrame};
 
 use crate::frame_dump::write_frame;
+use crate::frame_times::{FrameTimeReport, FrameTimes, Pacing, REPORT_FRAMES};
 use crate::{
     BackendKind, GameError, GameHost, Host, HostConfig, HostError, PlatformFrameTime, StepReport,
 };
@@ -79,6 +82,12 @@ pub struct Launch {
     /// spent it stops reporting and says so once. A budget of zero reports no
     /// slow frame at all.
     pub slow_report_budget: Option<Duration>,
+    /// Whether the run reports its frame-time distribution at the end.
+    ///
+    /// The report is the run's last line: the number of frames, the fastest
+    /// and the slowest frame, the percentiles and the 1% low. A run that
+    /// does not report it measures no history at all.
+    pub frame_report: bool,
 }
 
 /// What a completed [`run`] produced.
@@ -87,6 +96,9 @@ pub struct RunReport {
     /// The last frame the headless loop stepped, or `None` for a windowed run
     /// (and for a headless run of zero frames).
     pub last_frame: Option<StepReport>,
+    /// The frame-time distribution the run measured, or `None` for a run that
+    /// did not report it.
+    pub frame_times: Option<FrameTimeReport>,
 }
 
 /// The failures a [`run`] reports.
@@ -127,8 +139,18 @@ pub enum RunError {
 pub fn run(launch: Launch) -> Result<RunReport, RunError> {
     match launch.mode {
         RunMode::Headless { frames } => run_headless(&launch, frames),
-        RunMode::Windowed => run_windowed(&launch).map(|()| RunReport::default()),
+        RunMode::Windowed => run_windowed(&launch),
     }
+}
+
+/// Prints the run's frame-time report and returns it.
+///
+/// A run that measured no history reports nothing.
+fn print_frame_report(times: Option<&FrameTimes>, pacing: Pacing) -> Option<FrameTimeReport> {
+    let times = times?;
+    let report = times.report(pacing);
+    println!("{}", report.line());
+    Some(report)
 }
 
 /// Formats the null backend counters on one line.
@@ -268,6 +290,16 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
     // counts the time that actually passed, which is that period plus the
     // frame's own cost.
     let mut pacer = HeadlessPacer::new(launch.runtime.frame_rate_limit.period_secs());
+    // The loop waits for the frame's deadline, so every gap it measures
+    // includes that wait: the gaps are the presentation cadence, and not the
+    // engine's cost alone.
+    let pacing = Pacing {
+        paced: true,
+        period_ms: launch.runtime.frame_rate_limit.period_secs() * 1000.0,
+    };
+    // The history of the run's frame gaps; a run that does not report the
+    // distribution measures no history at all.
+    let mut times = launch.frame_report.then(|| FrameTimes::new(REPORT_FRAMES));
 
     if let Some(input) = &launch.game {
         let mut game = GameHost::open_with_preload(
@@ -288,6 +320,9 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
         for _ in 0..frames {
             pacer.wait();
             let frame_time = clock.advance(Instant::now());
+            if let Some(times) = times.as_mut() {
+                times.push(frame_time.elapsed_ms());
+            }
             last = Some(game.step(frame_time, &[])?);
             if let Some(path) = &launch.dump_frame {
                 // The file follows the picture: a frame that drew the same
@@ -336,7 +371,11 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
             scene.bitmaps.len(),
             reachable.join(",")
         );
-        return Ok(RunReport { last_frame: last });
+        let frame_times = print_frame_report(times.as_ref(), pacing);
+        return Ok(RunReport {
+            last_frame: last,
+            frame_times,
+        });
     }
 
     println!(
@@ -352,6 +391,9 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
     for _ in 0..frames {
         pacer.wait();
         let frame_time = clock.advance(Instant::now());
+        if let Some(times) = times.as_mut() {
+            times.push(frame_time.elapsed_ms());
+        }
         last = Some(host.step(frame_time)?);
         if let Some(path) = &launch.dump_frame {
             // The file follows the picture: a frame that drew the same image
@@ -372,7 +414,11 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
             format_stats(&stats)
         );
     }
-    Ok(RunReport { last_frame: last })
+    let frame_times = print_frame_report(times.as_ref(), pacing);
+    Ok(RunReport {
+        last_frame: last,
+        frame_times,
+    })
 }
 
 /// Writes the host's CPU-presented frame to `path`.
@@ -392,15 +438,37 @@ fn dump_presented_frame(media: &Media, path: &Path, host: &Host) -> Result<(), R
 }
 
 /// Opens a window through the L1 platform and drives [`Host::step`].
-fn run_windowed(launch: &Launch) -> Result<(), RunError> {
+fn run_windowed(launch: &Launch) -> Result<RunReport, RunError> {
     let frame_interval = Duration::from_secs_f64(launch.runtime.frame_rate_limit.period_secs());
     let mut config = PlatformConfig::default();
     config.title = "krkr-rs".to_owned();
     config.frame_interval = frame_interval;
-    Ok(platform::run(
-        config,
-        DesktopApp::new(launch, frame_interval),
-    )?)
+    // The platform's ticker paces the loop, so every gap the loop measures
+    // includes that wait: the gaps are the presentation cadence, and not the
+    // engine's cost alone.
+    let pacing = Pacing {
+        paced: true,
+        period_ms: frame_interval.as_secs_f64() * 1000.0,
+    };
+    // The handler records the gaps, and the runner reads the history after
+    // the platform loop returns, so the two share one handle.
+    let times = launch
+        .frame_report
+        .then(|| Rc::new(RefCell::new(FrameTimes::new(REPORT_FRAMES))));
+    let app = DesktopApp::new(launch, frame_interval, times.clone());
+    let outcome = platform::run(config, app);
+    let frame_times = match &times {
+        Some(times) => {
+            let history = times.borrow();
+            print_frame_report(Some(&history), pacing)
+        }
+        None => None,
+    };
+    outcome?;
+    Ok(RunReport {
+        last_frame: None,
+        frame_times,
+    })
 }
 
 /// The composition root's bridge from L1 platform events to the L2 host.
@@ -439,6 +507,11 @@ struct DesktopApp {
     /// The wall-clock time the run may spend producing slow-frame reports, or
     /// `None` to leave the reports unbounded.
     slow_report_budget: Option<Duration>,
+    /// The run's frame-gap history, shared with the runner that reports it.
+    ///
+    /// The handler records every gap the platform measured; the runner reads
+    /// the history when the platform loop returns.
+    frame_times: Option<Rc<RefCell<FrameTimes>>>,
     /// The image encoder the frame dump writes through.
     media: Media,
     /// Input and focus events received since the last frame, delivered to
@@ -561,7 +634,11 @@ impl DesktopApp {
     /// The handler keeps what it needs of the launch request: the backend,
     /// the game, the configuration the engine reads and the budget the
     /// slow-frame reports may spend.
-    fn new(launch: &Launch, frame_interval: Duration) -> Self {
+    fn new(
+        launch: &Launch,
+        frame_interval: Duration,
+        frame_times: Option<Rc<RefCell<FrameTimes>>>,
+    ) -> Self {
         Self {
             backend: launch.backend,
             game: launch.game.clone(),
@@ -580,6 +657,7 @@ impl DesktopApp {
             software: None,
             dump_frame: launch.dump_frame.clone(),
             slow_report_budget: launch.slow_report_budget,
+            frame_times,
             media: Media::new(),
         }
     }
@@ -742,6 +820,11 @@ impl EventHandler for DesktopApp {
         // The platform measured the real time since the previous frame; that
         // measurement is the elapsed time the engine's clock advances by.
         self.frame_time.elapsed_ms = f64::from(dt_ms);
+        // The same measurement is the run's frame gap, and the history keeps
+        // it for the distribution the run reports at the end.
+        if let Some(times) = &self.frame_times {
+            times.borrow_mut().push(f64::from(dt_ms));
+        }
         let (report, revisions) = {
             let Some(running) = self.running.as_mut() else {
                 return Flow::Continue;
@@ -842,6 +925,7 @@ mod tests {
             mode: RunMode::Headless { frames: 2 },
             dump_frame: None,
             slow_report_budget: None,
+            frame_report: true,
         })
         .expect("headless run");
         let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -882,6 +966,7 @@ mod tests {
             mode: RunMode::Headless { frames: 5 },
             dump_frame: None,
             slow_report_budget: None,
+            frame_report: true,
         })
         .expect("headless run");
         let elapsed = started.elapsed();

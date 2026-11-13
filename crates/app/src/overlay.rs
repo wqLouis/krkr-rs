@@ -22,6 +22,8 @@ use render::{
     upload_texture,
 };
 
+use crate::frame_times::one_percent_low_fps;
+
 use std::collections::VecDeque;
 
 /// Panel width in pixels.
@@ -188,7 +190,7 @@ impl Overlay {
 
         let stats = OverlayStats {
             fps,
-            one_percent_low_fps: one_percent_low_fps(&self.frame_times),
+            one_percent_low_fps: one_percent_low_fps(self.frame_times.iter().copied()),
             cpu_percent,
             io_read_per_s,
             io_write_per_s,
@@ -340,19 +342,6 @@ fn cpu_percent(previous_ns: Option<u64>, current_ns: Option<u64>, elapsed_s: f64
         return None;
     }
     Some(delta_ns as f64 / elapsed_s / 1_000_000_000.0 * 100.0)
-}
-
-/// Returns the average FPS of the slowest 1% of `frame_times`.
-fn one_percent_low_fps(frame_times: &VecDeque<f64>) -> Option<f64> {
-    if frame_times.is_empty() {
-        return None;
-    }
-    let mut sorted: Vec<f64> = frame_times.iter().copied().collect();
-    sorted.sort_by(|left, right| right.total_cmp(left));
-    let count = (sorted.len() / 100).max(1);
-    let slowest = sorted.get(..count)?;
-    let average_ms = slowest.iter().sum::<f64>() / count as f64;
-    (average_ms > 0.0).then_some(1000.0 / average_ms)
 }
 
 /// Formats the overlay's lines for one refresh.
@@ -704,29 +693,6 @@ mod tests {
         assert_eq!(cpu_percent(Some(0), Some(1_000), 0.0), None);
         assert_eq!(cpu_percent(Some(0), Some(1_000), -1.0), None);
         assert_eq!(cpu_percent(Some(0), Some(1_000), f64::NAN), None);
-    }
-
-    #[test]
-    fn one_percent_low_averages_the_slowest_hundredth() {
-        let mut frame_times = VecDeque::new();
-        for _ in 0..99 {
-            frame_times.push_back(10.0);
-        }
-        frame_times.push_back(100.0);
-        // 100 frames, 1% is the single slowest frame.
-        let low = one_percent_low_fps(&frame_times).expect("low value");
-        assert!((low - 10.0).abs() < 1e-9, "got {low}");
-        assert_eq!(one_percent_low_fps(&VecDeque::new()), None);
-
-        let mut wide = VecDeque::new();
-        for _ in 0..198 {
-            wide.push_back(10.0);
-        }
-        wide.push_back(20.0);
-        wide.push_back(100.0);
-        // 200 frames, 1% is the two slowest frames: (100 + 20) / 2 ms.
-        let low = one_percent_low_fps(&wide).expect("low value");
-        assert!((low - 1000.0 / 60.0).abs() < 1e-9, "got {low}");
     }
 
     #[test]

@@ -24,6 +24,7 @@
 
 mod audio;
 mod frame_dump;
+mod frame_times;
 mod game;
 mod image_codec;
 mod overlay;
@@ -92,6 +93,7 @@ impl FrameTimeSource for PlatformFrameTime {
     }
 }
 
+pub use frame_times::FrameTimeReport;
 pub use game::{GameError, GameHost, vm_report};
 pub use image_codec::install_image_codec;
 pub(crate) use image_codec::{install_image_codec_metered, install_image_decoder};

@@ -325,6 +325,15 @@ none. A run that has spent its budget stops reporting and says so once: a
 single note names the budget and the number of reports it had already
 emitted.
 
+### The frame-time distribution
+
+The slow-frame report names **one** frame that ran long. The run's
+**frame-time distribution** names the frame times as a whole — the
+percentiles and the **1% low**, the rate the slowest 1% of the frames run
+at — and it is the run's last line. It is the runner's report and not the
+game host's: the runner measures every gap and keeps the recent ones in a
+bounded ring. Its shape is in [`../../perf.md`](../../perf.md) §4.3.
+
 ---
 
 ## 8. Failure modes

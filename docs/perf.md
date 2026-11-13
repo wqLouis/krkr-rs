@@ -513,7 +513,9 @@ do too.
 Two reports name where a slow step went: the slow frame and the slow load.
 The slow frame has two forms — a one-line summary and, at `debug` level, a
 detailed report. Both are **observations**: neither changes what a load, a
-decode, a container or a frame does.
+decode, a container or a frame does. A third report, the **frame-time
+distribution** (§4.3), names the run's frame times as a whole; it is the
+run's last line, and it is where the 1% low is read.
 
 ### 4.1 The slow frame
 
@@ -591,6 +593,57 @@ A single step that took longer than 50 ms is reported with its phase times:
 Every report is bounded: a step below the threshold is never reported, and a
 step above it is reported at most once every five seconds, so a step that is
 slow in every frame does not report in every frame.
+
+### 4.3 The frame-time distribution
+
+The slow frame names **one** frame that ran long. The frame-time
+distribution names the run's frame times as a whole, and it is the run's
+**last line**: the number of frames, the fastest and the slowest frame, the
+percentiles, and the **1% low** — the rate the slowest 1% of the frames run
+at.
+
+```
+frame times: frames=600 gaps=599 kept=599 paced=yes(16.7ms) startup=3959.3ms fastest=16.7ms/60.0fps p50=16.7ms/60.0fps p90=16.7ms/60.0fps p99=16.7ms/59.9fps slowest=579.3ms/1.7fps 1%low=7.4fps(134.8ms)
+```
+
+That line is a real run: 600 headless frames of 【KRKR】魔女的夜宴 at 60 fps,
+where the engine load took 3 959 ms and one frame took 579 ms.
+
+| field | meaning |
+|---|---|
+| `frames` | the frames the run stepped |
+| `gaps` | the frame-to-frame gaps the run measured |
+| `kept` | the gaps the percentiles cover |
+| `paced` | whether the run waited for a frame deadline between the frames, and the period it paced at |
+| `startup` | the gap from the run's start to its first frame — the engine load, and not a frame |
+| `fastest`, `slowest` | the extremes of the run's frame-to-frame gaps |
+| `p50`, `p90`, `p99` | the percentiles of the kept gaps, by nearest rank |
+| `1%low` | the rate the slowest 1% of the kept frames run at, and their mean frame time |
+
+Every number in it is **measured**: the gaps the run read from its clock.
+The percentiles are the nearest ranks of the kept gaps (the smallest value at
+least that share of the gaps is at or below it), and the 1% low is the mean
+frame time of the slowest 1% of them, inverted — the same definition the
+debug panel's `1%` uses. The two answer different questions: `p99` is one
+frame's time, and the 1% low is the mean of the slowest frames — so a run
+with one very slow frame has a `p99` next to its neighbours and a 1% low
+that names the dip.
+
+**The history is bounded.** The run keeps the recent gaps in a fixed ring of
+65 536 entries (half a megabyte), so a run of any length reports the
+distribution of its most recent frames: a run longer than the ring reports
+its last 65 536 gaps, and `kept` says how many of them the percentiles
+cover.
+
+**A paced run's gaps include the wait.** The headless loop waits for the
+frame's deadline and the windowed loop waits for the platform's ticker, so
+every gap is the frame's cost plus the wait for the deadline: the
+distribution names the presentation cadence, and not the engine's cost
+alone. That is what `paced=yes(16.7ms)` says.
+
+The report is on by default; `--no-frame-report` leaves the run without it,
+and the run then measures no history at all. The option is in
+[code/app/main.md](code/app/main.md).
 
 ---
 

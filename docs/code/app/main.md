@@ -20,8 +20,8 @@ its own configuration and calls the same `app::run`.
 ```
 krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan]
      [--preload-archives] [--debug-overlay] [--graphic-cache-limit LIMIT]
-     [--dump-frame PATH] [--slow-report-ms N] [--vm-report] [--archive XP3 ...]
-     [--base-dir DIR] [GAME]
+     [--dump-frame PATH] [--slow-report-ms N] [--no-frame-report]
+     [--vm-report] [--archive XP3 ...] [--base-dir DIR] [GAME]
 ```
 
 | option | value | default | effect |
@@ -35,6 +35,7 @@ krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan]
 | `--graphic-cache-limit` | `none`, `unlimited`, `0`, bytes | the reference default (disabled) | the decoded-image cache policy |
 | `--dump-frame PATH` | path | — | write the presented frame as a PNG; needs the null backend |
 | `--slow-report-ms` | `0..` | unbounded | the total time the run may spend producing slow-frame reports; `0` reports none |
+| `--no-frame-report` | — | off | skip the frame-time distribution the run prints as its last line |
 | `--vm-report` | — | off | measure the VM's script compilation and print its analysis at the end of the run |
 | `--archive XP3` | path | — | mount an archive; repeatable, order-significant, later wins |
 | `--base-dir DIR` | path | the first archive's parent | the mount root; every relative archive path resolves against it |
@@ -78,6 +79,13 @@ compile and its phases took — the lexer, the parser, the generator and the
 image build. Every number in it is measured. The measurement is also what
 the slow-frame report's VM section needs for the script compilation of a
 frame, so a run that asks for the analysis gets that breakdown too.
+
+`--no-frame-report` skips the **frame-time distribution** the run prints as
+its last line: the number of frames, the fastest and the slowest frame, the
+percentiles, and the 1% low — the rate the slowest 1% of the frames run at.
+The distribution is on by default, and the option leaves the run without it:
+the run then measures no history at all. The shape of the line is in
+[`../../perf.md`](../../perf.md) §4.3.
 
 ---
 
@@ -181,6 +189,20 @@ count, the layer count, the bitmap count and, per window, how many layers
 the window's root list can actually reach. That last number is the
 reachability the reference's draw path uses, so a scene with many unreached
 layers renders as an empty window and the summary says so.
+
+### The frame-time distribution
+
+Both loops print the run's **frame-time distribution** as its last line:
+the headless loop after the scene summary, and the windowed loop when the
+event loop exits. The line names the number of frames, the fastest and the
+slowest frame, the percentiles, and the 1% low — the rate the slowest 1% of
+the frames run at. Its shape is in [`../../perf.md`](../../perf.md) §4.3.
+
+The runner measures every gap — the headless loop from its own clock, the
+windowed loop from the platform's measurement — and keeps the recent ones in
+a bounded ring, so a run of any length reports the distribution of its most
+recent frames. A run that is launched with `frame_report` off measures no
+history at all.
 
 ### The windowed loop
 
