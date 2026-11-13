@@ -220,7 +220,7 @@ fn a_face_resolves_under_each_of_its_names() {
 /// (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:165-195`).
 #[test]
 fn the_fallback_is_per_character() {
-    let (engine, wide, narrow) = engine_with_wide_default();
+    let (mut engine, wide, narrow) = engine_with_wide_default();
     assert!(
         !engine.has_glyph(narrow, WIDE_ONLY_CODEPOINT),
         "the narrow face must not carry the CJK glyph"
@@ -251,7 +251,7 @@ fn the_fallback_is_per_character() {
 /// reports it instead of drawing another character's shape.
 #[test]
 fn a_character_no_face_carries_has_no_provider() {
-    let (engine, _wide, narrow) = engine_with_wide_default();
+    let (mut engine, _wide, narrow) = engine_with_wide_default();
     assert!(matches!(
         engine.provider_for(narrow, '\u{10FFFD}'),
         Err(TextError::MissingGlyph { .. })

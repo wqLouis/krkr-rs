@@ -162,6 +162,11 @@ impl Env {
         }
     }
 
+    /// The text engine the compat host measures with.
+    fn text(&self) -> &TextEngine {
+        &self._text
+    }
+
     /// Evaluate an expression that must raise, returning the message.
     fn error(&self, expression: &str) -> String {
         self.eval(expression)
@@ -324,6 +329,41 @@ fn font_text_width_sums_the_per_character_advances() {
         "a run must measure as the sum of its characters' advances"
     );
     assert!(parts > 0, "the characters must have a positive advance");
+}
+
+/// The measurement shapes nothing: the width comes from the font's metrics,
+/// so the text engine's layout cache stays empty.
+///
+/// Reference: `tTJSNI_Font::GetTextWidthDirect` applies the font and then
+/// sums the rasterizer's per-character extent
+/// (`reference/cpp/core/visual/LayerIntf.cpp:11702-11717`); the reference
+/// shapes no run and rasterizes no glyph for a width, so neither does the
+/// measurement.
+#[test]
+fn font_get_text_width_does_not_shape_the_text() {
+    let Some((dir, name)) = test_font() else {
+        return;
+    };
+    let _lock = vm_lock();
+    let storage = Storage::mount_archives(
+        FileSystem::host(&dir),
+        dir.clone(),
+        std::iter::empty::<&str>(),
+    )
+    .expect("mount font directory");
+    let env = Env::new(Some(storage));
+    env.run(&format!("var f = new Font('{name}', 48, 0);"));
+
+    let width = env.eval_int("f.getTextWidth('Hello')");
+    assert!(
+        width > 0,
+        "the measured width should be positive, got {width}"
+    );
+    assert_eq!(
+        env.text().cached_layouts(),
+        0,
+        "a measurement must not shape the run"
+    );
 }
 
 /// The oldest registered face is the default font, so a face no source knows

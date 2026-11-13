@@ -141,29 +141,38 @@ impl FontRegistry {
     }
 
     /// The registered names a font list reports: newest first, without the
-    /// oldest name.
+    /// default face's name.
     ///
-    /// The oldest name is the one the default face is registered under, so a
-    /// registry that holds a single name reports an empty list.
+    /// The default face's name is the one the default face is registered
+    /// under, so a registry that holds a single name reports an empty list.
     pub fn list_names(&self) -> Vec<String> {
         let mut names = self.order.clone();
-        names.pop();
+        if let Some(default) = self.default_name() {
+            names.retain(|name| name != default);
+        }
         names
     }
 
-    /// The oldest registered name, the name the default face is registered
-    /// under.
+    /// The name the default face is registered under: the face's first name.
     pub fn default_name(&self) -> Option<&str> {
-        self.order.last().map(String::as_str)
+        self.faces
+            .first()
+            .and_then(|face| face.names.first())
+            .map(String::as_str)
     }
 
-    /// The default face: the face registered under the oldest name.
+    /// The default face: the OLDEST registered face.
+    ///
+    /// The faces are indexed by [`FontId`] and the ids are issued in
+    /// registration order, so the oldest face is the first one. The name
+    /// order cannot answer this: a name that is registered again moves to
+    /// the front, so the oldest NAME resolves to the newest face under it.
     ///
     /// The default face supplies the metrics of a face name that resolves to
     /// nothing, so the composition root installs the host's own default font
     /// before any script runs.
     pub fn default_face(&self) -> Option<FontId> {
-        self.default_name().and_then(|name| self.by_name(name))
+        (!self.faces.is_empty()).then_some(FontId(0))
     }
 
     /// Designates the face the per-character fallback reaches for.

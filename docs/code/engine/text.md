@@ -75,9 +75,12 @@ impl TextEngine {
     pub fn face(&self, id: FontId) -> Option<&Font>;
     pub fn family_name(&self, id: FontId) -> Option<&str>;
     pub fn has_glyph(&self, id: FontId, codepoint: char) -> bool;
-    pub fn provider_for(&self, id: FontId, codepoint: char) -> Result<FontId, TextError>;
+    pub fn provider_for(&mut self, id: FontId, codepoint: char) -> Result<FontId, TextError>;
     pub fn measure_code_unit(&mut self, id: FontId, codepoint: char, style: &TextStyle)
         -> Result<f32, TextError>;
+    pub fn validate_text(&self, id: FontId, style: &TextStyle) -> Result<(), TextError>;
+    pub fn measure_text(&mut self, id: FontId, text: &str, style: &TextStyle)
+        -> Result<f64, TextError>;
     pub fn font_metrics(&self, id: FontId, size_px: f32) -> Result<FontMetrics, TextError>;
     pub fn layout(&mut self, font: FontId, text: &str, style: &TextStyle,
                   wrap_width: Option<f32>) -> Result<TextLayout, TextError>;
@@ -119,8 +122,11 @@ The registry is the **one** place that knows which faces exist:
   (the typographic family first, then the plain family, in every language the
   face declares), so a lookup by any of them finds it. The names are matched
   case-insensitively.
-* The **default face** is the face registered under the **oldest** name — the
-  first entry the registry ever got. A later registration does not move it.
+* The **default face** is the **oldest registered face** — the first face the
+  registry ever got. A later registration does not move it, and neither does
+  a name that is registered again: the name order moves a name that is
+  registered twice to the front of the list, so it cannot name the oldest
+  face. The engine keeps the id of the face it registered first.
   The default face supplies the metrics of a face name that resolves to
   nothing, so the composition root installs the host's own default font
   there.
@@ -147,6 +153,11 @@ path draws each character with the face that carries it.
 
 The **measurement** and the **drawing** follow different rules on purpose:
 
+* `measure_text` is the sum of the per-character advances of the **requested**
+  face, and it shapes nothing: the reference measures a run with the font's
+  metrics, one character at a time
+  (`reference/cpp/core/visual/LayerIntf.cpp:11702-11717`), so a width never
+  enters the layout cache.
 * `measure_code_unit` measures the **requested** face: a character the face
   maps measures the rasterizer's advance for it, and a character the face
   does not map measures the face's em box (the requested size in pixels). The
@@ -171,11 +182,14 @@ font database.
 
 `set_host_faces` selects the host's two font roles: the families the host
 installs as its own default font, and the character the host's coverage face
-has to carry. The roles are **resolved on the first use of the text service**,
-not when they are selected, so a game that asks about no font never registers
-a host face. The resolution is guarded by a flag that lives with the state it
-guards, the way the reference's font system keeps its initialization flag
-beside the font names it fills
+has to carry. The **default face is resolved on the first use of the text
+service**, not when the role is selected, so a game that asks about no font
+never registers a host face. The **coverage face is resolved when a character
+needs it**: it is the face the per-character fallback draws with, so a
+measurement — which asks a face for its metrics and never for the fallback —
+does not pay for it. The resolution is guarded by a flag that lives with the
+state it guards, the way the reference's font system keeps its initialization
+flag beside the font names it fills
 (`reference/cpp/core/visual/FontSystem.cpp:14-25`); the work happens on
 whichever thread asks first, and it happens once.
 
@@ -197,9 +211,9 @@ unknown instead of being given a face the host does not have.
 The resolution registers the host's default face first — the first of the
 selected families the host provides — so it is the oldest face and therefore
 the engine's default face: the face a face name that resolves to nothing takes
-its metrics from. It then designates the coverage face, so the coverage face
-is a second face and not the default one. A registry that already holds a
-face keeps it.
+its metrics from. The coverage face is designated when a character needs it,
+so the coverage face is a second face and not the default one. A registry that
+already holds a face keeps it.
 
 `install_coverage_face` registers the face the per-character fallback reaches
 for: the first installed face that maps `codepoint` **and can draw it**, and

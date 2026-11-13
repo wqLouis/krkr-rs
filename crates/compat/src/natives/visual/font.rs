@@ -4,8 +4,10 @@
 //!
 //! `getTextWidth`/`getTextHeight`, the `getEsc*` rotation variants and
 //! `getGlyphDrawRect` are backed by the L2 `engine_api::TextEngine`
-//! (cosmic-text shaping); a font mapped with `mapPrerenderedFont` reads the
-//! `.tft` per-character `Inc` metrics instead. A face is
+//! (cosmic-text shaping); the width itself is the sum of the font's
+//! per-character advances, so a measurement shapes nothing. A font mapped
+//! with `mapPrerenderedFont` reads the `.tft` per-character `Inc` metrics
+//! instead. A face is
 //! resolved through the shared [`crate::resource::ResourceResolver`]: the
 //! `System.addFont` registry, then the attached `engine_api::Storage` (the face
 //! string read as a storage name), then the host's installed system fonts,
@@ -145,7 +147,7 @@ fn measure_text(
 /// Measure `text` with the copied font fields, optionally consulting the
 /// mapped pre-rendered font.
 ///
-/// `error_prefix` names the caller in the layout/rasterizer error, so the
+/// `error_prefix` names the caller in the measurement error, so the
 /// `Font` and `Layer` measurement methods keep their own messages.
 fn measure_text_with(
     engine: *mut c_void,
@@ -174,13 +176,15 @@ fn measure_text_with(
             .map_err(|error| format!("{error_prefix}: text layout failed: {error}"))?;
         return Ok((width, font.height));
     }
-    // An empty run resolves the face and the size, so an unusable one is
-    // still reported, but the text itself is never shaped: the width is
-    // measured one character at a time.
+    // The face and the size are checked first, so an unusable one is still
+    // reported. The width comes from the font's metrics, one character at a
+    // time: nothing is shaped and nothing is rasterized. The error text is
+    // script visible, so it keeps the wording it has.
     service
-        .layout(id, "", &style, None)
+        .validate_text(id, &style)
         .map_err(|error| format!("{error_prefix}: text layout failed: {error}"))?;
-    let width = measured_text_width(service, id, text, &style)
+    let width = service
+        .measure_text(id, text, &style)
         .map_err(|error| format!("{error_prefix}: text measurement failed: {error}"))?;
     Ok((width, font.height))
 }
@@ -199,32 +203,6 @@ pub(crate) fn measure_layer_text(
 ) -> Result<(i32, i32), String> {
     let (width, height) = measure_text_with(engine, font, text, true, method)?;
     Ok((width.round() as i32, height))
-}
-
-/// The measured text width: the sum of every character's rounded advance.
-///
-/// A run is measured one character at a time: each character's advance comes
-/// from the requested face and is rounded to whole pixels. A shaped run's
-/// width applies kerning and rounds once, so a kerned pair measures narrower
-/// than the sum of its two characters.
-///
-/// The measurement follows the requested face: a character the face does not
-/// map measures the face's em box, never the advance of the face that would
-/// draw it.
-fn measured_text_width(
-    engine: &mut TextEngine,
-    font: FontId,
-    text: &str,
-    style: &TextStyle,
-) -> Result<f64, TextError> {
-    let mut width: i64 = 0;
-    // A TJS string is UTF-16, so each code unit (not each Unicode scalar
-    // value) contributes an advance; a surrogate pair contributes two.
-    for unit in text.encode_utf16() {
-        let ch = char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}');
-        width = width.saturating_add(engine.measure_code_unit(font, ch, style)?.round() as i64);
-    }
-    Ok(width as f64)
 }
 
 /// The pre-rendered text width: the sum of each UTF-16 unit's `Inc`, falling

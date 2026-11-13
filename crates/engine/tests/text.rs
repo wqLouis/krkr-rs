@@ -440,3 +440,41 @@ fn a_repeated_advance_measures_the_same_value() {
         "the memoized advance must equal a fresh measurement"
     );
 }
+
+/// The measured width is the sum of the per-character advances, and the
+/// measurement shapes nothing.
+///
+/// Reference: `tTJSNI_Font::GetTextWidthDirect` applies the font and then
+/// sums the rasterizer's per-character extent for every character of the run
+/// (`reference/cpp/core/visual/LayerIntf.cpp:11702-11717`); the reference
+/// shapes no run and rasterizes no glyph for a width, so neither does the
+/// measurement.
+#[test]
+fn a_measurement_sums_the_advances_without_shaping() {
+    let Some(bytes) = load_test_font() else {
+        return;
+    };
+    let mut engine = TextEngine::new();
+    let font = engine.add_font(&bytes, 0).expect("register font");
+    let style = TextStyle::new(24.0);
+
+    let width = engine
+        .measure_text(font, "Hello", &style)
+        .expect("measure the text");
+    let mut parts = 0i64;
+    for ch in "Hello".chars() {
+        parts += engine
+            .measure_code_unit(font, ch, &style)
+            .expect("measure the character")
+            .round() as i64;
+    }
+    assert_eq!(
+        width, parts as f64,
+        "the width must be the sum of the per-character advances"
+    );
+    assert_eq!(
+        engine.cached_layouts(),
+        0,
+        "a measurement must not shape the run"
+    );
+}
