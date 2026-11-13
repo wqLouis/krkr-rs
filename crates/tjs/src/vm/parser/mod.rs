@@ -84,6 +84,22 @@ pub trait Commands {
     /// Opens a code context.
     fn push_context(&mut self, name: Option<&[u16]>, kind: ContextType) -> usize;
 
+    /// Opens a code context the block does not hold.
+    ///
+    /// The reference's `RegisterFunction` holds a child context in the
+    /// parent's constant area, registers it as a member of the parent's
+    /// object, or links it to the parent as a property's setter or
+    /// getter. A context the parent does not hold is released when its
+    /// scope ends, and it leaves the block
+    /// (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:886-947, :394).
+    ///
+    /// The context is opened with no name: the reference gives every
+    /// context a name, and the name of a context the block does not
+    /// hold is never read.
+    fn push_unheld_context(&mut self, _name: Option<&[u16]>, kind: ContextType) -> usize {
+        self.push_context(None, kind)
+    }
+
     /// Closes the code context the code is generated for.
     fn pop_context(&mut self) -> Result<(), crate::vm::codegen::CodegenError>;
 
@@ -233,6 +249,20 @@ enum CallArg {
     Node(Rc<Node>),
 }
 
+/// A priority expression the parser made.
+///
+/// The expression is a value and the operators that follow it, and the
+/// chain ends with a call when the last of the operators is the one that
+/// opens a parenthesis.
+#[derive(Clone, Copy, Debug)]
+struct PriorityExpr {
+    /// The place the node of the expression has in the tree the parser
+    /// made.
+    index: usize,
+    /// Whether the chain ends with a call.
+    called: bool,
+}
+
 /// What the parser produced.
 #[derive(Clone, Debug)]
 pub struct Parsed {
@@ -266,6 +296,12 @@ pub struct Parser<'a, C: Commands> {
     nodes: Nodes,
     /// The nodes the inline array and the inline dictionary are built in.
     current_nodes: Vec<usize>,
+    /// The kinds of the contexts the parser has opened.
+    ///
+    /// The parser opens a context for every function, class, property and
+    /// handler of the script, and the kind of the context it is in tells
+    /// it whether the block holds the context it is about to open.
+    contexts: Vec<ContextType>,
     /// The number of failures the parser reported.
     error_count: usize,
     /// The first failure the parser reported.
@@ -284,6 +320,7 @@ impl<'a, C: Commands> Parser<'a, C> {
             at_end: false,
             nodes: Nodes::default(),
             current_nodes: Vec::new(),
+            contexts: Vec::new(),
             error_count: 0,
             first_error: None,
             stopped: false,
@@ -559,6 +596,28 @@ impl<'a, C: Commands> Parser<'a, C> {
 
     // -- the grammar --------------------------------------------------------
 
+    /// Opens a code context.
+    ///
+    /// The block holds the context when the parent holds it, and the
+    /// parent is the context the parser is in.
+    fn open_context(&mut self, name: Option<&[u16]>, kind: ContextType) -> usize {
+        let parent = self.contexts.last().copied();
+        let index = if kind.block_holds(parent) {
+            self.commands.push_context(name, kind)
+        } else {
+            self.commands.push_unheld_context(name, kind)
+        };
+        self.contexts.push(kind);
+        index
+    }
+
+    /// Closes the code context the parser is in.
+    fn close_context(&mut self) -> Result<(), ParseError> {
+        self.contexts.pop();
+        self.commands.pop_context()?;
+        Ok(())
+    }
+
     /// The program.
     fn program(&mut self) -> Result<(), ParseError> {
         self.global_list()?;
@@ -573,10 +632,9 @@ impl<'a, C: Commands> Parser<'a, C> {
     /// The global definitions.
     fn global_list(&mut self) -> Result<(), ParseError> {
         let name: Vec<u16> = "global".encode_utf16().collect();
-        self.commands
-            .push_context(Some(&name), ContextType::TopLevel);
+        self.open_context(Some(&name), ContextType::TopLevel);
         let result = self.def_list();
-        self.commands.pop_context()?;
+        self.close_context()?;
         result
     }
 
@@ -872,8 +930,7 @@ impl<'a, C: Commands> Parser<'a, C> {
         self.advance();
         let name = self.expect_symbol()?;
         let units: Vec<u16> = name.encode_utf16().collect();
-        self.commands
-            .push_context(Some(&units), ContextType::Function);
+        self.open_context(Some(&units), ContextType::Function);
         self.commands.enter_block();
         let result = (|| {
             self.func_decl_arg_opt()?;
@@ -881,7 +938,7 @@ impl<'a, C: Commands> Parser<'a, C> {
             self.block()
         })();
         self.commands.exit_block();
-        self.commands.pop_context()?;
+        self.close_context()?;
         result
     }
 
@@ -933,10 +990,9 @@ impl<'a, C: Commands> Parser<'a, C> {
         let name = self.expect_symbol()?;
         self.expect(TokenKind::LeftBrace)?;
         let units: Vec<u16> = name.encode_utf16().collect();
-        self.commands
-            .push_context(Some(&units), ContextType::Property);
+        self.open_context(Some(&units), ContextType::Property);
         let result = self.property_handler_def_list();
-        self.commands.pop_context()?;
+        self.close_context()?;
         result?;
         self.expect(TokenKind::RightBrace)?;
         Ok(())
@@ -966,13 +1022,12 @@ impl<'a, C: Commands> Parser<'a, C> {
         self.variable_type()?;
         self.expect(TokenKind::RightParenthesis)?;
         let units: Vec<u16> = "(setter)".encode_utf16().collect();
-        self.commands
-            .push_context(Some(&units), ContextType::PropertySetter);
+        self.open_context(Some(&units), ContextType::PropertySetter);
         self.commands.enter_block();
         self.commands.set_property_decl_arg(&name);
         let result = self.block();
         self.commands.exit_block();
-        self.commands.pop_context()?;
+        self.close_context()?;
         result
     }
 
@@ -985,12 +1040,11 @@ impl<'a, C: Commands> Parser<'a, C> {
         }
         self.variable_type()?;
         let units: Vec<u16> = "(getter)".encode_utf16().collect();
-        self.commands
-            .push_context(Some(&units), ContextType::PropertyGetter);
+        self.open_context(Some(&units), ContextType::PropertyGetter);
         self.commands.enter_block();
         let result = self.block();
         self.commands.exit_block();
-        self.commands.pop_context()?;
+        self.close_context()?;
         result
     }
 
@@ -999,12 +1053,12 @@ impl<'a, C: Commands> Parser<'a, C> {
         self.advance();
         let name = self.expect_symbol()?;
         let units: Vec<u16> = name.encode_utf16().collect();
-        self.commands.push_context(Some(&units), ContextType::Class);
+        self.open_context(Some(&units), ContextType::Class);
         let result = (|| {
             self.class_extender()?;
             self.block()
         })();
-        self.commands.pop_context()?;
+        self.close_context()?;
         result
     }
 
@@ -1500,7 +1554,9 @@ impl<'a, C: Commands> Parser<'a, C> {
             return Ok(self.nodes.node(index));
         }
 
-        // the new operator takes a call
+        // the new operator takes a call: the engine's grammar gives the
+        // new a call expression, and a priority expression is not one
+        // (reference/krkr2/cpp/core/tjs2/bison/tjs.y:648, :685-686)
         if self.peek_kind() == Some(TokenKind::New) {
             self.advance();
             let index = self.func_call_expr()?;
@@ -1577,7 +1633,7 @@ impl<'a, C: Commands> Parser<'a, C> {
 
     /// An `incontextof` expression.
     fn incontextof_expr(&mut self) -> Result<Rc<Node>, ParseError> {
-        let mut index = self.priority_expr()?;
+        let PriorityExpr { mut index, .. } = self.priority_expr()?;
         let mut node = self.nodes.node(index);
         while self.peek_kind() == Some(TokenKind::InContextOf) {
             self.advance();
@@ -1592,14 +1648,22 @@ impl<'a, C: Commands> Parser<'a, C> {
     }
 
     /// A priority expression.
-    fn priority_expr(&mut self) -> Result<usize, ParseError> {
+    ///
+    /// The expression is a value and the operators that follow it, and
+    /// the chain ends with a call when the last of the operators is the
+    /// one that opens a parenthesis.
+    fn priority_expr(&mut self) -> Result<PriorityExpr, ParseError> {
         let index = self.priority_expr_primary()?;
         self.priority_expr_tail(index)
     }
 
     /// The operators that follow a priority expression.
-    fn priority_expr_tail(&mut self, first: usize) -> Result<usize, ParseError> {
+    ///
+    /// The chain ends with a call when the last of the operators is the
+    /// one that opens a parenthesis.
+    fn priority_expr_tail(&mut self, first: usize) -> Result<PriorityExpr, ParseError> {
         let mut index = first;
+        let mut called = false;
         loop {
             match self.peek_kind() {
                 Some(TokenKind::LeftBracket) => {
@@ -1665,11 +1729,12 @@ impl<'a, C: Commands> Parser<'a, C> {
                         Some(&self.nodes.node(index)),
                         Some(&arguments),
                     );
+                    called = true;
                 }
                 _ => break,
             }
         }
-        Ok(index)
+        Ok(PriorityExpr { index, called })
     }
 
     /// The first part of a priority expression.
@@ -1713,10 +1778,16 @@ impl<'a, C: Commands> Parser<'a, C> {
 
     /// A function call.
     ///
-    /// The call takes a whole priority expression on its left, so the call
-    /// of `new System.Foo()` is the call of the member access.
+    /// The engine's grammar gives the call to the `new` operator: the
+    /// call is a priority expression and the arguments that follow it
+    /// (reference/krkr2/cpp/core/tjs2/bison/tjs.y:685-686). A priority
+    /// expression whose chain ends with something else than a call is
+    /// not a call, and the operator refuses it.
     fn func_call_expr(&mut self) -> Result<usize, ParseError> {
-        let index = self.priority_expr()?;
+        let PriorityExpr { index, called } = self.priority_expr()?;
+        if !called {
+            return Err(self.syntax_error("'('"));
+        }
         Ok(index)
     }
 
@@ -1883,9 +1954,7 @@ impl<'a, C: Commands> Parser<'a, C> {
     fn func_expr_def(&mut self) -> Result<usize, ParseError> {
         self.advance();
         let units: Vec<u16> = "(anonymous)".encode_utf16().collect();
-        let context = self
-            .commands
-            .push_context(Some(&units), ContextType::ExprFunction);
+        let context = self.open_context(Some(&units), ContextType::ExprFunction);
         self.commands.enter_block();
         let result = (|| {
             self.func_decl_arg_opt()?;
@@ -1893,7 +1962,7 @@ impl<'a, C: Commands> Parser<'a, C> {
             self.block()
         })();
         self.commands.exit_block();
-        self.commands.pop_context()?;
+        self.close_context()?;
         result?;
         let position = self.position();
         let index = self.nodes.make_np0(token::T_CONSTVAL, position);

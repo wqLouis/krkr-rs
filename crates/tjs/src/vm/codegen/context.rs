@@ -57,6 +57,34 @@ impl ContextType {
             _ => 2,
         }
     }
+
+    /// Whether the block holds a context of this kind inside a context
+    /// of the given kind.
+    ///
+    /// The reference's `RegisterFunction` holds a child context in the
+    /// parent's constant area, registers it as a member of the parent's
+    /// object, or links it to the parent as a property's setter or
+    /// getter. A context the parent does not hold is released when its
+    /// scope ends, and it leaves the block
+    /// (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:886-947, :394).
+    pub fn block_holds(self, parent: Option<ContextType>) -> bool {
+        match self {
+            // the top level is the block itself
+            ContextType::TopLevel => true,
+            // the property's setter and getter are linked to the property
+            ContextType::PropertySetter | ContextType::PropertyGetter => true,
+            // the function expression is held by the node that names it
+            ContextType::ExprFunction => true,
+            // the super class proxy is held by its class
+            ContextType::SuperClassGetter => true,
+            // a function, a class and a property are held by the parent
+            // when the parent is the top level, a function or a class
+            _ => matches!(
+                parent,
+                Some(ContextType::TopLevel | ContextType::Function | ContextType::Class)
+            ),
+        }
+    }
 }
 
 /// The kind of a nest: a block, a loop, a switch, a try or a with.
