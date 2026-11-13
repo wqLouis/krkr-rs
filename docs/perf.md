@@ -1490,3 +1490,75 @@ bitmap's generation - the composite's own output - to the signature of every
 ancestor that draws the cache. This game does not exercise it: the endpoints
 are the only cached layers, the destination's cache slot holds the
 transition's display, and the source's only ancestor is not cached.
+
+### 11.6 The shipping measurement: the Vulkan backend, the delta clock
+
+**The harness's clock was wrong, and it made every earlier frame-time number
+mean something else.** The harness handed the engine the time since the run
+**started** as the frame's `dt`, and the engine adds that to its clock every
+frame - so the whole elapsed time's worth of timers fired in every frame and
+the scenario ran ahead of the wall clock. The frames measured the scenario's
+work, not the game at its real rate. The harness now hands the engine the
+frame's own gap; `KRKR_FRAME_CLOCK=cumulative` restores the fast-forward
+workload. Every frame-time number before this section is the fast-forward
+one.
+
+**The Vulkan backend, the real game, 1920x1080, 3 000 frames** (the load was
+3.62 before the run and 5.54 after - mildly loaded, so the median is
+trustworthy and the tail is to be repeated):
+
+| the measure | p50 | p90 | p99 | the 1% low | the worst |
+|---|---:|---:|---:|---:|---:|
+| **the frame gap** (what the display shows) | 16.68 ms | 16.80 ms | 18.66 ms | **41.44 ms (24.1 fps)** | 286.06 ms |
+| **the engine's own work** | **0.28 ms** | 0.37 ms | 4.26 ms | **30.30 ms (33.0 fps)** | 286.04 ms |
+| the platform's wait | 16.41 ms | 16.46 ms | 17.86 ms | 18.45 ms | |
+
+**The game holds 60 fps on the Vulkan path.** The frame gap's median is
+16.68 ms - the display's cadence - and the engine's own work at the median
+is **0.28 ms**; the platform's wait is 16.41 ms, so the engine is not the
+bottleneck in the steady state at all.
+
+The two 1% lows differ because they measure different things, and the
+difference is the whole remaining story:
+
+  * the **engine's own work** has a 1% low of **30.30 ms - 33.0 fps**, above
+    the 30 fps target;
+  * the **frame gap** has a 1% low of **41.44 ms - 24.1 fps**, because seven
+    frames took long enough to **miss a vsync**: a frame that should have
+    landed at 16.7 ms landed at 33-50 ms instead.
+
+So the deficit is not a steady cost. It is **seven frames** whose engine work
+exceeded the vsync interval, and two frames over 100 ms - and the worst
+frame (286 ms) is the same one the null backend shows, so it is engine work
+and not presentation.
+
+**The null backend, the same workload, 6 000 frames** (the load was 5.59
+before the run):
+
+| | the value |
+|---|---:|
+| p50 | 0.00 ms (the frames idle between the game's events) |
+| p90 | 2.70 ms |
+| p99 | 10.90 ms |
+| **the 1% low** | **24.90 ms (40.2 fps)** |
+| the worst | 264.04 ms |
+| the frames over 33 ms | 5 |
+| the frames over 100 ms | 2 |
+
+The engine's own work is therefore **at or above the 30 fps target on both
+backends**, and the remaining deficit is the handful of frames that miss a
+vsync - which is what the region composite and the text measurement are
+for.
+
+### 11.7 The logical screen is the surface
+
+The VM's logical screen - the window's client size, the primary layer's
+size, and what `System.screenWidth` reports - is now **1920x1080**, the
+renderer's surface size, so the mapping between them is the identity and
+nothing is scaled on the way out. The game sets no window size of its own
+(no `setSize`, `screenWidth` or `windowHeight` in the extracted corpus), so
+the default is the game's logical resolution.
+
+The plane the composite redraws is now 2.25x the area it was, which is what
+makes the region worth landing: a whole-plane redraw at 1920x1080 is exactly
+what the region removes.

@@ -15,9 +15,25 @@ use platform::{InputEvent, MouseButton, PlatformEvent};
 ///
 /// The gap the slow-frame report reads is this one, so it must be the wall
 /// clock and not an injected frame period.
+///
+/// The engine reads the frame's own gap, and the clock hands the value
+/// over: the engine adds it to its clock every frame, so handing it the
+/// time since the run started would run the scenario ahead of the wall
+/// clock - every frame would carry the whole elapsed time's worth of
+/// timers, and the frames would measure the scenario's work instead of
+/// the game's real rate.
+///
+/// `KRKR_FRAME_CLOCK=cumulative` hands the engine the cumulative time
+/// instead, which is the fast-forward workload: the game runs ahead of the
+/// wall clock and the frames carry the scenario's work every frame. The
+/// engine's slow-frame report reads the cumulative time as its gap there,
+/// so its gap and its unaccounted residual mean nothing in that mode; the
+/// phase costs stay the frame's own.
 struct WallClock {
     start: Instant,
-    last: Instant,
+    last: std::cell::Cell<Instant>,
+    elapsed: std::cell::Cell<f64>,
+    cumulative: bool,
 }
 
 impl WallClock {
@@ -25,22 +41,45 @@ impl WallClock {
         let now = Instant::now();
         Self {
             start: now,
-            last: now,
+            last: std::cell::Cell::new(now),
+            elapsed: std::cell::Cell::new(0.0),
+            cumulative: cumulative_clock(),
         }
     }
 
     /// The gap since the previous frame, and moves the clock's own boundary.
     fn take_gap(&mut self) -> f64 {
         let now = Instant::now();
-        let gap = now.duration_since(self.last).as_secs_f64() * 1000.0;
-        self.last = now;
+        let gap = now.duration_since(self.last.get()).as_secs_f64() * 1000.0;
+        self.last.set(now);
+        let handed = if self.cumulative {
+            self.start.elapsed().as_secs_f64() * 1000.0
+        } else {
+            gap
+        };
+        self.elapsed.set(handed);
         gap
+    }
+}
+
+/// The clock's mode, read from the environment.
+///
+/// The mode that is not named is the frame delta, so an absent variable is
+/// the default and a variable that cannot be read is an error.
+fn cumulative_clock() -> bool {
+    match std::env::var("KRKR_FRAME_CLOCK") {
+        Ok(value) => value == "cumulative",
+        Err(std::env::VarError::NotPresent) => false,
+        Err(error) => {
+            eprintln!("the frame clock mode is not readable: {error}");
+            std::process::exit(2);
+        }
     }
 }
 
 impl FrameTimeSource for WallClock {
     fn elapsed_ms(&self) -> f64 {
-        self.now_ms()
+        self.elapsed.get()
     }
 
     fn now_ms(&self) -> f64 {
