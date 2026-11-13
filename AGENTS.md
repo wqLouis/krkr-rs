@@ -17,6 +17,28 @@ Do not load the whole repository into every context.
 
 ## 0. How a change is made here
 
+### P0 — the disk
+
+**Do not write to the disk, and do not run cargo. This is the first rule. It
+overrides every task, every brief and every worker's judgement about what a
+task seems to need.**
+
+* **The only places you may write are your scoped files in the repository and
+  `/tmp`.** `/tmp` is a tmpfs — RAM — so writing there does not touch the
+  disk. Nothing else: not a scratch directory, not a copy of the tree, not a
+  report, not a build directory.
+* **`cargo` writes to the disk** — the target directory, the registry, the
+  incremental caches — so: no `cargo build`, `cargo check`, `cargo clippy`,
+  `cargo test`, `cargo run` or `rustc`. The main agent runs the builds and
+  the test suites, one at a time, under a shared lock.
+* **`/mnt/e_drive` is the user's drive. Nothing may be written to it.** A
+  worker that needs a baseline build, a copy of the tree, or more space than
+  `/tmp` has **stops and reports it**; the main agent does it, or frees the
+  space. Do not solve it yourself.
+* The user's drive is shared with the user's own work. A write there is not a
+  mess the user can clean up later, and the session may have to be stopped
+  for it.
+
 **Seven rules, stated once, up front.** The rest of this file explains *why* a
 change is made the way it is; these say *what* you owe the next person.
 
