@@ -38,10 +38,12 @@ pub mod codegen;
 pub mod commands;
 pub mod lexer;
 pub mod parser;
+mod stats;
 
 pub use codegen::Generator;
 pub use lexer::{LexError, Lexer, PpValues, Token, TokenKind, ValueRef};
 pub use parser::{Commands, ParseError, Parsed, Parser};
+pub use stats::{CompileStats, compile_stats, compile_stats_enabled, set_compile_stats_enabled};
 
 // ---------------------------------------------------------------------------
 // The compile entry: the script text in, the image of the script block out
@@ -157,6 +159,10 @@ pub unsafe extern "C" fn tjs2_script_compile(
         // SAFETY: the caller promises the text is readable.
         let units = unsafe { std::slice::from_raw_parts(script, length as usize) };
 
+        // The front end's own measurement: it is off by default, and a
+        // compile that is not measured keeps no clock.
+        let measurement = stats::Measurement::start();
+
         let mut lexer = if expression != 0 {
             Lexer::expression(units, result_needed != 0)
         } else {
@@ -189,14 +195,21 @@ pub unsafe extern "C" fn tjs2_script_compile(
         }
 
         let mut generator = Generator::new();
-        let parsed = Parser::new(&mut lexer, &mut generator).parse();
+        // The parse window holds the lexer, the parser and the generator: the
+        // two timed columns write their own times into the totals, and what
+        // is left of the window is the parser's own time. The generator's
+        // work is measured at the seam the parser drives it through.
+        let (parsed, parse_ns) = measurement
+            .timed(|| Parser::new(&mut lexer, stats::Timed::new(&mut generator)).parse());
 
         // the image of the script block
         let mut image = Box::new(Image::default());
         image.generator = generator;
         // the block's line table
-        image.lines = crate::vm::codegen::ffi::line_table(units);
-        let built = crate::vm::codegen::ffi::build_image(&mut image);
+        let (built, image_ns) = measurement.timed(|| {
+            image.lines = crate::vm::codegen::ffi::line_table(units);
+            crate::vm::codegen::ffi::build_image(&mut image)
+        });
 
         // the first failure and the count of the failures
         let (status, message, position, count) = match (parsed.first_error, built) {
@@ -254,6 +267,9 @@ pub unsafe extern "C" fn tjs2_script_compile(
             values: handle.values.as_ptr(),
             count: handle.values.len() as c_int,
         };
+        // The whole compile's time, and the phases it holds.
+        let total_ns = measurement.elapsed_ns();
+        measurement.finish(total_ns, parse_ns, image_ns, length as u64);
         handle
     }) {
         Ok(handle) => handle,
@@ -416,5 +432,74 @@ mod tests {
             );
             tjs2_script_free(handle);
         }
+    }
+
+    /// The front end's measurement is off until it is switched on, and a
+    /// measured compile lands in the totals with its phases.
+    ///
+    /// The measurement is the front end's own account of where a compile's
+    /// time went: the analyser times its tokens, the generator times the
+    /// commands the parser drives it with, and the parser's own time is what
+    /// the parse window holds besides the two.
+    #[test]
+    fn a_measured_compile_lands_in_the_totals() {
+        assert!(
+            !compile_stats_enabled(),
+            "the measurement is off until a run asks for it"
+        );
+        let script = "var a = 1;\nfunction f(x) { return x + a; }\n";
+        let units: Vec<u16> = script.encode_utf16().collect();
+        let before = compile_stats();
+        set_compile_stats_enabled(true);
+        // SAFETY: the units are readable for the length the call takes, and
+        // the null values pointer means "no conditional-compilation values".
+        let handle = unsafe {
+            tjs2_script_compile(units.as_ptr(), units.len() as u32, 0, 0, std::ptr::null())
+        };
+        assert!(!handle.is_null(), "the entry returned a handle");
+        // SAFETY: the handle is live and not freed.
+        unsafe {
+            tjs2_script_free(handle);
+        }
+        let after = compile_stats();
+        set_compile_stats_enabled(false);
+
+        assert!(
+            after.compiles > before.compiles,
+            "the compile was counted: {} -> {}",
+            before.compiles,
+            after.compiles
+        );
+        assert!(
+            after.code_units >= before.code_units + units.len() as u64,
+            "the compile read its script: {} -> {}",
+            before.code_units,
+            after.code_units
+        );
+        assert!(
+            after.bytes >= before.bytes + units.len() as u64 * 2,
+            "the compile read its script's bytes: {} -> {}",
+            before.bytes,
+            after.bytes
+        );
+        assert!(
+            after.total_ms > before.total_ms,
+            "the compile was timed: {} -> {}",
+            before.total_ms,
+            after.total_ms
+        );
+        assert!(
+            after.lexer_ms > before.lexer_ms,
+            "the analyser timed its tokens: {} -> {}",
+            before.lexer_ms,
+            after.lexer_ms
+        );
+        let phases = after.lexer_ms + after.parser_ms + after.generator_ms + after.image_ms;
+        assert!(
+            after.total_ms + 1.0 >= phases,
+            "the phases fit in the compile: {} against {}",
+            after.total_ms,
+            phases
+        );
     }
 }

@@ -20,7 +20,7 @@ its own configuration and calls the same `app::run`.
 ```
 krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan]
      [--preload-archives] [--debug-overlay] [--graphic-cache-limit LIMIT]
-     [--dump-frame PATH] [--slow-report-ms N] [--archive XP3 ...]
+     [--dump-frame PATH] [--slow-report-ms N] [--vm-report] [--archive XP3 ...]
      [--base-dir DIR] [GAME]
 ```
 
@@ -35,6 +35,7 @@ krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan]
 | `--graphic-cache-limit` | `none`, `unlimited`, `0`, bytes | the reference default (disabled) | the decoded-image cache policy |
 | `--dump-frame PATH` | path | — | write the presented frame as a PNG; needs the null backend |
 | `--slow-report-ms` | `0..` | unbounded | the total time the run may spend producing slow-frame reports; `0` reports none |
+| `--vm-report` | — | off | measure the VM's script compilation and print its analysis at the end of the run |
 | `--archive XP3` | path | — | mount an archive; repeatable, order-significant, later wins |
 | `--base-dir DIR` | path | the first archive's parent | the mount root; every relative archive path resolves against it |
 | `GAME` | path | — | a game directory (becomes the mount root) or an XP3 file (is mounted) |
@@ -66,6 +67,17 @@ detailed report alike. The option is absent by default, which leaves the
 reporting unbounded, and `0` reports none. When the budget is spent the run
 stops reporting and logs one note that names the budget and the number of
 reports it had already emitted.
+
+`--vm-report` switches the **VM's own measurement** of the script
+compilation on, and prints the analysis at the end of the run. The
+measurement is off by default: it reads the clock around every token the
+analyser produces and around every command the parser drives the generator
+with, which costs tens of milliseconds over a corpus. The report names the
+number of compiles, the size of the scripts they read, and the time the
+compile and its phases took — the lexer, the parser, the generator and the
+image build. Every number in it is measured. The measurement is also what
+the slow-frame report's VM section needs for the script compilation of a
+frame, so a run that asks for the analysis gets that breakdown too.
 
 ---
 

@@ -85,6 +85,40 @@ Each column has a page of its own: [`lexer.md`](lexer.md),
 [`parser.md`](parser.md) and [`generator.md`](generator.md) carry the rules
 that column implements, each with the reference line that defines it.
 
+## 4. The front end's own measurement
+
+The three columns interleave: the analyser produces the tokens, the parser
+reads them and drives the generator, and the generator writes the code. A
+compile cannot be split from the outside, so each column times its own work
+where the work happens:
+
+* the **analyser** times its token production — the scan that produces one
+  token;
+* the **generator** times the commands the parser drives it with: the
+  `Commands` seam is where its work is entered, and the parser's telling of
+  the analyser's place is the parser's own work and is not measured;
+* the **parser**'s own time is what the parse window holds besides the two;
+* the **image build** is timed on its own, and the **compile** as a whole is
+  timed from the entry's start to its end.
+
+The generator's own column is not touched: the compile entry wraps the
+commands the parser drives with a timing wrapper (`stats::Timed`), and the
+wrapper forwards every call and adds the time the call took.
+
+The totals live in `crates/tjs/src/vm/stats.rs`, and the snapshot is a plain
+Rust API: `tjs::vm::compile_stats()` returns the number of compiles, the
+number of script code units and bytes they read, and the time of the whole
+compile and of its four phases. `tjs::vm::set_compile_stats_enabled(bool)`
+switches the measurement, and it is **off by default**: the corpus is
+hundreds of thousands of tokens, and a clock read per token costs tens of
+milliseconds. With the measurement off, a token and a command cost one
+relaxed atomic load each and nothing else.
+
+The measurement is what the slow-frame report's VM section needs for the
+script compilation of a frame, and what the `--vm-report` flag prints at the
+end of a run; see [../app/main.md](../app/main.md) and
+[../app/game.md](../app/game.md).
+
 ---
 
 See also: [`../tjs.md`](../tjs.md) — the C++ VM these columns replace,

@@ -281,6 +281,29 @@ closes the accounting.
 A fast frame emits nothing, and the very first frame emits nothing: there
 is no predecessor to attribute.
 
+### The script compilation inside the tick
+
+The VM section holds the **script compilation** the tick ran as one cost of
+its own (`vm.front_end`), and the tick's residual is what the tick holds
+besides its input segments, its polls and that compilation. The phases of
+the compilation — the lexer, the parser, the generator and the image build —
+are the **breakdown** of that one cost, not costs of their own: the report
+prints them in their own block, ranked largest first, with the compilation's
+residual and total. Nothing is counted twice: the phases are never added to
+the ranked costs.
+
+The compilation's cost is measured by the VM itself and read across the
+tick, so it is only there when the run asked for the measurement
+(`--vm-report`, see [main.md](main.md)); a run that did not ask names no
+number for it. The measurement is described in
+[`../tjs/columns.md`](../tjs/columns.md).
+
+A compile that runs inside one of the polls is inside that poll's own cost
+as well: the polls are measured where they run, and the compilation is
+measured across the whole tick. The VM section's parts still add up to the
+tick — the input segments, the polls, the residual and the compilation — and
+the residual reads low in the frame where a compile ran inside a poll.
+
 ### The detailed report
 
 At `debug` log level (`RUST_LOG=debug`) a **detailed report** is emitted

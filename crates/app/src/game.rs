@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use api::error::FsError;
 use api::fs::FsPath;
 use api::input::InputEvent;
-use compat::{CompatCtx, CompatError, FrameBody};
+use compat::{CompatCtx, CompatError, CompileStats, FrameBody};
 use engine::input::InputState;
 use engine::jobpool::JobStats;
 use engine::storage::{MountOptions, StartupPlan, StorageReadError};
@@ -116,12 +116,59 @@ struct TickPhases {
     input_end_ms: f64,
     /// The whole `VmHost::tick` call, including the compat context lookup.
     tick_ms: f64,
+    /// The script compilation inside the tick, when it was measured.
+    ///
+    /// The three columns interleave, so the split is measured where the work
+    /// happens: the lexer times its own token production, the generator
+    /// times the commands the parser drives it with, and the parser's own
+    /// time is what the compile holds besides the two.
+    front_end: Option<FrontEndPhases>,
 }
 
 impl TickPhases {
     /// The input segments' combined cost.
     fn input_ms(&self) -> f64 {
         self.input_begin_ms + self.input_events_ms + self.input_end_ms
+    }
+}
+
+/// The front end's own phases inside one tick.
+///
+/// The phases are the breakdown of one cost: the script compilation the tick
+/// ran. The total is what the compilation took, and the phases say where the
+/// time went.
+#[derive(Clone, Copy, Default)]
+struct FrontEndPhases {
+    /// The whole compile time.
+    total_ms: f64,
+    /// The lexer's own time.
+    lexer_ms: f64,
+    /// The parser's own time.
+    parser_ms: f64,
+    /// The generator's own time.
+    generator_ms: f64,
+    /// The image build's time.
+    image_ms: f64,
+}
+
+impl FrontEndPhases {
+    /// The time the compile holds besides its four phases.
+    fn residual_ms(&self) -> f64 {
+        self.total_ms - self.lexer_ms - self.parser_ms - self.generator_ms - self.image_ms
+    }
+}
+
+/// The front end's cost between two of the VM's snapshots.
+///
+/// The snapshots are the VM's totals, so the difference is what the compiles
+/// between them cost. Every number is measured.
+fn front_end_between(before: &CompileStats, after: &CompileStats) -> FrontEndPhases {
+    FrontEndPhases {
+        total_ms: after.total_ms - before.total_ms,
+        lexer_ms: after.lexer_ms - before.lexer_ms,
+        parser_ms: after.parser_ms - before.parser_ms,
+        generator_ms: after.generator_ms - before.generator_ms,
+        image_ms: after.image_ms - before.image_ms,
     }
 }
 
@@ -394,8 +441,19 @@ impl FrameAttribution {
     }
 
     /// The VM tick the polls and the input segments do not cover.
+    ///
+    /// The script compilation the tick ran is not part of the residual: the
+    /// front end's cost is a cost of its own, and the phases below it are
+    /// its breakdown.
     fn tick_residual(&self) -> f64 {
-        self.tick.tick_ms - self.tick.input_ms() - self.phases.body_ms
+        self.tick.tick_ms - self.tick.input_ms() - self.phases.body_ms - self.front_end_ms()
+    }
+
+    /// The script compilation the tick ran, when it was measured.
+    fn front_end_ms(&self) -> f64 {
+        self.tick
+            .front_end
+            .map_or(0.0, |front_end| front_end.total_ms)
     }
 
     /// The engine frame the sync, the project and the render do not cover.
@@ -430,12 +488,18 @@ impl FrameAttribution {
         let unaccounted = self.unaccounted(gap_ms, pacing);
         let tick_residual = self.tick_residual();
         let host_residual = self.host_residual();
+        // The script compilation is named only when it was measured: a run
+        // that did not ask for the measurement has no number for it.
+        let front_end = match self.tick.front_end {
+            Some(front_end) => format!(" front_end={:.1}", front_end.total_ms),
+            None => String::new(),
+        };
         format!(
             "frame {} slow: presented={}, gap={gap_ms:.1} ms since the previous frame; \
              the gap spans the previous frame, so these are its phases: \
              sound={:.1} video={:.1} async={:.1} continuous={:.1} \
              frame_tail={:.1} body={:.1}; its vm: tick={:.1} \
-             input_begin={:.1} input_events={:.1} input_end={:.1} \
+             input_begin={:.1} input_events={:.1} input_end={:.1}{front_end} \
              tick_residual={tick_residual:.1}; its pool: pool_jobs={} \
              pool_ms={:.1}; its host: host_total={:.1} \
              audio={:.1} host_sync={:.1} sync_upload={:.1} sync_prune={:.1} \
@@ -492,7 +556,7 @@ impl FrameAttribution {
     /// The report is one string, and the log carries it as one entry.
     fn slow_frame_detail(&self, gap_ms: f64, pacing: FramePacing) -> String {
         let timings = self.timings.unwrap_or_default();
-        let mut costs = [
+        let mut costs = vec![
             MeasuredCost {
                 section: "phases",
                 name: "sound",
@@ -609,6 +673,15 @@ impl FrameAttribution {
                 ms: self.unaccounted(gap_ms, pacing),
             },
         ];
+        // The script compilation is one cost of the tick: the phases below it
+        // are its breakdown, not costs of their own.
+        if let Some(front_end) = self.tick.front_end {
+            costs.push(MeasuredCost {
+                section: "vm",
+                name: "front_end",
+                ms: front_end.total_ms,
+            });
+        }
         // The largest cost leads, so the report names the dominant cost
         // without the reader comparing the numbers.
         costs.sort_by(|left, right| right.ms.total_cmp(&left.ms));
@@ -634,6 +707,26 @@ impl FrameAttribution {
                 cost.ms
             ));
         }
+        // The front end's phases are the breakdown of the one cost the VM
+        // section holds for the script compilation.
+        if let Some(front_end) = self.tick.front_end {
+            out.push_str("front end (the tick's script compilation), largest first:\n");
+            let mut phases = [
+                ("lexer", front_end.lexer_ms),
+                ("parser", front_end.parser_ms),
+                ("generator", front_end.generator_ms),
+                ("image", front_end.image_ms),
+            ];
+            phases.sort_by(|left, right| right.1.total_cmp(&left.1));
+            for (index, (name, ms)) in phases.iter().enumerate() {
+                out.push_str(&format!("  {}. {name} = {ms:.1} ms\n", index + 1));
+            }
+            out.push_str(&format!(
+                "  residual = {:.1} ms; total = {:.1} ms\n",
+                front_end.residual_ms(),
+                front_end.total_ms
+            ));
+        }
         out.push_str(&format!(
             "residuals: tick_residual = {:.1} ms, host_residual = {:.1} ms, \
              unaccounted = {:.1} ms; pool jobs = {}\n",
@@ -654,6 +747,41 @@ impl FrameAttribution {
         ));
         out
     }
+}
+
+/// The VM's own analysis of the compiles it has done.
+///
+/// The report is the slow-frame report's shape: the counts, the dominant
+/// phase, the phases ranked largest first, and the residual and the totals
+/// that close it. Every number is measured; nothing here is estimated.
+pub fn vm_report(stats: &CompileStats) -> String {
+    let mut phases = [
+        ("lexer", stats.lexer_ms),
+        ("parser", stats.parser_ms),
+        ("generator", stats.generator_ms),
+        ("image", stats.image_ms),
+    ];
+    phases.sort_by(|left, right| right.1.total_cmp(&left.1));
+    let residual =
+        stats.total_ms - stats.lexer_ms - stats.parser_ms - stats.generator_ms - stats.image_ms;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "vm analysis: compiles={} code_units={} bytes={}",
+        stats.compiles, stats.code_units, stats.bytes
+    ));
+    if stats.compiles == 0 {
+        out.push_str("; no compiles");
+    } else if let Some((name, ms)) = phases.first() {
+        out.push_str(&format!("; dominant phase: {name} = {ms:.1} ms"));
+    }
+    out.push('\n');
+    out.push_str("phases, largest first:\n");
+    for (index, (name, ms)) in phases.iter().enumerate() {
+        out.push_str(&format!("  {}. {name} = {ms:.1} ms\n", index + 1));
+    }
+    out.push_str(&format!("residuals: residual = {residual:.1} ms\n"));
+    out.push_str(&format!("totals: compile = {:.1} ms", stats.total_ms));
+    out
 }
 
 /// A running game: the L4 VM host bound to the engine's scene and timer, and
@@ -744,8 +872,13 @@ impl GameFrame for VmHook<'_> {
             events,
         };
         let vm_started = Instant::now();
+        // The script compilation inside the tick: the VM's own totals before
+        // and after it. The measurement is off unless the run asked for it.
+        let before = compat::compile_stats_enabled().then(compat::compile_stats);
         self.vm.tick(frame).map_err(|error| error.to_string())?;
         self.polls.tick.tick_ms = vm_started.elapsed().as_secs_f64() * 1000.0;
+        self.polls.tick.front_end =
+            before.map(|before| front_end_between(&before, &compat::compile_stats()));
         let audio_started = Instant::now();
         self.audio
             .pump(self.vm, dt_ms)
@@ -1540,6 +1673,7 @@ mod tests {
                 input_events_ms: 2.0,
                 input_end_ms: 0.5,
                 tick_ms: body_ms + 3.5 + 4.0,
+                front_end: None,
             },
             StepReport {
                 frame_index: frame,
@@ -1704,6 +1838,11 @@ mod tests {
     fn ranked_costs(detail: &str) -> Vec<(String, f64)> {
         let mut costs = Vec::new();
         for line in detail.lines() {
+            // The front end's breakdown follows the ranked costs and is a
+            // breakdown of one of them, not costs of its own.
+            if line.starts_with("front end") {
+                break;
+            }
             let trimmed = line.trim();
             let Some((index, rest)) = trimmed.split_once(". ") else {
                 continue;
@@ -1778,6 +1917,95 @@ mod tests {
              host_total = 11.0 ms, total = 501.5 ms, platform_wait = 15.0 ms"
             ),
             "the report names the totals: {detail}"
+        );
+    }
+
+    /// The script compilation is one cost of the VM section, and its phases
+    /// are the breakdown of it: the tick's residual holds what the
+    /// compilation does not cover.
+    #[test]
+    fn the_front_end_is_one_cost_of_the_vm_section() {
+        let mut attribution = attribution_for(7, 480.0, 10.0);
+        attribution.tick.front_end = Some(FrontEndPhases {
+            total_ms: 2.0,
+            lexer_ms: 0.5,
+            parser_ms: 1.0,
+            generator_ms: 0.3,
+            image_ms: 0.2,
+        });
+        // The tick was 487.5 ms: the input segments took 3.5 ms, the polls
+        // 480 ms and the compilation 2 ms, so the residual is 2.0 ms.
+        assert_eq!(attribution.tick_residual(), 2.0);
+
+        let line = attribution.slow_frame_line(520.0, FramePacing::default());
+        assert!(line.contains("front_end=2.0"), "line was: {line}");
+        assert!(line.contains("tick_residual=2.0"), "line was: {line}");
+
+        let detail = attribution.slow_frame_detail(520.0, FramePacing::default());
+        assert!(
+            detail.contains("vm.front_end = 2.0 ms"),
+            "the compilation is a cost of the vm section: {detail}"
+        );
+        // The phases are the breakdown of that one cost, not costs of their
+        // own, so they are not in the ranked list.
+        let costs = ranked_costs(&detail);
+        assert_eq!(costs.len(), 24, "every measured cost is listed: {detail}");
+        assert!(
+            !costs.iter().any(|(name, _)| name.starts_with("front_end")),
+            "the phases are no costs of their own: {detail}"
+        );
+        assert!(
+            detail.contains("front end (the tick's script compilation), largest first:"),
+            "the report breaks the compilation down: {detail}"
+        );
+        assert!(
+            detail.contains("1. parser = 1.0 ms"),
+            "detail was: {detail}"
+        );
+        assert!(detail.contains("2. lexer = 0.5 ms"), "detail was: {detail}");
+        assert!(
+            detail.contains("residual = 0.0 ms; total = 2.0 ms"),
+            "the breakdown closes with the residual and the total: {detail}"
+        );
+    }
+
+    /// The VM's analysis names the dominant phase first, then the rest, and
+    /// closes with the residual and the totals.
+    #[test]
+    fn the_vm_analysis_names_the_dominant_phase_first() {
+        let stats = CompileStats {
+            compiles: 3,
+            code_units: 120,
+            bytes: 240,
+            total_ms: 10.0,
+            lexer_ms: 2.0,
+            parser_ms: 5.0,
+            generator_ms: 2.5,
+            image_ms: 0.5,
+        };
+        let report = vm_report(&stats);
+        assert!(report.contains("compiles=3"), "report was: {report}");
+        assert!(report.contains("code_units=120"), "report was: {report}");
+        assert!(report.contains("bytes=240"), "report was: {report}");
+        assert!(
+            report.contains("dominant phase: parser = 5.0 ms"),
+            "report was: {report}"
+        );
+        assert!(
+            report.contains("1. parser = 5.0 ms"),
+            "report was: {report}"
+        );
+        assert!(
+            report.contains("2. generator = 2.5 ms"),
+            "report was: {report}"
+        );
+        assert!(
+            report.contains("residuals: residual = 0.0 ms"),
+            "report was: {report}"
+        );
+        assert!(
+            report.contains("totals: compile = 10.0 ms"),
+            "report was: {report}"
         );
     }
 

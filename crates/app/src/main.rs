@@ -1,7 +1,7 @@
 //! `krkr` CLI: headless frame runner and windowed desktop frontend.
 //!
 //! ```text
-//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--preload-archives] [--graphic-cache-limit LIMIT] [--slow-report-ms N] [--archive XP3 ...] [--base-dir DIR] [GAME]
+//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--preload-archives] [--graphic-cache-limit LIMIT] [--slow-report-ms N] [--vm-report] [--archive XP3 ...] [--base-dir DIR] [GAME]
 //! ```
 //!
 //! * `--headless` runs an empty scene for `N` frames (default 120) through
@@ -50,6 +50,11 @@
 //!   reports unbounded, and `0` reports no slow frame at all. The budget is
 //!   spent by the time the reports take: a run that has spent it stops
 //!   reporting and says so once.
+//! * `--vm-report` switches the VM's own measurement of the script
+//!   compilation on and prints the analysis at the end of the run: the
+//!   number of compiles, the size of the scripts they read, and the time the
+//!   compiler's phases took. The measurement is off by default, because a
+//!   clock read per token costs tens of milliseconds.
 //! * Configuration is resolved **by this launcher** and handed to
 //!   [`app::run`] as an already-loaded value: the `key=value` file named by
 //!   the `KRKR_CONFIG` environment variable supplies overrides, the launch
@@ -131,6 +136,11 @@ const OPTIONS: &[OptionDoc] = &[
         help: "Bound the wall-clock time the run spends reporting slow frames (default: unbounded; 0 reports no slow frame).",
     },
     OptionDoc {
+        flag: "--vm-report",
+        value: "",
+        help: "Measure the VM's script compilation and print its analysis at the end of the run.",
+    },
+    OptionDoc {
         flag: "--archive",
         value: "XP3",
         help: "Mount an XP3 archive (repeatable, later wins); with none, every *.xp3 under the base directory mounts.",
@@ -190,6 +200,8 @@ struct Cli {
     /// The whole-run budget for the slow-frame reports, in milliseconds, or
     /// `None` when the option was absent.
     slow_report_ms: Option<u64>,
+    /// Whether `--vm-report` was given.
+    vm_report: bool,
     /// Explicit `--archive` list, in mount order (later wins).
     archives: Vec<PathBuf>,
     /// App path override (`--base-dir`); defaults to the current directory.
@@ -227,6 +239,7 @@ impl Cli {
             graphic_cache_limit: None,
             dump_frame: None,
             slow_report_ms: None,
+            vm_report: false,
             archives: Vec::new(),
             base_dir: None,
             positional: None,
@@ -283,6 +296,7 @@ impl Cli {
                         )
                     })?);
                 }
+                "--vm-report" => cli.vm_report = true,
                 "--archive" => {
                     let value = args
                         .next()
@@ -452,6 +466,12 @@ fn main() -> ExitCode {
     }
 
     let slow_report_budget = slow_report_budget(&cli);
+    // The VM's own measurement of the script compilation: the run asks for
+    // it, so the switch goes on before the run starts and the startup's own
+    // compiles are measured with the rest.
+    if cli.vm_report {
+        compat::set_compile_stats_enabled(true);
+    }
     let launch = Launch {
         runtime,
         backend: cli.backend,
@@ -465,7 +485,11 @@ fn main() -> ExitCode {
         slow_report_budget,
     };
 
-    match app::run(launch) {
+    let outcome = app::run(launch);
+    if cli.vm_report {
+        println!("{}", app::vm_report(&compat::compile_stats()));
+    }
+    match outcome {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("krkr: {error}");

@@ -33,6 +33,7 @@
 //! | the startup script | [`exec_storage`] |
 //! | the storage text decoder | [`decode_storage_text`] |
 //! | the plugin architecture | [`NativePlugin`], [`PluginOutcome`], [`PluginRegistry`], [`normalize_plugin_name`], [`builtin_plugin_names`] |
+//! | the VM's compile analysis | [`CompileStats`], [`compile_stats`], [`compile_stats_enabled`], [`set_compile_stats_enabled`] |
 //!
 //! Every item above states its ownership, its error contract and its panic
 //! and FFI-safety rules in its own documentation. The L2 seam
@@ -111,6 +112,10 @@ pub use natives::visual::{
 // (the analogue of the reference `TVPAddContinuousEventHook`).
 pub use natives::plugins::layer_ex::{movie_poll, set_movie_source};
 pub use plugin::{NativePlugin, PluginOutcome, PluginRegistry, normalize_plugin_name};
+// The VM's own analysis of the script compiles: the front end's measured
+// breakdown of the time a compile took. The measurement is off by default,
+// and a host that asks for it reads the totals here.
+pub use tjs::vm::{CompileStats, compile_stats, compile_stats_enabled, set_compile_stats_enabled};
 
 /// The DLL names of every ported plugin (the `Plugins.link` targets).
 ///

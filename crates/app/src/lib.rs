@@ -92,7 +92,7 @@ impl FrameTimeSource for PlatformFrameTime {
     }
 }
 
-pub use game::{GameError, GameHost};
+pub use game::{GameError, GameHost, vm_report};
 pub use image_codec::install_image_codec;
 pub(crate) use image_codec::{install_image_codec_metered, install_image_decoder};
 pub use render::BackendKind;
