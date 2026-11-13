@@ -1135,3 +1135,75 @@ fn the_hit_test_offers_the_candidates_front_to_back() {
     assert_eq!(scene.layer_hit_outcome(front, false), None);
     assert_eq!(scene.layer_hit_outcome(front, true), Some(front));
 }
+
+/// The pending-paint flag is not what the layer draws, so arming it moves
+/// neither the layer's contribution to a composite nor the tree's shape.
+///
+/// The reference's `CallOnPaint` flag is read by the paint dispatch and
+/// changes nothing about the layer's picture
+/// (`reference/cpp/core/visual/LayerIntf.h:987`,
+/// `reference/cpp/core/visual/LayerIntf.cpp:6400-6404`), so a composite that
+/// holds the layer is still the composite the tree describes.
+#[test]
+fn the_pending_paint_flag_moves_no_contribution() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (320, 240));
+    let layer = scene.add_layer(win, None);
+    let epoch = scene.layer(layer).unwrap().content_epoch;
+
+    assert!(scene.set_layer_pending_paint(layer, true));
+    assert!(scene.layer(layer).unwrap().pending_paint);
+    assert_eq!(
+        scene.layer(layer).unwrap().content_epoch,
+        epoch,
+        "the pending-paint flag is not what the layer draws"
+    );
+
+    assert!(scene.set_layer_pending_paint(layer, false));
+    assert!(!scene.layer(layer).unwrap().pending_paint);
+    assert_eq!(
+        scene.layer(layer).unwrap().content_epoch,
+        epoch,
+        "clearing the pending-paint flag is not what the layer draws"
+    );
+}
+
+/// A z-order write moves the moved child's contribution, not the parent's.
+///
+/// The parent's signature holds the child's contribution, so the parent's own
+/// cache is recomposited because of the child; the parent's own contribution
+/// does not move, because the parent's picture does not change.
+#[test]
+fn a_z_order_write_moves_no_parent_contribution() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (320, 240));
+    let parent = scene.add_layer(win, None);
+    let first = scene.add_layer(win, Some(parent));
+    let second = scene.add_layer(win, Some(parent));
+    // The absolute order mode is switched on first: the switch is a change of
+    // the parent's own contribution, and it is not what this test is about.
+    assert!(scene.set_absolute_order_mode(parent, true));
+
+    let parent_epoch = scene.layer(parent).unwrap().content_epoch;
+    let first_epoch = scene.layer(first).unwrap().content_epoch;
+    let second_epoch = scene.layer(second).unwrap().content_epoch;
+
+    scene
+        .set_absolute_order_index(second, 0)
+        .expect("the child moves to the front");
+
+    assert_eq!(
+        scene.layer(parent).unwrap().content_epoch,
+        parent_epoch,
+        "the parent's picture does not change, so its contribution does not move"
+    );
+    assert_eq!(
+        scene.layer(first).unwrap().content_epoch,
+        first_epoch,
+        "the sibling that stayed does not move"
+    );
+    assert!(
+        scene.layer(second).unwrap().content_epoch > second_epoch,
+        "the moved child's contribution moves"
+    );
+}

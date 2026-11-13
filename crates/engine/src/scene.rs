@@ -1407,7 +1407,12 @@ impl Scene {
         if from < to {
             to = to.saturating_sub(1);
         }
-        let Some(parent_layer) = self.layer_mut(parent) else {
+        // The parent's own contribution does not move: what moved is the
+        // child's position, and the child's contribution is what the
+        // parent's signature holds. The parent's subtree content changes,
+        // and the parent's cache is recomposited because of the child's
+        // contribution.
+        let Some(parent_layer) = self.layer_mut_untracked(parent) else {
             return Err("Layer.absolute: this layer has no parent".to_string());
         };
         parent_layer.children.retain(|&child| child != id);
@@ -1527,6 +1532,23 @@ impl Scene {
         self.invalidate_layer_cache(id);
         self.touch_structure();
         self.layer_mut_untracked(id)
+    }
+
+    /// Arm or disarm the layer's pending-paint flag: the marker the frame's
+    /// paint dispatch reads to fire the layer's `onPaint` handler.
+    ///
+    /// The flag is not what the layer draws, so it advances neither the
+    /// layer's contribution to a composite nor the tree's shape. The drawing
+    /// the handler does moves the images, and the images are what a
+    /// composite sees.
+    ///
+    /// Returns `false` when the layer is gone.
+    pub fn set_layer_pending_paint(&mut self, id: u32, pending: bool) -> bool {
+        let Some(layer) = self.layer_mut_untracked(id) else {
+            return false;
+        };
+        layer.pending_paint = pending;
+        true
     }
 
     /// Set a layer's script-visible `imageModified` flag without

@@ -1429,9 +1429,7 @@ extern "C" fn layer_update(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    if let Some(layer) = scene.layer_mut(id) {
-        layer.pending_paint = true;
-    }
+    scene.set_layer_pending_paint(id, true);
     set_void(out);
     0
 }
@@ -1468,9 +1466,7 @@ pub fn paint_poll(ctx: &CompatCtx) -> Result<(), String> {
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let host = unsafe { ctx.engine() };
     for id in ids {
-        if let Some(layer) = scene_mut(ctx)?.layer_mut(id) {
-            layer.pending_paint = false;
-        }
+        scene_mut(ctx)?.set_layer_pending_paint(id, false);
         let Some(target) = duplicate_object(ctx, host, ObjectKind::Layer, id) else {
             continue;
         };

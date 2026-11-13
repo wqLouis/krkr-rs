@@ -1444,23 +1444,49 @@ So the composite's own work - the backdrop fill over the whole plane and the
 draws - is the bulk of it, and a cache hit is three orders of magnitude
 cheaper than a composite.
 
-### 11.5 Four composites of one subtree per frame
+### 11.5 One composite per endpoint per frame, over the whole plane
 
-The transition's endpoints were composited **four times per frame**, and
-**three of the four produced byte-identical content**. The pixels of the
-endpoint images do *not* change every frame - the first transition's 31
-endpoint images were byte-identical between two steps, and in the second
-exactly one image changed (the motion player's target). The earlier reading
-that "the game rewrites the endpoint images every frame" was an artifact: a
-clean bitmap has no dirty region, and the probe read that as dirty.
-
-Four composites for one subtree is **our** shape, not the reference's: the
-reference completes each endpoint **once per frame**
-(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6431,6435`) and
-re-composites the whole area only when the recalc region is not empty
+The endpoint subtrees are composited **once per endpoint per transition
+frame** - nine composites over 6 000 frames - with a cache hit between them.
+That is already the reference's shape: the reference completes each endpoint
+once per frame (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6431,6435`)
+and re-composites only when the recalc region is not empty
 (`:7734,:7736-7748`).
 
-The cause is a cache whose **output feeds back into its own validity
-check**: the composite writes the content, that write advances the content's
-generation, the signature moves, and the next call composites again. The
-fix is the shape, not the cache: one owner for the cache's validity.
+**Two earlier readings of this were wrong, and both are withdrawn.**
+
+*"The game rewrites the endpoint images in full every frame."* An artifact:
+a clean bitmap has no dirty region, and the probe read that as dirty. The
+first transition's 31 endpoint images were byte-identical between two steps,
+and in the second exactly one changed - the motion player's target.
+
+*"Four composites of one subtree per frame, three of them byte-identical."*
+Also wrong: the count came from dividing the content's generation delta by
+two, and the delta is +8 per composite - the backdrop fill's write (+1), the
+dirty mark (+1) and one `mark_dirty_rect` per draw (six draws, +6). Eight is
+**one** composite.
+
+**The remaining difference is the area, not the frequency.** The reference
+redraws the changed rect; the composite here redraws the **whole 1280x960
+plane** every time. Measured on the real game in release, at a load of
+3.2-3.6:
+
+| | the cost |
+|---|---:|
+| a composite | **22-30 ms** |
+| the blend inside it | 0.10-3.7 ms |
+| a cache hit | 0.01-0.05 ms |
+
+So the blend is a small part of the composite: the backdrop fill over the
+whole plane and every draw are the rest. The region is the win - the
+reference's `CacheRecalcRegion` (`LayerIntf.h:963-965`), filled from the
+changed rectangles (`LayerIntf.cpp:6254,6285,6329`) and reconstructed alone
+(`:7737-7748`).
+
+The shape's weak point is real and named: the cache's own output feeds back
+into its own validity check, through the `live_subtree_cache` branch of the
+content signature (`crates/engine/src/layer_ops.rs`), which adds the cache
+bitmap's generation - the composite's own output - to the signature of every
+ancestor that draws the cache. This game does not exercise it: the endpoints
+are the only cached layers, the destination's cache slot holds the
+transition's display, and the source's only ancestor is not cached.
