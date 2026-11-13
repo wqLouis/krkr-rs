@@ -24,7 +24,12 @@ use crate::{CompatCtx, CompatError};
 use tjs::{VAL_OBJECT, VAL_VOID};
 
 /// The client size a window starts with.
-const DEFAULT_WINDOW_SIZE: (u32, u32) = (1280, 720);
+///
+/// The logical screen the VM draws in, and the renderer's surface it is
+/// presented on, are the same size: the mapping between them is the
+/// identity, so the VM's pixels are the surface's pixels and nothing is
+/// scaled on the way out.
+const DEFAULT_WINDOW_SIZE: (u32, u32) = (1920, 1080);
 
 /// `Window` payload: the scene id plus the window properties the L2 window
 /// state does not model (there is no OS chrome).

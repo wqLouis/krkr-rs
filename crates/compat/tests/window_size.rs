@@ -30,15 +30,17 @@ fn the_window_client_size_and_the_logical_screen_are_separate() {
 
     // reference/cpp/core/visual/WindowIntf.cpp:1518-1534,1554-1588 — the
     // `width`/`height` and `innerWidth`/`innerHeight` getters read the window's
-    // client size, which starts at the default 1280x720. With no primary layer
-    // yet, `System.screenWidth` falls back to that client size.
-    assert_eq!(client_size(&env), (1280, 720));
-    assert_eq!(env.eval_int("win.width"), 1280);
-    assert_eq!(env.eval_int("win.innerWidth"), 1280);
-    assert_eq!(env.eval_int("win.height"), 720);
-    assert_eq!(env.eval_int("win.innerHeight"), 720);
-    assert_eq!(env.eval_int("System.screenWidth"), 1280);
-    assert_eq!(env.eval_int("System.screenHeight"), 720);
+    // client size, which starts at the default 1920x1080 — the renderer's
+    // surface size, so the mapping between the logical screen and the surface
+    // is the identity. With no primary layer yet, `System.screenWidth` falls
+    // back to that client size.
+    assert_eq!(client_size(&env), (1920, 1080));
+    assert_eq!(env.eval_int("win.width"), 1920);
+    assert_eq!(env.eval_int("win.innerWidth"), 1920);
+    assert_eq!(env.eval_int("win.height"), 1080);
+    assert_eq!(env.eval_int("win.innerHeight"), 1080);
+    assert_eq!(env.eval_int("System.screenWidth"), 1920);
+    assert_eq!(env.eval_int("System.screenHeight"), 1080);
 
     // reference/cpp/core/visual/WindowIntf.cpp:885-893 — `setInnerSize` stores
     // the client size on the window.

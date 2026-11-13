@@ -577,7 +577,7 @@ fn subclass_member_calls_before_the_base_constructor_leave_global_kag_set() {
         "the subclass constructor must run to completion and set global.kag"
     );
     // The member call before `super.Window(...)` must have reached the window.
-    assert_eq!(env.eval_int("kag.width"), 1280);
+    assert_eq!(env.eval_int("kag.width"), 1920);
 }
 
 /// Dropping the last script reference to a window must release the scene
