@@ -17,6 +17,44 @@ Do not load the whole repository into every context.
 
 ## 0. How a change is made here
 
+**Seven rules, stated once, up front.** The rest of this file explains *why* a
+change is made the way it is; these say *what* you owe the next person.
+
+**For a worker — a subagent with a scope:**
+
+1. **Your scope is the only place you may write.** Every other path is
+   blocked for you. If the task needs a file outside it, stop and report it
+   rather than reaching for the file.
+2. **You may edit the working tree.** Do not copy the repository, and never
+   commit or push. But you **must notify the main agent**: end your turn with
+   a status that names the patch path, every file you touched, what changed
+   in each, and what you need from the main agent. A change without a status
+   is invisible, and an invisible change is an unreviewed change.
+3. **Do not run cargo.** Not `cargo build`, `cargo check`, `cargo clippy`,
+   `cargo test`, `cargo run` or `rustc`: concurrent builds in one target
+   directory have livelocked this machine, and the main agent runs the builds
+   and the suites, one at a time. You may run `cargo fmt` / `rustfmt`
+   (formatting is not a build), the compiler-free gate checks (§0.4), and
+   already-built binaries. A measurement needs a build: take the shared lock
+   (`flock /tmp/cargo.lock -c 'cargo ...'`), and report the load average with
+   your numbers — a load above about four invalidates a timing.
+4. **Scratch goes under `/tmp`, never on the hard disk**, and you delete it
+   when the task ends. `/tmp` is a 16 GB tmpfs: keep the build directories
+   out of `/tmp/pi-patches/`, and remove them when they are done.
+5. **Deliver a patch.** `/tmp/<task>.patch` is the diff of the files you
+   touched. Write it incrementally, as you go, so that a rate limit cannot
+   lose it.
+
+**For the integrator — the main agent that owns the change:**
+
+6. **The gate, the builds and the test suites are yours** (§0.4), run one at
+   a time and on a quiet machine. A load average above about four invalidates
+   a measurement, so a number taken under load is not a result.
+7. **Review the patch, not only the report** (§0.3), and **commit in stages**:
+   a reviewed stage is a commit of its own, never one large commit at the end.
+
+---
+
 One integrator owns a change end to end, and may build it in parallel with
 workers on disjoint scopes. The rules below are how this repository is worked
 on, whoever does the work.
@@ -50,11 +88,10 @@ reference behaviour is the oracle, what is in flight, and where the risk is.
    the direction is the shape refactor, not the failing case; the brief's
    **Shape** line carries it.
 2. **Dispatch disjoint workers.** One coherent change per worker, and no two
-   workers writing the same file in one wave. Work is produced in an isolated
-   `/tmp/<task>-work` copy or worktree and delivered as `/tmp/<task>.patch`:
-   the worker commits a baseline there, edits, and runs
-   `git diff > /tmp/<task>.patch`. A worker never commits or pushes the real
-   checkout, so the tree is never left half-edited.
+   workers writing the same file in one wave. The worker edits the working
+   tree and delivers `/tmp/<task>.patch` — the diff of the files it touched —
+   and notifies the main agent, which reviews and integrates (rule 2 and rule 5
+   above). A worker never commits or pushes.
 3. **Verify the patch.** Read the diff, apply it with `git apply --3way`,
    resolve conflicts, and check the layer boundary, the reference behaviour,
    the surface lock, the task's non-goals and silent fallbacks.
@@ -83,11 +120,11 @@ Every worker brief states these things, and is short enough to paste:
 Goal:        one behavior or cleanup, with the evidence that proves it
 Shape:       the current shape, why the bug is a consequence of it, and the
              shape the fix must leave behind
-Write:       exact files/directories inside the isolated copy; no other writes
-Work:        /tmp/<task>-work; deliver /tmp/<task>.patch; no repo commit
+Write:       exact files/directories; no other writes
+Work:        deliver /tmp/<task>.patch; no repo commit; notify the main agent
 Read:        the module, its callers, and the cited reference lines
 Must hold:   invariants, public/script surface, layer boundary
-Do not:      unrelated fixes, new deps, public renames, commits
+Do not:      unrelated fixes, new deps, public renames, commits, cargo
 Verify:      rustfmt + compiler-free guards only; main runs the gate
 Report:      files, patterns, the shape problem and the refactor proposal,
              risk, left alone, blockers
@@ -96,9 +133,12 @@ Report:      files, patterns, the shape problem and the refactor proposal,
 Parallel workers only run on **disjoint write scopes**; two workers never edit
 the same file in one wave. They must not run `cargo build`, `cargo check`,
 `cargo clippy`, `cargo test`, `cargo run` or `rustc` — parallel builds have
-exhausted the machine's disk and corrupted the tree before. They *may* run
+exhausted the machine's disk and corrupted the tree before, and concurrent
+builds in one target directory have livelocked it. They *may* run
 `cargo fmt` / `rustfmt` (formatting is not a build), the compiler-free gate
-checks (§0.4) and already-built binaries under `target/debug/`.
+checks (§0.4) and already-built binaries under `target/debug/`. A worker
+whose task is a measurement may build, under the shared lock, and reports the
+load average with its numbers.
 
 When a result arrives, the integrator reads the patch, not only the report: it
 checks the layer boundary, the reference behaviour, the surface lock and the
