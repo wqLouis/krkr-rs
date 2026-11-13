@@ -392,3 +392,121 @@ fn the_soft_light_table_holds_every_entry() {
         }
     }
 }
+
+/// The soft light's table holds the truncated double-precision power.
+///
+/// The entry is the truncated value of `255 · (d/255)^p`, with the exponent
+/// the source's channel selects
+/// (`reference/krkr2/cpp/core/visual/gl/blend_function.cpp:530-533`). The
+/// table the crate ships is compared with that formula over every pair of
+/// channels, so a table that does not hold the formula fails here.
+#[test]
+fn the_soft_light_table_holds_the_truncated_power_of_every_pair() {
+    let table = render::blend::soft_light_table();
+    for source in 0..=u8::MAX {
+        for destination in 0..=u8::MAX {
+            let base = f64::from(destination) / 255.0;
+            let value = if source >= 128 {
+                base.powf(128.0 / f64::from(source))
+            } else {
+                base.powf((1.0 - f64::from(source) / 255.0) / 0.5)
+            };
+            let expected = (value * 255.0) as u8;
+            let index = usize::from(source) * 256 + usize::from(destination);
+            assert_eq!(
+                table[index], expected,
+                "the entry for {source} over {destination}"
+            );
+        }
+    }
+}
+
+/// The colour dodge's table holds the reference's division.
+///
+/// The entry is `255` when the source's complement is below the
+/// destination's and the destination scaled by `255 / (255 - s)` otherwise
+/// (`reference/krkr2/cpp/core/visual/gl/blend_function.cpp:534-535`). The
+/// table the crate ships is compared with that formula over every pair of
+/// channels.
+#[test]
+fn the_color_dodge_table_holds_the_division_of_every_pair() {
+    let table = render::blend::color_dodge_table();
+    for source in 0..=u8::MAX {
+        for destination in 0..=u8::MAX {
+            let expected = if 255 - i32::from(source) <= i32::from(destination) {
+                255
+            } else {
+                ((i32::from(destination) * 255) / (255 - i32::from(source))) as u8
+            };
+            let index = usize::from(source) * 256 + usize::from(destination);
+            assert_eq!(
+                table[index], expected,
+                "the entry for {source} over {destination}"
+            );
+        }
+    }
+}
+
+/// The colour burn's table holds the reference's division.
+///
+/// The entry is zero when the source is below the destination's complement
+/// and `255 - (255 - d) · 255 / s` otherwise
+/// (`reference/krkr2/cpp/core/visual/gl/blend_function.cpp:536-537`). The
+/// table the crate ships is compared with that formula over every pair of
+/// channels.
+#[test]
+fn the_color_burn_table_holds_the_division_of_every_pair() {
+    let table = render::blend::color_burn_table();
+    for source in 0..=u8::MAX {
+        for destination in 0..=u8::MAX {
+            let expected = if i32::from(source) <= 255 - i32::from(destination) {
+                0
+            } else {
+                (255 - ((255 - i32::from(destination)) * 255) / i32::from(source)) as u8
+            };
+            let index = usize::from(source) * 256 + usize::from(destination);
+            assert_eq!(
+                table[index], expected,
+                "the entry for {source} over {destination}"
+            );
+        }
+    }
+}
+
+/// The overlay's entry for one pair of channels.
+///
+/// The entry is the source's and the destination's product below the
+/// destination's half and `2 · (s + d) - 2 · s · d / 255 - 255` above it
+/// (`reference/krkr2/cpp/core/visual/gl/blend_function.cpp:539-541`).
+fn overlay(source: u8, destination: u8) -> u8 {
+    let product = i32::from(source) * i32::from(destination) * 2;
+    let value = if destination < 128 {
+        product / 255
+    } else {
+        (i32::from(source) + i32::from(destination)) * 2 - product / 255 - 255
+    };
+    value.clamp(0, 255) as u8
+}
+
+/// The overlay computes both halves and selects one.
+///
+/// The channel function computes both halves of the overlay and selects the
+/// one the destination's half names, and it holds the formula over every
+/// pair of channels.
+#[test]
+fn the_overlay_selects_the_half_the_destination_names() {
+    for source in 0..=u8::MAX {
+        for destination in 0..=u8::MAX {
+            assert_eq!(
+                ChannelFunction::Overlay.apply(source, destination) as u8,
+                overlay(source, destination),
+                "the overlay of {source} over {destination}"
+            );
+            assert_eq!(
+                ChannelFunction::SwappedOverlay.apply(source, destination) as u8,
+                overlay(destination, source),
+                "the hard light of {source} over {destination}"
+            );
+        }
+    }
+}

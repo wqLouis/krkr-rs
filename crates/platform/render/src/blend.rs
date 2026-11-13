@@ -4,6 +4,11 @@
 //! path and the GPU's destination-dependent program both read it, so a
 //! Photoshop blend means the same thing on the CPU and on the GPU.
 //!
+//! Three of the functions are tables of entries rather than arithmetic:
+//! the soft light, the colour dodge and the colour burn. Their tables live
+//! in [`tables`] and are the crate's constants, so every path that blends
+//! reads the same entry for the same pair of channels.
+//!
 //! A mode is a per-channel function and the way its result combines with the
 //! source's alpha: the function turns the source's channel and the
 //! destination's channel into the blended channel, and the source's alpha
@@ -20,6 +25,10 @@
 //! [`dst_blend_shader`]), so the shader and the table cannot drift apart.
 
 use api::blend::{BlendMode, DstBlend};
+
+mod tables;
+
+pub use crate::blend::tables::{color_burn_table, color_dodge_table, soft_light_table};
 
 /// A per-channel function of the Photoshop blend family.
 ///
@@ -407,35 +416,30 @@ fn fade(source: u8, weight: u32) -> u8 {
 
 /// The overlay table's entry: the overlay of a source channel over a
 /// destination channel.
+///
+/// The two halves are computed and one of them is selected, so the
+/// destination's half does not decide the instruction path.
 #[inline]
 fn overlay_channel(source: u8, destination: u8) -> u8 {
     let product = i32::from(source) * i32::from(destination) * 2;
-    let value = if destination < 128 {
-        product / 255
-    } else {
-        (i32::from(source) + i32::from(destination)) * 2 - product / 255 - 255
-    };
+    let quotient = product / 255;
+    let dark = quotient;
+    let light = (i32::from(source) + i32::from(destination)) * 2 - quotient - 255;
+    let mask = -i32::from(destination >= 128);
+    let value = (dark & !mask) | (light & mask);
     value.clamp(0, 255) as u8
 }
 
 /// The colour-dodge table's entry.
 #[inline]
 fn color_dodge_channel(source: u8, destination: u8) -> u8 {
-    if 255 - i32::from(source) <= i32::from(destination) {
-        255
-    } else {
-        ((i32::from(destination) * 255) / (255 - i32::from(source))) as u8
-    }
+    tables::color_dodge(source, destination)
 }
 
 /// The colour-burn table's entry.
 #[inline]
 fn color_burn_channel(source: u8, destination: u8) -> u8 {
-    if i32::from(source) <= 255 - i32::from(destination) {
-        0
-    } else {
-        (255 - ((255 - i32::from(destination)) * 255) / i32::from(source)) as u8
-    }
+    tables::color_burn(source, destination)
 }
 
 /// The soft-light table's entry.
@@ -444,26 +448,5 @@ fn color_burn_channel(source: u8, destination: u8) -> u8 {
 /// the table is built from.
 #[inline]
 fn soft_light_channel(source: u8, destination: u8) -> u8 {
-    let base = f64::from(destination) / 255.0;
-    let value = if source >= 128 {
-        base.powf(128.0 / f64::from(source))
-    } else {
-        base.powf((1.0 - f64::from(source) / 255.0) / 0.5)
-    };
-    (value * 255.0) as u8
-}
-
-/// The soft-light table the GPU reads.
-///
-/// The table holds the entry for every source and destination channel, with
-/// the source's channel selecting the row. The GPU reads it because a
-/// shader's floating-point power cannot reproduce the table's entries.
-pub fn soft_light_table() -> Vec<u8> {
-    let mut table = Vec::with_capacity(256 * 256);
-    for source in 0..=u8::MAX {
-        for destination in 0..=u8::MAX {
-            table.push(soft_light_channel(source, destination));
-        }
-    }
-    table
+    tables::soft_light(source, destination)
 }

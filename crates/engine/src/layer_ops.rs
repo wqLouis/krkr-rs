@@ -117,23 +117,6 @@ pub fn clip_rect(clip: Option<Rect>) -> RectI {
     }
 }
 
-/// The effective color-blend factor for a source-over composite. `dopa` is the
-/// destination alpha, `opa` the source opacity. A fully transparent
-/// destination collapses to `255` (the source color is written unattenuated).
-fn opacity_on_opacity(dopa: u8, opa: u8) -> u8 {
-    if dopa == 0 {
-        return 255;
-    }
-    // Computed with `f32` in this operation order so the final truncation is
-    // reproducible.
-    let at = f32::from(dopa) / 255.0;
-    let bt = f32::from(opa) / 255.0;
-    let c = bt / at;
-    let c = c / (1.0 - bt + c);
-    let ci = (c * 255.0) as i32;
-    ci.clamp(0, 255) as u8
-}
-
 /// The per-channel color blend shared by the `_d`/`_a` constant-color
 /// routines: `d + ((s - d) * alpha >> 8)` with an arithmetic (flooring)
 /// shift, matching the C unsigned-shift trick.
@@ -231,10 +214,11 @@ pub fn fill_color_on_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 4]
         return;
     }
     let opa = opa as u8;
+    let tables = blend_tables();
     for y in y0..y1 {
         for x in x0..x1 {
             let d = read_pixel(bitmap, x, y);
-            let alpha = opacity_on_opacity(d[3], opa);
+            let alpha = tables.opacity_on_opacity[(usize::from(opa) << 8) | usize::from(d[3])];
             let out_a = 255 - (((255 - i32::from(d[3])) * (255 - i32::from(opa))) >> 8);
             let mut out = [0u8; 4];
             for c in 0..3 {
@@ -1086,17 +1070,17 @@ pub fn blit_plane(
         // The common copy is a whole rectangle whose rows map one to one;
         // copy each row as a run instead of resolving every pixel.
         if !copy_plane_rows(dst, dx, dy, src, src_rect, dc) {
-            for y in dc.1..dc.3 {
-                for x in dc.0..dc.2 {
-                    let sx = src_rect.0 + (x - dx);
-                    let sy = src_rect.1 + (y - dy);
-                    if sx < 0 || sy < 0 || sx as u32 >= src.width || sy as u32 >= src.height {
-                        continue;
-                    }
-                    let s = read_pixel(src, sx, sy);
-                    write_pixel(dst, x, y, s);
-                }
-            }
+            blend_pass(
+                dst,
+                dc,
+                RowPixels::new(src, src_rect, (dx, dy)),
+                PlaneBlend {
+                    plane: COPY_MAIN | COPY_MASK,
+                },
+                ModeKernel::Copy,
+                255,
+                Unreached::Keep,
+            );
         }
         // The pass wrote inside the clipped destination rectangle only, so the
         // upload needs that rectangle and not the whole bitmap.
@@ -1115,24 +1099,15 @@ pub fn blit_plane(
     let Some(dc) = intersect_rect(in_bounds, clip) else {
         return;
     };
-    for y in dc.1..dc.3 {
-        for x in dc.0..dc.2 {
-            let sx = src_rect.0 + (x - dx);
-            let sy = src_rect.1 + (y - dy);
-            if sx < 0 || sy < 0 || sx as u32 >= src.width || sy as u32 >= src.height {
-                continue;
-            }
-            let s = read_pixel(src, sx, sy);
-            let mut d = read_pixel(dst, x, y);
-            if plane & COPY_MAIN != 0 {
-                d[0..3].copy_from_slice(&s[0..3]);
-            }
-            if plane & COPY_MASK != 0 {
-                d[3] = s[3];
-            }
-            write_pixel(dst, x, y, d);
-        }
-    }
+    blend_pass(
+        dst,
+        dc,
+        RowPixels::new(src, src_rect, (dx, dy)),
+        PlaneBlend { plane },
+        ModeKernel::Copy,
+        255,
+        Unreached::Keep,
+    );
     // The pass wrote inside the clipped destination rectangle only, so the
     // upload needs that rectangle and not the whole bitmap.
     dst.mark_dirty_rect(clipped_region(dc));
@@ -1470,6 +1445,67 @@ fn sample_area(
     out
 }
 
+/// The source's horizontal position a destination column maps to.
+///
+/// The mapping divides the destination's offset by the destination's width,
+/// which every pixel of the pass shares, so the division belongs to the
+/// column and not to the pixel.
+fn stretch_column(src: RectI, dest: RectI, x: i32) -> f32 {
+    let dw = (dest.2 - dest.0) as f32;
+    let sw = (src.2 - src.0) as f32;
+    let u = (x as f32 - dest.0 as f32 + 0.5) / dw;
+    src.0 as f32 + u * sw - 0.5
+}
+
+/// The source's vertical position a destination row maps to.
+///
+/// The mapping divides the destination's offset by the destination's height,
+/// which every pixel of the pass shares, so the division belongs to the row
+/// and not to the pixel.
+fn stretch_row(src: RectI, dest: RectI, y: i32) -> f32 {
+    let dh = (dest.3 - dest.1) as f32;
+    let sh = (src.3 - src.1) as f32;
+    let v = (y as f32 - dest.1 as f32 + 0.5) / dh;
+    src.1 as f32 + v * sh - 0.5
+}
+
+/// The source position a destination pixel maps to.
+#[derive(Clone, Copy)]
+struct StretchPosition {
+    /// The source's horizontal position.
+    fx: f32,
+    /// The source's vertical position.
+    fy: f32,
+}
+
+/// Sample the source at dest-pixel center `(x, y)` at the source's position.
+/// `stretch_type` is a numeric stretch type: the low 16 bits select the
+/// resampler, the `stRefNoClip` (0x10000) flag lets the kernel read outside
+/// `src`. Unknown resamplers fall back to bilinear rather than throwing.
+fn stretch_sample_at(
+    bitmap: &BitmapState,
+    src: RectI,
+    dest: RectI,
+    position: StretchPosition,
+    x: i32,
+    y: i32,
+    stretch_type: i64,
+) -> [u8; 4] {
+    let kind = stretch_type & 0xffff;
+    let ref_no_clip = stretch_type & 0x1_0000 != 0;
+    let rect = if ref_no_clip {
+        (0, 0, dim_i32(bitmap.width), dim_i32(bitmap.height))
+    } else {
+        src
+    };
+    // Area average needs the destination footprint; every other resampler
+    // is a pure kernel evaluation.
+    if kind == 14 || kind == 15 {
+        return sample_area(bitmap, rect, src, dest, x, y);
+    }
+    sample_kind(bitmap, rect, position.fx, position.fy, kind)
+}
+
 /// Sample the source at dest-pixel center `(x, y)` using the mapping from the
 /// destination rect onto the source rect. `stretch_type` is a numeric stretch
 /// type: the low 16 bits select the resampler, the `stRefNoClip` (0x10000)
@@ -1483,27 +1519,17 @@ fn stretch_sample(
     y: i32,
     stretch_type: i64,
 ) -> [u8; 4] {
-    let kind = stretch_type & 0xffff;
-    let ref_no_clip = stretch_type & 0x1_0000 != 0;
-    let rect = if ref_no_clip {
-        (0, 0, dim_i32(bitmap.width), dim_i32(bitmap.height))
-    } else {
-        src
-    };
-    let dw = (dest.2 - dest.0) as f32;
-    let dh = (dest.3 - dest.1) as f32;
-    let sw = (src.2 - src.0) as f32;
-    let sh = (src.3 - src.1) as f32;
-    let u = (x as f32 - dest.0 as f32 + 0.5) / dw;
-    let v = (y as f32 - dest.1 as f32 + 0.5) / dh;
-    let fx = src.0 as f32 + u * sw - 0.5;
-    let fy = src.1 as f32 + v * sh - 0.5;
-    // Area average needs the destination footprint; every other resampler
-    // is a pure kernel evaluation.
-    if kind == 14 || kind == 15 {
-        return sample_area(bitmap, rect, src, dest, x, y);
-    }
-    sample_kind(bitmap, rect, fx, fy, kind)
+    let fx = stretch_column(src, dest, x);
+    let fy = stretch_row(src, dest, y);
+    stretch_sample_at(
+        bitmap,
+        src,
+        dest,
+        StretchPosition { fx, fy },
+        x,
+        y,
+        stretch_type,
+    )
 }
 
 /// Apply a numeric stretch type (low 16 bits) kernel at source position
@@ -1591,23 +1617,15 @@ pub fn stretch_blit_plane(
     let Some(dc) = intersect(dst, dest) else {
         return;
     };
-    for y in dc.1..dc.3 {
-        for x in dc.0..dc.2 {
-            let color = stretch_sample(src, src_rect, dest, x, y, stretch_type);
-            if plane == (COPY_MAIN | COPY_MASK) {
-                write_pixel(dst, x, y, color);
-                continue;
-            }
-            let mut d = read_pixel(dst, x, y);
-            if plane & COPY_MAIN != 0 {
-                d[0..3].copy_from_slice(&color[0..3]);
-            }
-            if plane & COPY_MASK != 0 {
-                d[3] = color[3];
-            }
-            write_pixel(dst, x, y, d);
-        }
-    }
+    blend_pass(
+        dst,
+        dc,
+        Sampled::new(move |x, y| Some(stretch_sample(src, src_rect, dest, x, y, stretch_type))),
+        PlaneBlend { plane },
+        ModeKernel::Copy,
+        255,
+        Unreached::Keep,
+    );
     // The pass wrote inside the clipped destination rectangle only, so the
     // upload needs that rectangle and not the whole bitmap.
     dst.mark_dirty_rect(clipped_region(dc));
@@ -2002,36 +2020,6 @@ pub fn gaussian_blur(bitmap: &mut BitmapState, rect: RectI, radius: i32, sigma: 
     bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
 }
 
-/// Blend one source pixel onto `dst` with an already resolved kernel.
-///
-/// A pass resolves its kernel once and hands it to every pixel, so the
-/// per-pixel loop never dispatches on the operation mode.
-pub(crate) fn blend_pixel_mode(
-    dst: &mut BitmapState,
-    x: i32,
-    y: i32,
-    src: [u8; 4],
-    opa: u8,
-    kernel: ModeKernel,
-) {
-    if x < 0 || y < 0 || x as u32 >= dst.width || y as u32 >= dst.height {
-        return;
-    }
-    let mut pixel = read_pixel(dst, x, y);
-    apply_mode_kernel(kernel, &mut pixel, src, opa);
-    write_pixel(dst, x, y, pixel);
-}
-
-/// The per-pixel core of [`blend_pixel_mode`]: blend `src` into one
-/// destination pixel, in place.
-///
-/// The kernel is factored out of the bitmap accessor so a pass that owns a
-/// destination row slice (the affine nearest pass) blends with the same
-/// arithmetic.
-fn blend_pixel_mode_at(pixel: &mut [u8; 4], src: [u8; 4], opa: u8, kernel: ModeKernel) {
-    apply_mode_kernel(kernel, pixel, src, opa);
-}
-
 /// The blend a pass applies.
 ///
 /// The variants name the per-pixel kernels the engine runs. The kernels work
@@ -2043,7 +2031,7 @@ fn blend_pixel_mode_at(pixel: &mut [u8; 4], src: [u8; 4], opa: u8, kernel: ModeK
 /// The Photoshop family is the exception: its kernels come from the render
 /// pipeline's shared table of per-channel functions, which mixes one channel
 /// at a time.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModeKernel {
     /// The source replaces the destination, alpha included.
     Copy,
@@ -2325,19 +2313,60 @@ fn resolve_kernel_on(
 
 /// The blend a pass applies.
 ///
-/// A pass resolves its blend once and hands it to every pixel, so the
-/// per-pixel loop never dispatches on the operation mode.
+/// A pass resolves its blend once and hands the row to it, so the row's
+/// pixels never dispatch on the operation mode: the operation mode's
+/// arithmetic is monomorphized, one loop per mode.
 trait BandBlend {
-    /// Blends `src` into `pixel` with the operation's kernel.
-    fn blend(kernel: ModeKernel, pixel: &mut [u8; 4], src: [u8; 4], opa: u8);
+    /// Blends the source row into the destination row, in place.
+    ///
+    /// The source answers the colour of each destination pixel; a `None`
+    /// leaves the destination pixel as it is.
+    fn blend_row(
+        &self,
+        kernel: ModeKernel,
+        opa: u8,
+        source: &mut impl Iterator<Item = Option<[u8; 4]>>,
+        destination: &mut [[u8; 4]],
+    );
+
+    /// Applies the blend to a whole row of source and destination bytes,
+    /// when the blend has a block-wise form.
+    ///
+    /// The plain source-over has one: a block whose source is wholly opaque
+    /// copies and a block whose source is wholly transparent leaves the
+    /// destination alone, which is exactly what the source-over's own
+    /// arithmetic gives for those blocks. The alpha blend has one too: an
+    /// opaque source gives the same weight at every destination alpha, and a
+    /// transparent source leaves the destination alone where the
+    /// destination's alpha is not zero.
+    ///
+    /// Returns whether the row was applied; a row that was not applied is
+    /// left to the row loop.
+    fn blend_blocks(
+        &self,
+        _kernel: ModeKernel,
+        _opa: u8,
+        _source: &[u8],
+        _destination: &mut [u8],
+    ) -> bool {
+        false
+    }
 }
 
 /// The source replaces the destination.
 struct ReplaceBlend;
 
 impl BandBlend for ReplaceBlend {
-    fn blend(_kernel: ModeKernel, pixel: &mut [u8; 4], src: [u8; 4], _opa: u8) {
-        *pixel = src;
+    fn blend_row(
+        &self,
+        _kernel: ModeKernel,
+        _opa: u8,
+        source: &mut impl Iterator<Item = Option<[u8; 4]>>,
+        destination: &mut [[u8; 4]],
+    ) {
+        for (destination, source) in row_pairs(source, destination) {
+            *destination = source;
+        }
     }
 }
 
@@ -2345,8 +2374,53 @@ impl BandBlend for ReplaceBlend {
 struct ModeBlend;
 
 impl BandBlend for ModeBlend {
-    fn blend(kernel: ModeKernel, pixel: &mut [u8; 4], src: [u8; 4], opa: u8) {
-        blend_pixel_mode_at(pixel, src, opa, kernel);
+    fn blend_row(
+        &self,
+        kernel: ModeKernel,
+        opa: u8,
+        source: &mut impl Iterator<Item = Option<[u8; 4]>>,
+        destination: &mut [[u8; 4]],
+    ) {
+        blend_row_by_mode(kernel, opa, source, destination);
+    }
+
+    fn blend_blocks(
+        &self,
+        kernel: ModeKernel,
+        opa: u8,
+        source: &[u8],
+        destination: &mut [u8],
+    ) -> bool {
+        source_over_row(kernel, source, destination, opa)
+            || alpha_blend_blocks(kernel, opa, source, destination)
+    }
+}
+
+/// The blend a plane selection applies.
+///
+/// The colour planes and the alpha plane are copied from the source; the
+/// planes the selection leaves out keep the destination's values.
+struct PlaneBlend {
+    /// The planes the copy takes from the source.
+    plane: u8,
+}
+
+impl BandBlend for PlaneBlend {
+    fn blend_row(
+        &self,
+        _kernel: ModeKernel,
+        _opa: u8,
+        source: &mut impl Iterator<Item = Option<[u8; 4]>>,
+        destination: &mut [[u8; 4]],
+    ) {
+        for (destination, source) in row_pairs(source, destination) {
+            if self.plane & COPY_MAIN != 0 {
+                destination[0..3].copy_from_slice(&source[0..3]);
+            }
+            if self.plane & COPY_MASK != 0 {
+                destination[3] = source[3];
+            }
+        }
     }
 }
 
@@ -2376,9 +2450,461 @@ fn affine_blend(kernel: ModeKernel) -> AffineBlend {
 struct SourceOverBlend;
 
 impl BandBlend for SourceOverBlend {
-    fn blend(_kernel: ModeKernel, pixel: &mut [u8; 4], src: [u8; 4], opa: u8) {
-        blend_pixel_at(pixel, src, 255, opa);
+    fn blend_row(
+        &self,
+        _kernel: ModeKernel,
+        opa: u8,
+        source: &mut impl Iterator<Item = Option<[u8; 4]>>,
+        destination: &mut [[u8; 4]],
+    ) {
+        for (destination, source) in row_pairs(source, destination) {
+            blend_pixel_at(destination, source, 255, opa);
+        }
     }
+
+    fn blend_blocks(
+        &self,
+        kernel: ModeKernel,
+        opa: u8,
+        source: &[u8],
+        destination: &mut [u8],
+    ) -> bool {
+        source_over_row(kernel, source, destination, opa)
+    }
+}
+
+/// The row-wide form of the plain source-over.
+///
+/// The source-over's own arithmetic copies a wholly opaque source and leaves
+/// a wholly transparent one alone, so a block of either kind needs no
+/// per-pixel work. The block pass reads the source's alpha to tell the
+/// blocks apart; a block that is neither is left to the per-pixel loop.
+///
+/// Returns whether the row was applied. A row the block pass could not
+/// finish is left as the block pass left it, and the per-pixel loop blends
+/// it again: the source-over is idempotent over a block it has already
+/// copied or skipped.
+fn source_over_row(kernel: ModeKernel, source: &[u8], destination: &mut [u8], opa: u8) -> bool {
+    if kernel != ModeKernel::SourceOver || opa != 255 {
+        return false;
+    }
+    #[cfg(feature = "simd-experiment")]
+    {
+        crate::simd::source_over_row(source, destination)
+    }
+    #[cfg(not(feature = "simd-experiment"))]
+    {
+        let _ = (source, destination);
+        false
+    }
+}
+
+/// The block-wise form of the alpha blend.
+///
+/// The alpha blend's weight table holds 255 for an opaque source at every
+/// destination alpha, so an opaque source gives the same mix for every
+/// destination; and a transparent source leaves the destination alone where
+/// the destination's alpha is not zero, because the weight is zero there. A
+/// row of such blocks needs no per-pixel work.
+///
+/// The mix of an opaque block is not idempotent, so the block pass applies
+/// nothing unless every block of the row qualifies.
+fn alpha_blend_blocks(kernel: ModeKernel, opa: u8, source: &[u8], destination: &mut [u8]) -> bool {
+    if opa != 255 {
+        return false;
+    }
+    match kernel {
+        // The alpha blend on an opaque destination holds the destination's
+        // alpha; the one on an alpha destination writes the weight table's
+        // alpha, which an opaque source leaves at 255.
+        ModeKernel::Alpha => alpha_blend_row(source, destination, true),
+        ModeKernel::AlphaOnAlpha => alpha_blend_row(source, destination, false),
+        _ => false,
+    }
+}
+
+/// The block-wise form of the alpha blend, when the build has the block
+/// pass.
+#[cfg(feature = "simd-experiment")]
+fn alpha_blend_row(source: &[u8], destination: &mut [u8], hold_alpha: bool) -> bool {
+    crate::simd::alpha_blend_row(source, destination, hold_alpha)
+}
+
+/// The block-wise form of the alpha blend, without the block pass.
+#[cfg(not(feature = "simd-experiment"))]
+fn alpha_blend_row(_source: &[u8], _destination: &mut [u8], _hold_alpha: bool) -> bool {
+    false
+}
+
+// ---------------------------------------------------------------------------
+// The one blend pass
+//
+// Every operation that mixes a source into a destination rectangle goes
+// through this pass. The bounds are resolved once — the clipped
+// destination rectangle, the source's placement on it and the source's row
+// for every destination row — and every destination row is then walked with
+// a pointer, so the per-pixel loop pays neither a bounds check nor a
+// bitmap accessor.
+// ---------------------------------------------------------------------------
+
+/// What a pass does with a destination pixel the source does not reach.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unreached {
+    /// The pixel keeps the value it had.
+    Keep,
+    /// The pixel is blended with the transparent miss value, the way a
+    /// source pixel outside the source bitmap reads.
+    Transparent,
+}
+
+/// The source of a blend pass.
+///
+/// The source answers the colour of the destination pixels of one row. A row
+/// source reads a contiguous run of the source bitmap; a sampled source
+/// answers a pixel at a time.
+trait PassSource {
+    /// Prepares the source for the destination row at `row` and the
+    /// destination columns `[left, right)` the pass walks.
+    fn begin_row(&mut self, row: i32, left: i32, right: i32);
+    /// The destination columns the source reaches on this row. The columns
+    /// outside the range hold no source colour.
+    fn reached(&self) -> std::ops::Range<i32>;
+    /// The source's run for the reached columns of the row, when the source
+    /// is a contiguous run of the source bitmap.
+    fn run(&self) -> Option<&[u8]>;
+    /// The colours of the reached pixels, in order. A `None` leaves the
+    /// destination pixel as it is.
+    fn colours(&mut self) -> impl Iterator<Item = Option<[u8; 4]>>;
+}
+
+/// The source of a pass that reads a contiguous run of a source bitmap.
+///
+/// The source rectangle maps one-to-one onto the destination rectangle, so
+/// the run of a destination row is the run of the matching source row. A
+/// source row outside the source bitmap, and a source column outside it,
+/// hold no colour.
+struct RowPixels<'a> {
+    /// The source bitmap.
+    bitmap: &'a BitmapState,
+    /// The source rectangle, in the source bitmap's coordinates.
+    rectangle: RectI,
+    /// The source's origin on the destination.
+    origin: (i32, i32),
+    /// The run of the row the pass is walking.
+    run: &'a [u8],
+    /// The destination columns the run covers.
+    reached: std::ops::Range<i32>,
+}
+
+impl<'a> RowPixels<'a> {
+    /// A source that reads `bitmap[rectangle]` at `origin` on the
+    /// destination.
+    fn new(bitmap: &'a BitmapState, rectangle: RectI, origin: (i32, i32)) -> Self {
+        Self {
+            bitmap,
+            rectangle,
+            origin,
+            run: &[],
+            reached: 0..0,
+        }
+    }
+
+    /// The source's row for the destination row `row`, or `None` when the
+    /// source row is outside the source bitmap.
+    fn source_row(&self, row: i32) -> Option<i64> {
+        let source_row = i64::from(self.rectangle.1) + i64::from(row) - i64::from(self.origin.1);
+        (source_row >= 0 && source_row < i64::from(self.bitmap.height)).then_some(source_row)
+    }
+}
+
+impl PassSource for RowPixels<'_> {
+    fn begin_row(&mut self, row: i32, left: i32, right: i32) {
+        let Some(source_row) = self.source_row(row) else {
+            self.run = &[];
+            self.reached = 0..0;
+            return;
+        };
+        // The source columns the destination columns `[left, right)` read.
+        let first = i64::from(self.rectangle.0) + i64::from(left) - i64::from(self.origin.0);
+        let last = i64::from(self.rectangle.0) + i64::from(right) - i64::from(self.origin.0);
+        let inside_first = first.max(0);
+        let inside_last = last.min(i64::from(self.bitmap.width));
+        if inside_first >= inside_last {
+            self.run = &[];
+            self.reached = 0..0;
+            return;
+        }
+        let pitch = i64::from(self.bitmap.width) * 4;
+        let Some(offset) = usize::try_from(source_row * pitch + inside_first * 4).ok() else {
+            self.run = &[];
+            self.reached = 0..0;
+            return;
+        };
+        let Some(length) = usize::try_from((inside_last - inside_first) * 4).ok() else {
+            self.run = &[];
+            self.reached = 0..0;
+            return;
+        };
+        let Some(run) = self.bitmap.rgba.get(offset..offset + length) else {
+            self.run = &[];
+            self.reached = 0..0;
+            return;
+        };
+        self.run = run;
+        let origin = i64::from(self.origin.0);
+        let rectangle = i64::from(self.rectangle.0);
+        let Some(first_column) = i32::try_from(origin + inside_first - rectangle).ok() else {
+            self.run = &[];
+            self.reached = 0..0;
+            return;
+        };
+        let Some(last_column) = i32::try_from(origin + inside_last - rectangle).ok() else {
+            self.run = &[];
+            self.reached = 0..0;
+            return;
+        };
+        self.reached = first_column..last_column;
+    }
+
+    fn reached(&self) -> std::ops::Range<i32> {
+        self.reached.clone()
+    }
+
+    fn run(&self) -> Option<&[u8]> {
+        (!self.run.is_empty()).then_some(self.run)
+    }
+
+    fn colours(&mut self) -> impl Iterator<Item = Option<[u8; 4]>> {
+        let run = self.run;
+        run.as_chunks::<4>().0.iter().copied().map(Some)
+    }
+}
+
+/// The source of a pass that answers a pixel at a time.
+///
+/// The sampler resolves the colour of the destination pixel at a column of
+/// the row the pass is walking. A `None` leaves the destination pixel as it
+/// is.
+struct Sampled<F> {
+    /// The sampler: the colour of the destination pixel at a column and a
+    /// row.
+    sampler: F,
+    /// The row the pass is walking.
+    row: i32,
+    /// The column the next colour answers.
+    column: i32,
+}
+
+/// The colours of one row of a sampled source.
+///
+/// The iterator answers a colour for every column of the row; a `None` is a
+/// colour that leaves the destination pixel as it is, not the end of the
+/// row.
+struct SampledColours<'a, F> {
+    /// The sampler.
+    sampler: &'a F,
+    /// The row the pass is walking.
+    row: i32,
+    /// The column the next colour answers.
+    column: i32,
+}
+
+impl<F: Fn(i32, i32) -> Option<[u8; 4]>> Iterator for SampledColours<'_, F> {
+    type Item = Option<[u8; 4]>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let column = self.column;
+        self.column = self.column.saturating_add(1);
+        Some((self.sampler)(column, self.row))
+    }
+}
+
+impl<F> Sampled<F> {
+    /// A source that answers its pixels with `sampler`.
+    fn new(sampler: F) -> Self {
+        Self {
+            sampler,
+            row: 0,
+            column: 0,
+        }
+    }
+}
+
+impl<F: Fn(i32, i32) -> Option<[u8; 4]>> PassSource for Sampled<F> {
+    fn begin_row(&mut self, row: i32, left: i32, _right: i32) {
+        self.row = row;
+        self.column = left;
+    }
+
+    fn reached(&self) -> std::ops::Range<i32> {
+        i32::MIN..i32::MAX
+    }
+
+    fn run(&self) -> Option<&[u8]> {
+        None
+    }
+
+    fn colours(&mut self) -> impl Iterator<Item = Option<[u8; 4]>> {
+        SampledColours {
+            sampler: &self.sampler,
+            row: self.row,
+            column: self.column,
+        }
+    }
+}
+
+/// One blend pass over a rectangle of a destination bitmap.
+///
+/// The pass resolves the bounds once — the clipped destination rectangle,
+/// the source's placement on it and the source's row for every destination
+/// row — and then walks every destination row with a pointer.
+struct BlendPass<'a, S: PassSource, B: BandBlend> {
+    /// The destination bitmap the pass writes.
+    destination: &'a mut BitmapState,
+    /// The clipped destination rectangle: `(left, top, right, bottom)`.
+    rectangle: RectI,
+    /// The source of the pass.
+    source: S,
+    /// The blend the pass applies.
+    blend: B,
+    /// The kernel the blend runs.
+    kernel: ModeKernel,
+    /// The opacity the blend runs at.
+    opa: u8,
+    /// What the pass does with a destination pixel the source does not
+    /// reach.
+    unreached: Unreached,
+}
+
+impl<S: PassSource, B: BandBlend> BlendPass<'_, S, B> {
+    /// Runs the pass over every row of the rectangle.
+    fn run(self) {
+        let BlendPass {
+            destination,
+            rectangle,
+            mut source,
+            blend,
+            kernel,
+            opa,
+            unreached,
+        } = self;
+        let (left, top, right, bottom) = rectangle;
+        if left >= right || top >= bottom {
+            return;
+        }
+        let Some(pitch) = usize::try_from(destination.width)
+            .ok()
+            .and_then(|width| width.checked_mul(4))
+        else {
+            return;
+        };
+        let (Ok(left_index), Ok(right_index)) = (usize::try_from(left), usize::try_from(right))
+        else {
+            return;
+        };
+        let Some(bytes) = right_index
+            .checked_sub(left_index)
+            .and_then(|width| width.checked_mul(4))
+        else {
+            return;
+        };
+        for row in top..bottom {
+            let Ok(index) = usize::try_from(row) else {
+                continue;
+            };
+            let Some(start) = index
+                .checked_mul(pitch)
+                .and_then(|row| row.checked_add(left_index.checked_mul(4)?))
+            else {
+                continue;
+            };
+            let Some(end) = start.checked_add(bytes) else {
+                continue;
+            };
+            let Some(destination_row) = destination.rgba.get_mut(start..end) else {
+                continue;
+            };
+            source.begin_row(row, left, right);
+            let reached = source.reached();
+            let first = reached.start.clamp(left, right);
+            let last = reached.end.clamp(left, right);
+            if first >= last {
+                // The source reaches no pixel of this row.
+                if unreached == Unreached::Transparent {
+                    blend_unreached(&blend, kernel, opa, destination_row);
+                }
+                continue;
+            }
+            let Some(prefix) = usize::try_from(first - left)
+                .ok()
+                .and_then(|width| width.checked_mul(4))
+            else {
+                continue;
+            };
+            let Some(middle) = usize::try_from(last - first)
+                .ok()
+                .and_then(|width| width.checked_mul(4))
+            else {
+                continue;
+            };
+            let (head, rest) = destination_row.split_at_mut(prefix);
+            let (reached_row, tail) = rest.split_at_mut(middle);
+            if unreached == Unreached::Transparent {
+                blend_unreached(&blend, kernel, opa, head);
+            }
+            // The block-wise form of the blend, when it has one and the
+            // source is a contiguous run: the blocks it copied, mixed or
+            // skipped need no per-pixel work.
+            let mut blended = false;
+            if let Some(source_run) = source.run()
+                && blend.blend_blocks(kernel, opa, source_run, reached_row)
+            {
+                blended = true;
+            }
+            if !blended {
+                let reached_pixels = reached_row.as_chunks_mut::<4>().0;
+                let mut colours = source.colours();
+                blend.blend_row(kernel, opa, &mut colours, reached_pixels);
+            }
+            if unreached == Unreached::Transparent {
+                blend_unreached(&blend, kernel, opa, tail);
+            }
+        }
+    }
+}
+
+/// Blends the transparent miss value into the pixels the source does not
+/// reach.
+fn blend_unreached<B: BandBlend>(blend: &B, kernel: ModeKernel, opa: u8, pixels: &mut [u8]) {
+    let count = pixels.len() / 4;
+    let mut source = std::iter::repeat_n(Some([0, 0, 0, 0]), count);
+    let pixels = pixels.as_chunks_mut::<4>().0;
+    blend.blend_row(kernel, opa, &mut source, pixels);
+}
+
+/// Runs one blend pass over a destination rectangle.
+///
+/// The rectangle is the destination's own clipped rectangle; the pass writes
+/// inside it alone.
+fn blend_pass<S: PassSource, B: BandBlend>(
+    destination: &mut BitmapState,
+    rectangle: RectI,
+    source: S,
+    blend: B,
+    kernel: ModeKernel,
+    opa: u8,
+    unreached: Unreached,
+) {
+    BlendPass {
+        destination,
+        rectangle,
+        source,
+        blend,
+        kernel,
+        opa,
+        unreached,
+    }
+    .run();
 }
 
 // ---------------------------------------------------------------------------
@@ -2412,18 +2938,22 @@ fn word_pixel(word: u32) -> [u8; 4] {
     ]
 }
 
-/// The two lookup tables the alpha blends read.
+/// The lookup tables the alpha blends read.
 ///
 /// `opacity_on_opacity` is the effective source weight of a (source alpha,
 /// destination alpha) pair: `(sa / da) / (1 - sa + sa / da)` in single
 /// precision, truncated to a byte. `negative_mul` is the destination alpha a
-/// blend leaves: `255 - (255 - da) * (255 - sa) / 255`.
+/// blend leaves: `255 - (255 - da) * (255 - sa) / 255`. `reciprocal` is the
+/// colour dodge's reciprocal per channel: `65536 / i`, and 65536 at the
+/// zero index.
 struct BlendTables {
     /// The effective source weight per (source alpha, destination alpha).
     opacity_on_opacity: [u8; 65536],
     /// The destination alpha a blend leaves per (source alpha, destination
     /// alpha).
     negative_mul: [u8; 65536],
+    /// The colour dodge's reciprocal per channel.
+    reciprocal: [u32; 256],
 }
 
 /// The lookup tables, built once on first use.
@@ -2433,7 +2963,13 @@ fn blend_tables() -> &'static BlendTables {
         let mut tables = BlendTables {
             opacity_on_opacity: [0; 65536],
             negative_mul: [0; 65536],
+            reciprocal: [0; 256],
         };
+        // The zero index has no reciprocal; the value is 65536 there.
+        tables.reciprocal[0] = 65536;
+        for index in 1..256u16 {
+            tables.reciprocal[usize::from(index)] = 65536 / u32::from(index);
+        }
         for destination_alpha in 0..256u32 {
             for source_alpha in 0..256u32 {
                 let weight = if destination_alpha == 0 {
@@ -2703,21 +3239,22 @@ fn mul_faded(destination: u32, source: u32, opa: u32) -> u32 {
 
 /// The reciprocal the colour dodge reads: `65536 / i`, and 65536 at the zero
 /// index.
-fn reciprocal(index: u32) -> u32 {
-    // The zero index has no reciprocal; the value is 65536 there.
-    65536u32.checked_div(index).unwrap_or(65536)
+fn reciprocal(index: u8) -> u32 {
+    blend_tables().reciprocal[usize::from(index)]
 }
 
 /// The colour-dodge blend: the destination scaled by the reciprocal of the
 /// source's complement.
 fn dodge(destination: u32, source: u32) -> u32 {
     let complement = !source;
-    let mut tmp = (destination & 0x0000_00ff).wrapping_mul(reciprocal(complement & 0xff)) >> 8;
+    let mut tmp =
+        (destination & 0x0000_00ff).wrapping_mul(reciprocal((complement & 0xff) as u8)) >> 8;
     let mut result = (tmp | below_limit(tmp, 0x100)) & 0x0000_00ff;
-    tmp = ((destination & 0x0000_ff00) >> 8).wrapping_mul(reciprocal((complement & 0xff00) >> 8));
+    tmp = ((destination & 0x0000_ff00) >> 8)
+        .wrapping_mul(reciprocal(((complement & 0xff00) >> 8) as u8));
     result |= (tmp | below_limit(tmp, 0x10000)) & 0x0000_ff00;
-    tmp =
-        ((destination & 0x00ff_0000) >> 16).wrapping_mul(reciprocal((complement & 0xff0000) >> 16));
+    tmp = ((destination & 0x00ff_0000) >> 16)
+        .wrapping_mul(reciprocal(((complement & 0xff0000) >> 16) as u8));
     result |= ((tmp | below_limit(tmp, 0x10000)) & 0x0000_ff00) << 8;
     result
 }
@@ -2784,124 +3321,407 @@ fn screen_faded(destination: u32, source: u32, opa: u32) -> u32 {
     (!(tmp >> 8)) ^ (inverted & 0xff00_0000)
 }
 
-/// Blends `src` into one destination pixel with the kernel of `mode`.
-fn apply_mode_kernel(kernel: ModeKernel, pixel: &mut [u8; 4], src: [u8; 4], opa: u8) {
-    let destination = argb_word(*pixel);
-    let source = argb_word(src);
-    let opacity = opa;
-    let opa = u32::from(opa);
-    let result = match kernel {
-        // The plain source-over works on the straight-alpha bytes, not on the
-        // word, so it writes the pixel itself.
-        ModeKernel::SourceOver => {
-            blend_pixel_at(pixel, src, 255, opacity);
-            return;
+// ---------------------------------------------------------------------------
+// The per-pixel arithmetic of the operation modes
+//
+// Each mode's arithmetic is a type of its own, so the row loop that runs it
+// is monomorphized: the row resolves the mode once, and the row's pixels
+// never dispatch on it again. The mode list, the arithmetic and the dispatch
+// live in one place, so a mode the list does not name does not compile.
+// ---------------------------------------------------------------------------
+
+/// The per-pixel arithmetic of one operation mode.
+///
+/// The arithmetic is the mode's own; a row loop that runs it is
+/// monomorphized over the mode.
+trait ModeArithmetic {
+    /// Blends `source` into `pixel` in place.
+    fn blend(pixel: &mut [u8; 4], source: [u8; 4], opa: u8);
+}
+
+/// One straight-alpha RGBA pixel.
+type Pixel = [u8; 4];
+
+/// The operation modes' arithmetic, one type per mode.
+///
+/// The macro takes the mode's name and the mode's arithmetic, and it builds
+/// the mode's type and the row's dispatch from them.
+macro_rules! mode_arithmetic {
+    ($($variant:ident => $body:expr),* $(,)?) => {
+        /// The arithmetic of the operation modes, one type per mode.
+        mod kernels {
+            use super::*;
+
+            $(
+                #[doc = concat!("The arithmetic of the ", stringify!($variant), " operation mode.")]
+                pub struct $variant;
+
+                impl super::ModeArithmetic for $variant {
+                    fn blend(pixel: &mut [u8; 4], source: [u8; 4], opa: u8) {
+                        ($body)(pixel, source, opa)
+                    }
+                }
+            )*
         }
-        // The plain source-over with the destination's alpha held.
-        ModeKernel::SourceOverHold => {
-            let alpha = pixel[3];
-            blend_pixel_at(pixel, src, 255, opacity);
-            pixel[3] = alpha;
-            return;
-        }
-        ModeKernel::Copy => source,
-        ModeKernel::CopyColor => (destination & 0xff00_0000).wrapping_add(source & 0x00ff_ffff),
-        ModeKernel::CopyOpaque => 0xff00_0000 | source,
-        ModeKernel::ConstAlpha => const_alpha_blend(destination, source, opa),
-        ModeKernel::ConstAlphaOnAlpha => const_alpha_blend_on_alpha(destination, source, opa),
-        ModeKernel::ConstAlphaOnAddAlpha => {
-            const_alpha_blend_on_add_alpha(destination, source, opa)
-        }
-        ModeKernel::Alpha => alpha_blend_keep_alpha(destination, source, opa),
-        ModeKernel::AlphaOnAlpha => alpha_blend_on_alpha(destination, source, opa),
-        ModeKernel::AlphaOnAddAlpha => alpha_blend_on_add_alpha(destination, source, opa),
-        ModeKernel::AddAlpha => add_alpha(destination, source, opa),
-        ModeKernel::AddAlphaOnAddAlpha => add_alpha_on_add_alpha(destination, source, opa),
-        ModeKernel::Add => add(destination, source, opa),
-        ModeKernel::Sub => sub(destination, source, opa),
-        ModeKernel::Mul => {
-            if opa == 255 {
-                mul(destination, source)
-            } else {
-                mul_faded(destination, source, opa)
+
+        /// Blends one row of source colours into one row of destination
+        /// pixels with the mode's arithmetic.
+        ///
+        /// The dispatch happens once for the row, so the row's pixels never
+        /// pay for it. A source colour of `None` leaves the destination
+        /// pixel as it is.
+        fn blend_row_by_mode(
+            kernel: ModeKernel,
+            opa: u8,
+            source: &mut impl Iterator<Item = Option<[u8; 4]>>,
+            destination: &mut [[u8; 4]],
+        ) {
+            match kernel {
+                $(
+                    ModeKernel::$variant => {
+                        blend_row_pixels::<kernels::$variant>(opa, source, destination)
+                    }
+                )*
             }
         }
-        ModeKernel::MulHoldAlpha => {
-            let result = if opa == 255 {
-                mul(destination, source)
-            } else {
-                mul_faded(destination, source, opa)
-            };
-            hold_alpha(result, destination)
-        }
-        ModeKernel::Dodge => {
-            if opa == 255 {
-                hold_alpha(dodge(destination, source), destination)
-            } else {
-                hold_alpha(dodge_faded(destination, source, opa), destination)
+
+        /// Blends one row of source colours into one row of destination
+        /// pixels with the mode's arithmetic, where every pixel has a
+        /// colour.
+        ///
+        /// The dispatch happens once for the row, so the row's pixels never
+        /// pay for it. A resampling row has a colour for every pixel, so it
+        /// pays no per-pixel test for a missing one.
+        fn blend_row_values_by_mode(
+            kernel: ModeKernel,
+            opa: u8,
+            source: &mut impl Iterator<Item = [u8; 4]>,
+            destination: &mut [[u8; 4]],
+        ) {
+            match kernel {
+                $(
+                    ModeKernel::$variant => {
+                        blend_row_values_pixels::<kernels::$variant>(opa, source, destination)
+                    }
+                )*
             }
-        }
-        ModeKernel::Darken => {
-            if opa == 255 {
-                hold_alpha(darken(destination, source), destination)
-            } else {
-                darken_faded(destination, source, opa)
-            }
-        }
-        ModeKernel::Lighten => {
-            if opa == 255 {
-                hold_alpha(lighten(destination, source), destination)
-            } else {
-                lighten_faded(destination, source, opa)
-            }
-        }
-        ModeKernel::Screen => {
-            if opa == 255 {
-                hold_alpha(screen(destination, source), destination)
-            } else {
-                screen_faded(destination, source, opa)
-            }
-        }
-        // The Photoshop family keeps the destination's alpha and comes from
-        // the render pipeline's shared table of per-channel functions.
-        ModeKernel::PsNormal => PhotoshopBlend::NORMAL.blend_word(destination, source, opacity),
-        ModeKernel::PsAdditive => PhotoshopBlend::ADDITIVE.blend_word(destination, source, opacity),
-        ModeKernel::PsSubtractive => {
-            PhotoshopBlend::SUBTRACTIVE.blend_word(destination, source, opacity)
-        }
-        ModeKernel::PsMultiplicative => {
-            PhotoshopBlend::MULTIPLICATIVE.blend_word(destination, source, opacity)
-        }
-        ModeKernel::PsScreen => PhotoshopBlend::SCREEN.blend_word(destination, source, opacity),
-        ModeKernel::PsOverlay => PhotoshopBlend::OVERLAY.blend_word(destination, source, opacity),
-        ModeKernel::PsHardLight => {
-            PhotoshopBlend::HARD_LIGHT.blend_word(destination, source, opacity)
-        }
-        ModeKernel::PsSoftLight => {
-            PhotoshopBlend::SOFT_LIGHT.blend_word(destination, source, opacity)
-        }
-        ModeKernel::PsColorDodge => {
-            PhotoshopBlend::COLOR_DODGE.blend_word(destination, source, opacity)
-        }
-        ModeKernel::PsColorDodge5 => {
-            PhotoshopBlend::COLOR_DODGE5.blend_word(destination, source, opacity)
-        }
-        ModeKernel::PsColorBurn => {
-            PhotoshopBlend::COLOR_BURN.blend_word(destination, source, opacity)
-        }
-        ModeKernel::PsLighten => PhotoshopBlend::LIGHTEN.blend_word(destination, source, opacity),
-        ModeKernel::PsDarken => PhotoshopBlend::DARKEN.blend_word(destination, source, opacity),
-        ModeKernel::PsDifference => {
-            PhotoshopBlend::DIFFERENCE.blend_word(destination, source, opacity)
-        }
-        ModeKernel::PsDifference5 => {
-            PhotoshopBlend::DIFFERENCE5.blend_word(destination, source, opacity)
-        }
-        ModeKernel::PsExclusion => {
-            PhotoshopBlend::EXCLUSION.blend_word(destination, source, opacity)
         }
     };
-    *pixel = word_pixel(result);
+}
+
+mode_arithmetic! {
+    // The plain source-over works on the straight-alpha bytes, not on the
+    // word, so it writes the pixel itself.
+    SourceOver => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        blend_pixel_at(pixel, source, 255, opa);
+    },
+    // The plain source-over with the destination's alpha held.
+    SourceOverHold => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        let alpha = pixel[3];
+        blend_pixel_at(pixel, source, 255, opa);
+        pixel[3] = alpha;
+    },
+    Copy => |pixel: &mut Pixel, source: Pixel, _opa: u8| {
+        *pixel = word_pixel(argb_word(source));
+    },
+    CopyColor => |pixel: &mut Pixel, source: Pixel, _opa: u8| {
+        *pixel = word_pixel(
+            (argb_word(*pixel) & 0xff00_0000).wrapping_add(argb_word(source) & 0x00ff_ffff),
+        );
+    },
+    CopyOpaque => |pixel: &mut Pixel, source: Pixel, _opa: u8| {
+        *pixel = word_pixel(0xff00_0000 | argb_word(source));
+    },
+    ConstAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(const_alpha_blend(
+            argb_word(*pixel),
+            argb_word(source),
+            u32::from(opa),
+        ));
+    },
+    ConstAlphaOnAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(const_alpha_blend_on_alpha(
+            argb_word(*pixel),
+            argb_word(source),
+            u32::from(opa),
+        ));
+    },
+    ConstAlphaOnAddAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(const_alpha_blend_on_add_alpha(
+            argb_word(*pixel),
+            argb_word(source),
+            u32::from(opa),
+        ));
+    },
+    Alpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(alpha_blend_keep_alpha(
+            argb_word(*pixel),
+            argb_word(source),
+            u32::from(opa),
+        ));
+    },
+    AlphaOnAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(alpha_blend_on_alpha(
+            argb_word(*pixel),
+            argb_word(source),
+            u32::from(opa),
+        ));
+    },
+    AlphaOnAddAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(alpha_blend_on_add_alpha(
+            argb_word(*pixel),
+            argb_word(source),
+            u32::from(opa),
+        ));
+    },
+    AddAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(add_alpha(
+            argb_word(*pixel),
+            argb_word(source),
+            u32::from(opa),
+        ));
+    },
+    AddAlphaOnAddAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(add_alpha_on_add_alpha(
+            argb_word(*pixel),
+            argb_word(source),
+            u32::from(opa),
+        ));
+    },
+    Add => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(add(
+            argb_word(*pixel),
+            argb_word(source),
+            u32::from(opa),
+        ));
+    },
+    Sub => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(sub(
+            argb_word(*pixel),
+            argb_word(source),
+            u32::from(opa),
+        ));
+    },
+    Mul => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        let result = if opa == 255 {
+            mul(argb_word(*pixel), argb_word(source))
+        } else {
+            mul_faded(argb_word(*pixel), argb_word(source), u32::from(opa))
+        };
+        *pixel = word_pixel(result);
+    },
+    MulHoldAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        let result = if opa == 255 {
+            mul(argb_word(*pixel), argb_word(source))
+        } else {
+            mul_faded(argb_word(*pixel), argb_word(source), u32::from(opa))
+        };
+        *pixel = word_pixel(hold_alpha(result, argb_word(*pixel)));
+    },
+    Dodge => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        let result = if opa == 255 {
+            dodge(argb_word(*pixel), argb_word(source))
+        } else {
+            dodge_faded(argb_word(*pixel), argb_word(source), u32::from(opa))
+        };
+        *pixel = word_pixel(hold_alpha(result, argb_word(*pixel)));
+    },
+    Darken => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        let result = if opa == 255 {
+            darken(argb_word(*pixel), argb_word(source))
+        } else {
+            darken_faded(argb_word(*pixel), argb_word(source), u32::from(opa))
+        };
+        *pixel = word_pixel(hold_alpha(result, argb_word(*pixel)));
+    },
+    Lighten => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        let result = if opa == 255 {
+            lighten(argb_word(*pixel), argb_word(source))
+        } else {
+            lighten_faded(argb_word(*pixel), argb_word(source), u32::from(opa))
+        };
+        *pixel = word_pixel(hold_alpha(result, argb_word(*pixel)));
+    },
+    Screen => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        let result = if opa == 255 {
+            screen(argb_word(*pixel), argb_word(source))
+        } else {
+            screen_faded(argb_word(*pixel), argb_word(source), u32::from(opa))
+        };
+        *pixel = word_pixel(hold_alpha(result, argb_word(*pixel)));
+    },
+    // The Photoshop family keeps the destination's alpha and comes from
+    // the render pipeline's shared table of per-channel functions.
+    PsNormal => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(PhotoshopBlend::NORMAL.blend_word(
+            argb_word(*pixel),
+            argb_word(source),
+            opa,
+        ));
+    },
+    PsAdditive => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(PhotoshopBlend::ADDITIVE.blend_word(
+            argb_word(*pixel),
+            argb_word(source),
+            opa,
+        ));
+    },
+    PsSubtractive => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(PhotoshopBlend::SUBTRACTIVE.blend_word(
+            argb_word(*pixel),
+            argb_word(source),
+            opa,
+        ));
+    },
+    PsMultiplicative => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(PhotoshopBlend::MULTIPLICATIVE.blend_word(
+            argb_word(*pixel),
+            argb_word(source),
+            opa,
+        ));
+    },
+    PsScreen => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(PhotoshopBlend::SCREEN.blend_word(
+            argb_word(*pixel),
+            argb_word(source),
+            opa,
+        ));
+    },
+    PsOverlay => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(PhotoshopBlend::OVERLAY.blend_word(
+            argb_word(*pixel),
+            argb_word(source),
+            opa,
+        ));
+    },
+    PsHardLight => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(PhotoshopBlend::HARD_LIGHT.blend_word(
+            argb_word(*pixel),
+            argb_word(source),
+            opa,
+        ));
+    },
+    PsSoftLight => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(PhotoshopBlend::SOFT_LIGHT.blend_word(
+            argb_word(*pixel),
+            argb_word(source),
+            opa,
+        ));
+    },
+    PsColorDodge => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(PhotoshopBlend::COLOR_DODGE.blend_word(
+            argb_word(*pixel),
+            argb_word(source),
+            opa,
+        ));
+    },
+    PsColorDodge5 => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(PhotoshopBlend::COLOR_DODGE5.blend_word(
+            argb_word(*pixel),
+            argb_word(source),
+            opa,
+        ));
+    },
+    PsColorBurn => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(PhotoshopBlend::COLOR_BURN.blend_word(
+            argb_word(*pixel),
+            argb_word(source),
+            opa,
+        ));
+    },
+    PsLighten => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(PhotoshopBlend::LIGHTEN.blend_word(
+            argb_word(*pixel),
+            argb_word(source),
+            opa,
+        ));
+    },
+    PsDarken => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(PhotoshopBlend::DARKEN.blend_word(
+            argb_word(*pixel),
+            argb_word(source),
+            opa,
+        ));
+    },
+    PsDifference => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(PhotoshopBlend::DIFFERENCE.blend_word(
+            argb_word(*pixel),
+            argb_word(source),
+            opa,
+        ));
+    },
+    PsDifference5 => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(PhotoshopBlend::DIFFERENCE5.blend_word(
+            argb_word(*pixel),
+            argb_word(source),
+            opa,
+        ));
+    },
+    PsExclusion => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+        *pixel = word_pixel(PhotoshopBlend::EXCLUSION.blend_word(
+            argb_word(*pixel),
+            argb_word(source),
+            opa,
+        ));
+    },
+}
+
+/// Blends one row of source colours into one row of destination pixels.
+///
+/// The mode's arithmetic is monomorphized, so the row pays no dispatch on
+/// the operation mode. A source colour of `None` leaves the destination
+/// pixel as it is.
+fn blend_row_pixels<K: ModeArithmetic>(
+    opa: u8,
+    source: &mut impl Iterator<Item = Option<[u8; 4]>>,
+    destination: &mut [[u8; 4]],
+) {
+    for (destination, source) in row_pairs(source, destination) {
+        K::blend(destination, source, opa);
+    }
+}
+
+/// Blends one row of source colours into one row of destination pixels,
+/// where every pixel has a colour.
+///
+/// The mode's arithmetic is monomorphized, so the row pays no dispatch on
+/// the operation mode.
+fn blend_row_values_pixels<K: ModeArithmetic>(
+    opa: u8,
+    source: &mut impl Iterator<Item = [u8; 4]>,
+    destination: &mut [[u8; 4]],
+) {
+    for (destination, source) in destination.iter_mut().zip(source) {
+        blend_value::<K>(destination, source, opa);
+    }
+}
+
+/// The mode's arithmetic for one pixel of a resampling row.
+///
+/// A resampling row mixes a float resample with the blend, and inlining the
+/// blend into that loop costs more in spilled registers than the call
+/// does, so the blend stays a call there. A row that only blends keeps the
+/// arithmetic inline.
+#[inline(never)]
+fn blend_value<K: ModeArithmetic>(pixel: &mut [u8; 4], source: [u8; 4], opa: u8) {
+    K::blend(pixel, source, opa);
+}
+
+/// The pairs of a row: each destination pixel and the source colour that
+/// reaches it.
+///
+/// A source colour of `None` leaves the destination pixel as it is.
+fn row_pairs<'a>(
+    source: &'a mut impl Iterator<Item = Option<[u8; 4]>>,
+    destination: &'a mut [[u8; 4]],
+) -> impl Iterator<Item = (&'a mut [u8; 4], [u8; 4])> {
+    destination
+        .iter_mut()
+        .zip(source)
+        .filter_map(|(destination, source)| {
+            let source = source?;
+            Some((destination, source))
+        })
 }
 
 #[cfg(feature = "simd-experiment")]
@@ -3000,12 +3820,18 @@ pub fn operate_rect_on(
     let Some(dc) = intersect(dst, (dx, dy, dx.saturating_add(sw), dy.saturating_add(sh))) else {
         return;
     };
-    for y in dc.1..dc.3 {
-        for x in dc.0..dc.2 {
-            let color = read_pixel(src, src_rect.0 + (x - dx), src_rect.1 + (y - dy));
-            blend_pixel_mode(dst, x, y, color, opa, kernel);
-        }
-    }
+    // A source pixel outside the source bitmap reads as the transparent
+    // miss value, so the pass blends that value where the source does not
+    // reach.
+    blend_pass(
+        dst,
+        dc,
+        RowPixels::new(src, src_rect, (dx, dy)),
+        ModeBlend,
+        kernel,
+        opa,
+        Unreached::Transparent,
+    );
     // The pass wrote inside the clipped destination rectangle only, so the
     // upload needs that rectangle and not the whole bitmap.
     dst.mark_dirty_rect(clipped_region(dc));
@@ -3229,33 +4055,47 @@ fn stretch_blit_mode_band(
         return;
     };
     let (x0, x1) = (area.clip.0, area.clip.2);
+    let (Some(pixel_start), Some(pixel_end)) = (
+        usize::try_from(x0).ok().and_then(|x| x.checked_mul(4)),
+        usize::try_from(x1).ok().and_then(|x| x.checked_mul(4)),
+    ) else {
+        return;
+    };
+    // The source position of a destination column is the same for every
+    // pixel of the band, so the mapping is computed once per column.
+    let columns: Vec<f32> = (x0..x1)
+        .map(|x| stretch_column(src_rect, area.dest, x))
+        .collect();
+    let columns = &columns;
     for (row_index, row) in band.chunks_mut(dst_pitch).enumerate() {
         let Ok(row_index) = i32::try_from(row_index) else {
             break;
         };
         let y = first_row.saturating_add(row_index);
-        for x in x0..x1 {
-            let color = stretch_sample(src, src_rect, area.dest, x, y, stretch_type);
-            let Ok(x) = usize::try_from(x) else {
-                continue;
-            };
-            let Some(dest_start) = x.checked_mul(4) else {
-                continue;
-            };
-            let Some(destination) = row.get(dest_start..dest_start.saturating_add(4)) else {
-                continue;
-            };
-            let mut pixel = [
-                destination[0],
-                destination[1],
-                destination[2],
-                destination[3],
-            ];
-            blend_pixel_mode_at(&mut pixel, color, opa, kernel);
-            if let Some(destination) = row.get_mut(dest_start..dest_start.saturating_add(4)) {
-                destination.copy_from_slice(&pixel);
-            }
-        }
+        let Some(pixels) = row.get_mut(pixel_start..pixel_end) else {
+            continue;
+        };
+        let pixels = pixels.as_chunks_mut::<4>().0;
+        // The source position of a destination row is the same for every
+        // pixel of the row, so the mapping is computed once per row.
+        let fy = stretch_row(src_rect, area.dest, y);
+        // The resampler gives every pixel of the row a colour, so the row
+        // pays no per-pixel test for a missing one.
+        let mut colours = (x0..x1).enumerate().map(move |(index, x)| {
+            stretch_sample_at(
+                src,
+                src_rect,
+                area.dest,
+                StretchPosition {
+                    fx: columns[index],
+                    fy,
+                },
+                x,
+                y,
+                stretch_type,
+            )
+        });
+        blend_row_values_by_mode(kernel, opa, &mut colours, pixels);
     }
 }
 
@@ -3419,11 +4259,15 @@ fn affine_blit_clipped_impl(
         return;
     };
     if clear {
-        for y in dc.1..dc.3 {
-            for x in dc.0..dc.2 {
-                write_pixel(dst, x, y, clear_color);
-            }
-        }
+        blend_pass(
+            dst,
+            dc,
+            Sampled::new(move |_, _| Some(clear_color)),
+            ReplaceBlend,
+            ModeKernel::Copy,
+            255,
+            Unreached::Keep,
+        );
     }
     // A one-to-one integer transfer is a copy, whatever the affine resampler:
     // every supported kernel is exact at an integer source centre. This is
@@ -3534,9 +4378,9 @@ fn affine_dest_bbox(m: [f64; 6]) -> RectI {
 /// the 2x2 matrix and the source is sampled with the requested resampler.
 fn affine_blit_generic(dst: &mut BitmapState, pass: AffinePass<'_>) {
     match affine_blend_of(&pass) {
-        AffineBlend::Replace => affine_blit_generic_with::<ReplaceBlend>(dst, pass),
-        AffineBlend::SourceOver => affine_blit_generic_with::<SourceOverBlend>(dst, pass),
-        AffineBlend::Mode => affine_blit_generic_with::<ModeBlend>(dst, pass),
+        AffineBlend::Replace => affine_blit_generic_with(dst, pass, ReplaceBlend),
+        AffineBlend::SourceOver => affine_blit_generic_with(dst, pass, SourceOverBlend),
+        AffineBlend::Mode => affine_blit_generic_with(dst, pass, ModeBlend),
     }
 }
 
@@ -3550,7 +4394,7 @@ fn affine_blend_of(pass: &AffinePass<'_>) -> AffineBlend {
 }
 
 /// The generic affine pass with its blend resolved.
-fn affine_blit_generic_with<B: BandBlend>(dst: &mut BitmapState, pass: AffinePass<'_>) {
+fn affine_blit_generic_with<B: BandBlend>(dst: &mut BitmapState, pass: AffinePass<'_>, blend: B) {
     let AffinePass {
         map: m,
         inverse: inv,
@@ -3564,38 +4408,31 @@ fn affine_blit_generic_with<B: BandBlend>(dst: &mut BitmapState, pass: AffinePas
     } = pass;
     let sw = (src_rect.2 - src_rect.0) as f64;
     let sh = (src_rect.3 - src_rect.1) as f64;
-    let row_bytes = dst.width as usize * 4;
-    for y in dc.1..dc.3 {
-        let row_start = y as usize * row_bytes;
-        let Some(row) = dst.rgba.get_mut(row_start..row_start + row_bytes) else {
-            continue;
-        };
-        for x in dc.0..dc.2 {
-            let px = x as f64 + 0.5 - m[0];
-            let py = y as f64 + 0.5 - m[3];
-            let u = inv[0] * px + inv[1] * py;
-            let v = inv[2] * px + inv[3] * py;
-            if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
-                continue;
-            }
-            let fx = src_rect.0 as f32 + (u * sw) as f32 - 0.5;
-            let fy = src_rect.1 as f32 + (v * sh) as f32 - 0.5;
-            // Affine sampling clamps to the whole source image (it may
-            // interpolate across the source-rect border), and supports the
-            // same resampler set as `stretch*`.
-            let rect = (0, 0, dim_i32(src.width), dim_i32(src.height));
-            let color = sample_kind(src, rect, fx, fy, stretch_type);
-            let offset = x as usize * 4;
-            let mut destination = [
-                row[offset],
-                row[offset + 1],
-                row[offset + 2],
-                row[offset + 3],
-            ];
-            B::blend(kernel, &mut destination, color, opa);
-            row[offset..offset + 4].copy_from_slice(&destination);
+    // Affine sampling clamps to the whole source image (it may interpolate
+    // across the source-rect border), and supports the same resampler set as
+    // `stretch*`.
+    let rect = (0, 0, dim_i32(src.width), dim_i32(src.height));
+    let sampler = move |x: i32, y: i32| {
+        let px = x as f64 + 0.5 - m[0];
+        let py = y as f64 + 0.5 - m[3];
+        let u = inv[0] * px + inv[1] * py;
+        let v = inv[2] * px + inv[3] * py;
+        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+            return None;
         }
-    }
+        let fx = src_rect.0 as f32 + (u * sw) as f32 - 0.5;
+        let fy = src_rect.1 as f32 + (v * sh) as f32 - 0.5;
+        Some(sample_kind(src, rect, fx, fy, stretch_type))
+    };
+    blend_pass(
+        dst,
+        dc,
+        Sampled::new(sampler),
+        blend,
+        kernel,
+        opa,
+        Unreached::Keep,
+    );
 }
 
 /// Whether the affine map is axis-aligned enough for the nearest pass.
@@ -4081,13 +4918,13 @@ fn axis_tap(
 fn affine_nearest_band(band: &mut [u8], first_row: i32, dst_width: i32, pass: AffinePass<'_>) {
     match affine_blend_of(&pass) {
         AffineBlend::Replace => {
-            affine_nearest_band_with::<ReplaceBlend>(band, first_row, dst_width, pass);
+            affine_nearest_band_with(band, first_row, dst_width, pass, ReplaceBlend);
         }
         AffineBlend::SourceOver => {
-            affine_nearest_band_with::<SourceOverBlend>(band, first_row, dst_width, pass);
+            affine_nearest_band_with(band, first_row, dst_width, pass, SourceOverBlend);
         }
         AffineBlend::Mode => {
-            affine_nearest_band_with::<ModeBlend>(band, first_row, dst_width, pass);
+            affine_nearest_band_with(band, first_row, dst_width, pass, ModeBlend);
         }
     }
 }
@@ -4099,6 +4936,7 @@ fn affine_nearest_band_with<B: BandBlend>(
     first_row: i32,
     dst_width: i32,
     pass: AffinePass<'_>,
+    blend: B,
 ) {
     let AffinePass {
         map: m,
@@ -4116,6 +4954,11 @@ fn affine_nearest_band_with<B: BandBlend>(
     let src_height = src.height as i32;
     let row_bytes = dst_width as usize * 4;
     let src_row_bytes = src_width as usize * 4;
+    let column_start = usize::try_from(dc.0).ok().and_then(|x| x.checked_mul(4));
+    let column_end = usize::try_from(dc.2).ok().and_then(|x| x.checked_mul(4));
+    let (Some(column_start), Some(column_end)) = (column_start, column_end) else {
+        return;
+    };
     for (index, row) in band.chunks_exact_mut(row_bytes).enumerate() {
         let y = first_row + index as i32;
         let py = y as f64 + 0.5 - m[3];
@@ -4137,15 +4980,17 @@ fn affine_nearest_band_with<B: BandBlend>(
         // The `u` term of the inverse map that does not depend on the
         // destination column is the same for the whole row.
         let inv1_py = inv[1] * py;
+        let Some(pixels) = row.get_mut(column_start..column_end) else {
+            continue;
+        };
+        let pixels = pixels.as_chunks_mut::<4>().0;
         // The destination column's half-pixel position grows by exactly one
         // per column, so it is stepped instead of recomputed.
-        let mut x_half = dc.0 as f64 + 0.5;
-        for column in dc.0 as usize..dc.2 as usize {
-            let px = x_half - m[0];
-            x_half += 1.0;
+        let sampler = move |column: i32, _row: i32| -> Option<[u8; 4]> {
+            let px = column as f64 + 0.5 - m[0];
             let u = inv[0] * px + inv1_py;
             if !(0.0..=1.0).contains(&u) {
-                continue;
+                return None;
             }
             let fx = src_rect.0 as f32 + (u * sw) as f32 - 0.5;
             // The source column is the floor of the sample position, clamped
@@ -4153,22 +4998,17 @@ fn affine_nearest_band_with<B: BandBlend>(
             // either way, so the truncation is the floor.
             let sx = ((fx + 0.5) as i32).clamp(0, src_width - 1);
             let source_offset = sx as usize * 4;
-            let color = [
+            Some([
                 source_row[source_offset],
                 source_row[source_offset + 1],
                 source_row[source_offset + 2],
                 source_row[source_offset + 3],
-            ];
-            let offset = column * 4;
-            let mut destination = [
-                row[offset],
-                row[offset + 1],
-                row[offset + 2],
-                row[offset + 3],
-            ];
-            B::blend(kernel, &mut destination, color, opa);
-            row[offset..offset + 4].copy_from_slice(&destination);
-        }
+            ])
+        };
+        let mut source = Sampled::new(sampler);
+        source.begin_row(y, dc.0, dc.2);
+        let mut colours = source.colours();
+        blend.blend_row(kernel, opa, &mut colours, pixels);
     }
 }
 
@@ -4235,7 +5075,7 @@ fn dest_alpha_for_blend(blend: BlendMode) -> DestAlpha {
     }
 }
 
-/// The operation-mode number [`blend_pixel_mode`] uses for the generic
+/// The operation-mode number the blend pass uses for the generic
 /// [`BlendMode`] stored on a layer.
 ///
 /// The operation modes share the native layer-type numbering
@@ -4483,6 +5323,8 @@ fn subtree_content_signature(scene: &Scene, order: &[u32], root: u32, depth: usi
         }
         if let Some(cache) = live_subtree_cache(scene, layer, root, depth, order) {
             covered.insert(id, cache);
+            // The cache stands in for the layer and its descendants, so its
+            // own generation is their contribution.
             if let Some(bitmap) = scene.bitmap(cache) {
                 sum = sum.wrapping_add(bitmap.content_generation);
             }
@@ -5047,13 +5889,19 @@ fn composite_subtree_draw(target: &mut BitmapState, draw: &SubtreeDraw, src: &Bi
 
 /// Render `root`'s own image and the visible layers of its subtree into the
 /// layer's composited content. Returns the bitmap to use as the layer's
-/// rendered content, reusing it while the subtree has no pending recalc:
+/// rendered content, reusing it while the subtree's content signature still
+/// matches the one the content was composited with:
 ///
 /// * the layer's main image when the subtree is trivial: no visible direct
 ///   child, the image at the origin, and the image size equal to the layer
 ///   rect;
 /// * otherwise the composited content bitmap, rebuilt only when the subtree
 ///   changed.
+///
+/// The signature is the subtree's content state in one number — the drawn
+/// sources' own contributions and their images' generations — so a change
+/// behind the layer accessors and a change through them both reach it, and a
+/// transition's tick, which changes no source, reaches it not at all.
 ///
 /// A layer with no main image is not a special case: the fill is transparent
 /// wherever no child drew, which the transparent clear reproduces — unless the
@@ -5602,6 +6450,731 @@ mod tests {
         assert!(
             affine_unit_copy(fractional, (0, 0, 4, 4), &src, 1, true).is_none(),
             "a fractional origin still resamples"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The row-based blend pass against the per-pixel loop it replaced
+    //
+    // The oracles below are the per-pixel loops the pass replaced, kept
+    // verbatim: the pass has to write the very same bytes.
+    // -----------------------------------------------------------------------
+
+    /// The operation modes the engine maps (`blend_operation_mode`).
+    const MODES: &[i64] = &[
+        1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+        27, 28, 29,
+    ];
+
+    /// A bitmap whose pixels carry a pattern of every value, so a blend
+    /// reads a different neighbour at every pixel.
+    fn pattern_bitmap(width: u32, height: u32) -> BitmapState {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                rgba.extend_from_slice(&[
+                    (x * 37 % 251) as u8,
+                    (y * 53 % 241) as u8,
+                    ((x * 7 + y * 11) % 239) as u8,
+                    ((x * 13 + y * 17) % 256) as u8,
+                ]);
+            }
+        }
+        BitmapState::new(width, height, rgba)
+    }
+
+    /// The per-pixel blend the row-based pass replaced: the kernel is
+    /// resolved once, and every pixel is read and written through the
+    /// bitmap's accessors.
+    ///
+    /// The arithmetic is the pre-change implementation, kept here as the
+    /// oracle the row-based pass is proved against: the words, the tables
+    /// and the results are the ones the reference's functors produce.
+    fn apply_mode_kernel(kernel: ModeKernel, pixel: &mut [u8; 4], src: [u8; 4], opa: u8) {
+        let destination = argb_word(*pixel);
+        let source = argb_word(src);
+        let opacity = opa;
+        let opa = u32::from(opa);
+        let result = match kernel {
+            // The plain source-over works on the straight-alpha bytes, not on the
+            // word, so it writes the pixel itself.
+            ModeKernel::SourceOver => {
+                blend_pixel_at(pixel, src, 255, opacity);
+                return;
+            }
+            // The plain source-over with the destination's alpha held.
+            ModeKernel::SourceOverHold => {
+                let alpha = pixel[3];
+                blend_pixel_at(pixel, src, 255, opacity);
+                pixel[3] = alpha;
+                return;
+            }
+            ModeKernel::Copy => source,
+            ModeKernel::CopyColor => (destination & 0xff00_0000).wrapping_add(source & 0x00ff_ffff),
+            ModeKernel::CopyOpaque => 0xff00_0000 | source,
+            ModeKernel::ConstAlpha => const_alpha_blend(destination, source, opa),
+            ModeKernel::ConstAlphaOnAlpha => const_alpha_blend_on_alpha(destination, source, opa),
+            ModeKernel::ConstAlphaOnAddAlpha => {
+                const_alpha_blend_on_add_alpha(destination, source, opa)
+            }
+            ModeKernel::Alpha => alpha_blend_keep_alpha(destination, source, opa),
+            ModeKernel::AlphaOnAlpha => alpha_blend_on_alpha(destination, source, opa),
+            ModeKernel::AlphaOnAddAlpha => alpha_blend_on_add_alpha(destination, source, opa),
+            ModeKernel::AddAlpha => add_alpha(destination, source, opa),
+            ModeKernel::AddAlphaOnAddAlpha => add_alpha_on_add_alpha(destination, source, opa),
+            ModeKernel::Add => add(destination, source, opa),
+            ModeKernel::Sub => sub(destination, source, opa),
+            ModeKernel::Mul => {
+                if opa == 255 {
+                    mul(destination, source)
+                } else {
+                    mul_faded(destination, source, opa)
+                }
+            }
+            ModeKernel::MulHoldAlpha => {
+                let result = if opa == 255 {
+                    mul(destination, source)
+                } else {
+                    mul_faded(destination, source, opa)
+                };
+                hold_alpha(result, destination)
+            }
+            ModeKernel::Dodge => {
+                if opa == 255 {
+                    hold_alpha(dodge(destination, source), destination)
+                } else {
+                    hold_alpha(dodge_faded(destination, source, opa), destination)
+                }
+            }
+            ModeKernel::Darken => {
+                if opa == 255 {
+                    hold_alpha(darken(destination, source), destination)
+                } else {
+                    hold_alpha(darken_faded(destination, source, opa), destination)
+                }
+            }
+            ModeKernel::Lighten => {
+                if opa == 255 {
+                    hold_alpha(lighten(destination, source), destination)
+                } else {
+                    hold_alpha(lighten_faded(destination, source, opa), destination)
+                }
+            }
+            ModeKernel::Screen => {
+                if opa == 255 {
+                    hold_alpha(screen(destination, source), destination)
+                } else {
+                    hold_alpha(screen_faded(destination, source, opa), destination)
+                }
+            }
+            // The Photoshop family keeps the destination's alpha and comes from
+            // the render pipeline's shared table of per-channel functions.
+            ModeKernel::PsNormal => PhotoshopBlend::NORMAL.blend_word(destination, source, opacity),
+            ModeKernel::PsAdditive => {
+                PhotoshopBlend::ADDITIVE.blend_word(destination, source, opacity)
+            }
+            ModeKernel::PsSubtractive => {
+                PhotoshopBlend::SUBTRACTIVE.blend_word(destination, source, opacity)
+            }
+            ModeKernel::PsMultiplicative => {
+                PhotoshopBlend::MULTIPLICATIVE.blend_word(destination, source, opacity)
+            }
+            ModeKernel::PsScreen => PhotoshopBlend::SCREEN.blend_word(destination, source, opacity),
+            ModeKernel::PsOverlay => {
+                PhotoshopBlend::OVERLAY.blend_word(destination, source, opacity)
+            }
+            ModeKernel::PsHardLight => {
+                PhotoshopBlend::HARD_LIGHT.blend_word(destination, source, opacity)
+            }
+            ModeKernel::PsSoftLight => {
+                PhotoshopBlend::SOFT_LIGHT.blend_word(destination, source, opacity)
+            }
+            ModeKernel::PsColorDodge => {
+                PhotoshopBlend::COLOR_DODGE.blend_word(destination, source, opacity)
+            }
+            ModeKernel::PsColorDodge5 => {
+                PhotoshopBlend::COLOR_DODGE5.blend_word(destination, source, opacity)
+            }
+            ModeKernel::PsColorBurn => {
+                PhotoshopBlend::COLOR_BURN.blend_word(destination, source, opacity)
+            }
+            ModeKernel::PsLighten => {
+                PhotoshopBlend::LIGHTEN.blend_word(destination, source, opacity)
+            }
+            ModeKernel::PsDarken => PhotoshopBlend::DARKEN.blend_word(destination, source, opacity),
+            ModeKernel::PsDifference => {
+                PhotoshopBlend::DIFFERENCE.blend_word(destination, source, opacity)
+            }
+            ModeKernel::PsDifference5 => {
+                PhotoshopBlend::DIFFERENCE5.blend_word(destination, source, opacity)
+            }
+            ModeKernel::PsExclusion => {
+                PhotoshopBlend::EXCLUSION.blend_word(destination, source, opacity)
+            }
+        };
+        *pixel = word_pixel(result);
+    }
+
+    /// The per-pixel blend the row-based pass replaced: every pixel is read
+    /// and written through the bitmap's accessors.
+    fn blend_pixel_loop(
+        dst: &mut BitmapState,
+        x: i32,
+        y: i32,
+        src: [u8; 4],
+        opa: u8,
+        kernel: ModeKernel,
+    ) {
+        if x < 0 || y < 0 || x as u32 >= dst.width || y as u32 >= dst.height {
+            return;
+        }
+        let mut pixel = read_pixel(dst, x, y);
+        apply_mode_kernel(kernel, &mut pixel, src, opa);
+        write_pixel(dst, x, y, pixel);
+    }
+
+    /// The per-pixel `operateRect` the row-based pass replaced.
+    fn operate_rect_pixel_loop(
+        dst_alpha: DestAlpha,
+        dst: &mut BitmapState,
+        dx: i32,
+        dy: i32,
+        source: BlitSource<'_>,
+        options: BlitOptions,
+    ) {
+        let BlitSource {
+            bitmap: src,
+            rect: src_rect,
+        } = source;
+        let BlitOptions {
+            mode,
+            opa,
+            hold_alpha,
+            treat_as_opaque,
+            source_over,
+            ..
+        } = options;
+        let sw = src_rect.2.saturating_sub(src_rect.0);
+        let sh = src_rect.3.saturating_sub(src_rect.1);
+        if sw <= 0 || sh <= 0 {
+            return;
+        }
+        if !pixels_usable(dst, "operateRect") || !pixels_usable(src, "operateRect") {
+            return;
+        }
+        let kernel = if source_over {
+            if hold_alpha {
+                ModeKernel::SourceOverHold
+            } else {
+                ModeKernel::SourceOver
+            }
+        } else {
+            match resolve_kernel_on(mode, opa, treat_as_opaque, hold_alpha, dst_alpha) {
+                Blend::Kernel(kernel) => kernel,
+                Blend::NoMethod => return,
+                Blend::UnknownMode => return,
+            }
+        };
+        let Some(dc) = intersect(dst, (dx, dy, dx.saturating_add(sw), dy.saturating_add(sh)))
+        else {
+            return;
+        };
+        for y in dc.1..dc.3 {
+            for x in dc.0..dc.2 {
+                let color = read_pixel(src, src_rect.0 + (x - dx), src_rect.1 + (y - dy));
+                blend_pixel_loop(dst, x, y, color, opa, kernel);
+            }
+        }
+    }
+
+    /// The per-pixel `copyRect` the row-based pass replaced.
+    fn blit_plane_pixel_loop(
+        dst: &mut BitmapState,
+        dx: i32,
+        dy: i32,
+        src: &BitmapState,
+        src_rect: RectI,
+        clip: RectI,
+        plane: u8,
+    ) {
+        let sw = src_rect.2.saturating_sub(src_rect.0);
+        let sh = src_rect.3.saturating_sub(src_rect.1);
+        if sw <= 0 || sh <= 0 || src.width == 0 || src.height == 0 {
+            return;
+        }
+        let Some(in_bounds) =
+            intersect(dst, (dx, dy, dx.saturating_add(sw), dy.saturating_add(sh)))
+        else {
+            return;
+        };
+        let Some(dc) = intersect_rect(in_bounds, clip) else {
+            return;
+        };
+        for y in dc.1..dc.3 {
+            for x in dc.0..dc.2 {
+                let sx = src_rect.0 + (x - dx);
+                let sy = src_rect.1 + (y - dy);
+                if sx < 0 || sy < 0 || sx as u32 >= src.width || sy as u32 >= src.height {
+                    continue;
+                }
+                let s = read_pixel(src, sx, sy);
+                if plane & (COPY_MAIN | COPY_MASK) == (COPY_MAIN | COPY_MASK) {
+                    write_pixel(dst, x, y, s);
+                    continue;
+                }
+                let mut d = read_pixel(dst, x, y);
+                if plane & COPY_MAIN != 0 {
+                    d[0..3].copy_from_slice(&s[0..3]);
+                }
+                if plane & COPY_MASK != 0 {
+                    d[3] = s[3];
+                }
+                write_pixel(dst, x, y, d);
+            }
+        }
+    }
+
+    /// The per-pixel `stretchBlt` the row-based pass replaced.
+    fn stretch_blit_plane_pixel_loop(
+        dst: &mut BitmapState,
+        dest: RectI,
+        src: &BitmapState,
+        src_rect: RectI,
+        stretch_type: i64,
+        plane: u8,
+    ) {
+        let Some(dc) = intersect(dst, dest) else {
+            return;
+        };
+        for y in dc.1..dc.3 {
+            for x in dc.0..dc.2 {
+                let color = stretch_sample(src, src_rect, dest, x, y, stretch_type);
+                if plane == (COPY_MAIN | COPY_MASK) {
+                    write_pixel(dst, x, y, color);
+                    continue;
+                }
+                let mut d = read_pixel(dst, x, y);
+                if plane & COPY_MAIN != 0 {
+                    d[0..3].copy_from_slice(&color[0..3]);
+                }
+                if plane & COPY_MASK != 0 {
+                    d[3] = color[3];
+                }
+                write_pixel(dst, x, y, d);
+            }
+        }
+    }
+
+    /// The affine pass the row-based pass replaced: the clear and the
+    /// per-pixel inverse map.
+    ///
+    /// The corners the test uses keep the pass on the generic path, so the
+    /// oracle and the pass under test walk the same pixels.
+    fn affine_blit_pixel_loop(
+        dst_alpha: DestAlpha,
+        dst: &mut BitmapState,
+        affine: AffineBlit,
+        source: BlitSource<'_>,
+        options: BlitOptions,
+        clip: RectI,
+    ) {
+        let AffineBlit {
+            corners,
+            stretch_type,
+            clear,
+            clear_color,
+        } = affine;
+        let [p0, p1, p2] = corners;
+        let BlitSource {
+            bitmap: src,
+            rect: src_rect,
+        } = source;
+        let BlitOptions {
+            mode,
+            opa,
+            treat_as_opaque,
+            hold_alpha,
+            source_over,
+            ..
+        } = options;
+        let kernel = if source_over {
+            ModeKernel::SourceOver
+        } else {
+            match resolve_kernel_on(mode, opa, treat_as_opaque, hold_alpha, dst_alpha) {
+                Blend::Kernel(kernel) => kernel,
+                _ => return,
+            }
+        };
+        let m = affine_forward(p0, p1, p2);
+        let det = m[1] * m[5] - m[2] * m[4];
+        if det.abs() < 1e-12 {
+            return;
+        }
+        let inv = [m[5] / det, -m[2] / det, -m[4] / det, m[1] / det];
+        let Some(dc) = intersect(dst, affine_dest_bbox(m)) else {
+            return;
+        };
+        let Some(dc) = intersect_rect(dc, clip) else {
+            return;
+        };
+        if clear {
+            for y in dc.1..dc.3 {
+                for x in dc.0..dc.2 {
+                    write_pixel(dst, x, y, clear_color);
+                }
+            }
+        }
+        let sw = (src_rect.2 - src_rect.0) as f64;
+        let sh = (src_rect.3 - src_rect.1) as f64;
+        let rect = (0, 0, dim_i32(src.width), dim_i32(src.height));
+        let row_bytes = dst.width as usize * 4;
+        for y in dc.1..dc.3 {
+            let row_start = y as usize * row_bytes;
+            let Some(row) = dst.rgba.get_mut(row_start..row_start + row_bytes) else {
+                continue;
+            };
+            for x in dc.0..dc.2 {
+                let px = x as f64 + 0.5 - m[0];
+                let py = y as f64 + 0.5 - m[3];
+                let u = inv[0] * px + inv[1] * py;
+                let v = inv[2] * px + inv[3] * py;
+                if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                    continue;
+                }
+                let fx = src_rect.0 as f32 + (u * sw) as f32 - 0.5;
+                let fy = src_rect.1 as f32 + (v * sh) as f32 - 0.5;
+                let color = sample_kind(src, rect, fx, fy, stretch_type);
+                let offset = x as usize * 4;
+                let mut destination = [
+                    row[offset],
+                    row[offset + 1],
+                    row[offset + 2],
+                    row[offset + 3],
+                ];
+                if source_over {
+                    blend_pixel_at(&mut destination, color, 255, opa);
+                } else {
+                    match affine_blend(kernel) {
+                        AffineBlend::Replace => {
+                            destination = color;
+                        }
+                        AffineBlend::SourceOver => {
+                            blend_pixel_at(&mut destination, color, 255, opa);
+                        }
+                        AffineBlend::Mode => {
+                            apply_mode_kernel(kernel, &mut destination, color, opa);
+                        }
+                    }
+                }
+                row[offset..offset + 4].copy_from_slice(&destination);
+            }
+        }
+    }
+
+    /// The placements a pass is proved at: the source inside the
+    /// destination, and the source hanging over each of its edges, so the
+    /// pixels the source does not reach are exercised too.
+    const PLACEMENTS: &[(i32, i32)] = &[(0, 0), (-1, -1), (4, 3), (-2, 1), (3, -1)];
+
+    /// A bitmap whose pixels are all opaque.
+    fn opaque_bitmap(width: u32, height: u32) -> BitmapState {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..width * height {
+            rgba.extend_from_slice(&[17, 34, 51, 255]);
+        }
+        BitmapState::new(width, height, rgba)
+    }
+
+    /// A bitmap whose pixels are all transparent.
+    fn transparent_bitmap(width: u32, height: u32) -> BitmapState {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..width * height {
+            rgba.extend_from_slice(&[17, 34, 51, 0]);
+        }
+        BitmapState::new(width, height, rgba)
+    }
+
+    /// The block-wise form of the alpha blend writes the same bytes as the
+    /// per-pixel loop.
+    ///
+    /// The block pass serves an opaque source (the weight table holds 255 for
+    /// it at every destination alpha) and a transparent one (the blend leaves
+    /// the destination alone where the destination's alpha is not zero), so
+    /// the proof covers both, and a source that is neither, which the block
+    /// pass leaves to the row loop.
+    #[test]
+    fn the_block_wise_alpha_blend_writes_the_same_pixels_as_the_per_pixel_loop() {
+        let sources = [
+            opaque_bitmap(8, 4),
+            transparent_bitmap(8, 4),
+            pattern_bitmap(8, 4),
+        ];
+        for dst_alpha in [DestAlpha::Straight, DestAlpha::Opaque] {
+            for destination in [pattern_bitmap(8, 4), opaque_bitmap(8, 4)] {
+                for source in &sources {
+                    let options = BlitOptions {
+                        mode: 2,
+                        opa: 255,
+                        treat_as_opaque: false,
+                        hold_alpha: false,
+                        source_over: false,
+                    };
+                    let source_rect = BlitSource {
+                        bitmap: source,
+                        rect: (0, 0, 8, 4),
+                    };
+                    let mut expected = destination.clone();
+                    operate_rect_pixel_loop(dst_alpha, &mut expected, 0, 0, source_rect, options);
+                    let mut actual = destination.clone();
+                    operate_rect_on(dst_alpha, &mut actual, 0, 0, source_rect, options);
+                    assert_eq!(
+                        actual.rgba, expected.rgba,
+                        "the block-wise alpha blend must write the same pixels"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The row-based blend pass writes the very bytes the per-pixel loop
+    /// wrote, for every operation mode, every destination face and every
+    /// opacity.
+    #[test]
+    fn the_row_based_blend_pass_writes_the_same_pixels_as_the_per_pixel_loop() {
+        let src = pattern_bitmap(4, 3);
+        for mode in MODES {
+            for dst_alpha in [DestAlpha::Straight, DestAlpha::Additive, DestAlpha::Opaque] {
+                for opa in [0u8, 1, 128, 254, 255] {
+                    for hold_alpha in [false, true] {
+                        for treat_as_opaque in [false, true] {
+                            for (dx, dy) in PLACEMENTS {
+                                let options = BlitOptions {
+                                    mode: *mode,
+                                    opa,
+                                    treat_as_opaque,
+                                    hold_alpha,
+                                    source_over: false,
+                                };
+                                let source = BlitSource {
+                                    bitmap: &src,
+                                    rect: (0, 0, 4, 3),
+                                };
+                                let mut expected = pattern_bitmap(6, 4);
+                                operate_rect_pixel_loop(
+                                    dst_alpha,
+                                    &mut expected,
+                                    *dx,
+                                    *dy,
+                                    source,
+                                    options,
+                                );
+                                let mut actual = pattern_bitmap(6, 4);
+                                operate_rect_on(dst_alpha, &mut actual, *dx, *dy, source, options);
+                                assert_eq!(
+                                    actual.rgba, expected.rgba,
+                                    "mode {mode} on a {dst_alpha:?} destination at {opa} must write the same pixels"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The row-based blend pass writes the very bytes the per-pixel loop
+    /// wrote for the plain source-over the plugins ask for.
+    #[test]
+    fn the_row_based_source_over_writes_the_same_pixels_as_the_per_pixel_loop() {
+        let src = pattern_bitmap(4, 3);
+        for hold_alpha in [false, true] {
+            for opa in [1u8, 128, 255] {
+                for (dx, dy) in PLACEMENTS {
+                    let options = BlitOptions {
+                        mode: 0,
+                        opa,
+                        treat_as_opaque: false,
+                        hold_alpha,
+                        source_over: true,
+                    };
+                    let source = BlitSource {
+                        bitmap: &src,
+                        rect: (0, 0, 4, 3),
+                    };
+                    let mut expected = pattern_bitmap(6, 4);
+                    operate_rect_pixel_loop(
+                        DestAlpha::Straight,
+                        &mut expected,
+                        *dx,
+                        *dy,
+                        source,
+                        options,
+                    );
+                    let mut actual = pattern_bitmap(6, 4);
+                    operate_rect_on(DestAlpha::Straight, &mut actual, *dx, *dy, source, options);
+                    assert_eq!(
+                        actual.rgba, expected.rgba,
+                        "the plain source-over at {opa} must write the same pixels"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The row-based plane copy writes the very bytes the per-pixel loop
+    /// wrote, for every plane selection.
+    #[test]
+    fn the_row_based_plane_copy_writes_the_same_pixels_as_the_per_pixel_loop() {
+        let src = pattern_bitmap(4, 3);
+        let clip = (i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+        for plane in [COPY_MAIN, COPY_MASK, COPY_MAIN | COPY_MASK, 0] {
+            for (dx, dy) in PLACEMENTS {
+                let mut expected = pattern_bitmap(6, 4);
+                blit_plane_pixel_loop(&mut expected, *dx, *dy, &src, (0, 0, 4, 3), clip, plane);
+                let mut actual = pattern_bitmap(6, 4);
+                blit_plane(&mut actual, *dx, *dy, &src, (0, 0, 4, 3), clip, plane);
+                assert_eq!(
+                    actual.rgba, expected.rgba,
+                    "the plane {plane} copy must write the same pixels"
+                );
+            }
+        }
+    }
+
+    /// The row-based stretch copy writes the very bytes the per-pixel loop
+    /// wrote, for every plane selection and every resampler.
+    #[test]
+    fn the_row_based_stretch_copy_writes_the_same_pixels_as_the_per_pixel_loop() {
+        let src = pattern_bitmap(4, 3);
+        for plane in [COPY_MAIN, COPY_MASK, COPY_MAIN | COPY_MASK, 0] {
+            for stretch_type in [0i64, 1, 2, 3, 6, 8, 13] {
+                for dest in [(0, 0, 6, 4), (-1, -1, 5, 3), (2, 1, 8, 5)] {
+                    let mut expected = pattern_bitmap(6, 4);
+                    stretch_blit_plane_pixel_loop(
+                        &mut expected,
+                        dest,
+                        &src,
+                        (0, 0, 4, 3),
+                        stretch_type,
+                        plane,
+                    );
+                    let mut actual = pattern_bitmap(6, 4);
+                    stretch_blit_plane(&mut actual, dest, &src, (0, 0, 4, 3), stretch_type, plane);
+                    assert_eq!(
+                        actual.rgba, expected.rgba,
+                        "the plane {plane} stretch at {stretch_type} must write the same pixels"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The row-based affine pass writes the very bytes the per-pixel loop
+    /// wrote, for every blend the affine pass runs.
+    ///
+    /// The corners keep the pass on its generic path: a copy of a whole
+    /// unit quad takes the row shortcut instead, and the row shortcut is
+    /// unchanged by this change.
+    #[test]
+    fn the_row_based_affine_pass_writes_the_same_pixels_as_the_per_pixel_loop() {
+        let src = pattern_bitmap(4, 3);
+        let cases: [(i64, [(f64, f64); 3]); 4] = [
+            (2, [(0.0, 0.0), (4.0, 0.0), (0.0, 3.0)]),
+            (2, [(0.25, 0.5), (5.5, 1.25), (1.75, 3.5)]),
+            (2, [(-0.5, -0.5), (3.5, -0.5), (-0.5, 2.5)]),
+            (1, [(0.25, 0.5), (5.5, 1.25), (1.75, 3.5)]),
+        ];
+        for (mode, corners) in cases {
+            let affine = AffineBlit {
+                corners,
+                stretch_type: 1,
+                clear: false,
+                clear_color: [0, 0, 0, 0],
+            };
+            let options = BlitOptions {
+                mode,
+                opa: 255,
+                treat_as_opaque: false,
+                hold_alpha: false,
+                source_over: false,
+            };
+            // The pass under test.
+            let mut actual = pattern_bitmap(6, 4);
+            affine_blit_clipped(
+                &mut actual,
+                affine,
+                BlitSource {
+                    bitmap: &src,
+                    rect: (0, 0, 4, 3),
+                },
+                options,
+                (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+            );
+            // The oracle: the same pass with the per-pixel loop.
+            let mut expected = pattern_bitmap(6, 4);
+            affine_blit_pixel_loop(
+                DestAlpha::Straight,
+                &mut expected,
+                affine,
+                BlitSource {
+                    bitmap: &src,
+                    rect: (0, 0, 4, 3),
+                },
+                options,
+                (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+            );
+            assert_eq!(
+                actual.rgba, expected.rgba,
+                "the affine pass at mode {mode} must write the same pixels"
+            );
+        }
+    }
+
+    /// The row-based affine clear writes the very bytes the per-pixel loop
+    /// wrote.
+    #[test]
+    fn the_row_based_affine_clear_writes_the_same_pixels_as_the_per_pixel_loop() {
+        let src = pattern_bitmap(4, 3);
+        let affine = AffineBlit {
+            corners: [(0.25, 0.5), (5.5, 1.25), (1.75, 3.5)],
+            stretch_type: 1,
+            clear: true,
+            clear_color: [9, 8, 7, 6],
+        };
+        let options = BlitOptions {
+            mode: 2,
+            opa: 255,
+            treat_as_opaque: false,
+            hold_alpha: false,
+            source_over: false,
+        };
+        let mut actual = pattern_bitmap(6, 4);
+        affine_blit_clipped(
+            &mut actual,
+            affine,
+            BlitSource {
+                bitmap: &src,
+                rect: (0, 0, 4, 3),
+            },
+            options,
+            (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+        );
+        // The oracle: the same pass with the per-pixel loop.
+        let mut expected = pattern_bitmap(6, 4);
+        affine_blit_pixel_loop(
+            DestAlpha::Straight,
+            &mut expected,
+            affine,
+            BlitSource {
+                bitmap: &src,
+                rect: (0, 0, 4, 3),
+            },
+            options,
+            (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+        );
+        assert_eq!(
+            actual.rgba, expected.rgba,
+            "the affine clear must write the same pixels"
         );
     }
 }

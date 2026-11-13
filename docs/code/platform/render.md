@@ -434,10 +434,36 @@ one.
 
 The functions are whole-byte arithmetic, not floating-point math: the mix's
 difference is signed and its shift rounds towards negative infinity, so a
-channel below the destination's darkens it. The soft light is the one mode
-whose entries cannot be computed in a shader — they are the truncated values
-of a double-precision power — so the program reads them from the table the
-pipeline uploads as a storage buffer.
+channel below the destination's darkens it.
+
+Three of the family's functions are tables of 256 by 256 entries rather than
+arithmetic: the soft light, the colour dodge and the colour burn. The soft
+light's entry is the truncated value of `255 · (d/255)^p`, with the exponent
+the source's channel selects (`reference/krkr2/cpp/core/visual/gl/blend_function.cpp:530-533`);
+the colour dodge's entry is `255` when the source's complement is below the
+destination's and the destination scaled by `255 / (255 - s)` otherwise
+(`reference/krkr2/cpp/core/visual/gl/blend_function.cpp:534-535`); the colour
+burn's entry is zero when the source is below the destination's complement and
+`255 - (255 - d) · 255 / s` otherwise
+(`reference/krkr2/cpp/core/visual/gl/blend_function.cpp:536-537`). The
+overlay's entry is the source's and the destination's product below the
+destination's half and `2 · (s + d) - 2 · s · d / 255 - 255` above it
+(`reference/krkr2/cpp/core/visual/gl/blend_function.cpp:539-541`).
+
+The tables live in `render::blend::tables` and are the crate's constants: they
+are written once by `cargo run -p render --bin write_blend_tables`, committed,
+and read by every path that blends — the engine's bitmap path, the software
+rasterizer and the graphics program — so a blend means the same thing on the
+CPU and on the GPU. A test compares every entry of every table with the
+formula it stands for.
+
+The soft light is the one mode whose entries cannot be computed in a shader —
+they are the truncated values of a double-precision power — so the program
+reads them from the table the pipeline uploads as a storage buffer. The
+program's declaration and its reader ask for whole numbers
+(`uint soft_light[65536]`), so the pipeline writes the entries as whole
+numbers. The colour dodge and the colour burn are whole-byte arithmetic that
+a shader can do, so the program still computes them.
 
 The copy is the offscreen-compositing route — render to a target, copy the
 target content for the quad's `dst` region into a sampled image, and draw with

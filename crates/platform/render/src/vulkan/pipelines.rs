@@ -820,13 +820,18 @@ fn create_tables_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout,
 ///
 /// The buffer holds the soft-light table, which the shared table of
 /// per-channel functions owns: the shader reads the entries the CPU path
-/// blends with.
+/// blends with. The program reads the table as a buffer of whole numbers,
+/// so every entry is written as one number.
 fn create_tables_buffer(
     device: &ash::Device,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
 ) -> Result<(vk::Buffer, vk::DeviceMemory), RenderError> {
-    let table = crate::blend::soft_light_table();
-    let size = vk::DeviceSize::try_from(table.len()).map_err(|_| RenderError::OutOfMemory {
+    let table: Vec<u32> = crate::blend::soft_light_table()
+        .iter()
+        .map(|entry| u32::from(*entry))
+        .collect();
+    let bytes = table.len() * size_of::<u32>();
+    let size = vk::DeviceSize::try_from(bytes).map_err(|_| RenderError::OutOfMemory {
         message: "the blend tables do not fit in a device buffer".to_owned(),
     })?;
 
@@ -896,7 +901,7 @@ fn create_tables_buffer(
     };
     // SAFETY: `mapped` points at `size` writable bytes owned by `memory`.
     unsafe {
-        std::ptr::copy_nonoverlapping(table.as_ptr(), mapped.cast::<u8>(), table.len());
+        std::ptr::copy_nonoverlapping(table.as_ptr().cast::<u8>(), mapped.cast::<u8>(), bytes);
         device.unmap_memory(memory);
     }
 
