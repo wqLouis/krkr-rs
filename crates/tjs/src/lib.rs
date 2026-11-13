@@ -793,9 +793,10 @@ pub struct CompileOptions<'a> {
 /// Thread-safety: the tjs2 VM keeps process-global state (script cache,
 /// string interning, ...), so engines are NOT safe to use from multiple
 /// threads concurrently. The `Send`/`Sync` impls below are sound only
-/// because krkr-rs confines all VM use to a single thread (see AGENT.md
-/// "The TJS2 VM is not thread-safe"). Do not create engines on multiple
-/// threads at the same time.
+/// because krkr-rs confines all VM use to a single thread - the engine owns
+/// the VM's global state, so there is one VM per process
+/// (`docs/arch/l4.md` §5). Do not create engines on multiple threads at the
+/// same time.
 pub struct Tjs2Engine {
     inner: *mut Engine,
     /// Raw ids of all values retained on this engine (see

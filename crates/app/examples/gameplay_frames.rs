@@ -61,10 +61,16 @@ fn main() {
     let mut game = GameHost::open(host, archives, dir.to_path_buf()).expect("the game");
     game = game.with_slow_report_budget(None);
 
-    let frames: usize = std::env::args()
-        .nth(2)
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(6000);
+    let frames: usize = match std::env::args().nth(2) {
+        Some(value) => match value.parse() {
+            Ok(frames) => frames,
+            Err(error) => {
+                eprintln!("the frame count is not a number: {error}");
+                std::process::exit(2);
+            }
+        },
+        None => 6000,
+    };
 
     // The frames are driven as fast as the host runs them, so the gap is the
     // engine's cost and not the presentation cadence.
@@ -135,6 +141,12 @@ fn main() {
     println!("the p99: {p99:.2} ms ({:.1} fps)", 1000.0 / p99);
     println!("the 1% low: {one_low:.2} ms ({:.1} fps)", 1000.0 / one_low);
     println!("the worst: {worst:.2} ms ({:.1} fps)", 1000.0 / worst);
-    println!("the frames over 33 ms: {}", rest.iter().filter(|g| **g > 33.3).count());
-    println!("the frames over 100 ms: {}", rest.iter().filter(|g| **g > 100.0).count());
+    println!(
+        "the frames over 33 ms: {}",
+        rest.iter().filter(|g| **g > 33.3).count()
+    );
+    println!(
+        "the frames over 100 ms: {}",
+        rest.iter().filter(|g| **g > 100.0).count()
+    );
 }
