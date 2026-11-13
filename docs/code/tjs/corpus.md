@@ -110,13 +110,21 @@ loses a difference:
 
 `crates/tjs/tests/fixtures/corpus_digest.txt` holds one line per script of
 the corpus: the digest, and the script's path under the corpus root. A
-script the C++ front end cannot compile is listed as `skip` — three of the
-175 are, because the tree's analyser stops the process on them.
+script the vendored path cannot compile is listed as `skip` — three of the
+279 are: the vendored path raises on them where the Rust front end recovers
+and counts the failure, so the two blocks differ.
 
-The digests were recorded **from the C++ front end**, with the tree's own
-analyser, grammar and generator, before they were removed. A digest
-recorded from the Rust front end would prove nothing: it would only say
-that the front end still does what it did when the fixture was written.
+The digests were recorded **from the tree's own analyser, grammar and
+generator**, never from the Rust front end. A digest recorded from the front
+end under test would prove nothing: it would only say that the front end
+still does what it did when the fixture was written.
+
+The shipped scripts' digests were recorded through the compile step while the
+tree's own analyser, grammar and generator took it. The generated scripts'
+digests were recorded through `tTJSScriptBlock::ParseReference` — the same
+analyser, grammar and generator, which the tree still carries and which the
+VM's compile step does not take. The recorder writes the canonical form of
+the block that path compiles, and the digest is the hash of that text.
 
 ## 4. The check
 
@@ -137,7 +145,7 @@ It **does not report success when the corpus is missing**: it says that the
 corpus is missing, says how to get it, and exits with a failure.
 
 A **generated** script (§1.1) that the fixture holds no digest for is not a
-failure: the digests are recorded from the C++ front end, and that recording
+failure: the digests are recorded from the vendored path, and that recording
 is a step of its own. The check names those scripts, counts them apart from
 the compared ones, and compares them as soon as the fixture holds their
 digests.
@@ -152,20 +160,19 @@ The other options:
 
 ## 5. The state of the corpus
 
-The fixture and the Rust front end agree on **every field of all the 172
+The fixture and the Rust front end agree on **every field of all the 276
 comparable scripts**: the code, the constant area, the counts, the relations,
-the member registrations and the source positions. The three the C++ front end
+the member registrations and the source positions. The three the vendored path
 cannot compile are listed as skipped, and the check skips them too.
 
 ### 5.1 The generated scripts
 
-The 104 generated scripts (§1.1) are not in the fixture yet. Their digests
-have to be recorded from the C++ front end, and that recording is a step of
-its own; until it happens, the check names them and compares nothing of them.
+The 104 generated scripts (§1.1) are in the fixture, and the check compares
+them like the shipped ones.
 
-Their blocks were measured against the C++ path's blocks in the meantime —
-the same comparison, field by field, over the three fields the C++ driver
-dumps (the code stream, the constant area and the source positions):
+Their blocks were measured against the C++ path's blocks — the same
+comparison, field by field, over the three fields the C++ driver dumps (the
+code stream, the constant area and the source positions):
 
 | | |
 |---|---|

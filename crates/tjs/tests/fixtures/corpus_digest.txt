@@ -12,8 +12,9 @@
 # constant area, counts, source positions, relations and member
 # registrations, and the block's own shape.
 #
-# The digests were recorded from the tree's own front end, before it was
-# removed. A script that front end cannot compile is listed as skipped.
+# The digests were recorded from the tree's own front end: the vendored
+# analyser, grammar and generator. A script that front end cannot compile
+# is listed as skipped.
 
 36e68b9a96424743a5a2ec3143efc0f0086cc0b5e5a41c30ca2a5687dc42e995  appconfig.tjs
 0cd8e364e97a240f0aaea5e05284de735d5dc3c6a372a72a84468e462aaf2552  k2compat/k2compat.tjs
@@ -39,6 +40,110 @@ abf7ed1307fd1fdb7f0cee346f4d3c67ebe47f08f69aab418058dad8f9680864  main/scrolluti
 0e1f2dead86617e465b79e2e8322b954263101ce49cb5362ea67829851065e63  main/yuzu_option.tjs
 954f4f47267a077deb068fb56d6e0a0562953bb1c7cd8ff9c88dad9fea569b3c  main/yuzu_system.tjs
 7402b1534403e3dc40c74926505ae15db37da2d0612e56814e9e931c9648c3e4  main/yuzu_touchui.tjs
+e4220e24d39c206b3b8a83ff97221253d997fced3233d627ce406252ac529815  psb/001.共通－オナニーマスター.ks.scn.tjs
+6cf080136355bee8bab3c62bfe2d4fe5d4440de29bf62228f1c23410ae4257e3  psb/002.共通－欠片吸収.ks.scn.tjs
+e6929444e697f9e17db8c4f7e481729caeb71de0e2fea27fd4f186a2ef3a71b1  psb/003.共通－心の穴.ks.scn.tjs
+5ee3fcf4af7b82936d67b037a40eee49d1a566b0b4bc389e7c3348f5b3667dc3  psb/004.共通－今後もよろしく.ks.scn.tjs
+b4aa7b430af80995a873e2f636b77c792db25cf08c2680cef00caf70f565f690  psb/005.共通－因幡めぐる.ks.scn.tjs
+3bb4770bacc61a361338653567d99aee369164792250214a746b0b4295a6a536  psb/006.共通－合コンテク.ks.scn.tjs
+b0b704d59d48c3abcf3a329657840ae30f5c3b8453ba0f05777e160b79333cd8  psb/007.共通－めぐるのその後.ks.scn.tjs
+0dae82fbaef395419ea607e1619552ca5995e740fa456f49f7faedd77db4a2ab  psb/008.共通－デート依頼.ks.scn.tjs
+5442a122c0f46e5cac63a11a2710bb275dfb5576cd6cc6fff1b2eaad2b597a5f  psb/009.共通－休日デート.ks.scn.tjs
+b24a991c71c2622faf41a8722816f2672ea47069e0bca9ddf810267629a27b52  psb/010.共通－転入生.ks.scn.tjs
+eab1ae642b981113640b5d373c4d7e25daaeae87103d1a1007b8d63b5d7318dd  psb/011.共通－先輩の悩み.ks.scn.tjs
+8c10159d686e76bc4397c3d1a2e56238a86a74e4b2c8366e5d2b81d76fb165ed  psb/012.共通－魔女.ks.scn.tjs
+72f885c93b0a4611edb4639ecbf19f0c18212ad496a91adf08f4d087988a97eb  psb/013.共通－キマシタワ.ks.scn.tjs
+ed41dfbf3d0177038bb25066974dee6e59bb8566168db43bbfe17e248b1c1a3a  psb/014.共通－失恋.ks.scn.tjs
+97ff1c8d35221bed60295a8f7c6b1257adc6ca88e7bdca1c8de32d3b58ee98b9  psb/015.共通－釣り.ks.scn.tjs
+844dacbe6c4a9c207e387164aec4e4adb4aa1813ae8946efa3f83951ee2c7596  psb/016.共通－廃部.ks.scn.tjs
+8820b384bfe1b9392f187bb861a7524915d7cf29c69cbbbd1564e258b085b448  psb/017.共通－勉強会.ks.scn.tjs
+f02655b65a8f178d37bb226674a5cd5b947ae2ec6f7782f0f0a3d45d868301f8  psb/018.共通－パーティー準備.ks.scn.tjs
+d4e2fe6d20661ebe2bd60bdcc7c1568e12610d8404697235325dae32e890be22  psb/019.共通－パーティ.ks.scn.tjs
+4ccf1afbfc5721e789e28c5c2b9042689f77da34bd5c0125d9fd08e8b4fe771a  psb/020.共通－パーティーめぐる.ks.scn.tjs
+dc5b81e9e6bd1a929f8a3765d21ba13474cd927a9074fab97145cdff8b304aba  psb/020.共通－パーティー紬.ks.scn.tjs
+38ac9cd2ee265bf63a33b527731a96d1fe8c67c6b4c872da296cd8aea4a93785  psb/020.共通－パーティ寧々.ks.scn.tjs
+11cafea535ea9b640c836ef75fcf80fc3561d31833c3796c622409d068284dea  psb/020.共通－パーティ憧子.ks.scn.tjs
+beb06121ebb3e455baece2561f4c0eca9bf9f4943b4c8f585d8ddc133740d31e  psb/101.寧々－ラーメン.ks.scn.tjs
+9d25f68a9ec5dfef4c6d4c99d1b7c0e5149ef1923500f241b84dc54d681afefb  psb/102.寧々－お見舞い.ks.scn.tjs
+0e045557f4188874e302495076104fd1bfaedfd25b77e9e477135092b517e92b  psb/103.寧々－告白.ks.scn.tjs
+b94f6140c2f20ff3a5251c339c989e8f853bf2bacd2a6128554e1034bf3fa57f  psb/104.寧々－初体験.ks.scn.tjs
+4222e6016e835d11a54bfea341930abc1aca7db3012e45977abea3818600f5e5  psb/105.寧々－報告会.ks.scn.tjs
+a9a8ffe4b2ab74d16722d7cffe9ce3657ef49311915c1c2987d869d2fe120b1e  psb/106.寧々－急転.ks.scn.tjs
+0f8afd65d8a3e8297a5859e3e317454994ff2998eb03720c9045bf260221b9eb  psb/107.寧々－元鞘.ks.scn.tjs
+ab1cd18edba2faa75b8691c2aec9e6f34e24841d6c46f3df7a933ff9ceeca380  psb/108.寧々－決断.ks.scn.tjs
+dee0c95646a7095095f9871e913e0c97d0d2bbce73d8f2bb50e4765cc5083b9f  psb/109_β.寧々－お別れデート.ks.scn.tjs
+6bd1d9a1da451d25ad4c00b28f8bbdf995722cc9baa47e20503373c92cec81ed  psb/110.寧々－restart（寧々編）.ks.scn.tjs
+7aa8fc12c32eec6bc6189c1842c3bcd2e9cb9b1617f430fd25492b045984cace  psb/111.寧々－restart（本編）.ks.scn.tjs
+69b1118ebe4e6f1c0ebdf181e69c1ae3c90bd847d0ab66a61047f91f58df6ae7  psb/112.寧々－restart（２週目Ｈ）.ks.scn.tjs
+34a3f4ff57d287d3b810c62fb60d45dcf9954e44046bfb89d6bdbc0a290b1050  psb/113.寧々－restart（再び部活）.ks.scn.tjs
+daa73a7759916153d9f7766ae0a49193a813d40755605a43a7eb50e2784bcf21  psb/114.寧々－restart（変わりゆく日々）.ks.scn.tjs
+f59349e7c483c96e6b848a6c10831a13115777cf8e5a72e0b4827e5e5e32d4e1  psb/115.寧々－restart（二度目の本番）.ks.scn.tjs
+f404a87ce1d2ed1981aeccc5e914cdfc8735ba408f478f7b86a37236bb2ddd8d  psb/116.寧々－エピローグ.ks.scn.tjs
+7669ea69c83e89f44efdf3ee0c25a9f1df8aaf73b4ee4f3982511c3fc6609fa8  psb/117.寧々－アフター.ks.scn.tjs
+3b31ba29332413c09afdd4ee49410c5adbddf5edbc3f798f3b64b1c715af1bf7  psb/201.めぐる－記念撮影.ks.scn.tjs
+42282867f0b7e1db743298354056aa77f14725a052801250cf2eeb650c59663a  psb/202.めぐる－同士.ks.scn.tjs
+3af951d488d75c17d0a0937e9b1e59052c53385c0ba44a01237310d5aa9554f3  psb/203.めぐる－仲良し.ks.scn.tjs
+b953af26dabb72690b385ea10ea9740197735ef44304f9241cc2560e68ba7adc  psb/204.めぐる－親友.ks.scn.tjs
+93e9ba8b7a3fad04a5e1bdd9b7b9a4a6c125689ff42d58be6e0ccdeaabc2f23f  psb/205.めぐる－距離感.ks.scn.tjs
+7da88ca998dfa42f3e20559742d8b04252482a6aebf93a1825c2b48d59c37b7e  psb/206.めぐる－解放.ks.scn.tjs
+fec72d1d2ea55372c6719285f36e360aadcbf6b6cfced5946ccb587cb3a1eda2  psb/207.めぐる－嫉妬.ks.scn.tjs
+2c87c17c56a80dae3f0489ea3f7d62cf1fb229bb4b5870e64de6dbd6cbb543b6  psb/208.めぐる－抱擁.ks.scn.tjs
+42022fd29cc077056114a4f20e783effb14926e61f3f94ea06987869bd2da2a4  psb/209.めぐる－不器用な二人.ks.scn.tjs
+97d8b3217e68221cd19d1a23821a76eaa35bcd9c45edf2fc8a36189673489856  psb/210.めぐる－甘酸っぱさ.ks.scn.tjs
+dac94b5f0baf86a9055d4ea3a697d0e79041f9247760f77859b76a307b01a221  psb/211.めぐる－ラブラブ.ks.scn.tjs
+d10bc3c7a439a93d77a1fe22531adddffe77f2efb4f43057fca7d19651f70a41  psb/212.めぐる－恋のサイクル.ks.scn.tjs
+8ae22799939576e7cf99aa4394ec85c2ed283f1681ef010507d3e5f49d9f9a18  psb/213.めぐる－罪悪感.ks.scn.tjs
+0577b918011275bb1b5c1ec24edbc7caec8669a65ff5b31661bd9d8767763afb  psb/214.めぐる－埋め合う二人.ks.scn.tjs
+43b9f618cdae5f3bdc1ed29945a25c990ef83fad70c7dcd3a25c60c5c760c802  psb/215.めぐる－互いの弱点.ks.scn.tjs
+1933a4950c20c72f06c22657b77308257272590c1fed233caa2b4bcc38af4bf9  psb/216.めぐる－伝えきれない想い.ks.scn.tjs
+429fb0b95da8805d79f64dc5cfbb3b8b6ce5deb55af5a3bea49350a4f30c47ea  psb/217.めぐる－自分自身の魔法.ks.scn.tjs
+12d6c375ba6bb9028e5fa88a9a15cf1c40b940fb4364c63eb6c8a55f94c9d620  psb/218.めぐる－エピローグ.ks.scn.tjs
+91c25b87af6a8c80de56fb6cd3a5b0b77ca7d2502c494196b06073c215ee7dea  psb/219.めぐる－アフター.ks.scn.tjs
+95760554f5180f3f277d16a238f8c5419b3b630447188ca82765eff547a8b007  psb/301.紬－もう１人のアルプ.ks.scn.tjs
+5535434857090829a1fdfeea64bb9feaae9c8f729d3721eb30c25ebc2adaf2ef  psb/302.紬－代償の理由.ks.scn.tjs
+77f2fd850412ba9c1ff3517ab6a29e97e629114a27dbc4d6b469d2c79cc20901  psb/303.紬－心の穴、再び.ks.scn.tjs
+d5527ee704992f725da92c2f207bc580569fe735afb13282d025aea10c59afc4  psb/304.紬－スイート間接キス.ks.scn.tjs
+b26d0e3e3ae39f7e6d92db62f5c9ceca7ae7d51467f205e85ec44e2aea06a176  psb/305.紬－手を繋いで歩こう.ks.scn.tjs
+f39163909a522dabe78abefed721292b50afef70d036fc2c3e41bae2b1d66a51  psb/306.紬－caught a cold.ks.scn.tjs
+940a73653991ad440c202a00752b781b722be37209f0f3adea78d6dc725645fa  psb/307.紬－ご褒美の期限.ks.scn.tjs
+2c05ce57e9908e8b6fc7f3cfa3047d3a260db4bd45cce658caf44061bee666e3  psb/308.紬－空回り.ks.scn.tjs
+052c8c6863ad1c73c7971f02be27e8dc31fdd3edb22be28d254f515ad34333da  psb/309.紬－告白の決意.ks.scn.tjs
+8eabfae35b71590357bd5cecab62698422c61c0a764b2377a6b0165a728c20e3  psb/310.紬－契約代行.ks.scn.tjs
+aa3f77e1cbe9efd5f8a3d84d00c4c3df4477edc4a0bb47ae35d5f331fa2c6e50  psb/311.紬－紬と初デート.ks.scn.tjs
+6ebbc627769728d4c562b847f7ce351e698b745377bfba63de4ceb91a448b567  psb/312.紬－シュウジくん.ks.scn.tjs
+74cdfc92bd135e38be979fde4b27941baab1edbdd958db0c4782f3ab5463a406  psb/313.紬－いつでも一緒.ks.scn.tjs
+dcae90e757f005a281fa83e2d8ff27d552631d8669323ac86aaccd434ee5c9c2  psb/314.紬－疑惑.ks.scn.tjs
+4b3d5fc1d302ab1fa452f3f241e6dfbefbda342310d0344a14aa0ea69ba97f59  psb/315.紬－父の様子.ks.scn.tjs
+a549eab5d871827b258385ff08bdc81c5093da2f79b6313f6cb4cecc5483ba52  psb/316.紬－その子犬は？.ks.scn.tjs
+8250a4f5e79b9e557c8aafc315e8963fd27561fdce0f8f8a7f1450ea46330fd3  psb/317.紬－新たな被害者.ks.scn.tjs
+77db6bb1144f2f77f8b0c1176964ded113d20a5d4616f919b141ba773ba1997c  psb/318.紬－出来損ないのアルプ.ks.scn.tjs
+c09778137f9c2fdcd954a69be70f43c2121cf256b29b778986dc49923f26241c  psb/319.紬－君は大切な友達.ks.scn.tjs
+f0b7cd5a85caad3f837106685afcda3e31937dfb7b5b203ab679b172d846c1f5  psb/320.紬－紬エピローグ.ks.scn.tjs
+8a6737451b0bc8fe78a1ffa0581f08082ba0c1d1b858adf57324920f230f855b  psb/321.紬－紬アフター.ks.scn.tjs
+9b5a6e41f4c9d9afae9ec18162295504a560765a095eddc6bde62c67c433dae8  psb/401.憧子－初デート.ks.scn.tjs
+b6d6bf9d508b90f76472754ccaa595dd4cc3cfc7d5ab34647165a4f3203ae436  psb/402.憧子－バスケ部.ks.scn.tjs
+9aabd992ce071b2db5076aa678ecb7c9b714b88a88bcaab775ea8c37c28fb32a  psb/403.憧子－恋の勉強.ks.scn.tjs
+3407356b6f88cde8343ce1fb668838c3a18f97b4b0e4a3f8c02bfad78c4ebdce  psb/404.憧子－告白.ks.scn.tjs
+4a3bae3e1ee40ddb94098e389867d60bc0e4e850c3d848468ffeba289478c62b  psb/405.憧子－初体験.ks.scn.tjs
+604139f380d1cb0581b51903df1c9acb48f0feb9c670d366d6dc10e30048f1e9  psb/406.憧子－謎.ks.scn.tjs
+992db8cb7447d0ed1410e8a5bd81807a3ba977ce79745e7c2fc1755d8487b52a  psb/407.憧子－記憶.ks.scn.tjs
+f25b69a770d43652c461ff8371b3d74bc2acd4af9079cb677f11eb4d5d19a66c  psb/408.憧子－突然の死.ks.scn.tjs
+2612e475dd4f8e4e9baddc170f2f63ca2492594ccb0b61c2eb291dfc0946d3ff  psb/409.憧子－復活.ks.scn.tjs
+aeb85306945ba1aa4519382586eb7209f3c5e6e86d2d777923b9559961cfa1d0  psb/410.憧子－その後.ks.scn.tjs
+8d95fd5d71fa32c2ddd51c5cf12d9015ab900e7cca2aa155ceb0befbd6d105a7  psb/411.憧子－エピローグ.ks.scn.tjs
+e69096a04d9e5a39a889e2ea590d6f844e8d48850586734850c0e6894e6b7859  psb/412.憧子－アフター.ks.scn.tjs
+d49da527ceba388869b9d9dc5012395cca290c9e5534feefdeb82ff78c7c39ea  psb/500.和奏－分岐.ks.scn.tjs
+625af719a38b7773cce1b7fb12c2e03357aa140f62534f91dc2a0b63ae4436e9  psb/501.和奏－ハプニング.ks.scn.tjs
+546b86382ec8b7748137b18618423691bd666a321cdec871f99fb44cd2890ac4  psb/502.和奏－意識する日々.ks.scn.tjs
+de439d0118b371b63a70c037db8fdc2113848e24a8381caea4a9f73e84bc6e58  psb/503.和奏－セカンドキス.ks.scn.tjs
+002260eef532e7389f61b10db543fe3e91e558576a83bc6063e196f4b8f92f00  psb/504.和奏－ドギマギな日々.ks.scn.tjs
+c41a3680f2f9026c24fee0bdf1dcec04c79bd0460fd3881439ce490747e4b2e0  psb/505.和奏－ライブ本番.ks.scn.tjs
+8ae9b08df09b24805d4a76d7090475439f3cb73109d2f1a297ea1428e089a6a3  psb/506.和奏－レロレロ.ks.scn.tjs
+73d3bff125e2cffa1a04e07732b1a9d6a664c10c1acb8d158d9b41e0892a18e0  psb/507.和奏－エピローグ的な.ks.scn.tjs
+f366bd523d7096a4d18c86f2c8c7796ef786dbfbf5e5b60d41cf82ddcce45ce8  psb/508.和奏－アフター.ks.scn.tjs
+345c35155fd12ff8788ded3a65ca1a7dfda64927a37a32687394f94af2ced5fa  psb/charvoice.scn.tjs
+69d402765a9fbba7eca72ab5043dfa3a076572cdbd55ae2a2b5ef30f1559d5e7  psb/classlist.scn.tjs
+5d9d0a1a81f57176e3e583e4e1a56d62a69cebfe9992ee545c1d2fc17f4c3b5f  psb/scenelist.scn.tjs
 3497437270cc5e5a973d07124d34566b914d66937e6642d11b9ef74bcb7c267d  startup.tjs
 7198eefa8373856ef1fe70c05e1140ab7dc19ec3274d3100aa576be082592b12  sysscn/afterinit.tjs
 89fc7e306d30243d4b9c724adf6e0610f110a1c837212c9b7a6df082d2344c8f  sysscn/autoface.tjs
