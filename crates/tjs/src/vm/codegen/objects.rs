@@ -261,6 +261,13 @@ impl crate::vm::codegen::emit::Emitter<'_> {
                 }
                 Ok(0)
             }
+            token::T_IN => {
+                // the `in` operator has no case of its own: the grammar
+                // makes the node and the generator's switch falls out of
+                // it, so the expression makes no code at all and its
+                // operands are not even evaluated
+                Ok(0)
+            }
             _ => Err(EmitError::Shape(format!(
                 "the operation {} has no code",
                 node.opcode

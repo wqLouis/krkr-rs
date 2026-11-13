@@ -105,9 +105,10 @@ fn cannot_modify() -> EmitError {
     EmitError::Shape("the left hand side of the operation cannot be modified".to_string())
 }
 
-/// The error the generator raises when the operation has no result.
-fn cannot_get_result() -> EmitError {
-    EmitError::Shape("the operation has no result".to_string())
+/// The error the generator raises when the operation has no result and
+/// its result is required. The message is the engine's own.
+pub(crate) fn cannot_get_result() -> EmitError {
+    EmitError::Shape("Cannot get the value of this expression".to_string())
 }
 
 impl crate::vm::codegen::emit::Emitter<'_> {

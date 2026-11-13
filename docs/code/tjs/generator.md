@@ -220,6 +220,8 @@ that prove them cite the same lines.
 | a member registered again under the same name replaces the earlier one, and the earlier context leaves the block | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:943` (the replacement), `:394` (the release) |
 | the object whose context is changed keeps its sub-type, so the `&` reaches the member access | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:1189-1190` |
 | the ternary's frame is the greater of the two branches' frames, and the then branch's register is returned | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3225-3227` |
+| the result of a resultless operation cannot be had, and the message is the engine's own | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:1153-1154` (the `if` operator), `:1214-1215` (the swap), `reference/krkr2/cpp/core/tjs2/tjsError.h:261-262` (the message) |
+| the `in` operator has no case of its own: the grammar makes the node and the generator's switch falls out of it, so the expression makes no code and its operands are not even evaluated | `reference/krkr2/cpp/core/tjs2/bison/tjs.y:661` (the node), `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:2717-2719` (the fall-out) |
 
 ## 3. The proofs the column still owes
 

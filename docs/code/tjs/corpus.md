@@ -76,6 +76,12 @@ loses a difference:
   registered twice at different places.
 * the **members of a constant inline dictionary are sorted by their name**.
   The dictionary holds them in the order of its own hash.
+* the **addresses are taken out of the text of an object**. An object turned
+  into a string carries the object's addresses
+  (`reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:206`), and the address is
+  where the heap happened to be — the engine differs from itself the same
+  way. Without this the digest would be a property of the heap's layout
+  rather than of the compiled script.
 
 ## 3. The fixture
 

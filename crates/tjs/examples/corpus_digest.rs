@@ -499,6 +499,32 @@ fn canonical_form(units: &[u16]) -> String {
     form
 }
 
+/// The text of an object with the addresses taken out.
+///
+/// An object turned into a string carries the object's addresses, and the
+/// address is where the heap happened to be: the engine differs from itself
+/// the same way. The canonical form therefore carries the text of an object
+/// without its addresses, and the digest is a property of the compiled
+/// script and not of where the heap happened to be.
+fn object_text_without_addresses(text: &str) -> Option<String> {
+    let rest = text.strip_prefix("(object ")?;
+    let (first, rest) = rest.split_once(':')?;
+    let second = rest.strip_suffix(')')?;
+    if !is_address(first) || !is_address(second) {
+        return None;
+    }
+    Some("(object 0x0:0x0)".to_string())
+}
+
+/// Whether the text is an address: they are printed in the hexadecimal
+/// form with the `0x` in front.
+fn is_address(text: &str) -> bool {
+    let Some(digits) = text.strip_prefix("0x") else {
+        return false;
+    };
+    !digits.is_empty() && digits.chars().all(|digit| digit.is_ascii_hexdigit())
+}
+
 /// The number of a context's kind.
 fn context_kind(kind: ContextType) -> i32 {
     match kind {
@@ -528,6 +554,14 @@ fn value_text(value: &Value) -> String {
         Value::Integer(number) => format!("int:{number}"),
         Value::Real(number) => format!("real:{:016x}", number.to_bits()),
         Value::String(text) => {
+            // the text of an object carries the object's addresses, and
+            // the address is where the heap happened to be, so the text is
+            // taken out of it: the text of an object is the same for
+            // every object
+            let text = match object_text_without_addresses(text) {
+                Some(text) => text,
+                None => text.clone(),
+            };
             let units: Vec<u16> = text.encode_utf16().collect();
             format!("string:{}", hex_units(&units))
         }

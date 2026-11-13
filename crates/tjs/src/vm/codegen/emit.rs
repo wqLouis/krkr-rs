@@ -359,9 +359,8 @@ impl<'a> Emitter<'a> {
             }
             token::T_IF => {
                 if restype & RT_NEEDED != 0 {
-                    return Err(EmitError::Shape(
-                        "the 'if' operator has no result".to_string(),
-                    ));
+                    // the result of a resultless operation cannot be had
+                    return Err(crate::vm::codegen::operations::cannot_get_result());
                 }
                 let condition = self.gen_node_code(
                     frame,
