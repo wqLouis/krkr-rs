@@ -44,9 +44,9 @@ fn the_dump_holds_the_presented_frame() {
     assert!(!bytes.is_empty(), "the dump file is empty");
 
     let image = media::decode_image(&Media::new(), &bytes, Some("png")).expect("a PNG");
-    // The host's surface is 1280×720, and the frame is the size of the
+    // The host's surface is 1920×1080, and the frame is the size of the
     // surface.
-    assert_eq!((image.width, image.height), (1280, 720));
+    assert_eq!((image.width, image.height), (1920, 1080));
     // The empty scene is the cleared background: opaque black.
     assert_eq!(&image.rgba[0..4], &[0u8, 0, 0, 255]);
 }

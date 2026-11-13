@@ -212,7 +212,7 @@ fn a_script_window_resize_is_surfaced_once() {
     assert_eq!(host.vm_size(), (320, 240));
     let translation = host.translation().expect("fittable sizes");
     assert_eq!(translation.vm_size, (320, 240));
-    assert_eq!(translation.device_size, (1280, 720));
+    assert_eq!(translation.device_size, (1920, 1080));
 }
 
 /// Boots the production composition root and confirms it installs the
@@ -231,8 +231,8 @@ fn game_host_open_installs_the_desktop_rectangle() {
 
     assert_eq!(eval_int(vm, "System.desktopLeft"), 0);
     assert_eq!(eval_int(vm, "System.desktopTop"), 0);
-    assert_eq!(eval_int(vm, "System.desktopWidth"), 1280);
-    assert_eq!(eval_int(vm, "System.desktopHeight"), 720);
+    assert_eq!(eval_int(vm, "System.desktopWidth"), 1920);
+    assert_eq!(eval_int(vm, "System.desktopHeight"), 1080);
 
     drop(game);
     let _ = std::fs::remove_dir_all(&base);

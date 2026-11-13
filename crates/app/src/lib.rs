@@ -204,7 +204,7 @@ impl Default for HostConfig {
     fn default() -> Self {
         Self {
             backend: BackendKind::Null,
-            surface_size: (1280, 720),
+            surface_size: (1920, 1080),
             application_name: "krkr-rs".to_owned(),
             validation: false,
             headless: false,
