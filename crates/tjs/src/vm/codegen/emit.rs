@@ -11,7 +11,7 @@ use super::context::{Context, ContextType, FuncArgKind};
 use super::node::Node;
 use super::opcode::{self, vm};
 use super::token;
-use super::value::Value;
+use super::value::{self, Value};
 
 /// The result a piece of code is needed for.
 pub const RT_NEEDED: u32 = 0x0001;
@@ -116,6 +116,8 @@ pub fn is_modify_sub_type(sub_type: i32) -> bool {
 pub enum EmitError {
     /// The tree has a shape the generator does not support.
     Shape(String),
+    /// The engine refuses the expression: the constant folding raises.
+    Refused(value::Raise),
 }
 
 /// The result of a piece of emission.
@@ -335,6 +337,11 @@ impl<'a> Emitter<'a> {
         let Some(node) = node else {
             return Ok(0);
         };
+        // the engine refuses the expression: the constant folding raises,
+        // and the script is refused while it is compiled
+        if let Some(raise) = crate::vm::codegen::folding::refusal_of(node) {
+            return Err(EmitError::Refused(raise));
+        }
         let node_pos = node.position;
         match node.opcode {
             token::T_CONSTVAL => {

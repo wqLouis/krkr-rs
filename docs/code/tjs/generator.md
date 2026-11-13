@@ -92,7 +92,9 @@ that prove them cite the same lines.
 |---|---|
 | the constant folding | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3812-3990` |
 | the folding follows the variant's own semantics: the operations are the variant's operators | `reference/krkr2/cpp/core/tjs2/tjsVariant.h:475` (the variant and its operators) |
-| a conversion that has no result simply does not fold | `reference/krkr2/cpp/core/tjs2/tjsVariant.h:475` (the variant's conversion operators) |
+| a conversion the engine refuses makes the fold refuse as well, and the script is refused while it is compiled, with the engine's own message | `reference/krkr2/cpp/core/tjs2/tjsVariant.h:862` (`AsInteger`), `:937` (`AsReal`), `:881` (`AsNumber`), `:1096` (`operator%`), `:1105` (`operator/`), `:1113` (`idiv`), `:1148` (`operator~`) |
+| the message of a refused conversion: the value in the readable form and the type in the engine's own words | `reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:146` (`TJSThrowVariantConvertError`), `reference/krkr2/cpp/core/tjs2/tjsUtils.cpp:111` (`TJSVariantToReadableString`), `:92` (`TJSVariantTypeToTypeString`), `reference/krkr2/cpp/core/tjs2/tjsError.h:250` (`TJSVariantConvertError`) |
+| the message of a division by zero | `reference/krkr2/cpp/core/tjs2/tjsError.h:308` (`TJSDivideByZero`) |
 | the ordered comparison is numeric | `reference/krkr2/cpp/core/tjs2/tjsVariant.h:1058` (`operator<`) |
 | a node with one child folds when the operand folds | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3812-3886` (`MakeNP1`) |
 | a node with two children folds when the operands fold | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3888-3980` (`MakeNP2`) |
@@ -134,7 +136,7 @@ that prove them cite the same lines.
 | the values carry the variant's distinctions | `reference/krkr2/cpp/core/tjs2/tjsVariant.h:475` (`tTJSVariant`) |
 | the identity of an object is the address of its dispatch: what is printed and what is compared | `reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:187` (the object text) and `:665` (`NormalCompare`) |
 | an object converts to `(object <address>:<address>)`; the null prints as `(object 0x0:0x0)` | `reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:187` (`TJSObjectToString`) |
-| the conversion fails when the value has no numeric conversion; an object has none | `reference/krkr2/cpp/core/tjs2/tjsVariant.h:475` (the variant's conversion operators) |
+| the conversion fails when the value has no numeric conversion; an object has none, and the failure is the engine's own message | `reference/krkr2/cpp/core/tjs2/tjsVariant.h:862` (`AsInteger`), `:937` (`AsReal`), `:881` (`AsNumber`) |
 | the comparison converts a value to a string when the two values are of different kinds and one of them is a string | `reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:665` (`NormalCompare`) |
 | an object is true when it has a dispatch; the null has none | `reference/krkr2/cpp/core/tjs2/tjsVariant.h:911` (`operator bool`) |
 | the comparison of two values | `reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:665` |
@@ -143,6 +145,8 @@ that prove them cite the same lines.
 | both values are converted to a string when one of the two is a string | `reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:665` |
 | the object text holds the address of the dispatch and the address of the `objthis` | `reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:187` |
 | the real is printed with the shortest form that reads back as the same number | `reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:241` (`TJSRealToString`) |
+| a real is read out of a text with the engine's own conversion, and the conversion is not the correctly rounded one: the fraction is a double before it is scaled | `reference/krkr2/cpp/core/tjs2/tjsConfig.cpp:672` (`TJS_strtod`), `reference/krkr2/cpp/core/tjs2/tjsLex.cpp:593` (`TJSParseDecimalReal`) |
+| a number is read out of a text without cutting the text at a byte that is not the end of a character, and a text that holds no number is the integer zero | `reference/krkr2/cpp/core/tjs2/tjsLex.cpp:700` (`TJSParseNumber`), `:611` (`TJSParseNumber2`) |
 | a constant array: the `(const)[...]` form's array, and the elements it puts in it | `reference/krkr2/cpp/core/tjs2/bison/tjs.y:796-806` |
 | a constant dictionary: the `(const)%[...]` form's dictionary, and the entries it puts in it | `reference/krkr2/cpp/core/tjs2/bison/tjs.y:831-841` |
 | a dictionary entry's name is a value and not a text: the side that builds the object converts it | `reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:132-139` (the element is added with a text for the name) |

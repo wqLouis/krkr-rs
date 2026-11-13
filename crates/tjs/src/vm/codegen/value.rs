@@ -8,9 +8,17 @@
 //! one. The identity is the address of the object's dispatch, which is
 //! what the generator prints and what the generator compares. An object
 //! with no dispatch — the null — has the identity zero.
+//!
+//! A conversion the engine refuses is a **refusal**: the engine folds the
+//! constant expressions with the variant's own operators, and the
+//! operators raise when the operation cannot be done. The refusal carries
+//! the engine's own message, and the generator refuses the expression when
+//! it meets one.
 
 use std::fmt;
 use std::num::IntErrorKind;
+
+use crate::vm::lexer::engine_real;
 
 /// The identity of an object.
 ///
@@ -77,8 +85,8 @@ pub enum Value {
     /// The dictionary is built at compile time and the entries are set
     /// with PropSet.
     ConstDictionary {
-        /// The identity of the dictionary: two constant dictionaries are
-        /// two objects, and the generator never merges them.
+        /// The identity of the dictionary: two constant dictionaries are two
+        /// objects, and the generator never merges them.
         identity: ObjectId,
         /// The entries, in the order the grammar set them: the value the
         /// name of the member is made of, and the value it holds.
@@ -89,22 +97,72 @@ pub enum Value {
     },
 }
 
-/// The reason a value cannot be converted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ValueError {
-    /// The value has no conversion to the wanted type.
-    Convert,
+/// The reason the engine refuses a constant expression.
+///
+/// The engine folds a constant expression with the variant's own
+/// operators, and the operators raise when the operation cannot be done.
+/// The message is the engine's own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Raise {
+    /// The divisor of a division is zero.
+    DivideByZero,
+    /// The value cannot be converted to the wanted type.
+    Convert {
+        /// The value that cannot be converted, in the engine's readable
+        /// form.
+        value: String,
+        /// The type the value cannot be converted to.
+        target: Target,
+    },
 }
 
-impl fmt::Display for ValueError {
+impl fmt::Display for Raise {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ValueError::Convert => write!(formatter, "the value cannot be converted"),
+            Raise::DivideByZero => formatter.write_str("Division by zero"),
+            Raise::Convert { value, target } => {
+                write!(
+                    formatter,
+                    "Cannot convert the variable type ({value} to {})",
+                    target.name()
+                )
+            }
         }
     }
 }
 
-impl std::error::Error for ValueError {}
+impl std::error::Error for Raise {}
+
+/// The type a value is converted to.
+///
+/// The names are the engine's own: the message of a refused conversion
+/// says the type the way the engine says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// An integer.
+    Integer,
+    /// A real number.
+    Real,
+    /// A string.
+    Text,
+    /// A byte string.
+    Octet,
+    /// A number: an integer or a real.
+    Number,
+}
+
+impl Target {
+    /// The name the engine gives the type.
+    fn name(self) -> &'static str {
+        match self {
+            Target::Integer => "int",
+            Target::Real => "real",
+            Target::Text => "string",
+            Target::Octet => "octet",
+            Target::Number => "int/real",
+        }
+    }
+}
 
 /// The value as a string.
 ///
@@ -133,31 +191,32 @@ impl fmt::Display for Value {
 impl Value {
     /// The value as its text.
     ///
-    /// `ToString` raises on a byte string, so the conversion of one fails
-    /// here too.
-    pub fn to_text(&self) -> Option<String> {
+    /// The engine's `ToString`: a byte string has no text, so the
+    /// conversion of one is refused.
+    pub fn to_text(&self) -> Result<String, Raise> {
         match self {
-            Value::Octet(_) => None,
-            other => Some(other.to_string()),
+            Value::Octet(_) => Err(self.refuse(Target::Text)),
+            other => Ok(other.to_string()),
         }
     }
 
     /// The conversion fails when the value has no numeric conversion;
     /// the object has none, so it fails too.
-    pub fn to_real(&self) -> Option<f64> {
+    pub fn to_real(&self) -> Result<f64, Raise> {
         match self {
-            Value::Void => Some(0.0),
-            Value::Integer(value) => Some(*value as f64),
-            Value::Real(value) => Some(*value),
-            Value::String(value) => Some(match parse_number(value) {
-                Some(parsed) => parsed.to_real().unwrap_or(0.0),
+            Value::Void => Ok(0.0),
+            Value::Integer(value) => Ok(*value as f64),
+            Value::Real(value) => Ok(*value),
+            Value::String(value) => Ok(match parse_number(value) {
+                Some(Number::Integer(number)) => number as f64,
+                Some(Number::Real(number)) => number,
                 None => 0.0,
             }),
             Value::Octet(_)
             | Value::Object(_)
             | Value::Context(_)
             | Value::ConstArray { .. }
-            | Value::ConstDictionary { .. } => None,
+            | Value::ConstDictionary { .. } => Err(self.refuse(Target::Real)),
         }
     }
 
@@ -166,20 +225,21 @@ impl Value {
     /// The conversion fails when the value has no integer conversion: an
     /// object and a byte string have none. A string that is not a number
     /// is zero, and a value of no value is zero.
-    pub fn to_integer(&self) -> Option<i64> {
+    pub fn to_integer(&self) -> Result<i64, Raise> {
         match self {
-            Value::Void => Some(0),
-            Value::Integer(value) => Some(*value),
-            Value::Real(value) => Some(*value as i64),
-            Value::String(value) => Some(match parse_number(value) {
-                Some(parsed) => parsed.to_integer().unwrap_or(0),
+            Value::Void => Ok(0),
+            Value::Integer(value) => Ok(*value),
+            Value::Real(value) => Ok(*value as i64),
+            Value::String(value) => Ok(match parse_number(value) {
+                Some(Number::Integer(number)) => number,
+                Some(Number::Real(number)) => number as i64,
                 None => 0,
             }),
             Value::Octet(_)
             | Value::Object(_)
             | Value::Context(_)
             | Value::ConstArray { .. }
-            | Value::ConstDictionary { .. } => None,
+            | Value::ConstDictionary { .. } => Err(self.refuse(Target::Integer)),
         }
     }
 
@@ -188,22 +248,21 @@ impl Value {
     /// A string that reads as a number becomes that number — an integer
     /// when it reads as one, a real when it reads as one — and a string
     /// that reads as nothing becomes the integer zero.
-    pub fn to_number(&self) -> Option<Value> {
+    pub fn to_number(&self) -> Result<Value, Raise> {
         match self {
-            Value::Void => Some(Value::Integer(0)),
-            Value::Integer(_) | Value::Real(_) => Some(self.clone()),
-            Value::String(value) => Some(parse_number(value).unwrap_or(Value::Integer(0))),
+            Value::Void => Ok(Value::Integer(0)),
+            Value::Integer(_) | Value::Real(_) => Ok(self.clone()),
+            Value::String(value) => Ok(match parse_number(value) {
+                Some(Number::Integer(number)) => Value::Integer(number),
+                Some(Number::Real(number)) => Value::Real(number),
+                None => Value::Integer(0),
+            }),
             Value::Octet(_)
             | Value::Object(_)
             | Value::Context(_)
             | Value::ConstArray { .. }
-            | Value::ConstDictionary { .. } => None,
+            | Value::ConstDictionary { .. } => Err(self.refuse(Target::Number)),
         }
-    }
-
-    /// The value as a real number, for the arithmetic that needs one.
-    pub fn as_real(&self) -> Result<f64, ValueError> {
-        self.to_real().ok_or(ValueError::Convert)
     }
 
     /// The value as a string, for the comparison that needs one.
@@ -211,10 +270,10 @@ impl Value {
     /// The comparison converts a value to a string when the two values
     /// are of different kinds and one of them is a string. An object
     /// converts to its text, so it takes this path too.
-    pub fn as_string_for_compare(&self) -> Result<String, ValueError> {
+    pub fn as_string_for_compare(&self) -> Result<String, Raise> {
         match self {
             Value::Object(id) => Ok(object_text(*id)),
-            _ => Ok(self.to_string()),
+            _ => self.to_text(),
         }
     }
 
@@ -228,7 +287,7 @@ impl Value {
             Value::Void => false,
             Value::Integer(value) => *value != 0,
             Value::Real(value) => *value != 0.0,
-            Value::String(_) => self.to_integer().unwrap_or(0) != 0,
+            Value::String(_) => self.to_integer().is_ok_and(|number| number != 0),
             Value::Octet(bytes) => !bytes.is_empty(),
             Value::Object(id) => !id.is_null(),
             Value::Context(_) => true,
@@ -283,7 +342,7 @@ impl Value {
     }
 
     /// The comparison of two values, with the conversion error.
-    fn compare_normal(left: &Value, right: &Value) -> Result<bool, ValueError> {
+    fn compare_normal(left: &Value, right: &Value) -> Result<bool, Raise> {
         use Value::*;
         match (left, right) {
             (Integer(a), Integer(b)) => Ok(a == b),
@@ -310,10 +369,19 @@ impl Value {
                 Ok(a == b)
             }
             _ => {
-                let a = left.as_real()?;
-                let b = right.as_real()?;
+                let a = left.to_real()?;
+                let b = right.to_real()?;
                 Ok(a == b)
             }
+        }
+    }
+
+    /// The refusal the engine raises when the value is converted to the
+    /// wanted type.
+    pub fn refuse(&self, target: Target) -> Raise {
+        Raise::Convert {
+            value: readable(self),
+            target,
         }
     }
 }
@@ -335,11 +403,121 @@ fn context_text(index: usize) -> String {
     format!("(object context:{index}:0x0)")
 }
 
+/// The value in the engine's readable form.
+///
+/// The engine's `TJSVariantToReadableString`: the kind of the value in
+/// parentheses, and the value itself.
+fn readable(value: &Value) -> String {
+    match value {
+        Value::Void => "()".to_string(),
+        Value::Integer(number) => format!("(int){number}"),
+        Value::Real(number) => format!("(real){}", format_real(*number)),
+        Value::String(text) => format!("(string)\"{}\"", escape_c(text)),
+        Value::Octet(bytes) => format!("(octet)<% {} %>", octet_list(bytes)),
+        Value::Object(id) => format!("(object){}", object_text(*id)),
+        Value::Context(index) => format!("(object){}", context_text(*index)),
+        Value::ConstArray { identity, .. } => format!("(object){}", object_text(*identity)),
+        Value::ConstDictionary { identity, .. } => format!("(object){}", object_text(*identity)),
+    }
+}
+
+/// The text of a string with the escapes of the engine.
+///
+/// The engine's `EscapeC`: the control characters and the two quotes
+/// are written as an escape, and the other control characters are
+/// written as their hexadecimal code.
+fn escape_c(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    let mut hexadecimal = false;
+    for character in text.chars() {
+        match character {
+            '\u{7}' => {
+                escaped.push_str("\\a");
+                hexadecimal = false;
+            }
+            '\u{8}' => {
+                escaped.push_str("\\b");
+                hexadecimal = false;
+            }
+            '\u{c}' => {
+                escaped.push_str("\\f");
+                hexadecimal = false;
+            }
+            '\n' => {
+                escaped.push_str("\\n");
+                hexadecimal = false;
+            }
+            '\r' => {
+                escaped.push_str("\\r");
+                hexadecimal = false;
+            }
+            '\t' => {
+                escaped.push_str("\\t");
+                hexadecimal = false;
+            }
+            '\u{b}' => {
+                escaped.push_str("\\v");
+                hexadecimal = false;
+            }
+            '\\' => {
+                escaped.push_str("\\\\");
+                hexadecimal = false;
+            }
+            '\'' => {
+                escaped.push_str("\\'");
+                hexadecimal = false;
+            }
+            '"' => {
+                escaped.push_str("\\\"");
+                hexadecimal = false;
+            }
+            _ => {
+                if hexadecimal && character.is_ascii_hexdigit() {
+                    escaped.push_str(&format!("\\x{:02x}", u32::from(character)));
+                    continue;
+                }
+                if (character as u32) < 0x20 {
+                    hexadecimal = true;
+                    escaped.push_str(&format!("\\x{:02x}", u32::from(character)));
+                } else {
+                    hexadecimal = false;
+                    escaped.push(character);
+                }
+            }
+        }
+    }
+    escaped
+}
+
+/// The bytes of a byte string, as the engine writes them.
+///
+/// The engine's `TJSOctetToListString`: the bytes as their hexadecimal
+/// code, one after the other, separated by a space.
+fn octet_list(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len() * 3);
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            text.push(' ');
+        }
+        text.push_str(&format!("{byte:02X}"));
+    }
+    text
+}
+
+/// A number, in the two kinds the engine has.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Number {
+    /// An integer.
+    Integer(i64),
+    /// A real number.
+    Real(f64),
+}
+
 /// The number the text holds, when the text holds a number.
 ///
 /// `TJSParseNumber`: an optional sign, then `true`, `false`, `NaN`,
 /// `Infinity`, or a number in the base its prefix names.
-fn parse_number(text: &str) -> Option<Value> {
+fn parse_number(text: &str) -> Option<Number> {
     let mut rest = text;
     let mut negative = false;
     if let Some(first) = rest.chars().next()
@@ -352,9 +530,8 @@ fn parse_number(text: &str) -> Option<Value> {
     let value = parse_number_body(rest)?;
     Some(if negative {
         match value {
-            Value::Integer(number) => Value::Integer(number.wrapping_neg()),
-            Value::Real(number) => Value::Real(-number),
-            other => other,
+            Number::Integer(number) => Number::Integer(number.wrapping_neg()),
+            Number::Real(number) => Number::Real(-number),
         }
     } else {
         value
@@ -362,19 +539,19 @@ fn parse_number(text: &str) -> Option<Value> {
 }
 
 /// The number the text holds, without a sign.
-fn parse_number_body(text: &str) -> Option<Value> {
+fn parse_number_body(text: &str) -> Option<Number> {
     // the words that are read as numbers
-    if text.len() >= 4 && text[..4].eq_ignore_ascii_case("true") {
-        return Some(Value::Integer(1));
+    if starts_with_word(text, "true") {
+        return Some(Number::Integer(1));
     }
-    if text.len() >= 5 && text[..5].eq_ignore_ascii_case("false") {
-        return Some(Value::Integer(0));
+    if starts_with_word(text, "false") {
+        return Some(Number::Integer(0));
     }
-    if text.len() >= 3 && text[..3].eq_ignore_ascii_case("NaN") {
-        return Some(Value::Real(f64::NAN));
+    if starts_with_word(text, "NaN") {
+        return Some(Number::Real(f64::NAN));
     }
-    if text.len() >= 8 && text[..8].eq_ignore_ascii_case("Infinity") {
-        return Some(Value::Real(f64::INFINITY));
+    if starts_with_word(text, "Infinity") {
+        return Some(Number::Real(f64::INFINITY));
     }
 
     // the numbers a prefix names
@@ -391,7 +568,7 @@ fn parse_number_body(text: &str) -> Option<Value> {
                 .chars()
                 .take_while(char::is_ascii_alphanumeric)
                 .collect();
-            return i64::from_str_radix(&digits, base).ok().map(Value::Integer);
+            return i64::from_str_radix(&digits, base).ok().map(Number::Integer);
         }
     }
 
@@ -399,7 +576,7 @@ fn parse_number_body(text: &str) -> Option<Value> {
     if text.len() > 1 && text.starts_with('0') {
         let digits: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
         if digits.len() > 1 && digits.chars().all(|c| ('0'..='7').contains(&c)) {
-            return i64::from_str_radix(&digits, 8).ok().map(Value::Integer);
+            return i64::from_str_radix(&digits, 8).ok().map(Number::Integer);
         }
     }
 
@@ -432,21 +609,30 @@ fn parse_number_body(text: &str) -> Option<Value> {
     }
     let number = &text[..end];
     if point || exponent {
-        number.parse::<f64>().ok().map(Value::Real)
+        Some(Number::Real(engine_real(number)))
     } else {
         // the text is a run of digits, so the only failure an integer
         // parse can have is an overflow, and a literal too large for an
         // integer is a real
         match number.parse::<i64>() {
-            Ok(value) => Some(Value::Integer(value)),
+            Ok(value) => Some(Number::Integer(value)),
             Err(error) => match error.kind() {
                 IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => {
-                    number.parse::<f64>().ok().map(Value::Real)
+                    Some(Number::Real(engine_real(number)))
                 }
                 _ => None,
             },
         }
     }
+}
+
+/// Whether the text starts with the word.
+///
+/// The word is compared without cutting the text at a byte that may not
+/// be the end of a character.
+fn starts_with_word(text: &str, word: &str) -> bool {
+    text.get(..word.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(word))
 }
 
 /// The text of a real number.
@@ -524,4 +710,78 @@ fn format_real(value: f64) -> String {
         }
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ObjectId, Value};
+
+    /// A refused conversion names the value and the type the way the
+    /// engine names them.
+    ///
+    /// The engine's `TJSThrowVariantConvertError` reads the value with
+    /// `TJSVariantToReadableString` and the type with
+    /// `TJSVariantTypeToTypeString`
+    /// (reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:146,
+    /// reference/krkr2/cpp/core/tjs2/tjsUtils.cpp:111,
+    /// reference/krkr2/cpp/core/tjs2/tjsUtils.cpp:92,
+    /// reference/krkr2/cpp/core/tjs2/tjsError.h:250).
+    #[test]
+    fn a_refused_conversion_names_the_value_and_the_type() {
+        let null = Value::Object(ObjectId::NULL);
+        assert_eq!(
+            null.to_real()
+                .expect_err("the null has no real conversion")
+                .to_string(),
+            "Cannot convert the variable type ((object)(object 0x0:0x0) to real)"
+        );
+        assert_eq!(
+            null.to_integer()
+                .expect_err("the null has no integer conversion")
+                .to_string(),
+            "Cannot convert the variable type ((object)(object 0x0:0x0) to int)"
+        );
+        assert_eq!(
+            null.to_number()
+                .expect_err("the null has no number conversion")
+                .to_string(),
+            "Cannot convert the variable type ((object)(object 0x0:0x0) to int/real)"
+        );
+    }
+
+    /// A text with a character outside ASCII is not a number, and reading
+    /// it does not cut the text at a byte that is not the end of a
+    /// character.
+    ///
+    /// The engine reads a number out of a text with `TJSParseNumber`
+    /// (reference/krkr2/cpp/core/tjs2/tjsLex.cpp:700), and a text that
+    /// holds no number is the integer zero.
+    #[test]
+    fn a_text_outside_ascii_is_not_a_number() {
+        for text in ["voice/１－寧々", "１－寧々"] {
+            let value = Value::String(text.to_string());
+            assert_eq!(
+                value.to_integer().expect("the text reads as the zero"),
+                0,
+                "the text {text} holds no number"
+            );
+        }
+    }
+
+    /// A long decimal text is the engine's number.
+    ///
+    /// The engine reads a real out of a text with `TJS_strtod`
+    /// (reference/krkr2/cpp/core/tjs2/tjsConfig.cpp:672), and the value
+    /// is one unit in the last place off the correctly rounded one.
+    #[test]
+    fn a_long_decimal_text_is_the_engines_number() {
+        let value = Value::String("9.090909090909093".to_string());
+        assert_eq!(
+            value
+                .to_real()
+                .expect("the text reads as a number")
+                .to_bits(),
+            0x4022_2e8b_a2e8_ba2f
+        );
+    }
 }

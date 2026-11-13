@@ -36,15 +36,15 @@ use value::Value;
 pub enum CodegenError {
     /// The tree has a shape the generator does not support.
     Shape(String),
-    /// A value could not be converted where the generator converts it.
-    Value(value::ValueError),
+    /// The engine refuses the expression: the constant folding raises.
+    Refused(value::Raise),
 }
 
 impl std::fmt::Display for CodegenError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CodegenError::Shape(message) => write!(formatter, "{message}"),
-            CodegenError::Value(error) => write!(formatter, "{error}"),
+            CodegenError::Refused(raise) => write!(formatter, "{raise}"),
         }
     }
 }
@@ -55,6 +55,7 @@ impl From<emit::EmitError> for CodegenError {
     fn from(error: emit::EmitError) -> Self {
         match error {
             emit::EmitError::Shape(message) => CodegenError::Shape(message),
+            emit::EmitError::Refused(raise) => CodegenError::Refused(raise),
         }
     }
 }

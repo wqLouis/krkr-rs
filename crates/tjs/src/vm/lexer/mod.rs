@@ -31,6 +31,7 @@ pub use value::ValueRef;
 pub(crate) use value::Value;
 
 use literal::StringEnd;
+pub(crate) use number::engine_real;
 
 /// The code unit that stands in for the carriage return of a newline pair.
 ///
@@ -562,12 +563,17 @@ impl Lexer {
             if let Some(token) = self.pending.pop_front() {
                 return Ok(Some(token));
             }
-            let scan = if self.embeddable.is_empty() {
-                self.cursor.skip_space();
-                self.scan_token()?
-            } else {
-                self.scan_embeddable()?
-            };
+            // The analyser times its own token production: the measurement
+            // is off by default, and a token that is not measured costs one
+            // relaxed atomic load and nothing else.
+            let scan = crate::vm::stats::timed_lexer(|| -> Result<Scan, LexError> {
+                if self.embeddable.is_empty() {
+                    self.cursor.skip_space();
+                    self.scan_token()
+                } else {
+                    self.scan_embeddable()
+                }
+            })?;
             match scan {
                 Scan::Token(token) => return Ok(Some(token)),
                 Scan::Pending => continue,

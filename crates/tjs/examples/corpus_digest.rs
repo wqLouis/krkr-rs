@@ -422,7 +422,7 @@ fn corpus_scripts(corpus: &Path) -> Result<Vec<(String, PathBuf)>, String> {
 /// The canonical form of one script file.
 fn canonical_of_file(path: &Path) -> Result<String, String> {
     let units = read_units(path)?;
-    Ok(canonical_form(&units))
+    canonical_form(&units)
 }
 
 /// The code units of a script file.
@@ -449,7 +449,7 @@ fn read_units(path: &Path) -> Result<Vec<u16>, String> {
 /// carried: the code stream, the constant area, the counts, the source
 /// positions, the relations and the member registrations of every
 /// context, and the block's own shape.
-fn canonical_form(units: &[u16]) -> String {
+fn canonical_form(units: &[u16]) -> Result<String, String> {
     let mut lexer = Lexer::new(units);
     let mut generator = Generator::new();
     let parsed = Parser::new(&mut lexer, &mut generator).parse();
@@ -488,7 +488,7 @@ fn canonical_form(units: &[u16]) -> String {
 
         let _ = write!(form, "  constants {}", context.data().len());
         for value in context.data() {
-            let _ = write!(form, " {}", value_text(value));
+            let _ = write!(form, " {}", value_text(value)?);
         }
         let _ = writeln!(form);
 
@@ -537,7 +537,7 @@ fn canonical_form(units: &[u16]) -> String {
         }
         let _ = writeln!(form);
     }
-    form
+    Ok(form)
 }
 
 /// The text of an object with the addresses taken out.
@@ -589,11 +589,11 @@ fn relation(index: Option<usize>) -> String {
 }
 
 /// The text of one value of the constant area.
-fn value_text(value: &Value) -> String {
+fn value_text(value: &Value) -> Result<String, String> {
     match value {
-        Value::Void => "void".to_string(),
-        Value::Integer(number) => format!("int:{number}"),
-        Value::Real(number) => format!("real:{:016x}", number.to_bits()),
+        Value::Void => Ok("void".to_string()),
+        Value::Integer(number) => Ok(format!("int:{number}")),
+        Value::Real(number) => Ok(format!("real:{:016x}", number.to_bits())),
         Value::String(text) => {
             // the text of an object carries the object's addresses, and
             // the address is where the heap happened to be, so the text is
@@ -604,27 +604,27 @@ fn value_text(value: &Value) -> String {
                 None => text.clone(),
             };
             let units: Vec<u16> = text.encode_utf16().collect();
-            format!("string:{}", hex_units(&units))
+            Ok(format!("string:{}", hex_units(&units)))
         }
-        Value::Octet(bytes) => format!("octet:{}", hex_bytes(bytes)),
+        Value::Octet(bytes) => Ok(format!("octet:{}", hex_bytes(bytes))),
         Value::Object(id) => {
             if id.is_null() {
-                "object:null".to_string()
+                Ok("object:null".to_string())
             } else {
-                "object:other".to_string()
+                Ok("object:other".to_string())
             }
         }
-        Value::Context(index) => format!("context:{index}"),
+        Value::Context(index) => Ok(format!("context:{index}")),
         Value::ConstArray { elements, .. } => {
             let mut text = String::from("array:[");
             for (index, element) in elements.iter().enumerate() {
                 if index != 0 {
                     text.push(',');
                 }
-                text.push_str(&value_text(element));
+                text.push_str(&value_text(element)?);
             }
             text.push(']');
-            text
+            Ok(text)
         }
         Value::ConstDictionary { entries, .. } => {
             // the members are sorted by their name: the dictionary holds
@@ -634,12 +634,16 @@ fn value_text(value: &Value) -> String {
                 .iter()
                 .map(|(name, value)| {
                     let name = match name.to_text() {
-                        Some(text) => hex_text(&text),
-                        None => "?".to_string(),
+                        Ok(text) => hex_text(&text),
+                        Err(refusal) => {
+                            return Err(format!(
+                                "a dictionary member's name is not a text: {refusal}"
+                            ));
+                        }
                     };
-                    (name, value_text(value))
+                    Ok((name, value_text(value)?))
                 })
-                .collect();
+                .collect::<Result<_, String>>()?;
             members.sort();
             let mut text = String::from("dictionary:{");
             for (index, (name, value)) in members.iter().enumerate() {
@@ -651,7 +655,7 @@ fn value_text(value: &Value) -> String {
                 text.push_str(value);
             }
             text.push('}');
-            text
+            Ok(text)
         }
     }
 }
