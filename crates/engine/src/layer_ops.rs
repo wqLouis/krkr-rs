@@ -248,8 +248,7 @@ fn saturated_add(a: u32, b: u32) -> u32 {
 /// `FillColorOnAddAlpha`: additive-alpha (premultiplied) fill.
 ///
 /// The full opacity is the plain ARGB fill, on this face as well: the
-/// reference's fill path takes that path at the full opacity on every face,
-/// so the colour is written as it is and the alpha is 255.
+/// colour is written as it is and the alpha is 255.
 pub fn fill_color_on_add_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 4], opa: i32) {
     if opa <= 0 {
         return;
@@ -361,7 +360,7 @@ pub fn fill_mask(bitmap: &mut BitmapState, rect: RectI, value: u8) {
 }
 
 /// `RemoveConstOpacity`: multiply the alpha by `255 - level` and keep the
-/// low byte of the product, so the alpha the reference's kernel leaves is
+/// low byte of the product, so the alpha left is
 /// `(alpha * (255 - level)) & 0xff`. `level <= 0` does nothing, `level >= 255`
 /// clears the alpha.
 pub fn remove_const_opacity(bitmap: &mut BitmapState, rect: RectI, level: i32) {
