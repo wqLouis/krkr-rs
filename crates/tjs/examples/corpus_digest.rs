@@ -6,6 +6,13 @@
 //! the game's archives with the crate's own `tools/extract_corpus.py`,
 //! and the check is run against the extracted corpus.
 //!
+//! The corpus holds two kinds of script. The **shipped** scripts are the
+//! `.tjs` files the game's archives carry. The **generated** scripts are the
+//! game's PSB scenarios: the compatibility layer converts a container into
+//! TJS, and the corpus holds that conversion under the
+//! [`GENERATED_DIRECTORY`]. The two kinds are compared the same way; only
+//! the directory they live in differs.
+//!
 //! The fixture is the digest of every script of the corpus, one line per
 //! script: the digest, and the script's path under the corpus root. The
 //! digests were recorded from the front end this one replaces, so they
@@ -51,6 +58,18 @@ use tjs::vm::{Generator, Lexer, Parser};
 /// The fixture the check reads when no other one is named.
 const FIXTURE: &str = "tests/fixtures/corpus_digest.txt";
 
+/// The directory under the corpus root that holds the generated scripts.
+///
+/// The game's PSB scenarios are converted into TJS by the compatibility layer
+/// and written here by the crate's own producer
+/// (`crates/compat/examples/psb_corpus.rs`). A generated script the fixture
+/// holds no digest for is **not recorded yet**: the digests are recorded from
+/// the front end this one replaces, and that recording is a step of its own.
+/// The check reports those scripts and compares them as soon as the fixture
+/// holds their digests; it does not fail on them, because a script nobody
+/// has recorded is not a difference.
+const GENERATED_DIRECTORY: &str = "psb";
+
 /// The options the run was given.
 struct Options {
     /// The directory the corpus was extracted into.
@@ -82,6 +101,8 @@ struct Report {
     missing: Vec<String>,
     /// The scripts the corpus holds and the fixture does not.
     unknown: Vec<String>,
+    /// The generated scripts the fixture holds no digest for yet.
+    pending: Vec<String>,
 }
 
 fn main() -> ExitCode {
@@ -150,12 +171,17 @@ fn main() -> ExitCode {
         different: Vec::new(),
         missing: Vec::new(),
         unknown: Vec::new(),
+        pending: Vec::new(),
     };
 
     for (relative, path) in &scripts {
         let Some(expected) = fixture.digests.get(relative) else {
             if !fixture.skipped.contains(relative) {
-                report.unknown.push(relative.clone());
+                if is_generated(relative) {
+                    report.pending.push(relative.clone());
+                } else {
+                    report.unknown.push(relative.clone());
+                }
             }
             continue;
         };
@@ -192,11 +218,21 @@ fn main() -> ExitCode {
     }
 
     println!(
-        "the corpus: {} scripts, {} compared, {} skipped",
+        "the corpus: {} scripts, {} compared, {} skipped, {} not recorded yet",
         scripts.len(),
         report.compared,
-        fixture.skipped.len()
+        fixture.skipped.len(),
+        report.pending.len()
     );
+    if !report.pending.is_empty() {
+        println!(
+            "the fixture holds no digest for {} generated scripts:",
+            report.pending.len()
+        );
+        for relative in &report.pending {
+            println!("  {relative}");
+        }
+    }
     if !report.unknown.is_empty() {
         println!(
             "the fixture holds no digest for {} scripts:",
@@ -336,6 +372,11 @@ fn write_record(path: &Path, lines: &[String]) -> Result<(), String> {
         let _ = writeln!(text, "{line}");
     }
     std::fs::write(path, text).map_err(|error| format!("cannot write {} ({error})", path.display()))
+}
+
+/// Whether the script is one of the generated scripts.
+fn is_generated(relative: &str) -> bool {
+    relative.starts_with(&format!("{GENERATED_DIRECTORY}/"))
 }
 
 /// The scripts of the corpus, with their path under the corpus root.

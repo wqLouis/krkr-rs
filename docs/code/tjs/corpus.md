@@ -1,7 +1,8 @@
 # The corpus digest — the net that outlives the front end it measures
 
 Source: `crates/tjs/examples/corpus_digest.rs`, `crates/tjs/tools/extract_corpus.py`,
-`crates/tjs/tests/fixtures/corpus_digest.txt` · module `tjs::vm` · L4
+`crates/tjs/tests/fixtures/corpus_digest.txt`,
+`crates/compat/examples/psb_corpus.rs` · module `tjs::vm` · L4
 
 Two proof instruments measured the Rust script columns against the C++ ones:
 the **corpus comparison** (the code and the constant images of every script
@@ -34,6 +35,28 @@ directory, under the path the archive holds it at. The corpus root is the
 directory the check is pointed at, and the path of a script under that root
 is its key everywhere: in the fixture, in the check's output, and in the
 digest's record.
+
+### 1.1 The generated scripts
+
+The game also ships its scenarios as **PSB containers** (`*.ks.scn`), and the
+compatibility layer converts a container into TJS at runtime: the `psbfile`
+plugin reads the container and hands the script its root as TJS values
+(`crates/compat/src/natives/plugins/psb_file/`). That conversion is the
+engine's own, so the corpus holds it — one script per container, under the
+**`psb`** directory of the corpus root:
+
+```
+psb/001.共通－オナニーマスター.ks.scn.tjs
+```
+
+The scripts are written by the crate's own producer
+(`crates/compat/examples/psb_corpus.rs`): it mounts the archives through the
+engine's loader, loads every container through the plugin, and writes the
+values the plugin built as TJS source. The extraction script runs the
+producer, so one command rebuilds the whole corpus.
+
+The two kinds of script are compared the same way; only the directory they
+live in differs.
 
 ## 2. The digest
 
@@ -113,6 +136,12 @@ digest differs — when:
 It **does not report success when the corpus is missing**: it says that the
 corpus is missing, says how to get it, and exits with a failure.
 
+A **generated** script (§1.1) that the fixture holds no digest for is not a
+failure: the digests are recorded from the C++ front end, and that recording
+is a step of its own. The check names those scripts, counts them apart from
+the compared ones, and compares them as soon as the fixture holds their
+digests.
+
 The other options:
 
 | the option | what it does |
@@ -123,18 +152,39 @@ The other options:
 
 ## 5. The state of the corpus
 
-The fixture and the Rust front end agree on **every field of 79 of the 172
-comparable scripts**. For the other 93 the two differ **in the source
-positions only**: the code, the constant area, the counts, the relations and
-the member registrations agree for all 172.
+The fixture and the Rust front end agree on **every field of all the 172
+comparable scripts**: the code, the constant area, the counts, the relations,
+the member registrations and the source positions. The three the C++ front end
+cannot compile are listed as skipped, and the check skips them too.
 
-The difference is the front end's own: the parser reads a token ahead, so
-the place it gives a node is the analyser's cursor one code unit later than
-the place the C++ front end gives it. The consequence is that the source
-position table holds an entry where the C++ table has none, and holds a
-different place at the entry before it.
+### 5.1 The generated scripts
 
-The check is therefore **red on those 93 scripts** until that difference is
-settled. The net is doing its job: the source positions are the one field
-the corpus comparison never covered, and the check is the first instrument
-that holds them to the recorded result.
+The 104 generated scripts (§1.1) are not in the fixture yet. Their digests
+have to be recorded from the C++ front end, and that recording is a step of
+its own; until it happens, the check names them and compares nothing of them.
+
+Their blocks were measured against the C++ path's blocks in the meantime —
+the same comparison, field by field, over the three fields the C++ driver
+dumps (the code stream, the constant area and the source positions):
+
+| | |
+|---|---|
+| the scripts | 104 |
+| the contexts | 104 — one per script |
+| the code words | 249 123 310 |
+| the constants | 17 115 807 |
+| the source positions | 46 750 027 |
+| the scripts the Rust front end cannot compile | 0 |
+| the scripts whose blocks the C++ path reproduces | 104 |
+| the scripts that differ in the source positions only | 0 |
+| the scripts that differ in anything else | 0 |
+
+The generated scripts add no difference of their own: the block the Rust front
+end compiles for the game's scenario data is the block the C++ path produced,
+field for field, source positions included.
+
+The one shape the rendering has to get right is the dictionary key. The data
+carries `class` as a member name, and `class` is a word the language
+reserves, so the key cannot be written as a symbol: it is written in the
+literal's pair form (`"class",value`), which both front ends read as the key
+and the value of one member.

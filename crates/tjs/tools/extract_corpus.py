@@ -16,6 +16,14 @@ every `.tjs` file in them is written into the corpus directory, under the
 path the archive holds it at. The corpus directory defaults to
 `corpus` beside the game directory.
 
+The game also ships its scenarios as PSB containers. The compatibility
+layer converts a container into TJS at runtime, and the corpus holds that
+conversion: the scripts are written under the `psb` directory of the
+corpus root, one per container. The conversion is the crate's own — the
+producer in `crates/compat/examples/psb_corpus.rs` loads every container
+through the `psbfile` plugin and writes the values the plugin built — so
+the corpus holds what the engine produces and not a copy of it.
+
 The XP3 index is a chain: each block's flag byte carries INDEX_CONTINUE
 (0x80), and when it is set the next index offset follows the block's
 data.
@@ -23,6 +31,7 @@ data.
 
 import os
 import struct
+import subprocess
 import sys
 import zlib
 
@@ -109,6 +118,35 @@ def archives(game):
     return found
 
 
+def scenarios(game, outdir):
+    """Writes the game's PSB scenarios as TJS scripts.
+
+    The conversion is the compatibility layer's own: the crate's producer
+    loads every container through the `psbfile` plugin and writes the
+    values the plugin built. The producer is run through cargo, so the
+    corpus holds what the engine produces and not a copy of it.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    command = [
+        "cargo",
+        "run",
+        "--quiet",
+        "-p",
+        "compat",
+        "--example",
+        "psb_corpus",
+        "--",
+        game,
+        outdir,
+    ]
+    print(" ".join(command), flush=True)
+    result = subprocess.run(command, cwd=root)
+    if result.returncode != 0:
+        raise SystemExit(
+            f"the scenario conversion failed with the exit code {result.returncode}"
+        )
+
+
 def main():
     if len(sys.argv) < 2:
         raise SystemExit(
@@ -148,6 +186,7 @@ def main():
         f"archives={len(paths)} files={count} bytes={total} "
         f"corpus={outdir}"
     )
+    scenarios(game, os.path.join(outdir, "psb"))
 
 
 if __name__ == "__main__":
