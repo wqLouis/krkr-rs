@@ -12,7 +12,7 @@
 
 #include "tjsCommHead.h"
 
-#include "tjsInterCodeGen.h"
+#include "tjsInterCodeContext.h"
 #include "tjsScriptBlock.h"
 #include "tjsUtils.h"
 

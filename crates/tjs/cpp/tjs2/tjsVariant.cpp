@@ -12,7 +12,7 @@
 
 #include "tjsVariant.h"
 #include "tjsError.h"
-#include "tjsLex.h"
+#include "tjsNumberParse.h"
 #include "tjsUtils.h"
 #include "tjsDebug.h"
 

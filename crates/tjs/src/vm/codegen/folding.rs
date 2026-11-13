@@ -25,7 +25,7 @@ use crate::vm::codegen::value::{Raise, Target, Value};
 enum Fold {
     /// The expression does not fold: the code is generated as it is
     /// written.
-    NoFold,
+    Unfolded,
     /// The expression folds to this value.
     Value(Value),
     /// The engine refuses the expression: the script is refused while it
@@ -41,7 +41,7 @@ enum Fold {
 pub fn fold_unary(opcode: i32, operand: &Value) -> Option<Value> {
     match fold_unary_operation(opcode, operand) {
         Fold::Value(value) => Some(value),
-        Fold::NoFold | Fold::Refused(_) => None,
+        Fold::Unfolded | Fold::Refused(_) => None,
     }
 }
 
@@ -53,7 +53,7 @@ pub fn fold_unary(opcode: i32, operand: &Value) -> Option<Value> {
 pub fn fold_binary(opcode: i32, left: &Value, right: &Value) -> Option<Value> {
     match fold_binary_operation(opcode, left, right) {
         Fold::Value(value) => Some(value),
-        Fold::NoFold | Fold::Refused(_) => None,
+        Fold::Unfolded | Fold::Refused(_) => None,
     }
 }
 
@@ -67,7 +67,7 @@ pub fn refusal_of(node: &Rc<Node>) -> Option<Raise> {
             let operand = constant(node.child(0))?;
             match fold_unary_operation(node.opcode, &operand) {
                 Fold::Refused(raise) => Some(raise),
-                Fold::NoFold | Fold::Value(_) => None,
+                Fold::Unfolded | Fold::Value(_) => None,
             }
         }
         2 => {
@@ -75,7 +75,7 @@ pub fn refusal_of(node: &Rc<Node>) -> Option<Raise> {
             let right = constant(node.child(1))?;
             match fold_binary_operation(node.opcode, &left, &right) {
                 Fold::Refused(raise) => Some(raise),
-                Fold::NoFold | Fold::Value(_) => None,
+                Fold::Unfolded | Fold::Value(_) => None,
             }
         }
         _ => None,
@@ -106,7 +106,7 @@ fn fold_unary_operation(opcode: i32, operand: &Value) -> Fold {
             match operand.to_integer() {
                 Ok(code) => match char::from_u32((code as u32) & 0xffff) {
                     Some(unit) => Fold::Value(Value::String(unit.to_string())),
-                    None => Fold::NoFold,
+                    None => Fold::Unfolded,
                 },
                 Err(raise) => Fold::Refused(raise),
             }
@@ -125,7 +125,7 @@ fn fold_unary_operation(opcode: i32, operand: &Value) -> Fold {
                         Fold::Value(Value::Integer(number.wrapping_neg()))
                     }
                     Ok(Value::Real(number)) => Fold::Value(Value::Real(-number)),
-                    Ok(_) => Fold::NoFold,
+                    Ok(_) => Fold::Unfolded,
                     Err(raise) => Fold::Refused(raise),
                 },
             }
@@ -149,7 +149,7 @@ fn fold_unary_operation(opcode: i32, operand: &Value) -> Fold {
             Value::Void => Fold::Value(Value::Octet(Vec::new())),
             _ => Fold::Refused(operand.refuse(Target::Octet)),
         },
-        _ => Fold::NoFold,
+        _ => Fold::Unfolded,
     }
 }
 
@@ -273,7 +273,7 @@ fn fold_binary_operation(opcode: i32, left: &Value, right: &Value) -> Fold {
             }
         }
         token::T_ASTERISK => multiply(left, right),
-        _ => Fold::NoFold,
+        _ => Fold::Unfolded,
     }
 }
 

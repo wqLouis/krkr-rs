@@ -8,8 +8,7 @@
 //!   1. run `zig build` in `../../deps` (fetches fmt/spdlog/boost/oniguruma
 //!      via the zig package manager and stages headers + libonig.a into
 //!      `$OUT_DIR/zig-out`)
-//!   2. run `bison` on `bison/tjs.y`, `bison/tjsdate.y`, `bison/tjspp.y`
-//!      into `$OUT_DIR/gen`
+//!   2. run `bison` on `bison/tjsdate.y` into `$OUT_DIR/gen`
 //!   3. run `python3 script/create_world_map.py` to generate
 //!      `tjsDateWordMap.inc`
 //!   4. compile all tjs2 `.cpp` sources + the shim with the C++ compiler
@@ -56,13 +55,12 @@ fn fail(msg: &str) -> ! {
 
 /// The tjs2 sources listed in the upstream `cpp/core/tjs2/CMakeLists.txt`.
 const TJS2_SOURCES: &[&str] = &[
-    "tjsLex.cpp",
     "tjsNative.cpp",
     "tjsRandomGenerator.cpp",
     "tjsDebug.cpp",
     "tjsRegExp.cpp",
     "tjsBinarySerializer.cpp",
-    "tjsInterCodeGen.cpp",
+    "tjsInterCodeContext.cpp",
     "tjsObject.cpp",
     "tjsConstArrayData.cpp",
     "tjsUtils.cpp",
@@ -72,6 +70,7 @@ const TJS2_SOURCES: &[&str] = &[
     "tjsVariantString.cpp",
     "tjsScriptBlock.cpp",
     "tjsMath.cpp",
+    "tjsNumberParse.cpp",
     "tjs.cpp",
     "tjsMessage.cpp",
     "tjsDisassemble.cpp",
@@ -83,16 +82,14 @@ const TJS2_SOURCES: &[&str] = &[
     "tjsDateParser.cpp",
     "tjsGlobalStringMap.cpp",
     "tjsOctPack.cpp",
-    "tjsNamespace.cpp",
     "tjsScriptCache.cpp",
     "tjsConfig.cpp",
-    "tjsCompileControl.cpp",
     "tjsObjectExtendable.cpp",
     "tjsVariant.cpp",
     "tjsString.cpp",
 ];
 
-const BISON_GRAMMARS: &[&str] = &["tjs.y", "tjsdate.y", "tjspp.y"];
+const BISON_GRAMMARS: &[&str] = &["tjsdate.y"];
 
 /// The oniguruma C sources, mirroring the list in `deps/build.zig`. The
 /// `*_data.c` files are `#include`d by `unicode.c` and must not be compiled
@@ -560,11 +557,13 @@ fn main() {
         sources.push(gen_dir.join(format!("{stem}.tab.cpp")));
     }
     sources.push(manifest_dir.join("cpp/tjs2_abi.cpp"));
-    sources.push(manifest_dir.join("cpp/tjs2_proof.cpp"));
     sources.push(manifest_dir.join("cpp/streams.cpp"));
 
     let failed = std::sync::Arc::new(AtomicUsize::new(0));
     let lock = std::sync::Arc::new(Mutex::new(()));
+    // The archive step below names the objects of these sources; the list is
+    // kept for it.
+    let archive_sources = sources.clone();
     let handles: Vec<_> = sources
         .into_iter()
         .map(|src| {
@@ -630,11 +629,20 @@ fn main() {
 
     // -- archive into a static lib ------------------------------------------
     let lib = out_dir.join("libtjs2_core.a");
-    let objects: Vec<PathBuf> = std::fs::read_dir(&obj_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|e| e == "o").unwrap_or(false))
+    // The archive holds exactly the objects the source list above produced.
+    // Globbing the object directory instead would link a stale object of a
+    // source that no longer exists, and the link would then carry two
+    // definitions of the same symbol.
+    let objects: Vec<PathBuf> = archive_sources
+        .iter()
+        .map(|src| {
+            obj_dir.join(
+                src.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace(".cpp", ".o"),
+            )
+        })
         .collect();
     let _ = std::fs::remove_file(&lib);
     let mut ar_cmd = Command::new(&ar[0]);

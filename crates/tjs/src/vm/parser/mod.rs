@@ -86,16 +86,13 @@ pub trait Commands {
 
     /// Opens a code context the block does not hold.
     ///
-    /// The reference's `RegisterFunction` holds a child context in the
-    /// parent's constant area, registers it as a member of the parent's
-    /// object, or links it to the parent as a property's setter or
-    /// getter. A context the parent does not hold is released when its
-    /// scope ends, and it leaves the block
-    /// (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:886-947, :394).
+    /// A child context is held by the parent's constant area, is registered
+    /// as a member of the parent's object, or is linked to the parent as a
+    /// property's setter or getter. A context the parent does not hold is
+    /// released when its scope ends, and it leaves the block.
     ///
-    /// The context is opened with no name: the reference gives every
-    /// context a name, and the name of a context the block does not
-    /// hold is never read.
+    /// The context is opened with no name: every context has a name, and the
+    /// name of a context the block does not hold is never read.
     fn push_unheld_context(&mut self, _name: Option<&[u16]>, kind: ContextType) -> usize {
         self.push_context(None, kind)
     }
@@ -1554,9 +1551,8 @@ impl<'a, C: Commands> Parser<'a, C> {
             return Ok(self.nodes.node(index));
         }
 
-        // the new operator takes a call: the engine's grammar gives the
-        // new a call expression, and a priority expression is not one
-        // (reference/krkr2/cpp/core/tjs2/bison/tjs.y:648, :685-686)
+        // the new operator takes a call: the grammar gives the new a
+        // call expression, and a priority expression is not one
         if self.peek_kind() == Some(TokenKind::New) {
             self.advance();
             let index = self.func_call_expr()?;
@@ -1778,11 +1774,10 @@ impl<'a, C: Commands> Parser<'a, C> {
 
     /// A function call.
     ///
-    /// The engine's grammar gives the call to the `new` operator: the
-    /// call is a priority expression and the arguments that follow it
-    /// (reference/krkr2/cpp/core/tjs2/bison/tjs.y:685-686). A priority
-    /// expression whose chain ends with something else than a call is
-    /// not a call, and the operator refuses it.
+    /// The grammar gives the call to the `new` operator: the call is a
+    /// priority expression and the arguments that follow it. A priority
+    /// expression whose chain ends with something else than a call is not
+    /// a call, and the operator refuses it.
     fn func_call_expr(&mut self) -> Result<usize, ParseError> {
         let PriorityExpr { index, called } = self.priority_expr()?;
         if !called {

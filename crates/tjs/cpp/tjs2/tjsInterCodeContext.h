@@ -8,19 +8,16 @@
 //---------------------------------------------------------------------------
 // Intermediate Code Context
 //---------------------------------------------------------------------------
-#ifndef tjsInterCodeGenH
-#define tjsInterCodeGenH
+#ifndef tjsInterCodeContextH
+#define tjsInterCodeContextH
 
+#include <functional>
 #include <vector>
-#include <stack>
-#include <list>
 #include "tjsVariant.h"
 #include "tjsInterface.h"
 #include "tjsVMCodes.h"
-#include "tjsNamespace.h"
 #include "tjsError.h"
 #include "tjsObject.h"
-#include "tjs.tab.hpp"
 
 #ifdef _DEBUG
 #include "tjsDebug.h"
@@ -28,39 +25,8 @@
 
 namespace TJS {
     class tTJSScriptBlock;
+    class tTJSVariantArrayStack;
 
-    int yylex(parser::value_type *yylex, tTJSScriptBlock *ptr);
-    int _yyerror(const tjs_char *msg, tTJSScriptBlock *pm, tjs_int pos = -1);
-
-    //---------------------------------------------------------------------------
-    enum tTJSSubType {
-        stNone = VM_NOP,
-        stEqual = VM_CP,
-        stBitAND = VM_BAND,
-        stBitOR = VM_BOR,
-        stBitXOR = VM_BXOR,
-        stSub = VM_SUB,
-        stAdd = VM_ADD,
-        stMod = VM_MOD,
-        stDiv = VM_DIV,
-        stIDiv = VM_IDIV,
-        stMul = VM_MUL,
-        stLogOR = VM_LOR,
-        stLogAND = VM_LAND,
-        stSAR = VM_SAR,
-        stSAL = VM_SAL,
-        stSR = VM_SR,
-
-        stPreInc = __VM_LAST,
-        stPreDec,
-        stPostInc,
-        stPostDec,
-        stDelete,
-        stFuncCall,
-        stIgnorePropGet,
-        stIgnorePropSet,
-        stTypeOf
-    };
     //---------------------------------------------------------------------------
     enum tTJSContextType {
         ctTopLevel,
@@ -75,64 +41,7 @@ namespace TJS {
 
     //---------------------------------------------------------------------------
     //---------------------------------------------------------------------------
-    // tTJSExprNode
-    //---------------------------------------------------------------------------
-    class tTJSExprNode {
-        tjs_int Op;
-        tjs_int Position;
-        std::vector<tTJSExprNode *> *Nodes;
-        tTJSVariant *Val;
-
-    public:
-        tTJSExprNode();
-
-        ~tTJSExprNode() { Clear(); }
-
-        void Clear();
-
-        void SetOpcode(tjs_int op) { Op = op; }
-
-        void SetPosition(tjs_int pos) { Position = pos; }
-
-        void SetValue(const tTJSVariant &val) {
-            if(!Val)
-                Val = new tTJSVariant(val);
-            else
-                Val->CopyRef(val);
-        }
-
-        void Add(tTJSExprNode *n);
-
-        tjs_int GetOpcode() const { return Op; }
-
-        tjs_int GetPosition() const { return Position; }
-
-        tTJSVariant &GetValue() {
-            if(!Val)
-                return *(tTJSVariant *)nullptr;
-            return *Val;
-        }
-
-        tTJSExprNode *operator[](tjs_int i) const {
-            if(!Nodes)
-                return nullptr;
-            return (*Nodes)[i];
-        }
-
-        unsigned int GetSize() const {
-            if(Nodes)
-                return static_cast<unsigned int>(Nodes->size());
-            return 0;
-        }
-
-        // for array and dictionary constant value
-        void AddArrayElement(const tTJSVariant &val);
-
-        void AddDictionaryElement(const tTJSString &name,
-                                  const tTJSVariant &val);
-    };
-    //---------------------------------------------------------------------------
-    // tTJSInterCodeContext - Intermediate Code Context
+    // tTJSInterCodeContext
     //---------------------------------------------------------------------------
     /*
             this class implements iTJSDispatch2;
@@ -140,36 +49,17 @@ namespace TJS {
        property handlers.
     */
 
-    class tTJSScriptBlock;
-
     class tTJSInterCodeContext : public tTJSCustomObject {
         typedef tTJSCustomObject inherited;
 
     public:
-        tTJSInterCodeContext(tTJSInterCodeContext *parant, const tjs_char *name,
-                             tTJSScriptBlock *block, tTJSContextType type);
-
-        ~tTJSInterCodeContext() override;
-
         // is bytecode export
         static bool IsBytecodeCompile;
 
     protected:
         void Finalize() override;
-        //-------------------------------------------------------
-        // compiling stuff
 
     public:
-        void ClearNodesToDelete();
-
-        struct tSubParam {
-            tTJSSubType SubType;
-            tjs_int SubFlag;
-            tjs_int SubAddress;
-
-            tSubParam() { SubType = stNone, SubFlag = 0, SubAddress = 0; }
-        };
-
         struct tSourcePos {
             tjs_int CodePos;
             tjs_int SourcePos;
@@ -178,103 +68,6 @@ namespace TJS {
         };
 
     private:
-        enum tNestType {
-            ntBlock,
-            ntWhile,
-            ntDoWhile,
-            ntFor,
-            ntSwitch,
-            ntIf,
-            ntElse,
-            ntTry,
-            ntCatch,
-            ntWith
-        };
-
-        struct tNestData {
-            tNestType Type;
-            tjs_int VariableCount;
-            union {
-                bool VariableCreated;
-                bool IsFirstCase;
-            };
-            tjs_int RefRegister;
-            tjs_int StartIP;
-            tjs_int LoopStartIP;
-            std::vector<tjs_int> ContinuePatchVector;
-            std::vector<tjs_int> ExitPatchVector;
-            tjs_int Patch1;
-            tjs_int Patch2;
-            tTJSExprNode *PostLoopExpr;
-        };
-
-        struct tFixData {
-            tjs_int StartIP;
-            tjs_int Size;
-            tjs_int NewSize;
-            bool BeforeInsertion;
-            tjs_int32 *Code;
-
-            tFixData(tjs_int startip, tjs_int size, tjs_int newsize,
-                     tjs_int32 *code, bool beforeinsertion) {
-                StartIP = startip, Size = size, NewSize = newsize, Code = code,
-                BeforeInsertion = beforeinsertion;
-            }
-
-            tFixData(const tFixData &fixdata) {
-                Code = nullptr;
-                operator=(fixdata);
-            }
-
-            tFixData &operator=(const tFixData &fixdata) {
-                delete[] Code;
-                StartIP = fixdata.StartIP;
-                Size = fixdata.Size;
-                NewSize = fixdata.NewSize;
-                BeforeInsertion = fixdata.BeforeInsertion;
-                Code = new tjs_int32[NewSize];
-                memcpy(Code, fixdata.Code, sizeof(tjs_int32) * NewSize);
-                return *this;
-            }
-
-            ~tFixData() { delete[] Code; }
-        };
-
-        struct tNonLocalFunctionDecl {
-            tjs_int DataPos;
-            tjs_int NameDataPos;
-            bool ChangeThis;
-
-            tNonLocalFunctionDecl(tjs_int datapos, tjs_int namedatapos,
-                                  bool changethis) {
-                DataPos = datapos, NameDataPos = namedatapos;
-                ChangeThis = changethis;
-            }
-        };
-
-        struct tFuncArgItem {
-            tjs_int Register;
-            tTJSFuncArgType Type;
-
-            tFuncArgItem(tjs_int reg, tTJSFuncArgType type = fatNormal) {
-                Register = reg;
-                Type = type;
-            }
-        };
-
-        struct tFuncArg {
-            bool IsOmit;
-            bool HasExpand;
-            std::vector<tFuncArgItem> ArgVector;
-
-            tFuncArg() { IsOmit = HasExpand = false; }
-        };
-
-        struct tArrayArg {
-            tjs_int Object;
-            tjs_int Counter;
-        };
-
         // for Bytecode
         struct tProperty {
             const tjs_char *Name;
@@ -288,53 +81,20 @@ namespace TJS {
 
         std::vector<tProperty *> *Properties;
 
-        tjs_int FrameBase;
-
         tjs_int32 *CodeArea;
-        tjs_int CodeAreaCapa;
         tjs_int CodeAreaSize;
 
-        tTJSVariant **_DataArea;
-        tjs_int _DataAreaSize;
-        tjs_int _DataAreaCapa;
         tTJSVariant *DataArea;
         tjs_int DataAreaSize;
 
-        tTJSLocalNamespace Namespace;
-
-        std::vector<tTJSExprNode *> NodeToDeleteVector;
-
-        std::vector<tTJSExprNode *> CurrentNodeVector;
-
-        std::stack<tFuncArg> FuncArgStack;
-
-        std::stack<tArrayArg> ArrayArgStack;
-
-        tjs_int PrevIfExitPatch;
-        std::vector<tNestData> NestVector;
-
-        std::list<tjs_int> JumpList;
-        std::list<tFixData> FixList;
-
-        std::vector<tNonLocalFunctionDecl> NonLocalFunctionDeclVector;
-
-        tjs_int FunctionRegisterCodePoint;
-
-        tjs_int PrevSourcePos;
         bool SourcePosArraySorted;
-        //	std::vector<tSourcePos> SourcePosVector;
         tSourcePos *SourcePosArray;
         tjs_int SourcePosArraySize;
-        tjs_int SourcePosArrayCapa;
-
-        tTJSExprNode *SuperClassExpr;
-
-        tjs_int VariableReserveCount;
-
-        bool AsGlobalContextMode;
 
         tjs_int MaxFrameCount;
         tjs_int MaxVariableCount;
+
+        tjs_int VariableReserveCount;
 
         tjs_int FuncDeclArgCount;
         tjs_int FuncDeclUnnamedArgArrayBase;
@@ -362,109 +122,11 @@ namespace TJS {
 
         ttstr GetShortDescription() const;
 
-        ttstr GetShortDescriptionWithClassName() const;
-
         tTJSScriptBlock *GetBlock() const { return Block; }
-
-#ifdef _DEBUG
-        ttstr GetClassName() const;
-        ttstr GetSelfClassName() const;
-
-        const ScopeKey &GetDebuggerScopeKey() { return DebuggerScopeKey; }
-        tTJSVariant *GetDebuggerRegisterArea() { return DebuggerRegisterArea; }
-        tTJSVariant *GetDebuggerDataArea() { return DataArea; }
-#endif // _DEBUG
-    private:
-        void OutputWarning(const tjs_char *msg, tjs_int pos = -1);
-
-    private:
-        tjs_int PutCode(tjs_int32 num, tjs_int32 pos = -1);
-
-        tjs_int PutData(const tTJSVariant &val);
-
-        void AddJumpList() { JumpList.push_back(CodeAreaSize); }
-
-        void SortSourcePos();
-
-        void FixCode();
-
-        void RegisterFunction();
-
-        tjs_int _GenNodeCode(tjs_int &frame, tTJSExprNode *node,
-                             tjs_uint32 restype, tjs_int reqresaddr,
-                             const tSubParam &param);
-
-        tjs_int GenNodeCode(tjs_int &frame, tTJSExprNode *node,
-                            tjs_uint32 restype, tjs_int reqresaddr,
-                            const tSubParam &param);
-
-        // restypes
-#define TJS_RT_NEEDED 0x0001 // result needed
-#define TJS_RT_CFLAG                                                           \
-    0x0002 // condition flag needed
-           // result value
-#define TJS_GNC_CFLAG (1 << (sizeof(tjs_int) * 8 - 1)) // true logic
-#define TJS_GNC_CFLAG_I (TJS_GNC_CFLAG + 1) // inverted logic
-
-        void StartFuncArg();
-
-        void AddFuncArg(tjs_int addr, tTJSFuncArgType type = fatNormal);
-
-        void EndFuncArg();
-
-        void AddOmitArg();
-
-        void DoNestTopExitPatch();
-
-        void DoContinuePatch(tNestData &nestdata);
-
-        void ClearLocalVariable(tjs_int top, tjs_int bottom);
-
-        void ClearFrame(tjs_int &frame, tjs_int base = -1);
-
-        static void _output_func(const tjs_char *msg, const tjs_char *comment,
-                                 tjs_int addr, const tjs_int32 *codestart,
-                                 tjs_int size, void *data);
-
-        static void _output_func_src(const tjs_char *msg, const tjs_char *name,
-                                     tjs_int line, void *data);
-
-    public:
-        void Commit();
 
         tjs_uint GetCodeSize() const { return CodeAreaSize; }
 
         tjs_uint GetDataSize() const { return DataAreaSize; }
-
-        // PROOF INSTRUMENT (not part of the shipped tree): the buffers and
-        // the counts the comparison reads.
-        const tjs_int32 *GetCodeArea() const { return CodeArea; }
-
-        const tTJSVariant *GetDataArea() const { return DataArea; }
-
-        tjs_int GetMaxVariableCount() const { return MaxVariableCount; }
-
-        tjs_int GetVariableReserveCount() const { return VariableReserveCount; }
-
-        tjs_int GetMaxFrameCount() const { return MaxFrameCount; }
-
-        tjs_int GetFuncDeclArgCount() const { return FuncDeclArgCount; }
-
-        tjs_int GetFuncDeclUnnamedArgArrayBase() const {
-            return FuncDeclUnnamedArgArrayBase;
-        }
-
-        tjs_int GetFuncDeclCollapseBase() const { return FuncDeclCollapseBase; }
-
-        tTJSInterCodeContext *GetParentContext() const { return Parent; }
-
-        tTJSInterCodeContext *GetPropSetterContext() const { return PropSetter; }
-
-        tTJSInterCodeContext *GetPropGetterContext() const { return PropGetter; }
-
-        tTJSInterCodeContext *GetSuperClassGetterContext() const {
-            return SuperClassGetter;
-        }
 
         tjs_int CodePosToSrcPos(tjs_int codepos) const;
 
@@ -472,99 +134,7 @@ namespace TJS {
 
         ttstr GetPositionDescriptionString(tjs_int codepos) const;
 
-        void AddLocalVariable(const tjs_char *name, tjs_int init = 0);
-
-        void InitLocalVariable(const tjs_char *name, tTJSExprNode *node);
-
-        void InitLocalFunction(const tjs_char *name, tjs_int data);
-
-        void CreateExprCode(tTJSExprNode *node);
-
-        void EnterWhileCode(bool do_while);
-
-        void CreateWhileExprCode(tTJSExprNode *node, bool do_while);
-
-        void ExitWhileCode(bool do_while);
-
-        void EnterIfCode();
-
-        void CreateIfExprCode(tTJSExprNode *node);
-
-        void ExitIfCode();
-
-        void EnterElseCode();
-
-        void ExitElseCode();
-
-        void EnterForCode();
-
-        void CreateForExprCode(tTJSExprNode *node);
-
-        void SetForThirdExprCode(tTJSExprNode *node);
-
-        void ExitForCode();
-
-        void EnterSwitchCode(tTJSExprNode *node);
-
-        void ExitSwitchCode();
-
-        void ProcessCaseCode(tTJSExprNode *node);
-
-        void EnterWithCode(tTJSExprNode *node);
-
-        void ExitWithCode();
-
-        void DoBreak();
-
-        void DoContinue();
-
-        void DoDebugger();
-
-        void ReturnFromFunc(tTJSExprNode *node);
-
-        void EnterTryCode();
-
-        void EnterCatchCode(const tjs_char *name);
-
-        void ExitTryCode();
-
-        void ProcessThrowCode(tTJSExprNode *node);
-
-        void CreateExtendsExprCode(tTJSExprNode *node, bool hold);
-
-        void CreateExtendsExprProxyCode(tTJSExprNode *node);
-
-        void EnterBlock();
-
-        void ExitBlock();
-
-        void GenerateFuncCallArgCode();
-
-        void AddFunctionDeclArg(const tjs_char *varname, tTJSExprNode *init);
-
-        void AddFunctionDeclArgCollapse(const tjs_char *varname);
-
-        void SetPropertyDeclArg(const tjs_char *varname);
-
         const tjs_char *GetName() const;
-
-        void PushCurrentNode(tTJSExprNode *node);
-
-        tTJSExprNode *GetCurrentNode();
-
-        void PopCurrentNode();
-
-        tTJSExprNode *MakeConstValNode(const tTJSVariant &val);
-
-        tTJSExprNode *MakeNP0(tjs_int opecode);
-
-        tTJSExprNode *MakeNP1(tjs_int opecode, tTJSExprNode *node1);
-
-        tTJSExprNode *MakeNP2(tjs_int opecode, tTJSExprNode *node1,
-                              tTJSExprNode *node2);
-
-        tTJSExprNode *MakeNP3(tjs_int opecode, tTJSExprNode *node1,
-                              tTJSExprNode *node2, tTJSExprNode *node3);
 
         //----------------------------------------------------------
         // disassembler
@@ -661,6 +231,13 @@ namespace TJS {
         static void TypeOfMemberIndirect(tTJSVariant *ra, const tjs_int32 *code,
                                          tjs_uint32 flags);
 
+        static void _output_func(const tjs_char *msg, const tjs_char *comment,
+                                 tjs_int addr, const tjs_int32 *codestart,
+                                 tjs_int size, void *data);
+
+        static void _output_func_src(const tjs_char *msg, const tjs_char *name,
+                                     tjs_int line, void *data);
+
         tjs_int CallFunction(tTJSVariant *ra, const tjs_int32 *code,
                              tTJSVariant **args, tjs_int numargs);
 
@@ -742,8 +319,7 @@ namespace TJS {
         }
 
         tjs_error DeleteMember(tjs_uint32 flag, const tjs_char *membername,
-                               tjs_uint32 *hint,
-                               iTJSDispatch2 *objthis) override;
+                               tjs_uint32 *hint, iTJSDispatch2 *objthis) override;
 
         tjs_error Invalidate(tjs_uint32 flag, const tjs_char *membername,
                              tjs_uint32 *hint, iTJSDispatch2 *objthis) override;
@@ -793,6 +369,8 @@ namespace TJS {
                              tSourcePos *srcPos, tjs_int srcPosSize,
                              std::vector<tjs_int> &superpointer);
 
+        ~tTJSInterCodeContext() override;
+
         // The source positions of this context: the code positions and the
         // source positions they belong to, sorted by code position. The
         // bytecode writer reads them to write the source section of a
@@ -814,7 +392,6 @@ namespace TJS {
                 TJS_free(SourcePosArray);
             SourcePosArray = srcPos;
             SourcePosArraySize = size;
-            SourcePosArrayCapa = size;
             SourcePosArraySorted = true;
         }
 
@@ -828,6 +405,9 @@ namespace TJS {
         void TJSVariantArrayStackRelease();
 
         tTJSVariantArrayStack *TJSVariantArrayStack = nullptr;
+
+    private:
+        void SortSourcePos();
     };
     //---------------------------------------------------------------------------
 } // namespace TJS

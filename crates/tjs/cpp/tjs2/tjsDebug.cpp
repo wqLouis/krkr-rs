@@ -13,7 +13,7 @@
 #include <algorithm>
 #include "tjsDebug.h"
 #include "tjsHashSearch.h"
-#include "tjsInterCodeGen.h"
+#include "tjsInterCodeContext.h"
 #include "tjsGlobalStringMap.h"
 
 namespace TJS {

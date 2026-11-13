@@ -13,7 +13,7 @@
 #include "tjsVariantString.h"
 #include "tjsError.h"
 #include "tjsUtils.h"
-#include "tjsLex.h"
+#include "tjsNumberParse.h"
 #include <algorithm>
 
 namespace TJS {

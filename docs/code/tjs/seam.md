@@ -1,8 +1,9 @@
 # The C++ adapter for the Rust script block — step 2 of the VM replacement
 
-**Status:** the specification for step 2. None of it is implemented yet.
-**Scope:** the contract the C++ side must meet once the Rust generator owns the
-front end, and the exact C ABI the Rust side must expose for it.
+**Status:** implemented. The Rust generator owns the front end, and the
+vendored analyser, grammar and generator are gone.
+**Scope:** the contract the C++ side had to meet once the Rust generator owned
+the front end, and the exact C ABI the Rust side had to expose for it.
 
 **Sources of truth.** The reference checkout is the oracle:
 `reference/krkr2/cpp/core/tjs2/`. Every statement below carries a citation of
@@ -951,15 +952,15 @@ image does not carry it.
 |---|---|
 | `crates/tjs/cpp/tjs2/tjsScriptBlock.cpp` | `Parse` (`:437`) becomes the call to the Rust entry plus the adapter (§1.2, §4.4). `SetText` (`:236`) keeps its line table and its top-level execution; it stops building the line table only if the image's table is adopted instead (it must not be). `Compile` (`:664`) is unchanged apart from riding on the new `Parse`. |
 | `crates/tjs/cpp/tjs2/tjsScriptBlock.h` | `Parse`'s signature is unchanged (`reference/…/tjsScriptBlock.h:94`); a private `BuildFromRustImage` is added; the `tjsLex.h` include goes when the analyser's header goes (§7.3). |
-| `crates/tjs/cpp/tjs2/tjsInterCodeGen.cpp` | the **generator half** is deleted: `PutCode` (`:584`), `PutData` (`:638`), `SortSourcePos` (`:693`), `FixCode` (`:702`), `RegisterFunction` (`:881`), `Commit` (`:952`), the whole `GenNodeCode` / `_GenNodeCode` pair (`:1110`, `:2724`), the nest / jump / fix bookkeeping (`EnterWhileCode` … `AddFunctionDeclArgCollapse`), the `MakeNP*` node builders (`:3800` …), and the `tTJSExprNode` class (`tjsInterCodeGen.h:181-234`). The **executor half** stays. |
-| `crates/tjs/cpp/tjs2/tjsInterCodeGen.h` | the class shrinks to what the executor and the adapter need: the code area, the constant area, the source positions, the counts, the relations and the `tSourcePos` record. `tTJSExprNode` goes; `tSubParam` goes; the compile-time fields go; the VM codes stay in `crates/tjs/cpp/tjs2/tjsVMCodes.h` (the vendored tree already moved them out of this header). |
-| `crates/tjs/cpp/tjs2/tjsLex.cpp`, `tjsLex.h` | the analyser goes. `tjsLex.h` also declares `tTJSLexicalAnalyzer`, which `tjsScriptBlock.h` includes — that include must go with it. The date literal parser (`tjsDateParser.cpp`, `bison/tjsdate.y`) and the preprocessor's expression parser (`bison/tjspp.y`, `tjsCompileControl.cpp`) are **not** part of the script front end and stay. |
-| `crates/tjs/cpp/tjs2/bison/tjs.y` | the script grammar goes. `bison/tjspp.y` and `bison/tjsdate.y` stay. |
+| `crates/tjs/cpp/tjs2/tjsInterCodeContext.cpp`, `.h` (they replace `tjsInterCodeGen.cpp`, `.h`) | the **generator half** is deleted: `PutCode` (`:584`), `PutData` (`:638`), `FixCode` (`:702`), `RegisterFunction` (`:881`), `Commit` (`:952`), the whole `GenNodeCode` / `_GenNodeCode` pair (`:1110`, `:2724`), the nest / jump / fix bookkeeping (`EnterWhileCode` … `AddFunctionDeclArgCollapse`), the `MakeNP*` node builders (`:3800` …), and the `tTJSExprNode` class (`tjsInterCodeGen.h:181-234`). The **executor half** moves into the new files: the class keeps the code area, the constant area, the source positions, the counts, the relations and the `tSourcePos` record. `tTJSExprNode` goes; `tSubParam` goes; the compile-time fields go; the VM codes stay in `crates/tjs/cpp/tjs2/tjsVMCodes.h` (the vendored tree already moved them out of that header). |
+| `crates/tjs/cpp/tjs2/tjsNumberParse.cpp`, `.h` (new) | `TJSParseNumber` and `TJSHexNum` move out of the analyser: the variant's own conversions (`tjsVariant.cpp`, `tjsVariantString.cpp`) and the random generator's state reader (`tjsRandomGenerator.cpp`) need them. The number parsing itself is unchanged. |
+| `crates/tjs/cpp/tjs2/tjsLex.cpp`, `tjsLex.h` | the analyser goes. `tjsLex.h` also declares `tTJSLexicalAnalyzer`, which `tjsScriptBlock.h` includes — that include goes with it. The date literal parser (`tjsDateParser.cpp`, `bison/tjsdate.y`) stays. The preprocessor's expression parser (`bison/tjspp.y`, `tjsCompileControl.cpp`) is reachable only through the analyser, so it goes with it; the conditional compilation is the Rust front end's (`crates/tjs/src/vm/lexer/preprocess.rs`). |
+| `crates/tjs/cpp/tjs2/bison/tjs.y` | the script grammar goes. `bison/tjspp.y` goes with it — the analyser was its only entry. `bison/tjsdate.y` stays. |
 | `crates/tjs/cpp/tjs2_codegen.h` | the shipped seam's header: the compile entry, the extended image records (`parent`, `prop_setter`, `prop_getter`, `super_class_getter`, `super_class_getter_pointer`, `properties`, `top_level`) and the `TJS2_CG_VALUE_CONTEXT` / `TJS2_CG_VALUE_NULL` constant kinds. |
 | `crates/tjs/src/vm/mod.rs` | the Rust side of the same seam: `tjs2_script_compile` and its accessors. |
 | `crates/tjs/src/vm/codegen/ffi.rs` | the image records the same seam carries. |
 | `crates/tjs/src/vm/parser/` | the parser column (it does not exist yet; see `docs/code/tjs/columns.md` §1). |
-| `crates/tjs/build.rs` | the bison step drops `tjs.y` (`:96`, `:470-478`, `:553`); the source list drops `tjsLex.cpp` (`:62`); the Rust codegen object is linked. |
+| `crates/tjs/build.rs` | the bison step drops `tjs.y` and `tjspp.y` (`:96`, `:470-478`, `:553`); the source list drops `tjsLex.cpp`, `tjsInterCodeGen.cpp`, `tjsCompileControl.cpp` and `tjsNamespace.cpp` (`:62`) and adds `tjsInterCodeContext.cpp` and `tjsNumberParse.cpp`; the Rust codegen object is linked. |
 | `crates/tjs/cpp/tjs2_abi.cpp`, `tjs2_abi.h` | unchanged — `tjs2_exec_script` and `tjs2_compile_script` reach the same `SetText` / `Compile` and inherit the new behaviour. |
 | `scripts/krkr_gates/checks/layering.py` | the reviewed FFI location list names the seam file: `crates/tjs/src/vm/mod.rs`. |
 
@@ -995,20 +996,27 @@ The differences that bear on this design (the reference wins):
 
 ## 9. A checklist for the implementer
 
-- [ ] `tjs2_script_compile` returns a handle for **every** input, success or
+Every item below is met; the tree is the evidence.
+
+- [x] `tjs2_script_compile` returns a handle for **every** input, success or
       failure; the failure carries the message, the position and the count.
-- [ ] The image's contexts are in **creation order**; the block's top level is
+      The handle of a panic is a handle too, and the failure is read back
+      through `tjs2_script_error_message`, `tjs2_script_error_position` and
+      `tjs2_script_error_count`.
+- [x] The image's contexts are in **creation order**; the block's top level is
       named by an index.
-- [ ] Every context's code, constants and source positions are **copied** into
+- [x] Every context's code, constants and source positions are **copied** into
       C++-owned storage; the image is freed with `tjs2_script_free`.
-- [ ] The context-valued constants and the member registrations are resolved
+- [x] The context-valued constants and the member registrations are resolved
       **after** all the contexts exist and **after** the relations are linked.
-- [ ] The image's source-position tables are sorted; the C++ passes
+- [x] The image's source-position tables are sorted; the C++ passes
       `srcsorted = true`.
-- [ ] The image's line table agrees with the block's own; a mismatch is a
+- [x] The image's line table agrees with the block's own; a mismatch is a
       hard error, not a silent substitution.
-- [ ] The C++ side runs **no** part of §5.1.
-- [ ] The bytecode export path (`tjs2_compile_script`) still produces a file
+- [x] The C++ side runs **no** part of §5.1. `tTJSScriptBlock::Parse` calls
+      the Rust front end and nothing else; the analyser, the grammar and the
+      generator are gone from the tree.
+- [x] The bytecode export path (`tjs2_compile_script`) still produces a file
       the loader can read back.
 
 ## 10. The gate the switch must pass
@@ -1032,5 +1040,30 @@ Identical images give identical behaviour by construction. A field that
 differs is a defect and not a tolerance: it is closed, or the switch does
 not land.
 
-The proof instrument that measures this stays in the tree. It is the
-regression net for the front end that replaces the vendored one.
+### 10.1 The gate the switch passed
+
+The switch landed with the measure above met: 172 of 172 comparable scripts
+compile to the same image, every context of every script matches the
+reference's field for field, the constant inline objects match in contents,
+ordering, values and identity, the conditional-compilation values round-trip
+between compiles, and the end-to-end suite is green.
+
+The proof instrument that measured this is **gone with the front end it
+proved**: it compared the two front ends, and there is only one now. The
+**permanent** net is the corpus digest
+(`crates/tjs/tests/fixtures/corpus_digest.txt`), which records the digest of
+every script's canonical form as the vendored front end produced it, and
+fails when the front end's output moves. The corpus grew to 279 scripts: the
+game's own 175 and the 104 the scenario containers render as TJS source.
+
+### 10.2 The differential fuzzer
+
+The corpus cannot reach every construct, so a differential fuzzer compared
+the two front ends over inputs nobody wrote: the mutations of the corpus's
+own scripts and the fragments a small grammar of the language's constructs
+makes. It found five divergences the corpus could not reach, and all five
+are closed: the constant fold now raises where the engine raises, a text that
+is not ASCII no longer panics, a long decimal literal is the engine's own
+number, `new X()--` is a syntax error, and a context the parent does not
+hold is released when its scope ends. The fuzzer is a finding tool rather
+than a gate, and it stops with the front end it compared.

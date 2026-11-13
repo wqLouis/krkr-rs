@@ -13,7 +13,7 @@
 #include <cstring>
 
 #include "tjsInterCodeExec.h"
-#include "tjsInterCodeGen.h"
+#include "tjsInterCodeContext.h"
 #include "tjsScriptBlock.h"
 #include "tjsError.h"
 #include "tjs.h"
@@ -24,6 +24,7 @@
 #include "tjsOctPack.h"
 #include "tjsGlobalStringMap.h"
 #include <csignal>
+#include <exception>
 #include <set>
 #include <mutex>
 
@@ -633,7 +634,7 @@ namespace TJS {
 
     //---------------------------------------------------------------------------
     // tTJSInterCodeContext ( class definitions are in
-    // tjsInterCodeGen.h )
+    // tjsInterCodeContext.h )
     //---------------------------------------------------------------------------
     void tTJSInterCodeContext::ExecuteAsFunction(iTJSDispatch2 *objthis,
                                                  tTJSVariant **args,
@@ -1316,7 +1317,7 @@ namespace TJS {
                 DisplayExceptionGeneratedCode(codesave - CodeArea, ra_org);
             }
             TJS_eTJSScriptError(e.getMessage(), this, codesave - CodeArea);
-        } catch(exception &e) {
+        } catch(std::exception &e) {
             if(tryCatch) {
                 spdlog::get("tjs2")->debug(e.what());
             } else {

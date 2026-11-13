@@ -61,12 +61,10 @@ impl ContextType {
     /// Whether the block holds a context of this kind inside a context
     /// of the given kind.
     ///
-    /// The reference's `RegisterFunction` holds a child context in the
-    /// parent's constant area, registers it as a member of the parent's
-    /// object, or links it to the parent as a property's setter or
-    /// getter. A context the parent does not hold is released when its
-    /// scope ends, and it leaves the block
-    /// (reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:886-947, :394).
+    /// A child context is held by the parent's constant area, is registered
+    /// as a member of the parent's object, or is linked to the parent as a
+    /// property's setter or getter. A context the parent does not hold is
+    /// released when its scope ends, and it leaves the block.
     pub fn block_holds(self, parent: Option<ContextType>) -> bool {
         match self {
             // the top level is the block itself

@@ -12,8 +12,7 @@
 #define tjsScriptBlockH
 
 #include "tjsInterface.h"
-#include "tjsInterCodeGen.h"
-#include "tjsLex.h"
+#include "tjsInterCodeContext.h"
 #include "tjs.h"
 
 #include <list>
@@ -40,12 +39,6 @@ namespace TJS {
         tjs_int LineOffset;
 
         std::list<tTJSInterCodeContext *> InterCodeContextList;
-
-        std::stack<tTJSInterCodeContext *> ContextStack;
-
-        tTJSLexicalAnalyzer *LexicalAnalyzer;
-
-        tTJSInterCodeContext *InterCodeContext;
 
         std::vector<tjs_int> LineVector;
         std::vector<tjs_int> LineLengthVector;
@@ -95,25 +88,9 @@ namespace TJS {
         // source has.
         void SetSourceText(const tjs_char *text);
 
-        void PushContextStack(const tjs_char *name, tTJSContextType type);
-        void PopContextStack();
         void Parse(const tjs_char *script, bool isexpr, bool resultneeded);
 
-        // PROOF INSTRUMENT (not part of the shipped tree): the compiler's
-        // own path, for the comparison with the adapter's.
-        void ParseReference(const tjs_char *script, bool isexpr,
-                            bool resultneeded);
-
-        // PROOF INSTRUMENT (not part of the shipped tree): the contexts of
-        // the block, in the block's order.
-        const std::list<tTJSInterCodeContext *> &GetContextList() const {
-            return InterCodeContextList;
-        }
-
         void SetFirstError(const tjs_char *error, tjs_int pos);
-
-        tTJSLexicalAnalyzer *GetLexicalAnalyzer() { return LexicalAnalyzer; }
-        tTJSInterCodeContext *GetCurrentContext() { return InterCodeContext; }
 
         [[nodiscard]] const tjs_char *GetName() const { return Name; }
         void SetName(const tjs_char *name, tjs_int lineofs);

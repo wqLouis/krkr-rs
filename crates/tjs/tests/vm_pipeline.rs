@@ -406,7 +406,7 @@ fn a_syntax_error_carries_the_reference_message() {
 /// The analyser's own failure carries its own message
 /// (`reference/cpp/core/tjs2/tjsError.h:285`) and its own place, and it
 /// is reported through the error handler
-/// (`crates/tjs/cpp/tjs2/tjsLex.cpp:1841-1844`).
+/// (`reference/cpp/core/tjs2/tjsLex.cpp:1841-1844`).
 #[test]
 fn a_lexical_failure_carries_the_reference_message() {
     // a comment that is never ended

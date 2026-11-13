@@ -23,7 +23,6 @@
 #include "tjsException.h"
 #include "tjsInterCodeExec.h"
 #include "tjsScriptCache.h"
-#include "tjsLex.h"
 #include "tjsHashSearch.h"
 #include "tjsRandomGenerator.h"
 #include "tjsGlobalStringMap.h"
@@ -104,9 +103,6 @@ namespace TJS {
         // ensure variant array stack for function stack
         //	TJSVariantArrayStackAddRef();
         VariantArrayStack = new tTJSVariantArrayStack;
-
-        // ensure hash table for reserved words
-        TJSReservedWordsHashAddRef();
 
         // AddRef create global string map object
         TJSAddRefGlobalStringMap();
@@ -213,8 +209,6 @@ namespace TJS {
 
         delete PPValues;
         delete Cache;
-
-        TJSReservedWordsHashRelease();
 
         TJSReleaseGlobalStringMap();
 

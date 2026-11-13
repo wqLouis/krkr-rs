@@ -11,7 +11,7 @@
 #include "tjsCommHead.h"
 
 #include "tjsScriptBlock.h"
-#include "tjsInterCodeGen.h"
+#include "tjsInterCodeContext.h"
 #include "tjsConstArrayData.h"
 #include "tjs.h"
 #include "tjsArray.h"
@@ -33,9 +33,7 @@ namespace TJS {
         Script = nullptr;
         Name = nullptr;
 
-        InterCodeContext = nullptr;
         TopLevelContext = nullptr;
-        LexicalAnalyzer = nullptr;
 
         UsingPreProcessor = false;
 
@@ -59,9 +57,7 @@ namespace TJS {
         LineOffset = lineoffset;
         Script = nullptr;
 
-        InterCodeContext = nullptr;
         TopLevelContext = nullptr;
-        LexicalAnalyzer = nullptr;
 
         UsingPreProcessor = false;
 
@@ -72,14 +68,9 @@ namespace TJS {
     tTJSScriptBlock::~tTJSScriptBlock() {
         if(TopLevelContext)
             TopLevelContext->Release(), TopLevelContext = nullptr;
-        while(!ContextStack.empty()) {
-            ContextStack.top()->Release();
-            ContextStack.pop();
-        }
 
         Owner->RemoveScriptBlock(this);
 
-        delete LexicalAnalyzer;
         delete[] Script;
         delete[] Name;
 
@@ -257,63 +248,7 @@ namespace TJS {
         try {
 
             // parse and execute
-#ifdef TJS_DEBUG_PROFILE_TIME
-            {
-                tTJSTimeProfiler p(parsetime);
-#endif
-
-                Parse(text, isexpression, result != nullptr);
-
-#ifdef TJS_DEBUG_PROFILE_TIME
-            }
-
-            {
-                char buf[256];
-                TJS_nsprintf(buf, "parsing : %d", parsetime);
-                OutputDebugString(buf);
-                if(parsetime) {
-                    TJS_nsprintf(buf, "Commit : %d (%d%%)", time_Commit,
-                                 time_Commit * 100 / parsetime);
-                    OutputDebugString(buf);
-                    TJS_nsprintf(buf, "yylex : %d (%d%%)", time_yylex,
-                                 time_yylex * 100 / parsetime);
-                    OutputDebugString(buf);
-                    TJS_nsprintf(buf, "MakeNP : %d (%d%%)", time_make_np,
-                                 time_make_np * 100 / parsetime);
-                    OutputDebugString(buf);
-                    TJS_nsprintf(buf, "GenNodeCode : %d (%d%%)",
-                                 time_GenNodeCode,
-                                 time_GenNodeCode * 100 / parsetime);
-                    OutputDebugString(buf);
-                    TJS_nsprintf(buf, "  PutCode : %d (%d%%)", time_PutCode,
-                                 time_PutCode * 100 / parsetime);
-                    OutputDebugString(buf);
-                    TJS_nsprintf(buf, "  PutData : %d (%d%%)", time_PutData,
-                                 time_PutData * 100 / parsetime);
-                    OutputDebugString(buf);
-                    TJS_nsprintf(buf, "  this_proxy : %d (%d%%)",
-                                 time_this_proxy,
-                                 time_this_proxy * 100 / parsetime);
-                    OutputDebugString(buf);
-
-                    TJS_nsprintf(buf, "ns::Push : %d (%d%%)", time_ns_Push,
-                                 time_ns_Push * 100 / parsetime);
-                    OutputDebugString(buf);
-                    TJS_nsprintf(buf, "ns::Pop : %d (%d%%)", time_ns_Pop,
-                                 time_ns_Pop * 100 / parsetime);
-                    OutputDebugString(buf);
-                    TJS_nsprintf(buf, "ns::Find : %d (%d%%)", time_ns_Find,
-                                 time_ns_Find * 100 / parsetime);
-                    OutputDebugString(buf);
-                    TJS_nsprintf(buf, "ns::Remove : %d (%d%%)", time_ns_Remove,
-                                 time_ns_Remove * 100 / parsetime);
-                    OutputDebugString(buf);
-                    TJS_nsprintf(buf, "ns::Commit : %d (%d%%)", time_ns_Commit,
-                                 time_ns_Commit * 100 / parsetime);
-                    OutputDebugString(buf);
-                }
-            }
-#endif
+            Parse(text, isexpression, result != nullptr);
 
 #ifdef TJS_DEBUG_DISASM
             std::list<tTJSInterCodeContext *>::iterator i =
@@ -332,10 +267,6 @@ namespace TJS {
             if(InterCodeContextList.size() != 1) {
                 if(TopLevelContext)
                     TopLevelContext->Release(), TopLevelContext = nullptr;
-                while(ContextStack.size()) {
-                    ContextStack.top()->Release();
-                    ContextStack.pop();
-                }
             }
             throw;
         }
@@ -346,10 +277,6 @@ namespace TJS {
             // release all contexts and global at this time
             if(TopLevelContext)
                 TopLevelContext->Release(), TopLevelContext = nullptr;
-            while(ContextStack.size()) {
-                ContextStack.top()->Release();
-                ContextStack.pop();
-            }
         }
     }
 
@@ -375,10 +302,6 @@ namespace TJS {
             if(InterCodeContextList.size() != 1) {
                 if(TopLevelContext)
                     TopLevelContext->Release(), TopLevelContext = nullptr;
-                while(ContextStack.size()) {
-                    ContextStack.top()->Release();
-                    ContextStack.pop();
-                }
             }
             throw;
         }
@@ -389,10 +312,6 @@ namespace TJS {
             // release all contexts and global at this time
             if(TopLevelContext)
                 TopLevelContext->Release(), TopLevelContext = nullptr;
-            while(ContextStack.size()) {
-                ContextStack.top()->Release();
-                ContextStack.pop();
-            }
         }
     }
 
@@ -411,32 +330,6 @@ namespace TJS {
             ConsoleOutput(str, (void *)this);
 #endif
         }
-    }
-
-    //---------------------------------------------------------------------------
-    void tTJSScriptBlock::PushContextStack(const tjs_char *name,
-                                           tTJSContextType type) {
-        tTJSInterCodeContext *cntx;
-        cntx = new tTJSInterCodeContext(InterCodeContext, name, this, type);
-        if(InterCodeContext == nullptr) {
-            if(TopLevelContext)
-                TJS_eTJSError(TJSInternalError);
-            TopLevelContext = cntx;
-            TopLevelContext->AddRef();
-        }
-        ContextStack.push(cntx);
-        InterCodeContext = cntx;
-    }
-
-    //---------------------------------------------------------------------------
-    void tTJSScriptBlock::PopContextStack() {
-        InterCodeContext->Commit();
-        InterCodeContext->Release();
-        ContextStack.pop();
-        if(!ContextStack.empty())
-            InterCodeContext = ContextStack.top();
-        else
-            InterCodeContext = nullptr;
     }
 
     //---------------------------------------------------------------------------
@@ -936,36 +829,6 @@ namespace TJS {
     }
 
     //---------------------------------------------------------------------------
-    // PROOF INSTRUMENT (not part of the shipped tree): the compiler's own
-    // path, for the comparison with the adapter's.
-    //---------------------------------------------------------------------------
-    void tTJSScriptBlock::ParseReference(const tjs_char *script, bool isexpr,
-                                         bool resultneeded) {
-        if(!script)
-            return;
-
-        CompileErrorCount = 0;
-
-        LexicalAnalyzer =
-            new tTJSLexicalAnalyzer(this, script, isexpr, resultneeded);
-
-        try {
-            parser{ this }.parse();
-        } catch(...) {
-            delete LexicalAnalyzer;
-            LexicalAnalyzer = nullptr;
-            throw;
-        }
-
-        delete LexicalAnalyzer;
-        LexicalAnalyzer = nullptr;
-
-        if(CompileErrorCount) {
-            TJS_eTJSScriptError(FirstError, this, FirstErrorPos);
-        }
-    }
-
-    //---------------------------------------------------------------------------
     void tTJSScriptBlock::SetFirstError(const tjs_char *error, tjs_int pos) {
         if(CompileErrorCount == 0) {
             FirstError = error;
@@ -1183,10 +1046,6 @@ namespace TJS {
             if(InterCodeContextList.size() != 1) {
                 if(TopLevelContext)
                     TopLevelContext->Release(), TopLevelContext = nullptr;
-                while(!ContextStack.empty()) {
-                    ContextStack.top()->Release();
-                    ContextStack.pop();
-                }
             }
             tTJSInterCodeContext::IsBytecodeCompile = false;
             throw;
@@ -1194,10 +1053,6 @@ namespace TJS {
         if(InterCodeContextList.size() != 1) {
             if(TopLevelContext)
                 TopLevelContext->Release(), TopLevelContext = nullptr;
-            while(!ContextStack.empty()) {
-                ContextStack.top()->Release();
-                ContextStack.pop();
-            }
         }
         tTJSInterCodeContext::IsBytecodeCompile = false;
     }

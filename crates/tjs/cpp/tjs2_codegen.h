@@ -6,8 +6,8 @@
     script block, context by context. The executor runs a context's
     code stream and its size, and reads the constant area, the variable
     and argument counts and the labels beside it
-    (crates/tjs/cpp/tjs2/tjsInterCodeGen.h:293-295, GetCodeSize() at :435,
-    the code read at crates/tjs/cpp/tjs2/tjsInterCodeExec.cpp:862).
+    (crates/tjs/cpp/tjs2/tjsInterCodeContext.h:364-366, GetCodeSize() at
+    :129, the code read at crates/tjs/cpp/tjs2/tjsInterCodeExec.cpp:863).
 
     The entry catches a panic and reports it as an error value; no entry
     point unwinds into the C++ caller.

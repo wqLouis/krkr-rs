@@ -121,10 +121,11 @@ still does what it did when the fixture was written.
 
 The shipped scripts' digests were recorded through the compile step while the
 tree's own analyser, grammar and generator took it. The generated scripts'
-digests were recorded through `tTJSScriptBlock::ParseReference` — the same
-analyser, grammar and generator, which the tree still carries and which the
-VM's compile step does not take. The recorder writes the canonical form of
-the block that path compiles, and the digest is the hash of that text.
+digests were recorded through the compiler's own path — the same analyser,
+grammar and generator, which the tree carried when the fixture was written
+and which the VM's compile step does not take. The recorder writes the
+canonical form of the block that path compiles, and the digest is the hash of
+that text.
 
 ## 4. The check
 

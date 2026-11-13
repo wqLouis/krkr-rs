@@ -16,7 +16,7 @@
 //!
 //! A `with(obj)` block stores the *value* of `obj` in a frame register
 //! (`T_WITHDOT_PROXY` returns `data.RefRegister`,
-//! `crates/tjs/cpp/tjs2/tjsInterCodeGen.cpp:2523-2534`; `EnterWithCode`
+//! `reference/cpp/core/tjs2/tjsInterCodeGen.cpp:2523-2534`; `EnterWithCode`
 //! writes it at `:3309-3330`). Every `.member` inside the block is compiled
 //! against that register. If the register holds a variant whose `ObjThis` is
 //! not the intended object — e.g. `null`, or an owner bound by a class-member
@@ -332,7 +332,7 @@ fn with_write_from_a_foreign_subclass_receiver_routes_to_the_member_object() {
 /// subclass instance).
 ///
 /// The class body's field initializer stores the `new` variant `(obj, obj)`
-/// through `VM_SPDS` (`crates/tjs/cpp/tjs2/tjsInterCodeGen.cpp:2850-2888`),
+/// through `VM_SPDS` (`reference/cpp/core/tjs2/tjsInterCodeGen.cpp:2850-2888`),
 /// so the class-field object keeps its own `ObjThis` and the native `volume`
 /// setter reaches the field object's mixer channel.
 #[test]

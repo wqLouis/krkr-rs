@@ -1250,7 +1250,7 @@ fn eval_storage_runs_a_script_shaped_storage() {
     // A game loads its own class definitions through the same member
     // (`reference/cpp/core/base/ScriptMgnIntf.cpp:713-729`). The TJS2's
     // expression mode compiles the text as `return <text>;`
-    // (`crates/tjs/cpp/tjs2/tjsLex.cpp:1676-1681`), so a script-shaped
+    // (`reference/cpp/core/tjs2/tjsLex.cpp:1676-1681`), so a script-shaped
     // storage — a class or a function definition — is a grammar error there
     // and has to run as a script.
     std::fs::write(

@@ -15,7 +15,7 @@
 #include "tjsError.h"
 #include "tjsRandomGenerator.h"
 #include "tjsDictionary.h"
-#include "tjsLex.h"
+#include "tjsNumberParse.h"
 
 namespace TJS {
     //---------------------------------------------------------------------------

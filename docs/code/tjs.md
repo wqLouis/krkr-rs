@@ -20,8 +20,8 @@ instance and drives it; see [vm.md](vm.md) and
 
 | piece | where |
 |---|---|
-| the vendored C++ sources | `crates/tjs/cpp/tjs2/` — 35 `.cpp` and 38 `.h` |
-| the three bison grammars | `crates/tjs/cpp/tjs2/bison/` (`tjs.y`, `tjsdate.y`, `tjspp.y`) |
+| the vendored C++ sources | `crates/tjs/cpp/tjs2/` — 32 `.cpp` and 37 `.h` |
+| the bison grammar | `crates/tjs/cpp/tjs2/bison/` (`tjsdate.y`) |
 | the C ABI shim | `crates/tjs/cpp/tjs2_abi.cpp` and `tjs2_abi.h` |
 | the port-authored C++ | `crates/tjs/cpp/streams.cpp` — the TJS stream IO |
 | the Rust binding | `crates/tjs/src/lib.rs` — the `tjs2_*` `extern "C"` surface and the safe wrapper |
@@ -43,7 +43,7 @@ oracle.
 1. `zig build` in `../../deps` fetches the header-only `fmt` / `spdlog` /
    `boost` and the **oniguruma** regex library, staging them into
    `$OUT_DIR/zig-out`;
-2. the three bison grammars are parsed into `$OUT_DIR/gen`;
+2. the date grammar is parsed into `$OUT_DIR/gen`;
 3. `python3 script/create_world_map.py` generates the date word map;
 4. the vendored sources, the generated parsers and the two shims are
    compiled (`-std=c++17 -fPIC`) into objects, archived into
