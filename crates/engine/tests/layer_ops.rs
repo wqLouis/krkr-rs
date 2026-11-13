@@ -14,7 +14,7 @@ use engine::layer_ops::{
     gaussian_blur, operate_rect, render_layer_subtree, stretch_blit, tile_rect,
 };
 use engine::raster::fill_rect_replace;
-use engine::scene::Rect;
+use engine::scene::{Rect, TransitionFrame, TransitionSource};
 use engine::trans::Trans;
 
 fn bitmap(width: u32, height: u32, rgba: Vec<u8>) -> BitmapState {
@@ -688,10 +688,11 @@ fn render_layer_subtree_falls_back_from_a_stale_nested_cache() {
 }
 
 /// `Scene::update_layer` skips all invalidation when its closure reports no
-/// change: the layer's subtree cache and every caching ancestor's stay clean
-/// and `Scene::structure_revision` does not advance. The reference guards a
-/// property write the same way, comparing the requested value with the stored
-/// one before it invalidates (`tTJSNI_BaseLayer::SetVisible`,
+/// change: the layer's contribution stays what it was, so the subtree cache
+/// and every caching ancestor's stay clean and `Scene::structure_revision`
+/// does not advance. The reference guards a property write the same way,
+/// comparing the requested value with the stored one before it invalidates
+/// (`tTJSNI_BaseLayer::SetVisible`,
 /// `reference/cpp/core/visual/LayerIntf.cpp:1183`).
 #[test]
 fn update_layer_unchanged_write_does_not_invalidate() {
@@ -710,9 +711,8 @@ fn update_layer_unchanged_write_does_not_invalidate() {
         }),
         Some(true)
     );
-    for layer in &mut scene.layers {
-        layer.cache_recalc = false;
-    }
+    let epoch = scene.layer(child).unwrap().content_epoch;
+    let parent_epoch = scene.layer(parent).unwrap().content_epoch;
     let revision = scene.structure_revision();
     // The second write receives the stored value: the guard skips `Update()`
     // and `Parent->NotifyChildrenVisualStateChanged()`
@@ -732,30 +732,56 @@ fn update_layer_unchanged_write_does_not_invalidate() {
         revision,
         "a no-op write bumps no revision"
     );
-    assert!(!scene.layer(child).unwrap().cache_recalc);
-    assert!(!scene.layer(parent).unwrap().cache_recalc);
+    assert_eq!(
+        scene.layer(child).unwrap().content_epoch,
+        epoch,
+        "a no-op write advances no contribution"
+    );
+    assert_eq!(
+        scene.layer(parent).unwrap().content_epoch,
+        parent_epoch,
+        "a no-op write advances no contribution in the ancestors either"
+    );
 }
 
-/// A write that changes the value still invalidates: the layer and every
-/// caching ancestor are marked for recomposite and the revision advances, so
-/// the host re-projects. `reference/cpp/core/visual/LayerIntf.cpp:1190-1193`
-/// (`SetVisible` calls `Update()` then notifies the parent).
+/// A write that changes the value still invalidates: the layer's
+/// contribution advances, so the layer and every caching ancestor are
+/// recomposited, and the revision advances, so the host re-projects.
+/// `reference/cpp/core/visual/LayerIntf.cpp:1190-1193` (`SetVisible` calls
+/// `Update()` then notifies the parent).
 #[test]
 fn update_layer_changed_write_marks_subtree_and_ancestors() {
     let mut scene = Scene::default();
-    let win = scene.add_window("t", (1, 1));
+    let win = scene.add_window("t", (2, 2));
     let parent = scene.add_layer(win, None);
-    let child = scene.add_layer(win, Some(parent));
-    for layer in &mut scene.layers {
-        layer.cache_recalc = false;
+    let parent_image = scene.add_bitmap(2, 2, vec![1u8; 16]);
+    {
+        let layer = scene.layer_mut(parent).expect("the parent");
+        layer.rect = Rect::new(0, 0, 2, 2);
+        layer.visible = true;
+        layer.bitmap = Some(parent_image);
     }
+    let child = scene.add_layer(win, Some(parent));
+    let child_image = scene.add_bitmap(2, 2, vec![2u8; 16]);
+    {
+        let layer = scene.layer_mut(child).expect("the child");
+        layer.rect = Rect::new(0, 0, 2, 2);
+        layer.visible = true;
+        layer.bitmap = Some(child_image);
+    }
+    // The parent's content is composited, so the write that follows has to
+    // composite it again: the parent's signature holds the child's
+    // contribution, and the write advances it.
+    let content = render_layer_subtree(&mut scene, parent).expect("the parent's content");
+    let generation = scene.bitmap(content).expect("the parent's content").content_generation;
+    let epoch = scene.layer(child).unwrap().content_epoch;
     let revision = scene.structure_revision();
     assert_eq!(
         scene.update_layer(child, |layer| {
-            if layer.visible {
+            if layer.opacity == 0.5 {
                 return false;
             }
-            layer.visible = true;
+            layer.opacity = 0.5;
             true
         }),
         Some(true)
@@ -764,8 +790,20 @@ fn update_layer_changed_write_marks_subtree_and_ancestors() {
         scene.structure_revision() > revision,
         "a changed write bumps the structural revision"
     );
-    assert!(scene.layer(child).unwrap().cache_recalc);
-    assert!(scene.layer(parent).unwrap().cache_recalc);
+    assert!(
+        scene.layer(child).unwrap().content_epoch > epoch,
+        "a changed write advances the layer's contribution"
+    );
+    let again = render_layer_subtree(&mut scene, parent).expect("the parent's content");
+    assert_eq!(again, content, "the parent keeps its content bitmap");
+    assert!(
+        scene
+            .bitmap(again)
+            .expect("the parent's content")
+            .content_generation
+            > generation,
+        "the caching ancestor is recomposited with the layer that changed"
+    );
 }
 
 /// A missing layer is `None`, distinct from `Some(false)` (an untouched
@@ -1438,5 +1476,215 @@ fn a_stretch_copy_marks_only_the_destination_rectangle() {
         destination.dirty_region,
         Some(PixelRegion::new(2, 3, 8, 6)),
         "only the destination rectangle is marked"
+    );
+}
+
+/// A whole-subtree transition's tick changes the transition's own frame, not
+/// the pixels of its endpoints: the endpoints' composites stay valid, and the
+/// step reads them as they are.
+///
+/// The reference keeps the endpoints' cached bitmaps: `Complete` returns the
+/// cached bitmap untouched while the cache region is empty
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7734-7740`), the
+/// transition's source is read through that cache
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:8186-8199`), and the
+/// transition's per-tick update appends to no region
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6322-6327`).
+#[test]
+fn a_transition_tick_keeps_the_endpoint_composites() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (8, 8));
+    let parent = scene.add_layer(win, None);
+    {
+        let layer = scene.layer_mut(parent).expect("the parent");
+        layer.rect = Rect::new(0, 0, 8, 8);
+        layer.visible = true;
+    }
+    // The KAG shape: the endpoints hold their content in child layers, so
+    // their subtree is not trivial and has a composited content.
+    let dest = scene.add_layer(win, Some(parent));
+    let dest_image = solid_bitmap(&mut scene, 8, 8, [10, 20, 30, 255]);
+    {
+        let layer = scene.layer_mut(dest).expect("the destination");
+        layer.rect = Rect::new(0, 0, 8, 8);
+        layer.visible = true;
+        layer.bitmap = Some(dest_image);
+    }
+    let dest_child = scene.add_layer(win, Some(dest));
+    let dest_child_image = solid_bitmap(&mut scene, 8, 8, [70, 80, 90, 255]);
+    {
+        let layer = scene
+            .layer_mut(dest_child)
+            .expect("the destination's child");
+        layer.rect = Rect::new(0, 0, 8, 8);
+        layer.visible = true;
+        layer.bitmap = Some(dest_child_image);
+    }
+    let source = scene.add_layer(win, Some(parent));
+    let source_image = solid_bitmap(&mut scene, 8, 8, [40, 50, 60, 255]);
+    {
+        let layer = scene.layer_mut(source).expect("the source");
+        layer.rect = Rect::new(0, 0, 8, 8);
+        layer.visible = true;
+        layer.bitmap = Some(source_image);
+    }
+    let source_child = scene.add_layer(win, Some(source));
+    let source_child_image = solid_bitmap(&mut scene, 8, 8, [100, 110, 120, 255]);
+    {
+        let layer = scene.layer_mut(source_child).expect("the source's child");
+        layer.rect = Rect::new(0, 0, 8, 8);
+        layer.visible = true;
+        layer.bitmap = Some(source_child_image);
+    }
+    // The transition enables the cache on both endpoints, as the reference's
+    // `StartTransition` does (`LayerIntf.cpp:7869-7876`).
+    scene.inc_cache_enabled_count(dest);
+    scene.inc_cache_enabled_count(source);
+    let dest_content = render_layer_subtree(&mut scene, dest).expect("the destination content");
+    let source_content = render_layer_subtree(&mut scene, source).expect("the source content");
+    // The parent's own composite is current as well.
+    render_layer_subtree(&mut scene, parent).expect("the parent content");
+    let dest_generation = scene
+        .bitmap(dest_content)
+        .expect("the destination content")
+        .content_generation;
+    let source_generation = scene
+        .bitmap(source_content)
+        .expect("the source content")
+        .content_generation;
+    let dest_epoch = scene.layer(dest).expect("the destination").content_epoch;
+    let source_epoch = scene.layer(source).expect("the source").content_epoch;
+    let parent_epoch = scene.layer(parent).expect("the parent").content_epoch;
+
+    // The first tick's frame.
+    let frame = TransitionFrame::new(
+        (8, 8),
+        true,
+        TransitionSource::new(
+            dest_content,
+            Rect::new(0, 0, 8, 8),
+            Rect::new(0, 0, 8, 8),
+            1.0,
+        ),
+        TransitionSource::new(
+            source_content,
+            Rect::new(0, 0, 8, 8),
+            Rect::new(0, 0, 8, 8),
+            0.5,
+        ),
+    );
+    scene.set_transition_frame(dest, Some(frame));
+    assert_eq!(
+        scene.layer(dest).expect("the destination").content_epoch,
+        dest_epoch,
+        "the frame advances no contribution"
+    );
+    assert_eq!(
+        scene.layer(source).expect("the source").content_epoch,
+        source_epoch,
+        "the frame advances no contribution in the other endpoint either"
+    );
+    assert_eq!(
+        scene.layer(parent).expect("the parent").content_epoch,
+        parent_epoch,
+        "the frame advances no contribution in the caching ancestors either"
+    );
+
+    // The next tick's frame is a new display of the same content.
+    let next = TransitionFrame::new(
+        (8, 8),
+        true,
+        TransitionSource::new(
+            dest_content,
+            Rect::new(0, 0, 8, 8),
+            Rect::new(0, 0, 8, 8),
+            1.0,
+        ),
+        TransitionSource::new(
+            source_content,
+            Rect::new(0, 0, 8, 8),
+            Rect::new(0, 0, 8, 8),
+            0.25,
+        ),
+    );
+    scene.set_transition_frame(dest, Some(next));
+    assert_eq!(
+        scene.layer(dest).expect("the destination").content_epoch,
+        dest_epoch,
+        "the next frame advances no contribution either"
+    );
+
+    // The endpoints' composites are still the ones the frame samples.
+    let dest_again = render_layer_subtree(&mut scene, dest).expect("the destination content");
+    let source_again = render_layer_subtree(&mut scene, source).expect("the source content");
+    assert_eq!(
+        dest_again, dest_content,
+        "the destination keeps its content"
+    );
+    assert_eq!(source_again, source_content, "the source keeps its content");
+    assert_eq!(
+        scene
+            .bitmap(dest_content)
+            .expect("the destination content")
+            .content_generation,
+        dest_generation,
+        "the destination subtree is not recomposited"
+    );
+    assert_eq!(
+        scene
+            .bitmap(source_content)
+            .expect("the source content")
+            .content_generation,
+        source_generation,
+        "the source subtree is not recomposited"
+    );
+}
+
+/// Enabling the cache does not change the layer's content, so it marks no
+/// contribution: the transition's endpoints keep the composites they had.
+///
+/// The reference's `IncCacheEnabledCount` marks the cache's own region, and
+/// the content behind it is the one the layer already had
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:3996-4006`).
+#[test]
+fn enabling_the_cache_keeps_the_composited_content() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (8, 8));
+    let parent = scene.add_layer(win, None);
+    {
+        let layer = scene.layer_mut(parent).expect("the parent");
+        layer.rect = Rect::new(0, 0, 8, 8);
+        layer.visible = true;
+    }
+    let child = scene.add_layer(win, Some(parent));
+    let child_image = solid_bitmap(&mut scene, 8, 8, [10, 20, 30, 255]);
+    {
+        let layer = scene.layer_mut(child).expect("the child");
+        layer.rect = Rect::new(0, 0, 8, 8);
+        layer.visible = true;
+        layer.bitmap = Some(child_image);
+    }
+    let content = render_layer_subtree(&mut scene, parent).expect("the content");
+    let generation = scene
+        .bitmap(content)
+        .expect("the content")
+        .content_generation;
+    let parent_epoch = scene.layer(parent).expect("the parent").content_epoch;
+
+    scene.inc_cache_enabled_count(parent);
+    assert_eq!(
+        scene.layer(parent).expect("the parent").content_epoch,
+        parent_epoch,
+        "enabling the cache advances no contribution"
+    );
+    let again = render_layer_subtree(&mut scene, parent).expect("the content");
+    assert_eq!(again, content, "the content is the same bitmap");
+    assert_eq!(
+        scene
+            .bitmap(content)
+            .expect("the content")
+            .content_generation,
+        generation,
+        "the subtree is not recomposited"
     );
 }

@@ -614,7 +614,8 @@ fn unsupported_transitions_and_media_helpers_raise_typed_errors() {
 /// An unchanged `visible` write is a no-op: the reference guards on
 /// `if(Visible != st)` and skips `Update()` and the parent notify
 /// (`reference/cpp/core/visual/LayerIntf.cpp:1183-1193`), so the scene
-/// revision does not advance and no subtree cache is marked stale. A real
+/// revision does not advance and the layer's contribution does not advance.
+/// A real
 /// hidden<->visible flip still invalidates.
 #[test]
 fn unchanged_visible_write_does_not_invalidate() {
@@ -626,9 +627,7 @@ fn unchanged_visible_write_does_not_invalidate() {
          var l = new Layer(w, null);",
     );
     let id = env.scene.layers.last().expect("the layer").id;
-    for layer in &mut env.scene.layers {
-        layer.cache_recalc = false;
-    }
+    let epoch = env.scene.layer(id).unwrap().content_epoch;
     let before = env.scene.structure_revision();
 
     // hidden -> visible still invalidates.
@@ -638,12 +637,13 @@ fn unchanged_visible_write_does_not_invalidate() {
         env.scene.structure_revision() > before,
         "a hidden->visible write still invalidates"
     );
-    assert!(env.scene.layer(id).unwrap().cache_recalc);
+    assert!(
+        env.scene.layer(id).unwrap().content_epoch > epoch,
+        "the write advances the layer's contribution"
+    );
 
     // The same value written again touches nothing.
-    for layer in &mut env.scene.layers {
-        layer.cache_recalc = false;
-    }
+    let epoch = env.scene.layer(id).unwrap().content_epoch;
     let revision = env.scene.structure_revision();
     env.run("l.visible = true;");
     // reference/cpp/core/visual/LayerIntf.cpp:1183
@@ -652,19 +652,24 @@ fn unchanged_visible_write_does_not_invalidate() {
         revision,
         "an unchanged visible write bumps no revision"
     );
-    assert!(
-        !env.scene.layer(id).unwrap().cache_recalc,
-        "an unchanged visible write marks no cache stale"
+    assert_eq!(
+        env.scene.layer(id).unwrap().content_epoch,
+        epoch,
+        "an unchanged visible write advances no contribution"
     );
 
     // visible -> hidden still invalidates.
+    let epoch = env.scene.layer(id).unwrap().content_epoch;
     env.run("l.visible = false;");
     // reference/cpp/core/visual/LayerIntf.cpp:1187-1193
     assert!(
         env.scene.structure_revision() > revision,
         "a visible->hidden write still invalidates"
     );
-    assert!(env.scene.layer(id).unwrap().cache_recalc);
+    assert!(
+        env.scene.layer(id).unwrap().content_epoch > epoch,
+        "the write advances the layer's contribution"
+    );
 }
 
 /// The reference guards the geometry, opacity and blend property setters on an
@@ -690,9 +695,7 @@ fn unchanged_geometry_opacity_and_blend_writes_are_no_ops() {
         "l.type = 1;",
     ] {
         env.run(write);
-        for layer in &mut env.scene.layers {
-            layer.cache_recalc = false;
-        }
+        let epoch = env.scene.layer(id).unwrap().content_epoch;
         let revision = env.scene.structure_revision();
         env.run(write);
         assert_eq!(
@@ -700,9 +703,10 @@ fn unchanged_geometry_opacity_and_blend_writes_are_no_ops() {
             revision,
             "{write} repeated at the same value bumps no revision"
         );
-        assert!(
-            !env.scene.layer(id).unwrap().cache_recalc,
-            "{write} repeated at the same value marks no cache stale"
+        assert_eq!(
+            env.scene.layer(id).unwrap().content_epoch,
+            epoch,
+            "{write} repeated at the same value advances no contribution"
         );
     }
 }
@@ -721,22 +725,23 @@ fn unchanged_unguarded_property_write_still_invalidates() {
     );
     let id = env.scene.layers.last().expect("the layer").id;
     env.run("l.hitType = 1;");
-    for layer in &mut env.scene.layers {
-        layer.cache_recalc = false;
-    }
+    let epoch = env.scene.layer(id).unwrap().content_epoch;
     let revision = env.scene.structure_revision();
     env.run("l.hitType = 1;");
     assert!(
         env.scene.structure_revision() > revision,
         "an unguarded repeated write bumps revision"
     );
-    assert!(env.scene.layer(id).unwrap().cache_recalc);
+    assert!(
+        env.scene.layer(id).unwrap().content_epoch > epoch,
+        "the write advances the layer's contribution"
+    );
 }
 
 /// `Layer.setPos` guards an unchanged position: the reference's `SetPosition`
 /// enters only `if(Rect.left != left || Rect.top != top)`
 /// (`reference/cpp/core/visual/LayerIntf.cpp:2203-2204`), so writing back the
-/// stored position bumps no revision and marks no cache stale, while a real
+/// stored position bumps no revision and advances no contribution, while a real
 /// move still invalidates. A negative offset is legal on a non-primary layer.
 #[test]
 fn unchanged_set_pos_write_does_not_invalidate() {
@@ -751,14 +756,16 @@ fn unchanged_set_pos_write_does_not_invalidate() {
 
     // A real move invalidates and reads back.
     // reference/cpp/core/visual/LayerIntf.cpp:2204-2216
+    let epoch = env.scene.layer(id).unwrap().content_epoch;
     env.run("l.setPos(5, 7);");
     assert_eq!(env.eval_int("l.left"), 5);
     assert_eq!(env.eval_int("l.top"), 7);
-    assert!(env.scene.layer(id).unwrap().cache_recalc);
+    assert!(
+        env.scene.layer(id).unwrap().content_epoch > epoch,
+        "the write advances the layer's contribution"
+    );
 
-    for layer in &mut env.scene.layers {
-        layer.cache_recalc = false;
-    }
+    let epoch = env.scene.layer(id).unwrap().content_epoch;
     let revision = env.scene.structure_revision();
     env.run("l.setPos(5, 7);");
     // reference/cpp/core/visual/LayerIntf.cpp:2203
@@ -767,9 +774,10 @@ fn unchanged_set_pos_write_does_not_invalidate() {
         revision,
         "an unchanged setPos bumps no revision"
     );
-    assert!(
-        !env.scene.layer(id).unwrap().cache_recalc,
-        "an unchanged setPos marks no cache stale"
+    assert_eq!(
+        env.scene.layer(id).unwrap().content_epoch,
+        epoch,
+        "an unchanged setPos advances no contribution"
     );
 
     // The position guard is not a clamp: a negative move still invalidates.
@@ -801,16 +809,18 @@ fn unchanged_set_pos_with_bounds_write_does_not_invalidate() {
     let id = env.scene.layers.last().expect("the layer").id;
 
     // reference/cpp/core/visual/LayerIntf.cpp:2138-2159
+    let epoch = env.scene.layer(id).unwrap().content_epoch;
     env.run("l.setPos(5, 7, 20, 30);");
     assert_eq!(env.eval_int("l.left"), 5);
     assert_eq!(env.eval_int("l.top"), 7);
     assert_eq!(env.eval_int("l.width"), 20);
     assert_eq!(env.eval_int("l.height"), 30);
-    assert!(env.scene.layer(id).unwrap().cache_recalc);
+    assert!(
+        env.scene.layer(id).unwrap().content_epoch > epoch,
+        "the write advances the layer's contribution"
+    );
 
-    for layer in &mut env.scene.layers {
-        layer.cache_recalc = false;
-    }
+    let epoch = env.scene.layer(id).unwrap().content_epoch;
     let revision = env.scene.structure_revision();
     env.run("l.setPos(5, 7, 20, 30);");
     // reference/cpp/core/visual/LayerIntf.cpp:2121, :2144
@@ -819,7 +829,11 @@ fn unchanged_set_pos_with_bounds_write_does_not_invalidate() {
         revision,
         "an unchanged setPos with bounds bumps no revision"
     );
-    assert!(!env.scene.layer(id).unwrap().cache_recalc);
+    assert_eq!(
+        env.scene.layer(id).unwrap().content_epoch,
+        epoch,
+        "an unchanged write advances no contribution"
+    );
 
     // A new position alone still invalidates with the size unchanged.
     // reference/cpp/core/visual/LayerIntf.cpp:2144-2159
@@ -851,16 +865,18 @@ fn unchanged_set_size_write_does_not_invalidate() {
     let id = env.scene.layers.last().expect("the layer").id;
 
     // reference/cpp/core/visual/LayerIntf.cpp:2122-2139, :2656-2673
+    let epoch = env.scene.layer(id).unwrap().content_epoch;
     env.run("l.setSize(48, 40);");
     assert_eq!(env.eval_int("l.width"), 48);
     assert_eq!(env.eval_int("l.height"), 40);
     assert_eq!(env.eval_int("l.imageWidth"), 48);
     assert_eq!(env.eval_int("l.imageHeight"), 40);
-    assert!(env.scene.layer(id).unwrap().cache_recalc);
+    assert!(
+        env.scene.layer(id).unwrap().content_epoch > epoch,
+        "the write advances the layer's contribution"
+    );
 
-    for layer in &mut env.scene.layers {
-        layer.cache_recalc = false;
-    }
+    let epoch = env.scene.layer(id).unwrap().content_epoch;
     let revision = env.scene.structure_revision();
     env.run("l.setSize(48, 40);");
     // reference/cpp/core/visual/LayerIntf.cpp:2121
@@ -869,9 +885,10 @@ fn unchanged_set_size_write_does_not_invalidate() {
         revision,
         "an unchanged setSize bumps no revision"
     );
-    assert!(
-        !env.scene.layer(id).unwrap().cache_recalc,
-        "an unchanged setSize marks no cache stale"
+    assert_eq!(
+        env.scene.layer(id).unwrap().content_epoch,
+        epoch,
+        "an unchanged setSize advances no contribution"
     );
 
     // A zero extent is a real change; the rect shrinks but the image does not.
@@ -902,9 +919,6 @@ fn unchanged_set_size_to_image_size_write_does_not_invalidate() {
          l.setSize(4, 4);",
     );
     let id = env.scene.layers.last().expect("the layer").id;
-    for layer in &mut env.scene.layers {
-        layer.cache_recalc = false;
-    }
     let revision = env.scene.structure_revision();
 
     // reference/cpp/core/visual/LayerIntf.cpp:8587-8588, :2122-2139
@@ -918,9 +932,7 @@ fn unchanged_set_size_to_image_size_write_does_not_invalidate() {
     assert_eq!(env.eval_int("l.imageWidth"), 32);
     assert_eq!(env.eval_int("l.imageHeight"), 32);
 
-    for layer in &mut env.scene.layers {
-        layer.cache_recalc = false;
-    }
+    let epoch = env.scene.layer(id).unwrap().content_epoch;
     let revision = env.scene.structure_revision();
     env.run("l.setSizeToImageSize();");
     // reference/cpp/core/visual/LayerIntf.cpp:8587, :2121
@@ -929,7 +941,11 @@ fn unchanged_set_size_to_image_size_write_does_not_invalidate() {
         revision,
         "an unchanged setSizeToImageSize bumps no revision"
     );
-    assert!(!env.scene.layer(id).unwrap().cache_recalc);
+    assert_eq!(
+        env.scene.layer(id).unwrap().content_epoch,
+        epoch,
+        "an unchanged write advances no contribution"
+    );
 }
 
 /// `setImagePos` and `setImageSize` already sit behind their reference guards:
@@ -955,9 +971,7 @@ fn unchanged_set_image_pos_and_size_writes_do_not_invalidate() {
     assert_eq!(env.eval_int("l.imageLeft"), -4);
     assert_eq!(env.eval_int("l.imageTop"), -4);
 
-    for layer in &mut env.scene.layers {
-        layer.cache_recalc = false;
-    }
+    let epoch = env.scene.layer(id).unwrap().content_epoch;
     let revision = env.scene.structure_revision();
     env.run("l.setImagePos(-4, -4);");
     // reference/cpp/core/visual/LayerIntf.cpp:2549
@@ -966,11 +980,13 @@ fn unchanged_set_image_pos_and_size_writes_do_not_invalidate() {
         revision,
         "an unchanged setImagePos bumps no revision"
     );
-    assert!(!env.scene.layer(id).unwrap().cache_recalc);
+    assert_eq!(
+        env.scene.layer(id).unwrap().content_epoch,
+        epoch,
+        "an unchanged write advances no contribution"
+    );
 
-    for layer in &mut env.scene.layers {
-        layer.cache_recalc = false;
-    }
+    let epoch = env.scene.layer(id).unwrap().content_epoch;
     let revision = env.scene.structure_revision();
     env.run("l.setImageSize(24, 24);");
     // reference/cpp/core/visual/LayerIntf.cpp:2649-2650
@@ -979,7 +995,11 @@ fn unchanged_set_image_pos_and_size_writes_do_not_invalidate() {
         revision,
         "an unchanged setImageSize bumps no revision"
     );
-    assert!(!env.scene.layer(id).unwrap().cache_recalc);
+    assert_eq!(
+        env.scene.layer(id).unwrap().content_epoch,
+        epoch,
+        "an unchanged write advances no contribution"
+    );
 }
 
 /// A script subclass may touch a native `Layer` member from its class prelude

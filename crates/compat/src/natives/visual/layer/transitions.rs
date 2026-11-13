@@ -1457,7 +1457,7 @@ fn composite_transition(
     let effect: Option<EffectDraw> =
         scene.transition_effect_draw(trans, src1, src2, (w, h), with_children);
     if let Some(effect) = effect {
-        scene.set_effect_for(id, source, Some(effect));
+        scene.set_effect(id, Some(effect));
         scene.set_transition_frame(id, None);
         return Ok(());
     }
@@ -1470,7 +1470,7 @@ fn composite_transition(
         None
     };
     if let Some(frame) = frame {
-        scene.set_transition_frame_for(id, source, Some(frame));
+        scene.set_transition_frame(id, Some(frame));
         return Ok(());
     }
     // The blend needs a frame of its own, distinct from the content it reads,
@@ -1524,8 +1524,14 @@ fn composite_transition(
 /// destination's composited subtree content and the source layer's.
 ///
 /// `render_layer_subtree` returns the composited subtree content, reusing it
-/// while the subtree is unchanged; a trivial layer's content is its MainImage,
-/// which is read as a source and never written.
+/// while the subtree's content signature still matches the one the content
+/// was composited with; a trivial layer's content is its MainImage, which is
+/// read as a source and never written.
+///
+/// A transition's tick changes the transition's own frame, not the pixels of
+/// the two endpoints, so the endpoints' composites stay valid and the step
+/// reads them as they are: the frame is blended from the two composites the
+/// endpoints already hold.
 fn transition_sources_subtree(
     scene: &mut Scene,
     dest: u32,

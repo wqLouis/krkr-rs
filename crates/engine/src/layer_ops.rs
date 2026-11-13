@@ -4339,7 +4339,8 @@ fn alloc_bitmap(scene: &mut Scene, w: u32, h: u32) -> Option<u32> {
 
 /// Allocate `root`'s composited subtree content at `w` x `h`, reusing the
 /// existing one when its size already matches. A newly allocated content is
-/// marked for recomposition.
+/// empty, so the layer's own contribution advances: the content signature no
+/// longer matches what was recorded and the content is composited.
 fn ensure_layer_content(scene: &mut Scene, root: u32, w: u32, h: u32) -> Option<u32> {
     if let Some(id) = scene.layer(root)?.cache_content {
         if scene.bitmap(id).map(|b| (b.width, b.height)) == Some((w, h)) {
@@ -4353,7 +4354,7 @@ fn ensure_layer_content(scene: &mut Scene, root: u32, w: u32, h: u32) -> Option<
     let id = alloc_bitmap(scene, w, h)?;
     let layer = scene.layer_mut_untracked(root)?;
     layer.cache_content = Some(id);
-    layer.cache_recalc = true;
+    layer.content_epoch = layer.content_epoch.wrapping_add(1);
     Some(id)
 }
 
@@ -4426,8 +4427,17 @@ pub fn ensure_transition_self_image(scene: &mut Scene, root: u32, w: u32, h: u32
     Some(id)
 }
 
-/// Sum of the drawn sources' [`BitmapState::content_generation`] for `root`'s
-/// subtree. A descendant whose subtree cache is live contributes the cache's
+/// The content signature of a subtree: the sum of the drawn sources' own
+/// contributions and of their images' content generations.
+///
+/// A source that changed through the layer accessors advances its
+/// [`LayerState::content_epoch`], and a source whose pixels changed behind
+/// them advances its image's [`BitmapState::content_generation`], so the sum
+/// is the subtree's content state in one number: it matches what a composite
+/// recorded while the subtree was unchanged, and stops matching as soon as
+/// the subtree changes.
+///
+/// A descendant whose subtree cache is live contributes the cache's
 /// generation and covers its own descendants, exactly like
 /// [`collect_subtree_draws`], so a change to a hidden layer does not
 /// invalidate the cache while an edit to any drawn image does — including the
@@ -4437,10 +4447,14 @@ pub fn ensure_transition_self_image(scene: &mut Scene, root: u32, w: u32, h: u32
 /// `depth` bounds the nested-cache walk: a parent chain cannot be deeper than
 /// the layer pool, so a malformed cycle stops instead of recursing forever.
 ///
+/// The signature answers one question — whether the composited content is
+/// still the content the tree describes. A transition's tick answers it the
+/// same way: it changes no source, so the signature does not move.
+///
 /// `order` is the paint order of the window the root belongs to. The caller
 /// reads it once and hands it down, so the nested walk does not rebuild it
 /// for every layer it visits.
-fn subtree_source_generation(scene: &Scene, order: &[u32], root: u32, depth: usize) -> u64 {
+fn subtree_content_signature(scene: &Scene, order: &[u32], root: u32, depth: usize) -> u64 {
     if scene.layer(root).is_none() {
         return 0;
     }
@@ -4474,6 +4488,7 @@ fn subtree_source_generation(scene: &Scene, order: &[u32], root: u32, depth: usi
             }
             continue;
         }
+        sum = sum.wrapping_add(layer.content_epoch);
         if let Some(bitmap) = subtree_drawn_image(layer).and_then(|id| scene.bitmap(id)) {
             sum = sum.wrapping_add(bitmap.content_generation);
         }
@@ -4509,12 +4524,12 @@ impl SubtreeSource {
 /// The cache bitmap a descendant layer draws in place of its live subtree.
 ///
 /// The cache is live while a consumer requires it
-/// ([`Scene::inc_cache_enabled_count`]), no change is pending, its content is
-/// up to date with the drawn sources, and it is the composited content rather
-/// than a transition frame. The layer that owns the composite is never its
-/// own source: it is writing that cache. `depth` is the nested-cache walk
-/// depth; past the layer pool a malformed parent cycle is not trusted.
-/// `order` is the paint order of the window, handed down by the caller.
+/// ([`Scene::inc_cache_enabled_count`]), its content is up to date with the
+/// drawn sources, and it is the composited content rather than a transition
+/// frame. The layer that owns the composite is never its own source: it is
+/// writing that cache. `depth` is the nested-cache walk depth; past the
+/// layer pool a malformed parent cycle is not trusted. `order` is the paint
+/// order of the window, handed down by the caller.
 fn live_subtree_cache(
     scene: &Scene,
     layer: &crate::scene::LayerState,
@@ -4524,7 +4539,6 @@ fn live_subtree_cache(
 ) -> Option<u32> {
     if layer.id == root
         || layer.cache_enabled_count == 0
-        || layer.cache_recalc
         || layer.transition_self.is_some()
         || depth >= scene.layers.len()
     {
@@ -4534,8 +4548,8 @@ fn live_subtree_cache(
     if layer.cache_content != Some(cache) {
         return None;
     }
-    let recorded = layer.cache_source_generation;
-    (subtree_source_generation(scene, order, layer.id, depth + 1) == recorded).then_some(cache)
+    let recorded = layer.cache_content_signature;
+    (subtree_content_signature(scene, order, layer.id, depth + 1) == recorded).then_some(cache)
 }
 
 /// What a subtree draw draws.
@@ -5089,12 +5103,9 @@ pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
     // The window's paint order, read once: the composite and the nested
     // cache walk share it instead of rebuilding it for every layer.
     let order = scene.window_layer_order(window);
-    let current_generation = subtree_source_generation(scene, &order, root, 0);
-    let (recalc, recorded) = {
-        let layer = scene.layer(root)?;
-        (layer.cache_recalc, layer.cache_source_generation)
-    };
-    if recalc || current_generation != recorded {
+    let current_signature = subtree_content_signature(scene, &order, root, 0);
+    let recorded = scene.layer(root)?.cache_content_signature;
+    if current_signature != recorded {
         let draws = collect_subtree_draws(scene, &order, root, w, h);
         // The content starts from the layer's backdrop: an opaque layer's
         // content is opaque, every other type's is transparent. The backdrop
@@ -5118,8 +5129,7 @@ pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
         }
         scene.bitmap_mut_untracked(content)?.mark_dirty();
         if let Some(layer) = scene.layer_mut_untracked(root) {
-            layer.cache_recalc = false;
-            layer.cache_source_generation = current_generation;
+            layer.cache_content_signature = current_signature;
         }
     }
     Some(content)

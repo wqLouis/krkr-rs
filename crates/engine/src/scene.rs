@@ -243,16 +243,30 @@ pub struct LayerState {
     /// the transition costs no per-tick pixel work. `None` while no such
     /// transition runs ([`Scene::set_effect`]).
     pub effect: Option<EffectDraw>,
-    /// The subtree content must be recomposited before it is used again.
-    /// Set for this layer and every
-    /// caching ancestor whenever the layer changes, and cleared when the
-    /// content is recomposited.
-    pub cache_recalc: bool,
-    /// Sum of the source images' [`BitmapState::content_generation`] when
-    /// [`Self::cache_content`] was last composited. A change to a drawn
-    /// image that did not go through a layer accessor is detected by
-    /// comparing this value with the current sum.
-    pub cache_source_generation: u64,
+    /// The layer's own contribution to the composited content of its
+    /// ancestors.
+    ///
+    /// The counter advances whenever the layer changes in a way a composite
+    /// sees — its geometry, its visibility, its face, its image placement —
+    /// so the content signature recorded for a subtree that contains it no
+    /// longer matches and the content is recomposited.
+    ///
+    /// The counter is the engine's record that the content changed: a layer
+    /// that did not change keeps its counter, and the composite of a subtree
+    /// that holds it stays reusable. A transition's tick changes the
+    /// transition's own frame and no layer's contribution, so the two
+    /// endpoints' composites stay reusable for the whole transition.
+    pub content_epoch: u64,
+    /// The content signature of the composited subtree: the sum of the drawn
+    /// sources' [`Self::content_epoch`] and their images'
+    /// [`BitmapState::content_generation`], recorded when
+    /// [`Self::cache_content`] was last composited.
+    ///
+    /// A source whose pixels changed behind the layer accessors is caught by
+    /// its image's generation, and a source whose own state changed by the
+    /// accessors by its epoch, so one comparison decides whether the
+    /// composited content is still the content the tree describes.
+    pub cache_content_signature: u64,
     /// The layer's hint (script `layer.hint`) and the hint-system flags.
     pub hint: String,
     /// Whether the layer inherits the parent's hint.
@@ -1145,8 +1159,8 @@ impl Scene {
             transition_self: None,
             transition_frame: None,
             effect: None,
-            cache_recalc: false,
-            cache_source_generation: 0,
+            content_epoch: 0,
+            cache_content_signature: 0,
             hint: String::new(),
             show_parent_hint: false,
             ignore_hint_sensing: false,
@@ -1484,59 +1498,26 @@ impl Scene {
             .is_some_and(|window| window.primary_layer == Some(id))
     }
 
-    /// Mark every layer of `window` as having a stale subtree cache.
+    /// Advance the contribution of every layer of `window`: a window
+    /// mutation can change the root render order, so the layers it holds
+    /// contribute differently to every composite that holds them.
     fn invalidate_window_cache(&mut self, window: u32) {
         for layer in &mut self.layers {
             if layer.window == window {
-                layer.cache_recalc = true;
+                layer.content_epoch = layer.content_epoch.wrapping_add(1);
             }
         }
     }
 
-    /// Mark `id`'s subtree cache and every caching ancestor's as stale
-    /// because this layer changed. A malformed
-    /// parent cycle terminates after the pool of layers is exhausted.
+    /// Advance `id`'s own contribution because this layer changed, so the
+    /// content signature every composite recorded for it no longer matches.
+    ///
+    /// The layer's ancestors hold the layer's contribution in their own
+    /// signatures, so they are recomposited with it; they need no mark of
+    /// their own.
     fn invalidate_layer_cache(&mut self, id: u32) {
         if let Some(layer) = self.layer_mut_untracked(id) {
-            layer.cache_recalc = true;
-        }
-        self.invalidate_ancestor_caches(id);
-    }
-
-    /// Mark every caching ancestor of `id` for recomposite, leaving `id`'s
-    /// own subtree cache alone. A transition advances its own frame every
-    /// tick, but its *sources* (the endpoint subtrees) are unchanged: the
-    /// layer's composited content stays valid even though an ancestor's cache
-    /// has to see the new frame. A malformed parent cycle terminates after the
-    /// pool of layers is exhausted.
-    fn invalidate_ancestor_caches(&mut self, id: u32) {
-        self.invalidate_ancestor_caches_except(id, None);
-    }
-
-    /// The same walk, skipping `except` itself. A transition source that is
-    /// also an ancestor of the destination supplies the frame's source pixels,
-    /// so its cached content must stay current even though the destination's
-    /// frame changed.
-    fn invalidate_ancestor_caches_except(&mut self, id: u32, except: Option<u32>) {
-        let limit = self.layers.len().saturating_add(1);
-        let mut current = self.layer(id).and_then(|layer| layer.parent);
-        let mut steps = 0usize;
-        while let Some(c) = current {
-            if steps > limit {
-                break;
-            }
-            steps += 1;
-            if except == Some(c) {
-                current = self.layer(c).and_then(|layer| layer.parent);
-                continue;
-            }
-            current = match self.layer_mut_untracked(c) {
-                Some(layer) => {
-                    layer.cache_recalc = true;
-                    layer.parent
-                }
-                None => break,
-            };
+            layer.content_epoch = layer.content_epoch.wrapping_add(1);
         }
     }
 
@@ -3513,13 +3494,19 @@ impl Scene {
     /// [`crate::layer_ops::render_layer_subtree`] on the first render and by
     /// [`crate::layer_ops::ensure_transition_display`]. Returns the new count
     /// (`0` for an unknown layer).
+    ///
+    /// Enabling the cache does not change the layer's content, so it marks
+    /// no cache stale: the content behind the cache is the one the layer
+    /// already had, and it is composited when it is first needed. A content
+    /// that is allocated then is composited from scratch.
     pub fn inc_cache_enabled_count(&mut self, id: u32) -> u32 {
-        let Some(layer) = self.layer_mut(id) else {
+        let Some(layer) = self.layer_mut_untracked(id) else {
             return 0;
         };
         layer.cache_enabled_count = layer.cache_enabled_count.saturating_add(1);
-        layer.cache_recalc = true;
-        layer.cache_enabled_count
+        let count = layer.cache_enabled_count;
+        self.touch_structure();
+        count
     }
 
     /// Release one cache consumer. The composited content and the transition
@@ -3897,37 +3884,15 @@ impl Scene {
 
     /// Set (or clear) the frame a running transition draws on `id`.
     ///
-    /// A changed frame marks every caching ancestor's cache stale and bumps
-    /// [`Scene::structure_revision`], so the projection redraws the two source
-    /// images the frame advances to. The layer's own composited content is the
-    /// frame's source and does not change with the frame, so it stays reusable
-    /// instead of being recomposited every tick. A source the outgoing frame
-    /// named and the new one does not is released once nothing else holds it;
-    /// the transition's own sources keep their owners' references.
+    /// A changed frame bumps [`Scene::structure_revision`], so the
+    /// projection redraws the two source images the frame advances to. The
+    /// frame is a display of the layer's content, not the content itself:
+    /// the layer's composited subtree and every caching ancestor's stay
+    /// reusable instead of being recomposited every tick. A source the
+    /// outgoing frame named and the new one does not is released once
+    /// nothing else holds it; the transition's own sources keep their owners'
+    /// references.
     pub fn set_transition_frame(&mut self, id: u32, frame: Option<TransitionFrame>) {
-        self.set_transition_frame_except(id, None, frame);
-    }
-
-    /// Set a running transition's frame while keeping the transition source
-    /// layer's own cache current. When the source is one of the destination's
-    /// ancestors its composited content is also the frame source, so the frame
-    /// change must not recomposite it; only the other caching ancestors need
-    /// the new frame.
-    pub fn set_transition_frame_for(
-        &mut self,
-        id: u32,
-        source: u32,
-        frame: Option<TransitionFrame>,
-    ) {
-        self.set_transition_frame_except(id, Some(source), frame);
-    }
-
-    fn set_transition_frame_except(
-        &mut self,
-        id: u32,
-        source: Option<u32>,
-        frame: Option<TransitionFrame>,
-    ) {
         let mut replaced = None;
         let changed = match self.layer_mut_untracked(id) {
             Some(layer) if layer.transition_frame != frame => {
@@ -3943,8 +3908,6 @@ impl Scene {
                 // from before the transition (or the one its transition ran
                 // through) is stale now, so resume from a fresh composite.
                 self.invalidate_layer_cache(id);
-            } else {
-                self.invalidate_ancestor_caches_except(id, source);
             }
             self.touch_structure();
             if let Some(replaced) = replaced {
@@ -3962,25 +3925,14 @@ impl Scene {
     /// Set (or clear) the custom-shader draw a running transition composites
     /// on `id`.
     ///
-    /// A changed draw marks every caching ancestor's cache stale and bumps
-    /// [`Scene::structure_revision`], so the projection redraws it. The
-    /// layer's own composited content is one of the draw's sources and does
-    /// not change with the draw, so it stays reusable instead of being
-    /// recomposited every tick. A source the outgoing draw named and the new
-    /// one does not is released once nothing else holds it; the transition's
-    /// own sources keep their owners' references.
+    /// A changed draw bumps [`Scene::structure_revision`], so the projection
+    /// redraws it. The draw is a display of the layer's content, not the
+    /// content itself: the layer's composited subtree and every caching
+    /// ancestor's stay reusable instead of being recomposited every tick. A
+    /// source the outgoing draw named and the new one does not is released
+    /// once nothing else holds it; the transition's own sources keep their
+    /// owners' references.
     pub fn set_effect(&mut self, id: u32, effect: Option<EffectDraw>) {
-        self.set_effect_except(id, None, effect);
-    }
-
-    /// Set a running transition's effect draw while keeping the transition
-    /// source layer's own cache current, for the same reason as
-    /// [`Scene::set_transition_frame_for`].
-    pub fn set_effect_for(&mut self, id: u32, source: u32, effect: Option<EffectDraw>) {
-        self.set_effect_except(id, Some(source), effect);
-    }
-
-    fn set_effect_except(&mut self, id: u32, source: Option<u32>, effect: Option<EffectDraw>) {
         let cleared = effect.is_none();
         let kept: Vec<u32> = effect
             .as_ref()
@@ -4006,8 +3958,6 @@ impl Scene {
                 // from before the transition (or the one its transition ran
                 // through) is stale now, so resume from a fresh composite.
                 self.invalidate_layer_cache(id);
-            } else {
-                self.invalidate_ancestor_caches_except(id, source);
             }
             self.touch_structure();
             if let Some(replaced) = replaced {

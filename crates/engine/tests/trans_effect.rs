@@ -158,15 +158,16 @@ fn advancing_an_effect_keeps_the_layer_content_reusable() {
         state.rect = Rect::new(0, 0, 4, 4);
         state.visible = true;
         state.bitmap = Some(source);
-        state.cache_recalc = false;
     }
+    let epoch = scene.layer(layer).expect("layer").content_epoch;
 
     let first = cross_fade(25.0)
         .effect_draw(source, other, (4, 4), true)
         .expect("first draw");
     scene.set_effect(layer, Some(first));
-    assert!(
-        !scene.layer(layer).expect("layer").cache_recalc,
+    assert_eq!(
+        scene.layer(layer).expect("layer").content_epoch,
+        epoch,
         "a new frame does not recomposite the layer's unchanged content"
     );
 
@@ -174,14 +175,15 @@ fn advancing_an_effect_keeps_the_layer_content_reusable() {
         .effect_draw(source, other, (4, 4), true)
         .expect("second draw");
     scene.set_effect(layer, Some(second));
-    assert!(
-        !scene.layer(layer).expect("layer").cache_recalc,
+    assert_eq!(
+        scene.layer(layer).expect("layer").content_epoch,
+        epoch,
         "the next tick reuses the content too"
     );
 
     scene.set_effect(layer, None);
     assert!(
-        scene.layer(layer).expect("layer").cache_recalc,
+        scene.layer(layer).expect("layer").content_epoch > epoch,
         "clearing the draw resumes from a fresh composite"
     );
 }

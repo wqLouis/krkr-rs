@@ -1168,9 +1168,10 @@ fn a_composited_whole_subtree_transition_reuses_its_content() {
     // The teardown returns the layer to its own subtree; a cache kept from
     // before or during the transition is stale and must be recomposited
     // (LayerIntf.cpp:7961-7991).
+    let epoch = named_layer(&env, "dest").content_epoch;
     env.run("b.stopTransition();");
     assert!(
-        named_layer(&env, "dest").cache_recalc,
+        named_layer(&env, "dest").content_epoch > epoch,
         "the ended transition resumes from a fresh composite"
     );
 }

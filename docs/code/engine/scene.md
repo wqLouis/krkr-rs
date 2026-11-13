@@ -53,7 +53,7 @@ projected scene.
 | type | owns |
 |---|---|
 | `WindowState` | the client size, visibility, opacity, the primary layer, the focus domains and their focus, and the window's layer list |
-| `LayerState` | the parent/child links, the focus domain, the rect, visibility, opacity, the generic `BlendMode`, the sibling sort key, the image placement, the province plane, the hit-test mode, the clip rect, the focus and hint properties, the cache slots (`cache_bitmap`, `cache_content`, `transition_self`, `transition_frame`, `cache_enabled_count`, `cache_recalc`) and the `pending_paint` / `shutdown` flags |
+| `LayerState` | the parent/child links, the focus domain, the rect, visibility, opacity, the generic `BlendMode`, the sibling sort key, the image placement, the province plane, the hit-test mode, the clip rect, the focus and hint properties, the cache slots (`cache_bitmap`, `cache_content`, `transition_self`, `transition_frame`, `cache_enabled_count`, `cache_recalc`), the content bookkeeping (`content_epoch`, `cache_content_signature`) and the `pending_paint` / `shutdown` flags |
 | `TransitionFrame` / `TransitionSource` | the frame a composited transition draws on a layer: its pixel size, whether it covers the layer rect, and the two source draws (`bitmap`, `src`, `dst`, `alpha`) |
 | `BitmapState` | the RGBA8 pixels, the dimensions, the dirty flag and dirty region, the script-ownership flag, the `content_generation` counter and the pending decode (`pending`) |
 | `FontState` | the requested face, height, colour and the style flags |
@@ -311,6 +311,33 @@ Scene  ──► projection::project_scene_report ──► RenderScene (VM pixe
 widens a partial region. Both bump `content_generation`, which the
 subtree-cache bookkeeping sums to detect an image edit that did not go through
 a layer accessor. A full mark (`dirty_region == None`) overrides a partial one.
+
+### The cache's validity
+
+A layer's composited subtree content is valid while the **content signature**
+of the subtree still matches the one the content was composited with. The
+signature is the sum of the drawn sources' own contributions
+(`LayerState::content_epoch`) and of their images' `content_generation`, and
+it is recorded in `LayerState::cache_content_signature`. One comparison
+therefore decides whether the content is still the content the tree
+describes: a source that changed through the layer accessors advanced its
+epoch, and a source whose pixels changed behind them advanced its image's
+generation.
+
+The counter is the engine's record of *that* the content changed; the
+reference records *where*, in the layer's `CacheRecalcRegion` — a complex
+rectangle of the part of the cache that must be reconstructed
+(`reference/krkr2/cpp/core/visual/LayerIntf.h:963`). The reference fills it
+with the rectangles that changed
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6254`, `:6285`, `:6329`) and
+`Complete` returns the cached bitmap untouched while it is empty
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7734-7740`).
+
+The transition's tick is the case the two shapes answer the same way: the
+transition changes its own frame and no source's pixels, so it appends to no
+region (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6322-6327`) and
+advances no epoch, and the transition's endpoints keep their composites for
+the whole run.
 
 ### The pending-image path
 

@@ -117,6 +117,30 @@ records the frame on the layer (`Scene::set_transition_frame`) and the
 projection draws the two sources, so nothing is written to a bitmap per tick
 (see [trans.md](trans.md) §6.1).
 
+### The composited content's validity
+
+`render_layer_subtree` composites the subtree only while the content is not
+the content the tree describes. The **content signature** of the subtree is
+the sum of the drawn sources' own contributions
+(`LayerState::content_epoch`) and of their images' `content_generation`, and
+the value recorded when the content was composited is
+`LayerState::cache_content_signature`; the content is composited again when
+the two differ.
+
+The reference records the same fact as a region: the layer's
+`CacheRecalcRegion` holds the part of the cache that must be reconstructed
+(`reference/krkr2/cpp/core/visual/LayerIntf.h:963`), the region is filled
+with the rectangles that changed
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6254`, `:6285`, `:6329`), and
+`Complete` reconstructs only that region and returns the cached bitmap
+untouched while the region is empty
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7734-7740`). The engine's
+signature is not per pixel, so a changed region is still composited whole,
+but both answer the same question and both leave a transition's tick alone:
+the transition's update is a "temp update" that appends to no region
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6322-6327`), so the
+transition's endpoints keep their composites.
+
 ---
 
 ## 4. Invariants

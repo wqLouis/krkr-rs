@@ -165,16 +165,24 @@ sizes.
 
 A composited frame changes every tick, but only because its blend weights (or
 placements) change: the endpoint **subtrees** it samples do not. The frame
-update therefore marks only the transitioning layer's caching **ancestors**
-stale, which must repaint the frame, and leaves the layer's own composited
-content reusable as the frame's source. A source layer that is also one of
-the destination's ancestors is excluded from that invalidation: its content is
-the frame source, not part of the changed output. Marking the layer itself
-stale would recomposite a full-screen endpoint subtree on every transition
-tick for no visible change. Clearing the frame does invalidate the layer
-itself, because it then returns to drawing its own subtree and any cache kept
-from before or during the transition is stale. The same rule applies to the
-custom-shader effect draw.
+update therefore marks **no** cache stale: the frame is a display of the
+layer's content, not the content itself, so the layer's composited subtree
+and every caching ancestor's stay reusable and a full-screen endpoint subtree
+is not recomposited on every transition tick. Clearing the frame does
+invalidate the layer itself, because it then returns to drawing its own
+subtree and any cache kept from before or during the transition is stale.
+The same rule applies to the custom-shader effect draw.
+
+The endpoints' composites are kept the same way: `Complete` returns the
+cached bitmap untouched while the cache region is empty
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7734-7740`), the transition's
+source is read through that cache
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:8186-8199`), and the
+transition's per-tick update is a "temp update", which appends to no cache
+region (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6322-6327`). Enabling
+the cache on the two endpoints marks no cache stale either: the content
+behind the cache is the content the layer already had
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:3996-4006`).
 
 While a layer owns a frame or effect draw, the projection never draws that
 layer's own `cache_bitmap`: the draw replaces the image the cache holds.
