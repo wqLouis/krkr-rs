@@ -98,6 +98,189 @@ residuals:
 
 ## 4. Rendering and layers
 
+### 4.0 The transition's subtree is recomposited whole, every tick
+
+**Measured on the real game, in gameplay** (the title menu is idle and shows
+nothing): the 1% low is **1.1 fps** (889 ms), and 151 frames of 6 000 are
+over 100 ms. The stalls are discrete, not a steady cost.
+
+The chain, measured with the phases split:
+
+| where | the cost |
+|---|---|
+| the frame tail's `advance_transitions` | 751 ms, 745 ms, 1 053 ms |
+| inside it, `transition_sources_subtree` | 727 ms of the 751 ms |
+| inside it, `render_layer_subtree` | the CPU composite of the subtree's pixels |
+| the async poll's `onFire` dispatch | 1128 ms, 997 ms, 553 ms |
+
+**The shape.** A whole-subtree transition composites its two sources on the
+CPU. `render_layer_subtree` writes the **whole** 1920×1080 plane: it fills
+the backdrop over every pixel and then composites every draw of the subtree
+into it. The cache that would skip that work is guarded by a **boolean**
+(`cache_recalc`) and a generation counter - and a transition's own advancing
+frame invalidates its **ancestors'** caches, so the flag is set again and the
+whole plane is recomposited.
+
+**The cost is discrete, not per tick.** The costs above are the recomposites
+themselves; in 3 000 gameplay frames there were **eight** of them, each
+around 700 ms. The flag was set again on each of those frames, not on every
+frame of the transition.
+
+**The reference does not do this.** `tTJSNI_BaseLayer::Complete(rect)`
+(`reference/krkr2/cpp/core/tjs2/../core/visual/LayerIntf.cpp:7719-7748`)
+reconstructs only `CacheRecalcRegion` - a **region**, not a flag - and
+returns the cached bitmap untouched when the region is empty
+(`:7737-7740`). The reference's `CacheRecalcRegion` is a `tTVPComplexRect`
+filled with the changed rectangles (`:6254`, `:6285`, `:6329`), and
+`:7738` skips the whole reconstruction when nothing changed.
+
+So the shape is: our cache says *whether* to recomposite, the reference's
+says *where*. The fix is the region, not a faster pixel loop: a transition
+tick changes the transition's own frame, and the sources' pixels do not
+change, so the sources' composites stay valid and only the destination's
+frame is new.
+
+The second half of the stall is the `onFire` dispatch (1 128 ms): the game's
+own scenario handler. That is script work - the reference does the same work
+in the same place - so the fix there is to make the *engine* cheaper, not to
+skip the script.
+
+**What the script does.** The game's KAG runtime (`system/conductor.tjs`)
+holds a `OneShotAsyncTrigger` whose action is the conductor's
+`timerCallback`. The callback walks the scenario's tags in a `while` loop:
+`getNextParseTag()`, `checkNextParseTag()`, then `onTag(obj)` for the tag's
+handler, until a tag asks to wait. `waitAndBreak` is what ends the loop: a
+tag that returns a positive step sets the timer's interval and returns, and
+a tag that returns `-4` re-triggers the one-shot so the events are processed
+first.
+
+So the loop runs until the scenario asks to wait, and everything it did in
+that time is **inside one frame**. That is the reference's own shape - the
+reference's KAG does the same - so the fix is that the engine's own costs
+inside the loop must be small: the tag handlers load images, build layers and
+start transitions, and each of those is an engine cost.
+
+**Where the engine's cost is in that loop.** The tag handlers that start a
+transition are the ones that pay the subtree composite above, once per
+transition tick. A transition that runs for 30 ticks at 60 Hz pays 30 whole-
+plane composites, and each of them is inside the frame that runs the
+scenario.
+
+### 4.0.1 The blend kernel is a naive per-pixel loop
+
+**This is the real cost, and caching it would only hide it.** Measured with
+the blend-family benchmark over a 512x512 rectangle of a 1920x1080 plane
+(`crates/engine/examples/blend_family_bench.rs`), in a **release** build:
+
+| the draw | the cost |
+|---|---|
+| a row copy (`blit_copy_clipped`) | **0.11 ns per pixel** |
+| mode 1 (the copy kernel) | 7.48 ns per pixel |
+| **mode 2 (the alpha source-over)** | **8.49 ns per pixel** |
+| mode 20 (the Photoshop soft light) | 37.9 ns per pixel |
+
+So one blend of the alpha source-over costs **~77x** what moving the same
+bytes costs, and the soft light costs **~340x**.
+
+**The first measurement of this was wrong and is withdrawn.** The 201 ms
+figure for a 1280x960 draw was taken on a **debug** build; the same draw in
+release is 1 228 800 px x 8.49 ns = **10.4 ms**. The relative shape of the
+problem survives - the blend is ~77x the cost of moving the same bytes - but
+the absolute numbers do not, and every gameplay figure measured on the
+debug build has to be read that way.
+
+**Why.** `operate_rect_on` (crates/engine/src/layer_ops.rs:3003) runs
+
+```rust
+for y in dc.1..dc.3 {
+    for x in dc.0..dc.2 {
+        let color = read_pixel(src, src_rect.0 + (x - dx), src_rect.1 + (y - dy));
+        blend_pixel_mode(dst, x, y, color, opa, kernel);
+    }
+}
+```
+
+`read_pixel` (`:187`) does a bounds-checked `pixel_offset` and a slice
+`get`; `blend_pixel_mode` (`:2009`) checks the bounds again, reads the
+destination pixel through the same accessor, and writes it back through a
+third. So every pixel pays four bounds checks and three accessor calls to do
+about twenty arithmetic operations - and the arithmetic itself (the word
+mix in `alpha_blend`, `:2501`) is already the reference's own shape.
+
+**But the accessors were only ~10-25 % of it.** The dominant cost is the
+**per-pixel kernel dispatch**: `apply_mode_kernel` (`:3212`) is a 35-arm
+`match kernel` **inside** the pixel loop, it is not inlined, and the
+destination pixel is spilled to a stack slot and read back for every
+pixel. The proof is the copy kernel: mode 1 does almost no arithmetic and
+still costs **7.48 ns per pixel**, while the same naive loop without a
+kernel - `blit_plane COPY_MAIN` - costs **1.29 ns per pixel**. The
+difference is the dispatch, and it is ~70 % of every mode's cost.
+
+So the fix is two things, in this order: **hoist the dispatch out of the
+pixel loop** (one monomorphised loop per kernel, so the pixel stays in
+registers and the kernel's arithmetic inlines), and **work on rows** with
+the bounds resolved once. The row-based pass is landed; the dispatch hoist
+is next.
+
+The **row-copy path does it right**: `blit_copy_clipped` and
+`copy_plane_rows` resolve the bounds once and copy whole rows with
+`copy_from_slice` - one `memcpy` per row, no per-pixel work at all, at
+0.11 ns per pixel. That is the shape every other kernel must have.
+
+**So the fix is the algorithm**: the blend pass must work on rows, with the
+bounds resolved once, the way the row-copy path does. Six places carried
+the naive loop (`:1089`, `:1118`, `:1594`, `:3003`, `:3422`, `:3568`) -
+they now share one row-based pass (`BlendPass`, `BandBlend`, `PassSource`),
+so the shape is one owner for the blend pass rather than a per-mode copy.
+
+**The kernels that are pathological beyond the dispatch.** The benchmark
+found these, and each one is arithmetic the reference does NOT do:
+
+| the kernel | the cost | what it does per pixel |
+|---|---:|---|
+| mode 20, the Photoshop soft light | 37.9 ns | **3 `f64::powf`** - and the GPU path already reads a 256x256 `soft_light_table()` (`crates/platform/render/src/blend.rs`) that the CPU path does not use |
+| `noise` | 24.5 ns | a serial xorshift step and an `f32` conversion, three times |
+| mode 8, the dodge | 9.2 ns | **3 integer divisions** (`reciprocal`, `65536u32.checked_div`) |
+| modes 21/22/23, the dodge and burn | 9.1-9.9 ns | one integer division per channel |
+| modes 18/19, the overlay and hard light | 10.3-10.5 ns | a data-dependent branch per channel |
+| `fill_color_on_alpha` with opa < 255 | 8.2 ns | 2 `f32` divisions - the 64 KiB `opacity_on_opacity` table already exists |
+| `stretch_blit` | 12.8-21.0 ns | 2 `f32` divisions per pixel for divisors that are **constant for the whole pass** |
+| `blit_over`, the plain source-over | 8.3 ns | 3 hardware integer divisions per pixel |
+
+Every one of these is a table or a hoist, not SIMD: a table lookup, a
+loop-invariant divisor lifted out of the loop, or a branch turned into a
+select.
+
+The mode 2 kernel is the **alpha face**'s source-over (`AlphaOnAlpha`,
+`blt_method_for` at `:2209`), which is the blend the subtree composite uses
+for every layer whose type is `ltAlpha` - the game's own layers. This is
+the same kernel the CPU presentation path uses, so the fix helps every
+CPU-rendered frame, not only the transitions.
+
+**The whole family may have the same problem, and only the mode-1 path has
+been measured.** The six naive loops are the pattern to look for; the
+benchmark over the whole blend family is what settles it.
+
+**What SIMD can and cannot reach.** The kernels are not all the same shape:
+
+| the kernel's work | can it be vectorized? |
+|---|---|
+| the word arithmetic (`alpha_blend` and the rest) | yes - it is packed-byte arithmetic on a u32, which is what a SIMD lane does |
+| the per-pixel table lookup (`opacity_on_opacity`, `negative_mul` - a 64 KiB table indexed by the source and destination alphas) | a gather, or a smaller table |
+| the per-pixel float divide (the darken and lighten blends' colour mix) | no - it stays scalar |
+
+So the arithmetic is vectorizable and the LOOKUP is the hard part. The
+reference's own blend functors
+(`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h`) are the oracle for
+what each kernel computes, and the bytes must not move.
+
+### 4.0.2 The transition's subtree composite is a CPU full-frame blend
+
+The subtree composite runs on the CPU even on the Vulkan backend, where the
+reference's `IsGPU()` path draws the transition with the GPU
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7615-7621`). Every pixel of
+every transition frame goes through the software rasterizer.
+
 * **R8b/R9/R10** `hasImage = true` must raise `TVPLayerCannotHaveImage` when the
   layer type cannot carry an image (`LayerIntf.cpp:2489-2493`): the three
   non-image types still collapse into `BlendMode::SourceOver`

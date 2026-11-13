@@ -1314,3 +1314,153 @@ The election is taken in a scope of its own now. The two tests finish in
 
 The two measurements above are of the two shapes in isolation, not of the
 game: they say what the shape costs, and the shape is what changed.
+## 11. The gameplay frame times
+
+### 11.1 Two corrections before any number means anything
+
+The first gameplay measurement said the 1% low was **889 ms** - 1.1 fps - and
+that the engine was far from a playable frame rate. It was a **debug build**.
+In release the same run, on the same machine, says:
+
+| | the debug build | the release build |
+|---|---:|---:|
+| p50 | 2.27 ms | 3.18 ms |
+| p90 | - | 3.28 ms |
+| p99 | 651.72 ms | **4.97 ms** |
+| the 1% low | 888.70 ms (1.1 fps) | **35.92 ms (27.8 fps)** |
+| the worst | 1 714.67 ms | 294.87 ms |
+| the frames over 33 ms | 289 | **9** |
+| the frames over 100 ms | 151 | **3** |
+
+So the tail is not a steady cost: **nine frames of 3 000** carry the whole
+deficit. Every figure in this section is a release number, and every
+measurement states the load average it was taken under - a load above about
+four invalidates a timing.
+
+The second correction is the backend. The gameplay harness builds its host
+with `HostConfig::headless()`, which is the **null** backend, and the null
+backend's `supports_effect_pipelines()` is false
+(`crates/platform/render/src/null.rs:77`). The engine logs it once per run:
+
+```
+transitions: this backend cannot run effect pipelines; the display bitmap is blended on the CPU
+```
+
+The Vulkan backend's is true (`crates/platform/render/src/vulkan/mod.rs:181`),
+so on the shipping backend the transition's cross-fade is a shader draw
+through the effect pipeline - and the CPU cross-fade the null backend pays is
+**not** part of the shipping path. The null backend's numbers are the
+comparable baseline; they are not the shipping numbers.
+
+### 11.2 The slow frames' statistics
+
+The engine logs one line per slow frame. The script that reads the log
+(`/tmp/pi-patches/slow-frame-stats/slow_frame_stats.py`) has to get the
+nesting right: `host.total` **is** the frame's cost, `vm.tick` is inside it,
+and `phases.body` is the **sum** of the five poll phases - so `async` and
+`frame_tail` are inside `body` and must not be added to it again.
+
+Of the 2 941 slow frames logged in a 3 000-frame run, **2 919 are the run
+idling at the end** (every phase zero) and **22 did real work**:
+
+| the frame's cost | the polls inside its body |
+|---:|---|
+| **294.9 ms** | async=210.0 frame_tail=78.2 |
+| **170.7 ms** | async=168.5 |
+| **118.3 ms** | frame_tail=113.1 |
+| 79.3 / 73.2 / 67.6 ms | frame_tail=67.6 / 69.3 / 66.1 |
+| 37.3 / 36.2 ms | async=30.8 / 32.3 |
+
+The aggregate over those 22 frames:
+
+| | the cost | the share |
+|---|---:|---:|
+| the VM tick | 892.9 ms | **95.0 %** |
+| - the async poll (the conductor's `onFire`) | 457.2 ms | 48.7 % |
+| - the frame tail (the transitions) | 433.1 ms | 46.1 % |
+| the host outside the tick | 46.8 ms | 5.0 % |
+
+The tail is therefore **half script work and half the transition's own**.
+The script half cannot be skipped - the reference does the same work in the
+same place - so only the engine work it triggers can be reduced.
+
+### 11.3 The blend family
+
+Every per-pixel blend was 67-420x over the memory floor: a row copy costs
+**0.11 ns per pixel**, the copy kernel **7.98**, the alpha source-over the
+game uses **9.15**, the Photoshop soft light **38.67**.
+
+The dominant cost was not the arithmetic but the **dispatch**: a 35-arm
+`match kernel` inside the pixel loop, not inlined, with the destination
+pixel spilled to a stack slot and read back for every pixel. The proof is
+the copy kernel - almost no arithmetic - at 7.48 ns per pixel against
+**1.29** for the same loop without a kernel.
+
+With each mode's arithmetic a type of its own, the row loop monomorphised
+and the mode resolved once per row:
+
+| the kernel | before | after | |
+|---|---:|---:|---:|
+| mode 1 (the copy) | 7.98 | **0.14** | 55x |
+| **mode 2 (the alpha source-over)** | 9.15 | **2.45** | **3.74x** |
+| mode 3 / 4 / 5 | 10.2 / 10.2 / 8.25 | 1.86 / 1.86 / 1.39 | 5.5-6.0x |
+| modes 13-17, 24-28 | 9.0-9.4 | 1.89-2.76 | 3.4-4.8x |
+| modes 18 / 19 | 11.3 | 3.73 / 3.44 | 3.1-3.3x |
+| **mode 20 (the soft light)** | 38.67 | **2.79** | **13.8x** |
+| modes 21 / 22 / 23 | 10.1-10.7 | 1.95-3.03 | 3.5-5.2x |
+| **the operate_rect median** | | | **3.55x** |
+
+A 1280x960 mode-2 draw: **11.7 ms -> 3.2 ms**. The stretch modes, which the
+row pass had made 5-18 % *slower*, are **1.31x faster** than they were -
+inlining the monomorphised kernel into the float resample spilled registers,
+so the resampling path has its own row loop with the blend kept out of line.
+
+Two block cases are byte-exact and skip the tables - a wholly opaque source
+has the same weight at every destination alpha, and a wholly transparent
+source leaves the destination alone where its alpha is not zero:
+
+| mode 2, a 1280x960 area | without the block pass | with it |
+|---|---:|---:|
+| an opaque source | 2.42 ns/px | **0.59 ns/px - 4.1x** |
+| a transparent source | 2.39 ns/px | **0.40 ns/px - 6.0x** |
+| a mixed source | 2.50 ns/px | 2.40 ns/px |
+
+The game's layers are mostly opaque backgrounds or fully transparent, so the
+hot path should land near the block numbers rather than 2.45.
+
+### 11.4 What the composite actually costs
+
+The blend is **not** the composite's cost. Measured inside one run (the
+absolute numbers were taken under a load of 131 and are not trustworthy; the
+ratios, measured in the same run, are):
+
+| | the cost per endpoint per tick |
+|---|---:|
+| the composite | 27-85 ms |
+| the blend inside it | 0.24-3.4 ms |
+| a composite that hits the cache | **0.05-0.08 ms** |
+
+So the composite's own work - the backdrop fill over the whole plane and the
+draws - is the bulk of it, and a cache hit is three orders of magnitude
+cheaper than a composite.
+
+### 11.5 Four composites of one subtree per frame
+
+The transition's endpoints were composited **four times per frame**, and
+**three of the four produced byte-identical content**. The pixels of the
+endpoint images do *not* change every frame - the first transition's 31
+endpoint images were byte-identical between two steps, and in the second
+exactly one image changed (the motion player's target). The earlier reading
+that "the game rewrites the endpoint images every frame" was an artifact: a
+clean bitmap has no dirty region, and the probe read that as dirty.
+
+Four composites for one subtree is **our** shape, not the reference's: the
+reference completes each endpoint **once per frame**
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6431,6435`) and
+re-composites the whole area only when the recalc region is not empty
+(`:7734,:7736-7748`).
+
+The cause is a cache whose **output feeds back into its own validity
+check**: the composite writes the content, that write advances the content's
+generation, the signature moves, and the next call composites again. The
+fix is the shape, not the cache: one owner for the cache's validity.
