@@ -42,16 +42,16 @@ fn blend(mode: i64, destination: [u8; 4], source: [u8; 4], opacity: u8) -> [u8; 
 /// weight from the opacity-on-opacity table
 /// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:711-724`), and the
 /// table holds `(sa / da) / (1 - sa + sa / da)`, truncated to a byte, with
-/// the second step in double precision
+/// the second step in single precision
 /// (`reference/krkr2/cpp/core/visual/tvpgl.cpp:224-251`).
 fn reference_weight(destination_alpha: u8, opacity: u8) -> u8 {
     if destination_alpha == 0 {
         return 255;
     }
-    let at = (f64::from(destination_alpha) / 255.0) as f32;
-    let bt = (f64::from(opacity) / 255.0) as f32;
+    let at = destination_alpha as f32 / 255.0;
+    let bt = opacity as f32 / 255.0;
     let mut share = bt / at;
-    share = (share as f64 / (1.0 - bt as f64 + share as f64)) as f32;
+    share /= 1.0 - bt + share;
     let value = (share * 255.0) as i32;
     if value >= 256 { 255 } else { value as u8 }
 }
@@ -94,10 +94,10 @@ fn the_dodge_reads_the_reciprocal_of_the_source_complement() {
 /// table, and the colour it leaves is the destination's colour moved towards
 /// the fill's colour by that weight.
 ///
-/// The alpha the fill leaves is the engine's own: it shifts the product by
-/// eight bits where the table's negative-multiplication divides it by 255
-/// (`reference/krkr2/cpp/core/visual/tvpgl.cpp:245-246`), so the two differ
-/// for some pairs. The test holds the colour and leaves the alpha alone.
+/// The alpha the fill leaves is the negative-multiplication table's entry for
+/// the opacity and the destination's alpha
+/// (`reference/krkr2/cpp/core/visual/tvpgl.cpp:248-249`); the test holds the
+/// colour and leaves the alpha alone.
 #[test]
 fn the_constant_colour_fill_reads_the_opacity_weight_of_the_table() {
     let color = [32u8, 64, 96, 200];

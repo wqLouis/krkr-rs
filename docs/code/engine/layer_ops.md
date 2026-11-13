@@ -69,13 +69,66 @@ bookkeeping see them like any other layer bitmap.
 | `fill_color_on_add_alpha` | additive-alpha (premultiplied) fill |
 | `fill_color_hold_alpha` | set RGB to a constant colour, holding the destination alpha |
 | `fill_mask` | replace the alpha channel with a constant |
-| `remove_const_opacity` | scale the alpha by `1 - level / 255` |
+| `remove_const_opacity` | multiply the alpha by `255 - level`, keeping the low byte of the product |
 | `colorize` | reblend hue and saturation, preserving lightness |
 | `noise` | add uniform per-channel noise, holding alpha |
 | `do_gray_scale` | greyscale: a weighted sum of the three colour channels, written to all three |
 | `adjust_gamma` | per-channel gamma with floors and ceilings |
 | `light_contrast` | brightness/contrast adjustment |
 | `convert_alpha_to_add_alpha` / `convert_add_alpha_to_alpha` | premultiplied ↔ straight alpha |
+
+The constant colour's fill on the alpha face leaves the destination's alpha
+through the **negative-multiplication table**, the table the alpha blend on an
+alpha destination reads as well
+(`reference/krkr2/cpp/core/visual/gl/blend_variation.h:127-131`,
+`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:716`): the table holds
+`255 - (255 - dst) * (255 - src) / 255`, the division truncating
+(`reference/krkr2/cpp/core/visual/tvpgl.cpp:248-249`). The shipped renderer
+computes the same quantity in floating point for the fill,
+`d.a = opacity + d.a - opacity * d.a`
+(`reference/krkr2/cpp/core/visual/ogl/RenderManager_ogl.cpp:3096-3098`).
+
+The additive face's fill composes the destination's alpha with the opacity
+instead — `Da = Sa + Da - SaDa`, adjusted afterwards
+(`reference/krkr2/cpp/core/visual/gl/blend_util_func.h:125-137`) — and the
+opaque face's fill holds the destination's alpha
+(`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:737-756`). The full
+opacity is the plain ARGB fill on every face, the additive face included: the
+reference's fill path takes that path at the full opacity
+(`reference/krkr2/cpp/core/visual/LayerBitmapIntf.cpp:497-507`), so the
+colour is written as it is and the alpha is 255.
+
+The opacity removal multiplies the alpha by `255 - level` and keeps the low
+byte of the product, so the alpha the kernel leaves is
+`(alpha * (255 - level)) & 0xff`
+(`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:914-921`,
+`reference/krkr2/cpp/core/visual/tvpgl.cpp:6401-6438`).
+
+#### The known divergence: the fill's alpha against the software renderer
+
+The reference's **software** renderer's fill functor computes the alpha the
+fill leaves with a shift, `255 - ((255 - dst) * (255 - opa) >> 8)`
+(`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:774-790`), while the
+table, the shipped OpenGL renderer and the reference's own alpha blend on an
+alpha destination compute the same quantity as a division by 255. The two
+reference paths disagree with each other, so the engine follows the division:
+the table's entry, which is what the shipped renderer produces and what the
+reference's alpha blend writes.
+
+The gap between the two is at most two alpha levels, and it shows for 16 678
+of the 65 536 (destination alpha, opacity) pairs — for example the alpha of a
+transparent destination under the opacity 128 is 129 in the software renderer
+and 128 in the table. The engine's fill and the engine's alpha blend agree
+with each other, which the reference's own fill and blend do not.
+
+#### The known divergence: the opacity removal against the shipped renderer
+
+The shipped renderer scales the alpha by `1 - level / 255` in floating point
+(`reference/krkr2/cpp/core/visual/ogl/RenderManager_ogl.cpp:3127-3135`), while
+the software kernel keeps the low byte of `alpha * (255 - level)`. The engine
+follows the kernel, whose value the reference's software renderer and its
+legacy `_c` kernel agree on; the two differ by up to two alpha levels, and
+the low byte is what the kernel produces.
 
 ### Copies and blits
 
@@ -196,6 +249,16 @@ name one of them:
 Below the full opacity a copy pass is the constant-alpha blend, and the
 pass that reads the source as an opaque image takes the constant-alpha blend
 of the alpha destination, so the destination's alpha takes part in the mix.
+
+The two tables the alpha destination's blends read are built exactly as the
+reference builds them
+(`reference/krkr2/cpp/core/visual/tvpgl.cpp:224-251`): the
+opacity-on-opacity table holds `(sa / da) / (1 - sa + sa / da)` **in single
+precision** — the second step is a float division, not a double one — and the
+negative-multiply table holds `255 - (255 - dst) * (255 - src) / 255` with the
+division truncating. The engine's tables are built with the same arithmetic
+and the same order, so every one of their 65 536 entries is the value the
+reference's table holds.
 
 The per-channel function of every Photoshop mode is the tree's CPU twin, and
 the tables the tree builds at start-up

@@ -13,7 +13,7 @@
 //! | [`fill_color_on_add_alpha`] | additive-alpha (premultiplied) fill |
 //! | [`fill_color_hold_alpha`] | set RGB to a constant color, holding the destination alpha |
 //! | [`fill_mask`] | replace the alpha channel with a constant |
-//! | [`remove_const_opacity`] | scale the alpha by `1 - level / 255` |
+//! | [`remove_const_opacity`] | multiply the alpha by `255 - level`, keeping the low byte of the product |
 //! | [`colorize`] | reblend hue and saturation, preserving lightness |
 //! | [`noise`] | add uniform per-channel noise, holding alpha |
 //! | [`blit_copy`] | copy a source region over the destination |
@@ -190,7 +190,9 @@ fn dim_i32(v: u32) -> i32 {
 /// * `opa <= 0` does nothing,
 /// * `opa >= 255` writes the RGB with a forced `255` alpha (`FillARGB`),
 /// * otherwise RGB is blended with the destination's effective opacity while
-///   the output alpha is `255 - ((255 - dst_a) * (255 - opa) >> 8)`.
+///   the output alpha is the negative-multiplication table's entry for the
+///   opacity and the destination's alpha,
+///   `255 - (255 - dst_a) * (255 - opa) / 255`.
 pub fn fill_color_on_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 4], opa: i32) {
     if opa <= 0 {
         return;
@@ -218,13 +220,14 @@ pub fn fill_color_on_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 4]
     for y in y0..y1 {
         for x in x0..x1 {
             let d = read_pixel(bitmap, x, y);
-            let alpha = tables.opacity_on_opacity[(usize::from(opa) << 8) | usize::from(d[3])];
-            let out_a = 255 - (((255 - i32::from(d[3])) * (255 - i32::from(opa))) >> 8);
+            let index = (usize::from(opa) << 8) | usize::from(d[3]);
+            let alpha = tables.opacity_on_opacity[index];
+            let out_a = tables.negative_mul[index];
             let mut out = [0u8; 4];
             for c in 0..3 {
                 out[c] = blend_channel(d[c], color[c], alpha);
             }
-            out[3] = out_a.clamp(0, 255) as u8;
+            out[3] = out_a;
             write_pixel(bitmap, x, y, out);
         }
     }
@@ -243,6 +246,10 @@ fn saturated_add(a: u32, b: u32) -> u32 {
 }
 
 /// `FillColorOnAddAlpha`: additive-alpha (premultiplied) fill.
+///
+/// The full opacity is the plain ARGB fill, on this face as well: the
+/// reference's fill path takes that path at the full opacity on every face,
+/// so the colour is written as it is and the alpha is 255.
 pub fn fill_color_on_add_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 4], opa: i32) {
     if opa <= 0 {
         return;
@@ -253,6 +260,18 @@ pub fn fill_color_on_add_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
     };
+    if opa >= 255 {
+        let rgba = [color[0], color[1], color[2], 255];
+        for y in y0..y1 {
+            for x in x0..x1 {
+                write_pixel(bitmap, x, y, rgba);
+            }
+        }
+        // The fill wrote the clipped rectangle alone, so the upload needs
+        // that rectangle and not the whole bitmap.
+        bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
+        return;
+    }
     let opa = opa.min(255) as u32;
     // Scale each RGB channel by `(channel * opa) >> 8`.
     let src = (((color[0] as u32 * opa) >> 8) << 16)
@@ -341,8 +360,9 @@ pub fn fill_mask(bitmap: &mut BitmapState, rect: RectI, value: u8) {
     bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
 }
 
-/// `RemoveConstOpacity`: multiply the alpha by `1 - level / 255`
-/// (`(alpha * (255 - level)) >> 8`). `level <= 0` does nothing, `level >= 255`
+/// `RemoveConstOpacity`: multiply the alpha by `255 - level` and keep the
+/// low byte of the product, so the alpha the reference's kernel leaves is
+/// `(alpha * (255 - level)) & 0xff`. `level <= 0` does nothing, `level >= 255`
 /// clears the alpha.
 pub fn remove_const_opacity(bitmap: &mut BitmapState, rect: RectI, level: i32) {
     if level <= 0 {
@@ -358,7 +378,7 @@ pub fn remove_const_opacity(bitmap: &mut BitmapState, rect: RectI, level: i32) {
     for y in y0..y1 {
         for x in x0..x1 {
             let mut d = read_pixel(bitmap, x, y);
-            d[3] = ((u32::from(d[3]) * strength) >> 8) as u8;
+            d[3] = ((u32::from(d[3]) * strength) & 0xff) as u8;
             write_pixel(bitmap, x, y, d);
         }
     }
@@ -2978,7 +2998,7 @@ fn blend_tables() -> &'static BlendTables {
                     let at = destination_alpha as f32 / 255.0;
                     let bt = source_alpha as f32 / 255.0;
                     let mut c = bt / at;
-                    c = (c as f64 / (1.0 - bt as f64 + c as f64)) as f32;
+                    c /= 1.0 - bt + c;
                     let value = (c * 255.0) as i32;
                     if value >= 256 { 255 } else { value as u8 }
                 };
@@ -7176,5 +7196,62 @@ mod tests {
             actual.rgba, expected.rgba,
             "the affine clear must write the same pixels"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The tables the constant colour's blends read
+    // -----------------------------------------------------------------------
+
+    /// The weight the reference's opacity-on-opacity table holds.
+    ///
+    /// Reference: the table the constant colour's blend on an alpha
+    /// destination reads holds `(sa / da) / (1 - sa + sa / da)`, the second
+    /// step in single precision, truncated to a byte
+    /// (`reference/krkr2/cpp/core/visual/tvpgl.cpp:233-244`).
+    fn reference_opacity_on_opacity(destination_alpha: u8, source_opacity: u8) -> u8 {
+        if destination_alpha == 0 {
+            return 255;
+        }
+        let at = destination_alpha as f32 / 255.0;
+        let bt = source_opacity as f32 / 255.0;
+        let mut share = bt / at;
+        share /= 1.0 - bt + share;
+        let value = (share * 255.0) as i32;
+        if value >= 256 { 255 } else { value as u8 }
+    }
+
+    /// The destination alpha the reference's negative-multiplication table
+    /// holds.
+    ///
+    /// Reference: the table holds `255 - (255 - dst) * (255 - src) / 255`, the
+    /// division truncating
+    /// (`reference/krkr2/cpp/core/visual/tvpgl.cpp:248-249`).
+    fn reference_negative_mul(destination_alpha: u8, source_opacity: u8) -> u8 {
+        let product = (255 - u32::from(destination_alpha)) * (255 - u32::from(source_opacity));
+        (255 - product / 255) as u8
+    }
+
+    /// Every entry of the two tables the constant colour's blends read is the
+    /// value the reference's tables hold.
+    #[test]
+    fn the_constant_colour_tables_hold_the_reference_values() {
+        let tables = blend_tables();
+        for destination_alpha in 0..=u8::MAX {
+            for source_opacity in 0..=u8::MAX {
+                let index = (usize::from(source_opacity) << 8) | usize::from(destination_alpha);
+                assert_eq!(
+                    tables.opacity_on_opacity[index],
+                    reference_opacity_on_opacity(destination_alpha, source_opacity),
+                    "the weight for the destination alpha {destination_alpha} and the \
+                     source opacity {source_opacity}"
+                );
+                assert_eq!(
+                    tables.negative_mul[index],
+                    reference_negative_mul(destination_alpha, source_opacity),
+                    "the destination alpha for the destination alpha {destination_alpha} \
+                     and the source opacity {source_opacity}"
+                );
+            }
+        }
     }
 }

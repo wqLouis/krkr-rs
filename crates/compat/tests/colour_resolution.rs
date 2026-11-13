@@ -172,9 +172,11 @@ fn layer_color_rect_resolves_a_system_colour_on_every_painting_face() {
     ));
     // The alpha face writes the resolved colour and the fill's alpha.
     assert_eq!(env.eval_int("alpha_color"), 0x00ff_ffff);
-    // The additive-alpha face writes the resolved colour in the additive
-    // representation, where each channel is scaled by the fill's opacity.
-    assert_eq!(env.eval_int("additive_color"), 0xfe_9832);
+    // The full opacity is the plain ARGB fill on every face, the additive
+    // face included: the reference's fill path takes that path at the full
+    // opacity (`reference/krkr2/cpp/core/visual/LayerBitmapIntf.cpp:497-507`),
+    // so the additive face writes the resolved colour as it is.
+    assert_eq!(env.eval_int("additive_color"), 0x00ff_9933);
     // The opaque face writes the resolved colour and holds the alpha.
     assert_eq!(env.eval_int("opaque_color"), 0x00ff_9933);
 }
@@ -338,9 +340,11 @@ fn image_function_color_rect_resolves_a_system_colour_on_every_painting_face() {
          var opaque_alpha = opaque.getMaskPixel(0, 0);",
     ));
     assert_eq!(env.eval_int("alpha_color"), 0x00ff_ffff);
-    // The additive-alpha face writes the resolved colour in the additive
-    // representation, where each channel is scaled by the fill's opacity.
-    assert_eq!(env.eval_int("additive_color"), 0xfe_9832);
+    // The full opacity is the plain ARGB fill on every face, the additive
+    // face included: the reference's fill path takes that path at the full
+    // opacity (`reference/krkr2/cpp/core/visual/LayerBitmapIntf.cpp:497-507`),
+    // so the additive face writes the resolved colour as it is.
+    assert_eq!(env.eval_int("additive_color"), 0x00ff_9933);
     assert_eq!(env.eval_int("opaque_color"), 0x00ff_9933);
     // The opaque face holds the destination alpha.
     assert_eq!(env.eval_int("opaque_alpha"), 0x80);
