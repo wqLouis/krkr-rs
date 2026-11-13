@@ -1214,6 +1214,15 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   turn dies. Clear the finished workers' target directories when a worker
   delivers, and keep a worker's own build to `cargo build -p tjs` rather
   than the whole workspace.
+* **The mount poisons files in `.git` as well as in the build.** A file
+  under `.git/objects` came back as `Input/output error`, and git reported the
+  object as garbage; a push then failed. The file cannot be opened and
+  cannot be removed, but a **rename** does not touch the contents of what it
+  names: rename the directory aside, rebuild the tree from the index
+  (`git rm --cached -r <dir> && git add <dir>` restores the tree object with
+  the same hash), and re-fetch what is still missing with
+  `git fetch --refetch origin <branch>`. Check `git fsck` afterwards: the
+  broken links it reports are the objects the mount lost.
 * **A change to `crates/tjs/build.rs` forces a fresh staging of the C++
   dependencies, and the development host's NTFS mount can leave a poisoned
   file behind.** The staging copies the header-only dependencies into the
